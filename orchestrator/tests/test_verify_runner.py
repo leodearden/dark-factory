@@ -4392,6 +4392,55 @@ class TestDriftDetectorAgree:
         await detector.check('sha1', _make_spec())
         assert pool.is_quarantined('laptop') is False
 
+    # -- task 4188: verify categories surfaced in the verdict_parity_ok payload --
+
+    async def test_agree_event_data_contains_suppression_category(self):
+        """A suppression-implicated arm is named in the emitted parity payload."""
+        from orchestrator.verify_runner import DriftDetector
+        pool, _, _ = _make_drift_pool(
+            local_result=_make_pass_result(category='merge_flake_suppressed'),
+            remote_result=_make_pass_result(),
+        )
+        event_store = MagicMock()
+        detector = DriftDetector(pool, event_store=event_store)
+        await detector.check('sha1', _make_spec())
+        data = event_store.emit.call_args[1]['data']
+        assert data['local_category'] == 'merge_flake_suppressed'
+        assert data['remote_category'] == ''
+
+    async def test_agree_event_data_contains_both_categories_on_plain_agreement(self):
+        """Always-populated at the event layer, pinned with a non-empty value on both arms."""
+        from orchestrator.verify_runner import DriftDetector
+        pool, _, _ = _make_drift_pool(
+            local_result=_make_fail_result(category='test_failure'),
+            remote_result=_make_fail_result(category='test_failure'),
+        )
+        event_store = MagicMock()
+        detector = DriftDetector(pool, event_store=event_store)
+        await detector.check('sha1', _make_spec())
+        data = event_store.emit.call_args[1]['data']
+        assert data['local_category'] == 'test_failure'
+        assert data['remote_category'] == 'test_failure'
+
+    async def test_agree_event_data_keys_always_present_for_clean_pass(self):
+        """Uniform payload shape: both keys present even for a clean, category-less pass.
+
+        A consumer reads the same two keys on every drift parity event and never
+        has to distinguish an absent key from a clean result.
+        """
+        from orchestrator.verify_runner import DriftDetector
+        pool, _, _ = _make_drift_pool(
+            local_result=_make_pass_result(), remote_result=_make_pass_result()
+        )
+        event_store = MagicMock()
+        detector = DriftDetector(pool, event_store=event_store)
+        await detector.check('sha1', _make_spec())
+        data = event_store.emit.call_args[1]['data']
+        assert 'local_category' in data
+        assert 'remote_category' in data
+        assert data['local_category'] == ''
+        assert data['remote_category'] == ''
+
     # -- task 4188: verify categories surfaced on the AGREE result --
 
     async def test_agree_result_carries_suppression_category_from_local_arm(self):
