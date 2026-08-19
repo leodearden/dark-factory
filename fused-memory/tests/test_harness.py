@@ -3184,6 +3184,88 @@ class TestStage2CycleSummaryRemediationBackstop:
         assert payload['stats'].get('stage2_cycle_summary_write_recovered_backstop') is True
 
     @pytest.mark.asyncio
+    async def test_remediation_stage2_row_is_present_when_stage3_reads_it(
+        self, journal, event_buffer, mock_memory_service, ledger_store
+    ):
+        """Task 4186 on the SECOND driver: the recovered row must be in the
+        ledger before _run_remediation_pass dispatches its own Stage 3, not
+        only in this driver's finally afterwards.
+
+        The stakes differ from run_full_cycle's but are not smaller: this
+        driver's Stage-3 findings feed the persistence-gated escalation path,
+        so a false "summary missing" here costs an escalation rather than a
+        second remediation pass.
+        """
+        from fused_memory.models.reconciliation import StageId
+
+        harness = self._build_harness(
+            journal, event_buffer, mock_memory_service, ledger_store,
+        )
+        stage2_report = self._stage2_report(stage2_cycle_summary_ledger_written=0)
+        _mock_stage_run(harness.stages[0])
+        harness.stages[1].run = AsyncMock(return_value=stage2_report)
+
+        observed: list = []
+        observed_stage1: list = []
+        observed_run_ids: list = []
+
+        async def _s3(events, watermark, prior_reports, run_id, model=None):
+            # run_id comes from Stage 3's own 4th positional arg:
+            # _run_remediation_pass mints a FRESH uuid4 per pass, never the
+            # parent cycle's, so it cannot be recovered from the caller.
+            observed_run_ids.append(run_id)
+            observed.append(
+                await ledger_store.get_by_identity(
+                    'test-project', 'cycle_summary', task_id='',
+                    flag_type='task_knowledge_sync', run_id=run_id,
+                )
+            )
+            observed_stage1.append(
+                await ledger_store.get_by_identity(
+                    'test-project', 'cycle_summary', task_id='',
+                    flag_type='memory_consolidator', run_id=run_id,
+                )
+            )
+            return StageReport(
+                stage=StageId.integrity_check,
+                started_at=datetime.now(UTC),
+                completed_at=datetime.now(UTC),
+                items_flagged=[],
+                stats={},
+                llm_calls=0,
+                tokens_used=0,
+            )
+
+        harness.stages[2].run = _s3
+
+        await self._invoke_remediation(harness)
+
+        assert len(observed) == 1, 'expected exactly one Stage 3 dispatch'
+        assert observed[0] is not None, (
+            'the write-recovered re-attempt must land the Stage 2 cycle_summary '
+            "row BEFORE this driver's Stage 3 is dispatched — its presence check "
+            'is the same ledger-primary one run_full_cycle uses'
+        )
+
+        payload = json.loads(observed[0].payload_json)
+        assert payload['llm_calls'] == 4, (
+            'the flushed row must reuse the REAL Stage 2 report, not a zeroed synth'
+        )
+        assert payload['remediation'] is True, (
+            'the recovered row must stay indistinguishable from what the in-stage '
+            'write would have stamped — get_cycle_summary_presence reads that flag, '
+            "and stage3.py's Remediation Run Exception keys its whole Stage-1-absent "
+            'ruling on it'
+        )
+
+        assert observed_stage1 == [None], (
+            "Stage 1's arm must stay inert on this driver: its "
+            'run_type != RunType.remediation gate exists because a remediation '
+            "pass's Stage 1 deliberately writes no summary, and the flush must not "
+            'weaken it into fabricating one'
+        )
+
+    @pytest.mark.asyncio
     async def test_remediation_happy_path_does_not_fire(
         self, journal, event_buffer, mock_memory_service, ledger_store
     ):
