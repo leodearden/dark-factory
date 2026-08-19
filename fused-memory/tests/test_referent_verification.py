@@ -30,7 +30,12 @@ import json
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from _fm_helpers import install_identity_mocks
+from _fm_helpers import (
+    MockAddEpisodeResult,
+    MockEdge,
+    MockNode,
+    install_identity_mocks,
+)
 
 from fused_memory.services.memory_service import (
     REFERENT_CHECKS,
@@ -57,6 +62,8 @@ def service(mock_config):
     svc.graphiti.add_episode = AsyncMock(return_value=None)
     svc.graphiti._require_client = MagicMock()
     svc.graphiti.get_nodes_by_exact_name = AsyncMock(return_value=[])
+    for name in _WRITE_PRIMITIVES:
+        setattr(svc.graphiti, name, AsyncMock(return_value=None))
     install_identity_mocks(svc.graphiti)
     return svc
 
@@ -182,3 +189,259 @@ class TestReferentStatsVocabulary:
         first.findings.append(_finding())
 
         assert second.findings == []
+
+
+def _episode(edges, nodes) -> MockAddEpisodeResult:
+    """An add_episode result carrying *edges* and *nodes*.
+
+    `entity_edges` is nulled so the `.edges` attribute is the one zeta reads —
+    `MockAddEpisodeResult.__post_init__` mirrors entity_edges INTO edges, and a
+    test that let both carry the same list could not tell which one was walked.
+    """
+    result = MockAddEpisodeResult(edges=edges, nodes=nodes)
+    result.entity_edges = []
+    return result
+
+
+def _edge(uuid='e1', *, fact='', source='n-src', target='n-tgt') -> MockEdge:
+    return MockEdge(
+        fact=fact, uuid=uuid, source_node_uuid=source, target_node_uuid=target,
+    )
+
+
+#: Every GraphitiBackend primitive that MUTATES the graph. zeta detects and
+#: records; the repair is leaf eta's, so none of these may ever be awaited.
+_WRITE_PRIMITIVES = (
+    'merge_entities',
+    'rename_entity_node',
+    'update_edge',
+    'reassign_edge',
+    'ensure_entity_node',
+    'refresh_entity_summary',
+    'add_episode',
+)
+
+
+def assert_never_repaired(service) -> None:
+    for name in _WRITE_PRIMITIVES:
+        getattr(service.graphiti, name).assert_not_awaited()
+
+
+class TestSetMembershipCheck:
+    """Did the edge land on a node this write is not about at all?
+
+    The dominant live shape: five of the PRD's measured cases share the
+    signature that the number the edge landed on is never named by the fact.
+    """
+
+    @pytest.mark.asyncio
+    async def test_fires_with_every_contract_field_populated(self, service):
+        result = _episode(
+            edges=[_edge('e1', fact='the deploy pipeline was retried',
+                         source='n-3129', target='n-x')],
+            nodes=[MockNode(name='Task 3129', uuid='n-3129'),
+                   MockNode(name='deploy pipeline', uuid='n-x')],
+        )
+
+        stats = await service._verify_episode_referents(
+            result, group_id='dark_factory', referents=(Referent(number='3127'),),
+        )
+
+        assert len(stats.findings) == 1
+        finding = stats.findings[0]
+        assert finding.check == 'set-membership'
+        assert finding.edge_uuid == 'e1'
+        assert finding.which_end == 'source'
+        assert finding.old_endpoint_uuid == 'n-3129'
+        assert finding.old_endpoint_name == 'Task 3129'
+        assert finding.endpoint_referent == Referent(number='3129')
+        assert finding.referent_set == ('Task 3127',)
+        assert stats.set_membership_findings == 1
+        assert_never_repaired(service)
+
+    @pytest.mark.asyncio
+    async def test_an_endpoint_in_the_set_produces_no_finding(self, service):
+        result = _episode(
+            edges=[_edge('e1', source='n-3127', target='n-x')],
+            nodes=[MockNode(name='Task 3127', uuid='n-3127'),
+                   MockNode(name='deploy pipeline', uuid='n-x')],
+        )
+
+        stats = await service._verify_episode_referents(
+            result, group_id='dark_factory', referents=(Referent(number='3127'),),
+        )
+
+        assert stats.findings == []
+        assert stats.endpoints_checked == 1
+        assert_never_repaired(service)
+
+    @pytest.mark.asyncio
+    async def test_a_non_canonical_endpoint_spelling_still_passes(self, service):
+        """The check keys on `parse_node_name`'s Referent, NOT a raw-string
+        compare — which is what makes it invariant across the rename/merge
+        `_normalize_task_node_names` performs immediately before it."""
+        result = _episode(
+            edges=[_edge('e1', source='n-3127', target='n-x')],
+            nodes=[MockNode(name='task #3127', uuid='n-3127'),
+                   MockNode(name='deploy pipeline', uuid='n-x')],
+        )
+
+        stats = await service._verify_episode_referents(
+            result, group_id='dark_factory', referents=(Referent(number='3127'),),
+        )
+
+        assert stats.findings == []
+        assert stats.endpoints_checked == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('name', ['MergeWorker', 'Task 42 orchestrator',
+                                      'PRD decision D2'])
+    async def test_endpoints_that_are_not_task_labels_are_never_checked(
+        self, service, name,
+    ):
+        """The postcondition is scoped to endpoints whose NAME parses as a
+        canonical task referent. 'Task 42 orchestrator' is the anchoring case:
+        it MENTIONS a task and is not one."""
+        result = _episode(
+            edges=[_edge('e1', source='n-a', target='n-b')],
+            nodes=[MockNode(name=name, uuid='n-a'),
+                   MockNode(name='deploy pipeline', uuid='n-b')],
+        )
+
+        stats = await service._verify_episode_referents(
+            result, group_id='dark_factory', referents=(Referent(number='3127'),),
+        )
+
+        assert stats.findings == []
+        assert stats.endpoints_checked == 0
+
+    @pytest.mark.asyncio
+    async def test_both_ends_are_checked_and_which_end_is_recorded(self, service):
+        """`which_end` is what lets eta call `reassign_edge(..., which_end=...)`."""
+        result = _episode(
+            edges=[_edge('e1', source='n-3127', target='n-3129')],
+            nodes=[MockNode(name='Task 3127', uuid='n-3127'),
+                   MockNode(name='Task 3129', uuid='n-3129')],
+        )
+
+        stats = await service._verify_episode_referents(
+            result, group_id='dark_factory', referents=(Referent(number='3127'),),
+        )
+
+        assert len(stats.findings) == 1
+        assert stats.findings[0].which_end == 'target'
+        assert stats.findings[0].old_endpoint_uuid == 'n-3129'
+        assert stats.endpoints_checked == 2
+
+    @pytest.mark.asyncio
+    async def test_digits_are_compared_verbatim_never_int_normalized(self, service):
+        """`Referent(number='0132') != Referent(number='132')` — a referent
+        never invents or reformats a task number."""
+        result = _episode(
+            edges=[_edge('e1', source='n-132', target='n-x')],
+            nodes=[MockNode(name='Task 132', uuid='n-132'),
+                   MockNode(name='deploy pipeline', uuid='n-x')],
+        )
+
+        stats = await service._verify_episode_referents(
+            result, group_id='dark_factory', referents=(Referent(number='0132'),),
+        )
+
+        assert len(stats.findings) == 1
+        assert stats.findings[0].endpoint_referent == Referent(number='132')
+
+    @pytest.mark.asyncio
+    async def test_a_cross_project_endpoint_is_a_different_referent(self, service):
+        """The qualifier is a DIFFERENT-project signal and is never normalized
+        away — flattening 'reify:132' onto 'Task 132' is precisely the
+        cross-project collapse utils/cross_project_refs.py exists to detect."""
+        result = _episode(
+            edges=[_edge('e1', source='n-r132', target='n-x')],
+            nodes=[MockNode(name='reify:132', uuid='n-r132'),
+                   MockNode(name='deploy pipeline', uuid='n-x')],
+        )
+
+        stats = await service._verify_episode_referents(
+            result, group_id='dark_factory', referents=(Referent(number='132'),),
+        )
+
+        assert len(stats.findings) == 1
+        assert stats.findings[0].endpoint_referent == Referent(
+            number='132', project_id='reify',
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_none_result_is_a_no_op(self, service):
+        stats = await service._verify_episode_referents(
+            None, group_id='dark_factory', referents=(Referent(number='3127'),),
+        )
+
+        assert stats.findings == []
+        assert stats.edges_scanned == 0
+        assert_never_repaired(service)
+
+    @pytest.mark.asyncio
+    async def test_an_edgeless_result_is_a_no_op(self, service):
+        stats = await service._verify_episode_referents(
+            _episode(edges=[], nodes=[MockNode(name='Task 3129', uuid='n-3129')]),
+            group_id='dark_factory',
+            referents=(Referent(number='3127'),),
+        )
+
+        assert stats.findings == []
+        assert stats.edges_scanned == 0
+
+    @pytest.mark.asyncio
+    async def test_an_empty_referent_set_makes_the_whole_pass_a_no_op(self, service):
+        """Honours epsilon's published contract ("an EMPTY `.referents` carries
+        nothing to test membership against, so a downstream verifier must no-op
+        on it regardless of `.source`") and the PRD's `source='none'` row."""
+        result = _episode(
+            edges=[_edge('e1', fact='Task 3129 was merged',
+                         source='n-3129', target='n-x')],
+            nodes=[MockNode(name='Task 3129', uuid='n-3129'),
+                   MockNode(name='deploy pipeline', uuid='n-x')],
+        )
+
+        stats = await service._verify_episode_referents(
+            result, group_id='dark_factory', referents=(),
+        )
+
+        assert stats.findings == []
+        assert stats.edges_scanned == 0
+        assert stats.endpoints_checked == 0
+        assert_never_repaired(service)
+
+    @pytest.mark.asyncio
+    async def test_an_endpoint_this_episode_does_not_name_is_counted(self, service):
+        """The one blind spot, COUNTED rather than silently skipped: a check
+        that did not run is not a check that passed."""
+        result = _episode(
+            edges=[_edge('e1', source='n-unknown', target='n-x')],
+            nodes=[MockNode(name='deploy pipeline', uuid='n-x')],
+        )
+
+        stats = await service._verify_episode_referents(
+            result, group_id='dark_factory', referents=(Referent(number='3127'),),
+        )
+
+        assert stats.findings == []
+        assert stats.endpoints_unresolved == 1
+        assert stats.endpoints_checked == 0
+
+    @pytest.mark.asyncio
+    async def test_edges_scanned_counts_every_edge_walked(self, service):
+        result = _episode(
+            edges=[_edge('e1', source='n-3127', target='n-x'),
+                   _edge('e2', source='n-x', target='n-3127'),
+                   _edge('e3', source='n-x', target='n-x')],
+            nodes=[MockNode(name='Task 3127', uuid='n-3127'),
+                   MockNode(name='deploy pipeline', uuid='n-x')],
+        )
+
+        stats = await service._verify_episode_referents(
+            result, group_id='dark_factory', referents=(Referent(number='3127'),),
+        )
+
+        assert stats.edges_scanned == 3
+        assert stats.findings == []
