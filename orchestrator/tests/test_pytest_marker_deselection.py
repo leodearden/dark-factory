@@ -445,6 +445,102 @@ class TestPerItemMarkerNames:
     def test_syntax_error_is_none_not_a_raise(self):
         assert per_item_marker_names('def broken(:\n') is None
 
+    # -- refusals: shapes whose items this walk cannot exhaustively see -------
+    #
+    # Every fixture carries at least one FULLY-decorated top-level
+    # `@pytest.mark.slow def test_a`, so a refusal can never pass vacuously:
+    # if the guard under test stopped firing, the function would return a
+    # non-None, all-proven `(frozenset({'slow'}), ...)` tuple instead.
+
+    def test_refuses_on_a_top_level_test_class(self):
+        """A test class is an item shape this tier does not model."""
+        source = (
+            '@pytest.mark.slow\n'
+            'def test_a():\n    pass\n\n\n'
+            'class TestThing:\n'
+            '    @pytest.mark.slow\n'
+            '    def test_method(self):\n        pass\n'
+        )
+        assert per_item_marker_names(source) is None
+
+    def test_refuses_on_a_class_nested_below_tree_body(self):
+        """Pins that the class scan uses ``ast.walk``, not ``tree.body``."""
+        source = (
+            '@pytest.mark.slow\n'
+            'def test_a():\n    pass\n\n\n'
+            'if True:\n'
+            '    class TestThing:\n'
+            '        pass\n'
+        )
+        assert per_item_marker_names(source) is None
+
+    @pytest.mark.parametrize(
+        'import_line',
+        [
+            'from helpers import TestBase',
+            'import helpers as TestAlias',
+            'from helpers import Base as TestBase',
+        ],
+    )
+    def test_refuses_when_an_import_binds_a_name_starting_with_test(self, import_line):
+        """An imported ``Test*`` name is collected in THIS module; ``asname`` wins."""
+        source = f'{import_line}\n\n\n@pytest.mark.slow\ndef test_a():\n    pass\n'
+        assert per_item_marker_names(source) is None
+
+    def test_asname_that_does_not_start_with_test_does_not_refuse_on_that_ground_alone(self):
+        """The reverse of the parametrized case above: aliasing a ``Test*`` name AWAY."""
+        source = (
+            'from helpers import TestBase as _base\n\n\n'
+            '@pytest.mark.slow\n'
+            'def test_a():\n    pass\n'
+        )
+        assert per_item_marker_names(source) is not None
+
+    def test_refuses_on_a_star_import(self):
+        """Bound names from ``from x import *`` are statically unknowable."""
+        source = (
+            'from helpers import *\n\n\n'
+            '@pytest.mark.slow\n'
+            'def test_a():\n    pass\n'
+        )
+        assert per_item_marker_names(source) is None
+
+    def test_refuses_when_a_test_function_is_nested_below_tree_body(self):
+        """THE UNSOUNDNESS THIS GUARD CLOSES.
+
+        An undecorated, still-SELECTED sibling hiding below ``tree.body``
+        would otherwise be invisible to the walk, and the module would
+        falsely widen.
+        """
+        source = (
+            '@pytest.mark.slow\n'
+            'def test_a():\n    pass\n\n\n'
+            "if sys.platform == 'linux':\n"
+            '    def test_b():\n        pass\n'
+        )
+        assert per_item_marker_names(source) is None
+
+    @pytest.mark.parametrize(
+        'hook_source',
+        [
+            'def pytest_collection_modifyitems(config, items):\n    pass\n',
+            'def pytest_generate_tests(metafunc):\n    pass\n',
+        ],
+    )
+    def test_refuses_on_a_top_level_pytest_hook(self, hook_source):
+        """A hook can add items this walk never sees."""
+        source = f'@pytest.mark.slow\ndef test_a():\n    pass\n\n\n{hook_source}'
+        assert per_item_marker_names(source) is None
+
+    def test_an_ordinary_helper_import_does_not_refuse(self):
+        """The real shape both target modules use — the ``Test*`` guard must not be over-broad."""
+        source = (
+            'from systemd_unit_invariants import require_installed_unit\n\n\n'
+            '@pytest.mark.slow\n'
+            'def test_a():\n    pass\n'
+        )
+        assert per_item_marker_names(source) is not None
+
 
 # ---------------------------------------------------------------------------
 # expression_definitely_deselects (step-5: RED)
