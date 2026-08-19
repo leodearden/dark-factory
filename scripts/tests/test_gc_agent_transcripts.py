@@ -406,7 +406,11 @@ def test_default_constants_match_orchestrator_config():
     assert TranscriptArchiveConfig().root == gct.ARCHIVE_ROOT_RELATIVE
     assert gct.ARCHIVE_ROOT_RELATIVE == "data/orchestrator/agent-transcripts"
     assert gct.DEFAULT_MAX_AGE_DAYS == RetentionConfig().max_age_days == 90
-    assert gct.DEFAULT_MAX_TASK_DIRS == RetentionConfig().max_task_dirs == 5000
+    # max_task_dirs is a DERIVED bound, re-derived against the live archive by
+    # test_max_task_dirs_is_derived_from_live_archive_rate below. Kept as exact
+    # equality on both sides: this guard exists to catch one site moving
+    # without the others, which an inequality would let through.
+    assert gct.DEFAULT_MAX_TASK_DIRS == RetentionConfig().max_task_dirs == 50000
 
 
 # ---------------------------------------------------------------------------
@@ -776,3 +780,74 @@ def test_retention_safety_factor_is_at_least_one():
     projection of the observed rate — quietly re-admitting the very truncation
     the derived bound exists to prevent."""
     assert gct.RETENTION_SAFETY_FACTOR >= 1
+
+
+# ---------------------------------------------------------------------------
+# step-5 (task 3621): the count cap re-derived against the LIVE archive.
+#
+# Meaningful on a live host, inert in a fresh checkout: with no archive (or too
+# sparse a one) it SKIPS rather than passing, so silence stays legible in the
+# pytest output as "not measured" instead of masquerading as a green check.
+# ---------------------------------------------------------------------------
+
+def test_max_task_dirs_is_derived_from_live_archive_rate():
+    """DERIVED BOUND: max_task_dirs must hold a FULL max_age_days window of the
+    archive's real peak throughput, with headroom.
+
+    The count cap prunes OLDEST-FIRST, so if it binds it truncates the 90-day
+    retention window from the forensic end while the sweep still reports a
+    90-day policy. This guard re-measures the live archive every run, so a
+    fleet that speeds up trips the test instead of silently losing history.
+    """
+    root = gct.default_archive_root()
+    if not root.is_dir():
+        pytest.skip(
+            f"no live archive at {root} — nothing to derive the cap from "
+            "(host-independent falsifiability is covered by "
+            "test_required_max_task_dirs_is_falsifiable_against_a_known_peak)"
+        )
+
+    scanned = gct.scan_task_dirs(root)
+    rate = gct.observed_daily_rate(scanned)
+    if rate is None:
+        pytest.skip(
+            f"live archive at {root} holds {len(scanned)} task dirs spanning "
+            f"fewer than {gct.MIN_RATE_SAMPLE_DAYS} complete days — too sparse "
+            "to derive a rate from"
+        )
+
+    # NON-DEGENERATE before it is consumed. A zero rate would make the bound
+    # below satisfiable by ANY cap, leaving this guard permanently green while
+    # measuring nothing — the exact vacuity trap it exists to avoid.
+    assert rate.sample_dirs > 0, "degenerate sample: no task dirs measured"
+    assert rate.peak_per_day > 0, "degenerate sample: zero peak arrival rate"
+
+    required = gct.required_max_task_dirs(
+        rate.peak_per_day, gct.DEFAULT_MAX_AGE_DAYS, gct.RETENTION_SAFETY_FACTOR
+    )
+
+    assert gct.DEFAULT_MAX_TASK_DIRS >= required, (
+        "retention count cap is too small for the archive's MEASURED "
+        "throughput: it will prune oldest-first and silently truncate the "
+        f"{gct.DEFAULT_MAX_AGE_DAYS}-day retention window.\n"
+        f"  archive root ..... {root}\n"
+        f"  sample ........... {rate.sample_dirs} task dirs over "
+        f"{rate.span_days} days ({rate.complete_days} complete)\n"
+        f"  observed peak .... {rate.peak_per_day}/day "
+        f"(mean {rate.mean_per_day:.1f}/day)\n"
+        f"  safety factor .... {gct.RETENTION_SAFETY_FACTOR}\n"
+        f"  REQUIRED cap ..... {required} = ceil({rate.peak_per_day}/day"
+        f" x {gct.DEFAULT_MAX_AGE_DAYS} days x {gct.RETENTION_SAFETY_FACTOR})\n"
+        f"  current cap ...... {gct.DEFAULT_MAX_TASK_DIRS}\n"
+        "TO FIX: re-derive the cap from the numbers above (ruling: "
+        "plans/transcript-preservation-seam-prd.md D8) and raise ALL FOUR "
+        "lock-step sites in ONE commit, or any single commit is red:\n"
+        "  1. orchestrator/src/orchestrator/config.py  RetentionConfig.max_task_dirs\n"
+        "  2. scripts/gc_agent_transcripts.py  DEFAULT_MAX_TASK_DIRS (+ the "
+        "module docstring's --max-task-dirs usage example)\n"
+        "  3. orchestrator/tests/test_transcript_archive_config.py  defaults test\n"
+        "  4. orchestrator/tests/test_transcript_archive_config.py  whole-submodel "
+        "reload rider assertion\n"
+        "  ...plus this file's test_default_constants_match_orchestrator_config "
+        "drift guard."
+    )
