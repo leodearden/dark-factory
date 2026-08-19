@@ -663,15 +663,27 @@ class TestStaleOutcomeHygiene:
         )
 
 
-def _make_steward_config() -> MagicMock:
+def _make_steward_config(project_root: Path) -> MagicMock:
     """A MagicMock ``OrchestratorConfig`` for a REAL ``TaskSteward``.
 
-    Same stamping recipe as ``test_steward.py``'s ``mock_config`` fixture so
-    the integration test does not introduce a second config shape.  Only the
-    fields the attempt-cap path actually reads are load-bearing
-    (``steward_max_attempts``, ``steward_lifetime_budget``); the routing stamp
-    is kept because the class's other paths reach ``resolve_route``, and a
-    ``spec_set`` MagicMock must not be the reason a future assertion moves.
+    Same stamping recipe as ``conftest.py``'s ``make_steward`` fixture — the
+    recipe's owner — so the integration test does not introduce a second config
+    shape.  (It previously named ``test_steward.py``'s ``mock_config``; task 3514
+    turned that into a one-line VIEW onto ``make_steward``, so the real owner is
+    the fixture.)  Only the fields the attempt-cap path actually reads are
+    load-bearing (``steward_max_attempts``, ``steward_lifetime_budget``); the
+    routing stamp is kept because the class's other paths reach
+    ``resolve_route``, and a ``spec_set`` MagicMock must not be the reason a
+    future assertion moves.
+
+    This factory stays SEPARATE from ``make_steward`` for three structural
+    reasons, examined by task 3551 and recorded in full in that fixture's
+    docstring: it feeds a ``TaskSteward`` SUBCLASS (``_CapFiringSteward`` below);
+    that construction passes ``config_dir=``, which the fixture does not accept;
+    and ``_make_real_steward_factory`` is a CALLBACK the workflow invokes later
+    with a worktree the workflow chooses, so it cannot request ``tmp_path`` at
+    construction time.  It does share the fixture's sandboxed ``project_root``
+    recipe (task 3551) — hence the required parameter.
 
     Deliberately SEPARATE from the workflow's own ``OrchestratorConfig``: the
     steward-side cap and the workflow-side ``steward_completion_timeout`` are
@@ -679,7 +691,10 @@ def _make_steward_config() -> MagicMock:
     enough that fix C cannot be what satisfies it.
     """
     cfg = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
-    cfg.project_root = Path('/tmp/fake-project')
+    # Same recipe as conftest.py's make_steward (parents=True, exist_ok=True), so
+    # the call cannot collide with a directory the enclosing test already built.
+    project_root.mkdir(parents=True, exist_ok=True)
+    cfg.project_root = project_root
     cfg.models.steward = 'opus'
     cfg.budgets.steward = 5.0
     cfg.max_turns.steward = 100
@@ -699,8 +714,37 @@ def _make_steward_config() -> MagicMock:
     return cfg
 
 
+def test_make_steward_config_project_root_is_sandboxed(tmp_path):
+    """``_make_steward_config``'s ``project_root`` is a real dir under ``tmp_path``.
+
+    Deliberately a plain SYNCHRONOUS unit test with no ``git_repo`` / ``git_ops``
+    / ``config`` fixtures — every sibling test in this module builds a real git
+    worktree, and this one only needs the factory.
+    """
+    cfg = _make_steward_config(tmp_path / 'project')
+
+    root = cfg.project_root
+    assert isinstance(root, Path), (
+        f'expected project_root to be a real Path, got '
+        f'{type(root).__name__!r} — a MagicMock child silently satisfies every '
+        f'"/"-join the steward performs without ever producing a directory'
+    )
+    assert root.is_dir(), (
+        f'expected the factory to CREATE {root}; the retired '
+        f"Path('/tmp/fake-project') literal was never created by anything, so a "
+        f'dangling project_root is a latent cwd= failure the moment a test stops '
+        f'patching the invoke seam'
+    )
+    assert root.resolve().is_relative_to(tmp_path.resolve()), (
+        f'expected project_root under tmp_path={tmp_path}, got {root} — the '
+        f"retired '/tmp/fake-project' literal pointed OUTSIDE the test sandbox, "
+        f'so anything the steward wrote relative to config.project_root escaped '
+        f"pytest's tmp_path retention sweep"
+    )
+
+
 def _make_real_steward_factory(
-    queue: EscalationQueue, esc: Escalation, task_id: str,
+    queue: EscalationQueue, esc: Escalation, task_id: str, project_root: Path,
 ):
     """A ``_steward_factory`` that builds a GENUINE ``TaskSteward``.
 
@@ -717,7 +761,7 @@ def _make_real_steward_factory(
     steward passes against a fake contract.  Task 2248 shipped the strand
     precisely because only the ``_mark_blocked`` half was ever tested.
     """
-    steward_config = _make_steward_config()
+    steward_config = _make_steward_config(project_root)
 
     class _CapFiringSteward(TaskSteward):
         async def start(self) -> None:
@@ -780,7 +824,7 @@ class TestRealStewardGiveUpUnblocksEscalatedRun:
         )
         _wire_resolve_callback(queue, workflow)
         workflow._steward_factory = _make_real_steward_factory(
-            queue, esc, task_assignment.task_id,
+            queue, esc, task_assignment.task_id, tmp_path / 'project',
         )
         evrl_mock, _state = _make_evrl_returner(
             [WorkflowOutcome.ESCALATED, WorkflowOutcome.DONE],
