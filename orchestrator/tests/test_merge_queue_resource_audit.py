@@ -50,6 +50,7 @@ import asyncio
 import concurrent.futures
 import logging
 import os
+import re
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -1607,7 +1608,7 @@ class TestCheckResourceAuditReclaimBandSuppression:
         self, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
     ) -> None:
         """THE regression. Across more consecutive violating heartbeats than
-        the streak threshold, an in-band leak still warns every time and still
+        the streak threshold, an in-band leak is still reported and still
         drives the streak — but never pages a human.
         """
         fake_eq = _FakeEscalationQueue(open_l1=False)
@@ -1617,7 +1618,7 @@ class TestCheckResourceAuditReclaimBandSuppression:
         )
         calls = worker.RESOURCE_AUDIT_ESCALATION_STREAK + 2
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_queue'):
             for i in range(1, calls + 1):
                 worker._check_resource_audit(self._NOW + i)
 
@@ -1626,9 +1627,14 @@ class TestCheckResourceAuditReclaimBandSuppression:
         assert len(violations) == 1
         assert str(wt.resolve()) in violations[0]
 
-        # Logging is untouched: one WARNING per violating call.
-        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
-        assert len(warnings) == calls, f'expected {calls} WARNINGs, got: {caplog.text}'
+        # Logging is COALESCED (task 3203): this used to pin one WARNING per
+        # violating call, which is precisely the pathology 3203 retires. The
+        # unchanging violation set is now reported on the exponential
+        # schedule — over these 5 polls, at streaks 1, 2 and 4. Counted
+        # level-agnostically so this survives step-9's level routing.
+        assert _streaks(caplog) == [1, 2, 4], (
+            f'expected the coalesced schedule over {calls} polls, got: {caplog.text}'
+        )
 
         # The streak is untouched: it keeps counting through the band.
         assert worker._resource_audit_violation_streak == calls
@@ -1993,3 +1999,275 @@ class TestResourceAuditFingerprint:
         assert len(first) == 2
         for i in range(1, 100):
             assert _fingerprint_at(self._NOW + i * 30.0) == first
+
+
+# ---------------------------------------------------------------------------
+# task 3203 step-5 RED / step-6 GREEN: exponential log coalescence
+# ---------------------------------------------------------------------------
+
+_AUDIT_PREFIX = 'merge queue resource-conservation audit: '
+_CLEAR_PREFIX = 'merge queue resource-conservation audit clear '
+_STREAK_RE = re.compile(r'consecutive streak=(\d+)')
+_UNCHANGED_RE = re.compile(r'unchanged for (\d+) polls')
+
+
+def _audit_lines(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    """Audit REPORT records, counted level-agnostically.
+
+    Deliberately level-agnostic: task 3203 step-9 pins the WARNING/INFO/DEBUG
+    routing separately, so every count asserted here survives that step
+    unchanged.  The clear line's prefix (``_CLEAR_PREFIX``) is distinct and is
+    never counted here.
+    """
+    return [r for r in caplog.records if r.getMessage().startswith(_AUDIT_PREFIX)]
+
+
+def _streaks(caplog: pytest.LogCaptureFixture) -> list[int]:
+    """The ``consecutive streak=N`` value of each emitted audit report line."""
+    out: list[int] = []
+    for record in _audit_lines(caplog):
+        match = _STREAK_RE.search(record.getMessage())
+        assert match is not None, f'audit line carries no streak: {record.getMessage()!r}'
+        out.append(int(match.group(1)))
+    return out
+
+
+class TestResourceAuditLogCoalescence:
+    """The headline of task 3203: an UNCHANGING violation set is reported on
+    an exponentially-backing-off schedule instead of once per 30s poll.
+
+    Before this task a single leaked worktree held for two hours emitted 246
+    identical WARNINGs (one measured incident emitted 897), which destroys the
+    greppability the logging exists to buy.
+
+    Counting is LEVEL-AGNOSTIC here (see :func:`_audit_lines`) — step-9 pins
+    the level routing separately.
+
+    RED until step-6 GREEN wires ExponentialLogCoalescer into
+    _check_resource_audit's logging arm.
+    """
+
+    _NOW = 1_000_000.0
+    _POLL_S = 30.0
+    _DETECT = 100.0
+    # Far above any age reached in these tests, so the reclaim disposition
+    # never flips mid-run (that flip is a real fingerprint change — pinned by
+    # TestResourceAuditFingerprint (b) and step-9 (g)) and so the escalation
+    # floor derived from it is never reached by the worktree arm.
+    _FAR_REAP_AGE = 10_000_000.0
+    _IN_BAND_AGE = 150.0
+
+    def _worker(self, git_ops: GitOps, fake_eq: _FakeEscalationQueue | None = None):
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(
+            git_ops, asyncio.Queue(), escalation_queue=fake_eq, speculation_depth=2,
+        )
+        worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = self._DETECT
+        worker.PERIODIC_REAP_MIN_AGE_SECS = self._FAR_REAP_AGE
+        return worker
+
+    def _drive(self, worker, polls: int, *, start_poll: int = 0) -> None:
+        for i in range(start_poll, start_poll + polls):
+            worker._check_resource_audit(self._NOW + i * self._POLL_S)
+
+    # ── (a)/(b) the schedule ────────────────────────────────────────────────
+
+    def test_unchanged_violation_set_is_reported_logarithmically_not_linearly(
+        self, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """(a) THE headline verification: 512 violating polls, 10 report lines."""
+        worker = self._worker(git_ops)
+        worker.RESOURCE_AUDIT_LOG_COALESCE_CAP_POLLS = 10_000  # cap must not bind here
+        _mkdir_worktree(git_ops, '_merge-leak', mtime=self._NOW - self._IN_BAND_AGE)
+
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_queue'):
+            self._drive(worker, 512)
+
+        assert _streaks(caplog) == [1, 2, 4, 8, 16, 32, 64, 128, 256, 512], (
+            f'expected the powers of two, got {_streaks(caplog)}'
+        )
+        assert len(_audit_lines(caplog)) == 10
+        # Stated explicitly: NOT linear, by more than an order of magnitude.
+        assert 10 < 512 / 10
+        # The backoff advanced only because the fingerprint held steady even
+        # though the tree's age grew by 30s on every one of those polls.
+        assert worker.worktree_ledger_violations(now=self._NOW)[0] != (
+            worker.worktree_ledger_violations(now=self._NOW + 511 * self._POLL_S)[0]
+        ), 'precondition: the raw violation string really does change every poll'
+
+    def test_cap_binds_and_degrades_the_schedule_to_linear(
+        self, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """(b) The cap is a floor on the cadence, monkeypatchable per-instance."""
+        worker = self._worker(git_ops)
+        worker.RESOURCE_AUDIT_LOG_COALESCE_CAP_POLLS = 4
+        _mkdir_worktree(git_ops, '_merge-leak', mtime=self._NOW - self._IN_BAND_AGE)
+
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_queue'):
+            self._drive(worker, 40)
+
+        assert _streaks(caplog) == [1, 2, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40], (
+            f'expected doubling-then-capped-at-4, got {_streaks(caplog)}'
+        )
+
+    # ── (c)/(d) nothing is dropped, and a repeat says what it stands for ────
+
+    def test_suppressed_polls_are_not_dropped(
+        self, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """(c) A debug-level operator still sees every single poll — mirrors
+        the _reprobe_last_info precedent's 'Never DROPPED' contract."""
+        worker = self._worker(git_ops)
+        worker.RESOURCE_AUDIT_LOG_COALESCE_CAP_POLLS = 10_000
+        _mkdir_worktree(git_ops, '_merge-leak', mtime=self._NOW - self._IN_BAND_AGE)
+
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_queue'):
+            self._drive(worker, 512)
+
+        assert len(_audit_lines(caplog)) == 512, (
+            'every violating poll must leave a record at SOME level; only 10 '
+            'are report-level. Got '
+            f'{len(_audit_lines(caplog))}'
+        )
+
+    def test_a_repeat_line_names_what_it_stands_in_for(
+        self, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """(d) Coalescing context, and today's exact format preserved on the
+        first line."""
+        worker = self._worker(git_ops)
+        worker.RESOURCE_AUDIT_LOG_COALESCE_CAP_POLLS = 10_000
+        wt = _mkdir_worktree(git_ops, '_merge-leak', mtime=self._NOW - self._IN_BAND_AGE)
+
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_queue'):
+            self._drive(worker, 64)
+
+        lines = _audit_lines(caplog)
+
+        # The first line is the pre-3203 format, byte-for-byte: full detail,
+        # streak=1, every violation string, and NO coalescing suffix.
+        first = lines[0].getMessage()
+        assert first == (
+            'merge queue resource-conservation audit: 1 violation(s) found '
+            f'(consecutive streak=1): {worker.worktree_ledger_violations(now=self._NOW)[0]}'
+        ), f'the first line must match the pre-3203 format exactly, got {first!r}'
+        assert 'unchanged for ' not in first
+        assert str(wt.resolve()) in first
+
+        # Every later line carries the coalescing context, and its
+        # "unchanged for N polls" is the poll index it was emitted on.
+        for record in lines[1:]:
+            message = record.getMessage()
+            assert 'unchanged for ' in message
+            assert ' polls' in message
+            assert 'next report in ' in message
+            unchanged = _UNCHANGED_RE.search(message)
+            streak = _STREAK_RE.search(message)
+            assert unchanged is not None and streak is not None
+            assert int(unchanged.group(1)) == int(streak.group(1)), (
+                f'the coalescing poll count must track the poll index: {message!r}'
+            )
+
+    # ── (e)/(f) a change is never withheld ──────────────────────────────────
+
+    def test_adding_a_leak_mid_backoff_reports_immediately(
+        self, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """(e) At poll 100 the next scheduled report is poll 128; a set that
+        GREW must not wait for it."""
+        worker = self._worker(git_ops)
+        worker.RESOURCE_AUDIT_LOG_COALESCE_CAP_POLLS = 10_000
+        first = _mkdir_worktree(git_ops, '_merge-one', mtime=self._NOW - self._IN_BAND_AGE)
+        self._drive(worker, 100)
+
+        second = _mkdir_worktree(git_ops, '_merge-two', mtime=self._NOW - self._IN_BAND_AGE)
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_queue'):
+            self._drive(worker, 1, start_poll=100)   # poll 101 — the change
+            change_lines = list(_audit_lines(caplog))
+            self._drive(worker, 1, start_poll=101)   # poll 102 — due again
+
+        assert len(change_lines) == 1
+        message = change_lines[0].getMessage()
+        assert '2 violation(s) found' in message
+        assert str(first.resolve()) in message
+        assert str(second.resolve()) in message, 'the change line must be full detail'
+        assert 'unchanged for ' not in message, 'a change is not a coalesced repeat'
+
+        # The schedule RESTARTED (interval back to 1) rather than resuming the
+        # 32-poll interval the previous fingerprint had backed off to.
+        assert len(_audit_lines(caplog)) == 2, (
+            'the poll immediately after a change must be due again, got '
+            f'{[r.getMessage() for r in _audit_lines(caplog)]}'
+        )
+
+    def test_removing_one_of_two_leaks_reports_immediately(
+        self, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """(f) Reclamation is a real event and must never be swallowed."""
+        worker = self._worker(git_ops)
+        worker.RESOURCE_AUDIT_LOG_COALESCE_CAP_POLLS = 10_000
+        kept = _mkdir_worktree(git_ops, '_merge-kept', mtime=self._NOW - self._IN_BAND_AGE)
+        gone = _mkdir_worktree(git_ops, '_merge-gone', mtime=self._NOW - self._IN_BAND_AGE)
+        self._drive(worker, 100)
+
+        gone_path = str(gone.resolve())
+        gone.rmdir()
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_queue'):
+            self._drive(worker, 1, start_poll=100)
+
+        lines = _audit_lines(caplog)
+        assert len(lines) == 1
+        message = lines[0].getMessage()
+        assert '1 violation(s) found' in message
+        assert str(kept.resolve()) in message
+        assert gone_path not in message
+        assert 'unchanged for ' not in message
+
+    # ── (g)/(h)/(i) everything else is untouched ────────────────────────────
+
+    def test_detection_is_untouched_by_coalescence(self, git_ops: GitOps) -> None:
+        """(g) Coalescence changes logging only, never what the audit sees."""
+        worker = self._worker(git_ops)
+        worker.RESOURCE_AUDIT_LOG_COALESCE_CAP_POLLS = 10_000
+        wt = _mkdir_worktree(git_ops, '_merge-leak', mtime=self._NOW - self._IN_BAND_AGE)
+        self._drive(worker, 512)
+
+        violations = worker.worktree_ledger_violations(now=self._NOW + 512 * self._POLL_S)
+        assert len(violations) == 1
+        assert str(wt.resolve()) in violations[0]
+        assert worker.snapshot()['resource_audit']['worktree_ledger']
+
+    def test_escalation_still_fires_on_a_poll_whose_log_line_was_suppressed(
+        self, git_ops: GitOps,
+    ) -> None:
+        """(h) THE regression guard. The gate sits in the LOGGING arm only —
+        never in front of the escalation predicate.
+
+        With the default streak threshold of 3, poll 3 is a SUPPRESSED poll
+        (due polls are 1, 2, 4, ...), so this fails loudly if the gate were
+        ever hoisted above the streak/escalation block.
+        """
+        fake_eq = _FakeEscalationQueue(open_l1=False)
+        worker = self._worker(git_ops, fake_eq)
+        worker.RESOURCE_AUDIT_LOG_COALESCE_CAP_POLLS = 10_000
+        worker._speculation_slot._value -= 1  # forced, PERSISTING permit leak
+        n = worker.RESOURCE_AUDIT_ESCALATION_STREAK
+        assert n == 3, 'this test is written against the shipped threshold'
+
+        self._drive(worker, n)
+
+        assert len(fake_eq.submitted) == 1, (
+            f'the L1 must fire on poll {n} even though that poll s log line '
+            f'was coalesced away, got {fake_eq.submitted!r}'
+        )
+        assert fake_eq.submitted[0].category == 'merge_resource_leak'
+
+    def test_streak_is_untouched_by_coalescence(self, git_ops: GitOps) -> None:
+        """(i) The streak counts violating heartbeats, not emitted lines."""
+        worker = self._worker(git_ops)
+        worker.RESOURCE_AUDIT_LOG_COALESCE_CAP_POLLS = 10_000
+        _mkdir_worktree(git_ops, '_merge-leak', mtime=self._NOW - self._IN_BAND_AGE)
+        self._drive(worker, 512)
+
+        assert worker._resource_audit_violation_streak == 512
