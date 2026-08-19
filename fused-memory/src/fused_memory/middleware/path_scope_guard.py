@@ -113,7 +113,7 @@ _SEG: str = r'[A-Za-z0-9_.\-]+'
 # file extension.  NOTE: the interval quantifier is written {{1,6}} here
 # because this is an f-string; braces in the RENDERED value are not
 # re-processed when it is interpolated into _build_pattern below.
-_RIGHT_CONTEXT: str = rf'(?={_SEG}/|[A-Za-z0-9_\-]*\.[A-Za-z0-9]{{1,6}}(?![A-Za-z0-9]))'
+_RIGHT_CONTEXT: str = rf'(?={_SEG}/|[A-Za-z0-9_\-]*\.[A-Za-z]{{1,6}}(?![A-Za-z0-9]))'
 
 
 def _build_pattern(prefixes: tuple[str, ...]) -> re.Pattern[str]:
