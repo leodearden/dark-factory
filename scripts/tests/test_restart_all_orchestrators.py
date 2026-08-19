@@ -746,6 +746,22 @@ _HB_IDLE = {"merge_idle": True}  # fresh + drained
 # can't carry a call-time value.
 _HB_STALE = {"merge_idle": True, "ts_epoch": time.time() - 99999}
 
+# Every timeline below polls at this cadence; named so the offsets DERIVED
+# from it (immediately below) move together with it instead of each test
+# repeating a bare "1" string for ORCH_DRAIN_POLL_INTERVAL_SECS
+# (reviewer_comprehensive #1).
+_TIMELINE_POLL_INTERVAL_SECS = 1
+# The delay before a timeline's FIRST transition. It must clear both the
+# subprocess's own startup and drain_gate's first heartbeat read -- fast under
+# no load (~0.2s observed) but NOT bounded -- with margin to spare: if a
+# loaded box pushes that first read out past this point, the read observes
+# the ALREADY-flipped heartbeat instead of the pre-timeline value, and every
+# assertion that depends on the pre-flip behaviour (starting with the initial
+# "deferring" line every one of these tests asserts on) fails for a reason
+# unrelated to the drain_gate branch under test. Three poll intervals rather
+# than a bare `2.0`, so the margin scales if the poll interval ever does.
+_FIRST_TRANSITION_DELAY_SECS = 3 * _TIMELINE_POLL_INTERVAL_SECS
+
 
 @contextlib.contextmanager
 def _heartbeat_timeline(fleet_dir, unit, timeline):
@@ -848,7 +864,9 @@ def test_busy_unit_that_drains_mid_defer_resumes_and_restarts(tmp_path):
     # instead of force-firing early and looking like a pass.
     spawn_timeout = 15
 
-    with _heartbeat_timeline(fleet_dir, UNIT_R, [("idle", 2.0, _HB_IDLE)]) as fired:
+    with _heartbeat_timeline(
+        fleet_dir, UNIT_R, [("idle", _FIRST_TRANSITION_DELAY_SECS, _HB_IDLE)],
+    ) as fired:
         result = _run_script(
             bin_dir, state_path, fleet_dir, "--drain",
             env={
@@ -856,7 +874,7 @@ def test_busy_unit_that_drains_mid_defer_resumes_and_restarts(tmp_path):
                 "ORCH_RESTART_FORCE_FIRE_AFTER_SECS": str(
                     wait_proof_grace_secs(spawn_timeout)
                 ),
-                "ORCH_DRAIN_POLL_INTERVAL_SECS": "1",
+                "ORCH_DRAIN_POLL_INTERVAL_SECS": str(_TIMELINE_POLL_INTERVAL_SECS),
             },
             timeout=spawn_timeout,
         )
@@ -919,7 +937,7 @@ def test_unit_that_stops_heartbeating_mid_defer_drops_into_the_shorter_grace(
     spawn_timeout = 15
 
     with _heartbeat_timeline(
-        fleet_dir, UNIT_R, [(verdict_label, 2.0, overrides)],
+        fleet_dir, UNIT_R, [(verdict_label, _FIRST_TRANSITION_DELAY_SECS, overrides)],
     ) as fired:
         result = _run_script(
             bin_dir, state_path, fleet_dir, "--drain",
@@ -929,7 +947,7 @@ def test_unit_that_stops_heartbeating_mid_defer_drops_into_the_shorter_grace(
                     wait_proof_grace_secs(spawn_timeout)
                 ),
                 "ORCH_DRAIN_UNKNOWN_GRACE_SECS": "0",
-                "ORCH_DRAIN_POLL_INTERVAL_SECS": "1",
+                "ORCH_DRAIN_POLL_INTERVAL_SECS": str(_TIMELINE_POLL_INTERVAL_SECS),
             },
             timeout=spawn_timeout,
         )
@@ -995,7 +1013,7 @@ def test_unit_that_drains_during_the_unknown_grace_resumes_after_the_await(tmp_p
 
     with _heartbeat_timeline(
         fleet_dir, UNIT_R,
-        [("stale", 2.0, _HB_STALE), ("idle", 8.0, _HB_IDLE)],
+        [("stale", _FIRST_TRANSITION_DELAY_SECS, _HB_STALE), ("idle", 8.0, _HB_IDLE)],
     ) as fired:
         result = _run_script(
             bin_dir, state_path, fleet_dir, "--drain",
@@ -1005,7 +1023,7 @@ def test_unit_that_drains_during_the_unknown_grace_resumes_after_the_await(tmp_p
                 "ORCH_DRAIN_UNKNOWN_GRACE_SECS": str(
                     wait_proof_grace_secs(spawn_timeout)
                 ),
-                "ORCH_DRAIN_POLL_INTERVAL_SECS": "1",
+                "ORCH_DRAIN_POLL_INTERVAL_SECS": str(_TIMELINE_POLL_INTERVAL_SECS),
             },
             timeout=spawn_timeout,
         )
@@ -1048,18 +1066,29 @@ def test_busy_stale_busy_oscillation_does_not_reset_the_force_fire_anchor(tmp_pa
     must NOT get a fresh force-fire deadline on the second busy reading --
     the deadline is anchored to when the unit FIRST went busy.
 
-    A scheduled idle "trap" at t=12 is what makes this a TEXT-level
+    A scheduled idle "trap" at t=15 is what makes this a TEXT-level
     assertion rather than a wall-clock one, which is deliberately NOT
-    "simplified" into a timing check:
-      - Anchor PRESERVED (correct): the busy reading lands at t~8, and the
-        very next top-of-loop check sees elapsed(8) >= FORCE_FIRE(6) and
-        force-fires BEFORE any further sleep. The script exits at ~9.6s and
-        never reads the heartbeat again, so the t=12 trap is unreachable --
-        `fired` stays ["stale", "busy"].
-      - Anchor RESET (the regression): start_secs restarts at t~8, so the
-        loop keeps polling, reaches the trap at t=12, and prints
-        "resuming restart of <unit>: drained" with NO force line (its own
-        deadline would not have been until t~14).
+    "simplified" into a timing check. The trap must sit strictly BETWEEN two
+    deadlines that differ only by whether the anchor reset, so the margin on
+    BOTH sides is the point (reviewer_comprehensive #1: the original t=12
+    trap, timed to sit just after an elapsed(8) >= FORCE_FIRE(6) force-fire,
+    measured as little as ~1.5s clear of the correct-path exit under 2x CPU
+    oversubscription). FORCE_FIRE=10 here (not 6) is what buys that margin:
+    it holds the correct path's force-fire a couple of poll cycles AFTER
+    busy is redetected at t~8 instead of on the very next check, which pushes
+    the reset path's hypothetical deadline out to ~18-19 and opens a wider
+    window to place the trap in.
+      - Anchor PRESERVED (correct): busy is redetected at t~8-9, still short
+        of the UNRESET deadline (start~0 + FORCE_FIRE(10) = ~10). The outer
+        loop force-fires the first time elapsed reaches 10 -- around
+        t~10-11 -- and never reads the heartbeat again, so the t=15 trap is
+        unreachable: `fired` stays ["stale", "busy"].
+      - Anchor RESET (the regression): start_secs restarts at t~8-9, so the
+        new deadline is ~8-9 + FORCE_FIRE(10) = ~18-19 -- AFTER the trap.
+        The loop keeps polling past t=15, its own (unguarded-by-FORCE_FIRE)
+        idle check reads the trap's heartbeat, and it prints "resuming
+        restart of <unit>: drained" with NO force line (the reset deadline
+        would not have been reached until t~18-19).
     The two counterfactuals differ in OUTPUT, not merely in duration, so the
     assertions below are text-level: exactly two defer lines (the initial
     one plus the re-defer after the stale interlude -- itself independent
@@ -1073,26 +1102,31 @@ def test_busy_stale_busy_oscillation_does_not_reset_the_force_fire_anchor(tmp_pa
     _write_heartbeat(fleet_dir, UNIT_R, **_HB_BUSY)
 
     # ORCH_DRAIN_UNKNOWN_GRACE_SECS is a must-never-elapse bound here (the
-    # unit resumes busy on its own at t=8, well inside it).
-    spawn_timeout = 20
+    # unit resumes busy on its own at t=8, well inside it). Capped at 22
+    # (rather than pushed higher for even more trap margin) because
+    # wait_proof_grace_secs(22)=88 is the largest multiple of this spawn
+    # timeout that still stays inside LEAK_SELF_TERMINATION_CEILING_SECS
+    # (90s, df_pytest_isolation.py) -- see design_decisions in this task's
+    # plan.json for why that ceiling is load-bearing.
+    spawn_timeout = 22
 
     with _heartbeat_timeline(
         fleet_dir, UNIT_R,
         [
-            ("stale", 2.0, _HB_STALE),
+            ("stale", _FIRST_TRANSITION_DELAY_SECS, _HB_STALE),
             ("busy", 8.0, _HB_BUSY),
-            ("idle-trap", 12.0, _HB_IDLE),
+            ("idle-trap", 15.0, _HB_IDLE),
         ],
     ) as fired:
         result = _run_script(
             bin_dir, state_path, fleet_dir, "--drain",
             env={
                 "RESTART_VERIFY_TIMEOUT": "5",
-                "ORCH_RESTART_FORCE_FIRE_AFTER_SECS": "6",
+                "ORCH_RESTART_FORCE_FIRE_AFTER_SECS": "10",
                 "ORCH_DRAIN_UNKNOWN_GRACE_SECS": str(
                     wait_proof_grace_secs(spawn_timeout)
                 ),
-                "ORCH_DRAIN_POLL_INTERVAL_SECS": "1",
+                "ORCH_DRAIN_POLL_INTERVAL_SECS": str(_TIMELINE_POLL_INTERVAL_SECS),
             },
             timeout=spawn_timeout,
         )
@@ -1107,7 +1141,7 @@ def test_busy_stale_busy_oscillation_does_not_reset_the_force_fire_anchor(tmp_pa
         f"stale/absent handoff; got count={defer_count} stdout={result.stdout!r}"
     )
     assert f"force-restarting {UNIT_R}" in result.stdout, (
-        f"expected the anchor to force-fire once elapsed(8) >= 6; got "
+        f"expected the anchor to force-fire once elapsed(~8-9) >= 10; got "
         f"stdout={result.stdout!r}"
     )
     # THE ANCHOR PROOF -- see the docstring's two counterfactuals.
