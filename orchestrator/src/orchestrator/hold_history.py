@@ -723,19 +723,18 @@ class HoldHistory:
         """
         wanted = str(task_id)
         now_f = float(now)
-        # Pre-sweep, so the age reported below is the OLDEST DROPPED hold's — the
-        # value this message has always carried.  (Step 4 rewrites the message.)
-        oldest = min(
-            (start for (tid, _module), start in self._open.items() if tid == wanted),
-            default=now_f,
-        )
         dropped = self._sweep_stale_open(wanted, now_f)
         starts = [start for (tid, _module), start in self._open.items() if tid == wanted]
         if dropped:
+            # Names ONLY the swept modules and counts the survivors: an operator
+            # must not mistake a live hold for a consumed one, and the outcome is
+            # no longer knowable in advance, so the message asserts neither.
+            # Still a WARNING even when the prediction survives — a hold that
+            # reached the ceiling is a missed release however the call resolves.
             logger.warning(
-                'hold_history: task %s has open hold(s) %.0fs old (> %.0fs) — '
-                'treating as a missed release and dropping them; no prediction',
-                wanted, now_f - oldest, self._stale_open_secs,
+                'hold_history: task %s — dropped %d open hold(s) older than %.0fs as missed '
+                'release(s): %s; %d open hold(s) remain',
+                wanted, len(dropped), self._stale_open_secs, dropped, len(starts),
             )
         if not starts:
             return None
