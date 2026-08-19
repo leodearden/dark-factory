@@ -6811,6 +6811,10 @@ class TestRunCancellationReapsChild:
     ``_run`` on timeout. Before the fix, the spawned child kept running as
     an orphan with its stdout/stderr pipes open, leaking a process + FDs on
     every scheduler sweep for a persistently-hung script.
+
+    Both tests below arrange through ``_start_hung_child``, which returns
+    only once the child has published its pid, so neither cancellation path
+    depends on interpreter-startup timing (task 4109).
     """
 
     async def test_timeout_kills_and_reaps_hung_child(self, tmp_path: Path) -> None:
@@ -6832,16 +6836,7 @@ class TestRunCancellationReapsChild:
 
     async def test_cancelled_error_kills_and_reaps_child(self, tmp_path: Path) -> None:
         pid_file = tmp_path / 'child.pid'
-        # Atomic tmp-write + rename — see _wait_for_child_pid (task 3851).
-        script = (
-            'import os, time\n'
-            f"tmp = {str(pid_file)!r} + '.tmp'\n"
-            "open(tmp, 'w').write(str(os.getpid()))\n"
-            f"os.replace(tmp, {str(pid_file)!r})\n"
-            'time.sleep(60)\n'
-        )
-        task = asyncio.ensure_future(_run(['python3', '-c', script]))
-        child_pid = await _wait_for_child_pid(pid_file)
+        task, child_pid = await _start_hung_child(pid_file)
 
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
