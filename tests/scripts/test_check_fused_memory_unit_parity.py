@@ -11,7 +11,6 @@ mirroring the pattern in tests/scripts/test_orchestrator_watchdog.py::_load_watc
 
 import importlib.util
 import pathlib
-import re
 import subprocess
 import sys
 import types
@@ -686,13 +685,17 @@ def test_parity_checker_callable_as_subprocess(tmp_path: pathlib.Path):
 _GATE_START = "_fm_parity_script="
 _GATE_END = "\nfi\n"
 
-# The status is believed only when the checker's own report is present. Unlike
-# the dashboard and orchestrator checkers, this one defines no LOG_TAG (it is
-# read-only for this task), so the gate greps the bracketed markers it does
-# emit. `_gate_report_lines` is that same regex; test_gate_markers_appear_on_
-# every_real_exit_path_and_neither_collision below is the contract pin that
-# keeps this vocabulary from drifting out from under the gate.
-_REPORT_MARKER_RE = re.compile(r"^\[(ok|skip|drift|fixed)\]", re.MULTILINE)
+# The status is believed only when the checker's own tag is present — the same
+# test the dashboard, orchestrator and lms gates apply, which the checker's
+# LOG_TAG (task 3909) made available on this side too. Not line-anchored and
+# not a regex in the gate itself: setup-host.sh uses bash's own
+# `[[ "$out" != *'[fused_memory_unit_parity]'* ]]` containment test.
+# Containment is safe here where a bare `[ok]` alternation was not, because no
+# imposter emits this string — measured on both, below.
+#
+# test_gate_tag_appears_on_every_real_exit_path_and_neither_collision is the
+# contract pin keeping the tag from drifting out from under the gate.
+_REPORT_TAG = "[fused_memory_unit_parity]"
 
 
 def _gate_repo(
@@ -750,18 +753,21 @@ _USAGE_ERROR_CHECKER = usage_error_checker(
 )
 
 
-def test_gate_markers_appear_on_every_real_exit_path_and_neither_collision(
+def test_gate_tag_appears_on_every_real_exit_path_and_neither_collision(
     tmp_path: pathlib.Path,
 ):
-    """CONTRACT PIN: the marker vocabulary the gate is about to depend on.
+    """CONTRACT PIN: the TAG the gate depends on, on every path that produced it.
 
-    check_fused_memory_unit_parity.py has no LOG_TAG, so the gate believes a
-    status only when a line matching ^\\[(ok|skip|drift|fixed)\\] is present.
-    The dashboard side has its equivalent contract guarded already
-    (test_main_every_emitted_line_carries_the_log_tag); this side had nothing,
-    so pin it here. A future change to the checker's output then fails as a
-    legible contract-test failure, instead of silently wedging the installer's
-    gate into permanent "it did not run".
+    The gate believes a status only when the checker's own
+    [fused_memory_unit_parity] tag is in the captured output.
+    test_main_every_emitted_line_carries_the_log_tag pins that the checker puts
+    it on every line it emits; this pins the other half — that the three REAL
+    exit paths each emit something, and that NEITHER exit-2 imposter does.
+    Together they make the gate's inference sound in both directions.
+
+    A future change to the checker's output then fails as a legible
+    contract-test failure, instead of silently wedging the installer's gate
+    into permanent "it did not run".
 
     stdout and stderr are MERGED throughout, because the [skip] line and the
     drift trailer go to stderr — which is also why the gate captures 2>&1.
@@ -780,36 +786,36 @@ def test_gate_markers_appear_on_every_real_exit_path_and_neither_collision(
     parity = _write_unit(tmp_path, template, name="parity.service")
     rc, out = _merged([str(CHECKER_PATH), "--installed", str(parity)])
     assert rc == 0, out
-    assert _REPORT_MARKER_RE.search(out), f"exit 0 emitted no report marker:\n{out}"
+    assert _REPORT_TAG in out, f"exit 0 emitted no tagged report:\n{out}"
 
     # exit 1 — a required directive removed.
     drifted = _write_unit(tmp_path, _MISSING_MEM0_UNIT, name="drifted.service")
     rc, out = _merged([str(CHECKER_PATH), "--installed", str(drifted)])
     assert rc == 1, out
-    assert _REPORT_MARKER_RE.search(out), f"exit 1 emitted no report marker:\n{out}"
+    assert _REPORT_TAG in out, f"exit 1 emitted no tagged report:\n{out}"
 
     # exit 2 — the installed unit is absent.
     rc, out = _merged(
         [str(CHECKER_PATH), "--installed", str(tmp_path / "nonexistent.service")]
     )
     assert rc == 2, out
-    assert _REPORT_MARKER_RE.search(out), f"exit 2 emitted no report marker:\n{out}"
+    assert _REPORT_TAG in out, f"exit 2 emitted no tagged report:\n{out}"
 
     # COLLISION 1 — argparse usage error also exits 2. Its output carries
-    # bracketed tokens ([-h], [--fix]), but they are flag spellings, and the
-    # wrapped usage continuation is indented — so nothing matches at line start.
+    # bracketed tokens ([-h], [--fix]) and names the script, but neither is the
+    # tag: `usage: check_fused_memory_unit_parity.py` carries no brackets around
+    # the name, and the flag spellings are not it.
     rc, out = _merged([str(CHECKER_PATH), "--bogus"])
     assert rc == 2, out
-    assert not _REPORT_MARKER_RE.search(out), (
+    assert _REPORT_TAG not in out, (
         f"An argparse usage error must NOT look like a report:\n{out}"
     )
 
     # COLLISION 2 — python3 refusing to open a renamed/moved script also exits
-    # 2. Its message carries `[Errno 2]`, which is mid-line and not in the
-    # alternation.
+    # 2. Its message carries `[Errno 2]` and the bare (bracket-free) path.
     rc, out = _merged([str(tmp_path / "check_fused_memory_unit_parity_RENAMED.py")])
     assert rc == 2, out
-    assert not _REPORT_MARKER_RE.search(out), (
+    assert _REPORT_TAG not in out, (
         f"A missing script must NOT look like a report:\n{out}"
     )
 
@@ -864,6 +870,42 @@ def test_gate_usage_error_does_not_read_as_not_installed(tmp_path: pathlib.Path)
     assert "FAIL " in result.stdout, (
         f"A gate that did not run must say so loudly.\n{result.stdout}"
     )
+
+
+# A checker that RAN and reported in the legacy marker vocabulary, exiting 0,
+# but emits no tag — what reshaping or replacing the checker would produce.
+# The bare `[ok]` is deliberate: it is precisely what the gate used to believe.
+_UNTAGGED_OK_CHECKER = (
+    "import sys\n"
+    "print('[ok] parity — all required directives present.')\n"
+    "sys.exit(0)\n"
+)
+
+
+def test_gate_untagged_report_is_not_believed(tmp_path: pathlib.Path):
+    """A checker reporting WITHOUT the tag gets no verdict, even exiting 0.
+
+    The failure this closes is not a renamed script or a rejected flag — both
+    already covered — but a checker that was RESHAPED or REPLACED. Exit 0 plus
+    a plausible-looking report is the most believable possible input, and it is
+    still not evidence about this host unless the tag says which script
+    produced it. The old marker alternation believed exactly this stub.
+    """
+    repo = _gate_repo(tmp_path, checker_body=_UNTAGGED_OK_CHECKER)
+    unit_dir = _gate_unit_dir(
+        tmp_path, content=TEMPLATE_PATH.read_text(encoding="utf-8")
+    )
+
+    result = _run_gate(tmp_path, repo, unit_dir)
+
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert "FAIL " in result.stdout, (
+        f"An untagged report must not be believed.\n{result.stdout}"
+    )
+    assert "OK " not in result.stdout, (
+        f"An untagged exit 0 was reported as a verdict.\n{result.stdout}"
+    )
+    assert "parity with template" not in result.stdout, result.stdout
 
 
 def test_gate_reports_parity_when_the_installed_unit_matches(
