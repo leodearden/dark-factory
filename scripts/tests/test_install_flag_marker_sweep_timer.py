@@ -138,12 +138,6 @@ def _systemctl_calls(tmp_path):
     return json.loads(state_path.read_text())["calls"]
 
 
-def _call_index(calls, call):
-    """Index of *call* within *calls* -- used to assert the relative
-    ordering of recorded systemctl invocations."""
-    return calls.index(call)
-
-
 # ---------------------------------------------------------------------------
 # Script driver
 # ---------------------------------------------------------------------------
@@ -200,8 +194,8 @@ def test_install_copies_units_enables_timer_and_kicks_drain(tmp_path):
     assert ["enable", "--now", TIMER_NAME] in calls, f"calls={calls!r}"
     assert ["start", SERVICE_NAME] in calls, f"calls={calls!r}"
     assert ["list-timers", "--all"] in calls, f"calls={calls!r}"
-    assert _call_index(calls, ["list-timers", "--all"]) < _call_index(
-        calls, ["start", SERVICE_NAME]
+    assert calls.index(["list-timers", "--all"]) < calls.index(
+        ["start", SERVICE_NAME]
     ), (
         "Expected the list-timers self-verify to run BEFORE the one-time "
         "drain kick (systemctl start): the drain runs a blocking "
@@ -258,11 +252,17 @@ def test_self_verify_runs_even_when_drain_kick_fails(tmp_path):
         f"drain kick (systemctl start) failed; calls={calls!r}"
     )
     assert ["start", SERVICE_NAME] in calls, f"calls={calls!r}"
-    assert _call_index(calls, ["list-timers", "--all"]) < _call_index(
-        calls, ["start", SERVICE_NAME]
+    assert calls.index(["list-timers", "--all"]) < calls.index(
+        ["start", SERVICE_NAME]
     ), (
         "Expected the list-timers self-verify to precede the (failing) "
         f"one-time drain kick; calls={calls!r}"
+    )
+    assert TIMER_NAME in result.stdout and "installed and enabled" in result.stdout, (
+        f"Expected the install-succeeded signal (naming {TIMER_NAME!r}) to "
+        f"still be emitted on stdout even though the drain kick failed -- "
+        f"the operator must be told the timer IS armed regardless; "
+        f"stdout={result.stdout!r}"
     )
     assert result.returncode != 0, (
         f"Expected a failing drain kick to still exit non-zero; "
@@ -273,17 +273,15 @@ def test_self_verify_runs_even_when_drain_kick_fails(tmp_path):
     # SCRIPT itself, not just visible via the fake systemctl's generic
     # 'Job for <unit> failed...' message (which is already in stderr today
     # and would make a bare `SERVICE_NAME in result.stderr` check a false
-    # GREEN).
-    assert "one-time drain kick failed" in result.stderr, (
-        f"Expected the script's own stderr to attribute the failure to "
-        f"the one-time drain kick, distinct from the fake systemctl's "
-        f"generic 'Job for ... failed' message; stderr={result.stderr!r}"
-    )
-    drain_failure_lines = [
-        line for line in result.stderr.splitlines()
-        if "one-time drain kick failed" in line
+    # GREEN). Select the script's own line by its `ERROR:` prefix -- the
+    # fake's message carries no such prefix -- rather than pinning exact
+    # prose, so a benign rewording of the message doesn't break this test.
+    own_error_lines = [
+        line for line in result.stderr.splitlines() if line.startswith("ERROR:")
     ]
-    assert drain_failure_lines and SERVICE_NAME in drain_failure_lines[0], (
-        f"Expected the script's own drain-kick-failed message to name "
-        f"{SERVICE_NAME!r}; stderr={result.stderr!r}"
+    assert own_error_lines and SERVICE_NAME in own_error_lines[0], (
+        f"Expected the script's own ERROR: line to attribute the failure "
+        f"to the one-time drain kick and name {SERVICE_NAME!r}, distinct "
+        f"from the fake systemctl's generic 'Job for ... failed' message; "
+        f"stderr={result.stderr!r}"
     )
