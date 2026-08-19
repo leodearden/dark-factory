@@ -34,6 +34,14 @@ RAISES is ``verification_error``, never a repair — unknown is not absent. A ru
 that is still live is refused outright, because the harness rewrites the whole
 ``stage_reports`` blob at each stage end and would silently clobber the repair.
 
+Journal I/O that raises is reported too, not thrown: ``journal_error`` carries
+the ``phase`` that failed (read / write / verify) and a hint saying whether
+anything was written — a read-only data dir is the failure this path has
+actually hit. And a repair that IS written but does not survive the
+read-after-write check (another writer rewrote the whole blob in between) is
+reported as ``repair_clobbered`` rather than a false ``repaired``. Every one of
+those exits 1; only ``status: repaired`` / ``status: dry_run`` exits 0.
+
 The incident this was written for
 ---------------------------------
 Run ``06a4466d-cdc0-49ac-8e99-e6723be39392`` (project ``reify``, completed

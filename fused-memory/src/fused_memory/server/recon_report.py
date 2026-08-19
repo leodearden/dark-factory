@@ -3010,8 +3010,16 @@ def create_recon_report_server(state: ReconReportState):  # -> FastMCP
         citation_not_dangling (the cited memory still resolves);
         replacement_not_found; verification_error (a lookup RAISED — unknown is
         not absent, so nothing is written); run_still_live (the target run is
-        not finished — use cite_memory/delete_finding within a live run);
-        run_id_unknown; journal_unavailable; service_not_configured.
+        not finished — use cite_memory/delete_finding within a live run; it
+        reports the row's own status under run_status, never under status);
+        journal_error (journal I/O raised — 'phase' says read/write/verify and
+        the hint says whether anything was written); repair_clobbered (the write
+        was made but a re-read does not show it, so another writer rewrote the
+        blob — retry when the run is quiescent); run_id_unknown;
+        journal_unavailable; service_not_configured.
+
+        On success 'status' is 'repaired'; every refusal above is keyed by
+        'error' and carries no 'status', so 'status' is safe to branch on.
         """
         return await state.repair_memory_citation(
             run_id=run_id,

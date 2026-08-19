@@ -142,6 +142,33 @@ _ERR_RUN_STILL_LIVE: dict[str, str] = {
     'error_type': 'ReconCitationRunStillLive',
 }
 
+# Journal I/O that RAISED — the SQLite half of the no-silent-fail split the Mem0
+# reads already make. aiosqlite surfaces a read-only data dir, a lock timeout or
+# a disk error as an OperationalError, and letting that propagate out of an MCP
+# tool (or out of a running stage) is exactly the unstructured failure INV-2
+# forbids. Not hypothetical: the first attempt at the incident repair died as
+# ``sqlite3.OperationalError: attempt to write a readonly database`` instead of
+# refusing legibly.
+_ERR_JOURNAL_ERROR: dict[str, str] = {
+    'error': 'journal_error',
+    'error_type': 'ReconCitationJournalError',
+}
+
+# The write was issued but did NOT survive: the read-after-write check could not
+# find THIS repair in the durable blob. Two real producers, neither of which the
+# terminal-status allowlist can see, because in both the row already reads
+# terminal: harness calls ``complete_run(...)`` BEFORE its trailing
+# ``update_run_stage_reports(...)``, so there is a window in which a completed
+# run still has a writer holding a loaded copy it is about to write back
+# wholesale; and two concurrent repairs each read-modify-write the WHOLE blob, so
+# the later write silently drops the earlier one's provenance record. Returning
+# ``repaired`` for a repair that was overwritten is the precise "worse than a
+# clean refusal" outcome REPAIRABLE_RUN_STATUSES' own comment exists to prevent.
+_ERR_REPAIR_CLOBBERED: dict[str, str] = {
+    'error': 'repair_clobbered',
+    'error_type': 'ReconCitationRepairClobbered',
+}
+
 # Cross-project isolation. ``reconciliation.data_dir`` holds ONE journal for
 # every project this process reconciles, so ``get_run(target_run_id)`` will
 # happily resolve a run owned by someone else. Without this gate a Stage-1/
@@ -181,19 +208,52 @@ def build_citation_repair_record(
     }
 
 
-def _fingerprint_from_record(record: Any) -> dict[str, Any]:
-    """The mem0 ``metadata_fingerprint`` shape, from a ``get_memory_by_id`` record.
+# What an operator needs to know for each phase of journal I/O: whether
+# anything was written. Declared per phase because that answer is the only
+# question a backend error raises, and a generic "the journal failed" leaves it
+# unanswered.
+_JOURNAL_ERROR_HINTS: dict[str, str] = {
+    'read': (
+        'the target run could not be READ, so nothing was written and the '
+        'durable stage_reports blob is unchanged. Resolve the backend error (a '
+        'missing DB file, a lock timeout, an unreadable data dir) and re-run.'
+    ),
+    'write': (
+        'the journal write RAISED, so the repair was NOT applied — SQLite '
+        'commits atomically, so the durable stage_reports blob is unchanged and '
+        'no partial rewrite is possible. Resolve the backend error (a read-only '
+        'data dir is the one this path has actually hit) and re-run.'
+    ),
+    'verify': (
+        'the write was issued but the read-after-write verification could not '
+        'be performed, so whether the repair persisted is UNKNOWN. Re-read the '
+        'run before re-running: on an already-repaired finding a re-run answers '
+        'citation_not_present and changes nothing.'
+    ),
+}
 
-    Same ``{category, agent_id, created_at}`` triple ``MemoryService.get_memory``
-    returns for a mem0 citation, so a repaired citation is shaped exactly like
-    one ``cite_memory`` would have written. Built from the record the
-    corroboration read already fetched rather than a second service call.
+
+def _journal_error(phase: str, target_run_id: str, exc: BaseException) -> dict[str, Any]:
+    """The verdict for journal I/O that RAISED.
+
+    The SQLite mirror of :func:`_verification_error`: the raised type and
+    message are carried as structured facts rather than propagating out of an
+    MCP tool or a stage. ``phase`` (read / write / verify) is what tells the
+    caller whether the durable blob could have been touched.
     """
-    payload = (record or {}).get('metadata') or {}
-    return {
-        'category': payload.get('category'),
-        'agent_id': payload.get('agent_id'),
-        'created_at': payload.get('created_at'),
+    logger.warning(
+        'citation_repair: journal %s for run %s raised %s: %s',
+        phase,
+        target_run_id,
+        type(exc).__name__,
+        exc,
+    )
+    return _ERR_JOURNAL_ERROR | {
+        'phase': phase,
+        'target_run_id': target_run_id,
+        'exception_type': type(exc).__name__,
+        'exception_message': str(exc),
+        'hint': _JOURNAL_ERROR_HINTS[phase],
     }
 
 
@@ -214,6 +274,39 @@ def _find_finding(
             if isinstance(finding, dict) and finding.get('finding_id') == finding_id:
                 return stage_name, report, finding
     return None
+
+
+def _repair_is_persisted(
+    run: Any,
+    finding_id: str,
+    memory_id: str,
+    replacement_memory_id: str | None,
+    repair_record: dict[str, Any],
+) -> bool:
+    """True when a RE-READ of the run shows this exact repair durably present.
+
+    Read-after-write, because the terminal-status allowlist structurally cannot
+    see the two windows in which a terminal-looking run still has a writer (see
+    ``_ERR_REPAIR_CLOBBERED``). Cheap — one point read on a path that already
+    did two Mem0 reads and a write — and it converts "reported repaired, then
+    silently overwritten" into a loud refusal.
+
+    Identity, not shape: ``repair_record`` carries this call's own
+    ``repaired_at``, so a look-alike record written by a CONCURRENT repair does
+    not satisfy the check.
+    """
+    located = _find_finding(run, finding_id)
+    if located is None:
+        return False
+    _stage, _report, finding = located
+    cited = finding.get('cited_memories') or []
+    if any(_is_citation_of(entry, memory_id) for entry in cited):
+        return False
+    if replacement_memory_id is not None and not any(
+        _is_citation_of(entry, replacement_memory_id) for entry in cited
+    ):
+        return False
+    return repair_record in (finding.get(CITATION_REPAIRS_KEY) or [])
 
 
 def _verification_error(memory_id: str, role: str, exc: BaseException) -> dict[str, Any]:
@@ -314,8 +407,11 @@ async def repair_memory_citation(
     its unchanged ``_resolve_entry`` contract and for stamping ``repaired_by``.
 
     Returns a structured dict: ``{'status': 'repaired'|'dry_run', ...}`` on
-    success, or one of the ``_ERR_*`` branches. Never raises for a backend
-    read failure — that is reported as ``verification_error``.
+    success, or one of the ``_ERR_*`` branches — every one of which is keyed by
+    ``error`` and carries NO ``status`` key, so ``status`` is unambiguously the
+    outcome discriminator and a consumer may branch on it. Never raises for a
+    backend failure: a Mem0 read that raises is ``verification_error``, and
+    journal I/O that raises is ``journal_error`` carrying the phase that failed.
 
     ``apply=False`` computes the whole outcome, INCLUDING both corroboration
     reads, and returns it without writing, so the operator script's dry-run and
@@ -363,7 +459,13 @@ async def repair_memory_citation(
         }
 
     # ── Resolution gates ──────────────────────────────────────────────────
-    run = await journal.get_run(target_run_id)
+    # Journal I/O is wrapped for the same reason the Mem0 reads are: aiosqlite
+    # raises OperationalError for a read-only data dir / lock timeout / disk
+    # error, and an MCP tool must answer with structured facts, not a traceback.
+    try:
+        run = await journal.get_run(target_run_id)
+    except Exception as exc:
+        return _journal_error('read', target_run_id, exc)
     if run is None:
         return _ERR_TARGET_RUN_NOT_FOUND | {'target_run_id': target_run_id}
 
@@ -394,7 +496,13 @@ async def repair_memory_citation(
     if status_value not in _REPAIRABLE_STATUS_VALUES or in_process:
         return _ERR_RUN_STILL_LIVE | {
             'target_run_id': target_run_id,
-            'status': status_value,
+            # ``run_status``, deliberately NOT ``status``: every success branch
+            # uses ``status`` as the OUTCOME discriminator ('repaired' |
+            # 'dry_run'), and a consumer that branches on it (the operator
+            # script's ``exit_code_for`` does exactly that) must never be handed
+            # a RUN status under that key. The two vocabularies only fail to
+            # collide by luck today; one key, one meaning removes the luck.
+            'run_status': status_value,
             'hint': _run_still_live_hint(target_run_id, status_value, in_process),
         }
 
@@ -443,7 +551,7 @@ async def repair_memory_citation(
             ),
         }
 
-    replacement_record = None
+    replacement_fingerprint: dict[str, Any] | None = None
     if replacement_memory_id is not None:
         try:
             replacement_record = await memory_service.get_memory_by_id(
@@ -464,6 +572,27 @@ async def repair_memory_citation(
                     'citation instead of re-pointing it.'
                 ),
             }
+        # The fingerprint comes from ``MemoryService.get_memory`` — the SAME
+        # primitive ``cite_memory`` calls — so a repaired citation is
+        # byte-identical to the one an in-run citation would have written for
+        # this id. Deliberately NOT re-derived from the ``get_memory_by_id``
+        # record the corroboration read already holds: that returns the raw
+        # Qdrant payload, whose ``category``/``created_at`` sit in a different
+        # place than the mem0 record ``get_memory`` reads, so extracting here
+        # would be a second implementation of the fingerprint that agrees in
+        # SHAPE and can silently diverge in VALUE — exactly the lockstep
+        # duplication INV-5 forbids. One extra point read, on a path that
+        # already does two, buys one extraction site instead of two.
+        try:
+            replacement_fingerprint = await memory_service.get_memory(
+                replacement_memory_id, store, run.project_id
+            )
+        except Exception as exc:
+            # Includes the not-found raise: the id resolved a moment ago, so a
+            # miss here is a race, and a race is UNKNOWN — never a repair.
+            return _verification_error(
+                replacement_memory_id, 'replacement_fingerprint', exc
+            )
 
     # ── Compute the new citation list (no mutation yet) ───────────────────
     # The mutation is confined to cited_memories plus the appended provenance
@@ -486,7 +615,7 @@ async def repair_memory_citation(
                 {
                     'memory_id': replacement_memory_id,
                     'store': store,
-                    'metadata_fingerprint': _fingerprint_from_record(replacement_record),
+                    'metadata_fingerprint': replacement_fingerprint,
                 }
             )
 
@@ -511,14 +640,54 @@ async def repair_memory_citation(
         # "which entries would be removed" that must stay in lockstep (INV-5).
         return outcome
 
-    finding['cited_memories'] = kept
-    finding.setdefault(CITATION_REPAIRS_KEY, []).append(
-        build_citation_repair_record(
-            memory_id, replacement_memory_id, store, repaired_by
-        )
+    repair_record = build_citation_repair_record(
+        memory_id, replacement_memory_id, store, repaired_by
     )
+    finding['cited_memories'] = kept
+    finding.setdefault(CITATION_REPAIRS_KEY, []).append(repair_record)
 
-    await journal.update_run_stage_reports(target_run_id, run.stage_reports)
+    try:
+        await journal.update_run_stage_reports(target_run_id, run.stage_reports)
+    except Exception as exc:
+        return _journal_error('write', target_run_id, exc)
+
+    # Read-after-write. The status allowlist gates who MAY write; this confirms
+    # the write actually survived, which the allowlist structurally cannot know:
+    # harness completes a run BEFORE its trailing update_run_stage_reports, and
+    # a concurrent repair rewrites the whole blob from its own loaded copy. Both
+    # windows end here as repair_clobbered instead of a ``repaired`` verdict on
+    # a repair that quietly evaporated.
+    try:
+        persisted = await journal.get_run(target_run_id)
+    except Exception as exc:
+        return _journal_error('verify', target_run_id, exc)
+    if persisted is None or not _repair_is_persisted(
+        persisted, finding_id, memory_id, replacement_memory_id, repair_record
+    ):
+        logger.warning(
+            'citation_repair: run=%s finding=%s repair did not survive '
+            'read-after-write — another writer rewrote stage_reports',
+            target_run_id,
+            finding_id,
+        )
+        return _ERR_REPAIR_CLOBBERED | {
+            'target_run_id': target_run_id,
+            'stage': stage_name,
+            'finding_id': finding_id,
+            'memory_id': memory_id,
+            'replacement_memory_id': replacement_memory_id,
+            'hint': (
+                f'the repair of {finding_id} was written but a re-read of run '
+                f'{target_run_id} does not show it, so another writer rewrote '
+                'stage_reports from its own loaded copy in between. Known '
+                'producers: the harness completes a run BEFORE its trailing '
+                'update_run_stage_reports (so a just-completed run may still '
+                'have a writer), and a concurrent repair of the same run. '
+                'Re-run once the run is quiescent; nothing is left '
+                "half-applied, because the other writer's blob won wholesale."
+            ),
+        }
+
     logger.info(
         'citation_repair: run=%s stage=%s finding=%s removed=%s (x%d) -> replacement=%s by=%s',
         target_run_id,
