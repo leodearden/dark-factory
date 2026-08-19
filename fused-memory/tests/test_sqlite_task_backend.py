@@ -26,6 +26,7 @@ from fused_memory.backends.sqlite_task_backend import (
     _parse_qualified_dep,
     _parse_task_id,
     _resolve_metadata_mode,
+    _StatusWriteNotPersisted,
 )
 from fused_memory.backends.task_backend_errors import (
     DoneProvenanceWriteAuthorityError,
@@ -1161,6 +1162,31 @@ class _RowUpdateSuppressedBackend(SqliteTaskBackend):
         return
 
 
+class _WriteStatusSeamSpyBackend(SqliteTaskBackend):
+    """Test double: records every ``_write_status_and_verify`` call and
+    suppresses the write, so a caller that does NOT route through the
+    shared tail is detectable through the public API."""
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.seam_calls: list[dict] = []
+
+    async def _write_status_and_verify(self, conn, **kwargs):
+        # **kwargs (rather than mirroring the real helper's parameter list
+        # positionally) so this double can't silently mis-wire a call if the
+        # helper's signature is ever reordered — the real call sites pass
+        # everything but `conn` by keyword (task 4057 amendment), and a
+        # rename here would raise a loud KeyError instead of a silent
+        # mismatch.
+        self.seam_calls.append({
+            'caller_name': kwargs['caller_name'],
+            'write_desc': kwargs['write_desc'],
+            'set_columns': list(kwargs['set_columns']),  # snapshot, not aliased
+            'status': kwargs['status'],
+        })
+        raise _StatusWriteNotPersisted(kwargs['task_id'], kwargs['status'], 'seam-suppressed')
+
+
 @pytest.mark.asyncio
 async def test_set_task_status_reports_explicit_error_when_write_not_persisted(tmp_path):
     """Plain set_task_status: a suppressed UPDATE must not report success."""
@@ -1180,6 +1206,34 @@ async def test_set_task_status_reports_explicit_error_when_write_not_persisted(t
         'task_id': '1',
         'requested_status': 'done',
         'actual_status': 'pending',
+    }
+    assert task['status'] == 'pending'
+
+
+@pytest.mark.asyncio
+async def test_set_task_status_routes_through_write_status_and_verify(tmp_path):
+    """set_task_status must route through the shared `_write_status_and_verify`
+    tail (task 4057) instead of inlining its own copy of the claimant/
+    collision/read-back logic."""
+    project_root = str(tmp_path / 'proj')
+    spy = _WriteStatusSeamSpyBackend(TaskmasterConfig(project_root=project_root))
+    await spy.start()
+    try:
+        await spy.add_task(project_root=project_root, title='x')
+        result = await spy.set_task_status('1', 'done', project_root=project_root)
+        task = await spy.get_task('1', project_root=project_root)
+    finally:
+        await spy.close()
+
+    assert len(spy.seam_calls) == 1
+    call = spy.seam_calls[0]
+    assert call['set_columns'] == ['status = ?', 'updated_at = ?']
+    assert result == {
+        'success': False,
+        'error': 'status_write_not_persisted',
+        'task_id': '1',
+        'requested_status': 'done',
+        'actual_status': 'seam-suppressed',
     }
     assert task['status'] == 'pending'
 
@@ -1221,6 +1275,52 @@ async def test_set_status_and_stamp_audit_reports_explicit_error_when_write_not_
     }
     assert task['status'] == 'done'
     assert 'reopen_reason' not in (task['metadata'] or {})
+
+
+@pytest.mark.asyncio
+async def test_set_status_and_stamp_audit_routes_through_write_status_and_verify(tmp_path):
+    """set_status_and_stamp_audit must route through the shared
+    `_write_status_and_verify` tail (task 4057) instead of inlining its own
+    copy of the claimant/collision/read-back logic.
+
+    Both-or-neither rollback of the metadata merge is NOT re-verified here —
+    the spy replaces `_write_status_and_verify` itself and raises before any
+    SQL runs, so no write is ever attempted and a rollback check against
+    that would be vacuous. That property is already covered, genuinely, by
+    `test_set_status_and_stamp_audit_reports_explicit_error_when_write_not_persisted`,
+    which suppresses the write one seam deeper (`_apply_status_row_update`)
+    and lets the real `_write_status_and_verify` read-back-and-raise logic
+    run for real."""
+    project_root = str(tmp_path / 'proj')
+    setup = SqliteTaskBackend(TaskmasterConfig(project_root=project_root))
+    await setup.start()
+    await setup.add_task(project_root=project_root, title='x')
+    await setup.set_task_status('1', 'done', project_root=project_root)
+    await setup.close()
+
+    spy = _WriteStatusSeamSpyBackend(TaskmasterConfig(project_root=project_root))
+    await spy.start()
+    try:
+        result = await spy.set_status_and_stamp_audit(  # type: ignore[attr-defined]
+            '1', 'pending', project_root=project_root,
+            audit_fields={
+                'reopen_reason': 'regression found',
+                'reopen_from': 'done',
+            },
+        )
+    finally:
+        await spy.close()
+
+    assert len(spy.seam_calls) == 1
+    call = spy.seam_calls[0]
+    assert call['set_columns'] == ['status = ?', 'metadata = ?', 'updated_at = ?']
+    assert result == {
+        'success': False,
+        'error': 'status_write_not_persisted',
+        'task_id': '1',
+        'requested_status': 'pending',
+        'actual_status': 'seam-suppressed',
+    }
 
 
 @pytest.mark.asyncio
