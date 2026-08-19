@@ -324,7 +324,7 @@ class TestFindPathsRightBoundary:
     def test_known_fail_open_residue_long_extension(self):
         """MISSED detection, never a false one — pinned so the gap stays visible.
 
-        The mechanism is the ``{1,6}`` extension-LENGTH cap, not the leading
+        The mechanism is the ``{2,6}`` extension-LENGTH cap, not the leading
         dot: an extension of 7+ chars fails the extension alternative whether
         or not the stem is empty.  ``test_extension_length_cap_boundary``
         below pins the cap itself; the contrast assertion here exists so a
@@ -338,11 +338,13 @@ class TestFindPathsRightBoundary:
         assert find_paths('docs/.env', ('docs/',)) == ['docs/']
 
     def test_extension_length_cap_boundary(self):
-        """Pin the ``{1,6}`` magic number itself, on both sides of the edge.
+        """Pin the ``{2,6}`` magic number itself, on both sides of both edges.
 
-        Without this, the cap could be changed to any other value and no test
-        would notice.
+        Without this, either bound could be changed to any other value and
+        no test would notice.
         """
+        assert find_paths('crates/x.a', ('crates/',)) == []  # 1 — out (new floor)
+        assert find_paths('crates/x.ab', ('crates/',)) == ['crates/']  # 2 — in
         assert find_paths('crates/x.abcdef', ('crates/',)) == ['crates/']  # 6 — in
         assert find_paths('crates/x.abcdefg', ('crates/',)) == []  # 7 — out
 
@@ -355,6 +357,38 @@ class TestFindPathsRightBoundary:
         ``project_for_path``.
         """
         assert find_paths('plans/*.md', ('plans/',)) == []
+
+    # ------------------------------------------------------------------
+    # KNOWN FALSE-POSITIVE residue — the opposite direction, deliberately
+    # not closed (task 4160)
+    # ------------------------------------------------------------------
+
+    def test_known_false_positive_residue_three_segment_slash(self):
+        """FALSE POSITIVE — the opposite direction from every other residue
+        entry in this class — pinned so the gap stays visible.
+
+        A ``>=3``-element English slash construction still satisfies the
+        ``_SEG/`` alternative (another '/' follows), so it lexes as a path
+        even though none is present.  Deliberately NOT closed: the only
+        mechanical fix — requiring the ``_SEG/`` chain to terminate in an
+        extension — would stop detecting genuine EXTENSIONLESS directory
+        paths ('fused-memory/src/fused_memory/middleware/', 'crates/reify/src'),
+        a strictly larger and more common real-prose class in this repo than
+        the English >=3-element slash shape it would close, so closing it
+        would be a net detection loss.
+
+        Live impact is bounded: the prose advisory this feeds
+        (:func:`check_text_for_scope` / :func:`check_candidate_for_scope`)
+        NEVER rejects a submission outright, and is suppressed entirely by
+        ``local_attesting_signals`` (task 3106) whenever the declared
+        deliverables attest local work — a false positive only reaches a
+        submission with no locally-attesting declared files.
+        """
+        # DELIBERATE: asserts the WRONG answer, so the gap is executable.
+        assert find_paths('the client/server/db split', ('client/',)) == ['client/']
+        assert find_paths('a read/write/execute decision', ('read/',)) == ['read/']
+        # CONTRAST: the TWO-element shape task 3120 closed is still closed.
+        assert find_paths('not a backend/timeout error', ('backend/',)) == []
 
     # ------------------------------------------------------------------
     # task 4160: numeric/single-letter "extension" false positives
