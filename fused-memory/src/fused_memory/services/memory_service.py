@@ -1597,6 +1597,168 @@ class ReconcileStats:
     errors: list[str] = field(default_factory=list)
 
 
+#: THE closed vocabulary of verification checks (task 3671, PRD leaf zeta).
+#: The single normative site for the "which check fired" field the PRD's
+#: §Contract requires on every repair record — a check name must be REGISTERED
+#: here, never spelled as a bare string at a call site, or the two consumers
+#: (leaf eta's repair, leaf iota's rate) key off vocabularies that drift.
+#:
+#: The C' post-LLM veto is deliberately NOT a third member. Post-write,
+#: "extracted Task N was merged onto the Task M node" is observationally
+#: IDENTICAL to "an edge about Task M is attached to a Task N node" — which
+#: these two checks already detect. A separate veto mechanism would be two
+#: sites that must agree byte-for-byte, i.e. exactly the INV-5 lockstep
+#: duplication utils/canonical_labels.py exists to prevent. The PRD says so
+#: outright: it "folds in", and is "not a distinct leaf".
+REFERENT_CHECKS: tuple[str, ...] = ('set-membership', 'per-edge-pairing')
+
+
+@dataclass(frozen=True, kw_only=True)
+class ReferentFinding:
+    """One edge END that landed on a node the write was not about.
+
+    The structured record INV-2 requires, carrying every field the PRD
+    §Contract names — "edge uuid, old endpoint uuid, new endpoint uuid,
+    referent set, which check fired" — plus what leaf eta needs to act:
+
+    ==========================  ====================================
+    PRD field                   Attribute
+    ==========================  ====================================
+    edge uuid                   :attr:`edge_uuid` (+ :attr:`which_end`)
+    old endpoint uuid           :attr:`old_endpoint_uuid`
+    new endpoint uuid           :attr:`new_endpoint_uuid`
+    referent set                :attr:`referent_set`
+    which check fired           :attr:`check`
+    ==========================  ====================================
+
+    FROZEN, and its collection field is a TUPLE, for the reason
+    :class:`~fused_memory.utils.canonical_labels.Referent` and ``LabelScan``
+    are: a finding is evidence for DESTRUCTIVE edge surgery, and ``frozen=True``
+    blocks attribute rebinding only — a list field would leave
+    ``finding.referent_set.append(...)`` open, letting a consumer quietly widen
+    the set that justified the repair it is about to perform.
+
+    Keyword-only because eleven fields, seven of them strings, is exactly the
+    shape where a positional argument silently lands in the wrong slot.
+
+    ``new_endpoint_uuid is None`` means "the node does not exist yet, or its
+    name keys a duplicate-name group" — leaf eta resolves-or-mints via
+    ``ensure_entity_node``, which handles both identically. It does NOT mean
+    unrepairable; that is :attr:`resolvable`, which zeta defaults to ``False``
+    so "recorded and left alone, never guessed at" is the structural default
+    rather than something every construction site must remember.
+    """
+
+    #: The edge whose endpoint is wrong.
+    edge_uuid: str
+    #: Which end: ``'source'`` or ``'target'``. With :attr:`edge_uuid` this is
+    #: the identity of the finding — at most one finding per (edge, end).
+    which_end: str
+    #: Which check fired; one of :data:`REFERENT_CHECKS`.
+    check: str
+    #: The node the edge is attached to today.
+    old_endpoint_uuid: str
+    #: That node's name as this episode's result reported it. Recorded for the
+    #: operator log; the VERDICT is keyed off :attr:`endpoint_referent`, since a
+    #: spelling can have been normalized out from under this string.
+    old_endpoint_name: str
+    #: The parsed referent that name denotes — the thing actually compared.
+    endpoint_referent: Referent
+    #: The declared referent set, as canonical node names, that the endpoint
+    #: was tested against.
+    referent_set: tuple[str, ...]
+    #: The referent the edge SHOULD hang off, when exactly one candidate
+    #: survives. ``None`` whenever :attr:`resolvable` is False.
+    intended_referent: Referent | None = None
+    #: The uuid of :attr:`intended_referent`'s node, when it resolves to
+    #: exactly one live node. See the class docstring for what ``None`` means.
+    new_endpoint_uuid: str | None = None
+    #: Whether a correct target was determined. Defaults False — fail-closed.
+    resolvable: bool = False
+    #: Why not, when :attr:`resolvable` is False. Empty on a resolvable
+    #: finding.
+    reason: str = ''
+
+    def __post_init__(self) -> None:
+        if self.check not in REFERENT_CHECKS:
+            raise ValueError(
+                f'unregistered referent check {self.check!r}; registered checks '
+                f'are {list(REFERENT_CHECKS)}. Add it to '
+                'memory_service.REFERENT_CHECKS rather than recording a finding '
+                'no consumer can key off.'
+            )
+
+    def to_dict(self) -> dict[str, Any]:
+        """A plain, JSON-safe dict keyed exactly by this record's field names.
+
+        The payload the operator warning carries. Referents render as their
+        canonical ``node_name`` rather than as a dataclass repr, so the log
+        line and any future durable row read as graph names — the same thing
+        an operator would type into a query.
+        """
+        return {
+            'edge_uuid': self.edge_uuid,
+            'which_end': self.which_end,
+            'check': self.check,
+            'old_endpoint_uuid': self.old_endpoint_uuid,
+            'old_endpoint_name': self.old_endpoint_name,
+            'endpoint_referent': self.endpoint_referent.node_name,
+            'referent_set': list(self.referent_set),
+            'intended_referent': (
+                self.intended_referent.node_name
+                if self.intended_referent is not None
+                else None
+            ),
+            'new_endpoint_uuid': self.new_endpoint_uuid,
+            'resolvable': self.resolvable,
+            'reason': self.reason,
+        }
+
+
+@dataclass
+class ReferentStats:
+    """What one ``_verify_episode_referents`` run looked at, and what it found.
+
+    The in-process half of INV-2's structured record: leaf eta reads
+    :attr:`findings` off the return value, inside the same identity-lock
+    critical section, and acts on it. (The process-lifetime half leaf iota
+    reads is ``MemoryService.referent_finding_counts``.)
+
+    The three summary counts are ``@property`` comprehensions over
+    :attr:`findings` rather than fields precisely so they CANNOT drift from the
+    list they summarize — the same property-not-field discipline
+    :attr:`Referent.node_name` follows. A stored count is a second site that
+    must be incremented in lockstep with every append.
+
+    :attr:`endpoints_unresolved` exists so this pass's one blind spot — an edge
+    endpoint uuid that this episode's ``result.nodes`` does not name, so its
+    name is unknown and it cannot be checked at all — is COUNTED rather than
+    silently skipped. A skipped endpoint is a check that did not run, and a
+    verification pass that cannot say how often it declined to look is not a
+    verification pass.
+    """
+
+    edges_scanned: int = 0
+    endpoints_checked: int = 0
+    endpoints_unresolved: int = 0
+    findings: list[ReferentFinding] = field(default_factory=list)
+
+    @property
+    def set_membership_findings(self) -> int:
+        """Findings from the SET MEMBERSHIP check."""
+        return sum(1 for f in self.findings if f.check == 'set-membership')
+
+    @property
+    def pairing_findings(self) -> int:
+        """Findings from the PER-EDGE PAIRING check."""
+        return sum(1 for f in self.findings if f.check == 'per-edge-pairing')
+
+    @property
+    def unresolvable_findings(self) -> int:
+        """Findings recorded with no determinable correct target — left alone."""
+        return sum(1 for f in self.findings if not f.resolvable)
+
+
 class DescendantScan(NamedTuple):
     """What a cascade WOULD destroy — and whether that answer is complete.
 
