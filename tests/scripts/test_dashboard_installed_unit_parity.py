@@ -127,9 +127,37 @@ implementer 2026-08-19 against systemd 255.4-1ubuntu8.17:
     returns '4' — so the defect was purely host-side install drift, not a
     repo defect.
 
-POST-FIX CONFIRMATION: recorded in step-4 once the installed unit is
-reconciled by manual surgical edit (scripts/check_dashboard_unit_parity.py
-has no --fix flag by design).
+POST-FIX CONFIRMATION, measured 2026-08-19 after a manual surgical edit —
+inserting the single line `RestartSteps=4` immediately after `RestartSec=5`
+in the installed unit (matching the committed template's directive
+ordering: Restart=on-failure / RestartSec=5 / RestartSteps=4 /
+RestartMaxDelaySec=60), changing nothing else — followed by `systemctl
+--user daemon-reload`:
+
+  - `diff` of the installed unit against its pre-fix backup is exactly
+    `36a37 > RestartSteps=4` — one line appended, nothing removed or
+    reordered. `grep -n Restart` now shows RestartSteps=4 at line 37,
+    between RestartSec=5 (line 36) and RestartMaxDelaySec=60 (line 38).
+  - `Environment=DASHBOARD_KNOWN_PROJECT_ROOTS=` still lists all nine
+    project roots (dark-factory, reify, autopilot-video, autotrade,
+    know-live, solar-challenge, mission-control, solar-challenge-platform,
+    pump-web-ui), and the three known out-of-scope staleness deltas
+    (missing SuccessExitStatus=143, missing DASHBOARD_PROJECT_ROOT=, and
+    --timeout-keep-alive 5 vs the committed 6) were left exactly as they
+    were — not opportunistically fixed; see follow-up task 4445.
+  - `systemctl --user show dark-factory-dashboard.service -p RestartSteps
+    -p RestartMaxDelayUSec` now reports RestartSteps=4 and
+    RestartMaxDelayUSec=1min (previously RestartSteps=0).
+  - `systemd-analyze --user verify` no longer prints the "Service has
+    RestartMaxDelaySec= but no RestartSteps= setting. Ignoring." line for
+    either dark-factory unit (the remaining jcodemunch-serve.service "No
+    such file or directory" line is Reify-owned, out of scope — see the
+    plan analysis).
+  - dark-factory-dashboard.service remained `active` throughout; no restart
+    was performed.
+  - Both tests in this module pass under `-m integration`; run together
+    with test_fused_memory_installed_unit_parity.py, all four tests across
+    both new modules pass (`-m integration`: 4 passed).
 
 Marking: both host-touching tests carry `@pytest.mark.integration`, which is
 registered and DESELECTED by the ROOT pyproject.toml's default addopts
