@@ -940,12 +940,39 @@ _STAGE1_FLAG_MARKER_MEM0_ENUM_FILTER_VARIANTS: tuple[dict, ...] = (
 # a {'source': ...} filter — it is enumerated by the boolean payload key
 # {'flag_for_stage2': True} instead (Qdrant payload filters are
 # type-sensitive; the stored value is boolean True, not the string 'true').
-# A marker Stage 2 hasn't consumed in 14+ days can never be "current" per
+# A marker Stage 2 hasn't consumed in N+ days can never be "current" per
 # _query_stage2_flags' run_id/run-window semantics (run_ids are per-cycle;
 # Stage 2 runs many times/day) — so it is definitionally unconsumed dead
-# signal past that point; 14 days reuses the task-1944
-# STAGE1_FLAG_MARKER_MEM0_MAX_AGE_DAYS convention for operator consistency.
-_FLAG_FOR_STAGE2_MEM0_MAX_AGE_DAYS: int = 14
+# signal past that point.
+#
+# Shortened 14 -> 7 (task 4374, interim mitigation ruled by esc-3796-1
+# 2026-08-17, pending the deterministic-sweep retirement of this whole
+# age-GC). Worst-case realized staleness after a fixing task lands is
+# TTL minus the flag's age at that moment, so halving the TTL halves the
+# worst case; measured against the motivating incident (flag 948f8d6a /
+# source ee83eb28, created 2026-07-27T18:46:37Z, fixed by task 3095
+# merging 2026-07-31T01:23:51Z / done 01:50:06Z, hand-purged at age
+# 9d20h on 2026-08-06T14:42:42Z) the prior 14-day TTL would not have
+# fired until 2026-08-10T18:46Z — 4d04h AFTER the manual purge — while a
+# 7-day TTL would have reaped it on 2026-08-03, roughly halving the
+# realized staleness. This is deliberately blunt and resolution-blind
+# (it reaps flags whose gap is still open just as readily as ones that
+# are fixed), which is exactly why it is interim mitigation and not the
+# fix; the fix is the deterministic sweep.
+#
+# This TTL applies ONLY to the boolean {'flag_for_stage2': True} pool
+# actually enumerated below via _FLAG_FOR_STAGE2_ENUM_FILTERS — the sole
+# filter passed to the delete sweep in
+# _sweep_stale_mem0_flag_for_stage2_markers. The string-'true' variant
+# (_FLAG_FOR_STAGE2_STRING_VARIANT_FILTERS below) is never deleted by
+# this sweep at any TTL value: it feeds only the diagnostic
+# _warn_on_flag_for_stage2_type_drift probe, not the GC delete path. So
+# shortening the TTL halves the worst case for the boolean population
+# this sweep actually reaps, but does nothing for the string-variant
+# drift population, which was already a known, separately-tracked gap
+# (task 2966 amendment) before this change and remains one after it —
+# not something this interim mitigation widens or narrows.
+_FLAG_FOR_STAGE2_MEM0_MAX_AGE_DAYS: int = 7
 _FLAG_FOR_STAGE2_GC_SWEEP_SOURCE = 'flag_for_stage2_gc_sweep'
 _FLAG_FOR_STAGE2_ENUM_FILTERS: dict = {'flag_for_stage2': True}
 
@@ -1851,7 +1878,8 @@ async def _sweep_stale_mem0_flag_for_stage2_markers(
         run_id: Current reconciliation run identifier used as ``causation_id``
             in the audit journal.
         max_age_days: Staleness cutoff in days (default
-            ``_FLAG_FOR_STAGE2_MEM0_MAX_AGE_DAYS`` == 14).
+            ``_FLAG_FOR_STAGE2_MEM0_MAX_AGE_DAYS`` == 7 as of task 4374;
+            was 14 before the esc-3796-1 interim mitigation).
         now: Reference "current time" for the cutoff calculation. Defaults to
             ``datetime.now(UTC)``; tests inject a fixed value.
         scroll_limit: Max records to enumerate in one scroll (default 1000).
