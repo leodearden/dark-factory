@@ -791,6 +791,147 @@ class TestMem0BackendScrollCollectionPages:
             'page budget propagating past it'
         )
 
+    # -- the caller-supplied points cap (task 3682) ------------------------
+    #
+    # scan_payload_text carried a second copy of this walk purely because it
+    # needed to stop after N POINTS rather than N pages.  Pushing that cap in
+    # here is what lets the walk have one home; the tests below pin the three
+    # properties the fold must not lose.
+
+    @pytest.mark.asyncio
+    async def test_max_points_shrinks_the_request_so_it_never_over_fetches(self, backend):
+        """The request is shrunk to what is still wanted: ONE round-trip, limit=3.
+
+        This is the property a naive ``async for ... break`` layering cannot
+        have: to learn "there is more" it must pull a point PAST the cap,
+        costing an extra scroll round-trip (~70-90 ms measured against live
+        qdrant).  Owning the cap inside the pager makes the look-ahead free.
+        """
+        points = [self._make_mock_point(f'id-{i}') for i in range(3)]
+        client = _paging_client([(points, None)])
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=client)):
+            got = await _drain(
+                backend.scroll_collection_pages('c', page_size=256, max_points=3)
+            )
+
+        assert len(got) == 3
+        assert client.scroll.await_count == 1
+        assert client.scroll.call_args.kwargs.get('limit') == 3, (
+            'the page request must shrink to the remaining budget, not ask for '
+            f'the full page_size; got {client.scroll.call_args.kwargs.get("limit")!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_raises_when_the_points_cap_is_reached_with_a_live_next_offset(self, backend):
+        """All capped points are yielded, THEN it raises — never a short return."""
+        from fused_memory.backends.mem0_client import ScrollPointBudgetExhausted
+
+        points = [self._make_mock_point(f'id-{i}') for i in range(2)]
+        client = _paging_client([(points, 'off-1')])
+        got: list = []
+
+        with (
+            patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=client)),
+            pytest.raises(ScrollPointBudgetExhausted) as excinfo,
+        ):
+            async for point in backend.scroll_collection_pages(
+                'fused_reify', page_size=256, max_points=2
+            ):
+                got.append(point)
+
+        assert got == points, 'the capped points are yielded before the raise'
+        message = str(excinfo.value)
+        assert 'fused_reify' in message, 'the message must name the collection'
+        assert '2' in message, 'the message must name the cap'
+        assert 'off-1' in message, 'the message must name the still-live offset'
+
+    @pytest.mark.asyncio
+    async def test_a_clean_end_exactly_at_the_cap_does_not_raise(self, backend):
+        """Reaching the cap and the end of the stream together is NOT a truncation.
+
+        Nothing was left behind, so there is nothing to disclose.  Ordering the
+        ``next_offset is None`` return ahead of the cap check is what makes an
+        exhaustive-but-exactly-capped walk a clean result instead of a
+        spurious error.
+        """
+        points = [self._make_mock_point(f'id-{i}') for i in range(3)]
+        client = _paging_client([(points, None)])
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=client)):
+            got = await _drain(
+                backend.scroll_collection_pages('c', page_size=256, max_points=3)
+            )
+
+        assert got == points
+
+    @pytest.mark.asyncio
+    async def test_the_default_points_cap_is_inert(self, backend):
+        """max_points=None (the default) never caps and never raises.
+
+        Pins that the existing consumers are structurally unaffected:
+        scroll_all_by_metadata / _scroll_all_records,
+        scripts/census_memory_metadata and
+        scripts/consolidate_namespace_families all pass no cap, so none of
+        them can ever see ScrollPointBudgetExhausted.
+        """
+        pages = [([self._make_mock_point(f'id-{i}')], f'off-{i}') for i in range(5)]
+        pages.append(([self._make_mock_point('last')], None))
+        client = _paging_client(pages)
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=client)):
+            got = await _drain(backend.scroll_collection_pages('c', page_size=1))
+
+        assert len(got) == 6
+        assert client.scroll.call_args.kwargs.get('limit') == 1, (
+            'with no cap the request stays at the full page_size'
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_points_cap_wins_when_both_budgets_are_exhausted(self, backend):
+        """Same page exhausts both: the caller's explicit cap is the event raised.
+
+        max_pages is a backstop; reporting it when the caller's own cap
+        explains the stop would misattribute an expected outcome to an
+        internal safety limit.
+        """
+        from fused_memory.backends.mem0_client import ScrollPointBudgetExhausted
+
+        client = _paging_client([([self._make_mock_point('a')], 'off-1')])
+
+        with (
+            patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=client)),
+            pytest.raises(ScrollPointBudgetExhausted),
+        ):
+            await _drain(
+                backend.scroll_collection_pages('c', page_size=1, max_pages=1, max_points=1)
+            )
+
+    @pytest.mark.asyncio
+    async def test_a_server_over_return_stops_at_the_cap_rather_than_over_yielding(self, backend):
+        """If the server hands back MORE than the shrunk request asked for, the
+        cap still holds.
+
+        The cap is enforced per-yield, not per-page, so a server that ignores
+        the shrunk ``limit`` cannot walk a caller past the budget it set.
+        """
+        from fused_memory.backends.mem0_client import ScrollPointBudgetExhausted
+
+        points = [self._make_mock_point(f'id-{i}') for i in range(5)]
+        client = _paging_client([(points, 'off-1')])
+        got: list = []
+
+        with (
+            patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=client)),
+            pytest.raises(ScrollPointBudgetExhausted),
+        ):
+            async for point in backend.scroll_collection_pages(
+                'c', page_size=256, max_points=2
+            ):
+                got.append(point)
+
+        assert got == points[:2], f'must not yield past the cap; got {len(got)} points'
+
     @pytest.mark.asyncio
     async def test_a_hung_page_request_raises_instead_of_hanging(self, backend):
         """A wedged socket fails loudly rather than hanging a ~30-page scan forever.
