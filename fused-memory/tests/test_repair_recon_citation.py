@@ -19,6 +19,8 @@ import importlib.util
 import sys
 import types
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
@@ -86,14 +88,9 @@ class TestBuildParser:
 
     def test_store_defaults_to_mem0(self):
         assert _parse(*_REQUIRED).store == 'mem0'
-        assert _parse(*_REQUIRED, '--store', 'graphiti').store == 'graphiti'
 
     def test_replacement_defaults_to_none_for_drop_only_mode(self):
         assert _parse(*_REQUIRED).replacement_memory_id is None
-
-    def test_data_dir_flag_exists(self):
-        args = _parse(*_REQUIRED, '--data-dir', '/tmp/recon')
-        assert Path(args.data_dir) == Path('/tmp/recon')
 
 
 # ===========================================================================
@@ -133,8 +130,7 @@ class TestRunDelegates:
 
     @pytest.mark.asyncio
     async def test_dry_run_threads_apply_false(self, spy):
-        await _mod.run(args := _parse(*_REQUIRED), journal=None, memory=None)
-        assert args.apply is False
+        await _mod.run(_parse(*_REQUIRED), journal=None, memory=None)
         assert spy.await_args.kwargs['apply'] is False
 
     @pytest.mark.asyncio
@@ -166,6 +162,29 @@ class TestExitCode:
         assert _mod.exit_code_for({'error': 'citation_not_dangling'}) == 1
         assert _mod.exit_code_for({'error': 'run_still_live'}) == 1
 
+    def test_a_run_status_is_never_read_as_an_outcome_status(self):
+        """The real ``run_still_live`` shape, with its own status key present.
+
+        ``run_still_live`` is the one refusal that also reports the TARGET RUN's
+        status. It reports it under ``run_status`` precisely so this function —
+        which discriminates on ``status`` — cannot read a run status as an
+        outcome status. Fed the dual-key shape, the exit code must still be 1;
+        that a RunStatus value never literally equals 'repaired' or 'dry_run' is
+        luck, and this pins the boundary rather than relying on it.
+        """
+        assert _mod.exit_code_for(
+            {
+                'error': 'run_still_live',
+                'error_type': 'ReconCitationRunStillLive',
+                'run_status': 'interrupted',
+            }
+        ) == 1
+        # The overloaded shape this rename retired. It still exits 1 — but only
+        # because no RunStatus value happens to spell 'repaired' or 'dry_run'.
+        # Pinned in both directions so a regression that reintroduces the
+        # overload is caught here rather than by a future enum member.
+        assert _mod.exit_code_for({'error': 'run_still_live', 'status': 'running'}) == 1
+
     def test_unrecognised_outcome_exits_one(self):
         """An outcome with neither key is a contract break, not a success."""
         assert _mod.exit_code_for({}) == 1
@@ -179,3 +198,119 @@ class TestExitCode:
 
         assert code == 1
         assert json.loads(capsys.readouterr().out) == outcome
+
+
+# ===========================================================================
+# main() — live wiring
+# ===========================================================================
+
+
+class TestMain:
+    """What ``main()`` actually constructs, and what it closes.
+
+    The ``--data-dir`` fallback, the journal/memory construction and the
+    ``finally`` teardown live ONLY here — asserting that argparse stores the
+    string it was handed exercises no project code at all.
+    """
+
+    @pytest.fixture
+    def wiring(self, monkeypatch):
+        """Stand in for the three live constructions ``main()`` makes.
+
+        ``_run_live`` imports each one INSIDE the function, so patching the
+        defining module is what the call actually resolves through.
+        """
+        seen: dict[str, Any] = {'closed': []}
+
+        class FakeJournal:
+            def __init__(self, data_dir):
+                seen['data_dir'] = data_dir
+                seen['journal'] = self
+
+            async def initialize(self):
+                seen['journal_initialized'] = True
+
+            async def close(self):
+                seen['closed'].append('journal')
+
+        class FakeMemory:
+            def __init__(self, config):
+                seen['memory_config'] = config
+
+            async def initialize(self):
+                seen['memory_initialized'] = True
+
+            async def close(self):
+                seen['closed'].append('memory')
+
+        class FakeConfig:
+            reconciliation = SimpleNamespace(data_dir='/configured/recon')
+
+        monkeypatch.setattr(
+            'fused_memory.config.schema.FusedMemoryConfig', FakeConfig
+        )
+        monkeypatch.setattr(
+            'fused_memory.reconciliation.journal.ReconciliationJournal', FakeJournal
+        )
+        monkeypatch.setattr(
+            'fused_memory.services.memory_service.MemoryService', FakeMemory
+        )
+        return seen
+
+    @staticmethod
+    def _patch_repair(monkeypatch, **kwargs) -> AsyncMock:
+        spy = AsyncMock(**kwargs)
+        monkeypatch.setattr(_mod.citation_repair, 'repair_memory_citation', spy)
+        return spy
+
+    def test_data_dir_flag_selects_the_journal_location(
+        self, monkeypatch, wiring, capsys
+    ):
+        self._patch_repair(monkeypatch, return_value={'status': 'dry_run'})
+        monkeypatch.setattr(
+            sys, 'argv', ['repair_recon_citation', *_REQUIRED, '--data-dir', '/tmp/recon']
+        )
+
+        assert _mod.main() == 0
+
+        assert wiring['data_dir'] == Path('/tmp/recon')
+        assert wiring['journal_initialized'] is True
+        assert wiring['memory_initialized'] is True
+        capsys.readouterr()
+
+    def test_omitted_data_dir_falls_back_to_the_configured_one(
+        self, monkeypatch, wiring, capsys
+    ):
+        """The default is the CONFIGURED reconciliation dir, not a literal.
+
+        An operator who omits the flag must hit the same journal the running
+        server owns; a wrong default would silently repair a different DB.
+        """
+        self._patch_repair(monkeypatch, return_value={'status': 'dry_run'})
+        monkeypatch.setattr(sys, 'argv', ['repair_recon_citation', *_REQUIRED])
+
+        assert _mod.main() == 0
+
+        assert wiring['data_dir'] == Path('/configured/recon')
+        capsys.readouterr()
+
+    def test_teardown_closes_memory_then_journal(self, monkeypatch, wiring, capsys):
+        self._patch_repair(monkeypatch, return_value={'status': 'repaired'})
+        monkeypatch.setattr(sys, 'argv', ['repair_recon_citation', *_REQUIRED, '--apply'])
+
+        assert _mod.main() == 0
+
+        assert wiring['closed'] == ['memory', 'journal']
+        capsys.readouterr()
+
+    def test_journal_is_closed_even_when_the_repair_raises(
+        self, monkeypatch, wiring
+    ):
+        """A leaked SQLite handle would outlive a crash and hold the WAL open."""
+        self._patch_repair(monkeypatch, side_effect=RuntimeError('boom'))
+        monkeypatch.setattr(sys, 'argv', ['repair_recon_citation', *_REQUIRED])
+
+        with pytest.raises(RuntimeError, match='boom'):
+            _mod.main()
+
+        assert wiring['closed'] == ['memory', 'journal']
