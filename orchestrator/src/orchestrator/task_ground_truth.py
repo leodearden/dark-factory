@@ -620,8 +620,12 @@ class TaskGroundTruth:
         # passes through as a list/str/number rather than raising. Guard
         # explicitly rather than crashing `.get()` below — same "degrade to
         # no plan-lock claimant" intent as the except block above (task
-        # 2243, W10-θ2 wiring; caught by
-        # test_reconcile_lock_format_variants[non-dict-json]).
+        # 2243, W10-θ2 wiring; caught by test_task_ground_truth.py::
+        # TestDeriveTruthLiveClaimant::
+        # test_non_dict_plan_lock_json_returns_none_not_raise — repointed
+        # from test_reconcile_lock_format_variants[non-dict-json], whose
+        # fixture stages the lock at the legacy worktree address this leg
+        # deliberately no longer reads, task 4028).
         if isinstance(lock_data, dict):
             owner_pid = lock_data.get('owner_pid')
             # Retain the PARSED pid: the composed identity below must embed the

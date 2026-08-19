@@ -17,6 +17,7 @@ from _orch_helpers import mock_lock_table, pydantic_spec, wire_scheduler_livenes
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
+from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.delivered_checks import (
     DeliveredChecksBlock,
@@ -46,6 +47,51 @@ def _bind_landed_row(tmp_path: Path, *, task_id: str, advanced_sha: str) -> None
         landed_at=1.0,
     ))
     MergeProvenance.bind(outbox)
+
+
+def _resolver_lock_dir(worktree: Path) -> Path:
+    """The directory the stranded sweep actually READS plan.lock from.
+
+    ``<worktree_base>/.task-meta/<worktree_name>`` — a SIBLING of the
+    worktree, derived through ``TaskArtifacts.meta_root_for`` (the single
+    owner of that path shape) rather than hand-joined, exactly as the sole
+    production writer does (``TaskWorkflow``, workflow.py) and as
+    ``TaskGroundTruth._resolve_live_claimant`` does on the read side (task
+    4028).  Mirrors ``_plan_lock_artifacts`` in test_task_ground_truth.py.
+
+    Every fixture whose lock CONTENT must be INTERPRETED — live vs dead
+    ``owner_pid``, fresh vs expired ``locked_at``, malformed JSON — must
+    stage it here.  A lock under ``<worktree>/.task`` is invisible to the
+    resolver, so such a test would pass vacuously: it would assert the
+    revert-to-pending that lock ABSENCE produces, never reaching
+    ``_pid_alive`` / ``_lock_fresh`` / the ``except (ValueError, OSError)``
+    degradation arm at all.
+    """
+    return TaskArtifacts.meta_root_for(worktree.parent, worktree.name)
+
+
+def _vestigial_lock_dir(worktree: Path) -> Path:
+    """The LEGACY ``<worktree>/.task`` directory — deliberately NOT the
+    resolver's address (task 4028).
+
+    Nothing has written a lock here since the meta-root migration and
+    ``_resolve_live_claimant`` never reads it, so a lock staged here is
+    inert CONTENT-wise by design.  It is still the exact — and only — path
+    that the two physical side-effects of the sweep target:
+
+      * ``_revert_in_progress_if_no_live_claimant``'s defensive
+        ``lock_path.unlink(missing_ok=True)`` (harness.py, the documented
+        "plan.lock unlink" side-effect), which joins ``.task`` itself; and
+      * ``cleanup_worktree``'s rmtree of the worktree dir, which cannot
+        reach the ``.task-meta`` SIBLING.
+
+    Fixtures that exist to pin one of those side-effects (``assert not
+    lock_path.exists()``, or ``assert lock_path.exists()`` proving the
+    unlink did NOT run) stage their lock here on purpose.  Migrating them
+    to the resolver address would silently retarget the assertion at a path
+    neither side-effect touches.
+    """
+    return worktree / '.task'
 
 
 # ---------------------------------------------------------------------------
@@ -789,8 +835,12 @@ class TestReconcileStrandedInProgress:
     ):
         """In-progress task with plan.lock pointing to live PID → untouched, no revert logged."""
         harness.scheduler.get_statuses.return_value = ({'7': 'in-progress'}, None)  # type: ignore[attr-defined]
-        # Create worktree with a plan.lock containing our own (live) PID
-        lock_dir = harness.git_ops.worktree_base / '7' / '.task'
+        # Create the worktree, plus a plan.lock containing our own (live) PID
+        # WHERE THE RESOLVER READS IT — the live-pid content is the whole
+        # premise here, so it must be visible (task 4028).
+        worktree_path = harness.git_ops.worktree_base / '7'
+        worktree_path.mkdir(parents=True)
+        lock_dir = _resolver_lock_dir(worktree_path)
         lock_dir.mkdir(parents=True)
         lock_path = lock_dir / 'plan.lock'
         lock_path.write_text(json.dumps({
@@ -819,8 +869,11 @@ class TestReconcileStrandedInProgress:
         owner_pid = 99999
         monkeypatch.setattr('orchestrator.harness._pid_alive', lambda pid: False)
 
-        # Create worktree with plan.lock referencing the synthetic dead PID
-        lock_dir = harness.git_ops.worktree_base / '8' / '.task'
+        # LEGACY address ON PURPOSE: the `assert not lock_path.exists()` below
+        # pins the applier's defensive `lock_path.unlink(missing_ok=True)`
+        # (harness.py), which joins `<worktree>/.task` — the meta-root lock is
+        # not that side-effect's target and would survive (task 4028).
+        lock_dir = _vestigial_lock_dir(harness.git_ops.worktree_base / '8')
         lock_dir.mkdir(parents=True)
         lock_path = lock_dir / 'plan.lock'
         lock_path.write_text(json.dumps({
@@ -855,7 +908,12 @@ class TestReconcileStrandedInProgress:
         # Same dead-PID staging as test_stale_plan_lock_cleared_and_reverted:
         # plan.lock/owner_pid forensics alone would read "stale".
         monkeypatch.setattr('orchestrator.harness._pid_alive', lambda pid: False)
-        lock_dir = harness.git_ops.worktree_base / '62' / '.task'
+        # Staged where the resolver READS it (task 4028): "the db claimant
+        # PRECEDES the stale plan.lock" only means something if the lock is
+        # actually visible to the resolver that is supposed to skip it.
+        worktree_path = harness.git_ops.worktree_base / '62'
+        worktree_path.mkdir(parents=True)
+        lock_dir = _resolver_lock_dir(worktree_path)
         lock_dir.mkdir(parents=True)
         lock_path = lock_dir / 'plan.lock'
         lock_path.write_text(json.dumps({
@@ -907,7 +965,12 @@ class TestReconcileStrandedInProgress:
 
         # Stale lock (dead PID) — the would-be-reaped shape absent the guard.
         monkeypatch.setattr('orchestrator.harness._pid_alive', lambda pid: False)
-        lock_dir = harness.git_ops.worktree_base / '60' / '.task'
+        # LEGACY address ON PURPOSE: the `assert lock_path.exists()` below is
+        # what proves the veto fired — only the applier's defensive
+        # `<worktree>/.task/plan.lock` unlink could have removed it, so at the
+        # meta root (which nothing in this path unlinks) it would be trivially
+        # true (task 4028).
+        lock_dir = _vestigial_lock_dir(harness.git_ops.worktree_base / '60')
         lock_dir.mkdir(parents=True)
         lock_path = lock_dir / 'plan.lock'
         lock_path.write_text(json.dumps({
@@ -952,7 +1015,11 @@ class TestReconcileStrandedInProgress:
         harness.scheduler.get_statuses.return_value = ({'61': 'in-progress'}, None)  # type: ignore[attr-defined]
 
         monkeypatch.setattr('orchestrator.harness._pid_alive', lambda pid: False)
-        lock_dir = harness.git_ops.worktree_base / '61' / '.task'
+        # LEGACY address ON PURPOSE — mirror of the test above: the
+        # `assert not lock_path.exists()` is the applier's defensive
+        # `<worktree>/.task/plan.lock` unlink, the side-effect the L1 veto
+        # suppresses there and permits here (task 4028).
+        lock_dir = _vestigial_lock_dir(harness.git_ops.worktree_base / '61')
         lock_dir.mkdir(parents=True)
         lock_path = lock_dir / 'plan.lock'
         lock_path.write_text(json.dumps({
@@ -1062,7 +1129,16 @@ class TestReconcileStrandedInProgress:
         harness.scheduler.get_statuses.return_value = ({str(task_id): 'in-progress'}, None)  # type: ignore[attr-defined]
 
         tid_str = str(task_id)
-        lock_dir = harness.git_ops.worktree_base / tid_str / '.task'
+        # LEGACY address ON PURPOSE: post-2763 every case here asserts the
+        # SAME outcome (revert + `expect_lock_exists=False`), and that
+        # deletion is the applier's defensive `<worktree>/.task/plan.lock`
+        # unlink.  What this parametrization now pins is precisely that the
+        # worktree lock's FORMAT is inert to the sweep.  Resolver-side format
+        # degradation is covered at the meta root by test_task_ground_truth.py
+        # (TestDeriveTruthLiveClaimant's corrupt-JSON / non-UTF-8 / non-dict /
+        # malformed-owner_pid / stale-locked_at cases, plus the
+        # TestClaimantRunIdIsComposedOrNone family) — task 4028.
+        lock_dir = _vestigial_lock_dir(harness.git_ops.worktree_base / tid_str)
         lock_path = lock_dir / 'plan.lock'
 
         if lock_contents is not None:
@@ -1150,7 +1226,10 @@ class TestReconcileStrandedInProgress:
         tid = '200'
         harness.scheduler.get_statuses.return_value = ({tid: 'in-progress'}, None)  # type: ignore[attr-defined]
 
-        lock_dir = harness.git_ops.worktree_base / tid / '.task'
+        # LEGACY address ON PURPOSE: this test IS about the vestigial
+        # `<worktree>/.task/plan.lock` named in its docstring — that the
+        # applier no longer reads it and defensively unlinks it (task 4028).
+        lock_dir = _vestigial_lock_dir(harness.git_ops.worktree_base / tid)
         lock_dir.mkdir(parents=True)
         lock_path = lock_dir / 'plan.lock'
         lock_path.write_text('not-valid-json')
@@ -1289,7 +1368,11 @@ class TestReconcileStrandedInProgress:
         harness.scheduler.get_statuses.return_value = ({str(tid): 'in-progress'}, None)  # type: ignore[attr-defined]
         monkeypatch.setattr('orchestrator.harness._pid_alive', lambda pid: False)
 
-        lock_dir = harness.git_ops.worktree_base / str(tid) / '.task'
+        # LEGACY address ON PURPOSE: with cleanup_worktree suppressed by
+        # _preserved_worktrees, the `assert not lock_path.exists()` below can
+        # only be the applier's defensive `<worktree>/.task/plan.lock` unlink
+        # — the sole side-effect this test is here to pin (task 4028).
+        lock_dir = _vestigial_lock_dir(harness.git_ops.worktree_base / str(tid))
         lock_dir.mkdir(parents=True)
         lock_path = lock_dir / 'plan.lock'
         lock_path.write_text(json.dumps({
@@ -1316,8 +1399,13 @@ class TestReconcileStrandedInProgress:
         harness.scheduler.get_statuses.return_value = ({str(tid): 'in-progress'}, None)  # type: ignore[attr-defined]
         monkeypatch.setattr('orchestrator.harness._pid_alive', lambda pid: False)
 
-        # Create worktree with a plan.lock referencing a synthetic dead PID
-        lock_dir = harness.git_ops.worktree_base / str(tid) / '.task'
+        # Create the worktree, plus a plan.lock referencing a synthetic dead
+        # PID where the RESOLVER reads it (task 4028) — the expired
+        # locked_at is what makes _lock_fresh return False, which is the
+        # stale-lock premise this test names.
+        worktree_path = harness.git_ops.worktree_base / str(tid)
+        worktree_path.mkdir(parents=True)
+        lock_dir = _resolver_lock_dir(worktree_path)
         lock_dir.mkdir(parents=True)
         lock_path = lock_dir / 'plan.lock'
         lock_path.write_text(json.dumps({
@@ -1325,7 +1413,6 @@ class TestReconcileStrandedInProgress:
             'locked_at': '2026-01-01T00:00:00+00:00',
             'owner_pid': 99999,
         }))
-        worktree_path = harness.git_ops.worktree_base / str(tid)
         # _recovered_plans is empty (default)
 
         await harness._reconcile_stranded_in_progress()
@@ -1353,8 +1440,12 @@ class TestReconcileStrandedInProgress:
         harness.scheduler.get_statuses.return_value = ({str(tid): 'in-progress'}, None)  # type: ignore[attr-defined]
         monkeypatch.setattr('orchestrator.harness._pid_alive', lambda pid: False)
 
-        # Create worktree with a plan.lock referencing a synthetic dead PID
-        lock_dir = harness.git_ops.worktree_base / str(tid) / '.task'
+        # Create worktree with a plan.lock referencing a synthetic dead PID.
+        # LEGACY address ON PURPOSE: with cleanup_worktree suppressed by
+        # _recovered_plans, the `assert not lock_path.exists()` below can only
+        # be the applier's defensive `<worktree>/.task/plan.lock` unlink — the
+        # sole side-effect this test is here to pin (task 4028).
+        lock_dir = _vestigial_lock_dir(harness.git_ops.worktree_base / str(tid))
         lock_dir.mkdir(parents=True)
         lock_path = lock_dir / 'plan.lock'
         lock_path.write_text(json.dumps({
@@ -1438,20 +1529,33 @@ class TestReconcileStrandedInProgress:
     ):
         """TypeError from json.loads must propagate — not be silently swallowed.
 
-        RED against current code: `except Exception:` catches TypeError and
-        treats the lock as stale (task reverted, lock deleted, no exception).
-        After the fix (narrow to OSError/JSONDecodeError/ValueError), TypeError
-        propagates out, set_task_status is never called, and the lock survives.
+        The plan.lock read now lives in ``TaskArtifacts.read_plan_lock``
+        (orchestrator/artifacts.py), reached from
+        ``TaskGroundTruth._resolve_live_claimant``.  Its degradation arm is
+        deliberately NARROW — ``except (ValueError, OSError)`` — so a
+        TypeError from ``json.loads`` is NOT absorbed as "lock unreadable,
+        treat as stale": it propagates out of the sweep, set_task_status is
+        never called, and the lock survives.  A blanket ``except Exception:``
+        there would swallow it and silently revert the task.
+
+        The patch targets ``orchestrator.artifacts.json.loads`` — the module
+        that actually performs the read (task 4028; it formerly named
+        ``orchestrator.harness``, which still bit only because both names
+        resolve to the one shared ``json`` module object).
         """
         from unittest.mock import patch as _patch
 
         harness.scheduler.get_statuses.return_value = ({'15': 'in-progress'}, None)  # type: ignore[attr-defined]
-        lock_dir = harness.git_ops.worktree_base / '15' / '.task'
+        # Staged where the resolver READS it (task 4028) — the whole point is
+        # that json.loads runs on THIS file.
+        worktree_path = harness.git_ops.worktree_base / '15'
+        worktree_path.mkdir(parents=True)
+        lock_dir = _resolver_lock_dir(worktree_path)
         lock_dir.mkdir(parents=True)
         lock_path = lock_dir / 'plan.lock'
         lock_path.write_text('{"session_id": "15-xyz", "owner_pid": 1}')  # valid-looking
 
-        with _patch('orchestrator.harness.json.loads', side_effect=TypeError('unexpected')), pytest.raises(TypeError, match='unexpected'):
+        with _patch('orchestrator.artifacts.json.loads', side_effect=TypeError('unexpected')), pytest.raises(TypeError, match='unexpected'):
             await harness._reconcile_stranded_in_progress()
 
         # No revert must have happened
@@ -1624,9 +1728,12 @@ class TestReconcileStrandedInProgress:
         )
         monkeypatch.setattr('orchestrator.harness._pid_alive', lambda pid: False)
 
-        # Create a worktree with a stale plan.lock (dead PID)
+        # Create a worktree with a stale plan.lock (dead PID).
+        # LEGACY address ON PURPOSE: the `assert not lock_path.exists()` below
+        # is a proxy for "cleanup_worktree's rmtree ran", and rmtree of the
+        # worktree dir cannot reach the `.task-meta` SIBLING (task 4028).
         worktree_path = harness.git_ops.worktree_base / '51'
-        lock_dir = worktree_path / '.task'
+        lock_dir = _vestigial_lock_dir(worktree_path)
         lock_dir.mkdir(parents=True)
         lock_path = lock_dir / 'plan.lock'
         lock_path.write_text(json.dumps({
@@ -1750,7 +1857,10 @@ class TestReconcileStrandedInProgress:
         )
         harness.scheduler.get_statuses.return_value = ({'8': 'in-progress'}, None)  # type: ignore[attr-defined]
         monkeypatch.setattr('orchestrator.harness._pid_alive', lambda pid: False)
-        lock_dir = harness.git_ops.worktree_base / '8' / '.task'
+        # LEGACY address ON PURPOSE: the `assert not lock_path.exists()` below
+        # pins the applier's defensive `<worktree>/.task/plan.lock` unlink,
+        # which is the only thing that removes it here (task 4028).
+        lock_dir = _vestigial_lock_dir(harness.git_ops.worktree_base / '8')
         lock_dir.mkdir(parents=True)
         lock_path = lock_dir / 'plan.lock'
         lock_path.write_text(json.dumps({
@@ -1903,9 +2013,12 @@ class TestReconcileStrandedInProgress:
         )
         monkeypatch.setattr('orchestrator.harness._pid_alive', lambda pid: False)
 
-        # Create a worktree with a stale plan.lock (dead PID)
+        # Create a worktree with a stale plan.lock (dead PID).
+        # LEGACY address ON PURPOSE: the `assert not lock_path.exists()` below
+        # is a proxy for "cleanup_worktree's rmtree ran", and rmtree of the
+        # worktree dir cannot reach the `.task-meta` SIBLING (task 4028).
         worktree_path = harness.git_ops.worktree_base / tid
-        lock_dir = worktree_path / '.task'
+        lock_dir = _vestigial_lock_dir(worktree_path)
         lock_dir.mkdir(parents=True)
         lock_path = lock_dir / 'plan.lock'
         lock_path.write_text(json.dumps({
@@ -2820,8 +2933,14 @@ async def test_mid_run_alive_owner_pid_not_in_dispatch_recovers(
         {'400': 'in-progress'}, None,
     )
 
-    # Create a worktree with plan.lock pointing to OUR pid (harness.pid).
-    lock_dir = harness.git_ops.worktree_base / '400' / '.task'
+    # Create a worktree, plus a plan.lock pointing to OUR pid (harness.pid)
+    # WHERE THE RESOLVER READS IT (task 4028).  Visibility is what makes this
+    # a live PLAN_LOCK-sourced claimant, and therefore what makes the R3
+    # mid-run exception (harness.py, plan_lock_mid_run_exception) the branch
+    # under test rather than the plain no-claimant revert.
+    worktree_path = harness.git_ops.worktree_base / '400'
+    worktree_path.mkdir(parents=True)
+    lock_dir = _resolver_lock_dir(worktree_path)
     lock_dir.mkdir(parents=True)
     (lock_dir / 'plan.lock').write_text(json.dumps({
         'session_id': '400-x', 'locked_at': datetime.now(UTC).isoformat(),
@@ -2846,7 +2965,11 @@ async def test_startup_alive_owner_pid_left_alone(harness: Harness):
         {'401': 'in-progress'}, None,
     )
 
-    lock_dir = harness.git_ops.worktree_base / '401' / '.task'
+    # Staged where the resolver READS it (task 4028) — an alive owner_pid can
+    # only "skip recovery" if the lock carrying it is actually visible.
+    worktree_path = harness.git_ops.worktree_base / '401'
+    worktree_path.mkdir(parents=True)
+    lock_dir = _resolver_lock_dir(worktree_path)
     lock_dir.mkdir(parents=True)
     (lock_dir / 'plan.lock').write_text(json.dumps({
         'session_id': '401-x', 'locked_at': datetime.now(UTC).isoformat(),
@@ -3322,9 +3445,11 @@ async def test_reconcile_stale_lock_uses_lane_path(harness: Harness, monkeypatch
     """_reconcile_one_stranded resolves the worktree via the pool assignment.
 
     When a WarmLanePool is attached and task '42' is assigned to '_lane-0',
-    the lock-state classification must inspect base/'_lane-0'/.task/plan.lock
-    (not the non-existent base/'42'/.task/plan.lock).  After clearing the stale
-    lock, cleanup_worktree must be called with (base/'_lane-0', '42').
+    the lock-state classification must inspect the lane's lock — which lives
+    at base/'.task-meta'/'_lane-0'/plan.lock, the meta-root SIBLING of
+    base/'_lane-0' (task 4028) — and not the one derived from the cold
+    base/'42'.  After finding it stale, cleanup_worktree must be called with
+    (base/'_lane-0', '42').
 
     Fails today because worktree_path = worktree_base / tid computes base/'42'.
     """
@@ -3333,8 +3458,11 @@ async def test_reconcile_stale_lock_uses_lane_path(harness: Harness, monkeypatch
     lane_path = base / '_lane-0'
     cold_path = base / '42'
 
-    # Create the lane dir with a stale plan.lock (dead PID)
-    lock_dir = lane_path / '.task'
+    # Create the lane dir, plus a stale plan.lock (dead PID) at the lane's
+    # RESOLVER address — the address is the whole subject of this test, so the
+    # lock has to be somewhere the resolver would actually look (task 4028).
+    lane_path.mkdir(parents=True, exist_ok=True)
+    lock_dir = _resolver_lock_dir(lane_path)
     lock_dir.mkdir(parents=True)
     lock_path = lock_dir / 'plan.lock'
     lock_path.write_text(json.dumps({
@@ -3347,6 +3475,10 @@ async def test_reconcile_stale_lock_uses_lane_path(harness: Harness, monkeypatch
     pool.restore_assignment('42', lane_path)
 
     monkeypatch.setattr('orchestrator.harness._pid_alive', lambda pid: False)
+    # The resolver has its OWN _pid_alive (task_ground_truth), and it now
+    # genuinely reaches this lock — pin it dead there too so the synthetic
+    # 99999 cannot read as live under PID reuse.
+    monkeypatch.setattr('orchestrator.task_ground_truth._pid_alive', lambda pid: False)
     # is_ancestor False → skip the found-on-main path, go to lock-state branch
     harness.git_ops.is_ancestor = AsyncMock(return_value=False)  # type: ignore[attr-defined]
 

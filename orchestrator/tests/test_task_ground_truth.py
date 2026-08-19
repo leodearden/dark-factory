@@ -963,6 +963,33 @@ class TestDeriveTruthLiveClaimant:
 
         assert report.live_claimant is None
 
+    async def test_non_dict_plan_lock_json_returns_none_not_raise(self, tmp_path: Path) -> None:
+        # read_plan_lock's `-> dict | None` hint is aspirational: it is a bare
+        # json.loads, so syntactically VALID but non-dict JSON (a lock
+        # truncated to a list/number/string) passes through without raising
+        # and would crash the `.get()` below on an AttributeError. The
+        # explicit `isinstance(lock_data, dict)` guard degrades it to "no
+        # plan-lock claimant" instead, same intent as the corrupt-JSON and
+        # non-UTF-8 cases above.
+        #
+        # This is the guard's ONLY live coverage. It previously cited
+        # test_reconcile_stranded.py::test_reconcile_lock_format_variants
+        # [non-dict-json], but that sweep-level fixture stages its lock at the
+        # LEGACY <worktree>/.task address on purpose (it pins the applier's
+        # defensive unlink, not the resolver), so the resolver never sees the
+        # non-dict payload there and the citation was vacuous (task 4028).
+        artifacts = _plan_lock_artifacts(tmp_path)
+        artifacts.root.mkdir(parents=True)
+        lock_path = artifacts.root / 'plan.lock'
+        lock_path.write_text('["not", "an", "object"]')
+        task = {'status': 'pending', 'claimant_run_id': None, 'heartbeat_at': None}
+        scheduler = _fake_scheduler(is_actively_held=False, task=task)
+        resolver = _make_ground_truth(scheduler=scheduler, worktree_resolver=lambda tid: tmp_path)
+
+        report = await resolver.derive_truth('34')
+
+        assert report.live_claimant is None
+
     async def test_no_claimant_and_no_plan_lock_returns_none(self) -> None:
         task = {'status': 'pending', 'claimant_run_id': None, 'heartbeat_at': None}
         scheduler = _fake_scheduler(is_actively_held=False, task=task)
