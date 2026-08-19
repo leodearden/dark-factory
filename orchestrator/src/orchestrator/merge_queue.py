@@ -19,6 +19,7 @@ import json
 import logging
 import math
 import os
+import re
 import shutil
 import time
 import traceback
@@ -18940,6 +18941,70 @@ audit is worker-level, not per-request — there is exactly one open/resolved
 L1 at a time for the whole worker's resource-conservation health, so the
 sentinel is a single fixed string rather than parameterized.
 """
+
+
+_RESOURCE_AUDIT_AGE_FIGURE_RE = re.compile(
+    r'\(age \d+(?:\.\d+)?s > grace \d+(?:\.\d+)?s\)'
+)
+"""The one VOLATILE span of a worktree-ledger violation string (task 3203).
+
+Emitted by :meth:`SpeculativeMergeWorker.worktree_ledger_violations`; its
+``age`` grows by ``_HEARTBEAT_POLL_S`` on every poll.  Kept module-level and
+pre-compiled because :func:`_resource_audit_fingerprint` runs on every
+heartbeat.
+"""
+
+
+def _resource_audit_fingerprint(violations: Sequence[str]) -> tuple[str, ...]:
+    """Reduce a resource-audit violation set to a stable coalescence key (task 3203).
+
+    Two polls reporting the same underlying condition must produce the SAME
+    fingerprint (so :class:`~orchestrator.log_coalesce.ExponentialLogCoalescer`
+    coalesces the repeat), and any real change must produce a DIFFERENT one
+    (so it re-logs immediately at full detail).
+
+    ONLY THE AGE IS ELIDED.  ``(age Ns > grace Ms)`` is the single span of a
+    worktree violation that changes every poll purely because the clock moved;
+    left in, it would defeat any dedup whatsoever — a naive string-set
+    comparison would read every poll as a change and log forever, which is
+    exactly the pathology this task removes.
+
+    EVERYTHING ELSE IS DELIBERATELY KEPT:
+
+      * the reclaim DISPOSITION suffix — a tree crossing
+        :attr:`SpeculativeMergeWorker.PERIODIC_REAP_MIN_AGE_SECS` flips from
+        "scheduled for automatic reclaim" to "reclaim overdue".  That is a
+        genuine state transition (the reaper was supposed to have destroyed
+        it and did not) and must force an immediate full-detail re-log rather
+        than being swallowed mid-backoff.
+      * ``grace`` — stable text for a given caller; a deployment that changes
+        the floor SHOULD re-log.
+      * speculation-accounting strings, which pass through untouched.  Their
+        counts (``slot_available(1) + live_permits(0) == 1, expected
+        depth=2``) ARE the signal, not noise: a leak that grows from one
+        permit to two is new information.
+
+    Sorting makes the result order-independent, so an ``os.scandir``
+    reordering its entries is not misread as a change.
+
+    FAIL-SAFE BY CONSTRUCTION.  If ``worktree_ledger_violations``'s format
+    ever drifts so this regex stops matching, the age leaks into the
+    fingerprint, the fingerprint changes on every poll, and behaviour
+    degrades to exactly the pre-3203 log-every-poll cadence — loud and
+    over-reporting, never silent and under-reporting.
+    ``TestResourceAuditFingerprint`` (test_merge_queue_resource_audit.py)
+    pins the normaliser against that emitter's REAL output, so the drift is
+    caught by a test first.
+
+    Pure: no I/O, no clock, total (never raises for any string input).  Does
+    not touch :meth:`~SpeculativeMergeWorker.worktree_ledger_violations`,
+    :meth:`~SpeculativeMergeWorker.speculation_accounting_violations`, or
+    :meth:`~SpeculativeMergeWorker.snapshot`.
+    """
+    return tuple(sorted(
+        _RESOURCE_AUDIT_AGE_FIGURE_RE.sub('(age <elided> > grace <elided>)', v)
+        for v in violations
+    ))
 
 
 def _alarm_resource_audit(
