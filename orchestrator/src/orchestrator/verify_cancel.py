@@ -633,6 +633,18 @@ def lane_lock_holder_pids_strict(
     which is how the regression tests stage the defect beside the fix on
     identical staging.
 
+    THE FAILURE ASYMMETRY, and why the loop is not one uniform ``try``.  The
+    FIRST read establishes whether an answer exists at all, so its ``OSError``
+    propagates untouched — no rows were examined, the answer is genuinely
+    unknown, and the fail-safe wrapper is what decides otherwise.  Every
+    SUBSEQUENT read only ever ENRICHES an answer that already exists, so its
+    failure cannot subtract information and ends the loop instead of
+    propagating.  Without the split, a fix for a 1.54% loss would hand a
+    previously-single-read function K independent chances to raise on hosts
+    where ``/proc/locks`` is restricted — trading a quiet wrong answer for a
+    LOUD NEW failure class on the acquire-timeout paths whose whole point is
+    that an exception there converts a diagnosable stall into a broken merge.
+
     Note this is a READ-COUNT bound, never a time bound.  This function is
     SYNCHRONOUS and is called from async contexts; this module's standing rule
     — the stated reason ``GitOps._acquire_lane_flock_off_thread`` exists — is
@@ -653,8 +665,14 @@ def lane_lock_holder_pids_strict(
 
     pids: list[int] = []
     seen: set[int] = set()
-    for _ in range(reads):
-        raw = locks_path.read_text()
+    for attempt in range(reads):
+        if attempt == 0:
+            raw = locks_path.read_text()  # unguarded: see the asymmetry above
+        else:
+            try:
+                raw = locks_path.read_text()
+            except OSError:
+                break  # best-effort: a confirm read cannot subtract an answer
         for line in raw.splitlines():
             fields = line.split()
             if len(fields) < 2:
