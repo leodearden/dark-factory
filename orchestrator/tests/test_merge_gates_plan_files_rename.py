@@ -615,6 +615,135 @@ class TestUniqueBasenameFallback:
 
 
 # ---------------------------------------------------------------------------
+# Mechanism 2's basename key — the last resolved hop, not the declared path
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestBasenameFallbackUsesLastResolvedHop:
+    """Mechanism 2 must key its basename lookup off the LAST RESOLVED HOP
+    (``current``), not the originally declared path (``norm``) — reached
+    precisely when mechanism 1 dead-ends on a hop that changed the
+    basename, so the declared name is the one name already proven stale.
+
+    The no-chain case (``current == norm``) is already covered by
+    ``TestUniqueBasenameFallback.test_delete_then_add_resolves_by_unique_basename``,
+    which must stay green — it pins that this class changes nothing when
+    the chain never advanced.
+
+    The sibling invariant — that the HISTORY evidence gate
+    (:func:`_path_existed_in_branch_history`) stays anchored on the
+    originally declared path and does NOT move to the hop — is already
+    pinned by
+    ``TestStalePathClassification.test_invented_path_does_not_resolve_by_basename``:
+    a chain can only ever advance past hop 1 (making ``current != norm``)
+    if *norm* itself was deleted by some commit — that is how mechanism 1
+    finds a pair to advance on — so "no history under the declared name"
+    is necessarily the no-chain (``current == norm``) case that test
+    already covers.  Re-anchoring the evidence gate on ``current`` instead
+    would make it vacuous (a hop only exists because a commit deleted it),
+    which is exactly the regression this reference guards against without
+    duplicating the test.
+    """
+
+    async def test_dead_ended_chain_resolves_on_the_hop_basename(
+        self,
+        git_ops: GitOps,
+        git_repo: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The headline false positive this defect produces.
+
+        Hop 1 is a pairable rename that CHANGES the basename
+        (``topo_e2e.rs`` -> ``topo_suite.rs``); hop 2 is an unpairable
+        delete-then-add, so the chain dead-ends on hop 1's target. Keying
+        the basename lookup on the ORIGINAL declared path searches the
+        tree for ``topo_e2e.rs`` and finds nothing — the entry is wrongly
+        blocked even though the branch delivered exactly what was asked,
+        at the file's live name.
+        """
+        declared = 'crates/tests/topo_e2e.rs'
+        hop1 = 'crates/tests/harness_topo/topo_suite.rs'
+        final = 'crates/harness/topo_suite.rs'
+
+        await _commit_on_main(
+            git_repo, {declared: 'fn topo() {}\n'}, 'add topo_e2e',
+        )
+        await _rename_on_main(
+            git_repo, declared, hop1, 'harness: hop 1 rename + retarget',
+        )
+        await _relocate_as_delete_then_add(git_repo, hop1, final)
+
+        wt = (await git_ops.create_worktree('dead-ended-hop-basename')).path
+        base = await _head_of(wt)
+        (wt / final).write_text('// branch edit\nfn topo() { assert_eq!(3, 3); }\n')
+        await git_ops.commit(wt, 'step-2')
+        head = await _head_of(wt)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            result = await _check_plan_files_touched_in_branch(
+                [declared], base, head, git_ops, task_id='hop-basename',
+            )
+
+        assert result.not_touched == [], (
+            'the chain dead-ended on a basename-changing hop, but the branch '
+            'delivered against the live path — the gate must PASS'
+        )
+        assert result.missing_from_tree == []
+        assert result.resolved_renames == {declared: final}
+
+        msg = ' '.join(
+            r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
+        )
+        assert hop1 in msg, (
+            'the audit trail must name the HOP the basename matched on, so a '
+            'human auditing the PASS can see it is not a coincidental match; '
+            f'got: {msg!r}'
+        )
+
+    async def test_hop_basename_still_requires_uniqueness(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """Two candidates sharing the HOP's basename ⇒ still no resolution.
+
+        Guards that this fix does not WEAKEN the heuristic: pins the
+        ``len(candidates) == 1`` bound now that the lookup key changed
+        from ``norm`` to ``current``.
+        """
+        declared = 'crates/tests/topo_e2e.rs'
+        hop1 = 'crates/tests/harness_topo/topo_suite.rs'
+        final = 'crates/harness/topo_suite.rs'
+        unrelated = 'crates/other/topo_suite.rs'
+
+        await _commit_on_main(
+            git_repo,
+            {declared: 'fn topo() {}\n', unrelated: 'fn other() {}\n'},
+            'add topo_e2e + unrelated topo_suite',
+        )
+        await _rename_on_main(
+            git_repo, declared, hop1, 'harness: hop 1 rename + retarget',
+        )
+        await _relocate_as_delete_then_add(git_repo, hop1, final)
+
+        wt = (await git_ops.create_worktree('hop-basename-ambiguous')).path
+        base = await _head_of(wt)
+        (wt / final).write_text('// branch edit\nfn topo() { assert_eq!(4, 4); }\n')
+        await git_ops.commit(wt, 'step-2')
+        head = await _head_of(wt)
+
+        result = await _check_plan_files_touched_in_branch(
+            [declared], base, head, git_ops, task_id='hop-basename-ambiguous',
+        )
+
+        assert result.resolved_renames == {}, (
+            'two candidates sharing the hop basename must NOT resolve — a '
+            'coincidental basename can never satisfy the gate'
+        )
+        assert result.not_touched == [declared]
+        assert result.missing_from_tree == [declared]
+
+
+# ---------------------------------------------------------------------------
 # Classification — missing_from_tree, and the two no-false-NEGATIVE guards
 # ---------------------------------------------------------------------------
 
