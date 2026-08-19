@@ -4614,6 +4614,78 @@ class TestDriftDetectorDivergence:
         assert pool.is_quarantined('laptop') is True
         escalation_queue.submit.assert_called_once()
 
+    # -- task 4188: verify categories surfaced on the DIVERGE artifacts --
+
+    def _diverge_queue(self):
+        queue = MagicMock()
+        queue.has_open_l1 = MagicMock(return_value=False)
+        queue.make_id = MagicMock(return_value='esc-__drift__-1')
+        return queue
+
+    async def test_diverge_result_carries_both_categories(self):
+        """The DIVERGE return carries both arms' categories, not just the AGREE one."""
+        from orchestrator.verify_runner import DriftDetector, DriftVerdict
+        pool, _, _ = _make_drift_pool(
+            local_result=_make_fail_result(category='test_failure'),
+            remote_result=_make_pass_result(category='merge_flake_suppressed'),
+        )
+        detector = DriftDetector(pool, escalation_queue=self._diverge_queue())
+        result = await detector.check('divergesha', _make_spec())
+        assert result.verdict == DriftVerdict.DIVERGE
+        assert result.local_category == 'test_failure'
+        assert result.remote_category == 'merge_flake_suppressed'
+
+    async def test_diverge_escalation_detail_names_suppressed_arm(self):
+        """The suppressed arm is named in the artifact an operator actually rules on.
+
+        Asserts the STRUCTURED, !r-quoted spelling rather than the bare word, so
+        it cannot be satisfied vacuously by the static explanatory sentence that
+        also names the category.  Also guards that the rewrite stayed ADDITIVE.
+        """
+        from orchestrator.verify_runner import DriftDetector
+        pool, _, _ = _make_drift_pool(
+            local_result=_make_fail_result(category='test_failure'),
+            remote_result=_make_pass_result(category='merge_flake_suppressed'),
+        )
+        escalation_queue = self._diverge_queue()
+        detector = DriftDetector(pool, escalation_queue=escalation_queue)
+        await detector.check('mydivergesha', _make_spec())
+        esc = escalation_queue.submit.call_args[0][0]
+        assert "remote_category='merge_flake_suppressed'" in esc.detail
+        # Regression guard: the pre-existing detail content survives.
+        assert "merge_sha='mydivergesha'" in esc.detail
+        assert "local_runner='local'" in esc.detail
+        assert "remote_runner='laptop'" in esc.detail
+        assert 'A remote PASS / local FAIL split can land unverified code on main.' in esc.detail
+
+    async def test_diverge_escalation_detail_names_local_category(self):
+        """The mirror case: both arms are threaded, into the right slots."""
+        from orchestrator.verify_runner import DriftDetector
+        pool, _, _ = _make_drift_pool(
+            local_result=_make_pass_result(category='merge_flake_suppressed'),
+            remote_result=_make_fail_result(category='test_failure'),
+        )
+        escalation_queue = self._diverge_queue()
+        detector = DriftDetector(pool, escalation_queue=escalation_queue)
+        await detector.check('divergesha', _make_spec())
+        esc = escalation_queue.submit.call_args[0][0]
+        assert "local_category='merge_flake_suppressed'" in esc.detail
+        assert "remote_category='test_failure'" in esc.detail
+
+    async def test_diverge_escalation_detail_carries_categories_when_neither_suppressed(self):
+        """Always-populated at the escalation artifact, including the '' arm."""
+        from orchestrator.verify_runner import DriftDetector
+        pool, _, _ = _make_drift_pool(
+            local_result=_make_fail_result(category='test_failure'),
+            remote_result=_make_pass_result(),
+        )
+        escalation_queue = self._diverge_queue()
+        detector = DriftDetector(pool, escalation_queue=escalation_queue)
+        await detector.check('divergesha', _make_spec())
+        esc = escalation_queue.submit.call_args[0][0]
+        assert "local_category='test_failure'" in esc.detail
+        assert "remote_category=''" in esc.detail
+
 
 # ---------------------------------------------------------------------------
 # ι step-7: DriftDetector dedup — has_open_l1 guard
