@@ -251,6 +251,61 @@ def build_harness(
         return 'esc_1'
 
     @mcp.tool
+    def escalate_info_typed(
+        task_id: str,
+        agent_role: str,
+        category: str,
+        summary: str,
+        severity: str = 'info',
+        detail: str = '',
+        suggested_action: str = '',
+        worktree: str | None = None,
+        workflow_state: str | None = None,
+        evidence: list[dict[str, Any]] | None = None,
+        terminal_state_is_the_bug: bool = False,
+    ) -> str:
+        """``escalate_info`` with the REAL escalation server's signature, verbatim.
+
+        Task **3690**. Copied byte-for-byte from
+        ``escalation/src/escalation/server.py:933`` because the one thing this
+        toy has that the legacy one above does not is a **list-typed**
+        parameter: ``evidence: list[dict[str, Any]] | None``. Every recovery
+        target asserted anywhere else in this file is ``str``-typed, so the
+        measured failure this tool exists to pin had never been reachable —
+        a ``str`` recovered into a list-typed parameter does not land and is
+        not coerced, it RAISES ``list_type`` inside pydantic and the tool body
+        never runs.
+
+        ADDITIVE rather than a widening of the legacy ``escalate_info`` toy,
+        exactly as ``add_memory_strict`` was added beside ``add_memory`` for
+        B14: roughly a dozen existing call sites (B3, the INV-2 rows, the
+        storm rows) call ``escalate_info`` with only ``{'summary', 'detail'}``,
+        and its narrow shape is load-bearing for all of them. Tightening it
+        into the real eleven-parameter signature would break every one for no
+        gain.
+
+        Kept VERBATIM rather than reduced to the three parameters the tests
+        touch: ``repair()`` validates recovered names against the LIVE schema,
+        so a reduced mirror would change which recoveries are admissible and
+        make this an easier problem than the real server poses.
+        """
+        rec.record(
+            'escalate_info_typed',
+            task_id=task_id,
+            agent_role=agent_role,
+            category=category,
+            summary=summary,
+            severity=severity,
+            detail=detail,
+            suggested_action=suggested_action,
+            worktree=worktree,
+            workflow_state=workflow_state,
+            evidence=evidence,
+            terminal_state_is_the_bug=terminal_state_is_the_bug,
+        )
+        return 'esc_typed_1'
+
+    @mcp.tool
     def add_memory(
         content: str,
         category: str | None = None,
@@ -971,6 +1026,103 @@ class TestB3StrandRiskTierForwards:
         _, result = await self._forward()
 
         assert meta_of(result).get('fastmcp') == {'wrap_result': True}
+
+
+class TestB3ExtendedListTypedRecovery:
+    """B3, extended to the one parameter TYPE the tier had never recovered.
+
+    Task **3690**. Every recovery asserted above lands in a ``str``-typed
+    parameter, so "the recovered parameter actually LANDS" had only ever been
+    measured where the verbatim slice was already the right Python type.
+    ``Repair.recovered`` is ``dict[str, str]`` by construction (invariant D5:
+    every recovered value is a verbatim slice of the tail), and ``_forward``
+    applied it as a bare ``arguments.update(fix.recovered)``.
+
+    MEASURED, before the fix: the guard repairs, reports
+    ``recovered_params=['evidence', 'suggested_action']`` — and then pydantic
+    rejects the ``str`` with ``1 validation error for
+    call[escalate_info_typed] / evidence / Input should be a valid list
+    [type=list_type, input_type=str]``. The tool body never runs.
+
+    That is strictly WORSE than no guard for this shape. ``evidence`` is
+    OPTIONAL on the real ``escalate_info``, so today an unguarded leaked call
+    lands with ``evidence=[]``: the escalation IS filed, with silent data
+    loss (on-disk specimen esc-3184-2 is exactly this). A guard that turns a
+    filed-but-lossy escalation into a raised error makes filing STRICTLY
+    HARDER for the one call the FORWARD_REPAIR tier exists to protect
+    (C2 / INV-6: a lost ``escalate_info`` strands a task).
+
+    Driven by the committed corpus specimen that recovers BOTH a list-typed
+    and a str-typed parameter in one call, so the fix cannot be satisfied by
+    retyping everything.
+    """
+
+    SPECIMEN = 'toolu_01Q1FPhhjWsxGhTEQRfvMaLa'
+
+    #: The four required parameters of the real signature. The specimen's own
+    #: ``supplied`` list records exactly these plus ``detail``, so this mirrors
+    #: what the leaking caller really put on the wire.
+    REQUIRED = {
+        'task_id': '3441',
+        'agent_role': 'implementer',
+        'category': 'cleanup_needed',
+        'summary': 'Eight near-duplicate entries restate the same gotcha.',
+    }
+
+    async def _forward(self):
+        record = specimen(self.SPECIMEN)
+        assert record['expected_outcome'] == 'repaired'
+        assert sorted(record['expected_recovered']) == ['evidence', 'suggested_action']
+        h = build_harness(RepairPolicy.FORWARD_REPAIR)
+        result = await h.call(
+            'escalate_info_typed', {**self.REQUIRED, record['param']: record['value']}
+        )
+        return h, result
+
+    async def test_the_call_succeeds_and_the_body_runs_exactly_once(self):
+        """(a) + (b). The assertion that fails first today: it RAISES."""
+        h, _ = await self._forward()
+
+        assert len(h.recorder.calls) == 1
+
+    async def test_the_list_typed_recovery_lands_as_a_list_of_dicts(self):
+        """(c). The gamma-1 signal, and the manifest's OPEN capability.
+
+        Not a ``str``, and not an empty list either — a guard that swallowed
+        the decode failure into ``[]`` would pass a bare ``isinstance(list)``
+        while losing exactly the data this row exists to preserve.
+        """
+        h, _ = await self._forward()
+
+        evidence = h.recorder.args['evidence']
+        assert isinstance(evidence, list), (
+            f'evidence landed as {type(evidence).__name__}, not a list — the '
+            'verbatim str slice was forwarded into a list-typed parameter'
+        )
+        assert evidence, 'the recovery landed as an EMPTY list: the payload was lost'
+        assert all(isinstance(entry, dict) for entry in evidence)
+
+    async def test_the_str_typed_recovery_still_lands_as_a_str(self):
+        """(d). The same call recovers both, so a fix cannot retype blindly."""
+        h, _ = await self._forward()
+
+        suggested_action = h.recorder.args['suggested_action']
+        assert isinstance(suggested_action, str)
+        assert suggested_action, 'the str-typed recovery landed empty'
+
+    async def test_the_absorbing_field_is_clean(self):
+        h, _ = await self._forward()
+
+        assert detect(h.recorder.args['detail']) is None
+
+    async def test_meta_reports_both_recoveries(self):
+        """(e). NAMES only — the warning must not become a second copy."""
+        _, result = await self._forward()
+
+        warning = meta_of(result)['markup_repair']
+        assert warning['outcome'] == 'repaired'
+        assert warning['field'] == 'detail'
+        assert warning['recovered_params'] == ['evidence', 'suggested_action']
 
 
 class TestB4LastParameterNothingDropped:
