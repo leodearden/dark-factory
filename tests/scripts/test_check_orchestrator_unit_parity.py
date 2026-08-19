@@ -68,7 +68,7 @@ from setup_host_parsing import (
 from setup_host_parsing import (
     declared_orchestrator_units as _units_installed_by_setup_host,
 )
-from setup_host_sections import slice_section
+from setup_host_sections import enabled_units, run_section, slice_section, systemctl_calls
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 CHECKER_PATH = REPO_ROOT / "scripts" / "check_orchestrator_unit_parity.py"
@@ -1642,6 +1642,62 @@ def test_slice_section_missing_end_after_marker_fails_by_name():
     bogus = 'if cp "$REPO_ROOT/scripts/$_unit" "$RENAMED_DIR/"; then'
     with pytest.raises(AssertionError, match=re.escape(bogus)):
         slice_section(_ORCH_GATE_START, _ORCH_GATE_END, end_after=bogus)
+
+
+def test_run_section_systemctl_stub_records_its_argv(tmp_path: pathlib.Path):
+    """The shared stub RECORDS, so the ENABLE half of an install is observable.
+
+    Half of what the installer section does is `systemctl --user enable`, and a
+    per-unit gate that copied the right files while enabling the wrong set
+    would pass every file-content assertion in this module. A stub that only
+    exits 0 makes that half unobservable, so the assertions silently cover the
+    `cp` alone.
+    """
+    repo = tmp_path / "repo"
+    (repo / "scripts").mkdir(parents=True)
+    unit_dir = tmp_path / "units"
+
+    result = run_section(
+        tmp_path,
+        "systemctl --user daemon-reload\n"
+        "systemctl --user enable some-unit.service\n",
+        repo_root=repo,
+        unit_dir=unit_dir,
+    )
+
+    # The stub still exits 0, so a slice containing `systemctl --user enable`
+    # neither touches the host nor trips `set -e`.
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+
+    assert systemctl_calls(tmp_path) == [
+        ["--user", "daemon-reload"],
+        ["--user", "enable", "some-unit.service"],
+    ], systemctl_calls(tmp_path)
+
+    assert enabled_units(tmp_path) == ["some-unit.service"], enabled_units(tmp_path)
+
+
+def test_enabled_units_is_token_matched_not_substring_matched(
+    tmp_path: pathlib.Path,
+):
+    """`enable` naming one unit is never satisfied by a line naming another.
+
+    The property the private copy documents, pinned: a `daemon-reload` call
+    contributes NO unit, so a run that reloaded but enabled nothing cannot read
+    as a run that enabled something.
+    """
+    repo = tmp_path / "repo"
+    (repo / "scripts").mkdir(parents=True)
+
+    run_section(
+        tmp_path,
+        "systemctl --user daemon-reload\n",
+        repo_root=repo,
+        unit_dir=tmp_path / "units",
+    )
+
+    assert systemctl_calls(tmp_path) == [["--user", "daemon-reload"]]
+    assert enabled_units(tmp_path) == []
 
 
 # ---------------------------------------------------------------------------
