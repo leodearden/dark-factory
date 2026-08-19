@@ -2,7 +2,7 @@
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from typing import Any
 
 from mem0 import AsyncMemory
@@ -599,13 +599,26 @@ class Mem0Backend:
         )
         return result.count
 
-    def _build_payload_filter(self, filters: dict[str, Any]):
+    def _build_payload_filter(
+        self,
+        filters: dict[str, Any] | None,
+        *,
+        text_needles: Sequence[str] | None = None,
+    ):
         """Build the Qdrant payload ``Filter`` for a key→value equality dict.
 
         THE single construction site for this filter (INV-5).  Every
         metadata-addressed Qdrant read in this class routes through here:
-        :meth:`count_by_metadata`, :meth:`scroll_by_metadata` and
-        :meth:`scroll_all_by_metadata`.
+        :meth:`count_by_metadata`, :meth:`scroll_by_metadata`,
+        :meth:`scroll_all_by_metadata` and :meth:`scan_payload_text`.
+
+        The last of those is why the builder carries a second, OPTIONAL arm.
+        :meth:`scan_payload_text` narrows by metadata exactly as the other
+        three do (``must``) but ALSO pushes a literal substring prefilter down
+        to Qdrant (``should``, one ``MatchText`` per needle).  It built that
+        combined filter inline until task 3682, which left the "one
+        construction site" claim true of three reads and quietly false of the
+        fourth — the one whose whole job is measuring a true incidence rate.
 
         This is a correctness requirement, not tidiness.  The metadata census
         (``scripts/census_memory_metadata.py``) reconciles its SCROLL against
@@ -617,36 +630,60 @@ class Mem0Backend:
         ``tests/test_mem0_client.py::TestMem0BackendPayloadFilterSingleHome``.
 
         Args:
-            filters: Non-empty dict of key→value equality filters.  Mem0
-                stores ``add_memory(metadata=...)`` fields as top-level keys
-                on the Qdrant payload, so ``{'source': 'X'}`` matches against
-                ``payload.source == 'X'``.
+            filters: Dict of key→value equality filters, AND-ed into ``must``.
+                Mem0 stores ``add_memory(metadata=...)`` fields as top-level
+                keys on the Qdrant payload, so ``{'source': 'X'}`` matches
+                against ``payload.source == 'X'``.  May be empty/``None`` only
+                when *text_needles* is non-empty.
+            text_needles: Optional literal substrings, OR-ed into ``should`` as
+                one ``FieldCondition(key='data', match=MatchText(...))`` each,
+                in the given order.  On an UN-INDEXED payload field
+                ``MatchText`` is a literal case-sensitive substring match; see
+                :meth:`scan_payload_text` for why that is an optimisation only
+                and never the authoritative verdict.
 
         Returns:
-            A ``qdrant_client.http.models.Filter`` whose ``must`` list holds
-            one ``FieldCondition``/``MatchValue`` per item, in dict-insertion
-            order.
+            A ``qdrant_client.http.models.Filter``.  ``must`` holds one
+            ``FieldCondition``/``MatchValue`` per *filters* item in
+            dict-insertion order; ``should`` holds one
+            ``FieldCondition``/``MatchText`` per needle in the given order.
+
+            An arm with no members is OMITTED (``None``), never emitted as
+            ``[]``.  Not cosmetic: an empty ``should`` is a no-op server-side
+            (measured on qdrant 1.17.1 — ``Filter(must=[c])`` and
+            ``Filter(must=[c], should=[])`` return the same count), but the two
+            are UNEQUAL under pydantic structural equality.  The anti-drift
+            assertions that pin this single home compare the filter one entry
+            point hands Qdrant against another's with ``==``, so an emitted
+            empty arm would make the sharing unprovable at that entry point.
 
         Raises:
-            ValueError: If *filters* is empty — an unfiltered ``Filter``
+            ValueError: If BOTH arms would be empty — an unfiltered ``Filter``
                 selects the WHOLE collection, which is a bug at every caller.
+                A ``should``-only filter is fine: it still selects a proper
+                subset, so needles-with-no-filters is a legitimate call.
                 Callers validate first with their own message naming the right
                 unfiltered alternative (``count()`` / ``get_all()``); this
                 guard is the backstop so the shared builder can never become
                 the hole that lets one through.
         """
-        if not filters:
+        if not filters and not text_needles:
             raise ValueError(
-                '_build_payload_filter requires at least one filter; '
+                '_build_payload_filter requires at least one filter or text needle; '
                 'an empty filter would select every point in the collection',
             )
         from qdrant_client.http import models as qmodels  # noqa: PLC0415
 
         must: list[qmodels.Condition] = [
             qmodels.FieldCondition(key=k, match=qmodels.MatchValue(value=v))
-            for k, v in filters.items()
+            for k, v in (filters or {}).items()
         ]
-        return qmodels.Filter(must=must)
+        should: list[qmodels.Condition] = [
+            qmodels.FieldCondition(key=_MEM0_TEXT_KEY, match=qmodels.MatchText(text=needle))
+            for needle in (text_needles or ())
+        ]
+        # `or None` on BOTH arms — the omit-an-unused-arm rule, stated once.
+        return qmodels.Filter(must=must or None, should=should or None)
 
     def _normalise_point(self, point: Any, *, with_vectors: bool) -> dict[str, Any]:
         """Normalise one raw Qdrant point into the standard record dict.
