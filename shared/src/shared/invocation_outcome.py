@@ -92,14 +92,57 @@ class AuthFailed(InvocationOutcome):
     status: int
 
     # The first <=120 characters of the 401/403 response body (``result.output``,
-    # falling back to ``result.stderr``), stripped; ``''`` when neither carried
-    # text. It exists because the numeric status ALONE cannot distinguish OAuth
-    # *revocation* from *expiry* from an *org-policy block* in the multi-account
-    # rotation — the distinction the task-2134 refactor (b68eea415b) dropped when
-    # it replaced ``_handle_auth_failure(f'HTTP {status}: {output[:120]}')`` with
+    # falling back to ``result.stderr``), whitespace-collapsed to a SINGLE line
+    # and credential-scrubbed by ``_sanitise_auth_body`` below; ``''`` when
+    # neither stream carried text. It exists because the numeric status ALONE
+    # cannot distinguish OAuth *revocation* from *expiry* from an *org-policy
+    # block* in the multi-account rotation — the distinction the task-2134
+    # refactor (b68eea415b) dropped when it replaced
+    # ``_handle_auth_failure(f'HTTP {status}: {output[:120]}')`` with
     # ``slot.report(outcome)``. Optional-with-a-default on purpose: every existing
     # bare ``AuthFailed(status=...)`` construction site keeps working.
     body: str = ''
+
+
+# Credential shapes masked out of an AuthFailed body snippet. The snippet is no
+# longer log-only: ``_handle_auth_failure`` persists it into the ``auth_failed``
+# cost-event JSON and surfaces it through ``gate.paused_reason`` to the
+# dashboard, so a backend CLI that echoes key material in its 401/403 stderr
+# would park that material on an operator-visible, durable surface. Deliberately
+# narrow — two shapes, each anchored so ordinary diagnostic prose survives:
+#   * ``sk-...`` secret keys (``sk-ant-api03-``, ``sk-ant-oat01-``, ``sk-proj-``).
+#     The lookbehind stops it eating the tail of an innocent word — without it
+#     ``risk-assessment-failure`` redacts to ``ri[REDACTED]``.
+#   * an Authorization-header dump. The ``{16,}`` floor is what keeps prose like
+#     ``Error: invalid bearer token`` intact (``token`` is 5 chars, and the
+#     longest plausible English follower, ``authentication``, is 14); a real
+#     JWT/OAuth bearer is far longer. The label is preserved via the capture
+#     group so an operator can still see WHICH field was masked.
+_CREDENTIAL_SCRUBS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r'(?<![A-Za-z0-9_-])sk-[A-Za-z0-9_-]{12,}'), '[REDACTED]'),
+    (re.compile(r'(bearer\s+)\S{16,}', re.IGNORECASE), r'\1[REDACTED]'),
+)
+
+
+def _sanitise_auth_body(text: str, *, limit: int = 120) -> str:
+    """Collapse ``text`` to one scrubbed line of at most ``limit`` characters.
+
+    Whitespace collapse (not a bare ``.strip()``) because the snippet's stderr
+    fallback stream is commonly MULTI-line, and the result is rendered as a
+    single WARNING log record (``Account {name} AUTH-FAILED: {reason}``), a
+    ``paused_reason`` cell in the dashboard, and one JSON string in the
+    ``auth_failed`` cost event. An embedded newline breaks the first and
+    renders as a blob in the second. Collapsing also spends the ``limit``
+    budget on content rather than on a CLI's indentation.
+
+    Scrub BEFORE truncating, never after: truncation can slice a key below the
+    ``{12,}`` match floor (``sk-ant-api03-abc`` cut to ``sk-ant-a``), which
+    would silently leak the surviving prefix past a scrub applied afterwards.
+    """
+    snippet = ' '.join(text.split())
+    for pattern, replacement in _CREDENTIAL_SCRUBS:
+        snippet = pattern.sub(replacement, snippet)
+    return snippet[:limit]
 
 
 def auth_failure_reason(outcome: AuthFailed) -> str:
@@ -483,11 +526,12 @@ def classify_invocation(
         # with `slot.report(outcome)`. Cannot reuse the `combined` string
         # built below (it is assembled AFTER this tier and interleaves
         # stderr+output with a newline); output-preferred with a stderr
-        # fallback matches the pre-refactor `result.output[:120]`. Truncating
+        # fallback matches the pre-refactor `result.output[:120]`. Sanitising
         # AFTER the fallback choice spends the 120-char budget on whichever
-        # stream actually carried text.
-        snippet = (result.output or '').strip() or (result.stderr or '').strip()
-        return AuthFailed(status=result.api_error_status, body=snippet[:120])
+        # stream actually carried text. `_sanitise_auth_body` owns the
+        # one-line-ness, the credential scrub and the truncation — see there.
+        raw = (result.output or '').strip() or (result.stderr or '').strip()
+        return AuthFailed(status=result.api_error_status, body=_sanitise_auth_body(raw))
 
     combined = f'{result.stderr or ""}\n{result.output or ""}'
     combined_lower = combined.lower()
