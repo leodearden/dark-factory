@@ -1054,6 +1054,7 @@ class Mem0Backend:
         scroll_filter: Any = None,
         page_size: int = 1000,
         max_pages: int = DEFAULT_SCROLL_MAX_PAGES,
+        max_points: int | None = None,
         with_vectors: bool = False,
     ) -> AsyncIterator[Any]:
         """Yield every Qdrant point in *collection_name*, paging on ``next_offset``.
@@ -1088,6 +1089,18 @@ class Mem0Backend:
             page_size: Points requested per page (Qdrant ``limit``).
             max_pages: Page budget; exhausting it raises rather than
                 truncating.
+            max_points: Optional cap on how many points to WALK.  ``None``
+                (the default) is inert — the walk is bounded only by
+                *max_pages* — so every caller that does not opt in is
+                structurally unable to see
+                :class:`ScrollPointBudgetExhausted`.
+
+                The cap is pushed down into the per-page request (each page
+                asks for ``min(page_size, remaining)``), so a capped walk
+                never over-fetches and never pays a look-ahead round-trip to
+                discover there is more.  A caller layering its own cap on top
+                with ``break`` could not have that: it learns "there is more"
+                only by pulling a point past the cap.
             with_vectors: Fetch each point's stored vector.  Costs bandwidth,
                 so it is opt-in.
 
@@ -1095,6 +1108,14 @@ class Mem0Backend:
             Raw Qdrant point objects, in page order.
 
         Raises:
+            ScrollPointBudgetExhausted: If *max_points* is consumed while
+                ``next_offset`` is still live.  Deliberately a DISTINCT event
+                from the page budget below, and checked FIRST when a single
+                page exhausts both: being stopped by the cap the caller itself
+                set is an expected outcome, and attributing it to an internal
+                safety limit would misreport it.  Reaching the cap exactly as
+                the stream ends is NOT this event — nothing was left behind,
+                so nothing is raised.
             ScrollPageBudgetExhausted: If *max_pages* is consumed while
                 ``next_offset`` is still live — the stream is truncated, so it
                 raises instead of ending short.
@@ -1107,7 +1128,12 @@ class Mem0Backend:
         client = await self._get_async_qdrant()
         offset: Any = None
         pages = 0
+        yielded = 0
         while True:
+            # Ask for only what is still wanted, so a capped walk never
+            # over-fetches and never needs a look-ahead page to discover it
+            # has more.
+            page_limit = page_size if max_points is None else min(page_size, max_points - yielded)
             # Bound each PAGE, not the whole scan: a per-scan bound would
             # abort a long-but-healthy multi-page enumeration.
             points, next_offset = await asyncio.wait_for(
@@ -1116,17 +1142,36 @@ class Mem0Backend:
                     scroll_filter=scroll_filter,
                     with_payload=True,
                     with_vectors=with_vectors,
-                    limit=page_size,
+                    limit=page_limit,
                     offset=offset,
                 ),
                 timeout=self._read_timeout,
             )
             pages += 1
             for point in points:
+                # Enforced per-YIELD, not per-page: a server that ignores the
+                # shrunk page_limit still cannot walk the caller past its cap.
+                if max_points is not None and yielded >= max_points:
+                    raise ScrollPointBudgetExhausted(
+                        f'scroll of collection={collection_name!r} exhausted its point '
+                        f'budget of {max_points} with next_offset={next_offset!r} still '
+                        f'live — the scan is truncated. Raise max_points to walk further.',
+                    )
                 yield point
+                yielded += 1
 
+            # A clean end is checked FIRST: reaching the cap exactly as the
+            # stream runs out left nothing behind, so it is not a truncation.
             if next_offset is None:
                 return
+            # The caller's own cap outranks the safety backstop when one page
+            # exhausts both — it is the expected outcome, not an internal limit.
+            if max_points is not None and yielded >= max_points:
+                raise ScrollPointBudgetExhausted(
+                    f'scroll of collection={collection_name!r} exhausted its point '
+                    f'budget of {max_points} with next_offset={next_offset!r} still '
+                    f'live — the scan is truncated. Raise max_points to walk further.',
+                )
             if pages >= max_pages:
                 raise ScrollPageBudgetExhausted(
                     f'scroll of collection={collection_name!r} exhausted its page budget '
