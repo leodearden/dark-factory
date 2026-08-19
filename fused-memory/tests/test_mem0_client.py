@@ -2128,6 +2128,90 @@ class TestMem0BackendScanPayloadText:
             await backend.scan_payload_text(scope=Scope(project_id='p'))
 
     @pytest.mark.asyncio
+    async def test_max_pages_is_accepted_and_forwarded_to_the_pager(self, backend):
+        """The page budget scan inherits from the shared pager is steerable.
+
+        At the default page_size=256 and max_pages=200 the ceiling is 51,200
+        points against a ~19,321-point live corpus (2.6x headroom), so the
+        default is not reachable today — but it is a real ceiling, and a
+        caller that outgrows it needs an escape hatch that is not "copy the
+        walk back out".
+        """
+        from fused_memory.backends.mem0_client import DEFAULT_SCROLL_MAX_PAGES
+
+        pager = _stub_pager()
+        with (
+            patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=AsyncMock())),
+            patch.object(backend, 'scroll_collection_pages', pager),
+        ):
+            await backend.scan_payload_text(scope=Scope(project_id='p'))
+        assert pager.calls[0][1]['max_pages'] == DEFAULT_SCROLL_MAX_PAGES
+
+        pager2 = _stub_pager()
+        with (
+            patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=AsyncMock())),
+            patch.object(backend, 'scroll_collection_pages', pager2),
+        ):
+            await backend.scan_payload_text(scope=Scope(project_id='p'), max_pages=7)
+        assert pager2.calls[0][1]['max_pages'] == 7
+
+    @pytest.mark.asyncio
+    async def test_page_budget_exhaustion_propagates_rather_than_flagging_truncated(
+        self, backend
+    ):
+        """The two truncation events must stay DISTINGUISHABLE at this caller.
+
+        A caller `limit` is something the caller asked for, so it is reported
+        as a normal capped result.  The page budget is a safety backstop
+        nobody asked for; reporting it the same way would hand a sweep a
+        plausible-looking undercount carrying a `truncated` flag it was not
+        told to expect — the exact silent-wrong-value class this scan exists
+        to measure.  So it PROPAGATES.
+        """
+        from fused_memory.backends.mem0_client import ScrollPageBudgetExhausted
+
+        # Pages that never exhaust: next_offset stays live forever.
+        client = AsyncMock()
+        client.scroll = AsyncMock(
+            return_value=([_scan_point('id-1', {'data': _SCAN_LEAK_TEXT})], 'cursor-forever')
+        )
+
+        with (
+            patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=client)),
+            pytest.raises(ScrollPageBudgetExhausted),
+        ):
+            await backend.scan_payload_text(scope=Scope(project_id='p'), max_pages=3)
+
+        assert client.scroll.await_count == 3
+
+    @pytest.mark.asyncio
+    async def test_a_limit_reached_first_is_the_quiet_flagged_form_not_a_raise(
+        self, backend, caplog
+    ):
+        """Both budgets in play, `limit` reached first: flag, not raise.
+
+        Pins the precedence chosen inside the pager — the caller's explicit
+        cap outranks the backstop — as observed from this caller.
+        """
+        client = AsyncMock()
+        client.scroll = AsyncMock(
+            return_value=([_scan_point('id-1', {'data': _SCAN_LEAK_TEXT})], 'cursor-forever')
+        )
+
+        with (
+            patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=client)),
+            caplog.at_level(logging.WARNING),
+        ):
+            result = await backend.scan_payload_text(
+                scope=Scope(project_id='p'), limit=1, max_pages=3
+            )
+
+        assert result['truncated'] is True
+        assert result['scanned'] == 1
+        assert client.scroll.await_count == 1
+        assert any('truncat' in r.message.lower() for r in caplog.records), caplog.text
+
+    @pytest.mark.asyncio
     async def test_page_size_is_forwarded_as_scroll_limit(self, backend):
         mock_client = AsyncMock()
         mock_client.scroll = AsyncMock(return_value=([], None))
