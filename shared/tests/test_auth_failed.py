@@ -305,8 +305,11 @@ def _parse_resets_at_call_sites() -> list[str]:
         # tree it can no longer find is worse than no guard.
         assert root.is_dir(), f'production source root missing: {root}'
         for path in sorted(root.rglob('*.py')):
-            tree = ast.parse(path.read_text(encoding='utf-8'), filename=str(path))
-            for node in ast.walk(tree):
+            source = path.read_text(encoding='utf-8')
+            lines = source.splitlines()
+            # ast.walk is breadth-first, so a single file's hits are not
+            # source-ordered; the caller sorts what it reports.
+            for node in ast.walk(ast.parse(source, filename=str(path))):
                 if not isinstance(node, ast.Call):
                     continue
                 func = node.func
@@ -317,8 +320,9 @@ def _parse_resets_at_call_sites() -> list[str]:
                 else:
                     continue
                 if called == '_parse_resets_at':
-                    sites.append(f'{path.relative_to(_REPO_ROOT)}:{node.lineno}')
-    return sites
+                    rel = path.relative_to(_REPO_ROOT)
+                    sites.append(f'{rel}:{node.lineno}: {lines[node.lineno - 1].strip()}')
+    return sorted(sites)
 
 
 class TestFabricatingForkHasNoProductionCallers:
@@ -351,7 +355,13 @@ class TestFabricatingForkHasNoProductionCallers:
         assert sites, 'AST scan found no _parse_resets_at call anywhere — guard is vacuous'
 
     def test_only_the_strict_copy_owner_calls_the_bare_name(self):
-        offenders = [s for s in _parse_resets_at_call_sites() if not s.startswith(_STRICT_PARSE_OWNER)]
+        # Exact file match, not a prefix match — and NO assertion on the call
+        # COUNT: a legitimate new call to the strict copy inside its own module
+        # must not fail this guard.
+        offenders = [
+            s for s in _parse_resets_at_call_sites()
+            if s.split(':', 1)[0] != _STRICT_PARSE_OWNER
+        ]
         assert offenders == [], (
             'new production caller(s) of the bare `_parse_resets_at` name: '
             f'{offenders}. Outside {_STRICT_PARSE_OWNER} this resolves to the '
