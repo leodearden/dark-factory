@@ -197,9 +197,13 @@ def fixture_marker(fixture: object) -> Any:
     suite-wide defences needs the same "is it really session-scoped and autouse"
     pin, and the two test roots (``tests/scripts/`` and ``scripts/tests/``)
     cannot import each other's test modules — this module is the one place both
-    already import.  ``tests/scripts/test_deploy_clock_isolation.py`` still
-    carries a private copy that predates this; de-duplicating it onto this
-    symbol is a one-line edit in a file outside task 3799's locked scope.
+    already import.  Every caller now resolves THIS symbol: task 3960 deleted
+    the private copy ``tests/scripts/test_deploy_clock_isolation.py`` carried,
+    and with it a test-module-imports-test-module import in
+    ``test_drain_process_leak_isolation.py``.  That single-definition property
+    is held by ``test_deploy_clock_isolation.py::
+    test_fixture_marker_is_the_shared_one_not_a_local_copy``, so the next time
+    pytest moves its private fixture API there is exactly one place to fix.
 
     ``Any``, not ``object``, is the honest annotation and is load-bearing for the
     type gate: the two :data:`_FIXTURE_MARKER_ATTRS` spellings hang DIFFERENT

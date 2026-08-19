@@ -33,7 +33,6 @@ import subprocess
 import sys
 from pathlib import Path
 from types import ModuleType
-from typing import Any
 
 import pytest
 
@@ -51,6 +50,7 @@ from df_pytest_isolation import (  # noqa: E402
     deploy_clock_guard_roots,
     deploy_clock_snapshot,
     deploy_clock_violation_reason,
+    fixture_marker,
 )
 
 # NOT `from df_pytest_isolation import _df_deploy_clocks_unwritten`. Importing a
@@ -59,37 +59,6 @@ from df_pytest_isolation import (  # noqa: E402
 # import and pass even with the conftest wiring removed, i.e. exactly the dead
 # defence it exists to detect. Reach it through the module instead.
 _GUARD_NAME = '_df_deploy_clocks_unwritten'
-
-# pytest's fixture marker is private and has MOVED: <=8.x hangs it off the
-# decorated function as `_pytestfixturefunction`, 9.x wraps the function in a
-# `FixtureFunctionDefinition` carrying `_fixture_function_marker`. Both spellings
-# are accepted, and neither-found is an explicit failure rather than a skipped
-# assertion — a private-API pin that silently stops finding its target is worse
-# than no pin, because it still reads as coverage.
-_MARKER_ATTRS = ('_fixture_function_marker', '_pytestfixturefunction')
-
-
-def _fixture_marker(fixture: object) -> Any:
-    """Return pytest's fixture marker, whatever this pytest version calls it.
-
-    `Any`, not `object`, is the honest annotation and is load-bearing for the
-    type gate: the two `_MARKER_ATTRS` spellings above hang DIFFERENT private
-    classes off the fixture, neither of which pytest exports, so there is no
-    real static type that covers both — and `object` makes every `.scope` /
-    `.autouse` read below a `reportAttributeAccessIssue`. Do not "tighten" this
-    back to `object`; pin the attributes with assertions instead, as the caller
-    does.
-    """
-    for attr in _MARKER_ATTRS:
-        marker = getattr(fixture, attr, None)
-        if marker is not None:
-            return marker
-    pytest.fail(
-        f'cannot find pytest\'s fixture marker on {fixture!r} under any of '
-        f'{_MARKER_ATTRS}. pytest moved its private fixture API again — find the '
-        'new spelling and add it, do NOT delete this assertion.',
-        pytrace=False,
-    )
 
 _FLEET_RELPATH = 'data/orchestrator/last_redeploy_orchestrator.json'
 _FM_RELPATH = 'data/fused-memory/last_redeploy_fused_memory.json'
@@ -455,7 +424,7 @@ class TestGuardIsLiveInThisRun:
         subprocess setup tends to live), and without ``autouse`` nothing would
         ever request it.
         """
-        marker = _fixture_marker(getattr(df_pytest_isolation, _GUARD_NAME))
+        marker = fixture_marker(getattr(df_pytest_isolation, _GUARD_NAME))
 
         assert marker.scope == 'session', f'scope is {marker.scope!r}, expected session'
         assert marker.autouse is True, 'the guard must be autouse — nothing requests it'
