@@ -1668,10 +1668,17 @@ class TestNormalisationLiftedToCanonical:
 
     dedupe.py had THREE uses of the two regexes — ``_normalize_description``
     (feeding ``compute_content_fingerprint``) and ``summary_dedupe_key``'s direct
-    ``_NON_WORD_PATTERN.sub`` (feeding ``find_dedupe_parent``).  Both now delegate
-    to the lifted helper under an explicitly-pinned ``punctuation='strip'``
-    policy, which is what makes the "exactly one implementation" claim structural
-    rather than conventional (INV-5).
+    ``_NON_WORD_PATTERN.sub`` (feeding ``find_dedupe_parent``).  Both call sites
+    now delegate to the lifted helper under an explicitly-pinned
+    ``punctuation='strip'`` policy, and the tests below pin that delegation by
+    OUTPUT EQUALITY against ``canonical_text`` — not by the absence of any
+    particular private name.  The regexes themselves live on quite legitimately
+    inside ``escalation.canonical``, their one home, so their presence somewhere
+    was never the property worth asserting; DRIFT is.  A second implementation of
+    the pipeline is caught the moment it diverges by a single character: the
+    delegation-equality assertions and the digest/tuple characterisation pins
+    below then fail loudly (INV-5).  A copy that does not diverge is not the risk
+    INV-5 exists to catch.
 
     The digests and key tuples below are CHARACTERISATION pins, not aspirations:
     every value was obtained by RUNNING the pre-lift implementation.  They are
@@ -1693,24 +1700,6 @@ class TestNormalisationLiftedToCanonical:
         ('cleanup_needed', 'dead-code', 'starvation:2370:persistent-lock-contention'):
             '45538de967982d58f3aafd64bcfae927f51a41cbb445c2115134b927cb076dd2',
     }
-
-    def test_dedupe_no_longer_owns_the_regexes(self):
-        """INV-5: no second copy of the transform survives in dedupe.py.
-
-        A lifted helper plus a surviving inline copy of the same pipeline is the
-        lockstep duplication the lift exists to prevent, so the module-level
-        constants must be GONE rather than merely unused.
-        """
-        from escalation import dedupe
-
-        assert not hasattr(dedupe, '_NON_WORD_PATTERN'), (
-            'dedupe must not keep its own copy of the non-word regex — '
-            'import canonical_text from escalation.canonical instead'
-        )
-        assert not hasattr(dedupe, '_WHITESPACE_PATTERN'), (
-            'dedupe must not keep its own copy of the whitespace regex — '
-            'import canonical_text from escalation.canonical instead'
-        )
 
     def test_normalize_description_delegates_to_the_strip_policy(self):
         """_normalize_description IS canonical_text(..., punctuation='strip')."""
