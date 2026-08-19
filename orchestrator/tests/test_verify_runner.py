@@ -4392,6 +4392,51 @@ class TestDriftDetectorAgree:
         await detector.check('sha1', _make_spec())
         assert pool.is_quarantined('laptop') is False
 
+    # -- task 4188: verify categories surfaced on the AGREE result --
+
+    async def test_agree_result_carries_suppression_category_from_local_arm(self):
+        """A local arm whose green came from flake suppression is named on the result."""
+        from orchestrator.verify_runner import DriftDetector, DriftVerdict
+        pool, _, _ = _make_drift_pool(
+            local_result=_make_pass_result(category='merge_flake_suppressed'),
+            remote_result=_make_pass_result(),
+        )
+        detector = DriftDetector(pool)
+        result = await detector.check('sha1', _make_spec())
+        assert result.verdict == DriftVerdict.AGREE
+        assert result.local_category == 'merge_flake_suppressed'
+        assert result.remote_category == ''
+
+    async def test_agree_result_carries_suppression_category_from_remote_arm(self):
+        """The mirror case: the REMOTE arm's category is threaded too, not just the local one."""
+        from orchestrator.verify_runner import DriftDetector, DriftVerdict
+        pool, _, _ = _make_drift_pool(
+            local_result=_make_pass_result(),
+            remote_result=_make_pass_result(category='merge_flake_suppressed'),
+        )
+        detector = DriftDetector(pool)
+        result = await detector.check('sha1', _make_spec())
+        assert result.verdict == DriftVerdict.AGREE
+        assert result.local_category == ''
+        assert result.remote_category == 'merge_flake_suppressed'
+
+    async def test_plain_agreement_carries_both_categories(self):
+        """Categories are ALWAYS populated, not only on divergence.
+
+        Both arms carry a NON-EMPTY category so this cannot pass vacuously
+        against the ``''`` dataclass default.
+        """
+        from orchestrator.verify_runner import DriftDetector, DriftVerdict
+        pool, _, _ = _make_drift_pool(
+            local_result=_make_fail_result(category='test_failure'),
+            remote_result=_make_fail_result(category='test_failure'),
+        )
+        detector = DriftDetector(pool)
+        result = await detector.check('sha1', _make_spec())
+        assert result.verdict == DriftVerdict.AGREE
+        assert result.local_category == 'test_failure'
+        assert result.remote_category == 'test_failure'
+
 
 # ---------------------------------------------------------------------------
 # ι step-5: DriftDetector diverge path
@@ -4704,6 +4749,44 @@ class TestDriftDetectorInconclusive:
         detector = DriftDetector(pool)
         await detector.check('sha1', _make_spec())
         assert pool.is_quarantined('laptop') is False
+
+    # -- task 4188: categories stay empty when nothing was compared --
+
+    async def test_drift_check_result_category_fields_default_empty(self):
+        """Both category fields default to '' — the INCONCLUSIVE contract, made explicit."""
+        from orchestrator.verify_runner import DriftCheckResult, DriftVerdict
+        result = DriftCheckResult(merge_sha='x', verdict=DriftVerdict.INCONCLUSIVE)
+        assert result.local_category == ''
+        assert result.remote_category == ''
+
+    async def test_inconclusive_no_eligible_remote_leaves_categories_empty(self):
+        """No eligible remote → nothing compared → both categories stay ''."""
+        from orchestrator.verify_runner import DriftDetector, DriftVerdict
+        pool, _, _ = _make_drift_pool()
+        pool.quarantine('laptop')
+        assert pool.eligible_remote() is None
+        detector = DriftDetector(pool)
+        result = await detector.check('sha1', _make_spec())
+        assert result.verdict == DriftVerdict.INCONCLUSIVE
+        assert result.local_category == ''
+        assert result.remote_category == ''
+
+    async def test_inconclusive_remote_unavailable_leaves_categories_empty(self):
+        """Remote transport failure → categories stay ''.
+
+        Mirrors how ``local_passed`` stays None on this path even though the
+        local arm genuinely produced a result — ``verdict`` is the disambiguator.
+        """
+        from orchestrator.verify_runner import DriftDetector, DriftVerdict, RunnerUnavailable
+        pool, _, remote_fake = _make_drift_pool(
+            local_result=_make_pass_result(category='merge_flake_suppressed'),
+        )
+        remote_fake.run_merge_verify = AsyncMock(side_effect=RunnerUnavailable('host down'))
+        detector = DriftDetector(pool)
+        result = await detector.check('sha1', _make_spec())
+        assert result.verdict == DriftVerdict.INCONCLUSIVE
+        assert result.local_category == ''
+        assert result.remote_category == ''
 
 
 # ---------------------------------------------------------------------------
