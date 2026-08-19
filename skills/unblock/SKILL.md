@@ -560,15 +560,17 @@ The merge procedure is iterative — don't assume one pass will be enough:
   # The trailing `echo` is REQUIRED -- see the [canonical ancestry
   # check](#branch-on-main) above for why: without it, "on main" and "NOT on
   # main" print identical empty output and exit 0, indistinguishable.
-  # rc=0 (on main): proceed to step 8 with done_provenance kind='found_on_main',
-  #   commit=<landing sha: git log --format=%H -1 main>
+  # rc=0 (on main): proceed to step 8 with the landing SHA from `git log --format=%H -1 main`:
+  #   done_provenance={"kind": "found_on_main", "commit": "<sha>", "note": "<cite the providing task or commit>"}
   #   (git log gives the merge commit; git merge-base gives the common ancestor, NOT the merge commit)
+  #   `found_on_main` requires `note` as well as `commit` — see step 8's payload bullets.
   # rc=128 (branch ref gone — already cleaned up after a successful merge): do NOT read
   #   this as "not on main". Run the exact-subject merge-marker search from the canonical
   #   check above:
   #     git log main --fixed-strings --grep="Merge task/<TASK_ID> into main" \
   #         --max-count=1 --format=%H
-  #   Non-empty → proceed to step 8 with that SHA as kind='found_on_main'.
+  #   Non-empty → proceed to step 8 with that SHA as
+  #     done_provenance={"kind": "found_on_main", "commit": "<sha>", "note": "<cite the providing task or commit>"}
   #   Empty     → not landed. (Do NOT substitute an unfiltered `git log main --merges`:
   #                it takes no task argument and would report "landed" for every rc=128.)
   # rc=1 (genuinely not on main) AND queue healthy: loop back to step 7 (resubmit).
@@ -736,7 +738,8 @@ git merge-base --is-ancestor task/<TASK_ID> main; rc=$?; echo "ancestry rc=$rc"
 # The trailing `echo` is REQUIRED -- see the [canonical ancestry
 # check](#branch-on-main) above for why: without it, "on main" and "NOT on
 # main" print identical empty output and exit 0, indistinguishable.
-# rc=0 (on main): treat as done; proceed to step 8 with done_provenance kind='found_on_main'
+# rc=0 (on main): treat as done; proceed to step 8 with the landing SHA from `git log --format=%H -1 main`:
+#   done_provenance={"kind": "found_on_main", "commit": "<sha>", "note": "<cite the providing task or commit>"}
 # rc=128 (branch ref gone after a successful merge + cleanup): NOT the same as rc=1 —
 #   run the merge-marker search from the canonical check above before concluding anything
 # rc=1 (not on main): the merge did not land; decide whether to resubmit or discard
