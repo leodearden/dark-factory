@@ -3166,7 +3166,16 @@ class MemoryService:
         stats = ReferentStats()
         if result is None or not referents:
             return stats
-        edges = getattr(result, 'edges', None) or []
+        # The `edges or entity_edges` idiom every sibling post-write sweep in
+        # this file uses (2378, 2518, 2621, 2795, 3832, 3871). Reading `edges`
+        # alone would make this pass a silent, TOTAL no-op on a result that
+        # exposes only `entity_edges` -- a shape the other six still walk, and
+        # one this method's own docstring promises parity on.
+        edges = (
+            getattr(result, 'edges', None)
+            or getattr(result, 'entity_edges', None)
+            or []
+        )
         if not edges:
             return stats
 
