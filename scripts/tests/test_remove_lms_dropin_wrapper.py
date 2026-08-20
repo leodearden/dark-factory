@@ -367,3 +367,108 @@ def test_selftest_prefix_is_shared_and_cannot_match_a_real_unit() -> None:
     assert _SELFTEST_PREFIX == "lms-dropin-selftest-"
     for real in ("lms-arm@", "fused-memory", "dark-factory-dashboard", "orchestrator"):
         assert not real.startswith(_SELFTEST_PREFIX)
+
+
+# ---------------------------------------------------------------------------
+# step-5: RED -- the stale-residue prune
+# ---------------------------------------------------------------------------
+
+def _write_unit(unit_dir: Path, template: str, *, age_s: float, now: float) -> tuple[Path, Path]:
+    """Install a <template>.service + <template>.service.d/ pair aged age_s.
+
+    Mirrors the exact on-disk shape the .sh's install_fixture() leaves behind,
+    so the prune is driven against real residue rather than a stand-in.
+    """
+    unit_dir.mkdir(parents=True, exist_ok=True)
+    unit = unit_dir / f"{template}.service"
+    dropin_dir = unit_dir / f"{template}.service.d"
+    dropin_dir.mkdir(exist_ok=True)
+    unit.write_text("[Service]\nExecStart=/bin/true\n")
+    (dropin_dir / "10-worktree-3713.conf").write_text("[Service]\nWorkingDirectory=/x\n")
+    stamp = now - age_s
+    for path in (unit, dropin_dir / "10-worktree-3713.conf", dropin_dir):
+        os.utime(path, (stamp, stamp))
+    return unit, dropin_dir
+
+
+def test_prune_removes_stale_selftest_residue(tmp_path: Path) -> None:
+    """(a) An OLD selftest unit and its drop-in dir are both removed.
+
+    Uniquifying the template name costs exactly one thing, and this is it.
+    The .sh's old FIXED name self-healed: a run killed before its EXIT trap
+    fired left residue the next run simply overwrote and removed.  Unique
+    names have no such self-healing -- a SIGKILLed run (verify timeout, task
+    cancellation, both routine in this fleet) strands
+    lms-dropin-selftest-<pid>-<hex>@.service in the operator's LIVE unit dir
+    forever, and those accumulate, slowing every daemon-reload and polluting
+    `systemctl --user list-unit-files`.  Driven against tmp_path with
+    hand-set mtimes: no systemd, no sleeping, no real unit dir.
+    """
+    now = 1_000_000.0
+    unit_dir = tmp_path / "systemd" / "user"
+    unit, dropin_dir = _write_unit(
+        unit_dir, f"{_SELFTEST_PREFIX}999-deadbeef@", age_s=7200.0, now=now
+    )
+
+    _prune_stale_selftest_units(unit_dir, now=now, max_age_s=3600.0)  # noqa: F821
+
+    assert not unit.exists(), f"stale {unit.name} should have been pruned"
+    assert not dropin_dir.exists(), f"stale {dropin_dir.name}/ should have been pruned"
+
+
+def test_prune_leaves_a_fresh_selftest_unit_alone(tmp_path: Path) -> None:
+    """(b) SAFETY -- a FRESH selftest unit belongs to a RUNNING sibling.
+
+    Under 48-way concurrency another task's .sh may be mid-run right now, and
+    its fixture is a selftest-prefixed unit that is only seconds old.
+    Deleting it would destroy that run's fixture and turn a green sibling red
+    -- reintroducing, from the cleanup side, the very collision the unique
+    template name was introduced to eliminate.  Age is the only thing
+    separating "my abandoned residue" from "someone else's live fixture".
+    """
+    now = 1_000_000.0
+    unit_dir = tmp_path / "systemd" / "user"
+    unit, dropin_dir = _write_unit(
+        unit_dir, f"{_SELFTEST_PREFIX}12345-cafebabe@", age_s=5.0, now=now
+    )
+
+    _prune_stale_selftest_units(unit_dir, now=now, max_age_s=3600.0)  # noqa: F821
+
+    assert unit.exists(), "a FRESH selftest unit belongs to a concurrent run and must survive"
+    assert dropin_dir.exists(), "a FRESH selftest drop-in dir must survive"
+
+
+def test_prune_never_touches_a_non_selftest_unit(tmp_path: Path) -> None:
+    """(c) SAFETY -- a real unit is never swept up, at ANY age.
+
+    This prune deletes files out of the operator's live
+    ~/.config/systemd/user.  `lms-arm@` is the actual unit the script under
+    test targets, and the dark-factory units below are the live fleet.  All
+    are aged FAR beyond max_age_s -- age must be irrelevant for anything
+    lacking the selftest prefix, or this module becomes the outage it was
+    written to prevent.
+    """
+    now = 1_000_000.0
+    unit_dir = tmp_path / "systemd" / "user"
+    reals = [
+        _write_unit(unit_dir, "lms-arm@", age_s=86_400.0 * 30, now=now),
+        _write_unit(unit_dir, "fused-memory", age_s=86_400.0 * 90, now=now),
+        _write_unit(unit_dir, "dark-factory-dashboard", age_s=86_400.0 * 90, now=now),
+    ]
+
+    _prune_stale_selftest_units(unit_dir, now=now, max_age_s=3600.0)  # noqa: F821
+
+    for unit, dropin_dir in reals:
+        assert unit.exists(), f"{unit.name} is a REAL unit and must never be pruned"
+        assert dropin_dir.exists(), f"{dropin_dir.name}/ is REAL and must never be pruned"
+
+
+def test_prune_is_silent_when_the_unit_dir_does_not_exist(tmp_path: Path) -> None:
+    """A fresh checkout or a container with no ~/.config/systemd/user.
+
+    The prune is opportunistic hygiene called before the real work; it must
+    never be the thing that turns a green suite red.
+    """
+    _prune_stale_selftest_units(  # noqa: F821
+        tmp_path / "nope" / "systemd" / "user", now=1_000_000.0, max_age_s=3600.0
+    )
