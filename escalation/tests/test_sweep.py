@@ -876,3 +876,90 @@ class TestReapOrphanLocksSeqSafety:
         # from it rather than falling into _recover_seq_from_disk's repair path
         # (which, with no submitted records on disk, would rewind to esc-4566-1).
         assert EscalationQueue(tmp_path).make_id('4566') == 'esc-4566-2'
+
+
+class TestStartupSweepOrphanLockPass:
+    """run_startup_sweep's fourth pass: wiring, ordering, dry-run and idempotency."""
+
+    _NOW = datetime(2026, 6, 4, tzinfo=UTC)
+    _STALE_AT = '2026-01-01T00:00:00+00:00'
+    _RECENT_AT = '2026-05-20T10:00:00+00:00'
+
+    def _disk_snapshot(self, root: Path) -> dict[str, bytes]:
+        """Return {relative_path_str: content_bytes} for every regular file under root."""
+        return {
+            str(p.relative_to(root)): p.read_bytes()
+            for p in sorted(root.rglob('*'))
+            if p.is_file()
+        }
+
+    def test_lock_of_same_run_pruned_record_is_reaped(self, tmp_path: Path):
+        """ORDERING: the reap runs AFTER prune, so this run's evictions are cleaned up.
+
+        Reversing the two passes would leave the pruned record's sidecar behind
+        for a whole restart cycle — the exact accumulation this task removes.
+        """
+        # Stale: prune_archive drops archive/2026-01-01 during THIS run.
+        _write_archive_esc(tmp_path, 'esc-9-1', self._STALE_AT, 'resolved')
+        stale_lock = _write_lock(tmp_path, 'esc-9-1')
+        # Recent: inside retention, so record and sidecar both stay.
+        _write_archive_esc(tmp_path, 'esc-8-1', self._RECENT_AT, 'resolved')
+        recent_lock = _write_lock(tmp_path, 'esc-8-1')
+
+        report = sweep.run_startup_sweep(tmp_path, now=self._NOW)
+
+        assert report.pruned_dirs == 1, 'the stale dated dir should have been pruned'
+        assert report.orphan_locks_reaped == 1
+        assert not stale_lock.exists(), (
+            'sidecar of a record pruned in this same run survived — the reap pass '
+            'must run after prune_archive'
+        )
+        assert recent_lock.exists(), 'sidecar of a still-archived record was reaped'
+
+    def test_startup_summary_line_reports_orphan_lock_count(self, tmp_path: Path, caplog):
+        """The one INFO summary line carries orphan_locks= beside the other counts."""
+        _write_lock(tmp_path, 'esc-1-1')
+
+        with caplog.at_level(logging.INFO, logger='escalation.sweep'):
+            sweep.run_startup_sweep(tmp_path, now=self._NOW)
+
+        infos = [
+            r for r in caplog.records
+            if r.name == 'escalation.sweep' and r.levelno == logging.INFO
+        ]
+        assert len(infos) == 1, f'expected ONE summary line; got: {[r.getMessage() for r in infos]}'
+        msg = infos[0].getMessage()
+        assert 'orphan_locks=1' in msg, msg
+        assert 'loose_reaped=' in msg and 'pruned_dirs=' in msg, msg
+
+    def test_startup_dry_run_reports_orphans_without_deleting(self, tmp_path: Path, caplog):
+        """apply=False counts orphans and leaves disk byte-identical."""
+        lock_path = _write_lock(tmp_path, 'esc-1-1')
+        before = self._disk_snapshot(tmp_path)
+
+        with caplog.at_level(logging.INFO, logger='escalation.sweep'):
+            report = sweep.run_startup_sweep(tmp_path, apply=False, now=self._NOW)
+
+        assert report.orphan_locks_reaped >= 1
+        assert lock_path.exists(), 'dry-run unlinked a sidecar'
+        assert self._disk_snapshot(tmp_path) == before, 'dry-run changed disk state'
+        assert any(
+            'DRY-RUN' in r.getMessage() for r in caplog.records
+        ), f'expected DRY-RUN summary; got: {[r.getMessage() for r in caplog.records]}'
+
+    def test_second_startup_sweep_is_a_byte_stable_noop(self, tmp_path: Path):
+        """After an applying run the pass neither re-reaps nor resurrects a sidecar."""
+        _write_lock(tmp_path, 'esc-1-1')
+        _write_root_esc(tmp_path, 'esc-3-1', 'pending')
+
+        first = sweep.run_startup_sweep(tmp_path, now=self._NOW)
+        assert first.orphan_locks_reaped == 1
+        snapshot_after_run1 = self._disk_snapshot(tmp_path)
+
+        second = sweep.run_startup_sweep(tmp_path, now=self._NOW)
+
+        assert second.orphan_locks_reaped == 0, 'nothing left to reap on the second run'
+        assert self._disk_snapshot(tmp_path) == snapshot_after_run1, (
+            'second run_startup_sweep changed disk state — the reap pass either '
+            're-created a sidecar via escalation_id_lock or re-reaped'
+        )
