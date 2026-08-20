@@ -1937,6 +1937,19 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     """Build a live service, run the sweep, write both artifacts, exit graded."""
+    # This script is otherwise print-based, so without this the module logger
+    # added for the fail-closed store preflight would have no handler at all
+    # and its refusal would reach the operator only through
+    # ``logging.lastResort`` -- a bare line on stderr with no timestamp, level
+    # or logger name, unlike every sibling guarded script. ``stream`` is named
+    # explicitly because stdout here is reserved for the machine-read report
+    # rendered below; diagnostics must not land in it.
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s %(levelname)s %(message)s',
+        stream=sys.stderr,
+    )
+
     args = _build_parser().parse_args(argv)
 
     if args.config:

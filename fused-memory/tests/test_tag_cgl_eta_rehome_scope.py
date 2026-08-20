@@ -581,13 +581,14 @@ class TestRunApplyStoreMutationPreflight:
         memory.mem0.update.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_the_guard_sits_before_the_tagging(self, monkeypatch):
-        """The scan already ran -- the probe gates only the write half.
+    async def test_the_guard_sits_before_every_backend_read(self, monkeypatch):
+        """It aborts without a single store round-trip.
 
-        Unlike the other guarded scripts this one probes at the ``--apply``
-        gate rather than the top of ``run``, so the scroll IS paid for. That is
-        the deliberate trade for keeping the unknown---project-id abort below
-        probe-free; what must hold is that nothing was TAGGED.
+        The probe sits below the unknown---project-id abort (kept probe-free by
+        the test further down) but ABOVE the ``scroll_by_metadata`` loop, so a
+        run that was never going to be allowed to mutate does not first pay for
+        a full multi-project scroll of up to ``--scan-limit`` records per
+        project. Nothing is TAGGED either, which is the point of the guard.
         """
         self._deny(monkeypatch)
         memory = self._make_memory()
@@ -599,6 +600,7 @@ class TestRunApplyStoreMutationPreflight:
                 known_projects_map=self._known_map(),
             )
 
+        memory.mem0.scroll_by_metadata.assert_not_awaited()
         memory.mem0.update.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -663,10 +665,13 @@ class TestRunApplyStoreMutationPreflight:
         """A run that aborts before reaching the tagging must not be gated on
         write capability -- it mutates nothing.
 
-        This is the test that pins the placement at the ``if args.apply:`` gate
-        rather than the top of ``run``: hoisting the probe would turn a clear
+        This is the test that pins the probe BELOW this abort rather than at
+        the very top of ``run``: hoisting it further would turn a clear
         "unknown --project-id" abort into an unrelated store-capability
-        refusal for anyone diagnosing a typo'd flag from a sandbox.
+        refusal for anyone diagnosing a typo'd flag from a sandbox. Together
+        with ``test_the_guard_sits_before_every_backend_read`` above -- which
+        pins it ABOVE the scroll -- the two bracket the placement from both
+        sides.
         """
         calls: list[dict] = []
         monkeypatch.setattr(
