@@ -334,6 +334,16 @@ def _run_script(worktree_base, *args, env=None, unit=UNIT):
     fake is constructed), and so where the synthetic-unit guard lives rather
     than in `_fake_systemctl`, which never sees a unit name at all.
 
+    TWO CHECKS, NOT ONE, because there are two routes to the variable and they
+    guard different properties. The pre-flight check on `unit` runs before
+    `_fake_systemctl` builds the shim, so a rejected keyword call writes
+    nothing and spawns nothing. But `env=` merges LAST (deliberately -- see
+    below), so a caller passing env={"ORCH_RESTART_UNIT": ...} bypasses the
+    keyword entirely; the second check reads the EFFECTIVE value out of
+    `full_env` immediately before the spawn, which is the only place both
+    routes have converged. Checking only the keyword would ship the guard and a
+    documented way around it.
+
     Systemctl invocations are inspectable afterward via
     `_systemctl_calls(worktree_base)`.
     """
@@ -355,6 +365,16 @@ def _run_script(worktree_base, *args, env=None, unit=UNIT):
     # `env=` LAST so a per-test override still wins.
     if env:
         full_env.update(env)
+    # SECOND, on the EFFECTIVE value: `env=` can overwrite ORCH_RESTART_UNIT
+    # after the pre-flight check, and only this one sits between every route
+    # and the subprocess (and so the `exec`d delegate that calls systemctl).
+    assert_synthetic_units(
+        [full_env["ORCH_RESTART_UNIT"]],
+        where=(
+            "scripts/tests/test_deploy_w11_lane_lifecycle.py::_run_script "
+            "(effective ORCH_RESTART_UNIT, after the env= merge)"
+        ),
+    )
     return subprocess.run(
         ["bash", str(SCRIPT), *args],
         env=full_env,
@@ -391,15 +411,61 @@ def test_run_script_rejects_a_real_unit_name(tmp_path):
     any subprocess work: the rejection must happen at construction, not after
     a script run.
     """
+    worktree_base = _build_worktree_base(tmp_path, [])
+    with pytest.raises(pytest.fail.Exception) as excinfo:
+        _run_script(worktree_base, "--check", unit="orchestrator-dark-factory.service")
+    message = str(excinfo.value)
+    assert "orchestrator-dark-factory.service" in message, message
+    assert "_run_script" in message, message
+    # The write-nothing/spawn-nothing property the pre-flight placement exists
+    # FOR, asserted rather than merely claimed: were the check ever moved below
+    # `_fake_systemctl(...)` or below the spawn, the message assertions above
+    # would still pass while a real unit name had already been shimmed onto
+    # PATH. `_fake_systemctl` is the sole creator of <tmp_path>/bin here
+    # (`_build_worktree_base` makes only origin/ and worktrees/), so its
+    # absence is a direct ordering proof.
+    assert not (tmp_path / "bin").exists(), (
+        "a rejected call must build no PATH shim -- the guard belongs BEFORE "
+        "`_fake_systemctl`"
+    )
+    assert _systemctl_calls(worktree_base) == [], (
+        "a rejected call must spawn nothing; got "
+        f"{_systemctl_calls(worktree_base)!r}"
+    )
+
+
+def test_run_script_rejects_a_real_unit_name_via_env(tmp_path):
+    """The `env=` route must be guarded too, not just the `unit=` keyword.
+
+    `_run_script` merges `env=` LAST so a per-test override still wins, which
+    makes env={"ORCH_RESTART_UNIT": ...} a SANCTIONED route past the pre-flight
+    `unit` check rather than a hypothetical one. Only the effective-value
+    check, read out of `full_env` immediately before the spawn, stands between
+    it and the `exec`d delegate that actually issues the restart. The twin of
+    this test lives in scripts/tests/test_restart_orchestrator.py -- two copies
+    because the two roots cannot import each other's test modules.
+
+    The shim IS built by the time this fires (`_fake_systemctl` runs before the
+    env dict), so the property asserted is the spawn-nothing one, not the
+    write-nothing one above.
+    """
+    worktree_base = _build_worktree_base(tmp_path, [])
     with pytest.raises(pytest.fail.Exception) as excinfo:
         _run_script(
-            _build_worktree_base(tmp_path, []),
+            worktree_base,
             "--check",
-            unit="orchestrator-dark-factory.service",
+            env={"ORCH_RESTART_UNIT": "orchestrator-dark-factory.service"},
         )
     message = str(excinfo.value)
     assert "orchestrator-dark-factory.service" in message, message
     assert "_run_script" in message, message
+    # Names the SECOND check specifically, so this cannot pass by accidentally
+    # tripping the pre-flight one.
+    assert "effective" in message, message
+    assert _systemctl_calls(worktree_base) == [], (
+        "a rejected call must spawn nothing; got "
+        f"{_systemctl_calls(worktree_base)!r}"
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -174,6 +174,15 @@ def _run_script(bin_dir, state_path, *extra_args, env=None, unit=UNIT):
     members of this family): the fake discards the unit token, so the name
     never reaches the factory -- it reaches the real bash subprocess through
     ORCH_RESTART_UNIT, set here.
+
+    TWO CHECKS, NOT ONE, because there are two routes to the variable and they
+    guard different properties. The pre-flight check on `unit` runs before the
+    env dict exists, so a rejected keyword call shims nothing and spawns
+    nothing. But `env=` merges LAST (deliberately -- see below), so a caller
+    passing env={"ORCH_RESTART_UNIT": ...} bypasses the keyword entirely; the
+    second check reads the EFFECTIVE value out of `full_env` immediately before
+    the spawn, which is the only place both routes have converged. Checking
+    only the keyword would ship the guard and a documented way around it.
     """
     # FIRST, before the env is built or PATH is shimmed, so a rejected call
     # shims nothing.
@@ -188,6 +197,16 @@ def _run_script(bin_dir, state_path, *extra_args, env=None, unit=UNIT):
     # spawner in this family follows.
     if env:
         full_env.update(env)
+    # SECOND, on the EFFECTIVE value: `env=` can overwrite ORCH_RESTART_UNIT
+    # after the pre-flight check, and only this one sits between every route
+    # and the subprocess.
+    assert_synthetic_units(
+        [full_env["ORCH_RESTART_UNIT"]],
+        where=(
+            "scripts/tests/test_restart_orchestrator.py::_run_script "
+            "(effective ORCH_RESTART_UNIT, after the env= merge)"
+        ),
+    )
     return subprocess.run(
         ["bash", str(SCRIPT), *extra_args],
         env=full_env,
@@ -272,6 +291,51 @@ def test_run_script_rejects_a_real_unit_name(tmp_path):
     message = str(excinfo.value)
     assert "orchestrator-dark-factory.service" in message, message
     assert "_run_script" in message, message
+    # The no-side-effect property the pre-flight placement exists FOR, asserted
+    # rather than merely claimed: were the check ever moved below the spawn,
+    # the message assertions above would still pass while the real bash script
+    # had already run against a real unit name. `_make_fake_systemctl` seeded
+    # `calls` empty, so anything here means a subprocess ran.
+    assert _load_state(state_path)["calls"] == [], (
+        "a rejected call must spawn nothing -- the guard belongs BEFORE the "
+        f"subprocess. got calls={_load_state(state_path)['calls']!r}"
+    )
+
+
+def test_run_script_rejects_a_real_unit_name_via_env(tmp_path):
+    """The `env=` route must be guarded too, not just the `unit=` keyword.
+
+    `_run_script` merges `env=` LAST so a per-test override still wins, and
+    `test_target_unit_is_env_overridable` below relies on exactly that --
+    which makes env={"ORCH_RESTART_UNIT": ...} a SANCTIONED route, not a
+    hypothetical one. It bypasses the `unit` keyword entirely, so the
+    pre-flight check cannot see it; only the effective-value check, read out
+    of `full_env` immediately before the spawn, stands between it and the
+    PATH-shimmed fake. Guarding one route and documenting the other would ship
+    the hazard this whole family exists to close.
+
+    The shim IS built by the time this fires (the caller constructed it), so
+    the property asserted is the spawn-nothing one, not the write-nothing one.
+    """
+    bin_dir, state_path = _make_fake_systemctl(tmp_path)
+
+    with pytest.raises(pytest.fail.Exception) as excinfo:
+        _run_script(
+            bin_dir,
+            state_path,
+            env={"ORCH_RESTART_UNIT": "orchestrator-dark-factory.service"},
+        )
+    message = str(excinfo.value)
+    assert "orchestrator-dark-factory.service" in message, message
+    assert "_run_script" in message, message
+    # Names the SECOND check specifically, so a reader of the failure knows
+    # which of the two seams fired -- and so this test cannot pass by
+    # accidentally tripping the pre-flight one.
+    assert "effective" in message, message
+    assert _load_state(state_path)["calls"] == [], (
+        "a rejected call must spawn nothing. got "
+        f"calls={_load_state(state_path)['calls']!r}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -312,14 +376,27 @@ def test_target_unit_is_env_overridable(tmp_path):
     )
 
     calls = _load_state(state_path)["calls"]
-    assert ["--user", "restart", override] in calls, (
-        f"Expected ORCH_RESTART_UNIT to retarget the restart at {override!r}; "
-        f"got calls={calls!r}"
+
+    # THE RETARGET CONTRACT, ASSERTED AS A PROPERTY rather than as "some named
+    # literal is absent". Naming `orchestrator-dark-factory.service` here would
+    # rot silently: if the script's production default were ever retargeted at
+    # a different unit, a check for the old name would keep passing while a
+    # reads-the-var-AND-ALSO-restarts-its-default regression sailed through. It
+    # would also read as a substring test while `x in call` is element equality
+    # over an argv list, so a unit embedded in a compound token would escape.
+    # "the override is the ONLY unit named anywhere" has neither weakness and
+    # is the contract the test's name actually claims.
+    restarts = [call for call in calls if "restart" in call]
+    assert restarts == [["--user", "restart", override]], (
+        f"ORCH_RESTART_UNIT must RETARGET the restart at {override!r} and at "
+        f"nothing else -- exactly one restart call, naming only the override. "
+        f"got restarts={restarts!r} out of calls={calls!r}"
     )
-    assert not any("orchestrator-dark-factory.service" in call for call in calls), (
-        "ORCH_RESTART_UNIT must RETARGET the script, not merely add a call: the "
-        "real unit name orchestrator-dark-factory.service must appear in NO "
-        f"recorded call. got calls={calls!r}"
+    named_units = {tok for call in calls for tok in call if tok.endswith(".service")}
+    assert named_units == {override}, (
+        f"every systemctl call (the verify-loop `show` polls included) must "
+        f"name the override {override!r} and no other unit; got "
+        f"{sorted(named_units)!r} from calls={calls!r}"
     )
 
 

@@ -1264,6 +1264,17 @@ def assert_synthetic_units(units: Iterable[str], *, where: str) -> None:
     every one of them and could only be silenced by an exclusion list, which is
     itself the thing that rots.)
 
+    WHEN THE NAME TRAVELS BY ENVIRONMENT rather than by argument, one call at the
+    construction point does not cover the seam -- check the EFFECTIVE value
+    immediately before the spawn as well.
+    ``scripts/tests/test_restart_orchestrator.py::_run_script`` and its
+    ``test_deploy_w11_lane_lifecycle.py`` twin do both: they hand
+    ``restart-orchestrator.sh`` its target through ``ORCH_RESTART_UNIT`` and merge
+    a caller-supplied ``env=`` LAST (so a per-test override wins), which makes the
+    keyword and the environment two independent routes to the same subprocess.
+    Only the second, post-merge check sees both; guarding the keyword alone ships
+    the guard together with a documented way around it.
+
     *where* is the caller's own ``<file>::<factory>`` label. It is required and
     keyword-only because the message is read far from here: a bare "a real unit
     name was used" leaves the reader grepping five files for the seam that fired.
