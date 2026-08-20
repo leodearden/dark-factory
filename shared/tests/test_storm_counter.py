@@ -478,16 +478,23 @@ class TestDistinctKeyCounting:
     def test_summary_count_reports_distinct_keys_not_raw_events(self):
         counter = StormCounter(count_distinct=True)
 
-        # 7 events, 3 distinct keys.
-        for key in ('owner-1', 'owner-1', 'owner-2', 'owner-2', 'owner-2', 'owner-3'):
+        # 6 events, 3 distinct keys — the third DISTINCT key arrives last, so
+        # the fire lands on the 6th event with 6 events live in the window.
+        keys = ('owner-1', 'owner-1', 'owner-2', 'owner-2', 'owner-2', 'owner-3')
+        fires = [
             counter.record(threshold=3, window_seconds=3600.0, label='p', key=key)
-        summary = counter.record(threshold=3, window_seconds=3600.0, label='p', key='owner-3')
+            for key in keys
+        ]
 
+        assert [f is not None for f in fires] == [False] * 5 + [True], (
+            'the burst must fire on the third DISTINCT key, not the third event'
+        )
+        summary = fires[-1]
         assert summary is not None
         assert summary['count'] == 3, (
             f'count must be the DISTINCT key count, got {summary["count"]!r} — '
-            'reporting the raw event count would misstate the incident size to '
-            'the operator reading the escalation'
+            'reporting the raw event count (6 here) would misstate the incident '
+            'size to the operator reading the escalation'
         )
 
     def test_none_keys_neither_count_nor_block(self):

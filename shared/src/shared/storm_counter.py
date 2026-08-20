@@ -1,7 +1,7 @@
 """Shared rolling-window burst detector (INV-4 storm counters, INV-5 single home).
 
-The body below — append ``(now, label)``, prune to the window, count, compare
-to the threshold, then rate-limit to one fire per window, and report the
+The body below — append ``(now, label, key)``, prune to the window, count,
+compare to the threshold, then rate-limit to one fire per window, and report the
 DISTINCT labels seen in the window — is the established storm-counter pattern
 first written as ``reconciliation/harness.py::_record_placeholder_finding_drop``
 and since reproduced in ``harness._dead_owner_suppressions`` and
@@ -54,6 +54,27 @@ class StormCounter:
     keying (``MarkupStormCounter``) and per-``agent_id`` keying
     (``MemoryService.update_memory``).
 
+    A counter built with ``count_distinct=True`` gains a SECOND, orthogonal
+    dimension: the per-call ``key``. The threshold is then compared against the
+    number of DISTINCT non-``None`` keys in the window rather than the raw
+    event count, while ``label`` keeps naming the burst independently. The
+    motivating consumer is
+    ``reconciliation/harness.py::_record_dead_owner_suppression``, which must
+    threshold on distinct dead-owner ``instance_id`` values (task 2039 — every
+    orphan recovered by ONE restart shares that one owner's instance_id, so a
+    single multi-project restart contributes 1 no matter how many projects it
+    touched) while still attributing the burst to the distinct ``project_id``
+    values it spanned. Neither the single ``label`` nor the middleware's
+    one-counter-per-key convention can express that: the former thresholds on
+    raw events, and the latter would put the threshold on the NUMBER of counter
+    objects, which no individual counter can see.
+
+    ``count_distinct`` is deliberately a CONSTRUCTOR flag while ``threshold``
+    and ``window_seconds`` stay per-call. It is a STRUCTURAL mode fixed by the
+    call site, not a config leaf, so capturing it at construction cannot go
+    stale — the RELOAD SAFETY rule in the module docstring constrains config
+    VALUES only.
+
     State is PROCESS-LOCAL and resets on restart, like every other in-process
     storm counter in this codebase: the counter exists to catch a live burst,
     not to keep durable statistics. It is also per-instance, so no state bleeds
@@ -63,9 +84,15 @@ class StormCounter:
     :meth:`record` never awaits.
     """
 
-    def __init__(self, time_provider: Callable[[], float] = time.time) -> None:
+    def __init__(
+        self,
+        time_provider: Callable[[], float] = time.time,
+        *,
+        count_distinct: bool = False,
+    ) -> None:
         self._now = time_provider
-        self._events: deque[tuple[float, str | None]] = deque()
+        self._count_distinct = count_distinct
+        self._events: deque[tuple[float, str | None, str | None]] = deque()
         self._last_fire_ts: float | None = None
 
     def _prune(self, now: float, window_seconds: float) -> int:
@@ -73,6 +100,10 @@ class StormCounter:
 
         The window is half-open: an event aged exactly *window_seconds* is
         already out.
+
+        Always the RAW remaining-event count, even in ``count_distinct`` mode —
+        :meth:`record` derives the distinct-key count from the pruned deque
+        itself, and :meth:`prune`'s public contract is remaining STATE.
         """
         cutoff = now - window_seconds
         while self._events and self._events[0][0] <= cutoff:
@@ -94,6 +125,13 @@ class StormCounter:
         already aged past the rate limit, and a freshly constructed counter
         would decide identically on the next event.
 
+        The returned count is the number of remaining EVENTS in every mode,
+        never the distinct-key count: this is an emptiness probe for sweepers
+        that drop whatever returns ``0``, so it must answer "how much state is
+        left". A ``count_distinct`` counter holding only ``key=None`` events
+        has zero distinct keys but is not empty, and evicting it would discard
+        live window state.
+
         *now* is the optional PER-CALL clock override described on
         :meth:`record`; omitting it reads the constructor-injected
         ``time_provider``, which is the default every existing consumer uses.
@@ -106,6 +144,7 @@ class StormCounter:
         threshold: int,
         window_seconds: float,
         label: str | None = None,
+        key: str | None = None,
         now: float | None = None,
     ) -> dict[str, Any] | None:
         """Record one event; return a storm summary iff a burst just fired.
@@ -117,6 +156,13 @@ class StormCounter:
         *label* is what the event should be attributed to, or ``None`` when the
         caller could not resolve one. Unlabelled events still count toward the
         burst — there is simply nothing to name them against.
+
+        *key* is the DISTINCT-COUNT dimension, and is read only when the
+        counter was built with ``count_distinct=True`` (see the class
+        docstring). It is orthogonal to *label*: the burst is thresholded on
+        distinct keys and NAMED by distinct labels. ``key=None`` is excluded
+        from the distinct set entirely — such an event neither counts toward
+        the threshold nor blocks it.
 
         *now* is an optional PER-CALL clock override, as an epoch float. The
         constructor-injected *time_provider* remains the default and is what
@@ -133,6 +179,10 @@ class StormCounter:
         rate-limit arithmetic alike, so an injected instant behaves exactly as
         a provider-stamped one would.
 
+        The count compared to *threshold* is the number of events in the
+        window, or — in ``count_distinct`` mode — the number of distinct
+        non-``None`` keys among them.
+
         Returns ``None`` when the count within the window is below *threshold*,
         AND when the threshold is met but a previous fire is still inside the
         window (the rate limit — without it, a runaway emitting hundreds of
@@ -147,8 +197,10 @@ class StormCounter:
         effective_now = now if now is not None else self._now()
 
         # Append, then prune.
-        self._events.append((effective_now, label))
+        self._events.append((effective_now, label, key))
         count = self._prune(effective_now, window_seconds)
+        if self._count_distinct:
+            count = len({k for _, _, k in self._events if k is not None})
         if count < threshold:
             return None
 
@@ -166,5 +218,5 @@ class StormCounter:
             'window_seconds': window_seconds,
             # Unlabelled events still count toward the burst, but there is
             # nothing to escalate them against, so they are simply not named.
-            'labels': sorted({label for _, label in self._events if label is not None}),
+            'labels': sorted({lbl for _, lbl, _ in self._events if lbl is not None}),
         }
