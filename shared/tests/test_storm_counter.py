@@ -300,3 +300,121 @@ class TestPruneSweepHook:
 
         assert [f is not None for f in kept] == [f is not None for f in fresh]
         assert kept[-1] == fresh[-1]
+
+
+class TestPerCallClockOverride:
+    """``now=`` on :meth:`record` / :meth:`prune` — a PER-CALL clock override.
+
+    Why the class needs a second time-injection door when ``time_provider``
+    already exists. ``time_provider`` binds the clock at CONSTRUCTION, which
+    fits a consumer that owns its counter for the process lifetime
+    (``MarkupStormCounter``, ``MemoryService``). But
+    ``reconciliation/harness.py``'s three storm counters inject time PER CALL —
+    ``now: datetime | None = None``, the ``_finding_recently_resolved``
+    convention at harness.py:1592 — and their callers pass an explicit instant
+    that the harness itself resolved. Without a per-call override those
+    counters could only delegate here via a mutable clock-holder shim mutated
+    around every call, which is exactly the hand-rolled state INV-5 is trying
+    to delete.
+
+    The override is optional and defaults to ``None``, so all five existing
+    consumers — every one of which relies on constructor-injected clocks —
+    keep the behaviour pinned by the classes above.
+    """
+
+    def test_injected_now_drives_the_window_not_the_time_provider(self):
+        """A threshold crossing driven entirely by injected instants.
+
+        The counter is built with the DEFAULT ``time.time`` clock, so if
+        ``now=`` were ignored the window would be built from wall-clock
+        instants instead — and these three events, injected 10 000s apart,
+        would all land inside the 100s window and fire.
+        """
+        counter = StormCounter()
+
+        assert counter.record(
+            threshold=3, window_seconds=3600.0, label='p', now=5_000.0
+        ) is None
+        assert counter.record(
+            threshold=3, window_seconds=3600.0, label='p', now=5_001.0
+        ) is None
+        summary = counter.record(
+            threshold=3, window_seconds=3600.0, label='p', now=5_002.0
+        )
+
+        assert summary is not None, 'the threshold-th injected event must fire'
+        assert summary == {
+            'count': 3,
+            'threshold': 3,
+            'window_seconds': 3600.0,
+            'labels': ['p'],
+        }
+
+    def test_injected_now_prunes_so_spread_events_never_accumulate(self):
+        """``now=`` ages events out, it does not merely stamp them.
+
+        Wall clock barely moves across these calls, so only the injected
+        instants can push each prior event out of the window.
+        """
+        counter = StormCounter()
+
+        for i in range(20):
+            assert counter.record(
+                threshold=3,
+                window_seconds=100.0,
+                label='p',
+                now=1_000.0 + i * 101.0,
+            ) is None
+
+    def test_injected_now_re_arms_the_rate_limit(self):
+        """The per-window rate limit is measured against injected time too."""
+        counter = StormCounter()
+
+        fires = [
+            counter.record(threshold=3, window_seconds=100.0, label='p', now=1_000.0)
+            for _ in range(5)
+        ]
+        assert sum(1 for f in fires if f is not None) == 1
+
+        # A full window later — prior events pruned, rate limit re-armed.
+        assert counter.record(
+            threshold=3, window_seconds=100.0, label='p', now=1_200.0
+        ) is None
+        assert counter.record(
+            threshold=3, window_seconds=100.0, label='p', now=1_201.0
+        ) is None
+        assert counter.record(
+            threshold=3, window_seconds=100.0, label='p', now=1_202.0
+        ) is not None
+
+    def test_prune_ages_out_against_the_injected_instant(self):
+        counter = StormCounter()
+        counter.record(threshold=99, window_seconds=100.0, label='p', now=1_000.0)
+        counter.record(threshold=99, window_seconds=100.0, label='p', now=1_001.0)
+
+        assert counter.prune(100.0, now=1_050.0) == 2
+        assert counter.prune(100.0, now=1_200.0) == 0
+
+    def test_omitting_now_still_uses_the_constructor_clock(self, counter, clock):
+        """The default path is unchanged — what keeps the five consumers safe."""
+        counter.record(threshold=2, window_seconds=100.0, label='p')
+        clock.advance(101.0)
+
+        assert counter.prune(100.0) == 0, 'prune() with no now= must read self._now()'
+        assert counter.record(threshold=2, window_seconds=100.0, label='p') is None, (
+            'record() with no now= must read self._now(), so the first event is '
+            'already pruned and the count is 1'
+        )
+
+    def test_now_and_time_provider_can_be_mixed_on_one_counter(self, counter, clock):
+        """An injected instant does not disturb the constructor clock's state.
+
+        The fake clock sits at 1000.0; an event injected at 1000.0 via ``now=``
+        must be indistinguishable from one stamped by the provider.
+        """
+        counter.record(threshold=2, window_seconds=100.0, label='a', now=clock.now)
+        summary = counter.record(threshold=2, window_seconds=100.0, label='b')
+
+        assert summary is not None
+        assert summary['count'] == 2
+        assert summary['labels'] == ['a', 'b']
