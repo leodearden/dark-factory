@@ -67,6 +67,7 @@ from __future__ import annotations
 import os
 import re
 from pathlib import Path
+from typing import NamedTuple
 
 import pytest
 
@@ -533,6 +534,195 @@ def unregistered_enumeration_sites(
         if len({slug for slug in slugs if slug in text}) >= threshold:
             unregistered.append(label)
     return unregistered
+
+
+# An `INV-<n>` alias immediately followed by a lowercase-kebab token — the ONE
+# structural shape a citation of an invariant BY NUMBER takes in this repo.
+#
+# `{0,2}` on each side, not `?`: this repo's Python docstrings use reST
+# ``double-backtick`` markup while its markdown uses single backticks, and a
+# one-backtick regex is BLIND to
+# `dashboard/src/dashboard/data/escalations.py:255` — "instead (INV-2,
+# ``no-silent-fail-soft``)" — a measured drift site.
+#
+# The separator class requires at least one character so `INV-3rd` cannot pair
+# with a following token, and admits the possessive because this repo writes
+# "INV-4's storm-escape" (orchestrator/src/orchestrator/deterministic_runner.py
+# :293 and :1567) as often as it writes "INV-4 storm-escape". `:` is in the
+# class so a `#: ` comment continuation marker survives the line join below.
+_ALIAS_PAIR_RE = re.compile(
+    r"INV-(\d+)(?:['’]s)?[\s,;:(\[]+\s*`{0,2}([a-z][a-z0-9]*(?:-[a-z0-9]+)+)`{0,2}"
+)
+
+# Leading comment/quote/indent markers stripped from a CONTINUATION line before
+# it is joined to its predecessor: `#`, `*`, `>` and whitespace. Deliberately
+# not `-`: a markdown list item beginning with a kebab token would otherwise
+# pair with a bare `INV-n` ending the line above it, inventing a citation.
+_CONTINUATION_MARKER_RE = re.compile(r"^[\s#*>]*")
+
+
+class AliasPair(NamedTuple):
+    """One `INV-<n>` / kebab-token pairing, tagged with how it was written.
+
+    ``backticks`` and ``wrapped`` are not decoration: the live assertion asserts
+    the scan still OBSERVES both shapes, which is the only way to prove the
+    extractor was not quietly narrowed back to single-backtick, single-line
+    matching. Re-deriving those shapes from the file text with a second regex
+    would keep passing after exactly that regression.
+    """
+
+    line: int
+    number: int
+    token: str
+    backticks: int
+    wrapped: bool
+
+
+def invariant_alias_pairs(text: str, *, source: str) -> list[AliasPair]:
+    """Every `INV-<n>` / kebab-token pairing in *text*, in order, duplicates kept.
+
+    Loud when *text* carries no pairing at all, never an empty list, per this
+    module's extractor contract: the callers are a repair list and a live drift
+    assertion, and both read "nothing found" as "nothing wrong".
+
+    Duplicates are preserved for the same reason ``slugs_in_span`` preserves
+    them — the caller is a list of sites to repair, and collapsing two
+    occurrences of one wrong pairing would under-report the work.
+
+    TWO-LINE WINDOW. Each line is joined to its successor (with the successor's
+    leading comment/quote/indent markers stripped) before matching, and any
+    match starting past the first line is DISCARDED so every pairing is
+    attributed exactly once, to the line it starts on. MEASURED on base
+    eba215060c: 21 pairings span a line break repo-wide and one of them is
+    genuine drift — ``fused-memory/scripts/census_memory_metadata.py:163``,
+    where ``INV-2`` ends :162 and ``no-silent-fail-soft`` opens :163. A
+    line-scoped extractor misses it while reporting a smaller, cleaner result.
+
+    A hyphen-wrapped slug (``contracts-machine-`` / ``checked``) yields its
+    leading segments as the token, which the prefix carve-out in
+    ``near_miss_alias_pairs`` then clears under its own number.
+    """
+    lines = text.split("\n")
+    pairs: list[AliasPair] = []
+    for index, line in enumerate(lines):
+        successor = lines[index + 1] if index + 1 < len(lines) else ""
+        window = line + " " + _CONTINUATION_MARKER_RE.sub("", successor)
+        for match in _ALIAS_PAIR_RE.finditer(window):
+            if match.start() >= len(line):
+                continue  # starts on the successor line; that line reports it
+            matched = match.group(0)
+            pairs.append(
+                AliasPair(
+                    line=index + 1,
+                    number=int(match.group(1)),
+                    token=match.group(2),
+                    backticks=2 if "``" in matched else (1 if "`" in matched else 0),
+                    wrapped=match.end() > len(line),
+                )
+            )
+
+    assert pairs, (
+        f"{source}: no `INV-<n> <kebab-token>` pairing found at all (task 3803). "
+        f"An empty parse would turn the alias drift check into an empty-vs-empty "
+        f"comparison that PASSES while examining nothing. Either the citation "
+        f"shape changed or the wrong text was read."
+    )
+    return pairs
+
+
+def _segments(token: str) -> tuple[str, ...]:
+    """A kebab token as its hyphen SEGMENTS, never as a raw string.
+
+    Every comparison below is segment-wise on purpose. A ``startswith`` test on
+    the raw string is subtly wrong in both directions: it would call
+    ``storm-escape-r`` a prefix of ``storm-escape-required`` (it is a typo, not
+    shorthand), and would call ``no-silent-fail-softly`` a match for
+    ``no-silent-fail-soft``.
+    """
+    return tuple(token.split("-"))
+
+
+def _is_proper_prefix(token: str, slug: str) -> bool:
+    """Is *token* a strictly shorter segment-wise prefix of *slug*?"""
+    short, full = _segments(token), _segments(slug)
+    return len(short) < len(full) and full[: len(short)] == short
+
+
+def _is_confusable(token: str, slug: str) -> bool:
+    """Would a reader take *token* for *slug*?
+
+    Exact match, or a shared first TWO hyphen-segments. Two segments rather than
+    a similarity score or an allowlist: a score needs a threshold nobody can
+    defend on 168 live pairings, and an allowlist trains readers to register a
+    file to silence the guard — the failure mode this module already warns about
+    at ``_ENUMERATION_THRESHOLD``. MEASURED on base eba215060c: the two-segment
+    rule flags all eight real drift sites with ZERO false positives.
+    """
+    return token == slug or _segments(token)[:2] == _segments(slug)[:2]
+
+
+def near_miss_alias_pairs(
+    pairs: list[AliasPair], family: list[tuple[int, str]]
+) -> list[AliasPair]:
+    """The pairings of *pairs* that CONTRADICT *family*, in the order given.
+
+    Loud on an empty *family* rather than returning ``[]``: with no canonical
+    slugs to be confusable with, nothing can ever be flagged and the live
+    assertion would report "no drift" having compared nothing.
+
+    THE THREE-LIMB RULE, each limb forced by measured live data:
+
+    1. Under its OWN number, a token equal to the canonical slug is clean — and
+       so is a segment-wise PROPER PREFIX of it. The prefix carve-out is
+       load-bearing: without it the guard fires on twelve correct citations
+       against eight true hits (``INV-4 storm-escape`` at merge_queue.py:2784,
+       workflow.py:6633, deterministic_runner.py:293 and :1567,
+       test_merge_queue.py:14976, test_workflow_ready_to_merge.py:551,
+       test_memory_service.py:2408, test_referent_queue_threading.py:658,
+       test_prompt_artifact.py:736; ``INV-2 structured-facts`` at
+       consolidation.py:282 and test_task_interceptor.py:8729; and
+       ``INV-1 contracts-machine`` at task_runtime.py:25, where the full slug is
+       hyphen-wrapped across a comment line break). Shorthand and line wraps are
+       how this repo actually cites invariants in prose, and a guard wrong more
+       often than right gets silenced.
+
+    2. Otherwise the pairing is DRIFT iff its token is confusable with some
+       canonical slug. Prefix-ness does NOT exculpate under a different number:
+       ``INV-2 no-silent-fail`` is a truncation of INV-9's slug filed under
+       INV-2, which is precisely the drift being hunted.
+
+    3. A token confusable with nothing canonical is always clean, whatever its
+       number. This repo carries module-local INV-n schemes — task 2885's
+       PRD-local ``INV-3 dangling-successor-edge``, test_lock_table.py's
+       ``INV-1: strictly-higher-priority`` — that are not this family at all.
+
+    FILE-LEVEL ANCHORING ON A ``design-invariants.md`` MENTION WAS EVALUATED AND
+    REJECTED: it fails in both directions on live data. merge_queue.py mentions
+    the doc once across ~15k lines and would false-positive its PRD-local INV-3,
+    while scripts/migrate_transcript_archive_gunzip.py mentions it zero times
+    and its genuine ``INV-3 corroborate-before-destroy`` drift would be missed.
+    """
+    assert family, (
+        "the alias check received an empty invariant family (task 3803) — with "
+        "no canonical slugs to be confusable with, no pairing can ever be "
+        "flagged and the check passes vacuously."
+    )
+
+    canonical = dict(family)
+    slugs = [slug for _, slug in family]
+
+    # Unpacked positionally rather than read by attribute: the rule is about a
+    # `(number, token)` pairing, not about the record type, so it stays
+    # exercisable with plain tuples in the fixture tests below.
+    near_misses: list[AliasPair] = []
+    for pair in pairs:
+        _, number, token, _, _ = pair
+        own = canonical.get(number)
+        if own is not None and (token == own or _is_proper_prefix(token, own)):
+            continue
+        if any(_is_confusable(token, slug) for slug in slugs):
+            near_misses.append(pair)
+    return near_misses
 
 
 # ---------------------------------------------------------------------------
