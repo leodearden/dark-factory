@@ -36,6 +36,23 @@ targets (task 2332-style routing-intent churn) and the dominant filing path
   substring "implement" in their canonical phrasing, so including it would
   make those markers permanently self-suppressing.
 
+  **Provenance-stamp carve-out (task 4532):** this suppression scan reads
+  the field text with machine-injected provenance stamps stripped (see
+  :data:`_PROVENANCE_STAMP_RE`). Empirically, a Stage-2
+  ``task_knowledge_sync`` doc-drift annotation stamped
+  ``[Stage 2 task-knowledge sync 2026-07-07] DOC-DRIFT FIX (finding ...)``
+  into a live task description permanently disarmed this guard for that
+  task: the bare word "FIX" inside DF's OWN downstream annotation matched
+  the signal regex, so the guard was blinded by an artifact of the system
+  it guards. An appended annotation is post-filing PROVENANCE and is not
+  evidence of the author's filing-era code intent, so it must not arm the
+  suppression. **Monotonicity invariant:** the strip is applied to the
+  suppression scan ONLY — the declarative-marker scan below keeps reading
+  the RAW field text — so this carve-out can only turn ``None`` into a
+  finding, never a finding into ``None``. No submission flagged today
+  stops being flagged, which is what makes it safe to land while
+  ``FUSED_ROUTING_INTENT_ENFORCE`` remains an available hard-reject mode.
+
   **Recall cost (deliberate, precision-over-recall):** unlike
   ``operational_ask_registry``, which scopes ``_CODE_CHANGE_TITLE_SIGNALS``
   to the title only, this guard scans the combined title + description +
@@ -109,7 +126,32 @@ _EXEMPT_EXECUTION_CLASSES: frozenset[str] = frozenset(
 # is silently suppressed (accepted even in enforce mode). Deliberate
 # precision-over-recall; watch the `routing_intent_lint.flagged` census
 # rate before flipping FUSED_ROUTING_INTENT_ENFORCE.
+#
+# Self-disarm carve-out (task 4532): the suppression scan reads field text
+# with machine-injected provenance stamps stripped (_PROVENANCE_STAMP_RE
+# below). The empirical trigger: a Stage-2 task_knowledge_sync doc-drift
+# annotation stamped "[Stage 2 task-knowledge sync 2026-07-07] DOC-DRIFT FIX
+# (finding ...)" into a live task description carried the bare word "FIX",
+# which matched this regex and permanently disarmed the guard for that task
+# -- the guard blinded by DF's own downstream annotation, on text the filing
+# author never wrote.
 _CODE_CHANGE_SIGNALS_RE = re.compile(r'\b(?:fix|bug|crash|refactor)\w*\b', re.IGNORECASE)
+
+# A machine-injected provenance stamp: an annotation block appended to a task
+# AFTER filing (by a recon stage, the escalation-watcher, or a steward), which
+# describes what was corrected rather than what the task is. Stripped from the
+# CODE-CHANGE-SIGNAL SUPPRESSION SCAN ONLY -- the marker scan in
+# routing_intent_finding keeps reading raw field text, which is what makes this
+# carve-out monotone (it can only turn None into a finding, never the reverse).
+_PROVENANCE_STAMP_RE = re.compile(
+    r'\[\s*stage\s+\d+[^\]\n]{0,160}\d{4}-\d{2}-\d{2}[^\]\n]{0,40}\].*',
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _strip_provenance_stamps(text: str) -> str:
+    """Return *text* with machine-injected provenance-stamp spans removed."""
+    return _PROVENANCE_STAMP_RE.sub(' ', text)
 
 # (compiled regex, marker label, detail text) — each anchored to a
 # DECLARATIVE self-description (an imperative directive or an explicit
@@ -235,7 +277,12 @@ def routing_intent_finding(
         'details': details or '',
     }
 
-    combined = ' '.join(fields.values())
+    # Suppression scan only: strip machine-injected provenance stamps first,
+    # per field, so an appended annotation's own wording cannot arm the
+    # code-change signal (task 4532). The marker loop below deliberately
+    # scans the RAW `fields` values -- see the module docstring's
+    # monotonicity invariant.
+    combined = ' '.join(_strip_provenance_stamps(v) for v in fields.values())
     if _CODE_CHANGE_SIGNALS_RE.search(combined):
         return None
 
