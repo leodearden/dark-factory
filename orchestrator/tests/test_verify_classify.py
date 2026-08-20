@@ -2122,6 +2122,47 @@ class TestRedactPassedSuiteBlocks:
         assert result == text
         assert result is text
 
+    def test_indented_quoted_framing_cannot_open_a_block(self):
+        """The OPEN pattern's hard column-0 anchoring, pinned (amendment,
+        review #2).
+
+        `_RUN_ALL_SUITE_OPEN_RE` deliberately carries NO `^[ \\t]*` tolerance
+        even though the CLOSE pattern does, because reify suites that assert
+        on run_all's own output contract QUOTE `--- Running: ` inside indented
+        `  PASS: ...` assertion prose (two such lines in the 4492 sample log,
+        at source L8934/L9254 — see the fixture's PROVENANCE.md; neither falls
+        inside the five retained `sed` ranges, so the excerpt alone cannot
+        catch this).
+
+        Unlike every other shape in this class, relaxing that anchor fails in
+        the UNSAFE direction rather than the fail-safe one: an indented quoted
+        header inside a FAILING suite's prose would OPEN a spurious block, a
+        later quoted `  RESULT: PASS (y.sh)` would CLOSE it, and the interior
+        blanked would lie INSIDE the failing block — deleting real failure
+        evidence. Measured under the mutant
+        `^[ \\t]*--- Running: (?P<name>.+?) ---[ \\t]*$`: the marker is dropped
+        and `_classify(OPAQUE, ...)` falls semaphore_timeout ->
+        unknown_test_failure.
+        """
+        text = (
+            '--- Running: outer.sh ---\n'
+            '  --- Running: y.sh ---\n'
+            f'{_INTERIOR_MARKER}\n'
+            '  RESULT: PASS (y.sh)\n'
+            '  RESULT: FAIL (outer.sh)\n'
+        )
+        result = verify_classify._redact_passed_suite_blocks(text)
+        assert result is text, (
+            'an INDENTED quoted `--- Running: ` is assertion prose, not a '
+            'block header; opening a block on it would blank a region that '
+            'lies inside the FAILING block'
+        )
+        assert _INTERIOR_MARKER in result
+        # the consequence, one layer up: the evidence still reaches guard 3.
+        assert (
+            _classify(ToolKind.OPAQUE, text, 1, False) == FailureCategory.SEMAPHORE_TIMEOUT
+        )
+
     # -- (g) UNCLOSED BLOCK IS FAIL-SAFE ------------------------------------
 
     @pytest.mark.parametrize(
@@ -2215,9 +2256,20 @@ class TestRedactPassedSuiteBlocks:
 # the incident; see its PROVENANCE.md for the source path, sha256 and the
 # exact five `sed` ranges. Do NOT edit the fixture to make a test here pass.
 _RUN_ALL_FIXTURE_DIR = Path(__file__).parent / 'fixtures' / 'verify_classify_run_all'
+#
+# `encoding='utf-8'` is EXPLICIT and load-bearing (amendment, review #3): the
+# fixture carries 195 non-ASCII bytes (reify's own assertion prose uses `→`,
+# `—` and `’`), so a bare `read_text()` decodes with the interpreter's locale
+# encoding. Under a non-UTF-8 locale that raises UnicodeDecodeError at MODULE
+# scope, which errors out collection of this ENTIRE file (~1100 tests), not
+# just the task-4492 classes — reproduced with `LC_ALL=C PYTHONCOERCECLOCALE=0`.
+# PEP 538/540 coercion masks it on a default CPython invocation, but verify
+# runs under `verify._target_subprocess_env`, which deliberately strips ambient
+# env. Matches the established in-repo convention for fixture reads in guard
+# tests (test_git_repo_isolation_guard.py:521, test_eval_boundary_suite.py:442).
 _REIFY_5623_TEST_LEG = (
     _RUN_ALL_FIXTURE_DIR / 'reify-5623-run-all-test-leg.log'
-).read_text()
+).read_text(encoding='utf-8')
 
 
 def _line_containing(text: str, position: int) -> str:
@@ -2381,6 +2433,25 @@ def _index_of_last_close() -> int:
     raise AssertionError('fixture carries no close line')
 
 
+def _index_inside_first_passing_block() -> int:
+    """A line index strictly INSIDE the first block that closes with a PASS —
+    i.e. a region `_redact_passed_suite_blocks` will blank."""
+    lines = _fixture_lines()
+    pending: tuple[int, str] | None = None
+    for index, line in enumerate(lines):
+        open_match = verify_classify._RUN_ALL_SUITE_OPEN_RE.match(line)
+        if open_match is not None:
+            pending = (index, open_match.group('name'))
+            continue
+        close = verify_classify._RUN_ALL_SUITE_CLOSE_RE.match(line)
+        if close is not None and pending is not None and close.group('name') == pending[1]:
+            if close.group('verdict') == 'PASS':
+                assert index > pending[0] + 1, 'fixture PASS block has no interior'
+                return pending[0] + 1
+            pending = None
+    raise AssertionError('fixture carries no PASS-closed block')
+
+
 def _splice(marker: str, at: int) -> str:
     """Insert *marker* (a single producer line, newline-terminated) into the
     fixture immediately before line index *at*."""
@@ -2491,6 +2562,52 @@ class TestGenuineHostEventSurvivesRunAllScoping:
         Outside a PASS block it must still classify."""
         output = _REIFY_5623_TEST_LEG + _COLLATERAL_INTERRUPTED_MARKER_OUTPUT
         assert _classify(tool, output, 1, False) == FailureCategory.ENV_TRANSIENT
+
+    # -- the VETO ASYMMETRY, the change's single safety invariant ------------
+
+    @pytest.mark.parametrize('tool', ALL_TOOL_KINDS)
+    def test_n9_rustc_span_veto_still_reads_the_full_unscoped_output(self, tool):
+        """The safety invariant of the whole change, pinned (amendment,
+        review #1).
+
+        `_classify_environmental` passes `scoped` to every POSITIVE detector
+        but keeps passing the FULL `output` to its one NEGATIVE condition,
+        `_RUSTC_DIAGNOSTIC_SPAN_RE`. That asymmetry is what bounds the change
+        to a single direction — scoping a VETO would make ENV_TRANSIENT
+        EASIER to reach, the false-GREEN direction.
+
+        The plausible future edit is small and looks like a tidy-up: making
+        the argument of a two-line boolean consistent (`.search(output)` ->
+        `.search(scoped)`). Nothing else in the suite catches it — measured:
+        that mutant left the full suite at 1211 passed, 0 failed.
+
+        This case is the one that does. A genuine rustc `#[path = ...]`
+        branch fault (shape 1's exact wording) lands in the TAIL, outside any
+        block, so redaction cannot touch it and the positive detector fires;
+        its span-pointer line sits INSIDE a PASSED suite's block, so it
+        survives ONLY as long as the veto reads the unscoped output. GREEN
+        today (`test_failure`); under the `scoped`-veto mutant the span is
+        redacted away, the veto never fires, and the branch fault is excused
+        as host collateral -> `env_transient` (measured).
+        """
+        with_span = _splice(' --> src/lib.rs:3:1\n', _index_inside_first_passing_block())
+        output = with_span + '\n' + _COLLATERAL_COULDNT_READ_OUTPUT
+
+        # control: without the span line this output IS env_transient, so the
+        # assertion below is about the veto and not about the splice being inert.
+        assert (
+            _classify(tool, _REIFY_5623_TEST_LEG + '\n' + _COLLATERAL_COULDNT_READ_OUTPUT, 1, False)
+            == FailureCategory.ENV_TRANSIENT
+        )
+
+        result = _classify(tool, output, 1, False)
+        assert result != FailureCategory.ENV_TRANSIENT, (
+            f'{tool!r}: the rustc span veto must read the FULL output — a span '
+            'line inside a PASSED block still vetoes shape 1, so a genuine '
+            'branch fault is never excused as host collateral'
+        )
+        assert result not in INFRA_TRANSIENT_CATEGORIES
+        assert CATEGORY_POLICY[result].is_infra_transient is False
 
 
 # step-9: verify._summarize_checks must thread the per-check config command
