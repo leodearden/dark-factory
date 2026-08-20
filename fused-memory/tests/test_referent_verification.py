@@ -372,6 +372,75 @@ class TestSetMembershipCheck:
         )
 
     @pytest.mark.asyncio
+    async def test_a_self_qualified_endpoint_is_the_local_referent(self, service):
+        """A qualifier naming OUR OWN project is not a different-project signal.
+
+        The mirror image of the test above, and the boundary between them is
+        the whole point: 'reify:132' in group 'dark_factory' stays foreign,
+        'dark_factory:3127' in that same group is the LOCAL Task 3127.
+
+        `parse_node_name` alone preserves the qualifier it read, so this
+        endpoint compared unequal to the very referent the write declared
+        itself to be about, set-membership fired, and ZETA emitted a repair
+        instruction for a correctly-attached edge. The self-qualified
+        reclassification is SOURCE-INVARIANT by contract — `scan_content` and
+        `resolve_referents` both answer the local referent for this spelling —
+        so the endpoint path must answer it too.
+        """
+        result = _episode(
+            edges=[_edge('e1', source='n-df3127', target='n-x')],
+            nodes=[MockNode(name='dark_factory:3127', uuid='n-df3127'),
+                   MockNode(name='deploy pipeline', uuid='n-x')],
+        )
+
+        stats = await service._verify_episode_referents(
+            result, group_id='dark_factory', referents=(Referent(number='3127'),),
+        )
+
+        assert stats.findings == []
+        assert stats.endpoints_checked == 1
+        assert_never_repaired(service)
+
+    @pytest.mark.asyncio
+    async def test_a_fact_citing_the_self_qualified_spelling_still_corroborates(
+        self, service,
+    ):
+        """The second half of the same break: the corroboration veto.
+
+        `endpoint in cited` compares the endpoint against `scan_content`'s
+        refs, which are ALREADY locally classified. With the endpoint left
+        foreign-qualified the two could never be equal, so the veto could not
+        fire even though the fact cites the endpoint node's own name verbatim —
+        and the finding came back `resolvable=True` with a resolved
+        `new_endpoint_uuid`. Here the endpoint is undeclared (Task 2500), so
+        membership DOES fire; what is pinned is that the veto reaches it.
+        """
+        service.graphiti.get_nodes_by_exact_name = AsyncMock(
+            return_value=_rows('n-3668'),
+        )
+        result = _episode(
+            edges=[_edge('e1',
+                         fact='dark_factory:2500 was completed by the merge worker',
+                         source='n-df2500', target='n-worker')],
+            nodes=[MockNode(name='dark_factory:2500', uuid='n-df2500'),
+                   MockNode(name='merge worker', uuid='n-worker')],
+        )
+
+        stats = await service._verify_episode_referents(
+            result, group_id='dark_factory', referents=(Referent(number='3668'),),
+        )
+
+        assert len(stats.findings) == 1
+        finding = stats.findings[0]
+        assert finding.check == 'set-membership'
+        # Reclassified: the endpoint is the LOCAL Task 2500, not a foreign one.
+        assert finding.endpoint_referent == Referent(number='2500')
+        assert finding.resolvable is False
+        assert finding.intended_referent is None
+        assert 'cites' in finding.reason
+        assert_never_repaired(service)
+
+    @pytest.mark.asyncio
     async def test_a_none_result_is_a_no_op(self, service):
         stats = await service._verify_episode_referents(
             None, group_id='dark_factory', referents=(Referent(number='3127'),),

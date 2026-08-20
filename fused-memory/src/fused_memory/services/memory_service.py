@@ -89,6 +89,7 @@ from fused_memory.utils.referent_resolution import (
     REFERENT_SOURCES,
     ReferentResolution,
     ReferentSet,
+    local_referent,
     resolve_referents,
 )
 from fused_memory.utils.task_naming import canonicalize_task_node_name
@@ -1727,6 +1728,29 @@ class ReferentFinding:
             'reason': self.reason,
         }
 
+def _endpoint_referent(endpoint_name: str, *, group_id: str) -> Referent | None:
+    """The referent an edge ENDPOINT's node name denotes, or ``None``.
+
+    ``None`` for an empty name (the endpoint this episode's result does not
+    name), and for a name that is not a canonical task label at all
+    ('MergeWorker') or merely MENTIONS one ('Task 42 orchestrator' —
+    ``parse_node_name`` is anchored).
+
+    A named function rather than an inline expression so the SOURCE-INVARIANT
+    reclassification cannot be dropped by a later edit that only means to
+    re-order the tuple this feeds: the bare ``parse_node_name`` it replaces read
+    as complete, which is precisely how ζ came to be the one referent path that
+    skipped the rule. See
+    :func:`~fused_memory.utils.referent_resolution.local_referent`.
+    """
+    if not endpoint_name:
+        return None
+    referent = parse_node_name(endpoint_name)
+    if referent is None:
+        return None
+    return local_referent(referent, group_id=group_id)
+
+
 def _candidate_pool(
     *,
     referents: frozenset[Referent],
@@ -3262,11 +3286,24 @@ class MemoryService:
                     # COUNTED rather than skipped silently: a check that did not
                     # run is not a check that passed.
                     stats.endpoints_unresolved += 1
+                # THROUGH `local_referent`, never a bare `parse_node_name`.
+                # The parser preserves the qualifier it read, so in group
+                # 'dark_factory' an endpoint node named 'dark_factory:3127'
+                # parses FOREIGN while `scan_content` and `resolve_referents`
+                # both answer the LOCAL 'Task 3127' for that same spelling.
+                # Comparing the two directly made a self-qualified endpoint
+                # unequal to the very referent the write DECLARED itself to be
+                # about: set-membership fired, and the corroboration veto could
+                # not save it either, because `endpoint in cited` compares a
+                # foreign-qualified endpoint against a locally-classified
+                # citation. The self-qualified reclassification is
+                # SOURCE-INVARIANT by contract (referent_resolution's module
+                # docstring) and this is its fourth consumer.
                 ends.append((
                     which_end,
                     endpoint_uuid,
                     endpoint_name,
-                    parse_node_name(endpoint_name) if endpoint_name else None,
+                    _endpoint_referent(endpoint_name, group_id=group_id),
                 ))
 
             for index, end in enumerate(ends):
