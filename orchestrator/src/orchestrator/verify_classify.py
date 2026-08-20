@@ -321,6 +321,30 @@ _SLOT_ACQUIRE_DEADLINE_RE = re.compile(
 # already source-verified in `offline_lane._INFRA_RESULT_FAIL_RE`, widened to
 # PASS|FAIL|SKIP, and stops before any trailing
 # ` [flaky: passed on serial retry]` suffix (run_all.sh:1792).
+#
+# ---> SIBLING ENCODING, KEEP IN SYNC (review amendment #4). This is the
+# SECOND in-repo encoding of run_all.sh's per-suite RESULT framing; the other
+# is `offline_lane._INFRA_RESULT_FAIL_RE` (offline_lane.py:102), which parses
+# the same lines for the infra confirmation runner. They intentionally
+# DIVERGE in three ways, none of them accidental:
+#
+#   * TAIL — offline_lane end-anchors (`\s*$`); this one does NOT, because the
+#     close may carry run_all's ` [flaky: ...]` suffix. Traced consequence of
+#     the open tail here: a close can only ever match EARLIER, which only ever
+#     SHRINKS a redaction window — i.e. it stays in the fail-safe direction.
+#   * SEPARATORS — offline_lane uses `\s*` between tokens; this one requires
+#     the literal single spaces run_all actually emits. Stricter, and correct
+#     per the ANCHORING CONTRACT: a looser separator is another way for quoted
+#     assertion prose to impersonate the producer.
+#   * NAME — offline_lane uses `.+?`; this one uses `[^)]+`, which cannot run
+#     past the closing paren into a ` [flaky: ...]` suffix.
+#
+# Neither site is generated from the other, so a future run_all framing change
+# must be fixed in BOTH. This cross-reference exists so that is discoverable
+# from either end. If a THIRD consumer ever appears, lift the patterns into
+# one small shared module rather than adding a fourth copy. (The reciprocal
+# `cf. verify_classify._RUN_ALL_SUITE_CLOSE_RE` comment in offline_lane.py is
+# NOT in task 4492's lock scope and is filed as follow-up work.)
 _RUN_ALL_SUITE_OPEN_RE = re.compile(r'^--- Running: (?P<name>.+?) ---[ \t]*$')
 _RUN_ALL_SUITE_CLOSE_RE = re.compile(
     r'^[ \t]*RESULT: (?P<verdict>PASS|FAIL|SKIP) \((?P<name>[^)]+)\)'
@@ -935,6 +959,22 @@ def classify_failure(tool: ToolKind, rc: int, output: str, timed_out: bool) -> F
        classified; its one veto still reads the full *output*, which keeps
        the change able to move a classification only AWAY from a guard-3
        category, never toward one.
+
+    SCOPING BOUNDARY — a RECORDED CHOICE, not an oversight (review amendment
+    #5). Guard 3 is the ONLY consumer of the scoped text. Guards 1/2/2.5 and
+    the whole per-tool dispatch table below still read the FULL, unscoped
+    *output*, so the same false-positive shape remains reachable under a
+    different label: a PYTEST/CARGO table pattern matching text quoted inside
+    a suite that reported zero failures classifies exactly as wrongly as the
+    slot markers did, just as e.g. TEST_FAILURE rather than SEMAPHORE_TIMEOUT.
+    Task 4492 deliberately stopped at guard 3, whose grounding is a single
+    incident and whose arms are all host-condition claims — claims an
+    aggregated runner's PASS attestation directly contradicts. Extending the
+    scoping downward is a SEPARATE decision needing per-tool evidence about
+    which patterns are position-sensitive (a pytest `FAILED ...` line quoted
+    inside a passing suite is not obviously the same case as a host marker),
+    so it is left un-taken and named here rather than silently assumed
+    covered.
 
     Then dispatches on *tool* to a per-tool classification table (Invariant
     C1: a tool-T pattern lives ONLY in tool-T's table, so a cargo token can
