@@ -28,6 +28,7 @@ import pytest
 from orchestrator.git_ops import CommitEffectProbe
 from orchestrator.landing_evidence import (
     LandingEvidenceVerdict,
+    file_unattributed_landing_escalation,
     format_unattributed_landing_detail,
     validate_landing_evidence,
 )
@@ -706,3 +707,92 @@ class TestFormatUnattributedLandingDetail:
         assert 're-evaluated on the next dispatch tick' not in lowered
         assert 'dispatch' in lowered
         assert 'agent' in lowered
+
+
+class TestFileUnattributedLandingEscalationDedup:
+    """Category-scoped L1 dedup (task 3116).
+
+    ``has_open_l1(task_id)`` with the default ``category=None`` matches ANY
+    open L1 on the task, which is a TWO-WAY BLINDFOLD: an unrelated open L1
+    (a task_failure, say) silently suppresses a provenance_unattributed
+    filing, so a provenance defect hides behind an escalation that has
+    nothing to do with it.  Observed live on task 4105.
+
+    Narrowing the dedup to ``category='provenance_unattributed'`` slightly
+    RAISES L1 volume — a task can now hold one open L1 per category rather
+    than one overall.  That is INTENDED per the task amendment: not hiding
+    provenance defects behind unrelated escalations is worth the extra
+    volume.  Do not "fix" this back.
+    """
+
+    def test_dedup_call_is_category_scoped(self) -> None:
+        """(a) The dedup probe must name the category, not pass a bare id."""
+        queue = MagicMock()
+        queue.has_open_l1.return_value = False
+
+        file_unattributed_landing_escalation(
+            queue, '42', 'task/42', _verdict('effect_absent'),
+            agent_role='harness-reconcile',
+        )
+
+        queue.has_open_l1.assert_called_once_with(
+            '42', category='provenance_unattributed',
+        )
+
+    def test_open_same_category_l1_still_suppresses(self) -> None:
+        """(b) Dedup WITHIN the category is preserved: an already-open
+        provenance_unattributed L1 must still suppress a duplicate filing, so
+        repeated ticks re-observing the same evidence don't stack L1s.
+        """
+        queue = MagicMock()
+        queue.has_open_l1.side_effect = (
+            lambda task_id, *, category=None: category == 'provenance_unattributed'
+        )
+
+        file_unattributed_landing_escalation(
+            queue, '42', 'task/42', _verdict('effect_absent'),
+            agent_role='harness-reconcile',
+        )
+
+        queue.submit.assert_not_called()
+
+    def test_open_other_category_l1_no_longer_suppresses(self) -> None:
+        """(c) THE BUG, and the whole point: an open L1 of a DIFFERENT
+        category (e.g. task_failure) must no longer hide a provenance
+        defect.  Today's bare call suppresses this filing entirely.
+        """
+        queue = MagicMock()
+        queue.has_open_l1.side_effect = (
+            lambda task_id, *, category=None: category is None
+        )
+        queue.make_id.return_value = 'esc-42-1'
+
+        file_unattributed_landing_escalation(
+            queue, '42', 'task/42', _verdict('effect_absent'),
+            agent_role='harness-reconcile',
+        )
+
+        queue.submit.assert_called_once()
+        esc = queue.submit.call_args.args[0]
+        assert esc.category == 'provenance_unattributed'
+
+    def test_none_queue_is_a_noop(self) -> None:
+        """(d) Best-effort: a bare-harness/bare-worker unit test passes None."""
+        file_unattributed_landing_escalation(
+            None, '42', 'task/42', _verdict('effect_absent'),
+            agent_role='harness-reconcile',
+        )
+
+    def test_raising_queue_is_contained(self) -> None:
+        """(e) The existing try/except still contains a queue that raises —
+        an escalation filer must never break its caller.
+        """
+        queue = MagicMock()
+        queue.has_open_l1.side_effect = RuntimeError('queue exploded')
+
+        file_unattributed_landing_escalation(
+            queue, '42', 'task/42', _verdict('effect_absent'),
+            agent_role='harness-reconcile',
+        )
+
+        queue.submit.assert_not_called()
