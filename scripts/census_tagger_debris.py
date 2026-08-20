@@ -57,8 +57,11 @@ Same contract, same reasons, as ``_task_db_scan.py:93-103``.
 """
 from __future__ import annotations
 
+import contextlib
 import json
+import os
 import sqlite3
+import tempfile
 from collections.abc import Collection
 from pathlib import Path
 from typing import NamedTuple
@@ -718,3 +721,177 @@ def build_report(censuses: list[ProjectCensus]) -> dict:
             "stamped_records": sum(census.coverage.stamped_records for census in ordered),
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# The artifact pair.
+#
+# Resolved __file__-relatively, never as a hardcoded absolute path, so a copy
+# of this script running from a task worktree writes into ITS OWN tree rather
+# than the main checkout. Same reasoning and same form as
+# repair_wiped_metadata_files.py:79-82 (tasks 2881/2882).
+# ---------------------------------------------------------------------------
+
+_PLANS_DIR = Path(__file__).resolve().parent.parent / "plans"
+DEFAULT_JSON_OUT = _PLANS_DIR / "module-tagger-debris-census.json"
+DEFAULT_MD_OUT = _PLANS_DIR / "module-tagger-debris-census.md"
+
+# The markdown records table is CAPPED; the JSON is not. The cap is a render
+# limit only, and the markdown says so at the top so a reader can never mistake
+# a truncated table for the whole population.
+_MARKDOWN_RECORD_CAP = 60
+
+
+def render_markdown(report: dict) -> str:
+    """Render the readable twin of *report*. PURE — no I/O, no clock.
+
+    Leads with the per-project counts an operator actually reads, then the
+    live-victim cells, then a capped sample of records, and closes with the
+    regeneration command. Deterministic: the same report renders byte-identical
+    every time, which is what keeps a re-run's `git diff` clean.
+    """
+    projects = report["projects"]
+    coverage = report["coverage"]
+    params = report["params"]
+
+    lines: list[str] = [
+        "# Tagger-debris census",
+        "",
+        "Every task record still carrying `metadata.files_tagged_at` — the stamp the",
+        "retired module tagger left behind — across all six project corpora, classified",
+        "on three axes for the repair pipeline.",
+        "",
+        f"Consumers: {', '.join(params['consumers'])}.",
+        "",
+        "**`module-tagger-debris-census.json` is the complete record.** This markdown is",
+        f"its readable twin and caps the record table at {_MARKDOWN_RECORD_CAP} rows; the JSON",
+        "never truncates. Neither file carries a generation timestamp, deliberately, so",
+        "re-running the command below and diffing is a meaningful reproducibility check.",
+        "",
+        "## Classification vocabulary",
+        "",
+        f"- **status_class** — `{STATUS_TERMINAL}` (status in {{done, cancelled}}) vs `{STATUS_NON_TERMINAL}`.",
+        f"- **reconciliation** — `{RECONCILED}` if a real scope event postdates the stamp",
+        f"  (the tagger's guess was superseded); `{NEVER_RECONCILED}` if none does, meaning the",
+        "  guess is still this record's live scope.",
+        f"- **wipe_signature** — `{POST_WIPE_OVERWRITE}` if an authoritative scope event predates",
+        f"  the stamp (the tagger stamped over it); `{NO_PRIOR_SCOPE}` otherwise.",
+        "- **merge_signature** — the audit's own `merge_finalized` verdict",
+        "  (`audit_wiped_metadata_files.classify_wipe_signature`), carried as correlating",
+        "  evidence in the vocabulary both consumers already speak.",
+        "",
+        "## Per-project counts",
+        "",
+        "| project | total tasks | stamped | terminal | non-terminal | reconciled | never reconciled | post-wipe overwrite | event log |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
+    ]
+    for project_id in sorted(projects):
+        block = projects[project_id]
+        lines.append(
+            f"| {project_id} | {block['total_tasks']} | {block['stamped_records']} "
+            f"| {block['status_class'][STATUS_TERMINAL]} "
+            f"| {block['status_class'][STATUS_NON_TERMINAL]} "
+            f"| {block['reconciliation'][RECONCILED]} "
+            f"| {block['reconciliation'][NEVER_RECONCILED]} "
+            f"| {block['wipe_signature'][POST_WIPE_OVERWRITE]} "
+            f"| {'read' if block['event_log_read'] else 'UNREADABLE'} |"
+        )
+
+    lines += [
+        "",
+        "## Three-axis cells",
+        "",
+        "Every cell is emitted even at zero: a missing count must never be readable as",
+        "a zero. The live-victim cell for the repair pipeline is",
+        f"`{STATUS_NON_TERMINAL}|{NEVER_RECONCILED}|{POST_WIPE_OVERWRITE}`.",
+        "",
+        "| project | cell | count |",
+        "| --- | --- | ---: |",
+    ]
+    for project_id in sorted(projects):
+        for cell in sorted(projects[project_id]["cells"]):
+            lines.append(f"| {project_id} | `{cell}` | {projects[project_id]['cells'][cell]} |")
+
+    lines += [
+        "",
+        "## Coverage",
+        "",
+        f"- projects swept: {coverage['projects_swept']}",
+        f"- tasks examined: {coverage['total_tasks']}",
+        f"- stamped records: {coverage['stamped_records']}",
+    ]
+    unreadable = coverage["projects_without_event_log"]
+    if unreadable:
+        lines += [
+            f"- **event log UNREADABLE for: {', '.join(unreadable)}**. For those projects the",
+            "  reconciliation and wipe_signature axes are UNKNOWN, not measured clean — every",
+            f"  record there is reported as `{NEVER_RECONCILED}`/`{NO_PRIOR_SCOPE}` because no",
+            "  scope event could be read, not because none exists.",
+        ]
+    else:
+        lines.append("- event log read for every swept project (no coverage shortfall)")
+
+    records = report["records"]
+    lines += [
+        "",
+        f"## Records (showing {min(len(records), _MARKDOWN_RECORD_CAP)} of {len(records)})",
+        "",
+        "| project | task | status | status_class | reconciliation | wipe_signature | merge_signature | files_tagged_at |",
+        "| --- | ---: | --- | --- | --- | --- | --- | --- |",
+    ]
+    for record in records[:_MARKDOWN_RECORD_CAP]:
+        lines.append(
+            f"| {record['project_id']} | {record['task_id']} | {record['status']} "
+            f"| {record['status_class']} | {record['reconciliation']} "
+            f"| {record['wipe_signature']} | {record['merge_signature']} "
+            f"| {record['files_tagged_at']} |"
+        )
+
+    lines += [
+        "",
+        "## Regenerate",
+        "",
+        "```",
+        params["regen_command"],
+        "```",
+        "",
+        "Read-only: every corpus connection is a `mode=ro` SQLite URI.",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Write *text* to *path* via a same-directory tempfile plus os.replace.
+
+    Mirrors bake_off_storage_shape._atomic_write_text:2590-2606. A reader can
+    never observe a half-written artifact, and a failed write leaves the
+    previous file intact rather than truncated.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(suffix=".tmp", prefix=f"{path.name}.", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        os.replace(tmp_name, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_name)
+        raise
+
+
+def write_artifacts(report: dict, json_path: Path, md_path: Path) -> tuple[Path, Path]:
+    """Write the JSON and its markdown twin, atomically and in that order.
+
+    THE MARKDOWN IS RENDERED BEFORE EITHER DESTINATION IS TOUCHED. If rendering
+    raises, both existing files survive byte-for-byte, so a stale .md can never
+    accompany a fresh .json. Same property, same shape, as
+    bake_off_storage_shape.write_artifacts.
+
+    ``sort_keys=False`` is deliberate: key ORDER carries meaning here, with
+    schema_version leading so a reader sees the version before anything it
+    would have to interpret under that version.
+    """
+    markdown = render_markdown(report)
+    _atomic_write_text(json_path, json.dumps(report, indent=2, sort_keys=False) + "\n")
+    _atomic_write_text(md_path, markdown)
+    return json_path, md_path
