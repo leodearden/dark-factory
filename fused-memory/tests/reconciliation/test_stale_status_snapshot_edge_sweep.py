@@ -866,18 +866,24 @@ class TestExtractSnapshotEdgeTaskIds:
         edge corpus ever makes the cost matter, this is the test that has to
         be renegotiated first.
 
-        The corpus has now been measured and says it does NOT (task 3949):
-        across 29415 live valid edges spanning three project graphs, ZERO
-        facts match PLURAL_ENUM_SNAPSHOT_RE at all, so this guard rejects
-        nothing and its recall cost is exactly zero edges. Both candidate
-        tightenings were re-validated against the full precision
-        parametrization: (b) re-opens a pinned over-selection, and (a)
-        re-opens none but does not even recover the 'As of <date>, ...'
-        case above. VERDICT: not tightened — see the measurement block at
-        ``_ENUM_PREP_WORDS``, and re-run
+        The corpus has now been measured and says it does NOT (task 3949).
+        Two live facts reach this guard, and BOTH are correctly-rejected
+        prepositional complements; NEITHER triages as an adverbial preamble,
+        which is the only rejection class that costs recall. So the measured
+        recall cost of the guard is zero edges — which is a WEAKER claim
+        than 'nothing matches the regex at all', and is the one the evidence
+        actually supports. Both candidate tightenings were re-validated
+        against the full precision parametrization: (b) re-opens a pinned
+        over-selection, and (a) re-opens none but does not even recover the
+        'As of <date>, ...' case above. VERDICT: not tightened — see the
+        measurement block at ``_ENUM_PREP_WORDS``, and
+        plans/plural-enum-guard-recall-report.md for the per-graph figures.
+        Those figures are deliberately NOT restated here: an earlier draft of
+        this docstring pinned an edge count and a graph count inline and both
+        were stale within days. Re-run
         ``scripts/measure_plural_enum_guard_recall.py`` before renegotiating
-        this test, since 'zero matches' is a point-in-time fact about a
-        growing corpus.
+        this test — every count in that report is a point-in-time fact about
+        a growing corpus.
         """
         assert extract_snapshot_edge_task_ids(fact) == set()
 

@@ -617,35 +617,34 @@ _PLURAL_COPULA_ALT = r'(?:are|were|remain)'
 # direction, so it needed measurement against the real edge corpus first.
 # (amendment, reviewer_comprehensive correctness-recall finding, task 3079)
 #
-# THAT MEASUREMENT IS NOW DONE (task 3949, measured 2026-08-17 against every
-# populated FalkorDB graph the store reports — 40 graphs, discovered rather
-# than hardcoded, because a hardcoded project list is a coverage claim nothing
-# checks):
+# THAT MEASUREMENT IS NOW DONE (task 3949), against every populated FalkorDB
+# graph the store reports — discovered rather than hardcoded, because a
+# hardcoded project list is a coverage claim nothing checks. THE FIGURES LIVE
+# IN THE ARTIFACT, DELIBERATELY NOT HERE:
 #
-#     dark_factory              12548 valid edges | 172 'tasks <n>' near-misses
-#     reify                     15871 valid edges | 168 near-misses
-#     know_live                  1588 valid edges |  54 near-misses
-#     solar_challenge_platform   1056 valid edges |   9 near-misses
-#     autopilot_video             723 valid edges |  15 near-misses
-#     + 35 further graphs         518 valid edges |   2 near-misses
-#     (all)                     32304 valid edges | 420 near-misses
-#                                                 | 2 PLURAL_ENUM_SNAPSHOT_RE
-#                                                 |   matches, 2 rejections,
-#                                                 |   BOTH correct
+#     plans/plural-enum-guard-recall-report.md    (per-graph table, totals)
+#     plans/plural-enum-guard-recall-report.json  (same, machine-readable)
 #
-# The recall cost of this guard on the real corpus is ZERO edges. Two live
-# facts reach it, and both are genuine prepositional complements it is right
-# to reject — 'Task 3949 mentions that blockers for downstream, still-unmerged
-# tasks 1020 and 1030 are pending' (the BLOCKERS are pending). Neither triages
-# as an adverbial preamble, which is the only rejection class that costs
-# recall. Note the observer effect, and discount accordingly: both edges were
-# written at 07:24 on the measurement day by task 3949's own session, so what
-# the corpus actually offers is still zero organic matches.
+# An earlier draft of this block hand-copied that table inline, and every row
+# of it went stale within days as the corpus grew — the per-graph edge counts,
+# the graph count and the near-miss total all moved on the next re-run. Cite
+# the artifact and re-run the script; do not paste the numbers back in here.
 #
-# What the plural path loses here it loses at the REGEX, not at the guard: the
-# 420 near-misses carry 'tasks <digits>' but no status marker, no copula, or
-# broken copula-marker adjacency ('Tasks 1752 and 1753 are related to ...',
-# 'Both tasks 1920 and 1921 edit ...').
+# What the measurement FOUND is the durable part, and is what belongs here:
+# the recall cost of this guard on the real corpus is ZERO edges. Only two live
+# facts reach the guard at all, and both are genuine prepositional complements
+# it is right to reject — 'Task 3949 mentions that blockers for downstream,
+# still-unmerged tasks 1020 and 1030 are pending' (the BLOCKERS are pending).
+# Neither triages as an adverbial preamble, which is the only rejection class
+# that costs recall. Note the observer effect, and discount accordingly: both
+# edges were written at 07:24 on the FIRST measurement day by task 3949's own
+# session, so what the corpus actually offers is still zero organic matches.
+#
+# What the plural path loses here it loses at the REGEX, not at the guard. The
+# artifact's 'tasks <n>' column is a LEXICAL SUPERSET that already includes the
+# two full matches above; the remainder carry 'tasks <digits>' but no status
+# marker, no copula, or broken copula-marker adjacency ('Tasks 1752 and 1753
+# are related to ...', 'Both tasks 1920 and 1921 edit ...').
 #
 # Both candidates were re-validated against the full precision
 # parametrization, as the finding required before shipping either:
