@@ -430,6 +430,19 @@ class TestUnicodeDigitsAreNotTaskNumbers:
     narrowing the DERIVED path minted exactly what the declared path refused; that
     asymmetry is what these fixtures close, at the one normative site (INV-5)
     rather than per consumer.
+
+    The standing ASCII regression guards are deliberately NOT copied into this
+    class. TestParseNodeNameMatchesLocalForms (every local spelling) plus its
+    test_digits_are_preserved_verbatim ('task 0132'),
+    TestParseNodeNameMatchesQualifiedForms ('reify:132', 'Dark-Factory:2500')
+    and TestQualifiedRefNeverSpansALineBreak.test_same_line_spellings_are_unaffected
+    (the four colon-padding spellings) already run on every commit, and between
+    them they are what proves this narrowing disturbed neither the separator
+    alternation, the case-insensitivity, nor the colon padding — that padding
+    being a SEPARATE axis, tracked as task 4235 (duplicate filing 4239) and
+    scoped out here. A second copy of those lists inside this class would be
+    the very lockstep duplication INV-5 exists to prevent, reproduced in the
+    test suite: the next narrowing would touch one copy and the two would drift.
     """
 
     @pytest.mark.parametrize(
@@ -460,17 +473,27 @@ class TestUnicodeDigitsAreNotTaskNumbers:
         ['Task 12' + ARABIC_INDIC_THREE, 'task #12' + FULLWIDTH_THREE],
     )
     def test_a_mixed_run_yields_nothing_rather_than_the_truncated_prefix(self, name):
-        """The sharper case, and the ONLY thing pinning the right-edge lookahead's
-        breadth.
+        """The ANCHORED half of the mixed-run guard. What it pins is the CAPTURE
+        class, not the right-edge lookahead.
 
         Before the fix this parsed to Referent(number='12٣') — a mangled number
-        naming no task. Under the WRONG fix — narrowing the '(?!\\d)' lookahead to
-        '(?![0-9])' alongside the capture class — it parses to Referent(number='12'),
-        the TRUNCATED PREFIX that lookahead's own comment says it exists to prevent.
-        That is strictly worse than the bug being fixed: 'Task ٣' is obvious junk,
-        while 'Task 12' is a well-formed name for a REAL node a consumer will
-        happily rename or re-attach edges on. So the capture class narrows and the
-        lookahead deliberately stays broad, and a mixed run matches nothing at all.
+        naming no task. What refuses it now is purely '([0-9]+)': the two anchored
+        patterns carry NO '(?!\\d)' clause at all — their right edge is '\\s*$', and a
+        Unicode digit is not '\\s', so the match dies at the anchor either way.
+
+        The lookahead's breadth, and the reason it deliberately stays BROAD while
+        the capture narrows, is pinned by the UNANCHORED siblings instead:
+        test_a_mixed_run_mention_yields_no_referent, the scan_content half of
+        test_a_qualified_mixed_run_yields_nothing_rather_than_the_truncated_prefix,
+        and test_cross_project_refs.py's 'see reify:12٣ now' case. Measured, not
+        assumed: mutating both '([0-9]+)(?!\\d)' occurrences to '([0-9]+)(?![0-9])'
+        fails exactly those three and NOT this one, minting Referent(number='12')
+        and Referent(project_id='reify', number='12') — the TRUNCATED PREFIX that
+        lookahead's own comment says it exists to prevent, and strictly worse than
+        the bug being fixed, since 'Task ٣' is obvious junk while 'Task 12' names
+        a REAL node a consumer will happily rename or re-attach edges on. So do
+        not trim those three as duplicative of this one: this one survives the
+        mutation they catch.
         """
         assert parse_node_name(name) is None
 
@@ -480,32 +503,6 @@ class TestUnicodeDigitsAreNotTaskNumbers:
         scan = scan_content('task 12' + ARABIC_INDIC_THREE, group_id='dark_factory')
         assert scan.refs == ()
         assert scan.ambiguous == ()
-
-    @pytest.mark.parametrize(
-        ('name', 'expected'),
-        [
-            ('task 132', 'Task 132'),
-            ('tasks 153', 'Task 153'),
-            ('TASK 42', 'Task 42'),
-            ('Task  7', 'Task 7'),
-            (' tasks 9 ', 'Task 9'),
-            ('task #1153', 'Task 1153'),
-            ('task#1153', 'Task 1153'),
-            ('Task: 132', 'Task 132'),
-            ('task 0132', 'Task 0132'),
-        ],
-    )
-    def test_ascii_local_spellings_are_unaffected(self, name, expected):
-        """Regression guard, green BEFORE and AFTER: every ASCII local spelling
-        already parametrized in TestParseNodeNameMatchesLocalForms still parses to
-        the same referent. This is what proves the narrowing is ASCII-only — that
-        it did not disturb the separator alternation, the whitespace padding or
-        the case-insensitivity, none of which this change declares.
-        """
-        referent = parse_node_name(name)
-        assert referent is not None
-        assert referent.project_id == ''
-        assert referent.node_name == expected
 
     @pytest.mark.parametrize(
         'name',
@@ -546,32 +543,6 @@ class TestUnicodeDigitsAreNotTaskNumbers:
         scan = scan_content('see reify:12' + ARABIC_INDIC_THREE, group_id='dark_factory')
         assert scan.refs == ()
         assert scan.ambiguous == ()
-
-    def test_ascii_qualified_spellings_are_unaffected(self):
-        """Regression guard, green BEFORE and AFTER: the colon padding is
-        untouched.
-
-        That padding is a SEPARATE axis — _QUALIFIED_NODE_NAME_PATTERN's '\\s*'
-        colon still spans a line break, tracked as task 4235 (duplicate filing
-        4239) and explicitly scoped out of this change. Narrowing the digit class
-        must not opportunistically fold it in, and these four spellings are what
-        proves it did not.
-        """
-        for content in (
-            'dark_factory:2500',
-            'dark_factory: 2500',
-            'dark_factory :2500',
-            'dark_factory\t:\t2500',
-        ):
-            assert [r.node_name for r in scan_content(content, group_id='reify').refs] == [
-                'dark_factory:2500'
-            ], content
-        assert parse_node_name('reify:132') == Referent(
-            kind='task', project_id='reify', number='132'
-        )
-        assert parse_node_name('Dark-Factory:2500') == Referent(
-            kind='task', project_id='dark_factory', number='2500'
-        )
 
 
 class TestQualifiedRefNeverSpansALineBreak:
