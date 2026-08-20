@@ -310,6 +310,15 @@ class Finding:
     nothing" rather than having to be inferred from the report's projects
     list. A graph never passed to ``--project`` is not read at all, so an
     empty list bounds the claim to the graphs named there, not to the store.
+
+    ``derived_edges_by_graph`` attributes each edge to the graph that HELD it,
+    mapping every answering graph (in argv order) to its own sorted slice — a
+    graph that answered holding nothing maps to ``[]``, so "asked here, found
+    nothing" stays readable per graph. It carries the same ``None``
+    NOT-ENUMERATED sentinel as ``derived_edge_uuids``, and the two are set
+    together and must never disagree: ``derived_edge_uuids`` remains the flat
+    sorted UNION of this map's values, so existing consumers of the central
+    harm-artefact column are unaffected by the added attribution.
     ``to_json`` also derives ``cross_graph`` (``graph_name != project_id``):
     the cross-graph population is exactly the one whose edges can live in a
     graph this sweep may not have read, so a consumer filtering on the edge
@@ -330,6 +339,7 @@ class Finding:
     observed: str
     claimed_text: str
     derived_edge_uuids: tuple[str, ...] | None = ()
+    derived_edges_by_graph: dict[str, tuple[str, ...]] | None = None
     edges_unqueried: bool = False
     edges_enumerated_in: tuple[str, ...] = ()
 
@@ -356,6 +366,15 @@ class Finding:
             'derived_edge_uuids': (
                 None if self.derived_edge_uuids is None
                 else list(self.derived_edge_uuids)
+            ),
+            # Same null discipline as derived_edge_uuids: {} would read as
+            # "asked everywhere, found nothing", a measured zero.
+            'derived_edges_by_graph': (
+                None if self.derived_edges_by_graph is None
+                else {
+                    graph: list(uuids)
+                    for graph, uuids in self.derived_edges_by_graph.items()
+                }
             ),
             'edges_unqueried': self.edges_unqueried,
             'edges_enumerated_in': list(self.edges_enumerated_in),
@@ -1402,6 +1421,7 @@ async def _run(
     enriched: list[Finding] = []
     for finding in findings:
         edges: tuple[str, ...] | None
+        by_graph: dict[str, tuple[str, ...]] | None
         if not answered:
             logger.warning(
                 'derived edges NOT enumerated for episode %s (graph %s, '
@@ -1409,16 +1429,27 @@ async def _run(
                 finding.record_uuid, finding.graph_name, finding.project_id,
             )
             edges = None
+            by_graph = None
         else:
-            merged: set[str] = set()
-            for name in answered:
-                answer = edges_by_graph[name] or {}
-                merged.update(answer.get(finding.record_uuid, ()))
-            edges = tuple(sorted(merged))
+            # Attribute first, then DERIVE the flat union from the map, so the
+            # two columns cannot drift apart. Insertion order is `answered`,
+            # i.e. argv order, and each slice is sorted — the report must stay
+            # byte-stable across runs, so nothing here may depend on store row
+            # order.
+            by_graph = {
+                name: tuple(sorted(
+                    (edges_by_graph[name] or {}).get(finding.record_uuid, ())
+                ))
+                for name in answered
+            }
+            edges = tuple(sorted(
+                {uuid for slice_ in by_graph.values() for uuid in slice_}
+            ))
         enriched.append(
             Finding(**{
                 **vars_of(finding),
                 'derived_edge_uuids': edges,
+                'derived_edges_by_graph': by_graph,
                 'edges_unqueried': edges is None,
                 'edges_enumerated_in': answered,
             })
