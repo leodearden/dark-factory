@@ -1602,8 +1602,15 @@ class UsageGate:
     async def _reprobe_account(self, acct: AccountState) -> None:
         """Reload env, refresh the account token, and probe once.
 
-        On success: clear ``auth_failed`` + ``auth_failed_at`` and reopen the
-        global gate. On failure: leave ``auth_failed`` set; caller retries.
+        Three outcomes, not two:
+
+        - probe ran and SUCCEEDED: clear ``auth_failed`` + ``auth_failed_at``
+          and reopen the global gate;
+        - probe ran and FAILED: leave ``auth_failed`` set; caller retries;
+        - probe could not be SPAWNED (``ProbeSpawnError``, task 4512): a host
+          fault, carrying no evidence about this token at all. Recorded on the
+          gate's shared spawn-fault accounting and the account left
+          ``AUTH_FAILED``.
         """
         load_dotenv(override=True)
         token_env = self._token_env_for(acct)
@@ -1614,7 +1621,22 @@ class UsageGate:
                 acct.token = fresh
 
         logger.info(f'Account {acct.name}: firing auth re-probe')
-        ok = await self._run_probe(acct)
+        try:
+            ok = await self._run_probe(acct)
+        except ProbeSpawnError as exc:
+            # The probe could not be spawned — a host fault, not evidence
+            # about this token. Record it and stay AUTH_FAILED: an account we
+            # could not VERIFY must not be read as recovered.
+            #
+            # Caught HERE rather than left to _auth_reprobe_loop's broad
+            # `except Exception`, which would downgrade it to a WARNING
+            # ('auth re-probe raised') and re-hide the one signal that says
+            # this is not an auth problem. Returning early also skips the
+            # 'auth re-probe failed — staying auth_failed' line below, which
+            # asserts a probe that ran.
+            self._note_probe_spawn_failure(acct, exc)
+            return
+        self._clear_probe_spawn_failures(acct)
         if ok:
             if acct.phase == AccountPhase.AUTH_FAILED:
                 # _transition owns: the phase write, clearing auth_failed_at,
