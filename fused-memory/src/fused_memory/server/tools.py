@@ -3204,6 +3204,20 @@ def create_mcp_server(
                 ),
                 'error_type': 'ValidationError',
             }
+        # LOAD-BEARING, unlike add_episode's defensive strip above: this tool
+        # FORWARDS the cleaned metadata to the store (`metadata=cleaned_meta`
+        # below), so without this the write-time control flag is persisted into
+        # the Mem0 corpus and rides along on every future read of a record that
+        # needed it exactly once. The boundary guard cannot do this for us —
+        # MarkupGuardMiddleware._apply_override forwards `allow_mcp_markup`
+        # UNCHANGED to any tool DECLARING a `metadata` parameter, by design, so
+        # the tool body remains the party that keeps it out of the corpus.
+        #
+        # Placed immediately before `_extract_causation` because that call is
+        # the single point where the caller's `metadata` becomes persisted
+        # state: stripping here cannot be bypassed by a later edit that adds
+        # another persistence path off `cleaned_meta`.
+        metadata = strip_markup_override(metadata)
         causation_id, source, cleaned_meta = _extract_causation(metadata, agent_id)
         result = await memory_service.add_system_record(
             content=content,
@@ -4761,6 +4775,20 @@ def create_mcp_server(
         )
         if err:
             return err
+        # LOAD-BEARING, unlike add_episode's defensive strip: `cleaned_meta` is
+        # the BASE of `canonical_meta` below, so without this the write-time
+        # control flag is written into the one record this IRREVERSIBLE op
+        # creates to outlive the whole cluster it folds. The boundary guard
+        # cannot do this for us — MarkupGuardMiddleware._apply_override
+        # forwards `allow_mcp_markup` UNCHANGED to any tool DECLARING a
+        # `metadata` parameter, by design, so the tool body remains the party
+        # that keeps it out of the corpus.
+        #
+        # Placed immediately before `_extract_causation` because that call is
+        # the single point where the caller's `metadata` becomes persisted
+        # state: stripping here cannot be bypassed by a later edit that adds
+        # another persistence path off `cleaned_meta`.
+        metadata = strip_markup_override(metadata)
         causation_id, source, cleaned_meta = _extract_causation(metadata, agent_id)
 
         # ONE call-and-classify block for EVERY metadata patch this op makes:
