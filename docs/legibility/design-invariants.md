@@ -10,7 +10,10 @@ the reconciliation loop-blocking incident (task 3778); INV-9 was added
 2026-08-24 from the answered-but-unrecorded escalation investigation
 (esc-6107-7, plus five further instances measured 2026-08-22→24);
 INV-10 was added 2026-08-30 from the doc-guard reconciliation
-(task 4666). They gate `/prd`
+(task 4666); INV-11 was added by promoting `no-silent-fail-soft`,
+which this codebase had minted independently across 56 files and
+cited as if canonical while no heading defined it (task 3803;
+rehearsal walked 2026-08-20). They gate `/prd`
 decompose (G7, `skills/prd/references/gates.md`) and `/review` phase 2's
 cross-module audit — both consumers Read this doc at run time;
 it is the single normative copy (no restatement, per INV-5). Stable slug
@@ -310,6 +313,53 @@ is the same test stated from the other side — if fully rewording the
 surrounding sentence while keeping the mechanism leaves the check green,
 it is referential integrity rather than a wording pin.
 
+## INV-11 `no-silent-fail-soft`
+
+**Rule**: A failure or degradation is never indistinguishable from a clean
+success at the point of consumption. Every failure, fallback, coercion or
+partial-enumeration path either REFUSES (raises, errors, exits nonzero) or
+carries the degradation in the RESULT a caller sees — a named delta, a
+false completeness flag, an UNKNOWN/SKIP sentinel — never in a log line
+alone. A log is not a return value: the caller that must act on the
+shortfall is not the reader who would find it there.
+
+**Checkable design question(s)**: For each failure, fallback, coercion or
+partial-enumeration path this feature adds — what value does the caller
+receive, and can that value be told apart from the success value? If the
+answer is "the log says so", the path is silent. If it is "the caller gets
+fewer items", what tells the caller that fewer is not all?
+
+**Evidence**: Already machine-enforced per occurrence, with no slug to
+name it: `shared/tests/test_silent_fallthrough_gate.py` lints all
+first-party source for `except (Exception|BaseException|bare):` returning
+an empty/None value with no WARN+ log and no re-raise, against the
+burn-down allowlist `shared/tests/silent_fallthrough_allowlist.py`
+(scanner `shared/tests/silent_fallthrough_scan.py`, PRD
+`plans/silent-fallthrough-dedup-prd.md`). The concept was ALSO minted
+independently as a bare phrase across 56 files; where those citations
+reached for a number they split five to INV-2 and one to INV-4, and the
+INV-4 one needed both invariants in a single sentence because neither fit
+alone (task 3803).
+
+**House pattern**: refuse at the boundary
+(`fused-memory/src/fused_memory/backends/mem0_client.py`'s truncated-scroll
+raise rather than a short return; `escalation/src/escalation/classify.py`
+raising on an unmodelled status rather than folding it into `excluded`);
+carry the shortfall in the result
+(`fused-memory/scripts/census_memory_metadata.py`'s `coverage.complete =
+false` plus a NAMED entry in `coverage.deltas`, with a nonzero caller
+exit); SKIP is not ALLOW.
+
+**Family boundary**: INV-2, INV-11 and INV-4 are adjacent, and a walker has
+to pick exactly one. INV-2 `structured-facts-at-failure` constrains the
+SHAPE of a signal that already exists — structured facts at the failure
+point, not a log-scrape of what the emitter had in a variable. INV-11
+constrains its EXISTENCE, per occurrence: can the caller tell the returned
+value apart from the success value? INV-4 `storm-escape-required`
+constrains the AGGREGATE audibility of a fail-soft path deliberately
+RETAINED, and presupposes that path is legitimate. One occurrence is
+already an INV-11 defect, where INV-4 only asks about the hundredth.
+
 ## Census seam
 
 Incident records MAY carry an optional `invariant_violated: <slug>` field.
@@ -325,5 +375,5 @@ Calibration fixtures — two seeded violations per invariant plus a rehearsal
 verdict table exercising the as-landed G7 and `/review` phase-2 text — live
 at `docs/legibility/design-invariants-fixtures.md` (landed 2026-07-14;
 INV-6/INV-7 fixtures added 2026-08-02; INV-8 fixtures added 2026-08-06;
-INV-9 fixtures added 2026-08-24;
-INV-10 fixtures added 2026-08-30).
+INV-9 fixtures added 2026-08-24; INV-10 fixtures added 2026-08-30;
+INV-11 fixtures added with the `no-silent-fail-soft` promotion).
