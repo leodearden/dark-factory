@@ -319,6 +319,16 @@ class Finding:
     together and must never disagree: ``derived_edge_uuids`` remains the flat
     sorted UNION of this map's values, so existing consumers of the central
     harm-artefact column are unaffected by the added attribution.
+
+    ``edges_unqueried_in`` names the targeted graphs whose scan did NOT answer,
+    making PARTIAL coverage a THIRD state between fully-enumerated and
+    not-enumerated: non-empty while ``edges_unqueried`` is false means some
+    graph answered and some did not, so the edge list is a measured LOWER
+    BOUND rather than the whole story. It is always present (``[]`` when there
+    is no hole). When NO graph answered the finding is fully unqueried —
+    ``edges_unqueried`` true, both edge columns ``None``, and this names every
+    targeted graph. ``summary.edges_partial`` and ``summary.edges_unqueried``
+    are the two denominators and never overlap.
     ``to_json`` also derives ``cross_graph`` (``graph_name != project_id``):
     the cross-graph population is exactly the one whose edges can live in a
     graph this sweep may not have read, so a consumer filtering on the edge
@@ -342,6 +352,7 @@ class Finding:
     derived_edges_by_graph: dict[str, tuple[str, ...]] | None = None
     edges_unqueried: bool = False
     edges_enumerated_in: tuple[str, ...] = ()
+    edges_unqueried_in: tuple[str, ...] = ()
 
     def to_json(self) -> dict[str, Any]:
         """Render as a plain JSON-serializable dict."""
@@ -378,6 +389,10 @@ class Finding:
             ),
             'edges_unqueried': self.edges_unqueried,
             'edges_enumerated_in': list(self.edges_enumerated_in),
+            # Always present, [] when every targeted graph answered: a key
+            # that appeared only when non-empty would read as ABSENT rather
+            # than as "no hole".
+            'edges_unqueried_in': list(self.edges_unqueried_in),
         }
 
 
@@ -552,6 +567,15 @@ def build_report(
     distinction load-bearing at the sentinel level (:123-127) — a report that
     collapsed it would undo that.
 
+    ``edges_unqueried`` and ``edges_partial`` are likewise two different facts
+    and NEVER overlap. Edge enumeration has THREE states, not two: fully
+    enumerated (every targeted graph answered), PARTIAL (some answered, some
+    did not — the edge list is a measured LOWER BOUND, counted only by
+    ``edges_partial``), and not enumerated at all (no graph answered — the
+    edge columns are ``null``, counted only by ``edges_unqueried``). Both are
+    always present and 0 when none, so a reader sees each denominator without
+    diffing the findings list.
+
     Pure: *swept_at* is an argument rather than a ``datetime.now()`` call, which
     is what makes the output byte-stable across two runs on the same input.
     """
@@ -593,6 +617,14 @@ def build_report(
             # no-silent-caps discipline as `truncated_by` — a reader sees the
             # denominator of un-enumerated findings without diffing the list.
             'edges_unqueried': sum(1 for f in findings if f.edges_unqueried),
+            # PARTIAL coverage: some targeted graph answered and some did not,
+            # so the edge list is a measured LOWER BOUND. Disjoint from
+            # edges_unqueried by construction — a fully-unqueried finding is
+            # counted only there — and likewise always present, 0 when none.
+            'edges_partial': sum(
+                1 for f in findings
+                if f.edges_unqueried_in and not f.edges_unqueried
+            ),
             'by_category': _tally(findings, lambda f: f.category or '(uncategorized)'),
             # by_project tallies the record's OWN group_id; by_graph tallies the
             # graph actually swept. They differ for exactly the cross-graph
@@ -1417,6 +1449,11 @@ async def _run(
     answered = tuple(
         name for name in targets if edges_by_graph.get(name) is not None
     )
+    # Only meaningful when a scan was actually attempted: with no findings
+    # nothing was targeted, so there is no hole to name.
+    unanswered = tuple(
+        name for name in targets if edges_by_graph.get(name) is None
+    ) if flagged else ()
 
     enriched: list[Finding] = []
     for finding in findings:
@@ -1452,6 +1489,7 @@ async def _run(
                 'derived_edges_by_graph': by_graph,
                 'edges_unqueried': edges is None,
                 'edges_enumerated_in': answered,
+                'edges_unqueried_in': unanswered,
             })
         )
 
