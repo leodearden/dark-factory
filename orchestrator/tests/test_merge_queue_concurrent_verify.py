@@ -525,6 +525,31 @@ def _unguarded_worker_teardown_methods(source: str) -> list[str]:
     return sorted(offenders)
 
 
+# task 4219: SHRINKING ratchet of methods that still carry the
+# suppress(TimeoutError)-wrapped-wait anti-pattern _suppressed_result_wait_methods
+# scans for. Entries may only be REMOVED as methods are migrated to
+# wait_responsive -- never added to (a NEW offender must be migrated, not
+# ledgered; see TestLoudWaitMigrationRatchet.test_no_unledgered_suppressed_result_waits
+# below). The migration target of task 4219,
+# TestCascadeErrorContainment::test_cascade_remerge_error_does_not_kill_verifier_loop,
+# is deliberately NOT on this ledger.
+#
+# The two remaining entries are not migrated in task 4219: routing
+# test_cascade_cancel_and_release_raises_contained's waits through
+# wait_responsive at their PRESERVED nominals bills 90+90+90+40+60+20 = 390s
+# against the shared HEAVY_BARRIER_TEST_TIMEOUT (300s), so it cannot land
+# without first resolving that mark's arithmetic across all nine classes
+# that share it -- a distinct design question, filed as follow-up.
+_SUPPRESSED_WAIT_DEBT: dict[str, frozenset[str]] = {
+    'TestChainInvalidationUnderOverlap': frozenset({
+        'test_n_fail_aborts_downstream_verify_reruns_remerge',
+    }),
+    'TestCascadeErrorContainment': frozenset({
+        'test_cascade_cancel_and_release_raises_contained',
+    }),
+}
+
+
 # task 3492: the pyproject-configured default per-test timeout ceiling that
 # every heavy-wait class in this module must clear. This is a hand-mirrored
 # copy of `[tool.pytest.ini_options].timeout` in orchestrator/pyproject.toml
@@ -6580,6 +6605,94 @@ class TestNoStopCall:
         assert result == [], (
             f'Expected unparseable source to return [] without raising, '
             f'got {result!r}.'
+        )
+
+
+class TestLoudWaitMigrationRatchet:
+    """Enforced invariant, task 4219: every `suppress(TimeoutError)`-wrapped
+    result wait in THIS module's own source must be accounted for on
+    `_SUPPRESSED_WAIT_DEBT` -- a SHRINKING ratchet (see the ledger's own
+    comment, above, for its contents and why the two remaining entries are
+    not migrated in this task).
+
+    No `@pytest.mark.timeout` mark needed: none of these three methods
+    performs a real await, so `_worst_per_method_wait_budget` would compute
+    0.0 for this class.
+    """
+
+    def test_no_unledgered_suppressed_result_waits(self) -> None:
+        """Every method `_suppressed_result_wait_methods` finds in this
+        module's own source must already be on `_SUPPRESSED_WAIT_DEBT` -- a
+        NEW offender (a fresh suppress(TimeoutError)-wrapped wait, or a
+        migrated method that regressed) fails loudly, naming the class and
+        method and pointing at the two blessed replacements.
+        """
+        source = Path(__file__).read_text()
+        scanned = _suppressed_result_wait_methods(source)
+
+        unledgered: list[str] = []
+        for class_name, methods in sorted(scanned.items()):
+            ledgered = _SUPPRESSED_WAIT_DEBT.get(class_name, frozenset())
+            for method_name in sorted(methods):
+                if method_name not in ledgered:
+                    unledgered.append(f'{class_name}::{method_name}')
+
+        assert not unledgered, (
+            'The following test methods contain a '
+            '`with contextlib.suppress(TimeoutError): await '
+            'asyncio.wait_for(...)` wait but are not on '
+            '_SUPPRESSED_WAIT_DEBT:\n'
+            + '\n'.join(f'  - {offender}' for offender in unledgered)
+            + '\n\nThis is the `outcome is None` anti-pattern: a genuine '
+            'timeout is swallowed and a downstream assertion reports a '
+            'confusing None/wrong-value failure instead of a loud, '
+            'by-label timeout. Migrate the wait to '
+            '`_orch_helpers.wait_responsive` (or, for a bare result future '
+            'with no starvation accounting needed, `_await_outcome`) '
+            'instead of adding it to the ledger.'
+        )
+
+    def test_ledger_has_no_stale_entries(self) -> None:
+        """Every `_SUPPRESSED_WAIT_DEBT` entry must still be found by the
+        scanner -- a migrated method left behind on the ledger fails
+        loudly instead of letting the ratchet rot (the ledger may only
+        shrink).
+        """
+        source = Path(__file__).read_text()
+        scanned = _suppressed_result_wait_methods(source)
+
+        stale: list[str] = []
+        for class_name, methods in sorted(_SUPPRESSED_WAIT_DEBT.items()):
+            scanned_methods = scanned.get(class_name, set())
+            for method_name in sorted(methods):
+                if method_name not in scanned_methods:
+                    stale.append(f'{class_name}::{method_name}')
+
+        assert not stale, (
+            'The following _SUPPRESSED_WAIT_DEBT entries were not found '
+            'by the scanner -- they appear to have been migrated already '
+            'and must be REMOVED from the ledger (it is a shrinking '
+            'ratchet; entries may only be deleted, not left stale):\n'
+            + '\n'.join(f'  - {entry}' for entry in stale)
+        )
+
+    def test_migrated_methods_stop_worker_in_finally(self) -> None:
+        """No method that calls `wait_responsive` may leave `worker.stop()`
+        outside a `finally:` block (esc-3980-4): `wait_responsive` gives up
+        by raising `_pytest.outcomes.Failed`, so a straight-line body that
+        skips `worker.stop()` on give-up leaks a live merge worker plus its
+        run task into pytest-asyncio teardown -- how one red test used to
+        cascade into unrelated failures elsewhere in the session.
+        """
+        source = Path(__file__).read_text()
+        offenders = _unguarded_worker_teardown_methods(source)
+
+        assert not offenders, (
+            'The following methods call wait_responsive but do not call '
+            'worker.stop() from inside a finally: block (esc-3980-4 leak '
+            'invariant -- see test_merge_speculation.py:1972-2003, '
+            '_stop_worker):\n'
+            + '\n'.join(f'  - {offender}' for offender in offenders)
         )
 
 
