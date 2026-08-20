@@ -57,6 +57,25 @@ defence-in-depth wrapper still contains everything the tool bodies raise.
 Consequence for tests: the guard is installed by ``main.py``, NOT by
 ``create_mcp_server``, so a test must install it explicitly — the same shape
 ``_install_safe_tool_wrapper`` already has.
+
+## Measured parity with the write-time gate this replaces
+
+Before the four in-line ``_markup_gate`` call sites in ``tools.py`` were
+retired, this boundary was driven over the retiring gate's ENTIRE scanned
+surface — its three hand-authored specimens against ``{'content'}`` on
+add_memory / add_episode and ``{title, description, details, prompt}`` on
+submit_task / update_task, 30 combinations. All 30 were rejected here, none
+reached the service or the interceptor, and each named the same matched literal
+the gate named. There was no gap to close.
+
+The rejections use two vocabularies, both this guard's: ``mcp_markup_detected``
+carries a repair, ``mcp_markup_unrepairable`` refuses without one. The split is
+:func:`shared.toolcall_markup.repair`'s NO SILENT PARTIAL REPAIR contract, not
+a hole — ``</invoke>`` closes the ENVELOPE rather than a parameter, and an
+opener with no preceding mis-close leaves the repairer nothing to attribute the
+residue to. Either way nothing is written and the residue is escalated rather
+than dropped. ``tests/server/test_markup_tripwire_gate.py`` holds the
+expectation table and the per-specimen reasoning.
 """
 
 from __future__ import annotations
