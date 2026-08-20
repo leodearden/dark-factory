@@ -63,36 +63,59 @@ a missing ``git``, an unimportable ``orchestrator.config`` or an unimportable
 ``test_root_lint_covers_nonmember_py`` must FAIL this guard, not silently pass
 it. A guard against a vacuous gate that can itself go vacuous is worthless.
 
-DUPLICATED COMMAND-PARSING HELPERS, KNOWINGLY. ``_pytest_segment`` /
-``_pytest_collected_dirs`` / ``_is_collected`` are a THIRD hand-maintained
-copy of a trio that also exists as ``_ruff_segment`` / ``_ruff_targets`` /
-``_is_covered`` in ``test_root_lint_covers_nonmember_py.py`` and ``_segment``
-/ ``_pytest_targets`` in ``test_scripts_module_config.py``. This file's first
-draft justified that with "``tests/scripts/`` modules are not an importable
-package" — which is FALSE, and is corrected here rather than deleted (the
-house convention this file's own DECIDED block follows). ``conftest.py`` in
-this directory puts it on ``sys.path`` precisely so siblings import;
+COMMAND-PARSING HELPERS, NOW SHARED. ``_pytest_segment`` /
+``_pytest_collected_dirs`` / ``_is_collected`` were a hand-maintained copy of a
+trio that also existed as ``_ruff_segment`` / ``_ruff_targets`` / ``_is_covered``
+in ``test_root_lint_covers_nonmember_py.py``, ``_segment`` / ``_targets`` /
+``_narrowing_flag_args`` in ``test_scripts_module_config.py``, and — a FOURTH
+copy this paragraph originally missed, corrected here rather than deleted —
+``_ruff_segment`` / ``_ruff_targets`` in
+``test_contributing_lint_command_drift.py``. This file's first draft justified
+the duplication with "``tests/scripts/`` modules are not an importable package"
+— which is FALSE, and is likewise corrected rather than deleted (the house
+convention this file's own DECIDED block follows). ``conftest.py`` in this
+directory puts it on ``sys.path`` precisely so siblings import;
 ``systemd_unit_invariants.py`` is that pattern in production, lifted by task
 3408 with the explicit rationale that duplicating a shared invariant "is how
-the two copies drift until one silently stops catching the defect". The
-copies HAVE already drifted: ``_is_covered`` normalises trailing slashes with
+the two copies drift until one silently stops catching the defect". The copies
+HAD already drifted: ``_is_covered`` normalised trailing slashes with
 ``rstrip('/')``, ``_is_collected`` with ``posixpath.normpath``.
 
-The extraction into a shared ``verify_command_invariants.py`` is therefore
-correct and is NOT done here only because it requires editing the two sibling
-guards, which are outside this task's locks. Filed as
-[tkt_0RS47G1QXJ5XDPH4T0HKKA1A9S] — a curator TICKET id, not a task id: the
-curator runs asynchronously and decides create/combine/drop, so the resulting
-task number is not knowable at this commit (the DECIDED block's own convention
-for its two residual-gap follow-ups). That ticket carries the four behaviours
-the unified helper must not regress, since ``_pytest_collected_dirs`` is
-strictly richer than either sibling: ``--directory`` base resolution,
-``_PYTEST_VALUE_FLAGS`` consumption, the target-EXISTS assertion, and the
-``None``-not-assert contract for a non-pytest command. What
-IS done here: the false rationale is corrected, the drift is named, and the
-one cross-module dependency this file genuinely needs — the skills/ ruff
-probe's runtime target list — is taken by IMPORT rather than by re-derivation,
-demonstrating in-place that the sibling-import mechanism works.
+TASK 3745 LANDED THAT EXTRACTION, into ``verify_command_invariants.py`` beside
+this file — the name this paragraph pre-committed to, filed as
+[tkt_0RS47G1QXJ5XDPH4T0HKKA1A9S]; a curator TICKET id, not a task id, because
+the curator runs asynchronously and decides create/combine/drop (the DECIDED
+block's own convention for its two residual-gap follow-ups). The three helpers
+above are now thin delegations, and the deferral this paragraph recorded — that
+the extraction "requires editing the two sibling guards, which are outside this
+task's locks" — no longer holds: 3745 held all four.
+
+The four behaviours the ticket said the unified helper must not regress, since
+``_pytest_collected_dirs`` is strictly richer than any sibling, all survive, and
+WHERE each now lives is the load-bearing half of that claim:
+
+  * ``--directory`` base resolution — STAYS HERE, in
+    ``_pytest_collected_dirs``. It scans the whole token list on purpose, since
+    ``uv run --directory X pytest ...`` puts the flag PRE-anchor.
+  * ``_PYTEST_VALUE_FLAGS`` consumption — the flag SET stays here as this
+    guard's policy and is passed explicitly; only the consume-next loop is
+    shared. Its two ruff siblings deliberately pass nothing and keep the naive
+    ``-``-prefix filter, so passing the set is exactly what preserves the gap.
+  * the target-EXISTS assertion — STAYS HERE. It is a decision about module
+    configs, not a fact about shell syntax.
+  * the ``None``-not-assert contract for a non-pytest command — moved into
+    ``optional_token_segment``, and pinned there by a unit test rather than left
+    to a comment.
+
+The ``rstrip('/')``-vs-``normpath`` drift named above is RESOLVED by adopting
+the slash-tolerant form: it is a strict superset on normpath'ed targets (the
+only kind this file passes) and is load-bearing for the raw tokens the root-lint
+guard passes.
+
+What was already done here before that: the false rationale was corrected, the
+drift was named, and the one cross-module dependency this file genuinely needs —
+the skills/ ruff probe's runtime target list — is taken by IMPORT rather than by
+re-derivation, demonstrating in-place that the sibling-import mechanism works.
 
 Production code is cited BY SYMBOL, deliberately never by file:line — task
 3445's explicit correction of the convention task 3350 established, after
@@ -119,9 +142,11 @@ import subprocess
 # for systemd_unit_invariants. A bare `import`, never an importorskip: if the
 # probe stops importing, this guard must fail loudly.
 import test_root_lint_covers_nonmember_py as skills_ruff_probe
-from orchestrator.config import _discover_module_configs
 
-from orchestrator import verify_cmd
+# The shared command parser this file's helpers used to duplicate (task 3745),
+# resolving by the same conftest sys.path mechanism as the probe above.
+import verify_command_invariants as vci
+from orchestrator.config import _discover_module_configs
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 
@@ -384,11 +409,12 @@ def test_skills_has_no_tests_of_its_own() -> None:
 def _pytest_segment(cmd: str) -> str | None:
     """The ``&&``-chained segment of *cmd* that invokes ``pytest``, or ``None``.
 
-    Uses the production splitter ``verify_cmd.split_top_level_and``
-    (quote-aware) rather than a naive ``str.split('&&')`` — see the module
-    docstring's DUPLICATED COMMAND-PARSING HELPERS note for why this is a
-    third copy and why the extraction is a follow-up rather than a defect
-    left unnamed.
+    Delegates to ``verify_command_invariants.optional_token_segment`` (task
+    3745, the extraction the module docstring's COMMAND-PARSING HELPERS note
+    records), which uses the production splitter
+    ``verify_cmd.split_top_level_and`` (quote-aware) rather than a naive
+    ``str.split('&&')``. Every behaviour documented below is preserved there and
+    pinned by ``test_verify_command_invariants.py``.
 
     Splitting matters for real commands in this repo, not hypothetically: the
     repo-root fleet ``test_command`` is a seven-segment ``&&`` chain of
@@ -422,14 +448,7 @@ def _pytest_segment(cmd: str) -> str | None:
     which is the truth, and the ``skills/`` invariants are unaffected because
     no ``skills/`` consumer lives under ``sampler/``.
     """
-    for segment in verify_cmd.split_top_level_and(cmd):
-        try:
-            tokens = shlex.split(segment)
-        except ValueError:  # unbalanced quotes in a segment — not parseable
-            continue
-        if _PYTEST in tokens:
-            return segment
-    return None
+    return vci.optional_token_segment(cmd, _PYTEST)
 
 
 # pytest flags whose VALUE is a SEPARATE token. Only the space-separated form
@@ -523,16 +542,11 @@ def _pytest_collected_dirs(cmd: str) -> list[str]:
         elif token.startswith("--directory="):
             base = token.split("=", 1)[1]
 
-    targets: list[str] = []
-    skip_next = False
-    for token in tokens[tokens.index(_PYTEST) + 1:]:
-        if skip_next:
-            skip_next = False
-            continue
-        if token.startswith("-"):
-            skip_next = token in _PYTEST_VALUE_FLAGS
-            continue
-        targets.append(token)
+    # Only the positional extraction is shared (task 3745). The --directory scan
+    # above, the normpath join below and assertion (3) stay HERE: they are this
+    # guard's policy, not command parsing, and _PYTEST_VALUE_FLAGS is passed in
+    # for the same reason — its two ruff siblings deliberately pass nothing.
+    targets = vci.positional_targets(segment, _PYTEST, value_flags=_PYTEST_VALUE_FLAGS)
 
     resolved = [posixpath.normpath(posixpath.join(base, t)) for t in targets]
     for target in resolved:
@@ -593,14 +607,14 @@ def _is_collected(rel_path: str, targets: list[str]) -> bool:
     PARENT DIRECTORY, which yields the slashless form), and a literal
     comparison would fail with a message accusing the author of removing a gate
     at the moment nothing changed.
+
+    Delegates to ``verify_command_invariants.covers`` (task 3745), which adopted
+    the SLASH-TOLERANT name set of the sibling ``_is_covered`` — a strict
+    superset of the slashless one on the ``posixpath.normpath``-ed targets this
+    helper is always given, so the drift the module docstring named is resolved
+    without changing what this guard decides.
     """
-    candidate = pathlib.PurePosixPath(rel_path)
-    names = {rel_path}
-    for parent in candidate.parents:
-        if parent == pathlib.PurePosixPath("."):
-            continue
-        names.add(parent.as_posix())
-    return any(t in names for t in targets)
+    return vci.covers(rel_path, targets)
 
 
 def test_skills_py_ruff_probe_is_collected_by_a_registered_module_config_test_command() -> None:
