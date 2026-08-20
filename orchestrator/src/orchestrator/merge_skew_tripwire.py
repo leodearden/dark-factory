@@ -287,7 +287,17 @@ async def emit_pipeline_landing_tripwire(
     escalation per landing). Every external call (oracle subprocess inside
     ``_run_load_bearing_oracle``, each ``get_branch_diff``, ``submit``,
     each ``update_task``) is individually guarded, and the whole body is
-    wrapped again as a backstop — this function NEVER raises.
+    wrapped again as a backstop — this function never raises for any
+    oracle/git/task-update FAILURE.
+
+    Caller cancellation is the one exit this does NOT swallow: it
+    propagates BY DESIGN (``_run_load_bearing_oracle`` re-raises
+    ``CancelledError`` rather than failing open — see its docstring and
+    ``_ABANDONED_ORACLES``), and the ``except Exception:`` guards above and
+    below must never be widened to ``except BaseException:`` to suppress
+    it. A cancelled merge-landed hot path must stay cancelled; swallowing
+    ``CancelledError`` here would break cooperative cancellation and
+    re-strand the very oracle task ``_ABANDONED_ORACLES`` now tracks.
     """
     try:
         if not oracle_cmd:
