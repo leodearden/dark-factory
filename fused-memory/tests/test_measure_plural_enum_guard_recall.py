@@ -452,9 +452,12 @@ class _FakeCappedEdgeQuery:
 
     FalkorDB's server-wide RESULTSET_SIZE is 10000 and nothing in this repo
     overrides it, so an unpaginated query is SILENTLY cut at that many rows
-    — no error, no warning. Measured on the live dark_factory graph at
-    planning time: get_all_valid_edges' exact query has 24902 rows and
-    returns 10000, exposing 6376 of 12488 distinct valid edges (51%).
+    — no error, no warning. Measured on the live dark_factory graph at this
+    task's planning time, when get_all_valid_edges was still unpaginated:
+    its exact query returned 10000 of 24902 rows, exposing 6376 of 12488
+    distinct valid edges (51%). get_all_valid_edges has been PAGINATED since
+    task 4340, so that figure is the historical hazard this fake reproduces,
+    not a live defect in the enumerator.
 
     This fake reproduces that hazard at test scale by setting its cap equal
     to the page size, which is the worst case: a full page is
@@ -514,10 +517,13 @@ def _fake_corpus() -> tuple[list[list], int]:
 async def test_edge_enumeration_paginates_past_the_resultset_cap():
     """All N distinct edges must be enumerated, not just the first page.
 
-    A probe that reuses the unpaginated production query would measure a
-    51% sample and report it as the whole corpus. Since this task's headline
-    result is a ZERO, a truncated zero would be worthless — it would say
-    'no plural-enum facts found' when half the corpus was never looked at.
+    A probe issuing ONE unpaginated whole-graph query would measure a 51%
+    sample and report it as the whole corpus — that is what the production
+    enumerator did at this task's planning time, before task 4340 paginated
+    it. Since this task's headline result is a ZERO, a truncated zero would
+    be worthless: it would say 'no plural-enum facts found' when half the
+    corpus was never looked at. This probe pages regardless of what the
+    shared enumerator does, so the guarantee is its own.
     """
     rows, distinct = _fake_corpus()
     query_fn = _FakeCappedEdgeQuery(rows, cap=_PAGE_SIZE)

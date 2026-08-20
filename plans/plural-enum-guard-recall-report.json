@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "measured_at": "2026-08-17T15:28:27.567287+00:00",
+  "measured_at": "2026-08-20T22:37:06.354587+00:00",
   "generated_by": "fused-memory/scripts/measure_plural_enum_guard_recall.py",
   "regenerate": "cd fused-memory && uv run python scripts/measure_plural_enum_guard_recall.py",
   "page_size": 5000,
@@ -10,10 +10,10 @@
   "unmeasured_graphs": [],
   "verdict": "DO NOT TIGHTEN \u2014 but on the triage, not on a bare zero. Facts in this corpus DO reach the guard now, and every rejection triaged as a prepositional_complement: a CORRECT rejection, where the copula's real subject is an outer head noun. Not one triaged as adverbial_preamble, so the measured recall cost of the guard is still exactly zero edges and a tightening still buys nothing. CAVEAT, and it is why this verdict is weaker than a zero-match one: triage_rejection is a HEURISTIC, and a deliberately asymmetric one \u2014 it answers prepositional_complement whenever it is unsure, precisely so it cannot manufacture the recall loss that would justify a tightening. Leaning on it in THIS direction leans on its biased side. Read the rejection samples below and check them by eye before treating this as settled.",
   "revalidation_test": "tests/test_measure_plural_enum_guard_recall.py::test_candidate_b_recovers_every_preamble_but_re_opens_an_over_selection",
-  "total_valid_edges": 32304,
+  "total_valid_edges": 33156,
   "totals": {
-    "facts_scanned": 32304,
-    "lexical_precondition": 420,
+    "facts_scanned": 33156,
+    "lexical_precondition": 430,
     "regex_matched": 2,
     "guard_rejected": 2,
     "selected": 0
@@ -65,6 +65,20 @@
       "rejections": []
     },
     {
+      "project_id": "_test_4340_read_pagination_17dfc32c",
+      "valid_edges": 0,
+      "complete": true,
+      "scan": {
+        "facts_scanned": 0,
+        "lexical_precondition": 0,
+        "regex_matched": 0,
+        "guard_rejected": 0,
+        "selected": 0
+      },
+      "triage": {},
+      "rejections": []
+    },
+    {
       "project_id": "_test_530_list_indices_integration_7ea892b5",
       "valid_edges": 0,
       "complete": true,
@@ -94,11 +108,11 @@
     },
     {
       "project_id": "autopilot_video",
-      "valid_edges": 723,
+      "valid_edges": 730,
       "complete": true,
       "scan": {
-        "facts_scanned": 723,
-        "lexical_precondition": 15,
+        "facts_scanned": 730,
+        "lexical_precondition": 16,
         "regex_matched": 0,
         "guard_rejected": 0,
         "selected": 0
@@ -108,11 +122,11 @@
     },
     {
       "project_id": "dark_factory",
-      "valid_edges": 12548,
+      "valid_edges": 13036,
       "complete": true,
       "scan": {
-        "facts_scanned": 12548,
-        "lexical_precondition": 172,
+        "facts_scanned": 13036,
+        "lexical_precondition": 176,
         "regex_matched": 2,
         "guard_rejected": 2,
         "selected": 0
@@ -135,11 +149,11 @@
     },
     {
       "project_id": "know_live",
-      "valid_edges": 1588,
+      "valid_edges": 1589,
       "complete": true,
       "scan": {
-        "facts_scanned": 1588,
-        "lexical_precondition": 54,
+        "facts_scanned": 1589,
+        "lexical_precondition": 52,
         "regex_matched": 0,
         "guard_rejected": 0,
         "selected": 0
@@ -386,6 +400,34 @@
       "rejections": []
     },
     {
+      "project_id": "probe_e1_gw22",
+      "valid_edges": 0,
+      "complete": true,
+      "scan": {
+        "facts_scanned": 0,
+        "lexical_precondition": 0,
+        "regex_matched": 0,
+        "guard_rejected": 0,
+        "selected": 0
+      },
+      "triage": {},
+      "rejections": []
+    },
+    {
+      "project_id": "probe_e1_gw29",
+      "valid_edges": 0,
+      "complete": true,
+      "scan": {
+        "facts_scanned": 0,
+        "lexical_precondition": 0,
+        "regex_matched": 0,
+        "guard_rejected": 0,
+        "selected": 0
+      },
+      "triage": {},
+      "rejections": []
+    },
+    {
       "project_id": "probe_e1_gw3",
       "valid_edges": 0,
       "complete": true,
@@ -513,11 +555,11 @@
     },
     {
       "project_id": "reify",
-      "valid_edges": 15871,
+      "valid_edges": 16210,
       "complete": true,
       "scan": {
-        "facts_scanned": 15871,
-        "lexical_precondition": 168,
+        "facts_scanned": 16210,
+        "lexical_precondition": 175,
         "regex_matched": 0,
         "guard_rejected": 0,
         "selected": 0
@@ -527,10 +569,10 @@
     },
     {
       "project_id": "solar_challenge",
-      "valid_edges": 62,
+      "valid_edges": 67,
       "complete": true,
       "scan": {
-        "facts_scanned": 62,
+        "facts_scanned": 67,
         "lexical_precondition": 0,
         "regex_matched": 0,
         "guard_rejected": 0,
@@ -541,10 +583,10 @@
     },
     {
       "project_id": "solar_challenge_platform",
-      "valid_edges": 1056,
+      "valid_edges": 1068,
       "complete": true,
       "scan": {
-        "facts_scanned": 1056,
+        "facts_scanned": 1068,
         "lexical_precondition": 9,
         "regex_matched": 0,
         "guard_rejected": 0,

@@ -445,12 +445,24 @@ MAX_ENUM_PAGES = 1000
 
 # The same MATCH pattern GraphitiBackend.get_all_valid_edges uses, so this
 # measures the corpus the production sweep is aimed at — but issued with
-# SKIP/LIMIT instead of unpaginated. This is DELIBERATELY not a call to
-# get_all_valid_edges: inheriting that function's truncation would make the
-# headline zero meaningless. The truncation is a real latent coverage bug in
-# the production sweep, but it lives in graphiti_client.py, outside this
-# task's scope — it is filed as a follow-up and noted in the report rather
-# than fixed here.
+# SKIP/LIMIT and page-audited here. This is DELIBERATELY not a call to
+# get_all_valid_edges.
+#
+# TENSE MATTERS HERE, and an earlier draft of this comment got it wrong (the
+# error reached the committed artifact, which is the deliverable): at this
+# task's PLANNING TIME get_all_valid_edges was a single unpaginated query and
+# was silently truncated by FalkorDB's server-wide RESULTSET_SIZE of 10000,
+# hiding about half the corpus. It is PAGINATED AS OF TASK 4340 and that
+# truncation is GONE — get_all_valid_edges' own docstring says so, and the
+# measured counts are recorded in the RESULT-SET CAP AUDIT block of
+# backends/graphiti_client.py. There is NO outstanding truncation bug in
+# graphiti_client.py to file or fix on this account.
+#
+# The probe keeps its own paging anyway, for independence rather than for
+# workaround: the coverage claim then rests on the page accounting audited
+# below, not on whatever a shared enumerator does next. (Separately, the
+# task-2613 miss RATE still carries the old truncated denominator; that
+# re-measurement is ticket tkt_0RSJP92VQNATQB0FSR20YMXGW8.)
 #
 # ORDER BY is load-bearing, not cosmetic. Every page is a SEPARATE query, and
 # DISTINCT + SKIP/LIMIT with no total order gives the store no obligation to
@@ -1376,16 +1388,32 @@ def render_markdown(report: Report) -> str:
         ]
     lines += [
         'This probe pages with `SKIP`/`LIMIT` instead of calling '
-        '`GraphitiBackend.get_all_valid_edges`. That is deliberate: '
-        "FalkorDB's server-wide `RESULTSET_SIZE` is 10000 and nothing in this "
-        'repo overrides it, so `get_all_valid_edges` — which issues one '
-        'unpaginated query — is silently truncated with no error. Measured on '
-        'the live `dark_factory` graph: its exact query has 24902 rows and '
-        'returns 10000, exposing 6376 of 12488 distinct valid edges (51%). '
-        'Measuring recall through a truncated enumerator would produce a zero '
-        'that means nothing. The truncation is a real latent coverage bug in '
-        'the production sweep, but it lives in `graphiti_client.py`, outside '
-        "task 3949's scope — filed as a follow-up rather than fixed here.",
+        '`GraphitiBackend.get_all_valid_edges`. That is deliberate, and the '
+        'reason has a history worth stating in the right tense. FalkorDB\'s '
+        'server-wide `RESULTSET_SIZE` is 10000 and nothing in this repo '
+        'overrides it, so any UNPAGINATED whole-graph read is silently '
+        'truncated with no error and no marker. At this task\'s planning time '
+        '`get_all_valid_edges` was exactly such a read: measured on the live '
+        '`dark_factory` graph, its query returned 10000 of 24902 rows, '
+        'exposing 6376 of 12488 distinct valid edges (51%). Measuring recall '
+        'through a truncated enumerator would have produced a zero that means '
+        'nothing — hence this probe\'s own paging.',
+        '',
+        '`get_all_valid_edges` is **PAGINATED as of task 4340** and that '
+        'truncation is GONE. The measured counts behind both statements live '
+        'in the `RESULT-SET CAP AUDIT` block of '
+        '`fused-memory/src/fused_memory/backends/graphiti_client.py`, which is '
+        'the one place they are recorded. This probe nonetheless keeps its own '
+        '`SKIP`/`LIMIT` paging, so the coverage claim below rests on the '
+        'page-accounting audited here rather than on whatever a shared '
+        'enumerator does next — but it is NOT working around a live bug, and '
+        'nothing in `graphiti_client.py` is owed a fix on this account.',
+        '',
+        'What has NOT been recomputed is the separate task-2613 stale-status '
+        'MISS RATE, which was calculated against the old truncated '
+        'denominator. That re-measurement is ticket '
+        '`tkt_0RSJP92VQNATQB0FSR20YMXGW8`, and it is a different quantity from '
+        'anything measured in this report.',
         '',
         '## VERDICT',
         '',
