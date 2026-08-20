@@ -27,6 +27,7 @@ Test coverage:
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -2207,6 +2208,150 @@ class TestRedactPassedSuiteBlocks:
         )
         assert result.count('\n') == text.count('\n')
 
+
+
+# task 4492 — the REPLAYED-LOG regression test. The fixture is a verbatim
+# line-slice excerpt of the real reify 5623 test-leg transcript that caused
+# the incident; see its PROVENANCE.md for the source path, sha256 and the
+# exact five `sed` ranges. Do NOT edit the fixture to make a test here pass.
+_RUN_ALL_FIXTURE_DIR = Path(__file__).parent / 'fixtures' / 'verify_classify_run_all'
+_REIFY_5623_TEST_LEG = (
+    _RUN_ALL_FIXTURE_DIR / 'reify-5623-run-all-test-leg.log'
+).read_text()
+
+
+def _line_containing(text: str, position: int) -> str:
+    """The full line of *text* containing the character offset *position*."""
+    start = text.rfind('\n', 0, position) + 1
+    end = text.find('\n', position)
+    return text[start:] if end == -1 else text[start:end]
+
+
+class TestAggregatedRunAllScopingReplay:
+    """task 4492: the user-observable signal. An aggregated `run_all.sh`
+    transcript whose ONLY slot-marker lines were emitted by suites reporting
+    ZERO failures must classify as the branch fault it is, not as host-infra
+    trouble.
+
+    reify 5623 was held blocked 2026-08-09 -> 08-19 on this exact output
+    under a false "disk pressure / SEMAPHORE_TIMEOUT" L1, while its own tail
+    named the real cause: a `test_reify_audit_ptodo.sh` PTODO ratchet
+    failure.
+    """
+
+    # -- FIXTURE INTEGRITY --------------------------------------------------
+    #
+    # These are NOT documentation tests. They are the only thing standing
+    # between "this regression test passes because the fix works" and "this
+    # regression test passes because the fixture got truncated or
+    # regenerated wrong and no longer contains the markers at all" — the one
+    # way this class could silently stop testing anything.
+
+    def test_fixture_carries_exactly_three_deadline_markers_at_column_zero(self):
+        """Column 0 is the load-bearing part: it proves these are GENUINE
+        emitter output, not the mid-line assertion-prose vector task 3679
+        already closed. That is precisely why no further line-anchoring could
+        have fixed this class, and why the scoping layer was needed."""
+        matches = list(
+            verify_classify._SLOT_ACQUIRE_DEADLINE_RE.finditer(_REIFY_5623_TEST_LEG)
+        )
+        assert len(matches) == 3, (
+            f'fixture must carry exactly 3 deadline markers, found '
+            f'{len(matches)} — the fixture has drifted, re-cut it per '
+            f'PROVENANCE.md rather than adjusting this number'
+        )
+        for match in matches:
+            line = _line_containing(_REIFY_5623_TEST_LEG, match.start())
+            assert not line[: len(line) - len(line.lstrip())], (
+                f'marker must be at column 0 to be genuine emitter output, '
+                f'got indented line {line!r}'
+            )
+
+    def test_every_marker_sits_inside_a_passing_suite_block(self):
+        """The whole premise of the fix: each marker is enclosed by an open
+        header and that SAME suite's `RESULT: PASS` close, so every one of
+        them is covered by a positive zero-failures attestation."""
+        lines = _REIFY_5623_TEST_LEG.split('\n')
+        marker_line_numbers = [
+            index
+            for index, line in enumerate(lines)
+            if verify_classify._SLOT_ACQUIRE_DEADLINE_RE.match(line)
+        ]
+        assert len(marker_line_numbers) == 3
+
+        for number in marker_line_numbers:
+            opened = None
+            for candidate in range(number - 1, -1, -1):
+                match = verify_classify._RUN_ALL_SUITE_OPEN_RE.match(lines[candidate])
+                if match is not None:
+                    opened = match.group('name')
+                    break
+            assert opened is not None, f'marker at line {number} has no open header'
+
+            closed = None
+            for candidate in range(number + 1, len(lines)):
+                match = verify_classify._RUN_ALL_SUITE_CLOSE_RE.match(lines[candidate])
+                if match is not None:
+                    closed = match
+                    break
+            assert closed is not None, f'marker at line {number} has no close'
+            assert closed.group('name') == opened, (
+                f'marker at line {number} is not enclosed by a matched-name '
+                f'block: opened {opened!r}, closed {closed.group("name")!r}'
+            )
+            assert closed.group('verdict') == 'PASS', (
+                f'marker at line {number} must sit in a PASSING block — that '
+                f'is what makes it a false positive; got '
+                f'{closed.group("verdict")!r}'
+            )
+
+    def test_fixture_carries_the_real_failure_and_the_summary_tail(self):
+        assert '=== Summary: 145 discovered, 1 failed ===' in _REIFY_5623_TEST_LEG
+        assert '  RESULT: FAIL (test_reify_audit_ptodo.sh)' in _REIFY_5623_TEST_LEG
+
+    # -- BEHAVIOUR ----------------------------------------------------------
+
+    def test_replayed_run_all_log_classifies_test_failure(self):
+        """RED before step-4: returns `semaphore_timeout`. Reproduced
+        first-hand on both the full 922 KB log and this 332-line excerpt."""
+        result = _classify(ToolKind.OPAQUE, _REIFY_5623_TEST_LEG, 1, False)
+        assert result == FailureCategory.TEST_FAILURE, (
+            f'the 5623 transcript is a deterministic branch fault (a PTODO '
+            f'ratchet failure named in its own tail), not a host event; '
+            f'got {result!r}'
+        )
+
+    def test_replayed_run_all_log_is_not_infra_transient(self):
+        """The CONSEQUENCE assertion, in the style of
+        TestDeterministicLintFailureIsNotSemaphoreTimeout. INFRA_TRANSIENT
+        membership is what routed 5623 into an infra hold instead of to the
+        debugger for 10 days — asserting only the enum label would still pass
+        if the fault were relabelled to some other infra-transient category,
+        reproducing the incident exactly."""
+        result = _classify(ToolKind.OPAQUE, _REIFY_5623_TEST_LEG, 1, False)
+        assert result not in INFRA_TRANSIENT_CATEGORIES, (
+            f'a branch fault must not land in an infra-transient category '
+            f'(it would be silently infra-retried), got {result!r}'
+        )
+        assert CATEGORY_POLICY[result].is_infra_transient is False
+
+    @pytest.mark.parametrize('tool', ALL_TOOL_KINDS)
+    def test_scoping_is_tool_blind(self, tool):
+        """Guard 3 runs BEFORE per-tool dispatch, so its scoping must hold
+        for every ToolKind. Non-OPAQUE tools may legitimately reach a
+        different non-infra category than TEST_FAILURE, so the portable
+        claims are the two that matter operationally: not SEMAPHORE_TIMEOUT,
+        and not infra-transient."""
+        result = _classify(tool, _REIFY_5623_TEST_LEG, 1, False)
+        assert result != FailureCategory.SEMAPHORE_TIMEOUT, (
+            f'{tool!r}: markers emitted by suites reporting zero failures '
+            f'must not classify semaphore_timeout, got {result!r}'
+        )
+        assert result not in INFRA_TRANSIENT_CATEGORIES, (
+            f'{tool!r}: must not land in an infra-transient category, '
+            f'got {result!r}'
+        )
+        assert CATEGORY_POLICY[result].is_infra_transient is False
 
 
 # step-9: verify._summarize_checks must thread the per-check config command
