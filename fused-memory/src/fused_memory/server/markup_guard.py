@@ -134,6 +134,10 @@ EXEMPT_TOOLS: frozenset[str] = frozenset({'scan_memory_content'})
 #: as calm, so this guard needs an anchor of its own.
 _STORM_ANCHOR_TASK_ID = 'markup-guard'
 
+#: The one record kind the storm filer understands. The middleware sends its
+#: per-call RESIDUE records down the same channel, and those are not bursts.
+_STORM_ERROR_TYPE = 'mcp_markup_storm'
+
 #: Where an operator should take a recurrence. DF 3083 delivered the root cause
 #: and the corpus sweep but is DONE and CLOSED to appends, so a reader sent there
 #: reports it nowhere. This text carries forward the correction commit e0ea6e3fe9
@@ -274,12 +278,37 @@ def install_markup_guard(
     def _escalation_sink(record: dict[str, Any]) -> None:
         """File a fired burst, and never change the rejection that fired it.
 
-        Receives the middleware's
-        ``{'error_type': 'mcp_markup_storm', count, threshold, window_seconds,
-        outcome, project}`` record. The middleware delegates dedup here on
-        purpose — whether an open escalation already exists is queue knowledge
-        the shared layer does not have and must not guess at.
+        ONE sink serves TWO record kinds — measured, not assumed. The middleware
+        routes both its storm summaries (``error_type='mcp_markup_storm'``:
+        count, threshold, window_seconds, outcome, project) AND its per-call
+        RESIDUE records (``mcp_markup_unrepairable``, carrying the ``raw_value``
+        the caller lost) through this one injected callable.
+
+        Only the first is a burst, so only the first reaches
+        :func:`emit_markup_storm_escalation`, whose record is storm-shaped down
+        to its detail text. Before this dispatch, a residue record filed a
+        rejected_writes_in_window=None escalation under the STORM anchor, once
+        per unrepairable call, and logged 'None None outcome(s) in Nones'.
+
+        The residue kind is logged instead, record intact, so the payload is
+        recoverable from the operator log. fused-memory has no durable residue
+        queue yet; wiring one is filed as follow-up rather than improvised here,
+        because minting a second escalation shape is the duplication INV-5
+        forbids.
+
+        The middleware delegates dedup here on purpose — whether an open
+        escalation already exists is queue knowledge the shared layer does not
+        have and must not guess at.
         """
+        if record.get('error_type') != _STORM_ERROR_TYPE:
+            logger.error(
+                'markup_guard_residue: refused an unrepairable call and preserved '
+                'its payload here — no durable residue queue is wired, so THIS '
+                'LOG LINE is the only copy: %r; %s',
+                record, _STORM_ROUTING,
+            )
+            return
+
         project_root = _resolve_project_root(record.get('project'), known_projects)
         if project_root is None:
             logger.error(

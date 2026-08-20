@@ -784,3 +784,54 @@ class TestReconReportServerIsNotGuarded:
         manager = mcp._tool_manager
         assert getattr(manager, '_fused_memory_safe_wrapped', False) is True
         assert getattr(manager, '_fused_memory_markup_guarded', False) is False
+
+
+# ---------------------------------------------------------------------------
+# step-11: INV-5 — exactly ONE mechanism, and it is not in the tool bodies.
+# ---------------------------------------------------------------------------
+
+
+class TestExactlyOneMechanism:
+    """The retirement, asserted structurally as well as behaviourally.
+
+    tests/server/test_markup_tripwire_gate.py pins the BEHAVIOUR (an unguarded
+    server no longer refuses a leaked write). This pins the SHAPE, so a
+    reintroduced in-line gate fails in pytest rather than only at the task's
+    machine gate — and so the failure names INV-5 rather than presenting as an
+    unexplained behavioural change.
+    """
+
+    def test_tools_module_exposes_no_in_line_markup_gate(self):
+        from fused_memory.server import tools
+
+        # The gate was a CLOSURE inside create_mcp_server, never a module
+        # attribute, so hasattr would pass vacuously. Its compiled body is
+        # reachable as a nested code object, which is what a reintroduced
+        # closure would put back.
+        nested = {
+            const.co_name for const in tools.create_mcp_server.__code__.co_consts
+            if hasattr(const, 'co_name')
+        }
+        assert '_markup_gate' not in nested, (
+            'the in-line markup gate is back: there must be exactly ONE '
+            'mechanism and it lives at the dispatch boundary (INV-5)'
+        )
+        assert '_markup_storm' not in tools.create_mcp_server.__code__.co_varnames, (
+            'the in-line storm counter is back; the boundary guard owns the '
+            'counter now, and two counters would each see half the burst'
+        )
+
+    @pytest.mark.parametrize(
+        'symbol', ['find_markup_violation', 'build_markup_block', 'MarkupStormCounter']
+    )
+    def test_tools_module_no_longer_imports_the_write_time_machinery(self, symbol):
+        """These stay PUBLIC on markup_tripwire — 75 unit tests cover them, and
+        emit_markup_storm_escalation is the boundary guard's own filer. What
+        must be gone is tools.py importing them, which is the only way a second
+        mechanism could be assembled in a tool body."""
+        from fused_memory.server import tools
+
+        assert not hasattr(tools, symbol), (
+            f'fused_memory.server.tools still imports {symbol}: the write-time '
+            f'mechanism it belongs to was retired in favour of the boundary guard'
+        )
