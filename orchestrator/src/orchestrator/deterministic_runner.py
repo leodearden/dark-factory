@@ -1591,6 +1591,13 @@ class DeterministicRunner:
 
         title = task.get('title') or task_id
         summary = f'Human curator gate {task_id} resumed without content adjudication'
+        # The configured per-project root — the SAME value the scheduler puts on
+        # its own real update_task MCP calls. Deliberately NOT os.getcwd(): every
+        # fleet orchestrator unit pins WorkingDirectory to the dark-factory
+        # checkout (so `uv run --project orchestrator` resolves) while selecting
+        # its actual target project via --config, so a cwd-derived value would
+        # silently aim most operators at the wrong project.
+        project_root = self.scheduler.config.project_root
         detail = (
             f"Task {task_id} ({title!r}) is a deterministic pure gate marked "
             f"`metadata.{HUMAN_CURATOR_GATE_KEY}`, meaning it closes only when a "
@@ -1608,7 +1615,8 @@ class DeterministicRunner:
             f"REMEDIATION — one of:\n"
             f"  (a) Perform the per-entry content review this gate asks for, then "
             f"stamp the proof and resolve this escalation:\n"
-            f"      update_task({task_id}, metadata={{'{HUMAN_CURATOR_ADJUDICATED_AT_KEY}': "
+            f"      update_task(id={task_id!r}, project_root={project_root!r}, "
+            f"metadata={{'{HUMAN_CURATOR_ADJUDICATED_AT_KEY}': "
             f"'<ISO-8601 timestamp>'}}, metadata_mode='merge')\n"
             f"      The stamp must be a non-empty string; a bare `true` is NOT "
             f"accepted (it asserts the conclusion without recording when the "
