@@ -5461,7 +5461,7 @@ class TestMemoryConsolidatorFlagAcknowledgment:
 
         ack_mock = AsyncMock(return_value=0)
 
-        async def _fake_dedup(*, memory_service, project_id, run_id, flags):
+        async def _fake_dedup(*, memory_service, project_id, run_id, flags, **_kwargs):
             # Simulate dedup_flags' internal filter_suppressed dropping
             # suppressed_flag before the signature-dedup loop runs.  Filters by
             # content (not object identity): StageReport is a pydantic model,
@@ -5549,7 +5549,7 @@ class TestMemoryConsolidatorFlagAcknowledgment:
 
         ack_mock = AsyncMock(return_value=1)
 
-        async def _fake_dedup(*, memory_service, project_id, run_id, flags):
+        async def _fake_dedup(*, memory_service, project_id, run_id, flags, **_kwargs):
             # By the time dedup_flags runs, filter_terminal_metadata_flags has
             # already dropped terminal_flag (real implementation, driven by
             # the taskmaster mock above) — so `flags` here is only
