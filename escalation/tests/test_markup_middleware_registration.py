@@ -453,3 +453,120 @@ class TestUnrepairableResidueIsPreserved:
 
         residue = self._residue(queue)
         assert payload['escalation_id'] == residue.id
+
+
+# ---------------------------------------------------------------------------
+# The regression pin: EVERY committed specimen, against the REAL server.
+# ---------------------------------------------------------------------------
+
+#: The corpus records tool names in the AGENT-FACING prefixed spelling; the
+#: in-server name FastMCP dispatches on is the bare suffix.
+ESCALATION_TOOLS = ('mcp__escalation__escalate_info', 'mcp__escalation__escalate_blocker')
+
+REPLAY = [r for r in load_corpus() if r['tool'] in ESCALATION_TOOLS]
+
+# A mis-typed filter would otherwise yield an empty, always-green
+# parametrisation. Measured: 24 escalate_info + 1 escalate_blocker.
+assert REPLAY, f'no specimens collected for {ESCALATION_TOOLS}'
+assert {r['tool'] for r in REPLAY} == set(ESCALATION_TOOLS), (
+    'at least one specimen must be collected for EACH tool'
+)
+
+#: Type-correct fillers for the OTHER arguments a specimen was sent with.
+#: Replaying with the specimen's own ``supplied`` set is what makes the outcome
+#: comparable: ``repair`` REFUSES a recovery whose name the caller already
+#: supplied, so replaying with a smaller argument map would be a more permissive
+#: call than the one that really happened.
+FILLERS: dict[str, Any] = {
+    'task_id': '3441',
+    'agent_role': 'implementer',
+    'category': 'cleanup_needed',
+    'summary': 'Replayed committed corpus specimen.',
+    'detail': '',
+    'suggested_action': '',
+    'severity': 'info',
+    'worktree': '/tmp/worktree',
+    'workflow_state': 'implementing',
+    'evidence': [],
+    'level': 0,
+}
+
+
+def replay_args(record: dict[str, Any]) -> dict[str, Any]:
+    """The argument map this specimen really arrived with, damage included."""
+    args = {name: FILLERS[name] for name in record['supplied']}
+    args[record['param']] = record['value']
+    if record['tool'].endswith('escalate_blocker'):
+        args.setdefault('severity', 'blocking')
+    return args
+
+
+def replay_id(record: dict[str, Any]) -> str:
+    """Name the parametrisation by ``tool_use_id`` — never by index."""
+    return f"{record['tool'].split('__')[-1]}-{record['tool_use_id']}"
+
+
+class TestCorpusReplayAgainstRealServer:
+    """All 25 real leaked calls, replayed through the real escalation server.
+
+    The hand-picked specimens above prove three shapes. This proves the whole
+    measured population, which is what catches two things nothing before it can:
+
+    (a) SCHEMA DRIFT. Each record carries the ``schema_params`` captured at
+        extraction time; the live tools may have moved since, and a recovery
+        target that is no longer a parameter legitimately becomes unrepairable
+        (``repair`` validates recovered names against the schema). The real
+        server is ground truth. MEASURED at this commit: zero divergence — every
+        name in every specimen's captured schema is still a live parameter of
+        the tool it names, so no specimen's outcome changes.
+
+    (b) BOTH TYPE SHAPES AT ONCE. These specimens recover ``suggested_action``
+        (str, 13 of them) and ``evidence`` (list, 4), so the schema-directed
+        coercion is exercised across every real shape rather than the three the
+        earlier tests hand-pick.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('record', REPLAY, ids=replay_id)
+    async def test_specimen(self, tmp_path: Path, record: dict[str, Any]):
+        bare = record['tool'].split('__')[-1]
+        queue, server = build(tmp_path)
+
+        async with Client(server) as client:
+            if record['expected_outcome'] == 'unrepairable':
+                with pytest.raises(ToolError) as excinfo:
+                    await client.call_tool(bare, replay_args(record))
+                payload = error_payload(excinfo)
+                assert payload['error_type'] == 'mcp_markup_unrepairable'
+                # The refusal preserved the payload rather than destroying it.
+                residues = [
+                    esc for esc in queue.get_pending()
+                    if esc.category == RESIDUE_CATEGORY
+                ]
+                assert len(residues) == 1
+                assert record['value'] in residues[0].detail
+                assert payload['escalation_id'] == residues[0].id
+                return
+
+            result = await client.call_tool(bare, replay_args(record))
+
+        # The escalation is FILED — the tier's whole purpose (INV-6).
+        assert result.data['status'] in {'queued', 'dedup_skipped'}
+        assert result.meta is not None
+        warning = result.meta['markup_repair']
+        assert warning['outcome'] == 'repaired'
+        assert warning['recovered_params'] == sorted(record['expected_recovered'])
+
+        esc = queue.get(result.data['id'])
+        assert esc is not None
+        # And the recovered values landed with their DECLARED types, not as the
+        # verbatim str slices repair() hands back.
+        if 'evidence' in record['expected_recovered']:
+            assert isinstance(esc.evidence, list) and esc.evidence
+            assert all(isinstance(entry, dict) for entry in esc.evidence)
+        if 'suggested_action' in record['expected_recovered']:
+            assert isinstance(esc.suggested_action, str)
+            assert esc.suggested_action.strip()
+        # The clean value is envelope-free wherever it landed.
+        assert detect(esc.detail) is None
+        assert detect(esc.suggested_action) is None

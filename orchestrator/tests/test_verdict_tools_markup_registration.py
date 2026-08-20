@@ -268,3 +268,97 @@ class TestPolicyDeclaredAndStrictValidationOff:
         """
         assert len(ALL_BRANCHES) == 4
         assert set(ALL_BRANCHES) - {REVIEWER_ROLE} == _SINGLETON_ROLE_TOOLS
+
+
+# ---------------------------------------------------------------------------
+# The regression pin: EVERY committed specimen, against the REAL server.
+# ---------------------------------------------------------------------------
+
+#: The corpus records tool names in the AGENT-FACING prefixed spelling; the
+#: in-server name FastMCP dispatches on is the bare suffix.
+VERDICT_TOOL = 'mcp__verdict-tools__submit_review_verdict'
+
+REPLAY = [r for r in load_corpus() if r['tool'] == VERDICT_TOOL]
+
+# A mis-typed filter would otherwise yield an empty, always-green
+# parametrisation. Measured: 19 specimens, all `repaired`.
+assert REPLAY, f'no specimens collected for {VERDICT_TOOL}'
+
+#: Type-correct fillers for the OTHER arguments a specimen was sent with.
+#: Replaying with the specimen's own ``supplied`` set is what makes the outcome
+#: comparable: ``repair`` REFUSES a recovery whose name the caller already
+#: supplied, so replaying with a smaller argument map would be a more permissive
+#: call than the one that really happened.
+FILLERS: dict[str, Any] = {
+    'reviewer': REVIEWER_ROLE,
+    'verdict': 'ISSUES_FOUND',
+    'issues': [],
+    'summary': '',
+}
+
+
+def replay_args(record: dict[str, Any]) -> dict[str, Any]:
+    """The argument map this specimen really arrived with, damage included."""
+    args = {name: FILLERS[name] for name in record['supplied']}
+    args[record['param']] = record['value']
+    return args
+
+
+def replay_id(record: dict[str, Any]) -> str:
+    """Name the parametrisation by ``tool_use_id`` — never by index."""
+    return record['tool_use_id']
+
+
+class TestCorpusReplayAgainstRealServer:
+    """All 19 real leaked calls, replayed through the real verdict-tools server.
+
+    Catches two things nothing before it can:
+
+    (a) SCHEMA DRIFT. Each record carries the ``schema_params`` captured at
+        extraction time, and the live tool has in fact MOVED since: every
+        specimen's captured schema lists ``__unparsedToolInput``, which is not a
+        parameter of ``submit_review_verdict`` at all. The real server is ground
+        truth, and dropping that name is inert here — no specimen recovers it,
+        so no outcome changes. (``repair`` validates recovered NAMES against the
+        schema, so a specimen that DID target it would legitimately become
+        unrepairable against the live tool, and that is the correct answer, not
+        a reason to edit the committed fixture: it is task 3688's artefact and
+        other suites replay it.)
+
+    (b) BOTH TYPE SHAPES AT ONCE. 16 specimens recover the REQUIRED list-typed
+        ``issues`` and one recovers the str-typed ``verdict``, so the
+        schema-directed coercion is exercised across every real shape rather
+        than the one the hand-picked specimen above covers. Two recover NOTHING
+        while still repairing — a clean truncation with an empty tail — which is
+        a distinct outcome from unrepairable and must stay one.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('record', REPLAY, ids=replay_id)
+    async def test_specimen(self, artifacts: TaskArtifacts, record: dict[str, Any]):
+        assert record['expected_outcome'] == 'repaired'
+        assert '__unparsedToolInput' in record['schema_params']
+
+        server = create_server(artifacts, REVIEWER_ROLE)
+        async with Client(server) as client:
+            result = await client.call_tool(
+                'submit_review_verdict', replay_args(record)
+            )
+
+        # The review gate is NOT stranded (INV-6).
+        assert result.data['status'] == 'ok'
+        assert result.meta is not None
+        warning = result.meta['markup_repair']
+        assert warning['outcome'] == 'repaired'
+        assert warning['recovered_params'] == sorted(record['expected_recovered'])
+
+        envelope = artifacts.read_verdict(REVIEWER_ROLE)
+        assert envelope is not None
+        verdict = envelope['verdict']
+        # The recovered values landed with their DECLARED types, not as the
+        # verbatim str slices repair() hands back.
+        if 'issues' in record['expected_recovered']:
+            assert isinstance(verdict['issues'], list)
+            assert all(isinstance(entry, dict) for entry in verdict['issues'])
+        if 'verdict' in record['expected_recovered']:
+            assert verdict['verdict'] in {'PASS', 'ISSUES_FOUND'}
