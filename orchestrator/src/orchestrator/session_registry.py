@@ -3438,6 +3438,10 @@ def main(argv: list[str] | None = None) -> int:
     # and handed to BOTH: to default_lease_slug via pid=, and to
     # _run_lease_claim via args.pid. Pinned by
     # test_main_lease_claim_derives_the_body_pid_and_the_slug_pid_from_one_resolution.
+    # An explicit --pid is the one case where the two legitimately differ: it
+    # overrides the BODY's liveness pid only, deliberately, and never the slug
+    # -- the identity has to stay derivable by the mutating verbs, which have no
+    # --pid at all (see that flag's help, and the parser.error below).
     #
     # Resolution is DEMAND-DRIVEN: an explicit --slug on a mutating verb needs
     # no pid at all (those verbs never write one), and resolving anyway would
