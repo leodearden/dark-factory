@@ -88,7 +88,9 @@ def _pass_through(mock_service: AsyncMock, method: str) -> None:
     getattr(mock_service, method).return_value = result
 
 
-def _build_guarded_server(*methods: str) -> tuple[Any, AsyncMock]:
+def _build_guarded_server(
+    *methods: str, known_projects: dict[str, str] | None = None
+) -> tuple[Any, AsyncMock]:
     """A real bundled-FastMCP server with the boundary guard installed.
 
     Shape copied from tests/test_tool_safe_wrapper.py::_build_server_with_tool:
@@ -103,7 +105,7 @@ def _build_guarded_server(*methods: str) -> tuple[Any, AsyncMock]:
     install_markup_guard(
         server,
         policy=RepairPolicy.REJECT_WITH_REPAIR,
-        known_projects=_KNOWN_PROJECTS,
+        known_projects=_KNOWN_PROJECTS if known_projects is None else known_projects,
     )
     return server, mock_service
 
@@ -396,4 +398,195 @@ class TestOverrideHatch:
             )
 
         assert _payload(exc_info)['error_type'] == 'mcp_markup_detected'
+        mock_service.add_system_record.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# The storm escape (INV-4), and the two defects this replacement must fix.
+# ---------------------------------------------------------------------------
+
+#: The middleware's threshold is 3 in a 3600s window, so three rejections in one
+#: test fire exactly one burst. No injected clock is needed: real time cannot
+#: leave a 3600s window during three in-process calls, and a fake clock here
+#: would test StormCounter (already covered by its own suite) rather than the
+#: sink wiring this class is about.
+_BURST = 3
+
+
+def _escalations(root) -> list[dict]:
+    """Every escalation record filed under *root*, parsed."""
+    return [
+        json.loads(path.read_text())
+        for path in sorted((root / 'data' / 'escalations').glob('esc-*.json'))
+    ]
+
+
+class TestStormEscape:
+    """A BURST means the upstream serialization leak is running right now.
+
+    One corrupted call is routine (the measured rate is 0.26%); a burst is the
+    operator-facing event, and it is the only signal that survives a caller
+    which simply retries forever.
+    """
+
+    @staticmethod
+    def _server(known_projects):
+        """A guarded server whose project map points at the test's queue dir."""
+        return _build_guarded_server('add_system_record', known_projects=known_projects)
+
+    @staticmethod
+    async def _burst(server, project_id=_PROJECT_ID, n=_BURST):
+        for i in range(n):
+            with pytest.raises(ToolError) as exc_info:
+                await server._tool_manager.call_tool(
+                    'add_system_record',
+                    {
+                        'content': _leaked(f'{_CLEAN_CONTENT} {i}', 'agent_id', _AGENT_ID),
+                        'project_id': project_id,
+                        'category': 'observations_and_summaries',
+                    },
+                )
+        return _payload(exc_info)
+
+    @pytest.mark.asyncio
+    async def test_a_burst_files_under_an_anchor_the_l1_watcher_does_not_share(
+        self, tmp_path
+    ):
+        """The measured defect (a).
+
+        The L1 escalation watcher files its cluster records under the
+        'markup-tripwire' anchor and SQUATS it — measured: the tripwire filed
+        nothing 2026-08-16..2026-08-19 while 41 rejections occurred, all 17
+        records at dedupe_count 0. A boundary guard inheriting that anchor would
+        inherit the silence, which reads as calm rather than as suppression.
+        """
+        server, _ = self._server({_PROJECT_ID: str(tmp_path)})
+
+        await self._burst(server)
+
+        records = _escalations(tmp_path)
+        assert len(records) == 1, f'expected exactly one burst record: {records!r}'
+        assert records[0]['task_id'] == 'markup-guard'
+        assert records[0]['task_id'] != 'markup-tripwire'
+
+    @pytest.mark.asyncio
+    async def test_an_open_markup_tripwire_record_does_not_suppress_the_burst(
+        self, tmp_path
+    ):
+        """The squat, reproduced: an open record on the OLD anchor must not
+        silence the new guard."""
+        from fused_memory.server.markup_tripwire import emit_markup_storm_escalation
+
+        squatter = emit_markup_storm_escalation(str(tmp_path), {'count': 9})
+        assert squatter is not None, 'escalation package unavailable in this environment'
+        server, _ = self._server({_PROJECT_ID: str(tmp_path)})
+
+        await self._burst(server)
+
+        anchors = {record['task_id'] for record in _escalations(tmp_path)}
+        assert anchors == {'markup-tripwire', 'markup-guard'}
+
+    @pytest.mark.asyncio
+    async def test_a_bare_project_id_is_translated_through_known_projects(
+        self, tmp_path
+    ):
+        """The measured defect (b).
+
+        ``MarkupGuardMiddleware._identity`` resolves ``project_root`` FIRST then
+        ``project_id``, so a leaked add_system_record — which carries only a
+        project_id — yields a bare id like 'dark_factory', not a path. Filing
+        against that would try to open a queue at a relative directory named
+        after the project. The sink translates it through known_projects, the
+        same ``_kp.get(project_id)`` translation the in-line gate does.
+        """
+        server, _ = self._server({_PROJECT_ID: str(tmp_path)})
+
+        await self._burst(server)
+
+        assert len(_escalations(tmp_path)) == 1
+        # And nothing was created at a path named after the bare project id.
+        assert not (tmp_path / _PROJECT_ID).exists()
+
+    @pytest.mark.asyncio
+    async def test_an_unresolvable_project_files_nothing(self, tmp_path):
+        """An escalation filed against a guessed default is worse than one an
+        operator has to place by hand, so an unresolvable project files NOTHING
+        — but the rejection itself is unaffected."""
+        server, _ = self._server({'some_other_project': str(tmp_path)})
+
+        payload = await self._burst(server)
+
+        assert payload['error_type'] == 'mcp_markup_detected'
+        assert not (tmp_path / 'data' / 'escalations').exists()
+
+    @pytest.mark.asyncio
+    async def test_the_filed_record_routes_at_the_live_prd(self, tmp_path):
+        """The measured defect (c): routing text.
+
+        Carries forward the correction commit e0ea6e3fe9 made to the ERROR line
+        inside the _markup_gate closure that step-12 deletes. DF 3083 is DONE
+        and CLOSED to appends, so a reader sent to report a recurrence there
+        reports it nowhere.
+        """
+        server, _ = self._server({_PROJECT_ID: str(tmp_path)})
+
+        await self._burst(server)
+
+        record = _escalations(tmp_path)[0]
+        routing = f'{record["summary"]}\n{record["detail"]}\n{record["suggested_action"]}'
+        assert 'toolcall-markup-containment-prd.md' in routing, (
+            f'must name the live owner: {routing!r}'
+        )
+        # 3083 may be NAMED as the closed predecessor — what must not happen is
+        # the reader being DIRECTED to report a recurrence against it. That
+        # correction is stated explicitly, so assert it explicitly.
+        assert 'not against 3083' in routing, (
+            f'must send recurrences to the PRD, not the closed predecessor: {routing!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_operator_facing_error_line_names_the_prd(self, tmp_path, caplog):
+        """The greppable half. The payload folded into the response reaches only
+        the leaking caller — the one party that already knows — so the operator's
+        copy cannot ride on it."""
+        server, _ = self._server({_PROJECT_ID: str(tmp_path)})
+
+        with caplog.at_level('ERROR', logger='fused_memory.server.markup_guard'):
+            await self._burst(server)
+
+        mine = [
+            r for r in caplog.records
+            if r.name == 'fused_memory.server.markup_guard' and r.levelname == 'ERROR'
+        ]
+        assert mine, f'expected one greppable ERROR line; got {caplog.records!r}'
+        text = '\n'.join(r.getMessage() for r in mine)
+        assert 'toolcall-markup-containment-prd.md' in text
+        assert 'see DF 3083' not in text, (
+            f'must not direct the reader at the closed predecessor: {text!r}'
+        )
+        # The visible-counter half of the task's remedy, without a schema change.
+        assert str(_BURST) in text, f'must state the observed count: {text!r}'
+
+    @pytest.mark.asyncio
+    async def test_a_sink_that_raises_never_changes_the_rejection(
+        self, tmp_path, monkeypatch
+    ):
+        """The measured defect (d), and the reason the emit is wrapped.
+
+        The rejection is already decided by the time the sink runs, so
+        escalation is purely additive — the same reasoning the retiring
+        _markup_gate applies to its own emitter.
+        """
+        import fused_memory.server.markup_guard as guard_module
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError('queue on fire')
+
+        monkeypatch.setattr(guard_module, 'emit_markup_storm_escalation', _boom)
+        server, mock_service = self._server({_PROJECT_ID: str(tmp_path)})
+
+        payload = await self._burst(server)
+
+        assert payload['error_type'] == 'mcp_markup_detected'
+        assert payload['repaired_call']['agent_id'] == _AGENT_ID
         mock_service.add_system_record.assert_not_awaited()

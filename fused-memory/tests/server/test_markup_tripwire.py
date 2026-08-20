@@ -777,6 +777,81 @@ class TestEmitMarkupStormEscalation:
             f'must still route at the live successor PRD: {payload!r}'
         )
 
+    # -- the anchor parameter (task 4458) -------------------------------
+
+    def test_the_default_anchor_is_unchanged(self, tmp_path):
+        """Callers that do not pass an anchor must behave exactly as before.
+
+        The in-line write-time gate still calls this with two positional
+        arguments, so a default drift here would silently re-point its records.
+        """
+        esc_id = emit_markup_storm_escalation(str(tmp_path), _STORM)
+        if not markup_tripwire.HAS_ESCALATION:
+            pytest.skip('escalation package unavailable in this environment')
+        payload = json.loads(next((tmp_path / 'data' / 'escalations').glob('esc-*.json')).read_text())
+        assert payload['task_id'] == 'markup-tripwire'
+        assert 'markup-tripwire' in str(esc_id)
+
+    def test_an_explicit_anchor_lands_in_both_the_task_id_and_the_id(self, tmp_path):
+        if not markup_tripwire.HAS_ESCALATION:
+            pytest.skip('escalation package unavailable in this environment')
+
+        esc_id = emit_markup_storm_escalation(
+            str(tmp_path), _STORM, anchor_task_id='markup-guard'
+        )
+
+        assert esc_id is not None
+        assert 'markup-guard' in esc_id, f'unexpected id shape: {esc_id!r}'
+        payload = json.loads(next((tmp_path / 'data' / 'escalations').glob('esc-*.json')).read_text())
+        assert payload['task_id'] == 'markup-guard'
+        # Everything else is unchanged: this is a parameterisation of the ONE
+        # filer, not a second one (INV-5).
+        assert payload['category'] == 'mcp_markup_write_storm'
+        assert payload['level'] == 1
+        assert 'toolcall-markup-containment-prd.md' in payload['summary']
+
+    def test_the_dedup_lookup_keys_on_the_SAME_anchor_that_is_filed(self, tmp_path):
+        """The measured defect this parameter exists to fix.
+
+        The L1 escalation watcher files its own cluster records under the
+        'markup-tripwire' anchor and so SQUATS it — measured: the tripwire filed
+        nothing 2026-08-16..2026-08-19 while 41 rejections occurred, and all 17
+        records sat at dedupe_count 0. A filer that deduped against a squatted
+        anchor is suppressed indefinitely, which is silence that reads as calm.
+
+        So an explicit anchor must dedupe against ITSELF only: an open record on
+        a DIFFERENT anchor must not suppress it.
+        """
+        if not markup_tripwire.HAS_ESCALATION:
+            pytest.skip('escalation package unavailable in this environment')
+
+        squatter = emit_markup_storm_escalation(str(tmp_path), _STORM)
+        guard = emit_markup_storm_escalation(
+            str(tmp_path), _STORM, anchor_task_id='markup-guard'
+        )
+
+        assert squatter is not None
+        assert guard is not None
+        assert guard != squatter, 'an open record on another anchor must not suppress this one'
+        assert len(list((tmp_path / 'data' / 'escalations').glob('esc-*.json'))) == 2
+
+    def test_two_bursts_on_one_explicit_anchor_still_dedupe(self, tmp_path):
+        """The dedup itself must survive the parameterisation, or a leak running
+        for hours files one record per window forever."""
+        if not markup_tripwire.HAS_ESCALATION:
+            pytest.skip('escalation package unavailable in this environment')
+
+        first = emit_markup_storm_escalation(
+            str(tmp_path), _STORM, anchor_task_id='markup-guard'
+        )
+        second = emit_markup_storm_escalation(
+            str(tmp_path), _STORM, anchor_task_id='markup-guard'
+        )
+
+        assert first is not None
+        assert second == first, f'expected dedup; got first={first!r} second={second!r}'
+        assert len(list((tmp_path / 'data' / 'escalations').glob('esc-*.json'))) == 1
+
 
 # ---------------------------------------------------------------------------
 # INV-5: the envelope literals are enumerated ONCE, in shared.toolcall_markup.
