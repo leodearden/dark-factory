@@ -19,6 +19,7 @@ Usage (stdio transport, spawned by orchestrator):
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
 from datetime import UTC, datetime
@@ -26,6 +27,15 @@ from pathlib import Path
 from typing import Any
 
 from fastmcp import FastMCP
+
+# Fully qualified rather than `from shared import ...`: the module is
+# deliberately NOT re-exported from shared/__init__, so `import shared` does
+# not pull fastmcp into every consumer of the base layer.
+from shared.mcp_markup_middleware import (
+    FACT_MARKUP_DETECTED,
+    MarkupGuardMiddleware,
+    RepairPolicy,
+)
 
 from orchestrator.artifacts import TaskArtifacts, _validate_verdict_role
 
@@ -165,11 +175,75 @@ def _submit_merge_disposition(
 _SINGLETON_ROLE_TOOLS = frozenset({'judge', 'triage', 'merger'})
 
 
+def _emit_markup_fact(fact: dict[str, Any]) -> None:
+    """Emit the ``markup_detected`` record itself, as ONE structured line.
+
+    INV-2: every outcome emits the fact, and no consumer re-derives it by
+    log-scraping. The middleware already logs a human-readable WARNING for an
+    operator reading the stream, so duplicating that prose here would add a
+    second thing to read and still nothing to parse. This emits the RECORD —
+    greppable by its own name, then ``json.loads``-able whole.
+
+    Same emitter shape as ``escalation.server``'s, which is the only other
+    registration site that wires one; the middleware owns the record, so
+    neither builds it.
+
+    Module level rather than a ``create_server`` closure: it captures nothing.
+    """
+    logger.info('%s %s', FACT_MARKUP_DETECTED, json.dumps(fact, sort_keys=True))
+
+
 def create_server(artifacts: TaskArtifacts, role: str, session_id: str = '') -> FastMCP:
     """Create the verdict-tools MCP server with EXACTLY ONE tool registered,
     selected by *role*.
     """
     mcp = FastMCP('verdict-tools')
+
+    # --- Leaked tool-call envelope markup (task 3690, PRD section 4 C2) ---
+    #
+    # Registered HERE, BEFORE the `if role == ...` chain below, so ONE
+    # registration covers all four branches and a fifth branch added later
+    # cannot be born unguarded. A per-branch registration would be exactly the
+    # silent gap this task exists to close.
+    #
+    # FORWARD_REPAIR, not REJECT_WITH_REPAIR, and the reason is C2's own: a lost
+    # submit_review_verdict STRANDS A REVIEW GATE (INV-6). The tier is passed
+    # EXPLICITLY as a keyword because INV-1 makes it a registration-time
+    # DECLARATION — never inferred per call from the shape of the damage or
+    # from a tool's name.
+    #
+    # This server's leaks were LOUD, unlike escalation's. submit_review_verdict
+    # declares FOUR required parameters, so an absorbed `issues` failed the call
+    # outright with `Missing required argument` rather than landing silently
+    # with an empty list; 19 corrupted calls of this shape sit in the committed
+    # corpus. That is why the repair can only work from `on_call_tool`, which
+    # runs BEFORE pydantic validation (PRD boundary row B14) — and why
+    # strict_input_validation is deliberately NOT set (row B15): with it on the
+    # SDK jsonschema-validates first, the middleware chain is never entered, and
+    # every required-parameter leak becomes silently unrepairable.
+    #
+    # exempt_tools is written out even though frozenset() is the default: an
+    # exemption is a declaration, and spelling it makes a future tool addition
+    # here a DECISION rather than an omission. No tool on this server carries
+    # envelope literals as data — the scan_memory_content case that motivates
+    # exemptions lives on fused-memory (sibling task 4458). A name added here
+    # would match BARE (`submit_review_verdict`, never the agent-facing
+    # mcp__verdict-tools__submit_review_verdict spelling the corpus records).
+    #
+    # escalation_sink is left UNWIRED, deliberately. This server runs as a
+    # standalone stdio subprocess (`python -m orchestrator.mcp.verdict_tools`,
+    # spawned from mcp_lifecycle.py) inside the task worktree, holding only a
+    # TaskArtifacts: there is no in-process escalation queue and no escalation
+    # client, so there is no in-scope way to preserve an unrepairable call's
+    # residue here. The middleware's own loud WARNING ("no escalation_sink is
+    # wired, so the residue of %r will not be preserved anywhere") is the honest
+    # fallback — a sink that silently dropped the payload would be strictly
+    # worse than none. Covered by the follow-up filed alongside task 3690.
+    mcp.add_middleware(MarkupGuardMiddleware(
+        policy=RepairPolicy.FORWARD_REPAIR,
+        exempt_tools=frozenset(),
+        fact_sink=_emit_markup_fact,
+    ))
 
     if role == 'judge':
         @mcp.tool()
