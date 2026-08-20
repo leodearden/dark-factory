@@ -725,6 +725,107 @@ def near_miss_alias_pairs(
     return near_misses
 
 
+# The normative doc's FILENAME, not its full path: prose cites it as
+# `docs/legibility/design-invariants.md`, as `design-invariants.md`, and inside
+# longer sentences, and all three are the same pointer.
+_ANCHOR_FILENAME = "design-invariants.md"
+
+# Scrubbed from a window line before it is scanned, longest first. Both are
+# three-or-more-segment kebab tokens with a suffix, so an extractor that
+# tokenized them would report the very pointer that made it look — a guard
+# permanently red on correct documentation.
+_ANCHOR_PATH_TOKENS = ("design-invariants-fixtures.md", _ANCHOR_FILENAME)
+
+# Lines either side of an anchor that count as "beside" it. Two is enough to
+# span a wrapped sentence and a following parenthetical without dragging in the
+# rest of the paragraph.
+_CITATION_WINDOW = 2
+
+# A BACKTICKED kebab token of at least three segments. Three is the shape floor
+# every canonical slug clears (`storm-escape-required` 3 ...
+# `loop-thread-occupancy-bounded` 4) and it excludes two-segment prose such as
+# `fail-soft`. Backticks are required on both sides, which is what keeps the
+# doc's own path out: `docs/legibility/design-invariants.md` carries slashes and
+# a dot inside its backticks, so it can never match.
+_CITATION_TOKEN_RE = re.compile(r"`([a-z][a-z0-9]*(?:-[a-z0-9]+){2,})`")
+
+
+def doc_anchored_slug_citations(text: str, *, source: str) -> list[tuple[int, str]]:
+    """``(line, token)`` for every backticked slug-shaped token cited beside the doc.
+
+    "Beside" means within ``_CITATION_WINDOW`` lines of a line naming
+    ``design-invariants.md``. The anchor is what makes this guard allowlist-free:
+    a repo-wide scan for slug-shaped tokens would drag in every kebab identifier
+    in a 15k-line module, and the resulting noise is how a guard gets silenced.
+
+    A text with NO anchor returns ``[]`` quietly — that is most of the repo, and
+    a loud extractor would fail on nearly every file. So does an anchored text
+    whose neighbourhood cites nothing in backticks: MEASURED on base
+    eba215060c, 30 of the 38 anchored files are exactly that shape (they point
+    at the doc in prose without naming a slug), so raising there would report a
+    defect on correct documentation.
+
+    What IS loud is an anchor whose whole window scrubs away to nothing: the
+    text is provably about the invariant family, yet the extractor has no text
+    left to examine, and ``[]`` there would be indistinguishable from "nothing
+    cited wrong".
+    """
+    lines = text.split("\n")
+    anchors = [index for index, line in enumerate(lines) if _ANCHOR_FILENAME in line]
+    if not anchors:
+        return []
+
+    windowed: set[int] = set()
+    for anchor in anchors:
+        start = max(0, anchor - _CITATION_WINDOW)
+        windowed.update(range(start, min(len(lines), anchor + _CITATION_WINDOW + 1)))
+
+    scrubbed: list[tuple[int, str]] = []
+    for index in sorted(windowed):
+        line = lines[index]
+        for path_token in _ANCHOR_PATH_TOKENS:
+            line = line.replace(path_token, "")
+        scrubbed.append((index, line))
+
+    assert any(line.strip() for _, line in scrubbed), (
+        f"{source}: a `{_ANCHOR_FILENAME}` citation was found, but scrubbing the "
+        f"anchor's own path left no text at all to examine within "
+        f"{_CITATION_WINDOW} lines of it (task 3803). An empty result here would "
+        f"read as `this file cites nothing wrong` while nothing had been read."
+    )
+
+    return [
+        (index + 1, match.group(1))
+        for index, line in scrubbed
+        for match in _CITATION_TOKEN_RE.finditer(line)
+    ]
+
+
+def noncanonical_citations(
+    citations: list[tuple[int, str]], family: list[tuple[int, str]]
+) -> list[tuple[int, str]]:
+    """The citations of *citations* naming a slug *family* does not back.
+
+    Loud on an empty *family* rather than returning every citation: a family
+    that failed to parse would report the whole repo as phantom citations, which
+    a reader would resolve by deleting the check.
+
+    A PHANTOM is a slug-shaped token cited as if canonical with no heading
+    behind it. `no-silent-fail-soft` was one for months — minted independently
+    in dozens of comments, filed under INV-2 five times and INV-4 once because
+    neither fit, and invisible to every by-slug lookup. This is the check that
+    would have caught it on the first citation.
+    """
+    assert family, (
+        "the citation check received an empty invariant family (task 3803) — "
+        "with no canonical vocabulary every citation is a phantom, so the check "
+        "would report the whole repo rather than the one slug that drifted."
+    )
+
+    canonical = {slug for _, slug in family}
+    return [(line, token) for line, token in citations if token not in canonical]
+
+
 # ---------------------------------------------------------------------------
 # parse_invariant_headings — the family extractor, fixture-driven tests
 # ---------------------------------------------------------------------------
