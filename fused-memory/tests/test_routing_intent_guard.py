@@ -484,3 +484,55 @@ class TestProvenanceStampDoesNotDisarmCodeChangeSuppression:
         assert finding is not None
         assert 'do_not_implement' in finding.markers
         assert 'details' in finding.fields
+
+    @pytest.mark.parametrize(
+        'stamp_block',
+        [
+            '[RECON CORRECTION 2026-08-08] the prior prose was a bug; corrected here.',
+            '[Block resolved 2026-06-02 by reconciliation stage 2]: build failure was '
+            'a disk-exhaustion crash, not a code bug.',
+            '[Scope correction by escalation-watcher-auto via esc-3871-178, 2026-05-31] '
+            'PATH FIX: the declared file set was wrong.',
+            '[Stage 2 task-knowledge sync] DOC-DRIFT FIX (finding y): re-derived the count.',
+            '[Stage 2 sync 2026-07-07] DOC-DRIFT FIX: line one\n'
+            'continues here with a bug reference\nand a third line.',
+        ],
+    )
+    def test_sibling_machine_stamp_shapes_are_also_stripped(self, stamp_block):
+        """The Stage-2 doc-drift stamp is one member of a FAMILY of dated,
+        line-anchored annotation blocks written by DF's own agents. Shapes
+        sampled from live task rows in the reify and dark-factory
+        `.taskmaster/tasks/tasks.db` corpora: [RECON CORRECTION <date>],
+        [Block resolved <date> by reconciliation stage N], [Scope correction
+        by escalation-watcher-auto via esc-N-M, <date>], an UNDATED Stage-N
+        variant (the agent does not always stamp a date), and a multi-line
+        stamp body. Each carries a code-change signal that is the ANNOTATOR's
+        wording, not the filing author's."""
+        finding = routing_intent_finding(
+            title=None,
+            description=(
+                'DO NOT IMPLEMENT; escalate to a human instead of implementing.'
+                '\n\n' + stamp_block
+            ),
+            details=None,
+            task_kind='normal',
+            metadata=None,
+        )
+        assert finding is not None, f'Stamp must not suppress, got None for: {stamp_block!r}'
+        assert 'do_not_implement' in finding.markers
+
+    def test_line_anchored_bracket_without_date_or_stage_is_not_a_stamp(self):
+        """Keeps the widening honest: an ordinary bracketed lead-in naming
+        neither a stage nor a date is AUTHORED prose, so its "crash" still
+        suppresses."""
+        finding = routing_intent_finding(
+            title=None,
+            description=(
+                '[design note] the crash reproduces under load.'
+                '\n\nDO NOT IMPLEMENT yet.'
+            ),
+            details=None,
+            task_kind='normal',
+            metadata=None,
+        )
+        assert finding is None, f'A bare bracketed lead-in is not a stamp, got: {finding!r}'
