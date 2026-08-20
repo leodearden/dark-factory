@@ -6191,6 +6191,136 @@ if x:
 
 
 # ---------------------------------------------------------------------------
+# task 4219: suppressed-wait debt-ratchet scanners
+# ---------------------------------------------------------------------------
+
+
+class TestSuppressedWaitScanner:
+    """Unit tests for `_suppressed_result_wait_methods` -- the executable
+    form of the `outcome is None` anti-pattern `_await_outcome`'s docstring
+    names (see "The shape this replaces", above): a `with
+    contextlib.suppress(TimeoutError): outcome = await
+    asyncio.wait_for(fut, timeout=N)` shape that converts a genuine pipeline
+    hang or a missing cascade into a confusing `outcome is None` assertion
+    failure instead of failing loudly by label (task 4219).
+
+    Every case here is driven from a SYNTHETIC source string, not this
+    module's own source, so these tests are provably non-vacuous and do not
+    shift when this file is later edited.
+    """
+
+    def test_suppressed_timeout_error_around_wait_for_is_reported(self) -> None:
+        """A `with contextlib.suppress(TimeoutError):` block enclosing an
+        `asyncio.wait_for(...)` call IS reported -- this is the anti-pattern
+        itself.
+        """
+        source = '''
+class TestSuppressedWait:
+    async def test_it(self):
+        with contextlib.suppress(TimeoutError):
+            outcome = await asyncio.wait_for(fut, timeout=5.0)
+'''
+        result = _suppressed_result_wait_methods(source)
+
+        assert result == {'TestSuppressedWait': {'test_it'}}, (
+            f'Expected the suppress(TimeoutError)-wrapped wait_for to be '
+            f'reported, got {result!r}.'
+        )
+
+    def test_suppress_exception_is_not_reported(self) -> None:
+        """`contextlib.suppress(Exception):` (not `TimeoutError`
+        specifically) around a wait_for call is NOT reported -- this is the
+        blessed best-effort teardown-join shape (the `worker_task` join at
+        line 4616), which asserts nothing and so isn't the None-outcome
+        anti-pattern.
+        """
+        source = '''
+class TestSuppressException:
+    async def test_it(self):
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(worker_task, timeout=5.0)
+'''
+        result = _suppressed_result_wait_methods(source)
+
+        assert result == {}, (
+            f'Expected suppress(Exception) (not TimeoutError) to NOT be '
+            f'reported, got {result!r}.'
+        )
+
+    def test_bare_wait_for_without_suppress_is_not_reported(self) -> None:
+        """A bare `await asyncio.wait_for(...)` with no enclosing suppress
+        at all is NOT reported -- a loud TimeoutError is exactly the
+        desired behaviour, not the anti-pattern.
+        """
+        source = '''
+class TestBareWaitFor:
+    async def test_it(self):
+        outcome = await asyncio.wait_for(fut, timeout=5.0)
+'''
+        result = _suppressed_result_wait_methods(source)
+
+        assert result == {}, (
+            f'Expected a bare, unsuppressed wait_for to NOT be reported, '
+            f'got {result!r}.'
+        )
+
+    def test_suppress_timeout_error_without_wait_for_is_not_reported(self) -> None:
+        """A `suppress(TimeoutError):` block that encloses no
+        `asyncio.wait_for` call at all is NOT reported -- the anti-pattern
+        is specifically about swallowing a result-future wait, not about
+        `suppress(TimeoutError)` used for some unrelated purpose.
+        """
+        source = '''
+class TestSuppressNoWaitFor:
+    async def test_it(self):
+        with contextlib.suppress(TimeoutError):
+            do_something_unrelated()
+'''
+        result = _suppressed_result_wait_methods(source)
+
+        assert result == {}, (
+            f'Expected a suppress(TimeoutError) block with no enclosed '
+            f'wait_for call to NOT be reported, got {result!r}.'
+        )
+
+    def test_non_test_method_and_non_test_class_are_skipped(self) -> None:
+        """A non-`test_*` method (even carrying the anti-pattern) and a
+        class whose name does not start with `Test` are both skipped
+        entirely.
+        """
+        source = '''
+class TestHelperMethodSkipped:
+    async def _helper(self):
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(fut, timeout=5.0)
+
+class NotATestClass:
+    async def test_it(self):
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(fut, timeout=5.0)
+'''
+        result = _suppressed_result_wait_methods(source)
+
+        assert result == {}, (
+            f'Expected a non-test_* method and a non-Test* class to both '
+            f'be skipped, got {result!r}.'
+        )
+
+    def test_unparseable_source_returns_empty_dict_without_raising(self) -> None:
+        """Unparseable source returns `{}` rather than raising -- mirrors
+        `_worst_per_method_wait_budget`'s must-never-raise contract: a
+        crash here would fail the whole suite over an unrelated edit to
+        this file.
+        """
+        result = _suppressed_result_wait_methods('def not valid python(:')
+
+        assert result == {}, (
+            f'Expected unparseable source to return {{}} without raising, '
+            f'got {result!r}.'
+        )
+
+
+# ---------------------------------------------------------------------------
 # task 3492 amend: cover _timeout_mark_offenders' failure branches directly
 # ---------------------------------------------------------------------------
 
