@@ -359,20 +359,13 @@ _STAGE2_GRAPHITI_QUEUED_GUIDANCE = _GRAPHITI_QUEUED_GUIDANCE_TEMPLATE.format(
 # iterates the keys of the signature mapping it is handed, so it can no longer
 # silently omit a whole tool the way its predecessor — nine hard-coded
 # render_call('...') invocations that ignored the mapping's other keys — did.
-# The mapping is the live tool set MINUS two classes, and that three-way
-# classification lives next to the @mcp.tool() registrations in
-# server/recon_report.py, not here:
-#   HARNESS_CALLED_REPORT_TOOLS — start_report; the harness opens the report
-#     before the stage begins, so an example would invite a redundant call.
-#     Its PROSE mention below is what tells the agent not to call it.
-#   STAGE_GATED_REPORT_TOOLS  — denied in some stages via
-#     DISALLOW_RECON_REPORT_LEDGER_WRITES (cli_stage_runner.py). This block is
-#     interpolated into ALL THREE stage prompts, and --disallowed-tools OMITS a
-#     denied tool rather than rejecting the call, so naming one here would tell
-#     a stage about an action it cannot take.
-#   everything else — shared guidance, rendered here for every stage.
-# Registering a new tool means classifying it into exactly one of the three;
-# tests/test_recon_report_guidance_drift.py fails loudly until you do.
+# The mapping is the live tool set minus the harness-called and stage-gated
+# tools (start_report keeps its PROSE mention below — the sentence that tells
+# the agent not to call it — but no call shape).
+#
+# Classification rules and rationale: see the "Tool classification" block in
+# server/recon_report.py, which is the single canonical statement of them and
+# sits where an author registering a new @mcp.tool() is already looking.
 _RECON_REPORT_PLACEHOLDERS = {
     'run_id': '<from Reconciliation Context>',
     'finding_id': '<finding_id from add_finding response>',
@@ -412,6 +405,12 @@ _RECON_REPORT_PLACEHOLDERS = {
 # writes one. A name here that is ABSENT from the mapping is skipped rather
 # than raising, so this tuple going stale in the other direction (a tool
 # deregistered upstream) cannot break rendering either.
+#
+# This tuple and _GUIDANCE_TOOL_PROSE below must stay in sync — every name here
+# except the _GUIDANCE_STATS_GROUP pair needs a prose entry. That is pinned by
+# tests/test_recon_report_guidance_drift.py::TestCuratedGuidanceTablesStayInSync,
+# and a slip degrades to a generic bullet rather than raising (see
+# _render_recon_report_tool_guidance's is_annotated()).
 _GUIDANCE_TOOL_ORDER = (
     'add_finding',
     'delete_finding',
@@ -460,6 +459,12 @@ _GUIDANCE_PREAMBLE = (
 # Curated per-tool prose. The `{call}` marker is substituted with the rendered
 # call shape via ``str.replace`` (NOT ``str.format``), so prose containing
 # literal braces needs no escaping.
+#
+# Keys must cover _GUIDANCE_TOOL_ORDER minus _GUIDANCE_STATS_GROUP (whose two
+# tools share one sentence rendered from this table's peer above). A missing or
+# renamed key does NOT raise — the tool degrades to an uncurated "Also
+# registered on this server" bullet — so the sync is pinned by a test rather
+# than by a crash; see _render_recon_report_tool_guidance's is_annotated().
 #
 # This prose is LOAD-BEARING, not decoration: the cite_task dedup-anchor
 # paragraph, the cite_edge/cite_memory verbatim-UUID rules, cite_run's
@@ -558,13 +563,14 @@ def _render_recon_report_tool_guidance(
     (``cmd required [optional]``).
 
     This function excludes NOTHING. start_report is absent from the rendered
-    call shapes because the CALLER does not hand it over (it is listed in
-    ``HARNESS_CALLED_REPORT_TOOLS``); the exclusion is data applied by
-    :func:`render_recon_report_tool_guidance`, not a property of this
-    function, which renders whatever mapping it is given. The start_report
-    PROSE mention in :data:`_GUIDANCE_PREAMBLE` is unconditional and
-    deliberately not derived from *signatures* — it is the sentence that tells
-    the agent the harness already called it.
+    call shapes because the CALLER does not hand it over; the exclusion is data
+    applied by :func:`render_recon_report_tool_guidance`, not a property of
+    this function, which renders whatever mapping it is given. Filtering which
+    tools an agent should be told about at all is the CALLER's job (rules and
+    rationale: the "Tool classification" block in ``server/recon_report.py``).
+    The start_report PROSE mention in :data:`_GUIDANCE_PREAMBLE` is
+    unconditional and deliberately not derived from *signatures* — it is the
+    sentence that tells the agent the harness already called it.
 
     PRESENCE is derived, PLACEMENT is curated (task 3878). Every key of
     *signatures* is rendered: :data:`_GUIDANCE_TOOL_ORDER` +
@@ -574,12 +580,17 @@ def _render_recon_report_tool_guidance(
     lead-in. So a newly-registered tool can never be silently absent from the
     guidance — which is what the previous design, nine hard-coded
     ``render_call('...')`` calls that ignored the mapping's other keys, allowed.
-    Conversely a curated name MISSING from *signatures* is skipped rather than
-    raising ``KeyError``, so this function renders whatever it is handed and
-    never depends on the caller supplying a particular tool. Filtering which
-    tools an agent should be told about at all is the CALLER's job (see
-    :func:`render_recon_report_tool_guidance` and the classification constants
-    in ``server/recon_report.py``), not this function's.
+
+    Neither curated table can turn a slip into a crash. A curated name MISSING
+    from *signatures* is skipped, and a name in :data:`_GUIDANCE_TOOL_ORDER`
+    with no matching :data:`_GUIDANCE_TOOL_PROSE` entry degrades to the same
+    generic bullet an unknown tool gets (reviewer robustness finding) rather
+    than raising ``KeyError``. That matters because this renderer is shared
+    with the frozen fallback: a raise here would take out BOTH paths at once
+    and surface as an ImportError for every consumer of the ``prompts``
+    package, the exact blast radius the lazy-render design exists to contain.
+    So this function renders whatever it is handed, and never depends on the
+    caller supplying a particular tool or on the two curated tables agreeing.
     """
 
     def render_call(tool_name: str) -> str:
@@ -590,14 +601,34 @@ def _render_recon_report_tool_guidance(
             parts.append(kwarg if required else f'[{kwarg}]')
         return f'mcp__recon-report__{tool_name}({", ".join(parts)})'
 
+    def is_annotated(tool_name: str) -> bool:
+        """Does *tool_name* have curated prose (or a curated group sentence) to render?
+
+        _GUIDANCE_TOOL_ORDER and _GUIDANCE_TOOL_PROSE are two tables that must
+        stay in sync, and nothing structurally forces them to. A name in the
+        ORDER with no matching PROSE entry — added to one table only, or a key
+        renamed/typo'd in the other — must NOT raise ``KeyError`` here: this
+        function is shared by the live path AND the frozen fallback, so a raise
+        would take out both and become an ImportError for every consumer of the
+        ``prompts`` package (see :func:`_frozen_recon_report_tool_guidance`).
+        Instead the tool degrades to the same generic call-shape bullet an
+        unknown tool gets, losing one annotation rather than every stage prompt.
+        """
+        return tool_name in _GUIDANCE_STATS_GROUP or tool_name in _GUIDANCE_TOOL_PROSE
+
     stats_present = [tool for tool in _GUIDANCE_STATS_GROUP if tool in signatures]
     citations_lead_in_pending = _GUIDANCE_CITATIONS_LEAD_IN
     sections = [_GUIDANCE_PREAMBLE]
     for tool in _GUIDANCE_TOOL_ORDER:
-        if tool not in signatures:
-            # A curated name that is no longer registered: skip its prose rather
-            # than raising, so a tool removed upstream degrades to a missing
-            # paragraph instead of a bare KeyError for every prompt consumer.
+        if tool not in signatures or not is_annotated(tool):
+            # Either a curated name that is no longer registered, or one with no
+            # curated prose to render. Skip it rather than raising: a
+            # deregistered tool degrades to a missing paragraph, an unannotated
+            # one falls through to the generic bullet list below. The
+            # annotation check happens HERE, before the citation lead-in is
+            # emitted, so an unannotated cite_* tool cannot strand a
+            # colon-terminated 'Then attach typed citations:' in front of
+            # unrelated prose.
             continue
         if tool in _GUIDANCE_CITATION_GROUP and citations_lead_in_pending:
             sections.append(citations_lead_in_pending)
@@ -610,7 +641,11 @@ def _render_recon_report_tool_guidance(
             continue
         sections.append(_GUIDANCE_TOOL_PROSE[tool].replace('{call}', render_call(tool)))
 
-    extra = [tool for tool in signatures if tool not in _GUIDANCE_TOOL_ORDER]
+    extra = [
+        tool
+        for tool in signatures
+        if tool not in _GUIDANCE_TOOL_ORDER or not is_annotated(tool)
+    ]
     if extra:
         bullets = '\n'.join(f'- `{render_call(tool)}`' for tool in extra)
         sections.append(
@@ -665,19 +700,12 @@ def render_recon_report_tool_guidance() -> str:
 
     signatures = get_recon_report_tool_signatures()
     # WHICH tools an agent is told about is decided by the classification that
-    # lives next to the @mcp.tool() registrations, not here and not by the
-    # renderer: every registered tool is shared-guidance unless it is
-    # harness-called (start_report — the harness opens the report before the
-    # stage begins) or stage-gated (denied in some stages via
-    # DISALLOW_RECON_REPORT_LEDGER_WRITES). Filtering HERE rather than inside
+    # lives next to the @mcp.tool() registrations — see the "Tool
+    # classification" block in server/recon_report.py for the rules and why
+    # they exist. Filtering HERE rather than inside
     # _render_recon_report_tool_guidance() is what lets that renderer stay a
     # pure 'render everything I was handed' function shared with the frozen
     # fallback, so the two paths cannot drift in wording.
-    #
-    # This block is interpolated into ALL THREE stage prompts, so a stage-gated
-    # tool named here would tell Stage 1 and Stage 3 about an action they
-    # cannot take: --disallowed-tools OMITS a denied tool rather than rejecting
-    # the call, so the agent would see an advertised tool simply not exist.
     specs = {
         tool: tuple(
             (name, param.default is inspect.Parameter.empty)
