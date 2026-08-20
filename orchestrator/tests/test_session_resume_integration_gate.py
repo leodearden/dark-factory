@@ -568,6 +568,7 @@ async def _drive_resumed_invoke(
     config_overrides: dict | None = None,
     event_store=None,
     slug: str = '',
+    result_kwargs: dict | None = None,
 ) -> _InvokeCapture:
     """Feed *recovered_session* as ``resume_session_id`` into a REAL
     ``TaskWorkflow`` and drive ``_invoke(role, 'p', cwd)`` with
@@ -579,6 +580,9 @@ async def _drive_resumed_invoke(
     from, and the premise every pre-3578 caller left implicit.
     ``seed_archive`` instead lays it only into the durable archive under
     ``project_root``, the pooled-warm-lane state this task exists to rehydrate.
+    ``result_kwargs`` overrides fields on the ``AgentResult`` the patched
+    ``invoke_with_cap_retry`` returns — used to hand back the
+    ``resume_fallbacks`` count the CLI-stage instrumentation reads.
     """
     caplog.set_level(logging.INFO)
     sid = (recovered_session or {}).get('session_id', 'x')
@@ -609,7 +613,7 @@ async def _drive_resumed_invoke(
     def _side_effect(**kwargs):
         assert workflow.artifacts is not None
         snapshot['sidecar'] = workflow.artifacts.read_agent_session()
-        return AgentResult(success=True, output='')
+        return AgentResult(success=True, output='', **(result_kwargs or {}))
 
     with patch(
         'orchestrator.workflow.invoke_with_cap_retry',
@@ -914,6 +918,108 @@ async def test_b1e_no_pre_flight_event_when_the_resume_succeeds(
         assert store.of_type(EventType.session_resume_failed) == [], kw
         for et in _PER_DISPATCH_RESUME_EVENTS:
             assert store.of_type(et) == [], kw
+
+
+# ── B1e: the CLI-stage instrumentation event ────────────────────────────────
+@pytest.mark.asyncio
+async def test_b1e_cli_stage_event_when_the_cli_rejected_an_armed_resume(
+    harness: Harness, tmp_path: Path, caplog,
+):
+    """The OTHER uninstrumented population: the resume was armed, the CLI
+    rejected it, ``invoke_with_cap_retry`` silently retried fresh and returned
+    a SUCCESS.
+
+    Nothing anywhere records that loss today — the invocation looks perfect
+    from runs.db, because the fresh retry worked.  ``shared`` has no event
+    store, so the count rides out on ``AgentResult.resume_fallbacks`` and the
+    orchestrator turns it into the ``stage='cli'`` half of
+    ``session_resume_failed``.
+
+    Seeded LIVE, so the pre-flight veto provably did not fire: this row isolates
+    the CLI-stage emit rather than re-testing step-12.
+    """
+    task_id, session_id = '85', 'uuid-b1e-cli'
+    _setup_warm_lane_session(harness, task_id, session_id, role='implementer')
+    harness.config.session_resume = SessionResumeConfig()
+    await harness._recover_crashed_tasks()
+    recovered = harness._recovered_sessions[task_id]
+    store = _RecordingEventStore()
+
+    cap = await _drive_resumed_invoke(
+        tmp_path, recovered, IMPLEMENTER, caplog, task_id=task_id,
+        seed_transcript=True, event_store=store,
+        result_kwargs={'resume_fallbacks': 1},
+    )
+
+    # The resume WAS armed — this is not the vetoed population.
+    assert cap.kwargs['resume_session_id'] == session_id
+    failed = store.of_type(EventType.session_resume_failed)
+    assert len(failed) == 1
+    assert failed[0]['data'] == {
+        'stage': 'cli',
+        'session_id': session_id,
+        'role': IMPLEMENTER.name,
+        'fallbacks': 1,
+    }
+    # Per-INVOCATION, so the per-dispatch ratio denominator is untouched.
+    for et in _PER_DISPATCH_RESUME_EVENTS:
+        assert store.of_type(et) == []
+
+
+@pytest.mark.asyncio
+async def test_b1e_cli_stage_event_reports_the_fallback_count(
+    harness: Harness, tmp_path: Path, caplog,
+):
+    """``data.fallbacks`` carries the count, not a bare boolean.
+
+    ``invoke_with_cap_retry`` can arm and lose a resume more than once inside a
+    single invocation (a caller resume fails, the fresh retry hits a cap that
+    carries a session id, that re-armed resume fails too).  Collapsing the
+    count to a flag would under-report the loss on exactly the pathological
+    invocations worth finding.
+    """
+    task_id, session_id = '86', 'uuid-b1e-cli-2'
+    _setup_warm_lane_session(harness, task_id, session_id, role='implementer')
+    harness.config.session_resume = SessionResumeConfig()
+    await harness._recover_crashed_tasks()
+    recovered = harness._recovered_sessions[task_id]
+    store = _RecordingEventStore()
+
+    await _drive_resumed_invoke(
+        tmp_path, recovered, IMPLEMENTER, caplog, task_id=task_id,
+        seed_transcript=True, event_store=store,
+        result_kwargs={'resume_fallbacks': 2},
+    )
+
+    failed = store.of_type(EventType.session_resume_failed)
+    assert len(failed) == 1
+    assert failed[0]['data']['stage'] == 'cli'
+    assert failed[0]['data']['fallbacks'] == 2
+
+
+@pytest.mark.asyncio
+async def test_b1e_no_cli_stage_event_when_the_resume_held(
+    harness: Harness, tmp_path: Path, caplog,
+):
+    """``resume_fallbacks == 0`` emits nothing — the overwhelmingly common case.
+
+    A failure event that also fires on success is not an instrument.  This is
+    also the row that keeps the emit cheap for every ordinary invocation.
+    """
+    task_id, session_id = '87', 'uuid-b1e-cli-ok'
+    _setup_warm_lane_session(harness, task_id, session_id, role='implementer')
+    harness.config.session_resume = SessionResumeConfig()
+    await harness._recover_crashed_tasks()
+    recovered = harness._recovered_sessions[task_id]
+    store = _RecordingEventStore()
+
+    cap = await _drive_resumed_invoke(
+        tmp_path, recovered, IMPLEMENTER, caplog, task_id=task_id,
+        seed_transcript=True, event_store=store,
+    )
+
+    assert cap.kwargs['resume_session_id'] == session_id
+    assert store.of_type(EventType.session_resume_failed) == []
 
 
 # ── B1: WIP commit preserved across recovery + architect skipped ─────────────
