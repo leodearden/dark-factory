@@ -22,6 +22,7 @@ no session bus.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -269,3 +270,65 @@ def test_skip_reason_falls_back_to_home_config_like_the_shell(
     # And an UNSET XDG_CONFIG_HOME resolves the same way.
     monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
     assert _systemd_user_manager_skip_reason() is None
+
+
+# ---------------------------------------------------------------------------
+# step-3: RED -- the per-invocation unique template name
+# ---------------------------------------------------------------------------
+
+def test_unique_template_is_a_legal_distinct_systemd_template_name() -> None:
+    """_unique_template must produce a fresh, legal systemd TEMPLATE name.
+
+    Isolation between concurrent runs comes from the unit NAME and nothing
+    else: the systemd --user manager resolves its unit search path from its
+    OWN environment, so pointing XDG_CONFIG_HOME at a tmp dir would give the
+    fixture a directory the manager never reads.  The .sh must therefore keep
+    writing to the real ~/.config/systemd/user, and every property below is
+    what makes that safe under `max_concurrent_tasks: 48` sharing one $HOME.
+
+      (a) Trailing "@".  The .sh appends ".service" and builds its probe as
+          "${TEMPLATE}probe.service"; a missing "@" silently yields a plain
+          unit instead of a template, and the probe unit resolves to nothing.
+      (b) Two calls differ.  Both subprocess tests in this module run the .sh,
+          and a shared name between them re-creates the collision this seam
+          exists to prevent.
+      (c) The shared _SELFTEST_PREFIX.  The generator and the prune bind the
+          SAME constant, so the prune's "never touch a real unit" property is
+          structural rather than a pair of string literals free to drift.
+      (d) A legal systemd unit-name charset.  Verified viable at plan time:
+          PID-suffixed template names resolve correctly against a real
+          manager.
+
+    No systemd required -- this runs everywhere.
+    """
+    name = _unique_template()  # noqa: F821  (step-4 defines it)
+
+    # (a)
+    assert name.endswith("@"), (
+        f"_unique_template() must return a TEMPLATE name ending in '@'; got {name!r}. "
+        "The .sh builds '${TEMPLATE}probe.service' from it."
+    )
+    # (b)
+    assert _unique_template() != _unique_template()  # noqa: F821
+    # (c)
+    assert name.startswith(_SELFTEST_PREFIX)  # noqa: F821
+    # (d)
+    assert re.fullmatch(r"[A-Za-z0-9:_.\-]+@", name), (
+        f"{name!r} is not a legal systemd template unit name; systemd accepts "
+        r"only [A-Za-z0-9:_.\-] before the '@'."
+    )
+
+
+def test_selftest_prefix_is_shared_and_cannot_match_a_real_unit() -> None:
+    """The one constant both the generator and the prune key on.
+
+    Pinned as its own assertion because the prune deletes files out of the
+    operator's LIVE unit directory: if _SELFTEST_PREFIX were ever widened to
+    something a real unit could start with, the prune would sweep up
+    production units and this module would become the outage it was written
+    to prevent.  "lms-dropin-selftest-" cannot prefix-match `lms-arm@` (the
+    real unit the script under test targets) or any dark-factory unit.
+    """
+    assert _SELFTEST_PREFIX == "lms-dropin-selftest-"  # noqa: F821
+    for real in ("lms-arm@", "fused-memory", "dark-factory-dashboard", "orchestrator"):
+        assert not real.startswith(_SELFTEST_PREFIX)  # noqa: F821
