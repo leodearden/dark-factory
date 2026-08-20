@@ -72,10 +72,14 @@ start_report gets a PROSE mention in the guidance but no call shape, and the
 stage-gated tools get neither. That is not a property of the renderer, which
 renders every key it is handed: render_recon_report_tool_guidance() filters the
 live tool set before calling it — see reconciliation/prompts/__init__.py. Both
-omissions are asserted positively here (TestNonSharedToolsAreNotAdvertisedToEveryStage),
-because --disallowed-tools OMITS a denied tool rather than rejecting the call,
-so advertising one to a stage that cannot call it produces silence, not a
-refusal the agent could act on.
+omissions are asserted POSITIVELY here (TestNonSharedToolsAreNotAdvertisedToEveryStage)
+rather than left implicit, because advertising a tool a stage cannot call
+produces silence rather than a refusal the agent could act on.
+
+The classification rules themselves, and the rationale for each bucket, are
+stated canonically in ONE place — the "Tool classification" block in
+server/recon_report.py, next to the @mcp.tool() registrations. This module
+asserts them; it deliberately does not restate them.
 """
 from __future__ import annotations
 
@@ -105,20 +109,18 @@ from fused_memory.server.recon_report import (
     get_recon_report_tool_signatures,
 )
 
-
-def _live_report_tool_names() -> tuple[str, ...]:
-    """Every tool NAME registered on the live recon_report server, in registration order.
-
-    Module-level helper (rather than a fixture) so it can drive
-    ``@pytest.mark.parametrize``: pytest then reports one test id per tool,
-    e.g. ``[write_entity_standing_decision]``, instead of collapsing every
-    undocumented tool into a single aggregate failure that names only the
-    first one it hits.
-    """
-    return tuple(get_recon_report_tool_signatures())
-
-
-_LIVE_REPORT_TOOL_NAMES = _live_report_tool_names()
+# The live tool set, introspected ONCE at import. get_recon_report_tool_signatures()
+# builds a throwaway ReconReportState plus a full FastMCP server on every call, and
+# its result is a pure function of module state, so the parametrized cases below read
+# these constants instead of re-introspecting per tool (reviewer efficiency finding:
+# that was ~35 server builds and grew linearly with every new tool registration).
+#
+# Module-level constants rather than fixtures because they drive
+# ``@pytest.mark.parametrize``: pytest then reports one test id per tool, e.g.
+# ``[write_entity_standing_decision]``, instead of collapsing every undocumented
+# tool into a single aggregate failure that names only the first one it hits.
+_LIVE_REPORT_TOOL_SIGNATURES = get_recon_report_tool_signatures()
+_LIVE_REPORT_TOOL_NAMES = tuple(_LIVE_REPORT_TOOL_SIGNATURES)
 
 # The SHARED-GUIDANCE report tools: every live-registered tool that is neither
 # harness-called nor stage-gated. DERIVED from the live tool set and the
@@ -135,9 +137,49 @@ _SHARED_GUIDANCE_REPORT_TOOLS = tuple(
     if name not in HARNESS_CALLED_REPORT_TOOLS and name not in STAGE_GATED_REPORT_TOOLS
 )
 
-# Backwards-compatible alias: the run_id scans below read as "every tool an
-# agent is told to call", which is exactly the shared-guidance set.
-_AGENT_CALLED_REPORT_TOOLS = _SHARED_GUIDANCE_REPORT_TOOLS
+
+@pytest.fixture(scope='module')
+def rendered_guidance() -> str:
+    """The shipped guidance block, rendered ONCE for the whole module.
+
+    render_recon_report_tool_guidance() introspects the live server (a
+    throwaway ReconReportState + a full FastMCP build) and its output is a pure
+    function of module state, so the scanning tests below share one render
+    instead of re-rendering per parametrized tool (reviewer efficiency
+    finding).
+
+    A module-scoped FIXTURE rather than an import-time constant so that a
+    render failure surfaces as an error on the tests that actually need the
+    text — including the actionable messages below — instead of a collection
+    error that takes out this whole module, TestRendererCoversEverySignatureItIsGiven
+    (which needs no live render at all) included.
+
+    Deliberately not used by the tests that must observe a LIVE call:
+    TestReconReportGuidanceDrift's smoke test and
+    TestReconReportGuidanceFallback's self-heal test both assert something
+    about the act of rendering, not about the text.
+    """
+    return render_recon_report_tool_guidance()
+
+
+def _names_tool(text: str, tool_name: str) -> bool:
+    """Is *tool_name* named in *text* as a whole identifier, not as a substring?
+
+    A bare ``tool_name in text`` is not a coverage check: it passes on any
+    longer word that merely CONTAINS the name. Verified empirically against
+    RECON_REPORT_INSTRUCTIONS (reviewer test-coverage finding) — deleting
+    `complete` from both the ``Tools:`` header and its numbered entry still
+    satisfied ``'complete' in RECON_REPORT_INSTRUCTIONS``, because the
+    surrounding prose says "completed" twice. A future ``set_stat`` /
+    ``set_stats`` pair, or any tool whose name is a prefix of nearby prose, has
+    the same hole.
+
+    Requiring an identifier boundary on both sides is what makes the
+    documentation assertions real coverage rather than the "guard that looks
+    like coverage but isn't" failure mode task 3878 exists to close.
+    """
+    pattern = rf'(?<![A-Za-z0-9_]){re.escape(tool_name)}(?![A-Za-z0-9_])'
+    return re.search(pattern, text) is not None
 
 
 def _iter_call_openers(text: str, tool_name: str):
@@ -202,7 +244,7 @@ class TestEveryRegisteredToolIsDocumented:
         'tool_name', _LIVE_REPORT_TOOL_NAMES, ids=list(_LIVE_REPORT_TOOL_NAMES)
     )
     def test_tool_is_named_in_server_instructions(self, tool_name):
-        assert tool_name in RECON_REPORT_INSTRUCTIONS, (
+        assert _names_tool(RECON_REPORT_INSTRUCTIONS, tool_name), (
             f'The tool `{tool_name}` is registered on the live recon_report server but '
             'is not named anywhere in RECON_REPORT_INSTRUCTIONS '
             '(server/recon_report.py) — a registered tool absent from '
@@ -230,8 +272,9 @@ class TestReportToolClassificationPartitionsTheLiveToolSet:
     """
 
     def test_classified_tools_are_all_still_registered(self):
-        sigs = set(get_recon_report_tool_signatures())
-        stale = (HARNESS_CALLED_REPORT_TOOLS | STAGE_GATED_REPORT_TOOLS) - sigs
+        stale = (HARNESS_CALLED_REPORT_TOOLS | STAGE_GATED_REPORT_TOOLS) - set(
+            _LIVE_REPORT_TOOL_NAMES
+        )
         assert not stale, (
             f'Classified tool(s) {stale} are no longer registered on the live recon_report '
             'server — remove them from HARNESS_CALLED_REPORT_TOOLS / '
@@ -254,8 +297,11 @@ class TestReportToolClassificationPartitionsTheLiveToolSet:
         )
 
     def test_shared_guidance_remainder_is_non_empty(self):
-        sigs = set(get_recon_report_tool_signatures())
-        shared = sigs - HARNESS_CALLED_REPORT_TOOLS - STAGE_GATED_REPORT_TOOLS
+        shared = (
+            set(_LIVE_REPORT_TOOL_NAMES)
+            - HARNESS_CALLED_REPORT_TOOLS
+            - STAGE_GATED_REPORT_TOOLS
+        )
         assert shared, (
             'Every live recon-report tool is classified as harness-called or stage-gated, '
             'leaving no shared-guidance tools at all — the guidance block would be empty. '
@@ -307,9 +353,10 @@ class TestSharedGuidanceToolsAreAllRendered:
     @pytest.mark.parametrize(
         'tool_name', _SHARED_GUIDANCE_REPORT_TOOLS, ids=list(_SHARED_GUIDANCE_REPORT_TOOLS)
     )
-    def test_shared_guidance_tool_is_rendered_as_a_call_example(self, tool_name):
-        guidance = render_recon_report_tool_guidance()
-        assert list(_iter_call_openers(guidance, tool_name)), (
+    def test_shared_guidance_tool_is_rendered_as_a_call_example(
+        self, tool_name, rendered_guidance
+    ):
+        assert list(_iter_call_openers(rendered_guidance, tool_name)), (
             f'`{tool_name}` is a shared-guidance tool (registered, and neither '
             'harness-called nor stage-gated) but no call example for it appears in '
             'render_recon_report_tool_guidance()\'s output — the agent is never told it '
@@ -332,7 +379,7 @@ class TestSharedGuidanceToolsAreAllRendered:
         make those scans quietly vacuous for it. Fail here, with an actionable
         message, rather than letting the guard erode in silence.
         """
-        params = list(get_recon_report_tool_signatures()[tool_name].parameters)
+        params = list(_LIVE_REPORT_TOOL_SIGNATURES[tool_name].parameters)
         assert params[:1] == ['run_id'], (
             f'`{tool_name}` is a shared-guidance tool but its first parameter is '
             f'{params[:1] or ["<none>"]}, not run_id. The run_id scans in this module '
@@ -346,15 +393,13 @@ class TestNonSharedToolsAreNotAdvertisedToEveryStage:
 
     The mirror image of TestSharedGuidanceToolsAreAllRendered, and the same
     shape as test_recon_amend_tool_advertisement.py::test_absent_from_stage3_prompt.
-    `--disallowed-tools` OMITS a denied tool rather than rejecting the call
-    (cli_stage_runner.py), so advertising a denied tool in the stage-agnostic
-    block does not produce a clean refusal — it tells a stage about an action it
-    cannot take, and for write_entity_standing_decision specifically it would
-    license a durable SQLite-ledger write from stages that are read-only with
-    respect to the ledger.
+    Advertising a denied tool in the stage-agnostic block does not produce a
+    clean refusal — the tool is simply absent when the agent reaches for it —
+    which is why these absences are asserted rather than assumed. Why each
+    bucket exists: the "Tool classification" block in server/recon_report.py.
     """
 
-    def test_start_report_has_no_call_example(self):
+    def test_start_report_has_no_call_example(self, rendered_guidance):
         """start_report's PROSE mention must survive; only its call example must not exist.
 
         Asserted via the call-opener scan rather than the bare name, because
@@ -362,12 +407,11 @@ class TestNonSharedToolsAreNotAdvertisedToEveryStage:
         `mcp__recon-report__start_report` for you" — that sentence is the whole
         reason the agent knows not to call it.
         """
-        guidance = render_recon_report_tool_guidance()
-        assert 'mcp__recon-report__start_report' in guidance, (
+        assert 'mcp__recon-report__start_report' in rendered_guidance, (
             'the prose mention telling the agent the harness calls start_report for it '
             'has been lost — that sentence is what stops the agent calling it itself'
         )
-        assert not list(_iter_call_openers(guidance, 'start_report')), (
+        assert not list(_iter_call_openers(rendered_guidance, 'start_report')), (
             'render_recon_report_tool_guidance() emits a start_report(...) CALL EXAMPLE. '
             'start_report is harness-called — the harness opens the report before the '
             'stage begins, so an example invites a redundant call. Keep the prose '
@@ -375,9 +419,8 @@ class TestNonSharedToolsAreNotAdvertisedToEveryStage:
         )
 
     @pytest.mark.parametrize('tool_name', sorted(STAGE_GATED_REPORT_TOOLS))
-    def test_stage_gated_tool_is_absent_from_shared_guidance(self, tool_name):
-        guidance = render_recon_report_tool_guidance()
-        assert tool_name not in guidance, (
+    def test_stage_gated_tool_is_absent_from_shared_guidance(self, tool_name, rendered_guidance):
+        assert tool_name not in rendered_guidance, (
             f'`{tool_name}` is stage-gated (denied in some stages via '
             'DISALLOW_RECON_REPORT_LEDGER_WRITES) but appears in the STAGE-AGNOSTIC '
             'guidance block, which is interpolated into all three stage prompts — so '
@@ -460,6 +503,151 @@ class TestRendererCoversEverySignatureItIsGiven:
             )
 
 
+def _render_without(*tools: str) -> str:
+    """Render the guidance from the frozen snapshot MINUS *tools*.
+
+    Uses the same dependency-injection seam as
+    TestRendererCoversEverySignatureItIsGiven: the renderer's only argument is
+    a plain ``{tool: ((param, required), ...)}`` mapping, so a subset can be
+    handed to it with no monkeypatching and no fake FastMCP server.
+    """
+    specs = {k: v for k, v in _FROZEN_RECON_REPORT_SIGNATURE_SPECS.items() if k not in tools}
+    return prompts_module._render_recon_report_tool_guidance(specs)
+
+
+class TestRendererGroupingBranchesDegradeCleanly:
+    """The renderer's conditional GROUPING branches, exercised on subsets.
+
+    :class:`TestRendererCoversEverySignatureItIsGiven` covers the additive
+    ("extra tool") path. This class covers the subtractive one — the branches
+    that must not leave a stranded lead-in or raise when a tool the curated
+    tables name is simply absent from the mapping (reviewer test-coverage
+    finding). Those are exactly the "renders whatever it is handed" promises
+    the renderer's docstring makes load-bearing, and each is reachable through
+    the same signature-mapping seam.
+    """
+
+    def test_citation_lead_in_disappears_when_no_cite_tool_is_present(self):
+        """The shared 'Then attach typed citations:' lead-in is emitted lazily.
+
+        It is emitted immediately before whichever citation tool renders FIRST,
+        so with none present it must not appear at all — a colon-terminated
+        lead-in in front of the stats sentence would read as though the
+        following text listed citation tools.
+        """
+        cite_tools = [t for t in _FROZEN_RECON_REPORT_SIGNATURE_SPECS if t.startswith('cite_')]
+        assert cite_tools, 'precondition: the frozen snapshot has citation tools to remove'
+        rendered = _render_without(*cite_tools)
+        assert 'Then attach typed citations' not in rendered, (
+            'the citation lead-in survived with no citation tool present — it must be '
+            'emitted only immediately before the first citation tool that renders, or '
+            'it strands a colon-terminated sentence in front of unrelated prose'
+        )
+        assert 'mcp__recon-report__add_finding(' in rendered, (
+            'removing the citation tools also dropped unrelated curated prose'
+        )
+
+    def test_stats_sentence_names_only_the_tools_present(self):
+        """set_stat and inc_stat share ONE sentence; a missing one must not be named."""
+        rendered = _render_without('set_stat')
+        assert rendered.count('For stats counters use') == 1, (
+            'the shared stats sentence must render exactly once regardless of how many '
+            f'of the stats group are present — got {rendered.count("For stats counters use")}'
+        )
+        assert list(_iter_call_openers(rendered, 'inc_stat')), (
+            'inc_stat is still present in the mapping but lost its call example when '
+            'set_stat was removed — the stats group renders at the position of whichever '
+            'of its members comes first, not only at set_stat\'s'
+        )
+        assert not list(_iter_call_openers(rendered, 'set_stat')), (
+            'set_stat was not in the mapping but a call example for it was rendered anyway'
+        )
+
+    def test_curated_name_absent_from_signatures_is_skipped(self):
+        """A curated tool missing from the mapping is skipped, not a KeyError.
+
+        ``cite_entity`` is chosen because it is a CITATION tool: its removal
+        also proves the lead-in survives on the next citation tool rather than
+        being lost with the one it happened to precede.
+        """
+        rendered = _render_without('cite_entity')
+        assert not list(_iter_call_openers(rendered, 'cite_entity')), (
+            'cite_entity was not in the mapping but a call example for it was rendered'
+        )
+        assert rendered.count('Then attach typed citations') == 1, (
+            'the citation lead-in must move to the next citation tool when the first one '
+            'is absent — it is neither lost nor duplicated'
+        )
+        for tool_name in _FROZEN_RECON_REPORT_SIGNATURE_SPECS:
+            if tool_name == 'cite_entity':
+                continue
+            assert list(_iter_call_openers(rendered, tool_name)), (
+                f'removing cite_entity also dropped the `{tool_name}` call example'
+            )
+
+    def test_curated_tool_without_prose_degrades_to_a_generic_bullet(self):
+        """A _GUIDANCE_TOOL_ORDER name with no _GUIDANCE_TOOL_PROSE entry must not raise.
+
+        The two curated tables have to stay in sync and nothing structurally
+        forces them to (reviewer robustness finding). Because this renderer is
+        shared by the live path AND the frozen fallback, a ``KeyError`` here
+        would take out both at once and surface as an ImportError for every
+        consumer of the ``prompts`` package — the exact blast radius the
+        lazy-render design exists to contain. So the tool must degrade to the
+        generic bullet an unknown tool gets, losing one annotation rather than
+        every stage prompt.
+        """
+        pruned = {k: v for k, v in prompts_module._GUIDANCE_TOOL_PROSE.items() if k != 'cite_entity'}
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(prompts_module, '_GUIDANCE_TOOL_PROSE', pruned)
+            rendered = prompts_module._render_recon_report_tool_guidance(
+                _FROZEN_RECON_REPORT_SIGNATURE_SPECS
+            )
+        assert list(_iter_call_openers(rendered, 'cite_entity')), (
+            'a curated tool with no prose entry vanished from the guidance entirely — it '
+            'must fall through to the generic call-shape bullet so a table-sync slip '
+            'loses an annotation, not a tool'
+        )
+        assert 'Also registered on this server' in rendered, (
+            'the unannotated tool was not rendered under the generic lead-in'
+        )
+        assert rendered.count('Then attach typed citations') == 1, (
+            'dropping cite_entity\'s prose stranded or duplicated the citation lead-in'
+        )
+
+
+class TestCuratedGuidanceTablesStayInSync:
+    """_GUIDANCE_TOOL_ORDER and _GUIDANCE_TOOL_PROSE cover the same tools.
+
+    The renderer no longer RAISES when they disagree (see
+    TestRendererGroupingBranchesDegradeCleanly above) — which is what makes a
+    slip survivable, and also what makes it silent. This is the cheap invariant
+    that keeps it from being silent: an ordered tool with no prose entry ships
+    a bare call shape to every stage instead of its behavioural rules.
+    """
+
+    def test_every_ordered_tool_has_curated_prose(self):
+        ordered = set(prompts_module._GUIDANCE_TOOL_ORDER) - set(prompts_module._GUIDANCE_STATS_GROUP)
+        prose = set(prompts_module._GUIDANCE_TOOL_PROSE)
+        assert ordered == prose, (
+            'the curated guidance tables in reconciliation/prompts/__init__.py have '
+            'drifted apart. Ordered but unannotated (these render as bare bullets with '
+            f'none of their behavioural rules): {ordered - prose}; annotated but never '
+            f'placed (this prose is dead): {prose - ordered}.'
+        )
+
+    def test_grouped_tools_are_all_in_the_render_order(self):
+        """A group member absent from the ORDER would never reach its branch."""
+        ordered = set(prompts_module._GUIDANCE_TOOL_ORDER)
+        for group_name in ('_GUIDANCE_CITATION_GROUP', '_GUIDANCE_STATS_GROUP'):
+            group = set(getattr(prompts_module, group_name))
+            assert group <= ordered, (
+                f'{group_name} names {group - ordered}, which _GUIDANCE_TOOL_ORDER does '
+                'not — the renderer walks the ORDER, so those tools would fall through '
+                'to the generic bullet list and lose their group sentence entirely.'
+            )
+
+
 # Fully assembled stage-prompt texts to scan for inline report-tool call examples.
 # build_stage2_system_prompt('autopilot_video') is included because it injects
 # AUTOPILOT_VIDEO_CONTAMINATION_GUARDRAIL, which carries its own cross-project
@@ -507,7 +695,7 @@ class TestReconReportRunIdGuardOverAssembledPrompts:
         ids=[label for label, _ in _ASSEMBLED_PROMPT_CASES],
     )
     def test_every_report_tool_call_example_shows_run_id(self, prompt_label, prompt_text):
-        for tool_name in _AGENT_CALLED_REPORT_TOOLS:
+        for tool_name in _SHARED_GUIDANCE_REPORT_TOOLS:
             for paren_idx in _iter_call_openers(prompt_text, tool_name):
                 args_substr = _extract_call_args_at(prompt_text, paren_idx)
                 assert 'run_id' in args_substr, (
@@ -643,7 +831,7 @@ class TestReconReportGuidanceFallback:
         the mechanism that now prevents drift.
         """
         fallback = _frozen_recon_report_tool_guidance()
-        for tool_name in _AGENT_CALLED_REPORT_TOOLS:
+        for tool_name in _SHARED_GUIDANCE_REPORT_TOOLS:
             for paren_idx in _iter_call_openers(fallback, tool_name):
                 args_substr = _extract_call_args_at(fallback, paren_idx)
                 assert 'run_id' in args_substr, (
@@ -668,8 +856,8 @@ class TestFallbackIsDerivedFromTheSameRenderer:
     scanning rendered prose.
     """
 
-    def test_fallback_equals_live_generated_guidance(self):
-        assert render_recon_report_tool_guidance() == _frozen_recon_report_tool_guidance(), (
+    def test_fallback_equals_live_generated_guidance(self, rendered_guidance):
+        assert rendered_guidance == _frozen_recon_report_tool_guidance(), (
             'The frozen fallback no longer matches the live-generated guidance — '
             'update _FROZEN_RECON_REPORT_SIGNATURE_SPECS in '
             'reconciliation/prompts/__init__.py to match the live tool signatures.'
@@ -698,7 +886,7 @@ class TestFallbackIsDerivedFromTheSameRenderer:
         still has teeth: the snapshot must cover exactly the shared-guidance
         set.
         """
-        sigs = get_recon_report_tool_signatures()
+        sigs = _LIVE_REPORT_TOOL_SIGNATURES
 
         assert set(_FROZEN_RECON_REPORT_SIGNATURE_SPECS) == set(_SHARED_GUIDANCE_REPORT_TOOLS), (
             'The frozen snapshot does not cover exactly the shared-guidance tools — '
@@ -763,8 +951,10 @@ class TestEveryRegisteredToolReachesTheAgentSomehow:
     @pytest.mark.parametrize(
         'tool_name', _LIVE_REPORT_TOOL_NAMES, ids=list(_LIVE_REPORT_TOOL_NAMES)
     )
-    def test_registered_tool_reaches_the_surface_its_classification_requires(self, tool_name):
-        assert tool_name in RECON_REPORT_INSTRUCTIONS, (
+    def test_registered_tool_reaches_the_surface_its_classification_requires(
+        self, tool_name, rendered_guidance
+    ):
+        assert _names_tool(RECON_REPORT_INSTRUCTIONS, tool_name), (
             f'`{tool_name}` is registered on the live recon_report server but is named '
             'nowhere in RECON_REPORT_INSTRUCTIONS (server/recon_report.py) — a '
             'registered tool absent from RECON_REPORT_INSTRUCTIONS is invisible to any '
@@ -772,7 +962,7 @@ class TestEveryRegisteredToolReachesTheAgentSomehow:
         )
         if tool_name not in _SHARED_GUIDANCE_REPORT_TOOLS:
             return
-        assert list(_iter_call_openers(render_recon_report_tool_guidance(), tool_name)), (
+        assert list(_iter_call_openers(rendered_guidance, tool_name)), (
             f'`{tool_name}` is a shared-guidance tool but no call example for it appears '
             'in render_recon_report_tool_guidance()\'s output, so no stage agent is ever '
             'told it exists. Either render it, or classify it in '
@@ -780,7 +970,7 @@ class TestEveryRegisteredToolReachesTheAgentSomehow:
             '(server/recon_report.py).'
         )
 
-    def test_delete_finding_regression_stays_closed(self):
+    def test_delete_finding_regression_stays_closed(self, rendered_guidance):
         """delete_finding: registered and denied by no stage, but unadvertised.
 
         Asserted BY NAME, not only through the derived sets, so the fix cannot
@@ -794,7 +984,7 @@ class TestEveryRegisteredToolReachesTheAgentSomehow:
             'stage can call it; classifying it otherwise hides a callable tool from the '
             'agent, which is the exact regression task 3878 fixed.'
         )
-        assert list(_iter_call_openers(render_recon_report_tool_guidance(), 'delete_finding')), (
+        assert list(_iter_call_openers(rendered_guidance, 'delete_finding')), (
             'the rendered guidance no longer shows a delete_finding call example — task '
             '3878 added it because an agent that filed a finding in error had no '
             'advertised way to retract it.'
@@ -810,7 +1000,7 @@ class TestEveryRegisteredToolReachesTheAgentSomehow:
         shared-guidance would advertise a durable SQLite-ledger write to two
         stages that cannot make one.
         """
-        assert 'write_entity_standing_decision' in RECON_REPORT_INSTRUCTIONS, (
+        assert _names_tool(RECON_REPORT_INSTRUCTIONS, 'write_entity_standing_decision'), (
             'write_entity_standing_decision has been dropped from '
             'RECON_REPORT_INSTRUCTIONS — task 3878 added it because it was the only '
             'registered tool the server-level listing never named.'
