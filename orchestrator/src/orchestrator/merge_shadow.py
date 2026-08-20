@@ -1339,13 +1339,11 @@ async def _run_cold_shadow_verify(
         #
         # (iv) FLOCK ONLY, NO GLOBAL RENDEZVOUS (task 4189).  Because `wt` is
         #     ephemeral, this lease takes the lane flock and does NOT record
-        #     the single fixed-key global holder-pgid.  Two things that used
-        #     to follow from an hours-long cold-shadow window no longer do:
-        #     `_run_warm_lane_gc_reclaim` no longer defers (127) for the
-        #     WHOLE window over a lane it would never reset, and this lease's
-        #     exit no longer strips the LIVE rendezvous of the next merge's
-        #     concurrent persistent-lane verify (shadow compares run as
-        #     background asyncio tasks; the key is not refcounted).  The
+        #     the single fixed-key global holder-pgid — `merge_verify_lease`'s
+        #     docstring carries the full argument; the two consequences that
+        #     motivated it were both this call site's hours-long cold-shadow
+        #     window (deferring warm-lane GC for its whole span, and stripping
+        #     the next merge's live persistent-lane rendezvous on exit).  The
         #     `skipped_lease_held` protection in (i) is unaffected — it comes
         #     from the FLOCK, which is untouched.
         #

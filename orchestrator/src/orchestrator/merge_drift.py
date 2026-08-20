@@ -243,12 +243,12 @@ async def _run_drift_check(
         #
         # (iv) FLOCK ONLY, NO GLOBAL RENDEZVOUS (task 4189).  Because `wt` is
         #     ephemeral, this lease takes the lane flock and does NOT record
-        #     the single fixed-key global holder-pgid: it therefore neither
-        #     defers `_run_warm_lane_gc_reclaim` over a lane that reclaim
-        #     would never reset, nor — on exit — strips the LIVE rendezvous of
-        #     a concurrent persistent-lane merge verify (the key is not
-        #     refcounted).  The `skipped_lease_held` protection in (i) is
-        #     unaffected: it comes from the FLOCK, which is untouched.
+        #     the single fixed-key global holder-pgid — see
+        #     `merge_verify_lease` for the full argument (it neither defers
+        #     `_run_warm_lane_gc_reclaim` over a lane reclaim would never
+        #     reset, nor strips a concurrent persistent-lane verify's live
+        #     rendezvous on exit).  The `skipped_lease_held` protection in (i)
+        #     is unaffected: it comes from the FLOCK, which is untouched.
         #
         # Entered only AFTER the assignment above succeeds — `wt` is still
         # None if creation raises, and the finally's `if wt is not None` guard

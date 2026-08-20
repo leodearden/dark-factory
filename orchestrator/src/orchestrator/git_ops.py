@@ -5663,8 +5663,19 @@ class GitOps:
         so it no longer defers the reclaim: such a lane is not one the
         reclaim resets, and an hours-long cold-shadow verify
         (``merge_shadow.py``) previously blocked the whole pool's reclaim for
-        its entire window.  Its own lane stays protected by the lane flock
-        the reclaim script itself takes.
+        its entire window.  What keeps that ephemeral lane itself safe is the
+        script's own BAND protection, not this predicate: ``_merge-`` is a
+        :data:`PROTECTED_PREFIXES` key, so it is rendered into
+        ``warm-lane-gc.sh``'s ``PROTECT_GLOB`` (``lane_protect_glob _lane-
+        _spec-``, which subtracts only the pool bands that sweep OWNS) and the
+        entry is counted ``preserved`` and skipped in the enumeration loop
+        BEFORE either pass looks at it — the script never opens that lane's
+        lock at all.  Should ``_merge-`` ever leave that registry, the backstop
+        is Pass 1's and Pass 2's own non-blocking ``flock -n`` on the lane
+        lock, which is exactly the lock this lease holds for the whole verify
+        body.  Naming the flock as the PRIMARY gate would be drift: it is the
+        second line, and a later reader could use the misattribution to
+        license removing the first.
 
         **Pool-storage guard (task 2099, self-heal task 2315)**: routes
         through :meth:`_reconcile_pool_storage_before_sweep`, which refuses
