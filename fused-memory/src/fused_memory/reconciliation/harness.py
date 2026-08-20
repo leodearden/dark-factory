@@ -9,7 +9,6 @@ import logging
 import os
 import time
 import traceback
-from collections import deque
 from collections.abc import Awaitable, Callable, Iterable
 from contextlib import suppress
 from dataclasses import dataclass
@@ -252,10 +251,11 @@ _RESOLVED_RECURRENCE_WINDOW_SECONDS = 86400  # 24h
 # _INTEGRITY_FINDING_RECURRENCE_THRESHOLD above, since a dropped placeholder
 # never enters a remediation run.  This rolling-window counter closes that
 # gap by firing ONE coarse escalation once drops recur this often for the
-# same project within the window.  Mirrors the dead_owner_shielded
-# suppression-storm counter (_record_dead_owner_suppression /
-# dead_owner_suppression_storm_threshold+window_seconds below) but as plain
-# module constants rather than ReconciliationConfig fields, since this
+# same project within the window.  The window mechanics are the shared
+# StormCounter's (see _record_placeholder_finding_drop); these knobs are
+# plain module constants rather than ReconciliationConfig fields — unlike
+# the dead_owner_shielded suppression-storm counter's
+# dead_owner_suppression_storm_threshold+window_seconds below — since this
 # predicate and its guard are private to this module.
 _PLACEHOLDER_DROP_STORM_THRESHOLD = 5
 _PLACEHOLDER_DROP_STORM_WINDOW_SECONDS = 3600.0  # 1h
@@ -651,11 +651,12 @@ class ReconciliationHarness:
 
         # Task 1755 / PRD β, amended by task 2039: rolling-window counter of
         # DISTINCT dead-owner instance UUIDs among dead_owner_shielded
-        # recon_stale_run suppressions.  Each entry is
-        # (timestamp, project_id, instance_id); pruned on each call to
-        # _record_dead_owner_suppression().  The count that matters is the
-        # number of distinct non-None instance_id values in the window, NOT
-        # the number of suppression events.
+        # recon_stale_run suppressions.  The count that matters is the number
+        # of distinct non-None instance_id values in the window, NOT the number
+        # of suppression events — hence count_distinct=True, with instance_id
+        # passed as the counter's `key` and project_id as its `label` (task
+        # 3259).  Those two dimensions are orthogonal by construction: the
+        # threshold follows the keys, the reported `projects` follow the labels.
         #
         # ⚠ In-process lifetime limitation: these counters are reset on every
         # harness restart.  A single restart recovers one dead_owner_shielded
@@ -675,10 +676,8 @@ class ReconciliationHarness:
         # Single-restart churn is instead observable via the per-event INFO
         # log emitted at harness.py:741.  If single-owner restart churn must
         # also alarm, count recent dead_owner_shielded _error records from
-        # the journal over the window instead of the in-memory deque.
-        self._dead_owner_suppressions: deque[tuple[datetime, str, str | None]] = deque()
-        # Timestamp of the last storm escalation — None means never fired.
-        self._last_suppression_storm_escalation_at: datetime | None = None
+        # the journal over the window instead of this in-memory counter.
+        self._dead_owner_storm = StormCounter(count_distinct=True)
 
         # Task 1970 amendment: rolling-window counter for dropped
         # referenceless actionable findings (see
@@ -2217,59 +2216,45 @@ class ReconciliationHarness:
     ) -> dict | None:
         """Record one dead_owner_shielded suppression and check for a storm.
 
-        Appends (effective_now, project_id, instance_id) to the rolling deque,
-        prunes entries older than the configured window, then:
-        - Returns None if the number of DISTINCT non-None instance_id values
-          (dead-owner instances) in the window is below the threshold.
-        - Returns None if the alarm already fired within this window
-          (rate limit: <=1 per window).
-        - Otherwise sets _last_suppression_storm_escalation_at = effective_now
-          and returns a storm summary dict with 'count' (the distinct
-          dead-owner-instance count), 'window_seconds', and 'projects'
-          (sorted distinct project labels seen in the window).
+        The rolling-window mechanics — append, prune to the window, count,
+        compare to the threshold, rate-limit to one fire per window, and report
+        the distinct project labels seen — live in
+        ``shared.storm_counter.StormCounter`` (INV-5); this method only supplies
+        the knobs and the event.  Returns None while the count is below the
+        threshold and None when the alarm already fired within this window,
+        otherwise a storm summary dict with 'count' (the distinct
+        dead-owner-instance count), 'window_seconds', and 'projects' (sorted
+        distinct project labels seen in the window).
 
         Task 2039: the count is keyed on DISTINCT dead-owner instance_id
-        values, not on the number of suppression events. All orphans
-        recovered by one restart share that ONE dead owner's instance_id, so
-        a single multi-project restart contributes only 1 to the count no
-        matter how many projects it touches; only genuinely-independent
-        watchdog kills (distinct instance_id values) accumulate toward the
-        threshold. instance_id=None entries (should not occur for
-        dead_owner_shielded, which requires a matching non-None instance_id)
-        are excluded from the distinct set defensively.
+        values, not on the number of suppression events — which is why the
+        counter runs in ``count_distinct`` mode with instance_id as its ``key``
+        and project_id as its independent ``label``. All orphans recovered by
+        one restart share that ONE dead owner's instance_id, so a single
+        multi-project restart contributes only 1 to the count no matter how
+        many projects it touches; only genuinely-independent watchdog kills
+        (distinct instance_id values) accumulate toward the threshold.
+        instance_id=None entries (should not occur for dead_owner_shielded,
+        which requires a matching non-None instance_id) are excluded from the
+        distinct set defensively — StormCounter drops ``key=None`` from it.
+
+        Threshold and window are read LIVE off ``self.config`` on every call
+        rather than captured, so promoting either dead_owner_suppression_storm_*
+        leaf into ``RELOADABLE_FIELDS`` would work without further edits.
 
         The now= parameter follows the ``_finding_recently_resolved(..., now=None)``
         time-injection convention (harness.py:1592) for deterministic unit tests.
-        Task 1755 / PRD β; distinct-instance counting added by task 2039.
+        Task 1755 / PRD β; distinct-instance counting added by task 2039;
+        migrated onto the shared counter by task 3259.
         """
-        effective_now = now if now is not None else datetime.now(UTC)
-
-        # Append and prune the rolling window.
-        self._dead_owner_suppressions.append((effective_now, project_id, instance_id))
-        window = timedelta(seconds=self.config.dead_owner_suppression_storm_window_seconds)
-        cutoff_ts = effective_now - window
-        while self._dead_owner_suppressions and self._dead_owner_suppressions[0][0] < cutoff_ts:
-            self._dead_owner_suppressions.popleft()
-
-        count = len({iid for _, _, iid in self._dead_owner_suppressions if iid is not None})
-        if count < self.config.dead_owner_suppression_storm_threshold:
-            return None
-
-        # Threshold crossed — apply the per-window rate limit.
-        if (
-            self._last_suppression_storm_escalation_at is not None
-            and (effective_now - self._last_suppression_storm_escalation_at) < window
-        ):
-            return None
-
-        # Fire: set rate-limit timestamp and build the storm summary dict.
-        self._last_suppression_storm_escalation_at = effective_now
-        projects = sorted({pid for _, pid, _ in self._dead_owner_suppressions})
-        return {
-            'count': count,
-            'window_seconds': self.config.dead_owner_suppression_storm_window_seconds,
-            'projects': projects,
-        }
+        return self._storm_summary(
+            self._dead_owner_storm,
+            threshold=self.config.dead_owner_suppression_storm_threshold,
+            window_seconds=self.config.dead_owner_suppression_storm_window_seconds,
+            project_id=project_id,
+            now=now,
+            key=instance_id,
+        )
 
     # ── Shared storm-counter adapter (task 3259 / INV-5) ───────────────
 
