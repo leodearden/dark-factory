@@ -677,7 +677,9 @@ def liveness_snapshot_subject_task_ids(record: dict) -> set[str]:
     return subjects
 
 
-def liveness_snapshot_subject_facts(record: dict, core_fact: str) -> dict[str, str]:
+def liveness_snapshot_subject_facts(
+    record: dict, core_fact: str,
+) -> dict[str, set[str]]:
     """WHAT each subject of a liveness snapshot is asserted to be.
 
     The per-subject sibling of ``liveness_snapshot_subject_task_ids``: that one
@@ -733,7 +735,7 @@ def liveness_snapshot_subject_facts(record: dict, core_fact: str) -> dict[str, s
         for ref in refs:
             scoped.setdefault(ref, set()).update(pairs)
 
-    facts: dict[str, str] = {}
+    facts: dict[str, set[str]] = {}
     for subject in liveness_snapshot_subject_task_ids(record):
         pairs = scoped.get(subject)
         # FALLBACK, and the deliberate answer to "how do subjects with no
@@ -747,7 +749,10 @@ def liveness_snapshot_subject_facts(record: dict, core_fact: str) -> dict[str, s
         # divergent per-task snapshots now group — and can never remove it, so
         # it warrants no new `_LIVENESS_DISCLOSURE_KEYS` counter: nothing here
         # is lost, and a subject dropped instead WOULD be.
-        facts[subject] = '|'.join(sorted(pairs)) if pairs else core_fact
+        keys = {core_fact}
+        if pairs:
+            keys.add('|'.join(sorted(pairs)))
+        facts[subject] = keys
     return facts
 
 
@@ -904,10 +909,15 @@ def find_liveness_snapshot_recurrences(
             disclosure['liveness_snapshot_untasked'] += 1
         # PER SUBJECT, from the clause(s) that name it — not one whole-record
         # key attributed to every subject alike.
-        for subject, fact in liveness_snapshot_subject_facts(
+        for subject, subject_facts in liveness_snapshot_subject_facts(
             record, core_fact,
         ).items():
-            buckets.setdefault((category, subject, fact), []).append(record)
+            # `sorted`, not bare set iteration: insertion order decides
+            # nothing stable across runs, and the Returns contract promises
+            # byte-identical serialisation. One comparison on a 1-or-2 element
+            # set removes the question.
+            for fact in sorted(subject_facts):
+                buckets.setdefault((category, subject, fact), []).append(record)
 
     groups: list[dict[str, Any]] = []
     for (category, subject, core_fact), members in buckets.items():
@@ -940,6 +950,7 @@ def find_liveness_snapshot_recurrences(
 
     groups.sort(key=lambda g: (
         str(g['category']), g['subject_task_id'], str(g['member_ids'][0]),
+        str(g['core_fact']),
     ))
     return groups, disclosure
 
