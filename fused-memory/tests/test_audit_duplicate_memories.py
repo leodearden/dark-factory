@@ -5171,10 +5171,10 @@ class TestLivenessSnapshotSubjectFacts:
 
         assert liveness_snapshot_subject_facts(
             by_id['6b245659'], _CORE_FACT_STRANDED,
-        ) == {'94': _CORE_FACT_STRANDED}
+        ) == {'94': {_CORE_FACT_STRANDED}}
         assert liveness_snapshot_subject_facts(
             by_id['08aa0017'], _CORE_FACT_STRANDED,
-        ) == {'96': _CORE_FACT_STRANDED}
+        ) == {'96': {_CORE_FACT_STRANDED}}
 
     def test_the_multi_task_reverification_keys_each_subject_from_its_own_clause(self):
         """1eef7df7: task 94 in clause 0, task 96 four clauses later.
@@ -5188,8 +5188,8 @@ class TestLivenessSnapshotSubjectFacts:
 
         facts = liveness_snapshot_subject_facts(record, _CORE_FACT_STRANDED)
 
-        assert facts['94'] == _CORE_FACT_STRANDED
-        assert facts['96'] == _CORE_FACT_STRANDED
+        assert facts['94'] == {_CORE_FACT_STRANDED}
+        assert facts['96'] == {_CORE_FACT_STRANDED}
 
     def test_the_record_is_not_mutated(self):
         record = {r['id']: r for r in _liveness_corpus()}['1eef7df7']
@@ -5203,20 +5203,28 @@ class TestLivenessSnapshotSubjectFacts:
 class TestLivenessSubjectFactsFallback:
     """A subject with NO clause-scoped evidence keys on the WHOLE-RECORD union.
 
-    The rule the rescope had to decide and this class documents. Clause
-    scoping can only ADD recall if a subject the clauses say nothing about
-    keeps exactly the key it had BEFORE the rescope -- the whole-record union.
-    Drop such a subject instead and the rescope would silently REMOVE recall
-    from a report-only path, which is the one direction it must not move.
+    EVERY subject keys on *core_fact* -- always, unconditionally -- and clause
+    scoping ADDS a second key beside it when the subject's clauses carried
+    readable assignments. The three shapes below are the cases where nothing
+    is added, so the set stays the one-element `{core_fact}` this class
+    asserts: a ref that exists only in metadata, a prose ref in a clause
+    carrying no readable assignment, and a clause boundary landing inside a
+    quoted value.
 
-    Because the fallback is byte-identical to today's behaviour, nothing is
+    An earlier reading of this class claimed the rescope "can only ADD recall
+    if a subject the clauses say nothing about keeps exactly the key it had
+    BEFORE the rescope". That condition is real but NOT sufficient, and
+    believing it shipped a regression: a subject whose clause named only SOME
+    of the record's fields keyed on a partial fact instead, silently vacating
+    the whole-record bucket it used to share -- an empty-set-only fallback
+    never fires for it. The invariant that actually holds is the unconditional
+    one above; `TestLivenessSubjectFactsIsAdditive` pins the
+    non-empty-but-incomplete half this class does not reach.
+
+    Because every pre-rescope bucket membership therefore survives, nothing is
     lost and no new `_LIVENESS_DISCLOSURE_KEYS` counter is warranted -- pinned
     below, so a later edit that starts dropping these subjects has to change
     a disclosure contract rather than quietly shrink the report.
-
-    Three shapes reach it, one per test: a ref that exists only in metadata, a
-    prose ref in a clause carrying no readable assignment, and a clause
-    boundary landing inside a quoted value.
     """
 
     def test_a_metadata_only_subject_falls_back_to_the_record_key(self):
@@ -5237,8 +5245,8 @@ class TestLivenessSubjectFactsFallback:
         assert set(facts) == {'94', '777'}, (
             'the metadata-only subject is keyed, not dropped'
         )
-        assert facts['94'] == _CORE_FACT_STRANDED, 'from its own clause'
-        assert facts['777'] == _CORE_FACT_STRANDED, 'from the whole-record union'
+        assert facts['94'] == {_CORE_FACT_STRANDED}, 'from its own clause'
+        assert facts['777'] == {_CORE_FACT_STRANDED}, 'from the whole-record union'
 
     def test_a_prose_subject_whose_clause_asserts_nothing_falls_back(self):
         """The REAL 1eef7df7: clause 6 names task 99 with no assignment.
@@ -5255,7 +5263,7 @@ class TestLivenessSubjectFactsFallback:
 
         facts = liveness_snapshot_subject_facts(record, _CORE_FACT_STRANDED)
 
-        assert facts['99'] == _CORE_FACT_STRANDED, (
+        assert facts['99'] == {_CORE_FACT_STRANDED}, (
             'keyed on the whole-record union, exactly as before the rescope'
         )
 
@@ -5287,7 +5295,7 @@ class TestLivenessSubjectFactsFallback:
             'the record-level read is whole -- only the CLAUSE is truncated'
         )
         assert liveness_snapshot_subject_facts(record, record_key) == {
-            '94': record_key,
+            '94': {record_key},
         }, 'the subject falls back rather than vanishing from the report'
 
     def test_the_fallback_adds_no_disclosure_counter(self):
@@ -5301,6 +5309,114 @@ class TestLivenessSubjectFactsFallback:
 
         assert set(disclosure) == set(_LIVENESS_DISCLOSURE_KEYS)
         assert set(disclosure.values()) == {0}
+
+
+# ONE clause carrying all three fields, and the SAME fact spread across two
+# clauses -- the ordinary shape, not an exotic one: `\n` is a clause boundary
+# too, so any snapshot naming its task on one line and listing fields on the
+# following lines splits exactly like this. Both records produce the IDENTICAL
+# whole-record key, so they grouped before the rescope.
+_LIVENESS_94_ONE_CLAUSE = (
+    'Point-in-time liveness check performed 2026-07-24 on task 94: get_task '
+    'reports status="in-progress" but claimant_run_id=null and '
+    'heartbeat_at=null.'
+)
+_LIVENESS_94_SPLIT_CLAUSES = (
+    'Point-in-time liveness check performed 2026-07-26 on task 94: get_task '
+    'reports status="in-progress". Separately, claimant_run_id=null and '
+    'heartbeat_at=null were observed for it.'
+)
+
+
+class TestLivenessSubjectFactsIsAdditive:
+    """*core_fact* is among a subject's keys ALWAYS -- the monotonicity proof.
+
+    Clause scoping is only safe on this report-only path if it can add
+    groupings and never take one away. `TestLivenessSubjectFactsFallback`
+    covers the case where a subject's clauses assert NOTHING; this class
+    covers the strictly harder one they do not reach -- clause evidence that
+    is non-empty but INCOMPLETE.
+
+    Measured against the shipped module before this class landed: record B
+    below names task 94 in its first clause and puts the other two fields in a
+    second clause naming no task, so the subject keyed on the partial
+    `status=in-progress`, matched nothing, and the whole-record bucket it had
+    shared with A was silently vacated -- `find_liveness_snapshot_recurrences`
+    returned `[]` with an ALL-ZERO disclosure. A fallback that fires only on
+    the empty set cannot catch that; a non-empty-but-incomplete set wins
+    outright.
+
+    The invariant that closes it: every subject buckets under *core_fact*
+    unconditionally, with the clause-scoped fact ADDED beside it. Every bucket
+    membership that existed before the rescope therefore still exists, which is
+    what makes "clause scoping can only ADD recall" a true statement about the
+    mechanism rather than an aspiration about the common case.
+    """
+
+    def _pair(self) -> list[dict]:
+        return [
+            _dated('A', _LIVENESS_94_ONE_CLAUSE, _TS_94_JUL24,
+                   category=_OS, metadata={'task_id': '94'}),
+            _dated('B', _LIVENESS_94_SPLIT_CLAUSES, _TS_REVERIFY,
+                   category=_OS, metadata={'task_id': '94'}),
+        ]
+
+    def test_an_incomplete_clause_still_keeps_the_whole_record_grouping(self):
+        """Asserted in link order, so a failure says WHICH link broke."""
+        a, b = self._pair()
+
+        # PREMISE: these two DID group before the rescope -- one record key.
+        assert extract_liveness_snapshot_fact(a) == _CORE_FACT_STRANDED
+        assert extract_liveness_snapshot_fact(b) == _CORE_FACT_STRANDED, (
+            'the record-level read is whole for both -- only B is SPLIT across '
+            'clauses, which is a clause-scoping question, not a reading one'
+        )
+
+        # The projection: both carry the record key; B carries its partial too.
+        assert liveness_snapshot_subject_facts(a, _CORE_FACT_STRANDED) == {
+            '94': {_CORE_FACT_STRANDED},
+        }
+        assert liveness_snapshot_subject_facts(b, _CORE_FACT_STRANDED) == {
+            '94': {_CORE_FACT_STRANDED, 'status=in-progress'},
+        }, 'the clause-scoped partial is ADDED beside the record key, not swapped in'
+
+        # And therefore the group survives the rescope.
+        groups, disclosure = find_liveness_snapshot_recurrences(self._pair())
+
+        assert [(g['subject_task_id'], g['core_fact'], g['member_ids'])
+                for g in groups] == [
+            ('94', _CORE_FACT_STRANDED, ['A', 'B']),
+        ], 'exactly the group that existed before clause scoping'
+        assert set(disclosure.values()) == {0}, (
+            'a vacated bucket moves no counter, which is why the regression was '
+            'invisible -- the group itself is the only observable'
+        )
+
+    def test_two_groups_for_one_subject_come_back_in_a_stable_order(self):
+        """RED for DETERMINISM, not recall -- the sort tie dual keying reaches.
+
+        Two records of the SPLIT shape bucket subject 94 twice: once at the
+        whole-record key, once at the clause-scoped `status=in-progress`. Both
+        groups carry the same category, the same subject and the same first
+        member id, so the three-component sort key does not discriminate them
+        and their order falls out of dict insertion -- breaking the Returns
+        contract's promise that two identical runs serialise byte-identically.
+        `core_fact` ascending is the stated tiebreak.
+        """
+        corpus = [
+            _dated('P', _LIVENESS_94_SPLIT_CLAUSES, _TS_94_JUL24,
+                   category=_OS, metadata={'task_id': '94'}),
+            _dated('Q', _LIVENESS_94_SPLIT_CLAUSES, _TS_REVERIFY,
+                   category=_OS, metadata={'task_id': '94'}),
+        ]
+
+        groups, _ = find_liveness_snapshot_recurrences(corpus)
+
+        assert [(g['subject_task_id'], g['core_fact'], g['member_ids'])
+                for g in groups] == [
+            ('94', _CORE_FACT_STRANDED, ['P', 'Q']),
+            ('94', 'status=in-progress', ['P', 'Q']),
+        ], 'sorted by core_fact ascending once category/subject/first-id tie'
 
 
 class TestFindLivenessSnapshotRecurrences:
