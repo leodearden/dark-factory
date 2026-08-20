@@ -707,6 +707,144 @@ class TestCapHitResume:
 
 
 @pytest.mark.asyncio
+class TestResumeFallbackCounter:
+    """``AgentResult.resume_fallbacks`` counts armed-then-lost resumes.
+
+    The population this makes visible: ``invoke_with_cap_retry`` armed
+    ``--resume``, the CLI rejected the session, the loop silently retried fresh
+    and returned a SUCCESS.  Today nothing anywhere records that a resume — and
+    with it the whole prior transcript — was lost; the 28 measured occurrences
+    left no runs.db event at all.  ``shared`` has no event store, so the count
+    rides out on the result as the carrier the orchestrator reads (step-22)
+    without ``shared`` acquiring an event-store dependency.
+
+    THE LOAD-BEARING SUBTLETY: the retry loop rebinds ``result`` on every pass,
+    so a counter stamped onto the DISCARDED first result is lost by
+    construction.  Only a loop-local counter stamped at the single return point
+    survives — which is exactly what the ``got is ok_result`` assertions below
+    pin: the object handed back is the LAST result, not the failed one.
+    """
+
+    async def test_single_resume_fallback_counted(self):
+        """One armed-then-failed resume → the RETURNED result carries 1.
+
+        Caller-initiated resume (the pooled-warm-lane shape this task fixes):
+        the first invocation carries the caller's ``resume_session_id``, fails
+        non-cap, and the loop retries fresh and succeeds.
+        """
+        gate = make_gate_mock(
+            account_count=1,
+            before_invoke=AsyncMock(side_effect=['token-a', 'token-a']),
+            detect_cap_hit=MagicMock(return_value=False),
+            active_account_name='acct',
+        )
+        # cost_usd defaults to 0.5, so the failure does not trip the zero-cost
+        # heuristic — it routes through the resume-fallback branch under test.
+        failed_resume = _make_result(success=False, output='resume error')
+        ok_result = _make_result()
+
+        with (
+            patch(
+                'shared.cli_invoke.invoke_claude_agent',
+                new_callable=AsyncMock,
+                side_effect=[failed_resume, ok_result],
+            ) as mock_invoke,
+            patch('shared.cli_invoke.asyncio.sleep', new_callable=AsyncMock),
+        ):
+            got = await invoke_with_cap_retry(
+                gate, 'test-label',
+                prompt='do stuff',
+                resume_session_id='sess-lost',
+            )
+
+        assert mock_invoke.call_count == 2
+        assert got is ok_result, (
+            'the loop rebinds result on each pass — the counter must be stamped '
+            'on the final returned object, not on the discarded failed resume'
+        )
+        assert got.resume_fallbacks == 1
+
+    async def test_two_resume_fallbacks_counted(self):
+        """Two armed-then-failed resumes across a cap re-arm → the count reaches 2.
+
+        Realistic five-call shape: caller resume fails (fallback 1) → fresh
+        retry hits a cap that carries a session id → the loop re-arms
+        ``--resume`` itself → that resume fails too (fallback 2) → fresh retry
+        succeeds.  Proves the counter accumulates rather than latching at one.
+        """
+        gate = make_gate_mock(
+            account_count=2,
+            before_invoke=AsyncMock(side_effect=['t-a', 't-b', 't-a', 't-b', 't-a']),
+            detect_cap_hit=MagicMock(side_effect=[False, True, False, False, False]),
+            active_account_name='acct-b',
+        )
+        failed_resume_1 = _make_result(success=False, output='resume error')
+        capped = _make_result(session_id='sess-capped')
+        failed_resume_2 = _make_result(success=False, output='resume error')
+        ok_result = _make_result()
+
+        with (
+            patch(
+                'shared.cli_invoke.invoke_claude_agent',
+                new_callable=AsyncMock,
+                side_effect=[failed_resume_1, capped, failed_resume_2, ok_result],
+            ) as mock_invoke,
+            patch('shared.cli_invoke.asyncio.sleep', new_callable=AsyncMock),
+        ):
+            got = await invoke_with_cap_retry(
+                gate, 'test-label',
+                prompt='do stuff',
+                resume_session_id='sess-lost',
+            )
+
+        assert mock_invoke.call_count == 4
+        # Call 1 armed the caller's resume; call 3 armed the cap-hit re-resume.
+        assert mock_invoke.call_args_list[0].kwargs.get('resume_session_id') == 'sess-lost'
+        assert mock_invoke.call_args_list[2].kwargs.get('resume_session_id') == 'sess-capped'
+        assert got is ok_result
+        assert got.resume_fallbacks == 2
+
+    async def test_no_resume_leaves_counter_zero(self):
+        """A plain invocation with no ``--resume`` leaves the default 0.
+
+        Every existing caller must see an unchanged result shape: the field is
+        additive, and a non-resumed invocation can never have lost a resume.
+        """
+        gate = make_gate_mock(detect_cap_hit=MagicMock(return_value=False))
+        ok_result = _make_result()
+
+        with patch(
+            'shared.cli_invoke.invoke_claude_agent',
+            new_callable=AsyncMock,
+            return_value=ok_result,
+        ):
+            got = await invoke_with_cap_retry(gate, 'test-label', prompt='do stuff')
+
+        assert got is ok_result
+        assert got.resume_fallbacks == 0
+
+    async def test_failed_resume_that_is_never_retried_still_reports_zero(self):
+        """Scope check: the counter counts FALLBACKS taken, not resumes armed.
+
+        A resumed invocation that SUCCEEDS took no fallback, so nothing was
+        lost and the count stays 0 — the orchestrator must not emit a
+        ``session_resume_failed`` event for a resume that worked.
+        """
+        gate = make_gate_mock(detect_cap_hit=MagicMock(return_value=False))
+        ok_result = _make_result()
+
+        with patch(
+            'shared.cli_invoke.invoke_claude_agent',
+            new_callable=AsyncMock,
+            return_value=ok_result,
+        ):
+            got = await invoke_with_cap_retry(
+                gate, 'test-label', prompt='do stuff', resume_session_id='sess-ok',
+            )
+
+        assert got.resume_fallbacks == 0
+
+@pytest.mark.asyncio
 class TestResumeDiscardProgressTimeout:
     """Regression for reify-4827 (task 2360 fix #2): a RESUMED invocation that
     hit the working-regime ceiling but made real agentic progress
