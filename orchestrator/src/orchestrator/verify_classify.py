@@ -285,6 +285,147 @@ _SLOT_ACQUIRE_DEADLINE_RE = re.compile(
     re.MULTILINE,
 )
 
+# task 4492 — run_all.sh suite framing, used ONLY by
+# `_redact_passed_suite_blocks` below to scope guard 3. Declared locally
+# rather than imported from `merge_shadow`/`offline_lane` (which parse
+# sibling run_all markers): this module is deliberately self-contained per
+# its docstring above, and `merge_shadow` is a much heavier module on a
+# different layer — importing it from the classifier would invert that
+# dependency for two one-line patterns.
+#
+# The OPEN pattern is anchored at hard column 0 with NO leading-whitespace
+# tolerance, matching how run_all emits it. That is not an oversight: reify
+# suites that assert on run_all's own output contract quote `--- Running: `
+# inside INDENTED `  PASS: ...` assertion prose (two such lines in the
+# task-4492 sample log), and column-0 anchoring excludes them for free.
+#
+# The CLOSE pattern uses the `^[ \t]*` tolerance of the ANCHORING CONTRACT
+# note above (cf. `_SLOT_ACQUIRE_DEADLINE_RE`, `verify._match_clock_marker`):
+# run_all emits two leading spaces, and verify output is aggregated from
+# wrappers that routinely indent captured sub-output. It adopts the shape
+# already source-verified in `offline_lane._INFRA_RESULT_FAIL_RE`, widened to
+# PASS|FAIL|SKIP, and stops before any trailing
+# ` [flaky: passed on serial retry]` suffix (run_all.sh:1792).
+_RUN_ALL_SUITE_OPEN_RE = re.compile(r'^--- Running: (?P<name>.+?) ---[ \t]*$')
+_RUN_ALL_SUITE_CLOSE_RE = re.compile(
+    r'^[ \t]*RESULT: (?P<verdict>PASS|FAIL|SKIP) \((?P<name>[^)]+)\)'
+)
+
+
+def _redact_passed_suite_blocks(output: str) -> str:
+    """Blank the interior of every aggregated-runner suite block that closed
+    with a PASS, leaving every other byte of *output* untouched.
+
+    WHY THIS EXISTS (task 4492, the 4th recurrence of its class — siblings
+    2748 / 2821 / 3677+3679 / 4212). When a verify leg runs reify's
+    ``tests/infra/run_all.sh``, its output is the CONCATENATION of ~146
+    independent suites. Suites that TEST the slot/lock machinery necessarily
+    EXECUTE the real emitter, so their transcripts contain genuine,
+    column-0, byte-identical-to-production marker lines while reporting zero
+    failures. reify 5623 was held blocked 2026-08-09 -> 08-19 under a false
+    ``SEMAPHORE_TIMEOUT`` L1 on exactly that basis; the real cause was a
+    ``test_reify_audit_ptodo.sh`` PTODO ratchet failure named in the same
+    log's tail. No line-anchoring rule can separate those markers from a host
+    event — task 3679 already closed the mid-line-prose vector and these
+    survive it — because positionally they ARE production emissions. Only the
+    surrounding PASS attestation distinguishes them.
+
+    PRODUCER CONTRACT (reify tests/infra/run_all.sh @ c09a26b5b1), emitted
+    identically by all four paths — H2 concurrent pool (:1772, :1792-1806),
+    legacy all-serial fallback (:1840-1850), member-subset (:1274,
+    :1293-1308, the only SKIP emitter), and H9 (:1222, :1226-1228)::
+
+        --- Running: <name> ---                 (open, column 0)
+          RESULT: (PASS|FAIL|SKIP) (<name>)     (close, optional trailing
+                                                 " [flaky: passed on serial retry]")
+
+    BLOCKS ARE ATOMIC EVEN UNDER THE CONCURRENT POOL. Phase 2 buffers each
+    member's output to its own file; Phase 3 (:1767-1810) replays it under
+    its own header in discovered order via ``_ra_emit_sanitized``. So
+    concurrency cannot interleave two blocks, and a simple single-pass
+    open/close walk is sufficient. Retried members archive BOTH attempts
+    under ONE header, delimited by ``--- attempt 1 (concurrent pool) ---`` /
+    ``--- attempt 2 (serial retry) ---``; those deliberately do not match
+    ``^--- Running: `` (run_all.sh says so at :1776, to preserve its
+    one-header-per-discovered-test contract), so they are ordinary interior
+    lines here too.
+
+    FAIL-SAFE DIRECTION — the property that bounds this function's blast
+    radius. A region is redacted ONLY on a positive PASS attestation whose
+    close names the SAME suite as its open. Every other shape redacts
+    NOTHING and therefore degrades to the exact whole-output behaviour that
+    predates this function:
+
+    * ``FAIL`` — the failing suite's block is the one region that certainly
+      does carry evidence about the failure.
+    * ``SKIP`` — a skipped suite never asserted the host was healthy, so it
+      is treated as not-attested rather than as passed.
+    * NAME MISMATCH — the nesting guard. reify ships suites that test
+      run_all.sh itself and can replay its transcript; without the name
+      check a nested ``RESULT: PASS (inner)`` could close, and thus silently
+      delete the evidence inside, an OUTER block. A mismatch leaves the
+      block pending instead.
+    * UNCLOSED BLOCK (EOF, or a second open header first) — an aborted run
+      is precisely where a genuine host event surfaces, so it is never
+      treated as attested. A second open header REPLACES the pending one.
+    * NO RECOGNISED FRAMING — non-reify projects and every non-aggregated
+      tool are untouched, and this returns the INPUT OBJECT itself.
+
+    Consequently the transform can only ever REMOVE text, so a caller
+    reading the result can only ever detect LESS than it does today — never
+    more. That is what makes wiring it into guard 3's POSITIVE detectors
+    (`_classify_environmental`) safe in exactly one direction.
+
+    Splitting is on ``'\\n'`` EXPLICITLY, not ``str.splitlines``: ``^`` under
+    ``re.MULTILINE`` breaks only on ``\\n``, while ``splitlines()`` also breaks
+    on ``\\x0b``/``\\x0c``/``\\x1c``-``\\x1e``/``\\x85``/``\\u2028``/``\\u2029`` — a form
+    feed anywhere in a 900 KB merged-stderr verify log would desync this
+    function's line view from the very regexes it exists to scope.
+    ``split('\\n')``/``'\\n'.join()`` also round-trips byte-exactly on every
+    input, including the empty string and text with or without a trailing
+    newline, so "only removes text" is structurally true rather than
+    case-analysed. Redacted lines are BLANKED rather than deleted, which
+    keeps the result line-addressable against the original during triage and
+    cannot create a new adjacency between two previously-separated lines.
+    """
+    lines = output.split('\n')
+    open_index: int | None = None
+    open_name: str | None = None
+    redacted = False
+
+    for index, line in enumerate(lines):
+        opened = _RUN_ALL_SUITE_OPEN_RE.match(line)
+        if opened is not None:
+            # A second header before any close REPLACES the pending block;
+            # the earlier one is never redacted (fail-safe).
+            open_index = index
+            open_name = opened.group('name')
+            continue
+
+        closed = _RUN_ALL_SUITE_CLOSE_RE.match(line)
+        if closed is None or open_index is None:
+            continue
+        if closed.group('name') != open_name:
+            # Nesting guard: leave the block PENDING on a name mismatch, so
+            # a replayed inner transcript cannot close an outer block.
+            continue
+
+        if closed.group('verdict') == 'PASS':
+            for interior in range(open_index + 1, index):
+                if lines[interior]:
+                    lines[interior] = ''
+                    redacted = True
+        # Any name-matching close ends the block, PASS/FAIL/SKIP alike.
+        open_index = None
+        open_name = None
+
+    if not redacted:
+        # The SAME object, not an equal copy — makes "unframed output is
+        # untouched" an assertable property for callers and tests.
+        return output
+    return '\n'.join(lines)
+
+
 # Broken _merge-verify worktree (task 2756) — a guard script (e.g. reify's
 # check-manifold-deps.sh) that cannot read the ephemeral merge-verify
 # worktree's own Cargo.lock is a broken verify ENVIRONMENT, not a branch
