@@ -507,6 +507,72 @@ class TestUnicodeDigitsAreNotTaskNumbers:
         assert referent.project_id == ''
         assert referent.node_name == expected
 
+    @pytest.mark.parametrize(
+        'name',
+        [
+            # The PROJECT-QUALIFIED half fails identically — measured RED:
+            # parse_node_name('reify:\u0663') returned
+            # Referent(project_id='reify', number='\u0663'). The qualifier
+            # classes were already ASCII-explicit ([A-Za-z][A-Za-z0-9_-]{2,});
+            # the digit capture was the last Unicode-permissive class left in
+            # the vocabulary.
+            'reify:' + ARABIC_INDIC_THREE,
+            'Dark-Factory:' + ARABIC_INDIC_THREE,
+            'reify:' + FULLWIDTH_THREE,
+        ],
+    )
+    def test_qualified_node_name_with_a_unicode_digit_is_not_a_task_label(self, name):
+        assert parse_node_name(name) is None
+
+    def test_a_unicode_digit_qualified_ref_yields_no_referent(self):
+        content = 'see reify:' + ARABIC_INDIC_THREE + ' now'
+        scan = scan_content(content, group_id='dark_factory')
+        assert scan.refs == ()
+        assert scan.ambiguous == ()
+
+    def test_a_qualified_mixed_run_yields_nothing_rather_than_the_truncated_prefix(self):
+        """Where the qualified half is MOST dangerous, and why its right-edge
+        lookahead stays broad too.
+
+        Under the wrong fix — narrowing '(?!\\d)' alongside the capture class —
+        'reify:12\u0663' yields Referent(project_id='reify', number='12'): not
+        mangled junk but a fully well-formed FOREIGN referent pointing at the
+        wrong task, which is exactly the misattribution cross_project_refs' split
+        hook exists to prevent and would instead perform. The local truncation
+        guard costs a rename; this one costs destructive edge surgery onto a real
+        node in another project.
+        """
+        assert parse_node_name('reify:12' + ARABIC_INDIC_THREE) is None
+        scan = scan_content('see reify:12' + ARABIC_INDIC_THREE, group_id='dark_factory')
+        assert scan.refs == ()
+        assert scan.ambiguous == ()
+
+    def test_ascii_qualified_spellings_are_unaffected(self):
+        """Regression guard, green BEFORE and AFTER: the colon padding is
+        untouched.
+
+        That padding is a SEPARATE axis — _QUALIFIED_NODE_NAME_PATTERN's '\\s*'
+        colon still spans a line break, tracked as task 4235 (duplicate filing
+        4239) and explicitly scoped out of this change. Narrowing the digit class
+        must not opportunistically fold it in, and these four spellings are what
+        proves it did not.
+        """
+        for content in (
+            'dark_factory:2500',
+            'dark_factory: 2500',
+            'dark_factory :2500',
+            'dark_factory\t:\t2500',
+        ):
+            assert [r.node_name for r in scan_content(content, group_id='reify').refs] == [
+                'dark_factory:2500'
+            ], content
+        assert parse_node_name('reify:132') == Referent(
+            kind='task', project_id='reify', number='132'
+        )
+        assert parse_node_name('Dark-Factory:2500') == Referent(
+            kind='task', project_id='dark_factory', number='2500'
+        )
+
 
 class TestQualifiedRefNeverSpansALineBreak:
     """The PROJECT-QUALIFIED pattern's colon is padded with '[ \\t]', not '\\s',
