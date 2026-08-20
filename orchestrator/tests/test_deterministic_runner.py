@@ -1300,6 +1300,87 @@ class TestHumanCuratorGateAdjudicationGuard:
         assert ast.literal_eval(kw['metadata_mode']) == 'merge'
         assert list(ast.literal_eval(kw['metadata'])) == ['human_curator_adjudicated_at']
 
+    async def test_curator_remediation_snippet_survives_a_scheduler_without_project_root(
+        self, tmp_path: Path,
+    ):
+        """A scheduler with no usable project_root must still file a VALID escalation.
+
+        The runner's ``scheduler`` collaborator is duck-typed and unannotated —
+        ``Harness._run_deterministic_slot`` constructs the runner "with only the
+        minimal dependencies needed" — so reading an attribute CHAIN off it is a
+        real production failure surface, not test paranoia.  This method's
+        contract (see its docstring) is that a durable on-disk safety escalation
+        is filed no matter what: an ``AttributeError`` raised while formatting
+        runbook PROSE must never convert a BLOCK into a propagated exception,
+        exactly as ``test_blocked_writeback_failure_still_returns_blocked`` pins
+        for the sibling writeback path.
+
+        Two shapes, because they fail differently:
+
+        1. A bare ``MagicMock`` scheduler with nothing set on ``.config`` — the
+           chain RESOLVES, to a Mock, which f-string-interpolates into
+           operator-facing text as ``<MagicMock id=...>``.
+        2. A minimal stand-in with genuinely NO ``config`` attribute — the chain
+           RAISES.
+
+        Both must degrade to a VISIBLE ``<project_root>`` placeholder, which
+        keeps the call syntactically valid and still NAMES the required
+        parameter — strictly better than omitting it.
+        """
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        class _MinimalScheduler:
+            """A scheduler-shaped collaborator with NO ``config`` at all."""
+
+            def __init__(self, task: dict) -> None:
+                self._task = task
+                self.set_task_status = AsyncMock()
+                self.update_task = AsyncMock(return_value=True)
+                self.get_task = AsyncMock(return_value=task)
+
+        for label in ('mock-config', 'no-config'):
+            task = _curator_gate_task(
+                task_id='3181',
+                gate_escalated_at='2026-07-30T16:30:28.993178+00:00',
+            )
+            queue = EscalationQueue(tmp_path / label)
+            _seed_resolved_gate(queue, '3181')
+
+            if label == 'mock-config':
+                # .config.project_root auto-creates a Mock — resolves, wrong type.
+                scheduler = _mock_scheduler(task)
+                assert not isinstance(scheduler.config.project_root, (str, Path))
+            else:
+                scheduler = _MinimalScheduler(task)
+                assert not hasattr(scheduler, 'config')
+
+            runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+
+            outcome = await runner.run(_make_assignment(task))
+            assert outcome == WorkflowOutcome.BLOCKED, (
+                f'[{label}] a degraded scheduler must not turn a durable BLOCK '
+                f'into a propagated exception'
+            )
+
+            pending = queue.get_by_task(
+                '3181', status='pending', agent_role='orchestrator-deterministic',
+            )
+            assert len(pending) == 1, f'[{label}] the safety escalation must stay durable'
+            esc = pending[0]
+            assert esc.category == 'curator_adjudication_missing', f'[{label}]'
+
+            kw = _parse_update_task_snippet(esc.detail)
+            assert set(kw) == {'id', 'project_root', 'metadata', 'metadata_mode'}, f'[{label}]'
+            assert ast.literal_eval(kw['id']) == '3181', f'[{label}]'
+            assert ast.literal_eval(kw['project_root']) == '<project_root>', (
+                f'[{label}] an unusable project_root must degrade to a visible '
+                f'placeholder naming the required parameter'
+            )
+            assert 'MagicMock' not in esc.detail, (
+                f'[{label}] an operator must never be handed a mock repr'
+            )
+
     async def test_curator_gate_with_zero_records_still_refiles_milestone_gate(
         self, tmp_path: Path,
     ):
