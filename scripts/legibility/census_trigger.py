@@ -99,8 +99,8 @@ it keeps the pure decision core fully unit-testable and makes "a failing
 get_statuses fails SAFE" testable with a raising fake regardless of what is
 listening. An MCP client is importable here too, symmetrically with httpx:
 `fastmcp>=3.2` is a direct dependency of `shared` (shared/pyproject.toml,
-task 3689), and fastmcp 3.2.2 requires `mcp<2.0,>=1.24`, so `mcp` 1.27.0
-and `mcp.client.streamable_http` both resolve under `uv run --project
+task 3689), and fastmcp in turn depends on `mcp`, so `mcp` and
+`mcp.client.streamable_http` both resolve under `uv run --project
 shared` -- a hardcoded MCP client would run here too, and would really
 reach whatever is listening. So, as with httpx, this seam's rationale rests
 on DETERMINISM ALONE -- a pure, unit-testable decision core and a fail-safe
