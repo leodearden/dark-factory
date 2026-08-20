@@ -296,15 +296,20 @@ class Finding:
 
     ``None`` is a THIRD state, distinct from ``()``: NOT ENUMERATED. It
     serializes to JSON ``null``, which no consumer can misread as a measured
-    zero, and it is what ``_run`` records when no reader resolved for the
-    finding's graph or the edge query raised. ``()`` keeps its one meaning —
-    queried, and no edges found. ``edges_unqueried`` carries the same fact as a
-    boolean so the condition is greppable in the committed artifact without
-    inferring it from a null.
+    zero, and it is what ``_run`` records when EVERY targeted graph's edge scan
+    raised. ``()`` keeps its one meaning — queried, and no edges found.
+    ``edges_unqueried`` carries the same fact as a boolean so the condition is
+    greppable in the committed artifact without inferring it from a null.
 
+    Edges are enumerated by EPISODE UUID across every swept ``--project``
+    graph, not only the graph the record was read from and the graph its
+    ``group_id`` names: an episode's derived edges live in the graph its
+    ingest ran against, which can be neither of those two.
     ``edges_enumerated_in`` names the graphs that actually ANSWERED for this
-    finding, so an empty list is readable as "asked here, found nothing" rather
-    than having to be inferred from the report's projects list.
+    finding, so an empty list is readable as "asked in these graphs, found
+    nothing" rather than having to be inferred from the report's projects
+    list. A graph never passed to ``--project`` is not read at all, so an
+    empty list bounds the claim to the graphs named there, not to the store.
     ``to_json`` also derives ``cross_graph`` (``graph_name != project_id``):
     the cross-graph population is exactly the one whose edges can live in a
     graph this sweep may not have read, so a consumer filtering on the edge
@@ -1346,29 +1351,29 @@ async def _run(
     )
 
     # ---- attach the harm artefacts: ONE batched scan per graph ------------- #
-    # Which graphs to ask for each finding. The read-from graph always (keyed
-    # on graph_name, NOT project_id: `readers` is keyed by --project graph
-    # name, and a graph legitimately holds episodes whose group_id differs).
-    # AND the record's own group_id graph when that graph was also swept:
+    # Edges are keyed on the EPISODE UUID, not on any graph, so EVERY swept
+    # --project graph is asked about EVERY flagged episode.
+    #
+    # Why not just the read-from graph and the record's own group_id graph:
     # Graphiti writes an episode's derived edges into the graph its ingest ran
-    # against, which for a cross-graph record is not necessarily the graph the
-    # episode itself landed in — measured, not hypothetical: episode
+    # against, which need not be the graph the node landed in NOR the graph its
+    # group_id names. Measured, not hypothetical: episode
     # a887c958-0018-4715-8817-cf048c187e8d sits in the reify graph with
-    # group_id dark_factory and all 8 of its edges are in dark_factory. Asking
-    # only the read-from graph left the ENTIRE cross-graph population showing
-    # an empty harm-artefact column.
-    targets_by_finding: list[tuple[Finding, tuple[str, ...]]] = []
-    wanted_by_graph: dict[str, set[str]] = {}
-    for finding in findings:
-        candidates = [finding.graph_name]
-        if finding.project_id != finding.graph_name:
-            candidates.append(finding.project_id)
-        targets = tuple(
-            dict.fromkeys(name for name in candidates if name in readers)
-        )
-        for name in targets:
-            wanted_by_graph.setdefault(name, set()).add(finding.record_uuid)
-        targets_by_finding.append((finding, targets))
+    # group_id dark_factory and all 8 of its edges are in dark_factory. A rule
+    # keyed on that "home pair" cannot reach a third graph at all, which left
+    # the cross-graph findings whose group_id names an UNSWEPT graph showing an
+    # empty harm-artefact column that was never actually measured.
+    #
+    # This costs no extra store traffic: the derived-edge query is a full
+    # relationship scan per graph however it is written, and the scan COUNT is
+    # still len(readers) — one batched scan each. Only the $uuids parameter
+    # widens, from a per-graph subset to all flagged uuids.
+    #
+    # Residual bound: a graph NOT passed to --project is still never read, so
+    # an empty list means "none in the graphs named by edges_enumerated_in",
+    # not "none anywhere".
+    targets: tuple[str, ...] = tuple(readers)  # argv order
+    flagged = sorted({f.record_uuid for f in findings})
 
     # None for a graph means its scan did NOT answer; every uuid it was asked
     # about is then NOT ENUMERATED, which is carried through to JSON `null`.
@@ -1376,23 +1381,26 @@ async def _run(
     # un-run query indistinguishable from a measured zero on the report's
     # central harm-artefact column.
     edges_by_graph: dict[str, dict[str, tuple[str, ...]] | None] = {}
-    for graph_name, uuids in sorted(wanted_by_graph.items()):
-        try:
-            edges_by_graph[graph_name] = await readers[
-                graph_name
-            ].fetch_derived_edges_batch(sorted(uuids))
-        except Exception:
-            logger.warning(
-                'derived-edge scan failed in graph %s; %d episode(s) are NOT '
-                'enumerated there', graph_name, len(uuids), exc_info=True,
-            )
-            edges_by_graph[graph_name] = None
+    if flagged:  # no findings -> no scan at all
+        for graph_name in targets:
+            try:
+                edges_by_graph[graph_name] = await readers[
+                    graph_name
+                ].fetch_derived_edges_batch(flagged)
+            except Exception:
+                logger.warning(
+                    'derived-edge scan failed in graph %s; %d episode(s) are '
+                    'NOT enumerated there', graph_name, len(flagged),
+                    exc_info=True,
+                )
+                edges_by_graph[graph_name] = None
+
+    answered = tuple(
+        name for name in targets if edges_by_graph.get(name) is not None
+    )
 
     enriched: list[Finding] = []
-    for finding, targets in targets_by_finding:
-        answered = tuple(
-            name for name in targets if edges_by_graph.get(name) is not None
-        )
+    for finding in findings:
         edges: tuple[str, ...] | None
         if not answered:
             logger.warning(

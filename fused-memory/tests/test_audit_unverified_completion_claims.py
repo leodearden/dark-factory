@@ -1154,15 +1154,20 @@ class TestDerivedEdgeLookupKeying:
         assert finding['graph_name'] == 'dark_factory'
         assert report['summary']['by_project'] == {'know_live': 1}
 
-    async def test_unresolved_reader_is_null_not_an_empty_list(
-        self, capsys, caplog
+    async def test_unread_home_graph_is_never_claimed_as_enumerated(
+        self, capsys
     ) -> None:
-        """NOT ENUMERATED and NO EDGES FOUND are different facts.
+        """A row must never OVERSTATE its coverage.
 
-        A --project dropped from the argv leaves a finding whose graph has no
-        reader. Serializing that as ``[]`` makes it indistinguishable in the
-        committed artifact from an episode genuinely free of derived edges —
-        a silent fail-soft, on the report's central harm-artefact column.
+        The record was READ FROM a graph (``reify``) that this run never
+        swept. Edges are now enumerated across every swept graph keyed on the
+        episode uuid, so ``dark_factory`` IS asked and the answer is a real
+        measurement — but ``edges_enumerated_in`` must name only the graph
+        that actually answered. Naming ``reify`` there would claim coverage of
+        a graph this run never opened.
+
+        The null-vs-``[]`` invariant this test used to guard is pinned by
+        ``test_reader_that_raises_is_null_not_an_empty_list`` below.
         """
         reader = _FakeReader(
             [
@@ -1170,22 +1175,23 @@ class TestDerivedEdgeLookupKeying:
                     uuid='ep-orphan',
                     text=ESC_3085_1_INSTANCE_1,
                     project_id='reify',
-                    graph_name='reify',  # not among --project, so no reader
+                    graph_name='reify',  # not among --project
                 )
             ],
+            edges={'ep-orphan': ('edge-in-dark-factory',)},
         )
-        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
-            _code, report = await self._run_capture(
-                capsys, reader, _probes(task_status='in-progress')
-            )
+        _code, report = await self._run_capture(
+            capsys, reader, _probes(task_status='in-progress')
+        )
         assert report is not None
         finding = report['findings'][0]
-        assert finding['derived_edge_uuids'] is None
-        assert finding['edges_unqueried'] is True
-        assert reader.edge_lookups == []
-        # Every other degradation path in this module warns; this one must too.
-        assert 'ep-orphan' in caplog.text
-        assert 'reify' in caplog.text
+        # The swept graph IS asked — this is a measurement, not a null.
+        assert reader.edge_lookups == ['ep-orphan']
+        assert finding['derived_edge_uuids'] == ['edge-in-dark-factory']
+        assert finding['edges_unqueried'] is False
+        # ...but coverage is claimed ONLY for the graph that answered.
+        assert finding['edges_enumerated_in'] == ['dark_factory']
+        assert 'reify' not in finding['edges_enumerated_in']
 
     async def test_reader_that_raises_is_null_not_an_empty_list(
         self, capsys, caplog
@@ -1372,20 +1378,22 @@ class TestDerivedEdgeLookupKeying:
         """The denominator of un-enumerated findings is visible without
         diffing the list — the same no-silent-caps discipline as
         ``truncated_by``."""
-        reader = _FakeReader(
+        # Every swept graph is now asked, so a reader-less graph no longer
+        # manufactures an unqueried finding. The remaining way to get one is
+        # the real degradation: the scan RAISES, so no graph answers.
+        reader = _ExplodingEdgeReader(
             [
-                _record(uuid='ep-seen', text=ESC_3085_1_INSTANCE_1,
+                _record(uuid='ep-a', text=ESC_3085_1_INSTANCE_1,
                         project_id='know_live', graph_name='dark_factory'),
-                _record(uuid='ep-orphan', text=ESC_3085_1_INSTANCE_1,
-                        project_id='reify', graph_name='reify'),
+                _record(uuid='ep-b', text=ESC_3085_1_INSTANCE_1,
+                        project_id='reify', graph_name='dark_factory'),
             ],
-            edges={'ep-seen': ('edge-1',)},
         )
         _code, report = await self._run_capture(
             capsys, reader, _probes(task_status='in-progress')
         )
         assert report is not None
-        assert report['summary']['edges_unqueried'] == 1
+        assert report['summary']['edges_unqueried'] == 2
         assert report['summary']['mismatch'] == 2
 
 
