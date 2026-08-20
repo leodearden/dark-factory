@@ -1404,6 +1404,73 @@ class TestDerivedEdgeLookupKeying:
         assert finding['derived_edge_uuids'] is None
         assert finding['edges_unqueried'] is True
 
+    async def test_partial_coverage_names_the_graph_that_did_not_answer(
+        self, capsys
+    ) -> None:
+        """PARTIAL coverage is a THIRD state, and must be visible on the row.
+
+        Some graph answered, so the edge list is a real measurement and NOT a
+        null — but it is a measured LOWER BOUND, not the whole story. Leaving
+        the hole to be inferred by differencing edges_enumerated_in against
+        report['projects'] is exactly the silent fail-soft the null state
+        exists to prevent, one level up.
+        """
+        episode = 'ep-partial'
+        reify_reader = _FakeReader(
+            [
+                _record(
+                    uuid=episode,
+                    text=ESC_3085_1_INSTANCE_1,
+                    project_id='reify',
+                    graph_name='reify',
+                )
+            ],
+            edges={episode: ('edge-in-reify',)},
+        )
+        # Contributes no records, but blows up on the edge scan.
+        dark_reader = _ExplodingEdgeReader([])
+        readers = {'reify': reify_reader, 'dark_factory': dark_reader}
+
+        code = await _run(
+            _args(project=['reify', 'dark_factory']),
+            reader_factory=lambda project: readers[project],
+            probes=_probes(task_status='in-progress'),
+        )
+        report = json.loads(capsys.readouterr().out)
+        assert code == 0
+        finding = report['findings'][0]
+        # A graph DID answer, so this is a measurement, not a null.
+        assert finding['derived_edge_uuids'] == ['edge-in-reify']
+        assert finding['edges_unqueried'] is False
+        assert finding['edges_enumerated_in'] == ['reify']
+        # ...and the row STATES its own coverage hole.
+        assert finding['edges_unqueried_in'] == ['dark_factory']
+        # The two counters are DISJOINT.
+        assert report['summary']['edges_partial'] == 1
+        assert report['summary']['edges_unqueried'] == 0
+
+    async def test_fully_covered_finding_is_not_counted_as_partial(
+        self, capsys
+    ) -> None:
+        """The new key is ALWAYS present, so [] reads as "no hole".
+
+        A key that appeared only when non-empty would read as absent rather
+        than as a measured zero — the same discipline as ``truncated_by``.
+        """
+        reader = _FakeReader(
+            [_record(uuid='ep-1', text=ESC_3085_1_INSTANCE_1,
+                     project_id='dark_factory', graph_name='dark_factory')],
+            edges={'ep-1': ('edge-1',)},
+        )
+        _code, report = await self._run_capture(
+            capsys, reader, _probes(task_status='in-progress')
+        )
+        assert report is not None
+        finding = report['findings'][0]
+        assert finding['edges_unqueried_in'] == []
+        assert report['summary']['edges_partial'] == 0
+        assert report['summary']['edges_unqueried'] == 0
+
     async def test_group_id_graph_not_swept_is_enumerated_where_it_can_be(
         self, capsys
     ) -> None:
