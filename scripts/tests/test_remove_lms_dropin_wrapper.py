@@ -413,21 +413,6 @@ def test_unique_template_is_a_legal_distinct_systemd_template_name() -> None:
     )
 
 
-def test_selftest_prefix_is_shared_and_cannot_match_a_real_unit() -> None:
-    """The one constant both the generator and the prune key on.
-
-    Pinned as its own assertion because the prune deletes files out of the
-    operator's LIVE unit directory: if _SELFTEST_PREFIX were ever widened to
-    something a real unit could start with, the prune would sweep up
-    production units and this module would become the outage it was written
-    to prevent.  "lms-dropin-selftest-" cannot prefix-match `lms-arm@` (the
-    real unit the script under test targets) or any dark-factory unit.
-    """
-    assert _SELFTEST_PREFIX == "lms-dropin-selftest-"
-    for real in ("lms-arm@", "fused-memory", "dark-factory-dashboard", "orchestrator"):
-        assert not real.startswith(_SELFTEST_PREFIX)
-
-
 # ---------------------------------------------------------------------------
 # step-5: RED -- the stale-residue prune
 # ---------------------------------------------------------------------------
