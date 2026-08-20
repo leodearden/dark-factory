@@ -404,8 +404,13 @@ _REASON_EXPLANATIONS: dict[str, str] = {
     ),
     'effect_absent': (
         "The evidence commit's own effect is not present at current main "
-        'HEAD (FIX 1\', task 2500/2675) — a later commit on main reverted '
-        'exactly the paths it touched, so the ancestry is real but stale.'
+        "HEAD (FIX 1', task 2500/2675) — the paths it touched no longer "
+        'match main HEAD. This means EITHER a later commit reverted them OR '
+        'they simply evolved further (another already-landed task\'s '
+        'follow-up edit, or a merge whose branch predates an unrelated '
+        'change to a co-touched file); this check CANNOT distinguish the '
+        'two. Judge the diverged paths below: if none of them is this '
+        "task's deliverable, this is skew, not a revert."
     ),
 }
 
@@ -435,23 +440,93 @@ def format_unattributed_landing_detail(
     explanation = _REASON_EXPLANATIONS.get(
         verdict.reason, f'Unrecognized reason code: {verdict.reason}',
     )
+    divergence_block, summary_fragment = _render_effect_divergence(verdict)
     summary = (
         f'Task {task_id}: landing evidence on branch {branch!r} could not '
-        f'be attributed ({verdict.reason})'
+        f'be attributed ({verdict.reason}){summary_fragment}'
     )[:200]
     detail = (
         f'validate_landing_evidence rejected the landing evidence for task '
         f'{task_id} on branch {branch!r}.\n\n'
         f'reason: {verdict.reason}\n'
         f'{explanation}\n\n'
+        f'{divergence_block}'
         f'probe: {verdict.probe}\n\n'
-        'The task was NOT marked done and remains pending — it will be '
-        're-evaluated on the next dispatch tick. If this landing is '
-        'genuine, investigate why attribution/effect-present failed (e.g. '
-        'a reverted merge, an unattributed commit, or a missing '
+        'The task was NOT marked done. It is left pending (or flipped to '
+        'pending by the coalesce re-drive, from merge-deferred), which means '
+        'it will be DISPATCHED TO AN AGENT on the next dispatch tick — a '
+        'full plan/verify/review cycle, not a cheap idempotent re-check. If '
+        'this landing is genuine, that dispatch is pure waste and will '
+        'REPEAT every tick, because this condition does not heal on its own. '
+        'Investigate why attribution/effect-present failed (e.g. ordinary '
+        'later evolution of the touched paths, a branch-alias landing, a '
+        'genuine reverted merge, an unattributed commit, or a missing '
         'task-citing commit); resolve this escalation once confirmed.'
     )
     return summary, detail
+
+
+def _render_effect_divergence(
+    verdict: LandingEvidenceVerdict,
+) -> tuple[str, str]:
+    """Render the effect_absent divergence diagnostics (task 3116).
+
+    Returns a ``(detail_block, summary_fragment)`` pair; both are empty
+    strings for any reason other than ``'effect_absent'`` and for a legacy
+    ``probe={}`` that predates the diagnostics, so a caller constructing
+    either still renders cleanly.
+
+    The labelled block is the point: the raw ``probe: {...}`` dict repr
+    already contained the paths, but nothing pointed a reader at them.
+    Naming them under a header is the one line that resolves the
+    "is this a revert or just skew?" question the reason prose now poses.
+    """
+    if verdict.reason != 'effect_absent':
+        return '', ''
+    probe = verdict.probe
+    if 'diverged_paths' not in probe:
+        return '', ''
+
+    paths = probe['diverged_paths']
+    if paths is None:
+        error = probe.get('effect_probe_error', '<no detail recorded>')
+        return (
+            f'diverged paths could not be determined: {error}\n\n'
+        ), ''
+
+    if not paths:
+        failure = probe.get('effect_failure')
+        if failure:
+            return (
+                'no path divergence recorded — the effect check failed '
+                f'structurally: {failure}\n\n'
+            ), ''
+        # The decision said absent but the re-probe says present: main HEAD
+        # advanced between the two calls.  Render the race rather than let
+        # the escalation silently contradict itself.
+        return (
+            'no path divergence recorded — the re-probe found the effect '
+            'present; main HEAD may have advanced between the decision and '
+            'this probe.\n\n'
+        ), ''
+
+    lines = [
+        'diverged paths (touched by the evidence commit, no longer '
+        'matching main HEAD):',
+    ]
+    lines.extend(f'  - {path}' for path in paths)
+    anchor = probe.get('effect_anchor_sha')
+    if anchor:
+        lines.append(f'effect anchor: {anchor}')
+    failure = probe.get('effect_failure')
+    if failure:
+        lines.append(f'effect failure: {failure}')
+    block = '\n'.join(lines) + '\n\n'
+
+    fragment = f'; diverged: {paths[0]}'
+    if len(paths) > 1:
+        fragment += f' +{len(paths) - 1} more'
+    return block, fragment
 
 
 def file_unattributed_landing_escalation(
