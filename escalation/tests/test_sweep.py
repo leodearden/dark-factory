@@ -769,3 +769,30 @@ class TestReapOrphanLocks:
         assert self._disk_snapshot(tmp_path) == before, (
             'dry-run changed disk state — apply=False must be a pure count'
         )
+
+    def test_lock_for_archived_record_is_kept(self, tmp_path: Path):
+        """An archived record's sidecar is NOT an orphan.
+
+        An archived record is still readable via ``get()``/``get_by_task`` and
+        its resolve/dismiss paths still take the sidecar lock, so a lock counts
+        as orphaned only when the record is absent from BOTH tiers.
+        """
+        _write_archive_esc(
+            tmp_path, 'esc-1-1', '2026-05-20T10:00:00+00:00', 'resolved'
+        )
+        lock_path = _write_lock(tmp_path, 'esc-1-1')
+
+        count = sweep.reap_orphan_locks(tmp_path, apply=True)
+
+        assert count == 0, 'a record in the archive tier still owns its lock'
+        assert lock_path.exists(), 'sidecar of an archived record was reaped'
+
+    def test_lock_for_root_record_is_kept(self, tmp_path: Path):
+        """A pending root record's sidecar is NOT an orphan."""
+        _write_root_esc(tmp_path, 'esc-2-1', 'pending')
+        lock_path = _write_lock(tmp_path, 'esc-2-1')
+
+        count = sweep.reap_orphan_locks(tmp_path, apply=True)
+
+        assert count == 0, 'a record in the queue root still owns its lock'
+        assert lock_path.exists(), 'sidecar of a live root record was reaped'
