@@ -21,6 +21,7 @@ The companion source-level sweep at the bottom forbids the construct itself.
 
 from __future__ import annotations
 
+import os
 import re
 
 from setup_host_sections import (
@@ -294,6 +295,57 @@ def test_jcodemunch_adds_the_server_when_the_listing_cannot_be_read(tmp_path):
     assert _ADD_SENTINEL in combined, combined
 
 
+def _path_without_claude(stub_bin):
+    """The stub dir, plus every inherited PATH entry that carries no `claude`.
+
+    `run_section` PREPENDS its stub dir to the inherited PATH, so simply
+    writing no `claude` stub is not enough: on a developer host Claude Code is
+    installed and the section would probe that real one. Dropping only the
+    directories that actually hold a `claude` executable keeps `mkdir` and
+    `cat` — which the preamble and this slice both need — while making
+    `command -v claude` fail deterministically rather than per-host.
+    """
+    kept = [
+        entry
+        for entry in os.environ.get("PATH", "").split(os.pathsep)
+        if entry and not os.access(os.path.join(entry, "claude"), os.X_OK)
+    ]
+    return os.pathsep.join([str(stub_bin), *kept])
+
+
+def test_jcodemunch_block_is_inert_on_a_host_with_no_claude(tmp_path):
+    """A host without Claude Code installed skips the block: no failure, no claim.
+
+    setup-host.sh keeps the `claude mcp list` capture INSIDE the
+    `command -v claude` guard and says so in a comment; every other test here
+    supplies a `claude` stub, so the case that placement was chosen for went
+    unexercised. What this pins from the outside: the section exits 0 and
+    claims neither "already in user config" nor "added to user config".
+
+    That is the whole observable contract, and it is deliberately not
+    overstated — a hoist that kept its `|| true` is invisible from out here,
+    because a capture of a missing binary yields the same empty string. What
+    it DOES catch is the two ways the block stops being inert: a capture
+    hoisted without `|| true` (a failed simple command mid-bootstrap under
+    `set -e`), and a guard dropped altogether, which reaches `claude mcp add`
+    and exits 127.
+    """
+    result = _run_probe(
+        tmp_path,
+        slice_section(_JCODEMUNCH_START, _JCODEMUNCH_END),
+        env_extra={"PATH": _path_without_claude(stub_bin_dir(tmp_path))},
+    )
+
+    combined = result.stdout + result.stderr
+    assert result.returncode == 0, combined
+    # Positive first: three absence assertions over a slice that never ran are
+    # a vacuous green, and the restricted PATH is exactly what could cause it.
+    assert "Project config written" in combined, combined
+    assert "jcodemunch MCP already in user config" not in combined, combined
+    assert "jcodemunch MCP added to user config" not in combined, combined
+    assert _ADD_SENTINEL not in combined, combined
+
+
 # --- section 12: the FalkorDB health check ---------------------------------
 # The twin of the section-2 wait loop, minus the retry. Both anchors are code,
 # unique, and survive the fix.
@@ -345,23 +397,41 @@ def test_section_12_reports_not_responding_when_the_producer_says_nothing(tmp_pa
 
 
 # --- the file-scoped contract ----------------------------------------------
-# Any `-`-flag cluster containing `q` on the grep at the end of a pipe, so
-# `-q`, `-qF`, `-Fq` and `-i -q` are all caught. Deliberately does NOT match a
-# bare `| grep -F`.
-_GREP_Q_PIPE = re.compile(r"\|\s*grep\s+(?:-[A-Za-z]+\s+)*-[A-Za-z]*q")
+# A grep on the receiving end of a pipe, plus its arguments up to the end of
+# THAT command: `[^|;&)]*` stops at the next pipeline stage, at a `;` or `&&`,
+# and at the close of a command substitution, so a `-q` belonging to some later
+# command on the same line is never read as this grep's.
+_GREP_PIPE = re.compile(r"\|\s*grep\s+(?P<args>[^|;&)]*)")
+
+# Every spelling of "exit on the first match and close the read end": the short
+# clusters (`-q`, `-qF`, `-Fq`, `-iq`) and GNU's long forms. Matched against
+# whole TOKENS rather than positionally, which is what lets a flag taking an
+# argument sit in between — `grep -e PONG --quiet` is the same defect as
+# `grep -q PONG` and the sweep must see both. Deliberately does NOT match a
+# bare `| grep -F`, which reads its input to the end and cannot SIGPIPE the
+# producer.
+_QUIET_FLAG = re.compile(r"-[A-Za-z]*q[A-Za-z]*|--quiet|--silent")
+
+
+def _pipes_into_quiet_grep(line):
+    """True when *line* feeds a producer into a grep that exits on first match."""
+    return any(
+        any(_QUIET_FLAG.fullmatch(token) for token in match.group("args").split())
+        for match in _GREP_PIPE.finditer(line)
+    )
 
 
 def _grep_q_offenders(source):
-    """Every non-comment line of *source* piping a producer into `grep -q`."""
+    """Every non-comment line of *source* piping a producer into a quiet grep."""
     return [
         (n, line)
         for n, line in enumerate(source.splitlines(), start=1)
-        if not line.strip().startswith("#") and _GREP_Q_PIPE.search(line)
+        if not line.strip().startswith("#") and _pipes_into_quiet_grep(line)
     ]
 
 
 def test_setup_host_never_pipes_a_producer_into_grep_q():
-    """No code line may decide anything through `producer | grep -q PAT`.
+    """No code line may decide anything through `producer | grep --quiet PAT`.
 
     Generalises scripts/tests/test_lms_ctl.py::
     test_installer_never_pipes_systemctl_into_grep to this file. The `pipefail`
@@ -369,9 +439,13 @@ def test_setup_host_never_pipes_a_producer_into_grep_q():
     without it there is no defect here and the sweep below would be guarding
     nothing.
 
-    Scoped to `grep -q` ONLY. `| grep -F ... || true` inside a command
-    substitution is a different, already-guarded shape (the `|| true` is what
-    makes it safe) and is deliberately not swept in.
+    Scoped to greps that EXIT ON FIRST MATCH — every spelling of that, short
+    cluster or long flag, since they share one defect. `| grep -F ... || true`
+    inside a command substitution is a different, already-guarded shape (the
+    `|| true` is what makes it safe, and a non-quiet grep drains its input
+    rather than SIGPIPE-ing the producer), so it is deliberately not swept in.
+    Neither is a `grep -q` reading a FILE rather than a pipe: with no producer
+    upstream there is nothing for `pipefail` to conflate.
 
     This forbids one known-defective construct and mandates no replacement
     spelling — `[[ ]]`, `case`, or a `<<<` here-string are all still open to a
@@ -395,14 +469,25 @@ def test_the_grep_q_sweep_detects_a_planted_pipeline():
     Passes on arrival — it pins the mechanism, not the product behaviour.
     """
     planted = (
-        'if foo | grep -q BAR; then\n'
-        'if foo | grep -qF BAR; then\n'
-        'if foo | grep -Fq BAR; then\n'
-        'if foo | grep -i -q BAR; then\n'
+        "if foo | grep -q BAR; then\n"
+        "if foo | grep -qF BAR; then\n"
+        "if foo | grep -Fq BAR; then\n"
+        "if foo | grep -i -q BAR; then\n"
+        # The long forms. `grep --quiet` reintroduces this task's exact defect
+        # and reads as innocuous, so it is pinned by the same mechanism as the
+        # short flags rather than left to a docstring claim.
+        "if foo | grep --quiet BAR; then\n"
+        "if foo | grep --silent BAR; then\n"
+        # A flag carrying an argument in between must not hide the quiet one.
+        "if foo | grep -e BAR --quiet; then\n"
     )
-    assert len(_grep_q_offenders(planted)) == 4, _grep_q_offenders(planted)
+    assert len(_grep_q_offenders(planted)) == 7, _grep_q_offenders(planted)
 
     # A comment describing the construct is not the construct.
-    assert _grep_q_offenders('  # never write `foo | grep -q BAR` here\n') == []
-    # Nor is a non-`-q` grep, which cannot exit early on a match.
+    assert _grep_q_offenders("  # never write `foo | grep -q BAR` here\n") == []
+    # Nor is a non-quiet grep, which drains its input instead of closing it.
     assert _grep_q_offenders("out=\"$(foo | grep -F 'tag' || true)\"\n") == []
+    # Nor is a `grep -q` over a FILE: no producer upstream, nothing to conflate.
+    assert _grep_q_offenders("if grep -q '^\\[Install\\]' \"$unit\"; then\n") == []
+    # And a `-q` belonging to a LATER command on the line is not this grep's.
+    assert _grep_q_offenders("if foo | grep -F BAR; then bar -q; fi\n") == []
