@@ -711,8 +711,18 @@ def liveness_snapshot_subject_facts(record: dict, core_fact: str) -> dict[str, s
     facts: dict[str, str] = {}
     for subject in liveness_snapshot_subject_task_ids(record):
         pairs = scoped.get(subject)
-        if pairs:
-            facts[subject] = '|'.join(sorted(pairs))
+        # FALLBACK, and the deliberate answer to "how do subjects with no
+        # clause-scoped evidence key": the WHOLE-RECORD union — byte-identical
+        # to what such a subject got before the rescope. Three shapes reach it
+        # (`TestLivenessSubjectFactsFallback`): a ref living only in
+        # `metadata.task_id`/`related_task_ids`, a prose ref whose own clause
+        # carries no readable assignment (real: subject 99 in 1eef7df7), and a
+        # clause boundary landing inside a quoted value. Because the fallback
+        # reproduces today's key exactly, the rescope can only ADD recall —
+        # divergent per-task snapshots now group — and can never remove it, so
+        # it warrants no new `_LIVENESS_DISCLOSURE_KEYS` counter: nothing here
+        # is lost, and a subject dropped instead WOULD be.
+        facts[subject] = '|'.join(sorted(pairs)) if pairs else core_fact
     return facts
 
 
