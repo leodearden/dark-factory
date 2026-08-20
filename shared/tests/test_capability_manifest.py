@@ -251,6 +251,13 @@ class TestManifestCapability:
         cap = ManifestCapability(name='foo', binding='b', verdict='FAIL')
         assert cap.verdict == 'FAIL'
 
+    def test_verdict_open_accepted(self):
+        # OPEN means the binding is deliberately deferred INTO the leaf that
+        # owns it — it is neither a green G3 binding (PASS) nor a
+        # queue-blocking FAIL.
+        cap = ManifestCapability(name='foo', binding='b', verdict='OPEN')
+        assert cap.verdict == 'OPEN'
+
     def test_verdict_outside_vocab_rejected(self):
         with pytest.raises(ValidationError):
             ManifestCapability(name='foo', binding='b', verdict='MAYBE')  # type: ignore[arg-type]
