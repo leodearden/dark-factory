@@ -17,9 +17,13 @@ their test suites assert that structurally. Do not re-introduce a second copy
 of the label pattern anywhere: a vocabulary that exists twice drifts, and the
 drift is invisible until a destructive consumer acts on the stale half.
 
-The same rule governs the vocabulary's character classes, which is why the
-digit captures are ASCII-explicit ('[0-9]', never '\\d') at this one normative
-site rather than re-narrowed per caller. Before that,
+The same rule governs the vocabulary's CAPTURE classes, which is why the digit
+captures are ASCII-explicit ('[0-9]', never '\\d') at this one normative site
+rather than re-narrowed per caller. Scoped to CAPTURES on purpose, and not to
+every class: the '\\s' padding and the '\\w' lookbehinds stay Unicode-broad (see
+the comment on _QUALIFIED_NODE_NAME_PATTERN). The vocabulary is ASCII-explicit
+exactly where a character reaches a consumer as DATA, and broad where it only
+decides whether to refuse. Before that,
 utils/referent_resolution._is_task_number was the only guard enforcing "a
 Unicode digit is not a task id" — it does so with ``isascii() and isdigit()``
 (task 3668) — so the DECLARED path refused what this DERIVED path happily
@@ -130,8 +134,18 @@ _TASK_NODE_NAME_PATTERN = re.compile(
 # The digit class is '[0-9]', NOT '\d', for the reason recorded on
 # _TASK_NODE_NAME_PATTERN above. Measured: 'reify:\u0663' parsed to
 # Referent(project_id='reify', number='\u0663'). The qualifier class was already
-# ASCII-explicit, so the digit capture was the last Unicode-permissive class in
-# the vocabulary.
+# ASCII-explicit, so the digit capture was the last Unicode-permissive CAPTURE
+# class in the vocabulary — captures only, and deliberately so. Every pattern
+# here still pads with '\s', and the mention patterns' lookbehinds still use
+# '\w', both of which stay Unicode-broad: measured on this branch,
+# 'task\u00a0132' and 'reify\u00a0:\u00a0132' (NBSP; likewise U+2003 EM SPACE and
+# U+2007 FIGURE SPACE) still parse to number '132'. That breadth is safe here:
+# padding breadth costs at most an exotic SPELLING of a number that is itself
+# ASCII and names a real node, while a lookaround only ever REFUSES a match, so
+# its breadth is precision, never recall loss. Only a CAPTURE hands
+# the character onward as data, which is why the fix is an explicit class and
+# not re.ASCII: re.ASCII would re-scope '\d', '\s' and '\w' at once, three
+# separately-reasoned axes for the price of one.
 _QUALIFIED_NODE_NAME_PATTERN = re.compile(r'^\s*([A-Za-z][A-Za-z0-9_-]{2,})\s*:\s*([0-9]+)\s*$')
 
 # Task-vocabulary words are never project ids. Matched with fullmatch() against
