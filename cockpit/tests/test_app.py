@@ -1216,6 +1216,60 @@ class TestBoostAndDeferOverlaysExpireWithTheAsk:
             assert app._overlay_asks == {}
 
 
+class TestReorderTargetsAreDeduped:
+    @pytest.mark.timeout(10)
+    async def test_a_shared_target_is_passed_to_reorder_only_once(self, tmp_path):
+        """A DecisionRecord and the AWAITING_INPUT session it links to
+        resolve to the exact SAME DisplayTarget (resolve_target maps a
+        decision through its session's display -- the case that method's own
+        docstring calls out). _update_attention dedups the URGENCY half
+        through a set, but builds its reorder list with a bare append per
+        queue item, so backend.reorder() receives that one target twice.
+
+        TmuxBackend.reorder assigns a running per-session index, so a
+        duplicate consumes two indices, its second park fails against the
+        already-vacated source (a warning), and the final compacted 0..N-1
+        range is left with a gap. Each target must therefore be handed to
+        reorder at most once. queue_items is score-ordered, so the dedup
+        must keep the FIRST (highest-scoring) occurrence -- for tmux that
+        surviving position IS the destination window index.
+
+        Uses a tmux display because tmux is the only backend whose reorder
+        is not a documented no-op.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import DisplayTarget, FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+
+        display = sr.Display(kind='tmux', tmux_target='s:1')
+        awaiting = _make_record(
+            session_slug='shared-1',
+            status=sr.Status.AWAITING_INPUT,
+            display=display,
+            question=sr.Question(text='Which port?', asked_at='2026-07-07T00:00:00+00:00'),
+        )
+        sr.write_record(awaiting, root=tmp_path)
+        decision = sr.DecisionRecord(
+            id='dec-shared',
+            project='df',
+            text='Proceed?',
+            filed_at='2026-07-07T00:00:00+00:00',
+            session_id='shared-1',
+        )
+        assert sr.write_decision(decision, root=tmp_path)
+
+        backend = FakeBackend()
+        app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            # Both items really are in the queue, so the duplicate target is
+            # genuinely produced -- this isn't a vacuously-passing assertion.
+            assert app.query_one(DecisionQueue).row_count == 2
+
+            assert backend.reorder_calls[-1] == [DisplayTarget(kind='tmux', tmux_target='s:1')]
+
+
 class TestCopyAction:
     @pytest.mark.timeout(10)
     async def test_copy_highlighted_decision_puts_question_and_ids_on_clipboard(self, tmp_path):
