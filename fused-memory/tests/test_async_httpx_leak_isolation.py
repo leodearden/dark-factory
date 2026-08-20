@@ -45,6 +45,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 
+import httpx
 import openai
 import pytest
 from _fm_helpers import (
@@ -136,3 +137,104 @@ async def test_a_reaped_client_del_schedules_no_aclose_task():
         'a CLOSED AsyncHttpxClientWrapper.__del__ must schedule no task — '
         'this is the short-circuit the whole fix rides on'
     )
+
+
+@pytest.mark.asyncio
+async def test_reap_leaves_a_bare_httpx_client_open():
+    """A bare ``httpx.AsyncClient`` is not resurrect-capable, so reap leaves it.
+
+    The blast-radius contract. Only a class defining ``__del__`` can resurrect
+    itself via ``create_task(self.aclose())`` and emit the ERROR record;
+    measured, ``'__del__' not in httpx.AsyncClient.__dict__``. A plain async
+    httpx client therefore cannot produce the flake, and closing one would
+    mean the reaper could yank a client an unrelated fixture still intends to
+    use — the wrong trade for a flake fix. Deriving the predicate from the
+    ``__del__`` mechanism (rather than allow-listing ``openai``/``anthropic``
+    by name) also means any future library shipping the same finaliser is
+    covered without a code change here.
+    """
+    track_async_httpx_clients()
+    await reap_leaked_async_httpx_clients()
+
+    assert '__del__' not in httpx.AsyncClient.__dict__, (
+        'httpx.AsyncClient now defines __del__, so a bare client CAN resurrect '
+        'itself and this exclusion is no longer safe — re-derive the reaper '
+        'predicate in _fm_helpers.reap_leaked_async_httpx_clients (task 4412).'
+    )
+
+    bare = httpx.AsyncClient()
+    try:
+        reaped = await reap_leaked_async_httpx_clients()
+        assert bare.is_closed is False, (
+            'the reaper must leave a bare httpx.AsyncClient open: it cannot '
+            'emit the ERROR record, and closing it would break whoever owns it'
+        )
+        assert reaped == 0, (
+            f'nothing resurrect-capable was leaked, so the reaper should have '
+            f'closed nothing, got {reaped}'
+        )
+    finally:
+        await bare.aclose()
+
+
+def test_track_async_httpx_clients_is_idempotent(monkeypatch):
+    """Installing the tracking hook twice does not double-wrap ``__init__``.
+
+    Load-bearing, not hygiene: ``pytest_configure`` installs the hook at
+    session start AND every test in this module calls it again, so without a
+    guard each call would nest another wrapper around the saved original —
+    one extra frame per call, for the whole session.
+
+    ``monkeypatch`` restores a pristine (unhooked) ``__init__`` first so this
+    measures the FIRST install regardless of whether ``pytest_configure``
+    already ran one, and puts the session's hook back at teardown.
+    """
+    pristine = getattr(httpx.AsyncClient.__init__, '__wrapped__', httpx.AsyncClient.__init__)
+    monkeypatch.setattr(httpx.AsyncClient, '__init__', pristine)
+
+    assert track_async_httpx_clients() is True, (
+        'the first install on a pristine httpx.AsyncClient must report that it '
+        'installed the hook'
+    )
+    installed = httpx.AsyncClient.__init__
+
+    assert track_async_httpx_clients() is False, (
+        'a second install must report that the hook was already present'
+    )
+    assert httpx.AsyncClient.__init__ is installed, (
+        'a second install must not re-wrap httpx.AsyncClient.__init__ — each '
+        're-wrap nests another frame around the saved original for the rest '
+        'of the session'
+    )
+
+
+@pytest.mark.asyncio
+async def test_reap_is_safe_when_nothing_is_leaked():
+    """reap_leaked_async_httpx_clients() returns 0 when nothing is leaked."""
+    track_async_httpx_clients()
+    # First reap to flush any residual leak from a prior test.
+    await reap_leaked_async_httpx_clients()
+
+    count = await reap_leaked_async_httpx_clients()
+    assert count == 0, (
+        f'Expected 0 leaked async httpx clients but got {count}. '
+        'A prior test may have leaked a client.'
+    )
+
+
+@pytest.mark.asyncio
+async def test_reap_ignores_an_already_closed_client():
+    """A client that was properly closed is not counted or touched by reap.
+
+    Safety-net assertion: reap must not double-close (and must not raise on) a
+    client a test already cleaned up correctly.
+    """
+    track_async_httpx_clients()
+    await reap_leaked_async_httpx_clients()
+
+    client = openai.AsyncOpenAI(api_key='test-key')
+    await client.close()
+    assert client._client.is_closed is True, 'AsyncOpenAI.close() should have closed the httpx client'
+
+    count = await reap_leaked_async_httpx_clients()
+    assert count == 0, 'An already-closed client must not be counted as reaped'
