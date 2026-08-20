@@ -147,6 +147,30 @@ resurrect. Grepping both runs' output for ``Task exception was never
 retrieved``, ``AsyncClient.aclose`` and ``Event loop is closed`` returned 0
 hits each.
 
+AMENDMENT PASS (review follow-up; same worktree, same toolchain). Four
+behavioural changes — a subset-safe guard on the affinity pair, four added
+tests (anthropic coverage, aclose-raises, aclose-hangs, the foreign-close
+warning), a guarded ``asyncio.run`` in the sync fallback arm, and the
+foreign-close warning itself — plus a docs dedup. Re-ran the full default lane
+under BOTH distributions again: ``-n auto --dist loadgroup`` 14625 passed, 2
+skipped, 0 failed (164s) and ``-n 8 --dist loadgroup`` 14625 passed, 2 skipped,
+0 failed (322s). The +4 over the 14621 above are exactly the four new tests.
+Grepping BOTH logs for ``Task exception was never retrieved``,
+``AsyncClient.aclose`` and ``Event loop is closed`` returned 0 hits each, as
+did ``drain closed`` and ``drain fallback failed`` — i.e. no fixture in the
+suite violates the wider-than-function CONSTRAINT, and the guarded fallback
+never had to swallow anything.
+
+What that re-run does NOT re-establish: the instrumented wrapper census (44
+built / 27 closed-before-finalisation / 1 deliberate resurrection) was measured
+at the PRE-amendment tip and was not re-taken, because it needs a throwaway
+probe hooked into ``AsyncHttpxClientWrapper.__del__``. It still describes the
+shipped drain: the amendment changes no part of the reap path — same selection
+predicate, same ``aclose()``, same 10s bound (moved from a literal to
+``_fm_helpers.ASYNC_HTTPX_ACLOSE_TIMEOUT`` so it is testable at 50ms) — it only
+adds the fallback guard, the warning, and tests. The four new tests do build
+four more wrappers, all of which they close themselves.
+
 Toolchain all of the above was measured against: python 3.13.9, pytest 9.0.3,
 pytest-asyncio 1.3.0 (``asyncio_mode=strict``), httpx 0.28.1, openai 2.31.0,
 anthropic 0.92.0. The ordering is a property of pytest-asyncio's fixture graph
@@ -562,8 +586,11 @@ async def test_foreign_client_close_is_warned_about_not_silent():
 # conftest wiring (task 4412)
 #
 # The helper alone retires nothing: it changes the suite's behaviour only once
-# it runs at EVERY test's teardown. These four guards are what keep the wiring
-# from being silently dropped by a later refactor — mirroring
+# it runs at EVERY test's teardown. These three guards (a fourth, an AST
+# meta-test on conftest's declaration order, was deleted for pinning source
+# layout while passing green against the inverse runtime order — the affinity
+# pair at the bottom of this module replaced it) are what keep the wiring from
+# being silently dropped by a later refactor — mirroring
 # orchestrator/tests/test_aiosqlite_leak_isolation.py::test_autouse_reap_fixture_is_active.
 # ---------------------------------------------------------------------------
 
