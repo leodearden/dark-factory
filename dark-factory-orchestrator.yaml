@@ -1498,6 +1498,57 @@ git:
   offline_lane_enabled: true
   persistent_offline_deep_worktree: true
   offline_lane_legacy_numeric_enabled: false
+
+  # Deterministic manifest-drift backstop, TURNED ON for this repo (task 3886).
+  # Zero new production code: the field, the predicate
+  # (verify._merge_config_only_diff_forces_full_gate), both its call sites, and
+  # its unit + integration tests all already exist — production-proven for reify
+  # (incident deb-reify-964887) and merely unwired here. Cited by SYMBOL and not
+  # by file:line, per task 3445's correction of the convention task 3350
+  # established; task 3886 re-confirmed the need for that rule when every line
+  # anchor its own plan carried had rotted between two passes over unchanged code.
+  #
+  # WHY THIS IS NOT REDUNDANT WITH THE GATES ALREADY HELD (the INV-5
+  # no-lockstep-duplication question, answered rather than assumed). Both call
+  # sites sit in the `else:` of `if role == 'merge' and is_merge_verify:`, so:
+  #   * is_merge_verify TRUE  — INV-1's nothing-to-run escalation (task 2883)
+  #     already routes a no-.py/.rs merge diff to the full per-subproject gate.
+  #     This glob is never consulted and buys nothing.
+  #   * is_merge_verify FALSE — the merge-role probe path. `should_override`
+  #     reduces to this predicate OR the async reify verify-pipeline-guard
+  #     consult, and that consult falls open for dark-factory. With the shipped
+  #     empty default the predicate short-circuits to False in O(1), so NOTHING
+  #     forces the full gate there. This line is the only thing that closes it.
+  # So the entry covers a path the other two gates do not reach, and it converts
+  # "a config-only diff forces the full gate" from an incidental side effect of
+  # merge_verify_breadth into a DECLARED intent about THIS file — the one whose
+  # retune turned main red in the first place (094d634465, the incident this
+  # task decides about). See the DECIDED block next to `lock_depth` above.
+  #
+  # RED TIER: this key is NOT in the config hot-reload allowlist
+  # (RELOADABLE_FIELDS, orchestrator/src/orchestrator/config.py) — so like
+  # offline_lane_enabled above, this edit is INERT in the running daemon until
+  # the next orchestrator restart. MEASURED, not assumed: RELOADABLE_FIELDS
+  # carries no whole-submodel `_submodel_leaf_paths('git', GitConfig)` group,
+  # only five explicit `git.offline_lane_*` leaves, and this key is not among
+  # them. A probe through the production symbol returns
+  # `'git.merge_config_only_full_gate_globs' in RELOADABLE_FIELDS` -> False.
+  #   CORRECTION, recorded rather than silently substituted (task 3460's
+  #   precedent, and the same treatment the DECIDED block above gives its own
+  #   superseded premises). Task 3886's own plan asserted this field was
+  #   "green-tier hot-reloadable" and would have shipped that claim into this
+  #   comment. It is FALSE, and it was load-bearing enough to matter: a reader
+  #   who believed it would reload_config, see {reloaded: true}, and conclude
+  #   the backstop was live when it was not. That is the read-the-dispositions
+  #   trap CLAUDE.md warns about, one tier over. The wiring is KEPT regardless
+  #   — the fleet redeploys on an 8h cadence, so the lag is bounded and the
+  #   entry costs nothing until then.
+  #
+  # Guarded by tests/scripts/test_config_retune_gate_decision.py, which asserts
+  # it through the production predicate rather than re-implementing fnmatch.
+  merge_config_only_full_gate_globs:
+    - "dark-factory-orchestrator.yaml"
+
   offline_lane_commands:
     - name: qdrant-integration
       command: "pytest -m integration"
