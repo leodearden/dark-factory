@@ -391,6 +391,36 @@ class TestTmuxBackendReorder:
             ['tmux', 'move-window', '-d', '-s', 's:9000', '-t', 's:0'],
         ]
 
+    def test_reorder_is_defensive_against_a_duplicated_target(self, caplog):
+        """Defence in depth: reorder() is a public FocusArrangeBackend method
+        with non-app callers, so a duplicated target must be absorbed rather
+        than turned into a destructive command sequence.
+
+        Without dedup the running per-session counter yields
+        valid=[(0,'s:1'), (1,'s:1'), (2,'s:0')]: the park phase moves
+        s:1->s:9000 (ok), then s:1->s:9001 FAILS ("no such window" -- that
+        source index was just vacated) and warns, then s:0->s:9002 (ok); the
+        place phase lands s:9000->s:0 and s:9002->s:2, leaving index 1 empty.
+        A duplicate is a benign caller-side collision, so the outcome must be
+        the compacted, gap-free 0..N-1 range with no warning at all.
+        """
+        from cockpit.backends.base import DisplayTarget
+        from cockpit.backends.tmux import TmuxBackend
+
+        table = FakeTmuxWindowTable({'s:0': 'wA', 's:1': 'wB'})
+        backend = TmuxBackend(run=table)
+        targets = [
+            DisplayTarget(kind='tmux', tmux_target='s:1'),
+            DisplayTarget(kind='tmux', tmux_target='s:1'),
+            DisplayTarget(kind='tmux', tmux_target='s:0'),
+        ]
+
+        with caplog.at_level(logging.WARNING):
+            backend.reorder(targets)
+
+        assert table.windows == {'s:0': 'wB', 's:1': 'wA'}
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
 
 class TestTmuxBackendSetUrgency:
     def test_is_a_noop_and_logs_debug(self, caplog):
