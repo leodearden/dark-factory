@@ -19,6 +19,7 @@ import dataclasses
 import json
 import logging
 from pathlib import Path
+from typing import Literal
 
 import pytest
 from _verify_config_corpus import (
@@ -2508,7 +2509,9 @@ class TestEffectiveMergeModuleConfigs:
 
     @classmethod
     def _registry_config(
-        cls, breadth: str, registry: dict[str, ModuleConfig] | None,
+        cls,
+        breadth: Literal['scoped', 'full'],
+        registry: dict[str, ModuleConfig] | None,
     ) -> OrchestratorConfig:
         """A REAL OrchestratorConfig (never a bare MagicMock — the
         ``check_bare_magicmock_config`` lint gate) with ``_module_configs`` set

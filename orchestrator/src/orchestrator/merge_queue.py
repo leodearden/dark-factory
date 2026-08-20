@@ -2616,7 +2616,23 @@ async def _run_post_merge_verify(
         if derived:
             task_files_tuple = tuple(derived)
 
-    spec = build_merge_verify_spec(req.config, req.module_configs, task_files_tuple)
+    # Projected from the SAME effective set the LocalRunner above receives
+    # (flake-ledger PRD §8.2 / task 3787 γ, INV-5), so the remote's
+    # reconstruction of it — `[_module_config_from_command(vc, spec) for vc in
+    # spec.verify_commands]` in verify_runner.run_merge_verify_on_worktree —
+    # yields the identical module set the local gate uses. Local ≡ remote BY
+    # CONSTRUCTION, from one resolution at the top of this function, rather
+    # than by an assertion that two sites independently agree.
+    #
+    # INV-1 interaction (checked): build_merge_verify_spec sources
+    # `global_verify_command` ONLY when the projected set is empty. The
+    # effective set is never SMALLER than the passed set (it is the full
+    # registry, or the passed set unchanged), so a previously-non-empty spec
+    # can never become empty here and that zero-module fallback is unaffected;
+    # a genuinely zero-module project (empty registry AND empty
+    # req.module_configs) still degrades to the global-command spec exactly as
+    # today.
+    spec = build_merge_verify_spec(req.config, effective_module_configs, task_files_tuple)
 
     # narrowed (task 2835) tracks whether THIS call actually applied a
     # narrowed retry_env — the ONLY correct gate for the larger max_narrowed
