@@ -221,10 +221,11 @@ MARKER_LIFECYCLE: dict[str, MarkerLifecycle] = {
     # Not a MARKER_KINDS member — see the superset note above.
     'mem0_tombstone': MarkerLifecycle(
         writer=(
-            'Python, from mem0_tombstone.record_mem0_deletion_tombstone — one '
-            'per CONFIRMED recon-initiated Mem0 delete (both the marker-GC '
-            'sweeps and the cycle_summary pool-cap trim), keyed by the deleted '
-            "record's memory uuid"
+            'Python, from mem0_tombstone.record_mem0_deletion_tombstones — one '
+            'per CONFIRMED delete performed by the sweeps that call it: the '
+            'marker-GC sweeps, the cycle_summary pool-cap trim, and the '
+            'consolidate_memories supersede path (not every recon-initiated '
+            "Mem0 delete), keyed by the deleted record's memory uuid"
         ),
         deleter=DELETER_TTL,
     ),
