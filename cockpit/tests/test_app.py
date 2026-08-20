@@ -993,6 +993,94 @@ class TestDropRemovesAndPersists:
             assert reread.status == sr.Status.AWAITING_INPUT
 
 
+class TestDroppedOverlayExpiresWithTheAsk:
+    @pytest.mark.timeout(10)
+    async def test_dropped_session_key_does_not_suppress_a_later_unrelated_ask(self, tmp_path):
+        """self._dropped is an in-memory overlay keyed by QueueItem.key, and
+        for a SESSION-backed row that key ('session:<slug>') is stable for
+        the session's whole lifetime. Dropping it must therefore expire once
+        the ask it was set against is gone -- otherwise a brand-new,
+        completely unrelated question from the SAME session is silently
+        suppressed for the cockpit's whole process lifetime, and the
+        operator never learns an agent is blocked on them.
+
+        The prune deliberately CANNOT copy self._handling's
+        `&= self._queue_items_by_key.keys()` predicate: a dropped item is by
+        construction absent from the rebuilt queue, so queue membership
+        would clear every drop on the very rebuild action_drop itself
+        triggers. Clause (b) below is the standing guard against that
+        mistake -- a live drop must survive an unrelated rebuild.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+
+        display = sr.Display(kind='wm', wm_title='drop title')
+        first_ask = _make_record(
+            session_slug='drop-1',
+            status=sr.Status.AWAITING_INPUT,
+            display=display,
+            question=sr.Question(text='First ask?', asked_at='2026-07-07T00:00:00+00:00'),
+        )
+        sr.write_record(first_ask, root=tmp_path)
+
+        backend = FakeBackend()
+        app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            queue = app.query_one(DecisionQueue)
+            assert queue.row_count == 1
+
+            # (a) the operator drops the row -- it leaves the queue and the
+            # overlay records the suppression.
+            await pilot.press('x')
+            await pilot.pause()
+            assert queue.row_count == 0
+            assert 'session:drop-1' in app._dropped
+
+            # (b) GUARD: an unrelated session appears and forces a real
+            # rebuild. The live drop must SURVIVE it -- this is exactly what
+            # a copied `&= queue keys` prune would break.
+            other = _make_record(
+                session_slug='other-1',
+                status=sr.Status.AWAITING_INPUT,
+                display=sr.Display(kind='wm', wm_title='other title'),
+                question=sr.Question(text='Unrelated ask?', asked_at='2026-07-07T01:00:00+00:00'),
+            )
+            sr.write_record(other, root=tmp_path)
+            app.refresh_registry()
+            await pilot.pause()
+
+            assert queue.row_count == 1  # only other-1
+            assert 'session:drop-1' in app._dropped
+
+            # (c) the dropped session's ask resolves -- it stops awaiting
+            # input entirely, so the overlay has nothing left to suppress.
+            answered = _make_record(
+                session_slug='drop-1', status=sr.Status.RUNNING, display=display
+            )
+            sr.write_record(answered, root=tmp_path)
+            app.refresh_registry()
+            await pilot.pause()
+
+            assert 'session:drop-1' not in app._dropped
+
+            # (d) the SAME session asks something brand new. It is a
+            # different ask, so it must be visible to the operator again.
+            second_ask = _make_record(
+                session_slug='drop-1',
+                status=sr.Status.AWAITING_INPUT,
+                display=display,
+                question=sr.Question(text='Second ask?', asked_at='2026-07-08T00:00:00+00:00'),
+            )
+            sr.write_record(second_ask, root=tmp_path)
+            app.refresh_registry()
+            await pilot.pause()
+
+            assert queue.get_row('session:drop-1')
+            assert queue.row_count == 2
+
+
 class TestCopyAction:
     @pytest.mark.timeout(10)
     async def test_copy_highlighted_decision_puts_question_and_ids_on_clipboard(self, tmp_path):
