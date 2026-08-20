@@ -17,6 +17,16 @@ their test suites assert that structurally. Do not re-introduce a second copy
 of the label pattern anywhere: a vocabulary that exists twice drifts, and the
 drift is invisible until a destructive consumer acts on the stale half.
 
+The same rule governs the vocabulary's character classes, which is why the
+digit captures are ASCII-explicit ('[0-9]', never '\\d') at this one normative
+site rather than re-narrowed per caller. Before that,
+utils/referent_resolution._is_task_number was the only guard enforcing "a
+Unicode digit is not a task id" — it does so with ``isascii() and isdigit()``
+(task 3668) — so the DECLARED path refused what this DERIVED path happily
+minted. That guard STAYS: it covers a STRUCTURED, caller-supplied number that
+never passes through these patterns, so it is a different input channel, not a
+duplicate to delete.
+
 This module is a dependency-free leaf — it imports only stdlib and
 utils/validation (itself a leaf) — so it can be imported from both the
 services write path and any future reconciliation sweep without import
@@ -116,7 +126,13 @@ _TASK_NODE_NAME_PATTERN = re.compile(
 # >=3-character qualifier rules, so clock times ('12:30') and short non-project
 # tokens ('w6:2', 'py:3') never parse as a project. Case-SENSITIVE start class
 # with no IGNORECASE flag needed, since [A-Za-z] already spans both cases.
-_QUALIFIED_NODE_NAME_PATTERN = re.compile(r'^\s*([A-Za-z][A-Za-z0-9_-]{2,})\s*:\s*(\d+)\s*$')
+#
+# The digit class is '[0-9]', NOT '\d', for the reason recorded on
+# _TASK_NODE_NAME_PATTERN above. Measured: 'reify:\u0663' parsed to
+# Referent(project_id='reify', number='\u0663'). The qualifier class was already
+# ASCII-explicit, so the digit capture was the last Unicode-permissive class in
+# the vocabulary.
+_QUALIFIED_NODE_NAME_PATTERN = re.compile(r'^\s*([A-Za-z][A-Za-z0-9_-]{2,})\s*:\s*([0-9]+)\s*$')
 
 # Task-vocabulary words are never project ids. Matched with fullmatch() against
 # the CANONICALIZED qualifier, so every spelling ('Task', 'TASK', 'sub-task',
@@ -216,10 +232,20 @@ _LOCAL_MENTION_PATTERN = re.compile(
 #   any qualified referent and would equally return None if the name stopped
 #   parsing; the value of closing it is coherence, before a consumer that acts
 #   on qualified node names lands.
+# - The digit class is '[0-9]', NOT '\d', for the reason recorded on
+#   _TASK_NODE_NAME_PATTERN above: '\d' matches Unicode decimal digits on a str
+#   pattern, so 'see reify:\u0663 now' scanned from another group yielded a
+#   FOREIGN referent numbered with that character.
 # - '(?!\d)' anchors the number's right edge so a truncated prefix is never
-#   captured.
+#   captured, and is deliberately left BROAD for the reason recorded on
+#   _LOCAL_MENTION_PATTERN — but the stakes are higher here. Measured: with
+#   '(?![0-9])' the mixed run 'reify:12\u0663' matches and captures
+#   ('reify', '12'), which is not mangled junk but a fully well-formed foreign
+#   referent naming the WRONG task — exactly the misattribution the consumer's
+#   destructive edge surgery exists to prevent, and one it would instead
+#   perform. Left broad, a mixed run yields nothing at all.
 _QUALIFIED_REF_PATTERN = re.compile(
-    r'(?<![\w:/.-])([A-Za-z][A-Za-z0-9_-]{2,})[ \t]*:[ \t]*(\d+)(?!\d)'
+    r'(?<![\w:/.-])([A-Za-z][A-Za-z0-9_-]{2,})[ \t]*:[ \t]*([0-9]+)(?!\d)'
 )
 
 
@@ -489,7 +515,12 @@ def scan_content(
     KNOWN BLIND SPOTS, so no reader assumes completeness: a node named with
     bare digits ('1251'), a reference made by task TITLE rather than number,
     and Greek-letter or codename aliases are all invisible here by design.
-    Recall is the consumer's problem; precision is this module's.
+    A task number written in NON-ASCII digits ('task \u0663', 'reify:\u0663') is
+    likewise invisible, and so is a MIXED run ('task 12\u0663', which yields
+    nothing rather than a truncated 'Task 12') — the deliberate, negligible
+    recall loss that is the price of the ``[0-9]`` capture classes above, which
+    exist because '\\d' matched those spellings and minted referents naming no
+    task at all. Recall is the consumer's problem; precision is this module's.
 
     One blind spot was MEASURED and accepted rather than merely designed
     around: a genuine qualified ref split across lines by HARD WRAPPING is
