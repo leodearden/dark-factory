@@ -11457,13 +11457,24 @@ class GitOps:
         TOCTOU). A live holder makes the non-blocking acquire fail
         immediately, in which case removal is skipped
         (``'skipped_lease_held'``, logged as a single WARNING naming the
-        holder pgid) rather than deferred or retried; a dead or stale
+        holder) rather than deferred or retried; a dead or stale
         holder's flock is auto-released by the kernel, so the acquire
         simply succeeds and removal proceeds (fail-open, intrinsic to
         flock — this method never consults holder liveness directly). The
         holder-pgid rendezvous file is read ONLY to name the holder in
         that WARNING — a best-effort, fail-open diagnostic hint, never a
         removal gate.
+
+        That WARNING carries TWO attributions, and ``rendezvous pgid=None``
+        in it is EXPECTED, not a defect: this method only reaches the refusal
+        on an EPHEMERAL lane (persistent ones return ``'skipped_persistent'``
+        above), and as of task 4189 an ephemeral :meth:`merge_verify_lease`
+        deliberately does not write the global rendezvous — so the cold-shadow
+        verify / drift check / DF-2822 cross-check that most often holds the
+        lane against this reaper is invisible to it. The kernel clause
+        (:func:`_lane_lock_holder_facts` over ``/proc/locks``) is what actually
+        names such a holder, and is fail-open in the same way: an unreadable
+        ``/proc`` degrades the clause, never the outcome.
 
         **Persistent-worktree exemption**: if *path* resolves to
         :attr:`persistent_merge_worktree_path` OR
@@ -11516,7 +11527,7 @@ class GitOps:
         (pure path math), :meth:`Path.exists`/:meth:`Path.resolve` and
         :meth:`is_persistent_merge_lane` (which swallow ``OSError`` by
         contract), :func:`_register_held_lane_lock`,
-        :func:`read_lock_holder_pgid` and
+        :func:`read_lock_holder_pgid`, :func:`_lane_lock_holder_facts` and
         :func:`_release_and_forget_held_lane_lock` — already suppresses its
         own.
 
@@ -11561,12 +11572,40 @@ class GitOps:
             # never be reachable from a legitimate hold.
             _register_held_lane_lock(fd, lock_path)
         if fd is None:
+            # TWO attributions, because neither alone covers the holder set.
+            #
+            # The global holder-pgid rendezvous names a PERSISTENT-lane verify
+            # (and the host verify-merge CLI span, which writes the same fixed
+            # key) — but as of task 4189 an EPHEMERAL `_merge-<hash>` lease
+            # deliberately never writes it, and this method only ever reaches
+            # here on an ephemeral lane (persistent ones returned
+            # 'skipped_persistent' above). So `pgid=None` is now EXPECTED in
+            # exactly the case 4189 makes routine: a cold-shadow verify, a
+            # drift check, or the DF-2822 cross-check holding its own throwaway
+            # lane while the reaper tries to remove it. Before 4189 this log
+            # named the right pgid only ACCIDENTALLY, because the ephemeral
+            # lease wrote the global key it had no business writing.
+            #
+            # Kernel attribution replaces that accident with the real thing:
+            # /proc/locks names whoever actually holds THIS lane's flock — the
+            # gate that just refused us — for the persistent and ephemeral
+            # holder alike. This is the reaper's ONLY attribution for a refused
+            # removal, so it must not go blank on the common path.
+            #
+            # Both remain fail-open diagnostics and neither is a removal gate:
+            # read_lock_holder_pgid returns None on any read error, and
+            # lane_lock_holder_pids returns [] on an unreadable /proc, so
+            # _lane_lock_holder_facts degrades its clause rather than raising
+            # inside a method that backs cleanup_merge_worktree's never-raises
+            # contract. Unlike the two acquire-timeout sites, no settled
+            # snapshot is threaded in here: nothing downstream branches on the
+            # holder set, so a rare empty read costs a clause, not a decision.
             holder = read_lock_holder_pgid(self.worktree_base)
             logger.warning(
                 'remove_merge_worktree_guarded: merge-verify lease held by live '
-                'holder (pgid=%s); skipping removal of %s (reason=%s) -- leaving '
-                'for the merge reaper',
-                holder, path, reason,
+                'holder (rendezvous pgid=%s; %s); skipping removal of %s '
+                '(reason=%s) -- leaving for the merge reaper',
+                holder, _lane_lock_holder_facts(lock_path), path, reason,
             )
             return 'skipped_lease_held'
         # Only unlink the sibling ``.lock`` file when THIS call both acquired
