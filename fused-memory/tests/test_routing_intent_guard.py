@@ -340,3 +340,60 @@ class TestRoutingIntentPayloadsAndFlag:
 
         monkeypatch.setenv('FUSED_ROUTING_INTENT_ENFORCE', raw_value)
         assert routing_intent_enforced() is False
+
+
+class TestProvenanceStampDoesNotDisarmCodeChangeSuppression:
+    """Machine-injected provenance stamps must not arm the code-change
+    suppression (task 4532).
+
+    A Stage-2 ``task_knowledge_sync`` doc-drift annotation appended to a
+    live task description ("[Stage 2 task-knowledge sync <date>] DOC-DRIFT
+    FIX (finding ...)") contains the bare word "FIX", which matched
+    ``_CODE_CHANGE_SIGNALS_RE`` and permanently disarmed this guard for
+    that task -- the guard's own downstream annotation blinded it. An
+    appended annotation is post-filing PROVENANCE, not evidence of the
+    author's filing-era code intent, so it must not suppress a finding.
+    """
+
+    def test_stage2_doc_drift_stamp_no_longer_suppresses_marker_finding(self):
+        """The verbatim reify-5117 shape: an authored routing declaration
+        followed by a machine-injected Stage-2 doc-drift stamp whose only
+        code-change signal is the bare word "FIX" inside the stamp ->
+        finding is still produced. The stamp must not arm
+        _CODE_CHANGE_SIGNALS_RE."""
+        finding = routing_intent_finding(
+            title=None,
+            description=(
+                'This is a no-code milestone gate. DO NOT IMPLEMENT; escalate '
+                'to a human instead of implementing when the gate trips.'
+                '\n\n[Stage 2 task-knowledge sync 2026-07-07] DOC-DRIFT FIX '
+                '(finding 4e06f01a-cacb-4688-9670-ff6d6ce41baf): the '
+                '`dependencies` array carries 32 entries, but this prose '
+                'previously itemized only 31.'
+            ),
+            details=None,
+            task_kind='normal',
+            metadata=None,
+        )
+        assert finding is not None
+        assert 'do_not_implement' in finding.markers
+        assert 'no_code_label' in finding.markers
+        assert 'escalate_instead_of_implementing' in finding.markers
+        assert finding.fields == ('description',)
+
+    def test_stamp_in_details_is_stripped_per_field(self):
+        """The strip is applied to EVERY field, not just description: the
+        marker lives in the description while the disarming stamp is
+        appended to details."""
+        finding = routing_intent_finding(
+            title='Milestone gate for the dependency census',
+            description='Do not attempt to author a TDD plan for this task.',
+            details=(
+                '[Stage 2 task-knowledge sync 2026-07-07] DOC-DRIFT FIX '
+                '(finding abc): re-derived the dependency count.'
+            ),
+            task_kind='normal',
+            metadata=None,
+        )
+        assert finding is not None
+        assert 'do_not_author_plan' in finding.markers

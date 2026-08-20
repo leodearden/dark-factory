@@ -412,3 +412,30 @@ async def test_routing_intent_warning_merged_into_planning_mode_result(
     assert result.get('status') == 'deferred'
     assert result.get('planning_mode') is True
     assert 'routing_intent_warning' in result, f'Expected warning payload, got: {result!r}'
+
+
+@pytest.mark.asyncio
+async def test_routing_intent_stage2_stamp_does_not_blind_submit_boundary(
+    mcp_server, task_interceptor, monkeypatch,
+):
+    """WARN mode + a marker-bearing submission whose description carries a
+    machine-injected Stage-2 doc-drift stamp ("DOC-DRIFT FIX ...") -> the
+    boundary still flags it. The stamp's bare "FIX" previously armed the
+    code-change suppression and blinded the guard for that task (4532)."""
+    monkeypatch.delenv('FUSED_ROUTING_INTENT_ENFORCE', raising=False)
+    result = await mcp_server._tool_manager.call_tool(
+        'submit_task',
+        {
+            'project_root': '/project',
+            'title': 'DO NOT IMPLEMENT this; escalate to a human instead of implementing.',
+            'description': (
+                '[Stage 2 task-knowledge sync 2026-07-07] DOC-DRIFT FIX '
+                '(finding 4e06f01a-cacb-4688-9670-ff6d6ce41baf): the '
+                '`dependencies` array carries 32 entries, but this prose '
+                'previously itemized only 31.'
+            ),
+            'task_kind': 'normal',
+        },
+    )
+    assert 'routing_intent_warning' in result, f'Expected warning payload, got: {result!r}'
+    task_interceptor.submit_task.assert_called_once()
