@@ -15,6 +15,7 @@ from fused_memory.models.scope import Scope
 from fused_memory.services import memory_service
 from fused_memory.services.memory_service import (
     MemoryService,
+    ReferentStats,
     _is_rate_limit_or_quota_error,
     _serialize_temporal,
 )
@@ -5039,6 +5040,7 @@ class TestReconcileEpisodeIdentity:
         service._restore_falsely_superseded_sibling_edges = AsyncMock(return_value=3)
         service._dedup_episode_nodes = AsyncMock(return_value=4)
         service._normalize_task_node_names = AsyncMock(return_value=5)
+        service._verify_episode_referents = AsyncMock(return_value=ReferentStats())
 
         manager = Mock()
         manager.attach_mock(service._dedup_episode_edges, '_dedup_episode_edges')
@@ -5051,6 +5053,7 @@ class TestReconcileEpisodeIdentity:
         )
         manager.attach_mock(service._dedup_episode_nodes, '_dedup_episode_nodes')
         manager.attach_mock(service._normalize_task_node_names, '_normalize_task_node_names')
+        manager.attach_mock(service._verify_episode_referents, '_verify_episode_referents')
 
         stats = await service._reconcile_episode_identity(mock_result, group_id='test')
 
@@ -5070,6 +5073,13 @@ class TestReconcileEpisodeIdentity:
             '_restore_falsely_superseded_sibling_edges',
             '_dedup_episode_nodes',
             '_normalize_task_node_names',
+            # Task 3671 (PRD leaf zeta) — LAST, and asserted rather than merely
+            # tolerated: the `if c[0] in expected_order` filter below would let
+            # an unlisted seventh pass slip in unpinned, and running last is
+            # load-bearing (zeta keys on the canonical 'Task N' names
+            # _normalize_task_node_names produces, and any repair it enables
+            # must describe post-normalization topology).
+            '_verify_episode_referents',
         ]
         call_order = [c[0] for c in manager.mock_calls if c[0] in expected_order]
         assert call_order == expected_order, (
@@ -5103,6 +5113,117 @@ class TestReconcileEpisodeIdentity:
 
         assert isinstance(stats, ReconcileStats)
         assert stats.errors == []
+
+    # ------------------------------------------------------------------
+    # Task 3671 / PRD leaf zeta: the verification sub-pass wiring
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_the_declared_referent_set_is_forwarded_to_the_verification_pass(
+        self, service,
+    ):
+        """The set leaf epsilon decoded off the queue payload reaches zeta
+        verbatim — it is the only thing zeta has to test membership against."""
+        from _fm_helpers import MockAddEpisodeResult
+
+        from fused_memory.utils.canonical_labels import Referent
+
+        mock_result = MockAddEpisodeResult()
+        service._verify_episode_referents = AsyncMock(return_value=ReferentStats())
+
+        await service._reconcile_episode_identity(
+            mock_result, group_id='test', referents=(Referent(number='3127'),),
+        )
+
+        service._verify_episode_referents.assert_awaited_once_with(
+            mock_result, group_id='test', referents=(Referent(number='3127'),),
+        )
+
+    @pytest.mark.asyncio
+    async def test_referents_defaults_to_empty_so_every_existing_caller_is_unchanged(
+        self, service,
+    ):
+        """zeta still RUNS (and no-ops internally on the empty set) — the
+        default is what keeps every pre-existing call site and test working."""
+        from _fm_helpers import MockAddEpisodeResult
+
+        mock_result = MockAddEpisodeResult()
+        service._verify_episode_referents = AsyncMock(return_value=ReferentStats())
+
+        await service._reconcile_episode_identity(mock_result, group_id='test')
+
+        service._verify_episode_referents.assert_awaited_once_with(
+            mock_result, group_id='test', referents=(),
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_referent_stats_are_carried_on_the_aggregate(self, service):
+        """Leaf eta reads the findings off this field, in-process, inside the
+        same identity-lock critical section — so the pass-through must be
+        observable, not merely counted."""
+        from _fm_helpers import MockAddEpisodeResult
+
+        from fused_memory.services.memory_service import ReferentFinding
+        from fused_memory.utils.canonical_labels import Referent
+
+        populated = ReferentStats(edges_scanned=2, endpoints_checked=3)
+        populated.findings.append(ReferentFinding(
+            edge_uuid='e1', which_end='source', check='set-membership',
+            old_endpoint_uuid='n-3129', old_endpoint_name='Task 3129',
+            endpoint_referent=Referent(number='3129'),
+            referent_set=('Task 3127',),
+        ))
+        mock_result = MockAddEpisodeResult()
+        service._dedup_episode_edges = AsyncMock(return_value=1)
+        service._verify_episode_referents = AsyncMock(return_value=populated)
+
+        stats = await service._reconcile_episode_identity(mock_result, group_id='test')
+
+        assert stats.referent_stats is populated
+        assert stats.referent_stats.set_membership_findings == 1
+        assert stats.edges_deduped == 1, 'the six int fields are unaffected'
+
+    @pytest.mark.asyncio
+    async def test_a_failing_verification_pass_degrades_to_a_typed_default(
+        self, service,
+    ):
+        """The best-effort guard is ONE guard, not two: zeta is the first
+        sub-pass returning a dataclass rather than an int, and its failure must
+        leave a ReferentStats behind — a `0` there would blow up every consumer
+        on exactly the error path the guard exists to survive."""
+        from _fm_helpers import MockAddEpisodeResult
+
+        mock_result = MockAddEpisodeResult()
+        service._dedup_episode_edges = AsyncMock(return_value=1)
+        service._restore_superseded_dependency_edges = AsyncMock(return_value=2)
+        service._restore_falsely_superseded_sibling_edges = AsyncMock(return_value=3)
+        service._dedup_episode_nodes = AsyncMock(return_value=4)
+        service._normalize_task_node_names = AsyncMock(return_value=5)
+        service._verify_episode_referents = AsyncMock(
+            side_effect=RuntimeError('falkor down'),
+        )
+
+        stats = await service._reconcile_episode_identity(mock_result, group_id='test')
+
+        assert '_verify_episode_referents' in stats.errors
+        assert stats.referent_stats == ReferentStats()
+        assert stats.edges_deduped == 1
+        assert stats.task_names_normalized == 5
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('exc_type', [asyncio.CancelledError, KeyboardInterrupt, SystemExit])
+    async def test_the_verification_pass_never_swallows_cancellation(
+        self, service, exc_type,
+    ):
+        """The generalized guard keeps the swallow/propagate rule identical for
+        the object-returning pass — mirroring the contract test above."""
+        from _fm_helpers import MockAddEpisodeResult
+
+        mock_result = MockAddEpisodeResult()
+        service._verify_episode_referents = AsyncMock(side_effect=exc_type('interrupted'))
+
+        with pytest.raises(exc_type):
+            await service._reconcile_episode_identity(mock_result, group_id='test')
 
     # best-effort per-sub-pass guard
 
@@ -5618,7 +5739,9 @@ class TestWriteTimeIdentityGate:
         assert observed_same_lock.get('add_episode') is True
         assert observed_same_lock.get('reconcile') is True
         assert lock.locked() is False, 'lock must be released after _execute_graphiti_write returns'
-        service._reconcile_episode_identity.assert_awaited_once_with(mock_result, group_id='test')
+        service._reconcile_episode_identity.assert_awaited_once_with(
+            mock_result, group_id='test', referents=(),
+        )
 
     @pytest.mark.asyncio
     async def test_concurrent_same_group_writes_serialize_b1(self, service):

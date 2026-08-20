@@ -1052,3 +1052,88 @@ class TestReferentsSurviveTheRealQueue:
 
         await poll_until(lambda: seen, message='the callback never fired')
         assert seen[0]['referents'] == blob
+
+
+class TestExecuteGraphitiWriteHandsReferentsToZeta:
+    """The executor hands the DECODED set to the verification sub-pass (task
+    3671, PRD leaf zeta), inside the identity lock — at the call site epsilon's
+    own comment reserved for it."""
+
+    @pytest.mark.asyncio
+    async def test_a_new_format_row_reaches_the_reconcile_with_the_decoded_set(
+        self, service,
+    ):
+        """The decoded ReferentSet, not the wire blob."""
+        service._reconcile_episode_identity = AsyncMock(return_value={})
+
+        await service._execute_graphiti_write(
+            'add_episode',
+            _graphiti_payload(referents=_encoded('derived', Referent(number='3127'))),
+        )
+
+        assert service._reconcile_episode_identity.call_args[1]['referents'] == (
+            Referent(number='3127'),
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_old_format_row_reaches_it_with_an_empty_set(self, service):
+        """The load-bearing back-compat path, still executing unchanged."""
+        service._reconcile_episode_identity = AsyncMock(return_value={})
+
+        await service._execute_graphiti_write('add_episode', _graphiti_payload())
+
+        assert service._reconcile_episode_identity.call_args[1]['referents'] == ()
+
+    @pytest.mark.asyncio
+    async def test_a_degraded_blob_reaches_it_as_an_empty_set(self, service):
+        """`_decode_referents` is all-or-nothing precisely because a PARTIAL set
+        would read as a conflation to zeta and drive eta's edge surgery onto the
+        wrong node. An empty set no-ops the pass instead."""
+        service._reconcile_episode_identity = AsyncMock(return_value={})
+
+        await service._execute_graphiti_write(
+            'add_episode',
+            _graphiti_payload(referents={'source': 'derived', 'refs': 'not-a-list'}),
+        )
+
+        assert service._reconcile_episode_identity.call_args[1]['referents'] == ()
+
+    @pytest.mark.asyncio
+    async def test_the_backend_kwargs_are_still_untouched(self, service):
+        """zeta reads the set AFTER the write; the backend never sees it."""
+        service._reconcile_episode_identity = AsyncMock(return_value={})
+
+        await service._execute_graphiti_write(
+            'add_episode',
+            _graphiti_payload(referents=_encoded('derived', Referent(number='3127'))),
+        )
+
+        assert service.graphiti.add_episode.call_args[1] == {
+            **_TODAYS_BACKEND_KWARGS, 'source': EpisodeType.text,
+        }
+
+    @pytest.mark.asyncio
+    async def test_the_verification_runs_while_the_identity_lock_is_held(self, service):
+        """No wrongly-attached state may be externally visible between the write
+        and its verification, so zeta must run INSIDE the critical section —
+        mirrors the TestWriteTimeIdentityGate probe in test_memory_service.py."""
+        lock = service.graphiti._identity_lock_for('test')
+        observed = {}
+
+        async def _probe(result, *, group_id, referents):
+            observed['locked'] = lock.locked()
+            observed['same_lock'] = service.graphiti._identity_lock_for(group_id) is lock
+            observed['referents'] = referents
+            return {}
+
+        service._reconcile_episode_identity = AsyncMock(side_effect=_probe)
+
+        await service._execute_graphiti_write(
+            'add_episode',
+            _graphiti_payload(referents=_encoded('derived', Referent(number='3127'))),
+        )
+
+        assert observed['locked'] is True
+        assert observed['same_lock'] is True
+        assert observed['referents'] == (Referent(number='3127'),)
+        assert lock.locked() is False, 'the lock must be released on return'
