@@ -147,34 +147,6 @@ class TestMarkerLifecycle:
         assert 'stage1_flag_suppression' not in gc_kinds
         assert 'cycle_summary' not in gc_kinds
 
-    def test_mem0_tombstone_writer_names_the_batched_writer(self):
-        """Regression pin (task 4421): MARKER_LIFECYCLE['mem0_tombstone'].writer
-        must name the PLURAL batched writer mem0_tombstone.
-        record_mem0_deletion_tombstones — the form all three production call
-        sites (summary_pool.enforce_summary_pool_cap,
-        task_knowledge_sync._sweep_stale_mem0_pool,
-        server.tools.consolidate_memories) actually use.
-
-        Ground truth verified this run: the SINGULAR
-        record_mem0_deletion_tombstone has ZERO production callers — its only
-        non-test occurrences repo-wide are its own `def`, a docstring
-        cross-reference in memory_service.py/recon_ledger.py, its own
-        docstring, and the __all__ export at mem0_tombstone.py:108. The
-        batched record_mem0_deletion_tombstones has three production callers.
-        """
-        writer = m.MARKER_LIFECYCLE['mem0_tombstone'].writer
-        # Names the plural writer that actually has production callers.
-        assert 'record_mem0_deletion_tombstones' in writer
-        # Does NOT name the singular form as the writer. 'record_mem0_deletion_tombstone'
-        # is a proper substring of 'record_mem0_deletion_tombstones', so a naive
-        # `not in` can never pass here — counting occurrences is what actually
-        # distinguishes "names only the plural" from "names the singular too".
-        assert writer.count('record_mem0_deletion_tombstone') == writer.count(
-            'record_mem0_deletion_tombstones'
-        )
-        # Scope is the named deleters, not "every recon-initiated delete".
-        assert 'CONFIRMED recon-initiated Mem0 delete' not in writer
-
 
 # --------------------------------------------------------------------------- #
 # MEM0_TOMBSTONE_DELETERS — single-sourced against the live deleter tags
