@@ -1912,6 +1912,18 @@ class UsageGate:
 
         Returns ``True`` if the invocation succeeded (no cap hit), ``False``
         otherwise.  Uses haiku to minimise cost (~$0.001 per probe).
+
+        Raises:
+            ProbeSpawnError: The probe could not be SPAWNED (task 4512) — the
+                binary is missing, non-executable, or otherwise unstartable.
+                A ``bool`` return always means the probe RAN, so ``False`` is
+                real evidence the account is still blocked; the exception
+                means no evidence was gathered at all. The return TYPE is
+                deliberately left a ``bool`` rather than widened to a
+                tri-state: ~60 call sites across three packages stub this
+                method with ``AsyncMock(return_value=True/False)``, and a new
+                enum member would silently compare unequal to those and be
+                re-read as "still capped".
         """
         _PROBE_TIMEOUT = 30
 
@@ -1941,8 +1953,18 @@ class UsageGate:
             env['CLAUDE_CODE_OAUTH_TOKEN'] = acct.token
         env['CLAUDE_CONFIG_DIR'] = str(config_dir.path)
 
-        proc: asyncio.subprocess.Process | None = None
-        pgid: int | None = None
+        # The spawn is guarded SEPARATELY from the read (task 4512), and the
+        # separation is structural rather than a matter of arm ordering.
+        # On py3.13 `issubclass(TimeoutError, OSError)` is True and
+        # `asyncio.TimeoutError is TimeoutError`, so an `except OSError` arm
+        # sharing a try with `communicate()` — at ANY position ahead of the
+        # existing `except TimeoutError` — would silently reclassify every
+        # 30-second probe timeout as a missing-binary host fault. Keeping the
+        # OSError arm on a try that cannot raise TimeoutError (no timeout is
+        # applied to the spawn) means a later edit reshuffling handlers cannot
+        # reintroduce that. It also gets a second case right for free: a
+        # mid-read BrokenPipeError/ConnectionResetError is an OSError, but the
+        # probe DID run, so it correctly keeps its `False` verdict below.
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -1951,8 +1973,27 @@ class UsageGate:
                 env=env,
                 start_new_session=True,
             )
-            # Capture pgid at spawn (pgid == pid under start_new_session).
-            pgid = proc.pid
+        except OSError as exc:
+            logger.error(
+                'Account %s: probe binary %r could not be spawned: %s — '
+                'INFRASTRUCTURE FAULT, not a usage cap',
+                acct.name, cmd[0], exc,
+            )
+            raise ProbeSpawnError(cmd[0], exc) from exc
+        except Exception as exc:
+            # Deliberately NARROWER than the OSError arm above. Splitting the
+            # try moved the spawn out from under the read's generic handler,
+            # so this restores it — a non-OSError here is a caller-side bug or
+            # a mocking accident, not evidence about the host, and must not
+            # latch the gate unhealthy. asyncio.CancelledError is a
+            # BaseException and so still propagates past this, keeping the
+            # shutdown-drain contract intact.
+            logger.warning(f'Account {acct.name}: probe error: {exc}')
+            return False
+
+        # Capture pgid at spawn (pgid == pid under start_new_session).
+        pgid = proc.pid
+        try:
             stdout_bytes, stderr_bytes = await asyncio.wait_for(
                 proc.communicate(),
                 timeout=_PROBE_TIMEOUT,
