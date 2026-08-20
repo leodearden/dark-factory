@@ -35,6 +35,7 @@ from fastmcp.exceptions import ToolError
 from shared.mcp_markup_middleware import RepairPolicy
 from shared.toolcall_markup import CANONICAL_OPENER_PREFIX, closer_for
 
+from fused_memory.server.main import _install_safe_tool_wrapper
 from fused_memory.server.markup_guard import install_markup_guard
 from fused_memory.server.tools import create_mcp_server
 
@@ -590,3 +591,196 @@ class TestStormEscape:
         assert payload['error_type'] == 'mcp_markup_detected'
         assert payload['repaired_call']['agent_id'] == _AGENT_ID
         mock_service.add_system_record.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# step-7: the guard must be LIVE on the real server, installed in the ONE
+# order prototype P4 forces.
+# ---------------------------------------------------------------------------
+
+
+def _leaked_add_system_record_arguments() -> dict[str, Any]:
+    """The step-1 specimen, reused so the order tests compare like with like."""
+    return {
+        'content': _leaked(_CLEAN_CONTENT, 'agent_id', _AGENT_ID),
+        'project_id': _PROJECT_ID,
+        'category': 'observations_and_summaries',
+    }
+
+
+def _build_server_installed(*, guard_first: bool) -> tuple[Any, AsyncMock]:
+    """A real server with BOTH ``call_tool`` wrappers, installed in either order.
+
+    Each wrapper is idempotent against its own sentinel and wraps whatever
+    ``call_tool`` it finds, so the install order alone decides which one ends up
+    OUTSIDE — which is exactly the variable under test.
+    """
+    mock_service = AsyncMock()
+    _pass_through(mock_service, 'add_system_record')
+    server = create_mcp_server(mock_service)
+
+    def _guard() -> None:
+        install_markup_guard(
+            server,
+            policy=RepairPolicy.REJECT_WITH_REPAIR,
+            known_projects=_KNOWN_PROJECTS,
+        )
+
+    if guard_first:
+        _guard()
+        _install_safe_tool_wrapper(server)
+    else:
+        _install_safe_tool_wrapper(server)
+        _guard()
+    return server, mock_service
+
+
+class TestInstalledOnTheRealServer:
+    """(a) The guard is wired into the process that actually serves agents.
+
+    A guard that only ever runs in its own tests contains nothing. The wiring
+    is pinned through the helper ``run_server`` calls rather than by driving
+    ``run_server`` itself, which builds stores, a reconciliation harness and two
+    uvicorn servers — the same reason ``_build_recon_report_components`` was
+    extracted from it. No assertion here reads source text.
+    """
+
+    def test_the_installer_helper_declares_the_reject_with_repair_tier(self):
+        """INV-1: the tier is declared at the interception point, not inferred.
+
+        REJECT_WITH_REPAIR is the PRD's declared tier for fused-memory
+        (section 4, C2). It also settles the PRD's open question 2:
+        add_system_record and update_memory take this SERVER default rather than
+        a per-tool tier, because a per-tool tier would be exactly the tool-name
+        inference INV-1 forbids.
+        """
+        from fused_memory.server import main as main_module
+
+        recorded: dict[str, Any] = {}
+
+        def _record(mcp: Any, **kwargs: Any) -> None:
+            recorded['mcp'] = mcp
+            recorded.update(kwargs)
+
+        known_projects = {'dark_factory': '/home/leo/src/dark-factory'}
+        server = create_mcp_server(AsyncMock())
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(main_module, 'install_markup_guard', _record)
+            main_module._install_tool_dispatch_guards(
+                server, known_projects=known_projects
+            )
+
+        assert recorded['mcp'] is server
+        assert recorded['policy'] is RepairPolicy.REJECT_WITH_REPAIR
+        assert recorded['known_projects'] is known_projects
+
+    def test_the_installer_helper_installs_both_wrappers(self):
+        """Unpatched, the helper leaves both sentinels set on the one tool
+        manager — the guard is added to the defence-in-depth wrapper, never
+        substituted for it."""
+        from fused_memory.server.main import _install_tool_dispatch_guards
+
+        server = create_mcp_server(AsyncMock())
+        _install_tool_dispatch_guards(server, known_projects=_KNOWN_PROJECTS)
+
+        manager = server._tool_manager
+        assert getattr(manager, '_fused_memory_safe_wrapped', False) is True
+        assert getattr(manager, '_fused_memory_markup_guarded', False) is True
+
+    def test_run_server_installs_the_guards_through_that_helper(self):
+        """The link the helper tests cannot make on their own.
+
+        Reads the COMPILED code object's global references, not source text:
+        ``co_names`` is what the interpreter will actually look up when the
+        coroutine runs, so a call deleted, renamed or commented out fails here
+        while reformatting, re-indenting or moving the call does not.
+        """
+        from fused_memory.server.main import run_server
+
+        assert '_install_tool_dispatch_guards' in run_server.__code__.co_names, (
+            'run_server no longer installs the tool-dispatch guards: the markup '
+            'boundary would be absent from the process that serves agents'
+        )
+
+
+class TestInstallationOrder:
+    """(b) The substantive assertion, and the regression it prevents.
+
+    The bundled ``Tool.run`` wraps EVERY tool-body exception into ToolError, so
+    ``_safe_call_tool`` cannot be taught to re-raise ToolError without gutting
+    the containment tests/test_tool_safe_wrapper.py pins. The guard therefore
+    has to sit OUTSIDE it. That is a property of the pair, so it is pinned by a
+    test rather than by a comment.
+    """
+
+    @pytest.mark.asyncio
+    async def test_guard_outside_the_safe_wrapper_delivers_the_payload_intact(self):
+        server, mock_service = _build_server_installed(guard_first=False)
+
+        with pytest.raises(ToolError) as exc_info:
+            await server._tool_manager.call_tool(
+                'add_system_record', _leaked_add_system_record_arguments()
+            )
+
+        payload = _payload(exc_info)
+        assert payload['error_type'] == 'mcp_markup_detected'
+        assert payload['field'] == 'content'
+        assert payload['repaired_call']['content'] == _CLEAN_CONTENT
+        assert payload['repaired_call']['agent_id'] == _AGENT_ID
+        mock_service.add_system_record.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_guard_inside_the_safe_wrapper_degrades_the_payload(self):
+        """The negative control: reverse the two calls and the diagnosis is lost.
+
+        The rejection still happens — nothing is written either way — but the
+        safe wrapper catches the guard's ToolError and flattens it into its own
+        ``{'error': str, 'error_type': str}`` shape. ``repaired_call`` stops
+        being a key the caller can read and survives only as text inside an
+        opaque string, so the agent cannot resubmit the repair. This is why the
+        two calls must not be 'tidied' into the other order.
+        """
+        server, mock_service = _build_server_installed(guard_first=True)
+
+        result = await server._tool_manager.call_tool(
+            'add_system_record', _leaked_add_system_record_arguments()
+        )
+
+        assert isinstance(result, dict)
+        assert result['error_type'] == 'ToolError'
+        assert 'repaired_call' not in result
+        assert 'error_type' in result and result['error_type'] != 'mcp_markup_detected'
+        # The diagnosis is not destroyed, only buried: it is now a substring of
+        # an opaque error message instead of a structured field.
+        assert 'repaired_call' in result['error']
+        mock_service.add_system_record.assert_not_awaited()
+
+
+class TestReconReportServerIsNotGuarded:
+    """(c) The second ``_install_safe_tool_wrapper`` call site stays bare.
+
+    The recon-report server hosts the cite_* / report tools and no write tools,
+    so it has no write boundary to guard. Asserting that keeps it from being
+    wired by accident when the two call sites are next edited together.
+    """
+
+    def _make_config(self) -> Any:
+        from fused_memory.config.schema import (
+            FusedMemoryConfig,
+            ReconciliationConfig,
+            ServerConfig,
+        )
+
+        return FusedMemoryConfig(
+            server=ServerConfig(recon_report_port=8003, host='127.0.0.1'),
+            reconciliation=ReconciliationConfig(recon_report_state_ttl_seconds=300),
+        )
+
+    def test_recon_report_server_gets_the_safe_wrapper_but_not_the_guard(self):
+        from fused_memory.server.main import _build_recon_report_components
+
+        _, mcp, _ = _build_recon_report_components(self._make_config())
+
+        manager = mcp._tool_manager
+        assert getattr(manager, '_fused_memory_safe_wrapped', False) is True
+        assert getattr(manager, '_fused_memory_markup_guarded', False) is False
