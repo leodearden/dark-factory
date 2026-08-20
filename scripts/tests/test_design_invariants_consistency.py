@@ -2263,3 +2263,108 @@ def test_noncanonical_citations_fails_loudly_on_an_empty_family() -> None:
         noncanonical_citations([(1, "structured-facts-at-failure")], [])
 
     assert "family" in str(excinfo.value).lower()
+
+
+# ---------------------------------------------------------------------------
+# _citation_scan_files — the drift scan's file walk
+#
+# The `.py`-and-`.md` sibling of `_enumeration_scan_files`. Two walks that must
+# agree on a prune policy byte-for-byte would be exactly the lock-step
+# duplication INV-5 forbids — and this module exists to enforce that family — so
+# both are built on ONE shared walker and differ only in their extension set and
+# in this module's self-exclusion.
+#
+# SELF-EXCLUSION IS NOT COSMETIC. The fixtures above embed deliberate decoy
+# pairings (`INV-3 dangling-successor-edge`, `INV-2 no-silent-fail`) and a
+# phantom citation. Without excluding this file, the live assertions would go
+# red on the guard's own test data — the identical hazard `_scan_label`'s
+# docstring documents for the `tmp_path` fixtures.
+# ---------------------------------------------------------------------------
+
+_THIS_MODULE = Path(__file__).resolve()
+
+
+def _write_scan_tree(root: Path, relative_paths: list[str]) -> None:
+    """Create an empty file at each of *relative_paths* under *root*."""
+    for relative in relative_paths:
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("", encoding="utf-8")
+
+
+def test_citation_scan_files_collects_python_and_markdown(tmp_path: Path) -> None:
+    """Both extensions, and NOTHING else — `.jsonl` in particular.
+
+    The extension set is what keeps `shared/tests/fixtures/toolcall_markup_corpus
+    .jsonl` structurally out of reach. That file carries the phantom slug but is
+    a CAPTURED replay corpus, regenerated only by its extract script; a guard
+    that reported it would invite a hand-edit that corrupts the fixture.
+    """
+    _write_scan_tree(tmp_path, ["a.py", "b.md", "corpus.jsonl", "notes.txt", "pkg/c.py"])
+
+    assert _citation_scan_files(root=tmp_path) == [
+        tmp_path / "a.py",
+        tmp_path / "b.md",
+        tmp_path / "pkg" / "c.py",
+    ]
+
+
+def test_citation_scan_files_prunes_the_point_in_time_record_trees(tmp_path: Path) -> None:
+    """`plans/` and `docs/prds/` stay pruned, via the SHARED `_in_excluded_tree`.
+
+    Reused rather than re-specified: those trees hold PRDs and capability
+    manifests that transcribe slugs as G7 walk records of the family AS IT WAS,
+    so a citation there is history, not drift, and repairing it would mean
+    rewriting the record.
+    """
+    _write_scan_tree(
+        tmp_path, ["plans/a-prd.md", "docs/prds/b-prd.py", "docs/legibility/c.md"]
+    )
+
+    assert _citation_scan_files(root=tmp_path) == [tmp_path / "docs" / "legibility" / "c.md"]
+
+
+def test_citation_scan_files_prunes_dot_and_vendored_directories(tmp_path: Path) -> None:
+    """Dot-directories and vendored trees are pruned for the same cost reason.
+
+    `.worktrees/` in the main checkout holds a full repo copy per in-flight task,
+    which is what made an unpruned glob unfinishable in 120s when the enumeration
+    scan measured it.
+    """
+    _write_scan_tree(
+        tmp_path,
+        [
+            ".worktrees/3803/a.py",
+            "node_modules/b.md",
+            "pkg/__pycache__/c.py",
+            "pkg/keep.py",
+        ],
+    )
+
+    assert _citation_scan_files(root=tmp_path) == [tmp_path / "pkg" / "keep.py"]
+
+
+def test_citation_scan_files_excludes_this_guard_module() -> None:
+    """LIVE: the scan never reads the file whose fixtures are deliberate decoys.
+
+    Two-sided on purpose. Absence alone would also be satisfied by a walk that
+    collected nothing at all, so this pins that the same walk DOES reach this
+    module's directory — the exclusion is targeted, not a broken walk.
+    """
+    scanned = _citation_scan_files()
+
+    assert _THIS_MODULE not in scanned
+    assert _THIS_MODULE.parent / "conftest.py" in scanned
+
+
+def test_citation_scan_files_fails_loudly_on_an_empty_scan(tmp_path: Path) -> None:
+    """An empty result RAISES rather than reporting a clean repo.
+
+    Same contract as `unregistered_enumeration_sites`: "no drift found" and
+    "nothing was read" are indistinguishable downstream, and only one of them is
+    good news.
+    """
+    with pytest.raises(AssertionError) as excinfo:
+        _citation_scan_files(root=tmp_path)
+
+    assert "no files" in str(excinfo.value).lower()
