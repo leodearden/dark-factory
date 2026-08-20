@@ -50,19 +50,25 @@ class TripwireHit:
 # otherwise-unreferenced one can be garbage-collected mid-flight; membership
 # in this set is what supplies the strong reference until the task ends.
 #
-# Mirrors the sibling ``_ABANDONED_PROBES`` registry in
-# dashboard/src/dashboard/app.py:567 (task 4089), but this module does NOT
-# call that package's ``track_task`` helper (dashboard/src/dashboard/data/db.py:24)
-# — nor could it: orchestrator has no dependency edge onto the leaf dashboard
-# UI package. More to the point, ``_log_abandoned_oracle_cleanup`` below is
-# already a strict superset of ``track_task``'s inner ``_release``: it
-# consumes the task's exception (the "exception was never retrieved" guard)
-# *and* logs at DEBUG for diagnostics, which ``_release`` does not. Calling
-# ``track_task`` here would install a SECOND done-callback retrieving the
-# same exception a second time — precisely the duplication ``track_task``
-# exists to eliminate. Only the strong reference was missing, so that is all
-# this registry plus ``_abandon_oracle`` below adds.
+# Mirrors the sibling ``_ABANDONED_PROBES`` / ``_abandon_probe`` registry in
+# dashboard/src/dashboard/app.py (task 4089). This module does NOT call that
+# package's ``track_task`` helper (dashboard/src/dashboard/data/db.py) —
+# orchestrator has no dependency edge onto the leaf dashboard UI package, and
+# ``_log_abandoned_oracle_cleanup`` below already does everything
+# ``track_task``'s ``_release`` does (consumes the task's exception) plus
+# DEBUG diagnostics it doesn't, so only the strong reference was missing
+# here. This is now the THIRD near-identical copy of this pattern (the other
+# two live in dashboard/); a follow-up (fused-memory ticket
+# tkt_0RSP5RCWJGY202HZ0ZA0QRYCHE, dark_factory project) tracks consolidating
+# it into shared/.
 _ABANDONED_ORACLES: set[asyncio.Task] = set()
+
+# A handful of concurrently-abandoned oracles is already unusual — at most
+# one runs per merge landing. Crossing this many pending cleanups signals a
+# persistent backlog (e.g. a wedged oracle whose grandchild holds the
+# stdout/stderr pipes open — see _run_load_bearing_oracle's docstring) worth
+# a human looking at, not one slow oracle; see _abandon_oracle below.
+_ABANDONED_ORACLES_WARN_THRESHOLD = 8
 
 
 def _log_abandoned_oracle_cleanup(task: asyncio.Task) -> None:
@@ -94,12 +100,26 @@ def _log_abandoned_oracle_cleanup(task: asyncio.Task) -> None:
 def _abandon_oracle(task: asyncio.Task) -> None:
     """Cancel *task* fire-and-forget and hold a strong reference until it ends.
 
-    Mirrors ``_abandon_probe``, dashboard/src/dashboard/app.py:570-573 (task
+    Mirrors ``_abandon_probe`` in dashboard/src/dashboard/app.py (task
     4089) — the landed sibling fix for the same defect class.
+
+    Also logs a WARNING naming the registry size once it exceeds
+    :data:`_ABANDONED_ORACLES_WARN_THRESHOLD`: the per-call WARNING already
+    logged by ``_run_load_bearing_oracle`` on timeout reads as a transient
+    hiccup, so a persistent pile-up would otherwise stay invisible until
+    something else notices the memory.
     """
     task.cancel()  # fire-and-forget — do NOT await the unwinding
     _ABANDONED_ORACLES.add(task)
     task.add_done_callback(_log_abandoned_oracle_cleanup)
+    backlog = len(_ABANDONED_ORACLES)
+    if backlog > _ABANDONED_ORACLES_WARN_THRESHOLD:
+        logger.warning(
+            '_run_load_bearing_oracle: %d abandoned oracle tasks still '
+            'pending cleanup — possible persistent backlog (e.g. a wedged '
+            'oracle grandchild holding the stdout/stderr pipes open)',
+            backlog,
+        )
 
 
 async def _run_load_bearing_oracle(

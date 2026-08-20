@@ -16,6 +16,7 @@ test_merge_queue_lifecycle_registry.py / test_merge_queue_request_liveness.py.
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from pathlib import Path
 from typing import Any
@@ -231,7 +232,7 @@ class TestAbandonedOracleRegistry:
         setup. Clearing would drop the strong reference to a task left
         in-flight by an earlier test, which would GC it mid-flight — exactly
         the hazard this registry exists to prevent. Mirrors
-        ``_drained_probe_registry`` (dashboard/tests/test_healthz_deadline.py:628-646).
+        ``_drained_probe_registry`` in dashboard/tests/test_healthz_deadline.py.
         A RED assertion failure here must fail loudly, not leak a pending
         task into the rest of the orchestrator suite.
         """
@@ -298,10 +299,11 @@ class TestAbandonedOracleRegistry:
         cancellation into a ``False`` verdict.
 
         ``timeout_secs=60.0`` is chosen STRUCTURALLY, not tuned (mirrors
-        task 4089's rationale at
-        dashboard/tests/test_healthz_deadline.py:658-662): 60s is
-        unreachable within this test's wall clock, so the caller's own
-        ``.cancel()`` is provably the ONLY thing that can end the
+        task 4089's rationale in
+        ``test_probe_db_abandons_and_tracks_on_every_exit_path``'s
+        ``caller_cancelled`` case, dashboard/tests/test_healthz_deadline.py):
+        60s is unreachable within this test's wall clock, so the caller's
+        own ``.cancel()`` is provably the ONLY thing that can end the
         coroutine — the oracle budget cannot have expired, which is what
         makes this a caller-cancellation test rather than a second
         timeout test. Waiting on ``stub.started`` rather than sleeping a
@@ -337,6 +339,73 @@ class TestAbandonedOracleRegistry:
         assert inner.cancelled(), 'abandoned oracle task was tracked but never actually cancelled'
         assert inner not in registry, (
             'abandoned oracle task leaked: still in _ABANDONED_ORACLES after it finished'
+        )
+
+    @pytest.mark.asyncio
+    async def test_successful_oracle_run_is_never_tracked_in_registry(
+        self,
+        tmp_path: Path,
+        _drained_oracle_registry,
+    ) -> None:
+        """A normally-completing oracle run — well within its timeout, caller
+        never cancelled — must never enter ``_ABANDONED_ORACLES``: only
+        genuinely abandoned tasks belong there. Pins the negative alongside
+        the positive cases above, so a future refactor could not register
+        every task at creation (relying solely on the done-callback to drain
+        it) while keeping every assertion above green.
+        """
+        from orchestrator.merge_skew_tripwire import _run_load_bearing_oracle
+
+        registry = _drained_oracle_registry
+        before = set(registry)
+        script = _write_oracle_script(tmp_path, exit_code=0)
+
+        result = await _run_load_bearing_oracle(
+            tmp_path, ['bash', str(script)], ['a.py'], timeout_secs=5.0,
+        )
+
+        assert result is True
+        assert registry == before, (
+            f'a normally-completing oracle task must never be tracked in '
+            f'_ABANDONED_ORACLES; registry changed to {registry!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_abandon_oracle_logs_warning_when_backlog_crosses_threshold(
+        self,
+        _drained_oracle_registry,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A persistent backlog of abandoned oracle tasks — e.g. several
+        landings in a row hitting a wedged oracle whose grandchild holds the
+        stdout/stderr pipes open (see ``_run_load_bearing_oracle``'s
+        docstring) — must be diagnosable from the log alone: the per-timeout
+        WARNING already logged by the caller reads as a transient hiccup,
+        not a pile-up.
+        """
+        from orchestrator import merge_skew_tripwire
+
+        registry = _drained_oracle_registry
+        before = set(registry)
+        threshold = merge_skew_tripwire._ABANDONED_ORACLES_WARN_THRESHOLD
+        tasks = [
+            asyncio.ensure_future(asyncio.Event().wait()) for _ in range(threshold + 1)
+        ]
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_skew_tripwire'):
+            for task in tasks:
+                merge_skew_tripwire._abandon_oracle(task)
+
+        expected_backlog = len(before) + threshold + 1
+        assert registry == before | set(tasks), (
+            'every newly-abandoned task must be tracked, and nothing pre-existing dropped'
+        )
+        assert any(
+            'abandoned oracle task' in r.message and str(expected_backlog) in r.message
+            for r in caplog.records
+        ), (
+            f'expected a backlog WARNING naming the count {expected_backlog}; '
+            f'got {[r.message for r in caplog.records]}'
         )
 
 
