@@ -1160,6 +1160,41 @@ class TestRunProbeSpawnFault:
             await gate._run_probe(acct)
 
 
+async def _drive_loop(
+    gate: UsageGate,
+    acct: AccountState,
+    *,
+    max_sleeps: int,
+) -> list[float]:
+    """Run `_account_resume_probe_loop` for a bounded number of iterations.
+
+    Same fake-clock shape as `TestProbeLoopBackoff._run_single_iteration`:
+    `asyncio.sleep` is replaced by a capture that never really waits, and the
+    account is uncapped on the last one so the loop's own `if not acct.capped:
+    return` terminates it. A persistently spawn-faulting probe would otherwise
+    loop forever — which is precisely the production symptom under test.
+
+    Note the off-by-one this shape implies: the uncapping sleep is followed by
+    the capped-check and a return, so N sleeps drive N-1 probes.
+    """
+    captured: list[float] = []
+    original_sleep = asyncio.sleep
+
+    async def capture_sleep(duration: float) -> None:
+        captured.append(duration)
+        if len(captured) >= max_sleeps:
+            acct.capped = False
+        await original_sleep(0)
+
+    with patch('asyncio.sleep', side_effect=capture_sleep):
+        await asyncio.wait_for(gate._account_resume_probe_loop(acct), timeout=5)
+    return captured
+
+
+def _count_matching(caplog, needle: str) -> int:
+    return sum(1 for r in caplog.records if needle in r.getMessage())
+
+
 def _spawn_fault(binary: str = 'claude') -> ProbeSpawnError:
     return ProbeSpawnError(
         binary, FileNotFoundError(2, 'No such file or directory', binary),
@@ -1308,6 +1343,205 @@ class TestProbeInfraFaultLatch:
 
         gate._clear_probe_spawn_failures(acct)
         assert gate.probe_infra_fault is None
+
+
+@pytest.mark.asyncio
+class TestProbeLoopSpawnFault:
+    """The resume loop must stop inventing a reset clock it cannot know.
+
+    Task 4512, the user-observable half. With `claude` unresolvable, every
+    probe failed to spawn and returned False; the loop read that as "still
+    capped", found `resets_at is None`, fabricated `now + 1h`, and logged
+    "no resets_at - defaulting to 1h" plus a synthetic "resets in 3600s"
+    countdown — forever. A permanent host fault presented as a self-inflicted
+    usage cap, indefinitely, with a confident-looking clock attached.
+
+    The second half of this class is the CONTROL: a genuine cap must not get
+    noisier or behave differently. Those tests are green before AND after the
+    fix, which is what makes them worth having — they pin that the non-fault
+    branch stayed byte-identical rather than merely still passing.
+    """
+
+    # --- the fault path -------------------------------------------------
+
+    async def test_spawn_fault_stops_repeating_the_fabricated_clock(self, caplog):
+        """The misleading lines fire once, pre-evidence, and never again.
+
+        Exactly once, not never. On the FIRST iteration the loop has not yet
+        run a probe, so it cannot know a spawn fault is coming — and it must
+        behave identically to a genuine cap at that point, or the control
+        tests below would be describing a different code path. What the fix
+        removes is the REPETITION: every iteration after the first knows, and
+        must not keep asserting a reset time it has no evidence for.
+
+        Driven well past the threshold (7 probes) so a still-repeating loop
+        would show 7 occurrences, not 1.
+        """
+        gate = make_gate(['a'], probe_interval_secs=1, max_probe_interval_secs=8)
+        acct = _capped_account(gate, resets_at=None)
+        gate._run_probe = AsyncMock(side_effect=_spawn_fault())
+
+        with caplog.at_level(logging.DEBUG, logger='shared.usage_gate'):
+            await _drive_loop(gate, acct, max_sleeps=8)
+
+        assert gate._run_probe.await_count == 7, 'test harness drove the wrong depth'
+        assert _count_matching(caplog, 'no resets_at') == 1, (
+            'the fabricated-1h default must not repeat once the loop knows '
+            'the probe cannot spawn'
+        )
+        assert _count_matching(caplog, 'resets in') == 1, (
+            'a synthetic countdown must not be reported for an account whose '
+            'reset time is genuinely unknown'
+        )
+
+    async def test_spawn_fault_never_writes_a_reset_time(self):
+        """`acct.resets_at` stays None — the unknown is preserved as unknown."""
+        gate = make_gate(['a'], probe_interval_secs=1, max_probe_interval_secs=8)
+        acct = _capped_account(gate, resets_at=None)
+        gate._run_probe = AsyncMock(side_effect=_spawn_fault())
+
+        await _drive_loop(gate, acct, max_sleeps=8)
+
+        assert acct.resets_at is None
+
+    async def test_spawn_fault_is_reported_as_infrastructure_and_latches(self, caplog):
+        gate = make_gate(['a'], probe_interval_secs=1, max_probe_interval_secs=8)
+        acct = _capped_account(gate, resets_at=None)
+        gate._run_probe = AsyncMock(side_effect=_spawn_fault())
+
+        with caplog.at_level(logging.DEBUG, logger='shared.usage_gate'):
+            await _drive_loop(gate, acct, max_sleeps=_SPAWN_FAULT_THRESHOLD + 1)
+
+        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert errors, 'a host fault must reach ERROR level'
+        rendered = ' '.join(r.getMessage() for r in errors)
+        assert 'claude' in rendered, rendered
+        assert gate.probe_infra_fault is not None, (
+            f'{_SPAWN_FAULT_THRESHOLD} consecutive spawn faults must latch'
+        )
+
+    async def test_spawn_fault_still_backs_off_instead_of_hot_spinning(self):
+        """Retry cadence is preserved, so a missing binary is not a busy loop.
+
+        `probe_count` is still incremented for a faulted attempt — deliberately
+        — so the interval still doubles toward the ceiling. What the fix drops
+        is only the fabricated `resets_at`, not the backoff.
+        """
+        gate = make_gate(['a'], probe_interval_secs=1, max_probe_interval_secs=8)
+        acct = _capped_account(gate, resets_at=None)
+        gate._run_probe = AsyncMock(side_effect=_spawn_fault())
+
+        sleeps = await _drive_loop(gate, acct, max_sleeps=8)
+
+        assert sleeps, 'the loop must sleep between spawn attempts'
+        assert all(s > 0 for s in sleeps), sleeps
+        assert all(s <= 8 for s in sleeps), (
+            f'a sleep exceeded max_probe_interval_secs: {sleeps}'
+        )
+        assert sleeps[-1] > sleeps[0], f'backoff did not grow: {sleeps}'
+
+    async def test_spawn_fault_leaves_the_account_capped(self):
+        """Fail-visible, not fail-open.
+
+        We could not verify capacity, and an invocation would die at the same
+        missing binary anyway — so the account stays CAPPED. The honest
+        difference from today is that its reset time stays unknown rather than
+        invented.
+        """
+        gate = make_gate(['a'], probe_interval_secs=1, max_probe_interval_secs=8)
+        acct = _capped_account(gate, resets_at=None)
+        gate._run_probe = AsyncMock(side_effect=_spawn_fault())
+
+        captured: list[bool] = []
+        original_sleep = asyncio.sleep
+
+        async def capture_sleep(duration: float) -> None:
+            captured.append(acct.capped)
+            if len(captured) >= 5:
+                acct.capped = False
+            await original_sleep(0)
+
+        with patch('asyncio.sleep', side_effect=capture_sleep):
+            await asyncio.wait_for(
+                gate._account_resume_probe_loop(acct), timeout=5,
+            )
+
+        assert all(captured), (
+            'the account was uncapped mid-fault: a probe that never ran is '
+            'not evidence of capacity'
+        )
+
+    async def test_recovery_clears_the_latch_and_then_resumes(self):
+        """fault, fault, ran-and-capped, ran-and-free.
+
+        The `False` is the load-bearing one: it clears BOTH the counter and
+        the latch even though the account is still capped, because a probe
+        that returned at all proves the binary spawns.
+        """
+        gate = make_gate(['a'], probe_interval_secs=1, max_probe_interval_secs=8)
+        acct = _capped_account(gate, resets_at=None)
+        gate._run_probe = AsyncMock(
+            side_effect=[_spawn_fault(), _spawn_fault(), False, True],
+        )
+
+        await _drive_loop(gate, acct, max_sleeps=20)
+
+        assert gate._run_probe.await_count == 4
+        assert acct.probe_spawn_failures == 0
+        assert gate.probe_infra_fault is None
+        assert not acct.capped, 'the final successful probe must still resume'
+
+    # --- the control: a genuine cap must not get noisier ----------------
+
+    async def test_genuine_cap_keeps_every_existing_log_line(self, caplog):
+        """The non-fault branch is byte-identical, and this is what says so.
+
+        A fix that made real caps noisier — or quieter — would be a
+        regression in the opposite direction, and nothing else in the suite
+        would catch it: every other cap test asserts on state, not on the
+        operator-facing narration.
+        """
+        gate = make_gate(['a'], probe_interval_secs=1, max_probe_interval_secs=8)
+        acct = _capped_account(gate, resets_at=None)
+        gate._run_probe = AsyncMock(side_effect=[False, True])
+
+        with caplog.at_level(logging.DEBUG, logger='shared.usage_gate'):
+            await _drive_loop(gate, acct, max_sleeps=20)
+
+        assert _count_matching(caplog, 'no resets_at') >= 1
+        assert _count_matching(caplog, 'resets in') >= 1
+        assert _count_matching(caplog, 'retrying after backoff') == 1
+        warnings = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and 'no resets_at' in r.getMessage()
+        ]
+        assert warnings, 'the 1h-default line must stay a WARNING'
+
+    async def test_genuine_cap_is_not_an_infrastructure_fault(self):
+        """A probe that RAN and found the account capped latches nothing."""
+        gate = make_gate(['a'], probe_interval_secs=1, max_probe_interval_secs=8)
+        acct = _capped_account(gate, resets_at=None)
+        gate._run_probe = AsyncMock(side_effect=[False, True])
+
+        await _drive_loop(gate, acct, max_sleeps=20)
+
+        assert gate.probe_infra_fault is None
+        assert acct.probe_spawn_failures == 0
+
+    async def test_genuine_cap_still_resumes_and_fires_one_resumed_event(self):
+        store = make_mock_cost_store()
+        gate = make_gate(
+            ['a'], cost_store=store, probe_interval_secs=1, max_probe_interval_secs=8,
+        )
+        acct = _capped_account(gate, resets_at=None)
+        gate._run_probe = AsyncMock(side_effect=[False, True])
+
+        with patch.object(gate, '_write_cost_event', new_callable=AsyncMock) as mock_write:
+            await _drive_loop(gate, acct, max_sleeps=20)
+
+        assert not acct.capped
+        assert mock_write.await_count == 1
+        assert mock_write.call_args[0][1] == 'resumed'
 
 
 @pytest.mark.asyncio
