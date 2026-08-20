@@ -901,6 +901,15 @@ _BLESSED_METADATA_KEYS: frozenset[str] = frozenset(
         'before_done_verified_at',
         'before_done_verified_pid',
         'files_tagged_at',
+        # The module tagger's affirmative "no local file predicted" verdict,
+        # written unconditionally as a bool in the SAME payload and by the
+        # same line of code as the files_tagged_at sentinel above (task 3122).
+        # Tier-A rather than parked in the x_ forward-compat namespace: it is
+        # a first-class, permanently-written signal produced by a funded
+        # orchestrator stage, not an ad-hoc one-off. Unblessed it would emit
+        # an unknown_key drift warning on EVERY tagger batch — noise in the
+        # very census it exists to make readable. Task 3121 is its consumer.
+        'files_tagged_empty',
         # Finding-provenance family (esc-3796-1, 2026-08-17). `source_finding_id`
         # is the CANONICAL key naming the finding a task was spawned from;
         # `stage1_finding_id` is a distinct canonical key naming a Stage-1
