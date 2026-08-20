@@ -1873,6 +1873,110 @@ def test_parse_flock_gate_waits_returns_empty_for_uninstrumented_stderr():
 
 
 # ---------------------------------------------------------------------------
+# Task 4474 -- watchdog twin of the flock-gate timing bootstrap above.  Same
+# defect class, same remedy: task 4248's verify attempt-1 observed
+# test_watchdog_timeout_env_override_fires_fast_without_heartbeat's OUTER
+# wall-clock fire_delay (pgid-file appearance to proc.wait() return) at
+# 19.75s under a full-suite xdist storm -- past even the 15.0s production
+# un-wired-override window, so no widened ceiling could both accommodate
+# that and still discriminate a wired override from an un-wired one.  The
+# outer measurement was never purely the watchdog's own window: it also
+# carries scheduler latency between the watchdog thread actually firing and
+# this PARENT process observing proc.wait() return, which balloons under
+# CPU contention exactly like the import cost the old pgid-file wait was
+# already compensating for (task 2921's own inline comment claiming
+# otherwise is what the 19.75s observation falsifies).
+#
+# So, exactly as FLOCK_GATE_TIMING_BOOTSTRAP does for
+# orchestrator.cli.acquire_merge_verify_flock, WATCHDOG_GATE_TIMING_BOOTSTRAP
+# wraps the OTHER production callable cli.py invokes on this seam --
+# orchestrator.cli.start_stdin_watchdog -- so the ``fire`` callback handed to
+# the real watchdog thread is itself wrapped in a stopwatch armed the instant
+# start_stdin_watchdog is called (i.e. immediately before the watchdog
+# thread starts its blocking select loop) and stopped the instant the
+# thread's fire callback actually runs -- before that callback goes on to
+# kill the build subtree and unconditionally ``os._exit(1)``
+# (fire_watchdog_kill).  The stopwatch flushes stderr explicitly before
+# delegating to the real fire callback, since os._exit bypasses normal
+# Python-level buffer flushing.  The reported fire_delay is therefore the
+# watchdog's own measured arm-to-fire window, immune to outer scheduler
+# noise and the storm that falsified the old wall-clock assertion.
+# ---------------------------------------------------------------------------
+
+#: Marker token the instrumented bootstrap prints, one line per watchdog fire.
+WATCHDOG_GATE_MARKER = '__WATCHDOG_GATE__'
+
+WATCHDOG_GATE_TIMING_BOOTSTRAP = f"""
+import sys, time
+import orchestrator.cli as _cli
+_real_start_stdin_watchdog = _cli.start_stdin_watchdog
+
+
+def _timed_start_stdin_watchdog(pgid, *, fire=None, **kwargs):
+    _t0 = time.monotonic()
+    _real_fire = fire
+
+    def _timed_fire():
+        _elapsed = time.monotonic() - _t0
+        print(
+            '{WATCHDOG_GATE_MARKER} fire_delay=%.4f' % _elapsed,
+            file=sys.stderr,
+        )
+        sys.stderr.flush()
+        if _real_fire is not None:
+            _real_fire()
+
+    return _real_start_stdin_watchdog(pgid, fire=_timed_fire, **kwargs)
+
+
+_cli.start_stdin_watchdog = _timed_start_stdin_watchdog
+_cli.main()
+"""
+
+_WATCHDOG_GATE_RE = re.compile(
+    re.escape(WATCHDOG_GATE_MARKER) + r' fire_delay=(?P<fire_delay>\S+)'
+)
+
+
+def parse_watchdog_gate_fire_delays(stderr: str) -> list[float]:
+    """Parse the :data:`WATCHDOG_GATE_TIMING_BOOTSTRAP` lines out of a child's stderr."""
+    return [float(m.group('fire_delay')) for m in _WATCHDOG_GATE_RE.finditer(stderr)]
+
+
+def test_watchdog_gate_timing_bootstrap_parses_its_own_marker_lines():
+    """parse_watchdog_gate_fire_delays round-trips the bootstrap's marker format.
+
+    Mirrors test_flock_gate_timing_bootstrap_parses_its_own_marker_lines: the
+    bootstrap emits its lines from inside a spawned child, so a drift between
+    what it prints and what the parser accepts would silently return zero
+    observations -- which would make the ceiling assertion in
+    test_watchdog_timeout_env_override_fires_fast_without_heartbeat vacuous
+    rather than red.  The emit format and this parser are therefore pinned
+    together here, with no subprocess involved.
+    """
+    emitted = (
+        f'{WATCHDOG_GATE_MARKER} fire_delay=0.6931\n'
+        'some unrelated stderr chatter\n'
+        f'{WATCHDOG_GATE_MARKER} fire_delay=14.9807\n'
+    )
+
+    assert parse_watchdog_gate_fire_delays(emitted) == [0.6931, 14.9807]
+
+
+def test_parse_watchdog_gate_fire_delays_returns_empty_for_uninstrumented_stderr():
+    """Stderr with no marker lines yields no observations.
+
+    Mirrors test_parse_flock_gate_waits_returns_empty_for_uninstrumented_stderr
+    -- this is the case the ceiling assertion's non-vacuity guard exists to
+    catch: if the CLI ever stops reaching the watchdog through the
+    module-level ``orchestrator.cli.start_stdin_watchdog`` name the bootstrap
+    patches, the child produces no marker lines at all, and an assertion over
+    an empty list would pass by default.
+    """
+    assert parse_watchdog_gate_fire_delays('Traceback (most recent call last):\nboom\n') == []
+
+
+# ---------------------------------------------------------------------------
 # Task 2309 step-1 RED -- env-var test seams for remote-side timing constants
 # (PRD SS11 Q1/Q2 tunability).  Production defaults are byte-identical when
 # unset; these overrides exist ONLY so the SS9 boundary rows below can run
@@ -1988,21 +2092,56 @@ def test_flock_wait_env_override_speeds_up_contention_result(tmp_path):
     )
 
 
+#: Ceiling on the CLI's own measured watchdog fire delay (armed -> fire,
+#: reported by the child's own clock via WATCHDOG_GATE_TIMING_BOOTSTRAP).
+#: Sits an order of magnitude above the ~0.7s override (0.5s heartbeat
+#: timeout + 0.2s kill grace) and comfortably under half of the 15.0s
+#: production window (10.0s heartbeat timeout + 5.0s kill grace) -- the same
+#: shape as FLOCK_WAIT_CEILING_SECS -- so it discriminates a wired override
+#: from an un-wired one with wide margin either side.
+WATCHDOG_FIRE_DELAY_CEILING_SECS = 7.0
+
+
+@pytest.mark.timeout(180)  # task 4474: one subprocess, wedge-detector wait widened
 def test_watchdog_timeout_env_override_fires_fast_without_heartbeat(tmp_path):
     """ORCH_WATCHDOG_HEARTBEAT_TIMEOUT_SECS/_KILL_GRACE_SECS override the watchdog window.
 
     Spawns a real verify-merge --request-id with stdin=PIPE and NEVER writes
-    a heartbeat.  Today (RED) the watchdog uses the 10s+5s production window;
-    asserting the process self-exits non-zero within a few seconds fails
-    until cli.py threads the overrides into start_stdin_watchdog.
+    a heartbeat, asserting the watchdog fires and self-exits non-zero.
+
+    task 4474 (de-flake): the assertion is on the fire delay the CLI's OWN
+    clock measured, reported by :data:`WATCHDOG_GATE_TIMING_BOOTSTRAP` from
+    inside the child, NOT on an outer wall-clock measurement.
+
+    Task 2921 measured this as an OUTER wall-clock quantity -- pgid-file
+    appearance to proc.wait() return -- reasoning that absorbing the
+    load-sensitive ``from orchestrator.cli import main`` startup via the
+    pgid-file wait would leave the remaining wait purely watchdog-bound.
+    Task 4248's verify attempt-1 falsified that: under a full-suite xdist
+    storm the outer fire_delay came in at 19.75s -- past even the 15.0s
+    production un-wired-override window -- while an isolated rerun at the
+    same HEAD passed in 6.51s. The outer measurement was never purely the
+    watchdog's own window: it also carries scheduler latency between the
+    watchdog thread actually firing and this PARENT process observing
+    proc.wait() return, which balloons under CPU contention exactly like the
+    import cost the pgid-file wait was already compensating for. Same defect
+    and same remedy as test_flock_wait_env_override_speeds_up_contention_result
+    (task 3369): stop using wall clock as a proxy for a quantity the code
+    under test already measures itself.
+
+    The child still runs the real CLI end to end -- real argv, real config,
+    real env, a real watchdog thread racing a real select() on fd 0. The
+    bootstrap only wraps the production ``start_stdin_watchdog`` callable in
+    a stopwatch, so an un-wired override still shows up as a ~15s fire delay.
+    Its one failure mode -- the CLI reaching the watchdog by some path other
+    than the patched module-level name, leaving zero observations and a
+    vacuously-true ceiling -- is closed by the non-vacuity assertion below.
     """
     repo, head_sha = _setup_verify_repo(tmp_path)
     cfg_file = tmp_path / 'config.yaml'
     write_verify_config(cfg_file, repo, persistent_merge_worktree=False)
-    worktree_base = worktree_base_for(repo)
 
     REQUEST_ID = 'env-seam-watchdog-test'
-    pgf = pgid_file(worktree_base, REQUEST_ID)
 
     proc = spawn_verify_merge(
         sha=head_sha,
@@ -2013,34 +2152,25 @@ def test_watchdog_timeout_env_override_fires_fast_without_heartbeat(tmp_path):
             'ORCH_WATCHDOG_HEARTBEAT_TIMEOUT_SECS': '0.5',
             'ORCH_WATCHDOG_KILL_GRACE_SECS': '0.2',
         },
+        bootstrap=WATCHDOG_GATE_TIMING_BOOTSTRAP,
     )
     try:
-        # task 2921 (load-robustness): the child's ``from orchestrator.cli
-        # import main`` startup dominates wall-clock under a full-suite storm
-        # (~9s observed on a loaded host) and is unrelated to the watchdog
-        # window under test -- so the old bare ``proc.wait(timeout=9.0)`` was
-        # import-bound, not watchdog-bound, and flaked under parallel load.
-        # The --request-id run writes its pgid file at startup BEFORE doing any
-        # work (cli.py verify_merge) and the watchdog self-kills via
-        # ``os._exit(1)`` (which bypasses pgid-file cleanup), so waiting for
-        # the pgid file to appear absorbs the load-sensitive import cost; the
-        # subsequent ``fire_delay`` then measures only the watchdog fire delay.
-        wait_for_pgid_file(pgf, timeout=30.0)
-        armed = time.monotonic()
         # No heartbeat is ever written -- stdin stays open but silent, which
         # is sufficient to exercise the heartbeat-starvation timing path
-        # (Rows 1-3 later distinguish EOF vs. timeout precisely). Wait well
-        # past the 15s production window so an un-wired override is OBSERVED
-        # self-exiting (not merely timed out) and caught by the delay
-        # assertion below rather than masked as a hang.
+        # (Rows 1-3 later distinguish EOF vs. timeout precisely). This
+        # ceiling is a WEDGE DETECTOR, not a speed assertion (task 2376's
+        # lesson for the flock twin): the discriminating invariant is the
+        # WATCHDOG_FIRE_DELAY_CEILING_SECS assertion below, never this one,
+        # which only bounds a genuinely wedged child and so costs zero
+        # wall-clock on the success path.
         try:
-            proc.wait(timeout=30.0)
+            proc.wait(timeout=60.0)
         except subprocess.TimeoutExpired:
             pytest.fail(
-                'verify-merge did not self-exit within 30s of startup -- '
+                'verify-merge did not self-exit within 60s of startup -- '
                 'the watchdog did not fire at all'
             )
-        fire_delay = time.monotonic() - armed
+        stderr = proc.stderr.read() if proc.stderr is not None else b''
     finally:
         if proc.poll() is None:
             proc.kill()
@@ -2052,17 +2182,28 @@ def test_watchdog_timeout_env_override_fires_fast_without_heartbeat(tmp_path):
     assert proc.returncode != 0, (
         f'expected non-zero exit (watchdog self-kill), got {proc.returncode}'
     )
-    # task 2921 discriminant: the override (0.5s heartbeat timeout + 0.2s kill
-    # grace, ~0.7s total) must fire the watchdog FAR faster than the
-    # 10s+5s=15s production window. Measured from pgid-appearance (post-import),
-    # so this ceiling is a genuine watchdog budget, not an import budget. The
-    # 10.0s value sits well above the ~0.7s override (with generous load
-    # headroom) yet well below the 15s production window, so it still catches a
-    # regression that un-wires the override.
-    assert fire_delay < 10.0, (
-        f'watchdog self-exit took {fire_delay:.2f}s after startup -- expected '
-        f'well under the 15s production window (env override=0.5s+0.2s); the '
-        f'watchdog env overrides are not wired up'
+
+    fire_delays = parse_watchdog_gate_fire_delays(stderr.decode(errors='replace'))
+    # Non-vacuity guard: mirrors the flock twin's -- the ceiling assertion
+    # below is a max() over these observations, so an empty list would pass
+    # by default. Zero observations means the CLI no longer calls the
+    # watchdog through the module-level ``orchestrator.cli.start_stdin_watchdog``
+    # name the bootstrap patches -- a real signal that this test stopped
+    # measuring anything, not a pass.
+    assert fire_delays, (
+        'no instrumented watchdog-gate observation on the child stderr -- the '
+        'timing bootstrap patches orchestrator.cli.start_stdin_watchdog, so '
+        'zero observations means the watchdog is no longer reached through '
+        f'that name and the ceiling assertion below would be vacuous; '
+        f'stderr={stderr_tail(stderr)!r}'
+    )
+    longest = max(fire_delays)
+    assert longest < WATCHDOG_FIRE_DELAY_CEILING_SECS, (
+        f'expected the CLI-measured watchdog fire delay to be well under the '
+        f'15s production window (10s heartbeat timeout + 5s kill grace) given '
+        f'the 0.5s+0.2s env override -- longest={longest:.2f}s over '
+        f'{len(fire_delays)} fire(s): {fire_delays}; the watchdog env '
+        f'overrides are not wired up'
     )
 
 
