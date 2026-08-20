@@ -221,6 +221,21 @@ _LINKER_SIGNAL_RE = re.compile(r'signal:?\s*7\b|SIGBUS|Bus error', re.IGNORECASE
 # that is the signal to promote the sentinel to the primary contract (or to
 # lift the marker list into per-project `verify_env` config) rather than to
 # extend the alternation again.
+#
+# task 4492 IS the change-of-approach this note asked for, and it did NOT
+# come at the allowlist's expense: the list stays at THREE basenames, no
+# fourth was added, and no fourth veto was added either. What changed is the
+# LAYER — `_redact_passed_suite_blocks` scopes guard 3 to the output not
+# covered by a passing suite's attestation, so the recurring false positive
+# is removed by construction rather than by another shape-specific veto.
+#
+# That helper adds a SECOND reify coupling (run_all.sh's suite framing), so
+# weigh it against the same portability concern: it is strictly SAFER than
+# the allowlist's. An unrecognised or absent framing shape makes the helper
+# redact NOTHING, degrading to today's exact whole-output behaviour — i.e. a
+# non-reify project, or a future run_all that changes its framing, loses the
+# SCOPING and keeps full detection. The allowlist's failure mode is the
+# opposite and worse: an unrecognised emitter is a MISSED detection.
 # Trailing capture group (task 4212) added IN PLACE rather than via a second
 # line-anchored regex, so there is exactly one `^[ \t]*@@REIFY_SLOT_TIMEOUT@@`
 # literal to keep in sync with the anchoring contract above (task 3679 /
@@ -598,6 +613,38 @@ def _classify_environmental(output: str) -> FailureCategory | None:
     proceeds to per-tool dispatch) when none of these conditions is grounded
     in *output*.
 
+    SCOPING (task 4492). Every POSITIVE detector below reads
+    ``_redact_passed_suite_blocks(output)`` — the output with each PASSED
+    suite's interior blanked — while the one NEGATIVE/veto condition, the
+    ``_RUSTC_DIAGNOSTIC_SPAN_RE`` check on collateral shape 1, keeps reading
+    the FULL *output*. That asymmetry is deliberate and is what bounds the
+    change to ONE direction: redaction removes only positive evidence, so
+    this guard can move a classification AWAY from a guard-3 category but
+    never TOWARD one. Scoping the veto too would weaken a veto, i.e. make
+    ENV_TRANSIENT easier to reach — the false-GREEN direction that would
+    excuse a branch fault as host collateral.
+
+    THE INCIDENT. reify 5623 was held blocked 2026-08-09 -> 08-19 under a
+    false "disk pressure / SEMAPHORE_TIMEOUT" L1 — infra-hold routing instead
+    of debugfix — while the real cause was a ``test_reify_audit_ptodo.sh``
+    PTODO ratchet failure named in the same log's own tail
+    (``=== Summary: 145 discovered, 1 failed ===``). The three lines that
+    flipped the classification were emitted by suites reporting ZERO
+    failures.
+
+    WHY LINE-ANCHORING COULD NOT FIX IT, and why this needed a new layer
+    rather than a fifth veto: those suites TEST the slot/lock machinery, so
+    they EXECUTE the real emitter. Their marker lines are genuine, at column
+    0, and byte-identical to production emissions — task 3679 had already
+    closed the mid-line assertion-prose vector and these survive it. No
+    POSITIONAL rule separates them from a host event, because positionally
+    they ARE production output. Only the surrounding PASS attestation does.
+    Adding another shape-specific veto would have been the fifth turn of the
+    2748 -> 2821 -> 3679 -> 4212 treadmill; scoping the whole guard removes
+    the class by construction. See ``_redact_passed_suite_blocks`` for the
+    producer contract and its fail-safe direction, and the replayed 5623
+    fixture under ``tests/fixtures/verify_classify_run_all/``.
+
     ORDERING: DISK_FULL (ENOSPC/linker) is checked FIRST, then the
     broken-``_merge-verify``-worktree ENV_TRANSIENT checks (task 2756's
     Cargo.lock signature + task 2831's restart-collateral shapes), then the
@@ -605,6 +652,16 @@ def _classify_environmental(output: str) -> FailureCategory | None:
     DISK_FULL/ENOSPC remains the most-specific root cause and stays first
     (see ``test_enospc_with_unreadable_lock_stays_disk_full`` and
     ``test_enospc_with_collateral_stays_disk_full``).
+
+    Task 4492 left this order UNCHANGED and it REMAINS LOAD-BEARING. Scoping
+    changes WHICH TEXT each arm reads, never the sequence they are tried in,
+    so every tie documented below is decided exactly as before — now on the
+    scoped text for the positive arms. The whole guard is scoped rather than
+    just the SEMAPHORE_TIMEOUT arm precisely so the ties stay meaningful:
+    DISK_FULL and the collateral shapes are reachable from a passing suite by
+    the same mechanism (reify ships ``df``-failure/garbage-``df`` suites, and
+    collateral shape 5 is a literal marker a test could replay), so scoping
+    one arm would have left the class alive under a different label.
 
     SEMAPHORE_TIMEOUT's last position is retained from task 2831's reorder,
     and that ordering REMAINS LOAD-BEARING (task 3679 review). Both signals
@@ -871,7 +928,13 @@ def classify_failure(tool: ToolKind, rc: int, output: str, timed_out: bool) -> F
        output" reason as guard 2 — a host condition like a full disk, a
        lock/semaphore-slot timeout, an unreadable worktree lockfile, or an
        interpreter resolved from a stripped ambient env is not a property of
-       any one tool).
+       any one tool). Task 4492: this guard's POSITIVE detectors read
+       *output* with each PASSED suite's interior blanked
+       (``_redact_passed_suite_blocks``), so a marker emitted by a suite that
+       reported zero failures is no longer evidence about the failure being
+       classified; its one veto still reads the full *output*, which keeps
+       the change able to move a classification only AWAY from a guard-3
+       category, never toward one.
 
     Then dispatches on *tool* to a per-tool classification table (Invariant
     C1: a tool-T pattern lives ONLY in tool-T's table, so a cargo token can
