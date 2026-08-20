@@ -44,11 +44,13 @@ from census_tagger_debris import (
     NO_PRIOR_SCOPE,
     POST_WIPE_OVERWRITE,
     RECONCILED,
+    SCHEMA_VERSION,
     SCOPE_EVENT_SOURCES,
     STATUS_NON_TERMINAL,
     STATUS_TERMINAL,
     ScopeEvent,
     _connect_readonly,
+    build_report,
     census_project,
     classify_record,
     load_scope_events,
@@ -865,3 +867,169 @@ def test_project_id_is_the_root_basename_with_underscores(tmp_path):
     root = _make_project(tmp_path, name="solar-challenge-platform", tasks=[])
 
     assert census_project(str(root)).coverage.project_id == "solar_challenge_platform"
+
+
+# ---------------------------------------------------------------------------
+# build_report — the committed artifact's shape, and its determinism.
+#
+# Modelled on fused-memory/tests/test_census_memory_metadata.py's
+# TestBuildReportDeterminism. The artifact is committed to the repo, so
+# "re-running reproduces the counts" is checkable by `git diff --exit-code` —
+# but ONLY if nothing in the report varies between two runs over the same
+# corpus. These tests are what protect that property.
+# ---------------------------------------------------------------------------
+
+
+def _census(tmp_path, name="proj", tasks=(), events=(), with_runs_db=True):
+    return census_project(
+        str(_make_project(tmp_path, tasks=tasks, events=events, name=name, with_runs_db=with_runs_db))
+    )
+
+
+def _stamped(task_id, status="pending", files=("a.py",)):
+    return {
+        "id": task_id,
+        "status": status,
+        "metadata": {"files_tagged_at": _STAMP, "files": list(files)},
+    }
+
+
+def test_schema_version_is_the_first_key_and_is_one(tmp_path):
+    """(a) First key, so a reader opening the raw JSON sees the version before
+    anything it would have to interpret under that version."""
+    report = build_report([_census(tmp_path, tasks=[_stamped(1)])])
+
+    assert next(iter(report)) == "schema_version"
+    assert report["schema_version"] == SCHEMA_VERSION == 1
+
+
+def test_params_says_how_the_artifact_was_produced(tmp_path):
+    """(b) The artifact carries no clock read, so the params block IS its
+    provenance: which roots were swept, what the labels mean, and the exact
+    command that regenerates it."""
+    report = build_report([_census(tmp_path, name="know-live", tasks=[])])
+    params = report["params"]
+
+    assert params["project_roots"] == [str(tmp_path / "know-live")]
+    assert params["stamp_key"] == "metadata.files_tagged_at"
+    assert params["classification"] == {
+        "status_class": [STATUS_TERMINAL, STATUS_NON_TERMINAL],
+        "reconciliation": [RECONCILED, NEVER_RECONCILED],
+        "wipe_signature": [POST_WIPE_OVERWRITE, NO_PRIOR_SCOPE],
+    }
+    assert "census_tagger_debris.py" in params["regen_command"]
+
+
+def test_zero_valued_classification_cells_are_present_not_omitted(tmp_path):
+    """(c) A MISSING key must not be readable as a zero. DF 3427 will read the
+    live-victim cell straight out of this artifact; if the cell vanished when
+    it hit zero, "no victims" and "the schema changed" would look identical."""
+    report = build_report([_census(tmp_path, tasks=[_stamped(1, status="pending")])])
+    block = report["projects"]["proj"]
+
+    assert block["total_tasks"] == 1
+    assert block["stamped_records"] == 1
+    assert block["status_class"] == {STATUS_TERMINAL: 0, STATUS_NON_TERMINAL: 1}
+    assert block["reconciliation"] == {RECONCILED: 0, NEVER_RECONCILED: 1}
+    assert block["wipe_signature"] == {POST_WIPE_OVERWRITE: 0, NO_PRIOR_SCOPE: 1}
+
+    # All eight three-axis intersections, every one present.
+    assert len(block["cells"]) == 8
+    assert block["cells"]["non_terminal|never_reconciled|no_prior_scope"] == 1
+    assert block["cells"]["terminal|plan_reconciled|post_wipe_overwrite"] == 0
+    assert sum(block["cells"].values()) == block["stamped_records"]
+
+
+def test_a_project_with_no_stamped_records_still_gets_a_full_block(tmp_path):
+    """(c) Same reason: an absent project block and a project with nothing to
+    report must not be the same artifact."""
+    block = build_report([_census(tmp_path, tasks=[{"id": 1, "metadata": None}])])["projects"]["proj"]
+
+    assert block["total_tasks"] == 1
+    assert block["stamped_records"] == 0
+    assert sum(block["cells"].values()) == 0
+    assert len(block["cells"]) == 8
+
+
+def test_records_are_totally_ordered_and_never_truncated(tmp_path):
+    """(d) Total order by (project_id asc, NUMERIC task id asc). The JSON is
+    the COMPLETE record — only the markdown is capped."""
+    censuses = [
+        _census(tmp_path, name="reify", tasks=[_stamped(100), _stamped(20)]),
+        _census(tmp_path, name="autopilot-video", tasks=[_stamped(7)]),
+    ]
+    report = build_report(censuses)
+
+    assert [(r["project_id"], r["task_id"]) for r in report["records"]] == [
+        ("autopilot_video", 7),
+        ("reify", 20),
+        ("reify", 100),
+    ]
+
+
+def test_building_twice_is_byte_identical_and_input_order_does_not_matter(tmp_path):
+    """(e) THE REPRODUCIBILITY PROPERTY, which `git diff --exit-code` on the
+    committed artifact ultimately rests on."""
+    a = _census(tmp_path, name="reify", tasks=[_stamped(2), _stamped(1)])
+    b = _census(tmp_path, name="know-live", tasks=[_stamped(9)])
+
+    first = json.dumps(build_report([a, b]), indent=2, sort_keys=False)
+    second = json.dumps(build_report([a, b]), indent=2, sort_keys=False)
+    shuffled = json.dumps(build_report([b, a]), indent=2, sort_keys=False)
+
+    assert first == second
+    assert first == shuffled
+
+
+def _walk_keys(node, path=""):
+    if isinstance(node, dict):
+        for key, value in node.items():
+            yield path, key
+            yield from _walk_keys(value, f"{path}.{key}" if path else str(key))
+    elif isinstance(node, list):
+        for item in node:
+            yield from _walk_keys(item, path)
+
+
+def test_the_report_carries_no_clock_read_anywhere(tmp_path):
+    """(f) WHY THIS TEST EXISTS AND MUST NOT BE "FIXED".
+
+    All three committed plans/*.json artifacts in this repo deliberately carry
+    no generated_at. That absence is what makes a re-run diff PURE SIGNAL: with
+    a clock read in the file, every regeneration would diff dirty and the
+    task's "re-running reproduces the counts" signal would be destroyed. A
+    later contributor adding one back fails here rather than silently.
+
+    ``timestamp`` is permitted ONLY inside the two evidence objects, where it
+    names WHEN A RECORDED EVENT HAPPENED — corpus-derived and stable across
+    runs — never when this run happened.
+    """
+    report = build_report([_census(tmp_path, tasks=[_stamped(1)])])
+
+    for parent, key in _walk_keys(report):
+        assert key not in {"generated_at", "created_at", "run_at", "sha", "commit", "git_sha"}
+        if key == "timestamp":
+            assert parent.endswith(("reconciled_by", "preceded_by")), parent
+
+
+def test_coverage_is_always_present_and_names_an_unreadable_event_log(tmp_path):
+    """(g) An incomplete sweep must SAY SO in the artifact itself, not only on
+    a stderr line nobody kept."""
+    censuses = [
+        _census(tmp_path, name="reify", tasks=[_stamped(1)], with_runs_db=False),
+        _census(tmp_path, name="know-live", tasks=[_stamped(2)]),
+    ]
+    coverage = build_report(censuses)["coverage"]
+
+    assert coverage["projects_swept"] == 2
+    assert coverage["projects_without_event_log"] == ["reify"]
+    assert coverage["total_tasks"] == 2
+    assert coverage["stamped_records"] == 2
+
+
+def test_coverage_reports_an_empty_shortfall_list_rather_than_omitting_it(tmp_path):
+    """A clean sweep still states the shortfall list, empty. Omission would
+    read as "not checked"."""
+    coverage = build_report([_census(tmp_path, tasks=[_stamped(1)])])["coverage"]
+
+    assert coverage["projects_without_event_log"] == []
