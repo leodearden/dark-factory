@@ -116,6 +116,43 @@ class SoftScopeSignal:
     evidence: str
     strength: Literal['strong', 'weak'] = 'strong'
 
+    @property
+    def tagged_evidence(self) -> str:
+        """``<short-tag>:<evidence>`` — self-describing evidence for consumers.
+
+        The confirmation step
+        (:class:`~fused_memory.middleware.path_scope_adjudicator.PathScopeAdjudicator`)
+        takes a ``matched_paths`` tuple and renders it under the fixed label
+        ``Flagged matched path prefixes``.  That label is TRUE for its
+        original caller, whose evidence really is repo-relative path
+        prefixes lexed out of prose — and FALSE for every signal in this
+        module: a leading title run, an absolute root, and a bare project
+        name are not path prefixes, and two of the three are not paths at
+        all.  Handed over raw, ``dark-factory`` would be presented to the
+        classifier as a path prefix, with nothing to say which rule found
+        it or how much weight it carries.
+
+        Tagging at the producer rather than reshaping the adjudicator's
+        prompt builder or its structured-output schema is deliberate: that
+        module's fail-safe contract and its 22 existing tests stay untouched,
+        and the trigger adapts to the confirmation step rather than the
+        reverse.  The tags double as operator-facing provenance in the
+        escalation detail and in the ``possible_scope_mismatch`` marker task
+        3121 consumes.
+        """
+        return f'{_EVIDENCE_TAGS[self.kind]}:{self.evidence}'
+
+
+# Short, stable, operator-legible tag per signal kind.  Stable because they
+# are written into task metadata (`possible_scope_mismatch.matched_paths`)
+# and read back by downstream consumers — renaming one is a data migration,
+# not a cosmetic edit.
+_EVIDENCE_TAGS: dict[str, str] = {
+    'title_project_prefix': 'title-prefix',
+    'absolute_foreign_root': 'abs-root',
+    'foreign_project_name': 'project-name',
+}
+
 
 # ---------------------------------------------------------------------------
 # Alias derivation
@@ -455,6 +492,19 @@ class SoftScopeFinding:
         """
         owners = {s.project_id for s in self.signals}
         return next(iter(owners)) if len(owners) == 1 else None
+
+    @property
+    def matched_paths(self) -> tuple[str, ...]:
+        """Tagged evidence, strong-first — the transport shape for consumers.
+
+        Named for the ``matched_paths`` parameter it feeds
+        (``PathScopeAdjudicator.adjudicate``, ``PathGuardVerdict``,
+        ``possible_scope_mismatch.matched_paths``) so the one conversion
+        lives here rather than being re-derived at each call site.  See
+        :attr:`SoftScopeSignal.tagged_evidence` for why the values are
+        tagged rather than raw.
+        """
+        return tuple(sig.tagged_evidence for sig in self.signals)
 
 
 def collect_soft_scope_signals(

@@ -2054,16 +2054,35 @@ class TaskInterceptor:
         registry = self._prefix_registry
         if not registry:
             return SoftScopeFinding()
-        if candidate is not None:
-            title = candidate.title or ''
-            description = candidate.description or ''
-            details = candidate.details or ''
-        else:
-            title = str(kwargs.get('title') or '')
-            description = str(kwargs.get('description') or kwargs.get('prompt') or '')
-            details = str(kwargs.get('details') or '')
+        title, description, details = self._soft_scope_texts(candidate, kwargs)
         return collect_soft_scope_signals(
             title, description, details, project_id, registry,
+        )
+
+    @staticmethod
+    def _soft_scope_texts(
+        candidate: CandidateTask | None,
+        kwargs: dict[str, Any],
+    ) -> tuple[str, str, str]:
+        """The ``(title, description, details)`` the soft signals scan.
+
+        Factored out so :meth:`_soft_scope_branch` can hand the CONFIRMATION
+        step exactly the text the SCAN matched on.  Deriving them
+        independently at the two call sites is how the two drift apart, and
+        the drift is silent: the adjudicator would be asked to rule on
+        evidence it was never shown, and would answer from whatever text it
+        did get.
+        """
+        if candidate is not None:
+            return (
+                candidate.title or '',
+                candidate.description or '',
+                candidate.details or '',
+            )
+        return (
+            str(kwargs.get('title') or ''),
+            str(kwargs.get('description') or kwargs.get('prompt') or ''),
+            str(kwargs.get('details') or ''),
         )
 
     async def _soft_scope_branch(
@@ -2111,13 +2130,20 @@ class TaskInterceptor:
         adjudicator = self._path_scope_adjudicator
         if not finding.should_adjudicate or adjudicator is None:
             return None
+        # SHOW THE CONFIRMATION STEP THE EVIDENCE IT IS RULING ON.  The
+        # signals scan title/description/details JOINED, so a strong signal
+        # can be found in `details` alone; adjudicating that on a
+        # title+description prompt would ask the classifier to rule on text
+        # it was never shown.  `adjudicate` has no `details` parameter, so
+        # details ride along in `description` — the same joined blob the scan
+        # matched on, via the same extraction helper.
+        title, description, details = self._soft_scope_texts(candidate, kwargs)
+        prompt_description = '\n'.join(p for p in (description, details) if p)
         try:
             adjudication = await adjudicator.adjudicate(
-                title=str(kwargs.get('title') or ''),
-                description=str(
-                    kwargs.get('description') or kwargs.get('prompt') or ''
-                ),
-                matched_paths=tuple(s.evidence for s in finding.signals),
+                title=title,
+                description=prompt_description,
+                matched_paths=finding.matched_paths,
                 project_id=project_id,
                 suggested_project=finding.suggested_project,
                 project_root=project_root,
@@ -2177,7 +2203,7 @@ class TaskInterceptor:
         transport = PathGuardVerdict(
             outcome='rejection',
             project_id=project_id,
-            matched_paths=tuple(sig.evidence for sig in finding.signals),
+            matched_paths=finding.matched_paths,
             suggested_project=finding.suggested_project,
         )
         self._emit_scope_violation_escalation(
