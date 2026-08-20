@@ -14365,3 +14365,182 @@ class TestSoftScopeEnforceMode:
         marker = (kwargs.get('metadata') or {}).get('possible_scope_mismatch')
         assert marker is not None
         assert marker['source'] == 'prose'
+
+
+@pytest.mark.asyncio
+class TestSoftScopeFilelessEndToEnd:
+    """The two USER-OBSERVABLE cases this task exists to separate.
+
+    Both are FILELESS — ``metadata`` present, ``files`` empty/absent,
+    ``details`` empty — mirroring reify 5575's actual submit blob, and both
+    carry the SAME strong soft signals.  What distinguishes them is not
+    anything mechanical in the submission; it is what the prose MEANS.  That
+    is precisely why the confirmation step is mandatory and why hard-gating
+    on the signal alone is forbidden.
+    """
+
+    async def test_the_misfile_raises_a_signal_where_today_there_is_none(
+        self, interceptor, tmp_path, monkeypatch,
+    ):
+        from fused_memory.middleware.path_scope_adjudicator import AdjudicationVerdict
+
+        monkeypatch.setenv('FUSED_SOFT_SCOPE_ENFORCE', '1')
+        registry = _soft_scope_registry(interceptor, tmp_path)
+        _stub_adjudicator(
+            interceptor,
+            AdjudicationVerdict(
+                verdict='reject',
+                reason='every deliverable named is in the dark-factory tree',
+                llm_used=True,
+            ),
+        )
+        interceptor._scope_violation_escalator = _SpyEscalator()
+        df_root = registry.root_for_project('dark_factory')
+
+        # The reify-5575 shape: fileless, details empty, metadata present.
+        kwargs: dict[str, Any] = {
+            'title': 'dark-factory: do the thing',
+            'description': (
+                'The recurring timer and the request consumer both live in '
+                f'{df_root} and need wiring together there.'
+            ),
+            'details': '',
+            'metadata': {'execution_class': 'code_tdd', 'files': []},
+        }
+
+        result = await interceptor._path_guard_or_skip(
+            kwargs, str(tmp_path / 'reify'), 'reify',
+        )
+
+        assert result is None, 'a soft signal never blocks creation'
+
+        marker = (kwargs.get('metadata') or {}).get('possible_scope_mismatch')
+        assert marker is not None, 'the misfile must now raise a scope signal'
+        assert marker['source'] == 'soft-signal'
+        assert marker['suggested_project'] == 'dark_factory'
+
+        calls = interceptor._scope_violation_escalator.calls
+        assert len(calls) == 1
+        assert calls[0]['suggested_project'] == 'dark_factory'
+        assert calls[0]['suggested_root'] == df_root
+        assert calls[0]['advisory'] is True
+
+        # THE COUNTERFACTUAL that motivates the whole task: neither existing
+        # path-based guard sees this submission at all.  Without the soft
+        # branch the operator gets nothing.
+        candidate = interceptor._build_candidate(kwargs)
+        assert (
+            interceptor._files_scope_check(candidate, kwargs, 'reify').outcome == 'ok'
+        )
+        assert (
+            interceptor._path_guard_check(candidate, kwargs, 'reify').outcome == 'ok'
+        )
+
+    async def test_the_legitimate_citation_is_left_alone(
+        self, interceptor, tmp_path, monkeypatch,
+    ):
+        """The adjudicator earning its keep — same signal, opposite meaning."""
+        from fused_memory.middleware.path_scope_adjudicator import AdjudicationVerdict
+
+        monkeypatch.setenv('FUSED_SOFT_SCOPE_ENFORCE', '1')
+        registry = _soft_scope_registry(interceptor, tmp_path)
+        stub = _stub_adjudicator(
+            interceptor,
+            AdjudicationVerdict(
+                verdict='allow',
+                reason='the foreign path is cited as a model, not as the deliverable',
+                llm_used=True,
+            ),
+        )
+        interceptor._scope_violation_escalator = _SpyEscalator()
+        df_root = registry.root_for_project('dark_factory')
+
+        kwargs: dict[str, Any] = {
+            'title': 'dark-factory: mirror the scheduler backoff here',
+            'description': (
+                'this mirrors how '
+                f'{df_root}/orchestrator/scheduler.py '
+                'already does it; do the equivalent here'
+            ),
+            'details': '',
+            'metadata': {'execution_class': 'code_tdd'},
+        }
+
+        result = await interceptor._path_guard_or_skip(
+            kwargs, str(tmp_path / 'reify'), 'reify',
+        )
+
+        assert result is None
+        stub.adjudicate.assert_awaited_once()
+        assert 'possible_scope_mismatch' not in (kwargs.get('metadata') or {})
+        assert interceptor._scope_violation_escalator.calls == []
+
+    async def test_adjudicator_receives_self_describing_evidence(
+        self, interceptor, tmp_path, monkeypatch,
+    ):
+        """The confirmation step must be able to tell the evidence apart.
+
+        ``PathScopeAdjudicator._build_user_prompt`` renders whatever it is
+        handed under the fixed label 'Flagged matched path prefixes'.  A soft
+        signal's evidence is NOT a path prefix — it is a title run, an
+        absolute root, or a bare project name — so handing the raw values over
+        presents a project NAME to the classifier as though it were a path,
+        with nothing to say which rule found what.  Tag them at this call
+        site rather than reshaping the adjudicator's prompt or schema: the
+        trigger adapts to the confirmation step, not the reverse.
+        """
+        monkeypatch.delenv('FUSED_SOFT_SCOPE_ENFORCE', raising=False)
+        registry = _soft_scope_registry(interceptor, tmp_path)
+        stub = _stub_adjudicator(interceptor)
+        df_root = registry.root_for_project('dark_factory')
+
+        await interceptor._path_guard_or_skip(
+            {
+                'title': 'dark-factory: do the thing',
+                'description': f'all of the asked work is in {df_root}',
+                'details': '',
+                'metadata': {'files': []},
+            },
+            str(tmp_path / 'reify'),
+            'reify',
+        )
+
+        paths = stub.adjudicate.await_args.kwargs['matched_paths']
+        assert any(p.startswith('title-prefix:') for p in paths), paths
+        assert f'abs-root:{df_root}' in paths, paths
+        assert any(p.startswith('project-name:') for p in paths), paths
+        # Every value is tagged — an untagged one would read as a path prefix.
+        assert all(
+            p.split(':', 1)[0]
+            in {'title-prefix', 'abs-root', 'project-name'}
+            for p in paths
+        ), paths
+
+    async def test_evidence_found_only_in_details_reaches_the_adjudicator(
+        self, interceptor, tmp_path, monkeypatch,
+    ):
+        """The classifier must see the text the signals actually matched.
+
+        ``collect_soft_scope_signals`` scans title/description/details joined,
+        so a strong signal can be found in ``details`` alone.  Adjudicating
+        that on a title+description prompt asks the confirmation step to rule
+        on evidence it was never shown.
+        """
+        monkeypatch.delenv('FUSED_SOFT_SCOPE_ENFORCE', raising=False)
+        registry = _soft_scope_registry(interceptor, tmp_path)
+        stub = _stub_adjudicator(interceptor)
+        df_root = registry.root_for_project('dark_factory')
+
+        await interceptor._path_guard_or_skip(
+            {
+                'title': 'wire the recurring timer',
+                'description': 'see the details for where this lands',
+                'details': f'the consumer lives in {df_root}/orchestrator/',
+                'metadata': {'files': []},
+            },
+            str(tmp_path / 'reify'),
+            'reify',
+        )
+
+        stub.adjudicate.assert_awaited_once()
+        assert df_root in stub.adjudicate.await_args.kwargs['description']
