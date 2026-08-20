@@ -1195,6 +1195,24 @@ def _count_matching(caplog, needle: str) -> int:
     return sum(1 for r in caplog.records if needle in r.getMessage())
 
 
+async def _drain_cost_events(gate: UsageGate) -> None:
+    """Let `_fire_cost_event`'s fire-and-forget tasks reach the writer.
+
+    `_fire_cost_event` schedules `_write_cost_event` via `loop.create_task`
+    and returns immediately, so asserting on the writer straight after the
+    loop would race it — and race it in the direction that makes a missing
+    event look like a correctly-suppressed one.
+    """
+    for _ in range(5):
+        if not gate._background_tasks:
+            return
+        await asyncio.gather(*list(gate._background_tasks))
+
+
+def _events_of(mock_write, event_type: str) -> list[tuple]:
+    return [c[0] for c in mock_write.call_args_list if c[0][1] == event_type]
+
+
 def _spawn_fault(binary: str = 'claude') -> ProbeSpawnError:
     return ProbeSpawnError(
         binary, FileNotFoundError(2, 'No such file or directory', binary),
@@ -1343,6 +1361,112 @@ class TestProbeInfraFaultLatch:
 
         gate._clear_probe_spawn_failures(acct)
         assert gate.probe_infra_fault is None
+
+
+@pytest.mark.asyncio
+class TestProbeInfraFaultCostEvents:
+    """The `probe_infra_fault` account event is edge-triggered and re-armable.
+
+    Task 4512. Forensics for an operator who reads the CostStore rather than
+    the journal — but only useful if the row rate reflects EVENTS, not
+    elapsed outage. The observed incident ran ~9 hours across six accounts;
+    a per-probe write would have produced thousands of identical rows and
+    buried the one fact that matters.
+    """
+
+    def _faulting_gate(self, store) -> tuple[UsageGate, AccountState]:
+        gate = make_gate(
+            ['a'], cost_store=store, probe_interval_secs=1, max_probe_interval_secs=8,
+        )
+        return gate, _capped_account(gate, resets_at=None)
+
+    async def test_exactly_one_event_for_a_long_outage(self):
+        store = make_mock_cost_store()
+        gate, acct = self._faulting_gate(store)
+        gate._run_probe = AsyncMock(side_effect=_spawn_fault())
+
+        with patch.object(gate, '_write_cost_event', new_callable=AsyncMock) as mock_write:
+            await _drive_loop(gate, acct, max_sleeps=10)
+            await _drain_cost_events(gate)
+
+        assert gate._run_probe.await_count == 9, 'harness drove the wrong depth'
+        assert len(_events_of(mock_write, 'probe_infra_fault')) == 1, (
+            'the latch must be edge-triggered: 9 faulted probes, one row'
+        )
+
+    async def test_event_details_are_diagnosable_without_the_log(self):
+        store = make_mock_cost_store()
+        gate, acct = self._faulting_gate(store)
+        gate._run_probe = AsyncMock(side_effect=_spawn_fault())
+
+        with patch.object(gate, '_write_cost_event', new_callable=AsyncMock) as mock_write:
+            await _drive_loop(gate, acct, max_sleeps=10)
+            await _drain_cost_events(gate)
+
+        (event,) = _events_of(mock_write, 'probe_infra_fault')
+        assert event[0] == 'a'
+        details = json.loads(event[2])
+        assert details['binary'] == 'claude'
+        assert 'No such file or directory' in details['cause']
+        assert details['consecutive'] == _SPAWN_FAULT_THRESHOLD
+
+    async def test_no_cap_hit_event_is_written_on_the_spawn_fault_path(self):
+        """The defect at the data layer.
+
+        A host fault recorded as `cap_hit` would be absorbed by every cap
+        dashboard and cap-history query as genuine load — the same
+        indistinguishable-from-a-real-cap failure this task removes, one
+        layer below the logs.
+        """
+        store = make_mock_cost_store()
+        gate, acct = self._faulting_gate(store)
+        gate._run_probe = AsyncMock(side_effect=_spawn_fault())
+
+        with patch.object(gate, '_write_cost_event', new_callable=AsyncMock) as mock_write:
+            await _drive_loop(gate, acct, max_sleeps=10)
+            await _drain_cost_events(gate)
+
+        assert _events_of(mock_write, 'cap_hit') == []
+        assert _events_of(mock_write, 'resumed') == []
+
+    async def test_a_recovered_then_broken_host_is_reported_twice(self):
+        """Re-latching, not deduped forever.
+
+        Three faults latch and fire; a probe that RUNS (returns False, so the
+        account is still capped) clears the latch; three more faults latch and
+        fire again. Without the clear re-arming the event, a host that broke,
+        healed, and broke again would be silently reported once.
+        """
+        store = make_mock_cost_store()
+        gate, acct = self._faulting_gate(store)
+        gate._run_probe = AsyncMock(
+            side_effect=[
+                *[_spawn_fault()] * _SPAWN_FAULT_THRESHOLD,
+                False,
+                *[_spawn_fault()] * _SPAWN_FAULT_THRESHOLD,
+            ],
+        )
+
+        with patch.object(gate, '_write_cost_event', new_callable=AsyncMock) as mock_write:
+            await _drive_loop(gate, acct, max_sleeps=2 * _SPAWN_FAULT_THRESHOLD + 2)
+            await _drain_cost_events(gate)
+
+        assert len(_events_of(mock_write, 'probe_infra_fault')) == 2
+
+    async def test_store_less_gate_takes_the_same_path_without_raising(self):
+        """`_fire_cost_event` no-ops without a store; the latch still arms."""
+        gate = make_gate(
+            ['a'], cost_store=None, probe_interval_secs=1, max_probe_interval_secs=8,
+        )
+        acct = _capped_account(gate, resets_at=None)
+        gate._run_probe = AsyncMock(side_effect=_spawn_fault())
+
+        with patch.object(gate, '_write_cost_event', new_callable=AsyncMock) as mock_write:
+            await _drive_loop(gate, acct, max_sleeps=10)
+            await _drain_cost_events(gate)
+
+        mock_write.assert_not_awaited()
+        assert gate.probe_infra_fault is not None
 
 
 @pytest.mark.asyncio
