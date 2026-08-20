@@ -138,3 +138,93 @@ def optional_token_segment(cmd: str, keyword: str) -> str | None:
         if keyword in tokens:
             return segment.strip()
     return None
+
+
+def anchor_split(
+    segment: str, keyword: str, *, label: str | None = None
+) -> tuple[list[str], list[str]]:
+    """*segment* split at the checker anchor into ``(pre, post)`` token lists.
+
+    The ANCHOR is the last whitespace-separated token of *keyword*: ``check`` for
+    ``ruff check``, ``pyright`` for ``pyright``, ``pytest`` for ``pytest``. One
+    rule reproduces every anchor the four callers use, two of which spelled it as
+    a hand-rolled ``tokens.index("check")``.
+
+    THE ANCHOR BELONGS TO NEITHER HALF, and the split is the whole point.
+    Everything BEFORE it is the WRAPPER's: in
+    ``uv run --project shared pyright scripts/`` the first four tokens are uv's,
+    and ``--project`` there selects the member ENVIRONMENT the binary resolves
+    from. Everything AFTER it is the CHECKER's own argv, where the identically
+    spelled ``--project`` would instead redirect pyright's CONFIG FILE. Only
+    POSITION tells the two apart, so a caller that reads the whole segment reads
+    a category error.
+
+    Sole home for the anchor rule and the anchor-presence assertion. That is
+    deliberate: this file's callers already paid once for the alternative, when
+    ``test_scripts_module_config.py``'s ``_narrowing_flag_args`` had missed the
+    slice its sibling ``_targets`` held from the start (task 4358).
+
+    Takes an already-extracted SEGMENT rather than a whole command, so the
+    segment-selection policy stays the caller's choice — :func:`required_segment`
+    for the ruff and pyright legs, :func:`optional_token_segment` for pytest.
+    """
+    anchor = keyword.split()[-1]
+    tokens = shlex.split(segment)
+    assert anchor in tokens, (
+        f"no `{anchor}` token in the `{keyword}` segment of "
+        f"{_where(label, segment)}, so the checker's own arguments cannot be "
+        f"located; segment: {segment!r}"
+    )
+    at = tokens.index(anchor)
+    return tokens[:at], tokens[at + 1:]
+
+
+def positional_targets(
+    segment: str,
+    keyword: str,
+    *,
+    value_flags: frozenset[str] = frozenset(),
+    label: str | None = None,
+) -> list[str]:
+    """The positional path arguments *keyword* checks, as whole TOKENS.
+
+    Callers must compare against these by exact element and never substring-match
+    the raw command. That rule is backed by a MEASURED counterexample rather than
+    a hypothetical: ``'shared' in cmd`` is already TRUE of the live repo-root
+    ``lint_command`` via the ``check_bare_magicmock_config.py`` TAIL leg's
+    ``shared/tests`` argument, so a substring test passes vacuously for a path
+    the ruff leg never checks. Likewise ``'scripts/'`` is a substring of
+    ``'tests/scripts/'``, so a copy-pasted sibling command satisfies a naive
+    ``'scripts/' in cmd`` for both.
+
+    *value_flags* is the caller's POLICY, and its default is the reason one
+    implementation serves four call sites unchanged. With it EMPTY, ``consume``
+    can never become True and the loop below reduces byte-for-byte to
+    ``[t for t in post if not t.startswith('-')]`` — exactly what
+    ``test_root_lint_covers_nonmember_py.py`` and ``test_scripts_module_config.py``
+    do today, phantom flag values included. Supplying a set (the CONTRIBUTING
+    guard's ``_RUFF_FLAGS_TAKING_A_VALUE``, the skills guard's
+    ``_PYTEST_VALUE_FLAGS``) drops the following token instead. The
+    ``--flag=value`` spelling needs no entry either way: ``shlex`` keeps it as
+    one token and the ``-`` prefix drops it whole.
+
+    WHAT THIS GUARANTEES, stated no more strongly than it holds: every returned
+    token was a positional argument after the anchor. It is NOT a proof that no
+    unlisted value-taking flag exists — an unknown one still donates its value —
+    which is why the caller that cares asserts its targets EXIST rather than
+    filtering unresolvable ones away. A phantom target can only ever make a
+    coverage check pass spuriously, so silently discarding it would preserve the
+    false-pass hazard the parsing exists to close.
+    """
+    post = anchor_split(segment, keyword, label=label)[1]
+    targets: list[str] = []
+    consume = False
+    for token in post:
+        if consume:
+            consume = False
+            continue
+        if token.startswith("-"):
+            consume = token in value_flags
+            continue
+        targets.append(token)
+    return targets
