@@ -522,6 +522,42 @@ OPERATIONAL_LLM_GATE_MARKER_KEY: str = 'x_operational_llm_gate'
 # grouping by prefix, to conflate two unrelated actors.  The `human_curator_`
 # prefix pairs the stamp unambiguously with its marker.
 
+# Rendered in place of the configured project_root when the runner's duck-typed
+# `scheduler` collaborator cannot supply a usable one.  A VISIBLE placeholder,
+# not an omission: it keeps the runbook's update_task call syntactically valid
+# and still NAMES the required parameter.
+_PROJECT_ROOT_PLACEHOLDER: str = '<project_root>'
+
+
+def _snippet_project_root(scheduler) -> str:
+    """Return the configured project_root for the operator runbook snippet.
+
+    Falls back to a VISIBLE placeholder rather than raising or interpolating a
+    repr.  ``scheduler`` is duck-typed here — ``Harness._run_deterministic_slot``
+    builds the runner "with only the minimal dependencies needed" — and
+    ``_file_curator_adjudication_missing_and_block``'s contract is that a
+    durable on-disk safety escalation is filed no matter what.  The attribute
+    chain is read while formatting the detail string, i.e. BEFORE
+    ``escalation_queue.submit()``, so an ``AttributeError`` there does not just
+    skip the BLOCK — it loses the escalation entirely and propagates, exactly
+    what that method's docstring forbids.
+
+    Accepts the value ONLY when it is a non-empty ``str``/``Path`` that is not
+    the literal ``'None'``, so a test double's Mock attribute cannot reach an
+    operator as ``<MagicMock id=...>``.  The ``'None'`` rejection mirrors the
+    scheduler's own project_root guard, which defends against a value that
+    bypassed pydantic validation.
+
+    Deliberately no broad ``except Exception``: the two ``getattr`` defaults
+    plus the isinstance/non-empty check are the entire failure surface.
+    """
+    root = getattr(getattr(scheduler, 'config', None), 'project_root', None)
+    if isinstance(root, (str, Path)):
+        text = str(root).strip()
+        if text and text != 'None':
+            return text
+    return _PROJECT_ROOT_PLACEHOLDER
+
 # Length bound applied to the externally-supplied `human_curator_adjudicated_at`
 # value when it is interpolated into the curator-gate `done_provenance.note`.
 #
@@ -1597,7 +1633,7 @@ class DeterministicRunner:
         # checkout (so `uv run --project orchestrator` resolves) while selecting
         # its actual target project via --config, so a cwd-derived value would
         # silently aim most operators at the wrong project.
-        project_root = self.scheduler.config.project_root
+        project_root = _snippet_project_root(self.scheduler)
         detail = (
             f"Task {task_id} ({title!r}) is a deterministic pure gate marked "
             f"`metadata.{HUMAN_CURATOR_GATE_KEY}`, meaning it closes only when a "
