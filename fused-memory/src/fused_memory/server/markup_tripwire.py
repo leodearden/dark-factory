@@ -1,4 +1,4 @@
-"""Write-time containment tripwire for leaked MCP envelope markup (task 3141).
+"""Escalation filers for leaked MCP envelope markup (tasks 3141, 4458).
 
 A recurring harness serialization bug leaks raw MCP envelope fragments — the
 closing/opening tags of the tool-call wire format — into the *payload* of
@@ -8,54 +8,48 @@ and Graphiti corpora), and task text arriving with a ``<parameter name=``
 fragment that the interceptor's description parser then mis-parses *silently*
 (reify task 3210 was filed ``priority=high`` and stored as ``medium``).
 
-This module is the CONTAINMENT half of that story (PRD
-``docs/prds/memory-write-path-convergence.md`` §9 leaf ο, contract C3): it
-REJECTS such a write at the boundary, loudly and with the matched pattern
-named, so no further specimen enters the corpus and no parser gets the chance
-to derive a wrong value from the fragment. Root cause, the Qdrant payload
-text-match read tool, and the retroactive corpus sweep belong to **DF task
-3083** and are deliberately out of scope here.
+WHAT THIS MODULE IS NOW
+-----------------------
+Task 3141 put the containment in a WRITE-TIME tripwire: a pattern matcher
+(``find_markup_pattern`` / ``find_markup_violation``), a rejection-block builder
+(``build_markup_block``) and a burst counter (``MarkupStormCounter``), called
+from a ``_markup_gate`` closure at four tool bodies in ``server/tools.py``.
 
-:data:`MCP_MARKUP_PATTERNS` is the write-time pattern list — every one of the
-four MCP write boundaries (``add_memory``, ``add_episode``, ``submit_task``,
-``update_task``) rejects against exactly this tuple. It is RE-EXPORTED from
-:mod:`shared.toolcall_markup`, which OWNS the literal enumeration (INV-5);
-nothing in this package spells those literals. The write-time and read-time
-calibrations described below are two NAMED PREDICATES over that one set — the
-split is preserved, the duplicated enumeration behind it is not.
+Task 4458 moved the containment to the DISPATCH BOUNDARY
+(:mod:`fused_memory.server.markup_guard`, wrapping ``ToolManager.call_tool``
+with the shared :class:`shared.mcp_markup_middleware.MarkupGuardMiddleware`),
+which covers every tool rather than four, and repairs a swallowed parameter
+before pydantic ever sees the call. The four in-line gates were retired, and
+those four symbols went with them: keeping a second, fully working markup
+mechanism alive behind its own tests is precisely the standing invitation to
+re-introduce a duplicate implementation that INV-5 forbids. Their behavioural
+coverage now lives in ``tests/server/test_markup_tripwire_gate.py``, which pins
+that an UNGUARDED server no longer refuses a leaked write while a guarded one
+does.
 
-Calibration vs. the retrospective scanner
------------------------------------------
-``scripts/scan_task_toolcall_leaks.py`` (task 2939) detects the *same* leak
-retrospectively, but with a deliberately DIFFERENT and much narrower matcher
-(its ``LEAK_TAIL`` regex — see that module's docstring for the discriminator
-and the evidence behind it; it is not restated here). The two are calibrated in
-opposite directions on purpose, because the cost of each error mode is
-inverted:
+What remains here is what the boundary guard's escalation sink CALLS, plus the
+re-exports ``server/tools.py`` still imports:
 
-* There, a false positive sends a human off to inspect a task that never
-  leaked, so precision is bought with a discriminated regex.
-* Here, a false positive is a *recoverable* rejection that carries its own
-  remediation and an explicit override (``metadata={'allow_mcp_markup': True}``)
-  — one retry clears it. A false NEGATIVE, by contrast, is another permanent
-  corpus specimen that DF 3083 has to hunt down by eye.
+* :func:`emit_markup_storm_escalation` — one deduped record per burst (INV-4).
+* :func:`emit_markup_residue_escalation` — one record per unrepairable refusal,
+  deliberately NOT deduped, holding that caller's payload verbatim (INV-7).
+* ``_MARKUP_STORM_THRESHOLD`` / ``_MARKUP_STORM_WINDOW_SECONDS`` — the ONE
+  source for the tuning, read by the guard when it builds the middleware.
+* ``MARKUP_OVERRIDE_KEY``, ``markup_override_requested``,
+  ``strip_markup_override``, ``MCP_MARKUP_PATTERNS`` — RE-EXPORTS from
+  :mod:`shared.toolcall_markup`, which OWNS the literal enumeration and the
+  override lifecycle (INV-5, task 3688/3689). Nothing in this package spells
+  those literals, and the write-time/read-time predicate calibration is
+  documented there rather than restated here.
 
-So this write-time check matches bare, case-sensitive literal substrings and
-accepts the resulting over-reporting. If you are tempted to "fix" one of the
-two pattern sets to match the other: don't — they are answering different
-questions.
-
-Structure mirrors the sibling :mod:`fused_memory.server.near_duplicate_guard`:
-module-level constants plus pure synchronous functions that do no I/O and never
-raise on empty/``None`` input, so callers can hand raw handler arguments
-straight through.
+Root cause, the Qdrant payload text-match read tool, and the retroactive corpus
+sweep belong to **DF task 3083**, which is DONE and CLOSED to appends — report
+a recurrence against its successor ``plans/toolcall-markup-containment-prd.md``.
 """
 
 from __future__ import annotations
 
 import logging
-import time
-from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -69,8 +63,6 @@ from shared.toolcall_markup import (  # noqa: F401
     markup_override_requested,
     strip_markup_override,
 )
-
-from fused_memory.server.storm_counter import StormCounter
 
 if TYPE_CHECKING:
     from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
@@ -96,46 +88,34 @@ logger = logging.getLogger(__name__)
 # in fused_memory/utils/toolcall_xml_leak.py, each documented as the single
 # source of truth; they drifted, which is the defect task 3688 repairs.
 #
-# What the move does NOT change: this predicate is still WRITE-time and
-# recall-first — bare, CASE-SENSITIVE substrings, deliberately over-reporting
-# relative to scripts/scan_task_toolcall_leaks.py for the reason the module
-# docstring gives. Its value and order are unchanged, and the same-file drift
-# guard in tests/server/test_markup_tripwire.py still pins them from here.
+# The matcher OVER it (find_markup_pattern / find_markup_violation) was deleted
+# in task 4458 with the write-time gate it served; shared.toolcall_markup.detect
+# is the live generalisation, and it is what the boundary guard calls. The
+# constant stays re-exported here for the same-file drift guard in
+# tests/server/test_markup_tripwire.py, which pins its value and order from this
+# import site.
 
 # MARKUP_OVERRIDE_KEY, markup_override_requested, strip_markup_override —
 # imported above, NOT defined here.
 #
 # The enumeration moved to shared.toolcall_markup under task 3688; task 3689
-# moved its OVERRIDE LIFECYCLE after it, for the same reason. There are now TWO
-# guards that can bounce a caller for envelope markup — this write-time tripwire
-# and shared.mcp_markup_middleware at the FastMCP boundary (PRD contract C2,
-# boundary row B6) — and the middleware sits in the base layer, which may not
-# import fused_memory. A second implementation of "is this deliberate?" is
-# exactly the lockstep-duplication defect (INV-5) the enumeration move repaired;
-# one override, one lifecycle, honoured identically by both guards.
+# moved its OVERRIDE LIFECYCLE after it, for the same reason — the middleware
+# sits in the base layer, which may not import fused_memory, and a second
+# implementation of "is this deliberate?" is exactly the lockstep-duplication
+# defect (INV-5) the enumeration move repaired.
 #
-# What the move does NOT change: the semantics are byte-for-byte the ones this
+# Since task 4458 there is only ONE guard that bounces a caller for envelope
+# markup (shared.mcp_markup_middleware, at the dispatch boundary), and it is
+# what honours the override. server/tools.py still imports strip_markup_override
+# from HERE, because the middleware forwards the flag UNCHANGED to any tool
+# declaring `metadata`: the tool body remains the party that keeps a write-time
+# control flag out of the corpus.
+#
+# What none of that changed: the semantics are byte-for-byte the ones this
 # module has always had — fail-closed on a literal boolean True only,
 # dict-or-JSON-string tolerant, never raising, and stripped NON-mutatingly in
-# the caller's own shape before dispatch. server/tools.py imports all three from
-# HERE and needs no edit; shared/tests/test_toolcall_markup.py pins both the
-# semantics and this re-export.
-
-# Surfaced in the rejection dict, the four tool docstrings and
-# FUSED_MEMORY_INSTRUCTIONS so the remediation and the escalation pointer are
-# discoverable at the point of rejection, not just in documentation the writer
-# may never have read (mirrors near_duplicate_guard._NEAR_DUPLICATE_HINT).
-_MARKUP_HINT = (
-    'This write carries raw MCP envelope markup (see matched_pattern/field), '
-    'which indicates the caller serialized part of its own tool-call envelope '
-    'into the payload. Strip the leaked envelope fragment and resubmit. Do NOT '
-    'work around this by rewording the payload around the fragment. DF task '
-    '3083 delivered the root cause and the corpus sweep but is DONE and CLOSED '
-    'to appends; its successor plans/toolcall-markup-containment-prd.md owns '
-    'the live work, so report a recurrence against that PRD, not against 3083. '
-    'If the markup is quoted deliberately (e.g. documenting '
-    "the leak itself), override with metadata={'" + MARKUP_OVERRIDE_KEY + "': True}."
-)
+# the caller's own shape before dispatch. shared/tests/test_toolcall_markup.py
+# pins both the semantics and this re-export.
 
 # Storm thresholds are plain module constants rather than FusedMemoryConfig
 # fields, following the _PLACEHOLDER_DROP_STORM_* precedent (harness.py:200-215):
@@ -143,19 +123,6 @@ _MARKUP_HINT = (
 # would add hot-reload tier surface and a schema migration for no operator gain.
 _MARKUP_STORM_THRESHOLD = 3
 _MARKUP_STORM_WINDOW_SECONDS = 3600.0
-
-# Fired only on a BURST. The wording matters: the alarm-worthy conclusion is
-# that the upstream serialization leak is ACTIVE, not that this tripwire has
-# started misfiring — an operator who reads it the second way would disable the
-# containment and let specimens back into the corpus.
-_MARKUP_STORM_HINT = (
-    'Multiple MCP-envelope-markup writes were rejected in a short window: the '
-    'upstream serialization leak is ACTIVE right now. This is not a sign the '
-    'tripwire is misfiring — do NOT disable it. DF task 3083 is DONE and CLOSED '
-    'to appends; its successor plans/toolcall-markup-containment-prd.md owns '
-    'the live root-cause, repair and retro-sweep work — attach the offending '
-    'agent_id, field and matched_pattern against that PRD, not against 3083.'
-)
 
 # Escalation wiring, copied shape-for-shape from
 # middleware/candidate_key_escalation.py. _ANCHOR_TASK_ID is a stable per-project
@@ -178,172 +145,6 @@ _RESIDUE_ANCHOR_TASK_ID: str = 'markup-residue'
 _RESIDUE_AGENT_ROLE: str = 'fused-memory/markup-guard'
 _RESIDUE_CATEGORY: str = 'mcp_markup_residue'
 _RESIDUE_LEVEL: int = 2
-
-
-def find_markup_pattern(text: object) -> str | None:
-    """Return the first :data:`MCP_MARKUP_PATTERNS` literal occurring in *text*.
-
-    "First" is by POSITION IN THE TEXT, not by position in the pattern tuple:
-    when several patterns are present the earliest one is reported, so the
-    caller is told where the leaked envelope actually starts rather than
-    whichever literal happens to be listed first.
-
-    Matching is case-sensitive — the harness emits lowercase tags, and
-    case-folding would only widen the guard onto prose that shouts a tag name.
-
-    Pure and synchronous. *text* is expected to be a handler argument's value
-    (``str``) but anything else — ``None``, an absent optional field, a dict —
-    returns ``None`` without raising, so call sites need no pre-validation.
-    """
-    if not text or not isinstance(text, str):
-        return None
-    best_index = -1
-    best_pattern: str | None = None
-    for pattern in MCP_MARKUP_PATTERNS:
-        index = text.find(pattern)
-        if index == -1:
-            continue
-        if best_index == -1 or index < best_index:
-            best_index = index
-            best_pattern = pattern
-    return best_pattern
-
-
-def find_markup_violation(fields: Mapping[str, object]) -> tuple[str, str] | None:
-    """Return ``(field_name, matched_pattern)`` for the first violating field.
-
-    *fields* maps a caller-facing field name (``'content'``, ``'description'``,
-    …) to its raw value. Fields are checked in dict INSERTION ORDER, so a call
-    site controls which field is named when several are dirty. Returns ``None``
-    when every field is clean, empty, ``None`` or non-``str``.
-
-    Typed ``Mapping[str, object]`` rather than ``dict[str, object]``: this
-    function only READS the map, and ``dict`` is invariant in its value type, so
-    a ``dict`` annotation would reject an ordinary homogeneous call site such as
-    ``{'title': a, 'description': b}`` (inferred ``dict[str, str]``). ``Mapping``
-    is covariant in the value type and accepts every dict a caller can build.
-
-    Pure and synchronous; never raises (an empty map is simply not a violation).
-    """
-    for field_name, value in fields.items():
-        pattern = find_markup_pattern(value)
-        if pattern is not None:
-            return field_name, pattern
-    return None
-
-
-def build_markup_block(
-    agent_id: str | None,
-    field: str,
-    pattern: str,
-    text: str,
-    *,
-    storm: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Build the structured rejection dict returned by the four write tools.
-
-    Mirrors :func:`near_duplicate_guard.build_near_duplicate_block`'s flat
-    ``error``/``error_type``/``agent_id``/``content_excerpt``/``hint`` shape so
-    both guards' agent-facing diagnostics stay uniform, and adds *field* and
-    *matched_pattern* — the write has already been refused, so this dict is the
-    only machine-readable account of WHICH pattern tripped and WHERE (INV-1).
-
-    *storm* is folded in only when a rejection burst actually fired: the
-    ``'storm'`` key is OMITTED entirely otherwise, rather than set to ``None``, so
-    its presence is an unambiguous signal (INV-4).
-    """
-    block: dict[str, Any] = {
-        'error': 'mcp_markup_write_blocked',
-        'error_type': 'McpEnvelopeMarkupWriteRejected',
-        'agent_id': agent_id,
-        'field': field,
-        'matched_pattern': pattern,
-        'content_excerpt': text[:200],
-        'hint': _MARKUP_HINT,
-    }
-    if storm is not None:
-        block['storm'] = storm
-    return block
-
-
-class MarkupStormCounter:
-    """Rolling-window burst detector over markup rejections (INV-4).
-
-    One bounced write is routine; a BURST means the upstream serialization leak
-    is actively running, which is the condition worth escalating rather than
-    merely logging.
-
-    A THIN ADAPTER over the shared ``server/storm_counter.StormCounter``, which
-    is the single home for the append/prune/count/rate-limit body (INV-5, task
-    3088 — this class was its third copy). Everything markup-specific stays
-    here: the module-constant defaults, the ``project=`` parameter name, the
-    ``projects`` result key and the ``hint``.
-
-    The per-project dimension is load-bearing, not decoration: one server
-    instance serves every known project, so a window that mixed two projects
-    into a bare count would let the caller attribute the whole burst to
-    whichever write happened to cross the threshold — and file the escalation
-    into that project's queue while the actually-leaking project got nothing.
-
-    State is PROCESS-LOCAL and resets on restart, like every other in-process
-    storm counter in this codebase: the counter exists to catch a live burst, not
-    to keep durable statistics. It is also per-instance, and ``server/tools.py``
-    instantiates one per ``create_mcp_server`` call rather than as a module
-    global, so no state bleeds between servers (or between tests).
-
-    Not thread-safe by construction; the MCP tool handlers that call it run on a
-    single event loop and ``record`` never awaits.
-    """
-
-    def __init__(
-        self,
-        threshold: int = _MARKUP_STORM_THRESHOLD,
-        window_seconds: float = _MARKUP_STORM_WINDOW_SECONDS,
-        time_provider: Callable[[], float] = time.time,
-    ) -> None:
-        self._threshold = threshold
-        self._window_seconds = window_seconds
-        self._counter = StormCounter(time_provider=time_provider)
-
-    def record(self, project: str | None = None) -> dict[str, Any] | None:
-        """Record one rejection; return a storm summary iff a burst just fired.
-
-        *project* is the label the rejection belongs to — the resolved
-        ``project_root``, or ``None`` when the boundary could not resolve one
-        (``add_memory``/``add_episode`` take a ``project_id``, which for a project
-        absent from the known-projects registry maps to no root at all).
-        Unlabelled rejections still count toward the burst but are not named.
-
-        Returns ``None`` when the count within the window is below the threshold,
-        AND when the threshold is met but a previous fire is still inside the
-        window (the rate limit — without it, a leak emitting hundreds of writes
-        would escalate hundreds of times for one incident).
-
-        Otherwise returns a JSON-serializable summary with ``count``,
-        ``threshold``, ``window_seconds``, ``hint`` and ``projects`` — the sorted
-        DISTINCT non-``None`` labels seen in the window, so the caller can
-        attribute the burst (and escalate to every project it touched) instead of
-        blaming whichever write crossed the threshold.
-
-        This counter's threshold and window are module constants, so passing them
-        through on each call is a no-op for reload semantics here; the shared
-        class takes them per call for the benefit of consumers whose knobs come
-        from a green-tier config leaf (see ``storm_counter``'s module docstring).
-        """
-        summary = self._counter.record(
-            threshold=self._threshold,
-            window_seconds=self._window_seconds,
-            label=project,
-        )
-        if summary is None:
-            return None
-        return {
-            'count': summary['count'],
-            'threshold': summary['threshold'],
-            'window_seconds': summary['window_seconds'],
-            'projects': summary['labels'],
-            'hint': _MARKUP_STORM_HINT,
-        }
 
 
 def emit_markup_storm_escalation(
