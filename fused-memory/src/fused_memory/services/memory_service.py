@@ -1727,10 +1727,36 @@ class ReferentFinding:
             'reason': self.reason,
         }
 
+def _candidate_pool(
+    *, referents: frozenset[Referent], cited: frozenset[Referent],
+) -> frozenset[Referent]:
+    """The evidence rule, before either endpoint is subtracted.
+
+    ``(cited & referents) or referents``. The edge's own fact is the sharpest
+    evidence available about which node THIS edge belongs on, so a citation the
+    declaration corroborates wins; the whole declared set is the fallback for
+    when the fact cites nothing the declaration also names. INTERSECTING rather
+    than unioning is what keeps a repair target from ever originating outside
+    the referent set — an LLM-restated fact naming a task the write never
+    declared itself to be about must not become a target. Fact-scoping is also
+    what keeps mode (iii) repairable: with referents {3074, 3075} the whole-set
+    fallback would see two candidates and abandon a repair the fact
+    unambiguously determines.
+
+    Extracted so the rule lives at ONE site that both :func:`_candidate_targets`
+    and :func:`_unresolvable_reason` read. Without it the reason builder would
+    have to RECOMPUTE the pool to explain itself — a second copy that must agree
+    with the first byte-for-byte, which is exactly the INV-5 lockstep
+    duplication this PRD exists to avoid.
+    """
+    return (cited & referents) or referents
+
+
 def _candidate_targets(
     *,
     referents: frozenset[Referent],
     cited: frozenset[Referent],
+    endpoint: Referent,
     other_endpoint: Referent | None,
 ) -> tuple[Referent, ...]:
     """Which referent could this misattached edge end correctly point at?
@@ -1741,24 +1767,37 @@ def _candidate_targets(
 
     The rule, in order:
 
-    1. ``pool = (cited & referents) or referents``. The edge's own fact is the
-       sharpest evidence available about which node THIS edge belongs on, so a
-       citation the declaration corroborates wins; the whole declared set is the
-       fallback for when the fact cites nothing the declaration also names.
-       INTERSECTING rather than unioning is what keeps a repair target from ever
-       originating outside the referent set — an LLM-restated fact naming a task
-       the write never declared itself to be about must not become a target.
-       Fact-scoping is also what keeps mode (iii) repairable: with referents
-       {3074, 3075} the whole-set fallback would see two candidates and abandon a
-       repair the fact unambiguously determines.
-    2. Subtract *other_endpoint*. Not defensive ceremony: ``reassign_edge``
+    1. ``pool = _candidate_pool(referents=..., cited=...)`` — the fact-cited
+       intersection when it is non-empty, else the whole declared set.
+    2. Subtract *endpoint*, the referent this finding is ABOUT. A "repair" onto
+       the node the edge is already attached to is not a repair — and is not
+       even a harmless no-op, because :meth:`_intended_endpoint_uuid` resolves
+       the CANONICAL name: with a non-canonical endpoint spelling
+       (``'task #3074'``) and a canonical ``'Task 3074'`` node both present it
+       yields a DIFFERENT uuid, and eta would perform real edge surgery on an
+       endpoint that was already correct.
+
+       On the SET-MEMBERSHIP arm this subtraction is provably a NO-OP: the pool
+       is always a subset of ``referents``, and membership fires precisely when
+       the endpoint is NOT in ``referents``, so the endpoint can never be in the
+       pool. It is therefore a STRUCTURAL GUARANTEE at the single site that
+       decides targets rather than a behaviour change on the dominant path —
+       which is the point: a future third check cannot silently reintroduce a
+       self-targeting repair by forgetting to guard for it.
+
+       The invariant is deliberately NOT additionally enforced by a raising
+       ``ReferentFinding.__post_init__`` validator. This pass runs inside an
+       already-committed write's identity-lock critical section, where raising
+       is strictly worse than recording: the write has landed either way, and an
+       exception would destroy the very evidence eta needs.
+    3. Subtract *other_endpoint*. Not defensive ceremony: ``reassign_edge``
        (graphiti_client.py) explicitly refuses a move that would fold the edge
        into a self-loop, so a "target" equal to the edge's other end is not a
        repair eta could perform. This subtraction is precisely what turns the
        live Task 2519/2520 case — referents {2519}, endpoints (Task 2519,
        Task 2520), a fact unary about 2519 — into the zero-candidate row the PRD
        names as explicitly unrepairable.
-    3. Return in a deterministic order.
+    4. Return in a deterministic order.
 
     Exactly one survivor means the correct target is DETERMINED. Zero or more
     than one means it is not, and the caller records the finding with
@@ -1772,6 +1811,10 @@ def _candidate_targets(
         referents: The set the write declared itself to be about.
         cited: The referents this edge's own fact mentions
             (``scan_content(...).refs``, which already excludes ambiguity).
+        endpoint: The referent the flagged endpoint currently parses as.
+            Non-optional: a finding is only ever built for an endpoint that
+            PARSED, so the flagged referent is always known — encoded in the
+            type rather than accepting a ``None`` no call site can produce.
         other_endpoint: The referent at the edge's OTHER end, or ``None`` when
             that end is not a task node at all.
 
@@ -1782,19 +1825,36 @@ def _candidate_targets(
         processes under hash randomization — and a finding must be stable across
         runs and diffable in eta's audit.
     """
-    pool = (cited & referents) or referents
-    if other_endpoint is not None:
-        pool = pool - {other_endpoint}
+    # `other_endpoint` may be None; None is simply not a member of a
+    # frozenset[Referent], and typeshed types `frozenset.__sub__` as accepting
+    # AbstractSet[_T_co | None], so no explicit `- {None}` branch is needed.
+    pool = _candidate_pool(referents=referents, cited=cited) - {
+        endpoint, other_endpoint,
+    }
     return tuple(sorted(pool, key=lambda r: (r.kind, r.project_id, r.number)))
 
 def _unresolvable_reason(
-    candidates: tuple[Referent, ...], other_endpoint: Referent | None,
+    candidates: tuple[Referent, ...],
+    *,
+    pool: frozenset[Referent],
+    endpoint: Referent,
+    other_endpoint: Referent | None,
 ) -> str:
     """Why :func:`_candidate_targets` could not determine a correct target.
 
     Carried on the finding so "recorded and left alone" is legible as a REASON
     rather than as an absence — a reader must be able to tell an unrepairable
-    row from a row nobody looked at.
+    row from a row nobody looked at, and to tell "the check had nothing to point
+    at but the node it was already on" from "the only target would form a
+    self-loop".
+
+    Args:
+        candidates: What :func:`_candidate_targets` returned.
+        pool: The PRE-subtraction pool from :func:`_candidate_pool`. Membership
+            is tested here rather than inferred from ``other_endpoint is None``
+            precisely so the message stays HONEST when BOTH subtractions apply.
+        endpoint: The referent the flagged endpoint currently parses as.
+        other_endpoint: The referent at the edge's other end, or ``None``.
     """
     if len(candidates) > 1:
         return (
@@ -1802,11 +1862,17 @@ def _unresolvable_reason(
             f'({[c.node_name for c in candidates]}) and the edge fact does not '
             'discriminate between them; recorded, not guessed at'
         )
+    # Zero candidates. The pool is non-empty by construction whenever
+    # `referents` is (and the caller no-ops on an empty set), so it can only
+    # empty out by one of the two subtractions below.
+    if endpoint in pool:
+        return (
+            f'the only candidate target {endpoint.node_name!r} is the node this '
+            'edge end is already attached to, so there is nothing to repoint '
+            'to; recorded, not repaired'
+        )
     if other_endpoint is not None:
-        # The only reachable zero-candidate shape: `_candidate_targets`' pool is
-        # non-empty by construction whenever `referents` is (and the caller
-        # no-ops on an empty set), so it can only empty out by subtracting the
-        # edge's other endpoint. The live Task 2519/2520 row.
+        # The live Task 2519/2520 row.
         return (
             f'the only candidate target {other_endpoint.node_name!r} is this '
             "edge's other endpoint, so repointing would form the self-loop "
@@ -3137,6 +3203,7 @@ class MemoryService:
                 candidates = _candidate_targets(
                     referents=referent_set,
                     cited=cited,
+                    endpoint=endpoint_referent,
                     other_endpoint=other_referent,
                 )
                 resolvable = len(candidates) == 1
@@ -3151,7 +3218,12 @@ class MemoryService:
                     intended_referent=candidates[0] if resolvable else None,
                     resolvable=resolvable,
                     reason='' if resolvable else _unresolvable_reason(
-                        candidates, other_referent,
+                        candidates,
+                        pool=_candidate_pool(
+                            referents=referent_set, cited=cited,
+                        ),
+                        endpoint=endpoint_referent,
+                        other_endpoint=other_referent,
                     ),
                 ))
 
