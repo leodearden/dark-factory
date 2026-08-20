@@ -21,7 +21,10 @@ load_dotenv()
 
 from functools import partial  # noqa: E402
 
+from shared.mcp_markup_middleware import RepairPolicy  # noqa: E402
+
 from fused_memory.config.schema import FusedMemoryConfig  # noqa: E402
+from fused_memory.server.markup_guard import install_markup_guard  # noqa: E402
 from fused_memory.server.tools import (  # noqa: E402
     _checkpoint_overrides_db_if_exists,
     create_mcp_server,
@@ -951,12 +954,11 @@ async def run_server():
         known_projects=_known_projects_map,
     )
 
-    # Defence-in-depth wrapper at FastMCP's central tool-dispatch chokepoint.
-    # Catches BaseException escapes (SystemExit, BaseExceptionGroup, etc.) that
-    # would otherwise poison StreamableHTTPSessionManager's shared task group
-    # and cascade into uvicorn's main loop. Re-raises CancelledError because
-    # it is required for asyncio cancellation semantics.
-    _install_safe_tool_wrapper(mcp)
+    # Both ToolManager.call_tool wrappers, in the ONE order that works. The
+    # ordering rationale lives on the helper, and is pinned by
+    # tests/test_markup_guard_fused_memory.py::TestInstallationOrder rather
+    # than by this comment.
+    _install_tool_dispatch_guards(mcp, known_projects=_known_projects_map)
 
     mcp.settings.host = config.server.host
     mcp.settings.port = config.server.port
@@ -1700,6 +1702,59 @@ def _install_safe_tool_wrapper(mcp: Any) -> None:
 
     tool_manager.call_tool = _safe_call_tool
     tool_manager._fused_memory_safe_wrapped = True
+
+
+def _install_tool_dispatch_guards(
+    mcp: Any, *, known_projects: dict[str, str] | None = None
+) -> None:
+    """Install both ``ToolManager.call_tool`` wrappers, in the ONE order that works.
+
+    Two independent concerns share this chokepoint, and the order they are
+    installed in is not cosmetic — it decides which one ends up OUTSIDE, and
+    therefore what the caller sees when both fire:
+
+    1. :func:`_install_safe_tool_wrapper` — defence-in-depth. Catches
+       BaseException escapes (SystemExit, BaseExceptionGroup, ...) that would
+       otherwise poison StreamableHTTPSessionManager's shared task group and
+       cascade into uvicorn's main loop. Re-raises CancelledError, which
+       asyncio cancellation semantics require.
+    2. :func:`~fused_memory.server.markup_guard.install_markup_guard` — the
+       write-boundary markup guard (task 4458, PRD
+       ``plans/toolcall-markup-containment-prd.md``). Rejects a call whose
+       argument absorbed MCP tool-call envelope markup and hands the caller a
+       ``repaired_call`` to resubmit verbatim.
+
+    DO NOT tidy these two calls into the other order. The guard REJECTS by
+    raising :class:`fastmcp.exceptions.ToolError` — measured as the only shape
+    that survives every output schema, since a returned dict is destroyed by
+    the output validation of any tool annotated ``-> str``. Installed second it
+    is the OUTER wrapper, so that ToolError reaches the lowlevel server intact.
+    Installed FIRST it ends up inside ``_safe_call_tool``, which catches
+    BaseException and flattens the rejection into its own
+    ``{'error': str, 'error_type': 'ToolError'}`` shape: ``repaired_call``
+    stops being a key the caller can read and survives only as text inside an
+    opaque string, so the agent cannot resubmit the repair.
+
+    Nor can that be fixed by teaching ``_safe_call_tool`` to re-raise ToolError:
+    the bundled ``Tool.run`` wraps EVERY tool-body exception into ToolError, so
+    such an exemption would gut the containment ``tests/test_tool_safe_wrapper.py``
+    pins. Order is the whole mechanism.
+
+    *known_projects* is run_server's ``project_id -> project_root`` registry,
+    which the guard's storm-escalation sink uses to place a burst in the right
+    queue.
+
+    REJECT_WITH_REPAIR is the PRD's declared tier for fused-memory (section 4,
+    C2), declared HERE at the interception point rather than inferred per tool
+    (INV-1). This is also the primary server only: the recon-report server
+    hosts no write tools and keeps the bare defence-in-depth wrapper.
+    """
+    _install_safe_tool_wrapper(mcp)
+    install_markup_guard(
+        mcp,
+        policy=RepairPolicy.REJECT_WITH_REPAIR,
+        known_projects=known_projects,
+    )
 
 
 def _build_uvicorn_config(
