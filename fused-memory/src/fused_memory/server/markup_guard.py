@@ -67,6 +67,12 @@ from typing import Any, cast
 
 from shared.mcp_markup_middleware import MarkupGuardMiddleware, RepairPolicy
 
+from fused_memory.server.markup_tripwire import (
+    _MARKUP_STORM_THRESHOLD,
+    _MARKUP_STORM_WINDOW_SECONDS,
+    emit_markup_storm_escalation,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -99,6 +105,52 @@ logger = logging.getLogger(__name__)
 #: correct; and ``search``, whose ``query`` is not a sanctioned carrier because
 #: ``scan_memory_content`` is explicitly the tool for literal substring lookup.
 EXEMPT_TOOLS: frozenset[str] = frozenset({'scan_memory_content'})
+
+
+#: The anchor this guard files bursts under. Deliberately NOT markup_tripwire's
+#: ``markup-tripwire``: the L1 escalation watcher files its own cluster records
+#: under that id and SQUATS it — measured, the tripwire filed nothing
+#: 2026-08-16..2026-08-19 while 41 rejections occurred, and all 17 records sat at
+#: dedupe_count 0. Deduping against a squatted anchor is suppression that reads
+#: as calm, so this guard needs an anchor of its own.
+_STORM_ANCHOR_TASK_ID = 'markup-guard'
+
+#: Where an operator should take a recurrence. DF 3083 delivered the root cause
+#: and the corpus sweep but is DONE and CLOSED to appends, so a reader sent there
+#: reports it nowhere. This text carries forward the correction commit e0ea6e3fe9
+#: made to the ERROR line inside tools.py's ``_markup_gate`` closure, which is
+#: deleted when the in-line gates retire — so it has to live here to survive.
+_STORM_ROUTING = (
+    'report the recurrence against plans/toolcall-markup-containment-prd.md '
+    '(DF 3083 is done and closed to appends, so not against 3083)'
+)
+
+
+def _resolve_project_root(project: Any, known_projects: dict[str, str] | None) -> str | None:
+    """Turn the middleware's ``project`` label into a filesystem project_root.
+
+    ``MarkupGuardMiddleware._identity`` resolves ``project_root`` FIRST then
+    ``project_id``, so the label arrives in one of two shapes depending on which
+    tool leaked: the task tools carry a ``project_root`` and yield a PATH, while
+    the memory tools carry only a ``project_id`` and yield a BARE ID like
+    ``dark_factory``. Filing against a bare id would open a queue at a relative
+    directory named after the project.
+
+    So an absolute path passes through unchanged, and anything else is looked up
+    in *known_projects* — the same ``_kp.get(project_id)`` translation the
+    write-time gate does at its four call sites.
+
+    An unresolvable project yields ``None`` and files NOTHING. An escalation
+    filed against a guessed default is worse than one an operator has to place
+    by hand.
+    """
+    if not isinstance(project, str) or not project:
+        return None
+    if project.startswith('/'):
+        return project
+    if known_projects:
+        return known_projects.get(project)
+    return None
 
 
 @dataclass
@@ -200,8 +252,71 @@ def install_markup_guard(
     if getattr(tool_manager, '_fused_memory_markup_guarded', False):
         return
 
+    def _escalation_sink(record: dict[str, Any]) -> None:
+        """File a fired burst, and never change the rejection that fired it.
+
+        Receives the middleware's
+        ``{'error_type': 'mcp_markup_storm', count, threshold, window_seconds,
+        outcome, project}`` record. The middleware delegates dedup here on
+        purpose — whether an open escalation already exists is queue knowledge
+        the shared layer does not have and must not guess at.
+        """
+        project_root = _resolve_project_root(record.get('project'), known_projects)
+        if project_root is None:
+            logger.error(
+                'markup_guard_storm: %s %s outcome(s) in %ss but project=%r could '
+                'not be resolved to a project_root, so NO escalation was filed — '
+                'the serialization leak is ACTIVE; %s',
+                record.get('count'), record.get('outcome'),
+                record.get('window_seconds'), record.get('project'), _STORM_ROUTING,
+            )
+            return
+
+        # ONE greppable operator-facing ERROR line. The storm summary folded
+        # into the tool response reaches only the leaking caller — the one party
+        # that already knows — so the operator's copy cannot ride on it. Naming
+        # the count here is also the visible-counter half of the remedy, without
+        # an escalation-schema change.
+        logger.error(
+            'markup_guard_storm: %s %s outcome(s) in %ss for project_root=%r '
+            '(threshold=%s) — the serialization leak is ACTIVE; %s',
+            record.get('count'), record.get('outcome'), record.get('window_seconds'),
+            project_root, record.get('threshold'), _STORM_ROUTING,
+        )
+
+        # Purely additive: the rejection is already decided, so a queue failure
+        # costs the operator a heads-up and nothing else. Same reasoning the
+        # retiring _markup_gate applies to its own emitter — and
+        # emit_markup_storm_escalation is itself built never to raise, so this
+        # guards only against a defect in it.
+        try:
+            emit_markup_storm_escalation(
+                project_root, record, anchor_task_id=_STORM_ANCHOR_TASK_ID
+            )
+        except Exception:
+            logger.exception(
+                'markup_guard: emit_markup_storm_escalation raised for '
+                'project_root=%r; storm %r not escalated',
+                project_root, record,
+            )
+
     original_call_tool = tool_manager.call_tool
-    guard = MarkupGuardMiddleware(policy, exempt_tools)
+    guard = MarkupGuardMiddleware(
+        policy,
+        exempt_tools,
+        escalation_sink=_escalation_sink,
+        # ONE source for the tuning across both guards, so the in-line gate and
+        # the boundary cannot drift to different thresholds while both are live.
+        storm_threshold=_MARKUP_STORM_THRESHOLD,
+        storm_window_seconds=_MARKUP_STORM_WINDOW_SECONDS,
+        # fact_sink is deliberately left unwired: the middleware already emits
+        # the structured fact unconditionally as a WARNING (INV-2), and
+        # fused-memory has no queue-backed CONSUMER for the stream. This task's
+        # consumers are the calling agent (served by repaired_call) and the
+        # operator (served by the storm escalation above). Left explicit so a
+        # future consumer wires it deliberately rather than inheriting a guess.
+        fact_sink=None,
+    )
     shim_fastmcp = _ShimFastMCPContext(_ShimFastMCP(tool_manager))
 
     async def _guarded_call_tool(

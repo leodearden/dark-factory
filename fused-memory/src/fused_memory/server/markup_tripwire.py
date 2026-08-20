@@ -336,6 +336,8 @@ class MarkupStormCounter:
 def emit_markup_storm_escalation(
     project_root: str | None,
     storm: dict[str, Any],
+    *,
+    anchor_task_id: str = _ANCHOR_TASK_ID,
 ) -> str | None:
     """File an ``mcp_markup_write_storm`` escalation for a rejection burst (INV-4).
 
@@ -355,6 +357,19 @@ def emit_markup_storm_escalation(
     The anchor dedup matters beyond the counter's own per-window rate limit: a
     leak running for hours would otherwise file one escalation per window, so
     those collapse into the single open record until an operator resolves it.
+
+    *anchor_task_id* selects WHICH anchor that dedup keys on, and is threaded
+    through both the lookup and the filing so a caller can never file under one
+    anchor while deduping against another. It exists because the default anchor
+    is SHARED: the L1 escalation watcher files its own cluster records under
+    ``markup-tripwire`` and squats it — measured, the tripwire filed nothing
+    2026-08-16..2026-08-19 while 41 rejections occurred, all 17 records at
+    dedupe_count 0 — so a filer deduping against a squatted anchor is suppressed
+    indefinitely, which is silence an operator reads as calm.
+
+    This is a PARAMETERISATION of the one filer, not licence to write a second
+    one (INV-5). The default is unchanged, so every existing caller behaves
+    identically.
     """
     if project_root is None:
         logger.debug(
@@ -384,7 +399,7 @@ def emit_markup_storm_escalation(
     # bailing out — losing duplicate-suppression is strictly better than losing
     # the alarm for an actively running leak.
     try:
-        existing = queue.get_by_task(_ANCHOR_TASK_ID, status='pending')
+        existing = queue.get_by_task(anchor_task_id, status='pending')
     except Exception:
         logger.exception(
             'markup_tripwire: failed to check for an existing open escalation '
@@ -433,8 +448,8 @@ def emit_markup_storm_escalation(
 
     try:
         esc = Escalation(  # type: ignore[possibly-unbound]
-            id=queue.make_id(_ANCHOR_TASK_ID),
-            task_id=_ANCHOR_TASK_ID,
+            id=queue.make_id(anchor_task_id),
+            task_id=anchor_task_id,
             agent_role=_AGENT_ROLE,
             severity='blocking',
             category=_CATEGORY,
