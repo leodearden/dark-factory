@@ -19,6 +19,7 @@ import re
 import sys
 import types
 import uuid
+import weakref
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -1317,6 +1318,113 @@ async def reap_leaked_ticket_workers() -> int:
                 asyncio.gather(task, return_exceptions=True), timeout=10.0,
             )
         if task.done():
+            reaped += 1
+    return reaped
+
+
+# ---------------------------------------------------------------------------
+# Leaked async httpx client reaping (task 4412)
+#
+# Sibling of reap_leaked_ticket_workers above, and of
+# orchestrator/tests/_orch_helpers.py::reap_leaked_aiosqlite_connections
+# (task 2413): a per-test teardown drain for a resource whose owner never
+# closes it, written here rather than at the ~40 call sites across 7 test
+# modules that leak one.
+# ---------------------------------------------------------------------------
+
+#: Every httpx.AsyncClient constructed since track_async_httpx_clients() ran.
+#: A WeakSet so tracking never keeps a client alive past its natural lifetime —
+#: the reaper only ever sees clients something else is still holding.
+_TRACKED_ASYNC_HTTPX_CLIENTS: weakref.WeakSet = weakref.WeakSet()
+
+
+def track_async_httpx_clients() -> None:
+    """Record every ``httpx.AsyncClient`` built from now on, for later reaping.
+
+    Wraps ``httpx.AsyncClient.__init__`` — ONE patch point that catches every
+    library shipping the leaky wrapper, present and future. Measured in this
+    worktree: ``openai._base_client.AsyncHttpxClientWrapper`` and
+    ``anthropic._base_client.AsyncHttpxClientWrapper`` both have MRO
+    ``(Wrapper -> _DefaultAsyncHttpxClient -> httpx.AsyncClient)`` and chain to
+    ``httpx.AsyncClient.__init__``, so patching only the base tracked all of
+    ``AsyncOpenAI``, ``AsyncAnthropic``, a ``graphiti_core`` ``OpenAIClient``
+    and a bare ``httpx.AsyncClient``. That needs no per-library import list to
+    keep in sync and cannot break on import order.
+
+    Instances are recorded AFTER the original ``__init__`` returns, so a
+    constructor that raises leaves nothing half-built in the WeakSet.
+    """
+    original = httpx.AsyncClient.__init__
+
+    @functools.wraps(original)
+    def __init__(self, *args, **kwargs):
+        original(self, *args, **kwargs)
+        _TRACKED_ASYNC_HTTPX_CLIENTS.add(self)
+
+    httpx.AsyncClient.__init__ = __init__
+
+
+async def reap_leaked_async_httpx_clients() -> int:
+    """Close any tracked ``httpx.AsyncClient`` that its owner never closed.
+
+    Task 4412 — fix for the fused-memory caplog flake CLASS where an unclosed
+    ``openai``/``anthropic`` client emits an ERROR record onto the root
+    ``asyncio`` logger from inside an unrelated later test's caplog window.
+
+    ROOT CAUSE: ``openai._base_client.AsyncHttpxClientWrapper`` and its
+    ``anthropic`` twin define::
+
+        def __del__(self) -> None:
+            if self.is_closed:
+                return
+            try:
+                asyncio.get_running_loop().create_task(self.aclose())
+            except Exception:
+                pass
+
+    An ``AsyncOpenAI``/``AsyncAnthropic`` that is never closed is GC-finalised
+    at a nondeterministic point; if a loop happens to be running, ``__del__``
+    RESURRECTS the object as ``create_task(self.aclose())``. That Task's
+    coroutine is httpx's inherited ``AsyncClient.aclose`` — the
+    ``coro=<AsyncClient.aclose() ...>`` in the symptom. Its ``aclose()`` then
+    hits a connection pool bound to an already-closed loop and raises
+    ``RuntimeError('Event loop is closed')``; nobody retrieves it, so
+    ``Task.__del__`` logs ``Task exception was never retrieved`` at ERROR and
+    it is blamed on whichever test's caplog is open at the time.
+
+    MEASURED (this worktree, full default-lane suite, 14147 passed): 40
+    wrapper instances constructed, ALL 40 GC-finalised, ZERO closed — i.e. 40
+    chances per suite run for ``__del__`` to resurrect. They come from
+    ``graphiti_core``'s ``OpenAIClient`` / ``OpenAIGenericClient`` /
+    ``OpenAIEmbedder`` / ``OpenAIRerankerClient``, each of which mints its own
+    ``AsyncOpenAI`` in ``__init__`` and exposes no ``close()`` — so the tests
+    that trigger them have no call-site fix available.
+
+    FIX: close every tracked client at each test's teardown boundary.
+    ``__del__``'s own ``if self.is_closed: return`` then short-circuits, so the
+    resurrect path is unreachable and the ERROR record can never be emitted.
+
+    Best-effort and bounded, and a cheap no-op for the (vast majority of)
+    tests that leak nothing. Only ``asyncio.TimeoutError`` and ``RuntimeError``
+    are suppressed: a client whose pool belongs to an already-closed loop
+    raises ``RuntimeError`` on ``aclose()`` and must not fail an innocent test.
+    A genuine bug inside the reaper itself — or a ``CancelledError`` targeting
+    the reaper's own task — is deliberately left to propagate rather than
+    masked by a blanket ``except Exception``
+    (loud-over-silent-degradation).
+
+    Returns:
+        The number of clients this call actually closed (``is_closed``
+        confirmed post-drain) — a client that fails to close within the
+        bounded timeout is not counted.
+    """
+    reaped = 0
+    for client in list(_TRACKED_ASYNC_HTTPX_CLIENTS):
+        if client.is_closed:
+            continue
+        with contextlib.suppress(asyncio.TimeoutError, RuntimeError):
+            await asyncio.wait_for(client.aclose(), timeout=10.0)
+        if client.is_closed:
             reaped += 1
     return reaped
 
