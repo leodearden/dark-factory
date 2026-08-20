@@ -15,6 +15,11 @@ from fastmcp import FastMCP
 from fastmcp.server.dependencies import get_http_headers
 from pydantic import ValidationError
 from shared.branch_names import canonical_queued_branch_name
+
+# Fully qualified rather than `from shared import ...`: the module is
+# deliberately NOT re-exported from shared/__init__, so `import shared` does
+# not pull fastmcp into every consumer of the base layer.
+from shared.mcp_markup_middleware import MarkupGuardMiddleware, RepairPolicy
 from shared.storm_counter import StormCounter
 from shared.task_runtime_state import TaskRuntimeEntry, TaskRuntimeSnapshot
 
@@ -647,6 +652,39 @@ def create_server(
     deterministic and wall-clock-independent.
     """
     mcp = FastMCP('escalation')
+
+    # --- Leaked tool-call envelope markup (task 3690, PRD section 4 C2) ---
+    #
+    # Registered HERE, immediately after the server exists and before any
+    # @mcp.tool() below, so every tool on this server is covered by one
+    # registration and a tool added later cannot miss it.
+    #
+    # FORWARD_REPAIR, not REJECT_WITH_REPAIR, and the reason is C2's own: a
+    # lost escalate_info STRANDS A TASK (INV-6). Where bouncing a caller costs
+    # more than proceeding, the guard repairs in place and warns rather than
+    # refusing. The tier is passed EXPLICITLY as a keyword because INV-1 makes
+    # it a registration-time DECLARATION — never inferred per call from the
+    # shape of the damage or from a tool's name.
+    #
+    # exempt_tools is likewise written out even though frozenset() is the
+    # default: an exemption is a declaration, and spelling it makes a future
+    # tool addition on this server a DECISION rather than an omission. No tool
+    # here legitimately carries envelope literals as data — the
+    # scan_memory_content case that motivates exemptions lives on fused-memory
+    # (sibling task 4458). A name added here would match BARE (`escalate_info`,
+    # never the agent-facing mcp__escalation__escalate_info spelling the
+    # specimen corpus records), because context.message.name is the in-server
+    # name and a declaration that fails open is worse than none.
+    #
+    # strict_input_validation is deliberately NOT set (PRD boundary row B15):
+    # with it on the SDK jsonschema-validates before FastMCP's handler, the
+    # middleware chain is never entered, and every required-parameter leak
+    # becomes silently unrepairable.
+    mcp.add_middleware(MarkupGuardMiddleware(
+        policy=RepairPolicy.FORWARD_REPAIR,
+        exempt_tools=frozenset(),
+    ))
+
     cfg = dedupe_config if dedupe_config is not None else DedupeConfig()
 
     # --- Startup sweep (pre-serving single-writer window) ---

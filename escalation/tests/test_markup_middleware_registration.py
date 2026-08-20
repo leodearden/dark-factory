@@ -38,12 +38,11 @@ from typing import Any
 
 import pytest
 from fastmcp import Client
-from fastmcp.exceptions import ToolError
+from shared.mcp_markup_middleware import MarkupGuardMiddleware, RepairPolicy
+from shared.toolcall_markup import detect
 
 from escalation.queue import EscalationQueue
 from escalation.server import create_server
-from shared.mcp_markup_middleware import MarkupGuardMiddleware, RepairPolicy
-from shared.toolcall_markup import detect
 
 # ---------------------------------------------------------------------------
 # The committed corpus.
