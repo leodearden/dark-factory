@@ -3368,13 +3368,31 @@ class TestClauseSplitRe:
         escalation already in the human queue — it wants
         STRICT_CLAUSE_BOUNDARY_RE, and adding itself to the allowlist below is
         the wrong fix.
+
+        scripts/audit_duplicate_memories.py (task 3891) made that showing and
+        is the second allowlist entry. Its
+        `find_liveness_snapshot_recurrences` keys each subject of a
+        point-in-time liveness snapshot on the clause(s) naming it, and that
+        path is REPORT-ONLY: its groups never reach `delete_candidates`
+        (enforced there by `test_no_liveness_member_is_ever_a_delete_candidate`
+        and `test_the_apply_gate_is_never_handed_a_liveness_group`), and the
+        report is rebuilt from scratch on every run. An over-long clause there
+        merges two subjects' facts into one reported group — a reviewer's
+        glance, gone next cycle, with nothing durable written. Same fail-safe
+        direction as the two soft-block gates, which is also why
+        STRICT_CLAUSE_BOUNDARY_RE would be the wrong constant for it: its
+        narrower alphabet returned the EMPTY SET on all four of the real
+        records that detector exists for.
         """
         import ast
         from pathlib import Path
 
         package_root = Path(__file__).resolve().parents[1]
         # Every file allowed to reference the private constant in CODE.
-        allowlist = {'src/fused_memory/reconciliation/task_filter.py'}
+        allowlist = {
+            'src/fused_memory/reconciliation/task_filter.py',
+            'scripts/audit_duplicate_memories.py',
+        }
         skip_parts = {'.venv', 'site-packages', '__pycache__'}
 
         consumers: set[str] = set()

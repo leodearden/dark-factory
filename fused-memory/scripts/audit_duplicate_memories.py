@@ -194,6 +194,21 @@ from pathlib import Path
 from typing import Any
 
 from fused_memory.reconciliation.task_filter import (
+    # `_CLAUSE_SPLIT_RE` is module-private BY CONTRACT — an AST scan over
+    # `src/` and `scripts/` (tests/test_task_filter.py
+    # ::test_clause_split_re_has_no_out_of_module_consumers) enforces an
+    # explicit allowlist, because the WIDENED splitter is only defensible for
+    # callers that fail toward something self-healing. This module qualifies:
+    # `find_liveness_snapshot_recurrences` is REPORT-ONLY — its groups never
+    # reach `delete_candidates` (pinned by
+    # `test_no_liveness_member_is_ever_a_delete_candidate` and
+    # `test_the_apply_gate_is_never_handed_a_liveness_group`) — and the report
+    # is regenerated from scratch every run, so an over-long clause costs a
+    # reviewer one glance and is gone next cycle. Same fail-safe direction as
+    # the two soft-block write gates, which is why `STRICT_CLAUSE_BOUNDARY_RE`
+    # is the WRONG constant here: its narrow alphabet is precisely what
+    # returned the empty set on all four real records.
+    _CLAUSE_SPLIT_RE,
     LIVE_TASK_STATUS_RE,
     POINT_IN_TIME_CHECK_RE,
     TASK_REF_RE,
@@ -452,6 +467,41 @@ _LIVE_FIELD_SCAN_RE = re.compile(
 )
 
 
+def _readable_field_pairs(text: str) -> set[str] | None:
+    """Every readable ``field=value`` pair in *text*, or None if any is not.
+
+    The SINGLE copy of the pair-reading logic, shared by the record-level
+    classifier and the per-clause scan `liveness_snapshot_subject_facts`
+    runs. A second hand-rolled copy of the same normalisation is exactly the
+    drift `_classify_liveness_snapshot`'s "deliberately single-copy" note
+    warns about.
+
+    Returns:
+        The set of ``<field>=<value>`` pairs — field name lowercased, value
+        whitespace-normalised, trailing delimiter/punctuation stripped, and
+        lowercased. Empty when *text* names no recognised field in assignment
+        form at all. None when a recognised ``<field>=`` was found but its
+        value could not be read WHOLE (an absent value group, or one that
+        cleaned to empty) — the distinction the record-level caller turns into
+        a `liveness_snapshot_unfielded` disclosure rather than a key built
+        from the survivors.
+    """
+    pairs: set[str] = set()
+    for m in _LIVE_FIELD_SCAN_RE.finditer(text):
+        if m.group('quoted') is None and m.group('bare') is None:
+            return None
+        # Exactly one of `quoted`/`bare` ever participates; `' '.join(split())`
+        # normalises the whitespace a quoted value may now legitimately carry
+        # (and is a no-op on a bare token).
+        cleaned = ' '.join(
+            (m.group('quoted') or m.group('bare')).split(),
+        ).rstrip('./:+-').lower()
+        if not cleaned:
+            return None
+        pairs.add(f"{m.group('field').lower()}={cleaned}")
+    return pairs
+
+
 def _classify_liveness_snapshot(content: str) -> tuple[bool, str | None]:
     """The ONE liveness-snapshot classifier. Both call sites route through here.
 
@@ -514,19 +564,11 @@ def _classify_liveness_snapshot(content: str) -> tuple[bool, str | None]:
     if not POINT_IN_TIME_CHECK_RE.search(content):
         return False, None
 
-    pairs: set[str] = set()
-    for m in _LIVE_FIELD_SCAN_RE.finditer(content):
-        if m.group('quoted') is None and m.group('bare') is None:
-            return True, None
-        # Exactly one of `quoted`/`bare` ever participates; `' '.join(split())`
-        # normalises the whitespace a quoted value may now legitimately carry
-        # (and is a no-op on a bare token).
-        cleaned = ' '.join(
-            (m.group('quoted') or m.group('bare')).split(),
-        ).rstrip('./:+-').lower()
-        if not cleaned:
-            return True, None
-        pairs.add(f"{m.group('field').lower()}={cleaned}")
+    # `not pairs` covers BOTH None (a field whose value could not be read
+    # whole) and the empty set (a `LIVE_TASK_STATUS_RE` paraphrase naming no
+    # readable field at all) — the two branches that separately returned
+    # `(True, None)` before the reader was extracted.
+    pairs = _readable_field_pairs(content)
     if not pairs:
         return True, None
     return True, '|'.join(sorted(pairs))
@@ -628,6 +670,50 @@ def liveness_snapshot_subject_task_ids(record: dict) -> set[str]:
         _add(ref)
 
     return subjects
+
+
+def liveness_snapshot_subject_facts(record: dict, core_fact: str) -> dict[str, str]:
+    """WHAT each subject of a liveness snapshot is asserted to be.
+
+    The per-subject sibling of `liveness_snapshot_subject_task_ids`: that one
+    answers WHICH tasks a record is about, this one answers what the record
+    says about each of them, so a multi-task re-verification reporting
+    DIVERGENT values per task joins each subject's own group instead of
+    matching neither.
+
+    Args:
+        record: A memory dict already classified as a liveness snapshot.
+        core_fact: That record's whole-record key, taken as a PARAMETER rather
+            than re-derived. Calling `extract_liveness_snapshot_fact` here
+            would re-consult the quadratic `POINT_IN_TIME_CHECK_RE` a second
+            time per record, which `TestLivenessDetectorRegexBudget` pins
+            against.
+
+    Returns:
+        ``{subject_task_id: core_fact_for_that_subject}``. Does not mutate
+        *record*.
+    """
+    scoped: dict[str, set[str]] = {}
+    for clause in _CLAUSE_SPLIT_RE.split(record.get('content') or ''):
+        if not clause.strip():
+            continue
+        refs = {str(ref) for ref in TASK_REF_RE.findall(clause)}
+        if not refs:
+            continue
+        # `or set()` is safe: the record-level gate already proved every
+        # recognised field in this record reads whole, so an unreadable CLAUSE
+        # is a clause boundary landing inside a value, not a poisoned key —
+        # it contributes nothing and the subject falls back below.
+        pairs = _readable_field_pairs(clause) or set()
+        for ref in refs:
+            scoped.setdefault(ref, set()).update(pairs)
+
+    facts: dict[str, str] = {}
+    for subject in liveness_snapshot_subject_task_ids(record):
+        pairs = scoped.get(subject)
+        if pairs:
+            facts[subject] = '|'.join(sorted(pairs))
+    return facts
 
 
 # The three Mem0-backed categories, enumerated ONCE. Graphiti-backed
@@ -778,8 +864,12 @@ def find_liveness_snapshot_recurrences(
             # A recognised snapshot no bucket can hold: real recall, counted
             # rather than invisible.
             disclosure['liveness_snapshot_untasked'] += 1
-        for subject in subjects:
-            buckets.setdefault((category, subject, core_fact), []).append(record)
+        # PER SUBJECT, from the clause(s) that name it — not one whole-record
+        # key attributed to every subject alike.
+        for subject, fact in liveness_snapshot_subject_facts(
+            record, core_fact,
+        ).items():
+            buckets.setdefault((category, subject, fact), []).append(record)
 
     groups: list[dict[str, Any]] = []
     for (category, subject, core_fact), members in buckets.items():
