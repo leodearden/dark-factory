@@ -769,12 +769,24 @@ def test_every_composing_caller_carries_a_timeout_override() -> None:
     `@pytest.mark.timeout` marker fails this test immediately instead of
     silently passing because nobody added a row for it. VALUE: for every
     `worst_case_secs` entry, its marker must exist and its value must
-    actually clear the computed worst case.
+    actually clear the REQUIRED timeout (task 4203's `_required_timeout_secs`
+    model) — the bounded-wait sum plus its out-of-bound real-git spawn
+    allowance, not the bounded sum alone.
 
     `worst_case_secs` maps each composing test FUNCTION OBJECT — never a
     string, so a rename breaks this test loudly instead of silently dropping
     a row — to its worst-case bounded-wait sum, expressed in terms of this
     module's named timeout constants (never bare literals).
+
+    `out_of_bound_spawns` (task 4203) maps the SAME function objects to their
+    counted real-git subprocess spawns that happen OUTSIDE any bounded wait
+    — the other multiplicand `_required_timeout_secs` prices at
+    `_MEASURED_SPAWN_LATENCY_SECS` per spawn, expressed in this module's
+    `_SPAWNS_PER_REPO_FIXTURE` / `_SPAWNS_PER_DRIVE_ADVANCE` constants, never
+    bare literals. Every function classified in `worst_case_secs` must also
+    appear here (enforced by a key-set equality assertion below) — a row
+    added to one table without its counterpart in the other would silently
+    size the requirement wrong.
 
     `single_pass_exempt` holds tests that call a composing helper but are
     proven to never exceed a single `_LANE_PASS_BOUND_SECS`-bounded pass —
@@ -813,6 +825,36 @@ def test_every_composing_caller_carries_a_timeout_override() -> None:
             + _NOTE_MERGE_ALL_BOUND_SECS
         ),
     }
+    # Task 4203 — the other multiplicand `_required_timeout_secs` needs per
+    # composing test: its counted out-of-bound real-git spawns (never
+    # `_run_one_lane_pass`'s spawns, which occur INSIDE the `_run_lane` 30s
+    # window and are already carried by worst_case_secs above). b5 and b7
+    # drive exactly n x `_drive_advance` via `_drive_reds` (`for _ in
+    # range(n)`) — b7's four `_drive_reds` calls sum n = 2+1+2+1 = 6. b3
+    # drives one direct `_drive_advance` plus `_assert_never_a_gate`'s own
+    # unbounded advance-and-notify work, approximated here at one
+    # `_drive_advance`-equivalent round (the landed `@pytest.mark.timeout`
+    # comment on b3 itself already characterizes this as "two
+    # _drive_advance/_advance_main rounds").
+    out_of_bound_spawns = {
+        test_b5_same_set_recurrence_updates_not_duplicates: (
+            _SPAWNS_PER_REPO_FIXTURE + 2 * _SPAWNS_PER_DRIVE_ADVANCE
+        ),
+        test_b7_stall_promotes_to_blocker: (
+            _SPAWNS_PER_REPO_FIXTURE + 6 * _SPAWNS_PER_DRIVE_ADVANCE
+        ),
+        test_b3_never_a_gate: (
+            _SPAWNS_PER_REPO_FIXTURE + 2 * _SPAWNS_PER_DRIVE_ADVANCE
+        ),
+    }
+    assert set(worst_case_secs) == set(out_of_bound_spawns), (
+        f'worst_case_secs and out_of_bound_spawns must classify exactly the '
+        f'same composing tests — '
+        f'{sorted(fn.__name__ for fn in set(worst_case_secs) ^ set(out_of_bound_spawns))} '
+        f'appear in only one of the two tables, so a row added to one table '
+        f'silently omits half of the _required_timeout_secs inputs for that '
+        f'test.'
+    )
     single_pass_exempt = {
         test_b1_advance_triggers_from_head_run,
         test_b2_coalesces_burst_of_advances_to_one_rerun,
@@ -837,27 +879,36 @@ def test_every_composing_caller_carries_a_timeout_override() -> None:
     )
 
     for fn, worst_case in worst_case_secs.items():
+        out_of_bound = out_of_bound_spawns[fn]
+        required = _required_timeout_secs(worst_case, out_of_bound)
+        spawn_allowance = out_of_bound * _MEASURED_SPAWN_LATENCY_SECS
         markers = [m for m in getattr(fn, 'pytestmark', []) if m.name == 'timeout']
         assert markers, (
             f'{fn.__name__} composes bounded waits to a worst case of '
-            f'{worst_case}s but carries no @pytest.mark.timeout override. '
-            f'Left uncovered, this can silently collide with the 60s '
-            f'orchestrator/pyproject.toml per-test default — under '
-            f'timeout_method="thread" with --max-worker-restart=0, '
-            f'pytest-timeout os._exit()s the xdist worker instead of '
-            f"failing cleanly, discarding _run_lane's own well-located "
-            f'TimeoutError. Add @pytest.mark.timeout(N) with N > {worst_case}.'
+            f'{worst_case}s plus {out_of_bound} out-of-bound real-git spawns '
+            f'({out_of_bound} x {_MEASURED_SPAWN_LATENCY_SECS}s = '
+            f'{spawn_allowance}s) — required = {required}s — but carries no '
+            f'@pytest.mark.timeout override. Left uncovered, this can '
+            f'silently collide with the 60s orchestrator/pyproject.toml '
+            f'per-test default — under timeout_method="thread" with '
+            f'--max-worker-restart=0, pytest-timeout os._exit()s the xdist '
+            f"worker instead of failing cleanly, discarding _run_lane's own "
+            f'well-located TimeoutError. Add @pytest.mark.timeout(N) with '
+            f'N >= {required} ({worst_case}s bounded + {out_of_bound} spawns '
+            f'x {_MEASURED_SPAWN_LATENCY_SECS}s).'
         )
         value = markers[0].args[0] if markers[0].args else markers[0].kwargs.get('timeout')
         assert value is not None, (
             f'{fn.__name__} carries @pytest.mark.timeout(...) but no timeout '
             f'value could be extracted from it (args={markers[0].args!r}, '
             f'kwargs={markers[0].kwargs!r}) — cannot verify it clears the '
-            f'{worst_case}s worst case.'
+            f'{required}s required timeout.'
         )
-        assert value > worst_case, (
-            f'{fn.__name__} carries @pytest.mark.timeout({value}) but its '
-            f'own worst-case bounded-wait sum is {worst_case}s — the '
+        assert value >= required, (
+            f'{fn.__name__} carries @pytest.mark.timeout({value}) but the '
+            f'required timeout is {required}s — {worst_case}s bounded-wait '
+            f'sum + {out_of_bound} out-of-bound real-git spawns x '
+            f'{_MEASURED_SPAWN_LATENCY_SECS}s = {spawn_allowance}s — the '
             f'override does not actually clear what it exists to cover. '
             f'Left uncovered, this can silently collide with the 60s '
             f'orchestrator/pyproject.toml per-test default — under '
