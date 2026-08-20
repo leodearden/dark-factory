@@ -55,6 +55,7 @@ import shlex
 import subprocess
 import sys
 
+import verify_command_invariants as vci
 import yaml
 
 from orchestrator import verify_cmd
@@ -181,23 +182,24 @@ def _root_lint_command() -> str:
     return yaml.safe_load(DF_CONFIG_PATH.read_text(encoding="utf-8"))["lint_command"]
 
 
+# The keyword whose segment this guard reads. Single-sourced because both
+# helpers below need it, and because it is what selects the shared parser's
+# anchor (``keyword.split()[-1]`` — here, ``check``).
+_RUFF_KEYWORD = "ruff check"
+
+
 def _ruff_segment(cmd: str) -> str:
     """The ``&&``-chained segment of *cmd* that actually invokes ``ruff check``.
 
-    Uses the production splitter ``verify_cmd.split_top_level_and`` (quote-aware)
-    rather than a naive ``str.split('&&')`` — matching ``_ruff_segment`` in
-    ``test_scripts_module_config.py``. Extracting the ruff segment FIRST is what
-    keeps the target assertions honest: tokenising the whole chain would read
-    ``&&``, ``python3`` and the magicmock checker's own directory arguments as
-    ruff lint targets.
+    Delegates to the shared implementation in ``verify_command_invariants``
+    (task 3745), which uses the production splitter
+    ``verify_cmd.split_top_level_and`` (quote-aware) rather than a naive
+    ``str.split('&&')``. Extracting the ruff segment FIRST is what keeps the
+    target assertions honest: tokenising the whole chain would read ``&&``,
+    ``python3`` and the magicmock checker's own directory arguments as ruff lint
+    targets.
     """
-    segments = verify_cmd.split_top_level_and(cmd)
-    ruff_segments = [s for s in segments if "ruff check" in s]
-    assert len(ruff_segments) == 1, (
-        f"expected exactly one `ruff check` segment in the root lint_command "
-        f"(task 3485), got {ruff_segments!r}"
-    )
-    return ruff_segments[0]
+    return vci.required_segment(cmd, _RUFF_KEYWORD, label="the root lint_command (task 3485)")
 
 
 def _ruff_targets(cmd: str) -> list[str]:
@@ -216,20 +218,37 @@ def _ruff_targets(cmd: str) -> list[str]:
     verified ``shared`` case is cited instead. The rule itself is unchanged:
     the ruff leg and the tail leg have DISJOINT target lists, and only
     per-leg token extraction can tell them apart.)
+
+    NO ``value_flags`` are passed, deliberately: this guard keeps the naive
+    ``-``-prefix filter it has always had, under which a space-separated flag
+    VALUE is admitted as a phantom target. That is safe HERE — a phantom can
+    only ever make ``_is_covered`` pass spuriously, and every assertion below
+    reads the target list for what it CONTAINS, never for what it omits — and
+    the shared extractor with an empty set is byte-for-byte that filter
+    (``test_verify_command_invariants.py`` pins the equivalence). The stricter
+    callers supply their own set.
     """
-    tokens = shlex.split(_ruff_segment(cmd))
-    assert "check" in tokens, f"no ruff `check` subcommand in {cmd!r} (task 3485)"
-    tail = tokens[tokens.index("check") + 1:]
-    return [t for t in tail if not t.startswith("-")]
+    return vci.positional_targets(
+        _ruff_segment(cmd), _RUFF_KEYWORD, label="the root lint_command (task 3485)"
+    )
 
 
 def _ruff_exclude_flags(cmd: str) -> list[str]:
     """Any ``--exclude`` / ``--extend-exclude`` / ``--force-exclude`` flags.
 
     Both spellings are caught: ``--exclude foo`` and ``--exclude=foo``.
+
+    SCANS THE WHOLE SEGMENT, and the scope is passed explicitly rather than
+    defaulted (task 3745). ``test_scripts_module_config.py``'s sibling helper
+    deliberately scans only the checker's POST-anchor arguments, because a
+    pre-anchor ``--project`` is uv's environment selector and not the checker's
+    config redirect (task 4358). Ruff's three exclude spellings happen not to
+    collide with any ``uv run`` flag, so the whole-segment scope is the one this
+    guard has always had and adopting the narrower one here would be an
+    unrequested behaviour change.
     """
     prefixes = ("--exclude", "--extend-exclude", "--force-exclude")
-    return [t for t in shlex.split(_ruff_segment(cmd)) if t.startswith(prefixes)]
+    return vci.flag_args(shlex.split(_ruff_segment(cmd)), prefixes)
 
 
 def _is_covered(rel_path: str, targets: list[str]) -> bool:
@@ -238,16 +257,13 @@ def _is_covered(rel_path: str, targets: list[str]) -> bool:
     Ancestor-directory coverage is real coverage: ``ruff check skills``
     traverses the directory. Membership is tested element-wise against the
     extracted target tokens, never by substring — see ``_ruff_targets``.
+
+    Delegates to the shared implementation in ``verify_command_invariants``
+    (task 3745), which keeps this helper's SLASH-TOLERANT name set. That matters
+    here specifically: ``_ruff_targets`` returns RAW command tokens, so a target
+    the config author wrote as ``skills/`` still carries its slash.
     """
-    candidate = pathlib.PurePosixPath(rel_path)
-    names = {rel_path, rel_path.rstrip("/")}
-    for parent in candidate.parents:
-        if parent == pathlib.PurePosixPath("."):
-            continue
-        names.add(parent.as_posix())
-        names.add(parent.as_posix() + "/")
-    names.add(rel_path + "/")
-    return any(t in names for t in targets)
+    return vci.covers(rel_path, targets)
 
 
 def test_root_lint_command_targets_every_root_level_and_skills_py() -> None:
