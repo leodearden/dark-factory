@@ -818,6 +818,104 @@ async def test_b1r_restore_from_archive_false_leaves_the_veto_to_fire(
     )
 
 
+class _RecordingEventStore:
+    """Minimal EventStore stand-in capturing ``(event_type, kwargs)`` emits.
+
+    A real ``EventStore`` would be a SQLite round-trip per row for no added
+    proof; ``emit`` is the whole surface ``_invoke`` uses.
+    """
+
+    def __init__(self) -> None:
+        self.emits: list[tuple] = []
+
+    def emit(self, event_type, **kwargs) -> None:
+        self.emits.append((event_type, kwargs))
+
+    def of_type(self, event_type) -> list[dict]:
+        return [kw for et, kw in self.emits if et is event_type]
+
+
+# The three PER-DISPATCH session-resume types emitted by the _run_slot guard.
+# The ratio recipe documented on EventType divides by their sum, so this path
+# must never add a fourth term to that denominator.
+_PER_DISPATCH_RESUME_EVENTS = (
+    EventType.session_resume,
+    EventType.session_resume_fallback,
+    EventType.session_resume_capped,
+)
+
+
+# ── B1e: the pre-flight instrumentation event ───────────────────────────────
+@pytest.mark.asyncio
+async def test_b1e_veto_emits_session_resume_failed_pre_flight(
+    harness: Harness, tmp_path: Path, caplog,
+):
+    """The second half of this task's user-observable signal: the veto is now
+    measurable in runs.db, not merely journalled.
+
+    Before this, a resume armed against a transcript the CLI could not find
+    produced NO runs.db row anywhere — the invisible population the task
+    measured at 28 occurrences.  ``data.stage`` splits the two populations:
+    ``pre_flight`` here (we vetoed before invoking), ``cli`` when the CLI itself
+    rejected a resume we did arm.
+    """
+    task_id, session_id = '82', 'uuid-b1e-preflight'
+    _setup_warm_lane_session(harness, task_id, session_id, role='implementer')
+    harness.config.session_resume = SessionResumeConfig()
+    await harness._recover_crashed_tasks()
+    recovered = harness._recovered_sessions[task_id]
+    store = _RecordingEventStore()
+
+    cap = await _drive_resumed_invoke(
+        tmp_path, recovered, IMPLEMENTER, caplog, event_store=store,
+    )
+
+    assert cap.kwargs['resume_session_id'] is None
+    failed = store.of_type(EventType.session_resume_failed)
+    assert len(failed) == 1
+    assert failed[0]['data'] == {
+        'stage': 'pre_flight',
+        'session_id': session_id,
+        'role': IMPLEMENTER.name,
+        'restored': False,
+    }
+    # The per-dispatch denominator is untouched by this per-INVOCATION path.
+    for et in _PER_DISPATCH_RESUME_EVENTS:
+        assert store.of_type(et) == []
+
+
+@pytest.mark.asyncio
+async def test_b1e_no_pre_flight_event_when_the_resume_succeeds(
+    harness: Harness, tmp_path: Path, caplog,
+):
+    """Both success paths — transcript already live, and transcript restored
+    from the durable archive — are silent.
+
+    A failure event that also fires on success is not an instrument; the
+    ``pre_flight`` population must count exactly the resumes that were lost.
+    """
+    harness.config.session_resume = SessionResumeConfig()
+
+    for idx, (task_id, session_id, kw) in enumerate((
+        ('83', 'uuid-b1e-live', {'seed_transcript': True}),
+        ('84', 'uuid-b1e-restored', {'seed_archive': True}),
+    )):
+        _setup_warm_lane_session(harness, task_id, session_id, role='implementer')
+        await harness._recover_crashed_tasks()
+        recovered = harness._recovered_sessions[task_id]
+        store = _RecordingEventStore()
+
+        cap = await _drive_resumed_invoke(
+            tmp_path, recovered, IMPLEMENTER, caplog, task_id=task_id,
+            event_store=store, slug=f'b1e-{idx}', **kw,
+        )
+
+        assert cap.kwargs['resume_session_id'] == session_id, kw
+        assert store.of_type(EventType.session_resume_failed) == [], kw
+        for et in _PER_DISPATCH_RESUME_EVENTS:
+            assert store.of_type(et) == [], kw
+
+
 # ── B1: WIP commit preserved across recovery + architect skipped ─────────────
 @pytest.mark.asyncio
 async def test_b1_recovery_preserves_wip_commit_and_skips_architect(
