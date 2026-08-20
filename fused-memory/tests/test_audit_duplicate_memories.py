@@ -5200,6 +5200,109 @@ class TestLivenessSnapshotSubjectFacts:
         assert json.dumps(record, sort_keys=True, default=str) == before
 
 
+class TestLivenessSubjectFactsFallback:
+    """A subject with NO clause-scoped evidence keys on the WHOLE-RECORD union.
+
+    The rule the rescope had to decide and this class documents. Clause
+    scoping can only ADD recall if a subject the clauses say nothing about
+    keeps exactly the key it had BEFORE the rescope -- the whole-record union.
+    Drop such a subject instead and the rescope would silently REMOVE recall
+    from a report-only path, which is the one direction it must not move.
+
+    Because the fallback is byte-identical to today's behaviour, nothing is
+    lost and no new `_LIVENESS_DISCLOSURE_KEYS` counter is warranted -- pinned
+    below, so a later edit that starts dropping these subjects has to change
+    a disclosure contract rather than quietly shrink the report.
+
+    Three shapes reach it, one per test: a ref that exists only in metadata, a
+    prose ref in a clause carrying no readable assignment, and a clause
+    boundary landing inside a quoted value.
+    """
+
+    def test_a_metadata_only_subject_falls_back_to_the_record_key(self):
+        """`related_task_ids` names 777; the content never mentions it.
+
+        No clause can be scoped to a subject the prose does not name, so 777
+        has no clause-level evidence by construction. It is still a subject --
+        `liveness_snapshot_subject_task_ids` resolves it -- so it must still be
+        keyed, and the only honest key is what the record as a whole asserts.
+        """
+        record = _memory(
+            'meta-only', _LIVENESS_SNAPSHOT_94_JUL24, category=_OS,
+            metadata={'task_id': '94', 'related_task_ids': ['777']},
+        )
+
+        facts = liveness_snapshot_subject_facts(record, _CORE_FACT_STRANDED)
+
+        assert set(facts) == {'94', '777'}, (
+            'the metadata-only subject is keyed, not dropped'
+        )
+        assert facts['94'] == _CORE_FACT_STRANDED, 'from its own clause'
+        assert facts['777'] == _CORE_FACT_STRANDED, 'from the whole-record union'
+
+    def test_a_prose_subject_whose_clause_asserts_nothing_falls_back(self):
+        """The REAL 1eef7df7: clause 6 names task 99 with no assignment.
+
+        Task 99 is the record's own `metadata.task_id` and appears in prose
+        ("whoever resolves task 99's commit-vs-discard decision"), but that
+        clause carries no `<field>=<value>` at all. The fallback restores
+        exactly today's key for it -- and, because 99 has no second record
+        anywhere in the corpus, it stays the singleton
+        `test_singleton_subject_and_non_snapshot_are_absent` already pins. The
+        fallback must not resurrect it as a false group.
+        """
+        record = {r['id']: r for r in _liveness_corpus()}['1eef7df7']
+
+        facts = liveness_snapshot_subject_facts(record, _CORE_FACT_STRANDED)
+
+        assert facts['99'] == _CORE_FACT_STRANDED, (
+            'keyed on the whole-record union, exactly as before the rescope'
+        )
+
+        groups, _ = find_liveness_snapshot_recurrences(_liveness_corpus())
+
+        assert '99' not in [g['subject_task_id'] for g in groups], (
+            'still a singleton -- the fallback restores recall, not a group'
+        )
+
+    def test_a_clause_split_inside_a_quoted_value_falls_back(self):
+        """`status="done. now"` -- the boundary lands mid-value.
+
+        `_CLAUSE_SPLIT_RE` is a regex over prose, not a parser, so a `.` inside
+        a quoted value splits the clause and leaves task 94's half holding an
+        unterminated `status="done` that `_readable_field_pairs` declines to
+        read. The RECORD-level classifier sees the value whole and keys fine,
+        asserted first so the fixture is known to reach the fallback for the
+        stated reason rather than by failing to classify at all.
+        """
+        content = (
+            'Point-in-time liveness check performed 2026-07-24 on task 94: '
+            'status="done. now", claimant_run_id=null, heartbeat_at=null'
+        )
+        record = _memory('quoted-split', content, category=_OS,
+                         metadata={'task_id': '94'})
+        record_key = extract_liveness_snapshot_fact(record)
+
+        assert record_key == 'claimant_run_id=null|heartbeat_at=null|status=done. now', (
+            'the record-level read is whole -- only the CLAUSE is truncated'
+        )
+        assert liveness_snapshot_subject_facts(record, record_key) == {
+            '94': record_key,
+        }, 'the subject falls back rather than vanishing from the report'
+
+    def test_the_fallback_adds_no_disclosure_counter(self):
+        """Nothing is lost, so nothing is disclosed as lost.
+
+        The counter set is a contract with the metrics layer; a fallback that
+        reproduces today's key byte-for-byte is not a loss and must not grow
+        it.
+        """
+        _groups, disclosure = find_liveness_snapshot_recurrences(_liveness_corpus())
+
+        assert set(disclosure) == set(_LIVENESS_DISCLOSURE_KEYS)
+        assert set(disclosure.values()) == {0}
+
+
 class TestFindLivenessSnapshotRecurrences:
     """The two groups the real corpus contains -- and nothing else.
 
