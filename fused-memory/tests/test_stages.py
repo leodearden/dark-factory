@@ -7408,11 +7408,23 @@ class TestSweepStaleMem0FlagMarkers:
                 memory_service, 'reify', run_id='r1', now=fixed_now, scroll_limit=3,
             )
 
+        # >= 1, not == 1: _sweep_stale_mem0_flag_markers scrolls TWO filter
+        # variants ({'source': ...} and {'kind': ...}, task 3915), each with
+        # its own scroll_limit budget. This test's mock returns the same
+        # `members` list regardless of which filter was passed, so BOTH
+        # variants see 3-of-3 and independently trip the scroll-cap warning
+        # — 2 real records from this same logger, not 1 (task 4329 follow-up:
+        # the == 1 tightening was measured against the single-variant
+        # persistence-markers sweep and didn't hold for this multi-variant
+        # one). The precise one-warning-per-variant behavior is already
+        # pinned by test_scroll_cap_warning_emitted_once_per_variant_naming_its_filter
+        # below, with a filter-aware mock; this test only needs "at least
+        # one scroll-cap warning fires", per its docstring.
         warning_records = [
             r for r in caplog.records
             if r.name == _TKS_LOGGER and r.levelno >= logging.WARNING
         ]
-        assert len(warning_records) == 1
+        assert len(warning_records) >= 1
 
     @pytest.mark.asyncio
     async def test_count_short_circuit_skips_scroll_when_count_is_zero(self):

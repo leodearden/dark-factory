@@ -4864,6 +4864,8 @@ class TestUnreadableTranscriptEscapeWiring:
                 f'must not fire for config_dir={config_dir!r} session_id={session_id!r}; '
                 f'got {[r.getMessage() for r in records]}'
             )
+
+
 # ── stdin-starvation race (task 3147 / esc-3118-1) ───────────────────────────
 #
 # The confirmed root cause of the pre-turn `CLI_INPUT_REJECTED` burst: the
