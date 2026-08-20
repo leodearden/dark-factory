@@ -66,7 +66,11 @@ targets (task 2332-style routing-intent churn) and the dominant filing path
   observe how often it actually fires before flipping
   ``FUSED_ROUTING_INTENT_ENFORCE``, and reconsider narrowing the signal
   words or scoping the suppression to the title field if false negatives
-  prove too costly.
+  prove too costly. Note when reading that census that the
+  provenance-stamp carve-out below recovers part of this recall: the
+  flagged rate can now RISE for tasks carrying appended annotation
+  stamps, by design, so a step up after task 4532 landed is the fix
+  working, not a regression.
 - None of the declarative markers match any field.
 
 This module is declaration-only: it never coerces ``task_kind`` or
@@ -143,6 +147,26 @@ _CODE_CHANGE_SIGNALS_RE = re.compile(r'\b(?:fix|bug|crash|refactor)\w*\b', re.IG
 # CODE-CHANGE-SIGNAL SUPPRESSION SCAN ONLY -- the marker scan in
 # routing_intent_finding keeps reading raw field text, which is what makes this
 # carve-out monotone (it can only turn None into a finding, never the reverse).
+# Being wrong in the conservative direction therefore costs RECALL only; it can
+# never produce a false rejection of an honest task.
+#
+# TWO RECOGNITION BRANCHES. (1) A DATED bracket: an ISO date inside a
+# line-leading bracket is the strongest available tell that a block was written
+# by a machine annotating an existing task rather than by the filing author.
+# (2) An undated "[Stage N ...]": the reported writer's own prefix, which the
+# agent does not always stamp with a date.
+#
+# OBSERVED CORPUS these were derived from -- Stage-2 `task_knowledge_sync`
+# doc-drift stamps ("[Stage 2 task-knowledge sync <date>] DOC-DRIFT FIX
+# (finding ...)"), [RECON CORRECTION <date>], [Block resolved <date> by
+# reconciliation stage N], [Scope correction by escalation-watcher-auto via
+# esc-N-M, <date>], [PHANTOM-PARTIAL FLAG <date>], [SCOPE NARROWED <date> -
+# esc-N-M, ...]. All of these are agent-IMPROVISED: no code template emits them
+# (the tree contains no "DOC-DRIFT" literal and no "[Stage N" occurrence). The
+# closest sanctioned convention is the prompt-side
+# STALE_KNOWLEDGE_ANNOTATION_NORM instruction to "prefix a dated
+# `[SUPERSEDED: ...]` marker" (reconciliation/prompts/__init__.py) -- i.e. DF
+# instructs the dated bracket-stamp convention but had no code recognizing it.
 #
 # DIRECTIONAL SAFETY, which is why every constraint below is deliberately
 # narrow: UNDER-stripping degrades to the pre-4532 behaviour (the suppression
@@ -155,7 +179,13 @@ _PROVENANCE_STAMP_RE = re.compile(
     # inline "... [re-verified 2026-08-06] ..." swallows the rest of the
     # sentence, losing the author's own code-change signal.
     r'^[ \t]*'
-    r'\[\s*stage\s+\d+[^\]\n]{0,160}\d{4}-\d{2}-\d{2}[^\]\n]{0,40}\]'
+    r'\['
+    r'(?:'
+    r'[^\]\n]{0,160}\d{4}-\d{2}-\d{2}[^\]\n]{0,160}'  # any DATED annotation stamp
+    r'|'
+    r'stage\s+\d+[^\]\n]{0,160}'  # or an undated "[Stage N ...]" stamp
+    r')'
+    r'\]'
     # Not a markdown link: DF task prose routinely opens a line with
     # "[Stage 1 stall detector](fused-memory/.../stage1_stall_detector.py)",
     # and treating that as a stamp strips a whole AUTHORED paragraph.
