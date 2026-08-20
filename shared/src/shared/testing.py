@@ -55,7 +55,8 @@ def make_gate_mock(**overrides) -> MagicMock:
     (task 4096). ``report(outcome)``
     (task W4-ε, PRD §7.4) mirrors production :meth:`InvokeSlot.report`'s
     dispatch-then-settle contract: OK→``confirm_account_ok``,
-    CapHit→``_handle_cap_detected``+``release_probe_slot`` (task 4096),
+    CapHit→``_handle_cap_detected`` (forwarding ``scope=slot.scope``, task
+    4234)+``release_probe_slot`` (task 4096),
     AuthFailed→``_handle_auth_failure`` (reason rendered by the single-sourced
     ``invocation_outcome.auth_failure_reason``, so it cannot drift from
     production — task 4042),
@@ -136,7 +137,9 @@ def make_gate_mock(**overrides) -> MagicMock:
                     if isinstance(outcome, OK):
                         gate.confirm_account_ok(token)
                     elif isinstance(outcome, CapHit):
-                        gate._handle_cap_detected(outcome.reason, outcome.resets_at, token)
+                        gate._handle_cap_detected(
+                            outcome.reason, outcome.resets_at, token, scope=slot.scope,
+                        )
                         gate.release_probe_slot(token)
                     elif isinstance(outcome, AuthFailed):
                         gate._handle_auth_failure(auth_failure_reason(outcome), token)
