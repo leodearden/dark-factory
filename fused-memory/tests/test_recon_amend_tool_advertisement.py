@@ -4,11 +4,12 @@ and episode-mutation MCP tools they can already call (esc-3391-1 ruling).
 The recon stage prompts ARE the documentation for the only consumer of these
 tools — the sleep-mode CLI agents that run each reconciliation stage have no
 other source of guidance. `--disallowed-tools` OMITS a denied tool from the
-agent's tool listing rather than rejecting an attempted call
-(cli_stage_runner.py:96-104), so the inverse failure mode is just as real: a
-tool the agent genuinely holds but that the curated "## Available Tools"
-block never mentions is a tool the agent simply never learns exists. That is
-a legibility defect, not a cosmetic one (esc-3391-1):
+agent's tool listing rather than rejecting an attempted call — see the
+`--disallowed-tools` handling in `build_claude_argv` (shared/cli_invoke.py) —
+so the inverse failure mode is just as real: a tool the agent genuinely holds
+but that the curated "## Available Tools" block never mentions is a tool the
+agent simply never learns exists. That is a legibility defect, not a
+cosmetic one (esc-3391-1):
 `mcp__fused-memory__update_memory`, `mcp__fused-memory__redact_episode_content`,
 and `mcp__fused-memory__delete_episode` are all callable from Stage 1 and
 Stage 2 today (neither STAGE1_DISALLOWED nor STAGE2_DISALLOWED folds
@@ -126,9 +127,10 @@ class TestDisallowListForAmendAndEpisodeTools:
     only checks 'update_memory' in STAGE3_DISALLOWED can pass while the tool
     remains live if the constant is composed differently than expected." Part B
     exists because `--disallowed-tools` OMITS a denied tool from the agent's
-    tool listing rather than rejecting an attempted call
-    (cli_stage_runner.py:96-104) — so a denial is only real once it reaches the
-    rendered CLI argv, not merely a Python list.
+    tool listing rather than rejecting an attempted call — see the
+    `--disallowed-tools` handling in `build_claude_argv` (shared/cli_invoke.py)
+    — so a denial is only real once it reaches the rendered CLI argv, not
+    merely a Python list.
 
     Measured fact this guard exists for: `redact_episode_content` and
     `delete_episode` already satisfy every assertion below, but `update_memory`
@@ -176,17 +178,18 @@ class TestDisallowListForAmendAndEpisodeTools:
         asserting on a constant.
 
         Path: IntegrityCheck.get_disallowed_tools() -> run_stage_via_cli
-        (disallowed_tools=..., cli_stage_runner.py:463) -> invoke_with_cap_retry
+        (disallowed_tools=...) -> invoke_with_cap_retry
         (disallowed_tools=...) -> shared.cli_invoke.build_claude_argv, which
-        renders the actual `--disallowed-tools` CLI flag (cli_invoke.py:1849).
+        renders the actual `--disallowed-tools` CLI flag.
         This runs through both the genuine stage hook (so a stage overriding
         get_disallowed_tools() would be caught) and the argv renderer (so a
         differently-composed disallow constant would be caught) — the failure
         mode a pure set-membership assertion (Part A) cannot see.
 
         output_schema={'type': 'object'} is passed to match the realistic
-        recon call site and exercise (not dodge) cli_invoke.py:1845-1848's
-        wildcard-expansion branch. That branch only rewrites disallowed_tools
+        recon call site and exercise (not dodge) `build_claude_argv`'s
+        wildcard-expansion branch (the `_REAL_BUILTIN_TOOLS_DENYLIST`
+        substitution). That branch only rewrites disallowed_tools
         when '*' is present; DISALLOW_BUILTIN (['Bash', 'Edit', 'Write',
         'NotebookEdit']) carries no '*', so STAGE3_DISALLOWED renders as a
         straight passthrough here — confirmed against today's code.
