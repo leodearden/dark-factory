@@ -1,29 +1,509 @@
 {
-  "schema_version": 1,
-  "measured_at": "2026-08-17T07:13:43.371814+00:00",
+  "schema_version": 2,
+  "measured_at": "2026-08-17T15:28:27.567287+00:00",
   "generated_by": "fused-memory/scripts/measure_plural_enum_guard_recall.py",
   "regenerate": "cd fused-memory && uv run python scripts/measure_plural_enum_guard_recall.py",
   "page_size": 5000,
+  "max_samples": 20,
   "complete": true,
-  "verdict": "DO NOT TIGHTEN. No fact in any enumerated project graph matches PLURAL_ENUM_SNAPSHOT_RE, so _enumeration_is_prepositional_complement rejects nothing and its recall cost on this corpus is exactly zero edges. A tightening can only change an outcome on a fact the regex already matched; with none, both candidates have provably zero measured benefit against nonzero unrecoverable over-selection risk.",
+  "project_ids_source": "discovered",
+  "unmeasured_graphs": [],
+  "verdict": "DO NOT TIGHTEN \u2014 but on the triage, not on a bare zero. Facts in this corpus DO reach the guard now, and every rejection triaged as a prepositional_complement: a CORRECT rejection, where the copula's real subject is an outer head noun. Not one triaged as adverbial_preamble, so the measured recall cost of the guard is still exactly zero edges and a tightening still buys nothing. CAVEAT, and it is why this verdict is weaker than a zero-match one: triage_rejection is a HEURISTIC, and a deliberately asymmetric one \u2014 it answers prepositional_complement whenever it is unsure, precisely so it cannot manufacture the recall loss that would justify a tightening. Leaning on it in THIS direction leans on its biased side. Read the rejection samples below and check them by eye before treating this as settled.",
   "revalidation_test": "tests/test_measure_plural_enum_guard_recall.py::test_candidate_b_recovers_every_preamble_but_re_opens_an_over_selection",
-  "total_valid_edges": 29415,
+  "total_valid_edges": 32304,
   "totals": {
-    "facts_scanned": 29415,
-    "lexical_precondition": 346,
-    "regex_matched": 0,
-    "guard_rejected": 0,
+    "facts_scanned": 32304,
+    "lexical_precondition": 420,
+    "regex_matched": 2,
+    "guard_rejected": 2,
     "selected": 0
   },
-  "triage_totals": {},
+  "triage_totals": {
+    "prepositional_complement": 2
+  },
   "projects": [
     {
-      "project_id": "dark_factory",
-      "valid_edges": 12488,
+      "project_id": "_probe",
+      "valid_edges": 0,
       "complete": true,
       "scan": {
-        "facts_scanned": 12488,
-        "lexical_precondition": 169,
+        "facts_scanned": 0,
+        "lexical_precondition": 0,
+        "regex_matched": 0,
+        "guard_rejected": 0,
+        "selected": 0
+      },
+      "triage": {},
+      "rejections": []
+    },
+    {
+      "project_id": "_test_2207_merge_entities_01473628",
+      "valid_edges": 4,
+      "complete": true,
+      "scan": {
+        "facts_scanned": 4,
+        "lexical_precondition": 0,
+        "regex_matched": 0,
+        "guard_rejected": 0,
+        "selected": 0
+      },
+      "triage": {},
+      "rejections": []
+    },
+    {
+      "project_id": "_test_2207_merge_entities_2f5e7021",
+      "valid_edges": 0,
+      "complete": true,
+      "scan": {
+        "facts_scanned": 0,
+        "lexical_precondition": 0,
+        "regex_matched": 0,
+        "guard_rejected": 0,
+        "selected": 0
+      },
+      "triage": {},
+      "rejections": []
+    },
+    {
+      "project_id": "_test_530_list_indices_integration_7ea892b5",
+      "valid_edges": 0,
+      "complete": true,
+      "scan": {
+        "facts_scanned": 0,
+        "lexical_precondition": 0,
+        "regex_matched": 0,
+        "guard_rejected": 0,
+        "selected": 0
+      },
+      "triage": {},
+      "rejections": []
+    },
+    {
+      "project_id": "_test_530_list_indices_integration_84e3d3d0",
+      "valid_edges": 0,
+      "complete": true,
+      "scan": {
+        "facts_scanned": 0,
+        "lexical_precondition": 0,
+        "regex_matched": 0,
+        "guard_rejected": 0,
+        "selected": 0
+      },
+      "triage": {},
+      "rejections": []
+    },
+    {
+      "project_id": "autopilot_video",
+      "valid_edges": 723,
+      "complete": true,
+      "scan": {
+        "facts_scanned": 723,
+        "lexical_precondition": 15,
+        "regex_matched": 0,
+        "guard_rejected": 0,
+        "selected": 0
+      },
+      "triage": {},
+      "rejections": []
+    },
+    {
+      "project_id": "dark_factory",
+      "valid_edges": 12548,
+      "complete": true,
+      "scan": {
+        "facts_scanned": 12548,
+        "lexical_precondition": 172,
+        "regex_matched": 2,
+        "guard_rejected": 2,
+        "selected": 0
+      },
+      "triage": {
+        "prepositional_complement": 2
+      },
+      "rejections": [
+        {
+          "fact": "Task 3949 mentions that blockers for downstream, still-unmerged tasks 1020 and 1030 are pending.",
+          "match_start": 64,
+          "triage": "prepositional_complement"
+        },
+        {
+          "fact": "Task 3949 mentions that blockers for downstream, still-unmerged tasks 1020 and 1030 are pending.",
+          "match_start": 64,
+          "triage": "prepositional_complement"
+        }
+      ]
+    },
+    {
+      "project_id": "know_live",
+      "valid_edges": 1588,
+      "complete": true,
+      "scan": {
+        "facts_scanned": 1588,
+        "lexical_precondition": 54,
+        "regex_matched": 0,
+        "guard_rejected": 0,
+        "selected": 0
+      },
+      "triage": {},
+      "rejections": []
+    },
+    {
+      "project_id": "knowlive",
+      "valid_edges": 0,
+      "complete": true,
+      "scan": {
+        "facts_scanned": 0,
+        "lexical_precondition": 0,
+        "regex_matched": 0,
+        "guard_rejected": 0,
+        "selected": 0
+      },
+      "triage": {},
+      "rejections": []
+    },
+    {
+      "project_id": "my_solar_challenge",
+      "valid_edges": 390,
+      "complete": true,
+      "scan": {
+        "facts_scanned": 390,
+        "lexical_precondition": 2,
+        "regex_matched": 0,
+        "guard_rejected": 0,
+        "selected": 0
+      },
+      "triage": {},
+      "rejections": []
+    },
+    {
+      "project_id": "probe_e1_gw0",
+      "valid_edges": 0,
+      "complete": true,
+      "scan": {
+        "facts_scanned": 0,
+        "lexical_precondition": 0,
+        "regex_matched": 0,
+        "guard_rejected": 0,
+        "selected": 0
+      },
+      "triage": {},
+      "rejections": []
+    },
+    {
+      "project_id": "probe_e1_gw1",
+      "valid_edges": 0,
+      "complete": true,
+      "scan": {
+        "facts_scanned": 0,
+        "lexical_precondition": 0,
+        "regex_matched": 0,
+        "guard_rejected": 0,
+        "selected": 0
+      },
+      "triage": {},
+      "rejections": []
+    },
+    {
+      "project_id": "probe_e1_gw10",
+      "valid_edges": 0,
+      "complete": true,
+      "scan": {
+        "facts_scanned": 0,
+        "lexical_precondition": 0,
+        "regex_matched": 0,
+        "guard_rejected": 0,
+        "selected": 0
+      },
+      "triage": {},
+      "rejections": []
+    },
+    {
+      "project_id": "probe_e1_gw11",
+      "valid_edges": 0,
+      "complete": true,
+      "scan": {
+        "facts_scanned": 0,
+        "lexical_precondition": 0,
+        "regex_matched": 0,
+        "guard_rejected": 0,
+        "selected": 0
+      },
+      "triage": {},
+      "rejections": []
+    },
+    {
+      "project_id": "probe_e1_gw12",
+      "valid_edges": 0,
+      "complete": true,
+      "scan": {
+        "facts_scanned": 0,
+        "lexical_precondition": 0,
+        "regex_matched": 0,
+        "guard_rejected": 0,
+        "selected": 0
+      },
+      "triage": {},
+      "rejections": []
+    },
+    {
+      "project_id": "probe_e1_gw13",
+      "valid_edges": 0,
+      "complete": true,
+      "scan": {
+        "facts_scanned": 0,
+        "lexical_precondition": 0,
+        "regex_matched": 0,
+        "guard_rejected": 0,
+        "selected": 0
+      },
+      "triage": {},
+      "rejections": []
+    },
+    {
+      "project_id": "probe_e1_gw14",
+      "valid_edges": 0,
+      "complete": true,
+      "scan": {
+        "facts_scanned": 0,
+        "lexical_precondition": 0,
+        "regex_matched": 0,
+        "guard_rejected": 0,
+        "selected": 0
+      },
+      "triage": {},
+      "rejections": []
+    },
+    {
+      "project_id": "probe_e1_gw15",
+      "valid_edges": 0,
+      "complete": true,
+      "scan": {
+        "facts_scanned": 0,
+        "lexical_precondition": 0,
+        "regex_matched": 0,
+        "guard_rejected": 0,
+        "selected": 0
+      },
+      "triage": {},
+      "rejections": []
+    },
+    {
+      "project_id": "probe_e1_gw16",
+      "valid_edges": 0,
+      "complete": true,
+      "scan": {
+        "facts_scanned": 0,
+        "lexical_precondition": 0,
+        "regex_matched": 0,
+        "guard_rejected": 0,
+        "selected": 0
+      },
+      "triage": {},
+      "rejections": []
+    },
+    {
+      "project_id": "probe_e1_gw17",
+      "valid_edges": 0,
+      "complete": true,
+      "scan": {
+        "facts_scanned": 0,
+        "lexical_precondition": 0,
+        "regex_matched": 0,
+        "guard_rejected": 0,
+        "selected": 0
+      },
+      "triage": {},
+      "rejections": []
+    },
+    {
+      "project_id": "probe_e1_gw18",
+      "valid_edges": 0,
+      "complete": true,
+      "scan": {
+        "facts_scanned": 0,
+        "lexical_precondition": 0,
+        "regex_matched": 0,
+        "guard_rejected": 0,
+        "selected": 0
+      },
+      "triage": {},
+      "rejections": []
+    },
+    {
+      "project_id": "probe_e1_gw19",
+      "valid_edges": 0,
+      "complete": true,
+      "scan": {
+        "facts_scanned": 0,
+        "lexical_precondition": 0,
+        "regex_matched": 0,
+        "guard_rejected": 0,
+        "selected": 0
+      },
+      "triage": {},
+      "rejections": []
+    },
+    {
+      "project_id": "probe_e1_gw2",
+      "valid_edges": 0,
+      "complete": true,
+      "scan": {
+        "facts_scanned": 0,
+        "lexical_precondition": 0,
+        "regex_matched": 0,
+        "guard_rejected": 0,
+        "selected": 0
+      },
+      "triage": {},
+      "rejections": []
+    },
+    {
+      "project_id": "probe_e1_gw20",
+      "valid_edges": 0,
+      "complete": true,
+      "scan": {
+        "facts_scanned": 0,
+        "lexical_precondition": 0,
+        "regex_matched": 0,
+        "guard_rejected": 0,
+        "selected": 0
+      },
+      "triage": {},
+      "rejections": []
+    },
+    {
+      "project_id": "probe_e1_gw21",
+      "valid_edges": 0,
+      "complete": true,
+      "scan": {
+        "facts_scanned": 0,
+        "lexical_precondition": 0,
+        "regex_matched": 0,
+        "guard_rejected": 0,
+        "selected": 0
+      },
+      "triage": {},
+      "rejections": []
+    },
+    {
+      "project_id": "probe_e1_gw3",
+      "valid_edges": 0,
+      "complete": true,
+      "scan": {
+        "facts_scanned": 0,
+        "lexical_precondition": 0,
+        "regex_matched": 0,
+        "guard_rejected": 0,
+        "selected": 0
+      },
+      "triage": {},
+      "rejections": []
+    },
+    {
+      "project_id": "probe_e1_gw4",
+      "valid_edges": 0,
+      "complete": true,
+      "scan": {
+        "facts_scanned": 0,
+        "lexical_precondition": 0,
+        "regex_matched": 0,
+        "guard_rejected": 0,
+        "selected": 0
+      },
+      "triage": {},
+      "rejections": []
+    },
+    {
+      "project_id": "probe_e1_gw5",
+      "valid_edges": 0,
+      "complete": true,
+      "scan": {
+        "facts_scanned": 0,
+        "lexical_precondition": 0,
+        "regex_matched": 0,
+        "guard_rejected": 0,
+        "selected": 0
+      },
+      "triage": {},
+      "rejections": []
+    },
+    {
+      "project_id": "probe_e1_gw6",
+      "valid_edges": 0,
+      "complete": true,
+      "scan": {
+        "facts_scanned": 0,
+        "lexical_precondition": 0,
+        "regex_matched": 0,
+        "guard_rejected": 0,
+        "selected": 0
+      },
+      "triage": {},
+      "rejections": []
+    },
+    {
+      "project_id": "probe_e1_gw7",
+      "valid_edges": 0,
+      "complete": true,
+      "scan": {
+        "facts_scanned": 0,
+        "lexical_precondition": 0,
+        "regex_matched": 0,
+        "guard_rejected": 0,
+        "selected": 0
+      },
+      "triage": {},
+      "rejections": []
+    },
+    {
+      "project_id": "probe_e1_gw8",
+      "valid_edges": 0,
+      "complete": true,
+      "scan": {
+        "facts_scanned": 0,
+        "lexical_precondition": 0,
+        "regex_matched": 0,
+        "guard_rejected": 0,
+        "selected": 0
+      },
+      "triage": {},
+      "rejections": []
+    },
+    {
+      "project_id": "probe_e1_gw9",
+      "valid_edges": 0,
+      "complete": true,
+      "scan": {
+        "facts_scanned": 0,
+        "lexical_precondition": 0,
+        "regex_matched": 0,
+        "guard_rejected": 0,
+        "selected": 0
+      },
+      "triage": {},
+      "rejections": []
+    },
+    {
+      "project_id": "probe_e1_master",
+      "valid_edges": 0,
+      "complete": true,
+      "scan": {
+        "facts_scanned": 0,
+        "lexical_precondition": 0,
+        "regex_matched": 0,
+        "guard_rejected": 0,
+        "selected": 0
+      },
+      "triage": {},
+      "rejections": []
+    },
+    {
+      "project_id": "pump_web_ui",
+      "valid_edges": 62,
+      "complete": true,
+      "scan": {
+        "facts_scanned": 62,
+        "lexical_precondition": 0,
         "regex_matched": 0,
         "guard_rejected": 0,
         "selected": 0
@@ -46,12 +526,68 @@
       "rejections": []
     },
     {
+      "project_id": "solar_challenge",
+      "valid_edges": 62,
+      "complete": true,
+      "scan": {
+        "facts_scanned": 62,
+        "lexical_precondition": 0,
+        "regex_matched": 0,
+        "guard_rejected": 0,
+        "selected": 0
+      },
+      "triage": {},
+      "rejections": []
+    },
+    {
       "project_id": "solar_challenge_platform",
       "valid_edges": 1056,
       "complete": true,
       "scan": {
         "facts_scanned": 1056,
         "lexical_precondition": 9,
+        "regex_matched": 0,
+        "guard_rejected": 0,
+        "selected": 0
+      },
+      "triage": {},
+      "rejections": []
+    },
+    {
+      "project_id": "sweep_e4_gw0",
+      "valid_edges": 0,
+      "complete": true,
+      "scan": {
+        "facts_scanned": 0,
+        "lexical_precondition": 0,
+        "regex_matched": 0,
+        "guard_rejected": 0,
+        "selected": 0
+      },
+      "triage": {},
+      "rejections": []
+    },
+    {
+      "project_id": "sweep_e4_gw1",
+      "valid_edges": 0,
+      "complete": true,
+      "scan": {
+        "facts_scanned": 0,
+        "lexical_precondition": 0,
+        "regex_matched": 0,
+        "guard_rejected": 0,
+        "selected": 0
+      },
+      "triage": {},
+      "rejections": []
+    },
+    {
+      "project_id": "sweep_e4_gw2",
+      "valid_edges": 0,
+      "complete": true,
+      "scan": {
+        "facts_scanned": 0,
+        "lexical_precondition": 0,
         "regex_matched": 0,
         "guard_rejected": 0,
         "selected": 0
@@ -65,17 +601,19 @@
       "name": "shipped",
       "over_selected": [],
       "recovered": [],
-      "unchanged_count": 0
+      "unchanged_count": 1
     },
     {
       "name": "a",
       "over_selected": [],
       "recovered": [],
-      "unchanged_count": 0
+      "unchanged_count": 1
     },
     {
       "name": "b",
-      "over_selected": [],
+      "over_selected": [
+        "Task 3949 mentions that blockers for downstream, still-unmerged tasks 1020 and 1030 are pending."
+      ],
       "recovered": [],
       "unchanged_count": 0
     }

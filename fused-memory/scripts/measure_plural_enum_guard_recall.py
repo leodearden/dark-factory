@@ -730,13 +730,58 @@ _VERDICT_ZERO_MATCHES = (
     'already matched; with none, both candidates have provably zero '
     'measured benefit against nonzero unrecoverable over-selection risk.'
 )
-_VERDICT_PROVISIONAL = (
-    'PROVISIONAL — the corpus now contains facts that reach the guard, so '
-    'the zero-benefit argument no longer applies unexamined. Read the '
-    'triage breakdown below: rejections labelled adverbial_preamble are '
-    'genuine recall loss and are what a tightening would be for. No verdict '
-    'is asserted here; re-decide against these numbers.'
+_VERDICT_NO_TRIAGED_RECALL_LOSS = (
+    'DO NOT TIGHTEN — but on the triage, not on a bare zero. Facts in this '
+    'corpus DO reach the guard now, and every rejection triaged as a '
+    'prepositional_complement: a CORRECT rejection, where the copula\'s real '
+    'subject is an outer head noun. Not one triaged as adverbial_preamble, so '
+    'the measured recall cost of the guard is still exactly zero edges and a '
+    'tightening still buys nothing. CAVEAT, and it is why this verdict is '
+    'weaker than a zero-match one: triage_rejection is a HEURISTIC, and a '
+    'deliberately asymmetric one — it answers prepositional_complement '
+    'whenever it is unsure, precisely so it cannot manufacture the recall '
+    'loss that would justify a tightening. Leaning on it in THIS direction '
+    'leans on its biased side. Read the rejection samples below and check '
+    'them by eye before treating this as settled.'
 )
+_VERDICT_PROVISIONAL = (
+    'PROVISIONAL — the corpus now contains rejections triaged as '
+    'adverbial_preamble, which is genuine recall loss and is what a '
+    'tightening would be for. The zero-benefit argument no longer applies '
+    'unexamined. No verdict is asserted here; re-decide against these '
+    'numbers, and note that any tightening must still be re-validated '
+    'against the full pinned precision parametrization before shipping.'
+)
+
+
+def _verdict_for(totals: ScanResult, triage_totals: dict[str, int]) -> str:
+    """Pick the verdict from what was MEASURED, at the right granularity.
+
+    Three cases, strongest evidence first:
+
+    1. Nothing matched the regex. The guard was never consulted, so its cost
+       is zero by construction and no heuristic is involved. The strongest
+       form of the answer.
+    2. Facts reached the guard, but NONE of the rejections triaged as
+       adverbial_preamble. The cost is still zero, but the claim now rests on
+       triage_rejection, so the verdict says so out loud.
+    3. At least one rejection triaged as adverbial_preamble. Real recall loss:
+       assert nothing, hand the reader the numbers.
+
+    The discriminator is the ADVERBIAL_PREAMBLE count, not ``regex_matched``.
+    Keying on regex_matched conflates 'the guard cost nothing' with 'the guard
+    was never reached', which are different findings — and reports the first
+    as unresolved the moment a single correctly-rejected fact appears. It did:
+    the first full-graph-set run found two, both correct rejections, and a
+    regex_matched-keyed rule called the whole measurement provisional over
+    them while the report's own text told the reader adverbial_preamble was
+    the deciding number.
+    """
+    if totals.regex_matched == 0:
+        return _VERDICT_ZERO_MATCHES
+    if triage_totals.get(ADVERBIAL_PREAMBLE, 0) == 0:
+        return _VERDICT_NO_TRIAGED_RECALL_LOSS
+    return _VERDICT_PROVISIONAL
 
 
 @dataclass(frozen=True)
@@ -914,10 +959,7 @@ async def run(
         total_valid_edges=sum(p.valid_edges for p in projects),
         triage_totals=triage_totals,
         candidates=candidates,
-        verdict=(
-            _VERDICT_ZERO_MATCHES if totals.regex_matched == 0
-            else _VERDICT_PROVISIONAL
-        ),
+        verdict=_verdict_for(totals, triage_totals),
         complete=all(p.complete for p in projects) and not unmeasured_graphs,
         max_samples=args.max_samples,
         project_ids_source=project_ids_source,

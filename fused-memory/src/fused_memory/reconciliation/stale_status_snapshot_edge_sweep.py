@@ -617,21 +617,35 @@ _PLURAL_COPULA_ALT = r'(?:are|were|remain)'
 # direction, so it needed measurement against the real edge corpus first.
 # (amendment, reviewer_comprehensive correctness-recall finding, task 3079)
 #
-# THAT MEASUREMENT IS NOW DONE (task 3949, measured 2026-08-17 against the
-# live FalkorDB graphs):
+# THAT MEASUREMENT IS NOW DONE (task 3949, measured 2026-08-17 against every
+# populated FalkorDB graph the store reports — 40 graphs, discovered rather
+# than hardcoded, because a hardcoded project list is a coverage claim nothing
+# checks):
 #
-#     dark_factory              12488 valid edges | 169 'tasks <n>' near-misses
+#     dark_factory              12548 valid edges | 172 'tasks <n>' near-misses
 #     reify                     15871 valid edges | 168 near-misses
+#     know_live                  1588 valid edges |  54 near-misses
 #     solar_challenge_platform   1056 valid edges |   9 near-misses
-#     (all)                     29415 valid edges | 346 near-misses
-#                                                 | 0 PLURAL_ENUM_SNAPSHOT_RE
-#                                                 |   matches, 0 rejections
+#     autopilot_video             723 valid edges |  15 near-misses
+#     + 35 further graphs         518 valid edges |   2 near-misses
+#     (all)                     32304 valid edges | 420 near-misses
+#                                                 | 2 PLURAL_ENUM_SNAPSHOT_RE
+#                                                 |   matches, 2 rejections,
+#                                                 |   BOTH correct
 #
-# Not one live fact reaches this guard, so its recall cost on the real corpus
-# is exactly ZERO edges. What the plural path loses here it loses at the
-# REGEX, not at the guard: the 346 near-misses carry 'tasks <digits>' but no
-# status marker, no copula, or broken copula-marker adjacency ('Tasks 1752 and
-# 1753 are related to ...', 'Both tasks 1920 and 1921 edit ...').
+# The recall cost of this guard on the real corpus is ZERO edges. Two live
+# facts reach it, and both are genuine prepositional complements it is right
+# to reject — 'Task 3949 mentions that blockers for downstream, still-unmerged
+# tasks 1020 and 1030 are pending' (the BLOCKERS are pending). Neither triages
+# as an adverbial preamble, which is the only rejection class that costs
+# recall. Note the observer effect, and discount accordingly: both edges were
+# written at 07:24 on the measurement day by task 3949's own session, so what
+# the corpus actually offers is still zero organic matches.
+#
+# What the plural path loses here it loses at the REGEX, not at the guard: the
+# 420 near-misses carry 'tasks <digits>' but no status marker, no copula, or
+# broken copula-marker adjacency ('Tasks 1752 and 1753 are related to ...',
+# 'Both tasks 1920 and 1921 edit ...').
 #
 # Both candidates were re-validated against the full precision
 # parametrization, as the finding required before shipping either:
@@ -643,21 +657,21 @@ _PLURAL_COPULA_ALT = r'(?:are|were|remain)'
 #       all three preamble shapes, but RE-OPENS the pinned over-selection
 #       'Blockers for down-stream, still-unmerged tasks 1020 and 1030 are
 #       pending.', where the comma is intra-clause. It fails the required
-#       re-validation outright.
+#       re-validation outright — and now on LIVE data too: it re-opens one of
+#       the two real corpus rejections above, which is the same shape.
 #
-# VERDICT: NOT TIGHTENED. A tightening can only change an outcome on a fact
-# the regex already matched, and there are none — so both candidates have
-# provably zero measured benefit against nonzero unrecoverable over-selection
-# risk, on a module whose stated invariant is that under-selection self-heals
-# and over-selection never does.
+# VERDICT: NOT TIGHTENED. Zero measured recall loss to buy back, against
+# nonzero unrecoverable over-selection risk, on a module whose stated
+# invariant is that under-selection self-heals and over-selection never does.
 #
 # Re-checkable as the corpus grows — the verdict is only as good as its
-# re-runnability, and 'zero matches' is a point-in-time fact:
+# re-runnability, and a rejection census is a point-in-time fact:
 #     cd fused-memory && \
 #       uv run python scripts/measure_plural_enum_guard_recall.py
 # Artifacts: plans/plural-enum-guard-recall-report.{json,md}. The candidate
-# re-validation is mechanical (it reads the pinned shapes off this suite's
-# own parametrize markers) in
+# re-validation is mechanical — it parametrizes over the shared pinned corpora
+# in tests/reconciliation/plural_enum_shapes.py, which this suite parametrizes
+# off too, so a shape appended there re-validates both candidates — in
 # tests/test_measure_plural_enum_guard_recall.py.
 #
 # Kept as a single flat tuple rather than inlined into the pattern so the

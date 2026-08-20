@@ -1335,6 +1335,46 @@ async def test_a_discovered_graph_set_is_not_frozen_into_the_command():
     assert '--project-id' not in _mod.regenerate_command(report)
 
 
+@pytest.mark.asyncio
+async def test_the_verdict_keys_on_triaged_recall_loss_not_on_raw_matches():
+    """'The guard cost nothing' and 'the guard was never reached' differ.
+
+    Keying the verdict on ``regex_matched`` conflates them, and calls the
+    whole measurement provisional the moment ONE correctly-rejected fact
+    appears. That is not hypothetical: the first full-graph-set live run found
+    exactly two, both prepositional complements, and the report's own text
+    already told the reader adverbial_preamble was the deciding number.
+    """
+    # (1) nothing reaches the guard — the strongest form, no heuristic used
+    empty = await run(
+        _args(project_id=['alpha']),
+        edge_source=_FakeEdgeSource({'alpha': (['The worker restarted.'], True)}),
+    )
+    assert empty.totals.regex_matched == 0
+    assert empty.verdict == _mod._VERDICT_ZERO_MATCHES
+
+    # (2) facts reach the guard, every rejection CORRECT — cost still zero,
+    #     but now resting on the triage heuristic, which the verdict must say
+    correct_only = await run(
+        _args(project_id=['alpha']),
+        edge_source=_FakeEdgeSource({
+            'alpha': (['Reviews of tasks 1020 and 1030 are pending.'], True),
+        }),
+    )
+    assert correct_only.totals.regex_matched == 1
+    assert correct_only.triage_totals == {'prepositional_complement': 1}
+    assert correct_only.verdict == _mod._VERDICT_NO_TRIAGED_RECALL_LOSS
+    assert 'HEURISTIC' in correct_only.verdict, 'the caveat is the point'
+
+    # (3) a single adverbial_preamble rejection IS recall loss — assert nothing
+    recall_loss = await run(
+        _args(project_id=['alpha']),
+        edge_source=_FakeEdgeSource({'alpha': (_BETA_FACTS, True)}),
+    )
+    assert recall_loss.triage_totals == {'adverbial_preamble': 1}
+    assert recall_loss.verdict == _mod._VERDICT_PROVISIONAL
+
+
 def test_build_parser_rejects_a_max_samples_below_one():
     """A cap of zero is not a cap, it is a hide — and it had no validator.
 
