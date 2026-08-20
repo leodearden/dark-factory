@@ -25,16 +25,25 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from orchestrator.git_ops import CommitEffectProbe
 from orchestrator.landing_evidence import validate_landing_evidence
 
 
-def _git_ops(*, citation, is_ancestor_map, effect_present) -> MagicMock:
+def _git_ops(
+    *, citation, is_ancestor_map, effect_present, effect_probe=None,
+) -> MagicMock:
     """Build a bare MagicMock git_ops with the three sub-methods the helper calls.
 
     ``is_ancestor_map`` maps ``(ancestor, descendant)`` arg-pairs to their
     return value; an unexpected pair raises AssertionError so an errant call
     the test didn't anticipate fails loudly instead of returning a stray
     MagicMock truthy default.
+
+    ``effect_probe`` (task 3116) stubs ``describe_commit_effect_in_main``, the
+    reject-path-only diagnostic enrichment.  It is left UNSTUBBED when the
+    kwarg is omitted, so every pre-3116 test keeps its exact call shape —
+    which is also the live shape in the seven OTHER test files that stub only
+    ``commit_effect_present_in_main`` on a bare MagicMock.
     """
     git_ops = MagicMock()
     git_ops.find_task_citation_commit = AsyncMock(return_value=citation)
@@ -47,6 +56,8 @@ def _git_ops(*, citation, is_ancestor_map, effect_present) -> MagicMock:
 
     git_ops.is_ancestor = AsyncMock(side_effect=_is_ancestor)
     git_ops.commit_effect_present_in_main = AsyncMock(return_value=effect_present)
+    if effect_probe is not None:
+        git_ops.describe_commit_effect_in_main = AsyncMock(return_value=effect_probe)
     return git_ops
 
 
@@ -326,3 +337,188 @@ class TestValidateLandingEvidenceCandidateMode:
 
         assert verdict.probe['citation'] == candidate_sha
         assert verdict.probe['effect_check_sha'] == candidate_sha
+
+
+@pytest.mark.asyncio
+class TestValidateLandingEvidenceEffectDivergenceProbe:
+    """Reject-path-only diagnostic enrichment (task 3116).
+
+    The gate DECISION still comes from the boolean
+    ``commit_effect_present_in_main``; ``describe_commit_effect_in_main`` is
+    consulted ONLY where that bool already rejected, purely to thread WHICH
+    paths diverged into ``LandingEvidenceVerdict.probe``.  That split is what
+    keeps the seven other test files' bare-MagicMock git_ops driving the
+    decision exactly as before, and it makes it structurally impossible for a
+    defect in the (much larger) diagnostic path to cement or withhold a
+    completion.
+    """
+
+    async def test_discovery_reject_threads_diverged_paths_into_probe(self) -> None:
+        """(a) DISCOVERY effect_absent: the verdict is unchanged, and probe
+        now names the diverged path — the one line that would have resolved
+        both reported instances.  The enrichment MUST probe the same sha the
+        decision ran against; probing a different one would name paths from
+        the wrong commit, which is worse than naming none.
+        """
+        citation = 'a' * 40
+        probe_result = CommitEffectProbe(
+            present=False,
+            diverged_paths=('tests/infra/harness-layout-baseline.manifest',),
+            anchor_sha='c' * 40,
+            failure='paths_diverged',
+        )
+        git_ops = _git_ops(
+            citation=citation,
+            is_ancestor_map={(citation, 'task/42'): False},
+            effect_present=False,
+            effect_probe=probe_result,
+        )
+
+        verdict = await validate_landing_evidence(
+            git_ops, '42', 'task/42', branch_tip_sha=None,
+        )
+
+        assert verdict.accepted is False
+        assert verdict.reason == 'effect_absent'
+        assert verdict.evidence_sha is None
+        assert verdict.probe['diverged_paths'] == [
+            'tests/infra/harness-layout-baseline.manifest'
+        ]
+        assert verdict.probe['effect_failure'] == 'paths_diverged'
+        assert verdict.probe['effect_anchor_sha'] == 'c' * 40
+        git_ops.describe_commit_effect_in_main.assert_awaited_once_with(
+            verdict.probe['effect_check_sha'],
+        )
+
+    async def test_candidate_reject_threads_diverged_paths_into_probe(self) -> None:
+        """(b) CANDIDATE mode carries the same enrichment, anchored on the
+        candidate sha the decision used.
+        """
+        candidate_sha = 'b' * 40
+        probe_result = CommitEffectProbe(
+            present=False,
+            diverged_paths=('tests/infra/harness-layout-baseline.manifest',),
+            anchor_sha='c' * 40,
+            failure='paths_diverged',
+        )
+        git_ops = _git_ops(
+            citation=None, is_ancestor_map={}, effect_present=False,
+            effect_probe=probe_result,
+        )
+
+        verdict = await validate_landing_evidence(
+            git_ops, '42', 'task/42',
+            branch_tip_sha=None,
+            candidate_sha=candidate_sha,
+        )
+
+        assert verdict.accepted is False
+        assert verdict.reason == 'effect_absent'
+        assert verdict.probe['diverged_paths'] == [
+            'tests/infra/harness-layout-baseline.manifest'
+        ]
+        assert verdict.probe['effect_failure'] == 'paths_diverged'
+        assert verdict.probe['effect_anchor_sha'] == 'c' * 40
+        git_ops.describe_commit_effect_in_main.assert_awaited_once_with(candidate_sha)
+
+    async def test_accept_path_never_probes(self) -> None:
+        """(c) The enrichment is reject-path-ONLY: an accepted verdict costs
+        no extra git work and carries no divergence keys at all.
+        """
+        candidate_sha = 'b' * 40
+        git_ops = _git_ops(
+            citation=None, is_ancestor_map={}, effect_present=True,
+            effect_probe=CommitEffectProbe(present=True),
+        )
+
+        verdict = await validate_landing_evidence(
+            git_ops, '42', 'task/42',
+            branch_tip_sha=None,
+            candidate_sha=candidate_sha,
+        )
+
+        assert verdict.accepted is True
+        git_ops.describe_commit_effect_in_main.assert_not_awaited()
+        assert 'diverged_paths' not in verdict.probe
+
+    async def test_enrichment_can_never_change_the_verdict(self) -> None:
+        """(d) THE TOCTOU RACE, made visible rather than hidden: the decision
+        said absent, then main HEAD advanced and the re-probe disagrees.  The
+        verdict is STILL effect_absent — a diagnostic must never overturn a
+        gate decision — and the probe records the disagreement explicitly
+        (empty diverged_paths, no failure code) so the formatter can render
+        the race instead of silently contradicting itself.
+        """
+        candidate_sha = 'b' * 40
+        git_ops = _git_ops(
+            citation=None, is_ancestor_map={}, effect_present=False,
+            effect_probe=CommitEffectProbe(
+                present=True, diverged_paths=(), anchor_sha='c' * 40, failure=None,
+            ),
+        )
+
+        verdict = await validate_landing_evidence(
+            git_ops, '42', 'task/42',
+            branch_tip_sha=None,
+            candidate_sha=candidate_sha,
+        )
+
+        assert verdict.accepted is False
+        assert verdict.reason == 'effect_absent'
+        assert verdict.probe['diverged_paths'] == []
+        assert verdict.probe['effect_failure'] is None
+
+    async def test_structural_failure_code_passes_through(self) -> None:
+        """(e) A structural failure (no path divergence to report) threads its
+        code through, so the escalation names the real cause instead of
+        implying paths diverged when none did.
+        """
+        candidate_sha = 'b' * 40
+        git_ops = _git_ops(
+            citation=None, is_ancestor_map={}, effect_present=False,
+            effect_probe=CommitEffectProbe(
+                present=False, diverged_paths=(), anchor_sha=None,
+                failure='empty_branch_merge',
+            ),
+        )
+
+        verdict = await validate_landing_evidence(
+            git_ops, '42', 'task/42',
+            branch_tip_sha=None,
+            candidate_sha=candidate_sha,
+        )
+
+        assert verdict.probe['effect_failure'] == 'empty_branch_merge'
+        assert verdict.probe['diverged_paths'] == []
+
+    async def test_unprobeable_git_ops_records_the_error_loudly(self) -> None:
+        """(f) LOUD, NOT SILENT.  A duck-typed stand-in predating the new
+        method — the live shape in seven other test files — must not break the
+        gate, but its failure is RECORDED into the probe (which is rendered
+        verbatim into the escalation a human reads), never swallowed.
+
+        ``diverged_paths`` is None here, deliberately distinct from ``[]``:
+        None means "could not be determined", ``[]`` means "determined, and
+        empty".  Collapsing the two would let an unprobeable stand-in render
+        as a clean no-divergence result.
+        """
+        candidate_sha = 'b' * 40
+        git_ops = _git_ops(
+            citation=None, is_ancestor_map={}, effect_present=False,
+        )
+        git_ops.describe_commit_effect_in_main = AsyncMock(
+            side_effect=AttributeError('describe_commit_effect_in_main'),
+        )
+
+        verdict = await validate_landing_evidence(
+            git_ops, '42', 'task/42',
+            branch_tip_sha=None,
+            candidate_sha=candidate_sha,
+        )
+
+        assert verdict.accepted is False
+        assert verdict.reason == 'effect_absent'
+        assert verdict.probe['diverged_paths'] is None
+        assert isinstance(verdict.probe['effect_probe_error'], str)
+        assert verdict.probe['effect_probe_error']
+        assert 'describe_commit_effect_in_main' in verdict.probe['effect_probe_error']
