@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -22,6 +23,7 @@ from shared.invocation_outcome import (
 )
 from shared.usage_gate import (
     AccountState,
+    ProbeSpawnError,
     UsageGate,
 )
 
@@ -772,12 +774,21 @@ class TestRunProbe:
             await gate._run_probe(acct)
 
     async def test_general_exception_returns_false(self):
-        """General exception (e.g., FileNotFoundError) -> returns False."""
+        """A non-OSError exception from the spawn -> still returns False.
+
+        The generic ``except Exception`` arm is unchanged. Its EXAMPLE changed
+        (task 4512): this test used to raise ``FileNotFoundError`` here and
+        assert ``False``, which is precisely the defect — a missing binary is
+        an infrastructure fault, and it now raises ``ProbeSpawnError`` (see
+        ``TestRunProbeSpawnFault``). ``RuntimeError`` is not an ``OSError``, so
+        it still falls through to the generic arm and keeps the old verdict:
+        only the OSError-at-spawn case was reclassified, not everything.
+        """
         gate, acct = await self._make_probing_gate()
 
         with patch(
             'asyncio.create_subprocess_exec',
-            side_effect=FileNotFoundError('claude not found'),
+            side_effect=RuntimeError('something unexpected'),
         ):
             result = await gate._run_probe(acct)
 
@@ -983,6 +994,169 @@ class TestRunProbe:
 # CliLocalError precedence (reify-3604) applies here too, not just at
 # detect_cap_hit/cli_invoke.
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRunProbeSpawnFault:
+    """_run_probe must distinguish "could not spawn" from "ran, still capped".
+
+    Task 4512. Both used to be ``return False``, which made a permanent host
+    fault (unresolvable ``claude`` binary) indistinguishable from a usage cap
+    all the way up the stack. The spawn fault now raises ``ProbeSpawnError``.
+
+    Half of this class is the RAISES side; the other half is the ORDERING TRAP
+    that the fix's shape exists to avoid. On py3.13
+    ``issubclass(TimeoutError, OSError)`` is True and ``asyncio.TimeoutError is
+    TimeoutError`` — so an ``except OSError`` arm added to the EXISTING
+    combined try (or placed before the current ``except TimeoutError``) would
+    silently reclassify every 30-second probe timeout as a missing-binary host
+    fault. That is the same misclassification this task removes, pointed the
+    other way. The fix therefore SPLITS the try so the OSError arm can only
+    ever see the spawn; these tests pin that boundary from both sides.
+    """
+
+    async def _make_probing_gate(self) -> tuple[UsageGate, AccountState]:
+        gate = make_gate(['a'])
+        acct = gate._accounts[0]
+        acct.capped = True
+        return gate, acct
+
+    # --- RAISES: every OSError from the spawn is an infrastructure fault ---
+
+    async def test_missing_binary_raises_probe_spawn_error(self, caplog):
+        """The observed incident: `claude` is not on PATH."""
+        gate, acct = await self._make_probing_gate()
+        cause = FileNotFoundError(2, 'No such file or directory', 'claude')
+
+        with (
+            caplog.at_level(logging.ERROR, logger='shared.usage_gate'),
+            patch('asyncio.create_subprocess_exec', side_effect=cause),
+            pytest.raises(ProbeSpawnError) as excinfo,
+        ):
+            await gate._run_probe(acct)
+
+        assert excinfo.value.binary == 'claude'
+        assert isinstance(excinfo.value.cause, FileNotFoundError)
+
+        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert errors, (
+            'a spawn fault must be logged at ERROR, not the WARNING an '
+            'ordinary probe failure gets — it is an operator action item'
+        )
+        rendered = ' '.join(r.getMessage() for r in errors)
+        assert acct.name in rendered, rendered
+        assert 'No such file or directory' in rendered, rendered
+
+    @pytest.mark.parametrize(
+        'cause',
+        [
+            PermissionError(13, 'Permission denied', 'claude'),
+            NotADirectoryError(20, 'Not a directory', 'claude'),
+        ],
+        ids=['permission-denied', 'not-a-directory'],
+    )
+    async def test_every_oserror_at_spawn_is_a_spawn_fault(self, cause):
+        """Not just ENOENT.
+
+        A non-executable binary (chmod loss) and a broken self-update symlink
+        whose parent is a file both surface as other OSError subclasses, and
+        both mean the same thing: the probe never ran, so nothing was learned
+        about the account's capacity. Enumerating errnos would leave the next
+        variant silently classified as a cap.
+        """
+        gate, acct = await self._make_probing_gate()
+
+        with (
+            patch('asyncio.create_subprocess_exec', side_effect=cause),
+            pytest.raises(ProbeSpawnError) as excinfo,
+        ):
+            await gate._run_probe(acct)
+
+        assert excinfo.value.cause is cause
+        assert excinfo.value.binary == 'claude'
+
+    # --- DOES NOT RAISE: the probe ran, so its bool verdict stands ---
+
+    @pytest.mark.filterwarnings('error::pytest.PytestUnraisableExceptionWarning')
+    async def test_timeout_is_not_a_spawn_fault(self):
+        """THE ORDERING TRAP. A 30s probe timeout still returns False.
+
+        `TimeoutError` IS an `OSError` subclass, so this is the single test
+        that distinguishes the split-try fix from the tempting one-line
+        `except OSError` added to the combined try. If it ever goes red with a
+        ProbeSpawnError, the OSError arm has drifted onto the read.
+        """
+        gate, acct = await self._make_probing_gate()
+        proc = _make_mock_proc(returncode=0, stdout=b'ok')
+
+        async def fake_wait_for(coro, *args, **kwargs):
+            coro.close()
+            raise TimeoutError()
+
+        with (
+            patch('asyncio.create_subprocess_exec', return_value=proc),
+            patch('shared.usage_gate.asyncio.wait_for', side_effect=fake_wait_for),
+        ):
+            result = await gate._run_probe(acct)
+
+        assert result is False
+
+    async def test_broken_pipe_during_read_is_not_a_spawn_fault(self):
+        """A mid-read BrokenPipeError (also an OSError) still returns False.
+
+        The spawn SUCCEEDED here, so the probe ran; whatever broke afterwards
+        is not evidence that the host cannot start `claude`. Latching the
+        gate unhealthy on this would make a flaky pipe look like a missing
+        binary — and, unlike a missing binary, no operator action fixes it.
+        """
+        gate, acct = await self._make_probing_gate()
+        proc = MagicMock()
+        proc.returncode = 0
+        proc.communicate = AsyncMock(
+            side_effect=BrokenPipeError(32, 'Broken pipe'),
+        )
+
+        with patch('asyncio.create_subprocess_exec', return_value=proc):
+            result = await gate._run_probe(acct)
+
+        assert result is False
+
+    async def test_non_oserror_at_spawn_is_not_a_spawn_fault(self):
+        """A RuntimeError from the spawn still returns False.
+
+        The reclassification is scoped to OSError specifically. A caller-side
+        bug or a mocking accident must not masquerade as a host fault and
+        latch the gate unhealthy.
+        """
+        gate, acct = await self._make_probing_gate()
+
+        with patch(
+            'asyncio.create_subprocess_exec',
+            side_effect=RuntimeError('not an OSError'),
+        ):
+            result = await gate._run_probe(acct)
+
+        assert result is False
+
+    async def test_cancelled_error_still_propagates(self):
+        """CancelledError must keep propagating past the new OSError arm.
+
+        `asyncio.CancelledError` derives from BaseException, so it cannot be
+        caught by `except OSError` — but the spawn's new arm sits ahead of
+        every existing handler, so the shutdown-drain contract
+        (`UsageGate.shutdown()` waits on this task) is re-pinned here rather
+        than assumed.
+        """
+        gate, acct = await self._make_probing_gate()
+
+        async def cancel_exec(*args, **kwargs):
+            raise asyncio.CancelledError()
+
+        with (
+            patch('asyncio.create_subprocess_exec', side_effect=cancel_exec),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await gate._run_probe(acct)
 
 
 @pytest.mark.asyncio
