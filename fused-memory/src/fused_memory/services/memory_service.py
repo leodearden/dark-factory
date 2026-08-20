@@ -1915,6 +1915,23 @@ class MemoryService:
         # Bounded by that four-member closed vocabulary, so unlike the per-agent
         # storm counters above it needs no pruning.
         self._referent_source_counts: dict[str, int] = dict.fromkeys(REFERENT_SOURCES, 0)
+        # INV-4 storm escape for the verification sub-pass (task 3671, PRD leaf
+        # zeta), and leaf iota's read side. Copies the shape directly above for
+        # the same stated reasons: constructed UNCONDITIONALLY — never obtained
+        # from `_write_journal` or the ReconciliationHarness — so it does not go
+        # dark in exactly the degraded configuration where a finding storm is
+        # least likely to be noticed any other way; and bounded by a closed
+        # vocabulary, so unlike the per-agent storm counters above it needs no
+        # pruning.
+        #
+        # Keyed off REFERENT_CHECKS so the check vocabulary lives at ONE site
+        # and a third check cannot escape the counter. The extra 'unresolvable'
+        # bucket is a SECOND, ORTHOGONAL axis (whether a finding can be acted on)
+        # rather than a third check, so the buckets deliberately do not sum to
+        # the finding total.
+        self._referent_finding_counts: dict[str, int] = dict.fromkeys(
+            (*REFERENT_CHECKS, 'unresolvable'), 0,
+        )
         # Test seam for the injectable-clock convention: a 3600s window has to
         # be exercised by advancing a fake clock, not by sleeping.
         self._mem0_update_storm_time_provider: Callable[[], float] = time.time
@@ -3145,6 +3162,22 @@ class MemoryService:
                 finding, new_endpoint_uuid=uuid_by_name[name],
             )
 
+        for finding in stats.findings:
+            # The two INV-2 surfaces no consumer has to parse a log for: the
+            # process-lifetime counter leaf iota reads, and the return value
+            # leaf eta reads in-process inside this same critical section.
+            self._referent_finding_counts[finding.check] += 1
+            if not finding.resolvable:
+                self._referent_finding_counts['unresolvable'] += 1
+            # WARNING, not DEBUG. The task calls out today's `logger.debug`-only
+            # ReconcileStats shape as unacceptable here, and a misattached edge
+            # is a correctness defect an operator should see. This line is the
+            # OPERATOR surface ONLY — it carries the structured payload for
+            # legibility, but nothing parses it.
+            logger.warning(
+                'Referent verification finding: %s', finding.to_dict(),
+            )
+
         return stats
 
     async def _intended_endpoint_uuid(
@@ -3317,6 +3350,33 @@ class MemoryService:
         samples and differences, matching the uptime-baseline convention above.
         """
         return dict(self._referent_source_counts)
+
+    def referent_finding_counts(self) -> dict[str, int]:
+        """How many verification findings each check has produced, ever.
+
+        The read side of ``_referent_finding_counts`` and the INV-4 storm escape
+        for the verification sub-pass (task 3671, PRD leaf zeta) — and the
+        surface leaf IOTA reads to turn findings into a rate. Deliberately
+        mirrors :meth:`referent_source_counts` rather than inventing a second
+        idiom in this file.
+
+        THE BUCKETS ARE TWO ORTHOGONAL AXES, NOT A PARTITION.
+        ``'set-membership'`` and ``'per-edge-pairing'`` answer "which check
+        fired" and do partition the findings between them (they are ordered, so
+        an endpoint failing both is counted once, under membership).
+        ``'unresolvable'`` answers the independent question "could a correct
+        target be determined at all", and increments ALONGSIDE whichever check
+        fired. So the three counts intentionally do not sum to the finding
+        total, and ``unresolvable`` is a numerator over the other two, not a
+        third category.
+
+        Every bucket exists from construction, so a reader never has to
+        distinguish "zero" from "absent". Returns a COPY, so a caller cannot
+        mutate the escape hatch's own state. Process-lifetime totals, never
+        reset — a monotonic counter a reader samples and differences, matching
+        the convention above.
+        """
+        return dict(self._referent_finding_counts)
 
     async def _execute_graphiti_write(
         self, operation: str, payload: dict[str, Any]
