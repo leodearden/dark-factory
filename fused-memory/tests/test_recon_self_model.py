@@ -14,6 +14,8 @@ drift invariant to own.
 
 from __future__ import annotations
 
+import pathlib
+
 import pytest
 
 from fused_memory.reconciliation import recon_self_model as m
@@ -162,11 +164,20 @@ class TestMem0TombstoneDeleters:
     drift between the two fails a test instead of silently diverging."""
 
     def test_mem0_tombstone_deleters_shape(self):
-        """MEM0_TOMBSTONE_DELETERS is a non-empty tuple of non-empty str."""
+        """MEM0_TOMBSTONE_DELETERS is a non-empty tuple of non-empty str,
+        with no duplicate entries. Uniqueness matters because the render
+        step (render_cycle_summary_section) and the live-site ratchet below
+        both compare via set() — a duplicated tag would render the same
+        deleter twice in the prompt while passing both of those set-based
+        checks silently."""
         assert isinstance(m.MEM0_TOMBSTONE_DELETERS, tuple)
         assert m.MEM0_TOMBSTONE_DELETERS
         for deleter in m.MEM0_TOMBSTONE_DELETERS:
             assert isinstance(deleter, str) and deleter
+        assert len(set(m.MEM0_TOMBSTONE_DELETERS)) == len(m.MEM0_TOMBSTONE_DELETERS), (
+            f'MEM0_TOMBSTONE_DELETERS must not contain duplicates: '
+            f'{m.MEM0_TOMBSTONE_DELETERS}'
+        )
 
     def test_mem0_tombstone_deleters_match_live_delete_sites(self):
         """Drift ratchet: MEM0_TOMBSTONE_DELETERS must equal the six live
@@ -201,6 +212,41 @@ class TestMem0TombstoneDeleters:
             srv_tools._CONSOLIDATE_SOURCE,
         }
         assert set(m.MEM0_TOMBSTONE_DELETERS) == expected
+
+    def test_record_mem0_deletion_tombstones_has_exactly_three_call_sites(self):
+        """Source-level guard for the unknown-unknown gap the ratchet above
+        documents: a brand-new call site introducing a brand-new deleter tag
+        does not fail `test_mem0_tombstone_deleters_match_live_delete_sites`
+        until someone remembers to add it to that test's `expected` set. This
+        test catches that moment a different way — by counting call sites
+        directly in the source text rather than by enumerating constants a
+        human must remember to update.
+
+        Today there are exactly three production call sites of
+        `mem0_tombstone.record_mem0_deletion_tombstones`:
+        summary_pool.enforce_summary_pool_cap,
+        task_knowledge_sync._sweep_stale_mem0_pool, and
+        server.tools.consolidate_memories. `mem0_tombstone.py` itself is
+        excluded from the scan — it contains the `def` site plus prose
+        cross-references, not a call.
+        """
+        src_root = pathlib.Path(__file__).parents[1] / 'src' / 'fused_memory'
+        target = 'record_mem0_deletion_tombstones('
+        call_sites: list[str] = []
+        for path in sorted(src_root.rglob('*.py')):
+            if path.name == 'mem0_tombstone.py':
+                continue
+            count = path.read_text(encoding='utf-8').count(target)
+            if count:
+                rel = path.relative_to(src_root.parent).as_posix()
+                call_sites.extend([rel] * count)
+        assert len(call_sites) == 3, (
+            f'Expected exactly 3 production call sites of '
+            f'record_mem0_deletion_tombstones(...), found {len(call_sites)}: '
+            f'{call_sites}. A writer was added or removed — update '
+            f'MEM0_TOMBSTONE_DELETERS (and its cross-check above) to match, '
+            f'then update this count.'
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -331,12 +377,24 @@ class TestRenderCycleSummarySection:
         assert m.STAGE2_CYCLE_SUMMARY_RECON_POOL == 'stage2_cycle_summary'
 
     def test_tombstone_claim_names_its_deleters(self):
-        """The scoped claim is single-sourced from MEM0_TOMBSTONE_DELETERS —
-        every entry must appear in the rendered text, so the prose cannot
-        silently disagree with the step-1 drift ratchet."""
+        """The scoped claim is single-sourced from MEM0_TOMBSTONE_DELETERS.
+
+        Deliberately stronger than a per-element `deleter in text` loop:
+        that form is satisfied by ANY ordering, duplication, or scattering
+        of the tags, so it can only fail if the f-string interpolation is
+        deleted outright — it carries almost no regression signal. Asserting
+        the exact backtick-wrapped, comma-joined, in-declared-order
+        substring instead also catches a reordering, a gap opened up by an
+        unrelated edit landing mid-list, or the render switching away from
+        MEM0_TOMBSTONE_DELETERS as its source, while still failing closed if
+        the interpolation is deleted entirely.
+        """
         text = m.render_cycle_summary_section()
-        for deleter in m.MEM0_TOMBSTONE_DELETERS:
-            assert deleter in text, f'{deleter!r} missing from render_cycle_summary_section()'
+        expected_deleters_str = ', '.join(f'`{deleter}`' for deleter in m.MEM0_TOMBSTONE_DELETERS)
+        assert expected_deleters_str in text, (
+            f'Expected the exact ordered, comma-joined deleter list '
+            f'{expected_deleters_str!r} in render_cycle_summary_section()'
+        )
 
 
 # --------------------------------------------------------------------------- #
