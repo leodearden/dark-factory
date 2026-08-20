@@ -224,7 +224,8 @@ with the sweep's `observed` in every case:
 - **18 mismatches** on episodes created 2026-08-12…08-19 whose claimed task is still
   non-terminal — 13 Class A (`reify` 6346, 6184, 6343, 6344, 6098, 6335, 6336, 5480 and
   `dark_factory` 3690, 4377, 4371, 4361, 3639) and 5 Class B (`reify` 5467, 6077 ×2, 5480 and
-  `dark_factory` 3589).
+  `dark_factory` 3589). `reify` 5480 appears in both lists because it carries **two**
+  findings — one `filing_dispatch`, one `applied_work` — one per class, not a double count.
 - **2 unverifiable** on *older* episodes (`c8be5801`, created 2026-06-25, ref
   `dark_factory:4778`; `ca2820dd`, created 2026-07-28, ref `dark_factory:5493`). Both refs
   are now **ABSENT** from `dark_factory`'s `tasks.db`, and neither episode was a finding on
