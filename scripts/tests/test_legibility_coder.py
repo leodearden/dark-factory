@@ -17,6 +17,8 @@ rather than ever shelling out to a real `claude` process.
 from __future__ import annotations
 
 import json
+import os
+import shutil
 from pathlib import Path
 
 import codebook as codebook_mod
@@ -746,6 +748,110 @@ def test_invoke_cli_cwd_that_is_a_file_raises_invocation_error(tmp_path, monkeyp
             "prompt text", "haiku",
             claude_bin=claude_bin, timeout=10, cwd=str(not_a_dir),
         )
+
+
+# ---------------------------------------------------------------------------
+# task 4510: characterization pins over _invoke_cli's LEGIBILITY_CLAUDE_BIN
+# branch — the seam scripts/legibility-trickle@.service's Environment= line
+# depends on. NOT a RED: coder.py already implements this branch. These make
+# the pin undeletable from the CODE side, so dropping the env-var lookup
+# (which would silently re-open the 2026-08-18 outage even with the unit line
+# present) fails here.
+# ---------------------------------------------------------------------------
+
+def _scrub_path_of_claude(tmp_path, monkeypatch):
+    """Point PATH somewhere the REAL `claude` is NOT resolvable, and prove it.
+
+    Load-bearing test SAFETY, not tidiness. The real
+    /home/leo/.local/bin/claude is on the test runner's PATH, so if
+    _invoke_cli's resolution order (`claude_bin or
+    os.environ.get(_CLAUDE_BIN_ENV_VAR) or "claude"`) ever regresses, an
+    unscrubbed PATH would let the bare-name fallback spawn the GENUINE claude
+    CLI — real LLM spend, real wall-clock, and a test that passes for the
+    wrong reason, silently breaking this module's docstring promise that the
+    LLM is ALWAYS mocked here. With `claude` unresolvable, that same
+    regression instead ENOENTs into CoderInvocationError: loud and cheap.
+
+    Deliberately NOT a fully empty PATH, though that is the obvious spelling.
+    The fake binaries above are `#!/usr/bin/env bash` scripts and `env` needs
+    PATH to find `bash`, so an empty PATH makes every fake die with exit 127
+    ("env: 'bash': No such file or directory") — failing these tests for a
+    reason with nothing to do with the branch under test. PATH therefore keeps
+    a stdlib bin dir and drops ~/.local/bin, and the assertion below pins the
+    property that actually matters instead of trusting the spelling to imply
+    it.
+    """
+    empty_bin = tmp_path / "empty_bin"
+    empty_bin.mkdir()
+    monkeypatch.setenv("PATH", f"{empty_bin}{os.pathsep}/usr/bin")
+    assert shutil.which("claude") is None, (
+        "PATH scrub failed: a real `claude` is still resolvable, so a "
+        "regression in _invoke_cli's env-var branch would silently spawn the "
+        "GENUINE CLI (real spend) instead of failing loudly"
+    )
+
+
+def test_invoke_cli_honours_claude_bin_env_var(tmp_path, monkeypatch):
+    """With no explicit claude_bin=, the binary comes from
+    LEGIBILITY_CLAUDE_BIN — the exact seam the trickle systemd unit pins so
+    the coder survives a `systemd --user` manager whose PATH lacks
+    ~/.local/bin (2026-08-18: 6/6 selected digests ENOENT'd on reify, 38/38
+    on dark_factory)."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    argv_file = tmp_path / "argv.txt"
+    stdin_file = tmp_path / "stdin.txt"
+    stdout_path = tmp_path / "stdout.txt"
+    stdout_path.write_text('{"matches": [], "candidates": []}')
+    _write_fake_claude_capturing(
+        bin_dir, argv_file=argv_file, stdin_file=stdin_file, stdout_path=stdout_path,
+    )
+
+    _scrub_path_of_claude(tmp_path, monkeypatch)
+    monkeypatch.setenv(mod._CLAUDE_BIN_ENV_VAR, str(bin_dir / "claude"))
+
+    raw = mod._invoke_cli("the prompt text UNIQUE_MARKER_ENV777", "haiku", timeout=10)
+
+    # The env-var-resolved binary actually RAN, and got the real argv/stdin.
+    argv = argv_file.read_text().splitlines()
+    assert "-p" in argv, argv
+    assert "--model" in argv, argv
+    assert "haiku" in argv, argv
+    assert "the prompt text UNIQUE_MARKER_ENV777" in stdin_file.read_text()
+    assert raw == '{"matches": [], "candidates": []}'
+
+
+def test_invoke_cli_explicit_claude_bin_beats_the_env_var(tmp_path, monkeypatch):
+    """Pins the precedence order _invoke_cli's docstring promises: explicit
+    argument > env var > bare name. The env var points at a FAILING fake, so
+    if precedence ever inverted this would raise CoderInvocationError."""
+    good_dir = tmp_path / "good-bin"
+    bad_dir = tmp_path / "bad-bin"
+    good_dir.mkdir()
+    bad_dir.mkdir()
+
+    argv_file = tmp_path / "argv.txt"
+    stdin_file = tmp_path / "stdin.txt"
+    stdout_path = tmp_path / "stdout.txt"
+    stdout_path.write_text('{"matches": [], "candidates": []}')
+    # Separate directories on purpose: both helpers write a file literally
+    # named "claude", so a shared bin_dir would have the loser overwrite the
+    # winner and the test would prove nothing.
+    _write_fake_claude_capturing(
+        good_dir, argv_file=argv_file, stdin_file=stdin_file, stdout_path=stdout_path,
+    )
+    _write_fake_claude_failing(bad_dir, exit_code=1, stderr_text="env var fake must not win")
+
+    _scrub_path_of_claude(tmp_path, monkeypatch)
+    monkeypatch.setenv(mod._CLAUDE_BIN_ENV_VAR, str(bad_dir / "claude"))
+
+    raw = mod._invoke_cli(
+        "the prompt text UNIQUE_MARKER_PREC555", "haiku",
+        claude_bin=str(good_dir / "claude"), timeout=10,
+    )
+
+    assert raw == '{"matches": [], "candidates": []}'
+    assert "the prompt text UNIQUE_MARKER_PREC555" in stdin_file.read_text()
 
 
 # ---------------------------------------------------------------------------
