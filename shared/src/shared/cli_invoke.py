@@ -361,6 +361,17 @@ class AgentResult:
       Empty string when the invocation did not time out.  Persisted to
       ``.task/zero_output_evidence-iter{N}.json`` by the workflow's
       ``_capture_zero_output_evidence`` helper (task 1739).
+    - ``resume_fallbacks``: how many times THIS invocation armed ``--resume``
+      and had to fall back to a fresh session because the resume itself failed
+      (task 3578).  Stamped by ``invoke_with_cap_retry`` at its single return
+      point from a loop-local counter — the retry loop rebinds ``result`` on
+      every pass, so a count stamped onto a discarded attempt would be lost by
+      construction.  ``shared`` has no event store, so this field is the
+      carrier the orchestrator reads to emit ``session_resume_failed``
+      (``stage='cli'``) for a resume the CLI rejected: previously that loss was
+      invisible in runs.db, because the loop retried fresh and returned a
+      SUCCESS.  Counts fallbacks TAKEN, not resumes armed — a resume that
+      succeeded leaves it 0.
     """
 
     success: bool
@@ -383,6 +394,7 @@ class AgentResult:
     ended_awaiting_background: bool = False
     api_error_status: int | None = None
     proc_tree: str = ''
+    resume_fallbacks: int = 0
     transcript_turns: int | None = None
     """Number of assistant turns found in the on-disk JSONL transcript, or None
     when the transcript could not be read or located.  Stamped on the
@@ -1665,6 +1677,11 @@ async def invoke_with_cap_retry(
     # controls: (1) skip confirm, (2) mark capped=True in cost_store
     started_at = ''
     completed_at = ''
+    # Loop-local, stamped onto the RETURNED result at the single exit below
+    # (task 3578).  Must live out here rather than on any individual result:
+    # the retry loop rebinds `result` on every pass, so a count written to the
+    # failed resume's result object is discarded along with it.
+    resume_fallbacks = 0
 
     # Default to Claude-specific invocation when no invoke_fn was provided
     invoke: Callable[..., Awaitable[AgentResult]] = invoke_fn or invoke_claude_agent
@@ -2276,6 +2293,15 @@ async def invoke_with_cap_retry(
                 # live-continuation caller's original_prompt (resume_delivers_prompt=True)
                 # is only valid inside the resumed session, not a brand-new one.
                 if not result.success and invoke_kwargs.get('resume_session_id'):
+                    # This branch — and ONLY this branch — is the population
+                    # task 3578 measured: 28 occurrences where a resume was
+                    # armed, the CLI rejected it, and the loop retried fresh
+                    # and returned a SUCCESS, leaving no runs.db event at all.
+                    # Deliberately NOT folded in with the cap-hit
+                    # 'fresh (transcript unreachable)' path above: that one is
+                    # already visible as a cap_hit event, and counting both
+                    # here would conflate two populations with different causes.
+                    resume_fallbacks += 1
                     logger.warning(
                         f'{label}: resume failed (session_id={invoke_kwargs["resume_session_id"]}), '
                         f'retrying fresh',
@@ -2289,6 +2315,7 @@ async def invoke_with_cap_retry(
                 break
 
     result.account_name = account_name
+    result.resume_fallbacks = resume_fallbacks
     if cost_store:
         try:
             await cost_store.save_invocation(
