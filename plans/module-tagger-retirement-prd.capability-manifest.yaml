@@ -1,0 +1,114 @@
+# Machine-readable twin of module-tagger-retirement-prd.capability-manifest.md
+# Schema: plans/capability-delivered-checks-prd.md §Contract
+# (shared/src/shared/capability_manifest.py CapabilityManifestDoc).
+# task_id values are null until commit_planning stamps them.
+# expect: absent checks describe the DELIVERED state (they pass once β lands).
+prd: plans/module-tagger-retirement-prd.md
+schema_version: 1
+tasks:
+  - label: "β"
+    task_id: null
+    title: "Delete the LLM module tagger end-to-end"
+    capabilities:
+      - name: "tagger-sites-present-for-removal"
+        binding: "capability→producer (wired) — grep:orchestrator/src/orchestrator/harness.py:2477,2883,10080,10135; module_tagger_prompt.py; cli.py --retag-modules"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_tag_task_modules|retag_modules|module_tagger_prompt"
+          paths: ["orchestrator/"]
+          expect: absent
+      - name: "upstream-producer-3122"
+        binding: "DAG-direction — DF 3122 upstream of β via a real dependency edge; β deletes the files_tagged_empty persistence 3122 lands"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "ordering is enforced by the wired dependency edge, not a grep"
+      - name: "synthetic-fallback-survives"
+        binding: "capability→producer (wired) — grep:orchestrator/src/orchestrator/scheduler.py:8810 task-<id> fallback in _get_modules must remain"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "task-\\{task_id"
+          paths: ["orchestrator/src/orchestrator/scheduler.py"]
+          expect: present
+      - name: "vocab-retained-annotated"
+        binding: "capability→producer (wired) — grep:shared/src/shared/task_metadata.py:903 files_tagged_at blessed; :82 module_tagger in KNOWN_ROLE_NAMES; retained per PRD decision 5"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "files_tagged_at"
+          paths: ["shared/src/shared/task_metadata.py"]
+          expect: present
+      - name: "digest-historical-rows-tolerated"
+        binding: "capability→producer (wired) — grep:orchestrator/src/orchestrator/digest.py:467,516 NULL-task_id module_tagger handling stays per PRD decision 6"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "module_tagger"
+          paths: ["orchestrator/src/orchestrator/digest.py"]
+          expect: present
+  - label: "δ"
+    task_id: null
+    title: "Hard-gate simple-task submissions on declared files"
+    capabilities:
+      - name: "interceptor-boundary-exists"
+        binding: "capability→producer (wired) — grep:fused-memory/src/fused_memory/middleware/task_interceptor.py:5926 lock_charter_error precedent at the same write boundary"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "simple_task_files_error"
+          paths: ["fused-memory/src/fused_memory/"]
+          expect: present
+      - name: "complexity-simple-field-real"
+        binding: "capability→producer (wired) — grep:orchestrator/src/orchestrator/workflow.py:2601 production read of metadata.complexity=='simple'; docs/task-authoring.md:490-513"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "pre-existing substrate, not a δ deliverable"
+      - name: "rejection-fires"
+        binding: "rejection-mechanism (G6 branch 4) — δ's own tests author the rejected case and observe simple_task_files_error fire, plus both allow-cases"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "simple_task_files_error"
+          paths: ["fused-memory/tests/"]
+          expect: present
+      - name: "submit-prompts-updated"
+        binding: "capability→producer — agents/roles.py submit-instruction stamps state the declared-files requirement for simple tasks"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "prompt prose is not mechanically bindable"
+  - label: "ε"
+    task_id: null
+    title: "Tagger-debris census across all six corpora"
+    capabilities:
+      - name: "audit-lens-exists"
+        binding: "capability→producer (wired) — scripts/audit_wiped_metadata_files.py models both plan-scope event sources; ε reuses, never duplicates (INV-5)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "reuse-vs-duplication is a review judgment, not a grep"
+      - name: "census-script-delivered"
+        binding: "capability→producer — prescribed deliverable scripts/census_tagger_debris.py containing the files_tagged_at classification logic"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "files_tagged_at"
+          paths: ["scripts/census_tagger_debris.py"]
+          expect: present
+      - name: "artifact-committed"
+        binding: "capability→producer — prescribed deliverable plans/module-tagger-debris-census.md + .json keyed for DF 3113 P4a / DF 3427"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "module-tagger-debris-census"
+          paths: ["plans/"]
+          expect: present
+      - name: "known-positives-present"
+        binding: "field-population — reify 6068/5602/5632 and DF 3113's record appear in the artifact as positive controls"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "external corpora are not greppable from this repo"
