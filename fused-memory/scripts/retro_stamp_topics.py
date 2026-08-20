@@ -90,6 +90,7 @@ import asyncio
 import functools
 import importlib.util
 import json
+import logging
 import re
 import sys
 import types
@@ -98,7 +99,18 @@ from pathlib import Path
 
 from fused_memory.memory_metadata import normalize_supersedes
 from fused_memory.topic_slug import TOPIC_SLUG_MAX_LEN, is_valid_topic_slug
+from fused_memory.utils.store_mutation_preflight import (
+    StoreMutationUnavailable,
+    assert_store_mutation_allowed,
+)
 from fused_memory.utils.validation import is_full_uuid
+
+# This script reports through ``print``; stdout carries its machine-read
+# markdown/JSON artifact, so the ONE diagnosis that must not land there -- the
+# fail-closed store-mutation refusal in ``run`` -- goes through this logger
+# instead. Named for the script basename, matching every other guarded script
+# (and what the tests filter ``caplog`` on).
+logger = logging.getLogger('retro_stamp_topics')
 
 # Convention: this list carries every imported helper the tests reach through the
 # module object, not only the names defined locally — ``TOPIC_SLUG_MAX_LEN``,
@@ -1520,6 +1532,36 @@ async def run(
         The report dict — rendered by :func:`render_markdown` /
         :func:`render_json` and graded by :func:`resolve_exit_code`.
     """
+    # Fail-CLOSED capability preflight, one probe per run, BEFORE the scan.
+    #
+    # ``run`` is the choke point precisely because ``stamp_one``'s own
+    # ``--apply`` gate is PER TARGET: probing there would run once per target
+    # rather than once per run, and -- since ``StoreMutationUnavailable``
+    # subclasses ``RuntimeError`` -- would be swallowed by the per-target
+    # ``except Exception`` around the write, downgrading a run-wide
+    # environment denial into N ``outcome: 'error'`` rows inside a report that
+    # otherwise looks like a completed sweep. Emitted through the logger, not
+    # ``print``, to keep it off the stdout this script reserves for its
+    # machine-read artifact.
+    if apply:
+        try:
+            assert_store_mutation_allowed(operation='retro_stamp_topics --apply')
+        except StoreMutationUnavailable:
+            logger.error(
+                'retro_stamp_topics: --apply NOT started (fail-closed) -- this '
+                "process cannot write mem0's history directory, so each stamp "
+                'would patch a record and then fail to record the change, '
+                'leaving the corpus half-stamped: some claims filed under the '
+                'new topic slug and some under the legacy one, which is worse '
+                'for an exact-match topic query than either uniform state. '
+                'Nothing was scrolled and no record was stamped. Route the '
+                'stamping through the fused-memory MCP server (the unsandboxed '
+                'owner of the store), or re-run from an unsandboxed operator '
+                'shell. To obtain the sweep report safely from anywhere, '
+                're-run without --apply.'
+            )
+            raise
+
     if calibration_rows is None:
         calibration_rows = load_calibration_rows(CALIBRATION_FIXTURE_PATH)
     if registry is None:
@@ -1895,6 +1937,19 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     """Build a live service, run the sweep, write both artifacts, exit graded."""
+    # This script is otherwise print-based, so without this the module logger
+    # added for the fail-closed store preflight would have no handler at all
+    # and its refusal would reach the operator only through
+    # ``logging.lastResort`` -- a bare line on stderr with no timestamp, level
+    # or logger name, unlike every sibling guarded script. ``stream`` is named
+    # explicitly because stdout here is reserved for the machine-read report
+    # rendered below; diagnostics must not land in it.
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s %(levelname)s %(message)s',
+        stream=sys.stderr,
+    )
+
     args = _build_parser().parse_args(argv)
 
     if args.config:

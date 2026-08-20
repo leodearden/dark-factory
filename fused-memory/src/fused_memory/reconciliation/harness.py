@@ -26,6 +26,7 @@ from fused_memory.backends.falkor_indices import (
     expected_index_set,
     normalize_index_records,
 )
+from fused_memory.backends.mem0_client import is_missing_collection_error
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.mcp_tools.scheduler_state import read_scheduler_state
 from fused_memory.models.reconciliation import (
@@ -1495,6 +1496,9 @@ class ReconciliationHarness:
             None when statuses is empty (fail-open: no supersede attempted, and
             no memory-service calls are made).  Otherwise a record dict:
               - found=False when no cached project_status_correction memory exists.
+              - found=False plus collection_missing=True when the project's Mem0
+                collection was never provisioned — an empty result, NOT an
+                error (task 2949); logged at INFO so found=False stays legible.
               - diverged=False, superseded=False when the cached memory matches
                 the live census (no-op).
               - diverged=True, superseded=True, memory_id, old, new when the
@@ -1510,10 +1514,46 @@ class ReconciliationHarness:
             return None
 
         try:
-            memories = await self.memory.get_memories_by_metadata(
-                project_id=project_id,
-                filters={'kind': 'project_status_correction'},
-            )
+            try:
+                memories = await self.memory.get_memories_by_metadata(
+                    project_id=project_id,
+                    filters={'kind': 'project_status_correction'},
+                )
+            except Exception as exc:
+                # A project whose Qdrant collection was never provisioned has no
+                # cached corrections — an EMPTY RESULT, not a failed read.  Left
+                # to the outer handler it would return an `error` record that
+                # Stage 3 re-flags as an unresolved integrity issue every cycle
+                # (task 2949).  Narrow by construction: anything else — a 500, a
+                # TimeoutError, any other exception — re-raises into the outer
+                # handler unchanged, so real failures still surface loudly.
+                #
+                # DELIBERATELY SCOPED to this call site.  The same un-provisioned
+                # collection still raises from every other Mem0 read in the cycle
+                # (targeted.py, standing_decision_writer.py, summary_pool.py,
+                # scope_freshness.py, stages/task_knowledge_sync.py all reach the
+                # same scroll_by_metadata), so a brand-new project can still see
+                # errors from those paths.  Task 2949 scopes the fix to the
+                # status_correction path and keeps scroll_by_metadata's
+                # no-silent-fail contract untouched for its other callers —
+                # including hot pool-GC loops that would pay for a proactive
+                # collection_exists round-trip.  Generalising the degradation to
+                # the whole read surface is filed as a follow-up.
+                if not is_missing_collection_error(exc):
+                    raise
+                logger.info(
+                    'reconciliation.status_correction_collection_missing',
+                    extra={'project_id': project_id},
+                )
+                return {
+                    'available': True,
+                    'found': False,
+                    'diverged': False,
+                    'superseded': False,
+                    # Distinguishes "collection absent" from "collection
+                    # genuinely empty" for an operator reading found=False.
+                    'collection_missing': True,
+                }
             if not memories:
                 return {
                     'available': True,

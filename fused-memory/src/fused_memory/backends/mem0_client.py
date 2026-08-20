@@ -54,6 +54,43 @@ class ScrollPageBudgetExhausted(RuntimeError):
     """
 
 
+def is_missing_collection_error(exc: BaseException) -> bool:
+    """True iff *exc* is Qdrant's "that collection doesn't exist" 404.
+
+    A collection that was never provisioned holds no memories, so the honest
+    answer for a read against it is an EMPTY RESULT — semantically the same 0
+    / ``[]`` that ``task_curator.corpus_count``/``search_corpus`` return for an
+    absent collection, and distinct from a failure to read.
+
+    Everything else returns False and MUST keep propagating to the caller's
+    error path: a non-404 ``UnexpectedResponse`` (a real backend failure), a
+    generic exception, and above all a ``TimeoutError`` — rendering a
+    transient failure as "no data" is precisely the silent fail-soft the
+    no-silent-fail invariant bans.  Matching is therefore narrow by
+    construction (404 AND the message), so a 404 raised about some other
+    Qdrant resource can never be read as an empty collection.
+
+    Callers that degrade on this predicate should still say so out loud (log
+    the missing collection), so an operator can tell "collection absent" from
+    "collection genuinely empty".
+    """
+    from qdrant_client.http.exceptions import UnexpectedResponse  # noqa: PLC0415
+
+    if not isinstance(exc, UnexpectedResponse) or exc.status_code != 404:
+        return False
+    content = exc.content
+    if isinstance(content, bytes | bytearray):
+        content = content.decode('utf-8', errors='replace')
+    text = str(content).lower()
+    # BOTH tokens, never the phrase alone: Qdrant words several other not-found
+    # errors identically ("Snapshot `x` doesn't exist!", alias/shard variants),
+    # and only the COLLECTION one means "zero memories".  Requiring 'collection'
+    # is what makes the narrowness the docstring promises actually hold.
+    # Verified against a live Qdrant scroll on an absent collection:
+    # {"status":{"error":"Not found: Collection `x` doesn't exist!"}}.
+    return "doesn't exist" in text and 'collection' in text
+
+
 # ---------------------------------------------------------------------------
 # mem0-owned metadata keys
 # ---------------------------------------------------------------------------

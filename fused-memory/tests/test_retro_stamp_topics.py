@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import logging
 import sys
 import types
 from pathlib import Path
@@ -47,6 +48,29 @@ def _load_module() -> types.ModuleType:
 
 
 _mod = _load_module()
+
+
+@pytest.fixture(autouse=True)
+def _neutralise_store_mutation_preflight(monkeypatch):
+    """Keep this MOCK-unit suite independent of the REAL ``~/.mem0``.
+
+    ``run(..., apply=True)`` runs a fail-closed capability preflight before it
+    scrolls (task 4293). That probe touches the real filesystem, so without
+    this fixture every ``--apply`` test would pass or fail according to whether
+    the machine running pytest happens to be able to write mem0's history
+    directory -- and it genuinely cannot inside an agent sandbox, which is the
+    whole reason the guard exists. This suite is deliberately MOCK-unit (an
+    AsyncMock service, no live store), so the environment must not be an input
+    to it.
+
+    ``TestRunApplyStoreMutationPreflight`` re-rigs this per test -- to refuse,
+    to record, or to pass -- so the guard's own behaviour is still pinned
+    explicitly rather than assumed away.
+
+    Deliberately NOT ``raising=False``: if the guard is ever removed from the
+    script this fixture must break loudly rather than silently no-op.
+    """
+    monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', lambda **_kw: None)
 
 
 # ===========================================================================
@@ -2697,3 +2721,184 @@ class TestReportRenderAndCli:
         )
         assert args.json_out == '/tmp/x.json'
         assert args.md_out == '/tmp/x.md'
+
+
+# ===========================================================================
+# Tests: --apply store-mutation preflight
+# ===========================================================================
+
+class TestRunApplyStoreMutationPreflight:
+    """``--apply`` refuses to START when this process cannot write mem0's store.
+
+    Ported from ``test_sweep_toolcall_xml_leak.TestRunApplyStoreMutationPreflight``
+    (task 3686), which is the in-repo precedent for this contract.
+
+    ``run`` stamps its targets in a sequential loop through ``stamp_one``,
+    whose write sits inside a per-target ``try/except Exception`` that files
+    the failure as an ``outcome: 'error'`` row and carries on.
+    ``StoreMutationUnavailable`` subclasses ``RuntimeError``, so a probe at
+    ``stamp_one``'s own ``--apply`` gate would be swallowed by that handler:
+    ``run`` would return a normally-shaped report and a success-ish exit code
+    while every target had been attempted against a store this process cannot
+    write a history for. Only a run-wide probe ahead of the scroll bounds that.
+    """
+
+    def _service(self) -> AsyncMock:
+        """Two stampable targets, so one-probe-per-RUN is distinguishable from
+        one-probe-per-target."""
+        service = _run_service()
+        service.seed(M1, M2)
+        return service
+
+    def _gates(self) -> tuple:
+        return (
+            _gate('topic-one', members=(M1,), gate_task_id='9998'),
+            _gate('topic-two', members=(M2,), gate_task_id='9999'),
+        )
+
+    async def _run(self, service, *, apply: bool):
+        return await _mod.run(
+            service,
+            projects=('dark_factory',),
+            apply=apply,
+            calibration_rows=[],
+            registry=_registry(),
+            gate_manifest=self._gates(),
+        )
+
+    @staticmethod
+    def _deny(monkeypatch):
+        """Rig the preflight to refuse, as it would inside an agent sandbox."""
+        def _raise(*_args, **_kwargs):
+            raise _mod.StoreMutationUnavailable('SENTINEL-store-unwritable')
+
+        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', _raise)
+
+    @staticmethod
+    def _fail_closed_records(caplog) -> list:
+        """The guard site's OWN diagnosis.
+
+        ``main`` has NO blanket handler here -- it hands ``run`` straight to
+        ``asyncio.run`` -- so the refusal exits as an uncaught traceback and
+        this ERROR record is the ONLY place the operator is told what was
+        refused and what to do instead. Pinned on the fail-closed marker and
+        the remedy noun ONLY, so every other word stays free to reword.
+
+        Asserting on message CONTENT is deliberate, and is the narrow exception
+        to the repo's don't-pin-guard-message-prose norm (task 3799): the record
+        this test is about is defined BY its content -- mere record-existence
+        would still pass if the whole diagnosis were replaced by "boom",
+        precisely the regression this exists to catch. Verified non-vacuous:
+        mutating the marker in the script turns this assertion red (task 4127
+        amendment).
+        """
+        return [
+            rec for rec in caplog.records
+            if rec.name == 'retro_stamp_topics'
+            and rec.levelname == 'ERROR'
+            and 'NOT started (fail-closed)' in rec.getMessage()
+            and 'MCP server' in rec.getMessage()
+        ]
+
+    @pytest.mark.asyncio
+    async def test_apply_performs_zero_mutations_when_the_store_is_unwritable(
+        self, monkeypatch
+    ):
+        """The whole point: refuse to start rather than half-complete.
+
+        The refusal must PROPAGATE. Swallowed at ``stamp_one``'s gate it would
+        become N ``outcome: 'error'`` rows inside a report that otherwise looks
+        like a completed sweep.
+        """
+        self._deny(monkeypatch)
+        service = self._service()
+
+        with pytest.raises(
+            _mod.StoreMutationUnavailable, match='SENTINEL-store-unwritable'
+        ):
+            await self._run(service, apply=True)
+
+        service.update_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_guard_sits_before_every_backend_read(self, monkeypatch):
+        """It aborts without a single round-trip: source (1)'s canonical scroll
+        is not paid for by a run that was never going to be allowed to stamp."""
+        self._deny(monkeypatch)
+        service = self._service()
+
+        with pytest.raises(_mod.StoreMutationUnavailable):
+            await self._run(service, apply=True)
+
+        service.get_memories_by_metadata.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_dry_run_is_never_gated_on_write_capability(self, monkeypatch):
+        """A rehearsal withholds only the writes, so it must not require the
+        ability to write -- the report stays obtainable from anywhere, with the
+        deny still installed."""
+        self._deny(monkeypatch)
+        service = self._service()
+
+        report = await self._run(service, apply=False)
+
+        assert report['apply'] is False
+        assert report['outcomes'].get('would_stamp') == 2
+        service.update_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_apply_is_unchanged_when_the_preflight_passes(self, monkeypatch):
+        """Happy path: a writable environment stamps exactly as before."""
+        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', lambda **_kw: None)
+        service = self._service()
+
+        report = await self._run(service, apply=True)
+
+        assert report['apply'] is True
+        assert report['outcomes'].get('stamped') == 2
+        assert service.update_memory.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_the_probe_names_the_operation_being_gated(self, monkeypatch):
+        """The refusal has to be attributable in a log, so the operation string
+        identifies this script and its mutating mode -- and with TWO stampable
+        targets in the manifest it is still probed once for the RUN, not once
+        per ``stamp_one`` call."""
+        calls: list[dict] = []
+        monkeypatch.setattr(
+            _mod, 'assert_store_mutation_allowed', lambda **kw: calls.append(kw)
+        )
+        service = self._service()
+
+        report = await self._run(service, apply=True)
+
+        assert report['outcomes'].get('stamped') == 2
+        assert len(calls) == 1, 'probed ONCE per run, not once per target'
+        assert 'retro_stamp_topics' in calls[0]['operation']
+        assert '--apply' in calls[0]['operation']
+
+    @pytest.mark.asyncio
+    async def test_the_refusal_is_loud(self, monkeypatch, caplog):
+        """The guard site logs its own fail-closed diagnosis before raising.
+
+        Nothing downstream will: ``main`` hands ``run`` to ``asyncio.run`` with
+        no handler, so without this record the operator sees a bare traceback
+        naming an exception class and no remedy. It is emitted through a
+        logger rather than ``print`` precisely so it stays off stdout, which
+        this script reserves for its machine-read markdown/JSON report.
+        """
+        self._deny(monkeypatch)
+        service = self._service()
+
+        with (
+            caplog.at_level(logging.ERROR),
+            pytest.raises(_mod.StoreMutationUnavailable),
+        ):
+            await self._run(service, apply=True)
+
+        assert self._fail_closed_records(caplog), (
+            'nothing else explains this traceback -- the guard site must log '
+            'the fail-closed diagnosis before raising; got: '
+            f'{[rec.getMessage() for rec in caplog.records]}'
+        )
+        service.update_memory.assert_not_awaited()

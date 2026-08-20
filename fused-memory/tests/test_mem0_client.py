@@ -5,12 +5,13 @@ import contextlib
 import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 from _fm_helpers import QDRANT_URL, collection_vector_size, qdrant_skipif
 from qdrant_client import QdrantClient
 from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedResponse
 
-from fused_memory.backends.mem0_client import Mem0Backend
+from fused_memory.backends.mem0_client import Mem0Backend, is_missing_collection_error
 from fused_memory.models.scope import Scope
 
 # Sentinel distinguishing "caller passed vector=None" (model a Qdrant point
@@ -1317,6 +1318,86 @@ class TestMem0BackendUpdate:
             'expected no non-None metadata kwarg when caller omits it, got '
             f'{call.kwargs.get("metadata")!r}'
         )
+
+
+class TestIsMissingCollectionError:
+    """`is_missing_collection_error` tells a genuinely-absent Qdrant collection
+    ("zero memories" — a true empty result) apart from a real backend failure
+    that callers must still surface per no-silent-fail (task 2949).
+
+    step-1 (RED): the predicate does not exist yet.
+    """
+
+    def test_missing_collection_404_is_true(self):
+        """Qdrant's stable missing-collection 404 is the ONLY matching shape."""
+        exc = UnexpectedResponse(
+            404,
+            'Not Found',
+            b"Collection `fused_solar_challenge` doesn't exist!",
+            httpx.Headers(),
+        )
+        assert is_missing_collection_error(exc) is True
+
+    def test_non_404_unexpected_response_is_false(self):
+        """A 500 is a real backend failure, not an empty collection."""
+        exc = UnexpectedResponse(500, 'Internal Server Error', b'boom', httpx.Headers())
+        assert is_missing_collection_error(exc) is False
+
+    def test_unrelated_404_is_false(self):
+        """The status code alone is NOT enough — the message must name a
+        collection.
+
+        Qdrant answers 404 for several absent resources, and only the missing
+        COLLECTION means "zero memories".  Reading any other 404 as an empty
+        result would be exactly the silent fail-soft this predicate exists to
+        avoid, so widening the match to `status_code == 404` must fail here.
+        """
+        exc = UnexpectedResponse(
+            404,
+            'Not Found',
+            b'{"status":{"error":"Not found: Point 42 does not exist"}}',
+            httpx.Headers(),
+        )
+        assert is_missing_collection_error(exc) is False
+
+    def test_missing_snapshot_404_is_false(self):
+        """Boundary on the phrase itself: Qdrant words a missing SNAPSHOT with
+        the same "doesn't exist!" wording, so the phrase alone cannot decide.
+        """
+        exc = UnexpectedResponse(
+            404,
+            'Not Found',
+            b"Snapshot `daily-2026-08-09` doesn't exist!",
+            httpx.Headers(),
+        )
+        assert is_missing_collection_error(exc) is False
+
+    def test_str_content_is_decoded_leniently(self):
+        """`.content` is typed bytes but assigned verbatim by qdrant_client, so
+        an already-decoded str must still match rather than crash the caller's
+        error path.
+        """
+        exc = UnexpectedResponse(
+            404,
+            'Not Found',
+            "Collection `fused_solar_challenge` doesn't exist!",  # type: ignore[arg-type]
+            httpx.Headers(),
+        )
+        assert is_missing_collection_error(exc) is True
+
+    def test_none_content_is_false(self):
+        """A 404 carrying no body proves nothing about a collection, and must
+        not blow up the predicate on the way to returning False.
+        """
+        exc = UnexpectedResponse(404, 'Not Found', None, httpx.Headers())  # type: ignore[arg-type]
+        assert is_missing_collection_error(exc) is False
+
+    def test_generic_exception_is_false(self):
+        assert is_missing_collection_error(RuntimeError('qdrant down')) is False
+
+    def test_timeout_error_is_false(self):
+        """A timeout must keep propagating — it is not evidence of 'no data'."""
+        assert is_missing_collection_error(TimeoutError()) is False
 
 
 # ---------------------------------------------------------------------------
