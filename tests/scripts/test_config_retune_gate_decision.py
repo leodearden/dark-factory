@@ -54,7 +54,12 @@ from __future__ import annotations
 import pathlib
 
 import pytest
-from orchestrator.config import OrchestratorConfig
+import yaml
+from orchestrator.config import (
+    OrchestratorConfig,
+    _discover_module_configs,
+    _load_defaults,
+)
 
 from orchestrator import verify, verify_plan
 
@@ -211,4 +216,129 @@ def test_merge_lane_already_gates_a_config_only_retune(
         'predicate is the only thing that can force the full gate. Task 3886 '
         f'wired it in the git: block of {DF_CONFIG_NAME}; restore that entry '
         'rather than deleting this assertion'
+    )
+
+
+def test_unit_tests_read_the_operational_lock_depth_not_the_package_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The binding arm: option (2) is REJECTED, and this is what says so.
+
+    Option (2) was to narrow ``orchestrator/tests/conftest.py``'s autouse
+    ``_isolate_orch_config`` so unit tests read the package-bundled DECLARED
+    defaults instead of this project's OPERATIONAL config. That is declined.
+    The heal commit for the incident (``c54d7cf81c``) argues against it in its
+    own body: the binding is deliberate "precisely so tests see real
+    operational values", and the three tests that broke failed LOUDLY via
+    self-validating preconditions — "the precondition worked as designed; the
+    fixture data was stale". Under option (2) those same tests would have
+    PASSED at a declared depth the factory does not run at, trading a loud
+    failure for a silent wrong-test. That is against INV-2
+    ``structured-facts-at-failure`` and the repo's loud-over-silent norm, and
+    ``conftest.py`` already ships the sanctioned escape hatch
+    (``code_default_config``, re-pointing ``ORCH_CONFIG_PATH`` at a
+    guaranteed-absent file) for the minority of tests that genuinely want
+    package defaults.
+
+    This test is the executable statement of the contract that decision
+    PRESERVES: a config load resolves the OPERATIONAL value, not the declared
+    one. If option (2) is ever silently adopted, this fails.
+
+    WHY THE DIFFER-CHECK IS NOT REDUNDANT. Asserting only that the resolved
+    depth equals the operational declaration would pass VACUOUSLY if a future
+    retune set the operational value back to the package default — equal to
+    both, proving nothing about which layer won. The pair is what makes the
+    layering observable at all.
+
+    Written in the knob-agnostic form throughout: it names neither the
+    operational value nor the package default, reading both live. Naming
+    either is the exact defect this whole task decides about.
+    """
+    operational_declared = yaml.safe_load(ROOT_CONFIG_PATH.read_text())['lock_depth']
+    package_declared = _load_defaults()['lock_depth']
+
+    # (1) The layering is observable at all: the two layers genuinely differ.
+    assert operational_declared != package_declared, (
+        f'{DF_CONFIG_NAME} and the package-bundled defaults.yaml both declare '
+        f'lock_depth={operational_declared!r}, so a resolved value equal to the '
+        'operational declaration would ALSO equal the package default and this '
+        'guard could not tell which layer won. That makes assertion (2) below '
+        'vacuous rather than false. This is not a failure of the decision — it '
+        'means the binding is no longer OBSERVABLE here and this guard needs a '
+        'different lever, not that the guard should be deleted'
+    )
+
+    # (2) A real load through the production loader resolves the OPERATIONAL
+    #     layer — the contract option (2) would have inverted.
+    cfg = _root_config(monkeypatch)
+    assert cfg.lock_depth == operational_declared, (
+        f'a config loaded through the production loader with ORCH_CONFIG_PATH '
+        f'anchored at {DF_CONFIG_NAME} resolves lock_depth={cfg.lock_depth!r}, '
+        f'but that file declares {operational_declared!r}. The operational layer '
+        'must win over the package-bundled defaults.yaml; unit tests reading '
+        'OPERATIONAL rather than DECLARED values is the contract task 3886 '
+        'decided to PRESERVE (option (2) rejected). Re-take that decision in the '
+        f'DECIDED block in {DF_CONFIG_NAME} rather than editing this assertion'
+    )
+    assert cfg.lock_depth != package_declared, (
+        f'the production loader resolved lock_depth={cfg.lock_depth!r}, which is '
+        f'the package-bundled defaults.yaml value ({package_declared!r}) and not '
+        f'{DF_CONFIG_NAME}\'s ({operational_declared!r}). The operational binding '
+        'has lapsed: tests are now exercising a depth the factory does not run '
+        'at, silently — precisely the failure mode option (2) would have '
+        'institutionalised and which task 3886 rejected'
+    )
+
+
+def test_every_discovered_module_config_is_reachable_at_the_operational_lock_depth(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The retune-coherence arm: the generic invariant a retune DOWNWARD breaks silently.
+
+    ``load_config`` only WARNS when a discovered module-config prefix is deeper
+    than ``lock_depth`` — it does not fail. The reason it can only warn is that
+    such a config is HALF-applied rather than unapplied: its test/lint commands
+    still run under full verification, while the scheduler (``_limit_for``) and
+    workflow (``_resolve_module_configs``) truncate module paths to
+    ``lock_depth`` components via ``normalize_lock``, so its scheduling limits
+    (``max_per_module``, ``module_overrides``) are silently ignored. A log line
+    nobody reads is the whole exposure.
+
+    This is the same reachability assertion
+    ``test_tests_scripts_module_config.py`` makes for the single
+    ``tests/scripts`` prefix, GENERALISED to every prefix the production
+    discovery walk returns — so a retune of ``lock_depth`` downward is caught
+    for ANY module, not only the one that happened to have a guard.
+
+    It reads ``cfg.lock_depth`` live and names no constant, so the next retune
+    of that knob falsifies nothing written here. The depth is computed with
+    ``prefix.count('/') + 1`` — the production expression from ``load_config``'s
+    own warn branch, copied rather than re-derived so the guard cannot disagree
+    with the warning it upgrades.
+    """
+    cfg = _root_config(monkeypatch)
+    discovered = _discover_module_configs(REPO_ROOT)
+
+    assert discovered, (
+        'config._discover_module_configs found NO module configs under '
+        f'{REPO_ROOT}, so this guard would pass vacuously. That is itself a '
+        'routing failure: an empty module_configs list is the sole trigger for '
+        "verify._build_fallback_config's __fallback__ branch"
+    )
+
+    unreachable = {
+        prefix: prefix.count('/') + 1
+        for prefix in discovered
+        if prefix.count('/') + 1 > cfg.lock_depth
+    }
+    assert not unreachable, (
+        f'module config(s) {unreachable!r} have a prefix DEEPER than the '
+        f'operational lock_depth={cfg.lock_depth}. load_config only WARNS about '
+        'this, so such a config is silently HALF-applied: its test/lint commands '
+        'still run under full verification while the scheduler (_limit_for) and '
+        'workflow (_resolve_module_configs) truncate module paths via '
+        'normalize_lock, so its max_per_module and module_overrides are ignored. '
+        f'Either move the orchestrator.yaml up, or raise lock_depth in '
+        f'{DF_CONFIG_NAME} — do not weaken this assertion. Discovered prefixes: '
+        f'{sorted(discovered)}'
     )
