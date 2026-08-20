@@ -580,3 +580,141 @@ def census_project(project_root: str) -> ProjectCensus:
             event_log_path=str(runs_db),
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# The report.
+#
+# SCHEMA_VERSION 1 — the initial shape: schema_version, params, projects
+# (per-project totals plus per-axis and eight-cell counts), records (the
+# COMPLETE population, never truncated), coverage. Bump this and record what
+# changed right here, the way census_memory_metadata.py:446-458 does, so a
+# consumer reading an older artifact can tell what it is looking at.
+# ---------------------------------------------------------------------------
+
+SCHEMA_VERSION = 1
+
+# The vocabulary, ordered. Iterating THIS rather than the observed data is what
+# makes a zero-valued cell present rather than absent — a missing key must
+# never be readable as a zero.
+_STATUS_CLASSES = (STATUS_TERMINAL, STATUS_NON_TERMINAL)
+_RECONCILIATIONS = (RECONCILED, NEVER_RECONCILED)
+_WIPE_SIGNATURES = (POST_WIPE_OVERWRITE, NO_PRIOR_SCOPE)
+
+# THE ARTIFACT DELIBERATELY CARRIES NO generated_at, timestamp OR SHA, and a
+# test walks the built structure to keep it that way. All three committed
+# plans/*.json artifacts in this repo follow the same convention: with a clock
+# read in the file every regeneration would diff dirty, destroying exactly the
+# signal task 4525 asks for — "re-running the script reproduces the counts",
+# checkable by `git diff --exit-code`. Provenance is the params block's
+# regen_command instead. Please do not "fix" this back in.
+_REGEN_COMMAND_HEAD = "python scripts/census_tagger_debris.py"
+
+
+def _cell_key(record: CensusRecord) -> str:
+    return f"{record.status_class}|{record.reconciliation}|{record.wipe_signature}"
+
+
+def _record_to_dict(record: CensusRecord) -> dict:
+    return {
+        "project_id": record.project_id,
+        "tag": record.tag,
+        "task_id": record.task_id,
+        "status": record.status,
+        "files_tagged_at": record.files_tagged_at,
+        "status_class": record.status_class,
+        "reconciliation": record.reconciliation,
+        "wipe_signature": record.wipe_signature,
+        "reconciled_by": record.reconciled_by._asdict(),
+        "preceded_by": record.preceded_by._asdict(),
+        "merge_signature": record.merge_signature,
+        "metadata_files": list(record.metadata_files),
+    }
+
+
+def _report_sort_key(record: CensusRecord) -> tuple[str, int, str]:
+    """(project_id asc, NUMERIC task id asc), with a fallback that cannot raise."""
+    try:
+        return (record.project_id, int(record.task_id), "")
+    except (TypeError, ValueError):
+        return (record.project_id, 0, str(record.task_id))
+
+
+def build_report(censuses: list[ProjectCensus]) -> dict:
+    """Assemble the committed artifact's JSON structure. PURE — no I/O, no clock.
+
+    Ordering is total and derived from the data, never from the caller's
+    argument order: projects sort by ``project_id``, records by
+    ``(project_id, numeric task id)``. Passing the same censuses in a different
+    order therefore yields a byte-identical dump, which is what lets the
+    artifact be regenerated and diffed as a reproducibility check.
+
+    The ``records`` array is the COMPLETE population and is never truncated;
+    only the markdown twin is capped.
+    """
+    ordered = sorted(censuses, key=lambda census: census.project_id)
+
+    projects: dict[str, dict] = {}
+    for census in ordered:
+        # Annotated dict[str, int] rather than left to inference: the
+        # vocabulary constants are string LITERALS, so an unannotated
+        # dict.fromkeys narrows the key type to those literals and then
+        # rejects the plain `str` a CensusRecord field carries.
+        cells: dict[str, int] = {
+            f"{status}|{reconciliation}|{signature}": 0
+            for status in _STATUS_CLASSES
+            for reconciliation in _RECONCILIATIONS
+            for signature in _WIPE_SIGNATURES
+        }
+        status_counts: dict[str, int] = dict.fromkeys(_STATUS_CLASSES, 0)
+        reconciliation_counts: dict[str, int] = dict.fromkeys(_RECONCILIATIONS, 0)
+        signature_counts: dict[str, int] = dict.fromkeys(_WIPE_SIGNATURES, 0)
+        for record in census.records:
+            status_counts[record.status_class] += 1
+            reconciliation_counts[record.reconciliation] += 1
+            signature_counts[record.wipe_signature] += 1
+            cells[_cell_key(record)] += 1
+
+        projects[census.project_id] = {
+            "project_root": census.project_root,
+            "total_tasks": census.coverage.total_tasks,
+            "stamped_records": census.coverage.stamped_records,
+            "event_log_read": census.coverage.event_log_read,
+            "status_class": status_counts,
+            "reconciliation": reconciliation_counts,
+            "wipe_signature": signature_counts,
+            "cells": cells,
+        }
+
+    records = sorted(
+        (record for census in ordered for record in census.records),
+        key=_report_sort_key,
+    )
+    roots = [census.project_root for census in ordered]
+
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "params": {
+            "project_roots": roots,
+            "stamp_key": "metadata.files_tagged_at",
+            "classification": {
+                "status_class": list(_STATUS_CLASSES),
+                "reconciliation": list(_RECONCILIATIONS),
+                "wipe_signature": list(_WIPE_SIGNATURES),
+            },
+            "consumers": ["dark_factory 3113 P4a", "dark_factory 3427"],
+            "regen_command": " ".join(
+                [_REGEN_COMMAND_HEAD, *(f"--project-root {root}" for root in roots)]
+            ),
+        },
+        "projects": projects,
+        "records": [_record_to_dict(record) for record in records],
+        "coverage": {
+            "projects_swept": len(ordered),
+            "projects_without_event_log": [
+                census.project_id for census in ordered if not census.coverage.event_log_read
+            ],
+            "total_tasks": sum(census.coverage.total_tasks for census in ordered),
+            "stamped_records": sum(census.coverage.stamped_records for census in ordered),
+        },
+    }
