@@ -330,6 +330,42 @@ class TestRenderCycleSummarySection:
         assert m.STAGE2_CYCLE_SUMMARY_RECON_POOL in text
         assert m.STAGE2_CYCLE_SUMMARY_RECON_POOL == 'stage2_cycle_summary'
 
+    def test_tombstone_claim_is_not_universal(self):
+        """Regression pin (task 4421): the false universal quantifier must be
+        gone. 'Any recon-initiated Mem0 deletion now leaves a TOMBSTONE'
+        licensed the invalid contrapositive 'no tombstone => not deliberately
+        deleted => data loss', which manufactures phantom data-loss reports
+        (recon gate 165 / esc-165-1, task 3041) — six of the nine production
+        Mem0 delete call sites write no tombstone at all."""
+        text = m.render_cycle_summary_section()
+        assert 'Any recon-initiated Mem0 deletion' not in text
+
+    def test_tombstone_claim_names_its_deleters(self):
+        """The scoped claim is single-sourced from MEM0_TOMBSTONE_DELETERS —
+        every entry must appear in the rendered text, so the prose cannot
+        silently disagree with the step-1 drift ratchet."""
+        text = m.render_cycle_summary_section()
+        for deleter in m.MEM0_TOMBSTONE_DELETERS:
+            assert deleter in text, f'{deleter!r} missing from render_cycle_summary_section()'
+
+    def test_tombstone_absence_is_explicitly_not_evidence(self):
+        """The contrapositive retraction must be present: absence of a
+        tombstone is NOT evidence a record wasn't deliberately deleted.
+        Pinned via load-bearing tokens (this file's stated convention, see
+        module docstring), not a verbatim sentence."""
+        text = m.render_cycle_summary_section()
+        assert 'absence' in text.lower()
+        # The untombstoned MCP delete_memory tool is the load-bearing gap —
+        # it's what the recon stages' own flag-reaping instructions call.
+        assert 'delete_memory' in text
+
+    def test_tombstone_true_half_is_retained(self):
+        """The surviving true half must not be lost in the rewrite: a
+        tombstone IS surfaced by get_memory_by_id on its not-found branch."""
+        text = m.render_cycle_summary_section()
+        assert 'tombstone' in text
+        assert 'get_memory_by_id' in text
+
 
 # --------------------------------------------------------------------------- #
 # render_execution_class_section (step-13/14)
