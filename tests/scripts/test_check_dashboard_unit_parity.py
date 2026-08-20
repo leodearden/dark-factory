@@ -3054,6 +3054,10 @@ def test_every_parity_call_site_refuses_a_status_the_checker_did_not_produce(
 # and only one of them stays correct when the helper changes.
 
 
+# A definition of the helper, in either of bash's two spellings.
+_DEFINITION_RE = re.compile(r"(?:function\s+)?_parity_verdict\s*(?:\(\s*\))?\s*\{")
+
+
 def test_the_verdict_helper_is_defined_exactly_once():
     """One definition, or the sites do not share a classifier at all.
 
@@ -3062,12 +3066,19 @@ def test_the_verdict_helper_is_defined_exactly_once():
     bash's last-definition-wins rule, which is precisely the two-shapes state
     the extraction exists to remove. The behavioural table slices the FIRST
     definition, so a divergent second copy would not show up there.
+
+    Counted after `lstrip()`, and allowing the `function` keyword: an INDENTED
+    redefinition — inside an `if` block above the last three sites, say — is
+    still in the one shared scope and still wins for everything below it.
+    Measured: anchoring at column 0 kept the suite green with exactly such a
+    copy in place.
     """
     text = setup_host_text()
     definitions = [
         lineno
         for lineno, line in enumerate(text.splitlines(), start=1)
-        if not line.lstrip().startswith("#") and line.startswith("_parity_verdict()")
+        if not line.lstrip().startswith("#")
+        and _DEFINITION_RE.match(line.lstrip())
     ]
 
     assert len(definitions) == 1, (
@@ -3083,17 +3094,24 @@ def test_the_verdict_helper_precedes_every_call_site():
     """Defined above the first site, because bash resolves a function at CALL time.
 
     A definition placed after a call site is not a style problem: the site runs
-    `_parity_verdict: command not found`, which under `set -e` inside a command
-    substitution yields an empty verdict and a non-zero status, and the gate
-    reports on a token that was never produced. The five sites share one shell
-    scope, so ONE position satisfies all of them.
+    `_parity_verdict: command not found`, and under `set -e` that ABORTS the
+    installer at that line (measured: `set -euo pipefail; v="$(missing_fn a)"`
+    exits 127). Bring-up dies partway through, mid-section, with whatever the
+    earlier sections already wrote to the host left in place. The five sites
+    share one shell scope, so ONE position satisfies all of them.
     """
     text = setup_host_text()
-    definition = next(
-        index
-        for index, line in enumerate(text.splitlines(), start=1)
-        if not line.lstrip().startswith("#") and line.startswith("_parity_verdict()")
+    definitions = [
+        lineno
+        for lineno, line in enumerate(text.splitlines(), start=1)
+        if not line.lstrip().startswith("#")
+        and _DEFINITION_RE.match(line.lstrip())
+    ]
+    assert definitions, (
+        "`_parity_verdict` is not defined anywhere in setup-host.sh, so every "
+        "call site below would abort the installer with `command not found`."
     )
+    definition = definitions[0]
     first_site = min(lineno for lineno, _, _ in _parity_call_sites())
 
     assert definition < first_site, (
@@ -3116,20 +3134,49 @@ def test_every_parity_call_site_routes_through_the_shared_verdict_helper(
 
     Collected from the sweep, so a sixth site added tomorrow is held to this
     rule without anyone remembering to add it here.
+
+    Matched as a CALL, not as a substring. `"_parity_verdict" in block` is
+    vacuous here and was measured so: every site declares a
+    `_<gate>_parity_verdict` variable, and each of those names CONTAINS
+    `_parity_verdict`, so the declaration alone satisfies a substring test
+    while the site classifies by hand underneath. Comments are stripped for
+    the same reason — a site whose only mention of the helper is a comment
+    saying it should use one is exactly the state this forbids.
     """
-    assert "_parity_verdict" in block, (
-        f"The parity call site at setup-host.sh:{lineno} ({checker}) does not "
-        "name `_parity_verdict`. It is classifying the checker's output by "
-        "hand, which is the two-shapes-for-one-rule state the shared helper "
-        f"exists to remove.\n{block}"
+    code = "\n".join(
+        line for line in block.splitlines() if not line.lstrip().startswith("#")
+    )
+    called = re.search(r"(?:^|[\s;&|(`]|\$\()_parity_verdict\b", code, re.MULTILINE)
+
+    assert called is not None, (
+        f"The parity call site at setup-host.sh:{lineno} ({checker}) never "
+        "CALLS `_parity_verdict` (a `_<gate>_parity_verdict` variable name "
+        "does not count). It is classifying the checker's output by hand, "
+        "which is the two-shapes-for-one-rule state the shared helper exists "
+        f"to remove.\n{block}"
     )
 
 
 # A bare status read, e.g. `[ "$_fm_parity_exit" -eq 2 ]`. Matched on the
-# variable, not on `-eq` alone: `_orch_install_blocked` and the verdict token
-# comparisons are legitimate arithmetic/string tests in these same blocks, and
-# forbidding the operator outright would forbid those too.
-_BARE_STATUS_READ_RE = re.compile(r"\$\{?_\w*parity_exit\}?\"?\s*-eq\b")
+# VARIABLE, not on the operator alone: `_orch_install_blocked` and the verdict
+# token comparisons are legitimate arithmetic/string tests in these same
+# blocks, and forbidding the operators outright would forbid those too.
+#
+# Every way bash can interrogate that variable, not just `-eq`. An earlier
+# version matched `-eq` only, and `[ "$_x_parity_exit" = 2 ]`, `-ne`, a `case`
+# over the status and an arithmetic `(( ))` all walked past it — a guard whose
+# docstring claims the status is read in exactly one place has to mean every
+# spelling of "read", or the site just picks another one.
+#
+# `==?` deliberately carries no trailing `\b`: a word boundary after `=` never
+# matches, which silently empties that alternative while the test keeps
+# passing. The interrogation forms are the two that do not spell the variable
+# with a leading `$`.
+_BARE_STATUS_READ_RE = re.compile(
+    r"case\s+\"?\$\{?_\w*parity_exit\}?\"?"           # case "$_x_parity_exit" in
+    r"|\(\(\s*[^)\n]*_\w*parity_exit\b"               # (( _x_parity_exit == 2 ))
+    r"|\$\{?_\w*parity_exit\}?\"?\s*(?:-(?:eq|ne|gt|lt|ge|le)\b|==?)"
+)
 
 
 @pytest.mark.parametrize(

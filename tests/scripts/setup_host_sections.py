@@ -274,8 +274,14 @@ def usage_error_checker(script_name: str, usage_flags: str, rejected: str) -> st
     One of the two ways a parity checker exits 2 without having checked
     anything (the other is `python3` refusing to open a script that was renamed
     or moved). Its stderr deliberately carries bracketed tokens — `[-h]`,
-    `[--fix]` — because a marker match that is not line-anchored would read
-    those as a report and hand the gate a verdict the checker never gave.
+    `[--fix]` — so that a gate matching brackets LOOSELY rather than matching
+    its checker's specific `[<tag>]` would read those as a report and hand the
+    gate a verdict the checker never gave.
+
+    (That hazard used to be worded as "a marker match that is not
+    line-anchored". No gate is line-anchored any more — all five now test
+    containment of one specific tag — but the stub is still exactly the right
+    imposter, for the reason above: it emits no tag at all.)
     """
     return (
         "import sys\n"

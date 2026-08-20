@@ -745,7 +745,9 @@ def _run_gate(
 # The argparse-shaped stub: exit 2, usage-shaped stderr, and no report marker —
 # what renaming a flag in a future refactor would actually produce. The real
 # flag spellings are kept because their bracketed tokens ([-h], [--fix]) are
-# precisely what a non-line-anchored marker match would misread as a report.
+# precisely what a LOOSE bracket match would misread as a report; this gate now
+# tests containment of its own [fused_memory_unit_parity] tag, which the stub
+# never emits.
 _USAGE_ERROR_CHECKER = usage_error_checker(
     CHECKER_PATH.name,
     "[-h] [--installed INSTALLED] [--template TEMPLATE] [--fix]",

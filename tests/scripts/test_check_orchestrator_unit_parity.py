@@ -1584,10 +1584,19 @@ def test_parity_gate_distinguishes_absent_from_a_finding():
     finding_arm = _verdict_arm(block, "finding")
     assert finding_arm is not None, _missing("finding")
 
-    assert absent_arm.start() != finding_arm.start(), (
+    # Compared by END offset, not start. _verdict_arm accepts a multi-pattern
+    # case label (it has to — the finding arm is spelled `finding | *)`), so
+    # against a COLLAPSED single arm `absent | finding | *)` both searches
+    # match, each anchored on the whitespace before its own label, and their
+    # STARTS differ while naming one and the same branch. Measured: comparing
+    # starts passed with the two arms folded together, which is the whole
+    # defect this test exists to catch and which main's `-eq 2` version did
+    # catch. Two labels on one arm end at the same `)`; two real arms do not.
+    assert absent_arm.end() != finding_arm.end(), (
         "The orchestrator parity branch reaches the same arm for `absent` and "
-        "`finding`, collapsing the distinction this test exists to hold.\n"
-        + block
+        "`finding`, collapsing the distinction this test exists to hold. A "
+        "fresh host with no orchestrator units would be reported as drift and "
+        "have its install refused.\n" + block
     )
     # Non-fatal: the gate reports and declines to install, but must never
     # abort setup-host.sh itself — five units are knowingly red on this host
