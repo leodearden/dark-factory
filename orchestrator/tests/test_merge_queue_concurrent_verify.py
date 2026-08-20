@@ -441,6 +441,90 @@ def _suppressed_result_wait_methods(source: str) -> dict[str, set[str]]:
     return result
 
 
+def _unguarded_worker_teardown_methods(source: str) -> list[str]:
+    """Statically scan *source* for the esc-3980-4 leak invariant recorded
+    at test_merge_speculation.py:1972-2003 (`_stop_worker`'s docstring):
+    `wait_responsive` gives up by raising `_pytest.outcomes.Failed` (a
+    ``BaseException`` subclass), so on a straight-line body a give-up --
+    like a mid-body ``assert`` -- skips ``worker.stop()`` entirely and
+    leaks a live ``SpeculativeMergeWorker`` plus its run task into
+    pytest-asyncio teardown. That leak is why one red test used to cascade
+    into unrelated failures elsewhere in the session (task 4219).
+
+    For each top-level ``Test*`` class, reports every ``test_*`` method
+    that calls ``wait_responsive(...)`` AND calls ``worker.stop()`` from
+    somewhere NOT inside a ``finally:`` block, as a sorted list of
+    ``'ClassName::method_name'`` strings. Deliberately scoped to methods
+    that call ``wait_responsive``: this module has ~25 pre-existing
+    straight-line teardown sites that have not been migrated yet, and this
+    guard's job is to stop the migrated set from regressing, not to flag
+    every unmigrated one. A method calling ``wait_responsive`` but never
+    ``worker.stop()`` at all is not reported either -- there is no stop
+    call to be unguarded.
+
+    Deliberately narrow to a variable literally named ``worker``: this
+    module names the worker ``worker`` at every relevant site, and a false
+    NEGATIVE (missing an oddly-named variable) is the correct failure
+    direction for a guard whose job is to stop a known regression --
+    matching `_call_wait_budget`'s documented conservative-floor stance
+    above.
+
+    Must never raise: a crash here would fail the whole suite over an
+    unrelated edit to this file. Unparseable source returns [].
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+
+    def _is_wait_responsive_call(node: ast.AST) -> bool:
+        return (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == 'wait_responsive'
+        )
+
+    def _is_worker_stop_call(node: ast.AST) -> bool:
+        return (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == 'stop'
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == 'worker'
+        )
+
+    offenders: list[str] = []
+    for class_node in ast.iter_child_nodes(tree):
+        if not (isinstance(class_node, ast.ClassDef) and class_node.name.startswith('Test')):
+            continue
+        for method in class_node.body:
+            if not (
+                isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and method.name.startswith('test_')
+            ):
+                continue
+            if not any(_is_wait_responsive_call(n) for n in ast.walk(method)):
+                continue
+
+            stop_calls = [n for n in ast.walk(method) if _is_worker_stop_call(n)]
+            if not stop_calls:
+                continue
+
+            guarded: set[ast.AST] = set()
+            for try_node in ast.walk(method):
+                if not isinstance(try_node, ast.Try):
+                    continue
+                for final_stmt in try_node.finalbody:
+                    for n in ast.walk(final_stmt):
+                        if _is_worker_stop_call(n):
+                            guarded.add(n)
+
+            if any(call not in guarded for call in stop_calls):
+                offenders.append(f'{class_node.name}::{method.name}')
+
+    return sorted(offenders)
+
+
 # task 3492: the pyproject-configured default per-test timeout ceiling that
 # every heavy-wait class in this module must clear. This is a hand-mirrored
 # copy of `[tool.pytest.ini_options].timeout` in orchestrator/pyproject.toml
