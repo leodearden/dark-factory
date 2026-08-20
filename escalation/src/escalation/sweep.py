@@ -405,11 +405,19 @@ def reap_orphan_locks(queue_dir: Path, *, apply: bool = True) -> int:
     # root at all.
     archived_stems = set(_build_archive_index(queue_dir / archive.ARCHIVE_SUBDIR))
 
+    # The `esc-` prefix is an explicit ALLOW-LIST, not a convenience: it is the
+    # D6 hard invariant (pinned by TestD6GlobInvariant) applied to this pass.
+    # Only escalation record ids and `esc-{task_id}.seq` counter ids ever take
+    # escalation_id_lock, so nothing outside the esc- namespace can be a sidecar
+    # this pass owns — any other `.json.lock` in the root belongs to a different
+    # subsystem and is none of our business, record or no record.
+    #
     # Materialize the glob before iterating so the directory scan completes
     # before any unlink occurs — mutating a directory during os.scandir/readdir
     # has unspecified behaviour on some filesystems and can cause subsequent
     # sibling entries to be skipped (mirrors reap_loose_archive_files()).
-    for path in list(queue_dir.glob('*.json.lock')):
+    for path in list(queue_dir.glob('esc-*.json.lock')):
+        # Sliced, not Path.stem: `.stem` strips only `.lock`, leaving `esc-1-1.json`.
         stem = path.name[: -len('.json.lock')]
         record_path = queue_dir / f'{stem}.json'
 
