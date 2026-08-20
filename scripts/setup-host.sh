@@ -129,7 +129,23 @@ docker compose -f "$COMPOSE_FILE" up -d falkordb qdrant
 
 # Wait for healthy
 for i in $(seq 1 30); do
-  if docker compose -f "$COMPOSE_FILE" exec -T falkordb redis-cli ping 2>/dev/null | grep -q PONG; then
+  # The verdict is read from the captured REPLY, not from a pipeline's exit
+  # status. `... ping | grep -q PONG` answers with the PRODUCER's status, which
+  # is a different question and gets this wrong two ways. `grep -q` exits on its
+  # first match and closes the read end, so a producer still writing dies of
+  # SIGPIPE and `pipefail` hands the `if` that 141; and the same conflation
+  # misreads any producer that emits PONG and then exits non-zero for reasons of
+  # its own (an exec whose status covers the whole run, not the one line asked
+  # about). Either way a live FalkorDB is reported as never healthy.
+  # `|| true` is load-bearing: without it the assignment is a simple command and
+  # `set -e` kills the bootstrap the moment docker is unavailable, where the old
+  # pipeline merely took the else branch. It also must not be `|| _out=""` — that
+  # throws away a reply the producer did write, preserving the bug. A producer
+  # that wrote nothing still yields no match, which is the not-healthy answer
+  # this loop already gave. (Measured: with 256KiB of trailing output the pipe
+  # form reports no PONG 30/30; this form reports PONG.)
+  _falkordb_ping_out="$(docker compose -f "$COMPOSE_FILE" exec -T falkordb redis-cli ping 2>/dev/null)" || true
+  if [[ "$_falkordb_ping_out" == *PONG* ]]; then
     ok "FalkorDB healthy"
     break
   fi
