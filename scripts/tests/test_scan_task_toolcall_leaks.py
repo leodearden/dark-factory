@@ -21,6 +21,7 @@ false-positive prose mentions (tasks 2938/2939) — not invented shapes.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -305,8 +306,17 @@ def test_format_json_empty_list_is_empty_array():
 
 SCRIPT = Path(__file__).parent.parent / "scan_task_toolcall_leaks.py"
 
+# Default wall-clock budget for a single CLI subprocess invocation below.
+# 10s was tight enough to flake under machine load (task 4217): concurrent
+# orchestrator agents can push interpreter startup + imports past 10s even
+# though the CLI under test behaves correctly (returncode/stderr already
+# correct at the moment the old budget expired). 60s gives real headroom
+# without materially slowing an idle-machine run; overridable via env for
+# further tuning without a code change.
+_CLI_TIMEOUT = float(os.environ.get("SCAN_TASK_TOOLCALL_LEAKS_TEST_TIMEOUT", "60"))
 
-def _run_cli(*args, timeout=10):
+
+def _run_cli(*args, timeout=_CLI_TIMEOUT):
     return subprocess.run(
         [sys.executable, str(SCRIPT), *args],
         capture_output=True,
