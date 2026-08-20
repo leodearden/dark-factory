@@ -240,6 +240,7 @@ class StartupSweepReport:
     sweep: SweepReport
     loose_reaped: int = 0
     pruned_dirs: int = 0
+    orphan_locks_reaped: int = 0
 
 
 def run_startup_sweep(
@@ -249,43 +250,56 @@ def run_startup_sweep(
     apply: bool = True,
     now: datetime | None = None,
 ) -> StartupSweepReport:
-    """Orchestrate sweep + loose-reap + prune at escalation server start.
+    """Orchestrate sweep + loose-reap + prune + lock-reap at escalation server start.
 
-    Runs three passes in sequence:
+    Runs four passes in sequence:
       1. sweep(queue_dir, apply=apply)       — root→archive relocation
       2. reap_loose_archive_files(…)         — archive top-level→dated subdir
       3. archive.prune_archive(…)            — drop subdirs beyond retention
+      4. reap_orphan_locks(…)                — unlink sidecar locks whose record
+                                               is in neither tier
+
+    Pass 4 runs LAST on purpose: records dropped by retention in pass 3 are dead
+    ids by the time it looks, so their sidecars are reaped in the SAME run rather
+    than lingering until the next restart.
 
     Logs one INFO summary line on the ``escalation.sweep`` logger.
 
     Args:
         queue_dir: Root queue directory.
         retention_days: Retention threshold forwarded to prune_archive.
-        apply: If False, dry-run all three passes (no disk mutations).
+        apply: If False, dry-run all four passes (no disk mutations).
         now: Reference datetime for prune_archive cutoff (defaults to live UTC).
 
     Returns:
-        StartupSweepReport with nested SweepReport plus loose_reaped and pruned_dirs.
+        StartupSweepReport with nested SweepReport plus loose_reaped, pruned_dirs
+        and orphan_locks_reaped.
     """
     queue_dir = Path(queue_dir)
     sweep_report = sweep(queue_dir, apply=apply)
     loose_reaped = reap_loose_archive_files(queue_dir, apply=apply)
     pruned_dirs = archive.prune_archive(queue_dir, retention_days, now=now) if apply else 0
+    # AFTER prune: a record evicted by retention just above is a dead id now, so
+    # its sidecar goes in this run.  It also means the archive index this pass
+    # builds is post-prune and cannot mistake an evicted record for a live one.
+    orphan_locks_reaped = reap_orphan_locks(queue_dir, apply=apply)
 
     report = StartupSweepReport(
         sweep=sweep_report,
         loose_reaped=loose_reaped,
         pruned_dirs=pruned_dirs,
+        orphan_locks_reaped=orphan_locks_reaped,
     )
     logger.info(
         'Startup sweep %s: archived=%d reconciled(root=%d archive=%d) '
-        'loose_reaped=%d pruned_dirs=%d pending=%d skipped=%d; root: %d → %d',
+        'loose_reaped=%d pruned_dirs=%d orphan_locks=%d pending=%d skipped=%d; root: %d → %d',
         'APPLIED' if apply else 'DRY-RUN',
         sweep_report.archived,
         sweep_report.reconciled_root_wins,
         sweep_report.reconciled_archive_wins,
         loose_reaped,
         pruned_dirs,
+        orphan_locks_reaped,
         sweep_report.untouched_pending,
         sweep_report.skipped_unparsable,
         sweep_report.root_before,
