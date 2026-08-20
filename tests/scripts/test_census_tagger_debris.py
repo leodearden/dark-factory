@@ -32,16 +32,23 @@ import sqlite3
 from pathlib import Path
 
 import pytest
+from audit_wiped_metadata_files import (
+    _EVENT_PLAN_SOURCES,
+    FIDELITY_FILE_LEVEL,
+    FIDELITY_LOCK_LEVEL,
+)
 from census_tagger_debris import (
     NEVER_RECONCILED,
     NO_PRIOR_SCOPE,
     POST_WIPE_OVERWRITE,
     RECONCILED,
+    SCOPE_EVENT_SOURCES,
     STATUS_NON_TERMINAL,
     STATUS_TERMINAL,
     ScopeEvent,
     _connect_readonly,
     classify_record,
+    load_scope_events,
     load_stamped_records,
 )
 
@@ -508,3 +515,174 @@ def test_the_censuss_own_opener_cannot_write(tmp_path):
             conn.execute("UPDATE tasks SET status = 'cancelled'")
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# load_scope_events — the timestamped event lens.
+#
+# This is the one place the census does NOT call the audit's own reader.
+# load_plan_files_from_events collapses each task to a single highest-fidelity
+# record and never selects ``timestamp``, and every census classification is a
+# comparison against that timestamp. The LENS DEFINITION — which event types
+# carry a scope, under which payload key, at what fidelity — nonetheless stays
+# single-sourced in the audit; only the query differs. The first test below is
+# what holds that line.
+# ---------------------------------------------------------------------------
+
+
+def test_scope_event_sources_are_derived_from_the_audits_table_not_re_spelled():
+    """INV-5: the census must expose no SECOND COPY of the event lens.
+
+    Checked by OBJECT IDENTITY on each shared entry, not by equality: a
+    re-spelled ``("plan_files", "phase_skipped_event", FIDELITY_FILE_LEVEL)``
+    literal in this module would build a distinct tuple at import time and fail
+    here, while a table derived from the imported one shares the very objects.
+    So a future edit to the audit's lens is inherited automatically, and a
+    contributor who copies the two entries instead fails CI.
+    """
+    for event_type, entry in _EVENT_PLAN_SOURCES.items():
+        assert SCOPE_EVENT_SOURCES[event_type] is entry, event_type
+
+    assert set(SCOPE_EVENT_SOURCES) == set(_EVENT_PLAN_SOURCES) | {"lock_acquired"}
+
+
+def test_set_to_plan_and_phase_skipped_carry_their_audit_fidelities(tmp_path):
+    """(a) A set_to_plan payload is DELIBERATELY lock-level (it carries the
+    module set, per event_store.py:77-82), while phase_skipped.plan_files is
+    true file-level. Fidelity stays load-bearing here for the same reason it is
+    in the audit: a module path must never be mistaken for a plan.files entry."""
+    db_path = _make_runs_db(
+        tmp_path,
+        [
+            {"event_type": "set_to_plan", "task_id": 1, "data": {"files": ["mod/"]}},
+            {
+                "event_type": "phase_skipped",
+                "task_id": 1,
+                "data": {"plan_files": ["a.py", "b.py"]},
+            },
+        ],
+    )
+    events = load_scope_events(str(db_path), {"1"})["1"]
+
+    assert [(e.event_type, e.fidelity, e.file_count) for e in events] == [
+        ("set_to_plan", FIDELITY_LOCK_LEVEL, 1),
+        ("phase_skipped", FIDELITY_FILE_LEVEL, 2),
+    ]
+
+
+def test_lock_acquired_with_real_module_paths_is_a_scope_event(tmp_path):
+    """(b) The task names "a set_to_plan/phase_skipped{plan_files} event or
+    real lock set" as the reconciliation signal, so lock_acquired is in the
+    census's lens even though the audit does not read it."""
+    db_path = _make_runs_db(
+        tmp_path,
+        [{"event_type": "lock_acquired", "task_id": 9, "data": {"modules": ["orchestrator/", "shared/"]}}],
+    )
+    events = load_scope_events(str(db_path), {"9"})["9"]
+
+    assert [(e.event_type, e.fidelity, e.file_count) for e in events] == [
+        ("lock_acquired", FIDELITY_LOCK_LEVEL, 2)
+    ]
+
+
+def test_the_synthetic_fallback_lock_is_not_evidence_of_reconciliation(tmp_path):
+    """(b) THE INVERSION THIS PREVENTS. The conflict-with-nothing fallback lock
+    renders as modules == ["task-<id>"] — a sentinel, not a derived scope.
+    Counting it as evidence would classify the tagger-era dispatches that
+    derived NOTHING as plan-reconciled, inverting the classification for
+    exactly the population the census exists to find."""
+    db_path = _make_runs_db(
+        tmp_path,
+        [{"event_type": "lock_acquired", "task_id": 4514, "data": {"modules": ["task-4514"]}}],
+    )
+
+    assert load_scope_events(str(db_path), {"4514"}) == {}
+
+
+def test_a_mixed_lock_drops_only_the_sentinel(tmp_path):
+    """(b) A lock carrying the sentinel ALONGSIDE real paths is still a real
+    lock. Only the sentinel is dropped, and the file count reflects that."""
+    db_path = _make_runs_db(
+        tmp_path,
+        [
+            {
+                "event_type": "lock_acquired",
+                "task_id": 77,
+                "data": {"modules": ["task-77", "scripts/"]},
+            }
+        ],
+    )
+    events = load_scope_events(str(db_path), {"77"})["77"]
+
+    assert len(events) == 1
+    assert events[0].file_count == 1
+
+
+@pytest.mark.parametrize(
+    ("label", "event"),
+    [
+        ("null task_id", {"event_type": "set_to_plan", "task_id": None, "data": {"files": ["a"]}}),
+        ("null data", {"event_type": "set_to_plan", "task_id": 1, "data": None}),
+        ("malformed json", {"event_type": "set_to_plan", "task_id": 1, "data": "{nope"}),
+        ("non-dict payload", {"event_type": "set_to_plan", "task_id": 1, "data": "[1,2]"}),
+        ("missing key", {"event_type": "set_to_plan", "task_id": 1, "data": {"other": ["a"]}}),
+        ("empty list", {"event_type": "phase_skipped", "task_id": 1, "data": {"plan_files": []}}),
+        ("wrong-typed list", {"event_type": "phase_skipped", "task_id": 1, "data": {"plan_files": "a"}}),
+        ("empty lock", {"event_type": "lock_acquired", "task_id": 1, "data": {"modules": []}}),
+    ],
+)
+def test_load_scope_events_skips_unusable_rows_without_raising(tmp_path, label, event):
+    """(c) An unusable row is NOT a scope assertion, so it is skipped. Never
+    raising matters at live scale: dark_factory's event log carries 21,345
+    lock_acquired rows alone, and one corrupt payload cannot be allowed to
+    abort the sweep."""
+    db_path = _make_runs_db(tmp_path, [event])
+
+    assert load_scope_events(str(db_path), {"1", "None"}) == {}, label
+
+
+def test_every_matching_event_is_retained_with_its_timestamp(tmp_path):
+    """(d) THE REASON THIS FUNCTION EXISTS AT ALL.
+
+    The audit's load_plan_files_from_events would collapse these three rows to
+    ONE highest-fidelity record and discard the timestamps. The census needs
+    all three, in emission order, because a record's classification turns on
+    which side of the stamp each event fell.
+    """
+    db_path = _make_runs_db(
+        tmp_path,
+        [
+            {"event_type": "set_to_plan", "task_id": 3, "timestamp": _BEFORE, "data": {"files": ["a"]}},
+            {"event_type": "phase_skipped", "task_id": 3, "timestamp": _STAMP, "data": {"plan_files": ["b"]}},
+            {"event_type": "lock_acquired", "task_id": 3, "timestamp": _AFTER, "data": {"modules": ["c/"]}},
+        ],
+    )
+    events = load_scope_events(str(db_path), {"3"})["3"]
+
+    assert [e.timestamp for e in events] == [_BEFORE, _STAMP, _AFTER]
+    assert [e.event_id for e in events] == [1, 2, 3]
+
+
+def test_only_the_requested_task_ids_are_returned(tmp_path):
+    """(e) The sweep asks for the stamped ids only. Decoding all 21k+
+    lock_acquired payloads to then discard almost all of them would make a
+    six-corpus sweep needlessly expensive."""
+    db_path = _make_runs_db(
+        tmp_path,
+        [
+            {"event_type": "set_to_plan", "task_id": 1, "data": {"files": ["a"]}},
+            {"event_type": "set_to_plan", "task_id": 2, "data": {"files": ["b"]}},
+        ],
+    )
+
+    assert set(load_scope_events(str(db_path), {"2"})) == {"2"}
+
+
+def test_an_empty_task_id_set_returns_nothing(tmp_path):
+    """A project with zero stamped records asks for zero ids. That must be an
+    empty result, never "all events"."""
+    db_path = _make_runs_db(
+        tmp_path, [{"event_type": "set_to_plan", "task_id": 1, "data": {"files": ["a"]}}]
+    )
+
+    assert load_scope_events(str(db_path), set()) == {}
