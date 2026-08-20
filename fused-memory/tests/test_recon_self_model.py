@@ -149,6 +149,61 @@ class TestMarkerLifecycle:
 
 
 # --------------------------------------------------------------------------- #
+# MEM0_TOMBSTONE_DELETERS — single-sourced against the live deleter tags
+# --------------------------------------------------------------------------- #
+
+
+class TestMem0TombstoneDeleters:
+    """MEM0_TOMBSTONE_DELETERS names the deleter audit tags of the ONLY Mem0
+    delete paths that write a mem0_tombstone ledger row, via
+    mem0_tombstone.record_mem0_deletion_tombstones. Hand-declared in
+    recon_self_model (import-light contract — see module docstring) rather
+    than imported, and cross-checked here against the live constants so
+    drift between the two fails a test instead of silently diverging."""
+
+    def test_mem0_tombstone_deleters_shape(self):
+        """MEM0_TOMBSTONE_DELETERS is a non-empty tuple of non-empty str."""
+        assert isinstance(m.MEM0_TOMBSTONE_DELETERS, tuple)
+        assert m.MEM0_TOMBSTONE_DELETERS
+        for deleter in m.MEM0_TOMBSTONE_DELETERS:
+            assert isinstance(deleter, str) and deleter
+
+    def test_mem0_tombstone_deleters_match_live_delete_sites(self):
+        """Drift ratchet: MEM0_TOMBSTONE_DELETERS must equal the six live
+        deleter tags used by the three production call sites of
+        mem0_tombstone.record_mem0_deletion_tombstones (summary_pool.
+        enforce_summary_pool_cap, task_knowledge_sync._sweep_stale_mem0_pool,
+        server.tools.consolidate_memories).
+
+        KNOWN LIMIT of this ratchet: it catches a RENAMED or REMOVED deleter
+        tag (the live import breaks or the set comparison fails), but a
+        brand-new call site introducing a brand-new constant is only caught
+        once someone adds it to `expected` below — it cannot discover an
+        unknown-unknown deleter on its own. That is the honest scope of this
+        guard, matching MARKER_KINDS' cross-check against recon_ledger.
+
+        Imports the stage modules lazily, inside the test body (costs ~20s
+        cold) rather than at module scope, matching this file's existing
+        `from fused_memory.reconciliation.recon_ledger import MARKER_KINDS`
+        idiom (see test_mem0_tombstone_is_in_neither_marker_kinds_constant
+        above) — recon_self_model itself must stay import-light.
+        """
+        from fused_memory.reconciliation.stages import memory_consolidator as mc
+        from fused_memory.reconciliation.stages import task_knowledge_sync as tks
+        from fused_memory.server import tools as srv_tools
+
+        expected = {
+            tks._STAGE2_PERSISTENCE_MARKER_GC_SWEEP_SOURCE,
+            tks._STAGE1_FLAG_MARKER_GC_SWEEP_SOURCE,
+            tks._FLAG_FOR_STAGE2_GC_SWEEP_SOURCE,
+            tks._STAGE2_CYCLE_SUMMARY_TRIM_SOURCE,
+            mc._STAGE1_CYCLE_SUMMARY_TRIM_SOURCE,
+            srv_tools._CONSOLIDATE_SOURCE,
+        }
+        assert set(m.MEM0_TOMBSTONE_DELETERS) == expected
+
+
+# --------------------------------------------------------------------------- #
 # FINGERPRINT_IDENTITY_FIELDS + harness._derive_affected_ids cross-check (step-5/6)
 # --------------------------------------------------------------------------- #
 
