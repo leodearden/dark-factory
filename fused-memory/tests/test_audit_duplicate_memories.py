@@ -58,6 +58,7 @@ _ALL_CATEGORIES = _mod._ALL_CATEGORIES
 extract_liveness_snapshot_fact = _mod.extract_liveness_snapshot_fact
 _classify_liveness_snapshot = _mod._classify_liveness_snapshot
 liveness_snapshot_subject_task_ids = _mod.liveness_snapshot_subject_task_ids
+liveness_snapshot_subject_facts = _mod.liveness_snapshot_subject_facts
 find_liveness_snapshot_recurrences = _mod.find_liveness_snapshot_recurrences
 _LIVENESS_DISCLOSURE_KEYS = _mod._LIVENESS_DISCLOSURE_KEYS
 # Bound here, off the module, so the regex-budget class below can delegate to
@@ -5152,6 +5153,53 @@ def _span_days(earlier: str, later: str) -> float:
             - datetime.fromisoformat(earlier).timestamp()) / 86400.0
 
 
+class TestLivenessSnapshotSubjectFacts:
+    """WHAT each subject is asserted to be -- measured on the FOUR REAL RECORDS.
+
+    The task's own acceptance bar: the rescope is only worth shipping if the
+    detector still fires on the corpus that motivated it. The clause technique
+    returned the EMPTY SET on all four of these records before task 3403
+    narrowed `_CLAUSE_SPLIT_RE`'s dot and widened `TASK_REF_RE`'s separator, so
+    "it works now" is a measurement, not an inference -- and this class is
+    where that measurement lives. If a later edit to either shared regex
+    re-breaks the association, this fails before the group-level tests do,
+    naming the subject and the fact rather than an absent group.
+    """
+
+    def test_a_single_task_snapshot_keys_its_one_subject(self):
+        by_id = {r['id']: r for r in _liveness_corpus()}
+
+        assert liveness_snapshot_subject_facts(
+            by_id['6b245659'], _CORE_FACT_STRANDED,
+        ) == {'94': _CORE_FACT_STRANDED}
+        assert liveness_snapshot_subject_facts(
+            by_id['08aa0017'], _CORE_FACT_STRANDED,
+        ) == {'96': _CORE_FACT_STRANDED}
+
+    def test_the_multi_task_reverification_keys_each_subject_from_its_own_clause(self):
+        """1eef7df7: task 94 in clause 0, task 96 four clauses later.
+
+        Both land on the stranded fact from their OWN clause -- which is what
+        keeps `test_exactly_the_two_real_groups` green through the rescope.
+        Subject 99 is deliberately not pinned here: it names no clause carrying
+        a readable assignment, and its fallback is `TestLivenessSubjectFactsFallback`.
+        """
+        record = {r['id']: r for r in _liveness_corpus()}['1eef7df7']
+
+        facts = liveness_snapshot_subject_facts(record, _CORE_FACT_STRANDED)
+
+        assert facts['94'] == _CORE_FACT_STRANDED
+        assert facts['96'] == _CORE_FACT_STRANDED
+
+    def test_the_record_is_not_mutated(self):
+        record = {r['id']: r for r in _liveness_corpus()}['1eef7df7']
+        before = json.dumps(record, sort_keys=True, default=str)
+
+        liveness_snapshot_subject_facts(record, _CORE_FACT_STRANDED)
+
+        assert json.dumps(record, sort_keys=True, default=str) == before
+
+
 class TestFindLivenessSnapshotRecurrences:
     """The two groups the real corpus contains -- and nothing else.
 
@@ -5242,52 +5290,69 @@ class TestFindLivenessSnapshotRecurrences:
 
         assert groups == []
 
-    def test_divergent_per_task_statuses_do_not_group(self):
-        """The KNOWN LIMITATION of the whole-record key, pinned not hidden.
+    def test_divergent_per_task_statuses_group_per_subject(self):
+        """The whole-record limitation, CLOSED: each subject keys on its own clause.
 
-        The core fact is built ONCE PER RECORD by unioning every assignment in
-        its content, then attributed to every subject the record names. When a
-        multi-task re-verification reports DIFFERENT values per task, that
-        merged key matches neither single-task snapshot and both stay
-        singletons.
+        The core fact is no longer built once per record and attributed to
+        every subject it names. `find_liveness_snapshot_recurrences` splits the
+        content into clauses with `task_filter._CLAUSE_SPLIT_RE`, reads the
+        task refs and the `<field>=<value>` assignments of each clause
+        separately, and keys every subject on the union of the clauses that
+        NAME it -- the same idiom `task_filter.find_conflicting_task_status_ids`
+        uses. A multi-task re-verification reporting DIVERGENT values per task
+        therefore joins each subject's own group instead of matching neither.
 
-        The real motivating record (1eef7df7) reports identical values for
-        both its subjects, so the detector fires on the corpus that motivated
-        it. This is a RECALL gap in a report-only path, never a wrong delete.
+        This was genuinely inert when the detector was written: `_CLAUSE_SPLIT_RE`
+        split on EVERY `.`, shattering filenames mid-sentence, and the real
+        content writes `task/94`, which `TASK_REF_RE` did not match -- together
+        they yielded the EMPTY SET on all four real records. Task 3403 fixed
+        both regexes at the source, and this task re-MEASURED the technique
+        against those same four records (see
+        `TestLivenessSnapshotSubjectFacts`) rather than assuming it now returns
+        non-empty.
 
-        Per-subject clause scoping was genuinely inert when this was written:
-        `_CLAUSE_SPLIT_RE` split on EVERY `.`, shattering filenames
-        mid-sentence, and the real content writes `task/94`, which
-        `TASK_REF_RE` did not match -- together they yielded the EMPTY SET on
-        all four real records. Task 3403 fixed both regexes at the source, so
-        that evidence no longer argues against the technique; the rescope is
-        filed separately (ticket tkt_0RSCGSWBBW66VDBWYSYDQWF9PM). Until it
-        lands, the whole-record union key is what ships and this test is what
-        pins it -- the assertions below are unchanged by 3403.
+        The record-level key is untouched: `extract_liveness_snapshot_fact`
+        still returns ONE merged key per record, asserted below, so the
+        per-subject fact is a genuinely new projection rather than a change to
+        an existing one.
         """
+        # All THREE live fields in EACH per-task clause. Two fields per clause
+        # would key subject 94 at `claimant_run_id=null|status=in-progress`,
+        # which still matches no single-task snapshot -- the divergence would
+        # go unreported for a reason that has nothing to do with clause
+        # scoping, and the test would pass under the OLD implementation too.
         divergent = (
             'Point-in-time liveness check performed 2026-07-26 on task 94: '
-            'status="in-progress", claimant_run_id=null. Separately on task '
-            '96: status="done", claimant_run_id=null.'
+            'status="in-progress", claimant_run_id=null, heartbeat_at=null. '
+            'Separately on task 96: status="done", claimant_run_id=null, '
+            'heartbeat_at=null.'
+        )
+        done_96 = (
+            'Point-in-time liveness check performed 2026-07-24 on task 96: '
+            'status="done", claimant_run_id=null, heartbeat_at=null.'
         )
         corpus = [
-            _dated('6b245659', _LIVENESS_SNAPSHOT_94_JUL24, _TS_94_JUL24,
+            _dated('a94', _LIVENESS_SNAPSHOT_94_JUL24, _TS_94_JUL24,
                    category=_OS, metadata={'task_id': '94'}),
+            _dated('b96', done_96, _TS_96_JUL24,
+                   category=_OS, metadata={'task_id': '96'}),
             _dated('divergent', divergent, _TS_REVERIFY,
                    category=_OS, metadata={'task_id': '99'}),
         ]
 
         groups, disclosure = find_liveness_snapshot_recurrences(corpus)
 
-        assert extract_liveness_snapshot_fact(corpus[1]) == (
-            'claimant_run_id=null|status=done|status=in-progress'
-        ), 'one merged key per record, carrying BOTH statuses'
-        assert groups == [], (
-            'the merged key matches neither single-task snapshot, so the '
-            'recurrence goes unreported -- a recall gap, not a bad delete'
-        )
+        assert extract_liveness_snapshot_fact(corpus[2]) == (
+            'claimant_run_id=null|heartbeat_at=null|status=done|status=in-progress'
+        ), 'the RECORD-level key is still one merged key carrying BOTH statuses'
+        assert [(g['subject_task_id'], g['core_fact'], g['member_ids'])
+                for g in groups] == [
+            ('94', _CORE_FACT_STRANDED, ['a94', 'divergent']),
+            ('96', 'claimant_run_id=null|heartbeat_at=null|status=done',
+             ['b96', 'divergent']),
+        ], 'each subject joins the group its OWN clause asserts'
         assert set(disclosure.values()) == {0}, (
-            'and it is NOT a counted loss: both records classified fine'
+            'and nothing is disclosed as lost: every record classified fine'
         )
 
 
@@ -5457,7 +5522,8 @@ class TestLivenessPartialKeyFalseGroup:
 
     def test_a_non_assignment_status_can_still_false_group(self):
         """KNOWN LIMITATION, pinned not hidden -- the same discipline
-        `test_divergent_per_task_statuses_do_not_group` already uses.
+        `test_divergent_per_task_statuses_group_per_subject` used for the
+        whole-record-key limitation that task 3891 went on to close.
 
         This task's fix closes the ASSIGNMENT-form route to a survivors-only
         key: a `<field>=` written but whose value could not be read. It does
