@@ -22,6 +22,7 @@ from shared.invocation_outcome import (
     classify_invocation,
 )
 from shared.usage_gate import (
+    _SPAWN_FAULT_THRESHOLD,
     AccountState,
     ProbeSpawnError,
     UsageGate,
@@ -1157,6 +1158,156 @@ class TestRunProbeSpawnFault:
             pytest.raises(asyncio.CancelledError),
         ):
             await gate._run_probe(acct)
+
+
+def _spawn_fault(binary: str = 'claude') -> ProbeSpawnError:
+    return ProbeSpawnError(
+        binary, FileNotFoundError(2, 'No such file or directory', binary),
+    )
+
+
+class TestProbeInfraFaultLatch:
+    """Gate-level accounting for probes that could not be spawned (task 4512).
+
+    `shared` cannot import `escalation` (the dependency runs the other way), so
+    the gate does what its same-layer peer `ApiHealthGate` does: it EXPOSES the
+    condition and leaves the escalation lifecycle to a consumer that may
+    legally file one. `probe_infra_fault` is that surface.
+
+    The latch is deliberately consecutive-counted rather than windowed. A
+    spawn error immediately followed by a probe that RAN is genuinely
+    transient and must clear; a window counter would still latch on three
+    errors interleaved with successes, which is a flaky host, not one that
+    cannot start the binary at all.
+    """
+
+    def _fresh(self) -> tuple[UsageGate, AccountState]:
+        gate = make_gate(['a'])
+        return gate, gate._accounts[0]
+
+    def test_fresh_gate_reports_no_fault(self):
+        gate = make_gate(['a', 'b'])
+
+        assert gate.probe_infra_fault is None
+        assert [a.probe_spawn_failures for a in gate._accounts] == [0, 0]
+
+    def test_below_threshold_counts_and_logs_but_does_not_latch(self, caplog):
+        """Loud immediately; latched only at the threshold.
+
+        The two are separate on purpose. Every spawn fault is an ERROR the
+        moment it happens, so a transient one is never silent — but the LATCH
+        is the durable "an operator must fix this host" claim, and staking that
+        on a single failure would flap.
+        """
+        gate, acct = self._fresh()
+
+        with caplog.at_level(logging.ERROR, logger='shared.usage_gate'):
+            for expected_count in range(1, _SPAWN_FAULT_THRESHOLD):
+                gate._note_probe_spawn_failure(acct, _spawn_fault())
+                assert acct.probe_spawn_failures == expected_count
+                assert gate.probe_infra_fault is None, (
+                    f'latched after {expected_count} failure(s); the threshold '
+                    f'is {_SPAWN_FAULT_THRESHOLD}'
+                )
+
+        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert len(errors) == _SPAWN_FAULT_THRESHOLD - 1, (
+            'every spawn fault must log at ERROR, not only the latching one'
+        )
+
+    def test_threshold_arms_the_latch_naming_binary_and_cause(self, caplog):
+        gate, acct = self._fresh()
+
+        with caplog.at_level(logging.ERROR, logger='shared.usage_gate'):
+            for _ in range(_SPAWN_FAULT_THRESHOLD):
+                gate._note_probe_spawn_failure(acct, _spawn_fault())
+
+        fault = gate.probe_infra_fault
+        assert isinstance(fault, str) and fault, (
+            f'expected a latched description after {_SPAWN_FAULT_THRESHOLD} '
+            f'consecutive spawn failures, got {fault!r}'
+        )
+        assert 'claude' in fault, fault
+        assert 'No such file or directory' in fault, fault
+
+    def test_a_probe_that_ran_clears_the_counter_and_the_latch(self):
+        """Recovery is proof-based: the binary is resolvable again.
+
+        A probe that returned at all — True or False — spawned, so the host
+        fault is over. Nothing else clears the latch; it is explicitly NOT
+        time-based, because no amount of waiting fixes a missing binary.
+        """
+        gate, acct = self._fresh()
+        for _ in range(_SPAWN_FAULT_THRESHOLD):
+            gate._note_probe_spawn_failure(acct, _spawn_fault())
+        assert gate.probe_infra_fault is not None
+
+        gate._clear_probe_spawn_failures(acct)
+
+        assert acct.probe_spawn_failures == 0
+        assert gate.probe_infra_fault is None
+
+    def test_non_consecutive_failures_never_latch(self):
+        """note, note, clear, note, note -> still None.
+
+        Four failures total, more than the threshold, but never three in a
+        row. This is what makes the counter CONSECUTIVE rather than windowed.
+        """
+        gate, acct = self._fresh()
+
+        gate._note_probe_spawn_failure(acct, _spawn_fault())
+        gate._note_probe_spawn_failure(acct, _spawn_fault())
+        gate._clear_probe_spawn_failures(acct)
+        gate._note_probe_spawn_failure(acct, _spawn_fault())
+        gate._note_probe_spawn_failure(acct, _spawn_fault())
+
+        assert gate.probe_infra_fault is None
+        assert acct.probe_spawn_failures == _SPAWN_FAULT_THRESHOLD - 1
+
+    def test_counters_are_per_account(self):
+        """Matching the observed incident, where all six accounts fault.
+
+        Each account runs its own probe loop, so a shared counter would reach
+        the threshold in a third of the time on a six-account fleet and make
+        the threshold mean something different per deployment size.
+        """
+        gate = make_gate(['a', 'b'])
+        acct_a, acct_b = gate._accounts
+
+        gate._note_probe_spawn_failure(acct_a, _spawn_fault())
+        gate._note_probe_spawn_failure(acct_a, _spawn_fault())
+        gate._note_probe_spawn_failure(acct_b, _spawn_fault())
+
+        assert acct_a.probe_spawn_failures == 2
+        assert acct_b.probe_spawn_failures == 1
+        assert gate.probe_infra_fault is None
+
+    def test_new_built_gate_never_raises_attribute_error(self):
+        """A gate built via `UsageGate.__new__`, as orchestrator tests build one.
+
+        orchestrator/tests/_orch_helpers.py:1142 assigns ~15 fields by hand and
+        never runs `__init__`, so it cannot know about a field added here. The
+        module already has an idiom for exactly this
+        (`getattr(self, '_shutting_down', False)`), and this test is what
+        forces the new attribute to use it rather than a bare `self._...` read
+        that would AttributeError deep inside an unrelated orchestrator test.
+        """
+        gate = UsageGate.__new__(UsageGate)
+        gate._accounts = [AccountState(name='a', token='tok')]
+        gate._cost_store = None
+        gate._background_tasks = set()
+        acct = gate._accounts[0]
+
+        assert gate.probe_infra_fault is None
+
+        for _ in range(_SPAWN_FAULT_THRESHOLD):
+            gate._note_probe_spawn_failure(acct, _spawn_fault())
+
+        assert acct.probe_spawn_failures == _SPAWN_FAULT_THRESHOLD
+        assert gate.probe_infra_fault is not None
+
+        gate._clear_probe_spawn_failures(acct)
+        assert gate.probe_infra_fault is None
 
 
 @pytest.mark.asyncio
