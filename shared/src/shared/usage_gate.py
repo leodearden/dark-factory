@@ -62,6 +62,7 @@ __all__ = [
     'AccountPhase',
     'SessionBudgetExhausted',
     'IllegalTransitionError',
+    'ProbeSpawnError',
 ]
 # NOTE: AccountLease is intentionally NOT listed here even though it is part
 # of this module's public surface (consumed by callers of
@@ -192,6 +193,40 @@ class AccountPhase(StrEnum):
 class IllegalTransitionError(Exception):
     """Raised by :meth:`UsageGate._transition` on a phase edge not present in
     ``_LEGAL_TRANSITIONS``. Account state is left unchanged."""
+
+
+class ProbeSpawnError(Exception):
+    """The cap-resume probe could not be SPAWNED at all (task 4512).
+
+    An INFRASTRUCTURE fault — a missing or non-executable ``claude`` binary, a
+    broken self-update symlink, an unresolvable PATH — never a usage cap. The
+    distinction matters because the two are indistinguishable downstream once
+    collapsed: :meth:`UsageGate._run_probe` used to swallow the spawn's
+    ``FileNotFoundError`` and return the same ``False`` it returns for "the
+    probe ran and the account is still capped", so
+    :meth:`UsageGate._account_resume_probe_loop` took the cap path, invented a
+    reset time an hour out, and reported a synthetic countdown forever. A
+    permanent host fault presented as a self-inflicted usage cap.
+
+    INVARIANT: raised ONLY when the spawn itself failed. A non-zero exit, a
+    probe timeout, a mid-read ``BrokenPipeError``, or a successfully parsed cap
+    message all mean the probe RAN, and all keep their existing ``bool``
+    verdict. Callers rely on that: a raised ProbeSpawnError is proof that
+    nothing was learned about the account's capacity.
+
+    Deliberately derives from ``Exception``, NOT from ``OSError``, even though
+    it always wraps one. An ``except OSError`` arm anywhere downstream would
+    otherwise reabsorb it and restore exactly the swallow it exists to remove.
+
+    Attributes:
+        binary: The command that could not be spawned (``cmd[0]``).
+        cause: The originating ``OSError`` from ``create_subprocess_exec``.
+    """
+
+    def __init__(self, binary: str, cause: OSError) -> None:
+        super().__init__(f'probe binary {binary!r} could not be spawned: {cause}')
+        self.binary = binary
+        self.cause = cause
 
 
 # Legal phase edges (PRD §7.3, task W4-γ). Any edge not listed here raises
