@@ -359,6 +359,59 @@ def reap_loose_archive_files(queue_dir: Path, *, apply: bool = True) -> int:
     return moved
 
 
+def reap_orphan_locks(queue_dir: Path, *, apply: bool = True) -> int:
+    """Unlink queue-root sidecar locks whose escalation record no longer exists.
+
+    ``escalation_id_lock`` creates a stable ``{escalation_id}.json.lock`` sidecar
+    on first use and never renames it (task 1609's stable-inode contract).  The
+    sidecar therefore outlives its record: once a record is pruned by archive
+    retention — or was never submitted after its id was minted — the lock file
+    is left behind forever and the queue root accumulates them.
+
+    A sidecar is an ORPHAN when its record is absent, in which case no writer can
+    ever take that lock again and unlinking it is safe.  Every unlink is
+    serialized on the very lock being removed, so a concurrent queue writer that
+    already holds it is never cut in on.
+
+    Args:
+        queue_dir: Root queue directory (the only place sidecars are created).
+        apply: If True (default), actually unlink.  If False, only count how many
+               would be unlinked (dry-run — mutates nothing).
+
+    Returns:
+        Number of sidecars unlinked (or would-unlink when apply=False).
+    """
+    queue_dir = Path(queue_dir)
+    reaped = 0
+
+    # Materialize the glob before iterating so the directory scan completes
+    # before any unlink occurs — mutating a directory during os.scandir/readdir
+    # has unspecified behaviour on some filesystems and can cause subsequent
+    # sibling entries to be skipped (mirrors reap_loose_archive_files()).
+    for path in list(queue_dir.glob('*.json.lock')):
+        stem = path.name[: -len('.json.lock')]
+        record_path = queue_dir / f'{stem}.json'
+
+        if record_path.exists():
+            continue
+
+        if not apply:
+            # Dry-run: report the would-reap count without touching disk, the
+            # same apply=False contract sweep() and reap_loose_archive_files()
+            # honour.
+            reaped += 1
+            continue
+
+        # Unlink INSIDE the critical section so the flock is released on the
+        # already-unlinked inode and the context manager never re-creates the
+        # file on its way out.
+        with escalation_id_lock(queue_dir, stem):
+            os.unlink(path)
+        reaped += 1
+
+    return reaped
+
+
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point: python -m escalation.sweep."""
     parser = argparse.ArgumentParser(
