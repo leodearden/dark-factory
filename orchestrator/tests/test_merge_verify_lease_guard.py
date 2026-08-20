@@ -733,10 +733,13 @@ class TestMergeVerifyLeaseParametrizedLane:
 #       remove-side stomp task_verify_lease's docstring already cites as its
 #       own reason for being flock-only.
 #
-# (a), (b) and (e) below are RED before step-2's fix; (c), (d) and (f) are
-# controls that must be GREEN both before and after it — (d) in particular
-# discriminates against a wrong `lane_dir is None`-only fix, because the
-# DF-2822 cross-check passes the PERSISTENT lane explicitly.
+# (a), (b) and (e) below are RED before step-2's fix; (c), (d), (f) and (g)
+# are controls that must be GREEN both before and after it — (d) in
+# particular discriminates against a wrong `lane_dir is None`-only fix,
+# because the DF-2822 cross-check passes the PERSISTENT lane explicitly, and
+# (g) pins the REFUSAL path (the flock and the fail-closed contended raise an
+# ephemeral lane still gets) against a future refactor that hoisted the
+# rendezvous remove out of the lease's finally.
 # ---------------------------------------------------------------------------
 
 
@@ -842,6 +845,54 @@ class TestEphemeralLaneLeaseLeavesGlobalRendezvousUntouched:
             assert git_ops._merge_verify_lease_active() is True
 
         assert read_lock_holder_pgid(git_ops.worktree_base) is None
+
+    async def test_ephemeral_lane_contended_raise_leaves_a_live_rendezvous_intact(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """(g) The docstring's OTHER half: an ephemeral lane still gets the
+        flock AND the fail-closed contended raise — and that REFUSAL path must
+        not touch the global rendezvous either.
+
+        ``test_contended_flock_raises_and_records_no_lease`` covers the
+        contended raise only on the default (persistent) lane, where clearing
+        the rendezvous would be harmless because we never wrote it. On an
+        EPHEMERAL lane the file may belong to a LIVE concurrent
+        persistent-lane verify (stood in for here by a pre-written
+        holder-pgid, as in (b)). A refactor that hoisted the remove out of the
+        ``finally`` into a broader cleanup path would silently strip that
+        foreign holder's rendezvous on the refusal path, and nothing else in
+        this suite would fail.
+        """
+        from orchestrator.git_ops import MergeVerifyLeaseContended  # noqa: PLC0415
+
+        git_ops = _git_ops(tmp_path)
+        ephemeral_wt = git_ops.worktree_base / '_merge-98c756bc'
+        lane_lock_path(ephemeral_wt).parent.mkdir(parents=True, exist_ok=True)
+
+        # Stand-in for the concurrent persistent-lane verify's live lease.
+        write_lock_holder_pgid(git_ops.worktree_base, os.getpgrp())
+        # Same seam the persistent-lane contention test uses: simulate
+        # acquire_merge_verify_flock's bounded-wait TIMEOUT (-> None).
+        monkeypatch.setattr(
+            'orchestrator.git_ops.acquire_merge_verify_flock',
+            lambda *a, **k: None,
+        )
+        try:
+            entered = False
+            with pytest.raises(MergeVerifyLeaseContended):
+                async with git_ops.merge_verify_lease(lane_dir=ephemeral_wt):
+                    entered = True  # body must never run
+
+            assert not entered, (
+                'an ephemeral lane must keep the fail-closed contended '
+                'contract — the body may not run without the flock'
+            )
+            assert read_lock_holder_pgid(git_ops.worktree_base) == os.getpgrp(), (
+                'the REFUSAL path must leave a live foreign rendezvous intact, '
+                'exactly as the acquire-and-release path does'
+            )
+        finally:
+            remove_lock_holder_pgid(git_ops.worktree_base)
 
 
 @pytest.mark.asyncio
