@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import hashlib
 import json
 import logging
@@ -3125,7 +3126,66 @@ class MemoryService:
                     ),
                 ))
 
+        # SECOND PASS, deliberately: the lookup below is deferred to the
+        # findings alone so the ~99.8% clean path issues ZERO extra queries
+        # inside the per-group identity lock. One query per DISTINCT intended
+        # referent, cached for this call.
+        uuid_by_name: dict[str, str | None] = {}
+        for index, finding in enumerate(stats.findings):
+            if finding.intended_referent is None:
+                continue
+            name = finding.intended_referent.node_name
+            if name not in uuid_by_name:
+                uuid_by_name[name] = await self._intended_endpoint_uuid(
+                    name, group_id=group_id,
+                )
+            # `dataclasses.replace`, never mutation: the record is frozen
+            # because it is evidence for destructive edge surgery.
+            stats.findings[index] = dataclasses.replace(
+                finding, new_endpoint_uuid=uuid_by_name[name],
+            )
+
         return stats
+
+    async def _intended_endpoint_uuid(
+        self, name: str, *, group_id: str
+    ) -> str | None:
+        """The uuid of the node *name* denotes, or ``None`` — never a write.
+
+        ``get_nodes_by_exact_name`` SPECIFICALLY, because it is documented
+        ``ro_query``-only and never raises on zero-or-many. zeta detects and must
+        not write, which rules out ``ensure_entity_node`` (MINTS) and
+        ``_resolve_or_create_entity`` (COLLAPSES) despite both being available
+        and both being what leaf eta will use.
+
+        ``len(rows) != 1`` yields ``None``, collapsing ABSENT and
+        DUPLICATE-NAME-GROUP to the same answer on purpose: the PRD measured 38
+        live name keys carrying more than one node, and zeta picking a survivor
+        from such a group would pre-empt the identity-lock-held collapse that is
+        ``_resolve_or_create_entity``'s job — while eta's ``ensure_entity_node``
+        handles both cases identically anyway. ``None`` therefore means "eta
+        resolves-or-mints", NEVER "unrepairable"; that is
+        :attr:`ReferentFinding.resolvable`.
+
+        Best-effort, mirroring ``_normalize_task_node_names``: a transient
+        backend error degrades the uuid to ``None`` rather than losing the
+        finding. Detection is the primary result and the uuid is an audit
+        convenience, so a lookup failure must not cost the evidence.
+        """
+        try:
+            rows = await self.graphiti.get_nodes_by_exact_name(
+                name, group_id=group_id,
+            )
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            logger.warning(
+                'Failed to resolve intended referent %r to a node uuid during '
+                'referent verification; recording the finding without one',
+                name, exc_info=True,
+            )
+            return None
+        return rows[0]['uuid'] if len(rows) == 1 else None
     async def _reconcile_episode_identity(
         self, result: Any, *, group_id: str
     ) -> ReconcileStats:
