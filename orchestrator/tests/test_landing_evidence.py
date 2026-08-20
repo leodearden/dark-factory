@@ -26,7 +26,11 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from orchestrator.git_ops import CommitEffectProbe
-from orchestrator.landing_evidence import validate_landing_evidence
+from orchestrator.landing_evidence import (
+    LandingEvidenceVerdict,
+    format_unattributed_landing_detail,
+    validate_landing_evidence,
+)
 
 
 def _git_ops(
@@ -522,3 +526,183 @@ class TestValidateLandingEvidenceEffectDivergenceProbe:
         assert isinstance(verdict.probe['effect_probe_error'], str)
         assert verdict.probe['effect_probe_error']
         assert 'describe_commit_effect_in_main' in verdict.probe['effect_probe_error']
+
+
+def _verdict(reason: str, **probe_extra) -> LandingEvidenceVerdict:
+    """A rejected LandingEvidenceVerdict with a realistic probe (task 3116)."""
+    probe = {
+        'task_id': '42',
+        'branch': 'task/42',
+        'branch_tip_sha': None,
+        'citation': 'a' * 40,
+        'effect_check_sha': 'a' * 40,
+        'reason': reason,
+    }
+    probe.update(probe_extra)
+    return LandingEvidenceVerdict(
+        accepted=False, evidence_sha=None, reason=reason, probe=probe,
+    )
+
+
+class TestFormatUnattributedLandingDetail:
+    """The escalation body a human actually reads (task 3116).
+
+    These assert on RENDERED RUNTIME OUTPUT, not on docstrings, and use a
+    small number of narrow lowercase substring checks rather than full-string
+    equality so a future reword does not break the suite.
+
+    The prose defects being pinned all cost real money.  The 'reverted
+    exactly the paths it touched' claim asserted a revert as FACT when the
+    primitive that produced the verdict explicitly cannot distinguish a
+    revert from ordinary later evolution — it sent two investigations
+    chasing a revert that never happened.  'remains pending' and
+    're-evaluated on the next dispatch tick' understated the consequence into
+    sounding like a harmless idempotent re-check, when the task is in fact
+    DISPATCHED TO AN AGENT on that tick (~5.80 USD across tasks
+    3653/3640/3717, plus a spurious task_failure escalation and four days
+    blocked).
+    """
+
+    def test_effect_absent_states_both_branches_honestly(self) -> None:
+        """(a) The reason prose must offer BOTH causes and say plainly that
+        the check cannot tell them apart — never assert a revert as fact.
+        """
+        _, detail = format_unattributed_landing_detail(
+            '42', 'task/42', _verdict('effect_absent'),
+        )
+        lowered = detail.lower()
+
+        assert 'cannot distinguish' in lowered
+        assert 'revert' in lowered
+        assert 'evolv' in lowered
+        assert 'reverted exactly the paths' not in lowered
+
+    def test_diverged_paths_render_in_a_labelled_block(self) -> None:
+        """(b) The path must appear under its own LABELLED header, not merely
+        somewhere in the raw ``probe: {...}`` dict repr — which already
+        contains it today, so a path-only assertion would pass without the
+        fix.
+        """
+        path = 'tests/infra/harness-layout-baseline.manifest'
+        _, detail = format_unattributed_landing_detail(
+            '42', 'task/42',
+            _verdict(
+                'effect_absent',
+                diverged_paths=[path],
+                effect_failure='paths_diverged',
+                effect_anchor_sha='c' * 40,
+            ),
+        )
+
+        assert 'diverged paths' in detail.lower()
+        assert path in detail
+        assert 'c' * 40 in detail
+
+    def test_summary_names_the_first_path_and_stays_clamped(self) -> None:
+        """(c) The summary feeds Escalation.summary, so the divergence
+        fragment must survive the [:200] clamp — pinned with 20 x 150-char
+        paths, far past the limit.
+        """
+        paths = [f'{"p" * 140}/{i:03d}.py' for i in range(20)]
+        summary, _ = format_unattributed_landing_detail(
+            '42', 'task/42',
+            _verdict('effect_absent', diverged_paths=paths,
+                     effect_failure='paths_diverged'),
+        )
+
+        assert 'diverged:' in summary.lower()
+        assert len(summary) <= 200
+
+    def test_structural_failure_does_not_claim_paths_diverged(self) -> None:
+        """(d) A structural failure has no path divergence to report; the
+        detail must name the failure CODE and must not imply paths diverged.
+        """
+        _, detail = format_unattributed_landing_detail(
+            '42', 'task/42',
+            _verdict('effect_absent', diverged_paths=[],
+                     effect_failure='empty_branch_merge'),
+        )
+
+        assert 'empty_branch_merge' in detail
+        assert 'diverged paths (' not in detail.lower()
+
+    def test_race_case_renders_an_explicit_note(self) -> None:
+        """(e) The re-probe found the effect PRESENT — main HEAD advanced
+        between the decision and the probe.  Render the race explicitly
+        rather than silently contradicting the verdict.
+        """
+        _, detail = format_unattributed_landing_detail(
+            '42', 'task/42',
+            _verdict('effect_absent', diverged_paths=[], effect_failure=None),
+        )
+        lowered = detail.lower()
+
+        assert 'main head may have advanced' in lowered
+        assert 'found the effect present' in lowered
+
+    def test_probe_error_says_paths_could_not_be_determined(self) -> None:
+        """(f) An unprobeable git_ops must read as "unknown", never as "no
+        divergence", and the error text itself must reach the human.
+        """
+        _, detail = format_unattributed_landing_detail(
+            '42', 'task/42',
+            _verdict(
+                'effect_absent',
+                diverged_paths=None,
+                effect_probe_error="AttributeError('describe_commit_effect_in_main')",
+            ),
+        )
+        lowered = detail.lower()
+
+        assert 'could not be determined' in lowered
+        assert 'describe_commit_effect_in_main' in detail
+
+    def test_no_citation_verdict_renders_unchanged(self) -> None:
+        """(g) The divergence block is effect_absent-SCOPED — a no_citation
+        verdict gets neither the block nor the summary fragment.
+        """
+        summary, detail = format_unattributed_landing_detail(
+            '42', 'task/42', _verdict('no_citation'),
+        )
+
+        assert 'diverged paths' not in detail.lower()
+        assert 'diverged:' not in summary.lower()
+
+    def test_legacy_empty_probe_renders_without_raising(self) -> None:
+        """(h) Several existing call-site tests construct ``probe={}``; the
+        block is skipped when the keys are absent rather than raising.
+        """
+        verdict = LandingEvidenceVerdict(
+            accepted=False, evidence_sha=None, reason='effect_absent', probe={},
+        )
+
+        summary, detail = format_unattributed_landing_detail('42', 'task/42', verdict)
+
+        assert 'effect_absent' in detail
+        assert len(summary) <= 200
+
+    def test_does_not_flatly_claim_the_task_remains_pending(self) -> None:
+        """(i) 'remains pending' is true only at the marker and
+        content-equivalence arms — the coalesce re-drive FLIPS merge-deferred
+        to pending.  The wording must admit both.
+        """
+        _, detail = format_unattributed_landing_detail(
+            '42', 'task/42', _verdict('effect_absent'),
+        )
+
+        assert 'remains pending' not in detail.lower()
+
+    def test_states_that_an_agent_is_dispatched_not_merely_re_evaluated(self) -> None:
+        """(j) 're-evaluated on the next dispatch tick' understated the
+        consequence into sounding idempotent.  The task is DISPATCHED TO AN
+        AGENT on that tick — that is the measured harm, and the mispricing is
+        why this defect survived this long.
+        """
+        _, detail = format_unattributed_landing_detail(
+            '42', 'task/42', _verdict('effect_absent'),
+        )
+        lowered = detail.lower()
+
+        assert 're-evaluated on the next dispatch tick' not in lowered
+        assert 'dispatch' in lowered
+        assert 'agent' in lowered
