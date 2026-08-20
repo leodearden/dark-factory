@@ -60,7 +60,11 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections.abc import Collection
+from pathlib import Path
 from typing import NamedTuple
+
+# Tier 1 — the ONE tasks.db locator. Never a hand-rolled path.
+from _task_db_scan import tasks_db_path
 
 # The audit owns the defensive JSON decoders. ``_coerce_file_list`` is
 # imported rather than re-implemented so the census's notion of "this
@@ -71,8 +75,12 @@ from typing import NamedTuple
 from audit_wiped_metadata_files import (
     _EVENT_PLAN_SOURCES,
     FIDELITY_LOCK_LEVEL,
+    NO_MERGE_EVENT,
     _coerce_file_list,
     _decode_files,
+    classify_wipe_signature,
+    load_merge_signatures,
+    runs_db_path,
 )
 
 # The terminal allowlist is IMPORTED, never re-spelled. The census exists to
@@ -423,3 +431,152 @@ def load_scope_events(
     finally:
         conn.close()
     return events
+
+
+# ---------------------------------------------------------------------------
+# The census itself.
+# ---------------------------------------------------------------------------
+
+
+class CensusCoverage(NamedTuple):
+    """How much of one project the census could actually see.
+
+    ALWAYS reported, including for a project with zero stamped records:
+    "found nothing" and "looked at nothing" are different claims, and this
+    block is the only thing that distinguishes them.
+
+    ``event_log_read`` False means the reconciliation and wipe-signature axes
+    are UNKNOWN for every record in this project, not measured to be clean.
+    Presenting them as clean would be exactly the no-silent-fail-soft violation
+    in docs/legibility/design-invariants.md.
+    """
+
+    project_root: str
+    project_id: str
+    total_tasks: int
+    stamped_records: int
+    event_log_read: bool
+    event_log_path: str
+
+
+class ProjectCensus(NamedTuple):
+    """One project's census: what was found, and what could be seen."""
+
+    project_root: str
+    project_id: str
+    records: list[CensusRecord]
+    coverage: CensusCoverage
+
+
+def project_id_for(project_root: str) -> str:
+    """``/home/leo/src/solar-challenge-platform`` -> ``solar_challenge_platform``.
+
+    The six corpora spell their project ids with underscores where the
+    directory uses hyphens. The artifact must key on the id spelling its
+    consumers already use, not on the directory name.
+    """
+    return Path(project_root).name.replace("-", "_")
+
+
+def _record_sort_key(record: CensusRecord) -> tuple[str, int, str]:
+    """Sort by (tag, NUMERIC task id) so 100 follows 20 rather than preceding it.
+
+    Same shape and same fallback as audit_wiped_metadata_files._candidate_sort_key
+    :573-578 — a non-numeric id sorts first under its own string rather than
+    raising, so one odd id cannot abort a whole sweep's rendering.
+    """
+    try:
+        return (record.tag, int(record.task_id), "")
+    except (TypeError, ValueError):
+        return (record.tag, 0, str(record.task_id))
+
+
+def census_project(project_root: str) -> ProjectCensus:
+    """Census one project root for surviving ``metadata.files_tagged_at`` stamps.
+
+    Reads the task store and the event log, both READ-ONLY, classifies every
+    stamped record on all three axes, and attaches the audit's own
+    ``merge_finalized`` verdict as correlating evidence.
+
+    A missing or unreadable runs.db is TOLERATED but never hidden: every record
+    still appears, degraded to NEVER_RECONCILED / NO_PRIOR_SCOPE /
+    NO_MERGE_EVENT, and ``coverage.event_log_read`` goes False so a consumer
+    can see the axes were unknown rather than measured clean.
+
+    A tasks.db error PROPAGATES. That is the contract
+    ``_task_db_scan.sweep_project_roots`` documents at :444-472 — exactly one
+    result per root, or raise — and its exit-3 gate rests on the resulting
+    ``len(audits) + len(unreadable) == len(roots)`` equality. Returning a
+    partial census here would silently re-open the false green exit 3 closes.
+    """
+    project_id = project_id_for(project_root)
+    tasks_db = tasks_db_path(project_root)
+
+    conn = _connect_readonly(str(tasks_db))
+    try:
+        (total_tasks,) = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()
+    finally:
+        conn.close()
+    stamped = load_stamped_records(str(tasks_db))
+
+    # runs_db_path is IMPORTED from the audit, which already resolves
+    # <root>/data/orchestrator/runs.db. That is how the 0-byte data/runs.db
+    # decoy task 4525 warns about is avoided — by reuse, not by a new constant
+    # this module would have to keep correct on its own.
+    runs_db = runs_db_path(project_root)
+    scope_events: dict[str, list[ScopeEvent]] = {}
+    merge_signatures: dict[str, list[dict]] = {}
+    event_log_read = False
+    if runs_db.exists():
+        try:
+            scope_events = load_scope_events(
+                str(runs_db), {str(record.task_id) for record in stamped.values()}
+            )
+            merge_signatures = load_merge_signatures(str(runs_db))
+            event_log_read = True
+        except sqlite3.Error:
+            # Deliberately NOT re-raised: an unreadable EVENT log costs two
+            # axes, while an unreadable TASK store costs the whole population.
+            # The coverage flag below is what keeps the difference visible.
+            scope_events = {}
+            merge_signatures = {}
+
+    records: list[CensusRecord] = []
+    for record in stamped.values():
+        events = scope_events.get(str(record.task_id), [])
+        verdict = classify_record(record.files_tagged_at, record.status, events)
+        records.append(
+            CensusRecord(
+                project_id=project_id,
+                tag=record.tag,
+                task_id=record.task_id,
+                status=record.status,
+                files_tagged_at=record.files_tagged_at,
+                status_class=verdict.status_class,
+                reconciliation=verdict.reconciliation,
+                wipe_signature=verdict.wipe_signature,
+                reconciled_by=verdict.reconciled_by,
+                preceded_by=verdict.preceded_by,
+                metadata_files=record.metadata_files,
+                merge_signature=(
+                    classify_wipe_signature(merge_signatures[str(record.task_id)])
+                    if str(record.task_id) in merge_signatures
+                    else NO_MERGE_EVENT
+                ),
+            )
+        )
+    records.sort(key=_record_sort_key)
+
+    return ProjectCensus(
+        project_root=project_root,
+        project_id=project_id,
+        records=records,
+        coverage=CensusCoverage(
+            project_root=project_root,
+            project_id=project_id,
+            total_tasks=total_tasks,
+            stamped_records=len(records),
+            event_log_read=event_log_read,
+            event_log_path=str(runs_db),
+        ),
+    )
