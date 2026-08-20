@@ -945,6 +945,49 @@ def test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling(pytestconfi
         f'fixture setup/teardown too, not just the call phase.'
     )
 
+    # Task 4203 — reconcile the retained 0.6 fraction (marker-less budget)
+    # against the additive `_required_timeout_secs` model this task adopts
+    # for @pytest.mark.timeout OVERRIDES. The two models are not applied to
+    # the same population: an override is a number this suite CHOOSES, so
+    # `_required_timeout_secs` prices it at every out-of-bound spawn's
+    # worst-case latency; the marker-less budget is bounded by the FIXED 60s
+    # pyproject global, which this suite cannot move, so it keeps the 0.6
+    # fraction as a cheaper proxy instead. Gating the marker-less population
+    # additively would be unsatisfiable: b1/b4/b6 (this module) and
+    # ib1/ib3/ib5 (the sibling infra module) each do the repo fixture plus at
+    # least one _drive_advance = _SPAWNS_PER_REPO_FIXTURE +
+    # _SPAWNS_PER_DRIVE_ADVANCE = 9 spawns = 42.39s of out-of-bound work
+    # against the 24s the 0.6 fraction leaves at a 60s timeout — precisely
+    # task 4030's "10 of the 15 tests exceed the 60s global" observation.
+    # Pricing every spawn at the worst-case SINGLE-spawn 4.71s is a sound
+    # upper bound for sizing a number this suite chooses (an override) and an
+    # unsound hard gate for one it cannot move (the 60s global) — no observed
+    # run actually pays that price on every spawn.
+    #
+    # What IS pinnable, and is asserted here executably rather than left as
+    # prose: the 40% the 0.6 fraction holds back at the effective timeout
+    # must cover at least the repo fixture's own out-of-bound spawns (every
+    # test in both modules transitively pays this cost, marker-less or not),
+    # priced by the SAME additive model. This is the fixture-only baseline
+    # both models agree on.
+    fixture_only_required = _required_timeout_secs(0.0, _SPAWNS_PER_REPO_FIXTURE)
+    marker_less_headroom = (1 - _MARKERLESS_CEILING_FRACTION) * global_timeout
+    assert marker_less_headroom >= fixture_only_required, (
+        f'the {(1 - _MARKERLESS_CEILING_FRACTION) * 100:.0f}% of the effective per-test '
+        f'timeout ({global_timeout}s) the {_MARKERLESS_CEILING_FRACTION} fraction holds '
+        f'back as marker-less headroom = {marker_less_headroom}s, but the repo fixture '
+        f'alone already requires {fixture_only_required}s '
+        f'(_SPAWNS_PER_REPO_FIXTURE={_SPAWNS_PER_REPO_FIXTURE} spawns x '
+        f'{_MEASURED_SPAWN_LATENCY_SECS}s) under the additive model this task adopts for '
+        f'@pytest.mark.timeout overrides. The 0.6 fraction is deliberately kept (not '
+        f'replaced by the additive model) for the marker-less population, since a '
+        f"marker-less test's timeout is the fixed 60s global and cannot be widened — but "
+        f'that choice is only sound while this fixture-only floor holds; a failure here '
+        f'means _MEASURED_SPAWN_LATENCY_SECS has been re-measured upward enough that even '
+        f'the cheapest marker-less test (fixture only, zero _drive_advance calls) no '
+        f'longer fits, and the 0.6 fraction itself needs re-deriving.'
+    )
+
 
 @pytest.mark.asyncio
 async def test_out_of_bound_spawn_counts_are_measured_not_asserted(
