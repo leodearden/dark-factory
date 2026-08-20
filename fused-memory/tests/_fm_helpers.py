@@ -1338,7 +1338,17 @@ async def reap_leaked_ticket_workers() -> int:
 _TRACKED_ASYNC_HTTPX_CLIENTS: weakref.WeakSet = weakref.WeakSet()
 
 
-def track_async_httpx_clients() -> None:
+#: Stamped on the installed wrapper so a second install is a no-op. Named on
+#: the FUNCTION rather than kept in a module global because the thing being
+#: guarded is the state of ``httpx.AsyncClient.__init__`` itself: a test that
+#: restores a pristine ``__init__`` (see
+#: test_async_httpx_leak_isolation.test_track_async_httpx_clients_is_idempotent)
+#: must be able to re-install, which a module-level "already ran" flag would
+#: wrongly refuse.
+_TRACK_SENTINEL = '_df_tracks_async_httpx_clients'
+
+
+def track_async_httpx_clients() -> bool:
     """Record every ``httpx.AsyncClient`` built from now on, for later reaping.
 
     Wraps ``httpx.AsyncClient.__init__`` — ONE patch point that catches every
@@ -1353,15 +1363,56 @@ def track_async_httpx_clients() -> None:
 
     Instances are recorded AFTER the original ``__init__`` returns, so a
     constructor that raises leaves nothing half-built in the WeakSet.
+
+    Idempotent, and that is load-bearing rather than hygiene: ``conftest``'s
+    ``pytest_configure`` installs the hook at session start and each test in
+    ``test_async_httpx_leak_isolation.py`` calls it again, so an unguarded
+    re-wrap would nest one extra frame around the saved original per call for
+    the rest of the session.
+
+    Returns:
+        True if this call installed the hook, False if it was already present.
     """
     original = httpx.AsyncClient.__init__
+    if getattr(original, _TRACK_SENTINEL, False):
+        return False
 
     @functools.wraps(original)
     def __init__(self, *args, **kwargs):
         original(self, *args, **kwargs)
         _TRACKED_ASYNC_HTTPX_CLIENTS.add(self)
 
+    # functools.wraps copies __dict__ from the wrapped function, so stamp the
+    # sentinel AFTER it — otherwise re-installing over an already-stamped
+    # original would carry the flag straight onto the new wrapper anyway.
+    setattr(__init__, _TRACK_SENTINEL, True)
     httpx.AsyncClient.__init__ = __init__
+    return True
+
+
+def _leaked_async_httpx_clients() -> list:
+    """Return the tracked clients that are unclosed AND resurrect-capable.
+
+    "Resurrect-capable" means ``type(c)`` defines ``__del__`` — the finaliser
+    that reschedules ``aclose()`` onto a running loop and so produces the
+    flake. Measured: True for both libraries' ``AsyncHttpxClientWrapper``,
+    False for a bare ``httpx.AsyncClient`` (``'__del__' not in
+    httpx.AsyncClient.__dict__``). Deriving the predicate from the MECHANISM
+    rather than allow-listing ``openai``/``anthropic`` by name means any
+    future dependency shipping the same finaliser is covered without a code
+    change, and — just as important — that a bare async httpx client owned by
+    an unrelated fixture is left strictly alone. Closing everything tracked
+    would give the reaper a much larger blast radius than a flake fix earns.
+
+    Also the cheap predicate ``conftest``'s SYNC autouse fixture checks before
+    deciding whether to spin up an event loop at all, so the ~14100-of-14147
+    tests that leak nothing pay only a WeakSet scan.
+    """
+    return [
+        client
+        for client in list(_TRACKED_ASYNC_HTTPX_CLIENTS)
+        if not client.is_closed and hasattr(type(client), '__del__')
+    ]
 
 
 async def reap_leaked_async_httpx_clients() -> int:
@@ -1413,15 +1464,29 @@ async def reap_leaked_async_httpx_clients() -> int:
     masked by a blanket ``except Exception``
     (loud-over-silent-degradation).
 
+    MAINTENANCE NOTE: this relies on third-party internals that are not part
+    of any public API — the ``AsyncHttpxClientWrapper.__del__`` finaliser in
+    ``openai``/``anthropic``, and those wrappers chaining to
+    ``httpx.AsyncClient.__init__`` so a single base-class hook sees them.
+    Verified against httpx 0.28.1 / openai 2.31.0 / anthropic 0.92.0. If a
+    future release drops the finaliser or stops chaining, this helper degrades
+    to a no-op (returns 0) rather than raising — the reaping is then lost. That
+    loss is NOT silent: ``test_async_httpx_leak_isolation.py``'s
+    ``test_a_reaped_client_del_schedules_no_aclose_task`` asserts an UNCLOSED
+    client's ``__del__`` schedules exactly 1 ``AsyncClient.aclose()`` task, so
+    a dropped finaliser fails that test loudly (mirrors
+    ``reap_leaked_aiosqlite_connections``'s MAINTENANCE NOTE and its
+    ``PytestUnhandledThreadExceptionWarning`` backstop, task 4075). Re-verify
+    this helper against both libraries' ``_base_client.py`` whenever the
+    pinned versions change.
+
     Returns:
         The number of clients this call actually closed (``is_closed``
         confirmed post-drain) — a client that fails to close within the
         bounded timeout is not counted.
     """
     reaped = 0
-    for client in list(_TRACKED_ASYNC_HTTPX_CLIENTS):
-        if client.is_closed:
-            continue
+    for client in _leaked_async_httpx_clients():
         with contextlib.suppress(asyncio.TimeoutError, RuntimeError):
             await asyncio.wait_for(client.aclose(), timeout=10.0)
         if client.is_closed:
