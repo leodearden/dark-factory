@@ -438,11 +438,14 @@ def _resolved_client_scope(request) -> str | None:
 _CLIENT_FIXTURE_EXEMPT = {'test_fixture_isolation.py'}
 
 
-def _decorator_name(node) -> str | None:
-    """The bare name a decorator expression resolves to, or None.
+def _resolved_name(node) -> str | None:
+    """The bare name an expression resolves to, or None.
 
-    Unwraps a call — `@pytest.fixture(scope='module')` — to its callee first,
-    then reads the attribute (`pytest.fixture`) or plain name (`fixture`).
+    Unwraps a call — `@pytest.fixture(scope='module')`, `TestClient(app)` — to
+    its callee first, then reads the attribute (`pytest.fixture`) or plain name
+    (`fixture`).  Used for both decorators and constructor calls: in each case
+    the trailing NAME is what identifies the thing, not the module path it was
+    reached through.
     """
     if isinstance(node, ast.Call):
         node = node.func
@@ -460,7 +463,7 @@ def _is_fixture(node) -> bool:
     `@fixture` alike: the NAME is what identifies a fixture here, not the
     module it was imported from.
     """
-    return any(_decorator_name(d) == 'fixture' for d in node.decorator_list)
+    return any(_resolved_name(d) == 'fixture' for d in node.decorator_list)
 
 
 def _fixture_defs() -> list[tuple[Path, ast.FunctionDef]]:
@@ -520,6 +523,78 @@ class TestNoModuleLocalClientFixtures:
             f'exempt modules that have LOST theirs (restore it, or drop the '
             f'row from _CLIENT_FIXTURE_EXEMPT): '
             f'{sorted(_CLIENT_FIXTURE_EXEMPT - offenders) or "none"}'
+        )
+
+    def test_no_test_module_constructs_a_testclient_in_a_fixture(self) -> None:
+        """No fixture may BUILD its own TestClient, whatever it is named.
+
+        The general, forward-looking half of the pair above: that one keys on
+        the name `_client`, so it is blind to a future module inventing `_c` or
+        `_app_client`.  This one keys on the construction itself, so any name
+        is covered.  A second client means a second app lifespan for that
+        module — the cost conftest's module-scoped fixture exists to pay once.
+
+        Matches on a real `ast.Call` NODE, never on source text, and that is
+        load-bearing rather than fastidious: this very module's
+        `test_client_is_module_scoped_not_function_scoped` docstring contains
+        the literal `TestClient(app)`, so a `'TestClient(' in source` search
+        reports the guard's own file as an offender.  Scoping the walk to
+        fixture bodies also draws the right line at the two deliberate
+        non-duplicates: test_scaffold.py's inline client sits in a plain test
+        function, and test_api_curator.py's `_override_client` is a
+        `@contextmanager` that mutates `app.state.config` — neither is a
+        fixture, and neither needs to be whitelisted.
+        """
+        offenders = {
+            path.name
+            for path, fn in _fixture_defs()
+            if any(
+                isinstance(node, ast.Call) and _resolved_name(node) == 'TestClient'
+                for node in ast.walk(fn)
+            )
+        }
+
+        assert offenders == _CLIENT_FIXTURE_EXEMPT, (
+            f'a fixture must request conftest.py\'s `_client` rather than '
+            f'constructing its own TestClient (each copy opens a second app '
+            f'lifespan for its module) — modules that build one: '
+            f'{sorted(offenders - _CLIENT_FIXTURE_EXEMPT) or "none"}; exempt '
+            f'modules that no longer build one (drop the row from '
+            f'_CLIENT_FIXTURE_EXEMPT): '
+            f'{sorted(_CLIENT_FIXTURE_EXEMPT - offenders) or "none"}'
+        )
+
+    def test_no_test_module_shadows_a_conftest_served_asset_fixture(self) -> None:
+        """No module may redefine a served-asset fixture conftest owns.
+
+        A local shadow silently WINS over conftest's, which makes it invisible
+        to `test_each_shared_fixture_serves_what_the_app_serves` — that test
+        resolves the fixture from its own module, where no shadow exists, so it
+        stays green while the shadowed consumers probe something else entirely.
+        The shadow is then free to drift to a different asset, or to a mistyped
+        path whose 404 body every downstream absence assertion passes against
+        vacuously, with nothing reporting it.  That is the exact false-GREEN
+        class the shared table exists to prevent, reappearing one level up.
+
+        Reads `_SHARED_ASSET_FIXTURES` rather than a second hand-written list
+        of the same nine names — writing that list out again would be the very
+        duplication this task removes.  It also keeps the guard tied to
+        conftest through `test_every_conftest_body_fixture_has_a_row`: a tenth
+        shared asset added there is covered here automatically.
+        """
+        shadows = {
+            (path.name, fn.name)
+            for path, fn in _fixture_defs()
+            if fn.name in _SHARED_ASSET_FIXTURES
+        }
+
+        assert not shadows, (
+            f'these fixtures shadow a conftest-owned served-asset fixture of '
+            f'the same name, silently overriding it for their module and '
+            f'taking its consumers out of the coverage of '
+            f'`test_each_shared_fixture_serves_what_the_app_serves`: '
+            f'{sorted(f"{mod}::{name}" for mod, name in shadows)} — delete '
+            f'them and let conftest.py serve the asset'
         )
 
 
