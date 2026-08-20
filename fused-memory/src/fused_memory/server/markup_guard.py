@@ -70,14 +70,35 @@ from shared.mcp_markup_middleware import MarkupGuardMiddleware, RepairPolicy
 logger = logging.getLogger(__name__)
 
 
-#: Tools DECLARED to carry envelope literals as ordinary data, and therefore
-#: not scanned (INV-1: a machine-checkable opt-out, never a heuristic). Names
-#: are BARE in-server names — ``context.message.name`` is ``scan_memory_content``,
-#: not the agent-facing ``mcp__fused-memory__scan_memory_content``, so a prefixed
-#: spelling would silently never match.
+#: Tools DECLARED to carry envelope literals as ordinary DATA, and therefore not
+#: scanned (INV-1: a declared, machine-checkable opt-out, never a heuristic).
 #:
-#: Populated in step-4; empty here so nothing is exempt by accident.
-EXEMPT_TOOLS: frozenset[str] = frozenset()
+#: Names are BARE in-server names. ``context.message.name`` is
+#: ``scan_memory_content``, not the agent-facing
+#: ``mcp__fused-memory__scan_memory_content`` that the specimen corpus records,
+#: so an exemption declared with the prefixed spelling would silently never
+#: match — and a machine-checked declaration that fails open is worse than none.
+#:
+#: One name, with the reason it is here:
+#:
+#: * ``scan_memory_content`` — PRD boundary row B7. Its whole job is scanning the
+#:   corpus for exactly these substrings, so guarding it would make the
+#:   retroactive-sweep tool unable to look for the thing it was built to find.
+#:   It is the sanctioned tool for that lookup precisely because the fragments
+#:   carry almost no semantic signal (a live 2026-07-26 semantic probe for the
+#:   known corrupted records returned ZERO), so there is no other path to the
+#:   same answer. Load-bearing on a MEASURED shape, not a precaution: ``needles``
+#:   is declared ``list[str] | None`` and the bundled dispatcher accepts it as a
+#:   JSON STRING and coerces it, which makes it a scanned string argument — and
+#:   without this exemption a sweep for the envelope literals is refused with
+#:   ``mcp_markup_unrepairable``.
+#:
+#: Surveyed for other legitimate carriers and deliberately NOT exempted:
+#: ``redact_episode_content``, whose ``new_content`` is the CLEAN replacement
+#: text for a corrupted episode — markup there is a defect, so rejecting it is
+#: correct; and ``search``, whose ``query`` is not a sanctioned carrier because
+#: ``scan_memory_content`` is explicitly the tool for literal substring lookup.
+EXEMPT_TOOLS: frozenset[str] = frozenset({'scan_memory_content'})
 
 
 @dataclass
