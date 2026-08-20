@@ -567,7 +567,7 @@ def render_cycle_summary_section() -> str:
         'the scope-freshness snapshot pool cap; and (2) even a written '
         'tombstone expires after `mem0_tombstone.MEM0_TOMBSTONE_TTL_DAYS` '
         'days. Widening tombstone coverage to the paths above is tracked as '
-        'a follow-up — treat this as a point-in-time scope, not a closed '
+        'task 4422 — treat this as a point-in-time scope, not a closed '
         'set.\n\n'
         "The `record_type` metadata key discriminates cycle_summary writers by "
         "purpose, not by shape: `'ledger_stamp'` marks Python's deterministic "
