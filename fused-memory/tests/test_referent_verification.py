@@ -819,3 +819,158 @@ class TestCandidateTargetSelection:
                                                            r.number)))
         assert _candidate_targets(referents=refs, cited=frozenset(),
                                   other_endpoint=None) == first
+
+
+def _rows(*uuids) -> list[dict]:
+    return [{'uuid': u, 'name': 'Task 3127', 'summary': None, 'labels': []}
+            for u in uuids]
+
+
+def _one_membership_finding_episode() -> MockAddEpisodeResult:
+    """One edge whose source landed on Task 3129 while the write declared 3127."""
+    return _episode(
+        edges=[_edge('e1', fact='the deploy pipeline was retried',
+                     source='n-3129', target='n-x')],
+        nodes=[MockNode(name='Task 3129', uuid='n-3129'),
+               MockNode(name='deploy pipeline', uuid='n-x')],
+    )
+
+
+class TestNewEndpointUuidResolution:
+    """Read-only, lazy, and never issued on the clean path."""
+
+    @pytest.mark.asyncio
+    async def test_an_existing_node_resolves_to_its_uuid(self, service):
+        service.graphiti.get_nodes_by_exact_name = AsyncMock(
+            return_value=_rows('n-3127'),
+        )
+
+        stats = await service._verify_episode_referents(
+            _one_membership_finding_episode(), group_id='dark_factory',
+            referents=(Referent(number='3127'),),
+        )
+
+        assert stats.findings[0].new_endpoint_uuid == 'n-3127'
+        service.graphiti.get_nodes_by_exact_name.assert_awaited_once_with(
+            'Task 3127', group_id='dark_factory',
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_absent_node_is_none_but_still_resolvable(self, service):
+        """Absence must not be confused with unrepairability — eta MINTS it via
+        `ensure_entity_node`."""
+        service.graphiti.get_nodes_by_exact_name = AsyncMock(return_value=[])
+
+        stats = await service._verify_episode_referents(
+            _one_membership_finding_episode(), group_id='dark_factory',
+            referents=(Referent(number='3127'),),
+        )
+
+        assert stats.findings[0].new_endpoint_uuid is None
+        assert stats.findings[0].resolvable is True
+
+    @pytest.mark.asyncio
+    async def test_a_duplicate_name_group_is_none_but_still_resolvable(self, service):
+        """The PRD measured 38 live name keys carrying more than one node. zeta
+        never picks a survivor from such a group — that would pre-empt the
+        identity-lock-held collapse `_resolve_or_create_entity` performs, which
+        eta's `ensure_entity_node` reaches anyway."""
+        service.graphiti.get_nodes_by_exact_name = AsyncMock(
+            return_value=_rows('n-3127-a', 'n-3127-b'),
+        )
+
+        stats = await service._verify_episode_referents(
+            _one_membership_finding_episode(), group_id='dark_factory',
+            referents=(Referent(number='3127'),),
+        )
+
+        assert stats.findings[0].new_endpoint_uuid is None
+        assert stats.findings[0].resolvable is True
+
+    @pytest.mark.asyncio
+    async def test_the_clean_path_issues_zero_queries(self, service):
+        """What keeps the common ~99.8% case free of an extra round-trip inside
+        the per-group identity lock."""
+        result = _episode(
+            edges=[_edge('e1', source='n-3127', target='n-x')],
+            nodes=[MockNode(name='Task 3127', uuid='n-3127'),
+                   MockNode(name='deploy pipeline', uuid='n-x')],
+        )
+
+        stats = await service._verify_episode_referents(
+            result, group_id='dark_factory', referents=(Referent(number='3127'),),
+        )
+
+        assert stats.findings == []
+        service.graphiti.get_nodes_by_exact_name.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_an_unresolvable_finding_triggers_no_lookup(self, service):
+        """There is no intended referent to resolve."""
+        result = _episode(
+            edges=[_edge('e1', fact='Task 2519 was completed',
+                         source='n-2519', target='n-2520')],
+            nodes=[MockNode(name='Task 2519', uuid='n-2519'),
+                   MockNode(name='Task 2520', uuid='n-2520')],
+        )
+
+        stats = await service._verify_episode_referents(
+            result, group_id='dark_factory', referents=(Referent(number='2519'),),
+        )
+
+        assert stats.findings[0].resolvable is False
+        service.graphiti.get_nodes_by_exact_name.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_one_lookup_per_distinct_intended_referent(self, service):
+        service.graphiti.get_nodes_by_exact_name = AsyncMock(
+            return_value=_rows('n-3127'),
+        )
+        result = _episode(
+            edges=[_edge('e1', source='n-3129', target='n-x'),
+                   _edge('e2', source='n-3129', target='n-y'),
+                   _edge('e3', source='n-y', target='n-3129')],
+            nodes=[MockNode(name='Task 3129', uuid='n-3129'),
+                   MockNode(name='deploy pipeline', uuid='n-x'),
+                   MockNode(name='merge lane', uuid='n-y')],
+        )
+
+        stats = await service._verify_episode_referents(
+            result, group_id='dark_factory', referents=(Referent(number='3127'),),
+        )
+
+        assert len(stats.findings) == 3
+        assert {f.new_endpoint_uuid for f in stats.findings} == {'n-3127'}
+        assert service.graphiti.get_nodes_by_exact_name.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_a_lookup_failure_never_loses_the_finding(self, service):
+        """Detection is the primary result; the uuid is an audit convenience."""
+        service.graphiti.get_nodes_by_exact_name = AsyncMock(
+            side_effect=RuntimeError('falkor down'),
+        )
+
+        stats = await service._verify_episode_referents(
+            _one_membership_finding_episode(), group_id='dark_factory',
+            referents=(Referent(number='3127'),),
+        )
+
+        assert len(stats.findings) == 1
+        assert stats.findings[0].new_endpoint_uuid is None
+        assert stats.findings[0].resolvable is True
+
+    @pytest.mark.asyncio
+    async def test_the_lookup_is_the_only_backend_call_zeta_ever_makes(self, service):
+        """`get_nodes_by_exact_name` is documented `ro_query`-only — the one
+        primitive that answers the question with no side effect."""
+        service.graphiti.get_nodes_by_exact_name = AsyncMock(
+            return_value=_rows('n-3127'),
+        )
+
+        await service._verify_episode_referents(
+            _one_membership_finding_episode(), group_id='dark_factory',
+            referents=(Referent(number='3127'),),
+        )
+
+        assert_never_repaired(service)
+        service.graphiti._resolve_or_create_entity.assert_not_awaited()
