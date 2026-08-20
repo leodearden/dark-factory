@@ -28,7 +28,6 @@ Mirrors the sibling split: pure functions get direct pytest coverage;
 from __future__ import annotations
 
 import pytest
-
 from census_tagger_debris import (
     NEVER_RECONCILED,
     NO_PRIOR_SCOPE,
