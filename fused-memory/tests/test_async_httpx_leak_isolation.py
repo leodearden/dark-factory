@@ -6,30 +6,17 @@ the leaked ``openai``/``anthropic`` ``AsyncHttpxClientWrapper`` that produces
 ERROR records on the root ``asyncio`` logger, which then land in whichever
 unrelated test's ``caplog`` window happens to be open.
 
-MECHANISM. ``openai._base_client`` and ``anthropic._base_client`` both define::
-
-    class AsyncHttpxClientWrapper(DefaultAsyncHttpxClient):   # -> httpx.AsyncClient
-        def __del__(self) -> None:
-            if self.is_closed:
-                return
-            try:
-                asyncio.get_running_loop().create_task(self.aclose())
-            except Exception:
-                pass
-
-So an ``AsyncOpenAI`` / ``AsyncAnthropic`` that is never closed gets
-GC-finalised at a nondeterministic point; if a loop happens to be running,
-``__del__`` RESURRECTS the object as ``create_task(self.aclose())``. That
-Task's coroutine qualname is ``AsyncClient.aclose`` (inherited from httpx) —
-exactly the ``coro=<AsyncClient.aclose() ...>`` in the symptom. Its
-``aclose()`` then hits a connection pool bound to an already-closed loop and
-raises ``RuntimeError('Event loop is closed')``. Nobody retrieves it, so
-``Task.__del__`` logs ``Task exception was never retrieved`` at ERROR on the
-root ``asyncio`` logger, and it is attributed to an innocent later test.
-
-The fix rides on ``__del__``'s own ``if self.is_closed: return``
-short-circuit: closing every tracked client at each test's teardown makes the
-resurrect path unreachable, so the ERROR record can never be emitted at all.
+MECHANISM — stated ONCE, in ``_fm_helpers.reap_leaked_async_httpx_clients``'s
+docstring, next to the code that depends on it. In a line: both libraries'
+``AsyncHttpxClientWrapper`` defines a ``__del__`` that RESURRECTS an unclosed
+client as ``create_task(self.aclose())`` if any loop is running when it is
+GC-finalised, and the fix rides on that same finaliser's
+``if self.is_closed: return`` short-circuit. Read the helper before changing
+anything here: it also carries the third-party version pins the whole design
+rests on, and it is the ONE place to update on an ``openai``/``anthropic``
+bump. (Four near-verbatim copies of that narrative were collapsed into it —
+copies silently disagree the first time only one is edited, which already
+happened once in-flight with the teardown-order story below.)
 
 Design decisions (mirroring orchestrator/tests/test_aiosqlite_leak_isolation.py,
 the house template for a leak-drain defence):

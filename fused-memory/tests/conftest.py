@@ -232,15 +232,12 @@ async def _reap_leaked_ticket_workers():
 def _reap_leaked_async_httpx_clients_sync():
     """Close leaked openai/anthropic httpx clients left behind by a SYNC test.
 
-    Task 4412. ``openai``/``anthropic`` ``AsyncHttpxClientWrapper`` defines a
-    ``__del__`` that, when the object is GC-finalised while some event loop is
-    running, RESURRECTS it as ``create_task(self.aclose())``. That task's
-    ``aclose()`` hits a pool bound to an already-closed loop, raises
-    ``RuntimeError('Event loop is closed')``, and — since nobody retrieves it —
-    ``Task.__del__`` logs ``Task exception was never retrieved`` at ERROR on the
-    root ``asyncio`` logger, landing in whichever unrelated test's ``caplog``
-    window is open. Closing the client first makes ``__del__`` short-circuit on
-    ``if self.is_closed: return``, so the record can never be emitted.
+    Task 4412. For WHY an unclosed openai/anthropic client emits a ``Task
+    exception was never retrieved`` ERROR into some unrelated test's ``caplog``
+    window, and why closing it at teardown makes that record unreachable, see
+    the ONE canonical write-up of the mechanism —
+    ``_fm_helpers.reap_leaked_async_httpx_clients``. It is deliberately not
+    restated here.
 
     THIS ARM IS DEFENCE IN DEPTH, NOT COVERAGE OF A GAP THE ASYNC ARM LEAVES.
     Measured on the pinned toolchain (with a spy installed at collection time,
@@ -298,7 +295,8 @@ def _reap_leaked_async_httpx_clients_sync():
 async def _reap_leaked_async_httpx_clients(_reap_leaked_async_httpx_clients_sync):
     """Close leaked openai/anthropic httpx clients before this test's loop closes.
 
-    Task 4412 — same mechanism as the sync arm above.
+    Task 4412 — mechanism in ``_fm_helpers.reap_leaked_async_httpx_clients``,
+    same as the sync arm above.
 
     THE ARGUMENT IS THE ORDERING, and it is the only reason it is there.
     Requesting the sync arm forces the sync arm to be SET UP first and so torn
