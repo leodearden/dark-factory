@@ -58,6 +58,13 @@ Consequence for tests: the guard is installed by ``main.py``, NOT by
 ``create_mcp_server``, so a test must install it explicitly — the same shape
 ``_install_safe_tool_wrapper`` already has.
 
+Being OUTERMOST also means this layer's OWN defects are outside that wrapper's
+BaseException containment, so it carries its own: anything but
+``CancelledError`` and the guard's ``ToolError`` is logged and the call is
+re-dispatched to the contained inner wrapper (fail OPEN — a scan that crashed
+contained nothing anyway), except after the call was already forwarded, where
+re-dispatching would double a write.
+
 ## Measured parity with the write-time gate this replaces
 
 Before the four in-line ``_markup_gate`` call sites in ``tools.py`` were
@@ -80,10 +87,12 @@ expectation table and the per-specimen reasoning.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass, field
 from typing import Any, cast
 
+from fastmcp.exceptions import ToolError
 from shared.mcp_markup_middleware import MarkupGuardMiddleware, RepairPolicy
 
 from fused_memory.server.markup_tripwire import (
@@ -159,17 +168,28 @@ def _resolve_project_root(project: Any, known_projects: dict[str, str] | None) -
     ``dark_factory``. Filing against a bare id would open a queue at a relative
     directory named after the project.
 
-    So an absolute path passes through unchanged, and anything else is looked up
-    in *known_projects* — the same ``_kp.get(project_id)`` translation the
+    So an absolute path resolves to itself, and anything else is looked up in
+    *known_projects* — the same ``_kp.get(project_id)`` translation the
     write-time gate does at its four call sites.
+
+    Either way the answer must be a root the REGISTRY vouches for. The label is
+    the caller's RAW ``project_root`` argument, read at the dispatch boundary
+    before ``submit_task``/``update_task`` normalise it, and
+    ``EscalationQueue.__init__`` does ``mkdir(parents=True)`` — so accepting an
+    arbitrary absolute string would let any caller create a
+    ``<anything>/data/escalations/`` tree on this host simply by leaking markup
+    often enough to fire a burst. The retired ``_markup_gate`` never had that
+    exposure: it saw either an already-normalized ``project_root`` or a
+    ``_kp.get(project_id)`` lookup, never a raw one.
 
     An unresolvable project yields ``None`` and files NOTHING. An escalation
     filed against a guessed default is worse than one an operator has to place
-    by hand.
+    by hand — and an escalation filed against a caller-CHOSEN default is worse
+    than both.
     """
     if not isinstance(project, str) or not project:
         return None
-    if project.startswith('/'):
+    if project.startswith('/') and project in (known_projects or {}).values():
         return project
     if known_projects:
         return known_projects.get(project)
@@ -373,27 +393,66 @@ def install_markup_guard(
         # A COPY: the guard mutates ``arguments`` in place on the override
         # path, and a wrapper has no licence to edit the caller's own dict.
         context = _ShimContext(_ShimMessage(name, dict(arguments or {})), shim_fastmcp)
+        forwarded = False
 
         async def call_next(ctx: _ShimContext) -> Any:
             # Re-read name and arguments off the context rather than closing
             # over the originals, so an in-place repair reaches the tool.
             # ``*args``/``**kwargs`` — the bundled signature's ``context`` and
             # ``convert_result`` — pass through untouched.
+            nonlocal forwarded
+            forwarded = True
             return await original_call_tool(
                 ctx.message.name, ctx.message.arguments, *args, **kwargs
             )
 
-        # ToolError is deliberately NOT caught: see the module docstring.
-        #
-        # ``cast`` at this ONE site, and nowhere else, is the whole nominal cost
-        # of the adaptation. ``on_call_tool`` is annotated against fastmcp's
-        # ``MiddlewareContext[CallToolRequestParams]``, a class the bundled SDK
-        # does not have and cannot construct; the shim satisfies the three
-        # attribute paths the method actually reads (verified exhaustively
-        # against the middleware source) but is not a nominal subtype. Keeping
-        # the cast here rather than typing the shims as ``Any`` preserves real
-        # type checking inside the shim classes themselves.
-        return await guard.on_call_tool(cast(Any, context), cast(Any, call_next))
+        try:
+            # ToolError is deliberately NOT caught: see the module docstring.
+            #
+            # ``cast`` at this ONE site, and nowhere else, is the whole nominal
+            # cost of the adaptation. ``on_call_tool`` is annotated against
+            # fastmcp's ``MiddlewareContext[CallToolRequestParams]``, a class the
+            # bundled SDK does not have and cannot construct; the shim satisfies
+            # the three attribute paths the method actually reads (verified
+            # exhaustively against the middleware source) but is not a nominal
+            # subtype. Keeping the cast here rather than typing the shims as
+            # ``Any`` preserves real type checking inside the shim classes
+            # themselves.
+            return await guard.on_call_tool(cast(Any, context), cast(Any, call_next))
+        except asyncio.CancelledError:
+            # Required, exactly as _safe_call_tool requires it: cancellation
+            # must propagate or structured concurrency breaks.
+            raise
+        except ToolError:
+            # The guard's own verdict — a rejection or a refusal. Propagating it
+            # intact IS the contract this wrapper exists to deliver.
+            raise
+        except BaseException:
+            # Being the OUTER wrapper puts this layer's own defects OUTSIDE
+            # _safe_call_tool's BaseException containment — a json.dumps
+            # TypeError on an exotic argument value, a defect in repair(), a
+            # shim that stops matching the middleware. Unhandled, those reach
+            # StreamableHTTPSessionManager's shared task group and cascade into
+            # uvicorn, which is precisely the failure class the inner wrapper
+            # was added to prevent. So the guard fails OPEN into the still
+            # contained inner wrapper: a scan that crashed contained nothing
+            # anyway, and the write it was inspecting is no more dangerous than
+            # it was before this guard existed.
+            if forwarded:
+                # The tool ALREADY RAN. Re-dispatching would double a write, so
+                # the only safe move is to let the exception out — and it can
+                # only be one _safe_call_tool re-raised (CancelledError, handled
+                # above) or, in a bare-guard test wiring, the tool's own.
+                logger.exception(
+                    'markup guard raised AFTER forwarding %s; not re-dispatching '
+                    '(a second call would double the write)', name,
+                )
+                raise
+            logger.exception(
+                'markup guard raised while inspecting %s; failing OPEN to the '
+                'contained dispatcher — this call was NOT scanned', name,
+            )
+            return await original_call_tool(name, arguments, *args, **kwargs)
 
     tool_manager.call_tool = _guarded_call_tool
     tool_manager._fused_memory_markup_guarded = True

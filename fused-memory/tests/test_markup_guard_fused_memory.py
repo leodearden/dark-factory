@@ -26,6 +26,7 @@ middleware itself already do.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -45,7 +46,10 @@ from shared.mcp_markup_middleware import RepairPolicy
 from shared.toolcall_markup import CANONICAL_OPENER_PREFIX, closer_for
 
 from fused_memory.server.main import _install_safe_tool_wrapper
-from fused_memory.server.markup_guard import install_markup_guard
+from fused_memory.server.markup_guard import (
+    _resolve_project_root,
+    install_markup_guard,
+)
 from fused_memory.server.tools import create_mcp_server
 
 _PROJECT_ID = 'dark_factory'
@@ -686,8 +690,14 @@ class TestStormEscape:
         assert 'see DF 3083' not in text, (
             f'must not direct the reader at the closed predecessor: {text!r}'
         )
-        # The visible-counter half of the task's remedy, without a schema change.
-        assert str(_BURST) in text, f'must state the observed count: {text!r}'
+        # The visible-counter half of the task's remedy, without a schema
+        # change. Asserted IN CONTEXT: a bare `str(_BURST) in text` is vacuous
+        # here, because '3' also appears in 'threshold=3', in '3600.0s' and in
+        # the routing text's '3083' — it would pass with the count rendered as
+        # None or as the wrong number.
+        assert f'markup_guard_storm: {_BURST} rejected outcome(s)' in text, (
+            f'must state the observed count where a reader can attribute it: {text!r}'
+        )
 
     @pytest.mark.asyncio
     async def test_a_sink_that_raises_never_changes_the_rejection(
@@ -805,6 +815,54 @@ class TestInstalledOnTheRealServer:
         assert recorded['policy'] is RepairPolicy.REJECT_WITH_REPAIR
         assert recorded['known_projects'] is known_projects
 
+    def test_an_undeliverable_policy_is_refused_at_WIRING_time(self):
+        """The declared ValueError, which is a fail-LOUD wiring guard.
+
+        ``MarkupGuardMiddleware._forward`` returns a fastmcp ``ToolResult`` that
+        the bundled dispatcher cannot consume, so FORWARD_REPAIR does not merely
+        behave differently here — it breaks at the FIRST repair, arbitrarily far
+        from the line that declared it. A tier that cannot work has to fail at
+        the wiring, and the tool manager must be left unwrapped so the failure
+        cannot be half-applied.
+        """
+        server = create_mcp_server(AsyncMock())
+        before = server._tool_manager.call_tool
+
+        with pytest.raises(ValueError) as exc_info:
+            install_markup_guard(server, policy=RepairPolicy.FORWARD_REPAIR)
+
+        assert 'FORWARD_REPAIR' in str(exc_info.value) or 'REJECT_WITH_REPAIR' in str(
+            exc_info.value
+        )
+        # ``==`` not ``is``: an UNWRAPPED call_tool is a bound method, and every
+        # attribute access mints a fresh bound-method object, so identity would
+        # fail here even with nothing installed. Equality compares (func, self),
+        # which is exactly the question — and once wrapped the attribute holds a
+        # plain closure, which no bound method equals.
+        assert server._tool_manager.call_tool == before
+        assert getattr(server._tool_manager, '_fused_memory_markup_guarded', False) is False
+
+    def test_installing_twice_does_not_double_wrap(self):
+        """The ``_fused_memory_markup_guarded`` sentinel's whole job.
+
+        Without it a second install would chain a second guard around the first:
+        every call scanned twice, and a rejection counted twice into the storm
+        window, so a burst would fire at half the declared threshold. Re-entry is
+        routine — tests install onto a server ``main.py`` may already have
+        guarded, mirroring ``_install_safe_tool_wrapper``'s own sentinel.
+        """
+        server = create_mcp_server(AsyncMock())
+        install_markup_guard(
+            server, policy=RepairPolicy.REJECT_WITH_REPAIR, known_projects=_KNOWN_PROJECTS
+        )
+        wrapped = server._tool_manager.call_tool
+
+        install_markup_guard(
+            server, policy=RepairPolicy.REJECT_WITH_REPAIR, known_projects=_KNOWN_PROJECTS
+        )
+
+        assert server._tool_manager.call_tool is wrapped
+
     def test_the_installer_helper_installs_both_wrappers(self):
         """Unpatched, the helper leaves both sentinels set on the one tool
         manager — the guard is added to the defence-in-depth wrapper, never
@@ -900,3 +958,182 @@ class TestReconReportServerIsNotGuarded:
         manager = mcp._tool_manager
         assert getattr(manager, '_fused_memory_safe_wrapped', False) is True
         assert getattr(manager, '_fused_memory_markup_guarded', False) is False
+
+
+# ---------------------------------------------------------------------------
+# amend: the OUTER wrapper's own containment, and the registry check on the
+# label it files against.
+# ---------------------------------------------------------------------------
+
+
+_CLEAN_ADD_SYSTEM_RECORD = {
+    'content': _CLEAN_CONTENT,
+    'project_id': _PROJECT_ID,
+    'category': 'observations_and_summaries',
+    'agent_id': _AGENT_ID,
+}
+
+
+class TestTheGuardContainsItsOwnDefects:
+    """Being OUTERMOST puts this layer outside ``_safe_call_tool``'s net.
+
+    The installation order is deliberate and pinned by
+    :class:`TestInstallationOrder`: the guard has to sit OUTSIDE the
+    defence-in-depth wrapper for its ``ToolError`` to survive. The cost is that
+    the guard's own code — ``repair()``, ``json.dumps`` over an exotic argument
+    value, the shims — no longer has anything catching it, and an escape from
+    here reaches StreamableHTTPSessionManager's shared task group and cascades
+    into uvicorn. That is exactly the failure class ``_safe_call_tool`` exists to
+    prevent, so the outer layer carries its own containment.
+
+    ToolError's passage is NOT re-asserted here — every rejection test in this
+    file already depends on it, and a regression that swallowed it would fail
+    them all.
+    """
+
+    @staticmethod
+    def _break_guard(monkeypatch, impl):
+        from shared.mcp_markup_middleware import MarkupGuardMiddleware
+
+        monkeypatch.setattr(MarkupGuardMiddleware, 'on_call_tool', impl)
+
+    @pytest.mark.asyncio
+    async def test_a_defect_in_the_guard_fails_OPEN_to_the_contained_dispatcher(
+        self, monkeypatch, caplog
+    ):
+        """A scan that crashed contained nothing anyway.
+
+        So the call is re-dispatched to the inner, still-contained wrapper
+        rather than poisoning the task group: the write is no more dangerous
+        than it was before this guard existed, and the operator gets a
+        traceback saying the call went UNSCANNED.
+        """
+        async def _boom(self, context, call_next):
+            raise RuntimeError('a defect in the guard itself')
+
+        self._break_guard(monkeypatch, _boom)
+        server, mock_service = _build_guarded_server('add_system_record')
+
+        with caplog.at_level('ERROR', logger='fused_memory.server.markup_guard'):
+            result = await server._tool_manager.call_tool(
+                'add_system_record', dict(_CLEAN_ADD_SYSTEM_RECORD)
+            )
+
+        assert result == {'id': 'ok'}
+        mock_service.add_system_record.assert_awaited_once()
+        text = '\n'.join(r.getMessage() for r in caplog.records)
+        assert 'NOT scanned' in text, f'the operator must be told: {text!r}'
+
+    @pytest.mark.asyncio
+    async def test_a_defect_AFTER_forwarding_never_doubles_the_write(
+        self, monkeypatch
+    ):
+        """Fail-open must not mean fail-twice.
+
+        If the guard raises once the call has already been forwarded, the tool
+        body has ALREADY RUN — re-dispatching would write twice, which is worse
+        than any containment it buys. The exception is let out instead.
+        """
+        async def _boom_after(self, context, call_next):
+            await call_next(context)
+            raise RuntimeError('a defect after the forward')
+
+        self._break_guard(monkeypatch, _boom_after)
+        server, mock_service = _build_guarded_server('add_system_record')
+
+        with pytest.raises(RuntimeError):
+            await server._tool_manager.call_tool(
+                'add_system_record', dict(_CLEAN_ADD_SYSTEM_RECORD)
+            )
+
+        assert mock_service.add_system_record.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_cancellation_still_propagates(self, monkeypatch):
+        """The one exception the containment must NOT absorb.
+
+        Swallowing CancelledError leaks tasks and breaks structured
+        concurrency — the same contract ``_safe_call_tool`` states first.
+        """
+        async def _cancel(self, context, call_next):
+            raise asyncio.CancelledError()
+
+        self._break_guard(monkeypatch, _cancel)
+        server, mock_service = _build_guarded_server('add_system_record')
+
+        with pytest.raises(asyncio.CancelledError):
+            await server._tool_manager.call_tool(
+                'add_system_record', dict(_CLEAN_ADD_SYSTEM_RECORD)
+            )
+
+        mock_service.add_system_record.assert_not_awaited()
+
+
+class TestTheFiledProjectRootIsRegistryVouched:
+    """The queue root is never a value the CALLER chose.
+
+    ``MarkupGuardMiddleware._identity`` reads the RAW ``project_root`` argument
+    at the dispatch boundary — before ``submit_task``/``update_task`` normalise
+    it through ``resolve_main_checkout`` — and ``EscalationQueue.__init__`` does
+    ``mkdir(parents=True, exist_ok=True)``. Passing an unvouched absolute string
+    through would therefore let three leaked writes create a
+    ``<anywhere>/data/escalations/`` tree on this host. The retired
+    ``_markup_gate`` never had that exposure: it saw either an already-normalized
+    root or a ``_kp.get(project_id)`` lookup.
+    """
+
+    def test_a_registered_root_resolves_to_itself(self):
+        assert _resolve_project_root('/registered', {'p': '/registered'}) == '/registered'
+
+    def test_an_unvouched_absolute_path_resolves_to_nothing(self):
+        assert _resolve_project_root('/anything/at/all', {'p': '/registered'}) is None
+
+    def test_a_bare_id_is_still_translated_through_the_registry(self):
+        assert _resolve_project_root('p', {'p': '/registered'}) == '/registered'
+
+    def test_an_unknown_id_and_an_absent_registry_resolve_to_nothing(self):
+        assert _resolve_project_root('nope', {'p': '/registered'}) is None
+        assert _resolve_project_root('/registered', None) is None
+        assert _resolve_project_root('', {'p': '/registered'}) is None
+        assert _resolve_project_root(None, {'p': '/registered'}) is None
+
+    @pytest.mark.asyncio
+    async def test_a_burst_carrying_a_caller_chosen_root_creates_no_queue_there(
+        self, tmp_path, monkeypatch
+    ):
+        """The behavioural half, at the one tool shape that carries a path.
+
+        submit_task takes ``project_root`` from the caller, so a leaking agent
+        picks the label this sink would file under.
+        """
+        monkeypatch.setattr(
+            'fused_memory.server.tools.resolve_main_checkout', lambda p: str(p)
+        )
+        interceptor = AsyncMock()
+        interceptor.submit_task.return_value = {'ticket': 'tkt_x'}
+        server = create_mcp_server(AsyncMock(), task_interceptor=interceptor)
+        install_markup_guard(
+            server,
+            policy=RepairPolicy.REJECT_WITH_REPAIR,
+            known_projects={_PROJECT_ID: str(tmp_path / 'registered')},
+        )
+        chosen = tmp_path / 'chosen-by-the-caller'
+
+        for i in range(_BURST):
+            with pytest.raises(ToolError):
+                await server._tool_manager.call_tool(
+                    'submit_task',
+                    {
+                        'project_root': str(chosen),
+                        'prompt': f'Reconcile task {i}',
+                        'description': _leaked(
+                            f'Reconcile task {i}', 'agent_id', _AGENT_ID
+                        ),
+                    },
+                )
+
+        assert not chosen.exists(), (
+            f'the guard created a queue at a caller-chosen path: '
+            f'{sorted(tmp_path.rglob("*"))!r}'
+        )
+        interceptor.submit_task.assert_not_called()
