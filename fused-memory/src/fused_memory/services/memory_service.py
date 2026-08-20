@@ -15,7 +15,7 @@ import uuid as uuid_mod
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any, NamedTuple, cast
+from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, cast
 
 from graphiti_core.nodes import EpisodeType
 
@@ -102,6 +102,11 @@ if TYPE_CHECKING:
     from fused_memory.services.write_journal import WriteJournal
 
 logger = logging.getLogger(__name__)
+
+#: Return type of one ``_reconcile_episode_identity`` sub-pass. Generic so ONE
+#: best-effort guard covers both the six int-returning sweeps and task 3671's
+#: ``ReferentStats``-returning verification pass — see ``_run_pass``.
+_T = TypeVar('_T')
 
 # Per-sub-close timeout used by MemoryService._safe_close (task 2701). A healthy
 # FalkorDB/Qdrant localhost driver teardown completes in well under 1s; 3s gives
@@ -1595,6 +1600,13 @@ class ReconcileStats:
     stale_ttl_edges_invalidated: int = 0
     nodes_resolved: int = 0
     task_names_normalized: int = 0
+    #: The verification sub-pass's findings (task 3671, PRD leaf zeta). A
+    #: STRUCTURED RECORD SET rather than an int, deliberately: zeta's
+    #: postcondition is INV-2 structured-facts-at-failure — "which edge, which
+    #: end, which check, what should it have pointed at" — and a count cannot
+    #: carry any of that, which is exactly why the logger.debug-only int shape
+    #: above is not enough for it. Leaf eta reads the findings off this field.
+    referent_stats: ReferentStats = field(default_factory=lambda: ReferentStats())
     errors: list[str] = field(default_factory=list)
 
 
@@ -3220,9 +3232,9 @@ class MemoryService:
             return None
         return rows[0]['uuid'] if len(rows) == 1 else None
     async def _reconcile_episode_identity(
-        self, result: Any, *, group_id: str
+        self, result: Any, *, group_id: str, referents: ReferentSet = ()
     ) -> ReconcileStats:
-        """Fold the six post-write identity/dedup sweeps into one call.
+        """Fold the seven post-write identity/verification sweeps into one call.
 
         Task 2202 (W6-β): the single reconcile step ``_execute_graphiti_write``
         runs immediately after ``add_episode``, inside α's (task 2198)
@@ -3247,9 +3259,22 @@ class MemoryService:
         it is the mirror-image, under-invalidation-direction counterpart of
         the sibling-restore pass.
 
+        ``_verify_episode_referents`` (task 3671, PRD leaf zeta) runs LAST,
+        after ``_normalize_task_node_names``, and that ordering is load-bearing:
+        it keys on the canonical ``Task N`` names the normalization pass
+        produces, and the ``new_endpoint_uuid`` it resolves — plus any repair
+        leaf eta performs off its findings — must describe POST-normalization
+        topology. Minting a ``Task N`` node before normalization ran would
+        create exactly the duplicate that pass exists to collapse. (Should task
+        3335's cross-project split ever land, zeta must run after that too, for
+        the same reason.) It is also the one sub-pass that performs no writes:
+        it DETECTS and records, and its ``ReferentStats`` is the structured
+        evidence eta acts on.
+
         Each sub-pass runs under its own best-effort guard: a generic
         ``Exception`` is logged and recorded as that sub-pass's label in
-        ``ReconcileStats.errors`` (leaving its count at 0), and the
+        ``ReconcileStats.errors`` (leaving its count at its default — ``0`` for
+        the six int passes, an empty ``ReferentStats`` for zeta), and the
         remaining sub-passes still run — a single sub-pass failure must
         never fail the already-committed episode write.
         ``CancelledError``/``KeyboardInterrupt``/``SystemExit`` are never
@@ -3260,14 +3285,26 @@ class MemoryService:
                 AddEpisodeResults object), forwarded verbatim to every
                 sub-pass.
             group_id: The project graph this episode was written to.
+            referents: The referent set the write DECLARED itself to be about,
+                forwarded to the verification sub-pass. Defaults to empty, which
+                makes that pass a no-op — so every caller predating task 3671 is
+                unchanged.
 
         Returns:
-            A ReconcileStats aggregating every sub-pass's count (and any
-            per-sub-pass failure labels).
+            A ReconcileStats aggregating every sub-pass's count, the
+            verification pass's findings, and any per-sub-pass failure labels.
         """
         stats = ReconcileStats()
 
-        async def _run_pass(label: str, coro: Any) -> int:
+        async def _run_pass(label: str, coro: Awaitable[_T], default: _T) -> _T:
+            # ONE best-effort guard, not two. Task 3671's verification sub-pass
+            # is the first to return a dataclass rather than an int, so the
+            # caller supplies the DEFAULT its own type demands — a parallel
+            # object-returning guard would duplicate the swallow/propagate rule
+            # at two sites that must stay identical (the INV-5 lockstep
+            # duplication this PRD exists to push back on), and returning `0`
+            # where a ReferentStats belongs would blow up every consumer on
+            # exactly the error path this guard exists to survive.
             try:
                 return await coro
             except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
@@ -3282,31 +3319,44 @@ class MemoryService:
                     label,
                 )
                 stats.errors.append(label)
-                return 0
+                return default
 
         stats.edges_deduped = await _run_pass(
             '_dedup_episode_edges',
             self._dedup_episode_edges(result, group_id=group_id),
+            0,
         )
         stats.dependency_edges_restored = await _run_pass(
             '_restore_superseded_dependency_edges',
             self._restore_superseded_dependency_edges(result, group_id=group_id),
+            0,
         )
         stats.sibling_edges_restored = await _run_pass(
             '_restore_falsely_superseded_sibling_edges',
             self._restore_falsely_superseded_sibling_edges(result, group_id=group_id),
+            0,
         )
         stats.stale_ttl_edges_invalidated = await _run_pass(
             '_invalidate_stale_superseded_ttl_edges',
             self._invalidate_stale_superseded_ttl_edges(result, group_id=group_id),
+            0,
         )
         stats.nodes_resolved = await _run_pass(
             '_dedup_episode_nodes',
             self._dedup_episode_nodes(result, group_id=group_id),
+            0,
         )
         stats.task_names_normalized = await _run_pass(
             '_normalize_task_node_names',
             self._normalize_task_node_names(result, group_id=group_id),
+            0,
+        )
+        stats.referent_stats = await _run_pass(
+            '_verify_episode_referents',
+            self._verify_episode_referents(
+                result, group_id=group_id, referents=referents,
+            ),
+            ReferentStats(),
         )
         return stats
 
@@ -3400,12 +3450,12 @@ class MemoryService:
         # the same channel. An ABSENT key decodes to ((), 'none'), so a queue
         # row written before this feature executes byte-identically to today.
         #
-        # `referents` is the value leaf zeta will hand to
-        # `_verify_episode_referents(result, group_id=..., referents=referents)`
-        # INSIDE the identity-lock critical section below — deliberately inside,
-        # so no wrongly-attached state is ever externally visible between the
-        # write and its verification. Nothing else in this method changes, which
-        # is what keeps an old-format row byte-identical.
+        # `referents` is handed to `_reconcile_episode_identity` below, which
+        # forwards it to leaf zeta's `_verify_episode_referents` (task 3671) as
+        # the LAST sub-pass — INSIDE the identity-lock critical section,
+        # deliberately, so no wrongly-attached state is ever externally visible
+        # between the write and its verification. Nothing the BACKEND sees
+        # changes, which is what keeps an old-format row byte-identical.
         referents: ReferentSet
         referents, referent_source = _decode_referents(payload)
         # INV-4 escape: EVERY Graphiti write is bucketed, so the absent and
@@ -3455,9 +3505,6 @@ class MemoryService:
                 # That resolves epsilon's half of PRD open question 2 (which
                 # suggested `write_ops.params`) without pre-empting iota's
                 # read-path choice.
-                #
-                # `len(referents)` is also what keeps the decoded set a live
-                # local rather than dead code until leaf zeta lands.
                 payload={
                     'content': payload['content'][:200],
                     'group_id': payload.get('group_id'),
@@ -3477,7 +3524,7 @@ class MemoryService:
                 ),
             )
             reconcile_stats = await self._reconcile_episode_identity(
-                result, group_id=payload['group_id'],
+                result, group_id=payload['group_id'], referents=referents,
             )
             logger.debug(
                 'Reconciled episode identity for group_id=%r: %r',

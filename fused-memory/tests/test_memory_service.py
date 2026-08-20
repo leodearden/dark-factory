@@ -5711,7 +5711,7 @@ class TestWriteTimeIdentityGate:
             )
             return mock_result
 
-        async def fake_reconcile(result, *, group_id):
+        async def fake_reconcile(result, *, group_id, referents=()):
             observed_locked['reconcile'] = lock.locked()
             observed_same_lock['reconcile'] = (
                 service.graphiti._identity_lock_for(group_id) is lock
@@ -5775,7 +5775,7 @@ class TestWriteTimeIdentityGate:
             await _bump()
             return MockAddEpisodeResult()
 
-        async def fake_reconcile(result, *, group_id):
+        async def fake_reconcile(result, *, group_id, referents=()):
             await _bump()
             return ReconcileStats()
 
