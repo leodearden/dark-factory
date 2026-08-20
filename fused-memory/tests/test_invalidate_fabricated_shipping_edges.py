@@ -230,7 +230,20 @@ class TestRunApplyStoreMutationPreflight:
         Reaching the backend sentinel proves the guard is a gate and not a
         detour: with the probe passing, execution continues into the normal
         path. The operation string identifies this script and its mutating
-        mode, and is probed once for the RUN, not once per candidate edge.
+        mode.
+
+        What ``len(calls) == 1`` pins here, precisely: the guard SITE probes
+        exactly once, and it sits above the backend stack. It is deliberately
+        NOT the once-per-run-not-once-per-record claim its siblings make --
+        ``_install_backend_sentinel`` stops the run at ``MemoryService``
+        construction, so no candidate edge is ever scanned and a hypothetical
+        per-edge probe downstream would not show up in ``calls``. This suite
+        has no injectable service seam to reach that loop with (contrast
+        ``test_tag_cgl_eta_rehome_scope``, which seeds two mutable records and
+        runs on through them), so the per-edge property is pinned
+        STRUCTURALLY instead: ``test_it_aborts_before_constructing_any_backend``
+        shows there is no reachable code between the probe and the refusal
+        that could hold a second one.
         """
         calls: list[dict] = []
         monkeypatch.setattr(
@@ -241,7 +254,9 @@ class TestRunApplyStoreMutationPreflight:
         with pytest.raises(_BackendWasConstructed):
             await _mod._run(self._args(apply=True))
 
-        assert len(calls) == 1, 'probed ONCE per run, not once per edge'
+        assert len(calls) == 1, (
+            'the guard site probes exactly once, above the backend stack'
+        )
         assert 'invalidate_fabricated_shipping_edges' in calls[0]['operation']
         assert '--apply' in calls[0]['operation']
 

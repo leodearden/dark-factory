@@ -219,7 +219,20 @@ async def main() -> int:
         # migrate_cross_graph_leak's fail-closed store preflight: _load_migrate
         # above EXECUTES that file via importlib.spec_from_file_location, so
         # the probe in its run() runs for this call exactly as it does for the
-        # CLI. A second probe here would only double-probe every run.
+        # CLI.
+        #
+        # The COST of siting the only probe here is real and is stated rather
+        # than waved away: in a write-denied environment steps 2-4 above (a
+        # fresh full-graph census, the cross-target recovery dump, and a
+        # FalkorDB BGSAVE plus a docker cp of the whole RDB with up to a 120s
+        # poll) are all performed and then thrown away when the refusal
+        # finally arrives here. An early probe at the top of main() would cost
+        # one file create+unlink and would buy that back. It is not added
+        # because a single probe site keeps this script's guard exactly
+        # co-extensive with migrate's -- there is no second message to keep in
+        # sync, and no way for the two to disagree about what is allowed. If
+        # that trade is ever revisited, the early probe is the change to make;
+        # migrate's run() probe must stay the authoritative one either way.
         #
         # That inheritance is load-bearing and fragile, so two things must stay
         # true (both pinned by tests/test_cgl_eta_auto_apply_impl.py):

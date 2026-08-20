@@ -305,9 +305,17 @@ class TestInheritedStoreMutationPreflight:
         """Step 2 of this script's sequence is a fresh dry-run census
         (``SimpleNamespace(apply=False, ...)`` at the ``migrate.run`` above the
         apply one). It mutates nothing, so it must not be gated on write
-        capability — and it must not probe, or the census/backup/recovery-dump
-        steps that precede the apply would all be paid for and then refused at
-        the last moment."""
+        capability: the census has standalone diagnostic value and must stay
+        obtainable from a read-only environment, exactly as ``--apply``-less
+        runs do everywhere else in this contract.
+
+        The trade this placement accepts, stated plainly: because the ONLY
+        probe in this script's sequence is the inherited one inside
+        ``migrate.run(apply=True)`` at step 5, a write-denied environment pays
+        for this census, the cross-target recovery dump and the full FalkorDB
+        backup before the refusal arrives. An early probe in ``main`` would
+        buy that back; see the comment at the step-5 call site for why a
+        single probe site was preferred anyway."""
         migrate = _load_migrate_from_this_tree(monkeypatch)
         shim, _ = _shim()
 
