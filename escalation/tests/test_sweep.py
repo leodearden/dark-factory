@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -963,3 +965,53 @@ class TestStartupSweepOrphanLockPass:
             'second run_startup_sweep changed disk state — the reap pass either '
             're-created a sidecar via escalation_id_lock or re-reaped'
         )
+
+
+class TestReapOrphanLocksConcurrency:
+    """What happens when another process acts while we hold the per-id lock.
+
+    Both tests model that process DETERMINISTICALLY — no threads, no sleeps — by
+    wrapping ``sweep.escalation_id_lock`` in a context manager that delegates to
+    the real one and performs its side effect INSIDE the critical section, which
+    is exactly the interleaving a real concurrent writer produces.
+    """
+
+    def _patch_lock_with_side_effect(self, monkeypatch, side_effect):
+        real_lock = sweep.escalation_id_lock
+
+        @contextlib.contextmanager
+        def _lock_with_side_effect(queue_dir: Path, escalation_id: str):
+            with real_lock(queue_dir, escalation_id):
+                side_effect(Path(queue_dir), escalation_id)
+                yield
+
+        monkeypatch.setattr(sweep, 'escalation_id_lock', _lock_with_side_effect)
+
+    def test_record_created_while_lock_held_is_not_reaped(self, tmp_path: Path, monkeypatch):
+        """A writer mid-submit that held the sidecar first must keep its lock."""
+        def _submit_the_record(queue_dir: Path, escalation_id: str) -> None:
+            _write_root_esc(queue_dir, escalation_id, 'pending')
+
+        self._patch_lock_with_side_effect(monkeypatch, _submit_the_record)
+        lock_path = _write_lock(tmp_path, 'esc-1-1')
+
+        count = sweep.reap_orphan_locks(tmp_path, apply=True)
+
+        assert count == 0, 'the record exists by the time we hold the lock — not an orphan'
+        assert lock_path.exists(), (
+            'reaped the sidecar of a record that appeared between the pre-check '
+            'and the lock — the in-lock re-check is missing'
+        )
+
+    def test_lock_vanishing_under_us_is_tolerated(self, tmp_path: Path, monkeypatch):
+        """Another process removing the sidecar first is the intended end state."""
+        def _steal_the_sidecar(queue_dir: Path, escalation_id: str) -> None:
+            os.unlink(queue_dir / f'{escalation_id}.json.lock')
+
+        self._patch_lock_with_side_effect(monkeypatch, _steal_the_sidecar)
+        lock_path = _write_lock(tmp_path, 'esc-1-1')
+
+        count = sweep.reap_orphan_locks(tmp_path, apply=True)
+
+        assert count == 1, 'the sidecar is gone, which is what we wanted — count it'
+        assert not lock_path.exists()
