@@ -176,13 +176,36 @@ class ManifestCapability(BaseModel):
     queue (enforced upstream of this schema, not here). ``delivered_check``
     is optional — omitted (or ``kind='manual'``) excludes the capability
     from the automated gate.
+
+    The ``verdict`` vocabulary is closed and three-valued:
+
+    - ``PASS`` — the binding held at authoring time.
+    - ``FAIL`` — the capability was measured ABSENT. Per
+      ``skills/prd/references/gates.md`` ("Any capability resolving to a
+      FAIL value blocks queueing until resolved") this BLOCKS queueing
+      until resolved. That rule is unchanged by the existence of OPEN.
+    - ``OPEN`` — the binding is deliberately UNDECIDED, and the decision is
+      homed in THIS leaf as its own work product. It does not block
+      queueing, and it must never be read as a green G3 binding.
+
+    ``OPEN`` exists because two rows in the corpus could not be recorded
+    honestly in a binary vocabulary — see
+    ``plans/toolcall-markup-containment-prd.capability-manifest.yaml``:
+    gamma2's ``d1-ruling-recorded-against-3692s-read-time-path`` is a
+    ruling the leaf must MAKE, and gamma3's
+    ``fused-memory-boundary-adapted`` is a row whose original PASS was
+    measured false. Recording either as PASS would restore that known
+    false green; recording either as FAIL would falsely assert the leaf is
+    blocked while its owning task is in-progress. Widening the vocabulary
+    is not a licence to author ``OPEN`` in place of doing the substrate
+    work: it records that the decision belongs to the leaf, nothing more.
     """
 
     model_config = ConfigDict(extra='forbid')
 
     name: str = Field(min_length=1)
     binding: str
-    verdict: Literal['PASS', 'FAIL']
+    verdict: Literal['PASS', 'FAIL', 'OPEN']
     delivered_check: DeliveredCheck | None = None
 
 
