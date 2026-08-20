@@ -845,7 +845,12 @@ class _FakeMovingCorpusQuery(_FakeCappedEdgeQuery):
     case, not the exotic one.
     """
 
-    def __init__(self, rows: list[list], cap: int, *, counts: list[int]) -> None:
+    def __init__(
+        self, rows: list[list], cap: int, *, counts: list[int | None],
+    ) -> None:
+        # ``None`` is a real element type, not a defensive widening: a probe
+        # that stops answering mid-run is the asymmetric case this fake
+        # exists to produce, so the annotation has to admit it.
         super().__init__(rows, cap)
         self.counts = list(counts)
 
