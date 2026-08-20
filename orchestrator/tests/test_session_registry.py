@@ -4049,7 +4049,11 @@ def test_main_lease_claim_slug_line_names_this_caller_not_the_holder(
     assert rc == 0
     lines = capsys.readouterr().out.splitlines()
     assert lines[0] == 'decision=stand-down'
-    assert lines[2] in ('holder_liveness=held', 'holder_liveness=orphaned')
+    # DETERMINISTIC, not "either value": the holder above was seeded with
+    # `_DEAD_PID`, which `test_main_lease_claim_reports_orphaned_for_a_dead_holder_pid`
+    # already pins as `orphaned`. Accepting `held` too would buy nothing and
+    # would read as if the outcome were nondeterministic.
+    assert lines[2] == 'holder_liveness=orphaned'
     assert lines[3] == f'slug=watcher-df-{os.getpid()}'
     assert 'watcher-df-OTHER' not in lines[3]
 
@@ -4155,6 +4159,39 @@ def test_main_lease_verbs_refuse_loudly_when_the_slug_cannot_be_derived(
     assert '--slug' in err
     # Nothing was mutated on the way out.
     assert lease_path.read_text() == original_body
+
+
+def test_the_read_only_lease_verbs_stay_usable_when_the_slug_cannot_be_derived(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """DIAGNOSIS must survive the degraded path the exit-2 refusal creates.
+
+    `lease-show` and `lease-reap` are exactly what the refusal message and both
+    watcher SKILLs tell a refused or degraded operator to run next — so the
+    guard must cover only the three SLUG-BEARING verbs. Nothing else pins that:
+    the guard is scoped by a hardcoded verb tuple, and widening it (or hoisting
+    it above the verb check) would leave every new test green while removing
+    the operator's only way to see WHY they were refused.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    monkeypatch.setenv('CLAUDE_PID', str(os.getpid()))
+    _claim_via_cli()
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    capsys.readouterr()
+
+    monkeypatch.delenv('CLAUDE_PID', raising=False)
+
+    # Read-only inspection: still prints its normal key=value report.
+    assert sr.main(['lease-show', '--name', 'watcher-df']) == 0
+    shown = dict(line.split('=', 1) for line in capsys.readouterr().out.splitlines())
+    assert shown['name'] == 'watcher-df'
+    assert shown['holder_slug'] == 'watcher-df-100'
+
+    # The sweep: also unguarded, and a live holder is still not reaped.
+    assert sr.main(['lease-reap']) == 0
+    assert lease_path.is_file()
 
 
 def test_an_explicit_slug_is_still_the_escape_hatch_under_an_unresolvable_pid(
