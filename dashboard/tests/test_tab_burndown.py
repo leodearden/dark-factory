@@ -8,24 +8,6 @@ from __future__ import annotations
 
 import re
 
-import pytest
-
-
-@pytest.fixture(scope='module')
-def tabs_jsx_body(_client):
-    return _client.get('/static/redux/tabs.jsx').text
-
-
-@pytest.fixture(scope='module')
-def app_jsx_body(_client):
-    return _client.get('/static/redux/app.jsx').text
-
-
-@pytest.fixture(scope='module')
-def charts_jsx_body(_client):
-    return _client.get('/static/redux/charts.jsx').text
-
-
 # ---------------------------------------------------------------------------
 # Chart labels/values pairing probe
 # ---------------------------------------------------------------------------

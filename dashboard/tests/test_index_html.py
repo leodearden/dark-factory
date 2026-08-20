@@ -52,17 +52,6 @@ def _find_script_position(
     return None
 
 
-@pytest.fixture(scope='module')
-def index_html_body():
-    """Fetch /static/redux/index.html once for the whole test module."""
-    from starlette.testclient import TestClient
-
-    from dashboard.app import app
-
-    with TestClient(app) as c:
-        return c.get(_INDEX_URL).text
-
-
 def test_static_index_html_serves_200(client):
     """GET /static/redux/index.html via the StaticFiles mount returns 200."""
     resp = client.get(_INDEX_URL)
