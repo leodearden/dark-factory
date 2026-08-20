@@ -47,6 +47,8 @@ distinguishable from each other.
 """
 from __future__ import annotations
 
+import pathlib
+import posixpath
 import shlex
 
 import pytest
@@ -299,3 +301,149 @@ def test_positional_targets_propagates_the_anchor_assertion_with_the_label() -> 
     with pytest.raises(AssertionError) as excinfo:
         vci.positional_targets("uv run ruff format alpha", _RUFF, label="the documented command")
     assert "the documented command" in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# covers
+# ---------------------------------------------------------------------------
+
+
+def _slashless_is_collected(rel_path: str, targets: list[str]) -> bool:
+    """``_is_collected`` from ``test_skills_module_config_decision.py``, transcribed.
+
+    An INDEPENDENT oracle for the agreement check below — deliberately a literal
+    copy of the pre-migration body rather than a call into the module under test,
+    so the two can genuinely disagree.
+    """
+    candidate = pathlib.PurePosixPath(rel_path)
+    names = {rel_path}
+    for parent in candidate.parents:
+        if parent == pathlib.PurePosixPath("."):
+            continue
+        names.add(parent.as_posix())
+    return any(t in names for t in targets)
+
+
+def test_covers_matches_an_exact_target() -> None:
+    assert vci.covers("conftest.py", ["conftest.py", "df_pytest_isolation.py"])
+
+
+def test_covers_treats_an_ancestor_directory_as_real_coverage() -> None:
+    """``ruff check skills`` and ``pytest tests/scripts/`` both traverse the directory."""
+    assert vci.covers("skills/factory-init/scripts/find_escalation_port.py", ["skills"])
+
+
+def test_covers_is_exact_element_never_substring() -> None:
+    """THE property the whole trio exists to provide, and the one ``in cmd`` destroys.
+
+    ``'scripts'`` is a substring of ``'tests/scripts/test_x.py'``, so a naive
+    containment test would report a file as linted by a command that never sees
+    it — a guard that passes vacuously, which is the silent failure direction.
+    """
+    assert not vci.covers("tests/scripts/test_x.py", ["scripts"])
+
+
+def test_covers_tolerates_a_trailing_slash_on_the_target() -> None:
+    """Slash tolerance is ``test_root_lint_covers_nonmember_py.py``'s requirement.
+
+    Its targets are RAW command tokens, so ``ruff check a/`` yields the target
+    ``'a/'`` with the slash still attached. The slashless form (which the skills
+    guard can afford, because ``posixpath.normpath`` has already stripped it)
+    returns False here — so the slash-TOLERANT form is the one that must survive
+    the unification, and this pair is the measurement that says so.
+    """
+    assert vci.covers("a/b.py", ["a/"])
+    assert not _slashless_is_collected("a/b.py", ["a/"])
+
+
+def test_covers_does_not_let_the_root_parent_cover_everything() -> None:
+    """``PurePosixPath('a/b.py').parents`` ends at ``'.'``, which is skipped.
+
+    Without the skip a ``.`` target — or any command run from the repo root that
+    happened to name it — would vacuously cover every path in the repo.
+    """
+    assert not vci.covers("a/b.py", ["."])
+
+
+@pytest.mark.parametrize(
+    "rel_path",
+    [
+        "conftest.py",
+        "tests/scripts/test_x.py",
+        "skills/factory-init/scripts/find_escalation_port.py",
+        "orchestrator/tests/test_verify.py",
+        "a/b.py",
+        "scripts/legibility/codebook.py",
+    ],
+)
+@pytest.mark.parametrize(
+    "targets",
+    [
+        [],
+        ["tests/scripts"],
+        ["tests"],
+        ["skills"],
+        ["conftest.py"],
+        ["orchestrator/tests"],
+        ["scripts"],
+        ["tests/scripts", "skills", "conftest.py"],
+        ["does/not/match"],
+    ],
+)
+def test_covers_agrees_with_the_slashless_form_on_normpathed_targets(
+    rel_path: str, targets: list[str]
+) -> None:
+    """THE SUPERSET EQUIVALENCE that lets one function replace both copies.
+
+    ``test_skills_module_config_decision.py`` only ever passes targets that have
+    been through ``posixpath.normpath``, so they carry no trailing slash. On
+    exactly that input the slash-tolerant name set and the slashless one agree,
+    while the tolerant one additionally handles the raw tokens
+    ``test_root_lint_covers_nonmember_py.py`` passes. Superset, not replacement:
+    neither caller regresses.
+
+    Every target below is already normpath-stable, which is what makes this an
+    assertion about the inputs the skills guard actually produces rather than
+    about arbitrary strings (``['a/']`` disagrees, on purpose — see the trailing
+    slash test above).
+    """
+    assert all(posixpath.normpath(t) == t for t in targets), "oracle inputs must be normpath-stable"
+    assert vci.covers(rel_path, targets) == _slashless_is_collected(rel_path, targets)
+
+
+# ---------------------------------------------------------------------------
+# flag_args
+# ---------------------------------------------------------------------------
+
+
+def test_flag_args_catches_both_the_spaced_and_equals_spellings() -> None:
+    tokens = shlex.split("ruff check a --exclude b --extend-exclude=c --force-exclude")
+    prefixes = ("--exclude", "--extend-exclude", "--force-exclude")
+    assert vci.flag_args(tokens, prefixes) == ["--exclude", "--extend-exclude=c", "--force-exclude"]
+
+
+def test_flag_args_returns_empty_when_no_flag_is_present() -> None:
+    tokens = shlex.split("uv run ruff check scripts/ tests/scripts/")
+    assert vci.flag_args(tokens, ("--exclude", "--extend-exclude", "--force-exclude")) == []
+
+
+def test_flag_args_scope_is_the_callers_choice_not_a_default() -> None:
+    """THE executable statement of why this takes TOKENS rather than a segment.
+
+    ``uv run --project <member> pyright <dir>`` and ``pyright --project <file>
+    <dir>`` contain the SAME CHARACTERS naming two unrelated things: uv's
+    PRE-anchor ``--project`` selects the member ENVIRONMENT and narrows nothing,
+    while pyright's POST-anchor ``--project`` redirects the CONFIG FILE and can
+    relax ``typeCheckingMode`` wholesale. Only POSITION distinguishes them.
+
+    So the two live callers pass different token lists ON PURPOSE:
+    ``test_root_lint_covers_nonmember_py.py``'s ``_ruff_exclude_flags`` scans the
+    WHOLE segment, and task 4358 deliberately narrowed
+    ``test_scripts_module_config.py``'s ``_narrowing_flag_args`` to the
+    post-anchor slice. A shared helper that took a segment would have to pick
+    one scope and would regress whichever caller it did not pick.
+    """
+    segment = "uv run --project shared pyright scripts/"
+    prefixes = ("--skip", "-p", "--project")
+    assert vci.flag_args(shlex.split(segment), prefixes) == ["--project"]
+    assert vci.flag_args(vci.anchor_split(segment, "pyright")[1], prefixes) == []
