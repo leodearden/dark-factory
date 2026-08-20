@@ -211,6 +211,32 @@ setting it as the landed default — this is a green-tier, hot-reloadable
 knob (`RELOADABLE_FIELDS`, `orchestrator/src/orchestrator/config.py:3238`),
 so adopting `'16'` later requires no restart.
 
+#### Addendum 2026-08-19 — dark_factory's DEPLOYED value is now `"8"` (task 4456)
+
+This section's recommendation still stands as written **for the code default
+and for every other install**: `verify_admission_pytest_n` ships as `'auto'`
+and task 4456 changed no source.
+
+What changed is dark_factory's *deployed* value. By operator decision (Leo,
+2026-08-19, esc-5984-3), `dark-factory-orchestrator.yaml` now sets
+`verify_admission_pytest_n: "8"` — an interim partial cap pending task 3589,
+reaching roles `{task, background}` only. The basis is task **3589's
+loaded-host ladder**, which POSTDATES this report: vs `n=16`, ~108% wall clock
+at ~61% of CPU-seconds and ~50% of RAM; vs `n=32`, both faster (9.31s vs
+12.27s) and 2.7x cheaper in CPU-seconds.
+
+**This report's own `-n 16` candidate was considered and not chosen** — the
+ladder above measured it directly rather than leaving it untested.
+
+Note the two sources were taken under different conditions and neither
+supersedes the other by date alone: this report's "keep `'auto'`" rests on the
+absence of a clean idle window, while 3589's ladder is explicitly a
+*loaded-host* measurement. **Anyone reopening the value question must
+reconcile BOTH, not cite either alone.** The yaml comment block points back
+here for exactly that reason, and
+`orchestrator/tests/test_verify_pytest_n_operator_cap.py` is the executable
+half pinning the deployed value and its role gating.
+
 ### PRD §9 item 3 — should `background` be excluded from `-n` capping?
 
 **Recommend NO — keep `background` included in the cap** (already

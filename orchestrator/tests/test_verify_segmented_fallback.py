@@ -846,12 +846,21 @@ class TestSegmentsAreDashNCapped:
     single pytest command — not N times the parallelism. Silently discarding
     a cap the operator configured is the degradation; honouring it is the fix.
 
-    Blast radius on this repo is zero: ``verify_admission_pytest_n`` ships as
-    'auto', which ``apply_pytest_numprocesses`` already no-ops, and the
-    committed YAML does not override it. Only a project that deliberately set
-    a numeric cap — i.e. one currently being ignored — is affected. The last
-    two tests pin that zero, so a future change cannot start rewriting
-    commands at the default.
+    ``verify_admission_pytest_n`` still SHIPS as 'auto', which
+    ``apply_pytest_numprocesses`` already no-ops, so the blast radius at the
+    DEFAULT remains zero and the last two tests pin that — a future change
+    cannot start rewriting commands at the default.
+
+    SUPERSEDED (task 4456, 2026-08-19): this block used to add "and the
+    committed YAML does not override it". That is no longer true — this repo's
+    dark-factory-orchestrator.yaml now sets ``verify_admission_pytest_n: "8"``
+    as an interim operator cap pending task 3589. THIS MODULE is unaffected
+    regardless, for two reasons that do not depend on the deployed value: its
+    shared driver hardcodes ``verify_admission_enabled: False``, and its capped
+    tests pass ``verify_admission_pytest_n`` explicitly via
+    ``_CAPPED_OVERRIDES``. dark_factory is now itself "a project that
+    deliberately set a numeric cap", which is the case this class exists to
+    cover.
     """
 
     _CAPPED_OVERRIDES = {
