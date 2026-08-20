@@ -393,6 +393,49 @@ class TestSetMembershipCheck:
         assert stats.edges_scanned == 0
 
     @pytest.mark.asyncio
+    async def test_an_entity_edges_only_result_is_walked_like_the_sibling_sweeps(
+        self, service,
+    ):
+        """The `result.edges or result.entity_edges` idiom, which this pass's
+        docstring promises parity with.
+
+        Every one of the six sibling post-write sweeps in `memory_service.py`
+        reads `getattr(result, 'edges', None) or getattr(result,
+        'entity_edges', None) or []`. A result exposing only `entity_edges` is
+        a shape they all still walk, so zeta reading `edges` ALONE would make
+        it a silent, total no-op there — no findings, no counters, no warning —
+        rather than the degraded-but-handled behaviour it documents.
+
+        `_episode()` deliberately nulls `entity_edges` so the other tests can
+        prove `.edges` is the attribute walked; this is the mirror case, so it
+        builds the result directly. Assigning after construction is what makes
+        the shape reachable at all: `MockAddEpisodeResult.__post_init__`
+        mirrors `entity_edges` INTO `edges`, so passing it to the constructor
+        would populate both and prove nothing.
+        """
+        result = MockAddEpisodeResult(
+            edges=[],
+            nodes=[MockNode(name='Task 3129', uuid='n-3129'),
+                   MockNode(name='deploy pipeline', uuid='n-x')],
+        )
+        result.entity_edges = [
+            _edge('e1', fact='the deploy pipeline was retried',
+                  source='n-3129', target='n-x'),
+        ]
+        assert result.edges == [], 'the shape under test carries no `.edges`'
+
+        stats = await service._verify_episode_referents(
+            result, group_id='dark_factory', referents=(Referent(number='3127'),),
+        )
+
+        assert stats.edges_scanned == 1
+        assert len(stats.findings) == 1
+        assert stats.findings[0].edge_uuid == 'e1'
+        assert stats.findings[0].check == 'set-membership'
+        assert stats.set_membership_findings == 1
+        assert_never_repaired(service)
+
+    @pytest.mark.asyncio
     async def test_an_empty_referent_set_makes_the_whole_pass_a_no_op(self, service):
         """Honours epsilon's published contract ("an EMPTY `.referents` carries
         nothing to test membership against, so a downstream verifier must no-op
