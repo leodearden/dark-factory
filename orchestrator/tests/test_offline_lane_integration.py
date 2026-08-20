@@ -134,6 +134,56 @@ _SPAWNS_PER_REPO_FIXTURE = 5
 # which it is here (the `git_config` fixture never sets it).
 _SPAWNS_PER_DRIVE_ADVANCE = 4
 
+
+def _required_timeout_secs(bounded_secs: float, out_of_bound_spawns: int) -> float:
+    """Task 4203 — THE canonical sizing model for `@pytest.mark.timeout`
+    OVERRIDES on tests that compose past a single `_run_lane` pass. This is
+    the single, callable statement of the model; both
+    `test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling` and
+    `test_every_composing_caller_carries_a_timeout_override` call it rather
+    than re-deriving or re-stating it in prose, so the rule cannot drift into
+    per-callsite copies the way `_drive_advance`'s spawn count already had
+    (two landed docstrings undercounted it, inconsistently, before this
+    task).
+
+    THE MODEL: a composing test's effective per-test pytest-timeout must
+    cover its bounded-wait sum (*bounded_secs* — sums of
+    `_LANE_PASS_BOUND_SECS`-style waits the test's own body composes) PLUS
+    its counted out-of-bound real-git subprocess spawns (*out_of_bound_spawns*
+    — real git work the test does OUTSIDE any bounded `wait_for`/`_run_lane`
+    window), each spawn priced at the worst-case measured latency
+    `_MEASURED_SPAWN_LATENCY_SECS`. Every term is an already-measured,
+    already-pinned quantity — task 3451's 4.71s, and the
+    `_SPAWNS_PER_REPO_FIXTURE` / `_SPAWNS_PER_DRIVE_ADVANCE` counts this
+    task's own measuring test pins — nothing guessed, matching the bar
+    `test_lane_bounds_...`'s own floor check already sets for itself ("the
+    multiplier is DERIVED, not guessed").
+
+    WHY THE ADDITIVE TERM EXISTS: pytest-timeout 2.4.0 installs its timer in
+    `pytest_runtest_protocol` whenever `func_only` is False — unset
+    repo-wide, so true for every test here — meaning the per-test budget
+    covers fixture setup/teardown and all real-git test-body work, not just
+    the bounded waits. Before this task, the marker-carrying guard
+    (`test_every_composing_caller_carries_a_timeout_override`) compared a
+    marker only against the bounded-wait sum (a bare `value > worst_case`),
+    reserving ZERO headroom for that real-git work — while the marker-less
+    guard (immediately above) reserved 40% of the budget for exactly it. That
+    asymmetry, not any one test's marker value, is what this task fixes:
+    `test_b7_stall_promotes_to_blocker` is simply the first test where the
+    missing term became numerically visible (see its updated
+    `@pytest.mark.timeout` comment for the worked derivation).
+
+    SCOPE — applies to the marker-carrying OVERRIDES only, i.e. a number this
+    suite CHOOSES. The marker-less population deliberately keeps
+    `_MARKERLESS_CEILING_FRACTION` as its proxy instead of this model — see
+    the reconciliation assertion and comment in
+    `test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling` for
+    why (not restated here, to avoid recreating the near-verbatim docstring
+    copies task 4030 removed).
+    """
+    return bounded_secs + out_of_bound_spawns * _MEASURED_SPAWN_LATENCY_SECS
+
+
 # ---------------------------------------------------------------------------
 # Shared end-to-end scaffolding (prerequisite P1)
 # ---------------------------------------------------------------------------
