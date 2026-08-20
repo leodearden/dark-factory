@@ -92,6 +92,18 @@ CREDENTIALS_PATH = Path.home() / '.claude' / '.credentials.json'
 # constant, not an operator knob.
 _SCOPE_WAIT_REPOLL_CEIL_SECS = 5.0
 
+# Consecutive spawn failures on ONE account before the gate latches
+# `probe_infra_fault` (task 4512). Greater than 1 so a single transient spawn
+# error cannot flap the latch; small so a real host fault — a missing binary, a
+# broken self-update symlink, an unresolvable PATH — is named within a few
+# probe cycles instead of hours. Counted CONSECUTIVELY rather than over a
+# window (cf. shared/storm_counter.py): a spawn error immediately followed by a
+# probe that RAN is genuinely transient and must clear, whereas a windowed
+# counter would still latch on three errors interleaved with successes.
+# Deliberately an internal constant, not an operator knob — it tunes how
+# quickly a fault is NAMED, not whether the fault is tolerated.
+_SPAWN_FAULT_THRESHOLD = 3
+
 # Probe config-dir naming (task 3086). _PROBE_TASK_ID_PREFIX is the task_id
 # stem handed to TaskConfigDir; _PROBE_DIR_PREFIX is the resulting on-disk
 # prefix the sweep keys off. Both construction sites below build from the
@@ -298,6 +310,13 @@ class AccountState:
     near_cap: bool = False
     auth_failed_at: datetime | None = None
     auth_reprobe_task: asyncio.Task | None = field(default=None, repr=False)
+    # CONSECUTIVE probe-spawn failures (task 4512), reset to 0 by any probe
+    # that actually RAN — whatever its verdict. Deliberately NOT part of the
+    # AccountPhase machine: a spawn fault says nothing about this account's
+    # capacity, so it must not move the account off CAPPED/AUTH_FAILED, and
+    # inventing a phase for it would need edges into and out of every existing
+    # one. It is host state that happens to be observed per account.
+    probe_spawn_failures: int = 0
     # Monotonic counter bumped once per successful `_transition` edge (task
     # W4-δ, PRD §7.4). Lets a capturer of an `AccountLease` (see below)
     # detect whether the account has re-transitioned since the lease was
@@ -658,6 +677,9 @@ class UsageGate:
         self._last_scope_account: dict[str, str] = {}
         self._background_tasks: set[asyncio.Task] = set()  # prevent GC of fire-and-forget tasks
         self._shutting_down: bool = False
+        # Latched description of an infrastructure fault stopping probes from
+        # running at all (task 4512). None whenever probes can spawn.
+        self._probe_infra_fault: str | None = None
 
         self._accounts: list[AccountState] = self._init_accounts()
         # Reclaim dead-PID probe dirs left behind by earlier processes BEFORE
@@ -1807,6 +1829,88 @@ class UsageGate:
             return
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
+
+    # --- Probe-spawn infrastructure faults (task 4512) -------------------
+    #
+    # `shared` cannot import `escalation` — the dependency runs the other way
+    # (see shared/mcp_markup_middleware.py:34-42) — so this gate cannot file
+    # one itself. It does what its same-layer peer `ApiHealthGate` does
+    # instead: EXPOSE the condition (`probe_infra_fault`, the analogue of
+    # `ApiHealthGate.is_degraded`) plus CostStore rows as forensics, and leave
+    # the escalation lifecycle to a downstream consumer that may legally
+    # import `escalation`.
+
+    @property
+    def probe_infra_fault(self) -> str | None:
+        """Latched description of an infrastructure fault preventing probes
+        from running at all, or None when probes can spawn.
+
+        NOT a usage cap: no amount of waiting clears it — an operator must fix
+        the host. That distinction is the whole point of the field, so a
+        consumer reading it may treat it as an actionable, non-self-healing
+        condition.
+        """
+        return getattr(self, '_probe_infra_fault', None)
+
+    def _note_probe_spawn_failure(self, acct: AccountState, exc: ProbeSpawnError) -> None:
+        """Record that a probe for *acct* could not be spawned.
+
+        Loud immediately, latched only at the threshold. Every fault is an
+        ERROR the moment it happens, so a transient one is never silent; the
+        latch is the durable "an operator must fix this host" claim, and
+        staking that on a single failure would flap.
+        """
+        acct.probe_spawn_failures += 1
+        logger.error(
+            'Account %s: probe could not be spawned (%d consecutive): '
+            'binary %r — %s. This is an INFRASTRUCTURE FAULT, not a usage '
+            'cap: the probe never ran, so nothing is known about this '
+            "account's capacity.",
+            acct.name,
+            acct.probe_spawn_failures,
+            exc.binary,
+            exc.cause,
+        )
+
+        # getattr, not a bare read: gates built via `UsageGate.__new__` (see
+        # orchestrator/tests/_orch_helpers.py) assign their fields by hand and
+        # never learn about ones added later. Same idiom as `_shutting_down`.
+        latching = (
+            acct.probe_spawn_failures >= _SPAWN_FAULT_THRESHOLD
+            and getattr(self, '_probe_infra_fault', None) is None
+        )
+        if latching:
+            self._probe_infra_fault = (
+                f'probe binary {exc.binary!r} could not be spawned '
+                f'({exc.cause}) — {acct.probe_spawn_failures} consecutive '
+                f'failures on account {acct.name}'
+            )
+            logger.error(
+                'UsageGate marked UNHEALTHY: probes cannot run — %s. '
+                'Capped accounts cannot be verified and will not resume '
+                'until this is fixed.',
+                self._probe_infra_fault,
+            )
+
+    def _clear_probe_spawn_failures(self, acct: AccountState) -> None:
+        """Record that a probe for *acct* actually RAN, whatever its verdict.
+
+        Recovery is proof-based, never time-based: a probe that returned at
+        all proves the binary is resolvable again. The latch clears only once
+        NO account still has a pending run of failures, so a fleet-wide fault
+        that has healed on one account of six stays reported until the rest
+        confirm it too.
+        """
+        acct.probe_spawn_failures = 0
+        if any(a.probe_spawn_failures for a in self._accounts):
+            return
+        if getattr(self, '_probe_infra_fault', None) is not None:
+            logger.info(
+                'UsageGate probe infrastructure fault CLEARED: a probe for '
+                'account %s spawned successfully.',
+                acct.name,
+            )
+        self._probe_infra_fault = None
 
     async def _refresh_capped_accounts(self) -> bool:
         """Check reset times for all capped accounts. Return True if any uncapped."""
