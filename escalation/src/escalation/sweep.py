@@ -403,6 +403,9 @@ def reap_orphan_locks(queue_dir: Path, *, apply: bool = True) -> int:
     rglob per candidate (thousands of candidates x thousands of archived files
     on the first run), which is not worth paying for a window this narrow.
 
+    Deliberately silent per KEPT sidecar: the common case is thousands of
+    legitimate keeps, and the aggregate is already on the startup INFO line.
+
     Args:
         queue_dir: Root queue directory (the only place sidecars are created).
         apply: If True (default), actually unlink.  If False, only count how many
@@ -460,7 +463,27 @@ def reap_orphan_locks(queue_dir: Path, *, apply: bool = True) -> int:
         # already-unlinked inode and the context manager never re-creates the
         # file on its way out.
         with escalation_id_lock(queue_dir, stem):
-            os.unlink(path)
+            # Re-check inside the lock to close the TOCTOU window: a concurrent
+            # writer could have created the record between our pre-check and
+            # acquiring the lock — mid-submit, holding this very sidecar first.
+            if record_path.exists():
+                continue
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                # Another reaper or process removed it first.  That IS the
+                # intended end state, so count it rather than pretending the
+                # sidecar is still there.
+                pass
+            except OSError as e:
+                # One unreadable sidecar (permissions, EIO) must not abort the
+                # pass for the remaining thousands — and raising would cost the
+                # WHOLE pass silently, since server.py wraps run_startup_sweep
+                # in a non-fatal try/except.  Not counted: nothing was removed.
+                logger.warning(
+                    'reap_orphan_locks: could not unlink %s: %s', path.name, e
+                )
+                continue
         reaped += 1
 
     return reaped
