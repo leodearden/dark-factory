@@ -57,17 +57,27 @@ Same contract, same reasons, as ``_task_db_scan.py:93-103``.
 """
 from __future__ import annotations
 
+import argparse
 import contextlib
 import json
 import os
 import sqlite3
+import sys
 import tempfile
-from collections.abc import Collection
+from collections.abc import Collection, Sequence
 from pathlib import Path
 from typing import NamedTuple
 
-# Tier 1 — the ONE tasks.db locator. Never a hand-rolled path.
-from _task_db_scan import tasks_db_path
+# Tier 1 — the ONE tasks.db locator. Tier 3 — the warn-and-continue per-root
+# loop and the shared no-root message. run_audit_cli is deliberately NOT
+# adopted; the exit-ladder block near main() records why.
+# discover_project_roots comes second-hand through the audit's documented
+# re-export, the same route repair_wiped_metadata_files.py takes.
+from _task_db_scan import (
+    NO_PROJECT_ROOT_RESOLVED_MESSAGE,
+    sweep_project_roots,
+    tasks_db_path,
+)
 
 # The audit owns the defensive JSON decoders. ``_coerce_file_list`` is
 # imported rather than re-implemented so the census's notion of "this
@@ -82,6 +92,7 @@ from audit_wiped_metadata_files import (
     _coerce_file_list,
     _decode_files,
     classify_wipe_signature,
+    discover_project_roots,
     load_merge_signatures,
     runs_db_path,
 )
@@ -643,7 +654,9 @@ def _report_sort_key(record: CensusRecord) -> tuple[str, int, str]:
         return (record.project_id, 0, str(record.task_id))
 
 
-def build_report(censuses: list[ProjectCensus]) -> dict:
+def build_report(
+    censuses: list[ProjectCensus], unreadable: Sequence[str] = ()
+) -> dict:
     """Assemble the committed artifact's JSON structure. PURE — no I/O, no clock.
 
     Ordering is total and derived from the data, never from the caller's
@@ -654,6 +667,10 @@ def build_report(censuses: list[ProjectCensus]) -> dict:
 
     The ``records`` array is the COMPLETE population and is never truncated;
     only the markdown twin is capped.
+
+    *unreadable* is the roots ``sweep_project_roots`` had to SKIP. They are
+    recorded in the coverage block so the incompleteness survives in the
+    artifact itself, not only on a stderr line nobody kept.
     """
     ordered = sorted(censuses, key=lambda census: census.project_id)
 
@@ -717,6 +734,7 @@ def build_report(censuses: list[ProjectCensus]) -> dict:
             "projects_without_event_log": [
                 census.project_id for census in ordered if not census.coverage.event_log_read
             ],
+            "projects_skipped_unreadable": list(unreadable),
             "total_tasks": sum(census.coverage.total_tasks for census in ordered),
             "stamped_records": sum(census.coverage.stamped_records for census in ordered),
         },
@@ -895,3 +913,133 @@ def write_artifacts(report: dict, json_path: Path, md_path: Path) -> tuple[Path,
     _atomic_write_text(json_path, json.dumps(report, indent=2, sort_keys=False) + "\n")
     _atomic_write_text(md_path, markdown)
     return json_path, md_path
+
+
+# ---------------------------------------------------------------------------
+# CLI.
+#
+# WHY THIS SCRIPT KEEPS ITS OWN EXIT LADDER instead of routing through
+# _task_db_scan.run_audit_cli, whose Tier-3 skeleton it otherwise adopts.
+#
+# run_audit_cli returns AUDIT_EXIT_FINDINGS=1 whenever its is_dirty predicate
+# fires, meaning "the read-only sweep found something dirty". THE CENSUS ALWAYS
+# FINDS RECORDS — 507 measured across the six corpora at plan time — so routing
+# through it would make task 4525's mandated user-observable signal,
+# "re-running the script reproduces the counts (exit 0)", structurally
+# unreachable. That is the identical exit-1 SEMANTIC collision
+# _task_db_scan.py:66-72 already records as one of the four reasons
+# repair_wiped_metadata_files.py keeps its own ladder. run_audit_cli
+# additionally prints its rendered report unconditionally and has nowhere to
+# write artifacts.
+#
+# sweep_project_roots carries none of that and IS adopted: it is a pure
+# synchronous warn-and-continue loop whose one-result-per-root-or-raise
+# contract census_project satisfies exactly.
+#
+# 0/2/3 stay in NUMERIC LOCKSTEP with AUDIT_EXIT_*, enforced by a test that
+# imports those constants, so renumbering either copy fails CI instead of
+# drifting silently. 1 deliberately diverges in MEANING, as described above.
+# ---------------------------------------------------------------------------
+
+EXIT_OK = 0                  # swept; artifacts written (or --check agreed)
+EXIT_STALE = 1               # --check: the committed artifact does not match a fresh sweep
+EXIT_NO_ROOT = 2             # no project root resolved to a readable tasks.db
+EXIT_NOTHING_SCANNED = 3     # roots resolved but EVERY one failed to read
+
+_EPILOG = """\
+Read-only: every corpus connection is a mode=ro SQLite URI, so this script is
+structurally incapable of mutating a task record, an event record or a plan.
+
+Exit codes: 0 swept ok; 1 --check found the artifact stale; 2 no project root
+resolved to a readable tasks.db; 3 roots resolved but every one was unreadable
+(NOT a clean run - nothing was examined, and no artifact is written).
+
+--check WARNING: it compares the committed artifact against a LIVE, continuously
+drifting corpus. Six orchestrators mutate these databases, and a stamped task
+becoming plan-reconciled is a NORMAL event, not a defect. Never wire --check
+into a verify or CI gate: it would go red on ordinary progress.
+"""
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Census every task record carrying metadata.files_tagged_at.",
+        epilog=_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--project-root", dest="project_roots", action="append",
+        help="Project root to sweep; repeatable. Defaults to the discovered roots.",
+    )
+    parser.add_argument("--json-out", default=str(DEFAULT_JSON_OUT), help="JSON artifact path.")
+    parser.add_argument("--md-out", default=str(DEFAULT_MD_OUT), help="Markdown artifact path.")
+    parser.add_argument(
+        "--check", action="store_true",
+        help="Compare against the existing artifact WITHOUT writing. See the --check warning above.",
+    )
+    parser.add_argument(
+        "--json", action="store_true", dest="json_stdout",
+        help="Print the report to stdout instead of writing the artifacts.",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Sweep the roots, classify every stamp, and publish the artifact pair."""
+    args = _build_parser().parse_args(argv)
+
+    roots = discover_project_roots(args.project_roots)
+    if not roots:
+        print(NO_PROJECT_ROOT_RESOLVED_MESSAGE, file=sys.stderr)
+        return EXIT_NO_ROOT
+
+    censuses, unreadable = sweep_project_roots(roots, census_project)
+    if not censuses:
+        # Every root failed. NOT a clean run: nothing was examined, so no
+        # artifact is written — replacing real findings with an empty file
+        # would record "no debris" as a measurement nobody made.
+        print(
+            f"error: {len(unreadable)} project root(s) resolved but NONE could be "
+            "read; nothing was examined. This is NOT a clean run and no artifact "
+            "was written.",
+            file=sys.stderr,
+        )
+        return EXIT_NOTHING_SCANNED
+
+    report = build_report(censuses, unreadable=unreadable)
+
+    if args.json_stdout:
+        print(json.dumps(report, indent=2, sort_keys=False))
+        return EXIT_OK
+
+    json_path = Path(args.json_out)
+    md_path = Path(args.md_out)
+
+    if args.check:
+        expected = json.dumps(report, indent=2, sort_keys=False) + "\n"
+        if not json_path.exists():
+            print(f"stale: {json_path} does not exist", file=sys.stderr)
+            return EXIT_STALE
+        actual = json_path.read_text(encoding="utf-8")
+        if actual != expected:
+            print(
+                f"stale: {json_path} does not match a fresh sweep "
+                f"({len(actual)} bytes on disk vs {len(expected)} freshly rendered). "
+                "The corpus drifts continuously; regenerate rather than treating "
+                "this as a defect.",
+                file=sys.stderr,
+            )
+            return EXIT_STALE
+        return EXIT_OK
+
+    write_artifacts(report, json_path, md_path)
+    print(
+        f"wrote {json_path} and {md_path}: "
+        f"{report['coverage']['stamped_records']} stamped record(s) across "
+        f"{report['coverage']['projects_swept']} project(s)"
+    )
+    return EXIT_OK
+
+
+if __name__ == "__main__":
+    sys.exit(main())
