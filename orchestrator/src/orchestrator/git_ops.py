@@ -3616,8 +3616,8 @@ class GitOps:
         ``verify_cancel.LOCK_HOLDER_PGID_KEY`` file under
         :attr:`worktree_base`, a fail-open liveness hint consumed only by
         PERSISTENT-lane actors — is written AND removed ONLY when *lane_dir*
-        is ``None`` or resolves to :attr:`persistent_merge_worktree_path`
-        (task 4189). An ephemeral lane still gets the flock and the
+        is ``None`` or satisfies :meth:`is_persistent_merge_lane` (task 4189).
+        An ephemeral lane still gets the flock and the
         fail-closed contended raise below; it simply never touches the
         global. Task 2873 kept the rendezvous unconditional as "a safe
         over-approximation", but that argument contemplated only the SHORT
@@ -3647,6 +3647,17 @@ class GitOps:
         would leak a permanently live-looking rendezvous; a remove with no
         write is stomp (ii) itself).
 
+        Neither side of that pair may orphan the won flock. The write runs
+        AFTER the acquire but BEFORE the ``try`` that owns the release, and
+        ``write_pgid_file`` is ``mkdir`` + ``write_text`` + ``os.replace`` with
+        nothing suppressed, so an ENOSPC/EACCES/EROFS there is caught only to
+        release the fd and re-raise; the remove sits inside a nested ``try``
+        whose ``finally`` IS the release, because ``remove_pgid_file``
+        suppresses ``FileNotFoundError`` alone. Both keep
+        :meth:`_release_lane_flock` reachable on every path out — the B12
+        orphaned-lane-flock invariant, which the pool-full case (when
+        warm-lane GC matters most) is the likeliest to test.
+
         On a contended flock (the bounded wait in
         :func:`acquire_merge_verify_flock` times out after
         ``_MERGE_VERIFY_LEASE_WAIT_SECS``), RAISES
@@ -3670,30 +3681,21 @@ class GitOps:
             lane_dir if lane_dir is not None else self.persistent_merge_worktree_path
         )
         # Does this lease record the GLOBAL holder-pgid rendezvous?  ONLY for
-        # the persistent merge lane (task 4189) — see the docstring above.
+        # the persistent merge lane (task 4189).  The full argument — both
+        # consequences it retires, and why it is keyed on the RESOLVED PATH
+        # rather than on "was an argument passed" — is in the docstring above;
+        # the comparison itself lives once, in is_persistent_merge_lane.  The
+        # two facts a reader AT THIS LINE needs:
         #
-        # Computed ONCE and reused for BOTH the write and the finally's
-        # remove, because two independent evaluations could in principle
-        # disagree (a .resolve() re-read crossing a mount/symlink change) and
-        # each asymmetry is worse than the bug this closes: a write with no
-        # remove leaks a permanent live-looking rendezvous that wedges
-        # warm-lane GC until process exit, and a remove with no write is the
-        # very cross-lease stomp being fixed.
-        #
-        # Computed BEFORE the acquire, so an OSError out of .resolve() raises
-        # while NO fd is held and can never orphan a lane flock (B12).
-        #
-        # Keyed on the RESOLVED PATH, not on "was an argument passed": the
-        # DF-2822 cross-check (merge_queue.py) passes lane_dir=merge_wt
-        # EXPLICITLY, and that IS the persistent lane whenever the merge ran
-        # there.  .resolve() on both sides matches the two other
-        # persistent-lane comparisons in this codebase
-        # (remove_merge_worktree_guarded's persistent exemption,
-        # merge_queue.py's LOCAL-dispatch gate), so a symlinked .worktrees
-        # pool mount cannot misclassify the persistent lane as ephemeral.
+        #   * computed ONCE, so the write below and the finally's remove can
+        #     never go asymmetric (a write with no remove leaks a permanently
+        #     live-looking rendezvous that wedges warm-lane GC until process
+        #     exit; a remove with no write IS the cross-lease stomp being
+        #     fixed);
+        #   * computed BEFORE the acquire, so anything it raises raises while
+        #     NO fd is held and can never orphan a lane flock (B12).
         records_rendezvous = (
-            lane_dir is None
-            or lane_dir.resolve() == self.persistent_merge_worktree_path.resolve()
+            lane_dir is None or self.is_persistent_merge_lane(lane_dir)
         )
         # Off-thread bounded-wait acquire (shared skeleton, task 3027):
         # _acquire_lane_flock_off_thread wraps the asyncio.to_thread(
@@ -3754,13 +3756,37 @@ class GitOps:
                 holder_facts=_lane_lock_holder_facts(lock_path, holder_pids),
             )
         if records_rendezvous:
-            write_lock_holder_pgid(self.worktree_base, os.getpgrp())
+            # The flock is WON here but the try/finally that releases it has
+            # not been entered yet, and this write is not a pure in-memory op:
+            # write_pgid_file does mkdir + write_text + os.replace, none of
+            # them suppressed, so ENOSPC/EACCES/EROFS raises with `fd` HELD
+            # and unreleased — the lane would stay locked until process exit,
+            # the orphaned-lane-flock outage shape B12 exists to prevent. Most
+            # likely to fire when the pool mount is full, i.e. exactly when
+            # warm-lane GC matters most. Release, then re-raise (loudly — a
+            # lease that cannot record its rendezvous must not run as if it
+            # had). The write/remove pair stays symmetric by construction: a
+            # failed write never enters the try, so the finally can never
+            # remove a file this lease did not write, which would be stomp
+            # (ii) against whoever's rendezvous is actually live.
+            try:
+                write_lock_holder_pgid(self.worktree_base, os.getpgrp())
+            except OSError:
+                self._release_lane_flock(fd)
+                raise
         try:
             yield
         finally:
-            if records_rendezvous:
-                remove_lock_holder_pgid(self.worktree_base)
-            self._release_lane_flock(fd)
+            # Nested finally, not two statements: remove_pgid_file suppresses
+            # only FileNotFoundError, so an EACCES/EROFS unlink raising here
+            # would skip the release and orphan the lane the same way. The
+            # release must be unconditional BY CONSTRUCTION, not by the
+            # happenstance that the line above usually cannot raise.
+            try:
+                if records_rendezvous:
+                    remove_lock_holder_pgid(self.worktree_base)
+            finally:
+                self._release_lane_flock(fd)
 
     @contextlib.asynccontextmanager
     async def task_verify_lease(self, lane_dir: Path):
@@ -11487,8 +11513,9 @@ class GitOps:
         (``OSError`` only) so ``CancelledError`` and programmer errors stay
         loud. Together they make this method total with respect to
         ``OSError``: every other call in its body — :func:`lane_lock_path`
-        (pure path math), :meth:`Path.exists`/:meth:`Path.resolve` (which
-        swallow ``OSError`` by contract), :func:`_register_held_lane_lock`,
+        (pure path math), :meth:`Path.exists`/:meth:`Path.resolve` and
+        :meth:`is_persistent_merge_lane` (which swallow ``OSError`` by
+        contract), :func:`_register_held_lane_lock`,
         :func:`read_lock_holder_pgid` and
         :func:`_release_and_forget_held_lane_lock` — already suppresses its
         own.
@@ -11496,7 +11523,7 @@ class GitOps:
         *reason* is a short caller-supplied label (e.g. the calling
         function's name) recorded in logs for diagnostics.
         """
-        if path.resolve() == self.persistent_merge_worktree_path.resolve():
+        if self.is_persistent_merge_lane(path):
             logger.debug('remove_merge_worktree_guarded: persistent merge worktree retained: %s', path)
             return 'skipped_persistent'
         if path.resolve() == self.persistent_offline_deep_worktree_path.resolve():
@@ -11763,6 +11790,41 @@ class GitOps:
         when the feature is off.
         """
         return self.worktree_base / PERSISTENT_MERGE_WORKTREE_NAME
+
+    def is_persistent_merge_lane(self, path: Path) -> bool:
+        """Does *path* name the singleton PERSISTENT merge-verify lane?
+
+        The ONE spelling of the "is this the persistent merge lane?"
+        comparison (task 4189). Several call sites answered it with
+        hand-copied ``.resolve()`` pairs whose AGREEMENT is load-bearing:
+        :meth:`merge_verify_lease` gates the global holder-pgid rendezvous on
+        it (an ephemeral lane must never write or remove that single fixed-key
+        file), and :meth:`remove_merge_worktree_guarded` gates its
+        ``'skipped_persistent'`` exemption on it (the persistent lane survives
+        across attempts and is never removed). A site that drifted — to a bare
+        ``==``, or to "was a *lane_dir* argument passed at all" — would
+        misclassify the persistent lane as ephemeral and silently stop
+        recording the rendezvous for a genuine persistent-lane verify,
+        re-opening the warm-lane clobber the lease exists to prevent.
+
+        ``.resolve()`` on BOTH sides, so a symlinked ``.worktrees`` pool mount
+        or a caller-supplied relative/``..``-bearing path still compares equal
+        to the canonical location. Non-strict :meth:`Path.resolve` swallows
+        ``OSError`` by contract, which is what lets
+        :meth:`remove_merge_worktree_guarded` keep its
+        total-with-respect-to-``OSError`` contract while calling this.
+
+        ``merge_queue.py``'s LOCAL-dispatch gate ("should I take a lease at
+        all?") still carries its own copy of the comparison: it is outside
+        this task's module lock set. It compares the same two paths the same
+        way; folding it in is filed as follow-up work.
+
+        :attr:`persistent_offline_deep_worktree_path` is deliberately NOT
+        covered here — it is a different lane with a different owner, and only
+        :meth:`remove_merge_worktree_guarded` cares about it (as a separate,
+        separately-logged exemption).
+        """
+        return path.resolve() == self.persistent_merge_worktree_path.resolve()
 
     @property
     def persistent_offline_deep_worktree_path(self) -> Path:
