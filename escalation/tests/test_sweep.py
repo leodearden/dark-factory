@@ -798,6 +798,47 @@ class TestReapOrphanLocks:
         assert lock_path.exists(), 'sidecar of a live root record was reaped'
 
 
+    def test_non_esc_root_residents_untouched(self, tmp_path: Path):
+        """D6 HARD-INVARIANT: nothing outside the esc-* namespace is a candidate.
+
+        Seeds the real non-esc residents of the production queue root plus two
+        hypothetical non-escalation sidecars that DO match a bare ``*.json.lock``
+        glob.  ``b3-state.json.lock`` is shielded anyway by the root-record check
+        (``b3-state.json`` is right there); ``sched-state.json.lock`` — a
+        subsystem sidecar whose data file is absent — is the one that actually
+        separates a ``*.json.lock`` glob from an ``esc-*.json.lock`` one.
+        """
+        residents = {
+            'b3-state.json': b'{"state": "active"}',
+            'b3-state.lock': b'',
+            'afk-digest.md': b'# AFK digest\n\nSome content here.',
+            'b3-state.json.lock': b'',
+            'sched-state.json.lock': b'',
+        }
+        for name, content in residents.items():
+            (tmp_path / name).write_bytes(content)
+        before = {
+            name: (
+                (tmp_path / name).read_bytes(),
+                (tmp_path / name).stat().st_mtime,
+            )
+            for name in residents
+        }
+
+        # Positive control: one genuine escalation orphan that MUST be reaped.
+        orphan = _write_lock(tmp_path, 'esc-1-1')
+
+        count = sweep.reap_orphan_locks(tmp_path, apply=True)
+
+        assert count == 1, 'only the esc-* orphan is a candidate'
+        assert not orphan.exists(), 'the genuine orphan should have been reaped'
+        for name, (content, mtime) in before.items():
+            path = tmp_path / name
+            assert path.exists(), f'{name} was deleted by the reap — glob widened!'
+            assert path.read_bytes() == content, f'{name} content changed'
+            assert path.stat().st_mtime == mtime, f'{name} mtime changed'
+
+
 class TestReapOrphanLocksSeqSafety:
     """SAFETY: the per-task_id .seq counter and its sidecar must survive the reap."""
 
