@@ -982,7 +982,14 @@ echo ""
 info "Health checks"
 
 # FalkorDB
-if docker compose -f "$COMPOSE_FILE" exec -T falkordb redis-cli ping 2>/dev/null | grep -q PONG; then
+# Matched in BASH, not through `| grep -q` — see the FalkorDB wait loop in
+# section 2 for why that pipeline can report a live server as not responding.
+# Distinct variable name from that loop deliberately: both blocks share one
+# shell scope, and reusing the name would let this check read a value section 2
+# left behind if an edit ever dropped the assignment — a verdict manufactured
+# by the mechanism rather than read from the server, which is what this removes.
+_falkordb_health_out="$(docker compose -f "$COMPOSE_FILE" exec -T falkordb redis-cli ping 2>/dev/null)" || true
+if [[ "$_falkordb_health_out" == *PONG* ]]; then
   ok "FalkorDB: PONG"
 else
   fail "FalkorDB: not responding"
