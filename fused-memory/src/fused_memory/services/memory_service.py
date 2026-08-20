@@ -1714,6 +1714,97 @@ class ReferentFinding:
             'reason': self.reason,
         }
 
+def _candidate_targets(
+    *,
+    referents: frozenset[Referent],
+    cited: frozenset[Referent],
+    other_endpoint: Referent | None,
+) -> tuple[Referent, ...]:
+    """Which referent could this misattached edge end correctly point at?
+
+    A pure module-level function — no ``self``, no I/O — so the rule that
+    decides whether leaf eta may perform destructive edge surgery is directly
+    unit-testable in isolation from the walk that drives it.
+
+    The rule, in order:
+
+    1. ``pool = (cited & referents) or referents``. The edge's own fact is the
+       sharpest evidence available about which node THIS edge belongs on, so a
+       citation the declaration corroborates wins; the whole declared set is the
+       fallback for when the fact cites nothing the declaration also names.
+       INTERSECTING rather than unioning is what keeps a repair target from ever
+       originating outside the referent set — an LLM-restated fact naming a task
+       the write never declared itself to be about must not become a target.
+       Fact-scoping is also what keeps mode (iii) repairable: with referents
+       {3074, 3075} the whole-set fallback would see two candidates and abandon a
+       repair the fact unambiguously determines.
+    2. Subtract *other_endpoint*. Not defensive ceremony: ``reassign_edge``
+       (graphiti_client.py) explicitly refuses a move that would fold the edge
+       into a self-loop, so a "target" equal to the edge's other end is not a
+       repair eta could perform. This subtraction is precisely what turns the
+       live Task 2519/2520 case — referents {2519}, endpoints (Task 2519,
+       Task 2520), a fact unary about 2519 — into the zero-candidate row the PRD
+       names as explicitly unrepairable.
+    3. Return in a deterministic order.
+
+    Exactly one survivor means the correct target is DETERMINED. Zero or more
+    than one means it is not, and the caller records the finding with
+    ``resolvable=False`` and a reason: RECORDED AND LEFT ALONE — never silently
+    dropped, and never guessed at. That is why
+    :attr:`ReferentFinding.resolvable` defaults to ``False`` rather than
+    ``True``: the fail-closed direction is structural rather than a matter of
+    every construction site remembering to say so.
+
+    Args:
+        referents: The set the write declared itself to be about.
+        cited: The referents this edge's own fact mentions
+            (``scan_content(...).refs``, which already excludes ambiguity).
+        other_endpoint: The referent at the edge's OTHER end, or ``None`` when
+            that end is not a task node at all.
+
+    Returns:
+        The surviving candidates, sorted by ``(kind, project_id, number)``.
+        Sorted rather than kept in the caller's first-seen order because the
+        inputs are FROZENSETS, whose iteration order is not stable across
+        processes under hash randomization — and a finding must be stable across
+        runs and diffable in eta's audit.
+    """
+    pool = (cited & referents) or referents
+    if other_endpoint is not None:
+        pool = pool - {other_endpoint}
+    return tuple(sorted(pool, key=lambda r: (r.kind, r.project_id, r.number)))
+
+def _unresolvable_reason(
+    candidates: tuple[Referent, ...], other_endpoint: Referent | None,
+) -> str:
+    """Why :func:`_candidate_targets` could not determine a correct target.
+
+    Carried on the finding so "recorded and left alone" is legible as a REASON
+    rather than as an absence — a reader must be able to tell an unrepairable
+    row from a row nobody looked at.
+    """
+    if len(candidates) > 1:
+        return (
+            'more than one candidate target survives '
+            f'({[c.node_name for c in candidates]}) and the edge fact does not '
+            'discriminate between them; recorded, not guessed at'
+        )
+    if other_endpoint is not None:
+        # The only reachable zero-candidate shape: `_candidate_targets`' pool is
+        # non-empty by construction whenever `referents` is (and the caller
+        # no-ops on an empty set), so it can only empty out by subtracting the
+        # edge's other endpoint. The live Task 2519/2520 row.
+        return (
+            f'the only candidate target {other_endpoint.node_name!r} is this '
+            "edge's other endpoint, so repointing would form the self-loop "
+            'reassign_edge refuses; there is no correct target'
+        )
+    # Defensive: unreachable while the caller no-ops on an empty referent set.
+    # Kept so a future relaxation records a reason rather than an empty string
+    # that reads as "resolvable".
+    return 'no candidate target could be determined from the declared referents'
+
+
 
 @dataclass
 class ReferentStats:
@@ -2883,6 +2974,12 @@ class MemoryService:
         The two are ORDERED, not additive. Membership is evaluated first and
         wins the label, so an endpoint failing both is reported exactly ONCE.
 
+        RESOLVABILITY is decided by :func:`_candidate_targets`, whose rule
+        reproduces every row of the PRD's boundary-test sketch. Exactly one
+        surviving candidate means the correct target is determined; zero or more
+        than one means it is not, and the finding is recorded with
+        ``resolvable=False`` and a reason rather than dropped or guessed at.
+
         An EMPTY *referents* makes the whole pass a no-op, honouring the contract
         ``resolve_referents`` publishes in its own docstring ("an EMPTY
         ``.referents`` carries nothing to test membership against, so a downstream
@@ -2950,6 +3047,11 @@ class MemoryService:
                     getattr(edge, 'fact', '') or '', group_id=group_id,
                 ).refs
             )
+            # BOTH ends are resolved before EITHER is checked: the candidate
+            # rule needs the OTHER end's referent (a target equal to it would be
+            # the self-loop `reassign_edge` refuses), which is only knowable once
+            # both names are parsed.
+            ends: list[tuple[str, str, str, Referent | None]] = []
             for which_end, attr in (
                 ('source', 'source_node_uuid'), ('target', 'target_node_uuid'),
             ):
@@ -2961,51 +3063,67 @@ class MemoryService:
                     # COUNTED rather than skipped silently: a check that did not
                     # run is not a check that passed.
                     stats.endpoints_unresolved += 1
-                    continue
-                endpoint_referent = parse_node_name(endpoint_name)
+                ends.append((
+                    which_end,
+                    endpoint_uuid,
+                    endpoint_name,
+                    parse_node_name(endpoint_name) if endpoint_name else None,
+                ))
+
+            for index, end in enumerate(ends):
+                which_end, endpoint_uuid, endpoint_name, endpoint_referent = end
                 if endpoint_referent is None:
-                    # Not a task label at all ('MergeWorker'), or a name that
-                    # merely MENTIONS one ('Task 42 orchestrator' — parse_node_name
-                    # is anchored). Out of scope, and not a blind spot.
+                    # Unresolvable (counted above), not a task label at all
+                    # ('MergeWorker'), or a name that merely MENTIONS one
+                    # ('Task 42 orchestrator' — parse_node_name is anchored).
                     continue
                 stats.endpoints_checked += 1
+                # `1 - index` is the other end of a two-element list.
+                other_referent = ends[1 - index][3]
+                # ORDERED, NOT ADDITIVE. Membership is evaluated FIRST and
+                # wins the label, so an endpoint failing BOTH checks reports the
+                # stronger, more specific signal exactly once. Two findings
+                # naming the same (edge_uuid, which_end) would hand eta two
+                # repair instructions for one edge end that it would have to
+                # reconcile before acting, and would double-count in iota's
+                # rate. "Both checks run" is a coverage claim, not a licence to
+                # emit two findings for one wrong endpoint.
+                #
+                # `if cited` on the pairing arm is LOAD-BEARING, not a
+                # micro-optimization: a fact citing no task number is
+                # UNINFORMATIVE about which node its edge belongs on, never
+                # contradictory (resolved decision 8; gamma's
+                # `_conflicting_referents` choice 4, one level down). A scanner
+                # blind spot — bare digits, a reference by title, a hard-wrapped
+                # qualified ref — must never manufacture evidence for
+                # destructive edge surgery.
                 if endpoint_referent not in referent_set:
-                    stats.findings.append(ReferentFinding(
-                        edge_uuid=edge_uuid,
-                        which_end=which_end,
-                        check='set-membership',
-                        old_endpoint_uuid=endpoint_uuid,
-                        old_endpoint_name=endpoint_name,
-                        endpoint_referent=endpoint_referent,
-                        referent_set=referent_names,
-                    ))
-                    # ORDERED, NOT ADDITIVE. Membership is evaluated first and
-                    # continues, so an endpoint failing BOTH checks reports the
-                    # stronger, more specific signal exactly once. Two findings
-                    # naming the same (edge_uuid, which_end) would hand eta two
-                    # repair instructions for one edge end that it would have to
-                    # reconcile before acting, and would double-count in iota's
-                    # rate. "Both checks run" is a coverage claim, not a licence
-                    # to emit two findings for one wrong endpoint.
+                    check = 'set-membership'
+                elif cited and endpoint_referent not in cited:
+                    check = 'per-edge-pairing'
+                else:
                     continue
 
-                # `if cited` is LOAD-BEARING, not a micro-optimization: a fact
-                # citing no task number is UNINFORMATIVE about which node its
-                # edge belongs on, never contradictory (resolved decision 8;
-                # gamma's `_conflicting_referents` choice 4, one level down). A
-                # scanner blind spot — bare digits, a reference by title, a
-                # hard-wrapped qualified ref — must never manufacture evidence
-                # for destructive edge surgery.
-                if cited and endpoint_referent not in cited:
-                    stats.findings.append(ReferentFinding(
-                        edge_uuid=edge_uuid,
-                        which_end=which_end,
-                        check='per-edge-pairing',
-                        old_endpoint_uuid=endpoint_uuid,
-                        old_endpoint_name=endpoint_name,
-                        endpoint_referent=endpoint_referent,
-                        referent_set=referent_names,
-                    ))
+                candidates = _candidate_targets(
+                    referents=referent_set,
+                    cited=cited,
+                    other_endpoint=other_referent,
+                )
+                resolvable = len(candidates) == 1
+                stats.findings.append(ReferentFinding(
+                    edge_uuid=edge_uuid,
+                    which_end=which_end,
+                    check=check,
+                    old_endpoint_uuid=endpoint_uuid,
+                    old_endpoint_name=endpoint_name,
+                    endpoint_referent=endpoint_referent,
+                    referent_set=referent_names,
+                    intended_referent=candidates[0] if resolvable else None,
+                    resolvable=resolvable,
+                    reason='' if resolvable else _unresolvable_reason(
+                        candidates, other_referent,
+                    ),
+                ))
 
         return stats
     async def _reconcile_episode_identity(
