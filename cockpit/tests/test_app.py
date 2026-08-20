@@ -1139,6 +1139,83 @@ class TestDroppedOverlayExpiresWithTheAsk:
             assert queue.row_count == 1
 
 
+class TestBoostAndDeferOverlaysExpireWithTheAsk:
+    @pytest.mark.timeout(10)
+    async def test_session_boost_expires_once_the_session_leaves_awaiting_input(self, tmp_path):
+        """self._boosts leaks exactly like self._dropped: a SESSION boost is
+        keyed by a slug-stable 'session:<slug>' key and nothing ever shrinks
+        it, so a stale boost silently mis-ranks a brand-new, unrelated ask
+        from the same session. It must expire under the same ask-liveness
+        rule -- and self._overlay_asks, the bookkeeping side-table, must be
+        garbage-collected along with it rather than becoming the new leak.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+
+        display = sr.Display(kind='wm', wm_title='boost title')
+        awaiting = _make_record(
+            session_slug='boost-1',
+            status=sr.Status.AWAITING_INPUT,
+            display=display,
+            question=sr.Question(text='Which port?', asked_at='2026-07-07T00:00:00+00:00'),
+        )
+        sr.write_record(awaiting, root=tmp_path)
+
+        backend = FakeBackend()
+        app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            await pilot.press('b')
+            await pilot.pause()
+            assert 'session:boost-1' in app._boosts
+
+            # The ask resolves -- the session leaves the queue entirely.
+            idle = _make_record(session_slug='boost-1', status=sr.Status.IDLE, display=display)
+            sr.write_record(idle, root=tmp_path)
+            app.refresh_registry()
+            await pilot.pause()
+
+            assert 'session:boost-1' not in app._boosts
+            assert app._overlay_asks == {}
+
+    @pytest.mark.timeout(10)
+    async def test_decision_defer_expires_once_the_decision_leaves_open(self, tmp_path):
+        """self._deferred leaks the same way, and applies to BOTH kinds (a
+        defer is uniform -- see action_defer). A decision key is live only
+        while that decision is OPEN, so once it is answered elsewhere the
+        stamp must expire rather than sit in memory forever suppressing the
+        effective age of whatever later reuses that id.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+
+        decision = sr.DecisionRecord(
+            id='dec-defer',
+            project='df',
+            text='Proceed?',
+            filed_at='2026-07-07T00:00:00+00:00',
+        )
+        assert sr.write_decision(decision, root=tmp_path)
+
+        backend = FakeBackend()
+        app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            await pilot.press('d')
+            await pilot.pause()
+            assert 'decision:dec-defer' in app._deferred
+
+            # Answered elsewhere (e.g. a C8 watcher) -- no longer OPEN.
+            sr.update_decision_state('dec-defer', sr.DecisionState.ANSWERED, root=tmp_path)
+            app.refresh_registry()
+            await pilot.pause()
+
+            assert 'decision:dec-defer' not in app._deferred
+            assert app._overlay_asks == {}
+
+
 class TestCopyAction:
     @pytest.mark.timeout(10)
     async def test_copy_highlighted_decision_puts_question_and_ids_on_clipboard(self, tmp_path):
