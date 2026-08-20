@@ -40,6 +40,8 @@ from audit_wiped_metadata_files import (
     NO_MERGE_EVENT,
 )
 from census_tagger_debris import (
+    DEFAULT_JSON_OUT,
+    DEFAULT_MD_OUT,
     NEVER_RECONCILED,
     NO_PRIOR_SCOPE,
     POST_WIPE_OVERWRITE,
@@ -55,6 +57,8 @@ from census_tagger_debris import (
     classify_record,
     load_scope_events,
     load_stamped_records,
+    render_markdown,
+    write_artifacts,
 )
 
 # ---------------------------------------------------------------------------
@@ -1033,3 +1037,101 @@ def test_coverage_reports_an_empty_shortfall_list_rather_than_omitting_it(tmp_pa
     coverage = build_report([_census(tmp_path, tasks=[_stamped(1)])])["coverage"]
 
     assert coverage["projects_without_event_log"] == []
+
+
+# ---------------------------------------------------------------------------
+# render_markdown / write_artifacts — the committed pair.
+# ---------------------------------------------------------------------------
+
+
+def test_the_markdown_covers_every_swept_project_including_empty_ones(tmp_path):
+    """(a) An operator reads the markdown; a project silently missing from the
+    table is indistinguishable from a project that was never swept."""
+    report = build_report(
+        [
+            _census(tmp_path, name="reify", tasks=[_stamped(1)]),
+            _census(tmp_path, name="know-live", tasks=[{"id": 2, "metadata": None}]),
+        ]
+    )
+    markdown = render_markdown(report)
+
+    assert "reify" in markdown
+    assert "know_live" in markdown
+    assert NEVER_RECONCILED in markdown
+    assert "census_tagger_debris.py" in markdown
+
+
+def test_rendering_is_deterministic_and_ends_with_one_trailing_newline(tmp_path):
+    """(b) Same property, same reason, as the JSON: a re-run must diff clean."""
+    report = build_report([_census(tmp_path, tasks=[_stamped(1)])])
+
+    assert render_markdown(report) == render_markdown(report)
+    assert render_markdown(report).endswith("\n")
+    assert not render_markdown(report).endswith("\n\n")
+
+
+def test_the_markdown_says_which_file_is_authoritative(tmp_path):
+    """(c) The markdown is CAPPED and the JSON is not, so the markdown must
+    say so — otherwise a consumer could read a truncated table as the whole
+    population."""
+    markdown = render_markdown(build_report([_census(tmp_path, tasks=[_stamped(1)])]))
+
+    assert "module-tagger-debris-census.json" in markdown
+    assert "3113" in markdown and "3427" in markdown
+
+
+def test_the_markdown_names_a_coverage_shortfall_rather_than_omitting_it(tmp_path):
+    """(c) An incomplete sweep must be legible in the readable twin too."""
+    report = build_report(
+        [_census(tmp_path, name="reify", tasks=[_stamped(1)], with_runs_db=False)]
+    )
+
+    assert "reify" in render_markdown(report)
+    assert "event log" in render_markdown(report).lower()
+
+
+def test_write_artifacts_writes_both_files_and_the_json_round_trips(tmp_path):
+    """(d) The exact serializer the convention pins: indent=2,
+    sort_keys=False (key ORDER is meaning here — schema_version leads), and a
+    trailing newline so the file is POSIX-clean and diffs by line."""
+    report = build_report([_census(tmp_path, tasks=[_stamped(1)])])
+    json_out = tmp_path / "out" / "census.json"
+    md_out = tmp_path / "out" / "census.md"
+
+    written_json, written_md = write_artifacts(report, json_out, md_out)
+
+    assert written_json == json_out and written_md == md_out
+    raw = json_out.read_text()
+    assert raw == json.dumps(report, indent=2, sort_keys=False) + "\n"
+    assert json.loads(raw) == report
+    assert md_out.read_text() == render_markdown(report)
+
+
+def test_neither_file_is_touched_when_rendering_fails(tmp_path):
+    """(e) THE ATOMICITY PROPERTY (bake_off_storage_shape.write_artifacts).
+
+    The markdown is rendered BEFORE either destination is replaced, so a stale
+    .md can never accompany a fresh .json. Proven by handing write_artifacts a
+    report that cannot render and asserting BOTH existing files survive
+    byte-for-byte — not merely that no new file appeared.
+    """
+    json_out = tmp_path / "census.json"
+    md_out = tmp_path / "census.md"
+    json_out.write_text("PREVIOUS JSON")
+    md_out.write_text("PREVIOUS MD")
+
+    with pytest.raises(KeyError):
+        write_artifacts({"schema_version": 1}, json_out, md_out)
+
+    assert json_out.read_text() == "PREVIOUS JSON"
+    assert md_out.read_text() == "PREVIOUS MD"
+
+
+def test_default_output_paths_are_the_tasks_user_observable_signal():
+    """(f) These two paths ARE task 4525's deliverable, and the .md path
+    satisfies its second delivered_check (grep module-tagger-debris-census
+    under plans/). Resolved __file__-relatively, never hardcoded absolute, so
+    a worktree run writes into its own tree rather than the main checkout."""
+    assert DEFAULT_JSON_OUT.as_posix().endswith("plans/module-tagger-debris-census.json")
+    assert DEFAULT_MD_OUT.as_posix().endswith("plans/module-tagger-debris-census.md")
+    assert DEFAULT_JSON_OUT.is_absolute()
