@@ -792,25 +792,51 @@ def _classify_environmental(output: str) -> FailureCategory | None:
     the same pattern across per-tool tables, not a category being reachable
     from more than one guard).
     """
-    lower = output.lower()
+    # task 4492 — every POSITIVE detector below reads `scoped`, the output
+    # with each PASSED suite's interior blanked; the one NEGATIVE/veto
+    # condition (`_RUSTC_DIAGNOSTIC_SPAN_RE`) deliberately keeps reading the
+    # FULL `output`. Three constraints a reviewer should check:
+    #
+    #   1. THE VETO ASYMMETRY IS THE SAFETY PROPERTY. Redaction removes only
+    #      POSITIVE evidence, so this guard can move a classification AWAY
+    #      from a guard-3 category but never TOWARD one — no output that
+    #      classifies non-guard-3 today can start classifying guard-3.
+    #      NEVER pass `scoped` to `_RUSTC_DIAGNOSTIC_SPAN_RE`: scoping a veto
+    #      makes ENV_TRANSIENT EASIER to reach, the false-GREEN direction
+    #      that would excuse a branch fault as host collateral.
+    #   2. THE WHOLE GUARD IS SCOPED, not just the SEMAPHORE_TIMEOUT arm.
+    #      DISK_FULL and the collateral shapes are reachable from a passing
+    #      suite by the identical mechanism — reify already ships suites
+    #      exercising `df`-failure/garbage-`df` handling (the 4492 sample
+    #      log's `test_warm_lane_sizing_lifecycle.sh` D7/D8/D9), and
+    #      collateral shape 5 is a literal `=== INTERRUPTED (worktree
+    #      removed) ===` marker a test could legitimately replay. Scoping one
+    #      arm would leave the class alive under a different label — the
+    #      shape-N+1 treadmill (2748 -> 2821 -> 3679 -> 4212) this exists to end.
+    #   3. ORDERING IS UNCHANGED (DISK_FULL, the three ENV_TRANSIENT
+    #      branches, then SEMAPHORE_TIMEOUT last). The ORDERING note above
+    #      stays load-bearing; scoping changes WHICH TEXT each arm reads,
+    #      never the order they are tried in.
+    scoped = _redact_passed_suite_blocks(output)
+    lower = scoped.lower()
     if any(marker in lower for marker in _ENOSPC_MARKERS):
         return FailureCategory.DISK_FULL
-    if _LINKER_CONTEXT_RE.search(output) and _LINKER_SIGNAL_RE.search(output):
+    if _LINKER_CONTEXT_RE.search(scoped) and _LINKER_SIGNAL_RE.search(scoped):
         return FailureCategory.DISK_FULL
-    if _VERIFY_ENV_BROKEN_RE.search(output):
+    if _VERIFY_ENV_BROKEN_RE.search(scoped):
         return FailureCategory.ENV_TRANSIENT
     if _VERIFY_WORKTREE_COLLATERAL_READ_FAILURE_RE.search(
-        output
-    ) and not _RUSTC_DIAGNOSTIC_SPAN_RE.search(output):
+        scoped
+    ) and not _RUSTC_DIAGNOSTIC_SPAN_RE.search(output):  # veto reads FULL output
         return FailureCategory.ENV_TRANSIENT
-    if any(pattern.search(output) for pattern in _VERIFY_WORKTREE_COLLATERAL_PATTERNS):
+    if any(pattern.search(scoped) for pattern in _VERIFY_WORKTREE_COLLATERAL_PATTERNS):
         return FailureCategory.ENV_TRANSIENT
-    if is_interpreter_missing_workspace_packages(output):
+    if is_interpreter_missing_workspace_packages(scoped):
         return FailureCategory.ENV_TRANSIENT
     # task 4212: sentinel half is gated on disposition
     # (`_has_fatal_slot_timeout_sentinel` above has the full grounding);
     # basename half stays ungated — its emitters carry no `disposition` field.
-    if _has_fatal_slot_timeout_sentinel(output) or _SLOT_ACQUIRE_DEADLINE_RE.search(output):
+    if _has_fatal_slot_timeout_sentinel(scoped) or _SLOT_ACQUIRE_DEADLINE_RE.search(scoped):
         return FailureCategory.SEMAPHORE_TIMEOUT
     return None
 
