@@ -55,6 +55,7 @@ single owner of the literal set (INV-5), plus the two structural prefixes.
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -67,6 +68,7 @@ from shared.toolcall_markup import ENVELOPE_LITERALS, MARKUP_OVERRIDE_KEY, detec
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.mcp import plan_tools
+from orchestrator.workflow import _is_gating_escalation
 
 # ---------------------------------------------------------------------------
 # Sentinel BUILDERS — the only way markup enters this module.
@@ -405,17 +407,26 @@ class TestComposesWithTheReadTimeRepair:
         Under REJECT_WITH_REPAIR the guard NEVER forwards a repaired argument,
         so the read-time path can never re-report the same damage as a second
         fact. The disjointness is a CONSEQUENCE of the declared policy.
+
+        A CLEAN decision is stored first so the stored-state assertion has
+        something to range over: against an empty list "no repaired value
+        reached storage" is vacuously true and would hold with no guard at all.
         """
         await harness.seed_plan()
+        await harness.call(
+            'add_design_decision',
+            {'decision': 'A clean stored decision.', 'rationale': 'A clean stored rationale.'},
+        )
 
         with pytest.raises(ToolError) as excinfo:
             await harness.call('add_design_decision', {'decision': ABSORBED_RATIONALE})
 
         assert 'markup_repairs' not in _refusal(excinfo)
-        plan = harness.plan()
-        assert plan['design_decisions'] == []
-        for decision in plan['design_decisions']:
+        decisions = harness.plan()['design_decisions']
+        assert len(decisions) == 1, 'the refused call added nothing'
+        for decision in decisions:
             assert detect(decision['decision']) is None
+            assert detect(decision['rationale']) is None
 
     @pytest.mark.asyncio
     async def test_a_rejection_defers_the_stored_repair_and_never_loses_it(
@@ -664,9 +675,15 @@ def build_residue_rig(
     def recording_factory(sink_artifacts: TaskArtifacts):
         sink = real_factory(sink_artifacts)
 
-        def wrapper(record: dict[str, Any]):
+        # ASYNC, because the real sink is: it does its blocking work on a
+        # worker thread so a git subprocess and two fsync'd queue writes never
+        # sit on the server's event loop. A sync wrapper here would hand the
+        # middleware a coroutine it awaits into `returns` as an un-awaited
+        # object, so the wrapper has to keep the same shape as the thing it
+        # wraps.
+        async def wrapper(record: dict[str, Any]):
             records.append(record)
-            result = sink(record)
+            result = await sink(record)
             returns.append(result)
             return result
 
@@ -769,16 +786,65 @@ class TestUnrepairableResidueIsPreserved:
         assert esc.severity == 'blocking'
         assert UNREPAIRABLE_DECISION in esc.detail
         assert str(artifacts.worktree) == esc.worktree
+        assert "owner='l2-escalation-watcher'" in esc.detail, (
+            'the middleware declares owner as INV-7\'s machine-readable owner '
+            'and Escalation has no field for it, so dropping it here would '
+            'silently discard a declared contract field'
+        )
 
     @pytest.mark.asyncio
-    async def test_the_task_id_comes_from_the_plan(
+    async def test_the_residue_never_gates_the_leaking_task(
+        self, monkeypatch, artifacts: TaskArtifacts
+    ):
+        """The record is filed under a NON-TASK anchor, and that is deliberate.
+
+        The middleware declares residue at ``level=2``, and a PENDING level>=2
+        escalation carrying a live task id is a stop-the-line event in this
+        repo: ``workflow._is_gating_escalation`` gates on ``level >= 2``,
+        ``_check_escalations`` looks records up by task id alone, and
+        ``_wait_for_resolution`` raises ``_StewardReescalated`` — which
+        ``run()`` turns into ``_mark_blocked``.
+
+        So filing under the leaking task's own id would turn ONE leaked tool
+        call into a human-gated task halt, and would contradict the refusal
+        hint this same guard ships, which tells the caller to resend from its
+        own copy and carry on. Same posture ``markup_tripwire`` takes with its
+        own anchor.
+        """
+        rig = build_residue_rig(monkeypatch, artifacts)
+        await rig.harness.seed_plan()
+
+        await rig.refuse('add_design_decision', {'decision': UNREPAIRABLE_DECISION})
+
+        esc = rig.queue.submitted[0]
+        assert rig.harness.plan()['task_id'] == 'test-1'
+        assert esc.task_id == plan_tools._MARKUP_RESIDUE_ANCHOR_TASK_ID
+        assert esc.task_id != 'test-1'
+        assert esc.id.startswith(f'esc-{plan_tools._MARKUP_RESIDUE_ANCHOR_TASK_ID}')
+        # The record is gating-SHAPED and stays that way: level 2 is the
+        # middleware's own declaration (INV-7) and is not re-decided here. The
+        # ANCHOR is therefore the only thing keeping it out of the running
+        # task's gate, because `_check_escalations` scopes that gate by task id
+        # alone — which is exactly what these two lookups model.
+        assert _is_gating_escalation(esc) is True
+        assert esc not in rig.queue.get_by_task('test-1', status='pending'), (
+            'the leaking task must not find this record at its own gate'
+        )
+        assert esc in rig.queue.get_by_task(
+            plan_tools._MARKUP_RESIDUE_ANCHOR_TASK_ID, status='pending'
+        ), 'it must still be visible to the L2 watcher under the anchor'
+
+    @pytest.mark.asyncio
+    async def test_the_subject_task_comes_from_the_plan(
         self, monkeypatch, artifacts: TaskArtifacts
     ):
         """(c) The middleware's own identity fields are structurally None here.
 
         ``_identity`` reads ``agent_id`` / ``project_root`` / ``project_id`` off
         the call's arguments, and NO plan-tools tool declares any of the three
-        — so the sink is the only party that can attribute the record.
+        — so the sink is the only party that can attribute the record. Since
+        the queue's ``task_id`` is the non-gating anchor, that attribution has
+        to survive in the summary and the detail instead.
         """
         rig = build_residue_rig(monkeypatch, artifacts)
         await rig.harness.seed_plan()
@@ -786,10 +852,12 @@ class TestUnrepairableResidueIsPreserved:
         await rig.refuse('add_design_decision', {'decision': UNREPAIRABLE_DECISION})
 
         assert rig.harness.plan()['task_id'] == 'test-1'
-        assert rig.queue.submitted[0].task_id == 'test-1'
+        esc = rig.queue.submitted[0]
+        assert esc.summary.startswith('[test-1] ')
+        assert "subject_task_id='test-1'" in esc.detail
 
     @pytest.mark.asyncio
-    async def test_the_task_id_falls_back_to_the_worktree_name(
+    async def test_the_subject_task_falls_back_to_the_worktree_name(
         self, monkeypatch, artifacts: TaskArtifacts
     ):
         """(c) The create_plan-rejected-before-any-plan-exists case."""
@@ -806,7 +874,36 @@ class TestUnrepairableResidueIsPreserved:
         )
 
         assert not rig.harness.plan_path.exists()
-        assert rig.queue.submitted[0].task_id == artifacts.worktree.name
+        esc = rig.queue.submitted[0]
+        assert esc.summary.startswith(f'[{artifacts.worktree.name}] ')
+        assert f'subject_task_id={artifacts.worktree.name!r}' in esc.detail
+
+    @pytest.mark.asyncio
+    async def test_the_subject_task_survives_an_unreadable_plan(
+        self, monkeypatch, artifacts: TaskArtifacts
+    ):
+        """An unreadable plan costs ATTRIBUTION, never the record.
+
+        The payload is the only copy that exists, so a plan that cannot be
+        parsed must degrade to the worktree-name fallback rather than take the
+        filing down with it.
+        """
+        rig = build_residue_rig(monkeypatch, artifacts)
+        await rig.harness.seed_plan()
+        monkeypatch.setattr(
+            TaskArtifacts, 'read_plan',
+            lambda self: (_ for _ in ()).throw(ValueError('plan.json is not JSON')),
+        )
+
+        payload = await rig.refuse(
+            'add_design_decision', {'decision': UNREPAIRABLE_DECISION}
+        )
+
+        assert len(rig.queue.submitted) == 1
+        esc = rig.queue.submitted[0]
+        assert esc.id == payload['escalation_id']
+        assert esc.summary.startswith(f'[{artifacts.worktree.name}] ')
+        assert UNREPAIRABLE_DECISION in esc.detail
 
     @pytest.mark.asyncio
     async def test_a_queue_failure_never_changes_the_refusal(
@@ -1025,3 +1122,197 @@ class TestTheStormEscape:
         assert payload['storm']['window_seconds'] == 3600.0
         assert payload['storm']['outcome'] == 'rejected'
         assert rig.queue.submitted == []
+
+
+# ---------------------------------------------------------------------------
+# The sink's own degraded paths — where the record lands, and what happens
+# when it cannot land there.
+# ---------------------------------------------------------------------------
+#
+# Every row above patches ``_markup_project_root`` and ``_escalation_channel``
+# away, because the record BUILDER is what those rows are about. These are the
+# rows that exercise the seams themselves: a residue record is the only
+# surviving copy of a caller's payload, so a sink that resolves the wrong
+# project root, or gives up permanently after one transient git failure, loses
+# data exactly where this leaf promises none is lost.
+
+
+def _git(*args: str, cwd: Path) -> None:
+    """Run one git command in *cwd*, failing loudly."""
+    subprocess.run(
+        ['git', *args], cwd=str(cwd), check=True, capture_output=True, text=True,
+    )
+
+
+class TestWhereTheRecordLands:
+    """``_markup_project_root`` decides which queue every record reaches."""
+
+    def test_a_plain_checkout_resolves_to_its_own_root(self, tmp_path):
+        """The relative-``.git`` branch: git answers ``.git``, not a path.
+
+        Resolved against the worktree it was run in, which is what makes the
+        branch correct rather than merely non-crashing.
+        """
+        checkout = tmp_path / 'repo'
+        checkout.mkdir()
+        _git('init', cwd=checkout)
+
+        assert plan_tools._markup_project_root(checkout) == checkout.resolve()
+
+    def test_a_linked_worktree_resolves_to_the_MAIN_checkout(self, tmp_path):
+        """The load-bearing case, and the reason it is not ``--show-toplevel``.
+
+        Every task runs in a linked worktree, and its records belong in the ONE
+        queue the fleet's watchers read — the main checkout's. ``--show-toplevel``
+        would answer with the lane itself, filing each record into a directory
+        that is deleted when the lane is reset.
+        """
+        checkout = tmp_path / 'repo'
+        checkout.mkdir()
+        _git('init', cwd=checkout)
+        _git('-c', 'user.email=t@t', '-c', 'user.name=t', 'commit',
+             '--allow-empty', '-m', 'root', cwd=checkout)
+        lane = tmp_path / 'lane'
+        _git('worktree', 'add', str(lane), '-b', 'task/1', cwd=checkout)
+
+        assert plan_tools._markup_project_root(lane) == checkout.resolve()
+        assert plan_tools._markup_project_root(lane) != lane.resolve()
+
+    def test_a_git_failure_degrades_to_None(self, tmp_path):
+        """Outside any repository there is no answer — and no guess either."""
+        assert plan_tools._markup_project_root(tmp_path) is None
+
+    def test_an_empty_answer_degrades_to_None(self, monkeypatch, tmp_path):
+        """A git that succeeds while naming nothing is still no answer.
+
+        ``Path('').parent`` is ``Path('.')``, so without the emptiness check
+        this branch would silently file every record under the CWD.
+        """
+        monkeypatch.setattr(
+            plan_tools.subprocess, 'run',
+            lambda *a, **k: subprocess.CompletedProcess(a, 0, stdout='  \n', stderr=''),
+        )
+
+        assert plan_tools._markup_project_root(tmp_path) is None
+
+
+class TestTheSinkNeverGivesUpPermanently:
+    """A TRANSIENT failure must not disable residue preservation for good."""
+
+    @pytest.mark.asyncio
+    async def test_a_failed_project_root_is_retried_on_the_next_record(
+        self, monkeypatch, artifacts: TaskArtifacts
+    ):
+        """Memoising a FAILURE would lose every later payload on this server.
+
+        ``_markup_project_root`` shells out to git, so it can fail for reasons
+        that have nothing to do with this worktree — a fork failure under load,
+        an EINTR, a transient timeout, an index.lock storm. Caching that answer
+        for the life of the server would turn one such blip into permanent,
+        silent data loss.
+        """
+        queue = _FakeQueue()
+        rig = build_residue_rig(monkeypatch, artifacts, queue)
+        await rig.harness.seed_plan()
+
+        answers = [None, artifacts.worktree]
+        monkeypatch.setattr(
+            plan_tools, '_markup_project_root', lambda worktree: answers.pop(0)
+        )
+
+        first = await rig.refuse(
+            'add_design_decision', {'decision': UNREPAIRABLE_DECISION}
+        )
+        second = await rig.refuse(
+            'add_design_decision', {'decision': SECOND_UNREPAIRABLE_DECISION}
+        )
+
+        assert first['escalation_id'] is None
+        assert rig.returns[0] is None
+        assert answers == [], 'the second record must have re-asked git'
+        assert isinstance(second['escalation_id'], str) and second['escalation_id']
+        assert len(rig.queue.submitted) == 1
+        assert SECOND_UNREPAIRABLE_DECISION in rig.queue.submitted[0].detail
+
+    @pytest.mark.asyncio
+    async def test_a_failed_channel_is_retried_on_the_next_record(
+        self, monkeypatch, artifacts: TaskArtifacts
+    ):
+        """Same argument one seam further in: opening the queue can also blip."""
+        queue = _FakeQueue()
+        rig = build_residue_rig(monkeypatch, artifacts, queue)
+        await rig.harness.seed_plan()
+
+        channels: list[Any] = [None, (Escalation, queue)]
+        monkeypatch.setattr(
+            plan_tools, '_escalation_channel', lambda root: channels.pop(0)
+        )
+
+        first = await rig.refuse(
+            'add_design_decision', {'decision': UNREPAIRABLE_DECISION}
+        )
+        second = await rig.refuse(
+            'add_design_decision', {'decision': SECOND_UNREPAIRABLE_DECISION}
+        )
+
+        assert first['escalation_id'] is None
+        assert channels == [], 'the second record must have re-opened the queue'
+        assert isinstance(second['escalation_id'], str) and second['escalation_id']
+        assert len(rig.queue.submitted) == 1
+
+    def test_an_unopenable_queue_degrades_to_None(self, monkeypatch, tmp_path):
+        """``_escalation_channel``'s own failure branch, at the seam it guards.
+
+        A queue whose directory cannot be opened costs the record, never the
+        refusal — so the branch must return ``None`` rather than propagate.
+        """
+        import escalation.queue as escalation_queue
+
+        monkeypatch.setattr(
+            escalation_queue, 'EscalationQueue',
+            lambda path: (_ for _ in ()).throw(OSError('read-only filesystem')),
+        )
+
+        assert plan_tools._escalation_channel(tmp_path) is None
+
+
+class TestAnUnrecognisedRecordKindIsStillFiled:
+    """Silently discarding a record kind is the fail-soft this PRD ends."""
+
+    @pytest.mark.asyncio
+    async def test_it_is_filed_under_the_fallback_vocabulary(
+        self, monkeypatch, artifacts: TaskArtifacts
+    ):
+        """A kind the middleware grows LATER reaches an operator regardless.
+
+        Driven straight at the sink because there is, by construction, no way
+        to make today's middleware emit tomorrow's record. The record carries
+        neither ``category`` nor ``summary`` — the shape a future emitter is
+        least likely to get right — so both fallbacks are exercised.
+        """
+        queue = _FakeQueue()
+        monkeypatch.setattr(
+            plan_tools, '_markup_project_root', lambda worktree: artifacts.worktree
+        )
+        monkeypatch.setattr(
+            plan_tools, '_escalation_channel', lambda root: (Escalation, queue)
+        )
+        sink = plan_tools._markup_escalation_sink(artifacts)
+
+        esc_id = await sink({
+            'error_type': 'mcp_markup_something_new',
+            'tool': 'add_design_decision',
+            'field': 'decision',
+            'raw_value': UNREPAIRABLE_DECISION,
+        })
+
+        assert len(queue.submitted) == 1
+        esc = queue.submitted[0]
+        assert esc.id == esc_id
+        assert esc.category == plan_tools._ESCALATION_FALLBACK_CATEGORY
+        assert plan_tools._ESCALATION_FALLBACK_SUMMARY in esc.summary
+        assert UNREPAIRABLE_DECISION in esc.detail, (
+            'an unfamiliar record still carries a payload — filing it without '
+            'that payload would discard the very thing worth keeping'
+        )
+        assert queue.reads == [], 'only the storm kind dedups'
