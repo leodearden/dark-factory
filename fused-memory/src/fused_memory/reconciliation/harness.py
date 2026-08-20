@@ -20,6 +20,7 @@ from uuid import uuid4
 
 from shared.cli_invoke import AllAccountsCappedException, read_transcript_records
 from shared.config_dir import TaskConfigDir
+from shared.storm_counter import StormCounter
 from shared.usage_gate import UsageGate
 
 from fused_memory.backends.falkor_indices import (
@@ -682,21 +683,17 @@ class ReconciliationHarness:
         # Task 1970 amendment: rolling-window counter for dropped
         # referenceless actionable findings (see
         # _record_placeholder_finding_drop / _maybe_remediate).  Same
-        # (timestamp, project_id) shape, in-process-lifetime caveat, and
-        # rate-limited single-fire semantics as _dead_owner_suppressions above.
-        self._placeholder_finding_drops: deque[tuple[datetime, str]] = deque()
-        self._last_placeholder_drop_storm_escalation_at: datetime | None = None
+        # in-process-lifetime caveat and rate-limited single-fire semantics as
+        # the dead-owner suppression counter above.
+        self._placeholder_drop_storm = StormCounter()
 
         # Task σ / 2717: rolling-window per-event counter of unresumable/failed
         # interrupted-run resume attempts (config-driven
-        # resume_failure_storm_threshold / _window_seconds).  Same
-        # (timestamp, project_id) shape, in-process-lifetime caveat, and
-        # rate-limited single-fire semantics as _placeholder_finding_drops above.
-        # Fed from _resume_interrupted_runs' failed+restore fallback arm so a
-        # persistent resume failure (prompt/tool drift, stale transcripts) surfaces
-        # ONE loud recon_resume_failure_storm escalation instead of silent churn.
-        self._resume_failures: deque[tuple[datetime, str]] = deque()
-        self._last_resume_failure_storm_escalation_at: datetime | None = None
+        # resume_failure_storm_threshold / _window_seconds).  Fed from
+        # _resume_interrupted_runs' failed+restore fallback arm so a persistent
+        # resume failure (prompt/tool drift, stale transcripts) surfaces ONE loud
+        # recon_resume_failure_storm escalation instead of silent churn.
+        self._resume_failure_storm = StormCounter()
 
         # Task 3049 lever 1: per-project count of CONSECUTIVE full cycles whose
         # inline remediation tail was deferred because the project was still in
@@ -2274,6 +2271,63 @@ class ReconciliationHarness:
             'projects': projects,
         }
 
+    # ── Shared storm-counter adapter (task 3259 / INV-5) ───────────────
+
+    @staticmethod
+    def _storm_summary(
+        counter: StormCounter,
+        *,
+        threshold: int,
+        window_seconds: float,
+        project_id: str,
+        now: datetime | None,
+        key: str | None = None,
+    ) -> dict | None:
+        """Record one event on *counter*; return this module's storm summary.
+
+        The single bridge between the harness's three storm recorders and
+        ``shared.storm_counter.StormCounter``, which owns the one
+        append-prune-count-ratelimit body in the codebase (INV-5).  It reconciles
+        the two contract differences, and nothing else:
+
+        CLOCK.  The harness injects time PER CALL (``now: datetime | None``, the
+        :meth:`_finding_recently_resolved` convention) while StormCounter's
+        ``time_provider`` binds at construction, so *now* is resolved here in
+        that idiom and forwarded as an epoch float.  The conversion is exact for
+        this use: the counter only ever subtracts and compares timestamps, and
+        ``.timestamp()`` on a tz-aware UTC datetime preserves both ordering and
+        differences.
+
+        SHAPE.  StormCounter returns ``count``/``threshold``/``window_seconds``/
+        ``labels``; this module's contract — read at the three call sites that
+        fold a summary into an escalation payload — is exactly
+        ``count``/``window_seconds``/``projects``.  Remapping here keeps that
+        shape byte-identical rather than leaking a renamed or extra key into an
+        operator-facing payload.  Same adapter shape MarkupStormCounter already
+        established: store/forward the knobs, rename ``labels`` on the way out.
+
+        *threshold* and *window_seconds* are passed PER CALL, never captured, so
+        a caller reading them live off ``self.config`` keeps observing in-place
+        reloads (``config/reload.py``'s reload-safety rule).  *key* is the
+        distinct-count dimension used only by
+        :meth:`_record_dead_owner_suppression`.
+        """
+        effective_now = now if now is not None else datetime.now(UTC)
+        summary = counter.record(
+            threshold=threshold,
+            window_seconds=window_seconds,
+            label=project_id,
+            key=key,
+            now=effective_now.timestamp(),
+        )
+        if summary is None:
+            return None
+        return {
+            'count': summary['count'],
+            'window_seconds': window_seconds,
+            'projects': summary['labels'],
+        }
+
     # ── Placeholder-finding drop storm counter (task 1970 amendment) ───
 
     def _record_placeholder_finding_drop(
@@ -2281,58 +2335,32 @@ class ReconciliationHarness:
     ) -> dict | None:
         """Record one dropped referenceless-finding event and check for a storm.
 
-        Same rolling-window-counter + rate-limited-single-fire shape as
-        _record_dead_owner_suppression above, applied to
-        reconciliation.remediation_dropped_placeholder_finding events instead
-        of dead_owner_shielded suppressions.  Thresholds are the plain module
-        constants _PLACEHOLDER_DROP_STORM_THRESHOLD /
+        Applied to reconciliation.remediation_dropped_placeholder_finding events
+        instead of the dead_owner_shielded suppressions
+        :meth:`_record_dead_owner_suppression` watches.  Thresholds are the plain
+        module constants _PLACEHOLDER_DROP_STORM_THRESHOLD /
         _PLACEHOLDER_DROP_STORM_WINDOW_SECONDS rather than ReconciliationConfig
         fields, since this counter is private to this module.
 
-        Appends (effective_now, project_id) to the rolling deque, prunes
-        entries older than the configured window, then:
-        - Returns None if the count is below the threshold.
-        - Returns None if the alarm already fired within this window
-          (rate limit: <=1 per window).
-        - Otherwise sets _last_placeholder_drop_storm_escalation_at =
-          effective_now and returns a storm summary dict with 'count',
-          'window_seconds', and 'projects' (sorted distinct project labels
-          seen in the window).
+        The rolling-window mechanics — append, prune to the window, count,
+        compare to the threshold, rate-limit to one fire per window, and report
+        the distinct project labels seen — live in
+        ``shared.storm_counter.StormCounter`` (INV-5); this method only supplies
+        the knobs and the event.  Returns None below the threshold and None when
+        the alarm already fired within this window, otherwise a storm summary
+        dict with 'count', 'window_seconds', and 'projects' (sorted distinct
+        project labels seen in the window).
 
         The now= parameter follows the same time-injection convention as
         _record_dead_owner_suppression, for deterministic unit tests.
         """
-        effective_now = now if now is not None else datetime.now(UTC)
-
-        # Append and prune the rolling window.
-        self._placeholder_finding_drops.append((effective_now, project_id))
-        window = timedelta(seconds=_PLACEHOLDER_DROP_STORM_WINDOW_SECONDS)
-        cutoff_ts = effective_now - window
-        while (
-            self._placeholder_finding_drops
-            and self._placeholder_finding_drops[0][0] < cutoff_ts
-        ):
-            self._placeholder_finding_drops.popleft()
-
-        count = len(self._placeholder_finding_drops)
-        if count < _PLACEHOLDER_DROP_STORM_THRESHOLD:
-            return None
-
-        # Threshold crossed — apply the per-window rate limit.
-        if (
-            self._last_placeholder_drop_storm_escalation_at is not None
-            and (effective_now - self._last_placeholder_drop_storm_escalation_at) < window
-        ):
-            return None
-
-        # Fire: set rate-limit timestamp and build the storm summary dict.
-        self._last_placeholder_drop_storm_escalation_at = effective_now
-        projects = sorted({pid for _, pid in self._placeholder_finding_drops})
-        return {
-            'count': count,
-            'window_seconds': _PLACEHOLDER_DROP_STORM_WINDOW_SECONDS,
-            'projects': projects,
-        }
+        return self._storm_summary(
+            self._placeholder_drop_storm,
+            threshold=_PLACEHOLDER_DROP_STORM_THRESHOLD,
+            window_seconds=_PLACEHOLDER_DROP_STORM_WINDOW_SECONDS,
+            project_id=project_id,
+            now=now,
+        )
 
     # ── Resume-failure storm counter (task σ / 2717) ───────────────────
 
@@ -2341,55 +2369,32 @@ class ReconciliationHarness:
     ) -> dict | None:
         """Record one unresumable/failed interrupted-run resume and check for a storm.
 
-        Same rolling-window per-event counter + rate-limited single-fire shape as
-        :meth:`_record_placeholder_finding_drop`, applied to the failed+restore
-        fallback arm of :meth:`_resume_interrupted_runs`.  Thresholds are the
-        config fields ``resume_failure_storm_threshold`` /
+        Applied to the failed+restore fallback arm of
+        :meth:`_resume_interrupted_runs`.  Thresholds are the config fields
+        ``resume_failure_storm_threshold`` /
         ``resume_failure_storm_window_seconds`` (mirroring
         :meth:`_record_dead_owner_suppression`, which likewise reads config)
-        rather than module constants, so an operator can retune the alarm.
+        rather than module constants, so an operator can retune the alarm.  Both
+        are read LIVE on every call rather than captured, so promoting either
+        into ``RELOADABLE_FIELDS`` would work without further edits.
 
-        Appends ``(effective_now, project_id)`` to the rolling deque, prunes
-        entries older than the configured window, then:
-        - Returns None if the count is below the threshold.
-        - Returns None if the alarm already fired within this window (rate limit:
-          <=1 per window).
-        - Otherwise sets ``_last_resume_failure_storm_escalation_at =
-          effective_now`` and returns a storm summary dict with ``count``,
-          ``window_seconds``, and ``projects`` (sorted distinct project labels
-          seen in the window).
+        The rolling-window mechanics live in
+        ``shared.storm_counter.StormCounter`` (INV-5); this method only supplies
+        the knobs and the event.  Returns None below the threshold and None when
+        the alarm already fired within this window, otherwise a storm summary
+        dict with ``count``, ``window_seconds``, and ``projects`` (sorted
+        distinct project labels seen in the window).
 
         The now= parameter follows the same time-injection convention as the
         sibling storm counters, for deterministic unit tests.
         """
-        effective_now = now if now is not None else datetime.now(UTC)
-
-        # Append and prune the rolling window.
-        self._resume_failures.append((effective_now, project_id))
-        window = timedelta(seconds=self.config.resume_failure_storm_window_seconds)
-        cutoff_ts = effective_now - window
-        while self._resume_failures and self._resume_failures[0][0] < cutoff_ts:
-            self._resume_failures.popleft()
-
-        count = len(self._resume_failures)
-        if count < self.config.resume_failure_storm_threshold:
-            return None
-
-        # Threshold crossed — apply the per-window rate limit.
-        if (
-            self._last_resume_failure_storm_escalation_at is not None
-            and (effective_now - self._last_resume_failure_storm_escalation_at) < window
-        ):
-            return None
-
-        # Fire: set rate-limit timestamp and build the storm summary dict.
-        self._last_resume_failure_storm_escalation_at = effective_now
-        projects = sorted({pid for _, pid in self._resume_failures})
-        return {
-            'count': count,
-            'window_seconds': self.config.resume_failure_storm_window_seconds,
-            'projects': projects,
-        }
+        return self._storm_summary(
+            self._resume_failure_storm,
+            threshold=self.config.resume_failure_storm_threshold,
+            window_seconds=self.config.resume_failure_storm_window_seconds,
+            project_id=project_id,
+            now=now,
+        )
 
     # ── Deferred write replay ─────────────────────────────────────────
 
