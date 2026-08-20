@@ -1257,6 +1257,7 @@ class TestCoercionNeverGuesses:
         """
         h = build_harness(RepairPolicy.FORWARD_REPAIR)
         tool = await h.mcp.get_tool('escalate_info_typed')
+        assert tool is not None
         declared = tool.parameters['properties']['evidence']
 
         assert 'type' not in declared, (
@@ -1355,6 +1356,7 @@ class TestCoercionNeverGuesses:
 
         h = build_harness(RepairPolicy.FORWARD_REPAIR)
         tool = await h.mcp.get_tool('escalate_info_typed')
+        assert tool is not None
         detail = self._payload('A union.', 'evidence', '[{"observation": "measured"}]')
 
         fix = repair(
