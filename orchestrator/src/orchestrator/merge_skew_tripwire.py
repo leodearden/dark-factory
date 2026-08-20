@@ -46,13 +46,35 @@ class TripwireHit:
     overlap_files: tuple[str, ...]
 
 
+# The event loop holds only a WEAK reference to a Task, so an
+# otherwise-unreferenced one can be garbage-collected mid-flight; membership
+# in this set is what supplies the strong reference until the task ends.
+#
+# Mirrors the sibling ``_ABANDONED_PROBES`` registry in
+# dashboard/src/dashboard/app.py:567 (task 4089), but this module does NOT
+# call that package's ``track_task`` helper (dashboard/src/dashboard/data/db.py:24)
+# — nor could it: orchestrator has no dependency edge onto the leaf dashboard
+# UI package. More to the point, ``_log_abandoned_oracle_cleanup`` below is
+# already a strict superset of ``track_task``'s inner ``_release``: it
+# consumes the task's exception (the "exception was never retrieved" guard)
+# *and* logs at DEBUG for diagnostics, which ``_release`` does not. Calling
+# ``track_task`` here would install a SECOND done-callback retrieving the
+# same exception a second time — precisely the duplication ``track_task``
+# exists to eliminate. Only the strong reference was missing, so that is all
+# this registry plus ``_abandon_oracle`` below adds.
+_ABANDONED_ORACLES: set[asyncio.Task] = set()
+
+
 def _log_abandoned_oracle_cleanup(task: asyncio.Task) -> None:
-    """Done-callback for a load-bearing-oracle task abandoned after a
-    timeout (see ``_run_load_bearing_oracle``) — retrieves the task's
-    result/exception so a background cleanup failure never surfaces as an
-    "exception was never retrieved" warning, and logs at DEBUG for
-    diagnostics. Never raises.
+    """Done-callback for a load-bearing-oracle task abandoned after an
+    exceptional exit from ``_run_load_bearing_oracle``'s wait — a timeout or
+    the caller being cancelled (see ``_run_load_bearing_oracle`` and
+    ``_abandon_oracle``) — releases the strong reference held in
+    ``_ABANDONED_ORACLES``, retrieves the task's result/exception so a
+    background cleanup failure never surfaces as an "exception was never
+    retrieved" warning, and logs at DEBUG for diagnostics. Never raises.
     """
+    _ABANDONED_ORACLES.discard(task)
     try:
         if task.cancelled():
             logger.debug('_run_load_bearing_oracle: abandoned oracle task finished cancelling')
@@ -67,6 +89,17 @@ def _log_abandoned_oracle_cleanup(task: asyncio.Task) -> None:
         logger.debug(
             '_run_load_bearing_oracle: error inspecting abandoned oracle task', exc_info=True,
         )
+
+
+def _abandon_oracle(task: asyncio.Task) -> None:
+    """Cancel *task* fire-and-forget and hold a strong reference until it ends.
+
+    Mirrors ``_abandon_probe``, dashboard/src/dashboard/app.py:570-573 (task
+    4089) — the landed sibling fix for the same defect class.
+    """
+    task.cancel()  # fire-and-forget — do NOT await the unwinding
+    _ABANDONED_ORACLES.add(task)
+    task.add_done_callback(_log_abandoned_oracle_cleanup)
 
 
 async def _run_load_bearing_oracle(
@@ -134,8 +167,7 @@ async def _run_load_bearing_oracle(
                 'cleanup to the background',
                 timeout_secs, project_root,
             )
-            task.cancel()
-            task.add_done_callback(_log_abandoned_oracle_cleanup)
+            _abandon_oracle(task)
             return False
         rc, _out, _err = task.result()
         return rc == 0
