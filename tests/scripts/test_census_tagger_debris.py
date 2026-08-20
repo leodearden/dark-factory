@@ -29,9 +29,16 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
+from _task_db_scan import (
+    AUDIT_EXIT_NO_ROOT,
+    AUDIT_EXIT_NOTHING_AUDITED,
+    AUDIT_EXIT_OK,
+)
 from audit_wiped_metadata_files import (
     _EVENT_PLAN_SOURCES,
     CONFIRMED_NULL_SHA_DONE_PATH,
@@ -42,6 +49,10 @@ from audit_wiped_metadata_files import (
 from census_tagger_debris import (
     DEFAULT_JSON_OUT,
     DEFAULT_MD_OUT,
+    EXIT_NO_ROOT,
+    EXIT_NOTHING_SCANNED,
+    EXIT_OK,
+    EXIT_STALE,
     NEVER_RECONCILED,
     NO_PRIOR_SCOPE,
     POST_WIPE_OVERWRITE,
@@ -1135,3 +1146,192 @@ def test_default_output_paths_are_the_tasks_user_observable_signal():
     assert DEFAULT_JSON_OUT.as_posix().endswith("plans/module-tagger-debris-census.json")
     assert DEFAULT_MD_OUT.as_posix().endswith("plans/module-tagger-debris-census.md")
     assert DEFAULT_JSON_OUT.is_absolute()
+
+
+# ---------------------------------------------------------------------------
+# CLI coverage.
+#
+# Driven by SUBPROCESS, never `python -m`: a directly-executed script places
+# its own directory at sys.path[0], which is the only reason the child resolves
+# `import audit_wiped_metadata_files` and `import _task_db_scan`. That is the
+# flat-sibling import contract at _task_db_scan.py:93-103, and `python -m`
+# would break every test below at once.
+#
+# Not one test here points at a live corpus.
+# ---------------------------------------------------------------------------
+
+_SCRIPT = str(Path(__file__).parent.parent.parent / "scripts" / "census_tagger_debris.py")
+
+
+def _run_cli(*args):
+    return subprocess.run([sys.executable, _SCRIPT, *args], capture_output=True, text=True)
+
+
+def _corrupt_root(tmp_path, name="corrupt"):
+    """A root whose tasks.db EXISTS (so discovery keeps it) but is unreadable."""
+    root = tmp_path / name
+    tasks_dir = root / ".taskmaster" / "tasks"
+    tasks_dir.mkdir(parents=True)
+    (tasks_dir / "tasks.db").write_bytes(b"not a database")
+    return root
+
+
+def test_a_successful_sweep_exits_zero_and_writes_both_artifacts(tmp_path):
+    """(a) THE USER-OBSERVABLE SIGNAL: the sweep runs, exits 0, and produces
+    the artifact pair."""
+    root = _make_project(tmp_path, tasks=[_stamped(1)])
+    json_out, md_out = tmp_path / "c.json", tmp_path / "c.md"
+
+    result = _run_cli(
+        "--project-root", str(root), "--json-out", str(json_out), "--md-out", str(md_out)
+    )
+
+    assert result.returncode == EXIT_OK, result.stderr
+    assert json.loads(json_out.read_text())["schema_version"] == SCHEMA_VERSION
+    assert md_out.exists()
+
+
+def test_no_resolvable_root_exits_two_and_writes_nothing(tmp_path):
+    """(b) Nothing was swept, so there is nothing to publish. Overwriting a
+    good artifact on this path would replace real findings with an empty file."""
+    json_out = tmp_path / "c.json"
+
+    result = _run_cli(
+        "--project-root", str(tmp_path / "does-not-exist"),
+        "--json-out", str(json_out), "--md-out", str(tmp_path / "c.md"),
+    )
+
+    assert result.returncode == EXIT_NO_ROOT
+    assert result.stderr.strip()
+    assert not json_out.exists()
+
+
+def test_every_root_unreadable_exits_three_and_writes_nothing(tmp_path):
+    """(c) EXIT 3 IS NOT A CLEAN RUN. Roots resolved but every one failed, so
+    the census measured nothing. Writing an empty artifact here would record
+    "no debris found" for a sweep that looked at nothing —
+    docs/legibility/design-invariants.md, no-silent-fail-soft."""
+    json_out = tmp_path / "c.json"
+
+    result = _run_cli(
+        "--project-root", str(_corrupt_root(tmp_path)),
+        "--json-out", str(json_out), "--md-out", str(tmp_path / "c.md"),
+    )
+
+    assert result.returncode == EXIT_NOTHING_SCANNED
+    assert "clean" in result.stderr.lower()
+    assert not json_out.exists()
+
+
+def test_one_unreadable_root_among_several_warns_and_continues(tmp_path):
+    """(d) A single corrupt project must not abort the sweep — but the
+    incompleteness must reach BOTH the stderr warning and the artifact's own
+    coverage block, so it survives a run whose stderr nobody kept."""
+    good = _make_project(tmp_path, name="reify", tasks=[_stamped(1)])
+    bad = _corrupt_root(tmp_path)
+    json_out = tmp_path / "c.json"
+
+    result = _run_cli(
+        "--project-root", str(good), "--project-root", str(bad),
+        "--json-out", str(json_out), "--md-out", str(tmp_path / "c.md"),
+    )
+
+    assert result.returncode == EXIT_OK, result.stderr
+    assert "incomplete" in result.stderr.lower()
+    coverage = json.loads(json_out.read_text())["coverage"]
+    assert coverage["projects_skipped_unreadable"] == [str(bad)]
+
+
+def test_check_mode_agrees_with_a_freshly_written_artifact(tmp_path):
+    """(e) The reproducibility claim, machine-checkable without writing."""
+    root = _make_project(tmp_path, tasks=[_stamped(1)])
+    json_out, md_out = tmp_path / "c.json", tmp_path / "c.md"
+    args = ("--project-root", str(root), "--json-out", str(json_out), "--md-out", str(md_out))
+
+    assert _run_cli(*args).returncode == EXIT_OK
+    before = json_out.read_text()
+
+    result = _run_cli(*args, "--check")
+
+    assert result.returncode == EXIT_OK, result.stderr
+    assert json_out.read_text() == before, "--check must never write"
+
+
+def test_check_mode_reports_drift_without_writing(tmp_path):
+    """(e) Drift exits 1 and NAMES the divergence, and still does not write —
+    --check reports, it never repairs."""
+    root = _make_project(tmp_path, tasks=[_stamped(1)])
+    json_out, md_out = tmp_path / "c.json", tmp_path / "c.md"
+    args = ("--project-root", str(root), "--json-out", str(json_out), "--md-out", str(md_out))
+    _run_cli(*args)
+    before = json_out.read_text()
+
+    # Drift the corpus the way a live one drifts: a new stamped record lands.
+    conn = sqlite3.connect(root / ".taskmaster" / "tasks" / "tasks.db")
+    conn.execute(
+        "INSERT INTO tasks (tag, id, title, status, metadata, updated_at) "
+        "VALUES ('master', 999, 't', 'pending', ?, '2026-08-01T00:00:00+00:00')",
+        (json.dumps({"files_tagged_at": _STAMP}),),
+    )
+    conn.commit()
+    conn.close()
+
+    result = _run_cli(*args, "--check")
+
+    assert result.returncode == EXIT_STALE
+    assert result.stderr.strip()
+    assert json_out.read_text() == before
+
+
+def test_check_mode_treats_a_missing_artifact_as_stale(tmp_path):
+    """(e) An absent artifact cannot be reproducing anything."""
+    root = _make_project(tmp_path, tasks=[_stamped(1)])
+
+    result = _run_cli(
+        "--project-root", str(root),
+        "--json-out", str(tmp_path / "absent.json"), "--md-out", str(tmp_path / "absent.md"),
+        "--check",
+    )
+
+    assert result.returncode == EXIT_STALE
+    assert not (tmp_path / "absent.json").exists()
+
+
+def test_json_flag_prints_the_report_instead_of_writing(tmp_path):
+    root = _make_project(tmp_path, tasks=[_stamped(1)])
+    json_out = tmp_path / "c.json"
+
+    result = _run_cli(
+        "--project-root", str(root), "--json-out", str(json_out),
+        "--md-out", str(tmp_path / "c.md"), "--json",
+    )
+
+    assert result.returncode == EXIT_OK, result.stderr
+    assert json.loads(result.stdout)["schema_version"] == SCHEMA_VERSION
+    assert not json_out.exists()
+
+
+# ---------------------------------------------------------------------------
+# Lockstep guard for the decision that this script keeps its own EXIT_* ladder
+# instead of adopting _task_db_scan.run_audit_cli. The shared constants are
+# IMPORTED, never re-spelled as 0/2/3 literals, or the guard would drift
+# exactly as the thing it guards against. Same shape as
+# test_repair_wiped_metadata_files.py:1685.
+# ---------------------------------------------------------------------------
+
+
+def test_exit_codes_stay_in_lockstep_with_the_shared_audit_ladder():
+    """The three shared codes must keep the SAME integers as Tier 3's.
+
+    The census adopts sweep_project_roots and this numbering but deliberately
+    NOT run_audit_cli: that function's exit 1 means "the sweep found something
+    dirty", and the census ALWAYS finds records, which would make its mandated
+    exit-0 reproducibility signal unreachable. Exit 1 is therefore reused here
+    for a DIFFERENT meaning — the artifact is stale — so the other three codes
+    agreeing is exactly what has to be frozen. Renumbering deliberately is
+    allowed; it must edit this test rather than drift past it unnoticed.
+    """
+    assert EXIT_OK == AUDIT_EXIT_OK
+    assert EXIT_NO_ROOT == AUDIT_EXIT_NO_ROOT
+    assert EXIT_NOTHING_SCANNED == AUDIT_EXIT_NOTHING_AUDITED
+    assert EXIT_STALE == 1
