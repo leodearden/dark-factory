@@ -50,6 +50,7 @@ precedent, as ``systemd_unit_invariants.py``, ``setup_host_parsing.py`` and
 """
 from __future__ import annotations
 
+import pathlib
 import shlex
 
 from orchestrator import verify_cmd
@@ -228,3 +229,74 @@ def positional_targets(
             continue
         targets.append(token)
     return targets
+
+
+def covers(rel_path: str, targets: list[str]) -> bool:
+    """True if *rel_path* or one of its ancestor directories is an exact target.
+
+    Ancestor-directory coverage is REAL coverage: ``ruff check skills`` and
+    ``pytest tests/scripts/`` both traverse the directory. Membership is tested
+    ELEMENT-WISE against the extracted target tokens, never by substring —
+    ``'scripts'`` is a substring of ``'tests/scripts/test_x.py'``, so a naive
+    containment test reports a file as checked by a command that never sees it,
+    and a guard that passes vacuously is the failure mode this whole module
+    exists to prevent.
+
+    THE NAME SET IS SLASH-TOLERANT, and that is a decision with a measurement
+    behind it rather than an incidental spelling. It unifies two copies that had
+    drifted: ``_is_covered`` normalised trailing slashes with ``rstrip('/')``,
+    ``_is_collected`` with ``posixpath.normpath``. The tolerant form is a strict
+    SUPERSET of the slashless one, so it regresses neither caller:
+
+      * ``covers('a/b.py', ['a/'])`` is True, where the slashless form is False.
+        That case is load-bearing for ``test_root_lint_covers_nonmember_py.py``,
+        whose targets are RAW command tokens that may still carry the slash the
+        author typed.
+      * On ``posixpath.normpath``-ed targets — the only kind
+        ``test_skills_module_config_decision.py`` ever passes — the two agree
+        exactly (measured across 6 rel_paths x 9 target lists, zero
+        disagreements; pinned by
+        ``test_covers_agrees_with_the_slashless_form_on_normpathed_targets``).
+
+    So do NOT "simplify" this back to the narrower set: the extra spellings are
+    the reason one function can serve both callers.
+
+    The root ``'.'`` parent is skipped, so a ``'.'`` target does not vacuously
+    cover every path in the repo.
+    """
+    candidate = pathlib.PurePosixPath(rel_path)
+    names = {rel_path, rel_path.rstrip("/"), rel_path + "/"}
+    for parent in candidate.parents:
+        if parent == pathlib.PurePosixPath("."):
+            continue
+        names.add(parent.as_posix())
+        names.add(parent.as_posix() + "/")
+    return any(t in names for t in targets)
+
+
+def flag_args(tokens: list[str], prefixes: tuple[str, ...]) -> list[str]:
+    """Those *tokens* beginning with any of *prefixes*, in order.
+
+    Both spellings are caught by construction: ``--exclude foo`` and
+    ``--exclude=foo``. *prefixes* is always supplied by the caller and is never
+    hardcoded here — which flags narrow a checker's target set is per-checker
+    POLICY (``_NARROWING_FLAGS`` in ``test_scripts_module_config.py``, ruff's
+    three exclude spellings in ``test_root_lint_covers_nonmember_py.py``).
+
+    THE SCOPE IS DELIBERATELY THE CALLER'S, which is why this takes an
+    already-tokenised LIST rather than a segment. ``uv run --project <member>
+    pyright <dir>`` and ``pyright --project <file> <dir>`` contain the same
+    characters naming two unrelated things: uv's PRE-anchor ``--project`` selects
+    the member ENVIRONMENT the binary resolves from and narrows nothing, while
+    pyright's POST-anchor ``--project`` redirects the CONFIG FILE and can relax
+    ``typeCheckingMode`` wholesale. Only POSITION distinguishes them.
+
+    The two live callers therefore pass different lists on purpose:
+    ``_ruff_exclude_flags`` in ``test_root_lint_covers_nonmember_py.py`` passes
+    ``shlex.split(segment)`` — the whole segment — while task 4358 deliberately
+    narrowed ``_narrowing_flag_args`` in ``test_scripts_module_config.py`` to
+    ``anchor_split(...)[1]``. A helper that took a segment would have to pick one
+    scope and would silently regress whichever caller it did not pick, so the
+    choice stays visible at the call site.
+    """
+    return [t for t in tokens if t.startswith(prefixes)]
