@@ -42,6 +42,7 @@ from _orch_helpers import (
     MERGE_RESULT_TIMEOUT,
     RESPONSIVE_WAIT_STRETCH,
     RESPONSIVE_WAIT_WALL_CAP,
+    wait_responsive,
 )
 
 from orchestrator.config import GitConfig, OrchestratorConfig, VerifyRunnerConfig
@@ -4721,99 +4722,140 @@ class TestCascadeErrorContainment:
 
         worker._remerge = _killer_remerge  # type: ignore[method-assign]
 
-        outcome_b: MergeOutcome | None = None
-        outcome_c: MergeOutcome | None = None
-
         with patch('orchestrator.merge_queue.run_scoped_verification', _gated_local):
             worker_task = asyncio.create_task(worker.run())
+            try:
+                await q.put(req_a)
+                await q.put(req_b)
 
-            await q.put(req_a)
-            await q.put(req_b)
+                # Wait for both verifies to enter (true concurrent overlap)
+                await wait_responsive(
+                    gate_a_entered.wait(),
+                    timeout=MERGE_GATE_BARRIER_TIMEOUT,
+                    label='cascade-err-a: gate_a_entered',
+                )
+                await wait_responsive(
+                    gate_b_entered.wait(),
+                    timeout=MERGE_GATE_BARRIER_TIMEOUT,
+                    label='cascade-err-b: gate_b_entered',
+                )
 
-            # Wait for both verifies to enter (true concurrent overlap)
-            await asyncio.wait_for(gate_a_entered.wait(), timeout=15.0)
-            await asyncio.wait_for(gate_b_entered.wait(), timeout=15.0)
+                # N fails → head-failure cascade fires → _killer_remerge raises for N+1
+                gate_a_release.set()
 
-            # N fails → head-failure cascade fires → _killer_remerge raises for N+1
-            gate_a_release.set()
+                # nominal PRESERVED at 15.0 as a literal -- never measured to
+                # fail (see the design decision on never-widen); this is
+                # deliberate, not an oversight.
+                outcome_a = await wait_responsive(
+                    req_a.result,
+                    timeout=15.0,
+                    label='cascade-err-a: MergeOutcome (N head verify fails)',
+                )
+                assert outcome_a.status not in ('done', 'already_merged'), (
+                    f'Expected N to fail, got status={outcome_a.status!r}.'
+                )
 
-            outcome_a = await asyncio.wait_for(req_a.result, timeout=15.0)
-            assert outcome_a.status not in ('done', 'already_merged'), (
-                f'Expected N to fail, got status={outcome_a.status!r}.'
-            )
+                # Unblock N+1's inner verify coroutine (the cascade already cancelled
+                # the outer verify_task; this releases any coroutine still awaiting
+                # gate_b so the test completes cleanly on both RED and GREEN paths).
+                gate_b_release.set()
 
-            # Unblock N+1's inner verify coroutine (the cascade already cancelled
-            # the outer verify_task; this releases any coroutine still awaiting
-            # gate_b so the test completes cleanly on both RED and GREEN paths).
-            gate_b_release.set()
+                # Wait for req_b to resolve. nominal PRESERVED at 5.0 -- never
+                # measured to fail.
+                # GREEN: except handler → MergeOutcome('blocked', 'Verifier cascade error: ...')
+                # RED:   RuntimeError escaped before handler → req_b.result never
+                #        set → wait_responsive fails loudly by label instead of a
+                #        silent None.
+                outcome_b = await wait_responsive(
+                    req_b.result,
+                    timeout=5.0,
+                    label='cascade-err-b: MergeOutcome (cascade error -> blocked)',
+                )
 
-            # Wait for req_b to resolve:
-            # GREEN: except handler → MergeOutcome('blocked', 'Verifier cascade error: ...')
-            # RED:   RuntimeError escaped before handler → req_b.result never set
-            with contextlib.suppress(TimeoutError):
-                outcome_b = await asyncio.wait_for(req_b.result, timeout=5.0)
+                # (3a) SLOT EXACT-ONCE: check BEFORE stop() (which over-releases for safety).
+                # The cascade releases the downstream speculative permit exactly once
+                # (in-body, BEFORE the _remerge call); _entry_released=True then prevents
+                # the except handler from re-releasing it on the _remerge-raises path.
+                #
+                # MEASUREMENT NOTE (task 1907): the merger is parked at its speculative
+                # look-ahead acquire() — _speculation_depth=1 and the downstream entry
+                # held the only permit — so it is a *waiter* on the slot.
+                # asyncio.Semaphore.release() hands the freed permit straight to that
+                # waiter (_wake_up_first decrements _value back), so a correct single
+                # release leaves _value at depth0 - 1, NOT depth0; the merger holds that
+                # one look-ahead permit for the rest of the test. A naive unconditional
+                # re-release in the except handler (double-release) would push _value up
+                # to depth0 — so this assertion still catches it. An under-release (leak)
+                # leaves the merger waiter blocked → req_c never dispatched → caught by
+                # the loop-survival assertion below.
+                expected_slot = depth0 - 1  # one permit held by the merger look-ahead
+                assert worker._speculation_slot._value == expected_slot, (
+                    f'Expected speculation slot at depth0-1={expected_slot} '
+                    f'(merger holds one look-ahead permit), '
+                    f'got {worker._speculation_slot._value!r}. '
+                    'A higher value means the except handler over-released '
+                    '(naive unconditional re-release).'
+                )
 
-            # (3a) SLOT EXACT-ONCE: check BEFORE stop() (which over-releases for safety).
-            # The cascade releases the downstream speculative permit exactly once
-            # (in-body, BEFORE the _remerge call); _entry_released=True then prevents
-            # the except handler from re-releasing it on the _remerge-raises path.
-            #
-            # MEASUREMENT NOTE (task 1907): the merger is parked at its speculative
-            # look-ahead acquire() — _speculation_depth=1 and the downstream entry
-            # held the only permit — so it is a *waiter* on the slot.
-            # asyncio.Semaphore.release() hands the freed permit straight to that
-            # waiter (_wake_up_first decrements _value back), so a correct single
-            # release leaves _value at depth0 - 1, NOT depth0; the merger holds that
-            # one look-ahead permit for the rest of the test. A naive unconditional
-            # re-release in the except handler (double-release) would push _value up
-            # to depth0 — so this assertion still catches it. An under-release (leak)
-            # leaves the merger waiter blocked → req_c never dispatched → caught by
-            # the loop-survival assertion below.
-            expected_slot = depth0 - 1  # one permit held by the merger look-ahead
-            assert worker._speculation_slot._value == expected_slot, (
-                f'Expected speculation slot at depth0-1={expected_slot} '
-                f'(merger holds one look-ahead permit), '
-                f'got {worker._speculation_slot._value!r}. '
-                'A higher value means the except handler over-released '
-                '(naive unconditional re-release).'
-            )
+                # Queue a third request as the loop-survival signal.
+                # GREEN: verifier_loop alive → req_c dispatched on local → 'done'.
+                # RED:   verifier_loop dead (RuntimeError terminated it) → req_c
+                #        never dispatched → wait_responsive fails loudly by label
+                #        instead of a silent None.
+                wt_c = await _make_branch_with_file(
+                    git_ops, 'task/cas-c', 'cas_c.py', 'c = 3\n'
+                )
+                req_c = MergeRequest(
+                    task_id='cas-c', branch=QueuedBranch.parse('task/cas-c', config.git.branch_prefix), worktree=wt_c,
+                    pre_rebased=False, task_files=None, module_configs=[],
+                    config=config, result=event_loop.create_future(), lane='normal',
+                )
+                await q.put(req_c)
 
-            # Queue a third request as the loop-survival signal.
-            # GREEN: verifier_loop alive → req_c dispatched on local → 'done'.
-            # RED:   verifier_loop dead (RuntimeError terminated it) → req_c
-            #        never dispatched → TimeoutError → outcome_c stays None.
-            wt_c = await _make_branch_with_file(
-                git_ops, 'task/cas-c', 'cas_c.py', 'c = 3\n'
-            )
-            req_c = MergeRequest(
-                task_id='cas-c', branch=QueuedBranch.parse('task/cas-c', config.git.branch_prefix), worktree=wt_c,
-                pre_rebased=False, task_files=None, module_configs=[],
-                config=config, result=event_loop.create_future(), lane='normal',
-            )
-            await q.put(req_c)
-
-            with contextlib.suppress(TimeoutError):
-                outcome_c = await asyncio.wait_for(req_c.result, timeout=10.0)
-
-            await worker.stop()
-
-        with contextlib.suppress(Exception):
-            await asyncio.wait_for(worker_task, timeout=5.0)
+                # NAMED WIDENING 10.0 -> MERGE_RESULT_TIMEOUT (45s): the one
+                # MEASURED failure site -- the xdist-load flake this task
+                # fixes (see data/verify-logs/2493/attempt-1.orchestrator.
+                # summary-20260720T122511_413502Z.json and the task-3980
+                # branch observation). suppress(TimeoutError) removed -- a
+                # give-up now fails loudly by label instead of leaving
+                # outcome_c at a stale None.
+                outcome_c = await wait_responsive(
+                    req_c.result,
+                    timeout=MERGE_RESULT_TIMEOUT,
+                    label='cascade-err-c: MergeOutcome (loop-survival signal)',
+                )
+            finally:
+                # esc-3980-4 (test_merge_speculation.py:1972-2003, _stop_worker):
+                # wait_responsive gives up by raising _pytest.outcomes.Failed,
+                # and the two hard asserts above raise too -- so on the old
+                # straight-line shape any of those could skip worker.stop()
+                # and leak a live worker plus its run task into pytest-asyncio
+                # teardown. Placement INSIDE the patch block is deliberate:
+                # whatever the worker still has to unwind should see the
+                # fakes, not real git ops. stop() is safe here even with an
+                # unreleased gate -- it cancels in-flight verify tasks rather
+                # than awaiting them.
+                await worker.stop()
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(worker_task, timeout=5.0)
 
         # ── (1) LOOP SURVIVES ────────────────────────────────────────────────
-        # RED: RuntimeError in _remerge propagates out of the unguarded cascade
-        #      for-loop → _verifier_loop terminates → req_c never dispatched.
-        assert outcome_c is not None and outcome_c.status == 'done', (
+        # A starved-or-hung wait now fails loudly by label at the
+        # wait_responsive call itself, above; this assertion only ever fires
+        # on a WRONG STATUS.
+        assert outcome_c.status == 'done', (
             f'Expected req_c to resolve "done" (loop survived cascade error), '
             f'got {outcome_c!r}. '
             'RED: RuntimeError in _remerge exits the unguarded cascade for-loop '
-            '→ _verifier_loop terminates → req_c never dispatched → TimeoutError. '
+            '→ _verifier_loop terminates → req_c never dispatched. '
             'GREEN (1856): per-entry try/except contains the error; loop continues.'
         )
 
         # ── (2) OFFENDING REQ BLOCKED ────────────────────────────────────────
-        # RED: RuntimeError escaped before the handler could set the result.
-        assert outcome_b is not None and outcome_b.status == 'blocked', (
+        # A starved-or-hung wait now fails loudly by label at the
+        # wait_responsive call itself, above; this assertion only ever fires
+        # on a WRONG STATUS.
+        assert outcome_b.status == 'blocked', (
             f'Expected cascade error to resolve req_b as "blocked", '
             f'got {outcome_b!r}. '
             'RED: RuntimeError propagated before the handler set req_b.result. '
