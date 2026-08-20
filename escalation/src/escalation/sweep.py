@@ -24,7 +24,7 @@ from pathlib import Path
 
 from escalation import archive
 from escalation.models import Escalation
-from escalation.queue import escalation_id_lock
+from escalation.queue import SEQ_COUNTER_SUFFIX, escalation_id_lock
 
 logger = logging.getLogger(__name__)
 
@@ -368,6 +368,9 @@ def reap_orphan_locks(queue_dir: Path, *, apply: bool = True) -> int:
     retention — or was never submitted after its id was minted — the lock file
     is left behind forever and the queue root accumulates them.
 
+    Sidecars for ``esc-{task_id}.seq`` counters are never candidates at all; see
+    the ``SEQ_COUNTER_SUFFIX`` guard in the loop.
+
     A sidecar is an ORPHAN when its record is absent from BOTH tiers — the queue
     root AND the archive — in which case no writer can ever take that lock again
     and unlinking it is safe.  An archived record still counts as live: it is
@@ -409,6 +412,14 @@ def reap_orphan_locks(queue_dir: Path, *, apply: bool = True) -> int:
     for path in list(queue_dir.glob('*.json.lock')):
         stem = path.name[: -len('.json.lock')]
         record_path = queue_dir / f'{stem}.json'
+
+        # A make_id sequence counter has NO .json record by construction, so it
+        # would look orphaned forever.  Deleting a counter or its sidecar forces
+        # make_id down _recover_seq_from_disk — a correctness-relevant repair
+        # path, not merely a slow one: it derives from SUBMITTED records only and
+        # so can rewind the counter below an id already minted but not yet filed.
+        if stem.endswith(SEQ_COUNTER_SUFFIX):
+            continue
 
         if stem in archived_stems:
             continue
