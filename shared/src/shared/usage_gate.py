@@ -1891,6 +1891,24 @@ class UsageGate:
                 'until this is fixed.',
                 self._probe_infra_fault,
             )
+            # A NEW event_type in this gate's vocabulary, joining cap_hit,
+            # near_cap, auth_failed, auth_resumed, resumed, failover and
+            # lease_stale. Deliberately distinct from cap_hit: a host fault
+            # recorded as cap telemetry is the same "indistinguishable from a
+            # real cap" defect this task removes, just at the data layer —
+            # cap dashboards and cap-history queries would absorb it as load.
+            # Additive for existing readers:
+            # dashboard/.../cap_history.py filters event_type IN
+            # ('cap_hit','resumed') and so is unaffected.
+            self._fire_cost_event(
+                acct.name,
+                'probe_infra_fault',
+                json.dumps({
+                    'binary': exc.binary,
+                    'cause': str(exc.cause),
+                    'consecutive': acct.probe_spawn_failures,
+                }),
+            )
 
     def _clear_probe_spawn_failures(self, acct: AccountState) -> None:
         """Record that a probe for *acct* actually RAN, whatever its verdict.
@@ -1944,24 +1962,48 @@ class UsageGate:
         Fires a minimal Claude invocation (haiku, 1 turn) to verify the
         account actually has capacity.  Only uncaps the account on success.
         """
-        while acct.capped:
-            target = acct.resets_at
-            if target is None:
-                target = datetime.now(UTC) + timedelta(hours=1)
-                logger.warning(f'Account {acct.name}: no resets_at — defaulting to 1h')
+        # Set once the last probe could not be SPAWNED (task 4512). Starts
+        # False because the first iteration has no evidence either way: at
+        # that instant a host fault and a genuine cap are indistinguishable,
+        # so it must take the cap path — the same one a real cap takes.
+        spawn_faulted = False
 
+        while acct.capped:
             base = self._config.probe_interval_secs
             ceiling = self._config.max_probe_interval_secs
             interval = min(base * (2**acct.probe_count), ceiling)
 
-            remaining = max(0, (target - datetime.now(UTC)).total_seconds())
-            sleep_for = min(interval, remaining) if remaining > 0 else 0
+            if spawn_faulted:
+                # The last probe could not be spawned at all. That is a host
+                # fault, not a cap: this account's real reset time is UNKNOWN
+                # and must not be invented. Retry at the plain backoff cadence
+                # so recovery is noticed once the binary is resolvable again,
+                # but report no countdown and write no resets_at. The account
+                # stays CAPPED — we could not verify capacity, and a real
+                # invocation would die at the same missing binary anyway.
+                sleep_for = interval
+                logger.info(
+                    'Account %s: probe could not be spawned — retrying in '
+                    '%.0fs (reset time unknown; NOT a usage cap)',
+                    acct.name, sleep_for,
+                )
+            else:
+                # --- unchanged cap path -------------------------------------
+                target = acct.resets_at
+                if target is None:
+                    target = datetime.now(UTC) + timedelta(hours=1)
+                    logger.warning(f'Account {acct.name}: no resets_at — defaulting to 1h')
+
+                remaining = max(0, (target - datetime.now(UTC)).total_seconds())
+                sleep_for = min(interval, remaining) if remaining > 0 else 0
+
+                if sleep_for > 0:
+                    logger.info(
+                        f'Account {acct.name}: sleeping {sleep_for:.0f}s '
+                        f'(probe #{acct.probe_count + 1}, resets in {remaining:.0f}s)',
+                    )
 
             if sleep_for > 0:
-                logger.info(
-                    f'Account {acct.name}: sleeping {sleep_for:.0f}s '
-                    f'(probe #{acct.probe_count + 1}, resets in {remaining:.0f}s)',
-                )
                 try:
                     await asyncio.sleep(sleep_for)
                 except asyncio.CancelledError:
@@ -1976,7 +2018,19 @@ class UsageGate:
                 f'Account {acct.name}: firing probe #{acct.probe_count}',
             )
 
-            ok = await self._run_probe(acct)
+            try:
+                ok = await self._run_probe(acct)
+            except ProbeSpawnError as exc:
+                # probe_count was already incremented above, deliberately: the
+                # retry cadence must keep backing off toward the ceiling
+                # rather than hot-spinning on a missing binary. What this
+                # branch removes is only the FABRICATED reset time.
+                spawn_faulted = True
+                self._note_probe_spawn_failure(acct, exc)
+                continue
+
+            spawn_faulted = False
+            self._clear_probe_spawn_failures(acct)
 
             if ok:
                 # _refresh_capped_accounts runs from before_invoke OUTSIDE
