@@ -368,10 +368,23 @@ def reap_orphan_locks(queue_dir: Path, *, apply: bool = True) -> int:
     retention — or was never submitted after its id was minted — the lock file
     is left behind forever and the queue root accumulates them.
 
-    A sidecar is an ORPHAN when its record is absent, in which case no writer can
-    ever take that lock again and unlinking it is safe.  Every unlink is
-    serialized on the very lock being removed, so a concurrent queue writer that
-    already holds it is never cut in on.
+    A sidecar is an ORPHAN when its record is absent from BOTH tiers — the queue
+    root AND the archive — in which case no writer can ever take that lock again
+    and unlinking it is safe.  An archived record still counts as live: it is
+    readable via ``get()``/``get_by_task`` and its resolve/dismiss paths still
+    take the sidecar lock.  Every unlink is serialized on the very lock being
+    removed, so a concurrent queue writer that already holds it is never cut in
+    on.
+
+    The archive index is a SNAPSHOT taken when this pass runs — which, inside
+    ``run_startup_sweep``, is after ``archive.prune_archive``, so records dropped
+    by retention in the same run have their sidecars reaped in that run.  The
+    residual: a resolve that archives a record between the snapshot and the
+    unlink could have its (now live) sidecar reaped.  The cost is bounded to a
+    re-created sidecar — the next ``escalation_id_lock`` O_CREATs it — and a
+    momentary exclusion gap for that one id.  Closing it would cost one archive
+    rglob per candidate (thousands of candidates x thousands of archived files
+    on the first run), which is not worth paying for a window this narrow.
 
     Args:
         queue_dir: Root queue directory (the only place sidecars are created).
@@ -384,6 +397,11 @@ def reap_orphan_locks(queue_dir: Path, *, apply: bool = True) -> int:
     queue_dir = Path(queue_dir)
     reaped = 0
 
+    # One pass over the archive tier for the whole run: _build_archive_index's
+    # keys ARE the esc-*.json stems, and it returns {} when there is no archive
+    # root at all.
+    archived_stems = set(_build_archive_index(queue_dir / archive.ARCHIVE_SUBDIR))
+
     # Materialize the glob before iterating so the directory scan completes
     # before any unlink occurs — mutating a directory during os.scandir/readdir
     # has unspecified behaviour on some filesystems and can cause subsequent
@@ -391,6 +409,9 @@ def reap_orphan_locks(queue_dir: Path, *, apply: bool = True) -> int:
     for path in list(queue_dir.glob('*.json.lock')):
         stem = path.name[: -len('.json.lock')]
         record_path = queue_dir / f'{stem}.json'
+
+        if stem in archived_stems:
+            continue
 
         if record_path.exists():
             continue
