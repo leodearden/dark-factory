@@ -608,3 +608,101 @@ nothing new is shared across runs — per-run dirs stay per-run).
   > as the wrong axis: the query is task-keyed, not time-keyed, and a
   > date window would reintroduce exactly the window-dependence γ exists
   > to remove.
+  >
+  > **CORRECTION 2026-08-20 (esc-3999-2 ruling, HEAD `ca7459b0a9`) — the
+  > threading premise above is FALSE and the resolution is WITHDRAWN.
+  > Neither half is to be built as specified.**
+  >
+  > **(i) "FastMCP 3.2.2 runs sync tool functions INLINE on the
+  > event-loop thread" — FALSE.** The cited path `fastmcp/tools/tool.py`
+  > does not exist in 3.2.2; `tool.py` was renamed to `base.py`, which
+  > `shared/pyproject.toml:41-42` already documents in-tree.
+  > `fastmcp/tools/function_tool.py:252` and `:275` both
+  > `await call_sync_fn_in_threadpool(...)` for any non-coroutine tool fn,
+  > delegating to `anyio.to_thread.run_sync` via
+  > `utilities/async_utils.py:26-34`. Proved at runtime, not only by
+  > reading: a sync `@mcp.tool()` invoked through FastMCP's own client
+  > path reports an AnyIO worker thread ident and a 5 ms asyncio
+  > heartbeat keeps ticking through a 250 ms hard block, while an `async
+  > def` control tool in the same run reports the loop's own ident — so
+  > the probe discriminates. `get_task_escalations` (sync `def`,
+  > `server.py:1548`) is therefore ALREADY off-loop, and "plus offload"
+  > is a no-op for it. Do NOT edit the `FastMCP threadpool worker`
+  > comment at `server.py:3628-3630`: it is TRUE, and six further sites
+  > depend on the same fact — including `harness.py:13533-13538`, which
+  > names the 2026-05-29 reify incident that assuming otherwise caused.
+  >
+  > **(ii) The scoping half is a CORRECTNESS REGRESSION, not a pure I/O
+  > reduction.** `make_id` takes an id-namespace KEY, not the record's
+  > stored `task_id`, and 5 production sites pass a divergent one
+  > (`curator_escalator.py:422/493/603` key `'curator'`;
+  > `ticket_janitor.py:284/491` key `'ticket-janitor'`). Measured on the
+  > live corpus: 42 records whose stem does not start with
+  > `esc-{task_id}-`. For the exact query γ's cross-check would issue,
+  > `get_task_escalations('task-curator', level=1)`, a scoped glob
+  > returns **0 of 37 records — 100% loss** — because the L1s are minted
+  > under the role key while `promote_to_l2` mints L2s under the real
+  > task_id, so the glob preserves exactly the L2s and destroys exactly
+  > the L1s. `esc-curator-35` is pending in the queue root today. The
+  > cited precedent does not transfer either: `make_id` is counter-file
+  > based as of `queue.py:1642` ("the retired directory/archive-scan
+  > derivation"), and the surviving glob in `_recover_seq_from_disk`
+  > scopes on the KEY — the thing that IS in the filename — which is
+  > exactly what its "never parsed back out of a filename" safety
+  > argument depends on. Scoping also erodes contract D11
+  > (`index_drift_detector.py:16-27`, task 3709), which adopted an opaque
+  > dedup key in the `task_id` slot precisely BECAUSE `get_by_task`
+  > filters on the stored field.
+  >
+  > **(iii) The motivation does not survive measurement — INV-8's
+  > premise here was never checked.** Nobody had ever timed the scan.
+  > Measured (medians over >=15 reps, load 60-168): archive-inclusive
+  > `get_by_task` **261-297 ms warm** (~950-1,100 ms cold), independent
+  > of hit count; root-only (`status='pending'`, 67 of 79 call sites)
+  > **~26 ms**. Rate: **~3.2 archive-inclusive MCP calls/day** over a
+  > 9.29-day transcript window, plus a bounded ~80-330 internal calls/day
+  > => **20-90 CPU-seconds/day**. The scoped-glob speedup is **15x**, not
+  > the 80-600x claimed. And "growing ~100/day with no pruning ...
+  > degrades monotonically forever" is FALSE: `archive.prune_archive`
+  > with `DEFAULT_RETENTION_DAYS = 30` runs as pass 3 of
+  > `sweep.run_startup_sweep`, the archive spans exactly 30 days, and the
+  > corpus **shrank** from the 3,039 files measured 2026-08-11 to 2,969
+  > on 2026-08-20. It is bounded at ~2,825 archived files and never
+  > reaches the ~10,700 needed for a 1 s call.
+  >
+  > **(iv) The real INV-8 exposure — the hazard is genuine, the site was
+  > wrong.** The escalation server has no loop of its own: it is a task
+  > on the ORCHESTRATOR's loop (`harness.py:11030`,
+  > `asyncio.create_task(_serve())`), so escalation-port latency IS
+  > orchestrator loop lag. What actually occupies that loop is the
+  > `async def` tools, exactly inverting the amendment: `async def
+  > get_pending_escalations` (`server.py:1450`) scans inline at `:1514`
+  > and awaits `_annotate_pins_recovery`, whose `level is not None`
+  > branch fans out one full root scan PER task_id at `server.py:544-546`
+  > — measured **2.1-4.9 s of loop occupancy per L2 drain cycle**. Plus
+  > seven in-process orchestrator sites doing archive-inclusive
+  > `get_by_task` inline inside `async def`, where FastMCP offload cannot
+  > help at all: `workflow.py:5620, 5702, 13024, 15525`,
+  > `deterministic_runner.py:2677, 2899`, `harness.py:13434`. Note the
+  > fanout POSTDATES this correction's own premise: `get_pending_escalations`
+  > became `async def` on 2026-08-17 (`b8e3bc95a3`, task 3543), six days
+  > after the 2026-08-11 analysis above — so the hazard named on
+  > 2026-08-11 was fictional, and a larger real one of the same shape has
+  > appeared since at a different site.
+  >
+  > **(v) The lever that measurement actually favours, which nobody
+  > proposed.** The queue root holds **8,901 dirents to serve 145
+  > records** — 7,531 `.json.lock` sidecars and 1,218 `.seq` counters —
+  > of which **3,334 record locks are ORPHANED** (their record was pruned
+  > by retention), the oldest dating to 2026-06-09.
+  > `run_startup_sweep`'s three passes reap records but never their
+  > locks, so this — not the record corpus — is the system's only
+  > unbounded growth vector, and it sits on the HOT path. Reaping is
+  > worth **24x** on the root glob (76.8 ms -> 1.70 ms measured) with zero
+  > semantic change, and projects to 131 ms at +6 months / 673 ms at
+  > +4.5 years if left alone.
+  >
+  > **Disposition:** γ (task 3999) is narrowed back to its decomposed
+  > SKILL.md scope; the `queue.py`/`server.py` work is withdrawn from it
+  > and re-filed against the sites above. INV-8 for γ is discharged by
+  > the fact that `get_task_escalations` is already off-loop.
