@@ -138,6 +138,15 @@ async def _run_load_bearing_oracle(
     background (logged via :func:`_log_abandoned_oracle_cleanup`, never
     blocking a caller).
 
+    The task is abandoned this way on EVERY exceptional exit from the
+    ``asyncio.wait`` above, not only budget expiry: if this coroutine's own
+    caller is cancelled while parked there, ``asyncio.wait`` does not cancel
+    what it was waiting on, so the oracle task would otherwise be left
+    referenced only by the event loop's WEAK task set. Either way the task
+    is cancelled and held in the module-level :data:`_ABANDONED_ORACLES`
+    strong-reference registry (via :func:`_abandon_oracle`) until it ends,
+    then released.
+
     Fail-open contract — returns False for ANY of:
     - ``oracle_cmd`` is ``None`` or empty (tripwire disabled / misconfigured).
     - ``changed_files`` is empty.
@@ -149,6 +158,11 @@ async def _run_load_bearing_oracle(
       raised (an oracle hiccup must never wedge the merge-landed hot path —
       log WARNING, return False).
 
+    The one exit that does NOT fail open: if this coroutine's caller is
+    cancelled, the oracle task is abandoned (as above) but the
+    ``CancelledError`` itself PROPAGATES rather than being laundered into
+    ``False`` — a cancelled caller must stay cancelled.
+
     Mirrors ``verify._verify_pipeline_guard_requires_full_gate``'s fail-open
     shape, but takes a config-driven command list instead of a hardcoded
     ``scripts/verify-pipeline-guard.sh`` path.
@@ -159,7 +173,18 @@ async def _run_load_bearing_oracle(
         from orchestrator.git_ops import _run  # noqa: PLC0415, I001 — lazy, mirrors _verify_pipeline_guard_requires_full_gate
 
         task = asyncio.ensure_future(_run([*oracle_cmd, *changed_files], cwd=project_root))
-        _done, pending = await asyncio.wait({task}, timeout=timeout_secs)
+        try:
+            _done, pending = await asyncio.wait({task}, timeout=timeout_secs)
+        except BaseException:
+            # asyncio.wait() does not cancel what it waits on, and this
+            # catches BaseException (not just Exception) because
+            # CancelledError — the caller being cancelled out from under us
+            # — is a BaseException subclass since 3.8, so the outer
+            # `except Exception` below cannot see it. Without this,
+            # cancellation jumps over the abandon and strands the task in
+            # the loop's WEAK set.
+            _abandon_oracle(task)
+            raise
         if pending:
             logger.warning(
                 '_run_load_bearing_oracle: oracle command exceeded %.1fs for '
