@@ -38,6 +38,7 @@ from typing import Any
 
 import pytest
 from fastmcp import Client
+from fastmcp.exceptions import ToolError
 from shared.mcp_markup_middleware import MarkupGuardMiddleware, RepairPolicy
 from shared.toolcall_markup import detect
 
@@ -85,6 +86,21 @@ def specimen(tool_use_id: str) -> dict[str, Any]:
 #: (``suggested_action``) parameter in ONE call — the PRD section 9 gamma-1
 #: signal in a single specimen.
 GAMMA_1 = 'toolu_01Q1FPhhjWsxGhTEQRfvMaLa'
+
+#: DOUBLY corrupted — the residue's own value carries a closing content tag, so
+#: :func:`repair` cannot locate the boundary and refuses (PRD boundary row B5).
+#: The same class as the on-disk ``esc-3184-2``, which is why that record could
+#: never have demonstrated a recovery.
+UNREPAIRABLE = 'toolu_012YjuXbKZAMwNAo9WR4Pvjx'
+
+#: The category the middleware stamps on a residue record
+#: (``mcp_markup_middleware._ESCALATION_CATEGORY``) and the machine-readable
+#: owner that will exit the hold unprompted (``_ESCALATION_OWNER``, INV-7).
+#: Spelled out here rather than imported: the point of these assertions is that
+#: the REGISTRATION SITE carried the middleware's contract onto a real record,
+#: and importing both sides of a contract lets both drift together.
+RESIDUE_CATEGORY = 'mcp_markup_residue'
+RESIDUE_OWNER = 'l2-escalation-watcher'
 
 #: The four required parameters of ``escalate_info``. The gamma-1 specimen's
 #: own ``supplied`` list records exactly these plus ``detail``, so this mirrors
@@ -278,3 +294,145 @@ class TestStrictInputValidationStaysOff:
 
         assert result.meta is not None
         assert 'markup_repair' in result.meta
+
+
+# ---------------------------------------------------------------------------
+# The other half of C2: what happens when the boundary CANNOT be found.
+# ---------------------------------------------------------------------------
+
+
+class TestUnrepairableResidueIsPreserved:
+    """A refusal must not DESTROY the payload it refuses (C2 L187, INV-7).
+
+    PRD section 4 C2: "Unrepairable input is never guessed, under either
+    policy: reject, and file an escalation carrying the full raw payload so
+    nothing is discarded even if the caller never retries. That escalation
+    names its owner and carries the standing L2 age bound (INV-7)."
+
+    That second sentence is the half a BARE registration silently does not
+    deliver. Measured on this server after step 8: with no ``escalation_sink``
+    wired the middleware logs ``no escalation_sink is wired, so the residue of
+    %r will not be preserved anywhere`` and returns ``None`` — the call is
+    refused, ``escalation_id`` comes back null, and the caller's payload is
+    gone. For a leak that is by construction an agent emitting text it cannot
+    re-emit identically, "the caller can just retry" is not true.
+
+    The refusal itself is CORRECT and is asserted here too: forwarding
+    unparsed residue would deliver a call the caller never made while
+    permanently dropping whatever arguments hide inside it.
+    """
+
+    async def _refuse(self, tmp_path: Path):
+        """Drive the doubly-corrupted specimen and return (queue, payload)."""
+        record = specimen(UNREPAIRABLE)
+        assert record['expected_outcome'] == 'unrepairable'
+        assert record['expected_recovered'] == []
+        queue, server = build(tmp_path)
+        async with Client(server) as client:
+            with pytest.raises(ToolError) as excinfo:
+                await client.call_tool(
+                    'escalate_info', {**REQUIRED, record['param']: record['value']}
+                )
+        return queue, error_payload(excinfo)
+
+    @staticmethod
+    def _residue(queue) -> Any:
+        """The one residue record on the queue — asserting there is exactly one."""
+        residues = [
+            esc for esc in queue.get_pending()
+            if esc.category == RESIDUE_CATEGORY
+        ]
+        assert len(residues) == 1, (
+            f'expected exactly one {RESIDUE_CATEGORY} record on the queue, '
+            f'found {len(residues)}'
+        )
+        return residues[0]
+
+    @pytest.mark.asyncio
+    async def test_the_call_is_refused(self, tmp_path: Path):
+        """(a) The boundary is a guess, so nothing is forwarded."""
+        _, payload = await self._refuse(tmp_path)
+
+        assert payload['error_type'] == 'mcp_markup_unrepairable'
+        assert payload['outcome'] == 'unrepairable'
+        assert payload['tool'] == 'escalate_info'
+        # No repaired_call: offering one would invite a retry re-sending a guess.
+        assert 'repaired_call' not in payload
+
+    @pytest.mark.asyncio
+    async def test_nothing_partial_was_written_for_the_caller(self, tmp_path: Path):
+        """(a) The refused call filed NO escalation of its own.
+
+        The tool body never ran, so the caller's own ``task_id`` must have no
+        record — a half-written escalation carrying the corrupted ``detail``
+        would be the silent fail-soft this guard exists to end.
+        """
+        queue, _ = await self._refuse(tmp_path)
+
+        assert queue.get_by_task(REQUIRED['task_id']) == []
+
+    @pytest.mark.asyncio
+    async def test_a_residue_escalation_is_queued(self, tmp_path: Path):
+        """(b) The refusal is non-destructive because THIS record exists."""
+        queue, _ = await self._refuse(tmp_path)
+
+        residue = self._residue(queue)
+        assert residue.category == RESIDUE_CATEGORY
+
+    @pytest.mark.asyncio
+    async def test_the_residue_carries_the_payload_in_full(self, tmp_path: Path):
+        """(c) VERBATIM and ENTIRE — not an excerpt.
+
+        Deliberately unlike ``build_markup_block``'s 200-char
+        ``content_excerpt``: that is a diagnostic sitting beside a payload the
+        caller still holds, while this is the only surviving copy. 3525
+        characters of it, for this specimen.
+        """
+        record = specimen(UNREPAIRABLE)
+        queue, _ = await self._refuse(tmp_path)
+
+        residue = self._residue(queue)
+        stored = residue.to_json()
+        assert record['value'] in stored, (
+            'the residue record does not contain the raw payload in full'
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_residue_names_the_leaking_call(self, tmp_path: Path):
+        """(c) Plus the flat fields an operator needs to chase the leak."""
+        queue, _ = await self._refuse(tmp_path)
+
+        stored = self._residue(queue).to_json()
+        assert 'escalate_info' in stored
+        assert 'detail' in stored
+
+    @pytest.mark.asyncio
+    async def test_the_residue_is_born_at_l2_and_names_its_owner(self, tmp_path: Path):
+        """(d) INV-7: a supervised consumer plus the standing age surfacing.
+
+        This is a queue-backed handoff, so the bound is the L2 watcher's
+        standing age surfacing rather than a deadline of this record's own —
+        which is exactly what the ``level=2`` stamp buys. A residue record born
+        at L0 would wait on a steward that has no idea it exists.
+        """
+        queue, _ = await self._refuse(tmp_path)
+
+        residue = self._residue(queue)
+        assert residue.level == 2
+        assert RESIDUE_OWNER in residue.to_json(), (
+            'the residue record does not name the owner that will exit the hold'
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_refusal_names_the_preserved_record(self, tmp_path: Path):
+        """(e) A bounced caller can point an operator at its own data.
+
+        Null today: ``_file_residue_escalation`` returns ``None`` when no sink
+        is wired, and a sink reporting a non-``str`` is treated as reporting no
+        id at all — the caller is better told nothing than pointed at a value
+        it cannot look up.
+        """
+        queue, payload = await self._refuse(tmp_path)
+
+        residue = self._residue(queue)
+        assert payload['escalation_id'] == residue.id
