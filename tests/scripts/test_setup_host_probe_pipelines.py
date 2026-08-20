@@ -23,7 +23,13 @@ from __future__ import annotations
 
 import re
 
-from setup_host_sections import run_section, setup_host_text, slice_section
+from setup_host_sections import (
+    run_section,
+    setup_host_text,
+    slice_section,
+    stub_bin_dir,
+    write_stub,
+)
 
 # Trailing bytes a producer writes AFTER the matching line, to provoke (b).
 #
@@ -55,48 +61,64 @@ _SECTION_2_START = 'docker compose -f "$COMPOSE_FILE" up -d falkordb qdrant'
 _SECTION_2_END = "\ndone\n"
 
 
-def _write_stub(stub_bin, name, body):
-    """Drop an executable bash stub *name* carrying *body* into *stub_bin*."""
-    path = stub_bin / name
-    path.write_text("#!/usr/bin/env bash\n" + body, encoding="utf-8")
-    path.chmod(0o755)
-    return path
-
-
 def _stub_bin(tmp_path):
     """The stub dir `run_section` will reuse, pre-loaded with a no-op `sleep`.
 
-    `run_section` does `stub_bin.mkdir(exist_ok=True)` on this exact path, so
-    stubs written here survive and its own `systemctl` stub joins them. The
-    `sleep` stub is what keeps the 30-iteration timeout case instant.
+    `stub_bin_dir` is the harness's own accessor for the directory it prepends
+    to PATH, so stubs written here land where `run_section` looks without this
+    module re-deriving its path. The `sleep` stub is what keeps the
+    30-iteration timeout case instant.
     """
-    stub_bin = tmp_path / "stub-bin"
-    stub_bin.mkdir(exist_ok=True)
-    _write_stub(stub_bin, "sleep", "exit 0\n")
+    stub_bin = stub_bin_dir(tmp_path)
+    write_stub(stub_bin, "sleep", "exit 0\n")
     return stub_bin
 
 
-def _docker_stub(stub_bin, exec_body):
-    """A `docker` stub whose `... exec ...` invocation runs *exec_body*.
+def _dispatch_stub_body(branches):
+    """A `case "$*"` body running one of *branches* — (glob, text) pairs.
 
-    The `up -d` invocation exits 0 silently; only the exec branch is under
-    test. `case` is the stub's LAST command, so the exec branch's own status
-    becomes the stub's exit status. That is deliberate and load-bearing: the
-    producer's status IS the thing these tests are about, and a trailing
-    `exit 0` here would swallow it and make every test below vacuously green.
+    `case` is the stub's LAST command, so the taken branch's own status becomes
+    the stub's exit status. That is deliberate and load-bearing: the producer's
+    status IS the thing these tests are about, and a trailing `exit 0` here
+    would swallow it and make every test below vacuously green. The catch-all
+    exits 0 so the invocations that are not under test stay silent.
     """
-    return _write_stub(
-        stub_bin,
-        "docker",
-        'case "$*" in\n'
-        '  *" exec "*)\n'
-        f"{exec_body}"
-        "    ;;\n"
-        "  *)\n"
-        "    exit 0\n"
-        "    ;;\n"
-        "esac\n",
+    arms = "".join(f"  {glob})\n{text}    ;;\n" for glob, text in branches)
+    return 'case "$*" in\n' + arms + "  *)\n    exit 0\n    ;;\nesac\n"
+
+
+def _run_probe(tmp_path, section_text, *, stub_name=None, stub_body=None, env_extra=None):
+    """Run *section_text* in a tmp tree, with at most one scripted PATH stub.
+
+    One scaffold for every probe site: build the stub dir, write the site's
+    stub, hand `run_section` a tmp repo root. Sites differ only in the slice
+    they pass, the stub they script, and whether they need $COMPOSE_FILE — so
+    a new probe site is a wrapper, not another copy of this.
+
+    *stub_name* None writes no stub at all, which is how the no-`claude` host
+    is expressed.
+    """
+    stub_bin = _stub_bin(tmp_path)
+    if stub_name is not None:
+        write_stub(stub_bin, stub_name, stub_body)
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir(exist_ok=True)
+    return run_section(
+        tmp_path,
+        section_text,
+        repo_root=repo_root,
+        unit_dir=tmp_path / "units",
+        env_extra=env_extra,
     )
+
+
+def _compose_env(tmp_path):
+    """The slices read $COMPOSE_FILE and the harness preamble does not set it.
+
+    Under `set -u` an undefined one aborts the section before it probes
+    anything. Same channel the existing parity sweeps use for $UV_PATH.
+    """
+    return {"COMPOSE_FILE": str(tmp_path / "docker-compose.yml")}
 
 
 # Scenario bodies for the docker exec branch. Indented to sit inside `case`.
@@ -106,20 +128,23 @@ _SILENT_FAILURE = "    exit 1\n"
 _CLEAN_REPLY = "    printf 'PONG\\n'\n    exit 0\n"
 
 
+def _docker_stub_body(exec_body):
+    """A `docker` stub body whose `... exec ...` invocation runs *exec_body*.
+
+    The `up -d` invocation falls to the catch-all and exits 0 silently; only
+    the exec branch is under test.
+    """
+    return _dispatch_stub_body((('*" exec "*', exec_body),))
+
+
 def _run_section_2(tmp_path, exec_body):
     """Slice the section-2 wait loop and run it against a scripted docker."""
-    stub_bin = _stub_bin(tmp_path)
-    _docker_stub(stub_bin, exec_body)
-    repo_root = tmp_path / "repo"
-    repo_root.mkdir(exist_ok=True)
-    return run_section(
+    return _run_probe(
         tmp_path,
         slice_section(_SECTION_2_START, _SECTION_2_END),
-        repo_root=repo_root,
-        unit_dir=tmp_path / "units",
-        # The slice reads $COMPOSE_FILE and the harness preamble does not
-        # define it, so under `set -u` it would abort without this.
-        env_extra={"COMPOSE_FILE": str(tmp_path / "docker-compose.yml")},
+        stub_name="docker",
+        stub_body=_docker_stub_body(exec_body),
+        env_extra=_compose_env(tmp_path),
     )
 
 
@@ -209,30 +234,16 @@ _LISTING_UNREADABLE = "    exit 1\n"
 
 def _run_jcodemunch(tmp_path, list_body):
     """Slice the jcodemunch MCP block and run it against a scripted `claude`."""
-    stub_bin = _stub_bin(tmp_path)
-    _write_stub(
-        stub_bin,
-        "claude",
-        'case "$*" in\n'
-        '  *"mcp add"*)\n'
-        f"    printf '{_ADD_SENTINEL}\\n'\n"
-        "    exit 0\n"
-        "    ;;\n"
-        '  *"mcp list"*)\n'
-        f"{list_body}"
-        "    ;;\n"
-        "  *)\n"
-        "    exit 0\n"
-        "    ;;\n"
-        "esac\n",
-    )
-    repo_root = tmp_path / "repo"
-    repo_root.mkdir(exist_ok=True)
-    return run_section(
+    return _run_probe(
         tmp_path,
         slice_section(_JCODEMUNCH_START, _JCODEMUNCH_END),
-        repo_root=repo_root,
-        unit_dir=tmp_path / "units",
+        stub_name="claude",
+        stub_body=_dispatch_stub_body(
+            (
+                ('*"mcp add"*', f"    printf '{_ADD_SENTINEL}\\n'\n    exit 0\n"),
+                ('*"mcp list"*', list_body),
+            )
+        ),
     )
 
 
@@ -292,16 +303,12 @@ _SECTION_12_END = "\nfi\n"
 
 def _run_section_12(tmp_path, exec_body):
     """Slice the section-12 FalkorDB health check and run it."""
-    stub_bin = _stub_bin(tmp_path)
-    _docker_stub(stub_bin, exec_body)
-    repo_root = tmp_path / "repo"
-    repo_root.mkdir(exist_ok=True)
-    return run_section(
+    return _run_probe(
         tmp_path,
         slice_section(_SECTION_12_START, _SECTION_12_END),
-        repo_root=repo_root,
-        unit_dir=tmp_path / "units",
-        env_extra={"COMPOSE_FILE": str(tmp_path / "docker-compose.yml")},
+        stub_name="docker",
+        stub_body=_docker_stub_body(exec_body),
+        env_extra=_compose_env(tmp_path),
     )
 
 

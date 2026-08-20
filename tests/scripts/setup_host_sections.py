@@ -39,7 +39,11 @@ while letting a future caller silently lose the observability.
 Generalized from the reference implementation in
 tests/scripts/test_check_orchestrator_unit_parity.py (task 3424) and migrated
 onto this module by task 3909, so all four parity suites now share one slicer,
-one preamble and one stub.
+one preamble and one stub. The stub directory's own PATH literal is owned here
+too, by `stub_bin_dir`: a caller that drops stubs of its own alongside the
+harness's `systemctl` imports that accessor instead of re-deriving
+``tmp_path / "stub-bin"`` and depending on this module's private choice by
+string equality.
 """
 
 from __future__ import annotations
@@ -104,6 +108,28 @@ def _preamble(repo_root: pathlib.Path, unit_dir: pathlib.Path) -> str:
 def setup_host_text() -> str:
     """The full text of scripts/setup-host.sh."""
     return SETUP_HOST_PATH.read_text(encoding="utf-8")
+
+
+def stub_bin_dir(tmp_path: pathlib.Path) -> pathlib.Path:
+    """The (created) directory `run_section` prepends to PATH for *tmp_path*.
+
+    THE PATH LITERAL LIVES HERE, ONCE. Callers that need to drop their own
+    stubs alongside the harness's `systemctl` previously re-derived
+    ``tmp_path / "stub-bin"`` and depended on this module's private choice by
+    string equality — a rename here would silently drop their stubs off PATH.
+    Going through this accessor makes that coupling an import instead.
+    """
+    stub_bin = tmp_path / "stub-bin"
+    stub_bin.mkdir(exist_ok=True)
+    return stub_bin
+
+
+def write_stub(stub_bin: pathlib.Path, name: str, body: str) -> pathlib.Path:
+    """Drop an executable bash stub *name* carrying *body* into *stub_bin*."""
+    path = stub_bin / name
+    path.write_text("#!/usr/bin/env bash\n" + body, encoding="utf-8")
+    path.chmod(0o755)
+    return path
 
 
 def _find_in_code(text: str, marker: str, *, start: int = 0) -> int:
@@ -220,16 +246,12 @@ def run_section(
     ``tmp_path / SYSTEMCTL_LOG`` before exiting 0 — see the module docstring
     for why that is unconditional.
     """
-    stub_bin = tmp_path / "stub-bin"
-    stub_bin.mkdir(exist_ok=True)
-    systemctl = stub_bin / "systemctl"
-    systemctl.write_text(
-        "#!/usr/bin/env bash\n"
-        f"printf '%s\\n' \"$*\" >> {tmp_path / SYSTEMCTL_LOG}\n"
-        "exit 0\n",
-        encoding="utf-8",
+    stub_bin = stub_bin_dir(tmp_path)
+    write_stub(
+        stub_bin,
+        "systemctl",
+        f"printf '%s\\n' \"$*\" >> {tmp_path / SYSTEMCTL_LOG}\nexit 0\n",
     )
-    systemctl.chmod(0o755)
 
     script = tmp_path / "section.sh"
     script.write_text(
