@@ -172,6 +172,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 
+import _fm_helpers
+import anthropic
 import httpx
 import openai
 import pytest
@@ -392,6 +394,129 @@ async def test_reap_ignores_an_already_closed_client():
     assert count == 0, 'An already-closed client must not be counted as reaped'
 
 
+@pytest.mark.asyncio
+async def test_reap_closes_a_leaked_anthropic_client():
+    """The ONE patch point covers ``anthropic`` too, not just ``openai``.
+
+    Both libraries ship their own ``AsyncHttpxClientWrapper``, and the drain
+    hooks NEITHER of them: it hooks their shared base,
+    ``httpx.AsyncClient.__init__``. "One base-class hook catches every library
+    with this pattern, present and future" is the load-bearing design claim of
+    ``track_async_httpx_clients`` — without this test it is asserted for
+    ``openai`` only and merely asserted in prose for ``anthropic``, so an
+    ``anthropic`` release that stopped chaining to the base ``__init__`` would
+    silently drop out of coverage.
+    """
+    track_async_httpx_clients()
+    await reap_leaked_async_httpx_clients()
+
+    client = anthropic.AsyncAnthropic(api_key='test-key')
+    inner = client._client
+    assert hasattr(type(inner), '__del__'), (
+        f'{type(inner).__module__}.{type(inner).__qualname__} no longer defines '
+        f'__del__, so anthropic clients are no longer resurrect-capable and the '
+        f'reaper now deliberately skips them — re-derive the predicate in '
+        f'_fm_helpers._leaked_async_httpx_clients (task 4412).'
+    )
+    assert inner.is_closed is False, 'expected a freshly-built AsyncAnthropic to hold an open httpx client'
+
+    reaped = await reap_leaked_async_httpx_clients()
+    assert reaped == 1, (
+        f'the anthropic wrapper must be tracked by the same httpx.AsyncClient '
+        f'base hook as the openai one, so the reaper should have closed exactly '
+        f'the 1 client this test built, got {reaped}'
+    )
+    assert inner.is_closed is True, 'reap must aclose() the leaked anthropic client'
+
+
+@pytest.mark.asyncio
+async def test_reap_survives_a_client_whose_aclose_raises():
+    """A client that refuses to close does not fail the innocent test around it.
+
+    The reaper runs at EVERY test's teardown, so its FAILURE mode matters more
+    than its success one: an exception escaping it is attributed to whichever
+    test happened to be finishing — the same "innocent test blamed" shape this
+    drain exists to remove. ``RuntimeError('Event loop is closed')`` is the
+    realistic case (a pool bound to a loop that is already gone — exactly what
+    the sync fallback arm's throwaway ``asyncio.run`` loop can provoke), so it
+    is the one pinned here, together with the return contract: a client that
+    failed to close is NOT counted as reaped.
+
+    Without this, ``contextlib.suppress(asyncio.TimeoutError, RuntimeError)``
+    is unexercised and a later edit narrowing or dropping it would surface as
+    a CI failure in an unrelated test's teardown.
+    """
+    track_async_httpx_clients()
+    await reap_leaked_async_httpx_clients()
+
+    client = openai.AsyncOpenAI(api_key='test-key')
+    inner = client._client
+    real_aclose = inner.aclose
+
+    async def _refuses_to_close(*args, **kwargs):
+        raise RuntimeError('Event loop is closed')
+
+    # Instance attribute, not the class: the reaper does client.aclose(), an
+    # instance lookup, so this is both sufficient and free of blast radius.
+    inner.aclose = _refuses_to_close
+    try:
+        reaped = await reap_leaked_async_httpx_clients()  # must not raise
+        assert reaped == 0, (
+            f'a client whose aclose() raised is still open and must not be '
+            f'counted as reaped, got {reaped}'
+        )
+        assert inner.is_closed is False, (
+            'sanity: the refusing aclose() left the client open, which is what '
+            'makes the count contract above meaningful'
+        )
+    finally:
+        del inner.aclose
+        await real_aclose()
+
+
+@pytest.mark.asyncio
+async def test_reap_is_bounded_when_aclose_hangs(monkeypatch):
+    """A hanging ``aclose()`` costs a bounded pause, not the whole xdist worker.
+
+    The other half of the "best-effort and bounded" contract. fused-memory runs
+    with ``timeout_method = "thread"``, whose handler ends in ``os._exit(1)`` —
+    a teardown that blocks forever therefore kills the entire xdist worker, not
+    just one test. The bound is exercised at 50ms via
+    ``ASYNC_HTTPX_ACLOSE_TIMEOUT`` rather than by waiting out the shipped 10s.
+    """
+    track_async_httpx_clients()
+    await reap_leaked_async_httpx_clients()
+    monkeypatch.setattr(_fm_helpers, 'ASYNC_HTTPX_ACLOSE_TIMEOUT', 0.05)
+
+    client = openai.AsyncOpenAI(api_key='test-key')
+    inner = client._client
+    real_aclose = inner.aclose
+
+    async def _never_returns(*args, **kwargs):
+        await asyncio.Event().wait()
+
+    inner.aclose = _never_returns
+    try:
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        reaped = await reap_leaked_async_httpx_clients()  # must not hang or raise
+        elapsed = loop.time() - started
+        assert elapsed < 5.0, (
+            f'the reaper must abandon a hanging aclose() after '
+            f'ASYNC_HTTPX_ACLOSE_TIMEOUT (patched to 0.05s here), but it took '
+            f'{elapsed:.2f}s — the timeout bound is gone, and a stuck client '
+            f'can now hang a test teardown until pytest-timeout kills the '
+            f'whole worker (task 4412).'
+        )
+        assert reaped == 0, (
+            f'a client whose aclose() timed out is still open and must not be '
+            f'counted as reaped, got {reaped}'
+        )
+    finally:
+        del inner.aclose
+        await real_aclose()
+
+
 # ---------------------------------------------------------------------------
 # conftest wiring (task 4412)
 #
@@ -521,7 +646,7 @@ async def test_aaa_leaked_client_records_its_closing_loop():
 
 
 @pytest.mark.xdist_group('async_httpx_reap_ordering')
-def test_aab_the_leak_was_closed_in_its_own_test_loop():
+def test_aab_the_leak_was_closed_in_its_own_test_loop(request):
     """Victim: the polluter's leaked client was closed in the polluter's loop.
 
     The behavioural pin for the two-arm teardown ordering, replacing an
@@ -542,21 +667,47 @@ def test_aab_the_leak_was_closed_in_its_own_test_loop():
     Measured against python 3.13.9 / pytest 9.0.3 / pytest-asyncio 1.3.0
     (``asyncio_mode=strict``); a bump to any of those is exactly when this
     pair should be re-run.
+
+    ``closing_loop is None`` covers two states that need OPPOSITE handling, so
+    they are separated by whether the polluter was collected in this session at
+    all (``request.session.items``): DESELECTED — a ``-k`` filter, ``--lf``
+    after an unrelated failure, an IDE run-one-test — means this pair simply
+    measured nothing and SKIPS, rather than manufacturing a red that reads like
+    a drain regression; COLLECTED but silent means the drain genuinely closed
+    nothing, and fails loudly. Deselection removes items from
+    ``session.items``, whereas an xdist worker collects the whole suite before
+    running its share, so a pair split across workers still lands in the loud
+    branch — which is correct: that means the ``xdist_group`` marks stopped
+    working.
     """
+    polluter = 'test_aaa_leaked_client_records_its_closing_loop'
+    polluter_collected = any(item.name == polluter for item in request.session.items)
     try:
         closing_loop = _REAP_ORDERING_PROBE.get('closing_loop')
         test_loop = _REAP_ORDERING_PROBE.get('test_loop')
 
-        # Guard FIRST: if the pair got split across xdist workers (or the
-        # polluter was deselected), both reads are None and the affinity
-        # assertion below would pass vacuously on `None is None`.
+        # Guard FIRST: with no measurement in hand, the affinity assertion
+        # below would pass vacuously on `None is None`.
+        if test_loop is None and not polluter_collected:
+            pytest.skip(
+                f'{polluter} was not collected in this session (subset '
+                f'selection: -k / --lf / run-one-test), so the teardown '
+                f'affinity pair has nothing to compare. The full-suite signal '
+                f'is unaffected.'
+            )
+        assert test_loop is not None, (
+            f'{polluter} WAS collected in this session but recorded no loop, '
+            f'so it never ran before this test. Either the pair was split '
+            f"across xdist workers — check both arms still carry "
+            f"@pytest.mark.xdist_group('async_httpx_reap_ordering') and remain "
+            f'adjacent in collection order — or it errored out (task 4412).'
+        )
         assert closing_loop is not None, (
-            'no aclose() was observed for the client leaked by '
-            'test_aaa_leaked_client_records_its_closing_loop, so this pair '
-            'measured nothing. Either the conftest drain never ran, or the '
-            "pair was split across xdist workers — check both arms still "
-            "carry @pytest.mark.xdist_group('async_httpx_reap_ordering') "
-            'and remain adjacent in collection order (task 4412).'
+            'the client leaked by '
+            'test_aaa_leaked_client_records_its_closing_loop ran but its '
+            'aclose() was never observed: the conftest drain closed nothing. '
+            'Check that both autouse arms are still wired in conftest.py '
+            '(task 4412).'
         )
         assert closing_loop is test_loop, (
             'the leaked client was closed in a FOREIGN event loop '

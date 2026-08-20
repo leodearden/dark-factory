@@ -1337,6 +1337,14 @@ async def reap_leaked_ticket_workers() -> int:
 #: the reaper only ever sees clients something else is still holding.
 _TRACKED_ASYNC_HTTPX_CLIENTS: weakref.WeakSet = weakref.WeakSet()
 
+#: Per-client bound on the drain's aclose(). The reaper runs in EVERY test's
+#: teardown, so an aclose() that never returns must cost that test a bounded
+#: pause rather than hang it until pytest-timeout kills the whole xdist worker
+#: (see the timeout notes in fused-memory/pyproject.toml). A module-level knob
+#: rather than a literal so the bound itself is testable in ~50ms — see
+#: test_async_httpx_leak_isolation.test_reap_is_bounded_when_aclose_hangs.
+ASYNC_HTTPX_ACLOSE_TIMEOUT = 10.0
+
 
 #: Stamped on the installed wrapper so a second install is a no-op. Named on
 #: the FUNCTION rather than kept in a module global because the thing being
@@ -1407,6 +1415,15 @@ def _leaked_async_httpx_clients() -> list:
     Also the cheap predicate ``conftest``'s SYNC autouse fixture checks before
     deciding whether to spin up an event loop at all, so the ~14100-of-14147
     tests that leak nothing pay only a WeakSet scan.
+
+    NO NOTION OF OWNERSHIP OR AGE, deliberately: every tracked, open,
+    resurrect-capable client is selected, whoever built it and whenever. A
+    client built by a fixture scoped WIDER than ``function`` would therefore
+    be closed at the first test's teardown, out from under its owner. See the
+    CONSTRAINT block above the two autouse arms in ``conftest.py`` for why
+    scoping the reap to the current test was considered and rejected (it opens
+    the inverse hole), and for the warning that makes the trap discoverable if
+    anyone ever walks into it.
     """
     return [
         client
@@ -1462,7 +1479,12 @@ async def reap_leaked_async_httpx_clients() -> int:
     A genuine bug inside the reaper itself — or a ``CancelledError`` targeting
     the reaper's own task — is deliberately left to propagate rather than
     masked by a blanket ``except Exception``
-    (loud-over-silent-degradation).
+    (loud-over-silent-degradation). Both halves of that robustness contract
+    are pinned behaviourally rather than left as prose:
+    ``test_reap_survives_a_client_whose_aclose_raises`` (the suppressed
+    ``RuntimeError``, and that a client which failed to close is NOT counted)
+    and ``test_reap_is_bounded_when_aclose_hangs`` (the
+    ``ASYNC_HTTPX_ACLOSE_TIMEOUT`` bound, exercised at 50ms).
 
     MAINTENANCE NOTE: this relies on third-party internals that are not part
     of any public API — the ``AsyncHttpxClientWrapper.__del__`` finaliser in
@@ -1488,7 +1510,9 @@ async def reap_leaked_async_httpx_clients() -> int:
     reaped = 0
     for client in _leaked_async_httpx_clients():
         with contextlib.suppress(asyncio.TimeoutError, RuntimeError):
-            await asyncio.wait_for(client.aclose(), timeout=10.0)
+            await asyncio.wait_for(
+                client.aclose(), timeout=ASYNC_HTTPX_ACLOSE_TIMEOUT,
+            )
         if client.is_closed:
             reaped += 1
     return reaped
