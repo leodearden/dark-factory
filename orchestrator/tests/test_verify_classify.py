@@ -2354,6 +2354,145 @@ class TestAggregatedRunAllScopingReplay:
         assert CATEGORY_POLICY[result].is_infra_transient is False
 
 
+def _fixture_lines() -> list[str]:
+    return _REIFY_5623_TEST_LEG.split('\n')
+
+
+def _index_of_first_open_header() -> int:
+    for index, line in enumerate(_fixture_lines()):
+        if verify_classify._RUN_ALL_SUITE_OPEN_RE.match(line):
+            return index
+    raise AssertionError('fixture carries no open header')
+
+
+def _index_of_failing_block_open() -> int:
+    for index, line in enumerate(_fixture_lines()):
+        match = verify_classify._RUN_ALL_SUITE_OPEN_RE.match(line)
+        if match is not None and match.group('name') == 'test_reify_audit_ptodo.sh':
+            return index
+    raise AssertionError('fixture carries no test_reify_audit_ptodo.sh block')
+
+
+def _index_of_last_close() -> int:
+    lines = _fixture_lines()
+    for index in range(len(lines) - 1, -1, -1):
+        if verify_classify._RUN_ALL_SUITE_CLOSE_RE.match(lines[index]):
+            return index
+    raise AssertionError('fixture carries no close line')
+
+
+def _splice(marker: str, at: int) -> str:
+    """Insert *marker* (a single producer line, newline-terminated) into the
+    fixture immediately before line index *at*."""
+    lines = _fixture_lines()
+    return '\n'.join(lines[:at] + marker.rstrip('\n').split('\n') + lines[at:])
+
+
+class TestGenuineHostEventSurvivesRunAllScoping:
+    """task 4492 preservation controls: a genuine host event that is NOT
+    covered by a passing suite's attestation must still be detected.
+
+    HONEST FRAMING: unlike TestRedactPassedSuiteBlocks and
+    TestAggregatedRunAllScopingReplay, every assertion in this class is GREEN
+    on unmodified HEAD. They are preservation pins, not a RED->GREEN proof,
+    so their value is established against MUTANTS rather than against the
+    pre-fix code. The three mutants and their measured kills are recorded in
+    this step's commit message; if a future edit makes one of these cases
+    unfalsifiable, re-run those mutants before trusting the class.
+
+    Each case splices a real emitter line into the pre-1 fixture, so the
+    surrounding output is the genuine 5623 transcript rather than a toy.
+    """
+
+    @pytest.mark.parametrize('name,marker', _ANCHORED_SLOT_TIMEOUT_SHAPES)
+    @pytest.mark.parametrize('tool', ALL_TOOL_KINDS)
+    def test_n1_marker_in_preamble_is_detected(self, tool, name, marker):
+        """The case that would break design option (a) — "narrow to the
+        failing suite's block" — and the reason option (b) was chosen. The
+        runner PREAMBLE is where a genuine pool-admission starvation
+        surfaces, before any suite has opened."""
+        output = _splice(marker, _index_of_first_open_header())
+        assert _classify(tool, output, 1, False) == FailureCategory.SEMAPHORE_TIMEOUT
+
+    @pytest.mark.parametrize('name,marker', _ANCHORED_SLOT_TIMEOUT_SHAPES)
+    @pytest.mark.parametrize('tool', ALL_TOOL_KINDS)
+    def test_n2_marker_inside_the_failing_block_is_detected(self, tool, name, marker):
+        """The FAILING suite's block is never redacted, so a marker there is
+        still evidence about the failure being classified."""
+        output = _splice(marker, _index_of_failing_block_open() + 1)
+        assert _classify(tool, output, 1, False) == FailureCategory.SEMAPHORE_TIMEOUT
+
+    @pytest.mark.parametrize('name,marker', _ANCHORED_SLOT_TIMEOUT_SHAPES)
+    @pytest.mark.parametrize('tool', ALL_TOOL_KINDS)
+    def test_n3_marker_in_an_aborted_run_is_detected(self, tool, name, marker):
+        """The run-aborting starvation the task names explicitly: an open
+        header with NO closing RESULT and no `=== Summary:` tail. An aborted
+        run is exactly where a real host event surfaces, so an unclosed block
+        must never be treated as attested."""
+        lines = _fixture_lines()[: _index_of_last_close() + 1]
+        output = '\n'.join(
+            lines + ['--- Running: test_x.sh ---', marker.rstrip('\n')]
+        )
+        assert '=== Summary:' not in output
+        assert _classify(tool, output, 1, False) == FailureCategory.SEMAPHORE_TIMEOUT
+
+    @pytest.mark.parametrize('name,marker', _ANCHORED_SLOT_TIMEOUT_SHAPES)
+    @pytest.mark.parametrize('tool', ALL_TOOL_KINDS)
+    def test_n4_marker_in_the_tail_is_detected(self, tool, name, marker):
+        """The aggregate TAIL — the other region design option (a) would have
+        discarded. A runner-level host abort surfaces here, after the last
+        suite closed."""
+        output = _REIFY_5623_TEST_LEG + marker
+        assert _classify(tool, output, 1, False) == FailureCategory.SEMAPHORE_TIMEOUT
+
+    @pytest.mark.parametrize('name,marker', _ANCHORED_SLOT_TIMEOUT_SHAPES)
+    @pytest.mark.parametrize('tool', ALL_TOOL_KINDS)
+    def test_n5_marker_in_a_skipped_block_is_detected(self, tool, name, marker):
+        """A SKIPPED suite carries no PASS attestation — it never asserted
+        the host was healthy — so a marker inside it is still evidence."""
+        block = (
+            '--- Running: test_x.sh ---\n'
+            + marker.rstrip('\n')
+            + '\n  RESULT: SKIP (test_x.sh)'
+        )
+        output = _splice(block + '\n', _index_of_last_close() + 1)
+        assert _classify(tool, output, 1, False) == FailureCategory.SEMAPHORE_TIMEOUT
+
+    @pytest.mark.parametrize('name,marker', _ANCHORED_SLOT_TIMEOUT_SHAPES)
+    @pytest.mark.parametrize('tool', ALL_TOOL_KINDS)
+    def test_n6_marker_under_mismatched_framing_is_detected(self, tool, name, marker):
+        """The nesting guard, from the detection side: a name mismatch makes
+        the helper fail SAFE (redact nothing), so a marker inside a replayed
+        or malformed transcript is still detected."""
+        block = (
+            '--- Running: a.sh ---\n'
+            + marker.rstrip('\n')
+            + '\n  RESULT: PASS (b.sh)'
+        )
+        output = _splice(block + '\n', _index_of_last_close() + 1)
+        assert _classify(tool, output, 1, False) == FailureCategory.SEMAPHORE_TIMEOUT
+
+    # -- the guard's OTHER arms, since step-4 scopes all of it ---------------
+
+    @pytest.mark.parametrize('tool', ALL_TOOL_KINDS)
+    def test_n7_enospc_inside_the_failing_block_is_disk_full(self, tool):
+        """DISK_FULL is scoped too, so it needs its own preservation pin —
+        and it must still outrank the SEMAPHORE_TIMEOUT markers already in
+        the fixture, per the unchanged ORDERING."""
+        marker = 'error: failed to write output: No space left on device\n'
+        output = _splice(marker, _index_of_failing_block_open() + 1)
+        assert _classify(tool, output, 1, False) == FailureCategory.DISK_FULL
+
+    @pytest.mark.parametrize('tool', ALL_TOOL_KINDS)
+    def test_n8_interrupted_marker_in_the_tail_is_env_transient(self, tool):
+        """Collateral shape 5 is a literal marker a suite testing run_all's
+        interrupt path could legitimately replay — which is precisely why the
+        whole guard is scoped rather than just the SEMAPHORE_TIMEOUT arm.
+        Outside a PASS block it must still classify."""
+        output = _REIFY_5623_TEST_LEG + _COLLATERAL_INTERRUPTED_MARKER_OUTPUT
+        assert _classify(tool, output, 1, False) == FailureCategory.ENV_TRANSIENT
+
+
 # step-9: verify._summarize_checks must thread the per-check config command
 # (test_cmd/lint_cmd/type_cmd) into classify_failure as that check's
 # ToolKind, instead of discarding tool identity (today's tool-blind
