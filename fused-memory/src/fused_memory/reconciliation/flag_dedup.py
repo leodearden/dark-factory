@@ -2394,7 +2394,10 @@ async def filter_terminal_metadata_flags(
         try:
             return await taskmaster.get_task(task_id, project_root)
         except Exception as exc:
-            logger.debug(
+            # WARN, not debug: this is a degraded outcome (the filter cannot
+            # tell whether the flag is stale), so it must be visible without
+            # raising the log level — see the silent-fallthrough gate.
+            logger.warning(
                 'reconciliation.terminal_metadata_filter_get_task_error task_id=%s error=%s',
                 task_id, exc,
             )
@@ -3598,7 +3601,10 @@ async def filter_already_tracked_systemic_patterns(
         except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
             raise
         except Exception as exc:
-            logger.info(
+            # WARN, not info: one project's backend being unreachable degrades
+            # this filter's coverage, and the silent-fallthrough gate requires
+            # a degraded empty/None return to be audible at WARN+.
+            logger.warning(
                 'reconciliation.systemic_pattern_already_tracked_get_tasks_error '
                 'project_root=%s error=%s',
                 project_root, exc,
