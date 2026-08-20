@@ -558,7 +558,17 @@ def file_unattributed_landing_escalation(
     Best-effort (a no-op when *escalation_queue* is None, e.g. bare-harness
     or bare-worker unit tests) and deduped via ``has_open_l1`` so repeated
     ticks re-observing the same unattributable evidence don't stack
-    duplicate L1s — one open escalation per task at a time.
+    duplicate L1s — one open escalation per task PER CATEGORY at a time.
+
+    **The category scoping is load-bearing** (task 3116). This call used to
+    pass a bare ``task_id``, and ``category=None`` matches ANY open L1 on the
+    task — a two-way blindfold in which an unrelated pending escalation (a
+    ``task_failure``, say) silently suppressed a ``provenance_unattributed``
+    filing, so a provenance defect hid behind an escalation that had nothing
+    to do with it. Observed live on task 4105. The narrower dedup
+    deliberately accepts slightly higher L1 volume — a task can now hold one
+    open L1 per category rather than one overall — in exchange for not hiding
+    provenance defects behind unrelated escalations. Do not widen it back.
 
     Args:
         escalation_queue: The caller's ``EscalationQueue``, or ``None``.
@@ -572,7 +582,9 @@ def file_unattributed_landing_escalation(
     if not escalation_queue:
         return
     try:
-        if escalation_queue.has_open_l1(task_id):
+        if escalation_queue.has_open_l1(
+            task_id, category='provenance_unattributed',
+        ):
             return
         from escalation.models import Escalation  # noqa: PLC0415
 
