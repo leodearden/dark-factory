@@ -904,6 +904,28 @@ async def run(
             len(unmeasured_graphs), ', '.join(unmeasured_graphs),
         )
 
+    # The empty-SET hole, one level up from the empty-graph one above.
+    # `unmeasured_graphs` catches a graph the store reports as populated that
+    # this run skipped — but if the store reports NO graphs at all there is
+    # nothing to skip: `unmeasured_graphs` is empty, `projects` is empty,
+    # `all([])` is True, and the report would claim a COMPLETE measurement
+    # while `_verdict_for` reads `regex_matched == 0` and returns the
+    # STRONGEST verdict in this file ('no fact in ANY project graph matches
+    # ... provably zero measured benefit') — quantified over zero facts, from
+    # an empty or wrong store (a fresh `docker-compose up -d`, a `--config`
+    # aimed elsewhere). Exit 0 would then greenlight overwriting the committed
+    # artifact with a zero-graph measurement. Measuring nothing is a coverage
+    # shortfall, not a complete measurement of nothing.
+    measured_no_graphs = not project_ids
+    if measured_no_graphs:
+        logger.warning(
+            'COVERAGE SHORTFALL: the store reported ZERO graphs to measure '
+            '(source=%s). A run that read no graph cannot support any claim '
+            'about every project graph — check the backing store is the '
+            'intended one and is populated. Reporting INCOMPLETE.',
+            project_ids_source,
+        )
+
     projects: list[ProjectReport] = []
     for project_id in project_ids:
         logger.info('enumerating project=%s', project_id)
@@ -960,7 +982,11 @@ async def run(
         triage_totals=triage_totals,
         candidates=candidates,
         verdict=_verdict_for(totals, triage_totals),
-        complete=all(p.complete for p in projects) and not unmeasured_graphs,
+        complete=(
+            all(p.complete for p in projects)
+            and not unmeasured_graphs
+            and not measured_no_graphs
+        ),
         max_samples=args.max_samples,
         project_ids_source=project_ids_source,
         unmeasured_graphs=unmeasured_graphs,
@@ -1285,6 +1311,16 @@ def render_markdown(report: Report) -> str:
         _GRAPH_SET_NOTES[report.project_ids_source],
         '',
     ]
+    if not report.projects:
+        lines += [
+            '**COVERAGE SHORTFALL.** This run measured ZERO graphs, so every '
+            'count below is zero for want of a corpus rather than as a '
+            'finding, and the verdict quantifies over nothing. The report is '
+            'marked incomplete for this reason alone — check the backing '
+            'store is the intended one and is populated before reading '
+            'anything into the numbers.',
+            '',
+        ]
     if report.unmeasured_graphs:
         lines += [
             '**COVERAGE SHORTFALL.** The store reports these graphs as '
@@ -1526,6 +1562,11 @@ async def _main(argv: list[str] | None = None) -> int:
             args.json_out, args.md_out,
         )
         if not report.complete:
+            if not report.projects:
+                logger.error(
+                    'COVERAGE SHORTFALL: zero graphs measured (source=%s)',
+                    report.project_ids_source,
+                )
             for project in report.projects:
                 if not project.complete:
                     logger.error(

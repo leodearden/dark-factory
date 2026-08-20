@@ -1205,6 +1205,52 @@ async def test_a_populated_graph_left_unmeasured_fails_closed(caplog):
 
 
 @pytest.mark.asyncio
+async def test_an_empty_store_fails_closed_instead_of_verdicting_over_nothing(
+    caplog,
+):
+    """The same shortfall class as above, one level up: an EMPTY measured set.
+
+    `unmeasured_graphs` catches a graph the store reports and the run skipped.
+    A store that reports NO graphs has nothing to skip, so that guard reads
+    clean: `unmeasured_graphs == []`, `projects == []`, `all([]) is True`. The
+    report would then be `complete`, exit 0, and carry the strongest verdict in
+    the file — 'no fact in ANY project graph matches ... provably zero measured
+    benefit' — derived from zero facts, and `_write_artifacts` would overwrite
+    the committed report with it. An empty or wrong store (a fresh
+    `docker-compose up -d`, a `--config` aimed elsewhere) must be a shortfall,
+    not a complete measurement of nothing.
+    """
+    source = _FakeEdgeSource({})
+
+    with caplog.at_level('WARNING'):
+        report = await run(
+            _args(project_id=None),
+            edge_source=source,
+            graph_lister=_lister(),
+        )
+
+    assert source.asked == [], 'there was nothing to enumerate'
+    assert report.projects == []
+    assert report.project_ids_source == 'discovered'
+    # the older guard genuinely has nothing to say here — that is the point
+    assert report.unmeasured_graphs == []
+    assert report.complete is False, 'measuring zero graphs is a shortfall'
+    assert exit_code(report) != 0
+
+    warnings = '\n'.join(r.getMessage() for r in caplog.records)
+    assert 'COVERAGE SHORTFALL' in warnings
+    assert 'ZERO graphs' in warnings
+
+    # and it is legible in the artifacts, which are what a reader actually sees
+    payload = json.loads(render_json(report))
+    assert payload['complete'] is False
+    markdown = render_markdown(report)
+    assert 'COVERAGE SHORTFALL' in markdown
+    assert 'ZERO graphs' in markdown
+    assert '- Enumeration complete: `False`' in markdown
+
+
+@pytest.mark.asyncio
 async def test_without_a_lister_the_report_says_its_graph_set_was_unchecked():
     """No inventory to compare against is not the same as a verified set.
 
