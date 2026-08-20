@@ -61,6 +61,178 @@ max_concurrent_tasks: 24
 #
 # RED TIER: lock_depth is not in RELOADABLE_FIELDS. This takes effect at the next
 # orchestrator restart, not on reload_config.
+#
+# DECIDED — pre-merge gate for operational config retunes (task 3886, spun out
+# of task 3866). Sited HERE, against the knob whose retune (094d634465, this
+# block's own subject) turned main red, because that is where a future retuner
+# reads before editing. The EXECUTABLE half is
+# tests/scripts/test_config_retune_gate_decision.py, which asserts every
+# premise below on RUNTIME state and carries a MEASURED RED for each.
+#
+# THE QUESTION, as filed: retuning a knob in this file is a potentially
+# main-breaking operation with no pre-merge gate, because orchestrator/tests/
+# conftest.py's autouse `_isolate_orch_config` binds every orchestrator test to
+# this file. Three options were offered — (1) add a pre-merge gate for yaml
+# retunes, (2) narrow the `_isolate_orch_config` contract so unit tests read
+# package defaults, (3) accept the exposure.
+#
+# THE ANSWER: (1) as framed is DECLINED — it buys nothing not already held, and
+# what WAS missing has been wired instead (see the `git:` block's
+# merge_config_only_full_gate_globs, this task's one production change). (2) is
+# REJECTED. (3) is ADOPTED QUALIFIED for the one genuinely ungated path. And a
+# FOURTH option the filing did not list is named as the standing remedy.
+#
+# ── CORRECTION 1: "there is NO pre-merge gate" is HALF-FALSE ──────────────
+#
+# 094d634465 never entered the merge lane at all. Measured: one parent
+# (50417b9d05), a direct-to-main commit touching only this file (+55/-0). So it
+# is not evidence that the merge gate is absent — it is evidence that a human
+# commit BYPASSED it. Those are different exposures with different remedies,
+# and conflating them is what made option (1) look like the obvious answer.
+#
+# For anything that DOES enter the lane, a yaml diff is already gated twice,
+# both asserted by the guard rather than taken on trust:
+#   * merge_verify_breadth: "full" (declared in the verification section of
+#     this file) — verify_plan.derive_verify_plan gates on
+#     verify_plan._merge_breadth_is_full and fans out through
+#     _derive_full_suite_runs, so merge-role verify runs EVERY registered
+#     module's full suite regardless of what the diff touches. This is what a
+#     new "run the orchestrator suite before a yaml retune can merge" gate
+#     would have added, and it is already unconditional.
+#   * INV-1's nothing-to-run escalation (task 2883) — a merge diff with no
+#     .py/.rs is routed to the full per-subproject gate rather than passing
+#     vacuously.
+#
+# ONE PATH WAS GENUINELY OPEN, and closing it is this task's only production
+# change. Both call sites of verify._merge_config_only_diff_forces_full_gate
+# sit in the `else:` of `if role == 'merge' and is_merge_verify:`. When
+# is_merge_verify is TRUE the INV-1 escalation above already covers the diff
+# and the predicate is never consulted. It is the is_merge_verify=FALSE
+# merge-role probe path where `should_override` reduces to that predicate OR
+# the async reify verify-pipeline-guard consult — and that consult falls open
+# for dark-factory. With the shipped empty default the predicate short-circuits
+# to False in O(1), so NOTHING forced the full gate there. The `git:` block now
+# names this file, which closes it and converts "a config-only diff forces the
+# full gate" from an incidental side effect of breadth into a DECLARED intent
+# about THIS file.
+#
+#   RED TIER, and this is a CORRECTION of this task's own plan, recorded rather
+#   than silently substituted. The plan asserted that key was green-tier
+#   hot-reloadable. It is NOT. Measured through the production symbol:
+#   RELOADABLE_FIELDS carries no whole-submodel `_submodel_leaf_paths('git',
+#   GitConfig)` group, only five explicit `git.offline_lane_*` leaves, and
+#   `'git.merge_config_only_full_gate_globs' in RELOADABLE_FIELDS` -> False.
+#   So that wiring is INERT in a running daemon until the next orchestrator
+#   restart — exactly like `lock_depth` itself (see the RED TIER note directly
+#   below). This is material to the decision, not a footnote: a reader who
+#   believed the green-tier claim would reload_config, see {reloaded: true},
+#   and conclude the backstop was live when it was not. The fleet redeploys on
+#   an 8h cadence, so the lag is bounded and the entry costs nothing until
+#   then.
+#
+# ── CORRECTION 2: option (2) is REJECTED, and the incident argues AGAINST it ─
+#
+# Option (2) — narrow `_isolate_orch_config` so unit tests read the
+# package-bundled DECLARED defaults — is a CONTRACT CHANGE, not a tidy-up, and
+# the heal commit for the very incident that motivated it (c54d7cf81c) argues
+# the other way in its own body: the binding is deliberate "precisely so tests
+# see real operational values", and the three tests that broke failed LOUDLY
+# via self-validating preconditions — "the precondition worked as designed; the
+# fixture data was stale".
+#
+# Under option (2) those same tests would have PASSED, at a declared depth the
+# factory does not run at. That trades a loud failure for a silent wrong-test:
+# against INV-2 structured-facts-at-failure and this repo's loud-over-silent
+# norm. It also inverts which behaviour is opt-in, when conftest.py ALREADY
+# ships the sanctioned per-test hatch — `code_default_config`, re-pointing
+# ORCH_CONFIG_PATH at a guaranteed-absent file so only defaults.yaml loads —
+# whose own docstring reserves it for "tests that assert the CODE DEFAULTS" and
+# says NEVER autouse.
+#
+# THIS TASK EXERCISED THAT HATCH ON ITSELF, which is the strongest evidence
+# either way and was not available when the task was filed. Wiring the glob
+# above turned one orchestrator test red:
+#   base a831c052b9   17964 passed, 17 skipped in 861.91s
+#   with the wiring    1 failed, 17966 passed, 16 skipped in 1456.42s
+#   FAILED tests/test_verify.py::TestMergeConfigOnlyDiffForcesFullGate::
+#          test_empty_globs_default_config_returns_false
+#   (reconfirmed in isolation; `pytest --collect-only` reports 17983 collected
+#   identically wired, unwired, and against the pristine yaml, so the outcome
+#   count delta is run-to-run variance and not attributable to the edit)
+# That test asserted `config.git.merge_config_only_full_gate_globs == []` on a
+# BARE OrchestratorConfig() — passing for an ACCIDENTAL reason, because this
+# repo happened not to declare the key. The repair was one line, the hatch
+# applied where it belongs (f1ea5d54fe), and it is STRICTLY STRONGER: the
+# assertion now means what the test's own name and docstring already claimed,
+# falsifiable by a change to defaults.yaml rather than by an unrelated
+# operational retune.
+#
+# So the defect class REPRODUCED LIVE, one knob over, in a file nobody
+# pre-checked — while the three test_config.py glob tests that WERE pre-checked
+# all survived. The task was filed on the strength of one historical instance;
+# it now has a second, generated by its own execution, and the remedy that
+# resolved it is the per-test hatch rather than the contract inversion. That is
+# the argument option (2) cannot answer.
+#
+# ── CORRECTION 3: option (3) is ADOPTED, QUALIFIED, and bounded ──────────────
+#
+# The residual exposure is exactly one path: a HUMAN direct-to-main commit,
+# which is what 094d634465 was. It is accepted rather than gated, for an honest
+# reason — the exposure is NOT yaml-specific, so a yaml-only pytest gate would
+# be a new policy justified by one incident:
+#   * hooks/project-checks runs ruff and pyright and NO pytest, for ANY file
+#     class (measured: zero occurrences of `pytest` in that file). A .py commit
+#     to main is no more test-gated than a .yaml one.
+#   * hooks/pre-commit:87-88 exits 0 on every non-main branch before reaching
+#     project-checks at all, so none of this runs in a task worktree.
+# Adding pytest for yaml alone would gate the least-common file class while
+# leaving the most-common one open, at the cost of putting a multi-minute suite
+# in a human's commit path.
+#
+# BOUNDED BY MEASUREMENT, not by optimism. run_main_tip_sweep is default-ON
+# (main_tip_sweep_enabled=True) at main_tip_sweep_interval_secs=1800.0 — a
+# 30-minute worst-case detection latency on a red main tip. The actual incident
+# ran 094d634465 (2026-08-07 17:32:03) -> c54d7cf81c (18:58:01) = 86 minutes,
+# so detection was not the binding constraint; the repair was. Accepting this
+# exposure costs at most one sweep interval of unnoticed red, against a fix
+# whose cost lands on every human commit.
+#
+# ── THE FOURTH OPTION THE FILING DID NOT LIST, and the standing remedy ───────
+#
+# KNOB-AGNOSTIC ASSERTION FORM: a test that DERIVES from the live value instead
+# of pinning a literal cannot be broken by a retune at all. This is not a
+# proposal — it is what the heal commit already did and what the repo has since
+# converged on. c54d7cf81c introduced `same_module_siblings(lock_depth)` in
+# orchestrator/tests/_workflow_helpers, and it has spread beyond the two call
+# sites this task's own plan cited: measured at HEAD it is used three times in
+# test_workflow_status_on_resume.py, again in
+# test_workflow_metadata_files_reconcile.py, and is itself pinned across every
+# plausible lock_depth by test_workflow_helpers.py. tests/scripts/
+# test_tests_scripts_module_config.py carries the same remedy in prose form —
+# CORRECTED-IN-PLACE notes replacing "the EFFECTIVE value is 4" with the
+# invariant, so the next retune falsifies nothing there.
+#
+# So the answer to "a retune broke a test" is: fix that test to read the value
+# live. Not "stop tests from seeing operational values" (option 2), and not
+# "add a gate so the breakage is caught later" (option 1). The guard file for
+# this decision is itself written that way throughout and pins no integer.
+#
+# ── SCOPE HONESTY — what this decision's guards do NOT buy ───────────────────
+#
+# tests/scripts/test_config_retune_gate_decision.py pins the four premises
+# above (breadth full + its predicate; the manifest-drift glob covering this
+# file; the operational-over-declared binding; every discovered module-config
+# prefix reachable at the live lock_depth) and would catch a retune DOWNWARD
+# that silently unreaches a module config.
+#
+# It does NOT catch the thing 094d634465 actually tripped: a stale fixture
+# literal in some unrelated test, derived from the old value of a knob. Nothing
+# can catch that at commit time short of running the suite, which is precisely
+# what this decision declines to add to the human commit path. That case
+# remains caught by the merge gate (for anything entering the lane) and by
+# run_main_tip_sweep (for anything that bypasses it) — later, not earlier. Read
+# a green run of that guard as "the decision's premises still hold", never as
+# "this retune is safe to land".
 lock_depth: 12
 
 # Verification commands (dark-factory multi-subproject layout)
