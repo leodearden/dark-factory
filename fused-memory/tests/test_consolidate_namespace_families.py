@@ -3079,16 +3079,30 @@ class TestRunApplyStoreMutationPreflight:
         # Phase B -- the collection merge, and the empty-collection drop.
         qdrant_client.upsert.assert_not_awaited()
         qdrant_client.delete_collection.assert_not_awaited()
-        # The junk-key GRAPH.DELETE.
-        for graph in graphiti._graphs_by_key.values():
-            graph.delete.assert_not_called()
+        # The junk-key GRAPH.DELETE. Asserted as "no graph was even
+        # RESOLVED" rather than by looping over ._graphs_by_key and asserting
+        # on each .delete: the registry is populated lazily by _graph_for, so
+        # under the deny it is EMPTY and a loop body over it never executes --
+        # a per-graph assertion here would be vacuous (contrast the dry-run
+        # test above, which asserts the registry is non-empty first).
+        assert not graphiti._graphs_by_key, (
+            'no graph may be resolved at all, so no GRAPH.DELETE can have been issued'
+        )
 
     @pytest.mark.asyncio
-    async def test_the_guard_sits_before_every_backend_read(self, monkeypatch):
-        """It aborts without a single round-trip: no graph is even resolved,
-        so neither the entity nor the episodic enumeration is paid for by a run
-        that was never going to be allowed to mutate. The Qdrant transport is
-        not opened either."""
+    async def test_the_guard_sits_before_every_graph_read(self, monkeypatch):
+        """It aborts without a single graph round-trip: no graph is even
+        resolved, so neither the entity nor the episodic enumeration is paid
+        for by a run that was never going to be allowed to mutate.
+
+        Split from the Qdrant half below rather than asserted alongside it:
+        ``_graph_for`` is a plain (sync) MagicMock -- the script CALLS it and
+        awaits the ``ro_query`` on its result -- so ``assert_not_awaited()`` is
+        not available for it, and mixing the two assertion styles in one body
+        is exactly what the repo's AsyncMock assertion-style check forbids
+        (task 525, scripts/check_asyncmock_assertion_style.py). Each half now
+        asserts in the one style its mock supports.
+        """
         self._deny(monkeypatch)
         _patch_merge_primitives(monkeypatch)
         memory_service, graphiti, _ = self._scenario()
@@ -3097,6 +3111,21 @@ class TestRunApplyStoreMutationPreflight:
             await _mod.run(_run_args(apply=True), memory_service, limit=1000)
 
         graphiti._graph_for.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_the_guard_sits_before_the_qdrant_transport_is_opened(
+        self, monkeypatch
+    ):
+        """The other half of the same claim: the raw Qdrant transport is never
+        even opened, so the collection enumeration behind it is not paid for
+        either."""
+        self._deny(monkeypatch)
+        _patch_merge_primitives(monkeypatch)
+        memory_service, _, _ = self._scenario()
+
+        with pytest.raises(_mod.StoreMutationUnavailable):
+            await _mod.run(_run_args(apply=True), memory_service, limit=1000)
+
         memory_service.mem0._get_async_qdrant.assert_not_awaited()
 
     @pytest.mark.asyncio
