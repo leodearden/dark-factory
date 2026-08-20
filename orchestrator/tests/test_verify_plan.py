@@ -2619,23 +2619,37 @@ class TestEffectiveMergeModuleConfigs:
 
     # -- (f) VALUE-PRESERVATION vs the expression being replaced -------------
 
-    @pytest.mark.parametrize('registry_populated', [True, False], ids=['registry', 'empty'])
-    def test_full_breadth_matches_the_inline_expression_it_replaces(self, registry_populated):
-        """(f) Under breadth='full' the helper's result is byte-identical to the
-        inline expression at verify.py's two rebinding sites, evaluated here.
+    @pytest.mark.parametrize(
+        ('registry_populated', 'expected_prefixes'),
+        [(True, ['alpha', 'beta']), (False, ['alpha'])],
+        ids=['registry', 'empty'],
+    )
+    def test_full_breadth_matches_the_inline_expression_it_replaces(
+        self, registry_populated, expected_prefixes,
+    ):
+        """(f) Under breadth='full' the helper returns what the inline
+        expression at verify.py's two rebinding sites returned — the whole
+        registry when there is one, else the passed set.
 
-        Step-4 replaces those sites with a call to this helper; this test IS
+        Step-4 replaced those sites with a call to this helper; this test IS
         the "value-preserving by inspection" claim, made executable so a later
-        edit to either side cannot drift them apart unnoticed.
+        edit cannot quietly change what a merge covers.
+
+        The expected sets are WRITTEN OUT rather than re-derived by evaluating
+        ``list(config.module_configs_or_empty.values()) or passed`` here
+        (reviewer amendment): an oracle that re-runs the implementation cannot
+        fail when the implementation and the oracle are changed together, or
+        when both share a misreading of the registry accessor. Hard-coding
+        them is what makes this an independent check rather than a tautology.
         """
         mc_a, mc_b = self._mc('alpha'), self._mc('beta')
         registry = {'alpha': mc_a, 'beta': mc_b} if registry_populated else {}
         config = self._registry_config('full', registry)
         passed = [mc_a]
 
-        inline = list(config.module_configs_or_empty.values()) or passed
+        result = effective_merge_module_configs(config, passed)
 
-        assert effective_merge_module_configs(config, passed) == inline
+        assert [m.prefix for m in result] == expected_prefixes
 
     def test_delegates_the_breadth_predicate_rather_than_rereading_the_knob(
         self, monkeypatch,
