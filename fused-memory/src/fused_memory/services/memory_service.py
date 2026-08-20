@@ -1765,6 +1765,21 @@ def _candidate_pool(
     misattribution this PRD exists to prevent, and polluting the rate leaf iota
     samples with a finding that has no observable defect.
 
+    THE GUARD IS TESTED FIRST, AND THAT ORDER IS LOAD-BEARING — not stylistic.
+    Behind the intersection short-circuit the guard is UNREACHABLE for every
+    fact that cites the endpoint AND some declared referent, which is not an
+    exotic shape but the same legitimate ambient-task write one sentence longer:
+    "Task 2500 was completed as part of task 3668 by the merge worker" cites
+    {2500, 3668}, so ``cited & referents`` is ``{3668}`` — non-empty — and an
+    intersection-first order returns it, re-manufacturing the exact
+    ``resolvable=True``-onto-Task-3668 instruction the paragraph above exists to
+    prevent, on a fact that literally asserts the edge is about Task 2500. A
+    citation of the endpoint therefore suppresses the pool UNCONDITIONALLY:
+    corroboration is not merely a fallback the intersection can outrank, it is a
+    veto. Nothing this test shadows is lost on the pairing arm, which is only
+    reached when ``endpoint_referent not in cited`` — the guard can never fire
+    there, so mode (iii) still resolves through the intersection below.
+
     Corroborated findings are still RECORDED — they are just recorded with an
     empty pool, which becomes ``resolvable=False`` plus a reason at the caller.
     That is this pass's stated postcondition: recorded and left alone, never
@@ -1785,15 +1800,21 @@ def _candidate_pool(
             function remains "which referents is there evidence for", not "which
             targets survive".
     """
-    corroborated_citations = cited & referents
-    if corroborated_citations:
-        return corroborated_citations
     if endpoint in cited:
         # The fact names the node this edge end is already on. It is evidence
         # FOR the current attachment, never for repointing it elsewhere, so the
-        # declared-set fallback is suppressed rather than allowed to nominate a
-        # target the fact does not support.
+        # pool is suppressed rather than allowed to nominate a target the fact
+        # does not support.
+        #
+        # FIRST, ahead of the intersection: a fact citing BOTH the endpoint and
+        # a declared referent ("Task 2500 was completed as part of task 3668")
+        # has a non-empty intersection, so testing the intersection first would
+        # short-circuit past this guard entirely and return the ambient task as
+        # a repair target. See the docstring — this is a veto, not a fallback.
         return frozenset()
+    corroborated_citations = cited & referents
+    if corroborated_citations:
+        return corroborated_citations
     return referents
 
 

@@ -1069,18 +1069,45 @@ class TestCandidateTargetSelection:
             other_endpoint=None,
         ) == ()
 
-    def test_corroboration_only_suppresses_the_fallback_never_a_real_citation(self):
-        """The guard is scoped to the whole-set FALLBACK.
+    def test_corroboration_outranks_a_non_empty_intersection(self):
+        """The guard is a VETO, not a fallback the intersection can outrank.
 
-        Mode (iii) keeps working: a fact citing BOTH the endpoint and another
-        DECLARED referent still resolves through the intersection, because the
-        intersection is non-empty and is reached before the guard.
+        The same legitimate ambient-task write, one sentence longer: "Task 2500
+        was completed as part of task 3668 by the merge worker" cites BOTH the
+        endpoint and the declared referent, so `cited & referents` is non-empty.
+        Testing the intersection first would short-circuit past the guard and
+        hand back `Task 3668` — a repair instruction against a fact that
+        literally asserts the edge is about Task 2500.
+
+        This is the REACHABLE shape: the endpoint (2500) is undeclared, which is
+        precisely what makes the membership arm fire on it. An earlier version of
+        this test pinned endpoint 3074 as both DECLARED and CITED — a shape
+        `_verify_episode_referents` can never produce, since membership needs the
+        endpoint undeclared and pairing needs it uncited — and so pinned the
+        wrong behaviour on an input no arm can reach.
+        """
+        from fused_memory.services.memory_service import _candidate_targets
+
+        assert _candidate_targets(
+            referents=frozenset({Referent(number='3668')}),
+            cited=frozenset({Referent(number='2500'), Referent(number='3668')}),
+            endpoint=Referent(number='2500'),
+            other_endpoint=None,
+        ) == ()
+
+    def test_the_guard_cannot_fire_on_the_pairing_arm_so_mode_iii_still_resolves(self):
+        """Suppressing unconditionally costs mode (iii) nothing.
+
+        The pairing arm is only reached when `endpoint_referent not in cited`, so
+        no input that arm can produce ever satisfies the guard — the intersection
+        below still decides, and the fact's citation of `Task 3075` remains the
+        repair target.
         """
         from fused_memory.services.memory_service import _candidate_targets
 
         assert _candidate_targets(
             referents=frozenset({Referent(number='3074'), Referent(number='3075')}),
-            cited=frozenset({Referent(number='3074'), Referent(number='3075')}),
+            cited=frozenset({Referent(number='3075')}),
             endpoint=Referent(number='3074'),
             other_endpoint=None,
         ) == (Referent(number='3075'),)
@@ -1227,6 +1254,47 @@ class TestCorroboratedEndpointIsNeverRepointed:
         assert 'Task 2500' in finding.reason
         assert stats.unresolvable_findings == 1
         assert service._referent_finding_counts['unresolvable'] == 1
+        assert_never_repaired(service)
+
+    @pytest.mark.asyncio
+    async def test_it_holds_when_the_fact_also_names_the_ambient_task(self, service):
+        """The same write one sentence longer — the shape that slipped past the
+        guard while it sat behind the intersection short-circuit.
+
+        The fact cites BOTH `Task 2500` (the endpoint) and `Task 3668` (the
+        declared referent), so `cited & referents` is non-empty. An
+        intersection-first order returned `Task 3668` as a sole surviving
+        candidate and emitted `resolvable=True` with `new_endpoint_uuid='n-3668'`
+        — a destructive-edge-surgery instruction against a fact that literally
+        asserts the edge is about Task 2500. Driven end-to-end rather than
+        through `_candidate_targets` alone, because the defect was invisible to
+        the unit test that pinned an arm-unreachable input.
+        """
+        service.graphiti.get_nodes_by_exact_name = AsyncMock(
+            return_value=_rows('n-3668'),
+        )
+        result = _episode(
+            edges=[_edge('e1',
+                         fact=('Task 2500 was completed as part of task 3668 '
+                               'by the merge worker'),
+                         source='n-2500', target='n-worker')],
+            nodes=[MockNode(name='Task 2500', uuid='n-2500'),
+                   MockNode(name='merge worker', uuid='n-worker')],
+        )
+
+        stats = await service._verify_episode_referents(
+            result, group_id='dark_factory', referents=(Referent(number='3668'),),
+        )
+
+        assert len(stats.findings) == 1
+        finding = stats.findings[0]
+        assert finding.check == 'set-membership'
+        assert finding.endpoint_referent == Referent(number='2500')
+        assert finding.resolvable is False
+        assert finding.intended_referent is None
+        assert finding.new_endpoint_uuid is None
+        assert 'Task 2500' in finding.reason
+        assert 'cites' in finding.reason
         assert_never_repaired(service)
 
     @pytest.mark.asyncio
