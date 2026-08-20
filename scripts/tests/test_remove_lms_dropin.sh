@@ -18,7 +18,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SCRIPT="$REPO_ROOT/scripts/remove-lms-arm-worktree-dropin.sh"
 UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 
-TEMPLATE='lms-dropin-selftest@'
+TEMPLATE="${LMS_SELFTEST_TEMPLATE:-lms-dropin-selftest@}"
 UNIT="$UNIT_DIR/${TEMPLATE}.service"
 DROPIN_DIR="$UNIT_DIR/${TEMPLATE}.service.d"
 DROPIN="$DROPIN_DIR/10-worktree-3713.conf"
