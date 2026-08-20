@@ -1395,9 +1395,20 @@ async def test_b6_flake_filtered_by_confirmation_rerun(harness, git_ops, repo, t
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.timeout(300)  # task 3832 review: 4 _drive_reds calls (2+1+2+1 = 6 total
-# 30s-bounded _run_one_lane_pass calls -- 180s worst case) across both arms, plus
-# real-git overhead -- clear the 60s pyproject default with margin.
+@pytest.mark.timeout(360)  # task 4203: widened from 300 under the now-adopted
+# _required_timeout_secs model (see its docstring for the full derivation).
+# Bounded term (task 3832 review, still correct): 4 _drive_reds calls, n =
+# 2+1+2+1 = 6 _run_one_lane_pass calls at _LANE_PASS_BOUND_SECS = 180s.
+# Out-of-bound term (previously only gestured at as "real-git overhead", now
+# counted): _SPAWNS_PER_REPO_FIXTURE + 6 * _SPAWNS_PER_DRIVE_ADVANCE = 29
+# spawns x _MEASURED_SPAWN_LATENCY_SECS = 136.59s -- the most out-of-bound
+# real-git work of any test in either module, which is why this is the one
+# marker the model moves (b3/b5/ib2/ib4 all clear it unchanged). required =
+# 316.59s; 360 is the next multiple of the 60s pyproject grid at or above
+# that. Erring high is deliberate: the marker is a backstop that must never
+# fire before _run_lane's own 30s TimeoutError, since under
+# timeout_method="thread" with --max-worker-restart=0 pytest-timeout
+# os._exit()s the xdist worker instead of failing cleanly.
 @pytest.mark.asyncio
 async def test_b7_stall_promotes_to_blocker(harness, git_ops, repo, tmp_path):
     """B7 (PRD §8, C4) — a fix task that stalls promotes the L0 info signal
