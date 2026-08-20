@@ -3143,6 +3143,11 @@ class MemoryService:
                     getattr(edge, 'fact', '') or '', group_id=group_id,
                 ).refs
             )
+            # The referents this edge's fact names that the write also DECLARED
+            # itself to be about — i.e. the concrete alternatives this edge
+            # could actually belong on. Computed once per edge, beside `cited`,
+            # because both endpoints test against it.
+            cited_declared = cited & referent_set
             # BOTH ends are resolved before EITHER is checked: the candidate
             # rule needs the OTHER end's referent (a target equal to it would be
             # the self-loop `reassign_edge` refuses), which is only knowable once
@@ -3185,7 +3190,7 @@ class MemoryService:
                 # rate. "Both checks run" is a coverage claim, not a licence to
                 # emit two findings for one wrong endpoint.
                 #
-                # `if cited` on the pairing arm is LOAD-BEARING, not a
+                # `if cited_declared` on the pairing arm is LOAD-BEARING, not a
                 # micro-optimization: a fact citing no task number is
                 # UNINFORMATIVE about which node its edge belongs on, never
                 # contradictory (resolved decision 8; gamma's
@@ -3193,9 +3198,35 @@ class MemoryService:
                 # blind spot — bare digits, a reference by title, a hard-wrapped
                 # qualified ref — must never manufacture evidence for
                 # destructive edge surgery.
+                #
+                # The guard is the DECLARATION-CORROBORATED citation, not merely
+                # a non-empty one, because per-edge pairing is a discriminator
+                # AMONG DECLARED REFERENTS (resolved decision 7; the PRD's mode
+                # (iii) row repairs to `Task 3075`, itself declared) — not a
+                # general "does the fact mention some other number" test. Two
+                # consequences make that fail-closed. An endpoint reaching this
+                # arm is itself declared (membership passed), so it ALREADY
+                # satisfies the PRD's first postcondition; and a citation
+                # outside the declared set can never become a target anyway
+                # (`_candidate_pool`'s intersection rule forbids it). Firing
+                # there would emit a finding unactionable BY CONSTRUCTION —
+                # polluting the rate leaf iota samples and raising an operator
+                # WARNING for an endpoint with no observable defect. Same
+                # rationale as the empty-scan guard it subsumes (non-empty
+                # `cited_declared` implies non-empty `cited`), one step out.
+                #
+                # Because this arm is only reached when the endpoint's referent
+                # IS declared and is NOT cited, a non-empty `cited_declared`
+                # necessarily names a DIFFERENT declared referent — exactly the
+                # mode (iii) shape. It also means the pool on this arm is
+                # `cited & referents`, which never contains the endpoint, so
+                # `_candidate_targets`' endpoint subtraction is now unreachable
+                # from EITHER arm. It is retained deliberately as a structural
+                # invariant at the single site that decides targets, so a future
+                # third check cannot reintroduce a self-targeting repair.
                 if endpoint_referent not in referent_set:
                     check = 'set-membership'
-                elif cited and endpoint_referent not in cited:
+                elif cited_declared and endpoint_referent not in cited:
                     check = 'per-edge-pairing'
                 else:
                     continue
