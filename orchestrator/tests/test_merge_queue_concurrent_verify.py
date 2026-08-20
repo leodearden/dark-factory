@@ -366,6 +366,81 @@ def _worst_per_method_wait_budget(source: str) -> dict[str, float]:
     return budgets
 
 
+def _suppressed_result_wait_methods(source: str) -> dict[str, set[str]]:
+    """Statically scan *source* for the executable form of the `outcome is
+    None` anti-pattern `_await_outcome`'s docstring names above ("The shape
+    this replaces"): a `with contextlib.suppress(TimeoutError):` block
+    enclosing an `asyncio.wait_for(...)` call, which converts a genuine
+    pipeline hang or a missing cascade into a confusing `outcome is None`
+    assertion failure instead of failing loudly by label (task 4219).
+
+    For each top-level ``Test*`` class, reports every ``test_*`` method
+    whose body contains at least one such suppressed wait, as a
+    ``{class_name: {method_names}}`` mapping. ``suppress(Exception)`` (the
+    blessed best-effort teardown-join shape used for the worker-task join
+    in this module) and a ``suppress(TimeoutError)`` block enclosing no
+    ``asyncio.wait_for`` call are both deliberately NOT reported.
+
+    Must never raise: a crash here would fail the whole suite over an
+    unrelated edit to this file (mirrors `_worst_per_method_wait_budget`'s
+    contract above). Unparseable source returns {}.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return {}
+
+    def _is_timeout_error_arg(node: ast.expr) -> bool:
+        if isinstance(node, ast.Name) and node.id == 'TimeoutError':
+            return True
+        return (
+            isinstance(node, ast.Attribute)
+            and node.attr == 'TimeoutError'
+            and isinstance(node.value, ast.Name)
+            and node.value.id == 'asyncio'
+        )
+
+    def _is_suppress_timeout_error_call(node: ast.expr) -> bool:
+        if not isinstance(node, ast.Call):
+            return False
+        func = node.func
+        is_suppress = (isinstance(func, ast.Attribute) and func.attr == 'suppress') or (
+            isinstance(func, ast.Name) and func.id == 'suppress'
+        )
+        return is_suppress and any(_is_timeout_error_arg(arg) for arg in node.args)
+
+    def _is_asyncio_wait_for_call(node: ast.AST) -> bool:
+        return (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == 'wait_for'
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == 'asyncio'
+        )
+
+    result: dict[str, set[str]] = {}
+    for class_node in ast.iter_child_nodes(tree):
+        if not (isinstance(class_node, ast.ClassDef) and class_node.name.startswith('Test')):
+            continue
+        for method in class_node.body:
+            if not (
+                isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and method.name.startswith('test_')
+            ):
+                continue
+            for node in ast.walk(method):
+                if not isinstance(node, ast.With):
+                    continue
+                if not any(
+                    _is_suppress_timeout_error_call(item.context_expr) for item in node.items
+                ):
+                    continue
+                if any(_is_asyncio_wait_for_call(n) for n in ast.walk(node)):
+                    result.setdefault(class_node.name, set()).add(method.name)
+                    break
+    return result
+
+
 # task 3492: the pyproject-configured default per-test timeout ceiling that
 # every heavy-wait class in this module must clear. This is a hand-mirrored
 # copy of `[tool.pytest.ini_options].timeout` in orchestrator/pyproject.toml
