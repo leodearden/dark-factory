@@ -1568,3 +1568,243 @@ def test_every_enumeration_site_is_pinned() -> None:
         f"point-in-time G7 walks that must not be retro-edited — so a new PRD "
         f"transcribing slugs will never appear here."
     )
+
+
+# ---------------------------------------------------------------------------
+# invariant_alias_pairs / near_miss_alias_pairs — the near-miss ALIAS guard
+#
+# A slug is only a stable id if a citation naming it agrees with the number it
+# is filed under. Task 3803 measured the failure mode on live data: the phantom
+# `no-silent-fail-soft` was minted independently in dozens of comments, and the
+# numbered ones reached for INV-2 five times and INV-4 once because neither fit.
+# Promotion to INV-9 makes those citations correct in place — but only the ones
+# that carry the RIGHT number, and nothing was watching the number.
+#
+# THE GUARD IS A NEAR-MISS DETECTOR, NOT A VOCABULARY CHECK. This repo carries
+# module-local INV-n numbering schemes that have nothing to do with the design
+# invariants (task 2885's PRD-local `INV-3 dangling-successor-edge`,
+# test_lock_table.py's per-module park-stack `INV-1: strictly-higher-priority`).
+# A universal "every INV-n pairing must be canonical" check flags those, and a
+# guard that is wrong half the time gets silenced — the same failure mode this
+# module already warns about at `_ENUMERATION_THRESHOLD`.
+# ---------------------------------------------------------------------------
+
+# HAND-WRITTEN fixture data, not a snapshot of the live family. It mirrors the
+# live family's SHAPES (a four-segment slug, two slugs sharing no prefix, a slug
+# whose truncation is a plausible alias) because the confusability rule can only
+# be pinned against realistic tokens. It is deliberately non-contiguous — 1..5
+# then 9 — so no reader mistakes it for a copy that has to be kept in sync: the
+# live assertions derive their vocabulary from `canonical_family()`, and adding
+# or renaming an invariant must leave this fixture untouched.
+_ALIAS_FIXTURE_FAMILY = [
+    (1, "contracts-machine-checked"),
+    (2, "structured-facts-at-failure"),
+    (3, "corroborate-before-acting"),
+    (4, "storm-escape-required"),
+    (5, "no-lockstep-duplication"),
+    (9, "no-silent-fail-soft"),
+]
+
+_ALIAS_HAPPY = """\
+The escalation path refuses rather than returning None (INV-2 no-silent-fail-soft).
+Aggregate audibility is a separate question (INV-4 storm-escape-required).
+A second sentence cites the same pairing again (INV-2 no-silent-fail-soft).
+"""
+
+# reST double-backtick markup: how this repo's PYTHON docstrings cite a slug,
+# where its markdown uses single backticks. Modelled on the live shape at
+# dashboard/src/dashboard/data/escalations.py.
+_ALIAS_DOUBLE_BACKTICK = '''\
+    """Raise on a truncated scroll instead (INV-2, ``no-silent-fail-soft``).
+
+    A trailing line so the two-line window has a successor to join.
+    """
+'''
+
+# A pairing WRAPPED across a line break, with a `#: ` continuation marker.
+# Modelled on the live shape at fused-memory/scripts/census_memory_metadata.py.
+_ALIAS_WRAPPED = """\
+#: The caller cannot tell the shortfall apart from a clean census (INV-2
+#: no-silent-fail-soft).
+#: A trailing comment line.
+"""
+
+_ALIAS_SUCCESSOR_ONLY = """\
+A line carrying no citation at all.
+The whole pairing lives on this line (INV-4 storm-escape-required).
+A trailing line.
+"""
+
+_ALIAS_NONE = "Prose that cites no invariant by number anywhere in it.\n"
+
+
+def _pair(number: int, token: str, *, line: int = 1, backticks: int = 0, wrapped: bool = False):
+    """A hand-built alias record, for tests of the RULE rather than the extractor."""
+    return (line, number, token, backticks, wrapped)
+
+
+def test_invariant_alias_pairs_collects_every_pairing_in_document_order() -> None:
+    """Ordered, duplicates preserved, each tagged with the line it starts on.
+
+    Duplicates are kept for the same reason `slugs_in_span` keeps them: the
+    caller is a repair list, and collapsing two occurrences of one wrong pairing
+    into one would under-report the work.
+    """
+    assert invariant_alias_pairs(_ALIAS_HAPPY, source=_FIXTURE_SOURCE) == [
+        _pair(2, "no-silent-fail-soft", line=1),
+        _pair(4, "storm-escape-required", line=2),
+        _pair(2, "no-silent-fail-soft", line=3),
+    ]
+
+
+def test_invariant_alias_pairs_reads_rest_double_backticks() -> None:
+    """A ``double-backticked`` slug is the same citation as a bare one.
+
+    MEASURED on base eba215060c: a one-backtick extractor is BLIND to
+    dashboard/src/dashboard/data/escalations.py:255 — a genuine drift site — so
+    tolerating zero, one or two backticks is a correctness requirement, not a
+    nicety. The backtick COUNT is reported so the live assertion can prove the
+    scan still observes the reST shape rather than trusting the regex.
+    """
+    assert invariant_alias_pairs(_ALIAS_DOUBLE_BACKTICK, source=_FIXTURE_SOURCE) == [
+        _pair(2, "no-silent-fail-soft", line=1, backticks=2)
+    ]
+
+
+def test_invariant_alias_pairs_reads_a_pairing_wrapped_across_a_line_break() -> None:
+    """A pairing split by a line break is reported once, on the line it STARTS on.
+
+    MEASURED: 21 line-spanning pairings exist repo-wide, one of them genuine
+    drift (fused-memory/scripts/census_memory_metadata.py:163). A line-scoped
+    extractor silently misses it and reports a smaller, cleaner-looking result.
+    """
+    assert invariant_alias_pairs(_ALIAS_WRAPPED, source=_FIXTURE_SOURCE) == [
+        _pair(2, "no-silent-fail-soft", line=1, wrapped=True)
+    ]
+
+
+def test_invariant_alias_pairs_attributes_a_pairing_to_exactly_one_line() -> None:
+    """A pairing wholly inside the SUCCESSOR line belongs to that line, once.
+
+    The two-line window makes every pairing visible twice — once as its own
+    line's match and once as its predecessor's continuation. Discarding matches
+    that start past the first line is what keeps the repair list from doubling.
+    """
+    assert invariant_alias_pairs(_ALIAS_SUCCESSOR_ONLY, source=_FIXTURE_SOURCE) == [
+        _pair(4, "storm-escape-required", line=2)
+    ]
+
+
+def test_invariant_alias_pairs_fails_loudly_on_a_text_with_no_pairing() -> None:
+    """No pairing at all RAISES, naming *source*, per the extractor contract."""
+    with pytest.raises(AssertionError) as excinfo:
+        invariant_alias_pairs(_ALIAS_NONE, source=_FIXTURE_SOURCE)
+
+    assert _FIXTURE_SOURCE in str(excinfo.value)
+
+
+def test_near_miss_alias_pairs_flags_a_canonical_slug_under_the_wrong_number() -> None:
+    """The headline drift: the right slug, the wrong number.
+
+    Pinned in all three written forms — bare, reST double-backticked, and
+    wrapped across a line break — because each was a measured blind spot.
+    """
+    pairs = [
+        _pair(2, "no-silent-fail-soft"),
+        _pair(4, "no-silent-fail-soft", line=7),
+        _pair(2, "no-silent-fail-soft", line=9, backticks=2),
+        _pair(2, "no-silent-fail-soft", line=11, wrapped=True),
+    ]
+
+    assert near_miss_alias_pairs(pairs, _ALIAS_FIXTURE_FAMILY) == pairs
+
+
+def test_near_miss_alias_pairs_flags_a_truncation_under_the_wrong_number() -> None:
+    """`INV-2 no-silent-fail` is a truncation of INV-9's slug filed under INV-2.
+
+    Prefix-ness exculpates only under a token's OWN number (see the carve-out
+    test below); under a different one it is precisely the drift being hunted.
+    """
+    pairs = [_pair(2, "no-silent-fail")]
+
+    assert near_miss_alias_pairs(pairs, _ALIAS_FIXTURE_FAMILY) == pairs
+
+
+def test_near_miss_alias_pairs_flags_a_paraphrase_under_the_right_number() -> None:
+    """`INV-3 corroborate-before-destroy` shares two segments but DIVERGES.
+
+    A paraphrase, not shorthand: it is not a truncation of
+    `corroborate-before-acting`, it is a different third segment. The number is
+    right and the token still has to be repaired, which is why the rule looks at
+    the token even when the number checks out.
+    """
+    pairs = [_pair(3, "corroborate-before-destroy")]
+
+    assert near_miss_alias_pairs(pairs, _ALIAS_FIXTURE_FAMILY) == pairs
+
+
+def test_near_miss_alias_pairs_clears_a_proper_prefix_under_its_own_number() -> None:
+    """Shorthand and hyphen-wrapped line breaks under the RIGHT number are CLEAN.
+
+    THE CARVE-OUT IS LOAD-BEARING. Without it the live guard fires on twelve
+    correct citations against eight true hits (measured on base eba215060c) —
+    `INV-4 storm-escape` nine times, `INV-2 structured-facts` twice, and
+    `INV-1 contracts-machine` once where the full slug is hyphen-wrapped across
+    a comment line break. A guard wrong more often than right gets silenced.
+    """
+    pairs = [
+        _pair(4, "storm-escape"),
+        _pair(2, "structured-facts"),
+        _pair(1, "contracts-machine"),
+        _pair(1, "contracts-machine", line=5, wrapped=True),
+        _pair(4, "storm-escape-required", line=7),
+    ]
+
+    assert near_miss_alias_pairs(pairs, _ALIAS_FIXTURE_FAMILY) == []
+
+
+def test_near_miss_alias_pairs_clears_a_module_local_numbering_scheme() -> None:
+    """INV-n schemes that are not the design-invariant family are not drift.
+
+    These are the false positives a naive alias checker cannot survive — real
+    live citations of PRD-local and per-module invariant lists.
+    `instrument-before-acting` is the sharpest: it shares the WORD `before` AND
+    the number INV-3 with `corroborate-before-acting`, yet differs in segment
+    one, so a looser rule would flag three correct sites.
+    """
+    pairs = [
+        _pair(3, "instrument-before-acting"),
+        _pair(3, "dangling-successor-edge"),
+        _pair(1, "strictly-higher-priority"),
+        _pair(3, "dead-base"),
+        _pair(2, "contract-currency"),
+        _pair(5, "single-home"),
+        _pair(4, "loud-over-silent"),
+    ]
+
+    assert near_miss_alias_pairs(pairs, _ALIAS_FIXTURE_FAMILY) == []
+
+
+def test_near_miss_alias_pairs_is_asymmetric_in_the_number() -> None:
+    """The SAME token is clean under one number and drift under another.
+
+    Pinned explicitly so a future reader cannot collapse the rule back into a
+    number-blind vocabulary check: `storm-escape` is legitimate shorthand under
+    INV-4 and a near-miss under INV-2.
+    """
+    clean = _pair(4, "storm-escape")
+    drift = _pair(2, "storm-escape", line=3)
+
+    assert near_miss_alias_pairs([clean, drift], _ALIAS_FIXTURE_FAMILY) == [drift]
+
+
+def test_near_miss_alias_pairs_fails_loudly_on_an_empty_family() -> None:
+    """An empty family RAISES rather than clearing every pairing.
+
+    With no canonical slugs to be confusable with, nothing can ever be flagged
+    and the live assertion would report "no drift" while comparing nothing.
+    """
+    with pytest.raises(AssertionError) as excinfo:
+        near_miss_alias_pairs([_pair(2, "no-silent-fail-soft")], [])
+
+    assert "family" in str(excinfo.value).lower()
