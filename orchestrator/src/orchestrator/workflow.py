@@ -36,6 +36,7 @@ from shared.cli_invoke import (
     is_timed_out_with_progress,
     is_zero_output_timeout,
     read_transcript_records,
+    transcript_exists,
 )
 from shared.config_dir import TaskConfigDir
 from shared.cost_store import CostStore
@@ -12370,18 +12371,66 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             and self._pending_resume_role == role.name
         ):
             session_id_val = self._pending_resume_session_id
-            resume_session_id = session_id_val
-            # Adopted resume: bump the cumulative count off the recovered base,
-            # then reset it (consumed-on-first-use, mirroring the session-id/
-            # role resets below).
-            resume_count_to_write = self._pending_resume_count + 1
+            # RE-CORROBORATE against the config dir we are about to USE.
+            #
+            # The harness eligibility guard (_session_resume_eligible) checks a
+            # BOOT-TIME snapshot path — the config dir that existed when
+            # recovery ran.  self._config_dir is constructed fresh (see
+            # _setup_worktree) from whatever lane was acquired AFTERWARDS, and
+            # _recycle_config_dir can replace it again mid-workflow.  Under a
+            # pooled warm lane those two can name different directories, and
+            # self._config_dir is the one exported as CLAUDE_CONFIG_DIR
+            # (cli_invoke's _build_agent_env) — so it, not the snapshot, is what
+            # --resume will actually be resolved against.  Arming off the
+            # snapshot alone makes the CLI exit `No conversation found with
+            # session ID` before it ever contacts the API: a wasted dispatch
+            # that emits no runs.db event at all.
+            #
+            # config_dir is None -> arm as today.  Scoping copied verbatim from
+            # the precedent at cli_invoke.py's cap-hit resume guard (whose own
+            # comment says it mirrors this orchestrator guard): without a
+            # concrete directory there is no correct place to glob, so the veto
+            # is scoped to "we have a directory and the transcript is provably
+            # not in it".
+            corroborated = self._config_dir is None or transcript_exists(
+                self._config_dir.path, session_id_val,
+            )
+            # Consume the pending fields on EITHER branch (consumed-on-first-use,
+            # mirroring the session-id/role resets this block already did): a
+            # sid we just proved unreachable must not be re-attempted on every
+            # subsequent invocation of this role.
+            pending_count = self._pending_resume_count
             self._pending_resume_session_id = None
             self._pending_resume_role = None
             self._pending_resume_count = 0
-            logger.info(
-                'Task %s [%s]: resuming prior session %s via --resume',
-                self.task_id, role.name, session_id_val,
-            )
+            if corroborated:
+                resume_session_id = session_id_val
+                # Adopted resume: bump the cumulative count off the recovered
+                # base (it was reset above, consumed-on-first-use).
+                resume_count_to_write = pending_count + 1
+                logger.info(
+                    'Task %s [%s]: resuming prior session %s via --resume',
+                    self.task_id, role.name, session_id_val,
+                )
+            else:
+                vetoed_session_id = session_id_val
+                session_id_val = str(uuid.uuid4())
+                resume_count_to_write = 0
+                logger.warning(
+                    'Task %s [%s]: recovered session %s has no transcript under '
+                    '%s — dispatching FRESH as %s instead of arming a --resume '
+                    'the CLI would reject (context from the prior attempt is lost)',
+                    self.task_id, role.name, vetoed_session_id,
+                    self._config_dir.path if self._config_dir else None,
+                    session_id_val,
+                    extra={
+                        'event': 'session_resume_failed',
+                        'stage': 'pre_flight',
+                        'task_id': str(self.task_id),
+                        'session_id': vetoed_session_id,
+                        'role': role.name,
+                    },
+                )
         else:
             session_id_val = str(uuid.uuid4())
             resume_count_to_write = 0

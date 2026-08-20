@@ -644,7 +644,13 @@ async def test_b1_resumed_invocation_journals_prior_session(
     await harness._recover_crashed_tasks()
     recovered = harness._recovered_sessions[task_id]
 
-    cap = await _drive_resumed_invoke(tmp_path, recovered, IMPLEMENTER, caplog)
+    # seed_transcript makes this row's previously-IMPLICIT premise explicit
+    # (task 3578): the session id reaches invoke_with_cap_retry only once the
+    # arm site corroborates the transcript against the config dir it exports.
+    # The B1v rows below own the provably-absent case.
+    cap = await _drive_resumed_invoke(
+        tmp_path, recovered, IMPLEMENTER, caplog, seed_transcript=True,
+    )
 
     assert cap.kwargs['resume_session_id'] == session_id
     assert f'resuming prior session {session_id}' in caplog.text
@@ -1219,8 +1225,13 @@ async def test_b11_v1_sidecar_adopts_via_plan_and_rewrites_v2(
     assert 'schema_version' not in adopted_v1  # …nor a version discriminator
 
     # ── PRODUCER (α): resume the v1 dict → next write is v2, id preserved ──
+    # seed_transcript makes this row's previously-IMPLICIT premise explicit: it
+    # asserts the v1→v2 REWRITE, which presupposes a resume was armed, which
+    # (since task 3578) presupposes the transcript is corroborated in the config
+    # dir _invoke is about to export.  The B1v rows own the absent case.
     cap = await _drive_resumed_invoke(
         tmp_path, adopted_v1, IMPLEMENTER, caplog, task_id=task_id,
+        seed_transcript=True,
     )
     # Resumed against the PRIOR id (not a fresh uuid).
     assert cap.kwargs['resume_session_id'] == session_id
