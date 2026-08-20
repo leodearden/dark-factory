@@ -602,6 +602,127 @@ class TestPerEdgePairingCheck:
         assert stats.findings[0].check == 'set-membership'
         assert stats.pairing_findings == 0
 
+    @pytest.mark.asyncio
+    async def test_a_fact_citing_only_undeclared_tasks_fires_nothing(self, service):
+        """Pairing is a discriminator AMONG DECLARED REFERENTS.
+
+        Resolved decision 7 / mode (iii): the check exists to tell which of the
+        write's OWN referents an edge belongs on. Here the endpoint (Task 3074)
+        is itself declared, so it already satisfies the PRD's first
+        postcondition — "every task-parsing endpoint is either in `referents`,
+        or has been repointed to a node that is". And `Task 77` can never become
+        a target, because the intersection rule in `_candidate_pool` forbids one
+        from outside the declared set.
+
+        There is therefore nothing to point at and nothing to say. This is the
+        existing `if cited` guard's own rationale — UNINFORMATIVE, never
+        contradictory — one step further out.
+        """
+        result = _episode(
+            edges=[_edge('e1', fact='Task 77 supersedes this',
+                         source='n-3074', target='n-lane')],
+            nodes=[MockNode(name='Task 3074', uuid='n-3074'),
+                   MockNode(name='merge lane', uuid='n-lane')],
+        )
+
+        stats = await service._verify_episode_referents(
+            result, group_id='dark_factory', referents=(Referent(number='3074'),),
+        )
+
+        assert stats.findings == []
+        # CHECKED and found clean, not skipped — a check that did not run is not
+        # a check that passed.
+        assert stats.endpoints_checked == 1
+        assert_never_repaired(service)
+
+    @pytest.mark.asyncio
+    async def test_no_counter_moves_and_no_warning_is_emitted_for_that_shape(
+        self, service, caplog,
+    ):
+        """The half a candidate-selection fix alone does not address.
+
+        A finding unactionable BY CONSTRUCTION still inflates the
+        `per-edge-pairing` process counter leaf iota reads, and still raises an
+        operator WARNING, for an endpoint with no observable defect. A rate iota
+        samples must not be polluted by a shape nothing can act on.
+        """
+        before = service.referent_finding_counts()
+        result = _episode(
+            edges=[_edge('e1', fact='Task 77 supersedes this',
+                         source='n-3074', target='n-lane')],
+            nodes=[MockNode(name='Task 3074', uuid='n-3074'),
+                   MockNode(name='merge lane', uuid='n-lane')],
+        )
+
+        with caplog.at_level(logging.WARNING,
+                             logger='fused_memory.services.memory_service'):
+            await service._verify_episode_referents(
+                result, group_id='dark_factory',
+                referents=(Referent(number='3074'),),
+            )
+
+        assert service.referent_finding_counts() == before
+        assert not [r for r in caplog.records
+                    if 'Referent verification finding' in r.getMessage()]
+
+    @pytest.mark.asyncio
+    async def test_a_declared_citation_still_fires_even_when_the_fact_also_cites_undeclared_tasks(
+        self, service,
+    ):
+        """The guard must not OVER-suppress.
+
+        `cited & referents == {3075}` is non-empty, so the fact names a concrete
+        declared alternative this edge could belong on — mode (iii), pairing's
+        whole reason to exist. The regression guard proving the narrowing hits
+        the uninformative shape ONLY.
+        """
+        result = _episode(
+            edges=[_edge('e1', fact='Task 77 says Task 3075 blocks the merge lane',
+                         source='n-3074', target='n-lane')],
+            nodes=[MockNode(name='Task 3074', uuid='n-3074'),
+                   MockNode(name='merge lane', uuid='n-lane')],
+        )
+
+        stats = await service._verify_episode_referents(
+            result, group_id='dark_factory',
+            referents=(Referent(number='3074'), Referent(number='3075')),
+        )
+
+        assert len(stats.findings) == 1
+        finding = stats.findings[0]
+        assert finding.check == 'per-edge-pairing'
+        assert finding.resolvable is True
+        assert finding.intended_referent == Referent(number='3075')
+        # A target never comes from outside the declared set.
+        assert finding.intended_referent != Referent(number='77')
+
+    @pytest.mark.asyncio
+    async def test_the_undeclared_only_shape_is_still_caught_when_the_endpoint_is_undeclared_too(
+        self, service,
+    ):
+        """Precedence is unchanged: the guard constrains the PAIRING arm only.
+
+        The endpoint sits outside the declared set, so SET MEMBERSHIP — the
+        dominant live check — still fires on exactly the fact shape the guard
+        silences on the other arm.
+        """
+        result = _episode(
+            edges=[_edge('e1', fact='Task 77 supersedes this',
+                         source='n-99', target='n-lane')],
+            nodes=[MockNode(name='Task 99', uuid='n-99'),
+                   MockNode(name='merge lane', uuid='n-lane')],
+        )
+
+        stats = await service._verify_episode_referents(
+            result, group_id='dark_factory', referents=(Referent(number='10'),),
+        )
+
+        assert len(stats.findings) == 1
+        finding = stats.findings[0]
+        assert finding.check == 'set-membership'
+        assert finding.resolvable is True
+        assert finding.intended_referent == Referent(number='10')
+
 
 class TestFindingResolvability:
     """Recorded and left alone, never guessed at.
