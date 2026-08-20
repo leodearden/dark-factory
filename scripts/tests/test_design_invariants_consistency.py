@@ -648,6 +648,26 @@ def invariant_alias_pairs(text: str, *, source: str) -> list[AliasPair]:
     leading segments as the token, which the prefix carve-out in
     ``near_miss_alias_pairs`` then clears under its own number.
     """
+    pairs = _alias_pairs_in(text)
+    assert pairs, (
+        f"{source}: no `INV-<n> <kebab-token>` pairing found at all (task 3803). "
+        f"An empty parse would turn the alias drift check into an empty-vs-empty "
+        f"comparison that PASSES while examining nothing. Either the citation "
+        f"shape changed or the wrong text was read."
+    )
+    return pairs
+
+
+def _alias_pairs_in(text: str) -> list[AliasPair]:
+    """The matching half of ``invariant_alias_pairs``, without its loud contract.
+
+    Split out for the repo-wide scan, which reads ~1700 files of which most cite
+    no invariant by number at all — a per-file loud contract there would fail on
+    ordinary source. The scan carries the anti-vacuity burden instead, and does
+    it more strongly: it asserts the live result still contains a correct
+    pairing, a shorthand one, a double-backticked one and a wrapped one before
+    it trusts an empty drift list.
+    """
     lines = text.split("\n")
     pairs: list[AliasPair] = []
     for index, line in enumerate(lines):
@@ -666,13 +686,6 @@ def invariant_alias_pairs(text: str, *, source: str) -> list[AliasPair]:
                     wrapped=match.end() > len(line),
                 )
             )
-
-    assert pairs, (
-        f"{source}: no `INV-<n> <kebab-token>` pairing found at all (task 3803). "
-        f"An empty parse would turn the alias drift check into an empty-vs-empty "
-        f"comparison that PASSES while examining nothing. Either the citation "
-        f"shape changed or the wrong text was read."
-    )
     return pairs
 
 
@@ -2411,3 +2424,169 @@ def test_citation_scan_files_fails_loudly_on_an_empty_scan(tmp_path: Path) -> No
         _citation_scan_files(root=tmp_path)
 
     assert "no files" in str(excinfo.value).lower()
+
+
+# ---------------------------------------------------------------------------
+# LIVE: the two repo-wide drift assertions
+#
+# Everything above pins the RULES against hand-written fixtures. These two read
+# the repo and are the assertions that actually go red when a citation drifts.
+#
+# Both derive their vocabulary from `canonical_family()` — never a slug list
+# stored here, which would be one more lock-step copy of the family and stale on
+# the next invariant, exactly like the prose sites this module was written for.
+#
+# MEASURED ON BASE eba215060c, as a starting point rather than a pinned
+# constant: the scan reads 1737 files and finds 173 numbered pairings — 97 that
+# name their invariant's canonical slug exactly, 12 that use a legitimate
+# shorthand or line-wrapped prefix of it, 56 that belong to module-local INV-n
+# schemes and are confusable with nothing canonical, and 8 that contradict the
+# family. It finds 12 doc-anchored backticked citations, all canonical.
+# ---------------------------------------------------------------------------
+
+
+def _live_alias_pairs(files: list[Path]) -> list[tuple[str, AliasPair]]:
+    """Every numbered pairing in *files*, each tagged with its scan label."""
+    found: list[tuple[str, AliasPair]] = []
+    for path in files:
+        text = path.read_text(encoding="utf-8", errors="replace")
+        found.extend((_scan_label(path), pair) for pair in _alias_pairs_in(text))
+    return found
+
+
+def _live_citations(files: list[Path]) -> list[tuple[str, int, str]]:
+    """Every doc-anchored backticked slug citation in *files*, with its label."""
+    found: list[tuple[str, int, str]] = []
+    for path in files:
+        label = _scan_label(path)
+        text = path.read_text(encoding="utf-8", errors="replace")
+        found.extend(
+            (label, line, token)
+            for line, token in doc_anchored_slug_citations(text, source=label)
+        )
+    return found
+
+
+def _assert_scan_is_trustworthy(scanned: list[Path]) -> None:
+    """The scan reached the repo and stayed out of the point-in-time record trees.
+
+    Non-emptiness is already loud inside ``_citation_scan_files``; what this adds
+    is the other direction — a walk that stopped pruning would report drift in
+    ``plans/`` and ``docs/prds/``, whose G7 walk records transcribe the family AS
+    IT WAS and must never be retro-edited.
+    """
+    leaked = sorted(_scan_label(path) for path in scanned if _in_excluded_tree(path))
+    assert not leaked, (
+        f"the citation scan returned {len(leaked)} file(s) from the excluded "
+        f"record trees {sorted(_EXCLUDED_TREES)} (task 3803): {leaked[:5]}. Those "
+        f"trees hold point-in-time G7 walk records that must not be retro-edited, "
+        f"so pruning them is the policy, not an optimisation."
+    )
+
+
+def test_no_invariant_alias_contradicts_the_canonical_family() -> None:
+    """LIVE: no `INV-<n>` cites a token confusable with a DIFFERENT invariant.
+
+    The drift this catches is a slug filed under the wrong number — a citation
+    that looks canonical, satisfies any vocabulary check, and sends a reader to
+    the wrong invariant. `no-silent-fail-soft` accumulated six of them while it
+    had no number of its own.
+
+    FOUR ANTI-VACUITY OBSERVATIONS gate the verdict, because an empty drift list
+    is this guard's strongest possible claim and a narrowed regex produces the
+    same empty list. The scan must still observe (1) an exactly-correct pairing,
+    (2) a legitimate prefix shorthand — proof the carve-out did not swallow
+    everything — (3) a pairing written with reST double-backticks and (4) one
+    wrapped across a line break. The last two are not hypothetical shapes: each
+    hides one of the eight sites this task exists to repair, and a regression
+    narrowing the extractor back to single-backtick or single-line matching
+    would otherwise read GREEN while going blind to them.
+    """
+    family = canonical_family()
+    canonical = dict(family)
+    scanned = _citation_scan_files()
+    _assert_scan_is_trustworthy(scanned)
+
+    pairs = _live_alias_pairs(scanned)
+    exact = [p for _, p in pairs if p.token == canonical.get(p.number)]
+    shorthand = [
+        p
+        for _, p in pairs
+        if p.number in canonical and _is_proper_prefix(p.token, canonical[p.number])
+    ]
+    double_backticked = [p for _, p in pairs if p.backticks == 2]
+    line_wrapped = [p for _, p in pairs if p.wrapped]
+
+    assert exact and shorthand, (
+        f"the alias scan observed {len(exact)} exactly-correct and "
+        f"{len(shorthand)} shorthand pairing(s) across {len(scanned)} files (task "
+        f"3803). Both must be non-zero before an empty drift list means anything: "
+        f"zero correct pairings means the extractor stopped matching, and zero "
+        f"shorthand ones means the prefix carve-out is swallowing every pairing."
+    )
+    assert double_backticked and line_wrapped, (
+        f"the alias scan observed {len(double_backticked)} double-backticked and "
+        f"{len(line_wrapped)} line-wrapped pairing(s) (task 3803). Both shapes "
+        f"exist in abundance in this repo — reST markup in Python docstrings, and "
+        f"long citations wrapped across a comment line break — and each hides a "
+        f"real drift site, so zero of either means the extractor was narrowed and "
+        f"is now blind rather than clean."
+    )
+
+    drifted = [
+        (label, pair.line, pair.number, pair.token)
+        for label, pair in pairs
+        if near_miss_alias_pairs([pair], family)
+    ]
+    assert not drifted, (
+        f"{len(drifted)} invariant citation(s) name a token confusable with a "
+        f"DIFFERENT invariant than the number they are filed under (task 3803): "
+        f"{drifted}. Each entry is (file, line, number, token). Either the number "
+        f"is wrong (renumber the citation) or the token is a paraphrase of the "
+        f"canonical slug (respell it). The canonical family is "
+        f"{family} — parsed from {_repo_relative(NORMATIVE_DOC)}, which is the "
+        f"only place a slug is defined. Shorthand under the RIGHT number is "
+        f"deliberately not reported, so everything listed here is real drift."
+    )
+
+
+def test_every_doc_anchored_slug_citation_is_canonical() -> None:
+    """LIVE: no backticked slug is cited beside the doc without a heading behind it.
+
+    A PHANTOM slug is worse than a wrong one: it reads as canonical, resolves to
+    nothing, and cannot be found by any by-slug lookup, so it accumulates
+    citations indefinitely. `no-silent-fail-soft` did exactly that for months.
+
+    Gated on observing at least one CANONICAL citation, for the same reason as
+    the alias assertion above: with none, "no phantom citations" would be a
+    verdict about a scan that read nothing.
+    """
+    family = canonical_family()
+    slugs = set(canonical_slugs())
+    scanned = _citation_scan_files()
+    _assert_scan_is_trustworthy(scanned)
+
+    citations = _live_citations(scanned)
+    canonical_seen = [c for c in citations if c[2] in slugs]
+    assert canonical_seen, (
+        f"the citation scan examined {len(scanned)} files and found no CANONICAL "
+        f"backticked slug cited beside {_repo_relative(NORMATIVE_DOC)} at all "
+        f"(task 3803). This repo has many; zero means the anchor or the token "
+        f"shape stopped matching, so an empty phantom list below would be a "
+        f"verdict about nothing."
+    )
+
+    phantom = [
+        (label, line, token)
+        for label, line, token in citations
+        if noncanonical_citations([(line, token)], family)
+    ]
+    assert not phantom, (
+        f"{len(phantom)} backticked slug(s) are cited beside "
+        f"{_repo_relative(NORMATIVE_DOC)} with no `## INV-N `slug`` heading "
+        f"behind them (task 3803): {phantom}. Each entry is (file, line, token). "
+        f"Either the concept deserves an invariant of its own — add the heading, "
+        f"its gates.md trigger shape and its fixtures in the SAME commit — or the "
+        f"citation means an existing one and should name it. The canonical "
+        f"vocabulary is {sorted(slugs)}."
+    )
