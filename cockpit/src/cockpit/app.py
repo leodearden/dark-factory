@@ -538,9 +538,20 @@ class CockpitApp(App):
         None means "no live ask under this key" -- either nothing in the
         registries answers to it, or what does is no longer asking. A
         'session:<slug>' key is live only while that session is
-        AWAITING_INPUT; a 'decision:<id>' key only while that decision is
-        OPEN. Any other key shape is not live (fail-soft: an unrecognized
-        key expires its overlay rather than pinning it forever).
+        AWAITING_INPUT, and its identity is that ask's (question.text,
+        question.asked_at) -- ('', '') for an awaiting session with no
+        question stamped. A 'decision:<id>' key is live only while that
+        decision is OPEN. Any other key shape is not live (fail-soft: an
+        unrecognized key expires its overlay rather than pinning it
+        forever).
+
+        Keying the session case on the QUESTION rather than on bare status
+        is strictly stronger, and the difference is reachable:
+        orchestrator.session_hooks.run_notification writes
+        status=AWAITING_INPUT plus a fresh Question on every Notification
+        hook, with no required intervening Stop hook (-> IDLE). So
+        AWAITING_INPUT(Q1) -> AWAITING_INPUT(Q2) really happens, and a
+        status-only rule would still silently suppress Q2.
 
         The DECISION identity is (text, filed_at) and deliberately excludes
         manual_boost and state: _apply_boost's decision path calls
@@ -554,7 +565,10 @@ class CockpitApp(App):
             record = next((r for r in self._records if r.session_slug == ident), None)
             if record is None or record.status is not Status.AWAITING_INPUT:
                 return None
-            return ('awaiting',)
+            question = record.question
+            if question is None:
+                return ('', '')
+            return (question.text, question.asked_at)
         if kind == 'decision':
             decision = next((d for d in self._decisions if d.id == ident), None)
             if decision is None or decision.state is not DecisionState.OPEN:
