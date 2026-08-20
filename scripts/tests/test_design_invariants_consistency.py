@@ -465,8 +465,21 @@ def _scan_label(path: Path) -> str:
         return str(path)
 
 
-def _enumeration_scan_files() -> list[Path]:
-    """Every markdown file in the repo that the registry is responsible for.
+# This module's own path. The citation scan below excludes it: the fixtures in
+# this file embed deliberate decoy `INV-n <slug>` pairings and a phantom
+# citation, so a scan that read its own test data would go red on it forever.
+# The enumeration scan does NOT exclude it — that one is a threshold scan over
+# markdown, and this is a `.py` file it can never reach.
+_THIS_MODULE = Path(__file__).resolve()
+
+
+def _walk_repo_files(root: Path, suffixes: tuple[str, ...]) -> list[Path]:
+    """Every file under *root* ending in one of *suffixes*, excluded trees pruned.
+
+    ONE walker behind both scans. Two walks that had to agree on a prune policy
+    byte-for-byte would be the lock-step duplication INV-5 forbids — in the very
+    module that enforces that family — and the copy would drift the first time an
+    exclusion was added to one of them.
 
     Walks with ``os.walk`` and PRUNES excluded directories in place rather than
     globbing everything and filtering the result. The distinction is not cosmetic:
@@ -475,27 +488,60 @@ def _enumeration_scan_files() -> list[Path]:
     measured. Pruning keeps the same walk at well under a second there.
     """
     found: list[Path] = []
-    for dirpath, dirnames, filenames in os.walk(REPO_ROOT):
+    for dirpath, dirnames, filenames in os.walk(root):
         directory = Path(dirpath)
         dirnames[:] = sorted(
             name
             for name in dirnames
             if not name.startswith(".")
             and name not in _PRUNED_DIR_NAMES
-            and not _in_excluded_tree(directory / name)
+            and not _in_excluded_tree(directory / name, root)
         )
-        found.extend(directory / name for name in filenames if name.endswith(".md"))
+        found.extend(directory / name for name in filenames if name.endswith(suffixes))
     return sorted(found)
 
 
-def _in_excluded_tree(path: Path) -> bool:
-    """Is *path* inside one of the point-in-time record trees?
+def _enumeration_scan_files() -> list[Path]:
+    """Every markdown file in the repo that the registry is responsible for."""
+    return _walk_repo_files(REPO_ROOT, (".md",))
+
+
+def _citation_scan_files(root: Path = REPO_ROOT) -> list[Path]:
+    """Every ``.py`` and ``.md`` file the two drift assertions read, minus this one.
+
+    Loud on an empty result rather than returning ``[]``: "no drift found" and
+    "nothing was read" are indistinguishable downstream, and only one of them is
+    good news. *root* is a seam for this module's own fixture trees, which must
+    live outside the repo for exactly that reason.
+
+    ``.py`` and ``.md`` ONLY. Restricting the extension set is what keeps
+    ``shared/tests/fixtures/toolcall_markup_corpus.jsonl`` structurally out of
+    reach: it carries the phantom slug, but it is a CAPTURED replay corpus
+    regenerated only by ``shared/tests/toolcall_markup_corpus_extract.py``, so a
+    report against it would invite a hand-edit that corrupts the fixture.
+    """
+    found = [path for path in _walk_repo_files(root, (".py", ".md")) if path != _THIS_MODULE]
+    assert found, (
+        f"the citation scan found no files under {root} to check (task 3803) — "
+        f"an empty scan reports no drift, which is indistinguishable from a "
+        f"clean repo. Check the walk's prune list."
+    )
+    return found
+
+
+def _in_excluded_tree(path: Path, root: Path = REPO_ROOT) -> bool:
+    """Is *path* inside one of the point-in-time record trees under *root*?
 
     Compares whole path COMPONENTS, never a string prefix: ``plans-archive/x.md``
     is not inside ``plans/``, and a substring test would silently stop scanning a
     tree nobody meant to exclude.
+
+    *root* defaults to the repo but is taken from the caller so the policy
+    travels with the walk: the scans' own fixture trees are built under
+    ``tmp_path``, and an exclusion that only ever resolved against ``REPO_ROOT``
+    could not be exercised there — it would be asserted by reading the code.
     """
-    parts = path.relative_to(REPO_ROOT).parts
+    parts = path.relative_to(root).parts
     return any(parts[: len(tree)] == tree for tree in _EXCLUDED_TREE_PARTS)
 
 
@@ -2280,9 +2326,6 @@ def test_noncanonical_citations_fails_loudly_on_an_empty_family() -> None:
 # red on the guard's own test data — the identical hazard `_scan_label`'s
 # docstring documents for the `tmp_path` fixtures.
 # ---------------------------------------------------------------------------
-
-_THIS_MODULE = Path(__file__).resolve()
-
 
 def _write_scan_tree(root: Path, relative_paths: list[str]) -> None:
     """Create an empty file at each of *relative_paths* under *root*."""
