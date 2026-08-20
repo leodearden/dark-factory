@@ -402,7 +402,15 @@ class TestTmuxBackendReorder:
         source index was just vacated) and warns, then s:0->s:9002 (ok); the
         place phase lands s:9000->s:0 and s:9002->s:2, leaving index 1 empty.
         A duplicate is a benign caller-side collision, so the outcome must be
-        the compacted, gap-free 0..N-1 range with no warning at all.
+        the compacted, gap-free 0..N-1 range with no failed move at all.
+
+        The move-failure warning is asserted specifically, rather than "no
+        WARNING records at all": FakeTmuxWindowTable answers the focus-restore
+        display-message with an empty stdout, so it always draws a "could not
+        read active window" warning -- pre-existing noise inherent to the fake
+        (the duplicate-free test_reorder_succeeds_against_a_live_occupied_
+        destination_index above provokes the identical record), unrelated to
+        the defect under test.
         """
         from cockpit.backends.base import DisplayTarget
         from cockpit.backends.tmux import TmuxBackend
@@ -419,7 +427,12 @@ class TestTmuxBackendReorder:
             backend.reorder(targets)
 
         assert table.windows == {'s:0': 'wB', 's:1': 'wA'}
-        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+        move_failures = [
+            r.getMessage()
+            for r in caplog.records
+            if r.levelno >= logging.WARNING and 'move-window' in r.getMessage()
+        ]
+        assert move_failures == []
 
 
 class TestTmuxBackendSetUrgency:
