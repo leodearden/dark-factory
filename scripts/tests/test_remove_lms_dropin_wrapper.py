@@ -162,6 +162,63 @@ def _unique_template() -> str:
     return f"{_SELFTEST_PREFIX}{os.getpid()}-{uuid4().hex[:8]}@"
 
 
+# How long a selftest unit must go untouched before it counts as abandoned.
+# Comfortably longer than the ~2s a run takes and than the suite's own
+# --timeout=300, so a live sibling is never mistaken for residue.
+_STALE_AFTER_S = 3600.0
+
+
+def _prune_stale_selftest_units(
+    unit_dir: Path,
+    *,
+    now: float,
+    max_age_s: float = _STALE_AFTER_S,
+) -> None:
+    """Best-effort removal of abandoned lms-dropin-selftest-* residue.
+
+    The .sh cleans up after itself on every exit path via `trap cleanup EXIT`,
+    but a SIGKILL has no exit path.  With the old fixed template name that was
+    self-healing; with per-invocation unique names it is not, so this pays the
+    cost explicitly.
+
+    TWO SAFETY PROPERTIES, each with its own test above, because this deletes
+    files out of the operator's LIVE unit directory:
+
+    * Only ``_SELFTEST_PREFIX``-named units are ever considered -- the same
+      constant ``_unique_template()`` generates with, so a real ``lms-arm@``
+      or fleet unit is out of scope structurally, at any age.
+    * Anything NEWER than max_age_s is left alone.  Under 48-way concurrency a
+      fresh selftest unit is a running sibling's fixture, and deleting it
+      would destroy that run.
+
+    ``now`` and ``max_age_s`` are parameters rather than clock reads so the
+    tests can drive this deterministically without sleeping or patching time.
+    The whole body is best-effort: this is opportunistic hygiene called before
+    the real work, and it must never be the thing that turns a green suite red.
+    """
+    try:
+        if not unit_dir.is_dir():
+            return
+        for path in sorted(unit_dir.iterdir()):
+            if not path.name.startswith(_SELFTEST_PREFIX):
+                continue
+            if not path.name.endswith((".service", ".service.d")):
+                continue
+            try:
+                if now - path.stat().st_mtime <= max_age_s:
+                    continue
+                if path.is_dir():
+                    shutil.rmtree(path, ignore_errors=True)
+                else:
+                    path.unlink(missing_ok=True)
+            except OSError:
+                # One unreadable/undeletable entry must not abort the sweep of
+                # the rest -- residue accumulates, so partial progress matters.
+                continue
+    except OSError:
+        return
+
+
 # ---------------------------------------------------------------------------
 # step-1: the computed skip guard
 # ---------------------------------------------------------------------------
@@ -410,7 +467,7 @@ def test_prune_removes_stale_selftest_residue(tmp_path: Path) -> None:
         unit_dir, f"{_SELFTEST_PREFIX}999-deadbeef@", age_s=7200.0, now=now
     )
 
-    _prune_stale_selftest_units(unit_dir, now=now, max_age_s=3600.0)  # noqa: F821
+    _prune_stale_selftest_units(unit_dir, now=now, max_age_s=3600.0)
 
     assert not unit.exists(), f"stale {unit.name} should have been pruned"
     assert not dropin_dir.exists(), f"stale {dropin_dir.name}/ should have been pruned"
@@ -432,7 +489,7 @@ def test_prune_leaves_a_fresh_selftest_unit_alone(tmp_path: Path) -> None:
         unit_dir, f"{_SELFTEST_PREFIX}12345-cafebabe@", age_s=5.0, now=now
     )
 
-    _prune_stale_selftest_units(unit_dir, now=now, max_age_s=3600.0)  # noqa: F821
+    _prune_stale_selftest_units(unit_dir, now=now, max_age_s=3600.0)
 
     assert unit.exists(), "a FRESH selftest unit belongs to a concurrent run and must survive"
     assert dropin_dir.exists(), "a FRESH selftest drop-in dir must survive"
@@ -456,7 +513,7 @@ def test_prune_never_touches_a_non_selftest_unit(tmp_path: Path) -> None:
         _write_unit(unit_dir, "dark-factory-dashboard", age_s=86_400.0 * 90, now=now),
     ]
 
-    _prune_stale_selftest_units(unit_dir, now=now, max_age_s=3600.0)  # noqa: F821
+    _prune_stale_selftest_units(unit_dir, now=now, max_age_s=3600.0)
 
     for unit, dropin_dir in reals:
         assert unit.exists(), f"{unit.name} is a REAL unit and must never be pruned"
@@ -469,6 +526,6 @@ def test_prune_is_silent_when_the_unit_dir_does_not_exist(tmp_path: Path) -> Non
     The prune is opportunistic hygiene called before the real work; it must
     never be the thing that turns a green suite red.
     """
-    _prune_stale_selftest_units(  # noqa: F821
+    _prune_stale_selftest_units(
         tmp_path / "nope" / "systemd" / "user", now=1_000_000.0, max_age_s=3600.0
     )
