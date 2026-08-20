@@ -192,7 +192,11 @@ async def test_a_reaped_client_del_schedules_no_aclose_task():
 
     # ARM 1 — unclosed: __del__ resurrects the object as a pending aclose task.
     before = set(asyncio.all_tasks())
-    inner.__del__()
+    # `inner` is STATICALLY an httpx.AsyncClient, which declares no __del__ — the
+    # very asymmetry test_reap_leaves_a_bare_httpx_client_open asserts on. At RUNTIME
+    # it is openai's AsyncHttpxClientWrapper subclass, which does define one, and
+    # calling that finaliser explicitly is the whole point of this test.
+    inner.__del__()  # pyright: ignore[reportAttributeAccessIssue]
     resurrected = set(asyncio.all_tasks()) - before
     assert len(resurrected) == 1, (
         f'expected an UNCLOSED AsyncHttpxClientWrapper.__del__ to schedule '
@@ -220,7 +224,7 @@ async def test_a_reaped_client_del_schedules_no_aclose_task():
     assert inner.is_closed is True, 'reap must aclose() the leaked client'
 
     before = set(asyncio.all_tasks())
-    inner.__del__()
+    inner.__del__()  # pyright: ignore[reportAttributeAccessIssue]  # see ARM 1
     assert set(asyncio.all_tasks()) - before == set(), (
         'a CLOSED AsyncHttpxClientWrapper.__del__ must schedule no task — '
         'this is the short-circuit the whole fix rides on'
