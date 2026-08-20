@@ -522,6 +522,17 @@ OPERATIONAL_LLM_GATE_MARKER_KEY: str = 'x_operational_llm_gate'
 # grouping by prefix, to conflate two unrelated actors.  The `human_curator_`
 # prefix pairs the stamp unambiguously with its marker.
 
+# The escalation category filed when a curator gate resumes unadjudicated.
+#
+# DUPLICATED — not imported — in
+# `escalation.authority.L2_AUTO_CLOSE_DENY_CATEGORIES`, which must never
+# auto-close it (task 3181).  escalation is the lower fleet-wide package and
+# must not import orchestrator, so the two literals are pinned in lockstep by
+# the cross-layer TEST import in `escalation/tests/test_authority.py`, mirroring
+# the `_WATCHER_AUTO_IDENTITY` convention documented in authority.py's module
+# docstring.  If this string changes, update both sides together.
+CURATOR_ADJUDICATION_MISSING_CATEGORY: str = 'curator_adjudication_missing'
+
 # Rendered in place of the configured project_root when the runner's duck-typed
 # `scheduler` collaborator cannot supply a usable one.  A VISIBLE placeholder,
 # not an omission: it keeps the runbook's update_task call syntactically valid
@@ -1671,7 +1682,7 @@ class DeterministicRunner:
             task_id=task_id,
             agent_role=DETERMINISTIC_AGENT_ROLE,
             severity='critical',
-            category='curator_adjudication_missing',
+            category=CURATOR_ADJUDICATION_MISSING_CATEGORY,
             summary=summary[:200],
             detail=detail,
             level=2,
