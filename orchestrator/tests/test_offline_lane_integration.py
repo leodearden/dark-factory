@@ -1000,6 +1000,12 @@ def test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling(pytestconfi
     from test_offline_lane_infra_integration import (  # noqa: PLC0415
         _LANE_PASS_BOUND_SECS as _infra_lane_pass_bound_secs,
     )
+    from test_offline_lane_infra_integration import (  # noqa: PLC0415
+        _SPAWNS_PER_DRIVE_ADVANCE as _infra_spawns_per_drive_advance,
+    )
+    from test_offline_lane_infra_integration import (  # noqa: PLC0415
+        _SPAWNS_PER_REPO_FIXTURE as _infra_spawns_per_repo_fixture,
+    )
 
     assert _infra_lane_pass_bound_secs == _LANE_PASS_BOUND_SECS, (
         f"this module's _LANE_PASS_BOUND_SECS ({_LANE_PASS_BOUND_SECS}) has drifted "
@@ -1008,6 +1014,25 @@ def test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling(pytestconfi
         f'value in [{floor}, {_MARKERLESS_CEILING_FRACTION} * effective_timeout], so '
         f'only this explicit cross-module equality check catches the two silently '
         f'diverging within that shared range.'
+    )
+
+    # Task 4203 — the same anti-drift rationale applies verbatim to the two
+    # new _required_timeout_secs multiplicands: each module independently
+    # measures its own copy (test_out_of_bound_spawn_counts_are_measured_not_asserted),
+    # so only an explicit equality check catches the two silently diverging.
+    assert _infra_spawns_per_repo_fixture == _SPAWNS_PER_REPO_FIXTURE, (
+        f"this module's _SPAWNS_PER_REPO_FIXTURE ({_SPAWNS_PER_REPO_FIXTURE}) has "
+        f"drifted from test_offline_lane_infra_integration.py's copy "
+        f'({_infra_spawns_per_repo_fixture}) — both modules share byte-identical '
+        f'_setup_repo bodies and harness fixture stubs, so a real divergence here '
+        f"means one module's measurement (or fixture) has silently changed."
+    )
+    assert _infra_spawns_per_drive_advance == _SPAWNS_PER_DRIVE_ADVANCE, (
+        f"this module's _SPAWNS_PER_DRIVE_ADVANCE ({_SPAWNS_PER_DRIVE_ADVANCE}) has "
+        f"drifted from test_offline_lane_infra_integration.py's copy "
+        f'({_infra_spawns_per_drive_advance}) — both modules share byte-identical '
+        f'_drive_advance bodies and harness fixture stubs, so a real divergence here '
+        f"means one module's measurement (or fixture) has silently changed."
     )
 
     global_timeout = _effective_per_test_timeout(pytestconfig)

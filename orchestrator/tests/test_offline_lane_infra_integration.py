@@ -139,6 +139,56 @@ _MARKERLESS_CEILING_FRACTION = 0.6
 # full derivation.
 _SPAWNS_PER_LANE_PASS_WORST_CASE = 5
 
+# Task 4203 — this module's own copy of the sibling numeric module's
+# constant of the same name (see that module for the full rationale). The
+# multiplicand `_required_timeout_secs` below prices at
+# `_MEASURED_SPAWN_LATENCY_SECS` per spawn. MEASURED by
+# `test_out_of_bound_spawn_counts_are_measured_not_asserted`, not
+# hand-counted: the `repo` fixture's `_setup_repo` spawns `init`, `config`
+# x2, `add`, `commit`.
+_SPAWNS_PER_REPO_FIXTURE = 5
+
+# Task 4203 — the other multiplicand of `_required_timeout_secs`. MEASURED,
+# not hand-counted (see `test_out_of_bound_spawn_counts_are_measured_not_asserted`):
+# `_drive_advance` costs `get_main_sha` (1) plus `_advance_main`'s `add` /
+# `commit` / `rev-parse` (3) = 4. This is NOT the naive "5" a reading of
+# `_note_merge_all`'s production source would suggest (`harness.py:10377`
+# unconditionally calls `get_merge_diff_files`, a real `git diff` spawn in
+# production) — under THIS module's `harness` fixture (identical to the
+# sibling's), `h.git_ops.get_merge_diff_files` is replaced wholesale with an
+# `AsyncMock(return_value=([], None))`, so that leg never reaches a
+# subprocess at all here.
+_SPAWNS_PER_DRIVE_ADVANCE = 4
+
+
+def _required_timeout_secs(bounded_secs: float, out_of_bound_spawns: int) -> float:
+    """Task 4203 — this module's own copy of the sibling numeric module's
+    `_required_timeout_secs` of the same name: THE canonical sizing model
+    for `@pytest.mark.timeout` OVERRIDES on tests that compose past a
+    single `_run_lane` pass. Both
+    `test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling` and
+    `test_every_composing_caller_carries_a_timeout_override` call it rather
+    than re-deriving or re-stating it in prose. See the sibling module's
+    version of this function for the full derivation (why the additive
+    term exists, and why the marker-less population is deliberately NOT
+    gated by it) — not restated here, to avoid recreating the near-verbatim
+    docstring copies task 4030 removed.
+
+    THE MODEL: a composing test's effective per-test pytest-timeout must
+    cover its bounded-wait sum (*bounded_secs*) PLUS its counted
+    out-of-bound real-git subprocess spawns (*out_of_bound_spawns*), each
+    priced at the worst-case measured latency `_MEASURED_SPAWN_LATENCY_SECS`.
+    Every term is an already-measured, already-pinned quantity — task
+    3451's 4.71s, and this module's own `_SPAWNS_PER_REPO_FIXTURE` /
+    `_SPAWNS_PER_DRIVE_ADVANCE` counts — nothing guessed.
+
+    CONSUMERS: `test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling`
+    and `test_every_composing_caller_carries_a_timeout_override`, both in
+    this module.
+    """
+    return bounded_secs + out_of_bound_spawns * _MEASURED_SPAWN_LATENCY_SECS
+
+
 # Default git_overrides for _build_infra_worker — declared with an explicit
 # dict[str, Any] value type (rather than left as an inline dict literal,
 # which pyright would infer as the concrete dict[str, bool] and then reject
@@ -825,11 +875,15 @@ def test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling(pytestconfi
     False (the default; `timeout_func_only` is not set anywhere in this
     repo), so the 60s budget covers FIXTURE SETUP AND TEARDOWN, not just the
     call phase. Every test in both offline-lane modules transitively pulls
-    the `repo` fixture, whose `_setup_repo` costs 5 git spawns (`init`,
-    `config` x2, `add`, `commit`), and each `_drive_advance` costs 4 more
-    (`add`, `commit`, `rev-parse`, plus `_note_merge_all`'s `git diff`) — the
-    24s of headroom the 0.6 fraction leaves at a 60s timeout is what pays
-    for that out-of-bound work.
+    the `repo` fixture, whose `_setup_repo` costs `_SPAWNS_PER_REPO_FIXTURE`
+    git spawns (`init`, `config` x2, `add`, `commit`), and each
+    `_drive_advance` costs `_SPAWNS_PER_DRIVE_ADVANCE` more (`get_main_sha`,
+    `add`, `commit`, `rev-parse` — NOT `_note_merge_all`'s `git diff`, which
+    this module's `harness` fixture stubs to an `AsyncMock` and so never
+    reaches a subprocess; see `_SPAWNS_PER_DRIVE_ADVANCE`'s own comment and
+    `test_out_of_bound_spawn_counts_are_measured_not_asserted`) — the 24s of
+    headroom the 0.6 fraction leaves at a 60s timeout is what pays for that
+    out-of-bound work.
 
     When no timeout is in effect at all, this either fails loudly (this
     module's own `orchestrator/pyproject.toml` is the governing inifile —
