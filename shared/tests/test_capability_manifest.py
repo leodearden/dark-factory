@@ -293,6 +293,18 @@ class TestManifestTask:
         task = ManifestTask(label='α', capabilities=[])
         assert task.title is None
 
+    def test_note_accepted(self):
+        note = (
+            'SPLIT 2026-08-19. The original gamma row was one task across four '
+            'servers; this leaf carries fused-memory.'
+        )
+        task = ManifestTask(label='α', capabilities=[], note=note)
+        assert task.note == note
+
+    def test_note_omitted_defaults_none(self):
+        task = ManifestTask(label='α', capabilities=[])
+        assert task.note is None
+
     def test_task_id_non_int_string_rejected(self):
         with pytest.raises(ValidationError):
             ManifestTask(label='α', task_id='not-an-int', capabilities=[])  # type: ignore[arg-type]
@@ -409,6 +421,23 @@ tasks:
     capabilities: []
 """
 
+    #: A task block carrying task-level ``note:`` provenance — the shape the
+    #: real sidecars use, so this pins the YAML path and not just kwargs
+    #: construction.
+    _VALID_YAML_WITH_NOTE = """\
+prd: plans/example-prd.md
+schema_version: 1
+tasks:
+  - label: "γ1"
+    task_id: 1
+    title: "Example task"
+    note: "SPLIT 2026-08-19. The original γ row was one task across four servers; this leaf carries fused-memory."
+    capabilities:
+      - name: "cap-one"
+        binding: "capability→producer (wired)"
+        verdict: OPEN
+"""
+
     def test_parse_capability_manifest_from_dict(self):
         data = {
             'prd': 'plans/example-prd.md',
@@ -435,6 +464,17 @@ tasks:
         assert isinstance(cap.delivered_check, DeliveredCheck)
         assert cap.delivered_check.kind == 'grep'
         assert cap.delivered_check.pattern == 'foo'
+
+    def test_load_sidecar_with_task_level_note_round_trips(self, tmp_path):
+        sidecar = tmp_path / 'example-prd.capability-manifest.yaml'
+        sidecar.write_text(self._VALID_YAML_WITH_NOTE)
+        doc = load_capability_manifest(sidecar)
+        task = doc.tasks[0]
+        assert task.label == 'γ1'
+        assert task.note is not None
+        assert task.note.startswith('SPLIT 2026-08-19.')
+        assert 'this leaf carries fused-memory' in task.note
+        assert task.capabilities[0].verdict == 'OPEN'
 
     def test_load_capability_manifest_accepts_str_path(self, tmp_path):
         sidecar = tmp_path / 'example-prd.capability-manifest.yaml'
