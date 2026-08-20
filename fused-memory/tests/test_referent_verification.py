@@ -600,3 +600,222 @@ class TestPerEdgePairingCheck:
         assert len(stats.findings) == 1
         assert stats.findings[0].check == 'set-membership'
         assert stats.pairing_findings == 0
+
+
+class TestFindingResolvability:
+    """Recorded and left alone, never guessed at.
+
+    One test per row of the PRD's boundary-test sketch. A finding whose correct
+    target cannot be DETERMINED is still recorded — it is just recorded as
+    unrepairable, with the reason, rather than dropped or guessed at.
+    """
+
+    @pytest.mark.asyncio
+    async def test_mode_i_correct_node_absent_resolves_to_the_sole_referent(
+        self, service,
+    ):
+        result = _episode(
+            edges=[_edge('e1', fact='the deploy pipeline was retried',
+                         source='n-3129', target='n-x')],
+            nodes=[MockNode(name='Task 3129', uuid='n-3129'),
+                   MockNode(name='deploy pipeline', uuid='n-x')],
+        )
+
+        stats = await service._verify_episode_referents(
+            result, group_id='dark_factory', referents=(Referent(number='3127'),),
+        )
+
+        finding = stats.findings[0]
+        assert finding.resolvable is True
+        assert finding.intended_referent == Referent(number='3127')
+        assert finding.reason == ''
+
+    @pytest.mark.asyncio
+    async def test_mode_ii_llm_picked_the_sibling_resolves_to_the_cited_task(
+        self, service,
+    ):
+        result = _episode(
+            edges=[_edge('e1', fact='Task 1031 was verified',
+                         source='n-1030', target='n-x')],
+            nodes=[MockNode(name='Task 1030', uuid='n-1030'),
+                   MockNode(name='deploy pipeline', uuid='n-x')],
+        )
+
+        stats = await service._verify_episode_referents(
+            result, group_id='dark_factory', referents=(Referent(number='1031'),),
+        )
+
+        finding = stats.findings[0]
+        assert finding.resolvable is True
+        assert finding.intended_referent == Referent(number='1031')
+
+    @pytest.mark.asyncio
+    async def test_mode_iii_the_fact_cited_candidate_wins_over_the_whole_set(
+        self, service,
+    ):
+        """Without fact-scoping, two declared referents would look ambiguous and
+        a repair the fact UNAMBIGUOUSLY determines would be abandoned."""
+        result = _episode(
+            edges=[_edge('e1', fact='Task 3075 blocks the merge lane',
+                         source='n-3074', target='n-lane')],
+            nodes=[MockNode(name='Task 3074', uuid='n-3074'),
+                   MockNode(name='merge lane', uuid='n-lane')],
+        )
+
+        stats = await service._verify_episode_referents(
+            result, group_id='dark_factory',
+            referents=(Referent(number='3074'), Referent(number='3075')),
+        )
+
+        finding = stats.findings[0]
+        assert finding.check == 'per-edge-pairing'
+        assert finding.resolvable is True
+        assert finding.intended_referent == Referent(number='3075')
+
+    @pytest.mark.asyncio
+    async def test_a_unary_fact_leaves_the_other_end_recorded_but_unrepairable(
+        self, service,
+    ):
+        """The live Task 2519/2520 row, and the PRD's explicitly unrepairable
+        one. The only candidate IS the edge's other endpoint, and repointing
+        onto it would form the self-loop `reassign_edge` refuses — so there is
+        no correct target, and the finding is recorded rather than acted on."""
+        result = _episode(
+            edges=[_edge('e1', fact='Task 2519 was completed',
+                         source='n-2519', target='n-2520')],
+            nodes=[MockNode(name='Task 2519', uuid='n-2519'),
+                   MockNode(name='Task 2520', uuid='n-2520')],
+        )
+
+        stats = await service._verify_episode_referents(
+            result, group_id='dark_factory', referents=(Referent(number='2519'),),
+        )
+
+        assert len(stats.findings) == 1
+        finding = stats.findings[0]
+        assert finding.which_end == 'target'
+        assert finding.check == 'set-membership'
+        assert finding.resolvable is False
+        assert finding.intended_referent is None
+        assert finding.reason
+        assert 'Task 2519' in finding.reason
+        assert stats.unresolvable_findings == 1
+        assert_never_repaired(service)
+
+    @pytest.mark.asyncio
+    async def test_two_candidates_with_no_fact_evidence_are_never_guessed_between(
+        self, service,
+    ):
+        result = _episode(
+            edges=[_edge('e1', fact='the deploy pipeline was retried',
+                         source='n-99', target='n-x')],
+            nodes=[MockNode(name='Task 99', uuid='n-99'),
+                   MockNode(name='deploy pipeline', uuid='n-x')],
+        )
+
+        stats = await service._verify_episode_referents(
+            result, group_id='dark_factory',
+            referents=(Referent(number='10'), Referent(number='11')),
+        )
+
+        finding = stats.findings[0]
+        assert finding.resolvable is False
+        assert finding.intended_referent is None
+        assert 'Task 10' in finding.reason
+        assert 'Task 11' in finding.reason
+
+    @pytest.mark.asyncio
+    async def test_a_target_never_comes_from_outside_the_declared_referent_set(
+        self, service,
+    ):
+        """The candidate pool is fact-cited INTERSECT declared, never a union:
+        'Task 77' is cited by the LLM-restated fact but the write never declared
+        itself to be about it, so it must not become a repair target."""
+        result = _episode(
+            edges=[_edge('e1', fact='Task 77 supersedes this',
+                         source='n-99', target='n-x')],
+            nodes=[MockNode(name='Task 99', uuid='n-99'),
+                   MockNode(name='deploy pipeline', uuid='n-x')],
+        )
+
+        stats = await service._verify_episode_referents(
+            result, group_id='dark_factory', referents=(Referent(number='10'),),
+        )
+
+        finding = stats.findings[0]
+        assert finding.intended_referent != Referent(number='77')
+        # The intersection is empty, so the rule falls back to the declared set,
+        # whose sole member is the only thing a repair may ever point at.
+        assert finding.resolvable is True
+        assert finding.intended_referent == Referent(number='10')
+
+    @pytest.mark.asyncio
+    async def test_unresolvable_findings_counts_exactly_the_unrepairable_ones(
+        self, service,
+    ):
+        result = _episode(
+            edges=[_edge('e1', fact='Task 2519 was completed',
+                         source='n-2519', target='n-2520'),
+                   _edge('e2', fact='the deploy pipeline was retried',
+                         source='n-3129', target='n-x')],
+            nodes=[MockNode(name='Task 2519', uuid='n-2519'),
+                   MockNode(name='Task 2520', uuid='n-2520'),
+                   MockNode(name='Task 3129', uuid='n-3129'),
+                   MockNode(name='deploy pipeline', uuid='n-x')],
+        )
+
+        stats = await service._verify_episode_referents(
+            result, group_id='dark_factory', referents=(Referent(number='2519'),),
+        )
+
+        assert len(stats.findings) == 2
+        assert stats.unresolvable_findings == 1
+        assert sorted(f.resolvable for f in stats.findings) == [False, True]
+
+
+class TestCandidateTargetSelection:
+    """The pure rule, unit-tested away from the walk that drives it."""
+
+    def test_the_pool_is_the_fact_cited_intersection_when_it_is_non_empty(self):
+        from fused_memory.services.memory_service import _candidate_targets
+
+        assert _candidate_targets(
+            referents=frozenset({Referent(number='3074'), Referent(number='3075')}),
+            cited=frozenset({Referent(number='3075')}),
+            other_endpoint=None,
+        ) == (Referent(number='3075'),)
+
+    def test_it_falls_back_to_the_declared_set_when_the_intersection_is_empty(self):
+        from fused_memory.services.memory_service import _candidate_targets
+
+        assert _candidate_targets(
+            referents=frozenset({Referent(number='10')}),
+            cited=frozenset({Referent(number='77')}),
+            other_endpoint=None,
+        ) == (Referent(number='10'),)
+
+    def test_the_other_endpoint_is_subtracted_so_no_repair_forms_a_self_loop(self):
+        from fused_memory.services.memory_service import _candidate_targets
+
+        assert _candidate_targets(
+            referents=frozenset({Referent(number='2519')}),
+            cited=frozenset({Referent(number='2519')}),
+            other_endpoint=Referent(number='2519'),
+        ) == ()
+
+    def test_the_order_is_deterministic_and_not_frozenset_iteration_order(self):
+        """A finding must be stable across runs and diffable in eta's audit;
+        frozenset iteration order is not stable across processes."""
+        from fused_memory.services.memory_service import _candidate_targets
+
+        refs = frozenset({
+            Referent(number='11'), Referent(number='10'),
+            Referent(number='2', project_id='reify'),
+        })
+        first = _candidate_targets(referents=refs, cited=frozenset(),
+                                   other_endpoint=None)
+
+        assert first == tuple(sorted(first, key=lambda r: (r.kind, r.project_id,
+                                                           r.number)))
+        assert _candidate_targets(referents=refs, cited=frozenset(),
+                                  other_endpoint=None) == first
