@@ -44,7 +44,12 @@ from shared.prompt_artifact import PromptArtifactStore, default_artifacts_root
 from shared.task_claimant import compose_claimant_run_id
 from shared.task_metadata import RetryLedger, RoutingDecisionMirror, RoutingState
 from shared.task_statuses import TaskStatus
-from shared.transcript_archive import archive_before_delete, archive_task_transcripts
+from shared.transcript_archive import (
+    archive_before_delete,
+    archive_task_transcripts,
+    resolve_archive_root,
+    restore_archived_transcript,
+)
 
 from orchestrator import chronic_flake
 from orchestrator.agents.invoke import AgentResult, invoke_agent
@@ -12371,6 +12376,84 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             and self._pending_resume_role == role.name
         ):
             session_id_val = self._pending_resume_session_id
+            # REHYDRATE FIRST, then corroborate — the order is load-bearing, so
+            # the check below sees the restored state rather than vetoing a
+            # session we could have saved.
+            #
+            # Under a pooled warm lane the config dir we are about to export has
+            # NEVER seen this session's JSONL: the dir that held it was destroyed
+            # at lane teardown. The durable archive under project_root outlives
+            # that teardown, so restoring from it is what makes the resume real
+            # instead of a silent fresh start.
+            #
+            # The transcript_exists precondition is an optimisation, not a
+            # correctness guard — restore_archived_transcript has its own
+            # no-clobber check keyed on the same locator — but it keeps the
+            # common already-live path from paying for an archive glob.
+            #
+            # Gated on session_resume.restore_from_archive (the NARROW kill
+            # switch: eligibility, corroboration and every session_resume_*
+            # event carry on without it) and deliberately NOT on
+            # transcript_archive.enabled, reusing Harness._archive_available's
+            # recorded argument: with archival off there is nothing on disk to
+            # find, and gating on the flag would add a second source of truth
+            # that can disagree with the filesystem.
+            if (
+                self.config.session_resume.restore_from_archive
+                and self._config_dir is not None
+                and not transcript_exists(self._config_dir.path, session_id_val)
+            ):
+                try:
+                    # The single-home composition helper, NOT an open-coded
+                    # `project_root / root` — that spelling already drifted
+                    # across five sites once (INV-5).
+                    #
+                    # Guarded because resolve_archive_root is deliberately NOT
+                    # total: under a config regression either operand can be a
+                    # type Path.__truediv__ refuses (a None project_root, a
+                    # non-PathLike root from malformed YAML) and it raises
+                    # TypeError — here, on the production dispatch path. Same
+                    # guard and same reasoning Harness._archive_available records
+                    # for the identical composition: unguarded, a mere config
+                    # regression would escalate into a dispatch fault.
+                    archive_root = resolve_archive_root(
+                        self.config.project_root,
+                        self.config.transcript_archive.root,
+                    )
+                    restored = restore_archived_transcript(
+                        archive_root, str(self.task_id), session_id_val,
+                        self._config_dir.path,
+                    )
+                except Exception as exc:
+                    # Fall through to the corroboration, which will veto and
+                    # dispatch fresh — a broken restore costs context, never a
+                    # dispatch.
+                    logger.warning(
+                        'Task %s [%s]: failed to compose the transcript archive '
+                        'root while rehydrating session %s — proceeding without '
+                        'a restore: %s',
+                        self.task_id, role.name, session_id_val, exc,
+                        extra={
+                            'event': 'session_resume_restore_fault',
+                            'task_id': str(self.task_id),
+                            'session_id': session_id_val,
+                            'role': role.name,
+                        },
+                    )
+                else:
+                    if restored is not None:
+                        logger.info(
+                            'Task %s [%s]: rehydrated session %s from the '
+                            'durable archive %s -> %s',
+                            self.task_id, role.name, session_id_val,
+                            archive_root, restored,
+                            extra={
+                                'event': 'session_resume_restored',
+                                'task_id': str(self.task_id),
+                                'session_id': session_id_val,
+                                'role': role.name,
+                            },
+                        )
             # RE-CORROBORATE against the config dir we are about to USE.
             #
             # The harness eligibility guard (_session_resume_eligible) checks a
