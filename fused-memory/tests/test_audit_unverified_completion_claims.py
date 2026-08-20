@@ -1272,6 +1272,56 @@ class TestDerivedEdgeLookupKeying:
         assert report['summary']['by_graph'] == {'reify': 1}
         assert report['summary']['by_project'] == {'dark_factory': 1}
 
+    async def test_every_swept_graph_is_asked_not_only_the_home_pair(
+        self, capsys
+    ) -> None:
+        """Edges are keyed on the EPISODE, not on any one graph.
+
+        The measured pattern behind this rule: an episode's derived edges live
+        in the graph its ingest ran against, which need not be the graph the
+        node landed in NOR the graph its group_id names (episode
+        a887c958-0018-4715-8817-cf048c187e8d: node in reify only, all 8 edges
+        in dark_factory only). Asking only the read-from graph and the group_id
+        graph therefore leaves a whole population — 12 of the 15 committed
+        findings read from reify whose group_id names an UNSWEPT graph — with
+        an empty harm-artefact column that was never actually measured.
+
+        Here the group_id (``know_live``) is not swept, so under the old rule
+        the target set collapsed to ``reify`` alone and dark_factory could
+        never enter it. Every swept graph must be asked.
+        """
+        episode = 'ep-third-graph'
+        reify_reader = _FakeReader(
+            [
+                _record(
+                    uuid=episode,
+                    text=ESC_3085_1_INSTANCE_1,
+                    project_id='know_live',  # NOT among --project
+                    graph_name='reify',
+                )
+            ],
+            edges={},  # reify answers, holding nothing for it
+        )
+        dark_reader = _FakeReader([], edges={episode: ('edge-in-dark-factory',)})
+        readers = {'reify': reify_reader, 'dark_factory': dark_reader}
+
+        code = await _run(
+            _args(project=['reify', 'dark_factory']),
+            reader_factory=lambda project: readers[project],
+            probes=_probes(task_status='in-progress'),
+        )
+        report = json.loads(capsys.readouterr().out)
+        assert code == 0
+        # The read-from graph is still asked...
+        assert reify_reader.edge_lookups == [episode]
+        # ...and so is a graph that is NEITHER the read-from graph NOR the
+        # group_id graph. This is the whole point of the rule.
+        assert dark_reader.edge_lookups == [episode]
+        finding = report['findings'][0]
+        assert finding['derived_edge_uuids'] == ['edge-in-dark-factory']
+        assert finding['edges_enumerated_in'] == ['reify', 'dark_factory']
+        assert finding['cross_graph'] is True
+
     async def test_group_id_graph_not_swept_is_enumerated_where_it_can_be(
         self, capsys
     ) -> None:
