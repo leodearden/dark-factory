@@ -188,17 +188,29 @@ class ManifestCapability(BaseModel):
       homed in THIS leaf as its own work product. It does not block
       queueing, and it must never be read as a green G3 binding.
 
-    ``OPEN`` exists because two rows in the corpus could not be recorded
-    honestly in a binary vocabulary — see
-    ``plans/toolcall-markup-containment-prd.capability-manifest.yaml``:
-    gamma2's ``d1-ruling-recorded-against-3692s-read-time-path`` is a
-    ruling the leaf must MAKE, and gamma3's
-    ``fused-memory-boundary-adapted`` is a row whose original PASS was
-    measured false. Recording either as PASS would restore that known
-    false green; recording either as FAIL would falsely assert the leaf is
-    blocked while its owning task is in-progress. Widening the vocabulary
-    is not a licence to author ``OPEN`` in place of doing the substrate
-    work: it records that the decision belongs to the leaf, nothing more.
+    ``OPEN`` exists because two recurring row SHAPES cannot be recorded
+    honestly in a binary vocabulary:
+
+    - a binding the leaf must MAKE — the capability is a ruling, or a
+      choice between substrates, so there is no measurement to record
+      until the leaf does the work that decides it;
+    - a row whose earlier ``PASS`` was later measured FALSE — recording it
+      as ``PASS`` again would reinstate a known false green.
+
+    Neither shape is a ``FAIL``: the capability is not measured absent, and
+    the owning leaf is deliberately queued, so recording it as FAIL would
+    assert a blocked-until-resolved state that is contradicted by the leaf
+    being in flight. Widening the vocabulary is not a licence to author
+    ``OPEN`` in place of doing the substrate work: it records that the
+    decision belongs to the leaf, nothing more.
+
+    Provenance for the third value: ``plans/capability-delivered-checks-prd.md``
+    §Contract (the canonical field reference) and task 4471's decision
+    record. Live corpus rows are deliberately NOT cited here by name — an
+    ``OPEN`` row exists precisely because its owning task is in flight, so
+    it flips to ``PASS`` when that task lands, and any row named in this
+    docstring would rot into a stale citation of a corpus that no longer
+    contains it.
     """
 
     model_config = ConfigDict(extra='forbid')
@@ -221,9 +233,14 @@ class ManifestTask(BaseModel):
     because ``manifest_stamping``'s write-back is
     ``yaml.safe_dump(raw, sort_keys=False, allow_unicode=True)``
     (``fused-memory/src/fused_memory/server/manifest_stamping.py``, step 4),
-    which discards every comment in the sidecar on the next stamp; a
-    declared field round-trips unchanged, because that step writes back the
-    raw decoded dict rather than a ``model_dump()``.
+    which discards every comment in the sidecar on the next stamp. A
+    declared field survives that rewrite; a comment does not. Surviving is
+    a property of the field being DECLARED, not of step 4 happening to dump
+    the raw decoded dict — it would hold equally under a ``model_dump()``.
+    That survival is asserted end-to-end on the stamping side, not here:
+    see ticket ``tkt_0RSNVJT1ZNWKS5Y7BM5F7A2QAD`` (follow-up from task
+    4471) for the ``test_manifest_stamping`` fixture that stamps a sidecar
+    carrying this field and re-reads it.
     """
 
     model_config = ConfigDict(extra='forbid')
