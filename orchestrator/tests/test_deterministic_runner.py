@@ -6,6 +6,7 @@ Step-7: RED — idempotent resume + quiescence (I2/B3/B4/B11)
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import functools
 import os
@@ -1153,6 +1154,25 @@ def _curator_gate_task(
     return task
 
 
+def _parse_update_task_snippet(detail: str) -> dict:
+    """Extract the runbook's ``update_task(`` line and return its keyword map.
+
+    Shared by the remediation-snippet tests below so the two cannot drift.
+    Parses the line as a Python expression, because the whole point of the
+    snippet is that an operator can PASTE it: it must be a syntactically valid,
+    fully-keyworded call, never a bare positional token.  If a later edit wraps
+    the snippet across physical output lines this raises ``SyntaxError`` — the
+    correct loud signal, not a flake.
+    """
+    line = next(ln for ln in detail.splitlines() if 'update_task(' in ln).strip()
+    call = ast.parse(line, mode='eval').body
+    assert isinstance(call, ast.Call) and call.func.id == 'update_task'
+    assert call.args == [], (
+        f'update_task snippet must pass everything by keyword, got positional: {call.args!r}'
+    )
+    return {k.arg: k.value for k in call.keywords}
+
+
 @pytest.mark.asyncio
 class TestHumanCuratorGateAdjudicationGuard:
     """DeterministicRunner — a curator gate needs CONTENT proof, not just a closed record.
@@ -1228,6 +1248,57 @@ class TestHumanCuratorGateAdjudicationGuard:
         assert 'human_curator_adjudicated_at' in pending[0].detail
 
         scheduler.set_task_status.assert_any_await('3181', 'blocked')
+
+    async def test_curator_remediation_snippet_is_a_runnable_update_task_call(
+        self, tmp_path: Path,
+    ):
+        """The (a) remediation must be PASTEABLE, not merely suggestive.
+
+        The real MCP signature is ``update_task(id: str, project_root: str, ...)``
+        (fused-memory/src/fused_memory/server/tools.py) — BOTH are required and
+        neither has a default.  An operator clearing a safety escalation must
+        not be handed a call that errors on arity/type at exactly the moment
+        they are trying to do the right thing.
+
+        ``project_root`` is set DELIBERATELY DIFFERENT from the process cwd:
+        every fleet orchestrator unit pins
+        ``WorkingDirectory=/home/leo/src/dark-factory`` (so ``uv run --project
+        orchestrator`` resolves the only pyproject that defines it) while
+        selecting its real target project purely via ``--config``.  So an
+        ``os.getcwd()``-derived snippet would silently aim most operators at
+        the WRONG project — worse than the missing argument it replaces,
+        because it fails misleadingly instead of loudly.  This test fails
+        against exactly that mistake.
+        """
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _curator_gate_task(
+            task_id='3181',
+            gate_escalated_at='2026-07-30T16:30:28.993178+00:00',
+        )
+        queue = EscalationQueue(tmp_path)
+        _seed_resolved_gate(queue, '3181')  # the exact esc-3181-1 shape
+
+        scheduler = _mock_scheduler(task)
+        scheduler.config.project_root = '/home/leo/src/reify'
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+
+        assert await runner.run(_make_assignment(task)) == WorkflowOutcome.BLOCKED
+
+        pending = queue.get_by_task(
+            '3181', status='pending', agent_role='orchestrator-deterministic',
+        )
+        assert len(pending) == 1
+        assert pending[0].category == 'curator_adjudication_missing'
+
+        kw = _parse_update_task_snippet(pending[0].detail)
+        assert set(kw) == {'id', 'project_root', 'metadata', 'metadata_mode'}
+        # A QUOTED str, not a bare int-like token — `id` is typed `str`.
+        assert ast.literal_eval(kw['id']) == '3181'
+        assert ast.literal_eval(kw['project_root']) == '/home/leo/src/reify'
+        assert ast.literal_eval(kw['metadata_mode']) == 'merge'
+        assert list(ast.literal_eval(kw['metadata'])) == ['human_curator_adjudicated_at']
 
     async def test_curator_gate_with_zero_records_still_refiles_milestone_gate(
         self, tmp_path: Path,
