@@ -26,6 +26,9 @@ import pytest
 # no __init__.py while ``tests/reconciliation/`` does, so pytest puts
 # ``tests/`` on sys.path for modules in both directories and this package
 # import resolves identically from either.
+from fused_memory.reconciliation.stale_status_snapshot_edge_sweep import (
+    _enumeration_is_prepositional_complement,
+)
 from reconciliation.plural_enum_shapes import (
     ADVERBIAL_PREAMBLE_SHAPES,
     GUARD_REJECTED_SUPPRESSION_SHAPES,
@@ -73,6 +76,7 @@ scan_corpus = _mod.scan_corpus
 triage_rejection = _mod.triage_rejection
 simulate_candidate = _mod.simulate_candidate
 extract_plural_ids = _mod.extract_plural_ids
+_CANDIDATE_GUARDS = _mod._CANDIDATE_GUARDS
 
 
 # The SAME lists the sweep suite parametrizes its guard tests off — imported,
@@ -227,33 +231,77 @@ def test_triage_rejection_labels_prepositional_complement(fact):
     assert triage_rejection(fact, match_start) == 'prepositional_complement'
 
 
-def test_the_two_shapes_the_candidate_verdicts_turn_on_are_present():
-    """The two named shapes below decide both candidate verdicts.
+def test_the_shared_corpora_and_the_two_deciding_shapes_are_present():
+    """Everything the candidate verdicts below silently depend on.
 
-    Not a size floor on the corpus — that was a meta-test guarding the old
-    marker-introspection mechanism, and the mechanism is gone: the shapes are
-    now an ordinary import, so an empty or missing corpus is an ImportError or
-    an obviously-failing assertion rather than a silent vacuous pass.
+    Not a size floor — the old size floors were a meta-test guarding the
+    marker-introspection mechanism, and that mechanism is gone. But an
+    earlier docstring here over-claimed what replacing it bought: that a
+    missing corpus would be 'an ImportError or an obviously-failing
+    assertion rather than a silent vacuous pass'. The ImportError half
+    holds; the EMPTY half does not. An emptied list makes
+    ``@pytest.mark.parametrize`` report a skip and makes a bare ``for``
+    loop pass green, so emptying any of the four upstream lists would
+    quietly stop several tests here from testing anything. Hence the
+    explicit non-empty pins: they are the cheapest thing that turns that
+    silent vacuity into a failure, in ONE place covering all four lists.
 
-    What still needs pinning is narrower and behavioural. Candidate (a) is
-    rejected specifically because it cannot recover _DATE_STAMP_PREAMBLE, and
-    candidate (b) specifically because it re-opens _INTRA_CLAUSE_COMMA. Both
-    verdicts are stated as set differences against the shared corpus, so if
-    either shape were dropped upstream those assertions would still pass while
-    silently no longer testing the thing they are named for.
+    The two named shapes are the narrower, behavioural half. Candidate (a)
+    is rejected specifically because it cannot recover
+    _DATE_STAMP_PREAMBLE, and candidate (b) specifically because it
+    re-opens _INTRA_CLAUSE_COMMA. Both verdicts are stated as set
+    differences against the shared corpus, so if either shape were dropped
+    upstream those assertions would keep passing while silently no longer
+    testing the thing they are named for.
     """
+    assert _PRECISION_SHAPES
+    assert _SUPPRESSION_SHAPES
+    assert _POSITIVE_SHAPES
+    assert _PREAMBLE_SHAPES
+
     assert _DATE_STAMP_PREAMBLE in _PREAMBLE_SHAPES
     assert _INTRA_CLAUSE_COMMA in _PRECISION_SHAPES
 
 
-def test_shipped_guard_baseline_over_selects_nothing():
-    """The baseline that makes the candidate deltas meaningful.
+def test_the_shipped_baseline_is_a_precondition_not_a_measurement():
+    """What actually makes the candidate deltas meaningful — falsifiably.
 
-    Simulating the shipped guard against itself must be a no-op. If this
-    ever reports a difference, the simulator disagrees with the shipped
-    extraction path and every candidate number below is measuring the
-    simulator's bug rather than the candidate.
+    An earlier spelling of this test asserted only that simulating the
+    shipped guard against itself is a no-op, with a docstring claiming that
+    a difference would prove 'the simulator disagrees with the shipped
+    extraction path'. It could not: ``simulate_candidate`` reaches its
+    ``guard(prefix)`` check only after ``_enumeration_is_prepositional_
+    complement(prefix)`` returned True on the SAME prefix, and for
+    ``'shipped'`` those two calls are the same function object, so the
+    no-op holds for any input and any behaviour of the guard. Verified by
+    execution: substituting a maximally broken all-reject guard left the
+    result byte-identical. A test that cannot fail underwrites nothing —
+    the same silent-vacuity class that produced two blocking findings on
+    this task.
+
+    The three assertions below are ordered precondition-first, and the two
+    that can fail come first:
+
+    1. IDENTITY (falsifiable, and spans the module boundary): the
+       simulator's 'shipped' guard is the PRODUCTION guard object, not a
+       copy that has drifted. Re-spelling the guard inside the probe is the
+       exact failure the script's import block exists to prevent, and it
+       would fail here rather than surface as a quietly wrong number.
+    2. CORPUS (falsifiable): every shape the candidates are scored against
+       really is one the shipped guard rejects. This is what makes
+       ``recovered``/``over_selected`` interpretable at all — a shape the
+       shipped guard already selects can never appear in either list, so a
+       corpus that silently drifted into selected shapes would report a
+       reassuring pair of zeroes.
+    3. The no-op baseline itself, stated as what it is: a CONSEQUENCE of
+       (1) and (2), not an independent measurement.
     """
+    assert _CANDIDATE_GUARDS['shipped'] is _enumeration_is_prepositional_complement
+
+    assert _ALL_GUARDED_SHAPES, 'the guarded corpus emptied upstream'
+    for fact in _ALL_GUARDED_SHAPES:
+        assert extract_plural_ids(fact) == set(), fact
+
     result = simulate_candidate('shipped', _ALL_GUARDED_SHAPES)
 
     assert result.over_selected == []
@@ -304,7 +352,12 @@ def test_subject_position_positives_extract_unchanged_under_both_candidates(
     id the shipped guard already yields. Asserting the exact expected id
     sets (not merely 'unchanged') means a candidate that yields a
     DIFFERENT id set for the same fact is caught too.
+
+    The guard on the loop is load-bearing: this body's only assertion is
+    INSIDE the loop, so an emptied _POSITIVE_SHAPES upstream would leave
+    this test green while checking nothing at all.
     """
+    assert _POSITIVE_SHAPES, 'the subject-position corpus emptied upstream'
     for fact, expected in _POSITIVE_SHAPES:
         assert extract_plural_ids(fact, candidate=candidate) == expected, fact
 
