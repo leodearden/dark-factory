@@ -1080,6 +1080,64 @@ class TestDroppedOverlayExpiresWithTheAsk:
             assert queue.get_row('session:drop-1')
             assert queue.row_count == 2
 
+    @pytest.mark.timeout(10)
+    async def test_dropped_session_key_expires_on_a_new_question_without_a_status_change(
+        self, tmp_path
+    ):
+        """A bare status rule is NOT enough: the drop must also expire when
+        the same session posts a brand-new question WITHOUT ever leaving
+        AWAITING_INPUT.
+
+        Reachability (the finding that motivates keying on ask identity
+        rather than status): orchestrator.session_hooks.run_notification
+        writes status=AWAITING_INPUT PLUS a fresh Question on every
+        Notification hook, and does not require an intervening Stop hook
+        (-> IDLE). So AWAITING_INPUT(Q1) -> AWAITING_INPUT(Q2) is a real
+        transition an operator can hit, and a status-only expiry rule would
+        still silently suppress Q2 -- the exact failure class this whole
+        prune exists to kill.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+
+        display = sr.Display(kind='wm', wm_title='renew title')
+        first_ask = _make_record(
+            session_slug='renew-1',
+            status=sr.Status.AWAITING_INPUT,
+            display=display,
+            question=sr.Question(text='First ask?', asked_at='2026-07-07T00:00:00+00:00'),
+        )
+        sr.write_record(first_ask, root=tmp_path)
+
+        backend = FakeBackend()
+        app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            queue = app.query_one(DecisionQueue)
+            assert queue.row_count == 1
+
+            await pilot.press('x')
+            await pilot.pause()
+            assert queue.row_count == 0
+
+            # A second Notification hook: STILL awaiting input (no Stop hook
+            # in between), but asking something completely different.
+            second_ask = _make_record(
+                session_slug='renew-1',
+                status=sr.Status.AWAITING_INPUT,
+                display=display,
+                question=sr.Question(
+                    text='Totally different ask?', asked_at='2026-07-08T00:00:00+00:00'
+                ),
+            )
+            sr.write_record(second_ask, root=tmp_path)
+            app.refresh_registry()
+            await pilot.pause()
+
+            assert 'session:renew-1' not in app._dropped
+            assert queue.row_count == 1
+
 
 class TestCopyAction:
     @pytest.mark.timeout(10)
