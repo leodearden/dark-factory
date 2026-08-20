@@ -25,6 +25,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from uuid import uuid4
@@ -636,3 +637,59 @@ def test_concurrent_selftests_do_not_collide() -> None:
     finally:
         for template in templates:
             _remove_template_residue(template)
+
+
+# ---------------------------------------------------------------------------
+# step-9: the primary anti-rot gate
+# ---------------------------------------------------------------------------
+
+def test_shell_selftest_is_executable() -> None:
+    """Expected GREEN on arrival -- a regression pin.
+
+    The .sh is mode 100755 today and this module drives it through `bash` for
+    portability, so the bit is not strictly load-bearing HERE -- but the .sh
+    documents itself as directly runnable by an operator
+    ("Usage: scripts/tests/test_remove_lms_dropin.sh"), and a lost +x silently
+    breaks that contract.  Mirrors
+    test_reclaim_orphaned_worktrees_wrapper.py::test_wrapper_is_executable.
+    """
+    assert SELFTEST_SH.is_file(), f"{SELFTEST_SH} is missing"
+    assert os.access(SELFTEST_SH, os.X_OK), (
+        f"Expected {SELFTEST_SH} to be executable (os.X_OK); it is not. "
+        f"Run: chmod +x {SELFTEST_SH}"
+    )
+
+
+@pytest.mark.skipif(_SKIP_REASON is not None, reason=str(_SKIP_REASON))
+def test_shell_selftest_passes() -> None:
+    """THE assertion this task exists to create.  Expected GREEN on arrival.
+
+    There is no RED to manufacture here and the absence of one is the point:
+    scripts/tests/test_remove_lms_dropin.sh was already correct -- 12/12
+    checks, ~2s -- and the defect was that NOTHING RAN IT.  It was the only
+    .sh among 61 pytest modules in scripts/tests/, and pytest collects only
+    `test_*.py`, so the file sat in the tree checked by nobody.  The fix is
+    therefore the EXISTENCE of a collected caller, and this is it.  Same shape
+    as tests/scripts/test_know_live_installed_unit_parity.py's
+    "Expected GREEN on arrival -- a regression pin".
+
+    What it protects: scripts/remove-lms-arm-worktree-dropin.sh runs
+    UNSANDBOXED and UNATTENDED as a deterministic `before_done` deploy action.
+    Its own TEST SEAMS comment says such a script "must not have its happy
+    path first execute in production" -- a guarantee that, until this module,
+    was delivered by an operator remembering to run a file rather than by
+    anything mechanical.  From here the verify gate delivers it.
+
+    Safety of running for real in the DEFAULT suite: the .sh only ever
+    `daemon-reload`s -- it never starts, stops, enables or restarts any unit
+    -- and it operates solely on a uniquely-named throwaway template sharing
+    no name with any real unit.  Cost is ~2s against a suite measured at
+    293-931s.
+    """
+    _prune_stale_selftest_units(_unit_dir(), now=time.time())
+
+    template = _unique_template()
+    try:
+        _assert_selftest_passed(_run_selftest(template), template)
+    finally:
+        _remove_template_residue(template)
