@@ -641,6 +641,24 @@ zero_progress_requeue:
   threshold: 5
   min_span_seconds: 900.0
 
+# Structured recovery-decision emission (task 3535, PRD
+# plans/task-escalation-state-graph-prd.md D5).  Every veto/LEAVE site in the
+# recovery machinery emits a recovery_vetoed / recovery_left event naming WHAT
+# held a stranded task, and a blocking L1 is filed against a streak sentinel
+# after `veto_streak_threshold` IDENTICAL consecutive vetoes spanning at least
+# `veto_streak_min_span_secs`.  Changes no recovery disposition — see
+# orchestrator/src/orchestrator/recovery_emission.py (module docstring) for the
+# canonical WHY, the signature-transition emission cadence, and the derivation
+# of the 1500.0s span default.  Shipped ENABLED: without it a strand held by an
+# open escalation leaves no machine-readable trace of what held it.
+recovery_emission:
+  enabled: true
+  veto_streak_threshold: 3
+  veto_streak_min_span_secs: 1500.0
+  # The narrower kill switch: the only part of the mechanism that WRITES to the
+  # escalation queue.  Turn this off to keep the telemetry and silence the L1.
+  streak_escalation_enabled: true
+
 # Autonomous dry-run unblock hook
 unblock_auto:
   enabled: true

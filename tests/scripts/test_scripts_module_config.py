@@ -131,8 +131,12 @@ _VACUOUS_PASS = (
 
 # The two extraPaths entries the declared type gate depends on, and the flat
 # modules that stop resolving without them. Measured, not assumed: at the
-# commit before task 3456 added these entries, `npx pyright scripts/` reported
-# exactly 9 reportMissingImports naming these five modules.
+# commit before task 3456 added these entries, the then-declared
+# `npx pyright scripts/` reported exactly 9 reportMissingImports naming these
+# five modules. That npx spelling is kept because it names the command that was
+# ACTUALLY RUN for this measurement; task 4358 later switched the declaration to
+# `uv run --project shared pyright scripts/`, which resolves the same root
+# [tool.pyright] table, so the measurement carries over unchanged.
 _REQUIRED_EXTRA_PATHS = ('scripts', 'scripts/legibility')
 _UNRESOLVED_WITHOUT = ('census', 'codebook', 'coder', 'digest', 'inventory')
 
@@ -155,8 +159,9 @@ def _load_root_pyright_config() -> dict[str, Any]:
 # the command line changing at all: `exclude` drops the files from analysis
 # entirely, `ignore` keeps analysing them but suppresses every diagnostic they
 # produce. Either one naming scripts/ un-gates it while the declared
-# `npx pyright scripts/` stays byte-identical and still exits 0 — the same
-# reports-green failure mode as a None command, reached a different way.
+# `uv run --project shared pyright scripts/` stays byte-identical and still
+# exits 0 — the same reports-green failure mode as a None command, reached a
+# different way.
 _CARVE_OUT_KEYS = ('exclude', 'ignore')
 
 
@@ -342,6 +347,31 @@ _PYTEST = 'pytest'
 #                 while checking almost nothing. Both spellings are listed
 #                 because neither is a prefix of the other, and neither is a
 #                 prefix of pyright's `--python*` flags (those begin `--p`).
+#
+# `-p`/`--project` MUST STAY IN THIS SET, and the reason is worth stating
+# because task 4358 hit the collision that makes deleting it tempting. `uv run
+# --project <member> pyright <dir>` — the invocation shape every module config
+# in this repo now uses — contains the SAME CHARACTERS as pyright's own
+# config-redirect flag, naming a completely different thing: uv's selects the
+# ENVIRONMENT the checker binary is resolved from and narrows NOTHING, while
+# pyright's selects a CONFIG FILE that can relax typeCheckingMode wholesale.
+#
+# The two are told apart by POSITION, not by dropping the flag from this table:
+# uv's flags precede the checker anchor, pyright's follow it. That is why
+# `_narrowing_flag_args` scans `_post_anchor_tokens` rather than the whole
+# segment. Dropping `--project` here would silence the same false positive and
+# simultaneously un-guard the sharpest carve-out vector this file documents —
+# see test_narrowing_flag_detection_is_scoped_to_the_checkers_own_arguments,
+# whose assertion (b) exists specifically to fail on that shortcut.
+#
+# The property is not new: `_targets` has always sliced after the anchor, and
+# the `_PYTEST` comment above already records it ("the anchor placement is what
+# excludes the pre-anchor positional `shared` of `uv run --project shared
+# pytest ...`"). `_narrowing_flag_args` was simply the one helper it had never
+# been applied to — latent because ruff's three exclude spellings below happen
+# not to collide with any `uv run` flag, so the already-uv-fronted
+# lint_command never tripped it, and the type_check_command was `npx`-fronted
+# until 4358.
 _NARROWING_FLAGS = {
     _RUFF: ('--exclude', '--extend-exclude', '--force-exclude'),
     _PYRIGHT: ('--skip', '-p', '--project'),
@@ -370,6 +400,60 @@ def _segment(cmd: str, keyword: str) -> str:
     return matching[0]
 
 
+def _anchor_split(cmd: str, keyword: str) -> tuple[list[str], list[str]]:
+    """*keyword*'s segment of *cmd*, split at the checker anchor into (pre, post).
+
+    The ANCHOR is the last whitespace-separated token of *keyword* (see the
+    ``_RUFF``/``_PYRIGHT`` comment above) and belongs to neither half. Sole
+    implementation of the anchor location and the anchor-presence assertion, so
+    every caller that cares about position shares one notion of where the
+    wrapper stops and the checker starts.
+    """
+    anchor = keyword.split()[-1]
+    tokens = shlex.split(_segment(cmd, keyword))
+    assert anchor in tokens, (
+        f'no `{anchor}` token in the `{keyword}` segment of {cmd!r}, so the '
+        "checker's own arguments cannot be located"
+    )
+    at = tokens.index(anchor)
+    return tokens[:at], tokens[at + 1:]
+
+
+def _pre_anchor_tokens(cmd: str, keyword: str) -> list[str]:
+    """The WRAPPER's tokens in *cmd* — everything before the checker anchor.
+
+    The mirror of ``_post_anchor_tokens``, for the assertions that are about
+    how the checker is RESOLVED rather than what it checks: in
+    ``uv run --project shared pyright scripts/`` these four tokens are uv's, and
+    they decide which member environment supplies the ``pyright`` binary.
+
+    Shares ``_anchor_split`` with its mirror deliberately. A hand-rolled
+    ``tokens.index(_PYRIGHT)`` at the call site is a third copy of the same
+    logic — the drift this file already paid for once (task 4358:
+    ``_narrowing_flag_args`` had missed the slice ``_targets`` always had) — and
+    it raises a bare ``ValueError`` instead of the diagnostic above when the
+    anchor is absent.
+    """
+    return _anchor_split(cmd, keyword)[0]
+
+
+def _post_anchor_tokens(cmd: str, keyword: str) -> list[str]:
+    """*keyword*'s OWN arguments in *cmd* — the tokens after the checker anchor.
+
+    Everything before the anchor belongs to the WRAPPER, not the checker: in
+    ``uv run --project shared pyright scripts/`` the pre-anchor tokens are uv's,
+    and reading them as the checker's is a category error.
+
+    Both callers need exactly this slice, for the same reason from opposite
+    directions — ``_targets`` must not count uv's positional ``shared`` as a
+    checked path, and ``_narrowing_flag_args`` must not count uv's
+    ``--project`` as pyright's config redirect. Sharing one implementation is
+    what keeps the two from drifting apart again (task 4358: ``_targets`` had
+    the slice from the start, ``_narrowing_flag_args`` never got it).
+    """
+    return _anchor_split(cmd, keyword)[1]
+
+
 def _targets(cmd: str, keyword: str) -> list[str]:
     """The positional path arguments *keyword*'s segment of *cmd* checks.
 
@@ -380,23 +464,53 @@ def _targets(cmd: str, keyword: str) -> list[str]:
     LIST MEMBERSHIP (exact-element, so ``'tests/scripts/'`` does not match) is
     what makes those assertions real.
     """
-    anchor = keyword.split()[-1]
-    tokens = shlex.split(_segment(cmd, keyword))
-    assert anchor in tokens, (
-        f'no `{anchor}` token in the `{keyword}` segment of {cmd!r}, so the '
-        'positional targets cannot be located'
-    )
-    tail = tokens[tokens.index(anchor) + 1:]
-    return [t for t in tail if not t.startswith('-')]
+    return [t for t in _post_anchor_tokens(cmd, keyword) if not t.startswith('-')]
 
 
 def _narrowing_flag_args(cmd: str, keyword: str) -> list[str]:
     """Any flag in *keyword*'s segment that carves files back out of the target.
 
     Both spellings are caught: ``--exclude foo`` and ``--exclude=foo``.
+
+    Scoped to the checker's OWN arguments via ``_post_anchor_tokens``, not the
+    whole segment: uv's pre-anchor ``--project <member>`` names an ENVIRONMENT,
+    while pyright's post-anchor ``--project <file>`` names a CONFIG FILE, and
+    only position distinguishes them. See the ``_NARROWING_FLAGS`` comment for
+    why the flag stays in the table rather than being deleted to dodge that
+    collision, and
+    ``test_narrowing_flag_detection_is_scoped_to_the_checkers_own_arguments``
+    for the four cases that pin it.
     """
     prefixes = _NARROWING_FLAGS[keyword]
-    return [t for t in shlex.split(_segment(cmd, keyword)) if t.startswith(prefixes)]
+    return [t for t in _post_anchor_tokens(cmd, keyword) if t.startswith(prefixes)]
+
+
+def _uv_project_member(cmd: str, keyword: str) -> str | None:
+    """The member named by uv's PRE-anchor ``--project`` in *keyword*'s segment.
+
+    Both spellings, matching ``_narrowing_flag_args``' documented both-spellings
+    behaviour: ``--project shared`` and ``--project=shared`` are the same uv
+    invocation, and a reader that recognises only one of them rejects a correct
+    command with a message claiming it selects no environment at all.
+
+    ``None`` means NO USABLE PRE-ANCHOR SELECTOR, which covers three cases the
+    caller reports identically because uv fails them identically:
+
+      * no ``--project`` before the anchor at all;
+      * a POST-anchor ``--project``, which is pyright's CONFIG-FILE redirect and
+        a different flag entirely (see ``_NARROWING_FLAGS``) — that one is
+        ``_narrowing_flag_args``' business, not this helper's;
+      * a dangling ``--project`` with the anchor as its next token, e.g.
+        ``uv run --project pyright scripts/``, where uv would consume
+        ``pyright`` as the project name and never invoke the checker.
+    """
+    pre = _pre_anchor_tokens(cmd, keyword)
+    for i, token in enumerate(pre):
+        if token == '--project':
+            return pre[i + 1] if i + 1 < len(pre) else None
+        if token.startswith('--project='):
+            return token.split('=', 1)[1]
+    return None
 
 
 # Thin ruff-spelling wrappers, kept so test_scripts_diff_is_lint_gated below is
@@ -460,6 +574,158 @@ def _dir_key(target: str) -> str:
 def _dir_keys(targets: list[str]) -> list[str]:
     """``_dir_key`` over a target list, order and multiplicity preserved."""
     return [_dir_key(t) for t in targets]
+
+
+def test_narrowing_flag_detection_is_scoped_to_the_checkers_own_arguments() -> None:
+    """``_narrowing_flag_args`` must read only the tokens AFTER the checker anchor.
+
+    Task 4358. ``uv run --project <member> pyright <dir>`` and
+    ``pyright --project <file> <dir>`` contain the SAME CHARACTERS naming two
+    unrelated things, and only POSITION tells them apart:
+
+      * ``uv``'s ``--project`` (PRE-anchor) selects the ENVIRONMENT the checker
+        is resolved from — which member venv supplies the ``pyright`` binary. It
+        narrows NOTHING about what gets checked.
+      * pyright's own ``-p``/``--project`` (POST-anchor) points pyright at a
+        DIFFERENT CONFIG FILE, which can relax ``typeCheckingMode``, add
+        excludes, or drop ``extraPaths`` wholesale. That is the sharpest
+        carve-out vector this file guards, and assertion (c) of
+        ``test_scripts_diff_is_type_gated`` provably cannot see it — ``_targets``
+        discards every ``-``-prefixed token, so ``pyright -p /tmp/lax.json
+        scripts/`` still lists ``'scripts/'`` among its targets.
+
+    THE OBVIOUS "FIX" FOR CASE (a) IS THE WRONG ONE, which is why case (b)
+    exists. Deleting ``-p``/``--project`` from ``_NARROWING_FLAGS[_PYRIGHT]``
+    also makes (a) pass, and simultaneously un-guards the real config-redirect
+    vector — trading a false positive for a silent hole. Discriminate by
+    position, not by dropping the flag.
+
+    The property is not new to this file: ``_targets`` has always sliced
+    ``tokens[tokens.index(anchor) + 1:]``, and the ``_PYTEST`` comment above
+    records that "the anchor placement is what excludes the pre-anchor
+    positional ``shared`` of ``uv run --project shared pytest ...``".
+    ``_narrowing_flag_args`` is the one helper that never received it, latent
+    only because ruff's three exclude spellings happen not to collide with any
+    ``uv run`` flag — so the already-uv-fronted ``lint_command`` never tripped
+    it.
+    """
+    # (a) uv's environment selector is NOT a pyright narrowing flag. RED before
+    # task 4358: whole-segment tokenisation returns ['--project'] here.
+    assert _narrowing_flag_args('uv run --project shared pyright scripts/', _PYRIGHT) == [], (
+        "uv's PRE-anchor `--project shared` selects the ENVIRONMENT pyright is "
+        'resolved from, not a pyright config file, so it narrows nothing about '
+        'what gets checked. Reading it as a narrowing flag makes '
+        'test_scripts_diff_is_type_gated assertion (d) fail with a message '
+        'accusing the author of un-gating the type check, on a command that '
+        'gates it fully — a false positive on two homographic flags in '
+        'different segments of one command line. Scope the scan to the tokens '
+        'AFTER the checker anchor, as _targets already does; do NOT fix this by '
+        'removing --project from _NARROWING_FLAGS (see case (b))'
+    )
+
+    # (b) A REAL post-anchor redirect is still caught, so (a) does not buy its
+    # pass by disabling the check.
+    assert _narrowing_flag_args(
+        'uv run --project shared pyright -p /tmp/lax.json scripts/', _PYRIGHT
+    ) == ['-p'], (
+        "pyright's OWN post-anchor -p/--project points it at a different config "
+        'file, which can relax typeCheckingMode, add excludes or drop '
+        'extraPaths wholesale while the declared command still names scripts/ '
+        'and still exits 0. This assertion is what stops case (a) being '
+        '"fixed" by deleting -p/--project from _NARROWING_FLAGS[_PYRIGHT]: that '
+        'edit would silence the false positive AND leave the sharpest carve-out '
+        'vector in this file unguarded'
+    )
+
+    # (c) The other genuine pyright narrowing spelling, also post-anchor.
+    assert _narrowing_flag_args(
+        'uv run --project shared pyright --skipunannotated scripts/', _PYRIGHT
+    ) == ['--skipunannotated'], (
+        '--skipunannotated drops every unannotated function from analysis, so a '
+        'directory-wide target checks far less than it appears to. It is '
+        'prefix-matched via --skip so a future --skip<x> is caught too; '
+        'anchor-scoping must not cost that'
+    )
+
+    # (d) ruff shares this helper through _ruff_exclude_flags and must not be
+    # regressed by the fix — its spellings are all post-anchor too.
+    assert _ruff_exclude_flags(
+        'uv run --project shared ruff check scripts/ --exclude foo'
+    ) == ['--exclude'], (
+        "ruff's three exclude spellings never collided with a `uv run` flag, "
+        'which is why this helper survived un-scoped for so long. '
+        'Anchor-scoping is a strict improvement for ruff rather than a '
+        'trade-off, and this assertion pins that it stays one'
+    )
+    assert _ruff_exclude_flags('uv run --project shared ruff check scripts/') == [], (
+        "the repo's actual scripts/ lint_command carries no exclude flag, and "
+        "uv's pre-anchor --project must not be mistaken for one here either"
+    )
+
+
+def test_uv_project_member_reads_both_spellings_and_only_pre_anchor() -> None:
+    """``_uv_project_member`` must accept ``--project=X`` as well as ``--project X``.
+
+    Task 4358 amendment. ``uv run --project=shared pyright scripts/`` is an
+    exactly equivalent uv invocation to the space-separated spelling, so a
+    reader that recognises only one of them fails a command that does precisely
+    what the contract asks — a FALSE POSITIVE whose message would accuse the
+    author of not selecting an environment. The sibling helper
+    ``_narrowing_flag_args`` already prefix-matches for this same reason ("Both
+    spellings are caught: ``--exclude foo`` and ``--exclude=foo``"); this pins
+    that ``test_type_gates_resolve_pyright_without_npx`` follows the convention
+    its own file established rather than re-deriving a stricter one.
+
+    Cases (c)-(e) carry the POSITION half, which is the same homograph
+    ``test_narrowing_flag_detection_is_scoped_to_the_checkers_own_arguments``
+    guards from the other side: this helper must see ONLY uv's pre-anchor
+    environment selector, ``_narrowing_flag_args`` ONLY pyright's post-anchor
+    config redirect. Case (e) is the mixed command that carries both at once —
+    neither helper alone can judge it, and each must read exactly its own half.
+    """
+    # (a) The spelling the repo actually declares.
+    assert _uv_project_member('uv run --project shared pyright scripts/', _PYRIGHT) == 'shared'
+
+    # (b) The equals spelling. RED before this amendment: the caller scanned for
+    # an exact `--project` token, so this equivalent command was reported as
+    # carrying no environment selector at all.
+    assert _uv_project_member('uv run --project=shared pyright scripts/', _PYRIGHT) == 'shared', (
+        '`--project=shared` selects the same environment as `--project shared`; '
+        'reading only the space-separated spelling turns an equivalent, correct '
+        'command into a false red'
+    )
+
+    # (c) No selector at all is None, not a crash — the caller turns that into
+    # its own diagnostic rather than an IndexError.
+    assert _uv_project_member('uv run pyright scripts/', _PYRIGHT) is None
+
+    # (d) A POST-anchor --project is pyright's config-file redirect, NOT a uv
+    # environment selector, so this helper must not report one. The command is
+    # caught instead by _narrowing_flag_args.
+    redirect = 'uv run pyright --project /tmp/lax.json scripts/'
+    assert _uv_project_member(redirect, _PYRIGHT) is None, (
+        "pyright's own post-anchor --project names a CONFIG FILE, not a uv "
+        'workspace member; reporting it as the environment selector would then '
+        'check `/tmp/lax.json` for membership in [tool.uv.workspace].members '
+        'and fail with a message about the wrong flag entirely'
+    )
+    assert _narrowing_flag_args(redirect, _PYRIGHT) == ['--project']
+
+    # (e) BOTH at once, each read by exactly one helper. This is the command
+    # that passes every assertion of test_type_gates_resolve_pyright_without_npx
+    # except the post-anchor-redirect one, which is why that assertion has to be
+    # a real check rather than a restatement of the pre-anchor one.
+    mixed = 'uv run --project=shared pyright --project /tmp/lax.json scripts/'
+    assert _uv_project_member(mixed, _PYRIGHT) == 'shared'
+    assert _narrowing_flag_args(mixed, _PYRIGHT) == ['--project']
+
+    # (f) The pre/post split itself, shared with _post_anchor_tokens.
+    assert _pre_anchor_tokens('uv run --project shared pyright scripts/', _PYRIGHT) == [
+        'uv',
+        'run',
+        '--project',
+        'shared',
+    ]
 
 
 def test_executed_for_touched_is_hermetic_against_the_ambient_orch_config_path(
@@ -812,17 +1078,23 @@ def test_root_pyright_extrapaths_resolves_scripts_imports() -> None:
 
     A PRECONDITION for the type gate, not a general pyright-config preference,
     which is why it lives beside the gate it protects rather than in its own
-    file. The declared ``type_check_command`` is ``npx pyright scripts/``: it
-    runs from the repo root, so it resolves against the ROOT ``[tool.pyright]``
-    table — NOT against any per-package pyproject.toml.
+    file. The declared ``type_check_command`` is
+    ``uv run --project shared pyright scripts/`` (task 4358; it was
+    ``npx pyright scripts/`` when this test was written): it carries no
+    ``--directory``, so it runs from the repo root either way and resolves
+    against the ROOT ``[tool.pyright]`` table — NOT against any per-package
+    pyproject.toml, and NOT against ``shared/``'s, since ``--project shared``
+    selects only the environment pyright is resolved from.
 
     ``scripts/tests/conftest.py`` inserts BOTH ``scripts/`` and
     ``scripts/legibility/`` onto sys.path at runtime, so the test modules
     import flat names (``import census``, ``import digest``) that only resolve
     for pyright if the same two directories are on extraPaths. Measured at the
-    commit before these entries were added: ``npx pyright scripts/`` reported
-    exactly 9 reportMissingImports naming census/codebook/coder/digest/
-    inventory. The gate would then be RED for reasons unrelated to any diff —
+    commit before these entries were added, with the command declared AT THAT
+    TIME (``npx pyright scripts/`` — named as run, not retro-fitted to the
+    current uv spelling): exactly 9 reportMissingImports naming
+    census/codebook/coder/digest/inventory. The gate would then be RED for
+    reasons unrelated to any diff —
     an unresolved import is not a finding about the change under review, and a
     permanently-red gate gets suppressed or ignored, which is how a gate dies.
 
@@ -833,13 +1105,16 @@ def test_root_pyright_extrapaths_resolves_scripts_imports() -> None:
     reason it performs two separate sys.path insertions.
 
     TWO module gates depend on these entries, not one. The ``tests/scripts``
-    module config next door declares its own ``npx pyright tests/scripts/``,
-    which also runs from the repo root against this same root table, and five
+    module config next door declares its own
+    ``uv run --project shared pyright tests/scripts/`` (task 3842), which also
+    runs from the repo root against this same root table, and five
     of its modules import flat ``scripts/`` names. Those imports used to carry
     ``# pyright: ignore[reportMissingImports]``; task 3456 dropped the pragmas
     precisely BECAUSE the extraPaths entries made them resolve, so the masking
     is gone and the dependency is now live. RE-MEASURED at the branch tip by
-    deleting both entries and re-running each command: ``pyright scripts/`` ->
+    deleting both entries and re-running each command — under the npx-fronted
+    declarations both configs carried at that time, which changes which pyright
+    BINARY ran but not which config table it read: ``pyright scripts/`` ->
     23 errors, 9 of them reportMissingImports; ``pyright tests/scripts/`` -> 8
     errors, ALL reportMissingImports, naming migrate_metadata_modules_to_files,
     drain_check, audit_wiped_metadata_files, repair_wiped_metadata_files,
@@ -859,7 +1134,8 @@ def test_root_pyright_extrapaths_resolves_scripts_imports() -> None:
             f'{required!r} missing from ROOT [tool.pyright] extraPaths = '
             f'{extra_paths!r} in {REPO_ROOT / "pyproject.toml"} (task 3456). '
             f'The declared type gate for the {MODULE_PREFIX} module runs '
-            f'`npx pyright {MODULE_PREFIX}/` FROM THE REPO ROOT, so it resolves '
+            f'`uv run --project shared pyright {MODULE_PREFIX}/` FROM THE REPO '
+            f'ROOT (no --directory), so it resolves '
             f'against this root table. Without both '
             f'{list(_REQUIRED_EXTRA_PATHS)!r} entries, pyright cannot resolve '
             f'the flat modules {list(_UNRESOLVED_WITHOUT)!r} that '
@@ -871,7 +1147,8 @@ def test_root_pyright_extrapaths_resolves_scripts_imports() -> None:
             f'{_REQUIRED_EXTRA_PATHS[1]!r} importable only as a namespace '
             f'package, not its contents as bare top-level names. '
             f'BLAST RADIUS IS TWO GATES, NOT ONE: the {SIBLING_PREFIX} module '
-            f'config declares its own `npx pyright {SIBLING_PREFIX}/`, which '
+            f'config declares its own '
+            f'`uv run --project shared pyright {SIBLING_PREFIX}/`, which '
             f'also runs from the repo root against this same table, and task '
             f'3456 dropped the `# pyright: ignore[reportMissingImports]` '
             f'pragmas that were masking its five modules\' flat '
@@ -1004,7 +1281,8 @@ def test_scripts_diff_is_type_gated(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
     # (d) part 2 — the OTHER carve-out vector, which NO inspection of the
-    # command can reach. `npx pyright scripts/` runs from the repo root, so it
+    # command can reach. `uv run --project shared pyright scripts/` runs from
+    # the repo root, so it
     # resolves against the ROOT [tool.pyright] table — the same table
     # test_root_pyright_extrapaths_resolves_scripts_imports pins, read here
     # through the same _load_root_pyright_config helper. An `exclude` or
@@ -1047,6 +1325,154 @@ def test_scripts_diff_is_type_gated(monkeypatch: pytest.MonkeyPatch) -> None:
         'contract.) Nothing about this repo licenses duplicating a command '
         'across these two configs'
     )
+
+
+def test_type_gates_resolve_pyright_without_npx() -> None:
+    """Both non-member type gates must resolve pyright through uv, never npx.
+
+    Task 4358, mirroring task 3842's switch on the sibling. NOT a style rule —
+    the failure it prevents was MEASURED, twice, on the GREEN path:
+
+    esc-3473-2 recorded a bare ``npx pyright`` re-resolving through the shared,
+    mutable, concurrently-written npm cache under ``$HOME`` on EVERY invocation,
+    and once turning a clean 0-error type leg RED on a transient npm-cache write
+    failure (npm could not write ``~/.npm/_logs``) with no real type errors in
+    the tree. Because ``verify.run_full_verification`` asyncio-gathers over ALL
+    ``module_configs.values()`` and the repo root sets
+    ``merge_verify_breadth: "full"``, that is a fleet-wide false-red blocking
+    every merge, review checkpoint and main-tip sweep — on branches with no
+    defect. Task 3842 fixed ``tests/scripts/``; this task fixed ``scripts/``,
+    which was the last holdout among the nine discovered module configs.
+
+    (b) IS WHY THIS IS NOT JUST A BAN. Satisfying (a) by dropping to a bare
+    ``pyright scripts/`` would resolve whatever ``pyright`` happens to sit on
+    PATH — or none at all, since pyright is not on PATH at the worktree root,
+    only inside a member venv (``verify.py``'s ``_FALLBACK_UV_PROJECT =
+    'shared'`` encodes the same pairing). That trades a flaky red for a
+    command-not-found red. The contract is the uv-resolved form specifically.
+
+    Scoped to the two NON-WORKSPACE-MEMBER configs deliberately. They are the
+    only two that were ever npx-fronted and the only realistic regression
+    surface; the seven workspace members have always been
+    ``uv run --project MEMBER ... pyright src/ tests/`` because they need their
+    own member environment anyway. Asserting over all nine from inside a
+    scripts-module-specific guard would put a repo-wide invariant in a file
+    whose ownership and lock scope are module-local — the confusion
+    ``tests/scripts/test_module_verify_budgets.py``'s own PLACEMENT docstring
+    warns about. That file is the established home for the promoted form, and
+    it was GENERALISED FROM these per-module guards after both existed rather
+    than bolted on ahead of them.
+    """
+    discovered = _discovered()
+
+    # Guarded read, in the .get-based shape _load_root_pyright_config already
+    # uses here. Raw chained indexing raises a bare KeyError naming only the
+    # missing key if the root workspace table is ever restructured, which reads
+    # as a broken test rather than the real finding: the membership check below
+    # has nothing left to check against.
+    with open(REPO_ROOT / 'pyproject.toml', 'rb') as fh:
+        root_pyproject = tomllib.load(fh)
+    members = root_pyproject.get('tool', {}).get('uv', {}).get('workspace', {}).get('members')
+    assert members, (
+        f'the root {REPO_ROOT / "pyproject.toml"} declares no non-empty '
+        '[tool.uv.workspace].members, so `uv run --project <member>` cannot be '
+        'checked against the workspace it names (task 4358). Either the table '
+        'moved and this read needs re-pointing, or the workspace itself is '
+        'gone and every uv-resolved gate in the repo is broken — both are real '
+        'findings, and neither should surface as a bare KeyError'
+    )
+
+    for prefix in (MODULE_PREFIX, SIBLING_PREFIX):
+        mc = discovered.get(prefix)
+        assert mc is not None, (
+            f'{prefix}/orchestrator.yaml is no longer discovered by '
+            '_discover_module_configs, so its type gate cannot be checked '
+            '(task 4358)'
+        )
+        cmd = mc.type_check_command
+        assert cmd, (
+            f'{prefix}/orchestrator.yaml declares no type_check_command, so '
+            f'{_VACUOUS_PASS} — the invocation-style contract below is moot '
+            'until the gate exists at all (tasks 3456 / 3350)'
+        )
+
+        # Position matters to every assertion below, so read the two halves
+        # through the shared helpers rather than re-locating the anchor here —
+        # a hand-rolled `tokens.index(_PYRIGHT)` is the duplication
+        # _anchor_split exists to end.
+        pre = _pre_anchor_tokens(cmd, _PYRIGHT)
+        post = _post_anchor_tokens(cmd, _PYRIGHT)
+
+        # (a) EXACT-TOKEN, not substring, and over the WHOLE segment (both
+        # halves; the anchor itself is `pyright`, never `npx`). RED for
+        # `scripts` before this task, which declared `npx pyright scripts/`;
+        # `tests/scripts` has satisfied it since 3842.
+        assert 'npx' not in pre + post, (
+            f'{prefix}/orchestrator.yaml declares type_check_command={cmd!r}, '
+            'which fronts pyright with npx (task 4358). esc-3473-2 measured '
+            'bare `npx pyright` re-resolving through the shared, mutable, '
+            'concurrently-written npm cache under $HOME on every invocation, '
+            'and once turning a clean 0-error type leg RED on a transient '
+            'npm-cache write failure (npm could not write ~/.npm/_logs) with '
+            'no real type errors. verify.run_full_verification gathers over '
+            'ALL module_configs and the repo root sets merge_verify_breadth: '
+            'full, so that is a fleet-wide false-red on the green path, not a '
+            'local flake. Resolve pyright through uv instead: '
+            f'`uv run --project <member> pyright {prefix}/`'
+        )
+
+        # (b) POSITIVELY the uv-resolved form, so (a) cannot be satisfied by
+        # dropping to a bare `pyright <dir>` that resolves off PATH or nowhere.
+        assert pre[:2] == ['uv', 'run'], (
+            f'{prefix}/orchestrator.yaml declares type_check_command={cmd!r}, '
+            f'whose pyright segment does not begin `uv run` (task 4358). '
+            'Merely removing npx is not the contract: pyright is not on PATH '
+            'at the worktree root, only inside a member venv, so a bare '
+            f'`pyright {prefix}/` trades a flaky red for a command-not-found '
+            "red. verify.py's _FALLBACK_UV_PROJECT = 'shared' encodes the same "
+            'environment pairing'
+        )
+        # Both spellings count — `--project shared` and `--project=shared` are
+        # the same uv invocation — so this is not a spelling complaint. See
+        # _uv_project_member for the three no-usable-selector cases it folds
+        # into None.
+        member = _uv_project_member(cmd, _PYRIGHT)
+        assert member is not None, (
+            f'{prefix}/orchestrator.yaml declares type_check_command={cmd!r}, '
+            'which carries no PRE-anchor `--project <member>` selecting the '
+            'environment pyright is resolved from (task 4358). A post-anchor '
+            '--project is a different thing entirely — it redirects pyright at '
+            'another CONFIG file — and is rejected separately below; see the '
+            '_NARROWING_FLAGS comment on why the two are distinguished by '
+            'position'
+        )
+        assert member in members, (
+            f'{prefix}/orchestrator.yaml declares type_check_command={cmd!r}, '
+            f'whose `uv run --project {member}` names {member!r}, which is not '
+            'among the declared [tool.uv.workspace].members '
+            f'{sorted(members)!r} in the root pyproject.toml (task 4358). uv '
+            'resolves a non-member project name to nothing usable, so the gate '
+            'would fail to start rather than run — the same reports-nothing '
+            'outcome a missing command produces, reached a different way'
+        )
+        # The POSITION half, and a real check rather than a restatement of the
+        # one above: a command may carry BOTH a pre-anchor uv selector and a
+        # post-anchor pyright redirect, and every assertion so far passes it.
+        # test_scripts_diff_is_type_gated assertion (d) catches that shape via
+        # _narrowing_flag_args, but only for MODULE_PREFIX — this loop covers
+        # the SIBLING config too, which nothing else checks for it.
+        redirects = [
+            t for t in post if t in ('--project', '-p') or t.startswith(('--project=', '-p='))
+        ]
+        assert not redirects, (
+            f'{prefix}/orchestrator.yaml declares type_check_command={cmd!r}, '
+            f'which carries {redirects!r} AFTER the `pyright` anchor — that is '
+            "PYRIGHT's config-file redirect, not uv's environment selector "
+            '(task 4358). It points pyright at another config file, which can '
+            'relax typeCheckingMode, add excludes or drop extraPaths wholesale '
+            'while the declared command still names the directory and still '
+            'exits 0'
+        )
 
 
 def test_scripts_full_suite_pytest_covers_scripts_tests(

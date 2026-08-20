@@ -54,8 +54,11 @@ from orchestrator.merge_disposition import (
     classify_merge_failure_disposition,
 )
 from orchestrator.merge_drift import (  # noqa: F401  re-export shim
+    DriftCheckState,
+    _load_drift_check_state,
     _maybe_run_drift_check,
     _run_drift_check,
+    _save_drift_check_state,
 )
 from orchestrator.merge_gates import (  # noqa: F401  re-export shim
     _OVERLAP_GIT_ERROR_SENTINEL,
@@ -121,10 +124,13 @@ from orchestrator.merge_shadow import (  # noqa: F401  re-export shim
     _maybe_schedule_shadow_compare,
     _nextest_reported_test_count,
     _persistent_alarm_tests,
+    _run_coarse_shadow_compare,
     _run_cold_shadow_verify,
+    _run_cold_shadow_verify_suite,
     _run_shadow_compare,
     _save_shadow_compare_state,
     _shadow_compare_due,
+    _submit_coarse_shadow_divergence_escalation,
     _submit_shadow_divergence_escalation,
     build_fail_fast_map,
     build_warm_shadow_results,
@@ -2391,6 +2397,7 @@ async def _run_post_merge_verify(
     keep_worktrees: Collection[Path] | None = None,
     runner: VerifyRunner | None = None,
     escalation_queue: Any = None,
+    halt_hook: Callable[[str], None] | None = None,
     dry_run_handles: _DryRunInvestigationHandles | None = None,
     main_health_probe_handles: _MainHealthProbeHandles | None = None,
     depth: int | None = None,
@@ -2464,6 +2471,26 @@ async def _run_post_merge_verify(
             (``is_flock_contention_failure``); has no effect on any other
             failure path.  None-safe — omitting it keeps every existing
             call site byte-identical.
+        halt_hook: Optional synchronous all-lane merge-queue halt (task 2886
+            fix 3, PRD §3.4 / decision 4).  Invoked with a human-readable
+            reason string the instant a GENUINE concluded cross-check
+            divergence (remote PASS / local trust-anchor FAIL with a
+            non-infra-transient local category) is detected — BEFORE the local
+            FAIL is adopted and the blocked outcome returns — so no FURTHER
+            adoption can occur before a human looks.  A local FAIL with an
+            INFRA-TRANSIENT category is treated as a local hiccup (not a
+            main-red divergence): the land is still withheld + the remote
+            quarantined, but the queue is NOT halted and the escalation is L1
+            blocking rather than born-at-L2 (task 2886 amendment — bound the
+            halt blast radius; DriftDetector Invariant 5).  Only the
+            production ``SpeculativeMergeWorker._run_inflight_verify`` call
+            site passes ``self.operator_halt``; every other (module-level,
+            test-local) caller omits it (default ``None`` → no halt), keeping
+            them byte-identical.  Cross-check REMAINS a trailing detector, not
+            a pre-adoption gate (pre-gating every remote-sole verdict would
+            double Lever-C cost); the halt is synchronous purely so it
+            precedes any further adoption — incident 83336a32 halted +3s too
+            late via the async escalation gate.
         dry_run_handles: Opaque bundle of scheduler/mcp/usage_gate/cost_store
             (task η, AFK coverage gap).  ``None`` (default) keeps the
             solo-reverify and train module-level callers byte-identical (no
@@ -2999,9 +3026,47 @@ async def _run_post_merge_verify(
                     )
             else:
                 # DIVERGE — remote PASS / local trust-anchor FAIL.  Fail-closed:
-                # quarantine the remote, file a dedup'd blocking escalation
-                # (mirrors DriftDetector's shape), and adopt the local FAIL
-                # verdict so the not-passed path below withholds the land.
+                # quarantine the remote, file a dedup'd escalation, and adopt the
+                # local FAIL verdict so the not-passed path below withholds the
+                # land.
+                #
+                # task 2886 fix 3 (PRD §3.4 / decision 4): a GENUINE concluded
+                # divergence means main is SUSPECTED-RED — a 'human must look now'
+                # condition (INV-5).  For that class HALT the queue via halt_hook
+                # FIRST, synchronously, right here — BEFORE quarantine/escalation
+                # and BEFORE adopting the local FAIL / returning the blocked
+                # outcome — so no FURTHER adoption can occur before a human looks.
+                # The async escalation-queue gate is only checked at the NEXT
+                # merger iteration, so it TRAILS adoption: incident 83336a32
+                # diverged +3s AFTER CAS-advance.  Cross-check REMAINS a TRAILING
+                # detector, not a pre-adoption gate (pre-gating every remote-sole
+                # verdict would double Lever-C cost); the halt is synchronous
+                # purely so it precedes any further adoption.  None-safe: only the
+                # production worker call site threads self.operator_halt.
+                #
+                # task 2886 amendment (reviewer robustness — bound the halt blast
+                # radius): only halt the WHOLE fleet when the local FAIL is a
+                # GENUINE test-level divergence.  A local FAIL whose category is
+                # policy-table infra-transient (SEMAPHORE_TIMEOUT, DISK_FULL,
+                # PYTEST_INTERNALERROR/OOM-class, ENV_TRANSIENT) is a LOCAL infra
+                # hiccup, NOT evidence main is red (DriftDetector Invariant 5:
+                # 'never block a good land on a local infra hiccup') — halting
+                # every lane on one flaky local verify would force an operator to
+                # un-halt for a non-divergence.  For that class fall back to the
+                # pre-fix-3 shape: quarantine the remote + withhold THIS land + an
+                # L1 blocking escalation (fail-closed for this land, no fleet halt,
+                # not born-at-L2).  A genuine failure — test_failure, a build/
+                # compile break on the intact merge_wt, or any non-infra /
+                # unclassified category — keeps the fix-3 halt + born-at-L2.
+                local_infra_fail = (
+                    (local_verify.category or '') in INFRA_TRANSIENT_CATEGORIES
+                )
+                if halt_hook is not None and not local_infra_fail:
+                    halt_hook(
+                        f'cross-check divergence for {merge_sha}: remote '
+                        f'{runner.name} PASS / local trust-anchor FAIL — '
+                        f'suspected red main'
+                    )
                 if quarantine is not None:
                     quarantine.add(runner.name)
                 if (
@@ -3011,30 +3076,77 @@ async def _run_post_merge_verify(
                     from escalation.models import (
                         Escalation,  # local import — escalation optional dep
                     )
-                    escalation_queue.submit(Escalation(
-                        id=escalation_queue.make_id(_CROSS_CHECK_SENTINEL),
-                        task_id=_CROSS_CHECK_SENTINEL,
-                        agent_role='orchestrator-cross-check',
-                        severity='blocking',
-                        level=1,
-                        category='verify_cross_check_mismatch',
-                        summary=(
+                    if local_infra_fail:
+                        # Local infra hiccup, not a genuine divergence: pre-fix-3
+                        # L1 blocking shape — land withheld + remote quarantined,
+                        # but NO fleet halt and NOT born-at-L2.
+                        _xc_severity, _xc_level = 'blocking', 1
+                        _xc_summary = (
                             f'Cross-check divergence for {merge_sha}: '
-                            f'remote={runner.name!r} PASS / local trust-anchor FAIL'
-                        ),
-                        detail=(
+                            f'remote={runner.name!r} PASS / local trust-anchor FAIL '
+                            f'(local category={local_verify.category!r}, '
+                            f'infra-transient) — land withheld, {runner.name!r} '
+                            f'quarantined (queue NOT halted)'
+                        )
+                        _xc_detail = (
+                            f'merge_sha={merge_sha!r} remote_runner={runner.name!r} '
+                            f'reported PASS but the local trust-anchor re-verify '
+                            f'FAILED with an INFRA-TRANSIENT category '
+                            f'(summary={local_verify.summary!r}, '
+                            f'category={local_verify.category!r}).  Treated as a '
+                            f'LOCAL infra hiccup rather than a genuine main-red '
+                            f'divergence (DriftDetector Invariant 5): the land is '
+                            f'withheld and {runner.name!r} is quarantined, but the '
+                            f'merge queue is NOT halted.  If this recurs the remote '
+                            f'host env may be genuinely diverging — investigate '
+                            f'before clearing the quarantine.'
+                        )
+                        _xc_action = (
+                            'Investigate the local infra failure (was it a real '
+                            'divergence or a transient local hiccup?).  Clear the '
+                            "remote quarantine once the host's env is re-proved; no "
+                            'queue un-halt is needed (the queue was not halted).'
+                        )
+                    else:
+                        # Genuine divergence (task 2886 fix 3): born-at-L2 —
+                        # critical severity is in BORN_AT_L2_SEVERITIES so it is
+                        # born at level 2, mirroring the warm/cold shadow alarm;
+                        # the queue has been halted synchronously above.
+                        _xc_severity, _xc_level = 'critical', 2
+                        _xc_summary = (
+                            f'Cross-check divergence for {merge_sha}: '
+                            f'remote={runner.name!r} PASS / local trust-anchor FAIL '
+                            f'— merge queue HALTED, main suspected-red'
+                        )
+                        _xc_detail = (
                             f'merge_sha={merge_sha!r} remote_runner={runner.name!r} '
                             f'reported PASS but the local trust-anchor re-verify FAILED '
                             f'(summary={local_verify.summary!r}, '
                             f'category={local_verify.category!r}). A remote PASS / local '
                             f'FAIL split can land unverified code on main; the land is '
-                            f'withheld and {runner.name!r} is quarantined.'
-                        ),
-                        suggested_action=(
-                            'Re-prove the remote host env (run_verdict_parity) and clear '
-                            'its quarantine once parity is restored; investigate why the '
+                            f'withheld and {runner.name!r} is quarantined.  The merge '
+                            f'queue has been HALTED synchronously and main is SUSPECTED '
+                            f'RED pending human review — no further land can proceed '
+                            f'until an operator confirms main is green and un-halts the '
+                            f'queue.'
+                        )
+                        _xc_action = (
+                            'Confirm whether main is actually red at this commit; if so, '
+                            'roll it back.  Re-prove the remote host env '
+                            '(run_verdict_parity) and clear its quarantine once parity is '
+                            'restored, then un-halt the merge queue.  Investigate why the '
                             'remote green disagreed with the local trust-anchor.'
-                        ),
+                        )
+                    escalation_queue.submit(Escalation(
+                        id=escalation_queue.make_id(_CROSS_CHECK_SENTINEL),
+                        task_id=_CROSS_CHECK_SENTINEL,
+                        agent_role='orchestrator-cross-check',
+                        severity=_xc_severity,
+                        level=_xc_level,
+                        category='verify_cross_check_mismatch',
+                        summary=_xc_summary,
+                        detail=_xc_detail,
+                        suggested_action=_xc_action,
                     ))
                 if event_store is not None:
                     event_store.emit(
@@ -8629,6 +8741,59 @@ class SpeculativeMergeWorker(_WipHaltMixin):
     # attribute so tests can monkeypatch it small, matching the
     # RESOURCE_AUDIT_*/MAX_* convention above.
     PERIODIC_REAP_MIN_AGE_SECS: float = 21600.0
+    # task 3622: number of periodic reaper SWEEPS (a COUNT, not seconds) of
+    # slack added on top of PERIODIC_REAP_MIN_AGE_SECS to derive the
+    # ESCALATION age floor — see _resource_audit_escalation_age_secs().
+    #
+    # A leaked worktree between the DETECTION floor
+    # (RESOURCE_AUDIT_WORKTREE_GRACE_SECS) and the DESTRUCTION floor
+    # (PERIODIC_REAP_MIN_AGE_SECS) is a condition the periodic sweep
+    # (_maybe_reap_orphaned_merge_worktrees) is already SCHEDULED to clear, so
+    # paging a human about it reports work that is about to happen anyway.
+    # Escalation therefore waits until that scheduled remediation has
+    # demonstrably FAILED, which is what this sweep count buys.
+    #
+    # The count is DERIVED, not picked.  The periodic sweep destroys any
+    # unowned `_merge-*` past PERIODIC_REAP_MIN_AGE_SECS on its NEXT firing,
+    # and it fires at most once per self._reap_interval_s — so ONE interval is
+    # the guaranteed-opportunity bound (the tree is certain to have been
+    # offered to the reaper at least once).  The SECOND interval covers
+    # exactly one fail-open cleanup_merge_worktree failure and its retry (the
+    # 'failed for %s — leaving for a later sweep' continue in
+    # reap_orphaned_merge_worktrees, which logs and moves on rather than
+    # raising).  Reaching the resulting floor means the reaper demonstrably
+    # had >= 2 SCHEDULED opportunities and the tree is STILL on disk — a
+    # genuine "nobody is going to clean this up".
+    #
+    # SCHEDULED, not attempted: two assumptions are stated here rather than
+    # left implicit (task 3622 review).
+    #   1. The sweep is driven ONLY from _heartbeat_loop's _HEARTBEAT_POLL_S
+    #      (30 s) tick, so the real sweep cadence is
+    #      max(_reap_interval_s, _HEARTBEAT_POLL_S).  At the shipped 300 s
+    #      interval the two agree and one interval really is one sweep; a
+    #      deployment that set _reap_interval_s BELOW the poll period would
+    #      get a floor lower than the true two-sweep bound.
+    #   2. _maybe_reap_orphaned_merge_worktrees consumes its rate-limit slot
+    #      (_last_reap_at = now) BEFORE awaiting the sweep, and _heartbeat_loop
+    #      bounds that await with _reap_sweep_timeout_s (120 s) — so a sweep
+    #      that times out or raises burns an opportunity WITHOUT ever reaching
+    #      the tree, logging only 'merge queue heartbeat: periodic reap failed'.
+    # Both err in the same direction: the floor can over-count how many times
+    # the reaper actually TRIED, so escalation may fire somewhat early.  Neither
+    # can suppress an escalation indefinitely, which is the only failure mode
+    # that would matter here (loud-over-silent).  A max(..., _HEARTBEAT_POLL_S)
+    # floor is deliberately NOT applied: it would buy nothing at any shipped
+    # value while forcing every test to run at >= 30 s-per-sweep scale.
+    # _alarm_resource_audit's suggested_action names case 2 explicitly so an
+    # operator does not grep for a cleanup failure that was never logged.
+    #
+    # Expressed in sweeps rather than seconds so it tracks the reaper's
+    # cadence: a deployment that changes _reap_interval_s moves the escalation
+    # floor with it instead of silently changing how many chances the reaper
+    # gets.  Kept as a class attribute so tests can monkeypatch it
+    # per-instance (e.g. worker.RESOURCE_AUDIT_REAP_GRACE_SWEEPS = 1.0),
+    # matching the RESOURCE_AUDIT_*/MAX_* convention above.
+    RESOURCE_AUDIT_REAP_GRACE_SWEEPS: float = 2.0
     # MQ-invariants iota (task 1994): number of CONSECUTIVE
     # _check_resource_audit heartbeats a resource-conservation violation
     # (speculation_accounting_violations / worktree_ledger_violations) must
@@ -8748,6 +8913,17 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         _root = getattr(git_ops, 'project_root', None)
         self._shadow_state_path: Path | None = (
             _root / 'data' / 'orchestrator' / 'warm_verify_shadow.json'
+        ) if _root is not None else None
+        # Drift-check cadence persistence (task 2886 fix 1a) — same None-safe
+        # project_root-derived pattern as _shadow_state_path above.  Persisting
+        # the drift land counter here (authoritative over the in-memory
+        # _drift_land_count below) is what makes the drift-check cadence survive
+        # the ~8h fleet redeploy that used to reset the counter before it ever
+        # reached verify_drift_check_every_n_lands (root cause: the drift check
+        # had NEVER fired in any runs.db).  None on bare-harness workers so
+        # _maybe_run_drift_check falls back to the in-memory counter there.
+        self._drift_state_path: Path | None = (
+            _root / 'data' / 'orchestrator' / 'drift_check_state.json'
         ) if _root is not None else None
         # Durable landed-row journal (task 2153 / W1 α): survives until the
         # scheduler's consult-before-dispatch gate (δ, separate task) confirms
@@ -11690,7 +11866,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         return violations
 
-    def worktree_ledger_violations(self, *, now: float | None = None) -> list[str]:
+    def worktree_ledger_violations(
+        self, *, now: float | None = None, grace_secs: float | None = None,
+    ) -> list[str]:
         """Return I6 worktree-ledger violations as human-readable strings.
 
         Empty list → every on-disk ``_merge-*`` worktree is accounted for.
@@ -11715,6 +11893,24 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         register/deregister races; a persistent leak eventually trips once
         it outlives the window.
 
+        Each violation string carries its RECLAIM DISPOSITION (task 3622):
+        below :attr:`PERIODIC_REAP_MIN_AGE_SECS` the tree is annotated as
+        scheduled for automatic reclaim by
+        :meth:`_maybe_reap_orphaned_merge_worktrees` (and names the age at
+        which that comes due); at or above it, as overdue.  Since detection
+        fires well before escalation does, this is what lets an operator tell
+        a self-healing leak from a stuck one.  The string is the ONLY channel
+        for the distinction — it is the single value flowing to all three
+        consumers (the WARNING log in :meth:`_check_resource_audit`, the
+        ``snapshot()['resource_audit']`` census, and the escalation body), so
+        annotating it reaches every consumer without adding a snapshot
+        sub-key (``snapshot()`` is under an additive-only freeze and its
+        ``resource_audit`` value is pinned by exact dict equality).  The
+        disposition is computed against
+        :attr:`PERIODIC_REAP_MIN_AGE_SECS`, NOT against the resolved
+        *grace_secs* floor, so a raised-floor caller cannot misreport an
+        in-window tree as overdue.  The leading text is unchanged.
+
         Returns ``[]`` immediately when ``not self._running``: mirrors
         :meth:`speculation_accounting_violations` — ``stop()`` drains and
         cleans up owned worktrees, so auditing during/after shutdown would
@@ -11722,6 +11918,21 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         *now* is injectable for deterministic tests; defaults to
         ``time.time()``.
+
+        *grace_secs* (task 3622) overrides the age floor for this call only;
+        ``None`` inherits :attr:`RESOURCE_AUDIT_WORKTREE_GRACE_SECS`.  Mirrors
+        :meth:`reap_orphaned_merge_worktrees`'s ``min_age_secs`` idiom — same
+        module, same "None means inherit the class default" semantics — so
+        detection and remediation expose the identical override shape.
+        Raising the floor narrows WHICH leaks are reported and changes
+        nothing else: every other exclusion (ownership, ``_merge-`` prefix,
+        the persistent verify worktree, the ``_running`` guard) is orthogonal
+        to it and still applies.  Its consumer is
+        :meth:`_check_resource_audit`'s escalation predicate, which re-asks
+        this question at :meth:`_resource_audit_escalation_age_secs` to find
+        the leaks that have outlived their scheduled reclaim; the default
+        callers (:meth:`snapshot`, and this method's own detection/logging
+        path) keep the lower floor so the census stays truthful.
 
         Pure/synchronous (no await, no git subprocess). Fail-safe: never
         raises; any unexpected exception is caught and surfaced as a
@@ -11736,7 +11947,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             if base is None or not base.is_dir():
                 return []
             effective_now = now if now is not None else time.time()
-            grace = self.RESOURCE_AUDIT_WORKTREE_GRACE_SECS
+            grace = (
+                grace_secs
+                if grace_secs is not None
+                else self.RESOURCE_AUDIT_WORKTREE_GRACE_SECS
+            )
             owned = {p.resolve() for p in self._owned_merge_worktrees}
             with os.scandir(base) as it:
                 candidates = list(it)
@@ -11755,10 +11970,26 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     continue
                 age = effective_now - mtime
                 if age > grace:
+                    # Reclaim disposition (task 3622). Compared against the
+                    # DESTRUCTION floor, never against the resolved `grace`
+                    # above — `grace` may have been raised by a *grace_secs*
+                    # caller, which would misreport an in-window tree as
+                    # overdue.
+                    reap_age = self.PERIODIC_REAP_MIN_AGE_SECS
+                    disposition = (
+                        f' — reclaim overdue: already past the periodic '
+                        f'reaper\'s {reap_age:.0f}s destruction floor and '
+                        f'still on disk'
+                        if age >= reap_age
+                        else f' — scheduled for automatic reclaim by the '
+                             f'periodic reaper once it passes age '
+                             f'{reap_age:.0f}s'
+                    )
                     violations.append(
                         f'unregistered on-disk merge worktree {path} '
                         f'(age {age:.0f}s > grace {grace:.0f}s) absent from '
                         f'owned ledger — possible leak'
+                        + disposition
                     )
         except Exception as exc:  # pragma: no cover — defensive
             violations.append(f'worktree_ledger_violations: check raised: {exc}')
@@ -12712,6 +12943,46 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 self._escalation_queue, stuck, event_store=self._event_store,
             )
 
+    def _resource_audit_escalation_age_secs(self) -> float:
+        """Age past which a leaked worktree is genuinely escalation-worthy (task 3622).
+
+        The DETECTION floor (:attr:`RESOURCE_AUDIT_WORKTREE_GRACE_SECS`,
+        9000 s) answers "old enough to be worth REPORTING"; the DESTRUCTION
+        floor (:attr:`PERIODIC_REAP_MIN_AGE_SECS`, 21600 s) answers "old
+        enough that destroying it cannot interrupt live work".  Neither
+        answers "old enough that nobody is going to clean this up" — which is
+        the only question an L1 page to a human should turn on.  This method
+        answers that third question.
+
+        Returns ``PERIODIC_REAP_MIN_AGE_SECS +
+        RESOURCE_AUDIT_REAP_GRACE_SWEEPS * self._reap_interval_s`` (defaults:
+        21600 + 2 x 300 = 22200 s).  Below it, the periodic sweep
+        (:meth:`_maybe_reap_orphaned_merge_worktrees`) is still SCHEDULED to
+        destroy the tree, so the condition is self-healing and not yet a
+        human's problem.  At or above it the reaper has demonstrably had at
+        least :attr:`RESOURCE_AUDIT_REAP_GRACE_SWEEPS` SCHEDULED opportunities
+        and the tree survived them all — the scheduled remediation has failed.
+        Scheduled, not necessarily attempted: a sweep that times out under
+        ``_reap_sweep_timeout_s`` still consumes its rate-limit slot.  See that
+        constant's declaration for the full derivation and both assumptions.
+
+        A METHOD, not a class constant, because ``_reap_interval_s`` is an
+        INSTANCE attribute set in ``__init__``: a class-level constant could
+        neither see a per-instance reap interval nor stay coherent with the
+        many tests that monkeypatch :attr:`PERIODIC_REAP_MIN_AGE_SECS`
+        per-instance.  Recomputed on every call for the same reason — it
+        never caches a stale interval.
+
+        Consumed only by :meth:`_check_resource_audit`'s escalation
+        predicate.  Detection, the WARNING log, and
+        ``snapshot()['resource_audit']`` all keep using the lower detection
+        floor, so the leak census stays truthful throughout the band.
+        """
+        return (
+            self.PERIODIC_REAP_MIN_AGE_SECS
+            + self.RESOURCE_AUDIT_REAP_GRACE_SWEEPS * self._reap_interval_s
+        )
+
     def _check_resource_audit(self, now: float) -> None:
         """Run both resource-conservation audits and alarm on a persisting violation.
 
@@ -12737,11 +13008,42 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         invoked on every further violating call; its own ``has_open_l1``
         dedup (see that function) ensures at most one open L1 regardless of
         how many times this method calls it.
+
+        DETECTION AND ESCALATION USE DIFFERENT AGE FLOORS (task 3622).
+        Detection, the WARNING log, the streak, and
+        ``snapshot()['resource_audit']`` all fire at
+        :attr:`RESOURCE_AUDIT_WORKTREE_GRACE_SECS`, so the leak census stays
+        truthful and immediate.  The ESCALATION, however, re-asks the
+        worktree question at the higher
+        :meth:`_resource_audit_escalation_age_secs` floor: a leaked worktree
+        younger than that is still inside the window in which
+        :meth:`_maybe_reap_orphaned_merge_worktrees` is SCHEDULED to destroy
+        it, so paging a human would report work that is about to happen
+        anyway (this is what produced esc-``__merge_resource_leak__``-46/-47).
+        The escalation waits until that scheduled remediation has
+        demonstrably failed.
+
+        Speculation-accounting violations are NEVER age-suppressed: nothing
+        reclaims a leaked permit or cap slot, so that arm is a genuine
+        "nobody is going to clean this up" from its first heartbeat and
+        passes through unfiltered.
+
+        The escalation-floor rescan is skipped outright when the detection
+        pass returned no worktree violations at all — a higher floor can only
+        drop entries, so the rescan's result is a strict subset and would be
+        provably empty.  That keeps a persisting permit leak from re-scanning
+        the worktree base on every poll for as long as it lasts.
+
+        The streak deliberately keeps counting through the suppressed band —
+        its documented meaning is "consecutive violating heartbeats", which
+        stays literally true, and it is the transient/racy-blip filter rather
+        than the escalate-now decision.  Preserving it means a tree that
+        crosses the escalation floor mid-streak alarms on the very next poll
+        instead of restarting a 3-heartbeat countdown.
         """
-        violations = (
-            self.speculation_accounting_violations()
-            + self.worktree_ledger_violations(now=now)
-        )
+        spec_violations = self.speculation_accounting_violations()
+        wt_violations = self.worktree_ledger_violations(now=now)
+        violations = spec_violations + wt_violations
 
         if not violations:
             self._resource_audit_violation_streak = 0
@@ -12756,9 +13058,33 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         self._resource_audit_violation_streak += 1
 
         if self._resource_audit_violation_streak >= self.RESOURCE_AUDIT_ESCALATION_STREAK:
-            _alarm_resource_audit(
-                self._escalation_queue, violations, event_store=self._event_store,
+            # Re-ask the worktree arm at the ESCALATION floor. Anything it
+            # still returns has outlived its scheduled reclaim; anything it
+            # drops is self-healing and stays logged-only. The permit arm is
+            # reused as-is — it has no scheduled remediation to wait for.
+            #
+            # Skipped entirely when the detection pass found no worktree
+            # violations. Raising the floor can only ever DROP entries, so the
+            # escalation-floor result is a strict subset of the detection-floor
+            # one and an empty detection pass guarantees an empty rescan —
+            # making the second os.scandir(worktree_base) + per-entry resolve()
+            # pure waste. That is the common case: a persisting PERMIT leak
+            # (which every pre-existing escalation test exercises) would
+            # otherwise re-scan the worktree base on every _HEARTBEAT_POLL_S
+            # tick indefinitely, including while has_open_l1 is already
+            # dropping the resulting alarm on the floor.
+            escalatable = spec_violations + (
+                self.worktree_ledger_violations(
+                    now=now, grace_secs=self._resource_audit_escalation_age_secs(),
+                )
+                if wt_violations
+                else []
             )
+            if escalatable:
+                _alarm_resource_audit(
+                    self._escalation_queue, escalatable,
+                    event_store=self._event_store,
+                )
 
     def _maybe_log_queue_heartbeat(self, now: float) -> bool:
         """Emit a queue-depth heartbeat log line and event if conditions are met.
@@ -13221,6 +13547,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         cleanup (``finally``) preserve the original semantics.  The ``finally`` also
         cancels any still-live loop task on the terminal-halt path (so the healthy
         sibling of a cap-exceeded loop does not leak).
+
+        Both arms' raw ``cancel()`` + ``gather()`` shutdown is safe against a
+        ``_verifier_loop`` parked on its reused persistent getter as of task 4306:
+        that branch's recovery clause now re-raises a cancellation aimed at the
+        loop task instead of absorbing it and re-parking on a fresh get().
         """
         # Reset supervisor state for this invocation.
         self._live_loops = {'merger', 'verifier'}
@@ -14844,8 +15175,18 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         Exception handling: unexpected exceptions from _dispatch_item (e.g. a
         _remerge failure) are caught, logged, the request resolved with 'blocked',
         and the loop continues so a single bad item does not crash the queue.
-        CancelledError is NOT caught; it propagates to stop() which cancels
-        _verifier_task.
+
+        CancelledError is never absorbed: this loop always terminates when its
+        own task is cancelled.  The loop's sole `except asyncio.CancelledError`
+        — the FINALIZE-HEAD getter-reuse recovery clause, which re-fetches via a
+        fresh get() so no queue item is lost when only `_pending_verifier_get`
+        was cancelled — re-raises when `asyncio.current_task().cancelling() > 0`,
+        i.e. whenever the cancellation is aimed at THIS task rather than at the
+        getter alone (task 4306).  So both stop()'s protocol (cancel the getter,
+        then push a None sentinel) AND a bare `task.cancel()` from any other
+        caller — run()'s shutdown arms, a TaskGroup teardown, an enclosing
+        wait_for timeout — terminate the loop.  Fenced by
+        orchestrator/tests/test_merge_queue_verifier_raw_cancel.py.
         """
         while True:
             # ── (a) DISPATCH-FILL ──────────────────────────────────────────────
@@ -15035,14 +15376,53 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
                 # Continue filling only if another slot is free (real verify entries
                 # consume a host slot, so check free_host_count).
-                # Also stop filling if we just dispatched from _redispatch and it is
-                # now empty: cascade-recovery items should proceed to FINALIZE-HEAD
-                # rather than blocking on _verifier_queue.get() waiting for new work
-                # (which would deadlock when the queue is empty after a cascade).
+                #
+                # task 3276: this used to also stop filling whenever a
+                # redispatch-sourced dispatch drained self._redispatch, on the
+                # theory that continuing would risk blocking on
+                # _verifier_queue.get() and deadlocking once the queue is empty
+                # after a cascade. That theory conflated two different
+                # conditions -- an empty _redispatch is not the same as an
+                # empty _verifier_queue -- and cost a free host and real,
+                # ready work every time it fired while the queue was
+                # non-empty.
+                #
+                # The clause is gone outright: tracing every path shows it was
+                # redundant, not merely mis-predicated. With self._redispatch
+                # empty, the top of this loop's NEXT iteration can only take
+                # one of three paths, none of which can block indefinitely:
+                #   1. the persistent-getter harvest (above, near the top of
+                #      this inner loop) consumes an already-arrived item
+                #      immediately;
+                #   2. get_nowait() dispatches immediately when
+                #      _verifier_queue is non-empty;
+                #   3. the QueueEmpty branch, which only blocks when
+                #      _has_running_inflight and a host is free -- and then
+                #      races a persistent getter against the running verify
+                #      tasks via asyncio.wait(..., FIRST_COMPLETED), so a
+                #      verify completing first always ends the wait and falls
+                #      through to FINALIZE-HEAD (the esc-1735-5 anti-block
+                #      property); otherwise (no running inflight, or no free
+                #      host) the else there breaks straight to FINALIZE-HEAD.
+                # So the "would deadlock when the queue is empty after a
+                # cascade" hazard the original comment named cannot occur --
+                # that property was always provided by path 3 above, not by
+                # this clause. Deleting it also removes the very
+                # redispatch-sourced-vs-queue-sourced divergence that
+                # produced the bug: both kinds of dispatch now continue
+                # filling under the exact same rule. See
+                # test_merge_queue_dispatch_fill_redispatch.py for the pinned
+                # invariants this argument backs (primary repro, late
+                # arrival, and the anti-deadlock fence).
+                #
+                # Do NOT add a free_host_count() == 0 special case here for
+                # single-host: that clause already covers it -- with one
+                # slot, dispatch acquires it, free_host_count() drops to 0,
+                # and the fill loop stops after one entry, preserving the
+                # SINGLE-HOST serial degeneracy documented in this method's
+                # docstring.
                 allocator = self._ensure_host_allocator(entry.item.request.config)
-                if allocator.free_host_count() == 0 or (
-                    not is_from_verifier_queue and not self._redispatch
-                ):
+                if allocator.free_host_count() == 0:
                     fill_done = True
                     break
 
@@ -15320,8 +15700,29 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     try:
                         item = await _pvg
                     except asyncio.CancelledError:
-                        # Getter was cancelled (stop() ordering race); re-fetch
-                        # via a fresh get so no queue item is lost.
+                        # Getter was cancelled; re-fetch via a fresh get so no
+                        # queue item is lost — but ONLY if the cancellation was
+                        # aimed at `_pvg` alone.  Discriminate WHOSE cancellation
+                        # this is (task 4306).  `Task.cancelling()` counts cancel
+                        # REQUESTS against the OUTER task and is NOT decremented
+                        # by catching, so it reads:
+                        #   0  -> only `_pvg` was cancelled (stop()'s getter-only
+                        #         protocol) -> recover with a fresh get(), the
+                        #         original intent of this clause;
+                        #   >0 -> `_verifier_loop`'s OWN task was cancelled and
+                        #         the CancelledError merely arrived through the
+                        #         transitively-cancelled getter.  Swallowing it
+                        #         here would consume the single cancel request
+                        #         and re-park the loop on a fresh, uncancelled
+                        #         get(), so run()'s `cancel()` + `gather()`
+                        #         shutdown would never return.
+                        # Nothing is lost by re-raising: asyncio.Queue.get()
+                        # calls get_nowait() only AFTER its await returns, so a
+                        # cancelled `_pvg` never consumed an item — it stays in
+                        # the queue for stop()'s drain or a restarted loop.
+                        _ct = asyncio.current_task()
+                        if _ct is not None and _ct.cancelling() > 0:
+                            raise
                         item = await self._verifier_queue.get()
                 else:
                     item = await self._verifier_queue.get()
@@ -16385,6 +16786,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 keep_worktrees=set(self._owned_merge_worktrees),
                 runner=None if lease.is_local else lease.runner,
                 escalation_queue=self._escalation_queue,
+                # task 2886 fix 3 (PRD §3.4 / decision 4): thread the synchronous
+                # all-lane halt so a CONCLUDED cross-check divergence stops the
+                # queue the instant it is detected — BEFORE any further adoption —
+                # instead of trailing it via the async escalation gate (incident
+                # 83336a32 halted +3s too late).  Cross-check stays a trailing
+                # detector; the halt is synchronous only to precede further lands.
+                halt_hook=self.operator_halt,
                 dry_run_handles=self._dry_run_handles,
                 main_health_probe_handles=_MainHealthProbeHandles(
                     background_tasks=self._background_tasks,
@@ -18597,6 +19005,16 @@ def _alarm_resource_audit(
         'for multiple consecutive heartbeats:\n\n'
         + '\n'.join(f'- {v}' for v in violations)
         + '\n\n'
+        'AUTOMATIC RECLAIM HAS ALREADY FAILED HERE (task 3622). Any worktree '
+        'named above has outlived PERIODIC_REAP_MIN_AGE_SECS plus at least '
+        'RESOURCE_AUDIT_REAP_GRACE_SWEEPS periodic reaper sweeps, so '
+        '_maybe_reap_orphaned_merge_worktrees has already had multiple '
+        'SCHEDULED opportunities to destroy it and the tree is still on disk '
+        '— this is not a leak that is about to clean itself up. (A leak still inside '
+        'that reclaim window is logged and censused in '
+        "snapshot()['resource_audit'] but deliberately does not escalate.) "
+        'Leaked permits/cap slots have no automatic reclaim at all and '
+        'escalate from their first persisting heartbeat.\n\n'
         'The orchestrator has NOT halted or mutated any pipeline state — '
         'this is observation-only (PRD design decision 4).'
     )
@@ -18614,7 +19032,24 @@ def _alarm_resource_audit(
             "Inspect the merge worker's snapshot()['resource_audit'] key "
             '(speculation_accounting / worktree_ledger sub-lists) to '
             'identify the leaked permit, cap, or worktree; fix the code '
-            'path that failed to release it.'
+            'path that failed to release it. For a WORKTREE violation, start '
+            'by asking why the periodic reaper did not remove it — at least '
+            'two scheduled reaper sweeps have come and gone without it '
+            'disappearing. THREE known reasons: (1) a still-held verify lease '
+            "(remove_merge_worktree_guarded returns 'skipped_lease_held' and "
+            'skips the tree regardless of age — look for the lease holder '
+            'that never released); (2) a fail-open removal error '
+            "(cleanup_merge_worktree logs 'failed for <path> — leaving for a "
+            "later sweep' and continues, so grep the orchestrator log for "
+            'that line and the exception under it); (3) the sweep never '
+            'reached the tree at all — _maybe_reap_orphaned_merge_worktrees '
+            'consumes its rate-limit slot (_last_reap_at = now) BEFORE '
+            'awaiting the sweep, and _heartbeat_loop bounds that await with '
+            'asyncio.wait_for(_reap_sweep_timeout_s, 120s default), so a '
+            'timed-out or raising sweep burns an opportunity silently. Under '
+            '(3) NEITHER of the first two log lines exists; the line to grep '
+            "for is 'merge queue heartbeat: periodic reap failed'. Check (3) "
+            'before concluding the removal path itself is broken.'
         ),
     )
     escalation_queue.submit(esc)

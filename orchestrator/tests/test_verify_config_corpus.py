@@ -84,7 +84,7 @@ class TestRootScalarsMatchLiveYaml:
 class TestModuleLintCommandsMatchLiveYaml:
     """Each per-module ``lint_command`` is byte-identical to its live YAML value.
 
-    These six share one 2-segment shape — ``uv run --project M --directory M
+    These six share one 2-segment shape — ``uv run --directory M
     ruff check src/ tests/ && python3
     fused-memory/scripts/check_bare_magicmock_config.py M/tests`` — which is
     why the corpus can generate them from the module name. ``fused-memory`` is

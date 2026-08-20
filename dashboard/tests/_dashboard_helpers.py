@@ -8,13 +8,14 @@ the same process.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
 from collections.abc import Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import aiosqlite
 import httpx
@@ -658,3 +659,279 @@ async def make_recon_db(
     async with aiosqlite.connect(str(db_path)) as conn:
         conn.row_factory = aiosqlite.Row
         yield conn
+
+
+# ---------------------------------------------------------------------------
+# JSX source slicing.
+#
+# There is no JS runtime in this project, so the dashboard suite asserts
+# structural contracts against the *served* .jsx text.  Nearly every such
+# assertion must first scope itself to one function's body — otherwise a token
+# appearing anywhere else in the file satisfies it and the test proves nothing.
+#
+# These two helpers used to be private copies in nine test modules (task 3549),
+# under two names covering FOUR distinct implementations, so a fix had to be
+# applied nine times or not at all.  Their contract lives in
+# test_jsx_source_helpers.py.
+#
+# Both are built on ONE quote-aware scanner, `_scan_js`.  Giving them a scanner
+# each would re-create in miniature exactly the duplication this consolidation
+# removed — and they need the same answer to the same question: which stretches
+# of this text are NOT code?
+# ---------------------------------------------------------------------------
+
+
+class _JsSpan(NamedTuple):
+    """One stretch of JS source that is not code: a string literal or a comment.
+
+    ``end`` is exclusive.  ``opener`` is the quote character for a string span
+    and ``'//'`` / ``'/*'`` for a comment.  ``closed`` is False when the source
+    ran out before the span was terminated.
+    """
+
+    start: int
+    end: int
+    kind: str  # 'string' | 'comment'
+    opener: str
+    closed: bool
+
+
+def _scan_js(source: str) -> list[_JsSpan]:
+    """Return the string-literal and comment spans of *source*, in order.
+
+    Deliberately not a full JS lexer: a regex literal containing ``//`` or a
+    quote (``str.replace(/'/g, '')``), or a quote nested inside a template's
+    ``${...}``, would confuse it.  Neither occurs in the assets these helpers
+    are used on, and `_assert_js_lexable` turns the failure mode that WOULD
+    reach them — an apostrophe in JSX prose — into a loud error.
+    """
+    spans: list[_JsSpan] = []
+    i, n = 0, len(source)
+
+    while i < n:
+        ch = source[i]
+
+        if ch in '\'"`':
+            start = i
+            i += 1
+            closed = False
+            while i < n:
+                if source[i] == '\\':  # an escaped char cannot close the literal
+                    i += 2
+                    continue
+                if source[i] == ch:
+                    i += 1
+                    closed = True
+                    break
+                i += 1
+            spans.append(_JsSpan(start, min(i, n), 'string', ch, closed))
+            continue
+
+        if source[i : i + 2] == '//':
+            end = source.find('\n', i)
+            end = n if end == -1 else end
+            spans.append(_JsSpan(i, end, 'comment', '//', True))
+            i = end
+            continue
+
+        if source[i : i + 2] == '/*':
+            end = source.find('*/', i + 2)
+            spans.append(_JsSpan(i, n if end == -1 else end + 2, 'comment', '/*', end != -1))
+            i = n if end == -1 else end + 2
+            continue
+
+        i += 1
+
+    return spans
+
+
+def _assert_js_lexable(source: str, spans: Sequence[_JsSpan]) -> None:
+    """Raise if the scan hit a state that means it almost certainly misparsed.
+
+    THE FAILURE THIS EXISTS FOR is an apostrophe in JSX *text* — ``don't`` in a
+    label — which the scanner reads as an opening quote.  Everything up to the
+    next ``'`` anywhere later in the file is then treated as string contents,
+    so real comments inside it are left unstripped (prose leaks into what the
+    consumers call "code") and real braces inside it are not counted (a body is
+    mis-scoped).  Both are silent: the caller gets a plausible string back.
+
+    Two states betray it, and neither can occur in well-formed source that this
+    scanner actually understands:
+
+    * a literal still open at end-of-input;
+    * a non-template literal spanning a newline — JS forbids a raw newline in a
+      ``'``/``"`` literal, so this is a misparse, not a long string.
+
+    A template literal (backtick) legitimately spans lines and is exempt; there
+    is one in tabs.jsx.
+    """
+    def _line(index: int) -> int:
+        return source.count('\n', 0, index) + 1
+
+    _APOSTROPHE_HINT = (
+        'The likeliest cause is an apostrophe in JSX text (a label reading '
+        '`don\'t`), which this scanner reads as an opening quote — everything '
+        'after it is then treated as string contents, so comments inside it are '
+        'left unstripped and braces inside it are not counted, and the caller '
+        'gets a plausible-looking wrong answer. Reword the prose, or write the '
+        'apostrophe as `&apos;`. (A regex literal containing a quote, e.g. '
+        '`/\'/`, would also do it — see `_scan_js`.)'
+    )
+
+    for span in spans:
+        if not span.closed:
+            what = 'string literal' if span.kind == 'string' else 'block comment'
+            raise AssertionError(
+                f'Cannot scan this JS source: a {span.opener} {what} opened at '
+                f'line {_line(span.start)} is never closed. {_APOSTROPHE_HINT}'
+            )
+        if span.kind == 'string' and span.opener != '`' and '\n' in source[span.start : span.end]:
+            raise AssertionError(
+                f'Cannot scan this JS source: a {span.opener} literal opened at '
+                f'line {_line(span.start)} spans a newline (it appears to close at '
+                f'line {_line(span.end - 1)}). A raw newline is illegal inside a '
+                f'{span.opener} literal in JS, so this is a misparse rather than a '
+                f'long string. {_APOSTROPHE_HINT}'
+            )
+
+
+def _mask_js(source: str, spans: Sequence[_JsSpan]) -> str:
+    """Return *source* with every non-code span blanked, LENGTH PRESERVED.
+
+    Equal length is the whole point: the caller searches and walks the mask but
+    slices the ORIGINAL with the indices it finds, so the returned text is the
+    real source rather than a blanked copy.  Newlines survive so a line number
+    computed from the mask still means something.
+    """
+    chars = list(source)
+    for span in spans:
+        for k in range(span.start, span.end):
+            if chars[k] != '\n':
+                chars[k] = ' '
+    masked = ''.join(chars)
+    assert len(masked) == len(source), 'the mask must be index-aligned with the source'
+    return masked
+
+
+def extract_function_body(source: str, func_name: str) -> str:
+    """Return the brace-delimited body of a ``function <func_name>(`` declaration.
+
+    The returned slice starts at the body's opening ``{`` and ends at its
+    matching ``}``, both included — the SIGNATURE AND PARAMETER LIST ARE
+    EXCLUDED.  Only named ``function`` declarations are matched: an arrow
+    function bound to a const, and a class method spelled ``Foo(a) {``, carry
+    no ``function`` keyword and are misses.
+
+    The search and both depth walks run over a `_mask_js` copy of the source, so
+    a brace, paren or ``function`` keyword inside a STRING LITERAL OR A COMMENT
+    is not counted.  Without that, ``const s = '}'`` inside a body ends the
+    brace walk early and the caller gets a truncated, unbalanced slice — every
+    absence assertion over which then passes vacuously, which is the same
+    permanent false GREEN the raise-on-miss rule below exists to prevent.  The
+    mask is index-aligned with the source, so the slice returned is the real
+    text, comments and literals intact.
+
+    Paren-depth walks past the parameter list before looking for the body's
+    opening ``{`` — a destructured parameter (``function Foo({ a, b }) {``)
+    contains its own ``{``/``}`` pair *inside* the parameter list, so naively
+    taking the first ``{`` after the opening ``(`` would return just the
+    destructuring pattern (e.g. ``{ a, b }``) instead of the function body.
+
+    The search regex is deliberately NOT line-anchored, so a declaration
+    NESTED inside another function is found and scoped to its own body (the
+    real instance is ``function statusMatches(s) {`` indented inside
+    ``TasksTab`` in tab_tasks.jsx).  Its trailing ``\\s*\\(`` is equally
+    load-bearing in the other direction: without it a prefix sibling declared
+    earlier would shadow the target — ``function TaskGraphEdges(`` at
+    tab_tasks.jsx:33 precedes ``function TaskGraph(`` at :151.
+
+    RAISES ``AssertionError`` on any miss rather than returning ``''``.  An
+    empty body makes every downstream ABSENCE assertion pass vacuously, which
+    is a permanent false GREEN that no amount of care at the call site can
+    detect; a loud failure naming the function is strictly better.
+    """
+    def _miss(what: str) -> AssertionError:
+        return AssertionError(
+            f'Could not locate the `function {func_name}(` body: {what}. Either '
+            f'the function was removed or renamed, or it was rewritten as an '
+            f'arrow function or a class method — neither is matched, only a '
+            f'named `function` declaration is. This cannot silently return an '
+            f'empty body: an absence assertion over one would pass vacuously.'
+        )
+
+    spans = _scan_js(source)
+    _assert_js_lexable(source, spans)
+    masked = _mask_js(source, spans)
+
+    match = re.search(rf'\bfunction\s+{re.escape(func_name)}\s*\(', masked)
+    if match is None:
+        raise _miss('no such declaration in this source')
+
+    paren_depth = 1
+    i = match.end()
+    while i < len(masked) and paren_depth > 0:
+        if masked[i] == '(':
+            paren_depth += 1
+        elif masked[i] == ')':
+            paren_depth -= 1
+        i += 1
+    if paren_depth != 0:
+        raise _miss('its parameter list is never closed')
+
+    start = masked.find('{', i)
+    if start == -1:
+        raise _miss('no opening brace follows its parameter list')
+
+    depth = 0
+    for j in range(start, len(masked)):
+        char = masked[j]
+        if char == '{':
+            depth += 1
+        elif char == '}':
+            depth -= 1
+            if depth == 0:
+                return source[start : j + 1]
+    raise _miss('its body brace is never closed')
+
+
+def strip_js_comments(source: str) -> str:
+    """Return *source* with every JS/JSX comment blanked, string literals intact.
+
+    The probes built on these helpers are plain substring/regex searches, so
+    without this they also match PROSE.  That coupling deformed the production
+    source once already: charts.jsx carried a comment whose content was an
+    apology for what it could not say, because naming the very expression the
+    component had just stopped using would fail CI with a message claiming the
+    component "still contains hole-blind scale/path arithmetic" — pointing at a
+    comment.  A comment is exactly where that expression SHOULD be quotable.
+
+    Quote-aware rather than a bare regex: blanking from a ``//`` inside a string
+    literal (a URL, say) to end-of-line would delete real CODE, and an absence
+    assertion over deleted code is a permanent false GREEN.  All three quote
+    styles (``'``, ``"``, backtick) are tracked, and an escaped character inside
+    a literal cannot close it.
+
+    Each comment is replaced by a SINGLE SPACE rather than removed outright, so
+    two previously separated tokens can never be spliced into a new match.
+
+    Deliberately not a full JS lexer (see `_scan_js` for the exact blind spots).
+    The one it is most likely to meet — an apostrophe in JSX text, which reads
+    as an opening quote and leaves every comment up to the next ``'`` in the
+    file unstripped — is not silently tolerated: `_assert_js_lexable` RAISES on
+    it.  A missed comment is a false RED for an absence probe and a false GREEN
+    for a presence one, and neither is visible at the call site.
+    """
+    spans = _scan_js(source)
+    _assert_js_lexable(source, spans)
+
+    out: list[str] = []
+    prev = 0
+    for span in spans:
+        if span.kind != 'comment':
+            continue  # a string literal is passed through verbatim
+        out.append(source[prev : span.start])
+        out.append(' ')
+        prev = span.end
+    out.append(source[prev:])
+
+    return ''.join(out)

@@ -79,8 +79,18 @@ WATCHDOG_UNIT_NAME = "orchestrator-watchdog.service"
 # exact-equality drift tests). It needs a richer probe than a bare port
 # check: the in-process systemd watchdog thread pings WATCHDOG=1 from a
 # dedicated OS thread unconditionally (task 1731), so a wedged asyncio loop
-# still looks "healthy" to systemd forever — only an HTTP /health fetch can
-# catch that. See fused_memory_liveness_pass() / probe_health() below.
+# still looks "healthy" to systemd forever — only an HTTP fetch SERVED BY THAT
+# LOOP can catch it. See fused_memory_liveness_pass() / probe_health() below.
+#
+# The kill decision fetches /alive, NOT /health (task 3765). /health awaits two
+# sequential backing-store round-trips, which makes it a LOAD measurement: a
+# slow FalkorDB/Qdrant, or a busy-but-advancing loop, manufactured a false
+# "wedged" verdict. /alive is a zero-I/O route served by the SAME asyncio loop,
+# so the argument above is preserved intact — a genuinely hung loop still fails
+# to answer it and is still killed — while the false wedge disappears.
+# /health remains the READINESS signal, consumed by --report's recon-busy
+# column and _fused_memory_recon_busy_verdict()'s restart gate, which need the
+# recon_busy body that /alive by construction does not carry.
 FUSED_MEMORY_UNIT = "fused-memory.service"
 # Port value matches fused-memory/config/config.yaml's server.port (guarded
 # by the drift test in tests/scripts/test_orchestrator_watchdog.py).
@@ -92,6 +102,43 @@ FUSED_MEMORY_HEALTH_URL = f"http://127.0.0.1:{FUSED_MEMORY_PORT}/health"
 # ~10s worst case with margin, so only a genuinely wedged loop (no response
 # at all) times out here.
 FUSED_MEMORY_HEALTH_TIMEOUT_SECS = 15
+
+# The KILL decision's probe target (task 3765). /alive is a zero-I/O route
+# (fused_memory/server/tools.py, registered beside /health) that touches no
+# backing store, no harness and no disk — being served at all IS the signal.
+# It is served by the SAME asyncio loop as /health, so it still catches the
+# wedge the task-1731 rationale above describes, while a slow FalkorDB/Qdrant
+# no longer reads as one. The path is pinned against the server's actual
+# registered routes by the drift test in
+# tests/scripts/test_orchestrator_watchdog.py.
+#
+# WHAT A TYPO'D PATH ACTUALLY COSTS (be precise here — the obvious reading is
+# wrong): it does NOT disable the kill decision. A 404 is still SERVED BY THE
+# ASYNCIO LOOP, so a wedged loop answers a mistyped path exactly as it answers
+# a correct one — i.e. not at all — and is still classified 'wedged' and
+# killed. A typo merely degrades the probe from "zero-I/O route served" to
+# "router 404 served"; both are valid liveness signals, so restart behaviour is
+# unchanged. (That is also why the rollout window — this watchdog deployed from
+# the repo before fused-memory.service restarts with the new route — is safe.)
+# The drift test therefore exists to keep the probe pointed at the INTENDED
+# zero-I/O route, not to stop the detector going blind. Do NOT "fix" this by
+# making probe_health() reject non-200: that would resurrect the exact
+# false-wedge class this task removed, since /health's 503-means-degraded-but
+# -alive would start reading as dead.
+FUSED_MEMORY_ALIVE_URL = f"http://127.0.0.1:{FUSED_MEMORY_PORT}/alive"
+# DELIBERATELY NOT SHORTENED below the /health budget, despite /alive doing no
+# I/O. Shortening it would trade one false-positive class for another: a 25s
+# event-loop stall blocks /alive exactly as it blocks /health, and those
+# transient stalls are measured, not hypothetical (2026-08-06 controlled
+# window: /health exceeded 15s four times in 2h, peaks of 23.5s and 25s+ —
+# every one SELF-RECOVERED). That class is absorbed by task 3764's consecutive
+# -failure streak, not by this timeout; this task removes only the
+# backing-store class of false wedge and must not reintroduce another.
+# Kept as its OWN constant rather than reusing FUSED_MEMORY_HEALTH_TIMEOUT_SECS
+# because that 15s is justified in-comment by /health's two sequential 5s store
+# probes — a rationale that does not apply here — so the two budgets can be
+# retuned independently without one's reasoning silently governing the other.
+FUSED_MEMORY_ALIVE_TIMEOUT_SECS = 15
 
 # Working directory shared by every orchestrator-*.service unit; the repo the
 # staleness pass diffs against.
@@ -439,9 +486,7 @@ def probe_port(port: int) -> bool:
     return False
 
 
-def probe_health(
-    url: str = FUSED_MEMORY_HEALTH_URL, timeout: float = FUSED_MEMORY_HEALTH_TIMEOUT_SECS
-) -> bool:
+def probe_health(url: str, timeout: float) -> bool:
     """Return True iff *url* returns ANY HTTP response within *timeout* seconds.
 
     Deliberately inverted fail-direction vs. probe_port(): probe_port defaults
@@ -462,6 +507,26 @@ def probe_health(
     hung asyncio loop never trips systemd's own watchdog) manifests as no
     HTTP response at all within the timeout — that is the only case that
     should return False here.
+
+    ROUTE-NEUTRAL BY CONSTRUCTION — *url* AND *timeout* ARE REQUIRED (task
+    3765). Despite the name, this asks only "does this URL answer at all"; it
+    knows nothing about /health's body or semantics. It deliberately carries NO
+    defaults, because the obvious ones are a live footgun: after task 3765 the
+    sole production caller is the kill decision (_fused_memory_liveness_verdict,
+    which passes FUSED_MEMORY_ALIVE_URL + FUSED_MEMORY_ALIVE_TIMEOUT_SECS), and
+    a FUSED_MEMORY_HEALTH_URL default would leave a bare ``probe_health()`` one
+    keystroke away from silently reinstating the load-dependent readiness probe
+    inside a liveness decision — precisely the defect that task removed. The
+    constants-and-verdict drift tests would not catch that, so the signature
+    does: there is nothing to fall back TO, and every caller must name its
+    route. (The /health BODY has its own consumer, _fused_memory_recon_busy_verdict(),
+    which bypasses this helper and calls urlopen directly because it needs the
+    recon_busy payload rather than a yes/no.)
+
+    ONE FAIL-DIRECTION, CORRECT FOR EITHER ROUTE. The inversion above stays
+    untouched: /alive returns only 200, so its "responded at all" reading is
+    trivially the same signal, and /health's 503-means-alive reading is exactly
+    what keeps a degraded store from being mistaken for a dead loop.
     """
     try:
         with urllib.request.urlopen(url, timeout=timeout):
@@ -483,13 +548,29 @@ def _fused_memory_liveness_verdict() -> str:
     (which restarts on anything but 'healthy') and _print_fused_memory_liveness()
     (the --report row).
 
+    MEASURES ALIVENESS, VIA THE ZERO-I/O /alive ROUTE (task 3765). /health is
+    deliberately NOT consulted here: it awaits two sequential backing-store
+    round-trips (FalkorDB then Qdrant, each under asyncio.timeout(5)), which
+    makes any verdict drawn from it a LOAD measurement rather than a liveness
+    one — a slow store or a busy-but-advancing loop manufactured a false
+    'wedged' and got the single shared MCP server restarted for nothing. The
+    detector survives the swap because /alive is served by the SAME asyncio
+    loop, so a genuinely hung loop still fails to answer it (task 1731: the
+    systemd WATCHDOG=1 ping runs on a dedicated OS thread and so can never
+    catch a hung loop; only an HTTP fetch served by that loop can).
+
+    /health remains the READINESS signal and keeps its own consumers:
+    _fused_memory_recon_busy_verdict() (which needs the recon_busy body that
+    /alive by construction does not carry) and, through it,
+    _print_fused_memory_liveness()'s recon-busy column.
+
     The port probe runs first and short-circuits before the (up to 15s)
-    health fetch, so a fully-dead unit is classified quickly without waiting
+    /alive fetch, so a fully-dead unit is classified quickly without waiting
     on probe_health()'s timeout.
     """
     if not probe_port(FUSED_MEMORY_PORT):
         return "port-down"
-    if probe_health():
+    if probe_health(FUSED_MEMORY_ALIVE_URL, timeout=FUSED_MEMORY_ALIVE_TIMEOUT_SECS):
         return "healthy"
     return "wedged"
 
@@ -1367,7 +1448,7 @@ def fused_memory_liveness_pass() -> None:
     WATCHED and main()'s loop are pinned by exact-equality drift tests. This
     sibling pass reuses is_unit_enabled + STARTUP_GRACE_SECS gating verbatim
     from main(), and _fused_memory_liveness_verdict() (B2) for the combined
-    port+/health verdict.
+    port+/alive verdict.
 
     THE KILL DECISION IS BOUNDED IN TIME (task 3764). A restart requires
     FM_LIVENESS_STREAK_THRESHOLD CONSECUTIVE non-healthy verdicts — 'port-down'
@@ -1389,13 +1470,22 @@ def fused_memory_liveness_pass() -> None:
     genuinely wedged asyncio loop (wedged by definition) still reaches it on
     the third tick.
 
+    COMPLEMENTARY TO /alive (task 3765). The verdict's HTTP probe now targets
+    the zero-I/O /alive route instead of /health. The two mitigations remove
+    DIFFERENT false-positive classes and neither is sufficient alone: /alive
+    removes the BACKING-STORE class (a slow FalkorDB/Qdrant reading as a
+    wedge), while this streak removes the TRANSIENT-STALL class (an
+    event-loop stall long enough to blow any timeout, which blocks /alive
+    exactly as it blocked /health). That is why the /alive budget was NOT
+    shortened below the /health one — see FUSED_MEMORY_ALIVE_TIMEOUT_SECS.
+
     DELIBERATELY UNCHANGED:
       - probe_health()'s inverted fail-direction — an HTTP response INCLUDING
         a 503 means alive, since a degraded backing store is not something a
         restart fixes;
       - _fused_memory_liveness_verdict()'s port-probe short-circuit, so a
         fully-dead unit is still classified without waiting on the up-to-15s
-        /health fetch;
+        /alive fetch;
       - the is_unit_enabled and STARTUP_GRACE_SECS gates above, which still
         return before any streak read or write (operator intent and a
         not-yet-bound port are neither failure evidence nor recovery);
@@ -1948,18 +2038,29 @@ def _fused_memory_recon_busy_verdict() -> str:
 def _print_fused_memory_liveness() -> None:
     """Print a single labelled fused-memory row for ``--report``.
 
+    THE ROW DELIBERATELY SHOWS TWO DIFFERENT SIGNALS (task 3765): ALIVENESS
+    (is the asyncio loop still serving?) from the zero-I/O /alive fetch, and
+    READINESS (are the backing stores usable?) from the recon-busy /health
+    fetch. So a row can legitimately read "healthy" while a store is degraded
+    — that combination is the whole point of the split, not an inconsistency.
+    The label names /alive because that is where the verdict actually comes
+    from: this row is the operator's answer to "why did / did not the watchdog
+    kill fused-memory", so naming a route the verdict no longer consults would
+    send them to inspect the wrong signal.
+
     Strictly read-only, mirroring report()'s I7/I8 guarantee. Three fields,
     all read-only:
       - liveness verdict via _fused_memory_liveness_verdict() (port probe +
-        /health fetch only — no is_unit_enabled/STARTUP_GRACE_SECS gating,
+        /alive fetch only — no is_unit_enabled/STARTUP_GRACE_SECS gating,
         since report() likewise shows every unit's raw verdict
         unconditionally);
       - DEPLOY-AGE from fused-memory's OWN deploy clock
         (_read_last_fm_deploy_epoch), rendered hours-to-one-decimal exactly
         like report()'s DEPLOY-AGE column, or 'unknown' when the fm clock has
         never been stamped / is unreadable (fail-open);
-      - recon-busy via _fused_memory_recon_busy_verdict() (fail-soft
-        'unknown');
+      - recon-busy via _fused_memory_recon_busy_verdict(), still sourced from
+        a /health fetch (fail-soft 'unknown') — /alive carries no recon_busy
+        body by construction, so this column was deliberately NOT repointed;
       - streak from _read_fm_liveness_streak(), rendered
         "<count>/<FM_LIVENESS_STREAK_THRESHOLD>" or 'none' (task 3764) — this
         is what lets an operator answer "why didn't the watchdog restart
@@ -2020,7 +2121,7 @@ def _print_fused_memory_liveness() -> None:
         log(f"could not read the {FUSED_MEMORY_UNIT} liveness restart clock: {exc}")
         restart_age_str = "unknown"
     print(
-        f"{FUSED_MEMORY_UNIT} liveness (port {FUSED_MEMORY_PORT} + /health): "
+        f"{FUSED_MEMORY_UNIT} liveness (port {FUSED_MEMORY_PORT} + /alive): "
         f"{verdict} | DEPLOY-AGE: {deploy_age_str} | recon-busy: {recon_busy} "
         f"| streak: {streak_str} | LIVENESS-RESTART-AGE: {restart_age_str}"
     )

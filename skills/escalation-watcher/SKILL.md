@@ -106,6 +106,7 @@ Parse the printed lines: `decision=<acquired|stand-down|proceed>`, a human-reada
   python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py write-decision \
     --id watcher-lease-orphan-<project> --project <project> \
     --text "watcher-<project> lease held by orphaned holder <holder_slug> (pid <holder_pid> not running, heartbeat <n>s ago); no live L2 consumer until it is reclaimed" \
+    --escalations-dir <project_root>/data/escalations \
     --session-id "watcher-<project>-${CLAUDE_PID:-unknown}"
   ```
 
@@ -215,12 +216,23 @@ Check for all pending L2 escalations — **compact** to keep context small:
 mcp__escalation__get_pending_escalations(level=2, compact=True)
 ```
 
-`compact=True` returns the triage fields (`id`, `task_id`, `category`, `severity`, `level`,
-`status`, `summary`, `suggested_action`, `timestamp`) plus the triage-ack annotation fields
-(`triaged_at`, `triaged_by`, `triage_note`, `updated_at` — see "Reading a triage-ack annotation"
-below), and drops the heavy free-text/cluster fields (`detail`, `members`, `options`, `root_cause`,
-`train_state`, …). Triage from that; fetch the full record with `get_escalation(id)` **only** for
-the one item you're about to act on — and prefer doing that full read inside the handling sub-agent
+`compact=True` returns the triage fields plus the triage-ack annotation fields (`triaged_at`,
+`triaged_by`, `triage_note`, `updated_at` — see "Reading a triage-ack annotation" below), and
+drops the heavy free-text/cluster fields (`detail`, `options`, `train_state`, …). The tool's own
+docstring carries the authoritative list — read it there rather than trusting a copy in this
+file, which is how this paragraph went stale before.
+
+**`root_cause` and `member_ids` ARE returned** (task 3997) — they were dropped until then.
+Operationally that is what makes a drain self-sufficient: you can rebuild the already-promoted
+set as {`root_cause` of the pending L2s} ∪ {their `member_ids`} from the drain ALONE, so a
+rotation that inherits no session memory does not re-promote a cluster its predecessor already
+promoted. `member_ids` is the projection of the record's `members` list; the raw `members` key
+stays dropped, as does `detail` — the unbounded free-text field compact mode exists to keep out
+of your context.
+
+Triage from that; fetch the full record with `get_escalation(id)` **only** for
+the one item you're about to act on (and when you do, read its `amendments` —
+see "Reading preserved framing" below) — and prefer doing that full read inside the handling sub-agent
 (see Context Conservation). During an AFK window the pending pile grows, and a full-dict drain every
 cycle is the dominant context sink — `compact=True` is what keeps a long-running session alive.
 
@@ -385,23 +397,55 @@ already reads it breaks.
 ```bash
 python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py write-decision \
   --id <stable-id> --project <project> --text "<one-line question>" \
+  --escalations-dir <project_root>/data/escalations \
   [--task-id <task_id>] [--escalation-id <escalation_id>] \
   [--session-id "watcher-<project>-${CLAUDE_PID:-unknown}"] \
-  [--severity <esc.severity>] [--escalations-dir <project_root>/data/escalations]
+  [--severity <esc.severity>]
 ```
 
 - **`--id`**: a stable id you can recompute idempotently for the same pending item — the
   escalation id (`esc-42-1`) is usually the natural choice. Re-filing the same id overwrites the
-  prior record rather than duplicating it (`write-decision` always writes the whole file).
-  **INTERIM RULE — check before you overwrite.** Decision ids are fleet-global, so *another*
-  watcher (notably the recon watcher, which runs its own queue) may already have filed a decision
-  for the same underlying human gate under this id. Before filing, check whether a decision for
-  that id already exists and is still `open`; if it is, do **not** overwrite it — a second watcher
-  observing the same gate must enrich or no-op, never clobber richer context or downgrade an
-  existing record's severity. Park your own record and add the id to your handled set instead.
+  prior record rather than duplicating it.
+  **You no longer have to pre-check before filing (task 3559).** Decision ids are fleet-global, so
+  *another* watcher (notably the recon watcher, which runs its own queue) may already have filed a
+  decision for the same underlying human gate under this id. The verb now handles that for you: if
+  an `open` record already exists at this id and was filed from a **different** `--escalations-dir`,
+  your filing **enriches** it instead of overwriting — non-empty fields survive, fields the first
+  filer left empty are filled from yours, `severity` takes the **max** of the two and is never
+  downgraded, and `filed_at`/`state`/`manual_boost` stay with the first filer (so you cannot reset
+  an operator's cockpit boost or re-open a closed row). Just file; you do not need to look first.
+  **One field is exempt from "empty ones are filled": `--escalation-id`.** It travels *with*
+  `--escalations-dir` as a pair and is never filled from the other filer across a queue boundary,
+  because `esc-<taskid>-<n>` ids are unique only within one queue and the reaper joins on the
+  (queue, id) pair — a borrowed id would resolve against an unrelated escalation in the adopting
+  queue. Two things that means for you:
+  - Always pass `--escalation-id` alongside `--escalations-dir`: they name the id and the namespace
+    it lives in, and a filing that supplies the queue but not the id cannot upgrade a legacy
+    unstamped record.
+  - If a legacy record already holds a *different* escalation id under an unknown queue, your
+    filing is refused with a `WARNING` and the record deliberately stays a visible cockpit row
+    rather than being silently repointed — that is the fail-OPEN direction, and the remedy is the
+    back-fill (`scripts/backfill_decision_queue_stamp.py`), which actually investigates provenance.
+
   (Observed with `esc-5914-1`, where both queues surfaced the same reify gate; that duplicate
   landing on one id is the *correct* outcome — one question, one cockpit row — but only if the
   second filer doesn't degrade the first one's record.)
+  Two deliberate limits: a re-file from the **same** queue is still a plain idempotent whole-file
+  overwrite — that is the restart promise above, and you are the sole authority on your own
+  escalation — and only an `open` record is protected, since a filing against an `answered` one is
+  a new ask rather than an enrichment of a live question. Even that same-queue overwrite holds
+  `filed_at` and `manual_boost` back, though: queue age and the operator's cockpit boost are never
+  yours to revise, so your restart cannot bump a row to the top of the age ordering or silently
+  drop a boost an operator set between your two filings.
+
+  **Across *projects*, a shared id is a collision, not a shared gate.** Decision ids are
+  fleet-global while `esc-<taskid>-<n>` numbering restarts per project, so `esc-42-1` under two
+  different `--project` values names two unrelated gates. A filing whose `--project` differs from
+  the `open` record already at that id is therefore **refused** with an `ERROR` — nothing written,
+  rc still 0 — because merging would hide your ask inside the other project's cockpit row and
+  overwriting would delete that row. Your ask still reaches the human through the in-session note
+  / afk-digest line this filing accompanies; if you need the cockpit row too, re-file under an id
+  that is unique fleet-wide.
 - **`--text`**: the one-line question a human needs to answer — the same summary you'd otherwise
   only give in-session or in the digest.
 - **`--task-id` / `--escalation-id` / `--session-id`**: thread through whatever you have — the
@@ -411,17 +455,24 @@ python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py wri
   `info`/`blocking`/`critical`/`urgent`). This now weights the cockpit decision-queue rank, so a
   freshly-filed `critical`/`urgent` park surfaces at the top of the queue instead of being buried
   under stale awaiting-input sessions.
-- **`--escalations-dir`**: the escalation **queue** your `--escalation-id` belongs to — for this
-  watcher, `<project_root>/data/escalations`. It must name the SAME queue you later pass to
+- **`--escalations-dir`** (**mandatory**): the escalation **queue** your `--escalation-id` belongs
+  to — for this watcher, `<project_root>/data/escalations`. It must name the SAME queue you later pass to
   `reap-decisions` (below). Decision records are fleet-global while an escalation id
   (`esc-<taskid>-<n>`) is unique only *within* one queue, and a project can run several
   (dark_factory also runs `data/reconciliation/escalations` over the same id namespace), so this is
   what lets the reaper join a decision back to the right per-queue id namespace instead of matching
   an unrelated same-named escalation. Stored normalized, so any spelling of the same directory
-  works. Omitting it files a queue-less record — see the reaper caveat below.
+  works. **You can no longer file without it** (task 3559): omit the flag and the verb exits 2 with
+  nothing filed, and pass it empty and it refuses with a loud error and prints no id — so if the id
+  doesn't come back on stdout, your filing did not land. There is no watcher for which this is a
+  burden: it is the same directory you already pass to `reap-decisions`.
   There is a third value the field can hold: `<unknown>` (`session_registry.UNKNOWN_QUEUE`) —
-  "this record's owning queue was investigated and could not be determined". You never write it;
-  task 3640's back-fill did, for legacy records whose escalation id resolved in several queues at
+  "this record's owning queue was investigated and could not be determined". You never write it —
+  and that is now enforced, not just asked: `write-decision` **rejects**
+  `--escalations-dir <unknown>` outright, because a record stamped that way is refused by *every*
+  reaper and could only ever be closed by hand. It stays valid on the back-fill path
+  (`set_decision_escalations_dir`), which is where task 3640 wrote it, for legacy records whose
+  escalation id resolved in several queues at
   once. It is **not** a respelling of the queue-less `''` state: `''` means *nobody told us* and
   falls back to project-only scoping, while `<unknown>` means *we looked and could not tell* and
   the reaper refuses to close it at all.
@@ -455,11 +506,17 @@ The join is scoped on **two** axes, project *and* queue: a decision stamped (via
 here is skipped outright, so your reaper can never close the recon watcher's decisions against
 your own same-named escalations. A decision filed **without** `--escalations-dir` — every record
 predating that flag — falls back to project-only scoping and therefore has **no** such protection:
-it can still be closed by whichever queue's reaper reaches it first. That is the reason to always
-pass the flag when filing. Task 3640 then **back-filled** the pre-existing open population, so
-that unprotected set is now drained rather than merely shrinking as new records are filed — but
-only for records that existed at back-fill time. A decision you file today without the flag lands
-straight back in it.
+it can still be closed by whichever queue's reaper reaches it first. Task 3640 **back-filled** that
+pre-existing open population, and task 3559 made the flag mandatory at the verb, so the unprotected
+set can no longer regrow through `write-decision` — which is what makes the back-fill terminal
+rather than a recurring chore. It can now only shrink.
+
+On a **MODE 2** cross-queue collapse — both queues surfacing the *same* human gate onto one
+decision id (see the recon watcher's MODE 1 / MODE 2 taxonomy) — the stamp that survives is the
+**first** filer's queue, since a second filing enriches rather than overwrites. The field holds one
+queue, not a list, so the other queue's reaper still skips that record; the trade is that the
+outcome is now deterministic (first filer) instead of depending on who happened to write last. The
+verb logs a warning naming both queues when it discards one.
 
 A decision stamped `<unknown>` is **refused**, not closed: its owning queue was investigated and
 could not be determined, so *no* reaper may close it and it stays a visible cockpit row until a
@@ -825,7 +882,8 @@ above — **a starting point, not a verdict**.
 - `triaged_at` is older than roughly 6 hours, or
 - the record changed since triage — `updated_at` is **not** `None` **and** is newer than
   `triaged_at` (e.g. the L2 cluster gained a new member via `promote_to_l2` after the stamp was
-  written). `updated_at` defaults to `None` (never bumped) until the record's first real content
+  written, its severity was promoted, or a later fold carried in NEW FRAMING — see "Reading
+  preserved framing" below). `updated_at` defaults to `None` (never bumped) until the record's first real content
   change, so a triaged record with no changes since still reads `updated_at = None` — treat that as
   "not newer than `triaged_at`", never as an ordering comparison between `None` and a timestamp
   string.
@@ -842,6 +900,41 @@ cost two churn cycles and five separate `resolve_issue` calls before the item wa
 cannot be spoofed by the caller — the identical non-spoofable attribution contract this skill
 already documents for `resolved_by` (see "Recognizing the supervised auto-watcher's resolutions"
 below).
+
+### Reading preserved framing (`amendments`)
+
+A pending L2 is a **cluster**, and `escalation-watcher-auto` re-promotes the same cluster every
+time it finds more L1s matching that root cause. Each of those folds carries its own
+`root_cause`/`evidence`/`options`/`summary` — the promoting rotation's current read of the problem,
+which is often sharper than the first one. Until task 3997 all of it was discarded on the floor
+(measured: 336,875 characters). It is now kept.
+
+**When you pull the full record with `get_escalation(id)`, read `amendments` alongside the record's
+own framing.** The two are different things and the distinction is the whole point:
+
+- The record's OWN `root_cause` / `detail` / `options` / `summary` are the **original** framing,
+  from the promote that minted the L2. They are immutable — a fold never overwrites them, so the
+  decision context a human started reading cannot shift under them.
+- `amendments` is an append-only list of what **later folds** carried in, oldest first, each with
+  the `agent_role` that submitted it and a queue-stamped `timestamp`. The **last** entry is the
+  most recent read of the cluster; if it disagrees with the record's own framing, that disagreement
+  is the signal — either the cluster drifted, or root-cause matching folded in something that does
+  not belong.
+- Framing byte-identical to what the record already says is **not** re-recorded, so every entry
+  present is a genuine reframing rather than a re-promote echo.
+
+Two counters say what was NOT kept — check them before treating the list as complete:
+
+- `amendments_truncated > 0` — older entries were shed at the cap (oldest-first). The record's own
+  original framing is unaffected; only intermediate reframings were lost.
+- `amendments_chars_elided > 0` — individual fields were long enough to be clipped at the per-field
+  cap. Elision is marked in-band (`[... N char(s) elided ...]`), so a field ending in that marker is
+  the head of what was submitted, not all of it.
+
+A sustained burst of truncation files its own `info` infra escalation (under the synthetic
+`l2-amendment-truncation` task anchor, not against any real task) saying either the cap is too low
+for the live fold rate or root-cause matching is over-folding unrelated clusters into one L2. If you
+see one, the named L2s are where to look.
 
 ### `review_suggestions` (info)
 

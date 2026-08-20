@@ -76,8 +76,15 @@ from fused_memory.services.memory_metadata_census import (
     file_unknown_key_storm_escalation,
 )
 from fused_memory.utils.async_utils import gather_collect, gather_or_raise
+from fused_memory.utils.canonical_labels import Referent
+from fused_memory.utils.referent_resolution import (
+    REFERENT_SOURCES,
+    ReferentResolution,
+    ReferentSet,
+    resolve_referents,
+)
 from fused_memory.utils.task_naming import canonicalize_task_node_name
-from fused_memory.utils.validation import require_full_uuid
+from fused_memory.utils.validation import _safe_repr, require_full_uuid
 
 if TYPE_CHECKING:
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
@@ -460,18 +467,27 @@ async def _apply_memory_metadata_validation(
     parent_lookup: Callable[[str, str], Awaitable[dict | None]],
     count_canonical: Callable[[str, dict], Awaitable[int]],
     find_canonical: Callable[..., Awaitable[list[dict]]],
+    baseline: dict | None = None,
 ) -> None:
     """Validate the Mem0 metadata vocabulary at the write boundary, in place.
 
     Task 3195 (leaf β of ``docs/prds/memory-metadata-vocabulary.md``).  The
     third of this module's shared in-place metadata helpers, alongside
     :func:`_normalize_task_id_metadata` and
-    :func:`_apply_cycle_summary_metadata_tagging`, and shared by
-    ``add_memory`` and ``add_system_record`` for the same reason the
-    task-2222 amendment made the cycle-summary tagging shared: PRD D8/§2 pin
-    enforcement at the SERVICE seam precisely because ``add_system_record``
-    is a second write path that a tools-layer validator would leak past.
-    Two call sites with drifting behaviour would reopen that hole.
+    :func:`_apply_cycle_summary_metadata_tagging`, and shared by ALL THREE
+    Mem0 write paths — ``add_memory``, ``add_system_record`` and (task 3523)
+    ``update_memory`` — for the same reason the task-2222 amendment made the
+    cycle-summary tagging shared: PRD D8/§2 pin enforcement at the SERVICE
+    seam precisely because ``add_system_record`` is a second write path that
+    a tools-layer validator would leak past.  Call sites with drifting
+    behaviour would reopen that hole.
+
+    ``update_memory`` is the third such path and reproduced exactly that
+    leak until task 3523: a patch could set any ``topic`` spelling or a
+    second ``canonical`` for a taken topic without ever reaching this
+    function.  D8/§2 enumerated only the two add paths, and that silence
+    read as coverage.  If a FOURTH write path appears, it belongs here too —
+    the enumeration above is the checkable list.
 
     Discharges five obligations:
 
@@ -488,6 +504,50 @@ async def _apply_memory_metadata_validation(
        above: malformed metadata is refused on shape before any live-state
        probe is spent on it.
 
+    ``baseline`` — JUDGE THE DELTA, NEVER THE CORPUS (task 3523).  The two
+    add paths CREATE a record, so there is no pre-image: they pass no
+    ``baseline`` and every obligation above applies to the whole dict,
+    bit-identically to before this parameter existed.  ``update_memory``
+    AMENDS one, and passes the record's pre-image custom subset.  When it is
+    supplied, obligations 2 through 5 are reduced to what this write actually
+    CHANGED — a violation the record already carried (on a key this write
+    left alone) is neither re-censused nor re-rejected, the ``parent_id``
+    liveness probe fires only for a parent this write ASSERTS, and the
+    uniqueness probe fires only for a ``canonical``/``topic`` claim the
+    record does not already hold.
+
+    That reduction has THREE implementation sites, not one, because the
+    rules reach live state differently.  Obligations 3 and 4 are reduced by
+    the ``(key, code)`` subtraction below; obligation 5 by
+    :func:`_check_canonical_uniqueness`'s guard 3; obligation 2 by its own
+    claim-is-NEW gate on the liveness block, because the subtraction
+    structurally cannot see liveness codes (the pure validator cannot
+    produce them) and would let both survive every patch.  A fourth rule
+    that reads live state needs its own gate too — the subtraction will not
+    cover it.
+
+    That reduction is not a leniency knob; it is what keeps ``enforce``
+    meaning "reject WRITES" instead of quietly becoming "re-validate the
+    corpus".  Both PRD §9 leaf ε's 2026-08-04 amendment and
+    :func:`_check_canonical_uniqueness` state that model in prose, and task
+    3626's decision to flip ``enforce`` on is measured against it (~20 → ~19
+    false rejections/week).  Validating the full effective dict on every
+    patch would silently invalidate that measurement: legacy records are
+    known fatal-invalid today (``scripts/sweep_toolcall_xml_leak.py``
+    enumerates the classes — unknown ``kind``, malformed ``supersedes``,
+    non-bool ``canonical``), so re-tagging exactly those records would start
+    failing the moment the flip landed.  ``scripts/retro_stamp_topics.py``
+    is the in-repo bulk re-tagger that would hit it: it stamps ``topic``
+    onto legacy records through THIS path, one metadata-only patch each.
+    (That sweep is cited for the enumeration and for the re-tagging
+    exposure, NOT as a caller of this arm — it repairs by delete + re-add
+    through ``add_memory`` and pre-checks with ``validate_memory_metadata``
+    itself, so it never reaches ``update_memory``.)  Costs one extra PURE
+    synchronous
+    ``validate_memory_metadata`` call on a shallow copy, and zero I/O; see
+    the block comment at the subtraction for the two-halves forgiveness rule
+    and its ordering constraints.
+
     LIVENESS IS HERE, NOT IN THE REGISTRY, on purpose.  Leaf β made
     ``validate_memory_metadata`` a pure synchronous function taking only a
     dict, so it structurally *cannot* perform a store lookup — a boundary
@@ -500,10 +560,13 @@ async def _apply_memory_metadata_validation(
     :func:`~fused_memory.memory_metadata.parent_liveness_violation`, so the
     rule still has exactly one normative home.
 
-    The lookup fires only when ``parent_id`` is PRESENT *and* already
-    shape-valid: the common write path (no ``parent_id`` at all — leaf α
-    measured zero live records carrying one) pays no round-trip, and an id
-    no store could resolve is never spent on.  Liveness ADDS a violation
+    The lookup fires only when ``parent_id`` is PRESENT, already
+    shape-valid, *and* (task 3523, when a ``baseline`` is supplied) actually
+    ASSERTED by this write: the common write path (no ``parent_id`` at all —
+    leaf α measured zero live records carrying one) pays no round-trip, an
+    id no store could resolve is never spent on, and a patch that leaves an
+    existing ``parent_id`` untouched is answerable for neither the lookup
+    nor its verdict.  Liveness ADDS a violation
     rather than opening a second rejection path: because
     ``parent_liveness_violation`` is ``fatal=True``, warn mode censuses and
     proceeds while ``enforce`` rejects, both through the same arms below.
@@ -555,7 +618,31 @@ async def _apply_memory_metadata_validation(
     # `validate_memory_metadata` emits `invalid_parent_id_shape` under the
     # same key, so any parent_id-keyed violation means the id is malformed
     # and no store could resolve it in that spelling.
-    if 'parent_id' in meta and not any(v.key == 'parent_id' for v in violations):
+    #
+    # ALSO gated on the parent_id claim being NEW (task 3523), mirroring
+    # `_check_canonical_uniqueness`'s guard 3 in shape and for the same
+    # reason. Liveness is the ONE rule the (key, code) subtraction below
+    # structurally cannot delta-scope: the baseline set is built by the PURE
+    # `validate_memory_metadata`, which cannot produce `dead_parent_id` or
+    # `parent_id_liveness_unavailable`, so those codes would survive the
+    # subtraction on EVERY patch — including one that never mentions
+    # parent_id. A record whose parent was later deleted would then become
+    # permanently un-patchable under `enforce` (and census a `dead_parent_id`
+    # line per patch under the shipped warn mode), which is exactly the
+    # "`enforce` re-validates the corpus" failure the delta rule exists to
+    # prevent. So the scoping happens HERE, at the source, instead.
+    #
+    # Fail-CLOSED is preserved for every write that ASSERTS a parent: a new
+    # or CHANGED parent_id still pays the round-trip and still rejects under
+    # `enforce`. Only an untouched pre-existing one is forgiven — the same
+    # value-unchanged half the shape rules use below. Compared raw rather
+    # than against the normalized copy because `validate_memory_metadata`'s
+    # only in-place mutation is `supersedes`; `parent_id` is never rewritten.
+    if (
+        'parent_id' in meta
+        and (baseline is None or baseline.get('parent_id') != meta['parent_id'])
+        and not any(v.key == 'parent_id' for v in violations)
+    ):
         try:
             parent = await parent_lookup(project_id, meta['parent_id'])
         except Exception as exc:
@@ -580,6 +667,64 @@ async def _apply_memory_metadata_validation(
             violations.append(
                 parent_liveness_violation(meta['parent_id'], code=liveness_code)
             )
+
+    # DELTA SCOPING (task 3523) — judge what this write CHANGED, never the
+    # record at rest.  Supplied only by `update_memory`, which is amending an
+    # existing record; the two add paths create one and so have no pre-image,
+    # pass no baseline, and are bit-identical to before.
+    #
+    # Reducing the set here, ONCE, is what makes the rule uniform: all three
+    # arms below — census, storm detector, enforce-reject — then operate on
+    # NEW violations only.  Re-censusing a pre-existing violation on every
+    # patch would inflate the census stream the task-3626 flip is measured
+    # from and trip false unknown-key storms off a long tail that was already
+    # counted; re-rejecting one would quietly restate `enforce` from "rejects
+    # WRITES" to "re-validates the corpus", which is the model both
+    # `_check_canonical_uniqueness`'s docstring and PRD §9 leaf ε's
+    # 2026-08-04 amendment state and measure against.
+    #
+    # AFTER the liveness block on purpose: that block gates its round-trip on
+    # `parent_id` carrying no shape violation, so subtracting first would let
+    # a pre-existing `invalid_parent_id_shape` spend a lookup on an id no
+    # store could resolve and then census `dead_parent_id` for it — blaming
+    # the wrong rule, which leaf δ explicitly forbids.
+    #
+    # THIS SUBTRACTION DOES NOT DELTA-SCOPE LIVENESS, and cannot: `already`
+    # comes from the PURE `validate_memory_metadata`, which structurally
+    # cannot emit `dead_parent_id` / `parent_id_liveness_unavailable`, so
+    # `(v.key, v.code) not in already` is unconditionally True for both and
+    # they would survive every patch. Liveness is delta-scoped at its SOURCE
+    # instead — see the claim-is-NEW gate on the block above. Do not "unify"
+    # the two by deleting that gate and relying on this list comprehension:
+    # it would silently reinstate corpus re-validation for exactly one rule.
+    #
+    # Forgiven only when BOTH halves hold: the baseline already carried this
+    # (key, code) AND the write left that key's value alone.  (key, code)
+    # alone is not enough — swapping one bad slug for a DIFFERENT bad slug
+    # repeats the pair while being entirely this write's doing, and would
+    # earn a free pass.  "Judge what the write CHANGED" is about the KEY's
+    # value, not about which rule happens to fire.
+    #
+    # Compared against the NORMALIZED baseline copy, not the raw pre-image:
+    # `validate_memory_metadata` mutates in place, so a record whose stored
+    # `supersedes` is a legacy scalar would otherwise read as "changed" on
+    # every patch that never mentioned it.
+    #
+    # One extra PURE synchronous call on a shallow COPY, and zero I/O.
+    if baseline is not None:
+        _unset = object()
+        before = dict(baseline)
+        already = {
+            (v.key, v.code)
+            for v in validate_memory_metadata(
+                before, enforce_kind_registry=config.enforce_kind_registry
+            )
+        }
+        violations = [
+            v for v in violations
+            if (v.key, v.code) not in already
+            or meta.get(v.key, _unset) != before.get(v.key, _unset)
+        ]
 
     # NOTE: this is `if violations:`, not an early `return` — the canonical
     # uniqueness re-check below must still run for metadata that is
@@ -619,6 +764,7 @@ async def _apply_memory_metadata_validation(
         config=config,
         count_canonical=count_canonical,
         find_canonical=find_canonical,
+        baseline=baseline,
     )
 
 
@@ -637,6 +783,7 @@ async def _check_canonical_uniqueness(
     config: MemoryMetadataConfig,
     count_canonical: Callable[[str, dict], Awaitable[int]],
     find_canonical: Callable[..., Awaitable[list[dict]]],
+    baseline: dict | None = None,
 ) -> None:
     """Enforce <=1 canonical memory per ``(project, topic)`` (PRD V1, INV-3).
 
@@ -707,9 +854,30 @@ async def _check_canonical_uniqueness(
        was already reported by the pure validator, and we must never build
        a query on a malformed key (``count_by_metadata`` also rejects an
        empty filter).
-    3. count == 0 → return.  The happy path pays exactly one exact Qdrant
+    3. *baseline* supplied and the effective ``(canonical, topic)`` claim
+       EQUALS the baseline's → return (task 3523).  This write asserts no
+       claim the record does not already hold, so there is nothing new to
+       check, and ε's contracted zero-extra-round-trips property must hold
+       for a no-op too.  Only ``update_memory`` supplies a baseline; the two
+       add paths pass none, keep this guard inert, and so keep today's exact
+       guard order and round-trip count.
+
+       THIS IS WHAT MAKES SELF-INCUMBENCY STRUCTURALLY IMPOSSIBLE — do not
+       "fix" it later by adding an ``exclude_id``.  The probe now runs only
+       when the record is ACQUIRING a claim, and a record that does not yet
+       hold the claim in the store cannot appear in the store-side count.
+       An ``exclude_id`` would instead cost an extra round-trip on every
+       canonical patch, need ``limit=2`` to filter self out of the scroll,
+       add a parameter to both injected collaborators, and risk
+       over-excluding a genuine duplicate — while STILL needing this guard
+       to avoid probing on a no-op.
+
+       Compared as a PAIR, not on ``canonical`` alone: a canonical record
+       re-homed from topic T to topic U changes no ``canonical`` value but
+       is acquiring a claim at U, where it genuinely is not the incumbent.
+    4. count == 0 → return.  The happy path pays exactly one exact Qdrant
        count and never scrolls.
-    4. otherwise resolve the incumbent's id and reject.
+    5. otherwise resolve the incumbent's id and reject.
 
     WHY COUNT THEN SCROLL: V1 contract-fixes ``count_memories_by_metadata``
     as the INV-3 mechanism, but also requires the error to name the existing
@@ -745,6 +913,17 @@ async def _check_canonical_uniqueness(
       who were never told the rule: ``_MEMORY_INSTRUCTIONS`` still carries
       no slug guidance.  THE REAL PRECONDITION is leaf ι (task 3202).
 
+    STILL TRUE AFTER TASK 3523, and deliberately so.  Wiring this seam into
+    ``update_memory`` added a third write path, but its enforcement is
+    DELTA-scoped: a patch is judged only on the violations and claims it
+    introduces, so amending a record never re-validates what that record
+    already carried.  Had it been full-dict instead, every patch of a legacy
+    record would have become a rejection under ``enforce`` and the ~19/week
+    figure above — the number 3626 flips against — would have silently
+    stopped describing the system.  Guard 3 is the uniqueness half of that
+    rule; see :func:`_apply_memory_metadata_validation`'s ``baseline`` for
+    the shape half.
+
     Task 3626 is the gate that re-measures and decides the flip; it carries
     the full model and the re-measurement recipes.  Do not flip from this
     docstring alone.
@@ -763,6 +942,14 @@ async def _check_canonical_uniqueness(
 
     topic = meta.get('topic')
     if not isinstance(topic, str) or not is_valid_topic_slug(topic):
+        return
+
+    # Guard 3 (task 3523) — no NEW claim, no probe.  See the numbered list in
+    # the docstring: this is what makes the record's own presence in the
+    # store irrelevant, so no `exclude_id` is needed anywhere below.
+    if baseline is not None and (
+        (baseline.get('canonical'), baseline.get('topic')) == (True, topic)
+    ):
         return
 
     filters = {'topic': topic, 'canonical': True}
@@ -899,6 +1086,182 @@ def _serialize_temporal(
         'valid_at': _to_iso(valid_at),
         'invalid_at': _to_iso(invalid_at),
     }
+
+
+def _encode_referents(resolution: ReferentResolution) -> dict[str, Any]:
+    """Encode a resolved referent set for the durable-queue payload.
+
+    THE WIRE CONTRACT (task 3670, PRD leaf epsilon).  One additional key,
+    ``'referents'``, on the EXISTING ``add_episode`` / ``add_memory_graphiti``
+    payloads::
+
+        {'source': <one of REFERENT_SOURCES>,
+         'refs': [{'kind': ..., 'project_id': ..., 'number': ...}, ...]}
+
+    Deliberately NO ``payload_version``, no unknown-operation guard and no
+    migration (PRD "Queue compatibility is free here").  An OLD consumer
+    draining a new row ignores exactly one unknown key; a NEW consumer draining
+    an old row finds the key absent and treats it as "no referents" — which is
+    today's behaviour exactly.  A new queue OPERATION would have needed all
+    three; one additional key on an existing payload needs none of them.
+
+    Nesting everything under a single key (rather than flat ``referent_source``
+    + ``referent_refs``) keeps the back-compat story to one presence test and
+    gives :func:`_decode_referents` exactly one thing to validate.
+
+    Emits PLAIN JSON SCALARS ONLY, never the frozen :class:`Referent` dataclass
+    itself: the queue persists payloads as JSON TEXT in SQLite, so a
+    non-serializable value here would surface only in production.
+
+    AMBIGUITY IS DELIBERATELY NOT THREADED — READ THIS BEFORE WRITING ZETA.
+    ``ReferentResolution.ambiguous`` (and ``.conflicts``) are dropped here; only
+    ``.source`` and ``.referents`` ride the wire.  That matters because gamma
+    excludes ambiguous referents from ``.referents`` on purpose ("recorded, not
+    guessed"), so a consumer that reads ONLY ``refs`` sees an ambiguous endpoint
+    as a plain non-member of the set — indistinguishable from a genuine
+    conflation.  Leaf zeta must therefore NOT treat "endpoint not in the decoded
+    set" as sufficient grounds for leaf eta to repoint the edge, or an ambiguous
+    reference gets destructively repaired instead of recorded and left alone
+    (PRD boundary-test table: "Ambiguous scan | ref routed to ``.ambiguous``;
+    treated as undeclared; recorded, not guessed").
+
+    Zeta re-derives it rather than reading it off the wire.  ``.ambiguous`` is
+    ``scan_content(content, group_id=group_id).ambiguous`` verbatim on EVERY
+    precedence path — a pure function of ``(content, group_id)``, independent of
+    ``declared``/``metadata`` (referent_resolution.py: "`.ambiguous` is the
+    scan's verbatim answer on every path").  ``_execute_graphiti_write`` holds
+    both ``payload['content']`` and ``payload['group_id']``, so zeta can recover
+    the producer's exact ambiguity set from data already on the payload.
+
+    That re-derivation is a SECOND SCAN SITE, which gamma's own comment flags as
+    the INV-5 lockstep duplication canonical_labels exists to prevent — so
+    carrying ``'ambiguous'`` as a third key is the better long-term shape and is
+    filed as follow-up work.  It is not done here because this leaf's frozen
+    contract is the two-key blob and widening it changes this function's return
+    arity and the wire shape every test in
+    tests/test_referent_queue_threading.py pins.  Extending it later is
+    additive and needs no migration, exactly as adding ``'referents'`` did.
+    """
+    return {
+        'source': resolution.source,
+        'refs': [
+            {'kind': r.kind, 'project_id': r.project_id, 'number': r.number}
+            for r in resolution.referents
+        ],
+    }
+
+
+def _decode_referents(payload: dict[str, Any]) -> tuple[ReferentSet, str]:
+    """Pop and decode the ``'referents'`` blob :func:`_encode_referents` wrote.
+
+    Returns ``(referents, source)``.  An ABSENT key decodes to ``((), 'none')``
+    — an old-format queue row executes byte-identically to today.
+
+    POPS the key, matching how ``_execute_graphiti_write`` already treats
+    ``temporal_context`` / ``unverified_claim`` / ``reference_time``.  Safe
+    because ``DurableWriteQueue._process_item`` hands the executor one
+    ``parsed_payload()`` and the registered callback a SECOND, FRESH one,
+    precisely so the executor can pop what the callbacks read back.
+
+    Each entry is rebuilt through the ``Referent(...)`` constructor rather than
+    kept as a bare dict, so the frozen type's kind-registry validation runs on
+    untrusted wire data too — which is also what makes an unregistered ``kind``
+    on the wire fall into the degradation path below instead of minting a bogus
+    referent.  That constructor validates ``kind`` ONLY, so ``number`` and
+    ``project_id`` are type-checked here before it runs; see the inline comment
+    in the decode loop for the three distinct ways an unchecked field escapes.
+
+    DEGRADATION IS ALL-OR-NOTHING.  Any unreadable element — a non-dict blob, a
+    ``source`` outside :data:`REFERENT_SOURCES`, a non-list ``refs``, or a
+    SINGLE malformed entry — degrades the WHOLE blob to ``((), 'none')``, never
+    a partial set.  A partial set is worse than no set for the consumer this
+    exists to serve: leaf zeta's set-membership check reads "endpoint not in
+    the referent set" as a conflation and leaf eta repairs it by repointing the
+    edge, so a referent silently dropped by a lenient decoder would manufacture
+    a false conflation and drive destructive edge surgery onto the wrong node.
+    Referents are therefore accumulated into a local list and only frozen into
+    a tuple on FULL success, so a partial set cannot escape by construction.
+
+    DEGRADES RATHER THAN RAISES, deliberately.  This runs inside the queue
+    executor: raising would route the item to ``_handle_failure`` and
+    eventually dead-letter it, LOSING the memory over a telemetry field.
+    Degrading is safe here only BECAUSE the anomaly lands in the 'none' bucket
+    that ``_execute_graphiti_write``'s counter makes loud — the INV-4 escape,
+    not a silent fallthrough.  The ABSENT key is the one case that does NOT
+    warn: it is the load-bearing back-compat path (every row written before
+    task 3670), not an anomaly, and warning on it would drown the log during a
+    drain of a pre-feature queue.  It is still COUNTED, in the same bucket.
+
+    Loud-and-degrade mirrors the invalid-``reference_time`` arm already in
+    ``_execute_graphiti_write``, so this file has one idiom, not two.
+    """
+    blob = payload.pop('referents', None)
+    if blob is None:
+        return (), 'none'
+
+    def _degrade(reason: str) -> tuple[ReferentSet, str]:
+        # _safe_repr, not a bare %r: the blob is arbitrary decoded JSON from a
+        # queue row and this warning fires on EVERY retry attempt of that item,
+        # so an oversized corrupt value would otherwise dump its full repr into
+        # the log repeatedly. Matches how the sibling module this codec is
+        # written against (utils/referent_resolution.py) renders every one of
+        # its untrusted-value rejection messages.
+        logger.warning(
+            "Unreadable 'referents' payload key (%s); treating the write as "
+            'having no referents. Blob: %s',
+            reason, _safe_repr(blob),
+        )
+        return (), 'none'
+
+    if not isinstance(blob, dict):
+        return _degrade(f'expected a dict, got {type(blob).__name__}')
+    source = blob.get('source')
+    if source not in REFERENT_SOURCES:
+        return _degrade(f'source {source!r} is not one of {list(REFERENT_SOURCES)}')
+    refs = blob.get('refs')
+    if not isinstance(refs, list):
+        return _degrade(f"'refs' must be a list, got {type(refs).__name__}")
+
+    decoded: list[Referent] = []
+    for entry in refs:
+        if not isinstance(entry, dict):
+            return _degrade(f'entry {_safe_repr(entry)} is not a dict')
+        # `Referent.__post_init__` validates `kind` against the kind registry
+        # but NOT `number`/`project_id` — those two fields accept any object at
+        # all, so the constructor alone does NOT harden this boundary. Each
+        # unchecked type is a distinct downstream failure:
+        #   - a non-str `number` (e.g. 3127) mints a Referent that compares
+        #     UNEQUAL to its string twin, so leaf zeta's set-membership check
+        #     would read a legitimate endpoint as a conflation and leaf eta
+        #     would repoint the edge destructively — the same false-conflation
+        #     failure the all-or-nothing rule above exists to prevent, arriving
+        #     through a mistyped field instead of a dropped one;
+        #   - a None `number`/`project_id` mints a referent whose `node_name`
+        #     is the literal string 'Task None';
+        #   - an UNHASHABLE `number` (a list) mints a Referent that raises
+        #     TypeError the moment a consumer puts it in a set — a raise inside
+        #     the queue executor, i.e. exactly the dead-letter-and-lose-the-
+        #     memory outcome degrade-rather-than-raise exists to prevent.
+        # `_encode_referents` only ever emits strings, so this is reachable
+        # today only from a corrupt or hand-edited SQLite row — but this
+        # function is the wire-hardening boundary, so it hardens the fields
+        # that matter rather than assuming its own encoder wrote the row.
+        number = entry.get('number')
+        project_id = entry.get('project_id', '')
+        if not isinstance(number, str) or not isinstance(project_id, str):
+            return _degrade(
+                f'entry {_safe_repr(entry)} has a non-string number/project_id'
+            )
+        try:
+            decoded.append(Referent(
+                kind=entry.get('kind', 'task'),
+                project_id=project_id,
+                number=number,
+            ))
+        except (KeyError, TypeError, ValueError) as e:
+            return _degrade(f'entry {_safe_repr(entry)} is not a valid Referent: {e}')
+
+    return tuple(decoded), source
 
 
 def _created_at_to_utc_iso(created_at: datetime | None) -> str | None:
@@ -1235,6 +1598,26 @@ class MemoryService:
         # likely to be noticed any other way.
         self._mem0_update_storm_counters: dict[str, StormCounter] = {}
         self._mem0_update_storm_escalator = Mem0UpdateStormEscalator()
+        # INV-4 storm escape for the referent-set queue channel (task 3670, PRD
+        # leaf epsilon). `_decode_referents` degrades an unreadable or absent
+        # blob to ('none') rather than raising — losing the memory over a
+        # telemetry field would be worse — so that degradation MUST be counted
+        # rather than silently fallen through. Constructed UNCONDITIONALLY, for
+        # the same reason the two counters above are: an alarm that only exists
+        # when `_write_journal` is configured would vanish in exactly the
+        # degraded configuration where a referent-less write storm is least
+        # likely to be noticed any other way.
+        #
+        # Bucketed by ALL FOUR sources, not just 'none', because leaf iota needs
+        # a DENOMINATOR: "sustained 100% none" is a rate, and an absolute
+        # none-count alone cannot distinguish a broken producer from a quiet
+        # system. Keyed off gamma's exported REFERENT_SOURCES so the vocabulary
+        # lives at ONE site (that constant's stated purpose) and a fifth source
+        # cannot escape the counter.
+        #
+        # Bounded by that four-member closed vocabulary, so unlike the per-agent
+        # storm counters above it needs no pruning.
+        self._referent_source_counts: dict[str, int] = dict.fromkeys(REFERENT_SOURCES, 0)
         # Test seam for the injectable-clock convention: a 3600s window has to
         # be exercised by advancing a fake clock, not by sleeping.
         self._mem0_update_storm_time_provider: Callable[[], float] = time.time
@@ -2324,6 +2707,47 @@ class MemoryService:
         )
         return stats
 
+    def referent_source_counts(self) -> dict[str, int]:
+        """How many Graphiti write ATTEMPTS resolved to each referent source.
+
+        ATTEMPTS, not completed writes, and the distinction is load-bearing for
+        anyone building an alert on the rate.  The increment sits at the TOP of
+        ``_execute_graphiti_write``, which ``DurableWriteQueue._process_item``
+        re-invokes on every RETRY of an item with a freshly parsed payload — so
+        a retry storm on one group inflates whichever bucket that item lands in,
+        and an item that eventually dead-letters is still counted.  Retries are
+        in the numerator AND the denominator; the skew is roughly uniform across
+        buckets in the common case (a row's source does not change between its
+        own attempts), so a "sustained 100% none" reading survives it, but a
+        per-bucket ABSOLUTE count must not be read as a count of memories.
+
+        The increment deliberately stays at the top rather than moving after the
+        successful backend call: counting only successes would make the escape
+        go dark during a backend outage — exactly when a referent-less write
+        storm is least likely to be noticed any other way — and would decouple
+        it from the single decode the journal stamp also reads.
+
+        The INV-4 storm escape for the referent-set queue channel (task 3670,
+        PRD leaf epsilon), and the read side of ``_referent_source_counts``.
+
+        Emitted at the CONSUMER (``_execute_graphiti_write``), not at the three
+        producers, deliberately: the regression this exists to detect is "the
+        plumbing breaks, every row arrives referent-less, and the feature
+        no-ops in total silence", and that failure lives on the PRODUCER side —
+        a counter emitted there would go dark in exactly that scenario. Only
+        the consumer sees both new-format and old-format rows.
+
+        Buckets ALL FOUR sources rather than only 'none', because leaf iota
+        needs a denominator: "sustained 100% none" is a RATE, and an absolute
+        none-count alone cannot distinguish a broken producer from a quiet
+        system.
+
+        Returns a COPY, so a caller cannot mutate the escape hatch's own state.
+        Process-lifetime totals, never reset — a monotonic counter a reader
+        samples and differences, matching the uptime-baseline convention above.
+        """
+        return dict(self._referent_source_counts)
+
     async def _execute_graphiti_write(
         self, operation: str, payload: dict[str, Any]
     ) -> Any:
@@ -2342,6 +2766,23 @@ class MemoryService:
         # the tag reaches the persisted episodic node (and, via
         # _dual_write_callback, every fact derived from it).
         unverified_claim = bool(payload.pop('unverified_claim', False))
+        # task 3670: the referent set resolved at the write boundary, popped on
+        # the same channel. An ABSENT key decodes to ((), 'none'), so a queue
+        # row written before this feature executes byte-identically to today.
+        #
+        # `referents` is the value leaf zeta will hand to
+        # `_verify_episode_referents(result, group_id=..., referents=referents)`
+        # INSIDE the identity-lock critical section below — deliberately inside,
+        # so no wrongly-attached state is ever externally visible between the
+        # write and its verification. Nothing else in this method changes, which
+        # is what keeps an old-format row byte-identical.
+        referents: ReferentSet
+        referents, referent_source = _decode_referents(payload)
+        # INV-4 escape: EVERY Graphiti write is bucketed, so the absent and
+        # degraded paths are counted rather than silently falling through. See
+        # `_referent_source_counts` in __init__ for why this is unconditional
+        # and why all four sources are bucketed. Leaf iota reads it.
+        self._referent_source_counts[referent_source] += 1
         reference_time_iso = payload.pop('reference_time', None)
         reference_time = None
         if reference_time_iso is not None:
@@ -2373,7 +2814,26 @@ class MemoryService:
                 causation_id=causation_id,
                 backend='graphiti',
                 operation='add_episode',
-                payload={'content': payload['content'][:200], 'group_id': payload.get('group_id')},
+                # referent_source/referent_count (task 3670) are the DURABLE
+                # half of the telemetry split, and come from the ONE decode
+                # above — never re-derived, so the durable channel and the
+                # in-process counter cannot disagree. The counter is the
+                # unconditional INV-4 escape (it exists even when
+                # `_write_journal` is None); this row is what gives leaf iota
+                # per-project, time-windowed data, through a journal row that
+                # already exists — no new schema, no new table, no new write.
+                # That resolves epsilon's half of PRD open question 2 (which
+                # suggested `write_ops.params`) without pre-empting iota's
+                # read-path choice.
+                #
+                # `len(referents)` is also what keeps the decoded set a live
+                # local rather than dead code until leaf zeta lands.
+                payload={
+                    'content': payload['content'][:200],
+                    'group_id': payload.get('group_id'),
+                    'referent_source': referent_source,
+                    'referent_count': len(referents),
+                },
                 coro=self.graphiti.add_episode(
                     name=payload.get('name', ''),
                     content=payload['content'],
@@ -2680,6 +3140,26 @@ class MemoryService:
 
         assert self.durable_queue is not None
 
+        # Resolve WHICH referents this episode is about (task 3670, PRD leaf
+        # epsilon) BEFORE the try below, for the same loud-over-silent reason
+        # add_memory's call sits outside its own try: gamma raises
+        # InputValidationError on a structural wiring bug, and that must not be
+        # absorbed by an enqueue-failure handler.
+        #
+        # metadata=None is not an oversight: add_episode deliberately never
+        # persists a metadata argument — the same fact that forced task 3142's
+        # `unverified_claim` onto this payload channel — so the bridge has
+        # nothing to read and the derived scan is the only live source here.
+        #
+        # declared=None: leaf delta owns the `entities` parameter; this is the
+        # seam it fills.
+        resolution = resolve_referents(
+            declared=None,
+            metadata=None,
+            content=content,
+            group_id=scope.graphiti_group_id,
+        )
+
         success = True
         error_msg = None
         try:
@@ -2703,6 +3183,7 @@ class MemoryService:
                     'temporal_context': temporal_context,
                     'unverified_claim': unverified_claim,
                     'reference_time': reference_time.isoformat() if reference_time is not None else None,
+                    'referents': _encode_referents(resolution),
                 },
                 callback_type='dual_write_episode',
             )
@@ -2829,6 +3310,32 @@ class MemoryService:
 
         # Graphiti: enqueue via durable queue (async, but durably persisted)
         if write_graphiti:
+            # Resolve WHICH referents this write is about (task 3670, PRD leaf
+            # epsilon), so leaf zeta can verify the resulting edges against it.
+            #
+            # Placement is load-bearing at BOTH ends:
+            #   INSIDE `if write_graphiti:` — a Mem0-only write never reaches
+            #   Graphiti, so it pays for no scan;
+            #   OUTSIDE the `try:` below, which degrades to `_graphiti_error`
+            #   and DROPS the Graphiti write. gamma raises InputValidationError
+            #   on structural inputs (a non-str content or group_id) precisely
+            #   so a wiring bug is loud; resolving inside that try would
+            #   convert that loud signal into a silently skipped Graphiti
+            #   write.
+            #
+            # `meta` is read AFTER _normalize_task_id_metadata has coerced
+            # task_id to a scalar str, which is the contract gamma's metadata
+            # bridge documents itself against.
+            #
+            # declared=None: leaf delta owns the `entities` parameter and its
+            # `_entities_gate`, and THIS CALL is the single seam it fills. No
+            # declared referents can exist until it lands.
+            resolution = resolve_referents(
+                declared=None,
+                metadata=meta,
+                content=content,
+                group_id=scope.graphiti_group_id,
+            )
             try:
                 assert self.durable_queue is not None
                 await self.durable_queue.enqueue(
@@ -2842,6 +3349,8 @@ class MemoryService:
                         'source_description': f'add_memory:{resolved_category.value}',
                         '_causation_id': causation_id,
                         '_write_op_id': write_op_id,
+                        # Popped and decoded by _execute_graphiti_write.
+                        'referents': _encode_referents(resolution),
                     },
                     callback_type='refresh_entity_summaries',
                 )
@@ -3327,8 +3836,43 @@ class MemoryService:
             content = mem.get('memory', '')
             if not content:
                 continue
+            if not isinstance(content, str):
+                # `resolve_referents` (task 3670) raises InputValidationError on
+                # a truthy non-str content, deliberately — but this call sits in
+                # a per-memory loop whose `enqueue_batch` only runs AFTER the
+                # loop completes, so letting it propagate would abort the WHOLE
+                # replay and enqueue nothing over ONE malformed Mem0 record.
+                # Skipping the record keeps the blast radius at one row, which
+                # is what it was before referents were threaded here. Loud
+                # rather than silent, unlike the empty-content skip above: an
+                # empty memory is ordinary, a non-str one is a Mem0 anomaly.
+                logger.warning(
+                    'Skipping replay of a Mem0 record whose memory is not a '
+                    'string (got %s): %s',
+                    type(content).__name__, _safe_repr(content),
+                )
+                continue
             meta = mem.get('metadata', {}) or {}
             category = meta.get('category', 'observations_and_summaries')
+            # The THIRD and last producer of add_memory_graphiti rows (task
+            # 3670, PRD leaf epsilon). Threaded even though the PRD named only
+            # the two primary write-boundary sites: replayed rows carry real
+            # prose whose referents the derived scanner can see, so leaving
+            # them on the absent path would stamp them 'none' and inflate leaf
+            # iota's undeclared bucket with writes that were plainly derivable
+            # — a false regression signal in the very counter this task exists
+            # to make trustworthy. They also produce real graph edges leaf zeta
+            # will want to verify.
+            #
+            # Unlike add_episode, this loop DOES hold a metadata dict (the Mem0
+            # record's own), so the bridge is live here. declared=None: leaf
+            # delta's seam, as at the other two producers.
+            #
+            # add_system_record is deliberately NOT threaded — it is Mem0-only
+            # and never routes to Graphiti.
+            resolution = resolve_referents(
+                declared=None, metadata=meta, content=content, group_id=target,
+            )
             batch.append({
                 'group_id': target,
                 'operation': 'add_memory_graphiti',
@@ -3338,6 +3882,7 @@ class MemoryService:
                     'source': 'text',
                     'group_id': target,
                     'source_description': f'replay_from_mem0:{category}',
+                    'referents': _encode_referents(resolution),
                 },
                 'callback_type': 'refresh_entity_summaries',
             })
@@ -4430,6 +4975,47 @@ class MemoryService:
         await walk(memory_id)
         return DescendantScan(ids=ordered, truncated=truncated)
 
+    async def list_child_ids(
+        self, memory_id: str, *, project_id: str
+    ) -> DescendantScan:
+        """*memory_id*'s DIRECT children — one level deep, WITHOUT deleting.
+
+        Deliberately not :meth:`list_descendant_ids`' transitive post-order
+        walk.  The consolidate op re-points a victim's immediate children
+        onto the new canonical and then deletes only that victim; its
+        grandchildren keep a living parent throughout and are never touched.
+        Enumerating them here would invite reparenting records whose own
+        parent is still alive — a pointer rewrite nothing asked for.
+
+        Public and side-effect-free for the same reason
+        :meth:`refuse_if_children` is: the tool layer has to pre-flight
+        "what would I have to reparent?" BEFORE the destructive part of the
+        operation starts.
+
+        Built from the same :meth:`_count_children` / :meth:`_list_children`
+        primitives as every other child read (INV-5) — no new scroll — so
+        the count-then-scroll ordering, the ``_CHILD_SCAN_LIMIT`` bound and
+        the truncation semantics keep exactly one home.  Count first: the
+        count is exact and cheap while the scroll fetches full payloads, and
+        a childless victim (the common case) must not pay for a listing
+        with nothing in it.
+
+        Returns:
+            DescendantScan: ``ids`` in scroll order, bounded by
+            ``_CHILD_SCAN_LIMIT``; and ``truncated``, true when the live
+            count exceeds what the scroll returned — the bound above, or a
+            concurrent write landing between the two reads.  A caller that
+            reparents a truncated listing and then deletes the parent
+            silently orphans everything it could not see, so the
+            disagreement is carried as data rather than reconciled toward
+            the smaller answer.
+        """
+        count = await self._count_children(memory_id, project_id=project_id)
+        if not count:
+            return DescendantScan(ids=[], truncated=False)
+        ids = await self._list_children(memory_id, project_id=project_id)
+        return DescendantScan(ids=ids, truncated=len(ids) < count)
+
     async def refuse_if_children(self, memory_id: str, *, project_id: str) -> None:
         """Raise ``ParentHasChildrenError`` if *memory_id* still has children.
 
@@ -4915,10 +5501,41 @@ class MemoryService:
         fails those loud before dispatching here — mirroring how ``update_edge``
         splits its boundary checks from its write path.
 
+        METADATA VOCABULARY is the exception, and belongs HERE (task 3523).  A
+        patch runs :func:`_apply_memory_metadata_validation` at this seam, the
+        same one ``add_memory`` and ``add_system_record`` use, for the reason
+        PRD D8 pins enforcement at the service layer: a tools-layer validator
+        leaks past every additional write path, and this was the third one.
+        Placed after the §5(c) existence check and before every journaled
+        backend call, so a rejection cannot leave a journal row, a partial
+        write, or a pending mem0 intent behind.
+
+        Two properties of that check are deliberate and easy to "simplify" away:
+
+        * It is DELTA-scoped — only violations and ``canonical`` claims NEW
+          relative to the record's pre-image are judged.  Amending a record
+          never re-validates the record.  See ``baseline`` on the seam.
+        * A CONTENT-ONLY amend does not run it at all.  Such a write leaves the
+          metadata byte-identical, so there is nothing it is responsible for.
+          That reason stands unaided; the consequence of getting it wrong is
+          that a legacy record's TEXT would become uncorrectable under
+          ``enforce`` because of metadata the amend never touched.
+
         Returns the ``{'status': 'updated', 'store': 'mem0', 'id': memory_id,
         ...}`` envelope on success, or a structured ``{'error_type': ...}``
         rejection. The id is echoed so a caller can assert identity stability
         straight from the response instead of re-fetching.
+
+        A vocabulary rejection is the one outcome that does NOT use that
+        envelope: :class:`MemoryMetadataValidationError` and
+        :class:`CanonicalUniquenessViolation` PROPAGATE from here, exactly as
+        they do from ``add_memory``.  PRD V1 keeps the two deliberately
+        distinguishable at an ``except`` (neither subclasses the other), and
+        flattening them into ``error_type`` strings at this layer would discard
+        their structured fields — the incumbent id a caller needs in order to
+        act.  The MCP tool above converts every exception to an
+        ``{'error', 'error_type'}`` envelope via ``@mcp_tool_errors()``, and
+        does so identically for all three write paths.
 
         *emit_event* forces a ``memory_updated`` event on a metadata-only route,
         which is otherwise silent (a patch leaves the record saying the same
@@ -4980,10 +5597,12 @@ class MemoryService:
         # metadata-only path — a caller must get the same resulting metadata
         # whether or not it also amended the content.
         #
-        # The set_payload / delete_payload fast paths deliberately do NOT read
-        # it: they hand the raw patch / key list to Qdrant and let it apply
-        # merge and delete SERVER-side, which is the entire reason those routes
-        # can skip a read-modify-write. So the INV-5 single-home claim is
+        # The set_payload / delete_payload fast paths read it for VALUES only
+        # (task 3523 — so the seam's `supersedes` scalar→list normalization is
+        # not lost on this route), never for merge / delete SEMANTICS: they
+        # still name only the patch keys / key list and let Qdrant apply the
+        # merge and the delete SERVER-side, which is the entire reason those
+        # routes can skip a read-modify-write. So the INV-5 single-home claim is
         # narrower than "every arm calls _apply_metadata_delta": merge and
         # delete semantics have two implementations that have to agree — this
         # one and Qdrant's primitives. ``TestMetadataFastPathEquivalence`` pins
@@ -4995,6 +5614,47 @@ class MemoryService:
             metadata_delete_keys=metadata_delete_keys,
             metadata_mode=metadata_mode,
         )
+
+        # Mem0 metadata vocabulary validation on the THIRD write path (task
+        # 3523). PRD D8/§2 pin enforcement at this seam precisely because a
+        # second write path leaks past a tools-layer validator; update_memory
+        # is a third one and reproduced exactly that leak.
+        #
+        # Placement mirrors add_memory's (see the note at its call site):
+        # AFTER the §5(c) read leg's existence check and the delta, so the
+        # EFFECTIVE post-patch custom subset is what gets judged; BEFORE
+        # `scope` and every _journaled_backend_call below, so a rejection can
+        # never leave a journal row or a half-applied patch behind.
+        #
+        # GATED ON A METADATA DELTA EXISTING. A content-only amend leaves the
+        # record's metadata byte-identical, so this write is responsible for
+        # none of it; validating it anyway would be corpus re-validation by
+        # another name. That first-principles reason is the whole
+        # justification and stands unaided — do not prop it up with a named
+        # repair sweep: no in-repo sweep drives this arm (grepped — the only
+        # callers of MemoryService.update_memory are the MCP tool and
+        # scripts/retro_stamp_topics.py, and the latter never amends
+        # content). The consequence of getting it wrong is nonetheless real:
+        # under `enforce` a legacy record's TEXT would become uncorrectable
+        # because of unrelated legacy metadata, and `enforce` would quietly
+        # restate from "rejects WRITES" to "re-validates the corpus", the
+        # model task 3626's flip measurement depends on. It also keeps the
+        # seam's cost off the one arm that already pays for a re-embed.
+        if metadata_patch or metadata_delete_keys:
+            await _apply_memory_metadata_validation(
+                new_custom,
+                project_id=project_id,
+                agent_id=agent_id,
+                config=self.config.memory_metadata,
+                storm_detector=self._metadata_storm_detector,
+                project_root=self._memory_metadata_project_root(),
+                parent_lookup=self.get_memory_by_id,
+                count_canonical=self.count_memories_by_metadata,
+                find_canonical=self.get_memories_by_metadata,
+                # The record's PRE-IMAGE, free from the §5(c) read leg above.
+                # Only violations NEW relative to it are this write's problem.
+                baseline=existing_custom,
+            )
 
         scope = Scope(project_id=project_id)
 
@@ -5075,8 +5735,48 @@ class MemoryService:
             elif metadata_patch:
                 # Qdrant merges server-side, so unlisted pre-existing keys
                 # survive without this layer reconstructing the whole payload.
+                #
+                # The VALIDATED values for the patch keys, not the raw patch
+                # (task 3523): the vocabulary seam normalizes in place —
+                # `supersedes` scalar→list, PRD D2 — and writing the raw patch
+                # here would persist the legacy scalar on this route while the
+                # overwrite and content arms persisted a list. Restricted to
+                # the patch keys, so the fast path keeps its whole point:
+                # Qdrant still merges server-side and no pre-image key the
+                # caller did not name is rewritten.
+                #
+                # UNFILTERED on purpose, and LOUD if that ever stops holding.
+                # This branch is reached only for `metadata_mode == 'merge'`
+                # with no delete keys, so `_apply_metadata_delta`'s
+                # `new_custom.update(metadata_patch)` puts every patch key in
+                # and the seam only ever ASSIGNS (`meta['supersedes'] =
+                # members`), never pops — so `missing` is unreachable today.
+                # Were a future normalizer to drop a key, an `if k in
+                # new_custom` filter would silently skip it here while
+                # set_payload merged server-side and LEFT THE OLD VALUE in
+                # Qdrant, whereas the overwrite and content arms would drop
+                # it: the three-route split this whole change closed,
+                # reopened silently. Raising costs the write and names the
+                # divergence, which is the house's loud-over-silent norm; it
+                # happens before the coroutine is built, so no journal row
+                # and no un-awaited coroutine are left behind.
+                missing = [k for k in metadata_patch if k not in new_custom]
+                if missing:
+                    raise RuntimeError(
+                        'update_memory: the metadata vocabulary seam removed '
+                        f'patch key(s) {missing!r} from the effective metadata; '
+                        'the set_payload fast path cannot express a key REMOVAL '
+                        '(Qdrant merges server-side), so this write would leave '
+                        'the stale value in place while the overwrite and '
+                        'content arms would drop it. Route key-removing '
+                        'normalization through the overwrite arm instead.'
+                    )
                 operation = 'update_memory_set_payload'
-                coro = self.mem0.set_payload(memory_id, dict(metadata_patch), scope)
+                coro = self.mem0.set_payload(
+                    memory_id,
+                    {k: new_custom[k] for k in metadata_patch},
+                    scope,
+                )
             else:
                 operation = 'update_memory_delete_payload'
                 coro = self.mem0.delete_payload(

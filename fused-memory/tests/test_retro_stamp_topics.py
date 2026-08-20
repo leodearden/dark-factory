@@ -438,7 +438,7 @@ class TestComputePatchCanonicalAndSupersedes:
 
         ``normalize_supersedes`` faithfully wraps ANY scalar, so folding this
         sentence would write ``['<prose>']`` — a one-member list whose member
-        fails ``_is_full_uuid``, turning a record that merely has a legacy
+        fails ``is_full_uuid``, turning a record that merely has a legacy
         shape into one that fails ``validate_memory_metadata`` outright.  D2
         offers the fold as a convenience; it does not license manufacturing a
         validation failure.  Leave it, name it, move on.
@@ -492,15 +492,22 @@ class TestComputePatchCanonicalAndSupersedes:
         }
 
     def test_shape_helpers_come_from_the_registry_not_a_local_copy(self):
-        """INV-5 again: the UUID predicate and the fold have one home.
+        """INV-5 again: each shape helper has one home — but not the SAME one.
 
-        Same private-helper reuse ``strip_leaked_control_keys.py`` already
-        establishes for ``_drop_reserved_control_keys``.
+        The ``supersedes`` fold is owned by ``memory_metadata``; the
+        canonical-full-UUID predicate is owned by
+        ``fused_memory.utils.validation`` (task 3132, leaf η), which
+        ``memory_metadata`` merely calls.  Pin each binding against its real
+        owner, so re-expressing either one locally fails a test instead of
+        silently forking the rule.  Same private-helper reuse
+        ``strip_leaked_control_keys.py`` already establishes for
+        ``_drop_reserved_control_keys``.
         """
         from fused_memory import memory_metadata
+        from fused_memory.utils import validation
 
         assert _mod.normalize_supersedes is memory_metadata.normalize_supersedes
-        assert _mod._is_full_uuid is memory_metadata._is_full_uuid
+        assert _mod.is_full_uuid is validation.is_full_uuid
 
 
 # ===========================================================================
@@ -1175,9 +1182,9 @@ class TestDfCuratorGateManifest:
         """
         for entry in _mod.DF_CURATOR_GATE_CLUSTERS:
             for memory_id in entry.member_memory_ids or ():
-                assert _mod._is_full_uuid(memory_id), (entry.gate_task_id, memory_id)
+                assert _mod.is_full_uuid(memory_id), (entry.gate_task_id, memory_id)
             if entry.canonical_memory_id is not None:
-                assert _mod._is_full_uuid(entry.canonical_memory_id), entry
+                assert _mod.is_full_uuid(entry.canonical_memory_id), entry
 
     def test_no_memory_id_is_claimed_by_two_gates(self):
         seen: dict[str, str] = {}
@@ -1321,9 +1328,12 @@ class TestMergePlans:
     def test_at_most_one_canonical_per_project_topic(self):
         """ε's <=1-canonical-per-topic invariant, pinned at PLAN level.
 
-        Checked before any write, because ``update_memory`` never reaches the
-        service-side uniqueness probe — so a plan that violated this would
-        reach Qdrant unchallenged.
+        Checked before any write.  ``update_memory`` does reach the
+        service-side probe as of task 3523, but that probe adjudicates one
+        write at a time against live state: it would admit the FIRST member
+        of a within-plan duplicate pair and refuse only the second, making
+        the outcome depend on iteration order.  Rejecting the pair AS a pair
+        is a plan-level property, and only this layer can see it.
         """
         targets, _ = _mod.merge_plans(
             [_plan('topic-one', canonical=C1, members=(M1,)),
@@ -1552,10 +1562,12 @@ class TestStampOne:
     async def test_canonical_uniqueness_is_probed_before_the_write(self):
         """The probe runs FIRST, with ε's exact filter.
 
-        ``update_memory`` never reaches
-        ``_apply_memory_metadata_validation``, so this script is the only
-        layer standing between a plan and a second ``canonical: true`` for
-        one ``(project, topic)``.  A probe issued after the write would
+        ``update_memory`` reaches ``_apply_memory_metadata_validation`` as of
+        task 3523, so this is no longer the ONLY layer standing between a
+        plan and a second ``canonical: true`` for one ``(project, topic)``.
+        It is still the strictest one: under the shipped ``enforce = false``
+        the seam warn-fails OPEN, while this script refuses.  Ordering stays
+        load-bearing either way — a probe issued after the write would
         observe the violation it was meant to prevent.
         """
         service = _service(record=_record())

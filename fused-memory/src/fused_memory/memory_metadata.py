@@ -80,13 +80,6 @@ from fused_memory.topic_slug import (
 # "is this a canonical full UUID" from ONE definition (INV-5).
 from fused_memory.utils.validation import is_full_uuid
 
-#: Back-compat alias for the pre-move private spelling; import
-#: ``is_full_uuid`` from :mod:`fused_memory.utils.validation` instead.
-# TODO(task 3132 follow-up): drop once scripts/retro_stamp_topics.py and
-# tests/test_retro_stamp_topics.py import the predicate directly (both are
-# outside this task's locked file scope).
-_is_full_uuid = is_full_uuid
-
 __all__ = [
     'BLESSED_METADATA_KEYS',
     'KIND_REGISTRY',

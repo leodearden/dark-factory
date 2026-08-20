@@ -320,6 +320,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from shared.proc_group import _unsafe_pgid_reason
 from shared.task_metadata import HUMAN_CURATOR_GATE_KEY, DoneProvenance
 
 from orchestrator import systemd_inspect
@@ -1153,6 +1154,11 @@ class DeterministicRunner:
             stderr=asyncio.subprocess.STDOUT,
             start_new_session=True,
         )
+        # Capture the pgid NOW, while proc is guaranteed alive and unreaped: with
+        # start_new_session=True, pgid == proc.pid by POSIX guarantee.  Reading it
+        # later via os.getpgid could hit a recycled pid and signal a stranger's
+        # group (task 845) — see `_terminate_process_tree`'s docstring.
+        pgid = proc.pid
         try:
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout_secs)
             tail = (stdout or b'').decode(errors='replace')[-2000:]
@@ -1171,13 +1177,15 @@ class DeterministicRunner:
             # is REPORTED, not the Layer-A guarantee that the process group is
             # dead before this frame unwinds.  `_terminate_process_tree` never
             # raises (see its docstring), so the raise below is always reached.
-            await self._terminate_process_tree(proc)
+            await self._terminate_process_tree(proc, pgid)
             # `from None` suppresses the noisy asyncio.TimeoutError context —
             # ScriptTimeout already carries the overrun budget as structured
             # data (timeout_secs), so the chained cause adds nothing.
             raise ScriptTimeout(timeout_secs) from None
 
-    async def _terminate_process_tree(self, proc: asyncio.subprocess.Process) -> None:
+    async def _terminate_process_tree(
+        self, proc: asyncio.subprocess.Process, pgid: int,
+    ) -> None:
         """Kill *proc*'s entire process group and bound the reap (task 2090).
 
         ``proc`` must have been spawned with ``start_new_session=True`` so its
@@ -1202,25 +1210,75 @@ class DeterministicRunner:
         stuck in an uninterruptible state cannot hang this helper (and
         therefore ``_default_run_script``) forever.
 
-        Note (residual race): ``os.killpg(os.getpgid(proc.pid), ...)`` targets
-        ``proc.pid`` by number.  If asyncio's child watcher has already reaped
-        the zombie in the background before this call runs, the OS could in
-        principle recycle that PID before ``os.getpgid``/``os.killpg`` execute,
-        making the SIGKILL target an unrelated process group.  This is a
-        low-probability race shared with any PID-based kill (not specific to
-        this helper); the ``ProcessLookupError``/``OSError`` suppression above
-        is the existing mitigation, not a full fix for the underlying race.
+        Args:
+            proc: the timed-out child, spawned with ``start_new_session=True``.
+            pgid: the process group id, which MUST be the value captured
+                immediately after that spawn (where ``pgid == proc.pid`` by
+                POSIX guarantee).  It is never refreshed here via
+                ``os.getpgid``: once ``proc`` has been reaped the kernel may
+                recycle its pid, and ``os.getpgid`` would then return an
+                unrelated group's id — in the task-845 incidents that resolved
+                to the user ``systemd --user`` manager's group and killed the
+                whole login session.  ``shared/src/shared/proc_group.py``'s
+                module docstring is the canonical statement of this contract.
+
+        A frozen capture alone is necessary but not sufficient, because the
+        captured NUMBER also goes stale the moment the leader is reaped.  The
+        ``proc.returncode is not None`` short-circuit below is what closes that
+        residual window: it dispatches no signal at all rather than risk
+        signalling a stranger.  Accepted trade-off, matching the shared
+        helper's: if the leader is already reaped we forgo killing surviving
+        grandchildren — refusing to kill a stranger beats reaping an orphan.
+
+        The third layer is ``shared.proc_group._unsafe_pgid_reason``, applied
+        below: even a frozen, unreaped pgid is refused if it resolves to init,
+        this process, our parent, our own group, or anything other than
+        ``proc.pid``.  This helper deliberately REUSES that predicate rather
+        than growing a third copy of it — the repo's other two group-killers
+        (``shared.proc_group.terminate_process_group`` and
+        ``df_pytest_isolation._kill_process_group``) both apply it, and a
+        divergent hand-rolled copy here would be the weakest of the three.  A
+        refusal degrades to the direct ``proc.kill()``, exactly as
+        ``df_pytest_isolation``'s does.
+
+        Why this does NOT simply delegate to ``terminate_process_group``, which
+        it otherwise resembles: that helper escalates SIGTERM → wait →
+        SIGKILL, while this path SIGKILLs immediately and bounds the reap once.
+        The immediate SIGKILL is deliberate for a deploy script that has
+        already blown its timeout budget, and delegation would also double the
+        worst-case wait (``2 * grace_secs``) and drop both the ``proc.kill()``
+        fallback and the reap-abandoned warning below.  Delegating is a
+        behaviour change, not a refactor; the shared *predicate* is the part
+        that is genuinely common, so that is what is shared.
         """
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except (ProcessLookupError, PermissionError, OSError) as exc:
+        if proc.returncode is not None:
             logger.debug(
-                'DeterministicRunner: killpg(%s) failed (%s: %s) — falling back '
-                'to direct kill()',
-                proc.pid, type(exc).__name__, exc,
+                'DeterministicRunner: proc %s already reaped — skipping killpg '
+                '(its pid may already be recycled onto another group)',
+                proc.pid,
+            )
+        elif (reason := _unsafe_pgid_reason(pgid, proc.pid)) is not None:
+            # Residual defence, degrading to the direct child exactly as
+            # df_pytest_isolation._kill_process_group does on the same refusal.
+            logger.error(
+                'DeterministicRunner: refusing to killpg — %s. Falling back to '
+                'a direct kill() of pid %s; any grandchildren will be left to '
+                'the caller. This indicates a bug in the pgid capture.',
+                reason, proc.pid,
             )
             with contextlib.suppress(ProcessLookupError, OSError):
                 proc.kill()
+        else:
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError) as exc:
+                logger.debug(
+                    'DeterministicRunner: killpg(%s) failed (%s: %s) — falling back '
+                    'to direct kill()',
+                    pgid, type(exc).__name__, exc,
+                )
+                with contextlib.suppress(ProcessLookupError, OSError):
+                    proc.kill()
 
         try:
             await asyncio.wait_for(proc.wait(), timeout=self._reap_grace_secs)

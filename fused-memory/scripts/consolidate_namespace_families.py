@@ -26,9 +26,10 @@ destroying data:
      ``merge_graph_family``'s own docstring for the full barrier contract.
   2. QDRANT COLLECTION MERGES -- legacy/divergent Mem0 collections (from
      historical ``collection_prefix`` values, RCA §4) are merged into their
-     ``fused_<project>`` target: scrolled with vectors, payload ``user_id``
-     rewritten to the canonical project id, upserted into the target, and
-     the source collection deleted ONLY once fully drained.
+     ``fused_<project>`` target: counted in a read-only preflight, then
+     streamed with vectors in bounded chunks with each payload ``user_id``
+     rewritten to the canonical project id and upserted into the target,
+     and the source collection deleted ONLY once fully drained.
   3. GUARDED JUNK-KEY DELETION -- known-junk FalkorDB graph keys (and any
      family sibling emptied by step 1) are removed via ``GRAPH.DELETE``
      (``graphiti._graph_for(key).delete()``) -- NOT the ``MATCH (n) DETACH
@@ -91,6 +92,10 @@ import logging
 import sys
 from typing import Any
 
+from fused_memory.backends.mem0_client import (
+    DEFAULT_SCROLL_MAX_PAGES,
+    ScrollPageBudgetExhausted,
+)
 from fused_memory.maintenance.cross_graph_move import (  # noqa: F401
     SubgraphEdgeResult,
     create_moved_episode,
@@ -599,54 +604,112 @@ async def merge_graph_family(
 # Qdrant collection merge
 # ---------------------------------------------------------------------------
 
-async def scroll_collection_points(
+async def preflight_collection_points(
     qdrant_client: Any,
     collection: str,
     *,
-    limit: int = 1000,
-) -> list:
-    """Read-only scroll of every point in *collection*, WITH vectors.
+    page_size: int = 1000,
+    max_pages: int = DEFAULT_SCROLL_MAX_PAGES,
+) -> tuple[int | None, bool]:
+    """Read-only PREFLIGHT: how many points *collection* holds, and whether
+    ``merge_collection``'s drain could enumerate all of them.
 
-    ``with_vectors=True`` is essential: omitting it drops embeddings from
-    the returned points, which would silently destroy them once re-upserted
-    into the target collection (see ``merge_collection``).
+    O(1) -- ONE ``count`` round-trip through this module's own
+    ``count_collection_points`` (defined below), not a paged scroll. This
+    used to drain ``Mem0Backend.scroll_collection_pages`` page by page just
+    to fold the points into a counter, which cost one round-trip per page
+    (~200 for a 200k-point collection) and, under ``--apply``, enumerated
+    every collection TWICE -- once here and again in ``merge_collection``.
+    Qdrant's count API answers the same question in one call, and the only
+    other bit the drain yielded, ``capped``, is exactly derivable (below).
 
-    Single-page fetch: this issues exactly ONE ``scroll(..., limit=limit)``
-    call and discards the returned ``next_offset`` rather than paging
-    through it, so a collection with more than *limit* points is
-    permanently reported UNRESOLVED at the given --limit. Callers must pass
-    a *limit* larger than the true point count of every collection they
-    intend to migrate in this run; the full result set (with vectors) is
-    held in memory, so raising *limit* trades completeness for peak memory.
+    *collection* is passed VERBATIM -- ``COLLECTION_MERGES`` holds legacy
+    mis-named collections (``fused_dark-factory``, ``reify_reify``) that a
+    ``Scope`` structurally cannot produce, which is why this addresses the
+    raw collection-name-keyed count API rather than a ``Scope``-addressed
+    ``Mem0Backend.count``. The BACKEND is still what pages: task 3225 moved
+    the offset/next_offset walk there, and ``merge_collection`` drives it as
+    the pass's sole drain.
+
+    Returns:
+        ``(point_count, capped)``.  ``capped`` is True when *collection*
+        holds more points than ``merge_collection``'s drain could enumerate
+        under this budget -- ``point_count > page_size * max_pages``. That
+        boundary matches the pager exactly: ``scroll_collection_pages``
+        raises only when ``max_pages`` pages are consumed with
+        ``next_offset`` STILL live, so a collection of exactly
+        ``page_size * max_pages`` points drains cleanly and is not capped.
+        The caller's ``if args.apply and not capped`` guard is what stops
+        ``merge_collection`` running at all against a collection this
+        preflight says cannot be fully enumerated, so an UNRESOLVED item
+        still means nothing was written.
+
+        ``point_count`` is None when the count itself could not be read --
+        the same 'unreadable count' convention ``run()``'s junk-key loop
+        already reports (``'node_count': None``), so a failure is never
+        rendered as a plausible-looking 0.
+
+    A raising count is CAUGHT, never propagated: an unreadable count, a
+    ``TimeoutError``, or a transport error.  A raising sub-operation must
+    not abort the whole consolidation run, because earlier keys/sections of
+    the same ``--apply`` pass may already hold committed mutations -- the
+    same except-``Exception`` -> WARNING -> 'UNRESOLVED' idiom the sibling
+    ``delete_empty_collection`` uses.  Every failure maps onto the existing
+    capped contract -- item UNRESOLVED, no upsert, no source delete, non-zero
+    exit -- so the externally visible behaviour is unchanged.
+
+    The two branches log DISTINCT warnings: only the over-budget branch
+    carries the raise-the-budget remediation, because that advice is wrong
+    after a transport failure.
     """
-    points, _next_offset = await qdrant_client.scroll(
-        collection_name=collection,
-        with_payload=True,
-        with_vectors=True,
-        limit=limit,
-    )
-    if len(points) >= limit:
+    try:
+        point_count = await count_collection_points(qdrant_client, collection)
+    except Exception as e:
+        # Deliberately NO raise-the-budget advice here: this is not a cap,
+        # and sending an operator to re-run a bigger scroll against a
+        # transport that is failing is wrong advice.
         logger.warning(
-            "consolidate_namespace_families: scrolled %d point(s) from "
-            "collection '%s', which hit limit=%d -- scroll may be "
-            "incomplete/capped. Re-run with a higher --limit value before "
-            "merging, or the source collection will not be deleted "
-            '(see merge_collection).',
-            len(points), collection, limit,
+            "consolidate_namespace_families: the point count for collection "
+            "'%s' could not be read: %s -- the collection is reported "
+            'UNRESOLVED and its source will not be deleted.',
+            collection, e, exc_info=True,
         )
-    return points
+        return None, True
+
+    budget = page_size * max_pages
+    if point_count > budget:
+        logger.warning(
+            "consolidate_namespace_families: collection '%s' holds %d point(s), "
+            'more than the merge drain could enumerate under its page budget '
+            '(%d page(s) of %d = %d) -- migrating it would be INCOMPLETE, so '
+            'this collection is reported UNRESOLVED and its source will not be '
+            'deleted (see merge_collection). Re-run with a higher --max-pages '
+            '(page budget) or --limit (page size).',
+            collection, point_count, max_pages, page_size, budget,
+        )
+        return point_count, True
+    return point_count, False
 
 
 async def merge_collection(
+    backend: Any,
     qdrant_client: Any,
     source: str,
     target: str,
     canonical_user_id: str,
-    points: list,
     *,
-    capped: bool,
+    page_size: int = 1000,
+    max_pages: int = DEFAULT_SCROLL_MAX_PAGES,
 ) -> dict:
-    """Upsert *points* (payload user_id rewritten to canonical) into *target*.
+    """STREAM *source* into *target*, rewriting each payload's user_id.
+
+    This is the pass's SOLE with-vectors drain, and it upserts in CHUNKS of
+    at most *page_size* points: it never holds more than one chunk resident
+    and never issues a request larger than one chunk. Draining the whole
+    collection first (with vectors) and issuing a single upsert made both
+    peak memory and the request size scale with the collection -- up to
+    *page_size* x *max_pages* points carrying embeddings -- on exactly the
+    multi-page collections task 3225 first made reachable.
 
     Preserves each point's original id and vector -- only the payload's
     user_id is rewritten. Qdrant upsert is id-keyed: this ASSUMES every
@@ -656,31 +719,137 @@ async def merge_collection(
     existence check is performed -- COLLECTION_MERGES entries must only ever
     pair collections whose point ids cannot collide.
 
-    The *source* collection is deleted ONLY when *capped* is False (the
-    scroll that produced *points* was NOT capped, i.e. fully drained): a
-    capped scroll means the enumeration may be incomplete, so deleting
-    source would risk losing un-migrated data -- the caller marks that case
-    UNRESOLVED instead.
+    The *source* collection is deleted ONLY after this function's own drain
+    reaches exhaustion. A drain that dies mid-stream leaves the target
+    holding an idempotent, id-keyed PARTIAL copy while the source stays
+    fully intact: a re-run with a larger budget completes the migration,
+    harmlessly re-upserting the points that already landed. No data is lost,
+    only duplicated work. Deleting the source there would destroy the
+    un-migrated remainder, so the delete is withheld and
+    ``enumeration_incomplete`` is returned True for the caller to fold into
+    an UNRESOLVED disposition.
+
+    Returns:
+        ``{'points_upserted': n, 'source_deleted': bool,
+        'enumeration_incomplete': bool, 'delete_failed': bool}``.
+        ``points_upserted`` tallies what ACTUALLY reached *target*, not what
+        was enumerated -- a chunk still buffered when the drain died was
+        never sent and is not counted. ``enumeration_incomplete`` and
+        ``delete_failed`` are DISTINCT because they describe different
+        states: the first means part of the source never reached the target
+        (a re-run must finish the migration), the second means every point
+        landed but the now-redundant source could not be dropped (a re-run
+        or a manual delete tidies up, and no data is at risk). ``run()``
+        folds EITHER into an UNRESOLVED disposition.
+
+    ANY failure is CAUGHT, never propagated, for the same reason
+    ``preflight_collection_points`` catches its own: budget exhaustion, a
+    ``TimeoutError`` from ``scroll_collection_pages``'s per-page
+    ``asyncio.wait_for``, a transport error, or a raising
+    ``delete_collection`` -- a raising sub-operation must not abort the whole
+    consolidation run, because earlier keys/sections of the same ``--apply``
+    pass may already hold committed mutations, and the later sections (junk
+    keys, empty collections) would be skipped entirely, handing the operator
+    a traceback instead of a manifest (the ``delete_empty_collection``
+    idiom). Every branch leaves the source in place; only the budget branch
+    advises raising the budget.
     """
     from qdrant_client.http import models as qmodels  # noqa: PLC0415
 
-    upsert_points = [
-        qmodels.PointStruct(
-            id=point.id,
-            vector=point.vector,
-            payload=rewrite_point_payload_user_id(dict(point.payload or {}), canonical_user_id),
+    points_upserted = 0
+    chunk: list = []
+
+    async def _flush() -> None:
+        nonlocal points_upserted
+        if not chunk:
+            return
+        await qdrant_client.upsert(collection_name=target, points=list(chunk))
+        points_upserted += len(chunk)
+        chunk.clear()
+
+    try:
+        async for point in backend.scroll_collection_pages(
+            source,
+            page_size=page_size,
+            max_pages=max_pages,
+            with_vectors=True,
+        ):
+            chunk.append(
+                qmodels.PointStruct(
+                    id=point.id,
+                    vector=point.vector,
+                    payload=rewrite_point_payload_user_id(
+                        dict(point.payload or {}), canonical_user_id,
+                    ),
+                ),
+            )
+            if len(chunk) >= page_size:
+                await _flush()
+        await _flush()
+    except ScrollPageBudgetExhausted:
+        logger.warning(
+            "consolidate_namespace_families: the merge drain of collection "
+            "'%s' exhausted its page budget (%d page(s) of %d) after "
+            '%d point(s) were upserted into %r -- the migration is '
+            'INCOMPLETE, so this collection is reported UNRESOLVED and its '
+            'source is NOT deleted. The points already upserted are id-keyed '
+            'and idempotent: re-run with a higher --max-pages (page budget) '
+            'or --limit (page size) to complete it.',
+            source, max_pages, page_size, points_upserted, target,
         )
-        for point in points
-    ]
-    if upsert_points:
-        await qdrant_client.upsert(collection_name=target, points=upsert_points)
+        return {
+            'points_upserted': points_upserted,
+            'source_deleted': False,
+            'enumeration_incomplete': True,
+            'delete_failed': False,
+        }
+    except Exception as e:
+        # Same withheld delete, no raise-the-budget advice -- see the sibling
+        # branch in scroll_collection_points.
+        logger.warning(
+            "consolidate_namespace_families: the merge drain of collection "
+            "'%s' FAILED after %d point(s) were upserted into %r: %s -- the "
+            'migration is INCOMPLETE, so this collection is reported '
+            'UNRESOLVED and its source is NOT deleted. The points already '
+            'upserted are id-keyed and idempotent, so a re-run completes it.',
+            source, points_upserted, target, e, exc_info=True,
+        )
+        return {
+            'points_upserted': points_upserted,
+            'source_deleted': False,
+            'enumeration_incomplete': True,
+            'delete_failed': False,
+        }
 
-    source_deleted = False
-    if not capped:
+    # The delete is guarded for the SAME reason the drain is: a raising
+    # sub-operation must not abort a pass whose earlier keys/sections may
+    # already hold committed mutations. Withholding it is also harmless --
+    # every point is already in the target, so the source is now a redundant
+    # copy an operator can drop by hand or on a re-run (which re-upserts
+    # id-keyed and idempotent).
+    try:
         await qdrant_client.delete_collection(source)
-        source_deleted = True
-
-    return {'points_upserted': len(upsert_points), 'source_deleted': source_deleted}
+    except Exception as e:
+        logger.warning(
+            "consolidate_namespace_families: collection '%s' was fully merged "
+            'into %r (%d point(s)) but deleting the source FAILED: %s -- the '
+            'collection is reported UNRESOLVED so the run exits non-zero. No '
+            'data is at risk: the target holds every point, and the source is '
+            'now a redundant copy that can be dropped by hand or by re-running.',
+            source, target, points_upserted, e, exc_info=True,
+        )
+        return {
+            'points_upserted': points_upserted,
+            'source_deleted': False,
+            'enumeration_incomplete': False,
+            'delete_failed': True,
+        }
+    return {
+        'points_upserted': points_upserted,
+        'source_deleted': True,
+        'enumeration_incomplete': False,
+        'delete_failed': False,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -717,14 +886,19 @@ async def delete_junk_key(graphiti: Any, key: str, node_count: int) -> str:
 async def count_collection_points(qdrant_client: Any, collection: str) -> int:
     """Read-only exact point count for *collection* via Qdrant's count API.
 
-    Used as the guard for ``delete_empty_collection``: deletion is only
-    safe when this is exactly 0. An INDETERMINATE result -- a response
+    THE single home for "how many points does this collection hold", with
+    two consumers: the guard for ``delete_empty_collection`` (deletion is
+    only safe when this is exactly 0) and ``preflight_collection_points``
+    (which turns the same number into the collection-merge report's
+    ``point_count`` and its ``capped`` budget verdict). An INDETERMINATE
+    result -- a response
     object with no ``.count`` attribute at all, or an explicit ``.count is
     None`` -- RAISES (``ValueError``) rather than defaulting to 0
     (reviewer follow-up: for a deletion guard, an unreadable count must
     fail CLOSED and block the delete, not fail OPEN and authorize one).
     ``run()``'s empty-collection loop already catches a raising call here
-    and reports that item UNRESOLVED, exactly like its sibling
+    (as does ``preflight_collection_points``) and reports that item
+    UNRESOLVED, exactly like its sibling
     ``count_graph_nodes``/``delete_junk_key`` guard, so raising is both
     consistent with that existing handler and strictly safer than the old
     silent-0 default. A genuine empty collection (``.count == 0``) is
@@ -775,6 +949,7 @@ async def run(
     memory_service: Any,
     *,
     limit: int = 1000,
+    max_pages: int = DEFAULT_SCROLL_MAX_PAGES,
 ) -> dict:
     """Enumerate/scroll/count every configured family, collection, junk key,
     and empty-collection candidate and, with ``args.apply``, perform the
@@ -789,10 +964,12 @@ async def run(
     ``delete_empty_collection`` are only invoked when ``args.apply`` is true
     (each guarded internally on its own count being exactly 0).
 
-    A capped enumeration/scroll (row or point count hits *limit*) is
-    reported ``UNRESOLVED`` rather than ``MERGE`` for that item, mirroring
-    the junk-key count>0 guard: a partial read must never be mistaken for a
-    clean, complete one (no-silent-caps).
+    A capped read is reported ``UNRESOLVED`` rather than ``MERGE`` for that
+    item, mirroring the junk-key count>0 guard: a partial read must never be
+    mistaken for a clean, complete one (no-silent-caps). A graph enumeration
+    is capped when its row count hits *limit*; a collection is capped when
+    its point count exceeds what the merge drain could enumerate under
+    ``limit * max_pages`` (see ``preflight_collection_points``).
 
     A graph-family item's ``disposition`` is DOWNGRADED from ``MERGE`` to
     ``UNRESOLVED`` after a clean (uncapped) ``--apply`` merge whenever the
@@ -863,14 +1040,20 @@ async def run(
     # --- 2. Qdrant collection merges ----------------------------------------
     collection_items: list[dict] = []
     for source, target in COLLECTION_MERGES.items():
-        points = await scroll_collection_points(qdrant_client, source, limit=limit)
-        capped = len(points) >= limit
+        # O(1) preflight: ONE count round-trip, not a paged scroll. `capped`
+        # is the flag it returns, NOT point_count >= limit -- with real
+        # paging a mergeable collection can hold any count; what disqualifies
+        # it is holding more than --limit x --max-pages. merge_collection
+        # below runs the pass's sole drain.
+        point_count, capped = await preflight_collection_points(
+            qdrant_client, source, page_size=limit, max_pages=max_pages,
+        )
         canonical_user_id = canonical_user_id_for(target)
         item = {
             'source': source,
             'target': target,
             'canonical_user_id': canonical_user_id,
-            'point_count': len(points),
+            'point_count': point_count,
             'disposition': 'UNRESOLVED' if capped else 'MERGE',
         }
         # Guarded exactly like the graph-family branch above: a capped
@@ -879,11 +1062,19 @@ async def run(
         # was written, matching the "reported UNRESOLVED rather than acted
         # on" contract (module docstring).
         if args.apply and not capped:
-            item.update(
-                await merge_collection(
-                    qdrant_client, source, target, canonical_user_id, points, capped=capped,
-                ),
+            summary = await merge_collection(
+                memory_service.mem0, qdrant_client, source, target, canonical_user_id,
+                page_size=limit, max_pages=max_pages,
             )
+            item.update(summary)
+            # A drain that died mid-merge upserted only part of the source,
+            # and a merge whose terminal delete failed left the source behind
+            # -- neither is a clean MERGE, so fold both into UNRESOLVED
+            # exactly like the graph-family post-merge downgrade above, so
+            # has_unresolved picks them up and the run exits non-zero rather
+            # than reporting an incomplete migration as done.
+            if summary['enumeration_incomplete'] or summary['delete_failed']:
+                item['disposition'] = 'UNRESOLVED'
         collection_items.append(item)
 
     # --- 3. Guarded junk-key deletion (JUNK_KEYS + emptied siblings) --------
@@ -961,12 +1152,12 @@ async def run(
 # CLI entry point
 # ---------------------------------------------------------------------------
 
-def main() -> int:
-    """Parse CLI args, build a live MemoryService, and run the consolidation."""
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s %(name)s %(levelname)s %(message)s',
-    )
+def _build_parser() -> argparse.ArgumentParser:
+    """Build the CLI parser.
+
+    Extracted from ``main()`` so the flags are testable without running the
+    consolidation, mirroring ``census_memory_metadata.py::_build_parser``.
+    """
     parser = argparse.ArgumentParser(
         description=(
             'Consolidate cross-graph namespace families: merge sibling Graphiti '
@@ -982,18 +1173,39 @@ def main() -> int:
     )
     parser.add_argument(
         '--limit', type=int, default=1000,
-        help='Maximum rows/points fetched in a SINGLE page per item (default: '
-             '1000 -- no further pages are fetched). Must exceed the true '
-             'row/point count of the largest graph/collection being '
-             'migrated, or that item is permanently reported UNRESOLVED. '
-             'Increase if the dry-run report logs a scroll/limit-cap '
-             'WARNING; memory scales with this value.',
+        help='Page/row size (default: 1000). For the GRAPH enumerations it is '
+             'a single-page row cap: it must exceed the true row count of the '
+             'largest graph being migrated, or that item is permanently '
+             'reported UNRESOLVED. For the COLLECTION scroll it is the PAGE '
+             'SIZE -- pages are followed to exhaustion, so a collection larger '
+             'than this now migrates fully instead of being permanently '
+             'UNRESOLVED; --max-pages bounds the total. It is also the merge '
+             'upsert CHUNK size, so peak memory scales with this value, not '
+             'with the collection. Increase if the dry-run report logs a '
+             'row-cap WARNING.',
+    )
+    parser.add_argument(
+        '--max-pages', dest='max_pages', type=int, default=DEFAULT_SCROLL_MAX_PAGES,
+        help='Per-collection PAGE BUDGET for the Qdrant scroll (default: '
+             f'{DEFAULT_SCROLL_MAX_PAGES}). Total points enumerated per '
+             'collection is bounded by --limit x --max-pages; exceeding it '
+             'reports that collection UNRESOLVED with its source undeleted. '
+             'Raise it when the report logs a page-budget WARNING.',
     )
     parser.add_argument(
         '--config', default=None,
         help='Path to a fused-memory config file (sets CONFIG_PATH before loading).',
     )
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> int:
+    """Parse CLI args, build a live MemoryService, and run the consolidation."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s %(name)s %(levelname)s %(message)s',
+    )
+    args = _build_parser().parse_args()
 
     if args.config:
         import os  # noqa: PLC0415
@@ -1007,7 +1219,7 @@ def main() -> int:
         memory = MemoryService(config)
         try:
             await memory.initialize()
-            return await run(args, memory, limit=args.limit)
+            return await run(args, memory, limit=args.limit, max_pages=args.max_pages)
         finally:
             if hasattr(memory, 'close'):
                 await memory.close()

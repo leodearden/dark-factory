@@ -5078,6 +5078,29 @@ class TestLivenessSnapshotSubjectTaskIds:
             _memory('6b245659', _LIVENESS_SNAPSHOT_94_JUL24, category=_OS),
         ) == {'94'}
 
+    def test_slash_form_content_ref_alone_still_groups_a_snapshot(self):
+        """A record whose only task reference is the slash form (task 3403).
+
+        'task/94' is the orchestrator's own branch-name convention and the
+        spelling the real corpus reaches for when a snapshot is about a
+        branch or worktree; before task 3403 widened the shared TASK_REF_RE
+        grammar it was not a reference at all, so such a record had NO
+        subject and was silently ungroupable. MEASURED set() before the
+        widening.
+
+        This is the report-only path (a recurrence report, never a delete
+        candidate), so the widening buys recall here at no risk to the
+        corpus -- which is the recall this task was filed for.
+        """
+        assert liveness_snapshot_subject_task_ids(
+            _memory(
+                'm',
+                'Liveness check performed at 2026-07-24T10:00Z: task/94 '
+                'reports status=in-progress.',
+                category=_OS,
+            ),
+        ) == {'94'}
+
     def test_no_metadata_id_and_no_content_ref_is_empty(self):
         assert liveness_snapshot_subject_task_ids(
             _memory('m', 'a note that names no task at all'),
@@ -5230,11 +5253,17 @@ class TestFindLivenessSnapshotRecurrences:
 
         The real motivating record (1eef7df7) reports identical values for
         both its subjects, so the detector fires on the corpus that motivated
-        it. Per-subject clause scoping was tried and rejected on evidence:
-        `_CLAUSE_SPLIT_RE` splits on `.`, shattering filenames mid-sentence,
-        and the real content writes `task/94`, which `TASK_REF_RE` does not
-        match -- it yields the EMPTY SET on all four real records. This is a
-        RECALL gap in a report-only path, never a wrong delete.
+        it. This is a RECALL gap in a report-only path, never a wrong delete.
+
+        Per-subject clause scoping was genuinely inert when this was written:
+        `_CLAUSE_SPLIT_RE` split on EVERY `.`, shattering filenames
+        mid-sentence, and the real content writes `task/94`, which
+        `TASK_REF_RE` did not match -- together they yielded the EMPTY SET on
+        all four real records. Task 3403 fixed both regexes at the source, so
+        that evidence no longer argues against the technique; the rescope is
+        filed separately (ticket tkt_0RSCGSWBBW66VDBWYSYDQWF9PM). Until it
+        lands, the whole-record union key is what ships and this test is what
+        pins it -- the assertions below are unchanged by 3403.
         """
         divergent = (
             'Point-in-time liveness check performed 2026-07-26 on task 94: '

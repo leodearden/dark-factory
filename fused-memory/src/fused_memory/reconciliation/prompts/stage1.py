@@ -177,6 +177,12 @@ must carry the same count and both count only writes where `memory_ids` was non-
 
 {_STAGE1_GRAPHITI_QUEUED_GUIDANCE}
 
+Note that the stats verifier may report a LOWER final count than you did, because a write \
+you correctly counted can later be dead-lettered by the durable queue after this stage has \
+already finished — the verifier counts only writes that LANDED. That specific divergence is \
+expected and is not a self-reporting error on your part. Report what the responses actually \
+returned to you; do not try to anticipate or adjust for later write failures.
+
 ## Verifying update_edge writes (Task 1145 Guard 2)
 Every `mcp__fused-memory__update_edge` MCP response now includes a `verified: bool` field \
 driven by a server-side fact-text readback. After persisting the edge, the server calls \
@@ -199,7 +205,7 @@ count as successful edge updates. This prevents silent write failures from infla
 `edges_updated` stat and triggering false-positive judge passes.
 
 ## Verifying add_finding responses
-A `mcp__fused-memory__add_finding` (recon_report) call is a successful new filing ONLY \
+A `mcp__recon-report__add_finding` (recon_report) call is a successful new filing ONLY \
 when its response contains a `finding_id` key. You MUST capture that `finding_id` \
 **verbatim** from the actual tool response, and you may cite or echo it ONLY when you \
 hold a genuine successful `add_finding` response from this turn. **Never** state that a \

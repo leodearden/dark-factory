@@ -342,6 +342,31 @@ def status(config_path: Path | None):
     asyncio.run(_show())
 
 
+@main.command('flake-ledger')
+@click.option('--config', 'config_path', type=click.Path(exists=True, path_type=Path),
+              default=None,
+              help='Path to orchestrator config YAML (REQUIRED unless ORCH_CONFIG_PATH '
+                   'is set). Selects the target project — sets project_root and '
+                   'fused_memory.project_id.')
+def flake_ledger_cmd(config_path: Path | None):
+    """Print the flake ledger report: open debt, recurrence chains, health counters.
+
+    READ ONLY. This command opens no debt, files no task, resolves nothing and
+    escalates nothing, and it will NOT create a ledger DB for a project that has
+    none — it reports the absence instead.
+    """
+    # Named flake_ledger_cmd so the function does not shadow the flake_ledger module.
+    from orchestrator.flake_ledger import ledger_db_path
+    from orchestrator.flake_report import build_report, render_report
+
+    try:
+        config = load_config(config_path)
+    except ConfigRequiredError as e:
+        click.echo(f'Error: {e}', err=True)
+        sys.exit(1)
+    click.echo(render_report(build_report(ledger_db_path(Path(config.project_root)))))
+
+
 @main.command('probe-models')
 @click.option('--config', 'config_path', type=click.Path(exists=True, path_type=Path),
               default=None,

@@ -374,3 +374,92 @@ async def empty_recon_conn(empty_reconciliation_db):
     async with aiosqlite.connect(str(empty_reconciliation_db)) as conn:
         conn.row_factory = aiosqlite.Row
         yield conn
+
+
+# ---------------------------------------------------------------------------
+# Shared served-asset fixtures (task 3549).
+#
+# The suite asserts structural contracts against the *served* .jsx/.js/.html
+# text, so nearly every such module needs a TestClient and the response body of
+# one or more static assets.  Nine modules used to carry byte-identical private
+# copies of exactly these fixtures; they live here now so a change lands once.
+#
+# SCOPE — module, matching the copies they replace.  Each CONSUMING MODULE pays
+# one app lifespan, not each test.  conftest's other TestClient fixture,
+# ``client`` above, is function-scoped and is a different thing: swapping these
+# onto it would stand up and tear down the app once per test across the whole
+# suite.  test_jsx_source_helpers.py pins the scope so that cannot happen
+# silently.
+#
+# ISOLATION — unchanged from the copies.  These lifespans still run under the
+# session-scoped autouse ``_isolated_project_root`` above (task 3503), so the
+# app opens its WAL databases inside a pytest temp root and never touches the
+# operator's live checkout.  That fixture is session-scoped precisely because a
+# module-scoped TestClient like this one cannot request a function-scoped
+# monkeypatch.
+#
+# SHADOWING IS INTENDED.  A module that defines its own ``_client`` overrides
+# this one; that is not a leftover to be cleaned up.  test_fixture_isolation.py
+# in particular MUST keep its copy — there the module-scoped TestClient is the
+# SUBJECT UNDER TEST (its docstring: "only a *session*-scoped fix satisfies
+# both" scopes), so deleting it would delete the coverage.
+#
+# APPEND ONLY BELOW THE sys.path BLOCK.  Adding a top-level non-stdlib import
+# above it fails test_conftest_import_guard.py's AST ordering guard.
+# ``TestClient`` is already imported at the top of this file, so this block adds
+# no import at all.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope='module')
+def _client():
+    """Module-scoped TestClient for static-asset and wiring assertions."""
+    from dashboard.app import app
+
+    with TestClient(app) as c:
+        yield c
+
+
+@pytest.fixture(scope='module')
+def index_html_body(_client):
+    return _client.get('/static/redux/index.html').text
+
+
+@pytest.fixture(scope='module')
+def data_js_body(_client):
+    return _client.get('/static/redux/data.js').text
+
+
+@pytest.fixture(scope='module')
+def app_jsx_body(_client):
+    return _client.get('/static/redux/app.jsx').text
+
+
+@pytest.fixture(scope='module')
+def shell_jsx_body(_client):
+    return _client.get('/static/redux/shell.jsx').text
+
+
+@pytest.fixture(scope='module')
+def tabs_jsx_body(_client):
+    return _client.get('/static/redux/tabs.jsx').text
+
+
+@pytest.fixture(scope='module')
+def charts_jsx_body(_client):
+    return _client.get('/static/redux/charts.jsx').text
+
+
+@pytest.fixture(scope='module')
+def tab_analytics_jsx_body(_client):
+    return _client.get('/static/redux/tab_escalation_analytics.jsx').text
+
+
+@pytest.fixture(scope='module')
+def tab_escalations_jsx_body(_client):
+    return _client.get('/static/redux/tab_escalations.jsx').text
+
+
+@pytest.fixture(scope='module')
+def tab_tasks_jsx_body(_client):
+    return _client.get('/static/redux/tab_tasks.jsx').text

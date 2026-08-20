@@ -108,6 +108,24 @@ rate; do not re-open them:
    unfiltered ``MATCH`` (no entity-type, label, or episode filter),
    reproduced end-to-end scanning every missed edge and dropping it at
    extraction — every gap was lexical, not a query-scope gap.
+
+   AMENDED, task 4340 (2026-08-17).  The lexical findings above STAND and
+   are unaffected; what does not stand is the scope of the ruling-out.
+   Those grounds covered query FILTERS only and were silent about
+   server-side TRUNCATION.  Task 4340 measured a FalkorDB
+   ``RESULTSET_SIZE`` cap silently truncating that very query to roughly
+   HALF the valid-edge corpus on dark_factory (exact figures: the
+   RESULT-SET CAP AUDIT block in ``backends/graphiti_client.py``, which is
+   the one place they are recorded).  So at the time of the task-2613
+   investigation this sweep saw about half the edges, and the miss rate was
+   computed against a truncated denominator.  ``get_all_valid_edges`` is
+   paginated as of task 4340 and the truncation is gone, but the RATE has
+   not been recomputed: a re-measurement against the now-complete corpus is
+   warranted, and the residuals list above is calibrated against the old
+   figure.  Filed as ticket tkt_0RSJP92VQNATQB0FSR20YMXGW8 (a TICKET id,
+   not a task id — the curator resolves it to a task asynchronously).  Do
+   not re-open the LEXICAL hypothesis; do not treat the old rate as
+   measured on a whole corpus.
 2. A shared blind spot with ``task_count_verification``: that function is
    an aggregate census-vs-tree consistency check (``task_filter``), not a
    per-task edge sweep at all — its 'healthy' report was correct, not
@@ -117,9 +135,23 @@ Why a regex in this module gets a performance test at all:
 ``sweep_stale_status_snapshot_edges`` calls
 ``extract_snapshot_edge_task_ids`` once per valid edge from an UNGUARDED
 dict comprehension with no per-edge timeout, over the whole group's edge
-set (~5868 edges in the task-3042 record). Extractor cost is therefore a
-whole-cycle LIVENESS property — one pathological fact stalls the entire
-reconciliation cycle — not a micro-optimisation. (amendment, task 3079)
+set (tens of thousands of edges; current figures in the RESULT-SET CAP
+AUDIT block in ``backends/graphiti_client.py``).  Extractor cost is
+therefore a whole-cycle LIVENESS property — one pathological fact stalls
+the entire reconciliation cycle — not a micro-optimisation. (amendment,
+task 3079)
+
+The figure was ~5868 in the task-3042 record; that number is consistent
+with a truncated enumeration and has been corrected upward by task 4340's
+live census (see the amendment to ruled-out hypothesis 1 above). The
+LIVENESS argument gets STRONGER, not weaker: with the truncation removed
+the per-edge extractor now runs over roughly twice as many edges per
+cycle, so the per-edge cost this test guards matters more than the
+original number implied, not less.  The read that feeds it was timed
+2026-08-18 at ~3.3 s per full enumeration on dark_factory (~3.7 s on
+reify) — bounded, and roughly +2.6 s per cycle over the old truncated
+read; see the MEASURED COST section of that same audit block, so this
+claim rests on a number rather than on an estimate. (amendment, task 4340)
 """
 
 from __future__ import annotations
@@ -129,7 +161,11 @@ import logging
 import re
 from datetime import UTC, datetime
 
-from fused_memory.reconciliation.task_filter import INACTIVE_TASK_STATUSES, TASK_REF_RE
+from fused_memory.reconciliation.task_filter import (
+    INACTIVE_TASK_STATUSES,
+    STRICT_CLAUSE_BOUNDARY_RE,
+    TASK_REF_RE,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -850,11 +886,6 @@ LIST_INTRODUCER_RE: re.Pattern[str] = re.compile(
     re.IGNORECASE,
 )
 
-# Clause-ish boundary used to close a colon-introduced list segment (no
-# closing delimiter of its own) and as a fallback for an unterminated
-# bracket segment. Mirrors task_filter._CLAUSE_SPLIT_RE.
-_CLAUSE_BOUNDARY_RE: re.Pattern[str] = re.compile(r'[.;\n!?]')
-
 # Bare digit token — used only within an already-detected, marker-anchored
 # span: an aggregate list segment, or a plural enumeration's 'ids' capture
 # group (task 3079). A bare '\d+' therefore never contributes a candidate id
@@ -863,6 +894,20 @@ _CLAUSE_BOUNDARY_RE: re.Pattern[str] = re.compile(r'[.;\n!?]')
 _BARE_DIGIT_RE: re.Pattern[str] = re.compile(r'\b\d+\b')
 
 
+# The clause-ish boundary that closes a colon-introduced list segment (which
+# has no closing delimiter of its own) and backstops an unterminated bracket
+# segment is task_filter.STRICT_CLAUSE_BOUNDARY_RE — the fail-safe-STRICT
+# alphabet [.;\n!?], NOT task_filter._CLAUSE_SPLIT_RE, which narrowed its dot
+# to '\.(?!\w)' at task 3403 so dotted technical tokens stop shattering a
+# sentence. The two started out identical; the canonical rationale for keeping
+# them apart lives next to STRICT_CLAUSE_BOUNDARY_RE. This module's stake in
+# it: the segment closed here is one from which BARE DIGITS are harvested as
+# task ids, and that path ends in memory_service.update_edge(invalid_at=...) —
+# a real Graphiti edge retirement. A longer segment absorbs more incidental
+# digits, i.e. over-selection, which this module's docstring explicitly
+# forbids: under-selection self-heals next cycle or is caught by Stage 2,
+# over-selection wrongly retires true facts. Copying the widening for symmetry
+# would trade a bounded soft-block for a permanent wrong invalidation.
 def _list_segment(text: str, start: int, open_char: str) -> str:
     """Return the list-segment substring of *text* beginning at *start*.
 
@@ -878,7 +923,7 @@ def _list_segment(text: str, start: int, open_char: str) -> str:
         if close != -1:
             return text[start:close]
 
-    boundary = _CLAUSE_BOUNDARY_RE.search(text, start)
+    boundary = STRICT_CLAUSE_BOUNDARY_RE.search(text, start)
     end = boundary.start() if boundary else len(text)
     return text[start:end]
 
@@ -900,7 +945,8 @@ def extract_snapshot_edge_task_ids(fact: str) -> set[int]:
       1. Gate on SNAPSHOT_STATUS_RE against the raw fact text; short-circuit
          to the empty set when absent.
       2. Individual form: extract ids via INDIVIDUAL_SNAPSHOT_RE, which
-         anchors 'task N' / '#N' / 'df N' (TASK_REF_RE's own grammar)
+         anchors 'task N' / '#N' / 'df N' / 'task/N' (TASK_REF_RE's own
+         grammar; the slash form was admitted by task 3403)
          directly to an adjacent status marker (only an optional copula
          and/or article may sit in between — deliberately NOT the
          preposition 'in') — so an incidental status word elsewhere in

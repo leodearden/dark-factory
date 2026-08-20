@@ -204,6 +204,46 @@ class TestExtractPriorityOverrideTaskId:
             is None
         )
 
+    def test_slash_form_subject_is_extracted(self):
+        """"Priority override set for task/7 by the operator" -> 7.
+
+        Task 3403 widened the shared TASK_REF_RE grammar to admit the
+        orchestrator's own 'task/<id>' branch-name form. This extractor
+        imports that regex directly, so the widening reaches it for free.
+        MEASURED None before the widening: the slash-form subject was
+        invisible, so the fact had no extractable subject at all and the
+        edge was never a sweep candidate.
+        """
+        assert (
+            extract_priority_override_task_id(
+                'Priority override set for task/7 by the operator'
+            )
+            == 7
+        )
+
+    def test_slash_form_plus_spaced_form_is_multi_subject_and_returns_none(self):
+        """"Priority override set for task/7 and task 8" -> None.
+
+        MEASURED 8 before the widening — and that was the dangerous answer,
+        not merely a missed one. With the slash-form reference invisible,
+        the fact looked single-subject, so the single-distinct-id rule was
+        satisfied by the WRONG task and this path ends in
+        memory_service.update_edge(invalid_at=...): task 8 going terminal
+        would have retired an edge that is really about task/7 as well.
+
+        The widening converts that silent wrong-subject sweep into the
+        deliberate multi-subject skip (two distinct ids -> None), which is
+        the under-selection direction this module explicitly prefers: an
+        edge left live is re-examined next cycle, an edge wrongly
+        invalidated is not.
+        """
+        assert (
+            extract_priority_override_task_id(
+                'Priority override set for task/7 and task 8'
+            )
+            is None
+        )
+
     def test_incidental_date_digits_not_swept_in(self):
         """"Task 5166 priority override boost set 2026-07-19" -> 5166: the
         date's digits are not task references and must not defeat the

@@ -81,6 +81,24 @@ Consequences for the decomposition: δ's *plan* work is nearly a no-op — its r
 
 Corrupted strings include cases where `rationale` was absorbed into `decision`, so the design rationale a future architect reads is another field's text. Retained plans are a survivor sample; most worktrees are deleted post-merge, so the historical total is larger.
 
+**δ's sweep was RUN on 2026-08-19 — and had never been run before.** The script landed with task 3691 on
+2026-08-15, but its `--apply` was never invoked against production data: a dry-run on 2026-08-19 still offered
+repairs on records archived as far back as **2026-07-20**. The applied run reports `2800 files scanned · 214 strings
+detected · **29 repaired** across 27 files · 0 write failures · 0 did-not-converge`, and the verifying second run
+reports **0 repairable** — δ's own acceptance invariant. **84 strings remain permanently unrepairable** and were
+deliberately left alone; 101 more are prose quoting the sentinels (documents *about* this leak, including the plans
+of 3083, 3141, 3689 and 3697) and are correctly untouched. That ~2× documentation-vs-damage split is why the
+collection predicate must be applied *on top of* the unrepairable verdict — a bare `detect()` census roughly doubles
+the number. Per operator decision the sweep is **not** put on a timer: γ is the door-closing fix, and a recurring
+cleanup would only make an open door survivable.
+
+**Two corpora §2.4 did not enumerate, both measured 2026-08-19.** (1) `.worktrees/.task-meta/*/plan.json` — the
+durable store the live lanes symlink into — holds 1,436 plans, 61 carrying residue, of which 33 belong to lanes that
+no longer exist. Neither sweep lane reaches those: δ globs `.worktrees-orphaned/*/.task/plan.json` and exactly **one**
+orphaned lane exists. Accepted as a transient irrelevance by operator decision — dead lanes are not read. (2) Live
+plans carry **19 hard-damage strings across 16 tasks**; three of those tasks (3382, 4081 pending; 3133 blocked) are
+plans an implementer will read *next*, and ε repairs them only on the next plan-tools read.
+
 **Sweep hazard pinned for δ:** `docs/task-recovery-2026-05-13/worktree-inventory.json` is git-tracked, legitimately contains predicate matches, and is replicated into every worktree — a loose glob hits it ~47 times. A sloppy sweep would rewrite committed evidence.
 
 ### 2.5 Containment *where installed* works — which is why the gap is the story
@@ -207,12 +225,12 @@ Every rewrite is **atomic**: repair into a temp file in the same directory, veri
 | Assumed capability | Verification | Result |
 |---|---|---|
 | `fastmcp.server.middleware.Middleware` with `on_call_tool` | `uv run python -c "import fastmcp; from fastmcp.server.middleware import Middleware"` | ✅ fastmcp **3.2.2**, `on_call_tool` present |
-| `FastMCP.add_middleware` | `hasattr(FastMCP,'add_middleware')` | ✅ True |
+| `FastMCP.add_middleware` | `hasattr(FastMCP,'add_middleware')` | ⚠️ **True for the STANDALONE `fastmcp` class ONLY.** Re-probed 2026-08-19: `fused-memory/server/tools.py:17` imports `mcp.server.fastmcp.FastMCP` — the MCP SDK's *bundled* class — where `add_middleware` and `get_tool` are both **False**. This row was verified against one class and applied to four sites. See γ3. |
 | Middleware sees tool name + arguments | live probe, `context.message.name` / `.arguments` | ✅ `demo`, `{'content':…,'category':'orig'}` |
 | Middleware can read the tool's parameter schema | live probe, `context.fastmcp_context.fastmcp.get_tool(n).parameters['properties']` | ✅ `['category','content','project_id']` — **the validation substrate is real** |
 | Mutated arguments reach the tool | live probe, set `arguments['category']='REPAIRED'` | ✅ tool returned `ok:…|REPAIRED|None` — **forward-repair is implementable** |
 | `dark-factory-shared` importable from all three packages | `pyproject.toml` workspace dep + live imports | ✅ fused-memory, orchestrator, escalation all import `shared.*` today |
-| The four registration sites | grep `FastMCP(` | ✅ `tools.py:1038`, `plan_tools.py:596`, `verdict_tools.py:172`, `escalation/server.py:307` |
+| The four registration sites | grep `FastMCP(` | ⚠️ Sites exist, but a **name match does not distinguish the two FastMCP classes**, which is how the row above passed green for a site lacking the capability. Anchors are also stale — re-measured on `f15a796313`: `tools.py:1060`, `plan_tools.py:1553`, `verdict_tools.py:172`, `escalation/server.py:649`. Re-grep; they move. |
 | `EscalationQueue` for residue escalations | already used by `markup_tripwire.emit_markup_storm_escalation` | ✅ |
 | 334-specimen corpus extractable | `data/orchestrator/agent-transcripts/**/*.jsonl.gz` | ✅ 334 collected, 308 repair, 26 escalate |
 
@@ -271,10 +289,43 @@ Implements C2: `RepairPolicy.{REJECT_WITH_REPAIR,FORWARD_REPAIR}`, `exempt_tools
 *Unlocks:* γ (registration on the four servers).
 *Evidence:* against an in-process `FastMCP` harness, a corrupted call under each policy produces the contracted outcome; a burst of repairs fires the storm escalation (INV-4).
 
-**γ — Register the middleware on all four servers; retire the in-line gates.** *(leaf)* · depends: β
-Modules: `fused-memory/src/fused_memory/server/tools.py`, `orchestrator/src/orchestrator/mcp/plan_tools.py`, `orchestrator/src/orchestrator/mcp/verdict_tools.py`, `escalation/src/escalation/server.py`.
-Registers with the declared per-server policy from C2 and removes the four `_markup_gate` call sites (D1, INV-5).
-*Signal:* a live `submit_task` whose description carries `</description>` + `<parameter name="priority">low` is **rejected with `repaired_call` containing `priority: "low"`**; a live `escalate_info` with the same defect **lands with `suggested_action` populated** and emits `markup_repaired` — both observable through the tool response and the filed escalation record, not by reading storage.
+**γ — SPLIT THREE WAYS 2026-08-19 (operator decision).** The single γ leaf declared all four servers and was
+therefore **never dispatched once** — `data/orchestrator/runs.db` carries zero events of any type for task 3690
+across four months, because the task required simultaneous module locks on the two hottest files in the repo
+(61 pending/in-progress tasks declare `fused-memory/server/tools.py`, 26 declare `escalation/server.py`). Two
+further reasons to split rather than re-pin: plan-tools acquired a *second* mechanism after decompose (ε, task
+3692) and needs an explicit D1 ruling, and fused-memory turns out not to support the middleware at all (§6).
+Nothing about the contracts changed — only the packaging.
+
+**γ1 — Register on the escalation and verdict-tools servers (the `FORWARD_REPAIR` pair).** *(leaf, task 3690)* · depends: β
+Modules: `escalation/src/escalation/server.py`, `orchestrator/src/orchestrator/mcp/verdict_tools.py`.
+Absorbs task **4180** (cancelled into it): same escalation-server slice, and its "reject vs stamp vs recover vs log"
+design question is already answered by C2 (`FORWARD_REPAIR` *is* its option (c)). Carries 4180's one non-obvious
+finding — `escalate_info.evidence` is **list-typed** while `Repair.recovered` is `dict[str, str]` and the middleware
+applies it as a bare `arguments.update` with no coercion, a case B3's str-typed specimen never exercises.
+*Signal:* a live `escalate_info` with a mis-closed `detail` **lands with `suggested_action` populated and `evidence`
+restored as a list**, and emits `markup_repaired` — where the identical call today lands with both silently at their
+defaults. This is where the *silent* damage actually is: a swallowed **required** parameter raises loudly in pydantic,
+a swallowed **optional** one just takes its default, and `escalate_info` requires only its first four.
+
+**γ2 — Register on plan-tools, and rule on the overlap with ε.** *(leaf, task 4457)* · depends: β
+Modules: `orchestrator/src/orchestrator/mcp/plan_tools.py`.
+ε (3692) landed `_with_markup_repairs` in this same file: **read-time** lazy repair of stored `plan.json` with
+write-back, which cannot reject, memoizes refusals per process, and whose `plan_markup_repaired` log line has **no
+sink** and whose `markup_repairs` fact has **no consumer**. `_create_plan` is deliberately unhooked with a comment
+delegating inbound arguments to this middleware. Complementary in principle — but D1/INV-5 requires the ruling be
+made, tested, and written down, not left implicit.
+*Signal:* as the original γ's `submit_task` row (B1/B2), on a plan-tools write tool.
+
+**γ3 — Adapt the guard to fused-memory's bundled FastMCP; cover the two ungated write tools; only then retire the in-line gates.** *(leaf, task 4458)* · depends: β
+Modules: `fused-memory/src/fused_memory/server/tools.py`, `fused-memory/src/fused_memory/server/main.py`.
+Choose between migrating to standalone `fastmcp` and adapting through the existing `_safe_call_tool` chokepoint in
+`server/main.py` (an in-repo precedent for a single interception point on this server). New coverage: `add_system_record`
+(`:3102`) and `update_memory` (`:4316`), both ungated, both Mem0 writers, both optional-tailed.
+⚠️ **The in-line gates are retired only after the replacement is live and demonstrated.** This is the one boundary whose
+containment provably works — Mem0 is frozen at 40 legacy specimens since **2026-07-30**, Graphiti at 14 since
+**2026-07-29** (both re-measured 2026-08-19; Graphiti had never been scanned before, as `scan_memory_content` is
+Mem0/Qdrant-only). Retiring early would open the only door that is currently shut.
 
 **δ — Retro-sweep of terminal state, atomic.** *(leaf)* · depends: α
 Modules: `scripts/sweep_toolcall_markup.py`, `scripts/tests/`.
@@ -305,7 +356,9 @@ Re-point `docs/prds/memory-write-path-convergence.md` §8's "XML-leak cure" row 
 ### DAG
 
 ```
-α ──┬── β ── γ ── ι
+α ──┬── β ──┬── γ1 ──┐
+    │        ├── γ2 ──┼── ι
+    │        └── γ3 ──┘
     ├── δ
     ├── ε
     ├── ζ

@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import asyncio
 import enum
+import logging
 import os
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -66,6 +67,7 @@ from shared.task_statuses import TaskStatus
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.landed_outbox import MergeProvenance
+from orchestrator.recovery_emission import LeaveReason, render_shape
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -76,16 +78,21 @@ if TYPE_CHECKING:
     from orchestrator.git_ops import GitOps
     from orchestrator.scheduler import Scheduler
 
+logger = logging.getLogger(__name__)
+
 __all__ = [
     'BranchState',
     'BranchStateKind',
     'Claimant',
     'ClaimantSource',
     'EscalationRef',
+    'LeaveReason',
     'RecoveryAction',
     'TaskGroundTruth',
     'TruthReport',
     'classify_recovery',
+    'leave_reason',
+    'recovery_shape_str',
 ]
 
 
@@ -205,8 +212,15 @@ class EscalationRef:
     ``escalation.pins.classify_pins`` (normative source: spec S6) — this
     docstring deliberately does not restate them.
 
-    Both new fields are DEFAULTED so every existing construction site keeps
-    working untouched.
+    ``created_at`` is the record's filing time (the queue row's ``timestamp``),
+    carried here because this ref is the ONLY record shape available at the
+    reconcile-sweep veto site — re-reading the store there to fetch timestamps
+    would break the one-read discipline this resolver already keeps.  ``None``
+    means "unknown"; ``orchestrator.recovery_emission.escalation_ages_secs``
+    maps that to a ``None`` age rather than dropping the id.
+
+    All three added fields are DEFAULTED so every existing construction site
+    keeps working untouched.
     """
 
     id: str
@@ -214,6 +228,7 @@ class EscalationRef:
     category: str = ''
     severity: str = ''
     filing_claimant_run_id: str | None = None
+    created_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -223,24 +238,30 @@ class TruthReport:
     Frozen — a point-in-time snapshot, not a live view; callers re-derive
     via :meth:`TaskGroundTruth.derive_truth` for a fresh report.
 
-    KNOWN GAP on ``open_escalations`` (task 3533 -> beta/3535): its ``[]`` is
-    currently AMBIGUOUS — "the store was read and holds no open escalations"
-    and "no escalation store was bound, so no read was possible" are
-    indistinguishable (see :meth:`TaskGroundTruth._resolve_open_escalations`).
-    That is exactly the collapse ``escalation.pins.classify_pins(records=None)
-    -> store_unavailable`` exists to make impossible, so this field has no way
-    to reach that third state yet.  Task beta (3535) widens it; until then a
-    consumer must NOT read ``open_escalations == []`` as proof that the task
-    carries no open escalation.
+    ``open_escalations == []`` is no longer ambiguous (task 3535): read it
+    together with ``escalation_store_unavailable``, which distinguishes "the
+    store was read and holds no open records" from "no read was possible".
+    Those are the same two states ``escalation.pins.classify_pins(records=None)
+    -> store_unavailable`` separates, and its store-correctness contract is the
+    normative statement of why — this docstring deliberately does not restate it.
+
+    ``escalation_store_unavailable`` is deliberately NOT folded into
+    :func:`_shape`'s table key; see the comment there for the disposition that
+    fold would change and who owns it.
     """
 
     db_status: str
     live_claimant: Claimant | None
     branch_state: BranchState
     worktree_present: bool
-    # ``[]`` is ambiguous — see the KNOWN GAP note in the class docstring.
+    # Read together with ``escalation_store_unavailable`` below — ``[]`` alone
+    # is not proof that the task carries no open escalation.
     open_escalations: list[EscalationRef]
     deploy_phase: DeployPhase | None
+    #: True when the escalation store could not be READ (no queue bound, or the
+    #: read raised).  DEFAULTED so every existing construction site keeps
+    #: working untouched.
+    escalation_store_unavailable: bool = False
 
 
 def _utc_now() -> datetime:
@@ -382,13 +403,15 @@ class TaskGroundTruth:
         )
         task = task or {}
         worktree_path = self.worktree_resolver(tid)
+        open_escalations, store_unavailable = self._resolve_open_escalations(tid)
         return TruthReport(
             db_status=task.get('status') or '',
             live_claimant=self._resolve_live_claimant(tid, task, worktree_path),
             branch_state=branch_state,
             worktree_present=worktree_path.exists(),
-            open_escalations=self._resolve_open_escalations(tid),
+            open_escalations=open_escalations,
             deploy_phase=self._resolve_deploy_phase(task.get('metadata')),
+            escalation_store_unavailable=store_unavailable,
         )
 
     async def recovery_for(self, tid: str) -> tuple[TruthReport, RecoveryAction]:
@@ -629,32 +652,45 @@ class TaskGroundTruth:
                 )
         return None
 
-    def _resolve_open_escalations(self, tid: str) -> list[EscalationRef]:
-        """Map *tid*'s pending escalations to lightweight refs.
+    def _resolve_open_escalations(
+        self, tid: str,
+    ) -> tuple[list[EscalationRef], bool]:
+        """Map *tid*'s pending escalations to refs, plus the store's readability.
 
-        ``severity`` and ``filing_claimant_run_id`` travel with each ref so
-        consumers can feed ``escalation.pins.classify_pins`` directly instead
-        of re-reading the store (spec ``docs/task-escalation-state-spec.md``
-        S6/E7).  ``row.severity or ''`` normalises a null/absent severity to
-        the unknown-severity sentinel, so the classifier reaches its
-        documented fail-safe-to-pinning branch rather than raising.
+        ``severity``, ``filing_claimant_run_id`` and ``created_at`` travel with
+        each ref so consumers can feed ``escalation.pins.classify_pins``
+        directly, and age a hold, without re-reading the store (spec
+        ``docs/task-escalation-state-spec.md`` S6/E7).  ``row.severity or ''``
+        normalises a null/absent severity to the unknown-severity sentinel, so
+        the classifier reaches its documented fail-safe-to-pinning branch
+        rather than raising.
 
         STORE-CORRECTNESS (spec S6; esc-3163 was a wrong-store read): this
         resolver reads the escalation store INJECTED by the task's owning
-        orchestrator — never the reconciliation store.
+        orchestrator — never the reconciliation store.  Its second obligation —
+        never substitute ``[]`` for a read that could not be performed — is why
+        this returns a THIRD state rather than collapsing both into ``[]``;
+        ``classify_pins``'s docstring is the normative statement of that
+        contract and is not restated here.
 
-        ``[]`` when no ``escalation_queue`` was injected — a caller that
-        doesn't wire one up gets an empty-but-valid TruthReport field rather
-        than an error.  That degradation is a KNOWN gap: it is indistinguishable
-        from a genuine "no open escalations", which is exactly the collapse
-        ``classify_pins(records=None)`` -> ``store_unavailable`` exists to
-        prevent.  Task beta (3535) replaces it with that distinguishable third
-        state; it is deliberately left unchanged here so this task ships no
-        disposition change.
+        Returns:
+            ``(refs, store_unavailable)``.  ``store_unavailable`` is True when
+            no ``escalation_queue`` was injected, or when the read RAISED — a
+            store fault degrades this one field (loudly, at WARNING) rather
+            than aborting the whole ground-truth sweep, matching the plan.lock
+            and deploy-state degradations elsewhere in this class.
         """
         if self.escalation_queue is None:
-            return []
-        rows = self.escalation_queue.get_by_task(tid, status='pending')
+            return [], True
+        try:
+            rows = self.escalation_queue.get_by_task(tid, status='pending')
+        except Exception:
+            logger.warning(
+                'task_ground_truth: escalation store read failed for task %s '
+                '— reporting store_unavailable rather than "no open '
+                'escalations" (non-fatal)', tid, exc_info=True,
+            )
+            return [], True
         return [
             EscalationRef(
                 id=row.id,
@@ -662,9 +698,10 @@ class TaskGroundTruth:
                 category=row.category,
                 severity=row.severity or '',
                 filing_claimant_run_id=row.filing_claimant_run_id,
+                created_at=getattr(row, 'timestamp', None),
             )
             for row in rows
-        ]
+        ], False
 
     def _resolve_deploy_phase(self, metadata: object) -> DeployPhase | None:
         """Resolve a deterministic task's ``deploy_state.phase`` (DS-1/ε).
@@ -807,6 +844,16 @@ def _shape(report: TruthReport) -> _RecoveryShape:
     check let an open L2 slip through row (a)'s veto and let rows (g)/(h)
     re-file over an already-open L0/L2).
     """
+    # DELIBERATELY not folded in: report.escalation_store_unavailable.
+    # Today a queue-absent or read-failing store yields open_escalations == []
+    # here, so a stranded in-progress task with an off-main branch classifies
+    # REVERT_TO_PENDING (row (c)).  Making store-unavailable pin would flip
+    # that exact shape to LEAVE — a real disposition change during a store
+    # outage, owned by tasks delta/eta behind the operator flip, not by task
+    # beta (3535).  Beta makes the third state VISIBLE (it is emitted as
+    # recovery_left(reason=escalation_store_unavailable)) while leaving this
+    # decision exactly where it was; TestStoreUnavailableChangesNoDisposition
+    # pins the unchanged classification so the fold cannot happen by accident.
     has_open_escalation = bool(report.open_escalations)
     return (
         report.db_status,
@@ -825,3 +872,71 @@ def classify_recovery(report: TruthReport) -> RecoveryAction:
     phantom-done, never guess on an unrecognized shape).
     """
     return _RECOVERY.get(_shape(report), RecoveryAction.LEAVE)
+
+
+# ---------------------------------------------------------------------------
+# Task 3535 (beta) — DESCRIBING a LEAVE, never deciding one.
+#
+# Both functions below are PURE and add no decision: `classify_recovery`'s body
+# and the `_RECOVERY` table above are untouched.  They exist so every veto site
+# can emit a structured account of the disposition it ALREADY reached.  The
+# canonical WHY for that mechanism lives in
+# orchestrator/src/orchestrator/recovery_emission.py (module docstring).
+#
+# THE PRECEDENCE CHAIN, evaluated top to bottom (same discipline as
+# escalation/pins.py's documented chain: re-ordering these links changes what
+# an operator is told, so change them deliberately).
+#
+#   1. live_claimant present            -> LIVE_CLAIMANT
+#      A held task is not stranded; there is nothing to recover yet.  Above
+#      everything else because a pinned-AND-held task is simply running, and
+#      because this is the healthy majority of every sweep (it emits nothing).
+#   2. escalation_store_unavailable     -> ESCALATION_STORE_UNAVAILABLE
+#      "we could not READ the store" is a strictly better explanation than any
+#      conclusion drawn from the empty list that outage produced.  Above
+#      escalation_pinned only for completeness — an unavailable store always
+#      yields open_escalations == [] — and above unmapped_shape because the
+#      shape is only unmapped as a CONSEQUENCE of the failed read.
+#   3. open_escalations non-empty       -> ESCALATION_PINNED
+#      The veto proper: a record actively held back an action the table would
+#      otherwise have taken.  Boundary #9 (row (f)) lands here.
+#   4. deploy_phase present             -> DEPLOY_PHASE_IN_FLIGHT
+#      One of the deliberately-unmapped phases (VERIFIED / FAILED / SCHEDULED /
+#      ESCALATED / DONE — see the note in `_RECOVERY`).  Below link 3 because a
+#      deploy holding an open record is PINNED, not merely in flight.
+#   5. otherwise                        -> UNMAPPED_SHAPE
+#      The table's fail-safe default reached on its own merits.
+# ---------------------------------------------------------------------------
+
+
+def leave_reason(report: TruthReport) -> LeaveReason | None:
+    """Describe WHY *report* classified :attr:`RecoveryAction.LEAVE`.
+
+    Returns ``None`` whenever :func:`classify_recovery` did NOT return LEAVE,
+    so a caller can never mislabel an action it actually took as a hold.
+
+    See the precedence chain above for the ordering and its rationale.  Pure:
+    no I/O, no mutation, and no influence on the disposition itself.
+    """
+    if classify_recovery(report) is not RecoveryAction.LEAVE:
+        return None
+    if report.live_claimant is not None:
+        return LeaveReason.live_claimant
+    if report.escalation_store_unavailable:
+        return LeaveReason.escalation_store_unavailable
+    if report.open_escalations:
+        return LeaveReason.escalation_pinned
+    if report.deploy_phase is not None:
+        return LeaveReason.deploy_phase_in_flight
+    return LeaveReason.unmapped_shape
+
+
+def recovery_shape_str(report: TruthReport) -> str:
+    """Render *report*'s discretized shape as the emitted ``shape`` string.
+
+    Delegates to ``recovery_emission.render_shape`` over EXACTLY the tuple
+    :func:`_shape` builds its ``_RECOVERY`` key from — by splatting ``_shape``'s
+    own output, not by re-listing the elements.  That binding is what keeps an
+    emitted shape string from drifting away from the table key it describes.
+    """
+    return render_shape(*_shape(report))

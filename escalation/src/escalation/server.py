@@ -15,6 +15,7 @@ from fastmcp import FastMCP
 from fastmcp.server.dependencies import get_http_headers
 from pydantic import ValidationError
 from shared.branch_names import canonical_queued_branch_name
+from shared.storm_counter import StormCounter
 from shared.task_runtime_state import TaskRuntimeEntry, TaskRuntimeSnapshot
 
 from escalation import sweep as _sweep
@@ -29,9 +30,10 @@ from escalation.models import (
     RESOLUTION_CLASSES,
     Escalation,
     EvidenceEntry,
+    max_severity,
 )
 from escalation.pins import classify_pins
-from escalation.queue import EscalationQueue
+from escalation.queue import AmendmentOutcome, EscalationQueue
 from escalation.queue import observed_submit_response as _observed_submit_response
 
 logger = logging.getLogger(__name__)
@@ -66,6 +68,96 @@ def _is_harness_sentinel_role(agent_role: str) -> bool:
     through to the downgrade path instead of raising ``AttributeError``.
     """
     return any((agent_role or '').startswith(p) for p in _HARNESS_SENTINEL_ROLE_PREFIXES)
+
+
+def _derive_l2_severity(queue: EscalationQueue, member_ids: list[str]) -> str | None:
+    """Return max(member severities) for a promoted L2, or None if none is usable.
+
+    This is what an OMITTED ``promote_to_l2(severity=...)`` argument resolves
+    to (task 3976).  The old literal ``'blocking'`` default inflated every
+    cluster of purely-informational L1s into a human-paging L2 — and did so
+    non-deterministically, since the outcome hinged on whether the LLM caller
+    happened to type the argument at all.
+
+    Members are read through ``queue.get()`` rather than the queue root
+    directly, so a member already resolved and archived between the watcher's
+    drain and its promote still contributes its true severity (``get`` falls
+    back to the archive), and repeated lookups of a genuinely nonexistent id
+    are negative-cached rather than re-scanning the archive each time.
+
+    **The fold ranges over ``KNOWN_SEVERITIES`` ONLY.**  A member is USABLE
+    only if it resolves AND its ``severity`` is in the vocabulary.  Nothing
+    validates a record's severity on write — ``Escalation`` is a plain
+    dataclass and ``queue.submit``/``_rewrite`` are field-agnostic
+    passthroughs — so a legacy, corrupt, or externally-written member can carry
+    an out-of-vocabulary string (``''``, ``'warn'``).  ``max_severity`` ranks
+    an unknown at 0, but its ``>=`` tie-break would let that string WIN over a
+    genuine ``'info'`` sibling and be minted onto the L2 verbatim, reported
+    back through the response ``severity`` key and missed by cockpit's
+    ``severity_weights``.  Treating it as unusable keeps the tool's promise
+    that a filed severity is always one of ``KNOWN_SEVERITIES``.
+
+    **Returning None means "the members say nothing".**  The two call paths
+    need different fail-safes, so this function reports the fact rather than
+    picking one:
+
+    - CREATE must choose a severity, so it fails safe UP to ``'blocking'`` —
+      today's behaviour, unchanged.  Rejecting the promotion instead would
+      silently drop a promotion the caller believed it had made, and quieting
+      it to ``'info'`` would fail in the dangerous direction.  This matches
+      ``escalation.pins`` link 2: an unknown severity fails safe to pinning,
+      never to conversion.
+    - UPDATE must NOT: the existing L2 already carries a severity derived from
+      real members, so an underivable set has nothing to contribute.  Failing
+      up there would inflate a correctly-inherited ``info`` L2 to ``blocking``
+      (and bump ``updated_at``, re-triggering the watcher's re-assess) merely
+      because an id was typo'd or momentarily unreadable.
+
+    Either way the unusable ids are named at WARNING — loud, never silent.
+
+    A PARTIALLY usable set derives from the usable subset only — discarding a
+    known-info member because a sibling id was unreadable would reintroduce
+    the very inflation this exists to remove.  The fold is therefore seeded
+    from the first USABLE member rather than from ``'info'``: an empty-ish
+    seed would be indistinguishable from a real info member, and the explicit
+    nothing-usable branch is what carries the fail-safe.
+    """
+    resolved: list[str] = []
+    unusable: list[str] = []
+    for mid in member_ids:
+        member = queue.get(mid)
+        if member is None:
+            unusable.append(mid)
+        elif member.severity not in KNOWN_SEVERITIES:
+            logger.warning(
+                'promote_to_l2: member escalation %s carries out-of-vocabulary '
+                'severity %r (expected one of %s); excluding it from the derived '
+                'L2 severity rather than propagating it.',
+                mid, member.severity, sorted(KNOWN_SEVERITIES),
+            )
+            unusable.append(mid)
+        else:
+            resolved.append(member.severity)
+
+    if not resolved:
+        logger.warning(
+            'promote_to_l2: no member escalation yielded a usable severity for %s '
+            '— cannot derive an L2 severity from members. Unusable ids: %s',
+            member_ids, ', '.join(unusable) or '(none)',
+        )
+        return None
+
+    if unusable:
+        logger.warning(
+            'promote_to_l2: %d of %d member escalation(s) yielded no usable '
+            'severity; deriving from the usable subset only. Unusable ids: %s',
+            len(unusable), len(member_ids), ', '.join(unusable),
+        )
+
+    derived = resolved[0]
+    for sev in resolved[1:]:
+        derived = max_severity(derived, sev)
+    return derived
 
 
 # The role the steward's own filings carry (orchestrator.steward
@@ -283,17 +375,42 @@ CATEGORIES = [
     'stranded_merge_failed',
 ]
 
-# Fields returned by get_pending_escalations(compact=True) — the triage-relevant
-# subset a long-running L2 watcher needs to decide whether to pull a full record.
-# The heavy fields (detail, members, options, root_cause, train_state,
-# workflow_state, worktree, dedupe_*) are dropped to keep the watcher's context
-# small as the pending pile grows during an AFK window. The triage-ack fields
-# (triaged_at, triaged_by, triage_note, updated_at) are included so a compact
-# drain can decide stamp-then-skip without a per-record get_escalation round-trip.
+# OUTPUT keys of a compact row — the triage-relevant subset a long-running L2
+# watcher needs to decide whether to pull a full record.  NOTE these are output
+# keys, not model field names: ``member_ids`` is a PROJECTION of the model's
+# ``members`` list (renamed once, in _compact_escalation below), so this tuple is
+# no longer a pure key subset of Escalation.to_dict().
+# The heavy fields (detail, options, train_state, workflow_state, worktree,
+# dedupe_*) are still dropped to keep the watcher's context small as the pending
+# pile grows during an AFK window; `detail` in particular is the unbounded
+# free-text field that motivated compact mode.  ``root_cause`` and
+# ``member_ids`` are what let a rotating watcher rebuild `already_promoted` from
+# the drain ALONE, with no session memory (task 3997, C1).  ``amendments`` is
+# deliberately NOT projected, so preserved incoming framing never inflates a
+# drain.
+#
+# NEITHER OF THE TWO ADDED FIELDS IS BOUNDED IN PRINCIPLE, and this comment used
+# to claim they were "bounded by construction" — they are not.  ``promote_to_l2``
+# validates only that ``root_cause.strip()`` is non-empty, so an arbitrarily long
+# key rides every compact row, and ``member_ids`` grows with cluster size.  Both
+# are short in PRACTICE (a one-line dedup key; ~20-char ids), which is the actual
+# basis for including them.  Bounding them here was considered and REJECTED in
+# both available forms: truncating ``root_cause`` in the projection would
+# silently break the exact-match rebuild that is C1's entire point, and capping
+# it at mint would either fail a legitimate promote outright or collapse two
+# distinct keys into one L2 — over-folding, the very failure the amendment
+# storm report exists to surface.  The cost is real and named rather than
+# denied: every compact reader pays it, including the dashboard's
+# ``fetch_pins_recovery`` poll (dashboard/.../escalations.py), which asks for
+# ``compact=True`` on a loop and reads nothing but ``pins_recovery``.
+# The triage-ack fields (triaged_at, triaged_by, triage_note, updated_at) are
+# included so a compact drain can decide stamp-then-skip without a per-record
+# get_escalation round-trip.
 _COMPACT_ESCALATION_FIELDS = (
     'id', 'task_id', 'category', 'severity', 'level', 'status',
     'summary', 'suggested_action', 'timestamp',
     'triaged_at', 'triaged_by', 'triage_note', 'updated_at',
+    'root_cause', 'member_ids',
 )
 
 # get_pending_escalations(compact=True) additionally keeps its computed
@@ -301,6 +418,66 @@ _COMPACT_ESCALATION_FIELDS = (
 # here would blank the whole PINNING surface.  Kept as a separate tuple so
 # get_task_escalations — which never computes the annotation — is untouched.
 _COMPACT_PENDING_FIELDS = (*_COMPACT_ESCALATION_FIELDS, 'pins_recovery')
+
+
+def _compact_escalation(d: dict[str, Any], fields: tuple[str, ...]) -> dict[str, Any]:
+    """Project one Escalation.to_dict() into a compact row over *fields*.
+
+    THE single site that knows compact rows expose ``member_ids`` where the model
+    says ``members`` (task 3997).  Both compact apply sites route through here so
+    the rename exists exactly once; widening _COMPACT_ESCALATION_FIELDS is then
+    enough to change both tools' wire shape.
+
+    Keys absent from *d* are OMITTED rather than defaulted.  That is not
+    defensive tidiness: ``pins_recovery`` is deliberately absent when it cannot
+    be computed, and emitting a false ``[]`` there reads as "nothing pins this
+    task" — the exact collapse (esc-3163) the omission contract exists to
+    prevent.
+    """
+    row: dict[str, Any] = {}
+    for k in fields:
+        if k == 'member_ids':
+            # Projection, not a model field: renamed from `members`.  Copied so a
+            # caller mutating the row cannot reach back into the loaded record.
+            row[k] = list(d.get('members', []))
+        elif k in d:
+            row[k] = d[k]
+    return row
+
+
+# INV-4 storm escape for L2 amendment truncation (task 3997).  Sizing: with
+# ``queue._MAX_AMENDMENTS`` = 20, ONE L2 has to fold 21+ times inside the window
+# to truncate even ONCE, so three truncations in an hour is not routine churn.
+# It says either the cap is systematically wrong for the live fold rate, or
+# root-cause matching is over-folding unrelated clusters into a single L2 — and
+# task 3998 canonicalises that matching, which RAISES the fold rate BY DESIGN.
+# Both readings are worth a human-adjacent signal rather than a WARNING nobody
+# reads; the durable per-record ``amendments_truncated`` counter remains the
+# primary structured fact (INV-8), this is the notification layered on it.
+#
+# Module constants rather than a config leaf, following the sanctioned
+# precedent of ``reconciliation/harness.py``'s ``_PLACEHOLDER_DROP_STORM_*``,
+# whose stated reason — the counter is private to this module — holds
+# identically here.  They are still passed per ``record()`` call because that
+# is ``StormCounter``'s API (see its RELOAD SAFETY note).
+_AMENDMENT_TRUNCATION_STORM_THRESHOLD = 3
+_AMENDMENT_TRUNCATION_STORM_WINDOW_SECONDS = 3600.0  # 1 h
+
+# A stable SYNTHETIC anchor (not a real task id), mirroring
+# ``markup_tripwire._ANCHOR_TASK_ID`` and its siblings.  The condition this
+# report describes — cap sizing, or root-cause matching over-folding unrelated
+# clusters — is SYSTEM-scoped, and a burst routinely spans several L2s across
+# several tasks, so filing it against whichever promote happened to cross the
+# threshold would be arbitrary attribution with two real costs:
+# ``get_task_escalations(that_task)`` would surface an infra record unrelated to
+# the task, and because this helper calls ``_submit_or_dedupe`` directly (it is
+# sync, and must never fail the promote) it bypasses the terminal-task
+# chokepoint, so the report could land PENDING on an already-terminal task.
+# The affected L2 ids stay named in the summary and detail, which is where the
+# attribution belongs.  The ids also form one greppable
+# ``esc-l2-amendment-truncation-N`` series.
+_AMENDMENT_TRUNCATION_ANCHOR_TASK_ID = 'l2-amendment-truncation'
+
 
 # Task statuses from which a recovery/redispatch is still possible.  A record
 # on a task outside this set pins nothing: there is no recovery to block.
@@ -540,6 +717,96 @@ def create_server(
             # (still carrying esc.level, so the 'level' echo is never missing).
             return _observed_submit_response(queue, esc_id, fallback_level=esc.level)
         return _dedupe_submit_or_dedupe(queue, esc, cfg)
+
+    # --- Amendment-truncation storm escape (INV-4, task 3997) ---
+
+    # PROCESS-LOCAL and per-instance BY CONSTRUCTION.  StormCounter documents
+    # its state as resetting on restart and not bleeding between servers (or
+    # between tests), and server.py otherwise holds zero module-level mutable
+    # state — every module-level name above is a frozen constant.  Keeping the
+    # counter in this closure is what preserves that property.
+    _amendment_truncation_storm = StormCounter()
+
+    def _report_amendment_truncation_storm(l2_id: str) -> None:
+        """File ONE info escalation when amendment truncation BURSTS.
+
+        ``queue.add_members_to_l2`` already counts every dropped amendment on
+        the record itself (``amendments_truncated``) and logs a WARNING.  The
+        counter stays the PRIMARY structured fact — the contract is assertable
+        from the record, never by log-scrape (INV-8) — but a WARNING has no
+        audience.  This is the rate-thresholded NOTIFICATION layered on top,
+        which is what INV-4 asks for: a hearer, at a threshold.
+
+        Deliberately lives here and not in ``queue.py``.  That module is a pure
+        storage leaf, and a self-file from inside ``add_members_to_l2`` would
+        re-enter ``make_id``/``submit``/``_atomic_write`` while still holding
+        ``escalation_id_lock``.  ``promote_to_l2`` already calls ``queue.submit``
+        on its create path and runs outside that flock.
+
+        PURELY ADDITIVE, NEVER FATAL, mirroring the house analogues
+        ``emit_markup_storm_escalation`` and
+        ``emit_residual_candidate_key_escalation``: nothing raised in here may
+        fail the promote that triggered it.  A dropped report costs a
+        notification; a raised one would cost the fold.
+
+        Filed under ``_AMENDMENT_TRUNCATION_ANCHOR_TASK_ID``, following the same
+        analogues, because the condition is system-scoped rather than a property
+        of whichever task's promote crossed the threshold.  The affected L2 ids
+        are named in the summary and detail instead.
+        """
+        try:
+            storm = _amendment_truncation_storm.record(
+                threshold=_AMENDMENT_TRUNCATION_STORM_THRESHOLD,
+                window_seconds=_AMENDMENT_TRUNCATION_STORM_WINDOW_SECONDS,
+                # The label is load-bearing, not decoration: it is what lets the
+                # report name WHICH L2s truncated instead of blaming whichever
+                # call happened to cross the threshold.
+                label=l2_id,
+            )
+            # None means below threshold, or a previous fire is still inside the
+            # window (one report per window, so a runaway escalates once).
+            if storm is None:
+                return
+            labels = ', '.join(storm['labels']) or l2_id
+            _submit_or_dedupe(Escalation(
+                # Filed under the synthetic anchor, NOT the triggering promote's
+                # task_id — see _AMENDMENT_TRUNCATION_ANCHOR_TASK_ID.
+                id=queue.make_id(_AMENDMENT_TRUNCATION_ANCHOR_TASK_ID),
+                task_id=_AMENDMENT_TRUNCATION_ANCHOR_TASK_ID,
+                agent_role='escalation-server',
+                # A report about lost framing is a notification, not a page:
+                # 'info' keeps it off the born-at-L2 human-direct route.
+                severity='info',
+                category='infra_issue',
+                summary=(
+                    f"L2 amendment truncation storm: {storm['count']} truncations "
+                    f"in {storm['window_seconds']}s "
+                    f"(threshold {storm['threshold']}); L2s: {labels}"
+                ),
+                detail=(
+                    f"OBSERVED: {storm['count']} amendment truncations within "
+                    f"{storm['window_seconds']}s across L2 escalation(s): {labels}.\n"
+                    f"Each truncation drops the OLDEST entry of that L2's "
+                    f"`amendments` list at the queue._MAX_AMENDMENTS cap; the "
+                    f"record's own `amendments_truncated` field holds the durable "
+                    f"per-L2 total, and its own root_cause/detail/options/summary "
+                    f"are never touched.\n"
+                    f"Hypothesis: either the cap is too low for the live fold "
+                    f"rate, or root-cause matching is over-folding unrelated L1 "
+                    f"clusters into one L2."
+                ),
+                suggested_action=(
+                    'Read the named L2s and compare each record\'s own framing '
+                    'against its amendments to judge whether those folds belong '
+                    'together; then either raise queue._MAX_AMENDMENTS or tighten '
+                    'root-cause matching.'
+                ),
+            ))
+        except Exception as e:  # pragma: no cover - defensive, never fatal
+            logger.exception(
+                'amendment-truncation storm report failed for L2 %s (non-fatal): %s',
+                l2_id, e,
+            )
 
     # --- Terminal-task chokepoint helper ---
 
@@ -1198,15 +1465,31 @@ def create_server(
         ANY escalation ever exist for this task", use ``get_task_escalations``
         instead — an empty result here is not evidence of absence.
 
-        *compact* — when True, each returned dict is projected to only the
-        triage-relevant fields (``id``, ``task_id``, ``category``, ``severity``,
-        ``level``, ``status``, ``summary``, ``suggested_action``, ``timestamp``);
-        the heavy free-text/cluster fields (``detail``, ``members``, ``options``,
-        ``root_cause``, ``train_state``, ``workflow_state``, ``worktree``,
-        ``dedupe_*``) are omitted.  Use this from a long-running watcher to keep
-        context small as the pending pile grows; fetch the full record for a
-        specific id via ``get_escalation`` only when you are about to act on it.
-        Default False preserves the full-dict shape for existing callers.
+        *compact* — when True, each returned dict is projected to the
+        triage-relevant field subset, plus this tool's computed
+        ``pins_recovery`` (below).  The authoritative list is
+        :data:`_COMPACT_ESCALATION_FIELDS` — read it there rather than trusting
+        a prose copy, which is how this paragraph drifted before.  What is
+        DROPPED: the heavy free-text/cluster fields ``detail``, ``options``,
+        ``train_state``, ``workflow_state``, ``worktree`` and ``dedupe_*``, plus
+        ``amendments``.  ``detail`` is the unbounded free-text field compact mode
+        exists to keep out of a long-running watcher's context.
+
+        Two L2-cluster fields ARE returned, because they are bounded by
+        construction and load-bearing for triage (task 3997): ``root_cause``,
+        the one-line dedup key ``promote_to_l2`` folds on, and ``member_ids``,
+        the PROJECTION of the record's ``members`` list under a contract name
+        (the raw ``members`` key stays dropped).  Together they make a drain
+        SELF-SUFFICIENT: a rotating watcher rebuilds ``already_promoted`` as
+        {root_cause of the pending L2s} u {their member_ids} across the returned
+        rows, with NO session memory — previously that set could only be carried
+        forward in-session, so a rotation re-promoted clusters it had already
+        promoted.
+
+        Use this from a long-running watcher to keep context small as the
+        pending pile grows; fetch the full record for a specific id via
+        ``get_escalation`` only when you are about to act on it.  Default False
+        preserves the full-dict shape for existing callers.
 
         *pins_recovery* — each returned dict carries a computed
         ``pins_recovery`` list: ``[task_id]`` when THIS record is what stops
@@ -1253,10 +1536,12 @@ def create_server(
                 'unstamped records report UNKNOWN (key absent)', len(dicts),
             )
         if compact:
-            # `if k in d` because pins_recovery is deliberately absent when
-            # unknown — projecting it unconditionally would KeyError on
-            # exactly the degraded path the omission contract exists for.
-            return [{k: d[k] for k in _COMPACT_PENDING_FIELDS if k in d} for d in dicts]
+            # _compact_escalation OMITS absent keys because pins_recovery is
+            # deliberately absent when unknown — projecting it unconditionally
+            # would KeyError on exactly the degraded path the omission contract
+            # exists for.  The same helper also owns the members -> member_ids
+            # rename, so both compact tools share one projection (task 3997).
+            return [_compact_escalation(d, _COMPACT_PENDING_FIELDS) for d in dicts]
         return dicts
 
     @mcp.tool()
@@ -1319,7 +1604,7 @@ def create_server(
         )
         if compact:
             return [
-                {k: d[k] for k in _COMPACT_ESCALATION_FIELDS}
+                _compact_escalation(d, _COMPACT_ESCALATION_FIELDS)
                 for d in (e.to_dict() for e in escalations)
             ]
         return [e.to_dict() for e in escalations]
@@ -1455,7 +1740,7 @@ def create_server(
         options: list[str],
         summary: str,
         category: str = 'design_concern',
-        severity: str = 'blocking',
+        severity: str | None = None,
     ) -> dict[str, Any]:
         """Promote one or more L1 escalations to an L2 cluster (human-facing).
 
@@ -1468,7 +1753,17 @@ def create_server(
         **Root-cause dedup**: if a pending L2 with the same *root_cause* already
         exists, this call UPDATES that existing L2 (appends new members) rather
         than filing a duplicate.  The response ``status`` distinguishes the two
-        outcomes: ``'created'`` for a new L2, ``'updated'`` for an append.
+        outcomes: ``'created'`` for a new L2, ``'updated'`` for an append.  An
+        append RAISES the existing L2's severity when the incoming members (or
+        an explicit *severity*) justify it, and never lowers it — an L2's
+        severity is monotonically non-decreasing after mint, so a record cannot
+        be quieted out from under a human already looking at it.  An append also
+        APPENDS this call's *root_cause*/*evidence*/*options*/*summary* to the
+        existing L2's ``amendments`` list rather than discarding them (task
+        3997): the record's OWN framing stays immutable, but the framing a fold
+        carried in is no longer lost.  That list is bounded — oldest-shed at
+        ``queue._MAX_AMENDMENTS``, with every drop counted in the record's
+        ``amendments_truncated``.
 
         **Members stay at L1**: the member L1 escalations are referenced but
         NOT promoted; they remain pending at L1 until the L2 is resolved.
@@ -1477,7 +1772,9 @@ def create_server(
         (create path) or ``queue.add_members_to_l2()`` (update path).  The
         terminal-task auto-resolve gate and severity→level=2 gate in
         ``_chokepoint_or_submit`` are intentionally bypassed — L2 is set
-        explicitly by this tool.
+        explicitly by this tool.  Because that severity→level gate is bypassed
+        by design, nothing else reconciles an L2's severity with the records it
+        clusters; the inherited default below is what does it.
 
         **Identity gate** (PRD task-status-authority C8/D7): the create side
         is gated by ``escalation.authority.PROMOTE_ALLOWED`` — a connection
@@ -1508,20 +1805,78 @@ def create_server(
         category:
             Escalation category; defaults to ``'design_concern'``.
         severity:
-            Severity tag; defaults to ``'blocking'``.  Decoupled from
-            ``level=2`` — the tool sets ``level=2`` explicitly.  Must be one
-            of ``models.KNOWN_SEVERITIES``; unknown values return
-            ``{'error': ...}`` (mirrors ``escalate_blocker`` validation).
+            Severity tag, decoupled from ``level=2`` — the tool sets
+            ``level=2`` explicitly.  **Omit it (or pass ``None``) and the L2
+            INHERITS ``max(member severities)``** — this is the correct default
+            in the overwhelming majority of cases, and is what stops a cluster
+            of purely-informational L1s from being born ``'blocking'`` and
+            paging a human (task 3976).
+
+            An EXPLICIT value overrides the derivation in BOTH directions at
+            mint time.  Upward in particular stays fully available and is not
+            discouraged: a cluster of individually-informational findings CAN
+            be collectively blocking, and a caller whose RCA concluded that
+            should say so explicitly.  (Post-mint the update path applies a
+            monotonic floor and will not accept a demotion — see
+            **Root-cause dedup**.)
+
+            The derivation ranges over ``models.KNOWN_SEVERITIES`` ONLY: a
+            member that does not resolve, or that resolves carrying an
+            out-of-vocabulary severity (nothing validates a record's severity
+            on write), contributes nothing and is named at WARNING.  A
+            partially usable set derives from the usable subset, so the filed
+            severity is always a member of the vocabulary.
+
+            When NO member yields a usable severity the two paths fail safe in
+            DIFFERENT directions.  CREATE must pick something, so it fails safe
+            UP to ``'blocking'``.  UPDATE deliberately does not: the existing
+            L2 already carries a severity derived from real members, so it is
+            left untouched (no floor, no ``updated_at`` bump) rather than being
+            inflated on nothing more than a typo'd or momentarily unreadable
+            member id.
+
+            An explicit value must be one of ``models.KNOWN_SEVERITIES``;
+            unknown values return ``{'error': ...}`` (mirrors
+            ``escalate_blocker`` validation) and mint nothing.
+
+            **An inherited ``'info'`` L2 is deliberately NON_PINNING.**  Before
+            task 3976 no producer could mint an L2 below ``'blocking'``, so
+            every L2 classified ``QUEUE_HANDOFF`` in ``escalation.pins``.  Link
+            1 there short-circuits on ``severity == 'info'`` BEFORE the
+            ``level != 0`` link — "an info record never pins, at any level" —
+            so an inherited-info L2 no longer vetoes its subject task's
+            ``done`` flip.  That is the INTENDED semantics and was considered
+            here, not an oversight: the members it clusters were themselves
+            non-pinning, and a record that does not merit a human's attention
+            must not hold a task open waiting for one.  An L2 that genuinely
+            should pin is one whose members are genuinely non-info, or one the
+            caller filed with an explicit upward *severity*.
 
         Response shapes
         ---------------
         Create (new L2)::
 
-            {'id': <new_id>, 'status': 'created', 'members': [<member_ids>]}
+            {'id': <new_id>, 'status': 'created', 'members': [<member_ids>],
+             'severity': <severity_filed>}
 
         Update (existing pending L2 with same root_cause)::
 
-            {'id': <existing_id>, 'status': 'updated', 'members': [<all_members>]}
+            {'id': <existing_id>, 'status': 'updated', 'members': [<all_members>],
+             'severity': <severity_after_floor>,
+             'amendment_recorded': <bool>, 'amendments': <int>}
+
+        ``amendment_recorded`` is True when THIS call's framing was appended.
+        It is reported by ``add_members_to_l2`` from inside its own write lock
+        (``queue.AmendmentOutcome``), so it describes this call's write exactly
+        — not a difference inferred from a pre-read, which cost an extra record
+        parse per fold and raced concurrent folds in either direction.  A
+        framing-free or framing-identical re-promote appends nothing and
+        correctly reports False.  ``amendments`` is the resulting list length,
+        which saturates at ``queue._MAX_AMENDMENTS``.
+
+        ``severity`` reports what was ACTUALLY filed, which for a caller that
+        omitted the argument is how the inherited value becomes visible — and
+        on the update path is the post-floor value, not the argument.
 
         Error::
 
@@ -1543,7 +1898,7 @@ def create_server(
             return {'error': 'member_ids must be a non-empty list'}
         if not root_cause.strip():
             return {'error': 'root_cause must be a non-empty string'}
-        if severity not in KNOWN_SEVERITIES:
+        if severity is not None and severity not in KNOWN_SEVERITIES:
             return {
                 'error': (
                     f'invalid severity {severity!r}; '
@@ -1551,15 +1906,85 @@ def create_server(
                 ),
             }
 
+        # Validate FIRST, derive second — an invalid explicit severity must mint
+        # nothing and must never be reachable past the derive branch.  Derived
+        # from the RAW member_ids: the fold is order-independent by
+        # construction, and deduplicating the id list is a storage concern.
+        #
+        # `derived is None` means the members said nothing usable (no id
+        # resolved, or every resolved member carried an out-of-vocabulary
+        # severity).  The two paths below fail safe in DIFFERENT directions,
+        # which is why the helper reports the fact instead of picking one.
+        derived = (
+            None if severity is not None else _derive_l2_severity(queue, member_ids)
+        )
+
+        # CREATE must land on some severity, so an underivable set fails safe
+        # UP to 'blocking' — unchanged from before task 3976.
+        effective_severity = (
+            severity
+            if severity is not None
+            else (derived if derived is not None else 'blocking')
+        )
+
+        # UPDATE must NOT fail up: the existing L2 already carries a severity
+        # derived from its real members, so an underivable set has nothing to
+        # contribute and leaves the record (and its updated_at) alone.  Failing
+        # up here would re-inflate a correctly-inherited info L2 to blocking on
+        # nothing more than a typo'd or momentarily unreadable member id —
+        # exactly the inflation this task removes.
+        severity_floor = severity if severity is not None else derived
+
         # Dedup check: look for an existing pending L2 with the same root_cause.
         existing_id = queue.find_pending_l2_by_root_cause(root_cause)
         if existing_id is not None:
-            updated = queue.add_members_to_l2(existing_id, list(dict.fromkeys(member_ids)))
+            # severity_floor is the caller's explicit value, or max(member
+            # severities) over the ids in THIS call — exactly the floor the
+            # incoming members justify — or None when they justify none, in
+            # which case add_members_to_l2 leaves the severity untouched.
+            # Upward-only inside add_members_to_l2, so an append can never
+            # quiet an existing L2.
+            # What this fold did to `amendments` is reported BY THE WRITER,
+            # from inside `escalation_id_lock` where it is already computed —
+            # not re-derived here from a pre-read plus a "did the count grow"
+            # heuristic.  That heuristic cost a second full read+parse per fold
+            # and was a real TOCTOU: the queue is built for cross-process
+            # mutators, so a concurrent fold between the pre-read and the call
+            # made the flag wrong in either direction.
+            outcome: AmendmentOutcome = {'recorded': False, 'dropped': 0}
+            updated = queue.add_members_to_l2(
+                existing_id,
+                list(dict.fromkeys(member_ids)),
+                severity_floor=severity_floor,
+                # The framing this promote carried in is APPENDED to the L2's
+                # `amendments` rather than discarded (task 3997, C2).  The
+                # record's OWN root_cause/detail/options/summary are untouched.
+                root_cause=root_cause,
+                evidence=evidence,
+                options=list(options),
+                summary=summary,
+                agent_role=agent_role,
+                outcome=outcome,
+            )
             if updated is not None:
+                # INV-4: repeated truncation gets a HEARER, not just a WARNING.
+                # The trigger is this call's OWN shed count, so it fires on the
+                # event rather than on an inferred difference.  Purely additive —
+                # _report_amendment_truncation_storm never raises, so a failed
+                # report can never fail this fold.
+                if outcome['dropped']:
+                    _report_amendment_truncation_storm(existing_id)
                 return {
                     'id': existing_id,
                     'status': 'updated',
                     'members': updated.members,
+                    # Read off the returned Escalation, so this is the
+                    # POST-floor value rather than the argument.
+                    'severity': updated.severity,
+                    # Report the preservation, so a caller LEARNS its framing
+                    # landed instead of having to re-read the record to find out.
+                    'amendment_recorded': outcome['recorded'],
+                    'amendments': len(updated.amendments),
                 }
             # Race: the pending L2 was resolved/archived between find and update.
             # Fall through to the create path so the caller gets a valid result
@@ -1577,7 +2002,7 @@ def create_server(
             id=queue.make_id(task_id),
             task_id=task_id,
             agent_role=agent_role,
-            severity=severity,
+            severity=effective_severity,
             category=category,
             summary=summary,
             detail=evidence,
@@ -1587,7 +2012,12 @@ def create_server(
             options=list(options),
         )
         queue.submit(esc)
-        return {'id': esc.id, 'status': 'created', 'members': esc.members}
+        return {
+            'id': esc.id,
+            'status': 'created',
+            'members': esc.members,
+            'severity': esc.severity,
+        }
 
     # --- Merge queue tools ---
 

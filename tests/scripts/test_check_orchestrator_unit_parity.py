@@ -207,6 +207,66 @@ def test_dashboard_checker_consumes_the_lifted_parser():
     assert dashboard._join_continuations is systemd_unit_parity._join_continuations
 
 
+def test_find_dropins_is_shared_not_duplicated():
+    """IDENTITY guard for the SECOND lift: ``find_dropins`` has one home.
+
+    ``find_dropins`` arrived in this family ALREADY duplicated — code-identical
+    bodies in check_dashboard_unit_parity.py and check_orchestrator_unit_parity.py,
+    differing only in their docstrings' example directives. A third consumer
+    (check_lms_unit_parity.py) forced the question, and pasting a third copy
+    would reproduce, inside the tooling built to catch silent drift, precisely
+    the failure it exists to report.
+
+    Same assertion shape as the parser guard above, for the same reason: a
+    look-alike copy pasted back into either checker would leave every other
+    test in both suites green while the implementations quietly diverged.
+    Object identity is the only check that fires on that.
+    """
+    import systemd_unit_parity  # pyright: ignore[reportMissingImports]
+
+    checker = _load_checker()
+    dashboard = _load_dashboard_checker()
+
+    assert checker.find_dropins is systemd_unit_parity.find_dropins
+    assert dashboard.find_dropins is systemd_unit_parity.find_dropins
+
+
+def test_shared_find_dropins_counts_only_conf_files(tmp_path: pathlib.Path):
+    """The lifted helper counts exactly what systemd would actually merge.
+
+    Exercised against the SHARED module rather than through either checker's
+    re-export, so the behaviour is pinned at its new home: no ``<unit>.d``
+    directory yields ``[]``; a directory yields its ``.conf`` files SORTED as
+    absolute paths; and non-``.conf`` entries plus directories that merely
+    happen to be named ``*.conf`` are excluded (the helper filters on
+    ``is_file()``). Counting a stray ``override.conf.bak`` would report an
+    override that has no effect at all.
+    """
+    import systemd_unit_parity  # pyright: ignore[reportMissingImports]
+
+    installed_dir = tmp_path / "user"
+    installed_dir.mkdir()
+    unit = "lms-arm@.service"
+
+    # No <unit>.d directory at all.
+    assert systemd_unit_parity.find_dropins(installed_dir, unit) == []
+
+    dropin_dir = installed_dir / f"{unit}.d"
+    dropin_dir.mkdir()
+    limits = dropin_dir / "10-limits.conf"
+    override = dropin_dir / "override.conf"
+    for path in (override, limits):
+        path.write_text("[Service]\n", encoding="utf-8")
+    (dropin_dir / "override.conf.bak").write_text("[Service]\n", encoding="utf-8")
+    # A DIRECTORY named like a drop-in: systemd would not merge it either.
+    (dropin_dir / "x.conf").mkdir()
+
+    found = systemd_unit_parity.find_dropins(installed_dir, unit)
+
+    assert found == [limits, override]
+    assert all(p.is_absolute() for p in found)
+
+
 # ---------------------------------------------------------------------------
 # The unit registry, and its staleness guard  (step-3 / step-4)
 # ---------------------------------------------------------------------------
