@@ -1328,6 +1328,82 @@ class TestDerivedEdgeLookupKeying:
         assert finding['edges_enumerated_in'] == ['reify', 'dark_factory']
         assert finding['cross_graph'] is True
 
+    async def test_edges_are_attributed_to_the_graph_that_held_them(
+        self, capsys
+    ) -> None:
+        """Which graph held which edge is a fact the row must carry.
+
+        The flat union answers "what are the harm artefacts"; it cannot answer
+        "where do I go to look at them", which is exactly what someone acting
+        on a finding needs — and, once edges are enumerated across every swept
+        graph, the union alone silently merges graphs that a reader may need
+        to tell apart.
+        """
+        episode = 'ep-cross'
+        reify_reader = _FakeReader(
+            [
+                _record(
+                    uuid=episode,
+                    text=ESC_3085_1_INSTANCE_1,
+                    project_id='dark_factory',
+                    graph_name='reify',
+                )
+            ],
+            edges={episode: ('edge-in-reify',)},
+        )
+        dark_reader = _FakeReader([], edges={episode: ('edge-in-dark-factory',)})
+        # A third swept graph that ANSWERS holding nothing: "asked here, found
+        # nothing" must stay distinguishable per graph, not vanish from the map.
+        other_reader = _FakeReader([], edges={})
+        readers = {
+            'reify': reify_reader,
+            'dark_factory': dark_reader,
+            'know_live': other_reader,
+        }
+
+        code = await _run(
+            _args(project=['reify', 'dark_factory', 'know_live']),
+            reader_factory=lambda project: readers[project],
+            probes=_probes(task_status='in-progress'),
+        )
+        report = json.loads(capsys.readouterr().out)
+        assert code == 0
+        finding = report['findings'][0]
+        assert finding['derived_edges_by_graph'] == {
+            'reify': ['edge-in-reify'],
+            'dark_factory': ['edge-in-dark-factory'],
+            'know_live': [],
+        }
+        # The flat union is UNCHANGED in meaning, so existing consumers of the
+        # central harm-artefact column keep working.
+        assert finding['derived_edge_uuids'] == [
+            'edge-in-dark-factory', 'edge-in-reify',
+        ]
+        assert finding['edges_enumerated_in'] == [
+            'reify', 'dark_factory', 'know_live',
+        ]
+
+    async def test_unqueried_finding_has_null_edges_by_graph(
+        self, capsys
+    ) -> None:
+        """The per-graph map carries the SAME not-enumerated sentinel.
+
+        ``{}`` would be a measured zero — "asked everywhere, found nothing" —
+        which is the precise fail-soft the null state exists to prevent.
+        """
+        reader = _ExplodingEdgeReader(
+            [_record(uuid='ep-1', text=ESC_3085_1_INSTANCE_1,
+                     project_id='know_live', graph_name='dark_factory')]
+        )
+        _code, report = await self._run_capture(
+            capsys, reader, _probes(task_status='in-progress')
+        )
+        assert report is not None
+        finding = report['findings'][0]
+        assert finding['derived_edges_by_graph'] is None
+        assert finding['derived_edge_uuids'] is None
+        assert finding['edges_unqueried'] is True
+
     async def test_group_id_graph_not_swept_is_enumerated_where_it_can_be(
         self, capsys
     ) -> None:
