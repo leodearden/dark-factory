@@ -357,33 +357,39 @@ else
        --print-verdicts 2>&1)" && _orch_parity_exit=0 || _orch_parity_exit=$?
   printf '%s\n' "$_orch_parity_out"
 
-  # The tag is matched in BASH, not through `printf ... | grep -q`. grep exits
-  # the instant it matches and the tag is on line 1, so once the report exceeds
-  # the pipe buffer (~64KB) the printf dies of SIGPIPE, `pipefail` makes the
-  # pipeline return 141, and `!` turns that into "it did not run" with the tag
-  # plainly present — a verdict manufactured by the mechanism rather than read
-  # from the checker, which is the exact class of failure this guard removes.
-  # `[[ ]]` forks nothing and cannot be signalled. (Measured: the pipe form
-  # flips at ~82KB of tagged output; the pattern below does not.)
-  if [[ "$_orch_parity_out" != *'[orchestrator_unit_parity]'* ]]; then
+  # Classified by the shared helper at the top of this file — see its comment
+  # for why the tag outranks the status and why it is matched with `[[ ]]`.
+  _orch_parity_verdict="$(_parity_verdict "$_orch_parity_out" \
+       "$_orch_parity_exit" '[orchestrator_unit_parity]')"
+  case "$_orch_parity_verdict" in
+  unreported)
     fail "Orchestrator parity gate produced no [orchestrator_unit_parity] report"
     fail "  (status $_orch_parity_exit) — it did not run, so its status says"
     fail "  nothing about this host. Check the script path and its flags."
     _orch_install_blocked=1
-  elif [ "$_orch_parity_exit" -eq 0 ]; then
+    ;;
+  parity)
     ok "Orchestrator units: parity with committed copies"
-  elif [ "$_orch_parity_exit" -eq 2 ]; then
+    ;;
+  absent)
     info "Orchestrator units: not yet installed in $UNIT_DIR (installing below)"
-  else
-    # Status 1 is "drift OR unverifiable" — it also covers a vanished committed
-    # unit, an unreadable unit file and a drop-in override, which the checker
-    # words apart so the operator is not sent hunting for a directive diff that
-    # does not exist.
+    ;;
+  finding | *)
+    # `*` folded in with `finding` deliberately: the helper is total over four
+    # tokens today, and a fifth added later must land on the LOUD arm rather
+    # than fall through a `case` that silently matches nothing — the same
+    # "benign because undocumented" reading the helper itself refuses.
+    #
+    # A finding is "drift OR unverifiable" — it also covers a vanished
+    # committed unit, an unreadable unit file and a drop-in override, which the
+    # checker words apart so the operator is not sent hunting for a directive
+    # diff that does not exist.
     warn "Orchestrator units: drift or unverifiable state — see the"
     warn "  [orchestrator_unit_parity] report above. Note a drop-in override"
     warn "  needs manual removal."
     _orch_install_blocked=1
-  fi
+    ;;
+  esac
 fi
 
 # A unit that did not clear is SKIPPED rather than warned about, because a
@@ -817,27 +823,33 @@ else
        --repo-root     "$REPO_ROOT" 2>&1)" && _dash_parity_exit=0 || _dash_parity_exit=$?
   printf '%s\n' "$_dash_parity_out"
 
-  # Matched in bash, not through a pipe to grep — see the orchestrator gate
-  # above for why a `printf | grep -q` here can report "it did not run" on a
-  # report that carries the tag.
-  if [[ "$_dash_parity_out" != *'[dashboard_unit_parity]'* ]]; then
+  # Classified by the shared helper at the top of this file.
+  _dash_parity_verdict="$(_parity_verdict "$_dash_parity_out" \
+       "$_dash_parity_exit" '[dashboard_unit_parity]')"
+  case "$_dash_parity_verdict" in
+  unreported)
     fail "Dashboard parity gate produced no [dashboard_unit_parity] report"
     fail "  (status $_dash_parity_exit) — it did not run, so its status says"
     fail "  nothing about this host. Check the script path and its flags."
     fail "  The install below still runs; it simply gathered no evidence first."
-  elif [ "$_dash_parity_exit" -eq 0 ]; then
+    ;;
+  parity)
     ok "Dashboard units: already at parity with the committed copies"
-  elif [ "$_dash_parity_exit" -eq 2 ]; then
+    ;;
+  absent)
     info "Dashboard units: not yet installed in $UNIT_DIR (installing below)"
-  else
-    # Exit 1 is "drift OR unverifiable" — it also covers a vanished committed
-    # unit and a drop-in override, which the checker deliberately words apart
-    # so the operator is not sent hunting for a directive diff that does not
-    # exist. Naming only DRIFT here would collapse that distinction back.
+    ;;
+  finding | *)
+    # A finding is "drift OR unverifiable" — it also covers a vanished
+    # committed unit and a drop-in override, which the checker deliberately
+    # words apart so the operator is not sent hunting for a directive diff that
+    # does not exist. Naming only DRIFT here would collapse that distinction
+    # back. (`*` is folded in for the reason given at the orchestrator gate.)
     warn "Dashboard units: pre-existing drift or unverifiable state — see the"
     warn "  [dashboard_unit_parity] report above. The install below propagates"
     warn "  the committed units; a drop-in override needs manual removal."
-  fi
+    ;;
+  esac
 fi
 
 sed \
@@ -1010,20 +1022,26 @@ else
        && _fm_parity_exit=0 || _fm_parity_exit=$?
   printf '%s\n' "$_fm_parity_out"
 
-  # Matched in bash, not through a pipe to grep — see the orchestrator gate
-  # above for why a `printf | grep -q` here can report "it did not run" on a
-  # report that carries the tag.
-  if [[ "$_fm_parity_out" != *'[fused_memory_unit_parity]'* ]]; then
+  # Classified by the shared helper at the top of this file.
+  _fm_parity_verdict="$(_parity_verdict "$_fm_parity_out" \
+       "$_fm_parity_exit" '[fused_memory_unit_parity]')"
+  case "$_fm_parity_verdict" in
+  unreported)
     fail "Fused-memory parity check produced no recognizable report"
     fail "  (status $_fm_parity_exit) — it did not run, so its status says"
     fail "  nothing about this host. Check the script path and its flags."
-  elif [ "$_fm_parity_exit" -eq 0 ]; then
+    ;;
+  parity)
     ok "Fused-memory unit: parity with template (all safety directives present)"
-  elif [ "$_fm_parity_exit" -eq 2 ]; then
+    ;;
+  absent)
     warn "Fused-memory unit: not installed at $UNIT_DIR/fused-memory.service (skipping parity check)"
-  else
+    ;;
+  finding | *)
+    # `*` folded in for the reason given at the orchestrator gate.
     warn "Fused-memory unit: DRIFT detected — run: python3 $_fm_parity_script --fix"
-  fi
+    ;;
+  esac
 fi
 
 # Dashboard unit parity — POST-INSTALL SANITY CHECK ONLY.
@@ -1064,24 +1082,32 @@ else
        && _dash_post_parity_exit=0 || _dash_post_parity_exit=$?
   printf '%s\n' "$_dash_post_parity_out"
 
-  # Matched in bash, not through a pipe to grep — see the orchestrator gate for
-  # why a `printf | grep -q` here can report "it did not run" on a report that
-  # carries the tag.
-  if [[ "$_dash_post_parity_out" != *'[dashboard_unit_parity]'* ]]; then
+  # Classified by the shared helper at the top of this file. Distinct verdict
+  # variable from section 8's for the same reason the _out/_exit pair above is
+  # distinct: both blocks share one shell scope.
+  _dash_post_parity_verdict="$(_parity_verdict "$_dash_post_parity_out" \
+       "$_dash_post_parity_exit" '[dashboard_unit_parity]')"
+  case "$_dash_post_parity_verdict" in
+  unreported)
     fail "Dashboard post-install check produced no [dashboard_unit_parity] report"
     fail "  (status $_dash_post_parity_exit) — it did not run, so its status says"
     fail "  nothing about this host. Check the script path and its flags."
     fail "  The install above is therefore UNVERIFIED, not verified."
-  elif [ "$_dash_post_parity_exit" -eq 0 ]; then
+    ;;
+  parity)
     ok "Dashboard units: install verified (installed copies match the committed ones)"
-  elif [ "$_dash_post_parity_exit" -eq 2 ]; then
+    ;;
+  absent)
     warn "Dashboard units: not installed in $UNIT_DIR (section 8 did not run?)"
-  else
+    ;;
+  finding | *)
+    # `*` folded in for the reason given at the orchestrator gate.
     warn "Dashboard units: still not at parity AFTER installing — the install"
     warn "  did not take. See the [dashboard_unit_parity] report above; a"
     warn "  [override] drop-in survives reinstallation and must be removed by"
     warn "  hand (systemctl --user cat <unit> shows the merged result)."
-  fi
+    ;;
+  esac
 fi
 
 # lms-arm@ unit: REPORT ONLY. setup-host.sh does not install the arms and must
@@ -1124,29 +1150,39 @@ else
        --repo-root     "$REPO_ROOT" 2>&1)" && _lms_parity_exit=0 || _lms_parity_exit=$?
   printf '%s\n' "$_lms_parity_out"
 
-  # Matched in bash, not through a pipe to grep — see the orchestrator gate
-  # above for why a `printf | grep -q` here can report "it did not run" on a
-  # report that carries the tag.
-  if [[ "$_lms_parity_out" != *'[lms_unit_parity]'* ]]; then
+  # Classified by the shared helper at the top of this file. Note this gate
+  # answers `unreported` with warn(), not fail(): it is warn-only by charter
+  # (test_setup_host_lms_parity_gate.py::test_the_lms_gate_is_warn_only), which
+  # is exactly the per-site severity difference the helper does not collapse.
+  _lms_parity_verdict="$(_parity_verdict "$_lms_parity_out" \
+       "$_lms_parity_exit" '[lms_unit_parity]')"
+  case "$_lms_parity_verdict" in
+  unreported)
     warn "lms-arm@ unit: parity gate produced no [lms_unit_parity] report"
     warn "  (status $_lms_parity_exit) — it did not run, so its status says"
     warn "  nothing about this host. Check the script path and its flags."
-  elif [ "$_lms_parity_exit" -eq 0 ]; then
+    ;;
+  parity)
     ok "lms-arm@ unit: parity with the committed template (effective configuration verified)"
-  elif [ "$_lms_parity_exit" -eq 2 ]; then
+    ;;
+  absent)
     info "lms-arm@ unit: not installed on this host (install with scripts/local-model-serving/install-lms-units.sh)"
-  else
-    # Exit 1 is "drift OR unverifiable" — it also covers a drop-in override and
-    # an effective configuration that disagrees, which the checker deliberately
-    # words apart so the operator is not sent hunting for a directive diff that
-    # does not exist. Naming only DRIFT here would collapse that distinction.
+    ;;
+  finding | *)
+    # A finding is "drift OR unverifiable" — it also covers a drop-in override
+    # and an effective configuration that disagrees, which the checker
+    # deliberately words apart so the operator is not sent hunting for a
+    # directive diff that does not exist. Naming only DRIFT here would collapse
+    # that distinction. (`*` is folded in for the reason given at the
+    # orchestrator gate.)
     warn "lms-arm@ unit: drift, a drop-in override, or an unverifiable effective"
     warn "  configuration — see the [lms_unit_parity] report above."
     warn "  A drop-in SURVIVES reinstallation and is NOT removed automatically."
     warn "  Inspect:  systemctl --user cat lms-arm@<arm>.service"
     warn "  Remove:   scripts/remove-lms-arm-worktree-dropin.sh (checks its"
     warn "            safety preconditions first)"
-  fi
+    ;;
+  esac
 fi
 
 # jCodeMunch watcher

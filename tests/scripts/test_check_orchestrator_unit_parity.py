@@ -1526,6 +1526,28 @@ def test_parity_gate_runs_BEFORE_the_units_are_copied():
     )
 
 
+def _verdict_arm(block: str, verdict: str) -> "re.Match[str] | None":
+    """Locate *verdict*'s own BRANCH in *block*, or None.
+
+    Anchored on the branch, never on a bare occurrence of the word: this
+    block's own prose contains "an absent note means the unit belongs here",
+    so a `\\babsent\\b` search passes with the arm deleted outright — measured
+    by mutation, not assumed. An assertion that survives deleting the thing it
+    names is not testing anything.
+
+    Accepts either spelling, because which reads better is a style call and
+    pinning one would reject a correct gate for a non-reason: a `case` label
+    (`absent)`, including a multi-pattern `finding | *)`) or a
+    `[ "$v" = absent ]` test.
+    """
+    return re.search(
+        rf"(?:^|[\s;(|])\b{verdict}\b\s*(?:\|\s*[^)\n]*)?\)"
+        rf"|=[=]?\s*[\"']?{verdict}\b[\"']?\s*\]",
+        block,
+        re.MULTILINE,
+    )
+
+
 def test_parity_gate_distinguishes_absent_from_a_finding():
     """The branch treats `absent` (not installed here) apart from `finding`.
 
@@ -1549,12 +1571,24 @@ def test_parity_gate_distinguishes_absent_from_a_finding():
         "`_parity_verdict`, so it is classifying an overloaded exit status by "
         f"hand.\n{block}"
     )
-    for verdict in ("absent", "finding"):
-        assert re.search(rf"\b{verdict}\b", block), (
-            f"The orchestrator parity branch has no `{verdict}` arm. Without "
+
+    def _missing(verdict: str) -> str:
+        return (
+            f"The orchestrator parity branch has no `{verdict}` ARM. Without "
             "one it cannot distinguish a host that never installed the units "
             "from a host with actionable drift.\n" + block
         )
+
+    absent_arm = _verdict_arm(block, "absent")
+    assert absent_arm is not None, _missing("absent")
+    finding_arm = _verdict_arm(block, "finding")
+    assert finding_arm is not None, _missing("finding")
+
+    assert absent_arm.start() != finding_arm.start(), (
+        "The orchestrator parity branch reaches the same arm for `absent` and "
+        "`finding`, collapsing the distinction this test exists to hold.\n"
+        + block
+    )
     # Non-fatal: the gate reports and declines to install, but must never
     # abort setup-host.sh itself — five units are knowingly red on this host
     # today, and killing the run there would take every later section with it.
