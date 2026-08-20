@@ -4204,9 +4204,11 @@ def test_the_read_only_lease_verbs_stay_usable_when_the_slug_cannot_be_derived(
 ) -> None:
     """DIAGNOSIS must survive the degraded path the exit-2 refusal creates.
 
-    `lease-show` and `lease-reap` are exactly what the refusal message and both
-    watcher SKILLs tell a refused or degraded operator to run next — so the
-    guard must cover only the three SLUG-BEARING verbs. Nothing else pins that:
+    `lease-show` and `lease-reap` are exactly what a refused or degraded
+    operator is sent to next — `_run_lease_mutation`'s `result=refused` message
+    ends "inspect with `lease-show --name <name>`", and both watcher SKILLs say
+    the same — so the guard must cover only the three SLUG-BEARING verbs.
+    Nothing else pins that:
     the guard is scoped by a hardcoded verb tuple, and widening it (or hoisting
     it above the verb check) would leave every new test green while removing
     the operator's only way to see WHY they were refused.
