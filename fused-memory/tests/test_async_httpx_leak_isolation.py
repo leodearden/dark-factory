@@ -33,9 +33,16 @@ resurrect path unreachable, so the ERROR record can never be emitted at all.
 
 Design decisions (mirroring orchestrator/tests/test_aiosqlite_leak_isolation.py,
 the house template for a leak-drain defence):
-- Tests are self-contained unit tests of the helper itself (not a cross-test
-  polluter/victim pair), so they are deterministic under
-  ``-n auto --dist loadgroup`` without requiring an ``xdist_group`` tag.
+- The helper's own contracts are pinned by self-contained unit tests (not a
+  cross-test polluter/victim pair), so they are deterministic under
+  ``-n auto --dist loadgroup`` without requiring an ``xdist_group`` tag. The
+  ONE exception is the teardown-affinity pair at the bottom of this module
+  (``test_aaa_leaked_client_records_its_closing_loop`` /
+  ``test_aab_the_leak_was_closed_in_its_own_test_loop``): it measures which
+  event loop actually closed a leaked client, which cannot be observed from
+  inside the test that leaked it, so that pair DOES require
+  ``@pytest.mark.xdist_group('async_httpx_reap_ordering')`` to co-locate both
+  arms on one worker in collection order.
 - Each test installs the tracking hook itself and reaps any residual leaked
   client from a *prior* test before measuring — the same flush-before-measure
   pattern that module uses for ``reap_leaked_aiosqlite_connections()``.
@@ -110,10 +117,8 @@ and ``Event loop is closed`` returned 0 hits each.
 """
 from __future__ import annotations
 
-import ast
 import asyncio
 import contextlib
-from pathlib import Path
 
 import httpx
 import openai
@@ -133,13 +138,16 @@ from _fm_helpers import (
 #: module happened to run first and call track_async_httpx_clients().
 _SENTINEL_AT_IMPORT = getattr(httpx.AsyncClient.__init__, _TRACK_SENTINEL, False)
 
-#: The conftest that must carry the wiring, read structurally (not as prose)
-#: by test_sync_reap_fixture_is_declared_before_the_async_one.
-_CONFTEST = Path(__file__).parent / 'conftest.py'
-
-#: The two autouse teardown fixtures conftest must declare, in this order.
+#: The two autouse teardown fixtures conftest must declare.
 _SYNC_FIXTURE = '_reap_leaked_async_httpx_clients_sync'
 _ASYNC_FIXTURE = '_reap_leaked_async_httpx_clients'
+
+#: Cross-test channel for the teardown-affinity pair at the bottom of this
+#: module. The polluter records the loop it ran in and the loop its leaked
+#: client was actually closed in; the victim, which runs after the polluter's
+#: teardown has finished, compares them. A module global is the only way to
+#: observe a teardown that has by definition already completed.
+_REAP_ORDERING_PROBE: dict = {}
 
 
 @pytest.mark.asyncio
@@ -396,41 +404,110 @@ def test_tracking_hook_is_installed_by_pytest_configure():
     )
 
 
-def test_sync_reap_fixture_is_declared_before_the_async_one():
-    """conftest declares the SYNC arm first, so the ASYNC arm tears down first.
+# ---------------------------------------------------------------------------
+# Teardown affinity (task 4412) — the ONE cross-test pair in this module.
+#
+# The two-arm autouse split in conftest exists for exactly one property: an
+# async test's leaked clients must be closed inside THAT TEST'S OWN still-open
+# event loop, because their connection pool has affinity to it. That property
+# is invisible from inside the test that leaks (the close happens later, at
+# teardown), so it takes a polluter/victim pair — and therefore an
+# ``xdist_group`` tag so ``-n auto --dist loadgroup`` keeps both arms on one
+# worker in collection order.
+#
+# The names are ``test_aaa_``/``test_aab_`` so the pair stays adjacent and in
+# order under any name-sorting collector, not merely under definition order.
+# ---------------------------------------------------------------------------
 
-    Same-scope autouse fixtures are set up in declaration order and torn down
-    in REVERSE, so declaring the async arm SECOND is what gives it teardown
-    priority — and that is the ordering the design depends on: an async test's
-    clients must be closed inside that test's OWN still-open event loop, which
-    is the correct-affinity path for
-    ``test_local_endpoint_base_url_integration.py``, the only cohort that
-    performs real I/O. The sync arm then runs last and finds nothing left.
 
-    Read structurally from conftest's AST rather than from prose, so a
-    reordering edit fails here instead of quietly degrading the affinity.
+@pytest.mark.xdist_group('async_httpx_reap_ordering')
+@pytest.mark.asyncio
+async def test_aaa_leaked_client_records_its_closing_loop():
+    """Polluter: leak a client that records which loop eventually closes it.
+
+    Deliberately never closes the client — the whole point is to let the
+    conftest teardown drain do it, and to capture where. The recording wraps
+    the INSTANCE attribute ``inner.aclose`` rather than the class, because the
+    reaper calls ``client.aclose()`` — an instance lookup
+    (``_fm_helpers.reap_leaked_async_httpx_clients``) — so an instance-level
+    wrapper is both sufficient and free of cross-test blast radius.
+
+    Asserts nothing itself: the measurement it takes is only observable after
+    its own teardown has run, so the assertion lives in the victim below.
     """
-    module = ast.parse(_CONFTEST.read_text(), filename=str(_CONFTEST))
-    defs = {
-        node.name: node
-        for node in module.body
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-    }
+    track_async_httpx_clients()
+    # Flush any client a prior test left behind, so the only leak in flight is
+    # the one this test is about to build (the module's flush-before-measure
+    # pattern).
+    await reap_leaked_async_httpx_clients()
 
-    assert _SYNC_FIXTURE in defs, f'{_CONFTEST} declares no {_SYNC_FIXTURE} fixture'
-    assert _ASYNC_FIXTURE in defs, f'{_CONFTEST} declares no {_ASYNC_FIXTURE} fixture'
+    _REAP_ORDERING_PROBE.clear()
+    _REAP_ORDERING_PROBE['test_loop'] = asyncio.get_running_loop()
 
-    assert isinstance(defs[_SYNC_FIXTURE], ast.FunctionDef), (
-        f'{_SYNC_FIXTURE} must be a plain `def` — an `async def` would only '
-        f'ever run for async tests, which is the gap it exists to cover'
-    )
-    assert isinstance(defs[_ASYNC_FIXTURE], ast.AsyncFunctionDef), (
-        f'{_ASYNC_FIXTURE} must be an `async def` so it can await the reaper '
-        f'inside the test\'s own event loop'
-    )
-    assert defs[_SYNC_FIXTURE].lineno < defs[_ASYNC_FIXTURE].lineno, (
-        f'{_SYNC_FIXTURE} must be declared BEFORE {_ASYNC_FIXTURE} in '
-        f'{_CONFTEST.name}: same-scope autouse fixtures tear down in reverse '
-        f'declaration order, and the async arm must tear down first so async '
-        f"tests reap inside their own still-open loop (task 4412)."
-    )
+    client = openai.AsyncOpenAI(api_key='test-key')
+    inner = client._client
+    original_aclose = inner.aclose
+
+    async def _recording_aclose(*args, **kwargs):
+        _REAP_ORDERING_PROBE.setdefault('closing_loop', asyncio.get_running_loop())
+        return await original_aclose(*args, **kwargs)
+
+    inner.aclose = _recording_aclose
+    # Hold a strong reference so the client survives to teardown rather than
+    # being refcount-finalised at test exit (which would close nothing and
+    # make the victim's not-None guard fire instead of the affinity assertion).
+    _REAP_ORDERING_PROBE['client'] = client
+
+
+@pytest.mark.xdist_group('async_httpx_reap_ordering')
+def test_aab_the_leak_was_closed_in_its_own_test_loop():
+    """Victim: the polluter's leaked client was closed in the polluter's loop.
+
+    The behavioural pin for the two-arm teardown ordering, replacing an
+    earlier AST meta-test that read conftest's declaration order. That test
+    passed GREEN while the RUNTIME order was the exact inverse of what it
+    claimed, because declaration order does not in fact decide it:
+    ``pytest_asyncio`` 1.x async fixtures acquire an event-loop dependency
+    that reorders them relative to plain autouse fixtures. Only an observation
+    of which loop did the closing can tell the two apart.
+
+    A cross-loop close is not merely untidy: the client's connection pool is
+    bound to the loop that opened it, so closing it from the sync arm's
+    throwaway ``asyncio.run`` loop is the very ``RuntimeError('Event loop is
+    closed')`` path the whole task exists to remove — most sharply for
+    ``test_local_endpoint_base_url_integration.py``, the one measured cohort
+    doing real I/O.
+
+    Measured against python 3.13.9 / pytest 9.0.3 / pytest-asyncio 1.3.0
+    (``asyncio_mode=strict``); a bump to any of those is exactly when this
+    pair should be re-run.
+    """
+    try:
+        closing_loop = _REAP_ORDERING_PROBE.get('closing_loop')
+        test_loop = _REAP_ORDERING_PROBE.get('test_loop')
+
+        # Guard FIRST: if the pair got split across xdist workers (or the
+        # polluter was deselected), both reads are None and the affinity
+        # assertion below would pass vacuously on `None is None`.
+        assert closing_loop is not None, (
+            'no aclose() was observed for the client leaked by '
+            'test_aaa_leaked_client_records_its_closing_loop, so this pair '
+            'measured nothing. Either the conftest drain never ran, or the '
+            "pair was split across xdist workers — check both arms still "
+            "carry @pytest.mark.xdist_group('async_httpx_reap_ordering') "
+            'and remain adjacent in collection order (task 4412).'
+        )
+        assert closing_loop is test_loop, (
+            'the leaked client was closed in a FOREIGN event loop '
+            f'({closing_loop!r}), not the test\'s own ({test_loop!r}). The '
+            'async autouse arm must tear down BEFORE the sync arm, so an '
+            "async test's clients are closed inside its own still-open loop "
+            'rather than by the sync arm\'s throwaway asyncio.run loop. In '
+            'conftest.py, the async arm gets that priority by REQUESTING the '
+            'sync arm as a fixture argument — not by declaration order, which '
+            'pytest-asyncio does not honour here (task 4412).'
+        )
+    finally:
+        # Drop the closed loop and the leaked client rather than holding them
+        # for the rest of the session.
+        _REAP_ORDERING_PROBE.clear()
