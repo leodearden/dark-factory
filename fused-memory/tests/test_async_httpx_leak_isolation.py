@@ -171,6 +171,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import warnings
+import weakref
 
 import _fm_helpers
 import anthropic
@@ -179,6 +181,7 @@ import openai
 import pytest
 from _fm_helpers import (
     _TRACK_SENTINEL,
+    _warn_if_drain_closed_a_foreign_client,
     reap_leaked_async_httpx_clients,
     track_async_httpx_clients,
 )
@@ -515,6 +518,57 @@ async def test_reap_is_bounded_when_aclose_hangs(monkeypatch):
     finally:
         del inner.aclose
         await real_aclose()
+
+
+@pytest.mark.asyncio
+async def test_foreign_client_close_is_warned_about_not_silent():
+    """Closing a client that pre-dated the test warns; leaving it open does not.
+
+    The drain's selection predicate has NO notion of ownership or age (see the
+    CONSTRAINT block above the two autouse arms in ``conftest.py``): a client
+    built by a fixture scoped wider than ``function`` WOULD be closed at the
+    first test's teardown, out from under its owner, and the owner would then
+    fail with ``Cannot send a request, as the client has been closed`` in a
+    later, apparently unrelated test — the "innocent test blamed" shape this
+    drain exists to remove. Scoping the reap to the current test was rejected
+    (it opens the inverse hole: a wider-scoped client dropped at its own
+    teardown is then never drained and can still resurrect), so the trap is
+    made DISCOVERABLE instead. This pins that: silent while the pre-existing
+    client is untouched, loud the moment the drain has closed it.
+    """
+    track_async_httpx_clients()
+    await reap_leaked_async_httpx_clients()
+
+    client = openai.AsyncOpenAI(api_key='test-key')
+    inner = client._client
+    # Stand-in for the sync arm's setup snapshot: a client that was already
+    # open and tracked before "this test" started.
+    preexisting = weakref.WeakSet([inner])
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter('always')
+        _warn_if_drain_closed_a_foreign_client(preexisting)
+    assert caught == [], (
+        f'a pre-existing client the drain did NOT close is the normal case and '
+        f'must stay silent, got {[str(w.message) for w in caught]}'
+    )
+
+    reaped = await reap_leaked_async_httpx_clients()
+    assert reaped == 1, 'sanity: the drain closes a foreign client exactly as it closes any other'
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter('always')
+        _warn_if_drain_closed_a_foreign_client(preexisting)
+    assert len(caught) == 1, (
+        f'the drain closed a client that pre-dated the test and said nothing '
+        f'— the constraint "never build an async openai/anthropic client in a '
+        f'fixture scoped wider than function" is then undiscoverable until it '
+        f'surfaces as a closed-client error in an unrelated test (task 4412). '
+        f'Got {len(caught)} warnings.'
+    )
+    assert 'function scope' in str(caught[0].message), (
+        f'the warning must name the fix, not just the symptom: {caught[0].message}'
+    )
 
 
 # ---------------------------------------------------------------------------

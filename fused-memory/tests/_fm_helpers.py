@@ -19,6 +19,7 @@ import re
 import sys
 import types
 import uuid
+import warnings
 import weakref
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -1516,6 +1517,39 @@ async def reap_leaked_async_httpx_clients() -> int:
         if client.is_closed:
             reaped += 1
     return reaped
+
+
+def _warn_if_drain_closed_a_foreign_client(preexisting: weakref.WeakSet) -> None:
+    """Warn if the drain closed a client that pre-dated the current test.
+
+    *preexisting* is the snapshot ``conftest``'s SYNC autouse arm takes at
+    SETUP: the clients that were already tracked, open and resurrect-capable
+    before the test started.
+    Any of them found closed at teardown was closed by this test or by the
+    drain — either way, something owns a client that outlives a single test,
+    which the drain cannot support (see the CONSTRAINT block above the two
+    autouse arms in ``conftest.py``, and ``_leaked_async_httpx_clients``
+    above for why the selection predicate has no notion of ownership).
+
+    A warning rather than a failure: the drain closing a foreign client is a
+    design violation by the FIXTURE, not by the test that happens to be
+    finishing, and failing that test would reproduce the very
+    blame-the-innocent-test pattern being removed. The warning is greppable in
+    CI output and names the fix.
+    """
+    closed = [client for client in preexisting if client.is_closed]
+    if not closed:
+        return
+    warnings.warn(
+        f'async-httpx drain closed {len(closed)} openai/anthropic client(s) '
+        f'that existed BEFORE this test started. The drain has no notion of '
+        f'ownership: it closes every tracked, open, resurrect-capable client '
+        f'at every test teardown. If a fixture scoped wider than `function` '
+        f'(or a module-level cache) owns one, it has just been closed out from '
+        f'under its owner and will fail later with "Cannot send a request, as '
+        f'the client has been closed". Move it to function scope (task 4412).',
+        stacklevel=2,
+    )
 
 
 # ---------------------------------------------------------------------------
