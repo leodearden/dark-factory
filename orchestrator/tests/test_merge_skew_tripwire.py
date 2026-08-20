@@ -286,6 +286,59 @@ class TestAbandonedOracleRegistry:
             'abandoned oracle task leaked: still in _ABANDONED_ORACLES after it finished'
         )
 
+    @pytest.mark.asyncio
+    async def test_caller_cancellation_abandons_and_tracks_until_drained(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        _drained_oracle_registry,
+    ) -> None:
+        """Cancelling the CALLER of ``_run_load_bearing_oracle`` must not
+        strand an untracked oracle task, and must not launder the
+        cancellation into a ``False`` verdict.
+
+        ``timeout_secs=60.0`` is chosen STRUCTURALLY, not tuned (mirrors
+        task 4089's rationale at
+        dashboard/tests/test_healthz_deadline.py:658-662): 60s is
+        unreachable within this test's wall clock, so the caller's own
+        ``.cancel()`` is provably the ONLY thing that can end the
+        coroutine — the oracle budget cannot have expired, which is what
+        makes this a caller-cancellation test rather than a second
+        timeout test. Waiting on ``stub.started`` rather than sleeping a
+        fixed interval removes the remaining timing dependence.
+
+        The ``pytest.raises(asyncio.CancelledError)`` assertion is
+        load-bearing in its own right: it pins that the fix must
+        RE-RAISE, never swallow the cancellation into the fail-open
+        ``return False``. A cancelled caller must stay cancelled.
+        """
+        from orchestrator.merge_skew_tripwire import _run_load_bearing_oracle
+
+        registry = _drained_oracle_registry
+        stub = self._StubRun(cleanup_raises=False)
+        monkeypatch.setattr('orchestrator.git_ops._run', stub)
+
+        caller = asyncio.create_task(
+            _run_load_bearing_oracle(tmp_path, ['fake-oracle'], ['a.py'], timeout_secs=60.0),
+        )
+        await asyncio.wait_for(stub.started.wait(), timeout=5.0)
+        inner = stub.task
+        assert inner is not None, 'stub was never invoked'
+
+        caller.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+
+        assert inner in registry, (
+            'caller cancellation must not strand an untracked oracle task'
+        )
+
+        await asyncio.wait({inner}, timeout=5.0)
+        assert inner.cancelled(), 'abandoned oracle task was tracked but never actually cancelled'
+        assert inner not in registry, (
+            'abandoned oracle task leaked: still in _ABANDONED_ORACLES after it finished'
+        )
+
 
 class TestComputeTripwireOverlap:
     """Unit tests for the pure ``compute_tripwire_overlap(landing_changed_files,
