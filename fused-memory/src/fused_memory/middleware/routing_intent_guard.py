@@ -143,9 +143,28 @@ _CODE_CHANGE_SIGNALS_RE = re.compile(r'\b(?:fix|bug|crash|refactor)\w*\b', re.IG
 # CODE-CHANGE-SIGNAL SUPPRESSION SCAN ONLY -- the marker scan in
 # routing_intent_finding keeps reading raw field text, which is what makes this
 # carve-out monotone (it can only turn None into a finding, never the reverse).
+#
+# DIRECTIONAL SAFETY, which is why every constraint below is deliberately
+# narrow: UNDER-stripping degrades to the pre-4532 behaviour (the suppression
+# stands, a finding is lost) — annoying but safe. OVER-stripping silently
+# manufactures findings out of authored prose, which in enforce mode rejects
+# an honest task. New stamp shapes are therefore added only against observed
+# corpus evidence, never speculatively.
 _PROVENANCE_STAMP_RE = re.compile(
-    r'\[\s*stage\s+\d+[^\]\n]{0,160}\d{4}-\d{2}-\d{2}[^\]\n]{0,40}\].*',
-    re.IGNORECASE | re.DOTALL,
+    # An appended annotation block starts its own line. Without this anchor an
+    # inline "... [re-verified 2026-08-06] ..." swallows the rest of the
+    # sentence, losing the author's own code-change signal.
+    r'^[ \t]*'
+    r'\[\s*stage\s+\d+[^\]\n]{0,160}\d{4}-\d{2}-\d{2}[^\]\n]{0,40}\]'
+    # Not a markdown link: DF task prose routinely opens a line with
+    # "[Stage 1 stall detector](fused-memory/.../stage1_stall_detector.py)",
+    # and treating that as a stamp strips a whole AUTHORED paragraph.
+    r'(?!\()'
+    # ... through the end of THIS paragraph only. Without the bound, an
+    # authored "fix" in a paragraph AFTER the stamp is stripped too, quietly
+    # widening the carve-out into the task-2408 precision case.
+    r'(?:(?!\n[ \t]*\n).)*',
+    re.IGNORECASE | re.DOTALL | re.MULTILINE,
 )
 
 
