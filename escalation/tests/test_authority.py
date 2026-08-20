@@ -84,6 +84,30 @@ class TestCrossLayerIdentityLockstep:
             f'Real watcher identity {identity!r} must remain in PROMOTE_ALLOWED'
         )
 
+    def test_runner_curator_category_is_in_the_deny_list(self) -> None:
+        """The category the DeterministicRunner ACTUALLY files stays denied.
+
+        Same anti-drift shape as the ``_WATCHER_AUTO_IDENTITY`` pin above, for
+        the same documented reason: the string lives as a bare literal in
+        ``orchestrator.deterministic_runner`` and again in this package's
+        denylist, with nothing otherwise tying the two together — so a rename
+        on either side would silently re-open the auto-close hole while every
+        test stayed green.
+
+        The orchestrator import is FUNCTION-LOCAL, exactly as
+        ``test_watcher_wire_identity_is_mapped_and_promote_allowed`` does it:
+        escalation is the lower fleet-wide package and must not module-level
+        import orchestrator (see authority.py's module docstring).
+        """
+        from orchestrator.deterministic_runner import (
+            CURATOR_ADJUDICATION_MISSING_CATEGORY,
+        )
+
+        assert CURATOR_ADJUDICATION_MISSING_CATEGORY in L2_AUTO_CLOSE_DENY_CATEGORIES, (
+            f'The category the DeterministicRunner actually files '
+            f'({CURATOR_ADJUDICATION_MISSING_CATEGORY!r}) must be denied auto-close'
+        )
+
 
 class TestL2AutoCloseClass:
     """``l2_auto_close_class`` — the narrow above-ceiling ``close_only`` carve-out.
