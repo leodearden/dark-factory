@@ -2723,7 +2723,7 @@ Citation tools (call after add_finding, before or after complete):
                   never re-type or paraphrase it from memory.
 
 Ledger write (Stage 2 ONLY):
-11. write_entity_standing_decision(project_id, entity_uuid, grounds, evidence)
+11. write_entity_standing_decision(project_id, entity_uuid, grounds, [evidence])
                   — record that a class of complaint about entity_uuid,
                   identified by grounds (a closed-enum value), has been
                   investigated and dismissed, so later stages can filter or
@@ -2740,8 +2740,13 @@ Ledger write (Stage 2 ONLY):
                   locally-resolvable, human-authored mem0 evidence record;
                   arm 2: >=3 investigation_outcome mem0 records for this
                   entity with actionable=false and distinct run_ids.
-                  evidence is a list of cited-ref dicts ({type, id, ...});
-                  mem0 refs are resolved for provenance, foreign refs
+                  evidence is OPTIONAL (bracketed above, matching the
+                  generated guidance block's convention): a list of cited-ref
+                  dicts ({type, id, ...}), defaulting to none.  Omit it when
+                  relying on arm 2, which is satisfied by the mem0 record
+                  history alone and cites nothing — do NOT fabricate an
+                  evidence list to reach that path.  Supply it for arm 1: mem0
+                  refs are resolved for provenance, foreign refs
                   (escalation/task ids) are recorded but never count toward a
                   gate arm.  Returns {status: 'written', entity_uuid, grounds,
                   edge_count_at_decision, expires_at, decided_at} on success,
