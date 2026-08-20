@@ -215,6 +215,15 @@ class ManifestTask(BaseModel):
     ``task_id`` is ``int | None``: ``None`` at authoring time, stamped by
     ``commit_planning`` — never author-supplied for a real batch. ``title``
     is a human aid, not load-bearing.
+
+    ``note`` is durable task-level provenance — why a label was split,
+    renamed or re-homed. It is a DECLARED field rather than a YAML comment
+    because ``manifest_stamping``'s write-back is
+    ``yaml.safe_dump(raw, sort_keys=False, allow_unicode=True)``
+    (``fused-memory/src/fused_memory/server/manifest_stamping.py``, step 4),
+    which discards every comment in the sidecar on the next stamp; a
+    declared field round-trips unchanged, because that step writes back the
+    raw decoded dict rather than a ``model_dump()``.
     """
 
     model_config = ConfigDict(extra='forbid')
@@ -222,6 +231,7 @@ class ManifestTask(BaseModel):
     label: str = Field(min_length=1)
     task_id: int | None = None
     title: str | None = None
+    note: str | None = None
     capabilities: list[ManifestCapability]
 
 
