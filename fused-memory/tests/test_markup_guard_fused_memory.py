@@ -757,13 +757,23 @@ def _build_server_installed(*, guard_first: bool) -> tuple[Any, AsyncMock]:
 
 
 class TestInstalledOnTheRealServer:
-    """(a) The guard is wired into the process that actually serves agents.
+    """(a) The installer helper does what the real server relies on it doing.
 
-    A guard that only ever runs in its own tests contains nothing. The wiring
-    is pinned through the helper ``run_server`` calls rather than by driving
+    A guard that only ever runs in its own tests contains nothing, so these
+    drive ``_install_tool_dispatch_guards`` — the helper ``run_server`` calls —
+    against a real ``create_mcp_server`` product, rather than driving
     ``run_server`` itself, which builds stores, a reconciliation harness and two
-    uvicorn servers — the same reason ``_build_recon_report_components`` was
-    extracted from it. No assertion here reads source text.
+    uvicorn servers.
+
+    KNOWN GAP: the last link, that ``run_server`` actually calls this helper, is
+    deliberately NOT pinned here. It was, by asserting over
+    ``run_server.__code__.co_names``, and that pin was deleted as unsound: a bare
+    reference to the name satisfied it without the call being reached
+    (fails-open), while moving the call into a nested helper broke it with the
+    wiring intact (fails-closed on a benign refactor). Pinning it honestly needs
+    the construction half of ``run_server`` extracted the way
+    ``_build_recon_report_components`` already was; until then the link is held
+    by review, not by a test. No assertion here reads source text.
     """
 
     def test_the_installer_helper_declares_the_reject_with_repair_tier(self):
@@ -807,21 +817,6 @@ class TestInstalledOnTheRealServer:
         manager = server._tool_manager
         assert getattr(manager, '_fused_memory_safe_wrapped', False) is True
         assert getattr(manager, '_fused_memory_markup_guarded', False) is True
-
-    def test_run_server_installs_the_guards_through_that_helper(self):
-        """The link the helper tests cannot make on their own.
-
-        Reads the COMPILED code object's global references, not source text:
-        ``co_names`` is what the interpreter will actually look up when the
-        coroutine runs, so a call deleted, renamed or commented out fails here
-        while reformatting, re-indenting or moving the call does not.
-        """
-        from fused_memory.server.main import run_server
-
-        assert '_install_tool_dispatch_guards' in run_server.__code__.co_names, (
-            'run_server no longer installs the tool-dispatch guards: the markup '
-            'boundary would be absent from the process that serves agents'
-        )
 
 
 class TestInstallationOrder:
