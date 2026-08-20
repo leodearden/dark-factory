@@ -170,10 +170,31 @@ async def _reap_leaked_ticket_workers():
 # ---------------------------------------------------------------------------
 # Leaked async httpx client drain (task 4412) — TWO autouse arms.
 #
-# DECLARATION ORDER IS LOAD-BEARING: same-scope autouse fixtures are set up in
-# declaration order and torn down in REVERSE, so the sync arm is declared
-# FIRST precisely so the async arm tears down FIRST. Pinned by
-# test_async_httpx_leak_isolation.py::test_sync_reap_fixture_is_declared_before_the_async_one.
+# TEARDOWN ORDER IS LOAD-BEARING, and it is bought by an explicit FIXTURE
+# DEPENDENCY, not by declaration order: the async arm REQUESTS the sync arm, so
+# the sync arm is set up first and therefore torn down LAST, leaving the async
+# arm to tear down FIRST. That matters because an async test's leaked clients
+# must be closed inside that test's OWN still-open event loop — their
+# connection pool has affinity to it.
+#
+# Declaration order does NOT decide this, despite the usual same-scope rule:
+# pytest-asyncio 1.x async fixtures acquire an event-loop dependency that
+# reorders them relative to plain autouse fixtures. MEASURED on the pinned
+# toolchain before the dependency below was added: the sync arm tore down
+# FIRST, the exact inverse of what declaration order predicts, and the
+# real-I/O cohort's clients were aclose()d cross-loop from the sync arm's
+# throwaway asyncio.run loop.
+#
+# Pinned behaviourally (not as source layout) by
+# test_async_httpx_leak_isolation.py's
+# test_aaa_leaked_client_records_its_closing_loop /
+# test_aab_the_leak_was_closed_in_its_own_test_loop pair, which records which
+# loop actually did the closing.
+#
+# Measured against: python 3.13.9, pytest 9.0.3, pytest-asyncio 1.3.0
+# (asyncio_mode=strict), httpx 0.28.1, openai 2.31.0, anthropic 0.92.0. The
+# ordering is a property of pytest-asyncio's fixture graph, so a bump to any of
+# those is exactly when that pair should be re-run.
 # ---------------------------------------------------------------------------
 
 
@@ -191,19 +212,26 @@ def _reap_leaked_async_httpx_clients_sync():
     window is open. Closing the client first makes ``__del__`` short-circuit on
     ``if self.is_closed: return``, so the record can never be emitted.
 
-    THIS ARM EXISTS BECAUSE THE LEAK COHORTS ARE MIXED. The async arm below is
-    a ``pytest_asyncio`` fixture and therefore only runs for ``async def``
-    tests, but the largest measured cohort —
-    ``test_graphiti_llm_client_construction.py``'s
-    ``test_returns_openai_client``, 16 of 40 leaked clients — is a plain
-    ``def test_``. Sibling precedents: ``_reap_leaked_ticket_workers`` above
-    (task 2737) and ``orchestrator/tests/conftest.py``'s
-    ``_reap_leaked_aiosqlite_connections`` (task 2413).
+    THIS ARM IS DEFENCE IN DEPTH, NOT COVERAGE OF A GAP THE ASYNC ARM LEAVES.
+    Measured on the pinned toolchain (with a spy installed at collection time,
+    so it survives function-scoped teardown unlike a ``monkeypatch`` one): the
+    ``pytest_asyncio`` arm below DOES fire for a plain ``def test_``, in a
+    throwaway loop of its own. So this arm is not what makes the sync cohort —
+    ``test_graphiti_llm_client_construction.py``'s ``test_returns_openai_client``,
+    16 of 40 measured leaks — get drained. What it buys is a cheap,
+    version-independent backstop that does not depend on pytest-asyncio's
+    fixture graph continuing to behave that way across a bump, and that still
+    runs if the async arm is skipped or errors. Sibling precedents:
+    ``_reap_leaked_ticket_workers`` above (task 2737) and
+    ``orchestrator/tests/conftest.py``'s ``_reap_leaked_aiosqlite_connections``
+    (task 2413).
 
-    The empty-check comes first so the ~14100-of-14147 tests that leak nothing
-    pay only a WeakSet scan and never spin up an event loop. A sync test's
-    clients never touched a loop, so they have no pool affinity to respect and
-    a throwaway ``asyncio.run`` loop closes them correctly.
+    Runs LAST (the async arm requests it, so it is set up first), by which
+    point an async test's clients are already closed and this is a no-op. The
+    empty-check comes first so the ~14100-of-14147 tests that leak nothing pay
+    only a WeakSet scan and never spin up an event loop. A client that reaches
+    this arm still open never had its pool exercised on a live loop, so a
+    throwaway ``asyncio.run`` loop closes it correctly.
     """
     yield
     if not _leaked_async_httpx_clients():
@@ -212,14 +240,21 @@ def _reap_leaked_async_httpx_clients_sync():
 
 
 @pytest_asyncio.fixture(autouse=True)
-async def _reap_leaked_async_httpx_clients():
+async def _reap_leaked_async_httpx_clients(_reap_leaked_async_httpx_clients_sync):
     """Close leaked openai/anthropic httpx clients before this test's loop closes.
 
-    Task 4412 — same mechanism as the sync arm above. Declared SECOND so it
-    tears down FIRST: an async test's clients are then closed inside that
-    test's OWN still-open event loop, which is the correct-affinity path for
-    ``test_local_endpoint_base_url_integration.py``, the only measured cohort
-    that performs real I/O. The sync arm afterwards finds nothing left.
+    Task 4412 — same mechanism as the sync arm above.
+
+    THE ARGUMENT IS THE ORDERING, and it is the only reason it is there.
+    Requesting the sync arm forces the sync arm to be SET UP first and so torn
+    down LAST, which gives this arm teardown PRIORITY: an async test's clients
+    are then closed inside that test's OWN still-open event loop, the
+    correct-affinity path for ``test_local_endpoint_base_url_integration.py``,
+    the only measured cohort that performs real I/O. Declaration order alone
+    does not achieve this — see the block comment above for the measurement
+    that showed the shipped order was the inverse — so do not "tidy" this
+    parameter away. It is pinned by
+    ``test_async_httpx_leak_isolation.py::test_aab_the_leak_was_closed_in_its_own_test_loop``.
 
     Best-effort and bounded — see ``reap_leaked_async_httpx_clients`` in
     ``_fm_helpers.py``: it never fails a test, and is a cheap no-op for the
