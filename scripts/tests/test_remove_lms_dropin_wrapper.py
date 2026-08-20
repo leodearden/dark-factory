@@ -21,9 +21,11 @@ no session bus.
 """
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 
@@ -31,7 +33,101 @@ SELFTEST_SH = Path(__file__).parent / "test_remove_lms_dropin.sh"
 
 
 # ---------------------------------------------------------------------------
-# step-1: RED -- the computed skip guard
+# The computed skip guard
+# ---------------------------------------------------------------------------
+
+def _unit_dir() -> Path:
+    """Resolve the systemd --user unit dir EXACTLY as the .sh resolves it.
+
+    The .sh (and the script under test) both spell this
+    `${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user`.  `:-` treats an EMPTY
+    value as absent, so this checks truthiness rather than key membership --
+    otherwise an exported-but-empty XDG_CONFIG_HOME would resolve a relative
+    path under the CWD and probe a directory the .sh will never touch.
+    """
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    base = Path(xdg) if xdg else Path.home() / ".config"
+    return base / "systemd" / "user"
+
+
+def _systemd_user_manager_skip_reason() -> str | None:
+    """Return why the systemd-backed tests must skip, or None to run them.
+
+    Three independent preconditions, checked in order.  Each returned string
+    says why the skip is an ENVIRONMENT FACT rather than a defect, so a
+    skipped verify log is not mistaken for a silently disabled gate.
+
+    1. ``systemctl`` must be on PATH.
+    2. The --user MANAGER must be reachable.  Probed with
+       ``systemctl --user show -p Version``, deliberately NOT
+       ``is-system-running``: the latter reports non-zero for a merely
+       ``degraded`` manager, which the operator host currently is and which
+       is perfectly usable for the .sh (it only ever ``daemon-reload``s), so
+       gating on it would over-skip on exactly the hosts where the test
+       works.  Any non-zero rc, FileNotFoundError/OSError or timeout counts
+       as unreachable -- a container with no DBUS_SESSION_BUS_ADDRESS or
+       XDG_RUNTIME_DIR produces the first, a stripped image the others.
+    3. The unit dir must be genuinely WRITABLE, confirmed by creating and
+       unlinking a real probe file rather than by trusting
+       ``os.access(..., os.W_OK)``.  os.access reports the mode bits, not a
+       sandbox/LSM denial -- and the observed failure in dark-factory task
+       worktrees is exactly that shape: files are user-owned and rw, yet the
+       write is refused ("install: cannot remove ...: Permission denied").
+       A mode-bit check would report writable, the guard would not fire, and
+       the wrapper would ERROR instead of skipping.
+    """
+    if shutil.which("systemctl") is None:
+        return (
+            "no systemctl on this PATH -- scripts/tests/test_remove_lms_dropin.sh "
+            "drives a real systemd --user manager and cannot run here.  This is "
+            "an environment fact (sandbox/CI container), not a defect in the "
+            "script under test"
+        )
+
+    try:
+        probe = subprocess.run(
+            ["systemctl", "--user", "show", "-p", "Version"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        reachable = probe.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        # FileNotFoundError is an OSError subclass, so a systemctl that
+        # vanished between the which() above and here lands here too.
+        reachable = False
+    if not reachable:
+        return (
+            "no reachable systemd --user manager (no session bus / "
+            "XDG_RUNTIME_DIR, or the probe timed out) -- the .sh installs a "
+            "throwaway template and asserts against `systemctl --user show`, "
+            "which needs a live user manager.  Environment fact, not a defect"
+        )
+
+    unit_dir = _unit_dir()
+    try:
+        unit_dir.mkdir(parents=True, exist_ok=True)
+        write_probe = unit_dir / f".lms-selftest-writeprobe-{os.getpid()}-{uuid4().hex[:8]}"
+        write_probe.write_text("")
+        write_probe.unlink()
+    except OSError as exc:
+        return (
+            f"the systemd user unit directory {unit_dir} is not writable "
+            f"({exc}) -- the .sh must install its throwaway template there "
+            "because the --user manager resolves its unit search path from "
+            "its OWN environment, so the dir cannot be redirected to a tmp "
+            "path.  Environment fact (agent write-scope), not a defect"
+        )
+
+    return None
+
+
+_SKIP_REASON = _systemd_user_manager_skip_reason()
+
+
+# ---------------------------------------------------------------------------
+# step-1: the computed skip guard
 # ---------------------------------------------------------------------------
 
 def test_skip_reason_gates_on_binary_manager_and_writable_unit_dir(
@@ -78,7 +174,7 @@ def test_skip_reason_gates_on_binary_manager_and_writable_unit_dir(
     monkeypatch.setenv("XDG_CONFIG_HOME", str(writable_cfg))
     monkeypatch.setattr(subprocess, "run", _ok_probe)
     monkeypatch.setattr(shutil, "which", lambda *_a, **_k: None)
-    reason = _systemd_user_manager_skip_reason()  # noqa: F821  (step-2 defines it)
+    reason = _systemd_user_manager_skip_reason()
     assert reason is not None
     assert "systemctl" in reason
 
@@ -97,7 +193,7 @@ def test_skip_reason_gates_on_binary_manager_and_writable_unit_dir(
         )
 
     monkeypatch.setattr(subprocess, "run", _rc1_probe)
-    reason = _systemd_user_manager_skip_reason()  # noqa: F821
+    reason = _systemd_user_manager_skip_reason()
     assert reason is not None
     assert "user manager" in reason
 
@@ -105,7 +201,7 @@ def test_skip_reason_gates_on_binary_manager_and_writable_unit_dir(
         raise FileNotFoundError(2, "No such file or directory: 'systemctl'")
 
     monkeypatch.setattr(subprocess, "run", _missing_probe)
-    reason = _systemd_user_manager_skip_reason()  # noqa: F821
+    reason = _systemd_user_manager_skip_reason()
     assert reason is not None
     assert "user manager" in reason
 
@@ -113,7 +209,7 @@ def test_skip_reason_gates_on_binary_manager_and_writable_unit_dir(
         raise subprocess.TimeoutExpired(cmd="systemctl", timeout=5)
 
     monkeypatch.setattr(subprocess, "run", _timeout_probe)
-    reason = _systemd_user_manager_skip_reason()  # noqa: F821
+    reason = _systemd_user_manager_skip_reason()
     assert reason is not None
     assert "user manager" in reason
 
@@ -126,7 +222,7 @@ def test_skip_reason_gates_on_binary_manager_and_writable_unit_dir(
     not_a_dir.write_text("")
     monkeypatch.setenv("XDG_CONFIG_HOME", str(not_a_dir))
     monkeypatch.setattr(subprocess, "run", _ok_probe)
-    reason = _systemd_user_manager_skip_reason()  # noqa: F821
+    reason = _systemd_user_manager_skip_reason()
     assert reason is not None
     assert "unit dir" in reason.lower() or "unit directory" in reason.lower()
 
@@ -134,7 +230,7 @@ def test_skip_reason_gates_on_binary_manager_and_writable_unit_dir(
     # never returns None would skip everywhere and re-create the very rot
     # this module exists to end.
     monkeypatch.setenv("XDG_CONFIG_HOME", str(writable_cfg))
-    reason = _systemd_user_manager_skip_reason()  # noqa: F821
+    reason = _systemd_user_manager_skip_reason()
     assert reason is None
 
 
@@ -167,9 +263,9 @@ def test_skip_reason_falls_back_to_home_config_like_the_shell(
     # does -- so the writable tmp HOME below is what gets probed, and the
     # guard returns None.
     monkeypatch.setenv("XDG_CONFIG_HOME", "")
-    assert _systemd_user_manager_skip_reason() is None  # noqa: F821
+    assert _systemd_user_manager_skip_reason() is None
     assert (fake_home / ".config" / "systemd" / "user").is_dir()
 
     # And an UNSET XDG_CONFIG_HOME resolves the same way.
     monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
-    assert _systemd_user_manager_skip_reason() is None  # noqa: F821
+    assert _systemd_user_manager_skip_reason() is None
