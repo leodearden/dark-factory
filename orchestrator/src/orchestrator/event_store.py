@@ -272,6 +272,45 @@ class EventType(StrEnum):
     session_resume_fallback = 'session_resume_fallback'
     session_resume_capped = 'session_resume_capped'
 
+    # session_resume_failed (task 3578) — a resume that was ADOPTED by the
+    # _run_slot guard above and then still failed to happen. It closes the
+    # population that was previously journal-only and runs.db-INVISIBLE: an
+    # armed --resume whose transcript the CLI could not resolve exits before it
+    # ever contacts the API, so none of the three events above, and no cost or
+    # cap row, ever recorded that the session was lost.
+    #
+    # NOT part of the ratio recipe's denominator above, and this is the one
+    # thing to get right when querying it. The three events above are emitted by
+    # the _run_slot guard, exactly once per DISPATCH that carried a recovered
+    # session. This one is emitted by TaskWorkflow._invoke, i.e. once per
+    # INVOCATION — and a single dispatch invokes several roles — so adding it to
+    # that sum would compare populations counted on different units and silently
+    # inflate the attempt count.
+    #
+    # data.stage splits the two ways an adopted resume dies:
+    #   pre_flight — _invoke corroborated the session against the config dir it
+    #                was about to export as CLAUDE_CONFIG_DIR, found no
+    #                transcript there (and could not rehydrate one from the
+    #                durable archive), and dispatched FRESH instead of arming a
+    #                --resume the CLI would reject. data: {stage, session_id,
+    #                role, restored} — `restored` records whether an archive
+    #                rehydration was attempted and still left nothing behind.
+    #   cli        — the resume WAS armed and the CLI rejected it;
+    #                invoke_with_cap_retry silently retried fresh and returned a
+    #                SUCCESS, so nothing else anywhere records the loss. data:
+    #                {stage, session_id, role, fallbacks}, where `fallbacks` is
+    #                AgentResult.resume_fallbacks — the count of fresh retries
+    #                this one invocation had to make.
+    #
+    # SQL split, alongside the existing '$.reason' / '$.archive_available' ones:
+    #   SELECT json_extract(data, '$.stage') AS stage, COUNT(*)
+    #     FROM events WHERE event_type = 'session_resume_failed'
+    #    GROUP BY stage;
+    # Read it against session_resume (the adopted-resume count) rather than
+    # against the three-event sum: it answers "of the resumes we decided to
+    # make, how many did not survive to the agent?".
+    session_resume_failed = 'session_resume_failed'
+
     # Scheduler fairness
     task_skipped = 'task_skipped'
     reservation_installed = 'reservation_installed'

@@ -12398,6 +12398,14 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             # recorded argument: with archival off there is nothing on disk to
             # find, and gating on the flag would add a second source of truth
             # that can disagree with the filesystem.
+            # Whether the rehydration below actually PUBLISHED a transcript.
+            # Reported on the veto event as data.restored, where it should
+            # always be False by construction — a successful restore satisfies
+            # the corroboration and there is no veto.  A True here therefore
+            # means the restore claimed success and the CLI-facing locator still
+            # cannot see the result, which is a real bug worth being able to
+            # count rather than a state to assume away.
+            restored_ok = False
             if (
                 self.config.session_resume.restore_from_archive
                 and self._config_dir is not None
@@ -12442,6 +12450,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     )
                 else:
                     if restored is not None:
+                        restored_ok = True
                         logger.info(
                             'Task %s [%s]: rehydrated session %s from the '
                             'durable archive %s -> %s',
@@ -12514,6 +12523,23 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                         'role': role.name,
                     },
                 )
+                # …and make it MEASURABLE, not just greppable. This population
+                # was previously journal-only and runs.db-invisible: the CLI
+                # exits before contacting the API, so no cost/cap/outcome row
+                # ever recorded that the session was lost. Per-INVOCATION, so
+                # it is deliberately NOT part of the _run_slot guard's
+                # per-dispatch ratio denominator — see EventType's taxonomy.
+                if self.event_store:
+                    self.event_store.emit(
+                        EventType.session_resume_failed,
+                        task_id=self.task_id,
+                        data={
+                            'stage': 'pre_flight',
+                            'session_id': vetoed_session_id,
+                            'role': role.name,
+                            'restored': restored_ok,
+                        },
+                    )
         else:
             session_id_val = str(uuid.uuid4())
             resume_count_to_write = 0
