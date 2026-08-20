@@ -6395,6 +6395,110 @@ class NotATestClass:
         )
 
 
+class TestWorkerTeardownGuardScanner:
+    """Unit tests for `_unguarded_worker_teardown_methods` -- the executable
+    form of the esc-3980-4 leak invariant recorded at
+    test_merge_speculation.py:1972-2003 (`_stop_worker`'s docstring):
+    `wait_responsive` gives up by raising `_pytest.outcomes.Failed`, so a
+    give-up on a straight-line body (like a mid-body `assert`) skips
+    `worker.stop()` entirely and leaks a live SpeculativeMergeWorker plus
+    its run task into pytest-asyncio teardown -- how one red test used to
+    cascade into unrelated failures elsewhere in the session (task 4219).
+
+    Every case here is driven from a SYNTHETIC source string, not this
+    module's own source, so these tests are provably non-vacuous and do not
+    shift when this file is later edited.
+    """
+
+    def test_straight_line_stop_after_wait_responsive_is_reported(self) -> None:
+        """A `test_*` method that calls `wait_responsive(...)` and then
+        calls `worker.stop()` from straight-line code (not inside a
+        `finally:`) IS reported -- a give-up mid-body would skip the stop
+        call entirely.
+        """
+        source = '''
+class TestUnguardedTeardown:
+    async def test_it(self):
+        await wait_responsive(fut, timeout=5.0, label='x')
+        await worker.stop()
+'''
+        result = _unguarded_worker_teardown_methods(source)
+
+        assert result == ['TestUnguardedTeardown::test_it'], (
+            f'Expected the straight-line worker.stop() after wait_responsive '
+            f'to be reported, got {result!r}.'
+        )
+
+    def test_stop_inside_finally_is_not_reported(self) -> None:
+        """The same method with `worker.stop()` moved into a
+        `try: ... finally:` block is NOT reported -- a give-up mid-try
+        still runs the finally, so the worker is always stopped.
+        """
+        source = '''
+class TestGuardedTeardown:
+    async def test_it(self):
+        try:
+            await wait_responsive(fut, timeout=5.0, label='x')
+        finally:
+            await worker.stop()
+'''
+        result = _unguarded_worker_teardown_methods(source)
+
+        assert result == [], (
+            f'Expected worker.stop() inside a finally: block to NOT be '
+            f'reported, got {result!r}.'
+        )
+
+    def test_stop_without_wait_responsive_is_not_reported(self) -> None:
+        """A method that calls `worker.stop()` outside a finally but never
+        calls `wait_responsive` at all is NOT reported -- the guard is
+        deliberately scoped to migrated methods, so it starts empty and
+        cannot mass-fail the ~25 pre-existing straight-line teardown sites
+        in this module that have not been migrated yet.
+        """
+        source = '''
+class TestUnmigratedTeardown:
+    async def test_it(self):
+        await asyncio.wait_for(fut, timeout=5.0)
+        await worker.stop()
+'''
+        result = _unguarded_worker_teardown_methods(source)
+
+        assert result == [], (
+            f'Expected worker.stop() with no wait_responsive call in the '
+            f'method to NOT be reported (guard scoped to migrated methods '
+            f'only), got {result!r}.'
+        )
+
+    def test_wait_responsive_without_stop_is_not_reported(self) -> None:
+        """A method that calls `wait_responsive` but never calls
+        `worker.stop()` at all is NOT reported -- there is no stop call to
+        be unguarded.
+        """
+        source = '''
+class TestNoStopCall:
+    async def test_it(self):
+        await wait_responsive(fut, timeout=5.0, label='x')
+'''
+        result = _unguarded_worker_teardown_methods(source)
+
+        assert result == [], (
+            f'Expected a method with no worker.stop() call at all to NOT '
+            f'be reported, got {result!r}.'
+        )
+
+    def test_unparseable_source_returns_empty_list_without_raising(self) -> None:
+        """Unparseable source returns `[]` rather than raising -- mirrors
+        `_worst_per_method_wait_budget`'s must-never-raise contract.
+        """
+        result = _unguarded_worker_teardown_methods('def not valid python(:')
+
+        assert result == [], (
+            f'Expected unparseable source to return [] without raising, '
+            f'got {result!r}.'
+        )
+
+
 # ---------------------------------------------------------------------------
 # task 3492 amend: cover _timeout_mark_offenders' failure branches directly
 # ---------------------------------------------------------------------------
