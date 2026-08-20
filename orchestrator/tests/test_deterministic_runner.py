@@ -1166,7 +1166,10 @@ def _parse_update_task_snippet(detail: str) -> dict:
     """
     line = next(ln for ln in detail.splitlines() if 'update_task(' in ln).strip()
     call = ast.parse(line, mode='eval').body
-    assert isinstance(call, ast.Call) and call.func.id == 'update_task'
+    assert isinstance(call, ast.Call), f'snippet is not a call expression: {line!r}'
+    assert isinstance(call.func, ast.Name) and call.func.id == 'update_task', (
+        f'snippet must call update_task by bare name, got: {line!r}'
+    )
     assert call.args == [], (
         f'update_task snippet must pass everything by keyword, got positional: {call.args!r}'
     )
