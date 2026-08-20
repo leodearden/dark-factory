@@ -79,7 +79,7 @@ class StormCounter:
             self._events.popleft()
         return len(self._events)
 
-    def prune(self, window_seconds: float) -> int:
+    def prune(self, window_seconds: float, now: float | None = None) -> int:
         """Age out stale events without recording one; return the live count.
 
         The sweep hook for a caller that keys counters by an UNBOUNDED label
@@ -93,8 +93,12 @@ class StormCounter:
         was still in the deque — so an empty window implies that fire has
         already aged past the rate limit, and a freshly constructed counter
         would decide identically on the next event.
+
+        *now* is the optional PER-CALL clock override described on
+        :meth:`record`; omitting it reads the constructor-injected
+        ``time_provider``, which is the default every existing consumer uses.
         """
-        return self._prune(self._now(), window_seconds)
+        return self._prune(now if now is not None else self._now(), window_seconds)
 
     def record(
         self,
@@ -102,6 +106,7 @@ class StormCounter:
         threshold: int,
         window_seconds: float,
         label: str | None = None,
+        now: float | None = None,
     ) -> dict[str, Any] | None:
         """Record one event; return a storm summary iff a burst just fired.
 
@@ -112,6 +117,21 @@ class StormCounter:
         *label* is what the event should be attributed to, or ``None`` when the
         caller could not resolve one. Unlabelled events still count toward the
         burst — there is simply nothing to name them against.
+
+        *now* is an optional PER-CALL clock override, as an epoch float. The
+        constructor-injected *time_provider* remains the default and is what
+        every consumer holding its counter for the process lifetime uses
+        (``MarkupStormCounter``, ``MemoryService``). ``now=`` exists for a
+        caller that already carries a per-call injected timestamp of its own:
+        ``reconciliation/harness.py``'s three storm counters take
+        ``now: datetime | None`` on every recording method (the
+        ``_finding_recently_resolved`` convention at harness.py:1592) and
+        resolve it against ``datetime.now(UTC)`` before calling in. Without
+        this door they could only delegate through a mutable clock-holder
+        mutated around each call, which is the hand-rolled state INV-5 exists
+        to delete. It threads through the window, the pruning and the
+        rate-limit arithmetic alike, so an injected instant behaves exactly as
+        a provider-stamped one would.
 
         Returns ``None`` when the count within the window is below *threshold*,
         AND when the threshold is met but a previous fire is still inside the
@@ -124,19 +144,22 @@ class StormCounter:
         labels seen in the window, so the caller can attribute the burst
         instead of blaming whichever event crossed the threshold.
         """
-        now = self._now()
+        effective_now = now if now is not None else self._now()
 
         # Append, then prune.
-        self._events.append((now, label))
-        count = self._prune(now, window_seconds)
+        self._events.append((effective_now, label))
+        count = self._prune(effective_now, window_seconds)
         if count < threshold:
             return None
 
         # Threshold crossed — apply the per-window rate limit.
-        if self._last_fire_ts is not None and (now - self._last_fire_ts) < window_seconds:
+        if (
+            self._last_fire_ts is not None
+            and (effective_now - self._last_fire_ts) < window_seconds
+        ):
             return None
 
-        self._last_fire_ts = now
+        self._last_fire_ts = effective_now
         return {
             'count': count,
             'threshold': threshold,
