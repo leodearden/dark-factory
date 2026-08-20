@@ -19,7 +19,11 @@ from shared.branch_names import canonical_queued_branch_name
 # Fully qualified rather than `from shared import ...`: the module is
 # deliberately NOT re-exported from shared/__init__, so `import shared` does
 # not pull fastmcp into every consumer of the base layer.
-from shared.mcp_markup_middleware import MarkupGuardMiddleware, RepairPolicy
+from shared.mcp_markup_middleware import (
+    FACT_MARKUP_DETECTED,
+    MarkupGuardMiddleware,
+    RepairPolicy,
+)
 from shared.storm_counter import StormCounter
 from shared.task_runtime_state import TaskRuntimeEntry, TaskRuntimeSnapshot
 
@@ -484,6 +488,40 @@ _AMENDMENT_TRUNCATION_STORM_WINDOW_SECONDS = 3600.0  # 1 h
 _AMENDMENT_TRUNCATION_ANCHOR_TASK_ID = 'l2-amendment-truncation'
 
 
+# --- Leaked-envelope-markup residue anchors (task 3690, PRD section 4 C2) ---
+#
+# Two SYNTHETIC anchors, same reasoning as ``_AMENDMENT_TRUNCATION_ANCHOR_TASK_ID``
+# above and as ``markup_tripwire._ANCHOR_TASK_ID``: both conditions are properties
+# of the HARNESS serialization leak, not of whichever task's call happened to
+# carry the damage.  The middleware's residue record has no ``task_id`` at all —
+# it resolves ``agent_id``/``project`` and deliberately does not guess a task —
+# so there is no caller task to file against even if one were wanted.
+#
+# They are DISTINCT anchors because the two records have opposite dedup needs.
+# A residue record is the ONLY surviving copy of one specific caller's payload,
+# so every one must land on its own; a storm record is a rate alarm about a
+# condition, so a second one while the first is still open is noise.  One shared
+# anchor would force a single answer to both.
+_MARKUP_RESIDUE_ANCHOR_TASK_ID = 'mcp-markup-residue'
+_MARKUP_STORM_ANCHOR_TASK_ID = 'mcp-markup-storm'
+
+# The sentinel role these records are filed under.  A born-at-L2 record must
+# carry a role in ``_HARNESS_SENTINEL_ROLE_PREFIXES`` — the same contract
+# ``submit.py`` enforces at its argument boundary for the file-backed CLI, and
+# the reason the agent-role downgrade gate below exists.  The residue sink
+# writes ``level=2`` directly via ``queue.submit`` and so bypasses that gate;
+# honouring the contract here is what keeps the on-disk record legal rather than
+# merely unchecked.
+_MARKUP_GUARD_AGENT_ROLE = 'harness-markup-guard'
+
+# Born-at-L2 severity for the residue record.  ``level=2`` and a severity in
+# ``BORN_AT_L2_SEVERITIES`` are one decision, not two: ``models`` states that an
+# escalation is born at L2 *when* its severity is in that set, so a level=2
+# record carrying 'info' would be internally incoherent to every reader of the
+# consumer-per-level contract.
+_MARKUP_RESIDUE_SEVERITY = 'critical'
+
+
 # Task statuses from which a recovery/redispatch is still possible.  A record
 # on a task outside this set pins nothing: there is no recovery to block.
 _RECOVERABLE_STATUSES = frozenset({'in-progress', 'blocked'})
@@ -680,9 +718,154 @@ def create_server(
     # with it on the SDK jsonschema-validates before FastMCP's handler, the
     # middleware chain is never entered, and every required-parameter leak
     # becomes silently unrepairable.
+    def _emit_markup_fact(fact: dict[str, Any]) -> None:
+        """Emit the ``markup_detected`` record itself, as ONE structured line.
+
+        INV-2: every outcome emits the fact, and no consumer re-derives it by
+        log-scraping.  The middleware already logs a human-readable WARNING for
+        an operator reading the stream, so duplicating that prose here would add
+        a second thing to read and still nothing to parse.  This emits the
+        RECORD — greppable by its own name, then ``json.loads``-able whole.
+
+        Never raises by construction (``json.dumps`` over a flat record of
+        strings and ``None``s), and the middleware invokes every sink
+        defensively anyway: a sink that raised would be logged and would not
+        change the caller's outcome.
+        """
+        logger.info('%s %s', FACT_MARKUP_DETECTED, json.dumps(fact, sort_keys=True))
+
+    def _file_markup_residue(record: dict[str, Any]) -> str | None:
+        """Persist an unrepairable call's payload, or report a storm burst.
+
+        The escalation channel the guard writes to (C2 L187 / INV-7).  Returns
+        the queued id as a ``str`` — the middleware propagates it into the
+        refusal payload so a bounced caller can point an operator at its own
+        preserved data, and treats a non-``str`` as reporting no id.
+
+        THE QUEUE IS WRITTEN DIRECTLY, and both halves of that are deliberate:
+
+        * NOT through ``escalate_info``/``escalate_blocker``.  Those re-enter
+          this same middleware, and a residue payload is BY CONSTRUCTION full of
+          envelope markup — it would be detected, refused, and recursed on.
+        * NOT through ``_submit_or_dedupe``.  Folding a residue record into a
+          pending parent destroys the raw payload the record exists to preserve.
+          (Its born-at-L2 branch would in fact bypass dedupe for this severity;
+          calling ``queue.submit`` directly is that branch's own mechanism, used
+          without depending on a severity check to keep choosing it.)
+
+        Blocking file I/O inside an async caller, matching every other write on
+        this server: ``escalate_info`` reaches ``queue.submit`` the same way.
+        """
+        if record.get('error_type') == 'mcp_markup_storm':
+            return _file_markup_storm(record)
+
+        # `level` and `category` are read from the RECORD rather than restated,
+        # so the middleware stays the single source of the contract (INV-5).
+        # The fallbacks matter only if that contract is ever violated, and they
+        # fail toward L2 rather than toward a silently-L0 record nobody reads.
+        level = int(record.get('level') or 2)
+        detail = '\n'.join([
+            # The OWNER that will exit this hold unprompted (INV-7), read off
+            # the record rather than restated: the middleware names it, and a
+            # second spelling here could name a consumer that no longer exists.
+            f'owner={record.get("owner")!r}',
+            f'tool={record.get("tool")!r}',
+            f'field={record.get("field")!r}',
+            f'matched_pattern={record.get("matched_pattern")!r}',
+            f'agent_id={record.get("agent_id")!r}',
+            f'project={record.get("project")!r}',
+            f'raw_value_chars={len(record.get("raw_value") or "")}',
+            '',
+            'RAW PAYLOAD, VERBATIM AND ENTIRE — the only surviving copy. The '
+            'call was refused because the leaked fragment\'s own boundary could '
+            'not be determined, so no repair was attempted and nothing was '
+            'guessed. Recover it for the caller if it is still needed, then '
+            'chase the harness serialization leak that produced it '
+            '(plans/toolcall-markup-containment-prd.md).',
+            '',
+            str(record.get('raw_value') or ''),
+        ])
+        esc = Escalation(
+            id=queue.make_id(_MARKUP_RESIDUE_ANCHOR_TASK_ID),
+            task_id=_MARKUP_RESIDUE_ANCHOR_TASK_ID,
+            agent_role=_MARKUP_GUARD_AGENT_ROLE,
+            # Derived from `level`, never asserted beside it: the two are one
+            # decision (see _MARKUP_RESIDUE_SEVERITY), so if the middleware ever
+            # lowers the level this record follows it down instead of writing a
+            # born-at-L2 severity onto an L0/L1 record.
+            severity=_MARKUP_RESIDUE_SEVERITY if level >= 2 else 'blocking',
+            category=str(record.get('category') or 'mcp_markup_residue'),
+            summary=str(record.get('summary') or ''),
+            detail=detail,
+            suggested_action=str(record.get('suggested_action') or ''),
+            level=level,
+        )
+        return queue.submit(esc)
+
+    def _file_markup_storm(record: dict[str, Any]) -> str | None:
+        """One open record per burst, not one per window (INV-4).
+
+        The middleware's own ``StormCounter`` already rate-limits to one fire
+        per window and states that dedup is the SINK's knowledge, not its own.
+        A leak running for hours would otherwise file one record per hour; this
+        collapses them into the single open record until an operator resolves
+        it, exactly as ``markup_tripwire.emit_markup_storm_escalation`` does.
+
+        A read failure falls THROUGH to filing rather than bailing: losing
+        duplicate suppression is strictly better than losing the alarm for an
+        actively running leak.
+        """
+        try:
+            existing = queue.get_by_task(_MARKUP_STORM_ANCHOR_TASK_ID, status='pending')
+        except Exception:
+            logger.exception(
+                'markup guard: could not check for an open storm record; '
+                'filing a new one rather than dropping the alarm',
+            )
+            existing = []
+        if existing:
+            logger.info(
+                'markup guard: %s already open (storm %r now); not duplicating',
+                existing[0].id, record,
+            )
+            return existing[0].id
+
+        outcome = record.get('outcome')
+        return queue.submit(Escalation(
+            id=queue.make_id(_MARKUP_STORM_ANCHOR_TASK_ID),
+            task_id=_MARKUP_STORM_ANCHOR_TASK_ID,
+            agent_role=_MARKUP_GUARD_AGENT_ROLE,
+            # 'blocking', not a born-at-L2 severity: this is a rate alarm about
+            # a condition, and markup_tripwire's storm record is filed the same
+            # way. The residue records it accompanies carry the L2 routing.
+            severity='blocking',
+            category='mcp_markup_storm',
+            summary=(
+                f'{record.get("count")} {outcome} MCP call(s) in '
+                f'{record.get("window_seconds")}s for project='
+                f'{record.get("project")!r} — the serialization leak is ACTIVE'
+            ),
+            detail='\n'.join(
+                f'{key}={record[key]!r}' for key in sorted(record)
+            ),
+            suggested_action=(
+                'identify the leaking caller from the markup_detected facts and '
+                'report it against plans/toolcall-markup-containment-prd.md'
+            ),
+            level=1,
+        ))
+
     mcp.add_middleware(MarkupGuardMiddleware(
         policy=RepairPolicy.FORWARD_REPAIR,
         exempt_tools=frozenset(),
+        # C2 L187 / INV-7. Without this the guard logs "no escalation_sink is
+        # wired, so the residue of %r will not be preserved anywhere" and the
+        # refusal DESTROYS the caller's payload — which for a leak that is by
+        # construction an agent emitting text it cannot re-emit identically is
+        # not something a retry recovers. The queue is in-process here, so this
+        # server is the one place the residue can actually be preserved.
+        escalation_sink=_file_markup_residue,
+        fact_sink=_emit_markup_fact,
     ))
 
     cfg = dedupe_config if dedupe_config is not None else DedupeConfig()

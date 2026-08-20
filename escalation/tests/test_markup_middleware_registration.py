@@ -42,6 +42,7 @@ from fastmcp.exceptions import ToolError
 from shared.mcp_markup_middleware import MarkupGuardMiddleware, RepairPolicy
 from shared.toolcall_markup import detect
 
+from escalation.models import BORN_AT_L2_SEVERITIES
 from escalation.queue import EscalationQueue
 from escalation.server import create_server
 
@@ -387,24 +388,31 @@ class TestUnrepairableResidueIsPreserved:
         ``content_excerpt``: that is a diagnostic sitting beside a payload the
         caller still holds, while this is the only surviving copy. 3525
         characters of it, for this specimen.
+
+        Asserted against the record READ BACK OFF THE QUEUE, so this is a
+        write-then-read round trip and not merely what was handed to
+        ``submit``: a payload this size crosses a JSON encode/decode, and the
+        specimen is full of the embedded quotes and newlines that a lossy one
+        would mangle.
         """
         record = specimen(UNREPAIRABLE)
         queue, _ = await self._refuse(tmp_path)
 
         residue = self._residue(queue)
-        stored = residue.to_json()
-        assert record['value'] in stored, (
+        assert record['value'] in residue.detail, (
             'the residue record does not contain the raw payload in full'
         )
+        assert len(record['value']) == record['original_length'] == 3525
 
     @pytest.mark.asyncio
     async def test_the_residue_names_the_leaking_call(self, tmp_path: Path):
         """(c) Plus the flat fields an operator needs to chase the leak."""
         queue, _ = await self._refuse(tmp_path)
 
-        stored = self._residue(queue).to_json()
-        assert 'escalate_info' in stored
-        assert 'detail' in stored
+        detail = self._residue(queue).detail
+        assert "tool='escalate_info'" in detail
+        assert "field='detail'" in detail
+        assert 'matched_pattern=' in detail
 
     @pytest.mark.asyncio
     async def test_the_residue_is_born_at_l2_and_names_its_owner(self, tmp_path: Path):
@@ -419,9 +427,18 @@ class TestUnrepairableResidueIsPreserved:
 
         residue = self._residue(queue)
         assert residue.level == 2
-        assert RESIDUE_OWNER in residue.to_json(), (
+        assert f'owner={RESIDUE_OWNER!r}' in residue.detail, (
             'the residue record does not name the owner that will exit the hold'
         )
+        # level=2 and a born-at-L2 severity are ONE decision (models.py: an
+        # escalation is born at L2 *when* its severity is in this set), so a
+        # level=2 record carrying 'info' would be incoherent to every reader of
+        # the consumer-per-level contract.
+        assert residue.severity in BORN_AT_L2_SEVERITIES
+        # And a born-at-L2 record must carry a SENTINEL role — the same
+        # contract submit.py enforces at its argument boundary, and the reason
+        # the server downgrades an agent-filed critical.
+        assert residue.agent_role.startswith(('harness-', 'orchestrator-'))
 
     @pytest.mark.asyncio
     async def test_the_refusal_names_the_preserved_record(self, tmp_path: Path):
