@@ -450,6 +450,31 @@ class TestL2AutoCloseClass:
             f'Expected denylist to block milestone_check_failed, got: {result!r}'
         )
 
+    def test_curator_adjudication_missing_denied_even_for_non_deterministic_role(self) -> None:
+        """'curator_adjudication_missing' is blocked by CATEGORY — the
+        highest-stakes member of the denylist.
+
+        It is the re-ask ``orchestrator.deterministic_runner`` files when a
+        ``human_curator_gate`` task resumes with no
+        ``human_curator_adjudicated_at`` stamp, so auto-closing it re-opens
+        the task-3181 phantom-done hazard the category exists to stop
+        (esc-3181-1 was auto-resolved by the watcher whose own resolution text
+        said the curator work was "deliberately NOT executed"). Class (c)
+        ``stale_task_scoped`` is both category- AND role-agnostic and accepts
+        a bare ``status=done`` marker, so without this denylist entry a filing
+        under any role other than ``orchestrator-deterministic`` sails
+        straight through — defense-in-depth, exactly as for
+        'milestone_check_failed' above."""
+        resolution = 'Subject task status=done per get_task; escalation moot.'
+        result = l2_auto_close_class(
+            identity=self.WATCHER, level=2, action='close_only',
+            category='curator_adjudication_missing', agent_role='some-other-role',
+            resolution=resolution,
+        )
+        assert result is None, (
+            f'Expected denylist to block curator_adjudication_missing, got: {result!r}'
+        )
+
     def test_orchestrator_deterministic_role_denied_even_for_infra_issue(self) -> None:
         resolution = 'live probe: curator paused=false — transient infra self-cleared.'
         result = l2_auto_close_class(
@@ -471,6 +496,7 @@ class TestL2AutoCloseClass:
         assert 'design_concern' in L2_AUTO_CLOSE_DENY_CATEGORIES
         assert 'milestone_gate' in L2_AUTO_CLOSE_DENY_CATEGORIES
         assert 'milestone_check_failed' in L2_AUTO_CLOSE_DENY_CATEGORIES
+        assert 'curator_adjudication_missing' in L2_AUTO_CLOSE_DENY_CATEGORIES
 
     def test_deny_roles_are_frozenset_containing_expected_members(self) -> None:
         assert isinstance(L2_AUTO_CLOSE_DENY_ROLES, frozenset)
