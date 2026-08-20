@@ -23,6 +23,7 @@ from orchestrator.config import GitConfig
 from orchestrator.git_ops import (
     MERGE_PARK_REF,
     PERSISTENT_OFFLINE_DEEP_WORKTREE_NAME,
+    CommitEffectProbe,
     GitOps,
     MergeParkContentionError,
     MergeResult,
@@ -4643,6 +4644,236 @@ class TestCommitEffectPresentInMain:
         assert rc == 0, f'later commit failed: {err}'
 
         assert await git_ops.commit_effect_present_in_main(fix_sha) is False
+
+
+@pytest.mark.asyncio
+class TestDescribeCommitEffectInMain:
+    """Real-git tests for GitOps.describe_commit_effect_in_main (task 3116).
+
+    The DIAGNOSTIC companion to ``commit_effect_present_in_main``: the bool
+    says only THAT the cited commit's effect is not present at main HEAD,
+    which is why two live instances (tasks 3653/3640/3717 and the
+    instance-2 co-touched-hot-file shape) each cost days of misdiagnosis.
+    ``describe_commit_effect_in_main`` returns the SAME verdict plus the
+    facts that explain it — WHICH paths diverged, WHICH anchor commit the
+    comparison ran against, and WHICH structural failure (if any) short-
+    circuited it.  ``commit_effect_present_in_main`` is a one-line wrapper
+    over this method, so the bool and its explanation can never drift.
+
+    These tests assert on DATACLASS FIELDS only, never on prose/docstrings.
+    """
+
+    async def test_present_for_non_merge_with_matching_paths(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """A commit that IS main HEAD: its touched paths trivially match, so
+        present is True with no divergence and no failure code, and the
+        anchor is the commit itself.
+        """
+        (git_repo / 'fileA.py').write_text('fixed\n')
+        await _run(['git', 'add', 'fileA.py'], cwd=git_repo)
+        rc, _, err = await _run(['git', 'commit', '-m', 'fix commit'], cwd=git_repo)
+        assert rc == 0, f'fix commit failed: {err}'
+        rc, fix_sha, err = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        assert rc == 0, f'rev-parse failed: {err}'
+        fix_sha = fix_sha.strip()
+
+        probe = await git_ops.describe_commit_effect_in_main(fix_sha)
+
+        assert isinstance(probe, CommitEffectProbe)
+        assert probe.present is True
+        assert probe.diverged_paths == ()
+        assert probe.failure is None
+        assert probe.anchor_sha == fix_sha
+
+    async def test_names_diverged_path_for_non_merge(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """The one line that would have resolved both reported instances: a
+        later commit fully replaces the touched file, so the probe not only
+        says absent but NAMES ``fileA.py`` as the diverged path.  The naming
+        is the point here, not the bool.
+        """
+        (git_repo / 'fileA.py').write_text('fixed\n')
+        await _run(['git', 'add', 'fileA.py'], cwd=git_repo)
+        rc, _, err = await _run(['git', 'commit', '-m', 'fix commit'], cwd=git_repo)
+        assert rc == 0, f'fix commit failed: {err}'
+        rc, fix_sha, err = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        assert rc == 0, f'rev-parse failed: {err}'
+        fix_sha = fix_sha.strip()
+
+        (git_repo / 'fileA.py').write_text('changed again\n')
+        await _run(['git', 'add', 'fileA.py'], cwd=git_repo)
+        rc, _, err = await _run(['git', 'commit', '-m', 'later commit'], cwd=git_repo)
+        assert rc == 0, f'later commit failed: {err}'
+
+        probe = await git_ops.describe_commit_effect_in_main(fix_sha)
+
+        assert probe.present is False
+        assert probe.failure == 'paths_diverged'
+        assert probe.diverged_paths == ('fileA.py',)
+        assert probe.anchor_sha == fix_sha
+
+    async def test_merge_names_only_the_co_touched_hot_file(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """THE INSTANCE-2 SHAPE, in miniature.
+
+        A task branch touches its own ``deliverable.py`` AND a shared hot
+        file ``shared.manifest``.  Main independently edits a DISTANT,
+        non-conflicting line of ``shared.manifest`` BEFORE the merge, so
+        ``git merge --no-ff`` auto-merges cleanly and main HEAD carries
+        BOTH edits — a perfectly clean landing.  Byte-identity against the
+        second parent nonetheless fails, because the parent's pre-merge
+        blob for ``shared.manifest`` lacks main's independent edit.
+
+        The regression proof is that the probe names ``shared.manifest``
+        and NOT ``deliverable.py``: a human reading the escalation can see
+        in one line that the diverged path is not this task's deliverable,
+        which is skew, not a revert.
+        """
+        (git_repo / 'shared.manifest').write_text(
+            ''.join(f'line{i}\n' for i in range(1, 41))
+        )
+        await _run(['git', 'add', 'shared.manifest'], cwd=git_repo)
+        rc, _, err = await _run(['git', 'commit', '-m', 'seed manifest'], cwd=git_repo)
+        assert rc == 0, f'seed manifest failed: {err}'
+
+        rc, _, err = await _run(['git', 'checkout', '-b', 'task/9001'], cwd=git_repo)
+        assert rc == 0, f'checkout task/9001 failed: {err}'
+        (git_repo / 'deliverable.py').write_text('deliverable\n')
+        lines = (git_repo / 'shared.manifest').read_text().split('\n')
+        lines[0] = 'line1 touched by the task branch'
+        (git_repo / 'shared.manifest').write_text('\n'.join(lines))
+        await _run(['git', 'add', '-A'], cwd=git_repo)
+        rc, _, err = await _run(
+            ['git', 'commit', '-m', 'impl(9001): deliverable + manifest entry'],
+            cwd=git_repo,
+        )
+        assert rc == 0, f'branch commit failed: {err}'
+
+        rc, _, err = await _run(['git', 'checkout', 'main'], cwd=git_repo)
+        assert rc == 0, f'checkout main failed: {err}'
+        lines = (git_repo / 'shared.manifest').read_text().split('\n')
+        lines[39] = 'line40 touched independently on main'
+        (git_repo / 'shared.manifest').write_text('\n'.join(lines))
+        await _run(['git', 'add', '-A'], cwd=git_repo)
+        rc, _, err = await _run(
+            ['git', 'commit', '-m', 'unrelated: distant manifest edit'], cwd=git_repo,
+        )
+        assert rc == 0, f'main-side commit failed: {err}'
+
+        rc, _, err = await _run(
+            ['git', 'merge', '--no-ff', 'task/9001', '-m', 'Merge task/9001 into main'],
+            cwd=git_repo,
+        )
+        assert rc == 0, f'clean no-ff merge failed: {err}'
+        rc, merge_sha, err = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        assert rc == 0, f'rev-parse failed: {err}'
+        merge_sha = merge_sha.strip()
+        rc, second_parent, err = await _run(
+            ['git', 'rev-parse', f'{merge_sha}^2'], cwd=git_repo,
+        )
+        assert rc == 0, f'rev-parse ^2 failed: {err}'
+        second_parent = second_parent.strip()
+
+        probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+
+        assert probe.present is False
+        assert probe.failure == 'paths_diverged'
+        assert probe.diverged_paths == ('shared.manifest',)
+        assert 'deliverable.py' not in probe.diverged_paths
+        assert probe.anchor_sha == second_parent
+
+    async def test_unresolvable_commit_reports_failure_code(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """An unresolvable sha is fail-safe absent, but distinguishable from
+        a genuine path divergence — 'unresolvable_commit', not silence.
+        """
+        probe = await git_ops.describe_commit_effect_in_main('f' * 40)
+
+        assert probe.present is False
+        assert probe.failure == 'unresolvable_commit'
+        assert probe.diverged_paths == ()
+
+    async def test_empty_branch_merge_reports_failure_code(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """A merge whose branch nets ZERO content vs its own fork point has
+        no deliverable to confirm — fail-safe absent under the distinct
+        'empty_branch_merge' code, never conflated with paths_diverged.
+        """
+        rc, _, err = await _run(['git', 'checkout', '-b', 'branch'], cwd=git_repo)
+        assert rc == 0, f'checkout branch failed: {err}'
+        (git_repo / 'temp.py').write_text('temp\n')
+        await _run(['git', 'add', 'temp.py'], cwd=git_repo)
+        rc, _, err = await _run(['git', 'commit', '-m', 'add temp'], cwd=git_repo)
+        assert rc == 0, f'add temp failed: {err}'
+        (git_repo / 'temp.py').unlink()
+        await _run(['git', 'add', '-A'], cwd=git_repo)
+        rc, _, err = await _run(['git', 'commit', '-m', 'remove temp again'], cwd=git_repo)
+        assert rc == 0, f'remove temp failed: {err}'
+
+        rc, _, err = await _run(['git', 'checkout', 'main'], cwd=git_repo)
+        assert rc == 0, f'checkout main failed: {err}'
+        rc, _, err = await _run(
+            ['git', 'merge', '--no-ff', 'branch', '-m', 'Merge branch into main'],
+            cwd=git_repo,
+        )
+        assert rc == 0, f'merge failed: {err}'
+        rc, merge_sha, err = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        assert rc == 0, f'rev-parse failed: {err}'
+
+        probe = await git_ops.describe_commit_effect_in_main(merge_sha.strip())
+
+        assert probe.present is False
+        assert probe.failure == 'empty_branch_merge'
+
+    async def test_empty_non_merge_commit_stays_present(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """Task-2500 behaviour preserved: a genuinely empty ordinary commit
+        has an empty touched-set, for which path-based revert detection is
+        inapplicable — present True, no failure code.
+        """
+        rc, _, err = await _run(
+            ['git', 'commit', '--allow-empty', '-m', 'empty commit'], cwd=git_repo,
+        )
+        assert rc == 0, f'empty commit failed: {err}'
+        rc, sha, err = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        assert rc == 0, f'rev-parse failed: {err}'
+
+        probe = await git_ops.describe_commit_effect_in_main(sha.strip())
+
+        assert probe.present is True
+        assert probe.failure is None
+
+    async def test_non_ascii_diverged_path_round_trips_unquoted(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """The ``-z``/``core.quotePath=false`` hardening must survive into
+        the new OUTPUT parsing, not just the touched-set stage: a git-quoted
+        ``caf\\303\\251.py`` rendered into an escalation is a diagnostic that
+        misleads the human reading it.
+        """
+        (git_repo / 'café.py').write_text('fixed\n')
+        await _run(['git', 'add', 'café.py'], cwd=git_repo)
+        rc, _, err = await _run(['git', 'commit', '-m', 'fix commit'], cwd=git_repo)
+        assert rc == 0, f'fix commit failed: {err}'
+        rc, fix_sha, err = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        assert rc == 0, f'rev-parse failed: {err}'
+        fix_sha = fix_sha.strip()
+
+        (git_repo / 'café.py').write_text('changed again\n')
+        await _run(['git', 'add', 'café.py'], cwd=git_repo)
+        rc, _, err = await _run(['git', 'commit', '-m', 'later commit'], cwd=git_repo)
+        assert rc == 0, f'later commit failed: {err}'
+
+        probe = await git_ops.describe_commit_effect_in_main(fix_sha)
+
+        assert probe.present is False
+        assert probe.diverged_paths == ('café.py',)
 
 
 @pytest.mark.asyncio
