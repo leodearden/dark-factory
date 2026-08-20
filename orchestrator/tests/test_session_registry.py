@@ -3780,15 +3780,51 @@ def test_resolve_session_pid_defaults_to_os_environ(monkeypatch: pytest.MonkeyPa
 
 
 def test_default_lease_slug_reproduces_the_measured_production_slug() -> None:
-    """The defaulted slug is BYTE-IDENTICAL to what the watcher skills build today.
+    """The defaulted slug is BYTE-IDENTICAL to what the WATCHER skills built.
 
     ``watcher-df-1894895`` is the slug measured in the live fleet root on
     2026-08-15 and recorded in ``TestLeaseSlugAndRecordSlugAreDisjoint``. This
-    equality is the back-compat oracle: an IN-FLIGHT watcher session that stops
-    passing ``--slug`` keeps its lease, with no restart, because the CLI
-    re-derives exactly the token that session already claimed with.
+    equality is the back-compat oracle FOR THE TWO WATCHER LEASES ONLY --
+    ``watcher-<project>`` and ``recon-watcher-<project>``, whose pre-4248 skill
+    prescription was already ``<name>-${CLAUDE_PID:-$PPID}``. For those, an
+    IN-FLIGHT session that stops passing ``--slug`` keeps its lease with no
+    restart, because the CLI re-derives exactly the token it claimed with.
+
+    It does NOT generalise to ``/unblock`` -- see
+    ``test_the_unblock_lease_slug_shape_changed_at_4248``, which records that
+    asymmetry rather than leaving this docstring to imply it away.
     """
     assert sr.default_lease_slug('watcher-df', {sr.SESSION_PID_ENV: '1894895'}) == 'watcher-df-1894895'
+    assert (
+        sr.default_lease_slug('recon-watcher-df', {sr.SESSION_PID_ENV: '1894895'})
+        == 'recon-watcher-df-1894895'
+    )
+
+
+def test_the_unblock_lease_slug_shape_changed_at_4248() -> None:
+    """The `/unblock` lease slug is NOT back-compatible, and that is recorded here.
+
+    The two watcher skills built ``<lease name>-<pid>``, so deriving from the
+    name reproduces their token exactly. ``/unblock`` did not: its lease NAME
+    is ``unblock-<project>#<TASK_ID>`` (``build_lease_name``'s ``#``) while its
+    skill built the slug with a ``-`` separator and no ``#`` at all. Deriving
+    from the name therefore yields a DIFFERENT token.
+
+    ROLLOUT CONSEQUENCE, stated so nobody rediscovers it from a lingering
+    lease: an `/unblock` session that CLAIMED under the pre-4248 prescription
+    and then releases slug-less gets ``result=refused`` -- non-destructive, but
+    its lease lingers and falsely reports a holder to the next `/unblock` on
+    that task until the 2h ``LEASE_HEARTBEAT_TTL`` ages it out. Such a session
+    must either keep passing its ORIGINAL ``--slug`` on release or accept the
+    TTL wait; ``skills/unblock/SKILL.md`` says so at the release step. Sessions
+    that claim after 4248 are unaffected -- both ends derive the same token.
+    """
+    name = sr.build_lease_name('unblock', 'df', '2085')
+    derived = sr.default_lease_slug(name, {sr.SESSION_PID_ENV: '1894895'})
+
+    assert derived == 'unblock-df#2085-1894895'
+    # The exact string the pre-4248 SKILL.md prescribed, for contrast.
+    assert derived != 'unblock-df-2085-1894895'
 
 
 @pytest.mark.parametrize(

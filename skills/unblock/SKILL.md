@@ -61,7 +61,9 @@ If `$CLAUDE_PID` is unresolvable **and** `--slug` is omitted, the lease verbs **
 rather than silently drifting to a slug your own later release would fail to match; the CLI will not
 invent one, because a synthesized token would be identical for every degraded session and let each
 act on the others' leases. Pass `--slug <stable-token>` to proceed, re-using the same token on the
-release. On that path the CLI records **pid 0**, a never-alive sentinel that degrades the lease to
+release — `--pid` does **not** substitute (it is the lease body's liveness pid, not your identity,
+and `lease-release` has no `--pid`; only `--slug` is honoured by both verbs).
+On that path the CLI records **pid 0**, a never-alive sentinel that degrades the lease to
 heartbeat-only staleness (loudly logged) instead of recording an unrelated durable pid that would
 leave the lease unreapable forever.
 
@@ -113,6 +115,17 @@ nothing to release (idempotent, not an error); `refused` = you are not the holde
 touched — inspect with `lease-show` rather than reflexively re-running with `--force` (`--force` is
 operator recovery and is logged loudly naming both parties); `faulted` = a substrate error, logged
 and swallowed so it cannot break your exit path.
+
+**One-time rollout note (task 4248): the unblock slug SHAPE changed.** Unlike the two watcher
+leases — whose old prescription was already `<--name>-$CLAUDE_PID`, so their derived slug is
+byte-identical and an in-flight watcher keeps its lease — `/unblock` previously built
+`unblock-<project>-<TASK_ID>-<pid>` while its lease **name** is `unblock-<project>#<TASK_ID>`. The
+derived slug is therefore `unblock-<project>#<TASK_ID>-<pid>`, a **different token**. A session that
+CLAIMED under the old prescription and releases slug-less gets `result=refused` — nothing is
+damaged, but its lease lingers and falsely reports a holder to the next `/unblock` on this task
+until the 2h TTL ages it out. Such a session must pass its **original** `--slug` on release
+(`lease-show` prints it as `holder_slug`), or accept the TTL wait. Sessions that claimed after 4248
+are unaffected: both ends derive the same token.
 
 ---
 

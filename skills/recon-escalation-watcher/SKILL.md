@@ -116,7 +116,9 @@ If `$CLAUDE_PID` is unresolvable **and** `--slug` is omitted, the lease verbs **
 rather than silently drifting to a slug your own later heartbeat would fail to match; the CLI will
 not invent one, because a synthesized token would be identical for every degraded session and let
 each act on the others' leases. Pass `--slug <stable-token>` to proceed, re-using it on every later
-lease verb. On that path the CLI records **pid 0**, a never-alive sentinel that degrades the lease to
+lease verb — `--pid` does **not** substitute (it is the lease body's liveness pid, not your identity,
+and the heartbeat/release verbs have no `--pid`; only `--slug` is honoured by all three).
+On that path the CLI records **pid 0**, a never-alive sentinel that degrades the lease to
 heartbeat-only staleness (loudly logged) rather than recording an unrelated durable pid that would
 make the lease unreapable forever.
 
