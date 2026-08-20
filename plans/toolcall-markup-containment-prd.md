@@ -122,12 +122,16 @@ The 08-15 entry is consistent with §2.1: `add_memory.content` remains the singl
 
 Datapoints swept from task 4107's open info-note **esc-4107-1** (filed by 4107's architect; swept into this PRD by 4107's steward, per the note's own suggested action — *"fold into plans/toolcall-markup-containment-prd.md as a recurrence datapoint; no action needed on task 4107"*):
 
-| Observed | Source | Detail |
-|---|---|---|
-| 2026-08-16 | esc-4107-1 | Recurrence observed during task 4107. The source note records the occurrence but not per-boundary specimen detail (matched pattern / outcome); not fabricated here — trace via esc-4107-1 if finer grain is needed. |
-| 2026-08-19 (×2, independent) | esc-4107-1 | Two further, independently-observed recurrences during task 4107, same caveat: the source note confirms recurrence, not the full specimen shape. |
+| Observed | Boundary | Reported `matched_pattern` | Outcome |
+|---|---|---|---|
+| 2026-08-16 (task 4107 architect planning session, esc-4107-1) | `add_design_decision.rationale` (plan-tools) — **gated**, repair-and-report | the invoke closer (misclose: the `rationale` closing tag) | Three consecutive calls, each silently auto-repaired and disclosed in the response under `markup_repairs` (outcome "repaired", collection `design_decisions`, index 0/1/2). **The write lands** in repaired form each time. |
+| 2026-08-16 (task 4107 architect planning session, esc-4107-1) | `add_memory.content` (fused-memory) — **gated** | closing `content` tag | Rejected `McpEnvelopeMarkupWriteRejected`; a verbatim resubmit landed clean (memory `62a1d125-65c1-404f-8642-3fdc0e201e5b`, `stores_written=['mem0']`). Nothing persisted corrupt. |
 
-The pre-existing 2026-08-20 row above (task 3886, esc-3886-1) is the "as originally scoped" close of this backlog — esc-4107-1's window ran 08-16 through 08-20, and that entry already satisfies its 08-20 datapoint.
+Four recurrences total, in one session (note filed 2026-08-16T04:48:24Z, resolved 2026-08-16T13:49:05Z by claude-task-4107-steward; observations at HEAD=`14da8a8023`). The note records two observations of its own, both carried forward here: the leak is not confined to one server or one param name — it followed the same caller across servers inside a single session — and the two servers handle it inconsistently (plan-tools repairs and reports, so the write lands; fused-memory rejects, so the write is lost until resubmitted), which a caller cannot predict.
+
+The two 2026-08-19 recurrences the task spec attributed to esc-4107-1 cannot be traced to that record: esc-4107-1 was filed *and* resolved entirely on 2026-08-16, and contains no 08-19 observation. What the archive holds for 2026-08-19 is four storm-tripwire firings — esc-markup-tripwire-18 (18:39:03Z), -19 (18:39:46Z), -20 (20:00:43Z), -21 (20:05:44Z) — each an aggregate rejected-write counter ("3 MCP writes rejected in 3600s") carrying an empty `evidence` list and attributed to no task. They corroborate the leak being live on 08-19, but are a different observation class — an aggregate counter, not a per-boundary specimen — and are named as such here rather than tabled as two esc-4107-1 specimens.
+
+The pre-existing 2026-08-20 row above (task 3886, esc-3886-1) already satisfies this backlog's 08-20 datapoint.
 
 **Additional 2026-08-20 material**, filed by the L2 escalation-watcher from esc-markup-tripwire-23's 2026-08-20T10:38 amendment:
 
