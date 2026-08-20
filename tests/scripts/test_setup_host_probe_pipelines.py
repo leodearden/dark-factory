@@ -28,6 +28,7 @@ from setup_host_sections import (
     run_section,
     setup_host_text,
     slice_section,
+    slice_shell_function,
     stub_bin_dir,
     write_stub,
 )
@@ -138,11 +139,23 @@ def _docker_stub_body(exec_body):
     return _dispatch_stub_body((('*" exec "*', exec_body),))
 
 
+def _falkordb_probe(start, end):
+    """A FalkorDB section, with the real `falkordb_pings` definition prepended.
+
+    Both FalkorDB sites call that helper, and it is defined up beside the
+    logging shims — outside either slice, so a bare slice would die at exit
+    127. `slice_shell_function` lifts the SHIPPED definition, so these tests
+    still assert on the script's own probe rather than on a copy the harness
+    wrote for itself.
+    """
+    return slice_shell_function("falkordb_pings") + slice_section(start, end)
+
+
 def _run_section_2(tmp_path, exec_body):
     """Slice the section-2 wait loop and run it against a scripted docker."""
     return _run_probe(
         tmp_path,
-        slice_section(_SECTION_2_START, _SECTION_2_END),
+        _falkordb_probe(_SECTION_2_START, _SECTION_2_END),
         stub_name="docker",
         stub_body=_docker_stub_body(exec_body),
         env_extra=_compose_env(tmp_path),
@@ -357,7 +370,7 @@ def _run_section_12(tmp_path, exec_body):
     """Slice the section-12 FalkorDB health check and run it."""
     return _run_probe(
         tmp_path,
-        slice_section(_SECTION_12_START, _SECTION_12_END),
+        _falkordb_probe(_SECTION_12_START, _SECTION_12_END),
         stub_name="docker",
         stub_body=_docker_stub_body(exec_body),
         env_extra=_compose_env(tmp_path),

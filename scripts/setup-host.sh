@@ -62,6 +62,35 @@ _parity_verdict() {
   fi
 }
 
+# Does FalkorDB answer? ONE probe, two callers — the section-2 wait loop and the
+# section-12 health check ask exactly the same question, and a copy at each site
+# is how the two drift apart.
+#
+# The verdict is read from the captured REPLY, not from a pipeline's exit
+# status. `... ping | grep -q PONG` answers with the PRODUCER's status, which is
+# a different question and gets this wrong two ways. `grep -q` exits on its
+# first match and closes the read end, so a producer still writing dies of
+# SIGPIPE and `pipefail` hands the caller that 141; and the same conflation
+# misreads any producer that emits PONG and then exits non-zero for reasons of
+# its own (an exec whose status covers the whole run, not the one line asked
+# about). Either way a live FalkorDB is reported as down. (Measured: with 256KiB
+# of trailing output the pipe form reports no PONG 30/30; this form reports it.)
+#
+# `|| true` is load-bearing: without it the assignment is a simple command and
+# `set -e` kills the bootstrap the moment docker is unavailable, where the old
+# pipeline merely took the else branch. It also must not be `|| out=""` — that
+# throws away a reply the producer did write, preserving the bug. A producer
+# that wrote nothing still yields no match, which is the not-answering verdict
+# both callers already gave.
+#
+# `local` confines the reply to the call, so neither caller can ever read a
+# verdict the other left behind in the shared shell scope.
+falkordb_pings() {
+  local out
+  out="$(docker compose -f "$COMPOSE_FILE" exec -T falkordb redis-cli ping 2>/dev/null)" || true
+  [[ "$out" == *PONG* ]]
+}
+
 # ---------------------------------------------------------------------------
 # 1. Prerequisites
 # ---------------------------------------------------------------------------
@@ -129,23 +158,9 @@ docker compose -f "$COMPOSE_FILE" up -d falkordb qdrant
 
 # Wait for healthy
 for i in $(seq 1 30); do
-  # The verdict is read from the captured REPLY, not from a pipeline's exit
-  # status. `... ping | grep -q PONG` answers with the PRODUCER's status, which
-  # is a different question and gets this wrong two ways. `grep -q` exits on its
-  # first match and closes the read end, so a producer still writing dies of
-  # SIGPIPE and `pipefail` hands the `if` that 141; and the same conflation
-  # misreads any producer that emits PONG and then exits non-zero for reasons of
-  # its own (an exec whose status covers the whole run, not the one line asked
-  # about). Either way a live FalkorDB is reported as never healthy.
-  # `|| true` is load-bearing: without it the assignment is a simple command and
-  # `set -e` kills the bootstrap the moment docker is unavailable, where the old
-  # pipeline merely took the else branch. It also must not be `|| _out=""` — that
-  # throws away a reply the producer did write, preserving the bug. A producer
-  # that wrote nothing still yields no match, which is the not-healthy answer
-  # this loop already gave. (Measured: with 256KiB of trailing output the pipe
-  # form reports no PONG 30/30; this form reports PONG.)
-  _falkordb_ping_out="$(docker compose -f "$COMPOSE_FILE" exec -T falkordb redis-cli ping 2>/dev/null)" || true
-  if [[ "$_falkordb_ping_out" == *PONG* ]]; then
+  # Matched in BASH, not through `| grep -q` — see falkordb_pings above for why
+  # that pipeline can report a live server as never healthy.
+  if falkordb_pings; then
     ok "FalkorDB healthy"
     break
   fi
@@ -671,8 +686,8 @@ fi
 
 # Add jcodemunch MCP to user-level Claude config (idempotent)
 if command -v claude &>/dev/null; then
-  # Matched in BASH, not through `| grep -q` — see the FalkorDB wait loop in
-  # section 2 for why that pipeline can report an installed server as absent.
+  # Matched in BASH, not through `| grep -q` — see falkordb_pings above for why
+  # that pipeline can report an installed server as absent.
   # Here the cost is re-running `claude mcp add` on a server already registered.
   # The capture stays INSIDE the `command -v claude` guard: hoisting it would
   # run `claude mcp list` on hosts with no claude installed.
@@ -982,14 +997,10 @@ echo ""
 info "Health checks"
 
 # FalkorDB
-# Matched in BASH, not through `| grep -q` — see the FalkorDB wait loop in
-# section 2 for why that pipeline can report a live server as not responding.
-# Distinct variable name from that loop deliberately: both blocks share one
-# shell scope, and reusing the name would let this check read a value section 2
-# left behind if an edit ever dropped the assignment — a verdict manufactured
-# by the mechanism rather than read from the server, which is what this removes.
-_falkordb_health_out="$(docker compose -f "$COMPOSE_FILE" exec -T falkordb redis-cli ping 2>/dev/null)" || true
-if [[ "$_falkordb_health_out" == *PONG* ]]; then
+# The same probe the section-2 wait loop runs, so it is the same function and
+# not a second copy of it — see falkordb_pings for why the verdict is read from
+# the reply rather than from `| grep -q`.
+if falkordb_pings; then
   ok "FalkorDB: PONG"
 else
   fail "FalkorDB: not responding"

@@ -230,6 +230,26 @@ def slice_section(
     return text[start:end]
 
 
+def slice_shell_function(name: str) -> str:
+    """Return setup-host.sh's ``name() {`` ... column-0 ``}`` definition, verbatim.
+
+    A slice that CALLS a helper defined elsewhere in the file dies with exit
+    127 under the preamble, which knows only the four logging shims. Prepending
+    the REAL definition is what keeps such a section runnable WITHOUT giving up
+    what these tests are for: defining a copy of the helper in `_preamble`
+    instead would make every assertion downstream a claim about the harness's
+    own bash, green no matter what the shipped helper does — the same
+    "verdict manufactured by the mechanism" failure a behavioural test exists
+    to catch.
+
+    Both endpoints are derived, as in `slice_section`: the header line, and the
+    first column-0 ``}`` at or after it. A helper whose body ever grew a
+    column-0 ``}`` of its own would slice short and fail LOUDLY under `bash`,
+    not silently.
+    """
+    return slice_section(f"{name}() {{", "\n}\n")
+
+
 def run_section(
     tmp_path: pathlib.Path,
     section_text: str,
