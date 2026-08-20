@@ -42,16 +42,36 @@ the house template for a leak-drain defence):
 """
 from __future__ import annotations
 
+import ast
 import asyncio
 import contextlib
+from pathlib import Path
 
 import httpx
 import openai
 import pytest
 from _fm_helpers import (
+    _TRACK_SENTINEL,
     reap_leaked_async_httpx_clients,
     track_async_httpx_clients,
 )
+
+#: Whether the tracking hook was ALREADY installed when this module was
+#: imported — i.e. at collection time, before any test here had a chance to
+#: install it itself. Snapshotting at import rather than inside the test body
+#: is what makes test_tracking_hook_is_installed_by_pytest_configure
+#: order-independent (and therefore honestly red when the wiring is absent):
+#: read inside a test, it would be satisfied by whichever sibling test in this
+#: module happened to run first and call track_async_httpx_clients().
+_SENTINEL_AT_IMPORT = getattr(httpx.AsyncClient.__init__, _TRACK_SENTINEL, False)
+
+#: The conftest that must carry the wiring, read structurally (not as prose)
+#: by test_sync_reap_fixture_is_declared_before_the_async_one.
+_CONFTEST = Path(__file__).parent / 'conftest.py'
+
+#: The two autouse teardown fixtures conftest must declare, in this order.
+_SYNC_FIXTURE = '_reap_leaked_async_httpx_clients_sync'
+_ASYNC_FIXTURE = '_reap_leaked_async_httpx_clients'
 
 
 @pytest.mark.asyncio
@@ -238,3 +258,107 @@ async def test_reap_ignores_an_already_closed_client():
 
     count = await reap_leaked_async_httpx_clients()
     assert count == 0, 'An already-closed client must not be counted as reaped'
+
+
+# ---------------------------------------------------------------------------
+# conftest wiring (task 4412)
+#
+# The helper alone retires nothing: it changes the suite's behaviour only once
+# it runs at EVERY test's teardown. These four guards are what keep the wiring
+# from being silently dropped by a later refactor — mirroring
+# orchestrator/tests/test_aiosqlite_leak_isolation.py::test_autouse_reap_fixture_is_active.
+# ---------------------------------------------------------------------------
+
+
+def test_autouse_async_reap_fixture_is_active(request):
+    """The async drain fixture is wired as an autouse teardown fixture.
+
+    Deterministic and worker-placement-agnostic: an autouse fixture appears in
+    ``request.fixturenames`` for every test; an absent one does not. This is a
+    behavioural assertion that the reaper is applied to arbitrary tests, not a
+    docstring lint.
+    """
+    assert _ASYNC_FIXTURE in request.fixturenames, (
+        f'{_ASYNC_FIXTURE} must be registered as an autouse pytest_asyncio '
+        f'fixture in conftest.py so every ASYNC test closes its leaked '
+        f'openai/anthropic clients inside its own still-open event loop, '
+        f'before AsyncHttpxClientWrapper.__del__ can resurrect them (task 4412).'
+    )
+
+
+def test_autouse_sync_reap_fixture_is_active(request):
+    """The sync-test drain fixture is wired as an autouse teardown fixture.
+
+    BOTH arms are required because the leak cohorts are mixed. Measured: the
+    largest single cohort — ``test_graphiti_llm_client_construction.py``'s
+    ``test_returns_openai_client``, 16 of the 40 leaked clients — is a SYNC
+    ``def test_``, while ``test_startup_identity_scan.py``,
+    ``test_per_group_client_cache.py``,
+    ``test_local_endpoint_base_url_integration.py`` and
+    ``test_openai_responses_preflight.py`` are ``async def``. A
+    ``pytest_asyncio`` autouse fixture only covers async tests, so that arm
+    alone would silently miss 40% of the leaks.
+    """
+    assert _SYNC_FIXTURE in request.fixturenames, (
+        f'{_SYNC_FIXTURE} must be registered as an autouse fixture in '
+        f'conftest.py so SYNC tests — which the pytest_asyncio arm never runs '
+        f'for — also drain their leaked openai/anthropic clients (task 4412).'
+    )
+
+
+def test_tracking_hook_is_installed_by_pytest_configure():
+    """``pytest_configure`` installs the tracking hook at session start.
+
+    Timing is the contract, not merely installation: a hook installed later
+    (say, lazily by the first test that needs it) would miss every client
+    constructed at import time during collection. The snapshot this asserts on
+    is taken when THIS MODULE is imported — i.e. during collection, before any
+    test in it has run — so it cannot be satisfied by a sibling test in this
+    module having called ``track_async_httpx_clients()`` first.
+    """
+    assert _SENTINEL_AT_IMPORT is True, (
+        'httpx.AsyncClient.__init__ did not carry the tracking sentinel when '
+        'this module was imported, so conftest.pytest_configure is not calling '
+        'track_async_httpx_clients(). Without it, clients built during '
+        'collection are never tracked and so are never reaped (task 4412).'
+    )
+
+
+def test_sync_reap_fixture_is_declared_before_the_async_one():
+    """conftest declares the SYNC arm first, so the ASYNC arm tears down first.
+
+    Same-scope autouse fixtures are set up in declaration order and torn down
+    in REVERSE, so declaring the async arm SECOND is what gives it teardown
+    priority — and that is the ordering the design depends on: an async test's
+    clients must be closed inside that test's OWN still-open event loop, which
+    is the correct-affinity path for
+    ``test_local_endpoint_base_url_integration.py``, the only cohort that
+    performs real I/O. The sync arm then runs last and finds nothing left.
+
+    Read structurally from conftest's AST rather than from prose, so a
+    reordering edit fails here instead of quietly degrading the affinity.
+    """
+    module = ast.parse(_CONFTEST.read_text(), filename=str(_CONFTEST))
+    defs = {
+        node.name: node
+        for node in module.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+
+    assert _SYNC_FIXTURE in defs, f'{_CONFTEST} declares no {_SYNC_FIXTURE} fixture'
+    assert _ASYNC_FIXTURE in defs, f'{_CONFTEST} declares no {_ASYNC_FIXTURE} fixture'
+
+    assert isinstance(defs[_SYNC_FIXTURE], ast.FunctionDef), (
+        f'{_SYNC_FIXTURE} must be a plain `def` — an `async def` would only '
+        f'ever run for async tests, which is the gap it exists to cover'
+    )
+    assert isinstance(defs[_ASYNC_FIXTURE], ast.AsyncFunctionDef), (
+        f'{_ASYNC_FIXTURE} must be an `async def` so it can await the reaper '
+        f'inside the test\'s own event loop'
+    )
+    assert defs[_SYNC_FIXTURE].lineno < defs[_ASYNC_FIXTURE].lineno, (
+        f'{_SYNC_FIXTURE} must be declared BEFORE {_ASYNC_FIXTURE} in '
+        f'{_CONFTEST.name}: same-scope autouse fixtures tear down in reverse '
+        f'declaration order, and the async arm must tear down first so async '
+        f"tests reap inside their own still-open loop (task 4412)."
+    )
