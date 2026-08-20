@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import logging
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -974,3 +975,152 @@ class TestNewEndpointUuidResolution:
 
         assert_never_repaired(service)
         service.graphiti._resolve_or_create_entity.assert_not_awaited()
+
+
+def _mixed_findings_episode() -> MockAddEpisodeResult:
+    """One membership finding (e1) and one pairing finding (e2)."""
+    return _episode(
+        edges=[_edge('e1', fact='the deploy pipeline was retried',
+                     source='n-3129', target='n-x'),
+               _edge('e2', fact='Task 3075 blocks the merge lane',
+                     source='n-3074', target='n-lane')],
+        nodes=[MockNode(name='Task 3129', uuid='n-3129'),
+               MockNode(name='deploy pipeline', uuid='n-x'),
+               MockNode(name='Task 3074', uuid='n-3074'),
+               MockNode(name='merge lane', uuid='n-lane')],
+    )
+
+
+_MIXED_REFERENTS = (Referent(number='3074'), Referent(number='3075'))
+
+
+class TestReferentFindingCounters:
+    """INV-2's process-lifetime surface — leaf iota's read side.
+
+    Mirrors `referent_source_counts()` line for line: every bucket exists from
+    construction, the vocabulary is closed and keyed off the constant, and the
+    accessor returns a copy of monotonic totals a reader samples and differences.
+    """
+
+    def test_every_bucket_exists_from_construction(self, service):
+        """A reader never has to distinguish "zero" from "absent"."""
+        assert service.referent_finding_counts() == dict.fromkeys(
+            (*REFERENT_CHECKS, 'unresolvable'), 0,
+        )
+
+    def test_the_counter_exists_even_with_no_write_journal(self, service):
+        """Unconditional construction: the escape must not go dark in exactly
+        the degraded configuration where a finding storm is least likely to be
+        noticed any other way."""
+        assert service._write_journal is None
+        assert service.referent_finding_counts()
+
+    @pytest.mark.asyncio
+    async def test_the_buckets_are_monotonic_across_episodes(self, service):
+        for expected in (1, 2):
+            await service._verify_episode_referents(
+                _mixed_findings_episode(), group_id='dark_factory',
+                referents=_MIXED_REFERENTS,
+            )
+            counts = service.referent_finding_counts()
+            assert counts['set-membership'] == expected
+            assert counts['per-edge-pairing'] == expected
+
+    @pytest.mark.asyncio
+    async def test_check_and_unresolvable_are_orthogonal_axes_not_a_partition(
+        self, service,
+    ):
+        """Which check fired and whether it can be acted on are independent, so
+        the buckets intentionally do not sum to the finding total."""
+        result = _episode(
+            edges=[_edge('e1', fact='Task 2519 was completed',
+                         source='n-2519', target='n-2520')],
+            nodes=[MockNode(name='Task 2519', uuid='n-2519'),
+                   MockNode(name='Task 2520', uuid='n-2520')],
+        )
+
+        stats = await service._verify_episode_referents(
+            result, group_id='dark_factory', referents=(Referent(number='2519'),),
+        )
+
+        assert len(stats.findings) == 1
+        counts = service.referent_finding_counts()
+        assert counts['set-membership'] == 1
+        assert counts['unresolvable'] == 1
+
+    @pytest.mark.asyncio
+    async def test_a_clean_episode_leaves_every_bucket_untouched(self, service):
+        result = _episode(
+            edges=[_edge('e1', source='n-3127', target='n-x')],
+            nodes=[MockNode(name='Task 3127', uuid='n-3127'),
+                   MockNode(name='deploy pipeline', uuid='n-x')],
+        )
+
+        await service._verify_episode_referents(
+            result, group_id='dark_factory', referents=(Referent(number='3127'),),
+        )
+
+        assert set(service.referent_finding_counts().values()) == {0}
+
+    def test_the_accessor_returns_a_copy(self, service):
+        service.referent_finding_counts()['set-membership'] = 99
+
+        assert service.referent_finding_counts()['set-membership'] == 0
+
+
+class TestReferentFindingOperatorLog:
+    """INV-2: a structured record, NOT the logger.debug-only shape the task
+    calls out as unacceptable. The log is the OPERATOR surface — eta reads
+    `ReferentStats.findings` and iota reads the counters, so nothing parses it.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_finding_is_emitted_at_warning_with_its_structured_payload(
+        self, service, caplog,
+    ):
+        with caplog.at_level(logging.WARNING,
+                             logger='fused_memory.services.memory_service'):
+            await service._verify_episode_referents(
+                _one_membership_finding_episode(), group_id='dark_factory',
+                referents=(Referent(number='3127'),),
+            )
+
+        emitted = [r.getMessage() for r in caplog.records
+                   if r.levelno == logging.WARNING]
+        assert emitted
+        payload = '\n'.join(emitted)
+        assert 'e1' in payload
+        assert 'n-3129' in payload
+        assert 'Task 3129' in payload
+        assert 'set-membership' in payload
+
+    @pytest.mark.asyncio
+    async def test_no_finding_is_reported_at_debug_only(self, service, caplog):
+        with caplog.at_level(logging.DEBUG,
+                             logger='fused_memory.services.memory_service'):
+            await service._verify_episode_referents(
+                _one_membership_finding_episode(), group_id='dark_factory',
+                referents=(Referent(number='3127'),),
+            )
+
+        debug_only = [r for r in caplog.records
+                      if r.levelno == logging.DEBUG and 'set-membership' in
+                      r.getMessage()]
+        assert not debug_only
+
+    @pytest.mark.asyncio
+    async def test_a_clean_episode_logs_no_warning(self, service, caplog):
+        result = _episode(
+            edges=[_edge('e1', source='n-3127', target='n-x')],
+            nodes=[MockNode(name='Task 3127', uuid='n-3127'),
+                   MockNode(name='deploy pipeline', uuid='n-x')],
+        )
+
+        with caplog.at_level(logging.WARNING,
+                             logger='fused_memory.services.memory_service'):
+            await service._verify_episode_referents(
+                result, group_id='dark_factory',
+                referents=(Referent(number='3127'),),
+            )
+
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
