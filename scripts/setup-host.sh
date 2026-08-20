@@ -671,7 +671,13 @@ fi
 
 # Add jcodemunch MCP to user-level Claude config (idempotent)
 if command -v claude &>/dev/null; then
-  if claude mcp list --scope user 2>/dev/null | grep -q jcodemunch; then
+  # Matched in BASH, not through `| grep -q` — see the FalkorDB wait loop in
+  # section 2 for why that pipeline can report an installed server as absent.
+  # Here the cost is re-running `claude mcp add` on a server already registered.
+  # The capture stays INSIDE the `command -v claude` guard: hoisting it would
+  # run `claude mcp list` on hosts with no claude installed.
+  _jcodemunch_mcp_out="$(claude mcp list --scope user 2>/dev/null)" || true
+  if [[ "$_jcodemunch_mcp_out" == *jcodemunch* ]]; then
     ok "jcodemunch MCP already in user config"
   else
     claude mcp add --scope user jcodemunch -- uvx --python 3.12 jcodemunch-mcp
