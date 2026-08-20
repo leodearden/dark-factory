@@ -1398,6 +1398,20 @@ class ReconciliationConfig(BaseModel):
     # sandbox_recon_writable_extras: additional paths to add to the writable set
     #   (e.g. a uvx/pip cache dir used by a stdio MCP server).  Empty by default;
     #   use only when an MCP server genuinely needs to write outside /tmp.
+    #
+    #   Do NOT add the recon CLAUDE_CONFIG_DIR here.  The PER-RUN dir is granted
+    #   AUTOMATICALLY per invocation by cli_stage_runner.run_stage_via_cli, which
+    #   appends `config_dir.path` to whatever is configured here (append, never
+    #   replace) and has resolve_recon_sandbox_wrap verify the containment.
+    #
+    #   In particular, NEVER add the config-dir BASE — `recon_config_base_dir(
+    #   data_dir)`, i.e. `<data_dir>/recon-config`.  That is the root under which
+    #   EVERY run's `claude-config-<run_id>/.credentials.json` lives, so granting
+    #   it would give every reconciliation stage write access to every other run's
+    #   OAuth credentials — a capability that does not exist today.  If a stage is
+    #   failing with a "CLAUDE_CONFIG_DIR is OUTSIDE the sandbox writable set"
+    #   error, the computed per-run grant has been lost; restore it rather than
+    #   widening this list (task 4003).
     sandbox_recon_agents: bool = Field(default=True)
     sandbox_recon_writable_extras: list[str] = Field(default_factory=list)
 
