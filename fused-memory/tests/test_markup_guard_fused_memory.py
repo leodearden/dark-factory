@@ -1137,3 +1137,150 @@ class TestTheFiledProjectRootIsRegistryVouched:
             f'{sorted(tmp_path.rglob("*"))!r}'
         )
         interceptor.submit_task.assert_not_called()
+
+
+class TestUnrepairableResidueIsPreserved:
+    """A refusal must not destroy the payload it refuses.
+
+    ``</invoke>`` closes the ENVELOPE rather than a parameter, so
+    ``shared.toolcall_markup.repair`` can attribute the residue to nothing and
+    refuses under its NO SILENT PARTIAL REPAIR contract. Per the boundary
+    specimen table that is the COMMON outcome for the real corpus shapes, not an
+    edge case — and the caller is told, in the shared hint, that its full payload
+    is "preserved verbatim in the escalation named above". These pin that the
+    escalation named there EXISTS.
+    """
+
+    @staticmethod
+    def _unrepairable(marker: str) -> str:
+        """A specimen the repairer cannot attribute — built from the constants."""
+        return f'{_CLEAN_CONTENT} {marker}' + closer_for('invoke')
+
+    @classmethod
+    async def _refuse(cls, server, marker='one'):
+        with pytest.raises(ToolError) as exc_info:
+            await server._tool_manager.call_tool(
+                'add_system_record',
+                {
+                    'content': cls._unrepairable(marker),
+                    'project_id': _PROJECT_ID,
+                    'category': 'observations_and_summaries',
+                    'agent_id': _AGENT_ID,
+                },
+            )
+        return _payload(exc_info)
+
+    @pytest.mark.asyncio
+    async def test_the_refusal_names_a_record_that_actually_exists(self, tmp_path):
+        """The defect: escalation_id was null while the hint pointed at it."""
+        server, mock_service = _build_guarded_server(
+            'add_system_record', known_projects={_PROJECT_ID: str(tmp_path)}
+        )
+
+        payload = await self._refuse(server)
+
+        assert payload['error_type'] == 'mcp_markup_unrepairable'
+        assert payload['escalation_id'] is not None, (
+            f'the hint promises a record; it must exist: {payload!r}'
+        )
+        records = _escalations(tmp_path)
+        assert [r['id'] for r in records] == [payload['escalation_id']]
+        mock_service.add_system_record.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_record_holds_the_payload_verbatim(self, tmp_path):
+        """"Preserved VERBATIM" is the promise, so assert the caller's own bytes."""
+        server, _ = _build_guarded_server(
+            'add_system_record', known_projects={_PROJECT_ID: str(tmp_path)}
+        )
+
+        await self._refuse(server)
+
+        record = _escalations(tmp_path)[0]
+        assert self._unrepairable('one') in record['detail']
+        assert record['task_id'] == 'markup-residue'
+        # A residue record is NOT a burst summary: it must not land on either
+        # storm anchor, whose records are deduped into one.
+        assert record['task_id'] not in {'markup-guard', 'markup-tripwire'}
+
+    @pytest.mark.asyncio
+    async def test_two_refusals_are_never_folded_into_one_record(self, tmp_path):
+        """The one place this filer must NOT dedupe like its storm sibling.
+
+        Each record is the only surviving copy of a DIFFERENT payload, so
+        collapsing them destroys data — the exact loss the record exists to
+        prevent.
+        """
+        server, _ = _build_guarded_server(
+            'add_system_record', known_projects={_PROJECT_ID: str(tmp_path)}
+        )
+
+        await self._refuse(server, marker='first')
+        await self._refuse(server, marker='second')
+
+        details = '\n'.join(r['detail'] for r in _escalations(tmp_path))
+        assert len(_escalations(tmp_path)) == 2
+        assert self._unrepairable('first') in details
+        assert self._unrepairable('second') in details
+
+    @pytest.mark.asyncio
+    async def test_an_unfilable_residue_falls_back_to_the_log(self, tmp_path, caplog):
+        """When there is genuinely no queue, the log line IS the only copy — so
+        that is when the full record is dumped, and only then."""
+        server, _ = _build_guarded_server(
+            'add_system_record', known_projects={'some_other_project': str(tmp_path)}
+        )
+
+        with caplog.at_level('ERROR', logger='fused_memory.server.markup_guard'):
+            payload = await self._refuse(server)
+
+        assert payload['escalation_id'] is None
+        assert not (tmp_path / 'data' / 'escalations').exists()
+        text = '\n'.join(r.getMessage() for r in caplog.records)
+        assert 'only copy' in text
+        assert self._unrepairable('one') in text, (
+            f'the payload has to survive somewhere: {text!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_filed_residue_does_not_dump_the_payload_into_the_log(
+        self, tmp_path, caplog
+    ):
+        """The log-volume half. Once the payload is queued, repeating it on every
+        refusal is maximum log volume exactly when a leak is bursting."""
+        server, _ = _build_guarded_server(
+            'add_system_record', known_projects={_PROJECT_ID: str(tmp_path)}
+        )
+
+        with caplog.at_level('ERROR', logger='fused_memory.server.markup_guard'):
+            payload = await self._refuse(server)
+
+        text = '\n'.join(
+            r.getMessage() for r in caplog.records
+            if r.name == 'fused_memory.server.markup_guard'
+        )
+        assert payload['escalation_id'] in text, (
+            f'the operator still needs the pointer: {text!r}'
+        )
+        assert self._unrepairable('one') not in text
+
+    @pytest.mark.asyncio
+    async def test_a_residue_filer_that_raises_never_changes_the_refusal(
+        self, tmp_path, monkeypatch
+    ):
+        """Escalation is purely additive: the refusal is already decided."""
+        import fused_memory.server.markup_guard as guard_module
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError('queue on fire')
+
+        monkeypatch.setattr(guard_module, 'emit_markup_residue_escalation', _boom)
+        server, mock_service = _build_guarded_server(
+            'add_system_record', known_projects={_PROJECT_ID: str(tmp_path)}
+        )
+
+        payload = await self._refuse(server)
+
+        assert payload['error_type'] == 'mcp_markup_unrepairable'
+        assert payload['escalation_id'] is None
+        mock_service.add_system_record.assert_not_awaited()

@@ -98,6 +98,7 @@ from shared.mcp_markup_middleware import MarkupGuardMiddleware, RepairPolicy
 from fused_memory.server.markup_tripwire import (
     _MARKUP_STORM_THRESHOLD,
     _MARKUP_STORM_WINDOW_SECONDS,
+    emit_markup_residue_escalation,
     emit_markup_storm_escalation,
 )
 
@@ -146,6 +147,12 @@ _STORM_ANCHOR_TASK_ID = 'markup-guard'
 #: The one record kind the storm filer understands. The middleware sends its
 #: per-call RESIDUE records down the same channel, and those are not bursts.
 _STORM_ERROR_TYPE = 'mcp_markup_storm'
+
+#: The anchor the per-call RESIDUE records file under — a third series,
+#: distinct from both storm anchors because it is a different record KIND: it
+#: holds one caller's payload rather than summarising a burst, and it is never
+#: deduped (folding two residue records together would destroy one payload).
+_RESIDUE_ANCHOR_TASK_ID = 'markup-residue'
 
 #: Where an operator should take a recurrence. DF 3083 delivered the root cause
 #: and the corpus sweep but is DONE and CLOSED to appends, so a reader sent there
@@ -295,7 +302,48 @@ def install_markup_guard(
     if getattr(tool_manager, '_fused_memory_markup_guarded', False):
         return
 
-    def _escalation_sink(record: dict[str, Any]) -> None:
+    def _file_residue(record: dict[str, Any]) -> str | None:
+        """Preserve one refused payload durably, and report where it went.
+
+        The full record — which carries the caller's ``raw_value`` verbatim — is
+        logged ONLY when it could not be filed. Logging it on every refusal would
+        put the whole payload in the log on every call of the commonest rejection
+        shape, i.e. maximum log volume exactly when a leak is bursting, while the
+        queued record already holds it.
+        """
+        project_root = _resolve_project_root(record.get('project'), known_projects)
+        escalation_id = None
+        if project_root is not None:
+            # Purely additive, same as the storm branch below: the refusal is
+            # already decided, and emit_markup_residue_escalation is itself built
+            # never to raise, so this guards only against a defect in it.
+            try:
+                escalation_id = emit_markup_residue_escalation(
+                    project_root, record, anchor_task_id=_RESIDUE_ANCHOR_TASK_ID
+                )
+            except Exception:
+                logger.exception(
+                    'markup_guard: emit_markup_residue_escalation raised for '
+                    'project_root=%r; residue of %r not filed',
+                    project_root, record.get('tool'),
+                )
+        if escalation_id is not None:
+            logger.error(
+                'markup_guard_residue: refused an unrepairable %s.%s and '
+                'preserved its payload in %s (%d chars); %s',
+                record.get('tool'), record.get('field'), escalation_id,
+                len(record.get('raw_value') or ''), _STORM_ROUTING,
+            )
+            return escalation_id
+        logger.error(
+            'markup_guard_residue: refused an unrepairable call and could NOT '
+            'file its payload (project=%r), so THIS LOG LINE is the only copy '
+            'and the caller was handed a null escalation_id: %r; %s',
+            record.get('project'), record, _STORM_ROUTING,
+        )
+        return None
+
+    def _escalation_sink(record: dict[str, Any]) -> str | None:
         """File a fired burst, and never change the rejection that fired it.
 
         ONE sink serves TWO record kinds — measured, not assumed. The middleware
@@ -304,30 +352,30 @@ def install_markup_guard(
         RESIDUE records (``mcp_markup_unrepairable``, carrying the ``raw_value``
         the caller lost) through this one injected callable.
 
-        Only the first is a burst, so only the first reaches
-        :func:`emit_markup_storm_escalation`, whose record is storm-shaped down
-        to its detail text. Before this dispatch, a residue record filed a
-        rejected_writes_in_window=None escalation under the STORM anchor, once
-        per unrepairable call, and logged 'None None outcome(s) in Nones'.
+        Each kind has its OWN filer and its own anchor, because they are not the
+        same record: a storm summarises a burst and is DEDUPED into one open
+        record, while a residue record HOLDS one caller's payload and must never
+        be folded into another's. Before this dispatch existed, a residue record
+        went to the storm filer, which filed a rejected_writes_in_window=None
+        escalation under the STORM anchor and logged 'None None outcome(s) in
+        Nones'.
 
-        The residue kind is logged instead, record intact, so the payload is
-        recoverable from the operator log. fused-memory has no durable residue
-        queue yet; wiring one is filed as follow-up rather than improvised here,
-        because minting a second escalation shape is the duplication INV-5
-        forbids.
+        The residue id is RETURNED, and that return value is load-bearing: the
+        middleware folds it into the refusal as ``escalation_id`` beside a hint
+        telling the caller its payload is preserved in the escalation named
+        there. A sink that returns nothing makes that sentence a lie — and
+        unrepairable is the COMMON outcome for the real corpus shapes, not an
+        edge case. When filing is genuinely impossible (an unresolvable project,
+        no escalation package, a queue outage) the caller does see a null id, and
+        THEN — only then — the full record is dumped to the log, because the log
+        line really is the only copy.
 
         The middleware delegates dedup here on purpose — whether an open
         escalation already exists is queue knowledge the shared layer does not
         have and must not guess at.
         """
         if record.get('error_type') != _STORM_ERROR_TYPE:
-            logger.error(
-                'markup_guard_residue: refused an unrepairable call and preserved '
-                'its payload here — no durable residue queue is wired, so THIS '
-                'LOG LINE is the only copy: %r; %s',
-                record, _STORM_ROUTING,
-            )
-            return
+            return _file_residue(record)
 
         project_root = _resolve_project_root(record.get('project'), known_projects)
         if project_root is None:
@@ -338,7 +386,7 @@ def install_markup_guard(
                 record.get('count'), record.get('outcome'),
                 record.get('window_seconds'), record.get('project'), _STORM_ROUTING,
             )
-            return
+            return None
 
         # ONE greppable operator-facing ERROR line. The storm summary folded
         # into the tool response reaches only the leaking caller — the one party
@@ -367,6 +415,10 @@ def install_markup_guard(
                 'project_root=%r; storm %r not escalated',
                 project_root, record,
             )
+        # The storm id is deliberately not reported back: the middleware folds a
+        # returned id into the REFUSAL payload as the record holding that
+        # caller's data, and a burst summary holds no payload.
+        return None
 
     original_call_tool = tool_manager.call_tool
     guard = MarkupGuardMiddleware(

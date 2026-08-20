@@ -166,6 +166,19 @@ _ANCHOR_TASK_ID: str = 'markup-tripwire'
 _AGENT_ROLE: str = 'fused-memory/markup-tripwire'
 _CATEGORY: str = 'mcp_markup_write_storm'
 
+# RESIDUE wiring — a different record KIND on the same queue, so it gets its own
+# anchor (an ``esc-markup-residue-N`` series) rather than sharing either the
+# tripwire's or the boundary guard's storm anchor. A storm record summarises a
+# burst and is deduped; a residue record HOLDS a caller's payload and is not.
+# The category/level/summary/suggested_action are the middleware's OWN
+# (``_ESCALATION_CATEGORY`` = 'mcp_markup_residue', ``_ESCALATION_OWNER`` =
+# 'l2-escalation-watcher', ``_ESCALATION_LEVEL`` = 2), read off the record rather
+# than re-authored here; these are fallbacks for a record that omits them.
+_RESIDUE_ANCHOR_TASK_ID: str = 'markup-residue'
+_RESIDUE_AGENT_ROLE: str = 'fused-memory/markup-guard'
+_RESIDUE_CATEGORY: str = 'mcp_markup_residue'
+_RESIDUE_LEVEL: int = 2
+
 
 def find_markup_pattern(text: object) -> str | None:
     """Return the first :data:`MCP_MARKUP_PATTERNS` literal occurring in *text*.
@@ -481,5 +494,125 @@ def emit_markup_storm_escalation(
     logger.warning(
         'markup_tripwire: queued %s for project_root=%r (storm %r)',
         esc_id, project_root, storm,
+    )
+    return esc_id
+
+
+def emit_markup_residue_escalation(
+    project_root: str | None,
+    record: dict[str, Any],
+    *,
+    anchor_task_id: str = _RESIDUE_ANCHOR_TASK_ID,
+) -> str | None:
+    """Preserve the payload of ONE refused-as-unrepairable call (INV-7, B5).
+
+    Returns the filed escalation id, or ``None`` when filing is impossible or
+    fails. The id is what makes the caller-facing refusal HONEST: the shared
+    middleware folds it into the response as ``escalation_id`` beside a hint
+    that says "your full payload is preserved verbatim in the escalation named
+    above". Returning ``None`` there leaves that sentence pointing at a record
+    that does not exist — and per the boundary specimen table, unrepairable is
+    the COMMON outcome for the real corpus shapes, not an edge case.
+
+    A TRANSLATOR, not a second escalation vocabulary (INV-5). The middleware
+    already emits an escalation-SHAPED record — ``category``, ``level``,
+    ``summary``, ``suggested_action``, plus the flat ``tool``/``field``/
+    ``matched_pattern``/``agent_id``/``project``/``raw_value`` fields — because
+    the record has to survive being routed to whichever queue a host server
+    happens to own. This function moves those fields onto an
+    :class:`escalation.models.Escalation` and writes it; it authors no prose of
+    its own beyond the detail layout.
+
+    DELIBERATELY NOT DEDUPED, which is the one place it diverges from
+    :func:`emit_markup_storm_escalation`. That filer collapses a running leak
+    into one open record because every burst summary says the same thing. Here
+    each record is the ONLY surviving copy of a DIFFERENT caller payload, so
+    folding two together would destroy data — the exact loss this record exists
+    to prevent. Volume during a burst is what the storm record is for: it
+    summarises the incident once, while these hold the individual payloads.
+
+    NEVER raises, for the same reason as its sibling: the refusal is already
+    decided by the time this runs, so every failure mode degrades to ``None``
+    plus a log line rather than changing the call's outcome.
+    """
+    if project_root is None:
+        logger.debug(
+            'markup_tripwire: no project_root resolved; residue %r will not be filed',
+            record.get('tool'),
+        )
+        return None
+    if not HAS_ESCALATION:
+        logger.debug(
+            'markup_tripwire: escalation package unavailable; residue of %r in '
+            'project_root=%r will not be filed',
+            record.get('tool'), project_root,
+        )
+        return None
+
+    try:
+        queue = EscalationQueue(Path(project_root) / _QUEUE_DIRNAME)
+    except Exception:
+        logger.exception(
+            'markup_tripwire: failed to open the escalation queue for '
+            'project_root=%r; residue of %r not filed',
+            project_root, record.get('tool'),
+        )
+        return None
+
+    raw_value = record.get('raw_value')
+    detail = '\n'.join([
+        f'tool={record.get("tool")!r}',
+        f'field={record.get("field")!r}',
+        f'matched_pattern={record.get("matched_pattern")!r}',
+        f'agent_id={record.get("agent_id")!r}',
+        f'project={record.get("project")!r}',
+        f'owner={record.get("owner")!r}',
+        '',
+        'The MCP boundary markup guard REFUSED this call: the argument below '
+        'absorbed raw MCP tool-call envelope markup whose own boundary cannot '
+        'be determined, so no repair was attempted and NOTHING was written. '
+        'Guessing a boundary would silently drop whatever arguments hide in the '
+        'residue.',
+        '',
+        'The caller was told its payload is preserved here, so this record is '
+        'the only surviving copy: recover it for the caller if it is still '
+        'needed, then chase the harness serialization leak that produced it. '
+        'Report the recurrence against plans/toolcall-markup-containment-prd.md '
+        '(DF 3083 is done and closed to appends, so not against 3083).',
+        '',
+        'raw_value (VERBATIM, the caller\'s own bytes):',
+        str(raw_value),
+    ])
+
+    try:
+        esc = Escalation(  # type: ignore[possibly-unbound]
+            id=queue.make_id(anchor_task_id),
+            task_id=anchor_task_id,
+            agent_role=_RESIDUE_AGENT_ROLE,
+            severity='blocking',
+            category=str(record.get('category') or _RESIDUE_CATEGORY),
+            summary=str(
+                record.get('summary')
+                or f'Unrepairable MCP envelope markup in {record.get("tool")}'
+            ),
+            detail=detail,
+            suggested_action=str(record.get('suggested_action') or ''),
+            level=int(record.get('level') or _RESIDUE_LEVEL),
+        )
+        esc_id = queue.submit(esc)
+    except Exception:
+        logger.exception(
+            'markup_tripwire: failed to submit the residue escalation for '
+            'project_root=%r (tool=%r field=%r); the payload survives only in '
+            'the caller-facing log line',
+            project_root, record.get('tool'), record.get('field'),
+        )
+        return None
+
+    logger.warning(
+        'markup_tripwire: queued %s holding the unrepairable payload of %s.%s '
+        '(%d chars) for project_root=%r',
+        esc_id, record.get('tool'), record.get('field'),
+        len(raw_value or ''), project_root,
     )
     return esc_id
