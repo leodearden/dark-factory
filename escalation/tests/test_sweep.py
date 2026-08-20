@@ -721,3 +721,51 @@ class TestSweepCli:
             'queue-dir does not exist' in r.getMessage() for r in caplog.records
         ), f'Expected missing-dir error; got: {[r.getMessage() for r in caplog.records]}'
 
+
+
+def _write_lock(queue_dir: Path, escalation_id: str) -> Path:
+    """Create the bare ``{escalation_id}.json.lock`` sidecar in the queue root.
+
+    A plain touch is exactly what ``escalation_id_lock``'s
+    ``os.open(..., O_CREAT)`` leaves behind: an empty, never-renamed file whose
+    only role is to be a stable flock() target.
+    """
+    queue_dir.mkdir(parents=True, exist_ok=True)
+    path = queue_dir / f'{escalation_id}.json.lock'
+    path.touch()
+    return path
+
+
+class TestReapOrphanLocks:
+    """sweep.reap_orphan_locks unlinks sidecars whose record is in neither tier."""
+
+    def _disk_snapshot(self, root: Path) -> dict[str, bytes]:
+        """Return {relative_path_str: content_bytes} for every regular file under root."""
+        return {
+            str(p.relative_to(root)): p.read_bytes()
+            for p in sorted(root.rglob('*'))
+            if p.is_file()
+        }
+
+    def test_orphan_lock_deleted_on_apply(self, tmp_path: Path):
+        """A sidecar with no record in root and no archive at all is reaped."""
+        lock_path = _write_lock(tmp_path, 'esc-1-1')
+        assert not (tmp_path / 'archive').exists(), 'precondition: no archive tier'
+
+        count = sweep.reap_orphan_locks(tmp_path, apply=True)
+
+        assert count == 1
+        assert not lock_path.exists(), 'orphaned sidecar should have been unlinked'
+
+    def test_orphan_lock_counted_but_kept_on_dry_run(self, tmp_path: Path):
+        """apply=False reports the would-reap count and mutates nothing on disk."""
+        lock_path = _write_lock(tmp_path, 'esc-1-1')
+        before = self._disk_snapshot(tmp_path)
+
+        count = sweep.reap_orphan_locks(tmp_path, apply=False)
+
+        assert count == 1, 'dry-run still reports what it would reap'
+        assert lock_path.exists(), 'dry-run must not unlink the sidecar'
+        assert self._disk_snapshot(tmp_path) == before, (
+            'dry-run changed disk state — apply=False must be a pure count'
+        )
