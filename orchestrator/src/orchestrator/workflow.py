@@ -12718,6 +12718,33 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     )
         completed_at = datetime.now(UTC).isoformat()
 
+        # The CLI-stage half of session_resume_failed (task 3578): we DID arm
+        # --resume, the CLI rejected the session, and invoke_with_cap_retry
+        # retried fresh and handed back a SUCCESS. Nothing else records that —
+        # from runs.db the invocation looks perfect, so the lost transcript was
+        # invisible. `shared` has no event store, so the count rides out on
+        # AgentResult.resume_fallbacks and is turned into an event here.
+        #
+        # getattr with a default, not attribute access: several suites hand
+        # _invoke a stand-in result object, and instrumentation must never be
+        # the thing that raises on the production dispatch path.
+        #
+        # Per-INVOCATION, like the pre_flight stage — deliberately NOT a fourth
+        # term in the _run_slot guard's per-dispatch ratio denominator (see
+        # EventType's taxonomy note).
+        resume_fallbacks = getattr(result, 'resume_fallbacks', 0)
+        if resume_fallbacks and self.event_store:
+            self.event_store.emit(
+                EventType.session_resume_failed,
+                task_id=self.task_id,
+                data={
+                    'stage': 'cli',
+                    'session_id': session_id_val,
+                    'role': role.name,
+                    'fallbacks': resume_fallbacks,
+                },
+            )
+
         # Record the last successfully-completed role (updated only on success,
         # mirrors the cost-accumulation path below — failed/raised invocations
         # do not advance either field).
