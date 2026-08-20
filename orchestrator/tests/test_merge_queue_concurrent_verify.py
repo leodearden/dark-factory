@@ -332,6 +332,41 @@ def _method_wait_budget(fn: ast.AST) -> float:
     )
 
 
+def _iter_test_methods(
+    source: str,
+) -> list[tuple[str, ast.FunctionDef | ast.AsyncFunctionDef]]:
+    """Statically parse *source* and return every ``(class_name, method)``
+    pair for a ``test_*`` method defined directly in the body of a
+    top-level ``Test*`` class.
+
+    The shared traversal behind `_worst_per_method_wait_budget`,
+    `_suppressed_result_wait_methods`, and `_unguarded_worker_teardown_methods`
+    (task 4219 amendment): all three previously re-implemented this exact
+    walk independently, so a blind spot (nested classes, module-level
+    helper functions, non-``Test*`` classes) had to be fixed in three
+    places instead of one.
+
+    Must never raise: a crash here would fail the whole suite over an
+    unrelated edit to this file. Unparseable source returns [].
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+
+    pairs: list[tuple[str, ast.FunctionDef | ast.AsyncFunctionDef]] = []
+    for class_node in ast.iter_child_nodes(tree):
+        if not (isinstance(class_node, ast.ClassDef) and class_node.name.startswith('Test')):
+            continue
+        for method in class_node.body:
+            if (
+                isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and method.name.startswith('test_')
+            ):
+                pairs.append((class_node.name, method))
+    return pairs
+
+
 def _worst_per_method_wait_budget(source: str) -> dict[str, float]:
     """Statically scan *source* and compute, per top-level ``Test*`` class,
     the MAX over its ``test_*`` methods of that method's summed sequential
@@ -347,49 +382,62 @@ def _worst_per_method_wait_budget(source: str) -> dict[str, float]:
     Must never raise: a crash here would fail the whole suite over an
     unrelated edit to this file. Unparseable source returns {}.
     """
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
-        return {}
-
     budgets: dict[str, float] = {}
-    for node in ast.iter_child_nodes(tree):
-        if not (isinstance(node, ast.ClassDef) and node.name.startswith('Test')):
-            continue
-        method_budgets = [
-            _method_wait_budget(item)
-            for item in node.body
-            if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and item.name.startswith('test_')
-        ]
-        if method_budgets:
-            budgets[node.name] = max(method_budgets)
+    for class_name, method in _iter_test_methods(source):
+        budget = _method_wait_budget(method)
+        prev = budgets.get(class_name)
+        budgets[class_name] = budget if prev is None else max(prev, budget)
     return budgets
 
 
 def _suppressed_result_wait_methods(source: str) -> dict[str, set[str]]:
     """Statically scan *source* for the executable form of the `outcome is
     None` anti-pattern `_await_outcome`'s docstring names above ("The shape
-    this replaces"): a `with contextlib.suppress(TimeoutError):` block
-    enclosing an `asyncio.wait_for(...)` call, which converts a genuine
-    pipeline hang or a missing cascade into a confusing `outcome is None`
-    assertion failure instead of failing loudly by label (task 4219).
+    this replaces"): either (a) a `with contextlib.suppress(TimeoutError):`
+    block enclosing an `asyncio.wait_for(...)` call, or (b) a
+    `try: outcome = await asyncio.wait_for(...) except TimeoutError: outcome
+    = None` block -- an `except` handler catching `TimeoutError` (bare or
+    `asyncio.TimeoutError`, alone or inside a tuple) AND whose body
+    SWALLOWS the timeout (every statement is either `pass` or an assignment
+    of the literal `None`) whose `try:` body contains an
+    `asyncio.wait_for(...)` call. Both spellings convert a genuine pipeline
+    hang or a missing cascade into a confusing `outcome is None` assertion
+    failure instead of failing loudly by label (task 4219; the try/except
+    spelling was added in the task 4219 amendment pass after a reviewer
+    found it undetected at
+    `TestHaltAndUnavailable::test_runner_unavailable_quarantine_fallback`,
+    L3340-3346).
+
+    The swallowing-body requirement on spelling (b) matters: a handler that
+    catches `TimeoutError` and then fails LOUDLY -- e.g. `except
+    TimeoutError: ...cleanup...; pytest.fail('descriptive RED message')`,
+    the shape used at `TestOverlapSignal::test_both_verifies_enter_before_either_released`
+    and `TestLastItemOfBurstFinalizes::test_single_item_resolves_with_free_remote_slot`
+    -- is already the DESIRED behaviour, not the anti-pattern, and matching
+    on the caught exception type alone (an earlier version of this scanner,
+    task 4219 amendment) false-positived on both (found by running the
+    scanner against this module's own source, not by review). Conservative
+    by construction, matching this module's documented floor-over-shapes
+    stance elsewhere: an `except TimeoutError:` handler that does anything
+    OTHER than `pass` or assign `None` is treated as already-loud and is
+    NOT reported, even if it happens to also be confusing in some other way
+    -- a false negative here is the safe direction.
 
     For each top-level ``Test*`` class, reports every ``test_*`` method
     whose body contains at least one such suppressed wait, as a
     ``{class_name: {method_names}}`` mapping. ``suppress(Exception)`` (the
     blessed best-effort teardown-join shape used for the worker-task join
-    in this module) and a ``suppress(TimeoutError)`` block enclosing no
-    ``asyncio.wait_for`` call are both deliberately NOT reported.
+    in this module), a ``suppress(TimeoutError)`` block enclosing no
+    ``asyncio.wait_for`` call, a ``try/except`` whose handler does not
+    catch ``TimeoutError``, and a ``try/except TimeoutError`` whose handler
+    does anything other than swallow (``pass`` / assign ``None``) are all
+    deliberately NOT reported.
 
     Must never raise: a crash here would fail the whole suite over an
     unrelated edit to this file (mirrors `_worst_per_method_wait_budget`'s
-    contract above). Unparseable source returns {}.
+    contract above; delegates to `_iter_test_methods`, which returns []
+    on unparseable source). Unparseable source returns {}.
     """
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
-        return {}
 
     def _is_timeout_error_arg(node: ast.expr) -> bool:
         if isinstance(node, ast.Name) and node.id == 'TimeoutError':
@@ -419,25 +467,52 @@ def _suppressed_result_wait_methods(source: str) -> dict[str, set[str]]:
             and node.func.value.id == 'asyncio'
         )
 
+    def _is_timeout_error_handler(handler: ast.ExceptHandler) -> bool:
+        node = handler.type
+        if node is None:
+            return False
+        if _is_timeout_error_arg(node):
+            return True
+        return isinstance(node, ast.Tuple) and any(
+            _is_timeout_error_arg(elt) for elt in node.elts
+        )
+
+    def _is_none_assignment(stmt: ast.stmt) -> bool:
+        return (
+            isinstance(stmt, ast.Assign)
+            and isinstance(stmt.value, ast.Constant)
+            and stmt.value.value is None
+        )
+
+    def _is_swallowing_handler(handler: ast.ExceptHandler) -> bool:
+        return all(
+            isinstance(stmt, ast.Pass) or _is_none_assignment(stmt)
+            for stmt in handler.body
+        )
+
     result: dict[str, set[str]] = {}
-    for class_node in ast.iter_child_nodes(tree):
-        if not (isinstance(class_node, ast.ClassDef) and class_node.name.startswith('Test')):
-            continue
-        for method in class_node.body:
-            if not (
-                isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef))
-                and method.name.startswith('test_')
-            ):
-                continue
-            for node in ast.walk(method):
-                if not isinstance(node, ast.With):
-                    continue
+    for class_name, method in _iter_test_methods(source):
+        for node in ast.walk(method):
+            if isinstance(node, ast.With):
                 if not any(
                     _is_suppress_timeout_error_call(item.context_expr) for item in node.items
                 ):
                     continue
                 if any(_is_asyncio_wait_for_call(n) for n in ast.walk(node)):
-                    result.setdefault(class_node.name, set()).add(method.name)
+                    result.setdefault(class_name, set()).add(method.name)
+                    break
+            elif isinstance(node, ast.Try):
+                if not any(
+                    _is_timeout_error_handler(h) and _is_swallowing_handler(h)
+                    for h in node.handlers
+                ):
+                    continue
+                if any(
+                    _is_asyncio_wait_for_call(n)
+                    for stmt in node.body
+                    for n in ast.walk(stmt)
+                ):
+                    result.setdefault(class_name, set()).add(method.name)
                     break
     return result
 
@@ -447,21 +522,36 @@ def _unguarded_worker_teardown_methods(source: str) -> list[str]:
     at test_merge_speculation.py:1972-2003 (`_stop_worker`'s docstring):
     `wait_responsive` gives up by raising `_pytest.outcomes.Failed` (a
     ``BaseException`` subclass), so on a straight-line body a give-up --
-    like a mid-body ``assert`` -- skips ``worker.stop()`` entirely and
+    like a mid-body ``assert`` -- skips the worker-stop call entirely and
     leaks a live ``SpeculativeMergeWorker`` plus its run task into
     pytest-asyncio teardown. That leak is why one red test used to cascade
     into unrelated failures elsewhere in the session (task 4219).
 
     For each top-level ``Test*`` class, reports every ``test_*`` method
-    that calls ``wait_responsive(...)`` AND calls ``worker.stop()`` from
-    somewhere NOT inside a ``finally:`` block, as a sorted list of
-    ``'ClassName::method_name'`` strings. Deliberately scoped to methods
-    that call ``wait_responsive``: this module has ~25 pre-existing
-    straight-line teardown sites that have not been migrated yet, and this
-    guard's job is to stop the migrated set from regressing, not to flag
-    every unmigrated one. A method calling ``wait_responsive`` but never
-    ``worker.stop()`` at all is not reported either -- there is no stop
-    call to be unguarded.
+    that calls ``wait_responsive(...)`` AND calls a worker-stop -- either
+    ``worker.stop()`` or the shared ``_stop_worker(worker, ...)`` teardown
+    helper (test_merge_speculation.py:1972-2006) -- from somewhere that is
+    NOT inside a ``finally:`` block whose guarded ``try:`` body encloses
+    EVERY ``wait_responsive`` call in the method, as a sorted list of
+    ``'ClassName::method_name'`` strings. Requiring the ``try:`` to enclose
+    every ``wait_responsive`` call (not just crediting any ``finally`` in
+    the method) matters: a give-up from a ``wait_responsive`` call that
+    sits OUTSIDE that ``try:`` -- e.g. before it -- is not caught by its
+    ``finally`` either, so the leak window stays open even though a
+    finally-wrapped stop call is present somewhere in the method
+    (task 4219 amendment; found by review). Recognising the ``_stop_worker``
+    helper alongside ``worker.stop()`` matters for the same reason: a
+    straight-line ``await _stop_worker(worker, worker_task)`` leaks exactly
+    like a straight-line ``await worker.stop()`` would, and the guard must
+    not go quietly vacuous for a method that adopts the module's OTHER
+    blessed teardown shape.
+
+    Deliberately scoped to methods that call ``wait_responsive``: this
+    module has ~25 pre-existing straight-line teardown sites that have not
+    been migrated yet, and this guard's job is to stop the migrated set
+    from regressing, not to flag every unmigrated one. A method calling
+    ``wait_responsive`` but never a worker-stop at all is not reported
+    either -- there is no stop call to be unguarded.
 
     Deliberately narrow to a variable literally named ``worker``: this
     module names the worker ``worker`` at every relevant site, and a false
@@ -471,12 +561,9 @@ def _unguarded_worker_teardown_methods(source: str) -> list[str]:
     above.
 
     Must never raise: a crash here would fail the whole suite over an
-    unrelated edit to this file. Unparseable source returns [].
+    unrelated edit to this file (delegates to `_iter_test_methods`, which
+    returns [] on unparseable source). Unparseable source returns [].
     """
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
-        return []
 
     def _is_wait_responsive_call(node: ast.AST) -> bool:
         return (
@@ -486,67 +573,111 @@ def _unguarded_worker_teardown_methods(source: str) -> list[str]:
         )
 
     def _is_worker_stop_call(node: ast.AST) -> bool:
-        return (
+        if (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
             and node.func.attr == 'stop'
             and isinstance(node.func.value, ast.Name)
             and node.func.value.id == 'worker'
+        ):
+            return True
+        return (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == '_stop_worker'
         )
 
     offenders: list[str] = []
-    for class_node in ast.iter_child_nodes(tree):
-        if not (isinstance(class_node, ast.ClassDef) and class_node.name.startswith('Test')):
+    for class_name, method in _iter_test_methods(source):
+        wait_calls = [n for n in ast.walk(method) if _is_wait_responsive_call(n)]
+        if not wait_calls:
             continue
-        for method in class_node.body:
-            if not (
-                isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef))
-                and method.name.startswith('test_')
-            ):
-                continue
-            if not any(_is_wait_responsive_call(n) for n in ast.walk(method)):
-                continue
 
-            stop_calls = [n for n in ast.walk(method) if _is_worker_stop_call(n)]
-            if not stop_calls:
+        stop_calls = [n for n in ast.walk(method) if _is_worker_stop_call(n)]
+        if not stop_calls:
+            continue
+
+        guarded: set[ast.AST] = set()
+        for try_node in ast.walk(method):
+            if not isinstance(try_node, ast.Try):
                 continue
+            try_body_ids = {id(n) for stmt in try_node.body for n in ast.walk(stmt)}
+            if not all(id(w) in try_body_ids for w in wait_calls):
+                # This try's body does not enclose every wait_responsive
+                # call in the method, so a give-up raised by one it does
+                # NOT enclose is not caught by its finally -- the esc-3980-4
+                # leak window stays open. Do not credit its finalbody stop
+                # call(s) as guarding anything.
+                continue
+            for final_stmt in try_node.finalbody:
+                for n in ast.walk(final_stmt):
+                    if _is_worker_stop_call(n):
+                        guarded.add(n)
 
-            guarded: set[ast.AST] = set()
-            for try_node in ast.walk(method):
-                if not isinstance(try_node, ast.Try):
-                    continue
-                for final_stmt in try_node.finalbody:
-                    for n in ast.walk(final_stmt):
-                        if _is_worker_stop_call(n):
-                            guarded.add(n)
-
-            if any(call not in guarded for call in stop_calls):
-                offenders.append(f'{class_node.name}::{method.name}')
+        if any(call not in guarded for call in stop_calls):
+            offenders.append(f'{class_name}::{method.name}')
 
     return sorted(offenders)
 
 
 # task 4219: SHRINKING ratchet of methods that still carry the
 # suppress(TimeoutError)-wrapped-wait anti-pattern _suppressed_result_wait_methods
-# scans for. Entries may only be REMOVED as methods are migrated to
-# wait_responsive -- never added to (a NEW offender must be migrated, not
-# ledgered; see TestLoudWaitMigrationRatchet.test_no_unledgered_suppressed_result_waits
+# scans for -- both the `with contextlib.suppress(TimeoutError):` spelling
+# and the `try: ... except TimeoutError: ... = None` spelling (the latter
+# added to the scanner in the task 4219 amendment pass; see its docstring).
+# Entries may only be REMOVED as methods are migrated to wait_responsive --
+# never added to (a NEW offender must be migrated, not ledgered; see
+# TestLoudWaitMigrationRatchet.test_no_unledgered_suppressed_result_waits
 # below). The migration target of task 4219,
 # TestCascadeErrorContainment::test_cascade_remerge_error_does_not_kill_verifier_loop,
 # is deliberately NOT on this ledger.
 #
-# The two remaining entries are not migrated in task 4219: routing
-# test_cascade_cancel_and_release_raises_contained's waits through
-# wait_responsive at their PRESERVED nominals bills 90+90+90+40+60+20 = 390s
-# against the shared HEAVY_BARRIER_TEST_TIMEOUT (300s), so it cannot land
-# without first resolving that mark's arithmetic across all nine classes
-# that share it -- a distinct design question, filed as follow-up.
+# Each entry's reason individually -- none has a MEASURED failure (see the
+# never-widen design decision in the task 4219 plan), so none is urgent:
+#
+# - TestCascadeErrorContainment::test_cascade_cancel_and_release_raises_contained:
+#   routing its waits through wait_responsive at their PRESERVED nominals
+#   bills 90+90+90+40+60+20 = 390s against the shared HEAVY_BARRIER_TEST_TIMEOUT
+#   (300s) -- cannot land without first resolving that mark's arithmetic
+#   across all nine classes that share it.
+#
+# - TestChainInvalidationUnderOverlap::test_n_fail_aborts_downstream_verify_reruns_remerge:
+#   its current (unmigrated) worst-case budget is 175s (45+45+45+20+20),
+#   comfortably under the class's 300s mark today -- but its three
+#   non-suppressed load-bearing waits already sit at the task-2350-widened
+#   45.0 nominal (gate_a, gate_b, req_a), so migrating at preserved nominals
+#   bills 90+90+90 for those three plus 40 for the formerly-suppressed 20.0
+#   req_b wait, plus the unmigrated 20s teardown join = 330s > 300s. It is
+#   the MIGRATED total, not the current one, that blows the mark -- same
+#   shared-mark arithmetic problem as the entry above, same follow-up.
+#
+# - TestHaltAndUnavailable::test_runner_unavailable_quarantine_fallback:
+#   carries the try/except TimeoutError spelling (L3340-3346), not the
+#   `with suppress(...)` spelling -- undetected until the scanner was
+#   extended to recognise it (task 4219 amendment; reviewer finding).
+#   UNLIKE the two entries above, migrating this one does NOT blow its
+#   shared HEAVY_BARRIER_TEST_TIMEOUT mark: its four load-bearing waits are
+#   all still at the un-widened 15.0 nominal, so wait_responsive would bill
+#   30+30+30+30 = 120s plus the unmigrated 5s teardown join = 125s, well
+#   under 300s. It is ledgered rather than migrated anyway, to keep this
+#   amendment pass's diff to additive guards plus the one already-planned
+#   method (the task 4219 plan's design decision explicitly scoped this
+#   task to "one method plus additive guards") -- a good candidate for a
+#   quick, low-risk follow-up migration on its own, unlike the other two.
+#
+# All three are filed as one follow-up: resolve the HEAVY_BARRIER_TEST_TIMEOUT
+# arithmetic across every class that shares it (needed for the first two),
+# then migrate the survivors (the third needs no arithmetic fix, just a
+# migration).
 _SUPPRESSED_WAIT_DEBT: dict[str, frozenset[str]] = {
     'TestChainInvalidationUnderOverlap': frozenset({
         'test_n_fail_aborts_downstream_verify_reruns_remerge',
     }),
     'TestCascadeErrorContainment': frozenset({
         'test_cascade_cancel_and_release_raises_contained',
+    }),
+    'TestHaltAndUnavailable': frozenset({
+        'test_runner_unavailable_quarantine_fallback',
     }),
 }
 
@@ -6424,11 +6555,14 @@ if x:
 class TestSuppressedWaitScanner:
     """Unit tests for `_suppressed_result_wait_methods` -- the executable
     form of the `outcome is None` anti-pattern `_await_outcome`'s docstring
-    names (see "The shape this replaces", above): a `with
+    names (see "The shape this replaces", above): either a `with
     contextlib.suppress(TimeoutError): outcome = await
-    asyncio.wait_for(fut, timeout=N)` shape that converts a genuine pipeline
-    hang or a missing cascade into a confusing `outcome is None` assertion
-    failure instead of failing loudly by label (task 4219).
+    asyncio.wait_for(fut, timeout=N)` shape, or a `try: outcome = await
+    asyncio.wait_for(...) except TimeoutError: outcome = None` shape. Both
+    convert a genuine pipeline hang or a missing cascade into a confusing
+    `outcome is None` assertion failure instead of failing loudly by label
+    (task 4219; the try/except spelling was added in the task 4219
+    amendment pass).
 
     Every case here is driven from a SYNTHETIC source string, not this
     module's own source, so these tests are provably non-vacuous and do not
@@ -6451,6 +6585,176 @@ class TestSuppressedWait:
         assert result == {'TestSuppressedWait': {'test_it'}}, (
             f'Expected the suppress(TimeoutError)-wrapped wait_for to be '
             f'reported, got {result!r}.'
+        )
+
+    def test_suppress_asyncio_timeout_error_attribute_form_is_reported(self) -> None:
+        """The `asyncio.TimeoutError` attribute spelling (as opposed to the
+        bare `TimeoutError` Name form) inside `suppress(...)` IS also
+        recognised. No site in this module currently uses this spelling --
+        this pins the branch so it does not silently rot un-covered.
+        """
+        source = '''
+class TestSuppressedWaitAttributeForm:
+    async def test_it(self):
+        with contextlib.suppress(asyncio.TimeoutError):
+            outcome = await asyncio.wait_for(fut, timeout=5.0)
+'''
+        result = _suppressed_result_wait_methods(source)
+
+        assert result == {'TestSuppressedWaitAttributeForm': {'test_it'}}, (
+            f'Expected the suppress(asyncio.TimeoutError)-wrapped wait_for '
+            f'to be reported, got {result!r}.'
+        )
+
+    def test_bare_suppress_name_import_form_is_reported(self) -> None:
+        """`suppress(TimeoutError):` -- the bare `Name` call from a
+        `from contextlib import suppress` import, rather than the
+        `contextlib.suppress` attribute form -- IS also recognised.
+        """
+        source = '''
+class TestBareSuppressImport:
+    async def test_it(self):
+        with suppress(TimeoutError):
+            outcome = await asyncio.wait_for(fut, timeout=5.0)
+'''
+        result = _suppressed_result_wait_methods(source)
+
+        assert result == {'TestBareSuppressImport': {'test_it'}}, (
+            f'Expected the bare suppress(TimeoutError)-wrapped wait_for to '
+            f'be reported, got {result!r}.'
+        )
+
+    def test_try_except_timeout_error_around_wait_for_is_reported(self) -> None:
+        """The second spelling of the anti-pattern: a bare `try: outcome =
+        await asyncio.wait_for(...) except TimeoutError: outcome = None`
+        block IS reported -- this is the exact shape found (undetected,
+        until this amendment) at
+        `TestHaltAndUnavailable::test_runner_unavailable_quarantine_fallback`,
+        L3340-3346.
+        """
+        source = '''
+class TestTryExceptTimeoutError:
+    async def test_it(self):
+        try:
+            outcome = await asyncio.wait_for(fut, timeout=5.0)
+        except TimeoutError:
+            outcome = None
+'''
+        result = _suppressed_result_wait_methods(source)
+
+        assert result == {'TestTryExceptTimeoutError': {'test_it'}}, (
+            f'Expected the try/except TimeoutError-wrapped wait_for to be '
+            f'reported, got {result!r}.'
+        )
+
+    def test_try_except_other_exception_is_not_reported(self) -> None:
+        """A `try/except` around a wait_for call whose handler catches a
+        DIFFERENT exception (not `TimeoutError`) is NOT reported -- the
+        anti-pattern is specifically about swallowing a timeout, not about
+        exception handling in general.
+        """
+        source = '''
+class TestTryExceptOtherException:
+    async def test_it(self):
+        try:
+            outcome = await asyncio.wait_for(fut, timeout=5.0)
+        except ValueError:
+            outcome = None
+'''
+        result = _suppressed_result_wait_methods(source)
+
+        assert result == {}, (
+            f'Expected a try/except catching ValueError (not TimeoutError) '
+            f'to NOT be reported, got {result!r}.'
+        )
+
+    def test_try_except_timeout_error_that_fails_loudly_is_not_reported(self) -> None:
+        """A `try/except TimeoutError:` handler that does NOT swallow --
+        e.g. it runs cleanup and then calls `pytest.fail(...)` with a clear
+        diagnostic message, the exact shape used at
+        `TestOverlapSignal::test_both_verifies_enter_before_either_released`
+        and `TestLastItemOfBurstFinalizes::test_single_item_resolves_with_free_remote_slot`
+        -- is NOT reported. This is already the DESIRED loud-failure
+        behaviour, not the `outcome is None` anti-pattern; an earlier
+        version of this scanner (task 4219 amendment) matched on the
+        caught exception type alone and false-positived on both real
+        sites.
+        """
+        source = '''
+class TestTryExceptLoudFailure:
+    async def test_it(self):
+        try:
+            outcome = await asyncio.wait_for(fut, timeout=5.0)
+        except TimeoutError:
+            with contextlib.suppress(Exception):
+                await cleanup()
+            pytest.fail('descriptive RED message explaining the failure')
+'''
+        result = _suppressed_result_wait_methods(source)
+
+        assert result == {}, (
+            f'Expected a try/except TimeoutError handler that fails loudly '
+            f'via pytest.fail(...) (not a swallow) to NOT be reported, '
+            f'got {result!r}.'
+        )
+
+    def test_try_except_timeout_error_without_wait_for_is_not_reported(self) -> None:
+        """A `try/except TimeoutError:` block whose `try:` body encloses no
+        `asyncio.wait_for` call at all is NOT reported.
+        """
+        source = '''
+class TestTryExceptNoWaitFor:
+    async def test_it(self):
+        try:
+            do_something_unrelated()
+        except TimeoutError:
+            pass
+'''
+        result = _suppressed_result_wait_methods(source)
+
+        assert result == {}, (
+            f'Expected a try/except TimeoutError block with no enclosed '
+            f'wait_for call in the try body to NOT be reported, '
+            f'got {result!r}.'
+        )
+
+    def test_multiple_classes_and_methods_are_all_aggregated(self) -> None:
+        """Offenders across MULTIPLE classes and MULTIPLE methods within
+        one class are all accumulated into the returned mapping -- not just
+        the first one found. Pins the dict-of-sets aggregation and the
+        per-class method-name set, which the single-offender cases above
+        cannot distinguish from an implementation that stops at the first
+        hit.
+        """
+        source = '''
+class TestFirstOffender:
+    async def test_one(self):
+        with contextlib.suppress(TimeoutError):
+            outcome = await asyncio.wait_for(fut, timeout=5.0)
+
+    async def test_two(self):
+        try:
+            outcome = await asyncio.wait_for(fut, timeout=5.0)
+        except TimeoutError:
+            outcome = None
+
+    async def test_clean(self):
+        outcome = await asyncio.wait_for(fut, timeout=5.0)
+
+class TestSecondOffender:
+    async def test_only(self):
+        with contextlib.suppress(TimeoutError):
+            outcome = await asyncio.wait_for(fut, timeout=5.0)
+'''
+        result = _suppressed_result_wait_methods(source)
+
+        assert result == {
+            'TestFirstOffender': {'test_one', 'test_two'},
+            'TestSecondOffender': {'test_only'},
+        }, (
+            f'Expected offenders from both classes and both offending '
+            f'methods in TestFirstOffender to be aggregated together, '
+            f'got {result!r}.'
         )
 
     def test_suppress_exception_is_not_reported(self) -> None:
@@ -6551,10 +6855,17 @@ class TestWorkerTeardownGuardScanner:
     form of the esc-3980-4 leak invariant recorded at
     test_merge_speculation.py:1972-2003 (`_stop_worker`'s docstring):
     `wait_responsive` gives up by raising `_pytest.outcomes.Failed`, so a
-    give-up on a straight-line body (like a mid-body `assert`) skips
-    `worker.stop()` entirely and leaks a live SpeculativeMergeWorker plus
+    give-up on a straight-line body (like a mid-body `assert`) skips the
+    worker-stop call entirely and leaks a live SpeculativeMergeWorker plus
     its run task into pytest-asyncio teardown -- how one red test used to
     cascade into unrelated failures elsewhere in the session (task 4219).
+
+    A stop call counts as guarded only when the `finally:`'s guarding
+    `try:` body encloses EVERY `wait_responsive` call in the method (not
+    merely when SOME finally exists somewhere in the method), and either
+    `worker.stop()` or the shared `_stop_worker(...)` helper counts as a
+    stop call (task 4219 amendment; both fixed after review found the
+    original implementation's blind spots).
 
     Every case here is driven from a SYNTHETIC source string, not this
     module's own source, so these tests are provably non-vacuous and do not
@@ -6598,6 +6909,96 @@ class TestGuardedTeardown:
         assert result == [], (
             f'Expected worker.stop() inside a finally: block to NOT be '
             f'reported, got {result!r}.'
+        )
+
+    def test_finally_that_does_not_enclose_the_wait_is_still_reported(self) -> None:
+        """A `finally:` block that stops the worker IS present, but the
+        `try:` guarding it does NOT enclose the `wait_responsive` call
+        (which sits before the try, as straight-line code) -- this IS
+        reported. A give-up from that wait_responsive call raises before
+        the try is ever entered, so its finally never runs and the worker
+        still leaks; crediting ANY finally-wrapped stop() in the method,
+        regardless of what its try actually encloses, would make the guard
+        vacuous for exactly this shape (task 4219 amendment; reviewer
+        finding, empirically verified against the pre-fix implementation).
+        """
+        source = '''
+class TestFinallyDoesNotEncloseWait:
+    async def test_it(self):
+        await wait_responsive(fut, timeout=5.0, label='x')
+        try:
+            await something()
+        finally:
+            await worker.stop()
+'''
+        result = _unguarded_worker_teardown_methods(source)
+
+        assert result == ['TestFinallyDoesNotEncloseWait::test_it'], (
+            f'Expected a finally that does not enclose the wait_responsive '
+            f'call to still be reported, got {result!r}.'
+        )
+
+    def test_one_guarded_and_one_unguarded_stop_call_is_reported(self) -> None:
+        """A method with TWO worker-stop calls -- one correctly
+        finally-guarded, one straight-line -- IS reported. Pins the
+        `any(call not in guarded ...)` branch: a single well-guarded stop
+        call must not paper over a second, unguarded one.
+        """
+        source = '''
+class TestMixedGuardedAndUnguarded:
+    async def test_it(self):
+        try:
+            await wait_responsive(fut, timeout=5.0, label='x')
+        finally:
+            await worker.stop()
+        await worker.stop()
+'''
+        result = _unguarded_worker_teardown_methods(source)
+
+        assert result == ['TestMixedGuardedAndUnguarded::test_it'], (
+            f'Expected the method with one guarded and one unguarded '
+            f'worker.stop() call to be reported, got {result!r}.'
+        )
+
+    def test_straight_line_stop_worker_helper_is_reported(self) -> None:
+        """A straight-line `await _stop_worker(worker, worker_task)` --
+        the shared teardown helper from test_merge_speculation.py:1972-2006
+        -- IS reported when not inside a finally, exactly like a
+        straight-line `worker.stop()`. Without this, a future migration
+        that adopts the module's OTHER blessed teardown shape would make
+        the guard silently vacuous instead of rewarding the correct usage.
+        """
+        source = '''
+class TestUnguardedStopWorkerHelper:
+    async def test_it(self):
+        await wait_responsive(fut, timeout=5.0, label='x')
+        await _stop_worker(worker, worker_task)
+'''
+        result = _unguarded_worker_teardown_methods(source)
+
+        assert result == ['TestUnguardedStopWorkerHelper::test_it'], (
+            f'Expected the straight-line _stop_worker(...) helper call to '
+            f'be reported, got {result!r}.'
+        )
+
+    def test_stop_worker_helper_inside_finally_is_not_reported(self) -> None:
+        """The same `_stop_worker(...)` helper call, moved into a
+        `try: ... finally:` block whose try encloses the wait_responsive
+        call, is NOT reported.
+        """
+        source = '''
+class TestGuardedStopWorkerHelper:
+    async def test_it(self):
+        try:
+            await wait_responsive(fut, timeout=5.0, label='x')
+        finally:
+            await _stop_worker(worker, worker_task)
+'''
+        result = _unguarded_worker_teardown_methods(source)
+
+        assert result == [], (
+            f'Expected a finally-wrapped _stop_worker(...) helper call to '
+            f'NOT be reported, got {result!r}.'
         )
 
     def test_stop_without_wait_responsive_is_not_reported(self) -> None:
@@ -6651,11 +7052,12 @@ class TestNoStopCall:
 
 
 class TestLoudWaitMigrationRatchet:
-    """Enforced invariant, task 4219: every `suppress(TimeoutError)`-wrapped
-    result wait in THIS module's own source must be accounted for on
-    `_SUPPRESSED_WAIT_DEBT` -- a SHRINKING ratchet (see the ledger's own
-    comment, above, for its contents and why the two remaining entries are
-    not migrated in this task).
+    """Enforced invariant, task 4219: every suppressed result wait (either
+    the `with contextlib.suppress(TimeoutError):` spelling or the
+    `try/except TimeoutError:` spelling) in THIS module's own source must
+    be accounted for on `_SUPPRESSED_WAIT_DEBT` -- a SHRINKING ratchet (see
+    the ledger's own comment, above, for its contents and why each entry
+    is not migrated in this task).
 
     No `@pytest.mark.timeout` mark needed: none of these three methods
     performs a real await, so `_worst_per_method_wait_budget` would compute
@@ -6665,9 +7067,9 @@ class TestLoudWaitMigrationRatchet:
     def test_no_unledgered_suppressed_result_waits(self) -> None:
         """Every method `_suppressed_result_wait_methods` finds in this
         module's own source must already be on `_SUPPRESSED_WAIT_DEBT` -- a
-        NEW offender (a fresh suppress(TimeoutError)-wrapped wait, or a
-        migrated method that regressed) fails loudly, naming the class and
-        method and pointing at the two blessed replacements.
+        NEW offender (a fresh suppressed wait, in either recognised
+        spelling, or a migrated method that regressed) fails loudly, naming
+        the class and method and pointing at the two blessed replacements.
         """
         source = Path(__file__).read_text()
         scanned = _suppressed_result_wait_methods(source)
@@ -6680,9 +7082,10 @@ class TestLoudWaitMigrationRatchet:
                     unledgered.append(f'{class_name}::{method_name}')
 
         assert not unledgered, (
-            'The following test methods contain a '
-            '`with contextlib.suppress(TimeoutError): await '
-            'asyncio.wait_for(...)` wait but are not on '
+            'The following test methods contain a suppressed result wait '
+            '(either `with contextlib.suppress(TimeoutError): await '
+            'asyncio.wait_for(...)`, or `try: ... await asyncio.wait_for(...) '
+            'except TimeoutError: ... = None`) but are not on '
             '_SUPPRESSED_WAIT_DEBT:\n'
             + '\n'.join(f'  - {offender}' for offender in unledgered)
             + '\n\nThis is the `outcome is None` anti-pattern: a genuine '
