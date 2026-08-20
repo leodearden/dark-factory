@@ -39,6 +39,74 @@ the house template for a leak-drain defence):
 - Each test installs the tracking hook itself and reaps any residual leaked
   client from a *prior* test before measuring — the same flush-before-measure
   pattern that module uses for ``reap_leaked_aiosqlite_connections()``.
+
+===========================================================================
+ACCEPTANCE EVIDENCE (recorded here so the next reader need not re-derive it)
+===========================================================================
+
+HOW THE SITE WAS FOUND. The leaked object is not a bare ``httpx.AsyncClient``
+— ``grep -rn 'httpx.AsyncClient(' fused-memory/`` has ZERO hits under ``src/``
+and ``tests/``, which is why several earlier attempts missed it. Instrumenting
+``AsyncHttpxClientWrapper.__init__`` with ``traceback.format_stack()`` gave the
+allocation path::
+
+    tests/test_graphiti_llm_client_construction.py, line 53, in test_returns_openai_client
+    src/fused_memory/backends/graphiti_client.py, line 238, in build_llm_client
+    .venv/.../graphiti_core/llm_client/openai_client.py, line 61, in __init__
+    .venv/.../openai/_client.py, line 617, in __init__
+    .venv/.../openai/_base_client.py, line 1501, in __init__
+
+``graphiti_core``'s ``OpenAIClient`` / ``OpenAIGenericClient`` /
+``OpenAIEmbedder`` / ``OpenAIRerankerClient`` each mint their own
+``AsyncOpenAI`` in ``__init__`` and expose no ``close()``, so the tests that
+trigger them have no call-site fix available — hence a teardown drain.
+
+WHERE THE 40 COME FROM (per-module census of the wrappers built by the
+default-lane suite)::
+
+    16  tests/test_graphiti_llm_client_construction.py   (build_llm_client)
+     8  tests/test_local_endpoint_base_url_integration.py (real round-trips)
+     8  tests/test_startup_identity_scan.py              (embedder + reranker)
+     2  tests/test_per_group_client_cache.py
+     2  tests/test_openai_responses_preflight.py
+     2  tests/test_operational_routing_boundary_matrix.py
+     1  tests/test_task_curator.py
+
+BEFORE / AFTER. Measured as a control/treatment A/B over those 7 modules with
+one throwaway probe (control = this reaper neutered; 376 passed in both arms).
+The probe wraps ``AsyncHttpxClientWrapper.__del__`` and records, for each
+finalisation of an UNCLOSED wrapper, whether a loop was running at that moment
+— i.e. whether ``__del__`` actually reached ``create_task(self.aclose())``.
+Each such RESURRECTION is exactly one potential ERROR record::
+
+                              CONTROL   TREATMENT
+    wrappers built                 40          40
+    ever closed                     2          22
+    GC-finalised                   40          40
+    RESURRECTIONS                   2  ->        0
+    finalised, no loop running     38          18
+
+Both control resurrections were attributed to one async test,
+``test_startup_identity_scan.py::TestInitializeSkipMaintenance::test_skip_maintenance_true_skips_both_blocks``.
+
+NOTE, correcting the task's own analysis: the 18 wrappers still finalised
+unclosed under treatment are the SYNC cohort
+(``test_graphiti_llm_client_construction.py``). They die by refcount at test
+exit, before any teardown fixture runs, and with no loop running — so
+``__del__``'s ``get_running_loop()`` raises, the ``except`` swallows it, and no
+task is created. They are structurally incapable of producing the flake, and
+the sync autouse arm is therefore defence-in-depth (against a client held past
+its test body by a mock's ``call_args`` or a reference cycle, and collected
+later inside a running loop) rather than same-run coverage of that cohort.
+
+FULL SUITE, three orderings (``-n auto`` / ``-n 8`` / ``-n 16``, all
+``--dist loadgroup``): 14564 passed, 2 skipped, 0 failed in each. Identical
+census every time — 43 wrappers built (the 40 above plus 3 built by this
+module), 25 closed, 1 resurrection, and that one resurrection is
+``test_a_reaped_client_del_schedules_no_aclose_task`` DELIBERATELY invoking
+``__del__`` on an unclosed client to prove the mechanism. Grepping all three
+runs' output for ``Task exception was never retrieved``, ``AsyncClient.aclose``
+and ``Event loop is closed`` returned 0 hits each.
 """
 from __future__ import annotations
 
