@@ -723,7 +723,19 @@ class CockpitApp(App):
         queue, even though the other (the session) is still asking. Then
         reorders each backend's own targets -- grouped by kind so a wm
         target never pollutes a tmux backend's positional reorder (whose
-        index IS the destination window position) and vice versa. This
+        index IS the destination window position) and vice versa.
+
+        That same decision/session target collision means the REORDER list
+        must be deduped too, keeping the FIRST occurrence: queue_items is
+        score-descending, so the first occurrence is the highest-scoring
+        item and its position is the priority position the target should
+        land at. Passing a target twice is actively destructive, not merely
+        redundant -- TmuxBackend.reorder assigns a running per-session
+        index, so a duplicate consumes two indices, its second park then
+        fails against the source window it just vacated (a warning), and
+        the final compacted 0..N-1 range is left with a gap. A single
+        global `seen` set is equivalent to a per-kind one because a
+        DisplayTarget carries exactly one kind. This
         method and its caller are the ONLY place the refresh path may call
         backend.*; it calls ONLY set_urgency/reorder, NEVER focus/tile
         (those live exclusively in explicit-action handlers, e.g.
@@ -737,9 +749,12 @@ class CockpitApp(App):
         self._attention_targets = new_targets
 
         targets_by_kind: dict[str, list[DisplayTarget]] = {}
+        seen: set[DisplayTarget] = set()
         for item in queue_items:
-            if item.target is not None:
-                targets_by_kind.setdefault(item.target.kind, []).append(item.target)
+            if item.target is None or item.target in seen:
+                continue
+            seen.add(item.target)
+            targets_by_kind.setdefault(item.target.kind, []).append(item.target)
         for kind, targets in targets_by_kind.items():
             self._backend_for(kind).reorder(targets)
 
