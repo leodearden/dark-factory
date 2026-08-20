@@ -18510,3 +18510,167 @@ async def test_maybe_remediate_deferral_leaves_the_findings_forward_feedable(
     assert forward_fed == findings, (
         'Deferred findings must still be forward-fed into the next cycle'
     )
+
+# ── INV-5: the storm counters delegate to shared.storm_counter (task 3259) ────
+
+
+def test_placeholder_drop_counter_is_the_shared_storm_counter(
+    journal, event_buffer, mock_memory_service,
+):
+    """The INV-5 acceptance criterion, made executable.
+
+    Task 3088 extracted the append-prune-count-ratelimit body into one home
+    (since promoted to ``shared.storm_counter`` by task 3689) precisely so no
+    module outside it carries its own copy. ``_record_placeholder_finding_drop``
+    was one of the three original copies this class was extracted FROM, so it
+    delegating back is what closes the loop.
+
+    Structural rather than behavioural on purpose: a hand-rolled deque can
+    reproduce every behaviour below and still be a fourth copy, which is the
+    thing INV-5 forbids.
+    """
+    from shared.storm_counter import StormCounter
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+    assert isinstance(harness._placeholder_drop_storm, StormCounter), (
+        'the placeholder-drop counter must BE a shared StormCounter, not a '
+        'local deque reproducing its body (INV-5)'
+    )
+
+
+def test_resume_failure_counter_is_the_shared_storm_counter(
+    journal, event_buffer, mock_memory_service,
+):
+    """The third copy, added after task 3259 was filed.
+
+    Task σ/2717 added ``_record_resume_failure`` with the identical body and a
+    docstring saying so outright ("Same rolling-window per-event counter +
+    rate-limited single-fire shape as _record_placeholder_finding_drop").
+    Leaving it behind would re-open the very gap this task closes.
+    """
+    from shared.storm_counter import StormCounter
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+    assert isinstance(harness._resume_failure_storm, StormCounter), (
+        'the resume-failure counter must BE a shared StormCounter (INV-5)'
+    )
+
+
+def test_record_placeholder_finding_drop_window_is_half_open(
+    journal, event_buffer, mock_memory_service,
+):
+    """An event aged EXACTLY window_seconds is already out of the window.
+
+    The behavioural half of delegation, and the one the structural check
+    above cannot fake. The hand-rolled body prunes strictly
+    (``deque[0][0] < cutoff``), so it KEEPS an event aged exactly the window
+    and fires here; ``StormCounter._prune`` is half-open (``<= cutoff``),
+    already pinned by ``shared/tests/test_storm_counter.py::
+    test_window_is_half_open``. Consolidation adopts the shared semantics —
+    preserving the harness variant would mean forking the body again.
+
+    Production impact is nil (it takes an event landing at exactly
+    3600.000000s offset), which is why none of the seven pre-existing storm
+    tests touches this boundary: every phase-3 re-fire in them jumps a FULL
+    2× window, leaving prior events strictly outside under either rule.
+    """
+    from fused_memory.reconciliation.harness import (
+        _PLACEHOLDER_DROP_STORM_THRESHOLD,
+        _PLACEHOLDER_DROP_STORM_WINDOW_SECONDS,
+    )
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    assert _PLACEHOLDER_DROP_STORM_THRESHOLD == 5
+    assert _PLACEHOLDER_DROP_STORM_WINDOW_SECONDS == 3600.0
+
+    base = datetime(2026, 6, 15, 0, 0, 0, tzinfo=UTC)
+
+    # THRESHOLD-1 drops all at `base`.
+    early = [
+        harness._record_placeholder_finding_drop('reify', now=base)
+        for _ in range(_PLACEHOLDER_DROP_STORM_THRESHOLD - 1)
+    ]
+    assert all(r is None for r in early), f'below threshold; got {early!r}'
+
+    # The threshold-th drop, one FULL window later. The four earlier drops are
+    # aged exactly window_seconds and must already be out, leaving a count of 1.
+    boundary = harness._record_placeholder_finding_drop(
+        'reify',
+        now=base + timedelta(seconds=_PLACEHOLDER_DROP_STORM_WINDOW_SECONDS),
+    )
+
+    assert boundary is None, (
+        'events aged EXACTLY window_seconds must have been pruned (half-open '
+        f'window), leaving a count of 1 below the threshold; got {boundary!r}'
+    )
+
+
+def test_record_resume_failure_window_is_half_open(
+    journal, event_buffer, mock_memory_service,
+):
+    """Same half-open boundary for the resume-failure counter."""
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    threshold = harness.config.resume_failure_storm_threshold
+    window = harness.config.resume_failure_storm_window_seconds
+    assert threshold == 6
+    assert window == 3600.0
+
+    base = datetime(2026, 7, 18, 0, 0, 0, tzinfo=UTC)
+
+    early = [
+        harness._record_resume_failure('reify', now=base)
+        for _ in range(threshold - 1)
+    ]
+    assert all(r is None for r in early), f'below threshold; got {early!r}'
+
+    boundary = harness._record_resume_failure(
+        'reify', now=base + timedelta(seconds=window),
+    )
+
+    assert boundary is None, (
+        'events aged EXACTLY window_seconds must have been pruned (half-open '
+        f'window), leaving a count of 1 below the threshold; got {boundary!r}'
+    )
+
+
+def test_migrated_per_event_counters_keep_the_three_key_return_shape(
+    journal, event_buffer, mock_memory_service,
+):
+    """The return dict stays EXACTLY {count, window_seconds, projects}.
+
+    ``StormCounter.record`` returns count/threshold/window_seconds/labels; the
+    harness contract is count/window_seconds/projects, read at harness.py:
+    1766-1769, 2039-2042 and 4593-4596. The adapter remaps rather than passing
+    the shared shape through, so a migrated counter cannot leak a renamed key
+    (``labels`` for ``projects``) or an extra one into an escalation payload.
+    """
+    from fused_memory.reconciliation.harness import _PLACEHOLDER_DROP_STORM_THRESHOLD
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    base = datetime(2026, 6, 15, 0, 0, 0, tzinfo=UTC)
+
+    storm = None
+    for i in range(_PLACEHOLDER_DROP_STORM_THRESHOLD):
+        storm = harness._record_placeholder_finding_drop(
+            'reify' if i % 2 == 0 else 'autopilot_video',
+            now=base + timedelta(seconds=i),
+        )
+    assert storm is not None, 'the threshold-crossing drop must fire'
+    assert set(storm) == {'count', 'window_seconds', 'projects'}, (
+        f'exact 3-key harness shape expected, got {sorted(storm)}'
+    )
+    assert storm['projects'] == ['autopilot_video', 'reify']
+
+    resume_storm = None
+    for i in range(harness.config.resume_failure_storm_threshold):
+        resume_storm = harness._record_resume_failure(
+            'reify' if i % 2 == 0 else 'dark_factory',
+            now=base + timedelta(seconds=i),
+        )
+    assert resume_storm is not None, 'the threshold-crossing resume failure must fire'
+    assert set(resume_storm) == {'count', 'window_seconds', 'projects'}, (
+        f'exact 3-key harness shape expected, got {sorted(resume_storm)}'
+    )
+    assert resume_storm['projects'] == ['dark_factory', 'reify']
