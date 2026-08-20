@@ -249,6 +249,8 @@ Every rewrite is **atomic**: repair into a temp file in the same directory, veri
 
 - **D6 — Claude Code builtin tools are out of scope.** `Agent` (2) and `Edit` (1, itself a false positive — the test fixture in `test_toolcall_xml_leak.py`) are not our servers. The middleware cannot reach them; the upstream report (θ) is the only lever.
 
+- **D8 — plan-tools COMPOSES the middleware with ε's read-time repair; neither skips nor supersedes.** *(γ2, task 4457)* The three options were enumerated as γ2 requires. **Skip** fails: ε cannot reject, cannot see inbound arguments, cannot recover a swallowed REQUIRED parameter, and `_create_plan` is deliberately unhooked from it — while plan-tools owns **52 of the 95** unrepairable specimens. **Supersede** fails on POPULATION: ε's is damage *already landed* in stored `plan.json` (19 hard-damage strings across 16 tasks, three still live — 3382 and 4081 pending, 3133 blocked), none of which the middleware repairs, because it only ever sees what an agent is sending *now*. **Compose** holds: different layers over different populations — inbound arguments at the FastMCP request layer versus stored state at read time inside the tool body. INV-5 forbids a second *enumeration* of the literals and there is none (both delegate every accept/refuse decision to `shared.toolcall_markup`); D1 forbids per-boundary *call sites* in place of a blanket middleware, and ε is a different layer, not a per-boundary call site. Two consequences are pinned by test rather than left to inference: under `REJECT_WITH_REPAIR` no middleware-repaired value ever reaches storage, so ε can never re-report the same damage as a second fact; and a rejected call short-circuits the tool body, so pre-existing stored damage is **deferred** to the next accepted call, never lost.
+
 - **D7 — The upstream defect is not fixable here.** The originating error is model-side (wrong closing-tag dialect); the *amplification* — silently over-consuming and dropping parameters instead of raising a parse error — is the harness parser's. Neither is in this repo. Everything in this PRD is containment, recovery and repair.
 
 ---
@@ -349,6 +351,13 @@ sink** and whose `markup_repairs` fact has **no consumer**. `_create_plan` is de
 delegating inbound arguments to this middleware. Complementary in principle — but D1/INV-5 requires the ruling be
 made, tested, and written down, not left implicit.
 *Signal:* as the original γ's `submit_task` row (B1/B2), on a plan-tools write tool.
+*RULED 2026-08-19 (task 4457) — **COMPOSE**, recorded as D8 in §5.* The registration site is
+`create_server` in `orchestrator/src/orchestrator/mcp/plan_tools.py`: `REJECT_WITH_REPAIR` with an
+explicitly empty `exempt_tools`, both declared at the site (INV-1), plus a real `escalation_sink`
+filing residue and storm records to the project's `EscalationQueue` — without it, this server's 52
+unrepairable specimens would go from *corrupt but present* to *silently absent*, while the
+middleware's own hint promises the payload is preserved in the escalation it names. `fact_sink`
+is deliberately left unwired and the site records why.
 
 **γ3 — Adapt the guard to fused-memory's bundled FastMCP; cover the two ungated write tools; only then retire the in-line gates.** *(leaf, task 4458)* · depends: β
 Modules: `fused-memory/src/fused_memory/server/tools.py`, `fused-memory/src/fused_memory/server/main.py`.

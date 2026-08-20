@@ -27,6 +27,43 @@ literal set and of every accept/refuse decision (INV-5) — this module
 enumerates only WHICH plan fields are prose (``_REPAIRABLE_PLAN_FIELDS``),
 never what corruption looks like.
 
+TWO MECHANISMS, ONE BOUNDARY EACH (task 4457's ruling — do not collapse them).
+The read-time repair above is NOT the only markup guard on this file:
+``create_server`` also registers
+:class:`shared.mcp_markup_middleware.MarkupGuardMiddleware` under
+``REJECT_WITH_REPAIR``, which guards INBOUND ARGUMENTS at the FastMCP request
+layer, before pydantic validation and before any tool body runs.  The three
+options were enumerated and COMPOSE was chosen:
+
+* SKIP (leave the read-time path as the only mechanism) — rejected.  It cannot
+  reject, cannot see inbound arguments at all, and cannot recover a swallowed
+  REQUIRED parameter; ``_create_plan`` is deliberately unhooked from it and
+  would stay wholly unguarded, on the server that owns 52 of the system's 95
+  unrepairable specimens.
+* SUPERSEDE (register and retire the read-time path) — rejected.  The two have
+  DISJOINT populations: the read-time path's is damage ALREADY LANDED in stored
+  plan.json, which the middleware repairs none of because it only ever sees
+  what an agent is sending NOW.
+* COMPOSE — chosen.  Different layers over different populations: inbound
+  arguments at the request layer, versus stored state at read time inside the
+  tool body.  INV-5 forbids a second ENUMERATION of the envelope literals and
+  there is none — both delegate every accept/refuse decision to
+  ``shared.toolcall_markup``.  D1 forbids per-boundary CALL SITES in place of a
+  blanket middleware, and the read-time path is not a per-boundary call site.
+
+Two consequences of that pairing are load-bearing, and both follow from the
+DECLARED policy rather than from coincidence:
+
+1. Under ``REJECT_WITH_REPAIR`` the middleware NEVER forwards a repaired
+   argument, so no middleware-repaired value can ever reach plan.json — which
+   is why the read-time path can never re-report the same damage as a second
+   fact.
+2. A rejected call short-circuits the tool body, so pre-existing STORED damage
+   is not repaired on that call.  That is a DEFERRAL, not a loss: the next
+   accepted call repairs it.  Do NOT "fix" it by invoking the read-time repair
+   from the middleware — that is exactly how two mechanisms on one boundary
+   become one tangled one.
+
 Usage (stdio transport, spawned by orchestrator):
     # Direct-interpreter no-uv hot path (production, task 1776):
     <sys.executable> -m orchestrator.mcp.plan_tools --worktree /path/to/worktree
@@ -1029,6 +1066,11 @@ def _create_plan(
     # wholesale, so there is no existing document to repair on the way in.
     # Guarding these INBOUND arguments against envelope markup is the write-time
     # middleware's job, not this read-time surface's — don't "fix" the omission.
+    # That promise is now KEPT: MarkupGuardMiddleware is LIVE on this server
+    # (see create_server), and it refuses a poisoned title or analysis before
+    # this function is ever entered. The instruction above is load-bearing in
+    # the other direction now — hooking this function into _read_plan_repaired
+    # would put the same damage through two mechanisms.
     files = _coerce_files(files)
     plan = {
         'task_id': task_id,
