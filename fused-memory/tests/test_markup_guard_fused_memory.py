@@ -31,6 +31,15 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+
+# The consolidate cluster harness, reused verbatim rather than re-modelled: a
+# bare AsyncMock leaves every `mem0_update` config leaf a Mock, which the
+# fail-closed authz resolver rejects, so a hand-rolled double would make the
+# consolidate pin below refuse for an authorization reason and pass for the
+# wrong one. Cross-test import per tests/test_halt_visibility.py; imported
+# MODULE-QUALIFIED so each borrowed constant names its origin at the use site
+# and cannot be confused with this file's own specimen constants.
+import test_consolidate_memories_tool as _consolidate
 from fastmcp.exceptions import ToolError
 from shared.mcp_markup_middleware import RepairPolicy
 from shared.toolcall_markup import CANONICAL_OPENER_PREFIX, closer_for
@@ -400,6 +409,118 @@ class TestOverrideHatch:
 
         assert _payload(exc_info)['error_type'] == 'mcp_markup_detected'
         mock_service.add_system_record.assert_not_awaited()
+
+
+class TestOverrideFlagNeverReachesPersistence:
+    """``allow_mcp_markup`` is a WRITE-TIME control, not corpus metadata.
+
+    The lifecycle, which is why this needs a behavioural pin at all:
+    ``MarkupGuardMiddleware._apply_override`` decides from the invoked tool's
+    OWN LIVE SCHEMA whether the flag travels onward, and deliberately forwards
+    ``metadata`` UNCHANGED to any tool DECLARING a ``metadata`` parameter. So
+    the boundary guard is NOT the party that strips it — the tool body is, and
+    a tool body that forgets writes the flag straight into the corpus, where it
+    rides along on every future read of a record that needed it exactly once.
+
+    SCOPE — audited over the tool surface and deliberately narrow. 18 tools
+    declare a top-level ``metadata`` parameter; only THREE capture the cleaned
+    dict (``causation_id, source, cleaned_meta = _extract_causation(...)``) and
+    can therefore persist it. ``add_memory`` already strips. The two pinned
+    here are the remaining ones:
+
+    * ``add_system_record`` -> ``memory_service.add_system_record(metadata=...)``
+    * ``consolidate_memories`` -> ``canonical_meta`` -> ``add_memory(metadata=...)``
+
+    The other 15 discard it (``causation_id, source, _ = _extract_causation``)
+    and cannot leak it, so they are not pinned — a strip there would be noise
+    that dilutes the signal that these two sites are load-bearing.
+
+    Every assertion co-passes an ordinary caller key and asserts it SURVIVES,
+    so "strip the flag" cannot be satisfied by dropping metadata wholesale.
+    One shape, mirroring tests/server/test_markup_tripwire_gate.py's
+    ``test_override_flag_is_stripped_before_persistence``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_add_system_record_strips_the_flag_before_persistence(self):
+        server, mock_service = _build_guarded_server('add_system_record')
+        leaked = _leaked(_CLEAN_CONTENT, 'session_id', 'sess-1')
+
+        await server._tool_manager.call_tool(
+            'add_system_record',
+            {
+                'content': leaked,
+                'project_id': _PROJECT_ID,
+                'category': 'observations_and_summaries',
+                'agent_id': _AGENT_ID,
+                'metadata': {'allow_mcp_markup': True, 'kind': 'cycle_summary'},
+            },
+        )
+
+        persisted = mock_service.add_system_record.await_args.kwargs['metadata'] or {}
+        assert 'allow_mcp_markup' not in persisted, (
+            f'the write-time control flag must not reach Mem0, got: {persisted!r}'
+        )
+        assert persisted.get('kind') == 'cycle_summary', (
+            f"the caller's own metadata must survive the strip, got: {persisted!r}"
+        )
+        # The override still forwards the PAYLOAD verbatim — the caller
+        # declared it is quoting the markup deliberately. Stripping the flag
+        # must not be confused with repairing the content.
+        assert mock_service.add_system_record.await_args.kwargs['content'] == leaked
+
+    @pytest.mark.asyncio
+    async def test_consolidate_memories_strips_the_flag_before_the_canonical_write(
+        self,
+    ):
+        """The second persisting tool, which has no markup coverage today.
+
+        Its ``cleaned_meta`` is the BASE of ``canonical_meta``, so an unstripped
+        flag is written into the one record consolidation creates to outlive
+        the whole cluster it folds.
+
+        Harness per tests/test_consolidate_memories_tool.py: a bare AsyncMock
+        makes every ``mem0_update`` config leaf a Mock, which the fail-closed
+        authz resolver rejects — so this drives that module's ``make_service``
+        rather than ``_build_guarded_server``, or the call would refuse for an
+        authorization reason and pass for the wrong one.
+        """
+        svc = _consolidate.make_service()
+        server = create_mcp_server(svc)
+        install_markup_guard(
+            server,
+            policy=RepairPolicy.REJECT_WITH_REPAIR,
+            known_projects=_KNOWN_PROJECTS,
+        )
+
+        await server._tool_manager.call_tool(
+            'consolidate_memories',
+            {
+                'canonical_content': _leaked(_consolidate.CONTENT, 'run_id', _consolidate.RUN_ID),
+                'topic': _consolidate.TOPIC,
+                'project_id': _PROJECT_ID,
+                'supersedes': list(_consolidate.SUPERSEDES),
+                'run_id': _consolidate.RUN_ID,
+                'agent_id': _consolidate.AGENT,
+                'metadata': {'allow_mcp_markup': True, 'kind': 'cycle_summary'},
+            },
+        )
+
+        svc.add_memory.assert_awaited_once()
+        persisted = svc.add_memory.await_args.kwargs['metadata'] or {}
+        assert 'allow_mcp_markup' not in persisted, (
+            f'the write-time control flag must not reach the canonical record, '
+            f'got: {persisted!r}'
+        )
+        assert persisted.get('kind') == 'cycle_summary', (
+            f"the caller's own metadata must survive the strip, got: {persisted!r}"
+        )
+        # The consolidation keys this op stamps ON TOP of the caller's metadata
+        # must be untouched by the strip — they are what makes the record
+        # findable as the cluster's canonical.
+        assert persisted.get('topic') == _consolidate.TOPIC
+        assert persisted.get('canonical') is True
+        assert list(persisted.get('supersedes') or []) == list(_consolidate.SUPERSEDES)
 
 
 # ---------------------------------------------------------------------------
