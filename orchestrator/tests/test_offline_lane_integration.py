@@ -112,6 +112,28 @@ _MARKERLESS_CEILING_FRACTION = 0.6
 # full derivation.
 _SPAWNS_PER_LANE_PASS_WORST_CASE = 5
 
+# Task 4203 — the multiplicands `_required_timeout_secs` below prices at
+# `_MEASURED_SPAWN_LATENCY_SECS` per spawn. MEASURED by
+# `test_out_of_bound_spawn_counts_are_measured_not_asserted`, not
+# hand-counted: the `repo` fixture's `_setup_repo` spawns `init`, `config`
+# x2, `add`, `commit`.
+_SPAWNS_PER_REPO_FIXTURE = 5
+
+# Task 4203 — the other multiplicand of `_required_timeout_secs`. MEASURED,
+# not hand-counted (see `test_out_of_bound_spawn_counts_are_measured_not_asserted`):
+# `_drive_advance` costs `get_main_sha` (1) plus `_advance_main`'s `add` /
+# `commit` / `rev-parse` (3) = 4. This is NOT the naive "5" a reading of
+# `_note_merge_all`'s production source would suggest (`harness.py:10377`
+# unconditionally calls `get_merge_diff_files`, a real `git diff` spawn in
+# production) — under THIS module's `harness` fixture, `h.git_ops
+# .get_merge_diff_files` is replaced wholesale with an
+# `AsyncMock(return_value=([], None))`, so that leg never reaches a
+# subprocess at all here. `_maybe_pipeline_landing_tripwire` (also reached
+# from `_note_merge_all`) is confirmed to no-op whenever
+# `config.git.load_bearing_oracle_cmd` is falsy (`harness.py:10438-10444`),
+# which it is here (the `git_config` fixture never sets it).
+_SPAWNS_PER_DRIVE_ADVANCE = 4
+
 # ---------------------------------------------------------------------------
 # Shared end-to-end scaffolding (prerequisite P1)
 # ---------------------------------------------------------------------------
@@ -311,8 +333,10 @@ async def _run_lane(
     ``timeout`` defaults to 30.0, not a tight bound: the clock starts at
     ``asyncio.create_task`` above, so it also covers the real-git test-body
     work the caller does between entering the held pass and releasing it
-    (each :func:`_drive_advance` is a git add + commit + rev-parse, i.e. 3+
-    subprocess spawns) — not just the lane pass(es) themselves. Task 3451
+    (each :func:`_drive_advance` costs `_SPAWNS_PER_DRIVE_ADVANCE` subprocess
+    spawns — MEASURED, not hand-counted, by
+    `test_out_of_bound_spawn_counts_are_measured_not_asserted`) — not just
+    the lane pass(es) themselves. Task 3451
     measured worst-case single subprocess spawn latency at 4.71s on this
     host under load; a caller can easily need several spawns inside this
     window. Same load-sensitive full-suite-flake class as
@@ -841,11 +865,15 @@ def test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling(pytestconfi
     False (the default; `timeout_func_only` is not set anywhere in this
     repo), so the 60s budget covers FIXTURE SETUP AND TEARDOWN, not just the
     call phase. Every test in both offline-lane modules transitively pulls
-    the `repo` fixture, whose `_setup_repo` costs 5 git spawns (`init`,
-    `config` x2, `add`, `commit`), and each `_drive_advance` costs 4 more
-    (`add`, `commit`, `rev-parse`, plus `_note_merge_all`'s `git diff`) — the
-    24s of headroom the 0.6 fraction leaves at a 60s timeout is what pays
-    for that out-of-bound work.
+    the `repo` fixture, whose `_setup_repo` costs `_SPAWNS_PER_REPO_FIXTURE`
+    git spawns (`init`, `config` x2, `add`, `commit`), and each
+    `_drive_advance` costs `_SPAWNS_PER_DRIVE_ADVANCE` more (`get_main_sha`,
+    `add`, `commit`, `rev-parse` — NOT `_note_merge_all`'s `git diff`, which
+    this module's `harness` fixture stubs to an `AsyncMock` and so never
+    reaches a subprocess; see `_SPAWNS_PER_DRIVE_ADVANCE`'s own comment and
+    `test_out_of_bound_spawn_counts_are_measured_not_asserted`) — the 24s of
+    headroom the 0.6 fraction leaves at a 60s timeout is what pays for that
+    out-of-bound work.
 
     When no timeout is in effect at all, this either fails loudly (this
     module's own `orchestrator/pyproject.toml` is the governing inifile —
