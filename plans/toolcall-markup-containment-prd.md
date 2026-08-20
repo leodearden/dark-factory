@@ -118,6 +118,26 @@ The 08-17 pair is the sharpest evidence in this document for the coverage thesis
 
 The 08-15 entry is consistent with §2.1: `add_memory.content` remains the single most-hit fused-memory parameter (90 of 96), the leak was **transient for that call pair** rather than a property of the payload text, and the gated boundary behaved exactly as designed. It is evidence for the *coverage* thesis, not against the tripwire — the ungated boundaries in §2.3 would have absorbed the same specimen silently.
 
+**Recurrence log continued (2026-08-16 → 2026-08-20).** This backlog of accumulated recurrence datapoints is consolidated here in a single append so the log stays current through 2026-08-20.
+
+Datapoints swept from task 4107's open info-note **esc-4107-1** (filed by 4107's architect; swept into this PRD by 4107's steward, per the note's own suggested action — *"fold into plans/toolcall-markup-containment-prd.md as a recurrence datapoint; no action needed on task 4107"*):
+
+| Observed | Source | Detail |
+|---|---|---|
+| 2026-08-16 | esc-4107-1 | Recurrence observed during task 4107. The source note records the occurrence but not per-boundary specimen detail (matched pattern / outcome); not fabricated here — trace via esc-4107-1 if finer grain is needed. |
+| 2026-08-19 (×2, independent) | esc-4107-1 | Two further, independently-observed recurrences during task 4107, same caveat: the source note confirms recurrence, not the full specimen shape. |
+
+The pre-existing 2026-08-20 row above (task 3886, esc-3886-1) is the "as originally scoped" close of this backlog — esc-4107-1's window ran 08-16 through 08-20, and that entry already satisfies its 08-20 datapoint.
+
+**Additional 2026-08-20 material**, filed by the L2 escalation-watcher from esc-markup-tripwire-23's 2026-08-20T10:38 amendment:
+
+| Observed | Boundary | Reported `matched_pattern` | Outcome |
+|---|---|---|---|
+| 2026-08-20T10:36 (task 3886, review-fix planning session) — **Specimen 2** | `add_memory.content` — **gated** | closing `content` tag | Rejected `McpEnvelopeMarkupWriteRejected`. Notable: **two** `add_memory` calls issued in a **single parallel tool-call block** both leaked **identically** at the same boundary. Same fragment dialect as the prior specimens in this table. |
+| 2026-08-20 (produced live while filing esc-markup-tripwire-23's amendment) — **Specimen 3** | not further specified — captured live during filing | — | Recorded alongside Specimen 2 as a third live specimen; no richer detail was captured at filing time beyond its occurrence. |
+
+**Open hypothesis (not implemented or tested — documentation only): parameter order.** Placing long free-text parameters *last* in a tool call may mitigate the leak — consistent with B4/§2.1's observation that when the leaking parameter is already last, nothing is dropped even though its own closing tag is mis-closed. Noted here as a candidate follow-up investigation, not a conclusion; no code or test changes accompany this note.
+
 ### 2.6 The corruption is deterministically repairable
 
 Replaying all 334 specimens through a schema-validated repairer: **308 repair cleanly (92.2%), recovering 194 dropped parameters**; 26 (7.8%) are ambiguous (doubly-corrupted calls) and must escalate. Recovered parameters are exactly the silently-lost ones: `add_memory.category` ×70, `add_memory.project_id` ×32, `add_design_decision.rationale` ×25, `add_memory.agent_id` ×18, `escalate_info.suggested_action` ×13, `submit_review_verdict.issues` ×10, `submit_task.priority` ×5.
