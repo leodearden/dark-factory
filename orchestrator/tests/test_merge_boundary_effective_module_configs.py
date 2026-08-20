@@ -407,3 +407,234 @@ class TestMergeBoundarySuppressionControls:
         assert outcome.status == 'blocked'
         assert _suppression_events(store) == []
         assert verify._merge_flake_suppression_streak == 0
+
+
+# ---------------------------------------------------------------------------
+# step-7: wire parity — the SPEC leg gets the same effective set, so
+# local ≡ remote BY CONSTRUCTION (PRD §8.2 ordering invariant, INV-5)
+# ---------------------------------------------------------------------------
+
+
+async def _capture_boundary_consumers(
+    tmp_path: Path,
+    *,
+    task_id: str,
+    breadth: Literal['scoped', 'full'],
+    registry: dict[str, ModuleConfig],
+    touched: list[ModuleConfig],
+) -> dict:
+    """Drive ``_run_post_merge_verify`` and capture what each consumer of the
+    module set actually RECEIVED.
+
+    Spies wrap (and delegate to) the real ``build_merge_verify_spec`` and
+    ``LocalRunner`` at their ``merge_queue`` lookup sites — the boundary
+    resolves both names there when it constructs the pool — so the captured
+    values are the genuine arguments, not a re-derivation. ``VerifyRunnerPool.
+    dispatch`` is stubbed to a pass so the run completes without executing
+    anything.
+
+    Returns ``{'spec_arg', 'spec', 'local_args', 'config', 'merge_wt'}``.
+    """
+    from orchestrator import merge_queue as merge_queue_module
+
+    config = _make_config(tmp_path, merge_verify_breadth=breadth)
+    config._module_configs = dict(registry)
+
+    git_ops = _make_git_ops(tmp_path)
+
+    task_wt = tmp_path / f'task-wt-{task_id}'
+    task_wt.mkdir(parents=True, exist_ok=True)
+    merge_wt = tmp_path / f'merge-wt-{task_id}'
+    merge_wt.mkdir(parents=True, exist_ok=True)
+    _materialize(merge_wt, _ALPHA_TEST, _BETA_TEST, _DELTA_TEST)
+
+    req = _make_req(task_id, task_wt, config)
+    req.module_configs = list(touched)
+
+    captured: dict = {'local_args': [], 'config': config, 'merge_wt': merge_wt}
+
+    real_build = merge_queue_module.build_merge_verify_spec
+    real_local_runner = merge_queue_module.LocalRunner
+
+    def _spy_build(cfg, module_configs, task_files):
+        captured['spec_arg'] = list(module_configs)
+        spec = real_build(cfg, module_configs, task_files)
+        captured['spec'] = spec
+        return spec
+
+    def _spy_local_runner(*args, **kwargs):
+        captured['local_args'].append(list(args[2]))
+        return real_local_runner(*args, **kwargs)
+
+    with (
+        patch('orchestrator.merge_queue.build_merge_verify_spec', new=_spy_build),
+        patch('orchestrator.merge_queue.LocalRunner', new=_spy_local_runner),
+        patch.object(
+            merge_queue_module.VerifyRunnerPool, 'dispatch',
+            new=AsyncMock(return_value=_passing_result()),
+        ),
+    ):
+        await _run_post_merge_verify(
+            git_ops, req, merge_wt,
+            timeouts={}, enospc_retries={},
+            max_timeouts=3, max_enospc=1,
+            merge_sha=_MERGE_SHA,
+        )
+
+    return captured
+
+
+def _prefixes(module_configs) -> list[str]:
+    return [mc.prefix for mc in module_configs]
+
+
+class TestMergeBoundaryShipsOneEffectiveSetToBothConsumers:
+    """The local runner and the wire spec receive the IDENTICAL module set.
+
+    This is the §8.2 ordering invariant asserted AT THE BOUNDARY rather than
+    as two independent expectations: the property under test is not "both
+    happen to equal the registry", it is "both came from one resolution", so
+    the decisive assertion is that the two captured sets are EQUAL TO EACH
+    OTHER. The remote reconstructs its module set from ``spec.verify_commands``
+    (verify_runner ``_module_config_from_command``), so projecting the spec
+    from the same effective set is what makes local ≡ remote by construction.
+    """
+
+    @staticmethod
+    def _three_module_registry():
+        mc_a = _module_config('alpha')
+        mc_b = _module_config('beta')
+        mc_g = _module_config('gamma')
+        return mc_a, mc_b, mc_g, {'alpha': mc_a, 'beta': mc_b, 'gamma': mc_g}
+
+    # -- (a) both consumers, one set ------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_spec_and_local_runner_receive_the_same_effective_set(
+        self, tmp_path: Path,
+    ):
+        """(a) Both captured sets are the whole registry in registry order, and
+        EQUAL to each other. Today the LocalRunner arg is already correct
+        (step-6) but the spec arg is still [mc_alpha] -> RED."""
+        mc_a, _mc_b, _mc_g, registry = self._three_module_registry()
+
+        captured = await _capture_boundary_consumers(
+            tmp_path, task_id='w1', breadth='full',
+            registry=registry, touched=[mc_a],
+        )
+
+        assert captured['local_args'], 'no LocalRunner was constructed'
+        local_set = captured['local_args'][0]
+        spec_set = captured['spec_arg']
+
+        assert _prefixes(local_set) == ['alpha', 'beta', 'gamma']
+        assert _prefixes(spec_set) == ['alpha', 'beta', 'gamma']
+        # THE property: one resolution reached both consumers.
+        assert _prefixes(spec_set) == _prefixes(local_set), (
+            'the wire spec and the local runner must receive the identical set '
+            'BY CONSTRUCTION, not by two sites independently agreeing'
+        )
+
+    # -- (b) the spec projection ----------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_spec_projection_covers_every_effective_module(self, tmp_path: Path):
+        """(b) The spec's own projected commands follow the effective set —
+        both the per-module verify_commands and the unscoped typecheck gate."""
+        mc_a, _mc_b, _mc_g, registry = self._three_module_registry()
+
+        captured = await _capture_boundary_consumers(
+            tmp_path, task_id='w2', breadth='full',
+            registry=registry, touched=[mc_a],
+        )
+        spec = captured['spec']
+        effective = captured['spec_arg']
+
+        assert [vc.prefix for vc in spec.verify_commands] == _prefixes(effective)
+        expected_unscoped = [
+            mc.prefix for mc in effective if mc.type_check_command is not None
+        ]
+        assert [vc.prefix for vc in spec.unscoped_typecheck.commands] == expected_unscoped
+        assert expected_unscoped == ['alpha', 'beta', 'gamma'], (
+            'the fixture must give every module a type_check_command, else this '
+            'assertion is vacuous'
+        )
+
+    # -- (c) the remote reconstruction leg ------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_remote_reconstruction_yields_the_same_module_set(
+        self, tmp_path: Path,
+    ):
+        """(c) Feed the spec the boundary ACTUALLY built through the remote
+        entry point and assert the module set it reconstructs matches the
+        local runner's — i.e. the remote merge gate now maps node-ids against
+        the same modules the local gate does.
+
+        Compared by PREFIX and command strings, never by object identity: the
+        remote set is reconstructed through the wire codec, so identity is
+        meaningless across it.
+        """
+        from orchestrator import verify_runner
+
+        mc_a, _mc_b, _mc_g, registry = self._three_module_registry()
+
+        captured = await _capture_boundary_consumers(
+            tmp_path, task_id='w3', breadth='full',
+            registry=registry, touched=[mc_a],
+        )
+        local_set = captured['local_args'][0]
+
+        remote_scoped = AsyncMock(return_value=_passing_result())
+        remote_unscoped = AsyncMock(return_value=PostMergePyrightResult())
+        await verify_runner.run_merge_verify_on_worktree(
+            captured['merge_wt'], captured['config'], captured['spec'],
+            merge_sha=_MERGE_SHA,
+            run_scoped=remote_scoped,
+            run_unscoped=remote_unscoped,
+        )
+
+        assert remote_scoped.await_args is not None
+        reconstructed = remote_scoped.await_args.args[2]
+        assert _prefixes(reconstructed) == _prefixes(local_set), (
+            f'remote reconstructed {_prefixes(reconstructed)!r} but the local '
+            f'runner got {_prefixes(local_set)!r} — the two gates would map '
+            f'node-ids against different module sets'
+        )
+        assert [mc.test_command for mc in reconstructed] == [
+            mc.test_command for mc in local_set
+        ]
+
+    # -- CONTROLS --------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_scoped_breadth_spec_carries_the_passed_set_unchanged(
+        self, tmp_path: Path,
+    ):
+        """Legacy byte-identical: at the shipped default the spec still carries
+        only the task's own modules."""
+        mc_a, _mc_b, _mc_g, registry = self._three_module_registry()
+
+        captured = await _capture_boundary_consumers(
+            tmp_path, task_id='w4', breadth='scoped',
+            registry=registry, touched=[mc_a],
+        )
+
+        assert _prefixes(captured['spec_arg']) == ['alpha']
+        assert _prefixes(captured['local_args'][0]) == ['alpha']
+
+    @pytest.mark.asyncio
+    async def test_full_breadth_empty_registry_spec_carries_the_passed_set(
+        self, tmp_path: Path,
+    ):
+        """Safe degrade: an empty registry resolves to the passed set, so the
+        spec is unchanged from today — never an empty projection."""
+        mc_a, _mc_b, _mc_g, _registry = self._three_module_registry()
+
+        captured = await _capture_boundary_consumers(
+            tmp_path, task_id='w5', breadth='full',
+            registry={}, touched=[mc_a],
+        )
+
+        assert _prefixes(captured['spec_arg']) == ['alpha']
+        assert _prefixes(captured['local_args'][0]) == ['alpha']
