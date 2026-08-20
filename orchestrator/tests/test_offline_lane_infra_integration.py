@@ -1008,6 +1008,7 @@ async def test_out_of_bound_spawn_counts_are_measured_not_asserted(
 
     async def _counting_run(*args, **kwargs):
         cmd = args[0] if args else kwargs.get('cmd')
+        assert cmd is not None, '_run must be called with a cmd list, positional or keyword'
         calls.append(list(cmd))
         return await orig_run(*args, **kwargs)
 
