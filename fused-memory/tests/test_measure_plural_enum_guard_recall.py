@@ -1263,6 +1263,45 @@ async def test_a_populated_graph_left_unmeasured_fails_closed(caplog):
 
 
 @pytest.mark.asyncio
+async def test_a_narrowing_that_leaves_nothing_out_is_still_complete():
+    """The other side of the shortfall rule, and the doc claim it corrects.
+
+    ``run``'s docstring and ``--project-id``'s help both used to say a
+    narrowing marks the report incomplete FULL STOP. That is wrong in both
+    directions and the rendered coverage note already said so correctly:
+    incompleteness here is EVIDENCE-based, derived by comparing the lister's
+    inventory against what was read.
+
+    So a ``--project-id`` naming every populated graph left nothing out and
+    is genuinely complete — pinned here — while one that skips a populated
+    graph is not (test_a_populated_graph_left_unmeasured_fails_closed).
+    Without a lister there is no inventory at all, so the shortfall is
+    UNKNOWABLE rather than zero, which is what ``project_ids_source`` and
+    the coverage note record instead (pinned by
+    test_without_a_lister_the_report_says_its_graph_set_was_unchecked).
+
+    Together those three pin the conditional the docs now state, so the
+    claim is checkable rather than prose.
+    """
+    source = _FakeEdgeSource({
+        'alpha': (_ALPHA_FACTS, True),
+        'beta': (_BETA_FACTS, True),
+    })
+
+    report = await run(
+        # a narrowing by FORM — but it names the whole populated store
+        _args(project_id=['alpha', 'beta']),
+        edge_source=source,
+        graph_lister=_lister('alpha', 'beta'),
+    )
+
+    assert report.project_ids_source == 'cli'
+    assert report.unmeasured_graphs == [], 'nothing was left out'
+    assert report.complete is True
+    assert exit_code(report) == 0
+
+
+@pytest.mark.asyncio
 async def test_an_empty_store_fails_closed_instead_of_verdicting_over_nothing(
     caplog,
 ):

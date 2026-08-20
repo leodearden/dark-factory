@@ -869,11 +869,25 @@ async def run(
     it the two are conflated, and a project graph nobody remembered to list
     is excluded with no trace while the artifact reports complete coverage.
 
-    Precedence: an explicit ``--project-id`` narrows (and, being a narrowing,
-    marks the report INCOMPLETE and names what it left out); otherwise the
-    lister's inventory is measured whole; otherwise — no lister, as in every
-    test — ``DEFAULT_PROJECT_IDS``, recorded as ``'fallback'`` so the artifact
-    admits its graph set was never cross-checked.
+    Precedence: an explicit ``--project-id`` narrows; otherwise the lister's
+    inventory is measured whole; otherwise — no lister, as in every test —
+    ``DEFAULT_PROJECT_IDS``, recorded as ``'fallback'`` so the artifact admits
+    its graph set was never cross-checked.
+
+    A narrowing marks the report INCOMPLETE and names what it left out
+    WHENEVER the lister reports a populated graph this run skipped — the
+    conditional is load-bearing in both directions, and an earlier spelling
+    of this docstring stated it unconditionally. Incompleteness here is
+    EVIDENCE-based, like every other completeness claim this script makes:
+    it comes from comparing the lister's inventory against what was read.
+    So (1) without a lister there is no inventory to compare against and the
+    shortfall is unknowable, not zero — which is why the graph set is
+    reported as ``'cli'``/``'fallback'`` and the rendered coverage note says
+    the set was never cross-checked; and (2) a ``--project-id`` naming every
+    populated graph left nothing out, so calling it incomplete would be
+    wrong. Through the CLI a lister is ALWAYS supplied (``_main`` passes
+    ``edge_source.list_graphs``), so case (1) is reachable only by a
+    programmatic caller.
     """
     requested = list(args.project_id) if args.project_id else None
     populated: list[str] | None = None
@@ -1457,9 +1471,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             'Project graph to measure; repeatable. Default: EVERY graph the '
             'store reports via list_graphs(). Passing this NARROWS the '
-            'measurement, which makes the report incomplete (exit 1) and '
-            'names the graphs it left out — the verdict quantifies over every '
-            'project graph, so a narrowed run cannot support it.'
+            'measurement: the verdict quantifies over every project graph, so '
+            'any populated graph this leaves out makes the report incomplete '
+            '(exit 1) and is named in the artifact. Leaving none out — naming '
+            'every populated graph — stays complete, because nothing was '
+            'missed.'
         ),
     )
     parser.add_argument(
