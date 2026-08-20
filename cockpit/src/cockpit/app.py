@@ -545,6 +545,15 @@ class CockpitApp(App):
         unrecognized key expires its overlay rather than pinning it
         forever).
 
+        Both liveness gates compare by VALUE (==), never by identity (is),
+        exactly as order_queue's own state/status filters do.
+        DecisionRecord.state is documented as a plain str field with NO
+        from_dict coercion through DecisionState (additive-safe: an
+        unrecognized wire value must round-trip rather than raise), so
+        `state is DecisionState.OPEN` would be False for every record read
+        back off disk and would silently expire every decision overlay on
+        the very rebuild that set it.
+
         Keying the session case on the QUESTION rather than on bare status
         is strictly stronger, and the difference is reachable:
         orchestrator.session_hooks.run_notification writes
@@ -563,7 +572,7 @@ class CockpitApp(App):
         kind, _, ident = key.partition(':')
         if kind == 'session':
             record = next((r for r in self._records if r.session_slug == ident), None)
-            if record is None or record.status is not Status.AWAITING_INPUT:
+            if record is None or record.status != Status.AWAITING_INPUT:
                 return None
             question = record.question
             if question is None:
@@ -571,7 +580,7 @@ class CockpitApp(App):
             return (question.text, question.asked_at)
         if kind == 'decision':
             decision = next((d for d in self._decisions if d.id == ident), None)
-            if decision is None or decision.state is not DecisionState.OPEN:
+            if decision is None or decision.state != DecisionState.OPEN:
                 return None
             return (decision.text, decision.filed_at)
         return None
@@ -598,16 +607,27 @@ class CockpitApp(App):
     def _prune_overlays(self) -> None:
         """Expire every overlay entry whose ask is gone or has been replaced.
 
-        An entry survives only while the ask it was recorded against is
-        still the same live ask -- i.e. the identity stored in
-        self._overlay_asks still equals the CURRENT _ask_identity(key).
-        Then garbage-collects self._overlay_asks down to the keys still
-        referenced by an overlay, so the bookkeeping side-table cannot
-        become the next leak.
+        Covers all three ephemeral overlays -- self._dropped, self._boosts
+        and self._deferred -- under one shared predicate
+        (_overlay_key_is_live): an entry survives only while the ask it was
+        recorded against is still the same live ask, i.e. the identity
+        stored in self._overlay_asks still equals the CURRENT
+        _ask_identity(key). Then garbage-collects self._overlay_asks down
+        to the keys still referenced by SOME overlay, so the bookkeeping
+        side-table cannot become the next leak.
         """
         self._dropped = {key for key in self._dropped if self._overlay_key_is_live(key)}
+        self._boosts = {
+            key: boost for key, boost in self._boosts.items() if self._overlay_key_is_live(key)
+        }
+        self._deferred = {
+            key: stamp for key, stamp in self._deferred.items() if self._overlay_key_is_live(key)
+        }
+        still_overlaid = self._dropped | self._boosts.keys() | self._deferred.keys()
         self._overlay_asks = {
-            key: identity for key, identity in self._overlay_asks.items() if key in self._dropped
+            key: identity
+            for key, identity in self._overlay_asks.items()
+            if key in still_overlaid
         }
 
     def _overlay_key_is_live(self, key: str) -> bool:
@@ -775,10 +795,18 @@ class CockpitApp(App):
         decision's boost is on disk. A SESSION-backed row has no
         persisted priority field at all (PRD §2 design decisions), so its
         boost lives ONLY in self._boosts, an ephemeral overlay order_queue
-        layers on top of the item's base (always-0) manual_boost. Either
-        way, the queue is re-scored and re-rendered immediately after --
-        never waits for the next poll tick. Fail-soft: no highlighted row,
-        or a key not present in the last-built queue, no-ops.
+        layers on top of the item's base (always-0) manual_boost. That
+        overlay expires with the ask it was set against (see
+        _prune_overlays) -- a session key is stable for the session's whole
+        lifetime, so a permanent boost would mis-rank a brand-new,
+        unrelated question from the same session -- which is why the
+        session branch records the identity BEFORE the rebuild below; the
+        prune inside it would otherwise clear the operator's own keypress.
+        The DECISION branch records nothing: it persists to disk and writes
+        no overlay at all. Either way, the queue is re-scored and
+        re-rendered immediately after -- never waits for the next poll
+        tick. Fail-soft: no highlighted row, or a key not present in the
+        last-built queue, no-ops.
         """
         queue = self.query_one('#decision-queue', DecisionQueue)
         key = queue.highlighted_key()
@@ -805,6 +833,7 @@ class CockpitApp(App):
             else:
                 assert delta is not None, 'exactly one of delta/absolute must be given'
                 new_boost = current_boost + delta
+            self._record_overlay(key)
             self._boosts[key] = new_boost
         self._rebuild_queue()
 
@@ -879,9 +908,14 @@ class CockpitApp(App):
         registry nor a session record has a cockpit-writable "deferred"
         field (PRD §2 design decisions): a defer is a pure, ephemeral
         "sink this for now" applied on top of whatever order_queue reads.
-        Re-scores and re-renders the queue immediately -- never waits for
-        the next poll tick. Fail-soft: no highlighted row, or a key not
-        present in the last-built queue, no-ops.
+        Uniformly for both kinds, that stamp expires with the ask it was
+        set against (see _prune_overlays), so it can never sink a later,
+        unrelated ask that happens to reuse the same key -- which is why
+        the identity is recorded BEFORE the rebuild below; the prune inside
+        it would otherwise clear the operator's own keypress. Re-scores and
+        re-renders the queue immediately -- never waits for the next poll
+        tick. Fail-soft: no highlighted row, or a key not present in the
+        last-built queue, no-ops.
         """
         queue = self.query_one('#decision-queue', DecisionQueue)
         key = queue.highlighted_key()
@@ -889,6 +923,7 @@ class CockpitApp(App):
             return
         if key not in self._queue_items_by_key:
             return
+        self._record_overlay(key)
         self._deferred[key] = self._now_fn()
         self._rebuild_queue()
 
