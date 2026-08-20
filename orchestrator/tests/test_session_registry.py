@@ -3930,6 +3930,61 @@ def test_main_lease_claim_without_slug_writes_the_derived_lease_slug(
     )
 
 
+def test_main_lease_claim_derives_the_body_pid_and_the_slug_pid_from_one_resolution(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A no-flag claim's IDENTITY pid and its LIVENESS pid come from ONE resolution.
+
+    The slug embeds a pid and the lease body records one. If each were resolved
+    independently they would agree only because both happen to call the same
+    function today: any later change making `resolve_session_pid`
+    non-deterministic (a cache, a fallback probe, a re-read of a mutated env)
+    would silently desynchronise the identity token from the pid
+    `holder_liveness` probes — a lease whose slug names a different session than
+    its own liveness check. So `main()` resolves once and feeds both, and this
+    pins the resulting equality rather than the implementation.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    monkeypatch.setenv('CLAUDE_PID', str(_DEAD_PID))
+
+    rc = sr.main(['lease-claim', '--name', 'watcher-df'])
+
+    assert rc == 0
+    holder = sr.LeaseHolder.from_json(sr.lease_path_for_name('watcher-df', root=tmp_path).read_text())
+    assert holder.pid == int(holder.session_slug.rsplit('-', 1)[1])
+    assert holder.pid == _DEAD_PID
+
+
+def test_an_explicit_pid_does_not_satisfy_an_underivable_slug(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """`--pid` is the body's LIVENESS pid, not this session's IDENTITY.
+
+    The two CLI-owned tokens read as one pattern in the skills ("the CLI owns
+    both"), so an operator on the degraded path may reach for the documented
+    `--pid` and expect it to unblock a slug-less claim. It deliberately does
+    not, and this pins that: `lease-heartbeat`/`lease-release` have no `--pid`
+    at all, so a slug derived from one would be derivable by the CLAIM alone —
+    an identity the session's own later release could not reproduce, which is
+    the exact drift task 4248 removes. `--slug` is the escape hatch precisely
+    because all three verbs honour it. The refusal must SAY so, or the operator
+    just retries with a bigger `--pid`.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    monkeypatch.delenv('CLAUDE_PID', raising=False)
+
+    with pytest.raises(SystemExit) as excinfo:
+        sr.main(['lease-claim', '--name', 'watcher-df', '--pid', str(_DEAD_PID)])
+
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert '--pid' in err
+    assert '--slug' in err
+    assert not sr.lease_path_for_name('watcher-df', root=tmp_path).exists()
+
+
 def test_main_lease_claim_explicit_slug_still_overrides_the_derived_default(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

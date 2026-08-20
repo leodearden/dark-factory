@@ -1919,7 +1919,9 @@ def resolve_session_pid(env: Mapping[str, str] | None = None) -> int:
     return 0
 
 
-def default_lease_slug(name: str, env: Mapping[str, str] | None = None) -> str | None:
+def default_lease_slug(
+    name: str, env: Mapping[str, str] | None = None, *, pid: int | None = None
+) -> str | None:
     """Derive THIS session's lease slug for lease *name*: ``<name>-<session pid>``.
 
     WHY THIS EXISTS (task 4248). This is ``resolve_session_pid``'s own argument,
@@ -1961,8 +1963,21 @@ def default_lease_slug(name: str, env: Mapping[str, str] | None = None) -> str |
     filesystem path (``lease_path_for_name`` sanitizes only the NAME, and
     ``sanitize_slug`` applies only to session RECORD slugs), so the ``#`` in a
     task-scoped ``unblock-df#2085`` needs no escaping; see LeaseHolder.session_slug.
+
+    *pid* ACCEPTS AN ALREADY-RESOLVED session pid, so a caller that also needs
+    the pid for something else resolves it ONCE and derives from that single
+    value. ``main()`` uses this on ``lease-claim``, which writes the pid into
+    the lease body AND embeds it in the slug: two independent
+    ``resolve_session_pid()`` calls would agree only by coincidence, and any
+    later change making that function non-deterministic (a cached value, a
+    fallback probe, a re-read of a mutated env) would silently desynchronise
+    the IDENTITY token from the LIVENESS pid the ``holder_liveness`` probe
+    reads. Passing None keeps the self-contained behaviour: resolve from *env*
+    (defaulting to ``os.environ``). *env* is ignored when *pid* is given --
+    the pid IS the resolution.
     """
-    pid = resolve_session_pid(env)
+    if pid is None:
+        pid = resolve_session_pid(env)
     if pid <= 0:
         return None
     return f'{name}-{pid}'
@@ -2901,12 +2916,18 @@ def _run_reap() -> list[ReapedSessionRecord]:
 def _run_lease_claim(name: str, slug: str, pid: int | None, policy_value: str) -> None:
     """Run the ``lease-claim`` verb: ALWAYS prints a ``decision=<value>`` line + message.
 
-    *pid* is None unless the operator explicitly passed ``--pid``, in which
-    case it wins; otherwise ``resolve_session_pid()`` supplies the real
-    long-lived session pid. Resolving it here rather than in the SKILL.md
-    makes the correct pid STRUCTURAL: the ``--pid $$`` defect (task 3994)
-    existed because it depended on every skill doc getting one shell token
-    right.
+    *pid* is the claimant's long-lived session pid. Resolving it in code
+    rather than in the SKILL.md makes the correct pid STRUCTURAL: the
+    ``--pid $$`` defect (task 3994) existed because it depended on every skill
+    doc getting one shell token right.
+
+    ON THE CLI PATH IT ARRIVES ALREADY RESOLVED (task 4248): ``main()`` resolves
+    the session pid ONCE and hands the same value to ``default_lease_slug`` and
+    to this function, so the pid embedded in the slug and the pid written into
+    the lease body cannot desynchronise. The ``pid is None`` fallback below is
+    therefore a defensive path for a DIRECT caller (a test, a future in-process
+    caller), not the CLI's route -- and it stays, so this function remains
+    correct standalone rather than depending on a caller it cannot see.
 
     This carries its OWN fail-open guard, independent of main()'s outer
     try/except: a fault raised by claim_lease itself (a corrupt lease body,
@@ -3295,7 +3316,11 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="this claimant's own long-lived session pid; defaults to "
         'resolve_session_pid() ($CLAUDE_PID). Only pass this as an explicit '
-        'operator override -- never `$$`, which is the transient Bash-tool shell',
+        'operator override -- never `$$`, which is the transient Bash-tool shell. '
+        'This is the lease body\'s LIVENESS pid only: it does not supply the '
+        "slug's identity (which always derives from $CLAUDE_PID), so --pid alone "
+        'does not satisfy an underivable --slug -- lease-heartbeat/lease-release '
+        'have no --pid, and a slug only one verb can derive is not an identity',
     )
     lease_claim_p.add_argument(
         '--policy',
@@ -3401,8 +3426,31 @@ def main(argv: list[str] | None = None) -> int:
     # cannot match is precisely the drift this change removes. One shared point
     # makes that structural instead of a three-way convention nobody enforces.
     # An explicit --slug always wins: it stays the operator's override.
+    #
+    # ONE PID RESOLUTION TOO. `lease-claim` both WRITES a pid (into the lease
+    # body, for the liveness guard) and EMBEDS one (in the derived slug, as this
+    # session's identity). Resolving twice -- once here for the slug, once
+    # inside _run_lease_claim for the body -- would make the two agree only
+    # because they happen to call the same function today; any later change
+    # making resolve_session_pid non-deterministic (a cache, a fallback probe,
+    # a re-read of a mutated env) would silently desynchronise the identity
+    # token from the pid `holder_liveness` probes. So it is resolved HERE, once,
+    # and handed to BOTH: to default_lease_slug via pid=, and to
+    # _run_lease_claim via args.pid. Pinned by
+    # test_main_lease_claim_derives_the_body_pid_and_the_slug_pid_from_one_resolution.
+    #
+    # Resolution is DEMAND-DRIVEN: an explicit --slug on a mutating verb needs
+    # no pid at all (those verbs never write one), and resolving anyway would
+    # emit resolve_session_pid's degradation WARNING for a fact nothing in that
+    # call depends on -- loud degradation is only useful when it is TRUE of the
+    # work being done.
     if args.verb in ('lease-claim', 'lease-heartbeat', 'lease-release'):
-        args.slug = args.slug or default_lease_slug(args.name)
+        needs_session_pid = args.slug is None or (args.verb == 'lease-claim' and args.pid is None)
+        session_pid = resolve_session_pid() if needs_session_pid else None
+        if args.verb == 'lease-claim' and args.pid is None:
+            args.pid = session_pid
+        if args.slug is None:
+            args.slug = default_lease_slug(args.name, pid=session_pid)
         # FAIL LOUDLY, never silently. default_lease_slug returns None only
         # when $CLAUDE_PID is unresolvable, and it refuses to synthesize
         # `<name>-0` because that token is IDENTICAL for two concurrently-
@@ -3429,7 +3477,10 @@ def main(argv: list[str] | None = None) -> int:
                 'heartbeat or release a lease with. Refusing to invent one -- a synthesized '
                 'token would collide with every other degraded session and let each act on '
                 "the other's lease. Fix the environment, or pass an explicit "
-                '--slug <stable-token> that this session will re-use on every later lease verb.'
+                '--slug <stable-token> that this session will re-use on every later lease verb. '
+                'Note --pid does NOT substitute for --slug: it sets the lease body\'s liveness '
+                'pid, not this session\'s identity, and lease-heartbeat/lease-release have no '
+                '--pid at all -- only --slug is honoured by all three verbs.'
             )
 
     try:
