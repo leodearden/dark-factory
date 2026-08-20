@@ -1998,3 +1998,167 @@ def test_near_miss_alias_pairs_fails_loudly_on_an_empty_family() -> None:
         near_miss_alias_pairs([_pair(2, "no-silent-fail-soft")], [])
 
     assert "family" in str(excinfo.value).lower()
+
+
+# ---------------------------------------------------------------------------
+# doc_anchored_slug_citations / noncanonical_citations — the CITATION guard
+#
+# The second half of task 3803's mechanization. The alias guard above catches a
+# citation filed under the wrong NUMBER; this one catches a citation naming a
+# slug that is not in the family at all — a PHANTOM. `no-silent-fail-soft` was
+# exactly that for months: cited as if canonical in dozens of comments, backed
+# by no heading anywhere, so no vocabulary check could ever have resolved it.
+#
+# BACKTICKED-ONLY, AND ANCHORED WITHIN +/-2 LINES OF A `design-invariants.md`
+# MENTION. Both narrowings are false-positive discipline, and both are what let
+# this guard ship with NO allowlist: ordinary prose is full of kebab phrases
+# (`point-in-time`, `read-before-write`, `machine-readable`), and a check that
+# reported them would be registered away into silence within a release.
+# ---------------------------------------------------------------------------
+
+# The pre-promotion vocabulary: `_ALIAS_FIXTURE_FAMILY` minus its INV-9 entry.
+# Used to model the promotion itself — the same phantom citation is reported
+# against this family and clean against the full one.
+_CITATION_FIXTURE_FAMILY = _ALIAS_FIXTURE_FAMILY[:5]
+
+_CITATION_HAPPY = """\
+The classifier refuses on an unmodelled status rather than folding it into
+`excluded` — see `docs/legibility/design-invariants.md` INV-2
+(`structured-facts-at-failure`), whose shape this mirrors.
+"""
+
+_CITATION_PHANTOM = """\
+Instrumented at the write boundary, per `docs/legibility/design-invariants.md`:
+a partial result must arrive as partial (`no-silent-fail-soft`), never as a
+clean success (`structured-facts-at-failure`).
+"""
+
+_CITATION_FAR = """\
+A paragraph naming `docs/legibility/design-invariants.md` and nothing else.
+One line of unrelated prose.
+Two lines of unrelated prose.
+Three lines of unrelated prose.
+Four lines later, an unrelated `no-lockstep-duplication` mention.
+"""
+
+_CITATION_UNBACKTICKED = """\
+See docs/legibility/design-invariants.md for the family. The verdict table is a
+point-in-time snapshot, the census is machine-readable, and the archive move is
+read-before-write ordered.
+"""
+
+_CITATION_SIBLING_PATH = """\
+Calibration fixtures live at `docs/legibility/design-invariants-fixtures.md`,
+beside `docs/legibility/design-invariants.md` itself.
+"""
+
+_CITATION_TWO_SEGMENT = """\
+`docs/legibility/design-invariants.md` draws the line: a `fail-soft` path is not
+automatically a defect.
+"""
+
+_CITATION_UNANCHORED = """\
+A module docstring citing `no-silent-fail-soft` with no pointer to the
+normative doc anywhere near it.
+"""
+
+# The whole window is the anchor's own path, so scrubbing it leaves nothing.
+_CITATION_PATH_ONLY = "design-invariants.md\n"
+
+
+def test_doc_anchored_slug_citations_collects_backticked_slugs_near_the_anchor() -> None:
+    """A backticked slug within +/-2 lines of the doc's path is a CITATION.
+
+    ``excluded`` (one segment) is in the fixture on purpose: the shape floor is
+    at least three hyphen-separated segments, which every canonical slug clears.
+    """
+    assert doc_anchored_slug_citations(_CITATION_HAPPY, source=_FIXTURE_SOURCE) == [
+        (3, "structured-facts-at-failure")
+    ]
+
+
+def test_doc_anchored_slug_citations_ignores_a_token_beyond_the_window() -> None:
+    """Four lines from the anchor is prose, not a citation of the family.
+
+    The window is what keeps this guard free of an allowlist. Scanning whole
+    files instead would drag in every kebab token in a 15k-line module.
+    """
+    assert doc_anchored_slug_citations(_CITATION_FAR, source=_FIXTURE_SOURCE) == []
+
+
+def test_doc_anchored_slug_citations_ignores_unbackticked_prose() -> None:
+    """`point-in-time`, `machine-readable`, `read-before-write` are not citations.
+
+    Backticked-only is deliberate false-positive discipline: unbackticked kebab
+    phrases sit beside doc pointers constantly, and reporting them would train
+    readers to silence the guard rather than fix a slug.
+    """
+    assert doc_anchored_slug_citations(_CITATION_UNBACKTICKED, source=_FIXTURE_SOURCE) == []
+
+
+def test_doc_anchored_slug_citations_never_reports_the_anchor_itself() -> None:
+    """The doc's own path — and its sibling fixtures path — are not citations.
+
+    ``design-invariants-fixtures`` is a three-segment kebab token, so an
+    extractor that tokenized the anchor would report the pointer that made it
+    look and stay red forever on correct documentation.
+    """
+    assert doc_anchored_slug_citations(_CITATION_SIBLING_PATH, source=_FIXTURE_SOURCE) == []
+
+
+def test_doc_anchored_slug_citations_ignores_a_token_below_the_shape_floor() -> None:
+    """Two segments is prose (`fail-soft`); three is the floor every slug clears."""
+    assert doc_anchored_slug_citations(_CITATION_TWO_SEGMENT, source=_FIXTURE_SOURCE) == []
+
+
+def test_doc_anchored_slug_citations_returns_nothing_for_an_unanchored_text() -> None:
+    """No pointer to the doc, no citation — a quiet ``[]``, not a failure.
+
+    Most files in the repo are this shape, so it must not be loud. The
+    non-vacuity guarantee is a property of the whole SCAN (the live assertion
+    checks that at least one canonical citation was examined repo-wide), not of
+    each file read in isolation.
+    """
+    assert doc_anchored_slug_citations(_CITATION_UNANCHORED, source=_FIXTURE_SOURCE) == []
+
+
+def test_doc_anchored_slug_citations_fails_loudly_when_nothing_remains_to_examine() -> None:
+    """An anchor whose whole window scrubs away to nothing RAISES, naming *source*.
+
+    This is the extractor contract's floor: the anchor was found, so the text
+    IS about the invariant family, yet the scan has no text left to look at.
+    Returning ``[]`` there is indistinguishable from "cited nothing wrong".
+    """
+    with pytest.raises(AssertionError) as excinfo:
+        doc_anchored_slug_citations(_CITATION_PATH_ONLY, source=_FIXTURE_SOURCE)
+
+    assert _FIXTURE_SOURCE in str(excinfo.value)
+
+
+def test_noncanonical_citations_reports_a_phantom_slug() -> None:
+    """A cited slug backed by no heading is the defect this guard exists for."""
+    citations = doc_anchored_slug_citations(_CITATION_PHANTOM, source=_FIXTURE_SOURCE)
+
+    assert noncanonical_citations(citations, _CITATION_FIXTURE_FAMILY) == [
+        (2, "no-silent-fail-soft")
+    ]
+
+
+def test_noncanonical_citations_clears_the_phantom_once_it_is_promoted() -> None:
+    """Promotion resolves the phantom IN PLACE — the citation never moves.
+
+    This is the whole economic case for promoting `no-silent-fail-soft` to INV-9
+    rather than rewriting its citations: the same text is a defect against the
+    pre-promotion vocabulary and correct against the post-promotion one.
+    """
+    citations = doc_anchored_slug_citations(_CITATION_PHANTOM, source=_FIXTURE_SOURCE)
+
+    assert noncanonical_citations(citations, _ALIAS_FIXTURE_FAMILY) == []
+
+
+def test_noncanonical_citations_fails_loudly_on_an_empty_family() -> None:
+    """An empty family RAISES rather than reporting every citation as a phantom."""
+    with pytest.raises(AssertionError) as excinfo:
+        noncanonical_citations([(1, "structured-facts-at-failure")], [])
+
+    assert "family" in str(excinfo.value).lower()
