@@ -89,6 +89,39 @@ test_command: "uv run --project shared pytest tests/scripts/ --tb=short -q --tim
 # (`1 failed, 5 passed`). So an edit here can only break the half named above —
 # do not read a green run of that one test as the gate being intact.
 
+# AND IT CARRIES THE CONFIG-RETUNE DECISION GATE (task 3886), for the same
+# structural reason and with the same consequence if narrowed.
+#
+# test_config_retune_gate_decision.py is the EXECUTABLE half of the
+# `DECIDED — pre-merge gate for operational config retunes` block in
+# dark-factory-orchestrator.yaml (sited next to lock_depth). It asserts, on
+# RUNTIME state rather than on prose, the premises that decision rests on:
+# that merge_verify_breadth resolves to "full" and verify_plan
+# ._merge_breadth_is_full agrees; that verify
+# ._merge_config_only_diff_forces_full_gate matches this repo's own
+# operational config; that a config load resolves the OPERATIONAL lock_depth
+# and not defaults.yaml's (the binding option (2) would have inverted); and
+# that every prefix config._discover_module_configs returns is reachable at
+# that depth.
+#
+# It lives in tests/scripts/ NOT by preference but because this is the only
+# lever available: _discover_module_configs skips prefix `.`, so a repo-root
+# artifact like dark-factory-orchestrator.yaml can never be routed to a module
+# config of its own. So this DIRECTORY target is what carries the gate into
+# verify.run_full_verification's gather — onto every review checkpoint,
+# run_main_tip_sweep and merge-role merge_verify_breadth=full. Narrowing this
+# command away from the directory would SILENTLY un-gate the decision, exactly
+# as it would the skills/ lint gate above: nothing reports skipped, nothing
+# exits non-zero.
+#
+# The reachability arm is also the generalisation of what this file's own
+# sibling guard (test_tests_scripts_module_config.py) asserts for the single
+# `tests/scripts` prefix — so a retune of lock_depth DOWNWARD is now caught
+# for every module, not only the one that happened to have a guard. That
+# matters here specifically: this config sits at depth 2, and the comment
+# block above records a CORRECTED-IN-PLACE repair (task 3866) of exactly the
+# constant-pinning defect a downward retune exposes.
+
 # KNOWN COST, recorded rather than left invisible (task 3350 amendment;
 # restated by task 3460, which falsified this block's original premise).
 #

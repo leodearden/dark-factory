@@ -48,6 +48,81 @@ merge-role ``merge_verify_breadth: full``. It is also the only lever available:
 ``_discover_module_configs`` skips prefix ``.``, so a repo-root artifact like
 ``dark-factory-orchestrator.yaml`` cannot be routed to a module config of its
 own.
+
+WHY THESE RATCHETS NEED A MEASURED RED, AND WHAT WAS MEASURED. The decision
+this file gates is largely "leave as-is", so three of its four assertions are
+green at HEAD BY CONSTRUCTION and a green run proves nothing about whether the
+guard bites. A vacuously-passing gate is the failure class tasks 3350 / 3445 /
+3485 exist to prevent, and ``test_skills_module_config_decision.py`` sets the
+precedent verbatim: "Each test below therefore records the failure text
+observed against a named scratch mutation." So each assertion below was driven
+red against a NAMED scratch mutation of the operational yaml, the observed
+failure recorded here, and the scratch artifact REVERTED before commit (`git
+status --porcelain` clean, verified after the last revert).
+
+MEASURED RED at base main ``a831c052b9`` — this branch's base, the SHA every
+number in the DECIDED block was taken at — on branch ``task/3886`` at
+``f1ea5d54fe``. Command for all four:
+``uv run --project shared pytest tests/scripts/test_config_retune_gate_decision.py --tb=short -q --timeout=300``.
+Unmutated at the same base: ``3 passed in 1.48s``.
+
+  M1  merge_verify_breadth: "full" -> "scoped"
+      -> ``1 failed, 2 passed in 1.95s``, FAILED
+      ``test_merge_lane_already_gates_a_config_only_retune`` on the
+      ``cfg.merge_verify_breadth == 'full'`` assertion:
+        E   assert 'scoped' == 'full'
+      The ``_merge_breadth_is_full`` assertion never runs, being second in the
+      pair — which is the ordering intended: the declared value is the thing a
+      retuner edits.
+
+  M2  the wired glob "dark-factory-orchestrator.yaml" -> "no-such-config-file.yaml"
+      -> ``1 failed, 2 passed in 1.47s``, FAILED the SAME test but on the
+      ``verify._merge_config_only_diff_forces_full_gate`` assertion:
+        E   assert False is True
+        E    +  where False = <function _merge_config_only_diff_forces_full_gate ...>(OrchestratorConfig(...), ['dark-factory-orchestrator.yaml'])
+      with the message reporting
+      ``git.merge_config_only_full_gate_globs=['no-such-config-file.yaml']``.
+      This is the ratchet on the one PRODUCTION change this task makes: it
+      proves the ``git:`` block entry is what carries assertion (2) and that
+      the arm reads the wired value rather than passing on the field's mere
+      presence.
+
+  M3  operational lock_depth 12 -> 4, i.e. set EQUAL to defaults.yaml
+      -> ``1 failed, 2 passed in 1.19s``, FAILED
+      ``test_unit_tests_read_the_operational_lock_depth_not_the_package_default``
+      on the DIFFER check, NOT the equality one:
+        E   assert 4 != 4
+      WHICH ASSERTION FIRED IS THE POINT, and is why this mutation was chosen
+      over a simpler one. Under M3 the equality assertion (resolved ==
+      operational) still passes, and a guard that checked only resolution would
+      have reported GREEN while proving nothing about which layer won. The
+      differ-check is what makes the layering observable, and this is the
+      measurement that says so rather than the docstring merely claiming it.
+
+  M4  operational lock_depth 12 -> 1
+      -> ``1 failed, 2 passed in 1.02s``, FAILED
+      ``test_every_discovered_module_config_is_reachable_at_the_operational_lock_depth``
+      naming the offending prefix and its depth:
+        E   assert not {'tests/scripts': 2}
+      with the message enumerating the discovered set
+      ``['cockpit', 'dashboard', 'escalation', 'fused-memory', 'orchestrator',
+      'sampler', 'scripts', 'shared', 'tests/scripts']`` — 9 prefixes, matching
+      pre-1's count, deepest at depth 2. Note M4 leaves the binding arm GREEN
+      (1 != 4, and resolved 1 == declared 1), so the two lock_depth arms are
+      independently falsifiable rather than one masking the other.
+
+Each mutation reddened a DIFFERENT assertion, and no mutation reddened more
+than one test. That is the property worth having: a future edit that breaks one
+premise of the decision reports which premise, rather than collapsing the whole
+file.
+
+NOT COVERED BY ANY OF THE ABOVE, stated so a green run here is not over-read.
+These ratchets pin the decision's PREMISES and catch a retune-down that
+unreaches a module. They do NOT catch a stale fixture literal of the kind
+``094d634465`` actually tripped — a test elsewhere in the tree that hard-codes
+a value derived from a knob. Nothing at commit time catches that; the merge
+gate and the main-tip sweep do. The full scope-honesty statement is in the
+DECIDED block.
 """
 from __future__ import annotations
 
