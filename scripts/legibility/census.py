@@ -27,17 +27,14 @@ network and make both the request shape and the failure path assertable
 regardless of what is installed or listening, never because a client
 library is absent: an MCP client IS importable there too, symmetrically
 with httpx below -- ``fastmcp>=3.2`` is a direct dependency of ``shared``
-(``shared/pyproject.toml``, task 3689), pulling in ``mcp>=1.24``, so an
-un-faked MCP seam would really POST to ``$FUSED_MEMORY_MCP_URL``; the
-deterministic core
-(duplicate/dup_rate, the mining batch loop + saturation stop, the origin x
-manifestation matrix, census-state advance, codebook lifecycle transforms,
-report rendering) is unit-tested with no network. Note that httpx IS
-available there -- a direct dependency of ``shared``
-(``shared/pyproject.toml``, ``httpx>=0.27``, task 2965) -- so the seams are
-what keep the suite off the network, not an absent HTTP client: an
-un-faked poster would really reach whatever is listening on
-``$FUSED_MEMORY_MCP_URL`` (default localhost:8002).
+(``shared/pyproject.toml``, task 3689), pulling in ``mcp>=1.24`` -- so an
+un-faked seam would really reach whatever is listening on
+``$FUSED_MEMORY_MCP_URL`` (default localhost:8002). The deterministic
+core (duplicate/dup_rate, the mining batch loop + saturation stop, the
+origin x manifestation matrix, census-state advance, codebook lifecycle
+transforms, report rendering) is unit-tested with no network. Note that
+httpx IS available there -- a direct dependency of ``shared``
+(``shared/pyproject.toml``, ``httpx>=0.27``, task 2965).
 
 Model routing (ratified static policy, PRD §5/§12 -- deliberately NOT the
 adaptive ``resolve_route`` ladder): Sonnet for mining + verification,
