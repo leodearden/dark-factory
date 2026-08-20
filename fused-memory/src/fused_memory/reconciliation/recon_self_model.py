@@ -89,6 +89,34 @@ DELETER_GC = 'gc-on-terminal-or-ttl'
 DELETER_POOL_TRIM = 'cycle-summary-pool-cap-trim-or-ttl'
 DELETER_TTL = 'ttl-expiry'
 
+# The `deleter` audit tags of the ONLY Mem0 delete paths that write a
+# mem0_tombstone ledger row, via mem0_tombstone.record_mem0_deletion_tombstones
+# (the batched/plural writer — see the mem0_tombstone MARKER_LIFECYCLE entry
+# below). There are exactly three production call sites of that writer:
+# summary_pool.enforce_summary_pool_cap, task_knowledge_sync._sweep_stale_mem0_pool
+# (a shared choke point for three delegating GC-sweep callers), and
+# server.tools.consolidate_memories — six deleter tags in total. Named by
+# mechanism, not by file:line: line numbers in this module drift silently
+# (see the design decision on this task), while these tags are stable string
+# constants a reader can grep straight to.
+#
+# Hand-transcribed here, not imported, because this module is import-light by
+# contract (module docstring above: only recon_pool_map and
+# standing_decision_constants) — the six source constants live in
+# task_knowledge_sync, memory_consolidator, and server.tools, all heavy.
+# test_recon_self_model.py cross-checks this tuple against those live
+# constants (imported lazily, inside the test body) so drift between this
+# description and the live code fails a test rather than silently diverging —
+# the same arrangement MARKER_KINDS already has with recon_ledger.MARKER_KINDS.
+MEM0_TOMBSTONE_DELETERS = (
+    'stage1_flag_marker_gc_sweep',
+    'stage2_persistence_marker_gc_sweep',
+    'flag_for_stage2_gc_sweep',
+    'stage1_cycle_summary_trim',
+    'stage2_cycle_summary_trim',
+    'consolidate_memories',
+)
+
 
 @dataclass(frozen=True)
 class MarkerLifecycle:
