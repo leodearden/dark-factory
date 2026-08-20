@@ -32,7 +32,9 @@ its first parameter, deliberately NOT a ``GitOps`` method and NOT a
   both simply import (duck-typing ``git_ops``) has none.
 - Existing gate-wiring tests construct ``h.git_ops = MagicMock()`` and stub
   its sub-methods (``find_task_citation_commit`` / ``is_ancestor`` /
-  ``commit_effect_present_in_main``). A ``GitOps`` *method* named
+  ``commit_effect_present_in_main``, and optionally
+  ``describe_commit_effect_in_main`` for the task-3116 divergence
+  diagnostics). A ``GitOps`` *method* named
   ``validate_landing_evidence`` would auto-mock under that MagicMock and
   silently bypass the real logic under test; a module-level function that
   merely CALLS those same (already-stubbed) sub-methods keeps exercising the
@@ -203,12 +205,74 @@ class LandingEvidenceVerdict:
             candidate), ``effect_check_sha`` (the sha the effect-present
             guard actually ran against), and ``reason`` — so a caller can
             build a structured-facts escalation without prose-parsing.
+
+            On an ``'effect_absent'`` REJECT ONLY, four further keys carry
+            the divergence diagnostics (task 3116; absent on every accept and
+            on a ``'no_citation'`` reject):
+
+            - ``diverged_paths`` — the touched paths that no longer match
+              main HEAD, as a list.  ``None`` means "could not be
+              determined" (the probe itself failed); ``[]`` means
+              "determined, and empty".  The two are deliberately DISTINCT —
+              collapsing them would render an unprobeable ``git_ops``
+              stand-in as a clean no-divergence result.
+            - ``effect_failure`` — the probe's structured failure code (see
+              :class:`~orchestrator.git_ops.CommitEffectProbe`), or ``None``
+              when the re-probe found the effect PRESENT, which means main
+              HEAD advanced between the decision and the probe.
+            - ``effect_anchor_sha`` — the commit the divergence comparison
+              actually ran against (a merge citation is judged against a
+              parent, not against ``effect_check_sha`` itself).
+            - ``effect_probe_error`` — present only when the probe raised;
+              the ``repr`` of the exception.  Recorded rather than swallowed
+              so the escalation states plainly that the paths are unknown.
     """
 
     accepted: bool
     evidence_sha: str | None
     reason: str
     probe: dict[str, Any]
+
+
+async def _record_effect_divergence(
+    git_ops: GitOps, effect_check_sha: str, probe: dict[str, Any],
+) -> None:
+    """Enrich *probe* with WHICH paths diverged, on the effect_absent reject
+    path only (task 3116).
+
+    Awaits ``git_ops.describe_commit_effect_in_main(effect_check_sha)`` and
+    writes ``diverged_paths`` / ``effect_failure`` / ``effect_anchor_sha``.
+    Called ONLY after the boolean ``commit_effect_present_in_main`` has
+    already rejected, and never on the accept path — the decision is the
+    bool's, this is only its explanation.  The extra git work is free in
+    practice because both calls hit the same ``(commit_sha, main_sha)`` memo.
+
+    Diagnostic-only, so it must NEVER break a gate decision: any exception is
+    contained.  But it is NOT swallowed — the failure is recorded into
+    ``probe``, which is rendered verbatim into the escalation a human reads,
+    and logged at WARNING with a traceback.  That is the repo's
+    structured-facts-at-failure / no-silent-fail-soft invariant applied to
+    this try/except.  The realistic trigger is a duck-typed ``git_ops``
+    stand-in predating this method (the shape seven gate-wiring test files
+    construct), which raises AttributeError here.
+
+    On failure ``diverged_paths`` is set to None — "could not be determined",
+    deliberately distinct from ``[]`` — so a formatter can never render an
+    unprobeable stand-in as a clean no-divergence result.
+    """
+    try:
+        result = await git_ops.describe_commit_effect_in_main(effect_check_sha)
+        probe['diverged_paths'] = list(result.diverged_paths)
+        probe['effect_failure'] = result.failure
+        probe['effect_anchor_sha'] = result.anchor_sha
+    except Exception as exc:
+        probe['diverged_paths'] = None
+        probe['effect_probe_error'] = repr(exc)
+        logger.warning(
+            'describe_commit_effect_in_main failed for %s — the effect_absent '
+            'escalation will report that diverged paths could not be determined',
+            effect_check_sha, exc_info=True,
+        )
 
 
 async def validate_landing_evidence(
@@ -228,7 +292,11 @@ async def validate_landing_evidence(
     Args:
         git_ops: A ``GitOps`` instance (or a duck-typed stand-in exposing
             ``find_task_citation_commit`` / ``is_ancestor`` /
-            ``commit_effect_present_in_main``).
+            ``commit_effect_present_in_main``, plus
+            ``describe_commit_effect_in_main`` for the effect_absent
+            divergence diagnostics — a stand-in lacking that last method
+            still decides identically; the failure is recorded in
+            ``probe['effect_probe_error']``).
         task_id: Bare task id (no ``task/`` prefix).
         branch: The task's branch name (e.g. ``f'task/{task_id}'``), used
             for the FIX 2 lineage guard in DISCOVERY mode. Not consulted in
@@ -274,6 +342,7 @@ async def validate_landing_evidence(
         probe['citation'] = candidate_sha
         probe['effect_check_sha'] = candidate_sha
         if not await git_ops.commit_effect_present_in_main(candidate_sha):
+            await _record_effect_divergence(git_ops, candidate_sha, probe)
             return _reject('effect_absent')
         return _accept(candidate_sha)
 
@@ -307,7 +376,8 @@ async def validate_landing_evidence(
 
     # FIX 1' effect-present guard (task 2500/2675): ancestry alone doesn't
     # mean the effect survives at HEAD — a later commit on main may have
-    # reverted exactly the paths the citation touched. Anchor on the branch
+    # CHANGED exactly the paths the citation touched (a revert, or ordinary
+    # later evolution — this check cannot distinguish them; task 3116). Anchor on the branch
     # TIP for an in-branch work commit (it may be a stale intermediate
     # commit); anchor on the citation itself for a no-ff merge commit (task
     # 2675 made this a REAL check — it diffs each non-first parent's content
@@ -321,6 +391,7 @@ async def validate_landing_evidence(
         effect_check_sha = branch_tip_sha
     probe['effect_check_sha'] = effect_check_sha
     if not await git_ops.commit_effect_present_in_main(effect_check_sha):
+        await _record_effect_divergence(git_ops, effect_check_sha, probe)
         return _reject('effect_absent')
 
     return _accept(citation)
