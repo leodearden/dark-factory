@@ -5153,6 +5153,17 @@ def _span_days(earlier: str, later: str) -> float:
             - datetime.fromisoformat(earlier).timestamp()) / 86400.0
 
 
+# A core_fact that CANNOT be produced by clause scoping, seeded in place of the
+# real one so the unconditional seed cannot supply the very answer the
+# assertion is checking for. `liveness_snapshot_subject_facts` seeds every
+# subject with `core_fact` and only THEN adds the clause-derived key, and on
+# these four records the two COINCIDE -- so asserting against the real fact
+# cannot tell "the clause derived it" from "the clause derived nothing and the
+# seed supplied it". Seeding a sentinel splits them: the sentinel is the seed's
+# contribution, and `_CORE_FACT_STRANDED` can only have come from a clause.
+_SENTINEL_CORE_FACT = '<sentinel-core-fact-no-clause-can-derive>'
+
+
 class TestLivenessSnapshotSubjectFacts:
     """WHAT each subject is asserted to be -- measured on the FOUR REAL RECORDS.
 
@@ -5164,32 +5175,59 @@ class TestLivenessSnapshotSubjectFacts:
     where that measurement lives. If a later edit to either shared regex
     re-breaks the association, this fails before the group-level tests do,
     naming the subject and the fact rather than an absent group.
+
+    That last guarantee is only REAL because these tests seed
+    `_SENTINEL_CORE_FACT` rather than `_CORE_FACT_STRANDED`. Asserting against
+    the real fact made this class VACUOUS with respect to the very thing it
+    claims to pin: because the seed is unconditional and coincides with the
+    clause-derived key here, `{_CORE_FACT_STRANDED}` is the result whether the
+    clause scope did all the work or none of it. Measured, not reasoned:
+    monkeypatching `TASK_REF_RE` to a never-matching pattern -- exactly the
+    pre-3403 breakage this class exists to catch -- left the original
+    assertions GREEN. With the sentinel seeded, that same inert regex yields
+    `{_SENTINEL_CORE_FACT}` and the tests fail naming the subject and the
+    missing fact.
+
+    The guarantee is the CLASS's, not each test's, and the two mutants divide
+    unevenly -- also measured. An inert `TASK_REF_RE` is killed by both tests.
+    An inert `_CLAUSE_SPLIT_RE` (one that never splits) is killed only by the
+    multi-task test: with a single-subject record the whole content IS that
+    subject's clause, so not splitting is indistinguishable from splitting
+    correctly and nothing is there to detect. That is why the multi-task
+    record carries the load here and must not be reduced to a single subject.
     """
 
     def test_a_single_task_snapshot_keys_its_one_subject(self):
         by_id = {r['id']: r for r in _liveness_corpus()}
 
         assert liveness_snapshot_subject_facts(
-            by_id['6b245659'], _CORE_FACT_STRANDED,
-        ) == {'94': {_CORE_FACT_STRANDED}}
+            by_id['6b245659'], _SENTINEL_CORE_FACT,
+        ) == {'94': {_SENTINEL_CORE_FACT, _CORE_FACT_STRANDED}}
         assert liveness_snapshot_subject_facts(
-            by_id['08aa0017'], _CORE_FACT_STRANDED,
-        ) == {'96': {_CORE_FACT_STRANDED}}
+            by_id['08aa0017'], _SENTINEL_CORE_FACT,
+        ) == {'96': {_SENTINEL_CORE_FACT, _CORE_FACT_STRANDED}}
 
     def test_the_multi_task_reverification_keys_each_subject_from_its_own_clause(self):
         """1eef7df7: task 94 in clause 0, task 96 four clauses later.
 
         Both land on the stranded fact from their OWN clause -- which is what
         keeps `test_exactly_the_two_real_groups` green through the rescope.
-        Subject 99 is deliberately not pinned here: it names no clause carrying
-        a readable assignment, and its fallback is `TestLivenessSubjectFactsFallback`.
+
+        Subject 99 is pinned here as the NEGATIVE, in the same sentinel style:
+        it names no clause carrying a readable assignment, so it comes back
+        with the seed and nothing else. That contrast is what proves 94's and
+        96's facts were clause-DERIVED rather than seeded -- all three subjects
+        share one record and one seed, and only the two with real clause
+        evidence gain a second key. The fallback's own three shapes stay
+        `TestLivenessSubjectFactsFallback`.
         """
         record = {r['id']: r for r in _liveness_corpus()}['1eef7df7']
 
-        facts = liveness_snapshot_subject_facts(record, _CORE_FACT_STRANDED)
+        facts = liveness_snapshot_subject_facts(record, _SENTINEL_CORE_FACT)
 
-        assert facts['94'] == {_CORE_FACT_STRANDED}
-        assert facts['96'] == {_CORE_FACT_STRANDED}
+        assert facts['94'] == {_SENTINEL_CORE_FACT, _CORE_FACT_STRANDED}
+        assert facts['96'] == {_SENTINEL_CORE_FACT, _CORE_FACT_STRANDED}
+        assert facts['99'] == {_SENTINEL_CORE_FACT}
 
     def test_the_record_is_not_mutated(self):
         record = {r['id']: r for r in _liveness_corpus()}['1eef7df7']
