@@ -46,6 +46,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _workflow_helpers import FakeBriefing, FakeMcp, FakeScheduler
+from shared.cli_invoke import transcript_exists
 from shared.config_dir import TaskConfigDir
 
 from orchestrator.agents.invoke import AgentResult
@@ -727,6 +728,94 @@ async def test_b1v_invoke_arms_resume_when_transcript_present_in_config_dir(
     assert cap.kwargs['resume_session_id'] == session_id
     assert cap.kwargs['session_id'] == session_id
     assert f'resuming prior session {session_id}' in caplog.text
+
+
+# ── B1r: the RESTORE — rehydrate from the durable archive at the arm site ────
+@pytest.mark.asyncio
+async def test_b1r_invoke_rehydrates_transcript_from_durable_archive(
+    harness: Harness, tmp_path: Path, caplog,
+):
+    """This task's headline behaviour: under a pooled warm lane the config dir
+    the workflow is about to export has NEVER seen the recovered session's
+    JSONL — the dir that held it was destroyed at lane teardown — but the
+    durable archive under ``project_root`` still has it.
+
+    ``_invoke`` must rehydrate it BEFORE corroborating, so the veto is
+    satisfied by a genuinely restored transcript and the resume becomes real
+    instead of a silent fresh start.
+
+    Note ``_config`` sets ``transcript_archive={'enabled': False}``: the restore
+    deliberately does not consult that flag (archival switched off today still
+    leaves restorable archives from yesterday), so this row also pins that.
+    """
+    task_id, session_id = '80', 'uuid-b1r-restore'
+    _setup_warm_lane_session(harness, task_id, session_id, role='implementer')
+    harness.config.session_resume = SessionResumeConfig()
+    await harness._recover_crashed_tasks()
+    recovered = harness._recovered_sessions[task_id]
+
+    cap = await _drive_resumed_invoke(
+        tmp_path, recovered, IMPLEMENTER, caplog, seed_archive=True,
+    )
+
+    # (a) the veto did NOT fire — the restore satisfied it.
+    assert cap.kwargs['resume_session_id'] == session_id
+    assert cap.kwargs['session_id'] == session_id
+    # (b) the transcript is PHYSICALLY there now, at the layout the CLI globs.
+    cfg = cap.workflow._config_dir.path
+    assert transcript_exists(cfg, session_id)
+    restored = list(cfg.glob(f'projects/*/{session_id}.jsonl'))
+    assert len(restored) == 1
+    assert restored[0].read_bytes() == _TRANSCRIPT_BYTES
+    # The archive's own encoded-cwd component is mirrored VERBATIM (measured:
+    # CLI 2.1.236 ignores this directory's name, so re-encoding it would buy a
+    # second implementation obliged to track a private encoding forever).
+    assert restored[0].parent.name == _RESUME_ENC
+    # (c) the win is greppable in the journal.
+    assert any(
+        r.levelname == 'INFO'
+        and 'archive' in r.getMessage()
+        and session_id in r.getMessage()
+        for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_b1r_restore_from_archive_false_leaves_the_veto_to_fire(
+    harness: Harness, tmp_path: Path, caplog,
+):
+    """The narrow kill switch: with ``session_resume.restore_from_archive`` off
+    and the SAME archive present, no rehydration happens and the step-12 veto
+    fires instead.
+
+    Distinct from ``enabled``, which kills the whole feature at the harness
+    guard: an operator can disable restoration alone without going blind on the
+    resume population — which is why the veto (and its WARNING) must still run.
+    """
+    task_id, session_id = '81', 'uuid-b1r-killswitch'
+    _setup_warm_lane_session(harness, task_id, session_id, role='implementer')
+    harness.config.session_resume = SessionResumeConfig()
+    await harness._recover_crashed_tasks()
+    recovered = harness._recovered_sessions[task_id]
+
+    cap = await _drive_resumed_invoke(
+        tmp_path, recovered, IMPLEMENTER, caplog, seed_archive=True,
+        config_overrides={
+            'session_resume': SessionResumeConfig(restore_from_archive=False),
+        },
+    )
+
+    assert cap.kwargs['resume_session_id'] is None
+    assert cap.kwargs['session_id'] != session_id
+    # Nothing was written into the config dir — a disabled restore leaves NO
+    # trace, exactly as a miss does.
+    assert not transcript_exists(cap.workflow._config_dir.path, session_id)
+    assert not (cap.workflow._config_dir.path / 'projects').exists()
+    # …and the veto still ran, so the population stays observable.
+    assert any(
+        r.levelname == 'WARNING' and session_id in r.getMessage()
+        for r in caplog.records
+    )
 
 
 # ── B1: WIP commit preserved across recovery + architect skipped ─────────────
