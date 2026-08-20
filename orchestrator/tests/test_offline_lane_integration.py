@@ -918,6 +918,107 @@ def test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling(pytestconfi
     )
 
 
+@pytest.mark.asyncio
+async def test_out_of_bound_spawn_counts_are_measured_not_asserted(
+    harness: Harness, repo: Path, tmp_path: Path,
+) -> None:
+    """`_SPAWNS_PER_DRIVE_ADVANCE` / `_SPAWNS_PER_REPO_FIXTURE` are the
+    multiplicands `_required_timeout_secs` (task 4203) prices at
+    `_MEASURED_SPAWN_LATENCY_SECS` per spawn — this test MEASURES them by
+    counting real git subprocess spawns, rather than trusting a
+    hand-maintained comment. That distinction is not academic: the two
+    landed comments this task corrects (`test_lane_bounds_...`'s and
+    `_run_lane`'s) had already drifted from each other AND from the truth,
+    which is exactly the failure mode a measuring test — instead of a third
+    hand count — closes off.
+
+    SEAM VERIFICATION (must hold before a single monkeypatch target can be
+    trusted to observe every spawn): this module does ``from
+    orchestrator.git_ops import GitOps, _run`` at the top of the file. That
+    `import` statement copies a REFERENCE to the `_run` function object into
+    this module's own globals — a name distinct from ``orchestrator.git_ops
+    ._run``, the attribute a `unittest.mock.patch` target string resolves
+    against. `_setup_repo` / `_advance_main` (defined in THIS module) call
+    the bare name `_run`, which Python resolves through THIS module's own
+    globals at call time — so patching only ``'orchestrator.git_ops._run'``
+    silently misses them (confirmed directly: doing so undercounts
+    `_drive_advance` at 1 spawn instead of 4). `GitOps.get_main_sha`, by
+    contrast, calls `_run` via ``orchestrator.git_ops``'s OWN globals, so it
+    is only ever observed by patching ``'orchestrator.git_ops._run'``. Both
+    targets are patched below with the same counting wrapper so neither leg
+    is silently missed.
+
+    THIRD LEG, MEASURED RATHER THAN ASSUMED: in PRODUCTION, `_note_merge_all`
+    (`harness.py:10377`) unconditionally calls
+    ``self.git_ops.get_merge_diff_files(...)`` — a real ``git diff`` spawn.
+    But the `harness` fixture above replaces ``h.git_ops.get_merge_diff_files``
+    wholesale with an ``AsyncMock(return_value=([], None))``, so under THIS
+    integration harness that leg reaches neither `_run` nor any subprocess at
+    all — it is a pure in-memory stub. (`_maybe_pipeline_landing_tripwire`,
+    also reached from `_note_merge_all` after the diff fetch, is confirmed
+    separately to no-op whenever ``config.git.load_bearing_oracle_cmd`` is
+    falsy — `harness.py:10438-10444` — and the `git_config` fixture never
+    sets it.) So `_drive_advance`'s measured spawn count is 4 — `get_main_sha`
+    plus `_advance_main`'s `add`/`commit`/`rev-parse` — not 5: not because
+    `get_main_sha` is uncounted (it IS, unlike the superseded `_run_lane`
+    docstring's "3+"), but because the diff fetch contributes zero spawns
+    under this harness's stub, unlike the superseded `test_lane_bounds_...`
+    docstring's assumption that it is real. If a future change to the
+    `harness` fixture ever makes `get_merge_diff_files` real again, THIS
+    assertion fails with the call list attached, rather than the sizing
+    model silently mispricing every composing test that calls
+    `_drive_advance` (directly or via `_drive_reds`).
+
+    No `@pytest.mark.timeout` override: this test has zero bounded waits,
+    and its real-git footprint (one `_drive_advance` plus one fresh
+    `_setup_repo`, on top of the `repo` fixture's own `_setup_repo`) is the
+    same real-git shape — fixture plus a handful of git spawns — the
+    marker-less B1/B4/B6 tests already carry unmarked; see this module's
+    `_MARKERLESS_CEILING_FRACTION` comment and
+    `test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling`'s own
+    docstring for why that shape is accepted for the marker-less population
+    as a whole rather than gated per-test.
+    """
+    import orchestrator.git_ops as git_ops_mod
+
+    calls: list[list[str]] = []
+    orig_run = git_ops_mod._run
+
+    async def _counting_run(*args, **kwargs):
+        cmd = args[0] if args else kwargs.get('cmd')
+        calls.append(list(cmd))
+        return await orig_run(*args, **kwargs)
+
+    with patch('orchestrator.git_ops._run', side_effect=_counting_run), \
+         patch(f'{__name__}._run', side_effect=_counting_run):
+        await _drive_advance(harness, repo)
+
+    assert len(calls) == _SPAWNS_PER_DRIVE_ADVANCE, (
+        f'_drive_advance spawned {len(calls)} real git subprocess(es) '
+        f'({calls}), not the pinned _SPAWNS_PER_DRIVE_ADVANCE = '
+        f'{_SPAWNS_PER_DRIVE_ADVANCE}. This count is a multiplicand of '
+        f'_required_timeout_secs (the @pytest.mark.timeout override sizing '
+        f'model) — a drift here silently mis-prices every composing test '
+        f'that calls _drive_advance, directly or via _drive_reds.'
+    )
+
+    calls.clear()
+    fresh_repo = tmp_path / 'fresh_repo_for_spawn_count'
+    fresh_repo.mkdir()
+    with patch('orchestrator.git_ops._run', side_effect=_counting_run), \
+         patch(f'{__name__}._run', side_effect=_counting_run):
+        await _setup_repo(fresh_repo)
+
+    assert len(calls) == _SPAWNS_PER_REPO_FIXTURE, (
+        f'_setup_repo spawned {len(calls)} real git subprocess(es) '
+        f'({calls}), not the pinned _SPAWNS_PER_REPO_FIXTURE = '
+        f'{_SPAWNS_PER_REPO_FIXTURE}. This count is a multiplicand of '
+        f'_required_timeout_secs — every test in this module transitively '
+        f'pulls the repo fixture, so a drift here mis-prices every '
+        f'composing test, not just one.'
+    )
+
+
 # ---------------------------------------------------------------------------
 # B1 — advance triggers a from-head run
 # ---------------------------------------------------------------------------
