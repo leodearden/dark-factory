@@ -14,15 +14,6 @@ from __future__ import annotations
 import re
 
 import pytest
-from starlette.testclient import TestClient
-
-
-@pytest.fixture(scope='module')
-def _client():
-    from dashboard.app import app
-
-    with TestClient(app) as c:
-        yield c
 
 
 @pytest.fixture(scope='module')
