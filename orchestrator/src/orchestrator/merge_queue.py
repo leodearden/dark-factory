@@ -2624,28 +2624,30 @@ async def _run_post_merge_verify(
     #
     # ACCEPTED CONSEQUENCE: under breadth='full' this also widens
     # _run_unscoped_typechecks (LocalRunner's fourth consumer of this set) to
-    # every registered module. That is semantically correct under the knob,
-    # and for a SOURCE-BEARING diff it introduces no new red: the scoped leg
-    # reaches derive_verify_plan's merge_full fork, whose
-    # _derive_full_suite_runs already runs each registered module's pyright
-    # FULL_SUITE, so anything the widened unscoped gate could catch is caught
-    # there first. It does duplicate that pyright across the registry per
-    # merge (concurrently, so wall-clock is the slowest module rather than the
-    # sum).
-    #
-    # That claim is NARROWER than it first reads, and the gap is stated here
-    # rather than glossed: for a diff with NO source files derive_verify_plan
-    # returns the TRIVIAL plan (its _has_source_files early return) BEFORE
-    # that fork, so no per-module pyright runs at all, the scoped leg passes
-    # trivially, and the widened unscoped gate is then the ONLY pyright that
-    # runs — over the whole registry where it previously covered just the
-    # task's own modules. A PRE-EXISTING pyright break in a registered but
-    # untouched module can therefore newly block such a merge. Accepted
-    # deliberately: splitting the set inside LocalRunner to dodge it would
-    # reintroduce exactly the two-sites-must-agree drift §8.2 exists to
-    # remove. Both this exposure and the duplicated pyright above are tracked
-    # as follow-up ticket tkt_0RSNVTEKHFD8D2PMDY1QQGHQ4E (filed from γ's
-    # amendment pass; the curator resolves it to a task id asynchronously).
+    # every registered module. That is semantically correct under the knob and
+    # introduces NO new red — but for TWO reasons, not one. γ's amendment pass
+    # re-measured both, because a reviewer read the second path as a new-red
+    # exposure and it is not:
+    #   - SOURCE-BEARING diff: derive_verify_plan takes its merge_full fork,
+    #     and _derive_full_suite_runs already runs each registered module's
+    #     pyright FULL_SUITE.
+    #   - NO-source-file diff (docs/YAML only): derive_verify_plan returns the
+    #     TRIVIAL plan — but run_scoped_verification does NOT return on it at
+    #     the merge gate. role=='merge' AND is_merge_verify (exactly what
+    #     LocalRunner.run_merge_verify passes, and this widened set is
+    #     reachable from nowhere else) hits INV-1, task 2883: the would-be
+    #     trivial pass ESCALATES to the per-subproject fan-out over these same
+    #     module_configs, and each _verify_module -> run_verification(…, mc)
+    #     runs that module's type_check_command. If NO module carries any
+    #     command it fails loud with merge_no_evidence instead, and the
+    #     unscoped gate is never reached at all.
+    # Either way, every module the widened unscoped gate covers has already had
+    # its pyright run on the scoped leg, so that gate can only re-report a red
+    # the merge already has. The real cost is duplication: pyright runs twice
+    # per registered module per merge (concurrently, so wall-clock is the
+    # slowest module rather than the sum) — tracked as task 4490. Splitting the
+    # set inside LocalRunner to dodge it would reintroduce exactly the
+    # two-sites-must-agree drift §8.2 exists to remove.
     effective_module_configs = _merge_boundary_module_configs(
         req.config, req.module_configs,
     )
