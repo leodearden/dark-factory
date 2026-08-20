@@ -118,8 +118,9 @@ class TestDisallowListForAmendAndEpisodeTools:
     cannot silently make the prompt lie.
 
     Two parts. PART A is the cheap structural guard (set membership, mirroring
-    the established shape at test_merge_entities.py:948-959 and
-    test_redact_episode_content.py:491-506). PART B is the by-MEASUREMENT pin
+    the established shape of TestDisallowListForMergeEntities in
+    test_merge_entities.py and TestDisallowListForRedactEpisodeContent in
+    test_redact_episode_content.py). PART B is the by-MEASUREMENT pin
     the 2026-08-06 operator amendment (esc-3623-3) requires: "assert on the
     RENDERED Stage 3 tool surface, not merely on set membership. A test that
     only checks 'update_memory' in STAGE3_DISALLOWED can pass while the tool
