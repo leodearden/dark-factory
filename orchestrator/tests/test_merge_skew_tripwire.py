@@ -15,12 +15,14 @@ test_merge_queue_lifecycle_registry.py / test_merge_queue_request_liveness.py.
 
 from __future__ import annotations
 
+import asyncio
 import time
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+import pytest_asyncio
 
 
 class TestLoadBearingOracle:
@@ -168,6 +170,120 @@ exit 0
         assert elapsed < 4.0, (
             f'expected the {0.2}s timeout to bound the wait well under the '
             f'script\'s 5s sleep; took {elapsed:.2f}s'
+        )
+
+
+class TestAbandonedOracleRegistry:
+    """Task 4233 — the oracle task abandoned on ANY exceptional exit from
+    ``_run_load_bearing_oracle``'s ``asyncio.wait`` (budget expiry OR caller
+    cancellation) must be held by a strong reference (``_ABANDONED_ORACLES``)
+    until it finishes, then released.
+
+    Mirrors ``test_probe_db_abandons_and_tracks_on_every_exit_path`` /
+    ``_drained_probe_registry`` (dashboard/tests/test_healthz_deadline.py,
+    task 4089) — the landed sibling fix for the same defect class in
+    ``dashboard/app.py::_probe_db``.
+
+    Uses a stub replacing ``orchestrator.git_ops._run`` rather than the real
+    bash-script subprocess ``TestLoadBearingOracle`` drives above: a real
+    subprocess's ``communicate()`` internally ``gather()``s per-pipe reader
+    tasks, so identifying "the one abandoned task" by set-diffing
+    ``asyncio.all_tasks()`` (4089's trick) would not isolate a single task
+    here. The stub instead records ``asyncio.current_task()`` directly, which
+    identifies it exactly regardless of subprocess internals.
+    """
+
+    class _StubRun:
+        """Replaces ``orchestrator.git_ops._run``: records the calling task,
+        signals ``started``, then blocks until cancelled.
+
+        ``cleanup_raises`` models ``_run``'s real kill+reap cleanup (task
+        2608) RAISING during unwinding instead of completing the
+        cancellation cleanly — the realistic failure shape that is the
+        entire reason this call site abandons the task rather than awaiting
+        it.
+        """
+
+        def __init__(self, *, cleanup_raises: bool) -> None:
+            self.cleanup_raises = cleanup_raises
+            self.task: asyncio.Task | None = None
+            self.started = asyncio.Event()
+
+        async def __call__(
+            self, cmd: list[str], cwd: Path | None = None, *, input_text: str | None = None,
+        ) -> tuple[int, str, str]:
+            self.task = asyncio.current_task()
+            self.started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                if self.cleanup_raises:
+                    raise RuntimeError('oracle cleanup blew up') from None
+                raise
+            return (0, '', '')  # pragma: no cover — unreachable: the Event above is never set
+
+    @pytest_asyncio.fixture()
+    async def _drained_oracle_registry(self):
+        """Yield ``_ABANDONED_ORACLES``; on teardown, cancel + drain whatever
+        remains.
+
+        Teardown-ONLY: deliberately does not ``.clear()`` the registry at
+        setup. Clearing would drop the strong reference to a task left
+        in-flight by an earlier test, which would GC it mid-flight — exactly
+        the hazard this registry exists to prevent. Mirrors
+        ``_drained_probe_registry`` (dashboard/tests/test_healthz_deadline.py:628-646).
+        A RED assertion failure here must fail loudly, not leak a pending
+        task into the rest of the orchestrator suite.
+        """
+        from orchestrator import merge_skew_tripwire
+
+        registry = merge_skew_tripwire._ABANDONED_ORACLES
+        yield registry
+        pending = set(registry)
+        if pending:
+            for task in pending:
+                task.cancel()
+            await asyncio.wait(pending, timeout=5.0)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'cleanup_raises', [False, True], ids=['cancels_cleanly', 'raises_during_cleanup'],
+    )
+    async def test_timeout_abandons_and_tracks_until_drained(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        _drained_oracle_registry,
+        cleanup_raises: bool,
+    ) -> None:
+        """A timed-out oracle task must be strongly referenced in
+        ``_ABANDONED_ORACLES`` until it finishes, then released — whether it
+        cancels cleanly or its cleanup raises during unwinding. A registry
+        that only ever grows is itself a leak, so both terminal shapes are
+        parametrized to force the drain to sit at the head of the
+        done-callback, outside its ``try``, rather than only on the
+        cancelled branch.
+        """
+        from orchestrator.merge_skew_tripwire import _run_load_bearing_oracle
+
+        registry = _drained_oracle_registry
+        stub = self._StubRun(cleanup_raises=cleanup_raises)
+        monkeypatch.setattr('orchestrator.git_ops._run', stub)
+
+        result = await _run_load_bearing_oracle(
+            tmp_path, ['fake-oracle'], ['a.py'], timeout_secs=0.05,
+        )
+
+        assert result is False, 'fail-open contract unchanged: a timed-out oracle returns False'
+        assert stub.task is not None, 'stub was never invoked'
+        assert stub.task in registry, (
+            'abandoned oracle task was not tracked in _ABANDONED_ORACLES'
+        )
+
+        await asyncio.wait({stub.task}, timeout=5.0)
+        assert stub.task.done(), 'abandoned oracle task never finished'
+        assert stub.task not in registry, (
+            'abandoned oracle task leaked: still in _ABANDONED_ORACLES after it finished'
         )
 
 
