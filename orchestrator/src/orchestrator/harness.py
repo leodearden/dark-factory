@@ -3085,6 +3085,21 @@ class Harness:
         # directory-shaped paths (sanitize strips them to []) — the last of
         # which is why the gate keys off the SANITIZED result, not the raw
         # (possibly all-directory but truthy) prediction.
+        #
+        # THE EMPTY PREDICTION IS A SIGNAL, NOT AN ABSENCE (task 3122).
+        # Suppressing the 'files' key is a no-clobber measure, but it also
+        # used to discard the verdict entirely: the metadata recorded THAT
+        # the tagger ran (files_tagged_at) and never WHAT it concluded. The
+        # tagger is prompted with the project's own top-level directory
+        # listing and explicitly instructed to "include it with an empty
+        # files list rather than omitting it" (module_tagger_prompt.py:78-79),
+        # so an empty result is an AFFIRMATIVE verdict from a model that
+        # could see the whole layout — and its cost is already sunk (~$0.278
+        # per batch). files_tagged_empty preserves it. It is NOT a gate on
+        # its own — it also fires for genuinely-new-file and vague tasks —
+        # but in conjunction with the submit-time soft scope signals it is
+        # strong evidence for the FILELESS misfile class. Task 3121 is its
+        # consumer.
         tagged_at = datetime.now(UTC).isoformat()
 
         tagged_count = 0
@@ -3104,6 +3119,13 @@ class Harness:
             # An all-directory prediction sanitizes to [] and is treated
             # exactly like an empty/omitted one (sentinel alone, no clobber).
             sanitized = sanitize_files_for_persist(files) if files else []
+            # Written UNCONDITIONALLY as a bool, unlike its 'files' sibling
+            # above: scheduler.update_task's default merge is shallow
+            # last-write-wins, so a set-only-when-empty write would leave a
+            # stale True from an earlier cycle sitting beside the real files
+            # a force re-tag just predicted — handing task 3121 a signal that
+            # contradicts the list next to it.
+            metadata_payload['files_tagged_empty'] = not sanitized
             if sanitized:
                 metadata_payload['files'] = sanitized
             await self.scheduler.update_task(task_id, json.dumps(metadata_payload))
