@@ -24,6 +24,7 @@ here: blanking real code would disarm every absence assertion downstream.
 
 from __future__ import annotations
 
+import ast
 import sys
 from pathlib import Path
 
@@ -424,6 +425,102 @@ def _resolved_client_scope(request) -> str | None:
         if marker is not None:
             return getattr(marker, 'scope', None)
     return None
+
+
+# Modules allowed to define their own `_client`, and why.
+#
+# test_fixture_isolation.py's copy is the SUBJECT UNDER TEST there, not a
+# leftover duplicate: task 3503's contract is that only a *session*-scoped
+# isolation fixture can protect a *module*-scoped TestClient lifespan, so that
+# module proves it by owning such a lifespan (see its `_client` docstring, and
+# conftest.py's "SHADOWING IS INTENDED" note).  Deleting that copy would delete
+# the coverage.  Every other module resolves `_client` from conftest.py.
+_CLIENT_FIXTURE_EXEMPT = {'test_fixture_isolation.py'}
+
+
+def _decorator_name(node) -> str | None:
+    """The bare name a decorator expression resolves to, or None.
+
+    Unwraps a call — `@pytest.fixture(scope='module')` — to its callee first,
+    then reads the attribute (`pytest.fixture`) or plain name (`fixture`).
+    """
+    if isinstance(node, ast.Call):
+        node = node.func
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    if isinstance(node, ast.Name):
+        return node.id
+    return None
+
+
+def _is_fixture(node) -> bool:
+    """True when any decorator on this function resolves to the name `fixture`.
+
+    Matches `@pytest.fixture`, `@pytest.fixture(scope='module')` and a bare
+    `@fixture` alike: the NAME is what identifies a fixture here, not the
+    module it was imported from.
+    """
+    return any(_decorator_name(d) == 'fixture' for d in node.decorator_list)
+
+
+def _fixture_defs() -> list[tuple[Path, ast.FunctionDef]]:
+    """Every fixture defined in every sibling `test_*.py`, as `(path, node)`.
+
+    STATIC, not introspective: these guards must see a fixture DEFINITION
+    wherever it sits, including one shadowed into irrelevance at runtime — a
+    shadow is precisely what they exist to catch, so asking the live fixture
+    registry would hide it.
+
+    The `test_*.py` glob excludes conftest.py naturally, which is the point:
+    conftest is the intended HOME of the shared fixtures, so it must never be
+    scanned as an offender.
+    """
+    paths = sorted(Path(__file__).parent.glob('test_*.py'))
+    assert paths, (
+        f'no test_*.py files found beside {__file__} — the test root moved, so '
+        f'every guard below would pass vacuously against zero files'
+    )
+
+    defs = []
+    for path in paths:
+        tree = ast.parse(path.read_text(encoding='utf-8'))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and _is_fixture(node):
+                defs.append((path, node))
+    return defs
+
+
+class TestNoModuleLocalClientFixtures:
+    """conftest.py is the only home of the shared TestClient fixture.
+
+    Deleting the module-local copies is a one-time fix; this guard is the
+    durable half.  The failure mode that produced fifteen byte-identical
+    copies is copy-paste from a sibling module when writing a new test file —
+    which reads as perfectly idiomatic in review, and so is caught by nothing
+    unless something checks structurally.
+    """
+
+    def test_client_fixture_is_defined_only_in_conftest(self) -> None:
+        """No module may declare `_client`, except the one that tests it.
+
+        EQUALITY, not a subset check, and deliberately so: it is
+        bidirectional.  A new module adding its own copy fails it, and so does
+        deleting test_fixture_isolation.py's deliberately-retained copy — which
+        would otherwise silently rot this exemption into a whitelist for a
+        fixture that no longer exists, dropping the module-scoped half of task
+        3503's isolation contract with nothing reporting it.
+        """
+        offenders = {path.name for path, fn in _fixture_defs() if fn.name == '_client'}
+
+        assert offenders == _CLIENT_FIXTURE_EXEMPT, (
+            f'`_client` must resolve from conftest.py (which defines it '
+            f'module-scoped, alongside the served-asset fixtures) — modules '
+            f'defining their own copy: '
+            f'{sorted(offenders - _CLIENT_FIXTURE_EXEMPT) or "none"}; '
+            f'exempt modules that have LOST theirs (restore it, or drop the '
+            f'row from _CLIENT_FIXTURE_EXEMPT): '
+            f'{sorted(_CLIENT_FIXTURE_EXEMPT - offenders) or "none"}'
+        )
 
 
 class TestSharedServedAssetFixtures:
