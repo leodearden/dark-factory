@@ -25,6 +25,7 @@ import os
 import re
 import shutil
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from uuid import uuid4
 
@@ -529,3 +530,109 @@ def test_prune_is_silent_when_the_unit_dir_does_not_exist(tmp_path: Path) -> Non
     _prune_stale_selftest_units(
         tmp_path / "nope" / "systemd" / "user", now=1_000_000.0, max_age_s=3600.0
     )
+
+
+# ---------------------------------------------------------------------------
+# step-7: the measured concurrency defect
+# ---------------------------------------------------------------------------
+
+# Comfortably under the suite's own --timeout=300 (scripts/orchestrator.yaml),
+# so a wedged run surfaces as this test's own diagnosable failure rather than
+# as an opaque suite-level timeout that names no cause.
+_SELFTEST_TIMEOUT_S = 120
+
+
+def _run_selftest(template: str) -> subprocess.CompletedProcess[str]:
+    """Drive scripts/tests/test_remove_lms_dropin.sh against ONE template name.
+
+    The template is threaded in through the LMS_SELFTEST_TEMPLATE seam, which
+    the .sh then forwards to the script under test via its existing
+    LMS_UNIT_TEMPLATE seam -- so this single variable propagates through both
+    halves and gives the invocation an absolute unit path no concurrent run
+    shares.
+    """
+    env = os.environ.copy()
+    env["LMS_SELFTEST_TEMPLATE"] = template
+    return subprocess.run(
+        ["bash", str(SELFTEST_SH)],
+        capture_output=True,
+        text=True,
+        timeout=_SELFTEST_TIMEOUT_S,
+        env=env,
+        check=False,
+    )
+
+
+def _remove_template_residue(template: str) -> None:
+    """Delete one template's unit + drop-in dir from the REAL unit directory.
+
+    The .sh cleans up after itself via `trap cleanup EXIT`; this is the
+    belt-and-braces for the path where it cannot -- a mid-test failure or an
+    exception raised between launch and assertion.  Best-effort by design.
+    """
+    unit_dir = _unit_dir()
+    try:
+        (unit_dir / f"{template}.service").unlink(missing_ok=True)
+        shutil.rmtree(unit_dir / f"{template}.service.d", ignore_errors=True)
+    except OSError:
+        pass
+
+
+def _assert_selftest_passed(result: subprocess.CompletedProcess[str], template: str) -> None:
+    """Assert one run is green, surfacing its full output on failure.
+
+    A future breakage of the script under test must be diagnosable from the
+    verify log ALONE -- nobody will have a live systemd box and this worktree
+    in hand when it goes red.  The .sh prints a PASS/FAIL line per check, so
+    embedding stdout names the exact check that broke.
+    """
+    detail = (
+        f"\n--- template: {template}\n"
+        f"--- exit code: {result.returncode}\n"
+        f"--- stdout ---\n{result.stdout}\n"
+        f"--- stderr ---\n{result.stderr}"
+    )
+    assert result.returncode == 0, f"{SELFTEST_SH.name} exited non-zero.{detail}"
+    assert "ALL CHECKS PASSED" in result.stdout, (
+        f"{SELFTEST_SH.name} did not report ALL CHECKS PASSED.{detail}"
+    )
+
+
+@pytest.mark.skipif(_SKIP_REASON is not None, reason=str(_SKIP_REASON))
+def test_concurrent_selftests_do_not_collide() -> None:
+    """Three simultaneous runs must all pass -- the MEASURED defect, not a guess.
+
+    The fleet runs `max_concurrent_tasks: 48` and every task shares one $HOME,
+    so this .sh can and will be running in several worktrees at once.  With
+    its old hardcoded `lms-dropin-selftest@`, every instance wrote and `rm`ed
+    the SAME absolute unit path, and case 4's `rm -f "$UNIT"` tore down the
+    other run's fixture mid-test.  Measured at plan time: two concurrent runs
+    BOTH failed, deterministically --
+
+      run A: "exit code is 0 -- expected '0', got '1'"
+             "WorkingDirectory now resolves to the repo root -- expected
+              '/tmp/tmp.NnkWkdITs8', got '/tmp/tmp.bUjgix0thr'"
+      run B: "drop-in still present after refusal -- expected 'yes', got 'no'"
+             "template survives the re-run -- expected 'yes', got 'no'"
+
+    That makes the LMS_SELFTEST_TEMPLATE seam MANDATORY rather than a nicety.
+    scripts/orchestrator.yaml warns that a red leg here "blocks every merge,
+    review checkpoint and main-tip sweep repo-wide, on branches with no
+    defect" (the repo root sets merge_verify_breadth: full).  Wiring the .sh
+    into the collected suite UNSEAMED would therefore have converted a
+    dormant-but-correct test into an intermittent repo-wide merge blocker --
+    strictly worse than the rot this task set out to fix.
+
+    THREE instances rather than two, so the overlap window is not marginal.
+    """
+    templates = [_unique_template() for _ in range(3)]
+    assert len(set(templates)) == 3, "the generator must not hand two runs the same name"
+
+    try:
+        with ThreadPoolExecutor(max_workers=len(templates)) as pool:
+            results = list(pool.map(_run_selftest, templates))
+        for template, result in zip(templates, results, strict=True):
+            _assert_selftest_passed(result, template)
+    finally:
+        for template in templates:
+            _remove_template_residue(template)
