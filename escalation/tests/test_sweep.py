@@ -796,3 +796,42 @@ class TestReapOrphanLocks:
 
         assert count == 0, 'a record in the queue root still owns its lock'
         assert lock_path.exists(), 'sidecar of a live root record was reaped'
+
+
+class TestReapOrphanLocksSeqSafety:
+    """SAFETY: the per-task_id .seq counter and its sidecar must survive the reap."""
+
+    def test_seq_counter_and_its_lock_survive_reap(self, tmp_path: Path):
+        """make_id's durable counter has no .json record — it must not look orphaned.
+
+        The id is MINTED through the real ``make_id`` rather than hand-writing
+        ``esc-4566.seq``: that couples this guard to the actual counter naming,
+        so a future rename of the suffix fails HERE, loudly, instead of silently
+        disarming the guard.
+        """
+        from escalation.queue import EscalationQueue
+
+        q = EscalationQueue(tmp_path)
+        esc_id = q.make_id('4566')
+        assert esc_id == 'esc-4566-1'
+
+        counter = tmp_path / 'esc-4566.seq'
+        counter_lock = tmp_path / 'esc-4566.seq.json.lock'
+        assert counter.exists(), 'precondition: make_id wrote the durable counter'
+        assert counter_lock.exists(), 'precondition: make_id took the counter sidecar lock'
+        counter_bytes = counter.read_bytes()
+
+        count = sweep.reap_orphan_locks(tmp_path, apply=True)
+
+        assert count == 0, 'the counter sidecar is not an orphan and must not be reaped'
+        assert counter.exists(), 'the .seq counter itself was deleted'
+        assert counter.read_bytes() == counter_bytes, '.seq counter contents changed'
+        assert counter_lock.exists(), (
+            'esc-4566.seq.json.lock was reaped — a counter has no .json record by '
+            'construction, so it would look orphaned forever'
+        )
+
+        # The counter is still AUTHORITATIVE: a fresh queue mints the next id
+        # from it rather than falling into _recover_seq_from_disk's repair path
+        # (which, with no submitted records on disk, would rewind to esc-4566-1).
+        assert EscalationQueue(tmp_path).make_id('4566') == 'esc-4566-2'
