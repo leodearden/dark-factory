@@ -21,8 +21,15 @@ Every LLM / MCP / git side effect in this module is an INJECTED seam
 ``escalate_fn``, ``status_fetcher``, ``commit``, ``batch_source``) --
 mirrors delta's ``coder.code_digests(invoke=)`` and zeta's
 ``census_trigger(status_fetcher=)``. The scripts/ test env (``uv run
---project shared``) has no MCP client and no live models, so every seam is
-ALWAYS faked in this module's own test suite; the deterministic core
+--project shared``) has no live models. Every seam is ALWAYS faked in this
+module's own test suite for DETERMINISM -- to keep the suite off the
+network and make both the request shape and the failure path assertable
+regardless of what is installed or listening, never because a client
+library is absent: an MCP client IS importable there too, symmetrically
+with httpx below -- ``fastmcp>=3.2`` is a direct dependency of ``shared``
+(``shared/pyproject.toml``, task 3689), pulling in ``mcp>=1.24``, so an
+un-faked MCP seam would really POST to ``$FUSED_MEMORY_MCP_URL``; the
+deterministic core
 (duplicate/dup_rate, the mining batch loop + saturation stop, the origin x
 manifestation matrix, census-state advance, codebook lifecycle transforms,
 report rendering) is unit-tested with no network. Note that httpx IS
