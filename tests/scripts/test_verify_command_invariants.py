@@ -47,6 +47,8 @@ distinguishable from each other.
 """
 from __future__ import annotations
 
+import shlex
+
 import pytest
 import verify_command_invariants as vci
 
@@ -160,3 +162,140 @@ def test_optional_token_segment_strips_the_verbatim_segment() -> None:
     assert vci.optional_token_segment("ls a && uv run pytest tests/", _PYTEST) == (
         "uv run pytest tests/"
     )
+
+
+# ---------------------------------------------------------------------------
+# anchor_split
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("segment", "keyword", "pre", "post"),
+    [
+        ("uv run ruff check alpha beta", _RUFF, ["uv", "run", "ruff"], ["alpha", "beta"]),
+        (
+            "uv run --project shared pyright scripts/",
+            "pyright",
+            ["uv", "run", "--project", "shared"],
+            ["scripts/"],
+        ),
+        (
+            "uv run --directory orchestrator pytest tests/ -q",
+            _PYTEST,
+            ["uv", "run", "--directory", "orchestrator"],
+            ["tests/", "-q"],
+        ),
+    ],
+)
+def test_anchor_split_derives_the_anchor_from_the_keywords_last_token(
+    segment: str, keyword: str, pre: list[str], post: list[str]
+) -> None:
+    """One rule — ``keyword.split()[-1]`` — reproduces all three live anchors.
+
+    ``ruff check`` anchors on ``check``, ``pyright`` and ``pytest`` on
+    themselves. Before this module the three were spelled three ways, including
+    two hand-rolled ``tokens.index("check")`` calls, which is how a caller ends
+    up with a slice a sibling caller does not have (task 4358).
+
+    The anchor belongs to NEITHER half: everything before it is the WRAPPER's
+    (``uv``'s ``--project shared`` selects the ENVIRONMENT the binary resolves
+    from), everything after is the CHECKER's own argv.
+    """
+    assert vci.anchor_split(segment, keyword) == (pre, post)
+
+
+def test_anchor_split_asserts_when_the_anchor_is_absent() -> None:
+    """Without the anchor the checker's own arguments cannot be located at all.
+
+    A bare ``ValueError`` from ``list.index`` would say so far less clearly, and
+    would not name which command failed.
+    """
+    with pytest.raises(AssertionError) as excinfo:
+        vci.anchor_split("uv run ruff format alpha", _RUFF, label="the live lint_command")
+    message = str(excinfo.value)
+    assert "the live lint_command" in message
+    assert "uv run ruff format alpha" in message
+
+
+# ---------------------------------------------------------------------------
+# positional_targets
+# ---------------------------------------------------------------------------
+
+
+def test_positional_targets_excludes_everything_before_the_anchor() -> None:
+    """uv's positional ``shared`` is an environment name, not a checked path.
+
+    This is the documented reason the extractor anchors where it does rather
+    than filtering the whole segment.
+    """
+    assert vci.positional_targets("uv run --project shared pytest tests/", _PYTEST) == ["tests/"]
+
+
+def test_positional_targets_with_no_value_flags_is_the_naive_dash_prefix_filter() -> None:
+    """THE EQUIVALENCE that lets one extractor serve all four call sites.
+
+    ``test_root_lint_covers_nonmember_py.py`` and ``test_scripts_module_config.py``
+    both use a bare ``[t for t in tail if not t.startswith('-')]`` today, phantoms
+    and all: ``--select E,F`` donates ``E,F`` and ``--line-length 100`` donates
+    ``100`` as though they were paths. With an empty ``value_flags`` set the
+    consume-next flag can never become True, so the loop reduces to exactly that
+    filter — and asserting the PHANTOM-ADMITTING result here is what proves the
+    migration changed nothing for those two files. (A phantom target can only
+    ever make a coverage check pass spuriously, never fail, which is why those
+    two callers can tolerate it and the two stricter ones do not.)
+    """
+    segment = "ruff check --select E,F --line-length 100 --fix alpha beta.py"
+    assert vci.positional_targets(segment, _RUFF) == ["E,F", "100", "alpha", "beta.py"]
+
+
+@pytest.mark.parametrize(
+    ("segment", "keyword"),
+    [
+        ("ruff check alpha beta.py", _RUFF),
+        ("uv run ruff check --fix alpha", _RUFF),
+        ("ruff check --select E,F --line-length 100 --fix alpha beta.py", _RUFF),
+        ("uv run --project shared pyright scripts/", "pyright"),
+        ("uv run --project shared pytest tests/scripts/ --tb=short -q --timeout=300", _PYTEST),
+        ("uv run --directory orchestrator pytest tests/ -k some_expr", _PYTEST),
+        ("pytest", _PYTEST),
+    ],
+)
+def test_positional_targets_agrees_with_the_pre_migration_filter(segment: str, keyword: str) -> None:
+    """The same equivalence, checked against an INDEPENDENT oracle over many shapes.
+
+    The right-hand side is the pre-migration expression transcribed literally
+    from ``_ruff_targets`` / ``_targets``, not a call back into this module, so
+    the two can genuinely disagree.
+    """
+    tokens = shlex.split(segment)
+    anchor = keyword.split()[-1]
+    naive = [t for t in tokens[tokens.index(anchor) + 1:] if not t.startswith("-")]
+    assert vci.positional_targets(segment, keyword) == naive
+
+
+def test_positional_targets_consumes_a_supplied_value_flags_following_token() -> None:
+    """With the caller's value-flag set supplied, a flag VALUE is not a target.
+
+    Byte-identical to ``test_contributing_lint_command_drift.py``'s existing
+    ``test_ruff_targets_reads_flag_values_as_flags_not_paths`` expectation. That
+    guard needs this because it reports a target that does not exist on disk, so
+    a phantom ``E,F`` surfaces as "names 'E,F', which does not exist" — a red
+    verify with a misleading diagnosis on a change that broke nothing.
+    """
+    segment = "ruff check --select E,F --line-length 100 --fix alpha beta.py"
+    targets = vci.positional_targets(
+        segment, _RUFF, value_flags=frozenset({"--select", "--line-length"})
+    )
+    assert targets == ["alpha", "beta.py"]
+
+
+def test_positional_targets_needs_no_entry_for_the_equals_spelling() -> None:
+    """``--flag=value`` is one shlex token and the ``-`` prefix drops it whole."""
+    segment = "uv run --project shared pytest tests/scripts/ --timeout=300 -q"
+    assert vci.positional_targets(segment, _PYTEST) == ["tests/scripts/"]
+
+
+def test_positional_targets_propagates_the_anchor_assertion_with_the_label() -> None:
+    with pytest.raises(AssertionError) as excinfo:
+        vci.positional_targets("uv run ruff format alpha", _RUFF, label="the documented command")
+    assert "the documented command" in str(excinfo.value)
