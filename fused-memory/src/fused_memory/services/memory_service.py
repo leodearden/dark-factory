@@ -1728,28 +1728,73 @@ class ReferentFinding:
         }
 
 def _candidate_pool(
-    *, referents: frozenset[Referent], cited: frozenset[Referent],
+    *,
+    referents: frozenset[Referent],
+    cited: frozenset[Referent],
+    endpoint: Referent,
 ) -> frozenset[Referent]:
     """The evidence rule, before either endpoint is subtracted.
 
-    ``(cited & referents) or referents``. The edge's own fact is the sharpest
-    evidence available about which node THIS edge belongs on, so a citation the
-    declaration corroborates wins; the whole declared set is the fallback for
-    when the fact cites nothing the declaration also names. INTERSECTING rather
-    than unioning is what keeps a repair target from ever originating outside
-    the referent set — an LLM-restated fact naming a task the write never
-    declared itself to be about must not become a target. Fact-scoping is also
-    what keeps mode (iii) repairable: with referents {3074, 3075} the whole-set
-    fallback would see two candidates and abandon a repair the fact
-    unambiguously determines.
+    ``cited & referents``, falling back to the whole of ``referents`` ONLY when
+    the fact says nothing about where this edge belongs. The edge's own fact is
+    the sharpest evidence available about which node THIS edge belongs on, so a
+    citation the declaration corroborates wins; the whole declared set is the
+    fallback for when the fact cites nothing the declaration also names.
+    INTERSECTING rather than unioning is what keeps a repair target from ever
+    originating outside the referent set — an LLM-restated fact naming a task
+    the write never declared itself to be about must not become a target.
+    Fact-scoping is also what keeps mode (iii) repairable: with referents
+    {3074, 3075} the whole-set fallback would see two candidates and abandon a
+    repair the fact unambiguously determines.
+
+    THE CORROBORATION GUARD (``endpoint in cited``) is what makes the fallback
+    safe on the SET-MEMBERSHIP arm, and it is the membership-arm counterpart of
+    the pairing arm's ``cited_declared`` guard — same principle, same
+    fail-closed direction. A fact that NAMES the very node its edge landed on is
+    the strongest possible evidence the attachment is CORRECT, so it must not be
+    read as "the fact is silent, fall back to the declared set". Without the
+    guard the dominant legitimate write shape becomes a repair instruction:
+    ``resolve_referents`` derives ``source='metadata'`` from the write's ambient
+    ``task_id``, and its own docstring names the mismatch as deliberately NOT a
+    conflict — "An agent working on task 3668 legitimately writes memories about
+    Task 2500". With referents {3668} and an edge whose fact reads "Task 2500
+    was completed by the merge worker" hanging off the ``Task 2500`` node, the
+    unguarded fallback yields the sole candidate ``Task 3668`` and hands leaf eta
+    a ``resolvable=True`` instruction to repoint a CORRECT edge onto the task the
+    agent merely happened to be working on — manufacturing the exact
+    misattribution this PRD exists to prevent, and polluting the rate leaf iota
+    samples with a finding that has no observable defect.
+
+    Corroborated findings are still RECORDED — they are just recorded with an
+    empty pool, which becomes ``resolvable=False`` plus a reason at the caller.
+    That is this pass's stated postcondition: recorded and left alone, never
+    guessed at.
 
     Extracted so the rule lives at ONE site that both :func:`_candidate_targets`
     and :func:`_unresolvable_reason` read. Without it the reason builder would
     have to RECOMPUTE the pool to explain itself — a second copy that must agree
     with the first byte-for-byte, which is exactly the INV-5 lockstep
     duplication this PRD exists to avoid.
+
+    Args:
+        referents: The set the write declared itself to be about.
+        cited: The referents this edge's own fact mentions.
+        endpoint: The referent the flagged endpoint currently parses as — read
+            ONLY to ask whether the fact corroborates it. The subtraction of the
+            endpoint from the pool stays in :func:`_candidate_targets`, so this
+            function remains "which referents is there evidence for", not "which
+            targets survive".
     """
-    return (cited & referents) or referents
+    corroborated_citations = cited & referents
+    if corroborated_citations:
+        return corroborated_citations
+    if endpoint in cited:
+        # The fact names the node this edge end is already on. It is evidence
+        # FOR the current attachment, never for repointing it elsewhere, so the
+        # declared-set fallback is suppressed rather than allowed to nominate a
+        # target the fact does not support.
+        return frozenset()
+    return referents
 
 
 def _candidate_targets(
@@ -1767,8 +1812,12 @@ def _candidate_targets(
 
     The rule, in order:
 
-    1. ``pool = _candidate_pool(referents=..., cited=...)`` — the fact-cited
-       intersection when it is non-empty, else the whole declared set.
+    1. ``pool = _candidate_pool(referents=..., cited=..., endpoint=...)`` — the
+       fact-cited intersection when it is non-empty; else the whole declared set,
+       UNLESS the fact cites the endpoint itself, in which case the fact
+       corroborates the current attachment and the pool is empty. See that
+       function for why the corroboration guard is load-bearing on the dominant
+       ``source='metadata'`` write shape.
     2. Subtract *endpoint*, the referent this finding is ABOUT. A "repair" onto
        the node the edge is already attached to is not a repair — and is not
        even a harmless no-op, because :meth:`_intended_endpoint_uuid` resolves
@@ -1828,15 +1877,16 @@ def _candidate_targets(
     # `other_endpoint` may be None; None is simply not a member of a
     # frozenset[Referent], and typeshed types `frozenset.__sub__` as accepting
     # AbstractSet[_T_co | None], so no explicit `- {None}` branch is needed.
-    pool = _candidate_pool(referents=referents, cited=cited) - {
-        endpoint, other_endpoint,
-    }
+    pool = _candidate_pool(
+        referents=referents, cited=cited, endpoint=endpoint,
+    ) - {endpoint, other_endpoint}
     return tuple(sorted(pool, key=lambda r: (r.kind, r.project_id, r.number)))
 
 def _unresolvable_reason(
     candidates: tuple[Referent, ...],
     *,
     pool: frozenset[Referent],
+    cited: frozenset[Referent],
     endpoint: Referent,
     other_endpoint: Referent | None,
 ) -> str:
@@ -1853,6 +1903,11 @@ def _unresolvable_reason(
         pool: The PRE-subtraction pool from :func:`_candidate_pool`. Membership
             is tested here rather than inferred from ``other_endpoint is None``
             precisely so the message stays HONEST when BOTH subtractions apply.
+        cited: The referents this edge's own fact mentions — the same set the
+            pool was computed from, so the corroboration branch reads the SAME
+            input :func:`_candidate_pool` decided on rather than re-deriving it
+            from the empty pool it produced (which is indistinguishable from an
+            empty declared set).
         endpoint: The referent the flagged endpoint currently parses as.
         other_endpoint: The referent at the edge's other end, or ``None``.
     """
@@ -1862,9 +1917,22 @@ def _unresolvable_reason(
             f'({[c.node_name for c in candidates]}) and the edge fact does not '
             'discriminate between them; recorded, not guessed at'
         )
-    # Zero candidates. The pool is non-empty by construction whenever
-    # `referents` is (and the caller no-ops on an empty set), so it can only
-    # empty out by one of the two subtractions below.
+    # Zero candidates. Either `_candidate_pool` returned nothing (the
+    # corroboration branch below), or one of the two subtractions emptied it.
+    #
+    # Ordered FIRST among the zero-candidate branches because corroboration is
+    # the most specific thing that can be said about a finding: when the fact
+    # names the endpoint, "there was no target" is true but uninformative, and
+    # "the fact says this edge belongs where it is" is the reason an operator
+    # (and leaf eta) actually needs. It also cannot be inferred from `pool`,
+    # which the guard deliberately empties.
+    if endpoint in cited:
+        return (
+            f"the edge's own fact cites {endpoint.node_name!r}, the endpoint it "
+            'landed on, which corroborates the current attachment; the declared '
+            'referent set is not evidence for repointing it, so this is '
+            'recorded, not repaired'
+        )
     if endpoint in pool:
         return (
             f'the only candidate target {endpoint.node_name!r} is the node this '
@@ -3224,6 +3292,14 @@ class MemoryService:
                 # from EITHER arm. It is retained deliberately as a structural
                 # invariant at the single site that decides targets, so a future
                 # third check cannot reintroduce a self-targeting repair.
+                #
+                # The MEMBERSHIP arm carries the SAME fail-closed principle, but
+                # one layer down, in `_candidate_pool`: a fact that cites the
+                # endpoint it landed on corroborates that attachment, so it never
+                # falls back to the declared set for a target. That guard lives
+                # with the evidence rule rather than here so both arms read ONE
+                # site (INV-5) — see `_candidate_pool` for why the dominant
+                # `source='metadata'` write shape depends on it.
                 if endpoint_referent not in referent_set:
                     check = 'set-membership'
                 elif cited_declared and endpoint_referent not in cited:
@@ -3252,7 +3328,9 @@ class MemoryService:
                         candidates,
                         pool=_candidate_pool(
                             referents=referent_set, cited=cited,
+                            endpoint=endpoint_referent,
                         ),
+                        cited=cited,
                         endpoint=endpoint_referent,
                         other_endpoint=other_referent,
                     ),

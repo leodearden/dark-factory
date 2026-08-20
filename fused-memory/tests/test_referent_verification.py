@@ -1006,6 +1006,43 @@ class TestCandidateTargetSelection:
         ) == (Referent(number='10'), Referent(number='11'))
 
 
+    def test_a_fact_citing_the_endpoint_corroborates_it_and_nominates_nothing(self):
+        """The dominant `source='metadata'` write shape, which the whole-set
+        fallback used to turn into a repair instruction.
+
+        `resolve_referents` derives `source='metadata'` from the write's ambient
+        `task_id`, and its own docstring names this shape as legitimate and
+        deliberately NOT a conflict: "An agent working on task 3668 legitimately
+        writes memories about Task 2500". The edge's fact NAMES `Task 2500`, the
+        node it landed on — the strongest possible evidence the attachment is
+        CORRECT — so the declared set {3668} must not be mined for a target.
+        """
+        from fused_memory.services.memory_service import _candidate_targets
+
+        assert _candidate_targets(
+            referents=frozenset({Referent(number='3668')}),
+            cited=frozenset({Referent(number='2500')}),
+            endpoint=Referent(number='2500'),
+            other_endpoint=None,
+        ) == ()
+
+    def test_corroboration_only_suppresses_the_fallback_never_a_real_citation(self):
+        """The guard is scoped to the whole-set FALLBACK.
+
+        Mode (iii) keeps working: a fact citing BOTH the endpoint and another
+        DECLARED referent still resolves through the intersection, because the
+        intersection is non-empty and is reached before the guard.
+        """
+        from fused_memory.services.memory_service import _candidate_targets
+
+        assert _candidate_targets(
+            referents=frozenset({Referent(number='3074'), Referent(number='3075')}),
+            cited=frozenset({Referent(number='3074'), Referent(number='3075')}),
+            endpoint=Referent(number='3074'),
+            other_endpoint=None,
+        ) == (Referent(number='3075'),)
+
+
 class TestUnresolvableReason:
     """"Recorded and left alone" must stay legible as a REASON, not an absence.
 
@@ -1018,6 +1055,7 @@ class TestUnresolvableReason:
 
         reason = _unresolvable_reason(
             (Referent(number='10'), Referent(number='11')),
+            cited=frozenset(),
             pool=frozenset({Referent(number='10'), Referent(number='11')}),
             endpoint=Referent(number='99'),
             other_endpoint=None,
@@ -1032,6 +1070,7 @@ class TestUnresolvableReason:
 
         reason = _unresolvable_reason(
             (),
+            cited=frozenset(),
             pool=frozenset({Referent(number='3074')}),
             endpoint=Referent(number='3074'),
             other_endpoint=None,
@@ -1047,6 +1086,7 @@ class TestUnresolvableReason:
 
         reason = _unresolvable_reason(
             (),
+            cited=frozenset(),
             pool=frozenset({Referent(number='2519')}),
             endpoint=Referent(number='2520'),
             other_endpoint=Referent(number='2519'),
@@ -1059,11 +1099,11 @@ class TestUnresolvableReason:
         from fused_memory.services.memory_service import _unresolvable_reason
 
         already_attached = _unresolvable_reason(
-            (), pool=frozenset({Referent(number='3074')}),
+            (), cited=frozenset(), pool=frozenset({Referent(number='3074')}),
             endpoint=Referent(number='3074'), other_endpoint=None,
         )
         self_loop = _unresolvable_reason(
-            (), pool=frozenset({Referent(number='2519')}),
+            (), cited=frozenset(), pool=frozenset({Referent(number='2519')}),
             endpoint=Referent(number='2520'),
             other_endpoint=Referent(number='2519'),
         )
@@ -1078,12 +1118,115 @@ class TestUnresolvableReason:
 
         reason = _unresolvable_reason(
             (),
+            cited=frozenset(),
             pool=frozenset({Referent(number='3074'), Referent(number='3075')}),
             endpoint=Referent(number='3074'),
             other_endpoint=Referent(number='3075'),
         )
 
         assert 'already' in reason
+
+
+    def test_a_corroborated_endpoint_says_so_rather_than_reporting_an_absence(self):
+        """"The fact names the node it landed on" is the reason an operator and
+        leaf eta need; it cannot be inferred from the pool, which the guard
+        deliberately empties."""
+        from fused_memory.services.memory_service import _unresolvable_reason
+
+        reason = _unresolvable_reason(
+            (),
+            cited=frozenset({Referent(number='2500')}),
+            pool=frozenset(),
+            endpoint=Referent(number='2500'),
+            other_endpoint=Referent(number='3668'),
+        )
+
+        assert 'Task 2500' in reason
+        assert 'cites' in reason
+        # The self-loop branch must not win: BOTH conditions hold here, and
+        # corroboration is the more specific — and the actionable — one.
+        assert 'self-loop' not in reason
+
+
+class TestCorroboratedEndpointIsNeverRepointed:
+    """A fact that names the node its edge landed on is evidence FOR it.
+
+    Regression for the reviewed defect: the membership arm marked such a finding
+    `resolvable=True` and nominated the write's ambient task as the repair
+    target, so leaf eta would have repointed a CORRECT edge — the very
+    misattribution this PRD exists to prevent.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_metadata_source_shape_is_recorded_but_never_resolvable(
+        self, service,
+    ):
+        """referents={3668} from the ambient task_id; the edge is about 2500."""
+        result = _episode(
+            edges=[_edge('e1', fact='Task 2500 was completed by the merge worker',
+                         source='n-2500', target='n-worker')],
+            nodes=[MockNode(name='Task 2500', uuid='n-2500'),
+                   MockNode(name='merge worker', uuid='n-worker')],
+        )
+
+        stats = await service._verify_episode_referents(
+            result, group_id='dark_factory', referents=(Referent(number='3668'),),
+        )
+
+        assert len(stats.findings) == 1
+        finding = stats.findings[0]
+        assert finding.check == 'set-membership'
+        assert finding.endpoint_referent == Referent(number='2500')
+        # The three fields leaf eta reads before acting. All fail-closed.
+        assert finding.resolvable is False
+        assert finding.intended_referent is None
+        assert finding.new_endpoint_uuid is None
+        assert 'Task 2500' in finding.reason
+        assert stats.unresolvable_findings == 1
+        assert service._referent_finding_counts['unresolvable'] == 1
+        assert_never_repaired(service)
+
+    @pytest.mark.asyncio
+    async def test_no_node_lookup_is_issued_for_a_corroborated_finding(self, service):
+        """`intended_referent is None` short-circuits the second pass, so the
+        corroborated row costs ZERO extra queries inside the identity lock."""
+        result = _episode(
+            edges=[_edge('e1', fact='Task 2500 was completed by the merge worker',
+                         source='n-2500', target='n-worker')],
+            nodes=[MockNode(name='Task 2500', uuid='n-2500'),
+                   MockNode(name='merge worker', uuid='n-worker')],
+        )
+
+        await service._verify_episode_referents(
+            result, group_id='dark_factory', referents=(Referent(number='3668'),),
+        )
+
+        service.graphiti.get_nodes_by_exact_name.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_an_uncorroborated_endpoint_on_the_same_shape_still_resolves(
+        self, service,
+    ):
+        """The guard is narrow: it fires only when the fact cites the ENDPOINT.
+
+        Same referent set, same arm — but the fact names a DIFFERENT task than
+        the node the edge landed on, so the declared-set fallback still supplies
+        the repair target. This is the five-PRD-case signature.
+        """
+        result = _episode(
+            edges=[_edge('e1', fact='Task 2500 was completed by the merge worker',
+                         source='n-2501', target='n-worker')],
+            nodes=[MockNode(name='Task 2501', uuid='n-2501'),
+                   MockNode(name='merge worker', uuid='n-worker')],
+        )
+
+        stats = await service._verify_episode_referents(
+            result, group_id='dark_factory', referents=(Referent(number='3668'),),
+        )
+
+        assert len(stats.findings) == 1
+        assert stats.findings[0].resolvable is True
+        assert stats.findings[0].intended_referent == Referent(number='3668')
 
 
 def _rows(*uuids) -> list[dict]:
