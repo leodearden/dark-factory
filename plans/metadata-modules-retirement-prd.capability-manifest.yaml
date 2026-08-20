@@ -1,101 +1,119 @@
 # Machine-readable twin of metadata-modules-retirement-prd.capability-manifest.md
-# Schema: shared/src/shared/capability_manifest.py (CapabilityManifestDoc);
-# field reference plans/capability-delivered-checks-prd.md §Contract.
-# task_id values stamped by commit_planning at decompose.
+# Schema: shared/src/shared/capability_manifest.py (CapabilityManifestDoc).
+# task_ids stamped by commit_planning 2026-08-20 (α→4527, β→4528, ε→4529).
 prd: plans/metadata-modules-retirement-prd.md
 schema_version: 1
 tasks:
-  - label: "α"
-    task_id: null
-    title: "Sweep the metadata.modules template sites in skills/ to sparse metadata.files"
-    capabilities:
-      - name: "post-sweep-modules-key-absent"
-        binding: "rejection-style absence — the swept templates no longer carry the quoted modules key (escalation-watcher/SKILL.md excluded: DF 3465 owns its remaining lines)"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "\"modules\""
-          paths:
-            - "skills/prd/references/decompose-mode.md"
-            - "skills/orchestrate/SKILL.md"
-            - "skills/unblock/SKILL.md"
-            - "skills/review/references/phase3-triage.md"
-          expect: absent
-      - name: "files-template-declared"
-        binding: "capability→producer — the decompose template declares a sparse files key"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "\"files\""
-          paths: ["skills/prd/references/decompose-mode.md"]
-          expect: present
-      - name: "escalation-watcher-template-swept"
-        binding: "manual — same file also carries DF 3465's recipe lines until 3465 lands, so a whole-file absence grep would false-fail"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "verify skills/escalation-watcher/SKILL.md's ticket template (~:1061) declares files not modules; the :981-988 recipe lines are DF 3465's scope"
-  - label: "β"
-    task_id: null
-    title: "Fix the migration's copy branch and run it across the seven corpora"
-    capabilities:
-      - name: "copy-branch-sanitized"
-        binding: "capability→producer (β itself) — sanitize logic and branch tests exist"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "sanitize"
-          paths:
-            - "scripts/migrate_metadata_modules_to_files.py"
-            - "tests/scripts/test_migrate_metadata_modules_to_files.py"
-          expect: present
-      - name: "directory-reject-gate-substrate"
-        binding: "capability→producer (wired) — _reject_directory_locks_in_update_metadata in task_interceptor.py (~:4450 at eba215060c), the collision being fixed"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "_reject_directory_locks_in_update_metadata"
-          paths: ["fused-memory/src/fused_memory/"]
-          expect: present
-      - name: "fleet-run-executed"
-        binding: "operational — per-project before/after counts in the PR; --dry-run re-run reports zero actions"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "live-run evidence lives in the PR body and the dry-run output, not the tree"
-  - label: "ε"
-    task_id: null
-    title: "Drop modules from the path-guard tuple, reject it on new submissions, annotate it retired"
-    capabilities:
-      - name: "attestation-tuple-dropped"
-        binding: "rejection-style absence — the three-key tuple at task_interceptor.py:1666 (verified consumed at every submit) no longer names modules"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "\\('files', 'files_to_modify', 'modules'\\)"
-          paths: ["fused-memory/src/fused_memory/middleware/"]
-          expect: absent
-      - name: "retired-key-rejection-built"
-        binding: "rejection-mechanism (G6 branch 4) — ε builds the guard and its test observes it fire; precedent lock_charter_error at the same boundary"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "retired_key_modules_error"
-          paths: ["fused-memory/src/fused_memory/"]
-          expect: present
-      - name: "rejection-observed-in-tests"
-        binding: "rejection-mechanism — the test names the error and asserts it fires on a modules-carrying submission"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "retired_key_modules_error"
-          paths: ["fused-memory/tests/"]
-          expect: present
-      - name: "blessing-annotated-retired"
-        binding: "capability→producer — Tier-A entry stays, gains the retired-historical comment (origin_finding_id shape)"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "retired 2026-08"
-          paths: ["shared/src/shared/task_metadata.py"]
-          expect: present
+- label: α
+  task_id: 4527
+  title: Sweep the metadata.modules template sites in skills/ to sparse metadata.files
+  capabilities:
+  - name: post-sweep-modules-key-absent
+    binding: 'rejection-style absence — the swept templates no longer carry the quoted
+      modules key (escalation-watcher/SKILL.md excluded: DF 3465 owns its remaining
+      lines)'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '"modules"'
+      paths:
+      - skills/prd/references/decompose-mode.md
+      - skills/orchestrate/SKILL.md
+      - skills/unblock/SKILL.md
+      - skills/review/references/phase3-triage.md
+      expect: absent
+  - name: files-template-declared
+    binding: capability→producer — the decompose template declares a sparse files
+      key
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '"files"'
+      paths:
+      - skills/prd/references/decompose-mode.md
+      expect: present
+  - name: escalation-watcher-template-swept
+    binding: manual — same file also carries DF 3465's recipe lines until 3465 lands,
+      so a whole-file absence grep would false-fail
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: verify skills/escalation-watcher/SKILL.md's ticket template (~:1061)
+        declares files not modules; the :981-988 recipe lines are DF 3465's scope
+- label: β
+  task_id: 4528
+  title: Fix the migration's copy branch and run it across the seven corpora
+  capabilities:
+  - name: copy-branch-sanitized
+    binding: capability→producer (β itself) — sanitize logic and branch tests exist
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: sanitize
+      paths:
+      - scripts/migrate_metadata_modules_to_files.py
+      - tests/scripts/test_migrate_metadata_modules_to_files.py
+      expect: present
+  - name: directory-reject-gate-substrate
+    binding: capability→producer (wired) — _reject_directory_locks_in_update_metadata
+      in task_interceptor.py (~:4450 at eba215060c), the collision being fixed
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: _reject_directory_locks_in_update_metadata
+      paths:
+      - fused-memory/src/fused_memory/
+      expect: present
+  - name: fleet-run-executed
+    binding: operational — per-project before/after counts in the PR; --dry-run re-run
+      reports zero actions
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: live-run evidence lives in the PR body and the dry-run output, not the
+        tree
+- label: ε
+  task_id: 4529
+  title: Drop modules from the path-guard tuple, reject it on new submissions, annotate
+    it retired
+  capabilities:
+  - name: attestation-tuple-dropped
+    binding: rejection-style absence — the three-key tuple at task_interceptor.py:1666
+      (verified consumed at every submit) no longer names modules
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: \('files', 'files_to_modify', 'modules'\)
+      paths:
+      - fused-memory/src/fused_memory/middleware/
+      expect: absent
+  - name: retired-key-rejection-built
+    binding: rejection-mechanism (G6 branch 4) — ε builds the guard and its test observes
+      it fire; precedent lock_charter_error at the same boundary
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: retired_key_modules_error
+      paths:
+      - fused-memory/src/fused_memory/
+      expect: present
+  - name: rejection-observed-in-tests
+    binding: rejection-mechanism — the test names the error and asserts it fires on
+      a modules-carrying submission
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: retired_key_modules_error
+      paths:
+      - fused-memory/tests/
+      expect: present
+  - name: blessing-annotated-retired
+    binding: capability→producer — Tier-A entry stays, gains the retired-historical
+      comment (origin_finding_id shape)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: retired 2026-08
+      paths:
+      - shared/src/shared/task_metadata.py
+      expect: present
