@@ -57,7 +57,17 @@ Same contract, same reasons, as ``_task_db_scan.py:93-103``.
 """
 from __future__ import annotations
 
+import json
+import sqlite3
 from typing import NamedTuple
+
+# The audit owns the defensive JSON decoders. ``_coerce_file_list`` is
+# imported rather than re-implemented so the census's notion of "this
+# record's current scope" is BYTE-IDENTICAL to the audit's and the repair's
+# — the three scripts can then never disagree about the same record (INV-5).
+# Precedent for importing audit internals including underscore names:
+# repair_wiped_metadata_files.py:65-74.
+from audit_wiped_metadata_files import _coerce_file_list
 
 # The terminal allowlist is IMPORTED, never re-spelled. The census exists to
 # tell the repair which non-terminal records it is currently blind to (the
@@ -137,6 +147,22 @@ class Classification(NamedTuple):
     wipe_signature: str
     reconciled_by: ScopeEvidence
     preceded_by: ScopeEvidence
+
+
+class StampedRecord(NamedTuple):
+    """One task record carrying ``metadata.files_tagged_at``, as stored.
+
+    ``metadata_files`` is the record's CURRENT scope — for a never-reconciled
+    record that is still the tagger's guess, which is the whole reason it is
+    reported. An empty tuple is a real and common shape (the reify-5632 case),
+    not an error.
+    """
+
+    tag: str
+    task_id: int
+    status: str
+    files_tagged_at: str
+    metadata_files: tuple[str, ...]
 
 
 class CensusRecord(NamedTuple):
@@ -227,3 +253,64 @@ def classify_record(
         reconciled_by=reconciled_by,
         preceded_by=preceded_by,
     )
+
+
+# ---------------------------------------------------------------------------
+# Corpus readers. Every connection below is mode=ro; see the module docstring.
+# ---------------------------------------------------------------------------
+
+
+def _connect_readonly(path: str) -> sqlite3.Connection:
+    """Open *path* through a read-only SQLite URI.
+
+    The IDENTICAL spelling as audit_wiped_metadata_files.load_task_records:492.
+    Kept as a single named helper so every corpus connection this module opens
+    is provably the same one, and so the "cannot write" property is testable
+    against the opener itself rather than re-asserted per call site.
+    """
+    return sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+
+
+def load_stamped_records(tasks_db_path: str) -> dict[tuple[str, int], StampedRecord]:
+    """Load every task carrying a truthy ``metadata.files_tagged_at``.
+
+    Keyed by the full ``(tag, id)`` primary key: the live corpora use a single
+    ``master`` tag, but the schema permits the same numeric id under two tags
+    and collapsing them would silently merge two distinct tasks.
+
+    A row whose ``metadata`` is NULL, malformed JSON, a non-dict payload, or
+    carries no/empty ``files_tagged_at`` is SKIPPED rather than raising: one
+    corrupt row must never abort a sweep over 12,000+ records. That is the same
+    defensive posture ``_decode_files`` takes on the audit side.
+
+    Only the stamp itself is decoded here, not the scope — the scope goes
+    through the audit's imported ``_coerce_file_list`` so a wrong-typed or
+    empty ``files`` degrades to an empty tuple exactly as it does for the audit
+    and the repair.
+    """
+    records: dict[tuple[str, int], StampedRecord] = {}
+    conn = _connect_readonly(tasks_db_path)
+    try:
+        cursor = conn.execute("SELECT tag, id, status, metadata FROM tasks")
+        for tag, task_id, status, metadata in cursor:
+            if not metadata or not isinstance(metadata, (str, bytes)):
+                continue
+            try:
+                payload = json.loads(metadata)
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            stamp = payload.get("files_tagged_at")
+            if not stamp or not isinstance(stamp, str):
+                continue
+            records[(tag, task_id)] = StampedRecord(
+                tag=tag,
+                task_id=task_id,
+                status=status,
+                files_tagged_at=stamp,
+                metadata_files=_coerce_file_list(payload.get("files")),
+            )
+    finally:
+        conn.close()
+    return records
