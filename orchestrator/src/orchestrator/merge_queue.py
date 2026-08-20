@@ -2379,6 +2379,50 @@ async def _build_attempt0_payload(
     )
 
 
+def _merge_boundary_module_configs(
+    config: OrchestratorConfig,
+    module_configs: list[ModuleConfig],
+) -> list[ModuleConfig]:
+    """The effective merge module set for a merge REQUEST — γ's widening, with
+    the zero-module task deliberately left exactly where it already was.
+
+    A thin wrapper over :func:`verify_plan.effective_merge_module_configs`
+    (the ONE implementation of "which modules does a merge-role verify
+    cover?", INV-5) carrying the single policy that belongs to the merge
+    boundary rather than to the breadth knob: an EMPTY passed set is never
+    widened.
+
+    WHY (reviewer amendment, task 3787 γ). A task with no assigned modules —
+    ``WorkflowRunner._resolve_module_configs`` returns ``[]`` whenever
+    ``self.modules`` is empty, i.e. docs-only and root-file tasks — is
+    verified today, even at breadth='full', through the GLOBAL fallback on
+    BOTH legs: ``build_merge_verify_spec`` sources ``global_verify_command``
+    precisely because the projected set is empty (INV-1, task 2883), and
+    ``run_scoped_verification``'s own widening sits INSIDE its ``if
+    module_configs:`` guard, so an empty set falls through to
+    ``_derive_fallback_runs``. Widening ``[]`` to the whole registry here
+    would silently re-point both of those legs at a per-module full-suite
+    fan-out (and ``_run_unscoped_typechecks`` at every registered module) — a
+    materially different, untested gate for the lightest merges, on a live
+    config that sets breadth='full' with 9 modules registered. γ's mandate is
+    to make the suppression gate map node-ids against the set that ACTUALLY
+    RAN; it is not to change what runs.
+
+    So this guard MIRRORS ``run_scoped_verification``'s ``if module_configs:``
+    guard: the boundary widens exactly where that site would have, and is the
+    identity otherwise. Whether breadth='full' OUGHT to cover the whole
+    registry for a zero-module task is a real question — but a pre-existing
+    one, and answering it is not γ's job.
+
+    The shared helper's own contract is deliberately NOT changed: its other
+    caller, ``run_scoped_verification``'s force_workspace branch (verify.py
+    site A), widened an empty passed set before γ and must keep doing so.
+    """
+    if not module_configs:
+        return module_configs
+    return effective_merge_module_configs(config, module_configs)
+
+
 async def _run_post_merge_verify(
     git_ops: GitOps,
     req: MergeRequest,
@@ -2572,19 +2616,37 @@ async def _run_post_merge_verify(
     # deliberately keeps using the task-scoped set: that probe is not the
     # merge gate).
     #
+    # ZERO-MODULE TASK: an EMPTY req.module_configs is deliberately NOT
+    # widened. That is this boundary's own policy, not the breadth helper's —
+    # _merge_boundary_module_configs' docstring carries the reasoning (both
+    # legs keep today's global-command fallback for a task with no assigned
+    # modules, exactly as before γ).
+    #
     # ACCEPTED CONSEQUENCE: under breadth='full' this also widens
     # _run_unscoped_typechecks (LocalRunner's fourth consumer of this set) to
-    # every registered module. That is semantically correct under the knob and
-    # introduces NO new red — the scoped leg's _derive_full_suite_runs already
-    # runs each registered module's pyright FULL_SUITE, so anything the
-    # widened unscoped gate could catch is already caught — but it does
-    # duplicate pyright across the registry per merge (concurrently, so
-    # wall-clock is the slowest module rather than the sum). Splitting the set
-    # inside LocalRunner to dodge this would reintroduce exactly the
-    # two-sites-must-agree drift §8.2 exists to remove, so the widening is
-    # accepted here and the pre-existing duplication is tracked as a separate
-    # follow-up.
-    effective_module_configs = effective_merge_module_configs(
+    # every registered module. That is semantically correct under the knob,
+    # and for a SOURCE-BEARING diff it introduces no new red: the scoped leg
+    # reaches derive_verify_plan's merge_full fork, whose
+    # _derive_full_suite_runs already runs each registered module's pyright
+    # FULL_SUITE, so anything the widened unscoped gate could catch is caught
+    # there first. It does duplicate that pyright across the registry per
+    # merge (concurrently, so wall-clock is the slowest module rather than the
+    # sum).
+    #
+    # That claim is NARROWER than it first reads, and the gap is stated here
+    # rather than glossed: for a diff with NO source files derive_verify_plan
+    # returns the TRIVIAL plan (its _has_source_files early return) BEFORE
+    # that fork, so no per-module pyright runs at all, the scoped leg passes
+    # trivially, and the widened unscoped gate is then the ONLY pyright that
+    # runs — over the whole registry where it previously covered just the
+    # task's own modules. A PRE-EXISTING pyright break in a registered but
+    # untouched module can therefore newly block such a merge. Accepted
+    # deliberately: splitting the set inside LocalRunner to dodge it would
+    # reintroduce exactly the two-sites-must-agree drift §8.2 exists to
+    # remove. Both this exposure and the duplicated pyright above are tracked
+    # as follow-up ticket tkt_0RSNVTEKHFD8D2PMDY1QQGHQ4E (filed from γ's
+    # amendment pass; the curator resolves it to a task id asynchronously).
+    effective_module_configs = _merge_boundary_module_configs(
         req.config, req.module_configs,
     )
 
@@ -2624,14 +2686,22 @@ async def _run_post_merge_verify(
     # CONSTRUCTION, from one resolution at the top of this function, rather
     # than by an assertion that two sites independently agree.
     #
-    # INV-1 interaction (checked): build_merge_verify_spec sources
-    # `global_verify_command` ONLY when the projected set is empty. The
-    # effective set is never SMALLER than the passed set (it is the full
-    # registry, or the passed set unchanged), so a previously-non-empty spec
-    # can never become empty here and that zero-module fallback is unaffected;
-    # a genuinely zero-module project (empty registry AND empty
-    # req.module_configs) still degrades to the global-command spec exactly as
-    # today.
+    # INV-1 interaction (checked, then re-checked in γ's amendment pass):
+    # build_merge_verify_spec sources `global_verify_command` ONLY when the
+    # projected set is empty. Two directions to keep straight, because they
+    # are NOT symmetric and only the first was reasoned about originally:
+    #   - non-empty -> non-empty. The effective set is never SMALLER than the
+    #     passed set (it is the full registry, or the passed set unchanged),
+    #     so a previously-non-empty spec can never become empty here.
+    #   - EMPTY -> EMPTY, and this is the case a POPULATED registry would
+    #     otherwise flip: widening [] to the whole registry would turn a spec
+    #     of `verify_commands=(), global_verify_command=<live globals>` into
+    #     per-module commands with global_verify_command=None, replacing the
+    #     zero-module task's entire gate as a side effect.
+    #     _merge_boundary_module_configs does not widen an empty passed set, so
+    #     the fallback holds for an empty registry AND for a populated one.
+    #     Pinned by test_merge_boundary_effective_module_configs.py::
+    #     TestMergeBoundaryLeavesTheZeroModuleTaskAlone.
     spec = build_merge_verify_spec(req.config, effective_module_configs, task_files_tuple)
 
     # narrowed (task 2835) tracks whether THIS call actually applied a
@@ -18894,11 +18964,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             return LocalRunner(
                 _item_for_factory.merge_wt,
                 _req_for_factory.config,
-                # Same γ resolution as the merge boundary (PRD §8.2): keep this
-                # slot/health placeholder consistent with the runner that
+                # Same γ resolution as the merge boundary (PRD §8.2), through
+                # the SAME wrapper so the zero-module policy matches too: keep
+                # this slot/health placeholder consistent with the runner that
                 # actually drives the verify, so the two can never disagree
                 # about which modules a merge covers.
-                effective_merge_module_configs(
+                _merge_boundary_module_configs(
                     _req_for_factory.config, _req_for_factory.module_configs,
                 ),
                 None,   # task_files — derived inside _run_post_merge_verify

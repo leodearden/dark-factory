@@ -414,6 +414,9 @@ class TestMergeBoundarySuppressionControls:
 # local ≡ remote BY CONSTRUCTION (PRD §8.2 ordering invariant, INV-5)
 # ---------------------------------------------------------------------------
 
+_GLOBAL_TEST_COMMAND = 'uv run pytest tests/'
+_GLOBAL_TYPECHECK_COMMAND = 'uv run pyright src/'
+
 
 async def _capture_boundary_consumers(
     tmp_path: Path,
@@ -422,6 +425,7 @@ async def _capture_boundary_consumers(
     breadth: Literal['scoped', 'full'],
     registry: dict[str, ModuleConfig],
     touched: list[ModuleConfig],
+    global_commands: bool = False,
 ) -> dict:
     """Drive ``_run_post_merge_verify`` and capture what each consumer of the
     module set actually RECEIVED.
@@ -433,12 +437,23 @@ async def _capture_boundary_consumers(
     dispatch`` is stubbed to a pass so the run completes without executing
     anything.
 
+    ``global_commands=True`` additionally gives the config LIVE global
+    commands, which is what makes INV-1's zero-module ``global_verify_command``
+    fallback observable at all (see the empty-set class below).
+
     Returns ``{'spec_arg', 'spec', 'local_args', 'config', 'merge_wt'}``.
     """
     from orchestrator import merge_queue as merge_queue_module
 
     config = _make_config(tmp_path, merge_verify_breadth=breadth)
     config._module_configs = dict(registry)
+    if global_commands:
+        # INV-1 (task 2883): build_merge_verify_spec only sources
+        # `global_verify_command` when the LIVE config actually has global
+        # commands to source, so the zero-module fallback is unobservable
+        # without these — the assertion would pass vacuously on None.
+        config.test_command = _GLOBAL_TEST_COMMAND
+        config.type_check_command = _GLOBAL_TYPECHECK_COMMAND
 
     git_ops = _make_git_ops(tmp_path)
 
@@ -638,3 +653,174 @@ class TestMergeBoundaryShipsOneEffectiveSetToBothConsumers:
 
         assert _prefixes(captured['spec_arg']) == ['alpha']
         assert _prefixes(captured['local_args'][0]) == ['alpha']
+
+
+# ---------------------------------------------------------------------------
+# amendment (reviewer suggestion 1): the ZERO-MODULE task keeps today's gate
+# ---------------------------------------------------------------------------
+
+
+class TestMergeBoundaryLeavesTheZeroModuleTaskAlone:
+    """An EMPTY ``req.module_configs`` is NOT widened, even at breadth='full'
+    with a populated registry.
+
+    ``WorkflowRunner._resolve_module_configs`` returns ``[]`` whenever the task
+    has no assigned modules — docs-only and root-file tasks — and this repo's
+    live config sets ``merge_verify_breadth: "full"`` over 9 registered
+    modules, so this is a LIVE path, not a corner case. Widening ``[]`` to the
+    registry would silently replace such a task's whole gate: the wire spec
+    would flip from INV-1's global-command fallback (task 2883) to per-module
+    commands with ``global_verify_command=None``, the scoped leg would leave
+    ``_derive_fallback_runs`` for a per-module full-suite fan-out, and
+    ``_run_unscoped_typechecks`` would cover every registered module.
+
+    γ's mandate is to make the suppression gate map node-ids against the set
+    that ACTUALLY RAN — not to change what runs. So the boundary mirrors
+    ``run_scoped_verification``'s own ``if module_configs:`` guard and this
+    class pins that: the widening applies exactly where it applied before,
+    and the zero-module task is left where it already was.
+    """
+
+    @staticmethod
+    def _three_module_registry():
+        mc_a = _module_config('alpha')
+        mc_b = _module_config('beta')
+        mc_g = _module_config('gamma')
+        return mc_a, mc_b, mc_g, {'alpha': mc_a, 'beta': mc_b, 'gamma': mc_g}
+
+    @pytest.mark.asyncio
+    async def test_empty_passed_set_reaches_both_consumers_unwidened(
+        self, tmp_path: Path,
+    ):
+        """breadth='full' + POPULATED registry + no assigned modules: both the
+        spec leg and the local runner still receive the empty set."""
+        _mc_a, _mc_b, _mc_g, registry = self._three_module_registry()
+
+        captured = await _capture_boundary_consumers(
+            tmp_path, task_id='z1', breadth='full',
+            registry=registry, touched=[],
+        )
+
+        assert captured['spec_arg'] == [], (
+            f"the spec leg must not be widened for a zero-module task; got "
+            f"{_prefixes(captured['spec_arg'])!r}"
+        )
+        assert captured['local_args'], 'no LocalRunner was constructed'
+        assert captured['local_args'][0] == [], (
+            f"the local runner must not be widened either; got "
+            f"{_prefixes(captured['local_args'][0])!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_zero_module_spec_still_sources_the_global_verify_command(
+        self, tmp_path: Path,
+    ):
+        """INV-1 preserved with a POPULATED registry — the case the original
+        comment block reasoned about only for an EMPTY registry.
+
+        The spec ships zero per-module commands and the live globals instead,
+        exactly as before γ, so the remote reconstructs the same global gate.
+        """
+        _mc_a, _mc_b, _mc_g, registry = self._three_module_registry()
+
+        captured = await _capture_boundary_consumers(
+            tmp_path, task_id='z2', breadth='full',
+            registry=registry, touched=[], global_commands=True,
+        )
+        spec = captured['spec']
+
+        assert spec.verify_commands == ()
+        assert spec.unscoped_typecheck.commands == ()
+        assert spec.global_verify_command is not None, (
+            'a zero-module spec must carry the live global gate (INV-1, task '
+            '2883), not an empty projection'
+        )
+        assert spec.global_verify_command.test_command == _GLOBAL_TEST_COMMAND
+
+    @pytest.mark.asyncio
+    async def test_non_empty_passed_set_still_widens_at_the_same_breadth(
+        self, tmp_path: Path,
+    ):
+        """The CONTROL that keeps the guard narrow: same config, same registry,
+        one assigned module -> γ's widening still fires on both legs (and the
+        global fallback is correctly NOT sourced). Without this, a guard that
+        disabled the widening outright would pass the two tests above."""
+        mc_a, _mc_b, _mc_g, registry = self._three_module_registry()
+
+        captured = await _capture_boundary_consumers(
+            tmp_path, task_id='z3', breadth='full',
+            registry=registry, touched=[mc_a], global_commands=True,
+        )
+
+        assert _prefixes(captured['spec_arg']) == ['alpha', 'beta', 'gamma']
+        assert _prefixes(captured['local_args'][0]) == ['alpha', 'beta', 'gamma']
+        assert captured['spec'].global_verify_command is None
+
+
+class TestMergeBoundaryModuleConfigsWrapper:
+    """``merge_queue._merge_boundary_module_configs`` — the guard, and nothing
+    but the guard.
+
+    INV-5: the wrapper must DELEGATE the expansion to the one shared
+    ``verify_plan.effective_merge_module_configs`` rather than reimplement it,
+    since a second copy of that expression is exactly the drift PRD §8.2
+    exists to remove. Pinned with a spy that returns a value neither the
+    registry nor the passed set could produce.
+    """
+
+    @staticmethod
+    def _config(tmp_path: Path):
+        config = _make_config(tmp_path, merge_verify_breadth='full')
+        config._module_configs = {'alpha': _module_config('alpha')}
+        return config
+
+    def test_non_empty_passed_set_delegates_to_the_shared_helper(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        from orchestrator import merge_queue as merge_queue_module
+
+        config = self._config(tmp_path)
+        passed = [_module_config('beta')]
+        sentinel = [_module_config('sentinel')]
+        calls: list[tuple] = []
+
+        def _spy(cfg, module_configs):
+            calls.append((cfg, list(module_configs)))
+            return list(sentinel)
+
+        monkeypatch.setattr(
+            merge_queue_module, 'effective_merge_module_configs', _spy,
+        )
+
+        result = merge_queue_module._merge_boundary_module_configs(config, passed)
+
+        assert _prefixes(result) == ['sentinel']
+        assert len(calls) == 1
+        assert calls[0][0] is config
+        assert _prefixes(calls[0][1]) == ['beta']
+
+    def test_empty_passed_set_never_consults_the_helper_at_all(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """Identity, and not even a call: the guard is the boundary's own
+        policy, so the breadth helper's contract stays untouched (its other
+        caller, verify.py's force_workspace branch, still widens an empty
+        passed set exactly as it did before γ)."""
+        from orchestrator import merge_queue as merge_queue_module
+
+        config = self._config(tmp_path)
+        calls: list[tuple] = []
+
+        def _spy(cfg, module_configs):
+            calls.append((cfg, list(module_configs)))
+            return [_module_config('sentinel')]
+
+        monkeypatch.setattr(
+            merge_queue_module, 'effective_merge_module_configs', _spy,
+        )
+
+        passed: list[ModuleConfig] = []
+        result = merge_queue_module._merge_boundary_module_configs(config, passed)
+
+        assert result is passed
+        assert calls == []
