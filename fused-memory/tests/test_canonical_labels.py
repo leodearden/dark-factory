@@ -27,6 +27,13 @@ from fused_memory.utils.canonical_labels import (
     scan_content,
 )
 
+# Unicode decimal digits that ``str.isdigit()`` accepts but ``str.isascii()``
+# does not — spelled by ESCAPE so the fixture survives transport through any
+# tool or terminal that mangles non-ASCII glyphs, and so a reader sees the
+# codepoint rather than a character that renders like an ASCII '3'.
+ARABIC_INDIC_THREE = '\u0663'  # ARABIC-INDIC DIGIT THREE
+FULLWIDTH_THREE = '\uff13'  # FULLWIDTH DIGIT THREE — the same hazard, a second block
+
 
 class TestReferentNodeName:
     """``Referent.node_name`` renders the graph node name the referent denotes.
@@ -402,6 +409,103 @@ class TestScanContentPrecision:
             assert [r.node_name for r in scan_content(content, group_id='reify').refs] == [
                 'Task 1153'
             ], content
+
+
+class TestUnicodeDigitsAreNotTaskNumbers:
+    """A task number is written in ASCII digits. Python's ``re`` matches Unicode
+    decimal digits with ``\\d`` on str patterns, so 'task \\u0663' parsed as a task
+    whose number was that character.
+
+    This is a false POSITIVE against the contract :func:`scan_content` states for
+    itself — PRECISION OVER RECALL, because its consumers perform destructive
+    edge surgery — and it is the OPPOSITE direction from the KNOWN BLIND SPOTS
+    that docstring enumerates (bare-digit names, title references, codename
+    aliases), every one of which is a recall loss. So it is not covered by them:
+    a blind spot silently misses a real referent, while this MINTS one that names
+    nothing.
+
+    The DECLARED path already refuses these — referent_resolution._is_task_number
+    guards its bare-digit branch with ``text.isascii() and text.isdigit()`` (task
+    3668), its docstring saying "a Unicode digit is not a task id". Until this
+    narrowing the DERIVED path minted exactly what the declared path refused; that
+    asymmetry is what these fixtures close, at the one normative site (INV-5)
+    rather than per consumer.
+    """
+
+    @pytest.mark.parametrize(
+        'name',
+        [
+            # Measured RED before the fix: each returned a Referent whose
+            # ``number`` was the Unicode character itself, rendering a
+            # 'Task ٣' node name a destructive consumer would act on.
+            'Task ' + ARABIC_INDIC_THREE,
+            'task#' + ARABIC_INDIC_THREE,
+            'tasks ' + ARABIC_INDIC_THREE,
+            'Task: ' + ARABIC_INDIC_THREE,
+            # A second Unicode block, so the fixture is not pinned to one script.
+            'Task ' + FULLWIDTH_THREE,
+        ],
+    )
+    def test_local_node_name_with_a_unicode_digit_is_not_a_task_label(self, name):
+        assert parse_node_name(name) is None
+
+    def test_a_unicode_digit_mention_yields_no_referent(self):
+        content = 'blocked on task ' + ARABIC_INDIC_THREE + ' for now'
+        scan = scan_content(content, group_id='dark_factory')
+        assert scan.refs == ()
+        assert scan.ambiguous == ()
+
+    @pytest.mark.parametrize(
+        'name',
+        ['Task 12' + ARABIC_INDIC_THREE, 'task #12' + FULLWIDTH_THREE],
+    )
+    def test_a_mixed_run_yields_nothing_rather_than_the_truncated_prefix(self, name):
+        """The sharper case, and the ONLY thing pinning the right-edge lookahead's
+        breadth.
+
+        Before the fix this parsed to Referent(number='12٣') — a mangled number
+        naming no task. Under the WRONG fix — narrowing the '(?!\\d)' lookahead to
+        '(?![0-9])' alongside the capture class — it parses to Referent(number='12'),
+        the TRUNCATED PREFIX that lookahead's own comment says it exists to prevent.
+        That is strictly worse than the bug being fixed: 'Task ٣' is obvious junk,
+        while 'Task 12' is a well-formed name for a REAL node a consumer will
+        happily rename or re-attach edges on. So the capture class narrows and the
+        lookahead deliberately stays broad, and a mixed run matches nothing at all.
+        """
+        assert parse_node_name(name) is None
+
+    def test_a_mixed_run_mention_yields_no_referent(self):
+        """Same guard on the unanchored side, where the truncated prefix would
+        land in ``refs`` and drive the surgery directly."""
+        scan = scan_content('task 12' + ARABIC_INDIC_THREE, group_id='dark_factory')
+        assert scan.refs == ()
+        assert scan.ambiguous == ()
+
+    @pytest.mark.parametrize(
+        ('name', 'expected'),
+        [
+            ('task 132', 'Task 132'),
+            ('tasks 153', 'Task 153'),
+            ('TASK 42', 'Task 42'),
+            ('Task  7', 'Task 7'),
+            (' tasks 9 ', 'Task 9'),
+            ('task #1153', 'Task 1153'),
+            ('task#1153', 'Task 1153'),
+            ('Task: 132', 'Task 132'),
+            ('task 0132', 'Task 0132'),
+        ],
+    )
+    def test_ascii_local_spellings_are_unaffected(self, name, expected):
+        """Regression guard, green BEFORE and AFTER: every ASCII local spelling
+        already parametrized in TestParseNodeNameMatchesLocalForms still parses to
+        the same referent. This is what proves the narrowing is ASCII-only — that
+        it did not disturb the separator alternation, the whitespace padding or
+        the case-insensitivity, none of which this change declares.
+        """
+        referent = parse_node_name(name)
+        assert referent is not None
+        assert referent.project_id == ''
+        assert referent.node_name == expected
 
 
 class TestQualifiedRefNeverSpansALineBreak:
