@@ -10,7 +10,27 @@
 #
 # It never touches lms-arm@ or any real unit, and cleans up on every exit path.
 #
+# WHO RUNS THIS (task 4200).  Until 4200 nothing did: this was the only .sh
+# among 61 pytest modules in scripts/tests/, and pytest collects only
+# `test_*.py`, so the file sat in the tree checked by nobody.  It is now driven
+# by scripts/tests/test_remove_lms_dropin_wrapper.py, which IS collected by the
+# default suite (`pytest ... scripts/tests/`) and so runs on every verify.
+# It remains directly runnable by hand: `scripts/tests/test_remove_lms_dropin.sh`.
+#
+# LMS_SELFTEST_TEMPLATE is a TEST SEAM, not a tuning knob, and it is
+# LOAD-BEARING rather than cosmetic: a run against the DEFAULT template is NOT
+# SAFE TO EXECUTE CONCURRENTLY.  Every instance would write and `rm` the same
+# absolute unit path under the one shared ~/.config/systemd/user, and case 4's
+# `rm -f "$UNIT"` would tear down a sibling run's fixture mid-test.  Measured
+# under task 4200: two concurrent default-template runs BOTH fail
+# deterministically ("drop-in still present after refusal", "template survives
+# the re-run", and a WorkingDirectory resolving to the OTHER run's mktemp dir).
+# The fleet runs max_concurrent_tasks: 48 against one $HOME, so the wrapper
+# passes a unique per-invocation name through this seam.  Three concurrent runs
+# with distinct templates all pass 12/12.
+#
 # Usage: scripts/tests/test_remove_lms_dropin.sh
+#        LMS_SELFTEST_TEMPLATE='lms-dropin-selftest-<unique>@' scripts/tests/test_remove_lms_dropin.sh
 
 set -euo pipefail
 
