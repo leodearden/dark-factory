@@ -15,6 +15,7 @@ Many older test modules still carry their own copy (task 3895 migrates
 them); don't add one (task 3738).
 """
 
+import asyncio
 import os
 import re
 import sys
@@ -66,9 +67,12 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
 
 from _fm_helpers import (  # noqa: E402
+    _leaked_async_httpx_clients,
     pydantic_spec,
+    reap_leaked_async_httpx_clients,
     reap_leaked_ticket_workers,
     resolve_xdist_worker_id,
+    track_async_httpx_clients,
 )
 from df_pytest_isolation import (  # noqa: E402
     _df_deploy_clocks_unwritten,  # noqa: F401  — the binding IS the wiring
@@ -91,8 +95,15 @@ from fused_memory.config.schema import (  # noqa: E402
 
 
 def pytest_configure(config):
-    """Refuse a --basetemp aimed inside a live task worktree (esc-3072-3)."""
+    """Session-start hooks: basetemp safety, and async-httpx leak tracking.
+
+    ``track_async_httpx_clients()`` runs HERE — at session start, before
+    collection — rather than lazily from a fixture, so clients constructed at
+    module import time are tracked too and can be reaped like any other
+    (task 4412).
+    """
     reject_unsafe_basetemp(config)
+    track_async_httpx_clients()
 
 
 @pytest.fixture(scope='session')
@@ -154,6 +165,68 @@ async def _reap_leaked_ticket_workers():
     """
     yield
     await reap_leaked_ticket_workers()
+
+
+# ---------------------------------------------------------------------------
+# Leaked async httpx client drain (task 4412) — TWO autouse arms.
+#
+# DECLARATION ORDER IS LOAD-BEARING: same-scope autouse fixtures are set up in
+# declaration order and torn down in REVERSE, so the sync arm is declared
+# FIRST precisely so the async arm tears down FIRST. Pinned by
+# test_async_httpx_leak_isolation.py::test_sync_reap_fixture_is_declared_before_the_async_one.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _reap_leaked_async_httpx_clients_sync():
+    """Close leaked openai/anthropic httpx clients left behind by a SYNC test.
+
+    Task 4412. ``openai``/``anthropic`` ``AsyncHttpxClientWrapper`` defines a
+    ``__del__`` that, when the object is GC-finalised while some event loop is
+    running, RESURRECTS it as ``create_task(self.aclose())``. That task's
+    ``aclose()`` hits a pool bound to an already-closed loop, raises
+    ``RuntimeError('Event loop is closed')``, and — since nobody retrieves it —
+    ``Task.__del__`` logs ``Task exception was never retrieved`` at ERROR on the
+    root ``asyncio`` logger, landing in whichever unrelated test's ``caplog``
+    window is open. Closing the client first makes ``__del__`` short-circuit on
+    ``if self.is_closed: return``, so the record can never be emitted.
+
+    THIS ARM EXISTS BECAUSE THE LEAK COHORTS ARE MIXED. The async arm below is
+    a ``pytest_asyncio`` fixture and therefore only runs for ``async def``
+    tests, but the largest measured cohort —
+    ``test_graphiti_llm_client_construction.py``'s
+    ``test_returns_openai_client``, 16 of 40 leaked clients — is a plain
+    ``def test_``. Sibling precedents: ``_reap_leaked_ticket_workers`` above
+    (task 2737) and ``orchestrator/tests/conftest.py``'s
+    ``_reap_leaked_aiosqlite_connections`` (task 2413).
+
+    The empty-check comes first so the ~14100-of-14147 tests that leak nothing
+    pay only a WeakSet scan and never spin up an event loop. A sync test's
+    clients never touched a loop, so they have no pool affinity to respect and
+    a throwaway ``asyncio.run`` loop closes them correctly.
+    """
+    yield
+    if not _leaked_async_httpx_clients():
+        return
+    asyncio.run(reap_leaked_async_httpx_clients())
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _reap_leaked_async_httpx_clients():
+    """Close leaked openai/anthropic httpx clients before this test's loop closes.
+
+    Task 4412 — same mechanism as the sync arm above. Declared SECOND so it
+    tears down FIRST: an async test's clients are then closed inside that
+    test's OWN still-open event loop, which is the correct-affinity path for
+    ``test_local_endpoint_base_url_integration.py``, the only measured cohort
+    that performs real I/O. The sync arm afterwards finds nothing left.
+
+    Best-effort and bounded — see ``reap_leaked_async_httpx_clients`` in
+    ``_fm_helpers.py``: it never fails a test, and is a cheap no-op for the
+    vast majority of tests that leak nothing.
+    """
+    yield
+    await reap_leaked_async_httpx_clients()
 
 
 @pytest.fixture
