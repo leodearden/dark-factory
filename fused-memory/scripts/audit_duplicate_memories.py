@@ -648,6 +648,11 @@ def liveness_snapshot_subject_task_ids(record: dict) -> set[str]:
     rather than two. A ``related_task_ids`` that is not a collection degrades
     without raising: a scalar contributes itself, anything else contributes
     nothing. Does not mutate *record*.
+
+    Answers WHICH tasks a record is about. For WHAT each of them is asserted
+    to be — the per-subject core fact this detector actually buckets on — see
+    ``liveness_snapshot_subject_facts``, which takes this function's output as
+    its subject set.
     """
     metadata = record.get('metadata') or {}
     subjects: set[str] = set()
@@ -675,22 +680,42 @@ def liveness_snapshot_subject_task_ids(record: dict) -> set[str]:
 def liveness_snapshot_subject_facts(record: dict, core_fact: str) -> dict[str, str]:
     """WHAT each subject of a liveness snapshot is asserted to be.
 
-    The per-subject sibling of `liveness_snapshot_subject_task_ids`: that one
+    The per-subject sibling of ``liveness_snapshot_subject_task_ids``: that one
     answers WHICH tasks a record is about, this one answers what the record
-    says about each of them, so a multi-task re-verification reporting
-    DIVERGENT values per task joins each subject's own group instead of
-    matching neither.
+    says about each of them. Splits the content into clauses with
+    ``task_filter._CLAUSE_SPLIT_RE``, reads each clause's task refs
+    (``TASK_REF_RE``) and its ``<field>=<value>`` assignments separately, and
+    unions a clause's pairs into every subject that clause NAMES — the
+    technique ``task_filter.find_conflicting_task_status_ids`` uses. A
+    multi-task re-verification reporting DIVERGENT values per task therefore
+    joins each subject's own group instead of matching neither.
+
+    An unreadable CLAUSE cannot poison a key. ``_readable_field_pairs(clause)
+    or set()`` folds "this clause names no field" and "a boundary landed
+    inside a value" into the same nothing-to-contribute outcome, which is sound
+    HERE — though it would not be at record level — because the caller has
+    already put the record through the record-level gate, which returns
+    ``(True, None)`` unless every recognised field in the whole content reads
+    whole. A clause the reader declines is therefore a clause-boundary
+    artifact, never a field this detector failed to see; the subject falls back
+    below rather than keying on a survivors-only fragment.
 
     Args:
-        record: A memory dict already classified as a liveness snapshot.
+        record: A memory dict the caller has already classified as a liveness
+            snapshot.
         core_fact: That record's whole-record key, taken as a PARAMETER rather
-            than re-derived. Calling `extract_liveness_snapshot_fact` here
-            would re-consult the quadratic `POINT_IN_TIME_CHECK_RE` a second
-            time per record, which `TestLivenessDetectorRegexBudget` pins
-            against.
+            than re-derived. Calling ``extract_liveness_snapshot_fact`` here
+            would consult the quadratic ``POINT_IN_TIME_CHECK_RE`` a SECOND
+            time per record, which ``TestLivenessDetectorRegexBudget``'s
+            consult-count pins forbid. It is also what a subject with no
+            clause-scoped evidence keys on.
 
     Returns:
-        ``{subject_task_id: core_fact_for_that_subject}``. Does not mutate
+        ``{subject_task_id: core_fact_asserted_about_it}``, carrying EVERY
+        subject ``liveness_snapshot_subject_task_ids`` resolves — clause-scoped
+        where the record gave clause-level evidence, *core_fact* where it did
+        not. Never drops a subject: the fallback reproduces the pre-rescope key
+        exactly, so this projection can only add recall. Does not mutate
         *record*.
     """
     scoped: dict[str, set[str]] = {}
@@ -783,40 +808,43 @@ def find_liveness_snapshot_recurrences(
 
     A record contributes to one bucket per subject it names, so a
     re-verification covering two tasks joins both their groups — which is
-    exactly how memory 1eef7df7 links to the earlier 94 and 96 snapshots.
+    exactly how memory 1eef7df7 links to the earlier 94 and 96 snapshots. Each
+    of those buckets now carries that subject's OWN fact, not one key shared
+    across every subject the record happens to mention.
 
-    KNOWN LIMITATION, deliberate: the core fact is built ONCE PER RECORD by
-    unioning every assignment in its content, then attributed to every subject
-    that record names. When a multi-task re-verification reports DIVERGENT
-    values per task, that merged key matches neither single-task snapshot and
-    the recurrence goes unreported — pinned, so the behaviour is visible
-    rather than discovered later, by
-    ``test_divergent_per_task_statuses_do_not_group``. The real motivating
-    record (1eef7df7) reports identical values for both its subjects, so the
-    detector fires on the corpus that motivated it; a future divergent one
-    would be a RECALL gap in a report-only path, never a wrong delete.
+    The core fact is keyed PER SUBJECT by ``liveness_snapshot_subject_facts``,
+    which splits the content into clauses with ``task_filter._CLAUSE_SPLIT_RE``
+    and keys each subject on the clause(s) naming it — the technique
+    ``task_filter.find_conflicting_task_status_ids`` uses. A multi-task
+    re-verification reporting DIVERGENT values per task therefore joins each
+    subject's own group, where the earlier whole-record union key matched
+    neither single-task snapshot and the recurrence went unreported. Pinned by
+    ``test_divergent_per_task_statuses_group_per_subject``.
 
-    The limitation above is a deliberate NOT-YET-DONE, not a dead end. Per-
-    subject key scoping — splitting content into per-task clauses with
-    ``task_filter._CLAUSE_SPLIT_RE`` and keying each subject on its own clause,
-    the technique ``task_filter.find_conflicting_task_status_ids`` uses — was
-    genuinely inert when this function was written: ``_CLAUSE_SPLIT_RE`` split
-    on EVERY ``.``, shattering ``dark-factory-orchestrator.yaml`` and
+    A subject with NO clause-scoped evidence falls back to the whole-record
+    union key — the same key it got before the rescope. Three shapes reach
+    that fallback: a ref living only in ``metadata.task_id`` /
+    ``related_task_ids``, a prose ref whose own clause carries no readable
+    assignment (real: subject 99 in 1eef7df7), and a clause boundary landing
+    inside a quoted value. Because the fallback is byte-identical to the prior
+    behaviour, the rescope is monotone — it can only ADD recall, never remove
+    it — which is why it grows no new disclosure counter
+    (``TestLivenessSubjectFactsFallback``).
+
+    This was not viable when the detector was first written: ``_CLAUSE_SPLIT_RE``
+    split on EVERY ``.``, shattering ``dark-factory-orchestrator.yaml`` and
     ``CLAUDE.md:95`` mid-sentence, and the nearby reference is written
     ``task/94``, which ``TASK_REF_RE``'s ``\\s*#?\\s*`` separator did not
-    match. Task 3403 fixed both regexes at the source
-    (``\\.(?!\\w)|[;\\n!?]`` and ``\\s*[#/]?\\s*`` respectively), so the
-    technique is viable now and that evidence no longer argues against it.
-
-    What this function DOES is still the whole-record union key described
-    above, and ``test_divergent_per_task_statuses_do_not_group`` still pins it.
-    The rescope is filed separately (ticket
-    tkt_0RSCGSWBBW66VDBWYSYDQWF9PM) rather than folded into 3403, which was
-    kept to the regexes plus their regression net so a bisect stays
-    unambiguous if the two Graphiti edge-invalidation sweeps that share
-    ``TASK_REF_RE`` misbehave in production. Whoever picks it up should
-    re-measure the clause technique against the four real records rather than
-    assume it now returns non-empty.
+    match — together they returned the EMPTY SET on all four real records.
+    Task 3403 narrowed the dot and widened the separator at the source
+    (``\\.(?!\\w)|[;\\n!?]`` and ``\\s*[#/]?\\s*`` respectively), and this
+    rescope RE-MEASURED the technique against those same four records
+    (6b245659, 08aa0017, 68dd5f93, 1eef7df7) rather than assuming it now
+    returns non-empty: subjects 94 and 96 each key at
+    ``claimant_run_id=null|heartbeat_at=null|status=in-progress`` from their
+    own clauses, so the two real groups survive. That measurement lives in
+    ``TestLivenessSnapshotSubjectFacts``, where a regression in either shared
+    regex fails naming the subject and the fact rather than an absent group.
 
     Args:
         memories: Raw memory list (any/all categories).
