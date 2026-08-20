@@ -47,7 +47,7 @@ class ScrollPageBudgetExhausted(RuntimeError):
 
     The stream is TRUNCATED, so the pager raises rather than ending short —
     a caller that folded a short stream into counters would under-report with
-    no error surface (INV-2 no-silent-fail-soft).
+    no error surface (INV-9 no-silent-fail-soft).
 
     ``scripts/census_memory_metadata.CensusScanIncomplete`` is a module-level
     ALIAS of this class (not a subclass): the census's ``except

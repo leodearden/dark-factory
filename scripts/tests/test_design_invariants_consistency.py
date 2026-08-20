@@ -758,8 +758,10 @@ def near_miss_alias_pairs(
     FILE-LEVEL ANCHORING ON A ``design-invariants.md`` MENTION WAS EVALUATED AND
     REJECTED: it fails in both directions on live data. merge_queue.py mentions
     the doc once across ~15k lines and would false-positive its PRD-local INV-3,
-    while scripts/migrate_transcript_archive_gunzip.py mentions it zero times
-    and its genuine ``INV-3 corroborate-before-destroy`` drift would be missed.
+    while scripts/migrate_transcript_archive_gunzip.py mentioned it zero times
+    and its genuine ``INV-3 corroborate-before-destroy`` drift — repaired by
+    this task, and caught only because the rule looks at the token rather than
+    at the file — would have been missed entirely.
     """
     assert family, (
         "the alias check received an empty invariant family (task 3803) — with "
