@@ -1063,6 +1063,78 @@ class ReapedInteractiveWorktree:
     reason: str
 
 
+@dataclass(frozen=True)
+class CommitEffectProbe:
+    """Result of :meth:`GitOps.describe_commit_effect_in_main` (task 3116).
+
+    The DIAGNOSTIC form of the effect check that
+    :meth:`GitOps.commit_effect_present_in_main` reduces to a bare bool.
+    Both come from ONE implementation — the bool method is a one-line
+    wrapper over this probe's ``present`` — so a verdict and the facts
+    that explain it can never drift apart.
+
+    This exists because the bool alone cost days of misdiagnosis twice:
+    an ``effect_absent`` escalation could say THAT the cited commit's
+    effect was gone but never WHICH path had moved, so a clean landing
+    whose branch merely co-touched a hot shared file read identically to
+    a genuine revert.  Naming the diverged path resolves both reported
+    instances in one line.
+
+    Fields
+    ------
+    present:
+        The verdict — True iff the commit's effect is still present at
+        main HEAD.  Byte-identical in meaning to
+        ``commit_effect_present_in_main``'s return value.
+    diverged_paths:
+        The touched paths that no longer match main HEAD, in git's own
+        order.  Populated only for the ``'paths_diverged'`` failure;
+        empty for every other outcome (including ``present=True``).
+        Paths are resolved with ``-z``/``core.quotePath=false`` and so
+        are byte-faithful — never git's quoted ``caf\\303\\251.py``
+        rendering, which would mislead a human reading the escalation
+        this feeds.
+    anchor_sha:
+        The commit the comparison actually ran against — the commit
+        itself for a non-merge, and for a merge the non-first parent
+        under examination (the FAILING one when a parent fails, the last
+        one checked on success).  Recorded because a merge citation's
+        effect is judged against a parent, not against the sha the
+        caller passed, and an escalation naming paths from the wrong
+        commit is worse than one naming none.  None when resolution
+        failed before any anchor was established.
+    failure:
+        Why ``present`` is False, or None when it is True.  The vocabulary
+        is exhaustive:
+
+        - ``None`` — the effect is present (``present=True``).
+        - ``'paths_diverged'`` — resolution succeeded and at least one
+          touched path differs at main HEAD.  The ONLY code that carries
+          ``diverged_paths``.
+        - ``'unresolvable_commit'`` — ``git rev-list --parents`` errored
+          or returned nothing (e.g. the sha does not resolve).
+        - ``'merge_base_unresolved'`` — a merge parent's ``git merge-base``
+          call errored or returned empty.
+        - ``'touched_enumeration_failed'`` — the touched-set diff
+          (``diff --name-only`` / ``diff-tree``) errored.
+        - ``'empty_branch_merge'`` — a merge parent nets ZERO content
+          against its own fork point, so there is no deliverable to
+          confirm on main.  Fail-safe False, deliberately unlike the
+          non-merge empty-touched-set case, which stays True (task 2500).
+        - ``'diff_failed'`` — the terminal comparison against main errored
+          for a reason other than "paths differ".
+
+        ``'paths_diverged'`` and ``'diff_failed'`` are separated on
+        purpose: the pre-3116 code folded rc==1 (paths genuinely differ)
+        and rc>1 (git errored) into one indistinguishable False even
+        though its own docstring claimed to separate them.
+    """
+    present: bool
+    diverged_paths: tuple[str, ...] = ()
+    anchor_sha: str | None = None
+    failure: str | None = None
+
+
 class ConflictProbe(NamedTuple):
     """Result of merge_tree_conflicts — a lightweight, tuple-destructurable probe.
 
@@ -8962,6 +9034,211 @@ class GitOps:
         )
         return rc == 0
 
+    async def describe_commit_effect_in_main(
+        self, commit_sha: str,
+    ) -> CommitEffectProbe:
+        """Return a :class:`CommitEffectProbe` for *commit_sha* vs main HEAD.
+
+        The single implementation of the FIX 1′ effect check (task 2500 /
+        2675 / 3116).  :meth:`commit_effect_present_in_main` is a one-line
+        wrapper returning this probe's ``present``, so the boolean verdict
+        and the diagnostics that explain it cannot drift apart.
+
+        Companion check to :meth:`is_ancestor` for the found_on_main
+        post-hoc-revert blind spot (task 2500): a cited commit can remain
+        an ancestor of main forever — ancestry is immutable history — even
+        after a LATER commit on main changes exactly the paths it touched.
+        ``is_ancestor`` alone cannot see that the commit's own effect is
+        gone from current HEAD.
+
+        Resolves *commit_sha*'s parents via ``git rev-list --parents -n 1
+        <commit_sha>`` and branches on parent count:
+
+        - **Merge commit** (2+ parents; task 2675 FIX 1′) — the old plain
+          ``diff-tree`` touched-set is empty by git's own default
+          behavior for merge commits, which used to make this primitive
+          return True *unconditionally* for every merge (the task-1175
+          "reverted merge" blind spot: a ``Merge task/1175 into main``
+          marker exists and the merge commit is an ancestor of main
+          forever, but a later commit on main removed the deliverable —
+          effect NOT present, yet the old code said True).  Instead this
+          diffs EVERY non-first parent's (each merged branch's) content
+          against current main, requiring ALL of them to still be present
+          (task 2675 amendment — octopus-merge safety, so a later revert
+          of a third-or-later parent's deliverable cannot silently read
+          as effect-present): for each ``other_parent`` in
+          ``parents[1:]``, ``merge_base = git merge-base <parents[0]>
+          <other_parent>`` (that parent's FORK POINT — stable regardless
+          of later main history; **CRITICAL**: this must be
+          ``merge-base(first_parent, other_parent)``, NOT
+          ``merge-base(main, other_parent)`` — because the merge commit
+          is itself an ancestor of main in the found_on_main scenario,
+          ``merge-base(main, other_parent)`` collapses to
+          ``other_parent`` and yields an empty, useless diff), then
+          ``touched = git -c core.quotePath=false diff --name-only -z
+          <merge_base> <other_parent>`` (the paths that parent introduced
+          since its fork point), and finally which of those paths still
+          differ between ``<other_parent>`` and main.  For an ordinary
+          two-parent merge this is exactly one iteration.
+
+        - **Non-merge commit** (root or single-parent) — UNCHANGED from
+          prior behavior (task 2500): ``touched = git -c
+          core.quotePath=false diff-tree --no-commit-id --name-only -r
+          -z <commit_sha>`` (the commit's own diff against its sole
+          parent) and, when non-empty, which of those paths still differ
+          from main.
+
+        ``anchor_sha`` records WHICH commit the comparison ran against —
+        *commit_sha* itself on the non-merge branch, and on the merge
+        branch the non-first parent under examination: the FAILING parent
+        when one fails (the per-parent check short-circuits on the first
+        failure, so an octopus merge requires EVERY parent to pass), and
+        the LAST parent checked on success.  A merge citation's effect is
+        judged against a parent rather than against the sha the caller
+        passed, and an escalation naming paths from the wrong commit is
+        worse than one naming none.
+
+        The terminal comparison is ``git -c core.quotePath=false diff
+        --name-only -z <anchor> <main> -- <touched...>`` rather than the
+        ``diff --quiet`` this check used before task 3116.  That is a
+        strict fidelity improvement, not just plumbing: ``--quiet``'s
+        ``rc != 0`` folded rc==1 (paths genuinely differ) and rc>1 (git
+        errored) into one indistinguishable False even though the
+        docstring claimed to separate them.  ``'paths_diverged'`` vs
+        ``'diff_failed'`` makes that claim true, and the same call yields
+        the diverged path list for free.
+
+        ``-z`` + ``core.quotePath=false`` together make every path list
+        byte-faithful for any filename, including non-ASCII or
+        newline-containing ones — see the path-quoting caveat on
+        :meth:`branch_content_in_main`, which shares this primitive's
+        underlying merge-base/diff pattern but not yet this hardening.
+        The hardening applies to the OUTPUT parsing as well as the
+        touched-set stage: a git-quoted path rendered into an escalation
+        is a diagnostic that misleads.
+
+        Returns ``present=True`` (path-based revert detection
+        inapplicable) when the commit is non-merge and its own touched-set
+        is empty — a genuinely empty ordinary commit.  This deliberately
+        preserves prior mark-done behavior for that case (task 2500).
+
+        Every other non-present outcome carries a ``failure`` code; see
+        :class:`CommitEffectProbe` for the exhaustive vocabulary and for
+        which codes populate ``diverged_paths``.  The direction is
+        fail-safe throughout — never claim an effect is present on doubt.
+        """
+        rc, parents_out, _ = await _run(
+            ['git', 'rev-list', '--parents', '-n', '1', commit_sha],
+            cwd=self.project_root,
+        )
+        if rc != 0 or not parents_out:
+            return CommitEffectProbe(present=False, failure='unresolvable_commit')
+        parents = parents_out.split()[1:]
+
+        if len(parents) >= 2:
+            # Merge commit (task 2675 FIX 1′): check EVERY non-first
+            # parent's (each merged branch's) content — the paths it
+            # touched since its fork point — against current main HEAD.
+            # For an ordinary two-parent merge this is exactly one
+            # iteration (byte-identical to the original second-parent-only
+            # check); for an octopus merge (3+ parents) ALL parents must
+            # pass, else a later revert of a third-or-later parent's
+            # deliverable would silently read as effect-present (task 2675
+            # amendment — the octopus blind spot).  Touched paths MUST
+            # derive from merge-base(first_parent, other_parent), NOT
+            # merge-base(main, other_parent) — see the docstring above.
+            first_parent = parents[0]
+            for other_parent in parents[1:]:
+                rc, merge_base, _ = await _run(
+                    ['git', 'merge-base', first_parent, other_parent],
+                    cwd=self.project_root,
+                )
+                if rc != 0 or not merge_base:
+                    return CommitEffectProbe(
+                        present=False,
+                        anchor_sha=other_parent,
+                        failure='merge_base_unresolved',
+                    )
+                rc, touched_out, _ = await _run(
+                    [
+                        'git', '-c', 'core.quotePath=false',
+                        'diff', '--name-only', '-z', merge_base, other_parent,
+                    ],
+                    cwd=self.project_root,
+                )
+                if rc != 0:
+                    return CommitEffectProbe(
+                        present=False,
+                        anchor_sha=other_parent,
+                        failure='touched_enumeration_failed',
+                    )
+                touched = [f for f in touched_out.split('\0') if f]
+                if not touched:
+                    # Empty branch merge — no deliverable to confirm; fail-safe.
+                    return CommitEffectProbe(
+                        present=False,
+                        anchor_sha=other_parent,
+                        failure='empty_branch_merge',
+                    )
+                probe = await self._compare_touched_paths_to_main(
+                    other_parent, touched,
+                )
+                if not probe.present:
+                    return probe
+            return CommitEffectProbe(present=True, anchor_sha=parents[-1])
+
+        # Non-merge (root or single-parent) commit: unchanged existing logic.
+        rc, touched_out, _ = await _run(
+            [
+                'git', '-c', 'core.quotePath=false',
+                'diff-tree', '--no-commit-id', '--name-only', '-r', '-z', commit_sha,
+            ],
+            cwd=self.project_root,
+        )
+        if rc != 0:
+            return CommitEffectProbe(
+                present=False,
+                anchor_sha=commit_sha,
+                failure='touched_enumeration_failed',
+            )
+        touched = [f for f in touched_out.split('\0') if f]
+        if not touched:
+            return CommitEffectProbe(present=True, anchor_sha=commit_sha)
+        return await self._compare_touched_paths_to_main(commit_sha, touched)
+
+    async def _compare_touched_paths_to_main(
+        self, anchor_sha: str, touched: list[str],
+    ) -> CommitEffectProbe:
+        """Compare *touched* paths between *anchor_sha* and main HEAD.
+
+        The terminal stage of :meth:`describe_commit_effect_in_main`,
+        shared by its merge and non-merge branches so both report
+        divergence identically.  Returns a probe whose ``anchor_sha`` is
+        always *anchor_sha*; ``present=True`` with no diverged paths when
+        every path still matches, ``'paths_diverged'`` naming the paths
+        that do not, and ``'diff_failed'`` when git itself errored.
+        """
+        rc, diff_out, _ = await _run(
+            [
+                'git', '-c', 'core.quotePath=false',
+                'diff', '--name-only', '-z', anchor_sha,
+                self.config.main_branch, '--', *touched,
+            ],
+            cwd=self.project_root,
+        )
+        if rc != 0:
+            return CommitEffectProbe(
+                present=False, anchor_sha=anchor_sha, failure='diff_failed',
+            )
+        diverged = tuple(f for f in diff_out.split('\0') if f)
+        if diverged:
+            return CommitEffectProbe(
+                present=False,
+                diverged_paths=diverged,
+                anchor_sha=anchor_sha,
+                failure='paths_diverged',
+            )
+        return CommitEffectProbe(present=True, anchor_sha=anchor_sha)
     async def commit_effect_present_in_main(self, commit_sha: str) -> bool:
         """Return True iff *commit_sha*'s own effect is still present at main HEAD.
 
@@ -9074,77 +9351,16 @@ class GitOps:
         unresolved pre-merge blob for the conflicting paths.  Same
         fail-safe trade-off as above: a false False costs the caller an
         idempotent re-check, never a wrongly-cemented completion.
+
+        **Task 3116 — callers needing WHICH paths diverged** should use
+        :meth:`describe_commit_effect_in_main`, which is the single
+        implementation this method wraps.  It returns the same verdict as
+        ``present`` plus the diverged path list, the anchor commit the
+        comparison ran against, and a structured failure code.  This bool
+        remains the contract of record for the gate DECISION; the probe is
+        for explaining it.
         """
-        rc, parents_out, _ = await _run(
-            ['git', 'rev-list', '--parents', '-n', '1', commit_sha],
-            cwd=self.project_root,
-        )
-        if rc != 0 or not parents_out:
-            return False
-        parents = parents_out.split()[1:]
-
-        if len(parents) >= 2:
-            # Merge commit (task 2675 FIX 1′): check EVERY non-first
-            # parent's (each merged branch's) content — the paths it
-            # touched since its fork point — against current main HEAD.
-            # For an ordinary two-parent merge this is exactly one
-            # iteration (byte-identical to the original second-parent-only
-            # check); for an octopus merge (3+ parents) ALL parents must
-            # pass, else a later revert of a third-or-later parent's
-            # deliverable would silently read as effect-present (task 2675
-            # amendment — the octopus blind spot).  Touched paths MUST
-            # derive from merge-base(first_parent, other_parent), NOT
-            # merge-base(main, other_parent) — see the docstring above.
-            first_parent = parents[0]
-            for other_parent in parents[1:]:
-                rc, merge_base, _ = await _run(
-                    ['git', 'merge-base', first_parent, other_parent],
-                    cwd=self.project_root,
-                )
-                if rc != 0 or not merge_base:
-                    return False
-                rc, touched_out, _ = await _run(
-                    [
-                        'git', '-c', 'core.quotePath=false',
-                        'diff', '--name-only', '-z', merge_base, other_parent,
-                    ],
-                    cwd=self.project_root,
-                )
-                if rc != 0:
-                    return False
-                touched = [f for f in touched_out.split('\0') if f]
-                if not touched:
-                    # Empty branch merge — no deliverable to confirm; fail-safe.
-                    return False
-                rc, _, _ = await _run(
-                    [
-                        'git', 'diff', '--quiet', other_parent,
-                        self.config.main_branch, '--', *touched,
-                    ],
-                    cwd=self.project_root,
-                )
-                if rc != 0:
-                    return False
-            return True
-
-        # Non-merge (root or single-parent) commit: unchanged existing logic.
-        rc, touched_out, _ = await _run(
-            [
-                'git', '-c', 'core.quotePath=false',
-                'diff-tree', '--no-commit-id', '--name-only', '-r', '-z', commit_sha,
-            ],
-            cwd=self.project_root,
-        )
-        if rc != 0:
-            return False
-        touched = [f for f in touched_out.split('\0') if f]
-        if not touched:
-            return True
-        rc, _, _ = await _run(
-            ['git', 'diff', '--quiet', commit_sha, self.config.main_branch, '--', *touched],
-            cwd=self.project_root,
-        )
-        return rc == 0
+        return (await self.describe_commit_effect_in_main(commit_sha)).present
 
     async def worktree_head_beyond_main(self, worktree: Path) -> str | None:
         """Return the HEAD SHA when *worktree* carries commits beyond main, else None.
