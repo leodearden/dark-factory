@@ -1939,6 +1939,276 @@ class TestSoftDispositionDoesNotVetoAGenuineSlotTimeout:
         )
 
 
+# ---------------------------------------------------------------------------
+# task 4492 — guard 3 must be scoped to the output that is NOT covered by a
+# passing suite's attestation, so an aggregated `run_all.sh` transcript stops
+# being classified as host-infra trouble on the strength of marker lines
+# emitted by suites that reported ZERO failures.
+#
+# The producer framing this pins is reify tests/infra/run_all.sh, read at
+# c09a26b5b1 — four emit sites, all the same two shapes:
+#     :1222 / :1226-1228          H9 path
+#     :1274 / :1293-1308          member-subset path (the only SKIP emitter)
+#     :1772 / :1792-1806          H2 concurrent-pool path
+#     :1840 / :1850               legacy all-serial fallback
+#
+#     ^--- Running: <name> ---                 (open,  column 0)
+#     ^  RESULT: (PASS|FAIL|SKIP) (<name>)     (close, two-space indent,
+#                                               optional trailing
+#                                               " [flaky: passed on serial retry]")
+#
+# Two facts from that source that the contract below depends on:
+#   * Blocks are ATOMIC. Phase 2 buffers each member's output to its own file
+#     and Phase 3 (:1767-1810) replays it under its own header in discovered
+#     order, so the concurrent pool cannot interleave two blocks.
+#   * `--- attempt 1 (concurrent pool) ---` / `--- attempt 2 (serial retry) ---`
+#     (:1783-1789) deliberately do NOT match `^--- Running: ` — run_all.sh says
+#     so in a comment at :1776, to keep its one-header-per-discovered-test
+#     contract intact. They are ordinary interior lines here too.
+#
+# RED today: `_redact_passed_suite_blocks` does not exist, so every test in
+# this class fails with AttributeError. Referenced directly (never via
+# getattr-with-default) so the step cannot pass vacuously.
+# ---------------------------------------------------------------------------
+
+_PASS_CLOSE = '  RESULT: PASS (t.sh)'
+_FAIL_CLOSE = '  RESULT: FAIL (t.sh)'
+_SKIP_CLOSE = '  RESULT: SKIP (t.sh)'
+_OPEN = '--- Running: t.sh ---'
+
+# A marker line of the kind guard 3 keys on, used as the interior payload so
+# each case reads as "would this evidence survive?" rather than as an opaque
+# string shuffle.
+_INTERIOR_MARKER = (
+    'lib_test_semaphore.sh: failed to acquire test slot within 0s '
+    '(LOCK=/tmp/reify-test-semaphore-1000.lock, N=1))'
+)
+
+
+class TestRedactPassedSuiteBlocks:
+    """task 4492: the scoping helper's unit contract.
+
+    The helper blanks the INTERIOR of every run_all block whose open header
+    and `RESULT: PASS` close agree on the suite name, and leaves literally
+    everything else alone. Every ambiguous framing shape (name mismatch,
+    unclosed block, SKIP, FAIL, no framing at all) must redact NOTHING, so
+    the failure direction is always "detect exactly as before", never
+    "detect less" — that fail-safe direction is what bounds the blast radius
+    of wiring this into guard 3 (step-4).
+    """
+
+    # -- (a) IDENTITY ON UNFRAMED OUTPUT -----------------------------------
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            '',
+            'FAILED tests/test_x.py::test_y - assert 1 == 2\n',
+            'error[E0308]: mismatched types\n  --> src/lib.rs:4:9\n',
+        ],
+        ids=['empty', 'pytest_blob', 'rustc_blob'],
+    )
+    def test_unframed_output_returns_the_same_object(self, text):
+        """`is`, not just `==`. A refactor that rebuilds an equal-but-new
+        string on the no-op path would still be correct-by-value, but it
+        would erase the cheap proof that non-reify projects and
+        non-aggregated tools are byte-identically unaffected."""
+        result = verify_classify._redact_passed_suite_blocks(text)
+        assert result == text
+        assert result is text, (
+            'the no-op path must return the INPUT OBJECT, so "unframed '
+            'output is untouched" is an assertable property rather than a claim'
+        )
+
+    @pytest.mark.parametrize('output', _GROUNDED_SLOT_TIMEOUT_OUTPUTS)
+    def test_grounded_slot_timeout_corpus_round_trips_identically(self, output):
+        """The whole existing grounded corpus carries no run_all framing, so
+        every entry must survive the helper as the same object — this is what
+        makes step-5's preservation controls meaningful rather than lucky."""
+        result = verify_classify._redact_passed_suite_blocks(output)
+        assert result is output
+
+    # -- (b) PASS BLOCK INTERIOR IS BLANKED ---------------------------------
+
+    def test_pass_block_interior_is_removed_and_framing_survives(self):
+        text = f'{_OPEN}\n{_INTERIOR_MARKER}\n{_PASS_CLOSE}\n'
+        result = verify_classify._redact_passed_suite_blocks(text)
+        assert _INTERIOR_MARKER not in result, (
+            'the interior of a PASSED suite carries no evidence about the '
+            'failure and must be blanked'
+        )
+        assert _OPEN in result
+        assert _PASS_CLOSE in result
+
+    # -- (c) BYTE-STRUCTURE PRESERVED ---------------------------------------
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            f'{_OPEN}\n{_INTERIOR_MARKER}\n{_PASS_CLOSE}\n',
+            f'{_OPEN}\n{_INTERIOR_MARKER}\n{_PASS_CLOSE}',
+            f'{_OPEN}\n{_INTERIOR_MARKER}\n\nstill interior\n{_PASS_CLOSE}\n',
+            f'{_OPEN}\n{_INTERIOR_MARKER}\n{_FAIL_CLOSE}\n',
+            'no framing at all\n',
+        ],
+        ids=[
+            'trailing_newline',
+            'no_trailing_newline',
+            'blank_line_in_interior',
+            'fail_block',
+            'unframed',
+        ],
+    )
+    def test_line_structure_is_preserved(self, text):
+        """Blanking rather than deleting keeps a redacted log line-addressable
+        against the original during triage, and cannot create a new adjacency
+        between two previously-separated lines."""
+        result = verify_classify._redact_passed_suite_blocks(text)
+        assert result.count('\n') == text.count('\n')
+        assert len(result.split('\n')) == len(text.split('\n'))
+
+    # -- (d) FAIL AND SKIP BLOCKS ARE NOT TOUCHED ---------------------------
+
+    @pytest.mark.parametrize(
+        'close', [_FAIL_CLOSE, _SKIP_CLOSE], ids=['fail', 'skip']
+    )
+    def test_non_pass_blocks_are_returned_verbatim(self, close):
+        """SKIP is treated as NOT-attested for the same reason FAIL is: a
+        skipped suite never asserted the host was healthy, so a marker inside
+        it is still evidence."""
+        text = f'{_OPEN}\n{_INTERIOR_MARKER}\n{close}\n'
+        result = verify_classify._redact_passed_suite_blocks(text)
+        assert result == text
+        assert result is text
+
+    # -- (e) FLAKY SUFFIX STILL CLOSES A PASS BLOCK -------------------------
+
+    def test_flaky_suffix_closes_a_pass_block(self):
+        """run_all.sh:1792. The retried member archives BOTH attempts under
+        one header; the two attempt delimiters are ordinary interior lines
+        (they deliberately do not match `^--- Running: `, run_all.sh:1776)."""
+        close = '  RESULT: PASS (t.sh) [flaky: passed on serial retry]'
+        text = (
+            f'{_OPEN}\n'
+            '--- attempt 1 (concurrent pool) ---\n'
+            f'{_INTERIOR_MARKER}\n'
+            '--- attempt 2 (serial retry) ---\n'
+            'second attempt output\n'
+            f'{close}\n'
+        )
+        result = verify_classify._redact_passed_suite_blocks(text)
+        assert _INTERIOR_MARKER not in result
+        assert '--- attempt 1 (concurrent pool) ---' not in result, (
+            'the attempt delimiters are interior lines of the PASSED block, '
+            'not headers, so they are blanked with the rest of the interior'
+        )
+        assert _OPEN in result
+        assert close in result
+
+    # -- (f) NAME MISMATCH IS FAIL-SAFE -------------------------------------
+
+    def test_name_mismatch_redacts_nothing(self):
+        """The nesting guard. reify ships suites that test run_all.sh itself
+        and can replay its transcript; without the name check a nested
+        `RESULT: PASS (inner)` could close — and thus silently delete the
+        evidence inside — an outer block."""
+        text = (
+            '--- Running: a.sh ---\n'
+            f'{_INTERIOR_MARKER}\n'
+            '  RESULT: PASS (b.sh)\n'
+        )
+        result = verify_classify._redact_passed_suite_blocks(text)
+        assert result == text
+        assert result is text
+
+    # -- (g) UNCLOSED BLOCK IS FAIL-SAFE ------------------------------------
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            f'{_OPEN}\n{_INTERIOR_MARKER}\n',
+            f'{_OPEN}\n{_INTERIOR_MARKER}\n--- Running: u.sh ---\nmore\n',
+        ],
+        ids=['eof_before_close', 'second_header_before_close'],
+    )
+    def test_unclosed_block_redacts_nothing(self, text):
+        """An aborted run is exactly where a genuine host event surfaces, so
+        an unclosed block must never be treated as attested. A second open
+        header REPLACES the pending one, and the earlier block is then never
+        redacted."""
+        result = verify_classify._redact_passed_suite_blocks(text)
+        assert result == text
+        assert result is text
+
+    # -- (h) TEXT OUTSIDE ANY BLOCK SURVIVES --------------------------------
+
+    def test_preamble_and_tail_survive_verbatim(self):
+        """The regions design option (a) — "narrow to the failing leg" —
+        would have discarded. They are where a genuine pool-admission
+        starvation or a runner-level host abort surfaces."""
+        preamble = 'verify.sh: + ./scripts/check-manifold-deps.sh'
+        tail_lines = [
+            '=== Summary: 145 discovered, 1 failed ===',
+            '=== FAILED: t.sh ===',
+            'FAILED t.sh',
+            '--- FAILED-DETAIL: t.sh ---',
+            '  FAIL: live fingerprints are a subset of committed baseline',
+            '--- END FAILED-DETAIL: t.sh ---',
+        ]
+        text = (
+            f'{preamble}\n'
+            f'{_OPEN}\n{_INTERIOR_MARKER}\n{_PASS_CLOSE}\n'
+            + '\n'.join(tail_lines)
+            + '\n'
+        )
+        result = verify_classify._redact_passed_suite_blocks(text)
+        assert preamble in result
+        for line in tail_lines:
+            assert line in result, f'tail line vanished: {line!r}'
+        assert _INTERIOR_MARKER not in result
+
+    # -- (i) INDENTED CLOSE TOLERATED, NOT REQUIRED -------------------------
+
+    @pytest.mark.parametrize(
+        'close',
+        ['  RESULT: PASS (t.sh)', 'RESULT: PASS (t.sh)', '\tRESULT: PASS (t.sh)'],
+        ids=['two_space', 'zero_indent', 'tab'],
+    )
+    def test_close_tolerates_leading_horizontal_whitespace(self, close):
+        """Same `^[ \\t]*` tolerance `_SLOT_ACQUIRE_DEADLINE_RE` and
+        `verify._match_clock_marker` already use: run_all emits two spaces,
+        but verify output is aggregated from wrappers that routinely indent
+        captured sub-output."""
+        text = f'{_OPEN}\n{_INTERIOR_MARKER}\n{close}\n'
+        result = verify_classify._redact_passed_suite_blocks(text)
+        assert _INTERIOR_MARKER not in result
+        assert close in result
+
+    # -- (j) MULTIPLE BLOCKS ------------------------------------------------
+
+    def test_only_pass_interiors_are_blanked_across_multiple_blocks(self):
+        text = (
+            '--- Running: a.sh ---\n'
+            'a interior\n'
+            '  RESULT: PASS (a.sh)\n'
+            '--- Running: b.sh ---\n'
+            'b interior\n'
+            '  RESULT: FAIL (b.sh)\n'
+            '--- Running: c.sh ---\n'
+            'c interior\n'
+            '  RESULT: PASS (c.sh)\n'
+        )
+        result = verify_classify._redact_passed_suite_blocks(text)
+        assert 'a interior' not in result
+        assert 'c interior' not in result
+        assert 'b interior' in result, (
+            'the FAILING suite block is the one region that certainly does '
+            'carry evidence about the failure'
+        )
+        assert result.count('\n') == text.count('\n')
+
+
+
 # step-9: verify._summarize_checks must thread the per-check config command
 # (test_cmd/lint_cmd/type_cmd) into classify_failure as that check's
 # ToolKind, instead of discarding tool identity (today's tool-blind
