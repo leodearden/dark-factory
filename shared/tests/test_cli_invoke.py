@@ -2566,6 +2566,44 @@ class TestInvokeWithCapRetryOutcomeRouting:
             'classify_invocation so CliLocalError precedence applies'
         )
 
+    async def test_unresolvable_resume_session_not_treated_as_cap(self):
+        """An unresolvable ``--resume`` must not mark a HEALTHY account CAPPED.
+
+        Exactly the reify-3604 shape, third instance (after the ``ServerError``
+        escape of 2026-07-29): a zero-cost, <=1-turn, sub-5s failure the CLI
+        produced entirely LOCALLY — it resolves the session id against the
+        on-disk transcript store and exits before contacting the API, so a usage
+        cap can never be the cause.  Without a positive non-cap attribution the
+        heuristic net takes its ``else`` branch and reports a SYNTHETIC cap hit,
+        churning the account pool through compounding cooldowns for an error the
+        API never saw.
+
+        LATENT-FRAGILITY hardening with ZERO live occurrences — real resume
+        failures currently exceed the net's 5000 ms floor — not an active
+        incident.  The stderr string and its placement were measured against
+        Claude Code CLI 2.1.236 on 2026-08-19.
+        """
+        gate = make_gate_mock(detect_cap_hit=MagicMock(return_value=False))
+        gate._handle_cap_detected = MagicMock(return_value=True)
+        result = _make_result(
+            success=False, cost_usd=0, turns=1, duration_ms=400,
+            stderr=(
+                'No conversation found with session ID: '
+                '4aed993b-20c0-4b91-a8dd-60180e7db2e0'
+            ),
+        )
+        with (
+            patch('shared.cli_invoke.invoke_claude_agent', new_callable=AsyncMock,
+                  return_value=result) as mock_invoke,
+            patch('shared.cli_invoke.asyncio.sleep', new_callable=AsyncMock) as mock_sleep,
+        ):
+            got = await invoke_with_cap_retry(gate, 'lbl', prompt='hi')
+
+        mock_invoke.assert_awaited_once()
+        gate._handle_cap_detected.assert_not_called()
+        mock_sleep.assert_not_awaited()
+        assert got is result
+
     async def test_auth_failure_401_403_routes_via_outcome(self):
         """A 401/403 result routes to _handle_auth_failure + failover,
         without sleeping (i.e. not counted as a cap hit).
