@@ -48,7 +48,6 @@ distinguishable from each other.
 from __future__ import annotations
 
 import pytest
-
 import verify_command_invariants as vci
 
 _RUFF = "ruff check"
