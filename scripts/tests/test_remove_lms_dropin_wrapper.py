@@ -128,6 +128,41 @@ _SKIP_REASON = _systemd_user_manager_skip_reason()
 
 
 # ---------------------------------------------------------------------------
+# Per-invocation isolation: a unique throwaway template name
+# ---------------------------------------------------------------------------
+
+# The single shared constant.  _unique_template() GENERATES names with this
+# prefix and _prune_stale_selftest_units() only ever DELETES names with it, so
+# "the prune can never touch a real unit" is structural rather than a pair of
+# string literals free to drift apart.  It cannot prefix-match `lms-arm@` (the
+# real unit the script under test targets) or any dark-factory unit.
+_SELFTEST_PREFIX = "lms-dropin-selftest-"
+
+
+def _unique_template() -> str:
+    """Return a fresh throwaway systemd TEMPLATE name for one .sh invocation.
+
+    BOTH components are load-bearing:
+
+    * ``os.getpid()`` disambiguates CONCURRENT pytest processes.  The fleet
+      runs ``max_concurrent_tasks: 48`` and all 48 share one $HOME, hence one
+      ~/.config/systemd/user.  Measured at plan time with the .sh's old
+      hardcoded ``lms-dropin-selftest@``: two concurrent runs BOTH fail
+      deterministically, because case 4's ``rm -f "$UNIT"`` tears down the
+      other run's fixture mid-test ("drop-in still present after refusal",
+      "template survives the re-run", and a WorkingDirectory that resolves to
+      the OTHER run's mktemp dir).
+    * The uuid suffix disambiguates repeat calls WITHIN one process -- two
+      tests in this module each run the .sh -- and survives PID reuse after a
+      killed run left same-PID residue behind.
+
+    The trailing "@" makes it a template: the .sh appends ".service" and
+    builds its probe unit as ``${TEMPLATE}probe.service``.
+    """
+    return f"{_SELFTEST_PREFIX}{os.getpid()}-{uuid4().hex[:8]}@"
+
+
+# ---------------------------------------------------------------------------
 # step-1: the computed skip guard
 # ---------------------------------------------------------------------------
 
@@ -301,7 +336,7 @@ def test_unique_template_is_a_legal_distinct_systemd_template_name() -> None:
 
     No systemd required -- this runs everywhere.
     """
-    name = _unique_template()  # noqa: F821  (step-4 defines it)
+    name = _unique_template()
 
     # (a)
     assert name.endswith("@"), (
@@ -309,9 +344,9 @@ def test_unique_template_is_a_legal_distinct_systemd_template_name() -> None:
         "The .sh builds '${TEMPLATE}probe.service' from it."
     )
     # (b)
-    assert _unique_template() != _unique_template()  # noqa: F821
+    assert _unique_template() != _unique_template()
     # (c)
-    assert name.startswith(_SELFTEST_PREFIX)  # noqa: F821
+    assert name.startswith(_SELFTEST_PREFIX)
     # (d)
     assert re.fullmatch(r"[A-Za-z0-9:_.\-]+@", name), (
         f"{name!r} is not a legal systemd template unit name; systemd accepts "
@@ -329,6 +364,6 @@ def test_selftest_prefix_is_shared_and_cannot_match_a_real_unit() -> None:
     to prevent.  "lms-dropin-selftest-" cannot prefix-match `lms-arm@` (the
     real unit the script under test targets) or any dark-factory unit.
     """
-    assert _SELFTEST_PREFIX == "lms-dropin-selftest-"  # noqa: F821
+    assert _SELFTEST_PREFIX == "lms-dropin-selftest-"
     for real in ("lms-arm@", "fused-memory", "dark-factory-dashboard", "orchestrator"):
-        assert not real.startswith(_SELFTEST_PREFIX)  # noqa: F821
+        assert not real.startswith(_SELFTEST_PREFIX)
