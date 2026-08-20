@@ -323,38 +323,29 @@ def _resolve_plan_lock_claimant(wf: TaskWorkflow):
     Uses the claimant-absent task shape, which is the ONLY shape that reaches
     the plan.lock leg (a present db claimant wins outright).
 
-    FIXTURE-ONLY SYMLINK — read this before trusting the tests below.
+    NO FIXTURE BRIDGE — this is the production path end to end.
     ``TaskWorkflow`` builds its artifacts with
-    ``meta_root=_meta_root_for_worktree(...)`` (workflow.py:2384-2385), so
-    plan.lock lives in the ``.task-meta`` SIBLING, whereas
-    ``_resolve_live_claimant`` constructs a bare ``TaskArtifacts(worktree_path)``
-    and therefore reads ``<worktree>/.task/plan.lock``.  NOTHING in production
-    bridges those two paths: ``TaskArtifacts.ensure_lane_plan_symlink``
-    (artifacts.py:354-386) relocates ``plan.json`` ONLY — there is no
-    ``.task`` -> ``.task-meta`` compat shape for plan.lock, and ``_read_path``
-    has no new-then-old fallback (unlike ``Harness._resolve_recovery_artifact``).
-    The link below is manufactured HERE and nowhere else.
+    ``meta_root=_meta_root_for_worktree(self.worktree)`` (workflow.py), so
+    plan.lock lives in the ``.task-meta`` SIBLING, and
+    ``_resolve_live_claimant`` derives that same root through
+    ``TaskArtifacts.meta_root_for`` on the read side (task 4028).  Writer and
+    reader meet at one path with nothing manufactured in between.
 
-    So these tests prove the identity ALGEBRA — that one incarnation's
-    lock-derived and DB-stamped identities are the same string, and that the
-    result discriminates in the real ``classify_pins`` — NOT that the
-    composition branch is reachable on a real orchestrator run.  It is not:
-    the only plan.lock a real run can find at that path is a PRE-3563 legacy
-    lock with no ``run_id``, which resolves to the fail-safe ``run_id=None``,
-    so that leg is inert in production until the path gap closes.  The gap is
-    out of task 3563's scope (which normalises the identity SHAPE, not where
-    the lock is looked up) and is tracked as task 4262 (relocate the read),
-    with task 4028 tracking deletion of the leg if that is the ruling instead.
+    That is what gives these tests their reach.  Before 4028 the reader
+    constructed a bare ``TaskArtifacts(worktree_path)`` and looked under
+    ``<worktree>/.task``, so a ``.task`` -> ``.task-meta`` symlink had to be
+    forged HERE for the leg to see anything at all — and they proved only the
+    identity ALGEBRA, not that the composition branch was reachable on a real
+    orchestrator run.  It was not.  With the read repointed they now prove
+    both: that one incarnation's lock-derived and DB-stamped identities are
+    the same string, that the result discriminates in the real
+    ``classify_pins``, and that a real run can actually get there.  If the
+    repoint ever regresses, these go red rather than passing on a shim.
     """
     from orchestrator.task_ground_truth import TaskGroundTruth
 
     assert wf.artifacts is not None and wf.worktree is not None
     worktree = Path(wf.worktree)
-    legacy_lock = worktree / '.task' / 'plan.lock'
-    real_lock = wf.artifacts.root / 'plan.lock'
-    if real_lock != legacy_lock and not legacy_lock.exists():
-        legacy_lock.parent.mkdir(parents=True, exist_ok=True)
-        legacy_lock.symlink_to(real_lock)
 
     scheduler = MagicMock()
     # Not held in memory — signal 1 short-circuits to IN_MEMORY otherwise, and
