@@ -262,10 +262,65 @@ def module_level_marker_names(source: str | None) -> frozenset[str]:
     )
 
 
-def _bound_names_start_with_test(node: ast.Import | ast.ImportFrom) -> bool:
-    """True iff any alias in *node* binds a name starting with ``Test`` (``asname`` wins)."""
+def _bound_names_start_with_test_ci(node: ast.Import | ast.ImportFrom) -> bool:
+    """True iff any alias in *node* binds a name starting with ``test`` (case-insensitive).
+
+    Case-insensitive because pytest's collection is not limited to the
+    ``Test*`` class-naming convention: the default ``python_functions = test*``
+    collects any module-level callable named ``test*`` too, and an alias can
+    import EITHER shape into this module — ``from helpers import TestBase``
+    (a class) or ``from helpers import test_shared_case`` (a function) are
+    both collected here.  ``asname`` wins, matching the name that actually
+    lands in this module's namespace.
+    """
     return any(
-        (alias.asname or alias.name.split('.')[0]).startswith('Test') for alias in node.names
+        (alias.asname or alias.name.split('.')[0]).lower().startswith('test')
+        for alias in node.names
+    )
+
+
+def _assign_binds_test_prefixed_name(node: ast.Assign | ast.AnnAssign) -> bool:
+    """True iff *node* binds a ``test*``-prefixed name (case-insensitive) to a ``Name`` target.
+
+    Pytest's default ``python_functions = test*`` collects any module
+    attribute so named that resolves to a callable — including one bound by
+    a plain assignment (``test_generated = _make_case()``), not only a
+    ``def``.  This walk cannot tell statically whether the bound value is
+    actually callable, so any ``test*``-prefixed target refuses, in the safe
+    direction.
+    """
+    targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+    return any(
+        isinstance(target, ast.Name) and target.id.lower().startswith('test')
+        for target in targets
+    )
+
+
+def _module_level_marker_names_from_tree(tree: ast.Module) -> frozenset[str]:
+    """Same result as :func:`module_level_marker_names`, from an already-parsed *tree*.
+
+    Deliberately a SEPARATE, small duplicate of that function's body rather
+    than a shared helper the two delegate to: ``module_level_marker_names``
+    is the exact edit site of task 3513's still-in-progress Gap-2
+    (class-level markers), and this task leaves that function byte-identical
+    to avoid a textual merge conflict with it (see the plan's design
+    decisions).  Used only by :func:`per_item_marker_names`, which already
+    holds a parsed *tree* and would otherwise pay a second, wholly redundant
+    ``ast.parse`` of the same source purely to re-derive this set.  A later
+    reader may collapse the two into one shared tree-walker once 3513 has
+    landed and that merge-conflict risk is gone.
+    """
+    value: ast.expr | None = None
+    for statement in tree.body:
+        bound = _pytestmark_value(statement)
+        if bound is not None:
+            value = bound
+    if value is None:
+        return frozenset()
+
+    elements = list(value.elts) if isinstance(value, ast.List | ast.Tuple) else [value]
+    return frozenset(
+        name for name in (_marker_name(element) for element in elements) if name is not None
     )
 
 
@@ -286,20 +341,46 @@ def per_item_marker_names(source: str | None) -> tuple[frozenset[str], ...] | No
     collected items this walk cannot exhaustively see:
 
     * any ``class`` anywhere in the module (``ast.walk``, not just the module
-      body) — pytest's collected class names are configurable, and a class is
-      an item shape this tier does not model at all;
+      body) — refused regardless of its name.  This is a DELIBERATE
+      over-refusal for simplicity: only ``Test*``-prefixed classes are
+      collected under the default ``python_classes``, so a name-prefix
+      carve-out (mirroring the ``test*`` prefix already applied below to
+      functions) would fire more often, but refusing on class SHAPE rather
+      than class NAME keeps this tier's competence statable in one line —
+      "a class means there may be items this walk does not model" — without
+      a second, independently-driftable prefix rule;
     * a ``test*``-named function found anywhere that is NOT a direct child of
       the module body — e.g. one defined inside a top-level ``if`` — which
       would otherwise hide an undecorated, still-SELECTED sibling from this
       walk and let the module widen unsoundly;
     * a star import (``from x import *``), whose bound names are statically
       unknowable;
-    * any import (plain or ``from``) that binds a name starting with ``Test``
-      (honouring ``asname``) — a test class imported from elsewhere, which
-      pytest collects in THIS module;
+    * any import (plain or ``from``) that binds a name starting with ``test``
+      case-insensitively (honouring ``asname``) — this covers BOTH an
+      imported ``Test*`` class and an imported lowercase ``test_*`` function,
+      either of which pytest collects in THIS module under the respective
+      default;
+    * a top-level assignment (``Assign``/``AnnAssign``) that binds a
+      ``test*``-prefixed name to a plain ``Name`` target — e.g.
+      ``test_generated = _make_case()`` — which the default
+      ``python_functions = test*`` collects exactly as it would a ``def``,
+      and which this walk cannot otherwise tell apart from an ordinary
+      module constant;
     * a top-level ``pytest_*`` hook function (e.g.
       ``pytest_collection_modifyitems``, ``pytest_generate_tests``), which can
       add items this walk never sees.
+
+    ASSUMPTIONS THIS WALK CANNOT CHECK: the caller's pytest configuration uses
+    the DEFAULT collection prefixes (``python_functions = test*``,
+    ``python_classes = Test*``) — a repo that overrides either in its ini
+    options can collect items this walk's name-prefix reasoning does not
+    model.  It also assumes no ancestor ``conftest.py`` implements an
+    item-ADDING ``pytest_collection_modifyitems``/``pytest_generate_tests``
+    hook: this walk only refuses on such a hook defined INSIDE *source*
+    itself, because a sibling ``conftest.py``'s content is outside a single
+    module string's reach.  Both are pre-existing limits of a purely
+    per-file static analysis, recorded here rather than fixed, since fixing
+    them would need reading files this function is not given.
 
     FAIL-SAFE IN EXACTLY ONE DIRECTION, matching the module docstring: every
     refusal above is a None, i.e. no proof, i.e. today's FILE_SCOPED
@@ -329,12 +410,19 @@ def per_item_marker_names(source: str | None) -> tuple[frozenset[str], ...] | No
         elif isinstance(node, ast.ImportFrom):
             if any(alias.name == '*' for alias in node.names):
                 return None
-            if _bound_names_start_with_test(node):
+            if _bound_names_start_with_test_ci(node):
                 return None
-        elif isinstance(node, ast.Import) and _bound_names_start_with_test(node):
+        elif (
+            (isinstance(node, ast.Import) and _bound_names_start_with_test_ci(node))
+            or (
+                isinstance(node, ast.Assign | ast.AnnAssign)
+                and id(node) in body_ids
+                and _assign_binds_test_prefixed_name(node)
+            )
+        ):
             return None
 
-    module_markers = module_level_marker_names(source)
+    module_markers = _module_level_marker_names_from_tree(tree)
     items: list[frozenset[str]] = []
     for node in tree.body:
         if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):

@@ -41,6 +41,7 @@ finally the end-to-end pin through ``run_scoped_verification``'s fallback branch
 """
 from __future__ import annotations
 
+import ast
 from pathlib import Path
 from unittest.mock import patch
 
@@ -437,6 +438,29 @@ class TestPerItemMarkerNames:
         )
         assert per_item_marker_names(source) == (frozenset({'slow'}),)
 
+    # -- cost bound: exactly one parse per call --------------------------------
+
+    def test_does_not_re_parse_source_to_derive_the_module_level_union(self, monkeypatch):
+        """One ``ast.parse`` per call, not two.
+
+        Before this pin, deriving the module-level markers to union into each
+        item re-parsed *source* a second time via
+        ``module_level_marker_names(source)`` — wholly redundant, since this
+        function already holds a parsed tree.  Combined with the caller's own
+        primary-tier parse in ``deselecting_expression_for_targets``, a
+        fallback target used to cost THREE parses; this pins it down to two.
+        """
+        calls: list[None] = []
+        original_parse = ast.parse
+
+        def counting_parse(*args, **kwargs):
+            calls.append(None)
+            return original_parse(*args, **kwargs)
+
+        monkeypatch.setattr(ast, 'parse', counting_parse)
+        assert per_item_marker_names(_ALL_DECORATED_SOURCE) is not None
+        assert len(calls) == 1
+
     # -- never raises ----------------------------------------------------------
 
     def test_none_source_is_none(self):
@@ -474,16 +498,39 @@ class TestPerItemMarkerNames:
         )
         assert per_item_marker_names(source) is None
 
+    def test_refuses_on_a_non_test_prefixed_helper_class_too(self):
+        """DELIBERATE OVER-REFUSAL: any class refuses, not only ``Test*``-named ones.
+
+        Pytest's default ``python_classes = Test*`` would not actually
+        collect ``_Case`` as a test class, but this tier refuses on class
+        SHAPE rather than class NAME — see the enumeration-guarantee
+        docstring's over-refusal note.
+        """
+        source = (
+            '@pytest.mark.slow\n'
+            'def test_a():\n    pass\n\n\n'
+            'class _Case:\n    pass\n'
+        )
+        assert per_item_marker_names(source) is None
+
     @pytest.mark.parametrize(
         'import_line',
         [
             'from helpers import TestBase',
             'import helpers as TestAlias',
             'from helpers import Base as TestBase',
+            'from helpers import test_shared_case',
+            'import helpers as test_alias',
+            'from helpers import shared_case as test_alias',
         ],
     )
     def test_refuses_when_an_import_binds_a_name_starting_with_test(self, import_line):
-        """An imported ``Test*`` name is collected in THIS module; ``asname`` wins."""
+        """An imported ``Test*``/``test_*`` name is collected in THIS module (case-insensitive).
+
+        Pytest's default ``python_functions = test*`` collects an imported
+        lowercase ``test_*`` FUNCTION exactly as ``python_classes = Test*``
+        collects an imported ``Test*`` class; ``asname`` wins either way.
+        """
         source = f'{import_line}\n\n\n@pytest.mark.slow\ndef test_a():\n    pass\n'
         assert per_item_marker_names(source) is None
 
@@ -493,6 +540,34 @@ class TestPerItemMarkerNames:
             'from helpers import TestBase as _base\n\n\n'
             '@pytest.mark.slow\n'
             'def test_a():\n    pass\n'
+        )
+        assert per_item_marker_names(source) is not None
+
+    @pytest.mark.parametrize(
+        'assignment_line',
+        [
+            'test_generated = _make_case()',
+            'test_generated: object = _make_case()',
+        ],
+    )
+    def test_refuses_on_a_top_level_assignment_that_binds_a_test_prefixed_name(
+        self, assignment_line,
+    ):
+        """Pytest's default ``python_functions = test*`` collects a module
+        attribute so named however it was bound — a plain ``Assign`` or an
+        ``AnnAssign``, not only a ``def`` — and this walk cannot tell
+        statically whether ``_make_case()`` returns a callable.
+        """
+        source = f'@pytest.mark.slow\ndef test_a():\n    pass\n\n\n{assignment_line}\n'
+        assert per_item_marker_names(source) is None
+
+    def test_a_local_test_prefixed_assignment_inside_a_function_does_not_refuse(self):
+        """Only a TOP-LEVEL binding is pytest-collectible; a local variable is not."""
+        source = (
+            '@pytest.mark.slow\n'
+            'def test_a():\n'
+            '    test_local = 1\n'
+            '    assert test_local == 1\n'
         )
         assert per_item_marker_names(source) is not None
 
