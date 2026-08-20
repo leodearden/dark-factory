@@ -2374,3 +2374,55 @@ class TestRegistryKeyOwnershipGuard:
         _assert_only_test_owned_registry_keys(
             {_DEPLOY_STATE_STUB_KEY, TestListValuedSubmodelSlice._KEY}
         )
+
+
+class TestFilesTaggedEmptyBlessed:
+    """Task 3122: the module tagger's affirmative "no local file" verdict.
+
+    Written unconditionally as a bool on every tagged task by
+    ``Harness._tag_task_modules``, in the SAME payload and by the same line
+    of code as its already-blessed ``files_tagged_at`` sibling. Unblessed it
+    would emit an ``unknown_key`` drift warning on every tagger batch —
+    noise in exactly the census this signal exists to make readable.
+    """
+
+    def _unknown_key_fields(self, blob: dict) -> set[str]:
+        _, warnings = parse_metadata(blob, direction='write')
+        return {w.field for w in warnings if w.code == 'unknown_key'}
+
+    def test_no_unknown_key_warning_for_the_pair(self):
+        fields = self._unknown_key_fields({
+            'files_tagged_empty': True,
+            'files_tagged_at': '2026-07-26T14:59:34',
+        })
+        assert 'files_tagged_empty' not in fields
+        # Control: the already-blessed sibling stays clean too.
+        assert 'files_tagged_at' not in fields
+
+    @pytest.mark.parametrize('value', [True, False])
+    def test_both_bool_values_are_accepted(self, value):
+        """False is the COMMON case — the key is written unconditionally."""
+        assert 'files_tagged_empty' not in self._unknown_key_fields(
+            {'files_tagged_empty': value},
+        )
+
+    @pytest.mark.parametrize('value', [True, False])
+    def test_round_trips_through_the_model(self, value):
+        """Invariant I1: a blessed key survives parse -> dump unchanged."""
+        model, _ = parse_metadata(
+            {'files_tagged_empty': value,
+             'files_tagged_at': '2026-07-26T14:59:34'},
+            direction='write',
+        )
+        dumped = model.model_dump()
+        assert dumped['files_tagged_empty'] is value
+        assert dumped['files_tagged_at'] == '2026-07-26T14:59:34'
+
+    def test_an_adjacent_unblessed_key_still_warns(self):
+        """Negative control: the parser is not vacuously permissive."""
+        fields = self._unknown_key_fields({
+            'files_tagged_empty': True,
+            'files_tagged_nonsense': True,
+        })
+        assert 'files_tagged_nonsense' in fields
+        assert 'files_tagged_empty' not in fields
