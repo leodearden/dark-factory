@@ -211,6 +211,7 @@ from orchestrator.verify_categories import (
     INFRA_TRANSIENT_CATEGORIES,
     PREEXISTING_BREAK_SKIP_CATEGORIES,
 )
+from orchestrator.verify_plan import effective_merge_module_configs
 from orchestrator.verify_runner import (
     UNSCOPED_TYPECHECK_TIMEOUT_CATEGORY,
     HostAllocator,
@@ -2543,6 +2544,50 @@ async def _run_post_merge_verify(
     if narrowed_retries is None:
         narrowed_retries = {}
 
+    # ── THE merge-request boundary resolution (flake-ledger PRD §8.2, task
+    # 3787 γ) ────────────────────────────────────────────────────────────
+    # The module set a merge-role verify actually COVERS, resolved ONCE here
+    # and threaded into every consumer below.
+    #
+    # ORDERING INVARIANT (INV-5): this binding must precede the spec build and
+    # every LocalRunner construction. Under merge_verify_breadth='full' a
+    # merge verify executes EVERY registered module, so the local runner, the
+    # wire spec (and hence the remote's reconstruction of it in
+    # verify_runner.run_merge_verify_on_worktree) and the merge-flake
+    # suppression gate must all reason against the SAME widened set — by
+    # CONSTRUCTION, from one resolution, rather than by asserting that two
+    # sites independently agree.
+    #
+    # This closes §3.1's task-scoped blindness on BOTH paths.
+    # run_scoped_verification widened the set internally, but rebound a local
+    # that never propagated out — so LocalRunner._module_configs stayed the
+    # TASK's own modules and the suppression gate mapped failing node-ids
+    # against them. A red in a REGISTERED-but-untouched module therefore
+    # mapped to no known subproject and the gate answered "unconfirmable":
+    # inverted exactly where it mattered, since the more clearly unrelated
+    # the failure, the less able it was to say so.
+    #
+    # req.module_configs is NOT mutated — a new local is bound, so the
+    # request object the caller owns is unchanged (and the main-health probe
+    # deliberately keeps using the task-scoped set: that probe is not the
+    # merge gate).
+    #
+    # ACCEPTED CONSEQUENCE: under breadth='full' this also widens
+    # _run_unscoped_typechecks (LocalRunner's fourth consumer of this set) to
+    # every registered module. That is semantically correct under the knob and
+    # introduces NO new red — the scoped leg's _derive_full_suite_runs already
+    # runs each registered module's pyright FULL_SUITE, so anything the
+    # widened unscoped gate could catch is already caught — but it does
+    # duplicate pyright across the registry per merge (concurrently, so
+    # wall-clock is the slowest module rather than the sum). Splitting the set
+    # inside LocalRunner to dodge this would reintroduce exactly the
+    # two-sites-must-agree drift §8.2 exists to remove, so the widening is
+    # accepted here and the pre-existing duplication is tracked as a separate
+    # follow-up.
+    effective_module_configs = effective_merge_module_configs(
+        req.config, req.module_configs,
+    )
+
     # Pre-verify disk guard: if free space is low, prune stale merge
     # worktrees; if still low, skip the build and escalate as transient
     # infra rather than entering a doomed multi-minute ENOSPC build.
@@ -2620,7 +2665,7 @@ async def _run_post_merge_verify(
         # constructed here and are auto-excluded by LocalRunner's default.
         pool = VerifyRunnerPool(
             [LocalRunner(
-                merge_wt, req.config, req.module_configs, task_files_tuple,
+                merge_wt, req.config, effective_module_configs, task_files_tuple,
                 run_scoped=run_scoped_verification,
                 run_unscoped=_run_unscoped_typechecks,
                 task_id=req.task_id,
@@ -2848,7 +2893,7 @@ async def _run_post_merge_verify(
         and req.config.verify_cross_check_remote_green
     ):
         cross_check_runner = LocalRunner(
-            merge_wt, req.config, req.module_configs, task_files_tuple,
+            merge_wt, req.config, effective_module_configs, task_files_tuple,
             run_scoped=run_scoped_verification,
             run_unscoped=_run_unscoped_typechecks,
             task_id=req.task_id,
@@ -18833,7 +18878,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             return LocalRunner(
                 _item_for_factory.merge_wt,
                 _req_for_factory.config,
-                _req_for_factory.module_configs,
+                # Same γ resolution as the merge boundary (PRD §8.2): keep this
+                # slot/health placeholder consistent with the runner that
+                # actually drives the verify, so the two can never disagree
+                # about which modules a merge covers.
+                effective_merge_module_configs(
+                    _req_for_factory.config, _req_for_factory.module_configs,
+                ),
                 None,   # task_files — derived inside _run_post_merge_verify
                 run_scoped=run_scoped_verification,
                 run_unscoped=_run_unscoped_typechecks,
