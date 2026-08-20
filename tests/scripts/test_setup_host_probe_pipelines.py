@@ -176,3 +176,106 @@ def test_section_2_reports_healthy_on_a_clean_reply(tmp_path):
     combined = result.stdout + result.stderr
     assert "OK FalkorDB healthy" in combined, combined
     assert "FAIL FalkorDB did not become healthy" not in combined, combined
+
+
+# --- section 6: the jcodemunch MCP "already installed?" check --------------
+# The slice deliberately starts one block EARLY, at the .jcodemunch.jsonc
+# config write. The natural anchor — `if command -v claude &>/dev/null; then` —
+# occurs TWICE in this file and `slice_section` takes the first, which is a
+# different block entirely; and every narrower anchor is either comment prose
+# or opens the slice mid-`if` and yields unbalanced bash. The extra block only
+# writes $REPO_ROOT/.jcodemunch.jsonc into the tmp repo root, which is inert.
+_JCODEMUNCH_START = 'if [ ! -f "$REPO_ROOT/.jcodemunch.jsonc" ]; then'
+_JCODEMUNCH_END = 'ok "jcodemunch MCP added to user config"\n  fi\nfi'
+
+# Printed by the `claude` stub when `mcp add` runs. Telling "already installed"
+# from "installed it again" is the whole point: re-adding a server that IS
+# registered is the operator-visible harm here, and that re-add runs under
+# `set -e`, so a failing one takes the whole bootstrap down.
+_ADD_SENTINEL = "STUB-CLAUDE-MCP-ADD-RAN"
+
+_LISTING_NAMES_IT_THEN_NONZERO = (
+    "    printf 'jcodemunch: uvx jcodemunch-mcp - Connected\\n'\n    exit 1\n"
+)
+_LISTING_NAMES_IT_THEN_BULK = (
+    "    printf 'jcodemunch: uvx jcodemunch-mcp - Connected\\n'\n"
+    f"    head -c {BULK_BYTES} /dev/zero | tr '\\0' x\n"
+)
+_LISTING_WITHOUT_IT = "    printf 'some-other-server: uvx other - Connected\\n'\n    exit 0\n"
+_LISTING_UNREADABLE = "    exit 1\n"
+
+
+def _run_jcodemunch(tmp_path, list_body):
+    """Slice the jcodemunch MCP block and run it against a scripted `claude`."""
+    stub_bin = _stub_bin(tmp_path)
+    _write_stub(
+        stub_bin,
+        "claude",
+        'case "$*" in\n'
+        '  *"mcp add"*)\n'
+        f"    printf '{_ADD_SENTINEL}\\n'\n"
+        "    exit 0\n"
+        "    ;;\n"
+        '  *"mcp list"*)\n'
+        f"{list_body}"
+        "    ;;\n"
+        "  *)\n"
+        "    exit 0\n"
+        "    ;;\n"
+        "esac\n",
+    )
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir(exist_ok=True)
+    return run_section(
+        tmp_path,
+        slice_section(_JCODEMUNCH_START, _JCODEMUNCH_END),
+        repo_root=repo_root,
+        unit_dir=tmp_path / "units",
+    )
+
+
+def test_jcodemunch_sees_an_installed_server_when_the_listing_exits_nonzero(tmp_path):
+    """A listing that NAMES jcodemunch means it is installed, whatever its status.
+
+    `claude mcp list` reports on the whole probe — one unreachable server among
+    several is enough for a non-zero status — so its status says nothing about
+    whether jcodemunch appeared. Reading the verdict from the pipeline conflates
+    the two and re-runs `claude mcp add` on an already-registered server.
+    """
+    result = _run_jcodemunch(tmp_path, _LISTING_NAMES_IT_THEN_NONZERO)
+
+    combined = result.stdout + result.stderr
+    assert "OK jcodemunch MCP already in user config" in combined, combined
+    assert _ADD_SENTINEL not in combined, combined
+
+
+def test_jcodemunch_sees_an_installed_server_when_the_listing_is_sigpiped(tmp_path):
+    """A long listing dies of SIGPIPE the instant `grep -q` matches its first line."""
+    result = _run_jcodemunch(tmp_path, _LISTING_NAMES_IT_THEN_BULK)
+
+    combined = result.stdout + result.stderr
+    assert "OK jcodemunch MCP already in user config" in combined, combined
+    assert _ADD_SENTINEL not in combined, combined
+
+
+def test_jcodemunch_adds_the_server_when_the_listing_does_not_name_it(tmp_path):
+    """Guard: a listing without jcodemunch still installs it."""
+    result = _run_jcodemunch(tmp_path, _LISTING_WITHOUT_IT)
+
+    combined = result.stdout + result.stderr
+    assert _ADD_SENTINEL in combined, combined
+    assert "OK jcodemunch MCP added to user config" in combined, combined
+
+
+def test_jcodemunch_adds_the_server_when_the_listing_cannot_be_read(tmp_path):
+    """Guard: an unreadable listing installs, and the capture must not abort.
+
+    `returncode == 0` is the pin against a bare `out="$(...)"` capture, which
+    under `set -e` would kill the bootstrap on any host where `claude mcp list`
+    fails rather than falling through to the add.
+    """
+    result = _run_jcodemunch(tmp_path, _LISTING_UNREADABLE)
+
+    combined = result.stdout + result.stderr
+    assert result.returncode == 0, combined
+    assert _ADD_SENTINEL in combined, combined
