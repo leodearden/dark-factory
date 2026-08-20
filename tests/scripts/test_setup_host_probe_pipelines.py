@@ -21,7 +21,9 @@ The companion source-level sweep at the bottom forbids the construct itself.
 
 from __future__ import annotations
 
-from setup_host_sections import run_section, slice_section
+import re
+
+from setup_host_sections import run_section, setup_host_text, slice_section
 
 # Trailing bytes a producer writes AFTER the matching line, to provoke (b).
 #
@@ -279,3 +281,121 @@ def test_jcodemunch_adds_the_server_when_the_listing_cannot_be_read(tmp_path):
     combined = result.stdout + result.stderr
     assert result.returncode == 0, combined
     assert _ADD_SENTINEL in combined, combined
+
+
+# --- section 12: the FalkorDB health check ---------------------------------
+# The twin of the section-2 wait loop, minus the retry. Both anchors are code,
+# unique, and survive the fix.
+_SECTION_12_START = 'info "Health checks"'
+_SECTION_12_END = "\nfi\n"
+
+
+def _run_section_12(tmp_path, exec_body):
+    """Slice the section-12 FalkorDB health check and run it."""
+    stub_bin = _stub_bin(tmp_path)
+    _docker_stub(stub_bin, exec_body)
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir(exist_ok=True)
+    return run_section(
+        tmp_path,
+        slice_section(_SECTION_12_START, _SECTION_12_END),
+        repo_root=repo_root,
+        unit_dir=tmp_path / "units",
+        env_extra={"COMPOSE_FILE": str(tmp_path / "docker-compose.yml")},
+    )
+
+
+def test_section_12_reports_pong_when_the_producer_exits_nonzero_after_the_reply(
+    tmp_path,
+):
+    """A health check that got PONG says PONG, whatever the producer's status was."""
+    result = _run_section_12(tmp_path, _REPLY_THEN_NONZERO)
+
+    combined = result.stdout + result.stderr
+    assert "OK FalkorDB: PONG" in combined, combined
+    assert "FAIL FalkorDB: not responding" not in combined, combined
+
+
+def test_section_12_reports_pong_when_the_producer_is_sigpiped_after_the_reply(
+    tmp_path,
+):
+    """The SIGPIPE misread, at the health check rather than the wait loop."""
+    result = _run_section_12(tmp_path, _REPLY_THEN_BULK)
+
+    combined = result.stdout + result.stderr
+    assert "OK FalkorDB: PONG" in combined, combined
+    assert "FAIL FalkorDB: not responding" not in combined, combined
+
+
+def test_section_12_reports_not_responding_when_the_producer_says_nothing(tmp_path):
+    """Guard: a silent producer is still not-responding, reached without aborting."""
+    result = _run_section_12(tmp_path, _SILENT_FAILURE)
+
+    combined = result.stdout + result.stderr
+    assert result.returncode == 0, combined
+    assert "FAIL FalkorDB: not responding" in combined, combined
+    assert "OK FalkorDB: PONG" not in combined, combined
+
+
+# --- the file-scoped contract ----------------------------------------------
+# Any `-`-flag cluster containing `q` on the grep at the end of a pipe, so
+# `-q`, `-qF`, `-Fq` and `-i -q` are all caught. Deliberately does NOT match a
+# bare `| grep -F`.
+_GREP_Q_PIPE = re.compile(r"\|\s*grep\s+(?:-[A-Za-z]+\s+)*-[A-Za-z]*q")
+
+
+def _grep_q_offenders(source):
+    """Every non-comment line of *source* piping a producer into `grep -q`."""
+    return [
+        (n, line)
+        for n, line in enumerate(source.splitlines(), start=1)
+        if not line.strip().startswith("#") and _GREP_Q_PIPE.search(line)
+    ]
+
+
+def test_setup_host_never_pipes_a_producer_into_grep_q():
+    """No code line may decide anything through `producer | grep -q PAT`.
+
+    Generalises scripts/tests/test_lms_ctl.py::
+    test_installer_never_pipes_systemctl_into_grep to this file. The `pipefail`
+    assertion comes first because it is what makes the rule load-bearing:
+    without it there is no defect here and the sweep below would be guarding
+    nothing.
+
+    Scoped to `grep -q` ONLY. `| grep -F ... || true` inside a command
+    substitution is a different, already-guarded shape (the `|| true` is what
+    makes it safe) and is deliberately not swept in.
+
+    This forbids one known-defective construct and mandates no replacement
+    spelling — `[[ ]]`, `case`, or a `<<<` here-string are all still open to a
+    future author.
+    """
+    source = setup_host_text()
+
+    assert "set -euo pipefail" in source
+
+    offenders = _grep_q_offenders(source)
+    assert not offenders, "producer piped into `grep -q`:\n" + "\n".join(
+        f"  line {n}: {line.strip()}" for n, line in offenders
+    )
+
+
+def test_the_grep_q_sweep_detects_a_planted_pipeline():
+    """Guard the guard: a detector that stops matching makes the sweep vacuous.
+
+    Same discipline tests/scripts/test_check_dashboard_unit_parity.py::
+    test_the_sweep_finds_every_known_parity_call_site applies to its own sweep.
+    Passes on arrival — it pins the mechanism, not the product behaviour.
+    """
+    planted = (
+        'if foo | grep -q BAR; then\n'
+        'if foo | grep -qF BAR; then\n'
+        'if foo | grep -Fq BAR; then\n'
+        'if foo | grep -i -q BAR; then\n'
+    )
+    assert len(_grep_q_offenders(planted)) == 4, _grep_q_offenders(planted)
+
+    # A comment describing the construct is not the construct.
+    assert _grep_q_offenders('  # never write `foo | grep -q BAR` here\n') == []
+    # Nor is a non-`-q` grep, which cannot exit early on a match.
+    assert _grep_q_offenders("out=\"$(foo | grep -F 'tag' || true)\"\n") == []
