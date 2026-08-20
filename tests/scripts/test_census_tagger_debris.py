@@ -34,8 +34,10 @@ from pathlib import Path
 import pytest
 from audit_wiped_metadata_files import (
     _EVENT_PLAN_SOURCES,
+    CONFIRMED_NULL_SHA_DONE_PATH,
     FIDELITY_FILE_LEVEL,
     FIDELITY_LOCK_LEVEL,
+    NO_MERGE_EVENT,
 )
 from census_tagger_debris import (
     NEVER_RECONCILED,
@@ -47,6 +49,7 @@ from census_tagger_debris import (
     STATUS_TERMINAL,
     ScopeEvent,
     _connect_readonly,
+    census_project,
     classify_record,
     load_scope_events,
     load_stamped_records,
@@ -686,3 +689,179 @@ def test_an_empty_task_id_set_returns_nothing(tmp_path):
     )
 
     assert load_scope_events(str(db_path), set()) == {}
+
+
+# ---------------------------------------------------------------------------
+# census_project — one project root, end to end.
+# ---------------------------------------------------------------------------
+
+
+def test_census_project_reports_only_stamped_records_sorted_numerically(tmp_path):
+    """(a) 100 must FOLLOW 20, not precede it. Same reason the audit sorts on
+    int(task_id) at _candidate_sort_key:573-578: a lexical id order makes an
+    operator scanning the artifact lose their place."""
+    root = _make_project(
+        tmp_path,
+        tasks=[
+            {"id": 100, "metadata": {"files_tagged_at": _STAMP}},
+            {"id": 20, "metadata": {"files_tagged_at": _STAMP}},
+            {"id": 3, "metadata": {"files": ["a.py"]}},
+        ],
+    )
+    census = census_project(str(root))
+
+    assert [record.task_id for record in census.records] == [20, 100]
+
+
+def test_census_record_carries_every_field_a_consumer_joins_on(tmp_path):
+    """(b) INV-2: each row states its classification AND the evidence for it.
+
+    The merge signature is the audit's own verdict over this task's
+    merge_finalized history — a second, independently derived piece of
+    evidence, in the vocabulary DF 3113 P4a and DF 3427 already consume.
+    """
+    root = _make_project(
+        tmp_path,
+        name="dark-factory",
+        tasks=[
+            {
+                "id": 3113,
+                "status": "pending",
+                "metadata": {"files_tagged_at": _STAMP, "files": ["orchestrator/x.py"]},
+            }
+        ],
+        events=[
+            {
+                "event_type": "set_to_plan",
+                "task_id": 3113,
+                "timestamp": _BEFORE,
+                "data": {"files": ["orchestrator/"]},
+            },
+            {
+                "event_type": "merge_finalized",
+                "task_id": 3113,
+                "data": {"state": "already_merged", "merge_sha": None},
+            },
+        ],
+    )
+    (record,) = census_project(str(root)).records
+
+    assert record.project_id == "dark_factory"
+    assert record.tag == "master"
+    assert record.task_id == 3113
+    assert record.status == "pending"
+    assert record.files_tagged_at == _STAMP
+    assert record.status_class == STATUS_NON_TERMINAL
+    assert record.reconciliation == NEVER_RECONCILED
+    assert record.wipe_signature == POST_WIPE_OVERWRITE
+    assert record.preceded_by.event_type == "set_to_plan"
+    assert record.preceded_by.timestamp == _BEFORE
+    assert record.reconciled_by.event_type is None
+    assert record.metadata_files == ("orchestrator/x.py",)
+    assert record.merge_signature == CONFIRMED_NULL_SHA_DONE_PATH
+
+
+def test_merge_signature_defaults_to_no_merge_event_not_to_a_clean_verdict(tmp_path):
+    """(b) The correlation must be REAL REUSE, not a hardcoded default. With no
+    merge_finalized row the audit's classifier returns NO_MERGE_EVENT — UNKNOWN,
+    not clean, because found_on_main recovery and eval mode both reach DONE
+    without emitting one."""
+    root = _make_project(
+        tmp_path, tasks=[{"id": 1, "metadata": {"files_tagged_at": _STAMP}}]
+    )
+    (record,) = census_project(str(root)).records
+
+    assert record.merge_signature == NO_MERGE_EVENT
+
+
+def test_a_missing_event_log_degrades_loudly_not_into_a_clean_project(tmp_path):
+    """(c) NO-SILENT-FAIL-SOFT. Without runs.db, "no scope event postdates the
+    stamp" is UNKNOWN, not measured — but every stamped record must still be
+    reported, and the coverage block must say the event log was unreadable.
+    Reporting the same rows with a silent clean verdict would tell DF 3427 the
+    tagger's guesses were never superseded, which is a claim this run did not
+    make."""
+    root = _make_project(
+        tmp_path,
+        with_runs_db=False,
+        tasks=[
+            {"id": 1, "status": "pending", "metadata": {"files_tagged_at": _STAMP}},
+            {"id": 2, "status": "done", "metadata": {"files_tagged_at": _STAMP}},
+        ],
+    )
+    census = census_project(str(root))
+
+    assert [record.task_id for record in census.records] == [1, 2]
+    for record in census.records:
+        assert record.reconciliation == NEVER_RECONCILED
+        assert record.wipe_signature == NO_PRIOR_SCOPE
+        assert record.merge_signature == NO_MERGE_EVENT
+    assert census.coverage.event_log_read is False
+    assert census.coverage.stamped_records == 2
+
+
+def test_an_unreadable_tasks_db_raises_rather_than_reporting_a_partial_result(tmp_path):
+    """(d) THE ONE-AUDIT-PER-ROOT-OR-RAISE CONTRACT.
+
+    sweep_project_roots documents that its callback returns exactly one result
+    per root or raises sqlite3.Error, because that equality is what makes "no
+    results but some unreadable" mean precisely "every root failed" — the gate
+    exit 3 rests on. Returning a partial or empty census here would re-open the
+    false green that exit code exists to close.
+    """
+    root = tmp_path / "corrupt"
+    tasks_dir = root / ".taskmaster" / "tasks"
+    tasks_dir.mkdir(parents=True)
+    (tasks_dir / "tasks.db").write_bytes(b"this is not a database")
+
+    with pytest.raises(sqlite3.Error):
+        census_project(str(root))
+
+
+def test_coverage_is_always_reported_even_for_a_project_with_no_stamps(tmp_path):
+    """(e) A zero-record project must still report what was LOOKED AT. "Found
+    nothing" and "looked at nothing" are different claims, and only the
+    coverage block can tell them apart."""
+    root = _make_project(
+        tmp_path,
+        name="know-live",
+        tasks=[{"id": 1, "metadata": {"files": ["a.py"]}}, {"id": 2, "metadata": None}],
+    )
+    census = census_project(str(root))
+
+    assert census.records == []
+    assert census.coverage.project_id == "know_live"
+    assert census.coverage.total_tasks == 2
+    assert census.coverage.stamped_records == 0
+    assert census.coverage.event_log_read is True
+
+
+def test_a_post_stamp_scope_event_marks_the_record_reconciled(tmp_path):
+    """The axis-2 path through the real loader: an event AFTER the stamp means
+    a real derivation superseded the tagger's guess."""
+    root = _make_project(
+        tmp_path,
+        tasks=[{"id": 5, "status": "done", "metadata": {"files_tagged_at": _STAMP}}],
+        events=[
+            {
+                "event_type": "lock_acquired",
+                "task_id": 5,
+                "timestamp": _AFTER,
+                "data": {"modules": ["scripts/"]},
+            }
+        ],
+    )
+    (record,) = census_project(str(root)).records
+
+    assert record.status_class == STATUS_TERMINAL
+    assert record.reconciliation == RECONCILED
+    assert record.reconciled_by.timestamp == _AFTER
+
+
+def test_project_id_is_the_root_basename_with_underscores(tmp_path):
+    """The six corpora spell their ids with underscores where the directory
+    uses hyphens (solar-challenge-platform -> solar_challenge_platform). The
+    artifact must use the id spelling its consumers already key on."""
+    root = _make_project(tmp_path, name="solar-challenge-platform", tasks=[])
+
+    assert census_project(str(root)).coverage.project_id == "solar_challenge_platform"
