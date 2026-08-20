@@ -775,23 +775,36 @@ class TestFindingResolvability:
 
 
 class TestCandidateTargetSelection:
-    """The pure rule, unit-tested away from the walk that drives it."""
+    """The pure rule, unit-tested away from the walk that drives it.
+
+    `_candidate_targets`' own docstring advertises being "directly unit-testable
+    in isolation from the walk that drives it", so the invariant that a repair
+    target is never a node the edge is ALREADY attached to is pinned HERE, on
+    the single site that decides targets — not on end-to-end
+    `_verify_episode_referents` behaviour, which the pairing-arm narrowing
+    changes independently. These assertions hold either way.
+    """
 
     def test_the_pool_is_the_fact_cited_intersection_when_it_is_non_empty(self):
+        """Mode (iii): the fact cites 3075, the edge sits on 3074."""
         from fused_memory.services.memory_service import _candidate_targets
 
         assert _candidate_targets(
             referents=frozenset({Referent(number='3074'), Referent(number='3075')}),
             cited=frozenset({Referent(number='3075')}),
+            endpoint=Referent(number='3074'),
             other_endpoint=None,
         ) == (Referent(number='3075'),)
 
     def test_it_falls_back_to_the_declared_set_when_the_intersection_is_empty(self):
+        """The MEMBERSHIP shape: the endpoint is outside the declared set, so
+        subtracting it is a no-op and the sole declared referent survives."""
         from fused_memory.services.memory_service import _candidate_targets
 
         assert _candidate_targets(
             referents=frozenset({Referent(number='10')}),
             cited=frozenset({Referent(number='77')}),
+            endpoint=Referent(number='99'),
             other_endpoint=None,
         ) == (Referent(number='10'),)
 
@@ -801,6 +814,7 @@ class TestCandidateTargetSelection:
         assert _candidate_targets(
             referents=frozenset({Referent(number='2519')}),
             cited=frozenset({Referent(number='2519')}),
+            endpoint=Referent(number='2520'),
             other_endpoint=Referent(number='2519'),
         ) == ()
 
@@ -814,12 +828,141 @@ class TestCandidateTargetSelection:
             Referent(number='2', project_id='reify'),
         })
         first = _candidate_targets(referents=refs, cited=frozenset(),
+                                   endpoint=Referent(number='99'),
                                    other_endpoint=None)
 
         assert first == tuple(sorted(first, key=lambda r: (r.kind, r.project_id,
                                                            r.number)))
         assert _candidate_targets(referents=refs, cited=frozenset(),
+                                  endpoint=Referent(number='99'),
                                   other_endpoint=None) == first
+
+    def test_the_flagged_endpoint_is_subtracted_so_no_repair_targets_the_node_it_is_already_on(self):
+        """A "repair" onto the node the edge is ALREADY attached to is not a
+        repair — and is not even a harmless no-op.
+
+        `_intended_endpoint_uuid` resolves the CANONICAL name, so with a
+        non-canonical endpoint spelling ('task #3074') and a canonical
+        'Task 3074' node both present, a self-targeting finding yields a
+        DIFFERENT uuid and eta performs real edge surgery on an endpoint that
+        was already correct.
+
+        Zero survivors is therefore the RIGHT answer, not a defect: the caller
+        records `resolvable=False` with a reason, which is the fail-closed
+        "recorded and left alone" direction.
+        """
+        from fused_memory.services.memory_service import _candidate_targets
+
+        assert _candidate_targets(
+            referents=frozenset({Referent(number='3074')}),
+            cited=frozenset({Referent(number='77')}),
+            endpoint=Referent(number='3074'),
+            other_endpoint=None,
+        ) == ()
+
+    def test_both_endpoints_are_subtracted_together(self):
+        """Neither end of an edge can ever be its own repair target."""
+        from fused_memory.services.memory_service import _candidate_targets
+
+        assert _candidate_targets(
+            referents=frozenset({Referent(number='3074'), Referent(number='3075')}),
+            cited=frozenset(),
+            endpoint=Referent(number='3074'),
+            other_endpoint=Referent(number='3075'),
+        ) == ()
+
+    def test_the_membership_arm_is_unaffected_by_the_endpoint_subtraction(self):
+        """Asserted rather than merely argued: the pool is always a SUBSET of
+        `referents`, and membership fires precisely when the endpoint is NOT in
+        `referents`, so the subtraction provably cannot bite on that arm."""
+        from fused_memory.services.memory_service import _candidate_targets
+
+        assert _candidate_targets(
+            referents=frozenset({Referent(number='10'), Referent(number='11')}),
+            cited=frozenset(),
+            endpoint=Referent(number='99'),
+            other_endpoint=None,
+        ) == (Referent(number='10'), Referent(number='11'))
+
+
+class TestUnresolvableReason:
+    """"Recorded and left alone" must stay legible as a REASON, not an absence.
+
+    A reader must be able to tell "the check had nothing to point at but the
+    node it was already on" from "the only target would form a self-loop".
+    """
+
+    def test_more_than_one_candidate_names_the_ambiguity(self):
+        from fused_memory.services.memory_service import _unresolvable_reason
+
+        reason = _unresolvable_reason(
+            (Referent(number='10'), Referent(number='11')),
+            pool=frozenset({Referent(number='10'), Referent(number='11')}),
+            endpoint=Referent(number='99'),
+            other_endpoint=None,
+        )
+
+        assert 'Task 10' in reason and 'Task 11' in reason
+        assert 'more than one' in reason
+
+    def test_zero_candidates_names_the_endpoint_already_attached_condition(self):
+        """The pool held only the flagged endpoint itself."""
+        from fused_memory.services.memory_service import _unresolvable_reason
+
+        reason = _unresolvable_reason(
+            (),
+            pool=frozenset({Referent(number='3074')}),
+            endpoint=Referent(number='3074'),
+            other_endpoint=None,
+        )
+
+        assert 'Task 3074' in reason
+        assert 'already' in reason
+        assert 'self-loop' not in reason
+
+    def test_zero_candidates_still_names_the_self_loop_for_the_live_2519_row(self):
+        """referents {2519}, endpoints (Task 2519, Task 2520), a unary fact."""
+        from fused_memory.services.memory_service import _unresolvable_reason
+
+        reason = _unresolvable_reason(
+            (),
+            pool=frozenset({Referent(number='2519')}),
+            endpoint=Referent(number='2520'),
+            other_endpoint=Referent(number='2519'),
+        )
+
+        assert 'Task 2519' in reason
+        assert 'self-loop' in reason
+
+    def test_the_two_zero_candidate_reasons_are_distinguishable(self):
+        from fused_memory.services.memory_service import _unresolvable_reason
+
+        already_attached = _unresolvable_reason(
+            (), pool=frozenset({Referent(number='3074')}),
+            endpoint=Referent(number='3074'), other_endpoint=None,
+        )
+        self_loop = _unresolvable_reason(
+            (), pool=frozenset({Referent(number='2519')}),
+            endpoint=Referent(number='2520'),
+            other_endpoint=Referent(number='2519'),
+        )
+
+        assert already_attached != self_loop
+
+    def test_the_endpoint_arm_wins_when_both_subtractions_apply(self):
+        """Tested against the PRE-subtraction pool rather than inferred from
+        `other_endpoint is None`, which is what keeps the message HONEST when
+        both ends were subtracted."""
+        from fused_memory.services.memory_service import _unresolvable_reason
+
+        reason = _unresolvable_reason(
+            (),
+            pool=frozenset({Referent(number='3074'), Referent(number='3075')}),
+            endpoint=Referent(number='3074'),
+            other_endpoint=Referent(number='3075'),
+        )
+
+        assert 'already' in reason
 
 
 def _rows(*uuids) -> list[dict]:
