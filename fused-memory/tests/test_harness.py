@@ -18674,3 +18674,111 @@ def test_migrated_per_event_counters_keep_the_three_key_return_shape(
         f'exact 3-key harness shape expected, got {sorted(resume_storm)}'
     )
     assert resume_storm['projects'] == ['dark_factory', 'reify']
+
+
+def test_dead_owner_counter_is_a_distinct_key_shared_storm_counter(
+    journal, event_buffer, mock_memory_service,
+):
+    """The last of the three copies INV-5 forbids (task 3259).
+
+    ``_record_dead_owner_suppression`` is the counter that could NOT delegate
+    to StormCounter as it stood: it thresholds on distinct dead-owner
+    ``instance_id`` values (task 2039) while attributing to distinct
+    ``project_id`` values, and the class only had one label dimension.
+    ``count_distinct=True`` plus the per-call ``key`` is what closes that gap,
+    so this asserts the MODE, not merely the type — a default-mode counter here
+    would silently restore the pre-2039 raw-event threshold and re-fire on the
+    benign multi-project restart that esc-recon-50da2482-1 was about.
+    """
+    from shared.storm_counter import StormCounter
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+    assert isinstance(harness._dead_owner_storm, StormCounter), (
+        'the dead-owner counter must BE a shared StormCounter (INV-5)'
+    )
+    assert harness._dead_owner_storm._count_distinct is True, (
+        'it must be in DISTINCT-KEY mode — default mode would threshold on raw '
+        'suppression events and re-fire on a benign multi-project restart, the '
+        'esc-recon-50da2482-1 regression task 2039 fixed'
+    )
+
+
+def test_record_dead_owner_suppression_window_is_half_open(
+    journal, event_buffer, mock_memory_service,
+):
+    """An event aged EXACTLY window_seconds is already out of the window.
+
+    The behavioural half of delegation, as for the two per-event counters:
+    the hand-rolled body prunes strictly (``deque[0][0] < cutoff``) and so
+    KEEPS suppressions aged exactly the window, firing here; StormCounter's
+    half-open ``<= cutoff`` prunes them, leaving a distinct count of 1.
+    """
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    threshold = harness.config.dead_owner_suppression_storm_threshold
+    window = harness.config.dead_owner_suppression_storm_window_seconds
+    assert threshold == 6
+    assert window == 3600.0
+
+    base = datetime(2026, 7, 3, 13, 42, 37, tzinfo=UTC)
+
+    # threshold-1 suppressions, each a genuinely DISTINCT dead owner, all at base.
+    early = [
+        harness._record_dead_owner_suppression('reify', f'iid-boundary-{i}', now=base)
+        for i in range(threshold - 1)
+    ]
+    assert all(r is None for r in early), f'below threshold; got {early!r}'
+
+    boundary = harness._record_dead_owner_suppression(
+        'reify', 'iid-boundary-last', now=base + timedelta(seconds=window),
+    )
+
+    assert boundary is None, (
+        'suppressions aged EXACTLY window_seconds must have been pruned '
+        '(half-open window), leaving a distinct count of 1 below the '
+        f'threshold; got {boundary!r}'
+    )
+
+
+def test_record_dead_owner_suppression_keeps_both_label_dimensions_after_migration(
+    journal, event_buffer, mock_memory_service,
+):
+    """count follows instance_id; projects follows project_id — independently.
+
+    The property that forced ``count_distinct`` + ``key`` to be TWO axes rather
+    than one. Here 6 distinct dead owners are spread across only 3 projects, so
+    the two numbers genuinely differ: a summary that reported 3 (the project
+    count) would understate the incident, and one that reported the raw event
+    count would overstate it the moment any restart touched several projects.
+    """
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    threshold = harness.config.dead_owner_suppression_storm_threshold
+    assert threshold == 6
+
+    base = datetime(2026, 7, 3, 13, 42, 37, tzinfo=UTC)
+    projects = ['reify', 'dark_factory', 'autopilot_video']
+
+    results = [
+        harness._record_dead_owner_suppression(
+            projects[i % len(projects)], f'iid-two-dims-{i}', now=base + timedelta(seconds=i),
+        )
+        for i in range(threshold)
+    ]
+
+    assert all(r is None for r in results[:-1]), f'below threshold; got {results!r}'
+    storm = results[-1]
+    assert storm is not None, 'the threshold-th DISTINCT dead owner must fire'
+    assert set(storm) == {'count', 'window_seconds', 'projects'}, (
+        f'exact 3-key harness shape expected, got {sorted(storm)}'
+    )
+    assert storm['count'] == threshold, (
+        f'count follows the DISTINCT dead-owner-instance dimension, got '
+        f'{storm["count"]!r}'
+    )
+    assert storm['projects'] == sorted(projects), (
+        f'projects follows the project_id dimension independently, got '
+        f'{storm["projects"]!r}'
+    )
+    assert len(storm['projects']) < storm['count'], (
+        'this scenario is only meaningful if the two dimensions differ'
+    )
