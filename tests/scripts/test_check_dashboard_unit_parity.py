@@ -3034,3 +3034,126 @@ def test_every_parity_call_site_refuses_a_status_the_checker_did_not_produce(
             f"strength of an exit status the checker never produced.\n{out}\n"
             f"---\n{block}"
         )
+
+
+# ---------------------------------------------------------------------------
+# One shape at every site
+# ---------------------------------------------------------------------------
+#
+# The behavioural table above proves the classifier is RIGHT; these prove it is
+# the only classifier anyone uses. That is a separate claim, and the one a
+# half-refactor breaks: extracting the helper while leaving three sites on the
+# hand-rolled chain leaves the codebase with two shapes for one rule, so every
+# later sweep has to bless both and the next author has to guess which is
+# canonical. Task 3557 named that outcome as the reason it declined to extract
+# the helper at all rather than extract it halfway.
+#
+# Structural on purpose, unlike the behavioural sweep below it. Running a block
+# cannot see the difference between a site that called the helper and a site
+# that inlined an identical copy of it — both produce the correct verdict today
+# and only one of them stays correct when the helper changes.
+
+
+def test_the_verdict_helper_is_defined_exactly_once():
+    """One definition, or the sites do not share a classifier at all.
+
+    A second copy — a `_parity_verdict()` redefined lower in the file, or a
+    per-section variant — would silently win for every site below it under
+    bash's last-definition-wins rule, which is precisely the two-shapes state
+    the extraction exists to remove. The behavioural table slices the FIRST
+    definition, so a divergent second copy would not show up there.
+    """
+    text = setup_host_text()
+    definitions = [
+        lineno
+        for lineno, line in enumerate(text.splitlines(), start=1)
+        if not line.lstrip().startswith("#") and line.startswith("_parity_verdict()")
+    ]
+
+    assert len(definitions) == 1, (
+        f"`_parity_verdict` is defined {len(definitions)} times in "
+        f"setup-host.sh (lines {definitions}). Under bash's "
+        "last-definition-wins rule a second copy silently takes over every "
+        "call site below it, so the five gates would stop sharing one "
+        "classifier while every test here still passed."
+    )
+
+
+def test_the_verdict_helper_precedes_every_call_site():
+    """Defined above the first site, because bash resolves a function at CALL time.
+
+    A definition placed after a call site is not a style problem: the site runs
+    `_parity_verdict: command not found`, which under `set -e` inside a command
+    substitution yields an empty verdict and a non-zero status, and the gate
+    reports on a token that was never produced. The five sites share one shell
+    scope, so ONE position satisfies all of them.
+    """
+    text = setup_host_text()
+    definition = next(
+        index
+        for index, line in enumerate(text.splitlines(), start=1)
+        if not line.lstrip().startswith("#") and line.startswith("_parity_verdict()")
+    )
+    first_site = min(lineno for lineno, _, _ in _parity_call_sites())
+
+    assert definition < first_site, (
+        f"`_parity_verdict` is defined at setup-host.sh:{definition}, BELOW "
+        f"the first parity call site at line {first_site}. Bash resolves a "
+        "function when the call runs, so that site would invoke a name that "
+        "does not exist yet."
+    )
+
+
+@pytest.mark.parametrize(
+    "lineno,checker,block",
+    _PARITY_CALL_SITES,
+    ids=[f"L{lineno}-{name}" for lineno, name, _ in _PARITY_CALL_SITES],
+)
+def test_every_parity_call_site_routes_through_the_shared_verdict_helper(
+    lineno: int, checker: str, block: str
+):
+    """Every site classifies through `_parity_verdict`, none by hand.
+
+    Collected from the sweep, so a sixth site added tomorrow is held to this
+    rule without anyone remembering to add it here.
+    """
+    assert "_parity_verdict" in block, (
+        f"The parity call site at setup-host.sh:{lineno} ({checker}) does not "
+        "name `_parity_verdict`. It is classifying the checker's output by "
+        "hand, which is the two-shapes-for-one-rule state the shared helper "
+        f"exists to remove.\n{block}"
+    )
+
+
+# A bare status read, e.g. `[ "$_fm_parity_exit" -eq 2 ]`. Matched on the
+# variable, not on `-eq` alone: `_orch_install_blocked` and the verdict token
+# comparisons are legitimate arithmetic/string tests in these same blocks, and
+# forbidding the operator outright would forbid those too.
+_BARE_STATUS_READ_RE = re.compile(r"\$\{?_\w*parity_exit\}?\"?\s*-eq\b")
+
+
+@pytest.mark.parametrize(
+    "lineno,checker,block",
+    _PARITY_CALL_SITES,
+    ids=[f"L{lineno}-{name}" for lineno, name, _ in _PARITY_CALL_SITES],
+)
+def test_no_parity_call_site_branches_on_a_bare_exit_status(
+    lineno: int, checker: str, block: str
+):
+    """The exit status is read ONCE, inside the helper, never at a site.
+
+    This is the half-refactor guard with teeth: a site could call
+    `_parity_verdict` for its logging and still branch on `-eq 2` underneath,
+    which reads as converted and behaves as it always did. The status is still
+    captured and still PASSED to the helper — that is the interface — it just
+    may not be interpreted here.
+    """
+    bare = _BARE_STATUS_READ_RE.search(block)
+
+    assert bare is None, (
+        f"The parity call site at setup-host.sh:{lineno} ({checker}) still "
+        f"branches on its raw exit status ({bare.group(0)!r} at offset "
+        f"{bare.start()}). Exit 2 is overloaded three ways, so interpreting "
+        "the status anywhere but inside `_parity_verdict` re-creates the "
+        f"defect the helper centralises.\n{block}"
+    )

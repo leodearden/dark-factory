@@ -68,21 +68,39 @@ def test_setup_host_runs_the_lms_parity_checker(lms_block: str):
     assert "--repo-root" in lms_block
 
 
-def test_exit_2_is_the_benign_not_installed_branch(lms_block: str):
-    """Exit 2 must not warn: on most hosts it is the CORRECT state.
+def test_the_absent_verdict_is_the_benign_not_installed_branch(lms_block: str):
+    """The `absent` verdict must not warn: on most hosts it is the CORRECT state.
 
     setup-host.sh installs no lms units — it contains no reference to
     install-lms or local-model-serving — so on any host that never installed
     the arms, 2 is the expected outcome. Warning there every single run is how
     operators learn to ignore the gate, taking the real finding with it.
-    """
-    assert re.search(r'-eq\s+2', lms_block), lms_block
 
-    # The exit-2 arm reports, it does not warn.
+    Anchored on the `absent` VERDICT rather than a literal `-eq 2`: the gate
+    now hands its captured output and status to `_parity_verdict`, which is the
+    single place exit 2 is interpreted. The argument above is unchanged and is
+    what this test still enforces — only the token the arm is keyed on moved
+    from the raw status to the verdict the helper returns.
+    """
+    assert "_parity_verdict" in lms_block, lms_block
+
+    # The absent arm reports, it does not warn.
+    #
+    # Matched under either branch shape — a `case` arm (`absent) ... ;;`) or a
+    # `[ "$v" = absent ]` test closed by the next elif/else/fi/;;. Which of the
+    # two reads better is a style call, and pinning one here would reject a
+    # correct gate for a non-reason: this suite already learned that lesson
+    # where it asserts non-INVOCATION rather than non-MENTION below.
     benign = re.search(
-        r'-eq\s+2\s*\]\s*;\s*then(?P<arm>.*?)\belse\b', lms_block, re.DOTALL
+        r"(?:\babsent\s*\)|=[=]?\s*[\"']?absent\b[\"']?\s*\]\s*;?\s*then)"
+        r"(?P<arm>.*?)(?:;;|\belif\b|\belse\b|\bfi\b)",
+        lms_block,
+        re.DOTALL,
     )
-    assert benign, lms_block
+    assert benign, (
+        "The lms-arm@ gate has no discoverable `absent` arm — it cannot be "
+        f"reporting the not-installed state apart from a finding.\n{lms_block}"
+    )
     assert "info " in benign.group("arm")
     assert "warn " not in benign.group("arm")
 

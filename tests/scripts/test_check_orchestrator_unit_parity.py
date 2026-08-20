@@ -1526,20 +1526,35 @@ def test_parity_gate_runs_BEFORE_the_units_are_copied():
     )
 
 
-def test_parity_gate_distinguishes_exit_2_from_exit_1():
-    """The branch treats 2 (not installed here) apart from 1 (actionable).
+def test_parity_gate_distinguishes_absent_from_a_finding():
+    """The branch treats `absent` (not installed here) apart from `finding`.
 
-    Matching the existing fused-memory and dashboard blocks: 2 is a benign
-    "not installed on this host, skipping", and collapsing it into the drift
-    branch would make a fresh host look like it had a supervision problem.
+    Matching the existing fused-memory and dashboard blocks: "not installed on
+    this host, skipping" is benign, and collapsing it into the drift branch
+    would make a fresh host look like it had a supervision problem.
+
+    Stated in VERDICT terms rather than as a literal `-eq 2`, because the block
+    no longer reads the status itself: it passes the status to
+    `_parity_verdict`, which owns the one place exit 2 is interpreted (that
+    centralisation is the point — 2 is overloaded three ways, and a site that
+    reads it directly re-creates the defect). The claim under test is unchanged
+    — the two states still get their own arms — only the vocabulary it is
+    expressed in has moved.
     """
     text = _setup_host_text()
     block = _orchestrator_gate_block(text)
 
-    assert "-eq 2" in block, (
-        "The orchestrator parity branch does not distinguish exit 2 "
-        "(not installed on this host) from exit 1 (actionable drift)."
+    assert "_parity_verdict" in block, (
+        "The orchestrator parity branch does not route through "
+        "`_parity_verdict`, so it is classifying an overloaded exit status by "
+        f"hand.\n{block}"
     )
+    for verdict in ("absent", "finding"):
+        assert re.search(rf"\b{verdict}\b", block), (
+            f"The orchestrator parity branch has no `{verdict}` arm. Without "
+            "one it cannot distinguish a host that never installed the units "
+            "from a host with actionable drift.\n" + block
+        )
     # Non-fatal: the gate reports and declines to install, but must never
     # abort setup-host.sh itself — five units are knowingly red on this host
     # today, and killing the run there would take every later section with it.
