@@ -53,6 +53,8 @@ ScannedRecord = _mod.ScannedRecord
 scan_records = _mod.scan_records
 adjudicate = _mod.adjudicate
 Finding = _mod.Finding
+# vars() does not work on a slots dataclass — the script's own accessor does.
+vars_of = _mod.vars_of
 UNRESOLVABLE = _mod.UNRESOLVABLE
 build_report = _mod.build_report
 _build_parser = _mod._build_parser
@@ -393,7 +395,13 @@ class TestAdjudicate:
         assert finding.claim_kind == 'filing_dispatch'
         assert 'tkt_0RRRC5AASJ9Z630VP4PCN9H376' in finding.claimed_text
         assert 'no ticket' in finding.observed
-        assert finding.derived_edge_uuids == ()
+        # The PURE layer read no graph, so it knows nothing about edges: all
+        # three not-enumerated columns say so together. () here would be a
+        # MEASURED zero on the report's central harm-artefact column, claimed
+        # by a layer that never queried.
+        assert finding.derived_edge_uuids is None
+        assert finding.derived_edges_by_graph is None
+        assert finding.edges_unqueried is True
         assert finding.to_json()['status'] == 'mismatch'
 
     def test_mismatches_sort_before_unverifiables(self) -> None:
@@ -430,6 +438,7 @@ def _finding(
     created_at: str = '2026-07-26T00:00:00Z',
     graph_name: str | None = None,
     edges_unqueried: bool = False,
+    edges_unqueried_in: tuple[str, ...] = (),
 ) -> object:
     return Finding(
         record_uuid=uuid,
@@ -445,9 +454,109 @@ def _finding(
         status=status,
         observed=f'observed for {ref}',
         claimed_text='some claiming clause',
+        # Both edge columns move TOGETHER — Finding.__post_init__ rejects the
+        # disagreeing pair, which is the shape CAVEAT 7 declares impossible.
         derived_edge_uuids=None if edges_unqueried else (),
+        derived_edges_by_graph=None if edges_unqueried else (),
         edges_unqueried=edges_unqueried,
+        edges_unqueried_in=edges_unqueried_in,
     )
+
+
+class TestFindingShape:
+    """The row's own contract: hashable, immutable, and unable to lie."""
+
+    def test_an_enriched_finding_is_still_hashable(self) -> None:
+        """Set/dict membership must not start raising once a store is read.
+
+        The attribution map is stored as ordered PAIRS precisely so this keeps
+        working: a dict field would make the auto-generated __hash__ raise
+        TypeError, and only for findings that went through ``_run`` — never
+        under the pure layer's tests, i.e. exactly where a run-to-run finding
+        delta (`set(a) - set(b)`, the natural move for this artifact set) would
+        first hit it.
+        """
+        enriched = {
+            'derived_edge_uuids': ('edge-a', 'edge-b'),
+            'derived_edges_by_graph': (
+                ('reify', ('edge-a',)), ('dark_factory', ('edge-b',)),
+            ),
+            'edges_unqueried': False,
+            'edges_enumerated_in': ('reify', 'dark_factory'),
+        }
+        one = Finding(**{**vars_of(_finding()), **enriched})
+        two = Finding(**{**vars_of(_finding()), **enriched})
+        assert hash(one) == hash(two)
+        assert one == two
+        assert len({one, two}) == 1
+        # And the JSON shape is a plain object regardless of the storage form.
+        assert one.to_json()['derived_edges_by_graph'] == {
+            'reify': ['edge-a'], 'dark_factory': ['edge-b'],
+        }
+
+    def test_the_attribution_cannot_be_mutated_through_the_frozen_wrapper(
+        self,
+    ) -> None:
+        """``frozen=True`` must not advertise an immutability it lacks."""
+        finding = Finding(**{
+            **vars_of(_finding()),
+            'derived_edge_uuids': ('edge-a',),
+            'derived_edges_by_graph': (('reify', ('edge-a',)),),
+            'edges_unqueried': False,
+        })
+        assert isinstance(finding.derived_edges_by_graph, tuple)
+        with pytest.raises(TypeError):
+            finding.derived_edges_by_graph[0] = ('other', ())  # type: ignore[index]
+
+    @pytest.mark.parametrize(
+        ('columns', 'why'),
+        [
+            (
+                {'derived_edge_uuids': (), 'derived_edges_by_graph': None,
+                 'edges_unqueried': False},
+                'a measured zero on the flat column beside a null map',
+            ),
+            (
+                {'derived_edge_uuids': None, 'derived_edges_by_graph': None,
+                 'edges_unqueried': False},
+                'null edges that do not admit to being unqueried',
+            ),
+            (
+                {'derived_edge_uuids': ('e',),
+                 'derived_edges_by_graph': (('reify', ('e',)),),
+                 'edges_unqueried': True},
+                'a real measurement flagged as never queried',
+            ),
+        ],
+    )
+    def test_disagreeing_edge_columns_are_rejected_at_construction(
+        self, columns: dict, why: str,
+    ) -> None:
+        """CAVEAT 7's impossible shapes must be unconstructable, not merely
+        undocumented — the three columns state ONE fact three ways."""
+        base = {
+            k: v for k, v in vars_of(_finding()).items()
+            if k not in {'derived_edge_uuids', 'derived_edges_by_graph',
+                         'edges_unqueried'}
+        }
+        with pytest.raises(ValueError, match='must agree'):
+            Finding(**base, **columns)
+
+    def test_the_agreeing_states_are_all_accepted(self) -> None:
+        """Guarding the impossible must not outlaw the three real states."""
+        base = {
+            k: v for k, v in vars_of(_finding()).items()
+            if k not in {'derived_edge_uuids', 'derived_edges_by_graph',
+                         'edges_unqueried'}
+        }
+        # not enumerated / enumerated-and-empty / enumerated-with-edges
+        Finding(**base, derived_edge_uuids=None,
+                derived_edges_by_graph=None, edges_unqueried=True)
+        Finding(**base, derived_edge_uuids=(),
+                derived_edges_by_graph=(('reify', ()),), edges_unqueried=False)
+        Finding(**base, derived_edge_uuids=('e',),
+                derived_edges_by_graph=(('reify', ('e',)),),
+                edges_unqueried=False)
 
 
 class TestBuildReport:
@@ -527,6 +636,39 @@ class TestBuildReport:
             _finding('mismatch', uuid='ep-c'),
         ])
         assert report['summary']['edges_unqueried'] == 2
+
+    def test_edges_partial_and_edges_unqueried_split_a_mixed_population(
+        self,
+    ) -> None:
+        """The two coverage denominators never double-count the same row.
+
+        ``_run`` computes coverage GLOBALLY — one batched scan per graph, so
+        every finding in a run shares the same answered/unanswered split and
+        ``edges_partial`` is necessarily 0 or len(findings) there. This layer
+        is where a mixed population is expressible, so it is where the
+        counters' actual predicate gets exercised.
+        """
+        report = self._build([
+            # Partial: some graph answered, some did not — a measured LOWER
+            # BOUND, counted only by edges_partial.
+            _finding('mismatch', uuid='ep-partial',
+                     edges_unqueried_in=('reify',)),
+            # Fully unqueried: no graph answered — counted only by
+            # edges_unqueried, even though it also names unqueried graphs.
+            _finding('mismatch', uuid='ep-none', edges_unqueried=True,
+                     edges_unqueried_in=('dark_factory', 'reify')),
+            # Fully covered: no hole at all.
+            _finding('mismatch', uuid='ep-full'),
+        ])
+        assert report['summary']['edges_partial'] == 1
+        assert report['summary']['edges_unqueried'] == 1
+        rows = {f['record_uuid']: f for f in report['findings']}
+        assert rows['ep-partial']['edges_unqueried_in'] == ['reify']
+        assert rows['ep-partial']['edges_unqueried'] is False
+        assert rows['ep-none']['edges_unqueried'] is True
+        # Always present, [] when there is no hole — an absent key and "no
+        # hole" must not read the same.
+        assert rows['ep-full']['edges_unqueried_in'] == []
 
     def test_report_is_json_serializable_and_byte_stable(self) -> None:
         findings = [
