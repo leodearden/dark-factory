@@ -397,3 +397,90 @@ class TestProvenanceStampDoesNotDisarmCodeChangeSuppression:
         )
         assert finding is not None
         assert 'do_not_author_plan' in finding.markers
+
+    def test_authored_signal_after_the_stamp_paragraph_still_suppresses(self):
+        """CONTAINMENT: the stamp strip stops at the blank line ending the
+        stamp's own paragraph, so an AUTHORED "fix" in a LATER paragraph
+        still suppresses (task-2408 precision preserved)."""
+        finding = routing_intent_finding(
+            title=None,
+            description=(
+                'DO NOT IMPLEMENT.'
+                '\n\n[Stage 2 task-knowledge sync 2026-07-07] DOC-DRIFT FIX '
+                '(finding x): re-derived the count.'
+                '\n\nAlso fix the retry helper while you are in here.'
+            ),
+            details=None,
+            task_kind='normal',
+            metadata=None,
+        )
+        assert finding is None, f'Authored trailing "fix" must still suppress, got: {finding!r}'
+
+    def test_authored_signal_before_the_stamp_still_suppresses(self):
+        """CONTAINMENT (leading side): an authored code-change signal in a
+        paragraph BEFORE the stamp is untouched by the strip and still
+        suppresses."""
+        finding = routing_intent_finding(
+            title=None,
+            description=(
+                'Fix the ingestion pipeline.'
+                '\n\n[Stage 2 task-knowledge sync 2026-07-07] note.'
+                '\n\nDO NOT IMPLEMENT.'
+            ),
+            details=None,
+            task_kind='normal',
+            metadata=None,
+        )
+        assert finding is None, f'Authored leading "Fix" must still suppress, got: {finding!r}'
+
+    def test_markdown_link_at_line_start_is_not_a_provenance_stamp(self):
+        """PRECISION: DF's own task prose routinely opens a line with a
+        markdown link naming a recon stage. Treating it as a stamp would
+        strip a whole AUTHORED paragraph and manufacture a finding."""
+        finding = routing_intent_finding(
+            title=None,
+            description=(
+                '[Stage 1 stall detector]'
+                '(fused-memory/src/fused_memory/reconciliation/stage1_stall_detector.py)'
+                ' needs a fix; DO NOT IMPLEMENT until reviewed.'
+            ),
+            details=None,
+            task_kind='normal',
+            metadata=None,
+        )
+        assert finding is None, f'A markdown link is not a stamp, got: {finding!r}'
+
+    def test_inline_dated_bracket_is_not_a_provenance_stamp(self):
+        """PRECISION: a mid-sentence dated bracket is authored prose, not an
+        appended annotation block, so it must not swallow the rest of the
+        sentence."""
+        finding = routing_intent_finding(
+            title=None,
+            description=(
+                'Spanning 2026-04-09 to 2026-08-06 [re-verified 2026-08-06]. '
+                'DO NOT IMPLEMENT before the fix lands.'
+            ),
+            details=None,
+            task_kind='normal',
+            metadata=None,
+        )
+        assert finding is None, f'An inline dated bracket is not a stamp, got: {finding!r}'
+
+    def test_marker_inside_a_stamp_still_produces_a_finding(self):
+        """MONOTONICITY lock: the marker scan reads RAW field text, so a
+        marker that lives INSIDE a stamp still fires. The strip is
+        asymmetric by design -- it never removes a finding that fires
+        today."""
+        finding = routing_intent_finding(
+            title='Dependency census for the milestone gate',
+            description='Re-derived the dependency count from the task graph.',
+            details=(
+                '[Stage 2 task-knowledge sync 2026-07-07] DOC-DRIFT FIX: the '
+                'task text says "do not implement" but is filed normal.'
+            ),
+            task_kind='normal',
+            metadata=None,
+        )
+        assert finding is not None
+        assert 'do_not_implement' in finding.markers
+        assert 'details' in finding.fields
