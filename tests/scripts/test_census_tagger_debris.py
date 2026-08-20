@@ -31,6 +31,7 @@ import json
 import sqlite3
 import subprocess
 import sys
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -1335,3 +1336,107 @@ def test_exit_codes_stay_in_lockstep_with_the_shared_audit_ladder():
     assert EXIT_NO_ROOT == AUDIT_EXIT_NO_ROOT
     assert EXIT_NOTHING_SCANNED == AUDIT_EXIT_NOTHING_AUDITED
     assert EXIT_STALE == 1
+
+
+# ---------------------------------------------------------------------------
+# The committed-artifact contract — the machine-checkable form of task 4525's
+# user-observable signal.
+#
+# These read the STATIC repo files, never a live database, so they are stable
+# under corpus drift. That is what makes it safe to assert the four positive
+# controls here and nowhere else: the artifact is a committed snapshot, and
+# regenerating it is a deliberate, reviewed act.
+#
+# DELIBERATELY ABSENT: any assertion on a total count, on the PRD's "33 live
+# victims (11 dark_factory, 22 reify)" figure, or on any other live-DB-derived
+# value. The PRD's number was measured with a differently-scoped lens and does
+# not reproduce under the strict three-axis intersection this task specifies;
+# asserting it would be a doomed test no implementation could satisfy.
+# ---------------------------------------------------------------------------
+
+_ARTIFACT_JSON = Path(__file__).parent.parent.parent / "plans" / "module-tagger-debris-census.json"
+_ARTIFACT_MD = Path(__file__).parent.parent.parent / "plans" / "module-tagger-debris-census.md"
+
+_REQUIRED_PROJECT_IDS = (
+    "dark_factory",
+    "reify",
+    "autopilot_video",
+    "know_live",
+    "pump_web_ui",
+    "solar_challenge_platform",
+)
+
+# The four records task 4525 names as positive controls. Asserted against the
+# COMMITTED artifact, not a live query, so corpus drift cannot turn them red.
+_POSITIVE_CONTROLS = (("reify", 6068), ("reify", 5602), ("reify", 5632), ("dark_factory", 3113))
+
+
+@pytest.fixture(scope="module")
+def artifact():
+    assert _ARTIFACT_JSON.exists(), f"the committed artifact is missing: {_ARTIFACT_JSON}"
+    return json.loads(_ARTIFACT_JSON.read_text(encoding="utf-8"))
+
+
+def test_the_committed_pair_exists_and_the_json_parses(artifact):
+    """(a) Both halves are committed. A JSON without its readable twin is a
+    half-published artifact."""
+    assert _ARTIFACT_MD.exists()
+    assert artifact["records"]
+
+
+def test_the_artifact_cannot_silently_lag_a_schema_bump(artifact):
+    """(b) Bumping SCHEMA_VERSION without regenerating leaves consumers reading
+    an old shape under a new version number. This is what forces the pair to
+    move together."""
+    assert artifact["schema_version"] == SCHEMA_VERSION
+
+
+def test_all_six_corpora_are_present_in_both_halves(artifact):
+    """(c) A missing project is indistinguishable from a project with nothing
+    to report unless the block is present with its counts."""
+    markdown = _ARTIFACT_MD.read_text(encoding="utf-8")
+    for project_id in _REQUIRED_PROJECT_IDS:
+        block = artifact["projects"][project_id]
+        assert isinstance(block["total_tasks"], int)
+        assert isinstance(block["stamped_records"], int)
+        assert project_id in markdown
+
+
+@pytest.mark.parametrize(("project_id", "task_id"), _POSITIVE_CONTROLS)
+def test_the_required_positive_controls_are_present_and_classified(artifact, project_id, task_id):
+    """(d) The four records task 4525 names. Each must carry a non-empty stamp
+    and a full three-axis classification — a control present but unclassified
+    would prove nothing."""
+    matches = [
+        record for record in artifact["records"]
+        if record["project_id"] == project_id and record["task_id"] == task_id
+    ]
+    assert len(matches) == 1, f"{project_id} {task_id} missing from the artifact"
+    (record,) = matches
+
+    assert record["files_tagged_at"]
+    assert record["status_class"] in {STATUS_TERMINAL, STATUS_NON_TERMINAL}
+    assert record["reconciliation"] in {RECONCILED, NEVER_RECONCILED}
+    assert record["wipe_signature"] in {POST_WIPE_OVERWRITE, NO_PRIOR_SCOPE}
+
+
+def test_every_record_carries_its_complete_evidence_key_set(artifact):
+    """(e) INV-2: no row is a prose-only claim. Every record states the
+    deciding event for each axis, with an explicit null where there was none."""
+    for record in artifact["records"]:
+        for key in ("reconciled_by", "preceded_by"):
+            assert set(record[key]) == {"event_type", "event_id", "timestamp"}, record["task_id"]
+        assert record["merge_signature"]
+
+
+def test_per_project_counts_agree_with_the_records_array(artifact):
+    """(f) An INTERNAL-CONSISTENCY check that pins no absolute number, so it
+    cannot go red on corpus drift: whatever the counts are, the summary and the
+    detail must be telling the same story."""
+    counted = Counter(record["project_id"] for record in artifact["records"])
+
+    for project_id, block in artifact["projects"].items():
+        assert block["stamped_records"] == counted.get(project_id, 0), project_id
+        assert sum(block["cells"].values()) == block["stamped_records"], project_id
+
+    assert artifact["coverage"]["stamped_records"] == len(artifact["records"])
