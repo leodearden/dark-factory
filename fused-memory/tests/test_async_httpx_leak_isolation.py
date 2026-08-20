@@ -81,6 +81,10 @@ default-lane suite)::
 
 BEFORE / AFTER. Measured as a control/treatment A/B over those 7 modules with
 one throwaway probe (control = this reaper neutered; 376 passed in both arms).
+Taken against the drain's FIRST cut, i.e. before the teardown ordering was
+fixed — see MEASURED TEARDOWN ORDER below; what it establishes (the reaper
+takes RESURRECTIONS to zero) is independent of which arm does the closing, and
+the full-suite census further down re-establishes it under the shipped order.
 The probe wraps ``AsyncHttpxClientWrapper.__del__`` and records, for each
 finalisation of an UNCLOSED wrapper, whether a loop was running at that moment
 — i.e. whether ``__del__`` actually reached ``create_task(self.aclose())``.
@@ -106,14 +110,62 @@ the sync autouse arm is therefore defence-in-depth (against a client held past
 its test body by a mock's ``call_args`` or a reference cycle, and collected
 later inside a running loop) rather than same-run coverage of that cohort.
 
-FULL SUITE, three orderings (``-n auto`` / ``-n 8`` / ``-n 16``, all
-``--dist loadgroup``): 14564 passed, 2 skipped, 0 failed in each. Identical
-census every time — 43 wrappers built (the 40 above plus 3 built by this
-module), 25 closed, 1 resurrection, and that one resurrection is
+MEASURED TEARDOWN ORDER (re-measured after the ordering fix, because the first
+cut of this drain had it backwards). A spy on conftest's own
+``reap_leaked_async_httpx_clients`` / ``_leaked_async_httpx_clients``,
+installed at ``pytest_collection_finish`` so it survives function-scoped
+teardown — a ``monkeypatch`` spy would be undone before the arms run — records
+per test which arm fired, in which loop::
+
+    PRE-FIX  sync  test_returns_openai_client
+               [('sync-arm-empty-check', -), ('reap', L1)]
+    PRE-FIX  async test_skip_maintenance_true_skips_both_blocks
+               [('sync-arm-empty-check', -), ('reap', L1), ('reap', L2)]
+    POST-FIX sync  test_returns_openai_client
+               [('reap', L1), ('sync-arm-empty-check', -)]
+    POST-FIX async test_skip_maintenance_true_skips_both_blocks
+               [('reap', L1), ('sync-arm-empty-check', -)]
+
+Three things fall out. (1) The order SHIPPED by the first cut was
+sync-arm-FIRST — the exact inverse of the declaration-order story it was
+documented with. It is now async-arm-first for both sync and async tests.
+(2) Pre-fix, an async test reaped TWICE in TWO DIFFERENT loops: the sync arm's
+throwaway ``asyncio.run`` loop closed the clients and the async arm then found
+nothing — i.e. the real-I/O cohort was being closed CROSS-LOOP, the very thing
+this drain exists to avoid. Post-fix there is exactly one reap, in the test's
+own loop. (3) The ``pytest_asyncio`` arm DOES fire for a plain ``def test_``
+(in a throwaway loop of its own), so the sync arm is defence in depth rather
+than coverage of a gap.
+
+The ordering is bought by an explicit FIXTURE DEPENDENCY — the async arm takes
+the sync arm as an argument, so the sync arm is set up first and torn down last
+— NOT by declaration order, which pytest-asyncio 1.x does not honour here
+because its async fixtures acquire an event-loop dependency that reorders them
+against plain autouse fixtures. Pinned behaviourally by this module's
+``test_aaa_leaked_client_records_its_closing_loop`` /
+``test_aab_the_leak_was_closed_in_its_own_test_loop`` pair.
+
+FULL SUITE (re-run under the shipped ordering), two distributions —
+``-n auto`` and ``-n 8``, both ``--dist loadgroup``, the flake being
+ordering-sensitive: 14621 passed, 2 skipped, 0 failed in each (921s / 980s).
+Identical census both times — 44 wrapper instances built (the 40 above plus 4
+built by this module), 27 already closed by the time they were finalised, 0
+still alive and open at session end, and exactly 1 RESURRECTION, which is
 ``test_a_reaped_client_del_schedules_no_aclose_task`` DELIBERATELY invoking
-``__del__`` on an unclosed client to prove the mechanism. Grepping all three
-runs' output for ``Task exception was never retrieved``, ``AsyncClient.aclose``
-and ``Event loop is closed`` returned 0 hits each.
+``__del__`` on an unclosed client to prove the mechanism. (46 finalisation
+EVENTS against 44 objects: that same test calls ``__del__`` explicitly twice
+before the object is really collected.) The other 18 are the sync cohort dying
+by refcount at test exit with no loop running — see the NOTE above; they cannot
+resurrect. Grepping both runs' output for ``Task exception was never
+retrieved``, ``AsyncClient.aclose`` and ``Event loop is closed`` returned 0
+hits each.
+
+Toolchain all of the above was measured against: python 3.13.9, pytest 9.0.3,
+pytest-asyncio 1.3.0 (``asyncio_mode=strict``), httpx 0.28.1, openai 2.31.0,
+anthropic 0.92.0. The ordering is a property of pytest-asyncio's fixture graph
+and the drain rides on openai/anthropic internals, so a bump to any of these is
+exactly when the affinity pair and
+``test_a_reaped_client_del_schedules_no_aclose_task`` should be re-run.
 """
 from __future__ import annotations
 
@@ -369,20 +421,29 @@ def test_autouse_async_reap_fixture_is_active(request):
 def test_autouse_sync_reap_fixture_is_active(request):
     """The sync-test drain fixture is wired as an autouse teardown fixture.
 
-    BOTH arms are required because the leak cohorts are mixed. Measured: the
-    largest single cohort — ``test_graphiti_llm_client_construction.py``'s
-    ``test_returns_openai_client``, 16 of the 40 leaked clients — is a SYNC
+    The leak cohorts genuinely ARE mixed: the largest single one —
+    ``test_graphiti_llm_client_construction.py``'s
+    ``test_returns_openai_client``, 16 of the 40 measured leaks — is a SYNC
     ``def test_``, while ``test_startup_identity_scan.py``,
     ``test_per_group_client_cache.py``,
     ``test_local_endpoint_base_url_integration.py`` and
-    ``test_openai_responses_preflight.py`` are ``async def``. A
-    ``pytest_asyncio`` autouse fixture only covers async tests, so that arm
-    alone would silently miss 40% of the leaks.
+    ``test_openai_responses_preflight.py`` are ``async def``.
+
+    That is NOT, however, why this arm exists. The inference it used to rest
+    on — "a ``pytest_asyncio`` autouse fixture only covers async tests, so
+    that arm alone would silently miss 40% of the leaks" — is measurably
+    false: instrumented on the pinned toolchain, the async arm fires for a
+    plain ``def test_`` too, in a throwaway loop of its own. This arm is
+    DEFENCE IN DEPTH — a cheap, version-independent backstop that does not
+    depend on pytest-asyncio's fixture graph continuing to behave that way
+    across a bump, and that still drains if the async arm is skipped or
+    errors. Cheap: it scans a WeakSet and returns before creating a loop
+    unless something is actually leaked.
     """
     assert _SYNC_FIXTURE in request.fixturenames, (
         f'{_SYNC_FIXTURE} must be registered as an autouse fixture in '
-        f'conftest.py so SYNC tests — which the pytest_asyncio arm never runs '
-        f'for — also drain their leaked openai/anthropic clients (task 4412).'
+        f'conftest.py as the version-independent backstop arm of the drain, '
+        f'behind the pytest_asyncio arm (task 4412).'
     )
 
 
