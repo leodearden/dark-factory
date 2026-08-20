@@ -153,6 +153,39 @@ def test_scan_corpus_counts_matches_and_guard_rejections():
     assert result.selected == 1  # the subject-position positive only
 
 
+def test_one_fact_can_count_as_both_rejected_and_selected():
+    """The counting rule the report's whole column semantics rest on.
+
+    The module header and the test above both state it — 'a fact with two
+    matches, one rejected and one surviving, counts toward BOTH
+    guard_rejected and selected, so the columns are not required to sum' —
+    and the rendered markdown repeats it to a reader deciding whether the
+    numbers add up. Nothing exercised it: every fact in _SYNTHETIC_CORPUS
+    carries exactly one match, and _TWO_REJECTIONS_IN_ONE_FACT has both of
+    its matches rejected, so `if len(fact_rejections) < len(matches)` was
+    unpinned in the one direction that makes the rule visible.
+
+    The fact below is the minimal witness: 'Reviews of ...' is a correct
+    complement rejection and the second sentence is a subject-position
+    selection, in ONE fact. regex_matched is 1 because that counter is
+    per-fact; guard_rejected and selected are both 1 for the same fact,
+    which is exactly the non-summing the rule describes.
+    """
+    both = (
+        'Reviews of tasks 1020 and 1030 are pending. '
+        'Tasks 2040 and 2050 are pending.'
+    )
+
+    result = scan_corpus([both])
+
+    assert result.facts_scanned == 1
+    assert result.regex_matched == 1, 'per-FACT, however many matches it holds'
+    assert result.guard_rejected == 1
+    assert result.selected == 1
+    # ...and the rejection is still recorded per MATCH, with its offset
+    assert [r.match_start for r in result.rejections] == [both.index('tasks 1020')]
+
+
 def test_scan_corpus_rejections_are_triageable_records():
     """A nonzero future run has to be diagnosable without a re-run.
 
@@ -223,6 +256,17 @@ def test_triage_rejection_labels_adverbial_preamble(fact):
         # recall loss and thereby manufacture the very evidence that would
         # wrongly justify tightening.
         'Blockers for down-stream, still-unmerged tasks 1020 and 1030 are pending.',
+        # The two shapes below reach the two comma-tail branches, which no
+        # shape above did — both are ways a comma can appear WITHOUT opening
+        # a preamble, and both must stay on the fail-safe label.
+        # A listed preposition AFTER the last comma governs the enumeration
+        # directly, whatever the preamble in front of it was doing.
+        'As noted, reviews of tasks 1020 and 1030 are pending.',
+        # A plural head noun between the comma and the enumeration could be
+        # what the copula agrees with, so the enumeration is not
+        # unambiguously the subject — the case that branch's own comment
+        # describes, and it survives a genuine 'As of <date>,' preamble.
+        'As of 2026-08-09, blockers tasks 1020 and 1030 are pending.',
     ],
 )
 def test_triage_rejection_labels_prepositional_complement(fact):
@@ -234,6 +278,30 @@ def test_triage_rejection_labels_prepositional_complement(fact):
     """
     match_start = fact.index('tasks 1020')
     assert triage_rejection(fact, match_start) == 'prepositional_complement'
+
+
+def test_triage_falls_back_when_it_cannot_see_what_the_guard_saw():
+    """The scope-disagreement branch — the heuristic's last fail-safe.
+
+    ``triage_rejection`` reuses ``_last_clause_break`` so it cannot normally
+    disagree with the guard about where the clause starts: the guard fired,
+    therefore a listed preposition is somewhere in that span, therefore
+    ``first_prep`` is found. The branch exists for the case where that
+    reasoning stops holding — a caller triaging a match the guard did NOT
+    reject, or a future edit moving one of the two scopes out from under the
+    other. Both are silent failures, and the branch's job is to answer
+    conservatively rather than to claim recall loss it cannot substantiate.
+
+    Driven directly, since it is by construction unreachable through a real
+    rejection: the fact below carries a comma and no listed preposition at
+    all, so the guard SELECTS it (asserted, or the test would be triaging a
+    rejection after all) while triage still returns the fail-safe label.
+    """
+    fact = 'Reviewed today, tasks 1020 and 1030 are pending.'
+    start = _first_enumeration_start(fact)
+
+    assert extract_plural_ids(fact) == {1020, 1030}, 'the guard does NOT reject it'
+    assert triage_rejection(fact, start) == 'prepositional_complement'
 
 
 def test_the_shared_corpora_and_the_two_deciding_shapes_are_present():
@@ -852,6 +920,13 @@ async def test_a_stable_count_that_disagrees_is_still_a_suspected_shortfall(capl
         pytest.param(None, id='null-result-set'),
         pytest.param([[None]], id='null-count'),
         pytest.param([[]], id='row-with-no-columns'),
+        # _census_count's docstring promises 'a non-integer' collapses to
+        # None like every other flavour of missing evidence. It is the one
+        # shape reached through the try/except rather than an explicit
+        # check, so it is also the one that would start RAISING — turning a
+        # fail-closed None into a crashed run — if the except clause were
+        # ever narrowed.
+        pytest.param([['abc']], id='non-integer-count'),
     ],
 )
 @pytest.mark.asyncio
@@ -878,6 +953,66 @@ async def test_enumeration_fails_closed_when_the_count_probe_returns_nothing(
     assert len(facts) == 50, 'the paging worked; only the proof was unavailable'
 
 
+@pytest.mark.asyncio
+async def test_a_census_that_answers_then_stops_answering_fails_closed(caplog):
+    """The pre/post asymmetry — half a proof is not a proof.
+
+    The census is probed twice, and the SECOND probe is what tells a
+    truncation apart from a raced write. Every case above loses both
+    probes together (``_FakeCappedEdgeQuery`` applies one ``count_rows``
+    to each), so the branch for 'the pre-count answered and the post-count
+    did not' was unreachable and unpinned — and it is the asymmetric case
+    that a real store produces, since the two probes are separated by the
+    whole paging run.
+
+    Without the post-count there is no evidence either way: a shortfall
+    cannot be distinguished from a write landing mid-run, and the operator
+    must not be told a cause. Fail-closed, and say only what is known.
+    """
+    query_fn = _FakeMovingCorpusQuery(
+        _fake_rows(50), cap=_PAGE_SIZE, counts=[50, None],
+    )
+
+    with caplog.at_level('WARNING'):
+        facts, complete = await enumerate_valid_edge_facts(
+            query_fn, page_size=_PAGE_SIZE,
+        )
+
+    assert len(facts) == 50, 'the paging itself was fine'
+    assert complete is False, 'an unavailable proof is not a passing one'
+
+    warnings = '\n'.join(r.getMessage() for r in caplog.records)
+    assert 'no usable count' in warnings
+    # ...and NEITHER diagnosis is offered, because neither is known
+    assert 'CHANGED MID-ENUMERATION' not in warnings
+    assert 'result-set cap' not in warnings
+
+
+@pytest.mark.asyncio
+async def test_a_row_with_a_null_uuid_is_skipped_not_counted():
+    """A row that cannot be keyed is not an edge this run enumerated.
+
+    The page loop skips a NULL uuid, and that skip is load-bearing for the
+    census cross-check rather than cosmetic: keying facts by uuid is how
+    the undirected MATCH's double-attribution is deduped, so a null-keyed
+    row has no identity to dedupe on. Counting it would inflate
+    ``len(facts)`` toward the census total and could make a genuinely
+    short enumeration read as complete — the fail-OPEN direction. Skipping
+    it instead leaves the count short, which the census then catches.
+    """
+    rows = _fake_rows(4)
+    rows[2] = [None, 'Tasks 1020 and 1030 are pending.']
+    query_fn = _FakeCappedEdgeQuery(rows, cap=_PAGE_SIZE, count_rows=[[3]])
+
+    facts, complete = await enumerate_valid_edge_facts(
+        query_fn, page_size=_PAGE_SIZE,
+    )
+
+    assert len(facts) == 3, 'the null-uuid row is not an enumerated edge'
+    assert None not in facts
+    assert complete is True, 'and the census agrees 3 is the whole corpus'
+
+
 # ---------------------------------------------------------------------------
 # run(): aggregation and the fail-closed rule
 # ---------------------------------------------------------------------------
@@ -894,9 +1029,17 @@ class _FakeEdgeSource:
     def __init__(self, corpora: dict[str, tuple[list[str], bool]]) -> None:
         self.corpora = corpora
         self.asked: list[str] = []
+        # RECORDED, not just accepted. An earlier version discarded
+        # page_size, so run() passing the wrong one — or none at all —
+        # failed no test, while a page_size at or above the server's
+        # result-set cap is the exact condition that makes the enumerator's
+        # short-page proof a lie. The seam has to carry the argument, not
+        # merely tolerate it.
+        self.page_sizes: list[int] = []
 
     async def __call__(self, project_id: str, *, page_size: int):
         self.asked.append(project_id)
+        self.page_sizes.append(page_size)
         facts, complete = self.corpora[project_id]
         return {f'{project_id}-edge-{i}': f for i, f in enumerate(facts)}, complete
 
@@ -917,6 +1060,32 @@ def _args(**overrides):
     for key, value in overrides.items():
         setattr(parsed, key, value)
     return parsed
+
+
+@pytest.mark.asyncio
+async def test_run_passes_the_requested_page_size_through_to_every_graph():
+    """--page-size has to REACH the enumerator, for every graph.
+
+    It is the flag the whole completeness argument turns on: the
+    enumerator's short-page break is only sound while page_size stays below
+    the server's result-set cap, and _page_size_arg validates that at the
+    CLI. All of which is worthless if run() then drops the value or passes
+    it to only the first graph — a silent fail-OPEN that no assertion on the
+    report could catch, since the report records the page size run() was
+    ASKED for, not the one the enumerator was HANDED.
+    """
+    source = _FakeEdgeSource({
+        'alpha': (_ALPHA_FACTS, True),
+        'beta': (_BETA_FACTS, True),
+    })
+
+    report = await run(
+        # deliberately not DEFAULT_PAGE_SIZE, so a hardcoded default fails
+        _args(project_id=['alpha', 'beta'], page_size=37), edge_source=source,
+    )
+
+    assert source.page_sizes == [37, 37], 'every graph, not just the first'
+    assert report.page_size == 37, 'and the artifact records what was used'
 
 
 @pytest.mark.asyncio
