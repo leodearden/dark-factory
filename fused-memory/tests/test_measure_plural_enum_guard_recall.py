@@ -26,14 +26,19 @@ import pytest
 # no __init__.py while ``tests/reconciliation/`` does, so pytest puts
 # ``tests/`` on sys.path for modules in both directories and this package
 # import resolves identically from either.
-from fused_memory.reconciliation.stale_status_snapshot_edge_sweep import (
-    _enumeration_is_prepositional_complement,
-)
 from reconciliation.plural_enum_shapes import (
     ADVERBIAL_PREAMBLE_SHAPES,
     GUARD_REJECTED_SUPPRESSION_SHAPES,
     PRECISION_GUARD_SHAPES,
     SUBJECT_POSITIVE_SHAPES,
+)
+
+# The PRODUCTION guard object, imported the same way the sweep suite imports
+# it. Held here only so the baseline test can assert the probe's 'shipped'
+# candidate IS this object rather than a drifted copy — an identity check that
+# has to span the module boundary to mean anything.
+from fused_memory.reconciliation.stale_status_snapshot_edge_sweep import (
+    _enumeration_is_prepositional_complement,
 )
 
 SCRIPT_PATH = (
@@ -1301,6 +1306,77 @@ async def test_an_empty_store_fails_closed_instead_of_verdicting_over_nothing(
     assert 'COVERAGE SHORTFALL' in markdown
     assert 'ZERO graphs' in markdown
     assert '- Enumeration complete: `False`' in markdown
+
+
+@pytest.mark.asyncio
+async def test_one_graphs_failure_is_a_shortfall_not_a_lost_run(caplog):
+    """A graph that fails to enumerate must not discard the graphs that did.
+
+    Reachable without any bug in this file, and cheaply: ``list_graphs()``
+    returns every non-``*_db`` FalkorDB key, and the committed artifact's
+    discovered set includes dozens of EPHEMERAL pytest graphs
+    (``probe_e1_gw*``, ``sweep_e4_gw*``, ``_test_*_``). A concurrent pytest
+    run dropping one of those keys between the listing and the enumeration
+    query raises mid-loop. Letting that propagate killed a 40-graph run at
+    graph #39 and wrote NO artifact — contradicting the rule ``exit_code``'s
+    own docstring states, that 'the artifact still lands — the evidence of
+    the shortfall is IN it — but the exit code refuses to call an
+    under-enumerated measurement a successful one'.
+
+    So a failure is recorded as exactly what it is: one INCOMPLETE project,
+    named in the artifact, forcing the whole report incomplete and a
+    non-zero exit — the identical fail-closed treatment a row-count
+    shortfall and an unmeasured graph already get. The measurement of every
+    other graph survives, which is the difference between a shortfall and a
+    lost run.
+
+    ``_FakeEdgeSource`` raises KeyError for a graph it has no corpus for,
+    which IS the vanished-key case rather than a stand-in for it.
+    """
+    source = _FakeEdgeSource({
+        'alpha': (_ALPHA_FACTS, True),
+        'gamma': (_BETA_FACTS, True),
+    })
+
+    with caplog.at_level('WARNING'):
+        report = await run(
+            _args(project_id=None),
+            edge_source=source,
+            # 'beta' vanished between the listing and the query
+            graph_lister=_lister('alpha', 'beta', 'gamma'),
+        )
+
+    assert source.asked == ['alpha', 'beta', 'gamma'], 'the loop kept going'
+    by_id = {p.project_id: p for p in report.projects}
+    assert set(by_id) == {'alpha', 'beta', 'gamma'}, 'the failure is RECORDED'
+    assert by_id['beta'].complete is False
+    assert by_id['beta'].valid_edges == 0
+    assert by_id['beta'].scan.facts_scanned == 0
+
+    # the graphs that DID enumerate are still measured — not discarded
+    assert by_id['alpha'].complete is True
+    assert by_id['alpha'].valid_edges == len(_ALPHA_FACTS)
+    assert by_id['gamma'].valid_edges == len(_BETA_FACTS)
+    assert report.totals.selected == (
+        by_id['alpha'].scan.selected + by_id['gamma'].scan.selected
+    )
+
+    # ...and the run is still fail-closed about what it could not read
+    assert report.unmeasured_graphs == [], 'nothing was SKIPPED; one FAILED'
+    assert report.complete is False
+    assert exit_code(report) != 0
+
+    warnings = '\n'.join(r.getMessage() for r in caplog.records)
+    assert 'COVERAGE SHORTFALL' in warnings
+    assert 'beta' in warnings
+
+    # the artifact LANDS, carrying the evidence — the whole point
+    payload = json.loads(render_json(report))
+    assert payload['complete'] is False
+    assert [p['project_id'] for p in payload['projects'] if not p['complete']] == [
+        'beta',
+    ]
+    assert '| `beta` | 0 |' in render_markdown(report)
 
 
 @pytest.mark.asyncio

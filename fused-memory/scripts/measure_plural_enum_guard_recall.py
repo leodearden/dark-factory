@@ -929,9 +929,38 @@ async def run(
     projects: list[ProjectReport] = []
     for project_id in project_ids:
         logger.info('enumerating project=%s', project_id)
-        facts_by_uuid, complete = await edge_source(
-            project_id, page_size=args.page_size,
-        )
+        try:
+            facts_by_uuid, complete = await edge_source(
+                project_id, page_size=args.page_size,
+            )
+        except Exception:
+            # One graph's failure is a coverage shortfall, NOT a lost run.
+            # Letting this propagate aborted the whole measurement and wrote
+            # no artifact at all, contradicting exit_code's own stated rule
+            # that the artifact lands carrying the evidence and only the exit
+            # code refuses to call it a success. It is reachable cheaply:
+            # list_graphs() returns every non-'*_db' FalkorDB key, so the
+            # discovered set includes dozens of ephemeral pytest graphs, and
+            # a concurrent test run dropping one between the listing and the
+            # query kills a 40-graph run at graph #39 with nothing recorded.
+            # Recorded instead as one INCOMPLETE project: named in the
+            # artifact, forcing the report incomplete and a non-zero exit —
+            # the same fail-closed treatment a row-count shortfall gets —
+            # while every graph that DID enumerate keeps its measurement.
+            logger.exception(
+                'COVERAGE SHORTFALL: project=%s enumeration FAILED; recording '
+                'it as an incomplete graph and continuing. The verdict cannot '
+                'quantify over this graph. Reporting INCOMPLETE.',
+                project_id,
+            )
+            projects.append(ProjectReport(
+                project_id=project_id,
+                valid_edges=0,
+                complete=False,
+                scan=ScanResult(),
+                triage={},
+            ))
+            continue
         scan = scan_corpus(facts_by_uuid.values())
         projects.append(ProjectReport(
             project_id=project_id,
