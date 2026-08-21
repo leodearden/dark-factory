@@ -43,6 +43,7 @@ REGISTRY_PATH = FIXTURES_DIR / 'memory_eval_topic_registry.json'
 ARM_CLAIMS_PATH = FIXTURES_DIR / 'e2_arm_claims.jsonl'
 QUERY_SET_PATH = FIXTURES_DIR / 'e2_query_set.jsonl'
 DISTRACTOR_SLAB_PATH = FIXTURES_DIR / 'e2_distractor_slab.jsonl'
+REGROWTH_INJECTION_PATH = FIXTURES_DIR / 'e2_regrowth_injection.jsonl'
 
 
 def _load_module() -> types.ModuleType:
@@ -339,6 +340,285 @@ class TestDefaultFixturePaths:
         # Nothing was copied alongside it, so a default that "exists" here
         # would mean it is pointing back at the original tree.
         assert not any(default.exists() for default in defaults)
+
+
+# ===========================================================================
+# 4012 step-1 — the regrowth-injection fixture's loader and cross-validation
+# ===========================================================================
+#
+# The +1-re-emission probe's own fixture: exactly one near-duplicate per
+# topic, re-emitting that topic's canonical claim.  Contract paths read the
+# COMMITTED fixture; error paths build tiny synthetic JSONL in tmp_path.
+# Pure — no network, no Qdrant, no key.
+
+
+def _injection_row(**overrides) -> dict:
+    """One well-formed injection row, before whatever the test breaks."""
+    row = {
+        'injection_id': 'topic-a-regrowth-01',
+        'topic': 'topic-a',
+        'cluster_id': 'cluster-a',
+        'reemits_claim_id': 'topic-a-01',
+        'text': 'a restatement of the canonical claim in different words',
+    }
+    row.update(overrides)
+    return row
+
+
+def _write_injections(path: Path, rows: list[dict]) -> Path:
+    path.write_text(''.join(json.dumps(r) + '\n' for r in rows))
+    return path
+
+
+def _synthetic_claims(mod, *rows: dict) -> list:
+    """Hand-built `ArmClaim`s, so cross-validation has an exact expectation."""
+    return [
+        mod.ArmClaim(
+            claim_id=r['claim_id'],
+            cluster_id=r['cluster_id'],
+            topic=r['topic'],
+            text=r.get('text', 'body'),
+            source_memory_id=r.get('source_memory_id', 'm'),
+            canonical=bool(r.get('canonical', False)),
+            b_arm_role=r.get('b_arm_role', 'canonical' if r.get('canonical') else 'sighting'),
+            contested=bool(r.get('contested', False)),
+        )
+        for r in rows
+    ]
+
+
+class TestLoadRegrowthInjections:
+    """`load_regrowth_injections` parses the probe's own fixture strictly."""
+
+    def test_the_committed_fixture_loads_one_injection_per_topic(self):
+        injections = _mod().load_regrowth_injections(REGROWTH_INJECTION_PATH)
+
+        assert len(injections) == 20
+        assert len({i.injection_id for i in injections}) == 20
+        for injection in injections:
+            assert injection.injection_id
+            assert injection.topic
+            assert injection.cluster_id
+            assert injection.reemits_claim_id
+            assert injection.text
+
+    def test_the_default_path_is_package_relative_and_committed(self):
+        mod = _mod()
+
+        assert mod.DEFAULT_REGROWTH_INJECTION_PATH == REGROWTH_INJECTION_PATH
+        assert mod.DEFAULT_REGROWTH_INJECTION_PATH.exists()
+
+    def test_the_default_path_follows_a_relocated_script(self, tmp_path):
+        """Package-relative, not resolved against the checkout cwd.
+
+        The same lesson `TestDefaultFixturePaths` pins for the five original
+        fixtures: a path baked in at author time works only from the tree it
+        was written in.
+        """
+        import importlib.util  # noqa: PLC0415
+        import shutil  # noqa: PLC0415
+        import sys  # noqa: PLC0415
+
+        (tmp_path / 'scripts').mkdir()
+        relocated = tmp_path / 'scripts' / SCRIPT_PATH.name
+        shutil.copy2(SCRIPT_PATH, relocated)
+
+        name = 'relocated_regrowth_bake_off'
+        spec = importlib.util.spec_from_file_location(name, relocated)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        try:
+            spec.loader.exec_module(module)
+            default = module.DEFAULT_REGROWTH_INJECTION_PATH
+        finally:
+            sys.modules.pop(name, None)
+
+        assert default.is_absolute()
+        assert default.is_relative_to(tmp_path)
+        assert not default.exists()
+
+    def test_a_duplicate_injection_id_names_the_path_line_and_id(self, tmp_path):
+        path = _write_injections(tmp_path / 'inj.jsonl', [
+            _injection_row(),
+            _injection_row(topic='topic-b', cluster_id='cluster-b'),
+        ])
+
+        with pytest.raises(_mod().FixtureError) as excinfo:
+            _mod().load_regrowth_injections(path)
+
+        message = str(excinfo.value)
+        assert 'inj.jsonl' in message
+        assert ':2:' in message
+        assert 'topic-a-regrowth-01' in message
+
+    @pytest.mark.parametrize('field', ['topic', 'cluster_id', 'reemits_claim_id', 'text'])
+    def test_a_missing_field_names_the_path_line_and_field(self, tmp_path, field):
+        row = _injection_row()
+        row.pop(field)
+        path = _write_injections(tmp_path / 'inj.jsonl', [row])
+
+        with pytest.raises(_mod().FixtureError) as excinfo:
+            _mod().load_regrowth_injections(path)
+
+        message = str(excinfo.value)
+        assert 'inj.jsonl' in message
+        assert ':1:' in message
+        assert field in message
+
+    def test_a_missing_injection_id_is_reported_by_name(self, tmp_path):
+        row = _injection_row()
+        row.pop('injection_id')
+        path = _write_injections(tmp_path / 'inj.jsonl', [row])
+
+        with pytest.raises(_mod().FixtureError) as excinfo:
+            _mod().load_regrowth_injections(path)
+
+        assert 'injection_id' in str(excinfo.value)
+
+
+class TestCrossValidateRegrowthInjections:
+    """The injections must AGREE with the claims fixture, not merely parse."""
+
+    def test_the_committed_fixtures_cross_validate(self):
+        mod = _mod()
+        claims = mod.load_arm_claims(ARM_CLAIMS_PATH)
+        injections = mod.load_regrowth_injections(REGROWTH_INJECTION_PATH)
+
+        mod.cross_validate_regrowth_injections(injections=injections, claims=claims)
+
+        per_topic: dict[str, int] = {}
+        for injection in injections:
+            per_topic[injection.topic] = per_topic.get(injection.topic, 0) + 1
+        assert set(per_topic) == {c.topic for c in claims}
+        assert set(per_topic.values()) == {1}, (
+            'the "+1" in the probe name is exactly one re-emission per topic'
+        )
+
+    def test_a_topic_with_no_injection_is_named(self):
+        mod = _mod()
+        claims = _synthetic_claims(
+            mod,
+            {'claim_id': 'topic-a-01', 'cluster_id': 'cluster-a', 'topic': 'topic-a',
+             'canonical': True},
+            {'claim_id': 'topic-b-01', 'cluster_id': 'cluster-b', 'topic': 'topic-b',
+             'canonical': True},
+        )
+        injections = [mod.RegrowthInjection(**_injection_row())]
+
+        with pytest.raises(mod.FixtureError) as excinfo:
+            mod.cross_validate_regrowth_injections(injections=injections, claims=claims)
+
+        message = str(excinfo.value)
+        assert 'topic-b' in message
+        assert _mod()._FIXTURE_DOCS in message
+
+    def test_two_injections_on_one_topic_are_a_fixture_defect(self):
+        """The quantity IS the experiment: 2 is a defect, not a bigger probe."""
+        mod = _mod()
+        claims = _synthetic_claims(
+            mod,
+            {'claim_id': 'topic-a-01', 'cluster_id': 'cluster-a', 'topic': 'topic-a',
+             'canonical': True},
+        )
+        injections = [
+            mod.RegrowthInjection(**_injection_row()),
+            mod.RegrowthInjection(**_injection_row(injection_id='topic-a-regrowth-02')),
+        ]
+
+        with pytest.raises(mod.FixtureError) as excinfo:
+            mod.cross_validate_regrowth_injections(injections=injections, claims=claims)
+
+        message = str(excinfo.value)
+        assert 'topic-a' in message
+        assert '2' in message
+
+    def test_a_cluster_id_disagreeing_with_the_claims_fixture_is_named(self):
+        mod = _mod()
+        claims = _synthetic_claims(
+            mod,
+            {'claim_id': 'topic-a-01', 'cluster_id': 'cluster-a', 'topic': 'topic-a',
+             'canonical': True},
+        )
+        injections = [mod.RegrowthInjection(**_injection_row(cluster_id='cluster-wrong'))]
+
+        with pytest.raises(mod.FixtureError) as excinfo:
+            mod.cross_validate_regrowth_injections(injections=injections, claims=claims)
+
+        message = str(excinfo.value)
+        assert 'cluster-wrong' in message
+        assert 'cluster-a' in message
+
+    def test_an_unknown_topic_is_named(self):
+        mod = _mod()
+        claims = _synthetic_claims(
+            mod,
+            {'claim_id': 'topic-a-01', 'cluster_id': 'cluster-a', 'topic': 'topic-a',
+             'canonical': True},
+        )
+        injections = [
+            mod.RegrowthInjection(**_injection_row()),
+            mod.RegrowthInjection(**_injection_row(
+                injection_id='ghost-regrowth-01', topic='ghost',
+                cluster_id='cluster-ghost', reemits_claim_id='ghost-01')),
+        ]
+
+        with pytest.raises(mod.FixtureError) as excinfo:
+            mod.cross_validate_regrowth_injections(injections=injections, claims=claims)
+
+        assert 'ghost' in str(excinfo.value)
+
+    def test_a_reemitted_claim_that_does_not_exist_is_named(self):
+        mod = _mod()
+        claims = _synthetic_claims(
+            mod,
+            {'claim_id': 'topic-a-01', 'cluster_id': 'cluster-a', 'topic': 'topic-a',
+             'canonical': True},
+        )
+        injections = [mod.RegrowthInjection(**_injection_row(reemits_claim_id='topic-a-99'))]
+
+        with pytest.raises(mod.FixtureError) as excinfo:
+            mod.cross_validate_regrowth_injections(injections=injections, claims=claims)
+
+        assert 'topic-a-99' in str(excinfo.value)
+
+    def test_reemitting_a_non_canonical_claim_is_named(self):
+        """The re-emission must name the TRUE canonical, never a peer.
+
+        `claim_ids = [reemits_claim_id]` is what credits the injection with
+        realizing the claim it restates; pointing it at a non-canonical peer
+        would make the probe measure something other than regrowth of the
+        canonical.
+        """
+        mod = _mod()
+        claims = _synthetic_claims(
+            mod,
+            {'claim_id': 'topic-a-01', 'cluster_id': 'cluster-a', 'topic': 'topic-a',
+             'canonical': True},
+            {'claim_id': 'topic-a-02', 'cluster_id': 'cluster-a', 'topic': 'topic-a',
+             'canonical': False},
+        )
+        injections = [mod.RegrowthInjection(**_injection_row(reemits_claim_id='topic-a-02'))]
+
+        with pytest.raises(mod.FixtureError) as excinfo:
+            mod.cross_validate_regrowth_injections(injections=injections, claims=claims)
+
+        message = str(excinfo.value)
+        assert 'topic-a-02' in message
+        assert 'canonical' in message
+
+    def test_no_injected_body_is_byte_identical_to_the_claim_it_reemits(self):
+        """A copy would make the probe measure deduplication, not regrowth.
+
+        Inequality ONLY.  No similarity threshold is asserted anywhere — a
+        bound on how alike a re-emission may be would be a guess dressed as
+        a finding (gate G6); the fixture README reports the ratios instead.
+        """
+        mod = _mod()
+        claims = {c.claim_id: c for c in mod.load_arm_claims(ARM_CLAIMS_PATH)}
+
+        for injection in mod.load_regrowth_injections(REGROWTH_INJECTION_PATH):
+            assert injection.text != claims[injection.reemits_claim_id].text
 
 
 # ===========================================================================
