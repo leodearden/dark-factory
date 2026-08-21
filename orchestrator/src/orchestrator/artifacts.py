@@ -1270,6 +1270,79 @@ class TaskArtifacts:
         _validate_verdict_role(role)
         self._clear_path(f'verdicts/{role}.json')
 
+    def write_markup_residue(self, record: dict) -> str | None:
+        """Preserve the residue of a tool call refused for unrepairable markup.
+
+        This is the ONLY surviving copy of a payload the calling agent could not
+        re-emit: the leak is, by construction, a serialization defect that
+        mangled text the agent produced once. Preserving it is what makes
+        refusing a corrupted call NON-DESTRUCTIVE (PRD C2 L187 / INV-7) rather
+        than a silent data loss dressed up as a clean error.
+
+        It exists because ``orchestrator.mcp.verdict_tools`` runs as a
+        standalone stdio subprocess with no in-process escalation client and no
+        queue, so ``MarkupGuardMiddleware``'s ``escalation_sink`` has nowhere
+        else to land there. This class's root is somewhere it CAN reach.
+        ``.task/`` is gitignored, so a residue file can never contaminate a
+        task's diff or its verify.
+
+        Returns the bare FILENAME (e.g. ``markup_residue-3.json``), not an
+        absolute path: the id stays stable across the worktree/``.task-meta``
+        split and is short enough to sit legibly in a refusal payload, which
+        quotes it so a bounced agent can point an operator at its own data.
+        Returns ``None`` when the root has vanished and nothing was written —
+        never a name for a file that does not exist, because the middleware's
+        hint is conditional on exactly this value, and a caller pointed at a
+        missing file is told its data is safe when it is gone.
+
+        The next index is derived by SCANNING the directory rather than from
+        in-process state: a fresh subprocess's counter would restart at 1 and
+        clobber the previous invocation's evidence.
+
+        There is deliberately no ``read_markup_residue``/``clear_markup_residue``
+        pair. The ``write_*``/``read_*``/``clear_*`` triads in this class exist
+        for records the orchestrator CONSUMES to make a routing decision;
+        residue is durable evidence for an operator, and inventing a consumer
+        API with no consumer would imply a sweep that does not exist. Wiring
+        proactive surfacing is follow-up work, filed against this task.
+        """
+        # The same root-gone guard write_review/write_verdict carry, and for the
+        # same reason. MEASURED: _write_json's FileNotFoundError tolerance does
+        # NOT cover this on its own, because its mkdir(parents=True) RE-CREATES
+        # a root that was deleted out-of-band — resurrecting a worktree
+        # directory as a side effect of a best-effort write. Both siblings guard
+        # explicitly ahead of the call for exactly that reason; this is that one
+        # policy, not a second one.
+        if not self.root.is_dir():
+            logger.info(
+                'TaskArtifacts: skipping write_markup_residue for %s.%s — '
+                'root %s no longer exists; %d chars of residue are NOT preserved',
+                record.get('tool'), record.get('field'), self.root,
+                len(record.get('raw_value') or ''),
+            )
+            return None
+
+        existing = sorted(self.root.glob('markup_residue-*.json'))
+        highest = 0
+        for path in existing:
+            suffix = path.stem.removeprefix('markup_residue-')
+            if suffix.isdigit():
+                highest = max(highest, int(suffix))
+        index = highest + 1
+        # Advance past any name that already exists — a non-numeric or
+        # out-of-band file must never cost an operator the record.
+        while (self.root / f'markup_residue-{index}.json').exists():
+            index += 1
+
+        name = f'markup_residue-{index}.json'
+        # Via _write_json, NOT a hand-rolled write_text: it already carries the
+        # mkdir, the indent+newline convention and the vanished-root tolerance
+        # every other writer in this class relies on. One write policy.
+        self._write_json(self.root / name, record)
+        if not (self.root / name).exists():
+            return None
+        return name
+
     def lock_plan(self, session_id: str, *, run_id: str | None = None) -> bool:
         """Atomically acquire the plan lock.
 
