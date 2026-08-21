@@ -1131,6 +1131,29 @@ _EFFECT_SURVIVAL_PER_FILE_MIN_ADDED_LINES = 25
 #: special-case one.
 _EMPTY_TREE_SHA = '4b825dc642cb6eb9a060e54bf8d69288fbee4904'
 
+#: Upper bound on GitOps._effect_probe_memo (task 3116 b5).  A main HEAD
+#: advance already invalidates every live entry at once — they all share one
+#: main sha by construction — so this cap only bites while HEAD sits still and
+#: distinct candidate commits keep arriving.  256 is far above the handful of
+#: landing candidates any single tick considers, and bounds the dict for a
+#: process that holds ONE GitOps for its whole lifetime.
+_EFFECT_PROBE_MEMO_MAX_ENTRIES = 256
+
+#: Failure codes that report a SUBPROCESS problem rather than a repository
+#: fact, and so are never memoized (task 3116 b5).  Caching one would pin a
+#: spurious effect-absent verdict for the life of the current HEAD; because
+#: the condition is ABSORBING (byte-identity, once broken, is never restored)
+#: that is not a self-healing re-check on the next tick but a guaranteed
+#: spurious full dispatch — plan/verify/review plus a task_failure escalation.
+#: Only verdicts derived from repository CONTENT are cached.
+_EFFECT_PROBE_TRANSIENT_FAILURES = frozenset({
+    'unresolvable_commit',
+    'merge_base_unresolved',
+    'touched_enumeration_failed',
+    'diff_failed',
+    'main_sha_unresolved',
+})
+
 
 @dataclass(frozen=True)
 class CommitEffectProbe:
@@ -1211,6 +1234,9 @@ class CommitEffectProbe:
           non-merge empty-touched-set case, which stays True (task 2500).
         - ``'diff_failed'`` — the terminal comparison against main errored
           for a reason other than "paths differ".
+        - ``'main_sha_unresolved'`` — ``git rev-parse <main_branch>``
+          errored or returned nothing, so there is no HEAD to compare
+          against and no key to memoize under (task 3116 b5).
 
         ``'paths_diverged'`` and ``'diff_failed'`` are separated on
         purpose: the pre-3116 code folded rc==1 (paths genuinely differ)
@@ -2519,6 +2545,17 @@ class GitOps:
         # survives across the requeue cycles a sustained soft-pressure
         # condition produces.
         self._warm_lane_audit_cache: tuple[float, str | None] | None = None
+        # Effect-probe memo (task 3116 b5), keyed on (commit_sha, main_sha).
+        # Line survival costs a blob read plus a set comparison PER TOUCHED
+        # PATH where byte-identity cost one `git diff --quiet`, and the cheap
+        # check cannot serve as a fast path because 94.9% of the merge corpus
+        # fails it while the deliverables sit intact at main — so the
+        # expensive path is the COMMON path, re-run for every landing
+        # candidate on every idle_poll_secs (15s) dispatch tick.  main_sha is
+        # in the KEY, not just the value: a HEAD advance is exactly the event
+        # that changes the answer, so a commit_sha-only key would freeze a
+        # stale verdict across it.  See describe_commit_effect_in_main.
+        self._effect_probe_memo: dict[tuple[str, str], CommitEffectProbe] = {}
         # Merge serialization is handled by MergeWorker in merge_queue.py.
         # See task 292 for design rationale (ghost loops, lock starvation,
         # branch drift at 64 max concurrency with external actors).
@@ -9255,6 +9292,76 @@ class GitOps:
         :class:`CommitEffectProbe` for the exhaustive vocabulary and for
         which codes populate ``diverged_paths``.  The direction is
         fail-safe throughout — never claim an effect is present on doubt.
+
+        **Memoized on (commit_sha, main_sha)** (task 3116 b5).  Cost is a
+        first-class constraint on the part-(b) semantics, not an
+        afterthought: byte-identity was ONE ``git diff --quiet``, whereas
+        line survival needs a blob read plus a set comparison PER TOUCHED
+        PATH.  The cheap check cannot be kept as a fast path either — the
+        full corpus measured 94.9% of merges failing byte-identity while
+        their deliverables sit intact at main — so the expensive path is
+        now the COMMON path, re-run for every landing candidate on every
+        ``idle_poll_secs`` (15s) dispatch tick.
+
+        The KEY is the correctness core.  main HEAD is what a probe is
+        measured AGAINST, so an advance is exactly the event that can
+        change the answer; a ``commit_sha``-only key would freeze a stale
+        verdict across it, which is strictly worse than no memo at all.
+        Keying on the pair makes a HEAD advance invalidate every entry by
+        construction.  main's sha is resolved ONCE at entry and used both
+        as the key component and as the comparison target passed down the
+        whole check, so there is no window in which the value cached and
+        the HEAD it is filed under disagree — a same-process advance
+        mid-probe simply produces a value filed under the sha it was
+        actually measured against.
+
+        A warm hit still costs one ``git rev-parse`` — the memo cannot
+        know whether HEAD moved without asking — against the cold path's
+        (1 + paths × 2) or so invocations.
+
+        Failures that report a SUBPROCESS problem rather than a repository
+        fact (:data:`_EFFECT_PROBE_TRANSIENT_FAILURES`) are NEVER cached;
+        see that constant for why caching one is a guaranteed spurious
+        dispatch rather than a stale read.  The memo is per-instance —
+        never a module global, which would outlive a config change and
+        answer for a repository it never measured — and bounded by
+        :data:`_EFFECT_PROBE_MEMO_MAX_ENTRIES`.
+        """
+        main_sha = await self.get_main_sha()
+        if not main_sha:
+            # No HEAD to compare against, and no key to file a result under.
+            return CommitEffectProbe(present=False, failure='main_sha_unresolved')
+        memo = self._effect_probe_memo
+        # Every live entry shares one main sha (this rule is what keeps that
+        # true), so a single sample decides whether the whole memo is stale.
+        sample = next(iter(memo), None)
+        if sample is not None and sample[1] != main_sha:
+            memo.clear()
+        cached = memo.get((commit_sha, main_sha))
+        if cached is not None:
+            return cached
+        probe = await self._probe_commit_effect(commit_sha, main_sha)
+        if probe.failure not in _EFFECT_PROBE_TRANSIENT_FAILURES:
+            if len(memo) >= _EFFECT_PROBE_MEMO_MAX_ENTRIES:
+                # Insertion-ordered: drop the oldest entry at this HEAD.
+                del memo[next(iter(memo))]
+            memo[commit_sha, main_sha] = probe
+        return probe
+
+    async def _probe_commit_effect(
+        self, commit_sha: str, main_sha: str,
+    ) -> CommitEffectProbe:
+        """Uncached body of :meth:`describe_commit_effect_in_main`.
+
+        See there for the semantics, the failure vocabulary and the memo
+        this sits behind.  Split out so that every one of the early returns
+        below is filed in the memo by one piece of code rather than each
+        having to remember to — and so the memo layer reads as one page.
+
+        *main_sha* is the RESOLVED sha of the main branch, not the branch
+        name: it is the memo key's second component, so the comparison must
+        run against exactly that commit for the cached value to mean what
+        its key says.
         """
         rc, parents_out, _ = await _run(
             ['git', 'rev-list', '--parents', '-n', '1', commit_sha],
@@ -9311,7 +9418,7 @@ class GitOps:
                         failure='empty_branch_merge',
                     )
                 probe = await self._compare_touched_paths_to_main(
-                    other_parent, touched, merge_base,
+                    other_parent, touched, merge_base, main_sha,
                 )
                 if not probe.present:
                     return probe
@@ -9347,7 +9454,7 @@ class GitOps:
         # Root commits have an empty touched set and returned above, so the
         # empty-tree base is a defensive fallback rather than a live path.
         return await self._compare_touched_paths_to_main(
-            commit_sha, touched, parents[0] if parents else _EMPTY_TREE_SHA,
+            commit_sha, touched, parents[0] if parents else _EMPTY_TREE_SHA, main_sha,
         )
 
     async def _anchor_diff_lines(
@@ -9425,7 +9532,7 @@ class GitOps:
         return out.strip() if rc == 0 and out.strip() else None
 
     async def _vacuous_path_survives(
-        self, anchor_sha: str, path: str, removed: list[str],
+        self, anchor_sha: str, path: str, removed: list[str], main_sha: str,
     ) -> bool:
         """Decide a ZERO-ADDED-LINES path's survival (task 3116 b3).
 
@@ -9458,28 +9565,27 @@ class GitOps:
         Anything else — the blob differs with nothing measurable to check, as
         for a clobbered binary — is fail-safe False.  Never a fabricated True.
         """
-        main = self.config.main_branch
         at_anchor = await self._path_exists_at(anchor_sha, path)
-        at_main = await self._path_exists_at(main, path)
+        at_main = await self._path_exists_at(main_sha, path)
         if not at_anchor:
             # The anchor DELETED this path; the effect is the absence.
             return not at_main
         if not at_main:
             return False
         anchor_oid = await self._blob_oid_at(anchor_sha, path)
-        main_oid = await self._blob_oid_at(main, path)
+        main_oid = await self._blob_oid_at(main_sha, path)
         if anchor_oid is not None and anchor_oid == main_oid:
             return True
         if removed:
-            main_lines = await self._main_line_set(path)
+            main_lines = await self._main_line_set(path, main_sha)
             if main_lines is None:
                 return False
             return not any(line in main_lines for line in removed)
         # Content differs with nothing measurable (e.g. a clobbered binary).
         return False
 
-    async def _main_line_set(self, path: str) -> set[str] | None:
-        """Return the set of stripped, non-blank lines of *path* at main HEAD.
+    async def _main_line_set(self, path: str, main_sha: str) -> set[str] | None:
+        """Return the set of stripped, non-blank lines of *path* at *main_sha*.
 
         None means the blob could not be read as text — the path is absent at
         main, or its content is not decodable (a binary blob would raise
@@ -9489,7 +9595,7 @@ class GitOps:
         """
         try:
             rc, content, _ = await _run(
-                ['git', 'show', f'{self.config.main_branch}:{path}'],
+                ['git', 'show', f'{main_sha}:{path}'],
                 cwd=self.project_root,
             )
         except UnicodeDecodeError:
@@ -9499,7 +9605,7 @@ class GitOps:
         return {stripped for line in content.split('\n') if (stripped := line.strip())}
 
     async def _compare_touched_paths_to_main(
-        self, anchor_sha: str, touched: list[str], base_sha: str,
+        self, anchor_sha: str, touched: list[str], base_sha: str, main_sha: str,
     ) -> CommitEffectProbe:
         """Decide whether *anchor_sha*'s effect SURVIVES at main HEAD.
 
@@ -9534,16 +9640,21 @@ class GitOps:
 
         ZERO-ADDED-LINES (vacuous) paths — pure deletions, pure renames,
         binaries, mode changes — contribute nothing to either ratio, because
-        an added-lines-survive test is trivially true for them.  When EVERY
-        touched path is vacuous this falls back to the pre-3116 byte-identity
-        verdict, which is conservative and preserves prior behaviour exactly.
-        That is an INTERIM measure: task 3116 b3 (plan step-12) replaces it
-        with real per-shape handling — removed-lines-still-absent for
-        deletions, blob-oid comparison for renames and binaries — because a
-        silent always-True for a deletion-shaped deliverable is precisely the
-        task-1175 clobber this gate exists to prevent.  The corpus puts this
-        class at 0.53% of merges, so the interim is narrow, but it is not
-        nothing.
+        an added-lines-survive test is trivially true for them.  They are
+        decided instead by :meth:`_vacuous_path_survives`, each by the
+        mechanism that actually applies to its shape, and a failing one
+        short-circuits the whole check with ``'vacuous_effect_absent'``.  When
+        EVERY touched path is vacuous, ``aggregate_survival`` stays None —
+        UNDEFINED rather than 0.0 or 1.0, both of which would assert a
+        measurement that was never taken.  The corpus puts this class at 0.53%
+        of merges; it is handled anyway because a silent always-True for a
+        deletion-shaped deliverable is precisely the task-1175 clobber this
+        gate exists to prevent (b3).
+
+        *main_sha* is the RESOLVED sha of main, threaded down from the memo
+        key in :meth:`describe_commit_effect_in_main` rather than re-read from
+        ``config.main_branch`` here, so every comparison in this stage runs
+        against exactly the HEAD the cached verdict is filed under.
 
         Fail-safe throughout: any git error yields ``present=False``, never a
         fabricated True.
@@ -9552,7 +9663,7 @@ class GitOps:
             [
                 'git', '-c', 'core.quotePath=false',
                 'diff', '--name-only', '-z', anchor_sha,
-                self.config.main_branch, '--', *touched,
+                main_sha, '--', *touched,
             ],
             cwd=self.project_root,
         )
@@ -9591,7 +9702,9 @@ class GitOps:
                 # Zero added lines: an added-lines test is trivially true
                 # here, so this path is decided by its own shape's arm (b3).
                 vacuous_seen.append(path)
-                if not await self._vacuous_path_survives(anchor_sha, path, removed):
+                if not await self._vacuous_path_survives(
+                    anchor_sha, path, removed, main_sha,
+                ):
                     # Short-circuit naming the OFFENDER.  This runs before the
                     # aggregate is known on purpose, but it can only ever add
                     # a rejection: a failed vacuous path is decisive on its
@@ -9606,7 +9719,7 @@ class GitOps:
                     )
                 continue
             if path in diverged_set:
-                main_lines = await self._main_line_set(path)
+                main_lines = await self._main_line_set(path, main_sha)
                 survived = (
                     0 if main_lines is None
                     else sum(1 for line in added if line in main_lines)
