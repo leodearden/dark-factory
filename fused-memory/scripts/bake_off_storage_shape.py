@@ -209,6 +209,12 @@ DEFAULT_REGISTRY_PATH = _FIXTURES_DIR / 'memory_eval_topic_registry.json'
 DEFAULT_ARM_CLAIMS_PATH = _FIXTURES_DIR / 'e2_arm_claims.jsonl'
 DEFAULT_QUERY_SET_PATH = _FIXTURES_DIR / 'e2_query_set.jsonl'
 DEFAULT_DISTRACTOR_SLAB_PATH = _FIXTURES_DIR / 'e2_distractor_slab.jsonl'
+#: The +1-re-emission regrowth probe's own fixture (task 4012, pre-1).
+#: Package-relative for the same reason its five siblings are — a path
+#: resolved against the checkout cwd works only from the tree it was
+#: authored in.  Read ONLY on the regrowth path: a probe-less run must not
+#: fail on a fixture it never opens.
+DEFAULT_REGROWTH_INJECTION_PATH = _FIXTURES_DIR / 'e2_regrowth_injection.jsonl'
 
 #: Where a reader is told to look when a fixture is missing or disagrees.
 _FIXTURE_DOCS = 'fused-memory/tests/fixtures/README.md'
@@ -287,6 +293,28 @@ QUERY_KINDS: tuple[str, ...] = ('claim', 'topic_phrasing')
 #: derivation input.  It overlaps a kind by construction — it is a SUBSET,
 #: not a third kind — and is labelled that way in the artifact.
 HELD_OUT_SUBSET = 'held_out'
+
+
+@dataclass(frozen=True)
+class RegrowthInjection:
+    """One +1 re-emission of a topic's canonical claim (task 4012, pre-1).
+
+    ``reemits_claim_id`` is carried in the fixture rather than derived
+    because the materialised record gets ``claim_ids = [reemits_claim_id]``:
+    a near-duplicate that restates the canonical's claim genuinely DOES
+    realize it, and scoring it as realizing nothing would make claim recall
+    able only to FALL under injection — rigging the probe toward the very
+    conclusion it exists to test.  Naming the re-emitted claim in the
+    fixture keeps that modelling choice auditable there rather than buried
+    in the materializer, and ``cross_validate_regrowth_injections`` pins it
+    to the cluster's TRUE ``canonical: true`` claim.
+    """
+
+    injection_id: str
+    topic: str
+    cluster_id: str
+    reemits_claim_id: str
+    text: str
 
 
 @dataclass(frozen=True)
@@ -430,6 +458,40 @@ def load_arm_claims(path: str | Path = DEFAULT_ARM_CLAIMS_PATH) -> list[ArmClaim
     return claims
 
 
+def load_regrowth_injections(
+    path: str | Path = DEFAULT_REGROWTH_INJECTION_PATH,
+) -> list[RegrowthInjection]:
+    """Read the +1-re-emission injection slab (task 4012, pre-1).
+
+    Deliberately the same strict idiom as ``load_arm_claims`` — dedup on the
+    id, ``KeyError`` translated into a ``FixtureError`` naming the path, the
+    1-based line and the field — so the error surface a reader meets is
+    uniform across all six fixtures.
+    """
+    injections = []
+    seen: set[str] = set()
+    for lineno, record in enumerate(_read_jsonl(path, what='E2 regrowth-injection'), 1):
+        injection_id = record.get('injection_id')
+        if not injection_id:
+            raise FixtureError(f'{path}:{lineno}: injection has no injection_id')
+        if injection_id in seen:
+            raise FixtureError(f'{path}:{lineno}: duplicate injection_id {injection_id!r}')
+        seen.add(injection_id)
+        try:
+            injections.append(RegrowthInjection(
+                injection_id=injection_id,
+                topic=record['topic'],
+                cluster_id=record['cluster_id'],
+                reemits_claim_id=record['reemits_claim_id'],
+                text=record['text'],
+            ))
+        except KeyError as exc:
+            raise FixtureError(
+                f'{path}:{lineno}: injection {injection_id!r} missing field {exc}'
+            ) from exc
+    return injections
+
+
 def load_query_set(path: str | Path = DEFAULT_QUERY_SET_PATH) -> list[Query]:
     """Read the blind-authored query set (pre-3)."""
     queries = []
@@ -552,6 +614,74 @@ def cross_validate_fixtures(
                     f'query {query.query_id!r} (cluster {query.cluster_id!r}) expects claim '
                     f'{claim_id!r} from cluster {expected.cluster_id!r}'
                 )
+
+
+def cross_validate_regrowth_injections(
+    *,
+    injections: list[RegrowthInjection],
+    claims: list[ArmClaim],
+) -> None:
+    """Assert the injection slab agrees with the claims fixture.
+
+    A SEPARATE function rather than a branch inside
+    ``cross_validate_fixtures`` on purpose: the five original fixtures are
+    cross-validated on EVERY run, including runs with the probe disabled,
+    and folding a sixth in would make a probe-less run fail on a fixture it
+    never reads.
+
+    Checks, in order: exactly one injection per topic; every topic covered;
+    ``cluster_id`` agreeing with the claims fixture; ``reemits_claim_id``
+    existing and naming that cluster's TRUE canonical claim.
+    """
+    claims_by_id = {c.claim_id: c for c in claims}
+    topics = {c.topic for c in claims}
+    cluster_by_topic = {c.topic: c.cluster_id for c in claims}
+
+    per_topic: dict[str, list[RegrowthInjection]] = {}
+    for injection in injections:
+        if injection.topic not in topics:
+            raise FixtureError(
+                f'injection {injection.injection_id!r} names topic '
+                f'{injection.topic!r}, which is not in the arm-claims fixture '
+                f'(see {_FIXTURE_DOCS})'
+            )
+        per_topic.setdefault(injection.topic, []).append(injection)
+
+    for topic in sorted(topics):
+        found = per_topic.get(topic, [])
+        if len(found) != 1:
+            raise FixtureError(
+                f'topic {topic!r} has {len(found)} regrowth injections, expected '
+                f'exactly 1 — the "+1" re-emission quantity IS the experiment, '
+                f'so a second injection is a fixture defect rather than a '
+                f'bigger probe (see {_FIXTURE_DOCS})'
+            )
+
+    for injection in injections:
+        expected_cluster = cluster_by_topic[injection.topic]
+        if injection.cluster_id != expected_cluster:
+            raise FixtureError(
+                f'injection {injection.injection_id!r} names cluster '
+                f'{injection.cluster_id!r} but topic {injection.topic!r} belongs '
+                f'to cluster {expected_cluster!r} in the arm-claims fixture '
+                f'(see {_FIXTURE_DOCS})'
+            )
+        reemitted = claims_by_id.get(injection.reemits_claim_id)
+        if reemitted is None:
+            raise FixtureError(
+                f'injection {injection.injection_id!r} re-emits claim '
+                f'{injection.reemits_claim_id!r}, which does not exist '
+                f'(see {_FIXTURE_DOCS})'
+            )
+        if not reemitted.canonical or reemitted.cluster_id != injection.cluster_id:
+            raise FixtureError(
+                f'injection {injection.injection_id!r} re-emits claim '
+                f'{injection.reemits_claim_id!r}, which is not the canonical '
+                f'claim of cluster {injection.cluster_id!r} — the record gets '
+                f'claim_ids=[reemits_claim_id], so pointing it at a peer would '
+                f'make the probe measure something other than regrowth of the '
+                f'canonical (see {_FIXTURE_DOCS})'
+            )
 
 
 # ---------------------------------------------------------------------------
