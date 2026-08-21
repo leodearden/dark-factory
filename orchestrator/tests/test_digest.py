@@ -687,8 +687,18 @@ class TestCostInWindow:
 # ---------------------------------------------------------------------------
 
 
-def _make_digest_inputs(*, tripped: bool = False) -> digest.DigestInputs:
-    """Build a concrete DigestInputs for render tests."""
+def _make_digest_inputs(
+    *,
+    tripped: bool = False,
+    submissions_in_step: int = 0,
+    lifecycle_events_in_step: int = 0,
+) -> digest.DigestInputs:
+    """Build a concrete DigestInputs for render tests.
+
+    ``submissions_in_step`` / ``lifecycle_events_in_step`` are the task-4559
+    gate-vs-numerator split; they default to 0 so every existing caller of
+    this helper is unaffected.
+    """
     esc_stats = digest.EscalationStats(
         category_level_status_counts={
             ('infra_issue', 0, 'resolved'): 3,
@@ -725,6 +735,8 @@ def _make_digest_inputs(*, tripped: bool = False) -> digest.DigestInputs:
         },
         watcher_clusters=['infra × scope cross-pattern (3 events)', 'repeated timeout cluster'],
         dry_run_proposals=['unblock task-42: bump timeout', 'retry task-99 after requeue'],
+        submissions_in_step=submissions_in_step,
+        lifecycle_events_in_step=lifecycle_events_in_step,
     )
 
 
@@ -738,6 +750,44 @@ class TestRenderDigestMarkdown:
         assert '## Window' in md
         assert '2026-05-10T00:00:00+00:00' in md
         assert '2026-05-10T23:59:59+00:00' in md
+
+    def test_ewa_section_reports_submissions_and_gate_counts(self) -> None:
+        """The EWA section shows WHICH number drove the value (task 4559).
+
+        Before 4559 one counter served as both the digest gate and the EWA
+        numerator, so an operator reading a trip digest could not tell whether
+        the trip was driven by real new escalations or by cleanup of old ones.
+        That ambiguity is what made both 2026 outages hard to diagnose, so the
+        two figures are now rendered separately and the numerator is labelled.
+        """
+        md = digest.render_digest_markdown(
+            _make_digest_inputs(submissions_in_step=4, lifecycle_events_in_step=20)
+        )
+        ewa_section = md.split('## EWA', 1)[1].split('##', 1)[0]
+        assert 'EWA numerator' in ewa_section, (
+            f'Expected the submissions figure to be labelled as the numerator; '
+            f'got section:\n{ewa_section}'
+        )
+        assert '4' in ewa_section, f'Expected the submissions figure 4; got:\n{ewa_section}'
+        assert '20' in ewa_section, (
+            f'Expected the lifecycle-event (gate) figure 20; got:\n{ewa_section}'
+        )
+
+    def test_digest_inputs_new_fields_default_to_zero(self) -> None:
+        """DigestInputs still constructs without the two task-4559 fields.
+
+        They are appended AFTER stale_lane_census with `= 0` defaults, following
+        the repo's existing "defaulted so existing constructors remain valid"
+        convention (see model_role_rollup / stale_lane_census), so no existing
+        construction across digest.py, harness.py or the test suite needs editing.
+        """
+        inputs = _make_digest_inputs()
+        assert inputs.submissions_in_step == 0, (
+            f'Expected default 0; got {inputs.submissions_in_step}'
+        )
+        assert inputs.lifecycle_events_in_step == 0, (
+            f'Expected default 0; got {inputs.lifecycle_events_in_step}'
+        )
 
     def test_escalation_outcomes_table(self) -> None:
         """Escalation outcomes section with category × level rows."""
