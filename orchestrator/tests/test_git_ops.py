@@ -4911,6 +4911,12 @@ class TestDescribeCommitEffectInMain:
 
 async def _commit_all(repo: Path, message: str) -> str:
     """Stage everything under *repo* and commit, returning the new sha."""
+    # esc-3072-3: git discovery walks UP, so a *repo* that is not itself a
+    # repository root sends `git add -A` + `git commit` into whatever repo
+    # encloses it — a real COMMIT into a live task worktree, sweeping up
+    # whatever uncommitted work it was holding. FIRST statement, before any
+    # subprocess, so a rejected call writes nothing anywhere.
+    assert_isolated_git_repo(repo)
     await _run(['git', 'add', '-A'], cwd=repo)
     rc, _, err = await _run(['git', 'commit', '-m', message], cwd=repo)
     assert rc == 0, f'commit {message!r} failed: {err}'
@@ -4936,6 +4942,10 @@ async def _seed_on_main(
     repo: Path, files: dict[str, str | bytes], message: str,
 ) -> str:
     """Write *files* and commit them straight to main (pre-branch baseline)."""
+    # Guarded ahead of the mkdir/write_text loop, not just inside _commit_all:
+    # a rejected call must leave no fixture litter in the wrong directory
+    # either (esc-3072-3).
+    assert_isolated_git_repo(repo)
     for name, content in files.items():
         path = repo / name
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -4960,6 +4970,12 @@ async def _land_branch(
     *renames* exist because the vacuous cases (task 3116 b3) are defined by
     having no added lines at all, which a write-only helper cannot express.
     """
+    # esc-3072-3: the branch create, `git mv`/`git rm`, tree writes and
+    # `git merge --no-ff` below all mutate whatever repo encloses *repo* if it
+    # is not itself a repository root — this helper would MERGE into a live
+    # task worktree's main. FIRST statement, ahead of every subprocess and
+    # every filesystem write.
+    assert_isolated_git_repo(repo)
     rc, _, err = await _run(
         ['git', 'checkout', '-b', f'task/{task_id}', 'main'], cwd=repo,
     )
@@ -5126,6 +5142,7 @@ class TestCommitEffectSurvival:
 
         assert probe.present is False
         assert probe.failure == 'effect_not_survived'
+        assert probe.aggregate_survival is not None
         assert probe.aggregate_survival >= 0.98, (
             'the aggregate must PASS here — otherwise this case proves '
             'nothing about the per-file guard'
@@ -5174,6 +5191,7 @@ class TestCommitEffectSurvival:
 
         assert probe.present is True
         assert probe.failure is None
+        assert probe.aggregate_survival is not None
         assert probe.aggregate_survival >= 0.98
         assert 'notes.md' in probe.diverged_paths, (
             'notes.md genuinely diverged — the FLOOR is what saved this '

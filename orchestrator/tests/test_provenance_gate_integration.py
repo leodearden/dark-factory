@@ -417,9 +417,9 @@ class TestAlreadyLandedGateSurvivalSemantics:
 
         assert result is True, 'a clean landing beside a co-touched hot file'
         cast(AsyncMock, h.scheduler.mark_done).assert_awaited_once()
-        assert cast(AsyncMock, h.scheduler.mark_done).await_args.kwargs['sha'] == (
-            marker_sha
-        )
+        call = cast(AsyncMock, h.scheduler.mark_done).await_args
+        assert call is not None
+        assert call.kwargs['sha'] == marker_sha
         cast(MagicMock, h._escalation_queue).submit.assert_not_called()
 
     async def test_later_additive_evolution_no_longer_reads_as_a_revert(
@@ -447,9 +447,9 @@ class TestAlreadyLandedGateSurvivalSemantics:
 
         assert result is True
         cast(AsyncMock, h.scheduler.mark_done).assert_awaited_once()
-        assert cast(AsyncMock, h.scheduler.mark_done).await_args.kwargs['sha'] == (
-            marker_sha
-        )
+        call = cast(AsyncMock, h.scheduler.mark_done).await_args
+        assert call is not None
+        assert call.kwargs['sha'] == marker_sha
         cast(MagicMock, h._escalation_queue).submit.assert_not_called()
 
     async def test_deletion_deliverable_is_accepted_when_it_holds(
@@ -475,9 +475,9 @@ class TestAlreadyLandedGateSurvivalSemantics:
 
         assert result is True
         cast(AsyncMock, h.scheduler.mark_done).assert_awaited_once()
-        assert cast(AsyncMock, h.scheduler.mark_done).await_args.kwargs['sha'] == (
-            marker_sha
-        )
+        call = cast(AsyncMock, h.scheduler.mark_done).await_args
+        assert call is not None
+        assert call.kwargs['sha'] == marker_sha
         cast(MagicMock, h._escalation_queue).submit.assert_not_called()
 
     async def test_resurrected_deletion_is_still_caught_as_a_revert(
