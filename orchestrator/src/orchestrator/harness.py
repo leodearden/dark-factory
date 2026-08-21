@@ -2003,11 +2003,22 @@ class Harness:
         Attributes
         ----------
         _escalation_event_count:
-            Incremented on every escalation submit/resolve callback.
+            Incremented on every escalation submit/resolve callback.  This is
+            the digest GATE: it decides WHEN a digest fires (task 1327).
         _last_digest_event_count:
             Snapshot of the count at the last digest write.
+        _escalation_submit_count:
+            Incremented on escalation SUBMISSION only.  This is the EWA
+            NUMERATOR (task 4559).  Splitting it from the gate is what stops a
+            backlog drain — resolutions, which are the healthy signal — from
+            re-tripping the breaker that the backlog caused.  The gate
+            deliberately keeps counting resolutions so that a pure-drain
+            window still fires a digest and still decays the EWA.
+        _last_digest_submit_count:
+            Snapshot of the submissions count at the last digest write.
         _ewa_value:
-            Current EWA state (process-local; resets on restart).
+            Current EWA state.  Persisted on the scheduler_state pause row and
+            restored on startup (task 4559); otherwise process-local.
         _last_digest_window_end_iso:
             ISO timestamp of the last digest window's end; set to start time
             on first run.  Note: done_count comes from EventStore
@@ -2016,6 +2027,8 @@ class Harness:
         """
         self._escalation_event_count: int = 0
         self._last_digest_event_count: int = 0
+        self._escalation_submit_count: int = 0
+        self._last_digest_submit_count: int = 0
         self._ewa_value: float = 0.0
         self._last_digest_window_end_iso: str = ''
 
@@ -13520,6 +13533,9 @@ class Harness:
         # callbacks cannot cause a double-skip between the threshold check and the advance.
         # May drift by a small constant under concurrency; not a correctness gate.
         self._escalation_event_count += 1  # task 1327 AFK hardening
+        # A submission advances the EWA numerator as well as the gate; a
+        # resolution (below) advances the gate ONLY.  Task 4559.
+        self._escalation_submit_count += 1  # task 4559 — EWA numerator
         event = self._escalation_events.get(escalation.task_id)
         if event:
             event.set()
@@ -13590,7 +13606,12 @@ class Harness:
     def _on_escalation_resolved(self, escalation) -> None:
         """Callback when an escalation is resolved — wake the waiting workflow."""
         # Increment for any status transition (resolved or dismissed) — both are
-        # escalation events that the EWA digest needs to count.
+        # escalation events, and resolutions feed the digest GATE so that a
+        # window which only drains a backlog still fires a digest (and, with a
+        # zero numerator, decays the EWA).  They deliberately do NOT feed the
+        # EWA NUMERATOR: _escalation_submit_count is bumped in _on_escalation
+        # only, so resolving an escalation can no longer re-trip the breaker
+        # that filing it caused.  Task 4559.
         # Best-effort observability counter — same concurrency caveat as _on_escalation
         # above; _maybe_write_digest snapshots it at entry to avoid double-skip drift.
         self._escalation_event_count += 1  # task 1327 AFK hardening
