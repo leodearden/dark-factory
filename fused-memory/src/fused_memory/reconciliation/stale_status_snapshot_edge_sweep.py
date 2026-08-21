@@ -76,9 +76,14 @@ constant — do not restate them here.)
   requirement is what keeps 'Task N is in the active branch' out while
   still reaching 'Task N is in a blocked status ...'. (amendment, task
   3042)
-- Invalidate-only-on-positively-terminal, and an aggregate/plural edge is
-  invalidated as a whole the moment any ONE referenced id is terminal —
-  see ``select_stale_status_snapshot_edges``.
+- Invalidate-only-on-positively-KNOWN, and an aggregate/plural edge is
+  invalidated as a whole the moment any ONE referenced id contradicts it —
+  see ``select_stale_status_snapshot_edges``. Two rules qualify an edge:
+  the TERMINAL rule (a union-marker id reached done/cancelled) and the
+  BLOCKED-ASSERTION rule (a blocked-asserted id has a positively-known
+  status other than 'blocked'). Neither ever fires on an id whose census
+  value is absent or outside the closed
+  ``shared.task_statuses.TaskStatus`` vocabulary.
 - The sweep is best-effort throughout (mirrors
   ``degenerate_task_node_sweep``): an edge-enumeration
   (``get_all_valid_edges``) or status cross-reference (``get_statuses``)
@@ -88,7 +93,15 @@ constant — do not restate them here.)
 - 'blocked' is deliberately NOT added to ``INACTIVE_TASK_STATUSES`` (stays
   ``{done, cancelled}``), which is what preserves
   invalidate-only-on-positively-terminal for a genuinely-still-blocked
-  task.
+  task.  AMENDED, task 3037: a stale blocked assertion IS now retired
+  before its task goes terminal — but by a SEPARATE second rule keyed on
+  the blocked-SCOPED id set (``extract_blocked_assertion_task_ids``), NOT
+  by widening ``INACTIVE_TASK_STATUSES``.  Widening it would make the
+  terminal rule retire every ACTIVE/PENDING snapshot whose task merely
+  became blocked, and — since that rule reads UNION ids — could fire on an
+  id some other marker contributed.  The two rules stay disjoint in what
+  they read: rule 1 union ids against ``INACTIVE_TASK_STATUSES``, rule 2
+  blocked-asserted ids against "positively known and != 'blocked'".
 - Every extraction path exists in TWO families — union and blocked-only —
   built from the same ``_build_snapshot_patterns`` call, and the blocked
   result is always a SUBSET of the union result. A future path or guard
@@ -180,6 +193,8 @@ import re
 from datetime import UTC, datetime
 from typing import NamedTuple
 
+from shared.task_statuses import TaskStatus
+
 from fused_memory.reconciliation.task_filter import (
     INACTIVE_TASK_STATUSES,
     STRICT_CLAUSE_BOUNDARY_RE,
@@ -187,6 +202,12 @@ from fused_memory.reconciliation.task_filter import (
 )
 
 logger = logging.getLogger(__name__)
+
+# The closed status vocabulary, frozen once at import. Defines "positively
+# known" for the blocked-assertion selection rule — see
+# ``is_blocked_assertion_contradicted``. A census value outside it is treated
+# as UNKNOWN, never as a contradiction. (task 3037)
+_KNOWN_TASK_STATUSES: frozenset[str] = frozenset(TaskStatus)
 
 # --------------------------------------------------------------------------- #
 # extract_snapshot_edge_task_ids — pure lexical extraction
@@ -1264,26 +1285,74 @@ def flatten_dedup_edges(grouped: dict[str, list[dict]]) -> list[dict]:
 # --------------------------------------------------------------------------- #
 
 
+def is_blocked_assertion_contradicted(status: str | None) -> bool:
+    """Does *status* positively contradict a 'blocked' assertion? (task 3037)
+
+    True iff *status* is a POSITIVELY KNOWN member of the closed
+    ``shared.task_statuses.TaskStatus`` vocabulary and is not 'blocked'.
+
+    The vocabulary check is what preserves this module's
+    invalidate-only-on-positively-known fail-safe in the same direction the
+    terminal rule already has it. A naive ``status != 'blocked'`` would read
+    every unrecognised value as a contradiction, so a malformed, renamed or
+    sentinel census entry ('unknown', '', a future status this build has not
+    heard of) would RETIRE a live edge — the unrecoverable direction, since an
+    invalidated Graphiti edge is never re-validated. Treating it as unknown
+    instead costs at most one cycle of under-selection.
+
+    ``None`` (id absent from the census entirely) is likewise unknown, which
+    is what makes a transient ``get_statuses`` gap self-healing.
+
+    Pure: no I/O, no side effects.
+    """
+    return status in _KNOWN_TASK_STATUSES and status != TaskStatus.BLOCKED
+
+
 def select_stale_status_snapshot_edges(
     edges: list[dict],
     statuses: dict[str, str],
     *,
     edge_ids: dict[str, set[int]] | None = None,
+    blocked_edge_ids: dict[str, set[int]] | None = None,
 ) -> list[dict]:
     """Return the subset of *edges* whose asserted status is now contradicted.
 
-    An edge is selected (stale) iff ``extract_snapshot_edge_task_ids`` returns
-    at least one id AND any one of those ids resolves (via *statuses*) to a
-    positively-terminal status (``INACTIVE_TASK_STATUSES`` — done/cancelled).
-    An aggregate edge referencing several ids is selected as a whole the
-    moment ANY single referenced id is terminal — the snapshot as asserted no
-    longer holds.
+    TWO independent selection rules; an edge is selected (stale) when EITHER
+    fires.
 
-    Invalidate-only-on-positively-terminal: an id absent from *statuses*, or
-    mapped to any non-terminal/unknown value, never contributes to
-    selection — a transient census gap or genuinely-still-active task can
-    only under-select (self-heals next cycle), never wrongly select a valid
-    edge.
+    1. TERMINAL rule (task 2613). ``extract_snapshot_edge_task_ids`` returns
+       at least one id AND any one of those ids resolves (via *statuses*) to
+       a positively-terminal status (``INACTIVE_TASK_STATUSES`` —
+       done/cancelled). This rule reads the UNION of every status marker, so
+       it covers active/pending/in-progress/stalled assertions too.
+
+    2. BLOCKED-ASSERTION rule (task 3037).
+       ``extract_blocked_assertion_task_ids`` returns at least one id AND any
+       one of those ids resolves to a positively-known status that is not
+       'blocked' (``is_blocked_assertion_contradicted``). A blocked assertion
+       is contradicted by ANY non-blocked status, not merely a terminal one:
+       before this rule, 'Task 2848 remains blocked as of 2026-07-22'
+       survived a blocked->pending unblock and stayed live until the task
+       eventually reached done/cancelled.
+
+    In both rules an aggregate/plural edge referencing several ids is selected
+    as a whole the moment ANY single referenced id contradicts it — the
+    snapshot as asserted no longer holds.
+
+    Why rule 2 is a SEPARATE rule keyed on a blocked-SCOPED id set, rather
+    than 'blocked' being added to ``INACTIVE_TASK_STATUSES``: that widening
+    would make rule 1 retire every ACTIVE/PENDING snapshot whose task merely
+    became blocked, and — because rule 1 reads union ids — a blocked-status
+    trigger there could fire on an id some OTHER marker contributed. Rule 2
+    reads only the ids the fact asserts as blocked, which is exactly its
+    scope.
+
+    Invalidate-only-on-positively-known, throughout: an id absent from
+    *statuses*, or mapped to a value outside the closed
+    ``shared.task_statuses.TaskStatus`` vocabulary, never contributes to
+    selection under either rule — a transient census gap or a
+    genuinely-still-blocked task can only under-select (self-heals next
+    cycle), never wrongly select a valid edge.
 
     Args:
         edges: Candidate edges (as returned by ``flatten_dedup_edges``).
@@ -1296,18 +1365,34 @@ def select_stale_status_snapshot_edges(
             (the default), ids are computed directly from each edge's fact —
             unchanged standalone behavior. (amendment, reviewer_comprehensive
             efficiency finding, task 2613)
+        blocked_edge_ids: Optional precomputed
+            ``{edge['uuid']: extract_blocked_assertion_task_ids(fact)}``
+            mapping, for rule 2. Exactly the same semantics and the same
+            fall-back-to-internal-extraction default as *edge_ids*, so
+            standalone behaviour is unchanged when it is omitted. (task 3037)
 
     Pure: no I/O, no side effects.
     """
     selected: list[dict] = []
     for edge in edges:
+        fact = edge.get('fact') or ''
         if edge_ids is not None:
             ids = edge_ids.get(edge['uuid'], set())
         else:
-            ids = extract_snapshot_edge_task_ids(edge.get('fact') or '')
-        if not ids:
+            ids = extract_snapshot_edge_task_ids(fact)
+        if blocked_edge_ids is not None:
+            blocked_ids = blocked_edge_ids.get(edge['uuid'], set())
+        else:
+            blocked_ids = extract_blocked_assertion_task_ids(fact)
+
+        # Rule 1 — terminal, over UNION ids.
+        if ids and any(statuses.get(str(i)) in INACTIVE_TASK_STATUSES for i in ids):
+            selected.append(edge)
             continue
-        if any(statuses.get(str(i)) in INACTIVE_TASK_STATUSES for i in ids):
+        # Rule 2 — blocked assertion contradicted, over BLOCKED-scoped ids only.
+        if blocked_ids and any(
+            is_blocked_assertion_contradicted(statuses.get(str(i))) for i in blocked_ids
+        ):
             selected.append(edge)
     return selected
 
