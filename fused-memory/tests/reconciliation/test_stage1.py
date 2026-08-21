@@ -2874,6 +2874,85 @@ class TestStaleStatusSnapshotEdgeSweepWiring:
         )
 
     @pytest.mark.asyncio
+    async def test_run_retires_a_stale_blocked_assertion_and_supersedes_it(self):
+        """The headline stat assertion for task 3037.
+
+        One blocked-assertion edge whose task has since been unblocked to
+        'pending', beside a genuinely-still-blocked control edge. run() must
+        retire ONLY the unblocked one — end-to-end through the real
+        sweep_stale_status_snapshot_edges orchestration and the wired backend
+        calls — and surface it in
+        report.stats['stale_status_snapshot_edges_invalidated'].
+
+        This is the reading the task was filed against: the sweep reported
+        invalidated=0 of 6312 scanned on a cycle where a blocked edge WAS
+        retired, because the terminal-only selection rule never selected it
+        and the Stage-1 agent had to retire it ad hoc via the MCP tool —
+        where no sweep counter can observe it. Routing the blocked rule
+        through the same counted loop is what makes the stat true.
+
+        report.stats['stale_blocked_edges_superseded'] is asserted on the
+        same run so the new deterministic step's OWN effect is observable in
+        Stage-1 stats, not merely inside the sweep's return value.
+        """
+        stage = _make_consolidator(project_root='/tmp/reify')
+
+        unblocked_edge = {
+            'uuid': 'edge-2848',
+            'fact': 'Task 2848 remains blocked as of 2026-07-22',
+            'name': '',
+        }
+        still_blocked_edge = {
+            'uuid': 'edge-3001', 'fact': 'Task 3001 is blocked.', 'name': '',
+        }
+        stage.memory.graphiti.get_all_valid_edges = AsyncMock(
+            return_value={'entity-a': [unblocked_edge, still_blocked_edge]},
+        )
+        assert stage.taskmaster is not None  # AsyncMock() from _make_consolidator
+        stage.taskmaster.get_statuses = AsyncMock(
+            return_value={'2848': 'pending', '3001': 'blocked'},
+        )
+        stage.memory.update_edge = AsyncMock()
+        stage.memory.add_memory = AsyncMock()
+
+        base_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+        )
+
+        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='test_project'),
+                prior_reports=[],
+                run_id='run-3037-wiring',
+            )
+
+        stage.memory.update_edge.assert_awaited_once()
+        assert stage.memory.update_edge.await_args is not None
+        assert stage.memory.update_edge.await_args.args[0] == 'edge-2848', (
+            'Expected update_edge awaited for the unblocked task\'s edge only — '
+            'the still-blocked control edge must survive; got '
+            f'{stage.memory.update_edge.await_args!r}'
+        )
+
+        assert report.stats.get('stale_status_snapshot_edges_invalidated') == 1, (
+            "Expected report.stats['stale_status_snapshot_edges_invalidated'] == 1 "
+            f'for the blocked->pending retirement; got stats={report.stats!r}. '
+            'A 0 here is the 0-of-N reading this task was filed against.'
+        )
+        assert report.stats.get('stale_status_snapshot_edges_scanned') == 2
+
+        assert report.stats.get('stale_blocked_edges_superseded') == 1, (
+            "Expected report.stats['stale_blocked_edges_superseded'] == 1 so the "
+            "new deterministic step's own effect is observable in Stage-1 stats; "
+            f'got stats={report.stats!r}'
+        )
+
+    @pytest.mark.asyncio
     async def test_sweep_failure_is_swallowed_and_other_stats_remain_intact(self):
         """sweep_stale_status_snapshot_edges raising must not blow up run() or
         blank other stats — mirrors the degenerate-sweep backstop.
@@ -2934,6 +3013,11 @@ class TestStaleStatusSnapshotEdgeSweepWiring:
             'stale_status_snapshot_edges_invalidated stat'
         )
         assert 'stale_status_snapshot_edges_scanned' not in report.stats
+        assert 'stale_blocked_edges_superseded' not in report.stats, (
+            "The task-3037 stat follows the same convention as its two "
+            'siblings: a failed sweep sets NO key at all, rather than a 0 '
+            'that would read as "the sweep ran and found nothing"'
+        )
 
 
 class TestStalePriorityOverrideEdgeSweepWiring:
