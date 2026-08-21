@@ -16,9 +16,10 @@ sibling of digest.py/codebook.py — deliberately does NOT import the
 heavyweight async ``shared.cli_invoke`` machinery (usage gates, cost
 stores, cap-retry, transcript watchdogs). The real LLM call lives behind
 exactly one swappable seam, the module-level ``_invoke_cli``, which every
-public function accepts as an ``invoke`` override — the LLM is ALWAYS
-mocked in this module's own test suite; no test ever shells out to a real
-model.
+public function accepts as an ``invoke`` override. What no test ever does
+is spawn a REAL model — but the seam ITSELF is exercised, so "the LLM is
+always mocked" is not the same claim as "``_invoke_cli`` never runs": see
+its own docstring for which tests reach it and how they stay free.
 
 Never-fabricate contract (codebook lesson ``one-shot-subagent-contract`` —
 the fail-soft fallback that hid a total outage): a CLI-invocation error,
@@ -283,10 +284,24 @@ def _invoke_cli(
     once, delivering *prompt* via stdin, and return its raw stdout.
 
     This is the ONE real-subprocess boundary in this module -- every
-    public function accepts an ``invoke`` override (this module's own
-    test suite always injects a fake one; no test ever reaches this
-    function). *claude_bin* resolves, in order: the explicit argument,
+    public function accepts an ``invoke`` override, and most tests inject
+    a fake one. *claude_bin* resolves, in order: the explicit argument,
     the ``LEGIBILITY_CLAUDE_BIN`` env var, else the bare ``"claude"``.
+
+    THIS FUNCTION IS ITSELF UNDER TEST -- it is no longer true that "no
+    test ever reaches it", and the resolution order above is exactly what
+    keeps those tests free. Two suites reach it, from two modules:
+    test_legibility_coder.py points *claude_bin* / ``LEGIBILITY_CLAUDE_BIN``
+    at a FAKE ``claude`` script it writes itself (task 4510, argv/stdin
+    delivery, non-zero exit, timeout, and the env-var branch), and
+    test_legibility_nightly.py replays the 2026-08-18 ENOENT incident end
+    to end by pointing ``LEGIBILITY_CLAUDE_BIN`` at a NONEXISTENT path and
+    running ``run_nightly`` with no ``invoke=`` override at all (task
+    4511). Both scrub PATH of any real ``claude`` first and assert
+    ``shutil.which("claude") is None``, because the bare-name fallback at
+    the end of the chain would otherwise turn a regression in the env-var
+    lookup into genuine, billable model calls inside a unit test. Preserve
+    that assertion if you touch the resolution order.
 
     *cwd*, when given, is the directory the headless CLI process RUNS IN;
     ``None`` (the default) is subprocess's own "inherit the parent's
@@ -490,6 +505,32 @@ def code_digests(
     itself fail the run. Only the storm does, and that branch's ERROR is
     emitted by ``nightly.post_escalation``. The reason is logged unbounded;
     ``_invoke_cli`` already tail-bounds the stderr it embeds.
+
+    TWO CONSUMERS, VERY DIFFERENT VOLUMES — and everything above is the
+    TRICKLE's argument. ``nightly.run_nightly`` codes exactly ONE small
+    batch per night, so its worst case is a handful of lines.
+    ``census.run_mining`` calls this once per MINED BATCH, in a loop that
+    runs until novelty saturates or the batch source exhausts — and a storm
+    batch explicitly does NOT stop mining. So under a SYSTEMIC failure (the
+    ENOENT-on-``claude`` shape) a census emits one WARNING per failed digest
+    per batch, bounded by nothing but the operator's ``--max-batches``. That
+    output is not swallowed: ``nightly._default_census_launcher`` runs
+    census.py with no ``capture_output``, so census inherits the trickle
+    unit's stderr and the volume lands in the same
+    ``journalctl --user -u legibility-trickle@<project>`` an operator reads.
+
+    That volume is ACCEPTED here rather than fixed here, deliberately.
+    Bounding it inside this function cannot work: the flood comes from the
+    batch COUNT, which only the mining loop knows, and a per-batch cap would
+    buy nothing when a batch is already only a handful of digests. The fix,
+    if it ever bites, belongs to ``run_mining``, which already computes
+    ``BatchStats.failed`` per batch and could surface ONE per-batch line
+    naming the DISTINCT reasons — preserving the
+    38-ENOENTs-vs-38-model-errors property without a line per digest. Filed
+    as a follow-up out of task 4511's review (census.py is outside that
+    task's lock). Do NOT instead silence this line or drop it to DEBUG: that
+    restores the sub-storm blind spot above for EVERY caller, including the
+    trickle, to spare a flood only one of them can produce.
 
     ``status`` is ``"failure"`` when ``failed/total`` STRICTLY exceeds
     0.5 — a majority-failure storm — else ``"ok"``. Never escalates,
