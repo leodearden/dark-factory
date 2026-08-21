@@ -39,9 +39,11 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from shared.task_statuses import TaskStatus
 
+from fused_memory.reconciliation import task_filter
 from fused_memory.reconciliation.stale_status_snapshot_edge_sweep import (
     _ENUM_PREP_WORDS,
     _last_clause_break,
+    build_supersede_fact,
     extract_blocked_assertion_task_ids,
     extract_snapshot_edge_task_ids,
     flatten_dedup_edges,
@@ -1802,6 +1804,132 @@ class TestPluralEnumerationPerformance:
         # correctly read as its complement and suppressed.
         assert extract_snapshot_edge_task_ids(fact) == set()
 
+
+# --------------------------------------------------------------------------- #
+# build_supersede_fact — the superseding temporal_fact's wording (task 3037)
+# --------------------------------------------------------------------------- #
+
+
+class TestBuildSupersedeFact:
+    """build_supersede_fact(task_id, status, now) renders the resulting-state-
+    only temporal_fact the sweep writes after retiring a stale blocked edge.
+
+    The wording is a VERIFIED CONSTRAINT, not a style choice, and this class
+    is where that verification lives. Two independent hazards bound it:
+
+    1. SELF-CHURN. The sweep's own extractor must not find task ids in the
+       fact it just wrote, or the superseding fact would select ITSELF for
+       invalidation on the next cycle — an infinite write loop. See the
+       contrast test below for the obvious wording that does exactly that.
+    2. WRITE NORMS. prompts/stage1.py's resulting-state-only rule forbids
+       PRIOR-state framing for temporal_facts, because Graphiti atomization
+       can re-emit the stale fragment as a co-current edge. That norm is
+       enforced at the MCP boundary (server/tools.py:2856/3061,
+       ReconMixedFramingWriteRejected) for any recon-stage-* writer — but the
+       sweep writes IN-PROCESS via memory_service.add_memory and so bypasses
+       that gate entirely. The four predicates are therefore asserted here,
+       directly, rather than assumed.
+    """
+
+    def test_template_shape(self):
+        """'As of 2026-08-21, task 2848 has status pending.'"""
+        out = build_supersede_fact(2848, 'pending', datetime(2026, 8, 21, 14, 3, tzinfo=UTC))
+
+        assert out == 'As of 2026-08-21, task 2848 has status pending.'
+
+    def test_date_comes_from_the_passed_in_timestamp(self):
+        """The date is formatted from *now*, never from a module-level clock.
+
+        The sweep threads one invalidation timestamp through the whole cycle;
+        the superseding fact must carry that same instant, so a replayed or
+        back-dated run is reproducible.
+        """
+        out = build_supersede_fact(7, 'done', datetime(2024, 1, 2, 23, 59, 59, tzinfo=UTC))
+
+        assert out.startswith('As of 2024-01-02,'), out
+
+    @pytest.mark.parametrize('status', sorted(s.value for s in TaskStatus))
+    def test_generated_fact_does_not_select_itself(self, status):
+        """Neither extractor finds an id in the generated fact, for any status.
+
+        Exhaustive over the closed vocabulary rather than a sample: the sweep
+        writes whatever status the census reports, so a single status whose
+        rendering re-extracts would be an infinite write loop in production
+        while every other status looked fine.
+        """
+        out = build_supersede_fact(2848, status, datetime(2026, 8, 21, tzinfo=UTC))
+
+        assert extract_snapshot_edge_task_ids(out) == set(), (
+            f'The superseding fact {out!r} re-extracts as a status snapshot, so the '
+            f'sweep would select it for invalidation next cycle and write another one '
+            f'— an infinite write loop.'
+        )
+        assert extract_blocked_assertion_task_ids(out) == set(), (
+            f'The superseding fact {out!r} re-extracts as a BLOCKED assertion.'
+        )
+
+    @pytest.mark.parametrize('status', sorted(s.value for s in TaskStatus))
+    def test_generated_fact_satisfies_the_recon_write_norms(self, status):
+        """None of the four MCP-boundary write guards fires, for any status.
+
+        These are the same predicates server/tools.py enforces on
+        recon-stage-* temporal_facts writers. The sweep's agent_id IS
+        recon-stage-memory_consolidator, but it writes in-process and never
+        crosses that boundary, so this test is the only thing standing
+        between a malformed superseding fact and the graph.
+        """
+        out = build_supersede_fact(2848, status, datetime(2026, 8, 21, tzinfo=UTC))
+
+        assert not task_filter.is_mixed_temporal_framing(out), (
+            f'{out!r} co-mentions a prior-state and a resulting-state marker'
+        )
+        assert task_filter.find_conflicting_task_status_ids(out) == set(), (
+            f'{out!r} frames a task as both non-terminal and terminal'
+        )
+        assert not task_filter.frames_live_task_status_as_current_fact(out), (
+            f'{out!r} frames a live task-table field as a standing fact rather than a '
+            f'timestamped point-in-time check'
+        )
+        assert not task_filter.is_count_snapshot(out), (
+            f'{out!r} reads as a count snapshot'
+        )
+
+    def test_contrast_the_obvious_wording_is_forbidden(self):
+        """WHY the template is resulting-state-only, pinned as a live contrast.
+
+        'Task 2848 was blocked and is now pending' is the wording a reader
+        reaches for first. It is forbidden twice over:
+
+        - this module's OWN extractor re-extracts it as {2848}, so writing it
+          would make the superseding fact select itself for invalidation
+          every cycle and write a fresh copy — an unbounded write loop
+          against the graph;
+        - it is mixed temporal framing, which prompts/stage1.py forbids for
+          temporal_facts because Graphiti atomization can re-emit the stale
+          'was blocked' fragment as a co-current edge — reintroducing exactly
+          the stale assertion this sweep just retired.
+
+        Kept as an executable contrast rather than a comment so the reason
+        stays true rather than merely remembered.
+        """
+        forbidden = 'Task 2848 was blocked and is now pending'
+
+        assert extract_snapshot_edge_task_ids(forbidden) == {2848}
+        assert task_filter.is_mixed_temporal_framing(forbidden)
+
+    def test_contrast_prior_state_negation_is_also_forbidden(self):
+        """'Task 2848 is no longer blocked' is extractor-SAFE but norm-unsafe.
+
+        It survives both extractors (measured -> set()), so the self-churn
+        hazard alone would not rule it out — but it is PRIOR-state framing,
+        which prompts/stage1.py L326-346 forbids for temporal_facts. Recorded
+        so a future author who checks only the extractor does not conclude it
+        is an acceptable alternative.
+        """
+        prior_state = 'Task 2848 is no longer blocked'
+
+        assert extract_snapshot_edge_task_ids(prior_state) == set()
+        assert extract_blocked_assertion_task_ids(prior_state) == set()
 
 # --------------------------------------------------------------------------- #
 # flatten_dedup_edges
