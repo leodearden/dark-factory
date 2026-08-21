@@ -164,9 +164,9 @@ rate; do not re-open them:
 
 Why a regex in this module gets a performance test at all:
 ``sweep_stale_status_snapshot_edges`` calls
-``extract_snapshot_edge_task_ids`` once per valid edge from an UNGUARDED
-dict comprehension with no per-edge timeout, over the whole group's edge
-set (tens of thousands of edges; current figures in the RESULT-SET CAP
+``extract_snapshot_edge_task_ids_by_marker_class`` once per valid edge from
+an UNGUARDED dict comprehension with no per-edge timeout, over the whole
+group's edge set (tens of thousands of edges; current figures in the RESULT-SET CAP
 AUDIT block in ``backends/graphiti_client.py``).  Extractor cost is
 therefore a whole-cycle LIVENESS property — one pathological fact stalls
 the entire reconciliation cycle — not a micro-optimisation. (amendment,
@@ -183,6 +183,20 @@ original number implied, not less.  The read that feeds it was timed
 reify) — bounded, and roughly +2.6 s per cycle over the old truncated
 read; see the MEASURED COST section of that same audit block, so this
 claim rests on a number rather than on an estimate. (amendment, task 4340)
+
+Adding the second (blocked) pattern family did NOT add a second per-edge
+pass (amendment, task 3037). The per-edge extraction remains exactly ONE
+entry into the pipeline: ``extract_snapshot_edge_task_ids_by_marker_class``
+evaluates the whole-fact gate once and returns both id sets, and the
+sweep's comprehension is its only caller — pinned by
+``test_extraction_runs_exactly_once_per_edge``, which counts pipeline
+entries rather than wall-clock. What keeps the added family's cost off the
+hot path is the cheap literal ``_BLOCKED_MARKER_RE`` pre-gate: the
+overwhelming majority of edges carry no 'blocked' token, so they pay one
+extra substring scan and never run the blocked family's five anchored
+patterns at all. Only edges that really do mention 'blocked' pay for the
+second family, and for those the work is irreducible — the two families
+answer different questions.
 """
 
 from __future__ import annotations
@@ -1146,10 +1160,7 @@ def extract_snapshot_edge_task_ids(fact: str) -> set[int]:
 
     Pure: no I/O, no side effects.
     """
-    fact = fact or ''
-    if not SNAPSHOT_STATUS_RE.search(fact):
-        return set()
-    return _extract_ids(fact, _UNION_PATTERNS)
+    return extract_snapshot_edge_task_ids_by_marker_class(fact).all_ids
 
 
 def extract_blocked_assertion_task_ids(fact: str) -> set[int]:
@@ -1186,10 +1197,65 @@ def extract_blocked_assertion_task_ids(fact: str) -> set[int]:
 
     Pure: no I/O, no side effects.
     """
+    return extract_snapshot_edge_task_ids_by_marker_class(fact).blocked_ids
+
+
+class SnapshotEdgeIds(NamedTuple):
+    """One edge fact's extracted task ids, split by marker class (task 3037).
+
+    ``blocked_ids`` is always a SUBSET of ``all_ids`` — both come from the
+    same builder's pattern families, whose marker alternations nest.
+    """
+
+    #: Every id the fact asserts as active/pending/blocked/stalled/in-progress.
+    all_ids: set[int]
+    #: The subset of those the fact asserts as BLOCKED specifically.
+    blocked_ids: set[int]
+
+
+def extract_snapshot_edge_task_ids_by_marker_class(fact: str) -> SnapshotEdgeIds:
+    """Extract BOTH id sets from *fact* in a single pass (task 3037).
+
+    THE single extraction implementation in this module.
+    ``extract_snapshot_edge_task_ids`` and
+    ``extract_blocked_assertion_task_ids`` are thin accessors over it, so the
+    three entry points cannot drift and no caller has to choose between
+    "correct" and "cheap".
+
+    Why one entry point rather than two calls. The extractor runs once per
+    valid edge over the whole group's edge set, with no per-edge timeout, so
+    its cost is a whole-cycle LIVENESS property — see the module docstring's
+    performance section. ``sweep_stale_status_snapshot_edges`` needs both id
+    sets for every edge (the union set to build its ``get_statuses`` census,
+    the blocked set for selection rule 2 and the superseding write), and
+    reaching them through two separate entry points meant walking each fact
+    through the pipeline twice. Pinned by
+    ``test_extraction_runs_exactly_once_per_edge``.
+
+    What one pass does and does not buy. The two pattern families are still
+    run — that is irreducible, since they answer different questions — but
+    the whole-fact gate is evaluated once instead of twice, and the
+    cheap-literal ``_BLOCKED_MARKER_RE`` pre-gate keeps the second family off
+    the hot path entirely for the overwhelming majority of edges, which carry
+    no 'blocked' token at all.
+
+    Pure: no I/O, no side effects.
+    """
     fact = fact or ''
+
+    if not SNAPSHOT_STATUS_RE.search(fact):
+        # No marker of ANY class — neither family can match, and the blocked
+        # family is a subset of this gate, so one scan settles both.
+        return SnapshotEdgeIds(all_ids=set(), blocked_ids=set())
+
+    all_ids = _extract_ids(fact, _UNION_PATTERNS)
     if not _BLOCKED_MARKER_RE.search(fact):
-        return set()
-    return _extract_ids(fact, _BLOCKED_PATTERNS)
+        return SnapshotEdgeIds(all_ids=all_ids, blocked_ids=set())
+
+    return SnapshotEdgeIds(
+        all_ids=all_ids,
+        blocked_ids=_extract_ids(fact, _BLOCKED_PATTERNS),
+    )
 
 
 def _extract_ids(fact: str, patterns: _SnapshotPatterns) -> set[int]:
@@ -1375,15 +1441,18 @@ def select_stale_status_snapshot_edges(
     """
     selected: list[dict] = []
     for edge in edges:
-        fact = edge.get('fact') or ''
+        # Each fall-back extracts independently, and each entry point
+        # normalises a missing fact itself — so a caller that precomputes
+        # BOTH maps (the sweep does) costs zero extraction-pipeline entries
+        # here. Pinned by test_extraction_runs_exactly_once_per_edge.
         if edge_ids is not None:
             ids = edge_ids.get(edge['uuid'], set())
         else:
-            ids = extract_snapshot_edge_task_ids(fact)
+            ids = extract_snapshot_edge_task_ids(edge.get('fact'))
         if blocked_edge_ids is not None:
             blocked_ids = blocked_edge_ids.get(edge['uuid'], set())
         else:
-            blocked_ids = extract_blocked_assertion_task_ids(fact)
+            blocked_ids = extract_blocked_assertion_task_ids(edge.get('fact'))
 
         # Rule 1 — terminal, over UNION ids.
         if ids and any(statuses.get(str(i)) in INACTIVE_TASK_STATUSES for i in ids):
@@ -1483,17 +1552,31 @@ async def sweep_stale_status_snapshot_edges(
     edges = flatten_dedup_edges(grouped)
     stats['scanned'] = len(edges)
 
-    # Extract each edge's ids exactly once — reused below both to build
-    # candidate_ids and (via select_stale_status_snapshot_edges's edge_ids
-    # kwarg) for the final selection, instead of re-running the extraction
-    # regex pipeline a second time per edge. (amendment,
-    # reviewer_comprehensive efficiency finding, task 2613)
-    edge_ids: dict[str, set[int]] = {
-        edge['uuid']: extract_snapshot_edge_task_ids(edge.get('fact') or '') for edge in edges
+    # Extract each edge's ids exactly once — ONE by-class pass per edge
+    # yielding BOTH id sets, reused below to build candidate_ids and (via
+    # select_stale_status_snapshot_edges's two precomputation kwargs) for the
+    # final selection, instead of re-running the extraction pipeline per
+    # edge per marker class. (amendment, reviewer_comprehensive efficiency
+    # finding, task 2613; extended to the blocked family, task 3037)
+    by_class = {
+        edge['uuid']: extract_snapshot_edge_task_ids_by_marker_class(edge.get('fact'))
+        for edge in edges
+    }
+    edge_ids: dict[str, set[int]] = {uuid: ids.all_ids for uuid, ids in by_class.items()}
+    blocked_edge_ids: dict[str, set[int]] = {
+        uuid: ids.blocked_ids for uuid, ids in by_class.items()
     }
 
+    # The census must cover BOTH maps' ids. blocked_ids is a subset of
+    # all_ids by construction, so this is currently the union of all_ids
+    # alone — but taking it over both is what keeps the census correct if
+    # that containment ever stops holding, rather than silently
+    # cross-referencing a blocked-asserted id against a status never looked
+    # up (which would read as absent, i.e. under-select).
     candidate_ids: set[int] = set()
     for ids in edge_ids.values():
+        candidate_ids |= ids
+    for ids in blocked_edge_ids.values():
         candidate_ids |= ids
 
     if not candidate_ids:
@@ -1513,7 +1596,9 @@ async def sweep_stale_status_snapshot_edges(
         stats['errors'] += 1
         return stats
 
-    stale = select_stale_status_snapshot_edges(edges, statuses, edge_ids=edge_ids)
+    stale = select_stale_status_snapshot_edges(
+        edges, statuses, edge_ids=edge_ids, blocked_edge_ids=blocked_edge_ids,
+    )
     stats['candidate_edges'] = len(stale)
 
     invalidate_at = now or datetime.now(UTC)
