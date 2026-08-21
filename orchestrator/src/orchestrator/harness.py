@@ -15195,6 +15195,9 @@ class Harness:
                 dry_run_proposals=[],
                 model_role_rollup=model_role_rollup,
                 stale_lane_census=stale_lane_census,
+                # Task 4559: surface the split that produced new_ewa.
+                submissions_in_step=submissions_in_step,
+                lifecycle_events_in_step=diff,
             )
 
             digest_mod.write_digest_entry(digest_dir, inputs)

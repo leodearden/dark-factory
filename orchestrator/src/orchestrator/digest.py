@@ -630,6 +630,13 @@ class DigestInputs:
     # stays valid.  These lanes are NEVER auto-reclaimed (WIP-preserving) — the
     # census only surfaces them for operator attention.
     stale_lane_census: list[str] = field(default_factory=list)
+    # Task 4559 — the gate/numerator split, rendered so the operator can see
+    # WHICH number drove the EWA.  submissions_in_step is the EWA NUMERATOR
+    # (new escalations only); lifecycle_events_in_step is the digest GATE
+    # (submits + resolves).  Defaulted to 0, appended last, so every existing
+    # constructor across digest.py, harness.py and the test suite stays valid.
+    submissions_in_step: int = 0
+    lifecycle_events_in_step: int = 0
 
 
 def render_digest_markdown(inputs: DigestInputs) -> str:
@@ -695,6 +702,13 @@ def render_digest_markdown(inputs: DigestInputs) -> str:
     lines.append(
         f'- Value / threshold: {inputs.ewa_value:.4f} / {inputs.ewa_threshold:.4f}'
         f'{tripped_marker}'
+    )
+    # Task 4559: make the gate/numerator split legible.  Reading a trip digest
+    # without these two figures cannot distinguish a burst of new escalations
+    # from a cleanup sweep of old ones.
+    lines.append(f'- Submissions in step (EWA numerator): {inputs.submissions_in_step}')
+    lines.append(
+        f'- Lifecycle events in step (digest gate): {inputs.lifecycle_events_in_step}'
     )
     lines.append('')
 
