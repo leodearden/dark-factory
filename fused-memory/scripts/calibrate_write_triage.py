@@ -646,6 +646,60 @@ def build_report(
 
 _BLOCK_KEY = 'write_triage:'
 
+# The keys this writer DERIVES and is therefore entitled to replace. Everything
+# else found in the block is a hand-set operator knob owned by a human (or by a
+# later leaf), and is preserved verbatim -- see write_triage_config_block.
+_CALIBRATION_OWNED_KEYS = frozenset({
+    't_high', 't_low', 'calibration_report_path', 't_high_by_category',
+})
+
+
+def _preserved_block_lines(lines: Sequence[str]) -> list[str]:
+    """The lines of an existing ``write_triage:`` body this writer does not own.
+
+    *lines* is the block body only (the ``write_triage:`` line excluded). A
+    two-space-indented ``key:`` line whose key is not in
+    ``_CALIBRATION_OWNED_KEYS`` is preserved, together with the run of comment
+    lines immediately above it (its explanatory note) and any deeper-indented
+    child lines below it (its nested value). A comment run that is followed by
+    an OWNED key -- the ``# CALIBRATION OUTPUT`` fence and its explanation --
+    is dropped, because the rebuilt block re-emits its own copy.
+
+    Line-oriented for the same reason the caller is: pyyaml is the only YAML
+    dependency, and a safe_dump round-trip would strip config.yaml's
+    operator-facing comments.
+    """
+    kept: list[str] = []
+    pending_comments: list[str] = []
+    keeping_children = False
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            # A blank line ends any comment run and any child block; it is
+            # never itself preserved, so the rebuilt block cannot accumulate
+            # a growing run of separators across successive runs.
+            pending_comments = []
+            keeping_children = False
+            continue
+        if stripped.startswith('#'):
+            pending_comments.append(line)
+            keeping_children = False
+            continue
+        indent = len(line) - len(line.lstrip())
+        if indent > 2:
+            # A child of whatever key we last saw.
+            if keeping_children:
+                kept.append(line)
+            continue
+        key = stripped.split(':', 1)[0].strip()
+        keeping_children = key not in _CALIBRATION_OWNED_KEYS
+        if keeping_children:
+            kept.extend(pending_comments)
+            kept.append(line)
+        pending_comments = []
+    return kept
+
+
 
 def write_triage_config_block(
     yaml_text: str,
@@ -660,6 +714,18 @@ def write_triage_config_block(
     round-trip: pyyaml is the only YAML dependency (no ruamel), and dumping
     would strip config.yaml's extensive explanatory comments, which are
     load-bearing for operators.
+
+    This writer OWNS exactly four keys -- ``t_high``, ``t_low``,
+    ``calibration_report_path``, ``t_high_by_category`` -- and PRESERVES
+    everything else it finds in the block, comments and nested values
+    included, re-emitting it above the calibration fence. The rule is
+    "preserve what this writer does not own", not an allowlist of known
+    knobs, so a key a later leaf adds is not dropped by a recalibration that
+    predates it. The reason it matters: ``write_triage.enabled`` is a
+    green-tier hot-reloadable operator kill switch living in this same
+    section, and ``reload_config`` re-reads config.yaml -- so rebuilding the
+    block from scratch would revert triage to off with nothing logged and
+    nothing to grep, and would make the flag unflippable at runtime besides.
 
     Raises when either POOLED threshold is ``None`` — an uncalibrated run
     must never put a null threshold into config, and a per-category map
@@ -693,8 +759,46 @@ def write_triage_config_block(
             for category in sorted(t_high_by_category)
         )
 
+    lines = yaml_text.splitlines(keepends=True)
+    start = next(
+        (i for i, line in enumerate(lines) if line.startswith(_BLOCK_KEY)),
+        None,
+    )
+
+    # Scan to the next line that opens a new TOP-LEVEL key (column 0, not a
+    # comment and not blank). Bounding the span this way is what keeps a
+    # section declared after write_triage from being eaten.
+    end = len(lines)
+    if start is not None:
+        for i in range(start + 1, len(lines)):
+            line = lines[i]
+            if line.strip() and not line[0].isspace() and not line.lstrip().startswith('#'):
+                end = i
+                break
+
+        # Then walk `end` back: a run of COLUMN-0 comment lines, plus any blank
+        # lines before it, is the HEADER for the section that FOLLOWS — that is
+        # config.yaml's convention throughout (see the 6-line comment block before
+        # `summary_rebuild:`). It must survive the replacement rather than being
+        # consumed as block-internal. The column-0 test is deliberately
+        # `startswith('#')` and NOT `lstrip().startswith('#')`: an INDENTED comment
+        # belongs to the block it sits inside, so the walk stops at it.
+        while end > start + 1 and (
+            not lines[end - 1].strip() or lines[end - 1].startswith('#')
+        ):
+            end -= 1
+
+    # Hand-set knobs found in the existing block, re-emitted ABOVE the
+    # calibration fence so the shipped file's layout round-trips unchanged and
+    # the derived and hand-set halves stay visually separable.
+    preserved = (
+        ''.join(_preserved_block_lines(lines[start + 1:end]))
+        if start is not None else ''
+    )
+
     block = (
         f'{_BLOCK_KEY}\n'
+        f'{preserved}'
         '  # CALIBRATION OUTPUT — do not hand-edit.\n'
         '  # Derived from measured similarity distributions by\n'
         '  # scripts/calibrate_write_triage.py; both values are order statistics of\n'
@@ -708,34 +812,9 @@ def write_triage_config_block(
         f'{by_category}'
     )
 
-    lines = yaml_text.splitlines(keepends=True)
-    start = next(
-        (i for i, line in enumerate(lines) if line.startswith(_BLOCK_KEY)),
-        None,
-    )
     if start is None:
         separator = '' if yaml_text.endswith('\n\n') or not yaml_text else '\n'
         return yaml_text + separator + block
-
-    # Scan to the next line that opens a new TOP-LEVEL key (column 0, not a
-    # comment and not blank). Bounding the span this way is what keeps a
-    # section declared after write_triage from being eaten.
-    end = len(lines)
-    for i in range(start + 1, len(lines)):
-        line = lines[i]
-        if line.strip() and not line[0].isspace() and not line.lstrip().startswith('#'):
-            end = i
-            break
-
-    # Then walk `end` back: a run of COLUMN-0 comment lines, plus any blank
-    # lines before it, is the HEADER for the section that FOLLOWS — that is
-    # config.yaml's convention throughout (see the 6-line comment block before
-    # `summary_rebuild:`). It must survive the replacement rather than being
-    # consumed as block-internal. The column-0 test is deliberately
-    # `startswith('#')` and NOT `lstrip().startswith('#')`: an INDENTED comment
-    # belongs to the block it sits inside, so the walk stops at it.
-    while end > start + 1 and (not lines[end - 1].strip() or lines[end - 1].startswith('#')):
-        end -= 1
 
     # No trailing accumulator: `lines[end:]` already emits every reclaimed line
     # verbatim, so collecting them separately would double-emit them.

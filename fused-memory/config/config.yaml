@@ -406,8 +406,11 @@ write_triage:
     procedural_knowledge: 0.839045608910388
   # EVIDENCE STATUS (hand-added prose, task 3357 — no numbers here; the
   # machine-readable record is the report's per_category section, which
-  # the calibration guard test binds. A later --write-config run rewrites
-  # this whole block and drops this note; the report survives it.)
+  # the calibration guard test binds. A later --write-config run replaces
+  # the four CALIBRATION keys above and PRESERVES the hand-set operator
+  # knobs at the top of this block (task 3127), but it still drops THIS
+  # trailing note: preservation attaches a comment run to the key beneath
+  # it, and this run has no key beneath it. The report survives it.)
   # - procedural_knowledge: has its own cutoff above, derived from that
   #   category's own 242 duplicate / 3328 negative labeled pairs.
   # - observations_and_summaries: NO cutoff. Refusal reason
