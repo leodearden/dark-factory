@@ -692,6 +692,12 @@ verify_admission_slots_dir: "/tmp/df-verify-slots-1000-dark_factory"
 # INTERIM PARTIAL cap (operator decision, Leo 2026-08-19, esc-5984-3) on the
 # pytest-xdist worker count for the verify TEST LEG.
 #
+# THIS BLOCK IS THE SINGLE SOURCE OF TRUTH for the decision. The T6 report's
+# dated addendum and orchestrator/tests/test_verify_pytest_n_operator_cap.py
+# each point HERE and deliberately keep only what is local to them, rather than
+# re-paraphrasing what follows: several copies of one rationale drift apart
+# silently, which is the same failure this key's guard test exists to prevent.
+#
 # REACHES ROLES {task, background} ONLY. `merge` is deliberately never
 # -n-capped: it bypasses admission slot-counting and is latency-critical
 # (verify.py gates the cap on `role in {'task','background'}`).

@@ -217,25 +217,22 @@ This section's recommendation still stands as written **for the code default
 and for every other install**: `verify_admission_pytest_n` ships as `'auto'`
 and task 4456 changed no source.
 
-What changed is dark_factory's *deployed* value. By operator decision (Leo,
-2026-08-19, esc-5984-3), `dark-factory-orchestrator.yaml` now sets
-`verify_admission_pytest_n: "8"` — an interim partial cap pending task 3589,
-reaching roles `{task, background}` only. The basis is task **3589's
-loaded-host ladder**, which POSTDATES this report: vs `n=16`, ~108% wall clock
-at ~61% of CPU-seconds and ~50% of RAM; vs `n=32`, both faster (9.31s vs
-12.27s) and 2.7x cheaper in CPU-seconds.
+What changed is dark_factory's *deployed* value: `dark-factory-orchestrator.yaml`
+now sets `verify_admission_pytest_n: "8"`. **The rationale, measured basis and
+reversion procedure live in the comment block directly above that key**, which
+is the single source of truth for the decision and is deliberately not
+paraphrased here.
 
-**This report's own `-n 16` candidate was considered and not chosen** — the
-ladder above measured it directly rather than leaving it untested.
+The two facts that are local to *this* report:
 
-Note the two sources were taken under different conditions and neither
-supersedes the other by date alone: this report's "keep `'auto'`" rests on the
-absence of a clean idle window, while 3589's ladder is explicitly a
-*loaded-host* measurement. **Anyone reopening the value question must
-reconcile BOTH, not cite either alone.** The yaml comment block points back
-here for exactly that reason, and
-`orchestrator/tests/test_verify_pytest_n_operator_cap.py` is the executable
-half pinning the deployed value and its role gating.
+- **This report's own `-n 16` candidate was considered and not chosen** — task
+  3589's loaded-host ladder measured it directly rather than leaving it
+  untested.
+- **Neither source supersedes the other by date alone**, because they were
+  taken under different conditions: this report's "keep `'auto'`" rests on the
+  absence of a clean idle window, while 3589's ladder is explicitly a
+  *loaded-host* measurement. Anyone reopening the value question must reconcile
+  BOTH, not cite either alone.
 
 ### PRD §9 item 3 — should `background` be excluded from `-n` capping?
 
