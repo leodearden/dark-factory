@@ -30,11 +30,20 @@ batch whose failure fraction STRICTLY exceeds 50% (failed/total > 0.5) is a
 run-level FAILURE: the CLI then writes ZERO coding records and exits
 non-zero. This module never escalates and never writes the codebook —
 that is epsilon/gamma's job.
+
+SKIPPED + COUNTED NOW ALSO MEANS ANNOUNCED (task 4511): every per-digest
+failure is logged at WARNING on ``legibility.coder`` as it happens, naming
+the session and the reason. Counting alone was not enough, because the
+count only ever reaches a human through epsilon's storm escalation — and a
+SUB-storm batch (failed/total <= 0.5) is ``status="ok"``, so those failures
+previously reached no sink whatsoever. Escalation is still not this
+module's job; a journal line is not an escalation.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import re
 import subprocess
@@ -44,6 +53,8 @@ from pathlib import Path
 
 import codebook as codebook_mod
 import yaml
+
+logger = logging.getLogger("legibility.coder")
 
 
 class CoderParseError(Exception):
@@ -462,6 +473,24 @@ def code_digests(
     ``failures`` as ``(session, reason)`` pairs (session is ``None`` when
     the crash happened before a session could even be determined).
 
+    EACH FAILURE IS ALSO ANNOUNCED AT WARNING AS IT HAPPENS, through ONE
+    append+log funnel that both failure paths converge on — the isolating
+    ``except`` above and the ``not result.ok`` arm — so neither can drift
+    from the other or be forgotten by a later edit.
+
+    That WARNING is the ONLY sink some failures ever reach. A batch whose
+    failure fraction does not STRICTLY exceed 0.5 (2 of 4, say) returns
+    ``status="ok"``, so epsilon escalates nothing and, before this, those
+    failures were invisible everywhere: not the journal, not an escalation,
+    nowhere. Per-digest lines also keep 38 identical ENOENTs distinguishable
+    from 38 distinct model errors — a distinction epsilon's single joined
+    aggregate detail flattens.
+
+    WARNING rather than ERROR, deliberately: one failed digest does not by
+    itself fail the run. Only the storm does, and that branch's ERROR is
+    emitted by ``nightly.post_escalation``. The reason is logged unbounded;
+    ``_invoke_cli`` already tail-bounds the stderr it embeds.
+
     ``status`` is ``"failure"`` when ``failed/total`` STRICTLY exceeds
     0.5 — a majority-failure storm — else ``"ok"``. Never escalates,
     never writes the codebook.
@@ -475,13 +504,20 @@ def code_digests(
                 digest_text, codebook, project=project, model=model, invoke=invoke,
             )
         except Exception as exc:  # isolate: one crash can't abort the batch
-            failures.append((None, str(exc)))
-            continue
-
-        if result.ok:
-            records.append(result.record)
+            failure = (None, str(exc))
         else:
-            failures.append((result.session, result.reason))
+            if result.ok:
+                records.append(result.record)
+                continue
+            failure = (result.session, result.reason)
+
+        # ONE append+log site for BOTH failure paths, so they cannot drift
+        # apart and a later edit cannot silence one of them.
+        session, reason = failure
+        logger.warning(
+            "legibility coder: digest failed (session=%s): %s", session, reason,
+        )
+        failures.append(failure)
 
     total = len(digests)
     failed = len(failures)
