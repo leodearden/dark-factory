@@ -112,6 +112,46 @@ class TestHarnessPauseScheduler:
         assert harness.scheduler.pause_reason == 'test reason'
 
     @pytest.mark.asyncio
+    async def test_pause_persists_current_ewa_value(self, tmp_path: Path) -> None:
+        """pause_scheduler records the live EWA on the persisted pause row (task 4559).
+
+        Without it a restart mid-pause loses the number the halt was based on,
+        so the halt can only ever be re-asserted blind.
+        """
+        harness, mock_run_store, _ = _make_harness_with_mocks(tmp_path)
+        harness._ewa_value = 73.59
+
+        await harness.pause_scheduler('ewa_trip_73.5900')
+
+        mock_run_store.save_scheduler_pause.assert_called_once()
+        recorded = mock_run_store.save_scheduler_pause.call_args.kwargs.get('ewa_value')
+        assert recorded == pytest.approx(73.59), (
+            f'Expected ewa_value=73.59 persisted; got {recorded!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_non_ewa_pause_also_persists_ewa_value(self, tmp_path: Path) -> None:
+        """Every pause class records the EWA — it is evidence, not a trip flag.
+
+        The pause CLASS is carried by the reason string, and the restore-time
+        predicate keys on that reason, never on the presence of a value.  So a
+        park-stop pause records the EWA too: it is forensic context for the
+        operator reading the row, and recording it uniformly is what makes the
+        evidence-vs-halt split structural to pause_scheduler rather than
+        EWA-specific.
+        """
+        harness, mock_run_store, _ = _make_harness_with_mocks(tmp_path)
+        harness._ewa_value = 4.2
+
+        await harness.pause_scheduler('park-stop: 5 blocked')
+
+        mock_run_store.save_scheduler_pause.assert_called_once()
+        recorded = mock_run_store.save_scheduler_pause.call_args.kwargs.get('ewa_value')
+        assert recorded == pytest.approx(4.2), (
+            f'Expected ewa_value=4.2 persisted for a non-EWA pause; got {recorded!r}'
+        )
+
+    @pytest.mark.asyncio
     async def test_pause_scheduler_persists_via_runstore(self, tmp_path: Path) -> None:
         """pause_scheduler() calls run_store.save_scheduler_pause with the correct args."""
         harness, mock_run_store, _ = _make_harness_with_mocks(tmp_path)
