@@ -3625,3 +3625,131 @@ def test_every_fail_loud_branch_journals_its_reason_with_the_server_down(
     assert detail_marker in message, (
         f'the reason must survive whole -- {detail_marker!r} not in {message!r}'
     )
+
+
+# ---------------------------------------------------------------------------
+# task 4511 step-3/4: the three EXIT-0 escalation sites stay at WARNING, and
+# are logged exactly ONCE.
+#
+# `post_escalation` now journals every escalation itself, so the two call
+# sites that already logged the pair would double-log, and all three exit-0
+# sites would be promoted to ERROR. Neither is acceptable: the budget door,
+# the barren streak and the deletion-directive aggregate all deliberately
+# leave `exit_code=0` (a non-zero exit would make check_trickle_liveness.sh
+# scream every night about a timer that is running perfectly), so an ERROR
+# here would put a healthy-but-barren timer into `journalctl -p err`.
+#
+# The rule these three pin: ERROR iff the escalation accompanies a NON-ZERO
+# exit; WARNING iff the run still exits 0.
+# ---------------------------------------------------------------------------
+
+def test_budget_suppression_door_journals_once_at_warning(tmp_path, caplog):
+    """The budget-suppression door escalates AND exits 0, so its journal
+    line stays a WARNING -- and there is exactly one of it, not a call-site
+    WARNING plus a post_escalation ERROR."""
+    cfg = _cfg_for(tmp_path)
+    posted = []
+
+    with caplog.at_level(logging.DEBUG, logger='legibility.nightly'):
+        escalated = nightly._report_sample_outcome(
+            cfg, _sample(budget_skipped=4), date(2026, 7, 13),
+            poster=lambda url, env: posted.append((url, env)),
+        )
+
+    assert escalated is True
+    assert len(posted) == 1
+
+    loud = _nightly_warnings(caplog)
+    assert len(loud) == 1, (
+        f'expected exactly one record for the summary/detail pair; got '
+        f'{[(r.levelname, r.getMessage()) for r in loud]}'
+    )
+    assert loud[0].levelno == logging.WARNING, (
+        'this door leaves exit_code=0 on purpose; promoting its journal '
+        'line to ERROR is a weaker version of the same false alarm a '
+        'non-zero exit would raise'
+    )
+    message = loud[0].getMessage()
+    assert 'totally suppressed by the digest byte budget' in message
+    assert 'max_daily_digest_bytes' in message, (
+        f'the detail half names the remedy; got {message!r}'
+    )
+
+
+def test_barren_streak_journals_once_at_warning(tmp_path, caplog):
+    """Same rule for the sibling streak escalation: it explicitly refuses to
+    touch `result.exit_code`, so it stays out of `journalctl -p err`."""
+    cfg = _cfg_for(tmp_path)
+    result = nightly.NightlyResult(exit_code=0)
+    posted = []
+    doc = {
+        'outcome': trickle_state.OUTCOME_BARREN,
+        'consecutive_barren_runs': trickle_state.DEFAULT_MAX_BARREN_RUNS,
+        'counters': {'budget_skipped': 2},
+        'last_productive_at': '2026-07-12T03:00:00+00:00',
+    }
+
+    with caplog.at_level(logging.DEBUG, logger='legibility.nightly'):
+        nightly._escalate_barren_streak(
+            cfg, doc, date(2026, 7, 15), result,
+            poster=lambda url, env: posted.append((url, env)),
+        )
+
+    assert result.barren_escalated is True
+    assert len(posted) == 1
+
+    loud = _nightly_warnings(caplog)
+    assert [r.levelname for r in loud] == ['WARNING'], (
+        f'expected exactly one WARNING; got '
+        f'{[(r.levelname, r.getMessage()) for r in loud]}'
+    )
+    message = loud[0].getMessage()
+    assert (
+        f'produced nothing for {trickle_state.DEFAULT_MAX_BARREN_RUNS} '
+        f'consecutive runs'
+    ) in message
+    assert 'check_trickle_progress.py' in message, (
+        f'the detail half names the on-demand probe; got {message!r}'
+    )
+
+
+def test_deletion_directive_aggregate_journals_once_at_warning(tmp_path, caplog):
+    """The third exit-0 escalation, which the task description does not name
+    but which shares the rule: one deletion-shaped coder record is loud but
+    NON-fatal (exit_code stays 0, the same shape census.py uses for its
+    mass-rejection signal), so its aggregate belongs at WARNING."""
+    work_cwd = str(tmp_path / 'work')
+    _repo, config_path = _init_e2e_repo(tmp_path, work_cwd=work_cwd)
+    projects_root = tmp_path / 'projects'
+    _write_transcript(
+        projects_root / _encode_cwd(work_cwd) / 'session-1.jsonl',
+        cwd=work_cwd, timestamp='2026-07-13T10:00:00Z', session_id='session-1',
+    )
+
+    escalations = []
+    with caplog.at_level(logging.DEBUG, logger='legibility.nightly'):
+        result = nightly.run_nightly(
+            config_path=config_path,
+            projects_root=projects_root,
+            target_date=date(2026, 7, 13),
+            now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
+            invoke=_fake_invoke_deletion_directive,
+            status_fetcher=None,
+            poster=lambda url, env: escalations.append((url, env)),
+        )
+
+    assert result.exit_code == 0
+    assert len(escalations) == 1
+
+    loud = _nightly_warnings(caplog)
+    # 'carried' (past tense) is the AGGREGATE; the per-record line at the
+    # skip site says 'carries' and is deliberately left alone.
+    aggregate = [r for r in loud if 'carried a deletion directive' in r.getMessage()]
+    assert len(aggregate) == 1, (
+        f'expected exactly one aggregate record; got '
+        f'{[(r.levelname, r.getMessage()) for r in aggregate]}'
+    )
+    assert aggregate[0].levelno == logging.WARNING
+    assert [r for r in loud if r.levelno >= logging.ERROR] == [], (
+        'a run that exits 0 must never appear in `journalctl -p err`'
+    )
