@@ -2035,6 +2035,50 @@ class TestParseArgs:
         assert exc_info.value.code == 2
         assert '--fail-on-blind-spot requires --check' in capsys.readouterr().err
 
+    @pytest.mark.parametrize(
+        ('argv', 'offender'),
+        [
+            (['--apply', '--list-known-projects'], '--apply'),
+            (['--check', '--list-known-projects'], '--check'),
+            (['--terminal-drain', '--list-known-projects'], '--terminal-drain'),
+            (['--delete-ids', 'abc', '--list-known-projects'], '--delete-ids'),
+        ],
+    )
+    def test_list_known_projects_with_a_sweeping_flag_is_rejected(
+        self, argv, offender, capsys,
+    ):
+        """task 2917 EDIT 1. --list-known-projects returns BEFORE the sweep
+        runs, so pairing it with any sweep-performing or verdict-rendering
+        flag would print the list and SILENTLY NOT SWEEP -- the same
+        cannot-fail/no-op defect class this function already rejects for
+        --fail-on-blind-spot. An operator who wired
+        `--apply --terminal-drain --list-known-projects` into the nightly
+        service would get a green run that drained nothing."""
+        with pytest.raises(SystemExit) as exc_info:
+            _mod._parse_args(argv)
+        assert exc_info.value.code == 2
+        stderr = capsys.readouterr().err
+        assert '--list-known-projects' in stderr and offender in stderr, (
+            f'Expected an actionable error naming both flags, got: {stderr!r}'
+        )
+
+    def test_list_known_projects_alone_parses(self):
+        """The supported shape -- resolution only, no sweep flags."""
+        args = _mod._parse_args(['--list-known-projects'])
+        assert args.list_known_projects is True
+
+    def test_nightly_argv_still_parses_alongside_the_new_guard(self):
+        """The load-bearing ordering guard, re-asserted for task 2917: the
+        nightly `--apply --terminal-drain` argv must keep parsing cleanly.
+        The new validation sits alongside the --fail-on-blind-spot check and
+        BEFORE the tri-state resolution, so it cannot reject a run that
+        passes neither spelling."""
+        args = _mod._parse_args(['--apply', '--terminal-drain'])
+        assert args.apply is True
+        assert args.terminal_drain is True
+        assert args.list_known_projects is False
+        assert args.fail_on_blind_spot is True
+
     def test_opt_in_with_check_parses(self):
         """The supported wiring — and the one
         scripts/fused-memory-flag-marker-check.sh produces, since its exec
