@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from _orch_helpers import pydantic_spec
 
-from orchestrator.config import OrchestratorConfig
+from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.event_store import EventType
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_runner import (
@@ -1900,6 +1900,162 @@ class TestRunMergeVerifyOnWorktree:
         effective_config = run_scoped.await_args[0][1]
         assert effective_config.merge_verify_breadth == 'full'
         assert effective_config.merge_verify_workspace is True
+
+    async def test_spec_module_set_overrides_host_config_registry(self):
+        """Task 4536: the SPEC names the module SET, so the (remote) host's own
+        `_discover_module_configs` registry can neither narrow nor widen it.
+
+        The natural extension of fix (a) above: the module set is the third
+        spec-supplied element of the merge-deciding profile, alongside
+        merge_verify_workspace/merge_verify_breadth (task 2822) and the global
+        commands (INV-1, task 2883). Without it the reconstructed set is passed
+        positionally but then DISCARDED by
+        verify_plan.effective_merge_module_configs, which prefers
+        `config.module_configs_or_empty` under breadth='full'.
+        """
+        from orchestrator.verify_runner import run_merge_verify_on_worktree
+
+        run_scoped = AsyncMock(return_value=_make_pass_result())
+        run_unscoped = AsyncMock(
+            return_value=MagicMock(
+                broken=False, timed_out=False,
+                failing_subprojects=[], timed_out_subprojects=[],
+            )
+        )
+        # The (remote) host config carries a registry of HOST-ONLY modules with
+        # stale commands (the blessed direct-assignment idiom — _module_configs
+        # is a PrivateAttr, not a model field). Profile fields are pinned
+        # explicitly: OrchestratorConfig is a BaseSettings whose bare defaults
+        # may be widened by a settings source.
+        config = OrchestratorConfig(
+            merge_verify_workspace=False, merge_verify_breadth='scoped',
+        )
+        config._module_configs = {
+            'host/only': ModuleConfig(prefix='host/only', test_command='STALE_HOST_TEST'),
+            'host/gone': ModuleConfig(prefix='host/gone', test_command='STALE_HOST_TEST_2'),
+        }
+        # ... but the spec carries a DIFFERENT, larger set (as the merge-request
+        # boundary would have widened it before build_merge_verify_spec ran).
+        spec = MergeVerifySpec(
+            verify_commands=(
+                VerifyCommand('src/a', test_command='SPEC_TEST_A', lint_command='SPEC_LINT_A'),
+                VerifyCommand('src/b', test_command='SPEC_TEST_B',
+                              type_check_command='SPEC_TYPE_B'),
+                VerifyCommand('src/c', lint_command='SPEC_LINT_C'),
+            ),
+            unscoped_typecheck=UnscopedTypecheckSpec(commands=()),
+            task_files=('src/a/m.py',),
+            verify_env={},
+            cold_timeout_secs=60.0,
+            merge_verify_workspace=False,
+            merge_verify_breadth='full',
+        )
+
+        await run_merge_verify_on_worktree(
+            MagicMock(), config, spec,
+            run_scoped=run_scoped, run_unscoped=run_unscoped,
+        )
+
+        assert run_scoped.await_args is not None
+        effective_config = run_scoped.await_args[0][1]
+        spec_prefixes = {vc.prefix for vc in spec.verify_commands}
+        registry = effective_config.module_configs_or_empty
+        assert set(registry) == spec_prefixes, (
+            f'the config registry threaded into the merge must be the SPEC\'s set; '
+            f'expected {spec_prefixes!r}, got {set(registry)!r}'
+        )
+        assert not {'host/only', 'host/gone'} & set(registry), (
+            'the remote host\'s own discovered modules must not survive into the '
+            'merge-deciding registry'
+        )
+        for vc in spec.verify_commands:
+            mc = registry[vc.prefix]
+            assert mc.test_command == vc.test_command
+            assert mc.lint_command == vc.lint_command
+            assert mc.type_check_command == vc.type_check_command
+
+        # The AGREEMENT invariant — the unit-level statement of
+        # effective_merge_module_configs' INV-5. The registry and the
+        # positionally-passed list are two sources a downstream reader could
+        # consult; pinning that they cannot disagree is what makes it impossible
+        # to pick the wrong one.
+        passed_modules = run_scoped.await_args[0][2]
+        assert {mc.prefix for mc in passed_modules} == spec_prefixes
+        assert {
+            (mc.prefix, mc.test_command, mc.lint_command, mc.type_check_command)
+            for mc in passed_modules
+        } == {
+            (mc.prefix, mc.test_command, mc.lint_command, mc.type_check_command)
+            for mc in registry.values()
+        }, (
+            'config.module_configs_or_empty and the passed module_configs must name '
+            'the same modules with the same commands (INV-5)'
+        )
+        # The unscoped typecheck gate reads the same set.
+        assert run_unscoped.await_args is not None
+        assert {mc.prefix for mc in run_unscoped.await_args[0][2]} == spec_prefixes
+
+    async def test_caller_config_registry_is_not_mutated(self):
+        """Task 4536, constraint 2: the registry install must REBIND the dict,
+        never mutate it in place.
+
+        ``model_copy`` shares ``__pydantic_private__`` BY REFERENCE with the
+        source, so a ``.clear()``/``.update()`` spelling would reach through the
+        copy and silently corrupt the CALLER's config — the object cli.py loaded
+        from disk and may still use. This is why the rebind is load-bearing
+        rather than stylistic.
+        """
+        from orchestrator.verify_runner import run_merge_verify_on_worktree
+
+        run_scoped = AsyncMock(return_value=_make_pass_result())
+        run_unscoped = AsyncMock(
+            return_value=MagicMock(
+                broken=False, timed_out=False,
+                failing_subprojects=[], timed_out_subprojects=[],
+            )
+        )
+        caller_config = OrchestratorConfig(
+            merge_verify_workspace=False, merge_verify_breadth='scoped',
+        )
+        host_modules = {
+            'host/only': ModuleConfig(prefix='host/only', test_command='STALE_HOST_TEST'),
+            'host/gone': ModuleConfig(prefix='host/gone', test_command='STALE_HOST_TEST_2'),
+        }
+        caller_config._module_configs = host_modules
+        original_dict = caller_config._module_configs
+        original_items = dict(host_modules)
+
+        spec = MergeVerifySpec(
+            verify_commands=(
+                VerifyCommand('src/a', test_command='SPEC_TEST_A'),
+                VerifyCommand('src/b', test_command='SPEC_TEST_B'),
+            ),
+            unscoped_typecheck=UnscopedTypecheckSpec(commands=()),
+            task_files=('src/a/m.py',),
+            verify_env={},
+            cold_timeout_secs=60.0,
+            merge_verify_workspace=False,
+            merge_verify_breadth='full',
+        )
+
+        await run_merge_verify_on_worktree(
+            MagicMock(), caller_config, spec,
+            run_scoped=run_scoped, run_unscoped=run_unscoped,
+        )
+
+        assert caller_config._module_configs is original_dict, (
+            'the caller\'s registry dict object must be untouched — an in-place '
+            'mutation of the COPY reaches through the shared __pydantic_private__ '
+            'and corrupts the caller\'s config'
+        )
+        assert caller_config._module_configs == original_items, (
+            f'the caller\'s registry contents must be unchanged; got '
+            f'{set(caller_config._module_configs)!r}'
+        )
+        # Sanity: the copy really did receive the spec's set, so the identity
+        # assertion above is not passing vacuously against a no-op fix.
+        effective_config = run_scoped.await_args[0][1]
+        assert set(effective_config.module_configs_or_empty) == {'src/a', 'src/b'}
 
     async def test_spec_global_verify_command_applied_onto_config(self):
         """INV-1 (task 2883): a spec's global_verify_command overrides the
