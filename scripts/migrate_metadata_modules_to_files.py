@@ -27,9 +27,31 @@ import json
 import os
 import sys
 import uuid
+from pathlib import Path
 from typing import Any
 
 import httpx
+
+# Bind `shared` to the SAME checkout as this script via a __file__-relative
+# path, never a hardcoded absolute. An editable install puts the MAIN
+# checkout's shared/src on sys.path for a bare `python3`, so without this a
+# copy of this script running from a worktree would silently evaluate the lock
+# charter using the main checkout's predicate. Same reasoning and same form as
+# scripts/repair_wiped_metadata_files.py:80-86 (which imports this module's
+# exact inverse, `directory_locks`, for the very same gate).
+_SHARED_SRC = Path(__file__).resolve().parent.parent / "shared" / "src"
+if str(_SHARED_SRC) not in sys.path:
+    sys.path.insert(0, str(_SHARED_SRC))
+
+# WHY `shared.locking` AND NOT `orchestrator.module_charter.
+# sanitize_files_for_persist`: `orchestrator` is not importable from this
+# script's runtime context (measured — it is not a dependency of the `shared`
+# project this script runs under, and a scripts/-rooted sys.path[0] gives no
+# namespace-package fallback), and that function's ENTIRE body is
+# `return strip_directory_locks(files)`. So this IS the charter predicate, one
+# indirection lower — and it is the same module the server-side gate,
+# `_reject_directory_locks_in_update_metadata`, calls `directory_locks` from.
+from shared.locking import strip_directory_locks  # noqa: E402
 
 DEFAULT_SERVER = 'http://127.0.0.1:8002'
 DEFAULT_ROOTS = ['/home/leo/src/dark-factory']
@@ -183,7 +205,16 @@ async def _migrate_one_project(
             if k not in ('modules', 'done_provenance')
         }
         if not files:
-            new_meta['files'] = modules
+            # SANITIZE, never copy verbatim. The server rejects any
+            # metadata.files carrying a directory-shaped entry
+            # (_reject_directory_locks_in_update_metadata), so a verbatim copy
+            # of a directory-shaped `modules` is a guaranteed write failure.
+            # When nothing survives the charter, leave new_meta ALONE: an
+            # absent `files` stays absent and an existing `[]` stays `[]`, and
+            # the task's scope is deferred to the architect at plan time.
+            sanitized = strip_directory_locks(list(modules))
+            if sanitized:
+                new_meta['files'] = sanitized
             action = 'copy'
         else:
             action = 'drop'
