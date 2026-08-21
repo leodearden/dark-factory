@@ -4944,11 +4944,12 @@ async def test_validate_done_provenance_missing_kind_lists_every_valid_kind(tmp_
     one, and a hardcoded subset misdirects it (task 2273 / 2490)."""
     from typing import get_args
 
+    from shared.task_metadata import DoneProvenance
+
     from fused_memory.middleware.task_interceptor import (
         _DONE_PROVENANCE_KINDS_TEXT,
         _validate_done_provenance,
     )
-    from shared.task_metadata import DoneProvenance
 
     # Non-empty dict WITHOUT 'kind' -> the kind-is-None branch. ({} would take
     # the earlier missing-provenance branch instead.)
