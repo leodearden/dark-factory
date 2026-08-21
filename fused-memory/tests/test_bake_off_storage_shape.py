@@ -622,6 +622,256 @@ class TestCrossValidateRegrowthInjections:
 
 
 # ===========================================================================
+# 4012 step-3 — the injected corpus, per mode, and the TRUE-canonical invariant
+# ===========================================================================
+#
+# The probe materialises the ratified `c_peers` write shape twice more, once
+# per injection mode, with exactly one extra near-duplicate per topic.  The
+# invariant tests below are the task's "scored by TRUE canonical id per
+# 3560's correction, never by an aliased record id" requirement made
+# mechanical.  Pure — built over the committed fixtures, no embedding.
+
+
+@functools.cache
+def _injections() -> tuple:
+    return tuple(_mod().load_regrowth_injections(REGROWTH_INJECTION_PATH))
+
+
+@functools.cache
+def _regrowth_records(mode: str) -> tuple:
+    mod = _mod()
+    return tuple(mod.materialize_regrowth_injections(
+        list(_injections()),
+        _committed_inputs()['claims'],
+        _committed_inputs()['clusters'],
+        mode,
+    ))
+
+
+@functools.cache
+def _regrowth_arm(mode: str) -> tuple:
+    """`c_peers` + the injections for `mode`, in corpus order."""
+    mod = _mod()
+    return tuple(mod.regrowth_corpus(
+        list(_arm('c_peers')),
+        list(_injections()),
+        _committed_inputs()['claims'],
+        _committed_inputs()['clusters'],
+        mode=mode,
+    ))
+
+
+def _indexed(records) -> object:
+    mod = _mod()
+    return mod._index_arm(
+        'c_peers', 'p', 'c', list(records), _committed_inputs()['claims'],
+    )
+
+
+class TestRegrowthModesArePinned:
+
+    def test_modes_are_pinned_by_equality_unstamped_first(self):
+        """Pinned, not derived — the convention `ARM_SHAPES`/`QUERY_KINDS` set.
+
+        `unstamped` leads because it is the case that models reality today:
+        esc-3200-3 measured exactly one topic-stamped record for the topic
+        whose re-emissions it was reading, so every organic re-emission
+        arrived with no topic key.  A reader who stops after the first row
+        has then read the real-world case, not the best case.
+        """
+        assert _mod().REGROWTH_MODES == ('unstamped', 'stamped')
+
+    def test_the_regrowth_role_is_distinct_from_every_other_role(self):
+        mod = _mod()
+
+        assert mod.REGROWTH_ROLE == 'regrowth'
+        assert mod.REGROWTH_ROLE not in (mod.DISTRACTOR_ROLE, mod.GROUPED_ROLE)
+
+
+class TestMaterializeRegrowthInjections:
+    """One `ArmRecord` per injection, carrying exactly what a re-emission would."""
+
+    @pytest.mark.parametrize('mode', ['unstamped', 'stamped'])
+    def test_one_record_per_injection_in_fixture_order(self, mode):
+        records = _regrowth_records(mode)
+        injections = _injections()
+
+        assert len(records) == len(injections)
+        for record, injection in zip(records, injections, strict=True):
+            assert record.content == injection.text
+
+    @pytest.mark.parametrize('mode', ['unstamped', 'stamped'])
+    def test_record_ids_are_derived_dashed_uuid5s_distinct_from_the_base_arm(self, mode):
+        mod = _mod()
+        base_ids = {r.record_id for r in _arm('c_peers')}
+
+        for record, injection in zip(_regrowth_records(mode), _injections(), strict=True):
+            expected = mod._derive_record_id(f'regrowth:{mode}', injection.injection_id)
+            assert record.record_id == expected
+            assert len(record.record_id) == 36 and record.record_id.count('-') == 4
+            assert record.record_id not in base_ids
+
+    def test_the_two_modes_derive_disjoint_record_ids(self):
+        unstamped = {r.record_id for r in _regrowth_records('unstamped')}
+        stamped = {r.record_id for r in _regrowth_records('stamped')}
+
+        assert not (unstamped & stamped)
+
+    def test_unstamped_carries_no_topic_key_at_all(self):
+        """`'topic' not in metadata` — NOT `metadata.get('topic') is None`.
+
+        A present-but-None topic key is a different write than no key, and
+        the pin's firing rule reads presence.  The unstamped mode models a
+        re-emission that never carried the vocabulary at all.
+        """
+        for record in _regrowth_records('unstamped'):
+            assert 'topic' not in record.metadata
+
+    def test_stamped_carries_its_injections_topic(self):
+        for record, injection in zip(_regrowth_records('stamped'), _injections(), strict=True):
+            assert record.metadata['topic'] == injection.topic
+
+    @pytest.mark.parametrize('mode', ['unstamped', 'stamped'])
+    @pytest.mark.parametrize('key', ['canonical', 'parent_id', 'contested', 'kind'])
+    def test_neither_mode_writes_a_key_a_reemission_would_not_carry(self, mode, key):
+        for record in _regrowth_records(mode):
+            assert key not in record.metadata
+
+    @pytest.mark.parametrize('mode', ['unstamped', 'stamped'])
+    def test_category_matches_the_reemitted_claims_own_category(self, mode):
+        mod = _mod()
+        categories = mod._claim_categories(
+            _committed_inputs()['clusters'], _committed_inputs()['claims'],
+        )
+
+        for record, injection in zip(_regrowth_records(mode), _injections(), strict=True):
+            assert record.metadata['category'] == categories[injection.reemits_claim_id]
+
+    @pytest.mark.parametrize('mode', ['unstamped', 'stamped'])
+    def test_bookkeeping_credits_the_reemitted_claim_and_its_cluster(self, mode):
+        for record, injection in zip(_regrowth_records(mode), _injections(), strict=True):
+            assert record.claim_ids == [injection.reemits_claim_id]
+            assert record.cluster_id == injection.cluster_id
+            assert record.role == _mod().REGROWTH_ROLE
+
+    def test_an_unknown_mode_names_the_modes_it_knows(self):
+        mod = _mod()
+
+        with pytest.raises(ValueError, match='REGROWTH_MODES|unstamped') as excinfo:
+            mod.materialize_regrowth_injections(
+                list(_injections()),
+                _committed_inputs()['claims'],
+                _committed_inputs()['clusters'],
+                'topic_stamped_and_pinned',
+            )
+
+        assert 'topic_stamped_and_pinned' in str(excinfo.value)
+
+
+class TestRegrowthCorpus:
+    """The injections go LAST, and the base list is never mutated."""
+
+    @pytest.mark.parametrize('mode', ['unstamped', 'stamped'])
+    def test_base_records_come_first_in_order_and_injections_are_appended(self, mode):
+        base = list(_arm('c_peers'))
+        corpus = list(_regrowth_arm(mode))
+
+        assert corpus[:len(base)] == base
+        assert corpus[len(base):] == list(_regrowth_records(mode))
+        assert len(corpus) == len(base) + len(_injections())
+
+    @pytest.mark.parametrize('mode', ['unstamped', 'stamped'])
+    def test_the_base_list_is_not_mutated(self, mode):
+        mod = _mod()
+        base = list(_arm('c_peers'))
+        before = len(base)
+
+        mod.regrowth_corpus(
+            base, list(_injections()), _committed_inputs()['claims'],
+            _committed_inputs()['clusters'], mode=mode,
+        )
+
+        assert len(base) == before
+
+
+class TestRegrowthPreservesTheTrueCanonical:
+    """The invariant the whole probe's credibility rests on.
+
+    `canonical_record_ids` is FIRST-MATCH-WINS over the record list, and the
+    injection deliberately carries the canonical's claim id.  Prepending it
+    would silently rename each cluster's canonical to the re-emission, and
+    every discoverability number in the block would then be scored against
+    the duplicate — the aliasing failure 3560 had to disclose after the fact
+    for `b_grouped`, and the one the task names as the thing to avoid.
+    """
+
+    @pytest.mark.parametrize('mode', ['unstamped', 'stamped'])
+    def test_canonical_by_cluster_is_byte_identical_to_the_uninjected_arm(self, mode):
+        base = _indexed(_arm('c_peers'))
+        injected = _indexed(_regrowth_arm(mode))
+
+        assert injected.canonical_by_cluster == base.canonical_by_cluster
+        injected_ids = {r.record_id for r in _regrowth_records(mode)}
+        assert not (set(injected.canonical_by_cluster.values()) & injected_ids)
+
+    @pytest.mark.parametrize('mode', ['unstamped', 'stamped'])
+    def test_canonical_by_topic_is_byte_identical_and_does_not_raise(self, mode):
+        """A stamped injection carrying `canonical: True` would raise here.
+
+        `build_canonical_by_topic` refuses two canonicals on a topic, so this
+        pins that the materializer never writes the key.
+        """
+        base = _indexed(_arm('c_peers'))
+        injected = _indexed(_regrowth_arm(mode))
+
+        assert list(injected.canonical_by_topic) == list(base.canonical_by_topic)
+        for topic, record in base.canonical_by_topic.items():
+            assert injected.canonical_by_topic[topic].record_id == record.record_id
+
+    @pytest.mark.parametrize('mode', ['unstamped', 'stamped'])
+    def test_contested_ids_are_unchanged(self, mode):
+        """An injection must not inherit contested-ness from what it re-emits.
+
+        `contested` has no writer in the live system, so a re-emission that
+        acquired it would be modelling something that cannot happen.
+        """
+        base = _indexed(_arm('c_peers'))
+        injected = _indexed(_regrowth_arm(mode))
+
+        assert injected.contested_ids == base.contested_ids
+
+    @pytest.mark.parametrize('mode', ['unstamped', 'stamped'])
+    def test_records_by_id_gains_exactly_the_injections_and_displaces_nothing(self, mode):
+        base = _indexed(_arm('c_peers'))
+        injected = _indexed(_regrowth_arm(mode))
+
+        added = set(injected.records_by_id) - set(base.records_by_id)
+        assert added == {r.record_id for r in _regrowth_records(mode)}
+        assert len(injected.records_by_id) == len(base.records_by_id) + len(_injections())
+        for record_id, record in base.records_by_id.items():
+            assert injected.records_by_id[record_id] is record
+
+    @pytest.mark.parametrize('mode', ['unstamped', 'stamped'])
+    def test_the_injection_joins_its_clusters_sibling_set(self, mode):
+        injected = _indexed(_regrowth_arm(mode))
+
+        for record in _regrowth_records(mode):
+            assert record.record_id in injected.siblings_by_cluster[record.cluster_id]
+
+
+class TestRegrowthCorpusFingerprintsAreDistinct:
+    """The fetch cache must never replay one pass's rankings as another's."""
+
+    def test_each_injected_corpus_differs_from_the_baseline_and_from_the_other(self):
+        mod = _mod()
+        base = mod.corpus_fingerprint(list(_arm('c_peers')))
+        unstamped = mod.corpus_fingerprint(list(_regrowth_arm('unstamped')))
+        stamped = mod.corpus_fingerprint(list(_regrowth_arm('stamped')))
+
+        assert len({base, unstamped, stamped}) == 3
+
+
+# ===========================================================================
 # step-3 — arm materialization
 # ===========================================================================
 #
