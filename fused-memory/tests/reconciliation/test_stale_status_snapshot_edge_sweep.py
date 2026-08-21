@@ -37,6 +37,7 @@ from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from shared.task_statuses import TaskStatus
 
 from fused_memory.reconciliation.stale_status_snapshot_edge_sweep import (
     _ENUM_PREP_WORDS,
@@ -2007,6 +2008,155 @@ class TestSelectStaleStatusSnapshotEdges:
 
         assert result == [edge]
 
+
+class TestSelectStaleStatusSnapshotEdgesBlockedRule:
+    """The SECOND selection rule (task 3037): a BLOCKED assertion is stale as
+    soon as the task's status is positively known and is not 'blocked' — not
+    only when it reaches a terminal (done/cancelled) status.
+
+    The measured defect this closes, live at HEAD=c54b8cfcc5 against the edge
+    fact 'Task 2848 remains blocked as of 2026-07-22':
+
+        extract_snapshot_edge_task_ids       -> {2848}   (extraction is fine)
+        select(..., {'2848': 'pending'})     -> []       <- the defect
+        select(..., {'2848': 'in-progress'}) -> []       <- the defect
+        select(..., {'2848': 'review'})      -> []       <- the defect
+        select(..., {'2848': 'blocked'})     -> []       (correct)
+        select(..., {'2848': 'done'})        -> [edge]   (the only path that
+                                                          retired it before)
+
+    So a blocked->pending unblock left the 'Task N remains blocked' edge live
+    until the task eventually reached done/cancelled. A blocked assertion is
+    contradicted by ANY non-blocked status, and restricting the trigger to
+    INACTIVE_TASK_STATUSES is precisely what made it survive.
+
+    Every case here calls select_stale_status_snapshot_edges WITHOUT any
+    precomputed-ids kwarg, so it pins the pure decision core rather than the
+    sweep's precomputation plumbing.
+    """
+
+    #: The live repro fact, verbatim.
+    BLOCKED_FACT = 'Task 2848 remains blocked as of 2026-07-22'
+
+    def _edge(self, fact: str = BLOCKED_FACT) -> dict:
+        return {'uuid': 'edge-2848', 'fact': fact, 'name': ''}
+
+    @pytest.mark.parametrize(
+        'status',
+        sorted(s.value for s in TaskStatus if s is not TaskStatus.BLOCKED),
+    )
+    def test_blocked_assertion_selected_for_every_non_blocked_status(self, status):
+        """A blocked assertion is stale under EVERY other member of the closed
+        status vocabulary — the six non-terminal ones (pending, in-progress,
+        deferred, review, merge-deferred, infra-hold) via the new rule, and
+        done/cancelled via the pre-existing terminal rule, which must keep
+        working.
+
+        Parametrized over shared.task_statuses.TaskStatus rather than a
+        hand-written list so the case table is exhaustive over the real
+        vocabulary and cannot drift when a status is added.
+        """
+        edge = self._edge()
+
+        result = select_stale_status_snapshot_edges([edge], {'2848': status})
+
+        assert result == [edge], (
+            f"Expected the blocked assertion {self.BLOCKED_FACT!r} selected as stale "
+            f'when task 2848 status is {status!r} — a blocked assertion is contradicted '
+            f'by ANY non-blocked status, not only a terminal one'
+        )
+
+    def test_blocked_assertion_not_selected_when_still_blocked(self):
+        """statuses={'2848': 'blocked'} -> NOT selected (genuinely still blocked)."""
+        edge = self._edge()
+
+        assert select_stale_status_snapshot_edges([edge], {'2848': 'blocked'}) == []
+
+    def test_blocked_assertion_not_selected_when_id_absent_from_census(self):
+        """The id is missing from the census entirely -> NOT selected.
+
+        Invalidate-only-on-positively-known: a transient census gap (a
+        paginated get_statuses page that failed, a task filed since the
+        enumeration) can only UNDER-select and self-heal next cycle. Over-
+        selection is unrecoverable — an invalidated Graphiti edge is never
+        re-validated.
+        """
+        edge = self._edge()
+
+        assert select_stale_status_snapshot_edges([edge], {}) == []
+        assert select_stale_status_snapshot_edges([edge], {'9999': 'pending'}) == []
+
+    def test_blocked_assertion_not_selected_for_unrecognised_status_value(self):
+        """A census value outside the closed TaskStatus vocabulary -> NOT selected.
+
+        'unknown' is not 'blocked', so a naive ``!= 'blocked'`` test would
+        retire the edge on it. "Positively known" is defined against the
+        closed shared.task_statuses.TaskStatus vocabulary precisely so a
+        malformed/renamed/sentinel census value reads as UNKNOWN rather than
+        as a contradiction — the same fail-safe direction the terminal rule
+        has.
+        """
+        edge = self._edge()
+
+        assert select_stale_status_snapshot_edges([edge], {'2848': 'unknown'}) == []
+        assert select_stale_status_snapshot_edges([edge], {'2848': ''}) == []
+
+    @pytest.mark.parametrize('status', ['in-progress', 'review'])
+    def test_non_blocked_assertion_is_out_of_the_new_rule_scope(self, status):
+        """SCOPE GUARD — this is what forbids the new rule generalising.
+
+        An edge asserting a NON-blocked marker ('Task 999 is an active
+        pending task') must NOT be selected merely because 999 moved to
+        another active status. Only the pre-existing terminal rule still
+        retires it.
+
+        Without this guard the new rule would silently widen to every
+        active/pending snapshot edge in the corpus, since
+        extract_snapshot_edge_task_ids returns the UNION over all markers
+        and cannot tell a pending assertion from a blocked one. That is why
+        the rule keys on extract_blocked_assertion_task_ids instead.
+        """
+        edge = {'uuid': 'edge-999', 'fact': 'Task 999 is an active pending task', 'name': ''}
+
+        assert select_stale_status_snapshot_edges([edge], {'999': status}) == []
+
+    @pytest.mark.parametrize('status', ['done', 'cancelled'])
+    def test_non_blocked_assertion_still_retired_by_the_terminal_rule(self, status):
+        """The other half of the scope guard: the terminal rule is untouched."""
+        edge = {'uuid': 'edge-999', 'fact': 'Task 999 is an active pending task', 'name': ''}
+
+        assert select_stale_status_snapshot_edges([edge], {'999': status}) == [edge]
+
+    def test_aggregate_blocked_edge_selected_on_a_single_unblocked_member(self):
+        """'Blocked tasks: 142, 148' with 142 unblocked to 'pending' and 148
+        still blocked -> the whole edge is selected.
+
+        Same whole-edge semantics the terminal rule already has: the snapshot
+        as asserted no longer holds the moment ANY one referenced id
+        contradicts it.
+        """
+        edge = {'uuid': 'edge-agg', 'fact': 'Blocked tasks: 142, 148', 'name': ''}
+
+        result = select_stale_status_snapshot_edges(
+            [edge], {'142': 'pending', '148': 'blocked'},
+        )
+
+        assert result == [edge]
+
+    def test_blocked_on_another_task_keys_on_the_blocked_task_not_the_blocker(self):
+        """'Task 5 is blocked on task 2862': only 5 is asserted blocked.
+
+        2862 is what task 5 is blocked ON. A rule keyed on 2862's status
+        would be reading the fact backwards — so 2862 going to 'done' must
+        NOT retire this edge through the BLOCKED rule.  (It is still retired
+        by the pre-existing TERMINAL rule, which reads union ids and sees
+        both — deliberately unchanged here; the guard is that the blocked
+        rule alone does not fire on the blocker.)
+        """
+        edge = {'uuid': 'edge-5', 'fact': 'Task 5 is blocked on task 2862', 'name': ''}
+
+        assert select_stale_status_snapshot_edges([edge], {'2862': 'pending'}) == []
+        assert select_stale_status_snapshot_edges([edge], {'5': 'pending'}) == [edge]
 
 # --------------------------------------------------------------------------- #
 # sweep_stale_status_snapshot_edges — core behavior
