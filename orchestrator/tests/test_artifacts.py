@@ -2142,3 +2142,136 @@ class TestEnsureLanePlanSymlink:
         # Still a regular file — no symlink, no self-reference.
         assert lane_plan.is_file()
         assert not lane_plan.is_symlink()
+
+
+class TestWriteMarkupResidue:
+    """`write_markup_residue` — the residue channel verdict-tools CAN reach.
+
+    ``create_server`` already holds a ``TaskArtifacts``, which is a file-backed
+    store rooted at ``self.root`` (``<worktree>/.task``, or the
+    ``.task-meta/<lane>`` root when one is supplied). ``.task/`` is gitignored,
+    so writing there cannot contaminate a task's diff or its verify.
+
+    This is the only surviving copy of a payload an agent could not re-emit, so
+    every row below is about NOT losing it (PRD C2 L187 / INV-7).
+    """
+
+    #: The keys the middleware's residue record actually supplies —
+    #: ``_refuse_unrepairable`` builds exactly this shape.
+    RESIDUE_KEYS = (
+        'error_type', 'category', 'owner', 'level', 'tool', 'field',
+        'matched_pattern', 'agent_id', 'project', 'summary', 'suggested_action',
+    )
+
+    @staticmethod
+    def _record(raw_value: str) -> dict:
+        return {
+            'error_type': 'mcp_markup_unrepairable',
+            'category': 'mcp_markup_residue',
+            'owner': 'l2-escalation-watcher',
+            'level': 2,
+            'tool': 'submit_review_verdict',
+            'field': 'summary',
+            'matched_pattern': '</invoke>',
+            'agent_id': 'claude-task-3690-reviewer',
+            'project': 'dark_factory',
+            'raw_value': raw_value,
+            'summary': 'Unrepairable MCP envelope markup in submit_review_verdict.summary',
+            'suggested_action': 'Recover the raw_value for the caller if still needed.',
+        }
+
+    def test_returns_a_lookup_able_id(self, artifacts: TaskArtifacts):
+        """(a) The return is the FILENAME, and a file of that name exists.
+
+        The id has to be something an operator can act on — that is the whole
+        reason the refusal payload carries one.
+        """
+        residue_id = artifacts.write_markup_residue(self._record('leaked'))
+
+        assert isinstance(residue_id, str)
+        assert residue_id.startswith('markup_residue-')
+        assert residue_id.endswith('.json')
+        assert (artifacts.root / residue_id).is_file()
+
+    def test_the_payload_survives_in_full_and_verbatim(self, artifacts: TaskArtifacts):
+        """(b) Not truncated, not excerpted.
+
+        Deliberately unlike ``build_markup_block``'s 200-char excerpt: that is
+        a diagnostic sitting beside a payload the caller still holds, this is
+        the only surviving copy.
+        """
+        raw = ('x' * 5000) + '\n</invoke>\n<parameter name="issues">[{"a": 1}]'
+        record = self._record(raw)
+
+        residue_id = artifacts.write_markup_residue(record)
+
+        assert residue_id is not None
+        stored = json.loads((artifacts.root / residue_id).read_text())
+        assert stored['raw_value'] == raw
+        assert len(stored['raw_value']) == len(raw)
+        for key in self.RESIDUE_KEYS:
+            assert stored[key] == record[key], f'{key} did not survive the write'
+
+    def test_a_second_refusal_does_not_overwrite_the_first(
+        self, artifacts: TaskArtifacts
+    ):
+        """(c) A fixed filename would make the second leak destroy the first
+        leak's evidence — the exact destruction this method exists to prevent.
+        """
+        first = artifacts.write_markup_residue(self._record('FIRST payload'))
+        second = artifacts.write_markup_residue(self._record('SECOND payload'))
+
+        assert first is not None and second is not None
+        assert first != second
+        assert json.loads((artifacts.root / first).read_text())['raw_value'] == (
+            'FIRST payload'
+        )
+        assert json.loads((artifacts.root / second).read_text())['raw_value'] == (
+            'SECOND payload'
+        )
+        assert len(sorted(artifacts.root.glob('markup_residue-*.json'))) == 2
+
+    def test_numbering_is_collision_tolerant(self, artifacts: TaskArtifacts):
+        """(d) A fresh subprocess starts its counter from zero.
+
+        verdict-tools runs as a fresh stdio subprocess per invocation, so
+        deriving the next index by SCANNING the directory rather than from
+        in-process state is what makes this hold.
+        """
+        one = artifacts.root / 'markup_residue-1.json'
+        two = artifacts.root / 'markup_residue-2.json'
+        one.write_text('{"raw_value": "from a previous process"}\n')
+        two.write_text('{"raw_value": "from another previous process"}\n')
+        before = (one.read_text(), two.read_text())
+
+        residue_id = artifacts.write_markup_residue(self._record('THIRD payload'))
+
+        assert residue_id is not None
+        assert (artifacts.root / residue_id) not in (one, two)
+        assert (artifacts.root / residue_id).is_file()
+        assert (one.read_text(), two.read_text()) == before, (
+            'a pre-existing residue file was clobbered'
+        )
+
+    def test_a_vanished_root_is_tolerated_not_raised(self, tmp_path: Path):
+        """(e) It runs on a path whose outcome is ALREADY decided.
+
+        Per ``_call_sink``'s never-raises contract a storage failure must cost
+        the operator a heads-up, not turn a clean refusal into an opaque crash.
+        And the return must not name a file that does not exist — ``None`` is
+        correct, because the conditional hint then tells the caller the truth
+        automatically.
+        """
+        import shutil
+
+        worktree = tmp_path / 'gone-residue'
+        worktree.mkdir()
+        ta = TaskArtifacts(worktree)
+        ta.init('task-r', 'gone', 'desc')
+        shutil.rmtree(worktree)
+        assert not ta.root.is_dir()
+
+        residue_id = ta.write_markup_residue(self._record('lost payload'))
+
+        assert residue_id is None
+        assert not ta.root.exists()
