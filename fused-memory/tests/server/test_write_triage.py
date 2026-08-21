@@ -16,6 +16,7 @@ triage for every input.
 
 from __future__ import annotations
 
+import json
 import types
 from unittest.mock import AsyncMock, Mock
 
@@ -23,6 +24,7 @@ import pytest
 
 from fused_memory.models.enums import MEM0_PRIMARY, MemoryCategory, SourceStore
 from fused_memory.models.memory import MemoryResult
+from fused_memory.server import write_triage
 from fused_memory.server.write_triage import (
     _DEFAULT_CANDIDATE_K,
     _DEFAULT_WRITE_TRIAGE_ENABLED,
@@ -39,6 +41,7 @@ from fused_memory.server.write_triage import (
     TriageFailOpenCounter,
     _stub_judge,
     decide_band,
+    emit_triage_fail_open_storm_escalation,
     resolve_bands,
     resolve_candidate_k,
     resolve_write_triage_enabled,
@@ -865,3 +868,325 @@ class TestTriageWriteFailsOpen:
         assert await _stub_judge(
             memory_service=None, content='c', project_id='p', decision=None,
         ) == OUTCOME_STORED
+
+
+# ---------------------------------------------------------------------------
+# The storm escalation (INV-4): the alarm that makes a fail-open burst visible
+# ---------------------------------------------------------------------------
+
+#: A storm summary in the exact shape `TriageFailOpenCounter.record` returns.
+_STORM: dict = {
+    'count': 12,
+    'threshold': _FAIL_OPEN_STORM_THRESHOLD,
+    'window_seconds': _FAIL_OPEN_STORM_WINDOW_SECONDS,
+    'projects': ['/project-a', '/project-b'],
+    'hint': 'add_memory write triage failed open repeatedly',
+}
+
+
+class TestEmitTriageFailOpenStormEscalation:
+    """The best-effort queue write on a fail-open burst (INV-4).
+
+    Purely ADDITIVE, exactly like `markup_tripwire.emit_markup_storm_escalation`
+    (whose coverage in `test_markup_tripwire.py::TestEmitMarkupStormEscalation`
+    this mirrors): by the time this runs the write's outcome is already decided
+    and the write has already been stored, so every failure mode here must
+    degrade to `None` rather than change it. Exercised against a real
+    `EscalationQueue` in `tmp_path` — the escalation package is a fused-memory
+    workspace dep.
+    """
+
+    def test_returns_none_for_a_none_project_root(self) -> None:
+        """`add_memory` takes a project_id, not a project_root.
+
+        An unknown project resolves to no root at all, so this must be a quiet
+        no-op rather than a crash on `Path(None)` — a triage fail-open that
+        also raised while trying to report itself would be the exact
+        write-blocking failure C1 forbids.
+        """
+        assert emit_triage_fail_open_storm_escalation(None, _STORM) is None
+
+    def test_returns_none_when_the_escalation_package_is_unavailable(
+        self, tmp_path, monkeypatch,
+    ) -> None:
+        """The defensive-import no-op path (minimal envs without escalation)."""
+        monkeypatch.setattr(write_triage, 'HAS_ESCALATION', False)
+        assert emit_triage_fail_open_storm_escalation(str(tmp_path), _STORM) is None
+        assert not (tmp_path / 'data' / 'escalations').exists()
+
+    def test_files_one_record_naming_the_leaf_the_numbers_and_the_kill_switch(
+        self, tmp_path,
+    ) -> None:
+        """The record must be actionable without opening the code.
+
+        An operator reading it has to be able to tell a real degradation (the
+        judge or mem0 retrieval is down, so every write in the window was
+        stored WITHOUT triage) apart from a misfiring tripwire, and must be
+        pointed at the ONE lever that stops it deliberately rather than
+        guessing at a nearby switch.
+
+        The numbers are asserted as their EXACT labelled substrings: a bare
+        `'12' in detail` would also be satisfied by a digit in the interpolated
+        tmp_path (`/tmp/pytest-of-leo/pytest-124/...`), i.e. it would pass with
+        the count dropped entirely.
+        """
+        esc_id = emit_triage_fail_open_storm_escalation(str(tmp_path), _STORM)
+        if not write_triage.HAS_ESCALATION:
+            assert esc_id is None
+            return
+
+        assert isinstance(esc_id, str)
+        queue_dir = tmp_path / 'data' / 'escalations'
+        files = list(queue_dir.glob('esc-*.json'))
+        assert len(files) == 1, f'expected exactly one escalation file, found: {files}'
+        payload = json.loads(files[0].read_text())
+
+        assert payload['id'] == esc_id
+        assert payload['category'] == 'write_triage_fail_open_storm'
+        assert payload['level'] == 1
+        assert payload['task_id'] == write_triage._ANCHOR_TASK_ID
+
+        detail = payload['detail']
+        routing_text = f'{payload["summary"]}\n{detail}\n{payload["suggested_action"]}'
+        assert 'fail_opens_in_window=12' in detail, f'must state the count: {detail!r}'
+        assert f'threshold={_FAIL_OPEN_STORM_THRESHOLD!r}' in detail, (
+            f'must state the threshold that fired: {detail!r}'
+        )
+        assert f'window_seconds={_FAIL_OPEN_STORM_WINDOW_SECONDS!r}' in detail, (
+            f'must state the window: {detail!r}'
+        )
+        assert "projects_in_window=['/project-a', '/project-b']" in detail, (
+            f'must name every project the burst spanned: {detail!r}'
+        )
+        assert 'write_triage.enabled' in routing_text, (
+            f'must name the one deliberate off switch: {payload!r}'
+        )
+        assert 'memory-write-path-convergence' in routing_text, (
+            f'must route the burst at the owning PRD leaf: {payload!r}'
+        )
+
+    def test_the_detail_says_triage_is_degraded_not_that_writes_were_lost(
+        self, tmp_path,
+    ) -> None:
+        """A burst is a DEGRADATION, not a data-loss incident.
+
+        Every write in the window still landed — with today's pre-triage
+        behaviour — so the record must say so plainly. An operator who reads a
+        fail-open storm as "writes were dropped" reaches for the wrong
+        remediation, and one who reads it as harmless never fixes retrieval:
+        silent degradation is precisely what INV-4 exists to prevent.
+        """
+        if not write_triage.HAS_ESCALATION:
+            pytest.skip('escalation package unavailable in this environment')
+
+        emit_triage_fail_open_storm_escalation(str(tmp_path), _STORM)
+        payload = json.loads(
+            next((tmp_path / 'data' / 'escalations').glob('esc-*.json')).read_text()
+        )
+        text = f'{payload["summary"]}\n{payload["detail"]}'.lower()
+
+        assert 'without triage' in text or 'pre-triage' in text, (
+            f'must say the writes landed untriaged: {payload!r}'
+        )
+        assert 'no write was lost' in text or 'never blocked' in text, (
+            f'must say no write was lost or blocked (contract C1): {payload!r}'
+        )
+
+    def test_the_escalation_id_is_greppable_via_the_stable_anchor(
+        self, tmp_path,
+    ) -> None:
+        """The anchor is stable so the ids form one greppable series."""
+        esc_id = emit_triage_fail_open_storm_escalation(str(tmp_path), _STORM)
+        if not write_triage.HAS_ESCALATION:
+            return
+        assert esc_id is not None
+        assert write_triage._ANCHOR_TASK_ID in esc_id, f'unexpected id shape: {esc_id!r}'
+
+    def test_the_queue_is_opened_under_project_root_data_escalations(
+        self, tmp_path,
+    ) -> None:
+        """The queue location is the project's own, never a global default."""
+        if not write_triage.HAS_ESCALATION:
+            pytest.skip('escalation package unavailable in this environment')
+
+        emit_triage_fail_open_storm_escalation(str(tmp_path), _STORM)
+
+        assert list((tmp_path / 'data' / 'escalations').glob('esc-*.json'))
+
+    def test_dedupes_against_an_already_open_escalation(self, tmp_path) -> None:
+        """A sustained outage must not mint one escalation per window forever.
+
+        The counter is already rate-limited per window, but retrieval down for
+        hours would still file an escalation every hour; the anchor dedup
+        collapses those into the one open record until it is resolved.
+        """
+        first = emit_triage_fail_open_storm_escalation(str(tmp_path), _STORM)
+        second = emit_triage_fail_open_storm_escalation(str(tmp_path), _STORM)
+        if not write_triage.HAS_ESCALATION:
+            assert first is None and second is None
+            return
+
+        assert first is not None
+        assert second == first, f'expected dedup; got first={first!r} second={second!r}'
+        assert len(list((tmp_path / 'data' / 'escalations').glob('esc-*.json'))) == 1
+
+    def test_files_afresh_once_the_prior_escalation_is_resolved(self, tmp_path) -> None:
+        """Dedup must not silence a NEW outage after the old one was cleared."""
+        if not write_triage.HAS_ESCALATION:
+            pytest.skip('escalation package unavailable in this environment')
+        from escalation.queue import EscalationQueue  # noqa: PLC0415
+
+        first = emit_triage_fail_open_storm_escalation(str(tmp_path), _STORM)
+        assert first is not None
+        EscalationQueue(tmp_path / 'data' / 'escalations').resolve(first, 'mem0 back')
+
+        second = emit_triage_fail_open_storm_escalation(str(tmp_path), _STORM)
+        assert second is not None
+        assert second != first
+
+    def test_a_dedup_read_failure_still_files(self, tmp_path, monkeypatch) -> None:
+        """If the dedup check itself fails, fall THROUGH and file.
+
+        Best-effort dedup: losing duplicate-suppression is strictly better than
+        losing the alarm for an outage that is actively happening.
+        """
+        if not write_triage.HAS_ESCALATION:
+            pytest.skip('escalation package unavailable in this environment')
+
+        def _boom(self, task_id, status=None):
+            raise OSError('cannot read queue')
+
+        monkeypatch.setattr(write_triage.EscalationQueue, 'get_by_task', _boom)
+        assert emit_triage_fail_open_storm_escalation(str(tmp_path), _STORM) is not None
+
+    def test_a_submit_failure_returns_none_rather_than_propagating(
+        self, tmp_path, monkeypatch,
+    ) -> None:
+        """The function must NEVER raise.
+
+        It is called from a write path whose outcome is already decided and
+        whose write has already been stored; an exception escaping here would
+        convert a successfully-degraded write into a failed one, which is the
+        C1 violation the whole fail-open apparatus exists to prevent.
+        """
+        if not write_triage.HAS_ESCALATION:
+            pytest.skip('escalation package unavailable in this environment')
+
+        def _boom(self, esc):
+            raise OSError('disk on fire')
+
+        monkeypatch.setattr(write_triage.EscalationQueue, 'submit', _boom)
+        assert emit_triage_fail_open_storm_escalation(str(tmp_path), _STORM) is None
+
+    def test_a_queue_open_failure_returns_none(self, tmp_path, monkeypatch) -> None:
+        """Even constructing the queue is wrapped — same never-raise contract."""
+        if not write_triage.HAS_ESCALATION:
+            pytest.skip('escalation package unavailable in this environment')
+
+        def _boom(*args, **kwargs):
+            raise OSError('no such directory')
+
+        monkeypatch.setattr(write_triage, 'EscalationQueue', _boom)
+        assert emit_triage_fail_open_storm_escalation(str(tmp_path), _STORM) is None
+
+    def test_tolerates_a_storm_dict_missing_keys(self, tmp_path) -> None:
+        """A degenerate storm shape still files a well-formed, routable record.
+
+        "Never raises" is established by the call returning at all; what this
+        pins is that the record stays USABLE — one whose category or anchor
+        degraded along with its missing numbers could not be routed or deduped,
+        which is exactly when an operator needs it most.
+        """
+        if not write_triage.HAS_ESCALATION:
+            pytest.skip('escalation package unavailable in this environment')
+
+        esc_id = emit_triage_fail_open_storm_escalation(str(tmp_path), {})
+
+        assert esc_id is not None
+        payload = json.loads(
+            next((tmp_path / 'data' / 'escalations').glob('esc-*.json')).read_text()
+        )
+        assert payload['category'] == 'write_triage_fail_open_storm'
+        assert payload['task_id'] == write_triage._ANCHOR_TASK_ID
+        assert payload['level'] == 1
+
+    def test_the_anchor_is_this_leafs_own_and_shared_with_nobody(self) -> None:
+        """A SQUATTED anchor is suppressed indefinitely, and reads as calm.
+
+        Measured incident: the L1 escalation watcher files its own cluster
+        records under the `markup-tripwire` anchor and SQUATS it — the tripwire
+        filed nothing 2026-08-16..2026-08-19 while 41 rejections occurred, all
+        17 records sitting at dedupe_count 0. A filer that dedupes against an
+        anchor somebody else keeps open never files again, and the resulting
+        silence is indistinguishable from health.
+
+        That incident is why `emit_markup_storm_escalation` grew its
+        `anchor_task_id` parameter (see its docstring), and it is why this leaf
+        must never share an anchor with any other filer. Asserted against the
+        siblings' constants IMPORTED FROM THEIR OWN HOMES, so a future rename
+        that collides is caught here rather than in production silence.
+        """
+        from fused_memory.middleware.candidate_key_escalation import (  # noqa: PLC0415
+            _ANCHOR_TASK_ID as CANDIDATE_KEY_ANCHOR,
+        )
+        from fused_memory.middleware.mem0_update_storm_escalator import (  # noqa: PLC0415
+            _ANCHOR_TASK_ID as MEM0_UPDATE_ANCHOR,
+        )
+        from fused_memory.middleware.scope_violation_escalator import (  # noqa: PLC0415
+            _ANCHOR_TASK_ID as SCOPE_VIOLATION_ANCHOR,
+        )
+        from fused_memory.server.markup_guard import (  # noqa: PLC0415
+            _RESIDUE_ANCHOR_TASK_ID as GUARD_RESIDUE_ANCHOR,
+            _STORM_ANCHOR_TASK_ID as GUARD_STORM_ANCHOR,
+        )
+        from fused_memory.server.markup_tripwire import (  # noqa: PLC0415
+            _ANCHOR_TASK_ID as TRIPWIRE_ANCHOR,
+            _RESIDUE_ANCHOR_TASK_ID as RESIDUE_ANCHOR,
+        )
+
+        ours = write_triage._ANCHOR_TASK_ID
+        assert ours == 'write-triage-fail-open'
+        for label, theirs in [
+            ('markup_tripwire (the SQUATTED one)', TRIPWIRE_ANCHOR),
+            ('markup_tripwire residue', RESIDUE_ANCHOR),
+            ('markup_guard storm', GUARD_STORM_ANCHOR),
+            ('markup_guard residue', GUARD_RESIDUE_ANCHOR),
+            ('candidate_key_escalation', CANDIDATE_KEY_ANCHOR),
+            ('mem0_update_storm_escalator', MEM0_UPDATE_ANCHOR),
+            ('scope_violation_escalator', SCOPE_VIOLATION_ANCHOR),
+        ]:
+            assert ours != theirs, (
+                f'write-triage must not share the {label} anchor {theirs!r}: a '
+                'filer deduping against an anchor another party keeps open is '
+                'suppressed indefinitely, and that silence reads as calm'
+            )
+
+    def test_the_filed_anchor_and_the_dedup_lookup_are_the_same(
+        self, tmp_path, monkeypatch,
+    ) -> None:
+        """Filing under one anchor while deduping against another is the bug.
+
+        It would produce a record nobody dedupes against (unbounded duplicates)
+        or a lookup nobody files under (permanent suppression). Pinned by
+        capturing the anchor the dedup read is called with and comparing it to
+        the `task_id` that actually landed.
+        """
+        if not write_triage.HAS_ESCALATION:
+            pytest.skip('escalation package unavailable in this environment')
+
+        seen: list = []
+        real_get_by_task = write_triage.EscalationQueue.get_by_task
+
+        def _spy(self, task_id, status=None):
+            seen.append(task_id)
+            return real_get_by_task(self, task_id, status=status)
+
+        monkeypatch.setattr(write_triage.EscalationQueue, 'get_by_task', _spy)
+        emit_triage_fail_open_storm_escalation(str(tmp_path), _STORM)
+
+        payload = json.loads(
+            next((tmp_path / 'data' / 'escalations').glob('esc-*.json')).read_text()
+        )
+        assert seen == [payload['task_id']], (
+            f'deduped against {seen!r} but filed under {payload["task_id"]!r}'
+        )
