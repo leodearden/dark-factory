@@ -254,6 +254,38 @@ None external. Every substrate capability is present on main @ `7cb0ef2e0c` (G3,
 
 No novel substrate is introduced.
 
+### Status-producer audit (G3, 2026-08-21)
+
+D1 reduces the clear-set to `TERMINAL`, so every other status is *keep* by construction and no
+per-status ruling is load-bearing. The audit was run anyway, because an earlier writer-inventory had
+already been caught wrong about `deferred`, and it found the same error twice more:
+
+| Status | Verdict | Evidence |
+|---|---|---|
+| `infra-hold` | **PRODUCED** — the "no producer" claim is false | `workflow.py:7385` `_mark_blocked(..., block_status='infra-hold')` landing at `workflow.py:14575`; the literal never appears at a `set_task_status` call site because it travels as a parameter (default `'blocked'` at `workflow.py:14485`). 15 journal writes, all `project_id='reify'`, 2026-07-18 → 2026-08-04 |
+| `review` | **PRODUCED-BUT-DORMANT** — no code writer, but MCP-reachable and used | Literal-arg histogram over all non-test src: 23 `blocked`, 10 `pending`, 7 `done`, 3 `in-progress`, 3 `cancelled`, 2 `merge-deferred`, **0 `review`** (control positive). One journal write ever: reify task 2958, 2026-05-07, `review` held **15 seconds**. Already documented as residue at `docs/task-escalation-state-spec.md:193` (§8-E14 retire-or-document) |
+
+Corpus: **0** rows at either status in either project today, each zero carried against a positive
+control (df `blocked` 22 / `deferred` 12 / `in-progress` 11; reify `in-progress` 48).
+
+**Both are correctly KEEP, and `infra-hold` is keep *by design*, not by accident.** It means a hold on
+a live, verify-complete branch whose worktree is preserved; clearing its claimant would be actively
+wrong. Three mechanisms already depend on that: `release_workflow` refuses to park it
+(`escalation/tests/test_release_workflow.py:320` — "the status IS the hold"), `is_stranded` hard-gates
+on `in-progress`, and `_RECONCILE_SWEEP_STATUSES` (`harness.py:238`) excludes it.
+
+**Consequence for C4-E6 — gate on the TTL, never on mere presence.** infra-hold holds run for weeks
+(one reify task sat 18+ days), so a legitimately-kept claimant there will be arbitrarily stale. Any
+consumer that treats *presence* as ownership will misread it. `is_stranded_any_status` is TTL-based and
+therefore correct; the pre-existing raw-presence check at `task_interceptor.py:2211-2212` (the curator
+combine guard, `pending` targets only) is **not**, and is noted as inherited, not introduced, by this
+PRD.
+
+**β additionally corrects the stale comment at `tools.py:1405-1407`**, which asserts "No current writer
+emits 'infra-hold', so this is inert today" — falsified on this same HEAD by `workflow.py:7385` and by
+the 15 journal writes. It sits in the file β edits, and it is the likeliest source of the earlier wrong
+inventory, so leaving it would re-seed the same error.
+
 ## Cross-PRD relationship
 
 | Other PRD | Direction | Seam mechanism | Owner | Status |
@@ -271,7 +303,7 @@ Phase 1 — foundation. Phase 2 — enforcement slice. Phase 3 — detection. Ph
 | Label | Title | Modules | Kind | Observable signal | Prereqs |
 |---|---|---|---|---|---|
 | **α** | Add `is_stranded_any_status`; re-express `is_stranded`/`is_stranded_blocked` through it | `shared` | intermediate | Unlocks γ — the status-agnostic liveness predicate γ repoints onto | — |
-| **β** | Clear the claimant columns on entry to a terminal status at the fused-memory choke point | `fused-memory` | **leaf** | Through the product's own read path: `set_task_status(id,'done')` on a claimed row, then `get_task(id)` returns `claimant_run_id: null` / `heartbeat_at: null`; a `blocked` write on the same row leaves both intact | — |
+| **β** | Clear the claimant columns on entry to a terminal status at the fused-memory choke point; correct the falsified infra-hold comment | `fused-memory` | **leaf** | Through the product's own read path: `set_task_status(id,'done')` on a claimed row, then `get_task(id)` returns `claimant_run_id: null` / `heartbeat_at: null`; a `blocked` write on the same row leaves both intact | — |
 | **γ** | Repoint `_resolve_live_claimant` at the status-agnostic predicate; invert the blocked-is-live pin | `orchestrator` | **leaf** | A `blocked` task with a stale claimant now yields recovery action `RE_FILE_ESCALATION` instead of LEAVE, visible in the emitted recovery-disposition event | α |
 | **δ** | Clear the claimant before the reconcile revert-to-pending flip | `orchestrator` | **leaf** | After the stranded sweep reverts a task, `get_task` shows `claimant_run_id: null` (today it shows the dead run's id) | — |
 | **ε** | Alarm a terminal row carrying a claimant as a logical error (born-at-L2, sentinel-deduped) | `orchestrator` | **leaf** | A seeded violating row makes `get_pending_escalations` return one `level=2`, `severity=critical`, `category=invariant_violation` record; a second violating row in the same sweep adds none | β, ζ |
@@ -322,6 +354,19 @@ step, not waived.
   D2 rejects.
 - **Backfilling other projects' corpora beyond dark-factory and reify.** ζ takes project roots as
   arguments; running it elsewhere is an operator action.
+- **The `review` status's unbounded-hold hazard.** `review` is human-writable with no exit owner and
+  no bound, and a `review` row is unreachable by *every* reaper (`is_stranded`'s `in-progress` gate,
+  the `_RECONCILE_SWEEP_STATUSES` exclusion, and starvation ineligibility) — so a human setting
+  `review` on a task with a stale claimant produces a permanently unreapable row. Inherited, not
+  introduced: it belongs to `docs/task-escalation-state-spec.md` §8-E14 (retire-or-document), which
+  already tracks it.
+- **The infra-hold resume path's claimant-less `in-progress` write** (spec §8-E5) — the resume
+  "manufactures the strand shape" and waits for the sweep, discarding the claimant on the very next
+  transition. Keeping the claimant through the hold is still correct, but this PRD does not fix E5.
+- **Adding a TTL to the curator combine guard** (`task_interceptor.py:2211-2212`). Its raw-presence
+  check will misread a legitimately-stale infra-hold claimant, but that is pre-existing behaviour on a
+  `pending`-target-only path, and changing it is a curator-semantics decision, not a claimant-lifecycle
+  one.
 
 ## Residual after this PRD (accepted, stated)
 
