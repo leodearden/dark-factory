@@ -217,3 +217,158 @@ class TestPromotingTopicPin:
         assert service.mem0.scroll_by_metadata.await_count == 1
         _scope, filters, _limit = service.mem0.scroll_by_metadata.await_args.args
         assert filters == {'topic': _TOPIC, 'canonical': True}
+
+
+class TestTopicPinDedupeAndMoveToFront:
+    """The canonical is pinned ONCE, and never rebuilt when it is already present."""
+
+    @staticmethod
+    def _canonical_as_search_hit(n: int = 9) -> dict:
+        """The canonical as it appears in the COSINE results — ranked LAST.
+
+        This is the measured inversion itself: the canonical is a genuine
+        semantic match, just the WORST one in its own cluster, because it is
+        long and general where every sibling is narrow and tight.
+        """
+        return {
+            'id': _CANONICAL_ID,
+            'memory': _CANONICAL_BODY,
+            'score': round(0.89 - 0.01 * n, 4),
+            'metadata': {
+                'category': 'procedural_knowledge',
+                'topic': _TOPIC,
+                'canonical': True,
+            },
+        }
+
+    @pytest.mark.asyncio
+    async def test_already_present_canonical_is_moved_not_duplicated(self, service):
+        """RED before the dedupe branch: an unconditional insert duplicates it.
+
+        Uses limit=10 deliberately.  At limit=5 a duplicate at rank 9 is
+        truncated back off by ``results[:limit]``, so the count would read 1
+        whether or not the dedupe branch exists — the assertion would pass for
+        the wrong reason and pin nothing.
+        """
+        service.mem0.search = AsyncMock(return_value={'results': [
+            *[_sibling(n) for n in range(1, 9)],
+            self._canonical_as_search_hit(),
+        ]})
+        service.mem0.scroll_by_metadata = AsyncMock(return_value=[_canonical_payload()])
+
+        results = await service.search(
+            query=_QUERY, project_id=_PROJECT_ID,
+            categories=['procedural_knowledge'], stores=['mem0'], limit=10,
+        )
+
+        assert [r.id for r in results].count(_CANONICAL_ID) == 1
+        assert len(results) == 9, 'a duplicate insert would make this 10'
+        assert results[0].id == _CANONICAL_ID
+        assert results[0].topic_anchored is True
+
+    @pytest.mark.asyncio
+    async def test_moved_result_keeps_its_original_score_and_metadata(self, service):
+        """Move, do not REBUILD: the record's own measured cosine is real data.
+
+        Zeroing or replacing it would discard the honest per-store signal that
+        the near-duplicate guard and every score-reading consumer depend on.
+        """
+        service.mem0.search = AsyncMock(return_value={'results': [
+            *[_sibling(n) for n in range(1, 9)],
+            self._canonical_as_search_hit(),
+        ]})
+        service.mem0.scroll_by_metadata = AsyncMock(return_value=[_canonical_payload()])
+
+        results = await service.search(
+            query=_QUERY, project_id=_PROJECT_ID,
+            categories=['procedural_knowledge'], stores=['mem0'], limit=5,
+        )
+
+        pinned = results[0]
+        # Its REAL cosine, stamped by _search_mem0 — not the scroll payload's
+        # (absent) score, and not a zero.
+        assert pinned.metadata['store_score'] == pytest.approx(0.80)
+        assert pinned.metadata['store_rank'] == 9
+        assert pinned.relevance_score > 0.0
+
+    @pytest.mark.asyncio
+    async def test_nothing_is_displaced_when_anchor_was_already_inside_the_window(self, service):
+        """A move-to-front costs no sibling its slot — only a fresh insert does.
+
+        The canonical ranks 3rd here, i.e. genuinely INSIDE the limit=5 window,
+        so all four siblings survive alongside it.  Contrast
+        ``test_window_stays_exactly_limit_and_displaces_the_last_sibling``,
+        where the canonical is absent and the insert costs sibling-5 its slot.
+        """
+        hits = [
+            _sibling(1), _sibling(2), self._canonical_as_search_hit(n=3),
+            _sibling(4), _sibling(5),
+        ]
+        service.mem0.search = AsyncMock(return_value={'results': hits})
+        service.mem0.scroll_by_metadata = AsyncMock(return_value=[_canonical_payload()])
+
+        results = await service.search(
+            query=_QUERY, project_id=_PROJECT_ID,
+            categories=['procedural_knowledge'], stores=['mem0'], limit=5,
+        )
+
+        assert len(results) == 5
+        assert [r.id for r in results] == [
+            _CANONICAL_ID, 'sibling-1', 'sibling-2', 'sibling-4', 'sibling-5',
+        ]
+
+    @pytest.mark.asyncio
+    async def test_non_pinned_remainder_keeps_relative_order(self, service):
+        """A move-to-front must not otherwise perturb the ranking."""
+        hits = [*[_sibling(n) for n in range(1, 4)], self._canonical_as_search_hit(n=4)]
+        service.mem0.search = AsyncMock(return_value={'results': hits})
+        service.mem0.scroll_by_metadata = AsyncMock(return_value=[_canonical_payload()])
+
+        results = await service.search(
+            query=_QUERY, project_id=_PROJECT_ID,
+            categories=['procedural_knowledge'], stores=['mem0'], limit=10,
+        )
+
+        assert [r.id for r in results] == [
+            _CANONICAL_ID, 'sibling-1', 'sibling-2', 'sibling-3',
+        ]
+
+    @pytest.mark.asyncio
+    async def test_two_topics_resolving_to_one_canonical_pin_it_once(self, service):
+        """Distinct topics may legitimately share a canonical; it is still ONE pin."""
+        service.mem0.search = AsyncMock(return_value={'results': [
+            _sibling(1, topic='topic-a'),
+            _sibling(2, topic='topic-b'),
+            _sibling(3, topic='topic-a'),
+        ]})
+        # Both topic lookups resolve to the SAME canonical record.
+        service.mem0.scroll_by_metadata = AsyncMock(return_value=[_canonical_payload()])
+
+        results = await service.search(
+            query=_QUERY, project_id=_PROJECT_ID,
+            categories=['procedural_knowledge'], stores=['mem0'], limit=10,
+        )
+
+        assert service.mem0.scroll_by_metadata.await_count == 2
+        assert [r.id for r in results].count(_CANONICAL_ID) == 1
+        assert results[0].id == _CANONICAL_ID
+
+    @pytest.mark.asyncio
+    async def test_two_topics_with_distinct_canonicals_pin_both(self, service):
+        """The cap is on TOPICS, not on pins — two real canonicals both land."""
+        service.mem0.search = AsyncMock(return_value={'results': [
+            _sibling(1, topic='topic-a'),
+            _sibling(2, topic='topic-b'),
+        ]})
+        service.mem0.scroll_by_metadata = AsyncMock(side_effect=[
+            [_canonical_payload('canonical-a', topic='topic-a')],
+            [_canonical_payload('canonical-b', topic='topic-b')],
+        ])
+
+        results = await service.search(
+            query=_QUERY, project_id=_PROJECT_ID,
+            categories=['procedural_knowledge'], stores=['mem0'], limit=10,
+        )
+
+        assert {r.id for r in results[:2]} == {'canonical-a', 'canonical-b'}
+        assert all(r.topic_anchored for r in results[:2])
