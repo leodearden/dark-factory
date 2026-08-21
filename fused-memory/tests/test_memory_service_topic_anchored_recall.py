@@ -452,3 +452,150 @@ class TestTopicPinScoreContract:
         results = await self._anchored_results(service)
 
         assert results[0].relevance_score == 0.0
+
+
+class TestTopicPinFailOpenAndGating:
+    """Anchoring is an ENRICHMENT — a failure to enrich must never become a
+    failure to retrieve.
+
+    This seam is shared by all of MemoryService.search's call sites, including
+    the near-duplicate guard's pre-check on every procedural_knowledge write.
+    Without fail-open, one Qdrant read timeout would break every search in the
+    system. ``get_memories_by_metadata`` genuinely PROPAGATES a TimeoutError
+    (unlike ``Mem0Backend.search``, which swallows failures into ``{}``), so
+    this is a real path, not a defensive hypothetical.
+    """
+
+    @pytest.mark.asyncio
+    async def test_timeout_fails_open_and_warns(self, service, caplog):
+        """A propagated backend timeout leaves the un-pinned results intact."""
+        _seed(service)
+        service.mem0.scroll_by_metadata = AsyncMock(side_effect=TimeoutError('qdrant scroll'))
+
+        with caplog.at_level('WARNING'):
+            results = await service.search(
+                query=_QUERY, project_id=_PROJECT_ID,
+                categories=['procedural_knowledge'], stores=['mem0'], limit=5,
+            )
+
+        assert [r.id for r in results] == [f'sibling-{n}' for n in range(1, 6)]
+        assert not any(r.topic_anchored for r in results)
+        assert any('topic-anchored' in record.message for record in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_generic_exception_fails_open(self, service):
+        """Same for any other transient backend failure."""
+        _seed(service)
+        service.mem0.scroll_by_metadata = AsyncMock(side_effect=RuntimeError('qdrant down'))
+
+        results = await service.search(
+            query=_QUERY, project_id=_PROJECT_ID,
+            categories=['procedural_knowledge'], stores=['mem0'], limit=5,
+        )
+
+        assert [r.id for r in results] == [f'sibling-{n}' for n in range(1, 6)]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('wiring_bug', [TypeError, AttributeError, NameError])
+    async def test_wiring_bugs_propagate_loudly(self, service, wiring_bug):
+        """LOUD ON WIRING BUG — a signature drift must not silently disable the pin.
+
+        Mirrors the near-dup pre-check's two-tier idiom at
+        server/tools.py:3097-3113. Absorbing these into fail-open would leave
+        the transform inert in production behind nothing but a WARNING.
+        """
+        _seed(service)
+        service.mem0.scroll_by_metadata = AsyncMock(side_effect=wiring_bug('signature drift'))
+
+        with pytest.raises(wiring_bug):
+            await service.search(
+                query=_QUERY, project_id=_PROJECT_ID,
+                categories=['procedural_knowledge'], stores=['mem0'], limit=5,
+            )
+
+    @pytest.mark.asyncio
+    async def test_kill_switch_disables_the_lookup_entirely(self, service):
+        """reconciliation.topic_anchored_recall_enabled=False => no I/O, no change."""
+        _seed(service)
+        service.config.reconciliation.topic_anchored_recall_enabled = False
+
+        results = await service.search(
+            query=_QUERY, project_id=_PROJECT_ID,
+            categories=['procedural_knowledge'], stores=['mem0'], limit=5,
+        )
+
+        service.mem0.scroll_by_metadata.assert_not_awaited()
+        assert [r.id for r in results] == [f'sibling-{n}' for n in range(1, 6)]
+
+    @pytest.mark.asyncio
+    async def test_no_topics_means_no_lookup(self, service):
+        """THE ZERO-COST PATH, and the common case on the live corpus today.
+
+        search is on the hot path for every agent read AND every
+        procedural_knowledge write, so an untopiced result set must cost
+        nothing at all — not a round-trip that returns empty.
+        """
+        service.mem0.search = AsyncMock(return_value={
+            'results': [_sibling(n, topic=None) for n in range(1, 6)]
+        })
+        service.mem0.scroll_by_metadata = AsyncMock(return_value=[])
+
+        await service.search(
+            query=_QUERY, project_id=_PROJECT_ID,
+            categories=['procedural_knowledge'], stores=['mem0'], limit=5,
+        )
+
+        service.mem0.scroll_by_metadata.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_graphiti_only_route_makes_no_lookup(self, service):
+        """metadata.topic is a Mem0 vocabulary key — a Graphiti route cannot anchor."""
+        _seed(service)
+
+        await service.search(
+            query=_QUERY, project_id=_PROJECT_ID, stores=['graphiti'], limit=5,
+        )
+
+        service.mem0.scroll_by_metadata.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_topic_cap_bounds_the_number_of_lookups(self, service):
+        """More distinct topics than the cap => at most _MAX_ANCHOR_TOPICS round-trips."""
+        from fused_memory.services.topic_anchor import _MAX_ANCHOR_TOPICS
+
+        service.mem0.search = AsyncMock(return_value={
+            'results': [_sibling(n, topic=f'topic-{n}') for n in range(1, 10)]
+        })
+        service.mem0.scroll_by_metadata = AsyncMock(return_value=[])
+
+        await service.search(
+            query=_QUERY, project_id=_PROJECT_ID,
+            categories=['procedural_knowledge'], stores=['mem0'], limit=5,
+        )
+
+        assert service.mem0.scroll_by_metadata.await_count == _MAX_ANCHOR_TOPICS
+
+    @pytest.mark.asyncio
+    async def test_fires_for_the_near_dup_guards_exact_call_shape(self, service):
+        """SCOPED-SEARCH OBLIGATION, per the task's SEAM CORRECTION.
+
+        Anchoring is contractually required to fire for scoped searches, not
+        only unscoped auto-routed ones. This is the near-duplicate guard's
+        literal pre-check shape (server/tools.py:3090-3096), which calls
+        MemoryService.search DIRECTLY and therefore bypasses MCP grouping —
+        `stores` only short-circuits ROUTING, never the sort/filter/anchor/
+        truncate tail.
+        """
+        _seed(service)
+
+        results = await service.search(
+            query=_QUERY,
+            project_id=_PROJECT_ID,
+            categories=['procedural_knowledge'],
+            stores=['mem0'],
+            limit=5,
+        )
+
+        assert service.mem0.scroll_by_metadata.await_count == 1
+        assert results[0].id == _CANONICAL_ID
+        assert results[0].topic_anchored is True
