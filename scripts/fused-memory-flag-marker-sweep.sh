@@ -122,9 +122,63 @@ PROJECT_IDS=()
 if [ -n "${FLAG_MARKER_SWEEP_PROJECT_IDS:-}" ]; then
   # shellcheck disable=SC2206
   PROJECT_IDS=(${FLAG_MARKER_SWEEP_PROJECT_IDS})
+else
+  # --- Stage 1: import the registry from the LIVE fused-memory unit ---------
+  #
+  # MEASURED: DASHBOARD_KNOWN_PROJECT_ROOTS is NOT in the repo `.env` and NOT
+  # in the systemd user manager's own environment. It exists only as an
+  # `Environment=` line inside the INSTALLED
+  # ~/.config/systemd/user/fused-memory.service unit. Reading it back off the
+  # same unit the fused-memory server itself runs under makes DRIFT
+  # STRUCTURALLY IMPOSSIBLE: there is exactly one place the fleet's project
+  # roots are declared, and this wrapper asks that place rather than carrying
+  # a second, host-specific 9-entry copy in a committed unit file that would
+  # silently rot the first time a project is added.
+  #
+  # Same technique, same source, as skills/factory-init/scripts/
+  # find_escalation_port.py:57-63 (known_project_roots()).
+  #
+  # pipefail is disabled inside the substitution so a `grep` that matches
+  # nothing (or a `head` that closes the pipe early) reports an empty value
+  # rather than tripping `set -e`; a missing/failing systemctl degrades the
+  # same way.
+  if [ -z "${DASHBOARD_KNOWN_PROJECT_ROOTS:-}" ]; then
+    imported_roots="$(
+      set +o pipefail
+      systemctl --user show fused-memory.service -p Environment 2>/dev/null \
+        | grep -o 'DASHBOARD_KNOWN_PROJECT_ROOTS=[^[:space:]]*' \
+        | head -1 | cut -d= -f2-
+    )" || imported_roots=""
+    if [ -n "$imported_roots" ]; then
+      export DASHBOARD_KNOWN_PROJECT_ROOTS="$imported_roots"
+    fi
+  fi
+
+  # --- Stage 2: ask the sweep itself which projects are registered ----------
+  #
+  # Resolution lives in Python (sweep_orphan_flag_markers.py
+  # --list-known-projects) rather than here because deriving ids in bash would
+  # mean reimplementing the registry's root-to-id rule, which prefers a
+  # manifest-declared project_id over the directory basename. A basename
+  # derivation would compute ids no memory is stored under, and such a sweep
+  # counts 0, deletes 0 and exits 0 -- a SILENT green. stderr is deliberately
+  # NOT redirected: the sweep's own coverage WARNING belongs in the journal.
+  resolved_project_ids="$(
+    "${SWEEP_CMD[@]}" "$FM/scripts/sweep_orphan_flag_markers.py" \
+      --list-known-projects
+  )" || resolved_project_ids=""
+  if [ -n "$resolved_project_ids" ]; then
+    # shellcheck disable=SC2206
+    PROJECT_IDS=($resolved_project_ids)
+  fi
 fi
 
 if [ "${#PROJECT_IDS[@]}" -eq 0 ]; then
+  # Fail-safe, not fail-silent. Exit stays 0 for this path on purpose: the
+  # degradation is persistent, and a non-zero exit would park the .timer's
+  # unit in `failed` state forever -- the same reasoning that keeps --check
+  # out of the nightly argv (see the header).
+  echo "fused-memory-flag-marker-sweep.sh: WARNING: could not resolve the registered-project list; narrowing this drain to project_id=dark_factory ONLY -- the rest of the fleet was NOT swept. Likely cause: DASHBOARD_KNOWN_PROJECT_ROOTS did not reach this process (it lives as an Environment= line on the installed fused-memory.service unit, not in the repo .env), or the resolution call itself failed -- see its own log lines above." >&2
   PROJECT_IDS=(dark_factory)
 fi
 

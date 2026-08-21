@@ -1327,6 +1327,83 @@ def _known_project_ids() -> list[str]:
         return []
 
 
+def _known_projects_coverage_issue(project_ids: list[str]) -> str | None:
+    """Describe how far short of fleet-wide the resolved project list falls.
+
+    EMPTINESS IS THE WRONG KEY for this, which is why this predicate exists
+    separately from :func:`_known_project_ids`' own ``[]`` fail-safe.
+    :func:`~fused_memory.models.scope.build_known_projects_map` seeds its
+    candidate list with the PRIMARY root before extending it with the env
+    roots, so an unset ``DASHBOARD_KNOWN_PROJECT_ROOTS`` produces a ONE-entry
+    map, never an empty one — an ``if not project_ids`` check is unreachable
+    in exactly the degradation it looks like it guards, and the nightly drain
+    narrows to a single project at exit 0, silently.
+
+    Two cases, deliberately told apart:
+      (i)  the env var is SET but names roots absent from *project_ids* — a
+           genuine degradation (typo, unreadable root, a project moved). The
+           missing roots are named individually so the warning is actionable.
+      (ii) the env var is UNSET — the map is primary-only, so coverage is
+           single-project and the census is not fleet-wide. Reported, but the
+           caller must NOT treat it as a hard failure: a legitimately
+           single-project install would otherwise warn-as-error forever.
+
+    Compares resolved project_IDS rather than counting roots. MEASURED on the
+    live registry, ``DASHBOARD_KNOWN_PROJECT_ROOTS`` lists the primary root
+    too, and ``build_known_projects_map`` drops it as a duplicate project_id
+    (logged at INFO) — so ``len(map) < 1 + len(named_roots)`` would cry
+    degradation on every healthy nightly run.
+
+    Args:
+        project_ids: The list :func:`_known_project_ids` resolved.
+
+    Returns:
+        A human-readable degradation description, or ``None`` when coverage is
+        fleet-wide. Fail-safe: an unexpected failure logs at WARNING with a
+        traceback and returns ``None`` rather than raising — this is a
+        diagnostic, and it must never be the thing that breaks the drain.
+    """
+    try:
+        from fused_memory.models import scope  # noqa: PLC0415
+
+        named_roots = scope.known_project_roots_from_env()
+        if not named_roots:
+            resolved = ', '.join(project_ids) if project_ids else '<none>'
+            return (
+                f'{scope.KNOWN_PROJECT_ROOTS_ENV} is UNSET, so the '
+                f'registered-project map is PRIMARY-ONLY ({resolved}). Coverage '
+                f'is single-project and this census is NOT fleet-wide. On a '
+                f'genuinely single-project install that is correct and expected; '
+                f'on the dark-factory host it means the var did not reach this '
+                f'process — it lives as an Environment= line on the installed '
+                f'fused-memory.service unit, not in the repo .env.'
+            )
+
+        known = set(project_ids)
+        missing = [
+            root for root in named_roots
+            if scope.resolve_project_id_for_root(root) not in known
+        ]
+        if missing:
+            return (
+                f'{scope.KNOWN_PROJECT_ROOTS_ENV} names '
+                f'{len(named_roots)} root(s), but {len(missing)} of them did not '
+                f'resolve into the registered-project map: {", ".join(missing)}. '
+                f'Those projects will NOT be swept. Likely causes: a typo in the '
+                f'root path, an unreadable/moved checkout, or a project_id that '
+                f'collides with one already claimed (first-wins).'
+            )
+        return None
+    except Exception:
+        logger.warning(
+            '_known_projects_coverage_issue: could not evaluate registry '
+            'coverage; reporting no issue (this is a diagnostic and must never '
+            'be what breaks the drain)',
+            exc_info=True,
+        )
+        return None
+
+
 async def _resolve_terminal_task_ids(project_id: str) -> set[str]:
     """Best-effort resolve terminal-status task ids for ``--terminal-drain``.
 
@@ -1447,6 +1524,18 @@ def main() -> int:
     # listing the fleet needs no live store connection at all.
     if args.list_known_projects:
         project_ids = _known_project_ids()
+        # Coverage is reported on its OWN predicate, not on emptiness: the
+        # primary root is always seeded into the map, so the most likely
+        # degradation (DASHBOARD_KNOWN_PROJECT_ROOTS never reaching this
+        # process) yields a one-entry list that the emptiness check below can
+        # never see. Warned, but NOT fatal -- a single-project install is
+        # legitimate, and warn-as-error there would be noise forever.
+        coverage_issue = _known_projects_coverage_issue(project_ids)
+        if coverage_issue:
+            logger.warning(
+                'sweep_orphan_flag_markers --list-known-projects: %s',
+                coverage_issue,
+            )
         if not project_ids:
             logger.warning(
                 'sweep_orphan_flag_markers --list-known-projects: resolved NO '
