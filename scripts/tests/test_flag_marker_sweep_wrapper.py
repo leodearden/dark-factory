@@ -14,6 +14,8 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
+
 WRAPPER = Path(__file__).parent.parent / "fused-memory-flag-marker-sweep.sh"
 
 
@@ -252,3 +254,97 @@ def test_wrapper_default_prefix_invokes_uv_run_frozen_project(tmp_path):
         str(fake_fm / "scripts" / "sweep_orphan_flag_markers.py"),
         "--apply", "--terminal-drain",
     ], f"argv={calls[0]!r}"
+
+
+def test_wrapper_resolves_uv_by_absolute_path_when_path_omits_it(tmp_path):
+    """Task 2917 EDIT 3. Pins that the wrapper resolves `uv` to an ABSOLUTE
+    path rather than trusting PATH.
+
+    OBSERVED production failure (journalctl --user -u
+    fused-memory-flag-marker-sweep.service):
+
+        Aug 18 09:02:44 ... fused-memory-flag-marker-sweep.sh[65377]:
+            .../fused-memory-flag-marker-sweep.sh: line 46: exec: uv: not found
+        Aug 18 09:02:44 ... fused-memory-flag-marker-sweep.service:
+            Main process exited, code=exited, status=127/n/a
+
+    That line is immediately preceded by a `-- Boot ... --` marker and the
+    next normal timer firing succeeded, so the failure is specific to the
+    unit's `Persistent=true` BOOT CATCH-UP run, which fires before the login
+    session pushes the user PATH into the systemd user manager. `uv` lives
+    in /home/leo/.local/bin, which is absent from that minimal boot PATH.
+
+    Simulated here by scrubbing PATH down to /usr/bin:/bin (no `uv`
+    anywhere on it) while pointing the wrapper's UV_BIN override at the fake
+    uv recorder. A wrapper that still relies on a bare `uv` word exits 127
+    without ever invoking it."""
+    uv_bin_dir, state_path = _fake_uv(tmp_path)
+
+    fake_repo = tmp_path / "fake-repo"
+    fake_repo.mkdir(exist_ok=True)
+
+    env = dict(os.environ)
+    env["PATH"] = "/usr/bin:/bin"
+    env["FAKE_SWEEP_STATE"] = str(state_path)
+    env["REPO"] = str(fake_repo)
+    env["UV_BIN"] = str(uv_bin_dir / "uv")
+    env.pop("FLAG_MARKER_SWEEP_CMD", None)
+
+    result = subprocess.run(
+        ["bash", str(WRAPPER)],
+        env=env, capture_output=True, text=True, timeout=30,
+    )
+
+    assert result.returncode == 0, (
+        f"Expected the wrapper to resolve uv via UV_BIN under a boot-catch-up "
+        f"PATH that omits it (returncode 127 == the OBSERVED regression); "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    calls = _recorded_calls(state_path)
+    assert len(calls) >= 1, (
+        f"Expected the absolute-path uv to actually be invoked; calls={calls!r} "
+        f"stderr={result.stderr!r}"
+    )
+
+
+def test_wrapper_fails_loud_when_uv_cannot_be_resolved(tmp_path):
+    """A missing interpreter must be DIAGNOSABLE from the journal, not a bare
+    shell 127 (loud-over-silent-degradation).
+
+    Scrubs PATH to /usr/bin:/bin, leaves UV_BIN unset, and repoints HOME at a
+    tmp dir so the $HOME/.local/bin/uv fallback misses too. The wrapper must
+    exit non-zero AND print its own ERROR:-prefixed line naming `uv`."""
+    if os.path.exists("/usr/local/bin/uv"):
+        pytest.skip(
+            "/usr/local/bin/uv exists on this host, so the wrapper's last-resort "
+            "fallback resolves and the unresolvable-uv path cannot be exercised"
+        )
+
+    fake_repo = tmp_path / "fake-repo"
+    fake_repo.mkdir(exist_ok=True)
+    fake_home = tmp_path / "fake-home"
+    fake_home.mkdir(exist_ok=True)
+
+    env = dict(os.environ)
+    env["PATH"] = "/usr/bin:/bin"
+    env["REPO"] = str(fake_repo)
+    env["HOME"] = str(fake_home)
+    env.pop("UV_BIN", None)
+    env.pop("FLAG_MARKER_SWEEP_CMD", None)
+
+    result = subprocess.run(
+        ["bash", str(WRAPPER)],
+        env=env, capture_output=True, text=True, timeout=30,
+    )
+
+    assert result.returncode != 0, (
+        f"Expected a non-zero exit when uv cannot be resolved; "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert "ERROR:" in result.stderr, (
+        f"Expected the wrapper's own ERROR:-prefixed diagnostic rather than a "
+        f"bare shell 127; stderr={result.stderr!r}"
+    )
+    assert "uv" in result.stderr, (
+        f"Expected the diagnostic to name `uv`; stderr={result.stderr!r}"
+    )
