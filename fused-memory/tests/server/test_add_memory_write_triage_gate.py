@@ -35,6 +35,7 @@ import pytest
 from fused_memory.config.schema import ProceduralTopicCluster
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.memory import MemoryResult
+from fused_memory.server import tools
 from fused_memory.server.grouped_read import PARENT_ID_KEY, SIGHTING_KIND
 from fused_memory.server.tools import create_mcp_server
 from fused_memory.server.write_triage import (
@@ -43,6 +44,7 @@ from fused_memory.server.write_triage import (
     OUTCOME_STORED,
     ROUTED_KEY,
     TRIAGE_OUTCOMES,
+    TriageFailOpenCounter,
 )
 from fused_memory.services.memory_service import RRF_K
 
@@ -613,3 +615,211 @@ class TestTheForceStoreArms:
         metadata = mock_service.add_memory.await_args.kwargs['metadata']
         assert PARENT_ID_KEY not in (metadata or {}), f'{metadata!r}'
         mock_service.search.assert_not_awaited()
+
+
+class TestC1HoldsEndToEnd:
+    """Contract C1 at the tool boundary, on every path a dependency can break.
+
+    Never lose content, never block a write, never edit a canonical. The unit
+    suite pins these inside `write_triage`; what these pin is that the WIRING
+    honours them too — a fail-open that `triage_write` handled perfectly is
+    still a blocked write if the tool body then raises on the attach.
+    """
+
+    @staticmethod
+    def _install_counter(monkeypatch) -> TriageFailOpenCounter:
+        """Bind a readable counter into the server the next call builds.
+
+        `create_mcp_server` constructs its counter closure-locally (so nothing
+        bleeds between servers), which also means a test cannot reach it. The
+        zero-arg construction is the seam: substituting the class with a
+        factory returning OUR instance leaves the production wiring identical
+        while making the count observable.
+        """
+        counter = TriageFailOpenCounter(time_provider=lambda: 1000.0)
+        monkeypatch.setattr(tools, 'TriageFailOpenCounter', lambda: counter)
+        return counter
+
+    @pytest.mark.asyncio
+    async def test_a_raising_search_still_stores_the_write(self, monkeypatch) -> None:
+        """A retrieval outage degrades triage; it must not touch the write.
+
+        The retired guard's call site RE-RAISED TypeError/AttributeError/
+        NameError so a wiring bug surfaced loudly. Triage cannot: re-raising
+        here is an errored write, i.e. a blocked write. The loudness is
+        preserved as an ERROR log plus a counted fail-open instead.
+        """
+        counter = self._install_counter(monkeypatch)
+        mock_service = AsyncMock()
+        _configure_config(mock_service, enabled=True)
+        _configure_pass_through_add_memory(mock_service)
+        mock_service.search.side_effect = RuntimeError('mem0 unreachable')
+        server = create_mcp_server(mock_service)
+
+        result = await _call(server)
+
+        assert result[ROUTED_KEY] == OUTCOME_STORED, f'{result!r}'
+        assert 'error' not in result, f'a fail-open must not error the write: {result!r}'
+        assert 'error_type' not in result, f'{result!r}'
+        mock_service.add_memory.assert_awaited_once()
+        assert mock_service.add_memory.await_args.kwargs['content'] == _CONTENT
+        assert counter.live_count() == 1, 'the degradation must be counted (INV-4)'
+
+    @pytest.mark.asyncio
+    async def test_a_wiring_bug_class_also_stores_rather_than_erroring(
+        self, monkeypatch,
+    ) -> None:
+        """A changed MemoryService.search signature is the concrete case."""
+        counter = self._install_counter(monkeypatch)
+        mock_service = AsyncMock()
+        _configure_config(mock_service, enabled=True)
+        _configure_pass_through_add_memory(mock_service)
+        mock_service.search.side_effect = TypeError(
+            "search() got an unexpected keyword argument 'categories'"
+        )
+        server = create_mcp_server(mock_service)
+
+        result = await _call(server)
+
+        assert result[ROUTED_KEY] == OUTCOME_STORED, f'{result!r}'
+        assert 'error_type' not in result, f'{result!r}'
+        assert counter.live_count() == 1
+
+    @pytest.mark.asyncio
+    async def test_an_attach_failure_falls_back_to_a_standalone_store(
+        self, monkeypatch,
+    ) -> None:
+        """The sharpest C1 case: the redirect fails, so the write must NOT.
+
+        If the child write raises and nothing catches it, triage has converted
+        a write that would have succeeded before the leaf into a hard failure —
+        content loss caused by the very mechanism built to prevent it. The
+        fallback stores the same FULL content standalone, which is exactly the
+        pre-triage outcome.
+        """
+        counter = self._install_counter(monkeypatch)
+        mock_service = AsyncMock()
+        _configure_config(mock_service, enabled=True)
+        mem_result = MagicMock()
+        mem_result.model_dump.return_value = {'id': 'fallback-id'}
+        mock_service.add_memory.side_effect = [
+            RuntimeError('parent_id rejected by the write seam'),
+            mem_result,
+        ]
+        mock_service.search.return_value = [_candidate('m1', 0.97)]
+        server = create_mcp_server(mock_service)
+
+        result = await _call(server)
+
+        assert 'error' not in result, f'the write was blocked: {result!r}'
+        assert 'error_type' not in result, f'{result!r}'
+        assert result[ROUTED_KEY] == OUTCOME_STORED, (
+            f'the attach did not happen, so the ack must not claim it did: {result!r}'
+        )
+        assert CANONICAL_ID_KEY not in result, (
+            f'nothing was attached, so nothing may be named: {result!r}'
+        )
+        assert result['id'] == 'fallback-id'
+        assert mock_service.add_memory.await_count == 2, (
+            f'expected attach then fallback: {mock_service.add_memory.await_args_list!r}'
+        )
+        fallback = mock_service.add_memory.await_args.kwargs
+        assert fallback['content'] == _CONTENT, 'the fallback must carry the FULL text'
+        assert PARENT_ID_KEY not in (fallback['metadata'] or {}), (
+            f'the failed parent link leaked into the fallback: {fallback["metadata"]!r}'
+        )
+        assert counter.live_count() == 1, 'a failed attach is a fail-open (INV-4)'
+
+    @pytest.mark.asyncio
+    async def test_the_canonical_is_never_mutated_on_any_path(
+        self, monkeypatch,
+    ) -> None:
+        """Swept across restate, store, judge-stub and every fail-open.
+
+        Triage issues no update_memory and no delete_memory, ever. A canonical
+        the write path can rewrite is a canonical a mis-scored write can
+        destroy; leaving it read-only is what makes a wrong attach a cheap,
+        reversible metadata edit (D4).
+        """
+        self._install_counter(monkeypatch)
+        scenarios = [
+            ('restate', {'search': AsyncMock(return_value=[_candidate('m1', 0.97)])}),
+            ('judge band', {'search': AsyncMock(return_value=[_candidate('m1', 0.80)])}),
+            ('store', {'search': AsyncMock(return_value=[_candidate('m1', 0.10)])}),
+            ('no candidates', {'search': AsyncMock(return_value=[])}),
+            ('fail-open', {'search': AsyncMock(side_effect=RuntimeError('down'))}),
+        ]
+        for label, wiring in scenarios:
+            mock_service = AsyncMock()
+            _configure_config(mock_service, enabled=True)
+            _configure_pass_through_add_memory(mock_service)
+            mock_service.search = wiring['search']
+            server = create_mcp_server(mock_service)
+
+            await _call(server)
+
+            mock_service.update_memory.assert_not_awaited()
+            mock_service.delete_memory.assert_not_awaited()
+            assert mock_service.add_memory.await_count == 1, label
+
+    @pytest.mark.asyncio
+    async def test_the_ack_contract_holds_across_the_whole_band(
+        self, monkeypatch,
+    ) -> None:
+        """`routed` is always a published outcome; `canonical_id` iff attached.
+
+        ABSENT rather than None for a non-attach: an omitted key is an
+        unambiguous signal, whereas a null is a value the reader then has to
+        disambiguate. This is the "omit rather than emit a null" convention now
+        documented in shared/mcp_markup_middleware.py (it used to live on
+        `build_markup_block`, which task 4458 deleted).
+        """
+        self._install_counter(monkeypatch)
+        for score in (0.0, 0.10, 0.69, _T_LOW, 0.80, _T_HIGH, 0.97, 1.0):
+            mock_service = AsyncMock()
+            _configure_config(mock_service, enabled=True)
+            _configure_pass_through_add_memory(mock_service)
+            mock_service.search.return_value = [_candidate('m1', score)]
+            server = create_mcp_server(mock_service)
+
+            result = await _call(server)
+
+            routed = result[ROUTED_KEY]
+            assert routed in TRIAGE_OUTCOMES, f'score={score}: {result!r}'
+            attached = routed != OUTCOME_STORED
+            assert (CANONICAL_ID_KEY in result) is attached, (
+                f'score={score}: canonical_id must be present iff attached, and '
+                f'ABSENT (not None) otherwise: {result!r}'
+            )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('label', 'category'),
+        [
+            ('a Graphiti-primary category', 'temporal_facts'),
+            ('an auto-classify write', None),
+        ],
+    )
+    async def test_untriaged_scopes_are_not_triaged_at_all(
+        self, monkeypatch, label, category,
+    ) -> None:
+        """Neither a search nor a `routed` key — the write bypasses triage.
+
+        `category=None` auto-classifies inside MemoryService.add_memory, BELOW
+        this seam, so triaging it here would mean running the classifier a
+        second time (INV-5) — and the second copy would be the one that drifts.
+        A Graphiti-primary category is out of scope for a leaf whose retrieval
+        is a mem0 vector search.
+        """
+        self._install_counter(monkeypatch)
+        mock_service = AsyncMock()
+        _configure_config(mock_service, enabled=True)
+        _configure_pass_through_add_memory(mock_service)
+        server = create_mcp_server(mock_service)
+
+        result = await _call(server, category=category)
+
+        mock_service.search.assert_not_awaited()
+        assert ROUTED_KEY not in result, f'{label} was triaged: {result!r}'
+        assert CANONICAL_ID_KEY not in result, f'{label}: {result!r}'
+        mock_service.add_memory.assert_awaited_once()
