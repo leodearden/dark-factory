@@ -15,6 +15,8 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import os
+import shutil
 import subprocess
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -3752,4 +3754,118 @@ def test_deletion_directive_aggregate_journals_once_at_warning(tmp_path, caplog)
     assert aggregate[0].levelno == logging.WARNING
     assert [r for r in loud if r.levelno >= logging.ERROR] == [], (
         'a run that exits 0 must never appear in `journalctl -p err`'
+    )
+
+
+# ---------------------------------------------------------------------------
+# task 4511 step-5/6: THE 2026-08-18 INCIDENT REPLAY, end to end.
+#
+# On 2026-08-18 the trickle's systemd manager had a PATH without
+# ~/.local/bin, every selected digest ENOENT'd on `claude`, and the operator
+# looking at `journalctl --user -u legibility-trickle@reify.service` saw
+# nothing but an unexplained benign 400 and `status=1/FAILURE` -- the only
+# copy of the reason lived inside the archived escalation JSON.
+#
+# This is that failure turned into an automated test, and it is the ONLY test
+# in this module that runs `run_nightly` with no `invoke=` override, so it is
+# the only one exercising the production wiring
+# `run_nightly -> coder.code_digests -> coder._invoke_cli` end to end. It
+# stays hermetic and free: a nonexistent binary makes `subprocess.run` raise
+# OSError BEFORE any process starts, so there is no LLM call, no network and
+# no timing.
+# ---------------------------------------------------------------------------
+
+def _scrub_path_of_claude(tmp_path, monkeypatch):
+    """Point PATH somewhere the REAL `claude` is NOT resolvable, and prove it.
+
+    MANDATORY SAFETY for the test below, not tidiness -- the discipline task
+    4510 established in test_legibility_coder.py, adopted here because this
+    module now reaches the same seam. `_invoke_cli` resolves
+    `claude_bin or os.environ.get(_CLAUDE_BIN_ENV_VAR) or "claude"`, and the
+    real /home/leo/.local/bin/claude is on the test runner's PATH. So if that
+    env-var lookup ever regresses -- exactly what 4510 exists to catch --
+    pointing LEGIBILITY_CLAUDE_BIN at a nonexistent path becomes a no-op,
+    resolution falls through to the bare name, and this test spawns up to
+    N GENUINE Haiku CLI calls: real spend, real wall-clock, and green for the
+    wrong reason. With `claude` unresolvable, that same regression ENOENTs
+    instead: loud and free.
+
+    Deliberately NOT an empty PATH, and for a reason specific to THIS module
+    (4510's is different -- its fake binaries are `#!/usr/bin/env bash` and
+    need `env`): nightly's e2e path shells out to git by BARE NAME
+    (`['git', '-C', ...]`), so an empty PATH would break the commit stage for
+    a reason with nothing to do with the branch under test -- the same class
+    of misleading failure this scrub exists to prevent. Do not "simplify" the
+    retained stdlib bin dir away.
+    """
+    empty_bin = tmp_path / 'empty-bin'
+    empty_bin.mkdir()
+    monkeypatch.setenv('PATH', f'{empty_bin}{os.pathsep}/usr/bin')
+    assert shutil.which('claude') is None, (
+        'PATH scrub failed: a real `claude` is still resolvable, so a '
+        'regression in _invoke_cli\'s env-var branch would silently spawn '
+        'the GENUINE CLI (real spend) instead of failing loudly'
+    )
+
+
+def test_missing_claude_binary_journals_both_halves_end_to_end(
+    tmp_path, monkeypatch, caplog,
+):
+    """One journal, both sinks: the per-digest WARNING from
+    `legibility.coder` naming what went wrong for that session, AND the
+    aggregate ERROR from `legibility.nightly` carrying the same reason --
+    which is what an operator would actually have had to read on
+    2026-08-18."""
+    work_cwd = str(tmp_path / 'work')
+    _repo, config_path = _init_e2e_repo(tmp_path, work_cwd=work_cwd)
+    projects_root = tmp_path / 'projects'
+    _write_transcript(
+        projects_root / _encode_cwd(work_cwd) / 'session-1.jsonl',
+        cwd=work_cwd, timestamp='2026-07-13T10:00:00Z', session_id='session-1',
+    )
+
+    _scrub_path_of_claude(tmp_path, monkeypatch)
+    monkeypatch.setenv('LEGIBILITY_CLAUDE_BIN', str(tmp_path / 'nonexistent-claude'))
+
+    escalations = []
+    with caplog.at_level(logging.DEBUG):
+        # NO invoke= override: the real coder._invoke_cli seam runs.
+        result = nightly.run_nightly(
+            config_path=config_path,
+            projects_root=projects_root,
+            target_date=date(2026, 7, 13),
+            now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
+            status_fetcher=None,
+            poster=lambda url, env: escalations.append((url, env)),
+        )
+
+    assert result.exit_code == 1
+    assert result.coder_status == 'failure'
+    assert result.commit_made is False
+
+    # Half one: the coder announced the failure for that specific digest.
+    coder_warnings = [
+        r for r in caplog.records
+        if r.name == 'legibility.coder' and r.levelno >= logging.WARNING
+    ]
+    assert len(coder_warnings) == 1, (
+        f'expected one per-digest WARNING; got '
+        f'{[r.getMessage() for r in coder_warnings]}'
+    )
+    coder_message = coder_warnings[0].getMessage()
+    assert 'claude CLI could not be started' in coder_message, coder_message
+    assert 'No such file or directory' in coder_message, coder_message
+
+    # Half two: the aggregate reached the journal at ERROR, reason intact,
+    # even though this run posted its escalation to a recording fake.
+    errors = [r for r in _nightly_warnings(caplog) if r.levelno == logging.ERROR]
+    assert len(errors) == 1, (
+        f'expected one aggregate ERROR; got {[r.getMessage() for r in errors]}'
+    )
+    aggregate = errors[0].getMessage()
+    assert 'coder storm' in aggregate, aggregate
+    assert 'claude CLI could not be started' in aggregate, (
+        'the aggregate must carry the REASON, not just the count -- a bare '
+        f'"1/1 digests failed" is what the incident already had. got '
+        f'{aggregate!r}'
     )
