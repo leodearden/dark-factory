@@ -14974,6 +14974,23 @@ class Harness:
         Logs a WARNING with the persisted reason and pause_at so the operator
         is alerted on startup.  Any failure is caught and logged but never
         blocks startup.
+
+        Task 4559 — restart-time predicate re-check.  SCOPE, stated precisely,
+        because it sits next to something deliberately excluded: this is NOT an
+        auto-resume of a live pause.  Nothing new reads ``_ewa_value`` to
+        unpause a running scheduler.  What this declines to do is RE-ASSERT,
+        across a process boundary, a halt whose stored predicate no longer
+        holds.  It is scoped strictly to ``ewa_trip_*`` — the one pause class
+        whose predicate is a stored scalar and can therefore be re-evaluated.
+        Park-stop, cost-ceiling and operator halts are restored blind exactly
+        as before (task 3328: 'Non-5xx park-stop pauses NEVER auto-resume'), as
+        is an ``ewa_trip_*`` row with a NULL value — a row predating the
+        migration — which fails safe toward KEEPING the halt when the predicate
+        is unknowable, never toward releasing it.
+
+        Restoring the EVIDENCE (assigning ``self._ewa_value``) is unconditional
+        and independent of the halt decision, so even a blind restore no longer
+        loses the number.
         """
         if not self._run_store:
             return
@@ -14993,12 +15010,52 @@ class Harness:
                     pause_at,
                     restored_from_run_id,
                 )
-                self.scheduler.pause(reason)
-                # Stash the reason so run() can file the L1 escalation once the
-                # escalation queue exists (this runs at line ~492, before
-                # _start_escalation_server creates _escalation_queue).  See
-                # _file_restored_pause_escalation.
-                self._restored_pause_reason = reason
+                # Restore the evidence FIRST — unconditional, and independent
+                # of the halt decision below (task 4559).
+                ewa_value = record.get('ewa_value')
+                if ewa_value is not None:
+                    self._ewa_value = ewa_value
+
+                threshold = self.config.digest_ewa_threshold
+                # Re-assert unless this is an ewa_trip_ pause whose stored
+                # predicate demonstrably no longer holds.  A missing value is
+                # an unknowable predicate, so it re-asserts.
+                reassert = not (
+                    reason.startswith('ewa_trip_')
+                    and ewa_value is not None
+                    and ewa_value < threshold
+                )
+
+                if reassert:
+                    self.scheduler.pause(reason)
+                    # Stash the reason so run() can file the L1 escalation once
+                    # the escalation queue exists (this runs at line ~492, before
+                    # _start_escalation_server creates _escalation_queue).  See
+                    # _file_restored_pause_escalation.
+                    self._restored_pause_reason = reason
+                    disposition = 'predicate still holds or is not re-checkable'
+                else:
+                    # Do NOT pause, and do NOT set _restored_pause_reason — no
+                    # L1 may be filed for a halt that is not being re-asserted.
+                    logger.warning(
+                        'Scheduler pause NOT re-asserted: persisted EWA %.4f is '
+                        'below the current threshold %.4f, so the stored trip '
+                        'predicate no longer holds. reason=%r  (task 4559)',
+                        ewa_value, threshold, reason,
+                    )
+                    disposition = 'ewa below threshold — halt not re-asserted'
+                    try:
+                        self._run_store.clear_scheduler_pause(
+                            self.config.fused_memory.project_id,
+                        )
+                    except Exception:
+                        # A clear failure must not break startup; the row simply
+                        # survives to be re-evaluated on the next restart.
+                        logger.warning(
+                            '_load_persisted_scheduler_pause: failed to clear the '
+                            'stale pause row', exc_info=True,
+                        )
+
                 # Emit a distinct event so the timeline self-documents
                 # cross-run continuity.  Operators querying the event log
                 # for a run that starts with dispatch halted can see WHY
@@ -15010,6 +15067,10 @@ class Harness:
                             'reason': reason,
                             'pause_at': pause_at,
                             'restored_from_run_id': restored_from_run_id,
+                            'reasserted': reassert,
+                            'ewa_value': ewa_value,
+                            'ewa_threshold': threshold,
+                            'disposition': disposition,
                         },
                     )
         except Exception:
