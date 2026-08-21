@@ -2275,3 +2275,67 @@ class TestWriteMarkupResidue:
 
         assert residue_id is None
         assert not ta.root.exists()
+
+    def test_two_concurrent_writers_do_not_clobber_each_other(
+        self, tmp_path: Path
+    ):
+        """(f) A reviewer PANEL races on one root, and both payloads survive.
+
+        REVIEW SUGGESTION 4. Only ``verdicts/<role>.json`` is per-role — the
+        residue files sit directly on the SHARED ``self.root``, and several
+        verdict-tools subprocesses run against it at once. A serialization leak
+        is by nature bursty and correlated across panel members, so "two
+        refusals at the same moment" is the expected case, not the exotic one.
+
+        Scan-then-write leaves a TOCTOU window that the ``while ... exists()``
+        advance re-checks but does not close: two writers that both scan before
+        either writes both compute the same index, and the second write
+        silently overwrites the first — destroying exactly the only-surviving
+        copy this method exists to preserve.
+
+        The interleaving is forced rather than threaded, so the test measures
+        the window instead of racing for it: the first writer is suspended at
+        the moment it hands off to ``_write_json`` (i.e. after it has chosen its
+        name) and the second writer runs to completion inside that gap.
+        """
+        first = TaskArtifacts(tmp_path / 'panel')
+        first.init('task-r', 'panel', 'desc')
+        second = TaskArtifacts(tmp_path / 'panel')
+
+        original = TaskArtifacts._write_json
+        interleaved = []
+
+        def suspend_and_let_the_other_finish(self, path, data):
+            # Fire ONCE, and only for the first writer: the nested call must
+            # reach the real writer or nothing is ever written.
+            if not interleaved:
+                interleaved.append(path.name)
+                second.write_markup_residue(
+                    TestWriteMarkupResidue._record('SECOND payload')
+                )
+            return original(self, path, data)
+
+        monkeypatch = pytest.MonkeyPatch()
+        try:
+            monkeypatch.setattr(
+                TaskArtifacts, '_write_json', suspend_and_let_the_other_finish
+            )
+            first_id = first.write_markup_residue(self._record('FIRST payload'))
+        finally:
+            monkeypatch.undo()
+
+        assert interleaved, 'the interleaving hook never fired'
+
+        files = sorted(first.root.glob('markup_residue-*.json'))
+        assert len(files) == 2, (
+            f'two concurrent writers must produce two files, found '
+            f'{[p.name for p in files]}'
+        )
+        payloads = {json.loads(p.read_text())['raw_value'] for p in files}
+        assert payloads == {'FIRST payload', 'SECOND payload'}
+        # And the id handed back names the caller's OWN record, not the one
+        # that happened to land last.
+        assert first_id is not None
+        assert json.loads(
+            (first.root / first_id).read_text()
+        )['raw_value'] == 'FIRST payload'
