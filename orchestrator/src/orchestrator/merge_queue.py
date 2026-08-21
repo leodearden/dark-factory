@@ -16936,16 +16936,23 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 merge_base_sha=merge_base_sha,
                 main_sha=main_sha,
             ))
-            # task 2420 (DEFECT 1, split from 2357; extends #1728): no-progress
-            # budget seed.  Content-mtime is LOCAL-only — a REMOTE lease's
-            # verify runs on the remote host and writes nothing to this local
-            # merge_wt, so a content-mtime budget would be blind to remote
-            # progress.  task 2566 covers the REMOTE case instead via
-            # RemoteRunner.dispatch_in_flight, branched in the poll loop
-            # below (Abort trigger 3).  newest_content_mtime never stats
-            # merge_wt's own root inode, so the #1728 alpha owner-heartbeat's
-            # os.utime(merge_wt) can never mask a dead LOCAL verify here.
-            _last_content_mtime = newest_content_mtime(merge_wt) if lease.is_local else None
+            # task 2420 (DEFECT 1, split from 2357; extends #1728), revised by
+            # task 4579: no-progress budget seed.  Content-mtime is sampled
+            # for BOTH lease kinds — a REMOTE lease's ssh dispatch itself
+            # writes nothing to this local merge_wt, but task 2822's
+            # post-dispatch cross-check runs a FULL LOCAL verify
+            # (LocalRunner(merge_wt, ...), merge_queue.py:2977-3015) on THIS
+            # host inside the SAME awaited verify_task, and that cross-check
+            # genuinely does advance merge_wt's content mtime.  See the union
+            # of evidence sources in the poll loop below (Abort trigger 3).
+            # newest_content_mtime never stats merge_wt's own root inode, so
+            # the #1728 alpha owner-heartbeat's os.utime(merge_wt) can never
+            # mask a dead verify on EITHER arm.  The seed is unconditional
+            # (not `if lease.is_local else None`): leaving it None for a
+            # remote lease would make the first probe hit the
+            # `_last_content_mtime is None` arm and hand a genuinely
+            # coasting remote lease one free budget window.
+            _last_content_mtime = newest_content_mtime(merge_wt)
             # task 2420 amend (reviewer finding, robustness): time.monotonic(),
             # not time.time(), for _last_progress_at/_last_probe_at/_now below
             # — all three are pure duration references (never persisted or
@@ -16958,23 +16965,27 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # per-attempt t0 at the top of the dequeue loop).
             _last_progress_at = time.monotonic()
             _last_probe_at = _last_progress_at
-            # task 2420 amend (reviewer finding, correctness): guard against
-            # INFLIGHT_VERIFY_PROGRESS_PROBE_SECS not being comfortably
-            # smaller than INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS. If the probe
-            # interval were >= the budget, the very first eligible content
-            # probe would land at/after the budget deadline, so the abort
-            # would trip before a single progress probe ever ran — false-
-            # aborting every LOCAL verify regardless of health. Clamp the
-            # EFFECTIVE probe interval (local var; never mutates the class/
-            # instance attribute) to a safe fraction of the budget and warn,
-            # so a misconfigured or hot-reloaded pair cannot silently wedge
-            # every local verify.
+            # task 2420 amend (reviewer finding, correctness); revised by task
+            # 4579: guard against INFLIGHT_VERIFY_PROGRESS_PROBE_SECS not
+            # being comfortably smaller than INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS.
+            # If the probe interval were >= the budget, the very first
+            # eligible content probe would land at/after the budget deadline,
+            # so the abort would trip before a single progress probe ever
+            # ran — false-aborting every verify regardless of health. The
+            # probe interval now drives the content-mtime arm for BOTH lease
+            # kinds (task 4579: it used to be LOCAL-only), so a misconfigured
+            # or hot-reloaded PROBE >= BUDGET pair would false-abort every
+            # REMOTE verify for the identical reason it would false-abort
+            # every LOCAL one — the clamp below is therefore no longer
+            # lease-type-gated either. Clamp the EFFECTIVE probe interval
+            # (local var; never mutates the class/instance attribute) to a
+            # safe fraction of the budget and warn.
             _progress_probe_secs = self.INFLIGHT_VERIFY_PROGRESS_PROBE_SECS
-            if lease.is_local and _progress_probe_secs >= self.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS:
+            if _progress_probe_secs >= self.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS:
                 logger.warning(
                     'Task %s: INFLIGHT_VERIFY_PROGRESS_PROBE_SECS (%.3fs) >= '
                     'INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS (%.3fs) -- would '
-                    'false-abort every local verify before a single progress '
+                    'false-abort every verify before a single progress '
                     'probe could run; clamping the effective probe interval '
                     'to budget/2 for this verify',
                     req.task_id, _progress_probe_secs,
@@ -17049,41 +17060,67 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # Abort trigger 3 — no in-flight verify progress budget
                 # (task 2420 DEFECT 1, split from 2357; extends #1728;
                 # un-gated to cover REMOTE leases by task 2566, closing the
-                # latent 7200s-coast gap): terminate a deterministically
-                # dead/hung verify and RE-QUEUE, mirroring the operator-halt
-                # branch above.  Checked last so abandon/halt precedence
-                # (triggers 1/2) is preserved when they land on the same
-                # poll.
+                # latent 7200s-coast gap; task 4579 unions the two evidence
+                # sources instead of branching on lease type — see below):
+                # terminate a deterministically dead/hung verify and
+                # RE-QUEUE, mirroring the operator-halt branch above.
+                # Checked last so abandon/halt precedence (triggers 1/2) is
+                # preserved when they land on the same poll.
                 #
-                # PROGRESS signal is branched by lease type:
-                #   LOCAL  — content progress under merge_wt (throttled by
-                #            _progress_probe_secs) resets the clock, so a
-                #            genuinely long-running healthy cold verify is
-                #            never false-killed.
-                #   REMOTE — RemoteRunner.dispatch_in_flight (task 2566):
-                #            a live ssh dispatch is progress (its death is
-                #            owned by task 2362's ssh keepalive, never
-                #            touched here) and resets the clock every poll;
-                #            once the dispatch has returned (or never
-                #            started) while the lease is still held, the
-                #            clock is left running so this trigger can
-                #            resolve a coasting lease — e.g. the ssh child
-                #            already exited, or a post-dispatch probe hangs
-                #            (reify-5067). getattr(..., True) fails safe: a
-                #            runner not exposing the property is treated as
-                #            live and never progress-aborted.
+                # PROGRESS is the UNION of two independent evidence sources
+                # (task 4579 — previously an if/elif branched by lease type,
+                # which made a REMOTE lease structurally unable to see its
+                # own post-dispatch local writes; see the reify mr-945466ca
+                # incident this closed):
+                #   A. content progress under merge_wt (throttled by
+                #      _progress_probe_secs), sampled for BOTH lease kinds —
+                #      resets the clock, so a genuinely long-running healthy
+                #      verify is never false-killed. For a LOCAL lease this
+                #      is the verify itself; for a REMOTE lease this is
+                #      task 2822's post-dispatch cross-check, a FULL LOCAL
+                #      verify (LocalRunner(merge_wt, ...),
+                #      merge_queue.py:2977-3015) that runs on THIS host
+                #      inside the SAME awaited verify_task once the ssh
+                #      dispatch returns.
+                #   B. a live remote ssh dispatch (REMOTE leases only) —
+                #      RemoteRunner.dispatch_in_flight (task 2566): a live
+                #      dispatch is progress (its death is owned by task
+                #      2362's ssh keepalive, never touched here) and resets
+                #      the clock every poll. dispatch_in_flight goes False
+                #      the instant run_merge_verify returns
+                #      (verify_runner.py:1483) — which is precisely when
+                #      evidence A takes over for the cross-check's window.
+                #      getattr(..., True) fails safe: a runner not exposing
+                #      the property is treated as live and never
+                #      progress-aborted.
+                #
+                # SAFETY: adding evidence A for remote leases can only make
+                # this trigger LESS trigger-happy, never introduce a false
+                # abort. The one way it could instead MASK a genuine remote
+                # coast — some writer other than the verify touching
+                # merge_wt — does not hold: during a coast the only local
+                # writes are RemoteRunner's `git push`/`fetch` at
+                # `cwd=self._cwd`, which touch only `.git` (pruned by
+                # newest_content_mtime) and archive to
+                # `project_root/data/verify-logs`, never merge_wt: and a
+                # concurrent foreign writer into the warm lane is already
+                # excluded by task 2873's merge_verify_lease
+                # (merge_queue.py:3006-3014) — the same exclusion the LOCAL
+                # arm has relied on since task 2420, with no new surface
+                # added here.
                 _now = time.monotonic()
-                if lease.is_local:
-                    if _now - _last_probe_at >= _progress_probe_secs:
-                        _last_probe_at = _now
-                        _cur_content_mtime = newest_content_mtime(merge_wt)
-                        if _cur_content_mtime is not None and (
-                            _last_content_mtime is None
-                            or _cur_content_mtime > _last_content_mtime
-                        ):
-                            _last_content_mtime = _cur_content_mtime
-                            _last_progress_at = _now
-                elif getattr(lease.runner, 'dispatch_in_flight', True):
+                # Evidence A — content progress under merge_wt (BOTH lease kinds).
+                if _now - _last_probe_at >= _progress_probe_secs:
+                    _last_probe_at = _now
+                    _cur_content_mtime = newest_content_mtime(merge_wt)
+                    if _cur_content_mtime is not None and (
+                        _last_content_mtime is None
+                        or _cur_content_mtime > _last_content_mtime
+                    ):
+                        _last_content_mtime = _cur_content_mtime
+                        _last_progress_at = _now
+                # Evidence B — a live remote ssh dispatch (REMOTE leases only).
+                if not lease.is_local and getattr(lease.runner, 'dispatch_in_flight', True):
                     _last_progress_at = _now
                 _no_progress_secs = _now - _last_progress_at
                 if _no_progress_secs >= self.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS:
