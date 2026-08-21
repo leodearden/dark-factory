@@ -2,14 +2,39 @@
 """Migrate live tasks: ``metadata.modules`` → ``metadata.files``.
 
 Run this BEFORE landing the principled-files-rename code change. Idempotent —
-safe to re-run.
+safe to re-run, and the sanctioned way to run it is dry-run → live → dry-run,
+with the final dry-run reporting zero pending actions.
 
-Behavior per task carrying ``metadata.modules``:
+Behaviour per task carrying ``metadata.modules``:
 
-- If ``metadata.files`` is missing or empty: copy ``modules`` into ``files``,
-  then drop ``modules``.
+- If ``metadata.files`` is missing or empty: copy ``modules`` into ``files``
+  SANITIZED THROUGH THE LOCK CHARTER (``shared.locking.strip_directory_locks``),
+  then drop ``modules``. The sanitization is not optional politeness: the
+  server rejects any ``metadata.files`` write carrying a directory-shaped entry
+  (``_reject_directory_locks_in_update_metadata``), so a verbatim copy of a
+  directory-shaped ``modules`` is a guaranteed write failure. Measured across
+  the seven live corpora, ALL of the copy-branch tasks were all-directory.
+- If the sanitized list is EMPTY — nothing in ``modules`` was file-level —
+  ``files`` is deliberately left empty (an absent key stays absent, an existing
+  ``[]`` stays ``[]``) and the outcome is reported as ``sanitized_empty``, not
+  as a copy. Scope is deferred to the architect, which widens it at plan time.
+  Reporting this as a copy would claim tasks got their scope back when nothing
+  was written.
 - If ``metadata.files`` is non-empty: keep ``files`` as authoritative, drop
   ``modules``.
+
+``done``/``cancelled``/``deferred`` are skipped ON PURPOSE — ``update_task``
+will not write them, and PRD decision 1 keeps ``modules`` on terminal tasks as
+the only in-record trace of their original scope. Their residual carriers are
+COUNTED BY STATUS and reported, so "we deliberately left some behind" is a
+checkable claim. The skip set is an EXACT MATCH: ``merge-deferred`` is a live,
+processed status and is not a member.
+
+A write the server REFUSES is reported as a failure and never as a migration.
+Nothing server-side crosses the wire as an exception — a rejection arrives as
+an ordinary reply — so replies are classified by
+:func:`write_failure_reason`, failures are named on stderr, and a non-zero
+failed total makes the process exit non-zero.
 
 Talks to the running fused-memory MCP server over JSON-RPC. Discovers project
 roots from ``DASHBOARD_KNOWN_PROJECT_ROOTS`` (comma-separated). Falls back to
@@ -380,10 +405,16 @@ async def _migrate_one_project(
             outcome = 'dropped'
         action = ACTION_LABELS[outcome]
 
+        # The RESULT, computed once above the fork so the dry-run reports what
+        # the live path would actually write rather than what it was handed.
+        # `.get`, not `[...]`: the sanitize-to-empty case deliberately leaves
+        # no `files` key at all.
+        resulting_files = new_meta.get('files')
+
         if dry_run:
             print(
                 f'  [dry-run][{project_root}] task={task_id} action={action} '
-                f'modules={modules!r} files={files!r}'
+                f'modules={modules!r} files={resulting_files!r}'
             )
         else:
             try:
