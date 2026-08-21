@@ -9803,26 +9803,31 @@ class GitOps:
           ``other_parent`` and yields an empty, useless diff), then
           ``touched = git -c core.quotePath=false diff --name-only -z
           <merge_base> <other_parent>`` (the paths that parent introduced
-          since its fork point), and finally whether ``git diff --quiet
-          <other_parent> <main> -- <touched...>`` reports no difference —
-          i.e. main HEAD still carries that parent's content
-          byte-identical for every path it touched.  For an ordinary
-          two-parent merge this is exactly one iteration, byte-identical
-          to checking the second parent alone.
+          since its fork point), and finally whether the lines that
+          parent ADDED across those paths still SURVIVE at main HEAD.
+          Until task 3116 part b that terminal test was a byte-identity
+          ``git diff --quiet <other_parent> <main> -- <touched...>``; it
+          is now the survival predicate described on
+          :meth:`describe_commit_effect_in_main`, which owns the
+          thresholds and the full-corpus measurement behind them.  For an
+          ordinary two-parent merge this is exactly one iteration,
+          equivalent to checking the second parent alone.
 
         - **Non-merge commit** (root or single-parent) — UNCHANGED from
           prior behavior (task 2500): ``touched = git -c
           core.quotePath=false diff-tree --no-commit-id --name-only -r
           -z <commit_sha>`` (the commit's own diff against its sole
-          parent) and, when non-empty, whether ``git diff --quiet
-          <commit_sha> <main> -- <touched...>`` reports no difference.
+          parent) and, when non-empty, whether the lines that commit
+          ADDED across those paths still SURVIVE at main HEAD — the same
+          survival test as the merge branch above.
 
         ``-z`` + ``core.quotePath=false`` together make every path list
         byte-faithful for any filename, including non-ASCII or
         newline-containing ones — see the path-quoting caveat on
         :meth:`branch_content_in_main`, which shares this primitive's
-        underlying merge-base/diff/diff-quiet pattern but not yet this
-        hardening.
+        underlying merge-base/diff anchor pattern (though it still ends
+        in the byte-identity ``diff --quiet`` this one retired) but not
+        yet this hardening.
 
         Returns True (path-based revert detection inapplicable) when:
         - the commit is non-merge and its own touched-set is empty — a
@@ -9843,16 +9848,20 @@ class GitOps:
           EVERY parent to pass;
         - for a non-merge commit, the ``diff-tree`` call errors (rc !=
           0);
-        - the final ``diff --quiet`` call errors for a reason other than
-          "paths differ" (rc not in {0, 1}); or
-        - any touched path differs (rc == 1) between the relevant commit
-          (*commit_sha* for non-merge, any non-first parent for merge) and
-          main HEAD — produced by a post-hoc revert of those paths, but
-          equally by any OTHER later change to the same paths (e.g.
-          another already-landed task's follow-up edit, or this task's
-          own later commit on the same branch overlapping the same
-          files).  This primitive cannot distinguish the two; see the
-          accepted-risk note below.
+        - a diff or blob read the survival test needs errors, leaving
+          the probe unable to reach a verdict; or
+        - the lines ADDED by the relevant commit (*commit_sha* for
+          non-merge, any non-first parent for merge) do not survive at
+          main HEAD — aggregate survival below
+          ``_EFFECT_SURVIVAL_AGGREGATE_THRESHOLD``, or some path carrying
+          at least ``_EFFECT_SURVIVAL_PER_FILE_MIN_ADDED_LINES`` added
+          lines below ``_EFFECT_SURVIVAL_PER_FILE_THRESHOLD``.  A
+          post-hoc revert of those paths lands here.  Ordinary ADDITIVE
+          later evolution of the same paths (another already-landed
+          task's follow-up edit, or this task's own later commit
+          overlapping the same files) does NOT — that was byte-identity's
+          false positive and task 3116 part b is what removed it; see the
+          narrowed-residual-risk note below for the tail that remains.
 
         **Narrowed residual risk — a heavy rewrite can still read as a
         revert** (task 3116 part b).  This note previously read "later

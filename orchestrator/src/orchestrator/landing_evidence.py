@@ -545,8 +545,10 @@ async def validate_landing_evidence(
 
     # FIX 1' effect-present guard (task 2500/2675): ancestry alone doesn't
     # mean the effect survives at HEAD — a later commit on main may have
-    # CHANGED exactly the paths the citation touched (a revert, or ordinary
-    # later evolution — this check cannot distinguish them; task 3116). Anchor on the branch
+    # REVERTED or rewritten the lines the citation ADDED. Task 3116 part b
+    # replaced byte-identity with line-survival here, so ordinary additive
+    # later evolution of those same paths no longer reads as a revert.
+    # Anchor on the branch
     # TIP for an in-branch work commit (it may be a stale intermediate
     # commit); anchor on the citation itself for a no-ff merge commit (task
     # 2675 made this a REAL check — it diffs each non-first parent's content
