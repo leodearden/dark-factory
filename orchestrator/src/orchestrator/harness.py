@@ -15021,9 +15021,11 @@ class Harness:
 
         Algorithm:
         1. Early-return when digest_enabled=False.
-        2. Snapshot _escalation_event_count (best-effort; see note below).
-        3. Early-return when (snapshot - last_count) < N.
-        4. Snapshot escalation delta.
+        2. Snapshot _escalation_event_count AND _escalation_submit_count
+           (best-effort; see note below).
+        3. Early-return when (event snapshot - last event count) < N.
+        4. Compute both step deltas: the lifecycle-event diff (the GATE) and
+           the submissions diff (the EWA NUMERATOR).
         5. Compute window (last window_end → now).
         6. Aggregate escalation stats (fail-open).
         7. Count done tasks in EventStore (fail-open).
@@ -15040,35 +15042,58 @@ class Harness:
             function do not silently skip counted events.
         14. If tripped and not already paused, call pause_scheduler (post-write).
 
-        Note on _escalation_event_count: callbacks fire inline on the asyncio
-        event loop thread, so there are no real concurrent writers — the
-        snapshot at step 2 guards against the logical interleaving where a
-        callback runs at an await point inside this function, not against torn
-        integer writes.  Snapshotting once at step 2 makes the threshold check
-        and the advance consistent — concurrent callbacks cannot cause a
-        "double-skip" where the advance overshoots the events that triggered
-        this digest.  The counter is best-effort observability; a small drift
-        is acceptable.
+        Note on the two counters (task 4559): _escalation_event_count counts
+        every escalation-lifecycle callback (submit AND resolve) and is the
+        digest GATE; _escalation_submit_count counts submissions only and is
+        the EWA NUMERATOR.  The gate deliberately keeps counting resolutions.
+        A submissions-only gate would mean a pure-drain window — many
+        resolutions, zero submissions — fires NO digest at all, so a tripped
+        EWA would freeze at its trip value forever, re-creating the
+        re-evaluation dead end that the supervisor-loop hoist closes.  Keeping
+        the gate unchanged means a drain window still fires a digest, and with
+        a zero numerator that digest DECAYS the EWA, so draining a backlog
+        heals the breaker instead of re-tripping it.
 
-        Task 1327 AFK hardening.
+        Both counters follow the same snapshot discipline: callbacks fire
+        inline on the asyncio event loop thread, so there are no real
+        concurrent writers — the snapshots at step 2 guard against the logical
+        interleaving where a callback runs at an await point inside this
+        function, not against torn integer writes.  Snapshotting once at step 2
+        makes the threshold check and the advance consistent — concurrent
+        callbacks cannot cause a "double-skip" where the advance overshoots the
+        events that triggered this digest.  The counters are best-effort
+        observability; a small drift is acceptable.
+
+        Task 1327 AFK hardening; task 4559 gate/numerator split.
         """
         try:
             # (1) Early-return if disabled.
             if not self.config.digest_enabled:
                 return
 
-            # (2) Snapshot _escalation_event_count so the threshold check (3)
-            # and the advance (13) are consistent even if a concurrent callback
-            # increments the live counter between those two reads.
+            # (2) Snapshot both counters so the threshold check (3) and the
+            # advance (13) are consistent even if a concurrent callback
+            # increments a live counter between those two reads.  The
+            # submissions snapshot obeys the same once-at-entry discipline as
+            # the event snapshot (task 4559) — otherwise a submission arriving
+            # at an await point below would be skipped by the advance instead
+            # of counted in the next digest step.
             event_count_snapshot = self._escalation_event_count
+            submit_count_snapshot = self._escalation_submit_count
 
-            # (3) Early-return if not enough new events.
+            # (3) Early-return if not enough new events.  The GATE is the
+            # lifecycle-event diff (submits + resolves) — unchanged by task
+            # 4559, deliberately: see the two-counter note in the docstring.
             diff = event_count_snapshot - self._last_digest_event_count
             if diff < self.config.digest_every_n_escalations:
                 return
 
-            # (4) Snapshot escalation delta.
-            escalations_in_step = diff
+            # (4) Step deltas.  The EWA NUMERATOR is the submissions diff, not
+            # the lifecycle-event diff (task 4559): counting resolutions here
+            # meant a single escalation contributed twice and a backlog drain
+            # re-tripped the breaker that the backlog caused.  A pure-drain
+            # window yields 0 here, which update_ewa turns into pure decay.
+            submissions_in_step = submit_count_snapshot - self._last_digest_submit_count
 
             # (5) Compute window timestamps.
             window_end = datetime.now(UTC).isoformat()
@@ -15122,7 +15147,7 @@ class Harness:
             # source of truth so the EWA input matches the rendered digest figure.
             new_ewa = digest_mod.update_ewa(
                 prev_ewa=self._ewa_value,
-                escalations_in_step=escalations_in_step,
+                escalations_in_step=submissions_in_step,
                 done_in_step=done_count,
                 alpha=self.config.digest_ewa_alpha,
             )
@@ -15180,6 +15205,7 @@ class Harness:
             # silently skipped — they will be counted in the next digest step.
             self._ewa_value = new_ewa
             self._last_digest_event_count = event_count_snapshot
+            self._last_digest_submit_count = submit_count_snapshot
             self._last_digest_window_end_iso = window_end
 
             # (14) EWA trip: pause scheduler AFTER the digest is written so the

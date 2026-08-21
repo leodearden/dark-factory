@@ -1665,6 +1665,10 @@ class TestHarnessMaybeWriteDigest:
         # diff=5 >= 3 → should trigger
         harness._escalation_event_count = 5
         harness._last_digest_event_count = 0
+        # Task 4559: the EWA numerator is the submissions counter, so a fixture
+        # modelling real escalations must set it alongside the gate counter.
+        harness._escalation_submit_count = 5
+        harness._last_digest_submit_count = 0
 
         await harness._maybe_write_digest()
 
@@ -1920,6 +1924,10 @@ class TestHarnessEwaTrip:
         # 1 new escalation, 0 done → EWA = 1.0*(1/1) = 1.0 >= 0.01
         harness._escalation_event_count = 1
         harness._last_digest_event_count = 0
+        # Task 4559: the EWA numerator is the submissions counter, so a fixture
+        # modelling real escalations must set it alongside the gate counter.
+        harness._escalation_submit_count = 1
+        harness._last_digest_submit_count = 0
 
         await harness._maybe_write_digest()
 
@@ -1958,6 +1966,12 @@ class TestHarnessEwaTrip:
         harness.cost_store = await _cost_store_factory()
         harness._escalation_event_count = 1
         harness._last_digest_event_count = 0
+        # Task 4559: the EWA numerator is the submissions counter, so a fixture
+        # modelling real escalations must set it alongside the gate counter.
+        # Without it the EWA would be 0 and the trip would never fire, so this
+        # test would pass vacuously rather than proving the already-paused skip.
+        harness._escalation_submit_count = 1
+        harness._last_digest_submit_count = 0
 
         # Pre-pause the scheduler.
         await harness.pause_scheduler('pre-existing-pause')
@@ -1987,6 +2001,10 @@ class TestHarnessEwaTrip:
         harness.cost_store = await _cost_store_factory()
         harness._escalation_event_count = 1
         harness._last_digest_event_count = 0
+        # Task 4559: the EWA numerator is the submissions counter, so a fixture
+        # modelling real escalations must set it alongside the gate counter.
+        harness._escalation_submit_count = 1
+        harness._last_digest_submit_count = 0
 
         await harness._maybe_write_digest()
 
@@ -2141,6 +2159,10 @@ class TestHarnessDigestDoneCountSource:
         harness.cost_store = await _cost_store_factory()
         harness._escalation_event_count = 1
         harness._last_digest_event_count = 0
+        # Task 4559: the EWA numerator is the submissions counter, so a fixture
+        # modelling real escalations must set it alongside the gate counter.
+        harness._escalation_submit_count = 1
+        harness._last_digest_submit_count = 0
 
         # Seed EventStore with 4 task_completed rows with outcome='done' inside
         # the 24h default window (timestamps 10–13 minutes in the past).
