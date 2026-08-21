@@ -505,6 +505,13 @@ _AMENDMENT_TRUNCATION_ANCHOR_TASK_ID = 'l2-amendment-truncation'
 _MARKUP_RESIDUE_ANCHOR_TASK_ID = 'mcp-markup-residue'
 _MARKUP_STORM_ANCHOR_TASK_ID = 'mcp-markup-storm'
 
+# The burst alarm's own category. Named once because it is written on the way
+# IN (the record this sink files) and read on the way OUT (the dedup predicate
+# asking whether this guard's own alarm is already open) — and a dedup that
+# matches on a second spelling of the category it writes silently stops
+# deduping, which is the failure mode that is hardest to notice from the queue.
+_MARKUP_STORM_CATEGORY = 'mcp_markup_storm'
+
 # The sentinel role these records are filed under.  A born-at-L2 record must
 # carry a role in ``_HARNESS_SENTINEL_ROLE_PREFIXES`` — the same contract
 # ``submit.py`` enforces at its argument boundary for the file-backed CLI, and
@@ -519,6 +526,33 @@ _MARKUP_GUARD_AGENT_ROLE = 'harness-markup-guard'
 # escalation is born at L2 *when* its severity is in that set, so a level=2
 # record carrying 'info' would be internally incoherent to every reader of the
 # consumer-per-level contract.
+#
+# THE SIBLING GUARDS FILE THE SAME RECORD CLASS AT 'blocking'
+# (``orchestrator.mcp.markup_sink.file_residue``), and that is ONE rule
+# resolving two ways, not two sites disagreeing.  The rule is the sentinel-role
+# gate directly below — ``_is_harness_sentinel_role`` — which this repo applies
+# wherever a born-at-L2 severity is minted: ``_chokepoint_or_submit`` downgrades
+# critical/urgent to 'blocking' for any non-sentinel role, and ``submit.py``
+# rejects a non-sentinel ``--agent-role`` outright.  This guard runs INSIDE the
+# escalation server and files as ``harness-markup-guard``, a sentinel; the
+# orchestrator-side guards file as ``plan-tools-markup-guard`` /
+# ``verdict-tools-markup-guard``, which are not, so 'blocking' is the only
+# severity those records may legally carry.  Both sites reach the queue through
+# a direct ``queue.submit`` that bypasses the gate, so each honours the rule by
+# construction rather than by being checked — which is exactly why the answer is
+# written down at both, and why neither may be "made to match" the other by
+# changing the severity alone.
+#
+# The severity is NOT the flood control, and must not be mistaken for it: an
+# actively running leak files one undeduped level=2 record per refused call, and
+# ``escalation.watcher`` emits one notification per pending L2 (it exits after
+# the first match and re-arms), so N refusals page N times regardless of which
+# born-at-L2 severity is written.  Batching that channel is the L2 watcher's own
+# concern — see the digest rule in ``skills/escalation-watcher/SKILL.md`` and the
+# rolling-window ceiling ``scripts/dashboard-watchdog.py`` already keeps — and
+# filed as follow-up work rather than fixed here, because the alternative inside
+# this sink is to dedup residue records, which destroys the one payload each of
+# them exists to preserve.
 _MARKUP_RESIDUE_SEVERITY = 'critical'
 
 
@@ -814,6 +848,19 @@ def create_server(
         A read failure falls THROUGH to filing rather than bailing: losing
         duplicate suppression is strictly better than losing the alarm for an
         actively running leak.
+
+        The open-record test is "is MY alarm already open", never "is anything
+        pending on this anchor", and the difference is measured rather than
+        theoretical. The anchor is a SYNTHETIC id, so nothing reserves it and
+        any producer of SYSTEM-scoped records may land one there;
+        ``markup_tripwire``'s own docstring records what a category-blind test
+        then costs — it "filed nothing 2026-08-16..2026-08-19 while 41
+        rejections occurred" because another producer held its shared anchor
+        open, and that silence read as calm. Both halves of the identity are
+        checked because both can differ independently: another PRODUCER's
+        record (any category), and a sibling guard's record (this category,
+        another server). ``getattr`` rather than attribute access so a record
+        shape that predates either field cannot raise on this path.
         """
         try:
             existing = queue.get_by_task(_MARKUP_STORM_ANCHOR_TASK_ID, status='pending')
@@ -823,12 +870,24 @@ def create_server(
                 'filing a new one rather than dropping the alarm',
             )
             existing = []
-        if existing:
+        mine = [
+            esc for esc in existing
+            if getattr(esc, 'category', None) == _MARKUP_STORM_CATEGORY
+            and getattr(esc, 'agent_role', None) == _MARKUP_GUARD_AGENT_ROLE
+        ]
+        if mine:
+            # Sorted by id, not `mine[0]`: get_by_task's order comes from a
+            # directory glob, so folding into "whichever came back first" would
+            # make the id this returns — the one a caller is told to look up —
+            # depend on filesystem enumeration order. The ids carry a
+            # monotonic sequence, so the lowest is the record that opened the
+            # alarm.
+            open_alarm = min(mine, key=lambda esc: esc.id)
             logger.info(
                 'markup guard: %s already open (storm %r now); not duplicating',
-                existing[0].id, record,
+                open_alarm.id, record,
             )
-            return existing[0].id
+            return open_alarm.id
 
         outcome = record.get('outcome')
         return queue.submit(Escalation(
@@ -839,7 +898,7 @@ def create_server(
             # a condition, and markup_tripwire's storm record is filed the same
             # way. The residue records it accompanies carry the L2 routing.
             severity='blocking',
-            category='mcp_markup_storm',
+            category=_MARKUP_STORM_CATEGORY,
             summary=(
                 f'{record.get("count")} {outcome} MCP call(s) in '
                 f'{record.get("window_seconds")}s for project='

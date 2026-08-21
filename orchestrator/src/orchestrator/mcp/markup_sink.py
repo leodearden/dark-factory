@@ -298,9 +298,25 @@ def file_residue(
         id=queue.make_id(spec.residue_anchor_task_id),
         task_id=spec.residue_anchor_task_id,
         agent_role=spec.agent_role,
-        # Anything above `blocking` is downgraded at the escalation chokepoint,
-        # so `blocking` is the correct filing severity even for the level-2
-        # record the middleware declares.
+        # 'blocking' even for the level-2 record the middleware declares, and
+        # the reason is the SENTINEL-ROLE rule, not squeamishness: a born-at-L2
+        # severity (`escalation.models.BORN_AT_L2_SEVERITIES`) is legal only for
+        # a role in `escalation.server._HARNESS_SENTINEL_ROLE_PREFIXES`, which
+        # `_chokepoint_or_submit` enforces by downgrading and `submit.py` by
+        # rejecting. Every spec on this module's callers files under its own
+        # server-named role (`plan-tools-markup-guard`,
+        # `verdict-tools-markup-guard`) — deliberately, so a reader can tell
+        # WHICH boundary leaked — and none of those is a sentinel, so 'blocking'
+        # is the only severity these records may legally carry.
+        #
+        # The guard registered INSIDE the escalation server files the same
+        # record class at 'critical' (`escalation.server._MARKUP_RESIDUE_SEVERITY`)
+        # because it files as `harness-markup-guard`, which IS a sentinel. That
+        # is one rule resolving two ways, not two sites disagreeing; neither may
+        # be "made to match" the other by changing the severity alone, because
+        # the severity follows the role. Both sites reach the queue through a
+        # direct `submit` that bypasses the gate, so each honours the rule by
+        # construction rather than by being checked.
         severity='blocking',
         # The middleware OWNS this vocabulary (INV-7). A second site re-deciding
         # a record's category or level is exactly the two-mechanisms-on-one-
