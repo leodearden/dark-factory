@@ -275,6 +275,143 @@ async def _record_effect_divergence(
         )
 
 
+#: Per-check differential verdicts recorded in
+#: ``probe['delivered_checks_legs']`` (task 3116).  ``'made_true_by_this_commit'``
+#: is the only one that confirms; every other value is explicitly NO SIGNAL,
+#: never evidence against a landing.
+_DIFFERENTIAL_CONFIRMED = 'made_true_by_this_commit'
+
+
+async def _delivered_checks_differential(
+    git_ops: GitOps,
+    effect_check_sha: str,
+    delivered_checks: list[dict[str, Any]],
+    probe: dict[str, Any],
+) -> bool:
+    """The SECOND accept path: did *effect_check_sha* MAKE a declared
+    capability true? (task 3116 part b.)
+
+    Threshold line survival (``commit_effect_present_in_main``) recovers most
+    of the false-positive class, but it remains a heuristic over line sets.
+    This is orthogonal POSITIVE evidence, and it is the task's OWN declared
+    ground truth: run each ``metadata.delivered_checks`` entry at three refs —
+
+        ``<sha>^1``   the pre-merge parent (first parent of a merge; the
+                      commit's own parent for a non-merge — ``^1`` is both)
+        ``<sha>``     the citation itself
+        ``main``      current HEAD
+
+    — and confirm when a check was FALSE at the parent, TRUE at the citation
+    and TRUE now.  That sequence is the whole signal: a check that merely
+    passes at main proves nothing, because the capability may have arrived by
+    any other route or have been true all along.  Only the three legs together
+    say THIS commit made it true, which no amount of line-set decay can argue
+    with.
+
+    **UPGRADE-ONLY.**  This is called from inside the ``effect_absent`` reject
+    branch and nowhere else, so it is structurally incapable of rejecting a
+    landing that survival accepted — the rule holds by construction rather
+    than by care.  That matters because the stored checks are NOT trustworthy
+    input: they rot when a path is renamed (erroring forever), they are
+    sometimes written broad enough to have been true before the merge, and 2
+    of the 458 live entries are ``script`` kind, which takes no ref at all.
+    Every one of those degrades to NO SIGNAL.
+
+    ``expect`` is honoured ONE LAYER DOWN and must not be re-applied here.
+    :func:`~orchestrator.delivered_checks.run_delivered_check` already
+    resolves it (for ``expect='absent'`` it is NO-match that means DELIVERED),
+    so the leg pattern reads uniformly for both expects.  Inverting again for
+    the 43 stored ``expect='absent'`` checks would read a capability a LATER
+    commit removed as proof that this one delivered it — the exact
+    double-inversion this docstring exists to prevent.
+
+    The ``main`` leg deliberately names the branch rather than a sha resolved
+    here: it asks whether the capability holds at HEAD *now*, which is the
+    question, and it matches ``run_delivered_check``'s own contract (grep is
+    evaluated against the committed tree at *ref*).  The first two legs are
+    immutable history, so a HEAD advance mid-differential can only change the
+    freshness of the third, not the "this commit made it true" core.
+
+    LAZY import (``# noqa: PLC0415``), mirroring
+    :func:`file_unattributed_landing_escalation`'s ``escalation.models``
+    import: this module deliberately imports nothing from ``orchestrator`` at
+    module level (see the module docstring) because
+    ``orchestrator.delivered_checks`` imports ``orchestrator.git_ops``, and a
+    module-level edge here would re-create the harness<->merge_queue cycle
+    this module was extracted to avoid.
+
+    Writes ``delivered_checks_legs`` (every check's three-leg outcome) and
+    ``delivered_checks_outcome`` (``'confirmed'`` / ``'no_signal'``) into
+    *probe*, so the escalation can say "capability X was made true by this
+    merge" or state plainly that there was no signal.  Returns True only on a
+    confirmation; any exception is contained, recorded in
+    ``delivered_checks_error`` and logged, and declines the upgrade — the
+    fail-safe direction for an accept path is to not accept.
+    """
+    from orchestrator.delivered_checks import (  # noqa: PLC0415
+        DeliveredCheckResult,
+        run_delivered_check,
+    )
+
+    legs: list[dict[str, Any]] = []
+    confirmed = False
+    try:
+        parent_ref = f'{effect_check_sha}^1'
+        for check in delivered_checks:
+            kind = check.get('kind')
+            if kind != 'grep':
+                # A script check execs against the LIVE CHECKOUT and takes no
+                # ref, so it cannot express a differential at all: running it
+                # three times would answer identically each time.  Recorded as
+                # an explicit carve-out rather than silently dropped.
+                legs.append({
+                    'name': check.get('name'),
+                    'kind': kind,
+                    'verdict': (
+                        'script_kind_no_signal' if kind == 'script'
+                        else 'unsupported_kind_no_signal'
+                    ),
+                })
+                continue
+            results = {}
+            for label, ref in (
+                ('parent', parent_ref),
+                ('citation', effect_check_sha),
+                ('main', 'main'),
+            ):
+                results[label] = await run_delivered_check(
+                    check, project_root=git_ops.project_root, ref=ref,
+                )
+            made_true = (
+                results['parent'] is DeliveredCheckResult.FAILED
+                and results['citation'] is DeliveredCheckResult.DELIVERED
+                and results['main'] is DeliveredCheckResult.DELIVERED
+            )
+            confirmed = confirmed or made_true
+            legs.append({
+                'name': check.get('name'),
+                'kind': kind,
+                'expect': check.get('expect'),
+                'parent': results['parent'].value,
+                'citation': results['citation'].value,
+                'main': results['main'].value,
+                'verdict': _DIFFERENTIAL_CONFIRMED if made_true else 'no_signal',
+            })
+    except Exception as exc:
+        # Contained but NOT swallowed (structured-facts-at-failure): the whole
+        # differential declines rather than upgrading on partial evidence.
+        confirmed = False
+        probe['delivered_checks_error'] = repr(exc)
+        logger.warning(
+            'delivered-checks differential failed for %s — the landing will '
+            'be reported as unattributed with no differential signal',
+            effect_check_sha, exc_info=True,
+        )
+    probe['delivered_checks_legs'] = legs
+    probe['delivered_checks_outcome'] = 'confirmed' if confirmed else 'no_signal'
+    return confirmed
+
+
 async def validate_landing_evidence(
     git_ops: GitOps,
     task_id: str,
@@ -283,6 +420,7 @@ async def validate_landing_evidence(
     branch_tip_sha: str | None,
     candidate_sha: str | None = None,
     pattern_template: str | None = None,
+    delivered_checks: list[dict[str, Any]] | None = None,
 ) -> LandingEvidenceVerdict:
     """Validate already-landed evidence for *task_id* on *branch*.
 
@@ -310,6 +448,20 @@ async def validate_landing_evidence(
             sha only.
         pattern_template: Optional override forwarded to
             ``find_task_citation_commit`` (DISCOVERY mode only).
+        delivered_checks: The task's ``metadata.delivered_checks`` list,
+            enabling the SECOND accept path (task 3116; see
+            :func:`_delivered_checks_differential`). THREE-STATE, and the
+            states are not interchangeable: ``None`` means NOT SUPPLIED — a
+            call site that has not been wired yet — while ``[]`` means
+            supplied by a task that declares no checks. Both are recorded in
+            ``probe['delivered_checks_state']`` so a permanently-unwired site
+            is distinguishable from a task with nothing to check; collapsing
+            them would leave the capstone task that makes this parameter
+            required with no signal to act on. Consulted ONLY on the
+            ``effect_absent`` reject path, so it can upgrade a rejection to an
+            acceptance and can NEVER do the reverse (b6: the interface stays
+            binary — omitting this parameter reproduces the pre-task behaviour
+            exactly).
 
     Returns:
         A :class:`LandingEvidenceVerdict`.
@@ -320,6 +472,15 @@ async def validate_landing_evidence(
         'branch_tip_sha': branch_tip_sha,
         'citation': None,
         'effect_check_sha': None,
+        # Supply state, recorded unconditionally — wiring is a property of the
+        # CALL SITE, not of the outcome, so an accepted verdict must show it
+        # too.  Otherwise the only way to learn a site is unwired is to wait
+        # for it to reject.
+        'delivered_checks_state': (
+            'unwired' if delivered_checks is None
+            else 'evaluated' if delivered_checks
+            else 'none_declared'
+        ),
     }
 
     def _reject(reason: str) -> LandingEvidenceVerdict:
@@ -343,6 +504,13 @@ async def validate_landing_evidence(
         probe['effect_check_sha'] = candidate_sha
         if not await git_ops.commit_effect_present_in_main(candidate_sha):
             await _record_effect_divergence(git_ops, candidate_sha, probe)
+            # SECOND ACCEPT PATH, and it lives INSIDE the reject branch on
+            # purpose: a differential can only ever rescue a rejection, never
+            # produce one (task 3116).
+            if delivered_checks and await _delivered_checks_differential(
+                git_ops, candidate_sha, delivered_checks, probe,
+            ):
+                return _accept(candidate_sha)
             return _reject('effect_absent')
         return _accept(candidate_sha)
 
@@ -392,6 +560,13 @@ async def validate_landing_evidence(
     probe['effect_check_sha'] = effect_check_sha
     if not await git_ops.commit_effect_present_in_main(effect_check_sha):
         await _record_effect_divergence(git_ops, effect_check_sha, probe)
+        # SECOND ACCEPT PATH — anchored on the sha the survival check actually
+        # ran against, so both modes ask the same question.  Inside the reject
+        # branch, so it is structurally upgrade-only (task 3116).
+        if delivered_checks and await _delivered_checks_differential(
+            git_ops, effect_check_sha, delivered_checks, probe,
+        ):
+            return _accept(citation)
         return _reject('effect_absent')
 
     return _accept(citation)
@@ -441,6 +616,7 @@ def format_unattributed_landing_detail(
         verdict.reason, f'Unrecognized reason code: {verdict.reason}',
     )
     divergence_block, summary_fragment = _render_effect_divergence(verdict)
+    differential_block = _render_delivered_checks_differential(verdict)
     summary = (
         f'Task {task_id}: landing evidence on branch {branch!r} could not '
         f'be attributed ({verdict.reason}){summary_fragment}'
@@ -451,6 +627,7 @@ def format_unattributed_landing_detail(
         f'reason: {verdict.reason}\n'
         f'{explanation}\n\n'
         f'{divergence_block}'
+        f'{differential_block}'
         f'probe: {verdict.probe}\n\n'
         'The task was NOT marked done. It is left pending (or flipped to '
         'pending by the coalesce re-drive, from merge-deferred), which means '
@@ -527,6 +704,69 @@ def _render_effect_divergence(
     if len(paths) > 1:
         fragment += f' +{len(paths) - 1} more'
     return block, fragment
+
+
+def _render_delivered_checks_differential(
+    verdict: LandingEvidenceVerdict,
+) -> str:
+    """Render the delivered-checks differential outcome (task 3116 part b).
+
+    Returns a detail block, or ``''`` for a legacy ``probe`` predating the
+    key so a caller constructing one still renders cleanly.
+
+    The UNWIRED state is named EXPLICITLY, and separately from
+    ``none_declared``.  Omitting it would hide precisely the degradation this
+    second accept path introduces: a call site nobody wired reads, in an
+    escalation, exactly like a task that declares nothing to check — and the
+    two are fixed by different people.  An unwired site is an orchestrator
+    gap; a task with no checks is a task-authoring gap.
+    """
+    state = verdict.probe.get('delivered_checks_state')
+    if state is None:
+        return ''
+    if state == 'unwired':
+        return (
+            'delivered-checks differential: NOT RUN — this call site is '
+            'unwired (it passes no delivered_checks), so the second accept '
+            'path could not be attempted. If this landing is genuine, wiring '
+            "the site is what would let the task's own declared capability "
+            'checks confirm it.\n\n'
+        )
+    if state == 'none_declared':
+        return (
+            'delivered-checks differential: NOT RUN — this task declares '
+            'no delivered_checks, so there is no capability to confirm it '
+            'delivered. Declaring one would give this landing a second, '
+            'independent way to be accepted.\n\n'
+        )
+
+    outcome = verdict.probe.get('delivered_checks_outcome')
+    if outcome is None:
+        # Checks were supplied but the differential never ran — the survival
+        # check accepted, so there was nothing to rescue.
+        return (
+            'delivered-checks differential: not consulted (the effect check '
+            'did not reject).\n\n'
+        )
+    lines = [f'delivered-checks differential: {outcome}']
+    for leg in verdict.probe.get('delivered_checks_legs') or []:
+        name = leg.get('name')
+        if 'parent' not in leg:
+            lines.append(f'  - {name}: {leg.get("verdict")}')
+            continue
+        lines.append(
+            f'  - {name}: parent={leg.get("parent")} '
+            f'citation={leg.get("citation")} main={leg.get("main")} '
+            f'-> {leg.get("verdict")}'
+        )
+    error = verdict.probe.get('delivered_checks_error')
+    if error:
+        lines.append(f'  differential error: {error}')
+    lines.append(
+        '  (a check must FAIL at the parent and PASS at both the citation '
+        'and main to confirm — a static pass at main proves nothing)'
+    )
+    return '\n'.join(lines) + '\n\n'
 
 
 def file_unattributed_landing_escalation(

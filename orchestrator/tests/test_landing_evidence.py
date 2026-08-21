@@ -709,6 +709,57 @@ class TestFormatUnattributedLandingDetail:
         assert 'dispatch' in lowered
         assert 'agent' in lowered
 
+    def test_detail_names_the_unwired_state_explicitly(self) -> None:
+        """(e)/step-16.7 — the escalation must SAY when the second accept path
+        could not run because this call site supplies no checks.  Silently
+        omitting it would hide exactly the degradation the amendment warns
+        about: a permanently unwired site looks like a task with nothing to
+        check.
+        """
+        verdict = LandingEvidenceVerdict(
+            accepted=False, evidence_sha=None, reason='effect_absent',
+            probe={
+                'task_id': '42', 'diverged_paths': ['shared/manifest.py'],
+                'delivered_checks_state': 'unwired',
+            },
+        )
+
+        _summary, detail = format_unattributed_landing_detail('42', 'task/42', verdict)
+
+        assert 'delivered-checks differential' in detail
+        assert 'unwired' in detail
+
+    def test_detail_distinguishes_none_declared_from_unwired(self) -> None:
+        """A task that declares no checks is a TASK-AUTHORING gap; an unwired
+        call site is an ORCHESTRATOR gap.  They are fixed by different people,
+        so the escalation must not render them identically.
+        """
+        def _detail(state: str, **extra: object) -> str:
+            probe = {'task_id': '42', 'diverged_paths': [], 'delivered_checks_state': state}
+            probe.update(extra)
+            return format_unattributed_landing_detail(
+                '42', 'task/42',
+                LandingEvidenceVerdict(
+                    accepted=False, evidence_sha=None, reason='effect_absent',
+                    probe=probe,
+                ),
+            )[1]
+
+        unwired = _detail('unwired')
+        none_declared = _detail('none_declared')
+        evaluated = _detail(
+            'evaluated',
+            delivered_checks_outcome='no_signal',
+            delivered_checks_legs=[{
+                'name': 'cap-x', 'verdict': 'no_signal',
+                'parent': 'failed', 'citation': 'failed', 'main': 'failed',
+            }],
+        )
+
+        assert unwired != none_declared
+        assert 'no delivered_checks' in none_declared
+        assert 'cap-x' in evaluated
+
 
 class TestFileUnattributedLandingEscalationDedup:
     """Category-scoped L1 dedup (task 3116).
@@ -1264,54 +1315,3 @@ class TestValidateLandingEvidenceDeliveredChecksDifferential:
         assert calls == [], 'an unwired call site must issue no check subprocesses'
         # The effect_absent diagnostics from Part A are untouched by Part B.
         assert rejected.probe['diverged_paths'] == ['shared/manifest.py']
-
-    def test_detail_names_the_unwired_state_explicitly(self) -> None:
-        """(e)/step-16.7 — the escalation must SAY when the second accept path
-        could not run because this call site supplies no checks.  Silently
-        omitting it would hide exactly the degradation the amendment warns
-        about: a permanently unwired site looks like a task with nothing to
-        check.
-        """
-        verdict = LandingEvidenceVerdict(
-            accepted=False, evidence_sha=None, reason='effect_absent',
-            probe={
-                'task_id': '42', 'diverged_paths': ['shared/manifest.py'],
-                'delivered_checks_state': 'unwired',
-            },
-        )
-
-        _summary, detail = format_unattributed_landing_detail('42', 'task/42', verdict)
-
-        assert 'delivered-checks differential' in detail
-        assert 'unwired' in detail
-
-    def test_detail_distinguishes_none_declared_from_unwired(self) -> None:
-        """A task that declares no checks is a TASK-AUTHORING gap; an unwired
-        call site is an ORCHESTRATOR gap.  They are fixed by different people,
-        so the escalation must not render them identically.
-        """
-        def _detail(state: str, **extra: object) -> str:
-            probe = {'task_id': '42', 'diverged_paths': [], 'delivered_checks_state': state}
-            probe.update(extra)
-            return format_unattributed_landing_detail(
-                '42', 'task/42',
-                LandingEvidenceVerdict(
-                    accepted=False, evidence_sha=None, reason='effect_absent',
-                    probe=probe,
-                ),
-            )[1]
-
-        unwired = _detail('unwired')
-        none_declared = _detail('none_declared')
-        evaluated = _detail(
-            'evaluated',
-            delivered_checks_outcome='no_signal',
-            delivered_checks_legs=[{
-                'name': 'cap-x', 'verdict': 'no_signal',
-                'parent': 'failed', 'citation': 'failed', 'main': 'failed',
-            }],
-        )
-
-        assert unwired != none_declared
-        assert 'no delivered_checks' in none_declared
-        assert 'cap-x' in evaluated
