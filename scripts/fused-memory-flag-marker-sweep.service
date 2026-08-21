@@ -7,6 +7,28 @@ Type=oneshot
 # All logic lives in the committed wrapper script -- the unit itself is a
 # thin systemd shell around it (mirrors scripts/legibility-trickle@.service).
 WorkingDirectory=/home/leo/src/dark-factory
+# The .timer sets Persistent=true, so a nightly firing missed while the
+# machine was asleep/offline is caught up at BOOT -- and a boot-time systemd
+# user service still has the user manager's MINIMAL PATH, because the login
+# session has not yet pushed the user PATH into it. Without this line the
+# wrapper's `uv` (which lives in /home/leo/.local/bin) was not found and the
+# catch-up run died:
+#
+#   Aug 18 09:02:44 ... fused-memory-flag-marker-sweep.sh[65377]:
+#       .../fused-memory-flag-marker-sweep.sh: line 46: exec: uv: not found
+#   Aug 18 09:02:44 ... fused-memory-flag-marker-sweep.service:
+#       Main process exited, code=exited, status=127/n/a
+#
+# (The next normal timer firing, Aug 19 03:34:58, succeeded -- which is what
+# localises the fault to the boot catch-up path.) Value copied verbatim from
+# scripts/orchestrator-dark-factory.service and its seven sibling
+# orchestrator units so the fleet keeps ONE spelling of this PATH.
+#
+# Belt-and-braces with the wrapper's own absolute-`uv` resolution (task 2917
+# EDIT 3): this unit-level PATH additionally covers everything ELSE the
+# wrapper shells out to (systemctl, grep, cut), while the wrapper-level
+# resolution survives a STALE installed unit that predates this line.
+Environment=PATH=/home/leo/.cargo/bin:/home/leo/.local/npm-global/bin:/usr/local/cuda-12.6/bin:/home/leo/.local/bin:/home/leo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
 ExecStart=/home/leo/src/dark-factory/scripts/fused-memory-flag-marker-sweep.sh
 StandardOutput=journal
 StandardError=journal
