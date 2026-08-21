@@ -28,6 +28,18 @@ _FAKE_RECORDER_SRC = '''#!/usr/bin/env python3
 fused-memory-flag-marker-sweep.sh. Records argv[1:] (the sweep script path
 and its flags) and a snapshot of os.environ into a JSON state file at
 $FAKE_SWEEP_STATE, then exits with $FAKE_SWEEP_EXIT_CODE (default 0).
+
+One executable serves BOTH call kinds the wrapper makes (task 2917 EDIT 1).
+When `--list-known-projects` is in argv it plays the RESOLUTION call: it
+prints each whitespace-separated entry of $FAKE_SWEEP_KNOWN_PROJECTS on its
+own line and exits $FAKE_SWEEP_LIST_EXIT_CODE (defaulting to 0 when that var
+named at least one project, else 1 -- mirroring the real script, which exits
+non-zero when the registry resolves empty). Otherwise it plays a SWEEP call
+and exits $FAKE_SWEEP_EXIT_CODE.
+
+The list-exit and sweep-exit seams are deliberately SEPARATE vars: the
+continue-after-failure test sets a non-zero SWEEP exit and must not
+simultaneously break project resolution.
 """
 import json
 import os
@@ -40,6 +52,14 @@ state.setdefault("calls", []).append(sys.argv[1:])
 state.setdefault("envs", []).append(dict(os.environ))
 with open(state_path, "w") as f:
     json.dump(state, f)
+
+if "--list-known-projects" in sys.argv[1:]:
+    known = os.environ.get("FAKE_SWEEP_KNOWN_PROJECTS", "").split()
+    for project_id in known:
+        print(project_id)
+    sys.exit(int(
+        os.environ.get("FAKE_SWEEP_LIST_EXIT_CODE", "0" if known else "1")
+    ))
 
 sys.exit(int(os.environ.get("FAKE_SWEEP_EXIT_CODE", "0")))
 '''
@@ -71,12 +91,22 @@ def _recorded_envs(state_path):
 # Script driver
 # ---------------------------------------------------------------------------
 
-def _run_wrapper(tmp_path, *, exit_code=0, extra_env=None, dotenv_contents=None):
+def _run_wrapper(
+    tmp_path, *, exit_code=0, extra_env=None, dotenv_contents=None,
+    project_ids="dark_factory",
+):
     """Run fused-memory-flag-marker-sweep.sh with FLAG_MARKER_SWEEP_CMD
     pointed at the fake recorder and REPO pointed at a tmp dir with no
     `.env` (so the wrapper's `source .env` is a no-op under test) -- unless
     `dotenv_contents` is given, in which case a `$REPO/.env` file with that
-    content is written first so the sourcing branch itself is exercised."""
+    content is written first so the sourcing branch itself is exercised.
+
+    `project_ids` seeds FLAG_MARKER_SWEEP_PROJECT_IDS, the explicit override
+    for the per-project sweep loop (task 2917 EDIT 1). It defaults to the
+    single `dark_factory` so every pre-existing single-call test keeps its
+    one-call contract; pass None to leave the var UNSET (and scrubbed from
+    the inherited environment) and exercise the wrapper's own registry
+    resolution instead."""
     bin_dir, state_path = _fake_recorder(tmp_path)
 
     fake_repo = tmp_path / "fake-repo"
@@ -90,6 +120,10 @@ def _run_wrapper(tmp_path, *, exit_code=0, extra_env=None, dotenv_contents=None)
     env["FAKE_SWEEP_STATE"] = str(state_path)
     env["FAKE_SWEEP_EXIT_CODE"] = str(exit_code)
     env["REPO"] = str(fake_repo)
+    if project_ids is None:
+        env.pop("FLAG_MARKER_SWEEP_PROJECT_IDS", None)
+    else:
+        env["FLAG_MARKER_SWEEP_PROJECT_IDS"] = project_ids
     if extra_env:
         env.update(extra_env)
 
@@ -126,6 +160,10 @@ def test_wrapper_invokes_sweep_with_apply_and_terminal_drain(tmp_path):
     ), f"Expected the sweep script path in argv={argv!r}"
     assert "--apply" in argv, f"argv={argv!r}"
     assert "--terminal-drain" in argv, f"argv={argv!r}"
+    # Task 2917 EDIT 1: every sweep invocation is now explicitly scoped to a
+    # project_id rather than riding the sweep parser's own default.
+    assert "--project-id" in argv, f"argv={argv!r}"
+    assert argv[argv.index("--project-id") + 1] == "dark_factory", f"argv={argv!r}"
 
 
 def test_wrapper_propagates_nonzero_exit(tmp_path):
@@ -238,6 +276,12 @@ def test_wrapper_default_prefix_invokes_uv_run_frozen_project(tmp_path):
     env["FAKE_SWEEP_STATE"] = str(state_path)
     env["REPO"] = str(fake_repo)
     env.pop("FLAG_MARKER_SWEEP_CMD", None)
+    # Pin the project list explicitly so this stays a test of the INTERPRETER
+    # PREFIX and nothing else: with the override unset the wrapper would make
+    # an extra `--list-known-projects` resolution call through this same fake
+    # `uv`, and the exactly-one-call assertion below would be measuring
+    # registry resolution rather than argv quoting.
+    env["FLAG_MARKER_SWEEP_PROJECT_IDS"] = "dark_factory"
 
     result = subprocess.run(
         ["bash", str(WRAPPER)],
@@ -252,7 +296,7 @@ def test_wrapper_default_prefix_invokes_uv_run_frozen_project(tmp_path):
     assert calls[0] == [
         "run", "--frozen", "--project", str(fake_fm), "python",
         str(fake_fm / "scripts" / "sweep_orphan_flag_markers.py"),
-        "--apply", "--terminal-drain",
+        "--apply", "--terminal-drain", "--project-id", "dark_factory",
     ], f"argv={calls[0]!r}"
 
 
@@ -347,4 +391,84 @@ def test_wrapper_fails_loud_when_uv_cannot_be_resolved(tmp_path):
     )
     assert "uv" in result.stderr, (
         f"Expected the diagnostic to name `uv`; stderr={result.stderr!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# step-9: RED -- the per-project sweep loop (task 2917 EDIT 1)
+# ---------------------------------------------------------------------------
+
+def _project_ids_of(calls):
+    """Extract the --project-id value from each recorded SWEEP call (the
+    resolution call, which carries --list-known-projects, is skipped)."""
+    out = []
+    for argv in calls:
+        if "--list-known-projects" in argv:
+            continue
+        assert "--project-id" in argv, f"sweep call without --project-id: {argv!r}"
+        out.append(argv[argv.index("--project-id") + 1])
+    return out
+
+
+def test_wrapper_sweeps_every_configured_project_id(tmp_path):
+    """The defect this closes: the wrapper used to `exec` the sweep exactly
+    ONCE, with no --project-id, so it rode the sweep parser's own
+    `dark_factory` default while the per-project census output read as if the
+    whole fleet had been drained. Every registered project must get its own
+    invocation."""
+    result, state_path = _run_wrapper(tmp_path, project_ids="dark_factory reify")
+
+    assert result.returncode == 0, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+
+    calls = _recorded_calls(state_path)
+    swept = _project_ids_of(calls)
+    assert sorted(swept) == ["dark_factory", "reify"], (
+        f"Expected exactly one sweep per configured project_id; "
+        f"swept={swept!r} calls={calls!r}"
+    )
+    for argv in calls:
+        if "--list-known-projects" in argv:
+            continue
+        assert "--apply" in argv and "--terminal-drain" in argv, (
+            f"Every per-project sweep keeps the nightly drain argv; argv={argv!r}"
+        )
+
+    # Census honesty: the journal must name each project actually swept, so an
+    # operator can read coverage off the log rather than inferring it.
+    combined = result.stdout + result.stderr
+    for project_id in ("dark_factory", "reify"):
+        assert f"project_id={project_id}" in combined, (
+            f"Expected a per-project progress line naming {project_id!r}; "
+            f"stdout={result.stdout!r} stderr={result.stderr!r}"
+        )
+
+
+def test_wrapper_continues_sweeping_after_one_project_fails(tmp_path):
+    """A failing project must not silently truncate the fleet sweep. The
+    wrapper drops `exec` and does NOT `set -e` out of the loop: every project
+    is still attempted, the failure is named on stderr, and the overall exit
+    is non-zero so a partial nightly drain is loud rather than swallowed."""
+    result, state_path = _run_wrapper(
+        tmp_path, exit_code=7, project_ids="dark_factory reify",
+    )
+
+    calls = _recorded_calls(state_path)
+    swept = _project_ids_of(calls)
+    assert sorted(swept) == ["dark_factory", "reify"], (
+        f"Expected BOTH projects to be attempted despite the first failing "
+        f"(no exec, no short-circuit); swept={swept!r} calls={calls!r}"
+    )
+    assert result.returncode != 0, (
+        f"Expected a non-zero overall exit when a project's sweep failed; "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert "ERROR:" in result.stderr, (
+        f"Expected an ERROR:-prefixed stderr line for the failing project; "
+        f"stderr={result.stderr!r}"
+    )
+    assert "dark_factory" in result.stderr, (
+        f"Expected the failing project_id to be named on stderr; "
+        f"stderr={result.stderr!r}"
     )

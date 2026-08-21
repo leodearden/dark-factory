@@ -2297,7 +2297,7 @@ class TestResolveTerminalTaskIds:
         )
 
         with caplog.at_level(logging.WARNING, logger='sweep_orphan_flag_markers'):
-            result = await _mod._resolve_terminal_task_ids()
+            result = await _mod._resolve_terminal_task_ids('dark_factory')
 
         assert result == set()
         assert not any(
@@ -2320,7 +2320,16 @@ class TestResolveTerminalTaskIds:
 
         monkeypatch.setattr(
             'fused_memory.config.schema.FusedMemoryConfig',
-            lambda: types.SimpleNamespace(taskmaster=object()),
+            # project_root is present so the primary-project guard (task 2917)
+            # resolves and MATCHES, letting the run reach the backend -- this
+            # test is about backend wiring, not about the guard.
+            lambda: types.SimpleNamespace(
+                taskmaster=types.SimpleNamespace(project_root='/srv/dark-factory'),
+            ),
+        )
+        monkeypatch.setattr(
+            'fused_memory.models.scope.resolve_project_id_for_root',
+            lambda _root: 'dark_factory',
         )
         monkeypatch.setattr(
             'fused_memory.backends.sqlite_task_backend.SqliteTaskBackend',
@@ -2328,7 +2337,7 @@ class TestResolveTerminalTaskIds:
         )
 
         with caplog.at_level(logging.WARNING, logger='sweep_orphan_flag_markers'):
-            result = await _mod._resolve_terminal_task_ids()
+            result = await _mod._resolve_terminal_task_ids('dark_factory')
 
         assert result == set()
         matching = [
@@ -2603,6 +2612,118 @@ class TestRunApplyStoreMutationPreflight:
             f'got: {[r.getMessage() for r in caplog.records]}'
         )
         memory_service.delete_memory.assert_not_awaited()
+
+
+class TestTerminalDrainIsPrimaryProjectOnly:
+    """--terminal-drain must never arm deletions in a project whose task
+    store this process does not own (task 2917, esc-2917-3 ruling).
+
+    The defect: `_resolve_terminal_task_ids` took no project argument and
+    resolved terminal ids from `config.taskmaster.project_root` -- ONE
+    project's task DB. `main` computed that set once and handed it to `run`,
+    which matched markers by PLAIN STRING MEMBERSHIP against whatever
+    `--project-id` it was sweeping. Once the wrapper began looping over the
+    registered fleet, a sibling project's marker whose task_id merely
+    COLLIDES with a terminal dark_factory id (ids are small integers; the
+    measured collision rate was ~96%) would be deleted -- unrecoverably,
+    since mem0 removes the Qdrant point BEFORE writing its SQLite history.
+
+    The ruling: terminal-drain stays scoped to the PRIMARY project (the one
+    whose taskmaster root this process is configured with); every other
+    registered project is swept AGE-ONLY. The guard lives here rather than in
+    the bash wrapper because this is the single chokepoint every caller --
+    including a direct CLI invocation -- passes through.
+    """
+
+    @staticmethod
+    def _rig(monkeypatch, *, primary_id='dark_factory'):
+        """Wire a config whose taskmaster root resolves to `primary_id`, plus a
+        stub backend that WOULD yield terminal ids if it were ever reached."""
+        seen: dict[str, Any] = {'constructed': 0, 'get_statuses_roots': []}
+
+        class _StubBackend:
+            def __init__(self, _cfg):
+                seen['constructed'] += 1
+
+            async def start(self):
+                return None
+
+            async def get_statuses(self, project_root):
+                seen['get_statuses_roots'].append(project_root)
+                return {'11': 'done', '12': 'pending', '13': 'cancelled'}
+
+            async def close(self):
+                return None
+
+        monkeypatch.setattr(
+            'fused_memory.config.schema.FusedMemoryConfig',
+            lambda: types.SimpleNamespace(
+                taskmaster=types.SimpleNamespace(project_root='/srv/dark-factory'),
+            ),
+        )
+        monkeypatch.setattr(
+            'fused_memory.models.scope.resolve_project_id_for_root',
+            lambda _root: primary_id,
+        )
+        monkeypatch.setattr(
+            'fused_memory.backends.sqlite_task_backend.SqliteTaskBackend',
+            _StubBackend,
+        )
+        return seen
+
+    @pytest.mark.asyncio
+    async def test_non_primary_project_gets_no_terminal_ids(self, monkeypatch, caplog):
+        """The escalation's own ask: sweeping `reify` must NOT receive
+        dark_factory's terminal task ids. Returning set() degrades that
+        project to an age-only sweep -- today's status quo, which self-drains
+        -- instead of arming a cross-project delete."""
+        seen = self._rig(monkeypatch, primary_id='dark_factory')
+
+        with caplog.at_level(logging.WARNING, logger='sweep_orphan_flag_markers'):
+            result = await _mod._resolve_terminal_task_ids('reify')
+
+        assert result == set(), (
+            f"Expected NO terminal ids for a non-primary project (they would be "
+            f"matched against reify's markers by plain string membership); "
+            f"got {result!r}"
+        )
+        assert seen['constructed'] == 0, (
+            'Expected the guard to short-circuit BEFORE the task backend is '
+            'even constructed, so no other project pays for a resolution it '
+            'must not use.'
+        )
+        messages = [
+            r.getMessage() for r in caplog.records
+            if r.name == 'sweep_orphan_flag_markers' and r.levelno == logging.WARNING
+        ]
+        assert messages, (
+            'A narrowed sweep must be LOUD: expected a WARNING, got '
+            f'{[r.getMessage() for r in caplog.records]}'
+        )
+        joined = ' '.join(messages)
+        assert 'reify' in joined and 'dark_factory' in joined, (
+            f'Expected the WARNING to name BOTH the swept project and the '
+            f'primary project so the journal explains the narrowing; got {joined!r}'
+        )
+        assert 'age-only' in joined, (
+            f'Expected the WARNING to state the sweep proceeds age-only; '
+            f'got {joined!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_primary_project_still_gets_its_terminal_ids(self, monkeypatch):
+        """The guard must not disarm the working case: the primary project's
+        sweep still resolves terminal ids exactly as before."""
+        seen = self._rig(monkeypatch, primary_id='dark_factory')
+
+        result = await _mod._resolve_terminal_task_ids('dark_factory')
+
+        assert result == {'11', '13'}, (
+            f'Expected the primary project to keep its terminal-drain set; '
+            f'got {result!r}'
+        )
+        assert seen['constructed'] == 1
+        assert seen['get_statuses_roots'] == ['/srv/dark-factory']
 
 
 class TestListKnownProjects:
