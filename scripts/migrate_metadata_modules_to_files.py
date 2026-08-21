@@ -180,6 +180,14 @@ class MigrationCounts(NamedTuple):
     copied: int
     sanitized_empty: int
     dropped: int
+    #: ``{status: carriers}`` for tasks in a deliberate skip status that STILL
+    #: carry ``metadata.modules``. Left untouched on purpose (PRD decision 1
+    #: keeps ``modules`` on terminal tasks as the only in-record trace of their
+    #: original scope, and update_task will not write them anyway) — but the
+    #: number is what makes "we deliberately left some behind" a checkable
+    #: claim rather than an assertion. Only statuses with at least one carrier
+    #: appear.
+    residual_by_status: dict[str, int]
 
     def merged_with(self, other: MigrationCounts) -> MigrationCounts:
         """Field-wise sum. Used to aggregate across project roots.
@@ -188,15 +196,43 @@ class MigrationCounts(NamedTuple):
         a field whose merge is not integer addition cannot be silently folded
         into a wrong one.
         """
+        residual = dict(self.residual_by_status)
+        for status, count in other.residual_by_status.items():
+            residual[status] = residual.get(status, 0) + count
         return MigrationCounts(
             visited=self.visited + other.visited,
             copied=self.copied + other.copied,
             sanitized_empty=self.sanitized_empty + other.sanitized_empty,
             dropped=self.dropped + other.dropped,
+            residual_by_status=residual,
         )
 
 
-EMPTY_COUNTS = MigrationCounts(visited=0, copied=0, sanitized_empty=0, dropped=0)
+def empty_counts() -> MigrationCounts:
+    """A zeroed :class:`MigrationCounts`.
+
+    A FACTORY, not a module-level constant: ``residual_by_status`` is a mutable
+    dict, and one shared instance handed to every early return and to
+    ``main_async``'s accumulator seed would let an unrelated caller's tally
+    leak across project boundaries. ``merged_with`` already copies rather than
+    mutates, but the constant would be one refactor away from being aliased
+    into something that does not.
+    """
+    return MigrationCounts(
+        visited=0, copied=0, sanitized_empty=0, dropped=0, residual_by_status={},
+    )
+
+
+def format_residuals(residual_by_status: dict[str, int]) -> str:
+    """Render a residual tally for the operator, sorted by status.
+
+    SORTED so two runs of the same corpus produce byte-comparable reports —
+    the committed run evidence is diffed across the before/after passes, and an
+    insertion-ordered dict repr would churn for no reason.
+    """
+    if not residual_by_status:
+        return 'none'
+    return ' '.join(f'{s}={n}' for s, n in sorted(residual_by_status.items()))
 
 #: Printed action label per outcome. The two copy-branch outcomes get DISTINCT
 #: labels so a per-task line is self-explaining without cross-referencing the
@@ -218,20 +254,32 @@ async def _migrate_one_project(
         )
     except Exception as exc:
         print(f'  [skip] get_tasks failed for {project_root}: {exc}', file=sys.stderr)
-        return EMPTY_COUNTS
+        return empty_counts()
 
     tasks = _flatten_tasks(tasks_result)
     # Done/cancelled tasks are immutable to update_task — skip them so the
     # migration log only reports tasks the server will actually touch.
+    # EXACT MATCH, never a prefix or substring test: `merge-deferred` contains
+    # `deferred` and is deliberately NOT a member — it is a live, processed
+    # status, and a `startswith`/`in`-the-string refactor would silently stop
+    # migrating the whole class.
     skip_statuses = {'done', 'cancelled', 'deferred'}
     visited = 0
     outcomes = {'copied': 0, 'sanitized_empty': 0, 'dropped': 0}
+    residual_by_status: dict[str, int] = {}
 
     for task in tasks:
-        if str(task.get('status', '')) in skip_statuses:
+        status = str(task.get('status', ''))
+        meta = task.get('metadata')
+        if status in skip_statuses:
+            # Count the carrier, then leave the task ENTIRELY alone. Counting
+            # only actual carriers, not every skipped task: the number answers
+            # "how many records still hold the retired key", and tallying the
+            # rest would inflate it by the project's whole finished history.
+            if isinstance(meta, dict) and meta.get('modules'):
+                residual_by_status[status] = residual_by_status.get(status, 0) + 1
             continue
         visited += 1
-        meta = task.get('metadata')
         if not isinstance(meta, dict):
             continue
         modules = meta.get('modules')
@@ -298,7 +346,9 @@ async def _migrate_one_project(
 
         outcomes[outcome] += 1
 
-    return MigrationCounts(visited=visited, **outcomes)
+    return MigrationCounts(
+        visited=visited, residual_by_status=residual_by_status, **outcomes,
+    )
 
 
 async def main_async(args: argparse.Namespace) -> int:
@@ -315,7 +365,7 @@ async def main_async(args: argparse.Namespace) -> int:
     print(f'Dry-run:  {args.dry_run}')
     print()
 
-    totals = EMPTY_COUNTS
+    totals = empty_counts()
     async with FusedMemoryClient(args.server_url) as client:
         for root in roots:
             print(f'Project: {root}')
@@ -331,11 +381,18 @@ async def main_async(args: argparse.Namespace) -> int:
                 f'sanitized_empty={counts.sanitized_empty} '
                 f'dropped_modules_only={counts.dropped}'
             )
+            print(
+                f'  residual_carriers_in_skip_statuses: '
+                f'{format_residuals(counts.residual_by_status)}'
+            )
             print()
 
     print('---- summary ----')
     for k, v in totals._asdict().items():
-        print(f'  {k}: {v}')
+        if k == 'residual_by_status':
+            print(f'  residual_carriers_in_skip_statuses: {format_residuals(v)}')
+        else:
+            print(f'  {k}: {v}')
     return 0
 
 
