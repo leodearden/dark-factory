@@ -481,9 +481,39 @@ def _default_poster(url: str, envelope: dict) -> None:
 
 def post_escalation(
     cfg: LegibilityConfig, summary: str, detail: str, *, poster=None,
+    level: int = logging.ERROR,
 ) -> bool:
     """Best-effort escalate_info POST for a fail-loud trigger (PRD decision
     8): extractor crash, coder storm, or commit failure.
+
+    JOURNALS THE PAIR FIRST, AT *level*, BEFORE ANYTHING ELSE HAPPENS.
+    That single line is the contract this function now carries: EVERY
+    escalation this module posts is written to the journal here, at the
+    call site's severity, before the envelope is built and before the POST
+    is attempted. Two properties fall out of putting it here rather than
+    at each of the six call sites, and neither survives a per-branch log
+    call:
+
+    * A future fail-loud branch CANNOT FORGET IT. The log sits on the only
+      path to the POST, so a new branch inherits journal visibility by
+      construction rather than by whoever adds it remembering.
+    * A DOWN ESCALATION SERVER NO LONGER COSTS THE DIAGNOSIS. On
+      2026-08-18 (esc-legibility-trickle-reify-3) the only copy of
+      "coder storm: 6/6 digests failed ... [Errno 2] No such file or
+      directory: claude" lived inside the archived escalation JSON, while
+      ``journalctl --user -u legibility-trickle@reify.service`` showed
+      nothing but an unexplained benign 400 and ``status=1/FAILURE``.
+      Ordering the write BEFORE the POST is what makes the reason durable
+      independent of whether the POST lands.
+
+    *detail* is logged IN FULL -- never truncated, never ``repr()``-ed.
+    ``census_trigger._bounded_repr`` is this package's precedent for
+    bounding text before a log sink and is deliberately not reused:
+    clipping the aggregate reason is precisely the defect this closes.
+    The ``'%s -- %s'`` grammar is carried verbatim from the two call sites
+    that already logged it, so the journal line shape (and any operator
+    grep keyed on it) is unchanged; no prefix is added because every
+    summary already begins with "legibility trickle".
 
     Posts an MCP ``tools/call`` JSON-RPC envelope for tool
     ``escalate_info`` to ``http://localhost:<cfg.escalation_port>/mcp``
@@ -494,6 +524,7 @@ def post_escalation(
     authoritative loud signal regardless of whether this POST succeeded.
     Returns True on a successful post.
     """
+    logger.log(level, '%s -- %s', summary, detail)
     poster_fn = poster if poster is not None else _default_poster
     url = f'http://localhost:{cfg.escalation_port}/mcp'
     arguments = _build_escalation_arguments(cfg, summary, detail)
