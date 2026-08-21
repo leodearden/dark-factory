@@ -445,3 +445,103 @@ def test_the_per_project_line_and_the_summary_both_name_sanitized_empty(monkeypa
     assert 'sanitized_empty' in per_project
     assert 'sanitized_empty: 1' in summary
     assert 'copied' in summary and 'dropped' in summary
+
+
+def _terminal(task_id: str, status: str, **meta: Any) -> dict:
+    """A task in one of the migration's deliberate skip statuses."""
+    return {'id': task_id, 'status': status, 'metadata': dict(meta)}
+
+
+def test_residual_carriers_in_skip_statuses_are_tallied_by_status():
+    """The skipped tasks are LEFT ALONE but COUNTED, per status.
+
+    PRD decision 1 keeps ``modules`` on terminal tasks deliberately — it is the
+    only in-record trace of a finished task's original scope, and
+    ``update_task`` will not write them anyway. But "we deliberately left some
+    behind" is only a defensible claim if the number is stated, which is what
+    the task requires in the PR and what the user-observable signal is judged
+    on: remaining carriers must be provably confined to these statuses.
+
+    Two things pinned at once, and both matter: the tally is BY STATUS (a
+    single scalar could not distinguish 400 done carriers from 400 cancelled
+    ones), and no ``update_task`` is recorded for any of them.
+    """
+    client = _CannedProject([
+        _terminal('d1', 'done', modules=['a/b.py']),
+        _terminal('d2', 'done', modules=['c/']),
+        _terminal('c1', 'cancelled', modules=['e/f.py']),
+        _terminal('f1', 'deferred', modules=['g/']),
+    ])
+
+    counts = _run(client)
+
+    assert counts.residual_by_status == {'done': 2, 'cancelled': 1, 'deferred': 1}
+    assert client.updates == []
+
+
+def test_the_residual_tally_counts_carriers_not_every_skipped_task():
+    """A skipped task with no ``modules`` is not a residual carrier.
+
+    The number in the PR answers "how many records still carry the retired
+    key", so counting every terminal task would inflate it by the entire
+    history of the project — on dark-factory that is the difference between a
+    handful and several hundred. A status with no carriers at all must be
+    ABSENT rather than present-and-zero, so the printed report names only
+    statuses that actually hold something.
+    """
+    client = _CannedProject([
+        _terminal('d1', 'done', modules=['a/b.py']),
+        _terminal('d2', 'done', priority='high'),
+        _terminal('d3', 'done'),
+        _terminal('c1', 'cancelled', files=['x/y.py']),
+    ])
+
+    counts = _run(client)
+
+    assert counts.residual_by_status == {'done': 1}
+
+
+def test_merge_deferred_is_processed_and_never_skipped():
+    """``merge-deferred`` is NOT a skip status. Pin the exact-match semantics.
+
+    ``deferred`` IS skipped and ``merge-deferred`` contains it as a substring,
+    so a refactor of ``in skip_statuses`` to a ``startswith``/substring test —
+    or to a "does the status mention deferred" heuristic — would silently stop
+    migrating a whole live status class, with no test failing and no operator
+    output changing except a number nobody has a baseline for. PRD open
+    question 1 states merge-deferred IS processed.
+
+    Asserted on the WRITE, not merely on ``visited``: being counted as visited
+    is not the same as being migrated.
+    """
+    client = _CannedProject([_task('m1', modules=['scripts/a.py'])])
+    client._tasks[0]['status'] = 'merge-deferred'
+
+    counts = _run(client)
+
+    assert _written(client, 'm1')['files'] == ['scripts/a.py']
+    assert counts.visited == 1
+    assert counts.residual_by_status == {}
+
+
+def test_the_residual_counts_reach_the_per_project_line_and_the_summary(monkeypatch, capsys):
+    """The by-status numbers have to be READ OFF the run, not reconstructed later.
+
+    The run evidence committed with this migration records residual carriers
+    per project and in aggregate; both come from this stdout. Ordering is
+    pinned as sorted-by-status so two runs of the same corpus produce
+    byte-comparable reports — an unordered dict repr would make the evidence
+    file churn for no reason and defeat a diff.
+    """
+    _run_main(monkeypatch, _CannedProject([
+        _terminal('d1', 'done', modules=['a/b.py']),
+        _terminal('d2', 'done', modules=['c/']),
+        _terminal('c1', 'cancelled', modules=['e/f.py']),
+        _task('p1', modules=['scripts/a.py']),
+    ]))
+
+    out = capsys.readouterr().out
+    per_project, summary = out.split('---- summary ----')
+    assert 'cancelled=1' in per_project and 'done=2' in per_project
+    assert per_project.index('cancelled=1') < per_project.index('done=2')
+    assert 'cancelled=1' in summary and 'done=2' in summary
