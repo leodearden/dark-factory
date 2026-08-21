@@ -76,6 +76,23 @@ def _bake_off() -> types.ModuleType:
     return _load_script(BAKE_OFF_PATH, 'bake_off_storage_shape')
 
 
+def _assert_reexported_from_bake_off(mod: types.ModuleType, name: str) -> None:
+    """INV-5: `mod.<name>` is the bake-off's definition, not a local restatement.
+
+    Asserts PROVENANCE, not object identity (task 4583).  `_load_script`
+    re-execs the source file on every call, so two loads of one file yield
+    equal-but-distinct function objects — and whichever instance ends up
+    registered in `sys.modules` is decided by xdist scheduling, not by the
+    invariant this check exists to protect.  Provenance is STRICTLY
+    STRONGER than `is` here: a local `def _cell` would shadow the PEP 562
+    `__getattr__` entirely and report `__module__ == 'read_transform_selection'`,
+    so the re-implementation INV-5 forbids is still caught, while a harmless
+    second module instance of the *same* source no longer trips it.
+    """
+    fn = getattr(mod, name)
+    assert (fn.__module__, fn.__qualname__) == ('bake_off_storage_shape', name)
+
+
 # ---------------------------------------------------------------------------
 # Hand-built ranked lists
 # ---------------------------------------------------------------------------
@@ -2422,7 +2439,8 @@ class TestNoneNeverAveragesInAsZero:
     def test_it_delegates_to_the_bake_offs_mean(self):
         """INV-5: there is not a second mean in this repo."""
         mod = _mod()
-        assert mod._mean is _bake_off()._mean
+        _assert_reexported_from_bake_off(mod, '_mean')
+        assert mod._mean([None, None]) is None
 
     def test_an_empty_row_set_aggregates_to_none_not_zero(self):
         mod = _mod()
@@ -2749,7 +2767,8 @@ class TestTheNoMeasurementConvention:
     def test_it_reuses_the_bake_offs_cell_renderer(self):
         """INV-5: there is not a second `—` convention in this repo."""
         mod = _mod()
-        assert mod._cell is _bake_off()._cell
+        _assert_reexported_from_bake_off(mod, '_cell')
+        assert mod._cell(None) == _bake_off()._NO_MEASUREMENT
 
 
 class TestInv5IsLoadOrderIndependent:
