@@ -21,6 +21,9 @@ from _orch_helpers import (
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import (
+    _EFFECT_SURVIVAL_AGGREGATE_THRESHOLD,
+    _EFFECT_SURVIVAL_PER_FILE_MIN_ADDED_LINES,
+    _EFFECT_SURVIVAL_PER_FILE_THRESHOLD,
     MERGE_PARK_REF,
     PERSISTENT_OFFLINE_DEEP_WORKTREE_NAME,
     CommitEffectProbe,
@@ -4874,6 +4877,319 @@ class TestDescribeCommitEffectInMain:
 
         assert probe.present is False
         assert probe.diverged_paths == ('café.py',)
+
+
+async def _commit_all(repo: Path, message: str) -> str:
+    """Stage everything under *repo* and commit, returning the new sha."""
+    await _run(['git', 'add', '-A'], cwd=repo)
+    rc, _, err = await _run(['git', 'commit', '-m', message], cwd=repo)
+    assert rc == 0, f'commit {message!r} failed: {err}'
+    rc, sha, err = await _run(['git', 'rev-parse', 'HEAD'], cwd=repo)
+    assert rc == 0, f'rev-parse failed: {err}'
+    return sha.strip()
+
+
+def _numbered(prefix: str, count: int) -> str:
+    """Return *count* unique, non-blank lines.
+
+    Uniqueness is load-bearing, not cosmetic: survival is measured by line-SET
+    membership, so duplicate or short-common lines can be "present" at main by
+    pure coincidence.  That is a real corpus hazard — motivating merge 3640 has
+    18 of its 45 removed lines still literally present at main for exactly this
+    reason (task 3116 b4) — and a fixture that tripped over it would measure
+    coincidence instead of survival.
+    """
+    return ''.join(f'{prefix}_{i:05d} = {i}\n' for i in range(count))
+
+
+async def _seed_on_main(repo: Path, files: dict[str, str], message: str) -> str:
+    """Write *files* and commit them straight to main (pre-branch baseline)."""
+    for name, content in files.items():
+        path = repo / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+    return await _commit_all(repo, message)
+
+
+async def _land_branch(repo: Path, task_id: str, files: dict[str, str]) -> str:
+    """Create task/<id> off main, write *files*, merge --no-ff, return merge sha."""
+    rc, _, err = await _run(
+        ['git', 'checkout', '-b', f'task/{task_id}', 'main'], cwd=repo,
+    )
+    assert rc == 0, f'branch create failed: {err}'
+    for name, content in files.items():
+        path = repo / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+    await _commit_all(repo, f'work for task {task_id}')
+    rc, _, err = await _run(['git', 'checkout', 'main'], cwd=repo)
+    assert rc == 0, f'checkout main failed: {err}'
+    rc, _, err = await _run(
+        [
+            'git', 'merge', '--no-ff',
+            '-m', f'Merge task/{task_id} into main', f'task/{task_id}',
+        ],
+        cwd=repo,
+    )
+    assert rc == 0, f'merge failed: {err}'
+    rc, sha, err = await _run(['git', 'rev-parse', 'HEAD'], cwd=repo)
+    assert rc == 0, f'rev-parse failed: {err}'
+    return sha.strip()
+
+
+@pytest.mark.asyncio
+class TestCommitEffectSurvival:
+    """Threshold line-SURVIVAL replaces byte-identity (task 3116 part b).
+
+    The predicate used to ask "does main still match the branch byte for
+    byte?", which is a question about whether ANYONE has touched the files
+    since — not about whether the branch's deliverable is still there.  On the
+    full corpus (2827 ``Merge task/N into main`` commits, measured at main
+    5bd7fd8489) that check reports effect_absent for 95.4% of all landings,
+    a third of them within 24 hours of merging.  A predicate that returns the
+    same answer for 95% of its population carries almost no information, and
+    the condition is ABSORBING — byte-identity once lost is never restored —
+    so each false False bought a full spurious dispatch (plan/verify/review, a
+    bogus task_failure escalation, days blocked; ~5.80 USD across tasks
+    3653/3640/3717).
+
+    The replacement asks the honest question: do the branch's ADDED LINES
+    still survive at main?  Verdict (constants pinned by test (f) below):
+
+        aggregate survival >= 0.98
+        AND every path with >= 25 added lines has per-file survival >= 0.90
+
+    Every fixture here is SYNTHETIC and sits at survival exactly 1.0 or 0.0,
+    so each case is unambiguous under ANY threshold in (0, 1) and no test
+    silently encodes a guessed number.  The two MIXED cases (c) and (d) are
+    the exceptions by necessity — they exist precisely to pin where the
+    per-file guard and its floor sit relative to each other — and both state
+    their arithmetic explicitly in the docstring.
+    """
+
+    async def test_additive_evolution_survives_the_task_3653_shape(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """THE DECISIVE MOTIVATING CASE, reconstructed synthetically.
+
+        A merge lands +N/-0 into a file; main then ADDS further lines to that
+        same file without touching any of the branch's.  Byte-identity is
+        broken, so the pre-3116 predicate said effect_absent — but every added
+        line is still literally there, so the effect plainly survived.
+
+        This is the exact live shape that re-dispatched task 3653 and left it
+        blocked four days: merge bd3d6f49b4 was +195/-0, additive edits landed
+        15.5 hours later, and the real merge measures aggregate survival
+        1.0000.  Mathematically 1.0 is guaranteed by construction here: a
+        later commit that only appends can never remove an anchor line from
+        main's line-set.
+
+        ``diverged_paths`` is asserted NON-empty on a PRESENT verdict on
+        purpose — byte-level divergence is still reported as a diagnostic, it
+        is simply no longer decisive.
+        """
+        merge_sha = await _land_branch(
+            git_repo, '3653', {'fileA.py': _numbered('branch', 6)},
+        )
+        (git_repo / 'fileA.py').write_text(
+            _numbered('branch', 6) + _numbered('later', 40),
+        )
+        await _commit_all(git_repo, 'later additive evolution on main')
+
+        probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+
+        assert probe.present is True
+        assert probe.failure is None
+        assert probe.aggregate_survival == 1.0
+        assert probe.diverged_paths == ('fileA.py',), (
+            'byte-identity IS broken here — the path must still be reported '
+            'as a diagnostic even though it no longer decides the verdict'
+        )
+
+    async def test_genuine_revert_is_still_rejected(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """A real revert must still be caught — this is the task-1175 hole.
+
+        The branch's added lines are removed wholesale by a later commit, so
+        survival is exactly 0.0 and the verdict is False under any threshold.
+        The failure code is the NEW ``'effect_not_survived'``, distinct from
+        ``'paths_diverged'`` (which since part (b) means only "byte-identity
+        broken" — a much weaker, no-longer-decisive fact).
+        """
+        await _seed_on_main(git_repo, {'mod.py': _numbered('base', 10)}, 'seed mod')
+        merge_sha = await _land_branch(
+            git_repo, '1175',
+            {'mod.py': _numbered('base', 10) + _numbered('deliverable', 40)},
+        )
+        (git_repo / 'mod.py').write_text(_numbered('base', 10))
+        await _commit_all(git_repo, 'revert the deliverable')
+
+        probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+
+        assert probe.present is False
+        assert probe.failure == 'effect_not_survived'
+        assert probe.aggregate_survival == 0.0
+        assert probe.diverged_paths == ('mod.py',)
+
+    async def test_per_file_guard_vetoes_reverted_deliverable(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """THE PER-FILE GUARD BITES — b2's own objection, closed.
+
+        b2 objected that a bare aggregate rule hides a reverted 20-line
+        deliverable behind a 2000-line test file.  This is that shape:
+
+            big_test.py    2000 added lines, untouched since  -> survival 1.00
+            deliverable.py   30 added lines, fully reverted   -> survival 0.00
+            aggregate = 2000/2030 = 0.9852  >= 0.98           -> PASSES
+
+        So the aggregate rule alone would wave this through.  The per-file
+        guard is what rejects it: deliverable.py carries 30 added lines, at or
+        above the 25-line floor, and 0.00 < 0.90.  The assertion on
+        ``aggregate_survival >= 0.98`` is load-bearing — it proves the GUARD
+        bit and not the aggregate, which is the whole point of the case.
+
+        On the real corpus this guard vetoes 40 merges that bare aggregate
+        would have accepted, at a cost of 1.5 points of recovery.
+        """
+        await _seed_on_main(
+            git_repo, {'deliverable.py': _numbered('base', 5)}, 'seed deliverable',
+        )
+        merge_sha = await _land_branch(
+            git_repo, '2000',
+            {
+                'deliverable.py': _numbered('base', 5) + _numbered('gone', 30),
+                'big_test.py': _numbered('kept', 2000),
+            },
+        )
+        (git_repo / 'deliverable.py').write_text(_numbered('base', 5))
+        await _commit_all(git_repo, 'revert only the deliverable')
+
+        probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+
+        assert probe.present is False
+        assert probe.failure == 'effect_not_survived'
+        assert probe.aggregate_survival >= 0.98, (
+            'the aggregate must PASS here — otherwise this case proves '
+            'nothing about the per-file guard'
+        )
+        assert probe.worst_guarded_path == 'deliverable.py'
+        assert probe.worst_guarded_survival == 0.0
+
+    async def test_per_file_floor_protects_a_small_hot_file(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """THE FLOOR PROTECTS A SMALL HOT FILE — the task-3640 shape.
+
+        A substantial deliverable survives intact while a small, frequently
+        edited prose file the branch also touched is heavily rewritten:
+
+            deliverable.py  1200 added lines, untouched  -> survival 1.00
+            notes.md          20 added lines, rewritten  -> survival 0.00
+            aggregate = 1200/1220 = 0.9836  >= 0.98      -> PASSES
+            notes.md has 20 added lines < 25 floor       -> EXEMPT from guard
+
+        Without the floor, a per-file rule rejects a motivating case: real
+        merge ed56626ce0 (task 3640) has aggregate 0.9848 but per-file-MINIMUM
+        0.6087, driven entirely by a 23-line hot SKILL.md.  25 is the SMALLEST
+        floor that clears that anchor, keeping the guard as wide — as much
+        veto power — as the anchors allow.
+
+        ``notes.md`` is asserted present in ``diverged_paths`` to prove the
+        floor is what saved this landing: the file genuinely did diverge.
+        """
+        await _seed_on_main(
+            git_repo,
+            {'deliverable.py': _numbered('base', 5), 'notes.md': _numbered('note', 5)},
+            'seed deliverable and notes',
+        )
+        merge_sha = await _land_branch(
+            git_repo, '3640',
+            {
+                'deliverable.py': _numbered('base', 5) + _numbered('kept', 1200),
+                'notes.md': _numbered('note', 5) + _numbered('prose', 20),
+            },
+        )
+        (git_repo / 'notes.md').write_text(_numbered('rewritten', 30))
+        await _commit_all(git_repo, 'heavily rewrite the hot prose file')
+
+        probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+
+        assert probe.present is True
+        assert probe.failure is None
+        assert probe.aggregate_survival >= 0.98
+        assert 'notes.md' in probe.diverged_paths, (
+            'notes.md genuinely diverged — the FLOOR is what saved this '
+            'landing, not an absence of divergence'
+        )
+
+    async def test_probe_carries_the_structured_survival_facts(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """The probe must carry WHY, not just THAT.
+
+        ``format_unattributed_landing_detail`` renders this verbatim into the
+        escalation a human reads, so the probe has to name the ratio measured,
+        the thresholds and floor actually applied, and the worst offending
+        guarded path.  An escalation that says only "effect absent" is what
+        cost days of misdiagnosis twice.
+        """
+        await _seed_on_main(git_repo, {'mod.py': _numbered('base', 10)}, 'seed mod')
+        merge_sha = await _land_branch(
+            git_repo, '4242',
+            {'mod.py': _numbered('base', 10) + _numbered('deliverable', 40)},
+        )
+        (git_repo / 'mod.py').write_text(_numbered('base', 10))
+        await _commit_all(git_repo, 'revert the deliverable')
+
+        probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+
+        assert probe.added_lines_total == 40
+        assert probe.aggregate_survival == 0.0
+        assert probe.worst_guarded_path == 'mod.py'
+        assert probe.worst_guarded_survival == 0.0
+        assert probe.aggregate_threshold == _EFFECT_SURVIVAL_AGGREGATE_THRESHOLD
+        assert probe.per_file_threshold == _EFFECT_SURVIVAL_PER_FILE_THRESHOLD
+        assert (
+            probe.per_file_min_added_lines
+            == _EFFECT_SURVIVAL_PER_FILE_MIN_ADDED_LINES
+        )
+
+    async def test_threshold_constants_match_the_full_corpus_measurement(
+        self,
+    ) -> None:
+        """REGRESSION PIN on the constants, so a silent retune is caught.
+
+        These are not guessed.  They come from the full-corpus sweep recorded
+        in task 3116 ``metadata.x_effect_survival_measurement`` (2827 merges,
+        2822 usable, measured at main 5bd7fd8489).  Residual still-absent
+        among the 2680 currently-rejected merges:
+
+            aggregate      1.00 75.3% | 0.99 66.0% | 0.98 59.3%
+                           0.95 45.9% | 0.90 34.7% | 0.50 12.0%
+            per-file-min   1.00 75.3% | 0.99 73.2% | 0.98 70.2%
+                           0.95 62.8% | 0.90 55.0% | 0.50 26.7%
+
+        Aggregate strictly dominates per-file-minimum at every threshold, so
+        aggregate is the primary unit and per-file-min is disqualified as a
+        standalone one.  Each constant is then the TIGHTEST — most
+        revert-catching — swept value that still satisfies all three
+        acceptance anchors:
+
+          0.98  task 3640's aggregate is 0.9848, so 0.99 and 1.00 reject an
+                anchor; 0.98 is the tightest that passes.
+          0.90  task 3717's worst guarded file is 0.9939 (1322 adds), so 0.90
+                clears with margin and is the tightest swept value.
+          25    task 3640's SKILL.md carries 23 added lines, so floors of 0
+                and 10 reject an anchor; 25 is the SMALLEST floor that passes.
+
+        Net effect: 1050 of 2680 currently-rejected merges recovered (39.2%),
+        with 0 of the 111 near-total-revert tail (aggregate < 0.05) accepted.
+        """
+        assert _EFFECT_SURVIVAL_AGGREGATE_THRESHOLD == 0.98
+        assert _EFFECT_SURVIVAL_PER_FILE_THRESHOLD == 0.90
+        assert _EFFECT_SURVIVAL_PER_FILE_MIN_ADDED_LINES == 25
 
 
 @pytest.mark.asyncio
