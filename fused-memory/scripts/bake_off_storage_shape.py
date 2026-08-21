@@ -1859,6 +1859,29 @@ def load_calibration_script() -> Any:
     return _load_sibling_script('calibrate_write_triage')
 
 
+def load_read_transform_script() -> Any:
+    """``scripts/read_transform_selection.py`` — 4004's read-transform arms.
+
+    LAZY BY NECESSITY, not merely by style.  ``read_transform_selection``
+    loads THIS module through its own lazy ``bake_off()`` accessor, so an
+    import-time load in either direction closes the cycle.  Calling this at
+    use time (inside :func:`read_path`) keeps both scripts importable on
+    their own.
+
+    Laziness is also sufficient for correctness.
+    ``apply_promoting_topic_anchor`` is duck-typed over ``.record_id`` and
+    ``.metadata`` with no ``isinstance`` check, so even if the two scripts
+    end up holding distinct ``sys.modules`` entries for the bake-off,
+    :class:`ArmRecord` instances from either copy still compare and
+    transform correctly.
+
+    The transform itself is 4004's deliverable and is NOT reimplemented
+    here: two copies could drift, and the point of the regrowth probe is to
+    measure the transform 4004's selection table actually picked.
+    """
+    return _load_sibling_script('read_transform_selection')
+
+
 def load_labeled_fixture(path: str | Path = DEFAULT_ALPHA_FIXTURE_PATH) -> list[dict[str, Any]]:
     """The alpha fixture as a flat record list, via its own strict loader.
 
@@ -3767,6 +3790,7 @@ def load_fetches(
 
 def read_path(
     seeded: SeededArm, hits: list[ScoredHit], k: int, *, pin: bool,
+    promote: bool = False,
 ) -> list[ArmRecord]:
     """What a reader of this arm variant actually receives for a top-*k* fetch.
 
@@ -3786,14 +3810,34 @@ def read_path(
     budget.  Grouping, which SHRINKS the window, is untouched: a collapsed
     window stays short (its legitimate token win) and a canonical pinned into
     the slot grouping freed survives.
+
+    ``promote`` selects 4004's PROMOTING variant of the pin
+    (``read_transform_selection.apply_promoting_topic_anchor``) instead of
+    the landed additive one.  Both truncations stay exactly as they are —
+    the promoting pin's whole measurable difference is that it survives the
+    second one.  It requires ``pin``: promotion is a variant of the pin's
+    firing rule, not an independent transform.
     """
+    if promote and not pin:
+        raise ValueError(
+            'promote=True requires pin=True — promotion is a variant of the '
+            'topic pin\'s FIRING RULE (the two select the identical set of '
+            'records and differ only in where the canonical lands), so '
+            '"promote without pin" is a caller bug rather than a fourth, '
+            'silent read mode.'
+        )
+
     records = [hit.record for hit in hits[:k]]
     if seeded.shape == 'b_grouped':
         records = apply_grouped_read(
             records, seeded.records_by_id, contested_ids=seeded.contested_ids,
         )
     if pin:
-        records = apply_topic_anchor(records, seeded.canonical_by_topic)
+        anchor = (
+            load_read_transform_script().apply_promoting_topic_anchor
+            if promote else apply_topic_anchor
+        )
+        records = anchor(records, seeded.canonical_by_topic)
     return records[:k]
 
 
@@ -3920,6 +3964,7 @@ def measure_arm(
     fetched: dict[str, dict[str, list[ScoredHit]]],
     *,
     pin: bool,
+    promote: bool = False,
     queries: list[Query],
     probes: list[tuple[str, dict[str, Any]]],
     estimator: tuple[str, Any],
@@ -3939,6 +3984,12 @@ def measure_arm(
     be "the pin never fired": at a full window an additive pin has nowhere to
     put anything.  It is ``None`` when the pin is off — the question was never
     asked, and a 0.0 would claim it was asked and answered.
+
+    ``promote`` selects 4004's promoting pin for the transformed windows
+    only.  The pin-off baseline inside ``_window`` and the transform-blind
+    ``stored_`` trio stay promote-free BY CONSTRUCTION — the former because
+    ``read_path`` refuses ``promote`` without ``pin``, the latter because it
+    never calls ``read_path`` at all.
     """
     #: One row per query, kept individually rather than accumulated straight
     #: into means.  eval-design §5 E2 names "claim recall@k" and
@@ -3960,8 +4011,13 @@ def measure_arm(
     def _window(hits: list[ScoredHit], k: int) -> list[ArmRecord]:
         """One read window, plus its pin-off counterfactual when pin is on."""
         nonlocal windows_compared, windows_changed
-        records = read_path(seeded, hits, k, pin=pin)
+        records = read_path(seeded, hits, k, pin=pin, promote=promote)
         if pin:
+            # The counterfactual stays pin-OFF, and therefore promote-free BY
+            # CONSTRUCTION (`read_path` refuses promote without pin).  A
+            # promote leak here would make the two windows agree and the
+            # diagnostic would report 0.00 for an arm that reorders every
+            # window it touches.
             baseline = read_path(seeded, hits, k, pin=False)
             windows_compared += 1
             if [r.record_id for r in records] != [r.record_id for r in baseline]:
@@ -3992,7 +4048,7 @@ def measure_arm(
             # None — exactly the conflation topic_discoverability's docstring
             # says would hide a shape that gets the canonical NEARLY there.
             deep = topic_discoverability(
-                read_path(seeded, hits, len(hits), pin=pin),
+                read_path(seeded, hits, len(hits), pin=pin, promote=promote),
                 query.topic, canonical_id, 5,
             )
             canonical_rank = deep['canonical_rank']

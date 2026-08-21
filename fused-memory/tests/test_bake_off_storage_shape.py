@@ -5616,8 +5616,14 @@ class TestMeasureArmPromote:
         promote-free by construction).  If promotion leaked into the baseline,
         the two would agree and the diagnostic would report 0.00 for an arm
         that reorders every window.
+
+        `n=12` so that EVERY window `_window` measures is genuinely full —
+        the k=5 pair, the k=10 pair and the guard probe's GUARD_TOP_K pair.
+        At n=5 the k=10 window has headroom, the additive pin legitimately
+        fires there, and the additive rate is 1/3 rather than 0 for a reason
+        that has nothing to do with promotion leaking.
         """
-        seeded, hits = _full_window_arm(n=5)
+        seeded, hits = _full_window_arm(n=12)
 
         promoting = _measure(seeded, hits, pin=True, promote=True, probes=[('c1', {})])
         additive = _measure(seeded, hits, pin=True, promote=False, probes=[('c1', {})])
