@@ -83,6 +83,11 @@ ROUTED_KEY = 'routed'
 #: null is a value the reader then has to disambiguate.
 CANONICAL_ID_KEY = 'canonical_id'
 
+#: Key on the add_memory ack naming the escalation filed when a fail-open
+#: BURST crossed the threshold on this call. Present only on that call —
+#: rare by construction, and additive like the other two.
+FAIL_OPEN_ESCALATION_ID_KEY = 'triage_fail_open_escalation_id'
+
 #: The write was stored as a new standalone memory. Also the fail-open
 #: outcome and the deliberate-stub outcome — from the caller's side those are
 #: indistinguishable from a genuine "nothing matched", which is the point.
@@ -430,6 +435,7 @@ class TriageFailOpenCounter:
 
     def __init__(self, time_provider: Callable[[], float] = time.time) -> None:
         self._counter = StormCounter(time_provider=time_provider)
+        self._pending_storm: dict[str, Any] | None = None
 
     def record(self, *, project: str | None = None) -> dict[str, Any] | None:
         """Record one fail-open; return a storm summary iff a burst just fired.
@@ -448,13 +454,31 @@ class TriageFailOpenCounter:
         )
         if summary is None:
             return None
-        return {
+        storm = {
             'count': summary['count'],
             'threshold': summary['threshold'],
             'window_seconds': summary['window_seconds'],
             'projects': summary['labels'],
             'hint': _FAIL_OPEN_HINT,
         }
+        # Stashed as well as returned. Most fail-opens are recorded DEEP inside
+        # `triage_write`, whose return value is a routing decision — so the
+        # party that can resolve a project_root and file the escalation (the
+        # tool body, which holds the known_projects map) is not the party that
+        # made the record() call. Without this the alarm would be built,
+        # counted, and then dropped on the floor.
+        self._pending_storm = storm
+        return storm
+
+    def drain_storm(self) -> dict[str, Any] | None:
+        """Return and CLEAR the storm summary the last :meth:`record` produced.
+
+        Draining rather than peeking: a storm is filed once per crossing, and
+        leaving it in place would re-file it on every subsequent write until
+        the window rolled — turning one alarm into a stream of them.
+        """
+        storm, self._pending_storm = self._pending_storm, None
+        return storm
 
     def live_count(self) -> int:
         """Fail-opens currently inside the window, without recording one.
