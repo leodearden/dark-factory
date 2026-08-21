@@ -28,6 +28,31 @@
 # watcher-rearm.sh's WATCHER_REARM_PYTHON override convention. REPO is
 # similarly overridable so tests can point it at a tmp dir with no `.env`
 # (a no-op source).
+#
+# Task 2917 EDIT 3 -- `uv` is resolved to an ABSOLUTE path below rather than
+# trusted to be on PATH. OBSERVED (journalctl --user -u
+# fused-memory-flag-marker-sweep.service):
+#
+#   Aug 18 09:02:44 ... fused-memory-flag-marker-sweep.sh[65377]:
+#       .../fused-memory-flag-marker-sweep.sh: line 46: exec: uv: not found
+#   Aug 18 09:02:44 ... fused-memory-flag-marker-sweep.service:
+#       Main process exited, code=exited, status=127/n/a
+#
+# That line is immediately preceded by a `-- Boot ... --` marker, and the
+# next normal timer firing (Aug 19 03:34:58) succeeded -- so the failure is
+# specific to the unit's `Persistent=true` BOOT CATCH-UP run, which fires
+# before the login session pushes the user PATH into the systemd user
+# manager. `uv` lives in $HOME/.local/bin, absent from that minimal boot
+# PATH. UV_BIN overrides the resolution outright (the test seam); otherwise
+# `command -v uv` wins, then the measured real location, then
+# /usr/local/bin. An unresolvable `uv` is reported LOUDLY (an ERROR: line
+# naming uv, the PATH searched, and the boot-catch-up cause) rather than
+# left as a bare shell 127 that says nothing about why.
+#
+# This is belt-and-braces with the `Environment=PATH=` line the .service
+# unit now carries: the unit-level PATH covers everything else the wrapper
+# shells out to, while this wrapper-level resolution survives a STALE
+# installed unit that predates that line.
 set -euo pipefail
 
 REPO="${REPO:-/home/leo/src/dark-factory}"
@@ -40,7 +65,41 @@ export CONFIG_PATH="${CONFIG_PATH:-$FM/config/config.yaml}"
 export PROJECT_ROOT="${PROJECT_ROOT:-$REPO}"
 export FALKORDB_URI="${FALKORDB_URI:-redis://localhost:6379}"
 
-# shellcheck disable=SC2206
-SWEEP_CMD=(${FLAG_MARKER_SWEEP_CMD:-uv run --frozen --project "$FM" python})
+resolve_uv_bin() {
+  # Order: explicit override, then PATH, then the two known install roots.
+  if [ -n "${UV_BIN:-}" ] && [ -x "${UV_BIN}" ]; then
+    printf '%s' "${UV_BIN}"
+    return 0
+  fi
+  local from_path
+  if from_path="$(command -v uv 2>/dev/null)" && [ -x "$from_path" ]; then
+    printf '%s' "$from_path"
+    return 0
+  fi
+  local candidate
+  for candidate in "$HOME/.local/bin/uv" /usr/local/bin/uv; do
+    if [ -x "$candidate" ]; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+if [ -n "${FLAG_MARKER_SWEEP_CMD:-}" ]; then
+  # The documented test seam: an unquoted expansion so a multi-word prefix
+  # word-splits into the array.
+  # shellcheck disable=SC2206
+  SWEEP_CMD=(${FLAG_MARKER_SWEEP_CMD})
+else
+  if ! UV_RESOLVED="$(resolve_uv_bin)"; then
+    echo "fused-memory-flag-marker-sweep.sh: ERROR: cannot resolve \`uv\` -- not at \$UV_BIN (${UV_BIN:-unset}), not on PATH (${PATH}), and not at \$HOME/.local/bin/uv or /usr/local/bin/uv. This is the \`exec: uv: not found\` / status=127 boot-catch-up failure OBSERVED 2026-08-18 09:02:44: the unit's Persistent=true catch-up run fires before the login session pushes the user PATH into the systemd user manager. Install uv, or set UV_BIN to its absolute path." >&2
+    exit 127
+  fi
+  # Built literally (not via a \${X:-...} default inside an unquoted array
+  # expansion) so "$FM" survives verbatim even when the repo path contains
+  # spaces -- see test_wrapper_default_prefix_invokes_uv_run_frozen_project.
+  SWEEP_CMD=("$UV_RESOLVED" run --frozen --project "$FM" python)
+fi
 
 exec "${SWEEP_CMD[@]}" "$FM/scripts/sweep_orphan_flag_markers.py" --apply --terminal-drain
