@@ -5291,6 +5291,21 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         'steward_lifetime_budget',
         # Scheduler tuning
         'fairness.skip_threshold',
+        # Transient-requeue jittered backoff (task 3317 / PRD contract C3,
+        # open question 2 decided GREEN).  Explicit literals, not a
+        # _submodel_leaf_paths group: these are FLAT top-level fields.  No
+        # reload hook is needed — ``Scheduler.release()`` reads
+        # ``self.config.<knob>`` at ARM time and ``apply_reload``/``_set_leaf``
+        # mutates the same object the Scheduler holds, so a retune lands on
+        # the NEXT arming.  ONE CAVEAT, identical to the existing
+        # ``requeue_cooldown_secs`` behaviour: an ALREADY-ARMED absolute
+        # deadline in ``Scheduler._requeue_until`` keeps its old window; the
+        # new values apply from the next arming onward.  Green-tier on
+        # purpose — retuning the backoff mid-outage is precisely when an
+        # operator needs it, and a restart-only tier would make the knob
+        # useless at the moment it matters.
+        'transient_requeue_backoff_base_secs',
+        'transient_requeue_backoff_cap_secs',
         # EASY-backfill admission (task 3823 / PRD C7).  Explicit literals, not
         # a _submodel_leaf_paths group: these are FLAT top-level fields, not a
         # submodel.  Green-tier on purpose — PRD Open Q3 ships safety_factor
