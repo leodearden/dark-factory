@@ -41,6 +41,43 @@ class TestUpdateEwa:
         result = digest.update_ewa(prev_ewa=0.0, escalations_in_step=4, done_in_step=0, alpha=0.3)
         assert result == pytest.approx(1.2), f"Expected 1.2; got {result}"
 
+    def test_esc_zero_decays_ewa(self) -> None:
+        """esc==0 is a LEGITIMATE drain window and must decay the EWA, not raise.
+
+        Task 4559: the EWA numerator now counts escalation SUBMISSIONS only —
+        resolutions feed the digest gate but not the numerator.  A backlog-drain
+        window (many resolutions, zero submissions) therefore arrives here with
+        escalations_in_step == 0, which is not a caller error but the healthy
+        case: such a window must HEAL the breaker rather than crash the digest.
+
+        prev=50.0, esc=0, done=0, alpha=0.3 -> 0.3*(0/1) + 0.7*50.0 = 35.0
+        """
+        result = digest.update_ewa(prev_ewa=50.0, escalations_in_step=0, done_in_step=0, alpha=0.3)
+        assert result == pytest.approx(35.0), f"Expected 35.0 (pure decay); got {result}"
+
+    def test_esc_zero_with_dones_decays(self) -> None:
+        """Zero submissions with work landing also decays: prev=10.0, done=7, alpha=0.3 -> 7.0.
+
+        0.3*(0/7) + 0.7*10.0 = 7.0.  The denominator is irrelevant once the
+        numerator is zero, so a drain window decays at exactly (1-alpha) per
+        step regardless of how much work landed alongside it.
+        """
+        result = digest.update_ewa(prev_ewa=10.0, escalations_in_step=0, done_in_step=7, alpha=0.3)
+        assert result == pytest.approx(7.0), f"Expected 7.0 (pure decay); got {result}"
+
+    def test_negative_esc_raises_value_error(self) -> None:
+        """Negative esc raises ValueError — loudness preserved for the impossible input.
+
+        Task 4559 retired the old ``esc > 0`` contract (zero is now legitimate,
+        see test_esc_zero_decays_ewa) but a NEGATIVE count is still arithmetically
+        impossible: counters are monotonically non-decreasing and the diff is
+        taken against an earlier snapshot.  Reaching here with esc < 0 means a
+        counter was reset or a snapshot went backwards, which must be loud
+        rather than silently pushing the EWA down.
+        """
+        with pytest.raises(ValueError, match='escalations_in_step must be >= 0'):
+            digest.update_ewa(prev_ewa=1.0, escalations_in_step=-1, done_in_step=5, alpha=0.3)
+
     def test_esc_zero_raises_value_error(self) -> None:
         """esc==0 raises ValueError — caller contract violation.
 
