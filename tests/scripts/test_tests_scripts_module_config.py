@@ -516,6 +516,34 @@ def _min_budget(worst: float) -> int:
 #                                    on a 32-core host
 #     185.29s wall / 180.47s pytest  task 3703 pre-1 run B, same base, same
 #                                    counts, rc=0; loadavg 61.43 at start
+#     353.63s, 374.40s               esc-4240-1 / esc-4240-3, on the task 4240
+#                                    branch (a tree carrying that task's extra
+#                                    module). Both derive the same 700s floor
+#                                    as the worst below, so nothing here hinges
+#                                    on which of the three is largest
+#     136.37s wall / 132.95s pytest  task 4320 architect sweep run 1, THIS
+#                                    branch at base 5c9d4817fb; rc=0, 1256
+#                                    passed / 2 skipped / 6 deselected;
+#                                    loadavg 263.26 -> 51.45, 32-core host
+#     153.57s wall / 149.97s pytest  architect run 2, same base/counts, rc=0;
+#                                    loadavg 51.45 -> 69.83
+#     283.00s wall / 270.40s pytest  architect run 3, same base/counts, rc=0;
+#                                    loadavg 69.83 -> 119.24
+#     397.47s wall                   architect run 4, same base/counts, rc=0;
+#                                    loadavg 119.24 -> 187.04.  <-- WORST
+#     323.88s wall                   architect run 5, same base/counts, rc=0;
+#                                    loadavg 187.04 -> 130.22
+#     234.34s wall / 230.67s pytest  task 4320 pre-1 run 1, same base; rc=0,
+#                                    1256 passed / 2 skipped / 6 deselected;
+#                                    loadavg 97.08 -> 154.41
+#     215.70s wall / 212.52s pytest  pre-1 run 2, same base/counts, rc=0;
+#                                    loadavg 154.41 -> 103.93
+#     172.19s wall / 167.41s pytest  pre-1 run 3, same base/counts, rc=0;
+#                                    loadavg 103.93 -> 80.03
+#     195.36s wall / 188.50s pytest  pre-1 run 4, same base/counts, rc=0;
+#                                    loadavg 80.03 -> 85.81
+#     148.20s wall / 145.77s pytest  pre-1 run 5, same base/counts, rc=0;
+#                                    loadavg 85.81 -> 103.79
 #
 #   FALLBACK-PATH runs — A DIFFERENT COMMAND, kept for history and LABELLED so
 #   nobody sizes this budget against them again:
@@ -524,22 +552,45 @@ def _min_budget(worst: float) -> int:
 #                                    legs narrowed to this diff, not the
 #                                    command declared here
 #
-# SIZING RULE: the WORST RUN, never the mean and never fresh-only. Both of
-# pre-1's fresh runs came in BELOW 233.50s, so sizing on them would LOWER the
-# floor — the unsafe direction. The spread is this oversubscribed host's LOAD at
-# measurement time, not suite variance: 167.73s and 233.50s are the same command
-# on the same tree.
+# SIZING RULE: the WORST RUN, never the mean and never fresh-only, across the
+# UNION of every VERBATIM run above. Task 4320's own five fresh runs all came in
+# BELOW the 397.47s worst — the freshest of them at 148.20s — so sizing on them
+# would have LOWERED the floor from 700 back to 400 and left the then-declared
+# 600s budget passing. That is the unsafe direction, and recording the
+# inconvenient figure rather than only the convenient one is what makes the rule
+# operative.
 #
-# HONEST CAVEAT, recorded rather than left implicit: 233.50s was measured when
-# this suite collected 369 tests, and it now collects 1072 (measured in pre-1).
-# It is therefore a LOWER BOUND on today's contended worst case, not a current
-# measurement. Do NOT scale it by the test-count ratio — RE-MEASURE under load
-# before ever tightening the budget against it.
-MEASURED_SUITE_WORST_SECS = 233.50
+# CORRECTED IN PLACE (task 4320). This paragraph used to read "HONEST CAVEAT ...
+# 233.50s was measured when this suite collected 369 tests, and it now collects
+# 1072 ... It is therefore a LOWER BOUND on today's contended worst case, not a
+# current measurement." That is no longer true in either half: the suite has
+# been RE-MEASURED under load on this branch (ten fresh VERBATIM runs, listed
+# above, at 1256 passed / 2 skipped / 6 deselected), so this constant is a
+# current measurement rather than a lower bound. Corrected rather than deleted,
+# because the caveat is why the re-measurement happened; corrected rather than
+# left standing, because an authoritative-reading comment a later change has
+# falsified is precisely the defect this file exists to remove.
+#
+# THE SPREAD IS LOAD, AND LOAD DOES NOT PREDICT WALL CLOCK. 136.37s -> 397.47s
+# is a 2.91x band on a BYTE-IDENTICAL command and tree within one session, which
+# is why the worst RUN and not any single fresh one sizes the floor. But the
+# loadavg annotations must not be read as a normalisation knob: the FASTEST run
+# of the architect's sweep started at the HIGHEST load of its five (263.26) and
+# the slowest at 119.24, and in task 4320's own sweep run 3 started at a HIGHER
+# load than run 4 (103.93 vs 80.03) and finished FASTER (172.19s vs 195.36s). A
+# figure annotated "recorded at loadavg N" therefore CANNOT be scaled back to a
+# clean-host number — re-measure instead.
+#
+# PROVENANCE CAVEAT RETIRED (task 4320): the 353.63s / 374.40s figures were
+# recorded on the task 4240 branch and could be argued to be inflated by that
+# task's extra module. 397.47s was measured on a tree WITHOUT it, at ~57 FEWER
+# collected tests, and still exceeds both — so the caveat is settled by
+# construction rather than by subtraction, and no figure here needs discounting.
+MEASURED_SUITE_WORST_SECS = 397.47
 # DERIVED from the measurement above, never hand-set beside it, so the two
 # cannot silently diverge again — see _min_budget's docstring for the rot that
 # motivated this and test_min_module_budget_is_derived_from_the_measured_worst_run
-# for the guard that now makes it a property. 2 * 233.50 -> 467.0 -> 400.
+# for the guard that now makes it a property. 2 * 397.47 -> 794.94 -> 700.
 MIN_MODULE_BUDGET_SECS = _min_budget(MEASURED_SUITE_WORST_SECS)
 
 
