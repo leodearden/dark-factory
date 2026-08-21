@@ -1582,8 +1582,18 @@ async def sweep_stale_status_snapshot_edges(
     failure aborts the rest of this cycle's sweep (there is nothing left to
     act on without them) and returns the stats gathered so far; a per-edge
     ``update_edge`` failure does NOT abort the loop — the remaining stale
-    edges are still attempted. ``asyncio.CancelledError``/``KeyboardInterrupt``/
-    ``SystemExit`` are re-raised unchanged (never swallowed as best-effort).
+    edges are still attempted. A superseding-write (``add_memory``) failure
+    is likewise caught, logged, and tallied — but into ``stats
+    ['supersede_errors']``, and it too leaves the loop running. It degrades
+    only OBSERVABILITY: by the time it runs the edge is already invalidated
+    (the correctness-bearing half of the step), so the graph is left
+    consistent, just without the fact recording what replaced the retired
+    assertion. The missing fact is not retried next cycle — the invalidated
+    edge no longer enumerates — so this is a permanently missing superseding
+    fact rather than a corrupted edge or a repeating failure.
+    ``asyncio.CancelledError``/``KeyboardInterrupt``/``SystemExit`` are
+    re-raised unchanged from BOTH write paths (never swallowed as
+    best-effort).
 
     Returns:
         dict with int counts: ``scanned`` (edges enumerated after dedup),
@@ -1721,13 +1731,23 @@ async def sweep_stale_status_snapshot_edges(
             if not is_blocked_assertion_contradicted(status) or task_id in superseded_ids:
                 continue
             superseded_ids.add(task_id)
-            await memory_service.add_memory(
-                content=build_supersede_fact(task_id, status, invalidate_at),
-                category='temporal_facts',
-                project_id=project_id,
-                agent_id=_SWEEP_AGENT_ID,
-                causation_id=run_id,
-            )
-            stats['superseded'] += 1
+            try:
+                await memory_service.add_memory(
+                    content=build_supersede_fact(task_id, status, invalidate_at),
+                    category='temporal_facts',
+                    project_id=project_id,
+                    agent_id=_SWEEP_AGENT_ID,
+                    causation_id=run_id,
+                )
+                stats['superseded'] += 1
+            except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                raise
+            except Exception:
+                log.exception(
+                    'stale_status_snapshot_edge_sweep: add_memory supersede failed '
+                    'for task_id=%s (edge uuid=%s already invalidated)',
+                    task_id, edge['uuid'],
+                )
+                stats['supersede_errors'] += 1
 
     return stats
