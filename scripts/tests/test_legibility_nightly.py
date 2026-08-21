@@ -2670,6 +2670,90 @@ def _one_recorded(calls):
     return calls[0][1]
 
 
+def _run_e2e_nightly(tmp_path, *, monkeypatch=None, branch=None, recorder=None,
+                     budget_bytes=None, invoke=_fake_invoke_known_cause,
+                     committer=None, poster=None, transcript=True):
+    """Run ``run_nightly`` end to end on a real temp git repo + transcript and
+    return ``(result, repo)``.
+
+    THE ONE e2e fixture for this module's full-run tests — the trickle-state
+    recorder suite and the task-4511 journaling tests both call it, so the
+    repo/transcript setup and the ``run_nightly`` kwargs exist exactly once
+    and cannot drift when that signature changes.
+
+    *branch*, when given, drives the run down ONE named decision-8 fail-loud
+    branch, and THIS IS THE ONLY PLACE that knowledge lives — a fifth branch
+    added to ``run_nightly`` gets wired here once, not in each suite:
+
+    * ``'extractor'``  — ``build_digests`` raises (needs *monkeypatch*)
+    * ``'storm'``      — every digest's coding output is unparseable
+    * ``'validation'`` — the merged codebook fails ``codebook.validate``
+      (needs *monkeypatch*)
+    * ``'commit'``     — the committer fails
+
+    The other knobs shape a run that does NOT fail: *budget_bytes* rewrites
+    the config with a digest byte budget small enough to suppress the whole
+    night, *transcript=False* makes it a genuinely quiet one, and
+    *recorder* / *committer* / *poster* / *invoke* are the injected seams
+    (*poster* defaults to a no-op, so a test that does not care about
+    escalations never has to build one).
+    """
+    work_cwd = str(tmp_path / 'work')
+    repo, config_path = _init_e2e_repo(tmp_path, work_cwd=work_cwd)
+    if budget_bytes is not None:
+        _write_config(
+            repo, project_id='testproj', escalation_port=8199,
+            cwd_prefixes=[work_cwd], max_daily_digest_bytes=budget_bytes,
+        )
+    projects_root = tmp_path / 'projects'
+    if transcript:
+        _write_transcript(
+            projects_root / _encode_cwd(work_cwd) / 'session-1.jsonl',
+            cwd=work_cwd, timestamp='2026-07-13T10:00:00Z',
+            session_id='session-1',
+        )
+    else:
+        projects_root.mkdir(parents=True, exist_ok=True)
+
+    # Annotated: a heterogeneous dict (Paths, a date, a datetime, injected
+    # callables, None) whose inferred value union would otherwise be
+    # re-reported once per union member at the run_nightly(**kwargs) call.
+    kwargs: dict[str, Any] = dict(
+        config_path=config_path,
+        projects_root=projects_root,
+        target_date=date(2026, 7, 13),
+        now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
+        invoke=invoke,
+        status_fetcher=None,
+        poster=poster if poster is not None else (lambda url, envelope: None),
+    )
+    if recorder is not None:
+        kwargs['recorder'] = recorder
+    if committer is not None:
+        kwargs['committer'] = committer
+
+    if branch is not None:
+        if branch in ('extractor', 'validation') and monkeypatch is None:
+            raise AssertionError(
+                f'the {branch!r} branch is driven by monkeypatching a module '
+                'global; pass monkeypatch='
+            )
+        if branch == 'extractor':
+            monkeypatch.setattr(nightly, 'build_digests', _crashing_build_digests)
+        elif branch == 'storm':
+            kwargs['invoke'] = _fake_invoke_unparseable
+        elif branch == 'validation':
+            monkeypatch.setattr(
+                codebook, 'validate', lambda cb: ['synthetic validation error'],
+            )
+        elif branch == 'commit':
+            kwargs['committer'] = _failing_committer
+        else:  # pragma: no cover - guards a typo'd branch id
+            raise AssertionError(f'unknown decision-8 branch {branch!r}')
+
+    return nightly.run_nightly(**kwargs), repo
+
+
 class TestRunNightlyRecordsTrickleState:
     """``run_nightly`` records WHY the night went the way it did — on every
     exit path, including the fail-loud ones and an unexpected raise.
@@ -2679,47 +2763,9 @@ class TestRunNightlyRecordsTrickleState:
     stale streak as healthy after repeated crashes.
     """
 
-    def _run(self, tmp_path, *, recorder=None, budget_bytes=None,
-             invoke=_fake_invoke_known_cause, committer=None, poster=None,
-             transcript=True):
-        work_cwd = str(tmp_path / 'work')
-        repo, config_path = _init_e2e_repo(tmp_path, work_cwd=work_cwd)
-        if budget_bytes is not None:
-            _write_config(
-                repo, project_id='testproj', escalation_port=8199,
-                cwd_prefixes=[work_cwd], max_daily_digest_bytes=budget_bytes,
-            )
-        projects_root = tmp_path / 'projects'
-        if transcript:
-            _write_transcript(
-                projects_root / _encode_cwd(work_cwd) / 'session-1.jsonl',
-                cwd=work_cwd, timestamp='2026-07-13T10:00:00Z',
-                session_id='session-1',
-            )
-        else:
-            projects_root.mkdir(parents=True, exist_ok=True)
-
-        # Annotated: a heterogeneous dict (Paths, a date, a datetime, injected
-        # callables, None) whose inferred value union would otherwise be
-        # re-reported once per union member at the run_nightly(**kwargs) call.
-        kwargs: dict[str, Any] = dict(
-            config_path=config_path,
-            projects_root=projects_root,
-            target_date=date(2026, 7, 13),
-            now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
-            invoke=invoke,
-            status_fetcher=None,
-            poster=poster if poster is not None else (lambda url, envelope: None),
-        )
-        if recorder is not None:
-            kwargs['recorder'] = recorder
-        if committer is not None:
-            kwargs['committer'] = committer
-        return nightly.run_nightly(**kwargs), repo
-
     def test_happy_path_records_a_productive_run(self, tmp_path):
         recorder, calls = _recorder_spy()
-        result, _repo = self._run(tmp_path, recorder=recorder)
+        result, _repo = _run_e2e_nightly(tmp_path, recorder=recorder)
 
         assert result.exit_code == 0
         assert result.commit_made is True
@@ -2738,7 +2784,7 @@ class TestRunNightlyRecordsTrickleState:
         """The 2026-07-16..29 incident replay, now RECORDED as barren
         instead of being indistinguishable from a quiet night."""
         recorder, calls = _recorder_spy()
-        result, _repo = self._run(tmp_path, recorder=recorder, budget_bytes=10)
+        result, _repo = _run_e2e_nightly(tmp_path, recorder=recorder, budget_bytes=10)
 
         assert result.exit_code == 0
         assert result.budget_suppressed is True
@@ -2753,7 +2799,7 @@ class TestRunNightlyRecordsTrickleState:
 
     def test_quiet_night_records_quiet_with_streak_zero(self, tmp_path):
         recorder, calls = _recorder_spy()
-        result, _repo = self._run(tmp_path, recorder=recorder, transcript=False)
+        result, _repo = _run_e2e_nightly(tmp_path, recorder=recorder, transcript=False)
 
         assert result.exit_code == 0
         assert result.budget_suppressed is False
@@ -2764,9 +2810,10 @@ class TestRunNightlyRecordsTrickleState:
         assert doc['exit_code'] == 0
 
     def test_extractor_crash_still_records(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(nightly, 'build_digests', _crashing_build_digests)
         recorder, calls = _recorder_spy()
-        result, _repo = self._run(tmp_path, recorder=recorder)
+        result, _repo = _run_e2e_nightly(
+            tmp_path, monkeypatch=monkeypatch, branch='extractor', recorder=recorder,
+        )
 
         assert result.exit_code == 1
         doc = _one_recorded(calls)
@@ -2775,8 +2822,8 @@ class TestRunNightlyRecordsTrickleState:
 
     def test_coder_storm_still_records(self, tmp_path):
         recorder, calls = _recorder_spy()
-        result, _repo = self._run(
-            tmp_path, recorder=recorder, invoke=_fake_invoke_unparseable,
+        result, _repo = _run_e2e_nightly(
+            tmp_path, branch='storm', recorder=recorder,
         )
 
         assert result.exit_code == 1
@@ -2786,11 +2833,10 @@ class TestRunNightlyRecordsTrickleState:
         assert doc['counters']['selected_count'] == 1
 
     def test_codebook_validation_failure_still_records(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(
-            codebook, 'validate', lambda cb: ['synthetic validation error'],
-        )
         recorder, calls = _recorder_spy()
-        result, _repo = self._run(tmp_path, recorder=recorder)
+        result, _repo = _run_e2e_nightly(
+            tmp_path, monkeypatch=monkeypatch, branch='validation', recorder=recorder,
+        )
 
         assert result.exit_code == 1
         doc = _one_recorded(calls)
@@ -2799,8 +2845,8 @@ class TestRunNightlyRecordsTrickleState:
 
     def test_commit_failure_still_records(self, tmp_path):
         recorder, calls = _recorder_spy()
-        result, _repo = self._run(
-            tmp_path, recorder=recorder, committer=_failing_committer,
+        result, _repo = _run_e2e_nightly(
+            tmp_path, branch='commit', recorder=recorder,
         )
 
         assert result.exit_code == 1
@@ -2819,7 +2865,7 @@ class TestRunNightlyRecordsTrickleState:
         recorder, calls = _recorder_spy()
 
         with pytest.raises(RuntimeError, match='synthetic mid-run explosion'):
-            self._run(tmp_path, recorder=recorder)
+            _run_e2e_nightly(tmp_path, recorder=recorder)
 
         doc = _one_recorded(calls)
         assert doc['exit_code'] != 0, (
@@ -2837,7 +2883,7 @@ class TestRunNightlyRecordsTrickleState:
             raise OSError('synthetic state-write failure')
 
         with caplog.at_level('WARNING', logger='legibility.nightly'):
-            result, _repo = self._run(tmp_path, recorder=_raising_recorder)
+            result, _repo = _run_e2e_nightly(tmp_path, recorder=_raising_recorder)
 
         assert result.exit_code == 0
         assert result.commit_made is True
@@ -2848,7 +2894,7 @@ class TestRunNightlyRecordsTrickleState:
     def test_wired_for_real_end_to_end(self, tmp_path):
         """No recorder= override: the two modules are wired together for
         real, not just against a spy."""
-        result, _repo = self._run(tmp_path)
+        result, _repo = _run_e2e_nightly(tmp_path)
         assert result.exit_code == 0
 
         status, doc = trickle_state.load_state(
@@ -3548,48 +3594,12 @@ def test_main_run_fails_safe_when_the_defaulted_fetcher_cannot_reach_fused_memor
 #
 # Nothing here asserts on the escalation payload: `_build_escalation_arguments`
 # and the envelope are deliberately untouched by this task.
+#
+# Driven through the SHARED `_run_e2e_nightly` helper, which is also what the
+# trickle-state recorder suite runs on -- one e2e fixture and one copy of the
+# branch dispatch, so "the four branches" cannot come to mean different things
+# in the two suites.
 # ---------------------------------------------------------------------------
-
-def _run_decision8_branch(tmp_path, monkeypatch, branch, *, poster):
-    """Drive `run_nightly` down ONE named decision-8 fail-loud branch, on the
-    existing e2e repo/transcript fixtures.
-
-    Modelled on `TestRunNightlyRecordsTrickleState._run` (which already
-    demonstrates one helper reaching all four branches) and reusing that
-    class's drivers verbatim, so this test pins logging and nothing else.
-    """
-    work_cwd = str(tmp_path / 'work')
-    repo, config_path = _init_e2e_repo(tmp_path, work_cwd=work_cwd)
-    projects_root = tmp_path / 'projects'
-    _write_transcript(
-        projects_root / _encode_cwd(work_cwd) / 'session-1.jsonl',
-        cwd=work_cwd, timestamp='2026-07-13T10:00:00Z', session_id='session-1',
-    )
-
-    kwargs: dict[str, Any] = dict(
-        config_path=config_path,
-        projects_root=projects_root,
-        target_date=date(2026, 7, 13),
-        now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
-        invoke=_fake_invoke_known_cause,
-        status_fetcher=None,
-        poster=poster,
-    )
-    if branch == 'extractor':
-        monkeypatch.setattr(nightly, 'build_digests', _crashing_build_digests)
-    elif branch == 'storm':
-        kwargs['invoke'] = _fake_invoke_unparseable
-    elif branch == 'validation':
-        monkeypatch.setattr(
-            codebook, 'validate', lambda cb: ['synthetic validation error'],
-        )
-    elif branch == 'commit':
-        kwargs['committer'] = _failing_committer
-    else:  # pragma: no cover - guards a typo'd parametrize id
-        raise AssertionError(f'unknown decision-8 branch {branch!r}')
-
-    return nightly.run_nightly(**kwargs)
-
 
 @pytest.mark.parametrize(
     ('branch', 'summary_marker', 'detail_marker'),
@@ -3607,8 +3617,9 @@ def test_every_fail_loud_branch_journals_its_reason_with_the_server_down(
         raise RuntimeError('escalation server unreachable')
 
     with caplog.at_level(logging.DEBUG, logger='legibility.nightly'):
-        result = _run_decision8_branch(
-            tmp_path, monkeypatch, branch, poster=_raising_poster,
+        result, _repo = _run_e2e_nightly(
+            tmp_path, monkeypatch=monkeypatch, branch=branch,
+            poster=_raising_poster,
         )
 
     assert result.exit_code == 1
