@@ -38,6 +38,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from fused_memory.models.enums import MEM0_PRIMARY
+
 if TYPE_CHECKING:
     from fused_memory.models.memory import MemoryResult
 
@@ -306,3 +308,56 @@ def decide_band(
         return BandDecision(OUTCOME_RESTATED, best.id, similarity, t_high, t_low)
 
     return BandDecision(OUTCOME_JUDGE, best.id, similarity, t_high, t_low)
+
+
+# --- candidate retrieval ----------------------------------------------------
+
+#: The one store triage searches. Graphiti exposes no similarity scores, so a
+#: Graphiti hit carries no ``store_score`` and can never be a comparable
+#: candidate — asking for it would cost a fan-out that cannot affect the
+#: decision.
+_TRIAGE_STORES = ['mem0']
+
+
+async def retrieve_candidates(
+    memory_service: Any,
+    content: str,
+    project_id: str,
+    k: int,
+) -> list[MemoryResult]:
+    """Fetch up to *k* comparable candidates for *content*, cross-category.
+
+    Two things about this call are load-bearing.
+
+    (1) The categories are ALL THREE Mem0-primary categories, deliberately.
+    The retired near-dup guard filtered candidates to the WRITE's own category
+    (``near_duplicate_guard.find_near_duplicate_memory``'s ``category``
+    parameter), which was a measured blind spot: reify esc-5547 and esc-5560
+    were both cross-category duplicates it structurally could not see. The set
+    is imported from :data:`fused_memory.models.enums.MEM0_PRIMARY` rather
+    than spelled out here, so there is one home for it (INV-5) and a category
+    added later is triaged without an edit to this module.
+
+    (2) Retrieval goes through the ``MemoryService.search`` SEAM and nowhere
+    else. Task 3111 lands topic-anchored recall at that seam; this call
+    inherits it the day it lands. Do NOT build a topic-aware retrieval here —
+    a second implementation is a second thing to keep in sync, and the seam
+    note in this module's docstring exists to forbid exactly that.
+
+    COST, stated plainly as the retired guard's call site stated it: this is
+    an embedding plus a vector round-trip on EVERY triaged write, so it is on
+    the latency path of ordinary memory writes. ``write_triage.enabled: false``
+    is the escape hatch, and it is the shipped default.
+
+    Exceptions PROPAGATE. Fail-open is :func:`triage_write`'s job, and
+    swallowing here would turn a wiring bug — a renamed kwarg, a changed
+    signature — into a silent "no candidates found" that routes every write to
+    ``stored`` with nothing to tell it apart from a genuinely novel corpus.
+    """
+    return await memory_service.search(
+        query=content,
+        project_id=project_id,
+        categories=sorted(category.value for category in MEM0_PRIMARY),
+        stores=list(_TRIAGE_STORES),
+        limit=k,
+    )
