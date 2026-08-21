@@ -900,9 +900,9 @@ async def test_b1e_no_pre_flight_event_when_the_resume_succeeds(
     """
     harness.config.session_resume = SessionResumeConfig()
 
-    for idx, (task_id, session_id, kw) in enumerate((
-        ('83', 'uuid-b1e-live', {'seed_transcript': True}),
-        ('84', 'uuid-b1e-restored', {'seed_archive': True}),
+    for idx, (task_id, session_id, mode) in enumerate((
+        ('83', 'uuid-b1e-live', 'live'),
+        ('84', 'uuid-b1e-restored', 'restored'),
     )):
         _setup_warm_lane_session(harness, task_id, session_id, role='implementer')
         await harness._recover_crashed_tasks()
@@ -911,13 +911,14 @@ async def test_b1e_no_pre_flight_event_when_the_resume_succeeds(
 
         cap = await _drive_resumed_invoke(
             tmp_path, recovered, IMPLEMENTER, caplog, task_id=task_id,
-            event_store=store, slug=f'b1e-{idx}', **kw,
+            event_store=store, slug=f'b1e-{idx}',
+            seed_transcript=mode == 'live', seed_archive=mode == 'restored',
         )
 
-        assert cap.kwargs['resume_session_id'] == session_id, kw
-        assert store.of_type(EventType.session_resume_failed) == [], kw
+        assert cap.kwargs['resume_session_id'] == session_id, mode
+        assert store.of_type(EventType.session_resume_failed) == [], mode
         for et in _PER_DISPATCH_RESUME_EVENTS:
-            assert store.of_type(et) == [], kw
+            assert store.of_type(et) == [], mode
 
 
 # ── B1e: the CLI-stage instrumentation event ────────────────────────────────
