@@ -44,11 +44,13 @@ import pytest
 from _workflow_helpers import FakeBriefing, FakeMcp, FakeScheduler
 from escalation.queue import EscalationQueue
 from shared.task_statuses import TaskStatus
+from shared.task_transitions import outcome_allows_status
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.workflow import TaskWorkflow
 from orchestrator.workflow_types import (
+    StewardReescalatedL1,
     StewardResolved,
     StewardTerminalDecision,
     WorkflowOutcome,
@@ -115,6 +117,15 @@ def _make_workflow(
 def _statuses(workflow: TaskWorkflow) -> list[str]:
     assert isinstance(workflow.scheduler, FakeScheduler)
     return workflow.scheduler.statuses.get(TASK_ID, [])
+
+
+def _wire_steward(workflow: TaskWorkflow, outcome) -> None:
+    """Drive ``_mark_blocked``'s steward branch straight to *outcome*."""
+    workflow._ensure_steward_started = AsyncMock()  # type: ignore[method-assign]
+    workflow._steward = MagicMock()
+    workflow._await_steward_completion = AsyncMock(  # type: ignore[method-assign]
+        return_value=outcome,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -184,6 +195,15 @@ class TestMergePhaseBlockedWritesParkStatus:
             f'merge_phase={merge_phase}: block_status must be honoured by the '
             f'merge-aware park write; got {_statuses(workflow)!r}'
         )
+        # ...and the row it writes must SURVIVE run()'s SM-2 check.  Writing a
+        # status the outcome<->status table forbids would raise AssertionError
+        # straight out of run(), so pin the pairing rather than assuming it:
+        # 'infra-hold' is a legitimate BLOCKED exit row (PRD C7/D3), just on
+        # the status is_infra_held keys on.
+        assert outcome_allows_status(outcome.value, 'infra-hold') is True, (
+            "_OUTCOME_ALLOWED['blocked'] must admit INFRA_HOLD — otherwise "
+            'this very write makes SM-2 raise out of run()'
+        )
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize('merge_phase', [False, True], ids=['plain', 'merge_phase'])
@@ -214,6 +234,69 @@ class TestMergePhaseBlockedWritesParkStatus:
         assert len(pending) == 1 and pending[0].level == 1
 
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('merge_phase', [False, True], ids=['plain', 'merge_phase'])
+    async def test_steward_reescalated_l1_slot_exit_writes_row(
+        self, tmp_path: Path, merge_phase: bool,
+    ) -> None:
+        """The THIRD slot exit: ``StewardReescalatedL1`` returns ESCALATED.
+
+        A different outcome, the same obligation.  ``_run_merge_phase`` exits
+        the slot on ANY non-DONE/non-REQUEUED outcome (``return
+        merge_outcome``), so an unwritten row here strands exactly the same
+        unclaimed ``in-progress`` shape a BLOCKED return would — and SM-2
+        cannot catch it, because ``outcome_allows_status('escalated',
+        'in-progress')`` is True (asserted below so the blind spot is on the
+        record, not assumed).
+        """
+        workflow = _make_workflow(tmp_path, with_queue=True)
+        workflow._enter_phase(WorkflowState.MERGE)
+        _wire_steward(workflow, StewardReescalatedL1(esc_id='esc-3537-99'))
+
+        outcome = await workflow._mark_blocked(
+            'merge verification failed', merge_phase=merge_phase,
+        )
+
+        assert outcome == WorkflowOutcome.ESCALATED
+        assert outcome_allows_status(outcome.value, 'in-progress') is True, (
+            'SM-2 is blind to an in-progress row on an ESCALATED exit, which '
+            'is precisely why this park write has to be unconditional'
+        )
+        assert _statuses(workflow)[-1:] == ['blocked'], (
+            f'merge_phase={merge_phase}: the steward handed off to a human and '
+            f'this return EXITS THE SLOT, so the row must be parked (INV-6); '
+            f'got statuses={_statuses(workflow)!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_steward_reescalated_l1_files_no_extra_human_record(
+        self, tmp_path: Path,
+    ) -> None:
+        """The park write must not disturb what the branch is FOR.
+
+        On this branch the steward's ``_auto_escalate_to_human`` has already
+        filed the human-facing L1 (and, in production, dismissed the L0 this
+        call filed for it on the way IN — the stub steward here cannot, so that
+        L0 is still pending).  Adding a row to the task must not add a record:
+        the only pending escalation is that steward-facing L0, and no second L1
+        appears.
+        """
+        workflow = _make_workflow(tmp_path, with_queue=True)
+        workflow._enter_phase(WorkflowState.MERGE)
+        _wire_steward(workflow, StewardReescalatedL1(esc_id='esc-3537-99'))
+
+        await workflow._mark_blocked(
+            'merge verification failed', merge_phase=True,
+        )
+
+        assert workflow.escalation_queue is not None
+        levels = [e.level for e in workflow.escalation_queue.get_pending()]
+        assert levels == [0], (
+            'the steward owns the human-facing L1 on this branch; the park '
+            f'write must not add one — pending levels {levels!r}'
+        )
+
+
 # ---------------------------------------------------------------------------
 # The Chesterton's fence — the two returns that must NOT write
 # ---------------------------------------------------------------------------
@@ -226,14 +309,6 @@ class TestMergePhaseFencePreserved:
     because ``outcome_allows_status('requeued', BLOCKED)`` is True.
     """
 
-    @staticmethod
-    def _wire_steward(workflow: TaskWorkflow, outcome) -> None:
-        workflow._ensure_steward_started = AsyncMock()  # type: ignore[method-assign]
-        workflow._steward = MagicMock()
-        workflow._await_steward_completion = AsyncMock(  # type: ignore[method-assign]
-            return_value=outcome,
-        )
-
     @pytest.mark.asyncio
     async def test_requeue_retry_in_place_writes_neither_status(
         self, tmp_path: Path,
@@ -244,7 +319,7 @@ class TestMergePhaseFencePreserved:
         carried by ``metadata.merge_retry_pending``."""
         workflow = _make_workflow(tmp_path, with_queue=True)
         workflow._enter_phase(WorkflowState.MERGE)
-        self._wire_steward(workflow, StewardResolved(resolution_text='fixed on main'))
+        _wire_steward(workflow, StewardResolved(resolution_text='fixed on main'))
         stamp = AsyncMock()
         workflow._stamp_merge_retry_pending = stamp  # type: ignore[method-assign]
 
@@ -274,7 +349,7 @@ class TestMergePhaseFencePreserved:
         from silently clobbering a human-visible adjudication."""
         workflow = _make_workflow(tmp_path, with_queue=True)
         workflow._enter_phase(WorkflowState.MERGE)
-        self._wire_steward(
+        _wire_steward(
             workflow, StewardTerminalDecision(new_status=TaskStatus.DEFERRED),
         )
 

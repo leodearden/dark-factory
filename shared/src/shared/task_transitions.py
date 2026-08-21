@@ -302,6 +302,14 @@ _OUTCOME_ALLOWED: dict[str, frozenset[TaskStatus]] = {
     # divergence E10's scope, and doing it in isolation would turn every
     # still-legitimate preserve path above into a hard AssertionError from
     # run()'s SM-2 check.
+    # INFRA_HOLD is the infra-hold PARK ROW: _mark_blocked(block_status=
+    # 'infra-hold') writes the first-class infra-hold status (PRD C7/D3) and
+    # then returns BLOCKED, so 'infra-hold' is a legitimate BLOCKED exit row —
+    # exactly like BLOCKED, just on the status the harness HOLD guard and
+    # RESUME cascade key on (is_infra_held).  Omitting it made SM-2 raise
+    # AssertionError out of run() on a row the writer had deliberately parked;
+    # task 3537 added the same block_status pass-through to the merge-phase
+    # park write, which would have widened that trap to a second path.
     'blocked': frozenset(
         {
             TaskStatus.BLOCKED,
@@ -309,14 +317,20 @@ _OUTCOME_ALLOWED: dict[str, frozenset[TaskStatus]] = {
             TaskStatus.DEFERRED,
             TaskStatus.MERGE_DEFERRED,
             TaskStatus.IN_PROGRESS,
+            TaskStatus.INFRA_HOLD,
         }
     ),
     # Self-repend / deferred-to-stranded-sweep window / requeue-cap
     # exhausted -> blocked.
     'requeued': frozenset({TaskStatus.PENDING, TaskStatus.IN_PROGRESS, TaskStatus.BLOCKED}),
     # Dominant _mark_blocked + open L1 / merge-gating bail preserves
-    # in-progress.
-    'escalated': frozenset({TaskStatus.BLOCKED, TaskStatus.IN_PROGRESS}),
+    # in-progress.  INFRA_HOLD for the same reason as in 'blocked' above: the
+    # infra-hold park row is written by _mark_blocked's ENTRY gate, BEFORE the
+    # branch that picks BLOCKED vs ESCALATED, so the same row can reach either
+    # exit and the two keys must agree about it.
+    'escalated': frozenset(
+        {TaskStatus.BLOCKED, TaskStatus.IN_PROGRESS, TaskStatus.INFRA_HOLD}
+    ),
     'cancelled': frozenset({TaskStatus.CANCELLED}),
     'merge-deferred': frozenset({TaskStatus.MERGE_DEFERRED}),
     # preserved / release_workflow park->blocked / stranded-sweep->pending.

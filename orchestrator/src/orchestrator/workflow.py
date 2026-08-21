@@ -3922,10 +3922,14 @@ class TaskWorkflow:
             await self._wait_for_resolution()
         except _StewardReescalated as reesc:
             # Byte-for-byte the shape at :2643-2647.  merge_phase stays at its
-            # default False so the row actually lands `blocked` (spec S1); the
-            # merge_phase=True carve-out writes no status at all (spec
-            # divergence E2) and this path is exiting the slot, not retrying a
-            # queue submission.
+            # default False so the row lands `blocked` at _mark_blocked's ENTRY
+            # gate (spec S1).  Post-3537 a merge_phase=True call would also
+            # write it — the suppression now covers only the ENTRY transition,
+            # and every slot-exiting return parks the row via
+            # _park_merge_phase_row — but False remains correct and clearer
+            # here: this path exits the slot outright, it does not retry a
+            # queue submission in-place, which is the ONLY thing merge_phase
+            # is for.
             return await self._mark_blocked(
                 'Steward re-escalated to human',
                 detail=_format_reescalation_detail(reesc.escalations),
@@ -14961,10 +14965,13 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         # VERIFY/REVIEW) BEFORE the `if not merge_phase` branch below calls
         # _enter_phase(BLOCKED) — mirrors the deleted `_last_block_phase =
         # self.state.value` pre-block stash.  Threaded into _record so every
-        # return point (including the merge_phase=True paths, which never
-        # transition) stamps TerminalReport.blocked_from_phase with the phase
+        # return point stamps TerminalReport.blocked_from_phase with the phase
         # this call was entered at, distinct from `phase` (machine.state at
-        # _record time, kept == machine.state for SM-2).
+        # _record time, kept == machine.state for SM-2).  That includes the
+        # merge_phase=True paths: since task 3537 their SLOT-EXITING returns do
+        # transition, via _park_merge_phase_row's _enter_phase(BLOCKED) — the
+        # snapshot must still be taken here, BEFORE any of them runs.  Only the
+        # retry-in-place REQUEUED arm truly never transitions.
         pre_block_state = self.machine.state
 
         def _record(outcome: WorkflowOutcome) -> WorkflowOutcome:
@@ -15239,10 +15246,29 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 if isinstance(outcome, StewardReescalatedL1):
                     # The steward's _auto_escalate_to_human already filed the
                     # L1 and dismissed its L0 before publishing this outcome —
-                    # nothing left for _mark_blocked to do.
+                    # no ESCALATION left for _mark_blocked to file.
+                    #
+                    # The ROW is still owed, though (task 3537, review
+                    # amendment).  This is a SLOT EXIT — _run_merge_phase
+                    # treats any non-DONE/non-REQUEUED outcome as `return
+                    # merge_outcome` — so under merge_phase=True the entry
+                    # gate's suppression would leave an `in-progress` row with
+                    # no live claimant and an open L1: exactly the unclaimed
+                    # strand this task exists to eliminate, and invisible to
+                    # SM-2 because outcome_allows_status('escalated',
+                    # IN_PROGRESS) is True.  Same _park_merge_phase_row target
+                    # as the two BLOCKED slot exits (no-op when merge_phase is
+                    # False, where the entry gate already wrote the row) —
+                    # which is what makes run()'s ESCALATED-branch comment
+                    # ("status='blocked' was already written") true on every
+                    # path rather than only the non-merge ones.
+                    await self._park_merge_phase_row(
+                        merge_phase, block_status,
+                        why=f'steward re-escalated to human: {reason[:80]}',
+                    )
                     logger.info(
                         'Task %s: L1 escalation open — steward handed '
-                        'off to human; leaving status as-is and exiting',
+                        'off to human; exiting ESCALATED',
                         self.task_id,
                     )
                     return _record(WorkflowOutcome.ESCALATED)
@@ -15408,7 +15434,15 @@ Update the plan to address the blocking issues. You may add new steps to the `st
     async def _park_merge_phase_row(
         self, merge_phase: bool, block_status: str, *, why: str,
     ) -> None:
-        """Write the park status for a ``merge_phase=True`` BLOCKED slot exit.
+        """Write the park status for a ``merge_phase=True`` SLOT-EXITING return.
+
+        Called from all three of :meth:`_mark_blocked`'s slot-exiting returns —
+        the ``escalate_to_human`` short-circuit, the ``StewardReescalatedL1``
+        ESCALATED hand-off, and the final BLOCKED fall-through.  (The outcome
+        differs; the obligation does not.  ``_run_merge_phase`` exits the slot
+        on any non-DONE/non-REQUEUED outcome, so ESCALATED strands an
+        unclaimed row just as BLOCKED would, and SM-2 cannot see it because
+        ``outcome_allows_status('escalated', IN_PROGRESS)`` is True.)
 
         No-op when *merge_phase* is False: that call already wrote
         ``block_status`` at :meth:`_mark_blocked`'s entry gate, and re-writing
@@ -15416,8 +15450,8 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         short-circuit, could resurrect a row the entry write's
         ``TerminalExitRejection`` handler deliberately left terminal).
 
-        When *merge_phase* is True the entry gate suppressed the write, but a
-        BLOCKED return EXITS THE SLOT with no live claimant — so INV-6
+        When *merge_phase* is True the entry gate suppressed the write, but
+        these returns EXIT THE SLOT with no live claimant — so INV-6
         (status-matches-liveness) obliges the write here instead.  Routed
         through :meth:`_persist_blocked_row` rather than a bare
         ``set_task_status`` so this inherits its fail-safe contract: a
