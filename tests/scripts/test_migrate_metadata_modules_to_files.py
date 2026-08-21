@@ -32,6 +32,7 @@ of a live server.
 """
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
 from typing import Any
@@ -43,9 +44,11 @@ from typing import Any
 # was "deliberately absent" from that table; declaring the `scripts` module's
 # type gate required the opposite. Same correction in
 # tests/scripts/test_repair_wiped_metadata_files.py.
+import migrate_metadata_modules_to_files as migrate_mod
 from migrate_metadata_modules_to_files import (
     FusedMemoryClient,
     _migrate_one_project,
+    main_async,
 )
 
 # The repo root's conftest.py puts shared/src on sys.path for the whole suite,
@@ -335,3 +338,110 @@ def test_the_write_drops_done_provenance_and_preserves_every_other_key():
         'milestone': '2026-09-01',
         'x_note': 'keep me',
     }
+
+
+class _CannedServer:
+    """Stand in for the ``FusedMemoryClient`` CLASS so ``main_async`` can be driven.
+
+    ``main_async`` builds its client with ``async with FusedMemoryClient(url)``,
+    so the seam for a serverless end-to-end test is the class name in the
+    module namespace, not the instance. This object is callable (standing in for
+    the constructor) and is its own async context manager, yielding the
+    :class:`_CannedProject` every root then shares.
+
+    Driving the REAL ``main_async`` rather than re-deriving its arithmetic here
+    is the point: the per-project line and the ``---- summary ----`` totals are
+    the operator-facing surface this task has to change, and a test that
+    recomputed them from the returned counts could not see them go wrong.
+    """
+
+    def __init__(self, project: _CannedProject) -> None:
+        self._project = project
+
+    def __call__(self, server_url: str) -> _CannedServer:
+        return self
+
+    async def __aenter__(self) -> _CannedProject:
+        return self._project
+
+    async def __aexit__(self, *exc: Any) -> None:
+        return None
+
+
+def _run_main(monkeypatch: Any, client: _CannedProject, *, dry_run: bool = False) -> int:
+    """Drive ``main_async`` end to end against *client*, one project root."""
+    monkeypatch.setattr(migrate_mod, 'FusedMemoryClient', _CannedServer(client))
+    return asyncio.run(main_async(argparse.Namespace(
+        server_url='http://127.0.0.1:9', dry_run=dry_run, project_roots=['/p'],
+    )))
+
+
+def _one_of_each() -> _CannedProject:
+    """A canned project holding exactly one task per outcome, plus one no-op.
+
+    Shared by the accounting tests so the expected counter tuple is read against
+    a single, legible population rather than a per-test ad-hoc one.
+    """
+    return _CannedProject([
+        _task('copy-file', modules=['scripts/a.py']),
+        _task('copy-dirs', modules=['orchestrator/tests/']),
+        _task('drop', modules=['crates/reify-core'], files=['src/b.py']),
+        _task('untouched', priority='low'),
+    ])
+
+
+def test_a_sanitize_to_nothing_is_counted_apart_from_a_real_copy():
+    """THE HONEST-ACCOUNTING FIX: three outcomes, not two.
+
+    Before this, both copy-branch outcomes fell through the same
+    ``if action == 'copy'`` tail, so an all-directory task that copied NOTHING
+    was reported as a copy. On the live corpora that is 11 of 11 — the PR's
+    before/after table would have claimed "copied: 11" describing zero copied
+    files, which is precisely the number a reader would use to decide the
+    migration had given those tasks their scope back.
+
+    ``dropped`` and ``visited`` are asserted in the same tuple so a fix that
+    invented ``sanitized_empty`` by cannibalising one of them goes red.
+    """
+    counts = _run(_one_of_each())
+
+    assert (counts.visited, counts.copied, counts.sanitized_empty, counts.dropped) == (
+        4, 1, 1, 1,
+    )
+
+
+def test_the_outcome_is_decided_by_the_sanitized_result_not_by_files_alone():
+    """A mixed list that KEEPS something is a real copy; one that keeps nothing is not.
+
+    The distinguishing input is identical on the ``files`` axis — both tasks
+    have no ``files`` — so an implementation that still branches on ``files``
+    alone cannot separate them. Only the post-charter result can, which is what
+    this pins.
+    """
+    counts = _run(_CannedProject([
+        _task('survives', modules=['orchestrator/tests/', 'hooks/pre-commit']),
+        _task('vanishes', modules=['orchestrator/tests/', 'crates/reify-ir']),
+    ]))
+
+    assert (counts.copied, counts.sanitized_empty) == (1, 1)
+
+
+def test_the_per_project_line_and_the_summary_both_name_sanitized_empty(monkeypatch, capsys):
+    """The count has to reach the OPERATOR, not just the return value.
+
+    The PR's before/after table is transcribed from this stdout, and the run
+    evidence committed alongside it quotes the summary verbatim. A
+    ``sanitized_empty`` that exists only on the result object would leave that
+    table reporting two numbers for three outcomes.
+
+    Both surfaces are asserted because they are separate call sites in
+    ``main_async`` — the per-root line and the aggregate — and a fix that
+    updated one and not the other is exactly the plausible half-done change.
+    """
+    _run_main(monkeypatch, _one_of_each())
+
+    out = capsys.readouterr().out
+    per_project, summary = out.split('---- summary ----')
+    assert 'sanitized_empty' in per_project
+    assert 'sanitized_empty: 1' in summary
+    assert 'copied' in summary and 'dropped' in summary
