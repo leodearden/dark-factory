@@ -397,7 +397,12 @@ Write operations:
 - add_memory: Lightweight classified write (skip extraction, direct store)
 
 Read operations:
-- search: Unified search across both stores with automatic routing
+- search: Unified search across both stores with automatic routing. Finding any member of a
+  consolidated cluster also surfaces that topic's CANONICAL record, promoted to first and
+  flagged topic_anchored=True (its relevance_score is not meaningful — it is pinned by order,
+  and the window stays exactly `limit` long, so the pin costs the lowest-ranked result its
+  slot). NOTE this is currently a no-op for almost every search: stamping coverage, not
+  ranking, is the binding constraint, and that coverage is still being built out.
 - get_entity: Direct entity lookup in the knowledge graph
 - get_episodes: Retrieve raw episode history
 - scan_memory_content: Literal substring scan over Mem0 memory TEXT (deterministic, not semantic) — use when search cannot find a string because it carries no semantic signal
@@ -3308,6 +3313,26 @@ def create_mcp_server(
             hit is a child whose parent_id no store could resolve, and it stays
             a top-level hit.  A record that is neither a child nor has children
             carries no 'grouped' key at all.
+
+            TOPIC-PINNED RESULTS (task 3111).  Every result carries a
+            'topic_anchored' bool.  When True, that result was PROMOTED into
+            the window BY RULE rather than earned its place by rank: a search
+            whose results carry a metadata.topic looks up that topic's
+            canonical:true record and seats it first.  'relevance_score' is NOT
+            meaningful for such a result — it is pinned by ORDER, never by
+            score.  Promotion is not addition: the window stays exactly `limit`
+            long, so a pin costs the lowest-ranked result its slot.  This
+            COMPOSES WITH, rather than replaces, the parent_id grouping
+            described above — pinning happens first, in the service, and
+            grouping then runs over the pinned list.
+
+            HONESTY CAVEAT: on the live corpus today this is a NO-OP for almost
+            every search.  Stamping COVERAGE, not ranking, is the binding
+            constraint — metadata.topic is present on 491 of 49,628 records and
+            metadata.canonical:true on 6 — and coverage is task 4006's scope
+            (still PENDING), not this transform's.  No live-corpus recall
+            improvement is claimed.  Task 3659 (briefing assembler) is a FUTURE
+            consumer, explicitly not a live one.
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
         project_id, err = _canonicalize_project_id_arg(project_id)

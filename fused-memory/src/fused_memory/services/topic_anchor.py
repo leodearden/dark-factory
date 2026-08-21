@@ -62,6 +62,10 @@ task 4006's scope (still PENDING), not this module's.  4006's census measured
 on 6.  So this transform fires for almost no search on the live corpus as it
 stands, and no user-observable live-corpus recall improvement is claimed here.
 Task 3659 (briefing assembler) is a FUTURE consumer, explicitly not a live one.
+
+The same caveat is carried in the ``search`` MCP tool docstring and in
+``FUSED_MEMORY_INSTRUCTIONS``, so an agent reading either learns both that the
+pin exists and that it is currently inert on most queries.
 """
 
 from __future__ import annotations
