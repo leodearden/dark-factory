@@ -1212,10 +1212,20 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         The parsed namespace, with ``fail_on_blind_spot`` resolved to a
         concrete ``bool`` (never the ``None`` sentinel).
 
+    ``--list-known-projects`` (task 2917) extends the same
+    rejecting-combinations-that-would-silently-no-op contract in the other
+    direction: it RETURNS from ``main`` before the sweep runs, so combining it
+    with a sweep-performing or verdict-rendering flag (``--apply``,
+    ``--check``, ``--terminal-drain``, a non-empty ``--delete-ids``) would
+    print the project list and silently skip the drain. An operator who added
+    it to the nightly ``--apply --terminal-drain`` service would get a green
+    run that drained nothing, so those combinations are rejected too.
+
     Raises:
         SystemExit: Code 2, via ``parser.error``, when either
             ``--fail-on-blind-spot`` or ``--no-fail-on-blind-spot`` is passed
-            without ``--check``.
+            without ``--check``, or when ``--list-known-projects`` is combined
+            with a sweep-performing/verdict-rendering flag.
     """
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -1239,6 +1249,31 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             f'or drop {passed}: the blind spot is reported in the log and in '
             "the JSON report's cross_check block either way."
         )
+    # task 2917: --list-known-projects returns before the sweep, so any of
+    # these would print the list and silently skip the drain. Sits HERE,
+    # alongside the check above and BEFORE the tri-state resolution below, so
+    # it cannot disturb the load-bearing ordering that keys the
+    # --fail-on-blind-spot rejection on explicit passage.
+    if args.list_known_projects:
+        conflicting = [
+            flag for flag, passed in (
+                ('--apply', args.apply),
+                ('--check', args.check),
+                ('--terminal-drain', args.terminal_drain),
+                ('--delete-ids', bool(args.delete_ids)),
+            ) if passed
+        ]
+        if conflicting:
+            parser.error(
+                f'--list-known-projects cannot be combined with '
+                f'{", ".join(conflicting)}: --list-known-projects prints the '
+                'registered project_ids and RETURNS before the sweep runs, so '
+                'the combination would silently skip the drain entirely — a '
+                'run that looks green while sweeping nothing. Run '
+                '--list-known-projects on its own to resolve the list, then '
+                'invoke the sweep once per project_id (this is what '
+                'scripts/fused-memory-flag-marker-sweep.sh does).'
+            )
     # Resolve the tri-state sentinel AFTER the validation above — see the
     # load-bearing-ordering paragraph in this function's docstring.
     if args.fail_on_blind_spot is None:
