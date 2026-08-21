@@ -2835,6 +2835,26 @@ class TestInv5IsLoadOrderIndependent:
         finally:
             self._restore_bake_off_module(saved)
 
+    def test_every_reexported_name_is_the_bake_offs_definition(self):
+        """INV-5 covers the whole re-export set, not two hand-picked names.
+
+        `_rate` has never had an INV-5 assertion because the re-export set
+        used to be a bare literal inside `__getattr__`'s body, not
+        introspectable from outside it — a fourth re-export could have been
+        added with no check at all.  `_REEXPORTED_FROM_BAKE_OFF` (task 4583)
+        closes that gap: this test walks it instead of hand-picking names.
+        """
+        mod = _mod()
+        names = mod._REEXPORTED_FROM_BAKE_OFF
+        assert names == ('_mean', '_rate', '_cell')
+        for name in names:
+            _assert_reexported_from_bake_off(mod, name)
+
+    def test_an_unknown_attribute_still_raises(self):
+        """The PEP 562 hook must not turn typos into silent bake-off lookups."""
+        with pytest.raises(AttributeError):
+            _mod()._definitely_not_a_real_name
+
 
 # ===========================================================================
 # step-21 — the COMMITTED artifact pair, asserted as DATA
