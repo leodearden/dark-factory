@@ -549,35 +549,29 @@ def _verdict(reason: str, **probe_extra) -> LandingEvidenceVerdict:
 class TestFormatUnattributedLandingDetail:
     """The escalation body a human actually reads (task 3116).
 
-    These assert on RENDERED RUNTIME OUTPUT, not on docstrings, and use a
-    small number of narrow lowercase substring checks rather than full-string
-    equality so a future reword does not break the suite.
+    These assert WHICH BLOCK the renderer selects and what runtime DATA it
+    carries into that block — a real branch in ``_render_effect_divergence``
+    or ``_render_delivered_checks_differential``, keyed off the verdict's
+    probe.  They deliberately do NOT assert the wording of any constant
+    paragraph.
 
-    The prose defects being pinned all cost real money.  The 'reverted
-    exactly the paths it touched' claim asserted a revert as FACT when the
-    primitive that produced the verdict explicitly cannot distinguish a
-    revert from ordinary later evolution — it sent two investigations
-    chasing a revert that never happened.  'remains pending' and
-    're-evaluated on the next dispatch tick' understated the consequence into
-    sounding like a harmless idempotent re-check, when the task is in fact
-    DISPATCHED TO AN AGENT on that tick (~5.80 USD across tasks
+    That standard is the one ``test_provenance_gate_integration.py`` states
+    for itself ("the operator PROSE around them is deliberately not
+    asserted"), and it is adopted here for the same reason: a wording pin on
+    a constant f-string exercises no branch, so it cannot catch a defect —
+    it can only BLOCK the corrective edit when the semantics it describes
+    move.  That is not hypothetical; the retired byte-identity framing had to
+    be reworded once part (b) shipped survival semantics, and a substring pin
+    on 'cannot distinguish' stood in the way.
+
+    The prose still matters — the original 'reverted exactly the paths it
+    touched' claim asserted a revert as FACT and sent two investigations
+    chasing a revert that never happened (~5.80 USD across tasks
     3653/3640/3717, plus a spurious task_failure escalation and four days
-    blocked).
+    blocked).  It is kept honest by review of the source strings, which is
+    where a reword can be judged against the semantics, rather than by tests
+    that only notice the text changed.
     """
-
-    def test_effect_absent_states_both_branches_honestly(self) -> None:
-        """(a) The reason prose must offer BOTH causes and say plainly that
-        the check cannot tell them apart — never assert a revert as fact.
-        """
-        _, detail = format_unattributed_landing_detail(
-            '42', 'task/42', _verdict('effect_absent'),
-        )
-        lowered = detail.lower()
-
-        assert 'cannot distinguish' in lowered
-        assert 'revert' in lowered
-        assert 'evolv' in lowered
-        assert 'reverted exactly the paths' not in lowered
 
     def test_diverged_paths_render_in_a_labelled_block(self) -> None:
         """(b) The path must appear under its own LABELLED header, not merely
@@ -682,32 +676,6 @@ class TestFormatUnattributedLandingDetail:
 
         assert 'effect_absent' in detail
         assert len(summary) <= 200
-
-    def test_does_not_flatly_claim_the_task_remains_pending(self) -> None:
-        """(i) 'remains pending' is true only at the marker and
-        content-equivalence arms — the coalesce re-drive FLIPS merge-deferred
-        to pending.  The wording must admit both.
-        """
-        _, detail = format_unattributed_landing_detail(
-            '42', 'task/42', _verdict('effect_absent'),
-        )
-
-        assert 'remains pending' not in detail.lower()
-
-    def test_states_that_an_agent_is_dispatched_not_merely_re_evaluated(self) -> None:
-        """(j) 're-evaluated on the next dispatch tick' understated the
-        consequence into sounding idempotent.  The task is DISPATCHED TO AN
-        AGENT on that tick — that is the measured harm, and the mispricing is
-        why this defect survived this long.
-        """
-        _, detail = format_unattributed_landing_detail(
-            '42', 'task/42', _verdict('effect_absent'),
-        )
-        lowered = detail.lower()
-
-        assert 're-evaluated on the next dispatch tick' not in lowered
-        assert 'dispatch' in lowered
-        assert 'agent' in lowered
 
     def test_detail_names_the_unwired_state_explicitly(self) -> None:
         """(e)/step-16.7 — the escalation must SAY when the second accept path

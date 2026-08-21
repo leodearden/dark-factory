@@ -579,14 +579,21 @@ _REASON_EXPLANATIONS: dict[str, str] = {
         'nothing) — there is no positive evidence to attribute a landing to.'
     ),
     'effect_absent': (
-        "The evidence commit's own effect is not present at current main "
-        "HEAD (FIX 1', task 2500/2675) — the paths it touched no longer "
-        'match main HEAD. This means EITHER a later commit reverted them OR '
-        'they simply evolved further (another already-landed task\'s '
-        'follow-up edit, or a merge whose branch predates an unrelated '
-        'change to a co-touched file); this check CANNOT distinguish the '
-        'two. Judge the diverged paths below: if none of them is this '
-        "task's deliverable, this is skew, not a revert."
+        "The evidence commit's own effect did not SURVIVE to current main "
+        "HEAD (FIX 1', task 2500/2675, survival semantics from task 3116) "
+        '— too few of the lines it added are still present at main. This '
+        'is no longer the old byte-identity question ("has anyone touched '
+        'these paths since?"), so ordinary additive evolution — a later '
+        'task appending to the same file, a co-touched hot file, an '
+        'unrelated edit a merge integrated cleanly — does NOT land here. '
+        'What does land here is a genuine revert of the deliverable, a '
+        'heavy rewrite that replaced most of those lines (a refactor, a '
+        'reformat, an extraction), or a revert paired with unrelated '
+        'additions in the same files; this check cannot separate those '
+        'from one another. Judge the diverged paths below against what '
+        "this task actually delivered: if the task's deliverable is still "
+        'recognisably present at main, this is a rewrite reading as a '
+        'revert rather than a real one.'
     ),
 }
 
@@ -636,10 +643,10 @@ def format_unattributed_landing_detail(
         'full plan/verify/review cycle, not a cheap idempotent re-check. If '
         'this landing is genuine, that dispatch is pure waste and will '
         'REPEAT every tick, because this condition does not heal on its own. '
-        'Investigate why attribution/effect-present failed (e.g. ordinary '
-        'later evolution of the touched paths, a branch-alias landing, a '
-        'genuine reverted merge, an unattributed commit, or a missing '
-        'task-citing commit); resolve this escalation once confirmed.'
+        'Investigate why attribution/effect-survival failed (e.g. a heavy '
+        'rewrite of the touched paths, a branch-alias landing, a genuine '
+        'reverted merge, an unattributed commit, or a missing task-citing '
+        'commit); resolve this escalation once confirmed.'
     )
     return summary, detail
 

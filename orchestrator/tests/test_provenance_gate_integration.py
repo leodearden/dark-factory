@@ -339,7 +339,9 @@ def _lines(prefix: str, count: int) -> str:
     return ''.join(f'{prefix}_{i:05d} = {i}\n' for i in range(count))
 
 
-async def _land_branch_marker(repo: Path, task_id: str, mutate) -> str:
+async def _land_branch_marker(
+    repo: Path, task_id: str, mutate, main_edit=None,
+) -> str:
     """Land ``task/{task_id}`` via a ``Merge task/N into main`` no-ff marker.
 
     *mutate* is called with *repo* on the branch and may write OR delete files
@@ -348,6 +350,16 @@ async def _land_branch_marker(repo: Path, task_id: str, mutate) -> str:
     deleted after the merge, exactly as ``cleanup_worktree`` does before
     ``set_task_status('done')`` lands, so only the marker can attribute the
     landing.  Returns the marker sha.
+
+    *main_edit*, when given, is called with *repo* back on main AFTER the
+    branch commit and BEFORE the merge, and its result is committed on main.
+    ORDER IS THE WHOLE POINT: the branch must fork BEFORE that edit, so
+    ``merge-base(parent1, parent2)`` precedes it and the ``--no-ff`` merge
+    genuinely auto-integrates two independent edits.  Making the edit first
+    and forking afterwards produces a fixture where main HEAD's tree for the
+    touched paths is byte-identical to parent2's — no divergence at all — so
+    even the retired byte-identity predicate would accept it and the test
+    would discriminate nothing.
     """
     branch = f'task/{task_id}'
     rc, _, err = await _run(['git', 'checkout', '-b', branch], cwd=repo)
@@ -356,6 +368,9 @@ async def _land_branch_marker(repo: Path, task_id: str, mutate) -> str:
     await _commit_all(repo, f'impl({task_id}): branch work')
     rc, _, err = await _run(['git', 'checkout', 'main'], cwd=repo)
     assert rc == 0, f'checkout main failed: {err}'
+    if main_edit is not None:
+        main_edit(repo)
+        await _commit_all(repo, "chore: an unrelated task's edit to a hot file")
     rc, _, err = await _run(
         ['git', 'merge', '--no-ff', branch, '-m', f'Merge {branch} into main'],
         cwd=repo,
@@ -397,6 +412,19 @@ class TestAlreadyLandedGateSurvivalSemantics:
         a co-touched file, and that false positive is what cost a full
         spurious dispatch.  The gate must now accept: mark_done awaited, no
         escalation.
+
+        The fixture ORDER is what makes this shape real, and is asserted
+        below rather than assumed.  The branch forks from the seeded manifest
+        FIRST and APPENDS its entry to the file as read from disk; only then
+        does the neighbour prepend its line on main.  So the fork point
+        precedes the neighbour commit, ``git merge --no-ff`` auto-integrates
+        two genuinely independent edits, and main HEAD carries BOTH — while
+        parent2's pre-merge blob carries only the branch's.  That is exactly
+        the divergence byte-identity rejected and survival accepts: the probe
+        must still NAME ``shared.manifest`` as diverged while reporting
+        ``present``.  ``test_git_ops.py``'s
+        ``test_merge_names_only_the_co_touched_hot_file`` is the unit-level
+        template for the same shape.
         """
         task_id = '3640'
         (git_repo / 'shared.manifest').write_text(_lines('shared', 40))
@@ -404,21 +432,34 @@ class TestAlreadyLandedGateSurvivalSemantics:
 
         def _branch_work(repo: Path) -> None:
             (repo / 'deliverable.py').write_text(_lines('deliv', 12))
-            (repo / 'shared.manifest').write_text(
-                _lines('shared', 40) + _lines('branch_entry', 3),
-            )
+            manifest = repo / 'shared.manifest'
+            manifest.write_text(manifest.read_text() + _lines('branch_entry', 3))
 
-        rc, _, err = await _run(['git', 'checkout', '-b', 'tmp/main-edit'], cwd=git_repo)
-        assert rc == 0, f'temp branch failed: {err}'
-        rc, _, err = await _run(['git', 'checkout', 'main'], cwd=git_repo)
-        assert rc == 0, f'checkout main failed: {err}'
-        (git_repo / 'shared.manifest').write_text(
-            _lines('neighbour', 1) + _lines('shared', 40),
+        def _neighbour_edit(repo: Path) -> None:
+            manifest = repo / 'shared.manifest'
+            manifest.write_text(_lines('neighbour', 1) + manifest.read_text())
+
+        marker_sha = await _land_branch_marker(
+            git_repo, task_id, _branch_work, main_edit=_neighbour_edit,
         )
-        await _commit_all(git_repo, "chore: an unrelated task's edit to the hot file")
-        marker_sha = await _land_branch_marker(git_repo, task_id, _branch_work)
+
+        merged_manifest = (git_repo / 'shared.manifest').read_text()
+        assert 'neighbour_00000' in merged_manifest, (
+            "main HEAD must carry the neighbour's independent edit"
+        )
+        assert 'branch_entry_00000' in merged_manifest, (
+            "main HEAD must carry the branch's own added lines"
+        )
 
         h = _wire_gate_harness(mock_orch_config, git_repo, task_id=task_id)
+        probe = await h.git_ops.describe_commit_effect_in_main(marker_sha)
+        assert 'shared.manifest' in probe.diverged_paths, (
+            'the co-touched hot file must diverge from parent2 — that '
+            'divergence IS the false positive byte-identity rejected'
+        )
+        assert 'deliverable.py' not in probe.diverged_paths
+        assert probe.present is True, 'survival must accept what byte-identity rejected'
+
         result = await h._already_landed_dispatch_gate(task_id)
 
         assert result is True, 'a clean landing beside a co-touched hot file'
