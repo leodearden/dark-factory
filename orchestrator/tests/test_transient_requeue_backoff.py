@@ -268,3 +268,145 @@ class TestPendingTransientCooldownStamp:
         assert scheduler._pending_transient_cooldown == {'T1': 1, 'T2': 2}
         scheduler.release('T1', requeued=True)
         assert scheduler._pending_transient_cooldown == {'T2': 2}
+
+
+def _clocked_scheduler(
+    clock: list[float],
+    *,
+    jitter_source=None,
+    config: OrchestratorConfig | None = None,
+) -> Scheduler:
+    """A bare Scheduler on an injected monotonic clock (test_scheduler.py idiom)."""
+    scheduler = Scheduler(
+        config if config is not None else OrchestratorConfig(max_per_module=1),
+        time_source=lambda: clock[0],
+        jitter_source=jitter_source,
+    )
+    scheduler.finish_startup()
+    return scheduler
+
+
+def _arm_transient(scheduler: Scheduler, clock: list[float], task_id: str) -> float:
+    """Drive one transient requeue+release and return the armed cooldown delta."""
+    _requeue(scheduler, task_id, api_error_status=529)
+    scheduler.release(task_id, requeued=True)
+    return scheduler._requeue_until[task_id] - clock[0]
+
+
+class TestReleaseArmsJitteredBackoff:
+    """``release`` arms a growing cooldown for transient requeues only.
+
+    Boundary row 4: armed cooldowns grow ~30 → 480s over the first five
+    transient requeues (jittered, inside the envelope ``[d/2, d]``), while a
+    genuine requeue stays flat at 30s.
+    """
+
+    def test_upper_edge_growth_is_exact(self):
+        """With the max draw the deltas are exactly the envelopes."""
+        clock = [1000.0]
+        scheduler = _clocked_scheduler(clock, jitter_source=lambda lo, hi: hi)
+        armed = [_arm_transient(scheduler, clock, 'T1') for _ in range(5)]
+        assert armed == [30.0, 60.0, 120.0, 240.0, 480.0]
+
+    def test_lower_edge_growth_is_exact(self):
+        """With the min draw every delta is exactly envelope/2 — the floor."""
+        clock = [1000.0]
+        scheduler = _clocked_scheduler(clock, jitter_source=lambda lo, hi: lo)
+        armed = [_arm_transient(scheduler, clock, 'T1') for _ in range(5)]
+        assert armed == [15.0, 30.0, 60.0, 120.0, 240.0]
+
+    def test_real_rng_stays_inside_the_envelope_and_is_nondecreasing(self):
+        """No injected jitter: every arming lands in [envelope/2, envelope].
+
+        The equal-jitter floor makes the schedule monotone-nondecreasing no
+        matter how the draws land — a plain ``U(0, envelope)`` would not.
+        """
+        clock = [1000.0]
+        scheduler = _clocked_scheduler(clock)
+        armed = [_arm_transient(scheduler, clock, 'T1') for _ in range(5)]
+        for i, delta in enumerate(armed):
+            envelope = ENVELOPES[i]
+            assert envelope / 2 <= delta <= envelope, (
+                f'n={i + 1}: {delta} outside [{envelope / 2}, {envelope}]'
+            )
+        assert armed == sorted(armed), f'schedule must not shrink: {armed}'
+
+    @pytest.mark.parametrize('n', [6, 7])
+    def test_cap_clamps_the_arming(self, n):
+        clock = [1000.0]
+        scheduler = _clocked_scheduler(clock, jitter_source=lambda lo, hi: hi)
+        armed = [_arm_transient(scheduler, clock, 'T1') for _ in range(n)]
+        assert armed[-1] == 900.0
+
+    def test_genuine_requeue_stays_flat_despite_prior_transients(self):
+        """The cumulative-counter trap the stamp exists to close.
+
+        Three prior transient requeues leave ``transient_requeue_count == 3``,
+        but this requeue is GENUINE, so it must arm the flat 30s — not the
+        240s an n=4 envelope would give.
+        """
+        clock = [1000.0]
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = _clocked_scheduler(
+            clock, jitter_source=lambda lo, hi: hi, config=config,
+        )
+        for _ in range(3):
+            _arm_transient(scheduler, clock, 'T1')
+        assert scheduler.transient_requeue_count('T1') == 3
+
+        _requeue(scheduler, 'T1', reason='verify failed', api_error_status=None)
+        scheduler.release('T1', requeued=True)
+        delta = scheduler._requeue_until['T1'] - clock[0]
+        assert delta == config.requeue_cooldown_secs == 30.0
+
+    def test_release_without_any_record_requeue_stays_flat(self):
+        """The blast-radius and arm_requeue_cooldown shapes arm flat 30s.
+
+        Neither is preceded by a ``record_requeue``, so neither leaves a
+        stamp — the no-stamp path must fall back to ``requeue_cooldown_secs``.
+        """
+        clock = [1000.0]
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = _clocked_scheduler(
+            clock, jitter_source=lambda lo, hi: hi, config=config,
+        )
+        scheduler.release('T2', requeued=True)
+        assert scheduler._requeue_until['T2'] - clock[0] == 30.0
+
+    def test_green_tier_retune_lands_on_the_next_arming(self):
+        """An in-place config mutation (what apply_reload does) takes effect.
+
+        ``release`` reads ``self.config.<knob>`` at ARM time, so no reload
+        hook is needed: base 5 / cap 20 walks 5, 10, 20, 20.
+        """
+        clock = [1000.0]
+        scheduler = _clocked_scheduler(clock, jitter_source=lambda lo, hi: hi)
+        scheduler.config.transient_requeue_backoff_base_secs = 5.0
+        scheduler.config.transient_requeue_backoff_cap_secs = 20.0
+        armed = [_arm_transient(scheduler, clock, 'T1') for _ in range(4)]
+        assert armed == [5.0, 10.0, 20.0, 20.0]
+
+    def test_dispatch_eligibility_honours_the_longer_deadline(self):
+        """The existing cooldown gate reads the longer deadline unchanged.
+
+        n=3 at the upper edge arms 120s: still cooling at +60s (where the old
+        flat 30s would already have expired), eligible again past 120s.  The
+        gate itself is untouched — ``_requeue_until`` keeps its plain
+        ``dict[str, float]`` monotonic-deadline shape.
+        """
+        clock = [1000.0]
+        scheduler = _clocked_scheduler(clock, jitter_source=lambda lo, hi: hi)
+        for _ in range(3):
+            armed = _arm_transient(scheduler, clock, 'T1')
+        assert armed == 120.0
+        deadline = scheduler._requeue_until['T1']
+
+        clock[0] += 60.0
+        assert scheduler._time_source() < deadline, 'must still be cooling at +60s'
+        scheduler._gc_expired_cooldowns()
+        assert 'T1' in scheduler._requeue_until
+
+        clock[0] += 61.0
+        assert scheduler._time_source() >= deadline
+        scheduler._gc_expired_cooldowns()
+        assert 'T1' not in scheduler._requeue_until
