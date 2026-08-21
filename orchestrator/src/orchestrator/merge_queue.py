@@ -17117,23 +17117,44 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 #      the property is treated as live and never
                 #      progress-aborted.
                 #
-                # SAFETY: adding evidence A for remote leases can only make
-                # this trigger LESS trigger-happy, never introduce a false
-                # abort. The one way it could instead MASK a genuine remote
-                # coast — some writer other than the verify touching
-                # merge_wt — does not hold: during a coast the only local
-                # writes are RemoteRunner's `git push`/`fetch` at
-                # `cwd=self._cwd`, which touch only `.git` (pruned by
-                # newest_content_mtime) and archive to
-                # `project_root/data/verify-logs`, never merge_wt: and a
-                # concurrent foreign writer into the warm lane is already
-                # excluded by task 2873's merge_verify_lease
-                # (merge_queue.py:3006-3014) — the same exclusion the LOCAL
-                # arm has relied on since task 2420, with no new surface
-                # added here.
+                # SAFETY: adding evidence A for remote leases can only make this trigger LESS
+                # trigger-happy, never introduce a false abort. The one way it could instead MASK a
+                # genuine remote coast — some writer other than the verify touching merge_wt — is
+                # narrower than it first looks: task 2873's merge_verify_lease
+                # (merge_queue.py:3006-3014) wraps ONLY the cross-check's own local verify call,
+                # gated on persistent_merge_worktree and entered just before
+                # cross_check_runner.run_merge_verify(...) — it does NOT cover the window before
+                # that lease is acquired, and it does not exist at all on paths where no cross-check
+                # runs at all (remote verify FAILs, a trivial pass, verify_cross_check_remote_green
+                # disabled, or an infra-transient retry between dispatches). A concurrent foreign
+                # write into merge_wt during one of those windows would reset the clock same as a
+                # real cross-check write. This narrows the guarantee, it does not remove it: masking
+                # is unreachable while evidence B is live (it dominates below), RemoteRunner's own
+                # writes during a coast touch only `.git` (pruned by newest_content_mtime) and
+                # archive outside merge_wt, and the busy-loop cap counts only actual aborts — so the
+                # residual exposure can DELAY a coast abort by a foreign write's timing, never
+                # suppress it the way a permanent mask would.
                 _now = time.monotonic()
-                # Evidence A — content progress under merge_wt (BOTH lease kinds).
-                if _now - _last_probe_at >= _progress_probe_secs:
+                # Evidence B is checked FIRST and short-circuits evidence A: while a remote dispatch
+                # is live it is already progress on its own, so probing content-mtime too would only
+                # re-confirm what B already established, at the cost of a synchronous os.walk of
+                # merge_wt (newest_content_mtime, merge_liveness.py) on the merge worker's event
+                # loop every _progress_probe_secs for the whole dispatch — 17-40+ minutes on reify —
+                # for zero marginal signal (reviewer finding, performance). Trade-off:
+                # _last_content_mtime stays at its seed for that whole window, so the first
+                # post-dispatch probe treats whatever mtime the tree is ACTUALLY at as fresh
+                # progress once — one extra budget window of slack if that mtime came from a foreign
+                # writer rather than the cross-check, not a masked coast (same busy-loop-cap
+                # argument as the SAFETY paragraph above).
+                _dispatch_live = (
+                    not lease.is_local
+                    and getattr(lease.runner, 'dispatch_in_flight', True)
+                )
+                if _dispatch_live:
+                    _last_progress_at = _now
+                # Evidence A — content progress under merge_wt (BOTH lease kinds), probed only when
+                # evidence B is not already live.
+                elif _now - _last_probe_at >= _progress_probe_secs:
                     _last_probe_at = _now
                     _cur_content_mtime = newest_content_mtime(merge_wt)
                     if _cur_content_mtime is not None and (
@@ -17142,9 +17163,6 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     ):
                         _last_content_mtime = _cur_content_mtime
                         _last_progress_at = _now
-                # Evidence B — a live remote ssh dispatch (REMOTE leases only).
-                if not lease.is_local and getattr(lease.runner, 'dispatch_in_flight', True):
-                    _last_progress_at = _now
                 _no_progress_secs = _now - _last_progress_at
                 if _no_progress_secs >= self.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS:
                     # Busy-loop guard (task 2420): count CONSECUTIVE
