@@ -650,7 +650,9 @@ window (even if `run_id` was omitted by the Stage 1 producer), appear in the \
 "Stage 1 Flagged Items" section above. Any markers from prior cycles that \
 failed FIX C deletion are excluded from the section above and garbage-collected \
 deterministically by the reconciliation ledger (TTL expiry or terminal-task match, \
-not an immediate delete); their total is recorded in `stats.recon_markers_gc_swept`. \
+not an immediate delete); their total is recorded in `stats.recon_markers_gc_swept` — \
+a count of reconciliation-ledger rows, NOT of Mem0 records, so do not read it as a \
+signal about the Mem0 marker pool. \
 You do NOT need to search for, re-process, or \
 count prior-cycle markers — every flag in this section is current-cycle and is your \
 responsibility to process and delete.

@@ -3383,6 +3383,18 @@ class TaskKnowledgeSync(BaseStage):
         # sweep. Runs unconditionally on both full and remediation paths so
         # the pool is bounded every cycle. Explicit zero so downstream
         # consumers never need a .get(..., 0) fallback.
+        #
+        # WARNING — this stat counts SQLite recon_ledger ROWS ONLY. It never
+        # reaches Mem0, and a healthy value here says NOTHING about whether
+        # the Mem0 stage1_flag_marker pool is draining. The Mem0-pool
+        # counterpart is 'stale_mem0_flag_markers_gc_swept' (emitted ~35
+        # lines below); the two address disjoint populations. Reading a
+        # healthy recon_markers_gc_swept as evidence that the Mem0 markers
+        # are being collected is precisely the inference that produced the
+        # task-2228 W5-κ regression, which deleted the two Mem0 sweeps and
+        # left that pool with no collector at all while this stat kept
+        # reporting green. See RCA §4.3,
+        # plans/reify-flag-marker-backlog-rca-2026-07-22.md.
         report.stats['recon_markers_gc_swept'] = await _gc_recon_markers(
             self.memory, self.taskmaster, self.scope, run_id,
         )
