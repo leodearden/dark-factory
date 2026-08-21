@@ -1103,6 +1103,13 @@ def score_unlabeled_query(
     }
 
 
+#: The bake-off helpers this module re-exports BY IDENTITY (INV-5).  A module
+#: constant rather than a literal inside `__getattr__` so the test suite can
+#: assert the invariant over the WHOLE set instead of hand-picked names —
+#: `_rate` went unasserted for exactly that reason (task 4583).
+_REEXPORTED_FROM_BAKE_OFF = ('_mean', '_rate', '_cell')
+
+
 def __getattr__(name: str) -> Any:
     """Re-export the bake-off's helpers BY IDENTITY, lazily (INV-5).
 
@@ -1116,7 +1123,7 @@ def __getattr__(name: str) -> Any:
     ``read_transform_selection._mean is bake_off._mean`` holds, and nothing
     loads until it is first asked for.
     """
-    if name in ('_mean', '_rate', '_cell'):
+    if name in _REEXPORTED_FROM_BAKE_OFF:
         return getattr(bake_off(), name)
     raise AttributeError(f'module {__name__!r} has no attribute {name!r}')
 
