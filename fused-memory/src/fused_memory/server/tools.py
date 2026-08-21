@@ -474,7 +474,14 @@ Conventions:
   task named in the hint; and (2) a cosine guard that soft-blocks a write matching an existing entry at
   high similarity (error_type=ProceduralKnowledgeNearDuplicateWriteRejected). For either, override with
   metadata={'allow_near_duplicate': True} only when the content is genuinely distinct; recon-stage-*
-  agents are exempt from both.
+  agents are exempt from both. Both guards apply only while write_triage.enabled is false (the
+  shipped default); with it on, an explicit Mem0-primary write is REDIRECTED instead of rejected —
+  nothing is soft-blocked, the ack carries routed (stored | restated | amended | contested) plus
+  canonical_id on an attach, and a restated write becomes a sighting CHILD of the memory it
+  restates rather than a standalone entry, so the full text you submitted is kept and the canonical
+  is never edited. There, allow_near_duplicate means force-store (store it standalone, do not
+  reroute it) rather than bypass-the-reject. Searching first is worth doing either way: it is how
+  you find the entry to update instead of restating it.
 - Never write raw MCP envelope markup into a payload. EVERY tool's string parameters are
   REJECTED (error_type=mcp_markup_detected, or mcp_markup_unrepairable when the residue
   cannot be parsed) when they carry a leaked tool-call envelope fragment; the response
@@ -2997,6 +3004,31 @@ def create_mcp_server(
         replaces, with no ordering guarantee that those duplicates are
         deleted first).
 
+        BOTH GUARDS ABOVE APPLY ONLY WHILE ``write_triage.enabled`` IS FALSE
+        (its shipped default). With write triage ON, an explicit Mem0-primary
+        write (preferences_and_norms / procedural_knowledge /
+        observations_and_summaries) is REDIRECTED rather than rejected: nothing
+        is ever soft-blocked, and the response carries two extra fields.
+
+        * ``routed`` — what triage did with the write, one of ``stored``
+          (a new standalone memory), ``restated`` (it restates an existing
+          memory), ``amended`` (it adds to one) or ``contested`` (it
+          contradicts one).
+        * ``canonical_id`` — the memory the write was attached to. Present
+          ONLY on an attach outcome; absent entirely for ``stored``.
+
+        A ``restated`` write becomes a SIGHTING CHILD of its canonical rather
+        than a standalone entry: the full text you submitted is stored, the
+        rediscovery is counted, and the canonical is never edited. Nothing is
+        lost and no write is ever blocked — a retrieval or judge failure
+        degrades to a plain ``stored``, never to an error.
+
+        With triage on, ``metadata={'allow_near_duplicate': True}`` is
+        reinterpreted rather than retired: it now means FORCE-STORE — store
+        this standalone, do not reroute it — for the same reason it meant
+        "do not reject me" before. recon-stage-* agents are likewise
+        force-stored.
+
         Content carrying a raw MCP envelope fragment is REJECTED outright
         (error_type=mcp_markup_detected, or mcp_markup_unrepairable when the
         residue cannot be parsed) — a harness serialization bug has been leaking
@@ -3024,7 +3056,9 @@ def create_mcp_server(
             metadata: Arbitrary key-value pairs (optional). For procedural_knowledge,
                       set {'allow_near_duplicate': True} to bypass both the topic-cluster
                       and near-duplicate write guards when the content is genuinely
-                      distinct. Set {'allow_mcp_markup': True} to bypass the MCP-markup
+                      distinct — or, when write_triage.enabled is true, to force a
+                      plain standalone store instead of an attach. Set
+                      {'allow_mcp_markup': True} to bypass the MCP-markup
                       boundary guard when the content quotes envelope markup deliberately.
                       Both flags are write-time-only and are stripped before
                       persistence — neither is ever stored on the resulting memory.
