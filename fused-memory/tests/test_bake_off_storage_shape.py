@@ -4960,7 +4960,11 @@ class TestRunBakeOffWiring:
         report = await mod.run_bake_off(**_SMALL_RUN)
 
         assert report['schema_version'] == mod.REPORT_SCHEMA_VERSION
-        assert set(report) == {'schema_version', 'protocol', 'arms', 'audit_recall'}
+        assert set(report) == {
+            'schema_version', 'protocol', 'arms', 'audit_recall',
+            # v3: always present, an explicit None when the probe did not run.
+            'regrowth',
+        }
         for arm in mod.ARM_VARIANTS:
             for metric in mod._REQUIRED_ARM_METRICS:
                 assert metric in report['arms'][arm]

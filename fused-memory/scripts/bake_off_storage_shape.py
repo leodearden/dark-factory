@@ -2136,6 +2136,17 @@ _REQUIRED_ARM_METRICS: dict[str, tuple[str, ...]] = {
                        'probes', 'guard_covered_probes'),
 }
 
+#: The regrowth block's completeness, enumerated ONCE and shared by the
+#: check and the renderer — the same reason ``_REQUIRED_ARM_METRICS`` is a
+#: constant rather than two hand-kept lists.
+_REQUIRED_REGROWTH_DESCRIPTORS: tuple[str, ...] = (
+    'shape', 'read_arms', 'modes', 'topics_injected', 'injections_per_topic',
+    'injection_fixture',
+)
+#: The flat ``{arm: {metric: value}}`` tables, and the per-mode ones.
+_REQUIRED_REGROWTH_KEYS: tuple[str, ...] = ('baseline', 'stamping_value')
+_REQUIRED_REGROWTH_MODE_KEYS: tuple[str, ...] = ('after', 'deltas')
+
 #: What each ``by_query_kind`` subset must carry, on top of the kind names
 #: registered above.  The metric BLOCKS are named here; the keys inside them
 #: are the same tuples the pooled block is checked against, reused rather than
@@ -2196,7 +2207,11 @@ DEFAULT_REPORT_MD = _PACKAGE_ROOT.parent / 'plans' / 'e2-storage-shape-bakeoff-r
 #: (`stored_canonical_in_top_5_rate` / `_median_rank` / `_found_count`), so a
 #: v1 artifact and a v2 one answer different questions in the same column
 #: names and must not be diffed as if they were the same schema.
-REPORT_SCHEMA_VERSION = 2
+#: v3 — the artifact gained the `regrowth` block (the +1-re-emission probe,
+#: task 4012).  A v2 artifact carries no block at all, so a v2 and a v3 one
+#: answer different questions about the same six arms and must not be diffed
+#: as if they were the same schema either.
+REPORT_SCHEMA_VERSION = 3
 
 
 class IncompleteReportError(RuntimeError):
@@ -2329,11 +2344,83 @@ def _check_arms(arms: dict[str, Any]) -> None:
                         )
 
 
+def _check_regrowth(regrowth: dict[str, Any]) -> None:
+    """Every mode, arm and metric present, or raise — modelled on `_check_arms`.
+
+    Missing AND unknown are collected TOGETHER at each level, for the same
+    reason ``_check_arms`` does it: a misspelled name produces both at once,
+    and the unknown half is the actionable one.  Every message names the
+    mode, the arm and the key.
+
+    A ``None`` VALUE never raises here.  "Measured, no denominator" is a
+    legitimate result in this pipeline and the renderer prints it as
+    ``_NO_MEASUREMENT``; only an ABSENT key means the run broke.
+    """
+    expected_metrics = {f'{block}.{key}' for block, key in REGROWTH_METRICS}
+
+    missing_descriptors = [
+        key for key in _REQUIRED_REGROWTH_DESCRIPTORS if key not in regrowth
+    ]
+    if missing_descriptors:
+        raise IncompleteReportError(
+            f'regrowth block is missing descriptor(s) {missing_descriptors}. '
+            f'A block whose shape, fixture and injected-topic count are not '
+            f'in it cannot be re-read later.'
+        )
+
+    def _check_arm_table(table: dict[str, Any], *, where: str) -> None:
+        missing = [arm for arm in REGROWTH_READ_ARMS if arm not in table]
+        unknown = [arm for arm in table if arm not in REGROWTH_READ_ARMS]
+        if missing or unknown:
+            problems = []
+            if missing:
+                problems.append(f'no measurement for {missing}')
+            if unknown:
+                problems.append(f'unknown read arm(s) {unknown}')
+            raise IncompleteReportError(
+                f'regrowth {where}: {"; ".join(problems)}. Expected exactly '
+                f'{list(REGROWTH_READ_ARMS)}.'
+            )
+        for arm in REGROWTH_READ_ARMS:
+            absent = sorted(expected_metrics - set(table[arm]))
+            if absent:
+                raise IncompleteReportError(
+                    f"regrowth {where}: read arm '{arm}' is missing metric(s) "
+                    f"{absent}. A metric absent from a delta table is a metric "
+                    f"absent from the decision."
+                )
+
+    for key in _REQUIRED_REGROWTH_KEYS:
+        if key not in regrowth:
+            raise IncompleteReportError(f'regrowth block is missing {key!r}')
+        _check_arm_table(regrowth[key], where=key)
+
+    for key in _REQUIRED_REGROWTH_MODE_KEYS:
+        if key not in regrowth:
+            raise IncompleteReportError(f'regrowth block is missing {key!r}')
+        table = regrowth[key]
+        missing_modes = [mode for mode in REGROWTH_MODES if mode not in table]
+        unknown_modes = [mode for mode in table if mode not in REGROWTH_MODES]
+        if missing_modes or unknown_modes:
+            problems = []
+            if missing_modes:
+                problems.append(f'no measurement for mode(s) {missing_modes}')
+            if unknown_modes:
+                problems.append(f'unknown mode(s) {unknown_modes}')
+            raise IncompleteReportError(
+                f'regrowth {key}: {"; ".join(problems)}. Expected exactly '
+                f'{list(REGROWTH_MODES)}.'
+            )
+        for mode in REGROWTH_MODES:
+            _check_arm_table(table[mode], where=f'{key}[{mode!r}]')
+
+
 def build_report(
     *,
     arms: dict[str, Any],
     audit_recall: dict[str, Any],
     protocol: dict[str, Any],
+    regrowth: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Assemble the E2 decision table + D10 measurement into one artifact.
 
@@ -2344,8 +2431,19 @@ def build_report(
 
     Arms are ordered by :data:`ARM_VARIANTS`, not by the caller's dict order,
     so two runs produce diffable artifacts.
+
+    ``regrowth`` is OPTIONAL — smoke runs and any ``--no-regrowth`` run
+    legitimately produce no block — but the key is ALWAYS emitted, as an
+    explicit ``None`` when the probe did not run.  Same convention as
+    ``protocol['replayed_from']``, and for the same reason: an absent key
+    would make "this build predates the probe" and "the probe was skipped"
+    the same reading.  The hard requirement that a COMMITTED artifact carry
+    a real block lives in the committed-artifact test, where the artifact
+    actually is, in the merge lane, on every commit.
     """
     _check_arms(arms)
+    if regrowth is not None:
+        _check_regrowth(regrowth)
     missing_protocol = [k for k in _REQUIRED_PROTOCOL_KEYS if k not in protocol]
     if missing_protocol:
         raise IncompleteReportError(
@@ -2358,6 +2456,8 @@ def build_report(
         'protocol': dict(protocol),
         'arms': {arm: arms[arm] for arm in ARM_VARIANTS},
         'audit_recall': audit_recall,
+        # LAST, and always present: see the docstring.
+        'regrowth': regrowth,
     }
 
 
