@@ -66,7 +66,7 @@ Task 3659 (briefing assembler) is a FUTURE consumer, explicitly not a live one.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from fused_memory.models.enums import SourceStore
 
@@ -103,6 +103,11 @@ _CHILD_KINDS = frozenset({'amendment', 'sighting'})
 #: non-``str`` ``created_at`` loses the recency tie-break instead of winning it
 #: by accident.  Never compared for meaning — only for ordering.
 _UNDATED = ''
+
+#: Default when the config is absent, partial, or wrongly typed.  The transform
+#: ships ON: it is a strict no-op wherever stamping coverage is absent (see the
+#: honesty caveat above), so an unconfigured deployment pays nothing for it.
+_DEFAULT_TOPIC_ANCHOR_ENABLED = True
 
 
 def extract_anchor_topics(
@@ -259,3 +264,36 @@ def select_canonical_payload(
     survivors.sort(key=_id)
     survivors.sort(key=_recency, reverse=True)
     return survivors[0]
+
+
+def _reconciliation_attr(memory_service: Any, attr: str) -> Any:
+    """Hop config -> reconciliation -> *attr*, tolerating a break at any hop.
+
+    Same shape as ``near_duplicate_guard._reconciliation_attr``: every hop uses
+    ``getattr(..., None)`` so a missing attribute, a ``None`` config, or a
+    ``None`` reconciliation section yields ``None`` rather than raising.
+    """
+    config = getattr(memory_service, 'config', None)
+    reconciliation = getattr(config, 'reconciliation', None)
+    return getattr(reconciliation, attr, None)
+
+
+def resolve_topic_anchor_enabled(memory_service: Any) -> bool:
+    """Whether the topic pin is enabled, read LIVE off the shared config object.
+
+    Returns ``reconciliation.topic_anchored_recall_enabled`` iff the leaf is a
+    real ``bool`` — otherwise :data:`_DEFAULT_TOPIC_ANCHOR_ENABLED`.  The
+    ``isinstance(value, bool)`` guard excludes a missing/``None`` config hop,
+    a wrongly-typed leaf (``1`` and ``'true'`` are NOT bools), and any attribute
+    an unspecced test double might auto-generate — so a non-configuration can
+    never read as a configured flag.
+
+    Called PER SEARCH and never captured at construction.  That live read is
+    the whole justification for the knob's GREEN-TIER (hot-reloadable)
+    classification in ``config/reload.py``: a value captured at construction
+    would not observe an in-place reload and would have to stay restart-only.
+    """
+    value = _reconciliation_attr(memory_service, 'topic_anchored_recall_enabled')
+    if isinstance(value, bool):
+        return value
+    return _DEFAULT_TOPIC_ANCHOR_ENABLED
