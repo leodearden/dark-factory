@@ -1120,6 +1120,126 @@ class TestDeadInflightVerifyAborts:
         with contextlib.suppress(BaseException):
             await verify_future
 
+    async def test_remote_lease_dispatch_returning_mid_verify_is_not_aborted_while_local_content_progresses(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+    ) -> None:
+        """task 2822 cross-check: a REMOTE lease whose ssh dispatch has
+        RETURNED mid-verify (dispatch_in_flight True -> False) while a local
+        post-dispatch verify keeps advancing merge_wt's content mtime must
+        NOT be progress-aborted.
+
+        Trigger 3 today (`merge_queue.py:17075-17087`) is an `if/elif` on
+        the LEASE TYPE, not on what is executing: a REMOTE lease can never
+        reach the content-mtime arm, so once `dispatch_in_flight` goes False
+        the no-progress clock runs free of the local writes actually
+        happening under merge_wt. Task 2822 put a FULL LOCAL cross-check
+        verify (`LocalRunner(merge_wt, ...)`, `merge_queue.py:2977-3015`)
+        into exactly that post-dispatch window, inside the SAME awaited
+        verify_task — so this transition is not hypothetical, it is what
+        every remote-dispatch-then-cross-check verify does today. The 1800s
+        production budget is applied to a local verify that on reify
+        routinely runs 40+ minutes, and the strike counter only clears when
+        verify_task returns (`:17653`) — which an aborted verify never does.
+        Reify specimen mr-945466ca / task 6393: three passing ~17.4-min
+        remote verifies discarded as dead 2026-08-20.
+
+        No existing test expresses this transition: every prior remote-lease
+        trigger-3 test (the three above) assigns `dispatch_in_flight` ONCE
+        as a static attribute. This uses a real stub class — not a
+        MagicMock snapshot — so the flag genuinely flips mid-verify while
+        the awaited coroutine stays pending, mirroring `verify_runner.py`'s
+        real `finally`-block clear at `:1483`.
+
+        RED until step-2 GREEN unions the progress signal: the expected RED
+        failure is `verify_future.done()` being True (progress-aborted and
+        re-queued) despite merge_wt content genuinely advancing.
+        """
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.verify_runner import HostLease
+
+        never_release = asyncio.Event()
+
+        class _DispatchReturnsMidVerifyRemote:
+            """Real `@property` over a mutable flag (not a MagicMock
+            snapshot) so `dispatch_in_flight` can genuinely transition
+            True -> False mid-verify, mirroring production
+            (verify_runner.py:1312 sets it live, :1483 clears it in the
+            outer `finally` once run_merge_verify returns) while this
+            coroutine stays pending for the task-2822 cross-check window.
+            """
+
+            name = 'remote-host'
+            is_local = False
+
+            def __init__(self) -> None:
+                self._dispatch_live = False
+                self.dispatch_returned = asyncio.Event()
+
+            @property
+            def dispatch_in_flight(self) -> bool:
+                return self._dispatch_live
+
+            async def run_merge_verify(self, *args: object, **kwargs: object) -> MagicMock:
+                self._dispatch_live = True  # ssh dispatch is LIVE
+                await asyncio.sleep(0.06)  # a few VERIFY_ABANDON_POLL_SECS ticks
+                self._dispatch_live = False  # dispatch RETURNS (verify_runner.py:1483)
+                self.dispatch_returned.set()
+                await never_release.wait()  # the task-2822 LOCAL cross-check window
+                raise AssertionError('unreachable — never_release is never set in this test')
+
+            async def cancel_verify(self) -> int:
+                return 0
+
+        runner = _DispatchReturnsMidVerifyRemote()
+
+        req, item = await _make_merged_item(
+            git_ops, config, 'remote-crosscheck-a', 'rcc.py', 'x=1\n',
+        )
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+        worker._register_owned_merge_worktree(item.merge_wt)
+
+        worker.VERIFY_ABANDON_POLL_SECS = 0.02
+        worker.INFLIGHT_VERIFY_PROGRESS_PROBE_SECS = 0.02
+        worker.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS = 0.2
+
+        lease = HostLease(name='remote-host', runner=runner, is_local=False)
+
+        # task 2921 anti-flake pattern: strictly-increasing stub so the
+        # content-mtime arm (once it exists for remote leases) unconditionally
+        # observes fresh progress on every probe, decoupling this
+        # must-NOT-abort assertion from real wall-clock file-write timing —
+        # simulates the task-2822 cross-check writing under merge_wt without
+        # coupling to real file I/O.
+        _mtime = [1000.0]
+
+        def _always_progress(_root: Path) -> float:
+            _mtime[0] += 1.0
+            return _mtime[0]
+
+        with patch('orchestrator.merge_queue.newest_content_mtime', _always_progress):
+            verify_future = asyncio.ensure_future(worker._run_inflight_verify(item, lease))
+            await asyncio.wait_for(runner.dispatch_returned.wait(), timeout=15.0)
+            # Let several whole budget windows elapse AFTER the dispatch flag
+            # went False, while merge_wt content keeps advancing.
+            await asyncio.sleep(worker.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS * 5)
+
+            assert not verify_future.done(), (
+                'a REMOTE lease whose ssh dispatch has RETURNED while a local '
+                'post-dispatch verify keeps writing under merge_wt must NOT '
+                'be progress-aborted (task 2822 cross-check)'
+            )
+            assert q.empty(), 'a progressing post-dispatch cross-check must not be re-queued'
+            assert worker._inflight_dead_verify_aborts.get(req.task_id, 0) == 0, (
+                'no strike should be recorded while local content is progressing'
+            )
+
+            verify_future.cancel()
+            with contextlib.suppress(BaseException):
+                await verify_future
+
 
 # ---------------------------------------------------------------------------
 # task 2420 step-7 RED / step-8 GREEN: busy-loop cap converts a repeated dead
