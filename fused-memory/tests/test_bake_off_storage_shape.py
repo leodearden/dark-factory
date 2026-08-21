@@ -5678,6 +5678,299 @@ class TestMeasureArmPromote:
         )
 
 
+# ===========================================================================
+# 4012 step-7 — the per-arm measurement fan-out and the delta arithmetic
+# ===========================================================================
+#
+# `measure_regrowth_arms` is fed a `SeededArm` and a hand-built `fetched`
+# dict; `regrowth_deltas` / `regrowth_stamping_value` are fed synthetic
+# measurement dicts, so every expected number below was written by the test
+# itself.  NO threshold, bound or magnitude is asserted on any MEASURED
+# quantity anywhere in this section (gate G6).
+
+
+def _plucked(**overrides) -> dict:
+    """A flat metric projection with every `REGROWTH_METRICS` key present."""
+    values = {
+        'claim_recall.at_5': 0.5,
+        'claim_recall.at_10': 0.6,
+        'discoverability.stored_canonical_in_top_5_rate': 0.7,
+        'discoverability.stored_canonical_median_rank': 3.0,
+        'discoverability.stored_canonical_found_count': 12.0,
+        'discoverability.canonical_in_top_5_rate': 0.8,
+        'tokens_per_query.mean': 100.0,
+    }
+    values.update(overrides)
+    return values
+
+
+def _arms(**per_arm) -> dict:
+    """`{arm: plucked}` for all three read arms, overridable per arm."""
+    return {
+        arm: per_arm.get(arm, _plucked())
+        for arm in _mod().REGROWTH_READ_ARMS
+    }
+
+
+class TestRegrowthReadArmsAndMetricsArePinned:
+
+    def test_the_three_read_arms_are_pinned_by_equality_in_order(self):
+        assert _mod().REGROWTH_READ_ARMS == ('flat', 'additive_pin', 'promoting_pin')
+
+    def test_the_reported_metrics_are_pinned_by_equality(self):
+        """A metric dropped from a delta table is a metric dropped from the
+        decision — asserted by equality, exactly as `DECISION_TABLE_COLUMNS`.
+
+        The credited `canonical_in_top_5_rate` travels BESIDE the stored trio
+        and never alone: `apply_promoting_topic_anchor` injects the canonical
+        into the window, so under `promoting_pin` that column is a PLACEMENT
+        property in exactly the way `apply_grouped_read`'s was under
+        `b_grouped`.  Dropping it would hide the transform's contribution;
+        printing it alone would repeat the misreading 3560 and 4004 each had
+        to correct after publication.
+        """
+        assert _mod().REGROWTH_METRICS == (
+            ('claim_recall', 'at_5'),
+            ('claim_recall', 'at_10'),
+            ('discoverability', 'stored_canonical_in_top_5_rate'),
+            ('discoverability', 'stored_canonical_median_rank'),
+            ('discoverability', 'stored_canonical_found_count'),
+            ('discoverability', 'canonical_in_top_5_rate'),
+            ('tokens_per_query', 'mean'),
+        )
+
+    def test_the_probe_is_scoped_to_the_ratified_write_shape(self):
+        """esc-3200-3 was a SPLIT ratification: C's write shape, no transform."""
+        assert _mod().REGROWTH_SHAPE == 'c_peers'
+        assert _mod().REGROWTH_SHAPE in _mod().ARM_SHAPES
+
+
+class TestMeasureRegrowthArms:
+    """One measurement block per read arm, routed to the right (pin, promote)."""
+
+    def _fanout(self, seeded, hits):
+        return _mod().measure_regrowth_arms(
+            seeded,
+            {'queries': {'q1': hits}, 'probes': {'c1': hits}},
+            queries=[_query()],
+            probes=[('c1', {})],
+            estimator=_CHARS,
+            guard_threshold=0.92,
+            limit=10,
+        )
+
+    def test_one_block_per_read_arm_in_order(self):
+        seeded, hits = _full_window_arm(n=12)
+
+        blocks = self._fanout(seeded, hits)
+
+        assert list(blocks) == list(_mod().REGROWTH_READ_ARMS)
+
+    def test_each_block_carries_the_full_required_metric_set(self):
+        mod = _mod()
+        seeded, hits = _full_window_arm(n=12)
+
+        for block in self._fanout(seeded, hits).values():
+            for metric, keys in mod._REQUIRED_ARM_METRICS.items():
+                for key in keys:
+                    assert key in block[metric], f'{metric}.{key}'
+
+    def test_the_arms_are_routed_to_flat_additive_and_promoting(self):
+        """Asserted by BEHAVIOUR, not by a flag readback.
+
+        The arm gives the canonical a rank only a promoting pin can move into
+        the window — a full k=5 window with the canonical outside it — so the
+        three arms are distinguishable by what they measured.
+        """
+        seeded, hits = _full_window_arm(n=12)
+
+        blocks = self._fanout(seeded, hits)
+
+        assert blocks['flat']['pin']['enabled'] is False
+        assert blocks['flat']['pin']['window_changed_rate'] is None
+        assert blocks['additive_pin']['pin']['enabled'] is True
+        # A full window leaves the additive pin nowhere to put anything...
+        assert blocks['additive_pin']['pin']['window_changed_rate'] == 0.0
+        # ...while the promoting one reorders every window it touches.
+        assert blocks['promoting_pin']['pin']['enabled'] is True
+        assert blocks['promoting_pin']['pin']['window_changed_rate'] == 1.0
+
+    def test_the_transform_blind_trio_agrees_across_all_three_arms(self):
+        seeded, hits = _full_window_arm(n=12)
+
+        blocks = self._fanout(seeded, hits)
+
+        for key in ('stored_canonical_in_top_5_rate', 'stored_canonical_median_rank',
+                    'stored_canonical_found_count'):
+            values = {
+                arm: block['discoverability'][key] for arm, block in blocks.items()
+            }
+            assert len(set(values.values())) == 1, values
+
+
+class TestPluckRegrowthMetrics:
+
+    def test_it_projects_exactly_the_pinned_metrics_to_a_flat_dict(self):
+        mod = _mod()
+        seeded, hits = _full_window_arm(n=12)
+        measurement = _measure(seeded, hits, pin=False, probes=[('c1', {})])
+
+        plucked = mod._pluck_regrowth_metrics(measurement)
+
+        assert list(plucked) == [f'{b}.{k}' for b, k in mod.REGROWTH_METRICS]
+        for block, key in mod.REGROWTH_METRICS:
+            assert plucked[f'{block}.{key}'] == measurement[block][key]
+
+
+class TestRegrowthDeltas:
+    """`after - baseline`, exactly, with None propagated rather than zeroed."""
+
+    def test_deltas_are_after_minus_baseline_per_arm_per_metric(self):
+        mod = _mod()
+        baseline = _arms()
+        after = _arms(flat=_plucked(**{'claim_recall.at_5': 0.25}))
+
+        deltas = mod.regrowth_deltas(baseline, after)
+
+        assert list(deltas) == list(mod.REGROWTH_READ_ARMS)
+        assert deltas['flat']['claim_recall.at_5'] == pytest.approx(-0.25)
+        assert deltas['flat']['claim_recall.at_10'] == 0.0
+        assert deltas['additive_pin']['claim_recall.at_5'] == 0.0
+
+    def test_a_none_on_either_side_propagates_as_none_never_as_zero(self):
+        """The `_NO_MEASUREMENT` discipline, one layer down.
+
+        A delta table that prints "no measurement" as a measured zero says the
+        injection changed nothing — which is a finding, not an absence.
+        """
+        mod = _mod()
+        baseline = _arms(flat=_plucked(**{'claim_recall.at_5': None}))
+        after = _arms(additive_pin=_plucked(**{'claim_recall.at_10': None}))
+
+        deltas = mod.regrowth_deltas(baseline, after)
+
+        assert deltas['flat']['claim_recall.at_5'] is None
+        assert deltas['additive_pin']['claim_recall.at_10'] is None
+        assert deltas['promoting_pin']['claim_recall.at_5'] == 0.0
+
+    def test_an_arm_present_on_one_side_only_raises_naming_it(self):
+        mod = _mod()
+        baseline = _arms()
+        after = dict(_arms())
+        after.pop('promoting_pin')
+
+        with pytest.raises(mod.MeasurementError) as excinfo:
+            mod.regrowth_deltas(baseline, after)
+
+        assert 'promoting_pin' in str(excinfo.value)
+
+    def test_a_metric_present_on_one_side_only_raises_naming_it(self):
+        mod = _mod()
+        baseline = _arms()
+        after = _arms()
+        after['flat'] = {
+            k: v for k, v in after['flat'].items() if k != 'tokens_per_query.mean'
+        }
+
+        with pytest.raises(mod.MeasurementError) as excinfo:
+            mod.regrowth_deltas(baseline, after)
+
+        assert 'tokens_per_query.mean' in str(excinfo.value)
+
+
+class TestRegrowthStampingValue:
+    """`stamped delta - unstamped delta` — the number task 4006 is owed."""
+
+    def test_it_subtracts_the_unstamped_delta_from_the_stamped_one(self):
+        mod = _mod()
+        deltas = {
+            'unstamped': _arms(flat=_plucked(**{'claim_recall.at_5': -0.10})),
+            'stamped': _arms(flat=_plucked(**{'claim_recall.at_5': -0.02})),
+        }
+
+        value = mod.regrowth_stamping_value(deltas)
+
+        assert list(value) == list(mod.REGROWTH_READ_ARMS)
+        assert value['flat']['claim_recall.at_5'] == pytest.approx(0.08)
+
+    def test_two_equal_measured_deltas_give_zero_not_none(self):
+        """Zero here is a measurement: stamping bought nothing, and said so."""
+        mod = _mod()
+        deltas = {'unstamped': _arms(), 'stamped': _arms()}
+
+        value = mod.regrowth_stamping_value(deltas)
+
+        assert value['flat']['claim_recall.at_5'] == 0.0
+        assert value['flat']['claim_recall.at_5'] is not None
+
+    def test_none_propagates_through_the_stamping_value_too(self):
+        mod = _mod()
+        deltas = {
+            'unstamped': _arms(flat=_plucked(**{'claim_recall.at_5': None})),
+            'stamped': _arms(),
+        }
+
+        value = mod.regrowth_stamping_value(deltas)
+
+        assert value['flat']['claim_recall.at_5'] is None
+
+    def test_a_missing_mode_raises_naming_it(self):
+        mod = _mod()
+
+        with pytest.raises(mod.MeasurementError) as excinfo:
+            mod.regrowth_stamping_value({'unstamped': _arms()})
+
+        assert 'stamped' in str(excinfo.value)
+
+
+class TestBuildRegrowthBlock:
+
+    def _block(self):
+        mod = _mod()
+        deltas = {mode: _arms() for mode in mod.REGROWTH_MODES}
+        return mod.build_regrowth_block(
+            baseline=_arms(),
+            after_by_mode={mode: _arms() for mode in mod.REGROWTH_MODES},
+            injections=list(_injections()),
+            fixture_path=REGROWTH_INJECTION_PATH,
+        ), deltas
+
+    def test_the_block_carries_its_descriptors_and_all_four_tables(self):
+        mod = _mod()
+        block, _ = self._block()
+
+        assert block['shape'] == mod.REGROWTH_SHAPE
+        assert block['read_arms'] == list(mod.REGROWTH_READ_ARMS)
+        assert block['modes'] == list(mod.REGROWTH_MODES)
+        assert block['topics_injected'] == 20
+        assert block['injections_per_topic'] == 1
+        assert block['injection_fixture'] == (
+            'fused-memory/tests/fixtures/e2_regrowth_injection.jsonl'
+        )
+        assert list(block['after']) == list(mod.REGROWTH_MODES)
+        assert list(block['deltas']) == list(mod.REGROWTH_MODES)
+        for mode in mod.REGROWTH_MODES:
+            assert list(block['after'][mode]) == list(mod.REGROWTH_READ_ARMS)
+            assert list(block['deltas'][mode]) == list(mod.REGROWTH_READ_ARMS)
+        assert list(block['stamping_value']) == list(mod.REGROWTH_READ_ARMS)
+
+    def test_the_deltas_it_carries_are_the_arithmetic_not_a_restatement(self):
+        mod = _mod()
+        block = mod.build_regrowth_block(
+            baseline=_arms(),
+            after_by_mode={
+                'unstamped': _arms(flat=_plucked(**{'claim_recall.at_5': 0.25})),
+                'stamped': _arms(),
+            },
+            injections=list(_injections()),
+            fixture_path=REGROWTH_INJECTION_PATH,
+        )
+
+        assert block['deltas']['unstamped']['flat']['claim_recall.at_5'] == pytest.approx(-0.25)
+        assert block['deltas']['stamped']['flat']['claim_recall.at_5'] == 0.0
+        assert block['stamping_value']['flat']['claim_recall.at_5'] == pytest.approx(0.25)
+
+
 class TestReadPathHoldsTheWindowBudget:
     """Pin-on and pin-off must be scored over equal-size windows."""
 
