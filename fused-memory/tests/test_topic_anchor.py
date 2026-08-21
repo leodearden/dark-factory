@@ -8,11 +8,16 @@ composition proof lives in ``tests/server/test_topic_anchored_recall_mcp.py``.
 
 from __future__ import annotations
 
+import types
+from unittest.mock import AsyncMock, MagicMock
+
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.memory import MemoryResult
 from fused_memory.services.topic_anchor import (
     _CHILD_KINDS,
+    _DEFAULT_TOPIC_ANCHOR_ENABLED,
     extract_anchor_topics,
+    resolve_topic_anchor_enabled,
     select_canonical_payload,
 )
 
@@ -387,3 +392,81 @@ class TestSelectCanonicalPayload:
                                             include_planned=False)
 
         assert selected is not None and selected['id'] == 'c1'
+
+
+def _memory_service_with_reconciliation(**leaves: object) -> types.SimpleNamespace:
+    """A config double built from SimpleNamespace, never MagicMock.
+
+    scripts/check_bare_magicmock_config.py rejects a bare MagicMock config: an
+    auto-generated attribute reads as a configured value, so a typo'd knob name
+    silently "works" in the test and is inert in production.
+    """
+    return types.SimpleNamespace(
+        config=types.SimpleNamespace(reconciliation=types.SimpleNamespace(**leaves))
+    )
+
+
+class TestTopicAnchorConfigResolver:
+    """The single enable knob, resolved LIVE off the shared config object.
+
+    There is exactly ONE knob here.  The amended task text item (1) explicitly
+    DROPS the planned ``topic_anchored_canonical_kinds`` kind-prefix knob and
+    the non-empty-``supersedes`` fallback, because ``metadata.canonical`` is now
+    the single marker vocabulary — do not add a second resolver.
+    """
+
+    def test_returns_config_value_when_present_and_valid(self):
+        memory_service = _memory_service_with_reconciliation(
+            topic_anchored_recall_enabled=False
+        )
+
+        assert resolve_topic_anchor_enabled(memory_service) is False
+
+    def test_returns_true_when_configured_true(self):
+        memory_service = _memory_service_with_reconciliation(
+            topic_anchored_recall_enabled=True
+        )
+
+        assert resolve_topic_anchor_enabled(memory_service) is True
+
+    def test_falls_back_to_default_when_config_attr_missing(self):
+        assert resolve_topic_anchor_enabled(
+            types.SimpleNamespace()
+        ) == _DEFAULT_TOPIC_ANCHOR_ENABLED
+
+    def test_falls_back_to_default_when_reconciliation_is_none(self):
+        memory_service = types.SimpleNamespace(config=types.SimpleNamespace(reconciliation=None))
+
+        assert resolve_topic_anchor_enabled(memory_service) == _DEFAULT_TOPIC_ANCHOR_ENABLED
+
+    def test_falls_back_to_default_when_config_is_none(self):
+        memory_service = types.SimpleNamespace(config=None)
+
+        assert resolve_topic_anchor_enabled(memory_service) == _DEFAULT_TOPIC_ANCHOR_ENABLED
+
+    def test_falls_back_to_default_when_leaf_is_missing(self):
+        memory_service = _memory_service_with_reconciliation()
+
+        assert resolve_topic_anchor_enabled(memory_service) == _DEFAULT_TOPIC_ANCHOR_ENABLED
+
+    def test_falls_back_to_default_when_leaf_is_non_bool(self):
+        """int 1 and str 'true' are NOT bools — a non-measurement must not gate I/O."""
+        for non_bool in (1, 0, 'true', 'false', None, [], {}):
+            memory_service = _memory_service_with_reconciliation(
+                topic_anchored_recall_enabled=non_bool
+            )
+
+            assert resolve_topic_anchor_enabled(memory_service) == _DEFAULT_TOPIC_ANCHOR_ENABLED, (
+                f'{non_bool!r} must not read as a configured flag'
+            )
+
+    def test_falls_back_to_default_for_unspecced_async_mock(self):
+        """An unspecced mock's attribute chain yields Mocks, not bools."""
+        assert resolve_topic_anchor_enabled(AsyncMock()) == _DEFAULT_TOPIC_ANCHOR_ENABLED
+
+    def test_falls_back_to_default_for_unspecced_magic_mock(self):
+        assert resolve_topic_anchor_enabled(MagicMock()) == _DEFAULT_TOPIC_ANCHOR_ENABLED
+
+    def test_default_is_enabled(self):
+        """The transform ships ON — it is a no-op wherever coverage is absent."""
+        assert _DEFAULT_TOPIC_ANCHOR_ENABLED is True
