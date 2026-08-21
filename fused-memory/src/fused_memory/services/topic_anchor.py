@@ -91,6 +91,19 @@ _MAX_ANCHOR_TOPICS = 3
 # the warn-mode duplicate case, not an expected working-set size.
 _ANCHOR_SCROLL_LIMIT = 25
 
+#: The two ``KIND_REGISTRY`` members that attach to a parent (task 3195).
+#: DELIBERATELY restated rather than imported from ``server/grouped_read.py``:
+#: that module imports ``_MEM0_CONTENT_KEYS`` from ``services/memory_service.py``,
+#: which imports this module, so a ``services -> server`` import here would close
+#: an import cycle.  ``test_child_kinds_matches_the_grouped_read_registry`` pins
+#: the two copies equal so the duplication cannot drift silently (INV-5).
+_CHILD_KINDS = frozenset({'amendment', 'sighting'})
+
+#: Sorts ahead of every real ISO-8601 timestamp, so a payload with a missing or
+#: non-``str`` ``created_at`` loses the recency tie-break instead of winning it
+#: by accident.  Never compared for meaning — only for ordering.
+_UNDATED = ''
+
 
 def extract_anchor_topics(
     results: list[MemoryResult],
@@ -134,3 +147,115 @@ def extract_anchor_topics(
         if len(topics) >= max_topics:
             break
     return topics
+
+
+def _canonical_meta(payload: object) -> dict | None:
+    """The raw Qdrant payload dict of *payload*, or ``None`` if unusable.
+
+    Every access below is defensive by necessity: these dicts come off
+    ``Mem0Backend.scroll_by_metadata`` as FULL raw Qdrant payloads, whose key
+    presence and value types are not schema-enforced at read time.  A malformed
+    entry must degrade to "not canonical" rather than raise — a scroll result
+    that trips over one junk row would take down the whole search it was only
+    trying to enrich.
+    """
+    if not isinstance(payload, dict):
+        return None
+    meta = payload.get('metadata')
+    if not isinstance(meta, dict):
+        return None
+    return meta
+
+
+def _is_child_shaped(meta: dict) -> bool:
+    """True when this payload would be folded into its PARENT downstream.
+
+    ``grouped_read._suppress_child`` runs at the MCP boundary, AFTER
+    ``MemoryService.search``, and replaces a child hit with its parent.  A
+    child-shaped record pinned at index 0 would therefore be silently swapped
+    for a DIFFERENT record than the one selected here.  Requires BOTH halves of
+    the link — a child ``kind`` and a non-empty ``str`` ``parent_id`` — matching
+    the condition grouped_read itself applies.
+
+    A well-formed canonical is never a child, so this excludes only malformed
+    stamped records; it is a defence against the silent swap, not a normal path.
+    """
+    kind = meta.get('kind')
+    if not isinstance(kind, str) or kind not in _CHILD_KINDS:
+        return False
+    parent_id = meta.get('parent_id')
+    return isinstance(parent_id, str) and bool(parent_id)
+
+
+def select_canonical_payload(
+    payloads: list[dict],
+    *,
+    allowed_categories: set[str] | None,
+    include_planned: bool,
+) -> dict | None:
+    """Pick the ONE scrolled payload to pin for a topic, or ``None``.
+
+    *payloads* are raw scroll dicts of shape ``{'id', 'created_at', 'metadata'}``
+    as returned by ``MemoryService.get_memories_by_metadata``.
+
+    Order of operations, which matters:
+
+    1. drop payloads outside *allowed_categories* (when it is not ``None``),
+       planned payloads (unless *include_planned*), and child-shaped payloads;
+    2. keep only STRICTLY canonical survivors — ``meta.get('canonical') is True``,
+       an IDENTITY check, never truthiness.  ``1 == True`` in Python, so
+       truthiness would admit an int as canonical; the identity check mirrors
+       the write-side uniqueness predicate at ``memory_service.py:940`` so the
+       read path and the write path agree on what "canonical" means;
+    3. apply the deterministic tie-break.
+
+    Filtering BEFORE selecting is what makes *allowed_categories* a narrowing:
+    anchoring may change WHICH member of the permitted set is returned, and may
+    return nothing, but it must never widen the set the caller asked for.
+
+    TIE-BREAK — most recent ``created_at``, then lowest ``id``.  More than one
+    canonical per topic is REACHABLE, not theoretical: 3198's per-(project,
+    topic) uniqueness enforcement ships WARN-MODE FIRST
+    (``memory_metadata.enforce`` defaults false) and is inherently
+    TOCTOU-windowed besides, so duplicates land through ordinary writes.  The
+    ``id`` leg makes the order TOTAL, so the pin is stable whatever order the
+    scroll returned rows in.  Recency is compared lexicographically on the raw
+    timestamp string — chronological for the offset-normalized ISO-8601 Mem0
+    stamps, and harmless otherwise because ``id`` still totalizes the order.
+
+    Pure and synchronous: does no I/O and raises nothing on malformed input.
+    """
+    survivors: list[dict] = []
+    for payload in payloads:
+        meta = _canonical_meta(payload)
+        if meta is None:
+            continue
+        if allowed_categories is not None and meta.get('category') not in allowed_categories:
+            continue
+        if not include_planned and meta.get('planned') is True:
+            continue
+        if _is_child_shaped(meta):
+            continue
+        if meta.get('canonical') is not True:
+            continue
+        survivors.append(payload)
+
+    if not survivors:
+        return None
+
+    def _recency(payload: dict) -> str:
+        created_at = payload.get('created_at')
+        return created_at if isinstance(created_at, str) else _UNDATED
+
+    def _id(payload: dict) -> str:
+        id_ = payload.get('id')
+        return id_ if isinstance(id_, str) else ''
+
+    # Two stable passes rather than one composite key: the two legs sort in
+    # OPPOSITE directions (recency descending, id ascending), and a single
+    # reverse=True would invert both, turning the documented "lowest id" tie
+    # break into the highest.  Python's sort is stable, so the id ordering
+    # laid down first survives inside each equal-timestamp group.
+    survivors.sort(key=_id)
+    survivors.sort(key=_recency, reverse=True)
+    return survivors[0]
