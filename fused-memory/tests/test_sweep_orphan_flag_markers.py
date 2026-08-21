@@ -2705,7 +2705,9 @@ class TestTerminalDrainIsPrimaryProjectOnly:
             f'Expected the WARNING to name BOTH the swept project and the '
             f'primary project so the journal explains the narrowing; got {joined!r}'
         )
-        assert 'age-only' in joined, (
+        # Case-insensitive: the message emphasises the downgrade as AGE-ONLY,
+        # and the contract is that it SAYS so, not how it capitalises it.
+        assert 'age-only' in joined.lower(), (
             f'Expected the WARNING to state the sweep proceeds age-only; '
             f'got {joined!r}'
         )

@@ -27,7 +27,8 @@
 # mirrors install-trickle-timer.sh's INSTALL_TRICKLE_TIMER_PYTHON /
 # watcher-rearm.sh's WATCHER_REARM_PYTHON override convention. REPO is
 # similarly overridable so tests can point it at a tmp dir with no `.env`
-# (a no-op source).
+# (a no-op source). FLAG_MARKER_SWEEP_PROJECT_IDS (whitespace-separated)
+# overrides the per-project sweep list -- see the loop at the bottom.
 #
 # Task 2917 EDIT 3 -- `uv` is resolved to an ABSOLUTE path below rather than
 # trusted to be on PATH. OBSERVED (journalctl --user -u
@@ -102,4 +103,48 @@ else
   SWEEP_CMD=("$UV_RESOLVED" run --frozen --project "$FM" python)
 fi
 
-exec "${SWEEP_CMD[@]}" "$FM/scripts/sweep_orphan_flag_markers.py" --apply --terminal-drain
+# --- Per-project sweep loop (task 2917 EDIT 1) ------------------------------
+#
+# This used to be a single `exec ... --apply --terminal-drain` with no
+# --project-id, so it rode the sweep parser's own `dark_factory` default while
+# the per-project census it printed read as if the whole registered fleet had
+# been drained. Every registered project now gets its own invocation.
+#
+# FLAG_MARKER_SWEEP_PROJECT_IDS (whitespace-separated) is the explicit
+# override, mirroring the FLAG_MARKER_SWEEP_CMD / REPO convention above.
+#
+# `exec` is deliberately DROPPED and the loop deliberately does NOT `set -e`
+# out on the first failure: one project's sweep failing must not silently
+# truncate the fleet. Each failure is named on stderr with its exit code, the
+# remaining projects are still attempted, and the wrapper exits non-zero
+# overall so a PARTIAL nightly drain is loud rather than swallowed.
+PROJECT_IDS=()
+if [ -n "${FLAG_MARKER_SWEEP_PROJECT_IDS:-}" ]; then
+  # shellcheck disable=SC2206
+  PROJECT_IDS=(${FLAG_MARKER_SWEEP_PROJECT_IDS})
+fi
+
+if [ "${#PROJECT_IDS[@]}" -eq 0 ]; then
+  PROJECT_IDS=(dark_factory)
+fi
+
+overall_status=0
+for project_id in "${PROJECT_IDS[@]}"; do
+  # Census honesty: name every project actually attempted, so coverage is
+  # readable straight off the journal. --terminal-drain is REQUESTED
+  # uniformly; the sweep itself decides and logs the EFFECTIVE mode, because
+  # terminal ids come from the one task store this process is configured with
+  # and are applied to that primary project ONLY -- every other project
+  # narrows to an age-only sweep (task 2917, esc-2917-3 ruling; the guard is
+  # _resolve_terminal_task_ids in sweep_orphan_flag_markers.py).
+  echo "fused-memory-flag-marker-sweep.sh: sweeping project_id=$project_id (requested: --apply --terminal-drain; the sweep logs the EFFECTIVE mode, which narrows to age-only for every non-primary project)"
+  status=0
+  "${SWEEP_CMD[@]}" "$FM/scripts/sweep_orphan_flag_markers.py" \
+    --apply --terminal-drain --project-id "$project_id" || status=$?
+  if [ "$status" -ne 0 ]; then
+    echo "fused-memory-flag-marker-sweep.sh: ERROR: sweep FAILED for project_id=$project_id (exit $status). Continuing with the remaining projects; the wrapper exits non-zero overall so this partial drain is not swallowed." >&2
+    overall_status="$status"
+  fi
+done
+
+exit "$overall_status"

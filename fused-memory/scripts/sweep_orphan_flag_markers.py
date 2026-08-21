@@ -1327,7 +1327,7 @@ def _known_project_ids() -> list[str]:
         return []
 
 
-async def _resolve_terminal_task_ids() -> set[str]:
+async def _resolve_terminal_task_ids(project_id: str) -> set[str]:
     """Best-effort resolve terminal-status task ids for ``--terminal-drain``.
 
     Mirrors
@@ -1337,20 +1337,82 @@ async def _resolve_terminal_task_ids() -> set[str]:
     raising, logged at WARNING. Only called when ``--terminal-drain`` is
     passed, so the default run path has no taskmaster dependency at all.
 
+    TERMINAL-DRAIN IS PRIMARY-PROJECT-ONLY (task 2917, esc-2917-3 ruling).
+    *project_id* is the project about to be swept; this function resolves ids
+    from exactly ONE task store — the one THIS process is configured with
+    (``config.taskmaster.project_root``) — and returns them only when the two
+    identify the same project. Otherwise it returns ``set()`` and says so at
+    WARNING.
+
+    Why the guard exists, and why HERE. Before task 2917 the nightly wrapper
+    swept a single project, so "the terminal ids" and "the swept project" were
+    trivially the same one. EDIT 1 turns that into a loop over every
+    registered project, and :func:`run` matches markers against this set by
+    PLAIN STRING MEMBERSHIP: a sibling project's marker whose ``task_id``
+    merely COLLIDES with a terminal dark_factory id would be deleted. Task ids
+    are small integers, so collision is the common case, not the corner one
+    (measured ~96% on the live registry). The delete is UNRECOVERABLE —
+    mem0's ``_delete_memory`` removes the Qdrant point BEFORE writing its
+    SQLite history — so the damage asymmetry is total: guarding wrongly costs
+    a lingering marker that the age predicate drains anyway, while not
+    guarding costs records that survive nowhere.
+
+    The alternative (resolve each project's terminal ids from ITS OWN task
+    store) is mechanically possible — ``SqliteTaskBackend.get_statuses``
+    accepts an arbitrary root — but it EXTENDS a cross-project contract to arm
+    deletions in projects whose task store this process does not own. That was
+    rejected-for-now rather than refuted; see
+    ``docs/flag-marker-sweep-recurring.md``. Declining to extend a contract
+    needs no broader authority; extending one does.
+
+    The guard lives at this chokepoint rather than in
+    ``scripts/fused-memory-flag-marker-sweep.sh`` because it is a single
+    unit-testable site that every caller — including a hand-typed
+    ``--project-id <other> --terminal-drain --apply`` — passes through, and it
+    keeps the wrapper a plain loop (the same rationale recorded in
+    :func:`_known_project_ids`).
+
+    Args:
+        project_id: The project this sweep run will operate on, i.e.
+            ``args.project_id``.
+
     Returns:
         Set of task_id strings whose status is terminal (``done`` or
         ``cancelled`` per ``shared.task_statuses.TERMINAL``); empty set on
-        any failure or unconfigured taskmaster.
+        any failure, unconfigured taskmaster, or a non-primary *project_id*.
     """
     try:
         from shared.task_statuses import TERMINAL as TERMINAL_STATUSES  # noqa: PLC0415
 
         from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend  # noqa: PLC0415
         from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+        from fused_memory.models import scope  # noqa: PLC0415
 
         config = FusedMemoryConfig()
         if config.taskmaster is None:
             return set()
+
+        # Resolved with the same rename-stable resolver the registry builder
+        # uses, so a manifest-declared id (not the directory basename) is
+        # compared against the same id space --list-known-projects emits.
+        primary_project_id = scope.resolve_project_id_for_root(
+            config.taskmaster.project_root
+        )
+        if primary_project_id != project_id:
+            logger.warning(
+                'sweep_orphan_flag_markers: --terminal-drain requested for '
+                'project_id=%r, but this process is configured with the task '
+                'store of project_id=%r (%s). Terminal ids are deliberately '
+                'NOT applied across projects -- they would be matched against '
+                "%r's markers by plain string membership, and colliding task "
+                'ids would be deleted unrecoverably. Proceeding AGE-ONLY for '
+                '%r (task 2917, esc-2917-3 ruling: see '
+                'docs/flag-marker-sweep-recurring.md).',
+                project_id, primary_project_id, config.taskmaster.project_root,
+                project_id, project_id,
+            )
+            return set()
+
         backend = SqliteTaskBackend(config.taskmaster)
         await backend.start()
         try:
@@ -1407,7 +1469,21 @@ def main() -> int:
         memory = MemoryService(config)
         now_dt = datetime.now(UTC)
         terminal_task_ids = (
-            await _resolve_terminal_task_ids() if args.terminal_drain else set()
+            await _resolve_terminal_task_ids(args.project_id)
+            if args.terminal_drain
+            else set()
+        )
+        # Census honesty (task 2917 EDIT 1): the wrapper loops over the whole
+        # registered fleet and requests --terminal-drain uniformly, but the
+        # guard above narrows every non-primary project to age-only. Say which
+        # mode ACTUALLY ran, per project, so the journal reports coverage
+        # rather than intent.
+        logger.info(
+            'sweep_orphan_flag_markers: project_id=%s effective mode=%s',
+            args.project_id,
+            f'terminal-drain ({len(terminal_task_ids)} terminal task ids)'
+            if terminal_task_ids
+            else 'age-only',
         )
         try:
             await memory.initialize()
