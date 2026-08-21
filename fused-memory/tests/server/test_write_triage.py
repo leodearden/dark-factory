@@ -26,6 +26,8 @@ from fused_memory.models.memory import MemoryResult
 from fused_memory.server.write_triage import (
     _DEFAULT_CANDIDATE_K,
     _DEFAULT_WRITE_TRIAGE_ENABLED,
+    _FAIL_OPEN_STORM_THRESHOLD,
+    _FAIL_OPEN_STORM_WINDOW_SECONDS,
     CANONICAL_ID_KEY,
     OUTCOME_AMENDED,
     OUTCOME_CONTESTED,
@@ -34,11 +36,14 @@ from fused_memory.server.write_triage import (
     OUTCOME_STORED,
     ROUTED_KEY,
     TRIAGE_OUTCOMES,
+    TriageFailOpenCounter,
+    _stub_judge,
     decide_band,
     resolve_bands,
     resolve_candidate_k,
     resolve_write_triage_enabled,
     retrieve_candidates,
+    triage_write,
 )
 from fused_memory.services.memory_service import RRF_K
 
@@ -618,3 +623,245 @@ class TestRetrieveCandidates:
         service.search = AsyncMock(side_effect=RuntimeError('mem0 down'))
         with pytest.raises(RuntimeError):
             await retrieve_candidates(service, 'c', 'p', 20)
+
+
+# ---------------------------------------------------------------------------
+# Fail-open + storm counter (INV-4)
+# ---------------------------------------------------------------------------
+
+class _Clock:
+    """An injected clock: the window is exercised by advancing it, never by
+    sleeping."""
+
+    def __init__(self) -> None:
+        self.t = 1_000_000.0
+
+    def __call__(self) -> float:
+        return self.t
+
+    def advance(self, seconds: float) -> None:
+        self.t += seconds
+
+
+class TestTriageFailOpenCounter:
+    """A burst of fail-opens means triage is DEGRADED, not that one write went wrong.
+
+    One fail-open is routine (a transient mem0 blip). A burst inside the window
+    means every write in that window silently fell back to pre-triage
+    behaviour — exactly the silent degradation INV-4 exists to make visible.
+    """
+
+    def test_below_the_threshold_returns_none(self) -> None:
+        counter = TriageFailOpenCounter(time_provider=_Clock())
+        for _ in range(_FAIL_OPEN_STORM_THRESHOLD - 1):
+            assert counter.record(project='dark_factory') is None
+
+    def test_the_crossing_call_returns_a_json_serializable_summary(self) -> None:
+        import json  # noqa: PLC0415
+
+        counter = TriageFailOpenCounter(time_provider=_Clock())
+        summary = None
+        for _ in range(_FAIL_OPEN_STORM_THRESHOLD):
+            summary = counter.record(project='dark_factory')
+
+        assert summary is not None, 'crossing the threshold must fire'
+        assert summary['count'] >= _FAIL_OPEN_STORM_THRESHOLD
+        assert summary['threshold'] == _FAIL_OPEN_STORM_THRESHOLD
+        assert summary['window_seconds'] == _FAIL_OPEN_STORM_WINDOW_SECONDS
+        assert summary['hint']
+        assert summary['projects'] == ['dark_factory']
+        # It goes into an escalation detail, so it must survive a round-trip.
+        json.loads(json.dumps(summary))
+
+    def test_a_burst_is_attributed_to_every_project_in_the_window(self) -> None:
+        """`projects`, not "whichever write happened to cross the threshold".
+
+        An operator reading the escalation needs to know whether one project
+        is broken or the whole server is. Naming only the crossing write's
+        project would answer that wrong half the time.
+        """
+        counter = TriageFailOpenCounter(time_provider=_Clock())
+        summary = None
+        for i in range(_FAIL_OPEN_STORM_THRESHOLD):
+            summary = counter.record(project=f'p{i % 2}')
+        assert summary is not None
+        assert summary['projects'] == ['p0', 'p1']
+
+    def test_a_second_crossing_in_the_same_window_is_rate_limited(self) -> None:
+        """A runaway must escalate once per window, not once per write."""
+        counter = TriageFailOpenCounter(time_provider=_Clock())
+        for _ in range(_FAIL_OPEN_STORM_THRESHOLD):
+            counter.record(project='p')
+        for _ in range(_FAIL_OPEN_STORM_THRESHOLD):
+            assert counter.record(project='p') is None
+
+    def test_the_window_ages_events_out(self) -> None:
+        clock = _Clock()
+        counter = TriageFailOpenCounter(time_provider=clock)
+        for _ in range(_FAIL_OPEN_STORM_THRESHOLD - 1):
+            counter.record(project='p')
+        clock.advance(_FAIL_OPEN_STORM_WINDOW_SECONDS + 1)
+        # The window is now empty, so one more event is nowhere near a burst.
+        assert counter.record(project='p') is None
+
+    def test_state_is_per_instance(self) -> None:
+        """No module global: no bleed between servers, or between tests."""
+        a = TriageFailOpenCounter(time_provider=_Clock())
+        b = TriageFailOpenCounter(time_provider=_Clock())
+        for _ in range(_FAIL_OPEN_STORM_THRESHOLD - 1):
+            a.record(project='p')
+        assert b.record(project='p') is None
+
+    def test_an_unresolved_project_still_counts(self) -> None:
+        """A write whose project could not be resolved is still a fail-open."""
+        counter = TriageFailOpenCounter(time_provider=_Clock())
+        summary = None
+        for _ in range(_FAIL_OPEN_STORM_THRESHOLD):
+            summary = counter.record(project=None)
+        assert summary is not None
+        assert summary['count'] >= _FAIL_OPEN_STORM_THRESHOLD
+        assert summary['projects'] == []
+
+
+class TestTriageWriteFailsOpen:
+    """C1 is ABSOLUTE: never an error, never a blocked write, always a decision."""
+
+    @staticmethod
+    def _service(search=None, **write_triage) -> types.SimpleNamespace:
+        service = _svc(**{'enabled': True, 't_high': T_HIGH, 't_low': T_LOW,
+                          'candidate_k': 20, **write_triage})
+        service.search = search or AsyncMock(return_value=[])
+        return service
+
+    @pytest.mark.asyncio
+    async def test_a_raising_search_stores_and_counts_once(self) -> None:
+        counter = TriageFailOpenCounter(time_provider=_Clock())
+        service = self._service(search=AsyncMock(side_effect=RuntimeError('mem0 down')))
+
+        decision = await triage_write(
+            service, content='c', project_id='p', counter=counter,
+        )
+
+        assert decision.outcome == OUTCOME_STORED, 'the write is never blocked'
+        assert counter.live_count() == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('exc', [TypeError, AttributeError, NameError])
+    async def test_a_wiring_bug_class_also_fails_open_and_counts(self, exc) -> None:
+        """The one place this deliberately diverges from the retired guard.
+
+        `tools.py`'s near-dup call site RE-RAISES TypeError/AttributeError/
+        NameError so a signature change surfaces loudly instead of being
+        swallowed. C1 forbids that here — an errored write is a blocked write.
+        The loudness is preserved differently: these are logged at ERROR naming
+        the exception type AND counted, so a changed `MemoryService.search`
+        signature surfaces as a storm escalation rather than as a stream of
+        errored writes.
+        """
+        counter = TriageFailOpenCounter(time_provider=_Clock())
+        service = self._service(search=AsyncMock(side_effect=exc('boom')))
+
+        decision = await triage_write(
+            service, content='c', project_id='p', counter=counter,
+        )
+
+        assert decision.outcome == OUTCOME_STORED
+        assert counter.live_count() == 1
+
+    @pytest.mark.asyncio
+    async def test_a_raising_judge_stores_and_counts_once(self) -> None:
+        counter = TriageFailOpenCounter(time_provider=_Clock())
+        service = self._service(search=AsyncMock(return_value=[_result('m1', 0.75)]))
+
+        async def _boom(**_kwargs):
+            raise RuntimeError('judge down')
+
+        decision = await triage_write(
+            service, content='c', project_id='p', counter=counter, judge=_boom,
+        )
+
+        assert decision.outcome == OUTCOME_STORED
+        assert counter.live_count() == 1
+
+    @pytest.mark.asyncio
+    async def test_the_deliberate_stub_judge_counts_zero(self) -> None:
+        """A STUB IS NOT AN OUTAGE — the other side of the C1 boundary.
+
+        Leaf gamma replaces `_stub_judge`; until then every middle-band write
+        is answered `stored` by design. If that counted as a fail-open, the
+        first `_FAIL_OPEN_STORM_THRESHOLD` middle-band writes after the flag
+        flip would guarantee a storm escalation describing an outage that is
+        not happening — which trains an operator to ignore the alarm that
+        exists to catch a real one.
+        """
+        counter = TriageFailOpenCounter(time_provider=_Clock())
+        service = self._service(search=AsyncMock(return_value=[_result('m1', 0.75)]))
+
+        decision = await triage_write(
+            service, content='c', project_id='p', counter=counter,
+        )
+
+        assert decision.outcome == OUTCOME_STORED
+        assert counter.live_count() == 0, 'a deliberate stub is not a fail-open'
+
+    @pytest.mark.asyncio
+    async def test_a_clean_restated_counts_zero(self) -> None:
+        counter = TriageFailOpenCounter(time_provider=_Clock())
+        service = self._service(search=AsyncMock(return_value=[_result('m1', 0.97)]))
+
+        decision = await triage_write(
+            service, content='c', project_id='p', counter=counter,
+        )
+
+        assert decision.outcome == OUTCOME_RESTATED
+        assert decision.canonical_id == 'm1'
+        assert counter.live_count() == 0
+
+    @pytest.mark.asyncio
+    async def test_a_clean_stored_counts_zero(self) -> None:
+        counter = TriageFailOpenCounter(time_provider=_Clock())
+        service = self._service(search=AsyncMock(return_value=[_result('m1', 0.10)]))
+
+        decision = await triage_write(
+            service, content='c', project_id='p', counter=counter,
+        )
+
+        assert decision.outcome == OUTCOME_STORED
+        assert counter.live_count() == 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('label', 'broken'),
+        [
+            ('search raises', {'search': AsyncMock(side_effect=RuntimeError('x'))}),
+            ('search raises TypeError', {'search': AsyncMock(side_effect=TypeError('x'))}),
+            ('search returns a string', {'search': AsyncMock(return_value='not a list')}),
+            ('search returns junk', {'search': AsyncMock(return_value=[object()])}),
+            ('search is not async', {'search': Mock(return_value=[])}),
+        ],
+    )
+    async def test_triage_write_never_raises_for_any_injected_failure(
+        self, label, broken,
+    ) -> None:
+        """Always a decision — never an exception, never an error dict.
+
+        The last three legs are the ones a narrower try/except would miss: a
+        `search` returning the wrong SHAPE fails inside band routing rather
+        than at the call, and a non-async `search` fails at the `await` itself.
+        """
+        counter = TriageFailOpenCounter(time_provider=_Clock())
+        service = self._service(**broken)
+
+        decision = await triage_write(
+            service, content='c', project_id='p', counter=counter,
+        )
+
+        assert decision.outcome in TRIAGE_OUTCOMES, label
+        assert decision.outcome == OUTCOME_STORED, label
+
+    @pytest.mark.asyncio
+    async def test_the_stub_judge_answers_stored(self) -> None:
+        """Named as leaf gamma's replacement point, and it answers `stored`."""
+        assert await _stub_judge(
+            memory_service=None, content='c', project_id='p', decision=None,
+        ) == OUTCOME_STORED
