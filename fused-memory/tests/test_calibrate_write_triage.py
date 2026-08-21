@@ -1686,6 +1686,63 @@ write_triage:
 """
 
 
+# The shipped config.yaml's actual layout since task 3127: the two hand-set
+# OPERATOR KNOBS sit at the top of the block, above the calibration fence, each
+# carrying its own explanatory comment. They are NOT calibration outputs and
+# this writer does not own them.
+WITH_OPERATOR_KNOBS = """\
+# Leading comment that must survive.
+server:
+  host: localhost
+
+write_triage:
+  # OPERATOR KNOBS — hand-set, NOT calibration outputs.
+  enabled: true
+  # candidate_k: retrieval width, not a threshold.
+  candidate_k: 32
+  # CALIBRATION OUTPUT — do not hand-edit.
+  t_high: 0.11
+  t_low: 0.05
+  calibration_report_path: old/report.json
+
+curator:
+  enabled: true
+"""
+
+# A knob this writer has never heard of. The preservation rule is "keep what
+# this writer does not own", not an allowlist of two names -- a future leaf's
+# knob must not be silently dropped by a recalibration that predates it.
+WITH_AN_UNKNOWN_KNOB = """\
+write_triage:
+  # A knob a later leaf added.
+  some_future_knob: 7
+  t_high: 0.11
+  t_low: 0.05
+  calibration_report_path: old/report.json
+"""
+
+
+def _block_lines(text: str) -> list[str]:
+    """The ``write_triage:`` line plus its indented body, as a line list.
+
+    The exact complement of ``_without_write_triage_block``: between them the
+    two partition the file, so a line can never be asserted twice or lost.
+    """
+    kept: list[str] = []
+    in_block = False
+    for line in text.splitlines():
+        if line.startswith('write_triage:'):
+            in_block = True
+            kept.append(line)
+            continue
+        if in_block:
+            if line[:1].isspace():
+                kept.append(line)
+                continue
+            in_block = False
+    return kept
+
+
 def _without_write_triage_block(text: str) -> list[str]:
     """Every line NOT belonging to a ``write_triage:`` block.
 
@@ -1784,6 +1841,148 @@ class TestWriteTriageConfigBlock:
         with pytest.raises(ValueError):
             _mod().write_triage_config_block(WITH_BLOCK, None, None, 'r.json')
         assert 'write_triage' in WITH_BLOCK and '0.11' in WITH_BLOCK, 'input untouched'
+
+    # -- operator-knob preservation (task 3127) -----------------------------
+    #
+    # This writer OWNS exactly four keys: t_high, t_low,
+    # calibration_report_path, t_high_by_category. Everything else that a
+    # human put in the block is not its business, and dropping it is a silent
+    # failure in the UNSAFE direction.
+
+    # The four keys this writer derives and is therefore entitled to replace.
+    CALIBRATION_OWNED = ('t_high', 't_low', 'calibration_report_path',
+                         't_high_by_category')
+
+    def test_the_operator_knobs_survive_a_recalibration(self) -> None:
+        """A --write-config run must not revert `write_triage.enabled` to off.
+
+        The failure this prevents is silent and points the wrong way.
+        `write_triage_config_block` rebuilds the block from scratch out of the
+        four calibration keys and replaces every line from `write_triage:` to
+        the next top-level key, so an operator who set `enabled: true` would
+        have triage reverted to OFF by the next recalibration, with nothing
+        logged and nothing to grep — the operator would keep reading a system
+        that silently stopped triaging as one that was quietly fine.
+
+        It is not merely cosmetic that the knob lives in config.yaml:
+        `write_triage.enabled` is green-tier hot-reloadable and `reload_config`
+        re-reads config.yaml, so a key that cannot SURVIVE in that file cannot
+        be flipped at runtime at all, and its RELOADABLE_FIELDS registration
+        would be decorative.
+        """
+        out = _call(WITH_OPERATOR_KNOBS)
+        parsed = yaml.safe_load(out)['write_triage']
+
+        assert parsed['enabled'] is True, (
+            'the operator kill switch must survive a recalibration; a rewrite '
+            'that drops it silently reverts triage to off'
+        )
+        assert parsed['candidate_k'] == 32, 'the retrieval width is hand-set too'
+        # ...while every key this writer DOES own is replaced.
+        assert parsed['t_high'] == pytest.approx(0.87)
+        assert parsed['t_low'] == pytest.approx(0.61)
+        assert parsed['calibration_report_path'] == 'calibration/r.json'
+        assert '0.11' not in out and 'old/report.json' not in out
+
+    def test_a_comment_attached_to_a_preserved_key_survives(self) -> None:
+        """The knobs' explanatory comments are the operator-facing half.
+
+        config.yaml's comments are load-bearing — that is the stated reason
+        this is a surgical text edit rather than a safe_dump round-trip. A
+        preserved key whose "hand-set operator knob, not a calibration output"
+        note was dropped is a key the next reader will assume is derived.
+        """
+        out = _call(WITH_OPERATOR_KNOBS)
+        assert '# OPERATOR KNOBS — hand-set, NOT calibration outputs.' in out
+        assert '# candidate_k: retrieval width, not a threshold.' in out
+
+    def test_an_unknown_extra_key_is_preserved_too(self) -> None:
+        """The rule is "preserve what this writer does not own", not a
+        two-name allowlist — otherwise a knob added by a later leaf is
+        silently dropped by a recalibration that predates it."""
+        out = _call(WITH_AN_UNKNOWN_KNOB)
+        parsed = yaml.safe_load(out)['write_triage']
+        assert parsed['some_future_knob'] == 7
+        assert '# A knob a later leaf added.' in out
+
+    def test_preservation_is_idempotent_and_order_stable(self) -> None:
+        """Two runs over the same measurement produce the same bytes.
+
+        The function's docstring already claims this for the sorted
+        per-category keys; preservation must not break it. A writer that
+        re-emitted preserved lines in a different place (or twice) each run
+        would make every recalibration a spurious config diff.
+        """
+        once = _call(WITH_OPERATOR_KNOBS)
+        twice = _call(once)
+        assert twice == once, 'the writer must be a fixed point over its own output'
+
+    def test_the_preserved_knobs_sit_above_the_calibration_fence(self) -> None:
+        """Round-trips the shipped file's layout unchanged.
+
+        config.yaml puts the hand-set knobs at the TOP of the block, above the
+        `# CALIBRATION OUTPUT — do not hand-edit.` fence, precisely so the
+        derived and hand-set halves are visually separable. Re-emitting them
+        below the fence would file them under a comment that tells the next
+        operator not to touch them.
+        """
+        body = _block_lines(_call(WITH_OPERATOR_KNOBS))
+        fence = body.index('  # CALIBRATION OUTPUT — do not hand-edit.')
+        assert body.index('  enabled: true') < fence
+        assert body.index('  candidate_k: 32') < fence
+
+    def test_a_block_with_no_operator_knobs_is_byte_identical_to_today(self) -> None:
+        """No regression for a config that has nothing to preserve.
+
+        Compared as a LINE LIST, not via ``in`` or ``yaml.safe_load``: both are
+        blind to a stray blank line or a duplicated comment, which is exactly
+        what a preservation preamble emitted unconditionally would leave
+        behind.
+        """
+        assert _block_lines(_call(WITH_BLOCK)) == [
+            'write_triage:',
+            '  # CALIBRATION OUTPUT — do not hand-edit.',
+            '  # Derived from measured similarity distributions by',
+            '  # scripts/calibrate_write_triage.py; both values are order statistics of',
+            '  # the observed curator-labeled corpus, not chosen constants.',
+            '  # Report: calibration/r.json',
+            "  # -- records the measured distributions and the deterministic band's",
+            '  # false-positive count. Re-run the script to change these values.',
+            '  t_high: 0.87',
+            '  t_low: 0.61',
+            '  calibration_report_path: calibration/r.json',
+        ]
+
+    def test_the_owned_keys_are_replaced_not_preserved(self) -> None:
+        """The complement of the rule above, stated as its own assertion.
+
+        A preservation pass that scooped up the calibration keys too would
+        emit each of them twice — once preserved, once derived — and pyyaml
+        takes the last, so the bug would be invisible to a safe_load check
+        while leaving a stale number in the file for a human to read.
+        """
+        body = _block_lines(_call(WITH_OPERATOR_KNOBS))
+        for key in self.CALIBRATION_OWNED:
+            emitted = [ln for ln in body if ln.startswith(f'  {key}:')]
+            assert len(emitted) <= 1, f'{key} emitted {len(emitted)} times: {emitted}'
+
+    def test_a_refused_write_cannot_strip_the_knobs_either(self) -> None:
+        """The never-mutate-the-input guarantee covers the preserved keys.
+
+        An uncalibrated run still raises, and the caller's string is untouched
+        — so the refusal path cannot become a way to lose the kill switch.
+        """
+        with pytest.raises(ValueError):
+            _mod().write_triage_config_block(WITH_OPERATOR_KNOBS, None, None, 'r.json')
+        assert 'enabled: true' in WITH_OPERATOR_KNOBS
+        assert 'candidate_k: 32' in WITH_OPERATOR_KNOBS
+
+    def test_the_surrounding_config_still_survives_with_knobs_present(self) -> None:
+        """Preservation must not widen (or narrow) what the span scan eats."""
+        out = _call(WITH_OPERATOR_KNOBS)
+        assert _without_write_triage_block(out) == _without_write_triage_block(
+            WITH_OPERATOR_KNOBS,
+        )
 
 
 class TestWriteTriageConfigBlockSpanScan:
