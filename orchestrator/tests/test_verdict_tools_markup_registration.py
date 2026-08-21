@@ -32,6 +32,7 @@ from typing import Any
 
 import pytest
 from fastmcp import Client
+from fastmcp.exceptions import ToolError
 from shared.mcp_markup_middleware import MarkupGuardMiddleware, RepairPolicy
 
 from orchestrator.artifacts import TaskArtifacts
@@ -362,3 +363,177 @@ class TestCorpusReplayAgainstRealServer:
             assert all(isinstance(entry, dict) for entry in verdict['issues'])
         if 'verdict' in record['expected_recovered']:
             assert verdict['verdict'] in {'PASS', 'ISSUES_FOUND'}
+
+
+# ---------------------------------------------------------------------------
+# The unrepairable path — C2 L187 / INV-7 on THIS server.
+# ---------------------------------------------------------------------------
+
+#: The doubly-corrupted B5-class specimen (the same class as the on-disk
+#: esc-3184-2 record). Borrowed from the ``escalate_info`` rows because the
+#: corpus has NO unrepairable ``submit_review_verdict`` specimen — MEASURED: all
+#: 19 of them are ``repaired``.
+#:
+#: The reuse is legitimate because unrepairability is a property of the VALUE's
+#: own boundary, not of the target tool's schema, and the test below ASSERTS the
+#: observed outcome rather than assuming it — so the reuse is self-verifying if
+#: the corpus or ``repair`` ever moves.
+UNREPAIRABLE_SPECIMEN = 'toolu_012YjuXbKZAMwNAo9WR4Pvjx'
+
+
+class TestUnrepairableResidueIsPreserved:
+    """A refusal on THIS server must not destroy the payload it refuses.
+
+    The state at risk here is worth MORE than the escalation server's, not
+    less: a lost ``submit_review_verdict`` strands a review gate (INV-6) AND
+    destroys a reviewer's entire ``issues`` findings list — by construction text
+    the agent cannot re-emit identically.
+
+    Fails today: ``escalation_sink`` is deliberately unwired on this server, so
+    ``escalation_id`` comes back null, no residue exists anywhere on disk, and
+    the caller is nonetheless told its payload is safely stored.
+    """
+
+    @staticmethod
+    def _value() -> str:
+        record = specimen(UNREPAIRABLE_SPECIMEN)
+        assert record['expected_outcome'] == 'unrepairable'
+        assert record['expected_recovered'] == []
+        return record['value']
+
+    async def _refuse(self, artifacts: TaskArtifacts) -> dict[str, Any]:
+        """Drive the specimen as ``submit_review_verdict.summary``."""
+        server = create_server(artifacts, REVIEWER_ROLE)
+        async with Client(server) as client:
+            with pytest.raises(ToolError) as excinfo:
+                await client.call_tool('submit_review_verdict', {
+                    'reviewer': REVIEWER_ROLE,
+                    'verdict': 'ISSUES_FOUND',
+                    'issues': [],
+                    'summary': self._value(),
+                })
+        return json.loads(str(excinfo.value))
+
+    @staticmethod
+    def _residue_files(artifacts: TaskArtifacts) -> list[Path]:
+        return sorted(artifacts.root.glob('markup_residue-*.json'))
+
+    @pytest.mark.asyncio
+    async def test_the_call_is_refused(self, artifacts: TaskArtifacts):
+        """(a) The boundary is a GUESS, so nothing is forwarded.
+
+        Also the self-verifying half of the cross-tool specimen reuse: the
+        observed outcome is asserted, not assumed.
+        """
+        payload = await self._refuse(artifacts)
+
+        assert payload['error_type'] == 'mcp_markup_unrepairable'
+        assert payload['outcome'] == 'unrepairable'
+        assert payload['tool'] == 'submit_review_verdict'
+        # No repaired_call: offering one would invite a retry re-sending a guess.
+        assert 'repaired_call' not in payload
+
+    @pytest.mark.asyncio
+    async def test_nothing_partial_was_written(self, artifacts: TaskArtifacts):
+        """(b) The tool body never ran, so no half-written verdict envelope
+        carrying the corrupted ``summary`` exists. Mirrors the escalation
+        suite's ``test_nothing_partial_was_written_for_the_caller``."""
+        await self._refuse(artifacts)
+
+        assert artifacts.read_verdict(REVIEWER_ROLE) is None
+
+    @pytest.mark.asyncio
+    async def test_the_residue_survives_in_full(self, artifacts: TaskArtifacts):
+        """(c) "The entire issues payload destroyed with no surviving copy
+        anywhere on disk" — made FALSE.
+
+        Verbatim and entire, deliberately unlike ``build_markup_block``'s
+        200-char excerpt: this is the only surviving copy.
+        """
+        value = self._value()
+        await self._refuse(artifacts)
+
+        files = self._residue_files(artifacts)
+        assert len(files) == 1, f'expected exactly one residue file, got {files!r}'
+        stored = json.loads(files[0].read_text())
+        assert stored['raw_value'] == value
+        assert len(stored['raw_value']) == len(value) == 3525
+
+    @pytest.mark.asyncio
+    async def test_the_refusal_names_the_residue(self, artifacts: TaskArtifacts):
+        """(d) A bounced reviewer must be able to point an operator at its own
+        preserved data — an id it cannot look up is no better than none."""
+        payload = await self._refuse(artifacts)
+
+        assert isinstance(payload['escalation_id'], str)
+        assert (artifacts.root / payload['escalation_id']).is_file()
+
+    @pytest.mark.asyncio
+    async def test_the_residue_carries_its_routing_fields(
+        self, artifacts: TaskArtifacts
+    ):
+        """(e) INV-7: a machine-readable owner plus the standing L2 bound, and
+        the flat fields locating the leak."""
+        await self._refuse(artifacts)
+
+        stored = json.loads(self._residue_files(artifacts)[0].read_text())
+        assert stored['category'] == 'mcp_markup_residue'
+        assert stored['owner'] == 'l2-escalation-watcher'
+        assert stored['level'] == 2
+        assert stored['tool'] == 'submit_review_verdict'
+        assert stored['field'] == 'summary'
+        assert stored['matched_pattern']
+
+    @pytest.mark.asyncio
+    async def test_the_hint_makes_the_preservation_claim(
+        self, artifacts: TaskArtifacts
+    ):
+        """(f) On this server preservation now ACTUALLY happened, so the
+        preserved variant of the hint is the true one."""
+        payload = await self._refuse(artifacts)
+
+        assert 'preserved verbatim' in payload['hint']
+
+    @pytest.mark.asyncio
+    async def test_the_hint_tells_the_truth_when_nothing_could_be_written(
+        self, tmp_path: Path
+    ):
+        """(f, negative) The guarantee is "the prose matches the id", NOT "the
+        prose is always optimistic".
+
+        With the artifacts root removed the residue write cannot land, and the
+        caller must be told so rather than sent after a file that never
+        existed.
+        """
+        import shutil
+
+        worktree = tmp_path / 'vanishing'
+        worktree.mkdir()
+        gone = TaskArtifacts(worktree)
+        gone.init('test-1', 'Test task', 'A test')
+        shutil.rmtree(worktree)
+
+        payload = await self._refuse(gone)
+
+        assert payload['escalation_id'] is None
+        assert 'preserved verbatim' not in payload['hint']
+        assert 'nothing was preserved' in payload['hint'].lower()
+
+    @pytest.mark.asyncio
+    async def test_the_fact_still_fires(self, artifacts: TaskArtifacts, caplog):
+        """(g) INV-2: EVERY outcome emits ``markup_detected``, including this
+        one. A refusal that emitted no fact would be invisible to the storm
+        counter and to any consumer watching the leak rate."""
+        import logging
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.mcp.verdict_tools'):
+            await self._refuse(artifacts)
+
+        facts = [
+            json.loads(rec.getMessage().split(' ', 1)[1])
+            for rec in caplog.records
+            if rec.getMessage().startswith('markup_detected ')
+        ]
+        assert len(facts) == 1, f'expected exactly one fact, got {facts!r}'
+        assert facts[0]['outcome'] == 'unrepairable'
+        assert facts[0]['tool'] == 'submit_review_verdict'
