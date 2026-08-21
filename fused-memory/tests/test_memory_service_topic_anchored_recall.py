@@ -370,5 +370,7 @@ class TestTopicPinDedupeAndMoveToFront:
             categories=['procedural_knowledge'], stores=['mem0'], limit=10,
         )
 
-        assert {r.id for r in results[:2]} == {'canonical-a', 'canonical-b'}
+        # TOPIC-RANK order: topic-a outranks topic-b in the result window, so
+        # its canonical is pinned ahead of topic-b's.
+        assert [r.id for r in results[:2]] == ['canonical-a', 'canonical-b']
         assert all(r.topic_anchored for r in results[:2])

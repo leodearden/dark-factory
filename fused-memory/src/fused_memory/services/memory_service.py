@@ -4099,6 +4099,18 @@ class MemoryService:
         #     INSIDE the returned window and the limit contract is preserved by
         #     construction rather than by arithmetic.
         anchor_topics = extract_anchor_topics(results, max_topics=_MAX_ANCHOR_TOPICS)
+        # Two distinct topics can legitimately resolve to the SAME canonical, so
+        # pinned ids are tracked across the loop: without this the second topic
+        # would pin an already-pinned record a second time.
+        pinned_ids: set[str] = set()
+        # Pins accumulate in TOPIC-RANK order: each lands just after the
+        # previously-pinned ones rather than at index 0, so the canonical of the
+        # highest-ranked topic stays ahead of the next topic's.  A plain
+        # insert(0) would emit them in reverse.  Every slot in [0, pin_at) is a
+        # pin whose id is already in `pinned_ids`, so the move-to-front branch
+        # below can only ever find `existing >= pin_at` and its pop cannot
+        # disturb them.
+        pin_at = 0
         for topic in anchor_topics:
             payloads = await self.get_memories_by_metadata(
                 project_id,
@@ -4112,6 +4124,31 @@ class MemoryService:
             )
             if canonical is None:
                 continue
+            canonical_id = canonical.get('id', '')
+            if canonical_id in pinned_ids:
+                continue
+            pinned_ids.add(canonical_id)
+
+            # MOVE, don't rebuild, when the canonical is already among the
+            # cosine results — which is the measured inversion itself: it IS a
+            # genuine match, just the worst one in its own cluster, so it sits
+            # at the bottom of the window or just outside it.  Its
+            # relevance_score and its metadata (including the real
+            # metadata['store_score'] cosine `_search_mem0` stamped) are honest
+            # measurements; replacing them with a freshly-built zero-scored
+            # result would destroy signal every score-reading consumer depends
+            # on, the near-duplicate write guard first among them.  Only the
+            # ORDER changes, plus the topic_anchored flag.
+            existing = next(
+                (i for i, r in enumerate(results) if r.id == canonical_id), None
+            )
+            if existing is not None:
+                moved = results.pop(existing)
+                moved.topic_anchored = True
+                results.insert(pin_at, moved)
+                pin_at += 1
+                continue
+
             payload_meta = canonical.get('metadata') or {}
             # SCORE CONTRACT: the injected anchor carries the RAW scroll payload
             # as its metadata and must never gain a 'store_score'.  The
@@ -4125,8 +4162,8 @@ class MemoryService:
             # the topics it exists to help.  relevance_score is NOT the cosine
             # since task 3658 (it is an ordinal RRF value, rank-1 ~ 0.0164), so
             # setting it is not a substitute either.  The pin is by ORDER ONLY.
-            results.insert(0, MemoryResult(
-                id=canonical.get('id', ''),
+            results.insert(pin_at, MemoryResult(
+                id=canonical_id,
                 content=_mem0_content(payload_meta),
                 category=_mem0_category(payload_meta),
                 source_store=SourceStore.mem0,
@@ -4135,6 +4172,7 @@ class MemoryService:
                 created_at=canonical.get('created_at'),
                 topic_anchored=True,
             ))
+            pin_at += 1
 
         degraded = bool(failed_stores)
         final = results[:limit]
