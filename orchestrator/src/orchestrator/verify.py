@@ -6438,7 +6438,10 @@ async def run_scoped_verification(
             # bypassed-scoping path executes, not WHETHER it executes.
             # role=='merge' + breadth=='full' replaces the single OPAQUE
             # global command below with a per-module full-suite fan-out
-            # across every REGISTERED module (config.module_configs_or_empty),
+            # across every REGISTERED module (config.module_configs_or_empty
+            # — on the CLI/remote leg that registry IS the dispatcher's spec
+            # set, installed by verify_runner.run_merge_verify_on_worktree,
+            # never the remote host's own discovery walk; task 4536),
             # reusing the SAME _derive_full_suite_runs /
             # _executed_module_configs_from_plan bridge the module_configs-
             # branch merge+full expansion above uses (PRD Resolved decision
@@ -6540,6 +6543,17 @@ async def run_scoped_verification(
             # direct-instantiated config in most unit tests) falls back to
             # the passed module_configs unchanged — degrades safely rather
             # than silently verifying nothing.
+            #
+            # THIS is the site dark_factory's production merge gate actually
+            # takes: dark-factory-orchestrator.yaml sets
+            # merge_verify_breadth: "full" but leaves merge_verify_workspace
+            # at its False default, so the force_workspace fan-out above is
+            # NOT the live routing. And on the CLI/remote leg the registry
+            # read here is the DISPATCHER's spec set, installed onto the
+            # reconstructed config by
+            # verify_runner.run_merge_verify_on_worktree — not the remote
+            # host's own _discover_module_configs walk, which would otherwise
+            # let a stale laptop checkout decide the merge (task 4536).
             #
             # The expansion lives in verify_plan.effective_merge_module_configs
             # (flake-ledger PRD §8.2 / task 3787 γ), which also owns the

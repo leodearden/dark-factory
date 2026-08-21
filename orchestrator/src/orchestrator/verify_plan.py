@@ -898,8 +898,15 @@ def effective_merge_module_configs(
     The local runner, the wire spec (and hence the remote's reconstruction of
     it in ``verify_runner.run_merge_verify_on_worktree``) and the merge-flake
     suppression gate then receive the IDENTICAL set BY CONSTRUCTION, rather
-    than by an assertion that two sites independently agree. Before this
-    helper the expansion was reimplemented inline at two sites inside
+    than by an assertion that two sites independently agree. The parenthetical
+    REMOTE leg was only made true by task 4536: that reconstruction now also
+    INSTALLS the spec's set as the config's module registry before this helper
+    reads it, so the ``config.module_configs_or_empty`` read below is the
+    DISPATCHER's set on the remote path rather than the remote host's own
+    ``_discover_module_configs`` walk. Until then it was aspirational — a
+    stale/divergent laptop checkout could both drop modules the spec named and
+    inject ones it never did. Before this helper the expansion was
+    reimplemented inline at two sites inside
     ``run_scoped_verification``, each rebinding a local that never propagated
     out: the run executed the full registry while the suppression gate still
     mapped failing node-ids against the task's own modules, so a red in an
@@ -913,10 +920,23 @@ def effective_merge_module_configs(
     inside ``run_scoped_verification`` stay in place once the boundary has
     already resolved the set.
 
+    WHOSE REGISTRY the full-breadth branch reads depends on the path, and both
+    answers are the dispatching side's by construction (task 4536): on the
+    genuinely LOCAL merge path it is the merging host's own discovery walk,
+    which IS the source the passed set was derived from; on the CLI/REMOTE path
+    (``orchestrator verify-merge``) it is the set the wire spec shipped,
+    installed onto the reconstructed config by
+    ``verify_runner.run_merge_verify_on_worktree``. There is deliberately no
+    third answer — the remote host's own walk never decides a merge.
+
     The empty-registry fallback is a deliberate SAFE DEGRADE: a project with
     no registered modules returns the passed set rather than ``[]``, so the
     broad gate degrades to today's scoped coverage instead of silently
     verifying nothing at the very breadth that exists to verify everything.
+    Post-4536 it also serves direct-instantiated configs in tests/evals, which
+    never run discovery and whose registry is therefore empty; a zero-module
+    SPEC installs ``{}`` deliberately (the documented "discovery ran and found
+    no subprojects" value), routing that case to the INV-1 global gate.
 
     Breadth is asked of :func:`_merge_breadth_is_full` rather than re-read
     from ``config`` here, so there stays exactly one breadth predicate in the
