@@ -2670,9 +2670,20 @@ def _one_recorded(calls):
     return calls[0][1]
 
 
-def _run_e2e_nightly(tmp_path, *, monkeypatch=None, branch=None, recorder=None,
-                     budget_bytes=None, invoke=_fake_invoke_known_cause,
-                     committer=None, poster=None, transcript=True):
+# Spelled once: two of the four branch drivers patch a module global, so they
+# need the caller's own `monkeypatch` fixture handed in (the previous inline
+# form got it from each test's signature). Asserted per-arm rather than once up
+# front so the failure is loud AND the type checker can see the narrowing.
+_BRANCH_NEEDS_MONKEYPATCH = (
+    'the {!r} branch is driven by monkeypatching a module global; pass '
+    'monkeypatch= to _run_e2e_nightly'
+)
+
+
+def _run_e2e_nightly(tmp_path, *, monkeypatch: pytest.MonkeyPatch | None = None,
+                     branch=None, recorder=None, budget_bytes=None,
+                     invoke=_fake_invoke_known_cause, committer=None, poster=None,
+                     transcript=True):
     """Run ``run_nightly`` end to end on a real temp git repo + transcript and
     return ``(result, repo)``.
 
@@ -2732,24 +2743,20 @@ def _run_e2e_nightly(tmp_path, *, monkeypatch=None, branch=None, recorder=None,
     if committer is not None:
         kwargs['committer'] = committer
 
-    if branch is not None:
-        if branch in ('extractor', 'validation') and monkeypatch is None:
-            raise AssertionError(
-                f'the {branch!r} branch is driven by monkeypatching a module '
-                'global; pass monkeypatch='
-            )
-        if branch == 'extractor':
-            monkeypatch.setattr(nightly, 'build_digests', _crashing_build_digests)
-        elif branch == 'storm':
-            kwargs['invoke'] = _fake_invoke_unparseable
-        elif branch == 'validation':
-            monkeypatch.setattr(
-                codebook, 'validate', lambda cb: ['synthetic validation error'],
-            )
-        elif branch == 'commit':
-            kwargs['committer'] = _failing_committer
-        else:  # pragma: no cover - guards a typo'd branch id
-            raise AssertionError(f'unknown decision-8 branch {branch!r}')
+    if branch == 'extractor':
+        assert monkeypatch is not None, _BRANCH_NEEDS_MONKEYPATCH.format(branch)
+        monkeypatch.setattr(nightly, 'build_digests', _crashing_build_digests)
+    elif branch == 'storm':
+        kwargs['invoke'] = _fake_invoke_unparseable
+    elif branch == 'validation':
+        assert monkeypatch is not None, _BRANCH_NEEDS_MONKEYPATCH.format(branch)
+        monkeypatch.setattr(
+            codebook, 'validate', lambda cb: ['synthetic validation error'],
+        )
+    elif branch == 'commit':
+        kwargs['committer'] = _failing_committer
+    elif branch is not None:  # pragma: no cover - guards a typo'd branch id
+        raise AssertionError(f'unknown decision-8 branch {branch!r}')
 
     return nightly.run_nightly(**kwargs), repo
 
