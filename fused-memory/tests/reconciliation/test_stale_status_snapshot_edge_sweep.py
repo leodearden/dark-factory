@@ -1456,6 +1456,10 @@ _BLOCKED_EXTRACTION_CASES: tuple[tuple[str, set[int]], ...] = (
     # --- the precision guards the union family already buys ---
     ('Task 5 blocked the merge queue', set()),
     ('Task 5 is no longer blocked', set()),
+    # --- the blocked-family-only aggregate subject guard (task 3037) ---
+    ('Task 5 blocked tasks: 142, 148', set()),
+    ('Task 5 is waiting on blocked tasks: 142, 148', set()),
+    ('Task 5 is blocked. Blocked tasks: 142, 148', {5, 142, 148}),
     # --- markers that are NOT blocked assertions ---
     ('Task 5 is pending', set()),
     ('The active pending tasks are [7, 9]', set()),
@@ -1545,6 +1549,57 @@ class TestExtractBlockedAssertionTaskIds:
         by the blocked rule. Refused for free by _ADVERB_ALT's closed class.
         """
         assert extract_blocked_assertion_task_ids('Task 5 is no longer blocked') == set()
+
+    def test_transitive_verb_list_collision_excluded(self):
+        """'Task 5 blocked tasks: 142, 148' -> set(), while the UNION family
+        still gives {142, 148}.
+
+        The one transitive/status-list collision LIST_INTRODUCER_RE's
+        adjacency requirement could not close (task 3042 logged it as a
+        deliberate ambiguity residual). Measured at HEAD before this
+        amendment, the blocked family inherited it and returned {142, 148} —
+        so this permanently-true historical fact would have been retired by
+        the BLOCKED rule the moment 142 or 148 took ANY positively-known
+        non-blocked status, and a superseding fact would have been written
+        attributing the wrong subject. Under the terminal rule alone the same
+        residual only fired at done/cancelled.
+
+        The union assertion is half the test: the terminal rule's behaviour
+        is deliberately UNCHANGED, so the narrowing is scoped to the rule
+        whose trigger made the residual dangerous.
+        (amendment, reviewer_comprehensive correctness-over-selection finding)
+        """
+        collision = 'Task 5 blocked tasks: 142, 148'
+
+        assert extract_blocked_assertion_task_ids(collision) == set()
+        assert extract_snapshot_edge_task_ids(collision) == {142, 148}
+
+    def test_genuine_aggregate_after_a_task_reference_is_the_cost_of_that_guard(self):
+        """'Task 5 is waiting on blocked tasks: 142, 148' -> set().
+
+        The documented UNDER-selection this trade costs: 142 and 148 really
+        are asserted blocked here, but the shape is indistinguishable from
+        the transitive reading by the same clause-scoped test, so the blocked
+        family drops it. Fail-safe direction — the edge is simply not retired
+        by the blocked rule, and the terminal rule still reaches it (union
+        assertion below), which is exactly where it stood before task 3037.
+        """
+        genuine = 'Task 5 is waiting on blocked tasks: 142, 148'
+
+        assert extract_blocked_assertion_task_ids(genuine) == set()
+        assert extract_snapshot_edge_task_ids(genuine) == {142, 148}
+
+    def test_aggregate_in_a_later_clause_is_not_governed_by_the_earlier_ref(self):
+        """'Task 5 is blocked. Blocked tasks: 142, 148' -> {5, 142, 148}.
+
+        The guard is CLAUSE-scoped, not fact-scoped: a task reference in an
+        earlier sentence governs nothing, so a genuine aggregate that merely
+        follows one keeps its ids. Without this scoping the guard would
+        suppress the aggregate path across most multi-sentence facts.
+        """
+        assert extract_blocked_assertion_task_ids(
+            'Task 5 is blocked. Blocked tasks: 142, 148'
+        ) == {5, 142, 148}
 
     # --- non-'blocked' markers are not blocked assertions ---
 
@@ -2313,6 +2368,25 @@ class TestSelectStaleStatusSnapshotEdgesBlockedRule:
 
         assert select_stale_status_snapshot_edges([edge], {'2862': 'pending'}) == []
         assert select_stale_status_snapshot_edges([edge], {'5': 'pending'}) == [edge]
+
+    def test_transitive_verb_list_collision_is_not_retired_by_the_blocked_rule(self):
+        """'Task 5 blocked tasks: 142, 148' is a permanently-true HISTORICAL
+        fact, and the blocked rule must not retire it on a non-terminal status.
+
+        The select-layer half of
+        TestExtractBlockedAssertionTaskIds.test_transitive_verb_list_collision_excluded:
+        the extractor guard is only worth anything if it actually keeps the
+        edge out of the selection. Both directions are pinned — the blocked
+        rule declines it at 'pending', and the pre-existing TERMINAL rule
+        still retires it at 'done', which is the behaviour task 2613 shipped
+        and task 3037 deliberately left alone.
+        (amendment, reviewer_comprehensive correctness-over-selection finding)
+        """
+        edge = {'uuid': 'edge-hist', 'fact': 'Task 5 blocked tasks: 142, 148', 'name': ''}
+
+        assert select_stale_status_snapshot_edges([edge], {'142': 'pending'}) == []
+        assert select_stale_status_snapshot_edges([edge], {'142': 'in-progress'}) == []
+        assert select_stale_status_snapshot_edges([edge], {'142': 'done'}) == [edge]
 
 # --------------------------------------------------------------------------- #
 # sweep_stale_status_snapshot_edges — core behavior

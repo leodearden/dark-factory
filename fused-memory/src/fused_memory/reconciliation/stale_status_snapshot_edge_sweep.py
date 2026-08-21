@@ -108,7 +108,14 @@ constant — do not restate them here.)
   must be added inside the builder, never as a family-specific special
   case: a blocked id the union family cannot reach would let the sweep
   select an edge on an id it never put into its ``get_statuses`` census.
-  (task 3037)
+  (task 3037)  A guard that only ever NARROWS one family is the one
+  permitted asymmetry — it cannot break the subset property — but it is
+  still expressed as a builder PARAMETER carried on
+  ``_SnapshotPatterns``, never as a branch on family identity inside
+  ``_extract_ids``.  ``reject_list_after_task_ref`` is the only such
+  parameter today; the two rules retire an edge on very different
+  triggers, so a residual that is tolerable under one can be intolerable
+  under the other.  (amendment, task 3037)
 
 Known residuals (deliberate; all fail-safe/under-selection unless noted)
 — shape-by-shape detail lives at the matching constant:
@@ -126,6 +133,14 @@ Known residuals (deliberate; all fail-safe/under-selection unless noted)
   and one fail-safe residual (a genuine subject-position enumeration
   sharing a clause with a listed preposition is missed) — see
   ``_ENUM_PREP_WORDS``.
+- task 3037: the blocked family drops any aggregate list whose introducer
+  follows a task reference in the same clause ('Task 5 is waiting on
+  blocked tasks: 142, 148'), so a genuine aggregate of that shape is not
+  retired by the BLOCKED rule — the terminal rule still reaches it. The
+  trade is deliberate: the same shape covers the transitive-verb reading
+  'Task 5 blocked tasks: 142, 148', whose over-selection the blocked rule
+  would trigger almost immediately rather than only at done/cancelled. See
+  ``_list_is_governed_by_task_ref``.
 - task 4149: ``_CLAUSE_BREAK_CHARS``'s ';' and '?' are unconditional
   breaks (only '.' gets the occurrence-level flanking test), so one
   residual is pointed the WRONG way: a '?' inside a URL query string or a
@@ -724,6 +739,51 @@ def _enumeration_is_prepositional_complement(prefix: str) -> bool:
     return _ENUM_PREP_WORD_RE.search(prefix, _last_clause_break(prefix) + 1) is not None
 
 
+def _list_is_governed_by_task_ref(prefix: str) -> bool:
+    """Does an explicit task reference precede this list introducer's clause?
+
+    ``prefix`` is the fact text preceding a ``list_introducer`` match. True
+    means the '<marker> tasks:' span reads as a TRANSITIVE VERB taking that
+    reference as its subject ('Task 5 blocked tasks: 142, 148') rather than as
+    a status list ('Blocked tasks: 142, 148'), and the segment must be
+    discarded.
+
+    Why this exists, and why only the BLOCKED family runs it (amendment,
+    reviewer_comprehensive correctness-over-selection finding, task 3037).
+    ``LIST_INTRODUCER_RE``'s adjacency requirement narrowed the transitive/
+    status-list collision to exactly one shape — the marker sitting
+    immediately before the list noun with no intervening word — and task 3042
+    logged that survivor as a deliberate ambiguity residual. It was tolerable
+    under the TERMINAL rule alone: a permanently-true historical fact was only
+    wrongly retired once one of its listed ids reached done/cancelled, which
+    is rare and late. The task-3037 BLOCKED rule retires on ANY positively
+    known non-'blocked' status, so the same residual fires on essentially the
+    next cycle — and additionally emits a superseding fact attributed to the
+    wrong subject. That is a material amplification in the OVER-selection
+    direction the module docstring calls unrecoverable, so the blocked family
+    trades it for under-selection.
+
+    The union family keeps the old behaviour deliberately: narrowing it too
+    would change the task-2613 terminal rule, which this task did not touch
+    and whose residual is unchanged in both likelihood and consequence.
+    Neither choice can violate the blocked-subset-of-union invariant, because
+    this guard only ever REMOVES ids from the blocked family.
+
+    Clause-scoped for the same reason ``_enumeration_is_prepositional_
+    complement`` is: a reference in an earlier sentence governs nothing here,
+    so 'Task 5 is blocked. Blocked tasks: 142, 148' keeps its aggregate. Uses
+    the same ``rfind`` + ``search(..., pos)`` shape rather than slicing, so it
+    adds no allocation to a hot path the module treats as a liveness property.
+
+    Cost (fail-safe, under-selection): a GENUINE aggregate that happens to
+    follow a task reference in its own clause — 'Task 5 is waiting on blocked
+    tasks: 142, 148' — is no longer reachable by the blocked family. Its edge
+    is simply not retired by the blocked rule; the terminal rule still retires
+    it when a listed id goes done/cancelled, exactly as before task 3037.
+    """
+    return TASK_REF_RE.search(prefix, _last_clause_break(prefix) + 1) is not None
+
+
 # --------------------------------------------------------------------------- #
 # Anchored pattern families — ONE builder, two instantiations (task 3037)
 # --------------------------------------------------------------------------- #
@@ -734,6 +794,12 @@ class _SnapshotPatterns(NamedTuple):
 
     ``individual`` omits its adjective arm entirely when the family carries no
     adjective markers (see ``_build_snapshot_patterns``).
+
+    ``reject_list_after_task_ref`` is not a pattern but a per-family SETTING of
+    the shared algorithm, carried here so ``_extract_ids`` reads it off the
+    family it was handed rather than branching on which family it is running —
+    the same reason the marker alternations are builder parameters. See
+    ``_build_snapshot_patterns``.
     """
 
     individual: re.Pattern[str]
@@ -741,11 +807,14 @@ class _SnapshotPatterns(NamedTuple):
     status_phrase: re.Pattern[str]
     plural_enum: re.Pattern[str]
     list_introducer: re.Pattern[str]
+    reject_list_after_task_ref: bool
 
 
 def _build_snapshot_patterns(
     adjective_alt: str | None,
     transitive_alt: str | None,
+    *,
+    reject_list_after_task_ref: bool = False,
 ) -> _SnapshotPatterns:
     """Compile the five anchored extraction patterns over one marker family.
 
@@ -771,6 +840,11 @@ def _build_snapshot_patterns(
             verbs, or None to omit that arm. These require a MANDATORY
             copula/article, which is what refuses the permanently-true
             historical reading 'Task 5 blocked the merge queue'.
+        reject_list_after_task_ref: Drop an aggregate list segment whose
+            introducer is preceded, IN THE SAME CLAUSE, by an explicit task
+            reference — 'Task 5 blocked tasks: 142, 148'. Off for the union
+            family (whose behaviour is unchanged), on for the blocked family.
+            See ``_list_is_governed_by_task_ref`` for the full argument.
 
     At least one of the two must be supplied. The remaining four patterns run
     against the UNION of whichever were supplied, since each of them pins its
@@ -1029,6 +1103,14 @@ def _build_snapshot_patterns(
     #   [...]' — a shape the sweep must keep. Requiring adjacency narrows the
     #   hazard to that one collision rather than every '... blocked ... tasks:'
     #   fact.
+    #   AMENDED, task 3037: this residual survives in the UNION family only.
+    #   The BLOCKED family additionally drops a segment whose introducer is
+    #   preceded by a task reference in the same clause, because the blocked
+    #   selection rule turns the same ambiguity from a rare late
+    #   over-selection into a near-immediate one, and pairs it with a
+    #   superseding fact attributed to the wrong subject — see
+    #   ``_list_is_governed_by_task_ref`` for the argument and the
+    #   under-selection it costs.
     list_introducer = re.compile(
         r'\b' + marker_alt + r'\s+tasks?\b\s*(?:are|is|were)?\s*(?P<open>[:\[])',
         re.IGNORECASE,
@@ -1040,6 +1122,7 @@ def _build_snapshot_patterns(
         status_phrase=status_phrase,
         plural_enum=plural_enum,
         list_introducer=list_introducer,
+        reject_list_after_task_ref=reject_list_after_task_ref,
     )
 
 
@@ -1055,7 +1138,9 @@ _UNION_PATTERNS = _build_snapshot_patterns(_ADJECTIVE_MARKER_ALT, _TRANSITIVE_MA
 # is transitive-capable, so it is supplied as the transitive alternation and
 # the individual form's adjective arm is omitted: the mandatory copula/article
 # is exactly what keeps 'Task 5 blocked the merge queue' out.
-_BLOCKED_PATTERNS = _build_snapshot_patterns(None, _BLOCKED_MARKER_ALT)
+_BLOCKED_PATTERNS = _build_snapshot_patterns(
+    None, _BLOCKED_MARKER_ALT, reject_list_after_task_ref=True,
+)
 
 INDIVIDUAL_SNAPSHOT_RE: re.Pattern[str] = _UNION_PATTERNS.individual
 GENITIVE_STATUS_RE: re.Pattern[str] = _UNION_PATTERNS.genitive
@@ -1173,6 +1258,11 @@ def extract_blocked_assertion_task_ids(fact: str | None) -> set[int]:
     SUBSET of the union result, by construction (both families come from
     ``_build_snapshot_patterns``, and the blocked family's marker alternation
     is a subset of the union's) — pinned by a test.
+
+    ONE guard is blocked-family-only, and it too narrows: an aggregate list
+    whose introducer follows a task reference in the same clause is dropped,
+    so the transitive-verb reading 'Task 5 blocked tasks: 142, 148' does not
+    reach the blocked rule. See ``_list_is_governed_by_task_ref``.
 
     Why this exists (task 3037). ``extract_snapshot_edge_task_ids`` returns
     the UNION over every status marker, so it cannot say WHICH ids a fact
@@ -1320,6 +1410,15 @@ def _extract_ids(fact: str, patterns: _SnapshotPatterns) -> set[int]:
         )
 
     for intro in patterns.list_introducer.finditer(fact):
+        # Subject guard for the aggregate path: a family may refuse a list
+        # whose introducer is governed by a preceding task reference in the
+        # same clause — the transitive-verb reading of 'Task 5 blocked tasks:
+        # 142, 148'. Read off the family rather than branched on family
+        # identity; see _list_is_governed_by_task_ref.
+        if patterns.reject_list_after_task_ref and _list_is_governed_by_task_ref(
+            fact[: intro.start()]
+        ):
+            continue
         segment = COUNT_QUANTITY_RE.sub(' ', _list_segment(fact, intro.end(), intro.group('open')))
         ids.update(int(tok) for tok in _BARE_DIGIT_RE.findall(segment))
 
