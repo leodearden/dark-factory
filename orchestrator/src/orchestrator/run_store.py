@@ -71,7 +71,12 @@ CREATE TABLE IF NOT EXISTS scheduler_state (
     project_id     TEXT PRIMARY KEY,
     pause_reason   TEXT NOT NULL,
     pause_at       TEXT NOT NULL,
-    set_by_run_id  TEXT NOT NULL
+    set_by_run_id  TEXT NOT NULL,
+    -- Task 4559: the live EWA value at pause time, recorded for EVERY pause
+    -- class as operator evidence.  Nullable on purpose: NULL means "row
+    -- predates task 4559", which the restart predicate treats as unknowable
+    -- and therefore restores the halt blind.
+    ewa_value      REAL
 );
 """
 
@@ -113,6 +118,7 @@ class RunStore:
             # table, so the _SCHEMA additions above reach FRESH DBs only.  Every
             # already-deployed runs.db needs the explicit ALTER.
             self._migrate_task_results_block_context(conn)
+            self._migrate_scheduler_state_ewa_value(conn)
         finally:
             conn.close()
 
@@ -172,6 +178,49 @@ class RunStore:
             logger.info(
                 'RunStore: migrated task_results — added %s', ', '.join(added)
             )
+
+    def _migrate_scheduler_state_ewa_value(self, conn: sqlite3.Connection) -> None:
+        """Add ``ewa_value`` to a pre-4559 ``scheduler_state``.
+
+        Same shape as :meth:`_migrate_task_results_block_context`, deliberately:
+        additive-only, ``PRAGMA table_info`` feature-detect, no
+        ``PRAGMA user_version`` ladder.  ``RunStore`` has never had a version
+        header, and adding one to an existing un-versioned DB would itself need
+        a "version 0 means unknown" special case for no benefit.
+
+        Idempotent, and a no-op on a fresh DB — ``_SCHEMA`` already declares the
+        column there, so ``PRAGMA table_info`` finds it present.
+
+        An existing row reads NULL, which is exactly right: NULL means "row
+        predates task 4559", and ``Harness._load_persisted_scheduler_pause``
+        treats an unknowable predicate as a reason to RE-ASSERT the halt, never
+        to release it.
+
+        FAILURE BEHAVIOUR — the same asymmetry the sibling migration documents.
+        A raise here propagates out of ``__init__``; the sole production caller
+        (``Harness.run``) wraps ``RunStore(db_path)`` in
+        ``except Exception: logger.error(...)`` and continues, so it would drop
+        persistence for the whole run rather than halt it.  That is strictly
+        worse than a NULL column, so the one plausible-and-benign failure — a
+        concurrent construction that already added the column between our
+        ``table_info`` read and this ``ALTER`` — is swallowed: ``duplicate
+        column name`` means the migration's goal is already met.  Everything
+        else (a corrupt DB, a lock we could not take inside the busy_timeout)
+        still surfaces, because a silent half-migrated schema would be worse.
+        """
+        existing = {row[1] for row in conn.execute('PRAGMA table_info(scheduler_state)')}
+        if 'ewa_value' in existing:
+            return
+        try:
+            # Column name is a hard-coded literal, never caller input.
+            conn.execute('ALTER TABLE scheduler_state ADD COLUMN ewa_value REAL')
+        except sqlite3.OperationalError as exc:
+            if 'duplicate column name' not in str(exc).lower():
+                raise
+            logger.debug('RunStore: scheduler_state.ewa_value already added concurrently')
+            return
+        conn.commit()
+        logger.info('RunStore: migrated scheduler_state — added ewa_value')
 
     def start_run(
         self,
@@ -383,19 +432,26 @@ class RunStore:
         reason: str,
         pause_at_iso: str,
         set_by_run_id: str,
+        ewa_value: float | None = None,
     ) -> None:
         """Persist (or replace) the scheduler pause state for *project_id*.
 
         Uses INSERT OR REPLACE so repeated saves are idempotent — the most
         recent call wins, matching UPSERT semantics.
+
+        *ewa_value* (task 4559) is the live EWA at pause time, recorded for
+        EVERY pause class as operator evidence rather than as a trip flag — the
+        pause CLASS is carried by *reason*.  Keyword-defaulted to ``None`` so
+        every existing call site and ``MagicMock(spec=RunStore)`` spy stays
+        valid; ``None`` stores NULL, which reads back as "predates task 4559".
         """
         conn = self._connect()
         try:
             conn.execute(
                 'INSERT OR REPLACE INTO scheduler_state '
-                '(project_id, pause_reason, pause_at, set_by_run_id) '
-                'VALUES (?, ?, ?, ?)',
-                (project_id, reason, pause_at_iso, set_by_run_id),
+                '(project_id, pause_reason, pause_at, set_by_run_id, ewa_value) '
+                'VALUES (?, ?, ?, ?, ?)',
+                (project_id, reason, pause_at_iso, set_by_run_id, ewa_value),
             )
             conn.commit()
         finally:
@@ -404,13 +460,15 @@ class RunStore:
     def load_scheduler_pause(self, project_id: str) -> dict | None:
         """Return the persisted pause record for *project_id*, or ``None``.
 
-        Returns a dict with keys ``reason``, ``pause_at``, ``set_by_run_id``.
+        Returns a dict with keys ``reason``, ``pause_at``, ``set_by_run_id``
+        and ``ewa_value`` (task 4559; ``None`` for a row written before that
+        migration).
         """
         conn = self._connect()
         try:
             conn.row_factory = sqlite3.Row
             row = conn.execute(
-                'SELECT pause_reason, pause_at, set_by_run_id '
+                'SELECT pause_reason, pause_at, set_by_run_id, ewa_value '
                 'FROM scheduler_state WHERE project_id = ?',
                 (project_id,),
             ).fetchone()
@@ -422,6 +480,7 @@ class RunStore:
             'reason': row['pause_reason'],
             'pause_at': row['pause_at'],
             'set_by_run_id': row['set_by_run_id'],
+            'ewa_value': row['ewa_value'],
         }
 
     def clear_scheduler_pause(self, project_id: str) -> None:
