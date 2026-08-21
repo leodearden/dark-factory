@@ -10,6 +10,7 @@ from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _usage_gate_test_helpers import spawn_fault as _spawn_fault
 
 from shared.cli_invoke import AgentResult
 from shared.config_models import AccountConfig, UsageCapConfig
@@ -1111,18 +1112,36 @@ class TestRunProbeSpawnFault:
         is not evidence that the host cannot start `claude`. Latching the
         gate unhealthy on this would make a flaky pipe look like a missing
         binary — and, unlike a missing binary, no operator action fixes it.
+
+        The verdict is only half of it: the spawn succeeded, so a live
+        `claude` is sitting in its own session (`start_new_session=True`) and
+        the generic read-side handler must reap it exactly as the timeout and
+        cancellation handlers do. Asserting only `result is False` would
+        bless a leaked process group (task 4512 review).
         """
         gate, acct = await self._make_probing_gate()
         proc = MagicMock()
-        proc.returncode = 0
+        proc.returncode = None  # still running: the read failed, not the child
+        proc.pid = 4512
         proc.communicate = AsyncMock(
             side_effect=BrokenPipeError(32, 'Broken pipe'),
         )
 
-        with patch('asyncio.create_subprocess_exec', return_value=proc):
+        with (
+            patch('asyncio.create_subprocess_exec', return_value=proc),
+            patch(
+                'shared.usage_gate.terminate_process_group',
+                new_callable=AsyncMock,
+            ) as mock_terminate,
+        ):
             result = await gate._run_probe(acct)
 
         assert result is False
+        mock_terminate.assert_awaited_once()
+        args, kwargs = mock_terminate.await_args
+        assert args[0] is proc
+        assert args[1] == proc.pid, 'the pgid captured at spawn, not a re-read one'
+        assert kwargs == {'grace_secs': 5.0}
 
     async def test_non_oserror_at_spawn_is_not_a_spawn_fault(self):
         """A RuntimeError from the spawn still returns False.
@@ -1215,12 +1234,6 @@ def _events_of(mock_write, event_type: str) -> list[tuple]:
     return [c[0] for c in mock_write.call_args_list if c[0][1] == event_type]
 
 
-def _spawn_fault(binary: str = 'claude') -> ProbeSpawnError:
-    return ProbeSpawnError(
-        binary, FileNotFoundError(2, 'No such file or directory', binary),
-    )
-
-
 class TestProbeInfraFaultLatch:
     """Gate-level accounting for probes that could not be spawned (task 4512).
 
@@ -1237,8 +1250,17 @@ class TestProbeInfraFaultLatch:
     """
 
     def _fresh(self) -> tuple[UsageGate, AccountState]:
+        """A gate whose account is CAPPED — i.e. actually running a probe loop.
+
+        The phase is not incidental: `_note_probe_spawn_failure` only
+        ACCUMULATES for an account that can still produce a probe to clear the
+        count (task 4512 review), so driving it against the default AVAILABLE
+        account would exercise a state the production callers never reach —
+        `_account_resume_probe_loop` runs `while acct.capped` and
+        `_auth_reprobe_loop` runs `while acct.auth_failed`.
+        """
         gate = make_gate(['a'])
-        return gate, gate._accounts[0]
+        return gate, _capped_account(gate)
 
     def test_fresh_gate_reports_no_fault(self):
         gate = make_gate(['a', 'b'])
@@ -1328,6 +1350,8 @@ class TestProbeInfraFaultLatch:
         """
         gate = make_gate(['a', 'b'])
         acct_a, acct_b = gate._accounts
+        acct_a.capped = True
+        acct_b.capped = True
 
         gate._note_probe_spawn_failure(acct_a, _spawn_fault())
         gate._note_probe_spawn_failure(acct_a, _spawn_fault())
@@ -1348,7 +1372,7 @@ class TestProbeInfraFaultLatch:
         that would AttributeError deep inside an unrelated orchestrator test.
         """
         gate = UsageGate.__new__(UsageGate)
-        gate._accounts = [AccountState(name='a', token='tok')]
+        gate._accounts = [AccountState(name='a', token='tok', phase=AccountPhase.CAPPED)]
         gate._cost_store = None
         gate._background_tasks = set()
         acct = gate._accounts[0]
@@ -1555,6 +1579,13 @@ class TestStaleSpawnFailureCounter:
         account's run of failures restarts from the reset, so the fault has
         to be re-established from scratch rather than re-latching instantly
         on counts the SIGHUP already invalidated.
+
+        The post-SIGHUP counts are ZERO, not one (task 4512 review). The
+        fan-out reprobe does fault on every account, but by then the hard
+        reset has left them all AVAILABLE, and `_note_probe_spawn_failure`
+        no longer accumulates for an account with no probe loop to clear the
+        count again — see `TestSighupSpawnFailureCounter` for why a residue
+        of 1 was itself a stale counter.
         """
         gate = make_gate(['a', 'b'])
         acct_a, acct_b = gate._accounts
@@ -1570,22 +1601,32 @@ class TestStaleSpawnFailureCounter:
         with patch('shared.usage_gate.load_dotenv'):
             await gate._on_sighup_async()
 
-        assert [a.probe_spawn_failures for a in gate._accounts] == [1, 1]
+        assert gate._run_probe.await_count == 2, (
+            'both accounts must really have been reprobed — a SIGHUP that '
+            'never reached _reprobe_account would zero the counts trivially'
+        )
+        assert [a.probe_spawn_failures for a in gate._accounts] == [0, 0]
         assert gate.probe_infra_fault is None, (
             'a single post-reset spawn failure must not re-arm a latch the '
             'operator-driven reset had just cleared'
         )
+
     # --- Only accounts that can still PRODUCE evidence may veto a clear ----
     #
-    # Defence in depth ALONGSIDE the reset above, not instead of it. The two
-    # fix different halves and neither subsumes the other. The reset stops
-    # stale counters being CREATED — and is the only thing that can fix the
-    # premature-latch half, since at `_note_probe_spawn_failure` time the
-    # account genuinely IS blocked, so no guard narrowing could help there.
-    # The narrowed guard stops a stale counter that exists ANYWAY — reached
-    # through a future exit path that bypasses `_transition`, or a
-    # `UsageGate.__new__` fixture that assigns its fields by hand — from
-    # pinning the latch UNHEALTHY forever.
+    # Defence in depth ALONGSIDE the reset above, not instead of it. Three
+    # guards now share the same rule — `probe_spawn_failures` is a
+    # PROBING-PHASE quantity — and none subsumes the others:
+    #
+    # 1. `_transition`'s reset stops a stale counter being LEFT BEHIND when a
+    #    still-counting account leaves the blocked set.
+    # 2. `_note_probe_spawn_failure`'s accumulate-side guard stops one being
+    #    CREATED on an account that has no probe loop at all — the
+    #    `_on_sighup_async` fan-out, which reprobes AVAILABLE accounts and so
+    #    is invisible to (1) (see `TestSighupSpawnFailureCounter`).
+    # 3. The narrowed clear-side vote below stops a stale counter that exists
+    #    ANYWAY — reached through a future exit path that bypasses
+    #    `_transition`, or a `UsageGate.__new__` fixture that assigns its
+    #    fields by hand — from pinning the latch UNHEALTHY forever.
 
     def _orphan_counter_gate(
         self, orphan_phase: AccountPhase
@@ -1667,6 +1708,88 @@ class TestStaleSpawnFailureCounter:
 
         assert gate.probe_infra_fault is not None
 
+
+@pytest.mark.asyncio
+class TestSighupSpawnFailureCounter:
+    """SIGHUP on a broken host must leave no counter behind (task 4512 review).
+
+    The one path that reaches `_note_probe_spawn_failure` for an account which
+    is NOT in a probing phase. `_on_sighup_async` force-resets every account to
+    AVAILABLE — zeroing `probe_spawn_failures` via `_transition` — and only
+    THEN fans out `_reprobe_account` across all of them. With the host broken,
+    every one of those reprobes raised `ProbeSpawnError` and left an AVAILABLE
+    account holding a count of 1.
+
+    Nothing could ever clear it: an AVAILABLE account runs neither
+    `_account_resume_probe_loop` (`while acct.capped`) nor `_auth_reprobe_loop`
+    (`while acct.auth_failed`), so it never produces a probe to zero the count,
+    and `_transition`'s compensating reset fires on LEAVING the blocked set —
+    AVAILABLE -> CAPPED is an ENTRY. The residue re-created, in miniature,
+    exactly the defect `TestStaleSpawnFailureCounter` above says it fixed: a
+    later genuine outage latched after `_SPAWN_FAULT_THRESHOLD - 1` real
+    consecutive failures.
+
+    The fix narrows the ACCUMULATE side of `_note_probe_spawn_failure` to the
+    same set as the clear-side vote, so a non-probing account never acquires a
+    count in the first place.
+    """
+
+    async def _sighup_against_a_broken_host(
+        self, names: list[str],
+    ) -> UsageGate:
+        gate = make_gate(names)
+        gate._run_probe = AsyncMock(side_effect=_spawn_fault())
+        with patch('shared.usage_gate.load_dotenv'):
+            await gate._on_sighup_async()
+        return gate
+
+    async def test_sighup_leaves_no_counter_on_an_available_account(self, caplog):
+        """The fault is still ERROR-loud; only the meaningless COUNT is dropped."""
+        with caplog.at_level(logging.ERROR, logger='shared.usage_gate'):
+            gate = await self._sighup_against_a_broken_host(['a', 'b'])
+
+        assert [a.phase for a in gate._accounts] == [AccountPhase.AVAILABLE] * 2
+        assert [a.probe_spawn_failures for a in gate._accounts] == [0, 0], (
+            'a SIGHUP-driven reprobe left a count on an account that runs no '
+            'probe loop, so nothing will ever clear it'
+        )
+        assert gate.probe_infra_fault is None
+        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert len(errors) == 2, (
+            'dropping the count must not also drop the ERROR: an operator '
+            'still needs to see that the binary could not be spawned'
+        )
+        assert all('INFRASTRUCTURE FAULT' in r.getMessage() for r in errors)
+
+    async def test_a_later_genuine_outage_still_needs_the_full_threshold(self):
+        """The consequence the residue caused, driven end to end.
+
+        SIGHUP against a broken host, then a fresh cap on the same account,
+        then `_SPAWN_FAULT_THRESHOLD - 1` genuine consecutive faults. With a
+        stale count of 1 carried over, that run latched the gate one failure
+        early — and the latch's message claimed `_SPAWN_FAULT_THRESHOLD`
+        consecutive failures when only `_SPAWN_FAULT_THRESHOLD - 1` had
+        happened.
+        """
+        gate = await self._sighup_against_a_broken_host(['a'])
+        acct = gate._accounts[0]
+
+        gate._transition(acct, AccountPhase.CAPPED)  # a fresh, unrelated cap
+
+        for _ in range(_SPAWN_FAULT_THRESHOLD - 1):
+            gate._note_probe_spawn_failure(acct, _spawn_fault())
+
+        assert acct.probe_spawn_failures == _SPAWN_FAULT_THRESHOLD - 1
+        assert gate.probe_infra_fault is None, (
+            f'latched after {_SPAWN_FAULT_THRESHOLD - 1} genuine consecutive '
+            f'failures; the SIGHUP reprobe before the cap is not consecutive '
+            f'with them'
+        )
+
+        gate._note_probe_spawn_failure(acct, _spawn_fault())
+
+        assert gate.probe_infra_fault is not None
+        assert f'{_SPAWN_FAULT_THRESHOLD} consecutive' in gate.probe_infra_fault
 
 
 @pytest.mark.asyncio
@@ -1902,21 +2025,48 @@ class TestProbeLoopSpawnFault:
         )
 
     async def test_recovery_clears_the_latch_and_then_resumes(self):
-        """fault, fault, ran-and-capped, ran-and-free.
+        """fault x THRESHOLD (latched), ran-and-capped, ran-and-free.
 
         The `False` is the load-bearing one: it clears BOTH the counter and
         the latch even though the account is still capped, because a probe
         that returned at all proves the binary spawns.
+
+        The fault run is driven all the way to `_SPAWN_FAULT_THRESHOLD` on
+        purpose (task 4512 review). A shorter run never ARMS the latch, which
+        would make the closing `probe_infra_fault is None` pass vacuously —
+        green even if `_clear_probe_spawn_failures` stopped re-evaluating the
+        latch entirely. `latch_seen` is what turns that into a real
+        before/after: it samples the property at the top of each probe, so
+        the sample taken by the `False` probe is the state left behind by the
+        last of the THRESHOLD consecutive faults.
         """
         gate = make_gate(['a'], probe_interval_secs=1, max_probe_interval_secs=8)
         acct = _capped_account(gate, resets_at=None)
-        gate._run_probe = AsyncMock(
-            side_effect=[_spawn_fault(), _spawn_fault(), False, True],
-        )
+
+        script: list[object] = [
+            *(_spawn_fault() for _ in range(_SPAWN_FAULT_THRESHOLD)),
+            False,
+            True,
+        ]
+        latch_seen: list[str | None] = []
+
+        async def scripted_probe(_acct: AccountState) -> bool:
+            latch_seen.append(gate.probe_infra_fault)
+            outcome = script[len(latch_seen) - 1]
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return bool(outcome)
+
+        gate._run_probe = AsyncMock(side_effect=scripted_probe)
 
         await _drive_loop(gate, acct, max_sleeps=20)
 
-        assert gate._run_probe.await_count == 4
+        assert gate._run_probe.await_count == len(script)
+        assert latch_seen[_SPAWN_FAULT_THRESHOLD] is not None, (
+            f'the latch was never armed after {_SPAWN_FAULT_THRESHOLD} '
+            f'consecutive spawn faults, so the post-recovery assertions below '
+            f'would pass vacuously; saw {latch_seen!r}'
+        )
         assert acct.probe_spawn_failures == 0
         assert gate.probe_infra_fault is None
         assert not acct.capped, 'the final successful probe must still resume'

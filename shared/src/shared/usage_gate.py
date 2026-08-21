@@ -1915,7 +1915,48 @@ class UsageGate:
         ERROR the moment it happens, so a transient one is never silent; the
         latch is the durable "an operator must fix this host" claim, and
         staking that on a single failure would flap.
+
+        The COUNT, unlike the log line, is only kept for an account that is
+        still in a probing phase — see the guard below.
         """
+        # Task 4512 review fix: the accumulate side is narrowed to the same
+        # set as the clear-side vote in `_reset_probe_spawn_failures`, and for
+        # the same reason. `probe_spawn_failures` counts CONSECUTIVE spawn
+        # failures, and only CAPPED/AUTH_FAILED accounts spawn probes on a
+        # cadence (`_account_resume_probe_loop` / `_auth_reprobe_loop`), so
+        # only they can ever produce the probe that zeroes the count again.
+        #
+        # `_on_sighup_async` is the path that proved it: it force-resets EVERY
+        # account to AVAILABLE (which zeroes the counter via `_transition`)
+        # and only THEN fans out `_reprobe_account` over all of them. On a
+        # broken host that left every AVAILABLE account holding a count of 1
+        # that nothing would ever clear — `_transition`'s reset fires on
+        # LEAVING the blocked set, and AVAILABLE -> CAPPED is an ENTRY — so a
+        # later, genuine outage latched after only _SPAWN_FAULT_THRESHOLD - 1
+        # real consecutive failures. That is the stale-counter defect
+        # `TestStaleSpawnFailureCounter` exists to prevent, in miniature.
+        #
+        # Narrowing here rather than adding an entry-side reset in
+        # `_transition` keeps ONE rule ("the count is a probing-phase
+        # quantity") instead of two compensating ones, and holds for a
+        # non-probing account that never re-enters the blocked set at all.
+        # The fault itself is still reported at ERROR either way: it is the
+        # COUNT, not the fault, that is meaningless for an account with no
+        # probe loop to clear it.
+        if not (acct.capped or acct.auth_failed):
+            logger.error(
+                'Account %s: probe could not be spawned: binary %r — %s. '
+                'This is an INFRASTRUCTURE FAULT, not a usage cap. NOT '
+                'counted toward the fault latch: the account is %s, which '
+                'runs no probe loop, so it could never produce the probe '
+                'that clears the count.',
+                acct.name,
+                exc.binary,
+                exc.cause,
+                acct.phase.value,
+            )
+            return
+
         acct.probe_spawn_failures += 1
         logger.error(
             'Account %s: probe could not be spawned (%d consecutive): '
@@ -2255,6 +2296,15 @@ class UsageGate:
             raise
         except Exception as exc:
             logger.warning(f'Account {acct.name}: probe error: {exc}')
+            # Symmetric with the TimeoutError/CancelledError arms above (task
+            # 4512 review). We are past the split try, so the spawn SUCCEEDED
+            # and `claude` is live in its own session/process group
+            # (start_new_session=True). A mid-read failure — BrokenPipeError,
+            # ConnectionResetError, a decode error — would otherwise orphan
+            # that group with nothing left to reap it. No `is not None` guard
+            # is needed on proc/pgid: unlike before the split, both are
+            # unconditionally bound by the time control reaches here.
+            await terminate_process_group(proc, pgid, grace_secs=5.0)
             return False
 
         stdout_text = stdout_bytes.decode(errors='replace') if stdout_bytes else ''
