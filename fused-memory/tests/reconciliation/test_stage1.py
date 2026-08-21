@@ -2952,6 +2952,21 @@ class TestStaleStatusSnapshotEdgeSweepWiring:
             f'got stats={report.stats!r}'
         )
 
+        # The superseding write's two failure modes are surfaced beside its
+        # success count, so a 0 there is readable. Without them an operator
+        # cannot tell "nothing needed superseding" from "every write failed"
+        # or "the per-cycle ceiling truncated them" — the log is the channel
+        # this task established is insufficient. (amendment,
+        # reviewer_comprehensive observability finding)
+        assert report.stats.get('stale_blocked_edges_supersede_errors') == 0, (
+            f'Expected the supersede-failure counter surfaced at 0 on a clean '
+            f'run rather than absent; got stats={report.stats!r}'
+        )
+        assert report.stats.get('stale_blocked_edges_supersede_skipped') == 0, (
+            f'Expected the ceiling-truncation counter surfaced at 0 on a clean '
+            f'run rather than absent; got stats={report.stats!r}'
+        )
+
     @pytest.mark.asyncio
     async def test_sweep_failure_is_swallowed_and_other_stats_remain_intact(self):
         """sweep_stale_status_snapshot_edges raising must not blow up run() or
@@ -3013,11 +3028,16 @@ class TestStaleStatusSnapshotEdgeSweepWiring:
             'stale_status_snapshot_edges_invalidated stat'
         )
         assert 'stale_status_snapshot_edges_scanned' not in report.stats
-        assert 'stale_blocked_edges_superseded' not in report.stats, (
-            "The task-3037 stat follows the same convention as its two "
-            'siblings: a failed sweep sets NO key at all, rather than a 0 '
-            'that would read as "the sweep ran and found nothing"'
-        )
+        for key in (
+            'stale_blocked_edges_superseded',
+            'stale_blocked_edges_supersede_errors',
+            'stale_blocked_edges_supersede_skipped',
+        ):
+            assert key not in report.stats, (
+                f'The task-3037 stat {key!r} follows the same convention as its '
+                'siblings: a failed sweep sets NO key at all, rather than a 0 '
+                'that would read as "the sweep ran and found nothing"'
+            )
 
 
 class TestStalePriorityOverrideEdgeSweepWiring:

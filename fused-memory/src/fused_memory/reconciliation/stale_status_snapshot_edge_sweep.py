@@ -1462,6 +1462,39 @@ def _extract_ids(fact: str, patterns: _SnapshotPatterns) -> set[int]:
 _SUPERSEDE_FACT_TEMPLATE = 'As of {date}, task {task_id} has status {status}.'
 
 
+# Per-cycle ceiling on superseding add_memory calls (amendment,
+# reviewer_comprehensive performance finding, task 3037).
+#
+# Each superseding write is a real Graphiti write plus an embedding round-trip,
+# awaited SERIALLY inside the per-stale-edge invalidation loop. Its count is
+# bounded only by how many distinct blocked-asserted tasks are contradicted in
+# the cycle — and on the FIRST cycle after this ships, every blocked assertion
+# accumulated in the corpus since the sweep was written becomes eligible at
+# once. This module treats a ~3.3s edge enumeration as a whole-cycle LIVENESS
+# property and carries performance tests to bound regex cost; adding an
+# unbounded number of sequential network writes to the same loop would blow
+# that budget by minutes on the drain cycle.
+#
+# 50 keeps the worst-case added latency in the same order as the enumeration
+# cost the module already budgets for, while sitting far above steady state:
+# once the backlog has drained, a cycle supersedes roughly one fact per task
+# unblocked since the previous cycle — single digits.
+#
+# NO SILENT CAP: truncation is tallied into stats['supersede_skipped'] and
+# logged at WARNING with the count. And it IS a loss, not a deferral — the
+# edges are still invalidated, so they do not re-enumerate next cycle and the
+# skipped facts are never written. That is the same trade the module already
+# takes on a supersede FAILURE (see sweep_stale_status_snapshot_edges'
+# best-effort paragraph): the correctness-bearing half of the step — retiring
+# the contradicted assertion — always completes; only the record of what
+# replaced it is best-effort.
+#
+# The ceiling counts ATTEMPTS, not successes, so a cycle whose writes are all
+# failing cannot spin through an unbounded number of them via the in-cycle
+# retry path either.
+_MAX_SUPERSEDE_WRITES_PER_CYCLE = 50
+
+
 def build_supersede_fact(task_id: int, status: str, now: datetime) -> str:
     """Render the resulting-state-only temporal_fact that supersedes a retired
     blocked assertion.
@@ -1702,6 +1735,18 @@ async def sweep_stale_status_snapshot_edges(
     re-raised unchanged from BOTH write paths (never swallowed as
     best-effort).
 
+    Because the missing fact cannot be retried NEXT cycle, the one retry it
+    can still get is in-cycle: the per-task dedupe marker is set on SUCCESS
+    only, so a task named by several stale edges gets a fresh attempt from
+    each until one lands. (amendment, reviewer_comprehensive robustness
+    finding, task 3037)
+
+    The superseding writes are additionally capped per cycle at
+    ``_MAX_SUPERSEDE_WRITES_PER_CYCLE`` so an unbounded backlog cannot turn
+    the invalidation loop into minutes of serial network writes; the excess
+    is tallied into ``stats['supersede_skipped']`` and logged at WARNING
+    rather than dropped silently.
+
     Returns:
         dict with int counts: ``scanned`` (edges enumerated after dedup),
         ``candidate_edges`` (edges selected as stale by
@@ -1709,7 +1754,9 @@ async def sweep_stale_status_snapshot_edges(
         update_edge calls), ``errors`` (caught enumerate/cross-reference/
         invalidate failures), ``superseded`` (successful superseding
         temporal_fact writes — blocked rule only), ``supersede_errors``
-        (caught superseding-write failures).
+        (caught superseding-write failures), ``supersede_skipped`` (distinct
+        contradicted tasks left without a superseding fact because
+        ``_MAX_SUPERSEDE_WRITES_PER_CYCLE`` was reached).
 
         ``errors`` stays scoped to the enumerate / cross-reference /
         INVALIDATE paths, which is what keeps the identity
@@ -1727,7 +1774,7 @@ async def sweep_stale_status_snapshot_edges(
     """
     stats = {
         'scanned': 0, 'candidate_edges': 0, 'invalidated': 0, 'errors': 0,
-        'superseded': 0, 'supersede_errors': 0,
+        'superseded': 0, 'supersede_errors': 0, 'supersede_skipped': 0,
     }
 
     if not taskmaster or not project_root:
@@ -1802,7 +1849,20 @@ async def sweep_stale_status_snapshot_edges(
     # contradicted task typically has several blocked-assertion edges (one per
     # phrasing Graphiti extracted), and writing per edge would emit the
     # identical fact several times in a single cycle.
+    #
+    # Membership means WRITTEN, not ATTEMPTED. Those coincide except when a
+    # write fails, and there the distinction is the whole point: the sibling
+    # edges of the same task are the only retry this fact can ever get (an
+    # invalidated edge does not re-enumerate next cycle), so a transient
+    # failure must not consume the task's one-write-per-cycle budget.
+    # (amendment, reviewer_comprehensive robustness finding, task 3037)
     superseded_ids: set[int] = set()
+    # Distinct tasks the per-cycle write ceiling left without a fact, and the
+    # number of add_memory calls issued so far — see
+    # _MAX_SUPERSEDE_WRITES_PER_CYCLE. Attempts, not successes, are what the
+    # ceiling bounds: they are what costs wall-clock.
+    supersede_skipped_ids: set[int] = set()
+    supersede_attempts = 0
     for edge in stale:
         try:
             await memory_service.update_edge(
@@ -1837,7 +1897,10 @@ async def sweep_stale_status_snapshot_edges(
             status = statuses.get(str(task_id))
             if not is_blocked_assertion_contradicted(status) or task_id in superseded_ids:
                 continue
-            superseded_ids.add(task_id)
+            if supersede_attempts >= _MAX_SUPERSEDE_WRITES_PER_CYCLE:
+                supersede_skipped_ids.add(task_id)
+                continue
+            supersede_attempts += 1
             try:
                 await memory_service.add_memory(
                     content=build_supersede_fact(task_id, status, invalidate_at),
@@ -1847,6 +1910,8 @@ async def sweep_stale_status_snapshot_edges(
                     causation_id=run_id,
                 )
                 stats['superseded'] += 1
+                # Marked as done only HERE — see superseded_ids' comment.
+                superseded_ids.add(task_id)
             except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
                 raise
             except Exception:
@@ -1856,5 +1921,19 @@ async def sweep_stale_status_snapshot_edges(
                     task_id, edge['uuid'],
                 )
                 stats['supersede_errors'] += 1
+
+    stats['supersede_skipped'] = len(supersede_skipped_ids)
+    if supersede_skipped_ids:
+        # No silent caps: say how much work was dropped and that it is not
+        # coming back next cycle (the edges are already invalidated).
+        log.warning(
+            'stale_status_snapshot_edge_sweep: per-cycle superseding-write ceiling '
+            '(%d) reached; %d contradicted task(s) left without a superseding fact '
+            'this cycle and will not be retried (their edges are already '
+            'invalidated). task_ids=%s',
+            _MAX_SUPERSEDE_WRITES_PER_CYCLE,
+            len(supersede_skipped_ids),
+            sorted(supersede_skipped_ids),
+        )
 
     return stats

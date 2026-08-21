@@ -42,6 +42,7 @@ from shared.task_statuses import TaskStatus
 from fused_memory.reconciliation import task_filter
 from fused_memory.reconciliation.stale_status_snapshot_edge_sweep import (
     _ENUM_PREP_WORDS,
+    _MAX_SUPERSEDE_WRITES_PER_CYCLE,
     _last_clause_break,
     build_supersede_fact,
     extract_blocked_assertion_task_ids,
@@ -2455,6 +2456,7 @@ class TestSweepStaleStatusSnapshotEdgesCore:
             'scanned': 2, 'candidate_edges': 1,
             'invalidated': 1, 'errors': 0,
             'superseded': 0, 'supersede_errors': 0,
+            'supersede_skipped': 0,
         }, (
             f'Expected exactly the stale edge counted+invalidated, got stats={stats!r}'
         )
@@ -2507,6 +2509,7 @@ class TestSweepStaleStatusSnapshotEdgesCore:
             'scanned': 3, 'candidate_edges': 2,
             'invalidated': 2, 'errors': 0,
             'superseded': 1, 'supersede_errors': 0,
+            'supersede_skipped': 0,
         }, (
             f'Expected both blocked-worded task-2885 edges invalidated and the '
             f'still-blocked control edge left alone, got stats={stats!r}'
@@ -2608,6 +2611,7 @@ class TestSweepStaleStatusSnapshotEdgesCore:
             'scanned': 3, 'candidate_edges': 2,
             'invalidated': 2, 'errors': 0,
             'superseded': 0, 'supersede_errors': 0,
+            'supersede_skipped': 0,
         }, (
             f'Expected both repro-shape edges invalidated and the still-pending '
             f'control edge left alone, got stats={stats!r}'
@@ -2970,6 +2974,139 @@ class TestSweepStaleStatusSnapshotEdgesSupersedeWrite:
         assert stats['superseded'] == 1
 
     @pytest.mark.asyncio
+    async def test_failed_supersede_write_is_retried_by_a_sibling_edge(self):
+        """A transient add_memory failure does not consume the task's one write.
+
+        The per-task dedupe marker is set on SUCCESS, not on attempt. This
+        is the ONLY retry the fact can ever get: both edges are invalidated
+        by the time the second attempt runs, so neither re-enumerates next
+        cycle and there is no later chance. Marking on attempt would forfeit
+        it — the sibling edge, already in hand, would be skipped.
+
+        Both counters stay faithful: one write landed (superseded == 1) and
+        one failed (supersede_errors == 1).
+        (amendment, reviewer_comprehensive robustness finding, task 3037)
+        """
+        memory_service = _make_memory_service()
+        taskmaster = _make_taskmaster()
+        memory_service.graphiti.get_all_valid_edges = AsyncMock(
+            return_value={'entity-a': [
+                {'uuid': 'edge-a', 'fact': self.BLOCKED_FACT, 'name': ''},
+                {'uuid': 'edge-b', 'fact': 'Task 2848 is currently blocked', 'name': ''},
+            ]},
+        )
+        taskmaster.get_statuses = AsyncMock(return_value={'2848': 'pending'})
+        memory_service.add_memory = AsyncMock(
+            side_effect=[RuntimeError('transient graphiti write failure'), None],
+        )
+
+        stats = await sweep_stale_status_snapshot_edges(
+            memory_service, taskmaster, 'test_project', '/tmp/reify',
+            **self._sweep_kwargs(),
+        )
+
+        assert memory_service.add_memory.await_count == 2, (
+            "The second edge naming task 2848 must re-attempt the write the "
+            f'first one failed, got {memory_service.add_memory.await_count} attempt(s)'
+        )
+        assert stats['superseded'] == 1, (
+            f'The retry landed, so the fact is written exactly once, got {stats!r}'
+        )
+        assert stats['supersede_errors'] == 1, (
+            f'The first attempt still counts as a failure, got {stats!r}'
+        )
+        assert stats['invalidated'] == 2, (
+            f'Both invalidations are unaffected by either write, got {stats!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_per_cycle_write_ceiling_truncates_and_reports_the_remainder(self):
+        """More contradicted tasks than _MAX_SUPERSEDE_WRITES_PER_CYCLE ->
+        the excess is skipped, counted, and logged — never silently dropped.
+
+        The writes are awaited serially inside the invalidation loop, so an
+        unbounded backlog (every blocked assertion in the corpus becomes
+        eligible on the first cycle after the rule ships) would add minutes
+        of network time to a loop whose enumeration cost this module already
+        treats as a liveness property.
+
+        The INVALIDATIONS are deliberately NOT capped: retiring the
+        contradicted assertion is the correctness-bearing half of the step,
+        and capping it would also break the
+        invalidated == candidate_edges - errors identity.
+        (amendment, reviewer_comprehensive performance finding, task 3037)
+        """
+        overflow = 3
+        total = _MAX_SUPERSEDE_WRITES_PER_CYCLE + overflow
+        task_ids = list(range(9000, 9000 + total))
+        memory_service = _make_memory_service()
+        taskmaster = _make_taskmaster()
+        memory_service.graphiti.get_all_valid_edges = AsyncMock(
+            return_value={'entity-a': [
+                {
+                    'uuid': f'edge-{task_id}',
+                    'fact': f'Task {task_id} remains blocked as of 2026-07-22',
+                    'name': '',
+                }
+                for task_id in task_ids
+            ]},
+        )
+        taskmaster.get_statuses = AsyncMock(
+            return_value={str(task_id): 'pending' for task_id in task_ids},
+        )
+        log = MagicMock()
+
+        stats = await sweep_stale_status_snapshot_edges(
+            memory_service, taskmaster, 'test_project', '/tmp/reify',
+            log=log, **self._sweep_kwargs(),
+        )
+
+        assert memory_service.add_memory.await_count == _MAX_SUPERSEDE_WRITES_PER_CYCLE, (
+            f'The ceiling bounds the number of awaited writes, got '
+            f'{memory_service.add_memory.await_count}'
+        )
+        assert stats['superseded'] == _MAX_SUPERSEDE_WRITES_PER_CYCLE
+        assert stats['supersede_skipped'] == overflow, (
+            f'Expected the {overflow} tasks past the ceiling counted as skipped, '
+            f'got {stats!r}'
+        )
+        assert stats['invalidated'] == total, (
+            f'Every stale edge is still retired — only the superseding WRITE is '
+            f'capped, got {stats!r}'
+        )
+        assert stats['supersede_errors'] == 0, (
+            f'A ceiling truncation is not a write failure, got {stats!r}'
+        )
+        assert log.warning.call_count == 1, (
+            'No silent caps: truncating must log exactly one WARNING naming how '
+            f'much was dropped, got {log.warning.call_args_list!r}'
+        )
+        assert overflow in log.warning.call_args.args, (
+            f'The WARNING must carry the skipped COUNT, got {log.warning.call_args!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_ceiling_warning_when_the_cycle_stays_under_it(self):
+        """The common case logs nothing — the warning marks real truncation."""
+        memory_service = _make_memory_service()
+        taskmaster = _make_taskmaster()
+        memory_service.graphiti.get_all_valid_edges = AsyncMock(
+            return_value={'entity-a': [
+                {'uuid': 'edge-2848', 'fact': self.BLOCKED_FACT, 'name': ''},
+            ]},
+        )
+        taskmaster.get_statuses = AsyncMock(return_value={'2848': 'pending'})
+        log = MagicMock()
+
+        stats = await sweep_stale_status_snapshot_edges(
+            memory_service, taskmaster, 'test_project', '/tmp/reify',
+            log=log, **self._sweep_kwargs(),
+        )
+
+        assert stats['supersede_skipped'] == 0
+        log.warning.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_no_supersede_write_when_the_invalidation_failed(self):
         """update_edge raised -> no superseding fact for that edge.
 
@@ -3101,6 +3238,7 @@ class TestSweepStaleStatusSnapshotEdgesGuards:
             'scanned': 0, 'candidate_edges': 0,
             'invalidated': 0, 'errors': 0,
             'superseded': 0, 'supersede_errors': 0,
+            'supersede_skipped': 0,
         }
         memory_service.graphiti.get_all_valid_edges.assert_not_awaited()
 
@@ -3170,6 +3308,7 @@ class TestSweepStaleStatusSnapshotEdgesBestEffort:
             'scanned': 2, 'candidate_edges': 2,
             'invalidated': 1, 'errors': 1,
             'superseded': 0, 'supersede_errors': 0,
+            'supersede_skipped': 0,
         }, (
             f'Expected the failed update tallied as an error without blocking the second, got {stats!r}'
         )
@@ -3192,6 +3331,7 @@ class TestSweepStaleStatusSnapshotEdgesBestEffort:
             'scanned': 0, 'candidate_edges': 0,
             'invalidated': 0, 'errors': 1,
             'superseded': 0, 'supersede_errors': 0,
+            'supersede_skipped': 0,
         }, (
             f'Expected all-zero stats with the failure tallied as an error, got {stats!r}'
         )
@@ -3220,6 +3360,7 @@ class TestSweepStaleStatusSnapshotEdgesBestEffort:
             'scanned': 1, 'candidate_edges': 0,
             'invalidated': 0, 'errors': 1,
             'superseded': 0, 'supersede_errors': 0,
+            'supersede_skipped': 0,
         }, (
             f'Expected the get_statuses failure tallied as an error with no invalidation, got {stats!r}'
         )
@@ -3300,6 +3441,7 @@ class TestSweepStaleStatusSnapshotEdgesBestEffort:
             'scanned': 2, 'candidate_edges': 2,
             'invalidated': 2, 'errors': 0,
             'superseded': 1, 'supersede_errors': 1,
+            'supersede_skipped': 0,
         }, (
             'Expected the failed supersede tallied into supersede_errors only, '
             f'leaving both invalidations intact and errors at 0, got {stats!r}'

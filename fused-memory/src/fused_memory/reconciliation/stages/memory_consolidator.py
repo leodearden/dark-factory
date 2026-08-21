@@ -649,6 +649,12 @@ class MemoryConsolidator(BaseStage):
         # resulting-state-only temporal_fact per contradicted task per cycle,
         # so the graph records what replaced the retired assertion instead of
         # merely losing it — surfaced here as stale_blocked_edges_superseded.
+        # Its two failure modes are surfaced beside it rather than left to the
+        # log: a bare superseded=0 cannot distinguish "no blocked edge needed
+        # superseding this cycle" from "every superseding write failed" or
+        # "the per-cycle write ceiling truncated them" — the same
+        # 0-vs-N ambiguity this task was filed against.  (amendment,
+        # reviewer_comprehensive observability finding)
         # Best-effort: a sweep failure must never abort the stage or leave a
         # partial/incorrect stat — it is logged and swallowed, and NONE of
         # these stats is set for this cycle.
@@ -676,6 +682,12 @@ class MemoryConsolidator(BaseStage):
             )
             report.stats['stale_blocked_edges_superseded'] = (
                 snapshot_sweep_stats['superseded']
+            )
+            report.stats['stale_blocked_edges_supersede_errors'] = (
+                snapshot_sweep_stats['supersede_errors']
+            )
+            report.stats['stale_blocked_edges_supersede_skipped'] = (
+                snapshot_sweep_stats['supersede_skipped']
             )
 
         # ── Stale priority-override / pin-queue edge sweep (task 2781) ─────────
