@@ -75,6 +75,12 @@ from fused_memory.services.memory_metadata_census import (
     emit_schema_warnings,
     file_unknown_key_storm_escalation,
 )
+from fused_memory.services.topic_anchor import (
+    _ANCHOR_SCROLL_LIMIT,
+    _MAX_ANCHOR_TOPICS,
+    extract_anchor_topics,
+    select_canonical_payload,
+)
 from fused_memory.utils.async_utils import gather_collect, gather_or_raise
 from fused_memory.utils.canonical_labels import Referent
 from fused_memory.utils.referent_resolution import (
@@ -164,6 +170,42 @@ _MEM0_ADD_INFER_PINNED_FALSE = True
 # clear_malformed_empty_memory.py:_CONTENT_KEYS and audit_duplicate_memories.py)
 # rather than importing from scripts/, so the service has no scripts/ dependency.
 _MEM0_CONTENT_KEYS = ('data', 'memory', 'content')
+
+
+def _mem0_content(payload: dict) -> str:
+    """The human-readable text of a RAW Qdrant payload, or ``''``.
+
+    First non-empty string among :data:`_MEM0_CONTENT_KEYS`.  Shared by every
+    caller that turns a raw payload into text — ``get_memory_by_id`` and the
+    topic-anchored pin in :meth:`MemoryService.search` — so the fallback ORDER
+    lives in exactly one place.  A second inline copy of this loop would be a
+    place for the two paths to disagree about which key holds the body (INV-5).
+
+    Note this is the RAW-PAYLOAD path, distinct from the Mem0 *search item*
+    path in ``_search_mem0``: a search item and a scroll payload do not put the
+    text under the same key, which is exactly why guessing one key is wrong.
+    """
+    for key in _MEM0_CONTENT_KEYS:
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return ''
+
+
+def _mem0_category(meta: dict) -> MemoryCategory | None:
+    """The MemoryCategory a raw Mem0 payload declares, or ``None``.
+
+    ``None`` for an absent key AND for an unrecognised value: a payload's
+    ``category`` is a plain string with no read-time schema enforcement, so an
+    unknown value degrades to "no category" rather than raising mid-search.
+    Shared by ``_search_mem0`` and the topic-anchored pin so both paths agree
+    on what an unrecognised category means (INV-5).
+    """
+    if 'category' not in meta:
+        return None
+    with contextlib.suppress(ValueError):
+        return MemoryCategory(meta['category'])
+    return None
 
 
 def _is_dependency_fact(fact: str | None) -> bool:
@@ -4043,6 +4085,57 @@ class MemoryService:
                     if r.source_store == SourceStore.graphiti and r.category is None:
                         r.category = inferred
 
+        # ---- Topic-anchored canonical pin (task 3111) -------------------
+        # PLACEMENT IS LOAD-BEARING, in both directions:
+        #   * AFTER the category filter above, because that comprehension
+        #     REBINDS `results`, and a pinned mem0 row whose category fell
+        #     outside `cat_set` would simply be dropped there (only Graphiti
+        #     rows with category None get the escape hatch).
+        #   * AFTER the sort at the top of this tail, because `sort_key` orders
+        #     by -relevance_score and every RRF score is <= 1/61 — a pin with
+        #     no synthetic score could not survive a re-sort, and giving it one
+        #     is forbidden (see the store_score contract below).
+        #   * BEFORE `final = results[:limit]`, so the pinned record lands
+        #     INSIDE the returned window and the limit contract is preserved by
+        #     construction rather than by arithmetic.
+        anchor_topics = extract_anchor_topics(results, max_topics=_MAX_ANCHOR_TOPICS)
+        for topic in anchor_topics:
+            payloads = await self.get_memories_by_metadata(
+                project_id,
+                {'topic': topic, 'canonical': True},
+                limit=_ANCHOR_SCROLL_LIMIT,
+            )
+            canonical = select_canonical_payload(
+                payloads,
+                allowed_categories=set(categories) if categories else None,
+                include_planned=include_planned,
+            )
+            if canonical is None:
+                continue
+            payload_meta = canonical.get('metadata') or {}
+            # SCORE CONTRACT: the injected anchor carries the RAW scroll payload
+            # as its metadata and must never gain a 'store_score'.  The
+            # write-time near-duplicate guard reads the cosine from
+            # metadata['store_score'] and qualifies on `>= threshold`
+            # (near_duplicate_guard.find_near_duplicate_memory :114-121, via
+            # _cosine_of :71-84); a MISSING cosine means "not comparable" and can
+            # never qualify at any threshold, while a synthetic one would
+            # hard-block EVERY procedural_knowledge write on a consolidated
+            # topic — turning a retrieval fix into a write outage on precisely
+            # the topics it exists to help.  relevance_score is NOT the cosine
+            # since task 3658 (it is an ordinal RRF value, rank-1 ~ 0.0164), so
+            # setting it is not a substitute either.  The pin is by ORDER ONLY.
+            results.insert(0, MemoryResult(
+                id=canonical.get('id', ''),
+                content=_mem0_content(payload_meta),
+                category=_mem0_category(payload_meta),
+                source_store=SourceStore.mem0,
+                relevance_score=0.0,
+                metadata=payload_meta,
+                created_at=canonical.get('created_at'),
+                topic_anchored=True,
+            ))
+
         degraded = bool(failed_stores)
         final = results[:limit]
 
@@ -4208,10 +4301,7 @@ class MemoryService:
             if meta.get('planned') is True and not include_planned:
                 continue
 
-            category = None
-            if 'category' in meta:
-                with contextlib.suppress(ValueError):
-                    category = MemoryCategory(meta['category'])
+            category = _mem0_category(meta)
 
             # Rank over SURVIVORS only (task 3658) — a result skipped above must
             # not consume a rank, since RRF maps rank directly to score.
@@ -4682,13 +4772,7 @@ class MemoryService:
         payload = await self.mem0.get_point_by_id(memory_id, scope)
         if payload is None:
             return None
-        content = ''
-        for key in _MEM0_CONTENT_KEYS:
-            value = payload.get(key)
-            if isinstance(value, str) and value:
-                content = value
-                break
-        return {'id': memory_id, 'content': content, 'metadata': payload}
+        return {'id': memory_id, 'content': _mem0_content(payload), 'metadata': payload}
 
     async def get_mem0_deletion_tombstone(
         self,
