@@ -718,6 +718,14 @@ class TestResumeFallbackCounter:
     rides out on the result as the carrier the orchestrator reads (step-22)
     without ``shared`` acquiring an event-store dependency.
 
+    THE PREDICATE, EXACTLY: every resumed attempt this loop made that then
+    failed non-cap — the caller's ``resume_session_id`` AND any resume the loop
+    re-armed itself off a capped attempt.  It is therefore not the answer to
+    "did the resume the ORCHESTRATOR adopted survive?"; the orchestrator gates
+    its ``session_resume_failed(stage='cli')`` emit on its own armed session id
+    for that.  ``resume_fallback_session_ids`` names which sessions were lost,
+    because after ``_reset_for_fresh_retry`` the ids are otherwise unrecoverable.
+
     THE LOAD-BEARING SUBTLETY: the retry loop rebinds ``result`` on every pass,
     so a counter stamped onto the DISCARDED first result is lost by
     construction.  Only a loop-local counter stamped at the single return point
@@ -763,19 +771,25 @@ class TestResumeFallbackCounter:
             'on the final returned object, not on the discarded failed resume'
         )
         assert got.resume_fallbacks == 1
+        assert got.resume_fallback_session_ids == ('sess-lost',)
 
     async def test_two_resume_fallbacks_counted(self):
         """Two armed-then-failed resumes across a cap re-arm → the count reaches 2.
 
-        Realistic five-call shape: caller resume fails (fallback 1) → fresh
+        Realistic FOUR-call shape: caller resume fails (fallback 1) → fresh
         retry hits a cap that carries a session id → the loop re-arms
         ``--resume`` itself → that resume fails too (fallback 2) → fresh retry
         succeeds.  Proves the counter accumulates rather than latching at one.
+
+        Also the row that pins the counter's REAL predicate: increment 2 comes
+        from a resume the LOOP re-armed, not one the caller asked for — which
+        is why the orchestrator's ``stage='cli'`` emit gates on its own armed
+        session id instead of on a non-zero count.
         """
         gate = make_gate_mock(
             account_count=2,
-            before_invoke=AsyncMock(side_effect=['t-a', 't-b', 't-a', 't-b', 't-a']),
-            detect_cap_hit=MagicMock(side_effect=[False, True, False, False, False]),
+            before_invoke=AsyncMock(side_effect=['t-a', 't-b', 't-a', 't-b']),
+            detect_cap_hit=MagicMock(side_effect=[False, True, False, False]),
             active_account_name='acct-b',
         )
         failed_resume_1 = _make_result(success=False, output='resume error')
@@ -803,12 +817,22 @@ class TestResumeFallbackCounter:
         assert mock_invoke.call_args_list[2].kwargs.get('resume_session_id') == 'sess-capped'
         assert got is ok_result
         assert got.resume_fallbacks == 2
+        # …and the carrier NAMES both lost sessions, oldest first.  The count
+        # alone cannot: _reset_for_fresh_retry regenerates the pre-allocated
+        # session_id and the cap re-arm replaced the armed id, so neither the
+        # caller's id nor got.session_id identifies what was dropped.
+        assert got.resume_fallback_session_ids == ('sess-lost', 'sess-capped')
 
     async def test_no_resume_leaves_counter_zero(self):
         """A plain invocation with no ``--resume`` leaves the default 0.
 
         Every existing caller must see an unchanged result shape: the field is
         additive, and a non-resumed invocation can never have lost a resume.
+
+        Asserting ``== 0`` alone would pin the dataclass DEFAULT and stay green
+        with the whole feature deleted, so the row asserts the behaviour that
+        can actually break: exactly ONE call, carrying no ``resume_session_id``
+        — i.e. the loop never armed (and so never lost) a resume of its own.
         """
         gate = make_gate_mock(detect_cap_hit=MagicMock(return_value=False))
         ok_result = _make_result()
@@ -817,18 +841,26 @@ class TestResumeFallbackCounter:
             'shared.cli_invoke.invoke_claude_agent',
             new_callable=AsyncMock,
             return_value=ok_result,
-        ):
+        ) as mock_invoke:
             got = await invoke_with_cap_retry(gate, 'test-label', prompt='do stuff')
 
         assert got is ok_result
+        assert mock_invoke.call_count == 1, 'no fresh retry should have happened'
+        assert not mock_invoke.call_args_list[0].kwargs.get('resume_session_id')
         assert got.resume_fallbacks == 0
+        assert got.resume_fallback_session_ids == ()
 
-    async def test_failed_resume_that_is_never_retried_still_reports_zero(self):
+    async def test_successful_resume_reports_zero(self):
         """Scope check: the counter counts FALLBACKS taken, not resumes armed.
 
         A resumed invocation that SUCCEEDS took no fallback, so nothing was
         lost and the count stays 0 — the orchestrator must not emit a
         ``session_resume_failed`` event for a resume that worked.
+
+        Same teeth as the row above: the resume is provably ARMED (call 1
+        carries ``resume_session_id``) and provably NOT retried
+        (``call_count == 1``), so a spurious increment or a lost stamp is
+        detectable rather than masked by the field's default.
         """
         gate = make_gate_mock(detect_cap_hit=MagicMock(return_value=False))
         ok_result = _make_result()
@@ -837,12 +869,18 @@ class TestResumeFallbackCounter:
             'shared.cli_invoke.invoke_claude_agent',
             new_callable=AsyncMock,
             return_value=ok_result,
-        ):
+        ) as mock_invoke:
             got = await invoke_with_cap_retry(
                 gate, 'test-label', prompt='do stuff', resume_session_id='sess-ok',
             )
 
+        assert got is ok_result
+        assert mock_invoke.call_count == 1, (
+            'the resume succeeded — no fresh fallback invocation should exist'
+        )
+        assert mock_invoke.call_args_list[0].kwargs.get('resume_session_id') == 'sess-ok'
         assert got.resume_fallbacks == 0
+        assert got.resume_fallback_session_ids == ()
 
 @pytest.mark.asyncio
 class TestResumeDiscardProgressTimeout:

@@ -1486,13 +1486,30 @@ cap or outcome row ever recorded the loss. `data.stage` splits it:
 
 | `stage` | Meaning | `data` |
 |---|---|---|
-| `pre_flight` | We corroborated, found nothing (and could not rehydrate), and dispatched fresh. | `{stage, session_id, role, restored}` — `restored` records whether a rehydration was attempted and still left nothing behind |
-| `cli` | The resume WAS armed and the CLI rejected it; `invoke_with_cap_retry` retried fresh and returned a **success**, so nothing else records the loss. | `{stage, session_id, role, fallbacks}` — `fallbacks` is the count of fresh retries this one invocation had to make |
+| `pre_flight` | We corroborated, found nothing (and could not rehydrate), and dispatched fresh. | `{stage, session_id, role, restore}` — `restore` is the rehydration **outcome**: `disabled` \| `miss` \| `fault` \| `published` (see below) |
+| `cli` | The resume WAS armed and the CLI rejected it; `invoke_with_cap_retry` retried fresh and returned a **success**, so nothing else records the loss. | `{stage, session_id, session_ids, role, fallbacks}` — `fallbacks` is the count of fresh retries this one invocation had to make, `session_ids` the ids they dropped (oldest first; `session_id` is the first, i.e. the resume the orchestrator adopted) |
 
 ```sql
 SELECT json_extract(data, '$.stage') AS stage, COUNT(*)
   FROM events WHERE event_type = 'session_resume_failed'
  GROUP BY stage;
+```
+
+`data.restore` on the `pre_flight` rows is what tells you *which* thing is
+broken, so split on it before concluding anything:
+
+| `restore` | What it means | What to do |
+|---|---|---|
+| `miss` | The durable archive holds no entry for that session. | **Archive-coverage problem, not a resume problem** — work the archival subsection above (`transcript_archive:` WARNINGs, archival-storm L1). |
+| `fault` | The restore itself raised — malformed `transcript_archive.root`, a `None` `project_root`, an unreadable archive. | Grep the log for `session_resume_restore_fault`; it is a config/IO fault, and the dispatch degraded to FRESH rather than failing. |
+| `disabled` | `session_resume.restore_from_archive` is off. | Expected while the kill switch is pulled; the veto and these events keep running so you do not go blind. |
+| `published` | The restore reported success and the CLI-facing locator still could not see it. | Unreachable by construction — a real occurrence is a bug in the restore/locator pair, not an operations issue. Escalate with the session id. |
+
+```sql
+SELECT json_extract(data, '$.restore') AS restore, COUNT(*)
+  FROM events WHERE event_type = 'session_resume_failed'
+   AND json_extract(data, '$.stage') = 'pre_flight'
+ GROUP BY restore;
 ```
 
 **Do not add it to the per-dispatch ratio denominator.** `session_resume`,
@@ -1503,11 +1520,26 @@ roles. Summing them compares populations counted on different units and
 silently inflates the attempt count. Read it against `session_resume` alone:
 *of the resumes we decided to make, how many did not survive to the agent?*
 
+That reading holds because BOTH stages are subsets of the adopted-resume
+population by construction: `pre_flight` fires only where a recovered session
+was about to be armed, and `cli` fires only when `_invoke` actually armed one.
+The underlying `AgentResult.resume_fallbacks` counter is *wider* than that — it
+also counts a resume `invoke_with_cap_retry` re-armed internally after a cap
+hit, which a plain fresh dispatch can reach — so the emit is gated on the
+orchestrator's own armed session id. Without that gate the ratio would count
+invocations that never resumed anything and could exceed 1.
+
 **Caveat U2 — the fallback rate will not go to zero.** What *removes* the live
 transcript from a lane's config dir is still unknown. This work restores from
-the archive; it does not stop the removal. A steady `pre_flight` count with
-`restored: true` never appearing means archives are missing, not that resume is
-broken — check archive coverage with the loop above first.
+the archive; it does not stop the removal. So a steady `pre_flight` count is
+expected; what matters is *why*, and the `restore` split above answers it
+without a filesystem sweep. `restore='miss'` dominating means **archives are
+missing** — the transcript was gone and there was nothing to rehydrate from, so
+work archive coverage (the `OK`/`MISS` loop above) rather than the resume path.
+`restore='fault'` dominating means the restore path itself is broken and
+coverage is a red herring. Note `restore='published'` should never appear at
+all: a published restore satisfies the corroboration, so no veto — and no
+event — follows it. Its absence is not evidence about archive coverage.
 
 ---
 

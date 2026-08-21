@@ -293,14 +293,26 @@ class EventType(StrEnum):
     #                transcript there (and could not rehydrate one from the
     #                durable archive), and dispatched FRESH instead of arming a
     #                --resume the CLI would reject. data: {stage, session_id,
-    #                role, restored} — `restored` records whether an archive
-    #                rehydration was attempted and still left nothing behind.
+    #                role, restore} — `restore` is the rehydration OUTCOME, one
+    #                of 'disabled' (session_resume.restore_from_archive off),
+    #                'miss' (no archive entry for that session — the
+    #                archive-COVERAGE signal), 'fault' (the restore raised) or
+    #                'published' (restore claimed success yet the CLI-facing
+    #                locator still cannot see it: pathological, unreachable by
+    #                construction, counted rather than assumed away).
     #   cli        — the resume WAS armed and the CLI rejected it;
     #                invoke_with_cap_retry silently retried fresh and returned a
     #                SUCCESS, so nothing else anywhere records the loss. data:
-    #                {stage, session_id, role, fallbacks}, where `fallbacks` is
-    #                AgentResult.resume_fallbacks — the count of fresh retries
-    #                this one invocation had to make.
+    #                {stage, session_id, session_ids, role, fallbacks}, where
+    #                `fallbacks` is AgentResult.resume_fallbacks — the count of
+    #                fresh retries this one invocation had to make — and
+    #                `session_ids` are the ids those retries dropped, oldest
+    #                first (`session_id` is the first of them, i.e. the resume
+    #                the orchestrator itself adopted). Emitted ONLY when _invoke
+    #                armed the resume: the shared/ counter also increments for a
+    #                resume its retry loop re-armed internally after a cap hit,
+    #                which a plain fresh dispatch can reach, and counting those
+    #                would inflate the ratio below past 1.
     #
     # SQL split, alongside the existing '$.reason' / '$.archive_available' ones:
     #   SELECT json_extract(data, '$.stage') AS stage, COUNT(*)

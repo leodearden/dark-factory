@@ -12398,14 +12398,27 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             # recorded argument: with archival off there is nothing on disk to
             # find, and gating on the flag would add a second source of truth
             # that can disagree with the filesystem.
-            # Whether the rehydration below actually PUBLISHED a transcript.
-            # Reported on the veto event as data.restored, where it should
-            # always be False by construction — a successful restore satisfies
-            # the corroboration and there is no veto.  A True here therefore
-            # means the restore claimed success and the CLI-facing locator still
-            # cannot see the result, which is a real bug worth being able to
-            # count rather than a state to assume away.
-            restored_ok = False
+            # What the rehydration below actually DID, reported on the veto
+            # event as data.restore.  An OUTCOME STRING, not a bool: a bool
+            # collapsed three materially different states into one False
+            # ("we never tried", "the archive had nothing", "the restore blew
+            # up") and so could not answer the archive-coverage question
+            # caveat U2 poses.  Four disjoint values:
+            #   'disabled'  — restore_from_archive is off; nothing was tried.
+            #   'miss'      — the archive holds no entry for this session.
+            #                 THIS is the archive-coverage signal: a steady
+            #                 pre_flight count that is overwhelmingly 'miss'
+            #                 means archives are not being written, not that
+            #                 the restore is broken.
+            #   'fault'     — the restore raised (malformed transcript_archive
+            #                 root, None project_root, unreadable archive).
+            #   'published' — the restore claimed success and the CLI-facing
+            #                 locator STILL cannot see the result.  Pathological
+            #                 and unreachable by construction (a published
+            #                 restore satisfies the corroboration, so no veto
+            #                 follows) — emitted rather than assumed away, so
+            #                 that if it ever does happen it is countable.
+            restore_outcome = 'disabled'
             if (
                 self.config.session_resume.restore_from_archive
                 and self._config_dir is not None
@@ -12436,6 +12449,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     # Fall through to the corroboration, which will veto and
                     # dispatch fresh — a broken restore costs context, never a
                     # dispatch.
+                    restore_outcome = 'fault'
                     logger.warning(
                         'Task %s [%s]: failed to compose the transcript archive '
                         'root while rehydrating session %s — proceeding without '
@@ -12449,8 +12463,8 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                         },
                     )
                 else:
+                    restore_outcome = 'published' if restored is not None else 'miss'
                     if restored is not None:
-                        restored_ok = True
                         logger.info(
                             'Task %s [%s]: rehydrated session %s from the '
                             'durable archive %s -> %s',
@@ -12537,7 +12551,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                             'stage': 'pre_flight',
                             'session_id': vetoed_session_id,
                             'role': role.name,
-                            'restored': restored_ok,
+                            'restore': restore_outcome,
                         },
                     )
         else:
@@ -12732,14 +12746,42 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         # Per-INVOCATION, like the pre_flight stage — deliberately NOT a fourth
         # term in the _run_slot guard's per-dispatch ratio denominator (see
         # EventType's taxonomy note).
+        #
+        # GATED ON OUR OWN ARMED RESUME, not on the counter alone. cli_invoke
+        # increments resume_fallbacks for ANY resumed attempt that failed
+        # non-cap and was retried fresh — including a resume its retry loop
+        # re-armed ITSELF after a cap hit (invoke_kwargs['resume_session_id'] =
+        # result.session_id). A plain FRESH dispatch that hits a cap can
+        # therefore come back with a non-zero count while no resume was ever
+        # adopted here; counting those would inflate exactly the ratio
+        # OPERATIONS.md tells operators to read against session_resume ("of the
+        # resumes we DECIDED to make, how many did not survive?") and could
+        # push it above 1. resume_session_id is non-None iff the arm site above
+        # corroborated and adopted, which is that predicate exactly.
         resume_fallbacks = getattr(result, 'resume_fallbacks', 0)
-        if resume_fallbacks and self.event_store:
+        if resume_fallbacks and resume_session_id and self.event_store:
+            # …and name the session actually LOST, which session_id_val often
+            # is not: cli_invoke's _reset_for_fresh_retry regenerates the
+            # pre-allocated id, and a cap re-arm replaces the armed id with
+            # result.session_id. The carrier keeps every dropped id in order;
+            # the first is the resume we adopted, so it is the scalar
+            # data.session_id, with the full list alongside for the
+            # multi-fallback invocations. Falls back to our own armed id if an
+            # older shared/ (or a suite stand-in) carries no list.
+            lost_session_ids = [
+                str(s) for s in
+                (getattr(result, 'resume_fallback_session_ids', ()) or ())
+            ]
             self.event_store.emit(
                 EventType.session_resume_failed,
                 task_id=self.task_id,
                 data={
                     'stage': 'cli',
-                    'session_id': session_id_val,
+                    'session_id': (
+                        lost_session_ids[0] if lost_session_ids
+                        else resume_session_id
+                    ),
+                    'session_ids': lost_session_ids,
                     'role': role.name,
                     'fallbacks': resume_fallbacks,
                 },

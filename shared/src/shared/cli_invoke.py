@@ -372,6 +372,22 @@ class AgentResult:
       invisible in runs.db, because the loop retried fresh and returned a
       SUCCESS.  Counts fallbacks TAKEN, not resumes armed — a resume that
       succeeded leaves it 0.
+
+      READ THE PREDICATE EXACTLY: it counts every resumed attempt this loop
+      made that then failed non-cap, which includes a resume **the loop itself
+      re-armed** after a cap hit (the cap branch sets
+      ``invoke_kwargs['resume_session_id'] = result.session_id``).  A caller
+      that never passed ``resume_session_id`` can therefore still come back
+      with a non-zero count, so a consumer asking "did the resume *I* adopted
+      survive?" must corroborate against its OWN armed session id rather than
+      treat this counter as that answer.
+    - ``resume_fallback_session_ids``: the session ids those fallbacks actually
+      dropped, oldest first, one per increment of ``resume_fallbacks``.  The
+      count alone cannot name them: ``_reset_for_fresh_retry`` regenerates the
+      pre-allocated ``session_id`` and a cap re-arm replaces the armed id with
+      ``result.session_id``, so neither the caller's id nor the final
+      ``result.session_id`` is reliably the session that was lost.  A tuple
+      (not a list) so the default is a safe immutable dataclass default.
     """
 
     success: bool
@@ -395,6 +411,7 @@ class AgentResult:
     api_error_status: int | None = None
     proc_tree: str = ''
     resume_fallbacks: int = 0
+    resume_fallback_session_ids: tuple[str, ...] = ()
     transcript_turns: int | None = None
     """Number of assistant turns found in the on-disk JSONL transcript, or None
     when the transcript could not be read or located.  Stamped on the
@@ -1682,6 +1699,12 @@ async def invoke_with_cap_retry(
     # the retry loop rebinds `result` on every pass, so a count written to the
     # failed resume's result object is discarded along with it.
     resume_fallbacks = 0
+    # The ids those fallbacks dropped, in order — same lifetime and same
+    # reasoning as the counter above.  Kept alongside rather than derived at
+    # the exit: by then _reset_for_fresh_retry has already regenerated the
+    # pre-allocated session_id, so the lost id is unrecoverable from the
+    # returned result.
+    resume_fallback_session_ids: list[str] = []
 
     # Default to Claude-specific invocation when no invoke_fn was provided
     invoke: Callable[..., Awaitable[AgentResult]] = invoke_fn or invoke_claude_agent
@@ -2301,7 +2324,17 @@ async def invoke_with_cap_retry(
                     # 'fresh (transcript unreachable)' path above: that one is
                     # already visible as a cap_hit event, and counting both
                     # here would conflate two populations with different causes.
+                    #
+                    # NOTE the armed id here is not necessarily the CALLER's:
+                    # after a cap hit this loop re-arms a resume of its own
+                    # (result.session_id), and that re-armed resume can land in
+                    # this branch too.  Record WHICH session each fallback lost
+                    # so the consumer can name it instead of guessing from a
+                    # pre-allocated id the fresh retry has already replaced.
                     resume_fallbacks += 1
+                    resume_fallback_session_ids.append(
+                        str(invoke_kwargs['resume_session_id']),
+                    )
                     logger.warning(
                         f'{label}: resume failed (session_id={invoke_kwargs["resume_session_id"]}), '
                         f'retrying fresh',
@@ -2316,6 +2349,7 @@ async def invoke_with_cap_retry(
 
     result.account_name = account_name
     result.resume_fallbacks = resume_fallbacks
+    result.resume_fallback_session_ids = tuple(resume_fallback_session_ids)
     if cost_store:
         try:
             await cost_store.save_invocation(
