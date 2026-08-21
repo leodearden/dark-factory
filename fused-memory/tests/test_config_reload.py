@@ -639,3 +639,89 @@ class TestWriteTriagePerCategoryLeafIsGreenTierAndAtomic:
         apply_reload(live, fresh)
 
         assert live.write_triage.t_high_by_category == self.SYNTHETIC
+
+
+class TestTopicAnchoredRecallReloadTier:
+    """The topic pin's kill switch is GREEN TIER (task 3111).
+
+    Green-tier classification is EARNED, not asserted: a knob captured by value
+    at construction would not observe an in-place reload and would have to stay
+    restart-only (config/reload.py's module docstring states the rule). So the
+    classification test is paired with the live-consumer test that justifies it.
+    """
+
+    def test_classified_hot_reloadable_not_restart_required(self):
+        """RED while the field is absent from RELOADABLE_FIELDS — it buckets as restart."""
+        live = FusedMemoryConfig()
+        fresh = FusedMemoryConfig()
+        old = live.reconciliation.topic_anchored_recall_enabled
+        object.__setattr__(fresh.reconciliation, 'topic_anchored_recall_enabled', not old)
+
+        d = diff_config(live, fresh)
+
+        assert d.applied_candidates['reconciliation.topic_anchored_recall_enabled'] == {
+            'old': old,
+            'new': not old,
+        }
+        assert 'reconciliation.topic_anchored_recall_enabled' not in d.restart_required
+
+    def test_flip_observed_by_live_resolver_without_reconstruction(self):
+        """The live-read property that MAKES the green-tier classification honest."""
+        from fused_memory.services.topic_anchor import resolve_topic_anchor_enabled
+
+        memory_service = types.SimpleNamespace(config=FusedMemoryConfig())
+        assert memory_service.config.reconciliation.topic_anchored_recall_enabled is True
+        assert resolve_topic_anchor_enabled(memory_service) is True
+
+        fresh = FusedMemoryConfig()
+        object.__setattr__(fresh.reconciliation, 'topic_anchored_recall_enabled', False)
+
+        report = apply_reload(memory_service.config, fresh)
+
+        assert 'reconciliation.topic_anchored_recall_enabled' in report['applied']
+        # No service reconstruction: the SAME object now resolves differently.
+        assert resolve_topic_anchor_enabled(memory_service) is False
+
+    @pytest.mark.asyncio
+    async def test_flip_changes_the_next_searchs_behaviour(self, mock_config):
+        """End of the chain: the in-place flip changes real search behaviour.
+
+        Asserts on the observable consequence — whether the metadata lookup is
+        made at all — rather than on the resolver's return value, so this
+        cannot pass while the search path ignores the knob.
+        """
+        from unittest.mock import AsyncMock, MagicMock
+
+        from _fm_helpers import install_identity_mocks
+
+        from fused_memory.services.memory_service import MemoryService
+
+        service = MemoryService(mock_config)
+        service.graphiti = MagicMock()
+        service.graphiti.search = AsyncMock(return_value=[])
+        service.graphiti.search_nodes = AsyncMock(return_value=[])
+        install_identity_mocks(service.graphiti)
+        service.mem0 = MagicMock()
+        service.mem0.search = AsyncMock(return_value={'results': [{
+            'id': 'sibling-1',
+            'memory': 'a narrow sibling',
+            'score': 0.85,
+            'metadata': {'category': 'procedural_knowledge', 'topic': 'topic-a'},
+        }]})
+        service.mem0.scroll_by_metadata = AsyncMock(return_value=[])
+
+        search_kwargs = dict(
+            query='q', project_id='dark_factory',
+            categories=['procedural_knowledge'], stores=['mem0'], limit=5,
+        )
+
+        await service.search(**search_kwargs)
+        assert service.mem0.scroll_by_metadata.await_count == 1
+
+        fresh = FusedMemoryConfig()
+        object.__setattr__(fresh.reconciliation, 'topic_anchored_recall_enabled', False)
+        apply_reload(service.config, fresh)
+
+        # Same service object, no reconstruction — the next search skips the I/O.
+        await service.search(**search_kwargs)
+        assert service.mem0.scroll_by_metadata.await_count == 1
