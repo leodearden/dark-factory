@@ -290,16 +290,18 @@ _PLAN_STATUS_TOOLS = [
 # the two sides disagree lives in
 # `fused-memory/tests/test_metadata_vocabulary_prompt_pinning.py` (that suite
 # has BOTH packages on its pythonpath, so the guard is a hard import there
-# rather than a silently-skipped no-op); the orchestrator-local
-# presence/brace/role-split anchor is `tests/test_roles_metadata_vocabulary.py`.
+# rather than a silently-skipped no-op).  That pin is registry-DERIVED only: it
+# asserts the reserved keys reach this text and each memory role's rendered
+# prompt, and never pins wording, so reflowing the prose below stays green.
 #
 # SEQUENCING SEAM -- task 3131 (dep-gated behind 3169) inverts the
 # write-eagerness guidance in the PRECEDING block ("Write when you discover..."
 # / "Write immediately..."). The two edits are different sentences at the same
 # site and must NOT be merged: 3131 rewrites what comes before, 3202 only
-# appends this section at the end.  The seam is enforced structurally by
-# `_MEMORY_INSTRUCTIONS.endswith(METADATA_VOCABULARY_INSTRUCTIONS)`, which pins
-# no sentence 3131 owns.
+# appends this section at the end.  This is a CONVENTION recorded here, not a
+# test assertion: an `endswith` pin was removed in review (task 3202) because it
+# failed correct refactors while catching no functional regression.  Keep 3131's
+# rewrite confined to the preceding block and this section additive at the end.
 #
 # Plain text, NO literal `{`/`}` braces -- same reason as
 # MANDATED_STAGING_COMMAND and BACKGROUND_TASK_WARNING below: role prompts are

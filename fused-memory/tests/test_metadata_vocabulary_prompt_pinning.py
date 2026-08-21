@@ -6,28 +6,35 @@ normative copy, everything else a pointer).
 ``fused_memory.memory_metadata`` (leaf β / task 3195) is that normative copy.
 Two prompt surfaces quote it, and both are pinned here:
 
-ARM 1 — the writer instructions.  ``METADATA_VOCABULARY_INSTRUCTIONS`` in
+ARM 1 — the writer instructions. ``METADATA_VOCABULARY_INSTRUCTIONS`` in
 ``orchestrator/src/orchestrator/agents/roles.py`` documents the reserved keys to
-every memory-writing agent role.  Adding a key to ``RESERVED_VOCABULARY_KEYS``
-without documenting it, documenting a key that is not reserved, or renaming
-either side, all fail here.
+every memory-writing agent role. Adding a key to ``RESERVED_VOCABULARY_KEYS``
+without documenting it, or renaming one, fails here.
 
-ARM 2 — the reconciliation stage prompts, whose
-``'kind': '<literal>'`` filter examples must name kinds that are in
-``KIND_REGISTRY``.
+ARM 2 — the reconciliation stage prompts, whose ``'kind': '<literal>'`` filter
+examples must name kinds that are in ``KIND_REGISTRY``, so a kind rename cannot
+silently strand recon agents emitting filters that match nothing.
 
 WHY THIS FILE LIVES IN fused-memory/tests: this suite's pytest config already
 declares ``pythonpath = ["src", "../orchestrator/src"]``, so BOTH
 ``fused_memory.memory_metadata`` and ``orchestrator.agents.roles`` are hard
-imports here.  The orchestrator suite cannot import ``fused_memory``, and a
+imports here. The orchestrator suite cannot import ``fused_memory``, and a
 guard written there would need a ``pytest.importorskip`` — i.e. a drift test
-that silently becomes a no-op the day the path breaks.  The orchestrator side
-keeps only its own presence/brace/role-split anchor
-(``orchestrator/tests/test_roles_metadata_vocabulary.py``).
+that silently becomes a no-op the day the path breaks.
 
-The registry-facing assertions are deliberately DERIVED, never hardcoded: no
-test here restates the five key names or the slug regex, because that would be
-the very second copy INV-5 forbids.
+SCOPE DISCIPLINE (review, task 3202). This file pins REGISTRY-DERIVED facts
+only. It does NOT assert on prompt WORDING: no bullet/em-dash/backtick shape,
+no verbatim substring of surrounding prose, no non-emptiness of a literal, no
+``endswith`` splice-order check. Those all go red on a cosmetic reflow while
+catching no functional regression. Reflowing, reordering, or rewording the
+vocabulary section is expected to keep this file green — only a genuine
+registry-vs-prompt divergence turns it red. Do not add wording assertions, and
+do not add tests that exercise a helper defined in this file rather than
+production code.
+
+SEQUENCING SEAM — task 3131 (dep-gated behind 3169) rewrites the
+write-eagerness prose inside ``_MEMORY_INSTRUCTIONS``. Nothing here pins any of
+those sentences, so that edit and this pin cannot collide.
 """
 
 from __future__ import annotations
@@ -35,7 +42,7 @@ from __future__ import annotations
 import re
 
 import pytest
-from orchestrator.agents.roles import METADATA_VOCABULARY_INSTRUCTIONS
+from orchestrator.agents.roles import _MEMORY_INSTRUCTIONS, METADATA_VOCABULARY_INSTRUCTIONS, ROLES
 
 from fused_memory.memory_metadata import (
     KIND_REGISTRY,
@@ -50,109 +57,45 @@ from fused_memory.reconciliation.prompts.stage3 import STAGE3_SYSTEM_PROMPT
 from fused_memory.reconciliation.recon_pool_map import CYCLE_SUMMARY_KIND
 from fused_memory.reconciliation.recon_self_model import render_cycle_summary_section
 
-# The documented-key bullet shape the writer instructions use:
-#     - `topic` — kebab-case slug naming ...
-# `[^`]+` rather than a character class of legal key names, so a RENAMED key is
-# still extracted (and then fails the comparison) instead of vanishing from the
-# extracted set and passing as "not documented, not required".
-_KEY_BULLET_RE = re.compile(r'^- `([^`]+)` —', re.MULTILINE)
+# Roles are DERIVED from the splice, never restated as a literal tuple: adding a
+# tenth role must not fail a test about the metadata vocabulary.
+_MEMORY_ROLES = sorted(
+    name for name, role in ROLES.items() if _MEMORY_INSTRUCTIONS in role.system_prompt
+)
 
 
-def _documented_vocabulary_keys(text: str) -> set[str]:
-    """Extract the metadata keys documented as bullets in `text`."""
-    return set(_KEY_BULLET_RE.findall(text))
+class TestReservedKeysReachTheWriters:
+    """ARM 1: the writer-facing text names every key the write path validates.
 
-
-def _pin_keys(text: str, registry: set[str]) -> set[str]:
-    """Assert `text` documents exactly `registry`; raise AssertionError if not.
-
-    Factored out of the tests so the DRIFT DEMONSTRATION below can run the very
-    same checker against a doctored registry — proving the pin actually fires
-    on divergence rather than merely passing today.
+    Registry-derived and reflow-proof: each reserved key is looked up as a
+    plain substring, so the section can be reworded or relaid-out freely. What
+    it does catch is the PRD §6 gap this task closes — a key that the writer
+    path enforces but no agent was ever told about.
     """
-    documented = _documented_vocabulary_keys(text)
-    expected = set(registry)
-    missing = expected - documented
-    undocumented_extras = documented - expected
-    assert not missing and not undocumented_extras, (
-        f'writer instructions drifted from the registry: '
-        f'reserved-but-undocumented={sorted(missing)}, '
-        f'documented-but-not-reserved={sorted(undocumented_extras)}'
-    )
-    return documented
 
-
-class TestReservedKeysPinnedToRegistry:
-    """ARM 1: the documented keys ARE `RESERVED_VOCABULARY_KEYS`."""
-
-    def test_documented_keys_match_registry(self) -> None:
-        assert _documented_vocabulary_keys(METADATA_VOCABULARY_INSTRUCTIONS) == set(
-            RESERVED_VOCABULARY_KEYS
+    @pytest.mark.parametrize('key', sorted(RESERVED_VOCABULARY_KEYS))
+    def test_every_reserved_key_is_documented(self, key: str) -> None:
+        assert key in METADATA_VOCABULARY_INSTRUCTIONS, (
+            f'reserved key {key!r} is validated on write but never named in the '
+            f'writer instructions — writers cannot use a key they are not told about'
         )
 
-    def test_extraction_is_non_empty(self) -> None:
-        """Guards the regex itself: if the bullet shape changes, the extractor
-        silently matches nothing and every set comparison above would pass
-        vacuously against an empty registry."""
-        assert _documented_vocabulary_keys(METADATA_VOCABULARY_INSTRUCTIONS)
+    @pytest.mark.parametrize('role_name', _MEMORY_ROLES)
+    @pytest.mark.parametrize('key', sorted(RESERVED_VOCABULARY_KEYS))
+    def test_every_reserved_key_reaches_each_memory_role(self, key: str, role_name: str) -> None:
+        """The task's user-observable signal, asserted end-to-end on the
+        RENDERED prompt: a memory-writing role's assembled briefing names every
+        reserved key (including ``supersedes``)."""
+        assert key in ROLES[role_name].system_prompt
 
-    def test_pin_helper_passes_against_the_real_registry(self) -> None:
-        assert _pin_keys(METADATA_VOCABULARY_INSTRUCTIONS, set(RESERVED_VOCABULARY_KEYS))
-
-
-# DELIBERATE NON-ASSERTION — do not "complete" ARM 1 by pinning the section's
-# PROSE.  A `TestEscapeHatchAndSlugRulesPinned` class doing exactly that was
-# removed in review (task 3202) and must not come back:
-#   * `EXPERIMENTAL_KEY_PREFIX in text` pins the 2-char substring `x_`, which
-#     matches incidentally anywhere in the prompt — it is green whether or not
-#     the escape hatch is actually explained.
-#   * `str(TOPIC_SLUG_MAX_LEN) in text` was worse than decorative: a bare `in`
-#     on a decimal rendering stays green against STALE text (lower the cap to
-#     10 and `'10' in '100 characters at most'` still holds), so it reported
-#     success in precisely the drift case it existed to catch.  Do not replace
-#     it with a stricter regex over the prompt either — the registry-derived
-#     key pin above is the guard that catches real vocabulary drift.
-#   * The slug-exemplar assertions (`is_valid_topic_slug('memory-write-path')
-#     is True` / `'Memory Write Path' is False`) were validator unit tests
-#     wearing a prose pin as a costume; they hold with no reference to the
-#     prompt at all and are already covered, case-for-case, by `_SLUG_CASES` in
-#     `test_topic_slug_namespace.py` ('a-good-slug', 'Bad-Slug',
-#     'bad topic-slug').
+    def test_some_role_actually_splices_the_memory_block(self) -> None:
+        """Guards the derivation above: if the splice were renamed away, the
+        parametrized role checks would vacuously collapse to zero cases."""
+        assert _MEMORY_ROLES
 
 
-class TestPinFiresOnDrift:
-    """DRIFT DEMONSTRATION — the user-observable signal this task delivers.
-
-    Same checker, doctored registry: if the pin could not fail, every assertion
-    above would be decorative.
-    """
-
-    def test_added_registry_key_fails_the_pin(self) -> None:
-        with pytest.raises(AssertionError):
-            _pin_keys(
-                METADATA_VOCABULARY_INSTRUCTIONS,
-                set(RESERVED_VOCABULARY_KEYS) | {'invented_key'},
-            )
-
-    def test_removed_registry_key_fails_the_pin(self) -> None:
-        with pytest.raises(AssertionError):
-            _pin_keys(
-                METADATA_VOCABULARY_INSTRUCTIONS,
-                set(RESERVED_VOCABULARY_KEYS) - {'supersedes'},
-            )
-
-
-# --------------------------------------------------------------------------
-# ARM 2 — recon prompt-embedded `'kind'` filter examples <-> KIND_REGISTRY
-# --------------------------------------------------------------------------
-
-# The shape a metadata filter example takes in RENDERED prompt text. The stage
-# prompts are f-strings that write `{{ }}` for a literal brace, so by the time
-# the constant exists the text carries single braces and ordinary dict syntax.
 _KIND_LITERAL_RE = re.compile(r"'kind':\s*'([^']+)'")
 
-# The prompt surfaces that show an agent a `'kind'` filter. Built at import
-# time, exactly as the stage prompts themselves are assembled.
 _PROMPT_SOURCES = {
     'STAGE1_SYSTEM_PROMPT': STAGE1_SYSTEM_PROMPT,
     'STAGE2_SYSTEM_PROMPT': STAGE2_SYSTEM_PROMPT,
@@ -161,77 +104,50 @@ _PROMPT_SOURCES = {
     'render_cycle_summary_section()': render_cycle_summary_section(),
 }
 
-# DELIBERATE NON-ASSERTION — do not "complete" this file by adding
-# `set(recon_self_model.MARKER_KINDS) <= KIND_REGISTRY`. MARKER_KINDS contains
-# `stage2_persistence_marker`, which is absent from KIND_REGISTRY and CORRECTLY
-# so: `_STAGE2_PERSISTENCE_MARKER_SOURCE` (stages/task_knowledge_sync.py) shows
-# it is a `metadata.source` value and a SQLite ledger `record_kind` — the
-# WRITER-PROVENANCE axis the PRD's V1 explicitly separates from `metadata.kind`.
-# That subset relation is a false premise; asserting it would fail on correct
-# code and pressure a future reader into polluting the kind registry with a
-# provenance token.
-
 
 def _kind_literals(text: str) -> set[str]:
-    """Extract the `'kind': '<value>'` literals a prompt shows to an agent."""
+    """Extract the ``'kind': '<value>'`` filter literals a prompt shows an agent.
+
+    This matches the literal dict syntax the agent is being told to emit — not
+    prose formatting — which is why it is a fair thing to pin.
+    """
     return set(_KIND_LITERAL_RE.findall(text))
 
 
-def _pin_kinds(text: str, registry: frozenset[str] | set[str]) -> set[str]:
-    """Assert every kind literal in `text` is in `registry`.
-
-    Same factoring rationale as `_pin_keys`: the drift demonstration below runs
-    this exact checker against a doctored registry.
-    """
-    literals = _kind_literals(text)
-    assert literals, 'no kind literal extracted — the regex stopped matching, so this guard is a no-op'
-    outside = literals - set(registry)
-    assert not outside, (
-        f'prompt names kind literals that are not in the registry: {sorted(outside)}'
-    )
-    return literals
-
-
 class TestReconPromptKindLiteralsPinned:
-    """Every `'kind'` filter example a recon prompt shows is a REGISTERED kind.
+    """ARM 2: every ``'kind'`` filter example a recon prompt shows is REGISTERED.
 
-    These RENDERED-OUTPUT assertions are the INV-5 guard for
-    ``render_cycle_summary_section``: if it re-typed the literal instead of
-    interpolating ``CYCLE_SUMMARY_KIND``, a rename in ``recon_pool_map`` would
-    leave the rendered text on the old value and
-    ``test_kind_literals_extracted_and_include_cycle_summary`` would go RED.
+    This is the INV-5 guard for ``render_cycle_summary_section``: if it re-typed
+    the literal instead of interpolating ``CYCLE_SUMMARY_KIND``, a rename in
+    ``recon_pool_map`` would leave the rendered text on the old value and
+    strand every recon agent that copied the filter.
 
     An ``inspect.getsource`` pin on the *identifier text* was removed in review
     (task 3202): it passed for a function that merely MENTIONS the name in a
-    comment, and failed correct refactors -- ``import ... as CSK``, a
+    comment, and failed correct refactors — ``import ... as CSK``, a
     module-qualified ``recon_pool_map.CYCLE_SUMMARY_KIND``, or extracting the
-    f-string into a helper.  Do NOT re-add it, and do not replace it with a
-    stricter source-text regex; assert on rendered output instead.
+    f-string into a helper. Do NOT re-add it; assert on rendered output instead.
     """
 
     @pytest.mark.parametrize('source_name', sorted(_PROMPT_SOURCES))
-    def test_kind_literals_extracted_and_include_cycle_summary(self, source_name: str) -> None:
-        """Non-emptiness is the load-bearing half: an extractor that silently
-        stops matching would turn the registry check below into a no-op."""
+    def test_every_kind_literal_is_registered(self, source_name: str) -> None:
         literals = _kind_literals(_PROMPT_SOURCES[source_name])
-        assert literals
-        assert CYCLE_SUMMARY_KIND in literals
+        assert literals, (
+            'no kind literal extracted — the filter-example syntax changed, so '
+            'this guard would silently pass against nothing'
+        )
+        outside = literals - KIND_REGISTRY
+        assert not outside, (
+            f'{source_name} shows kind literals that are not in KIND_REGISTRY: '
+            f'{sorted(outside)} — recon agents copying these filters would match nothing'
+        )
 
     @pytest.mark.parametrize('source_name', sorted(_PROMPT_SOURCES))
-    def test_every_kind_literal_is_registered(self, source_name: str) -> None:
-        assert _pin_kinds(_PROMPT_SOURCES[source_name], KIND_REGISTRY)
+    def test_cycle_summary_survives_rendering(self, source_name: str) -> None:
+        """Each pinned surface really does carry the shared constant's value."""
+        assert CYCLE_SUMMARY_KIND in _kind_literals(_PROMPT_SOURCES[source_name])
 
     def test_cycle_summary_constant_is_registered(self) -> None:
         """The constant<->registry edge itself: the shared kind constant the
         writers use must be a member of the closed registry."""
         assert CYCLE_SUMMARY_KIND in KIND_REGISTRY
-
-
-class TestKindPinFiresOnDrift:
-    """DRIFT DEMONSTRATION — a `cycle_summary` rename in the registry provably
-    strands every recon filter example, loudly."""
-
-    @pytest.mark.parametrize('source_name', sorted(_PROMPT_SOURCES))
-    def test_renamed_kind_fails_the_pin(self, source_name: str) -> None:
-        with pytest.raises(AssertionError):
-            _pin_kinds(_PROMPT_SOURCES[source_name], KIND_REGISTRY - {CYCLE_SUMMARY_KIND})
