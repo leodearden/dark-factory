@@ -20,6 +20,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from _usage_gate_test_helpers import spawn_fault as _spawn_fault
 
 from shared import invocation_outcome
 from shared.cli_invoke import AgentResult
@@ -29,7 +30,6 @@ from shared.usage_gate import (
     _SPAWN_FAULT_THRESHOLD,
     AccountPhase,
     AccountState,
-    ProbeSpawnError,
     UsageGate,
 )
 
@@ -474,12 +474,6 @@ class TestAuthReprobeReReadsEnv:
         assert gate._accounts[0].auth_failed is True
 
 
-def _spawn_fault(binary: str = 'claude') -> ProbeSpawnError:
-    return ProbeSpawnError(
-        binary, FileNotFoundError(2, 'No such file or directory', binary),
-    )
-
-
 @pytest.mark.asyncio
 class TestAuthReprobeSpawnFault:
     """The auth path must classify a spawn fault exactly as the resume path does.
@@ -515,11 +509,19 @@ class TestAuthReprobeSpawnFault:
         assert 'claude' in ' '.join(r.getMessage() for r in errors)
 
     async def test_spawn_fault_does_not_claim_the_probe_ran(self, caplog):
-        """The misleading line must not be emitted.
+        """The misleading line must not be emitted — and the honest one must be.
 
         "auth re-probe failed - staying auth_failed" is a claim about the
         token. Emitting it when nothing was spawned is what sends an operator
         to re-issue credentials for a host problem.
+
+        Deliberately a PAIR of assertions (task 4512 review). A negative
+        substring check on log prose is unfalsifiable on its own: merely
+        REWORDING the line in `_reprobe_account` would satisfy it while the
+        behaviour went away. Pairing it with a positive assertion that the
+        ERROR-level spawn-fault record WAS emitted means a rewording turns
+        the pair red rather than silently green — one of the two substrings
+        has to survive.
         """
         gate = _make_gate(['a'], auth_reprobe_secs=0)
         acct = gate._accounts[0]
@@ -536,6 +538,15 @@ class TestAuthReprobeSpawnFault:
         assert not [
             r for r in caplog.records if 'staying auth_failed' in r.getMessage()
         ]
+        spawn_errors = [
+            r for r in caplog.records
+            if r.levelno >= logging.ERROR and 'INFRASTRUCTURE FAULT' in r.getMessage()
+        ]
+        assert len(spawn_errors) == 1, (
+            'the probe-ran claim is suppressed, but nothing took its place: '
+            'the operator is now told less, not something truer'
+        )
+        assert acct.probe_spawn_failures == 1
 
     async def test_spawn_fault_is_not_read_as_recovery(self):
         """No AUTH_FAILED -> AVAILABLE edge, no auth_resumed event.
@@ -567,6 +578,14 @@ class TestAuthReprobeSpawnFault:
         would downgrade the one signal saying this is NOT an auth problem back
         into generic noise. Catching in `_reprobe_account` is what keeps the
         classification.
+
+        Pinned on STATE and LEVEL, not only on log prose (task 4512 review).
+        `probe_spawn_failures` advancing once per `_reprobe_account` call is
+        positive proof the INNER handler ran to completion on each iteration —
+        the broad handler catching instead would skip `_note_probe_spawn_failure`
+        entirely and leave the count behind. "No WARNING record at all" is the
+        level-based twin of the substring check, and unlike the substring it
+        survives any rewording of the loop's message.
         """
         gate = _make_gate(['a'], auth_reprobe_secs=0)
         acct = gate._accounts[0]
@@ -578,13 +597,15 @@ class TestAuthReprobeSpawnFault:
         sleeps = 0
 
         async def capture_sleep(duration: float) -> None:
-            # Clear on the SECOND sleep, not the first: the loop checks
+            # Clear on the THIRD sleep, not the first: the loop checks
             # auth_failed immediately after sleeping, so clearing on the first
             # would return before _reprobe_account ever runs and make this
-            # test vacuously green.
+            # test vacuously green. Two full iterations (not one) are what
+            # make "once per call" an assertion about the per-call handler
+            # rather than about a single increment.
             nonlocal sleeps
             sleeps += 1
-            if sleeps >= 2:
+            if sleeps >= 3:
                 acct.auth_failed = False
             await original_sleep(0)
 
@@ -595,6 +616,18 @@ class TestAuthReprobeSpawnFault:
         ):
             await asyncio.wait_for(gate._auth_reprobe_loop(acct), timeout=5)
 
+        assert gate._run_probe.await_count == 2
+        assert acct.probe_spawn_failures == 2, (
+            'the inner handler in _reprobe_account must run on every '
+            'iteration; a count short of the call count means the loop-level '
+            "`except Exception` caught one and skipped the fault's accounting"
+        )
+        assert not [
+            r for r in caplog.records if r.levelno == logging.WARNING
+        ], (
+            'a spawn fault on the auth path must never be narrated at '
+            'WARNING — that is the level the broad handler downgrades it to'
+        )
         assert not [
             r for r in caplog.records if 'auth re-probe raised' in r.getMessage()
         ]
