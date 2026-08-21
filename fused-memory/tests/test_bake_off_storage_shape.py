@@ -6149,6 +6149,453 @@ class TestCheckRegrowth:
         assert report['regrowth']['baseline']['flat']['claim_recall.at_5'] is None
 
 
+# ===========================================================================
+# 4012 step-11 — the rendered `## Regrowth deltas` section: the two tables,
+#                the per-arm bullets, the credited-vs-stored disclosure and
+#                the NOT-blind-authored disclosure in `## Protocol`.
+#
+# LANE: pure.  Every report rendered below is one the test itself built, so
+# every number asserted here was written by the test.  NO metric magnitude,
+# rate, threshold or bound is asserted anywhere in this section (gate G6);
+# what is pinned is COLUMNS, ORDER, COMPLETENESS and the None-vs-zero
+# distinction.
+# ===========================================================================
+
+
+def _report_with_regrowth(block=None, protocol=None):
+    """A full report carrying a regrowth block."""
+    mod = _mod()
+    return mod.build_report(
+        arms=_all_arms(),
+        audit_recall=_audit_recall(),
+        protocol=_protocol() if protocol is None else protocol,
+        regrowth=_regrowth_block() if block is None else block,
+    )
+
+
+def _moved_block(**after_unstamped):
+    """A block whose `unstamped`/`flat` arm MOVED, so deltas are nonzero.
+
+    Every value here is the test's own: baseline comes from `_plucked`, and
+    the override is whatever the caller passed.
+    """
+    mod = _mod()
+    return mod.build_regrowth_block(
+        baseline=_arms(),
+        after_by_mode={
+            'unstamped': _arms(flat=_plucked(**after_unstamped)),
+            'stamped': _arms(),
+        },
+        injections=list(_injections()),
+        fixture_path=REGROWTH_INJECTION_PATH,
+    )
+
+
+def _section(rendered: str, heading: str) -> list[str]:
+    """One `## ` section's lines — heading included, next heading excluded.
+
+    Located by the renderer-emitted heading rather than by a line index, for
+    the same reason `_by_kind_table` is: a paragraph added above must not
+    move the assertion off its section.
+    """
+    lines = rendered.splitlines()
+    start = lines.index(heading)
+    end = next(
+        (i for i, line in enumerate(lines[start + 1:], start + 1)
+         if line.startswith('## ')),
+        len(lines),
+    )
+    return lines[start:end]
+
+
+def _rows_under(lines: list[str], header: str) -> list[str]:
+    """The data rows of the table whose header row is exactly `header`."""
+    at = lines.index(header)
+    rows = []
+    for line in lines[at + 2:]:  # skip the header and its `| --- |`
+        if not line.startswith('| '):
+            break
+        rows.append(line)
+    return rows
+
+
+def _header_row(columns) -> str:
+    return '| ' + ' | '.join(columns) + ' |'
+
+
+class TestRenderMarkdownRegrowthSection:
+    """The operator-facing half of the probe.
+
+    The JSON block is the machine-readable record; this section is what a
+    reader of the artifact actually reads, and esc-3200-3's finding was that
+    a probe with no rendered section is indistinguishable from a probe that
+    never ran.
+    """
+
+    def test_the_section_sits_between_by_query_kind_and_d10(self):
+        """Asserted by relative index, so a section that MOVES fails here.
+
+        The operator's reading order is part of the artifact: the deltas
+        qualify the arm tables above them and are qualified by nothing in
+        D10, so a section that silently relocated would change what the
+        reader takes the numbers to mean.
+        """
+        lines = _mod().render_markdown(_report_with_regrowth()).splitlines()
+
+        assert (
+            lines.index('## By query kind')
+            < lines.index('## Regrowth deltas')
+            < lines.index('## D10 — audit-recall over the labeled fixture')
+        )
+
+    def test_the_metric_labels_line_up_one_for_one_with_the_metrics(self):
+        """A label tuple shorter than the metric tuple drops a column."""
+        mod = _mod()
+
+        assert len(mod.REGROWTH_METRIC_LABELS) == len(mod.REGROWTH_METRICS)
+        assert mod.REGROWTH_TABLE_COLUMNS == (
+            'mode', 'read arm', *mod.REGROWTH_METRIC_LABELS,
+        )
+        assert mod.REGROWTH_STAMPING_COLUMNS == (
+            'read arm', *mod.REGROWTH_METRIC_LABELS,
+        )
+
+    def test_the_delta_table_columns_are_pinned_by_equality(self):
+        """Exactly as `DECISION_TABLE_COLUMNS` is, and for the same reason:
+        a column quietly dropped from a delta table is a metric quietly
+        dropped from the decision."""
+        mod = _mod()
+
+        assert mod.REGROWTH_TABLE_COLUMNS == (
+            'mode',
+            'read arm',
+            'claim recall@5',
+            'claim recall@10',
+            'canonical in top-5 (stored)',
+            'median canonical rank (stored)',
+            'canonical found (stored)',
+            'canonical in top-5 (credited)',
+            'tokens/query',
+        )
+
+    def test_the_rendered_header_row_is_built_from_the_pinned_columns(self):
+        mod = _mod()
+        section = _section(
+            mod.render_markdown(_report_with_regrowth()), '## Regrowth deltas',
+        )
+
+        assert _header_row(mod.REGROWTH_TABLE_COLUMNS) in section
+        assert _header_row(mod.REGROWTH_STAMPING_COLUMNS) in section
+
+    def test_there_is_one_row_per_mode_and_arm_in_pinned_order(self):
+        mod = _mod()
+        section = _section(
+            mod.render_markdown(_report_with_regrowth()), '## Regrowth deltas',
+        )
+
+        rows = _rows_under(section, _header_row(mod.REGROWTH_TABLE_COLUMNS))
+
+        assert len(rows) == len(mod.REGROWTH_MODES) * len(mod.REGROWTH_READ_ARMS)
+        assert [tuple(_cells(row)[:2]) for row in rows] == [
+            (mode, arm)
+            for mode in mod.REGROWTH_MODES
+            for arm in mod.REGROWTH_READ_ARMS
+        ]
+
+    def test_every_row_carries_a_cell_for_every_metric(self):
+        mod = _mod()
+        section = _section(
+            mod.render_markdown(_report_with_regrowth()), '## Regrowth deltas',
+        )
+
+        for row in _rows_under(section, _header_row(mod.REGROWTH_TABLE_COLUMNS)):
+            assert len(_cells(row)) == len(mod.REGROWTH_TABLE_COLUMNS)
+
+    def test_a_metric_cell_carries_the_baseline_the_after_and_the_delta(self):
+        """All three, in the one cell the reader is looking at.
+
+        The numbers are the test's own: `_plucked` puts claim recall@5 at
+        0.5 and the override moves the injected pass to 0.25, so the cell
+        must read `0.50 → 0.25 (-0.25)` and nothing else.
+        """
+        mod = _mod()
+        block = _moved_block(**{'claim_recall.at_5': 0.25})
+        section = _section(
+            mod.render_markdown(_report_with_regrowth(block)),
+            '## Regrowth deltas',
+        )
+
+        row = next(
+            r for r in _rows_under(
+                section, _header_row(mod.REGROWTH_TABLE_COLUMNS))
+            if _cells(r)[:2] == ['unstamped', 'flat']
+        )
+
+        recall_at_5 = _cells(row)[mod.REGROWTH_TABLE_COLUMNS.index('claim recall@5')]
+        assert recall_at_5 == '0.50 → 0.25 (-0.25)'
+
+    def test_an_unmoved_metric_renders_a_measured_zero_delta(self):
+        """`0.00` here means "measured, and it did not move" — the finding
+        the None rendering below has to stay distinguishable from."""
+        mod = _mod()
+        section = _section(
+            mod.render_markdown(_report_with_regrowth()), '## Regrowth deltas',
+        )
+
+        row = next(
+            r for r in _rows_under(
+                section, _header_row(mod.REGROWTH_TABLE_COLUMNS))
+            if _cells(r)[:2] == ['stamped', 'flat']
+        )
+
+        assert _cells(row)[2] == '0.50 → 0.50 (0.00)'
+
+    def test_a_none_metric_renders_as_no_measurement_never_zero(self):
+        """On BOTH the value and the delta, in the same cell.
+
+        A delta table that prints "never measured" as `0.00` says the
+        injection changed nothing, which is a finding rather than an
+        absence — the same discipline `_NO_MEASUREMENT` exists for.
+        """
+        mod = _mod()
+        block = _moved_block(**{'claim_recall.at_5': None})
+        section = _section(
+            mod.render_markdown(_report_with_regrowth(block)),
+            '## Regrowth deltas',
+        )
+
+        row = next(
+            r for r in _rows_under(
+                section, _header_row(mod.REGROWTH_TABLE_COLUMNS))
+            if _cells(r)[:2] == ['unstamped', 'flat']
+        )
+
+        cell = _cells(row)[2]
+        assert cell == f'0.50 → {mod._NO_MEASUREMENT} ({mod._NO_MEASUREMENT})'
+        assert '0.00' not in cell
+
+    def test_the_stamping_table_carries_one_row_per_read_arm(self):
+        mod = _mod()
+        section = _section(
+            mod.render_markdown(_report_with_regrowth()), '## Regrowth deltas',
+        )
+
+        rows = _rows_under(
+            section, _header_row(mod.REGROWTH_STAMPING_COLUMNS))
+
+        assert [_cells(row)[0] for row in rows] == list(mod.REGROWTH_READ_ARMS)
+        for row in rows:
+            assert len(_cells(row)) == len(mod.REGROWTH_STAMPING_COLUMNS)
+
+    def test_the_stamping_table_renders_stamped_minus_unstamped(self):
+        """The number task 4006's stamping campaign is owed.
+
+        Baseline and the stamped pass are identical here and the unstamped
+        pass moved by -0.25, so the stamping value is +0.25 — arithmetic
+        over values this test wrote, not a measurement.
+        """
+        mod = _mod()
+        block = _moved_block(**{'claim_recall.at_5': 0.25})
+        section = _section(
+            mod.render_markdown(_report_with_regrowth(block)),
+            '## Regrowth deltas',
+        )
+
+        row = next(
+            r for r in _rows_under(
+                section, _header_row(mod.REGROWTH_STAMPING_COLUMNS))
+            if _cells(r)[0] == 'flat'
+        )
+
+        assert _cells(row)[1] == '0.25'
+
+    def test_the_stamping_intro_says_what_stamping_coverage_buys(self):
+        mod = _mod()
+        section = '\n'.join(_section(
+            mod.render_markdown(_report_with_regrowth()), '## Regrowth deltas',
+        )).lower()
+
+        assert 'stamp' in section
+        assert '4006' in section
+
+    def test_each_read_arm_gets_exactly_one_regrowth_bullet(self):
+        mod = _mod()
+        section = _section(
+            mod.render_markdown(_report_with_regrowth()), '## Regrowth deltas',
+        )
+
+        for arm in mod.REGROWTH_READ_ARMS:
+            anchor = mod.regrowth_bullet_prefix(arm)
+            assert sum(
+                1 for line in section if line.startswith(anchor)
+            ) == 1, f'expected exactly one {anchor!r} bullet'
+
+    def test_the_regrowth_anchor_is_distinct_from_the_other_two(self):
+        """Three bullet lists share this document.
+
+        `pin_bullet_prefix` and `stored_gap_bullet_prefix` each assert
+        "exactly one" over their own anchor, so a regrowth bullet that
+        collided with either would break a test in a distant section rather
+        than here.
+        """
+        mod = _mod()
+
+        anchor = mod.regrowth_bullet_prefix('flat')
+        assert anchor != mod.stored_gap_bullet_prefix('flat')
+        assert anchor != mod.pin_bullet_prefix('flat')
+
+    def test_the_bullets_are_derived_from_the_block_not_typed(self):
+        """Same rule as the pin bullets: a hand-typed number about a previous
+        run silently becomes a false sentence beside the table that
+        contradicts it."""
+        mod = _mod()
+        block = _moved_block(**{'claim_recall.at_5': 0.25})
+        section = _section(
+            mod.render_markdown(_report_with_regrowth(block)),
+            '## Regrowth deltas',
+        )
+
+        bullet = next(
+            line for line in section
+            if line.startswith(mod.regrowth_bullet_prefix('flat'))
+        )
+
+        assert '-0.25' in bullet
+
+    def test_the_section_discloses_credited_versus_stored_semantics(self):
+        """Neither column can be quoted without its semantics.
+
+        Under `promoting_pin` the credited column is a PLACEMENT property —
+        the transform injects the canonical into the window — exactly as
+        `apply_grouped_read`'s was under `b_grouped`.  The disclosure has to
+        be beside the number it qualifies, not three sections away.
+        """
+        mod = _mod()
+        section = '\n'.join(_section(
+            mod.render_markdown(_report_with_regrowth()), '## Regrowth deltas',
+        )).lower()
+
+        assert 'placement' in section
+        assert 'stored' in section
+        assert 'promoting_pin' in section
+
+    def test_the_section_says_what_was_injected_and_what_the_modes_mean(self):
+        mod = _mod()
+        section = '\n'.join(_section(
+            mod.render_markdown(_report_with_regrowth()), '## Regrowth deltas',
+        )).lower()
+
+        for mode in mod.REGROWTH_MODES:
+            assert mode in section
+        assert mod.REGROWTH_SHAPE in section
+        assert 're-emission' in section
+
+    def test_a_run_without_the_probe_still_emits_the_heading(self):
+        """An ABSENT section is how this probe went missing the first time.
+
+        A reader of a probe-less artifact must be able to tell "skipped"
+        from "this build predates the probe", and a heading that disappears
+        makes those two identical — which is precisely what esc-3200-3 could
+        not read off the previous artifact.
+        """
+        mod = _mod()
+
+        section = _section(
+            mod.render_markdown(_report()), '## Regrowth deltas',
+        )
+
+        assert any('not probed' in line.lower() for line in section)
+        assert _header_row(mod.REGROWTH_TABLE_COLUMNS) not in section
+        assert _header_row(mod.REGROWTH_STAMPING_COLUMNS) not in section
+
+    def test_rendering_is_byte_identical_for_identical_input(self):
+        mod = _mod()
+
+        assert (
+            mod.render_markdown(_report_with_regrowth())
+            == mod.render_markdown(_report_with_regrowth())
+        )
+
+
+class TestTheNotBlindAuthoredDisclosure:
+    """This probe does NOT carry the protection the six arms above it do."""
+
+    def test_the_disclosure_appears_verbatim_in_the_protocol_section(self):
+        mod = _mod()
+        rendered = mod.render_markdown(_report_with_regrowth())
+
+        assert mod.REGROWTH_BLIND_AUTHORING_DISCLOSURE in rendered
+        assert mod.REGROWTH_BLIND_AUTHORING_DISCLOSURE in '\n'.join(
+            _section(rendered, '## Protocol'))
+
+    def test_it_states_that_blindness_is_unrecoverable_here(self):
+        """Disclosure, not a claim of blindness.
+
+        The original E2 protection was mechanized by commit ordering — the
+        arm decomposition and query set were committed before any metric
+        function existed.  The metric code was already in the tree when this
+        probe's corpus was authored, so that protection cannot be recreated
+        and the artifact has to say so rather than imply it still holds.
+        """
+        text = _mod().REGROWTH_BLIND_AUTHORING_DISCLOSURE.lower()
+
+        assert 'blind' in text
+        assert 'unrecoverable' in text
+        assert 'partial audit trail' in text
+        assert 'table below' in text
+
+    def test_it_is_emitted_even_when_the_probe_was_skipped(self):
+        """The disclosure describes the probe's authoring, not its run.
+
+        A reader of a `--no-regrowth` artifact still needs to know what the
+        probe's protocol is when they go looking for its numbers.
+        """
+        mod = _mod()
+
+        assert mod.REGROWTH_BLIND_AUTHORING_DISCLOSURE in mod.render_markdown(
+            _report())
+
+    def test_the_injection_fixture_renders_as_a_row_in_the_fixture_table(self):
+        mod = _mod()
+        protocol = _protocol()
+        protocol['fixtures'].append({
+            'path': 'fused-memory/tests/fixtures/e2_regrowth_injection.jsonl',
+            'commit': 'cafe123',
+        })
+
+        rendered = mod.render_markdown(
+            _report_with_regrowth(protocol=protocol))
+
+        assert (
+            '| `fused-memory/tests/fixtures/e2_regrowth_injection.jsonl` '
+            '| cafe123 |'
+        ) in rendered
+
+
+class TestTheInjectionFixtureIsClaimedOnlyWhenItWasRead:
+    """Provenance for a fixture the run never opened is a false audit trail."""
+
+    def test_it_is_appended_when_the_probe_ran(self):
+        mod = _mod()
+
+        paths = mod._protocol_fixture_paths(['a', 'b'], regrowth={})
+
+        assert paths[:2] == ['a', 'b']
+        assert paths[-1] == mod.DEFAULT_REGROWTH_INJECTION_PATH
+
+    def test_the_gate_is_is_not_none_rather_than_truthiness(self):
+        """An empty block is still a block that read the fixture."""
+        mod = _mod()
+
+        assert mod.DEFAULT_REGROWTH_INJECTION_PATH in mod._protocol_fixture_paths(
+            [], regrowth={})
+
+    def test_it_is_absent_when_the_probe_was_skipped(self):
+        mod = _mod()
+
+        assert mod._protocol_fixture_paths(['a', 'b'], regrowth=None) == ['a', 'b']
+
+
 class TestReadPathHoldsTheWindowBudget:
     """Pin-on and pin-off must be scored over equal-size windows."""
 
