@@ -670,3 +670,107 @@ def test_a_nonzero_failed_total_makes_the_process_exit_nonzero(monkeypatch, caps
 
     clean = _CannedProject([_task('ok', modules=['scripts/a.py'])])
     assert _run_main(monkeypatch, clean) == 0
+
+
+#: One canned task per outcome, with the ACTION LABEL and RESULTING FILES the
+#: live path is contracted to produce. The parity and idempotence tests both
+#: walk this, so the three outcomes cannot be covered unevenly.
+OUTCOME_CASES = [
+    ('copy-file', {'modules': ['scripts/a.py']}, 'copy', ['scripts/a.py']),
+    ('copy-dirs', {'modules': ['orchestrator/tests/']}, 'copy-sanitized-empty', None),
+    (
+        'drop',
+        {'modules': ['crates/reify-core'], 'files': ['src/b.py']},
+        'drop',
+        ['src/b.py'],
+    ),
+]
+
+
+def test_the_dry_run_reports_what_the_live_path_would_actually_write(capsys):
+    """PARITY. Dry-run output IS the observable signal — it must not lie.
+
+    The pre-4528 dry-run line printed ``modules=... files=...``: the INPUT,
+    never the result. On the live corpora every copy-branch task is
+    all-directory, so an operator reading that output would have seen 11 lines
+    saying ``action=copy modules=['crates/reify-core', ...]`` and concluded
+    those directories were about to be written into ``files`` — when in fact
+    the write would have been rejected outright, and post-fix writes nothing at
+    all.
+
+    The label and the resulting files are compared against WHAT THE LIVE PASS
+    ACTUALLY DID, not against literals restated here, so the two paths cannot
+    drift apart while both still matching this test.
+    """
+    for task_id, meta, expected_label, expected_files in OUTCOME_CASES:
+        dry = _CannedProject([{'id': task_id, 'status': 'pending', 'metadata': dict(meta)}])
+        live = _CannedProject([{'id': task_id, 'status': 'pending', 'metadata': dict(meta)}])
+
+        _run(dry, dry_run=True)
+        dry_out = capsys.readouterr().out
+        _run(live)
+        capsys.readouterr()
+
+        # The dry-run made no writes at all.
+        assert dry.updates == [], task_id
+        # ...and reported the live path's label and result.
+        assert f'action={expected_label}' in dry_out, (task_id, dry_out)
+        written = _written(live, task_id).get('files')
+        assert written == expected_files, task_id
+        assert f'files={written!r}' in dry_out, (task_id, dry_out)
+
+
+def test_the_dry_run_counts_what_the_live_run_counts():
+    """The same parity on the COUNTERS, which is what the summary reports.
+
+    A dry-run whose per-task lines were honest but whose totals still lumped
+    the two copy outcomes together would put the wrong before/after table in
+    the PR — and the before table can only ever come from a dry run.
+    """
+    tasks = [
+        {'id': tid, 'status': 'pending', 'metadata': dict(meta)}
+        for tid, meta, _label, _files in OUTCOME_CASES
+    ]
+
+    dry = _run(_CannedProject(list(tasks)), dry_run=True)
+    live = _run(_CannedProject(list(tasks)))
+
+    assert dry == live
+    assert (dry.copied, dry.sanitized_empty, dry.dropped) == (1, 1, 1)
+
+
+def test_a_second_pass_over_the_migrated_metadata_is_a_no_op():
+    """IDEMPOTENCE, measured against what the FIRST pass really wrote.
+
+    The script's docstring has claimed "idempotent — safe to re-run" since it
+    was written, and the run this task performs is a three-phase
+    dry-run/live/dry-run whose final phase must report zero pending actions
+    everywhere. That assertion is only meaningful if a second pass over the
+    first pass's OWN OUTPUT is a no-op, which is what this feeds back — rather
+    than a hand-written "already migrated" shape that could differ from
+    reality.
+
+    The sanitize-to-empty case is the one worth the care: that task ends with
+    neither ``modules`` nor ``files``, so a re-run must not decide the empty
+    ``files`` means it has scope to restore.
+    """
+    first = _CannedProject([
+        {'id': tid, 'status': 'pending', 'metadata': dict(meta)}
+        for tid, meta, _label, _files in OUTCOME_CASES
+    ])
+    _run(first)
+
+    migrated = [
+        {'id': args['id'], 'status': 'pending', 'metadata': json.loads(args['metadata'])}
+        for args in first.updates
+    ]
+    assert len(migrated) == len(OUTCOME_CASES)
+
+    second_client = _CannedProject(migrated)
+    second = _run(second_client)
+
+    assert second_client.updates == []
+    assert (second.copied, second.sanitized_empty, second.dropped, second.failed) == (
+        0, 0, 0, 0,
+    )
+    assert second.visited == len(OUTCOME_CASES)
