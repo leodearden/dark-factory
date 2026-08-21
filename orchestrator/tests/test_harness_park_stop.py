@@ -243,6 +243,132 @@ class TestHarnessSchedulerParkStopWiring:
 class TestHarnessRestartPersistence:
     """Tests for restart-time rehydration of persisted scheduler pause state."""
 
+    @staticmethod
+    def _seed_and_load(
+        tmp_path: Path,
+        *,
+        reason: str,
+        ewa_value: float | None,
+        threshold: float = 24.6,
+    ) -> tuple[Harness, RunStore, Path]:
+        """Seed a real runs.db pause row, then run the restore path over it."""
+        db_dir = tmp_path / 'data' / 'orchestrator'
+        db_dir.mkdir(parents=True, exist_ok=True)
+        db_path = db_dir / 'runs.db'
+        seeder = RunStore(db_path)
+        seeder.save_scheduler_pause(
+            project_id='dark_factory',
+            reason=reason,
+            pause_at_iso='2026-05-13T22:00:00+00:00',
+            set_by_run_id='prior-run-id',
+            ewa_value=ewa_value,
+        )
+        config = OrchestratorConfig(project_root=tmp_path, digest_ewa_threshold=threshold)
+        harness = Harness(config)
+        harness._run_store = seeder
+        harness._run_id = 'new-run-id'
+        harness.event_store = EventStore(tmp_path / 'events.db', 'new-run-id')
+        return harness, seeder, db_path
+
+    @pytest.mark.asyncio
+    async def test_ewa_pause_still_tripped_is_reasserted(self, tmp_path: Path) -> None:
+        """A restart whose stored EWA still exceeds the threshold re-asserts the halt."""
+        harness, seeder, _ = self._seed_and_load(
+            tmp_path, reason='ewa_trip_73.5900', ewa_value=73.59, threshold=24.6,
+        )
+
+        await harness._load_persisted_scheduler_pause()
+
+        assert harness.scheduler.is_paused is True, 'Halt must be re-asserted'
+        assert harness._ewa_value == pytest.approx(73.59), (
+            f'Evidence must be restored, not zeroed; got {harness._ewa_value}'
+        )
+        assert seeder.load_scheduler_pause('dark_factory') is not None, (
+            'The row must survive a re-asserted halt'
+        )
+        events = _query_events(harness.event_store, 'scheduler_pause_restored')
+        assert len(events) == 1, f'Expected one restored event; got {events}'
+        payload = json.loads(events[0]['data'])
+        assert payload.get('reasserted') is True, (
+            f'Expected reasserted=True; got {payload!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_ewa_pause_below_threshold_is_not_reasserted(self, tmp_path: Path) -> None:
+        """A restart whose stored EWA no longer exceeds the threshold releases the halt.
+
+        This is NOT auto-resume of a live pause: nothing new reads _ewa_value to
+        unpause a running scheduler.  It is a refusal to RE-ASSERT, across a
+        process boundary, a halt whose stored predicate no longer holds.
+        """
+        harness, seeder, _ = self._seed_and_load(
+            tmp_path, reason='ewa_trip_73.5900', ewa_value=9.0, threshold=24.6,
+        )
+
+        await harness._load_persisted_scheduler_pause()
+
+        assert harness.scheduler.is_paused is False, (
+            'A halt whose predicate no longer holds must not be re-asserted'
+        )
+        assert harness._ewa_value == pytest.approx(9.0), (
+            f'Evidence restoration is unconditional; got {harness._ewa_value}'
+        )
+        assert seeder.load_scheduler_pause('dark_factory') is None, (
+            'The stale pause row must be cleared'
+        )
+        assert harness._restored_pause_reason is None, (
+            'No L1 may be filed for a halt that was not re-asserted'
+        )
+        events = _query_events(harness.event_store, 'scheduler_pause_restored')
+        assert len(events) == 1, f'Expected one restored event; got {events}'
+        payload = json.loads(events[0]['data'])
+        assert payload.get('reasserted') is False, f'Expected reasserted=False; got {payload!r}'
+        assert payload.get('ewa_value') == pytest.approx(9.0), (
+            f'The event must carry the value that decided it; got {payload!r}'
+        )
+        assert payload.get('ewa_threshold') == pytest.approx(24.6), (
+            f'The event must carry the threshold that decided it; got {payload!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_pre_migration_row_restores_blind(self, tmp_path: Path) -> None:
+        """A NULL ewa_value on an ewa_trip_ reason restores the halt exactly as today.
+
+        Fail-safe toward KEEPING the halt when the predicate is unknowable,
+        never toward releasing it.
+        """
+        harness, seeder, _ = self._seed_and_load(
+            tmp_path, reason='ewa_trip_73.5900', ewa_value=None, threshold=24.6,
+        )
+
+        await harness._load_persisted_scheduler_pause()
+
+        assert harness.scheduler.is_paused is True, (
+            'An unknowable predicate must restore the halt, not release it'
+        )
+        assert seeder.load_scheduler_pause('dark_factory') is not None
+        assert harness._restored_pause_reason == 'ewa_trip_73.5900'
+
+    @pytest.mark.asyncio
+    async def test_non_ewa_pause_never_consults_predicate(self, tmp_path: Path) -> None:
+        """A park-stop pause is restored blind even with a low stored EWA.
+
+        Honours task 3328's 'Non-5xx park-stop pauses NEVER auto-resume': the
+        predicate re-check is scoped strictly to ewa_trip_* reasons, the one
+        pause class whose predicate is a stored scalar.
+        """
+        harness, seeder, _ = self._seed_and_load(
+            tmp_path, reason='park-stop: 5 blocked', ewa_value=9.0, threshold=24.6,
+        )
+
+        await harness._load_persisted_scheduler_pause()
+
+        assert harness.scheduler.is_paused is True, (
+            'A park-stop halt must be restored blind regardless of the stored EWA'
+        )
+        assert seeder.load_scheduler_pause('dark_factory') is not None
+        assert harness._restored_pause_reason == 'park-stop: 5 blocked'
+
     @pytest.mark.asyncio
     async def test_harness_restart_loads_persisted_pause(self, tmp_path: Path) -> None:
         """_load_persisted_scheduler_pause() restores is_paused and pause_reason from runs.db.
