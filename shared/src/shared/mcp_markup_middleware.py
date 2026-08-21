@@ -279,8 +279,16 @@ def _json_type_name(value: Any) -> str | None:
 
 def _coerce_recovered(
     recovered: Mapping[str, str], properties: Mapping[str, Any]
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], tuple[str, ...]]:
     """Type a recovered value against the invoked tool's declared schema.
+
+    Returns the coerced map AND the names it could NOT type — those whose
+    parameter declares a non-string type that the verbatim slice does not decode
+    into. That second element is not a diagnostic: a value in it is one pydantic
+    is CERTAIN to reject, so a caller that forwards it forwards a doomed call.
+    Separating "left alone because a string is already correct" from "left alone
+    because nothing could be believed" is what lets the caller act on the
+    difference; both look identical in the map itself.
 
     ``Repair.recovered`` is ``dict[str, str]`` and every value in it is a
     VERBATIM slice of the absorbed tail (``shared.toolcall_markup`` invariant
@@ -313,6 +321,7 @@ def _coerce_recovered(
     exception here would convert a repair into a crash.
     """
     coerced: dict[str, Any] = dict(recovered)
+    untypable: list[str] = []
     for name, value in recovered.items():
         accepted = _accepted_types(properties.get(name))
 
@@ -320,23 +329,28 @@ def _coerce_recovered(
         # string-typed parameter's verbatim slice is ALREADY the correct value
         # (D5), and a union admitting a string is ambiguous — decoding text
         # that merely happens to parse would silently retype the caller's data.
+        # NOT untypable: nothing here is in doubt.
         if not accepted or 'string' in accepted:
             continue
 
         try:
             decoded = json.loads(value)
         except (json.JSONDecodeError, ValueError, TypeError):
+            untypable.append(name)
             continue
 
         decoded_name = _json_type_name(decoded)
         if decoded_name is None:
+            untypable.append(name)
             continue
         # 'integer' is acceptable where 'number' is declared; not the reverse.
         if decoded_name in accepted or (
             decoded_name == 'integer' and 'number' in accepted
         ):
             coerced[name] = decoded
-    return coerced
+        else:
+            untypable.append(name)
+    return coerced, tuple(untypable)
 
 
 #: The residue escalation's category, and the machine-readable owner that will
@@ -355,6 +369,20 @@ _FORWARD_HINT = (
     'parameters it had swallowed (see recovered_params) were restored. The '
     'call went through, but your tool-call envelope is leaking into your own '
     'payloads — fix the emission rather than relying on this repair.'
+)
+
+#: Replaces _FORWARD_HINT when a recovered parameter had to be DROPPED. It says
+#: the two things the plain hint would leave a caller to assume wrongly: the
+#: call is incomplete, and the missing value still exists somewhere.
+_UNRECOVERED_HINT = (
+    'This call carried raw MCP envelope markup and was REPAIRED in place '
+    'before dispatch, but at least one parameter the leak had swallowed could '
+    'NOT be typed against its declared schema (see unrecovered_params) and was '
+    'DROPPED — forwarding it verbatim would have failed validation and lost '
+    'the whole call. The call went through WITHOUT those parameters; their raw '
+    'values are preserved in the escalation named by unrecovered_residue_id '
+    '(null if preserving them failed too). Resend them yourself if you still '
+    'hold them, and fix the envelope leak at its emission.'
 )
 
 
@@ -677,7 +705,37 @@ class MarkupGuardMiddleware(Middleware):
         # in the fact and in both the meta and error payloads — picks the coerced
         # map up automatically, and those ``sorted`` calls read the map's KEYS,
         # so they stay type-agnostic and still emit NAMES only, never values.
-        fix = fix._replace(recovered=_coerce_recovered(fix.recovered, properties))
+        coerced, untypable = _coerce_recovered(fix.recovered, properties)
+
+        # A value the coercion could not type is one pydantic is CERTAIN to
+        # reject, so forwarding it forwards a DOOMED call: the tool body never
+        # runs, and for a tier whose whole purpose is that the call gets through
+        # (INV-6 — a lost escalate_info strands a task) that is the strand this
+        # tier exists to prevent, arrived at by a different road. MEASURED
+        # before this branch: a truncated `evidence` tail logged
+        # `outcome=repaired` and then died with `1 validation error … evidence:
+        # Input should be a valid list [type=list_type]`, with NO residue filed
+        # — the payload destroyed and only a pydantic error to show for it.
+        #
+        # So drop the name and let the call land LOSSILY, which is exactly what
+        # an unguarded leak would have delivered, minus the envelope markup the
+        # guard still strips from `param`. Nothing is guessed: the slice is not
+        # retyped, defaulted or invented, it is REMOVED and preserved verbatim
+        # in the residue channel below, so the payload survives a refusal the
+        # caller never sees.
+        #
+        # FORWARD_REPAIR ONLY. REJECT_WITH_REPAIR writes nothing and hands the
+        # caller a `repaired_call` to resubmit; dropping a name there would
+        # silently shrink the map the caller is told to send verbatim, turning a
+        # recoverable bounce into a quiet truncation.
+        unrecovered: dict[str, str] = {}
+        if untypable and self.policy is RepairPolicy.FORWARD_REPAIR:
+            unrecovered = {name: fix.recovered[name] for name in untypable}
+            coerced = {
+                name: value for name, value in coerced.items()
+                if name not in unrecovered
+            }
+        fix = fix._replace(recovered=coerced)
 
         # Identity from the REPAIRED view. If the leak ate the caller's own
         # ``agent_id`` — PRD section 2.1's first specimen does exactly that —
@@ -700,7 +758,15 @@ class MarkupGuardMiddleware(Middleware):
             outcome=_OUTCOME_REPAIRED, misclose=fix.misclose, recovered=fix.recovered,
         )
         storm = await self._record_storm(_OUTCOME_REPAIRED, identity[1])
-        return await self._forward(context, call_next, arguments, param, fix, storm)
+        residue_id = None
+        if unrecovered:
+            residue_id = await self._preserve_unrecovered(
+                name, identity, param, pattern, unrecovered,
+            )
+        return await self._forward(
+            context, call_next, arguments, param, fix, storm,
+            unrecovered=tuple(sorted(unrecovered)), residue_id=residue_id,
+        )
 
     # -- the injected channels --------------------------------------------
 
@@ -1018,6 +1084,58 @@ class MarkupGuardMiddleware(Middleware):
         )
         return escalation_id
 
+    async def _preserve_unrecovered(
+        self, name, identity, param, pattern, unrecovered: Mapping[str, str],
+    ) -> str | None:
+        """Queue the slices FORWARD_REPAIR dropped, so nothing is destroyed.
+
+        The other half of the drop above. C2 L187 binds every path this guard
+        takes, not just the refusal one: "nothing is discarded even if the
+        caller never retries". A dropped slice is a recovery that did not
+        happen, so the payload it holds gets the same treatment an unrepairable
+        one gets — the SAME residue record, through the SAME sink, carrying the
+        same owner and L2 bound (INV-7), because an operator recovering data
+        should not have to know which of two internal roads lost it.
+
+        One record per dropped NAME rather than one per call: each carries a
+        different parameter's payload, and the residue channel deliberately does
+        not dedup for exactly that reason. Returns the LAST id filed, which is
+        the one the forwarded call's warning names.
+
+        Never raises — ``_file_residue_escalation`` owns that contract, and this
+        runs on a path whose outcome (forward) is already decided.
+        """
+        agent_id, project = identity
+        residue_id = None
+        for field, raw in sorted(unrecovered.items()):
+            residue_id = await self._file_residue_escalation({
+                # A DISTINCT error_type from the refusal's, because the two
+                # differ in the one way that matters to whoever reads the queue:
+                # this call SUCCEEDED, lossily, and no caller was bounced — so
+                # nobody is waiting on a retry, and nobody was told.
+                'error_type': 'mcp_markup_unrecovered_param',
+                'category': _ESCALATION_CATEGORY,
+                'owner': _ESCALATION_OWNER,
+                'level': _ESCALATION_LEVEL,
+                'tool': name,
+                'field': field,
+                'matched_pattern': pattern,
+                'agent_id': agent_id,
+                'project': project,
+                'raw_value': raw,
+                'summary': (
+                    f'Recovered {name}.{field} could not be typed against its '
+                    f'declared schema — the call was forwarded WITHOUT it and '
+                    f'the value preserved here'
+                ),
+                'suggested_action': (
+                    f'Recover the raw_value into {name}.{field} if it is still '
+                    'needed — the caller was not told it was dropped — then '
+                    'chase the harness serialization leak that produced it.'
+                ),
+            })
+        return residue_id
+
     def _reject(self, name, arguments, param, fix, storm) -> NoReturn:
         """Write nothing; bounce the caller with the repaired argument map.
 
@@ -1066,7 +1184,10 @@ class MarkupGuardMiddleware(Middleware):
             'hint': _REJECT_HINT,
         }, storm)))
 
-    async def _forward(self, context, call_next, arguments, param, fix, storm):
+    async def _forward(
+        self, context, call_next, arguments, param, fix, storm,
+        *, unrecovered: tuple[str, ...] = (), residue_id: str | None = None,
+    ):
         """Repair in place, let the call through, and say so.
 
         The mutation is IN PLACE on ``context.message.arguments``, which is
@@ -1115,6 +1236,13 @@ class MarkupGuardMiddleware(Middleware):
             'recovered_params': sorted(fix.recovered),
             'hint': _FORWARD_HINT,
         }, storm)
+        # Omitted when empty, the same convention `storm` follows: a key that is
+        # always present teaches a reader to skip it, and this one must be read.
+        if unrecovered:
+            # NAMES only here too. The values went to the residue channel.
+            meta['markup_repair']['unrecovered_params'] = list(unrecovered)
+            meta['markup_repair']['unrecovered_residue_id'] = residue_id
+            meta['markup_repair']['hint'] = _UNRECOVERED_HINT
         return ToolResult(
             content=result.content,
             structured_content=result.structured_content,

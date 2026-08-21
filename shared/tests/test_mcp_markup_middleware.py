@@ -1307,29 +1307,117 @@ class TestCoercionNeverGuesses:
 
     # -- (c) a non-decodable value is left verbatim, never fabricated ------
 
-    async def test_an_undecodable_value_is_left_verbatim_not_invented(self):
+    async def test_an_undecodable_value_is_never_invented(self):
         """A decode failure is a failure to recover, not a licence to invent.
 
-        The caller must see pydantic's own ``list_type`` error NAMING
-        ``evidence``. Swallowing the failure into ``[]`` or ``None`` would
-        destroy the payload while reporting success — precisely the silent
-        loss this whole task exists to end (C2 L187).
+        The value must never be swallowed into ``[]``, ``None`` or a retyped
+        guess — that would destroy the payload while reporting success, which is
+        precisely the silent loss this task exists to end (C2 L187). Under
+        FORWARD_REPAIR it is DROPPED instead, so the parameter arrives at the
+        tool exactly as it would have without the recovery: absent.
         """
-        truncated = '[{"observation": "the tail was cut off'
-
-        with pytest.raises(ToolError) as excinfo:
-            await self._call(self._payload('Ill-formed.', 'evidence', truncated))
-
-        message = str(excinfo.value)
-        assert 'evidence' in message
-        assert 'list_type' in message
-
-    async def test_an_undecodable_value_does_not_reach_the_tool_at_all(self):
-        """No partial write: pydantic refuses the call, so the body never runs."""
         truncated = '[{"observation": "the tail was cut off'
         h = build_harness(RepairPolicy.FORWARD_REPAIR)
 
-        with pytest.raises(ToolError):
+        await h.call(
+            'escalate_info_typed',
+            {
+                **self.REQUIRED,
+                'detail': self._payload('Ill-formed.', 'evidence', truncated),
+            },
+        )
+
+        assert h.recorder.args.get('evidence') in (None, [])
+        assert h.recorder.args.get('evidence') != truncated
+
+    async def test_an_undecodable_value_does_not_cost_the_whole_call(self):
+        """REVIEW SUGGESTION 5. The tier's whole purpose is that the call lands.
+
+        MEASURED before the fix: a truncated ``evidence`` tail logged
+        ``outcome=repaired`` and then died with ``1 validation error … evidence:
+        Input should be a valid list [type=list_type]``, with ``recorder.calls
+        == []`` — the tool body never ran, no residue was filed, and an
+        ``escalate_info`` was lost with only a pydantic error to show for it.
+        That is the INV-6 strand FORWARD_REPAIR exists to prevent, reached by a
+        different road than the one the tier guards.
+
+        Forwarding a value pydantic is CERTAIN to reject is not a neutral
+        "leave it alone" — it is a decision to lose the call.
+        """
+        truncated = '[{"observation": "the tail was cut off'
+        h = build_harness(RepairPolicy.FORWARD_REPAIR)
+
+        result = await h.call(
+            'escalate_info_typed',
+            {
+                **self.REQUIRED,
+                'detail': self._payload('Ill-formed.', 'evidence', truncated),
+            },
+        )
+
+        assert len(h.recorder.calls) == 1, 'the call must reach the tool'
+        # The clean value still landed — the guard is strictly better than no
+        # guard here, not merely no worse.
+        assert h.recorder.args['detail'] == 'Ill-formed.'
+
+        warning = result.meta['markup_repair']
+        assert warning['outcome'] == 'repaired'
+        assert warning['unrecovered_params'] == ['evidence']
+        assert 'evidence' not in warning['recovered_params']
+        # The caller is TOLD the call is incomplete; a plain repair hint would
+        # let it assume the recovery succeeded.
+        assert 'DROPPED' in warning['hint']
+
+    async def test_a_dropped_value_is_preserved_verbatim_in_the_residue_channel(
+        self,
+    ):
+        """Dropping is not discarding (C2 L187 binds every path, not just refusal).
+
+        The same residue record, through the same sink, carrying the same owner
+        and L2 bound an unrepairable refusal files — an operator recovering data
+        should not have to know which internal road lost it. The error_type
+        differs because the difference matters to a reader: this call SUCCEEDED,
+        so nobody was bounced and nobody is waiting on a retry.
+        """
+        truncated = '[{"observation": "the tail was cut off'
+        h = build_harness(RepairPolicy.FORWARD_REPAIR)
+
+        result = await h.call(
+            'escalate_info_typed',
+            {
+                **self.REQUIRED,
+                'detail': self._payload('Ill-formed.', 'evidence', truncated),
+            },
+        )
+
+        residues = [
+            r for r in h.escalations
+            if r['error_type'] == 'mcp_markup_unrecovered_param'
+        ]
+        assert len(residues) == 1, f'expected one residue, got {h.escalations}'
+        residue = residues[0]
+        assert residue['raw_value'] == truncated
+        assert residue['field'] == 'evidence'
+        assert residue['tool'] == 'escalate_info_typed'
+        assert residue['owner'] == 'l2-escalation-watcher'
+        assert residue['level'] == 2
+        assert residue['category'] == 'mcp_markup_residue'
+        # And the forwarded caller is pointed at it by id.
+        assert result.meta['markup_repair']['unrecovered_residue_id'] is not None
+
+    async def test_reject_with_repair_keeps_the_undecodable_value_verbatim(self):
+        """The drop is FORWARD_REPAIR's alone.
+
+        REJECT_WITH_REPAIR writes nothing and hands the caller a
+        ``repaired_call`` it is told to resubmit verbatim. Shrinking that map
+        would turn a recoverable bounce into a quiet truncation — the caller
+        would resubmit a call missing a parameter it never chose to drop, and
+        nothing would say so.
+        """
+        truncated = '[{"observation": "the tail was cut off'
+        h = build_harness(RepairPolicy.REJECT_WITH_REPAIR)
+
+        with pytest.raises(ToolError) as excinfo:
             await h.call(
                 'escalate_info_typed',
                 {
@@ -1338,6 +1426,8 @@ class TestCoercionNeverGuesses:
                 },
             )
 
+        payload = json.loads(str(excinfo.value))
+        assert payload['repaired_call']['evidence'] == truncated
         assert h.recorder.calls == []
 
     # -- D5 is preserved: the transform is a BOUNDARY layer ----------------
