@@ -251,8 +251,8 @@ For any project running unattended, keep one long-running
    automatically inside the orchestrator itself.
 3. Handles each pending escalation, dispatching by category:
    - `review_issues` / `task_failure` / `wip_conflict` / `unmerged_state` /
-     unmatched `dependency_discovered` / blocking `cleanup_needed` → spawn
-     an interactive `/unblock` session via `/spawn`.
+     `stash_failed` / unmatched `dependency_discovered` / blocking
+     `cleanup_needed` → spawn an interactive `/unblock` session via `/spawn`.
    - `scope_violation` / matched `dependency_discovered` → resolve
      directly.
    - `design_concern` / `risk_identified` → always a human judgment call —
@@ -479,9 +479,9 @@ what you intended — the parameter ordering matters (`action` before a long
 free-text `resolution`) and a mis-ordered call can silently record the
 wrong action.
 
-### Merge-halt semantics (`wip_conflict` / `unmerged_state`)
+### Merge-halt semantics (`wip_conflict` / `unmerged_state` / `stash_failed`)
 
-These two escalation categories mean the **entire merge queue is halted**
+These three escalation categories mean the **entire merge queue is halted**
 — no other task can merge until the one escalation that owns the halt is
 resolved. The orchestrator tracks exactly one "halt owner" escalation
 internally; resolving any *other* escalation, even another `wip_conflict`,
@@ -494,6 +494,17 @@ does **not** release the halt.
   (`UU`/`AA`/`DD`) *before* the merge queue tried to advance — pre-existing
   corruption, not caused by the attempted merge. Needs `git mergetool`,
   manual resolution, or `git reset`, depending on intent.
+- `stash_failed` — the merge queue could not park `project_root`'s dirty
+  tracked WIP before advancing (task 2758). Like the other two this is a
+  shared main-checkout-hygiene fault rather than a fault of the merging task,
+  so the queue halts once instead of failing task after task. Inspect the main
+  checkout's uncommitted work and commit it — or get its owner to. **Do not
+  reach for `git stash`**: CLAUDE.md forbids it in *any* dark-factory checkout,
+  `project_root` or task worktree, because `refs/stash` is a single ref shared
+  by every worktree in the checkout (it is not per-worktree) and the merge
+  worker's advance path consumes the same stack — so a stash you push can be
+  popped out from under you, and a pop on a clean tree can apply an unrelated
+  task's WIP into it (incident 13674d3c68). Park WIP as commits on a branch.
 
 Resolve the halt-owner escalation specifically (check `get_merge_halt_status`
 if unsure which one owns it) — `resolve_issue` on it un-halts the whole
