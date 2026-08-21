@@ -1567,6 +1567,154 @@ class TestB5UnrepairableIsNeverGuessed:
         assert h.recorder.calls == []
 
 
+class TestTheHintNeverOverclaimsPreservation:
+    """The refusal's PROSE must agree with its own ``escalation_id`` field.
+
+    ``_file_residue_escalation`` returns ``None`` on THREE distinct paths — no
+    sink wired, a sink that RAISED (``_call_sink``'s never-raises contract), and
+    a sink that returned a non-str. On every one of them the payload carries
+    ``escalation_id: null``, so a hint that unconditionally asserts "your full
+    payload is preserved verbatim in the escalation named above" is a lie told
+    at the exact moment the payload was destroyed — and it explicitly
+    discourages the ONE recovery still available ("rather than reconstructing it
+    from this error").
+
+    That converts a RECOVERABLE loss into an unrecoverable one, because the
+    hint is read by an agent deciding whether it still needs its own copy.
+
+    This is not a verdict-tools-only gap. The raising-sink path applies to the
+    ESCALATION server too, where a queue I/O failure produces the identical
+    false claim — which is why the fix lives in the middleware once rather than
+    at either registration site.
+    """
+
+    #: Reuses B5's named specimen: the refusal path is a property of the VALUE's
+    #: own boundary, so the same row drives every branch below.
+    SPECIMEN_ID = TestB5UnrepairableIsNeverGuessed.SPECIMEN_ID
+
+    #: A distinctive slice of the PRESERVED variant. Asserting on the clause
+    #: itself rather than on the whole constant keeps this row readable when the
+    #: surrounding prose is reworded.
+    PRESERVED_CLAIM = 'preserved verbatim'
+
+    @staticmethod
+    def _value() -> str:
+        return TestB5UnrepairableIsNeverGuessed._value()
+
+    async def _refuse(self, policy, **guard_kwargs):
+        h = build_harness(policy, **guard_kwargs)
+        with pytest.raises(ToolError) as excinfo:
+            await h.call(
+                'add_reuse_item',
+                {'what': 'the sampler', 'how': self._value(), 'where': 'shared/'},
+            )
+        return h, _reject_payload(excinfo)
+
+    # -- (a) preserved --------------------------------------------------
+
+    @BOTH_POLICIES
+    async def test_a_preserved_payload_is_told_it_is_preserved(self, policy):
+        """The harness sink returns a real id, so the claim is TRUE here."""
+        _, payload = await self._refuse(policy)
+
+        assert payload['escalation_id'] == ESCALATION_ID
+        assert self.PRESERVED_CLAIM in payload['hint'], (
+            'preservation actually happened, so the caller must be told it can '
+            'stop holding its own copy'
+        )
+
+    # -- (b) no sink wired ----------------------------------------------
+
+    @BOTH_POLICIES
+    async def test_no_sink_wired_does_not_claim_preservation(self, policy):
+        """Nothing was written anywhere, so nothing may be promised."""
+        _, payload = await self._refuse(policy, escalation_sink=None)
+
+        assert payload['escalation_id'] is None
+        assert self.PRESERVED_CLAIM not in payload['hint'], (
+            'with no sink the payload was destroyed; telling the caller it is '
+            'safe is how a recoverable loss becomes unrecoverable'
+        )
+        assert 'nothing was preserved' in payload['hint'].lower(), (
+            'the honest variant must POSITIVELY say the data is gone, not '
+            'merely omit the claim — an agent skims for an instruction'
+        )
+
+    # -- (c) sink raised -------------------------------------------------
+
+    @BOTH_POLICIES
+    async def test_a_sink_that_raised_does_not_claim_preservation(self, policy):
+        """The escalation-server-with-a-failing-queue case."""
+        def boom(record):
+            raise RuntimeError('queue unavailable')
+
+        _, payload = await self._refuse(policy, escalation_sink=boom)
+
+        assert payload['escalation_id'] is None
+        assert self.PRESERVED_CLAIM not in payload['hint']
+        assert 'nothing was preserved' in payload['hint'].lower()
+
+    # -- (d) sink returned a non-str -------------------------------------
+
+    @BOTH_POLICIES
+    async def test_a_sink_returning_a_non_str_does_not_claim_preservation(self, policy):
+        """The middleware normalises this to ``None`` (it is not lookup-able).
+
+        So the hint must follow the ID it actually published, not the sink's
+        intent — keying off ``self._escalation_sink is not None`` would get
+        this row exactly backwards.
+        """
+        _, payload = await self._refuse(policy, escalation_sink=lambda record: 12)
+
+        assert payload['escalation_id'] is None
+        assert self.PRESERVED_CLAIM not in payload['hint']
+        assert 'nothing was preserved' in payload['hint'].lower()
+
+    # -- (e) what must NOT change across the split -----------------------
+
+    @BOTH_POLICIES
+    async def test_every_variant_still_offers_the_override_escape(self, policy):
+        """INV-3. The pre-existing assertion pins this on the preserved branch;
+        a split that dropped it from the other branch would strand a caller
+        quoting markup DELIBERATELY."""
+        sinks: list[Any] = [
+            {},
+            {'escalation_sink': None},
+            {'escalation_sink': _raises_for_test},
+            {'escalation_sink': lambda record: 12},
+        ]
+        for kwargs in sinks:
+            _, payload = await self._refuse(policy, **kwargs)
+            assert MARKUP_OVERRIDE_KEY in payload['hint'], (
+                f'the override escape vanished for {kwargs!r}'
+            )
+
+    @BOTH_POLICIES
+    async def test_every_variant_still_says_unrepairable_and_no_repair(self, policy):
+        """The split changes ONLY the preservation clause."""
+        for kwargs in ({}, {'escalation_sink': None}):
+            _, payload = await self._refuse(policy, **kwargs)
+            hint = payload['hint']
+            assert 'UNREPAIRABLE' in hint
+            assert 'no repair was attempted' in hint
+            assert payload['outcome'] == 'unrepairable'
+            assert 'repaired_call' not in payload
+
+    async def test_the_two_variants_are_genuinely_different(self):
+        """A copy-paste that left both branches identical would otherwise pass
+        every substring check above."""
+        _, preserved = await self._refuse(RepairPolicy.FORWARD_REPAIR)
+        _, unpreserved = await self._refuse(
+            RepairPolicy.FORWARD_REPAIR, escalation_sink=None
+        )
+
+        assert preserved['hint'] != unpreserved['hint']
+
+
+def _raises_for_test(record: dict[str, Any]) -> str:
+    """A sink that fails, as a module-level name so it is reusable in a table."""
+    raise RuntimeError('queue unavailable')
+
 class TestB8RecoveredNameOutsideTheToolSchema:
     """A tail that parses CLEANLY but names a parameter the tool does not have.
 
