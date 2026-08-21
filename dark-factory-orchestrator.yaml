@@ -689,6 +689,54 @@ verify_cold_preprovision_command: "uv sync --all-packages"
 # invariant I3 preserves this explicit override until then).
 verify_admission_slots_dir: "/tmp/df-verify-slots-1000-dark_factory"
 
+# INTERIM PARTIAL cap (operator decision, Leo 2026-08-19, esc-5984-3) on the
+# pytest-xdist worker count for the verify TEST LEG.
+#
+# THIS BLOCK IS THE SINGLE SOURCE OF TRUTH for the decision. The T6 report's
+# dated addendum and orchestrator/tests/test_verify_pytest_n_operator_cap.py
+# each point HERE and deliberately keep only what is local to them, rather than
+# re-paraphrasing what follows: several copies of one rationale drift apart
+# silently, which is the same failure this key's guard test exists to prevent.
+#
+# REACHES ROLES {task, background} ONLY. `merge` is deliberately never
+# -n-capped: it bypasses admission slot-counting and is latency-critical
+# (verify.py gates the cap on `role in {'task','background'}`).
+#
+# INTERIM, PENDING TASK 3589 — do NOT close 3589 on the back of this. 3589 puts
+# `-n 8` in `addopts` (orchestrator/pyproject.toml, fused-memory/pyproject.toml)
+# and thereby ALSO covers merge verifies, the offline lane, and agent-initiated
+# pytest inside the implement phase — none of which this knob reaches, since it
+# lives entirely inside verify.py and nothing outside it is touched. When 3589
+# lands, reconcile the two to the same value and state in that commit which
+# layer is authoritative.
+#
+# GREEN-TIER hot-reloadable (RELOADABLE_FIELDS, config.py:5250): reverting to
+# "auto" (or deleting this key) restores the previous behaviour instantly, with
+# no restart and no code change.
+#
+# MEASURED BASIS FOR 8, from task 3589's loaded-host ladder:
+#   - vs n=16: ~108% wall clock at ~61% of CPU-seconds and ~50% of RAM.
+#   - vs n=32: both FASTER (9.31s vs 12.27s) AND 2.7x cheaper in CPU-seconds.
+#   - ~446 MB per-worker RSS, so a fleet drops ~14.3 GB -> ~3.6 GB against
+#     orchestrator-dark-factory.service's 13 GiB memory.current / 11.6 GiB anon
+#     (re-measured 2026-08-19, unchanged from 2026-08-03).
+#
+# CONTRARY EVIDENCE — explicitly considered, not overridden by oversight:
+# plans/verify-oversubscription-benchmark-2026-07-14.md (the T6 report)
+# recommended KEEPING 'auto', because no clean idle window was obtainable on
+# this host, and nominated `-n 16` as the next candidate. That candidate was
+# considered and not chosen. 3589's loaded-host ladder POSTDATES the report.
+# Anyone reopening the value question must reconcile BOTH sources rather than
+# cite either alone; that report carries a dated addendum pointing back here.
+#
+# The CODE DEFAULT is unchanged at 'auto' — this is a deployment-value
+# decision for dark_factory, not a change to what the knob ships as.
+#
+# EXECUTABLE HALF: orchestrator/tests/test_verify_pytest_n_operator_cap.py
+# pins this value and its role gating. Its EXPECTED_COMMITTED_PYTEST_N must
+# move in the SAME COMMIT as any change to the value below.
+verify_admission_pytest_n: "8"
+
 # Fused memory HTTP server — port 8002
 # Port scheme: reify=xxx0, autopilot-video=xxx1, dark-factory=xxx2
 fused_memory:
