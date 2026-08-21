@@ -22,6 +22,7 @@ from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from shared.cost_store import CostStore
 
+import orchestrator.digest as digest
 from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventStore
 from orchestrator.harness import Harness
@@ -1678,6 +1679,143 @@ class TestHarnessMaybeWriteDigest:
         )
 
     @pytest.mark.asyncio
+    async def test_ewa_numerator_is_submissions_not_events(
+        self, tmp_path: Path, _cost_store_factory
+    ) -> None:
+        """The gate fires on lifecycle events; the EWA numerator uses submissions only.
+
+        Task 4559.  20 lifecycle events satisfy the gate of 10, but only 4 of
+        them were submissions.  With alpha=1.0 the EWA collapses to the raw
+        ratio, so the numerator is directly observable: it must be 4.0 (4
+        submissions / max(0 dones, 1)) and NOT 20.0.
+
+        Both snapshots advance to their own entry values, so the two counters
+        stay independently correct across digest steps.
+        """
+        harness, _, _ = _make_harness_with_mocks(tmp_path)
+        harness.config = OrchestratorConfig(
+            project_root=tmp_path,
+            digest_every_n_escalations=10,
+            digest_ewa_alpha=1.0,        # EWA collapses to the raw ratio
+            digest_ewa_threshold=999.0,  # high threshold — no trip
+        )
+        harness.cost_store = await _cost_store_factory()
+        harness._escalation_event_count = 20   # gate: 20 >= 10
+        harness._escalation_submit_count = 4   # numerator
+        harness._last_digest_event_count = 0
+        harness._last_digest_submit_count = 0
+
+        await harness._maybe_write_digest()
+
+        digest_dir = tmp_path / 'data' / 'digests'
+        files = list(digest_dir.glob('digest-*.md'))
+        assert len(files) == 1, (
+            f'Expected the gate (20 lifecycle events >= 10) to fire one digest; got {files}'
+        )
+        assert harness._ewa_value == pytest.approx(4.0), (
+            f'Expected EWA 4.0 (4 submissions / max(0 dones, 1)); '
+            f'got {harness._ewa_value} — 20.0 would mean the numerator is '
+            f'still the lifecycle-event count'
+        )
+        assert harness._last_digest_event_count == 20, (
+            f'Expected the event snapshot to advance to 20; '
+            f'got {harness._last_digest_event_count}'
+        )
+        assert harness._last_digest_submit_count == 4, (
+            f'Expected the submissions snapshot to advance to 4; '
+            f'got {harness._last_digest_submit_count}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_backlog_drain_decays_ewa_instead_of_tripping(
+        self, tmp_path: Path, _cost_store_factory
+    ) -> None:
+        """The headline defect: a pure backlog drain decays the EWA and does not trip.
+
+        Models the 2026-08-20 window — 196 escalation-lifecycle events, of which
+        ZERO were new submissions (the window drained a pre-existing backlog),
+        with the landing collapse giving 0 dones.
+
+        Phase A starts from ``_ewa_value = 73.59``, the recorded trip value the
+        OLD statistic produced, and shows the drain now moves it DOWN
+        (0.7 * 73.59 = 51.513).  One decay step from 73.59 is still above 24.6,
+        so the halt correctly persists there; the no-trip claim is therefore
+        asserted in phase B, at the only starting point where it can hold — a
+        healthy pre-window EWA.  See esc-4559-5: the plan's single-phase form of
+        this test asserted 51.513 and ``is_paused is False`` together, which is
+        arithmetically impossible since 51.513 >= 24.6.
+
+        Phase B replays the same 196-event drain from a healthy prev_ewa=4.0.
+        The NEW statistic gives 2.8 and leaves the scheduler running; the OLD
+        statistic on the byte-identical window gives 61.6 >= 24.6 and would have
+        tripped.  The contrast is computed through digest.update_ewa itself, so
+        it is exact rather than prose.
+        """
+        # --- Phase A: an already-tripped EWA decays under a pure-drain window ---
+        harness, _, _ = _make_harness_with_mocks(tmp_path)
+        harness.config = OrchestratorConfig(
+            project_root=tmp_path,
+            digest_every_n_escalations=10,
+            digest_ewa_alpha=0.3,
+            digest_ewa_threshold=24.6,
+        )
+        harness.cost_store = await _cost_store_factory()
+        harness._escalation_event_count = 196   # gate satisfied by resolutions alone
+        harness._escalation_submit_count = 0    # zero submissions — a pure drain
+        harness._last_digest_event_count = 0
+        harness._last_digest_submit_count = 0
+        harness._ewa_value = 73.59              # the recorded 2026-08-20 trip value
+
+        await harness._maybe_write_digest()
+
+        files = list((tmp_path / 'data' / 'digests').glob('digest-*.md'))
+        assert len(files) == 1, (
+            f'Expected the drain window to still fire a digest — that is what '
+            f'lets a tripped EWA decay at all; got {files}'
+        )
+        assert harness._ewa_value == pytest.approx(51.513), (
+            f'Expected 51.513 (= 0.7 * 73.59, pure decay); got {harness._ewa_value}'
+        )
+        assert harness._ewa_value < 73.59, (
+            'A pure-drain window must move the EWA DOWN, never up'
+        )
+
+        # --- Phase B: the same drain from a healthy EWA does not trip --------
+        harness_b, _, _ = _make_harness_with_mocks(tmp_path / 'b')
+        harness_b.config = OrchestratorConfig(
+            project_root=tmp_path / 'b',
+            digest_every_n_escalations=10,
+            digest_ewa_alpha=0.3,
+            digest_ewa_threshold=24.6,
+        )
+        harness_b.cost_store = await _cost_store_factory('cost_b.db')
+        harness_b._escalation_event_count = 196
+        harness_b._escalation_submit_count = 0
+        harness_b._last_digest_event_count = 0
+        harness_b._last_digest_submit_count = 0
+        harness_b._ewa_value = 4.0              # healthy pre-window EWA
+
+        await harness_b._maybe_write_digest()
+
+        assert harness_b._ewa_value == pytest.approx(2.8), (
+            f'Expected 2.8 (= 0.7 * 4.0); got {harness_b._ewa_value}'
+        )
+        assert harness_b.scheduler.is_paused is False, (
+            'Draining a backlog must not trip the breaker that the backlog caused'
+        )
+        # The identical window under the OLD statistic (resolutions counted in
+        # the numerator) would have tripped — computed, not asserted in prose.
+        old_statistic = digest.update_ewa(
+            prev_ewa=4.0, escalations_in_step=196, done_in_step=0, alpha=0.3
+        )
+        assert old_statistic == pytest.approx(61.6), (
+            f'Expected the old statistic to give 61.6; got {old_statistic}'
+        )
+        assert old_statistic >= 24.6, (
+            'Sanity: the old statistic must trip on this window — that is the defect'
+        )
+
+    @pytest.mark.asyncio
     async def test_disabled_skips_write(
         self, tmp_path: Path, _cost_store_factory
     ) -> None:
@@ -2098,6 +2236,46 @@ class TestHarnessDigestEscalationCounterSnapshot:
         assert harness._last_digest_event_count == 5, (
             f'Expected _last_digest_event_count=5 (entry snapshot); '
             f'got {harness._last_digest_event_count} '
+            f'(live value after concurrent +100 would be 105)'
+        )
+
+    @pytest.mark.asyncio
+    async def test_submit_counter_snapshotted_at_entry(
+        self, tmp_path: Path, _cost_store_factory
+    ) -> None:
+        """_last_digest_submit_count advances to the entry snapshot, not the live value.
+
+        Task 4559: the submissions counter is the EWA numerator and must obey
+        the same once-at-entry discipline as the event counter — otherwise a
+        submission arriving at the cost_in_window await point would be silently
+        skipped by the advance instead of counted in the next digest step.
+        """
+        harness, _, _ = _make_harness_with_mocks(tmp_path)
+        harness.config = OrchestratorConfig(
+            project_root=tmp_path,
+            digest_every_n_escalations=3,   # diff=5 >= 3 → triggers
+            digest_ewa_threshold=999.0,
+        )
+        harness.cost_store = await _cost_store_factory()
+        harness._escalation_event_count = 5
+        harness._last_digest_event_count = 0
+        harness._escalation_submit_count = 5
+        harness._last_digest_submit_count = 0
+
+        from orchestrator.digest import CostStats
+
+        def _concurrent_bump(*_args, **_kwargs):
+            harness._escalation_submit_count += 100
+            return CostStats()
+
+        with patch(
+            'orchestrator.digest.cost_in_window', new=AsyncMock(side_effect=_concurrent_bump)
+        ):
+            await harness._maybe_write_digest()
+
+        assert harness._last_digest_submit_count == 5, (
+            f'Expected _last_digest_submit_count=5 (entry snapshot); '
+            f'got {harness._last_digest_submit_count} '
             f'(live value after concurrent +100 would be 105)'
         )
 
