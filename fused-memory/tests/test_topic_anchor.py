@@ -10,7 +10,11 @@ from __future__ import annotations
 
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.memory import MemoryResult
-from fused_memory.services.topic_anchor import extract_anchor_topics
+from fused_memory.services.topic_anchor import (
+    _CHILD_KINDS,
+    extract_anchor_topics,
+    select_canonical_payload,
+)
 
 
 def _result(
@@ -143,3 +147,243 @@ class TestExtractAnchorTopics:
         results = [_result('m1', topic=...), _result('m2', topic=...)]
 
         assert extract_anchor_topics(results, max_topics=3) == []
+
+
+def _payload(
+    id_: str = 'c1',
+    *,
+    created_at: object = '2026-08-01T00:00:00+00:00',
+    metadata: object = ...,
+    **meta_overrides: object,
+) -> dict:
+    """Build a raw scroll dict of the shape get_memories_by_metadata returns.
+
+    ``{'id', 'created_at', 'metadata': <FULL raw Qdrant payload>}`` — note the
+    metadata is the unprocessed payload, so its keys and value types are NOT
+    schema-enforced here.  Pass ``metadata=`` explicitly to inject a malformed
+    (absent/non-dict) payload; otherwise *meta_overrides* build a well-formed
+    one, with ``...`` meaning "omit this key".
+    """
+    if metadata is ...:
+        base: dict = {
+            'canonical': True,
+            'topic': 'harness-layout-gate-decision-rule',
+            'category': 'procedural_knowledge',
+            'data': 'the consolidated canonical body',
+        }
+        for key, value in meta_overrides.items():
+            if value is ...:
+                base.pop(key, None)
+            else:
+                base[key] = value
+        metadata = base
+    return {'id': id_, 'created_at': created_at, 'metadata': metadata}
+
+
+class TestSelectCanonicalPayload:
+    """The pure selector that picks WHICH scrolled payload gets pinned."""
+
+    def test_selects_the_strictly_canonical_payload(self):
+        """canonical is a validated bool; the read side matches on identity."""
+        payloads = [
+            _payload('c0', canonical=...),
+            _payload('c1', canonical=True),
+        ]
+
+        selected = select_canonical_payload(payloads, allowed_categories=None,
+                                            include_planned=False)
+
+        assert selected is not None
+        assert selected['id'] == 'c1'
+
+    def test_truthy_non_bools_are_rejected(self):
+        """`1 == True` in Python, so truthiness would admit an int as canonical.
+
+        Mirrors the write-side predicate at memory_service.py:940
+        (``meta.get('canonical') is not True``) so both sides of the vocabulary
+        agree on what "canonical" means.
+        """
+        for truthy in (1, 'true', 'True', 'yes', [1], 1.0):
+            payloads = [_payload('c1', canonical=truthy)]
+
+            assert select_canonical_payload(
+                payloads, allowed_categories=None, include_planned=False
+            ) is None, f'{truthy!r} must not read as canonical'
+
+    def test_returns_none_when_nothing_is_canonical(self):
+        payloads = [_payload('c1', canonical=False), _payload('c2', canonical=...)]
+
+        assert select_canonical_payload(
+            payloads, allowed_categories=None, include_planned=False
+        ) is None
+
+    def test_returns_none_for_empty_input(self):
+        assert select_canonical_payload(
+            [], allowed_categories=None, include_planned=False
+        ) is None
+
+    def test_allowed_categories_excludes_out_of_scope_canonicals(self):
+        """Anchoring may change WHICH member of the permitted set is returned, never widen it."""
+        payloads = [_payload('c1', category='observations_and_summaries')]
+
+        assert select_canonical_payload(
+            payloads,
+            allowed_categories={'procedural_knowledge'},
+            include_planned=False,
+        ) is None
+
+    def test_allowed_categories_none_permits_any_category(self):
+        """An unscoped search filters nothing, so neither does the pin."""
+        payloads = [_payload('c1', category='observations_and_summaries')]
+
+        selected = select_canonical_payload(payloads, allowed_categories=None,
+                                            include_planned=False)
+
+        assert selected is not None and selected['id'] == 'c1'
+
+    def test_planned_payloads_excluded_unless_include_planned(self):
+        payloads = [_payload('c1', planned=True)]
+
+        assert select_canonical_payload(
+            payloads, allowed_categories=None, include_planned=False
+        ) is None
+        assert select_canonical_payload(
+            payloads, allowed_categories=None, include_planned=True
+        )['id'] == 'c1'
+
+    def test_child_shaped_payloads_excluded_even_when_canonical(self):
+        """A child would be folded into its PARENT at index 0 by grouped_read.
+
+        ``grouped_read._suppress_child`` (:685-691) runs AFTER
+        ``MemoryService.search``, so pinning a child-shaped record would let
+        the boundary silently swap slot 0 for that record's parent — a
+        different record than the one the pin selected.  Exclude at selection
+        time rather than relying on well-formed writes.
+        """
+        for kind in sorted(_CHILD_KINDS):
+            payloads = [_payload('c1', kind=kind, parent_id='parent-uuid-0001')]
+
+            assert select_canonical_payload(
+                payloads, allowed_categories=None, include_planned=False
+            ) is None, f'child-shaped {kind} must not be pinned'
+
+    def test_child_kinds_matches_the_grouped_read_registry(self):
+        """Anti-drift pin on a DELIBERATE duplication.
+
+        server/grouped_read.py imports _MEM0_CONTENT_KEYS from
+        services/memory_service.py, so a services -> server import here would
+        close an import cycle. The constant is therefore restated locally; this
+        assertion is what stops the two copies drifting apart silently.
+        """
+        from fused_memory.server.grouped_read import CHILD_KINDS
+
+        assert _CHILD_KINDS == CHILD_KINDS
+
+    def test_child_kind_without_parent_id_is_not_child_shaped(self):
+        """BOTH halves are required — a kind alone cannot be suppressed upward."""
+        for parent_id in (..., '', None, 7, []):
+            payloads = [_payload('c1', kind='amendment', parent_id=parent_id)]
+
+            selected = select_canonical_payload(
+                payloads, allowed_categories=None, include_planned=False
+            )
+            assert selected is not None, f'parent_id={parent_id!r} is not a real parent link'
+            assert selected['id'] == 'c1'
+
+    def test_parent_id_without_child_kind_is_not_child_shaped(self):
+        """Ditto the other half — a non-child kind is never suppressed."""
+        for kind in (..., '', None, 7, 'decision'):
+            payloads = [_payload('c1', kind=kind, parent_id='parent-uuid-0001')]
+
+            selected = select_canonical_payload(
+                payloads, allowed_categories=None, include_planned=False
+            )
+            assert selected is not None, f'kind={kind!r} is not a child kind'
+
+    def test_tie_break_is_most_recent_then_lowest_id(self):
+        """Duplicate canonicals are REACHABLE, not theoretical.
+
+        3198's per-(project, topic) uniqueness enforcement ships warn-mode
+        first (``memory_metadata.enforce`` defaults false), so two canonicals
+        on one topic can land via ordinary writes. The selector must still
+        return ONE record, deterministically.
+        """
+        older = _payload('a-old', created_at='2026-08-01T00:00:00+00:00')
+        newer = _payload('b-new', created_at='2026-08-09T00:00:00+00:00')
+
+        selected = select_canonical_payload([older, newer], allowed_categories=None,
+                                            include_planned=False)
+
+        assert selected['id'] == 'b-new'
+
+    def test_tie_break_falls_through_to_lowest_id(self):
+        """Same timestamp: the id is the total-order tiebreak."""
+        same_time = '2026-08-09T00:00:00+00:00'
+        payloads = [
+            _payload('zzz', created_at=same_time),
+            _payload('aaa', created_at=same_time),
+            _payload('mmm', created_at=same_time),
+        ]
+
+        selected = select_canonical_payload(payloads, allowed_categories=None,
+                                            include_planned=False)
+
+        assert selected['id'] == 'aaa'
+
+    def test_tie_break_is_stable_across_input_permutations(self):
+        """Order-independence is the point — scroll order is not guaranteed."""
+        import itertools
+
+        payloads = [
+            _payload('a-old', created_at='2026-08-01T00:00:00+00:00'),
+            _payload('b-new', created_at='2026-08-09T00:00:00+00:00'),
+            _payload('c-new', created_at='2026-08-09T00:00:00+00:00'),
+        ]
+
+        picks = {
+            select_canonical_payload(list(perm), allowed_categories=None,
+                                     include_planned=False)['id']
+            for perm in itertools.permutations(payloads)
+        }
+
+        assert picks == {'b-new'}
+
+    def test_missing_or_non_str_created_at_sorts_oldest_and_never_raises(self):
+        """An absent timestamp must not win the recency tie-break, nor crash the sort."""
+        payloads = [
+            _payload('a-undated', created_at=None),
+            _payload('b-dated', created_at='2026-01-01T00:00:00+00:00'),
+        ]
+
+        selected = select_canonical_payload(payloads, allowed_categories=None,
+                                            include_planned=False)
+
+        assert selected['id'] == 'b-dated'
+
+    def test_malformed_payloads_degrade_to_not_canonical(self):
+        """Raw payloads are not schema-enforced at read time — degrade, never raise."""
+        malformed = [
+            {'id': 'c1', 'created_at': None},                       # no metadata key at all
+            {'id': 'c2', 'created_at': None, 'metadata': None},     # metadata None
+            {'id': 'c3', 'created_at': None, 'metadata': 'nope'},   # metadata not a dict
+            {'id': 'c4', 'created_at': None, 'metadata': []},       # metadata wrong container
+            'not-a-dict-at-all',                                    # payload itself malformed
+            None,
+        ]
+
+        assert select_canonical_payload(
+            malformed, allowed_categories=None, include_planned=False
+        ) is None
+
+    def test_malformed_payloads_do_not_shadow_a_real_canonical(self):
+        """Junk in the scroll result must not suppress the record that IS canonical."""
+        payloads = [
+            {'id': 'junk', 'metadata': 'nope'},
+            None,
+            _payload('c1', canonical=True),
+        ]
+
+        selected = select_canonical_payload(payloads, allowed_categories=None,
+                                            include_planned=False)
+
+        assert selected is not None and selected['id'] == 'c1'
