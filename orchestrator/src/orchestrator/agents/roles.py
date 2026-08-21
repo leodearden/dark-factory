@@ -119,7 +119,7 @@ _ESCALATION_TOOLS = [
 # STEWARD's route, not yours" -- correct for the six non-steward escalating
 # roles below, but wrong for STEWARD itself, whose own body mandates
 # `escalate_blocker(..., level=1)` re-escalation in four places (Rule 2
-# be-conservative, Rule 6 wip_conflict/unmerged_state, MAX_TURNS,
+# be-conservative, Rule 6 merge-halt categories, MAX_TURNS,
 # CLI_INPUT_REJECTED -- see STEWARD's system_prompt below). Appending the
 # "not yours" gate after those mandates made the steward's LAST-read
 # instruction about escalation levels contradict its own mandated recourse.
@@ -1560,6 +1560,82 @@ ARCHITECT.system_prompt = ARCHITECT.system_prompt + _FOLLOWUP_FILING_INSTRUCTION
 IMPLEMENTER.system_prompt = IMPLEMENTER.system_prompt + _FOLLOWUP_FILING_INSTRUCTIONS
 
 
+MERGE_HALT_ESCALATION_CATEGORIES: tuple[str, ...] = (
+    'wip_conflict', 'unmerged_state', 'stash_failed',
+)
+"""Escalation categories that OWN a merge-queue halt.
+
+The authority for this membership is the ``esc.category in {...}`` gate in
+:meth:`orchestrator.harness.Harness._rehydrate_merge_halt` (cited by name --
+roles.py and harness.py both churn, and a hand-copied line number goes stale
+silently; every offset in task 4130's own brief had already drifted before the
+work started).  When an escalation in one of these categories is pending at
+level 1, the ENTIRE merge queue is stopped until that specific escalation is
+resolved -- which is why the steward must never try to auto-resolve one.
+
+``stash_failed`` (task 2758) is the main-checkout-hygiene member: ``advance_main``
+could not park project_root's dirty tracked WIP, so the queue halts once rather
+than failing task after task.
+
+Membership here is a correctness requirement, not a preference: it is checked
+against the harness gate at CI time by
+``test_roles_merge_halt_safety.test_safety_rule_categories_match_the_harness_gate``,
+and every member is required to be named in :data:`MERGE_HALT_SAFETY_RULE` by
+its sibling test.  Task 3870 corrected the same two-of-three framing twice and
+it recurred both times, because no site was mechanically tied to the gate.
+
+When task 3859 lands a shared ``MERGE_HALT_CATEGORIES`` constant, REPLACE this
+tuple with an import of it rather than letting it become a fourth independent
+spelling of the same set.
+
+Do NOT substitute either near-miss constant for this one -- they are different
+vocabularies that merely share the ``stash_failed`` token.
+:data:`orchestrator.merge_queue._HALT_ADVANCE_RESULTS` holds ``advance_main``
+RESULT codes (its ``wip_overlap`` / ``pop_conflict`` /
+``pop_conflict_no_advance`` members are not escalation categories at all), and
+:data:`orchestrator.stranded_verified_green.DURABLE_MERGE_FAILURE_STATUSES`
+holds ``MergeOutcome.status`` values.  Splicing either into the steward's
+safety rule would widen it with categories that do not exist and break the
+harness-coherence anchor."""
+
+
+MERGE_HALT_SAFETY_RULE: str = """\
+6. **Working-tree conflict escalations (`wip_conflict`, `unmerged_state`, or
+   `stash_failed` category).**
+   NEVER attempt to auto-resolve these. All three indicate project_root is in a state that
+   only a human can safely inspect — `wip_conflict` means the merge queue corrupted the
+   user's uncommitted work; `unmerged_state` means project_root already had UU/AA/DD
+   markers before the merge attempted to advance; `stash_failed` means the merge queue
+   could not park project_root's dirty tracked WIP before advancing, so the main checkout
+   still holds uncommitted work that only a human may triage. Do NOT run destructive git
+   commands (`git reset`, `git checkout -- .`, `git stash`, `git stash pop`,
+   `git stash drop/clear`, `git restore`, `git clean`) against the main project root.
+   For `stash_failed` the stash-shaped "recovery" is exactly the FORBIDDEN action, not the
+   fix: `refs/stash` is ONE ref shared by every worktree in the checkout, so a pop can
+   apply an unrelated task's WIP into your tree, and the merge worker's advance path
+   consumes the same stack (incident 13674d3c68). Instead, immediately re-escalate by
+   calling `escalate_blocker(..., level=1)`, preserving the original category
+   (`wip_conflict`, `unmerged_state`, or `stash_failed`) and
+   `suggested_action='manual_intervention'`.
+"""
+"""STEWARD Rule 6: never auto-resolve a merge-halt escalation.
+
+Lifted out of STEWARD's inline prompt body into a named constant (task 4130) so
+``test_roles_merge_halt_safety.py`` can guard it structurally.  That file's
+family rule -- stated in ``test_roles_wait_pattern.py`` -- is that the only
+sanctioned assertion shape is ``SOME_CONSTANT in ROLES[name].system_prompt``,
+"never a string literal asserted against a constant's prose"; with the rule
+inline there was nothing named to assert against, so the categories could (and
+did, three times) drift out of sync with the harness gate unnoticed.
+
+Every member of :data:`MERGE_HALT_ESCALATION_CATEGORIES` must be named here.
+The destructive-command prohibition and the ``level=1`` re-escalate recourse
+deliberately live in this SAME constant as the category list, so no future
+prompt refactor can splice the categories away from the prohibition that makes
+them load-bearing, or leave the handler forbidden every action with no stated
+alternative."""
+
+
 _STEWARD_MEMORY_TOOLS = [
     'mcp__fused-memory__search',
     'mcp__fused-memory__get_entity',
@@ -1670,17 +1746,7 @@ wording differs.
 4. **Resolve each escalation** by calling `resolve_issue` with a summary of what you did.
 5. **For raw suggestions:** Read the code at each location, search memory and tasks for
    duplicates, then classify and act. Maximum 50 tasks per triage batch.
-6. **Working-tree conflict escalations (`wip_conflict` or `unmerged_state` category).**
-   NEVER attempt to auto-resolve these. Both indicate project_root is in a state that only
-   a human can safely inspect — `wip_conflict` means the merge queue corrupted the user's
-   uncommitted work; `unmerged_state` means project_root already had UU/AA/DD markers
-   before the merge attempted to advance. Do NOT run destructive git commands (`git reset`,
-   `git checkout -- .`, `git stash drop/clear`, `git restore`, `git clean`) against the
-   main project root. Instead, immediately re-escalate by calling
-   `escalate_blocker(..., level=1)`, preserving the original category
-   (`wip_conflict` or `unmerged_state`) and
-   `suggested_action='manual_intervention'`.
-
+""" + MERGE_HALT_SAFETY_RULE + """
 ## CRITICAL: Git Staging Rules
 
 Task metadata now lives in the sibling `<worktree_base>/.task-meta/<worktree-name>/`
