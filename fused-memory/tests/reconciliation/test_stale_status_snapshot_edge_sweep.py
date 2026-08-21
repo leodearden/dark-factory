@@ -53,12 +53,20 @@ from fused_memory.reconciliation.stale_status_snapshot_edge_sweep import (
 
 
 def _make_memory_service() -> MagicMock:
-    """MagicMock memory_service with an AsyncMock .graphiti and .update_edge
-    (mirrors test_degenerate_task_node_sweep.py's _make_memory_service)."""
+    """MagicMock memory_service with an AsyncMock .graphiti, .update_edge and
+    .add_memory (mirrors test_degenerate_task_node_sweep.py's
+    _make_memory_service).
+
+    ``.add_memory`` must be an AsyncMock explicitly: a bare MagicMock
+    attribute returns a MagicMock, and awaiting one raises TypeError — so
+    without this every supersede-write path would fail for the wrong reason.
+    (task 3037)
+    """
     memory_service = MagicMock()
     memory_service.graphiti = MagicMock()
     memory_service.graphiti.get_all_valid_edges = AsyncMock(return_value={})
     memory_service.update_edge = AsyncMock()
+    memory_service.add_memory = AsyncMock()
     return memory_service
 
 
@@ -2366,7 +2374,11 @@ class TestSweepStaleStatusSnapshotEdgesCore:
             'Expected get_statuses called with only the referenced candidate ids'
         )
 
-        assert stats == {'scanned': 2, 'candidate_edges': 1, 'invalidated': 1, 'errors': 0}, (
+        assert stats == {
+            'scanned': 2, 'candidate_edges': 1,
+            'invalidated': 1, 'errors': 0,
+            'superseded': 0, 'supersede_errors': 0,
+        }, (
             f'Expected exactly the stale edge counted+invalidated, got stats={stats!r}'
         )
 
@@ -2414,7 +2426,11 @@ class TestSweepStaleStatusSnapshotEdgesCore:
             run_id='run-2885', now=now,
         )
 
-        assert stats == {'scanned': 3, 'candidate_edges': 2, 'invalidated': 2, 'errors': 0}, (
+        assert stats == {
+            'scanned': 3, 'candidate_edges': 2,
+            'invalidated': 2, 'errors': 0,
+            'superseded': 0, 'supersede_errors': 0,
+        }, (
             f'Expected both blocked-worded task-2885 edges invalidated and the '
             f'still-blocked control edge left alone, got stats={stats!r}'
         )
@@ -2504,7 +2520,11 @@ class TestSweepStaleStatusSnapshotEdgesCore:
             run_id='run-3079', now=now,
         )
 
-        assert stats == {'scanned': 3, 'candidate_edges': 2, 'invalidated': 2, 'errors': 0}, (
+        assert stats == {
+            'scanned': 3, 'candidate_edges': 2,
+            'invalidated': 2, 'errors': 0,
+            'superseded': 0, 'supersede_errors': 0,
+        }, (
             f'Expected both repro-shape edges invalidated and the still-pending '
             f'control edge left alone, got stats={stats!r}'
         )
@@ -2776,6 +2796,204 @@ class TestSweepStaleStatusSnapshotEdgesBlockedRuleAndCounters:
                 f'come from a single by-class extraction per edge.'
             )
 
+class TestSweepStaleStatusSnapshotEdgesSupersedeWrite:
+    """After retiring a stale blocked assertion the sweep writes ONE
+    superseding resulting-state-only temporal_fact per contradicted task per
+    cycle (task 3037).
+
+    The invalidation alone leaves the graph with a hole: the old assertion is
+    gone and nothing records what replaced it, so the next reader has to
+    re-derive the status from the task table. prompts/stage1.py already
+    prescribes this invalidate-then-supersede pair for the Stage-1 agent; the
+    sweep now performs it deterministically for blocked-status snapshot edges
+    instead of leaving the agent to rediscover it per finding.
+    """
+
+    BLOCKED_FACT = 'Task 2848 remains blocked as of 2026-07-22'
+    NOW = datetime(2026, 8, 21, 12, 0, 0, tzinfo=UTC)
+
+    def _sweep_kwargs(self) -> dict:
+        return {'run_id': 'run-3037', 'now': self.NOW}
+
+    @pytest.mark.asyncio
+    async def test_supersede_fact_written_after_successful_invalidation(self):
+        """One add_memory per contradicted task, with the full write envelope."""
+        memory_service = _make_memory_service()
+        taskmaster = _make_taskmaster()
+        memory_service.graphiti.get_all_valid_edges = AsyncMock(
+            return_value={'entity-a': [
+                {'uuid': 'edge-2848', 'fact': self.BLOCKED_FACT, 'name': ''},
+            ]},
+        )
+        taskmaster.get_statuses = AsyncMock(return_value={'2848': 'pending'})
+
+        stats = await sweep_stale_status_snapshot_edges(
+            memory_service, taskmaster, 'test_project', '/tmp/reify',
+            **self._sweep_kwargs(),
+        )
+
+        memory_service.add_memory.assert_awaited_once()
+        call = memory_service.add_memory.await_args
+        content = call.kwargs.get('content', call.args[0] if call.args else None)
+        assert content == build_supersede_fact(2848, 'pending', self.NOW), (
+            f'Expected the resulting-state-only superseding fact, got {content!r}'
+        )
+        assert call.kwargs.get('category') == 'temporal_facts', (
+            f'Expected the superseding fact routed to temporal_facts, got {call!r}'
+        )
+        assert call.kwargs.get('project_id') == 'test_project'
+        assert call.kwargs.get('agent_id') == 'recon-stage-memory_consolidator', (
+            "Expected the write stamped with the sweep's stable agent_id, so its "
+            f'writes are attributable in the write journal, got {call!r}'
+        )
+        assert call.kwargs.get('causation_id') == 'run-3037'
+
+        assert stats['superseded'] == 1
+        assert stats['supersede_errors'] == 0
+
+    @pytest.mark.asyncio
+    async def test_supersede_write_is_deduped_to_one_per_task_per_cycle(self):
+        """Two distinct edges naming the same task -> ONE superseding write.
+
+        A contradicted task typically has several blocked-assertion edges
+        (one per phrasing Graphiti extracted). Writing per EDGE would emit
+        the identical fact several times in a single cycle and flood the
+        graph with duplicates that the consolidation pass then has to clean
+        up.
+        """
+        memory_service = _make_memory_service()
+        taskmaster = _make_taskmaster()
+        memory_service.graphiti.get_all_valid_edges = AsyncMock(
+            return_value={'entity-a': [
+                {'uuid': 'edge-a', 'fact': self.BLOCKED_FACT, 'name': ''},
+                {'uuid': 'edge-b', 'fact': 'Task 2848 is currently blocked', 'name': ''},
+            ]},
+        )
+        taskmaster.get_statuses = AsyncMock(return_value={'2848': 'pending'})
+
+        stats = await sweep_stale_status_snapshot_edges(
+            memory_service, taskmaster, 'test_project', '/tmp/reify',
+            **self._sweep_kwargs(),
+        )
+
+        assert memory_service.update_edge.await_count == 2, (
+            'Both edges assert the stale blocked status, so both must be retired'
+        )
+        assert memory_service.add_memory.await_count == 1, (
+            f'Expected exactly ONE superseding fact for task 2848 across the cycle, '
+            f'got {memory_service.add_memory.await_count}'
+        )
+        assert stats['superseded'] == 1
+
+    @pytest.mark.asyncio
+    async def test_no_supersede_write_when_the_invalidation_failed(self):
+        """update_edge raised -> no superseding fact for that edge.
+
+        The write is gated on a SUCCESSFUL invalidation. Writing anyway would
+        leave the graph asserting both that task 2848 is blocked (the edge is
+        still valid) and that it is pending — a self-contradiction, and one
+        the sweep would repeat every cycle since the un-invalidated edge
+        re-enumerates.
+        """
+        memory_service = _make_memory_service()
+        taskmaster = _make_taskmaster()
+        memory_service.graphiti.get_all_valid_edges = AsyncMock(
+            return_value={'entity-a': [
+                {'uuid': 'edge-2848', 'fact': self.BLOCKED_FACT, 'name': ''},
+            ]},
+        )
+        taskmaster.get_statuses = AsyncMock(return_value={'2848': 'pending'})
+        memory_service.update_edge = AsyncMock(side_effect=RuntimeError('lock contention'))
+
+        stats = await sweep_stale_status_snapshot_edges(
+            memory_service, taskmaster, 'test_project', '/tmp/reify',
+            **self._sweep_kwargs(),
+        )
+
+        memory_service.add_memory.assert_not_awaited()
+        assert stats['superseded'] == 0
+        assert stats['errors'] == 1
+
+    @pytest.mark.asyncio
+    async def test_no_supersede_write_for_a_terminal_rule_invalidation(self):
+        """A done/cancelled invalidation writes NO superseding fact.
+
+        The supersede write belongs to the BLOCKED rule only. Keeping it so
+        is what makes 'superseded' a faithful per-step counter for the new
+        deterministic step rather than a second, noisier copy of
+        'invalidated' — and a terminal task's status is already recorded by
+        the task table and the done-transition reconciliation; re-asserting
+        it here would add nothing.
+        """
+        memory_service = _make_memory_service()
+        taskmaster = _make_taskmaster()
+        memory_service.graphiti.get_all_valid_edges = AsyncMock(
+            return_value={'entity-a': [
+                {'uuid': 'edge-142', 'fact': 'Task 142 is an active pending task', 'name': ''},
+            ]},
+        )
+        taskmaster.get_statuses = AsyncMock(return_value={'142': 'done'})
+
+        stats = await sweep_stale_status_snapshot_edges(
+            memory_service, taskmaster, 'test_project', '/tmp/reify',
+            **self._sweep_kwargs(),
+        )
+
+        assert stats['invalidated'] == 1
+        memory_service.add_memory.assert_not_awaited()
+        assert stats['superseded'] == 0
+
+    @pytest.mark.asyncio
+    async def test_blocked_task_that_went_terminal_supersedes_on_the_blocked_rule(self):
+        """A blocked assertion whose task went DONE is contradicted by BOTH
+        rules; it still yields exactly one superseding fact.
+
+        Both rules select the edge, but only one invalidation happens and the
+        supersede write keys on the blocked rule's own contradiction test —
+        'done' is positively known and is not 'blocked' — so the counter
+        stays exactly one per contradicted task.
+        """
+        memory_service = _make_memory_service()
+        taskmaster = _make_taskmaster()
+        memory_service.graphiti.get_all_valid_edges = AsyncMock(
+            return_value={'entity-a': [
+                {'uuid': 'edge-2848', 'fact': self.BLOCKED_FACT, 'name': ''},
+            ]},
+        )
+        taskmaster.get_statuses = AsyncMock(return_value={'2848': 'done'})
+
+        stats = await sweep_stale_status_snapshot_edges(
+            memory_service, taskmaster, 'test_project', '/tmp/reify',
+            **self._sweep_kwargs(),
+        )
+
+        assert stats['invalidated'] == 1
+        assert stats['superseded'] == 1
+        content = memory_service.add_memory.await_args.kwargs.get('content')
+        assert content == build_supersede_fact(2848, 'done', self.NOW)
+
+    @pytest.mark.asyncio
+    async def test_stats_gains_superseded_and_supersede_errors_keys(self):
+        """Both new keys are present and zero on a run with nothing to do.
+
+        'supersede_errors' is a SEPARATE key rather than a contribution to
+        'errors' so the counter invariant
+        ``invalidated == candidate_edges - errors`` stays exactly true — that
+        invariant is the structural guard for the whole stat requirement, and
+        diluting 'errors' with a non-invalidation failure mode would silently
+        retire it.
+        """
+        memory_service = _make_memory_service()
+        taskmaster = _make_taskmaster()
+
+        stats = await sweep_stale_status_snapshot_edges(
+            memory_service, taskmaster, 'test_project', '/tmp/reify',
+            **self._sweep_kwargs(),
+        )
+
+        assert stats['superseded'] == 0
+        assert stats['supersede_errors'] == 0
+
 # --------------------------------------------------------------------------- #
 # sweep_stale_status_snapshot_edges — guards
 # --------------------------------------------------------------------------- #
@@ -2795,7 +3013,11 @@ class TestSweepStaleStatusSnapshotEdgesGuards:
             memory_service, None, 'test_project', '/tmp/reify', run_id='run-1',
         )
 
-        assert stats == {'scanned': 0, 'candidate_edges': 0, 'invalidated': 0, 'errors': 0}
+        assert stats == {
+            'scanned': 0, 'candidate_edges': 0,
+            'invalidated': 0, 'errors': 0,
+            'superseded': 0, 'supersede_errors': 0,
+        }
         memory_service.graphiti.get_all_valid_edges.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -2860,7 +3082,11 @@ class TestSweepStaleStatusSnapshotEdgesBestEffort:
         assert memory_service.update_edge.await_count == 2, (
             'The second stale edge must still be attempted after the first update fails'
         )
-        assert stats == {'scanned': 2, 'candidate_edges': 2, 'invalidated': 1, 'errors': 1}, (
+        assert stats == {
+            'scanned': 2, 'candidate_edges': 2,
+            'invalidated': 1, 'errors': 1,
+            'superseded': 0, 'supersede_errors': 0,
+        }, (
             f'Expected the failed update tallied as an error without blocking the second, got {stats!r}'
         )
 
@@ -2878,7 +3104,11 @@ class TestSweepStaleStatusSnapshotEdgesBestEffort:
             memory_service, taskmaster, 'test_project', '/tmp/reify', run_id='run-1',
         )
 
-        assert stats == {'scanned': 0, 'candidate_edges': 0, 'invalidated': 0, 'errors': 1}, (
+        assert stats == {
+            'scanned': 0, 'candidate_edges': 0,
+            'invalidated': 0, 'errors': 1,
+            'superseded': 0, 'supersede_errors': 0,
+        }, (
             f'Expected all-zero stats with the failure tallied as an error, got {stats!r}'
         )
         taskmaster.get_statuses.assert_not_awaited()
@@ -2902,7 +3132,11 @@ class TestSweepStaleStatusSnapshotEdgesBestEffort:
             memory_service, taskmaster, 'test_project', '/tmp/reify', run_id='run-1',
         )
 
-        assert stats == {'scanned': 1, 'candidate_edges': 0, 'invalidated': 0, 'errors': 1}, (
+        assert stats == {
+            'scanned': 1, 'candidate_edges': 0,
+            'invalidated': 0, 'errors': 1,
+            'superseded': 0, 'supersede_errors': 0,
+        }, (
             f'Expected the get_statuses failure tallied as an error with no invalidation, got {stats!r}'
         )
         memory_service.update_edge.assert_not_awaited()
