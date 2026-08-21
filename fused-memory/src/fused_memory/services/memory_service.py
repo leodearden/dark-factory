@@ -4162,6 +4162,17 @@ class MemoryService:
             # the topics it exists to help.  relevance_score is NOT the cosine
             # since task 3658 (it is an ordinal RRF value, rank-1 ~ 0.0164), so
             # setting it is not a substitute either.  The pin is by ORDER ONLY.
+            #
+            # Order alone SUFFICES because nothing downstream re-sorts it: the
+            # sort in this method already ran, above, and the only other
+            # transform between here and the agent —
+            # grouped_read.group_search_results at the MCP boundary — is
+            # append-only, with no sort() and no truncation of its own.  A
+            # record placed at index 0 here is still at index 0 when the agent
+            # reads it.  (Its one way to lose slot 0 is _suppress_child folding
+            # a CHILD-shaped hit into its parent, which is why
+            # select_canonical_payload excludes child-shaped payloads outright
+            # rather than trusting writes to be well-formed.)
             results.insert(pin_at, MemoryResult(
                 id=canonical_id,
                 content=_mem0_content(payload_meta),
