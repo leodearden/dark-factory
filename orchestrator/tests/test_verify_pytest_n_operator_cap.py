@@ -41,7 +41,7 @@ from __future__ import annotations
 
 import shlex
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from unittest.mock import patch
 
 import pytest
@@ -157,7 +157,11 @@ def _load_committed_config(
     return OrchestratorConfig(**overrides)
 
 
-async def _captured_test_leg(config: OrchestratorConfig, worktree: Path, role: str) -> str:
+async def _captured_test_leg(
+    config: OrchestratorConfig,
+    worktree: Path,
+    role: Literal['merge', 'task', 'background'],
+) -> str:
     """Drive ``run_verification`` for *role* and return the INNER test-leg cmd."""
     captured_cmds: list[str] = []
 
