@@ -11102,6 +11102,16 @@ class Harness:
         the halt.  A ``== 1`` filter silently dropped it and brought the merge
         queue back UN-HALTED over a dirty project_root.
 
+        LIVE AND POST-RESTART AGREE (task 3537, review amendment).  Because a
+        parked record re-asserts the halt HERE, :meth:`_on_escalation_resolved`
+        must NOT release it when ``park()`` fires the resolve callback — see the
+        "a park is not a resolution" comment there.  Otherwise one record would
+        mean "halt released" in the running process and "halt still in effect"
+        after the next restart, and an operator who deliberately parked (rather
+        than resolved) it would face a fleet-wide merge stall clearable only by
+        a full resolve or ``force_unhalt_merge_queue``.  One record, one
+        meaning: still open ⇒ still halting.
+
         The lower bound stays at 1 deliberately: a level-0 record is
         auto-dismissed at startup by ``dismiss_all_pending``, so honouring one
         would resurrect a halt from a record nothing will ever resolve.
@@ -13658,8 +13668,27 @@ class Harness:
         # let any wip_conflict resolve release the halt — leaving the real
         # blocker's escalation pending (phantom-L1 bug, esc-1888-57 on reify
         # 2026-04-16). The owner pointer is the single source of truth.
+        #
+        # A PARK IS NOT A RESOLUTION (task 3537, review amendment).  This
+        # callback also fires for ``EscalationQueue.park()``, which promotes
+        # the record IN PLACE — level -> 2, ``status`` STAYS ``'pending'``,
+        # category preserved, never archived — so the record is still OPEN and
+        # spec §7.9 makes the halt's ONLY unhalt edge that record's
+        # *resolution*.  Un-halting on a park would also contradict
+        # :meth:`_rehydrate_merge_halt`, which matches at level >= 1 and
+        # re-asserts the halt from that very same parked record at the next
+        # restart: one record would mean "halt released" live and "halt still
+        # in effect" after a restart, and clearing it would then need a full
+        # resolve or ``force_unhalt_merge_queue`` — a fleet-wide merge stall on
+        # a record the operator deliberately parked rather than resolved.
+        # Gating on the record being CLOSED makes both halves agree that a
+        # parked halt owner still blocks.  ``status`` is 'resolved'/'dismissed'
+        # for ``resolve()`` and ``submit_resolved()``, and 'pending' only for
+        # ``park()`` (including its in-memory member cascade, where the members
+        # stay pending L1s covering their own tasks).
         if (
             self._merge_worker is not None
+            and escalation.status != 'pending'
             and self._merge_worker.is_halt_owner(escalation.id)
         ):
             self._merge_worker.unhalt_wip()

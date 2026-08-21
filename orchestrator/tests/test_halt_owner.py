@@ -401,9 +401,13 @@ class TestRehydrateMergeHalt:
 
         esc = _make_wip_esc(queue, f'24-{category}', category=category)
 
-        # Park BEFORE assigning the post-restart worker: park() fires the
-        # queue's resolve callback (wired to harness._on_escalation_resolved by
-        # the fixture), and we must not let that pre-empt the state under test.
+        # Park BEFORE assigning the post-restart worker, so this test isolates
+        # the REHYDRATION half: park() fires the queue's resolve callback
+        # (wired to harness._on_escalation_resolved by the fixture), and with
+        # no worker assigned yet that callback cannot touch halt state at all.
+        # The LIVE half — that the callback leaves an already-halted worker
+        # halted when the park fires — is pinned by
+        # test_parking_halt_owner_keeps_halt_live_and_after_restart below.
         parked = queue.park(esc.id, 'promoted for human triage')
         assert parked is not None
         assert parked.level == 2, 'park() must promote in place'
@@ -425,6 +429,74 @@ class TestRehydrateMergeHalt:
         )
         assert worker.halt_owner_esc_id == parked.id
         assert result == parked.id
+
+    @pytest.mark.parametrize(
+        'category', ['wip_conflict', 'unmerged_state', 'stash_failed'],
+    )
+    def test_parking_halt_owner_keeps_halt_live_and_after_restart(
+        self, harness: Harness, category: str,
+    ):
+        """One record, one meaning: a PARKED halt owner still blocks — live AND
+        after a restart, pinned in a single flow.
+
+        The two halves are wired to the same record and must agree.  Before
+        this amendment they did not: ``park()`` fires the queue's resolve
+        callback, ``_on_escalation_resolved`` saw the parked record as its halt
+        owner and called ``unhalt_wip()``, so the merge queue RESUMED in the
+        running process — while ``_rehydrate_merge_halt``'s ``level >= 1``
+        filter re-asserted the halt from that same record at the next restart
+        (the fleet redeploys on an ~8h clock).  The operator would then need a
+        full resolve or ``force_unhalt_merge_queue`` to clear a record they had
+        deliberately parked rather than resolved.
+
+        ``park()`` is not a resolution — the record stays ``status='pending'``,
+        i.e. OPEN — and spec §7.9 makes the halt's only unhalt edge that
+        record's *resolution*.  So: parking keeps the halt engaged (live), the
+        restart re-asserts it from the same record, and only ``resolve()``
+        releases it.
+        """
+        queue = harness._escalation_queue
+        assert queue is not None
+
+        worker = _FakeMergeWorker()
+        harness._merge_worker = worker  # type: ignore[assignment]
+
+        esc = _make_wip_esc(queue, f'24-live-{category}', category=category)
+        worker.halt_for_wip(category)
+        worker.set_halt_owner(esc.id)
+        assert worker.is_wip_halted
+
+        # ── live half: park fires the wired resolve callback ──────────────
+        parked = queue.park(esc.id, 'promoted for human triage')
+        assert parked is not None
+        assert parked.status == 'pending', 'a parked record is still OPEN'
+
+        assert worker.is_wip_halted is True, (
+            f'parking the {category} halt owner must NOT release the halt — '
+            f'the record is still open, and the restart below re-asserts the '
+            f'halt from it, so releasing here makes one record mean two '
+            f'opposite things'
+        )
+        assert worker.halt_owner_esc_id == esc.id, (
+            'the owner pointer must survive the park — clearing it would '
+            'strand the halt with nothing to resolve it'
+        )
+
+        # ── post-restart half: same record, same meaning ──────────────────
+        restarted = _FakeMergeWorker()
+        harness._merge_worker = restarted  # type: ignore[assignment]
+        assert restarted.is_wip_halted is False
+
+        assert harness._rehydrate_merge_halt() == parked.id
+        assert restarted.is_wip_halted is True
+        assert restarted.halt_owner_esc_id == parked.id
+
+        # ── and resolution — the ONE unhalt edge — still releases it ──────
+        queue.resolve(parked.id, 'operator cleaned project_root', resolved_by='test')
+        assert restarted.is_wip_halted is False, (
+            'resolving the parked record is the sole unhalt edge and must '
+            'still work after the promotion'
+        )
 
     def test_rehydrate_mixed_levels_picks_most_recent(
         self, harness: Harness, caplog: pytest.LogCaptureFixture,
