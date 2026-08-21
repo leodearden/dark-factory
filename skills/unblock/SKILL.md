@@ -266,7 +266,8 @@ submit_result = submit_task(
     metadata={
         "source": "unblock-triage",
         "spawn_context": "unblock",
-        "modules": ["<path/to/affected/module>"],
+        # sparse is fine — the architect widens scope at plan time. File paths only (a directory is rejected); use [] to defer entirely.
+        "files": ["<path/to/affected/file.py>"],
     },
 )
 ticket = submit_result["ticket"]

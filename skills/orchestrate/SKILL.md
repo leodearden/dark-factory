@@ -154,7 +154,8 @@ submit_result = submit_task(
     metadata={
         "source": "prd-decomposition",
         "spawn_context": "parse_prd",
-        "modules": ["<path/to/module>"],
+        # sparse is fine — the architect widens scope at plan time. File paths only (a directory is rejected); use [] to defer entirely.
+        "files": ["<path/to/file.py>"],
     },
 )
 ticket = submit_result["ticket"]

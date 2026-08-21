@@ -90,7 +90,8 @@ Modules touched: <list>
         "user_observable_signal": "<signal>",
         "consumer_ref": "<consumer_ref>",
         "grammar_confirmed": True,   # or the overlay's substrate-confirmed flag name
-        "modules": ["<module_path>", ...],
+        # sparse is fine — the architect widens scope at plan time. File paths only (a directory is rejected); use [] to defer entirely.
+        "files": ["<path/to/file.py>", ...],
         # "g7_waivers": [{"invariant": "<slug>", "rationale": "<text>"}],  # only if Step 2.3 recorded a waiver for this task
         # "execution_class": "operational" | "decision",  # only if this leaf is genuinely non-code work
     },

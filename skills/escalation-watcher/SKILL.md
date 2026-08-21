@@ -1058,7 +1058,8 @@ Technical debt or cleanup discovered during development.
           "escalation_id": escalation_id,
           "suggestion_hash": suggestion_hash,   # (escalation_id, suggestion_hash) is the idempotency key
           "spawn_context": "steward-triage",
-          "modules": ["<path/to/module>"],
+          # sparse is fine — the architect widens scope at plan time. File paths only (a directory is rejected); use [] to defer entirely.
+          "files": ["<path/to/file.py>"],
       },
   )
   ticket = submit_result["ticket"]
