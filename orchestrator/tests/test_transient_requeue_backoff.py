@@ -17,6 +17,9 @@ that boundary row 4 pins.
 """
 from __future__ import annotations
 
+import json
+from datetime import UTC, datetime
+
 import pytest
 
 from orchestrator.config import OrchestratorConfig
@@ -517,3 +520,98 @@ class TestSnapshotExposesRequeueCooldowns:
         fresh = scheduler.get_state_snapshot()['requeue_cooldowns']
         assert fresh['T1']['armed_secs'] == 30.0
         assert 'INJECTED' not in fresh
+
+
+class TestBoundaryRow4ViaGetSchedulerState:
+    """Boundary row 4, read through the REAL product path.
+
+    ``scheduler._write_state_snapshot_raw`` -> the on-disk
+    ``<root>/data/orchestrator/scheduler_state.json`` ->
+    ``fused_memory.mcp_tools.scheduler_state.read_scheduler_state``, which is
+    the exact function the ``get_scheduler_state`` MCP tool delegates to.
+    """
+
+    def _drive(self, tmp_path):
+        """Arm n=1..5 transient cooldowns, snapshotting through disk each time."""
+        from fused_memory.mcp_tools.scheduler_state import read_scheduler_state
+
+        clock = [1000.0]
+        wall = datetime(2026, 7, 29, 12, 0, 0, tzinfo=UTC)
+        scheduler = Scheduler(
+            OrchestratorConfig(max_per_module=1),
+            time_source=lambda: clock[0],
+            wall_time_source=lambda: wall,
+        )
+        scheduler.finish_startup()
+        snapshot_path = tmp_path / 'data' / 'orchestrator' / 'scheduler_state.json'
+
+        states = []
+        for _ in range(5):
+            _arm_transient(scheduler, clock, 'T1')
+            scheduler._write_state_snapshot_raw(snapshot_path)
+            states.append(read_scheduler_state(tmp_path))
+        return scheduler, clock, states, snapshot_path
+
+    def test_envelopes_grow_thirty_to_four_eighty_through_the_product_path(self, tmp_path):
+        """Row 4: armed cooldowns grow ~30 -> 480s, jittered inside [d/2, d]."""
+        _scheduler, _clock, states, _path = self._drive(tmp_path)
+        entries = [s['requeue_cooldowns']['T1'] for s in states]
+        assert [e['envelope_secs'] for e in entries] == [30.0, 60.0, 120.0, 240.0, 480.0]
+        for entry in entries:
+            envelope = entry['envelope_secs']
+            assert envelope / 2 <= entry['armed_secs'] <= envelope
+            assert entry['transient'] is True
+
+    def test_genuine_requeue_stays_flat_alongside_in_the_same_snapshot(self, tmp_path):
+        """Row 4's other half — and the two tasks' entries do not interfere."""
+        from fused_memory.mcp_tools.scheduler_state import read_scheduler_state
+
+        scheduler, _clock, _states, path = self._drive(tmp_path)
+        _requeue(scheduler, 'G1', reason='verify failed', api_error_status=None)
+        scheduler.release('G1', requeued=True)
+        scheduler._write_state_snapshot_raw(path)
+        cooldowns = read_scheduler_state(tmp_path)['requeue_cooldowns']
+
+        assert cooldowns['G1']['armed_secs'] == 30.0
+        assert cooldowns['G1']['transient'] is False
+        assert cooldowns['T1']['envelope_secs'] == 480.0
+        assert cooldowns['T1']['transient'] is True
+
+    def test_wall_clock_fields_are_parseable_and_consistent(self, tmp_path):
+        """``armed_at``/``expires_at`` answer "when does this task come back".
+
+        A monotonic deadline cannot: it has no epoch relation and does not
+        survive a restart.  ``expires_at - armed_at`` must equal
+        ``armed_secs`` (to millisecond tolerance — ``armed_secs`` is rounded
+        to 3 dp), which requires deriving both from ONE wall read.
+        """
+        _scheduler, _clock, states, _path = self._drive(tmp_path)
+        for state in states:
+            entry = state['requeue_cooldowns']['T1']
+            armed_at = datetime.fromisoformat(entry['armed_at'])
+            expires_at = datetime.fromisoformat(entry['expires_at'])
+            delta = (expires_at - armed_at).total_seconds()
+            assert abs(delta - entry['armed_secs']) < 0.001
+
+    def test_snapshot_is_strictly_json_native(self, tmp_path):
+        """No datetime object may leak into the snapshot.
+
+        The production writer serialises with ``json.dumps(state, default=str)``,
+        which would silently stringify a datetime into a shape
+        ``read_scheduler_state`` cannot round-trip into a comparable value.
+        Serialising with NO ``default=`` fallback is what proves it.
+        """
+        scheduler, _clock, _states, _path = self._drive(tmp_path)
+        json.dumps(scheduler.get_state_snapshot())  # no default= — must not raise
+        for entry in scheduler.get_state_snapshot()['requeue_cooldowns'].values():
+            for key, value in entry.items():
+                assert isinstance(value, (str, int, float, bool)), (
+                    f'{key}={value!r} ({type(value).__name__}) is not JSON-native'
+                )
+
+    def test_dedup_stability_survives_the_wall_clock_fields(self, tmp_path):
+        """The new fields are arming-time constants, so the throttle still holds."""
+        scheduler, clock, _states, _path = self._drive(tmp_path)
+        first = scheduler._build_snapshot_payload()
+        clock[0] += 5.0
+        assert scheduler._build_snapshot_payload() == first
