@@ -3167,3 +3167,192 @@ class TestSweepStaleStatusSnapshotEdgesBestEffort:
             await sweep_stale_status_snapshot_edges(
                 memory_service, taskmaster, 'test_project', '/tmp/reify', run_id='run-1',
             )
+
+    # ----------------------------------------------------------------- #
+    # The superseding write is best-effort too (task 3037)
+    #
+    # It is the SECOND half of the deterministic step and strictly the
+    # less important one: by the time it runs the stale edge is already
+    # retired, which is the correctness-bearing effect. A transient
+    # add_memory failure must therefore degrade observability only — never
+    # abort the remaining edges' invalidations, and never be mistaken for a
+    # failed invalidation in the counters.
+    # ----------------------------------------------------------------- #
+
+    BLOCKED_FACT_2848 = 'Task 2848 remains blocked as of 2026-07-22'
+    BLOCKED_FACT_2849 = 'Task 2849 remains blocked as of 2026-07-22'
+
+    @pytest.mark.asyncio
+    async def test_add_memory_failure_is_swallowed_and_second_edge_still_invalidated(self):
+        """add_memory raises for the first stale blocked edge; the second stale
+        edge is still invalidated AND still counted.
+
+        Mirrors this class's update_edge posture exactly: tally, log, carry
+        on. The failure lands in stats['supersede_errors'] — NOT in
+        stats['errors'], which stays scoped to the invalidation paths.
+        """
+        memory_service = _make_memory_service()
+        taskmaster = _make_taskmaster()
+        memory_service.graphiti.get_all_valid_edges = AsyncMock(
+            return_value={'entity-a': [
+                {'uuid': 'edge-2848', 'fact': self.BLOCKED_FACT_2848, 'name': ''},
+                {'uuid': 'edge-2849', 'fact': self.BLOCKED_FACT_2849, 'name': ''},
+            ]},
+        )
+        taskmaster.get_statuses = AsyncMock(
+            return_value={'2848': 'pending', '2849': 'in-progress'},
+        )
+        memory_service.add_memory = AsyncMock(
+            side_effect=[RuntimeError('embedding backend timeout'), None],
+        )
+
+        stats = await sweep_stale_status_snapshot_edges(
+            memory_service, taskmaster, 'test_project', '/tmp/reify', run_id='run-1',
+        )
+
+        assert memory_service.update_edge.await_count == 2, (
+            'Both stale edges must still be invalidated after the first '
+            'superseding write fails — the invalidation is the '
+            'correctness-bearing half of the step'
+        )
+        assert memory_service.add_memory.await_count == 2, (
+            "The second edge's superseding write must still be attempted "
+            'after the first one raised'
+        )
+        assert stats == {
+            'scanned': 2, 'candidate_edges': 2,
+            'invalidated': 2, 'errors': 0,
+            'superseded': 1, 'supersede_errors': 1,
+        }, (
+            'Expected the failed supersede tallied into supersede_errors only, '
+            f'leaving both invalidations intact and errors at 0, got {stats!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_add_memory_failure_does_not_undo_the_invalidation(self):
+        """The already-succeeded update_edge is never rolled back or retried.
+
+        There is no compensating write: the edge stays invalid_at-stamped and
+        counted, and the sweep simply returns without its superseding fact.
+        Retrying it next cycle is impossible anyway — the invalidated edge no
+        longer enumerates — so the failure mode is a permanently missing
+        superseding fact, not a corrupted edge.
+        """
+        memory_service = _make_memory_service()
+        taskmaster = _make_taskmaster()
+        memory_service.graphiti.get_all_valid_edges = AsyncMock(
+            return_value={'entity-a': [
+                {'uuid': 'edge-2848', 'fact': self.BLOCKED_FACT_2848, 'name': ''},
+            ]},
+        )
+        taskmaster.get_statuses = AsyncMock(return_value={'2848': 'pending'})
+        memory_service.add_memory = AsyncMock(side_effect=RuntimeError('write rejected'))
+
+        stats = await sweep_stale_status_snapshot_edges(
+            memory_service, taskmaster, 'test_project', '/tmp/reify', run_id='run-1',
+        )
+
+        memory_service.update_edge.assert_awaited_once()
+        assert stats['invalidated'] == 1, (
+            'The invalidation that already succeeded must stay counted, got '
+            f'{stats!r}'
+        )
+        assert stats['superseded'] == 0
+        assert stats['supersede_errors'] == 1
+
+    @pytest.mark.asyncio
+    async def test_counter_invariant_holds_when_only_the_supersede_write_fails(self):
+        """`invalidated == candidate_edges - errors` still holds exactly.
+
+        This is the structural guard for the whole stat-counter requirement
+        (task 3037): every SELECTED edge is either invalidated or tallied in
+        stats['errors'], by the one counted invalidation loop. Folding a
+        supersede failure into 'errors' would silently retire that identity,
+        so the invariant is re-asserted here on a run whose ONLY failure is a
+        superseding write.
+        """
+        memory_service = _make_memory_service()
+        taskmaster = _make_taskmaster()
+        memory_service.graphiti.get_all_valid_edges = AsyncMock(
+            return_value={'entity-a': [
+                {'uuid': 'edge-2848', 'fact': self.BLOCKED_FACT_2848, 'name': ''},
+                {'uuid': 'edge-healthy', 'fact': 'Task 3001 is blocked.', 'name': ''},
+            ]},
+        )
+        taskmaster.get_statuses = AsyncMock(
+            return_value={'2848': 'pending', '3001': 'blocked'},
+        )
+        memory_service.add_memory = AsyncMock(side_effect=RuntimeError('write rejected'))
+
+        stats = await sweep_stale_status_snapshot_edges(
+            memory_service, taskmaster, 'test_project', '/tmp/reify', run_id='run-1',
+        )
+
+        assert stats['errors'] == 0, (
+            "A failed superseding write is not a failed invalidation — 'errors' "
+            f'stays scoped to enumerate/cross-reference/invalidate, got {stats!r}'
+        )
+        assert stats['supersede_errors'] == 1
+        assert stats['invalidated'] == stats['candidate_edges'] - stats['errors'], (
+            "stats['errors'] is scoped to the enumerate / cross-reference / "
+            'INVALIDATE paths so that every selected edge is either invalidated '
+            'or tallied there. If this broke because a non-invalidation failure '
+            "mode (e.g. the superseding write) was folded into 'errors', give "
+            f'that mode its own key instead — got {stats!r}'
+        )
+
+    @pytest.mark.parametrize(
+        'exc_type',
+        [asyncio.CancelledError, KeyboardInterrupt, SystemExit],
+        ids=['cancelled', 'keyboard_interrupt', 'system_exit'],
+    )
+    @pytest.mark.asyncio
+    async def test_control_flow_exceptions_from_add_memory_propagate(self, exc_type):
+        """Control-flow exceptions are never swallowed as best-effort errors.
+
+        Same posture the invalidation path already holds: shutdown and
+        cancellation must tear the sweep down promptly rather than being
+        logged and counted as a transient backend failure.
+        """
+        memory_service = _make_memory_service()
+        taskmaster = _make_taskmaster()
+        memory_service.graphiti.get_all_valid_edges = AsyncMock(
+            return_value={'entity-a': [
+                {'uuid': 'edge-2848', 'fact': self.BLOCKED_FACT_2848, 'name': ''},
+            ]},
+        )
+        taskmaster.get_statuses = AsyncMock(return_value={'2848': 'pending'})
+        memory_service.add_memory = AsyncMock(side_effect=exc_type())
+
+        with pytest.raises(exc_type):
+            await sweep_stale_status_snapshot_edges(
+                memory_service, taskmaster, 'test_project', '/tmp/reify', run_id='run-1',
+            )
+
+    @pytest.mark.parametrize(
+        'exc_type',
+        [KeyboardInterrupt, SystemExit],
+        ids=['keyboard_interrupt', 'system_exit'],
+    )
+    @pytest.mark.asyncio
+    async def test_control_flow_exceptions_from_update_edge_propagate(self, exc_type):
+        """The invalidation path's control-flow posture, beside the new one.
+
+        The CancelledError leg is pinned above by
+        test_cancelled_error_from_update_edge_propagates; these two complete
+        the trio so both write paths are held to the identical contract.
+        """
+        memory_service = _make_memory_service()
+        taskmaster = _make_taskmaster()
+        memory_service.graphiti.get_all_valid_edges = AsyncMock(
+            return_value={'entity-a': [
+                {'uuid': 'edge-stale', 'fact': 'Task 142 is an active pending task', 'name': ''},
+            ]},
+        )
+        taskmaster.get_statuses = AsyncMock(return_value={'142': 'done'})
+        memory_service.update_edge = AsyncMock(side_effect=exc_type())
+
+        with pytest.raises(exc_type):
+            await sweep_stale_status_snapshot_edges(
+                memory_service, taskmaster, 'test_project', '/tmp/reify', run_id='run-1',
+            )
