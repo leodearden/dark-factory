@@ -99,7 +99,10 @@ _SCOPE_WAIT_REPOLL_CEIL_SECS = 5.0
 # probe cycles instead of hours. Counted CONSECUTIVELY rather than over a
 # window (cf. shared/storm_counter.py): a spawn error immediately followed by a
 # probe that RAN is genuinely transient and must clear, whereas a windowed
-# counter would still latch on three errors interleaved with successes.
+# counter would still latch on three errors interleaved with successes. A run
+# ends either way it can end — a probe that RAN, or the account leaving the
+# probing phases (see _reset_probe_spawn_failures) — so the count reaching the
+# threshold really does mean that many failures back to back.
 # Deliberately an internal constant, not an operator knob — it tunes how
 # quickly a fault is NAMED, not whether the fault is tolerated.
 _SPAWN_FAULT_THRESHOLD = 3
@@ -311,7 +314,9 @@ class AccountState:
     auth_failed_at: datetime | None = None
     auth_reprobe_task: asyncio.Task | None = field(default=None, repr=False)
     # CONSECUTIVE probe-spawn failures (task 4512), reset to 0 by any probe
-    # that actually RAN — whatever its verdict. Deliberately NOT part of the
+    # that actually RAN — whatever its verdict — and by this account leaving
+    # the CAPPED/AUTH_FAILED set, after which it spawns no probes at all and
+    # so can never produce that proof itself. Deliberately NOT part of the
     # AccountPhase machine: a spawn fault says nothing about this account's
     # capacity, so it must not move the account off CAPPED/AUTH_FAILED, and
     # inventing a phase for it would need edges into and out of every existing
@@ -1966,9 +1971,9 @@ class UsageGate:
 
         Recovery is proof-based, never time-based: a probe that returned at
         all proves the binary is resolvable again. The latch clears only once
-        NO account still has a pending run of failures, so a fleet-wide fault
-        that has healed on one account of six stays reported until the rest
-        confirm it too.
+        no account that STILL SPAWNS PROBES has a pending run of failures, so
+        a fleet-wide fault that has healed on one account of six stays
+        reported until the rest confirm it too.
         """
         self._reset_probe_spawn_failures(acct, reason='a probe spawned successfully')
 
@@ -1991,7 +1996,16 @@ class UsageGate:
         being reset never vetoes its own clear.
         """
         acct.probe_spawn_failures = 0
-        if any(a.probe_spawn_failures for a in self._accounts):
+        if any(a.probe_spawn_failures for a in self._accounts if a.capped or a.auth_failed):
+            # Only CAPPED/AUTH_FAILED accounts spawn probes
+            # (_account_resume_probe_loop and _reprobe_account respectively),
+            # so only they can still produce the evidence that would clear
+            # their own counter. An account outside that set holding a
+            # non-zero count is by definition stale — it will never probe
+            # again to zero it — and letting it vote here is what made the
+            # latch unclearable (task 4512 review). The property's contract
+            # is "None whenever probes CAN spawn", and a non-probing account
+            # says nothing about that.
             return
         if getattr(self, '_probe_infra_fault', None) is not None:
             logger.info(
