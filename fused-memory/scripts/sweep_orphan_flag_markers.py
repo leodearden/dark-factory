@@ -174,9 +174,11 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import sys
 from datetime import UTC, datetime, timedelta
 from functools import partial
+from pathlib import Path
 from typing import Any
 
 from fused_memory.reconciliation.flag_dedup import is_content_fingerprint_task_id
@@ -1121,6 +1123,24 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        '--list-known-projects', dest='list_known_projects',
+        action='store_true', default=False,
+        help=(
+            'Print one registered project_id per line to stdout and exit '
+            'WITHOUT sweeping. This is the seam '
+            'scripts/fused-memory-flag-marker-sweep.sh uses to per-projectize '
+            'the nightly drain: before this existed the wrapper swept exactly '
+            'one project (this parser\'s own --project-id default) while the '
+            "sweep's per-project census output read as if the fleet were "
+            'covered. The list comes from the same {project_id: project_root} '
+            'registry the fused-memory server is configured from, i.e. this '
+            'root plus DASHBOARD_KNOWN_PROJECT_ROOTS; exits 1 if it resolves '
+            'empty so the caller can detect the degradation. Rejected at '
+            'parse time alongside any sweep-performing flag (see '
+            '_parse_args).'
+        ),
+    )
+    parser.add_argument(
         '--fail-on-blind-spot', dest='fail_on_blind_spot',
         action='store_true', default=None,
         help=(
@@ -1226,6 +1246,52 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
+def _known_project_ids() -> list[str]:
+    """Best-effort resolve every registered project_id, for ``--list-known-projects``.
+
+    Why this lives in the sweep script rather than inline in
+    ``scripts/fused-memory-flag-marker-sweep.sh``: the wrapper needs a list of
+    project_ids to loop over, and deriving one in bash would mean
+    reimplementing the registry's root-to-id rule
+    (:func:`~fused_memory.models.scope.resolve_project_id_for_root`, which
+    prefers the id declared in ``<root>/dark-factory-orchestrator.yaml`` over
+    the basename, and resolves symlinks first). A bash basename derivation
+    would compute ids that no memory is stored under for any project whose
+    manifest id differs from its directory name — and since the sweep does no
+    known-project validation, such a run counts 0, sweeps 0 and exits 0: a
+    SILENT green, the same failure class this flag exists to close. Resolving
+    here reuses the one registry builder and keeps the wrapper a plain loop.
+
+    Fail-safe posture mirrors :func:`_resolve_terminal_task_ids`: any failure
+    (import error, unreadable root, broken registry) degrades to ``[]``,
+    logged at WARNING with a traceback, rather than raising. ``main`` turns an
+    empty list into a non-zero exit so the degradation is still loud.
+
+    Returns:
+        Sorted list of registered project_id strings; ``[]`` on any failure.
+    """
+    try:
+        from fused_memory.models import scope  # noqa: PLC0415
+
+        # PROJECT_ROOT is the var the wrapper already exports; fall back to
+        # this checkout (scripts/ -> fused-memory/ -> repo root).
+        primary_root = os.environ.get('PROJECT_ROOT') or str(
+            Path(__file__).resolve().parent.parent.parent
+        )
+        # extra_roots left None on purpose: build_known_projects_map then
+        # defaults it from known_project_roots_from_env(), so the
+        # DASHBOARD_KNOWN_PROJECT_ROOTS parse has exactly one owner.
+        return sorted(scope.build_known_projects_map(primary_root))
+    except Exception:
+        logger.warning(
+            '_known_project_ids: could not resolve the registered-project map; '
+            'degrading to an empty list (the caller reports this as a non-zero '
+            'exit rather than silently sweeping nothing)',
+            exc_info=True,
+        )
+        return []
+
+
 async def _resolve_terminal_task_ids() -> set[str]:
     """Best-effort resolve terminal-status task ids for ``--terminal-drain``.
 
@@ -1279,6 +1345,24 @@ def main() -> int:
         format='%(asctime)s %(name)s %(levelname)s %(message)s',
     )
     args = _parse_args()
+
+    # Resolution-only mode: return BEFORE any MemoryService is constructed, so
+    # listing the fleet needs no live store connection at all.
+    if args.list_known_projects:
+        project_ids = _known_project_ids()
+        if not project_ids:
+            logger.warning(
+                'sweep_orphan_flag_markers --list-known-projects: resolved NO '
+                'registered projects. DASHBOARD_KNOWN_PROJECT_ROOTS is the '
+                'likely-unset cause (it is not in the repo .env; it lives as an '
+                'Environment= line on the installed fused-memory.service unit). '
+                'Exiting non-zero so the caller narrows loudly instead of '
+                'silently sweeping nothing.'
+            )
+            return 1
+        for project_id in project_ids:
+            print(project_id)
+        return 0
 
     async def _run_live() -> dict:
         from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
