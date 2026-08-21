@@ -7421,8 +7421,9 @@ class Scheduler:
         - is_paused: bool — True when the scheduler is park-stop paused
         - pause_reason: str | None — human-readable reason, or None when not paused
         - requeue_cooldowns: {task_id: {armed_secs, envelope_secs, transient,
-          transient_count}} — the per-task requeue cooldown currently gating
-          re-dispatch, as armed (task 3317 / PRD contract C3).  ``armed_secs``
+          transient_count, armed_at, expires_at}} — the per-task requeue
+          cooldown currently gating re-dispatch, as armed (task 3317 / PRD
+          contract C3).  ``armed_secs``
           GROWS across successive transient (5xx) requeues — 30/60/120/240/480,
           capped at 900 — and stays FLAT at ``requeue_cooldown_secs`` for a
           genuine one; ``envelope_secs`` is the un-jittered ceiling the armed
@@ -7430,6 +7431,13 @@ class Scheduler:
           ``[envelope/2, envelope]``).  Entries appear at arming and are
           dropped by ``_gc_expired_cooldowns`` when the deadline passes, so
           the key answers "which tasks are cooling, and for how long".
+          ``armed_at``/``expires_at`` are ISO-8601 WALL-clock strings —
+          restart-comparable and operator-readable, answering "when does this
+          task come back" — while the internal ``_requeue_until`` deadline
+          they describe stays MONOTONIC (no epoch relation, resets across a
+          process restart).  That is the same split ``_resolve_wall_time_source``
+          documents; a monotonic float alone is meaningless to a cross-process
+          reader.
           NO wall-clock-relative "remaining" field is emitted, deliberately:
           every value here is fixed at arming, because
           ``_build_snapshot_payload`` content-dedups this snapshot to throttle
@@ -7987,13 +7995,25 @@ class Scheduler:
                 )
             self._requeue_until[task_id] = self._time_source() + cooldown
             # Operator-facing record of what was just armed.  JSON-native
-            # primitives ONLY (float/bool/int) and nothing derived from "now"
-            # — see the _requeue_cooldown_meta declaration for why.
+            # primitives ONLY (float/bool/int/str) and nothing derived from
+            # "now" — see the _requeue_cooldown_meta declaration for why.
+            #
+            # armed_at/expires_at are ISO-8601 STRINGS, never datetime
+            # objects: the production writer serialises with
+            # `json.dumps(state, default=str)`, which would silently
+            # stringify a datetime into a shape `read_scheduler_state`
+            # cannot round-trip — a loud TypeError is what the strings buy.
+            # The wall clock is read ONCE and expires_at derived from that
+            # same value, so `expires_at - armed_at` is exactly armed_secs;
+            # two _wall_now() calls would let the pair drift apart.
+            armed_at = self._wall_now()
             self._requeue_cooldown_meta[task_id] = {
                 'armed_secs': round(cooldown, 3),
                 'envelope_secs': round(envelope, 3),
                 'transient': armed_n is not None,
                 'transient_count': armed_n or 0,
+                'armed_at': armed_at.isoformat(),
+                'expires_at': (armed_at + timedelta(seconds=cooldown)).isoformat(),
             }
         modules = list(self.lock_table._held.get(task_id, set()))
         self.lock_table.release(task_id)
