@@ -5489,6 +5489,301 @@ class TestCommitEffectSurvivalVacuousCases:
         assert probe.vacuous_paths == ('obsolete.py',)
 
 
+@contextlib.contextmanager
+def _git_command_spy():
+    """Record every git command GitOps issues, delegating to the real ``_run``.
+
+    Counting invocations through the module's ``_run`` seam is the only
+    non-flaky way to assert a memo actually elided work: timing a subprocess
+    round-trip on a loaded CI box measures the box, not the cache.
+    """
+    original_run = _run
+    recorded: list[list[str]] = []
+
+    async def recording_run(cmd, cwd=None, **kwargs):
+        recorded.append(list(cmd))
+        return await original_run(cmd, cwd=cwd, **kwargs)
+
+    with patch('orchestrator.git_ops._run', side_effect=recording_run):
+        yield recorded
+
+
+@pytest.mark.asyncio
+class TestCommitEffectProbeMemo:
+    """The probe is memoized on (commit_sha, main_sha) (task 3116 b5).
+
+    COST is a first-class constraint on part (b), not an afterthought.  The
+    pre-3116 check was ONE ``git diff --quiet``; line survival needs a blob
+    read plus a set comparison PER TOUCHED PATH.  The cheap byte-identity test
+    cannot serve as a fast path either, because the full corpus measured 94.9%
+    of merges failing it while their deliverables sit intact at main — so the
+    expensive path is the COMMON path, re-run for every landing candidate on
+    every ``idle_poll_secs`` (15s) dispatch tick.
+
+    The KEY is the correctness core.  A memo keyed on ``commit_sha`` alone
+    would freeze a verdict across exactly the event that changes the answer: a
+    main HEAD advance.  Keying on the pair means a HEAD movement invalidates
+    every entry by construction, and the value cached is the value computed
+    against that HEAD.
+
+    A warm hit still costs ONE command — ``git rev-parse main`` — because the
+    memo cannot know whether HEAD moved without asking.  That single
+    invocation is the pin used throughout this class: a cache hit issues
+    exactly it and nothing else.
+    """
+
+    async def test_repeat_probe_at_same_main_head_issues_git_work_once(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """(a) Two consecutive probes for the same commit at the same main
+        HEAD return EQUAL probes, and the second issues no git work beyond the
+        single HEAD resolution the key requires.
+        """
+        await _seed_on_main(git_repo, {'mod.py': _numbered('base', 40)}, 'seed mod')
+        merge_sha = await _land_branch(
+            git_repo, '8001',
+            {'mod.py': _numbered('base', 40) + _numbered('added', 40)},
+        )
+
+        with _git_command_spy() as recorded:
+            first = await git_ops.describe_commit_effect_in_main(merge_sha)
+            cold_cost = len(recorded)
+            recorded.clear()
+            second = await git_ops.describe_commit_effect_in_main(merge_sha)
+            warm = list(recorded)
+
+        assert first.present is True
+        assert second == first, 'a warm hit must return the same verdict and facts'
+        assert cold_cost > 1, (
+            f'sanity: the cold probe must actually do git work, saw {cold_cost}'
+        )
+        assert warm == [['git', 'rev-parse', 'main']], (
+            f'a warm hit must cost exactly the HEAD resolution, saw {warm}'
+        )
+
+    async def test_main_head_advance_invalidates_and_can_flip_the_verdict(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """(b) THE correctness core: the memo must not survive the HEAD
+        movement that changes the answer.
+
+        Probe once while the deliverable is intact (present), advance main so
+        it is reverted, probe again — the second call must RECOMPUTE and
+        report absent.  A commit_sha-only key would serve the stale True
+        forever, which is strictly worse than no memo: it would hand the
+        dispatch gate a landing verdict for a deliverable that is gone.
+        """
+        await _seed_on_main(git_repo, {'mod.py': _numbered('base', 40)}, 'seed mod')
+        merge_sha = await _land_branch(
+            git_repo, '8002',
+            {'mod.py': _numbered('base', 40) + _numbered('added', 40)},
+        )
+
+        before = await git_ops.describe_commit_effect_in_main(merge_sha)
+        assert before.present is True
+
+        (git_repo / 'mod.py').write_text(_numbered('base', 40))
+        await _commit_all(git_repo, 'revert the deliverable on main')
+
+        with _git_command_spy() as recorded:
+            after = await git_ops.describe_commit_effect_in_main(merge_sha)
+            recompute_cost = len(recorded)
+            recorded.clear()
+            again = await git_ops.describe_commit_effect_in_main(merge_sha)
+            warm = list(recorded)
+
+        assert after.present is False, 'the advance must be seen, not memoized away'
+        assert after.failure == 'effect_not_survived'
+        assert recompute_cost > 1, (
+            f'a new HEAD must force real recomputation, saw {recompute_cost} commands'
+        )
+        assert again == after, 'the recomputed verdict is itself memoized'
+        assert warm == [['git', 'rev-parse', 'main']]
+
+    async def test_memo_drops_entries_keyed_on_a_superseded_main_head(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """The memo is BOUNDED: a HEAD advance invalidates every entry keyed
+        on the old sha, so they are dropped rather than accumulated.
+
+        The orchestrator holds one GitOps for the life of the process and
+        probes on every 15s tick; an unbounded dict keyed on a moving HEAD is
+        a slow leak that never gets collected.
+        """
+        await _seed_on_main(git_repo, {'mod.py': _numbered('base', 40)}, 'seed mod')
+        merge_sha = await _land_branch(
+            git_repo, '8003',
+            {'mod.py': _numbered('base', 40) + _numbered('added', 40)},
+        )
+
+        await git_ops.describe_commit_effect_in_main(merge_sha)
+        old_main = await git_ops.get_main_sha()
+        assert list(git_ops._effect_probe_memo) == [(merge_sha, old_main)]
+
+        (git_repo / 'unrelated.md').write_text('later, unrelated work\n')
+        await _commit_all(git_repo, 'unrelated advance on main')
+        new_main = await git_ops.get_main_sha()
+        await git_ops.describe_commit_effect_in_main(merge_sha)
+
+        assert list(git_ops._effect_probe_memo) == [(merge_sha, new_main)], (
+            'entries keyed on a superseded main sha must not accumulate'
+        )
+
+    async def test_distinct_commits_at_the_same_head_do_not_collide(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """(c) Two commits probed at the same HEAD keep their own verdicts —
+        one intact, one reverted — and neither is served the other's answer.
+        """
+        await _seed_on_main(
+            git_repo,
+            {'kept.py': _numbered('kept', 40), 'lost.py': _numbered('lost', 40)},
+            'seed both files',
+        )
+        kept_sha = await _land_branch(
+            git_repo, '8004',
+            {'kept.py': _numbered('kept', 40) + _numbered('kept_new', 40)},
+        )
+        lost_sha = await _land_branch(
+            git_repo, '8005',
+            {'lost.py': _numbered('lost', 40) + _numbered('lost_new', 40)},
+        )
+        (git_repo / 'lost.py').write_text(_numbered('lost', 40))
+        await _commit_all(git_repo, 'revert only task 8005 deliverable')
+
+        kept_probe = await git_ops.describe_commit_effect_in_main(kept_sha)
+        lost_probe = await git_ops.describe_commit_effect_in_main(lost_sha)
+
+        assert kept_probe.present is True
+        assert lost_probe.present is False
+        assert kept_probe.anchor_sha != lost_probe.anchor_sha
+        # And re-reading either one after the other was cached is unaffected.
+        assert (await git_ops.describe_commit_effect_in_main(kept_sha)).present is True
+        assert (await git_ops.describe_commit_effect_in_main(lost_sha)).present is False
+
+    async def test_bool_wrapper_shares_the_memo_with_the_probe(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """(d) The decision call (the bool) and the reject-path enrichment
+        call (the probe) together cost ONE computation.
+
+        This is what makes landing_evidence's decide-with-the-bool /
+        enrich-with-the-probe split free — without a shared memo that split
+        would double the cost of the gate's hottest check.
+        """
+        await _seed_on_main(git_repo, {'mod.py': _numbered('base', 40)}, 'seed mod')
+        merge_sha = await _land_branch(
+            git_repo, '8006',
+            {'mod.py': _numbered('base', 40) + _numbered('added', 40)},
+        )
+
+        with _git_command_spy() as recorded:
+            probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+            recorded.clear()
+            present = await git_ops.commit_effect_present_in_main(merge_sha)
+            after_probe = list(recorded)
+
+        assert present is probe.present
+        assert after_probe == [['git', 'rev-parse', 'main']], (
+            f'the bool must reuse the probe memo, saw {after_probe}'
+        )
+
+    async def test_probe_reuses_a_memo_warmed_by_the_bool_wrapper(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """(d), other order: the bool warms the same memo the probe reads, so
+        the enrichment call after a False decision is free too — which is the
+        order landing_evidence actually uses.
+        """
+        await _seed_on_main(git_repo, {'mod.py': _numbered('base', 40)}, 'seed mod')
+        merge_sha = await _land_branch(
+            git_repo, '8007',
+            {'mod.py': _numbered('base', 40) + _numbered('added', 40)},
+        )
+        (git_repo / 'mod.py').write_text(_numbered('base', 40))
+        await _commit_all(git_repo, 'revert the deliverable on main')
+
+        with _git_command_spy() as recorded:
+            present = await git_ops.commit_effect_present_in_main(merge_sha)
+            recorded.clear()
+            probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+            after_bool = list(recorded)
+
+        assert present is False
+        assert probe.present is False
+        assert probe.failure == 'effect_not_survived'
+        assert after_bool == [['git', 'rev-parse', 'main']], (
+            f'the enrichment probe must reuse the bool\'s computation, '
+            f'saw {after_bool}'
+        )
+
+    async def test_memo_is_per_instance_and_does_not_leak_across_gitops(
+        self, git_ops: GitOps, git_config: GitConfig, git_repo: Path,
+    ) -> None:
+        """(e) The memo lives on the instance, not in a module global.
+
+        A module-level cache would survive a config change — a different
+        ``main_branch``, a different project_root — and answer for a
+        repository it never measured.
+        """
+        await _seed_on_main(git_repo, {'mod.py': _numbered('base', 40)}, 'seed mod')
+        merge_sha = await _land_branch(
+            git_repo, '8008',
+            {'mod.py': _numbered('base', 40) + _numbered('added', 40)},
+        )
+
+        warmed = await git_ops.describe_commit_effect_in_main(merge_sha)
+        other = GitOps(git_config, git_repo)
+        assert other._effect_probe_memo == {}, 'a fresh instance starts cold'
+
+        with _git_command_spy() as recorded:
+            fresh = await other.describe_commit_effect_in_main(merge_sha)
+
+        assert fresh == warmed
+        assert len(recorded) > 1, (
+            f'a second instance must recompute, not read a module global; '
+            f'saw {len(recorded)} commands'
+        )
+
+    async def test_transient_git_failures_are_never_memoized(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """A subprocess failure is NOT a repository fact and must not be
+        pinned for the life of the current HEAD.
+
+        The effect-absent condition is ABSORBING (byte-identity, once broken,
+        is never restored), so a memoized transient failure means a guaranteed
+        spurious full dispatch — plan/verify/review plus a task_failure
+        escalation — rather than a self-healing re-check.  Only verdicts
+        derived from repository CONTENT may be cached.
+        """
+        await _seed_on_main(git_repo, {'mod.py': _numbered('base', 40)}, 'seed mod')
+        merge_sha = await _land_branch(
+            git_repo, '8009',
+            {'mod.py': _numbered('base', 40) + _numbered('added', 40)},
+        )
+        original_run = _run
+
+        async def flaky_run(cmd, cwd=None, **kwargs):
+            if cmd[:2] == ['git', 'merge-base']:
+                return 128, '', 'fatal: simulated transient git failure'
+            return await original_run(cmd, cwd=cwd, **kwargs)
+
+        with patch('orchestrator.git_ops._run', side_effect=flaky_run):
+            failed = await git_ops.describe_commit_effect_in_main(merge_sha)
+
+        assert failed.present is False
+        assert failed.failure == 'merge_base_unresolved'
+        assert git_ops._effect_probe_memo == {}, (
+            'a transient git failure must not be cached'
+        )
+
+        recovered = await git_ops.describe_commit_effect_in_main(merge_sha)
+        assert recovered.present is True, (
+            'the next tick must re-measure, not replay the cached failure'
+        )
+
+
 @pytest.mark.asyncio
 class TestFindTaskCitationCommit:
     """Real-git tests for GitOps.find_task_citation_commit (task 2675 FIX 2).
