@@ -1631,10 +1631,13 @@ class CountingStr(str):
     def __len__(self):
         """Tally EXTRACTION-PIPELINE ENTRIES (task 3037).
 
-        Every extraction entry point opens with ``fact = fact or ''``, whose
-        truthiness test is the one and only Python-level ``__len__`` call the
-        pipeline makes on the fact — the ``re`` module reads a str subclass's
-        buffer at C level and never calls this. So ``reads`` counts exactly
+        The extraction pipeline normalises its input exactly once, in
+        ``extract_snapshot_edge_task_ids_by_marker_class`` (``fact = fact or
+        ''``; the two public accessors delegate to it rather than
+        re-normalising). That truthiness test is the one and only
+        Python-level ``__len__`` call the pipeline makes on the fact — the
+        ``re`` module reads a str subclass's buffer at C level and never
+        calls this. So ``reads`` counts exactly
         one per entry into the extraction pipeline, which is the property
         ``test_extraction_runs_exactly_once_per_edge`` needs and the
         ``touched`` character counter structurally cannot express (running

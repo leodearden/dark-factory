@@ -1106,7 +1106,7 @@ def _list_segment(text: str, start: int, open_char: str) -> str:
     return text[start:end]
 
 
-def extract_snapshot_edge_task_ids(fact: str) -> set[int]:
+def extract_snapshot_edge_task_ids(fact: str | None) -> set[int]:
     """Return the task ids *fact* asserts as active/pending/blocked/stalled/in-progress.
 
     Returns the empty set (never a candidate for invalidation) when:
@@ -1163,7 +1163,7 @@ def extract_snapshot_edge_task_ids(fact: str) -> set[int]:
     return extract_snapshot_edge_task_ids_by_marker_class(fact).all_ids
 
 
-def extract_blocked_assertion_task_ids(fact: str) -> set[int]:
+def extract_blocked_assertion_task_ids(fact: str | None) -> set[int]:
     """Return the subset of task ids *fact* asserts as BLOCKED specifically.
 
     The blocked-scoped counterpart of ``extract_snapshot_edge_task_ids``:
@@ -1213,7 +1213,7 @@ class SnapshotEdgeIds(NamedTuple):
     blocked_ids: set[int]
 
 
-def extract_snapshot_edge_task_ids_by_marker_class(fact: str) -> SnapshotEdgeIds:
+def extract_snapshot_edge_task_ids_by_marker_class(fact: str | None) -> SnapshotEdgeIds:
     """Extract BOTH id sets from *fact* in a single pass (task 3037).
 
     THE single extraction implementation in this module.
@@ -1238,6 +1238,14 @@ def extract_snapshot_edge_task_ids_by_marker_class(fact: str) -> SnapshotEdgeIds
     cheap-literal ``_BLOCKED_MARKER_RE`` pre-gate keeps the second family off
     the hot path entirely for the overwhelming majority of edges, which carry
     no 'blocked' token at all.
+
+    *fact* is typed ``str | None`` because THIS function is where a missing
+    fact is normalised, and callers read it straight off an untyped edge dict
+    (``edge.get('fact')``). Pushing an ``or ''`` back to each call site would
+    type-check equally well but cost an extra truthiness test per edge per
+    call site — which is also the probe
+    ``test_extraction_runs_exactly_once_per_edge`` counts pipeline entries
+    with, so a call-site guard reads there as a second extraction pass.
 
     Pure: no I/O, no side effects.
     """
@@ -1499,10 +1507,10 @@ def select_stale_status_snapshot_edges(
     """
     selected: list[dict] = []
     for edge in edges:
-        # Each fall-back extracts independently, and each entry point
-        # normalises a missing fact itself — so a caller that precomputes
-        # BOTH maps (the sweep does) costs zero extraction-pipeline entries
-        # here. Pinned by test_extraction_runs_exactly_once_per_edge.
+        # Each fall-back extracts independently — so a caller that
+        # precomputes BOTH maps (the sweep does) costs zero
+        # extraction-pipeline entries here. Pinned by
+        # test_extraction_runs_exactly_once_per_edge.
         if edge_ids is not None:
             ids = edge_ids.get(edge['uuid'], set())
         else:
