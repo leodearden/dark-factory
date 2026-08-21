@@ -1188,14 +1188,17 @@ class CommitEffectProbe:
           ``_EFFECT_SURVIVAL_AGGREGATE_THRESHOLD``, or some file at or
           above the added-lines floor below the per-file threshold).  The
           survival fields below carry the numbers behind it.
-        - ``'paths_diverged'`` — byte-identity is broken and NO touched
-          path contributed any added lines, so survival could not be
-          measured (a pure deletion, rename, binary or mode change).  An
-          INTERIM fallback to the pre-3116 semantics for that class, at
-          0.53% of the corpus; task 3116 b3 replaces it with real
-          per-shape handling.  Note this code no longer means "the effect
-          is gone" — for every path that DID add lines, divergence is now
-          reported through ``diverged_paths`` on any verdict.
+        - ``'vacuous_effect_absent'`` — a path contributing NO added
+          lines failed its own shape's arm (task 3116 b3): a deletion was
+          undone, a rename reverted, or a binary/rename blob no longer
+          matches.  Distinct from ``'effect_not_survived'`` so a rendered
+          escalation can never imply a survival ratio that was never
+          computed.  Carries ``vacuous_paths``.
+        - ``'paths_diverged'`` — retained for the residual case where
+          byte-identity is broken but neither arm could reach a decision.
+          Note it no longer means "the effect is gone": for any path that
+          added lines, divergence is now reported through
+          ``diverged_paths`` on PRESENT verdicts too.
         - ``'unresolvable_commit'`` — ``git rev-list --parents`` errored
           or returned nothing (e.g. the sha does not resolve).
         - ``'merge_base_unresolved'`` — a merge parent's ``git merge-base``
@@ -1239,6 +1242,13 @@ class CommitEffectProbe:
         The constants actually applied, recorded alongside the result so a
         rendered escalation is self-explaining and a later retune is
         visible in the output rather than silent.
+    vacuous_paths:
+        Touched paths decided by the VACUOUS arm rather than by line
+        survival — those contributing zero added lines, where an
+        added-lines test is trivially true.  On a
+        ``'vacuous_effect_absent'`` verdict these are the paths that
+        FAILED; the arm short-circuits on the first, so it names the
+        offender, not the whole vacuous set.
     """
     present: bool
     diverged_paths: tuple[str, ...] = ()
@@ -1251,6 +1261,7 @@ class CommitEffectProbe:
     aggregate_threshold: float | None = None
     per_file_threshold: float | None = None
     per_file_min_added_lines: int | None = None
+    vacuous_paths: tuple[str, ...] = ()
 
 
 class ConflictProbe(NamedTuple):
@@ -9339,10 +9350,15 @@ class GitOps:
             commit_sha, touched, parents[0] if parents else _EMPTY_TREE_SHA,
         )
 
-    async def _anchor_added_lines(
+    async def _anchor_diff_lines(
         self, base_sha: str, anchor_sha: str, path: str,
-    ) -> list[str] | None:
-        """Return the non-blank lines *path* ADDED between base and anchor.
+    ) -> tuple[list[str], list[str]] | None:
+        """Return (added, removed) non-blank lines for *path* between base and anchor.
+
+        Both directions come from ONE diff invocation: the survival path needs
+        the added lines and the vacuous arm (task 3116 b3) needs the removed
+        ones, and computing them separately would double the subprocess cost
+        of the check's hottest stage for no benefit.
 
         Run once per touched path rather than once per branch with the file
         headers parsed out of a combined diff.  That is deliberate: *path*
@@ -9378,16 +9394,89 @@ class GitOps:
         if rc != 0:
             return None
         added: list[str] = []
+        removed: list[str] = []
         for line in out.split('\n'):
-            # '+++ b/<path>' is a header, not content; everything else
-            # beginning with '+' is an added line.  A binary path yields
-            # "Binary files ... differ" and so contributes NO added lines,
-            # which routes it to the zero-added-lines arm below.
+            # '+++ b/<path>' and '--- a/<path>' are headers, not content;
+            # everything else beginning with '+'/'-' is content.  A binary
+            # path yields "Binary files ... differ" and so contributes
+            # NEITHER, routing it to the vacuous arm.
             if line.startswith('+') and not line.startswith('+++'):
                 body = line[1:].strip()
                 if body:
                     added.append(body)
-        return added
+            elif line.startswith('-') and not line.startswith('---'):
+                body = line[1:].strip()
+                if body:
+                    removed.append(body)
+        return added, removed
+
+    async def _path_exists_at(self, rev: str, path: str) -> bool:
+        """True iff *path* resolves to a blob at *rev*."""
+        rc, _, _ = await _run(
+            ['git', 'cat-file', '-e', f'{rev}:{path}'], cwd=self.project_root,
+        )
+        return rc == 0
+
+    async def _blob_oid_at(self, rev: str, path: str) -> str | None:
+        """Return *path*'s blob oid at *rev*, or None if it does not resolve."""
+        rc, out, _ = await _run(
+            ['git', 'rev-parse', f'{rev}:{path}'], cwd=self.project_root,
+        )
+        return out.strip() if rc == 0 and out.strip() else None
+
+    async def _vacuous_path_survives(
+        self, anchor_sha: str, path: str, removed: list[str],
+    ) -> bool:
+        """Decide a ZERO-ADDED-LINES path's survival (task 3116 b3).
+
+        An added-lines-survive test is trivially true for these paths, so
+        without this arm the whole class — pure line deletions, file removals,
+        renames, binaries, mode changes — is a silent no-op, which is the
+        task-1175 clobber this gate exists to prevent.  Corpus rate: 0.53%.
+
+        Each shape is decided by the mechanism that actually applies to it,
+        because the wrong mechanism gives a WRONG answer rather than no
+        answer.  A content-preserving rename is the sharp example: the lines
+        are identical on both sides of the move, so a line-set test still
+        reports "survived" after the rename has been undone.  Only presence
+        and blob identity can see that.
+
+        - **Path deleted by the anchor** — survives iff still absent at main.
+          Resurrecting a file the deliverable removed is a genuine revert.
+        - **Path present at anchor and main with the SAME blob oid** —
+          survives, byte for byte.  One mechanism covers renames, binaries,
+          content-identical moves and pure mode changes.
+        - **Blob differs, and the anchor removed lines here** — survives iff
+          those removed lines are still absent from main's line-set.
+
+        Removed-line absence is used HERE AND ONLY HERE, never as a global
+        conjunct on the survival path (b4): corpus-wide only 73.0% of removed
+        lines are still absent, and merge 3640 has 18 of its 45 removed lines
+        present again at main by short-common-line coincidence, so a global
+        conjunct would reject a motivating case.
+
+        Anything else — the blob differs with nothing measurable to check, as
+        for a clobbered binary — is fail-safe False.  Never a fabricated True.
+        """
+        main = self.config.main_branch
+        at_anchor = await self._path_exists_at(anchor_sha, path)
+        at_main = await self._path_exists_at(main, path)
+        if not at_anchor:
+            # The anchor DELETED this path; the effect is the absence.
+            return not at_main
+        if not at_main:
+            return False
+        anchor_oid = await self._blob_oid_at(anchor_sha, path)
+        main_oid = await self._blob_oid_at(main, path)
+        if anchor_oid is not None and anchor_oid == main_oid:
+            return True
+        if removed:
+            main_lines = await self._main_line_set(path)
+            if main_lines is None:
+                return False
+            return not any(line in main_lines for line in removed)
+        # Content differs with nothing measurable (e.g. a clobbered binary).
+        return False
 
     async def _main_line_set(self, path: str) -> set[str] | None:
         """Return the set of stripped, non-blank lines of *path* at main HEAD.
@@ -9486,9 +9575,10 @@ class GitOps:
         worst_guarded_survival: float | None = None
         guard_failed = False
 
+        vacuous_seen: list[str] = []
         for path in touched:
-            added = await self._anchor_added_lines(base_sha, anchor_sha, path)
-            if added is None:
+            diff_lines = await self._anchor_diff_lines(base_sha, anchor_sha, path)
+            if diff_lines is None:
                 return CommitEffectProbe(
                     present=False,
                     diverged_paths=diverged,
@@ -9496,8 +9586,24 @@ class GitOps:
                     failure='diff_failed',
                     **thresholds,
                 )
+            added, removed = diff_lines
             if not added:
-                # Vacuous for this path — decided by the b3 arm, not here.
+                # Zero added lines: an added-lines test is trivially true
+                # here, so this path is decided by its own shape's arm (b3).
+                vacuous_seen.append(path)
+                if not await self._vacuous_path_survives(anchor_sha, path, removed):
+                    # Short-circuit naming the OFFENDER.  This runs before the
+                    # aggregate is known on purpose, but it can only ever add
+                    # a rejection: a failed vacuous path is decisive on its
+                    # own, and the text arm below cannot rescue it.
+                    return CommitEffectProbe(
+                        present=False,
+                        diverged_paths=diverged,
+                        anchor_sha=anchor_sha,
+                        failure='vacuous_effect_absent',
+                        vacuous_paths=(path,),
+                        **thresholds,
+                    )
                 continue
             if path in diverged_set:
                 main_lines = await self._main_line_set(path)
@@ -9519,13 +9625,15 @@ class GitOps:
                     guard_failed = True
 
         if total_added == 0:
-            # Every touched path was vacuous.  Interim byte-identity fallback
-            # (see the docstring); step-12 replaces this with the b3 arm.
+            # Every touched path was vacuous and every one passed its arm.
+            # aggregate_survival stays None — UNDEFINED, deliberately neither
+            # 0.0 nor 1.0, because both would be assertions the code cannot
+            # support and this probe is rendered verbatim into an escalation.
             return CommitEffectProbe(
-                present=not diverged,
+                present=True,
                 diverged_paths=diverged,
                 anchor_sha=anchor_sha,
-                failure='paths_diverged' if diverged else None,
+                vacuous_paths=tuple(vacuous_seen),
                 **thresholds,
             )
 
@@ -9542,6 +9650,7 @@ class GitOps:
             added_lines_total=total_added,
             worst_guarded_path=worst_guarded_path,
             worst_guarded_survival=worst_guarded_survival,
+            vacuous_paths=tuple(vacuous_seen),
             **thresholds,
         )
 

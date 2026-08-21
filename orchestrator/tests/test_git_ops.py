@@ -5329,11 +5329,25 @@ class TestCommitEffectSurvivalVacuousCases:
     async def test_pure_rename_resolves_by_blob_not_line_set(
         self, git_ops: GitOps, git_repo: Path,
     ) -> None:
-        """A content-preserving rename.  Line sets cannot decide this — the
-        lines are identical on both sides of the move, so a line-membership
-        test says "survived" even after the rename is undone.  Only the
-        PRESENCE of the old path and the blob identity of the new one can
-        tell the difference, which is what the arm must use.
+        """A content-preserving rename must not be rescued by the identical
+        content still sitting at the OLD path.
+
+        MEASURED, and it corrected this test's original premise: git's rename
+        detection collapses the touched set for a pure rename to the
+        DESTINATION path alone (``diff --name-only`` reports only
+        ``new_name.py``), and a path-scoped ``diff --unified=0`` cannot see
+        the rename pair, so the destination reads as a plain 30-line ADD.  A
+        pure rename is therefore NOT vacuous under this enumeration and never
+        reaches the b3 arm — it is decided by ordinary line survival.
+
+        That is still correct, and for a reason worth pinning: survival is
+        measured PER PATH.  When the rename is undone, ``main:new_name.py``
+        does not resolve at all, so its line set is empty and survival is 0.0
+        no matter that the very same 30 lines are present at
+        ``main:old_name.py``.  Per-path scoping is what stops content
+        elsewhere in the tree from rescuing a reverted move; the assertion
+        below on the old path's content is what would catch a future
+        implementation that widened the line set beyond the path.
         """
         await _seed_on_main(
             git_repo, {'old_name.py': _numbered('body', 30)}, 'seed old_name',
@@ -5344,7 +5358,6 @@ class TestCommitEffectSurvivalVacuousCases:
 
         probe = await git_ops.describe_commit_effect_in_main(merge_sha)
         assert probe.present is True
-        assert probe.aggregate_survival is None
 
         rc, _, err = await _run(
             ['git', 'mv', 'new_name.py', 'old_name.py'], cwd=git_repo,
@@ -5352,12 +5365,19 @@ class TestCommitEffectSurvivalVacuousCases:
         assert rc == 0, f'rename revert failed: {err}'
         await _commit_all(git_repo, 'revert the rename')
 
+        assert (git_repo / 'old_name.py').read_text() == _numbered('body', 30), (
+            'precondition: every one of the moved lines is still present at '
+            'main, just at the old path — this is what a path-blind line-set '
+            'implementation would be fooled by'
+        )
+
         probe = await git_ops.describe_commit_effect_in_main(merge_sha)
         assert probe.present is False, (
             'the rename was undone — identical line CONTENT at the old path '
             'must not read as the effect surviving'
         )
-        assert probe.failure == 'vacuous_effect_absent'
+        assert probe.failure == 'effect_not_survived'
+        assert probe.aggregate_survival == 0.0
 
     async def test_binary_blob_never_crashes_and_never_fakes_survival(
         self, git_ops: GitOps, git_repo: Path,
