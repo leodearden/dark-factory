@@ -846,6 +846,29 @@ class UsageGate:
             old_phase == AccountPhase.PROBE_IN_FLIGHT and new_phase == AccountPhase.AVAILABLE
         ):
             acct.probe_count = 0
+        if old_phase in (AccountPhase.CAPPED, AccountPhase.AUTH_FAILED) and new_phase not in (
+            AccountPhase.CAPPED,
+            AccountPhase.AUTH_FAILED,
+        ):
+            # Task 4512 review fix. probe_spawn_failures counts CONSECUTIVE
+            # failures to SPAWN a probe, and only CAPPED/AUTH_FAILED accounts
+            # spawn probes (_account_resume_probe_loop and _reprobe_account
+            # respectively). An account leaving that set stops producing
+            # evidence, so a counter left behind here is stale forever: it
+            # both pins the latch UNHEALTHY after the host is fixed and lets a
+            # single later transient error trip the >1 threshold. Belongs here
+            # rather than in each caller for the same reason probe_count does
+            # — this method is the sole writer of `phase`, and the two paths
+            # that stranded the counter (_refresh_capped_accounts' clock-driven
+            # CAPPED -> PROBING, _on_sighup_async's hard reset) were missed
+            # precisely because they never touch the probe machinery.
+            #
+            # Note the condition is "leaves the blocked SET", not "leaves
+            # CAPPED": CAPPED <-> AUTH_FAILED both still probe, so evidence
+            # must keep accumulating across that edge.
+            self._reset_probe_spawn_failures(
+                acct, reason=f'account left {old_phase.value} for {new_phase.value}'
+            )
 
         # --- Force hard-reset cleanup (operator-driven, SIGHUP only) ------
         # force=True is reserved for _on_sighup_async's per-account hard
@@ -861,6 +884,12 @@ class UsageGate:
                 acct.auth_reprobe_task.cancel()
             acct.probe_count = 0
             acct.resets_at = None
+            # Covers the AVAILABLE -> AVAILABLE self-loop the blocked-set
+            # block above cannot see (task 4512 review): SIGHUP discards every
+            # account's cap/auth evidence, so it must discard the spawn-fault
+            # evidence with it rather than stay latched on counts it has just
+            # invalidated.
+            self._reset_probe_spawn_failures(acct, reason='operator hard reset (SIGHUP)')
 
         # --- Centralized _open recompute (DD-5) ---------------------------
         if any(a.phase in (AccountPhase.AVAILABLE, AccountPhase.PROBING) for a in self._accounts):
@@ -1941,14 +1970,34 @@ class UsageGate:
         that has healed on one account of six stays reported until the rest
         confirm it too.
         """
+        self._reset_probe_spawn_failures(acct, reason='a probe spawned successfully')
+
+    def _reset_probe_spawn_failures(self, acct: AccountState, *, reason: str) -> None:
+        """Zero *acct*'s consecutive spawn-failure count and re-evaluate the latch.
+
+        The shared core behind both ways a pending run of failures can END:
+
+        - a probe for *acct* actually RAN (:meth:`_clear_probe_spawn_failures`)
+          — positive proof the binary is resolvable again; or
+        - *acct* LEFT the probing phases (:meth:`_transition`) — after which it
+          can never produce that proof, because only CAPPED/AUTH_FAILED
+          accounts spawn probes at all.
+
+        Both must re-evaluate the latch rather than merely zero the field: a
+        count the gate has just declared meaningless would otherwise keep
+        reporting the gate UNHEALTHY forever (task 4512 review).
+
+        The zeroing deliberately precedes the re-evaluation, so the account
+        being reset never vetoes its own clear.
+        """
         acct.probe_spawn_failures = 0
         if any(a.probe_spawn_failures for a in self._accounts):
             return
         if getattr(self, '_probe_infra_fault', None) is not None:
             logger.info(
-                'UsageGate probe infrastructure fault CLEARED: a probe for '
-                'account %s spawned successfully.',
+                'UsageGate probe infrastructure fault CLEARED for account %s: %s',
                 acct.name,
+                reason,
             )
         self._probe_infra_fault = None
 
