@@ -1992,6 +1992,20 @@ class Scheduler:
         self._module_cache: dict[str, list[str]] = {}  # task_id -> expanded modules
         self._fallback_warned: set[str] = set()  # task IDs already warned about fallback
         self._requeue_until: dict[str, float] = {}  # task_id -> monotonic deadline
+        # ADDITIVE sibling of _requeue_until (task 3317 / PRD contract C3):
+        # per-task cooldown facts for the state snapshot's `requeue_cooldowns`
+        # key.  _requeue_until itself keeps its plain dict[str, float] shape —
+        # the two eligibility readers, the per-tick GC sweep and several tests
+        # all depend on that — so the operator-facing detail lives here rather
+        # than widening the deadline map's value type.
+        #
+        # Holds ONLY values FIXED AT ARMING.  Nothing may be derived from
+        # "now": _build_snapshot_payload content-dedups the snapshot to
+        # throttle disk writes, so a field recomputed per tick (a naive
+        # `remaining_secs`) would make every payload byte-different and defeat
+        # the throttle.  Written in `release`, popped in lockstep by
+        # `_gc_expired_cooldowns` so an entry can never outlive its deadline.
+        self._requeue_cooldown_meta: dict[str, dict] = {}
         # Per-task dispatch timestamps (monotonic) for the dispatch-cooldown
         # gate.  Set immediately after a successful dispatch; cleared when the
         # task transitions to a terminal status.  Process-local — an
@@ -4707,6 +4721,11 @@ class Scheduler:
         for tid, deadline in list(self._requeue_until.items()):
             if deadline <= now:
                 del self._requeue_until[tid]
+                # Keep the snapshot meta in lockstep (task 3317) so a
+                # `requeue_cooldowns` entry can never outlive its deadline.
+                # `.pop(..., None)` because a deadline can be injected
+                # directly (tests) with no meta entry behind it.
+                self._requeue_cooldown_meta.pop(tid, None)
 
     def _deferred_watch_gated(self, task: dict) -> bool:
         """Return True when *task* must be withheld from dispatch as a
@@ -7386,7 +7405,7 @@ class Scheduler:
     def get_state_snapshot(self) -> dict:
         """Return a deep-copy snapshot of current in-memory scheduler state.
 
-        Contains eleven top-level keys:
+        Contains twelve top-level keys:
         - skip_counts: {task_id: int}
         - parks: {task_id: {modules: [...], installed_at: str}}
         - park_stacks: {module: [{owner, rank, shadowed, installed_at}, ...]} —
@@ -7401,6 +7420,20 @@ class Scheduler:
           same way before matching against current_holders.
         - is_paused: bool — True when the scheduler is park-stop paused
         - pause_reason: str | None — human-readable reason, or None when not paused
+        - requeue_cooldowns: {task_id: {armed_secs, envelope_secs, transient,
+          transient_count}} — the per-task requeue cooldown currently gating
+          re-dispatch, as armed (task 3317 / PRD contract C3).  ``armed_secs``
+          GROWS across successive transient (5xx) requeues — 30/60/120/240/480,
+          capped at 900 — and stays FLAT at ``requeue_cooldown_secs`` for a
+          genuine one; ``envelope_secs`` is the un-jittered ceiling the armed
+          value was drawn from (``armed`` always lies in
+          ``[envelope/2, envelope]``).  Entries appear at arming and are
+          dropped by ``_gc_expired_cooldowns`` when the deadline passes, so
+          the key answers "which tasks are cooling, and for how long".
+          NO wall-clock-relative "remaining" field is emitted, deliberately:
+          every value here is fixed at arming, because
+          ``_build_snapshot_payload`` content-dedups this snapshot to throttle
+          disk writes and a per-tick-recomputed field would defeat it.
         - snapshot_at: ISO8601 timestamp
         """
         # skip_counts — plain int values, safe to copy.
@@ -7465,6 +7498,11 @@ class Scheduler:
             'lock_depth': self.config.lock_depth,
             'is_paused': self.is_paused,
             'pause_reason': self.pause_reason,
+            # Per-entry copy — honours this method's deep-copy contract, so a
+            # caller mutating the returned dict cannot corrupt scheduler state.
+            'requeue_cooldowns': {
+                tid: dict(meta) for tid, meta in self._requeue_cooldown_meta.items()
+            },
             'snapshot_at': datetime.now(UTC).isoformat(),
         }
 
@@ -7939,15 +7977,24 @@ class Scheduler:
         armed_n = self._pending_transient_cooldown.pop(task_id, None)
         if requeued:
             if armed_n is None:
-                cooldown = self.config.requeue_cooldown_secs
+                cooldown = envelope = self.config.requeue_cooldown_secs
             else:
-                cooldown, _envelope = transient_requeue_cooldown(
+                cooldown, envelope = transient_requeue_cooldown(
                     armed_n,
                     base_secs=self.config.transient_requeue_backoff_base_secs,
                     cap_secs=self.config.transient_requeue_backoff_cap_secs,
                     rng=self._jitter_source,
                 )
             self._requeue_until[task_id] = self._time_source() + cooldown
+            # Operator-facing record of what was just armed.  JSON-native
+            # primitives ONLY (float/bool/int) and nothing derived from "now"
+            # — see the _requeue_cooldown_meta declaration for why.
+            self._requeue_cooldown_meta[task_id] = {
+                'armed_secs': round(cooldown, 3),
+                'envelope_secs': round(envelope, 3),
+                'transient': armed_n is not None,
+                'transient_count': armed_n or 0,
+            }
         modules = list(self.lock_table._held.get(task_id, set()))
         self.lock_table.release(task_id)
         # Defensive: clear any reservations still owned by this task.
