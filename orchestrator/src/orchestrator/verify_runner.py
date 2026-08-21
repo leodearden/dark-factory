@@ -507,6 +507,13 @@ async def run_merge_verify_on_worktree(
     delegates to LocalRunner.run_merge_verify (the same bundle the merge queue
     runs), providing fidelity by construction (PRD §A Invariant 1 / D2).
 
+    The reconstructed set is ALSO installed as the config's module registry
+    (task 4536), so ``config.module_configs_or_empty`` and the positionally
+    passed *module_configs* cannot disagree on this leg — whichever of the two
+    a downstream consumer happens to read (``effective_merge_module_configs``
+    reads the registry; ``run_scoped_verification`` is handed the list), it
+    sees the DISPATCHER's set rather than the remote host's own discovery walk.
+
     Args:
         merge_wt: Path to the detached worktree at the merge SHA.
         config:   OrchestratorConfig for the host project.
@@ -558,6 +565,55 @@ async def run_merge_verify_on_worktree(
         config_update['lint_command'] = spec.global_verify_command.lint_command
         config_update['type_check_command'] = spec.global_verify_command.type_check_command
     config = config.model_copy(update=config_update)
+    # Task 4536 — the spec is authoritative for the module SET too, not just
+    # the profile above. `module_configs` (reconstructed from the wire spec a
+    # few lines up) is the DISPATCHER's set, already widened at the
+    # merge-request boundary by merge_queue._merge_boundary_module_configs
+    # before build_merge_verify_spec projected it. But
+    # `config.module_configs_or_empty` is still the REMOTE host's
+    # _discover_module_configs(config.project_root) walk, and
+    # verify_plan.effective_merge_module_configs PREFERS that registry over the
+    # passed list under merge_verify_breadth='full'. Without this line a
+    # stale/divergent/narrower remote checkout silently decides the merge: it
+    # both DROPS modules the spec named (the task-2822 false-green class — the
+    # verdict vouches for modules no gate ever ran on) and INJECTS modules the
+    # spec never named (a red attributable to a subproject the dispatching side
+    # never scoped).
+    #
+    # This makes effective_merge_module_configs' OWN documented INV-5 ordering
+    # invariant true on the remote leg: its docstring already claims the wire
+    # spec "(and hence the remote's reconstruction of it in
+    # verify_runner.run_merge_verify_on_worktree)" receives the identical set BY
+    # CONSTRUCTION. Before this line that parenthetical was aspirational.
+    #
+    # It is the natural extension of fix (a): the spec is the single source of
+    # truth for the merge-deciding profile, and the module SET is part of that
+    # profile — alongside merge_verify_workspace/merge_verify_breadth (task
+    # 2822) and the global commands (INV-1, task 2883).
+    #
+    # No conditional is needed to protect the genuinely LOCAL merge path:
+    # run_merge_verify_on_worktree is reached only from cli.py's `verify-merge`
+    # subcommand (the remote/CLI host entry), while the local path constructs
+    # LocalRunner directly in merge_queue.py — so host discovery survives there
+    # by construction.
+    #
+    # Spelling constraints (all verified against the installed pydantic):
+    #  - DIRECT private-attribute assignment, never an entry in `config_update`.
+    #    `_module_configs` is a PrivateAttr, not a model field, so
+    #    model_copy(update=...) would write it into instance __dict__ while
+    #    __pydantic_private__ kept the stale value — it would read back only via
+    #    __dict__ shadowing, a later normal write would be silently swallowed,
+    #    and the shadow would propagate into further copies. Direct assignment
+    #    is the repo-wide blessed idiom (see config.load_config).
+    #  - REBIND the whole dict, never mutate in place: model_copy shares
+    #    __pydantic_private__ BY REFERENCE with the source, so an in-place
+    #    .clear()/.update() would corrupt the CALLER's config registry.
+    #  - UNCONDITIONAL, including `{}` for a zero-module spec. `{}` is the
+    #    documented "discovery ran and found no subprojects" value (distinct
+    #    from the None "never ran" sentinel) — exactly the claim a zero-module
+    #    spec makes, and what routes it to the INV-1 global gate instead of the
+    #    remote host's own modules.
+    config._module_configs = {mc.prefix: mc for mc in module_configs}
 
     runner = LocalRunner(
         merge_wt,
