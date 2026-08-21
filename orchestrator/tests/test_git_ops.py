@@ -4696,6 +4696,15 @@ class TestDescribeCommitEffectInMain:
         later commit fully replaces the touched file, so the probe not only
         says absent but NAMES ``fileA.py`` as the diverged path.  The naming
         is the point here, not the bool.
+
+        The failure code became ``'effect_not_survived'`` with task 3116 part
+        (b).  The verdict is unchanged and so is the reason it is correct —
+        this is a full REPLACEMENT (``fixed`` -> ``changed again``), so line
+        survival is 0.0 and the commit's effect really is gone.  What changed
+        is only which fact decides it: ``'paths_diverged'`` (byte-identity
+        broken) is now a diagnostic that no longer decides anything, because
+        95.4% of the corpus breaks byte-identity while their deliverables sit
+        untouched at main.
         """
         (git_repo / 'fileA.py').write_text('fixed\n')
         await _run(['git', 'add', 'fileA.py'], cwd=git_repo)
@@ -4713,7 +4722,8 @@ class TestDescribeCommitEffectInMain:
         probe = await git_ops.describe_commit_effect_in_main(fix_sha)
 
         assert probe.present is False
-        assert probe.failure == 'paths_diverged'
+        assert probe.failure == 'effect_not_survived'
+        assert probe.aggregate_survival == 0.0
         assert probe.diverged_paths == ('fileA.py',)
         assert probe.anchor_sha == fix_sha
 
@@ -4730,10 +4740,25 @@ class TestDescribeCommitEffectInMain:
         second parent nonetheless fails, because the parent's pre-merge
         blob for ``shared.manifest`` lacks main's independent edit.
 
-        The regression proof is that the probe names ``shared.manifest``
-        and NOT ``deliverable.py``: a human reading the escalation can see
-        in one line that the diverged path is not this task's deliverable,
-        which is skew, not a revert.
+        SINCE TASK 3116 PART (b) THIS LANDING IS ACCEPTED, and the inversion
+        of this assertion is the entire point of the task rather than a
+        regression.  Nothing about the scenario changed — it was always a
+        clean landing whose deliverable is intact at main — only the question
+        being asked did.  Byte-identity ("has anyone touched these paths?")
+        said absent; line survival ("are the branch's added lines still
+        there?") says 1.0, because the merge integrated both edits exactly as
+        git intended.  Under the old semantics this shape cost a full
+        spurious dispatch: plan/verify/review re-run, a bogus task_failure
+        escalation filed, days blocked, and the condition is ABSORBING, so
+        every subsequent tick repeated it.
+
+        ``diverged_paths`` is still asserted, and still names
+        ``shared.manifest`` and NOT ``deliverable.py``.  That diagnostic is
+        retained on a PRESENT verdict on purpose: it is the single most
+        legible line in an escalation — it shows at a glance that the
+        diverged path is a co-touched hot file rather than this task's
+        deliverable, i.e. skew rather than a revert — it has simply stopped
+        being the thing that decides the verdict.
         """
         (git_repo / 'shared.manifest').write_text(
             ''.join(f'line{i}\n' for i in range(1, 41))
@@ -4782,8 +4807,9 @@ class TestDescribeCommitEffectInMain:
 
         probe = await git_ops.describe_commit_effect_in_main(merge_sha)
 
-        assert probe.present is False
-        assert probe.failure == 'paths_diverged'
+        assert probe.present is True
+        assert probe.failure is None
+        assert probe.aggregate_survival == 1.0
         assert probe.diverged_paths == ('shared.manifest',)
         assert 'deliverable.py' not in probe.diverged_paths
         assert probe.anchor_sha == second_parent
