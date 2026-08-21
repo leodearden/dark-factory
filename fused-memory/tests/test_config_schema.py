@@ -3033,6 +3033,111 @@ class TestWriteTriageConfig:
                 'procedural_knowledge': 0.88, 'observations_and_summaries': 9.0,
             })
 
+    # -- operator knobs (task 3127, PRD leaf beta) --------------------------
+    #
+    # DELIBERATELY NOT added to the `['t_high', 't_low',
+    # 'calibration_report_path']` parametrize lists above. Those pin "defaults
+    # to None", which encodes UNCALIBRATED — a meaningful state for a measured
+    # threshold and a meaningless one for a kill switch. `enabled` and
+    # `candidate_k` are hand-set OPERATOR knobs, not calibration outputs, so
+    # they ship with real defaults and get their own tests here.
+
+    def test_enabled_ships_off(self):
+        """The D10 staged-rollout flag ships FALSE, on every deployment.
+
+        `write_triage.enabled` is the PRD's `write_triage_enabled`: it swaps
+        the two reject guards for redirect-not-reject routing across every
+        add_memory write. Shipping it True would flip that behaviour on the
+        merge that lands the skeleton, ahead of the judge (leaf gamma) and
+        ahead of the 3169 flip gate.
+        """
+        from fused_memory.config.schema import WriteTriageConfig  # noqa: PLC0415
+
+        value = WriteTriageConfig().enabled
+        assert value is False, (
+            f'write_triage.enabled must default to False (D10 staged rollout: '
+            f'the flag ships off and is flipped by task 3169); got {value!r}'
+        )
+
+    def test_candidate_k_default_is_materially_wider_than_the_retired_guards_five(self):
+        """k caps what any band threshold can achieve, so it is not inherited.
+
+        Measured same-category recall on the live corpus: 26.1% @5, 43.9% @10,
+        69.4% @20, 88.5% @50. Retrieval width is a RANK property — a candidate
+        that never enters the result set cannot be scored by any t_high or
+        t_low, so k is the ceiling on the whole band mechanism. The retired
+        near-dup guard's hardcoded `limit=5` (server/tools.py, at the guard
+        call site) is therefore the one number this leaf must NOT inherit by
+        analogy: at 5 the deterministic band would miss ~three quarters of the
+        duplicates it exists to catch, and the miss would be invisible.
+        """
+        from fused_memory.config.schema import WriteTriageConfig  # noqa: PLC0415
+
+        value = WriteTriageConfig().candidate_k
+        assert isinstance(value, int) and not isinstance(value, bool), (
+            f'write_triage.candidate_k must be an int, got {value!r}'
+        )
+        assert value > 5, (
+            f'write_triage.candidate_k must be materially wider than the retired '
+            f'near-dup guard\'s hardcoded limit=5 (measured same-category recall: '
+            f'26.1% @5 vs 69.4% @20 — k caps what any band threshold can reach); '
+            f'got {value!r}'
+        )
+
+    @pytest.mark.parametrize('value', [0, -1])
+    def test_candidate_k_rejects_a_width_that_would_disable_retrieval(self, value):
+        """Bounded ge=1 so a typo cannot silently turn triage into a no-op.
+
+        A `candidate_k: 0` loads fine as an int and produces an empty
+        candidate list on every write, which the band router reads as "no
+        comparable candidate" and routes to `stored`. That is triage disabled
+        with no error, no log line, and nothing to grep — the exact silent
+        degradation INV-4 exists to prevent. Fail at LOAD instead.
+        """
+        from fused_memory.config.schema import WriteTriageConfig  # noqa: PLC0415
+
+        with pytest.raises(ValidationError):
+            WriteTriageConfig(candidate_k=value)
+
+    def test_the_root_wiring_introduces_no_operator_knob_override(self):
+        """The submodel's own defaults are what every deployment gets.
+
+        Same half-of-the-invariant guard as
+        test_root_wiring_introduces_no_default above: a
+        ``default_factory=lambda: WriteTriageConfig(enabled=True)`` would
+        leave the class defaults clean while shipping the flag ON.
+        """
+        factory = FusedMemoryConfig.model_fields['write_triage'].default_factory
+        assert factory is not None
+        assert factory().enabled is False  # type: ignore[call-arg]
+        assert factory().candidate_k > 5  # type: ignore[call-arg]
+
+    def test_the_shipped_config_yaml_ships_the_flag_off_and_k_wide(self, monkeypatch):
+        """The pin must hold on the REAL deployment file, not just the model.
+
+        The schema default is what a deployment gets only if config.yaml stays
+        silent. config.yaml carries an explicit `write_triage:` block, so the
+        shipped values there are what the running server actually reads — and
+        they are what an operator (and the next calibration run) can edit.
+        Asserting the class default alone would pass while the deployed file
+        said `enabled: true`.
+        """
+        yaml_path = Path(__file__).resolve().parent.parent / 'config' / 'config.yaml'
+        assert yaml_path.is_file(), f'expected config.yaml at {yaml_path}'
+        monkeypatch.setenv('CONFIG_PATH', str(yaml_path))
+        cfg = FusedMemoryConfig()
+
+        assert cfg.write_triage.enabled is False, (
+            'fused-memory/config/config.yaml must ship write_triage.enabled: '
+            'false — the D10 staged-rollout flag is flipped by task 3169, not '
+            'by the merge that lands the skeleton'
+        )
+        assert cfg.write_triage.candidate_k > 5, (
+            'fused-memory/config/config.yaml must ship a candidate_k wider than '
+            "the retired guard's limit=5 (measured recall 26.1% @5 vs 69.4% @20)"
+        )
+
+
 
 class TestMemoryMetadataConfig:
     """`memory_metadata` — the Mem0 metadata write-boundary section (task 3195, leaf β).
