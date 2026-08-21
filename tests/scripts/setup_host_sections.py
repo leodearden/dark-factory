@@ -16,7 +16,8 @@ verbatim, to run in a hermetic tmp tree.
 Endpoints are DERIVED from markers, never pinned line numbers, so a slice
 follows a reflow of its block instead of silently shifting off it.
 
-MARKERS ARE CODE, NOT COMMENT PROSE. Each parity block hoists a uniquely-named
+MARKERS ARE CODE, NOT COMMENT PROSE — enforced, not merely stated: every
+marker is located on a non-comment line. Each parity block hoists a uniquely-named
 `_<gate>_parity_script="$REPO_ROOT/scripts/check_<x>_unit_parity.py"`
 assignment at its top, and that line is the anchor. Anchoring on the section
 comment instead would make CI red for a reworded comment or a fixed typo — zero
@@ -28,13 +29,17 @@ keys on, so both mechanisms share one anchor.
 
 NOTHING HERE TOUCHES REAL SYSTEMD. `repo_root` and `unit_dir` are always
 tmp_path trees supplied by the caller, and `systemctl` is always a PATH stub
-that exits 0 — the sliced sections do call `systemctl --user enable`.
+that exits 0 — the sliced sections do call `systemctl --user enable`. That stub
+also RECORDS its argv into tmp_path, readable via `systemctl_calls` /
+`enabled_units`, so the enable half of an install is observable rather than
+merely assumed. Always, with no opt-in flag: a caller that never reads the log
+is unaffected, and a flag would give the harness two behaviours to reason about
+while letting a future caller silently lose the observability.
 
-Generalized from the reference implementation at
-tests/scripts/test_check_orchestrator_unit_parity.py:1044-1119 (task 3424).
-That file deliberately still carries its own copy: migrating it needs an edit
-to a file this task holds no lock on. See the amendment note in the commit that
-introduced this paragraph.
+Generalized from the reference implementation in
+tests/scripts/test_check_orchestrator_unit_parity.py (task 3424) and migrated
+onto this module by task 3909, so all four parity suites now share one slicer,
+one preamble and one stub.
 """
 
 from __future__ import annotations
@@ -60,14 +65,40 @@ _SHIMS = (
 )
 
 
+# Where the systemctl stub appends one line per invocation, relative to the
+# caller's tmp_path.
+SYSTEMCTL_LOG = "systemctl-calls.log"
+
+
+# setup-host.sh defines `_parity_verdict` once, below the log shims and above
+# every parity call site, so a sliced block that calls it needs it in scope.
+_VERDICT_HELPER_START = "_parity_verdict() {"
+_VERDICT_HELPER_END = "\n}\n"
+
+
 def _preamble(repo_root: pathlib.Path, unit_dir: pathlib.Path) -> str:
-    """setup-host.sh's own `set` flags and variables, plus the plain-text shims."""
+    """setup-host.sh's own `set` flags and variables, the shims, and the verdict helper.
+
+    The helper is SLICED LIVE out of setup-host.sh, never carried here as a
+    hand-written copy — unlike the four log shims above, which are deliberately
+    reduced to plain text. The shims are reduced for a stated reason (stripping
+    ANSI so assertions can match on prefixes) and their bodies are trivial
+    `printf`s with no logic to drift. `_parity_verdict` IS the logic under
+    test: a copied body would let the version the suite exercises and the
+    version setup-host.sh ships diverge silently — which is precisely the
+    "reports green because it never ran" class this whole gate family exists to
+    catch, reproduced one level up in its own harness.
+
+    Slicing also fails LOUDLY (slice_section asserts, naming the marker) if the
+    helper is ever renamed, rather than leaving the suite testing a helper the
+    installer no longer has.
+    """
     return (
         "set -euo pipefail\n"
         f'REPO_ROOT="{repo_root}"\n'
         f'UNIT_DIR="{unit_dir}"\n'
         'mkdir -p "$UNIT_DIR"\n'
-    ) + _SHIMS
+    ) + _SHIMS + slice_section(_VERDICT_HELPER_START, _VERDICT_HELPER_END)
 
 
 def setup_host_text() -> str:
@@ -75,7 +106,36 @@ def setup_host_text() -> str:
     return SETUP_HOST_PATH.read_text(encoding="utf-8")
 
 
-def slice_section(start_marker: str, end_marker: str) -> str:
+def _find_in_code(text: str, marker: str, *, start: int = 0) -> int:
+    """Index of the first occurrence of *marker* on a NON-COMMENT line.
+
+    Enforces this module's "MARKERS ARE CODE, NOT COMMENT PROSE" rule rather
+    than merely stating it, and matches the discovery rule the structural sweep
+    in test_check_dashboard_unit_parity.py::_parity_call_sites already applies
+    (`line.lstrip().startswith("#")`).
+
+    Not cosmetic. MEASURED before this existed: a plain `text.find` for
+    `_orch_parity_script=` landed on setup-host.sh's own harness-constraint
+    COMMENT, which quotes the anchor, and the resulting slice reached back over
+    189 lines of real installer code — including an `install -m 0755` writing
+    into `$HOME`. These slices are EXECUTED, so that is a test running against
+    the developer's real home directory.
+
+    Returns -1 when *marker* appears only in comments (or not at all), so the
+    caller raises its own self-naming AssertionError.
+    """
+    pos = text.find(marker, start)
+    while pos != -1:
+        line_start = text.rfind("\n", 0, pos) + 1
+        if not text[line_start:pos].lstrip().startswith("#"):
+            return pos
+        pos = text.find(marker, pos + 1)
+    return -1
+
+
+def slice_section(
+    start_marker: str, end_marker: str, *, end_after: str | None = None
+) -> str:
     """Return setup-host.sh from the line carrying *start_marker* through *end_marker*.
 
     The slice runs from the START of the line containing the first instance of
@@ -83,25 +143,54 @@ def slice_section(start_marker: str, end_marker: str) -> str:
     *end_marker* at or after it — both endpoints derived, so the slice survives
     a reflow of the block.
 
-    Raises AssertionError NAMING the missing marker when either is absent. That
+    Every marker is located on a NON-COMMENT line (see `_find_in_code`): a
+    comment that quotes an anchor is prose about the code, not the code.
+
+    *end_after* is an optional THIRD anchor. When given, the search for
+    *end_marker* begins at it rather than at *start_marker*, so a slice can be
+    made to run THROUGH an inner construct that closes with the same token —
+    the orchestrator installer slice must end at the column-0 `fi` closing the
+    INSTALL construct, not at the gate's own, which is the first one after the
+    start.
+
+    Deliberately an ANCHOR rather than the counted `occurrence` parameter task
+    3557 deleted as dead. "The second `fi`" is a number that shifts silently
+    the moment the block is reflowed — re-pointing the slice at a region nobody
+    chose — whereas a marker that moves out from under the slice fails loudly,
+    which is the same reason 3557 removed the counted form.
+
+    Raises AssertionError NAMING the missing marker when any is absent. That
     matters: the silent alternative is a slice of the wrong (or empty) region,
     which runs cleanly and produces a vacuously green test — the same
     "reported green because it never ran" failure these tests exist to catch.
     """
     text = setup_host_text()
 
-    pos = text.find(start_marker)
+    pos = _find_in_code(text, start_marker)
     assert pos != -1, (
-        f"start_marker {start_marker!r} not found in {SETUP_HOST_PATH}. A "
-        f"renamed anchor must fail here, not slice an empty region."
+        f"start_marker {start_marker!r} not found in {SETUP_HOST_PATH} on a "
+        f"non-comment line. A renamed anchor must fail here, not slice an "
+        f"empty region."
     )
 
     start = text.rfind("\n", 0, pos) + 1
 
-    end_pos = text.find(end_marker, pos)
+    search_from = pos
+    if end_after is not None:
+        after_pos = _find_in_code(text, end_after, start=pos)
+        assert after_pos != -1, (
+            f"end_after {end_after!r} not found in {SETUP_HOST_PATH} on a "
+            f"non-comment line at or after {start_marker!r}."
+        )
+        search_from = after_pos
+
+    end_pos = text.find(end_marker, search_from)
+    # Names whichever anchor the search actually started from, so the message
+    # points at the region that was searched rather than at a marker that was
+    # found.
     assert end_pos != -1, (
         f"end_marker {end_marker!r} not found in {SETUP_HOST_PATH} at or after "
-        f"{start_marker!r}."
+        f"{end_after if end_after is not None else start_marker!r}."
     )
     # Search for the line end from the marker's LAST character, not its first.
     # An end_marker may itself span lines (`"\nfi\n"` is the natural way to name
@@ -125,14 +214,21 @@ def run_section(
 ) -> subprocess.CompletedProcess:
     """Execute *section_text* under bash with setup-host.sh's own preamble.
 
-    A stub `systemctl` that exits 0 is written into a tmp dir and PREPENDED to
-    PATH, so a slice containing `systemctl --user enable` neither touches the
-    host nor fails under `set -e`.
+    A stub `systemctl` is written into a tmp dir and PREPENDED to PATH, so a
+    slice containing `systemctl --user enable` neither touches the host nor
+    fails under `set -e`. It RECORDS its argv (one call per line) into
+    ``tmp_path / SYSTEMCTL_LOG`` before exiting 0 — see the module docstring
+    for why that is unconditional.
     """
     stub_bin = tmp_path / "stub-bin"
     stub_bin.mkdir(exist_ok=True)
     systemctl = stub_bin / "systemctl"
-    systemctl.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    systemctl.write_text(
+        "#!/usr/bin/env bash\n"
+        f"printf '%s\\n' \"$*\" >> {tmp_path / SYSTEMCTL_LOG}\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
     systemctl.chmod(0o755)
 
     script = tmp_path / "section.sh"
@@ -149,14 +245,43 @@ def run_section(
     )
 
 
+def systemctl_calls(tmp_path: pathlib.Path) -> list[list[str]]:
+    """Every `systemctl` invocation the run made, as argv token lists."""
+    log = tmp_path / SYSTEMCTL_LOG
+    if not log.is_file():
+        return []
+    return [
+        line.split() for line in log.read_text(encoding="utf-8").splitlines() if line
+    ]
+
+
+def enabled_units(tmp_path: pathlib.Path) -> list[str]:
+    """The units passed to `systemctl ... enable <unit>` during the run.
+
+    Token-matched rather than substring-matched: `enable` naming one unit must
+    never be satisfied by a line naming a different one.
+    """
+    enabled: list[str] = []
+    for argv in systemctl_calls(tmp_path):
+        if "enable" in argv:
+            enabled.extend(argv[argv.index("enable") + 1 :])
+    return enabled
+
+
 def usage_error_checker(script_name: str, usage_flags: str, rejected: str) -> str:
     """A stub checker body shaped like argparse rejecting a RENAMED flag.
 
     One of the two ways a parity checker exits 2 without having checked
     anything (the other is `python3` refusing to open a script that was renamed
     or moved). Its stderr deliberately carries bracketed tokens — `[-h]`,
-    `[--fix]` — because a marker match that is not line-anchored would read
-    those as a report and hand the gate a verdict the checker never gave.
+    `[--fix]` — so that a gate matching brackets LOOSELY rather than matching
+    its checker's specific `[<tag>]` would read those as a report and hand the
+    gate a verdict the checker never gave.
+
+    (That hazard used to be worded as "a marker match that is not
+    line-anchored". No gate is line-anchored any more — all five now test
+    containment of one specific tag — but the stub is still exactly the right
+    imposter, for the reason above: it emits no tag at all.)
     """
     return (
         "import sys\n"
