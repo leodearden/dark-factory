@@ -289,6 +289,8 @@ class TestHarnessRestartPersistence:
             'reason': 'pre-restart park-stop',
             'pause_at': '2026-05-13T22:00:00+00:00',
             'set_by_run_id': 'prior-run-id',
+            # Task 4559: the seed above omits ewa_value, so it reads back NULL.
+            'ewa_value': None,
         }, (
             f'Persisted row must be unchanged after restart load (no re-write '
             f'with new run_id); got {reloaded!r}'

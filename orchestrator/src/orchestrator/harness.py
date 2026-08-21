@@ -14859,7 +14859,16 @@ class Harness:
         """Pause the scheduler so acquire_next() returns None until resumed.
 
         1. Delegates to ``scheduler.pause(reason)`` (idempotent in-memory state).
-        2. Persists via ``RunStore.save_scheduler_pause`` (best-effort).
+        2. Persists via ``RunStore.save_scheduler_pause`` (best-effort),
+           including the live ``_ewa_value`` (task 4559).  The value is
+           recorded for EVERY pause class, not just ``ewa_trip_*``: it is
+           operator EVIDENCE and forensic record, never a trip flag — the
+           pause class is carried by *reason*, which is also the only thing
+           the restore-time predicate keys on.  Seven ``scheduler_pause_restored``
+           events across four pause classes showed a restart re-asserted the
+           halt while losing the number behind it, so the evidence-vs-halt
+           asymmetry is structural to ``pause_scheduler`` rather than
+           EWA-specific, and is fixed here for all classes at once.
         3. Emits ``EventType.scheduler_paused`` (best-effort).
         4. Logs a WARNING so the operator sees it.
         5. Files an auto-resumable scheduler-pause L1 — unless ``file_escalation``
@@ -14896,6 +14905,7 @@ class Harness:
                     reason=reason,
                     pause_at_iso=datetime.now(UTC).isoformat(),
                     set_by_run_id=self._run_id,
+                    ewa_value=self._ewa_value,  # task 4559 — evidence, every class
                 )
             except Exception:
                 logger.warning('pause_scheduler: failed to persist pause state', exc_info=True)
