@@ -26,13 +26,29 @@ Spy helpers (``_run_verification_spy`` / ``_executed_module_configs``) are
 reused directly from ``test_verify_scope_kappa.py`` rather than
 re-implemented, so both suites share one provenance-pinned execution-spy
 implementation.
+
+Task 4536 extends this module one layer outward, to the REMOTE leg. The
+classes above pin that ``run_scoped_verification`` delegates the
+effective-set DECISION to ``verify_plan.effective_merge_module_configs``
+(task 3787 γ); ``TestRemoteSpecAuthoritativeModuleRegistry`` below pins
+WHERE that helper's registry comes FROM when the merge runs off-host —
+i.e. for the Lever C consumer, ``verify_runner.run_merge_verify_on_worktree``
+(the CLI ``verify-merge`` subcommand's host entry). The helper reads
+``config.module_configs_or_empty``, which on that leg used to be the REMOTE
+host's own ``_discover_module_configs`` walk, so a stale/divergent laptop
+checkout silently decided the merge — both DROPPING modules the spec named
+(the task-2822 false-green class) and INJECTING modules it never did. The
+dispatcher's spec is authoritative for the module SET, so these tests drive
+the real ``build_merge_verify_spec`` → ``run_merge_verify_on_worktree`` →
+``run_scoped_verification`` round trip with a dispatcher and a host whose
+registries deliberately DISAGREE, and observe which side actually executed.
 """
 
 from __future__ import annotations
 
 from pathlib import Path, PurePosixPath
 from typing import Literal
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import yaml
@@ -42,6 +58,11 @@ from orchestrator import verify, verify_plan
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.verify import run_scoped_verification
 from orchestrator.verify_plan import ScopeKind, derive_verify_plan, parse_config_command
+from orchestrator.verify_runner import (
+    MergeVerifySpec,
+    build_merge_verify_spec,
+    run_merge_verify_on_worktree,
+)
 
 # ---------------------------------------------------------------------------
 # step-7: role x merge_verify_breadth end-to-end execution goldens (RED)
@@ -805,3 +826,279 @@ class TestRunScopedVerificationDelegatesEffectiveModuleConfigs:
             f'safe degrade: an empty registry must fall back to the passed set, '
             f'never execute nothing; got {executed!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# task 4536: the REMOTE leg — the SPEC, not the host's discovery, is the
+# authoritative source of the merge-verify module SET
+# ---------------------------------------------------------------------------
+
+
+# The nine real dark_factory module prefixes, as the live registry would carry
+# them — so the dispatcher side of the divergence is not a toy 1-vs-1 shape but
+# the actual set the production merge gate widens to under breadth='full'.
+_DARK_FACTORY_PREFIXES = (
+    'cockpit', 'dashboard', 'escalation', 'fused-memory', 'orchestrator',
+    'sampler', 'scripts', 'shared', 'tests/scripts',
+)
+
+
+def _tagged_module(prefix: str, tag: Literal['DISP', 'HOST']) -> ModuleConfig:
+    """A ModuleConfig whose three commands are all provenance-tagged *tag*.
+
+    The tag is what lets an assertion distinguish "the spec's set won" from
+    "the two sets happened to union" on an OVERLAPPING prefix: a module named
+    by BOTH registries can only be attributed by whose command it carries.
+    """
+    return ModuleConfig(
+        prefix=prefix,
+        test_command=f'{tag}_TEST --directory {prefix} pytest tests/',
+        lint_command=f'{tag}_LINT --directory {prefix} ruff check src/',
+        type_check_command=f'{tag}_TYPE --directory {prefix} pyright src/',
+    )
+
+
+def _divergent_dispatcher_and_host(
+    tmp_path: Path,
+    *,
+    dispatcher_prefixes: tuple[str, ...],
+    host_prefixes: tuple[str, ...],
+    workspace: bool,
+) -> tuple[list[ModuleConfig], MergeVerifySpec, OrchestratorConfig]:
+    """A DISPATCHER (spec producer) and a REMOTE HOST whose registries disagree.
+
+    Mirrors ``_two_module_registry``'s shape (real ``OrchestratorConfig`` +
+    the blessed direct ``config._module_configs = {...}`` assignment) but
+    builds a PAIR of configs, so an observed execution proves WHICH SIDE won
+    rather than echoing the test's own argument back — the same reasoning
+    ``_two_module_registry``'s "modB is registry-only, never passed in"
+    docstring gives, lifted to the local/remote axis.
+
+    Returns ``(dispatcher_module_configs, spec, host_config)``. The spec comes
+    from the REAL ``build_merge_verify_spec`` rather than hand-authored
+    ``VerifyCommand`` tuples, so these tests exercise the genuine
+    producer→wire→consumer round trip and pick up ``global_verify_command``
+    (INV-1, task 2883) and the ``merge_verify_workspace`` /
+    ``merge_verify_breadth`` projection (fix (a), task 2822) for free. That is
+    also the production ordering post-task-3787-γ: ``merge_queue``'s
+    ``_merge_boundary_module_configs`` resolves the effective set ONCE at the
+    merge-request boundary and hands it to this same producer, so a
+    nine-module dispatcher spec is exactly what the live merge gate ships.
+
+    Fixture requirements, each of which bites if dropped:
+
+    - ``merge_verify_breadth`` AND ``merge_verify_workspace`` are pinned
+      EXPLICITLY on BOTH configs. ``OrchestratorConfig`` is a ``BaseSettings``
+      whose bare defaults can be widened by a settings source (see the comment
+      at test_verify_runner.py's ``test_spec_profile_overrides_host_config``).
+    - The HOST is built at ``merge_verify_breadth='scoped'`` on purpose: the
+      full fan-out these tests observe can then only have come from the SPEC's
+      breadth via fix (a), never from the host's own knob.
+    - Both configs share ``project_root=tmp_path`` and every file in
+      *task_files* EXISTS on disk — verify.py's reuse guard re-walks the
+      filesystem when project_root differs, and the scoped path filters
+      *task_files* down to files that exist.
+    - Global commands are tagged on BOTH sides too, so the zero-module (INV-1)
+      case can attribute the global gate as well.
+    """
+    (tmp_path / 'f.py').write_text('x = 1\n')
+    task_files = ('f.py',)
+
+    dispatcher_modules = [_tagged_module(p, 'DISP') for p in dispatcher_prefixes]
+    dispatcher = OrchestratorConfig(
+        project_root=tmp_path,
+        merge_verify_breadth='full',
+        merge_verify_workspace=workspace,
+        test_command='DISP_GLOBAL_TEST pytest',
+        lint_command='DISP_GLOBAL_LINT ruff check',
+        type_check_command='DISP_GLOBAL_TYPE pyright',
+    )
+    dispatcher._module_configs = {mc.prefix: mc for mc in dispatcher_modules}
+    spec = build_merge_verify_spec(dispatcher, dispatcher_modules, task_files)
+
+    host_modules = [_tagged_module(p, 'HOST') for p in host_prefixes]
+    host = OrchestratorConfig(
+        project_root=tmp_path,
+        merge_verify_breadth='scoped',
+        merge_verify_workspace=False,
+        test_command='HOST_GLOBAL_TEST pytest',
+        lint_command='HOST_GLOBAL_LINT ruff check',
+        type_check_command='HOST_GLOBAL_TYPE pyright',
+    )
+    host._module_configs = {mc.prefix: mc for mc in host_modules}
+    return dispatcher_modules, spec, host
+
+
+def _passing_unscoped_gate() -> AsyncMock:
+    """A passing stand-in for ``merge_queue._run_unscoped_typechecks``.
+
+    Injected so ``LocalRunner.run_merge_verify``'s second phase never reaches
+    the real gate; ``run_scoped`` is deliberately NOT injected, so the REAL
+    ``run_scoped_verification`` runs and these tests observe genuine routing.
+    """
+    return AsyncMock(return_value=MagicMock(
+        broken=False, timed_out=False, failing_subprojects=[], timed_out_subprojects=[],
+    ))
+
+
+class TestRemoteSpecAuthoritativeModuleRegistry:
+    """The merge-verify module SET comes from the SPEC on the remote leg.
+
+    Task 4536. ``run_merge_verify_on_worktree`` reconstructs the dispatcher's
+    module_configs from ``spec.verify_commands`` and passes them positionally
+    — but under ``merge_verify_breadth='full'``
+    ``verify_plan.effective_merge_module_configs`` prefers
+    ``config.module_configs_or_empty``, which on this leg is the REMOTE host's
+    own ``_discover_module_configs`` walk. So the passed set was thrown away
+    and a divergent laptop checkout decided the merge.
+
+    Each test below pins BOTH halves of the infidelity, which are distinct
+    failure modes and would need distinct bugs to reappear:
+
+    - DROPPED: a module the spec named must still execute (the task-2822
+      false-green class — the merge is vouched for by a gate that never ran
+      on 7 of the 9 modules).
+    - INJECTED: a module ONLY the host knows about must NOT execute (a merge
+      red attributable to a subproject the dispatching side never scoped).
+
+    Attribution is by command tag, never by prefix alone: the OVERLAPPING
+    prefix in case (a) is registered by both sides, so only the ``DISP_*``
+    command proves the spec's registry won rather than the two sets unioning.
+    """
+
+    @pytest.mark.asyncio
+    async def test_live_routing_executes_the_spec_module_set_not_the_hosts(
+        self, tmp_path: Path,
+    ):
+        """(a) dark_factory's LIVE routing — ``merge_verify_workspace=False``,
+        so the ``if module_configs:`` site (NOT the force_workspace fan-out the
+        task description names; ``dark-factory-orchestrator.yaml`` sets
+        ``merge_verify_breadth: full`` but leaves ``merge_verify_workspace`` at
+        its ``False`` default).
+
+        Observed on main before the fix: exactly ``['cockpit', 'stale-only']``
+        — the HOST's two, with ``HOST_*`` commands.
+        """
+        _disp_modules, spec, host = _divergent_dispatcher_and_host(
+            tmp_path,
+            dispatcher_prefixes=_DARK_FACTORY_PREFIXES,
+            host_prefixes=('cockpit', 'stale-only'),
+            workspace=False,
+        )
+
+        mock_run_verification = _run_verification_spy()
+        with patch.object(verify, 'run_verification', new=mock_run_verification):
+            result = await run_merge_verify_on_worktree(
+                tmp_path, host, spec, run_unscoped=_passing_unscoped_gate(),
+            )
+
+        assert result.passed
+        executed = {mc.prefix: mc for mc in _executed_module_configs(mock_run_verification)}
+        assert set(executed) == set(_DARK_FACTORY_PREFIXES), (
+            f'the SPEC names the module set a remote merge covers; expected '
+            f'{set(_DARK_FACTORY_PREFIXES)!r}, got {set(executed)!r}'
+        )
+        for prefix, mc in sorted(executed.items()):
+            assert mc.test_command == f'DISP_TEST --directory {prefix} pytest tests/', (
+                f'{prefix!r} executed a non-dispatcher test command: {mc.test_command!r}'
+            )
+            assert mc.lint_command == f'DISP_LINT --directory {prefix} ruff check src/', (
+                f'{prefix!r} executed a non-dispatcher lint command: {mc.lint_command!r}'
+            )
+            assert mc.type_check_command == f'DISP_TYPE --directory {prefix} pyright src/', (
+                f'{prefix!r} executed a non-dispatcher type command: '
+                f'{mc.type_check_command!r}'
+            )
+        assert 'stale-only' not in executed, (
+            'a host-only module the spec never named must NOT execute — the fix '
+            'must stop phantom INJECTION, not merely restore the DROPPED modules'
+        )
+
+    @pytest.mark.asyncio
+    async def test_force_workspace_routing_executes_the_spec_module_set_not_the_hosts(
+        self, tmp_path: Path,
+    ):
+        """(b) The force_workspace per-module fan-out site. The DISPATCHER
+        carries ``merge_verify_workspace=True``, so the spec ships it and fix
+        (a) applies it onto the host config — the host's own knob is False, so
+        reaching this routing at all already proves the spec drove the profile.
+
+        Observed on main before the fix: exactly ``['hostonly1', 'hostonly2']``.
+        """
+        _disp_modules, spec, host = _divergent_dispatcher_and_host(
+            tmp_path,
+            dispatcher_prefixes=_DARK_FACTORY_PREFIXES,
+            host_prefixes=('hostonly1', 'hostonly2'),
+            workspace=True,
+        )
+
+        mock_run_verification = _run_verification_spy()
+        with patch.object(verify, 'run_verification', new=mock_run_verification):
+            result = await run_merge_verify_on_worktree(
+                tmp_path, host, spec, run_unscoped=_passing_unscoped_gate(),
+            )
+
+        assert result.passed
+        executed = {mc.prefix: mc for mc in _executed_module_configs(mock_run_verification)}
+        assert set(executed) == set(_DARK_FACTORY_PREFIXES), (
+            f'the force_workspace fan-out must cover the SPEC\'s registry; expected '
+            f'{set(_DARK_FACTORY_PREFIXES)!r}, got {set(executed)!r}'
+        )
+        for prefix, mc in sorted(executed.items()):
+            assert mc.test_command == f'DISP_TEST --directory {prefix} pytest tests/'
+            assert mc.lint_command == f'DISP_LINT --directory {prefix} ruff check src/'
+            assert mc.type_check_command == f'DISP_TYPE --directory {prefix} pyright src/'
+        assert not {'hostonly1', 'hostonly2'} & set(executed), (
+            f'host-only modules the spec never named must NOT execute; got {set(executed)!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_zero_module_spec_runs_the_shipped_global_gate_not_the_hosts_modules(
+        self, tmp_path: Path,
+    ):
+        """(c) INV-1 (task 2883) on the workspace path. A dispatcher with ZERO
+        module configs but real global commands ships
+        ``global_verify_command``; fix (a)'s ``config_update`` already applies
+        those globals onto the host config. But the force_workspace fan-out
+        consults the REGISTRY before the helper's ``or module_configs``
+        fallback can apply — so a host that registers modules runs ITS OWN
+        modules instead of the global gate the spec shipped.
+
+        Observed on main before the fix: TWO calls carrying the HOST's module
+        configs. An outright INV-1 hole, structurally invisible to reify (the
+        only Lever C project today) only because reify leaves
+        ``merge_verify_workspace`` False, where a zero-module spec never enters
+        the ``if module_configs:`` branch at all.
+        """
+        _disp_modules, spec, host = _divergent_dispatcher_and_host(
+            tmp_path,
+            dispatcher_prefixes=(),
+            host_prefixes=('hostonly1', 'hostonly2'),
+            workspace=True,
+        )
+        assert spec.verify_commands == (), 'fixture precondition: a zero-module spec'
+        assert spec.global_verify_command is not None, (
+            'fixture precondition: build_merge_verify_spec must ship the '
+            'dispatching globals for a zero-module spec (INV-1, task 2883)'
+        )
+
+        mock_run_verification = _run_verification_spy()
+        with patch.object(verify, 'run_verification', new=mock_run_verification):
+            result = await run_merge_verify_on_worktree(
+                tmp_path, host, spec, run_unscoped=_passing_unscoped_gate(),
+            )
+
+        assert result.passed
+        assert mock_run_verification.await_count == 1, (
+            f'a zero-module spec must run the ONE opaque global gate it shipped, '
+            f'never the host\'s own modules; got '
+            f'{mock_run_verification.await_count} call(s)'
+        )
+        assert _executed_module_configs(mock_run_verification) == [], (
+            'expected the global gate call to carry NO ModuleConfig (opaque global '
+            'command); a non-empty list means the host\'s registry drove execution'
+        )
+        effective_config = mock_run_verification.await_args.args[1]
+        assert effective_config.test_command == 'DISP_GLOBAL_TEST pytest'
+        assert effective_config.lint_command == 'DISP_GLOBAL_LINT ruff check'
+        assert effective_config.type_check_command == 'DISP_GLOBAL_TYPE pyright'
