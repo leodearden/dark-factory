@@ -152,3 +152,38 @@ match, and `deferred` being a substring of `merge-deferred` makes a
 
 Every remaining carrier outside these three statuses is accounted for: exactly
 one, reify 5050.
+
+## 6. Disposition of reify 5050 (steward, esc-4528-2)
+
+**Accepted as the single documented remainder.** The migration is complete for
+operational purposes; reify 5050 is NOT forced and NOT repaired by this task.
+
+Rationale — **the remaining carrier is inert**, so retiring the `modules`
+boundary is materially safe despite it:
+
+- 5050 carries `modules == ["crates/reify-eval"]` and `files == []`.
+- `crates/reify-eval` is directory-shaped, so the charter sanitizer maps it to
+  the empty list — which is precisely why the dry-run classifies 5050 as
+  `copy-sanitized-empty` rather than `copy`.
+- Lock derivation is therefore **identical before and after** the boundary
+  retirement: `files` is empty either way, and the task defers scope to the
+  architect either way. Dropping the key would change the record's bytes, not
+  its behaviour.
+
+So the ε leaf's premise ("boundary retirement is safe only once live carriers
+are gone") is satisfied in substance: the one surviving carrier contributes no
+lock information that retirement could strip.
+
+What is NOT resolved here, and is filed separately rather than silently
+absorbed:
+
+1. **reify 5050 + 215 terminal siblings** carry a malformed `metadata.milestone`
+   (JSON bool `true`, not the dated/delayed mapping). Pre-existing since
+   2026-07-19, unrelated to this task.
+2. **The underlying trap** is in this repo, not in reify's data: `update_task`'s
+   write gate validates the *merged* metadata with `enforce=True`, so an
+   untouched pre-existing malformed field rejects the write. A record that
+   acquired a bad field before the gate existed becomes **permanently unwritable
+   through the sanctioned API** — there is no in-band repair path, which is
+   exactly why this migration could not self-heal 5050. Fixing that would clear
+   5050 and all 215 latent siblings without any corpus surgery.
