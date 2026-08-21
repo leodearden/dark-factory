@@ -23,9 +23,13 @@ Behaviour per task carrying ``metadata.modules``:
 - If ``metadata.files`` is non-empty: keep ``files`` as authoritative, drop
   ``modules``.
 
-``done``/``cancelled``/``deferred`` are skipped ON PURPOSE — ``update_task``
-will not write them, and PRD decision 1 keeps ``modules`` on terminal tasks as
-the only in-record trace of their original scope. Their residual carriers are
+``done``/``cancelled``/``deferred`` are skipped BY POLICY, not by necessity:
+PRD decision 1 keeps ``modules`` on terminal tasks as the only in-record trace
+of their original scope. (``update_task`` would in fact accept the write —
+there is no status-based immutability gate in ``SqliteTaskBackend.update_task``
+or the interceptor — so this really is a choice, and the pre-4528 comment
+claiming terminal tasks were "immutable" was wrong about why.) Their residual
+carriers are
 COUNTED BY STATUS and reported, so "we deliberately left some behind" is a
 checkable claim. The skip set is an EXACT MATCH: ``merge-deferred`` is a live,
 processed status and is not a member.
@@ -265,10 +269,9 @@ class MigrationCounts(NamedTuple):
     #: ``{status: carriers}`` for tasks in a deliberate skip status that STILL
     #: carry ``metadata.modules``. Left untouched on purpose (PRD decision 1
     #: keeps ``modules`` on terminal tasks as the only in-record trace of their
-    #: original scope, and update_task will not write them anyway) — but the
-    #: number is what makes "we deliberately left some behind" a checkable
-    #: claim rather than an assertion. Only statuses with at least one carrier
-    #: appear.
+    #: original scope) — but the number is what makes "we deliberately left
+    #: some behind" a checkable claim rather than an assertion. Only statuses
+    #: with at least one carrier appear.
     residual_by_status: dict[str, int]
 
     def merged_with(self, other: MigrationCounts) -> MigrationCounts:
@@ -341,8 +344,12 @@ async def _migrate_one_project(
         return empty_counts()
 
     tasks = _flatten_tasks(tasks_result)
-    # Done/cancelled tasks are immutable to update_task — skip them so the
-    # migration log only reports tasks the server will actually touch.
+    # Terminal tasks are skipped BY POLICY (PRD decision 1: `modules` is their
+    # only in-record trace of original scope), NOT because they are immutable.
+    # The pre-4528 comment here claimed update_task could not write them; that
+    # is false — there is no status-based immutability gate in
+    # SqliteTaskBackend.update_task or the interceptor. Keeping the wrong
+    # reason on a correct behaviour is how the next reader "fixes" the skip.
     # EXACT MATCH, never a prefix or substring test: `merge-deferred` contains
     # `deferred` and is deliberately NOT a member — it is a live, processed
     # status, and a `startswith`/`in`-the-string refactor would silently stop
