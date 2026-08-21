@@ -2752,6 +2752,71 @@ class TestTheNoMeasurementConvention:
         assert mod._cell is _bake_off()._cell
 
 
+class TestInv5IsLoadOrderIndependent:
+    """The committed INV-5 checks must hold no matter which sibling loads
+    `bake_off_storage_shape` last (task 4583).
+
+    `_bake_off()` (:74-76) is `functools.cache`d, so once it has been called
+    the returned module instance never changes — but a sibling test module's
+    own loader (or a second direct call to this file's `_load_script`, as
+    below) can still register a *different*, independently `exec_module`d
+    instance under `sys.modules['bake_off_storage_shape']` at any time.
+    `read_transform_selection.bake_off()` has no such cache: it reads
+    `sys.modules` live on every call.  So `mod._cell is _bake_off()._cell`
+    compares "whatever is in `sys.modules` right now" against "whatever
+    `_bake_off()` cached the first time it ran" — two objects that are only
+    guaranteed equal when nothing has clobbered `sys.modules` in between,
+    which is exactly the guarantee xdist scheduling does not provide.  This
+    class reproduces that clobber deterministically, in-process, instead of
+    depending on which worker happens to run a given test first.
+    """
+
+    def _clobber_bake_off_module(self):
+        """Register a fresh, independently-exec'd `bake_off_storage_shape`.
+
+        Returns whatever was previously registered (or ``None``) so the
+        caller can restore it afterwards.  Uses this file's own
+        `_load_script`, which — unlike the production script's loader —
+        unconditionally execs a new module and overwrites `sys.modules`,
+        exactly what a sibling test module's load does.
+        """
+        import sys  # noqa: PLC0415
+
+        saved = sys.modules.get('bake_off_storage_shape')
+        _load_script(BAKE_OFF_PATH, 'bake_off_storage_shape')
+        return saved
+
+    def _restore_bake_off_module(self, saved):
+        import sys  # noqa: PLC0415
+
+        if saved is None:
+            sys.modules.pop('bake_off_storage_shape', None)
+        else:
+            sys.modules['bake_off_storage_shape'] = saved
+
+    def test_the_committed_inv5_checks_survive_a_reloaded_bake_off(self):
+        """Both hand-picked INV-5 identity checks must survive a clobber.
+
+        Re-clobber immediately before EACH check: a single clobber only
+        reddens the first check that runs, because that check's own
+        `_bake_off()` call (when its cache is cold) loads and registers yet
+        another instance, which re-syncs `sys.modules` with the cache — so a
+        second check run right after would pass regardless of whether it is
+        itself order-independent.
+        """
+        saved = self._clobber_bake_off_module()
+        try:
+            TestTheNoMeasurementConvention().test_it_reuses_the_bake_offs_cell_renderer()
+        finally:
+            self._restore_bake_off_module(saved)
+
+        saved = self._clobber_bake_off_module()
+        try:
+            TestNoneNeverAveragesInAsZero().test_it_delegates_to_the_bake_offs_mean()
+        finally:
+            self._restore_bake_off_module(saved)
+
+
 # ===========================================================================
 # step-21 — the COMMITTED artifact pair, asserted as DATA
 # ===========================================================================
