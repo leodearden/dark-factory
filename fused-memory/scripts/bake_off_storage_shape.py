@@ -890,6 +890,107 @@ def _materialize_c_peers(
     return records
 
 
+#: Injection modes the +1-re-emission regrowth probe measures (task 4012).
+#:
+#: Pinned as a tuple and asserted by EQUALITY in the tests, for the same
+#: reason ``QUERY_KINDS`` is: a mode that stopped being generated would
+#: otherwise vanish from the report as an empty row rather than as a
+#: failure.
+#:
+#: ``unstamped`` is FIRST because it is the case that models reality today —
+#: esc-3200-3 measured exactly one topic-stamped record for the topic whose
+#: re-emissions it was reading, so every organic re-emission had arrived
+#: with no ``topic`` key at all.  ``stamped`` is the write path's best case,
+#: and the difference between the two deltas is what a topic-stamping
+#: campaign actually buys against regrowth.
+REGROWTH_MODES: tuple[str, ...] = ('unstamped', 'stamped')
+
+#: Role marking an injected re-emission.  Distinct from ``DISTRACTOR_ROLE``
+#: and ``GROUPED_ROLE``: a re-emission is neither contamination nor a read-
+#: time synthetic, it is a record the live system genuinely would have.
+REGROWTH_ROLE = 'regrowth'
+
+
+def materialize_regrowth_injections(
+    injections: list[RegrowthInjection],
+    claims: list[ArmClaim],
+    clusters: dict[str, CalibrationCluster],
+    mode: str,
+) -> list[ArmRecord]:
+    """One +1 re-emission per topic, as the live system would have stored it.
+
+    ``mode`` decides only whether the record carries the ``topic`` key:
+
+    * ``unstamped`` — no ``topic`` key AT ALL (not a present-but-empty one).
+      This is the organically observed case, and it is what makes the topic
+      pin unable to reach the re-emission.
+    * ``stamped`` — ``topic`` present, the write path's best case.
+
+    Never writes ``canonical`` (a second canonical on a topic would make
+    ``build_canonical_by_topic`` raise), never ``parent_id`` (the ratified
+    shape is flat), never ``contested`` (which has no writer in the live
+    system, so a re-emission cannot acquire it), and never ``kind`` (arm
+    (c)'s peers are deliberately undifferentiated).
+
+    ``claim_ids=[reemits_claim_id]`` credits the re-emission with realizing
+    the claim it restates — see :class:`RegrowthInjection` for why crediting
+    it is both the truthful and the conservative modelling.
+    """
+    if mode not in REGROWTH_MODES:
+        raise ValueError(
+            f'unknown regrowth mode {mode!r} — the probe measures exactly '
+            f'{REGROWTH_MODES} (REGROWTH_MODES). Adding a mode means adding '
+            f'rows to the delta table the report renders, not just a branch '
+            f'here.'
+        )
+
+    categories = _claim_categories(clusters, claims)
+    records: list[ArmRecord] = []
+    for injection in injections:
+        metadata: dict[str, Any] = {'category': categories[injection.reemits_claim_id]}
+        if mode == 'stamped':
+            metadata['topic'] = injection.topic
+        records.append(ArmRecord(
+            record_id=_derive_record_id(f'regrowth:{mode}', injection.injection_id),
+            content=injection.text,
+            metadata=metadata,
+            cluster_id=injection.cluster_id,
+            claim_ids=[injection.reemits_claim_id],
+            role=REGROWTH_ROLE,
+        ))
+    return records
+
+
+def regrowth_corpus(
+    base_records: list[ArmRecord],
+    injections: list[RegrowthInjection],
+    claims: list[ArmClaim],
+    clusters: dict[str, CalibrationCluster],
+    *,
+    mode: str,
+) -> list[ArmRecord]:
+    """The ratified arm's corpus plus one re-emission per topic.
+
+    ORDER IS LOAD-BEARING, which is why it is asserted by a dedicated
+    invariant test rather than left as an implementation detail.
+    :func:`canonical_record_ids` takes the FIRST record whose ``claim_ids``
+    carry a cluster's canonical claim (``index.setdefault``), and the
+    injection deliberately carries exactly that claim id.  Prepending an
+    injection would therefore silently rename the cluster's canonical to the
+    re-emission, and every discoverability number in the regrowth block
+    would be scored against the duplicate instead of the true canonical —
+    the aliasing failure 3560 had to disclose after the fact for
+    ``b_grouped``.
+
+    Returns a NEW list; ``base_records`` is never mutated, so the same
+    baseline arm can be reused for both modes.
+    """
+    return [
+        *base_records,
+        *materialize_regrowth_injections(injections, claims, clusters, mode),
+    ]
+
+
 def _materialize_b_grouped(
     claims: list[ArmClaim],
     topics: dict[str, RegistryTopic],
