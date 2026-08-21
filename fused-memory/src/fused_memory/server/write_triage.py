@@ -35,13 +35,21 @@ one async retrieval helper and the async orchestrator kept separate from them.
 
 from __future__ import annotations
 
+import logging
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
+
+from shared.storm_counter import StormCounter
 
 from fused_memory.models.enums import MEM0_PRIMARY
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from fused_memory.models.memory import MemoryResult
+
+logger = logging.getLogger(__name__)
 
 # --- ack contract (INV-1: one home for the wire names) ---------------------
 #
@@ -361,3 +369,210 @@ async def retrieve_candidates(
         stores=list(_TRIAGE_STORES),
         limit=k,
     )
+
+
+# --- fail-open + storm counter (INV-4) --------------------------------------
+
+#: Fail-opens inside the window before the burst is escalated. One fail-open is
+#: routine (a transient mem0 blip); a burst means every write in the window
+#: silently fell back to pre-triage behaviour, which is the silent degradation
+#: INV-4 exists to make visible. Module constants rather than config leaves,
+#: like ``markup_tripwire``'s: an alarm an operator can tune down is an alarm
+#: that gets tuned down.
+_FAIL_OPEN_STORM_THRESHOLD = 10
+_FAIL_OPEN_STORM_WINDOW_SECONDS = 3600.0
+
+_FAIL_OPEN_HINT = (
+    'add_memory write triage failed open repeatedly: every write in this '
+    'window was stored WITHOUT triage, i.e. with the pre-triage behaviour. No '
+    'write was lost or blocked (contract C1), but no restatement was detected '
+    'either. Check candidate retrieval (MemoryService.search / mem0 '
+    'reachability) and the judge. To stop triage deliberately rather than '
+    'letting it degrade silently, set write_triage.enabled: false — it is '
+    'green-tier hot-reloadable via reload_config.'
+)
+
+
+class TriageFailOpenCounter:
+    """Rolling-window burst detector over triage fail-opens.
+
+    A THIN ADAPTER over :class:`shared.storm_counter.StormCounter`, not a
+    fifth copy of the append/prune/count/rate-limit body (INV-5). The
+    construction idiom matches the live per-instance consumers in
+    ``services/memory_service.py`` and ``shared/mcp_markup_middleware.py``:
+    ``StormCounter(time_provider=…)``, with threshold and window passed to
+    :meth:`StormCounter.record` per call rather than captured.
+
+    (An earlier draft of this leaf named ``markup_tripwire.MarkupStormCounter``
+    as the template. Task 4458 DELETED that class — do not go looking for it.)
+
+    State is process-local and per-instance, and resets on restart: this
+    catches a live burst, it is not durable statistics. One instance is built
+    per ``create_mcp_server`` call so nothing bleeds between servers or between
+    tests.
+    """
+
+    def __init__(self, time_provider: Callable[[], float] = time.time) -> None:
+        self._counter = StormCounter(time_provider=time_provider)
+
+    def record(self, *, project: str | None = None) -> dict[str, Any] | None:
+        """Record one fail-open; return a storm summary iff a burst just fired.
+
+        The summary renames ``StormCounter``'s generic ``labels`` to
+        ``projects`` and adds a ``hint``, so what lands in the escalation
+        detail reads as "which projects are degraded" rather than requiring
+        the reader to know the label convention. A project that could not be
+        resolved still counts toward the burst — there is simply nothing to
+        name it against.
+        """
+        summary = self._counter.record(
+            threshold=_FAIL_OPEN_STORM_THRESHOLD,
+            window_seconds=_FAIL_OPEN_STORM_WINDOW_SECONDS,
+            label=project,
+        )
+        if summary is None:
+            return None
+        return {
+            'count': summary['count'],
+            'threshold': summary['threshold'],
+            'window_seconds': summary['window_seconds'],
+            'projects': summary['labels'],
+            'hint': _FAIL_OPEN_HINT,
+        }
+
+    def live_count(self) -> int:
+        """Fail-opens currently inside the window, without recording one.
+
+        Read-only, for the tool-level assertions and for an operator probe.
+        """
+        return self._counter.prune(_FAIL_OPEN_STORM_WINDOW_SECONDS)
+
+
+async def _stub_judge(
+    *,
+    memory_service: Any,
+    content: str,
+    project_id: str,
+    decision: BandDecision | None,
+) -> str:
+    """Middle-band adjudication — LEAF GAMMA'S REPLACEMENT POINT.
+
+    Returns :data:`OUTCOME_STORED` unconditionally. That is a DELIBERATE STUB,
+    explicitly NOT a fail-open event: it must never be routed through
+    :class:`TriageFailOpenCounter`. If it were, the first
+    ``_FAIL_OPEN_STORM_THRESHOLD`` middle-band writes after the flag flip would
+    guarantee a storm escalation describing an outage that is not happening,
+    which trains an operator to ignore the alarm that exists to catch a real
+    one.
+
+    The real judge (D3) is synchronous-in-``add_memory``, fail-open,
+    closed-output over :data:`TRIAGE_OUTCOMES`, and DETECTS rather than
+    adjudicates — it classifies the relationship between the write and the
+    candidate, it does not decide which text is true.
+
+    Storing is also the right stub answer on the merits: with no judge, the
+    only alternative is to attach on a similarity the calibration explicitly
+    declined to call deterministic.
+    """
+    return OUTCOME_STORED
+
+
+async def triage_write(
+    memory_service: Any,
+    *,
+    content: str,
+    project_id: str,
+    counter: TriageFailOpenCounter,
+    judge: Any = None,
+) -> BandDecision:
+    """Route one ``add_memory`` write. NEVER raises, NEVER blocks, NEVER errors.
+
+    Retrieve → band → (judge slot) → decision. Every stage is wrapped: any
+    exception whatsoever yields :data:`OUTCOME_STORED` plus exactly one
+    counted fail-open and a logged warning with ``exc_info``. Nothing escapes,
+    because C1 is absolute — from the caller's side a fail-open is
+    indistinguishable from "nothing matched", which is what keeps the write
+    unblocked.
+
+    This is where the module deliberately DIVERGES from the retired guard's
+    call site, which re-raises ``TypeError``/``AttributeError``/``NameError``
+    so a wiring bug surfaces loudly rather than being swallowed. Re-raising
+    here would be an errored write, i.e. a blocked write. The loudness is
+    preserved a different way: those three classes are logged at ERROR on one
+    greppable line naming the exception type, and counted like any other
+    fail-open — so a changed ``MemoryService.search`` signature surfaces as a
+    storm escalation rather than as a stream of errored writes.
+    """
+    try:
+        k = resolve_candidate_k(memory_service)
+        t_high, t_low = resolve_bands(memory_service)
+        results = await retrieve_candidates(memory_service, content, project_id, k)
+        decision = decide_band(results, t_high=t_high, t_low=t_low)
+    except Exception as exc:  # noqa: BLE001 — C1: nothing escapes this path.
+        _record_fail_open(counter, project_id, exc, stage='retrieve')
+        return BandDecision(OUTCOME_STORED, None, None, None, None)
+
+    if decision.outcome != OUTCOME_JUDGE:
+        return decision
+
+    try:
+        verdict = await (judge or _stub_judge)(
+            memory_service=memory_service,
+            content=content,
+            project_id=project_id,
+            decision=decision,
+        )
+    except Exception as exc:  # noqa: BLE001 — C1: nothing escapes this path.
+        _record_fail_open(counter, project_id, exc, stage='judge')
+        return BandDecision(OUTCOME_STORED, None, None, decision.t_high, decision.t_low)
+
+    if verdict not in TRIAGE_OUTCOMES:
+        # A closed output set (D3) means an unrecognised verdict is a BUG, not
+        # an extension point — counted as a fail-open so it cannot pass as a
+        # routing decision nobody notices.
+        _record_fail_open(
+            counter, project_id,
+            ValueError(f'judge returned {verdict!r}, not in TRIAGE_OUTCOMES'),
+            stage='judge',
+        )
+        return BandDecision(OUTCOME_STORED, None, None, decision.t_high, decision.t_low)
+
+    # `stored` carries no canonical: nothing was attached, so naming one would
+    # invite a caller to attach to a candidate the judge declined to endorse.
+    canonical_id = None if verdict == OUTCOME_STORED else decision.canonical_id
+    return BandDecision(
+        verdict, canonical_id, decision.similarity, decision.t_high, decision.t_low,
+    )
+
+
+#: The exception classes the retired guard's call site re-raised as wiring
+#: bugs. Triage cannot re-raise (C1), so it logs them at ERROR instead of
+#: WARNING to keep the same signal at a different volume.
+_WIRING_BUG_CLASSES = (TypeError, AttributeError, NameError)
+
+
+def _record_fail_open(
+    counter: TriageFailOpenCounter,
+    project_id: str | None,
+    exc: BaseException,
+    *,
+    stage: str,
+) -> dict[str, Any] | None:
+    """Log and count one fail-open; return a storm summary iff a burst fired.
+
+    Never raises: a counter that failed while recording a failure would turn
+    a degraded write path into a broken one.
+    """
+    level = logging.ERROR if isinstance(exc, _WIRING_BUG_CLASSES) else logging.WARNING
+    try:
+        logger.log(
+            level,
+            'write_triage fail-open at stage=%s project=%s exc=%s — write stored '
+            'WITHOUT triage (contract C1: never block a write)',
+            stage, project_id, type(exc).__name__,
+            exc_info=exc,
+        )
+        return counter.record(project=project_id)
+    except Exception:  # noqa: BLE001 — the alarm must not break the write path.
+        logger.exception('write_triage fail-open counter itself failed')
+        return None
