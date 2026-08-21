@@ -1912,6 +1912,21 @@ class TestBuildParser:
         # (which passes neither spelling) parse cleanly instead of being
         # rejected with exit 2 by an armed default it never asked for.
         assert args.fail_on_blind_spot is None
+        # task 2917 EDIT 1: the per-project resolution seam the nightly
+        # wrapper uses. Defaults off so every pre-existing invocation still
+        # sweeps rather than printing a list and returning.
+        assert args.list_known_projects is False
+
+    def test_list_known_projects_flag(self):
+        """--list-known-projects is the seam
+        scripts/fused-memory-flag-marker-sweep.sh uses to per-projectize the
+        nightly drain (task 2917 EDIT 1). Resolution lives HERE, in Python,
+        rather than inline in the bash wrapper, so it is unit-testable and
+        so the wrapper's fake-recorder harness can distinguish a resolution
+        call from a sweep call by argv alone."""
+        parser = _mod._build_parser()
+        args = parser.parse_args(['--list-known-projects'])
+        assert args.list_known_projects is True
 
     def test_fail_on_blind_spot_opt_in(self):
         """--fail-on-blind-spot is a store_true opt-in (task 3897)."""
@@ -2544,3 +2559,68 @@ class TestRunApplyStoreMutationPreflight:
             f'got: {[r.getMessage() for r in caplog.records]}'
         )
         memory_service.delete_memory.assert_not_awaited()
+
+
+class TestListKnownProjects:
+    """_known_project_ids() — the registry-backed resolution behind
+    --list-known-projects (task 2917 EDIT 1).
+
+    The nightly wrapper previously swept exactly ONE project (the sweep's
+    own `--project-id` default, dark_factory) while its per-project census
+    output read as if the fleet were covered. This helper is what lets the
+    wrapper ask the SAME {project_id: project_root} registry the
+    fused-memory server itself is configured from, rather than duplicating a
+    host-specific root list into a committed unit file.
+
+    Fail-safe posture mirrors _resolve_terminal_task_ids: any failure
+    degrades to [] (logged at WARNING) rather than propagating.
+    """
+
+    def test_returns_sorted_project_ids_from_the_registry(self, monkeypatch):
+        import fused_memory.models.scope as scope
+
+        monkeypatch.setattr(
+            scope, 'build_known_projects_map',
+            lambda *_a, **_kw: {'reify': '/b', 'dark_factory': '/a'},
+        )
+        assert _mod._known_project_ids() == ['dark_factory', 'reify']
+
+    def test_passes_project_root_env_through_as_primary_root(self, monkeypatch):
+        """PROJECT_ROOT is the seam the wrapper already exports, so the
+        primary root the registry is built around must come from it."""
+        import fused_memory.models.scope as scope
+
+        seen: dict[str, Any] = {}
+
+        def _capture(primary_root, extra_roots=None):
+            seen['primary_root'] = primary_root
+            seen['extra_roots'] = extra_roots
+            return {'dark_factory': primary_root}
+
+        monkeypatch.setattr(scope, 'build_known_projects_map', _capture)
+        monkeypatch.setenv('PROJECT_ROOT', '/srv/some-checkout')
+
+        assert _mod._known_project_ids() == ['dark_factory']
+        assert seen['primary_root'] == '/srv/some-checkout'
+        # extra_roots left None so the registry defaults it from
+        # known_project_roots_from_env() (DASHBOARD_KNOWN_PROJECT_ROOTS) --
+        # the wrapper must not re-derive that list itself.
+        assert seen['extra_roots'] is None
+
+    def test_degrades_to_empty_list_when_registry_raises(self, monkeypatch, caplog):
+        """Fail-safe, not fail-open: a broken registry must not take down the
+        nightly drain, but it must be visible in the journal."""
+        import fused_memory.models.scope as scope
+
+        def _boom(*_a, **_kw):
+            raise RuntimeError('registry exploded')
+
+        monkeypatch.setattr(scope, 'build_known_projects_map', _boom)
+
+        with caplog.at_level(logging.WARNING):
+            assert _mod._known_project_ids() == []
+        assert any(
+            'registry exploded' in r.getMessage()
+            or '_known_project_ids' in r.getMessage()
+            for r in caplog.records
+        ), f'Expected a WARNING naming the failure; got {[r.getMessage() for r in caplog.records]}'
