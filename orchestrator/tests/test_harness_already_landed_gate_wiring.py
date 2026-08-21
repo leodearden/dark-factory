@@ -708,7 +708,13 @@ class TestAlreadyLandedDispatchGateMarkerPath:
         # the ONLY has_open_l1 caller left — but assert on the most recent
         # call rather than an exact count, so a future dedup site added
         # elsewhere in the path doesn't turn this into a brittle failure.
-        cast(MagicMock, h._escalation_queue).has_open_l1.assert_called_with('42')
+        # Since task 3116 that dedup is deliberately CATEGORY-SCOPED: passing a
+        # bare task_id matched any open L1, so an unrelated escalation silently
+        # suppressed a provenance_unattributed filing (the task-4105 two-way
+        # blindfold). The kwarg here is the point of that change, not drift.
+        cast(MagicMock, h._escalation_queue).has_open_l1.assert_called_with(
+            '42', category='provenance_unattributed',
+        )
         cast(MagicMock, h._escalation_queue).submit.assert_called_once()
         esc = cast(MagicMock, h._escalation_queue).submit.call_args[0][0]
         assert esc.category == 'provenance_unattributed'
