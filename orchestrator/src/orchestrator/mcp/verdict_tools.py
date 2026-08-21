@@ -230,19 +230,37 @@ def create_server(artifacts: TaskArtifacts, role: str, session_id: str = '') -> 
     # would match BARE (`submit_review_verdict`, never the agent-facing
     # mcp__verdict-tools__submit_review_verdict spelling the corpus records).
     #
-    # escalation_sink is left UNWIRED, deliberately. This server runs as a
-    # standalone stdio subprocess (`python -m orchestrator.mcp.verdict_tools`,
-    # spawned from mcp_lifecycle.py) inside the task worktree, holding only a
-    # TaskArtifacts: there is no in-process escalation queue and no escalation
-    # client, so there is no in-scope way to preserve an unrepairable call's
-    # residue here. The middleware's own loud WARNING ("no escalation_sink is
-    # wired, so the residue of %r will not be preserved anywhere") is the honest
-    # fallback — a sink that silently dropped the payload would be strictly
-    # worse than none. Covered by the follow-up filed alongside task 3690.
+    # escalation_sink lands the residue of an UNREPAIRABLE call as a gitignored
+    # `.task/markup_residue-<n>.json` under the TaskArtifacts root this server
+    # already holds — durable, in the task's own meta root, and readable by an
+    # operator without a queue. That is what makes refusing a corrupted call
+    # non-destructive here (C2 L187 / INV-7): the refusal payload quotes the
+    # filename, so a bounced reviewer can point an operator at its own data.
+    #
+    # It is NOT a queue submission and deliberately not equivalent to the
+    # escalation server's. This server runs as a standalone stdio subprocess
+    # (`python -m orchestrator.mcp.verdict_tools`, spawned from
+    # mcp_lifecycle.py) inside the task worktree with no in-process escalation
+    # queue and no escalation client, so nothing PROACTIVELY surfaces the file —
+    # it waits to be found. Wiring proactive surfacing is the follow-up filed
+    # alongside task 3690.
+    #
+    # The state this preserves is worth MORE than the escalation server's, not
+    # less: a lost submit_review_verdict strands a review gate (INV-6) AND
+    # destroys a reviewer's entire `issues` findings list, which is by
+    # construction text the agent cannot re-emit identically.
+    #
+    # No try/except around the delegation: the middleware invokes sinks
+    # defensively (`_call_sink` never raises and never changes the caller's
+    # outcome), and a second guard here would only hide which layer failed. A
+    # write that cannot land returns None, and the middleware's hint then tells
+    # the caller the truth rather than claiming a preservation that did not
+    # happen.
     mcp.add_middleware(MarkupGuardMiddleware(
         policy=RepairPolicy.FORWARD_REPAIR,
         exempt_tools=frozenset(),
         fact_sink=_emit_markup_fact,
+        escalation_sink=artifacts.write_markup_residue,
     ))
 
     if role == 'judge':
