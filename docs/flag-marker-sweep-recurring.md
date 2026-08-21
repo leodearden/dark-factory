@@ -234,21 +234,109 @@ the repo's `.env` and needs:
 - `OPENAI_API_KEY` — for embeddings.
 - FalkorDB and Qdrant reachable (`FALKORDB_URI`, default
   `redis://localhost:6379`).
+- `DASHBOARD_KNOWN_PROJECT_ROOTS` — the comma-separated project-root registry
+  the per-project loop is derived from (task 2917). It is **not** in the repo
+  `.env` and **not** in the systemd user manager's own environment: it exists
+  only as an `Environment=` line inside the installed
+  `~/.config/systemd/user/fused-memory.service` unit. The wrapper therefore
+  imports it from that live unit (`systemctl --user show
+  fused-memory.service -p Environment`) and exports it before resolving the
+  list. Reading it back off the same unit the fused-memory server itself runs
+  under makes drift structurally impossible — there is one declaration of the
+  fleet's roots, not a second host-specific copy in a committed unit file that
+  rots the first time a project is added. Same technique and source as
+  `skills/factory-init/scripts/find_escalation_port.py:57-63`. When it cannot
+  be resolved the sweep narrows to `dark_factory` alone and **says so loudly**
+  (a `WARNING:` line naming both the fallback and the cause), at exit 0 —
+  the degradation is persistent, and a non-zero exit would park the `.timer`
+  in `failed` state forever, the same footgun described under
+  "Why no `--check` in the recurring service".
 
 This mirrors the runbook lesson from
 `fused-memory/scripts/cgl_eta_auto_apply.sh`: a fused-memory maintenance
 action must run under the service env, not a bare shell, or the census
 silently narrows.
 
+The unit also pins `Environment=PATH=` (task 2917). `Persistent=true`
+catch-up runs fire at boot, before the login session pushes the user PATH
+into the systemd user manager, and `uv` lives in `$HOME/.local/bin` — absent
+from that minimal boot PATH. OBSERVED 2026-08-18 09:02:44: `exec: uv: not
+found` / `status=127`. The wrapper additionally resolves `uv` to an absolute
+path itself, so a stale installed unit that predates the `Environment=PATH=`
+line is still covered.
+
 ## Schedule
 
 Nightly at 03:30 local time (`scripts/fused-memory-flag-marker-sweep.timer`,
 `Persistent=true` so a missed night catches up on next boot/login). Each run
-drains via:
+loops over **every registered project** (task 2917), one invocation each:
 
 ```
-sweep_orphan_flag_markers.py --apply --terminal-drain
+for project_id in $(sweep_orphan_flag_markers.py --list-known-projects); do
+    sweep_orphan_flag_markers.py --apply --terminal-drain --project-id "$project_id"
+done
 ```
+
+Before this the wrapper `exec`d the sweep exactly once with no `--project-id`,
+riding the parser's own `dark_factory` default while the per-project census it
+printed read as if the whole fleet had been drained.
+`FLAG_MARKER_SWEEP_PROJECT_IDS` (whitespace-separated) overrides the resolved
+list — mirroring the existing `FLAG_MARKER_SWEEP_CMD` / `REPO` override
+convention. `exec` is deliberately dropped and the loop does not `set -e` out
+on the first failure: one project failing must not silently truncate the
+fleet, so each failure is named on stderr with its exit code, the remaining
+projects are still attempted, and the wrapper exits non-zero overall.
+
+### `--terminal-drain` is deliberately PRIMARY-PROJECT-ONLY
+
+`--terminal-drain` is requested uniformly by the loop, but it only ever takes
+effect for the **primary** project — the one whose taskmaster root this
+process is configured with (`config.taskmaster.project_root`). Every other
+registered project is swept **age-only**. The guard is
+`_resolve_terminal_task_ids` in `fused-memory/scripts/sweep_orphan_flag_markers.py`,
+which returns an empty set (and logs a WARNING naming both project_ids) when
+the project being swept is not the primary one. `main()` then logs the
+EFFECTIVE per-project mode, so the journal reports coverage rather than
+intent.
+
+Why: the sweep resolves terminal task ids from exactly one task store, and
+`run()` matches markers against that set by **plain string membership**. Task
+ids are small integers, so a sibling project's marker whose `task_id` merely
+collides with a terminal `dark_factory` id is the common case, not the corner
+one (measured ~96% collision on the live registry) — and the delete is
+unrecoverable, because mem0's `_delete_memory` removes the Qdrant point
+*before* writing its SQLite history.
+
+The alternative — resolve each project's terminal ids from **its own** task
+store — is mechanically possible (`SqliteTaskBackend.get_statuses` accepts an
+arbitrary root) and was **rejected-for-now, not refuted** (task 2917,
+esc-2917-3). Per-project scoping preserves the existing cross-project
+contract; the alternative *extends* it, arming deletions in projects whose
+task store this process does not own. Declining to extend a contract needs no
+broader authority; extending one does. The damage asymmetry settles it: the
+guard mis-firing costs a lingering marker that the age predicate drains
+anyway; its absence mis-firing costs records that survive nowhere.
+
+### When coverage is not fleet-wide
+
+`--list-known-projects` reports its own coverage on a predicate that is
+**not** emptiness. `build_known_projects_map` seeds its candidates with the
+primary root *before* extending with the env roots, so an unset
+`DASHBOARD_KNOWN_PROJECT_ROOTS` yields a one-entry map, never an empty one —
+an `if not project_ids` check is unreachable in exactly the degradation it
+looks like it guards. Two cases are distinguished:
+
+- **the env var is set but names roots absent from the resolved map** — a
+  genuine degradation (typo, unreadable/moved checkout, a project_id already
+  claimed under first-wins). The missing roots are named individually.
+- **the env var is unset** — the map is primary-only, so coverage is
+  single-project and the census is not fleet-wide. Reported, but *not* a hard
+  failure: a legitimately single-project install would otherwise
+  warn-as-error forever.
+
+The predicate compares resolved project **ids**, not root counts, because the
+live registry lists the primary root too and the builder drops it as a
+duplicate id — a count comparison would cry degradation on every healthy run.
 
 ## Why no `--check` in the recurring service
 
