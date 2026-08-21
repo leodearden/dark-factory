@@ -6453,7 +6453,23 @@ async def run_scoped_verification(
             # fork — breadth is merge-role-gated only, so that call stays on
             # the legacy path unconditionally regardless of the knob.
             if role == 'merge' and verify_plan._merge_breadth_is_full(config):
-                registered_modules = list(config.module_configs_or_empty.values()) or module_configs
+                # The expansion itself lives in
+                # verify_plan.effective_merge_module_configs (flake-ledger PRD
+                # §8.2 / task 3787 γ) — ONE implementation of "the effective
+                # merge module set" in the tree, shared with the merge-request
+                # boundary in merge_queue._run_post_merge_verify so the local
+                # runner, the wire spec and the merge-flake suppression gate
+                # all reason against the identical set BY CONSTRUCTION
+                # (INV-5). The enclosing breadth guard stays: it gates this
+                # whole per-module fan-out branch, not just the module set.
+                # The call is IDEMPOTENT, so on the merge path — where the
+                # boundary has already resolved the set — it is a
+                # value-preserving no-op, while every other caller (CLI,
+                # tests, the remote in-worktree path) still gets the real
+                # expansion here.
+                registered_modules = verify_plan.effective_merge_module_configs(
+                    config, module_configs,
+                )
                 if registered_modules:
                     plan = verify_plan.VerifyPlan(runs=tuple(
                         run
@@ -6524,8 +6540,24 @@ async def run_scoped_verification(
             # direct-instantiated config in most unit tests) falls back to
             # the passed module_configs unchanged — degrades safely rather
             # than silently verifying nothing.
-            if role == 'merge' and verify_plan._merge_breadth_is_full(config):
-                module_configs = list(config.module_configs_or_empty.values()) or module_configs
+            #
+            # The expansion lives in verify_plan.effective_merge_module_configs
+            # (flake-ledger PRD §8.2 / task 3787 γ), which also owns the
+            # breadth predicate and is the IDENTITY at breadth='scoped' — so
+            # the guard here narrows to the role only. That helper is the ONE
+            # implementation of "the effective merge module set": the
+            # merge-request boundary (merge_queue._run_post_merge_verify)
+            # resolves it once up front and hands the SAME set to the local
+            # runner, the wire spec and the merge-flake suppression gate, so
+            # local and remote agree BY CONSTRUCTION rather than by two sites
+            # being asserted to match (INV-5). The call is IDEMPOTENT, which
+            # is what makes it a value-preserving no-op on that already-
+            # resolved merge path while still being the real expansion for
+            # every other caller (CLI, tests, the remote in-worktree path).
+            if role == 'merge':
+                module_configs = verify_plan.effective_merge_module_configs(
+                    config, module_configs,
+                )
             # Apply file-level scoping within each subproject when task_files given
             if task_files:
                 # Filter to files that still exist — tasks may delete files as part of their work

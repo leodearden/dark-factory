@@ -881,6 +881,54 @@ def _merge_breadth_is_full(config: OrchestratorConfig | None) -> bool:
     return config is not None and config.merge_verify_breadth == 'full'
 
 
+def effective_merge_module_configs(
+    config: OrchestratorConfig | None,
+    module_configs: list[ModuleConfig],
+) -> list[ModuleConfig]:
+    """The module set a MERGE-role verify actually covers.
+
+    Under ``merge_verify_breadth='full'`` a merge verify executes EVERY
+    registered module, not just the ones the merging task happened to touch —
+    so *this*, not the caller's task-scoped list, is the set every downstream
+    consumer must reason against. Flake-ledger PRD §8.2 / task 3787 (γ).
+
+    ORDERING INVARIANT (INV-5). Call this ONCE, at the merge-request boundary
+    in ``merge_queue._run_post_merge_verify``, ahead of both
+    ``build_merge_verify_spec`` and every ``LocalRunner(...)`` construction.
+    The local runner, the wire spec (and hence the remote's reconstruction of
+    it in ``verify_runner.run_merge_verify_on_worktree``) and the merge-flake
+    suppression gate then receive the IDENTICAL set BY CONSTRUCTION, rather
+    than by an assertion that two sites independently agree. Before this
+    helper the expansion was reimplemented inline at two sites inside
+    ``run_scoped_verification``, each rebinding a local that never propagated
+    out: the run executed the full registry while the suppression gate still
+    mapped failing node-ids against the task's own modules, so a red in an
+    untouched module mapped to no known subproject and the gate answered
+    "unconfirmable" — inverted exactly where it mattered most (PRD §3.1).
+
+    IDEMPOTENT: ``f(cfg, f(cfg, xs)) == f(cfg, xs)``. The full-breadth branch
+    ignores its input entirely (bar the empty-registry fallback) and the
+    scoped branch is the identity, so re-applying it to an already-resolved
+    set is a value-preserving no-op. That is what lets the surviving call
+    inside ``run_scoped_verification`` stay in place once the boundary has
+    already resolved the set.
+
+    The empty-registry fallback is a deliberate SAFE DEGRADE: a project with
+    no registered modules returns the passed set rather than ``[]``, so the
+    broad gate degrades to today's scoped coverage instead of silently
+    verifying nothing at the very breadth that exists to verify everything.
+
+    Breadth is asked of :func:`_merge_breadth_is_full` rather than re-read
+    from ``config`` here, so there stays exactly one breadth predicate in the
+    tree (and a ``None`` config keeps degrading to the shipped 'scoped'
+    default instead of raising).
+    """
+    if not _merge_breadth_is_full(config):
+        return module_configs
+    assert config is not None  # narrowed by _merge_breadth_is_full
+    return list(config.module_configs_or_empty.values()) or module_configs
+
+
 def _derive_full_suite_runs(
     mc: ModuleConfig,
     role: Literal['merge', 'task'] = 'merge',
