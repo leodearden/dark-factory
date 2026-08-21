@@ -35,7 +35,11 @@ one async retrieval helper and the async orchestrator kept separate from them.
 
 from __future__ import annotations
 
-from typing import Any
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from fused_memory.models.memory import MemoryResult
 
 # --- ack contract (INV-1: one home for the wire names) ---------------------
 #
@@ -68,6 +72,12 @@ OUTCOME_AMENDED = 'amended'
 #: The write contradicts an existing memory and was attached as a contested
 #: child. Produced by leaf gamma's judge, never by this leaf's stub.
 OUTCOME_CONTESTED = 'contested'
+
+#: INTERNAL routing sentinel: the write landed in the middle band and must be
+#: adjudicated. Deliberately NOT a member of :data:`TRIAGE_OUTCOMES` — the ack
+#: says what triage DID with a write, and "sent it to a judge" is not an answer
+#: to that. The judge's own verdict is what a caller eventually sees.
+OUTCOME_JUDGE = 'judge'
 
 #: The closed set of ack outcomes. Closed deliberately (D3): the judge's
 #: output is a fixed vocabulary, so an unrecognised value is a bug rather
@@ -178,3 +188,121 @@ def _coerce_band(value: Any) -> float | None:
     if isinstance(value, int | float) and not isinstance(value, bool):
         return float(value)
     return None
+
+
+# --- pure band routing ------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class BandDecision:
+    """Which band a candidate set fell in, and the numbers that decided it.
+
+    Frozen so a downstream stage cannot rewrite the routing after the fact.
+    Carries the inputs alongside the verdict so the ack (and a log line, and
+    leaf gamma's judge prompt) can quote WHY without recomputing anything —
+    the same reason ``build_near_duplicate_block`` emits ``similarity`` beside
+    ``threshold``: a decision the reader cannot check reads as a malfunction.
+    """
+
+    #: One of the outcome constants, or the internal :data:`OUTCOME_JUDGE`.
+    outcome: str
+    #: The best comparable candidate's id, or ``None`` when nothing compared.
+    canonical_id: str | None
+    #: That candidate's per-store cosine, or ``None``.
+    similarity: float | None
+    #: The band edges this decision was made against, echoed as read.
+    t_high: float | None
+    t_low: float | None
+
+
+def _cosine_of(result: MemoryResult) -> float | None:
+    """Read the per-store cosine a search result carries, or ``None``.
+
+    Since task 3658 ``MemoryService.search`` puts the honest per-store
+    similarity in ``metadata['store_score']`` (the Mem0 cosine; ``None`` for
+    Graphiti, which exposes no scores) and leaves ``relevance_score`` an
+    ORDINAL Reciprocal-Rank-Fusion value. Same shape as
+    ``near_duplicate_guard._cosine_of``, including the ``bool`` exclusion, so
+    a non-measurement can never be read as a similarity.
+    """
+    value = (result.metadata or {}).get('store_score')
+    if isinstance(value, int | float) and not isinstance(value, bool):
+        return float(value)
+    return None
+
+
+def decide_band(
+    results: list[MemoryResult],
+    *,
+    t_high: float | None,
+    t_low: float | None,
+) -> BandDecision:
+    """Route a write by the MAXIMUM per-store cosine among *results*.
+
+    ``s >= t_high`` is a deterministic :data:`OUTCOME_RESTATED` with no judge
+    call; ``t_low <= s < t_high`` routes to :data:`OUTCOME_JUDGE`; anything
+    below ``t_low``, and an empty or wholly uncomparable candidate set, is
+    :data:`OUTCOME_STORED`. Both edges are INCLUSIVE, matching how the
+    calibrator derives them: each is an order statistic of measured pairs, so
+    the boundary value is itself an observed duplicate.
+
+    The score read is the COSINE from ``metadata['store_score']``, NOT
+    ``relevance_score``. Since task 3658 the latter is an ordinal RRF value —
+    a single-store rank-1 hit scores 1/(60+1) ~ 0.0164 — which would never
+    clear a cosine band, silently disabling triage for every input, and would
+    pick the wrong canonical even where it did fire. Same warning
+    ``near_duplicate_guard`` carries on ``find_near_duplicate_memory``.
+
+    A candidate with no numeric cosine can never qualify at ANY threshold. A
+    missing cosine means NOT COMPARABLE, which is not the same as a measured
+    similarity of 0.0 that a low floor might clear.
+
+    Candidates are NOT filtered by category. That is the point of this leaf:
+    the retired guard restricted matching to the write's own category, and
+    reify esc-5547/esc-5560 were both cross-category duplicates it therefore
+    could not see.
+
+    Two boundary-of-configuration readings, both of which return a decision
+    rather than raising:
+
+    ``t_low is None`` — UNCALIBRATED. Fail open to ``stored``, matching the
+    landed schema's own reading of ``None``. With no measured lower edge there
+    is no evidence that any candidate is a duplicate, and inventing a floor
+    would attach real writes to unrelated canonicals.
+
+    ``t_high is None`` — an EMPTY DETERMINISTIC BAND, and a FIRST-CLASS
+    configuration rather than a broken one. ``calibrate_write_triage.py``
+    derives ``t_high`` as "the smallest measured duplicate score that strictly
+    exceeds every measured negative", an objective only satisfiable when the
+    two distributions actually separate. On the esc-3181 cluster leaf alpha
+    measured that they do not: the unrelated-pair MAX (0.8672) sits ABOVE the
+    true-pair MAX (0.8532). So on such a corpus there is honestly no
+    deterministic cutoff, everything at or above ``t_low`` routes to the
+    judge, and NOTHING takes the autonomous ``restated`` path. Do not "fix"
+    this into an assertion that a deterministic band always exists.
+
+    Pure and synchronous: does no I/O, takes no service, and raises nothing on
+    empty input.
+    """
+    scored = [
+        (cosine, r)
+        for r in results
+        if (cosine := _cosine_of(r)) is not None
+    ]
+    if not scored:
+        return BandDecision(OUTCOME_STORED, None, None, t_high, t_low)
+
+    similarity, best = max(scored, key=lambda pair: pair[0])
+
+    # UNCALIBRATED: no measured lower edge, so nothing is evidenced as a
+    # duplicate. Reported with no canonical, so the caller cannot accidentally
+    # attach to a candidate this did not endorse.
+    if t_low is None or similarity < t_low:
+        return BandDecision(OUTCOME_STORED, None, None, t_high, t_low)
+
+    # t_high None => empty deterministic band => the judge takes everything
+    # from t_low up. See the docstring: this is measured, not a fallback.
+    if t_high is not None and similarity >= t_high:
+        return BandDecision(OUTCOME_RESTATED, best.id, similarity, t_high, t_low)
+
+    return BandDecision(OUTCOME_JUDGE, best.id, similarity, t_high, t_low)
