@@ -1137,10 +1137,14 @@ class TestEmitTriageFailOpenStormEscalation:
         )
         from fused_memory.server.markup_guard import (  # noqa: PLC0415
             _RESIDUE_ANCHOR_TASK_ID as GUARD_RESIDUE_ANCHOR,
+        )
+        from fused_memory.server.markup_guard import (
             _STORM_ANCHOR_TASK_ID as GUARD_STORM_ANCHOR,
         )
         from fused_memory.server.markup_tripwire import (  # noqa: PLC0415
             _ANCHOR_TASK_ID as TRIPWIRE_ANCHOR,
+        )
+        from fused_memory.server.markup_tripwire import (
             _RESIDUE_ANCHOR_TASK_ID as RESIDUE_ANCHOR,
         )
 

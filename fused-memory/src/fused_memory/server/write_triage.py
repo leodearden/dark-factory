@@ -38,6 +38,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from shared.storm_counter import StormCounter
@@ -47,7 +48,22 @@ from fused_memory.models.enums import MEM0_PRIMARY
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+
     from fused_memory.models.memory import MemoryResult
+
+# Defensive import of the optional ``escalation`` workspace package, copied
+# from markup_tripwire.py (which took it from middleware/candidate_key_
+# escalation.py): when it is missing — minimal CI envs, deployments that never
+# installed it — the storm escalation degrades to a logged no-op. This module
+# sits on the MCP write path, and by the time escalation is attempted the
+# write has ALREADY been stored, so nothing here may change its outcome.
+try:
+    from escalation.models import Escalation  # type: ignore[import-untyped]
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped,no-redef]
+    HAS_ESCALATION = True
+except ImportError:  # pragma: no cover — exercised only in minimal envs
+    HAS_ESCALATION = False
 
 logger = logging.getLogger(__name__)
 
@@ -576,3 +592,185 @@ def _record_fail_open(
     except Exception:  # noqa: BLE001 — the alarm must not break the write path.
         logger.exception('write_triage fail-open counter itself failed')
         return None
+
+
+# --- the storm escalation (INV-4) ------------------------------------------
+#
+# Escalation wiring copied shape-for-shape from
+# ``markup_tripwire.emit_markup_storm_escalation``, which took it from
+# ``middleware/candidate_key_escalation.py``.
+#
+# _ANCHOR_TASK_ID is a stable per-project anchor (not a real task id) so the
+# resulting ids form one greppable ``esc-write-triage-fail-open-N`` series and
+# the dedup check has something to key on.
+#
+# It is THIS LEAF'S OWN and is shared with nobody, which is load-bearing rather
+# than tidy. Measured: the L1 escalation watcher files its own cluster records
+# under the ``markup-tripwire`` anchor and SQUATS it — the tripwire filed
+# nothing 2026-08-16..2026-08-19 while 41 rejections occurred, all 17 records
+# sitting at dedupe_count 0. A filer that dedupes against an anchor somebody
+# else keeps open never files again, and the resulting silence is
+# indistinguishable from health. That incident is why
+# ``emit_markup_storm_escalation`` grew its ``anchor_task_id`` parameter, and
+# it is why "simplifying" this into a shared anchor would disable the alarm.
+_QUEUE_DIRNAME: str = 'data/escalations'
+_ANCHOR_TASK_ID: str = 'write-triage-fail-open'
+_AGENT_ROLE: str = 'fused-memory/write-triage'
+_CATEGORY: str = 'write_triage_fail_open_storm'
+_PRD_PATH: str = 'docs/prds/memory-write-path-convergence.md'
+
+
+def emit_triage_fail_open_storm_escalation(
+    project_root: str | None,
+    storm: dict[str, Any],
+) -> str | None:
+    """File a ``write_triage_fail_open_storm`` escalation for a burst (INV-4).
+
+    Returns the escalation id — freshly filed, or the id of an already-open
+    escalation under this leaf's anchor (dedup) — or ``None`` when filing is
+    impossible or fails.
+
+    NEVER raises. By the time this runs the write's outcome is already decided
+    AND the write has already been stored, so escalation is purely additive:
+    every failure mode degrades to ``None`` plus a log line. An exception
+    escaping here would convert a successfully-degraded write into a failed
+    one, which is the exact C1 violation the whole fail-open apparatus exists
+    to prevent.
+
+    A ``None`` *project_root* is a quiet no-op: ``add_memory`` takes a
+    ``project_id``, and an unknown project resolves to no root at all.
+
+    The anchor dedup matters beyond the counter's own per-window rate limit: a
+    retrieval outage running for hours would otherwise file one escalation per
+    window, so those collapse into the single open record until an operator
+    resolves it.
+    """
+    if project_root is None:
+        logger.debug(
+            'write_triage: no project_root resolved; fail-open storm %r will '
+            'not be escalated',
+            storm,
+        )
+        return None
+    if not HAS_ESCALATION:
+        logger.debug(
+            'write_triage: escalation package unavailable; fail-open storm %r '
+            'in project_root=%r will not be escalated',
+            storm, project_root,
+        )
+        return None
+
+    try:
+        queue = EscalationQueue(Path(project_root) / _QUEUE_DIRNAME)
+    except Exception:
+        logger.exception(
+            'write_triage: failed to open the escalation queue for '
+            'project_root=%r; fail-open storm %r not escalated',
+            project_root, storm,
+        )
+        return None
+
+    # Best-effort dedup: a read failure falls THROUGH to filing rather than
+    # bailing out — losing duplicate-suppression is strictly better than losing
+    # the alarm for a degradation that is happening right now.
+    try:
+        existing = queue.get_by_task(_ANCHOR_TASK_ID, status='pending')
+    except Exception:
+        logger.exception(
+            'write_triage: failed to check for an existing open fail-open '
+            'escalation for project_root=%r; proceeding to file a new one',
+            project_root,
+        )
+        existing = []
+    if existing:
+        logger.info(
+            'write_triage: %s already open for project_root=%r (storm %r now); '
+            'not filing a duplicate',
+            existing[0].id, project_root, storm,
+        )
+        return existing[0].id
+
+    count = storm.get('count')
+    window_seconds = storm.get('window_seconds')
+    detail = '\n'.join([
+        f'project_root={project_root!r}',
+        f'fail_opens_in_window={count!r}',
+        f'threshold={storm.get("threshold")!r}',
+        f'window_seconds={window_seconds!r}',
+        # The counter is per-server, not per-project, so the count above may
+        # span more than this project_root. Naming them all keeps the record
+        # honest and points at the co-affected queues, rather than blaming
+        # whichever write happened to cross the threshold.
+        f'projects_in_window={storm.get("projects")!r}',
+        '',
+        'add_memory write triage (PRD leaf beta, task 3127) FAILED OPEN '
+        'repeatedly inside one rolling window. This is a DEGRADATION, not a '
+        'data-loss incident, and the distinction decides the remediation:',
+        '',
+        '  * Every write in the window still LANDED — stored WITHOUT triage, '
+        'i.e. with the pre-triage behaviour. No write was lost and no write '
+        'was blocked (contract C1 holds on every fail-open path).',
+        '  * What was lost is DETECTION: no restatement was recognised, so '
+        'writes that should have been attached as sightings of an existing '
+        'memory were stored as new standalone entries instead. Nothing is '
+        'corrupted and nothing needs unwinding — the corpus simply grew the '
+        'duplicates triage exists to prevent.',
+        '',
+        'A burst therefore means a DEPENDENCY is down, not that triage is '
+        "misfiring. Check candidate retrieval first (MemoryService.search / "
+        'mem0 reachability / the embedding provider), then the judge. Grep the '
+        "server logs for 'write_triage fail-open at stage=' — the stage= field "
+        'says which of the two it was, and a stage the logs record at ERROR '
+        '(TypeError/AttributeError/NameError) is a WIRING BUG, most likely a '
+        'changed MemoryService.search signature, not an outage.',
+        '',
+        'To stop triage DELIBERATELY rather than letting it degrade silently, '
+        'set write_triage.enabled: false in fused-memory/config/config.yaml. '
+        'That is the one lever — it is green-tier hot-reloadable, so '
+        'reload_config applies it without a restart. Disabling it restores '
+        "today's pre-triage behaviour exactly, which is already what these "
+        'writes got; the difference is that it stops being silent.',
+        '',
+        f'Owner: {_PRD_PATH} (leaf beta / task 3127). Attach the stage, the '
+        'exception type and the affected project from the log lines above '
+        "against that PRD's open leaves.",
+    ])
+
+    try:
+        esc = Escalation(  # type: ignore[possibly-unbound]
+            id=queue.make_id(_ANCHOR_TASK_ID),
+            task_id=_ANCHOR_TASK_ID,
+            agent_role=_AGENT_ROLE,
+            severity='blocking',
+            category=_CATEGORY,
+            summary=(
+                f'{count} add_memory write(s) triaged WITHOUT triage in '
+                f'{window_seconds}s — write triage is failing open '
+                f'(see {_PRD_PATH})'
+            ),
+            detail=detail,
+            suggested_action=(
+                'check MemoryService.search / mem0 reachability, then the '
+                "judge; grep the logs for 'write_triage fail-open at stage=' "
+                'for the failing stage. To stop triage deliberately, set '
+                'write_triage.enabled: false (green-tier hot-reloadable)'
+            ),
+            level=1,
+        )
+        esc_id = queue.submit(esc)
+    except Exception:
+        # A queue I/O failure must not propagate: the write has already been
+        # stored, and the WARNING/ERROR log at the fail-open site has already
+        # recorded the burst. The operator simply loses the queued heads-up.
+        logger.exception(
+            'write_triage: failed to submit fail-open storm escalation for '
+            'project_root=%r (storm %r)',
+            project_root, storm,
+        )
+        return None
+
+    logger.warning(
+        'write_triage: queued %s for project_root=%r (fail-open storm %r)',
+        esc_id, project_root, storm,
+    )
+    return esc_id
