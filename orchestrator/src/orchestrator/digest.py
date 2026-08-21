@@ -91,6 +91,97 @@ def update_ewa(
     return alpha * ratio + (1 - alpha) * prev_ewa
 
 
+
+@dataclass(frozen=True)
+class EwaReplayStep:
+    """One replayed EWA step — the inputs, the chosen numerator, and the result."""
+
+    submissions: int
+    resolutions: int
+    dones: int
+    # The numerator actually fed to update_ewa: submissions, or
+    # submissions + resolutions under the pre-4559 statistic.
+    numerator: int
+    ratio: float
+    ewa: float
+    tripped: bool
+
+
+@dataclass(frozen=True)
+class EwaReplaySeries:
+    """The result of replaying a step sequence through the EWA statistic."""
+
+    steps: list[EwaReplayStep]
+    peak: float
+    # Index of the first step whose EWA reached the threshold; None if never.
+    tripped_at: int | None
+
+
+def replay_ewa_series(
+    steps,
+    *,
+    alpha: float,
+    threshold: float,
+    count_resolutions: bool,
+    prev_ewa: float = 0.0,
+) -> EwaReplaySeries:
+    """Replay a sequence of digest steps through the EWA statistic.
+
+    Task 4559.  Pure — no I/O, no Harness, no clock — so it is deterministic in
+    CI and reusable by an operator replaying real window data offline.
+
+    *steps* is a sequence of ``(submissions, resolutions, dones)`` triples, one
+    per digest write.
+
+    *count_resolutions* selects the numerator, and is the ONLY difference
+    between the two statistics::
+
+        numerator = submissions + resolutions  if count_resolutions  # pre-4559
+        numerator = submissions                otherwise             # current
+
+    Everything else — including the per-step arithmetic — is delegated to
+    :func:`update_ewa`, deliberately: a second implementation of the formula
+    here could drift from the live statistic and quietly turn this into a
+    replay of something production does not do.  The ``count_resolutions=True``
+    arm is therefore a faithful reproduction of pre-4559 behaviour rather than
+    a re-derivation of it.
+
+    Returns the per-step detail, the peak EWA reached (including *prev_ewa*, so
+    a series that only decays reports its starting value), and the index of the
+    first step at or above *threshold* (``None`` if it never reaches it).
+    """
+    replayed: list[EwaReplayStep] = []
+    ewa = prev_ewa
+    peak = prev_ewa
+    tripped_at: int | None = None
+
+    for index, (submissions, resolutions, dones) in enumerate(steps):
+        numerator = submissions + resolutions if count_resolutions else submissions
+        ewa = update_ewa(
+            prev_ewa=ewa,
+            escalations_in_step=numerator,
+            done_in_step=dones,
+            alpha=alpha,
+        )
+        tripped = ewa >= threshold
+        if tripped and tripped_at is None:
+            tripped_at = index
+        peak = max(peak, ewa)
+        replayed.append(
+            EwaReplayStep(
+                submissions=submissions,
+                resolutions=resolutions,
+                dones=dones,
+                numerator=numerator,
+                ratio=numerator / max(dones, 1),
+                ewa=ewa,
+                tripped=tripped,
+            )
+        )
+
+    return EwaReplaySeries(steps=replayed, peak=peak, tripped_at=tripped_at)
+
+
 # ---------------------------------------------------------------------------
 # Escalation aggregation
 # ---------------------------------------------------------------------------

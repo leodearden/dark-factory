@@ -185,7 +185,7 @@ class TestReplayEwaSeries:
             f'Sanity: 0.7 * 73.59 = 51.513 is still above {THRESHOLD}; got {flags}'
         )
         assert flags[-1] is False, f'Expected the series to decay below threshold; got {values}'
-        for earlier, later in zip(flags, flags[1:], strict=True):
+        for earlier, later in zip(flags[:-1], flags[1:], strict=True):
             assert not (later and not earlier), (
                 f'A strictly decreasing series must never cross the threshold '
                 f'upward; got {flags}'
