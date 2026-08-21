@@ -506,19 +506,33 @@ def post_escalation(
       Ordering the write BEFORE the POST is what makes the reason durable
       independent of whether the POST lands.
 
-    *level* IS THE RULE, AND IT IS CHECKABLE AGAINST THE UNIT'S OWN
-    systemd ``Result``: ERROR iff this escalation accompanies a NON-ZERO
-    exit, WARNING iff the run still exits 0. The four decision-8 fail-loud
-    branches take the ERROR default and pass nothing, so the
-    cannot-forget property above is untouched. The three exit-0 sites --
-    the budget-suppression door, the barren streak and the
+    *level* IS THE RULE, AND IT IS ABOUT THIS ESCALATION, NOT THE NIGHT:
+    ERROR iff this escalation is ITSELF the fail-loud trigger returning
+    ``exit_code=1``, WARNING iff it deliberately leaves the exit code
+    untouched (the run may still fail LATER, for an unrelated reason). The
+    four decision-8 fail-loud branches take the ERROR default and pass
+    nothing, so the cannot-forget property above is untouched. The three
+    exit-0 sites -- the budget-suppression door, the barren streak and the
     deletion-directive aggregate -- pass ``logging.WARNING``, because each
     deliberately leaves ``exit_code=0`` (a non-zero exit would make
     ``check_trickle_liveness.sh`` fail every night for a timer that is
     running perfectly, and an ERROR journal line is a weaker version of
-    that same false alarm). Keeping the rule tied to the exit code is what
-    keeps ``journalctl -p err`` a list of ACTUAL trickle failures rather
-    than a mixed feed a healthy-but-barren timer also appears in.
+    that same false alarm). Tying the level to what THIS escalation does
+    to the exit code is what keeps ``journalctl -p err`` a list of ACTUAL
+    trickle failures rather than a mixed feed a healthy-but-barren timer
+    also appears in.
+
+    The rule is DELIBERATELY NOT stated as "matches the unit's own systemd
+    ``Result``", which reads tighter but is false in two directions -- so
+    a future maintainer must not "fix" a WARNING site to match an observed
+    ``Result=failed``. :func:`_escalate_barren_streak` is reached through
+    :func:`_record_trickle_progress` from ``run_nightly``'s ``finally``
+    block, so a night that crashes, storms or fails its commit AND has hit
+    the streak posts a WARNING escalation on a unit that reports failure.
+    The deletion-directive aggregate posts at WARNING before execution can
+    still fall into the validation-failure or commit-failure branch below
+    it and exit 1. Both WARNINGs are correct: neither escalation is why
+    the night failed, and the branch that IS why logs its own ERROR here.
 
     *detail* is logged IN FULL -- never truncated, never ``repr()``-ed.
     ``census_trigger._bounded_repr`` is this package's precedent for
@@ -999,8 +1013,11 @@ def _escalate_barren_streak(
     the identical refusal :func:`_report_sample_outcome` already records,
     for the identical reason -- and it is why the :func:`post_escalation`
     call below passes ``logging.WARNING`` rather than taking the ERROR
-    default: a run that still exits 0 must not show up in
-    ``journalctl -p err``. That call is ALSO the single site that journals
+    default: an escalation that does not itself flip the exit code must
+    not show up in ``journalctl -p err``, even on a night that later fails
+    for an unrelated reason (this one is posted from ``run_nightly``'s
+    ``finally``, so it can accompany one). That call is ALSO the single
+    site that journals
     ``summary -- detail`` for this escalation (task 4511); this function
     does not log the pair itself, so a streak night produces exactly one
     such line.

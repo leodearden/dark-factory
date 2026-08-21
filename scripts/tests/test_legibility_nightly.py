@@ -853,8 +853,8 @@ def test_post_escalation_journals_the_pair_before_the_post(tmp_path, caplog):
         f'expected exactly one record; got {[r.getMessage() for r in loud]}'
     )
     assert loud[0].levelno == logging.ERROR, (
-        'a fail-loud escalation accompanies a non-zero exit, so it belongs '
-        'in `journalctl -p err`'
+        'a fail-loud escalation IS the reason for the non-zero exit, so it '
+        'belongs in `journalctl -p err`'
     )
     message = loud[0].getMessage()
     assert 'summary text' in message
@@ -3641,8 +3641,12 @@ def test_every_fail_loud_branch_journals_its_reason_with_the_server_down(
 # scream every night about a timer that is running perfectly), so an ERROR
 # here would put a healthy-but-barren timer into `journalctl -p err`.
 #
-# The rule these three pin: ERROR iff the escalation accompanies a NON-ZERO
-# exit; WARNING iff the run still exits 0.
+# The rule these three pin is about the ESCALATION, not the night: ERROR iff
+# this escalation is ITSELF the fail-loud trigger returning exit_code=1;
+# WARNING iff it leaves the exit code untouched. The run may still fail LATER
+# for an unrelated reason -- the barren streak posts from `run_nightly`'s
+# `finally`, so its WARNING can accompany a unit that reports Result=failed,
+# and that is correct: it is not why the night failed.
 # ---------------------------------------------------------------------------
 
 def test_budget_suppression_door_journals_once_at_warning(tmp_path, caplog):
@@ -3753,7 +3757,8 @@ def test_deletion_directive_aggregate_journals_once_at_warning(tmp_path, caplog)
     )
     assert aggregate[0].levelno == logging.WARNING
     assert [r for r in loud if r.levelno >= logging.ERROR] == [], (
-        'a run that exits 0 must never appear in `journalctl -p err`'
+        'no escalation on this path flips the exit code, so none of them '
+        'belongs in `journalctl -p err`'
     )
 
 
