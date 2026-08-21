@@ -20,23 +20,25 @@ import types
 from unittest.mock import Mock
 
 import pytest
+
+from fused_memory.models.enums import MemoryCategory, SourceStore
+from fused_memory.models.memory import MemoryResult
 from fused_memory.server.write_triage import (
     _DEFAULT_CANDIDATE_K,
     _DEFAULT_WRITE_TRIAGE_ENABLED,
     CANONICAL_ID_KEY,
     OUTCOME_AMENDED,
     OUTCOME_CONTESTED,
+    OUTCOME_JUDGE,
     OUTCOME_RESTATED,
     OUTCOME_STORED,
     ROUTED_KEY,
     TRIAGE_OUTCOMES,
+    decide_band,
     resolve_bands,
     resolve_candidate_k,
     resolve_write_triage_enabled,
 )
-
-from fused_memory.models.enums import MemoryCategory, SourceStore
-from fused_memory.models.memory import MemoryResult
 from fused_memory.services.memory_service import RRF_K
 
 # The real post-RRF relevance_score for a rank-1 hit, from production rather
@@ -302,3 +304,203 @@ class TestResolveBands:
         assert resolve_bands(service) == (0.88, 0.52)
         service.config.write_triage.t_high = 0.91
         assert resolve_bands(service) == (0.91, 0.52)
+
+
+# ---------------------------------------------------------------------------
+# Pure band routing
+# ---------------------------------------------------------------------------
+
+# Deliberately NOT the shipped calibrated numbers: these are test inputs, and
+# copying the live values in would make every assertion here re-break on the
+# next recalibration for a reason that has nothing to do with the routing
+# logic under test.
+T_HIGH = 0.90
+T_LOW = 0.60
+
+
+class TestDecideBand:
+    """Which band a candidate set falls in, decided on the MAX COSINE.
+
+    Pure and synchronous: no I/O, and nothing raises on empty input.
+    """
+
+    def test_the_judge_sentinel_is_not_an_ack_outcome(self) -> None:
+        """`judge` is INTERNAL routing, never a value a caller sees.
+
+        The ack's `routed` field carries what triage DID with the write.
+        "sent it to a judge" is not an answer to that — the judge's own
+        verdict is. Leaking the sentinel into TRIAGE_OUTCOMES would make the
+        closed set open to a value no caller can act on.
+        """
+        assert OUTCOME_JUDGE not in TRIAGE_OUTCOMES
+
+    def test_an_empty_candidate_list_stores(self) -> None:
+        d = decide_band([], t_high=T_HIGH, t_low=T_LOW)
+        assert d.outcome == OUTCOME_STORED
+        assert d.canonical_id is None
+
+    def test_below_t_low_stores(self) -> None:
+        d = decide_band([_result('m1', 0.10)], t_high=T_HIGH, t_low=T_LOW)
+        assert d.outcome == OUTCOME_STORED
+        assert d.canonical_id is None
+
+    def test_at_or_above_t_high_is_deterministically_restated(self) -> None:
+        d = decide_band([_result('m1', 0.97)], t_high=T_HIGH, t_low=T_LOW)
+        assert d.outcome == OUTCOME_RESTATED
+        assert d.canonical_id == 'm1'
+        assert d.similarity == pytest.approx(0.97)
+
+    def test_the_middle_band_routes_to_the_judge(self) -> None:
+        d = decide_band([_result('m1', 0.75)], t_high=T_HIGH, t_low=T_LOW)
+        assert d.outcome == OUTCOME_JUDGE
+        assert d.canonical_id == 'm1'
+
+    @pytest.mark.parametrize(
+        ('score', 'expected'),
+        [(T_HIGH, OUTCOME_RESTATED), (T_LOW, OUTCOME_JUDGE)],
+        ids=['exactly-t_high', 'exactly-t_low'],
+    )
+    def test_both_boundaries_are_inclusive(self, score, expected) -> None:
+        """`s >= t_high` and `t_low <= s`, exactly as the PRD spells them.
+
+        An off-by-one here is invisible in aggregate and wrong on exactly the
+        cases the calibration fitted the edges to — both bounds are order
+        statistics of measured pairs, so the boundary value IS an observed
+        duplicate.
+        """
+        assert decide_band(
+            [_result('m1', score)], t_high=T_HIGH, t_low=T_LOW,
+        ).outcome == expected
+
+    def test_the_winner_is_the_max_cosine_not_the_first_result(self) -> None:
+        d = decide_band(
+            [_result('m1', 0.62), _result('m2', 0.95), _result('m3', 0.70)],
+            t_high=T_HIGH, t_low=T_LOW,
+        )
+        assert d.canonical_id == 'm2'
+        assert d.outcome == OUTCOME_RESTATED
+
+    def test_the_winner_is_not_the_max_relevance_score(self) -> None:
+        """The RRF rank-1 hit deliberately carries the LOWEST cosine here.
+
+        Since task 3658 `relevance_score` is an ORDINAL RRF value — rank-1 is
+        1/(RRF_K+1) ~ 0.0164 — so reading it as a similarity would never clear
+        a cosine band and would silently disable triage for every input. A
+        band router that sorted by it would also pick the wrong canonical
+        even when it did fire.
+        """
+        results = [
+            # rank 1 by RRF, worst by cosine.
+            _result('rank1', 0.61, relevance_score=1.0 / (RRF_K + 1), store_rank=1),
+            _result('rank2', 0.96, relevance_score=1.0 / (RRF_K + 2), store_rank=2),
+        ]
+        d = decide_band(results, t_high=T_HIGH, t_low=T_LOW)
+        assert d.canonical_id == 'rank2', 'the max COSINE must win, not the top RRF rank'
+        assert d.outcome == OUTCOME_RESTATED
+
+    @pytest.mark.parametrize(
+        ('label', 'result'),
+        [
+            ('store_score key absent', _result('m1', None, omit_store_score=True)),
+            ('store_score is None', _result('m1', None)),
+            ('store_score is a bool', _result('m1', True)),  # type: ignore[arg-type]
+            ('store_score is a string', _result('m1', '0.99')),  # type: ignore[arg-type]
+        ],
+    )
+    @pytest.mark.parametrize('t_low', [0.0, T_LOW])
+    def test_an_uncomparable_candidate_never_qualifies_at_any_threshold(
+        self, label, result, t_low,
+    ) -> None:
+        """A missing cosine means NOT COMPARABLE, not a similarity of 0.0.
+
+        The t_low=0.0 leg is the one that matters: a router that coerced an
+        absent score to 0.0 would have it clear a zero floor and route a
+        Graphiti result (which carries no store_score at all) to the judge.
+        """
+        d = decide_band([result], t_high=T_HIGH, t_low=t_low)
+        assert d.outcome == OUTCOME_STORED, label
+        assert d.canonical_id is None
+
+    def test_a_candidate_in_a_different_mem0_category_still_qualifies(self) -> None:
+        """The cross-category blind spot this leaf exists to fix.
+
+        The retired guard filtered candidates to the WRITE's own category, so
+        a procedural_knowledge write could not be matched against an
+        observations_and_summaries duplicate of itself. Reify esc-5547 and
+        esc-5560 both had exactly that shape.
+        """
+        d = decide_band(
+            [_result('m1', 0.97, category=MemoryCategory.observations_and_summaries)],
+            t_high=T_HIGH, t_low=T_LOW,
+        )
+        assert d.outcome == OUTCOME_RESTATED
+        assert d.canonical_id == 'm1'
+
+    def test_the_decision_quotes_the_numbers_that_produced_it(self) -> None:
+        """Inspectable, so the ack can say WHY without recomputing anything."""
+        d = decide_band([_result('m1', 0.97)], t_high=T_HIGH, t_low=T_LOW)
+        assert (d.similarity, d.t_high, d.t_low) == (pytest.approx(0.97), T_HIGH, T_LOW)
+
+    def test_the_decision_is_frozen(self) -> None:
+        """A downstream stage must not be able to rewrite the routing."""
+        d = decide_band([_result('m1', 0.97)], t_high=T_HIGH, t_low=T_LOW)
+        with pytest.raises((AttributeError, TypeError)):
+            d.outcome = OUTCOME_STORED  # type: ignore[misc]
+
+    # -- boundary-of-configuration cases ------------------------------------
+
+    def test_an_empty_deterministic_band_routes_everything_to_the_judge(self) -> None:
+        """`t_high is None` is a FIRST-CLASS configuration, not a broken one.
+
+        Leaf alpha measured the esc-3181 cluster and found the distributions
+        do not separate: the unrelated-pair MAX (0.8672) sits ABOVE the
+        true-pair MAX (0.8532). `calibrate_write_triage.py` derives t_high as
+        "the smallest measured duplicate score that strictly exceeds every
+        measured negative", an objective only satisfiable when they DO
+        separate — so on such a corpus there is honestly no deterministic
+        band, and refusing to invent one is the correct outcome.
+
+        A future reader must not "fix" this into an assertion that a
+        deterministic band always exists: with t_high None, everything at or
+        above t_low goes to the judge and NOTHING takes the autonomous
+        restated path.
+        """
+        for score in (T_LOW, 0.75, 0.97, 1.0):
+            d = decide_band([_result('m1', score)], t_high=None, t_low=T_LOW)
+            assert d.outcome == OUTCOME_JUDGE, f'score {score} must reach the judge'
+            assert d.canonical_id == 'm1'
+
+    def test_an_empty_deterministic_band_still_stores_below_t_low(self) -> None:
+        """The lower edge keeps working when the upper one is absent."""
+        d = decide_band([_result('m1', 0.10)], t_high=None, t_low=T_LOW)
+        assert d.outcome == OUTCOME_STORED
+
+    @pytest.mark.parametrize('t_high', [None, T_HIGH])
+    @pytest.mark.parametrize('score', [0.0, 0.5, 0.97, 1.0])
+    def test_an_uncalibrated_t_low_stores_everything(self, t_high, score) -> None:
+        """`t_low is None` is UNCALIBRATED — fail open to `stored`.
+
+        Matches the landed schema's own reading of None, and it is the safe
+        direction: with no measured lower edge there is no evidence that any
+        candidate is a duplicate, so inventing a floor would attach real
+        writes to unrelated canonicals. Holds whether or not t_high is set —
+        an upper edge without a lower one does not license routing either.
+        """
+        d = decide_band([_result('m1', score)], t_high=t_high, t_low=None)
+        assert d.outcome == OUTCOME_STORED
+        assert d.canonical_id is None
+
+    def test_decide_band_raises_nothing_on_any_band_configuration(self) -> None:
+        """Pure and synchronous, like find_near_duplicate_memory before it.
+
+        Every combination of present/absent band edges over an empty
+        candidate list returns a decision rather than raising. The
+        uncalibrated and empty-deterministic-band configurations are the ones
+        a naive `if score >= t_high` would blow up on with a TypeError —
+        inside a write path that C1 forbids from erroring.
+
+        `decide_band` takes no service and no config: it is handed the two
+        edges as arguments precisely so it cannot acquire an I/O dependency.
+        """
+        for t_high, t_low in ((None, None), (T_HIGH, T_LOW), (None, T_LOW)):
+            assert decide_band([], t_high=t_high, t_low=t_low).outcome == OUTCOME_STORED
