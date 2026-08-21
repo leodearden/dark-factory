@@ -5971,6 +5971,180 @@ class TestBuildRegrowthBlock:
         assert block['stamping_value']['flat']['claim_recall.at_5'] == pytest.approx(0.25)
 
 
+# ===========================================================================
+# 4012 step-9 — `build_report` carries the regrowth block, and refuses a
+#               partial one
+# ===========================================================================
+
+
+def _regrowth_block(**overrides) -> dict:
+    """A COMPLETE regrowth block, before whatever a test removes from it."""
+    mod = _mod()
+    block = mod.build_regrowth_block(
+        baseline=_arms(),
+        after_by_mode={mode: _arms() for mode in mod.REGROWTH_MODES},
+        injections=list(_injections()),
+        fixture_path=REGROWTH_INJECTION_PATH,
+    )
+    block.update(overrides)
+    return block
+
+
+class TestReportSchemaVersionBump:
+
+    def test_the_schema_version_is_three(self):
+        """A v2 artifact carries no regrowth block.
+
+        Diffing a v2 and a v3 artifact as if they answered the same questions
+        is exactly the misreading the version exists to prevent.
+        """
+        assert _mod().REPORT_SCHEMA_VERSION == 3
+
+
+class TestBuildReportCarriesRegrowth:
+
+    def test_a_report_built_without_the_probe_emits_an_explicit_none(self):
+        """`'regrowth' in report`, not merely falsy.
+
+        An ABSENT key would make "this build predates the probe" and "the
+        probe was skipped" the same reading — structurally the failure that
+        let 3199 reach done, whose delivered-check tested only that the
+        report exists.  The explicit `None` follows the convention
+        `protocol['replayed_from']` already set in this file.
+        """
+        report = _mod().build_report(
+            arms=_all_arms(), audit_recall=_audit_recall(), protocol=_protocol(),
+        )
+
+        assert 'regrowth' in report
+        assert report['regrowth'] is None
+
+    def test_a_complete_block_is_carried_through_unchanged_and_last(self):
+        block = _regrowth_block()
+
+        report = _mod().build_report(
+            arms=_all_arms(), audit_recall=_audit_recall(), protocol=_protocol(),
+            regrowth=block,
+        )
+
+        assert report['regrowth'] == block
+        # Key order is stable so two runs stay diffable.
+        assert list(report) == [
+            'schema_version', 'protocol', 'arms', 'audit_recall', 'regrowth',
+        ]
+
+
+class TestCheckRegrowth:
+    """Every incompleteness is NAMED, never discovered as a bare KeyError."""
+
+    def _build(self, block):
+        return _mod().build_report(
+            arms=_all_arms(), audit_recall=_audit_recall(), protocol=_protocol(),
+            regrowth=block,
+        )
+
+    def test_it_is_not_invoked_at_all_when_regrowth_is_none(self, monkeypatch):
+        mod = _mod()
+        called = []
+        monkeypatch.setattr(
+            mod, '_check_regrowth', lambda block: called.append(block),
+        )
+
+        mod.build_report(
+            arms=_all_arms(), audit_recall=_audit_recall(), protocol=_protocol(),
+        )
+
+        assert called == []
+
+    @pytest.mark.parametrize(
+        'descriptor', ['shape', 'injection_fixture', 'topics_injected'],
+    )
+    def test_a_missing_top_level_descriptor_is_named(self, descriptor):
+        block = _regrowth_block()
+        block.pop(descriptor)
+
+        with pytest.raises(_mod().IncompleteReportError) as excinfo:
+            self._build(block)
+
+        assert descriptor in str(excinfo.value)
+
+    def test_a_missing_mode_is_named(self):
+        block = _regrowth_block()
+        block['deltas'].pop('stamped')
+
+        with pytest.raises(_mod().IncompleteReportError) as excinfo:
+            self._build(block)
+
+        assert 'stamped' in str(excinfo.value)
+
+    def test_an_unknown_mode_is_named(self):
+        block = _regrowth_block()
+        block['after']['stamped_and_pinned'] = _arms()
+
+        with pytest.raises(_mod().IncompleteReportError) as excinfo:
+            self._build(block)
+
+        assert 'stamped_and_pinned' in str(excinfo.value)
+
+    def test_a_missing_read_arm_is_named(self):
+        block = _regrowth_block()
+        block['baseline'].pop('promoting_pin')
+
+        with pytest.raises(_mod().IncompleteReportError) as excinfo:
+            self._build(block)
+
+        assert 'promoting_pin' in str(excinfo.value)
+
+    def test_an_unknown_read_arm_is_named(self):
+        block = _regrowth_block()
+        block['stamping_value']['grouped_pin'] = _plucked()
+
+        with pytest.raises(_mod().IncompleteReportError) as excinfo:
+            self._build(block)
+
+        assert 'grouped_pin' in str(excinfo.value)
+
+    @pytest.mark.parametrize('table', ['baseline', 'stamping_value'])
+    def test_a_missing_metric_in_a_flat_table_is_named(self, table):
+        block = _regrowth_block()
+        block[table]['flat'].pop('tokens_per_query.mean')
+
+        with pytest.raises(_mod().IncompleteReportError) as excinfo:
+            self._build(block)
+
+        message = str(excinfo.value)
+        assert 'tokens_per_query.mean' in message
+        assert 'flat' in message
+
+    @pytest.mark.parametrize('table', ['after', 'deltas'])
+    def test_a_missing_metric_in_a_per_mode_table_is_named(self, table):
+        block = _regrowth_block()
+        block[table]['unstamped']['flat'].pop('claim_recall.at_5')
+
+        with pytest.raises(_mod().IncompleteReportError) as excinfo:
+            self._build(block)
+
+        message = str(excinfo.value)
+        assert 'claim_recall.at_5' in message
+        assert 'unstamped' in message
+        assert 'flat' in message
+
+    def test_a_none_VALUE_does_not_raise(self):
+        """`None` is a legitimate "measured, no denominator" in this pipeline.
+
+        The renderer prints it as `—`.  Only an ABSENT key means the run
+        broke.  Both directions are pinned so the check cannot drift into
+        rejecting a real measurement.
+        """
+        block = _regrowth_block()
+        block['baseline']['flat']['claim_recall.at_5'] = None
+        block['deltas']['unstamped']['flat']['claim_recall.at_5'] = None
+
+        report = self._build(block)
+
+        assert report['regrowth']['baseline']['flat']['claim_recall.at_5'] is None
+
+
 class TestReadPathHoldsTheWindowBudget:
     """Pin-on and pin-off must be scored over equal-size windows."""
 
