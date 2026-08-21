@@ -545,3 +545,128 @@ def test_the_residual_counts_reach_the_per_project_line_and_the_summary(monkeypa
     assert 'cancelled=1' in per_project and 'done=2' in per_project
     assert per_project.index('cancelled=1') < per_project.index('done=2')
     assert 'cancelled=1' in summary and 'done=2' in summary
+
+
+# The reply shapes THIS SCRIPT'S OWN TRANSPORT can actually deliver for a
+# rejected write. Not hypothetical: `call_tool` raises only on a JSON-RPC-level
+# `error`, while a fused-memory tool rejection comes back as an ORDINARY reply
+# (`@mcp_tool_errors` converts every exception into one), and `_post` returns a
+# bare `{}` for a 202 or an empty body. scripts/repair_wiped_metadata_files.py:
+# 405-450 cites this module's `_post` (:89-90) and `call_tool` (:126) by line
+# number as the source of the reachable `{}`.
+REJECTION_REPLIES = [
+    # A lock_charter_error, the gate this whole migration collides with: an
+    # `error` marker and no `success` key at all.
+    {'error': 'metadata.files carries directory locks', 'task_id': '9'},
+    {'success': False, 'error': 'status_via_update_task', 'error_type': 'GuardError'},
+    {},
+    'not a dict at all',
+]
+
+
+def _reply_ids() -> list[str]:
+    return ['lock_charter_error', 'success_false', 'empty_dict', 'non_dict']
+
+
+def test_a_rejected_write_is_counted_as_a_failure_not_as_a_migration():
+    """THE SILENT-SUCCESS BUG. Today all four of these print as successes.
+
+    A migration whose entire subject is a collision with a server-side write
+    gate MUST be able to see that gate fire. If it cannot, the numbers in the
+    PR and in the committed run evidence are unverifiable — a run in which
+    every single write was rejected produces output identical to a clean one.
+
+    The rejected task is asserted absent from EVERY success tally, not merely
+    present in ``failed``: double-counting it would keep the copied/dropped
+    figures wrong in exactly the direction that hides the problem.
+    """
+    for reply, name in zip(REJECTION_REPLIES, _reply_ids(), strict=True):
+        client = _CannedProject(
+            [_task('r1', modules=['scripts/a.py'])],
+            update_reply=lambda args, _r=reply: _r,
+        )
+
+        counts = _run(client)
+
+        assert counts.failed == 1, name
+        assert (counts.copied, counts.sanitized_empty, counts.dropped) == (0, 0, 0), name
+
+
+def test_a_rejected_write_is_named_on_stderr(capsys):
+    """An operator has to be told WHICH task, and why, not just a total.
+
+    ``error_type`` is included when present because it is the machine-readable
+    half of the reply and is what an operator greps for.
+    """
+    client = _CannedProject(
+        [_task('r1', modules=['scripts/a.py'])],
+        update_reply=lambda args: {
+            'success': False, 'error': 'nope', 'error_type': 'GuardError',
+        },
+    )
+
+    _run(client)
+
+    err = capsys.readouterr().err
+    assert 'r1' in err
+    assert 'GuardError' in err
+
+
+def test_a_rejection_does_not_abort_the_remaining_tasks():
+    """One rejected task must not cost the rest of the corpus its migration.
+
+    A partial run is the realistic failure — a single task tripping a guard the
+    others do not — and stopping there would leave the corpus half-migrated
+    with no record of where it stopped.
+    """
+    client = _CannedProject(
+        [
+            _task('bad', modules=['scripts/a.py']),
+            _task('good', modules=['scripts/b.py']),
+        ],
+        update_reply=lambda args: (
+            {'error': 'rejected'} if args['id'] == 'bad' else {'success': True}
+        ),
+    )
+
+    counts = _run(client)
+
+    assert (counts.failed, counts.copied) == (1, 1)
+    assert _written(client, 'good')['files'] == ['scripts/b.py']
+
+
+def test_a_success_shaped_reply_with_no_success_key_still_counts():
+    """THE POSITIVE CONTROL: the classifier must not reject every real success.
+
+    ``update_task`` answers with the updated task record, which carries an
+    ``id`` and no ``success`` key at all. A classifier demanding an explicit
+    ``success: True`` would report a completely clean run as a total failure —
+    the opposite over-correction, and just as unusable.
+    """
+    client = _CannedProject(
+        [_task('ok', modules=['scripts/a.py'])],
+        update_reply=lambda args: {'id': 'ok', 'status': 'pending'},
+    )
+
+    counts = _run(client)
+
+    assert (counts.failed, counts.copied) == (0, 1)
+
+
+def test_a_nonzero_failed_total_makes_the_process_exit_nonzero(monkeypatch, capsys):
+    """A partly-rejected run must not be mistakable for a clean one at the shell.
+
+    ``main_async``'s return value becomes the process exit status. A migration
+    that prints failures and still exits 0 will be recorded as a green run by
+    anything driving it non-interactively — including the operator who reads
+    only the last line.
+    """
+    rejected = _CannedProject(
+        [_task('r1', modules=['scripts/a.py'])],
+        update_reply=lambda args: {'error': 'rejected'},
+    )
+    assert _run_main(monkeypatch, rejected) != 0
+    assert 'failed: 1' in capsys.readouterr().out.split('---- summary ----')[1]
+
+    clean = _CannedProject([_task('ok', modules=['scripts/a.py'])])
+    assert _run_main(monkeypatch, clean) == 0
