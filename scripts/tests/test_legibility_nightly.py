@@ -809,6 +809,97 @@ def test_post_escalation_is_best_effort_on_poster_failure(tmp_path):
     ok = nightly.post_escalation(cfg, 'summary text', 'detail text', poster=raising_poster)
 
     assert ok is False
+# ---------------------------------------------------------------------------
+# task 4511 step-1/2: post_escalation journals the summary/detail pair ITSELF,
+# before the POST.
+#
+# The 2026-08-18 incident (esc-legibility-trickle-reify-3): the only copy of
+# 'coder storm: 6/6 digests failed ... [Errno 2] No such file or directory:
+# claude' lived inside the archived escalation JSON, and
+# `journalctl --user -u legibility-trickle@reify.service` showed nothing but
+# an unexplained benign 400 and `status=1/FAILURE`. Logging from inside
+# `post_escalation` -- the only path to the POST -- makes the reason survive
+# both a future branch that forgets to log and an escalation server that is
+# down.
+# ---------------------------------------------------------------------------
+
+def test_post_escalation_journals_the_pair_before_the_post(tmp_path, caplog):
+    """The escalation reason reaches the journal from `post_escalation`
+    itself, at ERROR, carrying BOTH halves.
+
+    The "before the POST" half is asserted from INSIDE the injected poster
+    rather than after the call returns, because that is the property that
+    actually survives an unreachable escalation server: a write ordered
+    after a successful POST would still be missing in exactly the case an
+    operator needs it.
+    """
+    cfg = load_config(_write_config(tmp_path, project_id='proj_a'))
+    seen_inside_poster = []
+
+    def _recording_poster(url, envelope):
+        seen_inside_poster.extend(_nightly_warnings(caplog))
+
+    with caplog.at_level(logging.DEBUG, logger='legibility.nightly'):
+        ok = nightly.post_escalation(
+            cfg, 'summary text', 'detail text', poster=_recording_poster,
+        )
+
+    assert ok is True
+
+    loud = _nightly_warnings(caplog)
+    assert len(loud) == 1, (
+        f'expected exactly one record; got {[r.getMessage() for r in loud]}'
+    )
+    assert loud[0].levelno == logging.ERROR, (
+        'a fail-loud escalation accompanies a non-zero exit, so it belongs '
+        'in `journalctl -p err`'
+    )
+    message = loud[0].getMessage()
+    assert 'summary text' in message
+    assert 'detail text' in message, (
+        'the DETAIL is the diagnosis; a summary-only journal line is exactly '
+        f'what the 2026-08-18 incident already had. got {message!r}'
+    )
+
+    assert len(seen_inside_poster) == 1, (
+        'the journal write must already have happened when the poster is '
+        f'entered; saw {seen_inside_poster!r}'
+    )
+
+
+def test_post_escalation_journals_the_pair_even_when_the_poster_raises(
+    tmp_path, caplog,
+):
+    """The escalation-server-down case, which loses the diagnosis entirely
+    today. The pre-existing best-effort contract is unchanged and re-pinned
+    here so the new write cannot be mistaken for a behaviour change."""
+    cfg = load_config(_write_config(tmp_path, project_id='proj_a'))
+
+    def _raising_poster(url, envelope):
+        raise RuntimeError('escalation server unreachable')
+
+    with caplog.at_level(logging.DEBUG, logger='legibility.nightly'):
+        ok = nightly.post_escalation(
+            cfg, 'summary text', 'detail text', poster=_raising_poster,
+        )
+
+    # Unchanged best-effort behaviour: never raises, reports False, and
+    # still emits its own post-failure WARNING.
+    assert ok is False
+    loud = _nightly_warnings(caplog)
+    warned = [r.getMessage() for r in loud if r.levelno == logging.WARNING]
+    assert any('escalation post failed' in m for m in warned), warned
+
+    errors = [r for r in loud if r.levelno == logging.ERROR]
+    assert len(errors) == 1, (
+        f'expected exactly one ERROR; got {[r.getMessage() for r in errors]}'
+    )
+    message = errors[0].getMessage()
+    assert 'summary text' in message
+    assert 'detail text' in message, (
+        'a down escalation server must not cost the diagnosis -- that is the '
+        f'whole point of journaling before the POST. got {message!r}'
+    )
 
 
 class _FakeHttpxResponse:
@@ -3440,3 +3531,97 @@ def test_main_run_fails_safe_when_the_defaulted_fetcher_cannot_reach_fused_memor
         and 'tasks-landed: delta unavailable (no baseline/fetcher) -> N/A' in m
         for m in messages
     ), messages
+
+
+# ---------------------------------------------------------------------------
+# task 4511 step-1/2 (b): EVERY decision-8 fail-loud branch reaches the
+# journal, with the escalation server DOWN.
+#
+# This is the incident shape, not a hypothetical: the reason is only ever
+# durable if it is written before the POST that may never land. Driven end to
+# end through the four real branches (extractor crash, coder storm, codebook
+# validation failure, commit failure) so a NEW fail-loud branch added later
+# inherits the guarantee for free -- it cannot reach `escalated=...` without
+# passing through the one log site.
+#
+# Nothing here asserts on the escalation payload: `_build_escalation_arguments`
+# and the envelope are deliberately untouched by this task.
+# ---------------------------------------------------------------------------
+
+def _run_decision8_branch(tmp_path, monkeypatch, branch, *, poster):
+    """Drive `run_nightly` down ONE named decision-8 fail-loud branch, on the
+    existing e2e repo/transcript fixtures.
+
+    Modelled on `TestRunNightlyRecordsTrickleState._run` (which already
+    demonstrates one helper reaching all four branches) and reusing that
+    class's drivers verbatim, so this test pins logging and nothing else.
+    """
+    work_cwd = str(tmp_path / 'work')
+    repo, config_path = _init_e2e_repo(tmp_path, work_cwd=work_cwd)
+    projects_root = tmp_path / 'projects'
+    _write_transcript(
+        projects_root / _encode_cwd(work_cwd) / 'session-1.jsonl',
+        cwd=work_cwd, timestamp='2026-07-13T10:00:00Z', session_id='session-1',
+    )
+
+    kwargs: dict[str, Any] = dict(
+        config_path=config_path,
+        projects_root=projects_root,
+        target_date=date(2026, 7, 13),
+        now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
+        invoke=_fake_invoke_known_cause,
+        status_fetcher=None,
+        poster=poster,
+    )
+    if branch == 'extractor':
+        monkeypatch.setattr(nightly, 'build_digests', _crashing_build_digests)
+    elif branch == 'storm':
+        kwargs['invoke'] = _fake_invoke_unparseable
+    elif branch == 'validation':
+        monkeypatch.setattr(
+            codebook, 'validate', lambda cb: ['synthetic validation error'],
+        )
+    elif branch == 'commit':
+        kwargs['committer'] = _failing_committer
+    else:  # pragma: no cover - guards a typo'd parametrize id
+        raise AssertionError(f'unknown decision-8 branch {branch!r}')
+
+    return nightly.run_nightly(**kwargs)
+
+
+@pytest.mark.parametrize(
+    ('branch', 'summary_marker', 'detail_marker'),
+    [
+        ('extractor', 'extractor crashed', 'boom: corrupt transcript'),
+        ('storm', 'coder storm', 'could not parse a JSON object'),
+        ('validation', 'failed validation', 'synthetic validation error'),
+        ('commit', 'commit failed', 'cannot lock ref (simulated)'),
+    ],
+)
+def test_every_fail_loud_branch_journals_its_reason_with_the_server_down(
+    tmp_path, monkeypatch, caplog, branch, summary_marker, detail_marker,
+):
+    def _raising_poster(url, envelope):
+        raise RuntimeError('escalation server unreachable')
+
+    with caplog.at_level(logging.DEBUG, logger='legibility.nightly'):
+        result = _run_decision8_branch(
+            tmp_path, monkeypatch, branch, poster=_raising_poster,
+        )
+
+    assert result.exit_code == 1
+    assert result.escalated is False, (
+        'the POST failed, so nothing was filed -- which is precisely why the '
+        'journal has to carry the reason'
+    )
+
+    errors = [r for r in _nightly_warnings(caplog) if r.levelno == logging.ERROR]
+    assert len(errors) == 1, (
+        f'expected exactly one ERROR for the {branch} branch; got '
+        f'{[r.getMessage() for r in errors]}'
+    )
+    message = errors[0].getMessage()
+    assert summary_marker in message, f'{summary_marker!r} not in {message!r}'
+    assert detail_marker in message, (
+        f'the reason must survive whole -- {detail_marker!r} not in {message!r}'
+    )
