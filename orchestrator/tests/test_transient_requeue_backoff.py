@@ -410,3 +410,110 @@ class TestReleaseArmsJitteredBackoff:
         assert scheduler._time_source() >= deadline
         scheduler._gc_expired_cooldowns()
         assert 'T1' not in scheduler._requeue_until
+
+
+class TestSnapshotExposesRequeueCooldowns:
+    """``get_state_snapshot()['requeue_cooldowns']`` — the operator-visible read.
+
+    Sourced from a meta dict stamped ONCE AT ARMING, never recomputed from
+    "now": ``_build_snapshot_payload`` content-dedups the snapshot, so a
+    naive ``remaining_secs`` would make every tick byte-different and defeat
+    the write throttle.
+    """
+
+    def test_transient_arming_records_armed_envelope_and_count(self):
+        clock = [1000.0]
+        scheduler = _clocked_scheduler(clock, jitter_source=lambda lo, hi: hi)
+        _arm_transient(scheduler, clock, 'T1')
+        entry = scheduler.get_state_snapshot()['requeue_cooldowns']['T1']
+        assert entry['armed_secs'] == 30.0
+        assert entry['envelope_secs'] == 30.0
+        assert entry['transient'] is True
+        assert entry['transient_count'] == 1
+
+        for _ in range(2):
+            _arm_transient(scheduler, clock, 'T1')
+        entry = scheduler.get_state_snapshot()['requeue_cooldowns']['T1']
+        assert entry['armed_secs'] == entry['envelope_secs'] == 120.0
+        assert entry['transient_count'] == 3
+
+    def test_real_rng_armed_value_sits_inside_the_recorded_envelope(self):
+        clock = [1000.0]
+        scheduler = _clocked_scheduler(clock)
+        for _ in range(4):
+            _arm_transient(scheduler, clock, 'T1')
+        entry = scheduler.get_state_snapshot()['requeue_cooldowns']['T1']
+        assert entry['envelope_secs'] == 240.0
+        assert entry['envelope_secs'] / 2 <= entry['armed_secs'] <= entry['envelope_secs']
+
+    def test_genuine_requeue_records_a_flat_non_transient_entry(self):
+        clock = [1000.0]
+        scheduler = _clocked_scheduler(clock, jitter_source=lambda lo, hi: hi)
+        _requeue(scheduler, 'G1', reason='verify failed', api_error_status=None)
+        scheduler.release('G1', requeued=True)
+        entry = scheduler.get_state_snapshot()['requeue_cooldowns']['G1']
+        assert entry['armed_secs'] == 30.0
+        assert entry['envelope_secs'] == 30.0
+        assert entry['transient'] is False
+        assert entry['transient_count'] == 0
+
+    def test_armed_secs_grow_across_successive_transient_requeues(self):
+        """Boundary row 4's product-visible signal: the deltas GROW."""
+        clock = [1000.0]
+        scheduler = _clocked_scheduler(clock, jitter_source=lambda lo, hi: hi)
+        seen = []
+        for _ in range(5):
+            _arm_transient(scheduler, clock, 'T1')
+            seen.append(
+                scheduler.get_state_snapshot()['requeue_cooldowns']['T1']['armed_secs']
+            )
+        assert seen == [30.0, 60.0, 120.0, 240.0, 480.0]
+
+    def test_gc_drops_the_meta_in_lockstep_with_the_deadline(self):
+        """An entry must never outlive its deadline."""
+        clock = [1000.0]
+        scheduler = _clocked_scheduler(clock, jitter_source=lambda lo, hi: hi)
+        _arm_transient(scheduler, clock, 'T1')
+        assert 'T1' in scheduler.get_state_snapshot()['requeue_cooldowns']
+
+        clock[0] += 31.0
+        scheduler._gc_expired_cooldowns()
+        assert 'T1' not in scheduler._requeue_until
+        assert 'T1' not in scheduler.get_state_snapshot()['requeue_cooldowns']
+
+    def test_gc_tolerates_a_directly_injected_deadline_with_no_meta(self):
+        """Tests inject ``_requeue_until`` directly (test_scheduler_tick_phases.py).
+
+        The meta pop must be a no-op when no entry exists, not a KeyError.
+        """
+        clock = [1000.0]
+        scheduler = _clocked_scheduler(clock)
+        scheduler._requeue_until['ORPHAN'] = 500.0
+        scheduler._gc_expired_cooldowns()
+        assert 'ORPHAN' not in scheduler._requeue_until
+
+    def test_payload_is_dedup_stable_as_the_clock_advances(self):
+        """Regression guard for the content-dedup write throttle.
+
+        No cooldown field may be recomputed from "now" — with one cooldown
+        armed and no re-arming, two payloads five seconds apart must be
+        byte-identical, or every tick would rewrite the snapshot file.
+        """
+        clock = [1000.0]
+        scheduler = _clocked_scheduler(clock, jitter_source=lambda lo, hi: hi)
+        _arm_transient(scheduler, clock, 'T1')
+        first = scheduler._build_snapshot_payload()
+        clock[0] += 5.0
+        assert scheduler._build_snapshot_payload() == first
+
+    def test_returned_cooldowns_are_deep_copied(self):
+        """Mutating the returned dict must not corrupt scheduler state."""
+        clock = [1000.0]
+        scheduler = _clocked_scheduler(clock, jitter_source=lambda lo, hi: hi)
+        _arm_transient(scheduler, clock, 'T1')
+        snap = scheduler.get_state_snapshot()
+        snap['requeue_cooldowns']['T1']['armed_secs'] = 9999.0
+        snap['requeue_cooldowns']['INJECTED'] = {}
+        fresh = scheduler.get_state_snapshot()['requeue_cooldowns']
+        assert fresh['T1']['armed_secs'] == 30.0
+        assert 'INJECTED' not in fresh
