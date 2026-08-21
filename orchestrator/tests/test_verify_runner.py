@@ -2054,7 +2054,9 @@ class TestRunMergeVerifyOnWorktree:
         )
         # Sanity: the copy really did receive the spec's set, so the identity
         # assertion above is not passing vacuously against a no-op fix.
-        effective_config = run_scoped.await_args[0][1]
+        call_args = run_scoped.await_args
+        assert call_args is not None
+        effective_config = call_args[0][1]
         assert set(effective_config.module_configs_or_empty) == {'src/a', 'src/b'}
 
     async def test_spec_global_verify_command_applied_onto_config(self):

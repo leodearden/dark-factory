@@ -1098,7 +1098,9 @@ class TestRemoteSpecAuthoritativeModuleRegistry:
             'expected the global gate call to carry NO ModuleConfig (opaque global '
             'command); a non-empty list means the host\'s registry drove execution'
         )
-        effective_config = mock_run_verification.await_args.args[1]
+        global_gate_call = mock_run_verification.await_args
+        assert global_gate_call is not None
+        effective_config = global_gate_call.args[1]
         assert effective_config.test_command == 'DISP_GLOBAL_TEST pytest'
         assert effective_config.lint_command == 'DISP_GLOBAL_LINT ruff check'
         assert effective_config.type_check_command == 'DISP_GLOBAL_TYPE pyright'
