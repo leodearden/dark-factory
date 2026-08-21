@@ -370,6 +370,25 @@ summary_rebuild:
 #   storm_window_seconds: 3600.0
 
 write_triage:
+  # OPERATOR KNOBS — hand-set, NOT calibration outputs. These two are the only
+  # keys in this block a human is meant to edit; everything below the fence is
+  # derived. Both are green-tier hot-reloadable, and
+  # scripts/calibrate_write_triage.py --write-config preserves them when it
+  # rewrites the calibrated keys below.
+  #
+  # enabled: the staged-rollout flag for add_memory write triage (PRD D10,
+  # spelled `write_triage_enabled` there). While false the existing near-dup
+  # and topic-cluster reject guards run unchanged and no triage code executes.
+  # Flipped by task 3169, after the judge (leaf gamma) lands — until then the
+  # middle band is answered by a deliberate stub. Also the lever that stops an
+  # in-flight triage incident.
+  enabled: false
+  # candidate_k: retrieval WIDTH, not a threshold — it caps what any band can
+  # achieve, since an unretrieved candidate cannot be scored at all. 20 is the
+  # measured 69.4% same-category recall point (26.1% @5, 43.9% @10, 69.4% @20,
+  # 88.5% @50); the retired guard's limit=5 is the number this deliberately is
+  # not. Counted as a TOTAL across the three Mem0-primary categories.
+  candidate_k: 20
   # CALIBRATION OUTPUT — do not hand-edit.
   # Derived from measured similarity distributions by
   # scripts/calibrate_write_triage.py; both values are order statistics of
