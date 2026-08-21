@@ -1577,6 +1577,66 @@ class TestHarnessEscalationEventCounter:
             f'Expected 5 (3 submit + 2 resolve); got {harness._escalation_event_count}'
         )
 
+    def test_submit_counter_zero_on_construction(self, tmp_path: Path) -> None:
+        """The task-4559 submissions counters are zero on harness construction.
+
+        ``_escalation_submit_count`` is the EWA NUMERATOR and
+        ``_last_digest_submit_count`` its per-digest snapshot, mirroring the
+        existing event-count pair.
+        """
+        harness, _, _ = _make_harness_with_mocks(tmp_path)
+        assert harness._escalation_submit_count == 0, (
+            f'Expected 0; got {harness._escalation_submit_count}'
+        )
+        assert harness._last_digest_submit_count == 0, (
+            f'Expected 0; got {harness._last_digest_submit_count}'
+        )
+
+    def test_on_escalation_bumps_both_counters(self, tmp_path: Path) -> None:
+        """A submission advances BOTH the digest gate and the EWA numerator."""
+        harness, _, _ = _make_harness_with_mocks(tmp_path)
+        esc = _make_fake_escalation()
+
+        harness._on_escalation(esc)
+        harness._on_escalation(esc)
+        harness._on_escalation(esc)
+
+        assert harness._escalation_event_count == 3, (
+            f'Expected 3 events; got {harness._escalation_event_count}'
+        )
+        assert harness._escalation_submit_count == 3, (
+            f'Expected 3 submissions; got {harness._escalation_submit_count}'
+        )
+
+    def test_on_escalation_resolved_bumps_events_only(self, tmp_path: Path) -> None:
+        """A resolution advances the digest GATE but NOT the EWA numerator.
+
+        This is the defect task 4559 fixes.  Today a single escalation
+        contributes TWO lifecycle events to the one counter that serves as
+        both gate and numerator — once when filed, once when resolved — so
+        merely DRAINING a backlog re-trips the breaker that the backlog
+        caused.  Splitting the counters means resolutions still keep the
+        digest firing (which is what lets a drain window decay the EWA)
+        without inflating the numerator that decides the trip.
+        """
+        harness, _, _ = _make_harness_with_mocks(tmp_path)
+        esc = _make_fake_escalation()
+
+        harness._on_escalation(esc)
+        harness._on_escalation(esc)
+        harness._on_escalation(esc)
+        harness._on_escalation_resolved(esc)
+        harness._on_escalation_resolved(esc)
+
+        assert harness._escalation_event_count == 5, (
+            f'Expected 5 lifecycle events (3 submit + 2 resolve); '
+            f'got {harness._escalation_event_count}'
+        )
+        assert harness._escalation_submit_count == 3, (
+            f'Expected 3 submissions (resolutions excluded from the EWA '
+            f'numerator); got {harness._escalation_submit_count}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # TestHarnessMaybeWriteDigest (step-19)

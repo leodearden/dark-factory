@@ -236,21 +236,25 @@ class TestInitHarnessStateForTest:
     Guards two invariants:
 
     1. **Digest counters initialised** — after ``Harness.__new__(Harness)``
-       followed by ``_init_harness_state_for_test(h)``, the four task-1327
-       AFK-hardening digest counters exist at their ``Harness.__init__``
-       defaults.  Without the helper the attributes are absent and
+       followed by ``_init_harness_state_for_test(h)``, the six digest
+       counters (four from task-1327 AFK hardening plus the two task-4559
+       submissions counters) exist at their ``Harness.__init__`` defaults.
+       Without the helper the attributes are absent and
        ``_maybe_write_digest`` raises ``AttributeError`` (now surfaced by the
        narrowed catch-all added in step-4; previously silently swallowed).
 
     2. **Safe on already-initialised harness** — calling the helper a second
-       time on a harness that already has the four counters set does NOT raise.
+       time on a harness that already has the six counters set does NOT raise.
        Idempotence on *pre-existing values* is NOT required (the helper
        unconditionally overwrites with defaults), but it must not crash so that
        stacked helpers remain safe in future fixtures.
     """
 
     def test_digest_counters_set_to_init_defaults(self, tmp_path) -> None:
-        """Four task-1327 digest counters are present at their __init__ defaults.
+        """Six digest counters are present at their __init__ defaults.
+
+        Four from task 1327 (AFK hardening) plus the two task-4559 submissions
+        counters, which split the EWA NUMERATOR away from the digest GATE.
 
         This test FAILS before step-2 because ``_init_harness_state_for_test``
         does not yet exist in ``_orch_helpers``.
@@ -273,6 +277,13 @@ class TestInitHarnessStateForTest:
         )
         assert h._last_digest_window_end_iso == '', (
             f'_last_digest_window_end_iso expected \'\', got {h._last_digest_window_end_iso!r}'
+        )
+        # Task 4559: submissions-only EWA numerator, snapshotted like the events pair.
+        assert h._escalation_submit_count == 0, (
+            f'_escalation_submit_count expected 0, got {h._escalation_submit_count!r}'
+        )
+        assert h._last_digest_submit_count == 0, (
+            f'_last_digest_submit_count expected 0, got {h._last_digest_submit_count!r}'
         )
 
     def test_helper_does_not_crash_on_already_initialised_harness(self, tmp_path) -> None:
