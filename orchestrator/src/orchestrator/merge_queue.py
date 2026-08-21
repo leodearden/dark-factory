@@ -2948,9 +2948,16 @@ async def _run_post_merge_verify(
     # config-only pass ran no suite on either host, so there is nothing to
     # cross-check and it is left for task 2823's trivial-pass main-red gate on
     # the pass path below.  Gated by verify_cross_check_remote_green (default
-    # True), provably INERT on main today: reify's verify_runners is not yet
-    # enabled, so this call site always gets runner=None and this branch never
-    # runs — zero behaviour change until Lever C is turned on.
+    # True).  LIVE (task 4579 correction — this was previously "provably
+    # INERT on main today") on any project with an enabled remote runner:
+    # reify's dark-factory-orchestrator.yaml has declared verify_runners
+    # with `laptop` enabled since 2026-06-10, so this branch runs for every
+    # REMOTE-dispatch green.  It executes a FULL LOCAL verify
+    # (LocalRunner(merge_wt, ...) below) inside the SAME awaited verify_task
+    # that _run_inflight_verify polls — precisely why that trigger's
+    # no-progress signal must include the content-mtime arm for REMOTE
+    # leases too (see the union of evidence sources in
+    # _run_inflight_verify's Abort trigger 3).
     #
     #   AGREE (local passes too)  → emit verdict_parity_ok, proceed to land.
     #   DIVERGE (local FAILs)     → fail-CLOSED: quarantine the remote, file a
@@ -8700,6 +8707,20 @@ class SpeculativeMergeWorker(_WipHaltMixin):
     # tuning concern. Operators whose verify command writes its working
     # output outside the worktree should raise this budget accordingly (or,
     # if feasible, route that tool's cache/scratch dir back under merge_wt).
+    # REMOTE LEASES (task 4579 addition): this budget now governs BOTH lease
+    # kinds. For a REMOTE lease it additionally bounds the POST-DISPATCH
+    # window — the stretch after dispatch_in_flight goes False
+    # (verify_runner.py:1483) in which task 2822's cross-check runs a FULL
+    # LOCAL verify, authorised for up to merge_verify_cold_command_timeout_secs
+    # per command (far above this 1800s default). The tuning rule above is
+    # therefore stricter than it looks once a remote runner is enabled: this
+    # budget must exceed the longest expected no-write stretch of the
+    # CROSS-CHECK's local verify, not just of the remote dispatch itself.
+    # Measured reify mismatch: 345 of 463 local verifies in a 30-day window
+    # exceeded 1800s (mean 2561s, max 10263s) — a 1800s default is not
+    # automatically safe the moment a remote runner is turned on. The BLIND
+    # SPOT above (toolchains writing outside merge_wt) applies verbatim to
+    # the cross-check leg of the REMOTE arm too.
     INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS: float = 1800.0
     # Throttle for the newest_content_mtime() worktree-subtree walk that
     # drives the budget above — distinct from VERIFY_ABANDON_POLL_SECS so
@@ -9104,7 +9125,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         self._generation_chain_counts: dict[str, int] = {}
         # task 2420 (DEFECT 1): per-task consecutive in-flight-verify
         # no-progress-abort counter (abort trigger 3).  Incremented each time
-        # the LOCAL no-progress budget fires for a task; once it reaches
+        # the no-progress budget fires for a task (task 4579: no longer
+        # LOCAL-only — see the union of evidence sources in
+        # _run_inflight_verify); once it reaches
         # MAX_INFLIGHT_DEAD_VERIFY_ABORTS the request resolves terminally as
         # 'blocked' instead of being re-queued again, converting a
         # deterministically-hanging verify into a loud escalation rather than
