@@ -5061,11 +5061,12 @@ def _query(query_id='q1', *, topic='t', expects=('k0',), cluster_id='c1',
 _CHARS = ('injected:chars', len)
 
 
-def _measure(seeded, hits, *, pin, queries=None, probes=(), limit=10):
+def _measure(seeded, hits, *, pin, queries=None, probes=(), limit=10, **kwargs):
     return _mod().measure_arm(
         seeded,
         {'queries': {'q1': hits}, 'probes': {'c1': hits}},
         pin=pin,
+        **kwargs,
         queries=list(queries if queries is not None else [_query()]),
         probes=list(probes),
         estimator=_CHARS,
@@ -5488,6 +5489,187 @@ class TestGroupedReadCanonicalCreditIsDisclosed:
             'threshold', 'max_observed_score', 'probes', 'guard_covered_probes',
             'guard_covered_category',
         }
+
+
+# ===========================================================================
+# 4012 step-5 — `read_path` can select 4004's PROMOTING pin
+# ===========================================================================
+#
+# The regrowth probe's third read arm is the transform 4004's selection table
+# picked: `read_transform_selection.apply_promoting_topic_anchor`.  It is
+# reached lazily through the sibling-script loader, never reimplemented here —
+# two copies could drift, and the point of the probe is to measure the
+# transform that was actually selected.  Pure: hand-built `ScoredHit` lists
+# with exactly-known answers, no embedding.
+
+
+class TestReadPathPromote:
+
+    def test_promote_defaults_to_false_on_read_path_and_measure_arm(self):
+        """Every existing caller and test must be unchanged by this addition."""
+        import inspect  # noqa: PLC0415
+        mod = _mod()
+
+        for func in (mod.read_path, mod.measure_arm):
+            parameter = inspect.signature(func).parameters['promote']
+            assert parameter.default is False
+            assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+
+    def test_a_full_window_promote_puts_the_canonical_first_and_keeps_k(self):
+        """A FULL window is what distinguishes the two transforms.
+
+        `read_path` truncates AFTER the transforms, so at `len(hits) == k` the
+        additive pin's appended canonical is cut straight back off and the
+        window is unchanged.  Only a promoting transform can place it inside
+        the budget.
+        """
+        mod = _mod()
+        seeded, hits = _full_window_arm(n=5)
+
+        window = mod.read_path(seeded, hits, 5, pin=True, promote=True)
+
+        assert len(window) == 5
+        assert window[0].record_id == 'canon'
+        assert 'canon' not in [hit.record.record_id for hit in hits]
+
+    def test_at_a_full_window_the_additive_pin_changes_nothing(self):
+        """The contrast the probe's third arm exists to measure."""
+        mod = _mod()
+        seeded, hits = _full_window_arm(n=5)
+
+        additive = mod.read_path(seeded, hits, 5, pin=True, promote=False)
+
+        assert [r.record_id for r in additive] == [h.record.record_id for h in hits[:5]]
+
+    def test_pin_on_promote_off_is_byte_identical_to_todays_additive_behaviour(self):
+        mod = _mod()
+        seeded, hits = _full_window_arm(n=12)
+
+        for k in (5, 10, 12):
+            expected = mod.apply_topic_anchor(
+                [hit.record for hit in hits[:k]], seeded.canonical_by_topic,
+            )[:k]
+            got = mod.read_path(seeded, hits, k, pin=True, promote=False)
+            assert [r.record_id for r in got] == [r.record_id for r in expected]
+
+    def test_pin_off_promote_off_is_byte_identical_to_todays_flat_behaviour(self):
+        mod = _mod()
+        seeded, hits = _full_window_arm(n=12)
+
+        for k in (5, 10, 12):
+            got = mod.read_path(seeded, hits, k, pin=False, promote=False)
+            assert [r.record_id for r in got] == [h.record.record_id for h in hits[:k]]
+
+    def test_promote_without_pin_raises_naming_both_keywords(self):
+        """Promotion is a variant of the pin's firing rule, not a fourth mode.
+
+        A caller asking for `promote=True, pin=False` has a bug, and a silent
+        fourth behaviour would let it reach the decision table unnoticed.
+        """
+        mod = _mod()
+        seeded, hits = _full_window_arm(n=5)
+
+        with pytest.raises(ValueError) as excinfo:
+            mod.read_path(seeded, hits, 5, pin=False, promote=True)
+
+        message = str(excinfo.value)
+        assert 'promote' in message
+        assert 'pin' in message
+
+    def test_the_promoting_transform_is_reached_by_a_lazy_module_load(self):
+        """A rename in the sibling must fail HERE, by name.
+
+        Without this, `apply_promoting_topic_anchor` disappearing surfaces as
+        an `AttributeError` twenty minutes into a live run, after the seeding
+        has already been paid for.
+        """
+        mod = _mod()
+
+        script = mod.load_read_transform_script()
+
+        assert hasattr(script, 'apply_promoting_topic_anchor'), (
+            'read_transform_selection.apply_promoting_topic_anchor is gone — '
+            'the regrowth probe measures the transform 4004 selected, so a '
+            'rename there is a contract break here'
+        )
+        assert callable(script.apply_promoting_topic_anchor)
+
+    def test_read_path_routes_to_the_sibling_transform_not_a_local_copy(self):
+        mod = _mod()
+        seeded, hits = _full_window_arm(n=5)
+        script = mod.load_read_transform_script()
+
+        expected = script.apply_promoting_topic_anchor(
+            [hit.record for hit in hits[:5]], seeded.canonical_by_topic,
+        )[:5]
+        got = mod.read_path(seeded, hits, 5, pin=True, promote=True)
+
+        assert [r.record_id for r in got] == [r.record_id for r in expected]
+
+
+class TestMeasureArmPromote:
+
+    def test_the_pin_diagnostic_is_scored_against_the_pin_off_baseline(self):
+        """NOT against a promote=True baseline.
+
+        `_window`'s counterfactual call must stay `pin=False` (and therefore
+        promote-free by construction).  If promotion leaked into the baseline,
+        the two would agree and the diagnostic would report 0.00 for an arm
+        that reorders every window.
+        """
+        seeded, hits = _full_window_arm(n=5)
+
+        promoting = _measure(seeded, hits, pin=True, promote=True, probes=[('c1', {})])
+        additive = _measure(seeded, hits, pin=True, promote=False, probes=[('c1', {})])
+
+        assert promoting['pin']['enabled'] is True
+        assert promoting['pin']['window_changed_rate'] == 1.0
+        # The same windows, under the additive pin, are unchanged at a full
+        # window — so the two rates cannot both be an artifact of the closure.
+        assert additive['pin']['window_changed_rate'] == 0.0
+
+    def test_a_promoting_measurement_returns_the_full_required_metric_set(self):
+        mod = _mod()
+        seeded, hits = _full_window_arm(n=5)
+
+        measurement = _measure(seeded, hits, pin=True, promote=True, probes=[('c1', {})])
+
+        assert set(measurement) >= set(mod._REQUIRED_ARM_METRICS)
+        for block, keys in mod._REQUIRED_ARM_METRICS.items():
+            for key in keys:
+                assert key in measurement[block], f'{block}.{key}'
+
+    def test_the_transform_blind_stored_trio_is_unmoved_by_promotion(self):
+        """`stored_*` is measured over the RAW hits, before any `read_path`.
+
+        3560's correction is exactly this: the SCORED discoverability must be
+        blind to the read transform, or the probe reports a placement property
+        as a retrieval one.
+        """
+        seeded, hits = _full_window_arm(n=5)
+
+        promoting = _measure(seeded, hits, pin=True, promote=True, probes=[('c1', {})])
+        flat = _measure(seeded, hits, pin=False, probes=[('c1', {})])
+
+        for key in ('stored_canonical_in_top_5_rate', 'stored_canonical_median_rank',
+                    'stored_canonical_found_count'):
+            assert promoting['discoverability'][key] == flat['discoverability'][key]
+
+    def test_the_credited_column_is_the_one_promotion_moves(self):
+        """Reported BESIDE the stored one, never alone — the pair's semantics.
+
+        Promotion places the canonical inside the window, so the credited
+        rate is a PLACEMENT property under this arm, exactly the way
+        `apply_grouped_read`'s record-id aliasing was under `b_grouped`.
+        Asserted as "the two columns disagree", not as a magnitude.
+        """
+        seeded, hits = _full_window_arm(n=5)
+
+        promoting = _measure(seeded, hits, pin=True, promote=True, probes=[('c1', {})])
+
+        assert promoting['discoverability']['canonical_in_top_5_rate'] != (
+            promoting['discoverability']['stored_canonical_in_top_5_rate']
+        )
 
 
 class TestReadPathHoldsTheWindowBudget:
