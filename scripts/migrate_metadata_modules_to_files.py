@@ -158,6 +158,59 @@ class FusedMemoryClient:
         return content
 
 
+def write_failure_reason(reply: Any) -> str | None:
+    """Return why *reply* is not a successful write, or ``None`` if it is one.
+
+    NOTHING SERVER-SIDE EVER CROSSES THE WIRE AS AN EXCEPTION.
+    ``@mcp_tool_errors`` (fused-memory/src/fused_memory/server/tool_errors.py)
+    converts every exception into an ordinary reply dict, and
+    :meth:`FusedMemoryClient.call_tool` raises only on a JSON-RPC-LEVEL
+    ``error``. So a ``lock_charter_error`` from
+    ``_reject_directory_locks_in_update_metadata`` — the very gate this
+    migration exists to stop colliding with — arrives here as a perfectly
+    ordinary return value, and without this predicate is printed as a success.
+
+    DELIBERATELY MIRRORS, RATHER THAN IMPORTS, two existing implementations of
+    the same contract:
+
+    * ``fused_memory.middleware.task_interceptor.interceptor_write_succeeded``,
+      the canonical one. Not importable here — ``fused_memory`` fails to import
+      from this script's runtime context (measured:
+      ``ModuleNotFoundError: graphiti_core``).
+    * ``scripts/repair_wiped_metadata_files.py:classify_reply``. Not imported
+      because that module imports :class:`FusedMemoryClient` FROM this one
+      (:1066); importing it back would make this base module depend on its
+      subclass's module.
+
+    THE CHECK ORDER IS LOAD-BEARING: not-a-dict first (nothing else can call
+    ``.get`` on it), then emptiness — a ``{}`` has neither an ``error`` nor a
+    ``success`` key and would otherwise fall through to the success branch,
+    which is exactly the wedged-server-ACKs-with-a-202 case ``_post`` (:89-90)
+    can produce — and only then the error/success probes.
+
+    ``success`` defaults to True, not to False: ``update_task`` answers with
+    the updated task record, which carries no ``success`` key at all. The
+    falsy test rather than ``is False`` matches
+    ``interceptor_write_succeeded``'s own ``bool(resp.get('success', True))``,
+    so ``None``/``0``/``''`` are failures under this copy too.
+    """
+    if not isinstance(reply, dict):
+        raw = repr(reply)
+        if len(raw) > 200:
+            raw = raw[:200] + '…'
+        return f'server reply was not a dict: {type(reply).__name__}: {raw}'
+    if not reply:
+        return 'server reply was empty ({}) — it carries no positive write signal'
+    if reply.get('error'):
+        error_type = reply.get('error_type')
+        named = f'{error_type}: ' if error_type else ''
+        return f'server returned an error: {named}{reply["error"]}'
+    if not reply.get('success', True):
+        detail = reply.get('error_type') or reply.get('message') or reply
+        return f'server reported failure: {detail}'
+    return None
+
+
 class MigrationCounts(NamedTuple):
     """One project's migration outcome, split by what actually happened.
 
@@ -180,6 +233,10 @@ class MigrationCounts(NamedTuple):
     copied: int
     sanitized_empty: int
     dropped: int
+    #: Tasks whose ``update_task`` the server REFUSED. Counted apart from every
+    #: success tally, never folded into one: a run whose writes were all
+    #: rejected must not be able to report the same numbers as a clean one.
+    failed: int
     #: ``{status: carriers}`` for tasks in a deliberate skip status that STILL
     #: carry ``metadata.modules``. Left untouched on purpose (PRD decision 1
     #: keeps ``modules`` on terminal tasks as the only in-record trace of their
@@ -204,6 +261,7 @@ class MigrationCounts(NamedTuple):
             copied=self.copied + other.copied,
             sanitized_empty=self.sanitized_empty + other.sanitized_empty,
             dropped=self.dropped + other.dropped,
+            failed=self.failed + other.failed,
             residual_by_status=residual,
         )
 
@@ -219,7 +277,8 @@ def empty_counts() -> MigrationCounts:
     into something that does not.
     """
     return MigrationCounts(
-        visited=0, copied=0, sanitized_empty=0, dropped=0, residual_by_status={},
+        visited=0, copied=0, sanitized_empty=0, dropped=0, failed=0,
+        residual_by_status={},
     )
 
 
@@ -266,6 +325,7 @@ async def _migrate_one_project(
     skip_statuses = {'done', 'cancelled', 'deferred'}
     visited = 0
     outcomes = {'copied': 0, 'sanitized_empty': 0, 'dropped': 0}
+    failed = 0
     residual_by_status: dict[str, int] = {}
 
     for task in tasks:
@@ -327,27 +387,38 @@ async def _migrate_one_project(
             )
         else:
             try:
-                await client.call_tool('update_task', {
+                reply = await client.call_tool('update_task', {
                     'id': task_id,
                     'project_root': project_root,
                     'metadata': json.dumps(new_meta),
                     'metadata_mode': 'replace',
                 })
-                print(
-                    f'  [{project_root}] task={task_id} action={action}',
-                )
             except Exception as exc:
                 print(
                     f'  [error][{project_root}] task={task_id} update_task '
-                    f'failed: {exc}',
+                    f'raised: {exc}',
                     file=sys.stderr,
                 )
+                failed += 1
                 continue
+            reason = write_failure_reason(reply)
+            if reason is not None:
+                print(
+                    f'  [error][{project_root}] task={task_id} action={action} '
+                    f'update_task rejected: {reason}',
+                    file=sys.stderr,
+                )
+                failed += 1
+                continue
+            print(
+                f'  [{project_root}] task={task_id} action={action}',
+            )
 
         outcomes[outcome] += 1
 
     return MigrationCounts(
-        visited=visited, residual_by_status=residual_by_status, **outcomes,
+        visited=visited, failed=failed,
+        residual_by_status=residual_by_status, **outcomes,
     )
 
 
@@ -379,7 +450,8 @@ async def main_async(args: argparse.Namespace) -> int:
                 f'  visited={counts.visited} '
                 f'copied_modules→files={counts.copied} '
                 f'sanitized_empty={counts.sanitized_empty} '
-                f'dropped_modules_only={counts.dropped}'
+                f'dropped_modules_only={counts.dropped} '
+                f'failed={counts.failed}'
             )
             print(
                 f'  residual_carriers_in_skip_statuses: '
@@ -393,6 +465,15 @@ async def main_async(args: argparse.Namespace) -> int:
             print(f'  residual_carriers_in_skip_statuses: {format_residuals(v)}')
         else:
             print(f'  {k}: {v}')
+    # A partly-rejected run must not be mistakable for a clean one at the
+    # shell — this return becomes the process exit status.
+    if totals.failed:
+        print(
+            f'  [FAILED] {totals.failed} task(s) were REJECTED by the server; '
+            f'see the [error] lines above.',
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 
