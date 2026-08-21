@@ -42,7 +42,7 @@ from fastmcp.exceptions import ToolError
 from shared.mcp_markup_middleware import MarkupGuardMiddleware, RepairPolicy
 from shared.toolcall_markup import detect
 
-from escalation.models import BORN_AT_L2_SEVERITIES
+from escalation.models import BORN_AT_L2_SEVERITIES, Escalation
 from escalation.queue import EscalationQueue
 from escalation.server import create_server
 
@@ -570,3 +570,185 @@ class TestCorpusReplayAgainstRealServer:
         # The clean value is envelope-free wherever it landed.
         assert detect(esc.detail) is None
         assert detect(esc.suggested_action) is None
+
+
+# ---------------------------------------------------------------------------
+# INV-4: the burst alarm, on the real server.
+# ---------------------------------------------------------------------------
+
+
+#: The synthetic anchor every burst alarm is filed under
+#: (``server._MARKUP_STORM_ANCHOR_TASK_ID``) and the category that identifies an
+#: alarm AS one. Spelled out rather than imported for the same reason
+#: ``RESIDUE_CATEGORY`` is: these tests assert the registration site really put
+#: this vocabulary on a real record, and importing both sides of a contract lets
+#: both drift together.
+STORM_ANCHOR = 'mcp-markup-storm'
+STORM_CATEGORY = 'mcp_markup_storm'
+
+#: ``MarkupGuardMiddleware``'s default ``storm_threshold``. The escalation
+#: server registers the guard without overriding it, so three unrepairable
+#: calls in one window is what a burst IS here.
+STORM_THRESHOLD = 3
+
+
+class TestStormBurstAlarm:
+    """The burst path against the REAL server (INV-4).
+
+    ``_file_markup_storm`` is the half of the escalation server's sink that
+    nothing exercised: the residue path was covered from step 9, the burst path
+    by nothing at all. Everything it decides — the dedup predicate, the
+    read-failure fall-through, ``level=1``/``severity='blocking'``, and the
+    summary it builds — was therefore unverified.
+
+    The dedup predicate is the one that matters. ``get_by_task(anchor,
+    status='pending')`` answers "is anything pending on this anchor", NOT "is
+    MY alarm already open", and a shared anchor is squatted in practice: the
+    measured precedent is recorded in
+    ``fused_memory/server/markup_tripwire.py``'s own docstring — the tripwire
+    "filed nothing 2026-08-16..2026-08-19 while 41 rejections occurred" because
+    another producer's record held its anchor open. A category-blind dedup
+    turns that squatting into indefinite silence, and silence reads as calm.
+    """
+
+    @staticmethod
+    async def _burst(server, calls: int = STORM_THRESHOLD) -> list[dict[str, Any]]:
+        """Drive *calls* unrepairable calls; return each refusal payload.
+
+        Unrepairable rather than repairable because that outcome refuses
+        VISIBLY — the storm summary rides back on the ``ToolError`` — so the
+        test can assert the burst fired from the caller's side as well as from
+        the queue's, without depending on either one alone.
+        """
+        record = specimen(UNREPAIRABLE)
+        payloads = []
+        async with Client(server) as client:
+            for _ in range(calls):
+                with pytest.raises(ToolError) as excinfo:
+                    await client.call_tool(
+                        'escalate_info',
+                        {**REQUIRED, record['param']: record['value']},
+                    )
+                payloads.append(error_payload(excinfo))
+        return payloads
+
+    @staticmethod
+    def _alarms(queue) -> list[Any]:
+        """Every pending burst alarm on the queue, in filing order."""
+        return sorted(
+            (esc for esc in queue.get_pending() if esc.category == STORM_CATEGORY),
+            key=lambda esc: esc.id,
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_burst_files_exactly_one_alarm(self, tmp_path: Path):
+        """(a) Three refusals in a window produce ONE alarm, on the anchor."""
+        queue, server = build(tmp_path)
+        payloads = await self._burst(server)
+
+        # The caller-facing half: only the call that CROSSED the threshold
+        # carries the burst summary, so the alarm is not announced early.
+        assert [p.get('storm') is not None for p in payloads] == [False, False, True]
+        assert payloads[-1]['storm']['count'] == STORM_THRESHOLD
+        assert payloads[-1]['storm']['outcome'] == 'unrepairable'
+
+        alarms = self._alarms(queue)
+        assert len(alarms) == 1, f'expected one burst alarm, found {len(alarms)}'
+        alarm = alarms[0]
+        # Filed on the SYNTHETIC anchor, never on the leaking caller's task.
+        assert alarm.task_id == STORM_ANCHOR
+        assert alarm.agent_role == 'harness-markup-guard'
+        # A rate alarm about a condition, not a hold on one caller's payload:
+        # L1, and a severity that is NOT born-at-L2.
+        assert alarm.level == 1
+        assert alarm.severity == 'blocking'
+        assert alarm.severity not in BORN_AT_L2_SEVERITIES
+        assert str(STORM_THRESHOLD) in alarm.summary
+        assert 'unrepairable' in alarm.summary
+
+    @pytest.mark.asyncio
+    async def test_a_second_burst_folds_into_the_open_alarm(self, tmp_path: Path):
+        """(b) One open record per burst, not one per window (INV-4).
+
+        The second burst is driven through a SECOND server on the same queue
+        directory, because the middleware's own ``StormCounter`` rate-limits to
+        one fire per window per instance — so a leak that outlives a restart is
+        exactly how a second fire reaches the sink in production.
+        """
+        queue, server = build(tmp_path)
+        await self._burst(server)
+        first = self._alarms(queue)
+        assert len(first) == 1
+
+        _, restarted = build(tmp_path)
+        await self._burst(restarted)
+
+        alarms = self._alarms(queue)
+        assert len(alarms) == 1, (
+            f'a second burst must fold into the open alarm, found {len(alarms)}'
+        )
+        assert alarms[0].id == first[0].id
+
+    @pytest.mark.asyncio
+    async def test_an_unrelated_pending_record_does_not_suppress_the_alarm(
+        self, tmp_path: Path
+    ):
+        """(c) Another producer's record on this anchor must NOT silence it.
+
+        The anchor is a synthetic id, not a real task, so nothing reserves it:
+        any producer filing SYSTEM-scoped records may land one there. If merely
+        "something is pending here" counts as "my alarm is already open", an
+        actively running leak files nothing for as long as that unrelated record
+        stays open — the measured markup_tripwire failure, verbatim.
+        """
+        queue, server = build(tmp_path)
+        squatter = queue.submit(Escalation(
+            id=queue.make_id(STORM_ANCHOR),
+            task_id=STORM_ANCHOR,
+            agent_role='escalation-watcher',
+            severity='blocking',
+            category='escalation_cluster',
+            summary='Unrelated cluster record filed on the same synthetic anchor.',
+            level=1,
+        ))
+
+        await self._burst(server)
+
+        alarms = self._alarms(queue)
+        assert len(alarms) == 1, (
+            f'an unrelated pending record on {STORM_ANCHOR!r} must not suppress '
+            f'the burst alarm, found {len(alarms)} alarm(s)'
+        )
+        assert alarms[0].id != squatter
+        assert alarms[0].category == STORM_CATEGORY
+
+    @pytest.mark.asyncio
+    async def test_an_alarm_from_another_guard_does_not_suppress_this_one(
+        self, tmp_path: Path
+    ):
+        """(c') Nor does a record whose category matches but whose filer differs.
+
+        Sibling guards on other servers file their own bursts under their own
+        anchors, so this is the narrower squat: a same-anchor record carrying
+        the storm category but filed by a different producer. Dedup means "MY
+        alarm is already open", and the filer is half of that identity.
+        """
+        queue, server = build(tmp_path)
+        foreign = queue.submit(Escalation(
+            id=queue.make_id(STORM_ANCHOR),
+            task_id=STORM_ANCHOR,
+            agent_role='plan-tools-markup-guard',
+            severity='blocking',
+            category=STORM_CATEGORY,
+            summary="Another guard's burst alarm, filed on this anchor.",
+            level=1,
+        ))
+
+        await self._burst(server)
+
+        mine = [esc for esc in self._alarms(queue) if esc.id != foreign]
+        assert len(mine) == 1, (
+            "another guard's alarm must not suppress this server's, found "
+            f'{len(mine)}'
+        )
+        assert mine[0].agent_role == 'harness-markup-guard'
