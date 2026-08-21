@@ -2429,11 +2429,18 @@ class TestSweepStaleStatusSnapshotEdgesCore:
         assert stats == {
             'scanned': 3, 'candidate_edges': 2,
             'invalidated': 2, 'errors': 0,
-            'superseded': 0, 'supersede_errors': 0,
+            'superseded': 1, 'supersede_errors': 0,
         }, (
             f'Expected both blocked-worded task-2885 edges invalidated and the '
             f'still-blocked control edge left alone, got stats={stats!r}'
         )
+        # superseded == 1, not 2: both edges assert task 2885 as blocked and
+        # 'done' is positively known and is not 'blocked', so the task-3037
+        # blocked rule fires here too and contributes ONE superseding fact for
+        # the task — deduped across both edges. (The terminal rule alone would
+        # have written none; see
+        # TestSweepStaleStatusSnapshotEdgesSupersedeWrite for both halves of
+        # that boundary.)
 
         assert memory_service.update_edge.await_count == 2, (
             'Expected update_edge awaited exactly twice, for the two repro-fact edges only'

@@ -1553,7 +1553,13 @@ async def sweep_stale_status_snapshot_edges(
     ids' CURRENT status via ``taskmaster.get_statuses`` (a direct status
     lookup, not semantic search), and invalidates
     (``memory_service.update_edge(..., invalid_at=...)``) every edge whose
-    asserted status is now contradicted by a terminal (done/cancelled) task.
+    asserted status is now contradicted — either by a terminal
+    (done/cancelled) task, or (task 3037) by a blocked assertion whose task
+    now has any other positively-known status. After a successful
+    blocked-rule invalidation it also writes ONE superseding
+    resulting-state-only ``temporal_facts`` memory per contradicted task per
+    cycle (``build_supersede_fact``), so the graph records what replaced the
+    retired assertion instead of merely losing it.
 
     Args:
         memory_service: Object exposing ``.graphiti.get_all_valid_edges`` and
@@ -1584,13 +1590,28 @@ async def sweep_stale_status_snapshot_edges(
         ``candidate_edges`` (edges selected as stale by
         ``select_stale_status_snapshot_edges``), ``invalidated`` (successful
         update_edge calls), ``errors`` (caught enumerate/cross-reference/
-        invalidate failures).
+        invalidate failures), ``superseded`` (successful superseding
+        temporal_fact writes — blocked rule only), ``supersede_errors``
+        (caught superseding-write failures).
+
+        ``errors`` stays scoped to the enumerate / cross-reference /
+        INVALIDATE paths, which is what keeps the identity
+        ``invalidated == candidate_edges - errors`` exactly true: every
+        selected edge is either invalidated or tallied there, by the ONE
+        counted invalidation loop. That identity is the structural guard
+        against a future second invalidation site going uncounted (it is
+        pinned by a test), so a NON-invalidation failure mode must never be
+        folded into ``errors`` — the superseding write gets its own
+        ``supersede_errors`` key for exactly that reason. (task 3037)
 
     Empty *taskmaster*/*project_root* short-circuits to all-zero stats with
     no backend calls. When enumeration yields no candidate ids at all,
     ``taskmaster.get_statuses`` is never called.
     """
-    stats = {'scanned': 0, 'candidate_edges': 0, 'invalidated': 0, 'errors': 0}
+    stats = {
+        'scanned': 0, 'candidate_edges': 0, 'invalidated': 0, 'errors': 0,
+        'superseded': 0, 'supersede_errors': 0,
+    }
 
     if not taskmaster or not project_root:
         return stats
@@ -1660,6 +1681,11 @@ async def sweep_stale_status_snapshot_edges(
     stats['candidate_edges'] = len(stale)
 
     invalidate_at = now or datetime.now(UTC)
+    # One superseding fact per contradicted TASK per cycle, not per edge: a
+    # contradicted task typically has several blocked-assertion edges (one per
+    # phrasing Graphiti extracted), and writing per edge would emit the
+    # identical fact several times in a single cycle.
+    superseded_ids: set[int] = set()
     for edge in stale:
         try:
             await memory_service.update_edge(
@@ -1678,5 +1704,30 @@ async def sweep_stale_status_snapshot_edges(
                 edge['uuid'],
             )
             stats['errors'] += 1
+            continue
+
+        # Second half of the deterministic step, gated on a SUCCESSFUL
+        # invalidation and scoped to ids the BLOCKED rule contributed.
+        #
+        # Gating on success is also what bounds the write to exactly ONE per
+        # contradicted task over the fact's whole lifetime: an invalidated
+        # edge drops out of get_all_valid_edges, so it cannot re-present next
+        # cycle. Writing on FAILURE would instead repeat the same fact every
+        # cycle for as long as the invalidation kept failing — and would
+        # meanwhile leave the graph asserting both that the task is blocked
+        # (the edge is still valid) and that it is not.
+        for task_id in sorted(blocked_edge_ids.get(edge['uuid'], set())):
+            status = statuses.get(str(task_id))
+            if not is_blocked_assertion_contradicted(status) or task_id in superseded_ids:
+                continue
+            superseded_ids.add(task_id)
+            await memory_service.add_memory(
+                content=build_supersede_fact(task_id, status, invalidate_at),
+                category='temporal_facts',
+                project_id=project_id,
+                agent_id=_SWEEP_AGENT_ID,
+                causation_id=run_id,
+            )
+            stats['superseded'] += 1
 
     return stats
