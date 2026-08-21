@@ -187,6 +187,13 @@ def _normalize_plan(plan: dict) -> tuple[dict, bool]:
 
 _VALID_VERDICT_ROLE_RE = re.compile(r'^[A-Za-z0-9_-]+$')
 
+#: How many consecutive residue filenames ``write_markup_residue`` will probe
+#: before giving up LOUDLY. Every probe past the first means another writer
+#: claimed that index in the same instant, so this is a bound on simultaneous
+#: writers against one artifacts root — a reviewer panel is a handful, and the
+#: orchestrator runs one guarded MCP server per subprocess.
+_MARKUP_RESIDUE_MAX_PROBES = 64
+
 
 def _validate_verdict_role(role: str) -> None:
     """Guard ``verdicts/<role>.json`` against escaping the ``verdicts/`` dir.
@@ -1306,7 +1313,15 @@ class TaskArtifacts:
 
         The next index is derived by SCANNING the directory rather than from
         in-process state: a fresh subprocess's counter would restart at 1 and
-        clobber the previous invocation's evidence.
+        clobber the previous invocation's evidence. The scan only picks where to
+        START, though — the name itself is CLAIMED with ``O_CREAT | O_EXCL``,
+        the same primitive ``lock_plan`` uses below and for the same reason.
+        Scanning then writing would leave a window a re-check cannot close: a
+        reviewer panel runs several verdict-tools subprocesses against ONE
+        artifacts root (only ``verdicts/<role>.json`` is per-role), a
+        serialization leak is bursty and correlated across panel members, and
+        two writers that both scan before either writes would both choose the
+        same index — the second write silently destroying the first payload.
 
         There is deliberately no ``read_markup_residue``/``clear_markup_residue``
         pair. The ``write_*``/``read_*``/``clear_*`` triads in this class exist
@@ -1337,18 +1352,60 @@ class TaskArtifacts:
             suffix = path.stem.removeprefix('markup_residue-')
             if suffix.isdigit():
                 highest = max(highest, int(suffix))
-        index = highest + 1
-        # Advance past any name that already exists — a non-numeric or
-        # out-of-band file must never cost an operator the record.
-        while (self.root / f'markup_residue-{index}.json').exists():
-            index += 1
 
-        name = f'markup_residue-{index}.json'
+        name = None
+        # Bounded, and the bound is stated rather than assumed: this many
+        # writers would have to hold consecutive names at once to exhaust it,
+        # and a real reviewer panel is a handful. Exhaustion is LOUD below
+        # rather than silently rolling over to a second naming scheme.
+        for index in range(highest + 1, highest + 1 + _MARKUP_RESIDUE_MAX_PROBES):
+            candidate = self.root / f'markup_residue-{index}.json'
+            try:
+                # The claim IS the atomicity: O_EXCL fails rather than truncates
+                # if the name was taken between the scan and here, so a loser
+                # moves to the next index instead of overwriting a winner. It
+                # also skips a non-numeric or out-of-band file for free — such a
+                # name must never cost an operator the record.
+                os.close(os.open(candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644))
+            except FileExistsError:
+                continue
+            except OSError:
+                # A vanished root between the guard above and here, or any other
+                # storage failure. _call_sink's never-raises contract makes this
+                # a heads-up, not a crash on the caller's refusal path.
+                logger.info(
+                    'TaskArtifacts: could not claim a residue name under %s for '
+                    '%s.%s; %d chars of residue are NOT preserved',
+                    self.root, record.get('tool'), record.get('field'),
+                    len(record.get('raw_value') or ''),
+                )
+                return None
+            name = candidate.name
+            break
+
+        if name is None:
+            logger.error(
+                'TaskArtifacts: %d consecutive residue names from %d are taken '
+                'under %s; %d chars of residue are NOT preserved for %s.%s',
+                _MARKUP_RESIDUE_MAX_PROBES, highest + 1, self.root,
+                len(record.get('raw_value') or ''),
+                record.get('tool'), record.get('field'),
+            )
+            return None
+
         # Via _write_json, NOT a hand-rolled write_text: it already carries the
         # mkdir, the indent+newline convention and the vanished-root tolerance
-        # every other writer in this class relies on. One write policy.
+        # every other writer in this class relies on. One write policy. It
+        # overwrites the empty claim, which is what the claim is for.
         self._write_json(self.root / name, record)
-        if not (self.root / name).exists():
+        # A claim with nothing in it is worse than no claim: it holds an index
+        # AND reads as a preserved record that is in fact empty. Only a file
+        # with content earns the name this returns.
+        try:
+            if (self.root / name).stat().st_size == 0:
+                (self.root / name).unlink()
+                return None
+        except OSError:
             return None
         return name
 
