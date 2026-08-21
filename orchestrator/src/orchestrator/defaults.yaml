@@ -77,6 +77,15 @@ requeue_cap: 3
 # exempt from requeue_cap.  Guards against unbounded retry on a persistent
 # provider outage.  Process-local; orchestrator restart resets it.
 transient_requeue_cap: 10
+# Jittered exponential backoff for the transient lane (PRD contract C3).  The
+# n-th transient requeue arms min(base * 2**(n-1), cap) seconds, drawn with
+# equal jitter U(cooldown/2, cooldown); n is the task's transient requeue
+# count at arming.  30/900 walks 30/60/120/240/480 and pins at 900s from n=6,
+# so a provider outage settles into a 7.5-15 min cadence instead of a flat-30s
+# retry storm (2026-07-29: 67 starts in one half-hour bucket).  GENUINE
+# (non-5xx) requeues are unaffected — they stay flat at requeue_cooldown_secs.
+transient_requeue_backoff_base_secs: 30.0
+transient_requeue_backoff_cap_secs: 900.0
 
 # Verification timeouts
 verify_command_timeout_secs: 1800

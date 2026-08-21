@@ -3074,6 +3074,37 @@ class OrchestratorConfig(BaseSettings):
             'counter on DONE or cap-exhaust.'
         ),
     )
+    transient_requeue_backoff_base_secs: float = Field(
+        default=30.0,
+        gt=0.0,
+        description=(
+            'First-step cooldown / exponential base for the TRANSIENT requeue '
+            'lane (task 3317, PRD contract C3).  The n-th transient requeue '
+            'arms `min(base * 2**(n-1), transient_requeue_backoff_cap_secs)` '
+            'seconds, jittered with equal jitter `U(cooldown/2, cooldown)`; '
+            '`n` is the task\'s transient requeue count at arming time.  '
+            'Applies ONLY to requeues classified transient by '
+            '`is_transient_api_requeue` (a server-side HTTP 5xx) — a GENUINE '
+            'requeue keeps the flat `requeue_cooldown_secs` above.  Exists to '
+            'stop a provider outage becoming a retry storm: the 2026-07-29 '
+            'incident produced 67 starts in a single half-hour bucket under '
+            'the flat 30s cooldown.'
+        ),
+    )
+    transient_requeue_backoff_cap_secs: float = Field(
+        default=900.0,
+        gt=0.0,
+        description=(
+            'Per-step ceiling for the transient-requeue backoff envelope '
+            '`min(base * 2**(n-1), cap)` (task 3317, PRD contract C3).  With '
+            'the shipped 30/900 defaults the envelope walks 30/60/120/240/480 '
+            'and pins at 900s from n=6 onward, so a long provider outage '
+            'settles into a 7.5-15 min retry cadence (equal jitter '
+            '`U(cooldown/2, cooldown)`) instead of hammering every 30s.  '
+            'Genuine (non-5xx) requeues are unaffected and keep the flat '
+            '`requeue_cooldown_secs`.'
+        ),
+    )
     snapshot_min_write_interval_secs: float = Field(
         default=0.25,
         ge=0.0,
