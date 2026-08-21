@@ -4359,14 +4359,14 @@ class TestCommitEffectPresentInMain:
     (a) TRUE when the commit's own touched paths are still byte-identical
         on main (effect present — here the trivial "commit == main HEAD"
         shape).
-    (b) FALSE when a later commit on main changes those same touched
-        paths again — the commit is STILL an ancestor of main, but its
-        own snapshot no longer matches HEAD (the blind spot this
-        primitive exists to catch).  The trigger condition is
-        deliberately broad: a genuine revert and ordinary later evolution
-        (e.g. another task's overlapping follow-up edit) are
-        indistinguishable here and both return False — see the
-        "Accepted risk" note on the primitive's docstring.
+    (b) FALSE when a later commit on main does not PRESERVE the lines the
+        commit added — here a wholesale replacement, survival 0.0 — the
+        commit is STILL an ancestor of main, but its own effect is gone
+        from HEAD (the blind spot this primitive exists to catch).  Since
+        task 3116 part (b) the trigger is no longer "any change to the
+        touched paths": ordinary additive evolution reads as PRESENT.  A
+        heavy REWRITE that drops most of those lines can still read as
+        absent — the narrowed residual risk, documented on the primitive.
     (c) For a no-ff merge commit, the primitive checks EVERY non-first
         parent's (each merged branch's) content — the paths it touched
         since its fork point (``merge-base(parent1, other_parent)``) —
@@ -4420,11 +4420,13 @@ class TestCommitEffectPresentInMain:
         STILL an ancestor of main (it is never removed from history) but a
         LATER commit on main changes the exact paths it touched — the
         effect is gone from HEAD even though ancestry alone says "landed".
-        The trigger is deliberately broad — this later commit need not be
-        an intentional revert; ANY change to the touched paths (a genuine
-        revert, or ordinary subsequent evolution such as another task's
-        overlapping edit) reads as "effect not present" here. See the
-        "Accepted risk" note on commit_effect_present_in_main's docstring.
+        The trigger is a change that does not PRESERVE the commit's added
+        lines — here a full replacement, so survival is 0.0.  Since task 3116
+        that is what "effect not present" means: ordinary additive evolution
+        (another task appending to a file this one touched) now reads as
+        PRESENT, because its added lines are still there.  See the
+        ``_EFFECT_SURVIVAL_*`` thresholds and the residual-risk note on
+        commit_effect_present_in_main's docstring.
         """
         (git_repo / 'fileA.py').write_text('fixed\n')
         await _run(['git', 'add', 'fileA.py'], cwd=git_repo)
@@ -4626,12 +4628,14 @@ class TestCommitEffectPresentInMain:
         diff-tree unless ``-z``/``-c core.quotePath=false`` is used.
         Without that, the quoted literal string (backslashes, octal
         escapes and all) fails to match the real file as a ``--``
-        pathspec, so the follow-up ``git diff --quiet`` call silently
-        reports "no difference" against an effectively empty pathspec —
-        a FALSE POSITIVE ("effect present") even though the file's
-        content at main HEAD has genuinely changed since the cited
-        commit. Confirmed False here pins that the primitive resolves
-        the real path, not git's quoted rendering of it.
+        pathspec, so the terminal comparison silently sees nothing at all
+        and reports a FALSE POSITIVE ("effect present") even though the
+        file's content at main HEAD no longer carries the cited commit's
+        lines. Confirmed False here pins that the primitive resolves the
+        real path, not git's quoted rendering of it.  That is a PATH-QUOTING
+        regression pin and is unaffected by the task-3116 survival semantics:
+        the later commit here replaces the file's content wholesale, so
+        survival is 0.0 under any threshold.
         """
         (git_repo / 'café.py').write_text('fixed\n')
         await _run(['git', 'add', 'café.py'], cwd=git_repo)

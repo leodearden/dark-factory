@@ -12,7 +12,8 @@ main?" from live git state before stamping a task ``done``:
 Prior to task 2678 each site inlined its own subset of two primitives landed
 by task 2675 (dep δ): ``git_ops.find_task_citation_commit`` (FIX 2,
 subject-anchored citation discovery) and ``git_ops.commit_effect_present_in_main``
-(FIX 1', merge second-parent/octopus-aware effect-still-present check) — an
+(FIX 1', merge second-parent/octopus-aware effect-still-present check —
+since task 3116 a threshold LINE-SURVIVAL test, not byte-identity) — an
 inline-per-site shape that let two of the five sites (the merge-marker path
 and the coalesce re-drive) ship WITHOUT the effect-present guard at all (the
 task-1175 clobber: a reverted merge still read as a genuine landing) and let
