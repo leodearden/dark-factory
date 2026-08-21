@@ -32,6 +32,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from fused_memory.config.schema import ProceduralTopicCluster
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.memory import MemoryResult
 from fused_memory.server.grouped_read import PARENT_ID_KEY, SIGHTING_KIND
@@ -39,7 +40,9 @@ from fused_memory.server.tools import create_mcp_server
 from fused_memory.server.write_triage import (
     CANONICAL_ID_KEY,
     OUTCOME_RESTATED,
+    OUTCOME_STORED,
     ROUTED_KEY,
+    TRIAGE_OUTCOMES,
 )
 from fused_memory.services.memory_service import RRF_K
 
@@ -363,3 +366,250 @@ class TestRestatementIsRedirectedNotRejected:
 
         assert result[ROUTED_KEY] == OUTCOME_RESTATED
         assert result[CANONICAL_ID_KEY] == 'm-other'
+
+
+#: Content matching the injected test cluster's phrases below.
+_TOPIC_MATCH_CONTENT = 'run create_plan against the missing plan-tools MCP server'
+
+
+def _topic_cluster(
+    topic_id: str = 'test-topic',
+    phrases: tuple[str, ...] = ('plan-tools', 'create_plan'),
+    min_phrase_hits: int = 2,
+    hint: str = '',
+) -> ProceduralTopicCluster:
+    return ProceduralTopicCluster(
+        topic_id=topic_id,
+        phrases=list(phrases),
+        min_phrase_hits=min_phrase_hits,
+        hint=hint,
+    )
+
+
+class TestTheFlagOffPathIsUntouched:
+    """The shipped default (D10 staged rollout): triage is OFF.
+
+    Everything below is the behaviour that exists TODAY, re-asserted from the
+    triage suite so a regression in the new branch is caught by the suite that
+    introduced it rather than only by the guard's own file. The whole leaf is
+    inert until task 3169 flips the flag, and "inert" has to mean byte-identical
+    — including the ack, which must not grow a `routed` key nobody asked for.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_near_duplicate_write_is_still_rejected(self) -> None:
+        mock_service = AsyncMock()
+        _configure_config(mock_service, enabled=False)
+        _configure_pass_through_add_memory(mock_service)
+        mock_service.search.return_value = [_candidate('m1', 0.97)]
+        server = create_mcp_server(mock_service)
+
+        result = await _call(server)
+
+        assert result.get('error_type') == 'ProceduralKnowledgeNearDuplicateWriteRejected', (
+            f'the retired guard must still be live while the flag is off: {result!r}'
+        )
+        mock_service.add_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_topic_cluster_match_is_still_rejected(self) -> None:
+        mock_service = AsyncMock()
+        _configure_config(
+            mock_service, enabled=False, topic_clusters=[_topic_cluster()],
+        )
+        _configure_pass_through_add_memory(mock_service)
+        mock_service.search.return_value = []
+        server = create_mcp_server(mock_service)
+
+        result = await _call(server, content=_TOPIC_MATCH_CONTENT)
+
+        assert result.get('error_type') == (
+            'ProceduralKnowledgeKnownTopicClusterWriteRejected'
+        ), f'the topic guard must still be live while the flag is off: {result!r}'
+        mock_service.add_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_clean_write_acks_with_no_routed_key_at_all(self) -> None:
+        """Not `routed: None`, not `routed: 'stored'` — ABSENT.
+
+        A key that appears whenever the code is deployed, regardless of the
+        flag, would tell every caller that triage is live when it is not, and
+        would make the rollout unobservable from the outside.
+        """
+        mock_service = AsyncMock()
+        _configure_config(mock_service, enabled=False)
+        _configure_pass_through_add_memory(mock_service)
+        mock_service.search.return_value = []
+        server = create_mcp_server(mock_service)
+
+        result = await _call(server)
+
+        assert ROUTED_KEY not in result, f'the ack leaked a triage key: {result!r}'
+        assert CANONICAL_ID_KEY not in result, f'{result!r}'
+        mock_service.add_memory.assert_awaited_once()
+
+
+class TestTheFlagOnPathRetiresBothRejectGuards:
+    """D2: redirect SUPERSEDES reject. Not "runs after", not "runs alongside".
+
+    With triage on, neither reject error_type is reachable for a triaged write.
+    A write that the retired guards would have bounced now LANDS — as a child
+    when it restates something, as a plain entry otherwise. That is the whole
+    behavioural claim of the leaf, so it is asserted from the guards' own
+    inputs rather than from a fresh fixture that might simply miss them.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_near_duplicate_reject_is_unreachable(self) -> None:
+        mock_service = AsyncMock()
+        _configure_config(mock_service, enabled=True)
+        _configure_pass_through_add_memory(mock_service)
+        mock_service.search.return_value = [_candidate('m1', 0.97)]
+        server = create_mcp_server(mock_service)
+
+        result = await _call(server)
+
+        assert result.get('error_type') != 'ProceduralKnowledgeNearDuplicateWriteRejected', (
+            f'the reject guard must be retired for a triaged write: {result!r}'
+        )
+        assert result[ROUTED_KEY] == OUTCOME_RESTATED
+        mock_service.add_memory.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_a_topic_cluster_match_lands_rather_than_bouncing(self) -> None:
+        """The topic soft-block retires with the cosine one.
+
+        Below `t_high` a topic hit is a JUDGE question, not a rejection (C1) —
+        and while the judge is a deliberate stub answering `stored`, the
+        observable contract at this boundary is that the write LANDS. What the
+        judge eventually does with the topic signal is leaf gamma's; what this
+        pins is that the agent's text is never thrown away for matching a
+        known-contradictory topic.
+        """
+        mock_service = AsyncMock()
+        _configure_config(
+            mock_service, enabled=True, topic_clusters=[_topic_cluster()],
+        )
+        _configure_pass_through_add_memory(mock_service)
+        mock_service.search.return_value = []
+        server = create_mcp_server(mock_service)
+
+        result = await _call(server, content=_TOPIC_MATCH_CONTENT)
+
+        assert result.get('error_type') != (
+            'ProceduralKnowledgeKnownTopicClusterWriteRejected'
+        ), f'the topic guard must be retired for a triaged write: {result!r}'
+        assert 'error' not in result, f'{result!r}'
+        assert result[ROUTED_KEY] == OUTCOME_STORED
+        assert mock_service.add_memory.await_args.kwargs['content'] == _TOPIC_MATCH_CONTENT
+
+    @pytest.mark.asyncio
+    async def test_no_reject_error_type_is_reachable_for_any_triaged_input(
+        self,
+    ) -> None:
+        """Swept across the whole band, including exactly at each threshold."""
+        for score in (0.0, 0.69, _T_LOW, 0.80, _T_HIGH, 0.97, 1.0):
+            mock_service = AsyncMock()
+            _configure_config(
+                mock_service, enabled=True, topic_clusters=[_topic_cluster()],
+            )
+            _configure_pass_through_add_memory(mock_service)
+            mock_service.search.return_value = [_candidate('m1', score)]
+            server = create_mcp_server(mock_service)
+
+            result = await _call(server, content=_TOPIC_MATCH_CONTENT)
+
+            assert 'error_type' not in result, f'score={score}: {result!r}'
+            assert result[ROUTED_KEY] in TRIAGE_OUTCOMES, f'score={score}: {result!r}'
+
+
+class TestTheForceStoreArms:
+    """Two inputs that skip triage entirely, even with the flag on."""
+
+    @pytest.mark.asyncio
+    async def test_allow_near_duplicate_forces_a_plain_store(self) -> None:
+        """D2 reinterprets the old bypass flag as the force-store escape hatch.
+
+        Under the retired guard it meant "do not reject me"; under triage it
+        means "do not reroute me". Same intent — the writer has asserted the
+        content is genuinely distinct — expressed against the mechanism that
+        replaced the one it was built for.
+        """
+        mock_service = AsyncMock()
+        _configure_config(mock_service, enabled=True)
+        _configure_pass_through_add_memory(mock_service)
+        mock_service.search.return_value = [_candidate('m1', 0.99)]
+        server = create_mcp_server(mock_service)
+
+        result = await _call(server, metadata={'allow_near_duplicate': True})
+
+        assert result[ROUTED_KEY] == OUTCOME_STORED, f'{result!r}'
+        assert CANONICAL_ID_KEY not in result, f'nothing was attached: {result!r}'
+        metadata = mock_service.add_memory.await_args.kwargs['metadata']
+        assert PARENT_ID_KEY not in (metadata or {}), f'{metadata!r}'
+
+    @pytest.mark.asyncio
+    async def test_allow_near_duplicate_skips_the_retrieval_round_trip(self) -> None:
+        """No search at all — not a search whose result is then discarded.
+
+        Retrieval is an embedding + vector round-trip on every triaged write.
+        A writer who has already declared the content distinct should not pay
+        for a lookup whose answer cannot change the outcome.
+        """
+        mock_service = AsyncMock()
+        _configure_config(mock_service, enabled=True)
+        _configure_pass_through_add_memory(mock_service)
+        server = create_mcp_server(mock_service)
+
+        await _call(server, metadata={'allow_near_duplicate': True})
+
+        mock_service.search.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_bypass_flag_is_still_stripped_from_persistence(self) -> None:
+        """A write-time control flag must never reach the corpus.
+
+        The same discipline task 4458 pinned for `allow_mcp_markup`, whose
+        surviving `strip_markup_override` call sits in this same tool body: a
+        flag that steers a write is not a fact ABOUT the write.
+        """
+        mock_service = AsyncMock()
+        _configure_config(mock_service, enabled=True)
+        _configure_pass_through_add_memory(mock_service)
+        server = create_mcp_server(mock_service)
+
+        await _call(
+            server, metadata={'allow_near_duplicate': True, 'source': 'notes'},
+        )
+
+        metadata = mock_service.add_memory.await_args.kwargs['metadata']
+        assert 'allow_near_duplicate' not in metadata, f'flag persisted: {metadata!r}'
+        assert metadata['source'] == 'notes', f'{metadata!r}'
+
+    @pytest.mark.asyncio
+    async def test_a_recon_stage_agent_is_force_stored_and_never_attached(self) -> None:
+        """The recon-stage exemption SURVIVES this leaf. Leaf iota retires it.
+
+        Stage-1 consolidation writes a merged canonical that is EXPECTED to
+        closely resemble the duplicates it replaces, with no ordering guarantee
+        that those duplicates are deleted first. Attaching it as a sighting of
+        one of them would invert consolidation — the merged entry would become
+        a child of the very memory it was written to supersede.
+
+        Removing this is leaf iota's explicit signal ("a recon-agent direct
+        near-dup add_memory now triages like anyone else"), so it must still
+        hold here; iota is the owner of its removal, not this leaf.
+        """
+        mock_service = AsyncMock()
+        _configure_config(mock_service, enabled=True)
+        _configure_pass_through_add_memory(mock_service)
+        mock_service.search.return_value = [_candidate('m1', 0.99)]
+        server = create_mcp_server(mock_service)
+
+        result = await _call(server, agent_id='recon-stage-1')
+
+        assert result[ROUTED_KEY] == OUTCOME_STORED, f'{result!r}'
+        assert CANONICAL_ID_KEY not in result, f'consolidation was inverted: {result!r}'
+        metadata = mock_service.add_memory.await_args.kwargs['metadata']
+        assert PARENT_ID_KEY not in (metadata or {}), f'{metadata!r}'
+        mock_service.search.assert_not_awaited()
