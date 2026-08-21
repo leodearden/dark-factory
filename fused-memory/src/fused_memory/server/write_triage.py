@@ -500,10 +500,13 @@ async def triage_write(
     project_id: str,
     counter: TriageFailOpenCounter,
     judge: Any = None,
+    allow_near_duplicate: bool = False,
+    is_recon_stage_agent: bool = False,
 ) -> BandDecision:
     """Route one ``add_memory`` write. NEVER raises, NEVER blocks, NEVER errors.
 
-    Retrieve → band → (judge slot) → decision. Every stage is wrapped: any
+    Force-store → retrieve → band → (judge slot) → decision. Every stage is
+    wrapped after the force-store checks: any
     exception whatsoever yields :data:`OUTCOME_STORED` plus exactly one
     counted fail-open and a logged warning with ``exc_info``. Nothing escapes,
     because C1 is absolute — from the caller's side a fail-open is
@@ -518,7 +521,40 @@ async def triage_write(
     greppable line naming the exception type, and counted like any other
     fail-open — so a changed ``MemoryService.search`` signature surfaces as a
     storm escalation rather than as a stream of errored writes.
+
+    *allow_near_duplicate* and *is_recon_stage_agent* are passed IN rather than
+    recomputed: ``add_memory`` already derives both from the metadata and the
+    agent_id it holds, and a second derivation here is a second place for the
+    two to disagree about who is exempt.
     """
+    if allow_near_duplicate:
+        # D2 reinterprets the retired guard's bypass flag as triage's
+        # force-store escape hatch: under the guard it meant "do not reject
+        # me", here it means "do not reroute me". Same writer intent — the
+        # content is genuinely distinct — expressed against the mechanism that
+        # replaced the one it was built for.
+        #
+        # Returned BEFORE retrieval, not after: retrieval is an embedding +
+        # vector round-trip, and a writer who has already declared the content
+        # distinct should not pay for a lookup whose answer cannot change the
+        # outcome.
+        return BandDecision(OUTCOME_STORED, None, None, None, None)
+
+    if is_recon_stage_agent:
+        # The recon-stage exemption SURVIVES this leaf; LEAF IOTA owns its
+        # removal, and its explicit signal is "a recon-agent direct near-dup
+        # add_memory now triages like anyone else".
+        #
+        # Why it must survive until then: Stage-1 consolidation writes a merged
+        # canonical that is EXPECTED to closely resemble the duplicates it
+        # replaces, and there is no ordering guarantee that those duplicates are
+        # deleted first. Attaching the merged entry as a sighting of one of them
+        # would INVERT consolidation — the entry written to supersede a memory
+        # would become its child — and the inversion would be invisible, because
+        # a sighting of a near-identical parent is exactly what a real
+        # restatement looks like.
+        return BandDecision(OUTCOME_STORED, None, None, None, None)
+
     try:
         k = resolve_candidate_k(memory_service)
         t_high, t_low = resolve_bands(memory_service)

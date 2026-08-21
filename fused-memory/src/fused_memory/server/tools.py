@@ -3126,6 +3126,12 @@ def create_mcp_server(
                 content=content,
                 project_id=project_id,
                 counter=_triage_fail_open_counter,
+                # Both predicates are already derived above, from the metadata
+                # and agent_id this body holds. Passed IN rather than
+                # recomputed inside triage_write: a second derivation is a
+                # second place for the two to disagree about who is exempt.
+                allow_near_duplicate=allow_near_duplicate,
+                is_recon_stage_agent=is_recon_stage_agent,
             )
         if (
             not triage_enabled
