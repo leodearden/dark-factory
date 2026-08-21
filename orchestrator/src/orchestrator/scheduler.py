@@ -1995,6 +1995,29 @@ class Scheduler:
         self._requeue_counts: dict[str, int] = {}
         self._transient_requeue_counts: dict[str, int] = {}
         self._requeue_history: dict[str, list[RequeueRecord]] = {}
+        # task_id -> the POST-INCREMENT transient requeue count of a requeue
+        # whose cooldown has not been armed yet (task 3317 / PRD contract C3,
+        # open question 1).  Written by ``record_requeue``'s transient route
+        # (route 2) and CONSUMED — popped unconditionally — by ``release``,
+        # which is its sole reader.
+        #
+        # WHY THE CUMULATIVE COUNTER ALONE IS INSUFFICIENT.
+        # ``record_requeue`` runs strictly before ``release`` for the same
+        # outcome (``Harness._run_slot``'s finally block calls
+        # ``_apply_retry_cap`` and then ``scheduler.release``), so
+        # ``_transient_requeue_counts[task_id]`` is already post-increment at
+        # arming time — but it is CUMULATIVE and cannot say whether THIS
+        # requeue was transient.  A task carrying 2 prior transient requeues
+        # that then requeues GENUINELY would read 2 and wrongly arm a 60s
+        # backoff, violating boundary row 4's "genuine requeue stays flat
+        # 30s".  The stamp supplies both halves at once: the ``n`` for the
+        # envelope AND the transient-vs-genuine discrimination.
+        #
+        # It is consume-once precisely so a stamp can never leak into a later
+        # flat arming: ``release`` pops it even when ``requeued=False`` (the
+        # cap-exhaust shape), and ``clear_requeue_count`` drops it alongside
+        # the counters.
+        self._pending_transient_cooldown: dict[str, int] = {}
         # --- Fairness state (see orchestrator.config.FairnessConfig) ---
         self._skip_count: dict[str, int] = {}  # task_id -> consecutive top-skip count
         # Per-tier cap bookkeeping: remember the effective priority of every
@@ -7871,6 +7894,12 @@ class Scheduler:
         """Release all module locks for a task and clear dispatch guard."""
         self._dispatched.discard(task_id)
         self._dispatched_priority.pop(task_id, None)
+        # Consume this task's pending transient-cooldown stamp (task 3317 /
+        # PRD contract C3).  UNCONDITIONAL and ahead of the `requeued` branch:
+        # the cap-exhaust path records a transient requeue and then releases
+        # with requeued=False, so a conditional pop would leave residue that
+        # leaked into whatever armed next.
+        self._pending_transient_cooldown.pop(task_id, None)
         if requeued:
             self._requeue_until[task_id] = (
                 self._time_source() + self.config.requeue_cooldown_secs
@@ -8603,7 +8632,11 @@ class Scheduler:
         2. Transient API requeue (a server-side HTTP 5xx), classified by
            ``is_transient_api_requeue`` — routed to
            ``_transient_requeue_counts`` (feeds ``config.transient_requeue_cap``);
-           does NOT increment the genuine ``_requeue_counts``.  As of task
+           does NOT increment the genuine ``_requeue_counts``.  This route is
+           ALSO the sole writer of ``_pending_transient_cooldown[task_id]``
+           (task 3317 / PRD contract C3), the consume-once stamp carrying this
+           requeue's post-increment transient count to its arming; ``release``
+           is its sole reader and pops it unconditionally.  As of task
            3315 (PRD contract C2 / INV-1) this classification is FIELD-FIRST
            on the structured *api_error_status* threaded here from
            ``TerminalReport -> TaskReport``; the ``agent API error: HTTP <n>``
@@ -8630,6 +8663,10 @@ class Scheduler:
         elif is_transient_api_requeue(reason, api_error_status=api_error_status):
             t_count = self._transient_requeue_counts.get(task_id, 0) + 1
             self._transient_requeue_counts[task_id] = t_count
+            # Stamp the pending cooldown for THIS requeue (task 3317 / PRD C3).
+            # Route 2 only — routes 1 and 3 deliberately leave no stamp, so
+            # their arming stays flat.  Consumed by ``release``.
+            self._pending_transient_cooldown[task_id] = t_count
         else:
             g_count = self._requeue_counts.get(task_id, 0) + 1
             self._requeue_counts[task_id] = g_count
@@ -8667,6 +8704,10 @@ class Scheduler:
         self._requeue_counts.pop(task_id, None)
         self._transient_requeue_counts.pop(task_id, None)
         self._requeue_history.pop(task_id, None)
+        # Drop any un-armed cooldown stamp too (task 3317): it is keyed off a
+        # count that no longer exists, so leaving it would arm a backoff sized
+        # from a cleared history.
+        self._pending_transient_cooldown.pop(task_id, None)
 
     async def trigger_retry_cap_exhausted(
         self,
