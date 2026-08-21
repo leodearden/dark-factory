@@ -1839,6 +1839,7 @@ class Scheduler:
         park_eviction_store: ParkEvictionRequestStore | None = None,
         wall_time_source: Callable[[], datetime] | None = None,
         state_snapshot_path: Path | None = None,
+        jitter_source: Callable[[float, float], float] | None = None,
     ):
         self.config = config
         # Constructor-injected Harness callback bundle (task 2235).  Omitting
@@ -1852,6 +1853,15 @@ class Scheduler:
         # compare correctly after a process restart. Injectable so tests can
         # drive deterministic dated/delayed milestone scenarios.
         self._wall_now: Callable[[], datetime] = _resolve_wall_time_source(wall_time_source)
+        # Jitter draw for the transient-requeue backoff (task 3317 / PRD C3).
+        # NOT a clock: a ``(lo, hi) -> float`` uniform draw, the same seam
+        # ``fm_retry_backoffs``'s ``rng`` parameter exposes, so deterministic
+        # tests can inject a boundary function (``lambda lo, hi: hi``) and
+        # assert exact armed cooldowns instead of sampling a random band.
+        # Production leaves it None and gets ``random.uniform``.
+        self._jitter_source: Callable[[float, float], float] = (
+            jitter_source if jitter_source is not None else random.uniform
+        )
         # Monotonic clock source for the park-stop rolling-window transition
         # recorder.  time.monotonic avoids false-trip / stale-entry artefacts
         # from non-monotonic wall-clock skew (NTP steps, VM clock drift).
@@ -7891,7 +7901,34 @@ class Scheduler:
         return False
 
     def release(self, task_id: str, *, requeued: bool = False) -> None:
-        """Release all module locks for a task and clear dispatch guard."""
+        """Release all module locks for a task and clear dispatch guard.
+
+        When *requeued*, this also arms the anti-hot-loop cooldown that gates
+        re-dispatch — and as of task 3317 (PRD contract C3) it arms ONE OF TWO
+        cooldowns, discriminated by the ``_pending_transient_cooldown`` stamp
+        ``record_requeue``'s transient route left behind:
+
+        - NO stamp — a GENUINE requeue, or an arming with no preceding
+          ``record_requeue`` at all (the blast-radius requeue above, and
+          ``arm_requeue_cooldown``).  Arms the FLAT
+          ``config.requeue_cooldown_secs``, exactly as before.
+        - A stamp — a TRANSIENT (server-side 5xx) requeue.  Arms
+          ``transient_requeue_cooldown(n)``: a jittered exponential drawn from
+          ``[envelope/2, envelope]`` where
+          ``envelope = min(config.transient_requeue_backoff_base_secs *
+          2**(n-1), config.transient_requeue_backoff_cap_secs)`` and ``n`` is
+          the stamped post-increment transient count.  A sustained provider
+          outage therefore backs a task off 30 → 60 → 120 → 240 → 480 → 900s
+          instead of retrying flat every 30s.
+
+        Both knobs are read from ``self.config`` HERE, at arm time, which is
+        what makes them green-tier hot-reloadable with no reload hook (see
+        ``RELOADABLE_FIELDS``); an already-armed deadline keeps its old window.
+
+        ``_requeue_until``'s value type is unchanged — a monotonic deadline
+        float — because the eligibility readers, the per-tick GC sweep and
+        several tests all depend on that shape.
+        """
         self._dispatched.discard(task_id)
         self._dispatched_priority.pop(task_id, None)
         # Consume this task's pending transient-cooldown stamp (task 3317 /
@@ -7899,11 +7936,18 @@ class Scheduler:
         # the cap-exhaust path records a transient requeue and then releases
         # with requeued=False, so a conditional pop would leave residue that
         # leaked into whatever armed next.
-        self._pending_transient_cooldown.pop(task_id, None)
+        armed_n = self._pending_transient_cooldown.pop(task_id, None)
         if requeued:
-            self._requeue_until[task_id] = (
-                self._time_source() + self.config.requeue_cooldown_secs
-            )
+            if armed_n is None:
+                cooldown = self.config.requeue_cooldown_secs
+            else:
+                cooldown, _envelope = transient_requeue_cooldown(
+                    armed_n,
+                    base_secs=self.config.transient_requeue_backoff_base_secs,
+                    cap_secs=self.config.transient_requeue_backoff_cap_secs,
+                    rng=self._jitter_source,
+                )
+            self._requeue_until[task_id] = self._time_source() + cooldown
         modules = list(self.lock_table._held.get(task_id, set()))
         self.lock_table.release(task_id)
         # Defensive: clear any reservations still owned by this task.
