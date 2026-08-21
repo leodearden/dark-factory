@@ -2209,6 +2209,23 @@ class IncompleteReportError(RuntimeError):
     """
 
 
+def _repo_relative(path: str | Path) -> str:
+    """``fused-memory/tests/fixtures/…``, never an absolute home-directory path.
+
+    Shared by :func:`fixture_provenance` and the regrowth block so the two
+    cannot name the same file differently.  An artifact naming somebody's
+    absolute checkout is neither reproducible nor readable by anyone else,
+    and it leaks the worktree the run happened in.  Falls back to the bare
+    filename for a path outside the repo, rather than emitting the absolute
+    one.
+    """
+    resolved = Path(path).resolve()
+    try:
+        return str(resolved.relative_to(_PACKAGE_ROOT.parent))
+    except ValueError:
+        return resolved.name
+
+
 def fixture_provenance(paths: list[str | Path]) -> list[dict[str, Any]]:
     """Repo-relative path + last-touching commit for each fixture.
 
@@ -2232,10 +2249,7 @@ def fixture_provenance(paths: list[str | Path]) -> list[dict[str, Any]]:
     provenance: list[dict[str, Any]] = []
     for raw in paths:
         path = Path(raw).resolve()
-        try:
-            relative = str(path.relative_to(repo_root))
-        except ValueError:
-            relative = path.name
+        relative = _repo_relative(path)
         commit: str | None = None
         try:
             completed = subprocess.run(
@@ -4210,6 +4224,215 @@ async def run_arm(
             seeded, fetched, pin=True, queries=queries, probes=probes,
             estimator=estimator, guard_threshold=guard_threshold, limit=limit,
         ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# The +1-re-emission regrowth probe (task 4012)
+# ---------------------------------------------------------------------------
+#
+# esc-3200-3 was a SPLIT ratification: Option C's WRITE shape was ratified,
+# no read transform was, and the read choice was delegated to 4004 (which
+# selected the promoting topic pin).  Neither decision answered what ONE
+# organic re-emission of an already-canonical claim costs retrieval under
+# that ratified shape, or whether the selected transform absorbs it.  This
+# section measures it: the ratified write shape held fixed, the READ arm
+# varied three ways, over two injection modes.
+
+#: The probe is scoped to the RATIFIED write shape, and varies only the read
+#: arm.  Probing all six ``ARM_VARIANTS`` would re-open a settled question
+#: and triple the live cost; probing only ``c_peers`` and ``c_peers+pin``
+#: would omit the transform 4004 actually selected.
+REGROWTH_SHAPE = 'c_peers'
+
+#: The three read arms, pinned by EQUALITY like ``ARM_SHAPES``.
+REGROWTH_READ_ARMS: tuple[str, ...] = ('flat', 'additive_pin', 'promoting_pin')
+
+#: ``arm -> (pin, promote)``.  ONE definition, so the fan-out, the delta
+#: table and the renderer cannot disagree about what an arm name means.
+_REGROWTH_ARM_FLAGS: dict[str, tuple[bool, bool]] = {
+    'flat': (False, False),
+    'additive_pin': (True, False),
+    'promoting_pin': (True, True),
+}
+
+#: The ``(block, key)`` pairs the delta table reports, pinned by EQUALITY for
+#: the same reason ``DECISION_TABLE_COLUMNS`` is: a metric quietly dropped
+#: from a delta table is a metric quietly dropped from the decision.
+#:
+#: The ``stored_`` trio is the SCORED discoverability — ``topic_discoverability``
+#: over the RAW hits, before any ``read_path`` — which is the "TRUE canonical
+#: id, never an aliased group record id" scoring 3560 landed and the task
+#: mandates.
+#:
+#: The transform-CREDITED ``canonical_in_top_5_rate`` travels BESIDE it and
+#: never alone.  ``apply_promoting_topic_anchor`` injects the canonical into
+#: the window, so under the ``promoting_pin`` arm that column is a PLACEMENT
+#: property in exactly the way ``apply_grouped_read``'s record-id aliasing
+#: was under ``b_grouped`` (E2 report, "How to read this table";
+#: read-transform-selection report, disclosure (a)).  Dropping it would hide
+#: the transform's actual contribution; printing it alone would repeat the
+#: misreading 3560 and 4004 each had to correct after publication.  Both, in
+#: adjacent columns, with the semantics stated in the rendered section, is
+#: the convention both sibling reports converged on — and it costs nothing,
+#: because ``measure_arm`` already returns both.
+REGROWTH_METRICS: tuple[tuple[str, str], ...] = (
+    ('claim_recall', 'at_5'),
+    ('claim_recall', 'at_10'),
+    ('discoverability', 'stored_canonical_in_top_5_rate'),
+    ('discoverability', 'stored_canonical_median_rank'),
+    ('discoverability', 'stored_canonical_found_count'),
+    ('discoverability', 'canonical_in_top_5_rate'),
+    ('tokens_per_query', 'mean'),
+)
+
+
+def measure_regrowth_arms(
+    seeded: SeededArm,
+    fetched: dict[str, dict[str, list[ScoredHit]]],
+    *,
+    queries: list[Query],
+    probes: list[tuple[str, dict[str, Any]]],
+    estimator: tuple[str, Any],
+    guard_threshold: float,
+    limit: int,
+) -> dict[str, dict[str, Any]]:
+    """One full measurement per read arm, over ONE set of rankings.
+
+    ``measure_arm`` is pure over ``(SeededArm, fetched)`` and takes ``pin`` /
+    ``promote`` as flags, so all three arms are scored from the SAME
+    rankings.  That is what makes the baseline free — it is computed from
+    the ``c_peers`` arm's own fetches, the very rankings the decision table
+    is built from — and, more importantly, what keeps HNSW insertion-order
+    noise out of the deltas: re-seeding a separate control collection would
+    put exactly the difference the deltas must not contain between the two
+    sides.
+    """
+    return {
+        arm: measure_arm(
+            seeded, fetched,
+            pin=pin, promote=promote,
+            queries=queries, probes=probes, estimator=estimator,
+            guard_threshold=guard_threshold, limit=limit,
+        )
+        for arm, (pin, promote) in (
+            (arm, _REGROWTH_ARM_FLAGS[arm]) for arm in REGROWTH_READ_ARMS
+        )
+    }
+
+
+def _pluck_regrowth_metrics(measurement: dict[str, Any]) -> dict[str, Any]:
+    """Project ``REGROWTH_METRICS`` to a flat ``{'<block>.<key>': value}``.
+
+    One shape for the delta arithmetic and the renderer both, so a metric can
+    only be added or removed in ``REGROWTH_METRICS``.
+    """
+    return {
+        f'{block}.{key}': measurement[block][key]
+        for block, key in REGROWTH_METRICS
+    }
+
+
+def _delta(after: Any, baseline: Any) -> float | None:
+    """``after - baseline``, or ``None`` if EITHER side was never measured.
+
+    The ``_NO_MEASUREMENT`` discipline one layer down: a delta table that
+    printed an unmeasured pair as ``0.0`` would say the injection changed
+    nothing, which is a finding rather than an absence.
+    """
+    if after is None or baseline is None:
+        return None
+    return float(after) - float(baseline)
+
+
+def _check_same_arms(left: dict[str, Any], right: dict[str, Any], *, what: str) -> None:
+    if set(left) != set(right):
+        missing = sorted(set(left) ^ set(right))
+        raise MeasurementError(
+            f'{what}: the two sides disagree on which read arms were '
+            f'measured — {missing!r} is present on only one. Silently '
+            f'dropping it would delete a read arm from the decision table.'
+        )
+
+
+def regrowth_deltas(
+    baseline: dict[str, dict[str, Any]],
+    after: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, float | None]]:
+    """``after - baseline`` per read arm, per metric."""
+    _check_same_arms(baseline, after, what='regrowth deltas')
+    deltas: dict[str, dict[str, float | None]] = {}
+    for arm in REGROWTH_READ_ARMS:
+        if arm not in baseline:
+            raise MeasurementError(
+                f'regrowth deltas: read arm {arm!r} was never measured'
+            )
+        if set(baseline[arm]) != set(after[arm]):
+            missing = sorted(set(baseline[arm]) ^ set(after[arm]))
+            raise MeasurementError(
+                f'regrowth deltas: read arm {arm!r} disagrees on metrics — '
+                f'{missing!r} is present on only one side'
+            )
+        deltas[arm] = {
+            metric: _delta(after[arm][metric], baseline[arm][metric])
+            for metric in baseline[arm]
+        }
+    return deltas
+
+
+def regrowth_stamping_value(
+    deltas: dict[str, dict[str, dict[str, Any]]],
+) -> dict[str, dict[str, float | None]]:
+    """What topic-stamping coverage buys against regrowth, per arm.
+
+    ``stamped delta - unstamped delta``.  This is the number task 4006's
+    stamping campaign is owed: the unstamped delta is what one re-emission
+    costs today, the stamped delta is what it would cost if the write path
+    stamped every re-emission, and the difference is the campaign's value.
+    """
+    for mode in REGROWTH_MODES:
+        if mode not in deltas:
+            raise MeasurementError(
+                f'regrowth stamping value: mode {mode!r} was never measured — '
+                f'the value is stamped-minus-unstamped and cannot be formed '
+                f'from one mode alone'
+            )
+    unstamped, stamped = deltas['unstamped'], deltas['stamped']
+    _check_same_arms(unstamped, stamped, what='regrowth stamping value')
+    return {
+        arm: {
+            metric: _delta(stamped[arm][metric], unstamped[arm][metric])
+            for metric in unstamped[arm]
+        }
+        for arm in REGROWTH_READ_ARMS
+    }
+
+
+def build_regrowth_block(
+    *,
+    baseline: dict[str, dict[str, Any]],
+    after_by_mode: dict[str, dict[str, dict[str, Any]]],
+    injections: list[RegrowthInjection],
+    fixture_path: str | Path,
+) -> dict[str, Any]:
+    """The report's ``regrowth`` block, descriptors and all four tables."""
+    deltas = {
+        mode: regrowth_deltas(baseline, after_by_mode[mode])
+        for mode in REGROWTH_MODES
+    }
+    return {
+        'shape': REGROWTH_SHAPE,
+        'read_arms': list(REGROWTH_READ_ARMS),
+        'modes': list(REGROWTH_MODES),
+        'topics_injected': len({i.topic for i in injections}),
+        # A checkable property of the artifact, not a claim in its prose:
+        # the "+1" in the probe's name IS the independent variable.
+        'injections_per_topic': 1,
+        'injection_fixture': _repo_relative(fixture_path),
+        'baseline': baseline,
+        'after': {mode: after_by_mode[mode] for mode in REGROWTH_MODES},
+        'deltas': deltas,
+        'stamping_value': regrowth_stamping_value(deltas),
     }
 
 
