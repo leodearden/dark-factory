@@ -41,6 +41,7 @@ import pytest
 from fused_memory.reconciliation.stale_status_snapshot_edge_sweep import (
     _ENUM_PREP_WORDS,
     _last_clause_break,
+    extract_blocked_assertion_task_ids,
     extract_snapshot_edge_task_ids,
     flatten_dedup_edges,
     select_stale_status_snapshot_edges,
@@ -1422,6 +1423,168 @@ class TestExtractSnapshotEdgeTaskIds:
         """
         assert extract_snapshot_edge_task_ids(fact) == expected
 
+
+# --------------------------------------------------------------------------- #
+# extract_blocked_assertion_task_ids — blocked-scoped extraction (task 3037)
+# --------------------------------------------------------------------------- #
+
+# The whole case table for the blocked family, shared by the per-shape tests
+# and by the subset-parity test below so the two can never disagree about
+# what the expected values are. Each expectation was measured against the
+# UNION extractor at HEAD=c54b8cfcc5 before being written down, so none of
+# them is a guess (task 3037).
+_BLOCKED_EXTRACTION_CASES: tuple[tuple[str, set[int]], ...] = (
+    # --- the five extraction paths, each asserting 'blocked' ---
+    ('Task 2848 remains blocked as of 2026-07-22', {2848}),
+    ('Task 5 is currently blocked', {5}),
+    ('Task 5 is blocked on task 2862', {5}),
+    ("Task 5's status is blocked", {5}),
+    ('Task 5 is in a blocked status.', {5}),
+    ('Tasks 1020 and 1030 are blocked', {1020, 1030}),
+    ('Blocked tasks: 142, 148', {142, 148}),
+    # --- the precision guards the union family already buys ---
+    ('Task 5 blocked the merge queue', set()),
+    ('Task 5 is no longer blocked', set()),
+    # --- markers that are NOT blocked assertions ---
+    ('Task 5 is pending', set()),
+    ('The active pending tasks are [7, 9]', set()),
+    ('Task 7 is stalled', set()),
+)
+
+
+class TestExtractBlockedAssertionTaskIds:
+    """extract_blocked_assertion_task_ids(fact) returns the subset of ids the
+    fact asserts as BLOCKED specifically — not the union over every status
+    marker (task 3037).
+
+    Why a blocked-SCOPED extractor is needed at all, rather than reusing
+    extract_snapshot_edge_task_ids: the union extractor cannot say WHICH
+    marker contributed an id, so 'Task 5 is pending' and 'Task 5 is
+    currently blocked' are indistinguishable at {5}. The new selection rule
+    retires an edge whose asserted status is contradicted by any
+    positively-known non-'blocked' status; applied to union ids that rule
+    would retire an 'active/pending' snapshot the moment its task moved to
+    review — a behavioural widening far outside this task, and in the
+    over-selection direction the module docstring forbids.
+
+    The blocked family is generated from the same pattern builder as the
+    union family (see _build_snapshot_patterns), so every hardening tasks
+    2613/3042/3079/3403/4149 bought — transitive-verb guard, negation and
+    past-exit guard, intervening-task-reference guard, prepositional-
+    complement subjecthood guard, possessive quantifiers, intra-token-dot
+    narrowing — applies here for free and cannot drift.
+    """
+
+    # --- the five extraction paths ---
+
+    def test_individual_form_remains_blocked(self):
+        """The live repro fact: 'Task 2848 remains blocked as of 2026-07-22' -> {2848}."""
+        assert extract_blocked_assertion_task_ids(
+            'Task 2848 remains blocked as of 2026-07-22'
+        ) == {2848}
+
+    def test_individual_form_adverb_currently_blocked(self):
+        """'Task 5 is currently blocked' -> {5} (closed-class adverb slot)."""
+        assert extract_blocked_assertion_task_ids('Task 5 is currently blocked') == {5}
+
+    def test_individual_form_never_attributes_the_blocker(self):
+        """'Task 5 is blocked on task 2862' -> {5}, never the BLOCKING task 2862.
+
+        Only task 5 is asserted blocked; 2862 is what it is blocked ON. A
+        rule that retired this edge on 2862's status would be reading the
+        fact backwards.
+        """
+        assert extract_blocked_assertion_task_ids('Task 5 is blocked on task 2862') == {5}
+
+    def test_genitive_form(self):
+        """"Task 5's status is blocked" -> {5} (GENITIVE_STATUS_RE path, task 3079)."""
+        assert extract_blocked_assertion_task_ids("Task 5's status is blocked") == {5}
+
+    def test_status_phrase_form(self):
+        """'Task 5 is in a blocked status.' -> {5} (SNAPSHOT_STATUS_PHRASE_RE path)."""
+        assert extract_blocked_assertion_task_ids('Task 5 is in a blocked status.') == {5}
+
+    def test_plural_enumeration_form(self):
+        """'Tasks 1020 and 1030 are blocked' -> {1020, 1030} (task 3079 path)."""
+        assert extract_blocked_assertion_task_ids('Tasks 1020 and 1030 are blocked') == {
+            1020,
+            1030,
+        }
+
+    def test_aggregate_list_form(self):
+        """'Blocked tasks: 142, 148' -> {142, 148} (LIST_INTRODUCER_RE path)."""
+        assert extract_blocked_assertion_task_ids('Blocked tasks: 142, 148') == {142, 148}
+
+    # --- precision guards inherited from the shared builder ---
+
+    def test_transitive_verb_reading_excluded(self):
+        """'Task 5 blocked the merge queue' -> set().
+
+        A permanently-true HISTORICAL fact, not a status snapshot. The
+        transitive-capable arm's mandatory copula/article refuses it — the
+        same guard the union family carries (task 3042).
+        """
+        assert extract_blocked_assertion_task_ids('Task 5 blocked the merge queue') == set()
+
+    def test_negated_blocked_assertion_excluded(self):
+        """'Task 5 is no longer blocked' -> set().
+
+        Negation INVERTS the assertion: this fact says the task is NOT
+        blocked, so it is not a blocked assertion and must never be retired
+        by the blocked rule. Refused for free by _ADVERB_ALT's closed class.
+        """
+        assert extract_blocked_assertion_task_ids('Task 5 is no longer blocked') == set()
+
+    # --- non-'blocked' markers are not blocked assertions ---
+
+    def test_pending_marker_is_not_a_blocked_assertion(self):
+        """'Task 5 is pending' -> set() even though the UNION extractor gives {5}.
+
+        This is the whole point of the blocked-scoped set: the new selection
+        rule must not reach an active/pending snapshot.
+        """
+        assert extract_blocked_assertion_task_ids('Task 5 is pending') == set()
+        assert extract_snapshot_edge_task_ids('Task 5 is pending') == {5}
+
+    def test_aggregate_pending_list_is_not_a_blocked_assertion(self):
+        """'The active pending tasks are [7, 9]' -> set() (union gives {7, 9})."""
+        assert extract_blocked_assertion_task_ids('The active pending tasks are [7, 9]') == set()
+        assert extract_snapshot_edge_task_ids('The active pending tasks are [7, 9]') == {7, 9}
+
+    def test_stalled_marker_is_deliberately_excluded(self):
+        """'Task 7 is stalled' -> set() (union gives {7}).
+
+        'stalled' is deliberately NOT in the blocked family. It is not a
+        member of the closed shared.task_statuses.TaskStatus vocabulary, so
+        there is no census value it could be compared against: the new rule
+        keys on "positively known and != 'blocked'", and a marker with no
+        corresponding status value can never be evaluated that way. Scoping
+        the family to the literal 'blocked' marker keeps the rule and the
+        census vocabulary in exact correspondence.
+        """
+        assert extract_blocked_assertion_task_ids('Task 7 is stalled') == set()
+        assert extract_snapshot_edge_task_ids('Task 7 is stalled') == {7}
+
+    # --- structural parity with the union family ---
+
+    @pytest.mark.parametrize(('fact', 'expected'), _BLOCKED_EXTRACTION_CASES)
+    def test_case_table(self, fact, expected):
+        """Every case above, driven from the shared table."""
+        assert extract_blocked_assertion_task_ids(fact) == expected
+
+    @pytest.mark.parametrize(('fact', '_expected'), _BLOCKED_EXTRACTION_CASES)
+    def test_blocked_ids_are_always_a_subset_of_union_ids(self, fact, _expected):
+        """extract_blocked_assertion_task_ids(f) <= extract_snapshot_edge_task_ids(f).
+
+        True by construction — the blocked family is the union family with
+        its marker alternation narrowed to 'blocked' — and pinned here so a
+        future edit that lets the blocked family reach an id the union family
+        does not fails immediately. A blocked id outside the union set would
+        mean the sweep could select an edge on an id it never put into its
+        get_statuses census, i.e. cross-reference against a status it never
+        looked up.
+        """
+        assert extract_blocked_assertion_task_ids(fact) <= extract_snapshot_edge_task_ids(fact)
 
 # --------------------------------------------------------------------------- #
 # extract_snapshot_edge_task_ids — catastrophic-backtracking regression
