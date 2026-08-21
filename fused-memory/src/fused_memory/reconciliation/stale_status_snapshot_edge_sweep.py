@@ -1319,6 +1319,64 @@ def _extract_ids(fact: str, patterns: _SnapshotPatterns) -> set[int]:
 
 
 # --------------------------------------------------------------------------- #
+# build_supersede_fact — the superseding temporal_fact's wording (task 3037)
+# --------------------------------------------------------------------------- #
+
+# RESULTING-STATE-ONLY, and every word of it is load-bearing. Two independent
+# hazards rule out the wordings a reader reaches for first; both were measured
+# on this module's own extractor and on task_filter's write guards, and both
+# are pinned by TestBuildSupersedeFact rather than left as a claim here.
+#
+# (1) 'Task {N} was blocked and is now pending' — FORBIDDEN, twice over.
+#     This module's OWN extractor re-extracts it (measured -> {2848}), so the
+#     superseding fact would satisfy the very selection rule that produced it:
+#     next cycle the sweep would retire it and write a fresh copy, forever.
+#     It is also MIXED TEMPORAL FRAMING, which prompts/stage1.py L326-346
+#     forbids for temporal_facts because Graphiti atomization can re-emit the
+#     stale 'was blocked' fragment as a co-current edge — reintroducing
+#     exactly the assertion this sweep just retired.
+#
+# (2) 'Task {N} is no longer blocked' — also forbidden, but for only ONE of
+#     those reasons, which is why it is worth naming separately: it is
+#     extractor-SAFE (measured -> set()), so an author checking only the
+#     self-churn hazard would conclude it is fine. It is PRIOR-STATE framing,
+#     which the same resulting-state-only rule refuses.
+#
+# The chosen template states the CURRENT state and nothing else, and carries
+# an explicit 'As of <date>' stamp so it reads as a point-in-time observation
+# rather than a standing claim about a live task-table field (the distinction
+# task_filter.frames_live_task_status_as_current_fact enforces).
+#
+# Note the sweep writes in-process via memory_service.add_memory and so
+# BYPASSES the MCP-boundary enforcement at server/tools.py:2856/3061 that
+# would otherwise reject a recon-stage-* writer's malformed framing. The
+# module's compliance therefore rests entirely on this template plus its
+# tests — there is no second line of defence downstream.
+_SUPERSEDE_FACT_TEMPLATE = 'As of {date}, task {task_id} has status {status}.'
+
+
+def build_supersede_fact(task_id: int, status: str, now: datetime) -> str:
+    """Render the resulting-state-only temporal_fact that supersedes a retired
+    blocked assertion.
+
+    Args:
+        task_id: The task whose blocked assertion was contradicted.
+        status: Its CURRENT census status — the resulting state, stated on its
+            own. Never paired with the prior state; see
+            ``_SUPERSEDE_FACT_TEMPLATE`` for why.
+        now: The timestamp to stamp the observation with. Always passed in,
+            never read from a module-level clock, so the fact carries the same
+            instant the sweep used as the edge's ``invalid_at`` and a replayed
+            or back-dated run stays reproducible.
+
+    Pure: no I/O, no side effects.
+    """
+    return _SUPERSEDE_FACT_TEMPLATE.format(
+        date=now.strftime('%Y-%m-%d'), task_id=task_id, status=status,
+    )
+
+
+# --------------------------------------------------------------------------- #
 # flatten_dedup_edges
 # --------------------------------------------------------------------------- #
 
