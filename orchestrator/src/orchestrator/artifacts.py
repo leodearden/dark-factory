@@ -1279,10 +1279,19 @@ class TaskArtifacts:
         refusing a corrupted call NON-DESTRUCTIVE (PRD C2 L187 / INV-7) rather
         than a silent data loss dressed up as a clean error.
 
-        It exists because ``orchestrator.mcp.verdict_tools`` runs as a
-        standalone stdio subprocess with no in-process escalation client and no
-        queue, so ``MarkupGuardMiddleware``'s ``escalation_sink`` has nowhere
-        else to land there. This class's root is somewhere it CAN reach.
+        IT IS THE LAST RESORT, NOT THE CHANNEL. The primary channel for both
+        orchestrator-side boundary guards is the real escalation queue, via
+        ``orchestrator.mcp.markup_sink.make_escalation_sink`` — a queued record
+        names an owner, carries the standing L2 age bound, and is actually READ.
+        This writer is what a guard falls back to when that queue cannot be
+        opened at all (an unresolvable project root, a missing ``escalation``
+        package). Its root lives inside the task's own worktree/meta root, which
+        the orchestrator destroys at teardown with ``git worktree remove
+        --force`` and which a pooled lane clears on acquisition — so a payload
+        parked here survives only until the lane is reaped and nothing
+        proactively surfaces it. Strictly better than losing the payload the
+        instant the queue is down; strictly worse than a queued escalation.
+        Callers must wire it as ``last_resort=``, never as the sink itself.
         ``.task/`` is gitignored, so a residue file can never contaminate a
         task's diff or its verify.
 

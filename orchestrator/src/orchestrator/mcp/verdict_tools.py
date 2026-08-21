@@ -38,6 +38,7 @@ from shared.mcp_markup_middleware import (
 )
 
 from orchestrator.artifacts import TaskArtifacts, _validate_verdict_role
+from orchestrator.mcp import markup_sink
 
 logger = logging.getLogger(__name__)
 
@@ -193,6 +194,51 @@ def _emit_markup_fact(fact: dict[str, Any]) -> None:
     logger.info('%s %s', FACT_MARKUP_DETECTED, json.dumps(fact, sort_keys=True))
 
 
+#: verdict-tools' declaration of its own escalation channel (task 3690).
+#: Every field is stated here rather than defaulted inside ``markup_sink``:
+#: adding a server to the shared channel must be a decision at every axis, not
+#: an inheritance of plan-tools' answers.
+_MARKUP_SINK_SPEC = markup_sink.MarkupSinkSpec(
+    server_label='verdict-tools',
+    agent_role='verdict-tools-markup-guard',
+    residue_anchor_task_id='verdict-tools-markup-residue',
+    storm_anchor_task_id='verdict-tools-markup-storm',
+    refusal_consequence=(
+        'NO verdict was written, so the review gate this call was supposed to '
+        "close is still open and the reviewer's findings list below is the "
+        'only copy of it that exists.'
+    ),
+    storm_consequence=(
+        'further review gates strand on verdicts that never land.'
+    ),
+)
+
+
+def _markup_subject_task_id(artifacts: TaskArtifacts) -> str:
+    """Which task's verdict call leaked — the SUBJECT, not the routing key.
+
+    Deliberately NOT the escalation's ``task_id`` field: that is the non-task
+    residue anchor, because a level-2 record filed under a LIVE task id halts
+    that task, and preserving a payload must not cost the run that produced it.
+
+    The plan's own ``task_id`` when there is a plan to read (there always is by
+    the time a verdict is submitted — the verdict is about that plan's diff);
+    ``markup_sink`` falls back to the worktree name and then to an explicit
+    "unattributed" when this returns empty. An unreadable plan degrades the
+    same way rather than losing the record.
+    """
+    try:
+        plan = artifacts.read_plan()
+    except Exception:
+        logger.warning(
+            'markup guard: could not read the plan for attribution under %s; '
+            'falling back to the worktree name', artifacts.root,
+        )
+        return ''
+    task_id = plan.get('task_id') if isinstance(plan, dict) else None
+    return task_id if isinstance(task_id, str) else ''
+
+
 def create_server(artifacts: TaskArtifacts, role: str, session_id: str = '') -> FastMCP:
     """Create the verdict-tools MCP server with EXACTLY ONE tool registered,
     selected by *role*.
@@ -230,37 +276,46 @@ def create_server(artifacts: TaskArtifacts, role: str, session_id: str = '') -> 
     # would match BARE (`submit_review_verdict`, never the agent-facing
     # mcp__verdict-tools__submit_review_verdict spelling the corpus records).
     #
-    # escalation_sink lands the residue of an UNREPAIRABLE call as a gitignored
-    # `.task/markup_residue-<n>.json` under the TaskArtifacts root this server
-    # already holds — durable, in the task's own meta root, and readable by an
-    # operator without a queue. That is what makes refusing a corrupted call
-    # non-destructive here (C2 L187 / INV-7): the refusal payload quotes the
-    # filename, so a bounced reviewer can point an operator at its own data.
+    # THE ESCALATION SINK IS THE SHARED ONE, and deliberately not a second
+    # mechanism of this server's own. `orchestrator.mcp.markup_sink` is the one
+    # orchestrator-side channel every boundary guard files through — promoted
+    # out of plan_tools by this task once verdict-tools needed the identical
+    # thing. A private, weaker preservation path per server is exactly the
+    # INV-5 failure this PRD exists to rule against, and it very nearly shipped
+    # here: the first cut of this leaf wrote residue to a worktree-local
+    # `.task/markup_residue-<n>.json`, which dies with the lane at
+    # `git worktree remove --force` and which nothing ever reads. That file is
+    # now only the LAST RESORT, taken when the queue cannot be opened at all,
+    # and the sink says so in the log line it writes.
     #
-    # It is NOT a queue submission and deliberately not equivalent to the
-    # escalation server's. This server runs as a standalone stdio subprocess
-    # (`python -m orchestrator.mcp.verdict_tools`, spawned from
-    # mcp_lifecycle.py) inside the task worktree with no in-process escalation
-    # queue and no escalation client, so nothing PROACTIVELY surfaces the file —
-    # it waits to be found. Wiring proactive surfacing is the follow-up filed
-    # alongside task 3690.
+    # Filing works from this process even though it is a standalone stdio
+    # subprocess with no in-process queue: markup_sink resolves project_root
+    # off the worktree's `--git-common-dir` and lazily opens the real
+    # EscalationQueue on the 0.27% of calls that need it, so startup latency is
+    # untouched. Residue is filed under a NON-TASK anchor -- at the level 2 the
+    # middleware declares, a pending record carrying a live task id would halt
+    # the very task whose verdict leaked.
     #
-    # The state this preserves is worth MORE than the escalation server's, not
-    # less: a lost submit_review_verdict strands a review gate (INV-6) AND
-    # destroys a reviewer's entire `issues` findings list, which is by
-    # construction text the agent cannot re-emit identically.
+    # The state this preserves is worth MORE than plan-tools', not less: a lost
+    # submit_review_verdict strands a review gate (INV-6) AND destroys a
+    # reviewer's entire `issues` findings list, which is by construction text
+    # the agent cannot re-emit identically.
     #
-    # No try/except around the delegation: the middleware invokes sinks
-    # defensively (`_call_sink` never raises and never changes the caller's
-    # outcome), and a second guard here would only hide which layer failed. A
-    # write that cannot land returns None, and the middleware's hint then tells
-    # the caller the truth rather than claiming a preservation that did not
-    # happen.
+    # No try/except around the delegation: the sink's own contract is that it
+    # never raises and never changes the caller's outcome, and the middleware's
+    # `_call_sink` is a second floor under it. A record that cannot be filed
+    # anywhere returns None, and the middleware's hint then tells the caller
+    # the truth rather than claiming a preservation that did not happen.
     mcp.add_middleware(MarkupGuardMiddleware(
         policy=RepairPolicy.FORWARD_REPAIR,
         exempt_tools=frozenset(),
         fact_sink=_emit_markup_fact,
-        escalation_sink=artifacts.write_markup_residue,
+        escalation_sink=markup_sink.make_escalation_sink(
+            worktree=artifacts.worktree,
+            spec=_MARKUP_SINK_SPEC,
+            subject_task_id=lambda: _markup_subject_task_id(artifacts),
+            last_resort=artifacts.write_markup_residue,
+        ),
     ))
 
     if role == 'judge':

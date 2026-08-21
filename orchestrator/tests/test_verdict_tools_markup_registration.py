@@ -537,3 +537,147 @@ class TestUnrepairableResidueIsPreserved:
         assert len(facts) == 1, f'expected exactly one fact, got {facts!r}'
         assert facts[0]['outcome'] == 'unrepairable'
         assert facts[0]['tool'] == 'submit_review_verdict'
+
+
+# ---------------------------------------------------------------------------
+# The residue channel is the SHARED one (task 3690 review follow-up)
+# ---------------------------------------------------------------------------
+
+
+class TestVerdictToolsResidueChannelIsShared:
+    """The sink files into the real escalation queue, not a doomed worktree file.
+
+    The first cut of this leaf wired ``escalation_sink`` straight to
+    ``TaskArtifacts.write_markup_residue``, which lands under the task
+    worktree — a root the orchestrator destroys with
+    ``git worktree remove --force`` at teardown, and which no watcher ever
+    reads. These pin the corrected wiring: the queued escalation is the primary
+    channel, and the worktree file is only the floor beneath a queue that
+    cannot be opened.
+    """
+
+    def test_spec_declares_verdict_tools_own_anchors(self):
+        """Not plan-tools' anchors, and not the middleware's defaults."""
+        from orchestrator.mcp import plan_tools, verdict_tools
+
+        spec = verdict_tools._MARKUP_SINK_SPEC
+        assert spec.server_label == 'verdict-tools'
+        assert spec.residue_anchor_task_id == 'verdict-tools-markup-residue'
+        assert spec.storm_anchor_task_id == 'verdict-tools-markup-storm'
+        # Distinct from plan-tools', so a reader can tell whose boundary spoke,
+        # and so one server's open storm record cannot dedup the other's away.
+        assert spec.residue_anchor_task_id != plan_tools._MARKUP_RESIDUE_ANCHOR_TASK_ID
+        assert spec.storm_anchor_task_id != plan_tools._MARKUP_STORM_ANCHOR_TASK_ID
+        # A NON-TASK anchor: at the level 2 the middleware declares, a pending
+        # record under a live task id would halt the task whose verdict leaked.
+        assert not spec.residue_anchor_task_id.isdigit()
+
+    def test_residue_is_queued_as_an_escalation_not_dropped_in_the_worktree(
+        self, tmp_path,
+    ):
+        """The primary channel is the queue, and the fallback is NOT taken."""
+        import asyncio
+
+        from orchestrator.mcp import markup_sink, verdict_tools
+
+        submitted: list[Any] = []
+        fell_back: list[dict[str, Any]] = []
+
+        class _Queue:
+            def make_id(self, anchor: str) -> str:
+                return f'esc-{anchor}-1'
+
+            def get_by_task(self, anchor: str, status: str = '') -> list[Any]:
+                return []
+
+            def submit(self, esc: Any) -> str:
+                submitted.append(esc)
+                return esc.id
+
+        from escalation.models import Escalation
+
+        sink = markup_sink.make_escalation_sink(
+            worktree=tmp_path,
+            spec=verdict_tools._MARKUP_SINK_SPEC,
+            subject_task_id=lambda: '3690',
+            resolve_root=lambda worktree: tmp_path,
+            open_channel=lambda root: (Escalation, _Queue()),
+            last_resort=lambda record: fell_back.append(record) or 'residue.json',
+        )
+        record = {
+            'error_type': markup_sink.MARKUP_RESIDUE_ERROR_TYPE,
+            'tool': 'submit_review_verdict',
+            'field': 'issues',
+            'category': 'mcp_markup_residue',
+            'summary': 'unrepairable markup',
+            'owner': 'l2-escalation-watcher',
+            'level': 2,
+            'raw_value': 'THE ONLY SURVIVING COPY',
+        }
+        esc_id = asyncio.run(sink(record))
+
+        assert esc_id == 'esc-verdict-tools-markup-residue-1'
+        assert not fell_back, (
+            'the worktree-local writer is the LAST RESORT — taking it while '
+            'the queue is healthy is the doomed-storage bug this test pins'
+        )
+        assert len(submitted) == 1
+        filed = submitted[0]
+        assert filed.task_id == 'verdict-tools-markup-residue'
+        assert filed.agent_role == 'verdict-tools-markup-guard'
+        # INV-7: the middleware owns the vocabulary; the sink re-decides none of it.
+        assert filed.category == 'mcp_markup_residue'
+        assert filed.level == 2
+        # The subject rides in the summary, because the task_id is the anchor.
+        assert filed.summary.startswith('[3690] ')
+        # ...and the payload survives verbatim, which is the whole point.
+        assert 'THE ONLY SURVIVING COPY' in filed.detail
+        assert "owner='l2-escalation-watcher'" in filed.detail
+        assert 'verdict-tools' in filed.detail
+
+    def test_worktree_file_is_the_floor_when_the_queue_cannot_be_opened(
+        self, tmp_path,
+    ):
+        """Strictly better than losing the payload; strictly worse than a queue."""
+        import asyncio
+
+        from orchestrator.artifacts import TaskArtifacts
+        from orchestrator.mcp import markup_sink, verdict_tools
+
+        artifacts = TaskArtifacts(tmp_path)
+        artifacts.root.mkdir(parents=True, exist_ok=True)
+        sink = markup_sink.make_escalation_sink(
+            worktree=tmp_path,
+            spec=verdict_tools._MARKUP_SINK_SPEC,
+            subject_task_id=lambda: '3690',
+            resolve_root=lambda worktree: tmp_path,
+            open_channel=lambda root: None,
+            last_resort=artifacts.write_markup_residue,
+        )
+        locator = asyncio.run(sink({
+            'error_type': markup_sink.MARKUP_RESIDUE_ERROR_TYPE,
+            'tool': 'submit_review_verdict',
+            'field': 'issues',
+            'raw_value': 'THE ONLY SURVIVING COPY',
+        }))
+        assert locator, 'a queue outage must not silently destroy the payload'
+        # A bare filename, resolved against the artifacts root it was written to.
+        assert 'THE ONLY SURVIVING COPY' in (artifacts.root / locator).read_text()
+
+    def test_a_sink_that_can_reach_nothing_returns_none_rather_than_lying(
+        self, tmp_path,
+    ):
+        """The refusal hint must never promise a preservation that did not happen."""
+        import asyncio
+
+        from orchestrator.mcp import markup_sink, verdict_tools
+
+        sink = markup_sink.make_escalation_sink(
+            worktree=tmp_path,
+            spec=verdict_tools._MARKUP_SINK_SPEC,
+            subject_task_id=lambda: '3690',
+            resolve_root=lambda worktree: None,
+            open_channel=lambda root: None,
+            last_resort=None,
+        )
+        assert asyncio.run(sink({'error_type': 'mcp_markup_unrepairable'})) is None
