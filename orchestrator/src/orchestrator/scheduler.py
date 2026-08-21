@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import math
+import random
 import re
 import time
 from collections import deque
@@ -521,6 +522,63 @@ def is_transient_api_requeue(
     if m is None:
         return False
     return is_server_error_status(int(m.group(1)))
+
+
+def transient_requeue_cooldown(
+    n: int,
+    *,
+    base_secs: float,
+    cap_secs: float,
+    rng: Callable[[float, float], float] | None = None,
+) -> tuple[float, float]:
+    """Return ``(armed_secs, envelope_secs)`` for the *n*-th transient requeue.
+
+    PRD ``plans/server-side-api-error-handling-prd.md`` contract C3 (task
+    3317, resolved decision 7)::
+
+        envelope(n) = min(cap_secs, base_secs * 2**(n - 1))
+        armed       = U(envelope / 2, envelope)          # equal jitter
+
+    With the shipped defaults (base 30.0 / cap 900.0) the envelope walks
+    30 → 60 → 120 → 240 → 480 → 900 and then stays pinned at the cap.  This
+    replaces the flat ``requeue_cooldown_secs`` for requeues classified
+    transient by :func:`is_transient_api_requeue` ONLY; a genuine requeue
+    keeps the flat cooldown.  Origin incident: the 2026-07-29 provider
+    outage, where a flat 30s retry produced 67 starts in one half-hour
+    bucket.
+
+    The jitter is EQUAL jitter — the draw floor is ``envelope / 2``, never
+    zero — so the arming schedule is monotone-nondecreasing in *n*
+    regardless of how the draws land, while still decorrelating a fleet of
+    tasks that all began retrying against the same provider at the same
+    moment.  *n* is clamped to ``>= 1``, so a degenerate count can only
+    degrade toward a full base cooldown, never toward a hot loop.
+
+    Sibling implementation of the same idiom:
+    :func:`orchestrator.fm_retry.fm_retry_backoffs`.  The two are
+    deliberately NOT merged — this one is single-step and returns its
+    envelope for observability (the scheduler stamps it into the state
+    snapshot), that one builds a whole budget-spanning schedule and clamps
+    its final sleep to the remaining window.
+
+    Args:
+        n: The task's transient requeue count at arming (post-increment,
+            so the first transient requeue is ``n=1``).
+        base_secs: First-step cooldown / exponential base.
+        cap_secs: Per-step ceiling; also the answer when ``base > cap``.
+        rng: Injectable ``(lo, hi) -> float`` draw, defaulting to
+            ``random.uniform``.  Tests inject a boundary function
+            (``lambda lo, hi: hi``) for exact assertions — the same seam
+            ``fm_retry_backoffs`` exposes.
+
+    Returns:
+        ``(armed_secs, envelope_secs)`` — the jittered cooldown to arm, and
+        the un-jittered envelope it was drawn from.
+    """
+    uniform = rng or random.uniform
+    exp = max(1, int(n))
+    envelope = min(cap_secs, base_secs * (2 ** (exp - 1)))
+    return uniform(envelope / 2, envelope), envelope
 
 
 @dataclass(frozen=True)
