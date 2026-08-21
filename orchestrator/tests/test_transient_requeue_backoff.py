@@ -19,7 +19,8 @@ from __future__ import annotations
 
 import pytest
 
-from orchestrator.scheduler import transient_requeue_cooldown
+from orchestrator.config import OrchestratorConfig
+from orchestrator.scheduler import Scheduler, transient_requeue_cooldown
 
 # Contract C3 defaults, and the closed-form envelope they produce.  Every
 # assertion below is exact arithmetic — no numeric tolerance guesswork.
@@ -27,6 +28,23 @@ BASE = 30.0
 CAP = 900.0
 # n:                       1     2      3      4      5      6
 ENVELOPES = [30.0, 60.0, 120.0, 240.0, 480.0, 900.0]
+
+
+def _requeue(scheduler: Scheduler, task_id: str, **kw) -> int:
+    """Call ``record_requeue`` with the boilerplate report fields filled in.
+
+    Defaults to a TRANSIENT requeue (``reason`` carries the 5xx marker);
+    pass ``reason='verify failed', api_error_status=None`` for a genuine one.
+    """
+    return scheduler.record_requeue(
+        task_id,
+        phase=kw.pop('phase', 'execute'),
+        reason=kw.pop('reason', 'agent API error: HTTP 529'),
+        detail=kw.pop('detail', ''),
+        run_id=kw.pop('run_id', 'run-1'),
+        cost_usd=kw.pop('cost_usd', 0.0),
+        **kw,
+    )
 
 
 class TestTransientRequeueCooldownFormula:
@@ -130,3 +148,123 @@ class TestTransientRequeueCooldownFormula:
         )
         assert envelope == 20.0
         assert armed == 20.0
+
+
+class TestPendingTransientCooldownStamp:
+    """The consume-once stamp that tells ``release`` THIS requeue was transient.
+
+    PRD open question 1.  ``record_requeue`` already runs strictly before
+    ``Scheduler.release`` in ``Harness._run_slot``'s finally block, so the
+    cumulative ``_transient_requeue_counts`` value is post-increment by the
+    time arming happens — but the count alone cannot say whether *this*
+    requeue was transient.  A task with prior transients that then requeues
+    GENUINELY would read a non-zero count and wrongly get a backoff,
+    violating boundary row 4's "genuine requeue stays flat 30s".
+    ``_pending_transient_cooldown`` closes that gap: written only on the
+    transient route, popped unconditionally by ``release``.
+    """
+
+    def _scheduler(self) -> Scheduler:
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        scheduler.finish_startup()
+        return scheduler
+
+    def test_fresh_scheduler_has_no_stamps(self):
+        assert self._scheduler()._pending_transient_cooldown == {}
+
+    def test_transient_requeue_stamps_the_post_increment_count(self):
+        """The stamp equals ``transient_requeue_count`` AFTER the call.
+
+        Pinned together so the two can never drift — the stamp IS the ``n``
+        the backoff envelope is computed from.
+        """
+        scheduler = self._scheduler()
+        _requeue(scheduler, 'T1', api_error_status=529)
+        assert scheduler._pending_transient_cooldown['T1'] == 1
+        assert scheduler.transient_requeue_count('T1') == 1
+
+        _requeue(scheduler, 'T1', api_error_status=529)
+        assert scheduler._pending_transient_cooldown['T1'] == 2
+        assert scheduler.transient_requeue_count('T1') == 2
+
+    def test_legacy_marker_route_also_stamps(self):
+        """The stamp is keyed off the SAME is_transient_api_requeue decision.
+
+        A reason-marker-only transient (no structured status yet — the phases
+        that produce the field land in sibling PRD tasks) must stamp too, or
+        the stamp would amount to a second, divergent classifier.
+        """
+        scheduler = self._scheduler()
+        _requeue(
+            scheduler, 'T1',
+            reason='agent API error: HTTP 503', api_error_status=None,
+        )
+        assert scheduler._pending_transient_cooldown['T1'] == 1
+
+    def test_genuine_requeue_leaves_no_stamp(self):
+        scheduler = self._scheduler()
+        _requeue(scheduler, 'G1', reason='verify failed', api_error_status=None)
+        assert 'G1' not in scheduler._pending_transient_cooldown
+
+    def test_non_counting_requeue_leaves_no_stamp(self):
+        """Route 1 (counts_against_cap=False) precedence is preserved.
+
+        A history-only requeue moves NEITHER counter, so it must not arm a
+        backoff either — even when it also looks transient.
+        """
+        scheduler = self._scheduler()
+        _requeue(
+            scheduler, 'N1', api_error_status=529, counts_against_cap=False,
+        )
+        assert 'N1' not in scheduler._pending_transient_cooldown
+        assert scheduler.transient_requeue_count('N1') == 0
+
+    def test_release_requeued_true_consumes_the_stamp(self):
+        scheduler = self._scheduler()
+        _requeue(scheduler, 'T1', api_error_status=529)
+        scheduler.release('T1', requeued=True)
+        assert 'T1' not in scheduler._pending_transient_cooldown
+
+    def test_release_requeued_false_also_consumes_the_stamp(self):
+        """The cap-exhaust shape (``requeued=False``) must not leave residue.
+
+        ``_apply_retry_cap`` records the requeue and THEN discovers the cap is
+        exhausted, releasing with ``requeued=False``.  A stamp left behind
+        would leak into whatever armed next.
+        """
+        scheduler = self._scheduler()
+        _requeue(scheduler, 'T1', api_error_status=529)
+        scheduler.release('T1', requeued=False)
+        assert 'T1' not in scheduler._pending_transient_cooldown
+
+    def test_clear_requeue_count_drops_the_stamp(self):
+        """DONE / cap-exhaust reset clears the stamp alongside the counters."""
+        scheduler = self._scheduler()
+        _requeue(scheduler, 'T1', api_error_status=529)
+        scheduler.clear_requeue_count('T1')
+        assert 'T1' not in scheduler._pending_transient_cooldown
+        assert scheduler.transient_requeue_count('T1') == 0
+
+    def test_stamp_cannot_leak_into_a_later_genuine_arming(self):
+        """Leak regression — the whole reason the stamp is consume-once.
+
+        transient -> arm -> GENUINE -> arm.  At the second arming no stamp may
+        be present, or the genuine requeue would inherit a backoff.
+        """
+        scheduler = self._scheduler()
+        _requeue(scheduler, 'T1', api_error_status=529)
+        scheduler.release('T1', requeued=True)
+
+        _requeue(scheduler, 'T1', reason='verify failed', api_error_status=None)
+        assert 'T1' not in scheduler._pending_transient_cooldown, (
+            'a consumed stamp must not reappear for a genuine requeue'
+        )
+
+    def test_stamps_are_per_task(self):
+        scheduler = self._scheduler()
+        _requeue(scheduler, 'T1', api_error_status=529)
+        _requeue(scheduler, 'T2', api_error_status=500)
+        _requeue(scheduler, 'T2', api_error_status=500)
+        assert scheduler._pending_transient_cooldown == {'T1': 1, 'T2': 2}
+        scheduler.release('T1', requeued=True)
+        assert scheduler._pending_transient_cooldown == {'T2': 2}
