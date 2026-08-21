@@ -4928,25 +4928,51 @@ def _numbered(prefix: str, count: int) -> str:
     return ''.join(f'{prefix}_{i:05d} = {i}\n' for i in range(count))
 
 
-async def _seed_on_main(repo: Path, files: dict[str, str], message: str) -> str:
+async def _seed_on_main(
+    repo: Path, files: dict[str, str | bytes], message: str,
+) -> str:
     """Write *files* and commit them straight to main (pre-branch baseline)."""
     for name, content in files.items():
         path = repo / name
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content)
+        if isinstance(content, bytes):
+            path.write_bytes(content)
+        else:
+            path.write_text(content)
     return await _commit_all(repo, message)
 
 
-async def _land_branch(repo: Path, task_id: str, files: dict[str, str]) -> str:
-    """Create task/<id> off main, write *files*, merge --no-ff, return merge sha."""
+async def _land_branch(
+    repo: Path,
+    task_id: str,
+    files: dict[str, str | bytes] | None = None,
+    *,
+    deletes: tuple[str, ...] = (),
+    renames: tuple[tuple[str, str], ...] = (),
+) -> str:
+    """Create task/<id> off main, mutate the tree, merge --no-ff, return merge sha.
+
+    *files* values may be ``bytes`` to write a binary blob.  *deletes* and
+    *renames* exist because the vacuous cases (task 3116 b3) are defined by
+    having no added lines at all, which a write-only helper cannot express.
+    """
     rc, _, err = await _run(
         ['git', 'checkout', '-b', f'task/{task_id}', 'main'], cwd=repo,
     )
     assert rc == 0, f'branch create failed: {err}'
-    for name, content in files.items():
+    for old_path, new_path in renames:
+        rc, _, err = await _run(['git', 'mv', old_path, new_path], cwd=repo)
+        assert rc == 0, f'git mv {old_path} -> {new_path} failed: {err}'
+    for name in deletes:
+        rc, _, err = await _run(['git', 'rm', '-q', name], cwd=repo)
+        assert rc == 0, f'git rm {name} failed: {err}'
+    for name, content in (files or {}).items():
         path = repo / name
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content)
+        if isinstance(content, bytes):
+            path.write_bytes(content)
+        else:
+            path.write_text(content)
     await _commit_all(repo, f'work for task {task_id}')
     rc, _, err = await _run(['git', 'checkout', 'main'], cwd=repo)
     assert rc == 0, f'checkout main failed: {err}'
@@ -5216,6 +5242,231 @@ class TestCommitEffectSurvival:
         assert _EFFECT_SURVIVAL_AGGREGATE_THRESHOLD == 0.98
         assert _EFFECT_SURVIVAL_PER_FILE_THRESHOLD == 0.90
         assert _EFFECT_SURVIVAL_PER_FILE_MIN_ADDED_LINES == 25
+
+
+@pytest.mark.asyncio
+class TestCommitEffectSurvivalVacuousCases:
+    """ZERO-ADDED-LINES deliverables must not be waved through (task 3116 b3).
+
+    An added-lines-survive predicate is TRIVIALLY TRUE for a branch that added
+    no lines, so without a dedicated arm the detector silently becomes a NO-OP
+    for a whole class of deliverables: pure deletions, file removals, renames,
+    binaries, mode changes.  The amendment's words for that outcome are "the
+    fix is a green light that proves nothing".
+
+    The full corpus puts this class at 0.53% of merges (15 of 2822) — rare,
+    but a silent always-True for a deletion-shaped deliverable is exactly the
+    task-1175 clobber this gate exists to prevent, so rarity is not a reason
+    to skip it.  A deletion that gets reverted is a REAL revert and must be
+    caught; that is the whole point of the gate.
+
+    Each arm is decided by the mechanism that actually applies to its shape:
+
+        deleted path      still absent at main?          (presence)
+        rename / binary   same blob oid at main?         (blob comparison)
+        removed-only text removed lines still absent?    (line-set)
+
+    Removed-line absence is used HERE AND ONLY HERE.  It is deliberately NOT a
+    global conjunct on the survival path: corpus-wide only 73.0% of removed
+    lines are still absent, and motivating merge 3640 has 18 of its 45 removed
+    lines literally present again at main by short-common-line coincidence, so
+    a global conjunct would reject a case this task exists to fix (b4).
+    """
+
+    async def test_pure_line_deletion_holds_then_is_restored(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """A branch that ONLY removes lines: zero added lines throughout, so
+        this can be decided only by whether the removed lines are still gone.
+
+        Holding -> present.  Restored by a later commit -> absent: putting
+        back what the deliverable deleted is a genuine revert.
+        """
+        await _seed_on_main(
+            git_repo, {'mod.py': _numbered('base', 10)}, 'seed mod',
+        )
+        keep = ''.join(
+            line + '\n' for line in _numbered('base', 10).split('\n')[:4] if line
+        )
+        merge_sha = await _land_branch(git_repo, '7001', {'mod.py': keep})
+
+        probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+        assert probe.present is True, 'the deletion still holds at main'
+        assert probe.aggregate_survival is None, (
+            'no added lines were measured, so no survival ratio may be claimed'
+        )
+
+        (git_repo / 'mod.py').write_text(_numbered('base', 10))
+        await _commit_all(git_repo, 'restore the deleted lines')
+
+        probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+        assert probe.present is False
+        assert probe.failure == 'vacuous_effect_absent'
+        assert probe.vacuous_paths == ('mod.py',)
+
+    async def test_file_deletion_holds_then_is_resurrected(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """A branch whose deliverable IS a file removal.  Zero added lines, so
+        the pre-b3 code measured nothing at all here.
+        """
+        await _seed_on_main(
+            git_repo, {'obsolete.py': _numbered('old', 12)}, 'seed obsolete',
+        )
+        merge_sha = await _land_branch(git_repo, '7002', deletes=('obsolete.py',))
+
+        probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+        assert probe.present is True, 'the file is still gone at main'
+
+        (git_repo / 'obsolete.py').write_text(_numbered('old', 12))
+        await _commit_all(git_repo, 'resurrect the deleted file')
+
+        probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+        assert probe.present is False
+        assert probe.failure == 'vacuous_effect_absent'
+        assert 'obsolete.py' in probe.vacuous_paths
+
+    async def test_pure_rename_resolves_by_blob_not_line_set(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """A content-preserving rename.  Line sets cannot decide this — the
+        lines are identical on both sides of the move, so a line-membership
+        test says "survived" even after the rename is undone.  Only the
+        PRESENCE of the old path and the blob identity of the new one can
+        tell the difference, which is what the arm must use.
+        """
+        await _seed_on_main(
+            git_repo, {'old_name.py': _numbered('body', 30)}, 'seed old_name',
+        )
+        merge_sha = await _land_branch(
+            git_repo, '7003', renames=(('old_name.py', 'new_name.py'),),
+        )
+
+        probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+        assert probe.present is True
+        assert probe.aggregate_survival is None
+
+        rc, _, err = await _run(
+            ['git', 'mv', 'new_name.py', 'old_name.py'], cwd=git_repo,
+        )
+        assert rc == 0, f'rename revert failed: {err}'
+        await _commit_all(git_repo, 'revert the rename')
+
+        probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+        assert probe.present is False, (
+            'the rename was undone — identical line CONTENT at the old path '
+            'must not read as the effect surviving'
+        )
+        assert probe.failure == 'vacuous_effect_absent'
+
+    async def test_binary_blob_never_crashes_and_never_fakes_survival(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """A binary deliverable.  ``git diff --unified=0`` emits "Binary files
+        ... differ" and no + lines, so line survival is meaningless and must
+        not be fabricated as 1.0.  Decoding the blob would raise
+        UnicodeDecodeError inside _run, so the arm must never attempt it.
+        """
+        await _seed_on_main(
+            git_repo, {'asset.bin': b'\x00\x01\x02seed'}, 'seed asset',
+        )
+        merge_sha = await _land_branch(
+            git_repo, '7004', {'asset.bin': b'\x00\x01\x02delivered\xff'},
+        )
+
+        probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+        assert probe.present is True
+        assert probe.aggregate_survival is None, (
+            'a binary contributes no measurable lines — reporting a survival '
+            'ratio here would be a number that was never computed'
+        )
+
+        (git_repo / 'asset.bin').write_bytes(b'\x00\x01\x02clobbered\xfe')
+        await _commit_all(git_repo, 'clobber the binary deliverable')
+
+        probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+        assert probe.present is False
+        assert probe.failure == 'vacuous_effect_absent'
+        assert 'asset.bin' in probe.vacuous_paths
+
+    async def test_vacuous_arm_and_text_arm_cannot_mask_each_other(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """MIXED branch — a text file with real added lines PLUS a deleted
+        file.  Neither arm may override the other:
+
+        - a surviving deletion must not rescue reverted text, and
+        - surviving text must not rescue a resurrected deletion.
+
+        Both directions are exercised, because a conservative-looking
+        implementation can easily get one right and the other wrong.
+        """
+        await _seed_on_main(
+            git_repo,
+            {'obsolete.py': _numbered('old', 12), 'impl.py': _numbered('base', 5)},
+            'seed obsolete and impl',
+        )
+        merge_sha = await _land_branch(
+            git_repo, '7005',
+            {'impl.py': _numbered('base', 5) + _numbered('feature', 40)},
+            deletes=('obsolete.py',),
+        )
+
+        probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+        assert probe.present is True, 'both arms pass immediately after landing'
+
+        # Direction 1: text reverted, deletion still holding.
+        (git_repo / 'impl.py').write_text(_numbered('base', 5))
+        revert_text = await _commit_all(git_repo, 'revert the text deliverable')
+
+        probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+        assert probe.present is False, (
+            'a surviving deletion must NOT mask reverted text'
+        )
+        assert probe.failure == 'effect_not_survived'
+
+        # Direction 2: text restored, deletion resurrected.
+        rc, _, err = await _run(
+            ['git', 'revert', '--no-edit', revert_text], cwd=git_repo,
+        )
+        assert rc == 0, f'revert of the revert failed: {err}'
+        (git_repo / 'obsolete.py').write_text(_numbered('old', 12))
+        await _commit_all(git_repo, 'resurrect the deleted file')
+
+        probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+        assert probe.present is False, (
+            'surviving text must NOT mask a resurrected deletion'
+        )
+        assert probe.failure == 'vacuous_effect_absent'
+        assert 'obsolete.py' in probe.vacuous_paths
+
+    async def test_probe_distinguishes_a_vacuous_decision_from_a_survival_one(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """The probe is rendered verbatim into the escalation a human reads,
+        so it must never present a survival ratio it did not compute.
+
+        An all-vacuous branch reports aggregate_survival None (undefined, not
+        0.0 and not 1.0 — both would be assertions the code cannot support),
+        names the paths the vacuous arm decided, and uses a failure code
+        distinct from the survival path's 'effect_not_survived'.
+        """
+        await _seed_on_main(
+            git_repo, {'obsolete.py': _numbered('old', 12)}, 'seed obsolete',
+        )
+        merge_sha = await _land_branch(git_repo, '7006', deletes=('obsolete.py',))
+        (git_repo / 'obsolete.py').write_text(_numbered('old', 12))
+        await _commit_all(git_repo, 'resurrect the deleted file')
+
+        probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+
+        assert probe.present is False
+        assert probe.failure == 'vacuous_effect_absent'
+        assert probe.failure != 'effect_not_survived'
+        assert probe.aggregate_survival is None
+        assert probe.added_lines_total == 0
+        assert probe.worst_guarded_path is None
+        assert probe.vacuous_paths == ('obsolete.py',)
 
 
 @pytest.mark.asyncio
