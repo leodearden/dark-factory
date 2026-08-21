@@ -21,10 +21,11 @@ idiom keeps exercising the real (now-shared) helper logic.
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from orchestrator.delivered_checks import DeliveredCheckResult
 from orchestrator.git_ops import CommitEffectProbe
 from orchestrator.landing_evidence import (
     LandingEvidenceVerdict,
@@ -796,3 +797,521 @@ class TestFileUnattributedLandingEscalationDedup:
         )
 
         queue.submit.assert_not_called()
+
+
+def _grep_check(
+    name: str = 'cap-x', *, pattern: str = 'def new_capability', expect: str = 'present',
+) -> dict[str, object]:
+    """A minimal, VALID ``metadata.delivered_checks`` grep entry.
+
+    Kept schema-valid (``shared.capability_manifest.DeliveredCheckMeta``)
+    rather than a bare stub: the differential hands these straight to
+    ``run_delivered_check``, which re-validates, so an invalid fixture would
+    degrade to ERRORED and silently test nothing.
+    """
+    return {'name': name, 'kind': 'grep', 'pattern': pattern, 'expect': expect}
+
+
+def _script_check(name: str = 'cap-script') -> dict[str, object]:
+    """A VALID script-kind entry — the 2-of-458 carve-out in the live store."""
+    return {'name': name, 'kind': 'script', 'script': 'scripts/check.sh', 'timeout_secs': 5}
+
+
+def _check_runner(outcomes):
+    """Return a (stub_run_delivered_check, calls) pair.
+
+    *outcomes* maps ``ref`` -> :class:`DeliveredCheckResult`, or is a callable
+    ``(check, ref) -> DeliveredCheckResult`` for per-check control.  ``calls``
+    records ``(check name, ref)`` in order, which is what lets a test assert
+    the differential probed the PARENT, the CITATION and MAIN — a static pass
+    at main alone proves nothing, so the sequence IS the signal.
+    """
+    calls: list[tuple[str, str]] = []
+
+    async def _stub(check, *, project_root, ref='main', runner=None):
+        calls.append((check['name'], ref))
+        if callable(outcomes):
+            return outcomes(check, ref)
+        return outcomes[ref]
+
+    return _stub, calls
+
+
+@pytest.mark.asyncio
+class TestValidateLandingEvidenceDeliveredChecksDifferential:
+    """The delivered-checks DIFFERENTIAL — the SECOND accept path (task 3116).
+
+    Threshold line survival recovers most of the false-positive class, but it
+    is still a heuristic over line sets.  The differential is orthogonal
+    positive evidence: run the task's own declared capability check at the
+    citation's PRE-MERGE PARENT, at the citation, and at current main.  A
+    check that was FALSE before this commit, TRUE at it, and TRUE now proves
+    THIS commit made the capability true — which no amount of line-set decay
+    can argue with.
+
+    THE THREE-PROBE SEQUENCE IS THE SIGNAL.  A check that merely passes at
+    main proves nothing: the capability might have arrived by any other route,
+    or have been true all along.  Every test here asserts the refs.
+
+    THE CRITICAL RULE IS UPGRADE-ONLY.  The live store's checks are not
+    trustworthy input: they rot (a path is renamed and the check fails
+    forever), they are written too broad (already true before the merge), and
+    2 of 458 are script-kind, which takes no ref at all.  So a failing,
+    erroring or nonsensical differential must degrade to NO SIGNAL and leave
+    the survival verdict exactly as it found it.  That is enforced
+    STRUCTURALLY — the differential is only ever consulted inside the reject
+    branch — not by care.
+    """
+
+    @staticmethod
+    def _rejecting_git_ops(candidate_sha: str) -> MagicMock:
+        """A git_ops whose survival check REJECTS — the only path the
+        differential is ever consulted on.
+        """
+        return _git_ops(
+            citation=None,
+            is_ancestor_map={},
+            effect_present=False,
+            effect_probe=CommitEffectProbe(
+                present=False,
+                diverged_paths=('shared/manifest.py',),
+                anchor_sha=candidate_sha,
+                failure='effect_not_survived',
+                aggregate_survival=0.42,
+            ),
+        )
+
+    async def test_differential_upgrades_a_survival_rejection(self) -> None:
+        """(a) FAIL at the parent, PASS at the citation, PASS at main ->
+        a verdict survival REJECTED is ACCEPTED.
+
+        The three refs are asserted in order because establishing that THIS
+        merge made the capability true is the entire signal.
+        """
+        sha = 'c' * 40
+        git_ops = self._rejecting_git_ops(sha)
+        stub, calls = _check_runner({
+            f'{sha}^1': DeliveredCheckResult.FAILED,
+            sha: DeliveredCheckResult.DELIVERED,
+            'main': DeliveredCheckResult.DELIVERED,
+        })
+
+        with patch('orchestrator.delivered_checks.run_delivered_check', stub):
+            verdict = await validate_landing_evidence(
+                git_ops, '42', 'task/42', branch_tip_sha=None, candidate_sha=sha,
+                delivered_checks=[_grep_check()],
+            )
+
+        assert verdict.accepted is True
+        assert verdict.reason == 'ok'
+        assert verdict.evidence_sha == sha
+        # The survival check ran and rejected FIRST — this is a rescue of its
+        # verdict, not a bypass of it.
+        git_ops.commit_effect_present_in_main.assert_awaited_once_with(sha)
+        assert calls == [
+            ('cap-x', f'{sha}^1'), ('cap-x', sha), ('cap-x', 'main'),
+        ], f'the differential must probe parent, citation and main: {calls}'
+        assert verdict.probe['delivered_checks_state'] == 'evaluated'
+        assert verdict.probe['delivered_checks_outcome'] == 'confirmed'
+
+    async def test_differential_is_never_consulted_when_survival_accepts(self) -> None:
+        """(b) UPGRADE-ONLY, enforced structurally: when survival ACCEPTS, the
+        differential does not run at all, so no rotten check can downgrade it.
+
+        Asserting zero runner calls (not merely an accepted verdict) is what
+        pins the structure — a differential wired as an additional conjunct
+        would still call the runner here.
+        """
+        sha = 'c' * 40
+        git_ops = _git_ops(citation=None, is_ancestor_map={}, effect_present=True)
+        stub, calls = _check_runner({
+            f'{sha}^1': DeliveredCheckResult.DELIVERED,
+            sha: DeliveredCheckResult.FAILED,
+            'main': DeliveredCheckResult.FAILED,
+        })
+
+        with patch('orchestrator.delivered_checks.run_delivered_check', stub):
+            verdict = await validate_landing_evidence(
+                git_ops, '42', 'task/42', branch_tip_sha=None, candidate_sha=sha,
+                delivered_checks=[_grep_check()],
+            )
+
+        assert verdict.accepted is True
+        assert calls == [], (
+            f'a check that fails at main must not be able to reach an accepted '
+            f'verdict at all; saw {calls}'
+        )
+
+    @pytest.mark.parametrize(
+        ('rot', 'outcomes'),
+        [
+            (
+                'fails at main (the capability is genuinely gone, or the check rotted)',
+                {
+                    'parent': DeliveredCheckResult.FAILED,
+                    'citation': DeliveredCheckResult.DELIVERED,
+                    'main': DeliveredCheckResult.FAILED,
+                },
+            ),
+            (
+                'names a path that no longer exists — errors forever',
+                {
+                    'parent': DeliveredCheckResult.ERRORED,
+                    'citation': DeliveredCheckResult.ERRORED,
+                    'main': DeliveredCheckResult.ERRORED,
+                },
+            ),
+            (
+                'pattern so broad it was already true before the merge',
+                {
+                    'parent': DeliveredCheckResult.DELIVERED,
+                    'citation': DeliveredCheckResult.DELIVERED,
+                    'main': DeliveredCheckResult.DELIVERED,
+                },
+            ),
+            (
+                'never true on any ref',
+                {
+                    'parent': DeliveredCheckResult.FAILED,
+                    'citation': DeliveredCheckResult.FAILED,
+                    'main': DeliveredCheckResult.FAILED,
+                },
+            ),
+        ],
+    )
+    async def test_rotten_differentials_degrade_to_no_signal(
+        self, rot: str, outcomes: dict[str, DeliveredCheckResult],
+    ) -> None:
+        """(b) Every rotten shape the live store actually contains leaves the
+        survival REJECTION exactly as it was — never a harder rejection, never
+        an exception, always an explicit NO SIGNAL in the probe.
+        """
+        sha = 'c' * 40
+        git_ops = self._rejecting_git_ops(sha)
+        by_ref = {
+            f'{sha}^1': outcomes['parent'],
+            sha: outcomes['citation'],
+            'main': outcomes['main'],
+        }
+        stub, calls = _check_runner(by_ref)
+
+        with patch('orchestrator.delivered_checks.run_delivered_check', stub):
+            verdict = await validate_landing_evidence(
+                git_ops, '42', 'task/42', branch_tip_sha=None, candidate_sha=sha,
+                delivered_checks=[_grep_check()],
+            )
+
+        assert verdict.accepted is False, f'rot ({rot}) must not flip the verdict'
+        assert verdict.reason == 'effect_absent', 'the reason must be unchanged'
+        assert verdict.probe['delivered_checks_outcome'] == 'no_signal'
+        assert calls, 'the differential must actually have been attempted'
+
+    async def test_a_raising_differential_is_contained_as_no_signal(self) -> None:
+        """(b) The differential is an OPTIONAL second opinion, so it must never
+        break the gate — but it must not be swallowed either.  The failure is
+        recorded into the probe that gets rendered into the escalation.
+        """
+        sha = 'c' * 40
+        git_ops = self._rejecting_git_ops(sha)
+
+        async def _boom(check, *, project_root, ref='main', runner=None):
+            raise RuntimeError('delivered-check runner exploded')
+
+        with patch('orchestrator.delivered_checks.run_delivered_check', _boom):
+            verdict = await validate_landing_evidence(
+                git_ops, '42', 'task/42', branch_tip_sha=None, candidate_sha=sha,
+                delivered_checks=[_grep_check()],
+            )
+
+        assert verdict.accepted is False
+        assert verdict.reason == 'effect_absent'
+        assert verdict.probe['delivered_checks_outcome'] == 'no_signal'
+        assert 'delivered-check runner exploded' in str(
+            verdict.probe.get('delivered_checks_error'),
+        )
+
+    async def test_expect_absent_check_still_upgrades(self) -> None:
+        """(c) 43 of the live store's 458 checks are ``expect='absent'`` — a
+        capability whose delivery is a REMOVAL.  These are exactly the
+        deletion-shaped deliverables the vacuous arm (b3) also special-cases;
+        getting both wrong at once is the failure this pins.
+
+        ``run_delivered_check`` already resolves ``expect`` into
+        DELIVERED/FAILED (for ``absent`` it is NO-match that means delivered),
+        so the differential's legs read uniformly and this layer must NOT
+        invert them a second time.
+        """
+        sha = 'c' * 40
+        git_ops = self._rejecting_git_ops(sha)
+        stub, calls = _check_runner({
+            f'{sha}^1': DeliveredCheckResult.FAILED,
+            sha: DeliveredCheckResult.DELIVERED,
+            'main': DeliveredCheckResult.DELIVERED,
+        })
+
+        with patch('orchestrator.delivered_checks.run_delivered_check', stub):
+            verdict = await validate_landing_evidence(
+                git_ops, '42', 'task/42', branch_tip_sha=None, candidate_sha=sha,
+                delivered_checks=[_grep_check('cap-removed', expect='absent')],
+            )
+
+        assert verdict.accepted is True
+        assert verdict.probe['delivered_checks_outcome'] == 'confirmed'
+        assert [ref for _name, ref in calls] == [f'{sha}^1', sha, 'main']
+
+    async def test_expect_absent_is_not_inverted_twice(self) -> None:
+        """(c), the other side: the INVERSE leg pattern (delivered at the
+        parent, failing at the citation and at main) is a capability that was
+        REMOVED by a later commit, not delivered by this one.
+
+        A second inversion applied here would read it as proof and upgrade —
+        the precise double-inversion bug this pins against.
+        """
+        sha = 'c' * 40
+        git_ops = self._rejecting_git_ops(sha)
+        stub, _calls = _check_runner({
+            f'{sha}^1': DeliveredCheckResult.DELIVERED,
+            sha: DeliveredCheckResult.FAILED,
+            'main': DeliveredCheckResult.FAILED,
+        })
+
+        with patch('orchestrator.delivered_checks.run_delivered_check', stub):
+            verdict = await validate_landing_evidence(
+                git_ops, '42', 'task/42', branch_tip_sha=None, candidate_sha=sha,
+                delivered_checks=[_grep_check('cap-removed', expect='absent')],
+            )
+
+        assert verdict.accepted is False
+        assert verdict.probe['delivered_checks_outcome'] == 'no_signal'
+
+    async def test_script_kind_contributes_no_signal_and_never_raises(self) -> None:
+        """(d) A script check execs against the LIVE CHECKOUT and takes no ref,
+        so it cannot express a differential at all.  It is skipped explicitly
+        — recorded as a carve-out, never run three times against a checkout
+        that would answer identically each time.
+        """
+        sha = 'c' * 40
+        git_ops = self._rejecting_git_ops(sha)
+        stub, calls = _check_runner({})
+
+        with patch('orchestrator.delivered_checks.run_delivered_check', stub):
+            verdict = await validate_landing_evidence(
+                git_ops, '42', 'task/42', branch_tip_sha=None, candidate_sha=sha,
+                delivered_checks=[_script_check()],
+            )
+
+        assert verdict.accepted is False
+        assert calls == [], 'a script check must not be run against a ref'
+        assert verdict.probe['delivered_checks_outcome'] == 'no_signal'
+        legs = verdict.probe['delivered_checks_legs']
+        assert len(legs) == 1
+        assert legs[0]['name'] == 'cap-script'
+        assert legs[0]['verdict'] == 'script_kind_no_signal'
+
+    async def test_a_script_check_does_not_suppress_a_greppable_one(self) -> None:
+        """(d) The carve-out is per CHECK, not per task: a task carrying both
+        kinds still gets the differential from the greppable one.
+        """
+        sha = 'c' * 40
+        git_ops = self._rejecting_git_ops(sha)
+        stub, calls = _check_runner({
+            f'{sha}^1': DeliveredCheckResult.FAILED,
+            sha: DeliveredCheckResult.DELIVERED,
+            'main': DeliveredCheckResult.DELIVERED,
+        })
+
+        with patch('orchestrator.delivered_checks.run_delivered_check', stub):
+            verdict = await validate_landing_evidence(
+                git_ops, '42', 'task/42', branch_tip_sha=None, candidate_sha=sha,
+                delivered_checks=[_script_check(), _grep_check()],
+            )
+
+        assert verdict.accepted is True
+        assert {name for name, _ref in calls} == {'cap-x'}
+
+    async def test_three_supply_states_are_distinguishable_in_probe(self) -> None:
+        """(e) THE UNWIRED HAZARD.  ``unwired`` (the parameter was never
+        passed) and ``none_declared`` (the task declares no checks) must not
+        collapse into one value: without the distinction a permanently
+        unwired call site looks exactly like a task with nothing to check, and
+        the capstone task that flips this parameter to required has no signal
+        to act on.
+        """
+        sha = 'c' * 40
+        stub, _calls = _check_runner({
+            f'{sha}^1': DeliveredCheckResult.FAILED,
+            sha: DeliveredCheckResult.DELIVERED,
+            'main': DeliveredCheckResult.DELIVERED,
+        })
+
+        unwired = await validate_landing_evidence(
+            self._rejecting_git_ops(sha), '42', 'task/42',
+            branch_tip_sha=None, candidate_sha=sha,
+        )
+        none_declared = await validate_landing_evidence(
+            self._rejecting_git_ops(sha), '42', 'task/42',
+            branch_tip_sha=None, candidate_sha=sha, delivered_checks=[],
+        )
+        with patch('orchestrator.delivered_checks.run_delivered_check', stub):
+            evaluated = await validate_landing_evidence(
+                self._rejecting_git_ops(sha), '42', 'task/42',
+                branch_tip_sha=None, candidate_sha=sha,
+                delivered_checks=[_grep_check()],
+            )
+
+        assert unwired.probe['delivered_checks_state'] == 'unwired'
+        assert none_declared.probe['delivered_checks_state'] == 'none_declared'
+        assert evaluated.probe['delivered_checks_state'] == 'evaluated'
+        assert len({
+            unwired.probe['delivered_checks_state'],
+            none_declared.probe['delivered_checks_state'],
+            evaluated.probe['delivered_checks_state'],
+        }) == 3
+
+    async def test_supply_state_is_recorded_on_accepted_verdicts_too(self) -> None:
+        """(e) The wiring state is a property of the CALL SITE, not of the
+        outcome, so it is recorded on accepts as well — otherwise the only way
+        to learn a site is unwired would be to wait for it to reject.
+        """
+        sha = 'c' * 40
+        git_ops = _git_ops(citation=None, is_ancestor_map={}, effect_present=True)
+
+        verdict = await validate_landing_evidence(
+            git_ops, '42', 'task/42', branch_tip_sha=None, candidate_sha=sha,
+        )
+
+        assert verdict.accepted is True
+        assert verdict.probe['delivered_checks_state'] == 'unwired'
+
+    async def test_discovery_mode_differential_anchors_on_the_effect_check_sha(
+        self,
+    ) -> None:
+        """DISCOVERY mode rescues identically, anchored on the sha the
+        SURVIVAL check actually ran against — the branch tip for an in-branch
+        work-commit citation — so both modes ask the same question.
+        """
+        branch = 'task/42'
+        branch_tip_sha = 'f' * 40
+        citation_sha = 'a' * 40
+        git_ops = _git_ops(
+            citation=citation_sha,
+            is_ancestor_map={(citation_sha, branch): True},
+            effect_present=False,
+            effect_probe=CommitEffectProbe(present=False, failure='effect_not_survived'),
+        )
+        stub, calls = _check_runner({
+            f'{branch_tip_sha}^1': DeliveredCheckResult.FAILED,
+            branch_tip_sha: DeliveredCheckResult.DELIVERED,
+            'main': DeliveredCheckResult.DELIVERED,
+        })
+
+        with patch('orchestrator.delivered_checks.run_delivered_check', stub):
+            verdict = await validate_landing_evidence(
+                git_ops, '42', branch, branch_tip_sha=branch_tip_sha,
+                delivered_checks=[_grep_check()],
+            )
+
+        assert verdict.accepted is True
+        assert verdict.evidence_sha == citation_sha
+        assert [ref for _name, ref in calls] == [
+            f'{branch_tip_sha}^1', branch_tip_sha, 'main',
+        ]
+
+    async def test_no_citation_reject_never_runs_the_differential(self) -> None:
+        """A missing citation is an ATTRIBUTION failure, not a decayed-effect
+        one: there is no commit to anchor a differential on, so the rescue
+        must not fire (and must not fabricate one from thin air).
+        """
+        git_ops = _git_ops(citation=None, is_ancestor_map={}, effect_present=True)
+        stub, calls = _check_runner({})
+
+        with patch('orchestrator.delivered_checks.run_delivered_check', stub):
+            verdict = await validate_landing_evidence(
+                git_ops, '42', 'task/42', branch_tip_sha=None,
+                delivered_checks=[_grep_check()],
+            )
+
+        assert verdict.accepted is False
+        assert verdict.reason == 'no_citation'
+        assert calls == []
+
+    async def test_omitting_the_parameter_preserves_the_pre_task_shape(self) -> None:
+        """(f) b6 — THE INTERFACE STAYS BINARY.  Every existing caller passes
+        no ``delivered_checks``; each must behave exactly as before, so the
+        four call-site sibling tasks can wire their own sites concurrently
+        against an unchanged contract.
+        """
+        sha = 'c' * 40
+        stub, calls = _check_runner({})
+
+        with patch('orchestrator.delivered_checks.run_delivered_check', stub):
+            accepted = await validate_landing_evidence(
+                _git_ops(citation=None, is_ancestor_map={}, effect_present=True),
+                '42', 'task/42', branch_tip_sha=None, candidate_sha=sha,
+            )
+            rejected = await validate_landing_evidence(
+                self._rejecting_git_ops(sha), '42', 'task/42',
+                branch_tip_sha=None, candidate_sha=sha,
+            )
+
+        assert isinstance(accepted, LandingEvidenceVerdict)
+        assert (accepted.accepted, accepted.reason, accepted.evidence_sha) == (
+            True, 'ok', sha,
+        )
+        assert (rejected.accepted, rejected.reason, rejected.evidence_sha) == (
+            False, 'effect_absent', None,
+        )
+        assert calls == [], 'an unwired call site must issue no check subprocesses'
+        # The effect_absent diagnostics from Part A are untouched by Part B.
+        assert rejected.probe['diverged_paths'] == ['shared/manifest.py']
+
+    def test_detail_names_the_unwired_state_explicitly(self) -> None:
+        """(e)/step-16.7 — the escalation must SAY when the second accept path
+        could not run because this call site supplies no checks.  Silently
+        omitting it would hide exactly the degradation the amendment warns
+        about: a permanently unwired site looks like a task with nothing to
+        check.
+        """
+        verdict = LandingEvidenceVerdict(
+            accepted=False, evidence_sha=None, reason='effect_absent',
+            probe={
+                'task_id': '42', 'diverged_paths': ['shared/manifest.py'],
+                'delivered_checks_state': 'unwired',
+            },
+        )
+
+        _summary, detail = format_unattributed_landing_detail('42', 'task/42', verdict)
+
+        assert 'delivered-checks differential' in detail
+        assert 'unwired' in detail
+
+    def test_detail_distinguishes_none_declared_from_unwired(self) -> None:
+        """A task that declares no checks is a TASK-AUTHORING gap; an unwired
+        call site is an ORCHESTRATOR gap.  They are fixed by different people,
+        so the escalation must not render them identically.
+        """
+        def _detail(state: str, **extra: object) -> str:
+            probe = {'task_id': '42', 'diverged_paths': [], 'delivered_checks_state': state}
+            probe.update(extra)
+            return format_unattributed_landing_detail(
+                '42', 'task/42',
+                LandingEvidenceVerdict(
+                    accepted=False, evidence_sha=None, reason='effect_absent',
+                    probe=probe,
+                ),
+            )[1]
+
+        unwired = _detail('unwired')
+        none_declared = _detail('none_declared')
+        evaluated = _detail(
+            'evaluated',
+            delivered_checks_outcome='no_signal',
+            delivered_checks_legs=[{
+                'name': 'cap-x', 'verdict': 'no_signal',
+                'parent': 'failed', 'citation': 'failed', 'main': 'failed',
+            }],
+        )
+
+        assert unwired != none_declared
+        assert 'no delivered_checks' in none_declared
+        assert 'cap-x' in evaluated
