@@ -1575,6 +1575,98 @@ class TestStaleSpawnFailureCounter:
             'a single post-reset spawn failure must not re-arm a latch the '
             'operator-driven reset had just cleared'
         )
+    # --- Only accounts that can still PRODUCE evidence may veto a clear ----
+    #
+    # Defence in depth ALONGSIDE the reset above, not instead of it. The two
+    # fix different halves and neither subsumes the other. The reset stops
+    # stale counters being CREATED — and is the only thing that can fix the
+    # premature-latch half, since at `_note_probe_spawn_failure` time the
+    # account genuinely IS blocked, so no guard narrowing could help there.
+    # The narrowed guard stops a stale counter that exists ANYWAY — reached
+    # through a future exit path that bypasses `_transition`, or a
+    # `UsageGate.__new__` fixture that assigns its fields by hand — from
+    # pinning the latch UNHEALTHY forever.
+
+    def _orphan_counter_gate(
+        self, orphan_phase: AccountPhase
+    ) -> tuple[UsageGate, AccountState, AccountState]:
+        """Gate where `a` holds an orphaned counter in *orphan_phase* and `b`,
+        CAPPED, has just armed the latch.
+
+        `a`'s count is assigned DIRECTLY, deliberately bypassing `_transition`:
+        it stands in for a counter that exists anyway, which is exactly the
+        case the reset in the sole phase writer cannot police.
+        """
+        gate = make_gate(['a', 'b'])
+        acct_a, acct_b = gate._accounts
+        acct_a.phase = orphan_phase
+        acct_a.probe_spawn_failures = _SPAWN_FAULT_THRESHOLD - 1
+
+        acct_b.capped = True
+        for _ in range(_SPAWN_FAULT_THRESHOLD):
+            gate._note_probe_spawn_failure(acct_b, _spawn_fault())
+        assert gate.probe_infra_fault is not None
+        return gate, acct_a, acct_b
+
+    def test_a_non_probing_account_cannot_veto_the_clear(self):
+        """The only account that can still spawn probes has just proven it can.
+
+        `a` is AVAILABLE: it runs neither a resume loop nor an auth re-probe,
+        so it will never spawn a probe to zero its own counter. Letting it
+        vote is what makes the latch unclearable. `probe_infra_fault`'s
+        contract is "None whenever probes CAN spawn", and an account that
+        does not probe says nothing at all about that.
+        """
+        gate, _acct_a, acct_b = self._orphan_counter_gate(AccountPhase.AVAILABLE)
+
+        gate._clear_probe_spawn_failures(acct_b)
+
+        assert gate.probe_infra_fault is None, (
+            'a non-probing account is holding the latch open on a count it '
+            'can never clear, because it will never probe again'
+        )
+
+    def test_narrowing_the_vote_mutates_nobody_else(self):
+        """Who gets a vote changes; nobody else's counter does.
+
+        The guard must not quietly become a fleet-wide zeroing pass — an
+        orphaned count stays visible for diagnosis, it just stops voting.
+        """
+        gate, acct_a, acct_b = self._orphan_counter_gate(AccountPhase.AVAILABLE)
+
+        gate._clear_probe_spawn_failures(acct_b)
+
+        assert acct_b.probe_spawn_failures == 0
+        assert acct_a.probe_spawn_failures == _SPAWN_FAULT_THRESHOLD - 1
+
+    def test_an_auth_failed_account_does_get_a_vote(self):
+        """AUTH_FAILED still probes, so its pending failures are still live.
+
+        `_reprobe_account` -> `_run_probe` runs for an auth-failed account
+        exactly as the resume loop does for a capped one. This pins the
+        narrowing at `capped or auth_failed` rather than `capped` alone —
+        dropping the auth path would take it back out of the accounting
+        surface it was deliberately joined to.
+        """
+        gate, _acct_a, acct_b = self._orphan_counter_gate(AccountPhase.AUTH_FAILED)
+
+        gate._clear_probe_spawn_failures(acct_b)
+
+        assert gate.probe_infra_fault is not None
+
+    def test_a_capped_account_still_gets_a_vote_after_the_narrowing(self):
+        """Belt and braces that the reset and the narrowing compose.
+
+        The regression control above, restated through the narrowed guard:
+        `a` is still CAPPED, still running its resume loop, and still
+        genuinely cannot spawn — so one good probe on `b` must not clear it.
+        """
+        gate, _acct_a, acct_b = self._orphan_counter_gate(AccountPhase.CAPPED)
+
+        gate._clear_probe_spawn_failures(acct_b)
+
+        assert gate.probe_infra_fault is not None
+
 
 
 @pytest.mark.asyncio
