@@ -2231,6 +2231,62 @@ class TestTransientRequeueBackoffConfig:
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         assert OrchestratorConfig().requeue_cooldown_secs == 30.0
 
+    @pytest.mark.parametrize('leaf', [
+        'transient_requeue_backoff_base_secs',
+        'transient_requeue_backoff_cap_secs',
+    ])
+    def test_backoff_leaves_are_green_tier_reloadable(self, leaf):
+        """Both knobs are hot-reloadable (green tier; PRD open question 2).
+
+        Retuning the backoff during a live provider outage is exactly when
+        an operator needs it, so a restart-only tier would make the knob
+        useless at the moment it matters.
+        """
+        assert leaf in RELOADABLE_FIELDS, (
+            f"'{leaf}' must be in RELOADABLE_FIELDS (green-tier hot-reloadable, "
+            'in the # Scheduler tuning slice alongside fairness.skip_threshold)'
+        )
+
+    def test_apply_reload_mutates_backoff_knobs_in_place(self, monkeypatch, tmp_path):
+        """apply_reload applies both leaves to the LIVE config object.
+
+        In-place mutation is what makes the green tier work without a reload
+        hook: ``Scheduler.release()`` reads ``self.config.<knob>`` at ARM
+        time, and the Scheduler holds this same object, so the next arming
+        sees the new value.
+        """
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        live = OrchestratorConfig()
+        fresh = OrchestratorConfig(
+            transient_requeue_backoff_base_secs=5.0,
+            transient_requeue_backoff_cap_secs=20.0,
+        )
+        report = apply_reload(live, fresh)
+        assert report['reloaded'] is True
+        assert report['error'] is None
+        assert report['applied'] == {
+            'transient_requeue_backoff_base_secs': {'old': 30.0, 'new': 5.0},
+            'transient_requeue_backoff_cap_secs': {'old': 900.0, 'new': 20.0},
+        }
+        assert report['restart_required'] == {}
+        assert live.transient_requeue_backoff_base_secs == 5.0
+        assert live.transient_requeue_backoff_cap_secs == 20.0
+
+    @pytest.mark.parametrize('leaf', [
+        'transient_requeue_backoff_base_secs',
+        'transient_requeue_backoff_cap_secs',
+    ])
+    def test_reloadable_names_resolve_on_a_default_config(self, leaf, monkeypatch, tmp_path):
+        """Typo gate: each RELOADABLE_FIELDS literal must be a real attribute.
+
+        Mirrors ``test_every_path_resolves_on_default_config`` — a misspelled
+        entry would silently no-op inside diff_config/apply_reload.
+        """
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        assert getattr(OrchestratorConfig(), leaf) > 0.0
+
 
 class TestVerifyInfraRetryConfig:
     """Tests for verify_infra_retry_* config fields (step-5)."""
