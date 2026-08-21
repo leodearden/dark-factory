@@ -17,11 +17,11 @@ triage for every input.
 from __future__ import annotations
 
 import types
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from fused_memory.models.enums import MemoryCategory, SourceStore
+from fused_memory.models.enums import MEM0_PRIMARY, MemoryCategory, SourceStore
 from fused_memory.models.memory import MemoryResult
 from fused_memory.server.write_triage import (
     _DEFAULT_CANDIDATE_K,
@@ -38,6 +38,7 @@ from fused_memory.server.write_triage import (
     resolve_bands,
     resolve_candidate_k,
     resolve_write_triage_enabled,
+    retrieve_candidates,
 )
 from fused_memory.services.memory_service import RRF_K
 
@@ -504,3 +505,116 @@ class TestDecideBand:
         """
         for t_high, t_low in ((None, None), (T_HIGH, T_LOW), (None, T_LOW)):
             assert decide_band([], t_high=t_high, t_low=t_low).outcome == OUTCOME_STORED
+
+
+# ---------------------------------------------------------------------------
+# Candidate retrieval (INV-5: one seam, no second implementation)
+# ---------------------------------------------------------------------------
+
+class TestRetrieveCandidates:
+    """Exactly ONE ``MemoryService.search`` call, cross-category, mem0-only."""
+
+    @staticmethod
+    def _service(results=None, **write_triage) -> types.SimpleNamespace:
+        service = _svc(**write_triage)
+        service.search = AsyncMock(return_value=results if results is not None else [])
+        return service
+
+    @pytest.mark.asyncio
+    async def test_issues_exactly_one_search_and_touches_nothing_else(self) -> None:
+        """The INV-5 pin: this leaf builds no second retrieval.
+
+        Task 3111 lands topic-anchored recall AT the `MemoryService.search`
+        seam. Calling that seam once means the improvement arrives here for
+        free; a topic-aware retrieval built inside `write_triage.py` would be
+        a second implementation to keep in sync forever. A second call — to a
+        store, an embedder, or search again with different arguments — is the
+        regression this catches.
+        """
+        service = self._service()
+        service.update_memory = AsyncMock()
+        service.delete_memory = AsyncMock()
+        service.add_memory = AsyncMock()
+
+        await retrieve_candidates(service, 'some content', 'dark_factory', 20)
+
+        assert service.search.await_count == 1
+        # C1: triage never edits a canonical, on any path including this one.
+        service.update_memory.assert_not_called()
+        service.delete_memory.assert_not_called()
+        service.add_memory.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_the_search_kwargs_are_the_published_shape(self) -> None:
+        service = self._service()
+        await retrieve_candidates(service, 'some content', 'dark_factory', 20)
+
+        kwargs = service.search.await_args.kwargs
+        assert kwargs['query'] == 'some content'
+        assert kwargs['project_id'] == 'dark_factory'
+        assert kwargs['stores'] == ['mem0']
+        assert kwargs['limit'] == 20
+
+    @pytest.mark.asyncio
+    async def test_the_categories_are_every_mem0_primary_category(self) -> None:
+        """Asserted against the imported frozenset, never a hand-written triple.
+
+        Cross-category retrieval IS the fix this leaf exists for — the retired
+        guard filtered to the write's own category and could not see the
+        cross-category duplicates in reify esc-5547/esc-5560. Binding the
+        assertion to `MEM0_PRIMARY` means a future category addition carries
+        this test with it instead of leaving a stale literal that still passes
+        while the new category goes untriaged.
+        """
+        service = self._service()
+        await retrieve_candidates(service, 'c', 'p', 20)
+
+        assert service.search.await_args.kwargs['categories'] == sorted(
+            c.value for c in MEM0_PRIMARY
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_resolved_width_reaches_limit(self) -> None:
+        """A distinct sentinel, so a hardcoded default cannot pass by luck."""
+        service = self._service()
+        await retrieve_candidates(service, 'c', 'p', 37)
+        assert service.search.await_args.kwargs['limit'] == 37
+
+    @pytest.mark.asyncio
+    async def test_the_shipped_default_width_is_wider_than_the_retired_guards_five(
+        self,
+    ) -> None:
+        """The retired guard's `limit=5` must not be inherited by analogy.
+
+        Measured same-category recall: 26.1% @5 vs 69.4% @20. Retrieval width
+        caps what any band threshold can achieve, so narrowing back to 5 would
+        discard three quarters of the duplicates triage exists to catch,
+        silently.
+        """
+        service = self._service()
+        await retrieve_candidates(
+            service, 'c', 'p', resolve_candidate_k(self._service()),
+        )
+        assert service.search.await_args.kwargs['limit'] > 5
+
+    @pytest.mark.asyncio
+    async def test_the_results_are_returned_unchanged(self) -> None:
+        """No filtering, no re-ranking: banding is `decide_band`'s job."""
+        results = [_result('m1', 0.9), _result('m2', 0.5)]
+        service = self._service(results=results)
+        assert await retrieve_candidates(service, 'c', 'p', 20) == results
+
+    @pytest.mark.asyncio
+    async def test_a_raising_search_propagates(self) -> None:
+        """Fail-open is the ORCHESTRATOR's job, not this helper's.
+
+        Swallowing here would make the seam dishonest: a wiring bug (a renamed
+        kwarg, a changed signature) would look like "no candidates found" and
+        route every write to `stored` with nothing to distinguish it from a
+        genuinely novel corpus. `triage_write` catches this and counts it as a
+        fail-open, which is what makes the degradation visible.
+        """
+        service = self._service()
+        service.search = AsyncMock(side_effect=RuntimeError('mem0 down'))
+        with pytest.raises(RuntimeError):
+            await retrieve_candidates(service, 'c', 'p', 20)
