@@ -28,7 +28,7 @@ import os
 import sys
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import httpx
 
@@ -158,25 +158,74 @@ class FusedMemoryClient:
         return content
 
 
+class MigrationCounts(NamedTuple):
+    """One project's migration outcome, split by what actually happened.
+
+    A NamedTuple rather than the bare ``tuple[int, int, int]`` this replaced,
+    matching the house style of the sibling script's ``ReplyVerdict`` /
+    ``AuditCoverage``: the caller aggregates four fields whose ORDER is not
+    self-evident, and a positional mix-up between ``copied`` and
+    ``sanitized_empty`` would be silent and would land in the PR's table.
+
+    ``copied`` and ``sanitized_empty`` are BOTH copy-branch outcomes and are
+    deliberately not summed. ``copied`` means file-level entries survived the
+    lock charter and were written; ``sanitized_empty`` means nothing survived,
+    so ``files`` was left empty and the task's scope is deferred to the
+    architect. Reporting the second as a copy would state that N tasks got
+    their scope back when zero files were written — on the live corpora, all
+    11 of them.
+    """
+
+    visited: int
+    copied: int
+    sanitized_empty: int
+    dropped: int
+
+    def merged_with(self, other: MigrationCounts) -> MigrationCounts:
+        """Field-wise sum. Used to aggregate across project roots.
+
+        Written out by NAME rather than as a positional ``zip`` so that adding
+        a field whose merge is not integer addition cannot be silently folded
+        into a wrong one.
+        """
+        return MigrationCounts(
+            visited=self.visited + other.visited,
+            copied=self.copied + other.copied,
+            sanitized_empty=self.sanitized_empty + other.sanitized_empty,
+            dropped=self.dropped + other.dropped,
+        )
+
+
+EMPTY_COUNTS = MigrationCounts(visited=0, copied=0, sanitized_empty=0, dropped=0)
+
+#: Printed action label per outcome. The two copy-branch outcomes get DISTINCT
+#: labels so a per-task line is self-explaining without cross-referencing the
+#: summary — `copy` alone cannot tell an operator whether anything was written.
+ACTION_LABELS = {
+    'copied': 'copy',
+    'sanitized_empty': 'copy-sanitized-empty',
+    'dropped': 'drop',
+}
+
+
 async def _migrate_one_project(
     client: FusedMemoryClient, project_root: str, *, dry_run: bool,
-) -> tuple[int, int, int]:
-    """Walk one project's tasks and migrate metadata. Returns (visited, copied, dropped_only)."""
+) -> MigrationCounts:
+    """Walk one project's tasks and migrate metadata. See :class:`MigrationCounts`."""
     try:
         tasks_result = await client.call_tool(
             'get_tasks', {'project_root': project_root, 'with_subtasks': True},
         )
     except Exception as exc:
         print(f'  [skip] get_tasks failed for {project_root}: {exc}', file=sys.stderr)
-        return (0, 0, 0)
+        return EMPTY_COUNTS
 
     tasks = _flatten_tasks(tasks_result)
     # Done/cancelled tasks are immutable to update_task — skip them so the
     # migration log only reports tasks the server will actually touch.
     skip_statuses = {'done', 'cancelled', 'deferred'}
     visited = 0
-    copied = 0
-    dropped_only = 0
+    outcomes = {'copied': 0, 'sanitized_empty': 0, 'dropped': 0}
 
     for task in tasks:
         if str(task.get('status', '')) in skip_statuses:
@@ -215,9 +264,13 @@ async def _migrate_one_project(
             sanitized = strip_directory_locks(list(modules))
             if sanitized:
                 new_meta['files'] = sanitized
-            action = 'copy'
+            # THE OUTCOME IS THE SANITIZED RESULT, not `files`. Both branches
+            # here have an empty `files`; only the post-charter list separates
+            # a copy that gave the task scope from one that gave it none.
+            outcome = 'copied' if sanitized else 'sanitized_empty'
         else:
-            action = 'drop'
+            outcome = 'dropped'
+        action = ACTION_LABELS[outcome]
 
         if dry_run:
             print(
@@ -243,12 +296,9 @@ async def _migrate_one_project(
                 )
                 continue
 
-        if action == 'copy':
-            copied += 1
-        else:
-            dropped_only += 1
+        outcomes[outcome] += 1
 
-    return (visited, copied, dropped_only)
+    return MigrationCounts(visited=visited, **outcomes)
 
 
 async def main_async(args: argparse.Namespace) -> int:
@@ -265,24 +315,26 @@ async def main_async(args: argparse.Namespace) -> int:
     print(f'Dry-run:  {args.dry_run}')
     print()
 
-    totals = {'visited': 0, 'copied': 0, 'dropped': 0}
+    totals = EMPTY_COUNTS
     async with FusedMemoryClient(args.server_url) as client:
         for root in roots:
             print(f'Project: {root}')
-            visited, copied, dropped = await _migrate_one_project(
-                client, root, dry_run=args.dry_run,
-            )
-            totals['visited'] += visited
-            totals['copied'] += copied
-            totals['dropped'] += dropped
+            counts = await _migrate_one_project(client, root, dry_run=args.dry_run)
+            totals = totals.merged_with(counts)
+            # `copied_modules→files` and `dropped_modules_only` keep their
+            # pre-4528 spellings so an operator diffing against an older run's
+            # output can still line the columns up; `sanitized_empty` is the
+            # only new one.
             print(
-                f'  visited={visited} copied_modules→files={copied} '
-                f'dropped_modules_only={dropped}'
+                f'  visited={counts.visited} '
+                f'copied_modules→files={counts.copied} '
+                f'sanitized_empty={counts.sanitized_empty} '
+                f'dropped_modules_only={counts.dropped}'
             )
             print()
 
     print('---- summary ----')
-    for k, v in totals.items():
+    for k, v in totals._asdict().items():
         print(f'  {k}: {v}')
     return 0
 
