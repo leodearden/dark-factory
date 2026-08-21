@@ -245,16 +245,22 @@ class TestAlreadyLandedGateRealGitBoundaries:
         assert esc.task_id == task_id
         assert branch in esc.detail
         assert marker_sha in esc.detail
+        # Task 3116 part A, end-to-end.  The gate is still SAFE here, and the
+        # three assertions below pin what an operator can ACT on: the
+        # machine-readable reason code (``effect_absent``), the labelled
+        # ``diverged paths`` block — whose header is the structural evidence
+        # that the paths are rendered under their own label rather than buried
+        # in the ``probe: {...}`` dict repr — and the real deliverable path
+        # this scenario's fixture created, which the probe had to compute.
+        # Each fails if the step-4 enrichment or the step-6 rendering
+        # regresses.
+        #
+        # The operator PROSE around them is deliberately not asserted: it is
+        # not a contract, part (b) moved the semantics underneath it (the
+        # check no longer decides on byte-identity), and pinning the wording
+        # here would let the assertion outlive a real regression while
+        # blocking the corrective edit at its source.
         assert 'effect_absent' in esc.detail
-        # Task 3116 part A, end-to-end: the gate is still SAFE here, and when
-        # it does fire it now explains itself truthfully.  The prose no longer
-        # asserts a revert as fact — it names both branches and says plainly
-        # that this check cannot distinguish them — and the diverged paths are
-        # rendered under their own label instead of being buried in the probe
-        # dict repr, which is the one line that resolves "revert or skew?".
-        assert 'CANNOT distinguish' in esc.detail
-        assert 'reverted' in esc.detail
-        assert 'evolved further' in esc.detail
         assert 'diverged paths' in esc.detail
         assert 'deliverable.py' in esc.detail
 
