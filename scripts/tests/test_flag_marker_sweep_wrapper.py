@@ -120,6 +120,11 @@ def _run_wrapper(
     env["FAKE_SWEEP_STATE"] = str(state_path)
     env["FAKE_SWEEP_EXIT_CODE"] = str(exit_code)
     env["REPO"] = str(fake_repo)
+    # Always scrubbed first so the suite is hermetic: the wrapper's registry
+    # import only fires when this is empty, and an inherited value from the
+    # developer's shell would make the resolution tests environment-dependent.
+    # `extra_env` can still set it back.
+    env.pop("DASHBOARD_KNOWN_PROJECT_ROOTS", None)
     if project_ids is None:
         env.pop("FLAG_MARKER_SWEEP_PROJECT_IDS", None)
     else:
@@ -470,5 +475,164 @@ def test_wrapper_continues_sweeping_after_one_project_fails(tmp_path):
     )
     assert "dark_factory" in result.stderr, (
         f"Expected the failing project_id to be named on stderr; "
+        f"stderr={result.stderr!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# step-11: RED -- resolving the project list from the live registry
+# ---------------------------------------------------------------------------
+
+_FAKE_SYSTEMCTL_SRC = '''#!/usr/bin/env python3
+"""Fake `systemctl` for testing fused-memory-flag-marker-sweep.sh's
+registry import. Reduced to the one verb the wrapper uses:
+`--user show fused-memory.service -p Environment`, which is answered with
+$FAKE_SYSTEMCTL_ENVIRONMENT_LINE. With that var unset it prints a bare
+`Environment=` -- systemd's own spelling for a unit that declares none --
+so the DASHBOARD_KNOWN_PROJECT_ROOTS extraction finds nothing. Any other
+verb exits non-zero.
+"""
+import os
+import sys
+
+args = [a for a in sys.argv[1:] if a != "--user"]
+if args[:1] == ["show"]:
+    print(os.environ.get("FAKE_SYSTEMCTL_ENVIRONMENT_LINE", "Environment="))
+    sys.exit(0)
+sys.exit(1)
+'''
+
+# The value the fake unit reports, mirroring the MEASURED shape of the real
+# `systemctl --user show fused-memory.service -p Environment` output: a single
+# space-separated Environment= line with the roots comma-joined.
+_FAKE_UNIT_ROOTS = "/a/dark-factory,/b/reify"
+_FAKE_UNIT_ENVIRONMENT_LINE = (
+    "Environment=CONFIG_PATH=/x/config.yaml "
+    f"DASHBOARD_KNOWN_PROJECT_ROOTS={_FAKE_UNIT_ROOTS} MEM0_TELEMETRY=false"
+)
+
+
+def _fake_systemctl(tmp_path):
+    """Drop the fake `systemctl` into the same <tmp_path>/bin/ that
+    _run_wrapper prepends to PATH."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    fake = bin_dir / "systemctl"
+    fake.write_text(_FAKE_SYSTEMCTL_SRC)
+    fake.chmod(0o755)
+    return bin_dir
+
+
+def _list_calls(calls):
+    return [argv for argv in calls if "--list-known-projects" in argv]
+
+
+def test_wrapper_imports_known_project_roots_from_live_fused_memory_unit(tmp_path):
+    """MEASURED: DASHBOARD_KNOWN_PROJECT_ROOTS is not in the repo `.env` and
+    not in the systemd user manager's environment -- it exists only as an
+    `Environment=` line inside the INSTALLED ~/.config/systemd/user/
+    fused-memory.service unit. Without importing it from there the resolution
+    call would run with the var unset, resolve only the primary root, and the
+    nightly drain would narrow to one project while reporting success.
+
+    Reading the registry back off the same unit the fused-memory server itself
+    runs under makes drift structurally impossible, versus duplicating a
+    host-specific 9-entry root list into a committed unit file."""
+    _fake_systemctl(tmp_path)
+
+    result, state_path = _run_wrapper(
+        tmp_path,
+        project_ids=None,
+        extra_env={
+            "FAKE_SYSTEMCTL_ENVIRONMENT_LINE": _FAKE_UNIT_ENVIRONMENT_LINE,
+            "FAKE_SWEEP_KNOWN_PROJECTS": "dark_factory reify",
+        },
+    )
+
+    assert result.returncode == 0, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+
+    calls = _recorded_calls(state_path)
+    list_calls = _list_calls(calls)
+    assert len(list_calls) == 1, (
+        f"Expected exactly one --list-known-projects resolution call; "
+        f"calls={calls!r}"
+    )
+
+    list_index = calls.index(list_calls[0])
+    resolution_env = _recorded_envs(state_path)[list_index]
+    assert resolution_env.get("DASHBOARD_KNOWN_PROJECT_ROOTS") == _FAKE_UNIT_ROOTS, (
+        f"Expected the roots imported from the live unit to be EXPORTED before "
+        f"resolution runs (not left unset); "
+        f"DASHBOARD_KNOWN_PROJECT_ROOTS="
+        f"{resolution_env.get('DASHBOARD_KNOWN_PROJECT_ROOTS')!r}"
+    )
+
+
+def test_wrapper_sweeps_the_resolved_project_list(tmp_path):
+    """With no explicit override, the projects actually swept are exactly the
+    ones the resolution call printed -- the whole point of the seam."""
+    _fake_systemctl(tmp_path)
+
+    result, state_path = _run_wrapper(
+        tmp_path,
+        project_ids=None,
+        extra_env={
+            "FAKE_SYSTEMCTL_ENVIRONMENT_LINE": _FAKE_UNIT_ENVIRONMENT_LINE,
+            "FAKE_SWEEP_KNOWN_PROJECTS": "dark_factory reify know_live",
+        },
+    )
+
+    assert result.returncode == 0, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+
+    calls = _recorded_calls(state_path)
+    assert len(_list_calls(calls)) == 1, f"calls={calls!r}"
+    swept = _project_ids_of(calls)
+    assert sorted(swept) == ["dark_factory", "know_live", "reify"], (
+        f"Expected one sweep per RESOLVED project_id; swept={swept!r} "
+        f"calls={calls!r}"
+    )
+
+
+def test_wrapper_warns_loud_when_registry_resolution_is_empty(tmp_path):
+    """Fail-safe, not fail-silent. A registry that cannot be resolved narrows
+    the drain to dark_factory -- today's status quo, which self-drains -- but
+    an operator reading the journal must be able to tell the fleet was NOT
+    covered. Exit stays 0 on purpose: this degradation is persistent, and a
+    non-zero exit would park the .timer's unit in `failed` state forever (the
+    same reasoning that keeps --check out of the nightly argv)."""
+    _fake_systemctl(tmp_path)
+
+    result, state_path = _run_wrapper(
+        tmp_path,
+        project_ids=None,
+        # No FAKE_SYSTEMCTL_ENVIRONMENT_LINE: the fake unit declares no
+        # Environment, so the import finds nothing. No FAKE_SWEEP_KNOWN_PROJECTS
+        # either, so the resolution call itself exits non-zero.
+    )
+
+    assert result.returncode == 0, (
+        f"Expected the narrowed fallback to be a WARNING, not a unit failure; "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+
+    calls = _recorded_calls(state_path)
+    swept = _project_ids_of(calls)
+    assert swept == ["dark_factory"], (
+        f"Expected the dark_factory fallback sweep; swept={swept!r} calls={calls!r}"
+    )
+    assert "WARNING" in result.stderr, (
+        f"Expected a WARNING on stderr so the narrowing is visible in the "
+        f"journal; stderr={result.stderr!r}"
+    )
+    assert "dark_factory" in result.stderr, (
+        f"Expected the WARNING to name the narrowed fallback; "
+        f"stderr={result.stderr!r}"
+    )
+    assert "DASHBOARD_KNOWN_PROJECT_ROOTS" in result.stderr, (
+        f"Expected the WARNING to name the likely cause so it is actionable; "
         f"stderr={result.stderr!r}"
     )

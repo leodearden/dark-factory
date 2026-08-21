@@ -2614,6 +2614,111 @@ class TestRunApplyStoreMutationPreflight:
         memory_service.delete_memory.assert_not_awaited()
 
 
+class TestKnownProjectsCoverageIssue:
+    """_known_projects_coverage_issue() — the degradation predicate behind
+    --list-known-projects (task 2917 EDIT 1, esc-2917-3 ruling).
+
+    EMPTINESS IS THE WRONG KEY. ``build_known_projects_map`` seeds its
+    candidates with the primary root BEFORE extending with the env roots, so
+    an unset DASHBOARD_KNOWN_PROJECT_ROOTS yields a ONE-entry map, never an
+    empty one: the ``if not project_ids`` guard is unreachable in exactly the
+    degradation it was written to catch, and the nightly drain narrows to a
+    single project at exit 0, silently.
+
+    Two cases must be told apart:
+      (i)  the env var is SET but names roots that did not make it into the
+           resolved map — a genuine degradation (typo, unreadable root, a
+           project moved), warned about LOUDLY and named root-by-root;
+      (ii) the env var is UNSET — the map is primary-only, so coverage is
+           single-project and the census is not fleet-wide. Reported, but NOT
+           as a hard failure: a legitimately single-project install would
+           otherwise warn-as-error forever.
+    """
+
+    @staticmethod
+    def _stub_root_ids(monkeypatch, mapping):
+        import fused_memory.models.scope as scope
+
+        monkeypatch.setattr(
+            scope, 'resolve_project_id_for_root',
+            lambda root: mapping[str(root)],
+        )
+
+    def test_unset_env_reports_single_project_coverage(self, monkeypatch):
+        """Case (ii): primary-only is legible, not silent."""
+        monkeypatch.delenv('DASHBOARD_KNOWN_PROJECT_ROOTS', raising=False)
+
+        issue = _mod._known_projects_coverage_issue(['dark_factory'])
+
+        assert issue is not None, (
+            'A primary-only map must be REPORTED: it is the exact degradation '
+            'an empty-list check can never see, since the primary root is '
+            'always seeded into the map.'
+        )
+        assert 'DASHBOARD_KNOWN_PROJECT_ROOTS' in issue, issue
+        assert 'dark_factory' in issue, issue
+
+    def test_env_set_but_under_resolved_is_reported_root_by_root(self, monkeypatch):
+        """Case (i): a named root that did not survive into the map is the
+        loud one — the operator needs to know WHICH root vanished."""
+        monkeypatch.setenv(
+            'DASHBOARD_KNOWN_PROJECT_ROOTS', '/a/dark-factory,/b/reify',
+        )
+        self._stub_root_ids(monkeypatch, {
+            '/a/dark-factory': 'dark_factory',
+            '/b/reify': 'reify',
+        })
+
+        issue = _mod._known_projects_coverage_issue(['dark_factory'])
+
+        assert issue is not None, (
+            'A root named in the env var but absent from the resolved map is a '
+            'genuine degradation and must not pass quietly.'
+        )
+        assert '/b/reify' in issue, (
+            f'Expected the MISSING root to be named so the warning is '
+            f'actionable; got {issue!r}'
+        )
+        assert '/a/dark-factory' not in issue, (
+            f'Expected only the missing root to be named, not the resolved '
+            f'ones; got {issue!r}'
+        )
+
+    def test_fully_resolved_multi_project_map_is_quiet(self, monkeypatch):
+        """No degradation, no noise — otherwise the warning stops being read."""
+        monkeypatch.setenv(
+            'DASHBOARD_KNOWN_PROJECT_ROOTS', '/a/dark-factory,/b/reify',
+        )
+        self._stub_root_ids(monkeypatch, {
+            '/a/dark-factory': 'dark_factory',
+            '/b/reify': 'reify',
+        })
+
+        assert _mod._known_projects_coverage_issue(['dark_factory', 'reify']) is None
+
+    def test_primary_root_repeated_in_the_env_var_is_not_a_degradation(
+        self, monkeypatch,
+    ):
+        """MEASURED on the live registry: DASHBOARD_KNOWN_PROJECT_ROOTS lists
+        the primary root too, and build_known_projects_map drops it as a
+        duplicate project_id (logged at INFO). A naive count comparison
+        (len(map) < 1 + len(named)) would therefore cry degradation on every
+        healthy nightly run. Comparing resolved IDS is what makes the
+        predicate correct."""
+        monkeypatch.setenv(
+            'DASHBOARD_KNOWN_PROJECT_ROOTS',
+            '/a/dark-factory,/b/reify',
+        )
+        self._stub_root_ids(monkeypatch, {
+            '/a/dark-factory': 'dark_factory',
+            '/b/reify': 'reify',
+        })
+
+        # The map has exactly the two ids; the primary root's id simply
+        # coincides with a named one.
+        assert _mod._known_projects_coverage_issue(['dark_factory', 'reify']) is None
+
+
 class TestTerminalDrainIsPrimaryProjectOnly:
     """--terminal-drain must never arm deletions in a project whose task
     store this process does not own (task 2917, esc-2917-3 ruling).
