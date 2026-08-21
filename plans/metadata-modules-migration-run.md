@@ -184,6 +184,23 @@ absorbed:
    write gate validates the *merged* metadata with `enforce=True`, so an
    untouched pre-existing malformed field rejects the write. A record that
    acquired a bad field before the gate existed becomes **permanently unwritable
-   through the sanctioned API** — there is no in-band repair path, which is
-   exactly why this migration could not self-heal 5050. Fixing that would clear
-   5050 and all 215 latent siblings without any corpus surgery.
+   through the sanctioned API** under `metadata_mode='merge'`, which is why this
+   migration could not self-heal 5050. Fixing that would clear 5050 and all 215
+   latent siblings without any corpus surgery.
+
+   **Caveat, added after the fact — do not read the above as "no repair path
+   exists".** Everything measured here used merge-mode. `metadata_mode='replace'`
+   was NEVER ATTEMPTED against 5050, and it may simply work: replace overwrites
+   the blob wholesale instead of merging a delta into the malformed existing
+   metadata. `update_task`'s own docstring calls replace *the sanctioned repair
+   path*, and `fused-memory/scripts/strip_leaked_control_keys.py` is the
+   established precedent for this shape of one-off live-metadata correction
+   (read -> pure transform -> replace-mode write -> read-back diff).
+
+   So whoever picks up the follow-up task should **try replace-mode before
+   reaching for a raw SQLite edit**. What is genuinely open is whether the write
+   path deserializes the EXISTING metadata independently of the payload (e.g.
+   the candidate_key recompute from `(title, files)`, or the lock-charter
+   directory gate) — if it does, replace-mode fails too and the
+   direct-edit conclusion is restored. That is a one-call experiment, not a
+   reason to start with the destructive option.
