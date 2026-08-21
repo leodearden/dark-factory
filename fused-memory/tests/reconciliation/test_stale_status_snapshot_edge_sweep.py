@@ -1615,7 +1615,24 @@ class CountingStr(str):
     def __new__(cls, value):
         self = super().__new__(cls, value)
         self.touched = 0
+        self.reads = 0
         return self
+
+    def __len__(self):
+        """Tally EXTRACTION-PIPELINE ENTRIES (task 3037).
+
+        Every extraction entry point opens with ``fact = fact or ''``, whose
+        truthiness test is the one and only Python-level ``__len__`` call the
+        pipeline makes on the fact — the ``re`` module reads a str subclass's
+        buffer at C level and never calls this. So ``reads`` counts exactly
+        one per entry into the extraction pipeline, which is the property
+        ``test_extraction_runs_exactly_once_per_edge`` needs and the
+        ``touched`` character counter structurally cannot express (running
+        two marker families costs the same character traversals whether they
+        are reached through one entry point or two).
+        """
+        self.reads += 1
+        return str.__len__(self)
 
     def rfind(self, sub, start=0, end=None):
         stop = len(self) if end is None else end
@@ -2393,6 +2410,243 @@ class TestSweepStaleStatusSnapshotEdgesCore:
             'rather than only the first, which is the precise gap the finding reports'
         )
 
+
+class TestSweepStaleStatusSnapshotEdgesBlockedRuleAndCounters:
+    """The blocked-assertion rule at the SWEEP layer, plus the stat-counter
+    coverage task 3037 asks for over BOTH selection rules (task 3037).
+
+    On the stat counter: the folded-in finding reported
+    ``stale_status_snapshot_edges_invalidated`` reading 0 of 6312 scanned
+    while an edge WAS invalidated that same run, and attributed it to "a
+    code-level bug in the counter". Measured at HEAD=c54b8cfcc5 there is no
+    arithmetic defect — the module has exactly ONE update_edge call site and
+    ``stats['invalidated'] += 1`` sits immediately after the awaited call,
+    inside the try and before the except. The 0 was CORRECT for the sweep:
+    the terminal-only selection rule never selected the blocked edge, and the
+    Stage-1 LLM agent invalidated it ad hoc via the MCP update_edge tool,
+    which no sweep counter observes. Same root cause as this task's primary
+    defect, not a second bug.
+
+    The requirement is therefore met STRUCTURALLY rather than by chasing a
+    nonexistent bug: the new rule is routed through the SAME single counted
+    invalidation loop, both rules are covered by one parametrized counter
+    test, and ``invalidated == candidate_edges - errors`` is pinned as an
+    explicit invariant — which is what actually forbids a future second
+    invalidation site from going uncounted.
+    """
+
+    @pytest.mark.asyncio
+    async def test_blocked_assertion_edge_invalidated_end_to_end(self):
+        """The live repro, driven through the full enumerate -> extract ->
+        cross-reference -> invalidate path.
+
+        'Task 2848 remains blocked as of 2026-07-22' with census
+        {'2848': 'pending'} must be invalidated; the still-blocked control
+        edge (task 3001, census 'blocked') must be left alone. Before task
+        3037 the repro edge was not even SELECTED — done/cancelled was the
+        only trigger — so it stayed live through the entire unblock.
+        """
+        memory_service = _make_memory_service()
+        taskmaster = _make_taskmaster()
+
+        blocked_edge = {
+            'uuid': 'edge-2848',
+            'fact': 'Task 2848 remains blocked as of 2026-07-22',
+            'name': '',
+        }
+        control_edge = {
+            'uuid': 'edge-3001-control', 'fact': 'Task 3001 is blocked.', 'name': '',
+        }
+        memory_service.graphiti.get_all_valid_edges = AsyncMock(
+            return_value={'entity-a': [blocked_edge, control_edge]},
+        )
+        taskmaster.get_statuses = AsyncMock(return_value={'2848': 'pending', '3001': 'blocked'})
+        now = datetime(2026, 8, 21, 12, 0, 0, tzinfo=UTC)
+
+        stats = await sweep_stale_status_snapshot_edges(
+            memory_service, taskmaster, 'test_project', '/tmp/reify',
+            run_id='run-3037', now=now,
+        )
+
+        memory_service.update_edge.assert_awaited_once()
+        call = memory_service.update_edge.await_args
+        assert call.args[0] == 'edge-2848', (
+            f'Expected only the unblocked task-2848 edge invalidated, never the '
+            f'still-blocked control edge, got {call!r}'
+        )
+        assert call.kwargs.get('invalid_at') == now, (
+            f'Expected update_edge called with the explicit now= timestamp, got {call!r}'
+        )
+        assert call.kwargs.get('project_id') == 'test_project'
+        assert call.kwargs.get('agent_id') == 'recon-stage-memory_consolidator'
+        assert call.kwargs.get('causation_id') == 'run-3037'
+
+        assert stats['scanned'] == 2
+        assert stats['candidate_edges'] == 1
+        assert stats['errors'] == 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('rule_name', 'fact', 'census'),
+        [
+            ('blocked-assertion rule (task 3037)',
+             'Task 2848 remains blocked as of 2026-07-22', {'2848': 'pending'}),
+            ('terminal rule (task 2613)',
+             'Task 142 is an active pending task', {'142': 'done'}),
+        ],
+    )
+    async def test_invalidated_counter_covers_both_selection_rules(
+        self, rule_name, fact, census,
+    ):
+        """stats['invalidated'] == 1 under EITHER rule.
+
+        Written as ONE parametrized test over both rules rather than two
+        independent tests, so a future change that counts one rule but not
+        the other fails immediately instead of leaving a silent gap. The
+        terminal leg is a REGRESSION PIN (already green on arrival); the
+        blocked leg is the new coverage.
+        """
+        memory_service = _make_memory_service()
+        taskmaster = _make_taskmaster()
+        memory_service.graphiti.get_all_valid_edges = AsyncMock(
+            return_value={'entity-a': [{'uuid': 'edge-1', 'fact': fact, 'name': ''}]},
+        )
+        taskmaster.get_statuses = AsyncMock(return_value=census)
+
+        stats = await sweep_stale_status_snapshot_edges(
+            memory_service, taskmaster, 'test_project', '/tmp/reify', run_id='run-1',
+        )
+
+        assert stats['invalidated'] == 1, (
+            f'Expected the invalidation counted under the {rule_name}, got stats={stats!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_invalidated_equals_candidates_minus_errors_across_a_mixed_run(self):
+        """COUNTER INVARIANT: invalidated == candidate_edges - errors.
+
+        This is the structural remedy for the stat-counter requirement. It
+        fails the moment ANY edge is invalidated outside the single counted
+        loop, which is the failure mode the folded-in finding feared — far
+        stronger than re-asserting the increment that already exists.
+
+        Driven over a mixed run exercising both rules and both outcomes: a
+        terminal-path stale edge, a blocked-path stale edge, a healthy edge,
+        and one stale edge whose update_edge raises.
+
+        The identity is EXACT only because stats['errors'] stays scoped to
+        the enumerate / cross-reference / INVALIDATE paths. Supersede-write
+        failures deliberately get their own 'supersede_errors' key rather
+        than diluting 'errors' — see the sweep's Returns docstring.
+        """
+        memory_service = _make_memory_service()
+        taskmaster = _make_taskmaster()
+
+        terminal_stale = {
+            'uuid': 'edge-terminal', 'fact': 'Task 142 is an active pending task', 'name': '',
+        }
+        blocked_stale = {
+            'uuid': 'edge-blocked',
+            'fact': 'Task 2848 remains blocked as of 2026-07-22',
+            'name': '',
+        }
+        healthy = {
+            'uuid': 'edge-healthy', 'fact': 'Task 3001 is blocked.', 'name': '',
+        }
+        failing = {
+            'uuid': 'edge-failing', 'fact': 'Task 144 is an active pending task', 'name': '',
+        }
+        memory_service.graphiti.get_all_valid_edges = AsyncMock(
+            return_value={'entity-a': [terminal_stale, blocked_stale, healthy, failing]},
+        )
+        taskmaster.get_statuses = AsyncMock(
+            return_value={
+                '142': 'done', '2848': 'pending', '3001': 'blocked', '144': 'cancelled',
+            },
+        )
+        memory_service.update_edge = AsyncMock(
+            side_effect=[None, None, RuntimeError('lock contention')],
+        )
+
+        stats = await sweep_stale_status_snapshot_edges(
+            memory_service, taskmaster, 'test_project', '/tmp/reify', run_id='run-mixed',
+        )
+
+        assert stats['scanned'] == 4
+        assert stats['candidate_edges'] == 3, (
+            f'Expected the terminal, blocked and failing edges all selected and the '
+            f'still-blocked healthy edge left alone, got stats={stats!r}'
+        )
+        assert stats['invalidated'] == 2
+        assert stats['errors'] == 1
+        assert stats['invalidated'] == stats['candidate_edges'] - stats['errors'], (
+            f"COUNTER INVARIANT VIOLATED: stats['invalidated'] must equal "
+            f"stats['candidate_edges'] - stats['errors'], got stats={stats!r}. "
+            f"Every selected edge is either invalidated or tallied as an error by the "
+            f"ONE counted invalidation loop. If this broke because 'errors' was widened "
+            f"to cover a NON-invalidation failure mode (e.g. the superseding "
+            f"temporal_fact write), that widening is the bug: give the new failure mode "
+            f"its own stats key instead, or this invariant stops being able to detect an "
+            f"invalidation that went uncounted."
+        )
+
+    @pytest.mark.asyncio
+    async def test_extraction_runs_exactly_once_per_edge(self):
+        """LIVENESS: the sweep must enter the extraction pipeline exactly ONCE
+        per edge, even though there are now TWO marker families.
+
+        Extractor cost is a whole-cycle liveness property in this module (see
+        the module docstring): the extractor runs once per valid edge over the
+        whole group's edge set — ~12k edges and ~3.3 s per enumeration on
+        dark_factory post-task-4340 — with no per-edge timeout, so one
+        pathological fact stalls the entire reconciliation cycle. A second
+        full pass per edge doubles the cost the module's own performance tests
+        exist to bound.
+
+        Measured with CountingStr.reads, which tallies extraction-pipeline
+        ENTRIES: every entry point opens with ``fact = fact or ''`` and that
+        truthiness test is the only Python-level ``__len__`` the pipeline
+        makes on the fact. The sibling ``touched`` character counter cannot
+        express this property — running two marker families costs the same
+        character traversals whether they are reached through one entry point
+        or two — so the two counters measure genuinely different things.
+
+        RED before the by-class extractor lands: the sweep precomputes only
+        the UNION edge_ids map, so select_stale_status_snapshot_edges falls
+        back to extracting blocked ids internally, per edge — a second entry
+        the liveness discipline forbids.
+        """
+        memory_service = _make_memory_service()
+        taskmaster = _make_taskmaster()
+
+        facts = [
+            CountingStr('Task 2848 remains blocked as of 2026-07-22'),
+            CountingStr('Task 142 is an active pending task'),
+            CountingStr('Tasks 1020 and 1030 are blocked'),
+        ]
+        edges = [
+            {'uuid': f'edge-{i}', 'fact': fact, 'name': ''}
+            for i, fact in enumerate(facts)
+        ]
+        memory_service.graphiti.get_all_valid_edges = AsyncMock(
+            return_value={'entity-a': edges},
+        )
+        taskmaster.get_statuses = AsyncMock(
+            return_value={'2848': 'pending', '142': 'done', '1020': 'blocked',
+                          '1030': 'blocked'},
+        )
+
+        await sweep_stale_status_snapshot_edges(
+            memory_service, taskmaster, 'test_project', '/tmp/reify', run_id='run-1',
+        )
+
+        for fact in facts:
+            assert fact.reads == 1, (
+                f'Expected the sweep to enter the extraction pipeline exactly ONCE for '
+                f'{str(fact)!r}, got {fact.reads}. More than one entry means the union '
+                f'and blocked id sets are being extracted in separate passes; they must '
+                f'come from a single by-class extraction per edge.'
+            )
 
 # --------------------------------------------------------------------------- #
 # sweep_stale_status_snapshot_edges — guards
