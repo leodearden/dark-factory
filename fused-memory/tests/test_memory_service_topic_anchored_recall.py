@@ -374,3 +374,81 @@ class TestTopicPinDedupeAndMoveToFront:
         # its canonical is pinned ahead of topic-b's.
         assert [r.id for r in results[:2]] == ['canonical-a', 'canonical-b']
         assert all(r.topic_anchored for r in results[:2])
+
+
+class TestTopicPinScoreContract:
+    """The pin must not create — or suppress — a near-duplicate write block.
+
+    WHY THIS IS PINNED, in production terms. Since task 3658
+    ``relevance_score`` is an ordinal RRF value (rank-1 ~ 0.0164), NOT a
+    cosine; the honest per-store cosine lives in ``metadata['store_score']``,
+    and ``near_duplicate_guard.find_near_duplicate_memory`` reads it from there
+    and qualifies on ``>= threshold``. The near-dup guard's pre-check is
+    exactly ``search(categories=['procedural_knowledge'], stores=['mem0'],
+    limit=5)``, so EVERY procedural_knowledge write now runs through the
+    anchoring block.
+
+    An injected anchor that carried a synthetic ``store_score >= threshold``
+    would therefore hard-block every ``procedural_knowledge`` write on a
+    consolidated topic — turning a retrieval fix into a WRITE OUTAGE on
+    precisely the topics it exists to help. These tests use the production
+    selector as the oracle rather than asserting an implementation detail.
+    """
+
+    @staticmethod
+    async def _anchored_results(service, *, hot_sibling: bool = False):
+        """The step-9 scenario's result list, run through the real search tail."""
+        hits = [_sibling(n) for n in range(1, 10)]
+        if hot_sibling:
+            # A sibling that IS a genuine near-duplicate of the pending write.
+            hits[0] = {**hits[0], 'score': 0.97}
+        service.mem0.search = AsyncMock(return_value={'results': hits})
+        service.mem0.scroll_by_metadata = AsyncMock(return_value=[_canonical_payload()])
+        return await service.search(
+            query=_QUERY, project_id=_PROJECT_ID,
+            categories=['procedural_knowledge'], stores=['mem0'], limit=5,
+        )
+
+    @pytest.mark.asyncio
+    async def test_pin_does_not_create_a_near_duplicate_match(self, service):
+        """Every sibling is safely below 0.92 — the guard must still find nothing."""
+        from fused_memory.server.near_duplicate_guard import find_near_duplicate_memory
+
+        results = await self._anchored_results(service)
+
+        assert find_near_duplicate_memory(results, 0.92) is None
+
+    @pytest.mark.asyncio
+    async def test_pin_does_not_suppress_a_real_near_duplicate_match(self, service):
+        """The paired positive: a genuinely-similar sibling is still selected."""
+        from fused_memory.server.near_duplicate_guard import find_near_duplicate_memory
+
+        results = await self._anchored_results(service, hot_sibling=True)
+
+        match = find_near_duplicate_memory(results, 0.92)
+        assert match is not None
+        assert match.id == 'sibling-1'
+
+    @pytest.mark.asyncio
+    async def test_injected_anchor_carries_no_store_score_at_all(self, service):
+        """ABSENT is not the same as 0.0 — and only absent is safe.
+
+        ``near_duplicate_guard._cosine_of`` treats a missing cosine as "not
+        comparable", which can never qualify at ANY threshold; a measured 0.0
+        would still be a measurement, and a low threshold could clear it. This
+        assertion is what stops a future refactor 'helpfully' copying a score
+        onto the anchor.
+        """
+        results = await self._anchored_results(service)
+        anchor = results[0]
+
+        assert anchor.topic_anchored is True
+        assert 'store_score' not in anchor.metadata
+        assert 'store_rank' not in anchor.metadata
+
+    @pytest.mark.asyncio
+    async def test_injected_anchor_relevance_score_is_zero(self, service):
+        """The pin is by ORDER ONLY — never by an inflated score."""
+        results = await self._anchored_results(service)
+
+        assert results[0].relevance_score == 0.0
