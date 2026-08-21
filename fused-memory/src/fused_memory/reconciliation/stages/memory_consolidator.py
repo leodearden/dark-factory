@@ -631,14 +631,27 @@ class MemoryConsolidator(BaseStage):
                 report.stats['degenerate_task_nodes_swept'] = sweep_stats['deleted']
                 report.stats['degenerate_task_nodes_scanned'] = sweep_stats['scanned']
 
-        # ── Stale task-status snapshot edge sweep (task 2613) ──────────────────
+        # ── Stale task-status snapshot edge sweep (tasks 2613, 3037) ──────────
         # Invalidate VALID (invalid_at IS NULL) task-status-snapshot Graphiti
-        # edges whose asserted active/pending/in-progress status now contradicts
-        # a terminal (done/cancelled) task, via a deterministic direct-lookup
-        # sweep (never semantic search). Best-effort: a sweep failure must never
-        # abort the stage or leave a partial/incorrect stat — it is logged and
-        # swallowed, and no stale_status_snapshot_edges_* stat is set for this
-        # cycle.
+        # edges whose asserted status is now contradicted, via a deterministic
+        # direct-lookup sweep (never semantic search). Two selection rules:
+        #   - the TERMINAL rule (task 2613): an asserted active/pending/
+        #     in-progress status contradicted by a terminal (done/cancelled)
+        #     task;
+        #   - the BLOCKED-ASSERTION rule (task 3037): an asserted BLOCKED
+        #     status contradicted by ANY other positively-known status —
+        #     'pending', 'in-progress', 'review', … — not merely a terminal
+        #     one. Without it a blocked->pending unblock left 'Task N remains
+        #     blocked' asserted as current until the task eventually reached
+        #     done, which is most of a task's life.
+        # Second half of the blocked rule's deterministic step: after each
+        # successful blocked-rule invalidation the sweep writes ONE superseding
+        # resulting-state-only temporal_fact per contradicted task per cycle,
+        # so the graph records what replaced the retired assertion instead of
+        # merely losing it — surfaced here as stale_blocked_edges_superseded.
+        # Best-effort: a sweep failure must never abort the stage or leave a
+        # partial/incorrect stat — it is logged and swallowed, and NONE of
+        # these stats is set for this cycle.
         try:
             snapshot_sweep_stats = await sweep_stale_status_snapshot_edges(
                 self.memory, self.taskmaster, self.project_id, self.project_root,
@@ -660,6 +673,9 @@ class MemoryConsolidator(BaseStage):
             )
             report.stats['stale_status_snapshot_edges_scanned'] = (
                 snapshot_sweep_stats['scanned']
+            )
+            report.stats['stale_blocked_edges_superseded'] = (
+                snapshot_sweep_stats['superseded']
             )
 
         # ── Stale priority-override / pin-queue edge sweep (task 2781) ─────────
