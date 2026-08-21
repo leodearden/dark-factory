@@ -53,6 +53,8 @@ ScannedRecord = _mod.ScannedRecord
 scan_records = _mod.scan_records
 adjudicate = _mod.adjudicate
 Finding = _mod.Finding
+# vars() does not work on a slots dataclass — the script's own accessor does.
+vars_of = _mod.vars_of
 UNRESOLVABLE = _mod.UNRESOLVABLE
 build_report = _mod.build_report
 _build_parser = _mod._build_parser
@@ -393,7 +395,13 @@ class TestAdjudicate:
         assert finding.claim_kind == 'filing_dispatch'
         assert 'tkt_0RRRC5AASJ9Z630VP4PCN9H376' in finding.claimed_text
         assert 'no ticket' in finding.observed
-        assert finding.derived_edge_uuids == ()
+        # The PURE layer read no graph, so it knows nothing about edges: all
+        # three not-enumerated columns say so together. () here would be a
+        # MEASURED zero on the report's central harm-artefact column, claimed
+        # by a layer that never queried.
+        assert finding.derived_edge_uuids is None
+        assert finding.derived_edges_by_graph is None
+        assert finding.edges_unqueried is True
         assert finding.to_json()['status'] == 'mismatch'
 
     def test_mismatches_sort_before_unverifiables(self) -> None:
@@ -430,6 +438,7 @@ def _finding(
     created_at: str = '2026-07-26T00:00:00Z',
     graph_name: str | None = None,
     edges_unqueried: bool = False,
+    edges_unqueried_in: tuple[str, ...] = (),
 ) -> object:
     return Finding(
         record_uuid=uuid,
@@ -445,9 +454,109 @@ def _finding(
         status=status,
         observed=f'observed for {ref}',
         claimed_text='some claiming clause',
+        # Both edge columns move TOGETHER — Finding.__post_init__ rejects the
+        # disagreeing pair, which is the shape CAVEAT 7 declares impossible.
         derived_edge_uuids=None if edges_unqueried else (),
+        derived_edges_by_graph=None if edges_unqueried else (),
         edges_unqueried=edges_unqueried,
+        edges_unqueried_in=edges_unqueried_in,
     )
+
+
+class TestFindingShape:
+    """The row's own contract: hashable, immutable, and unable to lie."""
+
+    def test_an_enriched_finding_is_still_hashable(self) -> None:
+        """Set/dict membership must not start raising once a store is read.
+
+        The attribution map is stored as ordered PAIRS precisely so this keeps
+        working: a dict field would make the auto-generated __hash__ raise
+        TypeError, and only for findings that went through ``_run`` — never
+        under the pure layer's tests, i.e. exactly where a run-to-run finding
+        delta (`set(a) - set(b)`, the natural move for this artifact set) would
+        first hit it.
+        """
+        enriched = {
+            'derived_edge_uuids': ('edge-a', 'edge-b'),
+            'derived_edges_by_graph': (
+                ('reify', ('edge-a',)), ('dark_factory', ('edge-b',)),
+            ),
+            'edges_unqueried': False,
+            'edges_enumerated_in': ('reify', 'dark_factory'),
+        }
+        one = Finding(**{**vars_of(_finding()), **enriched})
+        two = Finding(**{**vars_of(_finding()), **enriched})
+        assert hash(one) == hash(two)
+        assert one == two
+        assert len({one, two}) == 1
+        # And the JSON shape is a plain object regardless of the storage form.
+        assert one.to_json()['derived_edges_by_graph'] == {
+            'reify': ['edge-a'], 'dark_factory': ['edge-b'],
+        }
+
+    def test_the_attribution_cannot_be_mutated_through_the_frozen_wrapper(
+        self,
+    ) -> None:
+        """``frozen=True`` must not advertise an immutability it lacks."""
+        finding = Finding(**{
+            **vars_of(_finding()),
+            'derived_edge_uuids': ('edge-a',),
+            'derived_edges_by_graph': (('reify', ('edge-a',)),),
+            'edges_unqueried': False,
+        })
+        assert isinstance(finding.derived_edges_by_graph, tuple)
+        with pytest.raises(TypeError):
+            finding.derived_edges_by_graph[0] = ('other', ())  # type: ignore[index]
+
+    @pytest.mark.parametrize(
+        ('columns', 'why'),
+        [
+            (
+                {'derived_edge_uuids': (), 'derived_edges_by_graph': None,
+                 'edges_unqueried': False},
+                'a measured zero on the flat column beside a null map',
+            ),
+            (
+                {'derived_edge_uuids': None, 'derived_edges_by_graph': None,
+                 'edges_unqueried': False},
+                'null edges that do not admit to being unqueried',
+            ),
+            (
+                {'derived_edge_uuids': ('e',),
+                 'derived_edges_by_graph': (('reify', ('e',)),),
+                 'edges_unqueried': True},
+                'a real measurement flagged as never queried',
+            ),
+        ],
+    )
+    def test_disagreeing_edge_columns_are_rejected_at_construction(
+        self, columns: dict, why: str,
+    ) -> None:
+        """CAVEAT 7's impossible shapes must be unconstructable, not merely
+        undocumented — the three columns state ONE fact three ways."""
+        base = {
+            k: v for k, v in vars_of(_finding()).items()
+            if k not in {'derived_edge_uuids', 'derived_edges_by_graph',
+                         'edges_unqueried'}
+        }
+        with pytest.raises(ValueError, match='must agree'):
+            Finding(**base, **columns)
+
+    def test_the_agreeing_states_are_all_accepted(self) -> None:
+        """Guarding the impossible must not outlaw the three real states."""
+        base = {
+            k: v for k, v in vars_of(_finding()).items()
+            if k not in {'derived_edge_uuids', 'derived_edges_by_graph',
+                         'edges_unqueried'}
+        }
+        # not enumerated / enumerated-and-empty / enumerated-with-edges
+        Finding(**base, derived_edge_uuids=None,
+                derived_edges_by_graph=None, edges_unqueried=True)
+        Finding(**base, derived_edge_uuids=(),
+                derived_edges_by_graph=(('reify', ()),), edges_unqueried=False)
+        Finding(**base, derived_edge_uuids=('e',),
+                derived_edges_by_graph=(('reify', ('e',)),),
+                edges_unqueried=False)
 
 
 class TestBuildReport:
@@ -527,6 +636,39 @@ class TestBuildReport:
             _finding('mismatch', uuid='ep-c'),
         ])
         assert report['summary']['edges_unqueried'] == 2
+
+    def test_edges_partial_and_edges_unqueried_split_a_mixed_population(
+        self,
+    ) -> None:
+        """The two coverage denominators never double-count the same row.
+
+        ``_run`` computes coverage GLOBALLY — one batched scan per graph, so
+        every finding in a run shares the same answered/unanswered split and
+        ``edges_partial`` is necessarily 0 or len(findings) there. This layer
+        is where a mixed population is expressible, so it is where the
+        counters' actual predicate gets exercised.
+        """
+        report = self._build([
+            # Partial: some graph answered, some did not — a measured LOWER
+            # BOUND, counted only by edges_partial.
+            _finding('mismatch', uuid='ep-partial',
+                     edges_unqueried_in=('reify',)),
+            # Fully unqueried: no graph answered — counted only by
+            # edges_unqueried, even though it also names unqueried graphs.
+            _finding('mismatch', uuid='ep-none', edges_unqueried=True,
+                     edges_unqueried_in=('dark_factory', 'reify')),
+            # Fully covered: no hole at all.
+            _finding('mismatch', uuid='ep-full'),
+        ])
+        assert report['summary']['edges_partial'] == 1
+        assert report['summary']['edges_unqueried'] == 1
+        rows = {f['record_uuid']: f for f in report['findings']}
+        assert rows['ep-partial']['edges_unqueried_in'] == ['reify']
+        assert rows['ep-partial']['edges_unqueried'] is False
+        assert rows['ep-none']['edges_unqueried'] is True
+        # Always present, [] when there is no hole — an absent key and "no
+        # hole" must not read the same.
+        assert rows['ep-full']['edges_unqueried_in'] == []
 
     def test_report_is_json_serializable_and_byte_stable(self) -> None:
         findings = [
@@ -1154,15 +1296,20 @@ class TestDerivedEdgeLookupKeying:
         assert finding['graph_name'] == 'dark_factory'
         assert report['summary']['by_project'] == {'know_live': 1}
 
-    async def test_unresolved_reader_is_null_not_an_empty_list(
-        self, capsys, caplog
+    async def test_unread_home_graph_is_never_claimed_as_enumerated(
+        self, capsys
     ) -> None:
-        """NOT ENUMERATED and NO EDGES FOUND are different facts.
+        """A row must never OVERSTATE its coverage.
 
-        A --project dropped from the argv leaves a finding whose graph has no
-        reader. Serializing that as ``[]`` makes it indistinguishable in the
-        committed artifact from an episode genuinely free of derived edges —
-        a silent fail-soft, on the report's central harm-artefact column.
+        The record was READ FROM a graph (``reify``) that this run never
+        swept. Edges are now enumerated across every swept graph keyed on the
+        episode uuid, so ``dark_factory`` IS asked and the answer is a real
+        measurement — but ``edges_enumerated_in`` must name only the graph
+        that actually answered. Naming ``reify`` there would claim coverage of
+        a graph this run never opened.
+
+        The null-vs-``[]`` invariant this test used to guard is pinned by
+        ``test_reader_that_raises_is_null_not_an_empty_list`` below.
         """
         reader = _FakeReader(
             [
@@ -1170,22 +1317,23 @@ class TestDerivedEdgeLookupKeying:
                     uuid='ep-orphan',
                     text=ESC_3085_1_INSTANCE_1,
                     project_id='reify',
-                    graph_name='reify',  # not among --project, so no reader
+                    graph_name='reify',  # not among --project
                 )
             ],
+            edges={'ep-orphan': ('edge-in-dark-factory',)},
         )
-        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
-            _code, report = await self._run_capture(
-                capsys, reader, _probes(task_status='in-progress')
-            )
+        _code, report = await self._run_capture(
+            capsys, reader, _probes(task_status='in-progress')
+        )
         assert report is not None
         finding = report['findings'][0]
-        assert finding['derived_edge_uuids'] is None
-        assert finding['edges_unqueried'] is True
-        assert reader.edge_lookups == []
-        # Every other degradation path in this module warns; this one must too.
-        assert 'ep-orphan' in caplog.text
-        assert 'reify' in caplog.text
+        # The swept graph IS asked — this is a measurement, not a null.
+        assert reader.edge_lookups == ['ep-orphan']
+        assert finding['derived_edge_uuids'] == ['edge-in-dark-factory']
+        assert finding['edges_unqueried'] is False
+        # ...but coverage is claimed ONLY for the graph that answered.
+        assert finding['edges_enumerated_in'] == ['dark_factory']
+        assert 'reify' not in finding['edges_enumerated_in']
 
     async def test_reader_that_raises_is_null_not_an_empty_list(
         self, capsys, caplog
@@ -1272,6 +1420,199 @@ class TestDerivedEdgeLookupKeying:
         assert report['summary']['by_graph'] == {'reify': 1}
         assert report['summary']['by_project'] == {'dark_factory': 1}
 
+    async def test_every_swept_graph_is_asked_not_only_the_home_pair(
+        self, capsys
+    ) -> None:
+        """Edges are keyed on the EPISODE, not on any one graph.
+
+        The measured pattern behind this rule: an episode's derived edges live
+        in the graph its ingest ran against, which need not be the graph the
+        node landed in NOR the graph its group_id names (episode
+        a887c958-0018-4715-8817-cf048c187e8d: node in reify only, all 8 edges
+        in dark_factory only). Asking only the read-from graph and the group_id
+        graph therefore leaves a whole population — 12 of the 15 committed
+        findings read from reify whose group_id names an UNSWEPT graph — with
+        an empty harm-artefact column that was never actually measured.
+
+        Here the group_id (``know_live``) is not swept, so under the old rule
+        the target set collapsed to ``reify`` alone and dark_factory could
+        never enter it. Every swept graph must be asked.
+        """
+        episode = 'ep-third-graph'
+        reify_reader = _FakeReader(
+            [
+                _record(
+                    uuid=episode,
+                    text=ESC_3085_1_INSTANCE_1,
+                    project_id='know_live',  # NOT among --project
+                    graph_name='reify',
+                )
+            ],
+            edges={},  # reify answers, holding nothing for it
+        )
+        dark_reader = _FakeReader([], edges={episode: ('edge-in-dark-factory',)})
+        readers = {'reify': reify_reader, 'dark_factory': dark_reader}
+
+        code = await _run(
+            _args(project=['reify', 'dark_factory']),
+            reader_factory=lambda project: readers[project],
+            probes=_probes(task_status='in-progress'),
+        )
+        report = json.loads(capsys.readouterr().out)
+        assert code == 0
+        # The read-from graph is still asked...
+        assert reify_reader.edge_lookups == [episode]
+        # ...and so is a graph that is NEITHER the read-from graph NOR the
+        # group_id graph. This is the whole point of the rule.
+        assert dark_reader.edge_lookups == [episode]
+        finding = report['findings'][0]
+        assert finding['derived_edge_uuids'] == ['edge-in-dark-factory']
+        assert finding['edges_enumerated_in'] == ['reify', 'dark_factory']
+        assert finding['cross_graph'] is True
+
+    async def test_edges_are_attributed_to_the_graph_that_held_them(
+        self, capsys
+    ) -> None:
+        """Which graph held which edge is a fact the row must carry.
+
+        The flat union answers "what are the harm artefacts"; it cannot answer
+        "where do I go to look at them", which is exactly what someone acting
+        on a finding needs — and, once edges are enumerated across every swept
+        graph, the union alone silently merges graphs that a reader may need
+        to tell apart.
+        """
+        episode = 'ep-cross'
+        reify_reader = _FakeReader(
+            [
+                _record(
+                    uuid=episode,
+                    text=ESC_3085_1_INSTANCE_1,
+                    project_id='dark_factory',
+                    graph_name='reify',
+                )
+            ],
+            edges={episode: ('edge-in-reify',)},
+        )
+        dark_reader = _FakeReader([], edges={episode: ('edge-in-dark-factory',)})
+        # A third swept graph that ANSWERS holding nothing: "asked here, found
+        # nothing" must stay distinguishable per graph, not vanish from the map.
+        other_reader = _FakeReader([], edges={})
+        readers = {
+            'reify': reify_reader,
+            'dark_factory': dark_reader,
+            'know_live': other_reader,
+        }
+
+        code = await _run(
+            _args(project=['reify', 'dark_factory', 'know_live']),
+            reader_factory=lambda project: readers[project],
+            probes=_probes(task_status='in-progress'),
+        )
+        report = json.loads(capsys.readouterr().out)
+        assert code == 0
+        finding = report['findings'][0]
+        assert finding['derived_edges_by_graph'] == {
+            'reify': ['edge-in-reify'],
+            'dark_factory': ['edge-in-dark-factory'],
+            'know_live': [],
+        }
+        # The flat union is UNCHANGED in meaning, so existing consumers of the
+        # central harm-artefact column keep working.
+        assert finding['derived_edge_uuids'] == [
+            'edge-in-dark-factory', 'edge-in-reify',
+        ]
+        assert finding['edges_enumerated_in'] == [
+            'reify', 'dark_factory', 'know_live',
+        ]
+
+    async def test_unqueried_finding_has_null_edges_by_graph(
+        self, capsys
+    ) -> None:
+        """The per-graph map carries the SAME not-enumerated sentinel.
+
+        ``{}`` would be a measured zero — "asked everywhere, found nothing" —
+        which is the precise fail-soft the null state exists to prevent.
+        """
+        reader = _ExplodingEdgeReader(
+            [_record(uuid='ep-1', text=ESC_3085_1_INSTANCE_1,
+                     project_id='know_live', graph_name='dark_factory')]
+        )
+        _code, report = await self._run_capture(
+            capsys, reader, _probes(task_status='in-progress')
+        )
+        assert report is not None
+        finding = report['findings'][0]
+        assert finding['derived_edges_by_graph'] is None
+        assert finding['derived_edge_uuids'] is None
+        assert finding['edges_unqueried'] is True
+
+    async def test_partial_coverage_names_the_graph_that_did_not_answer(
+        self, capsys
+    ) -> None:
+        """PARTIAL coverage is a THIRD state, and must be visible on the row.
+
+        Some graph answered, so the edge list is a real measurement and NOT a
+        null — but it is a measured LOWER BOUND, not the whole story. Leaving
+        the hole to be inferred by differencing edges_enumerated_in against
+        report['projects'] is exactly the silent fail-soft the null state
+        exists to prevent, one level up.
+        """
+        episode = 'ep-partial'
+        reify_reader = _FakeReader(
+            [
+                _record(
+                    uuid=episode,
+                    text=ESC_3085_1_INSTANCE_1,
+                    project_id='reify',
+                    graph_name='reify',
+                )
+            ],
+            edges={episode: ('edge-in-reify',)},
+        )
+        # Contributes no records, but blows up on the edge scan.
+        dark_reader = _ExplodingEdgeReader([])
+        readers = {'reify': reify_reader, 'dark_factory': dark_reader}
+
+        code = await _run(
+            _args(project=['reify', 'dark_factory']),
+            reader_factory=lambda project: readers[project],
+            probes=_probes(task_status='in-progress'),
+        )
+        report = json.loads(capsys.readouterr().out)
+        assert code == 0
+        finding = report['findings'][0]
+        # A graph DID answer, so this is a measurement, not a null.
+        assert finding['derived_edge_uuids'] == ['edge-in-reify']
+        assert finding['edges_unqueried'] is False
+        assert finding['edges_enumerated_in'] == ['reify']
+        # ...and the row STATES its own coverage hole.
+        assert finding['edges_unqueried_in'] == ['dark_factory']
+        # The two counters are DISJOINT.
+        assert report['summary']['edges_partial'] == 1
+        assert report['summary']['edges_unqueried'] == 0
+
+    async def test_fully_covered_finding_is_not_counted_as_partial(
+        self, capsys
+    ) -> None:
+        """The new key is ALWAYS present, so [] reads as "no hole".
+
+        A key that appeared only when non-empty would read as absent rather
+        than as a measured zero — the same discipline as ``truncated_by``.
+        """
+        reader = _FakeReader(
+            [_record(uuid='ep-1', text=ESC_3085_1_INSTANCE_1,
+                     project_id='dark_factory', graph_name='dark_factory')],
+            edges={'ep-1': ('edge-1',)},
+        )
+        _code, report = await self._run_capture(
+            capsys, reader, _probes(task_status='in-progress')
+        )
+        assert report is not None
+        finding = report['findings'][0]
+        assert finding['edges_unqueried_in'] == []
+        assert report['summary']['edges_partial'] == 0
+        assert report['summary']['edges_unqueried'] == 0
+
     async def test_group_id_graph_not_swept_is_enumerated_where_it_can_be(
         self, capsys
     ) -> None:
@@ -1322,20 +1663,22 @@ class TestDerivedEdgeLookupKeying:
         """The denominator of un-enumerated findings is visible without
         diffing the list — the same no-silent-caps discipline as
         ``truncated_by``."""
-        reader = _FakeReader(
+        # Every swept graph is now asked, so a reader-less graph no longer
+        # manufactures an unqueried finding. The remaining way to get one is
+        # the real degradation: the scan RAISES, so no graph answers.
+        reader = _ExplodingEdgeReader(
             [
-                _record(uuid='ep-seen', text=ESC_3085_1_INSTANCE_1,
+                _record(uuid='ep-a', text=ESC_3085_1_INSTANCE_1,
                         project_id='know_live', graph_name='dark_factory'),
-                _record(uuid='ep-orphan', text=ESC_3085_1_INSTANCE_1,
-                        project_id='reify', graph_name='reify'),
+                _record(uuid='ep-b', text=ESC_3085_1_INSTANCE_1,
+                        project_id='reify', graph_name='dark_factory'),
             ],
-            edges={'ep-seen': ('edge-1',)},
         )
         _code, report = await self._run_capture(
             capsys, reader, _probes(task_status='in-progress')
         )
         assert report is not None
-        assert report['summary']['edges_unqueried'] == 1
+        assert report['summary']['edges_unqueried'] == 2
         assert report['summary']['mismatch'] == 2
 
 
