@@ -753,6 +753,18 @@ _TRIO = [
 
 _TRIO_IDS = [row[0] for row in _TRIO]
 
+#: The categories ``harness._rehydrate_merge_halt`` selects a halt owner from,
+#: and that ``_on_escalation_resolved``'s owner check can therefore unhalt on.
+_HALT_CATEGORIES = {'wip_conflict', 'unmerged_state', 'stash_failed'}
+
+#: A representative ``_build_train_state()`` payload (escalation.models.TrainState).
+_TRAIN_STATE = {
+    'id': 'T7',
+    'order': 2,
+    'parked_members': ['alpha', 'beta'],
+    'failing_member': '1448',
+}
+
 
 def _forbid_waiting_helper(workflow: TaskWorkflow) -> None:
     """§7.9 constraint (a), enforced STRUCTURALLY.
@@ -858,13 +870,23 @@ async def test_trio_never_refiles_sibling_halt_category(
     workflow: TaskWorkflow,
     fake_worker: _FakeMergeWorker,
 ) -> None:
-    """§7.9 constraint (c): recovery never re-files a sibling halt-category
-    record.
+    """§7.9 constraint (c): recovery never re-files a sibling HALT-CATEGORY
+    record — but it does still file a plain one for THIS task.
 
     Rehydration selects the halt owner most-recent-wins across the halt
-    categories, so a second record filed while a sibling already owns the halt
-    would make a restart re-own the WRONG escalation.  Mirrors the defensive
-    re-check ``_escalate_train_halt`` already carries.
+    categories, so a second record IN A HALT CATEGORY would make a restart
+    re-own the WRONG escalation.  Mirrors the defensive re-check
+    ``_escalate_train_halt`` used to carry inline (now shared: it delegates to
+    ``_file_halt_owning_l1`` too).
+
+    Filing NOTHING is not the answer either (review amendment): the caller
+    tails into ``_mark_blocked(skip_escalation=True)``, so the task would be
+    parked ``blocked`` with ZERO escalations referencing it — a LEAVE-shaped
+    row for the ground-truth sweep, while resolving the SIBLING's L1 unhalts
+    the queue with no edge back to this task.  That is a silent permanent
+    strand.  So the branch files a NON-OWNING ``task_failure`` record naming
+    the owner: invisible to rehydration's filter and to the owner check, but
+    discoverable and resolvable for this task.
 
     RED today: the handler unconditionally submits and calls ``set_halt_owner``,
     tripping ``_FakeMergeWorker``'s owner-collision assertion.
@@ -882,17 +904,60 @@ async def test_trio_never_refiles_sibling_halt_category(
     assert isinstance(workflow.scheduler, FakeScheduler)
     assert 'blocked' in workflow.scheduler.statuses.get(workflow.task_id, [])
 
-    # (b) no duplicate filing
+    # (b) exactly ONE record, and NOT in a halt category
     assert workflow.escalation_queue is not None
-    assert workflow.escalation_queue.get_pending() == [], (
-        f'{handler_id}: a sibling already owns the halt — filing a second '
-        f'halt-category record would make rehydration re-own the wrong one'
+    pending = workflow.escalation_queue.get_pending()
+    assert len(pending) == 1, (
+        f'{handler_id}: expected exactly one non-owning record for this task '
+        f'(zero would strand it blocked-with-no-escalation; two would be the '
+        f'duplicate filing), got {pending!r}'
+    )
+    record = pending[0]
+    assert record.level == 1, f'{handler_id}: the record must be human-facing'
+    assert record.category not in _HALT_CATEGORIES, (
+        f'{handler_id}: a sibling already owns the halt — a second record in '
+        f'halt category {record.category!r} would join rehydration\'s '
+        f'most-recent-wins candidate set and make a restart re-own the wrong '
+        f'escalation'
+    )
+    assert 'esc-foreign-1' in record.detail, (
+        f'{handler_id}: the record must name the owning escalation so a human '
+        f'can see what actually releases the halt: {record.detail!r}'
     )
 
     # (c) the foreign owner is untouched, and the halt is neither stolen nor released
     assert fake_worker.halt_owner_esc_id == 'esc-foreign-1'
     assert fake_worker.is_wip_halted is True
     assert fake_worker.last_unhalt_reason is None
+
+
+@pytest.mark.parametrize('train_state', [None, _TRAIN_STATE], ids=['single_task', 'train'])
+def test_file_halt_owning_l1_threads_train_state(
+    train_state,
+    workflow: TaskWorkflow,
+    fake_worker: _FakeMergeWorker,
+) -> None:
+    """The shared helper is ALSO the train path's filing block.
+
+    ``_escalate_train_halt``'s inline copy of the owner-re-check ->
+    ``Escalation(...)`` -> ``_submit_halt_owning_escalation`` sequence was
+    deleted in favour of this helper (review amendment: two copies of a
+    load-bearing ordering contract drift).  The only thing the train copy added
+    was the ``train_state=`` payload, so pin that it survives the delegation —
+    the train-path tests assert ownership and outcome, but never this field.
+    """
+    fake_worker.halt_for_wip('stash_failed')
+
+    workflow._file_halt_owning_l1(
+        'stash_failed', 'summary', 'detail', train_state=train_state,
+    )
+
+    assert workflow.escalation_queue is not None
+    pending = workflow.escalation_queue.get_pending()
+    assert len(pending) == 1
+    assert pending[0].train_state == train_state
+    # ...and the ordering contract still holds: submitted, THEN owned.
+    assert fake_worker.halt_owner_esc_id == pending[0].id
 
 
 @pytest.mark.asyncio
