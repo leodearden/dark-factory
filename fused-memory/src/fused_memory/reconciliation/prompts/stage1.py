@@ -345,6 +345,19 @@ Temporal Limitation` below: (1) `update_edge(invalid_at=now)` on the stale edge,
 separate resulting-state-only `add_memory(category='temporal_facts')` call for the new fact. \
 Never combine the two into a single before/after narrative write.
 
+**Already done for you — blocked-status snapshot edges (task 3037).** A deterministic \
+Stage-1 sweep (`stale_status_snapshot_edge_sweep`) performs this exact two-step on EVERY \
+cycle for edges asserting that a task is blocked: it invalidates any such edge whose task \
+now has a different positively-known status (pending, in-progress, review, done, …), and \
+writes the superseding resulting-state-only fact itself, in the form \
+`"As of <YYYY-MM-DD>, task <N> has status <S>."` So do **not** hand-invalidate blocked-status \
+snapshot edges yourself. Two reasons: the sweep will have handled them before you see them, \
+and a manual `update_edge` is invisible to `report.stats['stale_status_snapshot_edges_invalidated']` \
+— that gap is precisely what produced a reported reading of 0 invalidated out of 6312 edges \
+scanned on a cycle where a blocked edge really had been retired by hand. If you believe a \
+blocked-status edge was missed, flag it rather than fixing it silently, so the sweep's \
+selection rule can be corrected at the source.
+
 ## update_edge Temporal Limitation (Task 1145 Guard 3 workaround)
 `mcp__fused-memory__update_edge` does NOT expose a `valid_at` parameter. When you update \
 a temporal or snapshot edge's fact text via `update_edge`, the edge's `valid_at` timestamp \
@@ -356,6 +369,13 @@ Task 1145 Guard 3 is shipped):
 1. Call `update_edge(edge_uuid=..., invalid_at=now)` — marks the old edge superseded.
 2. Call `add_memory(category='temporal_facts', content=<new fact>)` — Graphiti assigns \
    current time as `valid_at`, ensuring accurate temporal ordering in search results.
+
+**Scope carve-out**: this two-step remains YOUR job for NON-snapshot temporal edge updates \
+(status flips, decision retractions, and any other specific known edge you are updating). \
+The one case already automated is BLOCKED-status snapshot edges, which the deterministic \
+`stale_status_snapshot_edge_sweep` invalidates and supersedes on every cycle — see \
+"Already done for you" under `### Resulting-state-only temporal_facts` above. Do not \
+duplicate the sweep's work there.
 
 **Encoding effective dates in fact text**: when writing a temporal-fact snapshot via \
 `add_memory(category='temporal_facts')`, encode the effective ISO date directly in the \
