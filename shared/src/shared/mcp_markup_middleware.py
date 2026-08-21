@@ -173,14 +173,44 @@ _REJECT_HINT = (
 #: Surfaced when the value's boundary is a GUESS. It deliberately does NOT
 #: offer a mechanical retry — there is no repaired call to resend — so it points
 #: at the two things the caller can actually do.
-_UNREPAIRABLE_HINT = (
+#:
+#: Spelled ONCE, with the two variants below differing ONLY in the preservation
+#: clause. Composed rather than duplicated for the usual reason (INV-5): a
+#: reworded refusal must not require two edits kept in lock step.
+_UNREPAIRABLE_PREFIX = (
     'This value is UNREPAIRABLE: its own boundary cannot be determined, so no '
     'repair was attempted and nothing was written. Guessing would silently '
-    'drop whatever arguments hide in the residue. Your full payload is '
-    'preserved verbatim in the escalation named above — resend it from your '
-    'own copy once your tool-call envelope stops leaking, rather than '
-    'reconstructing it from this error. If the markup is quoted DELIBERATELY, '
-    + _OVERRIDE_SENTENCE
+    'drop whatever arguments hide in the residue. '
+)
+_UNREPAIRABLE_SUFFIX = (
+    ' If the markup is quoted DELIBERATELY, ' + _OVERRIDE_SENTENCE
+)
+
+#: WHY THE CLAIM IS CONDITIONAL. This hint is read by an agent deciding whether
+#: it still needs its own copy of the payload, so a FALSE preservation claim is
+#: worse than no hint at all: it converts a recoverable loss into an
+#: unrecoverable one by telling the caller to stop holding the data (and by
+#: explicitly discouraging the one recovery still available — reconstructing
+#: from the error). PRD C2 L187 is the contract: an unrepairable input files an
+#: escalation carrying the FULL raw payload so nothing is discarded. When that
+#: filing did NOT happen, saying it did breaks the contract twice over.
+#:
+#: Selecting between the two keeps the payload's PROSE consistent with its own
+#: ``escalation_id`` field rather than letting the two disagree.
+_UNREPAIRABLE_HINT_PRESERVED = (
+    _UNREPAIRABLE_PREFIX
+    + 'Your full payload is preserved verbatim in the escalation named above '
+    '— resend it from your own copy once your tool-call envelope stops '
+    'leaking, rather than reconstructing it from this error.'
+    + _UNREPAIRABLE_SUFFIX
+)
+_UNREPAIRABLE_HINT_UNPRESERVED = (
+    _UNREPAIRABLE_PREFIX
+    + 'NOTHING WAS PRESERVED: no record of your payload was stored anywhere, '
+    'so keep your own copy and resend it once your tool-call envelope stops '
+    'leaking. If you no longer hold one, say so — do not assume an operator '
+    'can recover this call.'
+    + _UNREPAIRABLE_SUFFIX
 )
 
 #: A decoded Python value -> the JSON-Schema type name that admits it. ``bool``
@@ -940,7 +970,18 @@ class MarkupGuardMiddleware(Middleware):
             'escalation_id': escalation_id,
             # NO 'repaired_call'. There is no repair, and offering one would
             # invite a retry that re-sends a guess.
-            'hint': _UNREPAIRABLE_HINT,
+            #
+            # Keyed off the SAME value that populates 'escalation_id' above,
+            # never off ``self._escalation_sink is not None``: a wired sink that
+            # RAISED (a queue I/O failure on the escalation server) or returned
+            # a non-str preserved exactly nothing, and must select the
+            # unpreserved variant too. See the constants for why the claim is
+            # conditional at all.
+            'hint': (
+                _UNREPAIRABLE_HINT_PRESERVED
+                if isinstance(escalation_id, str)
+                else _UNREPAIRABLE_HINT_UNPRESERVED
+            ),
         }, storm)))
 
     async def _file_residue_escalation(self, record: dict[str, Any]) -> str | None:
