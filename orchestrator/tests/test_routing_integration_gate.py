@@ -100,6 +100,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import yaml
+from _orch_helpers import pydantic_spec, stamp_stock_routing_config
 from _recording_event_store import _RecordingEventStore
 from _workflow_helpers import (
     AgentStub,
@@ -110,6 +111,7 @@ from _workflow_helpers import (
     _init_repo,
     wire_metadata_backend,
 )
+from escalation.models import Escalation
 from pydantic import ValidationError
 from shared.cost_store import CostStore
 
@@ -126,6 +128,7 @@ from orchestrator.config import (
 from orchestrator.event_store import EventType
 from orchestrator.git_ops import GitOps
 from orchestrator.harness import TaskReport
+from orchestrator.review_checkpoint import ReviewCheckpoint
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.verify import VerifyResult
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
@@ -1535,3 +1538,168 @@ class TestUnknownRuleKeyRejectedPriorRulesStillRoute:
 
         with pytest.raises(ValidationError, match='model_typo'):
             load_config(bad_yaml)
+
+
+# ---------------------------------------------------------------------------
+# Boundary scenario 9 -- out-of-band site parity: steward + deep_reviewer
+# each resolve through the REAL resolve_and_record_route seam and each emit
+# a routing_decision event exactly once per invocation (plan step-9).
+# ---------------------------------------------------------------------------
+
+
+def _mk_escalation(**overrides) -> Escalation:
+    """Minimal ``Escalation`` for driving ``TaskSteward._invoke_with_session``
+    directly. Mirrors ``test_out_of_band_routing._mk_escalation`` -- kept
+    module-local per this suite's fixtures-stay-module-local discipline (see
+    module docstring)."""
+    defaults: dict = dict(
+        id='esc-42-1', task_id='42', agent_role='orchestrator',
+        severity='blocking', category='limit_exhausted', summary='s',
+    )
+    defaults.update(overrides)
+    return Escalation(**defaults)  # type: ignore[arg-type]
+
+
+# Deliberately OUTSIDE pytest's tmp_path -- NOT a sandbox escape.
+# ReviewCheckpoint._run_review (review_checkpoint.py:150-155) raises ValueError
+# on any project_root containing '/tmp/pytest', ahead of every seam this suite
+# patches. Mirrors test_out_of_band_routing.py's identical workaround (module-
+# local per this suite's discipline, so reimplemented rather than imported).
+_REVIEW_PROJECT_ROOT = Path('/tmp/dark-factory-review-nonpytest-root')
+
+
+@pytest.mark.asyncio
+class TestOutOfBandParity:
+    """PRD boundary scenario 9: the out-of-band dispatch sites (steward,
+    deep_reviewer) resolve through the REAL ``resolve_and_record_route`` seam
+    -- driven end to end via ``TaskSteward._invoke_with_session`` /
+    ``ReviewCheckpoint._run_review`` with ONLY ``invoke_agent`` faked, never
+    by patching ``resolve_and_record_route`` itself (that shallower mock is
+    exactly what ``test_out_of_band_routing.py`` uses to prove the resolver
+    call SHAPE; this class proves the resolved value additionally survives
+    the REAL ``invoke_with_cap_retry`` cap-retry loop down to the CLI argv --
+    the same one-level-deeper seam discipline this suite uses everywhere else
+    for ``TaskWorkflow._invoke``/``orchestrator.workflow.invoke_agent``).
+
+    Steward is genuinely per-task (``task_id``/``task_metadata`` both flow
+    into the resolver via ``_invoke_with_session``, steward.py:786-798), so
+    its override reaches the ``metadata_override`` layer. deep_reviewer is
+    STRUCTURALLY project-level -- ``_run_review`` passes NO task_id /
+    task_metadata / scheduler / in_memory_task at all (review_checkpoint.py:
+    184-208) -- so ``metadata_override`` is provably UNREACHABLE there,
+    confirmed both by that comment and independently by
+    ``TestDeepReviewerAdoptsResolveRoute``'s docstring in
+    ``test_out_of_band_routing.py`` ("The metadata_override layer is
+    unreachable here"). Its half therefore proves seam-parity via the one
+    override channel it DOES have -- a config-layer value distinct from the
+    role default -- while explicitly asserting the metadata-mirror absence
+    its narrower contract implies (routing_dispatch.py:262-283).
+    """
+
+    async def test_steward_override_honored_and_emits_once(
+        self, make_steward, monkeypatch,
+    ) -> None:
+        rec = _RecordingEventStore()
+        task = {
+            'id': '42', 'title': 't', 'description': 'd',
+            'metadata': {'model_overrides': {'steward': 'haiku', 'triage': 'haiku'}},
+        }
+        # make_steward's config stamps models.steward = 'opus' (conftest.py)
+        # -- distinct from 'haiku', so the layers genuinely disagree, same
+        # spirit as TestOverrideWinsAtTheSeam.
+        steward = make_steward(task=task, event_store=rec)
+        stub = _MinimalRouteRecorder()
+        monkeypatch.setattr('orchestrator.steward.invoke_agent', stub.invoke_agent)
+
+        await steward._invoke_with_session(
+            prompt='p', cwd=steward.worktree, mcp_config={'mcpServers': {}},
+            per_invocation_budget=3.0, escalation=_mk_escalation(),
+        )
+
+        # The override reached the CLI seam, not just the resolver.
+        assert stub.calls[-1]['model'] == 'haiku'
+
+        entries = _routing_events(rec)
+        assert len(entries) == 1, (
+            f'expected exactly one routing_decision event: {rec.events!r}'
+        )
+        data = entries[0]['data']
+        assert data['role'] == 'steward'
+        assert data['source_layer'] == 'metadata_override'
+        # The steward's enforced per-invocation cap is surfaced alongside the
+        # resolver's advisory budget_usd, flagged advisory-only
+        # (routing_dispatch.py:247-254).
+        assert data['applied_budget_usd'] == pytest.approx(3.0)
+        assert data['budget_usd_advisory'] is True
+
+    @staticmethod
+    def _deep_reviewer_config() -> OrchestratorConfig:
+        """Mirrors ``test_out_of_band_routing._review_config``, reimplemented
+        module-locally (fixtures-stay-module-local discipline -- see module
+        docstring) with ``models.deep_reviewer`` set to a value DISTINCT from
+        the role default ('haiku', not the RoleDefaults-supplied 'opus') so
+        the seam assertion is meaningful: it proves the resolved CONFIG value
+        reaches ``invoke_agent`` rather than merely coinciding with a
+        default."""
+        cfg = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
+        cfg.project_root = _REVIEW_PROJECT_ROOT
+        cfg.fused_memory.project_id = 'dark_factory'
+        cfg.models.deep_reviewer = 'haiku'
+        cfg.budgets.deep_reviewer = 10.0
+        cfg.max_turns.deep_reviewer = 50
+        cfg.effort.deep_reviewer = 'max'
+        cfg.backends.deep_reviewer = 'claude'
+        cfg.escalation.host = 'localhost'
+        cfg.escalation.port = 8102
+        stamp_stock_routing_config(cfg)
+        return cfg
+
+    async def test_deep_reviewer_resolves_and_emits_once_no_metadata_mirror(
+        self, monkeypatch,
+    ) -> None:
+        rec = _RecordingEventStore()
+        mcp = MagicMock()
+        mcp.mcp_config_json.return_value = {'mcpServers': {}}
+        cp = ReviewCheckpoint(self._deep_reviewer_config(), mcp, None)
+        cp.event_store = rec
+
+        stub = _MinimalRouteRecorder()
+        monkeypatch.setattr('orchestrator.review_checkpoint.invoke_agent', stub.invoke_agent)
+        # Verification is orthogonal to routing and is faked throughout this
+        # suite (mirrors _mock_verify_passes's use for workflow's
+        # run_scoped_verification); _save_report is stubbed because it writes
+        # against self.config.project_root, which this fixture never creates.
+        monkeypatch.setattr(
+            'orchestrator.review_checkpoint.run_full_verification', _mock_verify_passes(),
+        )
+        monkeypatch.setattr(cp, '_save_report', lambda *a, **k: None)
+
+        await cp._run_review('full', [])
+
+        # The config-layer override reached the CLI seam.
+        assert stub.calls[-1]['model'] == 'haiku'
+
+        entries = _routing_events(rec)
+        assert len(entries) == 1, (
+            f'expected exactly one routing_decision event: {rec.events!r}'
+        )
+        data = entries[0]['data']
+        assert data['role'] == 'deep_reviewer'
+        # metadata_override is structurally unreachable here: _run_review
+        # (review_checkpoint.py:190-208) passes no task_id/task_metadata, so
+        # resolve_route's layer-1 override lookup is against {} and always
+        # misses -- 'config' is the topmost layer this site can reach (see
+        # class docstring).
+        assert data['source_layer'] == 'config'
+        # No applied_budget_usd annotation -- deep_reviewer never passes one
+        # (byte-equivalent event, unlike steward's advisory-budget pair).
+        assert 'applied_budget_usd' not in data
+        assert 'budget_usd_advisory' not in data
+        # No task identity flowed in, so routing_dispatch.py:271's
+        # `scheduler is not None and task_id is not None` guard is
+        # structurally False -- no metadata.routing mirror write is even
+        # attempted (there is no scheduler/task object anywhere in this rig
+        # for one to land on). The recorded event's own task_id is the
+        # direct, observable witness of that honest "no task association"
+        # contract.
+        assert entries[0]['task_id'] is None
