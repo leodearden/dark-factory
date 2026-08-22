@@ -185,6 +185,26 @@ def emit_markup_storm_escalation(
     — never ``rejected``, never the literal ``'None'``: absent is not zero, and
     it is not a rejection either.
 
+    That rule binds EVERY operator-facing field on the record — ``summary``,
+    ``detail`` AND ``suggested_action`` — not just the sentence carrying the
+    number. ``suggested_action`` is no afterthought: ``escalation/server.py``
+    :409-414 lists it in ``_COMPACT_ESCALATION_FIELDS`` beside ``summary`` and
+    :420 carries both into ``_COMPACT_PENDING_FIELDS``, while ``detail`` is
+    dropped BY NAME as the unbounded free-text field, so a compact consumer that
+    never sees the detail still reads it. Task 4505 fixed the summary first and
+    left two rejection-framed sentences behind in the other two fields; a fourth
+    sentence added here must not repeat that.
+
+    The grep tokens those sentences name must also be ones an emitter actually
+    writes. They pointed at ``markup_tripwire_storm``, whose only occurrence in
+    the repo was the instruction prescribing it — a triager who followed it
+    found zero lines, indistinguishable from "the leak stopped". The live tokens
+    are ``markup_guard_storm`` (``mcp_markup_middleware.py``:682,
+    ``markup_guard.py``:383,397) and the per-call ``markup guard: <outcome>
+    tool=... agent_id=... project=...`` line (``mcp_markup_middleware.py``
+    :615-619). Keep them STATIC — never interpolate the resolved outcome into a
+    suggested grep, for the reason ``writes_in_window=`` is a static key.
+
     NEVER raises. This is called from an MCP write path whose rejection has
     already been decided, so escalation is purely additive: every failure mode
     degrades to ``None`` plus a log line rather than changing the write's
@@ -300,9 +320,10 @@ def emit_markup_storm_escalation(
         'payload carries done_provenance, which the write-authority floor '
         'refuses. Its successor plans/toolcall-markup-containment-prd.md '
         'owns the live blast-radius, deterministic-repair and retro-sweep work. '
-        'Attach the agent_id, field and matched_pattern from the rejection '
-        "responses (grep the server logs for 'markup_tripwire_storm') against "
-        "that PRD's open leaves, not against 3083.",
+        "Attach the agent_id, tool, param and matched pattern from the guard's "
+        "own log lines — grep 'markup_guard_storm' for this burst and 'markup "
+        "guard:' for each individual call — against that PRD's open leaves, "
+        'not against 3083.',
     ])
 
     try:
@@ -322,9 +343,21 @@ def emit_markup_storm_escalation(
                 '(see plans/toolcall-markup-containment-prd.md)'
             ),
             detail=detail,
+            # Compact-projected BESIDE the summary (escalation/server.py:409-414
+            # lists it in _COMPACT_ESCALATION_FIELDS; :420 carries both into
+            # _COMPACT_PENDING_FIELDS) while `detail` is dropped by name — so
+            # the outcome-fidelity rule binds here exactly as it binds the
+            # summary, and the grep tokens must be ones an emitter writes.
+            # STATIC, never interpolated with the resolved outcome: an
+            # operator-facing hint whose text varies with the data cannot be
+            # grepped without already knowing the answer, and an unmeasured
+            # outcome would render `markup guard: None`.
             suggested_action=(
-                'identify the leaking caller from the rejection logs and report '
-                'it against plans/toolcall-markup-containment-prd.md — DF task '
+                'identify the leaking caller from the markup guard logs — grep '
+                "'markup_guard_storm' for this burst and 'markup guard:' for "
+                'the individual calls, whose outcome, tool, agent_id and '
+                'project are named on each line — and report it against '
+                'plans/toolcall-markup-containment-prd.md — DF task '
                 '3083 is done and closed to appends'
             ),
             level=1,
