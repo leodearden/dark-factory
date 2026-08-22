@@ -15006,9 +15006,17 @@ class Harness:
         migration — which fails safe toward KEEPING the halt when the predicate
         is unknowable, never toward releasing it.
 
-        Restoring the EVIDENCE (assigning ``self._ewa_value``) is unconditional
-        and independent of the halt decision, so even a blind restore no longer
-        loses the number.
+        The stored value is written back to LIVE state (``self._ewa_value``)
+        only for an ``ewa_trip_*`` row — the same predicate that governs the
+        halt decision, and the one class whose stored scalar IS the live
+        statistic.  For every other pause class it is forensic evidence about
+        a value that never tripped anything: seeding it would leave a latent
+        EWA trip input that ``resume_scheduler`` never clears (it resets only
+        on ``ewa_trip_`` reasons), turning a park-stop restart into a head
+        start toward the threshold.  The evidence is not lost by that
+        narrowing — every pause class still carries ``ewa_value`` on the
+        ``scheduler_pause_restored`` event and in the startup WARNING, which is
+        where an operator reads it.
         """
         if not self._run_store:
             return
@@ -15028,18 +15036,26 @@ class Harness:
                     pause_at,
                     restored_from_run_id,
                 )
-                # Restore the evidence FIRST — unconditional, and independent
-                # of the halt decision below (task 4559).
                 ewa_value = record.get('ewa_value')
-                if ewa_value is not None:
+                threshold = self.config.digest_ewa_threshold
+                # One class test, two decisions — hoisted to a single local so
+                # the live-state restore and the halt re-assertion below can
+                # never drift apart (task 4559).
+                is_ewa_trip = reason.startswith('ewa_trip_')
+
+                # Restore the value into LIVE state only for an ewa_trip_ row,
+                # the one class whose stored scalar IS the live statistic.  For
+                # any other class it is forensic evidence about a value that
+                # never tripped anything; seeding it would leave a head start
+                # toward the threshold that resume_scheduler never clears.
+                if is_ewa_trip and ewa_value is not None:
                     self._ewa_value = ewa_value
 
-                threshold = self.config.digest_ewa_threshold
                 # Re-assert unless this is an ewa_trip_ pause whose stored
                 # predicate demonstrably no longer holds.  A missing value is
                 # an unknowable predicate, so it re-asserts.
                 reassert = not (
-                    reason.startswith('ewa_trip_')
+                    is_ewa_trip
                     and ewa_value is not None
                     and ewa_value < threshold
                 )

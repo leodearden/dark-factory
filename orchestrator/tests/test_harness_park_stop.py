@@ -312,7 +312,8 @@ class TestHarnessRestartPersistence:
             'A halt whose predicate no longer holds must not be re-asserted'
         )
         assert harness._ewa_value == pytest.approx(9.0), (
-            f'Evidence restoration is unconditional; got {harness._ewa_value}'
+            'Restoration into live state is scoped to ewa_trip_ pauses, whose '
+            f'stored value IS the live statistic; got {harness._ewa_value}'
         )
         assert seeder.load_scheduler_pause('dark_factory') is None, (
             'The stale pause row must be cleared'
