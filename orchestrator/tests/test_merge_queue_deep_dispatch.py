@@ -1186,6 +1186,31 @@ def _spy_chain_lane_release(monkeypatch) -> list[tuple]:
     return calls
 
 
+
+def _fake_pass_runner(name: str = 'fake-runner'):
+    """A RemoteRunner-shaped fake whose ``run_merge_verify`` always passes.
+
+    Copied from test_merge_queue_depth_telemetry.py:153 rather than imported:
+    ``orchestrator/tests/`` has no ``__init__.py``, so a cross-module helper
+    import would be a bare-module-name import of a sibling TEST file, which
+    couples the two suites' collection order.
+    """
+    from unittest.mock import AsyncMock, MagicMock
+
+    from orchestrator.verify import VerifyResult
+
+    fake = MagicMock()
+    fake.name = name
+    fake.is_local = False
+    fake.run_merge_verify = AsyncMock(return_value=VerifyResult(
+        passed=True, test_output='ok', lint_output='', type_output='',
+        summary='ok', category='',
+    ))
+    fake.cancel_verify = AsyncMock(return_value=0)
+    fake.probe_clean = AsyncMock(return_value=True)
+    return fake
+
+
 def _fail_verify_result():
     """A failing :class:`VerifyResult` — a RED tip verdict."""
     from orchestrator.verify import VerifyResult
@@ -1601,3 +1626,410 @@ class TestDeepTipVerifyNeverAdopts:
         assert await worker._finalize_inflight(entry) is False
         assert worker._finalizing_head_entry() is None
         assert not item.request.result.done()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# step-19: RED — the task's USER-OBSERVABLE SIGNAL, as one integration class.
+#
+# Everything above pins a seam in isolation. This class is the only place the
+# seams are driven the way production drives them — `_dispatch_item` →
+# `_deep_chain_placement` → `_run_inflight_verify` → the halving state → the
+# NEXT round's `_deep_chain_placement` — because γ's whole thesis is a
+# multi-ROUND property: a tip verdict changes what the next dispatch builds.
+# A per-seam unit test can never see that, and the capability sidecar's
+# "manual/integration signal" for `deep-tip-dispatch-and-halving-state-machine`
+# is exactly this.
+#
+# Four properties, one per PRD row:
+#   (a) dispatched depths follow the halving policy across rounds  (6→3→floor→6)
+#   (b) the d=1 floor is byte-identical to a `chain_cap=0` dispatch
+#   (c) EVERY merge_verify carries an int `chain_items >= 1` (η1's reader)
+#   (d) conservation: no permit, worktree or `_spec-` lane left behind
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+_DEEP_QUEUE = ('102', '103', '104', '105', '106')
+"""Five chainable followers → ``queue_len`` 6, so ``cap=6`` binds, not the queue.
+
+Deliberately >= cap: with a shorter queue ``min(queue_len, cap)`` would be the
+QUEUE's length and the halving-walk assertions below would be pinning the
+fixture rather than the policy.
+"""
+
+
+async def _fresh_repo(tmp_path: Path, name: str) -> Path:
+    """Build a second independent fixture repo beside ``git_repo``'s.
+
+    The floor-byte-identity test needs two runs of the SAME fixture at
+    different ``chain_cap`` values, and a single repo cannot host both (the
+    branch names collide and the first run's worktree pool is already warm).
+    """
+    repo = tmp_path / name
+    repo.mkdir()
+    await _setup_repo(repo)
+    await _add_recording_seed_to_repo(repo)
+    return repo
+
+
+class _StubRemoteAllocator:
+    """Minimal HostAllocator stand-in handing out ONE remote lease at a time.
+
+    Used only by the ``chain_items`` scene, and REMOTE deliberately: a remote
+    lease makes ``_run_post_merge_verify`` build its pool from the injected
+    runner (merge_queue.py:2747-2758) instead of a real ``LocalRunner``, so
+    ``VerifyRunnerPool.dispatch`` — the single ``merge_verify`` emission site —
+    genuinely runs and genuinely emits.  Stubbing ``_run_post_merge_verify``
+    instead (what the other scenes do) would emit no event at all and make
+    every "every merge verify carries chain_items" assertion vacuous.
+    """
+
+    def __init__(self, lease) -> None:
+        self._lease = lease
+        self._held = False
+
+    def free_host_count(self) -> int:
+        return 0 if self._held else 1
+
+    async def acquire(self, _local_factory):
+        if self._held:
+            return None
+        self._held = True
+        return self._lease
+
+    async def release(self, _lease) -> None:
+        self._held = False
+
+    async def cancel_and_release(self, _lease) -> bool:
+        self._held = False
+        return True
+
+
+class _DeepScene:
+    """One repo + worker + queue, driven round after round by :meth:`round_`."""
+
+    def __init__(self, git_ops, config, worker, item_head, repo, store) -> None:
+        self.git_ops = git_ops
+        self.config = config
+        self.worker = worker
+        self.head = item_head
+        self.repo = repo
+        self.store = store
+        self.calls: list[dict] = []
+        self.posted: list[dict] = []
+        self.built: list[dict] = []
+        self.released: list[tuple] = []
+        self.lanes: list[str] = []
+        self._round_no = 0
+
+    @property
+    def depths(self) -> list[int | None]:
+        """The depth ACTUALLY dispatched each round, ``None`` for "no chain".
+
+        Read off the ``ChainResult`` handed to ``_run_inflight_verify`` — the
+        one place the built depth is a fact rather than an intention, since
+        ``build_chain`` truncates.
+        """
+        return [
+            None if c['chain'] is None else 1 + len(c['chain'].links)
+            for c in self.calls
+        ]
+
+    async def round_(self, *, tag: str) -> dict:
+        """Drive ONE full dispatch round through ``_dispatch_item``.
+
+        Returns the recorded ``_run_inflight_verify`` kwargs for the round
+        (plus ``'result'``).  Releases the host lease and any worktree the
+        ordinary (non-chain) arm hands back, so the next round starts from the
+        same resource state — which is what makes the ROUND SEQUENCE, and not
+        a slowly-leaking fixture, the thing under test.
+        """
+        self._round_no += 1
+        worker = self.worker
+        item = _make_item(
+            _make_req('101', '101', self.config, self.repo), self.head,
+            _ephemeral_merge_wt(self.git_ops, f'{tag}-r{self._round_no}'),
+        )
+        entry = await worker._dispatch_item(item)
+        assert entry is not None, 'dispatch must not decline: a host is free'
+        assert entry.verify_task is not None
+        await entry.verify_task
+
+        rec = self.calls[-1]
+        rec['item'] = item
+        rec['round'] = self._round_no
+        if entry.lease is not None:
+            await worker._host_allocator.release(entry.lease)
+        vr = rec['result']
+        if vr.merge_wt is not None:
+            # The ordinary arm hands its verified worktree to _finalize_inflight;
+            # this scene stops short of finalize (γ lands nothing), so return it
+            # here or the pool starves the next round.
+            await worker._release_or_cleanup(vr.merge_wt, spec_warm=vr.spec_warm)
+        return rec
+
+
+async def _make_deep_scene(
+    repo: Path, *, chain_cap: int, script: list[bool], monkeypatch,
+    allocator=None,
+) -> _DeepScene:
+    """Build a scene whose verify oracle returns *script* verdicts in order.
+
+    *script* is one bool per round (``True`` == the verify passed).  When
+    *allocator* is given it is installed on the worker BEFORE first use, so
+    ``_ensure_host_allocator``'s cache check (merge_queue.py:10288) short-
+    circuits and the real one is never built.
+    """
+    git_ops = _make_git_ops(repo, size=2)
+    config = _make_config(repo, chain_cap=chain_cap)
+    await _create_branch_editing(repo, 'task/101', 'a.txt', 'edit-101\n')
+    for tid in _DEEP_QUEUE:
+        await _create_branch_editing(repo, f'task/{tid}', f'f{tid}.txt', f'edit-{tid}\n')
+    head = await _merge_commit_off_main(repo, 'task/101', '101')
+    store = _CapturingEventStore()
+    worker = _make_worker(git_ops)
+    worker._event_store = store
+    worker._lane_buffers['normal'].extend(
+        _make_req(tid, tid, config, repo) for tid in _DEEP_QUEUE
+    )
+    if allocator is not None:
+        worker._host_allocator = allocator
+    scene = _DeepScene(git_ops, config, worker, head, repo, store)
+
+    # ── the round recorder, installed ONCE ───────────────────────────────────
+    # Once, not per round: re-wrapping `worker._run_inflight_verify` each round
+    # would capture the PREVIOUS round's recorder as `real` and nest the
+    # wrappers one deeper every round.
+    real_verify = worker._run_inflight_verify
+
+    async def _recording(_item, _lease, **kwargs):
+        rec = dict(kwargs)
+        rec['lease_is_local'] = _lease.is_local
+        scene.calls.append(rec)
+        rec['result'] = await real_verify(_item, _lease, **kwargs)
+        return rec['result']
+
+    monkeypatch.setattr(worker, '_run_inflight_verify', _recording)
+    scene.built = _spy_build_chain(monkeypatch, passthrough=True)
+    scene.released = _spy_chain_lane_release(monkeypatch)
+    scene.lanes = _count_spec_lane_acquires(git_ops, monkeypatch)
+
+    if script is not None:
+        verdicts = list(script)
+
+        async def _oracle(_git_ops, _req, merge_wt, **kwargs):
+            scene.posted.append({'merge_wt': merge_wt, **kwargs})
+            passed = verdicts.pop(0) if verdicts else True
+            return None if passed else _fail_verify_result()
+
+        monkeypatch.setattr(
+            'orchestrator.merge_queue._run_post_merge_verify', _oracle,
+        )
+    return scene
+
+
+def _round_transcript(scene: _DeepScene, idx: int) -> dict:
+    """Normalise ONE round into a repo-independent, comparable transcript.
+
+    Absolute paths and SHAs differ between two fixture repos, so the
+    comparison is made on the FACTS instead: was a chain handed down, what
+    depth/base/chain_items were labelled, was the item's OWN merge commit the
+    thing verified, and which pool lane did the verify run in.
+    """
+    rec = scene.calls[idx]
+    posted = scene.posted[idx]
+    item = rec['item']
+    return {
+        'chain': rec['chain'],
+        'chain_items': rec['chain_items'],
+        'depth': rec['depth'],
+        'probe_base': rec['probe_base'],
+        'verified_the_items_own_merge_commit':
+            posted['merge_sha'] == item.merge_result.merge_commit,
+        'verify_worktree_name': Path(posted['merge_wt']).name,
+        'speculative': posted.get('speculative'),
+        'result_status': rec['result'].status,
+        'result_has_worktree': rec['result'].merge_wt is not None,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(180)
+class TestDeepDispatchRoundsIntegration:
+    """γ end to end: successive rounds, a scripted oracle, real git."""
+
+    async def test_dispatch_depths_follow_the_halving_walk(
+        self, git_repo: Path, monkeypatch,
+    ):
+        """PRD row "Halving walk isolates bad item": 6 → 3 → floor → 6.
+
+        Rounds 1-2 fail, so the bisector halves twice and lands on the d=1
+        floor, where the gate declines and the pipeline is back on today's
+        adjacent verify.  Round 3 (the floor round) PASSES — and PRD decision 5
+        is explicit that **any** pass resets — so round 4 must chain at
+        ``min(queue_len, cap)`` again.  Without that reset the walk is a
+        one-way ratchet: two red rounds would disable deep merge-ahead for the
+        entire life of the worker process, silently, which is precisely the
+        failure mode ``next_halving_state``'s ``max(1, ...)`` floor exists to
+        prevent one step earlier.
+        """
+        scene = await _make_deep_scene(
+            git_repo, chain_cap=6, script=[False, False, True, True],
+            monkeypatch=monkeypatch,
+        )
+
+        for _ in range(4):
+            await scene.round_(tag='walk')
+
+        assert scene.depths == [6, 3, None, 6]
+        assert scene.worker._chain_halving_state is None, 'a pass resets'
+
+    async def test_halving_state_walks_down_in_lockstep_with_the_depths(
+        self, git_repo: Path, monkeypatch,
+    ):
+        """The state AFTER each round, which is what the next round reads."""
+        scene = await _make_deep_scene(
+            git_repo, chain_cap=6, script=[False, False, True, True],
+            monkeypatch=monkeypatch,
+        )
+        seen: list[int | None] = []
+
+        for _ in range(4):
+            await scene.round_(tag='state')
+            seen.append(scene.worker._chain_halving_state)
+
+        assert seen == [3, 1, None, None]
+
+    async def test_floor_round_is_byte_identical_to_a_cap_zero_dispatch(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """(b) The d=1 floor IS today's adjacent verify — not a mimic of it.
+
+        Byte-identity here is BY CONSTRUCTION: ``select_chain_depth`` returns
+        ``None`` below 2, so at the floor no chain code executes at all.  This
+        test is the fence around that construction — it compares the floor
+        round of a ``chain_cap=6`` walk against the first round of the same
+        fixture at ``chain_cap=0`` (the shipped kill switch) and requires the
+        two dispatches to agree on every observable.
+        """
+        deep_repo = await _fresh_repo(tmp_path, 'deep')
+        flat_repo = await _fresh_repo(tmp_path, 'flat')
+        deep = await _make_deep_scene(
+            deep_repo, chain_cap=6, script=[False, False, True],
+            monkeypatch=monkeypatch,
+        )
+        for _ in range(2):
+            await deep.round_(tag='floor')
+        # Snapshot BEFORE the floor round, not after it: rounds 1-2 chained and
+        # each took a lane, so a post-hoc count cannot tell the floor round's
+        # own work from theirs.
+        n_built_before_floor = len(deep.built)
+        n_lanes_before_floor = len(deep.lanes)
+        n_released_before_floor = len(deep.released)
+        await deep.round_(tag='floor')
+
+        flat = await _make_deep_scene(
+            flat_repo, chain_cap=0, script=[True], monkeypatch=monkeypatch,
+        )
+        await flat.round_(tag='flat')
+
+        assert deep.depths[2] is None, 'round 3 must be the FLOOR round'
+        assert _round_transcript(deep, 2) == _round_transcript(flat, 0)
+        # ...and the floor round did no chain work of any kind.
+        assert len(deep.built) == n_built_before_floor, 'zero build_chain calls'
+        assert len(deep.released) == n_released_before_floor, 'no lane to release'
+        assert flat.built == [], 'cap=0 never reaches the builder either'
+        # The warm-swap block ran on BOTH — one _spec- acquisition for the
+        # item's own merge commit, which is what "today's adjacent verify"
+        # means observably (see this module's note on how the bypass is seen).
+        assert len(deep.lanes) == n_lanes_before_floor + 1
+        assert deep.lanes[-1] == deep.calls[2]['item'].merge_result.merge_commit
+        assert flat.lanes == [flat.calls[0]['item'].merge_result.merge_commit]
+
+    async def test_every_merge_verify_carries_chain_items(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """(c) η1's reader can see a deep verify at all.
+
+        ``scripts/merge-deep-canary-predicate.sh:84`` counts merge verifies
+        with ``chain_items >= 2``; today it always reports 0 because no such
+        event exists.  This drives the REAL emission site
+        (``VerifyRunnerPool.dispatch``) over a mixed run — a slot-1 head
+        verify, a deep tip verify, a halved tip verify and a floor verify —
+        and requires the field present, integral and truthful on all of them.
+        """
+        from orchestrator.verify_runner import HostLease
+
+        repo = await _fresh_repo(tmp_path, 'events')
+        lease = HostLease(
+            name='laptop', runner=_fake_pass_runner(), is_local=False,
+        )
+        scene = await _make_deep_scene(
+            repo, chain_cap=6, script=None, monkeypatch=monkeypatch,
+            allocator=_StubRemoteAllocator(lease),
+        )
+
+        # slot 1 (the trust anchor) — never chained, so a flat 1.
+        #
+        # base_sha is REAL MAIN, deliberately: a slot-1 item is merged onto
+        # main, and a stale base would fire _dispatch_item's Mechanism-2
+        # staleness re-merge, which sets `_remerge_occurred` and makes every
+        # LATER speculative round re-merge as `chain_invalidated` — arriving at
+        # _deep_chain_placement non-speculative, so no round after this one
+        # would chain at all and the whole scene would go quietly vacuous.
+        head_item = _make_item(
+            _make_req('101', '101', scene.config, repo), scene.head,
+            _ephemeral_merge_wt(scene.git_ops, 'ev-head'), speculative=False,
+            base_sha=await _rev_parse(repo, 'main'),
+        )
+        entry = await scene.worker._dispatch_item(head_item)
+        assert entry is not None and entry.verify_task is not None
+        await entry.verify_task
+        await scene.worker._host_allocator.release(entry.lease)
+        _vr = scene.calls[-1]['result']
+        if _vr.merge_wt is not None:
+            await scene.worker._release_or_cleanup(
+                _vr.merge_wt, spec_warm=_vr.spec_warm,
+            )
+
+        # slot 2: deep (6) → halved (3) → floor (no chain).  The fake runner
+        # always passes, so drive the halving by hand rather than by verdict —
+        # this test is about the EVENT, not the policy (that is test (a)).
+        for state, tag in ((None, 'ev-deep'), (3, 'ev-halved'), (1, 'ev-floor')):
+            scene.worker._chain_halving_state = state
+            await scene.round_(tag=tag)
+
+        events = scene.store.events_of(EventType.merge_verify)
+        assert len(events) == 4, 'one merge_verify per dispatched round'
+        for ev in events:
+            assert isinstance(ev['data'].get('chain_items'), int)
+            assert not isinstance(ev['data']['chain_items'], bool)
+            assert ev['data']['chain_items'] >= 1
+
+        assert [e['data']['chain_items'] for e in events] == [1, 6, 3, 1]
+        deep_events = [e for e in events if e['data']['chain_items'] >= 2]
+        assert len(deep_events) == 2, 'η1 must be able to SEE a deep verify'
+
+    async def test_conservation_holds_across_the_whole_run(
+        self, git_repo: Path, monkeypatch,
+    ):
+        """(d) PRD ι: nothing leaks over a full mixed run.
+
+        Speculation permits, the worktree ledger and the ``_spec-`` pool are
+        the three resources γ touches, and a chain that acquires a lane per
+        round is exactly the shape that strands one.
+        """
+        from orchestrator.warm_lane_pool import LaneState
+
+        scene = await _make_deep_scene(
+            git_repo, chain_cap=6, script=[False, False, True, True],
+            monkeypatch=monkeypatch,
+        )
+
+        for _ in range(4):
+            await scene.round_(tag='conserve')
+
+        assert scene.worker.speculation_accounting_violations() == []
+        assert scene.worker.worktree_ledger_violations(grace_secs=0.0) == []
+        assert all(s is LaneState.FREE for s in _lane_states(scene.git_ops)), \
+            'every chain lane went back to the pool'
+        assert len(scene.released) == 3, 'released once per round that chained'
