@@ -36,6 +36,7 @@ other ~16000 tests, which is exactly the ceiling that catches real hangs.
 """
 from __future__ import annotations
 
+import ast
 import tomllib
 
 import pytest
@@ -133,6 +134,79 @@ class TestTimeoutConstants:
             'xdist worker deaths this guard exists to prevent were seen at '
             'loadavg 250-423; anything tighter re-arms that cliff.'
         )
+
+
+#: Path methods that expand a glob pattern over a directory tree.
+_GLOB_METHODS = frozenset({'glob', 'rglob'})
+
+
+def _scans_whole_tree_py(source: str) -> bool:
+    """True if *source* sweeps a directory tree for Python files.
+
+    Matches an :class:`ast.Call` whose ``func`` is an :class:`ast.Attribute`
+    with ``attr`` in ``{'glob', 'rglob'}`` and whose FIRST positional argument
+    is a string literal that both contains ``*`` and ends in ``.py`` -- i.e. a
+    pattern that expands to "every Python file under here" rather than to one
+    named file or to some other suffix.
+
+    DELIBERATE SCOPE, and why each half of it is drawn where it is:
+
+    * **AST, not a text grep** -- the same justification the sibling guards
+      give (test_raw_semaphore_access_guard.py:52-54,
+      test_prune_chokepoint_guard.py). A docstring or comment merely
+      MENTIONING ``rglob('*.py')`` cannot trip it, which matters more here
+      than usual: this module's own docstring is full of such mentions, and so
+      are the per-file comments step-6 adds to the twelve files it marks.
+
+    * **Matched on the ATTRIBUTE name only**, never on the receiver. All three
+      scan-root idioms in this directory therefore hit the same code path --
+      ``_TESTS_DIR.rglob(...)``, ``_SRC_DIR.rglob(...)``, ``REPO_ROOT.rglob(...)``,
+      ``_orchestrator_src_root().rglob(...)`` -- with no allowlist of receiver
+      names to keep in sync.
+
+    * **Wildcard required.** ``glob('conftest.py')`` names at most one file
+      per directory; the hazard being guarded is ``ast.parse`` over hundreds
+      of modules, not a lookup.
+
+    * **``.py`` suffix required.** ``glob('*/src/*')`` (a real pattern, at
+      test_killpg_frozen_pgid_guard.py:433-434) walks directories, not Python
+      sources. Restricting to ``.py`` is what keeps that file's genuine
+      ``rglob('*.py')`` at :447 caught without its directory walks being
+      misread as three more scans.
+
+    KNOWN LIMITATION, stated rather than papered over: an f-string, a
+    variable, or a pattern built at runtime is NOT matched, and neither is a
+    sweep whose per-file cost comes from something other than a ``.py`` glob.
+    This detector is therefore a FLOOR on family coverage, not a proof of
+    totality -- the same conservative-under-demand stance task 3492's auditor
+    took ("it can under-demand ... but must never over-demand"). The
+    anti-vacuity assertion in the family invariant below is what stops that
+    concession from quietly becoming total.
+
+    Fails SOFT: an unparseable *source* yields ``False`` rather than raising,
+    matching test_prune_chokepoint_guard.py:138-141 and
+    test_raw_semaphore_access_guard.py:76-79. A file mid-edit, or a fixture
+    that is malformed on purpose, must not turn this guard red.
+    """
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return False
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not (isinstance(func, ast.Attribute) and func.attr in _GLOB_METHODS):
+            continue
+        if not node.args:
+            continue
+        first = node.args[0]
+        if not (isinstance(first, ast.Constant) and isinstance(first.value, str)):
+            continue
+        if first.value.endswith('.py') and '*' in first.value:
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
