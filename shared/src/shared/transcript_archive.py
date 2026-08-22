@@ -746,6 +746,7 @@ def restore_archived_transcript(
     task_id: str,
     session_id: str,
     config_dir: Path,
+    strict: bool = False,
 ) -> Path | None:
     """Rehydrate *session_id*'s archived transcript into *config_dir*.
 
@@ -781,6 +782,22 @@ def restore_archived_transcript(
     for the same reason :func:`_archive_one` mirrors it outbound: a copy
     stamped ``now`` reads to the next archival pass as newer than its own
     archive and is pointlessly re-archived over it.
+
+    ``strict`` selects who classifies a genuine FAULT. It defaults to
+    ``False``, preserving the published totality contract (the sibling of
+    :func:`durable_archive_path`'s I-A, pinned by
+    ``test_a_genuine_fault_returns_none_loudly_and_never_raises``) for every
+    caller that wants a helper which cannot fail. ``strict=True`` re-raises
+    after the WARNING is emitted, and exists for the ONE caller that already
+    brackets this call in its own blanket ``except``: without it, a broken
+    restore and an empty archive are the same ``None`` there, so the whole
+    fault population is mis-bucketed as an archive MISS and an operator is
+    sent to chase coverage instead of the breakage. Totality is then held at
+    the composite level rather than surrendered. Only genuine faults are
+    affected, by construction: the miss and no-clobber early-returns sit ABOVE
+    the handler and never enter it, so ``strict`` can never turn a miss into a
+    raise. The orchestrator's arm site is currently the sole production
+    caller, making this an additive seam rather than a migration.
     """
     # Imported lazily, NOT at module scope: transcript_archive is a leaf on the
     # PURE_STDLIB_LEAVES contract and cli_invoke is a heavy sibling, so a
@@ -889,9 +906,22 @@ def restore_archived_transcript(
             config_dir,
             exc,
             extra={
+                # The HELPER-layer half of the fault pair, deliberately named
+                # apart from the dispatch layer's session_resume_restore_fault
+                # (workflow.py): both now fire for one underlying fault, and a
+                # shared name would double-count it under one greppable key.
+                # This record is the one carrying errno/path; that one carries
+                # task/role/session.
+                'event': 'transcript_restore_fault',
                 'path': str(config_dir),
                 'task_id': str(task_id),
                 'errno': getattr(exc, 'errno', None),
             },
         )
+        # LOG, then propagate — never one or the other. The WARNING keeps the
+        # fault greppable at this layer; the raise is what lets the caller one
+        # frame up tell it apart from a plain miss. See the docstring for why
+        # the default stays total.
+        if strict:
+            raise
         return None
