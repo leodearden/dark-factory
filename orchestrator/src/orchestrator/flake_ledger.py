@@ -63,10 +63,11 @@ do NOT wire a second filing path through this module — ζ owns the single fili
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
@@ -168,6 +169,90 @@ class FlakeSuppression:
     runner: str  # 'local' | remote host name — WHERE the re-run ran
     psi_cpu_some10: float | None  # shared.psi at observation; None when read_ok is False
     unconfirmable_reason: str | None  # populated iff verdict is unconfirmable
+
+
+def flake_suppression_from_wire(d: object) -> FlakeSuppression | None:
+    """Rebuild a :class:`FlakeSuppression` from its JSON-decoded wire form (§8, §8.4).
+
+    The READ half of the ``VerifyResult.flake_suppression`` carrier.  ``result_to_dict``
+    is ``dataclasses.asdict`` and ``result_from_dict`` is a bare ``VerifyResult(**d)``
+    (verify_runner.py:362-373), so the WRITE half needs nothing — ``json.dumps``
+    flattens a ``StrEnum`` to its value and a tuple to an array losslessly — but the read
+    half hands ``verdict``/``call_site`` back as plain ``str`` and ``test_ids`` as a
+    ``list``.  Coercing here is what makes the field's annotation true on the
+    deserialized path and makes the round-trip equality-preserving.
+
+    It NEVER raises, and that is the load-bearing property, not politeness:
+    ``RemoteRunner.run_merge_verify`` converts any ``TypeError``/``ValueError`` escaping
+    ``result_from_json`` into a ``RunnerUnavailable`` (verify_runner.py:1447), which the
+    pool pays for with a whole local re-verify.  Letting one malformed sub-payload cost a
+    re-verify would be strictly worse than dropping the one observation it carried, so a
+    bad payload degrades to ``None`` plus a LOUD warning (B12's discipline, applied to
+    the wire).
+
+    It is deliberately NOT a validator.  An unrecognised ``verdict``/``call_site`` string
+    is PRESERVED on the field rather than rejected, so that
+    :func:`record_flake_occurrence`'s existing coercion guard stays the SINGLE write-time
+    vocabulary policy.  Duplicating that policy here would give a producer that went
+    off-vocabulary two different failure modes depending on whether it ran locally or
+    across the wire — and would delete the evidence before the log line that names the
+    bug could be emitted.
+    """
+    if d is None:
+        return None
+    try:
+        # `bool` is an `int` and neither is a payload; the isinstance check below rejects
+        # every non-mapping uniformly, which is what B13's "old remote sent something
+        # else entirely" case needs.
+        if not isinstance(d, dict):
+            logger.warning(
+                'flake_ledger: flake_suppression arrived as %s, not a dict; dropping the '
+                'observation (%r)',
+                type(d).__name__,
+                d,
+            )
+            return None
+
+        # Project onto exactly the declared field names: an unknown key from a NEWER
+        # producer must not cost the observation it rides along with (forward-compat),
+        # and `FlakeSuppression(**d)` would `TypeError` on it.
+        field_names = tuple(f.name for f in fields(FlakeSuppression))
+        kwargs = {name: d[name] for name in field_names if name in d}
+
+        # Coerce the two vocabulary fields back to members, falling back to the RAW value
+        # so an off-vocabulary string reaches `record_flake_occurrence`'s B12 guard
+        # intact (see the docstring — one coercion policy, at write time).
+        for name, enum_cls in (('verdict', FlakeVerdict), ('call_site', FlakeCallSite)):
+            if name in kwargs:
+                with contextlib.suppress(ValueError):
+                    kwargs[name] = enum_cls(kwargs[name])
+
+        # Same bare-str hazard `record_flake_occurrence` guards (see its `test_ids`
+        # comment): `tuple('a::t')` explodes one node-id into one entry per CHARACTER.
+        # Wrapped identically rather than with a second, divergent rule.
+        supplied = kwargs.get('test_ids')
+        if isinstance(supplied, str):
+            logger.warning(
+                'flake_ledger: wire test_ids arrived as a bare str (%r); treating it as '
+                'ONE node-id — the producer should send a list',
+                supplied,
+            )
+            kwargs['test_ids'] = (supplied,)
+        elif supplied is not None:
+            kwargs['test_ids'] = tuple(supplied)
+
+        # A missing REQUIRED key raises TypeError here and is caught below — a truncated
+        # payload is a producer bug worth a loud line, not a half-built observation.
+        return FlakeSuppression(**kwargs)
+    except Exception:
+        logger.warning(
+            'flake_ledger: could not rebuild a FlakeSuppression from the wire payload '
+            '%r; dropping the observation (a malformed sub-payload must never cost a '
+            're-verify)',
+            d,
+            exc_info=True,
+        )
+        return None
 
 
 @dataclass(frozen=True)
