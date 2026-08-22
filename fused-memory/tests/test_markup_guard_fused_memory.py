@@ -646,6 +646,75 @@ class TestStormEscape:
         assert not (tmp_path / 'data' / 'escalations').exists()
 
     @pytest.mark.asyncio
+    async def test_a_two_project_window_credits_each_project_only_its_own(
+        self, tmp_path
+    ):
+        """The headline (task 4505): ONE server, TWO projects, no cross-credit.
+
+        This is esc-markup-tripwire-6 reproduced in miniature. That record was
+        filed into reify's queue carrying count=3 for a window reify had
+        contributed 1 to, because the retired ``MarkupStormCounter`` held one
+        window per SERVER. Task 4458 replaced it with
+        ``MarkupGuardMiddleware._record_storm``, which keys one ``StormCounter``
+        per ``(project, outcome)`` pair (mcp_markup_middleware.py:648-652) — so
+        the count is now per-project. That correctness is INCIDENTAL to a keying
+        choice made for a different reason (separating the three outcomes) and
+        is untested; a future re-pool, or a re-key by outcome alone, would bring
+        the incident back with nothing failing.
+
+        The numbers are derived, not chosen. ``_BURST`` is 3 in a 3600s window
+        and ``StormCounter.record()`` fires EXACTLY when the in-window count
+        reaches the threshold, then rate-limits for the rest of the window
+        (storm_counter.py:132-139). Counted independently, proj_a reaches 3 on
+        the fifth call and fires with count=3, while proj_b only ever reaches 2
+        and never fires at all. Pooled, the THIRD call — proj_b's first — would
+        have crossed the threshold and filed a record for proj_b stating 3.
+        """
+        dir_a = tmp_path / 'proj-a'
+        dir_b = tmp_path / 'proj-b'
+        dir_a.mkdir()
+        dir_b.mkdir()
+        server, _ = self._server({'proj_a': str(dir_a), 'proj_b': str(dir_b)})
+
+        # Interleaved on purpose: A, A, B, B, A. A pooled window crosses the
+        # threshold on proj_b's first call; two independent windows do not.
+        await self._burst(server, project_id='proj_a', n=2)
+        await self._burst(server, project_id='proj_b', n=2)
+        await self._burst(server, project_id='proj_a', n=1)
+
+        # (a) The structural invariant 4458 delivered but never pinned.
+        records = _escalations(dir_a)
+        assert len(records) == 1, (
+            f'proj_a reached the threshold exactly once: {records!r}'
+        )
+        assert not (dir_b / 'data' / 'escalations').exists(), (
+            'proj_b contributed 2 rejections, below the threshold of '
+            f'{_BURST} — it must be credited with NOTHING'
+        )
+
+        # (b) The record must not contradict (a) in what it tells the triager.
+        # Substrings are asserted LABELLED, never as bare digits: the
+        # interpolated tmp_path (/tmp/pytest-of-leo/pytest-124/...) carries
+        # digits and 'window_seconds=3600.0' carries a 3, so `'3' in detail`
+        # passes vacuously even with the count dropped entirely.
+        detail = records[0]['detail']
+        summary = records[0]['summary']
+        assert 'projects_in_window' not in detail, (
+            'the live producer emits `project` (singular) and never `projects`, '
+            'so this key renders a dead `None` beside a comment claiming the '
+            f'count may span other projects — which (a) proves it cannot: {detail!r}'
+        )
+        assert "outcome='rejected'" in detail, (
+            f'the count is a count of ONE outcome; name it: {detail!r}'
+        )
+        # summary is the ONLY field a compact consumer is projected
+        # (escalation/server.py:409-420 drops `detail` by name), so the scope
+        # marker has to live there or the L1 watcher never sees it.
+        assert 'in this project' in summary, (
+            f'the summary must scope the count to this project: {summary!r}'
+        )
+
+    @pytest.mark.asyncio
     async def test_the_filed_record_routes_at_the_live_prd(self, tmp_path):
         """The measured defect (c): routing text.
 
