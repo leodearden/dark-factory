@@ -16,7 +16,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, TypeGuard
+from typing import IO, TYPE_CHECKING, Any, TypeGuard
 
 # VllmBridge depends on aiohttp, which is not installed in every consumer
 # environment (e.g. dashboard's venv).  Tolerate ImportError so that callers
@@ -45,11 +45,20 @@ _CAP_HIT_COOLDOWN_SECS = 5.0
 _MAX_CAP_COOLDOWN_SECS = 300.0
 # Bounded retry budget for a pre-turn CLI rejection (task 3143 / esc-3118-1):
 # the CLI exited on argument validation before contacting the API, so nothing
-# was billed and no work was lost — a free retry.  ONE is deliberate: a single
-# rejection is consistent with a transient race delivering the prompt to the
-# child's stdin, but a SECOND consecutive one is deterministic (a genuinely
-# blank prompt, a broken argv, a wrapper that never pipes stdin) and must reach
-# a human via the normal steward/escalation path instead of looping.
+# was billed and no work was lost — a free retry.  ONE is deliberate: any
+# SECOND consecutive rejection is deterministic (a genuinely blank prompt, a
+# broken argv, a wrapper that never pipes stdin) and must reach a human via the
+# normal steward/escalation path instead of looping.
+#
+# NOTE (task 3147): this was originally written when a single rejection was
+# thought to be MOST likely a transient race delivering the prompt to the
+# child's stdin.  That race was subsequently confirmed by reproduction AND
+# structurally closed on BOTH runners — the payload is now pre-materialized
+# into an fd before execve (see _materialize_stdin), so a stalled event loop
+# can no longer starve the child.  A rejection reaching here is therefore now
+# much more likely to be the DETERMINISTIC kind.  The retry is retained as a
+# backstop for those genuinely deterministic causes, which 3147 does not make
+# impossible — it is no longer the race mitigation it was written to be.
 _MAX_CLI_INPUT_REJECTED_RETRIES = 1
 # Poll interval for the two-regime liveness watchdog in _run_subprocess.
 # Each tick reads the on-disk transcript to check for assistant turns; the
@@ -793,6 +802,18 @@ def is_cli_invocation_rejected(result: AgentResult) -> bool:
     with ``turns=0``, ``cost_usd=0.0``, ``duration_ms=17331``,
     ``timed_out=False``, and empty stdout.
 
+    CAUSE CONFIRMED AND FIXED (task 3147) — do not re-investigate.  The
+    observed payload above was reproduced against the real CLI (v2.1.226) and
+    against ``_run_subprocess`` itself: the spawn path passed a bare
+    ``stdin=PIPE`` and left the prompt to be written by the EVENT LOOP after
+    ``execve``, so any loop stall past the CLI's ~3s stdin deadline lost the
+    run.  (The otherwise-puzzling multi-second ``duration_ms`` on a run that
+    never reached a turn is the CLI's teardown, which runs long AFTER it has
+    already given up on stdin.)  The fix pre-materializes the payload into an
+    fd before spawn on BOTH runners — see ``_materialize_stdin``.  What can
+    still legitimately arrive here is the deterministic family: a blank
+    prompt, a broken argv, or a wrapper that never pipes stdin.
+
     Deliberately contrasted with ``is_zero_output_timeout``: that predicate is
     keyed to the TIMEOUT family (it returns False immediately unless
     ``result.timed_out``), so it always misses this failure — which is exactly
@@ -847,11 +868,19 @@ def require_non_blank_prompt(
     ``cmd = ['claude', '--print', '--output-format', 'json']`` and NEVER
     appends a positional prompt or a ``-`` stdin marker (unlike the codex
     backend in ``orchestrator/agents/invoke.py``, which passes its own input
-    argument).  The prompt is delivered solely by
-    ``stdin_data = prompt.encode()``, and a blank one pipes happily — the CLI
+    argument).  The prompt is delivered solely on stdin — ``stdin_data =
+    prompt.encode()``, pre-materialized into an unlinked temp file and handed
+    to the child as an already-open fd (task 3147; see ``_materialize_stdin``)
+    — and a blank one is delivered just as happily as a real one.  The CLI
     then exits on argument validation with an opaque
     "Input must be provided either through stdin or as a prompt argument"
     error, zero-cost and zero-turn, with no indication that WE sent nothing.
+
+    That argv shape is why this guard is load-bearing and why the delivery
+    mechanism may never move to argv: with no positional prompt and no ``-``
+    marker, the CLI cannot distinguish "empty input" from "no input", so both
+    a blank prompt and (before 3147) an undelivered one produced the identical
+    opaque error.  Pinned by ``test_argv_never_carries_the_user_prompt``.
 
     Called at every boundary that can originate an invocation, so the failure
     surfaces at the caller that built the blank prompt — with *context* naming
@@ -1806,6 +1835,12 @@ async def invoke_with_cap_retry(
                 # argument validation BEFORE contacting the API.  The agent was
                 # never asked anything, nothing was billed and no transcript
                 # exists — so this is a free retry, not an agent failure.
+                # Since task 3147 the TRANSIENT cause (a stalled event loop
+                # missing the child's stdin deadline) is structurally closed on
+                # both runners, so what reaches here should now be the
+                # deterministic family — for which the single retry is a
+                # backstop that buys one more attempt before escalating, not a
+                # fix.  See _MAX_CLI_INPUT_REJECTED_RETRIES.
                 #
                 # POSITIONING is load-bearing in two directions:
                 # - ABOVE the heuristic cap safety-net below: the CLI's stdin
@@ -2509,7 +2544,12 @@ async def _invoke_claude(
         strict_mcp_config=strict_mcp_config,
     )
 
-    # User prompt is piped via stdin to avoid ARG_MAX on large payloads
+    # User prompt goes over stdin, never argv, to avoid ARG_MAX on large
+    # payloads (and to keep it out of `ps` output and systemd scope names).
+    # _run_subprocess pre-materializes these bytes into an unlinked temp file
+    # BEFORE spawning, rather than writing them to a pipe afterwards, so a
+    # stalled event loop cannot make the child miss its ~3s stdin deadline
+    # (task 3147 — see _materialize_stdin).
     stdin_data = prompt.encode()
 
     # Strip ANTHROPIC_API_KEY so `claude` falls back to OAuth
@@ -2752,6 +2792,19 @@ def _cpu_govern_prefix(env: dict[str, str]) -> list[str]:
     process-group kill logic in ``_run_subprocess`` are unaffected.  Cargo and
     rustc children inherit the cgroup scope via fork, which is the intended
     effect for DF-1.
+
+    TIMING (task 3147): the wrapper performs TWO blocking ``systemd-run --user
+    --scope`` D-Bus round-trips — a probe plus the real exec — before the CLI
+    itself execs.  That measurably WIDENS the window between spawn and the
+    child's first read of stdin.  It was investigated as a suspect for the
+    esc-3118-1 starvation race and REFUTED as the cause (it is inert in the
+    live deployment: ``cpu_governance.exec_path`` is unset, so
+    ``resolved_exec_path()`` returns None and this function emits nothing); the
+    cause was the parent writing the prompt to a pipe AFTER ``execve``.  It is
+    harmless now that the payload is pre-materialized before spawn — and that
+    is exactly why the delivery must not be "optimized" back to a lazily-written
+    pipe: this wrapper would widen the window that fix closed.  Pinned by
+    ``TestStdinStarvationRace::test_stdin_survives_govern_and_nice_wrapper_chain``.
     """
     raw = env.pop('DF_AGENT_CPU_GOVERN', None)
     if not raw:
@@ -2804,6 +2857,87 @@ def _cpu_priority_prefix(env: dict[str, str]) -> list[str]:
     return ['nice', '-n', str(n)]
 
 
+def _materialize_stdin(stdin_data: bytes) -> IO[bytes]:
+    """Write *stdin_data* into an unlinked temp file and return it positioned at 0.
+
+    THE INVARIANT: the payload is resident in the kernel BEFORE ``execve``, so
+    the child's very first ``read(0)`` succeeds no matter how long — or how
+    badly — the parent's event loop is stalled.
+
+    This closes the race confirmed under task 3147 (esc-3118-1, and the
+    esc-3072-1 / 3111-1 / 3112-1 / 3113-1 burst that landed within 7 seconds of
+    it).  The previous shape spawned with ``stdin=PIPE`` and then handed the
+    bytes to ``communicate(input=...)``, i.e. the payload was written to the
+    child's pipe BY THE EVENT LOOP, after the child had already exec'd and
+    started counting.  The claude CLI gives up on an empty stdin after ~3s
+    ('no stdin data received in 3s') and — because its argv carries neither a
+    positional prompt nor a ``-`` stdin marker (see ``build_claude_argv``) — it
+    cannot tell "input is coming" from "there is no input", so it exits on
+    ARGUMENT VALIDATION pre-first-turn: ``turns=0``, ``cost_usd=0.0``,
+    ``timed_out=False``, empty stdout.  Any loop stall >= that deadline in the
+    window between exec and the write was silently, unrecoverably fatal, and
+    the orchestrator runs one event loop across up to 48 concurrent agents.
+
+    ``tempfile.TemporaryFile()`` is unlinked at creation (Linux ``O_TMPFILE``),
+    so the payload never appears in the filesystem namespace, needs no
+    ``temp_files`` bookkeeping or ``finally`` unlink, and its inode is
+    reclaimed when the last fd closes even if the process is killed mid-spawn.
+    A pre-filled ``os.pipe()`` was measured to close the race too but is
+    capacity-bounded (65536 bytes by default, 1 MiB ceiling via
+    ``/proc/sys/fs/pipe-max-size``): writing a larger payload would block the
+    parent BEFORE spawn with no reader attached — a deadlock strictly worse
+    than the bug.  Briefing prompts routinely exceed 64 KiB.
+
+    Raises rather than falling back to ``stdin=PIPE``.  A silent fallback would
+    reintroduce this exact race in precisely the degraded conditions (disk
+    pressure, exhausted fds) where the loop is most likely to be stalled, and
+    would do so invisibly — see the ``no-silent-fail-soft`` design invariant.
+    On failure the file is closed before re-raising so no fd is leaked.
+
+    THE RETURNED FD IS READ-ONLY.  ``tempfile.TemporaryFile()`` opens ``'w+b'``
+    (``O_RDWR``), and fd 0 is inherited by the child's WHOLE subtree — bwrap,
+    the systemd-run scope, ``nice``, the CLI, and every tool the agent itself
+    spawns.  The shape this replaced handed the child the read end of a pipe,
+    so a writable stdin would have been a silent widening of what that subtree
+    can do to its own input.  The payload is therefore re-opened ``O_RDONLY``
+    through ``/proc/self/fd/N`` — same still-unlinked inode, no filesystem
+    name, fresh description already at offset 0 — and the read-write handle is
+    closed.
+
+    That narrowing is deliberately BEST-EFFORT and logs when it is skipped,
+    which is not the same fail-soft the paragraph above forbids: the
+    race-closing invariant (payload resident in the kernel before ``execve``)
+    holds identically either way, so a host without ``/proc`` degrades to
+    today's read-write fd rather than losing every spawn.  A ``stdin=PIPE``
+    fallback would instead give up the invariant itself, which is why that one
+    raises.
+    """
+    # noqa SIM115: a context manager is exactly wrong here — the fd must
+    # OUTLIVE this call.  It is handed to create_subprocess_exec so the child
+    # can dup it, and the caller closes the parent's handle immediately after
+    # spawn (that close is what delivers EOF to the child).
+    f = tempfile.TemporaryFile()  # noqa: SIM115
+    try:
+        f.write(stdin_data)
+        f.flush()
+        f.seek(0)  # only load-bearing on the read-write fallback arm below
+    except BaseException:
+        f.close()
+        raise
+
+    try:
+        ro = open(f'/proc/self/fd/{f.fileno()}', 'rb')  # noqa: SIM115 — see above
+    except OSError as e:
+        logger.warning(
+            f'stdin payload could not be narrowed to a read-only fd ({e}); '
+            f'handing the child the read-write handle instead. The task-3147 '
+            f'pre-materialization invariant is unaffected.'
+        )
+        return f
+    f.close()
+    return ro
+
+
 async def _run_subprocess(
     cmd: list[str],
     cwd: Path,
@@ -2819,8 +2953,13 @@ async def _run_subprocess(
 ) -> _SubprocessResult:
     """Run a subprocess, log output.
 
-    *stdin_data*, when set, is piped to the process's stdin.  This avoids
-    passing large payloads as command-line arguments (which hit ARG_MAX).
+    *stdin_data*, when set, is delivered on the process's stdin.  This avoids
+    passing large payloads as command-line arguments (which hit ARG_MAX).  It
+    is NOT written through a pipe by the event loop: it is pre-materialized
+    into an unlinked temp file handed to the child as an already-open fd, so
+    the payload is readable before ``execve`` and cannot be lost to an
+    event-loop stall (task 3147 — see ``_materialize_stdin``).  ``None`` leaves
+    stdin inherited from the parent.
 
     *working_idle_secs* / *absolute_cap_secs*, when BOTH set, extend the
     WORKING regime past *timeout_seconds* while the transcript keeps
@@ -2844,15 +2983,28 @@ async def _run_subprocess(
     # (PRD C-G1).
     spawn_cmd = _cpu_govern_prefix(env) + _cpu_priority_prefix(env) + cmd
 
-    proc = await asyncio.create_subprocess_exec(
-        *spawn_cmd,
-        cwd=str(cwd),
-        env=env,
-        stdin=asyncio.subprocess.PIPE if stdin_data is not None else None,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        start_new_session=True,
-    )
+    # Pre-materialize the prompt BEFORE the child exists (task 3147).  The
+    # bytes must be in the kernel before execve, or a stalled event loop can
+    # miss the CLI's ~3s stdin deadline and lose the run — see
+    # _materialize_stdin's docstring for the confirmed failure mode.
+    # stdin_data is None must still yield stdin=None (inherited).
+    stdin_file = _materialize_stdin(stdin_data) if stdin_data is not None else None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *spawn_cmd,
+            cwd=str(cwd),
+            env=env,
+            stdin=stdin_file,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+    finally:
+        # Close the parent's handle as soon as the child has its own dup — this
+        # is what guarantees the child sees EOF at the end of the payload.  In
+        # a `finally` so a raising create_subprocess_exec cannot leak the fd.
+        if stdin_file is not None:
+            stdin_file.close()
     # Capture pgid at spawn (pgid == pid under start_new_session).  Never
     # refresh via os.getpgid() later — the PID may be reused post-reap.
     pgid = proc.pid
@@ -2896,7 +3048,11 @@ async def _run_subprocess(
             # must not silence each other.
             unreadable_escape_fired = False
 
-            comm_task = asyncio.ensure_future(proc.communicate(input=stdin_data))
+            # No `input=`: stdin was pre-materialized as a real fd before spawn
+            # (task 3147), so communicate() performs reads only.  That also keeps
+            # the SECOND communicate() inside the SIGTERM grace window below
+            # valid, since there is no PIPE for it to try to re-write.
+            comm_task = asyncio.ensure_future(proc.communicate())
 
             while True:
                 elapsed = time.monotonic() - watchdog_start
