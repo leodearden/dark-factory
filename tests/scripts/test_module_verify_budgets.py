@@ -87,6 +87,7 @@ from __future__ import annotations
 import ast
 import os
 import pathlib
+import textwrap
 
 import pytest
 import yaml
@@ -723,15 +724,28 @@ def test_the_budget_family_derives_every_floor_from_one_canonical_expression() -
           and agrees with today's measurement, then silently stops agreeing the
           next time the measurement moves. It now fails HERE, cross-file.
 
-      (4) ONE CANONICAL DERIVATION. The expression is evaluated in a namespace
-          whose ONLY bindings are the published worst and
-          ``module_budget_family.min_budget`` — deliberately without
+      (4) ONE CANONICAL DERIVATION, closed on BOTH sides. The expression is
+          evaluated in a namespace whose ONLY bindings are the published worst
+          and ``module_budget_family.min_budget`` — deliberately without
           ``__builtins__``. So ``min_budget(MEASURED_SUITE_WORST_SECS)``
           succeeds, while a local ``_min_budget`` copy or an inlined
           ``(int(2 * W) // 100) * 100`` raises ``NameError`` and fails here.
-          That is what makes "one canonical expression" a mechanism rather than
-          a convention: re-spelling the derivation locally is now impossible to
-          land green, whatever value it happens to produce today.
+          That namespace only closes re-spellings under a DIFFERENT name,
+          though, and saying it closed all of them was an over-claim a reviewer
+          caught: it evaluates against the CANONICAL helper, so a publisher
+          spelling the call exactly while binding ``min_budget`` to a local
+          ``def`` — or re-assigning it after the import — satisfied every check
+          while its own floor was whatever the shadow returned. So the reader
+          also scans the publisher's MODULE-SCOPE bindings of that name and
+          requires them all to be ``from module_budget_family import
+          min_budget``, reporting a shadow through the same ``error`` this
+          assertion prints. Together the two halves are what make "one
+          canonical expression" a mechanism rather than a convention:
+          re-spelling the derivation locally is now impossible to land green
+          under ANY name, whatever value it happens to produce today.
+          ``test_the_published_pair_reader_rejects_every_way_the_derivation_
+          can_rot`` is where each of those rejections is actually OBSERVED —
+          this assertion only ever meets publishers that comply.
 
       (5) SAME SHAPE. The evaluated value equals ``min_budget(published
           worst)``. (4) rejects a different SPELLING; (5) rejects a different
@@ -869,8 +883,12 @@ def test_the_budget_family_derives_every_floor_from_one_canonical_expression() -
             f'bound and no __builtins__, so a locally re-spelled derivation — a '
             f'`def _min_budget` copy, or an inlined `(int(2 * W) // 100) * 100` '
             f'— raises NameError HERE even when it computes the right number '
-            f'today. Import module_budget_family.min_budget and call it: the '
-            f'family may hold exactly one implementation of this expression'
+            f'today; and the same check reports a `min_budget` that is bound in '
+            f'the publisher by anything other than `from module_budget_family '
+            f'import min_budget`, which is how a SAME-NAME shadow is caught '
+            f'despite evaluating cleanly against the canonical helper. Import '
+            f'module_budget_family.min_budget and call it: the family may hold '
+            f'exactly one implementation of this expression'
         )
 
         # ---- (5) SAME SHAPE ------------------------------------------------
@@ -1037,4 +1055,292 @@ def test_root_config_fixture_anchors_this_worktrees_own_yaml(
         'a broken anchor produces a fully-populated config of DEFAULTS and no '
         'error anywhere. That silence is the whole reason the fixture asserts '
         'the path is a real file before setting the env var'
+    )
+
+
+# SYNTHETIC publishers for the reader's own negative test below. Each is a
+# minimal module in the shape a real family member has — a MODULE_PREFIX, a
+# MEASURED_SUITE_WORST_SECS and a MIN_MODULE_BUDGET_SECS — differing in exactly
+# one way the pair can rot. Kept as SOURCE TEXT rather than as real files under
+# tests/scripts/, because a second real publisher would join FAMILY_PUBLISHER_
+# PATHS' production set and every guard above would then assert about it.
+_SYNTHETIC_PUBLISHERS: dict[str, str] = {
+    # The shape a compliant publisher has. Everything below is this, minus one
+    # property, so a failure names the property rather than the arrangement.
+    'canonical': """
+        from module_budget_family import min_budget
+
+        MODULE_PREFIX = 'synthetic'
+        MEASURED_SUITE_WORST_SECS = 397.47
+        MIN_MODULE_BUDGET_SECS = min_budget(MEASURED_SUITE_WORST_SECS)
+    """,
+    # The exact spelling test_scripts_module_config.py carried before task 4320.
+    # Computes the RIGHT number; must still be rejected.
+    'inlined': """
+        MODULE_PREFIX = 'synthetic'
+        MEASURED_SUITE_WORST_SECS = 397.47
+        MIN_MODULE_BUDGET_SECS = (int(2 * MEASURED_SUITE_WORST_SECS) // 100) * 100
+    """,
+    # The other pre-4320 spelling: a copied `def _min_budget`, per-file.
+    'copied_helper': """
+        MODULE_PREFIX = 'synthetic'
+        MEASURED_SUITE_WORST_SECS = 397.47
+
+
+        def _min_budget(worst: float) -> int:
+            return (int(2 * worst) // 100) * 100
+
+
+        MIN_MODULE_BUDGET_SECS = _min_budget(MEASURED_SUITE_WORST_SECS)
+    """,
+    # The rot task 3703 repaired for ONE file: a floor transcribed beside its
+    # measurement instead of derived from it. Evaluates fine in any namespace.
+    'transcribed_literal': """
+        MODULE_PREFIX = 'synthetic'
+        MEASURED_SUITE_WORST_SECS = 397.47
+        MIN_MODULE_BUDGET_SECS = 700
+    """,
+    # A "measurement" that is itself computed has no observed run behind it.
+    'computed_measurement': """
+        from module_budget_family import min_budget
+
+        MODULE_PREFIX = 'synthetic'
+        MEASURED_SUITE_WORST_SECS = 2 * 198.735
+        MIN_MODULE_BUDGET_SECS = min_budget(MEASURED_SUITE_WORST_SECS)
+    """,
+    # THE SAME-NAME SHADOW. Spells the canonical call exactly, and binds the
+    # name to something else. Defeats the namespace check outright.
+    'shadowed_helper': """
+        from module_budget_family import min_budget
+
+
+        def min_budget(worst: float) -> int:
+            return 0
+
+
+        MODULE_PREFIX = 'synthetic'
+        MEASURED_SUITE_WORST_SECS = 397.47
+        MIN_MODULE_BUDGET_SECS = min_budget(MEASURED_SUITE_WORST_SECS)
+    """,
+    # The same shadow by re-assignment rather than by `def`, and AFTER the
+    # canonical import — the ordering that reads most like a harmless alias.
+    'reassigned_helper': """
+        from module_budget_family import min_budget
+
+        min_budget = lambda worst: 0
+
+        MODULE_PREFIX = 'synthetic'
+        MEASURED_SUITE_WORST_SECS = 397.47
+        MIN_MODULE_BUDGET_SECS = min_budget(MEASURED_SUITE_WORST_SECS)
+    """,
+    # A shadow hidden in a module-level `if`, which binds in module scope just
+    # as a top-level statement does.
+    'conditionally_shadowed_helper': """
+        from module_budget_family import min_budget
+
+        if True:
+            def min_budget(worst: float) -> int:
+                return 0
+
+        MODULE_PREFIX = 'synthetic'
+        MEASURED_SUITE_WORST_SECS = 397.47
+        MIN_MODULE_BUDGET_SECS = min_budget(MEASURED_SUITE_WORST_SECS)
+    """,
+    # Calls the canonical name while importing nothing at all.
+    'unimported_helper': """
+        MODULE_PREFIX = 'synthetic'
+        MEASURED_SUITE_WORST_SECS = 397.47
+        MIN_MODULE_BUDGET_SECS = min_budget(MEASURED_SUITE_WORST_SECS)
+    """,
+    # A measurement that gates nothing.
+    'no_floor': """
+        MODULE_PREFIX = 'synthetic'
+        MEASURED_SUITE_WORST_SECS = 397.47
+    """,
+    # No MODULE_PREFIX: yields NO entry, which is why the consuming guard pins
+    # the SET of prefixes rather than iterating whatever it happens to find.
+    'no_prefix': """
+        from module_budget_family import min_budget
+
+        MEASURED_SUITE_WORST_SECS = 397.47
+        MIN_MODULE_BUDGET_SECS = min_budget(MEASURED_SUITE_WORST_SECS)
+    """,
+    # The derivation reached through the CANONICAL helper, at a different
+    # meaning — the case assertion (5) exists for, and which (4) cannot see.
+    'different_meaning': """
+        from module_budget_family import min_budget
+
+        MODULE_PREFIX = 'synthetic'
+        MEASURED_SUITE_WORST_SECS = 397.47
+        MIN_MODULE_BUDGET_SECS = min_budget(MEASURED_SUITE_WORST_SECS * 3)
+    """,
+}
+
+
+def test_the_published_pair_reader_rejects_every_way_the_derivation_can_rot(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The cross-file mechanism itself must be observed FAILING, not only passing.
+
+    Task 4320 amendment. ``test_the_budget_family_derives_every_floor_from_one_
+    canonical_expression`` above runs only against the two real publishers,
+    which already comply — so every one of its seven assertions was exercised on
+    the happy path exclusively, and the load-bearing claims underneath them were
+    demonstrated NOWHERE. If ``published_pairs`` regressed — someone adds
+    ``'int': int`` to its namespace, or the bare-``except`` branch stops setting
+    ``error`` — that guard would stay green and the anti-drift property would be
+    silently gone.
+
+    THAT IS THE SAME GAP THE FAMILY NAMES FOR HAND-SET FLOORS: an assertion
+    nobody has ever seen fail is indistinguishable from one that cannot. This
+    test is the negative half, and it follows the precedent
+    ``test_min_module_budget_is_derived_from_the_measured_worst_run`` set next
+    door when it switched from pinning the sibling's real published pair to
+    pinning ``min_budget``'s SHAPE against synthetic cases.
+
+    SYNTHETIC PUBLISHERS IN ``tmp_path``, not real files in this directory. A
+    second real publisher would land in ``FAMILY_PUBLISHER_PATHS``' production
+    set, where every assertion of the guard above would start asserting about
+    it. Passing *paths* explicitly is what keeps the mechanism testable without
+    widening what it checks in production — the default remains this module's
+    own tuple, so no caller can quietly narrow the real set.
+
+    ASSERTS ON THE READER'S OUTPUT, never on its prose: each case checks
+    ``PublishedPair.error`` / ``.floor`` / ``.worst`` / ``.floor_source``, plus
+    (for the two rots the reader deliberately does NOT catch) the consuming
+    guard's own reference and value checks reproduced against the same pair.
+    """
+
+    def read_one(case: str) -> dict:
+        path = tmp_path / f'{case}.py'
+        path.write_text(
+            textwrap.dedent(_SYNTHETIC_PUBLISHERS[case]).lstrip('\n'),
+            encoding='utf-8',
+        )
+        return published_pairs(paths=(path,))
+
+    # ---- the compliant shape, so every rejection below is one property apart -
+    canonical = read_one('canonical')['synthetic']
+    assert canonical.error is None, (
+        f'the canonical synthetic publisher was rejected: {canonical.error} '
+        f'(task 4320). Every case below differs from it in exactly one way, so '
+        f'a false positive here would make all of them meaningless'
+    )
+    assert canonical.worst == 397.47 and canonical.floor == min_budget(397.47), (
+        f'canonical synthetic publisher read back worst={canonical.worst}, '
+        f'floor={canonical.floor}, expected 397.47 / {min_budget(397.47)}'
+    )
+
+    # ---- (4) re-spellings under a DIFFERENT name: caught by the namespace ----
+    inlined = read_one('inlined')['synthetic']
+    assert inlined.floor is None and inlined.error is not None, (
+        f'an INLINED `(int(2 * W) // 100) * 100` — the spelling '
+        f'test_scripts_module_config.py carried before task 4320 — was accepted '
+        f'(floor={inlined.floor}). It computes the right number, so only the '
+        f'builtins-free namespace can reject it; if `int` ever becomes '
+        f'available there, the one-canonical-expression property is gone'
+    )
+    assert 'NameError' in inlined.error and 'int' in inlined.error, (
+        f'the inlined derivation was rejected for the wrong reason: '
+        f'{inlined.error!r} (task 4320). It must fail as a NameError on `int`, '
+        f'which is what shows the namespace — not luck — is doing the work'
+    )
+
+    copied = read_one('copied_helper')['synthetic']
+    assert copied.floor is None and copied.error is not None, (
+        f'a COPIED `def _min_budget` — the other pre-4320 spelling — was '
+        f'accepted (floor={copied.floor}), so the family could go back to one '
+        f'implementation per file'
+    )
+    assert 'NameError' in copied.error and '_min_budget' in copied.error, (
+        f'the copied helper was rejected for the wrong reason: {copied.error!r}'
+    )
+
+    # ---- re-spellings under the SAME name: caught by the binding check -------
+    for case, needle in (
+        ('shadowed_helper', 'def min_budget'),
+        ('reassigned_helper', 'assignment'),
+        ('conditionally_shadowed_helper', 'def min_budget'),
+        ('unimported_helper', 'no module-level'),
+    ):
+        shadowed = read_one(case)['synthetic']
+        assert shadowed.floor is None and shadowed.error is not None, (
+            f'{case}: a publisher that spells `min_budget(MEASURED_SUITE_WORST_'
+            f'SECS)` while binding `min_budget` to something else was accepted '
+            f'(floor={shadowed.floor}) (task 4320). The floor is evaluated in a '
+            f'SYNTHETIC namespace holding the canonical helper, so the eval '
+            f'cannot see this — only the module-scope binding scan can, and '
+            f'without it every re-spelling under the same name lands green '
+            f'while that module publishes whatever the shadow returns'
+        )
+        assert needle in shadowed.error, (
+            f'{case}: rejected for the wrong reason: {shadowed.error!r} '
+            f'(expected the message to name {needle!r})'
+        )
+
+    # ---- (2) a measurement that is not a measurement ------------------------
+    computed = read_one('computed_measurement')['synthetic']
+    assert computed.worst is None and computed.error is not None, (
+        f'MEASURED_SUITE_WORST_SECS = 2 * 198.735 was read as a measurement '
+        f'(worst={computed.worst}) (task 4320). A computed figure has no '
+        f'observed run behind it and no yaml provenance block can record it'
+    )
+    assert 'numeric literal' in computed.error, (
+        f'the computed measurement was rejected for the wrong reason: '
+        f'{computed.error!r}'
+    )
+    assert computed.worst_source == '2 * 198.735', (
+        f'worst_source is {computed.worst_source!r} — the VERBATIM source '
+        f'segment is what lets the consuming guard quote the offending '
+        f'expression back rather than merely reporting a type'
+    )
+
+    # ---- (3) THE READER DOES NOT CATCH A LITERAL, and must not pretend to ---
+    literal = read_one('transcribed_literal')['synthetic']
+    assert literal.error is None and literal.floor == 700, (
+        f'a transcribed `MIN_MODULE_BUDGET_SECS = 700` was reported as an eval '
+        f'failure ({literal.error}) (task 4320). It evaluates fine in ANY '
+        f'namespace — that is precisely why the consuming guard needs its '
+        f'separate reference check, and why documenting the eval as catching it '
+        f'would be an over-claim'
+    )
+    literal_names = {
+        node.id
+        for node in ast.walk(ast.parse(literal.floor_source or '', mode='eval'))
+        if isinstance(node, ast.Name)
+    }
+    assert 'MEASURED_SUITE_WORST_SECS' not in literal_names, (
+        f'the transcribed literal `{literal.floor_source}` references '
+        f'{sorted(literal_names)}, so the consuming guard\'s assertion (3) — '
+        f'the ONLY check that catches a hand-set floor — would pass it'
+    )
+
+    # ---- (5) the canonical helper, at a different MEANING -------------------
+    different = read_one('different_meaning')['synthetic']
+    assert different.error is None and different.floor is not None, (
+        f'`min_budget(MEASURED_SUITE_WORST_SECS * 3)` failed to evaluate '
+        f'({different.error}) (task 4320) — it calls the canonical helper, so '
+        f'assertion (4) is not what rejects it'
+    )
+    assert different.floor != min_budget(397.47), (
+        f'a 3x argument to the canonical helper produced {different.floor}, the '
+        f'SAME floor as min_budget(397.47) (task 4320), so assertion (5) would '
+        f'pass it. That assertion exists because (4) rejects a different '
+        f'SPELLING and this is a different MEANING reached through the right '
+        f'spelling'
+    )
+
+    # ---- structural absences, reported rather than crashed on ---------------
+    no_floor = read_one('no_floor')['synthetic']
+    assert no_floor.floor_source is None and no_floor.error is not None, (
+        f'a publisher binding no MIN_MODULE_BUDGET_SECS yielded '
+        f'floor_source={no_floor.floor_source!r}, error={no_floor.error!r} '
+        f'(task 4320) — it records a measurement that gates nothing, and must '
+        f'say so rather than raising out of the reader'
+    )
+    assert read_one('no_prefix') == {}, (
+        'a publisher binding no module-level MODULE_PREFIX yielded an entry '
+        '(task 4320). It must yield NONE — which is exactly why the consuming '
+        'guard pins the SET of returned prefixes against '
+        'FAMILY_PUBLISHED_PREFIXES instead of iterating whatever it finds'
     )

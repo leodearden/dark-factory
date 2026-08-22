@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import ast
 import pathlib
+from collections.abc import Iterable, Iterator
 from typing import Any, NamedTuple
 
 THIS_DIR = pathlib.Path(__file__).parent
@@ -86,6 +87,14 @@ FAMILY_READER_PATH = THIS_DIR / 'test_module_verify_budgets.py'
 PREFIX_NAME = 'MODULE_PREFIX'
 WORST_NAME = 'MEASURED_SUITE_WORST_SECS'
 FLOOR_NAME = 'MIN_MODULE_BUDGET_SECS'
+
+# THIS module and THE name a publisher must import from it. Spelled as
+# constants for the same reason as the three above: the shadow check below
+# compares a publisher's import against them, so a rename of this module or of
+# its one exported function cannot leave the check silently looking for a name
+# nothing binds any more.
+HELPER_MODULE_NAME = 'module_budget_family'
+HELPER_NAME = 'min_budget'
 
 
 def min_budget(worst: float) -> int:
@@ -206,13 +215,152 @@ def _module_level_bindings(tree: ast.Module) -> dict[str, ast.expr]:
     return bindings
 
 
-def published_pairs() -> dict[str, PublishedPair]:
+# Statement types whose nested bodies execute in the ENCLOSING scope. A `def`
+# or a `class` is deliberately absent: those introduce a scope of their own, so
+# a `min_budget` bound inside one is a different binding and flagging it would
+# be a false positive.
+_SCOPE_TRANSPARENT = (
+    ast.If,
+    ast.Try,
+    ast.TryStar,
+    ast.With,
+    ast.AsyncWith,
+    ast.For,
+    ast.AsyncFor,
+    ast.While,
+    ast.Match,
+)
+
+
+def _module_scope_statements(body: Iterable[ast.stmt]) -> Iterator[ast.stmt]:
+    """Every statement in *body* that executes in MODULE scope, nested ones included.
+
+    Recurses through ``if`` / ``try`` / ``with`` / ``for`` / ``while`` /
+    ``match`` bodies, which do NOT introduce a scope, and stops at ``def`` and
+    ``class``, which do.
+
+    DELIBERATELY ASYMMETRIC WITH ``_module_level_bindings``, which reads
+    ``tree.body`` only, and the asymmetry is principled rather than an
+    oversight. That function answers "what pair does this module
+    UNCONDITIONALLY publish", so a conditionally-assigned ``MODULE_PREFIX``
+    correctly yields NO pair and fails loudly at the consuming guard's floor-set
+    assertion. This one answers "what could rebind ``min_budget`` here", where
+    the conservative direction is to FLAG: a rebinding tucked inside a
+    module-level ``if`` changes what the name means just as thoroughly as a
+    top-level one.
+    """
+    for node in body:
+        yield node
+        if isinstance(node, _SCOPE_TRANSPARENT):
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child, ast.stmt):
+                    yield from _module_scope_statements([child])
+                elif isinstance(child, (ast.ExceptHandler, ast.match_case)):
+                    yield from _module_scope_statements(child.body)
+
+
+def _non_canonical_min_budget_binding(tree: ast.Module) -> str | None:
+    """Describe how *tree* binds ``min_budget`` non-canonically, or ``None`` if it does not.
+
+    THE HOLE THIS CLOSES (task 4320 amendment). ``published_pairs`` evaluates a
+    publisher's floor expression in a SYNTHETIC namespace holding the CANONICAL
+    ``min_budget``, not in that publisher's real module namespace. So a
+    publisher that writes ``MIN_MODULE_BUDGET_SECS = min_budget(
+    MEASURED_SUITE_WORST_SECS)`` while binding ``min_budget`` to something else
+    — a local ``def min_budget``, or a re-assignment after the import — passed
+    every check: the reference is there, it evaluates cleanly against the
+    canonical helper, and the canonical result equals the canonical result.
+    Meanwhile that module's OWN ``MIN_MODULE_BUDGET_SECS`` was whatever the
+    shadow returned. The namespace check makes re-spelling the derivation under
+    a DIFFERENT name impossible; without this one, re-spelling it under the
+    SAME name was free.
+
+    CANONICAL means ``from module_budget_family import min_budget`` — the
+    module and the name spelled exactly, with no ``as`` clause (importing
+    something else AS ``min_budget`` binds the name to a different object).
+    Repeating that import is harmless and is not flagged; anything else that
+    binds the name in module scope is, wherever it sits relative to the floor
+    assignment. A rebinding BEFORE the assignment changes the published value
+    outright, and one AFTER it leaves the name meaning two different things in
+    one file, which is the ambiguity this family exists to remove.
+
+    Returns a human-readable description of the FIRST offending binding — line
+    numbers computed from the AST at read time, never transcribed, so they
+    cannot rot the way a hard-coded file:line pin does — or ``None`` when every
+    module-scope binding of the name is the canonical import.
+
+    NOT A SANDBOX, and does not claim to be. This reads source structure, so it
+    answers what the file says rather than what an adversary could contrive
+    (``globals()`` mutation, an ``exec``, a rebinding inside a function that
+    module-level code then calls). The property it establishes is that the
+    family cannot DRIFT into several derivations by ordinary editing, which is
+    the failure this guard family has actually observed twice.
+    """
+    imported = False
+    for node in _module_scope_statements(tree.body):
+        if isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if (alias.asname or alias.name) != HELPER_NAME:
+                    continue
+                if node.module == HELPER_MODULE_NAME and alias.asname is None:
+                    imported = True
+                    continue
+                return (
+                    f'`from {node.module or "."} import '
+                    f'{alias.name}{" as " + alias.asname if alias.asname else ""}` '
+                    f'at line {node.lineno}'
+                )
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if (alias.asname or alias.name.split('.')[0]) == HELPER_NAME:
+                    return f'`import {alias.name}` at line {node.lineno}'
+        elif (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+            and node.name == HELPER_NAME
+        ):
+            return (
+                f'a module-level `{"class" if isinstance(node, ast.ClassDef) else "def"} '
+                f'{HELPER_NAME}` at line {node.lineno}'
+            )
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == HELPER_NAME:
+                    return f'a module-level assignment at line {node.lineno}'
+        elif (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == HELPER_NAME
+        ):
+            return f'a module-level annotated assignment at line {node.lineno}'
+    if not imported:
+        return (
+            f'no module-level `from {HELPER_MODULE_NAME} import {HELPER_NAME}` '
+            f'at all, so the name its floor expression calls is bound by nothing '
+            f'this reader can see'
+        )
+    return None
+
+
+def published_pairs(
+    paths: Iterable[pathlib.Path] = FAMILY_PUBLISHER_PATHS,
+) -> dict[str, PublishedPair]:
     """Every family publisher's (measurement, floor) pair, keyed by module config prefix.
 
-    ``ast.parse``s each path in ``FAMILY_PUBLISHER_PATHS``, picks the
-    module-level ``MODULE_PREFIX`` / ``MEASURED_SUITE_WORST_SECS`` /
+    ``ast.parse``s each path in *paths*, picks the module-level
+    ``MODULE_PREFIX`` / ``MEASURED_SUITE_WORST_SECS`` /
     ``MIN_MODULE_BUDGET_SECS`` bindings, and EVALUATES the floor expression
     against the canonical namespace.
+
+    *paths* DEFAULTS TO ``FAMILY_PUBLISHER_PATHS`` — the production call passes
+    nothing, so the set this reader checks is still owned by this module rather
+    than by its caller. It is a parameter only so the mechanism itself can be
+    tested against SYNTHETIC publishers: until it was, every one of the
+    consuming guard's assertions ran exclusively against two files that already
+    comply, and the load-bearing claims below (an inlined expression raises
+    ``NameError``, a literal is caught by the reference check, a shadowed
+    ``min_budget`` is caught by the binding check) were demonstrated nowhere. An
+    assertion that has never been observed to fail is the same gap this family
+    calls out for hand-set floors.
 
     THE NAMESPACE IS THE MECHANISM. ``compile(ast.Expression(floor_node), ...,
     'eval')`` runs with globals ``{'__builtins__': {}}`` and locals holding ONLY
@@ -223,6 +371,18 @@ def published_pairs() -> dict[str, PublishedPair]:
     right number, and a copied ``_min_budget(W)`` raises ``NameError: name
     '_min_budget' is not defined``. A publisher cannot satisfy this by
     re-implementing the derivation correctly; it has to CALL the canonical one.
+
+    THE NAMESPACE IS ONLY HALF THE MECHANISM, and saying otherwise was the
+    over-claim a reviewer caught (task 4320 amendment). Evaluating against the
+    canonical helper in a synthetic namespace says nothing about what
+    ``min_budget`` is bound to in the PUBLISHER's namespace: a local ``def
+    min_budget`` — or a re-assignment after the import — satisfied every check
+    while that module's own floor was whatever the shadow returned. The
+    namespace closes re-spellings under a DIFFERENT name;
+    ``_non_canonical_min_budget_binding`` closes re-spellings under the SAME
+    name, by requiring the name to come from ``from module_budget_family import
+    min_budget`` and to be rebound nowhere in module scope. Neither half
+    subsumes the other, and the guard reports both through ``error``.
 
     A LITERAL FLOOR IS NOT CAUGHT HERE, and that is not an oversight: ``1800``
     evaluates fine in any namespace. It is caught by the consuming guard's
@@ -238,11 +398,12 @@ def published_pairs() -> dict[str, PublishedPair]:
     """
     pairs: dict[str, PublishedPair] = {}
 
-    for path in FAMILY_PUBLISHER_PATHS:
+    for path in paths:
         if not path.is_file():
             continue
         source = path.read_text(encoding='utf-8')
-        bindings = _module_level_bindings(ast.parse(source, filename=str(path)))
+        tree = ast.parse(source, filename=str(path))
+        bindings = _module_level_bindings(tree)
 
         prefix_node = bindings.get(PREFIX_NAME)
         if not isinstance(prefix_node, ast.Constant) or not isinstance(prefix_node.value, str):
@@ -302,6 +463,32 @@ def published_pairs() -> dict[str, PublishedPair]:
                         f'{FLOOR_NAME} evaluated to {value!r} '
                         f'({type(value).__name__}), not an int'
                     )
+
+        # THE SHADOW CHECK, applied only when the floor expression actually
+        # CALLS the canonical name — a floor that never mentions `min_budget`
+        # is already rejected by the eval above or by the consuming guard's
+        # reference check, and flagging its import hygiene would report the
+        # wrong defect. Checked AFTER the eval so a more specific failure (a
+        # NameError naming the re-spelling) wins the `error` slot; this one
+        # fires exactly when the expression looks canonical and the binding is
+        # not, which is the case nothing else can see.
+        if (
+            error is None
+            and floor_node is not None
+            and any(
+                isinstance(node, ast.Name) and node.id == HELPER_NAME
+                for node in ast.walk(floor_node)
+            )
+        ):
+            rebinding = _non_canonical_min_budget_binding(tree)
+            if rebinding is not None:
+                floor = None
+                error = (
+                    f'floor calls `{HELPER_NAME}`, but {path.name} binds that '
+                    f'name via {rebinding} — so the expression evaluated here '
+                    f'against the canonical derivation is NOT the one that runs '
+                    f'in that module'
+                )
 
         pairs[prefix] = PublishedPair(
             prefix=prefix,
