@@ -1619,3 +1619,111 @@ class TestRestoreArchivedTranscript:
         assert restore_archived_transcript(root, task_id, sid, config_dir) is None
         assert list((config_dir / 'projects' / ENC).glob('*')) == []
         assert transcript_exists(config_dir, sid) is False
+
+    def test_strict_propagates_a_genuine_fault_after_logging_it(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """(a) ``strict=True``: a real fault RAISES — and still logs first.
+
+        The miss/fault distinction has to survive the helper boundary. Total
+        by default, this function answers a plain miss and a broken restore
+        with the same ``None``, so its one production caller — which brackets
+        the call in its own blanket ``except`` — can only ever bucket an
+        internal fault as ``restore='miss'``: an operator is then sent to chase
+        archive COVERAGE while the restore path itself is the broken thing.
+        That mis-bucketing covers nearly every real fault, since the only
+        exception the caller can catch unaided comes from ``resolve_archive_root``.
+
+        Logged AND raised, not one or the other: the WARNING is the greppable
+        helper-layer record carrying ``errno``/``path``, and the raise is what
+        makes the fault classifiable one frame up. Asserting the record after
+        the raise escapes pins the order — emit, then propagate.
+        """
+        sid = 'sess-strict-fault'
+        task_id = '42'
+        root = tmp_path / 'archive'
+        _write(root / task_id / ENC / f'{sid}.jsonl', b'payload\n')
+
+        config_dir = tmp_path / 'lane-b' / 'claude-config'
+        config_dir.mkdir(parents=True)
+
+        def _boom(src, dst, **kwargs):
+            raise OSError(errno.ENOSPC, 'No space left on device')
+
+        monkeypatch.setattr(transcript_archive_module.shutil, 'copyfile', _boom)
+
+        with caplog.at_level(logging.WARNING, logger='shared.transcript_archive'):
+            with pytest.raises(OSError) as excinfo:
+                restore_archived_transcript(
+                    root, task_id, sid, config_dir, strict=True
+                )
+
+        assert excinfo.value.errno == errno.ENOSPC
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        rec = warnings[0]
+        # The helper-layer half of the fault pair, deliberately named apart
+        # from the dispatch layer's session_resume_restore_fault so one fault
+        # cannot be double-counted under a single greppable key.
+        assert rec.event == 'transcript_restore_fault'
+        assert rec.task_id == task_id
+        assert rec.errno == errno.ENOSPC
+        assert sid in rec.getMessage()
+        # Nothing published, exactly as in the non-strict tear: strict changes
+        # who learns about the fault, never what lands on disk.
+        assert list((config_dir / 'projects' / ENC).glob('*')) == []
+
+    def test_strict_leaves_a_plain_miss_a_quiet_none(self, tmp_path, caplog):
+        """(b) ``strict=True`` + a MISS still returns None, silently.
+
+        Load-bearing, not symmetry. A miss is not a fault: it is the ~36%
+        common case. If ``strict`` ever regressed into raising on misses, the
+        caller's ``except`` would stamp that whole population ``fault`` and
+        INVERT the diagnosis this seam exists to restore — the archive-coverage
+        signal would read as a broken restore path. By construction the miss
+        returns from a branch ABOVE the blanket handler, so it can never reach
+        the ``raise``; this pins that structure rather than trusting it.
+        """
+        root = tmp_path / 'archive'
+        config_dir = tmp_path / 'lane-b' / 'claude-config'
+        config_dir.mkdir(parents=True)
+
+        with caplog.at_level(logging.DEBUG, logger='shared.transcript_archive'):
+            assert restore_archived_transcript(
+                root, '42', 'sess-nope', config_dir, strict=True
+            ) is None
+
+        assert caplog.records == []
+
+    def test_the_default_call_stays_total_and_gains_the_event_key(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """(c) No ``strict`` kwarg: the published total contract is preserved.
+
+        ``strict`` is an additive seam for the ONE caller that can hold the
+        totality at the composite level, not a migration: every other caller
+        keeps a helper that cannot fail (the I-A sibling contract
+        ``test_a_genuine_fault_returns_none_loudly_and_never_raises`` pins).
+        The WARNING gains ``event=`` so OPERATIONS.md's grep-by-event-name
+        instruction resolves against a record that today has no such key.
+        """
+        sid = 'sess-default-fault'
+        task_id = '42'
+        root = tmp_path / 'archive'
+        _write(root / task_id / ENC / f'{sid}.jsonl', b'payload\n')
+
+        config_dir = tmp_path / 'lane-b' / 'claude-config'
+        config_dir.mkdir(parents=True)
+
+        def _boom(src, dst, **kwargs):
+            raise OSError(errno.ENOSPC, 'No space left on device')
+
+        monkeypatch.setattr(transcript_archive_module.shutil, 'copyfile', _boom)
+
+        with caplog.at_level(logging.WARNING, logger='shared.transcript_archive'):
+            assert restore_archived_transcript(root, task_id, sid, config_dir) is None
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert warnings[0].event == 'transcript_restore_fault'
+        assert warnings[0].errno == errno.ENOSPC
