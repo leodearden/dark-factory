@@ -41,6 +41,7 @@ from typing import Literal
 
 import pytest
 
+from orchestrator import merge_liveness, merge_queue
 from orchestrator.config import GitConfig, MergeDeepConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps, _run
@@ -597,7 +598,12 @@ class TestChainHalvingWorkerState:
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-def _spy_build_chain(monkeypatch, result: ChainResult | None = None) -> list[dict]:
+def _spy_build_chain(
+    monkeypatch,
+    result: ChainResult | None = None,
+    *,
+    passthrough: bool = False,
+) -> list[dict]:
     """Replace ``orchestrator.merge_queue.build_chain`` with a recorder.
 
     Returns the list of recorded call kwargs (``{'git_ops', 'queue_snapshot',
@@ -607,8 +613,13 @@ def _spy_build_chain(monkeypatch, result: ChainResult | None = None) -> list[dic
     *result* defaults to a ZERO-LINK :class:`ChainResult`, which per its
     docstring never holds a lane — so a stubbed call can never leak one, and
     these gate tests stay valid once step-14 lands the real build.
+
+    ``passthrough=True`` records the arguments and then delegates to the REAL
+    builder, so one test can pin both the call contract and the built chain
+    without the two drifting apart.
     """
     calls: list[dict] = []
+    real = merge_queue.build_chain
 
     async def _recording(git_ops, queue_snapshot, head_merge_commit, *, cap, target_depth):
         calls.append({
@@ -618,6 +629,11 @@ def _spy_build_chain(monkeypatch, result: ChainResult | None = None) -> list[dic
             'cap': cap,
             'target_depth': target_depth,
         })
+        if passthrough:
+            return await real(
+                git_ops, queue_snapshot, head_merge_commit,
+                cap=cap, target_depth=target_depth,
+            )
         return result if result is not None else ChainResult(links=[], tip=head_merge_commit)
 
     monkeypatch.setattr('orchestrator.merge_queue.build_chain', _recording)
@@ -805,3 +821,245 @@ class TestDeepChainPlacementGate:
         await worker._deep_chain_placement(item)
 
         assert scans, 'the flipped-on cap must be observed on the very next call'
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# step-13: RED — the BOUNDED build
+#
+# β made bounding γ's obligation in build_chain's own docstring (:6212-6224):
+# one lane acquisition plus up to `depth` sequential `git merge` subprocesses,
+# with NO internal deadline BY DESIGN — "the honest bound belongs to the policy
+# layer". These tests pin that bound, and pin that every degenerate outcome of
+# the build (deadline, empty, truncated) degrades to a path that leaks nothing.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+async def _merge_commit_off_main(repo: Path, branch: str, label: str) -> str:
+    """Return a REAL merge commit of *branch* into main, WITHOUT advancing main.
+
+    Stands in for the dispatching item's ``merge_result.merge_commit``.  It must
+    not be reachable from ``main`` and must not equal ``frozen_prefix_tip``, or
+    the "the chain continues from the DISPATCHING item, never from the frozen
+    prefix tip" assertion below would hold vacuously.
+    """
+    await _run(['git', 'checkout', '-b', f'_tmp-{label}', 'main'], cwd=repo)
+    await _run(['git', 'merge', '--no-ff', '-m', f'merge {branch}', branch], cwd=repo)
+    sha = await _rev_parse(repo)
+    await _run(['git', 'checkout', 'main'], cwd=repo)
+    return sha
+
+
+def _lane_states(git_ops: GitOps) -> list:
+    """Return the ``_spec-`` pool's lane states (``[]`` when there is no pool)."""
+    pool = git_ops.spec_warm_lane_pool
+    return [] if pool is None else list(pool._lanes.values())
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(180)
+class TestDeepChainPlacementBuild:
+    """The gate's build: exact call contract, the deadline, and the leak-free exits."""
+
+    async def _fixture(
+        self, git_repo: Path, *, chain_cap: int, queued: list[tuple[str, str, str]],
+    ) -> tuple[GitOps, SpeculativeMergeWorker, RealMergeItem, str, OrchestratorConfig]:
+        """Build a repo + worker + slot-2 item sitting on a REAL merge commit.
+
+        *queued* is ``[(task_id, filename, content), ...]`` — each becomes a
+        real branch AND a buffered request, in that order.
+        """
+        git_ops = _make_git_ops(git_repo)
+        config = _make_config(git_repo, chain_cap=chain_cap)
+        await _create_branch_editing(git_repo, 'task/101', 'a.txt', 'edit-101\n')
+        for task_id, filename, content in queued:
+            await _create_branch_editing(git_repo, f'task/{task_id}', filename, content)
+        head = await _merge_commit_off_main(git_repo, 'task/101', '101')
+        worker = _make_worker(git_ops)
+        worker._lane_buffers['normal'].extend(
+            _make_req(task_id, task_id, config, git_repo) for task_id, _, _ in queued
+        )
+        item = _make_item(_make_req('101', '101', config, git_repo), head, git_repo)
+        return git_ops, worker, item, head, config
+
+    async def test_build_chain_is_called_with_the_exact_contract(
+        self, git_repo: Path, monkeypatch,
+    ):
+        """The four arguments, and the UNIT CONVERSION between the two depth spaces.
+
+        ``select_chain_depth`` counts ITEMS IN THE CHAIN (the dispatching item
+        is #1); ``build_chain`` counts ADDITIONAL LINKS BEYOND the base it is
+        handed.  The gate is the seam between those units, so it must pass
+        ``cap - 1`` / ``d - 1`` — an off-by-one here silently builds one item
+        too many (over-running the operator's cap) or one too few.
+
+        ``head_merge_commit`` is the DISPATCHING ITEM's merge commit, not
+        ``frozen_prefix_tip``: the chain must be a contiguous continuation of
+        the queue through this item, and seeding it at the frozen tip would
+        skip the very item being dispatched — a hole that breaks the in-order
+        prefix property δ's CAS walk depends on.
+        """
+        git_ops, worker, item, head, _cfg = await self._fixture(
+            git_repo, chain_cap=6,
+            queued=[('102', 'b.txt', 'edit-102\n'), ('103', 'c.txt', 'edit-103\n')],
+        )
+        built = _spy_build_chain(monkeypatch, passthrough=True)
+        expected_snapshot = worker.chain_snapshot()
+        main_sha = await _rev_parse(git_repo, 'main')
+
+        res = await worker._deep_chain_placement(item)
+
+        assert len(built) == 1
+        call = built[0]
+        assert call['git_ops'] is git_ops
+        assert call['queue_snapshot'] == expected_snapshot
+        assert call['head_merge_commit'] == head == item.merge_result.merge_commit
+        assert call['head_merge_commit'] != worker.frozen_prefix_tip(main_sha)
+        # queue_len = 1 + 2 = 3, cap 6, no halving -> d = 3 (items).
+        assert call['cap'] == 5, 'cap - 1: extra links beyond the dispatching item'
+        assert call['target_depth'] == 2, 'd - 1, same unit conversion'
+        await merge_liveness.release_chain_build_lane(
+            git_ops, res.lane, warm=res.lane_warm,
+        )
+
+    async def test_clean_chain_returns_two_links_in_one_lane(
+        self, git_repo: Path, monkeypatch,
+    ):
+        """A clean 3-item fixture builds a real 2-link chain holding exactly ONE lane."""
+        from orchestrator.warm_lane_pool import LaneState
+
+        git_ops, worker, item, head, _cfg = await self._fixture(
+            git_repo, chain_cap=6,
+            queued=[('102', 'b.txt', 'edit-102\n'), ('103', 'c.txt', 'edit-103\n')],
+        )
+        before = await _worktree_names(git_ops)
+        lanes = _count_spec_lane_acquires(git_ops, monkeypatch)
+
+        res = await worker._deep_chain_placement(item)
+
+        assert res is not None
+        assert [tid for tid, _ in res.links] == ['102', '103']
+        assert res.tip == res.links[-1][1]
+        assert res.truncated_at is None
+        # The tip is a REAL descendant of the dispatching item's merge commit,
+        # which is what makes one verify on it authorise the whole prefix.
+        code, _, _ = await _run(
+            ['git', 'merge-base', '--is-ancestor', head, res.tip], cwd=git_repo,
+        )
+        assert code == 0
+        assert res.tip != head
+
+        assert len(lanes) == 1, 'exactly ONE lane acquisition for the whole chain'
+        assert await _worktree_names(git_ops) - before == {'_spec-0'}
+        assert res.lane == git_ops.worktree_base / '_spec-0'
+        assert _lane_states(git_ops) == [LaneState.ASSIGNED], 'result HOLDS its lane'
+
+        await merge_liveness.release_chain_build_lane(
+            git_ops, res.lane, warm=res.lane_warm,
+        )
+
+    async def test_build_is_wrapped_in_a_deadline_and_leaks_no_lane(
+        self, git_repo: Path, monkeypatch,
+    ):
+        """A build that overruns ``CHAIN_BUILD_TIMEOUT_SECS`` degrades to today's path.
+
+        The REAL ``build_chain`` runs here (only the per-item merge is stalled),
+        so the deadline genuinely cancels it mid-merge and its own
+        ``except BaseException`` arm (merge_queue.py:6350-6355) is what returns
+        the lane.  Stubbing the builder wholesale would prove only that a stub
+        does not leak.
+        """
+        from orchestrator.warm_lane_pool import LaneState
+
+        git_ops, worker, item, _head, _cfg = await self._fixture(
+            git_repo, chain_cap=6,
+            queued=[('102', 'b.txt', 'edit-102\n'), ('103', 'c.txt', 'edit-103\n')],
+        )
+        assert isinstance(merge_queue.CHAIN_BUILD_TIMEOUT_SECS, (int, float))
+        assert merge_queue.CHAIN_BUILD_TIMEOUT_SECS > 0
+        monkeypatch.setattr('orchestrator.merge_queue.CHAIN_BUILD_TIMEOUT_SECS', 0.2)
+
+        async def _stalled_merge(_lane, _branch):
+            await asyncio.sleep(30)
+
+        monkeypatch.setattr(git_ops, 'merge_branch_into_worktree', _stalled_merge)
+
+        assert await worker._deep_chain_placement(item) is None
+        assert _lane_states(git_ops) == [LaneState.FREE], 'deadline must not strand a lane'
+
+    async def test_zero_link_result_declines_without_double_releasing(
+        self, git_repo: Path, monkeypatch,
+    ):
+        """An empty ChainResult -> None, and the caller must NOT release.
+
+        A zero-link result never holds a lane (``lane is None``,
+        ``lane_warm is False`` — ChainResult "Lane ownership"), because
+        ``build_chain`` already released it on that path.  A caller that
+        released again would return a FREE lane to the pool a second time.
+
+        It also must not consume a halving round: nothing was verified deeply,
+        so there is no verdict to halve or reset on.
+        """
+        released: list = []
+        monkeypatch.setattr(
+            'orchestrator.merge_queue.release_chain_build_lane',
+            lambda git_ops, lane, *, warm: released.append((lane, warm)),
+        )
+        git_ops, worker, item, _head, _cfg = await self._fixture(
+            git_repo, chain_cap=6,
+            queued=[('102', 'b.txt', 'edit-102\n'), ('103', 'c.txt', 'edit-103\n')],
+        )
+        # A first-item conflict is the realistic way to get a zero-link result.
+        built = _spy_build_chain(monkeypatch, ChainResult(
+            links=[], tip=item.merge_result.merge_commit,
+            truncated_at='102', truncated_reason='conflict',
+        ))
+        worker._chain_halving_state = 4
+
+        assert await worker._deep_chain_placement(item) is None
+        assert len(built) == 1, 'the gate must have BUILT — otherwise this passes vacuously'
+        assert released == [], 'an empty result holds no lane — releasing would double-free'
+        assert worker._chain_halving_state == 4, 'no chain verified, so no halving round'
+
+    async def test_truncated_short_of_target_still_returns_the_chain(
+        self, git_repo: Path, monkeypatch,
+    ):
+        """A short chain is still useful, and β's decision-4 purity survives its caller.
+
+        ``104`` conflicts with ``102`` on the same line, so a 3-target build
+        truncates after 2 links.  The gate must return that ChainResult rather
+        than discard the work — and the truncated item must have NO outcome
+        rendered for it: it may conflict only with an *unlanded* predecessor,
+        and takes its normal sequential path later.
+        """
+        git_ops, worker, item, _head, _cfg = await self._fixture(
+            git_repo, chain_cap=6,
+            queued=[
+                ('102', 'shared.txt', _shared_txt_with(1, 'from-102')),
+                ('103', 'c.txt', 'edit-103\n'),
+                ('104', 'shared.txt', _shared_txt_with(1, 'from-104')),
+            ],
+        )
+        built = _spy_build_chain(monkeypatch, passthrough=True)
+        conflicts: list[str] = []
+        monkeypatch.setattr(worker, '_note_conflict_detected', conflicts.append)
+        store = _CapturingEventStore()
+        worker._event_store = store
+        queued_reqs = list(worker._lane_buffers['normal'])
+
+        res = await worker._deep_chain_placement(item)
+
+        assert built[0]['target_depth'] == 3, 'queue_len 4 -> d 4 -> 3 extra links'
+        assert res is not None, 'a short chain is useful — do not discard it'
+        assert [tid for tid, _ in res.links] == ['102', '103']
+        assert res.truncated_at == '104'
+        assert res.truncated_reason == 'conflict'
+
+        # PRD decision 4: NO outcome for the truncated item, end to end.
+        assert conflicts == []
+        assert store.events_of(EventType.MERGE_ATTEMPT) == []
+        assert all(not r.result.done() for r in queued_reqs)
+        assert list(worker._lane_buffers['normal']) == queued_reqs, 'queue untouched'
+
+        await merge_liveness.release_chain_build_lane(
+            git_ops, res.lane, warm=res.lane_warm,
+        )
