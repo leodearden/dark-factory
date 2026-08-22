@@ -236,6 +236,120 @@ class TestRunPostMergeVerifyDepthPlumbing:
         assert events[0]['data']['speculative'] is None
 
 
+# ---------------------------------------------------------------------------
+# step-7 RED / step-8 GREEN (task 3185, PRD γ): _run_post_merge_verify forwards
+# chain_items to ALL THREE pool.dispatch sites.
+#
+# Unlike depth/speculative (which default to None), chain_items defaults to 1 —
+# the smallest TRUTHFUL 1-indexed count of items in a verified tree — so the
+# legacy callers (reverify_member_solo, _do_train_merge, merge_gates'
+# _reverify_rebased_tree) keep emitting an honest count with no edit.
+# ---------------------------------------------------------------------------
+
+
+def _fail_result(category: str = '', test_output: str = 'boom') -> VerifyResult:
+    """A failing VerifyResult with a caller-chosen category/output."""
+    return VerifyResult(
+        passed=False, test_output=test_output, lint_output='', type_output='',
+        summary='fail', category=category,
+    )
+
+
+def _pass_result() -> VerifyResult:
+    return VerifyResult(
+        passed=True, test_output='ok', lint_output='', type_output='',
+        summary='ok', category='',
+    )
+
+
+@pytest.mark.asyncio
+class TestRunPostMergeVerifyChainItemsPlumbing:
+    """chain_items reaches the initial dispatch AND both retry dispatches.
+
+    A retry re-verifies the SAME tree, so it must carry the SAME chain_items as
+    its attempt-0 dispatch.  A retry that silently dropped back to the default
+    would understate depth in exactly the rows ε's deep-fail-rate reader keys
+    on — it would read a deep retry as an ordinary single-item verify.
+    """
+
+    async def _dispatch_calls(
+        self, tmp_path: Path, results: list[VerifyResult], **kwargs,
+    ) -> list[dict]:
+        """Run _run_post_merge_verify with a scripted dispatch and return kwargs.
+
+        *results* is consumed one per ``pool.dispatch`` call (the last is
+        repeated if the code dispatches more times than scripted).
+        """
+        from orchestrator.merge_queue import _run_post_merge_verify
+
+        config = _make_bare_config()
+        req = _make_request('t-chain', 'task/t-chain', tmp_path, config)
+        git_ops = _make_git_ops_mock()
+        captured: list[dict] = []
+        seq = list(results)
+
+        async def _fake_dispatch(_self, merge_sha, spec, **dispatch_kwargs):
+            captured.append(dispatch_kwargs)
+            return seq.pop(0) if len(seq) > 1 else seq[0]
+
+        with patch(
+            'orchestrator.verify_runner.VerifyRunnerPool.dispatch', _fake_dispatch,
+        ):
+            await _run_post_merge_verify(
+                git_ops, req, tmp_path,
+                timeouts={}, enospc_retries={}, max_timeouts=2, max_enospc=1,
+                merge_sha='abc123', runner=_fake_pass_runner(),
+                event_store=_CapturingEventStore(),
+                **kwargs,
+            )
+        return captured
+
+    async def test_initial_dispatch_carries_chain_items(self, tmp_path: Path) -> None:
+        calls = await self._dispatch_calls(
+            tmp_path, [_pass_result()], chain_items=4,
+        )
+
+        assert len(calls) == 1
+        assert calls[0]['chain_items'] == 4
+
+    async def test_enospc_retry_carries_the_same_chain_items(
+        self, tmp_path: Path,
+    ) -> None:
+        """The ENOSPC retry dispatch (attempt=1) must not drop to the default."""
+        enospc = _fail_result(test_output='fatal: No space left on device')
+        calls = await self._dispatch_calls(
+            tmp_path, [enospc, _pass_result()], chain_items=5,
+        )
+
+        assert len(calls) == 2, 'expected an ENOSPC retry dispatch'
+        assert calls[1]['attempt'] == 1
+        assert [c['chain_items'] for c in calls] == [5, 5]
+
+    async def test_infra_transient_retry_carries_the_same_chain_items(
+        self, tmp_path: Path,
+    ) -> None:
+        """The classified-infra-transient retry dispatch likewise."""
+        from orchestrator.verify_categories import INFRA_TRANSIENT_CATEGORIES
+
+        category = sorted(str(c) for c in INFRA_TRANSIENT_CATEGORIES)[0]
+        transient = _fail_result(category=category)
+        calls = await self._dispatch_calls(
+            tmp_path, [transient, _pass_result()], chain_items=3,
+        )
+
+        assert len(calls) == 2, f'expected an infra-transient retry for {category!r}'
+        assert calls[1]['attempt'] >= 1
+        assert [c['chain_items'] for c in calls] == [3, 3]
+
+    async def test_legacy_call_form_defaults_to_one(self, tmp_path: Path) -> None:
+        """No chain_items kwarg → 1, keeping the train / merge_gates callers
+        byte-identical in MEANING: each verifies exactly one item's tree."""
+        calls = await self._dispatch_calls(tmp_path, [_pass_result()])
+
+        assert len(calls) == 1
+        assert calls[0]['chain_items'] == 1
+
+
 @pytest.mark.asyncio
 class TestRunInflightVerifyDepthWiring:
     """_run_inflight_verify forwards depth + item.speculative into
