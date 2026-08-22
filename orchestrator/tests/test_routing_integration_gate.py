@@ -101,9 +101,11 @@ import pytest
 from _recording_event_store import _RecordingEventStore
 from _workflow_helpers import (
     AgentStub,
+    FakeMetadataBackend,
     _build_workflow,
     _derive_meta_root_like_production,  # noqa: F401  autouse fixture, see its docstring
     _init_repo,
+    wire_metadata_backend,
 )
 
 from orchestrator.agents.invoke import AgentResult
@@ -637,3 +639,148 @@ class TestByteEquivalenceThroughTheRig:
         assert data['source_layer'] == 'config'
         assert data['rule_id'] is None
         assert data['rejected'] == []
+
+
+# ---------------------------------------------------------------------------
+# Boundary scenario 6 — routing_tier is stable WITHIN one dispatch (plan
+# step-3).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestTierStableWithinOneDispatch:
+    """PRD boundary scenario 6: ``metadata.routing.routing_tier`` never
+    changes WITHIN a single dispatch, no matter how many verify/debug
+    iterations it takes to reach DONE. ``workflow.py`` only ever READS
+    ``routing_tier`` (``_invoke`` at workflow.py:12227); the sole writer is
+    ``Harness._maybe_bump_routing_tier`` at slot release (task mu,
+    harness.py:9027), which this suite never drives here.
+
+    Seeds ``routing_tier=1`` so the shipped ``retry-tier-up`` rule
+    (defaults.yaml:320) is LIVE for the whole dispatch: if tier read/write
+    ever drifted mid-dispatch, it would surface as a visible MODEL change
+    (sonnet -> opus), not merely a silent counter change -- a stronger
+    signal than asserting the counter alone.
+
+    Uses ``code_default_config`` (rather than the module ``config`` fixture)
+    to deliberately INSTALL the shipped default rules -- the ambient
+    operational yaml happens not to override ``routing`` today, but this
+    scenario's premise (retry-tier-up is live) must not depend on that
+    drifting, mirroring ``test_routing_retry_tier_up.py``'s own isolation
+    rationale.
+
+    Wires a real ``FakeMetadataBackend`` onto the rig's ``FakeScheduler`` via
+    ``wire_metadata_backend`` so ``_record_routing_decision``'s
+    ``scheduler.update_task(..., metadata_mode='merge')`` mirror-write
+    actually succeeds and is recorded -- the bare ``FakeScheduler.update_task``
+    has no ``metadata_mode`` parameter and a call with it is silently
+    swallowed by ``_record_routing_decision``'s best-effort try/except
+    (workflow.py:12701-12717), which would make assertion (c) vacuous.
+    """
+
+    @pytest.fixture
+    def stock_config(self, git_repo: Path, code_default_config) -> OrchestratorConfig:
+        return OrchestratorConfig(
+            project_root=git_repo,
+            max_concurrent_tasks=1,
+            max_execute_iterations=5,
+            max_verify_attempts=3,
+            max_review_cycles=2,
+            git=GitConfig(
+                main_branch='main',
+                branch_prefix='task/',
+                remote='origin',
+                worktree_dir='.worktrees',
+            ),
+            sandbox=SandboxConfig(enabled=False),
+        )
+
+    async def test_routing_tier_stable_across_verify_debug_iterations(
+        self, stock_config, git_ops, task_assignment, monkeypatch,
+    ):
+        assert stock_config.models.implementer == stock_config.models.debugger == 'sonnet'
+        task_assignment.task['metadata']['routing'] = {'routing_tier': 1}
+
+        stub = _RoutingRecorderStub()
+        workflow, scheduler = _build_workflow(stock_config, git_ops, task_assignment, stub)
+        rec = _RecordingEventStore()
+        workflow.event_store = rec
+        backend = FakeMetadataBackend()
+        wire_metadata_backend(
+            scheduler, backend, seed=task_assignment.task['metadata'], grants=True,
+        )
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
+
+        # False, False, then True FOREVER -- not just for 3 calls. A full
+        # dispatch to DONE calls run_scoped_verification again in the merge
+        # phase (workflow.py:3614, _run_merge_phase) AFTER the
+        # verify/debug loop's own 3 calls; a length-3 side_effect list would
+        # StopIteration on that 4th call and BLOCK the dispatch for a reason
+        # unrelated to what this scenario tests.
+        _verify_call_count = 0
+
+        async def _verify_sequence(*args, **kwargs) -> VerifyResult:
+            nonlocal _verify_call_count
+            _verify_call_count += 1
+            if _verify_call_count <= 2:
+                return VerifyResult(
+                    passed=False, test_output='FAILED test_farewell', lint_output='',
+                    type_output='', summary='Failures: tests failed',
+                )
+            return VerifyResult(
+                passed=True, test_output='OK', lint_output='',
+                type_output='', summary='All checks passed',
+            )
+
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification', _verify_sequence,
+        )
+
+        outcome = (await workflow.run()).outcome
+
+        # (d) two verify failures + debugger fixes still reach DONE.
+        assert outcome == WorkflowOutcome.DONE
+
+        # The EXECUTE->VERIFY loop re-entered implementer/debugger at least
+        # three times (1 implementer from EXECUTE + 2 debugger from the two
+        # verify failures).
+        idx_events = [
+            e['data'] for e in _routing_events(rec)
+            if e['data']['role'] in ('implementer', 'debugger')
+        ]
+        assert len(idx_events) >= 3, (
+            f'expected >=3 implementer/debugger routing_decision events '
+            f'(1 implementer + 2 debugger): {idx_events!r}'
+        )
+
+        # (a) every one of those events carries the SAME routing_tier --
+        # collected into a set of exactly one element.
+        tiers = {e['routing_tier'] for e in idx_events}
+        assert tiers == {1}, f'routing_tier drifted mid-dispatch: {idx_events!r}'
+
+        # (b) every one of those events resolves to the SAME model -- no
+        # mid-dispatch ladder drift. (Also confirms retry-tier-up genuinely
+        # fired rather than being inert: both roles' stock model is
+        # 'sonnet', asserted above, so a bare 'sonnet' here would mean the
+        # rule never installed.)
+        models = {e['model'] for e in idx_events}
+        assert models == {'opus'}, f'model drifted mid-dispatch: {idx_events!r}'
+        assert all(e['rule_id'] == 'retry-tier-up' for e in idx_events)
+        assert all(e['source_layer'] == 'policy_rule' for e in idx_events)
+
+        # (c) every recorded merge-mode metadata write carrying a 'routing'
+        # key shows the tier VALUE unchanged at 1 -- not merely "no write
+        # happened". `_invoke`'s mirror writes `routing` on every
+        # invocation, so this list is expected to be non-empty.
+        routing_writes = [
+            call['metadata']['routing'] for call in backend.update_task_calls
+            if isinstance(call.get('metadata'), dict) and 'routing' in call['metadata']
+        ]
+        assert routing_writes, (
+            f'expected at least one merge-mode routing mirror write: '
+            f'{backend.update_task_calls!r}'
+        )
+        assert {w['routing_tier'] for w in routing_writes} == {1}, (
+            f'a routing mirror write raised routing_tier above 1 mid-dispatch: '
+            f'{routing_writes!r}'
+        )
