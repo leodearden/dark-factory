@@ -252,9 +252,10 @@ class TestSelectCanonicalPayload:
         assert select_canonical_payload(
             payloads, allowed_categories=None, include_planned=False
         ) is None
-        assert select_canonical_payload(
+        included = select_canonical_payload(
             payloads, allowed_categories=None, include_planned=True
-        )['id'] == 'c1'
+        )
+        assert included is not None and included['id'] == 'c1'
 
     def test_child_shaped_payloads_excluded_even_when_canonical(self):
         """A child would be folded into its PARENT at index 0 by grouped_read.
@@ -319,7 +320,7 @@ class TestSelectCanonicalPayload:
         selected = select_canonical_payload([older, newer], allowed_categories=None,
                                             include_planned=False)
 
-        assert selected['id'] == 'b-new'
+        assert selected is not None and selected['id'] == 'b-new'
 
     def test_tie_break_falls_through_to_lowest_id(self):
         """Same timestamp: the id is the total-order tiebreak."""
@@ -333,7 +334,7 @@ class TestSelectCanonicalPayload:
         selected = select_canonical_payload(payloads, allowed_categories=None,
                                             include_planned=False)
 
-        assert selected['id'] == 'aaa'
+        assert selected is not None and selected['id'] == 'aaa'
 
     def test_tie_break_is_stable_across_input_permutations(self):
         """Order-independence is the point — scroll order is not guaranteed."""
@@ -345,11 +346,13 @@ class TestSelectCanonicalPayload:
             _payload('c-new', created_at='2026-08-09T00:00:00+00:00'),
         ]
 
-        picks = {
+        selections = [
             select_canonical_payload(list(perm), allowed_categories=None,
-                                     include_planned=False)['id']
+                                     include_planned=False)
             for perm in itertools.permutations(payloads)
-        }
+        ]
+        assert all(s is not None for s in selections)
+        picks = {s['id'] for s in selections if s is not None}
 
         assert picks == {'b-new'}
 
@@ -363,7 +366,7 @@ class TestSelectCanonicalPayload:
         selected = select_canonical_payload(payloads, allowed_categories=None,
                                             include_planned=False)
 
-        assert selected['id'] == 'b-dated'
+        assert selected is not None and selected['id'] == 'b-dated'
 
     def test_malformed_payloads_degrade_to_not_canonical(self):
         """Raw payloads are not schema-enforced at read time — degrade, never raise."""

@@ -710,12 +710,19 @@ class TestTopicAnchoredRecallReloadTier:
         }]})
         service.mem0.scroll_by_metadata = AsyncMock(return_value=[])
 
-        search_kwargs = dict(
-            query='q', project_id='dark_factory',
-            categories=['procedural_knowledge'], stores=['mem0'], limit=5,
-        )
+        async def _search() -> None:
+            # Spelled out rather than splatted from a dict: a heterogeneous
+            # dict literal infers `str | list[str] | int` for every value and
+            # pyright rejects the splat against search's real signature.
+            await service.search(
+                query='q',
+                project_id='dark_factory',
+                categories=['procedural_knowledge'],
+                stores=['mem0'],
+                limit=5,
+            )
 
-        await service.search(**search_kwargs)
+        await _search()
         assert service.mem0.scroll_by_metadata.await_count == 1
 
         fresh = FusedMemoryConfig()
@@ -723,5 +730,5 @@ class TestTopicAnchoredRecallReloadTier:
         apply_reload(service.config, fresh)
 
         # Same service object, no reconstruction — the next search skips the I/O.
-        await service.search(**search_kwargs)
+        await _search()
         assert service.mem0.scroll_by_metadata.await_count == 1
