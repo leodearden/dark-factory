@@ -17,6 +17,7 @@ rather than ever shelling out to a real `claude` process.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 from pathlib import Path
@@ -547,6 +548,141 @@ def test_code_digests_exactly_half_failure_is_not_a_storm():
     assert len(result.failures) == 2
     failure_sessions = {session for session, _reason in result.failures}
     assert failure_sessions == fail_sessions
+
+
+# ---------------------------------------------------------------------------
+# task 4511: code_digests announces EVERY per-digest failure as it happens.
+#
+# Not merely a nicer rendering of the aggregate nightly.py already escalates.
+# A SUB-STORM batch -- failed/total <= 0.5, e.g. 2 of 4 -- returns
+# status="ok", so run_nightly escalates nothing and those failures reach NO
+# sink at all today: not the journal, not an escalation, nowhere. Per-digest
+# lines also separate a storm of 38 identical ENOENTs from 38 distinct model
+# errors, a distinction the single joined aggregate detail flattens.
+# ---------------------------------------------------------------------------
+
+def _coder_warnings(caplog):
+    """Records at >= WARNING on coder.py's OWN logger, filtered by name so a
+    sibling module's records can never be mistaken for these."""
+    return [
+        r for r in caplog.records
+        if r.levelno >= logging.WARNING and r.name == "legibility.coder"
+    ]
+
+
+def _make_crashing_invoke(crash_sessions):
+    """Fake invoke that raises a BARE RuntimeError (not CoderInvocationError)
+    for the named sessions -- the exception class code_digest does NOT catch,
+    so it escapes to code_digests' own isolating `except Exception` and lands
+    as a `(None, reason)` failure."""
+    def fake_invoke(prompt, model):
+        for session_id in crash_sessions:
+            if session_id in prompt:
+                raise RuntimeError(f"unexpected explosion coding {session_id}")
+        return json.dumps({"matches": [], "candidates": []})
+    return fake_invoke
+
+
+def test_code_digests_logs_every_failure_in_a_sub_storm_batch(caplog):
+    """THE MOTIVATING CASE: 2 of 4 fail, which does not STRICTLY exceed the
+    0.5 storm threshold, so status stays "ok" and nightly.py escalates
+    nothing. These WARNINGs are the only sink those two failures ever
+    reach."""
+    digests = _batch_digests(4)
+    fail_sessions = {"batch-sess-0", "batch-sess-1"}
+
+    with caplog.at_level(logging.DEBUG, logger="legibility.coder"):
+        result = mod.code_digests(
+            digests, _tiny_codebook(), project="dark_factory", model="haiku",
+            invoke=_make_batch_invoke(fail_sessions),
+        )
+
+    assert result.status == "ok", (
+        "if this ever became a storm the test would be pinning the wrong "
+        "case -- the whole point is that nightly.py stays silent here"
+    )
+
+    warned = _coder_warnings(caplog)
+    assert len(warned) == 2, (
+        f"expected one WARNING per failed digest; got "
+        f"{[r.getMessage() for r in warned]}"
+    )
+    messages = [r.getMessage() for r in warned]
+    for session_id in sorted(fail_sessions):
+        assert any(session_id in m for m in messages), (
+            f"{session_id!r} never reached the journal; got {messages}"
+        )
+    for session_id in ("batch-sess-2", "batch-sess-3"):
+        assert not any(session_id in m for m in messages), (
+            f"a SUCCEEDING digest was reported as a failure: {messages}"
+        )
+    for message in messages:
+        assert "could not parse a JSON object" in message, (
+            f"the REASON is the diagnosis, not just the session id; got "
+            f"{message!r}"
+        )
+
+
+def test_code_digests_logs_one_record_per_failure_in_a_storm(caplog):
+    """3 of 4 -- a genuine storm. One line per failure, so an operator can
+    tell three identical ENOENTs from three distinct model errors; the
+    aggregate nightly.py escalates joins them into one string and loses
+    that."""
+    digests = _batch_digests(4)
+    fail_sessions = {"batch-sess-0", "batch-sess-1", "batch-sess-2"}
+
+    with caplog.at_level(logging.DEBUG, logger="legibility.coder"):
+        result = mod.code_digests(
+            digests, _tiny_codebook(), project="dark_factory", model="haiku",
+            invoke=_make_batch_invoke(fail_sessions),
+        )
+
+    assert result.status == "failure"
+
+    warned = _coder_warnings(caplog)
+    assert len(warned) == 3, (
+        f"expected one WARNING per failed digest; got "
+        f"{[r.getMessage() for r in warned]}"
+    )
+    messages = [r.getMessage() for r in warned]
+    for session_id in sorted(fail_sessions):
+        assert any(session_id in m for m in messages), (
+            f"{session_id!r} never reached the journal; got {messages}"
+        )
+
+
+def test_code_digests_logs_the_isolated_crash_path_too(caplog):
+    """The OTHER failure path -- code_digests' own isolating `except
+    Exception`, which yields `(None, reason)` because the crash happened
+    before a session could be attributed. Both paths must reach the journal,
+    and the batch must keep going."""
+    digests = _batch_digests(3)
+
+    with caplog.at_level(logging.DEBUG, logger="legibility.coder"):
+        result = mod.code_digests(
+            digests, _tiny_codebook(), project="dark_factory", model="haiku",
+            invoke=_make_crashing_invoke({"batch-sess-1"}),
+        )
+
+    # The batch kept going: the other two digests still coded.
+    assert result.status == "ok"
+    assert result.total == 3
+    assert result.succeeded == 2
+    assert len(result.failures) == 1
+    session, reason = result.failures[0]
+    assert session is None
+    assert "unexpected explosion coding batch-sess-1" in reason
+
+    warned = _coder_warnings(caplog)
+    assert len(warned) == 1, (
+        f"expected exactly one WARNING; got {[r.getMessage() for r in warned]}"
+    )
+    message = warned[0].getMessage()
+    assert "unexpected explosion coding batch-sess-1" in message
+    assert "None" in message, (
+        f"an unattributable crash must SAY the session is unknown rather "
+        f"than omitting it; got {message!r}"
+    )
 
 
 # ---------------------------------------------------------------------------
