@@ -242,7 +242,21 @@ async def _record_effect_divergence(
     path only (task 3116).
 
     Awaits ``git_ops.describe_commit_effect_in_main(effect_check_sha)`` and
-    writes ``diverged_paths`` / ``effect_failure`` / ``effect_anchor_sha``.
+    writes ``diverged_paths`` / ``effect_failure`` / ``effect_anchor_sha``,
+    plus the part-(b) SURVIVAL facts that actually decided the verdict
+    (``aggregate_survival`` and its ``added_lines_total`` denominator, the
+    worst guarded file and its ratio, the three thresholds applied, and any
+    ``vacuous_paths``).
+
+    Carrying the survival numbers is not decoration.  Since part (b),
+    ``diverged_paths`` is an explicitly DEMOTED diagnostic — it no longer
+    decides anything — so an escalation that printed only the paths would
+    show the reader everything except the measurement the rejection was
+    actually based on, and invite exactly the "it says diverged, so it was
+    reverted" leap this task exists to stop.  The thresholds ride along so a
+    later retune is visible in the output instead of silently changing what
+    the same numbers mean.
+
     Called ONLY after the boolean ``commit_effect_present_in_main`` has
     already rejected, and never on the accept path — the decision is the
     bool's, this is only its explanation.  The extra git work is free in
@@ -266,6 +280,14 @@ async def _record_effect_divergence(
         probe['diverged_paths'] = list(result.diverged_paths)
         probe['effect_failure'] = result.failure
         probe['effect_anchor_sha'] = result.anchor_sha
+        probe['aggregate_survival'] = result.aggregate_survival
+        probe['added_lines_total'] = result.added_lines_total
+        probe['worst_guarded_path'] = result.worst_guarded_path
+        probe['worst_guarded_survival'] = result.worst_guarded_survival
+        probe['aggregate_threshold'] = result.aggregate_threshold
+        probe['per_file_threshold'] = result.per_file_threshold
+        probe['per_file_min_added_lines'] = result.per_file_min_added_lines
+        probe['vacuous_paths'] = list(result.vacuous_paths)
     except Exception as exc:
         probe['diverged_paths'] = None
         probe['effect_probe_error'] = repr(exc)
@@ -699,7 +721,8 @@ def _render_effect_divergence(
 
     lines = [
         'diverged paths (touched by the evidence commit, no longer '
-        'matching main HEAD):',
+        'matching main HEAD — a DIAGNOSTIC; since the survival semantics '
+        'these do not decide the verdict):',
     ]
     lines.extend(f'  - {path}' for path in paths)
     anchor = probe.get('effect_anchor_sha')
@@ -708,6 +731,7 @@ def _render_effect_divergence(
     failure = probe.get('effect_failure')
     if failure:
         lines.append(f'effect failure: {failure}')
+    lines.extend(_survival_lines(probe))
     block = '\n'.join(lines) + '\n\n'
 
     fragment = f'; diverged: {paths[0]}'
