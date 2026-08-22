@@ -62,14 +62,6 @@ from orchestrator import verify, verify_plan
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 
-# This worktree's own top-level orchestrator config. ``dark-factory-orchestrator
-# .yaml`` is the canonical, REQUIRED filename for a project's top-level config;
-# the legacy spellings are a discovery fallback for unmigrated projects, not a
-# choice this repo has. Anchored to REPO_ROOT rather than taken from the ambient
-# ORCH_CONFIG_PATH, for the reason ``_root_config``'s docstring records at length.
-DF_CONFIG_PATH = REPO_ROOT / 'dark-factory-orchestrator.yaml'
-
-
 # MEASURED wall-clock, in seconds: the WORST run of each module's own VERBATIM
 # test_command, copied byte-for-byte out of that module's orchestrator.yaml.
 #
@@ -189,46 +181,6 @@ def _discovered() -> dict:
     return _discover_module_configs(REPO_ROOT)
 
 
-def _root_config(monkeypatch: pytest.MonkeyPatch) -> OrchestratorConfig:
-    """Load the repo-root config through the PRODUCTION loader, anchored at DF_CONFIG_PATH.
-
-    ANCHORING ``ORCH_CONFIG_PATH`` IS LOAD-BEARING, not hygiene. ``project_root``
-    is only a model FIELD and selects nothing:
-    ``OrchestratorConfig.settings_customise_sources`` builds its
-    ``YamlSettingsSource`` from ``os.environ['ORCH_CONFIG_PATH']`` alone,
-    falling back to a CWD-relative ``config.yaml``. Both ambient states are
-    wrong here, in OPPOSITE directions:
-
-      * UNSET — the state INSIDE VERIFY, because
-        ``verify._target_subprocess_env`` deliberately scrubs the whole
-        ``ORCH_`` prefix — finds no file, so every value collapses to the
-        pydantic DEFAULTS. Assertion (c) below would then compare each module
-        budget against a default this repo does not declare.
-      * SET, as an operator's shell has it, points at whichever checkout that
-        orchestrator serves — typically the MAIN one, not this worktree. Every
-        assertion would then be about a different checkout's yaml and report
-        GREEN on a worktree that had actually regressed.
-
-    Setting the env var IS the production load path (``config.load_config``
-    stamps it before constructing), so this stays a read through the real
-    loader, pinned to THIS worktree's committed yaml.
-
-    Fails LOUDLY on a missing file: ``YamlSettingsSource`` SKIPS a non-existent
-    ``config_path`` rather than raising, so a bad path would silently yield the
-    pydantic defaults instead of an error.
-    """
-    assert DF_CONFIG_PATH.is_file(), (
-        f'{DF_CONFIG_PATH} does not exist, so anchoring ORCH_CONFIG_PATH at it '
-        'would silently load the pydantic DEFAULTS instead (YamlSettingsSource '
-        'skips a non-existent path rather than raising), and every value read '
-        'from the returned config would be about a config this repo does not '
-        'declare. dark-factory-orchestrator.yaml is the canonical, required '
-        "filename for a project's top-level orchestrator config"
-    )
-    monkeypatch.setenv('ORCH_CONFIG_PATH', str(DF_CONFIG_PATH))
-    return OrchestratorConfig(project_root=REPO_ROOT)
-
-
 def _executed_for_touched(prefix: str, files: list[str], cfg: OrchestratorConfig):
     """Run the PRODUCTION plan->execution bridge and return the single executed config.
 
@@ -237,13 +189,15 @@ def _executed_for_touched(prefix: str, files: list[str], cfg: OrchestratorConfig
     executes. Asserting on THAT is what makes "the budget survives to
     execution" a structural claim rather than a claim about the yaml.
 
-    *cfg* IS A REQUIRED PARAMETER, not a convenience. It must be a config built
-    by ``_root_config``, whose docstring spells out why the ``ORCH_CONFIG_PATH``
-    anchor is load-bearing: an unset anchor collapses every value to the
-    pydantic defaults, SILENTLY. This helper used to construct its own
-    ``OrchestratorConfig(project_root=REPO_ROOT)`` and read the right yaml only
-    because its caller happened to have called ``_root_config`` earlier in the
-    same test body, leaving the env var set as a SIDE EFFECT. Reordering the
+    *cfg* IS A REQUIRED PARAMETER, not a convenience. It must be the config
+    built by the directory-wide ``root_config`` fixture in
+    ``tests/scripts/conftest.py``, whose docstring spells out why the
+    ``ORCH_CONFIG_PATH`` anchor is load-bearing: an unset anchor collapses every
+    value to the pydantic defaults, SILENTLY. This helper used to construct its
+    own ``OrchestratorConfig(project_root=REPO_ROOT)`` and read the right yaml
+    only because its caller happened to have called the (then file-local)
+    anchoring helper earlier in the same test body, leaving the env var set as a
+    SIDE EFFECT. Reordering the
     assertions, or calling this helper from a new test, would have handed it a
     defaults-collapsed config with no failure signal. Taking the config as an
     argument makes the dependency structural instead of ordering-dependent.
@@ -263,7 +217,7 @@ def _executed_for_touched(prefix: str, files: list[str], cfg: OrchestratorConfig
 
 @pytest.mark.parametrize('prefix', sorted(MEASURED_MODULE_SUITE_WORST_SECS))
 def test_module_carries_its_own_measured_verify_budget(
-    prefix: str, monkeypatch: pytest.MonkeyPatch
+    prefix: str, root_config: OrchestratorConfig
 ) -> None:
     """Each measured module declares a warm budget, narrower than the repo-root ceiling.
 
@@ -349,11 +303,12 @@ def test_module_carries_its_own_measured_verify_budget(
         f'reintroduced one level down'
     )
 
-    # (c) Strictly tighter than the repo-root ceiling: a real narrowing. Read
-    # through the PRODUCTION loader (see _root_config's docstring for why the
-    # ORCH_CONFIG_PATH anchoring is load-bearing rather than hygiene).
-    cfg = _root_config(monkeypatch)
-    root_warm = cfg.verify_command_timeout_secs
+    # (c) Strictly tighter than the repo-root ceiling: a real narrowing. The
+    # repo-root config arrives from the directory-wide `root_config` fixture,
+    # which reads it through the PRODUCTION loader — see its docstring in
+    # tests/scripts/conftest.py for why the ORCH_CONFIG_PATH anchoring is
+    # load-bearing rather than hygiene.
+    root_warm = root_config.verify_command_timeout_secs
     assert mc.verify_command_timeout_secs < root_warm, (
         f'{prefix} verify_command_timeout_secs='
         f'{mc.verify_command_timeout_secs} is not strictly below the repo-root '
@@ -363,7 +318,7 @@ def test_module_carries_its_own_measured_verify_budget(
     )
 
     # (d) The REAL precedence mechanism honours it, warm.
-    resolved = verify._resolve_verify_timeout(cfg, mc, is_cold=False)
+    resolved = verify._resolve_verify_timeout(root_config, mc, is_cold=False)
     assert resolved == mc.verify_command_timeout_secs, (
         f'_resolve_verify_timeout returned {resolved} for a warm verify of '
         f'{prefix}, not the declared module budget '
@@ -374,7 +329,9 @@ def test_module_carries_its_own_measured_verify_budget(
     # (e) Survives the PRODUCTION plan -> execution bridge, not just the
     # resolver in isolation. See the docstring for why _apply_cargo_scope makes
     # this a live risk rather than a formality.
-    executed = _executed_for_touched(prefix, [SAMPLE_TOUCHED_FILE[prefix]], cfg)
+    executed = _executed_for_touched(
+        prefix, [SAMPLE_TOUCHED_FILE[prefix]], root_config
+    )
     assert executed.verify_command_timeout_secs == mc.verify_command_timeout_secs, (
         f'the production plan->execution bridge '
         f'(verify._executed_module_configs_from_plan) rendered '
@@ -395,9 +352,9 @@ def test_module_carries_its_own_measured_verify_budget(
         f'intentionally, this assertion and the module yaml\'s cold-cascade '
         f'note must be updated together, not just this line'
     )
-    root_cold = cfg.verify_cold_command_timeout_secs
+    root_cold = root_config.verify_cold_command_timeout_secs
     resolved_cold = verify._resolve_verify_timeout(
-        cfg, mc, is_cold=True, is_merge_verify=False
+        root_config, mc, is_cold=True, is_merge_verify=False
     )
     assert resolved_cold == root_cold, (
         f'_resolve_verify_timeout(is_cold=True) returned {resolved_cold} for '

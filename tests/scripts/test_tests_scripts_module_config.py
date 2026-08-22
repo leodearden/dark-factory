@@ -46,15 +46,6 @@ from orchestrator import verify, verify_plan
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 
-# This worktree's own top-level orchestrator config — the one `_root_config`
-# reads. `dark-factory-orchestrator.yaml` is the canonical, REQUIRED filename
-# for a project's top-level config (it is what the dashboard's escalation-URL
-# discovery keys on); the legacy spellings are a discovery fallback for
-# unmigrated projects, not a choice this repo has. Anchored to REPO_ROOT rather
-# than taken from the ambient ORCH_CONFIG_PATH for the reason that helper's
-# docstring records at length.
-ROOT_CONFIG_PATH = REPO_ROOT / 'dark-factory-orchestrator.yaml'
-
 MODULE_PREFIX = 'tests/scripts'
 
 # A file in this suite, used as the representative touched-file for the
@@ -64,63 +55,6 @@ SAMPLE_TOUCHED_FILE = 'tests/scripts/test_spawn_claude.py'
 
 def _discovered() -> dict:
     return _discover_module_configs(REPO_ROOT)
-
-
-def _root_config(monkeypatch: pytest.MonkeyPatch) -> OrchestratorConfig:
-    """Load the repo-root config through the PRODUCTION loader, anchored at ROOT_CONFIG_PATH.
-
-    COPIED (task 3703) from the two sibling guards
-    (``test_scripts_module_config.py`` and ``test_module_verify_budgets.py``),
-    not imported: a test file importing a sibling test file couples two guards
-    that must be able to fail independently, and this anchor is load-bearing
-    enough that it must be visibly present in the file that depends on it.
-
-    THE COST OF THAT, RECORDED RATHER THAN LEFT IMPLICIT (task 3703 amendment
-    pass, reviewer-flagged): this makes THREE verbatim copies of a helper that
-    is pure setup, and the no-cross-import argument — sound for ASSERTIONS —
-    does not reach ``tests/scripts/conftest.py``, which already exists and is
-    pytest's idiomatic home for exactly this. One anchoring implementation as a
-    conftest fixture would leave each guard's assertions just as independent.
-    NOT done here: conftest.py is outside this task's locked module list, so
-    de-triplicating it is filed as a follow-up rather than reached for.
-
-    ANCHORING ``ORCH_CONFIG_PATH`` IS LOAD-BEARING, not hygiene.
-    ``project_root`` is only a model FIELD and selects nothing:
-    ``OrchestratorConfig.settings_customise_sources`` builds its
-    ``YamlSettingsSource`` from ``os.environ['ORCH_CONFIG_PATH']`` alone,
-    falling back to a CWD-relative ``config.yaml``. Both ambient states are
-    wrong here, in OPPOSITE directions:
-
-      * UNSET — the state INSIDE VERIFY, because
-        ``verify._target_subprocess_env`` deliberately scrubs the whole
-        ``ORCH_`` prefix (task 2957) — finds no file, so every value collapses
-        to the pydantic DEFAULTS, a config this repo does not declare.
-      * SET, as an operator's shell has it, points at whichever checkout that
-        orchestrator serves — typically the MAIN one, not this worktree. Every
-        assertion would then be about a different checkout's yaml and report
-        GREEN on a worktree that had actually regressed: the exact
-        reports-green-while-checking-something-else failure this file exists
-        to prevent, one env var over.
-
-    Setting the env var IS the production load path (``config.load_config``
-    stamps ``os.environ['ORCH_CONFIG_PATH']`` before constructing), so this
-    stays a read through the real loader, pinned to THIS worktree's committed
-    yaml rather than left to the ambient environment.
-
-    Fails LOUDLY on a missing file rather than silently: ``YamlSettingsSource``
-    SKIPS a non-existent ``config_path`` instead of raising, so a bad path
-    would yield the pydantic DEFAULTS with no error at all.
-    """
-    assert ROOT_CONFIG_PATH.is_file(), (
-        f'{ROOT_CONFIG_PATH} does not exist, so anchoring ORCH_CONFIG_PATH at '
-        'it would silently load the pydantic DEFAULTS instead (YamlSettingsSource '
-        'skips a non-existent path rather than raising), and every value read '
-        'from the returned config would be about a config this repo does not '
-        'declare. dark-factory-orchestrator.yaml is the canonical, required '
-        "filename for a project's top-level orchestrator config"
-    )
-    monkeypatch.setenv('ORCH_CONFIG_PATH', str(ROOT_CONFIG_PATH))
-    return OrchestratorConfig(project_root=REPO_ROOT)
 
 
 def test_tests_scripts_is_a_registered_module_config() -> None:
@@ -270,8 +204,9 @@ def _executed_for_touched(files: list[str], cfg: OrchestratorConfig):
 
     *cfg* IS A REQUIRED PARAMETER, not a convenience (task 3703, applying the
     shape commit 6c72a7da5a landed next door in
-    ``test_module_verify_budgets.py``). It must be a config built by
-    ``_root_config``, whose docstring spells out why the ``ORCH_CONFIG_PATH``
+    ``test_module_verify_budgets.py``). It must be the config built by the
+    directory-wide ``root_config`` fixture in ``tests/scripts/conftest.py``,
+    whose docstring spells out why the ``ORCH_CONFIG_PATH``
     anchor is load-bearing: an unset anchor collapses every value to the
     pydantic defaults, SILENTLY. This helper used to construct its own
     ``OrchestratorConfig(project_root=REPO_ROOT)``, and — unlike the sibling
@@ -295,7 +230,7 @@ def _executed_for_touched(files: list[str], cfg: OrchestratorConfig):
 
 
 def test_tests_scripts_diff_executes_its_own_suite_and_keeps_lint_and_type(
-    monkeypatch: pytest.MonkeyPatch,
+    root_config: OrchestratorConfig,
 ) -> None:
     """The task's acceptance criterion, asserted STRUCTURALLY rather than via rc.
 
@@ -318,7 +253,7 @@ def test_tests_scripts_diff_executes_its_own_suite_and_keeps_lint_and_type(
     ``pyright tests/scripts/test_spawn_claude.py`` rc=0). Closing the TEST gap
     must not open a LINT/TYPE one.
     """
-    executed = _executed_for_touched([SAMPLE_TOUCHED_FILE], _root_config(monkeypatch))
+    executed = _executed_for_touched([SAMPLE_TOUCHED_FILE], root_config)
 
     # (a) The tests/scripts segment ACTUALLY RUNS.
     assert executed.test_command is not None, (
@@ -371,7 +306,9 @@ def test_tests_scripts_diff_executes_its_own_suite_and_keeps_lint_and_type(
 
 
 def test_executed_for_touched_is_hermetic_against_the_ambient_orch_config_path(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    root_config: OrchestratorConfig,
 ) -> None:
     """``_executed_for_touched`` must not read the ambient ``ORCH_CONFIG_PATH``.
 
@@ -409,12 +346,19 @@ def test_executed_for_touched_is_hermetic_against_the_ambient_orch_config_path(
     poisoned env — they read this module's own yaml and the config they are
     handed, never ``ORCH_CONFIG_PATH``.
 
-    ORDER IS LOAD-BEARING: the anchored config is built FIRST, while the
-    environment is still sane, and the poison applied SECOND. Anchoring
-    afterwards would overwrite the poison and leave this test vacuous.
+    ORDER IS LOAD-BEARING, AND IS NOW STRUCTURAL RATHER THAN A COMMENT (task
+    4320). The anchored config must be built FIRST, while the environment is
+    still sane, and the poison applied SECOND; anchoring afterwards would
+    overwrite the poison and leave this test vacuous. That used to rest on the
+    file-local ``_root_config(monkeypatch)`` call physically preceding the
+    poison in the body, enforceable only by reading. The anchored config now
+    arrives from the directory-wide ``root_config`` fixture, and pytest builds
+    fixtures during SETUP — before this body runs at all — so the ordering can
+    no longer be broken by an edit that moves a line.
     """
-    # (1) The anchored config, built while the environment is still sane.
-    cfg = _root_config(monkeypatch)
+    # (1) The anchored config, built during fixture setup while the environment
+    # is still sane.
+    cfg = root_config
 
     # (2) NOW poison the ambient environment, with a config the PRODUCTION
     # loader REJECTS — see the docstring for why rejected and not merely
