@@ -669,6 +669,60 @@ reports two different shapes, and they need OPPOSITE fixes:
 """
 
 
+# Census-2026-08-21 §1.1 companion to TOOL_CALL_REJECTION_GUIDANCE above (task
+# 4578; plans/confusion-census-2026-08-21.md). A dispatched session called the
+# `Agent` tool supplying only a `prompt` field; the schema also requires
+# `description`, and the omission was rejected by `InputValidationError: The
+# required parameter 'description' is missing` before any sub-agent launched.
+#
+# WHAT IS AND IS NOT ADDRESSED. The CAUSE is upstream of this repository --
+# harness-side tool-call construction for a Claude Code builtin -- and no
+# in-repo code path produces or can intercept it, so this constant does not
+# attempt to detect or repair the malformed call. Only the RECOVERY facet is
+# in scope, the same carve-out the constant above already takes for the
+# stray-comma sighting: a dispatched agent's response to the rejection is
+# this repo's to fix, through the role system prompts.
+#
+# DISCRIMINATION, NOT DUPLICATION. This is a THIRD `InputValidationError`
+# shape, not a rewording of either bullet above -- do not fold it into, or
+# delete, either existing bullet as redundant. The raw error string ("The
+# required parameter `X` is missing") is IDENTICAL to the deferred-tool
+# shape's founding evidence above, so the string alone does not discriminate
+# between the two mechanisms; read the echo instead. The deferred-tool case
+# carries a trailer stating the tool's schema was not sent to the API, and
+# names a parameter the schema does not have -- an INVENTED name. This case
+# carries neither: the named parameter is real and accepted, and only a
+# required sibling is missing.
+#
+# HARD CONSTRAINTS, same as the block above. No `mcp__<family>__<name>`
+# example -- the ancestry-check test that guards role/tool-grant consistency
+# is parametrized over every role and would fail for whichever of the 8
+# roles lacks the grant; `Agent`, `ToolSearch` and `InputValidationError` are
+# all builtins and do not match that test's regex, so naming them is safe,
+# and `Agent` is genuinely reachable by a dispatched role regardless of
+# whether it appears in that role's allowed_tools -- the same fact the
+# comment above already records for `ToolSearch`. No literal `{`/`}` braces
+# -- role prompts reach this only by plain `+` concatenation. No sighting
+# COUNT -- the codebook accrues a new sighting every census cycle, and a
+# number baked into a role prompt goes stale silently.
+MISSING_REQUIRED_PARAMETER_REJECTION = """\
+- A rejection naming a REQUIRED parameter that is MISSING is a third shape,
+  distinct from both above: the call parsed fine, and the parameter it
+  names IS a real, accepted field — the defect is that a required sibling
+  was left out. Re-emit the whole call with every required field supplied;
+  do not edit or drop the field that was already accepted, and do not
+  reach for `ToolSearch` — the schema was already in context, and loading
+  it again neither supplies the missing value nor changes the outcome. The
+  raw error string is IDENTICAL to the deferred-tool shape above, so the
+  string alone does not tell you which you hit — read the echo: the
+  deferred case carries a trailer saying the tool's schema was not sent to
+  the API and names a parameter the schema does not have; this case
+  carries neither. Catalogued sighting: a sub-dispatch via the `Agent` tool
+  that supplied `prompt` and omitted the required `description`, rejected
+  before any sub-agent launched.
+"""
+
+
 # Canonical rc=0/1/128 check for `git merge-base --is-ancestor`, spliced into
 # both STEWARD "Marking tasks done" call sites (kind="merged" and
 # kind="found_on_main"). Being a single shared constant IS the mechanism that
