@@ -7,6 +7,7 @@ const { useState: uS_T, useEffect: uE_T, useRef: uR_T, useLayoutEffect: uLE_T, u
 const { computeTiers, partitionComponents, orderRows, computeNeighborhood, focusSubset } = window.DF_GRAPH_LAYOUT;
 const { prdTitle, aggregatePrdStatus, summarizePrdMembers, groupTasksByPrd, orderPrdGroups } = window.DF_PRD_GROUPING;
 const { projectStatusCounts, activityPips } = window.DF_TASK_STATUS_COUNTS;
+const { strandBadgeState, agentCellState } = window.DF_TASK_ROW_CELLS;
 const { rtCell, rtAge } = window.DF_RUNTIME_FMT;
 const { tasksBannerNotices } = window.DF_TASKS_OFFLINE_BANNER;
 
@@ -185,7 +186,7 @@ function TaskGraph({ tasks, selectedId, onSelect, onEnterFocus, nodeRefs: extern
           <span className="status-pip"></span>
           <span className="id">{window.DF_SHELL.taskId(t.id)}</span>
           {t.train && <span className="train-badge" title={`train ${t.train.id} · order ${t.train.order}`}>🚂 {t.train.id}</span>}
-          {t.stranded && <span className="badge bad" title="stranded: in-progress with no live claimant / stale heartbeat">⚠</span>}
+          {(() => { const sb = strandBadgeState(t, { compact: true }); return sb && <span className={sb.cls} title={sb.title}>{sb.label}</span>; })()}
           <span style={{ marginLeft: 'auto', fontSize: 9, color: 'var(--fg-3)', fontFamily: 'var(--mono)' }}>
             {t.status === 'in-progress' ? rtAge(t.started) : t.status === 'done' ? (t.completed ? window.DF_SHELL.timeago(t.completed) : 'done') : t.status}
           </span>
@@ -534,8 +535,8 @@ function TaskDetail({ task, allTasks }) {
           {/* Strand verdict (task 3543). Computed server-side from the claim
               columns; deliberately INDEPENDENT of `agent` below, which is only
               worktree presence and stays truthy after the agent dies. */}
-          {task.stranded && <span className="badge bad" style={{ marginLeft: 6 }} title="stranded: in-progress with no live claimant / stale heartbeat">stranded</span>}</span>
-        <span className="k">agent</span><span style={{ fontFamily: 'var(--mono)', fontSize: 11 }}>{task.agent || <span style={{ color: 'var(--fg-3)' }}>unassigned</span>}</span>
+          {(() => { const sb = strandBadgeState(task); return sb && <span className={sb.cls} style={{ marginLeft: sb.marginLeft }} title={sb.title}>{sb.label}</span>; })()}</span>
+        <span className="k">agent</span><span style={{ fontFamily: 'var(--mono)', fontSize: 11 }}>{(() => { const ac = agentCellState(task); return ac.muted ? <span style={{ color: 'var(--fg-3)' }}>{ac.text}</span> : ac.text; })()}</span>
         <span className="k">loops</span><span style={{ fontFamily: 'var(--mono)', fontSize: 11 }}>{rtCell(task.loops)}</span>
         <span className="k">attempts</span><span style={{ fontFamily: 'var(--mono)', fontSize: 11 }}>{rtCell(task.attempts)}</span>
         <span className="k">lane</span><span style={{ fontFamily: 'var(--mono)', fontSize: 11 }}>{rtCell(task.lane)}</span>

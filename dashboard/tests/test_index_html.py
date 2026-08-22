@@ -684,6 +684,193 @@ def test_task_status_counts_js_loads_before_tab_tasks(index_html_body: str) -> N
 
 
 # ---------------------------------------------------------------------------
+# Regression guards: the three render-decision helpers extracted by task 4361
+# (task_row_cells.js, burndown_bands.js, pins_recovery.js)
+#
+# task_row_cells.js was first spelled task_strand_badge.js; it was renamed in
+# the amendment pass because it owns BOTH task-row claim cells (the stranded
+# badge and the agent cell beside it), not just the badge. Its browser global
+# moved with it: DF_TASK_STRAND_BADGE -> DF_TASK_ROW_CELLS.
+#
+# These modules hold render DECISIONS lifted out of JSX so they could be
+# covered behaviourally by node --test — the substrate decision taken after
+# commit 039e55c7ef deleted four JSX source-text meta-test blocks that could
+# not discriminate (a whole-file substring grep is satisfied by a MENTION, so
+# the explanatory comment at tab_escalation_analytics.jsx:414-419 alone
+# satisfied `'pins_recovery' in body` with the render arm deleted).
+#
+# The assertions below are NOT that anti-pattern returning under a new name.
+# `_assert_script_loads_before` walks real <script> tags with html.parser and
+# compares their document positions, checking defer/async/type=module along the
+# way; it reads the page's STRUCTURE, not its source text, and there is no
+# other way to state a load-order invariant. The served-200 checks exercise the
+# actual HTTP route.
+# ---------------------------------------------------------------------------
+
+_TASK_ROW_CELLS_PREFIX = '/static/redux/task_row_cells.js'
+_BURNDOWN_BANDS_PREFIX = '/static/redux/burndown_bands.js'
+_PINS_RECOVERY_PREFIX = '/static/redux/pins_recovery.js'
+_TAB_ESCALATIONS_PREFIX = '/static/redux/tab_escalations.jsx'
+_TAB_ESC_ANALYTICS_PREFIX = '/static/redux/tab_escalation_analytics.jsx'
+
+
+def test_task_row_cells_js_is_served(client) -> None:
+    """GET /static/redux/task_row_cells.js returns 200.
+
+    The load-order guards below only inspect the <script> tag's position in
+    index.html, so a file that exists in git but is not actually served (a
+    packaging or StaticFiles-mount regression) would keep CI green while the
+    browser 404s. Both consumers destructure window.DF_TASK_ROW_CELLS at top
+    level with no `|| {}` fallback, so a 404 here throws at load and blanks the
+    Tasks tab and every tab defined in tabs.jsx.
+    """
+    resp = client.get(_TASK_ROW_CELLS_PREFIX)
+    assert resp.status_code == 200, (
+        f'expected 200 for {_TASK_ROW_CELLS_PREFIX}, got {resp.status_code} '
+        '— the module is registered in index.html but not reachable at runtime.'
+    )
+
+
+def test_task_row_cells_js_loads_before_tab_tasks(index_html_body: str) -> None:
+    """task_row_cells.js must load BEFORE tab_tasks.jsx.
+
+    tab_tasks.jsx destructures {strandBadgeState, agentCellState} from
+    window.DF_TASK_ROW_CELLS at top-level execution time with no fallback —
+    a later (or missing) tag makes tab_tasks.jsx throw at load, so the whole
+    Tasks tab never renders. The destructure is deliberate (loud-over-silent
+    degradation); this ordering guard keeps that loudness out of a browser.
+    """
+    _assert_script_loads_before(
+        index_html_body,
+        _TASK_ROW_CELLS_PREFIX,
+        _TAB_TASKS_PREFIX,
+        before_label='task_row_cells.js',
+        after_label='tab_tasks.jsx',
+        consumer_note=(
+            'tab_tasks.jsx (renderNode and TaskDetail) destructures '
+            'window.DF_TASK_ROW_CELLS at top level; task_row_cells.js '
+            'must define it first.'
+        ),
+    )
+
+
+def test_task_row_cells_js_loads_before_tabs(index_html_body: str) -> None:
+    """task_row_cells.js must also load BEFORE tabs.jsx.
+
+    The stranded badge has THREE render sites, not one: tab_tasks.jsx's
+    renderNode and TaskDetail, and tabs.jsx's OrchTab — the last being where
+    the badge sits literally beside the `agent` value it must stay independent
+    of. Both consumers need their own ordering assertion; covering only
+    tab_tasks.jsx would let a tag inserted between the two JSX files pass.
+    """
+    _assert_script_loads_before(
+        index_html_body,
+        _TASK_ROW_CELLS_PREFIX,
+        _TABS_PREFIX,
+        before_label='task_row_cells.js',
+        after_label='tabs.jsx',
+        consumer_note=(
+            'tabs.jsx (OrchTab) destructures window.DF_TASK_ROW_CELLS at '
+            'top level; task_row_cells.js must define it first.'
+        ),
+    )
+
+
+def test_burndown_bands_js_is_served(client) -> None:
+    """GET /static/redux/burndown_bands.js returns 200.
+
+    tabs.jsx destructures window.DF_BURNDOWN_BANDS at top level with no
+    fallback, so a 404 here throws at load and blanks EVERY tab defined in
+    tabs.jsx — not just the Burndown one whose bands this module draws.
+    """
+    resp = client.get(_BURNDOWN_BANDS_PREFIX)
+    assert resp.status_code == 200, (
+        f'expected 200 for {_BURNDOWN_BANDS_PREFIX}, got {resp.status_code} — '
+        'the module is registered in index.html but not reachable at runtime.'
+    )
+
+
+def test_burndown_bands_js_loads_before_tabs(index_html_body: str) -> None:
+    """burndown_bands.js must load BEFORE tabs.jsx.
+
+    tabs.jsx destructures {burndownStacks, burndownLegend, parityBannerState}
+    from window.DF_BURNDOWN_BANDS at top-level execution time with no fallback.
+    A later (or missing) tag therefore does not merely lose the status-mix
+    bands: it throws while tabs.jsx is evaluating, so every tab that file
+    defines goes with it.
+    """
+    _assert_script_loads_before(
+        index_html_body,
+        _BURNDOWN_BANDS_PREFIX,
+        _TABS_PREFIX,
+        before_label='burndown_bands.js',
+        after_label='tabs.jsx',
+        consumer_note=(
+            'tabs.jsx (BurnTab) destructures window.DF_BURNDOWN_BANDS at top '
+            'level; burndown_bands.js must define it first.'
+        ),
+    )
+
+
+def test_pins_recovery_js_is_served(client) -> None:
+    """GET /static/redux/pins_recovery.js returns 200.
+
+    Both escalation tabs destructure window.DF_PINS_RECOVERY at top level with
+    no fallback, so a 404 here throws at load and blanks them.
+    """
+    resp = client.get(_PINS_RECOVERY_PREFIX)
+    assert resp.status_code == 200, (
+        f'expected 200 for {_PINS_RECOVERY_PREFIX}, got {resp.status_code} — '
+        'the module is registered in index.html but not reachable at runtime.'
+    )
+
+
+def test_pins_recovery_js_loads_before_tab_escalations(index_html_body: str) -> None:
+    """pins_recovery.js must load BEFORE tab_escalations.jsx.
+
+    tab_escalations.jsx destructures {pinningSummary} from
+    window.DF_PINS_RECOVERY at top-level execution time with no fallback; it
+    feeds the "pinning" StatTile in the analytics strip.
+    """
+    _assert_script_loads_before(
+        index_html_body,
+        _PINS_RECOVERY_PREFIX,
+        _TAB_ESCALATIONS_PREFIX,
+        before_label='pins_recovery.js',
+        after_label='tab_escalations.jsx',
+        consumer_note=(
+            'tab_escalations.jsx (the analytics strip) destructures '
+            'window.DF_PINS_RECOVERY at top level; pins_recovery.js must '
+            'define it first.'
+        ),
+    )
+
+
+def test_pins_recovery_js_loads_before_tab_escalation_analytics(
+    index_html_body: str,
+) -> None:
+    """pins_recovery.js must also load BEFORE tab_escalation_analytics.jsx.
+
+    The two pins_recovery surfaces live in DIFFERENT files — the per-row
+    PINNING chip beside the 6h+ breach badge is here, in the analytics tab,
+    while tab_escalations.jsx holds the StatTile. Each consumer therefore needs
+    its own ordering assertion.
+    """
+    _assert_script_loads_before(
+        index_html_body,
+        _PINS_RECOVERY_PREFIX,
+        _TAB_ESC_ANALYTICS_PREFIX,
+        before_label='pins_recovery.js',
+        after_label='tab_escalation_analytics.jsx',
+        consumer_note=(
+            'tab_escalation_analytics.jsx (the per-row PINNING chip) '
+            'destructures window.DF_PINS_RECOVERY at top level; '
+            'pins_recovery.js must define it first.'
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Regression guard: all /static/redux/* cache-busters share one bumped version
 # ---------------------------------------------------------------------------
 
