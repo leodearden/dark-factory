@@ -9475,6 +9475,13 @@ class GitOps:
         touched list this iterates already came from a ``-z`` enumeration and
         is authoritative; nothing here re-parses a path out of git's output.
 
+        Lines are classified by HUNK STATE — header until the first ``@@``,
+        content after it — and never by raw ``+++``/``---`` prefix.  Under
+        ``--unified=0`` a content line carries exactly one prefix column, so
+        text of its own beginning with ``++`` or ``--`` is indistinguishable
+        from a file header by prefix alone; see the inline note at the loop
+        for the false-accept that cost.
+
         Lines are returned STRIPPED, and blank ones dropped.  Two reasons,
         both load-bearing.  (1) :func:`_run` applies ``.strip()`` to the whole
         captured stdout, so exact-text matching would silently mangle the
@@ -9488,30 +9495,66 @@ class GitOps:
         RAISE a survival ratio — so every acceptance anchor that passed under
         the recorded measurement still passes.
 
-        Returns None when git itself errored, which callers must treat as
-        fail-safe (never as "nothing was added").
+        Returns None when git itself errored OR when its output was not
+        UTF-8 decodable, which callers must treat as fail-safe (never as
+        "nothing was added").
         """
-        rc, out, _ = await _run(
-            [
-                'git', '-c', 'core.quotePath=false',
-                'diff', '--unified=0', base_sha, anchor_sha, '--', path,
-            ],
-            cwd=self.project_root,
-        )
+        try:
+            rc, out, _ = await _run(
+                [
+                    'git', '-c', 'core.quotePath=false',
+                    'diff', '--unified=0', base_sha, anchor_sha, '--', path,
+                ],
+                cwd=self.project_root,
+            )
+        except UnicodeDecodeError:
+            # A file with no NUL bytes but non-UTF-8 content (a latin-1 text
+            # fixture, say) is TEXT to git, so `git diff` emits its raw bytes
+            # and :func:`_run`'s strict ``.decode()`` raises.  Fail-safe like
+            # every other git failure here — None routes to `diff_failed` and
+            # present=False.  Without this the exception escapes through
+            # commit_effect_present_in_main and validate_landing_evidence
+            # into the dispatch gate.  :meth:`_main_line_set` guards the
+            # identical call for the identical reason.
+            return None
         if rc != 0:
             return None
         added: list[str] = []
         removed: list[str] = []
+        # Classify by HUNK STATE, never by raw prefix.  Under `--unified=0`
+        # every content line carries exactly ONE '+'/'-' column, so a line
+        # whose own text begins with '++' renders as '+++...' and one
+        # beginning with '--' renders as '---...' — indistinguishable from
+        # the '+++ b/<path>' / '--- a/<path>' file headers by prefix alone.
+        # Discarding those as headers silently dropped real content: C/C++
+        # `++i;`, SQL/Lua/Haskell `--` comments, TOML `+++` front matter and
+        # .patch fixtures all hit it.  Worse, the loss was ASYMMETRIC — a
+        # revert of exactly those lines went unseen, so a half-reverted
+        # deliverable measured 1.0 survival and read as a clean landing.
+        # That is a false ACCEPT on the task-1175 revert class this check
+        # exists to catch, the one direction it must never take.
+        #
+        # Everything before the first '@@' is header; after it, a leading
+        # '+'/'-' at column 0 is always content.  A binary path yields
+        # "Binary files ... differ" with no hunk at all and so contributes
+        # NEITHER, routing it to the vacuous arm exactly as before.
+        in_hunk = False
         for line in out.split('\n'):
-            # '+++ b/<path>' and '--- a/<path>' are headers, not content;
-            # everything else beginning with '+'/'-' is content.  A binary
-            # path yields "Binary files ... differ" and so contributes
-            # NEITHER, routing it to the vacuous arm.
-            if line.startswith('+') and not line.startswith('+++'):
+            if line.startswith('diff --git '):
+                # Rename detection can emit a second file block even under a
+                # single pathspec; re-arm so its headers are not read as body.
+                in_hunk = False
+                continue
+            if line.startswith('@@'):
+                in_hunk = True
+                continue
+            if not in_hunk or not line:
+                continue
+            if line.startswith('+'):
                 body = line[1:].strip()
                 if body:
                     added.append(body)
-            elif line.startswith('-') and not line.startswith('---'):
+            elif line.startswith('-'):
                 body = line[1:].strip()
                 if body:
                     removed.append(body)

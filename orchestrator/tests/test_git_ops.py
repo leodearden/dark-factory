@@ -5431,6 +5431,99 @@ class TestCommitEffectSurvivalVacuousCases:
         assert probe.failure == 'vacuous_effect_absent'
         assert 'asset.bin' in probe.vacuous_paths
 
+    async def test_content_lines_that_look_like_diff_headers_still_count(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """A content line whose OWN TEXT starts with ``++`` is content, not a
+        ``+++ b/<path>`` file header.
+
+        ``git diff --unified=0`` prefixes every content line with exactly ONE
+        '+'/'-' column, so a C ``++counter;`` statement renders as
+        ``+++counter;`` and a SQL ``-- note`` comment renders as ``--- note``.
+        Classifying by raw prefix discards both as headers.  Here that emptied
+        the added-line set entirely and mis-routed a perfectly ordinary text
+        deliverable to the VACUOUS arm, so survival was never measured at all.
+
+        Real triggers are common: C/C++/Java/JS ``++i;``, SQL/Lua/Haskell
+        ``--`` comments, TOML ``+++`` front matter, and ``.patch``/``.diff``
+        fixture files.
+        """
+        await _seed_on_main(git_repo, {'mod.c': 'int seed;\n'}, 'seed mod.c')
+        body = ''.join(f'++counter_{i};\n' for i in range(40))
+        merge_sha = await _land_branch(
+            git_repo, '7101', {'mod.c': 'int seed;\n' + body},
+        )
+
+        probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+
+        assert probe.added_lines_total == 40, (
+            'every ++-prefixed content line must be counted as added'
+        )
+        assert 'mod.c' not in probe.vacuous_paths, (
+            'a 40-line text deliverable is not a zero-added-lines shape'
+        )
+        assert probe.aggregate_survival == 1.0
+        assert probe.present is True
+
+    async def test_revert_of_only_the_header_lookalike_lines_is_not_survival(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """THE FALSE ACCEPT.  A branch adds 30 ``++``-prefixed lines and 30
+        ordinary ones; a later commit on main reverts ONLY the ``++`` half.
+
+        Half the deliverable is gone, but if the ``++`` lines were never
+        counted as added, the surviving half measures 1.0 and the gate marks
+        the task done.  That is a false accept on the exact task-1175 revert
+        class this check exists to catch — the one direction the primitive is
+        documented never to take ('never claim an effect is present on
+        doubt').
+        """
+        await _seed_on_main(git_repo, {'mod.c': 'int seed;\n'}, 'seed mod.c')
+        looky = ''.join(f'++counter_{i};\n' for i in range(30))
+        plain = ''.join(f'int plain_{i};\n' for i in range(30))
+        merge_sha = await _land_branch(
+            git_repo, '7102', {'mod.c': 'int seed;\n' + looky + plain},
+        )
+
+        # A later commit reverts ONLY the header-lookalike half.
+        (git_repo / 'mod.c').write_text('int seed;\n' + plain)
+        await _commit_all(git_repo, 'revert half the deliverable')
+
+        probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+
+        assert probe.added_lines_total == 60
+        assert probe.aggregate_survival == pytest.approx(0.5), (
+            'half the added lines are gone from main'
+        )
+        assert probe.present is False, (
+            'a half-reverted deliverable must not read as a clean landing'
+        )
+
+    async def test_non_utf8_text_blob_is_fail_safe_not_a_crash(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """A latin-1 text file has no NUL bytes, so git treats it as TEXT and
+        ``git diff`` emits its raw bytes — which ``_run``'s strict
+        ``.decode()`` cannot decode.
+
+        Distinct from the binary case above, which uses NUL bytes and so only
+        ever exercises git's ASCII "Binary files ... differ" output.  This one
+        reaches the decode.  The contract is fail-safe throughout: any git
+        error yields present=False, never a fabricated True and never an
+        exception escaping into the dispatch gate.
+        """
+        await _seed_on_main(
+            git_repo, {'t.txt': b'seed\n'}, 'seed t.txt',
+        )
+        merge_sha = await _land_branch(
+            git_repo, '7103', {'t.txt': 'caf\xe9 na\xefve\n'.encode('latin-1')},
+        )
+
+        probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+
+        assert probe.present is False
+        assert probe.failure == 'diff_failed'
+
     async def test_vacuous_arm_and_text_arm_cannot_mask_each_other(
         self, git_ops: GitOps, git_repo: Path,
     ) -> None:
