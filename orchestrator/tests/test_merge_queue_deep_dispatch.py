@@ -300,3 +300,158 @@ def _shared_txt_with(line_no: int, text: str) -> str:
     lines = [f'line{i}\n' for i in range(1, 21)]
     lines[line_no - 1] = f'{text}\n'
     return ''.join(lines)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# step-01: RED — pure dispatch policy (select_chain_depth / next_halving_state)
+#
+# Sync class, deliberately UNMARKED (see the module docstring's harness note):
+# both functions are pure, so they must be callable with no running event loop.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestSelectChainDepth:
+    """``select_chain_depth(chain_cap, queue_len, halving_state) -> int | None``.
+
+    The PRD's dispatch invariant ``target_depth = min(len(queue), cap,
+    halving_state)`` plus its two gates (``cap > 0``, ``queue >= 2``) and its
+    ``< 2 → None`` floor.  Units are 1-INDEXED item counts: item #1 is the
+    dispatching slot-2 item itself.
+    """
+
+    def test_cap_zero_is_the_kill_switch_for_every_input(self) -> None:
+        """cap=0 (α's shipped default) → None for EVERY queue_len/halving_state."""
+        from orchestrator.merge_queue import select_chain_depth
+
+        for queue_len in (0, 1, 2, 5, 50, 1000):
+            for halving_state in (None, 1, 2, 3, 6, 999):
+                assert select_chain_depth(0, queue_len, halving_state) is None, (
+                    f'cap=0 must gate off at queue_len={queue_len}, '
+                    f'halving_state={halving_state}'
+                )
+
+    def test_queue_shorter_than_two_never_chains(self) -> None:
+        """The PRD's ``queue >= 2`` gate: a lone item is not a chain."""
+        from orchestrator.merge_queue import select_chain_depth
+
+        for cap in (1, 2, 6, 100):
+            for halving_state in (None, 1, 6):
+                assert select_chain_depth(cap, 0, halving_state) is None
+                assert select_chain_depth(cap, 1, halving_state) is None
+
+    def test_reset_state_evaluates_min_queue_cap(self) -> None:
+        """``halving_state=None`` is the reset sentinel → ``min(queue_len, cap)``.
+
+        Evaluated at DISPATCH time, not frozen at pass time, so a queue that
+        grew since the last pass is honoured (plan design decision 4).
+        """
+        from orchestrator.merge_queue import select_chain_depth
+
+        assert select_chain_depth(6, 4, None) == 4     # queue binds
+        assert select_chain_depth(6, 10, None) == 6    # cap binds
+        assert select_chain_depth(6, 6, None) == 6     # tie
+
+    def test_halving_state_binds_when_smallest(self) -> None:
+        from orchestrator.merge_queue import select_chain_depth
+
+        assert select_chain_depth(6, 10, 3) == 3       # halving binds
+        assert select_chain_depth(6, 10, 6) == 6       # equal to cap
+        assert select_chain_depth(6, 2, 3) == 2        # queue still binds
+        assert select_chain_depth(3, 10, 6) == 3       # cap still binds
+
+    def test_target_below_two_is_the_d1_floor(self) -> None:
+        """Any combination whose min is < 2 → None: no chain code runs at all.
+
+        This is what makes "the floor is byte-identical to today's adjacent
+        verify" true BY CONSTRUCTION rather than by careful mimicry.
+        """
+        from orchestrator.merge_queue import select_chain_depth
+
+        assert select_chain_depth(1, 10, None) is None   # cap=1
+        assert select_chain_depth(6, 10, 1) is None      # halving_state=1
+        assert select_chain_depth(6, 2, 1) is None       # both floor-ish
+        assert select_chain_depth(1, 2, 1) is None
+
+    def test_is_pure_with_no_running_event_loop(self) -> None:
+        """No I/O, no worker, no clock — callable outside an event loop."""
+        from orchestrator.merge_queue import select_chain_depth
+
+        with pytest.raises(RuntimeError):
+            asyncio.get_running_loop()  # proves there is none
+        assert select_chain_depth(6, 10, None) == 6
+
+
+class TestNextHalvingState:
+    """``next_halving_state(passed, dispatched_depth) -> int | None`` (PRD dec. 5).
+
+    Fail at d halves to ``max(1, d // 2)``; a pass resets to the ``None``
+    sentinel (re-evaluated as ``min(queue, cap)`` at the next dispatch).
+    """
+
+    def test_fail_halves_with_a_floor_of_one(self) -> None:
+        from orchestrator.merge_queue import next_halving_state
+
+        assert next_halving_state(False, 6) == 3
+        assert next_halving_state(False, 3) == 1
+        assert next_halving_state(False, 2) == 1
+        # The max(1, ...) floor never yields 0 or a negative state.
+        assert next_halving_state(False, 1) == 1
+
+    def test_pass_resets_to_the_none_sentinel(self) -> None:
+        from orchestrator.merge_queue import next_halving_state
+
+        for depth in (1, 2, 3, 6, 50):
+            assert next_halving_state(True, depth) is None
+
+    def test_is_pure_with_no_running_event_loop(self) -> None:
+        from orchestrator.merge_queue import next_halving_state
+
+        with pytest.raises(RuntimeError):
+            asyncio.get_running_loop()
+        assert next_halving_state(False, 6) == 3
+
+
+class TestHalvingWalkComposition:
+    """The composed walk — the PRD's "Halving walk isolates bad item" row.
+
+    Starting from the reset sentinel at cap=6 / queue_len=10, successive FAILs
+    step 6 → 3 → floor(None, no chain), and a PASS anywhere returns the next
+    target to ``min(queue_len, cap)``.
+    """
+
+    def test_successive_fails_walk_six_three_then_floor(self) -> None:
+        from orchestrator.merge_queue import next_halving_state, select_chain_depth
+
+        cap, queue_len = 6, 10
+        state: int | None = None
+        walk: list[int | None] = []
+
+        for _ in range(3):
+            target = select_chain_depth(cap, queue_len, state)
+            walk.append(target)
+            if target is None:
+                break  # floor reached: no chain dispatched, so nothing to halve
+            state = next_halving_state(False, target)
+
+        assert walk == [6, 3, None]
+        assert state == 1, 'the halving state rests at the floor, never 0'
+
+    def test_a_pass_resets_the_walk_to_min_queue_cap(self) -> None:
+        from orchestrator.merge_queue import next_halving_state, select_chain_depth
+
+        cap, queue_len = 6, 10
+        state = next_halving_state(False, 6)       # one fail: 6 → 3
+        assert select_chain_depth(cap, queue_len, state) == 3
+
+        state = next_halving_state(True, 3)        # a pass at 3 resets
+        assert state is None
+        assert select_chain_depth(cap, queue_len, state) == 6
+
+    def test_reset_re_evaluates_a_grown_queue(self) -> None:
+        """A pass stores None, so a queue that grew is seen on the next round."""
+        from orchestrator.merge_queue import next_halving_state, select_chain_depth
+
+        cap = 6
+        state = next_halving_state(True, 2)
+        assert select_chain_depth(cap, 3, state) == 3   # short queue binds
+        assert select_chain_depth(cap, 9, state) == 6   # grown queue: cap binds
