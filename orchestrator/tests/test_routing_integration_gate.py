@@ -786,3 +786,174 @@ class TestTierStableWithinOneDispatch:
             f'a routing mirror write raised routing_tier above 1 mid-dispatch: '
             f'{routing_writes!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Boundary scenario 5 -- retry-tier bump on dispatch #2 after a BLOCKED
+# dispatch #1 (plan step-4). Also proves the other half of scenario 6's
+# guarantee at the harness boundary: a DONE outcome persists no bump.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRetryTierBumpAcrossDispatches:
+    """PRD boundary scenario 5: a terminal-failed (BLOCKED) dispatch #1 bumps
+    ``metadata.routing.routing_tier`` at the harness boundary
+    (``Harness._maybe_bump_routing_tier``, task mu's WRITE side), and
+    dispatch #2 -- seeded from that ACTUAL persisted metadata dict, never a
+    hand-written ``{'routing_tier': 1}`` literal -- routes one ladder rung
+    stronger via the shipped ``retry-tier-up`` rule (task mu's READ side,
+    defaults.yaml:320). A hand-written literal in half 2 would re-mock
+    exactly the write/read joint this scenario proves is real (plan.json's
+    design_decisions).
+
+    Half 1 drives the WRITE side against a real ``Harness``
+    (``_workflow_helpers._build_harness``) whose scheduler is wired to a
+    ``FakeMetadataBackend`` via ``wire_metadata_backend`` -- so the bump
+    exercises genuine ``metadata_mode='merge'`` semantics (harness.py:9044-9048),
+    not merely a recorded call, and ``latest``/``history``/``simple_saturated``
+    -- seeded as genuinely non-default values -- are proven to ride through
+    the merge untouched (harness.py:216 ``model_copy``), alongside a sibling
+    ``files`` key proving the merge never clobbers unrelated metadata. Half 2
+    drives the READ side through the full rig, using ``code_default_config``
+    so the shipped ``retry-tier-up`` rule is guaranteed live regardless of
+    whether the ambient operational yaml overrides ``routing`` (mirrors
+    ``TestTierStableWithinOneDispatch``'s isolation rationale).
+
+    ``test_done_outcome_persists_no_bump`` covers the other half of PRD
+    boundary scenario 6 at the harness (WRITE) boundary --
+    ``TestTierStableWithinOneDispatch`` already covers scenario 6's resolver
+    (READ) half, that routing_tier is stable within one dispatch.
+    """
+
+    @pytest.fixture
+    def stock_config(self, git_repo: Path, code_default_config) -> OrchestratorConfig:
+        return OrchestratorConfig(
+            project_root=git_repo,
+            max_concurrent_tasks=1,
+            max_execute_iterations=5,
+            max_verify_attempts=3,
+            max_review_cycles=2,
+            git=GitConfig(
+                main_branch='main',
+                branch_prefix='task/',
+                remote='origin',
+                worktree_dir='.worktrees',
+            ),
+            sandbox=SandboxConfig(enabled=False),
+        )
+
+    @staticmethod
+    def _seed_metadata() -> dict:
+        """The dispatch-#1-time metadata: ``routing_tier=0`` plus a
+        genuinely non-default ``latest``/``history``/``simple_saturated`` (a
+        real prior decision, not ``None``/``[]``/``False``) so their survival
+        through the bump is a real assertion, not vacuously true over
+        already-empty/default state -- mirrors test_harness_retry_tier.
+        TestBumpedRoutingDump.test_preserves_latest_history_and_saturated.
+        Also carries a sibling ``files`` key, untouched by the bump's
+        ``{'routing': ...}`` payload, to prove the merge write never
+        clobbers sibling metadata (harness.py:9044-9046).
+        """
+        prior_decision = {
+            'role': 'implementer', 'model': 'sonnet', 'effort': 'high',
+            'budget_usd': 10.0, 'max_turns': 80, 'source_layer': 'config',
+            'rule_id': None, 'rejected': [], 'routing_tier': 0, 'decided_at': None,
+        }
+        return {
+            'files': ['lib'],
+            'routing': {
+                'routing_tier': 0,
+                'simple_saturated': True,
+                'latest': prior_decision,
+                'history': [prior_decision],
+            },
+        }
+
+    async def test_blocked_dispatch_bumps_tier_and_next_dispatch_routes_one_rung_up(
+        self, stock_config, git_ops, task_assignment, monkeypatch,
+    ):
+        # -- Half 1 (WRITE side): a real Harness whose scheduler is wired to
+        # a FakeMetadataBackend, so the bump below exercises genuine
+        # metadata_mode='merge' semantics rather than a recorded call.
+        harness = _build_harness(stock_config)
+        backend = FakeMetadataBackend()
+        seed_metadata = self._seed_metadata()
+        wire_metadata_backend(harness.scheduler, backend, seed=seed_metadata, grants=True)
+
+        task_assignment.task['metadata'] = self._seed_metadata()
+        blocked_report = TaskReport(
+            task_id=task_assignment.task_id, title='Routing boundary task',
+            outcome=WorkflowOutcome.BLOCKED,
+        )
+
+        await harness._maybe_bump_routing_tier(task_assignment, blocked_report)
+
+        assert backend.blob['routing']['routing_tier'] == 1
+        # latest/history/simple_saturated ride through the bump's model_copy
+        # untouched (harness.py:216) -- only the counter moved.
+        assert backend.blob['routing']['simple_saturated'] is True
+        assert backend.blob['routing']['latest'] == seed_metadata['routing']['latest']
+        assert backend.blob['routing']['history'] == seed_metadata['routing']['history']
+        # The merge write never clobbered the sibling `files` key.
+        assert backend.blob['files'] == ['lib']
+
+        # -- Half 2 (READ side): dispatch #2 is seeded from the ACTUAL
+        # persisted metadata dict backend.blob just produced -- never a
+        # hand-written {'routing_tier': 1} literal.
+        persisted_metadata = dict(backend.blob)
+        fresh_assignment = TaskAssignment(
+            task_id='42',
+            task={
+                'id': '42',
+                'title': 'Routing boundary task',
+                'description': 'Exercise the real _invoke routing-resolution path',
+                'status': 'pending',
+                'metadata': persisted_metadata,
+                'dependencies': [],
+            },
+            modules=['lib'],
+        )
+        assert stock_config.models.implementer == 'sonnet'  # so opus below is a genuine +1 rung
+
+        stub = _RoutingRecorderStub()
+        workflow, _scheduler = _build_workflow(stock_config, git_ops, fresh_assignment, stub)
+        rec = _RecordingEventStore()
+        workflow.event_store = rec
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification', _mock_verify_passes(),
+        )
+
+        outcome = (await workflow.run()).outcome
+        assert outcome == WorkflowOutcome.DONE
+
+        assert stub.route_by_role['implementer']['model'] == 'opus'
+
+        impl_events = [e for e in _routing_events(rec) if e['data']['role'] == 'implementer']
+        assert impl_events, f'expected an implementer routing_decision event: {rec.events!r}'
+        data = impl_events[-1]['data']
+        assert data['source_layer'] == 'policy_rule'
+        assert data['rule_id'] == 'retry-tier-up'
+        assert data['routing_tier'] == 1
+
+    async def test_done_outcome_persists_no_bump(self, stock_config, task_assignment):
+        """The other half of scenario 6's guarantee, at the harness
+        (WRITE) boundary: a DONE (success) dispatch never bumps the tier in
+        the first place -- ``_maybe_bump_routing_tier`` returns before ever
+        calling ``scheduler.update_task`` (harness.py:9050)."""
+        harness = _build_harness(stock_config)
+        backend = FakeMetadataBackend()
+        seed_metadata = self._seed_metadata()
+        wire_metadata_backend(harness.scheduler, backend, seed=seed_metadata, grants=True)
+
+        task_assignment.task['metadata'] = self._seed_metadata()
+        done_report = TaskReport(
+            task_id=task_assignment.task_id, title='Routing boundary task',
+            outcome=WorkflowOutcome.DONE,
+        )
+
+        await harness._maybe_bump_routing_tier(task_assignment, done_report)
+
+        assert backend.update_task_calls == []
+        assert backend.blob['routing']['routing_tier'] == 0
