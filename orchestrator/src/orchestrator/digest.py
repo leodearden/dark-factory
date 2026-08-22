@@ -10,7 +10,17 @@ correctness gate.
 
 Design decisions (see plan.json):
 - Pure, Harness-free helpers here; harness.py owns the trigger and state.
-- EWA state is process-local (reset on restart — consistent with park-stop counters).
+- Task 4559: the digest GATE counts escalation-lifecycle events (submits AND
+  resolves), but the EWA NUMERATOR counts SUBMISSIONS only — a resolve is work
+  being cleared, not a new fault.  A pure-drain window therefore has numerator
+  0 and the EWA decays, so draining a backlog heals the breaker instead of
+  re-tripping it.  The gate is deliberately left on all lifecycle events: a
+  submissions-only gate would fire no digest at all during a drain, freezing a
+  tripped EWA forever.
+- EWA state is process-local EXCEPT across an ewa_trip_ pause (task 4559): the
+  tripping value is persisted on the scheduler_state row and restored on
+  startup, where the trip predicate is RE-TESTED before the halt is
+  re-asserted.  Every other pause reason is restored blind (task 3328).
 - write_digest_entry never raises; digest_dir is auto-created if missing.
 """
 
