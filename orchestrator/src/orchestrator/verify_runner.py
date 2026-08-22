@@ -1915,6 +1915,7 @@ class VerifyRunnerPool:
         attempt: int = 0,
         depth: int | None = None,
         speculative: bool | None = None,
+        chain_items: int = 1,
     ) -> VerifyResult:
         """Run the verify bundle and emit a merge_verify event.
 
@@ -1929,6 +1930,27 @@ class VerifyRunnerPool:
         per-event schema branching.  Bare/legacy callers that omit both
         kwargs get ``None`` for each, which is byte-identical to pre-2340
         behaviour aside from the two extra always-present keys.
+
+        ``chain_items`` (task 3185, PRD γ decision 8) is the **1-indexed count
+        of queued items contained in the tree this verify actually
+        exercised**.  It defaults to ``1``, deliberately NOT to ``None`` the
+        way ``depth``/``speculative`` do, for two reasons.  (1) Semantics: a
+        count of items in a verified tree has a smallest TRUTHFUL value of
+        1 — every merge verify exercises at least the one item it was created
+        for — so there is no "absent" state to represent, and ``None`` would
+        be a lie rather than a missing signal.  (2) Contract: the PRD requires
+        the field on EVERY merge verify, and several callers thread no
+        telemetry kwargs at all (``merge_shadow.py:1254``/``:1368``); a
+        ``None`` default would emit ``chain_items: null`` for exactly those
+        and break both the contract and η1's reader
+        (``scripts/merge-deep-canary-predicate.sh``).
+
+        ``chain_items`` SUPERSEDES ``depth`` as the honest depth signal: a
+        firing speculation probe (task 2359) relabels ``depth`` into an
+        attribution fact about a stack that was never verified, whereas
+        ``chain_items`` is derived from the tree that actually ran.  See the
+        ``merge_verify`` doc-comment in ``event_store.py`` for the full field
+        note.
 
         Fail-safe (PRD §A Invariant 2 / D5): if the selected runner raises
         RunnerUnavailable, dispatch falls back to the local runner (if
@@ -2036,6 +2058,10 @@ class VerifyRunnerPool:
                     'attempt': attempt,
                     'depth': depth,
                     'speculative': speculative,
+                    # task 3185 (PRD γ): 1-indexed count of items in the tree
+                    # actually verified -- always >= 1, never None. See
+                    # dispatch()'s docstring for why the default is 1.
+                    'chain_items': chain_items,
                     # task 2837 (PRD verify-retry-failed-only D5): retry_scope +
                     # retry_subset_sizes — always-present (None for a full/legacy
                     # verify), derived from the D2 failed-only contract carried in

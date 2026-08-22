@@ -97,6 +97,25 @@ class EventType(StrEnum):
     # Both keys are ALWAYS present (None when not narrowed) so the survey's
     # runtime mining (milestone 5254) reads a uniform data.get('retry_scope')
     # and can NEVER miscount a narrowed retry as a full green gate.
+    # PLUS one always-present deep merge-ahead key (task 3185, PRD γ):
+    #   chain_items  int, ALWAYS >= 1, NEVER None.  The 1-indexed count of
+    #                queued items contained in the tree this verify actually
+    #                exercised.  1 = an ordinary single-item verify (head or
+    #                adjacent speculative); >= 2 = a deep merge-ahead tip
+    #                verify covering that many stacked items.  The floor is 1
+    #                rather than 0/None because every merge verify exercises
+    #                at least the item it was created for, so there is no
+    #                "absent" state to represent -- which is what lets a
+    #                reader treat data['chain_items'] as unconditionally
+    #                present and lets the deep-canary predicate count deep
+    #                verifies as `chain_items >= 2`.
+    #                SUPERSEDES reliance on `depth` as a depth signal: a
+    #                firing speculation probe (task 2359) relabels `depth`
+    #                into an attribution fact about a stack that was never
+    #                verified (see ProbePlacement's known-limitation note), so
+    #                probe-era `depth` values are excluded from calibration.
+    #                `chain_items` is derived from the tree that actually ran
+    #                and carries no such caveat.
     merge_verify = 'merge_verify'
     # A merge-role scoped-verify red that the isolated-rerun-confirm gate
     # (verify.apply_merge_flake_suppression, PRD task α) demonstrated was a
