@@ -174,6 +174,17 @@ def emit_markup_storm_escalation(
     task 4458 retired, and restating it now tells the triager to discount a
     number that is exactly reproducible from their own journal.
 
+    OUTCOME FIDELITY, for the same reason. That same keying means this filer
+    serves ALL THREE of the middleware's outcomes — ``repaired``, ``rejected``,
+    ``unrepairable`` — so it must never hardcode one. It did hardcode
+    ``rejected`` until task 4505, which meant a burst of REPAIRS (calls that all
+    SUCCEEDED) was filed as N rejections that never happened. A record naming an
+    outcome the burst did not have states a number the triager cannot reproduce
+    from their own journal, which is the same defect as stating a count the
+    burst did not have. A storm carrying no readable outcome gets a NEUTRAL word
+    — never ``rejected``, never the literal ``'None'``: absent is not zero, and
+    it is not a rejection either.
+
     NEVER raises. This is called from an MCP write path whose rejection has
     already been decided, so escalation is purely additive: every failure mode
     degrades to ``None`` plus a log line rather than changing the write's
@@ -246,6 +257,12 @@ def emit_markup_storm_escalation(
 
     count = storm.get('count')
     window_seconds = storm.get('window_seconds')
+    # isinstance-guarded rather than truthy-cast, for the reason the middleware
+    # guards its own identity fields: a caller that sent a non-string has not
+    # named an outcome, and str(None) would put the literal 'None' into an
+    # operator-facing sentence as though it had been measured.
+    outcome = storm.get('outcome')
+    outcome = outcome if isinstance(outcome, str) and outcome else None
     detail = '\n'.join([
         f'project_root={project_root!r}',
         # The producer keys one StormCounter per (project, outcome) pair
@@ -258,15 +275,21 @@ def emit_markup_storm_escalation(
         # project_root", both left over from the per-SERVER MarkupStormCounter
         # task 4458 retired. That pooling is what filed esc-markup-tripwire-6
         # into reify's queue stating 3, for a window reify contributed 1 to.
-        f'outcome={storm.get("outcome")!r}',
-        f'rejected_writes_in_window={count!r}',
+        f'outcome={outcome!r}',
+        # The key is outcome-NEUTRAL and STATIC. Neutral because this filer
+        # serves all three of the middleware's outcomes and a key naming one of
+        # them contradicts its own content on the other two; static — never
+        # interpolated into `repaired_writes_in_window=` — because grepping one
+        # field across every record is the property an operator relies on.
+        f'writes_in_window={count!r}',
         f'threshold={storm.get("threshold")!r}',
         f'window_seconds={window_seconds!r}',
         '',
-        'The fused-memory MCP write tripwire (task 3141) rejected multiple '
-        'writes carrying raw MCP envelope markup within one rolling window. A '
+        'The fused-memory MCP write guard (tasks 3141, 4458) flagged multiple '
+        'writes carrying raw MCP envelope markup within one rolling window; '
+        'the outcome above states what it did with them. A '
         'burst means the upstream harness serialization leak is ACTIVE right '
-        'now, not that the tripwire is misfiring — do NOT disable it, or '
+        'now, not that the guard is misfiring — do NOT disable it, or '
         'further specimens will land permanently in the corpus.',
         '',
         'DF task 3083 delivered the root cause and the Qdrant payload '
@@ -289,9 +312,13 @@ def emit_markup_storm_escalation(
             agent_role=_AGENT_ROLE,
             severity='blocking',
             category=_CATEGORY,
+            # The summary is the ONLY field a compact consumer is projected —
+            # escalation/server.py:409-420 drops `detail` by name — so it has
+            # to answer how many, of what, and for whom on its own.
             summary=(
-                f'{count} MCP write(s) rejected for leaked envelope markup in '
-                f'{window_seconds}s — serialization leak active '
+                f'{count} MCP write(s) {outcome or "flagged"} for leaked '
+                f'envelope markup in this project in {window_seconds}s — '
+                'serialization leak active '
                 '(see plans/toolcall-markup-containment-prd.md)'
             ),
             detail=detail,
