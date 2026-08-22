@@ -38,13 +38,24 @@ rule had to be lifted into ``MERGE_HALT_SAFETY_RULE`` / ``MERGE_HALT_
 ESCALATION_CATEGORIES`` to give this file something named to assert against.
 
 Every assertion below is accordingly a containment / identity check against a
-named constant.  The two token tuples defined below are the deliberate,
-narrow exception and are NOT prose pins: they hold executable git vocabulary
-(the literal commands the rule forbids) and an API call shape
-(``escalate_blocker`` / ``level=1``), which are the same class of machine
-vocabulary as the category names themselves — reword the rule's sentences
-however you like and they keep holding; delete the forbidden commands or the
-mandated call and they fail, which is the point.
+named constant, with NO exception.  Two literal token pins were tried here and
+removed in the task 4130 review — a destructive-git-command tuple and a
+``level=1`` re-escalate tuple, each a hand-written string literal asserted
+against ``MERGE_HALT_SAFETY_RULE``'s prose.  Do not reintroduce them, and do
+not "strengthen" one into a regex.  What is worth recording is the concrete
+evidence, because they were demonstrably non-detecting in BOTH directions:
+``'git stash'`` is a substring of the adjacent ``git stash pop`` / ``git stash
+drop/clear`` entries, so deleting the standalone ``git stash`` prohibition —
+the one that pin's own failure message called "non-negotiable" — left it
+PASSING; and ``'level=1'`` carries no polarity, so rewording the rule to say
+level=1 is PROHIBITED left the other pin PASSING too.  Symmetrically ``'git
+checkout -- .'`` would have FAILED on a reflow that tightens nothing.
+
+The co-travel property those pins were meant to guard needs no assertion of
+its own: the prohibition, the category list and the ``level=1`` recourse are
+ONE string constant, and ``test_safety_rule_is_spliced_into_steward_prompt``
+asserts that whole constant reaches the steward.  Splitting them apart is not
+expressible without deleting the constant, which that test already fails on.
 
 Sites are cited BY NAME, never by line number.  Every line number in this
 task's own brief had already gone stale before the work started, which is the
@@ -65,29 +76,6 @@ from orchestrator.agents.roles import (
 )
 from orchestrator.harness import Harness
 
-# The destructive git commands Rule 6 must keep forbidding against the main
-# project root.  ``git stash`` leads the list because the ``stash_failed``
-# category IS a stash-shaped temptation: the queue failed to park WIP, and the
-# obvious-looking manual fix is the one CLAUDE.md forbids outright (shared
-# ``refs/stash``, incident 13674d3c68).
-_DESTRUCTIVE_GIT_TOKENS = (
-    'git stash',
-    'git reset',
-    'git checkout -- .',
-    'git restore',
-    'git clean',
-)
-
-# The hands-off recourse the rule mandates INSTEAD of any of the above.  The
-# steward is the one role whose own prompt mandates level=1 (see
-# test_roles_escalation_ladder.py); a rule that named the categories but
-# dropped the recourse would leave the handler with a prohibition and no exit.
-_RE_ESCALATE_MANDATE_TOKENS = (
-    'escalate_blocker',
-    'level=1',
-    'manual_intervention',
-)
-
 # The authoritative gate.  ``Harness._rehydrate_merge_halt`` is cited by name;
 # the set literal is read out of its source rather than restated here, because
 # a hand-written expected set in this file would drift exactly the way the
@@ -102,8 +90,8 @@ def test_merge_halt_constants_are_nonempty() -> None:
     NOT redundant with the containment tests below, though it reads that way:
     the empty string is a substring of every string, so
     ``test_safety_rule_is_spliced_into_steward_prompt`` holds VACUOUSLY if the
-    rule is ever emptied, and every per-category and per-token containment
-    check degenerates the same way against an empty tuple or an empty rule.
+    rule is ever emptied, and every per-category containment check degenerates
+    the same way against an empty tuple or an empty rule.
 
     Emptying either constant would therefore pass every other test in this
     file — which is precisely the silent-removal-during-a-prompt-refactor
@@ -159,56 +147,6 @@ def test_every_halt_category_is_named_in_the_safety_rule() -> None:
         'is the third recurrence of exactly that gap (task 3870 fixed the '
         'prose twice); name the category in the rule rather than narrowing '
         'MERGE_HALT_ESCALATION_CATEGORIES to match the prose.'
-    )
-
-
-def test_destructive_git_prohibition_travels_with_the_categories() -> None:
-    """CO-TRAVEL: the prohibition lives in the SAME constant as the categories.
-
-    Pinned STRUCTURALLY rather than editorially, mirroring
-    ``test_roles_wait_pattern.py``'s "the two rules are mandated to travel
-    TOGETHER".  The category list is only load-bearing because of the
-    prohibition attached to it: a future prompt refactor that split the two
-    into separate splice units could drop the prohibition while every
-    category-naming test above still passed.  Asserting both against the one
-    constant makes that split impossible.
-    """
-    missing = [
-        token for token in _DESTRUCTIVE_GIT_TOKENS
-        if token not in MERGE_HALT_SAFETY_RULE
-    ]
-    assert missing == [], (
-        f'Forbidden git commands missing from MERGE_HALT_SAFETY_RULE: {missing}. '
-        'These are the destructive recoveries a steward must never run against '
-        'the shared main checkout.  `git stash` in particular is non-negotiable: '
-        '`refs/stash` is a single ref shared by every worktree in the checkout, '
-        'so a pop can apply an unrelated task\'s WIP into the tree '
-        '(incident 13674d3c68), and it is the recovery a `stash_failed` halt '
-        'most invites.'
-    )
-
-
-def test_re_escalate_mandate_travels_with_the_categories() -> None:
-    """CO-TRAVEL: the hands-off recourse lives in the same constant too.
-
-    A prohibition with no stated alternative is an invitation to improvise.
-    The steward is the one role whose own body mandates
-    ``escalate_blocker(..., level=1)`` (see ``test_roles_escalation_ladder.py``,
-    which splits the ladder so the steward stops reading the non-steward "level=1
-    is not yours" gate); this pins that Rule 6 keeps carrying that recourse
-    alongside the categories it applies to.
-    """
-    missing = [
-        token for token in _RE_ESCALATE_MANDATE_TOKENS
-        if token not in MERGE_HALT_SAFETY_RULE
-    ]
-    assert missing == [], (
-        f'Re-escalate mandate tokens missing from MERGE_HALT_SAFETY_RULE: '
-        f'{missing}.  The rule forbids auto-resolution, so it must state the '
-        'sanctioned recourse — an `escalate_blocker(..., level=1)` re-escalation '
-        "preserving the original category with suggested_action="
-        "'manual_intervention'.  Forbidding every action without naming one is "
-        'how a steward ends up improvising a destructive fix.'
     )
 
 
