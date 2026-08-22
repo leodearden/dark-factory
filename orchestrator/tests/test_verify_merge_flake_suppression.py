@@ -304,14 +304,24 @@ _B3_TEST_OUTPUT = 'ERROR orchestrator/tests/test_x.py\n'
 
 class TestConfirmMergeVerifyFlakeSuppressible:
     """confirm_merge_verify_flake_suppressible(config, failing_result, *,
-    worktree, module_configs) -> list[str] | None — the PURE gate (PRD task α).
+    worktree, module_configs) -> FlakeSuppression — the PURE gate (PRD task α,
+    widened by task ε).
 
     SAME-TREE (re-runs in the given merge worktree, no fresh probe worktree),
-    single-shot per node-id group, returns the suppressed node-ids on a
-    confirmed flake or None (fail-closed to red) otherwise. NEVER raises.
+    single-shot per node-id group. NEVER raises.
+
+    It now returns the discriminator's OBSERVATION unchanged instead of
+    collapsing it to `list[str] | None`. Every scenario below is the same one
+    it always was; what changes is that a non-suppressing outcome must now name
+    WHICH non-suppressing outcome it was — `fails_in_isolation` (a real red) vs
+    `unconfirmable` plus its reason (we could not tell). β deliberately
+    collapsed that distinction; ε is the first caller that needs it, because
+    the ledger row and θ's class-1 unconfirmable RATE are computed from it.
     """
 
     def _run(self, config, failing_result, worktree, module_configs):
+        """Returns a FlakeSuppression — ALWAYS, never None (the discriminator
+        is TOTAL, INV-2)."""
         from orchestrator.verify import confirm_merge_verify_flake_suppressible
 
         return asyncio.run(
@@ -320,13 +330,26 @@ class TestConfirmMergeVerifyFlakeSuppressible:
             )
         )
 
+    @staticmethod
+    def _assert_not_suppressing(s, verdict, *, reason=None):
+        """Shared shape for the fail-closed cases: not a suppression, and the
+        SPECIFIC verdict that says why."""
+        from orchestrator.flake_ledger import FlakeVerdict
+
+        assert s.verdict is not FlakeVerdict.passes_in_isolation, s
+        assert s.verdict is verdict, s
+        if reason is not None:
+            assert s.unconfirmable_reason == reason, s
+
     # -- B1: suppress a confirmed flake -----------------------------------
 
     def test_b1_suppresses_when_isolated_rerun_passes(self, tmp_path: Path) -> None:
-        """FAILED + node-down node-ids both pass on isolated re-run -> returns
-        the extracted node-id list, and the isolated ModuleConfig carries the
-        serial + generous-timeout recovery command with null lint/type."""
+        """FAILED + node-down node-ids both pass on isolated re-run -> a
+        `passes_in_isolation` observation naming the extracted node-ids, and the
+        isolated ModuleConfig carries the serial + generous-timeout recovery
+        command with null lint/type."""
         from orchestrator import verify as verify_module
+        from orchestrator.flake_ledger import FlakeVerdict
 
         _materialize(tmp_path, 'orchestrator/tests/test_x.py')
         config = _make_config(tmp_path)
@@ -339,7 +362,9 @@ class TestConfirmMergeVerifyFlakeSuppressible:
         with patch.object(verify_module, 'run_verification', rv):
             result = self._run(config, failing, tmp_path, [_orch_module_config()])
 
-        assert result == [_B1_FAILED_ID, _B1_CRASH_ID], result
+        assert result.verdict is FlakeVerdict.passes_in_isolation, result
+        assert list(result.test_ids) == [_B1_FAILED_ID, _B1_CRASH_ID], result
+        assert result.unconfirmable_reason is None, result
 
         rv.assert_awaited()
         # The isolated re-run's ModuleConfig: serial + generous timeout, null gates.
@@ -357,8 +382,11 @@ class TestConfirmMergeVerifyFlakeSuppressible:
     # -- B2: never mask a still-real red ----------------------------------
 
     def test_b2_no_suppress_when_isolated_rerun_still_fails(self, tmp_path: Path) -> None:
-        """The isolated re-run still FAILS -> None (merge stays red)."""
+        """The isolated re-run still FAILS -> `fails_in_isolation` (merge stays
+        red). A REAL red, not "we could not tell" — the distinction θ's class-1
+        rate divides by."""
         from orchestrator import verify as verify_module
+        from orchestrator.flake_ledger import FlakeVerdict
 
         _materialize(tmp_path, 'orchestrator/tests/test_x.py')
         config = _make_config(tmp_path)
@@ -371,15 +399,16 @@ class TestConfirmMergeVerifyFlakeSuppressible:
         with patch.object(verify_module, 'run_verification', rv):
             result = self._run(config, failing, tmp_path, [_orch_module_config()])
 
-        assert result is None
+        self._assert_not_suppressing(result, FlakeVerdict.fails_in_isolation)
         rv.assert_awaited()
 
     # -- B3: whole-file collection error re-errors -> not suppressed ------
 
     def test_b3_collection_error_not_suppressed(self, tmp_path: Path) -> None:
         """A bare `ERROR file.py` collection error yields a whole-file target;
-        the isolated re-run re-errors (not passed) -> None."""
+        the isolated re-run re-errors (not passed) -> `fails_in_isolation`."""
         from orchestrator import verify as verify_module
+        from orchestrator.flake_ledger import FlakeVerdict
 
         _materialize(tmp_path, 'orchestrator/tests/test_x.py')
         config = _make_config(tmp_path)
@@ -392,14 +421,19 @@ class TestConfirmMergeVerifyFlakeSuppressible:
         with patch.object(verify_module, 'run_verification', rv):
             result = self._run(config, failing, tmp_path, [_orch_module_config()])
 
-        assert result is None
+        self._assert_not_suppressing(result, FlakeVerdict.fails_in_isolation)
 
     # -- fail-closed: no recoverable node-id, no re-run at all -------------
 
-    def test_no_node_id_returns_none_without_rerun(self, tmp_path: Path) -> None:
-        """Opaque/lint/type failure output (no pytest node-id) -> None WITHOUT
-        calling run_verification (cheap early-out, fail-closed to red)."""
+    def test_no_node_id_is_unconfirmable_without_rerun(self, tmp_path: Path) -> None:
+        """Opaque/lint/type failure output (no pytest node-id) -> `unconfirmable`
+        WITHOUT calling run_verification (cheap early-out, fail-closed to red).
+
+        NOT `fails_in_isolation`: nothing was re-run, so this is "we could not
+        tell", and reporting it as a red would launder a gate-blind case into a
+        verdict about the code."""
         from orchestrator import verify as verify_module
+        from orchestrator.flake_ledger import FlakeVerdict
 
         config = _make_config(tmp_path)
         failing = VerifyResult(
@@ -412,15 +446,21 @@ class TestConfirmMergeVerifyFlakeSuppressible:
         with patch.object(verify_module, 'run_verification', rv):
             result = self._run(config, failing, tmp_path, [_orch_module_config()])
 
-        assert result is None
+        self._assert_not_suppressing(
+            result, FlakeVerdict.unconfirmable, reason='no_recoverable_node_ids',
+        )
+        assert result.test_ids == (), result
         rv.assert_not_awaited()
 
     # -- fail-closed: node-id maps to no subproject -----------------------
 
-    def test_unmapped_node_id_returns_none(self, tmp_path: Path) -> None:
-        """A node-id whose file exists under no given subproject -> None.
-        (No file materialized on disk -> the existence mapping fails.)"""
+    def test_unmapped_node_id_is_unconfirmable(self, tmp_path: Path) -> None:
+        """A node-id whose file exists under no given subproject ->
+        `unconfirmable`, and the examined node-ids ARE named (PRD B6 — we know
+        exactly which tests we could not place). (No file materialized on disk
+        -> the existence mapping fails.)"""
         from orchestrator import verify as verify_module
+        from orchestrator.flake_ledger import FlakeVerdict
 
         config = _make_config(tmp_path)
         failing = VerifyResult(
@@ -432,14 +472,21 @@ class TestConfirmMergeVerifyFlakeSuppressible:
         with patch.object(verify_module, 'run_verification', rv):
             result = self._run(config, failing, tmp_path, [_orch_module_config()])
 
-        assert result is None
+        self._assert_not_suppressing(
+            result, FlakeVerdict.unconfirmable,
+            reason='node_ids_unmapped_to_subproject',
+        )
+        assert list(result.test_ids) == ['some/other/tests/test_q.py::test_z'], result
 
     # -- fail-closed: infra-sentinel re-run is never trusted --------------
 
-    def test_infra_transient_rerun_category_returns_none(self, tmp_path: Path) -> None:
+    def test_infra_transient_rerun_category_is_unconfirmable(self, tmp_path: Path) -> None:
         """An isolated re-run whose category is in INFRA_TRANSIENT_CATEGORIES
-        is never trusted as confirmation, even paired with passed=True -> None."""
+        is never trusted as confirmation, even paired with passed=True ->
+        `unconfirmable`, with the sentinel category named in the reason so θ can
+        tell an infra-blind gate from a genuinely red one."""
         from orchestrator import verify as verify_module
+        from orchestrator.flake_ledger import FlakeVerdict
 
         _materialize(tmp_path, 'orchestrator/tests/test_x.py')
         config = _make_config(tmp_path)
@@ -452,7 +499,10 @@ class TestConfirmMergeVerifyFlakeSuppressible:
         with patch.object(verify_module, 'run_verification', rv):
             result = self._run(config, failing, tmp_path, [_orch_module_config()])
 
-        assert result is None
+        self._assert_not_suppressing(
+            result, FlakeVerdict.unconfirmable,
+            reason='infra_transient_rerun:pytest_internalerror',
+        )
 
     # -- task-3290: node-id -> subproject mapping DELEGATES to the shared
     # -- helper (_group_node_ids_by_subproject), plus the characterization
@@ -516,19 +566,23 @@ class TestConfirmMergeVerifyFlakeSuppressible:
             call.kwargs
         )
         # The helper's groups drive the re-run, which confirms green -> suppress.
-        assert result == [_B1_FAILED_ID, _B1_CRASH_ID], result
+        from orchestrator.flake_ledger import FlakeVerdict
+
+        assert result.verdict is FlakeVerdict.passes_in_isolation, result
+        assert list(result.test_ids) == [_B1_FAILED_ID, _B1_CRASH_ID], result
 
     def test_helper_returning_none_fails_closed_without_rerunning(
         self, tmp_path: Path
     ) -> None:
         """`None` from the helper (an unmappable node-id) fails CLOSED to red
         end-to-end THROUGH the delegation boundary: no isolated re-run is
-        attempted and the gate returns None.
+        attempted and the gate reports `unconfirmable`, never a suppression.
 
         RED today: the inline copy ignores the spy and maps the materialized
         file successfully, so the gate re-runs and suppresses.
         """
         from orchestrator import verify as verify_module
+        from orchestrator.flake_ledger import FlakeVerdict
 
         _materialize(tmp_path, 'orchestrator/tests/test_x.py')
         config = _make_config(tmp_path)
@@ -541,7 +595,10 @@ class TestConfirmMergeVerifyFlakeSuppressible:
         ):
             result = self._run(config, self._b1_failing(), tmp_path, [_orch_module_config()])
 
-        assert result is None, f'Expected None (fail-closed to red), got {result!r}'
+        self._assert_not_suppressing(
+            result, FlakeVerdict.unconfirmable,
+            reason='node_ids_unmapped_to_subproject',
+        )
         rv.assert_not_awaited()
 
     def test_helper_returning_empty_dict_fails_closed(self, tmp_path: Path) -> None:
@@ -566,6 +623,7 @@ class TestConfirmMergeVerifyFlakeSuppressible:
         RED today: no such guard exists (the inline loop cannot produce {}).
         """
         from orchestrator import verify as verify_module
+        from orchestrator.flake_ledger import FlakeVerdict
 
         _materialize(tmp_path, 'orchestrator/tests/test_x.py')
         config = _make_config(tmp_path)
@@ -578,9 +636,13 @@ class TestConfirmMergeVerifyFlakeSuppressible:
         ):
             result = self._run(config, self._b1_failing(), tmp_path, [_orch_module_config()])
 
-        assert result is None, (
-            f'Expected None: an empty group dict is zero evidence, not '
-            f'"all groups clean" — got {result!r}'
+        assert result.verdict is not FlakeVerdict.passes_in_isolation, (
+            f'an empty group dict is zero evidence, not "all groups clean" — '
+            f'got {result!r}'
+        )
+        self._assert_not_suppressing(
+            result, FlakeVerdict.unconfirmable,
+            reason='node_ids_unmapped_to_subproject',
         )
         rv.assert_not_awaited()
 
@@ -615,7 +677,10 @@ class TestConfirmMergeVerifyFlakeSuppressible:
                 config, failing, tmp_path, [_module_config('alpha'), _module_config('beta')],
             )
 
-        assert result == ['tests/test_dup.py::test_dup'], result
+        from orchestrator.flake_ledger import FlakeVerdict
+
+        assert result.verdict is FlakeVerdict.passes_in_isolation, result
+        assert list(result.test_ids) == ['tests/test_dup.py::test_dup'], result
         rv.assert_awaited()
         cmd = rv.call_args.args[2].test_command
         assert 'alpha/tests/test_dup.py::test_dup' in cmd, (
@@ -662,7 +727,12 @@ class TestConfirmMergeVerifyFlakeSuppressible:
         ):
             result = self._run(config, failing, tmp_path, [_orch_module_config()])
 
-        assert result is None
+        from orchestrator.flake_ledger import FlakeVerdict
+
+        self._assert_not_suppressing(
+            result, FlakeVerdict.unconfirmable,
+            reason='node_ids_unmapped_to_subproject',
+        )
         rendered = [_fmt_log(call) for call in mock_logger.info.call_args_list]
         logged = any(
             'not suppressing' in msg and 'some/other/tests/test_q.py::test_z' in msg
