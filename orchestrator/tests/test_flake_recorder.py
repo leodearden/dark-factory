@@ -328,3 +328,74 @@ class TestRecordMergeFlakeSuppression:
         # None-safe all the way through: the streak still advances (it is a
         # module-global, not a store), and nothing raised.
         assert flake_recorder._merge_flake_suppression_streak == 1
+
+
+class TestSuppressionStormStreak:
+    """INV-4 storm detector: _bump_suppression_streak_and_maybe_escalate files
+    exactly ONE born-at-L2 escalation once the module-global suppression streak
+    reaches the threshold, then resets. Only suppressions bump it (task α, B4).
+
+    Moved here verbatim from test_verify_merge_flake_suppression.py by task ε
+    along with the helper itself: the storm detector is the RECORDER's, not the
+    producer's, and a test left behind in the producer's file would keep asserting
+    on a module that no longer owns the behaviour.
+    """
+
+    def _reset(self):
+        """Belt to the autouse fixture's braces, and the handle the cases below
+        use to reach the module — these drive the bump helper DIRECTLY, one unit
+        below ``record_merge_flake_suppression``."""
+        flake_recorder._merge_flake_suppression_streak = 0
+        return flake_recorder
+
+    def test_storm_files_one_l2_escalation_at_threshold_and_resets(self) -> None:
+        vm = self._reset()
+        threshold = vm._MERGE_FLAKE_SUPPRESSION_STREAK_THRESHOLD
+        q = _FakeEscalationQueue(open_l2=None)
+
+        for _ in range(threshold):
+            vm._bump_suppression_streak_and_maybe_escalate(q, '2768', _MERGE_SHA)
+
+        assert len(q.submitted) == 1, q.submitted
+        esc = q.submitted[0]
+        assert esc.level == 2
+        assert esc.severity == 'critical'
+        assert esc.agent_role.startswith('orchestrator-')
+        assert esc.category == 'merge_flake_suppression_storm'
+        # Counter cleared so the next window starts fresh (B4).
+        assert vm._merge_flake_suppression_streak == 0
+
+    def test_below_threshold_files_nothing(self) -> None:
+        vm = self._reset()
+        threshold = vm._MERGE_FLAKE_SUPPRESSION_STREAK_THRESHOLD
+        q = _FakeEscalationQueue(open_l2=None)
+
+        for _ in range(threshold - 1):
+            vm._bump_suppression_streak_and_maybe_escalate(q, '2768', _MERGE_SHA)
+
+        assert q.submitted == []
+        assert vm._merge_flake_suppression_streak == threshold - 1
+
+    def test_dedup_skips_submit_when_open_l2_exists(self) -> None:
+        vm = self._reset()
+        threshold = vm._MERGE_FLAKE_SUPPRESSION_STREAK_THRESHOLD
+        q = _FakeEscalationQueue(open_l2=object())  # a truthy open L2
+
+        for _ in range(threshold):
+            vm._bump_suppression_streak_and_maybe_escalate(q, '2768', _MERGE_SHA)
+
+        assert q.submitted == []
+        # get_by_task consulted for dedup on the same sentinel, at level=2.
+        assert q.get_by_task_calls, q.get_by_task_calls
+        assert q.get_by_task_calls[-1][2] == 2
+        assert vm._merge_flake_suppression_streak == 0
+
+    def test_none_queue_is_tolerated(self) -> None:
+        vm = self._reset()
+        threshold = vm._MERGE_FLAKE_SUPPRESSION_STREAK_THRESHOLD
+
+        for _ in range(threshold):
+            vm._bump_suppression_streak_and_maybe_escalate(None, '2768', _MERGE_SHA)
+
+        # No crash; window resets without filing (no queue to file into).
+        assert vm._merge_flake_suppression_streak == 0

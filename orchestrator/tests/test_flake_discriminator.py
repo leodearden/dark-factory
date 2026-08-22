@@ -1341,11 +1341,16 @@ class TestConfirmIsolatedRerunVerdictIsPure:
         return out
 
     def test_emits_no_event_and_touches_no_streak(self, tmp_path: Path) -> None:
+        """Both side-effects live on ``flake_recorder`` after task ε, so the fence
+        patches them THERE.  Patching the (now absent) ``verify`` attributes would
+        raise rather than silently pass, but naming the real owner is what keeps
+        this a fence around the discriminator rather than around a stale name."""
+        from orchestrator import flake_recorder
         from orchestrator import verify as verify_module
 
         _materialize(tmp_path, 'orchestrator/tests/test_x.py')
         config = _make_config(tmp_path)
-        before = verify_module._merge_flake_suppression_streak
+        before = flake_recorder._merge_flake_suppression_streak
 
         for rerun in (_result(True), _result(False)):
             emit = MagicMock()
@@ -1354,9 +1359,9 @@ class TestConfirmIsolatedRerunVerdictIsPure:
                 patch.object(
                     verify_module, 'run_verification', AsyncMock(return_value=rerun),
                 ),
-                patch.object(verify_module, '_emit_merge_flake_suppressed', emit),
+                patch.object(flake_recorder, '_emit_merge_flake_suppressed', emit),
                 patch.object(
-                    verify_module, '_bump_suppression_streak_and_maybe_escalate', bump,
+                    flake_recorder, '_bump_suppression_streak_and_maybe_escalate', bump,
                 ),
             ):
                 self._drive_both_sites(verify_module, config, tmp_path, rerun)
@@ -1364,7 +1369,7 @@ class TestConfirmIsolatedRerunVerdictIsPure:
             emit.assert_not_called()
             bump.assert_not_called()
 
-        assert verify_module._merge_flake_suppression_streak == before, (
+        assert flake_recorder._merge_flake_suppression_streak == before, (
             'the discriminator must not mutate the suppression streak'
         )
 
