@@ -8604,6 +8604,127 @@ def select_probe_depth(
     return d
 
 
+# ── deep merge-ahead (PRD γ, task 3185): the SECOND second-slot policy ───────
+#
+# Sibling of select_probe_depth() above: same shape (module-level, pure, knob
+# guard first, `None` == "do nothing this round"), different question.  The
+# probe only RELABELS a dispatch's depth/base attribution; these two decide
+# whether the dispatch is REDIRECTED onto a deep chain tip, and how the
+# halving bisector reacts to the resulting verdict.  Their stateful
+# counterparts are SpeculativeMergeWorker._deep_chain_placement (which owns
+# the live queue length and the git work) and _note_chain_outcome (which owns
+# the live halving state).
+#
+# UNIT — every depth here is a 1-INDEXED COUNT OF ITEMS IN THE CHAIN, where
+# item #1 is the dispatching slot-2 item itself.  So `d == 1` means "a chain
+# consisting of the dispatching item alone", which IS today's adjacent
+# speculative verify.  build_chain()'s own `cap`/`target_depth` are in the
+# different "additional links BEYOND the dispatching item" unit, which is why
+# _deep_chain_placement passes `cap - 1` / `d - 1` (see its docstring).
+
+
+def select_chain_depth(
+    chain_cap: int,
+    queue_len: int,
+    halving_state: int | None,
+) -> int | None:
+    """Decide how deep THIS second-slot dispatch should chain (PRD γ).
+
+    Implements the PRD §Contract dispatch invariant ``target_depth =
+    min(len(queue), cap, halving_state)`` plus its gates.  Returns the
+    1-indexed chain depth to target, or ``None`` meaning **"no chain this
+    round — take today's adjacent-verify path, unchanged"**.
+
+    Order of checks:
+
+      1. ``chain_cap <= 0`` -> ``None`` unconditionally.  This is α's shipped
+         kill switch (``MergeDeepConfig.chain_cap`` defaults to 0), so under
+         stock config every call returns ``None`` regardless of the other
+         arguments.  Note the CALLER
+         (:meth:`SpeculativeMergeWorker._deep_chain_placement`) hoists this
+         same guard a layer up so the O(n) queue scan is skipped too — the
+         kill switch must cost nothing, not merely do nothing.
+      2. ``queue_len < 2`` -> ``None``.  The PRD's ``queue >= 2`` gate: with
+         only the dispatching item available there is nothing to chain ONTO
+         it, so a chain would be a strictly more expensive spelling of the
+         adjacent verify.
+      3. ``target = min(queue_len, chain_cap, halving_state)``, where a
+         ``halving_state`` of ``None`` (the reset sentinel — never failed, or
+         just reset by a pass) drops out of the ``min`` entirely and the
+         result is ``min(queue_len, chain_cap)``.  Storing ``None`` rather
+         than the literal ``min(queue, cap)`` at pass time is deliberate: the
+         target is recomputed at EVERY dispatch, so the sentinel evaluates to
+         a FRESH ``min`` against the queue length as it is now, instead of
+         freezing a length that may be stale by the next round.
+      4. ``target < 2`` -> ``None``: the **d=1 floor**.  A one-item chain is
+         today's adjacent verify, so rather than build one the gate declines,
+         and NO chain code executes at all.  That is what makes the PRD's
+         "the floor is byte-identical to today's adjacent verify" claim true
+         BY CONSTRUCTION rather than by careful mimicry of the ordinary path.
+
+    Pure/synchronous — no I/O, no clock, no RNG, no worker state; callable
+    with no running event loop.
+
+    Args:
+        chain_cap: ``MergeDeepConfig.chain_cap``, read live off the
+            dispatching item's config.  ``0`` is the kill switch.
+        queue_len: 1-indexed count of chainable items INCLUDING the
+            dispatching item (i.e. ``1 + len(chain_snapshot())``).
+        halving_state: The bisector's current state — ``None`` for
+            reset/never-failed, else the depth ceiling
+            :func:`next_halving_state` last produced.
+
+    Returns:
+        The 1-indexed target chain depth (``>= 2``), or ``None`` for
+        "no chain this round".
+
+    See ``plans/deep-merge-ahead-prd.md`` decision 5 and §Contract.
+    """
+    if chain_cap <= 0:
+        return None
+    if queue_len < 2:
+        return None
+    target = min(queue_len, chain_cap)
+    if halving_state is not None:
+        target = min(target, halving_state)
+    if target < 2:
+        return None
+    return target
+
+
+def next_halving_state(passed: bool, dispatched_depth: int) -> int | None:
+    """Fold a deep-tip verdict into the halving bisector (PRD γ, decision 5).
+
+    A deep chain that FAILS says nothing about WHICH item in the chain broke,
+    so the policy bisects: halve the depth ceiling and try again, walking
+    (for example) 6 -> 3 -> 1, at which point :func:`select_chain_depth`'s
+    ``< 2`` floor declines to chain and the pipeline is back on its ordinary
+    one-item-at-a-time path — which does isolate the bad item, via the normal
+    sequential verify.  A chain that PASSES clears the suspicion entirely, so
+    the state resets.
+
+      * ``passed=False`` -> ``max(1, dispatched_depth // 2)``.  The ``max(1,
+        ...)`` floor is load-bearing: without it a fail at depth 1 would
+        produce ``0``, which :func:`select_chain_depth` would then ``min``
+        into every future round and the feature would be permanently, and
+        silently, off.
+      * ``passed=True`` -> ``None``, the reset sentinel (see
+        :func:`select_chain_depth` check 3 for why ``None`` rather than the
+        literal ``min(queue, cap)``).
+
+    *dispatched_depth* must be the depth ACTUALLY BUILT
+    (``1 + len(chain.links)``), never the target that was requested:
+    ``build_chain`` truncates on conflict/train/already-merged, so halving off
+    a 6-target that only built 2 links would punish the round by dropping
+    straight to 3 for a chain that was never 6 deep.
+
+    Pure/synchronous — no I/O, no clock, no worker state.
+    """
+    if passed:
+        return None
+    return max(1, dispatched_depth // 2)
+
+
 @dataclasses.dataclass(frozen=True)
 class ProbePlacement:
     """Result of a firing variable-depth speculative verify probe (task 2359).
