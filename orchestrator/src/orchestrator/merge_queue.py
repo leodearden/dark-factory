@@ -9884,10 +9884,18 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         test_merge_queue_lifecycle_registry.py's
         ``TestRequeueRecipeHasASingleChokepoint``, which fails if any
         ``_queue.put_nowait`` or ``on_requeued`` call site appears outside this
-        method. Its five callers are the head-failure cascade's downstream
+        method. Its six callers are the head-failure cascade's downstream
         self-requeue, the operator-halt mid-verify abort, the dead-verify
-        no-progress abort, the ``MergeVerifyLeaseContended`` defer, and the
-        pre-dispatch operator halt in :meth:`_dispatch_item`.
+        no-progress abort, the ``MergeVerifyLeaseContended`` defer, the
+        pre-dispatch operator halt in :meth:`_dispatch_item`, and — task 3185,
+        PRD γ — the deep-tip verify's NON-ADOPTING exit in
+        :meth:`_run_inflight_verify`. That sixth site is the odd one out in
+        WHY it defers: the other five are all "something went wrong, come back
+        later", while it defers a verify that ran perfectly and may well have
+        PASSED. A tip verdict proves the cumulative tree, never the
+        dispatching item's own subset tree, so adopting it would land work
+        from a tree nothing verified; requeuing is how γ dispatches deep
+        chains while landing nothing at all.
 
         Three effects, and all three are load-bearing:
 
@@ -18329,12 +18337,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 'owns the in-order prefix walk)',
                 req.task_id, merge_commit[:8], _chain_depth, out is None,
             )
-            # TEMPORARY, COMPLETED IN STEP-18 (task 3185): the REQUEUED
-            # sentinel is returned here, but `self._requeue_request(req)` — the
-            # enforced single chokepoint that actually puts the request back on
-            # `_queue` and re-arms the ledger + lifecycle registry — lands with
-            # step-18's tests.  Until then the request is deferred without
-            # being re-filed.  Unreachable under the shipped `chain_cap=0`.
+            # THE chokepoint, not a bare put_nowait: all three of its effects
+            # are load-bearing here exactly as they are at the operator-halt
+            # and dead-verify defers it already serves (see its docstring).
+            self._requeue_request(req)
             return InflightVerifyResult(
                 outcome=None,
                 merge_wt=None,
