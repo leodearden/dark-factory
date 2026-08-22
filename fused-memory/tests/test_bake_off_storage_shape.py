@@ -8152,6 +8152,121 @@ class TestCommittedReportJson:
         assert protocol['queries_measured'] == len(_mod().load_query_set())
         assert protocol['distractor_slab_size'] == len(_mod().load_distractor_slab())
 
+    # --- the +1-re-emission probe (task 4012) -----------------------------
+    #
+    # esc-3200-3 asked for regrowth deltas and read an artifact that had no
+    # such section.  Nothing in the tree could have caught that: 3199's
+    # delivered-check asserted only that the report EXISTS.  These are the
+    # gate it did not have — a committed run whose probe was skipped now
+    # fails in the merge lane instead of being published as complete.
+
+    def test_the_committed_run_actually_probed_regrowth(self):
+        """The absence esc-3200-3 could not read, made a test failure.
+
+        `--no-regrowth` is a legitimate flag for a smoke run, and the
+        renderer says so in words.  What it must not do is reach the
+        COMMITTED pair, because a skipped probe and a probe that ran and
+        found nothing read identically to the operator holding the artifact.
+        """
+        report = _committed_report()
+
+        assert report['regrowth'] is not None, (
+            'the committed report carries no regrowth block — the +1-'
+            're-emission probe was skipped. Regenerate with `cd fused-memory '
+            '&& uv run python scripts/bake_off_storage_shape.py` (probe on by '
+            'default; `--no-regrowth` must not reach the committed pair).'
+        )
+        assert report['protocol']['regrowth_probed'] is True
+
+    def test_the_delta_tables_cover_every_mode_and_every_read_arm(self):
+        """Pinned by EQUALITY, like `test_every_arm_variant_has_a_row` above.
+
+        A mode or a read arm quietly missing from the committed tables is a
+        row quietly missing from the decision the probe informs, and the
+        rendered table would simply be shorter — which nothing about the
+        artifact makes visible.
+        """
+        mod = _mod()
+        regrowth = _committed_report()['regrowth']
+
+        assert list(regrowth['deltas']) == list(mod.REGROWTH_MODES)
+        assert list(regrowth['after']) == list(mod.REGROWTH_MODES)
+        assert list(regrowth['baseline']) == list(mod.REGROWTH_READ_ARMS)
+        for mode in mod.REGROWTH_MODES:
+            assert list(regrowth['deltas'][mode]) == list(mod.REGROWTH_READ_ARMS), mode
+            assert list(regrowth['after'][mode]) == list(mod.REGROWTH_READ_ARMS), mode
+
+    def test_every_regrowth_table_measured_every_metric(self):
+        """The same completeness bar the arms are held to, for the same reason.
+
+        `None` is a legitimate value in the pipeline — "measured, no
+        denominator" — but in a FULL committed run it means the arm was never
+        asked, and `_regrowth_cell` renders it as `—` beside real numbers.
+
+        Keyed through `_regrowth_metric_keys()` rather than by re-spelling the
+        `<block>.<key>` join here: that helper is the ONE spelling the
+        projection, the completeness check and the renderer all share, so a
+        test that spelled it independently could pass over a table the
+        renderer cannot read.
+        """
+        mod = _mod()
+        regrowth = _committed_report()['regrowth']
+        metrics = mod._regrowth_metric_keys()
+
+        tables = [('baseline', regrowth['baseline'])]
+        for mode in mod.REGROWTH_MODES:
+            tables.append((f'after.{mode}', regrowth['after'][mode]))
+            tables.append((f'deltas.{mode}', regrowth['deltas'][mode]))
+        tables.append(('stamping_value', regrowth['stamping_value']))
+
+        for where, table in tables:
+            for arm in mod.REGROWTH_READ_ARMS:
+                assert set(table[arm]) == set(metrics), f'{where}.{arm}'
+                for metric in metrics:
+                    assert table[arm][metric] is not None, f'{where}.{arm}.{metric}'
+
+    def test_the_plus_one_in_the_probes_name_is_a_property_of_the_artifact(self):
+        """The `+1` is checkable here, not a claim in the artifact's prose.
+
+        Joined to `clusters_measured` rather than to a literal 20, so a
+        `--clusters 2` smoke artifact cannot satisfy it by carrying two
+        injections either: the probe covered every topic the run measured, or
+        it did not.
+        """
+        report = _committed_report()
+
+        assert report['regrowth']['topics_injected'] == (
+            report['protocol']['clusters_measured']
+        )
+        assert report['regrowth']['injections_per_topic'] == 1
+        assert report['protocol']['regrowth_injections_measured'] == (
+            report['regrowth']['topics_injected']
+        )
+
+    def test_it_records_the_injection_fixtures_commit(self):
+        """The disclosure's own checkable claim.
+
+        `REGROWTH_BLIND_AUTHORING_DISCLOSURE` says the injection fixture was
+        committed on its own ahead of every line of probe code and that "its
+        commit is in the fixture table below".  A disclosure pointing at a row
+        that is not there is worse than no disclosure: it reads as a trail
+        that can be followed.
+        """
+        mod = _mod()
+        report = _committed_report()
+
+        wanted = mod._repo_relative(mod.DEFAULT_REGROWTH_INJECTION_PATH)
+        # The block and the fixture table name the same file, through the one
+        # `_repo_relative` spelling, so the audit trail cannot point at a path
+        # the probe did not read.
+        assert report['regrowth']['injection_fixture'] == wanted
+        rows = [
+            entry for entry in report['protocol']['fixtures']
+            if entry['path'] == wanted
+        ]
+        assert len(rows) == 1, f'{wanted}: {len(rows)} rows in the fixture table'
+        assert rows[0]['commit'], f'{wanted} is not committed'
+
 
 class TestCommittedReportMarkdown:
     """The operator-facing half, and its agreement with the JSON."""
@@ -8334,3 +8449,106 @@ class TestCommittedReportMarkdown:
         assert mod.render_markdown(_committed_report()) == (
             mod.DEFAULT_REPORT_MD.read_text(encoding='utf-8')
         )
+
+    # --- the +1-re-emission probe (task 4012) -----------------------------
+    #
+    # The JSON half above pins that the probe RAN and measured everything.
+    # This half pins that the operator can read it: the section is where the
+    # reading order puts it, its tables carry no `—`, and the disclosure that
+    # qualifies every number in it is present verbatim.
+    #
+    # `test_it_renders_byte_identically_from_the_committed_json` does NOT
+    # subsume these.  Both sides of that comparison go through
+    # `render_markdown`, so a renderer that dropped the section, or a JSON
+    # half that never carried it, agrees with itself perfectly.
+
+    def test_the_regrowth_section_sits_between_by_query_kind_and_d10(self):
+        """The committed artifact's reading order, not just the renderer's.
+
+        `TestRenderMarkdownRegrowthSection` asserts this over a synthetic
+        report; here it is asserted over the file the operator actually
+        opens, which is also what makes the heading's PRESENCE a merge-lane
+        gate rather than a unit-test property.
+        """
+        lines = _mod().DEFAULT_REPORT_MD.read_text(
+            encoding='utf-8').splitlines()
+
+        assert (
+            lines.index('## By query kind')
+            < lines.index('## Regrowth deltas')
+            < lines.index('## D10 — audit-recall over the labeled fixture')
+        )
+
+    def test_the_regrowth_table_headers_are_the_pinned_column_sets(self):
+        """Same contract as `test_the_table_header_is_the_pinned_column_set`.
+
+        Both tables, because both carry metric columns and a column dropped
+        from either is a metric dropped from the decision.
+        """
+        mod = _mod()
+        section = _section(
+            mod.DEFAULT_REPORT_MD.read_text(encoding='utf-8'),
+            '## Regrowth deltas',
+        )
+
+        assert _header_row(mod.REGROWTH_TABLE_COLUMNS) in section
+        assert _header_row(mod.REGROWTH_STAMPING_COLUMNS) in section
+
+    def test_there_is_one_regrowth_bullet_per_read_arm(self):
+        """Located by `regrowth_bullet_prefix` — the renderer's own anchor.
+
+        Same discipline as the pin and stored-gap bullets: the prose stays
+        free to change, and what is pinned is that every read arm the tables
+        report also gets a sentence a reader can find.
+        """
+        mod = _mod()
+        rendered = mod.DEFAULT_REPORT_MD.read_text(encoding='utf-8')
+
+        for arm in mod.REGROWTH_READ_ARMS:
+            bullets = [
+                line for line in rendered.splitlines()
+                if line.startswith(mod.regrowth_bullet_prefix(arm))
+            ]
+            assert len(bullets) == 1, f'{arm}: {len(bullets)} regrowth bullets'
+
+    def test_the_not_blind_authored_disclosure_is_carried_verbatim(self):
+        """The probe's numbers are not protected the way the six arms' are.
+
+        Verbatim rather than by keyword: the disclosure is load-bearing prose
+        — it states WHY the protection is unrecoverable and what the fixture
+        commit does and does not prove — and a paraphrase that lost the
+        "partial audit trail and nothing more" qualifier would let the
+        section be read as a blind measurement.
+        """
+        mod = _mod()
+        rendered = mod.DEFAULT_REPORT_MD.read_text(encoding='utf-8')
+
+        assert mod.REGROWTH_BLIND_AUTHORING_DISCLOSURE in rendered
+
+    def test_no_regrowth_cell_in_the_committed_tables_is_unmeasured(self):
+        """`—` beside real numbers reads as a tie, exactly as in the decision
+        table above.  In a FULL committed run every cell was measured.
+
+        Substring-tested per cell, not by cell equality: a delta cell is
+        `base → after (Δ)`, so an unmeasured after or delta hides INSIDE an
+        otherwise populated-looking cell.
+        """
+        mod = _mod()
+        section = _section(
+            mod.DEFAULT_REPORT_MD.read_text(encoding='utf-8'),
+            '## Regrowth deltas',
+        )
+        rows = [
+            *_rows_under(section, _header_row(mod.REGROWTH_TABLE_COLUMNS)),
+            *_rows_under(section, _header_row(mod.REGROWTH_STAMPING_COLUMNS)),
+        ]
+
+        # Anti-vacuity: a section whose tables failed to render would make
+        # every assertion below run zero times and pass.
+        assert len(rows) == (
+            len(mod.REGROWTH_MODES) * len(mod.REGROWTH_READ_ARMS)
+            + len(mod.REGROWTH_READ_ARMS)
+        ), f'{len(rows)} regrowth rows'
+        for row in rows:
+            for cell in _cells(row):
+                assert mod._NO_MEASUREMENT not in cell, row
