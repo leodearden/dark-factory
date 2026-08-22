@@ -764,7 +764,6 @@ class LocalRunner:
         task_id: str | None = None,
         archive_root: Path | None = None,
         event_store: EventStore | None = None,
-        escalation_queue: Any = None,
     ) -> None:
         """Initialise LocalRunner.
 
@@ -775,13 +774,20 @@ class LocalRunner:
         cold-shadow / drift intentionally leave this ``None`` so they are
         auto-excluded from archival without any extra deny-list logic.
 
-        *event_store* / *escalation_queue* thread the merge-flake suppression gate's
-        (PRD task α) fact-emission and storm-escalation side-effects.  Both default
-        to ``None`` — byte-identical for the CLI ``run_merge_verify_on_worktree`` /
-        remote-runner paths, which cannot reach the dispatching host's stores; only
-        the authoritative local merge path (merge_queue.py) wires them.  The gate
-        still runs when they are ``None`` (it just emits no fact and bumps no streak),
-        mirroring the optional ``archive_root`` threading above.
+        *event_store* threads the dispatching store into ``run_scoped``'s merge
+        gate, so a trivial pass emits ``trivial_pass_escalated`` (INV-1, task 2883).
+        It defaults to ``None`` — byte-identical for the CLI
+        ``run_merge_verify_on_worktree`` / remote-runner paths, which cannot reach
+        the dispatching host's store — mirroring the optional ``archive_root``
+        threading above.
+
+        There is deliberately NO *escalation_queue* (task ε).  It fed only the
+        merge-flake storm-streak bump, and that side-effect now happens on the
+        DISPATCHER, from the ``FlakeSuppression`` the returned ``VerifyResult``
+        carries — see ``verify.apply_merge_flake_suppression``.  A LocalRunner
+        runs where the WORKTREE is and cannot reach the dispatching host's queue,
+        so accepting one here only ever invited re-wiring a side-effect onto the
+        host that cannot perform it.
         """
         self._merge_wt = merge_wt
         self._config = config
@@ -792,7 +798,6 @@ class LocalRunner:
         self._task_id = task_id
         self._archive_root = archive_root
         self._event_store = event_store
-        self._escalation_queue = escalation_queue
 
     async def health(self) -> bool:
         return True
@@ -840,19 +845,22 @@ class LocalRunner:
             # isolated + serial in THIS merge worktree; if they all pass, the red
             # was a CPU-starvation flake — suppress it (returns a PASSED result)
             # so the merge proceeds INTO the unscoped gate below, rather than
-            # short-circuiting here.  On a non-confirmation the original failing
-            # result is returned unchanged (merge stays red).  Never raises
-            # (fail-closed) — merge_queue.py has no VerifyInfraError handler.
-            # Resolved via the verify module so it stays monkeypatchable.
+            # short-circuiting here.  On a non-confirmation the failing result is
+            # returned (merge stays red).  Never raises (fail-closed) —
+            # merge_queue.py has no VerifyInfraError handler.  Resolved via the
+            # verify module so it stays monkeypatchable.
+            #
+            # Task ε: the hook takes only what the OBSERVATION needs.  Its two
+            # side-effects — the merge_flake_suppressed emit and the INV-4 storm
+            # streak — now happen on the DISPATCHER, driven off the
+            # FlakeSuppression the returned result carries, because THIS code runs
+            # wherever the worktree is and on the remote path that host has no
+            # event store and a private copy of the streak counter.
             scoped = await verify.apply_merge_flake_suppression(
                 scoped,
                 worktree=self._merge_wt,
                 config=self._config,
                 module_configs=self._module_configs,
-                merge_sha=merge_sha,
-                event_store=self._event_store,
-                escalation_queue=self._escalation_queue,
-                task_id=self._task_id,
             )
             if not scoped.passed:
                 return scoped

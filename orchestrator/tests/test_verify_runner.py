@@ -1123,13 +1123,25 @@ class TestLocalRunnerBundle:
         run_unscoped.assert_not_awaited()
 
     async def test_scoped_fail_returns_scoped_result_unchanged(self):
+        """The red is returned unchanged — EQUAL, not identical.
+
+        Task 3789 (ε): the merge-flake gate now ATTACHES its observation to the
+        result on the non-suppressed branch too (§5.5 records the observation,
+        not the remedy), so the returned object is a `replace()` copy. It
+        compares EQUAL because `flake_suppression` is `compare=False`, and every
+        merge-deciding field is untouched — which is what "unchanged" meant here
+        all along.
+        """
         scoped_result = _make_fail_result(category='test_failure', cause_hint='assertion error')
         run_scoped = AsyncMock(return_value=scoped_result)
         runner = _make_local_runner(run_scoped=run_scoped)
 
         result = await runner.run_merge_verify('abc123', _make_spec())
 
-        assert result is scoped_result
+        assert result == scoped_result
+        assert result.passed is False
+        assert result.category == 'test_failure'
+        assert result.cause_hint == 'assertion error'
 
     async def test_unscoped_broken_returns_sentinel_category_result(self):
         from orchestrator.verify_runner import UNSCOPED_TYPECHECK_FAILED_CATEGORY

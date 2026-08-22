@@ -9062,31 +9062,47 @@ async def apply_merge_flake_suppression(
     worktree: Path,
     config: 'OrchestratorConfig',
     module_configs: list[ModuleConfig],
-    merge_sha: str,
-    event_store: 'EventStore | None' = None,
-    escalation_queue: Any = None,
-    task_id: str | None = None,
     _confirm=confirm_merge_verify_flake_suppressible,
 ) -> VerifyResult:
-    """Merge-verify result handler: suppress a confirmed CPU-starvation flake.
+    """Merge-verify result handler: OBSERVE a red, ATTACH the observation.
 
     THE hook ``LocalRunner.run_merge_verify`` calls on its ``not scoped.passed``
-    branch (PRD task α). Runs the pure gate *_confirm*; on a confirmed flake it
-    emits the INV-2 fact, bumps the INV-4 storm streak, and returns a PASSED
-    VerifyResult (category ``merge_flake_suppressed``) so the merge proceeds
-    into the unscoped typecheck gate. On a non-confirmation it returns
-    *failing_result* UNCHANGED (merge stays red; no fact, streak untouched).
+    branch (PRD task α). Runs the pure gate *_confirm* and returns a
+    ``VerifyResult`` carrying its ``FlakeSuppression`` on BOTH branches: a
+    PASSED result (category ``merge_flake_suppressed``) on
+    ``passes_in_isolation``, so the merge proceeds into the unscoped typecheck
+    gate; otherwise *failing_result* with the observation attached (merge stays
+    red).
 
-    Never raises: the pure gate is itself fail-closed and non-raising, and the
-    fact/streak side-effects are None-safe — an uncaught raise here would stall
-    the merge queue (merge_queue.py has no VerifyInfraError handler). *_confirm*
-    is injectable for testing.
+    IT PERFORMS NO SIDE-EFFECT (task ε). The ``merge_flake_suppressed`` emit and
+    the INV-4 storm-streak bump used to happen HERE, inline, and that was the
+    defect: this function runs wherever the WORKTREE is, and on the remote path
+    that host has no event store and its own module-global streak counter — so
+    the fact was dropped and the storm detector silently disarmed exactly where
+    load is highest. Both now happen on the DISPATCHER, in
+    ``flake_recorder.record_merge_flake_suppression``, driven off the attached
+    observation. Keeping ``event_store``/``escalation_queue``/``merge_sha``/
+    ``task_id`` OUT of this signature is what makes that structural.
+
+    §5.5 — record the OBSERVATION, not the remedy: the observation is attached
+    on the non-suppressed branch too, so a ``fails_in_isolation`` or
+    ``unconfirmable`` verdict still reaches the ledger. Only
+    ``passes_in_isolation`` changes the VERDICT.
+
+    Shaping the suppressed pass stays here rather than moving to the recorder:
+    that is the GATE's judgement about the merge, not a record of anything.
+
+    Never raises: the pure gate is itself fail-closed and non-raising, and
+    ``replace`` cannot fail — an uncaught raise here would stall the merge queue
+    (merge_queue.py has no VerifyInfraError handler). *_confirm* is injectable
+    for testing.
     """
-    ids = await _confirm(
+    suppression = await _confirm(
         config, failing_result, worktree=worktree, module_configs=module_configs,
     )
-    if not ids:
-        return failing_result
-    _emit_merge_flake_suppressed(event_store, task_id, merge_sha, ids)
-    _bump_suppression_streak_and_maybe_escalate(escalation_queue, task_id, merge_sha)
-    return _merge_flake_suppressed_pass(failing_result, ids)
+    if suppression.verdict is FlakeVerdict.passes_in_isolation:
+        return replace(
+            _merge_flake_suppressed_pass(failing_result, list(suppression.test_ids)),
+            flake_suppression=suppression,
+        )
+    return replace(failing_result, flake_suppression=suppression)

@@ -2817,10 +2817,12 @@ async def _run_post_merge_verify(
                 run_unscoped=_run_unscoped_typechecks,
                 task_id=req.task_id,
                 archive_root=req.config.project_root / 'data' / 'verify-logs',
-                # PRD task α: thread the fact-emission + storm-escalation stores
-                # into the merge-flake suppression gate (LocalRunner.run_merge_verify).
+                # INV-1 (task 2883): thread the dispatching store so run_scoped's
+                # merge gate emits trivial_pass_escalated.  The merge-flake gate's
+                # own side-effects are NOT threaded here — task ε moved them to the
+                # dispatcher (_run_post_merge_verify), driven off the
+                # FlakeSuppression the returned VerifyResult carries.
                 event_store=event_store,
-                escalation_queue=escalation_queue,
             )],
             event_store=event_store,
             task_id=req.task_id,
@@ -3059,7 +3061,6 @@ async def _run_post_merge_verify(
             task_id=req.task_id,
             archive_root=req.config.project_root / 'data' / 'verify-logs',
             event_store=event_store,
-            escalation_queue=escalation_queue,
         )
         try:
             # task 2873: defense-in-depth lane-lock for the REMOTE-path
