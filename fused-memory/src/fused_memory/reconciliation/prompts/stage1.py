@@ -350,13 +350,23 @@ Stage-1 sweep (`stale_status_snapshot_edge_sweep`) performs this exact two-step 
 cycle for edges asserting that a task is blocked: it invalidates any such edge whose task \
 now has a different positively-known status (pending, in-progress, review, done, …), and \
 writes the superseding resulting-state-only fact itself, in the form \
-`"As of <YYYY-MM-DD>, task <N> has status <S>."` So do **not** hand-invalidate blocked-status \
-snapshot edges yourself. Two reasons: the sweep will have handled them before you see them, \
-and a manual `update_edge` is invisible to `report.stats['stale_status_snapshot_edges_invalidated']` \
-— that gap is precisely what produced a reported reading of 0 invalidated out of 6312 edges \
-scanned on a cycle where a blocked edge really had been retired by hand. If you believe a \
-blocked-status edge was missed, flag it rather than fixing it silently, so the sweep's \
-selection rule can be corrected at the source.
+`"As of <YYYY-MM-DD>, task <N> has status <S>."` So do **not** go hunting for \
+blocked-status snapshot edges to retire by hand: for the shapes the sweep reaches, it will \
+have done both halves before you see them, and a redundant manual `update_edge` is \
+invisible to `report.stats['stale_status_snapshot_edges_invalidated']` — that gap is \
+precisely what produced a reported reading of 0 invalidated out of 6312 edges scanned on a \
+cycle where a blocked edge really had been retired by hand.
+
+**But the sweep has documented residuals it structurally cannot reach** (an aggregate whose \
+status marker is not adjacent to the list noun, an adverbial preamble, a wide open-class gap \
+between the task reference and the marker, an aggregate list that follows a task reference in \
+the same clause). For those the edge is genuinely stale and nothing else will retire it until \
+the task eventually reaches done/cancelled. So if you find a blocked-status snapshot edge you \
+can show the sweep missed: **fix it AND flag it** — perform the two-step yourself, and say so \
+in your cycle summary (which edge, which fact text, which task) so the selection rule can be \
+corrected at the source. Do not silently leave a stale assertion standing to protect the \
+stat's fidelity: the stat counts SWEEP work by design, and your hand-retirement being absent \
+from it is exactly what the cycle-summary note is for.
 
 ## update_edge Temporal Limitation (Task 1145 Guard 3 workaround)
 `mcp__fused-memory__update_edge` does NOT expose a `valid_at` parameter. When you update \
@@ -375,7 +385,8 @@ Task 1145 Guard 3 is shipped):
 The one case already automated is BLOCKED-status snapshot edges, which the deterministic \
 `stale_status_snapshot_edge_sweep` invalidates and supersedes on every cycle — see \
 "Already done for you" under `### Resulting-state-only temporal_facts` above. Do not \
-duplicate the sweep's work there.
+duplicate the sweep's work there; the one exception is an edge you can show it missed, \
+which you fix AND flag per that section.
 
 **Encoding effective dates in fact text**: when writing a temporal-fact snapshot via \
 `add_memory(category='temporal_facts')`, encode the effective ISO date directly in the \

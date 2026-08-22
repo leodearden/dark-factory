@@ -1448,6 +1448,12 @@ def _extract_ids(fact: str, patterns: _SnapshotPatterns) -> set[int]:
 #     extractor-SAFE (measured -> set()), so an author checking only the
 #     self-churn hazard would conclude it is fine. It is PRIOR-STATE framing,
 #     which the same resulting-state-only rule refuses.
+#     Note what that means operationally: unlike (1), NOTHING executable
+#     rejects this wording — all four of task_filter's write-norm predicates
+#     pass it (asserted in
+#     test_prior_state_negation_is_extractor_safe_but_still_not_the_template).
+#     The prohibition is a prose norm, so this template's compliance with it
+#     rests on review, not on a guard that would catch a regression.
 #
 # The chosen template states the CURRENT state and nothing else, and carries
 # an explicit 'As of <date>' stamp so it reads as a point-in-time observation

@@ -1984,19 +1984,41 @@ class TestBuildSupersedeFact:
         assert extract_snapshot_edge_task_ids(forbidden) == {2848}
         assert task_filter.is_mixed_temporal_framing(forbidden)
 
-    def test_contrast_prior_state_negation_is_also_forbidden(self):
-        """'Task 2848 is no longer blocked' is extractor-SAFE but norm-unsafe.
+    def test_prior_state_negation_is_extractor_safe_but_still_not_the_template(self):
+        """'Task 2848 is no longer blocked' passes every EXECUTABLE check and is
+        still not the wording to use — the rule against it is prompt-level only.
 
-        It survives both extractors (measured -> set()), so the self-churn
-        hazard alone would not rule it out — but it is PRIOR-state framing,
-        which prompts/stage1.py L326-346 forbids for temporal_facts. Recorded
-        so a future author who checks only the extractor does not conclude it
-        is an acceptable alternative.
+        This test deliberately claims LESS than its sibling
+        test_contrast_the_obvious_wording_is_forbidden, which can point at a
+        real predicate (is_mixed_temporal_framing) that rejects
+        'was blocked and is now pending'. Here there is no such predicate:
+        both extractors return set() AND all four write-norm predicates the
+        MCP boundary enforces pass it, as asserted below. So nothing in the
+        code would stop an author who switched to this wording — the only
+        thing forbidding it is the resulting-state-only norm written in
+        prompts/stage1.py, which is prose.
+
+        Named and scoped this way on purpose (amendment,
+        reviewer_comprehensive test-quality finding): the earlier version
+        asserted only the two extractor results while its docstring claimed
+        the wording was "forbidden", which would have left a future reader
+        believing an automated guard exists here. It does not, and the
+        template's compliance rests on TestBuildSupersedeFact plus review.
         """
         prior_state = 'Task 2848 is no longer blocked'
 
+        # Extractor-safe: it would not select itself for invalidation.
         assert extract_snapshot_edge_task_ids(prior_state) == set()
         assert extract_blocked_assertion_task_ids(prior_state) == set()
+
+        # ...and NO write-norm predicate rejects it either. These four
+        # assertions are the point of the test: they pin that the prior-state
+        # prohibition has no executable backing, so a future author does not
+        # go looking for the guard that supposedly caught it.
+        assert not task_filter.is_mixed_temporal_framing(prior_state)
+        assert task_filter.find_conflicting_task_status_ids(prior_state) == set()
+        assert not task_filter.frames_live_task_status_as_current_fact(prior_state)
+        assert not task_filter.is_count_snapshot(prior_state)
 
 # --------------------------------------------------------------------------- #
 # flatten_dedup_edges
