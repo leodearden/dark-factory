@@ -35,13 +35,18 @@ from __future__ import annotations
 import pytest
 from shared.task_metadata import parse_metadata
 
+from fused_memory.reconciliation.cli_stage_runner import DISALLOW_TASK_WRITES
 from fused_memory.reconciliation.prompts import (
     FINDING_ID_METADATA_KEY,
     FINDING_MEMORY_IDS_METADATA_KEY,
     get_recon_report_tool_guidance,
+    render_finding_provenance_section,
 )
 from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
-from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
+from fused_memory.reconciliation.prompts.stage2 import (
+    STAGE2_SYSTEM_PROMPT,
+    build_stage2_system_prompt,
+)
 from fused_memory.reconciliation.prompts.stage3 import STAGE3_SYSTEM_PROMPT
 
 # The call-opener scanners are imported from the drift-guard module that owns
@@ -53,6 +58,9 @@ from test_recon_report_guidance_drift import (  # noqa: E402
     _extract_call_args_at,
     _iter_call_openers,
 )
+
+_STAGE1_SECTION = render_finding_provenance_section(can_file_tasks=False)
+_STAGE2_SECTION = render_finding_provenance_section(can_file_tasks=True)
 
 # The two constants, paired with the spelling esc-3796-1 ratified. This is the
 # ONE place in this file the literal strings are written down — everything
@@ -182,3 +190,111 @@ class TestGuidanceClauseDoesNotReopenTheRunIdHole:
                     f'A `{tool_name}(...)` example in the shared guidance is missing '
                     f'`run_id` — got: {tool_name}({args_substr})'
                 )
+
+
+class TestCapabilitySplitOfTheActionableRule:
+    """The actionable rule is parameterized on what the stage may actually do.
+
+    Stage 1 cannot file tasks: `cli_stage_runner.STAGE1_DISALLOWED` folds in
+    `DISALLOW_TASK_WRITES`, which contains `mcp__fused-memory__submit_task`,
+    while `STAGE2_DISALLOWED` does not. Naming a tool in a stage's prompt is a
+    live positive license, not inert prose, so handing Stage 1 the Stage-2 text
+    would instruct it to take an action it cannot take — which this package
+    forbids in two separate documented places
+    (`render_escalation_boundary_note`: "Never tell a stage about an action it
+    is not sanctioned to take"; `render_source_completion_section`: "Never
+    instruct Stage 1 to call a tool it does not hold").
+
+    These assertions pin the SPLIT, not the wording of either branch.
+    """
+
+    def test_stage2_carries_the_task_filing_branch_exactly_once(self):
+        assert STAGE2_SYSTEM_PROMPT.count(_STAGE2_SECTION) == 1, (
+            'STAGE2_SYSTEM_PROMPT must interpolate '
+            'render_finding_provenance_section(can_file_tasks=True) exactly once.'
+        )
+
+    def test_stage1_carries_the_relay_branch_exactly_once(self):
+        assert STAGE1_SYSTEM_PROMPT.count(_STAGE1_SECTION) == 1, (
+            'STAGE1_SYSTEM_PROMPT must interpolate '
+            'render_finding_provenance_section(can_file_tasks=False) exactly once.'
+        )
+
+    @pytest.mark.parametrize('project_id', ['dark_factory', 'autopilot_video'])
+    def test_survives_build_stage2_system_prompt(self, project_id: str):
+        """Both branches of the runtime builder keep the section.
+
+        `autopilot_video` injects an extra guardrail section before
+        `## Available Tools`; that injection must not displace this one.
+        """
+        built = build_stage2_system_prompt(project_id)
+        assert built.count(_STAGE2_SECTION) == 1, (
+            f'build_stage2_system_prompt({project_id!r}) must carry the '
+            'can_file_tasks=True section exactly once.'
+        )
+
+    def test_the_two_renderings_differ(self):
+        """A split that renders identically is not a split."""
+        assert _STAGE1_SECTION != _STAGE2_SECTION, (
+            'The two capability branches render identically — the parameterization '
+            'is then decorative, and Stage 1 is being told whatever Stage 2 is told.'
+        )
+
+    def test_neither_stage_carries_the_other_branch(self):
+        """What makes the split structural rather than incidental.
+
+        A copy-paste that hands Stage 1 the Stage-2 text goes red here even
+        though both stages would still "have a provenance section".
+        """
+        assert _STAGE2_SECTION not in STAGE1_SYSTEM_PROMPT, (
+            'STAGE1_SYSTEM_PROMPT carries the can_file_tasks=True rendering — that '
+            'licenses Stage 1 to file a task it holds no tool for.'
+        )
+        assert _STAGE1_SECTION not in STAGE2_SYSTEM_PROMPT, (
+            'STAGE2_SYSTEM_PROMPT carries the can_file_tasks=False rendering — that '
+            'tells Stage 2 to relay work it can do itself, right now.'
+        )
+
+    def test_only_the_task_filing_branch_names_submit_task(self):
+        """THE capability contract, and the reason the split exists at all.
+
+        The tool name is derived from `DISALLOW_TASK_WRITES` at its source
+        rather than hard-coded, so this tracks the disallow list as it changes.
+        Mirroring an inventory instead of reading it at the source is the exact
+        failure mode that hid the Stage-2 escalation-read gap until task 3163,
+        recorded in `render_source_completion_section`'s docstring.
+        """
+        qualified = 'mcp__fused-memory__submit_task'
+        assert qualified in DISALLOW_TASK_WRITES, (
+            f'{qualified} is no longer in DISALLOW_TASK_WRITES — the premise of this '
+            'capability split has changed, so the split itself needs re-deciding, '
+            'not this assertion updating.'
+        )
+        bare = qualified.rsplit('__', 1)[-1]
+
+        assert bare not in _STAGE1_SECTION, (
+            f'The can_file_tasks=False rendering names {bare!r}, but Stage 1 does not '
+            'hold that tool (DISALLOW_TASK_WRITES is folded into STAGE1_DISALLOWED). '
+            'Naming it there licenses an action Stage 1 cannot take.'
+        )
+        assert bare in _STAGE2_SECTION, (
+            f'The can_file_tasks=True rendering must name {bare!r} — Stage 2 holds it, '
+            'and the whole point is to say WHERE the keys get set.'
+        )
+
+    @pytest.mark.parametrize('key, _ratified', _RATIFIED_SPELLINGS, ids=_KEY_IDS)
+    def test_both_renderings_name_both_keys(self, key: str, _ratified: str):
+        """Neither stage is left to invent a spelling.
+
+        Stage 1 cannot persist the keys itself, but it must still name them
+        when relaying to Stage 2 — otherwise the relay hands over a value with
+        no agreed field to put it in, which is the original defect.
+        """
+        assert key in _STAGE1_SECTION, (
+            f'The can_file_tasks=False rendering must name {key!r} so the relay to '
+            'Stage 2 carries the agreed field name.'
+        )
+        assert key in _STAGE2_SECTION, (
+            f'The can_file_tasks=True rendering must name {key!r} — it is the key '
+            'Stage 2 is being told to set.'
+        )
