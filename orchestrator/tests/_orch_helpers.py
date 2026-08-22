@@ -95,6 +95,55 @@ def wire_scheduler_liveness_mock(scheduler_mock: MagicMock) -> None:
     )
 
 
+# task 3492/4215: the pyproject-configured default per-test timeout ceiling
+# that every heavy test in this suite must clear.  MIRROR of
+# `[tool.pytest.ini_options].timeout` in orchestrator/pyproject.toml
+# (currently 60).  It was a bare literal in
+# test_merge_queue_concurrent_verify.py, whose own comment admitted the
+# defect -- "it is still a literal and CAN drift if that setting changes
+# without a matching edit here; there is no automated link between the two."
+# Task 4215 moved the single definition here and made that link EXECUTABLE:
+# test_whole_tree_scan_timeout_guard.py::TestTimeoutConstants reads the real
+# pyproject with `tomllib` at runtime and fails if the two disagree.  Do NOT
+# add a second copy -- import this one.
+PYPROJECT_DEFAULT_TIMEOUT = 60
+
+# task 4215: per-test ceiling for the family of guard tests that sweep the
+# WHOLE tree -- `rglob('*.py')` over ~500 files, `ast.parse` on each -- and so
+# cannot be sized by the ordinary 60s default.  Coverage of this family is
+# ENFORCED, not sprinkled: test_whole_tree_scan_timeout_guard.py recomputes the
+# census from source on every run and fails a scanner that lacks a module-level
+# `pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)`.
+#
+# MECHANISM -- why a breach here is far more expensive than a red test:
+#   * `timeout_method = "thread"` (pyproject.toml:153) means pytest-timeout
+#     answers a breach by `os._exit()`ing the whole xdist worker ("node down:
+#     Not properly terminated"), NOT by failing the offending test;
+#   * `--max-worker-restart=0` (pyproject.toml:178, task 1907) then declines to
+#     replace that worker, degrading the run to a TRUNCATED whole-suite session
+#     whose surviving failure names some innocent guard that merely shared the
+#     dead worker.
+#   So one slow tree-scan costs a whole verify run AND misattributes the blame.
+#
+# MEASURED basis for 5x rather than a tuned literal:
+#   * unloaded and serial (`-n0`) on a 32-core box: 8.25s/call
+#     (test_merge_queue_reachback_patch_guard), 6.70s
+#     (test_event_loop_antipattern_guard), 6.46s
+#     (test_serial_merge_worker_import_guard);
+#   * the SAME serial_merge_worker guard measured 17.85 / 21.32 / 30.75s per
+#     call at loadavg 120-176 under `-n auto` -- ~4.8x load inflation;
+#   * xdist worker deaths were then observed at loadavg 250-423, one further
+#     inflation step past the 60s default (esc-3980-1 on branch task/3980,
+#     esc-3787-1 on branch task/3787).
+# 300s is ~36x the unloaded worst case and ~10x the measured-under-load worst
+# case.  DERIVED from PYPROJECT_DEFAULT_TIMEOUT because that ini default IS the
+# hazard being cleared -- deliberately NOT from HEAVY_BARRIER_TEST_TIMEOUT,
+# which happens to equal 300 but is merge-wait arithmetic
+# (`5 * MERGE_RESULT_TIMEOUT + 75`); an AST sweep performs zero merge waits, so
+# borrowing it would let a future merge-timing retune silently move this
+# ceiling.  Never-narrow.
+WHOLE_TREE_SCAN_TEST_TIMEOUT = 5 * PYPROJECT_DEFAULT_TIMEOUT  # 300s
+
 # task 2376: generous merge-pipeline result-wait ceiling that tolerates host
 # oversubscription; never-narrow — only replaces literals <=15 across the
 # merge-pipeline test files (test_merge_queue.py, test_merge_speculation.py,

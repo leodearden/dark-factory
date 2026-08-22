@@ -40,6 +40,13 @@ import pytest
 from _orch_helpers import (
     MERGE_GATE_BARRIER_TIMEOUT,
     MERGE_RESULT_TIMEOUT,
+    # task 4215 moved this constant to _orch_helpers.py, where a runtime
+    # `tomllib` read of orchestrator/pyproject.toml now pins it against the
+    # real `[tool.pytest.ini_options].timeout`
+    # (test_whole_tree_scan_timeout_guard.py).  It is re-exported through this
+    # module's namespace, which is how test_merge_speculation.py:64 keeps
+    # importing it from here unchanged.
+    PYPROJECT_DEFAULT_TIMEOUT,
     RESPONSIVE_WAIT_STRETCH,
     RESPONSIVE_WAIT_WALL_CAP,
     wait_responsive,
@@ -680,15 +687,6 @@ _SUPPRESSED_WAIT_DEBT: dict[str, frozenset[str]] = {
         'test_runner_unavailable_quarantine_fallback',
     }),
 }
-
-
-# task 3492: the pyproject-configured default per-test timeout ceiling that
-# every heavy-wait class in this module must clear. This is a hand-mirrored
-# copy of `[tool.pytest.ini_options].timeout` in orchestrator/pyproject.toml
-# (currently 60) -- it is still a literal and CAN drift if that setting
-# changes without a matching edit here; there is no automated link between
-# the two.
-PYPROJECT_DEFAULT_TIMEOUT = 60
 
 
 def _timeout_mark_offenders(

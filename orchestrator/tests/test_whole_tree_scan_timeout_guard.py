@@ -37,15 +37,28 @@ other ~16000 tests, which is exactly the ceiling that catches real hangs.
 from __future__ import annotations
 
 import tomllib
-from pathlib import Path
 
-from _orch_helpers import PYPROJECT_DEFAULT_TIMEOUT, WHOLE_TREE_SCAN_TEST_TIMEOUT
+import pytest
+from _orch_helpers import (
+    ORCH_PYPROJECT,
+    PYPROJECT_DEFAULT_TIMEOUT,
+    WHOLE_TREE_SCAN_TEST_TIMEOUT,
+)
 
-# Resolved from THIS FILE, never the process CWD: merge-verify runs pytest from
-# the orchestrator/ cwd while a plain `pytest orchestrator/tests` runs from the
-# repo root, and both must resolve identically. Same idiom as
-# test_marker_registration_drift.py:597-601.
-_ORCH_PYPROJECT = Path(__file__).resolve().parents[1] / 'pyproject.toml'
+# This module is ITSELF a member of the family it polices -- the invariant
+# below rglob()s every *.py under this directory and ast.parse()s each one --
+# so it carries the very mark it demands instead of exempting itself.  The
+# deliberate omission of the sibling guards' `_THIS_FILE`/`continue` skip-self
+# idiom is spelled out in that test's docstring; skipping itself would exempt
+# the one file most certain to need the mark.
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
+
+# Resolved from _orch_helpers' shared anchor, which is itself resolved from
+# THAT file and never from the process CWD: merge-verify runs pytest from the
+# orchestrator/ cwd while a plain `pytest orchestrator/tests` runs from the
+# repo root, and both must resolve identically.  Aliased to a private name so
+# the assertion messages below read as this module's own.
+_ORCH_PYPROJECT = ORCH_PYPROJECT
 
 
 def _pytest_ini_options() -> dict[str, object]:
