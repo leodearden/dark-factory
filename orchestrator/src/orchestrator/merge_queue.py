@@ -9711,6 +9711,20 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # speculative items (see _probe_verify_placement); a non-speculative
         # (head trust-anchor) dispatch never consumes a probe round.
         self._probe_round_counter: int = 0
+        # task 3185 (PRD γ, decision 5): the deep merge-ahead HALVING
+        # BISECTOR state -- the live counterpart to the pure
+        # select_chain_depth()/next_halving_state() pair, and the SECOND
+        # piece of second-slot policy state to live in this block. `None` is
+        # the RESET sentinel (never failed, or just cleared by a passing
+        # chain); an int is the depth ceiling a preceding deep-tip FAIL
+        # halved us down to. Mutated in exactly one place,
+        # _note_chain_outcome(); read only via _deep_target_depth().
+        # Deliberately NOT the literal min(queue, cap) frozen at pass time --
+        # see select_chain_depth()'s check 3 for why a sentinel re-evaluated
+        # at dispatch time beats a stale integer. Init-None also means a
+        # restarted worker never inherits phantom suspicion, matching
+        # _recent_verify_outcomes' empty-at-construction rationale above.
+        self._chain_halving_state: int | None = None
 
     # ── MQ-reliability kappa (task 2169): ItemLifecycle chokepoint helpers ──
     # register/transition/retire an item's lifecycle state + the lockstep
@@ -11825,6 +11839,66 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             return None
         n_failed = sum(1 for passed in self._recent_verify_outcomes if not passed)
         return n_failed / len(self._recent_verify_outcomes)
+
+    # ── deep merge-ahead halving state (PRD γ, task 3185) ────────────────────
+    #
+    # The stateful counterparts to the module-level select_chain_depth() /
+    # next_halving_state() pair, in the same relationship the two methods
+    # immediately above have to select_probe_depth(): the pure functions hold
+    # the policy, these hold the live state and do nothing else.  Both are
+    # pure/synchronous so they are callable from unit tests with no running
+    # loop and from the dispatch hot path with no await point.
+
+    def _note_chain_outcome(self, passed: bool, depth: int) -> None:
+        """Fold ONE deep-tip verdict into the halving bisector.
+
+        The **single mutation chokepoint** for
+        :attr:`_chain_halving_state`: nothing else in this class assigns to
+        it, so the whole bisector policy is auditable at
+        :func:`next_halving_state` plus this one line.  Same role
+        :meth:`_record_verify_outcome` plays for the probe's rolling window.
+
+        *depth* must be the depth ACTUALLY BUILT (``1 + len(chain.links)``),
+        never the target that was requested — ``build_chain`` truncates, and
+        halving off an unbuilt target would punish a round for depth it never
+        reached.  See :func:`next_halving_state`.
+
+        Deliberately touches NOTHING else.  In particular it does not append
+        to :attr:`_recent_verify_outcomes` and does not advance
+        :attr:`_probe_round_counter`: the deep policy and the speculation
+        probe are independent second-slot policies that happen to share this
+        block, and a deep outcome silently perturbing the probe's cadence or
+        flake-rate suppression would couple them invisibly.
+
+        Called exactly once per dispatched chain, at the point the tip
+        verdict is known (see :meth:`_run_inflight_verify`'s chain arm).  A
+        round that built no chain at all — the kill switch, the ``queue < 2``
+        gate, the d=1 floor, a timed-out or empty build — must NOT call this:
+        nothing was verified deeply, so there is no outcome to halve or reset
+        on.
+
+        Pure/synchronous (no await, no I/O).
+        """
+        self._chain_halving_state = next_halving_state(passed, depth)
+
+    def _deep_target_depth(self, cap: int, queue_len: int) -> int | None:
+        """Return this round's target chain depth, or ``None`` for no chain.
+
+        Composes the live :attr:`_chain_halving_state` with the pure
+        :func:`select_chain_depth` policy and **delegates** rather than
+        re-deriving the ``min(queue_len, cap, halving_state)`` invariant, so
+        the formula is written down in exactly one place.
+
+        *cap* is ``MergeDeepConfig.chain_cap`` read live off the dispatching
+        item's config (never cached at construction); *queue_len* is the
+        1-indexed count INCLUDING the dispatching item, i.e.
+        ``1 + len(chain_snapshot())``.
+
+        Pure/synchronous (no await, no I/O) — the git work lives in
+        :meth:`_deep_chain_placement`, which calls this to decide whether any
+        of it is worth doing.
+        """
+        return select_chain_depth(cap, queue_len, self._chain_halving_state)
 
     def _available_built_depth(self) -> int:
         """Return the deepest already-built speculative cumulative stack depth.
