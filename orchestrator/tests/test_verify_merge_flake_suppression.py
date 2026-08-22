@@ -17,6 +17,7 @@ monkeypatched so no real subprocess runs).
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -1125,6 +1126,66 @@ class TestLocalRunnerMergeFlakeSuppressionHook:
         run_unscoped.assert_awaited_once()
         assert result.passed is False
         assert result.category == UNSCOPED_TYPECHECK_FAILED_CATEGORY
+
+    # -- the suppression must SURVIVE an independent unscoped-gate red -----
+
+    def test_suppression_survives_a_broken_unscoped_gate(self, tmp_path: Path) -> None:
+        """A suppressed scoped red followed by a BROKEN unscoped typecheck gate
+        must still carry the observation to the dispatcher.
+
+        run_merge_verify constructs a FRESH VerifyResult on the gate.broken
+        branch, which would drop the field — and that would silently REGRESS an
+        emission that happens today, since before task ε the suppression had
+        already emitted inline by this point. It is also the compound failure
+        most likely to occur under load, so dropping it here would under-count
+        the ledger and disarm the INV-4 streak exactly when it matters most.
+        """
+        from orchestrator import verify as verify_module
+        from orchestrator.flake_ledger import FlakeVerdict
+        from orchestrator.verify_runner import UNSCOPED_TYPECHECK_FAILED_CATEGORY
+
+        s, _confirm = TestApplyMergeFlakeSuppression._confirming(
+            FlakeVerdict.passes_in_isolation,
+        )
+        suppressed = _result(True, category='merge_flake_suppressed')
+        suppressed = dataclasses.replace(suppressed, flake_suppression=s)
+
+        runner, _run_scoped, run_unscoped = _make_hook_runner(
+            tmp_path, scoped_result=_result(False), unscoped_gate=_broken_unscoped_gate(),
+        )
+        apply = AsyncMock(return_value=suppressed)
+
+        with patch.object(verify_module, 'apply_merge_flake_suppression', apply):
+            result = asyncio.run(runner.run_merge_verify(_MERGE_VERIFY_SHA, _merge_spec()))
+
+        run_unscoped.assert_awaited_once()
+        assert result.passed is False
+        assert result.category == UNSCOPED_TYPECHECK_FAILED_CATEGORY
+        assert result.flake_suppression is s, result
+
+    def test_suppression_survives_a_clean_unscoped_gate(self, tmp_path: Path) -> None:
+        """The mirrored positive: the ordinary suppressed pass carries it too."""
+        from orchestrator import verify as verify_module
+        from orchestrator.flake_ledger import FlakeVerdict
+
+        s, _confirm = TestApplyMergeFlakeSuppression._confirming(
+            FlakeVerdict.passes_in_isolation,
+        )
+        suppressed = dataclasses.replace(
+            _result(True, category='merge_flake_suppressed'), flake_suppression=s,
+        )
+
+        runner, _run_scoped, _run_unscoped = _make_hook_runner(
+            tmp_path, scoped_result=_result(False),
+        )
+        apply = AsyncMock(return_value=suppressed)
+
+        with patch.object(verify_module, 'apply_merge_flake_suppression', apply):
+            result = asyncio.run(runner.run_merge_verify(_MERGE_VERIFY_SHA, _merge_spec()))
+
+        assert result.passed is True
+        assert result.category == 'merge_flake_suppressed'
+        assert result.flake_suppression is s, result
 
     # -- (b) non-suppression is byte-identical to today's short-circuit ----
 
