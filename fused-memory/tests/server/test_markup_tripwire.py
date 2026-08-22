@@ -43,10 +43,9 @@ _STORM = {
 }
 
 #: The shape the ONE live producer actually sends — ``project``/``outcome``,
-#: singular, no ``projects``. ``shared.mcp_markup_middleware`` declares THREE
-#: storm outcomes (:135-138) and fires ``_record_storm`` for each of them
-#: (:497, :513, :520), so all three arrive at this one filer and it may not
-#: hardcode any of them.
+#: singular, no ``projects``. ``shared.mcp_markup_middleware`` enumerates its
+#: storm outcomes in ``OUTCOMES`` and records one for each of them, so every
+#: one arrives at this filer and it may hardcode none of them.
 _REJECTED_STORM = {
     'count': 3,
     'threshold': 3,
@@ -302,14 +301,11 @@ class TestEmitMarkupStormEscalation:
 
     # -- outcome fidelity (task 4505) -----------------------------------
     #
-    # The middleware fires a storm for each of THREE outcomes — 'repaired',
-    # 'rejected', 'unrepairable' (mcp_markup_middleware.py:135-138, recorded at
-    # :497, :513, :520) — and every one reaches this single filer. A 'repaired'
-    # burst is a burst of calls that all SUCCEEDED (the middleware says so at
-    # :899), so a record describing them as rejections states a number the
-    # triager cannot reproduce: grepping their own journal for rejections finds
-    # zero. Naming an outcome the burst did not have is the same defect as
-    # stating a count the burst did not have.
+    # Every outcome in shared.mcp_markup_middleware.OUTCOMES reaches this ONE
+    # filer, because MarkupGuardMiddleware records a storm for each of them.
+    # The rule, its history and the stem-vs-'rejected' trap are stated ONCE, on
+    # test_each_outcome_names_itself_and_no_other below; the tests around it pin
+    # halves of that rule and deliberately do not restate it.
 
     @staticmethod
     def _filed(tmp_path, storm) -> dict:
@@ -488,7 +484,7 @@ class TestEmitMarkupStormEscalation:
         """Asserted against the SUMMARY ONLY — never the detail — because that
         is all a compact consumer is given.
 
-        escalation/src/escalation/server.py:409-420 projects `summary` into both
+        `escalation.server` projects `summary` into both
         `_COMPACT_ESCALATION_FIELDS` and `_COMPACT_PENDING_FIELDS` and
         explicitly DROPS `detail` as "the unbounded free-text field that
         motivated compact mode". So the L1 escalation watcher and
@@ -529,14 +525,14 @@ class TestEmitMarkupStormEscalation:
         indistinguishable from "the leak stopped", the one conclusion this
         record exists to prevent.
 
-        'markup_guard_storm' is the real token, emitted by BOTH live producers:
-        shared/src/shared/mcp_markup_middleware.py:682 and
-        fused-memory/src/fused_memory/server/markup_guard.py:383,397. The
-        per-call companion line is `markup guard: <outcome> tool=... agent_id=...
-        project=...` (mcp_markup_middleware.py:615-619). The sibling filer
-        already gets this right — orchestrator/src/orchestrator/mcp/plan_tools.py:1849
-        points operators at 'markup guard:' and 'markup_guard_storm' — so the
-        correct text is precedent here, not invention.
+        'markup_guard_storm' is the real token, logged by BOTH live producers:
+        `MarkupGuardMiddleware._record_storm`'s own line and
+        `markup_guard._escalation_sink`. The per-call companion line is
+        `markup guard: <outcome> tool=... agent_id=... project=...`, written by
+        the same middleware. The sibling filer already gets this right —
+        `plan_tools._markup_storm_detail` points operators at 'markup guard:'
+        and 'markup_guard_storm' — so the correct text is precedent here, not
+        invention.
         """
         if not markup_tripwire.HAS_ESCALATION:
             assert emit_markup_storm_escalation(str(tmp_path), _REJECTED_STORM) is None
@@ -552,8 +548,8 @@ class TestEmitMarkupStormEscalation:
         )
         assert 'markup_guard_storm' in pointers, (
             f'the record must name the token its own producers actually log '
-            f'(mcp_markup_middleware.py:682, markup_guard.py:383,397): '
-            f'{pointers!r}'
+            f'(MarkupGuardMiddleware._record_storm and '
+            f'markup_guard._escalation_sink): {pointers!r}'
         )
 
     def test_a_storm_of_unknown_outcome_claims_no_outcome_it_did_not_measure(

@@ -220,23 +220,26 @@ def emit_markup_storm_escalation(
 
     That rule binds EVERY operator-facing field on the record — ``summary``,
     ``detail`` AND ``suggested_action`` — not just the sentence carrying the
-    number. ``suggested_action`` is no afterthought: ``escalation/server.py``
-    :409-414 lists it in ``_COMPACT_ESCALATION_FIELDS`` beside ``summary`` and
-    :420 carries both into ``_COMPACT_PENDING_FIELDS``, while ``detail`` is
-    dropped BY NAME as the unbounded free-text field, so a compact consumer that
-    never sees the detail still reads it. Task 4505 fixed the summary first and
-    left two rejection-framed sentences behind in the other two fields; a fourth
-    sentence added here must not repeat that.
+    number. ``suggested_action`` is no afterthought: ``escalation.server`` lists
+    it in ``_COMPACT_ESCALATION_FIELDS`` beside ``summary`` and carries both
+    into ``_COMPACT_PENDING_FIELDS``, while ``detail`` is dropped BY NAME as the
+    unbounded free-text field, so a compact consumer that never sees the detail
+    still reads it. Task 4505 fixed the summary first and left two
+    rejection-framed sentences behind in the other two fields; a fourth sentence
+    added here must not repeat that.
 
     The grep tokens those sentences name must also be ones an emitter actually
     writes. They pointed at ``markup_tripwire_storm``, whose only occurrence in
     the repo was the instruction prescribing it — a triager who followed it
     found zero lines, indistinguishable from "the leak stopped". The live tokens
-    are ``markup_guard_storm`` (``mcp_markup_middleware.py``:682,
-    ``markup_guard.py``:383,397) and the per-call ``markup guard: <outcome>
-    tool=... agent_id=... project=...`` line (``mcp_markup_middleware.py``
-    :615-619). Keep them STATIC — never interpolate the resolved outcome into a
-    suggested grep, for the reason the detail's ``count=`` key is static.
+    are ``markup_guard_storm`` — logged by
+    :meth:`shared.mcp_markup_middleware.MarkupGuardMiddleware._record_storm`,
+    again by :mod:`fused_memory.server.markup_guard`'s escalation sink, and
+    again here when a burst is suppressed — and the per-call
+    ``markup guard: <outcome> tool=... agent_id=... project=...`` line the same
+    middleware writes beside it. Keep them STATIC — never interpolate the
+    resolved outcome into a suggested grep, for the reason the detail's
+    ``count=`` key is static.
 
     NEVER raises. This is called from an MCP write path whose rejection has
     already been decided, so escalation is purely additive: every failure mode
@@ -362,8 +365,8 @@ def emit_markup_storm_escalation(
     )
     detail = '\n'.join([
         f'project_root={project_root!r}',
-        # The producer keys one StormCounter per (project, outcome) pair
-        # (mcp_markup_middleware.py:648-652), so this window holds ONE project's
+        # MarkupGuardMiddleware._record_storm keys one StormCounter per
+        # (project, outcome) pair, so this window holds ONE project's
         # events for ONE outcome: the count below is this project_root's own
         # contribution, and an operator can reproduce it by grepping this
         # project's own `markup guard: <outcome> tool=... project=...` lines.
@@ -428,9 +431,9 @@ def emit_markup_storm_escalation(
             agent_role=_AGENT_ROLE,
             severity='blocking',
             category=_CATEGORY,
-            # The summary is the ONLY field a compact consumer is projected —
-            # escalation/server.py:409-420 drops `detail` by name — so it has
-            # to answer how many, of what, and for whom on its own.
+            # The summary is the ONLY field a compact consumer is projected
+            # besides suggested_action (see the docstring's compact-tier note),
+            # so it has to answer how many, of what, and for whom on its own.
             summary=(
                 f'{count} MCP write(s) {outcome or "flagged"} for leaked '
                 f'envelope markup in this project in {window_seconds}s '
@@ -439,15 +442,12 @@ def emit_markup_storm_escalation(
                 'active (see plans/toolcall-markup-containment-prd.md)'
             ),
             detail=detail,
-            # Compact-projected BESIDE the summary (escalation/server.py:409-414
-            # lists it in _COMPACT_ESCALATION_FIELDS; :420 carries both into
-            # _COMPACT_PENDING_FIELDS) while `detail` is dropped by name — so
-            # the outcome-fidelity rule binds here exactly as it binds the
-            # summary, and the grep tokens must be ones an emitter writes.
-            # STATIC, never interpolated with the resolved outcome: an
-            # operator-facing hint whose text varies with the data cannot be
-            # grepped without already knowing the answer, and an unmeasured
-            # outcome would render `markup guard: None`.
+            # Compact-projected BESIDE the summary, so the outcome-fidelity
+            # rule and the live-grep-token rule both bind here — the docstring
+            # states both once. STATIC, never interpolated with the resolved
+            # outcome: an operator-facing hint whose text varies with the data
+            # cannot be grepped without already knowing the answer, and an
+            # unmeasured outcome would render `markup guard: None`.
             suggested_action=(
                 'identify the leaking caller from the markup guard logs — grep '
                 "'markup_guard_storm' for this burst and 'markup guard:' for "

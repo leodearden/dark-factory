@@ -656,16 +656,14 @@ class TestStormEscape:
         contributed 1 to, because the retired ``MarkupStormCounter`` held one
         window per SERVER. Task 4458 replaced it with
         ``MarkupGuardMiddleware._record_storm``, which keys one ``StormCounter``
-        per ``(project, outcome)`` pair (mcp_markup_middleware.py:648-652) — so
-        the count is now per-project. That correctness is INCIDENTAL to a keying
+        per ``(project, outcome)`` pair — so the count is now per-project. That correctness is INCIDENTAL to a keying
         choice made for a different reason (separating the three outcomes) and
         is untested; a future re-pool, or a re-key by outcome alone, would bring
         the incident back with nothing failing.
 
         The numbers are derived, not chosen. ``_BURST`` is 3 in a 3600s window
         and ``StormCounter.record()`` fires EXACTLY when the in-window count
-        reaches the threshold, then rate-limits for the rest of the window
-        (storm_counter.py:132-139). Counted independently, proj_a reaches 3 on
+        reaches the threshold, then rate-limits for the rest of the window. Counted independently, proj_a reaches 3 on
         the fifth call and fires with count=3, while proj_b only ever reaches 2
         and never fires at all. Pooled, the THIRD call — proj_b's first — would
         have crossed the threshold and filed a record for proj_b stating 3.
@@ -708,7 +706,7 @@ class TestStormEscape:
             f'the count is a count of ONE outcome; name it: {detail!r}'
         )
         # summary is the ONLY field a compact consumer is projected
-        # (escalation/server.py:409-420 drops `detail` by name), so the scope
+        # (`escalation.server` drops `detail` by name), so the scope
         # marker has to live there or the L1 watcher never sees it.
         assert 'in this project' in summary, (
             f'the summary must scope the count to this project: {summary!r}'
