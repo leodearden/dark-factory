@@ -14,9 +14,10 @@ Each of these reads globs ``<config_dir>/projects/*/<session_id>.jsonl``, opens
 the whole file and ``json.loads`` every line — a 1.0-1.3 MB JSONL for a mature
 agent session.  Executed inline on the loop by up to ``max_concurrent_tasks``
 agents, that blocking work starves every other coroutine in the process.  The
-sibling rationale is stated at ``orchestrator/src/orchestrator/harness.py:7965``
-(``run_substrate_recheck``), and the invariant itself is restated in the source at
-the top of ``_run_subprocess``'s watchdog poll loop.
+sibling rationale is stated at ``run_substrate_recheck`` in
+``orchestrator/src/orchestrator/harness.py``, and the invariant itself is stated
+once in the source, in the INVARIANT block above ``_run_subprocess``'s watchdog
+poll loop.
 
 HOW IT IS TESTED — thread identity, not wall clock
 ──────────────────────────────────────────────────
@@ -25,7 +26,7 @@ transcript function records ``threading.get_ident()`` on each call, and the test
 asserts none of the recorded idents equals the ident of the thread running the
 event loop.  This is load-independent and encodes the property directly.
 
-That choice is deliberate.  ``orchestrator/tests/test_liveness_boundary_gate.py:352-358``
+That choice is deliberate.  ``orchestrator/tests/test_liveness_boundary_gate.py``
 records a documented history of load-flakiness in exactly this code — "6.98s wall
 for a kill the watchdog itself measured at 0.1s — correct behaviour reported red
 by scheduling noise outside the code under test" — naming seven prior tasks
@@ -38,9 +39,14 @@ PATCH-TARGET DISCIPLINE.  Every patch below uses the module-global string target
 ``asyncio.to_thread(count_transcript_turns, ...)`` resolves that global at CALL
 time, so the patches keep working.  A ``functools.partial`` or module-scope alias
 built at import time in ``cli_invoke.py`` would capture the REAL function and
-silently defeat these patches (and the 10 pre-existing ones in
+silently defeat these patches (and the pre-existing ones in
 ``test_cli_invoke.py``) — the tests would do real filesystem reads against empty
 tmp_path dirs instead of failing loudly.
+
+ANCHOR POLICY.  Every reference to another file below names the enclosing
+function, class or branch — never a line number.  Line pins into ``cli_invoke.py``
+go stale on the next edit to either file and then send a reader chasing a failure
+message into unrelated code; symbolic anchors survive.  Do not reintroduce them.
 """
 
 from __future__ import annotations
@@ -50,13 +56,14 @@ import contextlib
 import threading
 import time
 import uuid
+import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from shared.cli_invoke import _run_subprocess
 
 # ── Fake process builders ───────────────────────────────────────────────────
 # Copied in spirit from TestRunSubprocessWatchdog._make_hanging_proc
-# (shared/tests/test_cli_invoke.py:3783) so this file stands alone, matching how
+# (in shared/tests/test_cli_invoke.py) so this file stands alone, matching how
 # test_cli_invoke_background.py / test_cli_invoke_sandbox_wrap.py each carry
 # their own fixtures rather than importing across test modules.
 
@@ -83,11 +90,13 @@ def _make_hanging_proc():
     return proc, call_count
 
 
-def _make_delayed_success_proc(delay_secs, stdout_bytes=b'{"type":"result","subtype":"success"}'):
+def _make_delayed_success_proc(
+    delay_secs, stdout_bytes=b'{"type":"result","subtype":"success"}', *, returncode=0
+):
     """Return a proc whose communicate() sleeps *delay_secs* then succeeds once.
 
     Mirrors ``TestRunSubprocessWorkingRegimeProgressExtension._make_delayed_success_proc``
-    (test_cli_invoke.py:4056).  Used where a test must observe the watchdog POLL
+    (in test_cli_invoke.py).  Used where a test must observe the watchdog POLL
     reads in isolation: the run leaves the loop via ``comm_task in done`` and
     never enters the ``except TimeoutError:`` handler, so the handler's own
     one-shot re-read cannot land in the recorded-ident list.
@@ -102,7 +111,12 @@ def _make_delayed_success_proc(delay_secs, stdout_bytes=b'{"type":"result","subt
     proc.terminate = MagicMock()
     proc.kill = MagicMock()
     proc.wait = AsyncMock()
-    proc.returncode = 0
+    # returncode is a knob so a caller can build a proc that COMPLETED but whose
+    # returncode still reads None — see
+    # TestCancellationDuringOffLoopRead::test_cancel_during_normal_exit_read_leaves_the_group_alone,
+    # which needs the outer cancel handler's `if proc.returncode is None:` guard
+    # to be TRUE so that a would-be reap is observable.
+    proc.returncode = returncode
     proc.pid = 12345
     return proc
 
@@ -121,7 +135,7 @@ def _ident_recorder_growing(recorded: list[int]):
     ident and returning a MONOTONICALLY GROWING count (1, 2, 3, ...).
 
     Mirrors ``TestRunSubprocessWorkingRegimeProgressExtension._always_growing_turns``
-    (test_cli_invoke.py:4094).  Growing counts latch ``seen_turn`` on call 1 and
+    (in test_cli_invoke.py).  Growing counts latch ``seen_turn`` on call 1 and
     keep refreshing ``last_progress_monotonic`` on every later call, so every
     call after the first takes the ``elif extension_engaged`` branch and the run
     is never idle-killed.
@@ -140,8 +154,8 @@ def _ident_recorder(recorded: list[int], return_value):
     """A sync ``count_transcript_turns`` stand-in appending the CALLING thread's
     ident to *recorded* and returning *return_value*.
 
-    Same closure shape as the existing side-effect idiom at
-    ``test_cli_invoke.py:4094`` (``_always_growing_turns``).  Under
+    Same closure shape as the existing ``_always_growing_turns`` side-effect
+    idiom in ``test_cli_invoke.py``.  Under
     ``asyncio.to_thread`` these list mutations happen on a worker thread; that
     stays correct because at most one read is in flight per ``_run_subprocess``
     and the ``await`` establishes happens-before on both sides.  A future test
@@ -156,8 +170,8 @@ def _ident_recorder(recorded: list[int], return_value):
 
 
 class TestStartupRegimePollOffLoop:
-    """The startup-regime watchdog poll (``cli_invoke.py:2842``, inside
-    ``if not seen_turn and config_dir and session_id:``) must read off the loop."""
+    """The startup-regime watchdog poll in ``_run_subprocess`` — the read inside
+    ``if not seen_turn and config_dir and session_id:`` — must run off the loop."""
 
     async def test_startup_poll_reads_transcript_off_the_loop_thread(self, tmp_path):
         """Every startup-regime ``count_transcript_turns`` call runs on a worker thread.
@@ -169,8 +183,8 @@ class TestStartupRegimePollOffLoop:
 
         The process COMPLETES rather than hanging, deliberately.  The run then
         leaves the watchdog loop via ``comm_task in done`` and never enters the
-        ``except TimeoutError:`` handler, whose own one-shot re-read
-        (cli_invoke.py:2970) is a DIFFERENT site owned by step-5/step-6 — with a
+        ``except TimeoutError:`` handler, whose own one-shot re-read is a
+        DIFFERENT site (covered by TestTimeoutPathRereadOffLoop) — with a
         hanging proc that handler's still-on-loop read lands in ``recorded`` and
         this test would be asserting two sites at once.  The normal-exit path
         reads via ``read_transcript_records``, a different module global that is
@@ -206,7 +220,7 @@ class TestStartupRegimePollOffLoop:
         assert recorded, 'Expected the startup-regime poll to read the transcript at least once'
         assert loop_ident not in recorded, (
             f'count_transcript_turns ran on the event-loop thread ({loop_ident}) — '
-            f'the startup-regime poll at cli_invoke.py:2842 blocks the shared loop. '
+            f'the startup-regime poll in _run_subprocess blocks the shared loop. '
             f'Recorded idents: {sorted(set(recorded))}'
         )
 
@@ -226,7 +240,7 @@ class TestStartupRegimePollOffLoop:
         anything.  If it runs off-loop, ~100 ticks are expected at a 5ms cadence
         over 0.5s, so ``>= 1`` carries roughly 50x headroom and is immune to the
         scheduling noise that made the wall-clock proxies at
-        ``test_liveness_boundary_gate.py:407-415`` load-fragile.  Raising this
+        ``test_liveness_boundary_gate.py`` load-fragile.  Raising this
         bound would trade that structural guarantee for a load-sensitive one.
         """
         sid = str(uuid.uuid4())
@@ -282,8 +296,9 @@ class TestStartupRegimePollOffLoop:
 
 
 class TestWorkingRegimeExtensionPollOffLoop:
-    """The working-regime progress-extension poll (``cli_invoke.py:2850``, inside
-    ``elif extension_engaged and config_dir and session_id:``) must read off the loop.
+    """The working-regime progress-extension poll in ``_run_subprocess`` — the read
+    inside ``elif extension_engaged and config_dir and session_id:`` — must run off
+    the loop.
 
     THIS IS THE HIGHEST-VALUE SITE IN PRODUCTION.
     ``orchestrator/src/orchestrator/workflow.py`` passes BOTH ``working_idle_secs``
@@ -312,7 +327,7 @@ class TestWorkingRegimeExtensionPollOffLoop:
 
         The process COMPLETES rather than hanging, for the same reason as the
         startup-poll test: a cap/idle kill would route through the
-        ``except TimeoutError:`` handler whose own re-read (cli_invoke.py:2970) is
+        ``except TimeoutError:`` handler whose own one-shot re-read is
         step-5/step-6's site, and its ident would land in ``recorded`` and make
         this test assert two sites at once.
         """
@@ -360,15 +375,15 @@ class TestWorkingRegimeExtensionPollOffLoop:
         )
         assert loop_ident not in recorded, (
             f'count_transcript_turns ran on the event-loop thread ({loop_ident}) — '
-            f'the working-regime progress-extension poll at cli_invoke.py:2850 blocks '
+            f'the working-regime progress-extension poll in _run_subprocess blocks '
             f'the shared loop for every agent, for its entire working lifetime. '
             f'Recorded idents: {sorted(set(recorded))}'
         )
 
 
 class TestTimeoutPathRereadOffLoop:
-    """The one-shot post-kill re-read (``cli_invoke.py:2970``, inside the
-    ``except TimeoutError:`` handler) must read off the loop.
+    """The one-shot post-kill re-read inside ``_run_subprocess``'s
+    ``except TimeoutError:`` handler must run off the loop.
 
     This read stamps ``transcript_turns`` onto the returned ``_SubprocessResult``,
     which ``classify_agent_failure`` surfaces in its ``diagnostic_detail`` — so
@@ -422,7 +437,8 @@ class TestTimeoutPathRereadOffLoop:
         )
         assert loop_ident not in recorded, (
             f'count_transcript_turns ran on the event-loop thread ({loop_ident}) — the '
-            f'post-kill re-read at cli_invoke.py:2970 blocks the shared loop. '
+            f'post-kill re-read in the except-TimeoutError handler blocks the shared '
+            f'loop. '
             f'Recorded idents: {sorted(set(recorded))}'
         )
 
@@ -433,7 +449,7 @@ class TestTimeoutPathRereadOffLoop:
         short-circuits: no read happens at all, so no thread hop is paid when
         there is nothing to read, and ``transcript_turns`` stays None.  Mirrors
         ``test_run_subprocess_transcript_turns_none_when_no_session_id``
-        (test_cli_invoke.py:1842).
+        (in test_cli_invoke.py).
         """
         cfg_dir = tmp_path / 'cfg'
         cfg_dir.mkdir()
@@ -472,7 +488,7 @@ class TestTimeoutPathRereadOffLoop:
 # ── Normal-exit fixture ─────────────────────────────────────────────────────
 # Two assistant records whose tail is an unreaped background launch.  Borrowed
 # from TestDetectEndedAwaitingBackground::test_single_abandoned_launch_is_true
-# (test_cli_invoke_background.py:99) so the expected ended_awaiting_background
+# (in test_cli_invoke_background.py) so the expected ended_awaiting_background
 # value is one the detector's own suite already pins, not one invented here.
 #   → transcript_turns == 2 (two type='assistant' records)
 #   → ended_awaiting_background is True (launch never followed by a reap)
@@ -499,8 +515,8 @@ _ABANDONED_LAUNCH_RECORDS = [
 
 
 class TestNormalExitReadOffLoop:
-    """The normal-exit read (``cli_invoke.py:3033``, ``read_transcript_records``)
-    must read off the loop.
+    """The normal-exit ``read_transcript_records`` call in ``_run_subprocess`` —
+    after the watchdog loop, outside both try blocks — must run off the loop.
 
     This site had NO direct assertion anywhere in the repo before task 3925 — no
     test patched ``shared.cli_invoke.read_transcript_records``, and the only
@@ -558,7 +574,7 @@ class TestNormalExitReadOffLoop:
         )
         assert loop_ident not in recorded, (
             f'read_transcript_records ran on the event-loop thread ({loop_ident}) — the '
-            f'normal-exit read at cli_invoke.py:3033 blocks the shared loop. '
+            f'normal-exit read in _run_subprocess blocks the shared loop. '
             f'Recorded idents: {sorted(set(recorded))}'
         )
         assert result.transcript_turns == 2, (

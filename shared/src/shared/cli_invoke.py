@@ -92,6 +92,14 @@ _WATCHDOG_WORKING_POLL_SECS = 60.0
 # 60s per poll) and, in the startup regime, would fire ~15s after spawn — inside
 # the MCP-init window a healthy stage routinely spends before the CLI writes its
 # first record.  See `note_unreadable_transcript`.
+# Saturation alarm for the off-loop transcript reads (task 3925).  A read that
+# takes this long is not "a big transcript" — a 1.0-1.3 MB parse is ~10-30ms —
+# it means the shared default ThreadPoolExecutor is backed up, which delays the
+# watchdog's kill decisions by however long the pool made the read wait.
+# Deliberately a FLAT threshold rather than "longer than the poll interval":
+# the working-regime poll is 60s, so a poll-relative yardstick would mask a 5s
+# read that already indicates a badly saturated executor.
+_WATCHDOG_SLOW_READ_WARN_SECS = 1.0
 # Per-caller cap-wait policy (post-1365 audit, task 1401)
 # ─────────────────────────────────────────────────────────────────────────────
 # _DEFAULT_CAP_WAIT_SANITY_SECS (14 days) is inherited by callers that do NOT
@@ -3255,6 +3263,24 @@ def _materialize_stdin(stdin_data: bytes) -> IO[bytes]:
     return ro
 
 
+def _warn_if_transcript_read_slow(read_secs: float, site: str, model: str) -> None:
+    """Make executor saturation on the off-loop transcript reads observable (task 3925).
+
+    The watchdog is a LIVENESS mechanism, and since its transcript reads moved to
+    ``asyncio.to_thread`` its cadence depends on the shared default executor's
+    availability (see the EXECUTOR DEPENDENCY note in ``_run_subprocess``).  A
+    queued read delays the wedge / idle / absolute-cap kill decision by however
+    long the pool makes it wait.  That degradation is otherwise invisible; log it.
+    """
+    if read_secs >= _WATCHDOG_SLOW_READ_WARN_SECS:
+        logger.warning(
+            f'Off-loop transcript read took {read_secs:.1f}s at the {site} '
+            f'(warn threshold={_WATCHDOG_SLOW_READ_WARN_SECS}s, model={model}) — the shared '
+            f'default ThreadPoolExecutor is likely saturated, delaying watchdog kill '
+            f'decisions by that much.'
+        )
+
+
 async def _run_subprocess(
     cmd: list[str],
     cwd: Path,
@@ -3372,29 +3398,54 @@ async def _run_subprocess(
             comm_task = asyncio.ensure_future(proc.communicate())
 
             # ── INVARIANT (task 3925): every transcript read below is OFF-LOOP ─
-            # All four transcript reads in _run_subprocess — the two watchdog
-            # polls in this loop, the one-shot re-read in the except-TimeoutError
-            # handler, and the normal-exit read after it — go through
-            # `await asyncio.to_thread(...)`.  They are blocking whole-file reads
-            # (glob + open + json.loads per line; 1.0-1.3 MB for a mature
-            # session), and the orchestrator runs EVERY role of EVERY concurrent
-            # task on ONE event loop (orchestrator/src/orchestrator/cli.py,
-            # `asyncio.run(_main())`), so an inline read stalls every other
-            # agent's I/O for its whole duration.  Sibling offloads of the same
-            # shape: harness.py:7965 (run_substrate_recheck) and
-            # harness.py:10925 (write_heartbeat).  The deliberate COUNTER-example
-            # is workflow.py:12475-12487, whose archive hook is synchronous on
-            # purpose — it is a WRITE, and the to_thread there was a cancellation
-            # point that lost transcripts.  These four are side-effect-free READS,
-            # so that argument does not transfer.
+            # THE authoritative statement of this invariant.  The four call
+            # sites below point back here with one-liners instead of restating
+            # it; keep it that way — duplicated prose drifts independently.
             #
-            # Pass the function as a BARE POSITIONAL REFERENCE
-            # (`asyncio.to_thread(count_transcript_turns, config_dir, session_id)`).
-            # Do NOT hoist a functools.partial or a module-scope alias: that would
-            # bind the real function at import time and silently defeat every
-            # existing `patch('shared.cli_invoke.count_transcript_turns', ...)`
-            # module-global patch, which would then do real FS reads against
-            # empty tmp_paths and pass vacuously.
+            # WHAT.  All four transcript reads in _run_subprocess (the two
+            # watchdog polls in this loop, the one-shot re-read in the
+            # except-TimeoutError handler, and the normal-exit read after it) go
+            # through `await asyncio.to_thread(...)`.
+            #
+            # WHY.  Each is a blocking whole-file read — glob + open +
+            # json.loads per line, 1.0-1.3 MB for a mature session — and the
+            # orchestrator runs EVERY role of EVERY concurrent task on ONE event
+            # loop (orchestrator/src/orchestrator/cli.py, `asyncio.run(_main())`),
+            # so an inline read stalls every other agent's I/O for its whole
+            # duration.  Sibling offloads of the same shape: `run_substrate_recheck`
+            # and `write_heartbeat` in orchestrator/src/orchestrator/harness.py.
+            # The deliberate COUNTER-example is the `archive_task_transcripts`
+            # hook in workflow.py's `_invoke` finally, kept synchronous on
+            # purpose: it is a WRITE whose in-flight transcripts a cancellation
+            # point would lose.  These four are side-effect-free READS, so that
+            # argument does not transfer.
+            #
+            # HOW TO SPELL IT.  Bare positional reference —
+            # `asyncio.to_thread(count_transcript_turns, config_dir, session_id)`.
+            # Do NOT hoist a functools.partial or a module-scope alias: that
+            # binds the real function at import time and silently defeats every
+            # `patch('shared.cli_invoke.count_transcript_turns', ...)` in the
+            # suites, which would then read real (empty) tmp_path dirs and pass
+            # vacuously instead of failing loudly.
+            #
+            # EXECUTOR DEPENDENCY.  to_thread dispatches to the loop's DEFAULT
+            # executor — one process-wide ThreadPoolExecutor
+            # (max_workers = min(32, cpu_count + 4)) shared with every other
+            # offload in the process.  Watchdog poll cadence, and hence how
+            # promptly a wedge / idle / absolute-cap kill DECISION is taken, now
+            # depends on executor availability: worst-case added latency per poll
+            # is the executor QUEUE DEPTH, not the read itself.  Two things bound
+            # that.  (1) The direction is fail-SAFE: saturation DELAYS a kill and
+            # can never manufacture a spurious one — the completion re-check
+            # after the two reads below closes the one window where a slow read
+            # could have turned a finished run into a reported timeout.  (2) It
+            # is observable rather than silent: every poll read is timed and
+            # logged at warning past _WATCHDOG_SLOW_READ_WARN_SECS.  A dedicated
+            # ThreadPoolExecutor for transcript reads was considered and NOT
+            # adopted: a small private pool trades contention with unrelated
+            # offloads for contention among these four reads (the normal-exit one
+            # is paid by every completing agent) and adds a process-global pool
+            # with no shutdown path.  Revisit if that warning ever fires.
             while True:
                 elapsed = time.monotonic() - watchdog_start
                 # Extension engages once liveness is proven (seen_turn) AND the
@@ -3479,18 +3530,12 @@ async def _run_subprocess(
                 # The post-kill transcript_turns re-read in the except block is
                 # unaffected — it is a separate, one-shot read outside this loop.
                 if not seen_turn and config_dir and session_id:
-                    # OFF-LOOP (task 3925).  count_transcript_turns globs
-                    # <config_dir>/projects/*/<session_id>.jsonl, opens the whole
-                    # file and json.loads every line — 1.0-1.3 MB for a mature
-                    # session.  The orchestrator runs every role of every
-                    # concurrent task on ONE event loop, so up to
-                    # max_concurrent_tasks agents would each block it inline
-                    # here.  Same rationale (and same to_thread shape) as the
-                    # run_substrate_recheck / write_heartbeat offloads in
-                    # orchestrator/src/orchestrator/harness.py.  See the INVARIANT
-                    # block above the poll loop before changing how this call is
-                    # spelled.
+                    # OFF-LOOP — see the task-3925 INVARIANT block above this loop.
+                    _read_started = time.monotonic()
                     n = await asyncio.to_thread(count_transcript_turns, config_dir, session_id)
+                    _warn_if_transcript_read_slow(
+                        time.monotonic() - _read_started, 'startup-regime poll', model
+                    )
                     if n is None:
                         if not unreadable_escape_fired:
                             unreadable_escape_fired = note_unreadable_transcript(
@@ -3508,17 +3553,19 @@ async def _run_subprocess(
                             last_progress_turns = n
                             last_progress_monotonic = time.monotonic()
                 elif extension_engaged and config_dir and session_id:
-                    # OFF-LOOP (task 3925) — same rationale as the branch above,
-                    # and this is the higher-frequency site in production:
-                    # workflow.py passes BOTH working_idle_secs and
-                    # absolute_cap_secs for every role, so extension_engaged
-                    # latches for every agent and this read fires every
-                    # _WATCHDOG_WORKING_POLL_SECS for the agent's entire working
-                    # lifetime (20-40 min is routine), against a transcript that
-                    # only grows.  The branches are kept separate on purpose: a
-                    # merged read would also fire on iterations where neither
-                    # branch applies.
+                    # OFF-LOOP — see the task-3925 INVARIANT block above this loop.
+                    # Site-specific: this is the higher-frequency read in
+                    # production — workflow.py passes BOTH extension params for
+                    # every role, so extension_engaged latches for every agent and
+                    # this fires every _WATCHDOG_WORKING_POLL_SECS for the whole
+                    # (routinely 20-40 min) working lifetime.  The two branches
+                    # stay separate on purpose: a merged read would also fire on
+                    # iterations where neither branch applies.
+                    _read_started = time.monotonic()
                     n = await asyncio.to_thread(count_transcript_turns, config_dir, session_id)
+                    _warn_if_transcript_read_slow(
+                        time.monotonic() - _read_started, 'working-regime extension poll', model
+                    )
                     if n is None:
                         if not unreadable_escape_fired:
                             unreadable_escape_fired = note_unreadable_transcript(
@@ -3533,6 +3580,26 @@ async def _run_subprocess(
                         if last_progress_turns is None or n > last_progress_turns:
                             last_progress_turns = n
                             last_progress_monotonic = time.monotonic()
+
+                # ── Completion re-check (task 3925) ─────────────────────────
+                # The two reads above are `await`s — a yield point that did NOT
+                # exist while they were synchronous.  comm_task can therefore now
+                # transition to done WHILE a read is in flight (and a read can be
+                # slow — see the EXECUTOR DEPENDENCY note above).  Falling through
+                # to the kill checks below would then cancel an already-finished
+                # task and raise TimeoutError, reporting timed_out=True and
+                # DISCARDING the captured stdout/result envelope for a run that
+                # actually succeeded — on exactly the boundary production runs hit
+                # most often.  Handle it the same way as the `comm_task in done`
+                # branch above: take the result and leave the loop.  result()
+                # re-raises a communicate() exception exactly as it does there, so
+                # the mocked-TimeoutError tests keep routing through the unchanged
+                # kill block.  No-op when neither read ran: with no await in
+                # between, comm_task cannot have completed since asyncio.wait
+                # returned it as pending.
+                if comm_task.done():
+                    stdout, stderr = comm_task.result()
+                    break
 
                 elapsed = time.monotonic() - watchdog_start
                 # Re-derive fresh (not the top-of-loop value) so a seen_turn
@@ -3659,14 +3726,8 @@ async def _run_subprocess(
                     f'Process terminated after {timeout_seconds}s timeout (SIGTERM); ' + stderr_text
                 )
             duration_ms = int(time.monotonic() * 1000) - start_ms
-            # OFF-LOOP (task 3925) — one-shot, but the same blocking glob +
-            # whole-file parse as the polls above, and it lands on the shared
-            # loop at the worst moment: a timeout kill is exactly when other
-            # agents' coroutines are queued behind it.  The guard is kept so no
-            # thread hop is paid when there is nothing to read.
-            #
-            # Cancellation: this handler already awaits (wait_for(communicate)
-            # above), so awaits here are established.  A CancelledError from the
+            # OFF-LOOP — see the task-3925 INVARIANT block above the poll loop.
+            # Site-specific cancellation note: a CancelledError from this
             # to_thread propagates out of the inner try/except into the outer
             # `except asyncio.CancelledError:` below, which cancels comm_task and
             # reaps the process group — the same treatment a cancel landing
@@ -3734,23 +3795,17 @@ async def _run_subprocess(
     #     success→failure downgrade.
     # Both fail safe when the transcript can't be located (records None →
     # transcript_turns None, ended_awaiting_background False).
-    # OFF-LOOP (task 3925) — the single largest of the four transcript reads:
-    # this one parses the FULL record list (not just a turn count) at the end of
-    # every successful run, so it is paid by every agent on every completion.
-    #
-    # Cancellation: unlike the other three sites this one is OUTSIDE both try
-    # blocks, so a CancelledError here is NOT caught by the
+    # OFF-LOOP — see the task-3925 INVARIANT block above the poll loop.  This is
+    # the largest of the four reads: it parses the FULL record list, and every
+    # successful run pays it.
+    # Site-specific cancellation note: unlike the other three this read sits
+    # OUTSIDE both try blocks, so a CancelledError here is NOT caught by the
     # `except asyncio.CancelledError:` handler above and propagates directly.
     # That is safe and needs no asyncio.shield: comm_task has already completed
     # (proc.communicate() returned), so the child has exited and been reaped —
     # there is no process group left to orphan.  The only loss is the
     # transcript_turns / ended_awaiting_background enrichment on a run that is
-    # being torn down anyway.  Note the deliberate contrast with the
-    # archive_task_transcripts hook in workflow.py's `_invoke` finally
-    # (:12475-12487), which now treats its to_thread as a liability: that one
-    # is a WRITE whose in-flight transcripts a cancel would lose.  These four
-    # are READS with no side effects, so that argument does not transfer and
-    # the offload remains correct here.
+    # being torn down anyway.
     transcript_records = (
         await asyncio.to_thread(read_transcript_records, config_dir, session_id)
         if (config_dir and session_id)
