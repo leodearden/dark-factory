@@ -305,11 +305,78 @@ async def _record_effect_divergence(
 _DIFFERENTIAL_CONFIRMED = 'made_true_by_this_commit'
 
 
+def _main_ref(git_ops: GitOps) -> str:
+    """The project's main BRANCH NAME, honouring ``config.main_branch``.
+
+    ``main`` is a configurable Pydantic field, not a constant, and a project
+    that sets it to anything else would otherwise have the differential's
+    third leg permanently dead: an unresolvable ref makes
+    ``run_delivered_check`` return ERRORED, which degrades to no_signal and
+    silently declines every upgrade, with no diagnostic saying why (amendment
+    pass, review finding).
+
+    The BRANCH NAME, deliberately not a sha resolved here — see
+    :func:`_delivered_checks_differential`'s docstring for why the third leg
+    must ask about HEAD *now*.
+
+    Falls back to ``'main'`` for a duck-typed ``git_ops`` stand-in carrying no
+    config (the shape several gate-wiring test files construct), which is the
+    pre-amendment behaviour rather than a crash.
+    """
+    ref = getattr(getattr(git_ops, 'config', None), 'main_branch', None)
+    return ref if isinstance(ref, str) and ref else 'main'
+
+
+async def _differential_parent_ref(
+    git_ops: GitOps, effect_check_sha: str, *, anchor_is_branch_tip: bool,
+) -> str:
+    """The ref that stands for "before this landing" in the differential.
+
+    ``<sha>^1`` for a MERGE-COMMIT or citation anchor: the first parent is
+    main-before-the-merge, exactly the pre-merge baseline the three-leg
+    sequence needs.
+
+    NOT ``^1`` for a BRANCH-TIP anchor, which DISCOVERY mode selects whenever
+    the citation is an in-branch work commit.  There ``tip^1`` is the branch's
+    own previous work commit, so the differential would ask "did the branch's
+    LAST commit make this true?" instead of "did this BRANCH make it true?".
+    For any multi-commit branch whose deliverable landed in an earlier commit
+    the parent leg then reads DELIVERED, the sequence fails, and the second
+    accept path silently never fires — for precisely the multi-commit shape
+    most likely to have tripped the survival heuristic in the first place
+    (amendment pass, review finding).  The branch's FORK POINT from main is
+    the honest baseline there.
+
+    Falls back to ``^1`` when the fork point cannot be resolved — a stand-in
+    git_ops without :meth:`~orchestrator.git_ops.GitOps.merge_base_with_main`,
+    a deleted branch, any git failure.  That is the pre-amendment behaviour:
+    a weaker baseline that can only cost an upgrade, never manufacture one.
+    """
+    parent_ref = f'{effect_check_sha}^1'
+    if not anchor_is_branch_tip:
+        return parent_ref
+    resolver = getattr(git_ops, 'merge_base_with_main', None)
+    if resolver is None:
+        return parent_ref
+    try:
+        fork_point = await resolver(effect_check_sha)
+    except Exception:
+        logger.warning(
+            'fork-point resolution failed for %s — the delivered-checks '
+            'differential falls back to its first parent',
+            effect_check_sha, exc_info=True,
+        )
+        return parent_ref
+    return fork_point if isinstance(fork_point, str) and fork_point else parent_ref
+
+
 async def _delivered_checks_differential(
     git_ops: GitOps,
     effect_check_sha: str,
     delivered_checks: list[dict[str, Any]],
     probe: dict[str, Any],
+    *,
+    anchor_is_branch_tip: bool = False,
 ) -> bool:
     """The SECOND accept path: did *effect_check_sha* MAKE a declared
     capability true? (task 3116 part b.)
@@ -319,10 +386,11 @@ async def _delivered_checks_differential(
     This is orthogonal POSITIVE evidence, and it is the task's OWN declared
     ground truth: run each ``metadata.delivered_checks`` entry at three refs —
 
-        ``<sha>^1``   the pre-merge parent (first parent of a merge; the
-                      commit's own parent for a non-merge — ``^1`` is both)
+        PARENT        the pre-branch baseline: ``<sha>^1`` for a merge-commit
+                      or citation anchor, the branch's FORK POINT for a
+                      branch-tip anchor (see :func:`_differential_parent_ref`)
         ``<sha>``     the citation itself
-        ``main``      current HEAD
+        MAIN          current HEAD, named by ``config.main_branch``
 
     — and confirm when a check was FALSE at the parent, TRUE at the citation
     and TRUE now.  That sequence is the whole signal: a check that merely
@@ -348,12 +416,20 @@ async def _delivered_checks_differential(
     commit removed as proof that this one delivered it — the exact
     double-inversion this docstring exists to prevent.
 
-    The ``main`` leg deliberately names the branch rather than a sha resolved
-    here: it asks whether the capability holds at HEAD *now*, which is the
-    question, and it matches ``run_delivered_check``'s own contract (grep is
-    evaluated against the committed tree at *ref*).  The first two legs are
-    immutable history, so a HEAD advance mid-differential can only change the
-    freshness of the third, not the "this commit made it true" core.
+    The main leg deliberately names the BRANCH (``config.main_branch``, via
+    :func:`_main_ref`) rather than a sha resolved here: it asks whether the
+    capability holds at HEAD *now*, which is the question, and it matches
+    ``run_delivered_check``'s own contract (grep is evaluated against the
+    committed tree at *ref*).  The first two legs are immutable history, so a
+    HEAD advance mid-differential can only change the freshness of the third,
+    not the "this commit made it true" core.
+
+    KILL SWITCH.  Honours ``config.delivered_checks.enabled``, the same flag
+    ``Harness._delivered_checks_withhold`` honours for the mark-done gate.
+    Without it, disabling the delivered-checks feature would still leave this
+    consumer of it running task-declared checks (amendment pass, review
+    finding).  A stand-in git_ops carrying no config reads as ENABLED, which
+    is the pre-amendment behaviour.
 
     LAZY import (``# noqa: PLC0415``), mirroring
     :func:`file_unattributed_landing_escalation`'s ``escalation.models``
@@ -371,15 +447,28 @@ async def _delivered_checks_differential(
     ``delivered_checks_error`` and logged, and declines the upgrade — the
     fail-safe direction for an accept path is to not accept.
     """
+    checks_config = getattr(getattr(git_ops, 'config', None), 'delivered_checks', None)
+    if not getattr(checks_config, 'enabled', True):
+        # Switched off fleet-wide. Recorded, never silent: an operator who
+        # disabled the feature must be able to see in the escalation that the
+        # second accept path was not merely unlucky.
+        probe['delivered_checks_legs'] = []
+        probe['delivered_checks_outcome'] = 'disabled'
+        return False
+
     from orchestrator.delivered_checks import (  # noqa: PLC0415
         DeliveredCheckResult,
         run_delivered_check,
     )
 
+    main_ref = _main_ref(git_ops)
     legs: list[dict[str, Any]] = []
     confirmed = False
     try:
-        parent_ref = f'{effect_check_sha}^1'
+        parent_ref = await _differential_parent_ref(
+            git_ops, effect_check_sha, anchor_is_branch_tip=anchor_is_branch_tip,
+        )
+        probe['delivered_checks_parent_ref'] = parent_ref
         for check in delivered_checks:
             kind = check.get('kind')
             if kind != 'grep':
@@ -400,7 +489,7 @@ async def _delivered_checks_differential(
             for label, ref in (
                 ('parent', parent_ref),
                 ('citation', effect_check_sha),
-                ('main', 'main'),
+                ('main', main_ref),
             ):
                 results[label] = await run_delivered_check(
                     check, project_root=git_ops.project_root, ref=ref,
@@ -485,6 +574,26 @@ async def validate_landing_evidence(
             acceptance and can NEVER do the reverse (b6: the interface stays
             binary — omitting this parameter reproduces the pre-task behaviour
             exactly).
+
+            STAGING, NAMED SO IT CANNOT GO PERMANENT (amendment pass, review
+            finding — as shipped by task 3116 NO production call site passes
+            this, so the whole second accept path is unreachable and the only
+            live effect is the escalation text "this call site is unwired").
+            The call sites are owned by other tasks and are deliberately not
+            edited here — task 3116 holds no lock on them:
+
+              task 4496  harness.py x4 (three ``_already_landed_dispatch_gate``
+                         arms + ``_reconcile_one_stranded``)
+              task 4497  merge_queue.py x1 (the coalesce re-drive)
+              task 4498  escalation/server.py x2 (``merge_status``'s
+                         git-authority arms)
+              task 4500  CAPSTONE — flips this parameter to REQUIRED and
+                         keyword-only once all seven are wired, so no future
+                         caller can inherit the default silently
+
+            If ``delivered_checks_state == 'unwired'`` is still appearing in
+            escalations after 4500 has landed, that is the bug: one of the
+            seven sites regressed to the default.
 
     Returns:
         A :class:`LandingEvidenceVerdict`.
@@ -580,16 +689,22 @@ async def validate_landing_evidence(
     # authoritative), or in the defensive case a DISCOVERY caller omitted
     # branch_tip_sha despite citation_on_branch.
     effect_check_sha = citation
+    anchor_is_branch_tip = False
     if citation_on_branch and branch_tip_sha is not None:
         effect_check_sha = branch_tip_sha
+        anchor_is_branch_tip = True
     probe['effect_check_sha'] = effect_check_sha
     if not await git_ops.commit_effect_present_in_main(effect_check_sha):
         await _record_effect_divergence(git_ops, effect_check_sha, probe)
         # SECOND ACCEPT PATH — anchored on the sha the survival check actually
         # ran against, so both modes ask the same question.  Inside the reject
-        # branch, so it is structurally upgrade-only (task 3116).
+        # branch, so it is structurally upgrade-only (task 3116).  The
+        # branch-tip flag travels with it because it decides what "before this
+        # landing" means: a tip's ^1 is the branch's own previous commit, not
+        # a pre-branch baseline (see _differential_parent_ref).
         if delivered_checks and await _delivered_checks_differential(
             git_ops, effect_check_sha, delivered_checks, probe,
+            anchor_is_branch_tip=anchor_is_branch_tip,
         ):
             return _accept(citation)
         return _reject('effect_absent')
@@ -864,7 +979,18 @@ def _render_delivered_checks_differential(
             'delivered-checks differential: not consulted (the effect check '
             'did not reject).\n\n'
         )
+    if outcome == 'disabled':
+        return (
+            'delivered-checks differential: NOT RUN — delivered_checks.enabled '
+            'is false in this project config, so the second accept path is '
+            'switched off (the same kill switch the mark-done delivered-check '
+            'gate honours). This landing was decided by line survival alone.'
+            '\n\n'
+        )
     lines = [f'delivered-checks differential: {outcome}']
+    parent_ref = verdict.probe.get('delivered_checks_parent_ref')
+    if parent_ref:
+        lines.append(f'  pre-landing baseline (the parent leg): {parent_ref}')
     for leg in verdict.probe.get('delivered_checks_legs') or []:
         name = leg.get('name')
         if 'parent' not in leg:

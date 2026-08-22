@@ -21,6 +21,7 @@ idiom keeps exercising the real (now-shared) helper logic.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -36,7 +37,14 @@ from orchestrator.landing_evidence import (
 
 
 def _git_ops(
-    *, citation, is_ancestor_map, effect_present, effect_probe=None,
+    *,
+    citation,
+    is_ancestor_map,
+    effect_present,
+    effect_probe=None,
+    main_branch='main',
+    delivered_checks_enabled=True,
+    fork_point=None,
 ) -> MagicMock:
     """Build a bare MagicMock git_ops with the three sub-methods the helper calls.
 
@@ -50,8 +58,24 @@ def _git_ops(
     kwarg is omitted, so every pre-3116 test keeps its exact call shape —
     which is also the live shape in the seven OTHER test files that stub only
     ``commit_effect_present_in_main`` on a bare MagicMock.
+
+    ``config`` is a REAL object, not a MagicMock attribute (amendment pass):
+    the differential now reads ``config.main_branch`` for its third leg and
+    ``config.delivered_checks.enabled`` for the kill switch, and an
+    auto-created MagicMock attribute would sail through both as a truthy
+    non-string.  ``fork_point`` stubs ``merge_base_with_main``; left UNSTUBBED
+    when omitted so the ``^1`` fallback stays exercised on the shape the other
+    gate-wiring files construct.
     """
     git_ops = MagicMock()
+    git_ops.config = SimpleNamespace(
+        main_branch=main_branch,
+        delivered_checks=SimpleNamespace(enabled=delivered_checks_enabled),
+    )
+    if fork_point is not None:
+        git_ops.merge_base_with_main = AsyncMock(return_value=fork_point)
+    else:
+        del git_ops.merge_base_with_main
     git_ops.find_task_citation_commit = AsyncMock(return_value=citation)
 
     async def _is_ancestor(a, b):
@@ -1349,6 +1373,12 @@ class TestValidateLandingEvidenceDeliveredChecksDifferential:
         """DISCOVERY mode rescues identically, anchored on the sha the
         SURVIVAL check actually ran against — the branch tip for an in-branch
         work-commit citation — so both modes ask the same question.
+
+        This git_ops carries NO ``merge_base_with_main`` (the shape the other
+        gate-wiring test files construct), so the parent leg falls back to
+        ``tip^1``.  The fallback is pinned deliberately: a stand-in without
+        the method must degrade to the weaker baseline, never raise and never
+        skip the differential.
         """
         branch = 'task/42'
         branch_tip_sha = 'f' * 40
@@ -1376,6 +1406,163 @@ class TestValidateLandingEvidenceDeliveredChecksDifferential:
         assert [ref for _name, ref in calls] == [
             f'{branch_tip_sha}^1', branch_tip_sha, 'main',
         ]
+
+    async def test_branch_tip_anchor_uses_the_fork_point_not_the_tips_parent(
+        self,
+    ) -> None:
+        """THE MULTI-COMMIT BRANCH — a branch tip's ``^1`` is NOT a baseline.
+
+        DISCOVERY mode anchors on the BRANCH TIP whenever the citation is an
+        in-branch work commit, and ``tip^1`` is then the branch's own previous
+        work commit.  For a two-commit branch whose deliverable landed in the
+        FIRST commit, the capability is already true at ``tip^1``: the parent
+        leg reads DELIVERED, the FAIL/PASS/PASS sequence never forms, and the
+        second accept path silently declines — for precisely the multi-commit
+        shape most likely to have tripped the survival heuristic in the first
+        place.
+
+        The branch's FORK POINT from main is the honest "before this landing"
+        ref, and this fixture is arranged so the two answers DISAGREE: FAILED
+        at the fork point, DELIVERED at ``tip^1``.  Anchoring on ``^1`` gives
+        no_signal; anchoring on the fork point rescues the landing.
+        """
+        branch = 'task/42'
+        branch_tip_sha = 'f' * 40
+        citation_sha = 'a' * 40
+        fork_point = '9' * 40
+        git_ops = _git_ops(
+            citation=citation_sha,
+            is_ancestor_map={(citation_sha, branch): True},
+            effect_present=False,
+            effect_probe=CommitEffectProbe(present=False, failure='effect_not_survived'),
+            fork_point=fork_point,
+        )
+        stub, calls = _check_runner({
+            fork_point: DeliveredCheckResult.FAILED,
+            # The deliverable landed in the branch's FIRST commit, so it is
+            # already true one commit back from the tip.
+            f'{branch_tip_sha}^1': DeliveredCheckResult.DELIVERED,
+            branch_tip_sha: DeliveredCheckResult.DELIVERED,
+            'main': DeliveredCheckResult.DELIVERED,
+        })
+
+        with patch('orchestrator.delivered_checks.run_delivered_check', stub):
+            verdict = await validate_landing_evidence(
+                git_ops, '42', branch, branch_tip_sha=branch_tip_sha,
+                delivered_checks=[_grep_check()],
+            )
+
+        git_ops.merge_base_with_main.assert_awaited_once_with(branch_tip_sha)
+        assert [ref for _name, ref in calls] == [
+            fork_point, branch_tip_sha, 'main',
+        ], 'the parent leg must be the fork point, not the tip\'s first parent'
+        assert verdict.accepted is True, (
+            'anchored on tip^1 this landing reads as no_signal and stays '
+            'rejected — the fork point is what makes the branch the subject '
+            'of the question'
+        )
+        assert verdict.probe['delivered_checks_parent_ref'] == fork_point
+
+    async def test_candidate_mode_keeps_the_first_parent_as_the_baseline(
+        self,
+    ) -> None:
+        """CANDIDATE mode anchors on a MERGE COMMIT, whose ``^1`` IS
+        main-before-the-merge — the correct pre-landing baseline.
+
+        So the fork-point substitution must NOT happen here even when
+        ``merge_base_with_main`` is available: merge-base(main, <a commit
+        already on main>) is that commit itself, which would collapse the
+        parent and citation legs into the same ref and make the differential
+        structurally incapable of ever confirming.
+        """
+        sha = 'c' * 40
+        git_ops = self._rejecting_git_ops(sha)
+        git_ops.merge_base_with_main = AsyncMock(return_value=sha)
+        stub, calls = _check_runner({
+            f'{sha}^1': DeliveredCheckResult.FAILED,
+            sha: DeliveredCheckResult.DELIVERED,
+            'main': DeliveredCheckResult.DELIVERED,
+        })
+
+        with patch('orchestrator.delivered_checks.run_delivered_check', stub):
+            verdict = await validate_landing_evidence(
+                git_ops, '42', 'task/42', branch_tip_sha=None, candidate_sha=sha,
+                delivered_checks=[_grep_check()],
+            )
+
+        assert verdict.accepted is True
+        git_ops.merge_base_with_main.assert_not_awaited()
+        assert [ref for _name, ref in calls] == [f'{sha}^1', sha, 'main']
+
+    async def test_the_main_leg_honours_a_configured_main_branch(self) -> None:
+        """The third leg names ``config.main_branch``, not the literal 'main'.
+
+        ``main_branch`` is a configurable Pydantic field.  On a project that
+        sets it to anything else, a hardcoded 'main' is an unresolvable ref:
+        ``run_delivered_check`` returns ERRORED, that degrades to no_signal,
+        and the second accept path is PERMANENTLY dead there with no
+        diagnostic saying why.  Everything else in this check threads the
+        configured branch through, so this was the one place that would
+        silently mis-target.
+        """
+        sha = 'c' * 40
+        git_ops = self._rejecting_git_ops(sha)
+        git_ops.config = SimpleNamespace(
+            main_branch='trunk',
+            delivered_checks=SimpleNamespace(enabled=True),
+        )
+        stub, calls = _check_runner({
+            f'{sha}^1': DeliveredCheckResult.FAILED,
+            sha: DeliveredCheckResult.DELIVERED,
+            'trunk': DeliveredCheckResult.DELIVERED,
+            # A hardcoded 'main' would land here instead.
+            'main': DeliveredCheckResult.ERRORED,
+        })
+
+        with patch('orchestrator.delivered_checks.run_delivered_check', stub):
+            verdict = await validate_landing_evidence(
+                git_ops, '42', 'task/42', branch_tip_sha=None, candidate_sha=sha,
+                delivered_checks=[_grep_check()],
+            )
+
+        assert [ref for _name, ref in calls] == [f'{sha}^1', sha, 'trunk']
+        assert verdict.accepted is True
+
+    async def test_the_kill_switch_disables_the_second_accept_path(self) -> None:
+        """``delivered_checks.enabled=False`` switches this consumer off too.
+
+        The mark-done delivered-check gate honours that flag
+        (``Harness._delivered_checks_withhold``); a second consumer that
+        ignored it would mean disabling the feature did not actually disable
+        it.  The rejection is left exactly as survival found it, no check is
+        executed, and the state is RECORDED rather than looking like ordinary
+        bad luck — an operator must be able to see in the escalation that the
+        path was switched off, not merely unlucky.
+        """
+        sha = 'c' * 40
+        git_ops = self._rejecting_git_ops(sha)
+        git_ops.config = SimpleNamespace(
+            main_branch='main',
+            delivered_checks=SimpleNamespace(enabled=False),
+        )
+        stub, calls = _check_runner({
+            f'{sha}^1': DeliveredCheckResult.FAILED,
+            sha: DeliveredCheckResult.DELIVERED,
+            'main': DeliveredCheckResult.DELIVERED,
+        })
+
+        with patch('orchestrator.delivered_checks.run_delivered_check', stub):
+            verdict = await validate_landing_evidence(
+                git_ops, '42', 'task/42', branch_tip_sha=None, candidate_sha=sha,
+                delivered_checks=[_grep_check()],
+            )
+
+        assert calls == [], 'no declared check may run while the feature is off'
+        assert verdict.accepted is False
+        assert verdict.reason == 'effect_absent'
+        assert verdict.probe['delivered_checks_outcome'] == 'disabled'
+        _summary, detail = format_unattributed_landing_detail('42', 'task/42', verdict)
+        assert 'delivered_checks.enabled is false' in detail
 
     async def test_no_citation_reject_never_runs_the_differential(self) -> None:
         """A missing citation is an ATTRIBUTION failure, not a decayed-effect
