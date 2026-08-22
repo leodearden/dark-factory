@@ -3253,6 +3253,69 @@ def test_spawn_unsets_inherited_launch_inputs_from_child_env(
     )
 
 
+def test_owner_ppid_is_exported_and_is_the_owning_claudes_direct_parent(
+    tmp_path: pathlib.Path,
+) -> None:
+    """CLAUDE_SPAWN_OWNER_PPID must name the payload shell that runs claude.
+
+    Task 4193 (L2 ruling item 4-i). This is the ownership discriminator for
+    the window BEFORE the session registry record carries a
+    ``claude_session_id`` -- measured median ~27s, p90 ~141s over the live
+    fleet, and unbounded. ``session_hooks._owner_ppid_verdict`` compares it
+    against ``_parent_pid_of(_owning_claude_pid())``, so the contract this
+    test pins is exactly: *the value the child sees equals the child's own
+    ``getppid()``*.
+
+    That holds only because ``claude`` is invoked WITHOUT ``exec`` -- an
+    implicit-exec optimisation would collapse the payload shell into the
+    claude process and break the equality silently. bash suppresses that
+    optimisation here because ``$inner`` sets traps and ends in
+    ``ec=$?; exit $ec``, but nothing in the source SAYS so, which is why it
+    is pinned by an end-to-end launch rather than by reading the string.
+
+    Also asserted: it survives ``sanitize_env`` (it is exported after the
+    namespace unset) and is present even with no title and no parent, since
+    unlike the other four exports it is gated on nothing.
+    """
+    bin_dir = _make_bin_dir(tmp_path)
+    capture_file = tmp_path / "captured_env.bin"
+    ppid_file = tmp_path / "claude_ppid.txt"
+    p_claude = bin_dir / "claude"
+    p_claude.write_text(
+        "#!/usr/bin/env bash\n"
+        f"env -0 > {capture_file!s}\n"
+        f"ps -o ppid= -p $$ | tr -d ' ' > {ppid_file!s}\n"
+        "exit 0\n"
+    )
+    p_claude.chmod(0o755)
+    _write_foreground_terminal(bin_dir, "xterm")
+
+    env = _base_env(bin_dir, "xterm")
+    # Poison it: an inherited value must be overwritten by THIS spawn's, the
+    # same way the other identity exports are.
+    env["CLAUDE_SPAWN_OWNER_PPID"] = "999999"
+
+    result = _run_spawn(env, tmp_path)
+    assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
+
+    captured = _read_spawn_namespace(capture_file)
+    exported = captured.get("CLAUDE_SPAWN_OWNER_PPID", "")
+    assert exported.isdigit() and int(exported) > 1, (
+        f"CLAUDE_SPAWN_OWNER_PPID must be a real pid, got {exported!r}"
+    )
+    assert exported != "999999", (
+        "the inherited value must be scrubbed and recomputed for THIS child"
+    )
+    actual_parent = ppid_file.read_text().strip()
+    assert exported == actual_parent, (
+        f"CLAUDE_SPAWN_OWNER_PPID ({exported}) must equal the launched "
+        f"claude's own direct parent pid ({actual_parent}) -- if these "
+        f"diverge, the payload shell was exec'd away and "
+        f"session_hooks._owner_ppid_verdict would misread every owner event "
+        f"as an inheritor"
+    )
+
+
 def test_spawn_unset_is_prefix_generic_not_an_enumerated_list(
     tmp_path: pathlib.Path,
 ) -> None:

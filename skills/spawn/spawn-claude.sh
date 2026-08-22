@@ -205,26 +205,52 @@ fi
 # launcher_pid), so it is unaffected; a nested claude NOT started through
 # this script instead inherits this value.
 #
-# RESOLVED (task 4193) in the Python layer, with no change needed here --
-# this export and the spawn_id_export below stay exactly as they are. The
-# first hook event to adopt a slug binds its own Claude Code session_id
-# (hook stdin) into record.claude_session_id
-# (orchestrator/session_hooks.py, _bind_claude_session_id), and any later
-# hook arriving with a DIFFERENT stdin session_id is recognised as an
-# inheritor-not-owner: hook_session_slug falls through to the hand-launched
-# build_session_slug keying, so that nested claude gets its OWN record
-# instead of collapsing its lifecycle writes onto THIS spawn's. The stdin
-# session_id is the only token that can make that distinction -- a nested
-# claude is also a descendant of the original launcher, so PID lineage
-# cannot tell an owner from an inheritor.
+# RESOLVED (task 4193) by TWO discriminators, because neither covers the
+# whole session lifetime on its own. This export and the spawn_id_export
+# below stay exactly as they are; the owner_ppid_export further down is the
+# only addition here.
+#
+#   1. ONCE THE RECORD IS BOUND -- the stdin session_id. The first hook
+#      event to adopt a slug binds its own Claude Code session_id into
+#      record.claude_session_id (orchestrator/session_hooks.py,
+#      _bind_claude_session_id), and any later hook arriving with a
+#      DIFFERENT stdin session_id is recognised as an inheritor-not-owner:
+#      hook_session_slug falls through to the hand-launched
+#      build_session_slug keying, so that nested claude gets its OWN record
+#      instead of collapsing its lifecycle writes onto THIS spawn's. Note
+#      an ANCESTRY test could never do this job -- a nested claude is also a
+#      descendant of the original launcher.
+#
+#   2. BEFORE IT IS BOUND -- CLAUDE_SPAWN_OWNER_PPID (see owner_ppid_export
+#      below). Between this script's `launching` write and the spawned
+#      session's own first SessionStart, the record carries no binding at
+#      all, so discriminator 1 does not exist yet and whichever event
+#      arrives first would capture the record. That window is WIDE --
+#      measured over the live fleet, median ~27s, p90 ~141s -- and nothing
+#      bounds it. So session_hooks._owner_ppid_verdict compares the owning
+#      claude's DIRECT PARENT against the pid this script exports from
+#      inside $inner. That is a parent-EQUALITY test on one process, not an
+#      ancestry test, and it needs no persisted state, so it works from the
+#      very first event. It also covers CLAUDE_SPAWN_MODE=sibling records,
+#      which resolve_sibling() flips to `running` at launch and which a
+#      status-based guard would therefore never match.
+#
+# Both probes are FAIL-SOFT in the same direction: whenever ownership can be
+# neither proved nor disproved (no /proc, an unreadable record, a session
+# spawned by a pre-task-4193 copy of this script), the event ADOPTS, i.e.
+# degrades to the pre-task-4193 behaviour, rather than inventing a split.
 #
 # Two consequences of that fork worth knowing when reading a forked row:
 #   * it is parented to THIS spawn's slug (the inherited CLAUDE_SPAWN_PARENT_ID
 #     names this spawn's OWN parent, which would render the nested session as
 #     this one's sibling), it does not resolve CLAUDE_SPAWN_WM_TITLE (that
 #     marker is THIS window, and a row claiming it would misdirect cockpit
-#     focus), and its launcher_pid is the nested claude itself so the row is
-#     reapable once that process exits;
+#     focus), and its launcher_pid is the nested claude itself so the row
+#     becomes reapable after that process exits -- "reapable", not "reaped":
+#     reap_stale_records' stale_pid rule ALSO requires
+#     NON_TERMINAL_HEARTBEAT_TTL of silence, and where /proc is unavailable
+#     _nested_claude_liveness_pid falls back to os.getsid(0), the terminal's
+#     session leader, which outlives the nested claude;
 #   * the discriminator survives /clear. Claude Code re-mints session_id in
 #     place there, so the owning session's own SessionStart would look like a
 #     mismatch -- session_hooks keys off the SessionStart-only `source` field
@@ -387,7 +413,7 @@ q_sentinel=$(printf %q "$sentinel")
 #     subprocess -- so the unset can never disturb them. Deliberate inputs
 #     still reach the direct child's argv exactly as before; what changes is
 #     only that they no longer travel onward in its ENVIRONMENT.
-#   - It must precede the four re-exports below, or it would erase the very
+#   - It must precede the re-exports below, or it would erase the very
 #     per-child values being handed over.
 # Kept to ONE logical line: the mac-terminal branch writes $inner into a
 # tmpscript via printf '#!/usr/bin/env bash\n%s\n', so an embedded newline
@@ -414,10 +440,34 @@ q_sentinel=$(printf %q "$sentinel")
 # under `set -u` when the namespace is empty.
 sanitize_env='for _v in ${!CLAUDE_SPAWN_@}; do unset "$_v"; done; unset _v; '
 
+# Owner-provenance token (task 4193, L2 ruling item 4-i). CLAUDE_SPAWN_SESSION_ID
+# alone cannot tell the session THIS script launched from a nested `claude` that
+# merely inherited the variable, and during the LAUNCHING window the registry
+# record carries no claude_session_id yet, so the Python layer's stdin-session_id
+# discriminator does not exist yet either -- the window is wide (measured median
+# ~27s over the live fleet, p90 ~141s) and nothing bounds it.
+#
+# `$$` is deliberately deferred (\$\$) so it expands inside $inner at RUNTIME,
+# naming the payload bash that is about to run `claude` -- and because that
+# `claude` is invoked WITHOUT exec (`cd ... && claude ...` is part of a compound
+# list with traps and a trailing `ec=$?`), the owning claude's DIRECT PARENT is
+# always exactly this pid, on every backend branch. A nested claude started from
+# inside the session has some other parent (its agent's Bash-tool shell), so it
+# mismatches. See session_hooks._owner_ppid_verdict.
+#
+# NOT launcher_pid: this script's own $$ is not even in the owning claude's
+# ancestry under a detached emulator (gnome-terminal reparents the payload to
+# gnome-terminal-server), so a lineage test against the launcher cannot work.
+#
+# Placed AFTER $sanitize_env like the other identity exports, so a nested
+# spawn through this script overwrites rather than inherits. Purely additive:
+# a Python layer that does not read it is unaffected.
+owner_ppid_export="export CLAUDE_SPAWN_OWNER_PPID=\$\$; "
+
 inner="trap 'echo \"\${ec:-\$?}\" > $q_sentinel' EXIT; \
 trap 'exit 129' HUP; \
 trap 'exit 143' TERM; \
-${sanitize_env}${spawn_id_export}${parent_id_export}${result_export}${wm_title_export}export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1; cd $q_cwd && claude $flags $q_prompt; ec=\$?; exit \$ec"
+${sanitize_env}${spawn_id_export}${parent_id_export}${result_export}${wm_title_export}${owner_ppid_export}export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1; cd $q_cwd && claude $flags $q_prompt; ec=\$?; exit \$ec"
 
 # How long to wait for the sentinel to appear after the launcher returns
 # (covers a hair-late write or a very fast emulator).  Tests can shrink this.

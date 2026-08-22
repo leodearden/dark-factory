@@ -196,6 +196,7 @@ def _env_slug_is_owned(
     hook_input: Mapping[str, Any],
     root: Path | str | None,
     *,
+    env: Mapping[str, str],
     allow_remint: bool = False,
 ) -> bool:
     """Is the inherited CLAUDE_SPAWN_SESSION_ID *slug* THIS session's own?
@@ -220,10 +221,25 @@ def _env_slug_is_owned(
     owning session needs no such bypass on those events -- its SessionStart
     has already re-bound the record to the fresh id by then.
 
+    An UNBOUND record has no ``claude_session_id`` discriminator yet -- the
+    spawn-created ``launching`` snapshot, a sibling-mode record already
+    flipped to ``running`` by ``resolve_sibling``, or any pre-task-4193
+    record. That window is wide (median ~27s over the live fleet, p90 ~141s)
+    and unbounded, and the FIRST event to arrive in it binds, owner or
+    inheritor. So the stateless ``CLAUDE_SPAWN_OWNER_PPID`` probe decides
+    there instead (``_owner_ppid_verdict``): a positive MISMATCH forks; a
+    match, or no verdict at all, adopts. Deliberately keyed on
+    unbound-ness rather than ``status is LAUNCHING``, so sibling-mode spawns
+    -- never LAUNCHING by the time a hook sees them -- are covered too
+    (task 4193 L2 ruling items 4-i and 8).
+
     FAIL-SOFT: every failure mode resolves to adopt (True), never to fork.
     A probe that cannot answer degrades to the pre-task-4193 behaviour
     rather than inventing a record split, honouring the hook trio's hard
-    rule that a registry fault never breaks a session.
+    rule that a registry fault never breaks a session. That includes the
+    pid arm below: an owner pid missing on EITHER side is "cannot prove",
+    not "disproved" -- forking there would split the owner's own record on
+    every routine automatic compaction wherever ``/proc`` is unavailable.
     """
     hook_session_id = _hook_session_id(hook_input)
     if not hook_session_id:
@@ -249,7 +265,11 @@ def _env_slug_is_owned(
         return True
     bound = (record.claude_session_id or '').strip()
     if not bound:
-        return True
+        # No binding yet, so the stdin session_id proves nothing: whoever
+        # arrives first would otherwise capture the spawn-created record,
+        # inverting ownership permanently. Fall back to the stateless
+        # owner-provenance probe, which needs no persisted field.
+        return _owner_ppid_verdict(env) is not False
     if bound == hook_session_id:
         return True
     # A re-mint is forgiven only when the OWNING PROCESS is the one
@@ -262,13 +282,18 @@ def _env_slug_is_owned(
     if not (allow_remint and _is_owner_only_session_start(hook_input)):
         return False
     owner_pid = record.claude_owner_pid
-    if owner_pid is None:
-        # Legacy record bound before the pid existed, or a bind where it
-        # could not be resolved. Ownership is unprovable, so take the
-        # fail-safe direction the module already prefers: fork onto our own
-        # record rather than risk inverting the spawner's.
-        return False
-    return owner_pid == _owning_claude_pid()
+    current_pid = _owning_claude_pid()
+    if owner_pid is None or current_pid is None:
+        # Legacy record bound before the pid existed, a bind where it could
+        # not be resolved, or a platform with no /proc (macOS -- a
+        # first-class lane, cf. task 4058). Ownership is UNPROVABLE, not
+        # DISPROVED, so take the fail-soft direction this docstring
+        # promises: adopt. Forking here would split the OWNER's own record
+        # on every routine automatic compaction, a universal regression
+        # strictly worse than the rare inversion it would prevent
+        # (task 4193 L2 ruling item 4-ii).
+        return True
+    return owner_pid == current_pid
 
 
 def _resolve_hook_slug(
@@ -306,7 +331,9 @@ def _resolve_hook_slug(
         # (task 4112) intact, and means an adversarial env token can no more
         # escape sessions_dir when READ than when written.
         candidate = session_registry.sanitize_slug(spawn_session_id)
-        if _env_slug_is_owned(candidate, hook_input, root, allow_remint=allow_remint):
+        if _env_slug_is_owned(
+            candidate, hook_input, root, env=env, allow_remint=allow_remint
+        ):
             return candidate, None
         rejected = candidate
 
@@ -539,6 +566,63 @@ def _owning_claude_pid() -> int | None:
     if grandparent is not None and grandparent > 1:
         return grandparent
     return None
+
+
+def _owner_ppid_verdict(env: Mapping[str, str]) -> bool | None:
+    """Does this event come from the claude spawn-claude.sh actually launched?
+
+    Returns True (positively the owner), False (positively an inheritor), or
+    None (no verdict -- the probe is unavailable, so callers must fail soft).
+
+    The discriminator is ``CLAUDE_SPAWN_OWNER_PPID``, exported by
+    spawn-claude.sh INSIDE ``$inner`` and therefore carrying the pid of the
+    payload bash that is about to run ``claude``. That ``claude`` is invoked
+    without ``exec``, so the owning process's DIRECT PARENT is always exactly
+    that pid, on every backend branch. A nested ``claude`` started from
+    inside the session (an agent's Bash tool, ``scripts/legibility/coder.py``,
+    a ``cli_invoke`` without ``spawn_env``) inherits the VALUE but has some
+    other parent, so it mismatches.
+
+    Why this exists alongside the ``claude_session_id`` binding: that binding
+    is the discriminator only ONCE a record is bound. Before the owner's own
+    SessionStart lands, the spawn-created record carries no binding at all,
+    and that window is wide -- measured over the live fleet, median ~27s,
+    p90 ~141s, and nothing bounds it (no LAUNCHING reaper). This probe works
+    with NO persisted state, so it covers exactly that window (task 4193 L2
+    ruling item 4-i).
+
+    Why not lineage against ``CLAUDE_SPAWN_LAUNCHER_PID``: that variable is
+    never exported into a spawned session (``sanitize_env`` strips the whole
+    namespace and only four values are re-exported), and under a detached
+    emulator the launcher is not even in the owning claude's ancestry --
+    gnome-terminal reparents the payload to gnome-terminal-server. An
+    ancestry test also cannot discriminate at all, since a nested claude is
+    likewise a descendant (task 4193 detail item 4). This is a parent
+    EQUALITY test on one specific process, not an ancestry test.
+
+    Every unresolvable input yields None rather than False: an absent or
+    unparseable env var (a hand-launched session, or one spawned by a
+    pre-task-4193 spawn-claude.sh), an unresolvable owning pid, or a platform
+    with no ``/proc`` (macOS -- a first-class lane, cf. task 4058). Callers
+    treat None as "adopt", the fail-soft direction this module documents.
+    """
+    raw = (env.get('CLAUDE_SPAWN_OWNER_PPID') or '').strip()
+    if not raw:
+        return None
+    try:
+        expected = int(raw)
+    except ValueError:
+        logger.warning('unparseable CLAUDE_SPAWN_OWNER_PPID %r; no ownership verdict', raw)
+        return None
+    if expected <= 1:
+        return None
+    owner_pid = _owning_claude_pid()
+    if owner_pid is None:
+        return None
+    actual = _parent_pid_of(owner_pid)
+    if actual is None:
+        return None
+    return actual == expected
 
 
 def _nested_claude_liveness_pid() -> int:
@@ -891,6 +975,50 @@ def _prior_record_or_none(
         return None
 
 
+_LAUNCH_WINDOW_WITHHOLD_MAX_SECS = 600.0
+"""How long an event of UNKNOWN provenance may be withheld from a still-
+LAUNCHING, still-unbound record before the rail prefers a possibly-wrong
+status to a permanently blind one.
+
+Nothing else bounds that window: there is no LAUNCHING reaper or expiry, and
+``reap_stale_records`` needs both NON_TERMINAL_HEARTBEAT_TTL (1h) and a DEAD
+``launcher_pid`` -- which is spawn-claude.sh's own ``$$``, alive for the whole
+session. So without this bound, a session whose SessionStart never landed (it
+can be killed by ``_HOOK_TIMEOUT_SECS`` while ``_resolve_wm_window_id``
+retries) is invisible to the attention rail FOR ITS ENTIRE LIFE, and its
+pending question is silently dropped -- a regression in the rail's core
+function (task 4193 L2 ruling item 4-iii).
+
+600s is comfortably past the measured launch window (n=51 live-fleet records:
+median 27.2s, p90 141.2s, max 172.3s; max 575s under a looser match), so a
+merely-slow-but-healthy spawn is still withheld and only a genuinely stuck one
+falls through. This is the FALLBACK path: an event whose
+``CLAUDE_SPAWN_OWNER_PPID`` positively identifies it as the owner's is never
+withheld at all, and one that positively identifies an inheritor has already
+been forked onto its own slug by ``_env_slug_is_owned``."""
+
+
+def _launch_window_withholding_expired(
+    prior: session_registry.SessionRecord,
+) -> bool:
+    """Has *prior* sat in the unbound launch window past the withhold bound?
+
+    Fail-soft in the direction of WITHHOLDING: a missing or unparseable
+    ``start_ts`` returns False, keeping today's behaviour, since an
+    unreadable clock is no evidence the spawn is stuck.
+    """
+    raw = (prior.start_ts or '').strip()
+    if not raw:
+        return False
+    try:
+        started = datetime.fromisoformat(raw)
+    except ValueError:
+        return False
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=UTC)
+    return (datetime.now(UTC) - started).total_seconds() > _LAUNCH_WINDOW_WITHHOLD_MAX_SECS
+
+
 def _in_unbound_launch_window(
     prior: session_registry.SessionRecord | None,
 ) -> bool:
@@ -907,10 +1035,39 @@ def _in_unbound_launch_window(
     A LAUNCHING record that IS already bound is not in the window: a bound
     record has a discriminator, so ``_env_slug_is_owned`` has already proved
     this event's ownership and the caller may write normally.
+
+    This answers only the RECORD-SHAPE question. Whether the caller actually
+    withholds is decided in ``_run_status_refresh_and_retitle``, which also
+    consults ``_owner_ppid_verdict`` (a positively-identified owner is never
+    withheld) and ``_launch_window_withholding_expired``.
     """
     if prior is None or prior.status is not session_registry.Status.LAUNCHING:
         return False
     return not (prior.claude_session_id or '').strip()
+
+
+def _withhold_from_launching(
+    prior: session_registry.SessionRecord,
+    env: Mapping[str, str],
+) -> bool:
+    """Given a record in the unbound launch window, withhold this event?
+
+    False -- write normally -- in exactly two cases:
+
+    * ``CLAUDE_SPAWN_OWNER_PPID`` positively identifies this event as the
+      OWNER's (``_owner_ppid_verdict`` is True). Its own status and pending
+      question belong on this record whether or not its SessionStart has
+      landed yet, and withholding them was the regression this repairs.
+    * The record has been stuck in the window past
+      ``_LAUNCH_WINDOW_WITHHOLD_MAX_SECS``, i.e. the owner's SessionStart is
+      not merely slow, it is never coming.
+
+    Otherwise the event's provenance is genuinely unknowable and nothing it
+    carries may land on the spawn-created record.
+    """
+    if _owner_ppid_verdict(env) is True:
+        return False
+    return not _launch_window_withholding_expired(prior)
 
 
 def _run_status_refresh_and_retitle(
@@ -958,7 +1115,9 @@ def _run_status_refresh_and_retitle(
     # read-modify-WRITE, so passing the status here at all would already have
     # mutated the spawn-created record by the time any later guard ran.
     # status=None makes it a pure heartbeat bump, leaving status untouched.
-    in_launch_window = _in_unbound_launch_window(prior)
+    in_launch_window = prior is not None and _in_unbound_launch_window(
+        prior
+    ) and _withhold_from_launching(prior, env)
     record = session_registry.refresh_record(
         slug, root=root, status=None if in_launch_window else status
     )

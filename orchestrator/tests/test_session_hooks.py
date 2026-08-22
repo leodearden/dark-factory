@@ -17,7 +17,7 @@ import os
 import re
 import subprocess
 from collections.abc import Mapping
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest  # pyright: ignore[reportMissingImports]
@@ -2867,13 +2867,18 @@ def test_owner_auto_compact_still_converges_on_its_own_record(tmp_path: Path) ->
     assert len(list(sr.sessions_dir(root=tmp_path).iterdir())) == 1
 
 
-def test_legacy_record_without_owner_pid_forks_rather_than_reinverting(
+def test_legacy_record_without_owner_pid_adopts_rather_than_splitting_the_owner(
     tmp_path: Path,
 ) -> None:
-    # A record bound before claude_owner_pid existed cannot prove ownership.
-    # Unprovable must take the fail-safe direction the module already
-    # prefers -- fork onto our own record -- never "adopt anyway", which is
-    # exactly the inversion this condition exists to stop.
+    # A record bound before claude_owner_pid existed cannot prove ownership
+    # EITHER WAY. Task 4193 L2 ruling item 4-ii: unprovable is not disproved,
+    # so it must take the fail-soft direction this module documents at
+    # _env_slug_is_owned ("every failure mode resolves to adopt, never to
+    # fork"). Forking here would split the OWNER's own record on every
+    # routine automatic compaction wherever /proc is unavailable (macOS) --
+    # a universal regression, strictly worse than the rare inversion it
+    # would prevent. The fork is reserved for a pid that RESOLVES and
+    # mismatches (see the test below).
     slug = 'session-cockpit-4400012'
     env = {'CLAUDE_SPAWN_SESSION_ID': slug}
     sr.write_record(
@@ -2886,7 +2891,262 @@ def test_legacy_record_without_owner_pid_forks_rather_than_reinverting(
     remint = {'session_id': 'uuid-other', 'cwd': '/home/leo/src/dark-factory', 'source': 'compact'}
     sh.run_session_start(remint, env, root=tmp_path)
 
-    assert sr.read_record(slug, root=tmp_path).claude_session_id == 'uuid-owner'
+    assert sr.read_record(slug, root=tmp_path).claude_session_id == 'uuid-other'
+    assert len(list(sr.sessions_dir(root=tmp_path).iterdir())) == 1
+
+
+def test_unresolvable_current_owner_pid_adopts_rather_than_splitting_the_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The mirror of the case above, and the one the pre-existing pin could
+    # never observe (both _owning_claude_pid() calls happened inside one
+    # pytest process): the record HAS an owner pid, but the CURRENT probe
+    # cannot resolve one -- exactly macOS, where _parent_pid_of has no /proc
+    # to read. Unprovable again means adopt.
+    slug = 'session-cockpit-4400013'
+    env = {'CLAUDE_SPAWN_SESSION_ID': slug}
+    sr.write_record(
+        sr.SessionRecord(
+            session_slug=slug, status=sr.Status.RUNNING, launcher_pid=4400013,
+            claude_session_id='uuid-owner', claude_owner_pid=4400099,
+        ),
+        root=tmp_path,
+    )
+    monkeypatch.setattr(sh, '_owning_claude_pid', lambda: None)
+    remint = {'session_id': 'uuid-owner-2', 'cwd': '/home/leo/src/dark-factory', 'source': 'compact'}
+    sh.run_session_start(remint, env, root=tmp_path)
+
+    assert sr.read_record(slug, root=tmp_path).claude_session_id == 'uuid-owner-2'
+    assert len(list(sr.sessions_dir(root=tmp_path).iterdir())) == 1
+
+
+# ---------------------------------------------------------------------------
+# Task 4193 L2 ruling item 4: the UNBOUND launch window.
+#
+# Before the owner's own SessionStart lands, the spawn-created record carries
+# no claude_session_id, so the stdin-session_id discriminator does not exist
+# yet and the FIRST event to arrive captures the record -- owner or inheritor.
+# The stateless CLAUDE_SPAWN_OWNER_PPID probe decides there instead.
+# ---------------------------------------------------------------------------
+
+
+def _owner_ppid_env(slug: str, ppid: int) -> dict[str, str]:
+    return {'CLAUDE_SPAWN_SESSION_ID': slug, 'CLAUDE_SPAWN_OWNER_PPID': str(ppid)}
+
+
+def _launching_record(slug: str, root: Path, *, pid: int = 4193001) -> None:
+    sr.write_record(
+        sr.SessionRecord(
+            session_slug=slug,
+            status=sr.Status.LAUNCHING,
+            launcher_pid=pid,
+            role='cockpit',
+            start_ts=datetime.now(UTC).isoformat(),
+        ),
+        root=root,
+    )
+
+
+def test_nested_session_start_cannot_capture_an_unbound_launching_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # THE REVIEWER'S BLOCKING CASE (esc-4193-9). SessionStart is the event
+    # that reaches the launch window FIRST -- a nested claude always fires
+    # its own SessionStart before any Notification/Stop -- so a guard wired
+    # only into the refresh path never gets a chance to fire. Here the
+    # nested claude's SessionStart arrives at a LAUNCHING+unbound record and
+    # must NOT bind it: it forks onto its own slug, leaving the record that
+    # holds role/prompt/result_file (the one spawn-claude.sh writes 'exited'
+    # to) untouched and still available to its true owner.
+    slug = 'session-cockpit-4193001'
+    _launching_record(slug, tmp_path)
+    env = _owner_ppid_env(slug, 4193500)
+    # The nested claude's parent is its agent's Bash-tool shell, not the
+    # payload bash spawn-claude.sh exported.
+    monkeypatch.setattr(sh, '_owning_claude_pid', lambda: 4193777)
+    monkeypatch.setattr(sh, '_parent_pid_of', lambda pid: 4193776)
+
+    nested = {'session_id': 'uuid-nested', 'cwd': '/home/leo/src/dark-factory', 'source': 'startup'}
+    sh.run_session_start(nested, env, root=tmp_path)
+
+    spawn_record = sr.read_record(slug, root=tmp_path)
+    assert spawn_record.claude_session_id is None
+    assert spawn_record.status is sr.Status.LAUNCHING
+    assert spawn_record.role == 'cockpit'
+    forked = sr.read_record(sh.hook_session_slug(nested, env, root=tmp_path), root=tmp_path)
+    assert forked.claude_session_id == 'uuid-nested'
+    assert forked.parent_session_id == slug
+
+
+def test_owner_session_start_binds_the_unbound_launching_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The other half: the session spawn-claude.sh actually launched is the
+    # direct child of the payload bash whose pid it exported, so it adopts
+    # and binds the spawn-created record -- exactly one row, converged.
+    slug = 'session-cockpit-4193002'
+    _launching_record(slug, tmp_path, pid=4193002)
+    env = _owner_ppid_env(slug, 4193500)
+    monkeypatch.setattr(sh, '_owning_claude_pid', lambda: 4193501)
+    monkeypatch.setattr(sh, '_parent_pid_of', lambda pid: 4193500)
+
+    owner = {'session_id': 'uuid-owner', 'cwd': '/home/leo/src/dark-factory', 'source': 'startup'}
+    sh.run_session_start(owner, env, root=tmp_path)
+
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.claude_session_id == 'uuid-owner'
+    assert record.status is sr.Status.RUNNING
+    assert len(list(sr.sessions_dir(root=tmp_path).iterdir())) == 1
+
+
+def test_nested_then_owner_session_start_leaves_the_spawn_record_with_the_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The end-to-end ordering the reviewer reproduced against the branch:
+    # nested SessionStart -> nested Stop -> owner SessionStart. Previously
+    # the nested SessionStart inverted ownership permanently. Now the spawn
+    # record survives untouched until its real owner arrives.
+    slug = 'session-cockpit-4193003'
+    _launching_record(slug, tmp_path, pid=4193003)
+    env = _owner_ppid_env(slug, 4193500)
+
+    monkeypatch.setattr(sh, '_owning_claude_pid', lambda: 4193777)
+    monkeypatch.setattr(sh, '_parent_pid_of', lambda pid: 4193776)
+    nested = {'session_id': 'uuid-nested', 'cwd': '/home/leo/src/dark-factory', 'source': 'startup'}
+    sh.run_session_start(nested, env, root=tmp_path)
+    sh.run_stop(nested, env, root=tmp_path)
+    assert sr.read_record(slug, root=tmp_path).status is sr.Status.LAUNCHING
+
+    monkeypatch.setattr(sh, '_owning_claude_pid', lambda: 4193501)
+    monkeypatch.setattr(sh, '_parent_pid_of', lambda pid: 4193500)
+    owner = {'session_id': 'uuid-owner', 'cwd': '/home/leo/src/dark-factory', 'source': 'startup'}
+    sh.run_session_start(owner, env, root=tmp_path)
+
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.claude_session_id == 'uuid-owner'
+    assert record.status is sr.Status.RUNNING
+
+
+def test_owner_stop_is_not_withheld_from_a_still_launching_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Ruling item 4-iii. The launch-window withholding suppressed status AND
+    # the pending question for EVERY event, including the legitimate
+    # owner's. A SessionStart killed by _HOOK_TIMEOUT_SECS (reachable:
+    # _resolve_wm_window_id's own docstring prices the pathological wmctrl
+    # case at ~10.8s against a 10s budget) writes nothing, so the record
+    # stays LAUNCHING+unbound and the session went invisible for its whole
+    # life. An event whose OWNER_PPID matches must write.
+    slug = 'session-cockpit-4193004'
+    _launching_record(slug, tmp_path, pid=4193004)
+    env = _owner_ppid_env(slug, 4193500)
+    monkeypatch.setattr(sh, '_owning_claude_pid', lambda: 4193501)
+    monkeypatch.setattr(sh, '_parent_pid_of', lambda pid: 4193500)
+
+    owner = {'session_id': 'uuid-owner', 'cwd': '/home/leo/src/dark-factory'}
+    sh.run_notification({**owner, 'message': 'may I proceed?'}, env, root=tmp_path)
+
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.status is sr.Status.AWAITING_INPUT
+    assert record.question is not None and record.question.text == 'may I proceed?'
+    assert record.claude_session_id == 'uuid-owner'
+
+
+def test_unknown_provenance_event_is_still_withheld_inside_the_window(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # No verdict at all (a session spawned by a pre-task-4193
+    # spawn-claude.sh, or a platform with no /proc): provenance is genuinely
+    # unknowable, so the conservative withholding stands.
+    slug = 'session-cockpit-4193005'
+    _launching_record(slug, tmp_path, pid=4193005)
+    env = {'CLAUDE_SPAWN_SESSION_ID': slug}
+    monkeypatch.setattr(sh, '_owning_claude_pid', lambda: None)
+
+    sh.run_stop({'session_id': 'uuid-anon', 'cwd': '/home/leo/src/dark-factory'}, env, root=tmp_path)
+
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.status is sr.Status.LAUNCHING
+    assert record.claude_session_id is None
+
+
+def test_withholding_expires_so_a_stuck_record_is_never_blind_forever(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Nothing else bounds the window: no LAUNCHING reaper, and
+    # reap_stale_records needs a DEAD launcher_pid, which is
+    # spawn-claude.sh's own $$ -- alive for the whole session. Past the
+    # bound, a possibly-wrong status beats a permanently blind record.
+    slug = 'session-cockpit-4193006'
+    stale = datetime.now(UTC) - timedelta(seconds=sh._LAUNCH_WINDOW_WITHHOLD_MAX_SECS + 60)
+    sr.write_record(
+        sr.SessionRecord(
+            session_slug=slug, status=sr.Status.LAUNCHING, launcher_pid=4193006,
+            start_ts=stale.isoformat(),
+        ),
+        root=tmp_path,
+    )
+    env = {'CLAUDE_SPAWN_SESSION_ID': slug}
+    monkeypatch.setattr(sh, '_owning_claude_pid', lambda: None)
+
+    sh.run_stop({'session_id': 'uuid-late', 'cwd': '/home/leo/src/dark-factory'}, env, root=tmp_path)
+
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.status is sr.Status.IDLE
+    assert record.claude_session_id == 'uuid-late'
+
+
+def test_sibling_mode_running_unbound_record_is_still_protected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Ruling item 4-i: resolve_sibling() runs `refresh --status running`
+    # immediately at launch on EVERY backend branch, so a
+    # CLAUDE_SPAWN_MODE=sibling record is RUNNING-and-unbound and a
+    # `status is LAUNCHING` predicate never matches it at all. Keying the
+    # ownership probe on UNBOUND-ness instead covers it.
+    slug = 'session-cockpit-4193007'
+    sr.write_record(
+        sr.SessionRecord(
+            session_slug=slug, status=sr.Status.RUNNING, launcher_pid=4193007, role='cockpit'
+        ),
+        root=tmp_path,
+    )
+    env = _owner_ppid_env(slug, 4193500)
+    monkeypatch.setattr(sh, '_owning_claude_pid', lambda: 4193777)
+    monkeypatch.setattr(sh, '_parent_pid_of', lambda pid: 4193776)
+
+    nested = {'session_id': 'uuid-nested', 'cwd': '/home/leo/src/dark-factory', 'source': 'startup'}
+    sh.run_session_start(nested, env, root=tmp_path)
+
+    assert sr.read_record(slug, root=tmp_path).claude_session_id is None
     assert sr.read_record(
-        sh.hook_session_slug(remint, env, root=tmp_path), root=tmp_path
-    ).claude_session_id == 'uuid-other'
+        sh.hook_session_slug(nested, env, root=tmp_path), root=tmp_path
+    ).claude_session_id == 'uuid-nested'
+
+
+def test_owner_ppid_verdict_is_none_for_every_unresolvable_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Fail-soft: never False (fork) on an input the probe simply cannot read.
+    monkeypatch.setattr(sh, '_owning_claude_pid', lambda: 4193501)
+    monkeypatch.setattr(sh, '_parent_pid_of', lambda pid: 4193500)
+    assert sh._owner_ppid_verdict({}) is None
+    assert sh._owner_ppid_verdict({'CLAUDE_SPAWN_OWNER_PPID': '   '}) is None
+    assert sh._owner_ppid_verdict({'CLAUDE_SPAWN_OWNER_PPID': 'not-a-pid'}) is None
+    assert sh._owner_ppid_verdict({'CLAUDE_SPAWN_OWNER_PPID': '1'}) is None
+    assert sh._owner_ppid_verdict({'CLAUDE_SPAWN_OWNER_PPID': '4193500'}) is True
+    assert sh._owner_ppid_verdict({'CLAUDE_SPAWN_OWNER_PPID': '4193999'}) is False
+
+    monkeypatch.setattr(sh, '_owning_claude_pid', lambda: None)
+    assert sh._owner_ppid_verdict({'CLAUDE_SPAWN_OWNER_PPID': '4193500'}) is None
+    monkeypatch.setattr(sh, '_owning_claude_pid', lambda: 4193501)
+    monkeypatch.setattr(sh, '_parent_pid_of', lambda pid: None)
+    assert sh._owner_ppid_verdict({'CLAUDE_SPAWN_OWNER_PPID': '4193500'}) is None
