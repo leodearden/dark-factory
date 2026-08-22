@@ -4973,6 +4973,433 @@ class TestRunBakeOffWiring:
 
 
 # ===========================================================================
+# step-13 — the probe's driver, CLI, cache and teardown wiring
+# ===========================================================================
+#
+# Everything the regrowth block needs that is NOT arithmetic: two more
+# ephemeral collections that the SAME teardown has to reach, two more fetch
+# passes the cache has to be able to describe and refuse when stale, and a
+# CLI switch whose default is "probe".
+#
+# The failure this section exists to catch is a leak, not a wrong number.  A
+# probe that seeds an injected corpus into a collection the `finally` does
+# not name leaves a live collection behind on every run, and the report it
+# returns looks perfect.
+#
+# Pins NO metric value (G6).
+
+
+def _regrowth_collection_names(mod, *, suffix: str) -> set[str]:
+    """The two injected passes' collections, derived exactly as the driver must."""
+    return set(mod.ephemeral_collections(
+        shapes=tuple(mod.regrowth_pass_key(mode) for mode in mod.REGROWTH_MODES),
+        suffix=suffix,
+    ).values())
+
+
+class TestRegrowthPassKey:
+    """The pass key names a COLLECTION, so it is a reapability contract."""
+
+    def test_each_mode_gets_its_own_key_and_none_collides_with_an_arm(self):
+        mod = _mod()
+
+        keys = [mod.regrowth_pass_key(mode) for mode in mod.REGROWTH_MODES]
+
+        assert len(set(keys)) == len(mod.REGROWTH_MODES)
+        assert set(keys).isdisjoint(mod.ARM_SHAPES)
+
+    def test_the_key_survives_scopes_canonicalization_unchanged(self):
+        """`arm_project_id` interpolates this into a project id that `Scope`
+        lowercases and `-`->`_`s.  A key that canonicalized DIFFERENTLY would
+        name a collection under one spelling and be swept under another —
+        i.e. a collection the teardown cannot find, which is the leak."""
+        from fused_memory.models.scope import Scope  # noqa: PLC0415
+
+        mod = _mod()
+
+        for mode in mod.REGROWTH_MODES:
+            key = mod.regrowth_pass_key(mode)
+            assert key == key.lower()
+            assert '-' not in key and '@' not in key
+            project_id = mod.arm_project_id(key, suffix='utest')
+            assert Scope(project_id=project_id).project_id == project_id
+
+    def test_the_key_names_the_mode_it_measures(self):
+        """Two collections whose names do not say which mode they hold make
+        a leaked one unattributable in the reaper's output."""
+        mod = _mod()
+
+        for mode in mod.REGROWTH_MODES:
+            assert mode in mod.regrowth_pass_key(mode)
+
+    def test_the_two_pass_collections_are_distinct_and_disjoint_from_the_arms(self):
+        mod = _mod()
+        arms = set(mod.ephemeral_collections(suffix='utest').values())
+
+        passes = _regrowth_collection_names(mod, suffix='utest')
+
+        assert len(passes) == len(mod.REGROWTH_MODES)
+        assert passes.isdisjoint(arms)
+        prefix = mod.load_cleanup_script().E2_BAKEOFF_PREFIX
+        for name in passes:
+            # Under the reapable prefix or the sweep never finds it, which is
+            # the same leak the arm collections' identity test guards.
+            assert name.startswith(prefix)
+
+
+@pytest.mark.asyncio
+class TestRunBakeOffRegrowthWiring:
+    """The probe's effect on the world, measured through the same doubles."""
+
+    async def test_the_default_run_seeds_both_injected_passes(self, monkeypatch):
+        mod = _mod()
+        _install_driver_doubles(monkeypatch)
+
+        await mod.run_bake_off(**_SMALL_RUN)
+
+        seeded_projects = set(_FakeMemoryService.instances[-1].mem0._stored)
+        assert seeded_projects == {
+            mod.arm_project_id(shape, suffix='utest') for shape in mod.ARM_SHAPES
+        } | {
+            mod.arm_project_id(mod.regrowth_pass_key(mode), suffix='utest')
+            for mode in mod.REGROWTH_MODES
+        }
+
+    async def test_the_default_run_returns_a_complete_regrowth_block(
+        self, monkeypatch,
+    ):
+        """Complete, not merely present: `_check_regrowth` is the gate, and
+        this asserts the DRIVER hands it something that passes."""
+        mod = _mod()
+        _install_driver_doubles(monkeypatch)
+
+        report = await mod.run_bake_off(**_SMALL_RUN)
+
+        regrowth = report['regrowth']
+        assert regrowth is not None
+        assert regrowth['shape'] == mod.REGROWTH_SHAPE
+        assert list(regrowth['modes']) == list(mod.REGROWTH_MODES)
+        assert list(regrowth['read_arms']) == list(mod.REGROWTH_READ_ARMS)
+        for mode in mod.REGROWTH_MODES:
+            for arm in mod.REGROWTH_READ_ARMS:
+                assert set(regrowth['after'][mode][arm]) == set(
+                    mod._regrowth_metric_keys()
+                )
+                assert set(regrowth['deltas'][mode][arm]) == set(
+                    mod._regrowth_metric_keys()
+                )
+
+    async def test_the_probe_respects_the_cluster_subset(self, monkeypatch):
+        """`--clusters N` has to filter the injections too, or a smoke run
+        injects re-emissions for topics whose claims it never seeded — and
+        cross-validation, which runs over the SUBSET, would reject them."""
+        mod = _mod()
+        _install_driver_doubles(monkeypatch)
+
+        report = await mod.run_bake_off(**_SMALL_RUN)
+
+        assert report['regrowth']['topics_injected'] == 2
+        assert report['protocol']['regrowth_injections_measured'] == 2
+
+    async def test_the_probe_records_that_it_ran_in_the_protocol_block(
+        self, monkeypatch,
+    ):
+        """Same reason `clusters_measured` is there: a reader holding the
+        artifact must not have to infer the probe's coverage from whether a
+        table looks populated."""
+        mod = _mod()
+        _install_driver_doubles(monkeypatch)
+
+        report = await mod.run_bake_off(**_SMALL_RUN)
+
+        assert report['protocol']['regrowth_probed'] is True
+        assert report['protocol']['regrowth_injections_measured'] > 0
+
+    async def test_the_injected_collections_are_dropped_before_and_after(
+        self, monkeypatch,
+    ):
+        """THE LEAK.  A probe that seeds into a collection the `finally` does
+        not name leaves it live on every run, and the report looks perfect."""
+        mod = _mod()
+        drops = _install_driver_doubles(monkeypatch)
+        expected = set(
+            mod.ephemeral_collections(suffix='utest').values()
+        ) | _regrowth_collection_names(mod, suffix='utest')
+
+        await mod.run_bake_off(**_SMALL_RUN)
+
+        assert len(drops.calls) == 2
+        assert set(drops.calls[0]) == expected
+        assert set(drops.calls[-1]) == expected
+
+    async def test_the_injected_collections_are_dropped_when_a_query_raises(
+        self, monkeypatch,
+    ):
+        mod = _mod()
+        drops = _install_driver_doubles(monkeypatch, search_raises_on=2)
+        expected = set(
+            mod.ephemeral_collections(suffix='utest').values()
+        ) | _regrowth_collection_names(mod, suffix='utest')
+
+        with pytest.raises(RuntimeError, match='qdrant went away'):
+            await mod.run_bake_off(**_SMALL_RUN)
+
+        assert set(drops.calls[-1]) == expected
+
+    async def test_disabling_the_probe_creates_no_collection_and_reads_no_fixture(
+        self, monkeypatch,
+    ):
+        """`regrowth=False` is a real skip, not a measured-then-discarded
+        pass: it must cost no seeding, name no extra collection, and open no
+        injection fixture."""
+        mod = _mod()
+        drops = _install_driver_doubles(monkeypatch)
+        opened: list = []
+        real_loader = mod.load_regrowth_injections
+        monkeypatch.setattr(mod, 'load_regrowth_injections', lambda *a, **k: (
+            opened.append(a), real_loader(*a, **k))[1])
+        passes = _regrowth_collection_names(mod, suffix='utest')
+
+        report = await mod.run_bake_off(regrowth=False, **_SMALL_RUN)
+
+        assert opened == []
+        assert drops.dropped.isdisjoint(passes)
+        assert set(_FakeMemoryService.instances[-1].mem0._stored) == {
+            mod.arm_project_id(shape, suffix='utest') for shape in mod.ARM_SHAPES
+        }
+        assert report['regrowth'] is None
+        assert report['protocol']['regrowth_probed'] is False
+        assert report['protocol']['regrowth_injections_measured'] == 0
+
+    async def test_a_probe_less_run_claims_no_provenance_for_the_injection_fixture(
+        self, monkeypatch,
+    ):
+        """Provenance for a file the run never opened is a false audit trail."""
+        mod = _mod()
+        _install_driver_doubles(monkeypatch)
+        relative = mod._repo_relative(mod.DEFAULT_REGROWTH_INJECTION_PATH)
+
+        skipped = await mod.run_bake_off(regrowth=False, **_SMALL_RUN)
+        probed = await mod.run_bake_off(**_SMALL_RUN)
+
+        assert relative not in [
+            row['path'] for row in skipped['protocol']['fixtures']
+        ]
+        assert relative in [
+            row['path'] for row in probed['protocol']['fixtures']
+        ]
+
+    async def test_the_probe_does_not_disturb_the_six_arm_rows(self, monkeypatch):
+        """The decision table is the ratified artifact; the probe rides
+        alongside it and must not move a single one of its cells."""
+        mod = _mod()
+        _install_driver_doubles(monkeypatch)
+
+        without = await mod.run_bake_off(regrowth=False, **_SMALL_RUN)
+        with_probe = await mod.run_bake_off(**_SMALL_RUN)
+
+        assert with_probe['arms'] == without['arms']
+
+
+class TestRegrowthFetchCache:
+    """The two injected passes are cacheable, and refusably stale."""
+
+    def _cache_inputs(self, mod):
+        """Two hand-built pass corpora and their `SeededArm`s, keyed by pass.
+
+        Built through `_index_arm` with `seeded.shape` left at
+        `REGROWTH_SHAPE`: the pass key names the CACHE slot and the
+        collection, never the read behaviour, so `read_path` must still see
+        `c_peers`.
+        """
+        seeded, records = {}, {}
+        for mode in mod.REGROWTH_MODES:
+            key = mod.regrowth_pass_key(mode)
+            corpus = list(_regrowth_arm(mode))
+            records[key] = corpus
+            seeded[key] = mod._index_arm(
+                mod.REGROWTH_SHAPE, f'proj_{key}', f'coll_{key}',
+                corpus, _committed_inputs()['claims'],
+            )
+        return seeded, records
+
+    def _dump(self, mod, path, records, *, fixtures=None):
+        hit = mod.ScoredHit
+        arms = {
+            key: {
+                'queries': {'q1': [
+                    hit(record=corpus[0], relevance_score=0.9),
+                    hit(record=corpus[-1], relevance_score=0.5),
+                ]},
+                'probes': {},
+            }
+            for key, corpus in records.items()
+        }
+        return mod.dump_fetches(path, arms, provenance=mod.fetch_cache_provenance(
+            records_by_shape=records,
+            fixtures=list(fixtures if fixtures is not None else [
+                ALPHA_FIXTURE_PATH, REGISTRY_PATH, ARM_CLAIMS_PATH,
+                QUERY_SET_PATH, DISTRACTOR_SLAB_PATH,
+                mod.DEFAULT_REGROWTH_INJECTION_PATH,
+            ]),
+            search_limit=10, guard_threshold=0.85,
+            embedder_model='text-embedding-3-small',
+        ))
+
+    def test_a_document_carries_the_arm_keys_and_both_pass_keys(self, tmp_path):
+        mod = _mod()
+        seeded, records = self._cache_inputs(mod)
+        arm_records = {shape: list(_arm(shape)) for shape in mod.ARM_SHAPES}
+
+        path = self._dump(mod, tmp_path / 'cache.json', {**arm_records, **records})
+
+        doc = json.loads(path.read_text())
+        assert set(doc['arms']) == set(mod.ARM_SHAPES) | set(records)
+        assert set(doc['provenance']['corpus_fingerprints']) == (
+            set(mod.ARM_SHAPES) | set(records)
+        )
+        loaded = mod.load_fetches(path, seeded)
+        assert set(loaded) == set(records)
+
+    def test_a_caller_asking_only_for_the_arms_still_loads(self, tmp_path):
+        """`load_fetches` iterates the CALLER's shapes, so the extra pass keys
+        are merely a wider cache.  This is what keeps 4004's committed
+        `e2_fetch_cache.json` — read by `read_transform_selection` — loadable
+        after this task widens the dump."""
+        mod = _mod()
+        _, pass_records = self._cache_inputs(mod)
+        arm_records = {shape: list(_arm(shape)) for shape in mod.ARM_SHAPES}
+        path = self._dump(
+            mod, tmp_path / 'cache.json', {**arm_records, **pass_records},
+        )
+        arm_seeded = {
+            shape: mod._index_arm(
+                shape, f'p_{shape}', f'c_{shape}', arm_records[shape],
+                _committed_inputs()['claims'],
+            )
+            for shape in mod.ARM_SHAPES
+        }
+
+        loaded = mod.load_fetches(path, arm_seeded)
+
+        assert set(loaded) == set(mod.ARM_SHAPES)
+
+    def test_a_pass_replayed_over_the_other_modes_corpus_is_refused_by_name(
+        self, tmp_path,
+    ):
+        """The two injected corpora differ ONLY in a metadata key, so a
+        crossed cache still loads and every ranking still joins.  The
+        fingerprint is the only thing standing between that and a stamped
+        measurement published as an unstamped one."""
+        mod = _mod()
+        seeded, records = self._cache_inputs(mod)
+        unstamped = mod.regrowth_pass_key('unstamped')
+        stamped = mod.regrowth_pass_key('stamped')
+        # Dumped with the two corpora SWAPPED under each other's key.
+        path = self._dump(mod, tmp_path / 'cache.json', {
+            unstamped: records[stamped], stamped: records[unstamped],
+        })
+
+        with pytest.raises(mod.FetchCacheError) as excinfo:
+            mod.load_fetches(path, {unstamped: seeded[unstamped]})
+
+        assert unstamped in str(excinfo.value)
+
+    def _injection_fixture_copy(self, tmp_path) -> Path:
+        """A writable copy of the committed injection slab.
+
+        Copied rather than edited in place for the reason every other
+        digest-drift test in this repo copies: mutating the real fixture
+        would fail every other test in this module and leave the tree dirty.
+        """
+        target = tmp_path / REGROWTH_INJECTION_PATH.name
+        target.write_bytes(REGROWTH_INJECTION_PATH.read_bytes())
+        return target
+
+    def test_replaying_a_pass_verifies_the_injection_fixtures_digest(
+        self, tmp_path,
+    ):
+        """The corpus fingerprint cannot catch this.
+
+        It is taken over the MATERIALIZED records, and the driver decides
+        which injections exist by reading the fixture — so an edit that
+        rewrites an injection's `text` while keeping its `injection_id`
+        leaves every id intact and the cached rankings still join cleanly.
+        The digest is the only thing between that and a measurement of a
+        re-emission nobody wrote.
+        """
+        mod = _mod()
+        seeded, records = self._cache_inputs(mod)
+        fixture = self._injection_fixture_copy(tmp_path)
+        path = self._dump(
+            mod, tmp_path / 'cache.json', records, fixtures=[fixture],
+        )
+        rows = [
+            json.loads(line)
+            for line in fixture.read_text(encoding='utf-8').splitlines()
+            if line.strip()
+        ]
+        rows[0]['text'] = rows[0]['text'] + ' and something else entirely'
+        fixture.write_text(
+            '\n'.join(json.dumps(row) for row in rows) + '\n', encoding='utf-8',
+        )
+
+        # The premise, asserted rather than described: without the guard the
+        # stale cache loads clean, because nothing else in the pipeline can
+        # see the edit.
+        assert mod.load_fetches(path, seeded)
+
+        with pytest.raises(mod.FetchCacheError) as excinfo:
+            mod.load_fetches(path, seeded, expect_fixtures=[fixture])
+
+        assert REGROWTH_INJECTION_PATH.name in str(excinfo.value)
+
+    def test_an_unedited_injection_slab_replays_clean(self, tmp_path):
+        """The converse, so the refusal above is not vacuously always-on."""
+        mod = _mod()
+        seeded, records = self._cache_inputs(mod)
+        fixture = self._injection_fixture_copy(tmp_path)
+        path = self._dump(
+            mod, tmp_path / 'cache.json', records, fixtures=[fixture],
+        )
+
+        loaded = mod.load_fetches(path, seeded, expect_fixtures=[fixture])
+
+        assert set(loaded) == set(records)
+
+    def test_the_five_original_fixtures_are_checked_separately_from_the_sixth(
+        self, tmp_path,
+    ):
+        """A cache dumped WITHOUT the injection digest — 4004's committed one —
+        must still satisfy a five-fixture check.  Folding the sixth into the
+        same list would make `e2_fetch_cache.json` unloadable for the E2 arms
+        and break `read_transform_selection`, which this task does not touch."""
+        mod = _mod()
+        arm_records = {shape: list(_arm(shape)) for shape in mod.ARM_SHAPES}
+        five = [ALPHA_FIXTURE_PATH, REGISTRY_PATH, ARM_CLAIMS_PATH,
+                QUERY_SET_PATH, DISTRACTOR_SLAB_PATH]
+        path = self._dump(
+            mod, tmp_path / 'cache.json', arm_records, fixtures=five,
+        )
+        arm_seeded = {
+            shape: mod._index_arm(
+                shape, f'p_{shape}', f'c_{shape}', arm_records[shape],
+                _committed_inputs()['claims'],
+            )
+            for shape in mod.ARM_SHAPES
+        }
+
+        loaded = mod.load_fetches(path, arm_seeded, expect_fixtures=five)
+
+        assert set(loaded) == set(mod.ARM_SHAPES)
+        with pytest.raises(mod.FetchCacheError):
+            mod.load_fetches(
+                path, arm_seeded,
+                expect_fixtures=[*five, mod.DEFAULT_REGROWTH_INJECTION_PATH],
+            )
+
+
+# ===========================================================================
 # step-26 — the equal-window discipline
 # ===========================================================================
 #
@@ -7210,6 +7637,46 @@ class TestBuildParser:
         assert args.distractors is None
         assert args.limit == _mod().DEFAULT_SEARCH_LIMIT
 
+    def test_the_default_run_probes_regrowth_and_skipping_it_is_explicit(self):
+        """Asserted by ATTRIBUTE, like every other default here.
+
+        The default is ON because the artifact this script writes is gate
+        leaf eta's input and esc-3200-3 asked for these deltas by name: a
+        probe that had to be opted INTO would go missing again exactly the
+        way it went missing the first time, and the artifact would carry no
+        trace of the omission.
+        """
+        parser = _mod().build_parser()
+
+        assert parser.parse_args([]).regrowth is True
+        assert parser.parse_args(['--no-regrowth']).regrowth is False
+
+    def test_the_probe_switch_does_not_disturb_the_cache_flags(self):
+        """`--dump-fetches`/`--replay-fetches` and their exit codes are
+        4004's contract; this task widens what they carry, not what they
+        default to."""
+        args = _mod().build_parser().parse_args(['--no-regrowth'])
+
+        assert args.dump_fetches is None
+        assert args.replay_fetches is None
+
+    def test_the_mutual_exclusion_guard_still_fires_with_the_probe_off(
+        self, tmp_path, capsys,
+    ):
+        """Exit 2, named on stderr, unchanged: a run that both dumps and
+        replays has provenance the artifact cannot describe, and turning the
+        probe off does not make that ambiguity readable."""
+        mod = _mod()
+
+        code = mod.main([
+            '--no-regrowth',
+            '--dump-fetches', str(tmp_path / 'a.json'),
+            '--replay-fetches', str(tmp_path / 'b.json'),
+        ])
+
+        assert code == 2
+        assert '--dump-fetches' in capsys.readouterr().err
+
 
 class TestMain:
     """`main(argv)` driven directly — no subprocess."""
@@ -7294,6 +7761,36 @@ class TestMain:
         # artifact gets published as if it were a fresh measurement.
         assert code == 2
 
+    @pytest.mark.parametrize(
+        ('argv', 'expected'), [([], True), (['--no-regrowth'], False)],
+    )
+    def test_the_switch_reaches_run_bake_off_rather_than_stopping_at_the_parser(
+        self, monkeypatch, tmp_path, argv, expected,
+    ):
+        """A flag the driver never receives is a flag that silently does
+        nothing — and the artifact would then say `regrowth_probed: true`
+        for a run the operator asked to skip."""
+        mod = _mod()
+        _install_driver_doubles(monkeypatch)
+        seen: list = []
+        real = mod.run_bake_off
+
+        async def _spy(**kwargs):
+            seen.append(kwargs.get('regrowth'))
+            return await real(**kwargs)
+
+        monkeypatch.setattr(mod, 'run_bake_off', _spy)
+
+        code = mod.main([
+            *argv, '--clusters', '2', '--distractors', '12',
+            '--project-suffix', 'utest',
+            '--json-out', str(tmp_path / 'r.json'),
+            '--md-out', str(tmp_path / 'r.md'),
+        ])
+
+        assert code == 0
+        assert seen == [expected]
+
 
 # ===========================================================================
 # step-20 — the ONE live end-to-end test
@@ -7320,7 +7817,7 @@ from _fm_helpers import QDRANT_URL, qdrant_skipif  # noqa: E402
 
 
 @pytest.mark.integration
-@pytest.mark.timeout(300)
+@pytest.mark.timeout(600)
 @pytest.mark.asyncio
 @qdrant_skipif()
 @pytest.mark.skipif(
@@ -7331,13 +7828,22 @@ async def test_a_live_two_cluster_run_reports_completely_and_leaves_nothing(
     worker_id,
 ):
     """A 2-cluster / 12-distractor subset: enough to exercise every seam
-    (three collections, six variants, both read transforms, the guard replay,
-    the D10 block, both artifacts) at a fraction of a full run's wall clock."""
+    (three arm collections, six variants, both read transforms, the guard
+    replay, the D10 block, the two INJECTED regrowth passes and both
+    artifacts) at a fraction of a full run's wall clock.
+
+    The timeout covers five seed+fetch passes rather than three: the probe
+    adds one live seeding and one live fetch per injection mode.
+    """
     from qdrant_client import QdrantClient  # noqa: PLC0415
 
     mod = _mod()
     suffix = f'live_{worker_id}'
     collections = set(mod.ephemeral_collections(suffix=suffix).values())
+    # The probe's two collections are part of the teardown contract, not a
+    # separate one: a leaked injected pass is exactly as unreapable as a
+    # leaked arm, and is the failure the widened disjointness below catches.
+    collections |= _regrowth_collection_names(mod, suffix=suffix)
 
     report = await mod.run_bake_off(
         cluster_limit=2, distractor_limit=12, project_suffix=suffix,
@@ -7351,8 +7857,23 @@ async def test_a_live_two_cluster_run_reports_completely_and_leaves_nothing(
     assert report['audit_recall']['true_dup']['pairs'] > 0
     assert report['protocol']['distractor_slab_size'] == 12
 
+    # COMPLETE, not merely present.  A live run that produced an empty or
+    # half-filled block would still render a `## Regrowth deltas` section, and
+    # its blank cells read as "the injection changed nothing".
+    regrowth = report['regrowth']
+    assert regrowth is not None
+    assert report['protocol']['regrowth_probed'] is True
+    assert report['protocol']['regrowth_injections_measured'] == 2
+    for mode in mod.REGROWTH_MODES:
+        for arm in mod.REGROWTH_READ_ARMS:
+            for key in mod._regrowth_metric_keys():
+                assert key in regrowth['after'][mode][arm]
+                assert key in regrowth['deltas'][mode][arm]
+                assert key in regrowth['stamping_value'][arm]
+                assert key in regrowth['baseline'][arm]
+
     # The teardown is the half that leaks silently: a report that looks right
-    # while three collections survive is the failure this asserts against.
+    # while five collections survive is the failure this asserts against.
     client = QdrantClient(url=QDRANT_URL, timeout=10)
     try:
         live = {col.name for col in client.get_collections().collections}
