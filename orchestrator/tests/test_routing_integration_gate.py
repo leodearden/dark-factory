@@ -114,7 +114,7 @@ from orchestrator.event_store import EventType
 from orchestrator.git_ops import GitOps
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.verify import VerifyResult
-from orchestrator.workflow import WorkflowOutcome
+from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 
 # ---------------------------------------------------------------------------
 # Fixtures — file-local, mirroring test_workflow_e2e.py:153-203 /
@@ -228,6 +228,43 @@ def _routing_events(rec: _RecordingEventStore) -> list[dict]:
     ``['data']`` for the payload fields.
     """
     return [entry for (etype, entry) in rec.events if etype == EventType.routing_decision]
+
+
+def _artifacts_for(worktree: Path) -> TaskArtifacts:
+    """Real on-disk ``TaskArtifacts`` at the derived ``.task-meta`` sibling
+    root for *worktree* — the SAME root production's ``self.artifacts``
+    derives via ``TaskArtifacts.meta_root_for``. Reimplemented locally
+    (rather than relying on the autouse ``_derive_meta_root_like_production``
+    shim, which exists for legacy bare-``TaskArtifacts(cwd)`` call sites, or
+    importing across test files) per this suite's module-local-fixtures
+    discipline — mirrors
+    ``test_verdict_servers_integration_gate._artifacts_for`` (task 2488).
+    """
+    return TaskArtifacts(worktree, TaskArtifacts.meta_root_for(worktree.parent, worktree.name))
+
+
+def _seed_workflow_artifacts(
+    workflow: TaskWorkflow, *, tmp_path: Path, task_id: str = '42',
+) -> TaskArtifacts:
+    """Wire a real on-disk ``TaskArtifacts`` + worktree directory onto
+    *workflow*.
+
+    ``_build_workflow`` only constructs the ``TaskWorkflow`` — it does not
+    create a worktree or set ``.worktree``/``.artifacts`` (those are normally
+    set by the full ``run()`` cycle's ``_setup``). The merger byte-
+    equivalence test below drives ``_resolve_and_resubmit`` directly,
+    bypassing ``run()``, so this seeds what that path reads. Mirrors
+    ``test_verdict_servers_integration_gate._seed_workflow_artifacts`` (task
+    2488), reimplemented locally rather than imported across test files (see
+    module docstring, FIXTURES ARE MODULE-LOCAL).
+    """
+    worktree = tmp_path / 'wt'
+    worktree.mkdir(parents=True, exist_ok=True)
+    artifacts = _artifacts_for(worktree)
+    artifacts.init(task_id, 'Routing boundary task', 'desc', base_commit='oldbase')
+    workflow.artifacts = artifacts
+    workflow.worktree = worktree
+    return artifacts
 
 
 class _MinimalRouteRecorder:
