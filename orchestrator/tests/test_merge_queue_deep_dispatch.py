@@ -455,3 +455,121 @@ class TestHalvingWalkComposition:
         state = next_halving_state(True, 2)
         assert select_chain_depth(cap, 3, state) == 3   # short queue binds
         assert select_chain_depth(cap, 9, state) == 6   # grown queue: cap binds
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# step-03: RED — worker-resident halving state
+#
+# Sync class (unmarked): _note_chain_outcome / _deep_target_depth are pure and
+# synchronous, matching the _record_verify_outcome / _recent_verify_fail_rate
+# pair they sit beside.  Constructing a worker needs no running loop.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestChainHalvingWorkerState:
+    """``_chain_halving_state`` + its single mutation chokepoint.
+
+    The worker owns the LIVE bisector state that the pure
+    :func:`select_chain_depth` policy consumes, exactly as it owns
+    ``_probe_round_counter`` for :func:`select_probe_depth`.
+    """
+
+    def _worker(self, tmp_path: Path) -> SpeculativeMergeWorker:
+        return _make_worker(_make_git_ops(tmp_path, pool=False, size=0))
+
+    def test_state_is_none_at_construction(self, tmp_path: Path) -> None:
+        """A fresh (or restarted) worker has never failed → the reset sentinel."""
+        worker = self._worker(tmp_path)
+
+        assert worker._chain_halving_state is None
+
+    def test_note_chain_outcome_halves_on_fail(self, tmp_path: Path) -> None:
+        worker = self._worker(tmp_path)
+
+        worker._note_chain_outcome(False, 6)
+        assert worker._chain_halving_state == 3
+
+        worker._note_chain_outcome(False, 3)
+        assert worker._chain_halving_state == 1
+
+        # The floor holds: a fail at 1 stays at 1, never 0.
+        worker._note_chain_outcome(False, 1)
+        assert worker._chain_halving_state == 1
+
+    def test_note_chain_outcome_resets_on_pass(self, tmp_path: Path) -> None:
+        worker = self._worker(tmp_path)
+
+        worker._note_chain_outcome(False, 6)
+        assert worker._chain_halving_state == 3
+
+        worker._note_chain_outcome(True, 3)
+        assert worker._chain_halving_state is None
+
+    def test_note_chain_outcome_is_synchronous(self, tmp_path: Path) -> None:
+        """Returns None, not a coroutine — it is a pure state fold, not I/O."""
+        worker = self._worker(tmp_path)
+
+        assert worker._note_chain_outcome(False, 4) is None
+
+    def test_deep_target_depth_delegates_to_the_pure_policy(
+        self, tmp_path: Path,
+    ) -> None:
+        """``_deep_target_depth`` composes live state with select_chain_depth.
+
+        It must DELEGATE rather than re-derive the formula, so there is exactly
+        one place the dispatch invariant is written down.
+        """
+        from orchestrator.merge_queue import select_chain_depth
+
+        worker = self._worker(tmp_path)
+
+        for cap, queue_len in ((0, 10), (6, 1), (6, 4), (6, 10), (1, 10)):
+            assert worker._deep_target_depth(cap, queue_len) == select_chain_depth(
+                cap, queue_len, worker._chain_halving_state,
+            )
+
+        worker._note_chain_outcome(False, 6)   # state → 3
+        for cap, queue_len in ((6, 10), (6, 2), (3, 10)):
+            assert worker._deep_target_depth(cap, queue_len) == select_chain_depth(
+                cap, queue_len, worker._chain_halving_state,
+            )
+
+    def test_scripted_round_sequence_end_to_end(self, tmp_path: Path) -> None:
+        """fail(6) → 3 → fail(3) → floor(None) → pass(1) → back to min(queue, cap).
+
+        The worker-level restatement of the PRD's halving-walk row.
+        """
+        worker = self._worker(tmp_path)
+        cap, queue_len = 6, 10
+
+        assert worker._deep_target_depth(cap, queue_len) == 6
+        worker._note_chain_outcome(False, 6)
+
+        assert worker._deep_target_depth(cap, queue_len) == 3
+        worker._note_chain_outcome(False, 3)
+
+        # Floor: no chain is dispatched this round at all.
+        assert worker._deep_target_depth(cap, queue_len) is None
+
+        # A passing ordinary (d=1) verify clears the bisector.
+        worker._note_chain_outcome(True, 1)
+        assert worker._chain_halving_state is None
+        assert worker._deep_target_depth(cap, queue_len) == 6
+
+    def test_does_not_touch_neighbouring_probe_state(self, tmp_path: Path) -> None:
+        """Negative control: the deep policy and the probe policy stay decoupled.
+
+        ``_recent_verify_outcomes`` (the probe's flake-rate window) and
+        ``_probe_round_counter`` (its round index) are the OTHER second-slot
+        state living in the same __init__ block; a deep outcome must not
+        silently perturb the probe's cadence or suppression signal.
+        """
+        worker = self._worker(tmp_path)
+        outcomes_before = list(worker._recent_verify_outcomes)
+        counter_before = worker._probe_round_counter
+
+        worker._note_chain_outcome(False, 6)
+        worker._note_chain_outcome(True, 2)
+
+        assert list(worker._recent_verify_outcomes) == outcomes_before
+        assert worker._probe_round_counter == counter_before
