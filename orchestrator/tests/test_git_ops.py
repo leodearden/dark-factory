@@ -8,6 +8,7 @@ import logging
 import os
 import subprocess
 import time
+from collections.abc import Mapping
 from pathlib import Path
 from unittest.mock import patch
 
@@ -21,8 +22,12 @@ from _orch_helpers import (
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import (
+    _EFFECT_SURVIVAL_AGGREGATE_THRESHOLD,
+    _EFFECT_SURVIVAL_PER_FILE_MIN_ADDED_LINES,
+    _EFFECT_SURVIVAL_PER_FILE_THRESHOLD,
     MERGE_PARK_REF,
     PERSISTENT_OFFLINE_DEEP_WORKTREE_NAME,
+    CommitEffectProbe,
     GitOps,
     MergeParkContentionError,
     MergeResult,
@@ -4355,14 +4360,14 @@ class TestCommitEffectPresentInMain:
     (a) TRUE when the commit's own touched paths are still byte-identical
         on main (effect present — here the trivial "commit == main HEAD"
         shape).
-    (b) FALSE when a later commit on main changes those same touched
-        paths again — the commit is STILL an ancestor of main, but its
-        own snapshot no longer matches HEAD (the blind spot this
-        primitive exists to catch).  The trigger condition is
-        deliberately broad: a genuine revert and ordinary later evolution
-        (e.g. another task's overlapping follow-up edit) are
-        indistinguishable here and both return False — see the
-        "Accepted risk" note on the primitive's docstring.
+    (b) FALSE when a later commit on main does not PRESERVE the lines the
+        commit added — here a wholesale replacement, survival 0.0 — the
+        commit is STILL an ancestor of main, but its own effect is gone
+        from HEAD (the blind spot this primitive exists to catch).  Since
+        task 3116 part (b) the trigger is no longer "any change to the
+        touched paths": ordinary additive evolution reads as PRESENT.  A
+        heavy REWRITE that drops most of those lines can still read as
+        absent — the narrowed residual risk, documented on the primitive.
     (c) For a no-ff merge commit, the primitive checks EVERY non-first
         parent's (each merged branch's) content — the paths it touched
         since its fork point (``merge-base(parent1, other_parent)``) —
@@ -4416,11 +4421,13 @@ class TestCommitEffectPresentInMain:
         STILL an ancestor of main (it is never removed from history) but a
         LATER commit on main changes the exact paths it touched — the
         effect is gone from HEAD even though ancestry alone says "landed".
-        The trigger is deliberately broad — this later commit need not be
-        an intentional revert; ANY change to the touched paths (a genuine
-        revert, or ordinary subsequent evolution such as another task's
-        overlapping edit) reads as "effect not present" here. See the
-        "Accepted risk" note on commit_effect_present_in_main's docstring.
+        The trigger is a change that does not PRESERVE the commit's added
+        lines — here a full replacement, so survival is 0.0.  Since task 3116
+        that is what "effect not present" means: ordinary additive evolution
+        (another task appending to a file this one touched) now reads as
+        PRESENT, because its added lines are still there.  See the
+        ``_EFFECT_SURVIVAL_*`` thresholds and the residual-risk note on
+        commit_effect_present_in_main's docstring.
         """
         (git_repo / 'fileA.py').write_text('fixed\n')
         await _run(['git', 'add', 'fileA.py'], cwd=git_repo)
@@ -4622,12 +4629,14 @@ class TestCommitEffectPresentInMain:
         diff-tree unless ``-z``/``-c core.quotePath=false`` is used.
         Without that, the quoted literal string (backslashes, octal
         escapes and all) fails to match the real file as a ``--``
-        pathspec, so the follow-up ``git diff --quiet`` call silently
-        reports "no difference" against an effectively empty pathspec —
-        a FALSE POSITIVE ("effect present") even though the file's
-        content at main HEAD has genuinely changed since the cited
-        commit. Confirmed False here pins that the primitive resolves
-        the real path, not git's quoted rendering of it.
+        pathspec, so the terminal comparison silently sees nothing at all
+        and reports a FALSE POSITIVE ("effect present") even though the
+        file's content at main HEAD no longer carries the cited commit's
+        lines. Confirmed False here pins that the primitive resolves the
+        real path, not git's quoted rendering of it.  That is a PATH-QUOTING
+        regression pin and is unaffected by the task-3116 survival semantics:
+        the later commit here replaces the file's content wholesale, so
+        survival is 0.0 under any threshold.
         """
         (git_repo / 'café.py').write_text('fixed\n')
         await _run(['git', 'add', 'café.py'], cwd=git_repo)
@@ -4643,6 +4652,1398 @@ class TestCommitEffectPresentInMain:
         assert rc == 0, f'later commit failed: {err}'
 
         assert await git_ops.commit_effect_present_in_main(fix_sha) is False
+
+
+@pytest.mark.asyncio
+class TestDescribeCommitEffectInMain:
+    """Real-git tests for GitOps.describe_commit_effect_in_main (task 3116).
+
+    The DIAGNOSTIC companion to ``commit_effect_present_in_main``: the bool
+    says only THAT the cited commit's effect is not present at main HEAD,
+    which is why two live instances (tasks 3653/3640/3717 and the
+    instance-2 co-touched-hot-file shape) each cost days of misdiagnosis.
+    ``describe_commit_effect_in_main`` returns the SAME verdict plus the
+    facts that explain it — WHICH paths diverged, WHICH anchor commit the
+    comparison ran against, and WHICH structural failure (if any) short-
+    circuited it.  ``commit_effect_present_in_main`` is a one-line wrapper
+    over this method, so the bool and its explanation can never drift.
+
+    These tests assert on DATACLASS FIELDS only, never on prose/docstrings.
+    """
+
+    async def test_present_for_non_merge_with_matching_paths(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """A commit that IS main HEAD: its touched paths trivially match, so
+        present is True with no divergence and no failure code, and the
+        anchor is the commit itself.
+        """
+        (git_repo / 'fileA.py').write_text('fixed\n')
+        await _run(['git', 'add', 'fileA.py'], cwd=git_repo)
+        rc, _, err = await _run(['git', 'commit', '-m', 'fix commit'], cwd=git_repo)
+        assert rc == 0, f'fix commit failed: {err}'
+        rc, fix_sha, err = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        assert rc == 0, f'rev-parse failed: {err}'
+        fix_sha = fix_sha.strip()
+
+        probe = await git_ops.describe_commit_effect_in_main(fix_sha)
+
+        assert isinstance(probe, CommitEffectProbe)
+        assert probe.present is True
+        assert probe.diverged_paths == ()
+        assert probe.failure is None
+        assert probe.anchor_sha == fix_sha
+
+    async def test_names_diverged_path_for_non_merge(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """The one line that would have resolved both reported instances: a
+        later commit fully replaces the touched file, so the probe not only
+        says absent but NAMES ``fileA.py`` as the diverged path.  The naming
+        is the point here, not the bool.
+
+        The failure code became ``'effect_not_survived'`` with task 3116 part
+        (b).  The verdict is unchanged and so is the reason it is correct —
+        this is a full REPLACEMENT (``fixed`` -> ``changed again``), so line
+        survival is 0.0 and the commit's effect really is gone.  What changed
+        is only which fact decides it: ``'paths_diverged'`` (byte-identity
+        broken) is now a diagnostic that no longer decides anything, because
+        95.4% of the corpus breaks byte-identity while their deliverables sit
+        untouched at main.
+        """
+        (git_repo / 'fileA.py').write_text('fixed\n')
+        await _run(['git', 'add', 'fileA.py'], cwd=git_repo)
+        rc, _, err = await _run(['git', 'commit', '-m', 'fix commit'], cwd=git_repo)
+        assert rc == 0, f'fix commit failed: {err}'
+        rc, fix_sha, err = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        assert rc == 0, f'rev-parse failed: {err}'
+        fix_sha = fix_sha.strip()
+
+        (git_repo / 'fileA.py').write_text('changed again\n')
+        await _run(['git', 'add', 'fileA.py'], cwd=git_repo)
+        rc, _, err = await _run(['git', 'commit', '-m', 'later commit'], cwd=git_repo)
+        assert rc == 0, f'later commit failed: {err}'
+
+        probe = await git_ops.describe_commit_effect_in_main(fix_sha)
+
+        assert probe.present is False
+        assert probe.failure == 'effect_not_survived'
+        assert probe.aggregate_survival == 0.0
+        assert probe.diverged_paths == ('fileA.py',)
+        assert probe.anchor_sha == fix_sha
+
+    async def test_merge_names_only_the_co_touched_hot_file(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """THE INSTANCE-2 SHAPE, in miniature.
+
+        A task branch touches its own ``deliverable.py`` AND a shared hot
+        file ``shared.manifest``.  Main independently edits a DISTANT,
+        non-conflicting line of ``shared.manifest`` BEFORE the merge, so
+        ``git merge --no-ff`` auto-merges cleanly and main HEAD carries
+        BOTH edits — a perfectly clean landing.  Byte-identity against the
+        second parent nonetheless fails, because the parent's pre-merge
+        blob for ``shared.manifest`` lacks main's independent edit.
+
+        SINCE TASK 3116 PART (b) THIS LANDING IS ACCEPTED, and the inversion
+        of this assertion is the entire point of the task rather than a
+        regression.  Nothing about the scenario changed — it was always a
+        clean landing whose deliverable is intact at main — only the question
+        being asked did.  Byte-identity ("has anyone touched these paths?")
+        said absent; line survival ("are the branch's added lines still
+        there?") says 1.0, because the merge integrated both edits exactly as
+        git intended.  Under the old semantics this shape cost a full
+        spurious dispatch: plan/verify/review re-run, a bogus task_failure
+        escalation filed, days blocked, and the condition is ABSORBING, so
+        every subsequent tick repeated it.
+
+        ``diverged_paths`` is still asserted, and still names
+        ``shared.manifest`` and NOT ``deliverable.py``.  That diagnostic is
+        retained on a PRESENT verdict on purpose: it is the single most
+        legible line in an escalation — it shows at a glance that the
+        diverged path is a co-touched hot file rather than this task's
+        deliverable, i.e. skew rather than a revert — it has simply stopped
+        being the thing that decides the verdict.
+        """
+        (git_repo / 'shared.manifest').write_text(
+            ''.join(f'line{i}\n' for i in range(1, 41))
+        )
+        await _run(['git', 'add', 'shared.manifest'], cwd=git_repo)
+        rc, _, err = await _run(['git', 'commit', '-m', 'seed manifest'], cwd=git_repo)
+        assert rc == 0, f'seed manifest failed: {err}'
+
+        rc, _, err = await _run(['git', 'checkout', '-b', 'task/9001'], cwd=git_repo)
+        assert rc == 0, f'checkout task/9001 failed: {err}'
+        (git_repo / 'deliverable.py').write_text('deliverable\n')
+        lines = (git_repo / 'shared.manifest').read_text().split('\n')
+        lines[0] = 'line1 touched by the task branch'
+        (git_repo / 'shared.manifest').write_text('\n'.join(lines))
+        await _run(['git', 'add', '-A'], cwd=git_repo)
+        rc, _, err = await _run(
+            ['git', 'commit', '-m', 'impl(9001): deliverable + manifest entry'],
+            cwd=git_repo,
+        )
+        assert rc == 0, f'branch commit failed: {err}'
+
+        rc, _, err = await _run(['git', 'checkout', 'main'], cwd=git_repo)
+        assert rc == 0, f'checkout main failed: {err}'
+        lines = (git_repo / 'shared.manifest').read_text().split('\n')
+        lines[39] = 'line40 touched independently on main'
+        (git_repo / 'shared.manifest').write_text('\n'.join(lines))
+        await _run(['git', 'add', '-A'], cwd=git_repo)
+        rc, _, err = await _run(
+            ['git', 'commit', '-m', 'unrelated: distant manifest edit'], cwd=git_repo,
+        )
+        assert rc == 0, f'main-side commit failed: {err}'
+
+        rc, _, err = await _run(
+            ['git', 'merge', '--no-ff', 'task/9001', '-m', 'Merge task/9001 into main'],
+            cwd=git_repo,
+        )
+        assert rc == 0, f'clean no-ff merge failed: {err}'
+        rc, merge_sha, err = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        assert rc == 0, f'rev-parse failed: {err}'
+        merge_sha = merge_sha.strip()
+        rc, second_parent, err = await _run(
+            ['git', 'rev-parse', f'{merge_sha}^2'], cwd=git_repo,
+        )
+        assert rc == 0, f'rev-parse ^2 failed: {err}'
+        second_parent = second_parent.strip()
+
+        probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+
+        assert probe.present is True
+        assert probe.failure is None
+        assert probe.aggregate_survival == 1.0
+        assert probe.diverged_paths == ('shared.manifest',)
+        assert 'deliverable.py' not in probe.diverged_paths
+        assert probe.anchor_sha == second_parent
+
+    async def test_unresolvable_commit_reports_failure_code(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """An unresolvable sha is fail-safe absent, but distinguishable from
+        a genuine path divergence — 'unresolvable_commit', not silence.
+        """
+        probe = await git_ops.describe_commit_effect_in_main('f' * 40)
+
+        assert probe.present is False
+        assert probe.failure == 'unresolvable_commit'
+        assert probe.diverged_paths == ()
+
+    async def test_empty_branch_merge_reports_failure_code(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """A merge whose branch nets ZERO content vs its own fork point has
+        no deliverable to confirm — fail-safe absent under the distinct
+        'empty_branch_merge' code, never conflated with paths_diverged.
+        """
+        rc, _, err = await _run(['git', 'checkout', '-b', 'branch'], cwd=git_repo)
+        assert rc == 0, f'checkout branch failed: {err}'
+        (git_repo / 'temp.py').write_text('temp\n')
+        await _run(['git', 'add', 'temp.py'], cwd=git_repo)
+        rc, _, err = await _run(['git', 'commit', '-m', 'add temp'], cwd=git_repo)
+        assert rc == 0, f'add temp failed: {err}'
+        (git_repo / 'temp.py').unlink()
+        await _run(['git', 'add', '-A'], cwd=git_repo)
+        rc, _, err = await _run(['git', 'commit', '-m', 'remove temp again'], cwd=git_repo)
+        assert rc == 0, f'remove temp failed: {err}'
+
+        rc, _, err = await _run(['git', 'checkout', 'main'], cwd=git_repo)
+        assert rc == 0, f'checkout main failed: {err}'
+        rc, _, err = await _run(
+            ['git', 'merge', '--no-ff', 'branch', '-m', 'Merge branch into main'],
+            cwd=git_repo,
+        )
+        assert rc == 0, f'merge failed: {err}'
+        rc, merge_sha, err = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        assert rc == 0, f'rev-parse failed: {err}'
+
+        probe = await git_ops.describe_commit_effect_in_main(merge_sha.strip())
+
+        assert probe.present is False
+        assert probe.failure == 'empty_branch_merge'
+
+    async def test_empty_non_merge_commit_stays_present(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """Task-2500 behaviour preserved: a genuinely empty ordinary commit
+        has an empty touched-set, for which path-based revert detection is
+        inapplicable — present True, no failure code.
+        """
+        rc, _, err = await _run(
+            ['git', 'commit', '--allow-empty', '-m', 'empty commit'], cwd=git_repo,
+        )
+        assert rc == 0, f'empty commit failed: {err}'
+        rc, sha, err = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        assert rc == 0, f'rev-parse failed: {err}'
+
+        probe = await git_ops.describe_commit_effect_in_main(sha.strip())
+
+        assert probe.present is True
+        assert probe.failure is None
+
+    async def test_non_ascii_diverged_path_round_trips_unquoted(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """The ``-z``/``core.quotePath=false`` hardening must survive into
+        the new OUTPUT parsing, not just the touched-set stage: a git-quoted
+        ``caf\\303\\251.py`` rendered into an escalation is a diagnostic that
+        misleads the human reading it.
+        """
+        (git_repo / 'café.py').write_text('fixed\n')
+        await _run(['git', 'add', 'café.py'], cwd=git_repo)
+        rc, _, err = await _run(['git', 'commit', '-m', 'fix commit'], cwd=git_repo)
+        assert rc == 0, f'fix commit failed: {err}'
+        rc, fix_sha, err = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        assert rc == 0, f'rev-parse failed: {err}'
+        fix_sha = fix_sha.strip()
+
+        (git_repo / 'café.py').write_text('changed again\n')
+        await _run(['git', 'add', 'café.py'], cwd=git_repo)
+        rc, _, err = await _run(['git', 'commit', '-m', 'later commit'], cwd=git_repo)
+        assert rc == 0, f'later commit failed: {err}'
+
+        probe = await git_ops.describe_commit_effect_in_main(fix_sha)
+
+        assert probe.present is False
+        assert probe.diverged_paths == ('café.py',)
+
+
+async def _commit_all(repo: Path, message: str) -> str:
+    """Stage everything under *repo* and commit, returning the new sha."""
+    # esc-3072-3: git discovery walks UP, so a *repo* that is not itself a
+    # repository root sends `git add -A` + `git commit` into whatever repo
+    # encloses it — a real COMMIT into a live task worktree, sweeping up
+    # whatever uncommitted work it was holding. FIRST statement, before any
+    # subprocess, so a rejected call writes nothing anywhere.
+    assert_isolated_git_repo(repo)
+    await _run(['git', 'add', '-A'], cwd=repo)
+    rc, _, err = await _run(['git', 'commit', '-m', message], cwd=repo)
+    assert rc == 0, f'commit {message!r} failed: {err}'
+    rc, sha, err = await _run(['git', 'rev-parse', 'HEAD'], cwd=repo)
+    assert rc == 0, f'rev-parse failed: {err}'
+    return sha.strip()
+
+
+def _numbered(prefix: str, count: int) -> str:
+    """Return *count* unique, non-blank lines.
+
+    Uniqueness is load-bearing, not cosmetic: survival is measured by line-SET
+    membership, so duplicate or short-common lines can be "present" at main by
+    pure coincidence.  That is a real corpus hazard — motivating merge 3640 has
+    18 of its 45 removed lines still literally present at main for exactly this
+    reason (task 3116 b4) — and a fixture that tripped over it would measure
+    coincidence instead of survival.
+    """
+    return ''.join(f'{prefix}_{i:05d} = {i}\n' for i in range(count))
+
+
+async def _seed_on_main(
+    repo: Path, files: dict[str, str | bytes], message: str,
+) -> str:
+    """Write *files* and commit them straight to main (pre-branch baseline)."""
+    # Guarded ahead of the mkdir/write_text loop, not just inside _commit_all:
+    # a rejected call must leave no fixture litter in the wrong directory
+    # either (esc-3072-3).
+    assert_isolated_git_repo(repo)
+    for name, content in files.items():
+        path = repo / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if isinstance(content, bytes):
+            path.write_bytes(content)
+        else:
+            path.write_text(content)
+    return await _commit_all(repo, message)
+
+
+async def _land_branch(
+    repo: Path,
+    task_id: str,
+    files: Mapping[str, str | bytes] | None = None,
+    *,
+    deletes: tuple[str, ...] = (),
+    renames: tuple[tuple[str, str], ...] = (),
+) -> str:
+    """Create task/<id> off main, mutate the tree, merge --no-ff, return merge sha.
+
+    *files* values may be ``bytes`` to write a binary blob.  *deletes* and
+    *renames* exist because the vacuous cases (task 3116 b3) are defined by
+    having no added lines at all, which a write-only helper cannot express.
+    """
+    # esc-3072-3: the branch create, `git mv`/`git rm`, tree writes and
+    # `git merge --no-ff` below all mutate whatever repo encloses *repo* if it
+    # is not itself a repository root — this helper would MERGE into a live
+    # task worktree's main. FIRST statement, ahead of every subprocess and
+    # every filesystem write.
+    assert_isolated_git_repo(repo)
+    rc, _, err = await _run(
+        ['git', 'checkout', '-b', f'task/{task_id}', 'main'], cwd=repo,
+    )
+    assert rc == 0, f'branch create failed: {err}'
+    for old_path, new_path in renames:
+        rc, _, err = await _run(['git', 'mv', old_path, new_path], cwd=repo)
+        assert rc == 0, f'git mv {old_path} -> {new_path} failed: {err}'
+    for name in deletes:
+        rc, _, err = await _run(['git', 'rm', '-q', name], cwd=repo)
+        assert rc == 0, f'git rm {name} failed: {err}'
+    for name, content in (files or {}).items():
+        path = repo / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if isinstance(content, bytes):
+            path.write_bytes(content)
+        else:
+            path.write_text(content)
+    await _commit_all(repo, f'work for task {task_id}')
+    rc, _, err = await _run(['git', 'checkout', 'main'], cwd=repo)
+    assert rc == 0, f'checkout main failed: {err}'
+    rc, _, err = await _run(
+        [
+            'git', 'merge', '--no-ff',
+            '-m', f'Merge task/{task_id} into main', f'task/{task_id}',
+        ],
+        cwd=repo,
+    )
+    assert rc == 0, f'merge failed: {err}'
+    rc, sha, err = await _run(['git', 'rev-parse', 'HEAD'], cwd=repo)
+    assert rc == 0, f'rev-parse failed: {err}'
+    return sha.strip()
+
+
+@pytest.mark.asyncio
+class TestCommitEffectSurvival:
+    """Threshold line-SURVIVAL replaces byte-identity (task 3116 part b).
+
+    The predicate used to ask "does main still match the branch byte for
+    byte?", which is a question about whether ANYONE has touched the files
+    since — not about whether the branch's deliverable is still there.  On the
+    full corpus (2827 ``Merge task/N into main`` commits, measured at main
+    5bd7fd8489) that check reports effect_absent for 95.4% of all landings,
+    a third of them within 24 hours of merging.  A predicate that returns the
+    same answer for 95% of its population carries almost no information, and
+    the condition is ABSORBING — byte-identity once lost is never restored —
+    so each false False bought a full spurious dispatch (plan/verify/review, a
+    bogus task_failure escalation, days blocked; ~5.80 USD across tasks
+    3653/3640/3717).
+
+    The replacement asks the honest question: do the branch's ADDED LINES
+    still survive at main?  Verdict (constants pinned by test (f) below):
+
+        aggregate survival >= 0.98
+        AND every path with >= 25 added lines has per-file survival >= 0.90
+
+    Every fixture here is SYNTHETIC and sits at survival exactly 1.0 or 0.0,
+    so each case is unambiguous under ANY threshold in (0, 1) and no test
+    silently encodes a guessed number.  The two MIXED cases (c) and (d) are
+    the exceptions by necessity — they exist precisely to pin where the
+    per-file guard and its floor sit relative to each other — and both state
+    their arithmetic explicitly in the docstring.
+    """
+
+    async def test_additive_evolution_survives_the_task_3653_shape(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """THE DECISIVE MOTIVATING CASE, reconstructed synthetically.
+
+        A merge lands +N/-0 into a file; main then ADDS further lines to that
+        same file without touching any of the branch's.  Byte-identity is
+        broken, so the pre-3116 predicate said effect_absent — but every added
+        line is still literally there, so the effect plainly survived.
+
+        This is the exact live shape that re-dispatched task 3653 and left it
+        blocked four days: merge bd3d6f49b4 was +195/-0, additive edits landed
+        15.5 hours later, and the real merge measures aggregate survival
+        1.0000.  Mathematically 1.0 is guaranteed by construction here: a
+        later commit that only appends can never remove an anchor line from
+        main's line-set.
+
+        ``diverged_paths`` is asserted NON-empty on a PRESENT verdict on
+        purpose — byte-level divergence is still reported as a diagnostic, it
+        is simply no longer decisive.
+        """
+        merge_sha = await _land_branch(
+            git_repo, '3653', {'fileA.py': _numbered('branch', 6)},
+        )
+        (git_repo / 'fileA.py').write_text(
+            _numbered('branch', 6) + _numbered('later', 40),
+        )
+        await _commit_all(git_repo, 'later additive evolution on main')
+
+        probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+
+        assert probe.present is True
+        assert probe.failure is None
+        assert probe.aggregate_survival == 1.0
+        assert probe.diverged_paths == ('fileA.py',), (
+            'byte-identity IS broken here — the path must still be reported '
+            'as a diagnostic even though it no longer decides the verdict'
+        )
+
+    async def test_genuine_revert_is_still_rejected(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """A real revert must still be caught — this is the task-1175 hole.
+
+        The branch's added lines are removed wholesale by a later commit, so
+        survival is exactly 0.0 and the verdict is False under any threshold.
+        The failure code is the NEW ``'effect_not_survived'``, distinct from
+        ``'paths_diverged'`` (which since part (b) means only "byte-identity
+        broken" — a much weaker, no-longer-decisive fact).
+        """
+        await _seed_on_main(git_repo, {'mod.py': _numbered('base', 10)}, 'seed mod')
+        merge_sha = await _land_branch(
+            git_repo, '1175',
+            {'mod.py': _numbered('base', 10) + _numbered('deliverable', 40)},
+        )
+        (git_repo / 'mod.py').write_text(_numbered('base', 10))
+        await _commit_all(git_repo, 'revert the deliverable')
+
+        probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+
+        assert probe.present is False
+        assert probe.failure == 'effect_not_survived'
+        assert probe.aggregate_survival == 0.0
+        assert probe.diverged_paths == ('mod.py',)
+
+    async def test_per_file_guard_vetoes_reverted_deliverable(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """THE PER-FILE GUARD BITES — b2's own objection, closed.
+
+        b2 objected that a bare aggregate rule hides a reverted 20-line
+        deliverable behind a 2000-line test file.  This is that shape:
+
+            big_test.py    2000 added lines, untouched since  -> survival 1.00
+            deliverable.py   30 added lines, fully reverted   -> survival 0.00
+            aggregate = 2000/2030 = 0.9852  >= 0.98           -> PASSES
+
+        So the aggregate rule alone would wave this through.  The per-file
+        guard is what rejects it: deliverable.py carries 30 added lines, at or
+        above the 25-line floor, and 0.00 < 0.90.  The assertion on
+        ``aggregate_survival >= 0.98`` is load-bearing — it proves the GUARD
+        bit and not the aggregate, which is the whole point of the case.
+
+        On the real corpus this guard vetoes 40 merges that bare aggregate
+        would have accepted, at a cost of 1.5 points of recovery.
+        """
+        await _seed_on_main(
+            git_repo, {'deliverable.py': _numbered('base', 5)}, 'seed deliverable',
+        )
+        merge_sha = await _land_branch(
+            git_repo, '2000',
+            {
+                'deliverable.py': _numbered('base', 5) + _numbered('gone', 30),
+                'big_test.py': _numbered('kept', 2000),
+            },
+        )
+        (git_repo / 'deliverable.py').write_text(_numbered('base', 5))
+        await _commit_all(git_repo, 'revert only the deliverable')
+
+        probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+
+        assert probe.present is False
+        assert probe.failure == 'effect_not_survived'
+        assert probe.aggregate_survival is not None
+        assert probe.aggregate_survival >= 0.98, (
+            'the aggregate must PASS here — otherwise this case proves '
+            'nothing about the per-file guard'
+        )
+        assert probe.worst_guarded_path == 'deliverable.py'
+        assert probe.worst_guarded_survival == 0.0
+
+    async def test_per_file_floor_protects_a_small_hot_file(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """THE FLOOR PROTECTS A SMALL HOT FILE — the task-3640 shape.
+
+        A substantial deliverable survives intact while a small, frequently
+        edited prose file the branch also touched is heavily rewritten:
+
+            deliverable.py  1200 added lines, untouched  -> survival 1.00
+            notes.md          20 added lines, rewritten  -> survival 0.00
+            aggregate = 1200/1220 = 0.9836  >= 0.98      -> PASSES
+            notes.md has 20 added lines < 25 floor       -> EXEMPT from guard
+
+        Without the floor, a per-file rule rejects a motivating case: real
+        merge ed56626ce0 (task 3640) has aggregate 0.9848 but per-file-MINIMUM
+        0.6087, driven entirely by a 23-line hot SKILL.md.  25 is the SMALLEST
+        floor that clears that anchor, keeping the guard as wide — as much
+        veto power — as the anchors allow.
+
+        ``notes.md`` is asserted present in ``diverged_paths`` to prove the
+        floor is what saved this landing: the file genuinely did diverge.
+        """
+        await _seed_on_main(
+            git_repo,
+            {'deliverable.py': _numbered('base', 5), 'notes.md': _numbered('note', 5)},
+            'seed deliverable and notes',
+        )
+        merge_sha = await _land_branch(
+            git_repo, '3640',
+            {
+                'deliverable.py': _numbered('base', 5) + _numbered('kept', 1200),
+                'notes.md': _numbered('note', 5) + _numbered('prose', 20),
+            },
+        )
+        (git_repo / 'notes.md').write_text(_numbered('rewritten', 30))
+        await _commit_all(git_repo, 'heavily rewrite the hot prose file')
+
+        probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+
+        assert probe.present is True
+        assert probe.failure is None
+        assert probe.aggregate_survival is not None
+        assert probe.aggregate_survival >= 0.98
+        assert 'notes.md' in probe.diverged_paths, (
+            'notes.md genuinely diverged — the FLOOR is what saved this '
+            'landing, not an absence of divergence'
+        )
+
+    async def test_probe_carries_the_structured_survival_facts(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """The probe must carry WHY, not just THAT.
+
+        The probe has to name the ratio measured, the thresholds and floor
+        actually applied, and the worst offending guarded path.  An
+        escalation that says only "effect absent" is what cost days of
+        misdiagnosis twice.
+
+        THIS test asserts the dataclass only.  That those fields actually
+        reach the escalation body is a separate seam, pinned in
+        ``test_landing_evidence.py`` by
+        ``test_probe_carries_the_survival_facts_that_decided_it`` (threading
+        through ``_record_effect_divergence``) and
+        ``test_survival_measurement_is_rendered_not_just_carried``
+        (rendering).  Stated explicitly because this docstring previously
+        claimed ``format_unattributed_landing_detail`` "renders this
+        verbatim" while nothing rendered it at all — the same
+        prose-asserts-an-unimplemented-behaviour defect this task exists to
+        remove.
+        """
+        await _seed_on_main(git_repo, {'mod.py': _numbered('base', 10)}, 'seed mod')
+        merge_sha = await _land_branch(
+            git_repo, '4242',
+            {'mod.py': _numbered('base', 10) + _numbered('deliverable', 40)},
+        )
+        (git_repo / 'mod.py').write_text(_numbered('base', 10))
+        await _commit_all(git_repo, 'revert the deliverable')
+
+        probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+
+        assert probe.added_lines_total == 40
+        assert probe.aggregate_survival == 0.0
+        assert probe.worst_guarded_path == 'mod.py'
+        assert probe.worst_guarded_survival == 0.0
+        assert probe.aggregate_threshold == _EFFECT_SURVIVAL_AGGREGATE_THRESHOLD
+        assert probe.per_file_threshold == _EFFECT_SURVIVAL_PER_FILE_THRESHOLD
+        assert (
+            probe.per_file_min_added_lines
+            == _EFFECT_SURVIVAL_PER_FILE_MIN_ADDED_LINES
+        )
+
+    async def test_repeated_added_lines_survive_only_as_often_as_main_kept_them(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """Survival is a MULTISET intersection, not set membership.
+
+        Every other fixture here uses ``_numbered``, whose lines are unique by
+        construction — which is exactly why set membership looked correct.
+        Real deliverables are not unique: a manifest gains 40 near-identical
+        entries, a module gains 40 ``return None`` guards, a config gains a
+        repeated import block.  Under set membership main retaining ONE copy
+        scored ALL 40 as surviving, so a reverted deliverable cleared the 0.98
+        aggregate.  That is a false ACCEPT, the one direction this check must
+        never take.
+
+        Here the anchor adds 40 identical lines and a later commit on main
+        keeps exactly one of them.  Correct survival is 1/40 = 0.025.
+        """
+        await _seed_on_main(git_repo, {'manifest.txt': 'seed\n'}, 'seed manifest')
+        repeated = 'entry = shared\n' * 40
+        merge_sha = await _land_branch(
+            git_repo, '9101', {'manifest.txt': 'seed\n' + repeated},
+        )
+        (git_repo / 'manifest.txt').write_text('seed\nentry = shared\n')
+        await _commit_all(git_repo, 'revert all but one copy of the entry')
+
+        probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+
+        assert probe.added_lines_total == 40
+        assert probe.aggregate_survival == pytest.approx(1 / 40), (
+            'main kept ONE copy, so exactly one added line survived — set '
+            'membership would have scored all 40 and accepted the landing'
+        )
+        assert probe.present is False
+        assert probe.failure == 'effect_not_survived'
+
+    async def test_main_renaming_the_deliverable_after_landing_reads_as_absent(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """KNOWN GAP, pinned so it is explicit rather than folklore.
+
+        Survival is read PER PATH under the name the anchor used, so when a
+        later commit on main simply MOVES the deliverable, ``git show
+        <main>:<old path>`` fails, main's line multiset comes back None, and
+        every added line counts as lost — even though all of them are present
+        at main, intact, under the new name.
+
+        This is a false POSITIVE (a spurious reject), i.e. the fail-safe
+        direction, and it is a genuine member of the residual tail
+        :meth:`describe_commit_effect_in_main` describes.  It is NOT closed
+        here: resolving the path through ``git diff --name-status -M`` before
+        the read would loosen the predicate, and every threshold in this
+        module is calibrated against a full-corpus sweep taken WITHOUT that
+        loosening.  Retuning is a measurement, not an edit.
+
+        ``test_pure_rename_resolves_by_blob_not_line_set`` covers the mirror
+        case — a rename performed by the ANCHOR — which is decided correctly.
+        """
+        await _seed_on_main(git_repo, {'mod.py': _numbered('base', 5)}, 'seed mod')
+        merge_sha = await _land_branch(
+            git_repo, '9102',
+            {'mod.py': _numbered('base', 5) + _numbered('deliverable', 40)},
+        )
+
+        assert (await git_ops.describe_commit_effect_in_main(merge_sha)).present, (
+            'precondition: the landing reads as present before the move'
+        )
+
+        rc, _, err = await _run(['git', 'mv', 'mod.py', 'renamed.py'], cwd=git_repo)
+        assert rc == 0, f'rename on main failed: {err}'
+        await _commit_all(git_repo, 'main moves the deliverable to a new path')
+
+        assert _numbered('deliverable', 40) in (git_repo / 'renamed.py').read_text(), (
+            'precondition: every added line is still at main, just moved'
+        )
+
+        probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+
+        assert probe.present is False, (
+            'CURRENT behaviour, deliberately pinned: a move by main reads as '
+            'a total loss. Closing this needs rename resolution plus a '
+            'corpus re-measurement, not a one-line edit'
+        )
+        assert probe.failure == 'effect_not_survived'
+        assert probe.aggregate_survival == 0.0
+
+    async def test_clean_paths_are_costed_in_one_batched_read(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """Paths that did NOT diverge are read in ONE batch, not ~5 subprocesses
+        each.
+
+        This is the COMMON path — re-run for every landing candidate on every
+        15s dispatch tick — and a clean landing touching many files used to
+        pay a full ``git diff`` (plus, for a vacuous path, four existence/oid
+        reads) for each one, all to learn a survival ratio that is 1.0 by
+        construction.  The memo does not save it: a merge landing is exactly
+        what advances main HEAD and invalidates every entry.
+
+        Asserting the COMMAND COUNT is what pins it; the verdict assertions
+        alone pass with the per-path loop restored.
+        """
+        await _seed_on_main(git_repo, {'seed.py': 'seed = 1\n'}, 'seed')
+        files = {f'pkg/mod_{i:02d}.py': _numbered(f'body{i}', 30) for i in range(12)}
+        merge_sha = await _land_branch(git_repo, '9103', files)
+
+        with _git_command_spy() as recorded:
+            probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+            cold = list(recorded)
+
+        assert probe.present is True
+        assert probe.added_lines_total == 12 * 30
+        per_path_diffs = [
+            cmd for cmd in cold
+            if 'diff' in cmd and '--unified=0' in cmd and cmd[-2] == '--'
+        ]
+        assert len(per_path_diffs) <= 1, (
+            f'12 non-diverged paths must not cost a diff each; saw '
+            f'{len(per_path_diffs)} pathspec-scoped unified diffs'
+        )
+        assert len(cold) < 12, (
+            f'the whole clean probe must cost well under one command per '
+            f'touched path; saw {len(cold)}: {cold}'
+        )
+
+
+@pytest.mark.asyncio
+class TestCommitEffectSurvivalVacuousCases:
+    """ZERO-ADDED-LINES deliverables must not be waved through (task 3116 b3).
+
+    An added-lines-survive predicate is TRIVIALLY TRUE for a branch that added
+    no lines, so without a dedicated arm the detector silently becomes a NO-OP
+    for a whole class of deliverables: pure deletions, file removals, renames,
+    binaries, mode changes.  The amendment's words for that outcome are "the
+    fix is a green light that proves nothing".
+
+    The full corpus puts this class at 0.53% of merges (15 of 2822) — rare,
+    but a silent always-True for a deletion-shaped deliverable is exactly the
+    task-1175 clobber this gate exists to prevent, so rarity is not a reason
+    to skip it.  A deletion that gets reverted is a REAL revert and must be
+    caught; that is the whole point of the gate.
+
+    Each arm is decided by the mechanism that actually applies to its shape:
+
+        deleted path      still absent at main?          (presence)
+        rename / binary   same blob oid at main?         (blob comparison)
+        removed-only text removed lines still absent?    (line-set)
+
+    Removed-line absence is used HERE AND ONLY HERE.  It is deliberately NOT a
+    global conjunct on the survival path: corpus-wide only 73.0% of removed
+    lines are still absent, and motivating merge 3640 has 18 of its 45 removed
+    lines literally present again at main by short-common-line coincidence, so
+    a global conjunct would reject a case this task exists to fix (b4).
+    """
+
+    async def test_pure_line_deletion_holds_then_is_restored(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """A branch that ONLY removes lines: zero added lines throughout, so
+        this can be decided only by whether the removed lines are still gone.
+
+        Holding -> present.  Restored by a later commit -> absent: putting
+        back what the deliverable deleted is a genuine revert.
+        """
+        await _seed_on_main(
+            git_repo, {'mod.py': _numbered('base', 10)}, 'seed mod',
+        )
+        keep = ''.join(
+            line + '\n' for line in _numbered('base', 10).split('\n')[:4] if line
+        )
+        merge_sha = await _land_branch(git_repo, '7001', {'mod.py': keep})
+
+        probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+        assert probe.present is True, 'the deletion still holds at main'
+        assert probe.aggregate_survival is None, (
+            'no added lines were measured, so no survival ratio may be claimed'
+        )
+
+        (git_repo / 'mod.py').write_text(_numbered('base', 10))
+        await _commit_all(git_repo, 'restore the deleted lines')
+
+        probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+        assert probe.present is False
+        assert probe.failure == 'vacuous_effect_absent'
+        assert probe.vacuous_paths == ('mod.py',)
+
+    async def test_file_deletion_holds_then_is_resurrected(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """A branch whose deliverable IS a file removal.  Zero added lines, so
+        the pre-b3 code measured nothing at all here.
+        """
+        await _seed_on_main(
+            git_repo, {'obsolete.py': _numbered('old', 12)}, 'seed obsolete',
+        )
+        merge_sha = await _land_branch(git_repo, '7002', deletes=('obsolete.py',))
+
+        probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+        assert probe.present is True, 'the file is still gone at main'
+
+        (git_repo / 'obsolete.py').write_text(_numbered('old', 12))
+        await _commit_all(git_repo, 'resurrect the deleted file')
+
+        probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+        assert probe.present is False
+        assert probe.failure == 'vacuous_effect_absent'
+        assert 'obsolete.py' in probe.vacuous_paths
+
+    async def test_pure_rename_resolves_by_blob_not_line_set(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """A content-preserving rename must not be rescued by the identical
+        content still sitting at the OLD path.
+
+        MEASURED, and it corrected this test's original premise: git's rename
+        detection collapses the touched set for a pure rename to the
+        DESTINATION path alone (``diff --name-only`` reports only
+        ``new_name.py``), and a path-scoped ``diff --unified=0`` cannot see
+        the rename pair, so the destination reads as a plain 30-line ADD.  A
+        pure rename is therefore NOT vacuous under this enumeration and never
+        reaches the b3 arm — it is decided by ordinary line survival.
+
+        That is still correct, and for a reason worth pinning: survival is
+        measured PER PATH.  When the rename is undone, ``main:new_name.py``
+        does not resolve at all, so its line set is empty and survival is 0.0
+        no matter that the very same 30 lines are present at
+        ``main:old_name.py``.  Per-path scoping is what stops content
+        elsewhere in the tree from rescuing a reverted move; the assertion
+        below on the old path's content is what would catch a future
+        implementation that widened the line set beyond the path.
+        """
+        await _seed_on_main(
+            git_repo, {'old_name.py': _numbered('body', 30)}, 'seed old_name',
+        )
+        merge_sha = await _land_branch(
+            git_repo, '7003', renames=(('old_name.py', 'new_name.py'),),
+        )
+
+        probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+        assert probe.present is True
+
+        rc, _, err = await _run(
+            ['git', 'mv', 'new_name.py', 'old_name.py'], cwd=git_repo,
+        )
+        assert rc == 0, f'rename revert failed: {err}'
+        await _commit_all(git_repo, 'revert the rename')
+
+        assert (git_repo / 'old_name.py').read_text() == _numbered('body', 30), (
+            'precondition: every one of the moved lines is still present at '
+            'main, just at the old path — this is what a path-blind line-set '
+            'implementation would be fooled by'
+        )
+
+        probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+        assert probe.present is False, (
+            'the rename was undone — identical line CONTENT at the old path '
+            'must not read as the effect surviving'
+        )
+        assert probe.failure == 'effect_not_survived'
+        assert probe.aggregate_survival == 0.0
+
+    async def test_binary_blob_never_crashes_and_never_fakes_survival(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """A binary deliverable.  ``git diff --unified=0`` emits "Binary files
+        ... differ" and no + lines, so line survival is meaningless and must
+        not be fabricated as 1.0.  Decoding the blob would raise
+        UnicodeDecodeError inside _run, so the arm must never attempt it.
+        """
+        await _seed_on_main(
+            git_repo, {'asset.bin': b'\x00\x01\x02seed'}, 'seed asset',
+        )
+        merge_sha = await _land_branch(
+            git_repo, '7004', {'asset.bin': b'\x00\x01\x02delivered\xff'},
+        )
+
+        probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+        assert probe.present is True
+        assert probe.aggregate_survival is None, (
+            'a binary contributes no measurable lines — reporting a survival '
+            'ratio here would be a number that was never computed'
+        )
+
+        (git_repo / 'asset.bin').write_bytes(b'\x00\x01\x02clobbered\xfe')
+        await _commit_all(git_repo, 'clobber the binary deliverable')
+
+        probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+        assert probe.present is False
+        assert probe.failure == 'vacuous_effect_absent'
+        assert 'asset.bin' in probe.vacuous_paths
+
+    async def test_content_lines_that_look_like_diff_headers_still_count(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """A content line whose OWN TEXT starts with ``++`` is content, not a
+        ``+++ b/<path>`` file header.
+
+        ``git diff --unified=0`` prefixes every content line with exactly ONE
+        '+'/'-' column, so a C ``++counter;`` statement renders as
+        ``+++counter;`` and a SQL ``-- note`` comment renders as ``--- note``.
+        Classifying by raw prefix discards both as headers.  Here that emptied
+        the added-line set entirely and mis-routed a perfectly ordinary text
+        deliverable to the VACUOUS arm, so survival was never measured at all.
+
+        Real triggers are common: C/C++/Java/JS ``++i;``, SQL/Lua/Haskell
+        ``--`` comments, TOML ``+++`` front matter, and ``.patch``/``.diff``
+        fixture files.
+        """
+        await _seed_on_main(git_repo, {'mod.c': 'int seed;\n'}, 'seed mod.c')
+        body = ''.join(f'++counter_{i};\n' for i in range(40))
+        merge_sha = await _land_branch(
+            git_repo, '7101', {'mod.c': 'int seed;\n' + body},
+        )
+
+        probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+
+        assert probe.added_lines_total == 40, (
+            'every ++-prefixed content line must be counted as added'
+        )
+        assert 'mod.c' not in probe.vacuous_paths, (
+            'a 40-line text deliverable is not a zero-added-lines shape'
+        )
+        assert probe.aggregate_survival == 1.0
+        assert probe.present is True
+
+    async def test_revert_of_only_the_header_lookalike_lines_is_not_survival(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """THE FALSE ACCEPT.  A branch adds 30 ``++``-prefixed lines and 30
+        ordinary ones; a later commit on main reverts ONLY the ``++`` half.
+
+        Half the deliverable is gone, but if the ``++`` lines were never
+        counted as added, the surviving half measures 1.0 and the gate marks
+        the task done.  That is a false accept on the exact task-1175 revert
+        class this check exists to catch — the one direction the primitive is
+        documented never to take ('never claim an effect is present on
+        doubt').
+        """
+        await _seed_on_main(git_repo, {'mod.c': 'int seed;\n'}, 'seed mod.c')
+        looky = ''.join(f'++counter_{i};\n' for i in range(30))
+        plain = ''.join(f'int plain_{i};\n' for i in range(30))
+        merge_sha = await _land_branch(
+            git_repo, '7102', {'mod.c': 'int seed;\n' + looky + plain},
+        )
+
+        # A later commit reverts ONLY the header-lookalike half.
+        (git_repo / 'mod.c').write_text('int seed;\n' + plain)
+        await _commit_all(git_repo, 'revert half the deliverable')
+
+        probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+
+        assert probe.added_lines_total == 60
+        assert probe.aggregate_survival == pytest.approx(0.5), (
+            'half the added lines are gone from main'
+        )
+        assert probe.present is False, (
+            'a half-reverted deliverable must not read as a clean landing'
+        )
+
+    async def test_non_utf8_text_blob_is_fail_safe_not_a_crash(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """A latin-1 text file has no NUL bytes, so git treats it as TEXT and
+        ``git diff`` emits its raw bytes — which ``_run``'s strict
+        ``.decode()`` cannot decode.
+
+        Distinct from the binary case above, which uses NUL bytes and so only
+        ever exercises git's ASCII "Binary files ... differ" output.  This one
+        reaches the decode.  The contract is fail-safe throughout: any git
+        error yields present=False, never a fabricated True and never an
+        exception escaping into the dispatch gate.
+        """
+        await _seed_on_main(
+            git_repo, {'t.txt': b'seed\n'}, 'seed t.txt',
+        )
+        merge_sha = await _land_branch(
+            git_repo, '7103', {'t.txt': 'caf\xe9 na\xefve\n'.encode('latin-1')},
+        )
+
+        probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+
+        assert probe.present is False
+        assert probe.failure == 'diff_failed'
+
+    async def test_vacuous_arm_and_text_arm_cannot_mask_each_other(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """MIXED branch — a text file with real added lines PLUS a deleted
+        file.  Neither arm may override the other:
+
+        - a surviving deletion must not rescue reverted text, and
+        - surviving text must not rescue a resurrected deletion.
+
+        Both directions are exercised, because a conservative-looking
+        implementation can easily get one right and the other wrong.
+        """
+        await _seed_on_main(
+            git_repo,
+            {'obsolete.py': _numbered('old', 12), 'impl.py': _numbered('base', 5)},
+            'seed obsolete and impl',
+        )
+        merge_sha = await _land_branch(
+            git_repo, '7005',
+            {'impl.py': _numbered('base', 5) + _numbered('feature', 40)},
+            deletes=('obsolete.py',),
+        )
+
+        probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+        assert probe.present is True, 'both arms pass immediately after landing'
+
+        # Direction 1: text reverted, deletion still holding.
+        (git_repo / 'impl.py').write_text(_numbered('base', 5))
+        revert_text = await _commit_all(git_repo, 'revert the text deliverable')
+
+        probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+        assert probe.present is False, (
+            'a surviving deletion must NOT mask reverted text'
+        )
+        assert probe.failure == 'effect_not_survived'
+
+        # Direction 2: text restored, deletion resurrected.
+        rc, _, err = await _run(
+            ['git', 'revert', '--no-edit', revert_text], cwd=git_repo,
+        )
+        assert rc == 0, f'revert of the revert failed: {err}'
+        (git_repo / 'obsolete.py').write_text(_numbered('old', 12))
+        await _commit_all(git_repo, 'resurrect the deleted file')
+
+        probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+        assert probe.present is False, (
+            'surviving text must NOT mask a resurrected deletion'
+        )
+        assert probe.failure == 'vacuous_effect_absent'
+        assert 'obsolete.py' in probe.vacuous_paths
+
+    async def test_probe_distinguishes_a_vacuous_decision_from_a_survival_one(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """The probe is rendered verbatim into the escalation a human reads,
+        so it must never present a survival ratio it did not compute.
+
+        An all-vacuous branch reports aggregate_survival None (undefined, not
+        0.0 and not 1.0 — both would be assertions the code cannot support),
+        names the paths the vacuous arm decided, and uses a failure code
+        distinct from the survival path's 'effect_not_survived'.
+        """
+        await _seed_on_main(
+            git_repo, {'obsolete.py': _numbered('old', 12)}, 'seed obsolete',
+        )
+        merge_sha = await _land_branch(git_repo, '7006', deletes=('obsolete.py',))
+        (git_repo / 'obsolete.py').write_text(_numbered('old', 12))
+        await _commit_all(git_repo, 'resurrect the deleted file')
+
+        probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+
+        assert probe.present is False
+        assert probe.failure == 'vacuous_effect_absent'
+        assert probe.failure != 'effect_not_survived'
+        assert probe.aggregate_survival is None
+        assert probe.added_lines_total == 0
+        assert probe.worst_guarded_path is None
+        assert probe.vacuous_paths == ('obsolete.py',)
+
+
+@contextlib.contextmanager
+def _git_command_spy():
+    """Record every git command GitOps issues, delegating to the real ``_run``.
+
+    Counting invocations through the module's ``_run`` seam is the only
+    non-flaky way to assert a memo actually elided work: timing a subprocess
+    round-trip on a loaded CI box measures the box, not the cache.
+    """
+    original_run = _run
+    recorded: list[list[str]] = []
+
+    async def recording_run(cmd, cwd=None, **kwargs):
+        recorded.append(list(cmd))
+        return await original_run(cmd, cwd=cwd, **kwargs)
+
+    with patch('orchestrator.git_ops._run', side_effect=recording_run):
+        yield recorded
+
+
+@pytest.mark.asyncio
+class TestCommitEffectProbeMemo:
+    """The probe is memoized on (commit_sha, main_sha) (task 3116 b5).
+
+    COST is a first-class constraint on part (b), not an afterthought.  The
+    pre-3116 check was ONE ``git diff --quiet``; line survival needs a blob
+    read plus a set comparison PER TOUCHED PATH.  The cheap byte-identity test
+    cannot serve as a fast path either, because the full corpus measured 94.9%
+    of merges failing it while their deliverables sit intact at main — so the
+    expensive path is the COMMON path, re-run for every landing candidate on
+    every ``idle_poll_secs`` (15s) dispatch tick.
+
+    The KEY is the correctness core.  A memo keyed on ``commit_sha`` alone
+    would freeze a verdict across exactly the event that changes the answer: a
+    main HEAD advance.  Keying on the pair means a HEAD movement invalidates
+    every entry by construction, and the value cached is the value computed
+    against that HEAD.
+
+    A warm hit still costs ONE command — ``git rev-parse main`` — because the
+    memo cannot know whether HEAD moved without asking.  That single
+    invocation is the pin used throughout this class: a cache hit issues
+    exactly it and nothing else.
+    """
+
+    async def test_repeat_probe_at_same_main_head_issues_git_work_once(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """(a) Two consecutive probes for the same commit at the same main
+        HEAD return EQUAL probes, and the second issues no git work beyond the
+        single HEAD resolution the key requires.
+        """
+        await _seed_on_main(git_repo, {'mod.py': _numbered('base', 40)}, 'seed mod')
+        merge_sha = await _land_branch(
+            git_repo, '8001',
+            {'mod.py': _numbered('base', 40) + _numbered('added', 40)},
+        )
+
+        with _git_command_spy() as recorded:
+            first = await git_ops.describe_commit_effect_in_main(merge_sha)
+            cold_cost = len(recorded)
+            recorded.clear()
+            second = await git_ops.describe_commit_effect_in_main(merge_sha)
+            warm = list(recorded)
+
+        assert first.present is True
+        assert second == first, 'a warm hit must return the same verdict and facts'
+        assert cold_cost > 1, (
+            f'sanity: the cold probe must actually do git work, saw {cold_cost}'
+        )
+        assert warm == [['git', 'rev-parse', 'main']], (
+            f'a warm hit must cost exactly the HEAD resolution, saw {warm}'
+        )
+
+    async def test_main_head_advance_invalidates_and_can_flip_the_verdict(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """(b) THE correctness core: the memo must not survive the HEAD
+        movement that changes the answer.
+
+        Probe once while the deliverable is intact (present), advance main so
+        it is reverted, probe again — the second call must RECOMPUTE and
+        report absent.  A commit_sha-only key would serve the stale True
+        forever, which is strictly worse than no memo: it would hand the
+        dispatch gate a landing verdict for a deliverable that is gone.
+        """
+        await _seed_on_main(git_repo, {'mod.py': _numbered('base', 40)}, 'seed mod')
+        merge_sha = await _land_branch(
+            git_repo, '8002',
+            {'mod.py': _numbered('base', 40) + _numbered('added', 40)},
+        )
+
+        before = await git_ops.describe_commit_effect_in_main(merge_sha)
+        assert before.present is True
+
+        (git_repo / 'mod.py').write_text(_numbered('base', 40))
+        await _commit_all(git_repo, 'revert the deliverable on main')
+
+        with _git_command_spy() as recorded:
+            after = await git_ops.describe_commit_effect_in_main(merge_sha)
+            recompute_cost = len(recorded)
+            recorded.clear()
+            again = await git_ops.describe_commit_effect_in_main(merge_sha)
+            warm = list(recorded)
+
+        assert after.present is False, 'the advance must be seen, not memoized away'
+        assert after.failure == 'effect_not_survived'
+        assert recompute_cost > 1, (
+            f'a new HEAD must force real recomputation, saw {recompute_cost} commands'
+        )
+        assert again == after, 'the recomputed verdict is itself memoized'
+        assert warm == [['git', 'rev-parse', 'main']]
+
+    async def test_memo_drops_entries_keyed_on_a_superseded_main_head(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """The memo is BOUNDED: a HEAD advance invalidates every entry keyed
+        on the old sha, so they are dropped rather than accumulated.
+
+        The orchestrator holds one GitOps for the life of the process and
+        probes on every 15s tick; an unbounded dict keyed on a moving HEAD is
+        a slow leak that never gets collected.
+        """
+        await _seed_on_main(git_repo, {'mod.py': _numbered('base', 40)}, 'seed mod')
+        merge_sha = await _land_branch(
+            git_repo, '8003',
+            {'mod.py': _numbered('base', 40) + _numbered('added', 40)},
+        )
+
+        await git_ops.describe_commit_effect_in_main(merge_sha)
+        old_main = await git_ops.get_main_sha()
+        assert list(git_ops._effect_probe_memo) == [(merge_sha, old_main)]
+
+        (git_repo / 'unrelated.md').write_text('later, unrelated work\n')
+        await _commit_all(git_repo, 'unrelated advance on main')
+        new_main = await git_ops.get_main_sha()
+        await git_ops.describe_commit_effect_in_main(merge_sha)
+
+        assert list(git_ops._effect_probe_memo) == [(merge_sha, new_main)], (
+            'entries keyed on a superseded main sha must not accumulate'
+        )
+
+    async def test_distinct_commits_at_the_same_head_do_not_collide(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """(c) Two commits probed at the same HEAD keep their own verdicts —
+        one intact, one reverted — and neither is served the other's answer.
+        """
+        await _seed_on_main(
+            git_repo,
+            {'kept.py': _numbered('kept', 40), 'lost.py': _numbered('lost', 40)},
+            'seed both files',
+        )
+        kept_sha = await _land_branch(
+            git_repo, '8004',
+            {'kept.py': _numbered('kept', 40) + _numbered('kept_new', 40)},
+        )
+        lost_sha = await _land_branch(
+            git_repo, '8005',
+            {'lost.py': _numbered('lost', 40) + _numbered('lost_new', 40)},
+        )
+        (git_repo / 'lost.py').write_text(_numbered('lost', 40))
+        await _commit_all(git_repo, 'revert only task 8005 deliverable')
+
+        kept_probe = await git_ops.describe_commit_effect_in_main(kept_sha)
+        lost_probe = await git_ops.describe_commit_effect_in_main(lost_sha)
+
+        assert kept_probe.present is True
+        assert lost_probe.present is False
+        assert kept_probe.anchor_sha != lost_probe.anchor_sha
+        # And re-reading either one after the other was cached is unaffected.
+        assert (await git_ops.describe_commit_effect_in_main(kept_sha)).present is True
+        assert (await git_ops.describe_commit_effect_in_main(lost_sha)).present is False
+
+    async def test_bool_wrapper_shares_the_memo_with_the_probe(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """(d) The decision call (the bool) and the reject-path enrichment
+        call (the probe) together cost ONE computation.
+
+        This is what makes landing_evidence's decide-with-the-bool /
+        enrich-with-the-probe split free — without a shared memo that split
+        would double the cost of the gate's hottest check.
+        """
+        await _seed_on_main(git_repo, {'mod.py': _numbered('base', 40)}, 'seed mod')
+        merge_sha = await _land_branch(
+            git_repo, '8006',
+            {'mod.py': _numbered('base', 40) + _numbered('added', 40)},
+        )
+
+        with _git_command_spy() as recorded:
+            probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+            recorded.clear()
+            present = await git_ops.commit_effect_present_in_main(merge_sha)
+            after_probe = list(recorded)
+
+        assert present is probe.present
+        assert after_probe == [['git', 'rev-parse', 'main']], (
+            f'the bool must reuse the probe memo, saw {after_probe}'
+        )
+
+    async def test_probe_reuses_a_memo_warmed_by_the_bool_wrapper(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """(d), other order: the bool warms the same memo the probe reads, so
+        the enrichment call after a False decision is free too — which is the
+        order landing_evidence actually uses.
+        """
+        await _seed_on_main(git_repo, {'mod.py': _numbered('base', 40)}, 'seed mod')
+        merge_sha = await _land_branch(
+            git_repo, '8007',
+            {'mod.py': _numbered('base', 40) + _numbered('added', 40)},
+        )
+        (git_repo / 'mod.py').write_text(_numbered('base', 40))
+        await _commit_all(git_repo, 'revert the deliverable on main')
+
+        with _git_command_spy() as recorded:
+            present = await git_ops.commit_effect_present_in_main(merge_sha)
+            recorded.clear()
+            probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+            after_bool = list(recorded)
+
+        assert present is False
+        assert probe.present is False
+        assert probe.failure == 'effect_not_survived'
+        assert after_bool == [['git', 'rev-parse', 'main']], (
+            f'the enrichment probe must reuse the bool\'s computation, '
+            f'saw {after_bool}'
+        )
+
+    async def test_memo_is_per_instance_and_does_not_leak_across_gitops(
+        self, git_ops: GitOps, git_config: GitConfig, git_repo: Path,
+    ) -> None:
+        """(e) The memo lives on the instance, not in a module global.
+
+        A module-level cache would survive a config change — a different
+        ``main_branch``, a different project_root — and answer for a
+        repository it never measured.
+        """
+        await _seed_on_main(git_repo, {'mod.py': _numbered('base', 40)}, 'seed mod')
+        merge_sha = await _land_branch(
+            git_repo, '8008',
+            {'mod.py': _numbered('base', 40) + _numbered('added', 40)},
+        )
+
+        warmed = await git_ops.describe_commit_effect_in_main(merge_sha)
+        other = GitOps(git_config, git_repo)
+        assert other._effect_probe_memo == {}, 'a fresh instance starts cold'
+
+        with _git_command_spy() as recorded:
+            fresh = await other.describe_commit_effect_in_main(merge_sha)
+
+        assert fresh == warmed
+        assert len(recorded) > 1, (
+            f'a second instance must recompute, not read a module global; '
+            f'saw {len(recorded)} commands'
+        )
+
+    async def test_transient_git_failures_are_never_memoized(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """A subprocess failure is NOT a repository fact and must not be
+        pinned for the life of the current HEAD.
+
+        The effect-absent condition is ABSORBING (byte-identity, once broken,
+        is never restored), so a memoized transient failure means a guaranteed
+        spurious full dispatch — plan/verify/review plus a task_failure
+        escalation — rather than a self-healing re-check.  Only verdicts
+        derived from repository CONTENT may be cached.
+        """
+        await _seed_on_main(git_repo, {'mod.py': _numbered('base', 40)}, 'seed mod')
+        merge_sha = await _land_branch(
+            git_repo, '8009',
+            {'mod.py': _numbered('base', 40) + _numbered('added', 40)},
+        )
+        original_run = _run
+
+        async def flaky_run(cmd, cwd=None, **kwargs):
+            if cmd[:2] == ['git', 'merge-base']:
+                return 128, '', 'fatal: simulated transient git failure'
+            return await original_run(cmd, cwd=cwd, **kwargs)
+
+        with patch('orchestrator.git_ops._run', side_effect=flaky_run):
+            failed = await git_ops.describe_commit_effect_in_main(merge_sha)
+
+        assert failed.present is False
+        assert failed.failure == 'merge_base_unresolved'
+        assert git_ops._effect_probe_memo == {}, (
+            'a transient git failure must not be cached'
+        )
+
+        recovered = await git_ops.describe_commit_effect_in_main(merge_sha)
+        assert recovered.present is True, (
+            'the next tick must re-measure, not replay the cached failure'
+        )
+
+    async def test_memo_evicts_the_oldest_entry_at_the_bound(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """(f) The FIFO bound actually holds, and drops the OLDEST entry.
+
+        Every other test in this class exercises the memo's correctness
+        machinery; this one covers the only branch that enforces its stated
+        SIZE bound.  It needs its own test precisely because the memo is a
+        pure optimization: evicting the newest entry, or an off-by-one that
+        drops the entry just inserted, leaves every functional test in this
+        file green while the bound silently stops holding or the cache stops
+        caching.
+
+        The bound is patched down to 2 rather than probing 257 commits — the
+        branch under test is ``len(memo) >= _EFFECT_PROBE_MEMO_MAX_ENTRIES``,
+        and it does not care what the constant is.  All three probes run at
+        ONE fixed main HEAD so the whole-memo staleness clear (a different
+        mechanism, covered above) cannot be what does the dropping.
+        """
+        await _seed_on_main(
+            git_repo,
+            {'a.py': _numbered('a', 30), 'b.py': _numbered('b', 30),
+             'c.py': _numbered('c', 30)},
+            'seed three files',
+        )
+        shas = [
+            await _land_branch(
+                git_repo, f'85{i:02d}',
+                {name: _numbered(name[0], 30) + _numbered(f'add{i}', 30)},
+            )
+            for i, name in enumerate(('a.py', 'b.py', 'c.py'))
+        ]
+        main_sha = await git_ops.get_main_sha()
+        assert main_sha
+
+        with patch('orchestrator.git_ops._EFFECT_PROBE_MEMO_MAX_ENTRIES', 2):
+            for sha in shas:
+                await git_ops.describe_commit_effect_in_main(sha)
+
+        assert list(git_ops._effect_probe_memo) == [
+            (shas[1], main_sha), (shas[2], main_sha),
+        ], (
+            'the bound must hold at 2 and the OLDEST key must be the one '
+            'dropped — the newest probe must still be cached'
+        )
 
 
 @pytest.mark.asyncio

@@ -51,6 +51,7 @@ import subprocess
 import threading
 import time
 import uuid
+from collections import Counter
 from collections.abc import (
     AsyncIterator,
     Awaitable,
@@ -1061,6 +1062,233 @@ class ReapedInteractiveWorktree:
     branch: str
     slug: str
     reason: str
+
+
+# ── FIX 1′ effect-survival constants (task 3116 part b) ──────────────────────
+# Byte-identity ("does main still match the branch byte for byte?") was the
+# wrong question: it asks whether ANYONE has touched the paths since, not
+# whether the branch's deliverable is still there.  Replaced by threshold line
+# SURVIVAL.  These three numbers are MEASURED, not guessed — see
+# describe_commit_effect_in_main's docstring for the full table and
+# task 3116 metadata.x_effect_survival_measurement for the raw record.
+#
+# Full-corpus sweep: ALL 2827 `Merge task/N into main` commits on main, 2822
+# usable, measured at main 5bd7fd8489.  Byte-identity reports effect_absent
+# for 95.4% of them.  Residual still-absent among the 2680 currently-rejected:
+#
+#   threshold      1.00    0.99    0.98    0.95    0.90    0.80    0.50
+#   aggregate     75.3%   66.0%   59.3%   45.9%   34.7%   24.3%   12.0%
+#   per-file-min  75.3%   73.2%   70.2%   62.8%   55.0%   44.1%   26.7%
+#
+# Aggregate strictly DOMINATES per-file-minimum at every threshold, so
+# aggregate is the primary unit and per-file-min is disqualified as a
+# standalone one (task 3640 sits at per-file-min 0.6087 on a 23-line hot
+# SKILL.md, so any per-file-min rule >= 0.80 rejects a motivating case).
+#
+# Hybrid floor sweep — residual % for (aggregate >= T_agg AND every file with
+# >= FLOOR added lines has survival >= T_file):
+#
+#   T_agg/T_file   FLOOR=0  10     25     50     100
+#   0.98 / 0.90     62.9%  61.6%  60.8%  59.8%  59.5%
+#   0.98 / 0.80     61.2%  60.0%  59.7%  59.4%  59.3%
+#   0.95 / 0.90     57.0%  54.5%  52.3%  49.5%  47.7%
+#   0.90 / 0.90     55.0%  51.6%  48.0%  43.8%  40.5%
+#
+# Each constant below is the TIGHTEST (most revert-catching) swept value that
+# still satisfies all three acceptance anchors:
+#
+#   bd3d6f49b4 (task 3653)  aggregate 1.0000, per-file-min 1.0000
+#   ed56626ce0 (task 3640)  aggregate 0.9848, per-file-min 0.6087 on a
+#                           23-add SKILL.md; worst GUARDED file 0.9568
+#   6163c0c12d (task 3717)  aggregate 0.9976, worst guarded file 0.9939
+#
+# Net effect of the chosen triple: 1050 of the 2680 currently-rejected merges
+# recovered (39.2%), the per-file guard vetoing 40 that bare aggregate would
+# have waved through, and 0 of the 111 near-total-revert tail (aggregate
+# < 0.05) accepted.
+
+#: Fraction of the anchor's added lines that must survive across the WHOLE
+#: branch.  0.98 because task 3640's aggregate is 0.9848 — 0.99 and 1.00 both
+#: reject that anchor, so 0.98 is the tightest value that passes.
+_EFFECT_SURVIVAL_AGGREGATE_THRESHOLD = 0.98
+
+#: Per-file survival floor, applied only to files at or above
+#: _EFFECT_SURVIVAL_PER_FILE_MIN_ADDED_LINES.  0.90 because task 3717's worst
+#: guarded file is 0.9939 (1322 adds), so 0.90 clears with margin and is the
+#: tightest swept value.  This guard is what closes b2's own objection that a
+#: bare aggregate hides a reverted 20-line deliverable behind a 2000-line test
+#: file.
+_EFFECT_SURVIVAL_PER_FILE_THRESHOLD = 0.90
+
+#: Minimum added-line count for a file to be subject to the per-file guard.
+#: 25 because task 3640's hot SKILL.md carries 23 added lines — floors of 0
+#: and 10 reject that anchor, so 25 is the SMALLEST floor that passes, keeping
+#: the guard as WIDE (as much veto power) as the anchors allow.  Below this a
+#: small, frequently-edited prose file cannot veto an otherwise clean landing.
+_EFFECT_SURVIVAL_PER_FILE_MIN_ADDED_LINES = 25
+
+#: git's canonical empty-tree object.  Used as the diff base when an anchor
+#: has no parent (a root commit), so added-line extraction never has to
+#: special-case one.
+_EMPTY_TREE_SHA = '4b825dc642cb6eb9a060e54bf8d69288fbee4904'
+
+#: Upper bound on GitOps._effect_probe_memo (task 3116 b5).  A main HEAD
+#: advance already invalidates every live entry at once — they all share one
+#: main sha by construction — so this cap only bites while HEAD sits still and
+#: distinct candidate commits keep arriving.  256 is far above the handful of
+#: landing candidates any single tick considers, and bounds the dict for a
+#: process that holds ONE GitOps for its whole lifetime.
+_EFFECT_PROBE_MEMO_MAX_ENTRIES = 256
+
+#: Failure codes that report a SUBPROCESS problem rather than a repository
+#: fact, and so are never memoized (task 3116 b5).  Caching one would pin a
+#: spurious effect-absent verdict for the life of the current HEAD; because
+#: the condition is ABSORBING (byte-identity, once broken, is never restored)
+#: that is not a self-healing re-check on the next tick but a guaranteed
+#: spurious full dispatch — plan/verify/review plus a task_failure escalation.
+#: Only verdicts derived from repository CONTENT are cached.
+_EFFECT_PROBE_TRANSIENT_FAILURES = frozenset({
+    'unresolvable_commit',
+    'merge_base_unresolved',
+    'touched_enumeration_failed',
+    'diff_failed',
+    'main_sha_unresolved',
+})
+
+
+@dataclass(frozen=True)
+class CommitEffectProbe:
+    """Result of :meth:`GitOps.describe_commit_effect_in_main` (task 3116).
+
+    The DIAGNOSTIC form of the effect check that
+    :meth:`GitOps.commit_effect_present_in_main` reduces to a bare bool.
+    Both come from ONE implementation — the bool method is a one-line
+    wrapper over this probe's ``present`` — so a verdict and the facts
+    that explain it can never drift apart.
+
+    This exists because the bool alone cost days of misdiagnosis twice:
+    an ``effect_absent`` escalation could say THAT the cited commit's
+    effect was gone but never WHICH path had moved, so a clean landing
+    whose branch merely co-touched a hot shared file read identically to
+    a genuine revert.  Naming the diverged path resolves both reported
+    instances in one line.
+
+    Fields
+    ------
+    present:
+        The verdict — True iff the commit's effect is still present at
+        main HEAD.  Byte-identical in meaning to
+        ``commit_effect_present_in_main``'s return value.
+    diverged_paths:
+        The touched paths that no longer match main HEAD, in git's own
+        order.  Since task 3116 part (b) this is a pure DIAGNOSTIC and is
+        populated on ``present=True`` verdicts too — byte-level divergence
+        no longer decides anything, because 95.4% of the merge corpus
+        breaks byte-identity while the deliverables sit untouched at main.
+        It is retained because it is the single most legible line in an
+        escalation: it names the co-touched hot file in both reported
+        instances, letting a reader tell skew from a revert at a glance.
+        Paths are resolved with ``-z``/``core.quotePath=false`` and so
+        are byte-faithful — never git's quoted ``caf\\303\\251.py``
+        rendering, which would mislead a human reading the escalation
+        this feeds.
+    anchor_sha:
+        The commit the comparison actually ran against — the commit
+        itself for a non-merge, and for a merge the non-first parent
+        under examination (the FAILING one when a parent fails, the last
+        one checked on success).  Recorded because a merge citation's
+        effect is judged against a parent, not against the sha the
+        caller passed, and an escalation naming paths from the wrong
+        commit is worse than one naming none.  None when resolution
+        failed before any anchor was established.
+    failure:
+        Why ``present`` is False, or None when it is True.  The vocabulary
+        is exhaustive:
+
+        - ``None`` — the effect is present (``present=True``).
+        - ``'effect_not_survived'`` — the decisive verdict since task 3116
+          part (b): the anchor's added lines do not survive at main to the
+          measured thresholds (aggregate below
+          ``_EFFECT_SURVIVAL_AGGREGATE_THRESHOLD``, or some file at or
+          above the added-lines floor below the per-file threshold).  The
+          survival fields below carry the numbers behind it.
+        - ``'vacuous_effect_absent'`` — a path contributing NO added
+          lines failed its own shape's arm (task 3116 b3): a deletion was
+          undone, a rename reverted, or a binary/rename blob no longer
+          matches.  Distinct from ``'effect_not_survived'`` so a rendered
+          escalation can never imply a survival ratio that was never
+          computed.  Carries ``vacuous_paths``.
+        - ``'paths_diverged'`` — retained for the residual case where
+          byte-identity is broken but neither arm could reach a decision.
+          Note it no longer means "the effect is gone": for any path that
+          added lines, divergence is now reported through
+          ``diverged_paths`` on PRESENT verdicts too.
+        - ``'unresolvable_commit'`` — ``git rev-list --parents`` errored
+          or returned nothing (e.g. the sha does not resolve).
+        - ``'merge_base_unresolved'`` — a merge parent's ``git merge-base``
+          call errored or returned empty.
+        - ``'touched_enumeration_failed'`` — the touched-set diff
+          (``diff --name-only`` / ``diff-tree``) errored.
+        - ``'empty_branch_merge'`` — a merge parent nets ZERO content
+          against its own fork point, so there is no deliverable to
+          confirm on main.  Fail-safe False, deliberately unlike the
+          non-merge empty-touched-set case, which stays True (task 2500).
+        - ``'diff_failed'`` — the terminal comparison against main errored
+          for a reason other than "paths differ".
+        - ``'main_sha_unresolved'`` — ``git rev-parse <main_branch>``
+          errored or returned nothing, so there is no HEAD to compare
+          against and no key to memoize under (task 3116 b5).
+
+        ``'paths_diverged'`` and ``'diff_failed'`` are separated on
+        purpose: the pre-3116 code folded rc==1 (paths genuinely differ)
+        and rc>1 (git errored) into one indistinguishable False even
+        though its own docstring claimed to separate them.
+
+    Survival fields (task 3116 part b)
+    ----------------------------------
+    All are None/0 when survival was not measured — i.e. when resolution
+    failed before the terminal stage, or every touched path was vacuous.
+    They are populated on PRESENT verdicts as well as absent ones, so an
+    escalation can state the ratio it actually measured rather than
+    asserting a conclusion it cannot support.
+
+    aggregate_survival:
+        Fraction of the anchor's added lines (across all touched paths)
+        still present at main.  The primary unit: it strictly dominates
+        per-file-minimum at every swept threshold.
+    added_lines_total:
+        Denominator of ``aggregate_survival`` — how many added lines the
+        ratio was measured over.  A ratio without its denominator invites
+        the reader to over-trust a 3-line sample.
+    worst_guarded_path / worst_guarded_survival:
+        The GUARDED file (at or above the added-lines floor) with the
+        lowest survival, and its ratio.  None when no touched file met the
+        floor.  This is what names a reverted deliverable that a healthy
+        aggregate would otherwise hide.
+    aggregate_threshold / per_file_threshold / per_file_min_added_lines:
+        The constants actually applied, recorded alongside the result so a
+        rendered escalation is self-explaining and a later retune is
+        visible in the output rather than silent.
+    vacuous_paths:
+        Touched paths decided by the VACUOUS arm rather than by line
+        survival — those contributing zero added lines, where an
+        added-lines test is trivially true.  On a
+        ``'vacuous_effect_absent'`` verdict these are the paths that
+        FAILED; the arm short-circuits on the first, so it names the
+        offender, not the whole vacuous set.
+    """
+    present: bool
+    diverged_paths: tuple[str, ...] = ()
+    anchor_sha: str | None = None
+    failure: str | None = None
+    aggregate_survival: float | None = None
+    added_lines_total: int = 0
+    worst_guarded_path: str | None = None
+    worst_guarded_survival: float | None = None
+    aggregate_threshold: float | None = None
+    per_file_threshold: float | None = None
+    per_file_min_added_lines: int | None = None
+    vacuous_paths: tuple[str, ...] = ()
 
 
 class ConflictProbe(NamedTuple):
@@ -2318,6 +2546,17 @@ class GitOps:
         # survives across the requeue cycles a sustained soft-pressure
         # condition produces.
         self._warm_lane_audit_cache: tuple[float, str | None] | None = None
+        # Effect-probe memo (task 3116 b5), keyed on (commit_sha, main_sha).
+        # Line survival costs a blob read plus a set comparison PER TOUCHED
+        # PATH where byte-identity cost one `git diff --quiet`, and the cheap
+        # check cannot serve as a fast path because 94.9% of the merge corpus
+        # fails it while the deliverables sit intact at main — so the
+        # expensive path is the COMMON path, re-run for every landing
+        # candidate on every idle_poll_secs (15s) dispatch tick.  main_sha is
+        # in the KEY, not just the value: a HEAD advance is exactly the event
+        # that changes the answer, so a commit_sha-only key would freeze a
+        # stale verdict across it.  See describe_commit_effect_in_main.
+        self._effect_probe_memo: dict[tuple[str, str], CommitEffectProbe] = {}
         # Merge serialization is handled by MergeWorker in merge_queue.py.
         # See task 292 for design rationale (ghost loops, lock starvation,
         # branch drift at 64 max concurrency with external actors).
@@ -8891,6 +9130,28 @@ class GitOps:
         )
         return rc == 0
 
+    async def merge_base_with_main(self, ref: str) -> str | None:
+        """Return *ref*'s FORK POINT from ``config.main_branch``, or None.
+
+        "Where did this branch leave main?", which is the only honest
+        pre-branch baseline for a BRANCH TIP.  ``<tip>^1`` is not that: it is
+        the branch's own previous work commit, so a differential anchored on
+        it asks whether the branch's LAST commit delivered a capability rather
+        than whether the BRANCH did.  See
+        :func:`~orchestrator.landing_evidence._delivered_checks_differential`,
+        the caller this exists for (amendment pass, review finding).
+
+        None on any git failure or an unresolvable ref — callers must treat it
+        as "no baseline available" and degrade, never substitute a guess.
+        """
+        rc, out, _ = await _run(
+            ['git', 'merge-base', self.config.main_branch, ref],
+            cwd=self.project_root,
+        )
+        if rc != 0 or not out.strip():
+            return None
+        return out.strip()
+
     async def branch_content_in_main(self, branch: str) -> bool:
         """Return True iff every file *branch* touched is byte-identical on main.
 
@@ -8962,6 +9223,785 @@ class GitOps:
         )
         return rc == 0
 
+    async def describe_commit_effect_in_main(
+        self, commit_sha: str,
+    ) -> CommitEffectProbe:
+        """Return a :class:`CommitEffectProbe` for *commit_sha* vs main HEAD.
+
+        The single implementation of the FIX 1′ effect check (task 2500 /
+        2675 / 3116).  :meth:`commit_effect_present_in_main` is a one-line
+        wrapper returning this probe's ``present``, so the boolean verdict
+        and the diagnostics that explain it cannot drift apart.
+
+        Companion check to :meth:`is_ancestor` for the found_on_main
+        post-hoc-revert blind spot (task 2500): a cited commit can remain
+        an ancestor of main forever — ancestry is immutable history — even
+        after a LATER commit on main changes exactly the paths it touched.
+        ``is_ancestor`` alone cannot see that the commit's own effect is
+        gone from current HEAD.
+
+        Resolves *commit_sha*'s parents via ``git rev-list --parents -n 1
+        <commit_sha>`` and branches on parent count:
+
+        - **Merge commit** (2+ parents; task 2675 FIX 1′) — the old plain
+          ``diff-tree`` touched-set is empty by git's own default
+          behavior for merge commits, which used to make this primitive
+          return True *unconditionally* for every merge (the task-1175
+          "reverted merge" blind spot: a ``Merge task/1175 into main``
+          marker exists and the merge commit is an ancestor of main
+          forever, but a later commit on main removed the deliverable —
+          effect NOT present, yet the old code said True).  Instead this
+          diffs EVERY non-first parent's (each merged branch's) content
+          against current main, requiring ALL of them to still be present
+          (task 2675 amendment — octopus-merge safety, so a later revert
+          of a third-or-later parent's deliverable cannot silently read
+          as effect-present): for each ``other_parent`` in
+          ``parents[1:]``, ``merge_base = git merge-base <parents[0]>
+          <other_parent>`` (that parent's FORK POINT — stable regardless
+          of later main history; **CRITICAL**: this must be
+          ``merge-base(first_parent, other_parent)``, NOT
+          ``merge-base(main, other_parent)`` — because the merge commit
+          is itself an ancestor of main in the found_on_main scenario,
+          ``merge-base(main, other_parent)`` collapses to
+          ``other_parent`` and yields an empty, useless diff), then
+          ``touched = git -c core.quotePath=false diff --name-only -z
+          <merge_base> <other_parent>`` (the paths that parent introduced
+          since its fork point), and finally which of those paths still
+          differ between ``<other_parent>`` and main.  For an ordinary
+          two-parent merge this is exactly one iteration.
+
+        - **Non-merge commit** (root or single-parent) — UNCHANGED from
+          prior behavior (task 2500): ``touched = git -c
+          core.quotePath=false diff-tree --no-commit-id --name-only -r
+          -z <commit_sha>`` (the commit's own diff against its sole
+          parent) and, when non-empty, which of those paths still differ
+          from main.
+
+        ``anchor_sha`` records WHICH commit the comparison ran against —
+        *commit_sha* itself on the non-merge branch, and on the merge
+        branch the non-first parent under examination: the FAILING parent
+        when one fails (the per-parent check short-circuits on the first
+        failure, so an octopus merge requires EVERY parent to pass), and
+        the LAST parent checked on success.  A merge citation's effect is
+        judged against a parent rather than against the sha the caller
+        passed, and an escalation naming paths from the wrong commit is
+        worse than one naming none.
+
+        The terminal comparison is ``git -c core.quotePath=false diff
+        --name-only -z <anchor> <main> -- <touched...>`` rather than the
+        ``diff --quiet`` this check used before task 3116.  That is a
+        strict fidelity improvement, not just plumbing: ``--quiet``'s
+        ``rc != 0`` folded rc==1 (paths genuinely differ) and rc>1 (git
+        errored) into one indistinguishable False even though the
+        docstring claimed to separate them.  ``'paths_diverged'`` vs
+        ``'diff_failed'`` makes that claim true, and the same call yields
+        the diverged path list for free.
+
+        ``-z`` + ``core.quotePath=false`` together make every path list
+        byte-faithful for any filename, including non-ASCII or
+        newline-containing ones — see the path-quoting caveat on
+        :meth:`branch_content_in_main`, which shares this primitive's
+        underlying merge-base/diff pattern but not yet this hardening.
+        The hardening applies to the OUTPUT parsing as well as the
+        touched-set stage: a git-quoted path rendered into an escalation
+        is a diagnostic that misleads.
+
+        Returns ``present=True`` (path-based revert detection
+        inapplicable) when the commit is non-merge and its own touched-set
+        is empty — a genuinely empty ordinary commit.  This deliberately
+        preserves prior mark-done behavior for that case (task 2500).
+
+        Every other non-present outcome carries a ``failure`` code; see
+        :class:`CommitEffectProbe` for the exhaustive vocabulary and for
+        which codes populate ``diverged_paths``.  The direction is
+        fail-safe throughout — never claim an effect is present on doubt.
+
+        **Memoized on (commit_sha, main_sha)** (task 3116 b5).  Cost is a
+        first-class constraint on the part-(b) semantics, not an
+        afterthought: byte-identity was ONE ``git diff --quiet``, whereas
+        line survival needs a blob read plus a set comparison PER TOUCHED
+        PATH.  The cheap check cannot be kept as a fast path either — the
+        full corpus measured 94.9% of merges failing byte-identity while
+        their deliverables sit intact at main — so the expensive path is
+        now the COMMON path, re-run for every landing candidate on every
+        ``idle_poll_secs`` (15s) dispatch tick.
+
+        The KEY is the correctness core.  main HEAD is what a probe is
+        measured AGAINST, so an advance is exactly the event that can
+        change the answer; a ``commit_sha``-only key would freeze a stale
+        verdict across it, which is strictly worse than no memo at all.
+        Keying on the pair makes a HEAD advance invalidate every entry by
+        construction.  main's sha is resolved ONCE at entry and used both
+        as the key component and as the comparison target passed down the
+        whole check, so there is no window in which the value cached and
+        the HEAD it is filed under disagree — a same-process advance
+        mid-probe simply produces a value filed under the sha it was
+        actually measured against.
+
+        A warm hit still costs one ``git rev-parse`` — the memo cannot
+        know whether HEAD moved without asking — against the cold path's
+        (1 + paths × 2) or so invocations.
+
+        Failures that report a SUBPROCESS problem rather than a repository
+        fact (:data:`_EFFECT_PROBE_TRANSIENT_FAILURES`) are NEVER cached;
+        see that constant for why caching one is a guaranteed spurious
+        dispatch rather than a stale read.  The memo is per-instance —
+        never a module global, which would outlive a config change and
+        answer for a repository it never measured — and bounded by
+        :data:`_EFFECT_PROBE_MEMO_MAX_ENTRIES`.
+        """
+        main_sha = await self.get_main_sha()
+        if not main_sha:
+            # No HEAD to compare against, and no key to file a result under.
+            return CommitEffectProbe(present=False, failure='main_sha_unresolved')
+        memo = self._effect_probe_memo
+        # Every live entry shares one main sha (this rule is what keeps that
+        # true), so a single sample decides whether the whole memo is stale.
+        sample = next(iter(memo), None)
+        if sample is not None and sample[1] != main_sha:
+            memo.clear()
+        cached = memo.get((commit_sha, main_sha))
+        if cached is not None:
+            return cached
+        probe = await self._probe_commit_effect(commit_sha, main_sha)
+        if probe.failure not in _EFFECT_PROBE_TRANSIENT_FAILURES:
+            if len(memo) >= _EFFECT_PROBE_MEMO_MAX_ENTRIES:
+                # Insertion-ordered: drop the oldest entry at this HEAD.
+                del memo[next(iter(memo))]
+            memo[commit_sha, main_sha] = probe
+        return probe
+
+    async def _probe_commit_effect(
+        self, commit_sha: str, main_sha: str,
+    ) -> CommitEffectProbe:
+        """Uncached body of :meth:`describe_commit_effect_in_main`.
+
+        See there for the semantics, the failure vocabulary and the memo
+        this sits behind.  Split out so that every one of the early returns
+        below is filed in the memo by one piece of code rather than each
+        having to remember to — and so the memo layer reads as one page.
+
+        *main_sha* is the RESOLVED sha of the main branch, not the branch
+        name: it is the memo key's second component, so the comparison must
+        run against exactly that commit for the cached value to mean what
+        its key says.
+        """
+        rc, parents_out, _ = await _run(
+            ['git', 'rev-list', '--parents', '-n', '1', commit_sha],
+            cwd=self.project_root,
+        )
+        if rc != 0 or not parents_out:
+            return CommitEffectProbe(present=False, failure='unresolvable_commit')
+        parents = parents_out.split()[1:]
+
+        if len(parents) >= 2:
+            # Merge commit (task 2675 FIX 1′): check EVERY non-first
+            # parent's (each merged branch's) content — the paths it
+            # touched since its fork point — against current main HEAD.
+            # For an ordinary two-parent merge this is exactly one
+            # iteration (byte-identical to the original second-parent-only
+            # check); for an octopus merge (3+ parents) ALL parents must
+            # pass, else a later revert of a third-or-later parent's
+            # deliverable would silently read as effect-present (task 2675
+            # amendment — the octopus blind spot).  Touched paths MUST
+            # derive from merge-base(first_parent, other_parent), NOT
+            # merge-base(main, other_parent) — see the docstring above.
+            first_parent = parents[0]
+            last_probe = CommitEffectProbe(present=True, anchor_sha=parents[-1])
+            for other_parent in parents[1:]:
+                rc, merge_base, _ = await _run(
+                    ['git', 'merge-base', first_parent, other_parent],
+                    cwd=self.project_root,
+                )
+                if rc != 0 or not merge_base:
+                    return CommitEffectProbe(
+                        present=False,
+                        anchor_sha=other_parent,
+                        failure='merge_base_unresolved',
+                    )
+                rc, touched_out, _ = await _run(
+                    [
+                        'git', '-c', 'core.quotePath=false',
+                        'diff', '--name-only', '-z', merge_base, other_parent,
+                    ],
+                    cwd=self.project_root,
+                )
+                if rc != 0:
+                    return CommitEffectProbe(
+                        present=False,
+                        anchor_sha=other_parent,
+                        failure='touched_enumeration_failed',
+                    )
+                touched = [f for f in touched_out.split('\0') if f]
+                if not touched:
+                    # Empty branch merge — no deliverable to confirm; fail-safe.
+                    return CommitEffectProbe(
+                        present=False,
+                        anchor_sha=other_parent,
+                        failure='empty_branch_merge',
+                    )
+                probe = await self._compare_touched_paths_to_main(
+                    other_parent, touched, merge_base, main_sha,
+                )
+                if not probe.present:
+                    return probe
+                last_probe = probe
+            # Return the LAST parent's probe rather than a freshly minted
+            # present=True, so the survival facts that JUSTIFY the verdict
+            # travel with it — a bare True would strand the escalation
+            # formatter with nothing to render and silently re-create the
+            # says-THAT-but-not-WHY defect this task exists to fix.  For an
+            # ordinary two-parent merge (effectively all of them) the loop
+            # runs exactly once, so these facts are exact; for an octopus
+            # merge they describe the last parent checked, which is also what
+            # ``anchor_sha`` names.  Every parent passed either way.
+            return last_probe
+
+        # Non-merge (root or single-parent) commit: unchanged existing logic.
+        rc, touched_out, _ = await _run(
+            [
+                'git', '-c', 'core.quotePath=false',
+                'diff-tree', '--no-commit-id', '--name-only', '-r', '-z', commit_sha,
+            ],
+            cwd=self.project_root,
+        )
+        if rc != 0:
+            return CommitEffectProbe(
+                present=False,
+                anchor_sha=commit_sha,
+                failure='touched_enumeration_failed',
+            )
+        touched = [f for f in touched_out.split('\0') if f]
+        if not touched:
+            return CommitEffectProbe(present=True, anchor_sha=commit_sha)
+        # Root commits have an empty touched set and returned above, so the
+        # empty-tree base is a defensive fallback rather than a live path.
+        return await self._compare_touched_paths_to_main(
+            commit_sha, touched, parents[0] if parents else _EMPTY_TREE_SHA, main_sha,
+        )
+
+    async def _anchor_diff_lines(
+        self, base_sha: str, anchor_sha: str, path: str,
+    ) -> tuple[list[str], list[str]] | None:
+        """Return (added, removed) non-blank lines for *path* between base and anchor.
+
+        Both directions come from ONE diff invocation: the survival path needs
+        the added lines and the vacuous arm (task 3116 b3) needs the removed
+        ones, and computing them separately would double the subprocess cost
+        of the check's hottest stage for no benefit.
+
+        Run once per touched path rather than once per branch with the file
+        headers parsed out of a combined diff.  That is deliberate: *path*
+        goes through as its own argv element, so a filename containing a
+        newline (or anything else that would wreck ``+++ b/<path>`` header
+        parsing) cannot desynchronise the attribution of lines to files.  The
+        touched list this iterates already came from a ``-z`` enumeration and
+        is authoritative; nothing here re-parses a path out of git's output.
+
+        Lines are classified by HUNK STATE — header until the first ``@@``,
+        content after it — and never by raw ``+++``/``---`` prefix.  Under
+        ``--unified=0`` a content line carries exactly one prefix column, so
+        text of its own beginning with ``++`` or ``--`` is indistinguishable
+        from a file header by prefix alone; see the inline note at the loop
+        for the false-accept that cost.
+
+        Lines are returned STRIPPED, and blank ones dropped.  Two reasons,
+        both load-bearing.  (1) :func:`_run` applies ``.strip()`` to the whole
+        captured stdout, so exact-text matching would silently mangle the
+        leading whitespace of a file's first line and the trailing whitespace
+        of its last — comparing stripped text sidesteps that artifact instead
+        of quietly mis-measuring at file edges.  (2) Survival should be
+        insensitive to pure RE-INDENTATION: wrapping a block in an ``if`` or a
+        ``try`` preserves the deliverable completely, and a rule that called
+        that a revert would re-introduce the false-positive class this task
+        exists to remove.  The effect is monotone — stripping can only ever
+        RAISE a survival ratio — so every acceptance anchor that passed under
+        the recorded measurement still passes.
+
+        Returns None when git itself errored OR when its output was not
+        UTF-8 decodable, which callers must treat as fail-safe (never as
+        "nothing was added").
+        """
+        try:
+            rc, out, _ = await _run(
+                [
+                    'git', '-c', 'core.quotePath=false',
+                    'diff', '--unified=0', base_sha, anchor_sha, '--', path,
+                ],
+                cwd=self.project_root,
+            )
+        except UnicodeDecodeError:
+            # A file with no NUL bytes but non-UTF-8 content (a latin-1 text
+            # fixture, say) is TEXT to git, so `git diff` emits its raw bytes
+            # and :func:`_run`'s strict ``.decode()`` raises.  Fail-safe like
+            # every other git failure here — None routes to `diff_failed` and
+            # present=False.  Without this the exception escapes through
+            # commit_effect_present_in_main and validate_landing_evidence
+            # into the dispatch gate.  :meth:`_main_line_counts` guards the
+            # identical call for the identical reason.
+            return None
+        if rc != 0:
+            return None
+        added: list[str] = []
+        removed: list[str] = []
+        # Classify by HUNK STATE, never by raw prefix.  Under `--unified=0`
+        # every content line carries exactly ONE '+'/'-' column, so a line
+        # whose own text begins with '++' renders as '+++...' and one
+        # beginning with '--' renders as '---...' — indistinguishable from
+        # the '+++ b/<path>' / '--- a/<path>' file headers by prefix alone.
+        # Discarding those as headers silently dropped real content: C/C++
+        # `++i;`, SQL/Lua/Haskell `--` comments, TOML `+++` front matter and
+        # .patch fixtures all hit it.  Worse, the loss was ASYMMETRIC — a
+        # revert of exactly those lines went unseen, so a half-reverted
+        # deliverable measured 1.0 survival and read as a clean landing.
+        # That is a false ACCEPT on the task-1175 revert class this check
+        # exists to catch, the one direction it must never take.
+        #
+        # Everything before the first '@@' is header; after it, a leading
+        # '+'/'-' at column 0 is always content.  A binary path yields
+        # "Binary files ... differ" with no hunk at all and so contributes
+        # NEITHER, routing it to the vacuous arm exactly as before.
+        in_hunk = False
+        for line in out.split('\n'):
+            if line.startswith('diff --git '):
+                # Rename detection can emit a second file block even under a
+                # single pathspec; re-arm so its headers are not read as body.
+                in_hunk = False
+                continue
+            if line.startswith('@@'):
+                in_hunk = True
+                continue
+            if not in_hunk or not line:
+                continue
+            if line.startswith('+'):
+                body = line[1:].strip()
+                if body:
+                    added.append(body)
+            elif line.startswith('-'):
+                body = line[1:].strip()
+                if body:
+                    removed.append(body)
+        return added, removed
+
+    async def _batch_added_line_counts(
+        self, base_sha: str, anchor_sha: str, paths: list[str],
+    ) -> dict[str, int] | None:
+        """Added-line counts for *paths* in TWO subprocesses instead of N.
+
+        Only ever called for the paths that did NOT diverge from main
+        (amendment pass, review finding).  Those paths need nothing but their
+        added-line COUNT: their survival ratio is 1.0 by construction, and the
+        vacuous arm cannot fail for them either — ``diff --name-only <anchor>
+        <main>`` reporting nothing means the trees agree at that path, so
+        either it is absent on both sides (the anchor's deletion still holds)
+        or the blob oids match, and :meth:`_vacuous_path_survives` returns
+        True on both of those branches without consulting a line at all.
+        Issuing the per-path ``git diff`` for them anyway cost ~5 subprocesses
+        each (1 diff, plus 4 existence/oid reads for a vacuous one) on what
+        the docstrings above correctly call the COMMON path, re-run for every
+        landing candidate on every 15s dispatch tick.  A clean landing that
+        touches 200 files with 3 diverged paid ~985 of them for nothing.
+
+        NOT ``--numstat``, which would be one call rather than two: numstat
+        counts BLANK added lines, which :meth:`_anchor_diff_lines` drops.  A
+        fully-surviving path contributes ``(n, n)`` to the aggregate, so
+        inflating ``n`` pulls the ratio toward 1.0 — a calibration shift in
+        the false-ACCEPT direction, against thresholds measured under the
+        non-blank rule.  This reads the same ``--unified=0`` patch the
+        per-path path reads, with the same hunk-state classifier, so the
+        counts are IDENTICAL by construction rather than approximately equal.
+
+        Attribution is by ORDER, never by name: file blocks come back in the
+        same order as ``--name-only -z``'s authoritative path list, so no
+        pathname is ever parsed out of patch text — the desync hazard
+        :meth:`_anchor_diff_lines` avoids by scoping one diff per path is
+        avoided here by not reading names at all.
+
+        Returns None — meaning "fall back to the per-path reads" — on any git
+        failure, on a non-UTF-8 patch, on a block/path count mismatch, or when
+        the returned path set differs from the requested one.  That last guard
+        matters: restricting the pathspec to the whole clean set can let git
+        pair a rename it could not see per-path, collapsing two requested
+        paths into one block.  Every one of these is a fall-back to the slower
+        but definitive path, never a fabricated count.
+        """
+        rc, order_out, _ = await _run(
+            [
+                'git', '-c', 'core.quotePath=false',
+                'diff', '--name-only', '-z', base_sha, anchor_sha, '--', *paths,
+            ],
+            cwd=self.project_root,
+        )
+        if rc != 0:
+            return None
+        ordered = [f for f in order_out.split('\0') if f]
+        if set(ordered) != set(paths) or len(ordered) != len(paths):
+            return None
+        try:
+            rc, patch_out, _ = await _run(
+                [
+                    'git', '-c', 'core.quotePath=false',
+                    'diff', '--unified=0', base_sha, anchor_sha, '--', *paths,
+                ],
+                cwd=self.project_root,
+            )
+        except UnicodeDecodeError:
+            return None
+        if rc != 0:
+            return None
+        counts: list[int] = []
+        added = 0
+        in_hunk = False
+        started = False
+        for line in patch_out.split('\n'):
+            if line.startswith('diff --git '):
+                # A new file block: bank the previous one and re-arm.  Under
+                # `--unified=0` every in-hunk content line carries a '+'/'-'
+                # column, so this prefix at column 0 is unambiguously a header.
+                if started:
+                    counts.append(added)
+                started, added, in_hunk = True, 0, False
+                continue
+            if not started:
+                continue
+            if line.startswith('@@'):
+                in_hunk = True
+                continue
+            if not in_hunk or not line:
+                continue
+            if line.startswith('+') and line[1:].strip():
+                added += 1
+        if started:
+            counts.append(added)
+        if len(counts) != len(ordered):
+            return None
+        return dict(zip(ordered, counts, strict=True))
+
+    async def _path_exists_at(self, rev: str, path: str) -> bool:
+        """True iff *path* resolves to a blob at *rev*."""
+        rc, _, _ = await _run(
+            ['git', 'cat-file', '-e', f'{rev}:{path}'], cwd=self.project_root,
+        )
+        return rc == 0
+
+    async def _blob_oid_at(self, rev: str, path: str) -> str | None:
+        """Return *path*'s blob oid at *rev*, or None if it does not resolve."""
+        rc, out, _ = await _run(
+            ['git', 'rev-parse', f'{rev}:{path}'], cwd=self.project_root,
+        )
+        return out.strip() if rc == 0 and out.strip() else None
+
+    async def _vacuous_path_survives(
+        self, anchor_sha: str, path: str, removed: list[str], main_sha: str,
+    ) -> bool:
+        """Decide a ZERO-ADDED-LINES path's survival (task 3116 b3).
+
+        An added-lines-survive test is trivially true for these paths, so
+        without this arm the whole class — pure line deletions, file removals,
+        renames, binaries, mode changes — is a silent no-op, which is the
+        task-1175 clobber this gate exists to prevent.  Corpus rate: 0.53%.
+
+        Each shape is decided by the mechanism that actually applies to it,
+        because the wrong mechanism gives a WRONG answer rather than no
+        answer.  A content-preserving rename is the sharp example: the lines
+        are identical on both sides of the move, so a line-set test still
+        reports "survived" after the rename has been undone.  Only presence
+        and blob identity can see that.
+
+        - **Path deleted by the anchor** — survives iff still absent at main.
+          Resurrecting a file the deliverable removed is a genuine revert.
+        - **Path present at anchor and main with the SAME blob oid** —
+          survives, byte for byte.  One mechanism covers renames, binaries,
+          content-identical moves and pure mode changes.
+        - **Blob differs, and the anchor removed lines here** — survives iff
+          those removed lines are still absent from main's line-set.
+
+        Removed-line absence is used HERE AND ONLY HERE, never as a global
+        conjunct on the survival path (b4): corpus-wide only 73.0% of removed
+        lines are still absent, and merge 3640 has 18 of its 45 removed lines
+        present again at main by short-common-line coincidence, so a global
+        conjunct would reject a motivating case.
+
+        Anything else — the blob differs with nothing measurable to check, as
+        for a clobbered binary — is fail-safe False.  Never a fabricated True.
+        """
+        at_anchor = await self._path_exists_at(anchor_sha, path)
+        at_main = await self._path_exists_at(main_sha, path)
+        if not at_anchor:
+            # The anchor DELETED this path; the effect is the absence.
+            return not at_main
+        if not at_main:
+            return False
+        anchor_oid = await self._blob_oid_at(anchor_sha, path)
+        main_oid = await self._blob_oid_at(main_sha, path)
+        if anchor_oid is not None and anchor_oid == main_oid:
+            return True
+        if removed:
+            main_lines = await self._main_line_counts(path, main_sha)
+            if main_lines is None:
+                return False
+            return not any(line in main_lines for line in removed)
+        # Content differs with nothing measurable (e.g. a clobbered binary).
+        return False
+
+    async def _main_line_counts(
+        self, path: str, main_sha: str,
+    ) -> Counter[str] | None:
+        """Return the MULTISET of stripped, non-blank lines of *path* at *main_sha*.
+
+        A ``Counter``, not a ``set``, and the difference runs in the
+        false-ACCEPT direction — the one direction this check must never take
+        (amendment pass, review finding).  Survival is counted as a multiset
+        intersection (``min(added_count, main_count)`` per distinct line), so
+        a line the anchor added N times can contribute at most as many
+        survivors as main actually still carries.  Under set membership a
+        deliverable that adds a repeated boilerplate line — a manifest entry,
+        a duplicated import block, N copies of ``return None`` — scored ALL N
+        of them as surviving whenever main retained even ONE, and could clear
+        the 0.98 aggregate while genuinely reverted.  The same coincidence
+        hazard is already documented on the removed-line side in
+        :meth:`_vacuous_path_survives` ("18 of its 45 removed lines present
+        again at main by short-common-line coincidence"); this is its
+        added-line twin.
+
+        Residual (accepted, and monotone in the SAFE direction): a line can
+        still be counted as surviving when main's copies of it live somewhere
+        unrelated in the same file rather than where the anchor put them.
+        Closing that needs positional matching, which re-introduces the
+        re-indentation false positive :meth:`_anchor_diff_lines` deliberately
+        removed.  Multiset counting can only ever LOWER a ratio relative to
+        set membership, so every acceptance anchor that passed the recorded
+        measurement still passes.
+
+        None means the blob could not be read as text — the path is absent at
+        main, or its content is not decodable (a binary blob would raise
+        ``UnicodeDecodeError`` inside :func:`_run`'s ``.decode()``).  Callers
+        treat None as "nothing survives here", which is the fail-safe
+        direction: never claim an effect is present on doubt.
+
+        KNOWN GAP — a rename performed by MAIN after the landing.  This reads
+        *path* at ``main_sha`` under its ORIGINAL name, so if a later commit
+        on main simply MOVED the deliverable, ``git show`` fails, None comes
+        back, and every one of that path's added lines counts as lost even
+        though all of them sit at main under the new name.  That is a
+        false-POSITIVE (a spurious reject), i.e. the fail-safe direction, and
+        it is pinned by
+        ``test_main_renaming_the_deliverable_after_landing_reads_as_absent``.
+        Closing it would mean resolving the path through
+        ``git diff --name-status -M`` before the read, which loosens the
+        predicate and so needs its own corpus re-measurement.
+        """
+        try:
+            rc, content, _ = await _run(
+                ['git', 'show', f'{main_sha}:{path}'],
+                cwd=self.project_root,
+            )
+        except UnicodeDecodeError:
+            return None
+        if rc != 0:
+            return None
+        return Counter(
+            stripped for line in content.split('\n') if (stripped := line.strip())
+        )
+
+    async def _compare_touched_paths_to_main(
+        self, anchor_sha: str, touched: list[str], base_sha: str, main_sha: str,
+    ) -> CommitEffectProbe:
+        """Decide whether *anchor_sha*'s effect SURVIVES at main HEAD.
+
+        The terminal stage of :meth:`describe_commit_effect_in_main`, shared by
+        its merge and non-merge branches so both decide identically.  Since
+        task 3116 part (b) the question asked here is line SURVIVAL, not byte
+        identity — see the module-level ``_EFFECT_SURVIVAL_*`` constants for
+        the full-corpus measurement that set the thresholds.
+
+        Three stages:
+
+        1. **Byte-level divergence** — which touched paths differ between the
+           anchor and main.  Retained as a DIAGNOSTIC (it is the single most
+           legible line in an escalation: it names the co-touched hot file in
+           both reported instances) but it no longer decides anything, so
+           ``diverged_paths`` is now populated on ``present=True`` verdicts
+           too.  It also does real work here: a path that did NOT diverge is
+           byte-identical at main, so its survival is exactly 1.0, it cannot
+           fail the vacuous arm either, and the whole clean set is costed in
+           ONE batched read (:meth:`_batch_added_line_counts`) rather than ~5
+           subprocesses per path.
+
+        2. **Per-path added lines and their survival** — for each DIVERGED
+           path the lines the anchor added since *base_sha*, and how many of
+           them main's copy of that path still carries.  Counted as a MULTISET
+           intersection (:meth:`_main_line_counts`), so N copies of a repeated
+           boilerplate line cannot all score as surviving because main kept
+           one.
+
+        3. **The verdict** — aggregate survival at or above
+           ``_EFFECT_SURVIVAL_AGGREGATE_THRESHOLD``, AND every path carrying
+           at least ``_EFFECT_SURVIVAL_PER_FILE_MIN_ADDED_LINES`` added lines
+           at or above ``_EFFECT_SURVIVAL_PER_FILE_THRESHOLD``.  The per-file
+           guard closes b2's objection that a bare aggregate hides a reverted
+           20-line deliverable behind a 2000-line test file; the floor stops a
+           small, frequently-edited prose file from vetoing a clean landing.
+
+        ZERO-ADDED-LINES (vacuous) paths — pure deletions, pure renames,
+        binaries, mode changes — contribute nothing to either ratio, because
+        an added-lines-survive test is trivially true for them.  They are
+        decided instead by :meth:`_vacuous_path_survives`, each by the
+        mechanism that actually applies to its shape, and a failing one
+        short-circuits the whole check with ``'vacuous_effect_absent'``.  When
+        EVERY touched path is vacuous, ``aggregate_survival`` stays None —
+        UNDEFINED rather than 0.0 or 1.0, both of which would assert a
+        measurement that was never taken.  The corpus puts this class at 0.53%
+        of merges; it is handled anyway because a silent always-True for a
+        deletion-shaped deliverable is precisely the task-1175 clobber this
+        gate exists to prevent (b3).
+
+        *main_sha* is the RESOLVED sha of main, threaded down from the memo
+        key in :meth:`describe_commit_effect_in_main` rather than re-read from
+        ``config.main_branch`` here, so every comparison in this stage runs
+        against exactly the HEAD the cached verdict is filed under.
+
+        Fail-safe throughout: any git error yields ``present=False``, never a
+        fabricated True.
+        """
+        rc, diff_out, _ = await _run(
+            [
+                'git', '-c', 'core.quotePath=false',
+                'diff', '--name-only', '-z', anchor_sha,
+                main_sha, '--', *touched,
+            ],
+            cwd=self.project_root,
+        )
+        if rc != 0:
+            return CommitEffectProbe(
+                present=False, anchor_sha=anchor_sha, failure='diff_failed',
+            )
+        diverged = tuple(f for f in diff_out.split('\0') if f)
+        diverged_set = set(diverged)
+
+        thresholds = {
+            'aggregate_threshold': _EFFECT_SURVIVAL_AGGREGATE_THRESHOLD,
+            'per_file_threshold': _EFFECT_SURVIVAL_PER_FILE_THRESHOLD,
+            'per_file_min_added_lines': _EFFECT_SURVIVAL_PER_FILE_MIN_ADDED_LINES,
+        }
+
+        total_added = 0
+        total_survived = 0
+        worst_guarded_path: str | None = None
+        worst_guarded_survival: float | None = None
+        guard_failed = False
+
+        # Paths that did NOT diverge need only their added-line count, so they
+        # are read in ONE batch rather than ~5 subprocesses each; None means
+        # the batch could not be trusted and every path falls back below.
+        clean_paths = [p for p in touched if p not in diverged_set]
+        clean_counts: dict[str, int] = {}
+        if clean_paths:
+            clean_counts = await self._batch_added_line_counts(
+                base_sha, anchor_sha, clean_paths,
+            ) or {}
+
+        vacuous_seen: list[str] = []
+        for path in touched:
+            fast_added = clean_counts.get(path)
+            if fast_added is not None:
+                # Byte-identical at main (or absent on both sides): survival is
+                # 1.0 by construction and the vacuous arm cannot fail — see
+                # :meth:`_batch_added_line_counts` for the proof — so this path
+                # needs no blob read and no existence probe at all.
+                if fast_added == 0:
+                    vacuous_seen.append(path)
+                    continue
+                added_count = survived = fast_added
+            else:
+                diff_lines = await self._anchor_diff_lines(base_sha, anchor_sha, path)
+                if diff_lines is None:
+                    return CommitEffectProbe(
+                        present=False,
+                        diverged_paths=diverged,
+                        anchor_sha=anchor_sha,
+                        failure='diff_failed',
+                        **thresholds,
+                    )
+                added, removed = diff_lines
+                if not added:
+                    # Zero added lines: an added-lines test is trivially true
+                    # here, so this path is decided by its own shape's arm (b3).
+                    vacuous_seen.append(path)
+                    if not await self._vacuous_path_survives(
+                        anchor_sha, path, removed, main_sha,
+                    ):
+                        # Short-circuit naming the OFFENDER.  This runs before
+                        # the aggregate is known on purpose, but it can only
+                        # ever add a rejection: a failed vacuous path is
+                        # decisive on its own, and the text arm below cannot
+                        # rescue it.
+                        return CommitEffectProbe(
+                            present=False,
+                            diverged_paths=diverged,
+                            anchor_sha=anchor_sha,
+                            failure='vacuous_effect_absent',
+                            vacuous_paths=(path,),
+                            **thresholds,
+                        )
+                    continue
+                added_count = len(added)
+                if path in diverged_set:
+                    main_counts = await self._main_line_counts(path, main_sha)
+                    if main_counts is None:
+                        survived = 0
+                    else:
+                        # MULTISET intersection, not set membership: a line the
+                        # anchor added N times may contribute at most as many
+                        # survivors as main actually still carries.
+                        added_counts = Counter(added)
+                        survived = sum(
+                            min(n, main_counts[line])
+                            for line, n in added_counts.items()
+                        )
+                else:
+                    # Byte-identical at main: every added line is still there.
+                    survived = added_count
+            total_added += added_count
+            total_survived += survived
+            ratio = survived / added_count
+            if added_count >= _EFFECT_SURVIVAL_PER_FILE_MIN_ADDED_LINES:
+                if worst_guarded_survival is None or ratio < worst_guarded_survival:
+                    worst_guarded_survival = ratio
+                    worst_guarded_path = path
+                if ratio < _EFFECT_SURVIVAL_PER_FILE_THRESHOLD:
+                    guard_failed = True
+
+        if total_added == 0:
+            # Every touched path was vacuous and every one passed its arm.
+            # aggregate_survival stays None — UNDEFINED, deliberately neither
+            # 0.0 nor 1.0, because both would be assertions the code cannot
+            # support and this probe is rendered verbatim into an escalation.
+            return CommitEffectProbe(
+                present=True,
+                diverged_paths=diverged,
+                anchor_sha=anchor_sha,
+                vacuous_paths=tuple(vacuous_seen),
+                **thresholds,
+            )
+
+        aggregate = total_survived / total_added
+        present = (
+            aggregate >= _EFFECT_SURVIVAL_AGGREGATE_THRESHOLD and not guard_failed
+        )
+        return CommitEffectProbe(
+            present=present,
+            diverged_paths=diverged,
+            anchor_sha=anchor_sha,
+            failure=None if present else 'effect_not_survived',
+            aggregate_survival=aggregate,
+            added_lines_total=total_added,
+            worst_guarded_path=worst_guarded_path,
+            worst_guarded_survival=worst_guarded_survival,
+            vacuous_paths=tuple(vacuous_seen),
+            **thresholds,
+        )
+
     async def commit_effect_present_in_main(self, commit_sha: str) -> bool:
         """Return True iff *commit_sha*'s own effect is still present at main HEAD.
 
@@ -8998,26 +10038,31 @@ class GitOps:
           ``other_parent`` and yields an empty, useless diff), then
           ``touched = git -c core.quotePath=false diff --name-only -z
           <merge_base> <other_parent>`` (the paths that parent introduced
-          since its fork point), and finally whether ``git diff --quiet
-          <other_parent> <main> -- <touched...>`` reports no difference —
-          i.e. main HEAD still carries that parent's content
-          byte-identical for every path it touched.  For an ordinary
-          two-parent merge this is exactly one iteration, byte-identical
-          to checking the second parent alone.
+          since its fork point), and finally whether the lines that
+          parent ADDED across those paths still SURVIVE at main HEAD.
+          Until task 3116 part b that terminal test was a byte-identity
+          ``git diff --quiet <other_parent> <main> -- <touched...>``; it
+          is now the survival predicate described on
+          :meth:`describe_commit_effect_in_main`, which owns the
+          thresholds and the full-corpus measurement behind them.  For an
+          ordinary two-parent merge this is exactly one iteration,
+          equivalent to checking the second parent alone.
 
         - **Non-merge commit** (root or single-parent) — UNCHANGED from
           prior behavior (task 2500): ``touched = git -c
           core.quotePath=false diff-tree --no-commit-id --name-only -r
           -z <commit_sha>`` (the commit's own diff against its sole
-          parent) and, when non-empty, whether ``git diff --quiet
-          <commit_sha> <main> -- <touched...>`` reports no difference.
+          parent) and, when non-empty, whether the lines that commit
+          ADDED across those paths still SURVIVE at main HEAD — the same
+          survival test as the merge branch above.
 
         ``-z`` + ``core.quotePath=false`` together make every path list
         byte-faithful for any filename, including non-ASCII or
         newline-containing ones — see the path-quoting caveat on
         :meth:`branch_content_in_main`, which shares this primitive's
-        underlying merge-base/diff/diff-quiet pattern but not yet this
-        hardening.
+        underlying merge-base/diff anchor pattern (though it still ends
+        in the byte-identity ``diff --quiet`` this one retired) but not
+        yet this hardening.
 
         Returns True (path-based revert detection inapplicable) when:
         - the commit is non-merge and its own touched-set is empty — a
@@ -9038,29 +10083,64 @@ class GitOps:
           EVERY parent to pass;
         - for a non-merge commit, the ``diff-tree`` call errors (rc !=
           0);
-        - the final ``diff --quiet`` call errors for a reason other than
-          "paths differ" (rc not in {0, 1}); or
-        - any touched path differs (rc == 1) between the relevant commit
-          (*commit_sha* for non-merge, any non-first parent for merge) and
-          main HEAD — produced by a post-hoc revert of those paths, but
-          equally by any OTHER later change to the same paths (e.g.
-          another already-landed task's follow-up edit, or this task's
-          own later commit on the same branch overlapping the same
-          files).  This primitive cannot distinguish the two; see the
-          accepted-risk note below.
+        - a diff or blob read the survival test needs errors, leaving
+          the probe unable to reach a verdict; or
+        - the lines ADDED by the relevant commit (*commit_sha* for
+          non-merge, any non-first parent for merge) do not survive at
+          main HEAD — aggregate survival below
+          ``_EFFECT_SURVIVAL_AGGREGATE_THRESHOLD``, or some path carrying
+          at least ``_EFFECT_SURVIVAL_PER_FILE_MIN_ADDED_LINES`` added
+          lines below ``_EFFECT_SURVIVAL_PER_FILE_THRESHOLD``.  A
+          post-hoc revert of those paths lands here.  Ordinary ADDITIVE
+          later evolution of the same paths (another already-landed
+          task's follow-up edit, or this task's own later commit
+          overlapping the same files) does NOT — that was byte-identity's
+          false positive and task 3116 part b is what removed it; see the
+          narrowed-residual-risk note below for the tail that remains.
 
-        **Accepted risk — later evolution reads the same as a revert**:
-        because this primitive only compares the relevant commit's own
-        touched paths against current main HEAD, ordinary subsequent
-        evolution of those paths (not just a genuine revert) also
-        returns False here.  This is a deliberate fail-safe trade-off,
-        not a bug: the caller's own recovery path on False is idempotent
-        (re-open to pending / withhold the flip — never a wrong terminal
-        state), so the cost of a false negative here is a re-check,
-        whereas a false True would wrongly cement a completion that
-        never happened. Callers with a same-branch multi-commit shape
-        should anchor this check on the branch's own tip rather than a
-        possibly-stale intermediate commit — see
+        **Narrowed residual risk — a heavy rewrite can still read as a
+        revert** (task 3116 part b).  This note previously read "later
+        evolution reads the same as a revert" and priced a false False at
+        "an idempotent re-check".  BOTH halves were wrong, and together
+        they are why the defect survived as long as it did.
+
+        Ordinary ADDITIVE evolution no longer reads as a revert.  The
+        predicate no longer demands byte-identity against a moving HEAD;
+        it asks whether the anchor's ADDED LINES still survive at main
+        (see :meth:`describe_commit_effect_in_main` for the thresholds
+        and the full-corpus measurement behind them).  A later commit
+        that appends to, extends, or re-indents the same paths leaves
+        every added line in place and reads as PRESENT.
+
+        What remains is a genuinely narrower tail: a heavy REWRITE that
+        replaces most of the branch's added lines, a revert paired with
+        unrelated additions in the same files, or a later commit on main
+        that RENAMES the deliverable's file (survival is read per path
+        under the anchor's own name, so a pure move reads as a total
+        loss — see :meth:`_main_line_counts`'s KNOWN GAP and
+        ``test_main_renaming_the_deliverable_after_landing_reads_as_absent``)
+        can still land inside
+        the residual band the threshold cannot separate from a real
+        revert.  The full corpus puts that tail at roughly 60% of
+        currently-rejected merges still rejected — much smaller than
+        before, and no longer dominated by the additive-evolution class.
+
+        And the COST of a false False is not a re-check.  It is a FULL
+        DISPATCH: plan, verify and review all re-run, a spurious
+        task_failure escalation is filed, and the task sits blocked for
+        days (measured at about 5.80 USD of post-landing spend across
+        tasks 3653, 3640 and 3717, before the L2 triage their secondary
+        escalations consumed).  Worse, the condition is ABSORBING — once
+        the deliverable is judged gone it is never judged back — so
+        "re-evaluated on the next dispatch tick" describes a guaranteed
+        repeat, not a recovery.  The fail-safe direction is still correct
+        (a false True would wrongly cement a completion that never
+        happened, which is strictly worse), but it is a real cost to be
+        minimised, not a free one.
+
+        Callers with a same-branch multi-commit shape should anchor this
+        check on the branch's own tip rather than a possibly-stale
+        intermediate commit — see
         ``Harness._already_landed_dispatch_gate``'s citation-lineage
         handling (task 2500).
 
@@ -9071,80 +10151,23 @@ class GitOps:
         conflict resolution can therefore read as effect-absent (False)
         here even though the merge landed cleanly on main, because the
         resolved content on main no longer matches that parent's
-        unresolved pre-merge blob for the conflicting paths.  Same
-        fail-safe trade-off as above: a false False costs the caller an
-        idempotent re-check, never a wrongly-cemented completion.
+        unresolved pre-merge blob for the conflicting paths.  Since task
+        3116 this is much less likely to bite — a conflict resolution
+        that KEEPS the parent's added lines (the common shape) now reads
+        as present, because survival is measured on those lines rather
+        than on byte-identity — but a resolution that rewrote them can
+        still read as absent.  Same fail-safe direction as above, at the
+        real (not free) cost documented there.
+
+        **Task 3116 — callers needing WHICH paths diverged** should use
+        :meth:`describe_commit_effect_in_main`, which is the single
+        implementation this method wraps.  It returns the same verdict as
+        ``present`` plus the diverged path list, the anchor commit the
+        comparison ran against, and a structured failure code.  This bool
+        remains the contract of record for the gate DECISION; the probe is
+        for explaining it.
         """
-        rc, parents_out, _ = await _run(
-            ['git', 'rev-list', '--parents', '-n', '1', commit_sha],
-            cwd=self.project_root,
-        )
-        if rc != 0 or not parents_out:
-            return False
-        parents = parents_out.split()[1:]
-
-        if len(parents) >= 2:
-            # Merge commit (task 2675 FIX 1′): check EVERY non-first
-            # parent's (each merged branch's) content — the paths it
-            # touched since its fork point — against current main HEAD.
-            # For an ordinary two-parent merge this is exactly one
-            # iteration (byte-identical to the original second-parent-only
-            # check); for an octopus merge (3+ parents) ALL parents must
-            # pass, else a later revert of a third-or-later parent's
-            # deliverable would silently read as effect-present (task 2675
-            # amendment — the octopus blind spot).  Touched paths MUST
-            # derive from merge-base(first_parent, other_parent), NOT
-            # merge-base(main, other_parent) — see the docstring above.
-            first_parent = parents[0]
-            for other_parent in parents[1:]:
-                rc, merge_base, _ = await _run(
-                    ['git', 'merge-base', first_parent, other_parent],
-                    cwd=self.project_root,
-                )
-                if rc != 0 or not merge_base:
-                    return False
-                rc, touched_out, _ = await _run(
-                    [
-                        'git', '-c', 'core.quotePath=false',
-                        'diff', '--name-only', '-z', merge_base, other_parent,
-                    ],
-                    cwd=self.project_root,
-                )
-                if rc != 0:
-                    return False
-                touched = [f for f in touched_out.split('\0') if f]
-                if not touched:
-                    # Empty branch merge — no deliverable to confirm; fail-safe.
-                    return False
-                rc, _, _ = await _run(
-                    [
-                        'git', 'diff', '--quiet', other_parent,
-                        self.config.main_branch, '--', *touched,
-                    ],
-                    cwd=self.project_root,
-                )
-                if rc != 0:
-                    return False
-            return True
-
-        # Non-merge (root or single-parent) commit: unchanged existing logic.
-        rc, touched_out, _ = await _run(
-            [
-                'git', '-c', 'core.quotePath=false',
-                'diff-tree', '--no-commit-id', '--name-only', '-r', '-z', commit_sha,
-            ],
-            cwd=self.project_root,
-        )
-        if rc != 0:
-            return False
-        touched = [f for f in touched_out.split('\0') if f]
-        if not touched:
-            return True
-        rc, _, _ = await _run(
-            ['git', 'diff', '--quiet', commit_sha, self.config.main_branch, '--', *touched],
-            cwd=self.project_root,
-        )
-        return rc == 0
+        return (await self.describe_commit_effect_in_main(commit_sha)).present
 
     async def worktree_head_beyond_main(self, worktree: Path) -> str | None:
         """Return the HEAD SHA when *worktree* carries commits beyond main, else None.
