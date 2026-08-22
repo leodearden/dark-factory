@@ -4777,6 +4777,41 @@ async def test_done_provenance_accepts_deterministic_gate(
 
 
 @pytest.mark.asyncio
+async def test_done_provenance_deterministic_gate_persists_escalation_id(
+    taskmaster, reconciler, event_buffer, tmp_path
+):
+    """kind='deterministic-gate' with escalation_id survives to the persisted blob.
+
+    DeterministicRunner cites the resolving gate escalation via
+    escalation_id on this kind (deterministic_runner.py, `_build_done_provenance(
+    'deterministic-gate', ..., escalation_id=_gate_esc_id)`), and the
+    _validate_done_provenance docstring promises the same. The field is
+    optional (unlike 'operational-verified', where it is required), but when
+    supplied it must not be silently dropped at the persistence chokepoint —
+    Stage-2 audit and any operator reading the stored blob rely on it to
+    find the gate record.
+    """
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    result = await interceptor.set_task_status(
+        '1',
+        'done',
+        str(tmp_path),
+        done_provenance={
+            'kind': 'deterministic-gate',
+            'note': 'pure gate resolved',
+            'escalation_id': 'esc-4064-gate',
+        },
+    )
+
+    assert 'error' not in result, f'expected acceptance but got: {result}'
+    taskmaster.set_status_and_stamp_audit.assert_called_once()
+    persisted = taskmaster.set_status_and_stamp_audit.call_args.kwargs['audit_fields']['done_provenance']
+    assert persisted['kind'] == 'deterministic-gate'
+    assert persisted['escalation_id'] == 'esc-4064-gate'
+
+
+@pytest.mark.asyncio
 async def test_done_provenance_accepts_deterministic_deploy_scheduled(
     taskmaster, reconciler, event_buffer, tmp_path
 ):
