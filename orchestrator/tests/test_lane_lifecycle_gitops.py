@@ -18,6 +18,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import TASK_META_DIRNAME, GitConfig
@@ -32,6 +33,29 @@ from orchestrator.lane_lifecycle import (
     AcquireRoute,
     LaneState,
 )
+
+# HONEST EXCEPTION in this family, recorded rather than papered over with the
+# boilerplate: TestSingleWriterSourceScan does sweep every *.py under
+# orchestrator/src via rglob, but with a plain `'.note_assigned(' in
+# py.read_text()` SUBSTRING test and NO ast.parse -- MEASURED at 0.05s/call
+# here, three orders of magnitude below the 60s default. It is marked for
+# family consistency and future-proofing, NOT because it is near the cliff:
+# the whole-tree walk is already in place, so the day this scan grows an AST
+# step (as every other member of the family has) the cost jumps by those three
+# orders with no other signal, and a marked-but-fast test costs nothing.
+# Under pytest-timeout's thread method a breach does NOT fail the test -- it
+# os._exit()s the xdist worker ("node down: Not properly terminated"), and
+# `--max-worker-restart=0` then declines to replace it, degrading the run to a
+# TRUNCATED whole-suite session whose surviving failure names whichever
+# innocent guard merely shared the dead worker.
+# Opt into the pyproject-sanctioned "Slow tests opt out with
+# @pytest.mark.timeout(N)" mechanism (orchestrator/pyproject.toml:154).
+# WHOLE_TREE_SCAN_TEST_TIMEOUT is `5 * PYPROJECT_DEFAULT_TIMEOUT` (300s) in
+# _orch_helpers.py -- DERIVED from the very ini default being cleared, so it
+# tracks that setting instead of drifting from it. Coverage of this family is
+# ENFORCED, not sprinkled: test_whole_tree_scan_timeout_guard.py recomputes
+# the census from source on every run and fails a scanner that loses this.
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # ---------------------------------------------------------------------------
 # Repo fixture (mirrors test_warm_lane_abort_teardown.py)

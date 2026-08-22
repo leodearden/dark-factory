@@ -42,6 +42,32 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+import pytest
+from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+# This guard AST-parses every *.py under orchestrator/tests/ -- 535 files at
+# authorship time -- via rglob. CPU/IO-heavy work that can exceed the
+# pyproject's 60s per-test default under `-n auto` xdist oversubscription;
+# MEASURED at 8.25s/call unloaded and serial (-n0) on a 32-core box, the
+# slowest in the family.
+# Under pytest-timeout's thread method a breach does NOT fail the test -- it
+# os._exit()s the xdist worker ("node down: Not properly terminated"), and
+# `--max-worker-restart=0` then declines to replace it, degrading the run to a
+# TRUNCATED whole-suite session whose surviving failure names whichever
+# innocent guard merely shared the dead worker.
+# Measured LIVE, not hypothesised: branch task/3980 @ d4182e4642, loadavg
+# ~250-336 -- "FAILED test_no_new_merge_queue_private_reachback_patches" /
+# "[gw17] node down", session truncated at 44% (task 4215 / escalation
+# esc-3980-1).
+# Opt into the pyproject-sanctioned "Slow tests opt out with
+# @pytest.mark.timeout(N)" mechanism (orchestrator/pyproject.toml:154).
+# WHOLE_TREE_SCAN_TEST_TIMEOUT is `5 * PYPROJECT_DEFAULT_TIMEOUT` (300s) in
+# _orch_helpers.py -- DERIVED from the very ini default being cleared, so it
+# tracks that setting instead of drifting from it. Coverage of this family is
+# ENFORCED, not sprinkled: test_whole_tree_scan_timeout_guard.py recomputes
+# the census from source on every run and fails a scanner that loses this.
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
+
 _THIS_FILE = Path(__file__).name
 _TESTS_DIR = Path(__file__).parent
 _SRC_DIR = Path(__file__).parent.parent / 'src' / 'orchestrator'

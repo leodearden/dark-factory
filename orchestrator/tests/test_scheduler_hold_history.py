@@ -27,10 +27,38 @@ from pathlib import Path
 
 import _hold_history_fixtures as F
 import pytest
+from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.hold_history import HoldHistory
 from orchestrator.scheduler import Scheduler
+
+# test_lock_events_are_emitted_from_exactly_one_site AST-parses every *.py
+# under orchestrator/src via rglob -- CPU/IO-heavy work that can exceed the
+# pyproject's 60s per-test default under `-n auto` xdist oversubscription.
+# MEASURED at 2.90s and 3.07s per call unloaded and serial (-n0) here: it is
+# parametrized over two event names, so the whole sweep runs twice.
+# Under pytest-timeout's thread method a breach does NOT fail the test -- it
+# os._exit()s the xdist worker ("node down: Not properly terminated"), and
+# `--max-worker-restart=0` then declines to replace it, degrading the run to a
+# TRUNCATED whole-suite session whose surviving failure names whichever
+# innocent guard merely shared the dead worker.
+# Not individually reproduced under load, but three structurally-identical
+# whole-tree AST scan guards in this directory
+# (test_event_loop_antipattern_guard.py,
+# test_merge_queue_reachback_patch_guard.py,
+# test_serial_merge_worker_import_guard.py) crashed in exactly this way,
+# confirming a FAMILY defect rather than three accidents (task 4215 /
+# escalations esc-3980-1, esc-3787-1). Marked preemptively: a marked-but-fast
+# test costs nothing, while an unmarked-and-slow one costs a whole session.
+# Opt into the pyproject-sanctioned "Slow tests opt out with
+# @pytest.mark.timeout(N)" mechanism (orchestrator/pyproject.toml:154).
+# WHOLE_TREE_SCAN_TEST_TIMEOUT is `5 * PYPROJECT_DEFAULT_TIMEOUT` (300s) in
+# _orch_helpers.py -- DERIVED from the very ini default being cleared, so it
+# tracks that setting instead of drifting from it. Coverage of this family is
+# ENFORCED, not sprinkled: test_whole_tree_scan_timeout_guard.py recomputes
+# the census from source on every run and fails a scanner that loses this.
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 FIXED_DT = datetime(2026, 8, 1, 0, 0, 0, tzinfo=UTC)
 

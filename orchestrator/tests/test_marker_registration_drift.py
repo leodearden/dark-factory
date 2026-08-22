@@ -66,6 +66,38 @@ from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
+from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+# This guard sweeps every *.py under orchestrator/tests/ -- 535 files at
+# authorship time -- and ast.parse()s each one; its module-scoped
+# `_real_tree_sweep` fixture measured ~5.6s for ~494 files. CPU/IO-heavy work
+# that can exceed the pyproject's 60s per-test default under `-n auto` xdist
+# oversubscription.
+# Under pytest-timeout's thread method a breach does NOT fail the test -- it
+# os._exit()s the xdist worker ("node down: Not properly terminated"), and
+# `--max-worker-restart=0` then declines to replace it, degrading the run to a
+# TRUNCATED whole-suite session whose surviving failure names whichever
+# innocent guard merely shared the dead worker.
+# WHY A MODULE-LEVEL MARK when this file already carries two
+# @pytest.mark.timeout(120) DECORATORS on the tests that consume that fixture:
+# the decorators still WIN where present -- get_closest_marker resolves the
+# nearest mark, verified empirically (pytestmark timeout(300) plus
+# @pytest.mark.timeout(7) on one test yields args (7,) for the decorated test
+# and (300,) for the bare one) -- so this narrows nothing. It is a FLOOR for
+# any test ADDED here later without a decorator, which would otherwise fall
+# silently back to 60s while the file "looks" marked. That gap is exactly why
+# test_whole_tree_scan_timeout_guard.py demands a MODULE-LEVEL pytestmark (a
+# sound LOWER bound on every collected item) rather than "some timeout mark
+# somewhere in the file" (an UPPER bound), and why this file is the 12th
+# member of the family rather than an exception to it.
+# Opt into the pyproject-sanctioned "Slow tests opt out with
+# @pytest.mark.timeout(N)" mechanism (orchestrator/pyproject.toml:154).
+# WHOLE_TREE_SCAN_TEST_TIMEOUT is `5 * PYPROJECT_DEFAULT_TIMEOUT` (300s) in
+# _orch_helpers.py -- DERIVED from the very ini default being cleared, so it
+# tracks that setting instead of drifting from it. Coverage of this family is
+# ENFORCED, not sprinkled: test_whole_tree_scan_timeout_guard.py recomputes
+# the census from source on every run and fails a scanner that loses this.
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 
 def _marker_name(element: ast.expr) -> str | None:

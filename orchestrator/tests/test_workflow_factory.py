@@ -21,11 +21,39 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 
-from _orch_helpers import pydantic_spec
+import pytest
+from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT, pydantic_spec
 
 import orchestrator
 from orchestrator.config import OrchestratorConfig
 from orchestrator.workflow import TaskWorkflow, build_workflow
+
+# test_single_taskworkflow_construction_point scans every *.py under
+# orchestrator/src via _orchestrator_src_root().rglob('*.py') -- the same
+# helper test_eval_boundary_suite.py imports from here, so one slow tree walk
+# is billed to two modules. CPU/IO-heavy work that can exceed the pyproject's
+# 60s per-test default under `-n auto` xdist oversubscription.
+# Under pytest-timeout's thread method a breach does NOT fail the test -- it
+# os._exit()s the xdist worker ("node down: Not properly terminated"), and
+# `--max-worker-restart=0` then declines to replace it, degrading the run to a
+# TRUNCATED whole-suite session whose surviving failure names whichever
+# innocent guard merely shared the dead worker.
+# Not individually reproduced under load, but three structurally-identical
+# whole-tree AST scan guards in this directory
+# (test_event_loop_antipattern_guard.py,
+# test_merge_queue_reachback_patch_guard.py,
+# test_serial_merge_worker_import_guard.py) crashed in exactly this way,
+# confirming a FAMILY defect rather than three accidents (task 4215 /
+# escalations esc-3980-1, esc-3787-1). Marked preemptively: a marked-but-fast
+# test costs nothing, while an unmarked-and-slow one costs a whole session.
+# Opt into the pyproject-sanctioned "Slow tests opt out with
+# @pytest.mark.timeout(N)" mechanism (orchestrator/pyproject.toml:154).
+# WHOLE_TREE_SCAN_TEST_TIMEOUT is `5 * PYPROJECT_DEFAULT_TIMEOUT` (300s) in
+# _orch_helpers.py -- DERIVED from the very ini default being cleared, so it
+# tracks that setting instead of drifting from it. Coverage of this family is
+# ENFORCED, not sprinkled: test_whole_tree_scan_timeout_guard.py recomputes
+# the census from source on every run and fails a scanner that loses this.
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 
 def test_build_workflow_forwards_params():

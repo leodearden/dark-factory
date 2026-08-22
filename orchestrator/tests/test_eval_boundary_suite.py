@@ -84,6 +84,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from test_scheduler_dispatch_literal_tripwire import _dispatch_tool_literals
 from test_workflow_factory import (
     _CONSTRUCT_RE,
@@ -106,6 +107,32 @@ from orchestrator.evals.runner import (
 )
 from orchestrator.mcp import verdict_tools as _verdict_tools
 from orchestrator.workflow import TaskWorkflow
+
+# test_b2_factory_single_construction_point reuses test_workflow_factory's
+# _orchestrator_src_root().rglob('*.py') helper (imported above) to scan every
+# *.py under orchestrator/src -- CPU/IO-heavy work that can exceed the
+# pyproject's 60s per-test default under `-n auto` xdist oversubscription.
+# Under pytest-timeout's thread method a breach does NOT fail the test -- it
+# os._exit()s the xdist worker ("node down: Not properly terminated"), and
+# `--max-worker-restart=0` then declines to replace it, degrading the run to a
+# TRUNCATED whole-suite session whose surviving failure names whichever
+# innocent guard merely shared the dead worker.
+# Not individually reproduced under load, but three structurally-identical
+# whole-tree AST scan guards in this directory
+# (test_event_loop_antipattern_guard.py,
+# test_merge_queue_reachback_patch_guard.py,
+# test_serial_merge_worker_import_guard.py) crashed in exactly this way,
+# confirming a FAMILY defect rather than three accidents (task 4215 /
+# escalations esc-3980-1, esc-3787-1). Marked preemptively: a marked-but-fast
+# test costs nothing, while an unmarked-and-slow one costs a whole session.
+# Opt into the pyproject-sanctioned "Slow tests opt out with
+# @pytest.mark.timeout(N)" mechanism (orchestrator/pyproject.toml:154).
+# WHOLE_TREE_SCAN_TEST_TIMEOUT is `5 * PYPROJECT_DEFAULT_TIMEOUT` (300s) in
+# _orch_helpers.py -- DERIVED from the very ini default being cleared, so it
+# tracks that setting instead of drifting from it. Coverage of this family is
+# ENFORCED, not sprinkled: test_whole_tree_scan_timeout_guard.py recomputes
+# the census from source on every run and fails a scanner that loses this.
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # The non-routable null sentinel EVAL_PROFILE pins fused_memory.url to, and the
 # production endpoint an un-isolated eval run would otherwise write into.
