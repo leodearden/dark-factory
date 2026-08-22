@@ -6229,11 +6229,28 @@ async def build_chain(
     convention of :func:`classify_and_merge` (collaborators injected rather
     than reached for).
 
-    Nothing calls this yet — γ (task 3185, deep-tip dispatch) is the first
-    caller — so this commit cannot change any production behaviour.  With
-    α's shipped ``chain_cap`` default of 0, ``depth <= 0`` short-circuits
-    before any lane or subprocess is touched, which is what makes the kill
-    switch structurally free.
+    **Sole caller: γ (task 3185).**
+    :meth:`SpeculativeMergeWorker._deep_chain_placement` — the slot-2 deep
+    gate — is the only thing that calls this, and it bounds the call the way
+    the caller-cost note below requires: one ``asyncio.timeout``
+    (:data:`CHAIN_BUILD_TIMEOUT_SECS`) wrapped around the whole invocation,
+    with a timeout, an unexpected exception, an unavailable lane and a
+    zero-link result all mapped to "no chain this round" (today's adjacent
+    verify) rather than to a failure.  The gate ALSO hoists α's kill switch
+    above this call — at the shipped ``chain_cap`` default of 0 it returns
+    before the O(n) queue scan, so nothing here is reached at all, and
+    ``depth <= 0`` short-circuiting below is a second, independent guard
+    rather than the load-bearing one.
+
+    Note the UNIT CONVERSION at that seam: the caller's policy counts ITEMS
+    IN THE CHAIN (the dispatching item is #1) while ``cap``/``target_depth``
+    here count ADDITIONAL LINKS BEYOND ``head_merge_commit``, so the gate
+    passes ``cap - 1`` / ``d - 1``.
+
+    γ never LANDS anything built here — it verifies the tip and requeues on
+    both arms (see :meth:`SpeculativeMergeWorker._run_inflight_verify`'s
+    non-adopting exit).  δ (task 3186) is what adopts a green tip, and it is
+    the only place adoption may be introduced.
 
     See the module section comment above for the two invariants (purity and
     one-worktree) this function exists to uphold.
@@ -8748,7 +8765,11 @@ def next_halving_state(passed: bool, dispatched_depth: int) -> int | None:
         silently, off.
       * ``passed=True`` -> ``None``, the reset sentinel (see
         :func:`select_chain_depth` check 3 for why ``None`` rather than the
-        literal ``min(queue, cap)``).
+        literal ``min(queue, cap)``).  PRD decision 5 says **any** pass
+        resets, not only a deep tip pass — and that breadth is what lets the
+        walk climb back out at all, since once the floor declines to chain
+        there are no more tip verdicts to reset on.  See
+        :meth:`SpeculativeMergeWorker._note_chain_outcome`'s two call sites.
 
     *dispatched_depth* must be the depth ACTUALLY BUILT
     (``1 + len(chain.links)``), never the target that was requested:
@@ -11916,12 +11937,23 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         block, and a deep outcome silently perturbing the probe's cadence or
         flake-rate suppression would couple them invisibly.
 
-        Called exactly once per dispatched chain, at the point the tip
-        verdict is known (see :meth:`_run_inflight_verify`'s chain arm).  A
-        round that built no chain at all — the kill switch, the ``queue < 2``
-        gate, the d=1 floor, a timed-out or empty build — must NOT call this:
-        nothing was verified deeply, so there is no outcome to halve or reset
-        on.
+        TWO call sites, both in :meth:`_run_inflight_verify` and both exactly
+        once per dispatch:
+
+          * the CHAIN arm — once per dispatched chain, at the point the tip
+            verdict is known, with the built depth;
+          * the d=1 FLOOR's reset arm — a PASSING slot-2 verify on a round
+            that built no chain, folded at ``depth=1``.  That is truthful
+            rather than a placeholder: at the floor the tree that ran IS a
+            one-item chain.  It is also the ONLY way the walk climbs back out
+            (see that arm's block comment), because a chain outcome alone can
+            only ever push the bisector down.
+
+        Everything else must NOT call this.  In particular a FAILING non-chain
+        round must not: PRD decision 5 scopes the halve to a deep TIP fail,
+        and halving off ordinary red branches would pin the bisector at the
+        floor without a single chain having failed.  A round declined by the
+        kill switch never reaches either site at all.
 
         Pure/synchronous (no await, no I/O).
         """
@@ -18346,6 +18378,46 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 merge_wt=None,
                 status=InflightStatus.REQUEUED,
             )
+
+        # ══ task 3185 (PRD γ): THE d=1 FLOOR'S RESET ARM ════════════════════
+        #
+        # This is the ONLY way the halving walk ever climbs back out.  At the
+        # floor the gate declines (select_chain_depth's `< 2` check), so no
+        # chain exists and the block above never runs — which means a chain
+        # outcome alone can only ever push the bisector DOWN.  Without this
+        # arm the walk is a one-way ratchet: 6 -> 3 -> 1 -> 1 -> 1 forever, and
+        # two red rounds silently disable deep merge-ahead for the whole life
+        # of the worker process.  That is the same permanently-and-silently-off
+        # failure next_halving_state's `max(1, ...)` floor guards against one
+        # step earlier, and the PRD's boundary row "deep resumes after bad item
+        # blocks" is unreachable without it.
+        #
+        # PASS ONLY, deliberately.  PRD decision 5 scopes the two rules
+        # differently and the asymmetry is load-bearing: the halve is "tip fail
+        # at depth d -> max(1, d//2)" — a fact about a DEEP verify — while the
+        # reset is "ANY pass resets to min(queue, cap)".  Folding a non-chain
+        # FAIL in here would halve off ordinary red branches, which are routine,
+        # and would drag the bisector to the floor and pin it there without a
+        # single deep chain having failed.
+        #
+        # The three guards, in the order they matter:
+        #   * `chain_cap > 0` — α's kill switch.  At the shipped default this
+        #     arm does not merely have no effect, it is not REACHED: cap=0
+        #     dispatch stays byte-identical down to "no method call".
+        #   * `item.speculative` — slot 2 only.  A slot-1 head verify is a
+        #     different tree (merged onto REAL main, never chained by γ), so
+        #     its verdict says nothing about whether chaining is safe.
+        #   * state `is not None` — already reset; nothing to do.
+        # `depth=1` is truthful, not a placeholder: at the floor the tree that
+        # actually ran IS a one-item chain (that is what makes the floor
+        # byte-identical to today's adjacent verify in the first place).
+        if (
+            out is None
+            and item.speculative
+            and self._chain_halving_state is not None
+            and req.config.merge_deep.chain_cap > 0
+        ):
+            self._note_chain_outcome(True, 1)
 
         if out is None:
             logger.info(
