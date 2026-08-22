@@ -92,6 +92,7 @@ import pytest
 import yaml
 from module_budget_family import (
     FAMILY_PUBLISHER_PATHS,
+    FAMILY_READER_PATH,
     min_budget,
     published_pairs,
 )
@@ -702,7 +703,12 @@ def test_the_budget_family_derives_every_floor_from_one_canonical_expression() -
           a pair, and the discovered prefixes are EXACTLY
           ``FAMILY_PUBLISHED_PREFIXES``. Without this the loop below passes on
           an empty or shrunken set — the vacuous-pass hole
-          ``KNOWN_MODULE_CONFIG_PREFIXES`` closes for the sibling guard.
+          ``KNOWN_MODULE_CONFIG_PREFIXES`` closes for the sibling guard. It
+          also pins ``FAMILY_READER_PATH`` to THIS file, so the shared module's
+          record of where the family's only cross-file enforcement lives cannot
+          rot into a pointer at nothing — the same stale-pointer failure (7)
+          closes for ``MEASURED_BY_SIBLING_GUARD``, applied to the constant
+          that names this guard.
 
       (2) THE MEASUREMENT IS A MEASUREMENT. ``MEASURED_SUITE_WORST_SECS`` must
           be a plain numeric literal, not a computed expression. A measurement
@@ -765,6 +771,23 @@ def test_the_budget_family_derives_every_floor_from_one_canonical_expression() -
         f'update FAMILY_PUBLISHER_PATHS — or it was deleted, in which case the '
         f'family has lost a member and every assertion below would go quiet '
         f'about it rather than failing'
+    )
+
+    assert FAMILY_READER_PATH.is_file(), (
+        f'module_budget_family.FAMILY_READER_PATH names {FAMILY_READER_PATH}, '
+        f'which does not exist (task 4320). That constant records WHERE the '
+        f'family\'s sole cross-file enforcement lives, so that a reader which '
+        f'is renamed or deleted is visible from the shared module every '
+        f'publisher already depends on rather than only from the file that '
+        f'disappeared'
+    )
+    assert FAMILY_READER_PATH.resolve() == pathlib.Path(__file__).resolve(), (
+        f'module_budget_family.FAMILY_READER_PATH names {FAMILY_READER_PATH}, '
+        f'but the guard that actually reads the published pairs is '
+        f'{pathlib.Path(__file__)} (task 4320). The constant exists to be true, '
+        f'not to be decorative: a pointer nothing checks reads as authoritative '
+        f'while naming the wrong file, which is the same stale-pointer failure '
+        f'assertion (7) below closes for MEASURED_BY_SIBLING_GUARD'
     )
 
     pairs = published_pairs()
@@ -934,7 +957,11 @@ def test_root_config_fixture_anchors_this_worktrees_own_yaml(
           from that exact file. Asserted AGAINST THE FILE rather than against
           pinned literals, deliberately: pinning the warm ceiling as a number
           here would create a second copy of a value the root yaml owns, and it
-          would start failing the day that yaml is legitimately retuned.
+          would start failing the day that yaml is legitimately retuned. The
+          parse being a mapping, and both keys being PRESENT in it, are
+          asserted before either is indexed — otherwise a root config that
+          stopped declaring one died with a bare ``KeyError`` and said nothing
+          about which file or which key.
 
       (c) IT IS NOT A DEFAULTS COLLAPSE. ``test_command`` is not the pydantic
           default ``'pytest'``. This is the SILENT failure mode: a missing or
@@ -958,6 +985,33 @@ def test_root_config_fixture_anchors_this_worktrees_own_yaml(
 
     # (b) THE YAML WAS ACTUALLY READ — compared against the file, not a literal.
     declared = yaml.safe_load(expected_path.read_text(encoding='utf-8'))
+    # THE KEYS ARE ASSERTED BEFORE THEY ARE INDEXED (task 4320 amendment).
+    # Indexing straight into the parsed yaml made a root config that stopped
+    # declaring either key die with a bare KeyError on the comparison line —
+    # none of the messages below, and no hint that the failure is about the
+    # root yaml declaring nothing. That is the inverse of the loud-structured-
+    # failure norm the rest of this file follows, and of the `is_file()`
+    # precheck the fixture itself carries for the same class of silent failure.
+    assert isinstance(declared, dict), (
+        f'{expected_path} parsed to {type(declared).__name__}, not a mapping '
+        f'(task 4320), so nothing below can be compared against it. An empty '
+        f'or malformed root config yields None here while the fixture\'s '
+        f'config silently collapses to the pydantic defaults'
+    )
+    missing = [
+        key
+        for key in ('test_command', 'verify_command_timeout_secs')
+        if key not in declared
+    ]
+    assert not missing, (
+        f'{expected_path.name} declares no {missing!r} (task 4320), so the '
+        f'comparisons below have nothing to compare the fixture\'s config '
+        f'against. Both keys are read through this fixture by every "strictly '
+        f'below the root warm ceiling" assertion in this directory: a root '
+        f'config that stopped declaring them would leave those assertions '
+        f'reading the pydantic defaults, which is the exact silent collapse (c) '
+        f'exists to make observable'
+    )
     assert root_config.test_command == declared['test_command'], (
         f'root_config.test_command is {root_config.test_command!r} but '
         f'{expected_path.name} declares {declared["test_command"]!r} '

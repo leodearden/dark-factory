@@ -69,6 +69,16 @@ FAMILY_PUBLISHER_PATHS: tuple[pathlib.Path, ...] = (
 # renamed or deleted takes the only cross-file enforcement with it, and naming
 # it here is what makes that visible from the shared module rather than only
 # from the file that disappeared.
+#
+# CHECKED, NOT MERELY DECLARED (task 4320 amendment). This constant is asserted
+# against by the reader itself — ``test_the_budget_family_derives_every_floor_
+# from_one_canonical_expression``'s assertion (1) requires it to name a real
+# file AND to resolve to that guard's own ``__file__``. It carried the claim
+# above while nothing read it at all, so a renamed or deleted reader would have
+# left it pointing at nothing, silently: the same stale-pointer failure mode
+# assertion (7) exists to close for ``MEASURED_BY_SIBLING_GUARD``, and an
+# unused constant making a strong claim is precisely the authoritative-but-
+# untrue text this family removes rather than writes.
 FAMILY_READER_PATH = THIS_DIR / 'test_module_verify_budgets.py'
 
 # The module-level names a publisher must bind. Spelled once, as constants, so
