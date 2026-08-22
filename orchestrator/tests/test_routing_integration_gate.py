@@ -94,6 +94,7 @@ hand-built ``PlanShape``.
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -108,6 +109,7 @@ from _workflow_helpers import (
     _init_repo,
     wire_metadata_backend,
 )
+from shared.cost_store import CostStore
 
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.agents.roles import ARCHITECT, DEBUGGER, IMPLEMENTER
@@ -957,3 +959,130 @@ class TestRetryTierBumpAcrossDispatches:
 
         assert backend.update_task_calls == []
         assert backend.blob['routing']['routing_tier'] == 0
+
+
+# ---------------------------------------------------------------------------
+# Boundary scenario 7 -- per-model daily ceiling exhaustion falls back one
+# layer WITHOUT blocking the dispatch (plan step-5).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestCeilingFallbackDoesNotBlockDispatch:
+    """PRD boundary scenario 7: a per-role ``model_overrides`` pin that has
+    exhausted its ``routing.per_model_daily_ceiling_usd`` ceiling falls back
+    ONE layer (to ``config.models``) WITHOUT blocking the dispatch --
+    invariant 6, ceilings bound spend, they never gate dispatch.
+
+    Seeds a REAL ``shared.cost_store.CostStore`` on a tmp runs.db with an
+    actual completed 'opus' invocation row via the store's own write API, so
+    the ``>= ceiling`` comparison at routing.py:441-443 reads a genuine
+    ``model_cost_in_window`` result (cost_store.py:265) rather than a
+    stubbed number -- exercising ``TaskWorkflow._ceiling_spend_by_model``'s
+    trailing-24h window query (workflow.py:12121, ``_trailing_24h_window``
+    at :1140) as one wired path. ``cost_store`` is a plain post-construction
+    attribute (workflow.py:1192), attached the same way ``event_store`` is
+    attached elsewhere in this suite.
+
+    Uses 'opus' rather than ``claude-fable-5``: fable is deliberately absent
+    from the stock ``allowed_models`` until xi admits it, so pinning fable
+    would reject on the allowlist FIRST (routing.py check order: allowlist
+    -> ceiling -> capacity, routing.py:439-445) and this suite would
+    silently assert the wrong rejection mechanism.
+    """
+
+    _CEILING_USD = 10.0
+
+    @staticmethod
+    async def _seed_opus_spend(cost_store: CostStore, *, total_usd: float) -> None:
+        """Write one completed 'opus' invocation inside the trailing-24h
+        window totalling *total_usd* -- via the store's own write API, so
+        the ceiling comparison reads a real query result rather than a
+        stubbed number."""
+        now_iso = datetime.now(UTC).isoformat()
+        await cost_store.save_invocation(
+            run_id='seed-run', task_id='seed-task', project_id='dark_factory',
+            account_name='seed-account', model='opus', role='implementer',
+            cost_usd=total_usd, input_tokens=None, output_tokens=None,
+            cache_read_tokens=None, cache_create_tokens=None, duration_ms=100,
+            capped=False, started_at=now_iso, completed_at=now_iso,
+        )
+
+    async def test_ceiling_exhausted_falls_back_without_blocking(
+        self, config, git_ops, task_assignment, tmp_path, monkeypatch,
+    ):
+        config.routing.per_model_daily_ceiling_usd = {'opus': self._CEILING_USD}
+        assert 'opus' in config.routing.allowed_models
+        assert config.models.implementer != 'opus'  # so a config-layer fallback is observable
+        task_assignment.task['metadata']['model_overrides'] = {'implementer': 'opus'}
+
+        cost_store = CostStore(tmp_path / 'costs.db')
+        await cost_store.open()
+        try:
+            # >= ceiling: exactly at the boundary routing.py:442 checks.
+            await self._seed_opus_spend(cost_store, total_usd=self._CEILING_USD)
+
+            stub = _RoutingRecorderStub()
+            workflow, _scheduler = _build_workflow(config, git_ops, task_assignment, stub)
+            workflow.cost_store = cost_store
+            rec = _RecordingEventStore()
+            workflow.event_store = rec
+            monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
+            monkeypatch.setattr(
+                'orchestrator.workflow.run_scoped_verification', _mock_verify_passes(),
+            )
+
+            outcome = (await workflow.run()).outcome
+
+            # (a) the seam did NOT see 'opus' -- it fell back to the config layer.
+            assert stub.route_by_role['implementer']['model'] == config.models.implementer
+            assert stub.route_by_role['implementer']['model'] != 'opus'
+
+            # (b) the exact rejection reason and the layer fallen through to.
+            impl_events = [e for e in _routing_events(rec) if e['data']['role'] == 'implementer']
+            assert impl_events, f'expected an implementer routing_decision event: {rec.events!r}'
+            assert impl_events[-1]['data']['rejected'] == [
+                'metadata_override:model-ceiling-exhausted',
+            ]
+            assert impl_events[-1]['data']['source_layer'] == 'config'
+
+            # (c) invariant 6: a per-model ceiling never blocks the dispatch.
+            assert outcome == WorkflowOutcome.DONE
+        finally:
+            await cost_store.close()
+
+    async def test_below_ceiling_control_resolves_the_override(
+        self, config, git_ops, task_assignment, tmp_path, monkeypatch,
+    ):
+        """(d) control: with the seeded spend BELOW the ceiling, the SAME
+        override resolves to 'opus' with ``source_layer=='metadata_override'``
+        and empty ``rejected`` -- proving the fallback above is caused by the
+        ceiling specifically, not an unrelated rejection."""
+        config.routing.per_model_daily_ceiling_usd = {'opus': self._CEILING_USD}
+        task_assignment.task['metadata']['model_overrides'] = {'implementer': 'opus'}
+
+        cost_store = CostStore(tmp_path / 'costs.db')
+        await cost_store.open()
+        try:
+            await self._seed_opus_spend(cost_store, total_usd=self._CEILING_USD - 5.0)
+
+            stub = _RoutingRecorderStub()
+            workflow, _scheduler = _build_workflow(config, git_ops, task_assignment, stub)
+            workflow.cost_store = cost_store
+            rec = _RecordingEventStore()
+            workflow.event_store = rec
+            monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
+            monkeypatch.setattr(
+                'orchestrator.workflow.run_scoped_verification', _mock_verify_passes(),
+            )
+
+            outcome = (await workflow.run()).outcome
+
+            assert stub.route_by_role['implementer']['model'] == 'opus'
+            impl_events = [e for e in _routing_events(rec) if e['data']['role'] == 'implementer']
+            assert impl_events, f'expected an implementer routing_decision event: {rec.events!r}'
+            assert impl_events[-1]['data']['source_layer'] == 'metadata_override'
+            assert impl_events[-1]['data']['rejected'] == []
+            assert outcome == WorkflowOutcome.DONE
+        finally:
+            await cost_store.close()
