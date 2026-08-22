@@ -976,14 +976,21 @@ class TestDeepChainPlacementBuild:
         )
         assert isinstance(merge_queue.CHAIN_BUILD_TIMEOUT_SECS, (int, float))
         assert merge_queue.CHAIN_BUILD_TIMEOUT_SECS > 0
-        monkeypatch.setattr('orchestrator.merge_queue.CHAIN_BUILD_TIMEOUT_SECS', 0.2)
+        # 2.0s, not a tighter value: the deadline starts at the `async with`,
+        # so it also covers acquire_chain_build_lane's reset+clean+CoW seed.
+        # Too tight and the cancel lands INSIDE the acquisition under parallel
+        # load, testing a different path than the one this test names.
+        monkeypatch.setattr('orchestrator.merge_queue.CHAIN_BUILD_TIMEOUT_SECS', 2.0)
+        reached: list[str] = []
 
-        async def _stalled_merge(_lane, _branch):
-            await asyncio.sleep(30)
+        async def _stalled_merge(_lane, branch):
+            reached.append(branch)
+            await asyncio.sleep(60)
 
         monkeypatch.setattr(git_ops, 'merge_branch_into_worktree', _stalled_merge)
 
         assert await worker._deep_chain_placement(item) is None
+        assert reached, 'the stall must be reached, so the cancel lands in the merge loop'
         assert _lane_states(git_ops) == [LaneState.FREE], 'deadline must not strand a lane'
 
     async def test_zero_link_result_declines_without_double_releasing(
@@ -1056,7 +1063,7 @@ class TestDeepChainPlacementBuild:
 
         # PRD decision 4: NO outcome for the truncated item, end to end.
         assert conflicts == []
-        assert store.events_of(EventType.MERGE_ATTEMPT) == []
+        assert store.events_of(EventType.merge_attempt) == []
         assert all(not r.result.done() for r in queued_reqs)
         assert list(worker._lane_buffers['normal']) == queued_reqs, 'queue untouched'
 

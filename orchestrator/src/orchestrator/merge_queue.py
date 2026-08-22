@@ -8640,6 +8640,27 @@ def select_probe_depth(
 # _deep_chain_placement passes `cap - 1` / `d - 1` (see its docstring).
 
 
+# γ's bound on β's unbounded builder.  ``build_chain``'s Caller-cost note
+# (see its docstring above) is explicit that it carries NO internal deadline
+# BY DESIGN -- an internal timeout would abandon a half-built lane mid-``git
+# merge`` -- and that "the honest bound belongs to the policy layer".  This is
+# that bound: one lane acquisition (``git reset --hard`` + ``git clean -xfd``
+# + a CoW seed) plus up to ``chain_cap`` sequential real ``git merge``
+# subprocesses, all of it blocking the verifier's dispatch path.
+#
+# Imposing the deadline from OUTSIDE is what makes it safe: build_chain's
+# ``except BaseException`` arm releases the lane on cancellation, so an
+# overrun returns the lane to the pool and _deep_chain_placement degrades to
+# "no chain this round" -- today's adjacent verify -- rather than stranding a
+# lane in ASSIGNED.
+#
+# 120s is deliberately generous against a staged cap of a handful of items
+# (a wedged lane is the failure this catches, not a merely slow one) while
+# still being an order of magnitude below the verify it precedes, so a stall
+# here can never masquerade as a slow verify.
+CHAIN_BUILD_TIMEOUT_SECS: float = 120.0
+
+
 def select_chain_depth(
     chain_cap: int,
     queue_len: int,
@@ -12134,10 +12155,62 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         d = self._deep_target_depth(cap, queue_len)
         if d is None:
             return None
-        # step-14 (task 3185) lands the bounded build_chain call here. Until
-        # then the gate is complete but inert: every path returns None, so
-        # dispatch is unchanged even with the cap turned on.
-        return None
+        # UNIT CONVERSION. Everything above counts ITEMS IN THE CHAIN, with the
+        # dispatching item as #1; build_chain counts ADDITIONAL LINKS BEYOND
+        # the base it is handed, and the base here IS the dispatching item's
+        # merge commit. Hence `cap - 1` / `d - 1`. Both are >= 1 (the policy's
+        # `< 2` floor already declined), so neither can underflow to a
+        # kill-switch-shaped 0.
+        #
+        # The base is the DISPATCHING ITEM's merge commit, never
+        # frozen_prefix_tip(): the chain must be a contiguous continuation of
+        # the queue THROUGH this item, and seeding at the frozen tip would skip
+        # it -- a hole that breaks the in-order prefix property δ's CAS walk
+        # depends on.
+        try:
+            async with asyncio.timeout(CHAIN_BUILD_TIMEOUT_SECS):
+                result = await build_chain(
+                    self._git_ops,
+                    self.chain_snapshot(),
+                    item.merge_result.merge_commit,
+                    cap=cap - 1,
+                    target_depth=d - 1,
+                )
+        except (TimeoutError, asyncio.CancelledError):
+            # FAIL-OPEN. An overrun is not a merge fault, so it must not fail
+            # the dispatch -- it degrades to today's adjacent verify. Safe to
+            # impose from out here because build_chain's own `except
+            # BaseException` arm releases the lane on cancellation, so nothing
+            # is left ASSIGNED. WARNING, not INFO: a build that cannot finish
+            # inside CHAIN_BUILD_TIMEOUT_SECS means a wedged lane or a
+            # pathological repo, and a silent degrade is exactly what the
+            # no-silent-fail-soft design invariant forbids.
+            logger.warning(
+                'deep chain build exceeded %.0fs for %s (target_depth=%d) -- '
+                'falling back to the adjacent verify',
+                CHAIN_BUILD_TIMEOUT_SECS, item.request.task_id, d,
+            )
+            return None
+        except Exception:
+            # Same fail-open contract as acquire_chain_build_lane's never-raise
+            # promise (merge_liveness.py:777-780) and _probe_verify_placement's
+            # defensive fall-back: a bug in the OPTIONAL deep path must never
+            # crash the dispatch hot path the whole queue depends on.
+            logger.exception(
+                'deep chain build failed for %s -- falling back to the '
+                'adjacent verify', item.request.task_id,
+            )
+            return None
+        if not result.links:
+            # A zero-link result NEVER holds a lane -- build_chain already
+            # released it on that path (merge_types.py "Lane ownership") -- so
+            # do NOT release here: that would return a FREE lane to the pool a
+            # second time. Declining also consumes no halving round: nothing
+            # was verified deeply, so there is no verdict to halve or reset on.
+            return None
+        # NON-EMPTY: this result HOLDS its lane, and release is now the
+        # CALLER's obligation, exactly once, on every exit.
+        return result
 
     # ── MQ-invariants iota (task 1994): resource-conservation audits ────────
     #
@@ -19462,14 +19535,21 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # the probe -- which only relabels this dispatch's depth/base -- a
         # firing chain REDIRECTS the verify onto a cumulative tip.
         #
-        # Inert today: _deep_chain_placement returns None on every path until
-        # step-14 lands the bounded build, so this is one guard check and
-        # nothing else. ORDERING HAZARD for whoever lands that build: a
-        # non-empty ChainResult HOLDS a scratch lane whose release is the
-        # CALLER's obligation (ChainResult docstring, "Lane ownership"), so
-        # the build must not land ahead of step-16's consumer here -- a
-        # discarded result would leak the lane on every deep dispatch.
-        await self._deep_chain_placement(item)
+        # A non-empty ChainResult HOLDS a scratch lane whose release is the
+        # CALLER's obligation (ChainResult docstring, "Lane ownership").
+        #
+        # TEMPORARY, DELETE IN STEP-16 (task 3185): step-16 threads `chain`
+        # into _run_inflight_verify, which then owns the tip verify AND the
+        # single release. Until it does, this dispatch has no consumer for the
+        # chain, so it releases the lane immediately and takes today's path --
+        # wasteful under a non-zero cap, but sound, and unreachable under the
+        # shipped chain_cap=0 default. Landing the build (step-14) without this
+        # would leak one lane per deep dispatch.
+        _chain = await self._deep_chain_placement(item)
+        if _chain is not None:
+            await release_chain_build_lane(
+                self._git_ops, _chain.lane, warm=_chain.lane_warm,
+            )
         verify_task: asyncio.Task = asyncio.ensure_future(  # type: ignore[type-arg]
             self._run_inflight_verify(
                 item, lease, depth=depth, probe_base=probe_base,
