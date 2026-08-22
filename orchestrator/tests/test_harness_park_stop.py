@@ -370,6 +370,76 @@ class TestHarnessRestartPersistence:
         )
         assert seeder.load_scheduler_pause('dark_factory') is not None
         assert harness._restored_pause_reason == 'park-stop: 5 blocked'
+        assert harness._ewa_value == pytest.approx(0.0), (
+            'A non-ewa_trip row carries the EWA as forensic evidence only; it '
+            f'must never be seeded into live state. got {harness._ewa_value}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_non_ewa_pause_does_not_seed_live_ewa_value(self, tmp_path: Path) -> None:
+        """A park-stop restore keeps the stored EWA as forensics, not live state.
+
+        For an ``ewa_trip_*`` row the stored scalar IS the live statistic, so
+        restoring it is correct.  For every other pause class it is forensic
+        evidence about a value that never tripped anything — seeding it into
+        ``_ewa_value`` turns a restart into a head start toward the threshold.
+        The evidence must still survive where the operator reads it: the
+        WARNING log and the ``scheduler_pause_restored`` event payload.
+        """
+        harness, _, _ = self._seed_and_load(
+            tmp_path, reason='park-stop: 5 blocked', ewa_value=22.0, threshold=24.6,
+        )
+
+        await harness._load_persisted_scheduler_pause()
+
+        assert harness._ewa_value == pytest.approx(0.0), (
+            'A non-ewa_trip pause row must not seed live EWA state; got '
+            f'{harness._ewa_value}'
+        )
+        # The blind halt restore is unchanged for this pause class.
+        assert harness.scheduler.is_paused is True, (
+            'A park-stop halt must still be restored blind'
+        )
+        assert harness._restored_pause_reason == 'park-stop: 5 blocked'
+        # ...and the forensics survive where the operator actually reads them.
+        assert harness.event_store is not None, 'The helper wires a real EventStore'
+        events = _query_events(harness.event_store, 'scheduler_pause_restored')
+        assert len(events) == 1, f'Expected one restored event; got {events}'
+        payload = json.loads(events[0]['data'])
+        assert payload.get('ewa_value') == pytest.approx(22.0), (
+            f'The restored event must still carry the stored value; got {payload!r}'
+        )
+        assert payload.get('ewa_threshold') == pytest.approx(24.6), (
+            f'The restored event must still carry the threshold; got {payload!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_resume_after_non_ewa_restore_leaves_ewa_at_zero(
+        self, tmp_path: Path,
+    ) -> None:
+        """The end-to-end carryover: a park-stop restore + resume leaves EWA at 0.
+
+        ``resume_scheduler`` deliberately resets ``_ewa_value`` only when the
+        prior pause reason starts with ``ewa_trip_`` (harness.py:14965), so a
+        value seeded from a non-EWA row would never be cleared by an operator
+        resume.  It would sit in live state as a head start toward the
+        threshold and the next digest step with even a modest submission ratio
+        could halt fleet-wide dispatch.  The only place to break that chain is
+        to never seed it.
+        """
+        harness, _, _ = self._seed_and_load(
+            tmp_path, reason='park-stop: 5 blocked', ewa_value=22.0, threshold=24.6,
+        )
+
+        await harness._load_persisted_scheduler_pause()
+        await harness.resume_scheduler()
+
+        assert harness.scheduler.is_paused is False, 'The operator resume must take effect'
+        assert harness._ewa_value == pytest.approx(0.0), (
+            'resume_scheduler resets _ewa_value only for ewa_trip_ pauses, so a '
+            'non-EWA restore must never have seeded it; got '
+            f'{harness._ewa_value}'
+        )
 
     @pytest.mark.asyncio
     async def test_harness_restart_loads_persisted_pause(self, tmp_path: Path) -> None:
