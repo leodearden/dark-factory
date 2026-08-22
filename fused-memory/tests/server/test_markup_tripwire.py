@@ -38,7 +38,6 @@ _STORM = {
     'count': 4,
     'threshold': 3,
     'window_seconds': 3600.0,
-    'projects': ['/project-a', '/project-b'],
     'hint': 'the leak is active; DF 3083 owns the root cause',
 }
 
@@ -263,8 +262,14 @@ class TestEmitMarkupStormEscalation:
         )
         assert 'rejected_writes_in_window=4' in detail, f'must state the count: {detail!r}'
         assert 'window_seconds=3600.0' in detail, f'must state the window: {detail!r}'
-        assert "projects_in_window=['/project-a', '/project-b']" in detail, (
-            f'must name every project the burst spanned: {detail!r}'
+        # A burst cannot span projects (task 4505): the live producer keys one
+        # StormCounter per (project, outcome) pair, so the window holds one
+        # project's events and the count needs no cross-project qualifier. The
+        # `projects_in_window=` line this replaces was dead — no live producer
+        # ever emitted the `projects` key it read, so it rendered `None` on
+        # every record filed since 4458 landed.
+        assert 'projects_in_window' not in detail, (
+            f'the count cannot span projects, so it must not be hedged: {detail!r}'
         )
 
     def test_escalation_id_is_greppable_via_the_stable_anchor(self, tmp_path):

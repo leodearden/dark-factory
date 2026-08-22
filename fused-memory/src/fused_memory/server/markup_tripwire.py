@@ -159,6 +159,21 @@ def emit_markup_storm_escalation(
     escalation for this project (dedup) — or ``None`` when filing is impossible
     or fails.
 
+    *storm* is the record its ONE live producer sends —
+    :meth:`shared.mcp_markup_middleware.MarkupGuardMiddleware._record_storm` via
+    :mod:`fused_memory.server.markup_guard`'s sink — and the keys read off it
+    are ``count``, ``threshold``, ``window_seconds`` and ``outcome``. Every one
+    is read defensively, because degenerate and legacy shapes (``{}``,
+    ``{'count': 9}``) reach this filer from tests and older callers and must
+    still produce a routable record.
+
+    ``count`` is ALREADY this project's own number: the producer keys one
+    ``StormCounter`` per ``(project, outcome)`` pair, so a window can only ever
+    hold one project's events. Do not re-add a "the count may span other
+    projects" hedge — that was true of the per-SERVER ``MarkupStormCounter``
+    task 4458 retired, and restating it now tells the triager to discount a
+    number that is exactly reproducible from their own journal.
+
     NEVER raises. This is called from an MCP write path whose rejection has
     already been decided, so escalation is purely additive: every failure mode
     degrades to ``None`` plus a log line rather than changing the write's
@@ -233,13 +248,20 @@ def emit_markup_storm_escalation(
     window_seconds = storm.get('window_seconds')
     detail = '\n'.join([
         f'project_root={project_root!r}',
+        # The producer keys one StormCounter per (project, outcome) pair
+        # (mcp_markup_middleware.py:648-652), so this window holds ONE project's
+        # events for ONE outcome: the count below is this project_root's own
+        # contribution, and an operator can reproduce it by grepping this
+        # project's own `markup guard: <outcome> tool=... project=...` lines.
+        # It was not always so — task 4505 removed a `projects_in_window=` line
+        # and a comment hedging that the count "may span more than this
+        # project_root", both left over from the per-SERVER MarkupStormCounter
+        # task 4458 retired. That pooling is what filed esc-markup-tripwire-6
+        # into reify's queue stating 3, for a window reify contributed 1 to.
+        f'outcome={storm.get("outcome")!r}',
         f'rejected_writes_in_window={count!r}',
         f'threshold={storm.get("threshold")!r}',
         f'window_seconds={window_seconds!r}',
-        # The window is shared across every project this server serves, so the
-        # count above may span more than this project_root. Naming them all
-        # keeps the record honest and points at the co-affected queues.
-        f'projects_in_window={storm.get("projects")!r}',
         '',
         'The fused-memory MCP write tripwire (task 3141) rejected multiple '
         'writes carrying raw MCP envelope markup within one rolling window. A '
