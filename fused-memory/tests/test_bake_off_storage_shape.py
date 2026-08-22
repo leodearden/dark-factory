@@ -6253,12 +6253,15 @@ class TestRenderMarkdownRegrowthSection:
         mod = _mod()
 
         assert len(mod.REGROWTH_METRIC_LABELS) == len(mod.REGROWTH_METRICS)
-        assert mod.REGROWTH_TABLE_COLUMNS == (
-            'mode', 'read arm', *mod.REGROWTH_METRIC_LABELS,
-        )
-        assert mod.REGROWTH_STAMPING_COLUMNS == (
-            'read arm', *mod.REGROWTH_METRIC_LABELS,
-        )
+        # Sliced rather than rebuilt as `(*prefix, *labels)` because that
+        # spelling trips ruff's SIM300 (a SCREAMING_SNAKE attribute on the
+        # left of a non-literal tuple reads to it as a Yoda condition).  The
+        # slice form says the same thing more directly anyway: each table is
+        # its own row-key prefix followed by the labels, in label order.
+        assert mod.REGROWTH_TABLE_COLUMNS[:2] == ('mode', 'read arm')
+        assert mod.REGROWTH_TABLE_COLUMNS[2:] == mod.REGROWTH_METRIC_LABELS
+        assert mod.REGROWTH_STAMPING_COLUMNS[:1] == ('read arm',)
+        assert mod.REGROWTH_STAMPING_COLUMNS[1:] == mod.REGROWTH_METRIC_LABELS
 
     def test_the_delta_table_columns_are_pinned_by_equality(self):
         """Exactly as `DECISION_TABLE_COLUMNS` is, and for the same reason:

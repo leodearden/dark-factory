@@ -2192,6 +2192,39 @@ DECISION_TABLE_COLUMNS: tuple[str, ...] = (
     'pin changed window',
 )
 
+#: The regrowth delta tables' metric labels, index-aligned with
+#: ``REGROWTH_METRICS`` (defined with the probe, far below — a test pins the
+#: two tuples to the same length, so a metric added without a label cannot
+#: silently lose a column).  Both `canonical in top-5` columns are named
+#: with their semantics in the header itself: `(stored)` is the SCORED
+#: retrieval property, `(credited)` is what the read transform handed the
+#: reader, and a header that distinguished them only by position would let
+#: either be quoted as the other.
+REGROWTH_METRIC_LABELS: tuple[str, ...] = (
+    'claim recall@5',
+    'claim recall@10',
+    'canonical in top-5 (stored)',
+    'median canonical rank (stored)',
+    'canonical found (stored)',
+    'canonical in top-5 (credited)',
+    'tokens/query',
+)
+
+#: The regrowth delta table's columns, pinned in one place for the same
+#: reason ``DECISION_TABLE_COLUMNS`` is: a column quietly dropped from a
+#: delta table is a metric quietly dropped from the decision, so the test
+#: asserts this by equality rather than substring.  One row per
+#: ``(mode, read arm)``; each metric cell carries baseline, after AND delta
+#: (see :func:`_regrowth_cell` for why three numbers share a cell).
+REGROWTH_TABLE_COLUMNS: tuple[str, ...] = (
+    'mode', 'read arm', *REGROWTH_METRIC_LABELS,
+)
+
+#: The stamping-value table's columns — ``stamped delta - unstamped delta``,
+#: one row per read arm.  Built from the SAME labels, so the two tables
+#: cannot drift into naming the same metric differently.
+REGROWTH_STAMPING_COLUMNS: tuple[str, ...] = ('read arm', *REGROWTH_METRIC_LABELS)
+
 #: Rendered for a measurement that is None.  Deliberately NOT '0.00': the
 #: whole point of carrying None through the pipeline is that "no measurement"
 #: and "measured zero" are different findings, and a table that prints them
@@ -2239,6 +2272,24 @@ def _repo_relative(path: str | Path) -> str:
         return str(resolved.relative_to(_PACKAGE_ROOT.parent))
     except ValueError:
         return resolved.name
+
+
+def _protocol_fixture_paths(
+    base: list[Any], *, regrowth: dict[str, Any] | None,
+) -> list[Any]:
+    """The fixtures whose provenance this run is entitled to claim.
+
+    The injection fixture joins the table only when the probe actually READ
+    it.  Provenance for a file the run never opened is a false audit trail —
+    the same failure :func:`fixture_provenance` avoids by reporting ``None``
+    for an untracked path rather than falling back to HEAD.
+
+    Gated on ``is not None`` rather than truthiness: an empty block is still
+    a block, and a probe that measured nothing still opened the fixture.
+    """
+    if regrowth is None:
+        return list(base)
+    return [*base, DEFAULT_REGROWTH_INJECTION_PATH]
 
 
 def fixture_provenance(paths: list[str | Path]) -> list[dict[str, Any]]:
@@ -2356,7 +2407,7 @@ def _check_regrowth(regrowth: dict[str, Any]) -> None:
     legitimate result in this pipeline and the renderer prints it as
     ``_NO_MEASUREMENT``; only an ABSENT key means the run broke.
     """
-    expected_metrics = {f'{block}.{key}' for block, key in REGROWTH_METRICS}
+    expected_metrics = set(_regrowth_metric_keys())
 
     missing_descriptors = [
         key for key in _REQUIRED_REGROWTH_DESCRIPTORS if key not in regrowth
@@ -2569,12 +2620,46 @@ def stored_gap_bullet_prefix(arm: str) -> str:
     return f'- `{arm}` stored vs credited:'
 
 
+def regrowth_bullet_prefix(arm: str) -> str:
+    """The machine-findable anchor for one read arm's regrowth bullet.
+
+    Same contract as :func:`pin_bullet_prefix` and
+    :func:`stored_gap_bullet_prefix` — renderer and test both go through
+    here, so the bullet's prose stays free to change and only the numbers
+    are pinned.  Deliberately distinct from BOTH: each of those asserts
+    "exactly one" bullet over its own anchor, so a colliding prefix would
+    break a test in a distant section rather than in the one that owns it.
+    """
+    return f'- `{arm}` regrowth:'
+
+
+def _regrowth_cell(baseline: Any, after: Any, delta: Any) -> str:
+    """``base → after (Δ)``, in the one cell the reader is looking at.
+
+    Three numbers in a cell rather than three columns per metric: at seven
+    metrics the split form is a 23-column markdown table, which is not a
+    table anybody reads, and the delta is only interpretable beside the
+    level it moved from.
+
+    Nothing here is hand-formatted.  The levels go through :func:`_cell` and
+    the delta through :func:`_gap_cell`, so ``—`` (never measured) stays
+    distinguishable from ``0.00`` (measured, did not move) and from
+    ``<0.01`` (moved, too little to round up) exactly as they are in the arm
+    tables above.
+    """
+    return f'{_cell(baseline)} → {_cell(after)} ({_gap_cell(delta)})'
+
+
 def _gap_cell(gap: float) -> str:
     """A stored-vs-credited gap, where a rounded-down nonzero would be a lie.
 
     Same rule as :func:`_pin_cell`, for the same reason: this block sorts arms
     by whether the two columns AGREE, so a real gap must never print as
     ``0.00`` — the value the surrounding sentence reads as "identical".
+
+    Shared with the regrowth delta tables, which are the same kind of
+    quantity: a difference whose whole content is "did this move at all",
+    where a rounded-down nonzero reads as "the injection changed nothing".
     """
     if gap and abs(gap) < _PIN_RATE_ROUNDS_TO_ZERO:
         return _PIN_RATE_UNDERFLOW if gap > 0 else f'-{_PIN_RATE_UNDERFLOW}'
@@ -2641,6 +2726,182 @@ def _stored_gap_lines(report: dict[str, Any]) -> list[str]:
         'columns on the `held_out` rows of the by-kind table, which are the '
         'only rows measuring generalisation.',
     ]
+    return lines
+
+
+def _absorption_phrase(flat: Any, selected: Any) -> str:
+    """Does 4004's selected transform absorb the flat read's regrowth cost?
+
+    DERIVED and deliberately COMPARATIVE: it reports which of two measured
+    deltas sits closer to baseline and asserts no threshold on either (gate
+    G6).  The alternative — a typed sentence about what the transform does —
+    is a claim that goes stale the first time this generator is rerun, three
+    lines above the table that then contradicts it.
+    """
+    if flat is None or selected is None:
+        return ('is not comparable on this column — one of the two arms was '
+                'never measured')
+    if flat == 0 and selected == 0:
+        return 'had nothing to absorb: neither arm moved on this column'
+    if abs(selected) < abs(flat):
+        return (f'absorbs part of it ({_gap_cell(selected)} against the flat '
+                f"read's {_gap_cell(flat)})")
+    if abs(selected) == abs(flat):
+        return (f'does not change it ({_gap_cell(selected)}, the same '
+                f'distance from baseline as the flat read)')
+    return (f'does not absorb it — it lands further from baseline '
+            f'({_gap_cell(selected)}) than the flat read ({_gap_cell(flat)})')
+
+
+def _regrowth_lines(report: dict[str, Any]) -> list[str]:
+    """The +1-re-emission probe's section: what was injected, and what moved.
+
+    Emitted on EVERY run, probed or not.  An absent section is exactly how
+    this probe went missing the first time: esc-3200-3 asked for regrowth
+    deltas and read an artifact that simply had no such section, which is
+    indistinguishable from a probe that ran and found nothing.  So the
+    heading is unconditional and the skipped case says so in words.
+
+    Every number is DERIVED from ``report['regrowth']``, like every other
+    run-specific finding in this renderer (see :func:`_stored_gap_lines`).
+    """
+    lines: list[str] = ['', '## Regrowth deltas', '']
+    regrowth = report['regrowth']
+    if regrowth is None:
+        lines.append(
+            '**Not probed in this run.**  The +1-re-emission probe was '
+            'skipped (`--no-regrowth`), so this artifact carries no regrowth '
+            'measurement at all.  The heading is emitted anyway: an ABSENT '
+            'section reads identically to a probe that ran and moved '
+            'nothing, and telling those two apart is the whole reason this '
+            'section exists.'
+        )
+        return lines
+
+    metrics = _regrowth_metric_keys()
+    shape = regrowth['shape']
+    baseline, after, deltas = (
+        regrowth['baseline'], regrowth['after'], regrowth['deltas'],
+    )
+    arms = ', '.join(f'`{arm}`' for arm in regrowth['read_arms'])
+    lines += [
+        f"One near-duplicate **re-emission** was injected per topic "
+        f"({regrowth['topics_injected']} topics, "
+        f"{regrowth['injections_per_topic']} injection each, from "
+        f"`{regrowth['injection_fixture']}`) into the RATIFIED write shape "
+        f"`{shape}`, and only the READ arm was varied: {arms}.  Each "
+        f"injected record restates that topic's canonical claim in different "
+        f"words — the organic pattern esc-3200-3 documents — and is scored "
+        f"as realizing the claim it re-emits, so claim recall can move in "
+        f"either direction rather than only fall.",
+        '',
+        'Two injection modes, because the write path\'s best case and the '
+        'case actually observed are different.  **`unstamped`** carries no '
+        '`topic` key at all, which is how every reify warm-lane re-emission '
+        'arrived and is therefore the mode that models reality today; '
+        '**`stamped`** carries the topic a stamping write path would have '
+        'set.  The gap between their deltas is the second table.',
+        '',
+        'Baseline is the SAME read arm over the un-injected corpus — the '
+        'rankings the decision table above is built from — so a delta is the '
+        're-emission\'s contribution and not ANN noise between two seedings. '
+        '**No threshold is asserted on any delta here** (gate G6): the probe '
+        'informs gate η and task 4006\'s stamping campaign, it does not gate '
+        'a build.',
+        '',
+        '| ' + ' | '.join(REGROWTH_TABLE_COLUMNS) + ' |',
+        '| ' + ' | '.join('---' for _ in REGROWTH_TABLE_COLUMNS) + ' |',
+    ]
+
+    for mode in REGROWTH_MODES:
+        for arm in REGROWTH_READ_ARMS:
+            lines.append('| ' + ' | '.join([
+                mode,
+                arm,
+                *(
+                    _regrowth_cell(
+                        baseline[arm][metric],
+                        after[mode][arm][metric],
+                        deltas[mode][arm][metric],
+                    )
+                    for metric in metrics
+                ),
+            ]) + ' |')
+
+    recall, stored = 'claim_recall.at_5', (
+        'discoverability.stored_canonical_in_top_5_rate'
+    )
+    selected = REGROWTH_READ_ARMS[-1]
+    lines += [
+        '',
+        'As measured in THIS run, per read arm (derived from the table '
+        'above, not asserted):',
+        '',
+    ]
+    for arm in REGROWTH_READ_ARMS:
+        lines.append(
+            f'{regrowth_bullet_prefix(arm)} one re-emission per topic moves '
+            f'claim recall@5 by {_gap_cell(deltas["unstamped"][arm][recall])} '
+            f'unstamped / {_gap_cell(deltas["stamped"][arm][recall])} '
+            f'stamped, and stored canonical-in-top-5 by '
+            f'{_gap_cell(deltas["unstamped"][arm][stored])} unstamped / '
+            f'{_gap_cell(deltas["stamped"][arm][stored])} stamped.  Stamping '
+            f'every re-emission is worth '
+            f'{_gap_cell(regrowth["stamping_value"][arm][recall])} on claim '
+            f'recall@5 and '
+            f'{_gap_cell(regrowth["stamping_value"][arm][stored])} on stored '
+            f'canonical-in-top-5 under this arm.'
+        )
+
+    lines += [
+        '',
+        f'**The signal sentence.**  Under the ratified `{shape}` write '
+        f'shape, one unstamped re-emission per topic costs '
+        f'{_gap_cell(deltas["unstamped"]["flat"][recall])} claim recall@5 '
+        f'and {_gap_cell(deltas["unstamped"]["flat"][stored])} stored '
+        f'canonical-in-top-5 on a flat read.  4004\'s selected transform '
+        f'(`{selected}`) {_absorption_phrase(deltas["unstamped"]["flat"][recall], deltas["unstamped"][selected][recall])} '
+        f'on claim recall@5, and '
+        f'{_absorption_phrase(deltas["unstamped"]["flat"][stored], deltas["unstamped"][selected][stored])} '
+        f'on stored canonical-in-top-5.  Stamped, the same injection costs '
+        f'{_gap_cell(deltas["stamped"]["flat"][recall])} and '
+        f'{_gap_cell(deltas["stamped"]["flat"][stored])} on a flat read.',
+        '',
+        'Both `canonical in top-5` columns travel together and neither can '
+        'be quoted without the other.  The `(stored)` trio is the SCORED '
+        'discoverability — `topic_discoverability` over the RAW store hits, '
+        'before any `read_path` — so it is scored by the TRUE canonical '
+        'record id and never by an aliased one, which is what makes it '
+        'readable as retrieval.  The `(credited)` column is what the reader '
+        'was handed AFTER the read transform ran, and under `promoting_pin` '
+        'it is a PLACEMENT property: the transform injects the canonical '
+        'into the window, in exactly the way `apply_grouped_read`\'s '
+        'record-id aliasing did under `b_grouped`.  A credited column that '
+        'holds while the stored one falls means the transform is masking '
+        'regrowth at read time, not that retrieval survived it.',
+        '',
+        '### What topic-stamping buys',
+        '',
+        '`stamped delta - unstamped delta`, per read arm.  This is the '
+        'number task 4006\'s stamping campaign is owed: the unstamped delta '
+        'is what one re-emission costs today, the stamped delta is what it '
+        'would cost if the write path stamped every re-emission, and the '
+        'difference is what the campaign buys against regrowth.  Sign is the '
+        'underlying column\'s: on recall and discoverability a positive '
+        'value is cost recovered, on `tokens/query` it is not.',
+        '',
+        '| ' + ' | '.join(REGROWTH_STAMPING_COLUMNS) + ' |',
+        '| ' + ' | '.join('---' for _ in REGROWTH_STAMPING_COLUMNS) + ' |',
+    ]
+    for arm in REGROWTH_READ_ARMS:
+        lines.append('| ' + ' | '.join([
+            arm,
+            *(
+                _gap_cell(regrowth['stamping_value'][arm][metric])
+                for metric in metrics
+            ),
+        ]) + ' |')
+
     return lines
 
 
@@ -2852,6 +3113,8 @@ def render_markdown(report: dict[str, Any]) -> str:
                 _rank_cell(subset['discoverability']),
             ]) + ' |')
 
+    lines += _regrowth_lines(report)
+
     lines += [
         '',
         '## D10 — audit-recall over the labeled fixture',
@@ -2905,6 +3168,11 @@ def render_markdown(report: dict[str, Any]) -> str:
         f'claim id realizable in every arm), deliberately not length parity — '
         f"arm (a)'s long originals versus arm (c)'s short peers differ by "
         f'construction, and that difference IS the tokens/query column.',
+        '',
+        # Emitted on EVERY run, probed or not: the disclosure describes how
+        # the probe was AUTHORED, which a reader of a `--no-regrowth`
+        # artifact still needs when they go looking for its numbers.
+        REGROWTH_BLIND_AUTHORING_DISCLOSURE,
         '',
         f"**Embedder**: {protocol['embedder_model']}.",
         '',
@@ -3053,6 +3321,23 @@ BLIND_AUTHORING_PROTOCOL = (
     'single-author-blind-to-metrics, mechanized by commit ordering: the arm '
     'decomposition and query set were committed before any metric function '
     'existed in the tree'
+)
+
+#: Recorded verbatim in the artifact's Protocol section.  The +1-re-emission
+#: probe (task 4012) does NOT carry the protection the six arms do, and the
+#: artifact has to SAY so rather than let the section above imply it.
+REGROWTH_BLIND_AUTHORING_DISCLOSURE = (
+    '**Regrowth probe — not blind-authored**: the +1-re-emission probe does '
+    'not carry the blind-authoring protection the six arms above do.  That '
+    'protection was mechanized by commit ordering — the arm decomposition '
+    'and query set were committed before any metric function existed in the '
+    'tree — and it is UNRECOVERABLE for this probe, because the metric code '
+    'was already in the tree when the injection corpus was authored.  The '
+    'injection fixture was committed on its own, ahead of every line of '
+    'probe code, as a PARTIAL audit trail and nothing more: it fixes WHAT '
+    'was injected before any delta was seen, not before the metrics were '
+    'written.  Its commit is in the fixture table below.  Read the regrowth '
+    'section as a disclosed non-blind measurement, not as a blind one.'
 )
 
 
@@ -4421,6 +4706,16 @@ def measure_regrowth_arms(
     }
 
 
+def _regrowth_metric_keys() -> tuple[str, ...]:
+    """``('claim_recall.at_5', …)`` — the flat keys, in metric order.
+
+    ONE spelling of the ``<block>.<key>`` join, shared by the projection,
+    the completeness check and the renderer, so the three cannot disagree
+    about what a metric is called or what order the table reports it in.
+    """
+    return tuple(f'{block}.{key}' for block, key in REGROWTH_METRICS)
+
+
 def _pluck_regrowth_metrics(measurement: dict[str, Any]) -> dict[str, Any]:
     """Project ``REGROWTH_METRICS`` to a flat ``{'<block>.<key>': value}``.
 
@@ -4428,8 +4723,10 @@ def _pluck_regrowth_metrics(measurement: dict[str, Any]) -> dict[str, Any]:
     only be added or removed in ``REGROWTH_METRICS``.
     """
     return {
-        f'{block}.{key}': measurement[block][key]
-        for block, key in REGROWTH_METRICS
+        metric: measurement[block][key]
+        for metric, (block, key) in zip(
+            _regrowth_metric_keys(), REGROWTH_METRICS, strict=True,
+        )
     }
 
 
@@ -4739,16 +5036,23 @@ async def run_bake_off(
             ),
         )
 
+    # The two injected passes are wired into the drivers in the next step;
+    # until they are, no run produces a block, and BOTH the report's
+    # `regrowth` key and the fixture-provenance claim below correctly say so
+    # rather than claiming a fixture this run never opened.
+    regrowth_block: dict[str, Any] | None = None
+
     return build_report(
         arms=arms,
         audit_recall=audit_recall_over_labeled_fixture(
             load_labeled_fixture(alpha_fixture),
         ),
+        regrowth=regrowth_block,
         protocol={
             'blind_authoring': BLIND_AUTHORING_PROTOCOL,
-            'fixtures': fixture_provenance([
+            'fixtures': fixture_provenance(_protocol_fixture_paths([
                 alpha_fixture, registry, arm_claims, query_set, distractor_slab,
-            ]),
+            ], regrowth=regrowth_block)),
             'token_estimator': estimator[0],
             'guard_threshold': guard_threshold,
             'distractor_slab_size': len(distractors),
@@ -4853,16 +5157,23 @@ async def _replay_bake_off(
             fetched=replayed[shape],
         ))
 
+    # The two injected passes are wired into the drivers in the next step;
+    # until they are, no run produces a block, and BOTH the report's
+    # `regrowth` key and the fixture-provenance claim below correctly say so
+    # rather than claiming a fixture this run never opened.
+    regrowth_block: dict[str, Any] | None = None
+
     return build_report(
         arms=arms,
         audit_recall=audit_recall_over_labeled_fixture(
             load_labeled_fixture(alpha_fixture),
         ),
+        regrowth=regrowth_block,
         protocol={
             'blind_authoring': BLIND_AUTHORING_PROTOCOL,
-            'fixtures': fixture_provenance([
+            'fixtures': fixture_provenance(_protocol_fixture_paths([
                 alpha_fixture, registry, arm_claims, query_set, distractor_slab,
-            ]),
+            ], regrowth=regrowth_block)),
             'token_estimator': estimator[0],
             'guard_threshold': guard_threshold,
             'distractor_slab_size': len(distractors),
