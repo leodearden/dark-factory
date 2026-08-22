@@ -326,3 +326,120 @@ class TestRunReviewerVerdictRouting:
 
         assert result['verdict'] == 'ERROR'
         assert result['reviewer'] == 'reviewer_comprehensive'
+
+
+def _invoke_writes_raw_verdict(
+    f, payload: dict, *, success: bool = True, output: str = 'ok',
+    timed_out: bool = False,
+) -> Callable:
+    """Build an ``_invoke`` side_effect that writes *payload* to
+    ``verdicts/reviewer_comprehensive.json`` VERBATIM, bypassing
+    ``_submit_review_verdict``.
+
+    ``mcp/verdict_tools.py:_submit_review_verdict`` rejects a payload whose
+    ``reviewer`` disagrees with the artifact's role at WRITE time ("the
+    artifact filename is authoritative for this role"), so a cross-role
+    payload can only be staged on disk by going around that server — which
+    is exactly the corrupt/hand-edited-artifact case ``_run_reviewer``'s
+    own identity check must defend against.
+    """
+
+    def _side_effect(*args, **kwargs):
+        f.artifacts.write_verdict(
+            'reviewer_comprehensive',
+            _envelope('reviewer_comprehensive', 'sid', payload),
+        )
+        return AgentResult(success=success, output=output, timed_out=timed_out)
+
+    return _side_effect
+
+
+@pytest.mark.asyncio
+class TestReviewerIdentityGate:
+    """A salvaged payload must actually belong to the role being run.
+
+    Defense-in-depth (task 3639): ``verdict_tools.py:86-95`` already rejects
+    a mismatched ``reviewer`` at write time, so this gate only fires for a
+    corrupt, hand-edited or cross-role artifact reaching disk another way.
+    It matters because ``_run_reviewer``'s return is mirrored verbatim to
+    ``reviews/<role>.json`` (``_review`` -> ``artifacts.write_review``) and
+    that mirror is the SOLE input to ``aggregate_reviews()``, which makes
+    the blocking-issue decision — so a cross-role payload returned verbatim
+    would be filed, and counted, under the wrong reviewer's name.
+    """
+
+    def _setup(self, tmp_path: Path):
+        f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
+        f.wf.briefing.build_reviewer_prompt = AsyncMock(return_value='prompt')
+        return f
+
+    @pytest.mark.parametrize('success', [True, False])
+    async def test_verdict_reviewer_identity_mismatch_is_failsafe_error(
+        self, tmp_path: Path, success: bool,
+    ):
+        """A well-formed payload naming a DIFFERENT reviewer is untrusted.
+
+        Parametrized over ``success`` so the identity gate is proven
+        independent of the invocation-result signal — it is a property of
+        the payload, not of how the run ended.
+        """
+        f = self._setup(tmp_path)
+        f.wf._invoke = AsyncMock(  # type: ignore[method-assign]
+            side_effect=_invoke_writes_raw_verdict(
+                f,
+                {
+                    'reviewer': 'reviewer_security',
+                    'verdict': 'PASS',
+                    'issues': [],
+                    'summary': 'Different reviewer entirely.',
+                },
+                success=success,
+                output='cross-role artifact',
+            ),
+        )
+
+        result = await f.wf._run_reviewer(REVIEWER_COMPREHENSIVE, 'diff')
+
+        assert result['reviewer'] == 'reviewer_comprehensive'
+        assert result['verdict'] == 'ERROR'
+        assert result['issues'] == []
+        assert result['summary'].startswith('Reviewer emitted no/invalid verdict:')
+
+    async def test_absent_reviewer_field_is_failsafe_error(self, tmp_path: Path):
+        """A payload with no ``reviewer`` key at all cannot be attributed."""
+        f = self._setup(tmp_path)
+        f.wf._invoke = AsyncMock(  # type: ignore[method-assign]
+            side_effect=_invoke_writes_raw_verdict(
+                f, {'verdict': 'PASS', 'issues': [], 'summary': 'anonymous'},
+            ),
+        )
+
+        result = await f.wf._run_reviewer(REVIEWER_COMPREHENSIVE, 'diff')
+
+        assert result['verdict'] == 'ERROR'
+        assert result['reviewer'] == 'reviewer_comprehensive'
+
+    @pytest.mark.parametrize('success', [True, False])
+    async def test_matching_reviewer_identity_is_salvaged(
+        self, tmp_path: Path, success: bool,
+    ):
+        """Positive control: the SAME staging path with a matching
+        ``reviewer`` still returns the payload verbatim.
+
+        Guards against the identity check being written inverted — this
+        differs from the mismatch case in exactly one field.
+        """
+        f = self._setup(tmp_path)
+        payload = {
+            'reviewer': 'reviewer_comprehensive',
+            'verdict': 'PASS',
+            'issues': [],
+            'summary': 'Mine, and it says PASS.',
+        }
+        f.wf._invoke = AsyncMock(  # type: ignore[method-assign]
+            side_effect=_invoke_writes_raw_verdict(f, payload, success=success),
+        )
+
+        result = await f.wf._run_reviewer(REVIEWER_COMPREHENSIVE, 'diff')
+
+        assert result == payload
