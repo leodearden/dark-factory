@@ -346,13 +346,10 @@ class TestProvenanceStampDoesNotDisarmCodeChangeSuppression:
     """Machine-injected provenance stamps must not arm the code-change
     suppression (task 4532).
 
-    A Stage-2 ``task_knowledge_sync`` doc-drift annotation appended to a
-    live task description ("[Stage 2 task-knowledge sync <date>] DOC-DRIFT
-    FIX (finding ...)") contains the bare word "FIX", which matched
-    ``_CODE_CHANGE_SIGNALS_RE`` and permanently disarmed this guard for
-    that task -- the guard's own downstream annotation blinded it. An
-    appended annotation is post-filing PROVENANCE, not evidence of the
-    author's filing-era code intent, so it must not suppress a finding.
+    The backstory, observed stamp corpus, monotonicity invariant and
+    directional-safety rule live in ONE place — routing_intent_guard.py's
+    "Provenance-stamp carve-out" module-docstring section. Each test below
+    names only the specific behaviour it pins.
     """
 
     def test_stage2_doc_drift_stamp_no_longer_suppresses_marker_finding(self):
@@ -536,3 +533,127 @@ class TestProvenanceStampDoesNotDisarmCodeChangeSuppression:
             metadata=None,
         )
         assert finding is None, f'A bare bracketed lead-in is not a stamp, got: {finding!r}'
+
+    def test_crlf_authored_signal_after_the_stamp_paragraph_still_suppresses(self):
+        """CONTAINMENT, CRLF variant of the LF case above: the paragraph
+        terminator must recognize a CRLF blank line too. A bound written
+        only against an LF blank line ran straight past it to the END OF THE
+        FIELD, stripping the authored trailing "fix" and manufacturing a
+        finding — the one direction that can hard-reject an honest task in
+        enforce mode. CRLF reaches task text via paste from a Windows or
+        browser client."""
+        finding = routing_intent_finding(
+            title=None,
+            description=(
+                'DO NOT IMPLEMENT.'
+                '\r\n\r\n[Stage 2 task-knowledge sync 2026-07-07] DOC-DRIFT FIX '
+                '(finding x): re-derived the count.'
+                '\r\nAnd a second stamp line.'
+                '\r\n\r\nAlso fix the retry helper while you are in here.'
+            ),
+            details=None,
+            task_kind='normal',
+            metadata=None,
+        )
+        assert finding is None, f'CRLF trailing "fix" must still suppress, got: {finding!r}'
+
+    def test_crlf_stamp_is_still_stripped(self):
+        """The CRLF bound must not be bought by losing recognition: a
+        CRLF-separated stamp is still stripped, so the reported defect stays
+        fixed under both line-ending conventions."""
+        finding = routing_intent_finding(
+            title=None,
+            description=(
+                'DO NOT IMPLEMENT; escalate to a human instead of implementing.'
+                '\r\n\r\n[Stage 2 task-knowledge sync 2026-07-07] DOC-DRIFT FIX '
+                '(finding x): re-derived the count.'
+            ),
+            details=None,
+            task_kind='normal',
+            metadata=None,
+        )
+        assert finding is not None, 'CRLF-separated stamp must still be stripped'
+        assert 'do_not_implement' in finding.markers
+
+    def test_stamp_at_the_start_of_the_title_field_is_stripped(self):
+        """The line anchor is a MULTILINE ``^``, which also matches at
+        position 0 — so a stamp opening the TITLE (the field the sibling
+        operational_ask_registry scopes its signals to) is recognized, not
+        just one appearing after a newline."""
+        finding = routing_intent_finding(
+            title=(
+                '[Stage 2 task-knowledge sync 2026-07-07] DOC-DRIFT FIX: '
+                're-derived the dependency count.'
+            ),
+            description='This is a no-code milestone gate. DO NOT IMPLEMENT.',
+            details=None,
+            task_kind='normal',
+            metadata=None,
+        )
+        assert finding is not None
+        assert 'do_not_implement' in finding.markers
+        assert 'no_code_label' in finding.markers
+
+    def test_every_stamp_in_a_field_is_stripped_not_just_the_first(self):
+        """Two stamps in one field, each carrying its OWN code-change signal
+        ("bug" in the first, "FIX" in the second): a finding proves BOTH were
+        stripped, since either survivor alone would re-suppress. Live task
+        descriptions accumulate annotations over a task's lifetime."""
+        finding = routing_intent_finding(
+            title=None,
+            description=(
+                'DO NOT IMPLEMENT; escalate to a human instead of implementing.'
+                '\n\n[RECON CORRECTION 2026-08-08] the prior prose was a bug.'
+                '\n\n[Stage 2 task-knowledge sync 2026-07-07] DOC-DRIFT FIX '
+                '(finding z): re-derived the count.'
+            ),
+            details=None,
+            task_kind='normal',
+            metadata=None,
+        )
+        assert finding is not None
+        assert 'do_not_implement' in finding.markers
+        assert 'escalate_instead_of_implementing' in finding.markers
+
+    def test_list_item_stamp_is_not_stripped(self):
+        """UNDER-STRIP BOUNDARY, pinned deliberately: the opener allows only
+        leading spaces/tabs, so a stamp bulleted into a list ("- [Stage 2
+        ...]") is NOT recognized and its signal still suppresses. This is the
+        SAFE direction (it degrades to pre-4532 behaviour), and pinning it
+        makes any future widening of the opener's leading-whitespace class
+        a visible, deliberate choice rather than a silent behaviour
+        change."""
+        finding = routing_intent_finding(
+            title=None,
+            description=(
+                'DO NOT IMPLEMENT.'
+                '\n\n- [Stage 2 task-knowledge sync 2026-07-07] DOC-DRIFT FIX: '
+                're-derived the count.'
+            ),
+            details=None,
+            task_kind='normal',
+            metadata=None,
+        )
+        assert finding is None, f'A bulleted stamp is not recognized, got: {finding!r}'
+
+    def test_line_continuing_a_stamp_is_stripped_with_it(self):
+        """KNOWN COST of the paragraph bound, pinned so it stays visible:
+        observed stamps have multi-line bodies, so a line separated from the
+        stamp by only a SINGLE newline is stripped with it and its
+        code-change signal is lost. Accepted because every observed annotator
+        appends its stamp as its own blank-line-separated paragraph; a
+        line-bounded strip would instead drop the multi-line stamp bodies
+        this guard must handle."""
+        finding = routing_intent_finding(
+            title=None,
+            description=(
+                'DO NOT IMPLEMENT.'
+                '\n\n[RECON CORRECTION 2026-08-08] corrected.'
+                '\nAlso fix the retry helper while here.'
+            ),
+            details=None,
+            task_kind='normal',
+            metadata=None,
+        )
+        assert finding is not None, 'Single-newline continuation is stripped with the stamp'
+        assert 'do_not_implement' in finding.markers
