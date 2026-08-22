@@ -45,9 +45,15 @@ pin is worse than no pin because it reads as authoritative.
 """
 from __future__ import annotations
 
+import ast
 import pathlib
 
 import pytest
+from module_budget_family import (
+    FAMILY_PUBLISHER_PATHS,
+    min_budget,
+    published_pairs,
+)
 from orchestrator.config import OrchestratorConfig, _discover_module_configs
 
 from orchestrator import verify, verify_plan
@@ -680,3 +686,246 @@ def test_every_discovered_module_config_declares_its_own_verify_budget() -> None
             f'table above and in the yaml\'s provenance block, then add the '
             f'worst wall-clock here'
         )
+
+
+# ---------------------------------------------------------------------------
+# CROSS-FILE DERIVATION (task 4320)
+# ---------------------------------------------------------------------------
+
+# The family members that PUBLISH a (measurement, derived floor) pair, expressed
+# as prefixes rather than as file paths so the floor below cannot be satisfied
+# by a reader that found the right NUMBER of files but the wrong ones.
+# ``FAMILY_PUBLISHER_PATHS`` names the files; this names what they must turn out
+# to be about. Modelled on ``KNOWN_MODULE_CONFIG_PREFIXES`` above, for the same
+# reason: without it a shrunken discovery set makes every per-pair assertion
+# below pass VACUOUSLY.
+FAMILY_PUBLISHED_PREFIXES = frozenset({'scripts', 'tests/scripts'})
+
+
+def test_the_budget_family_derives_every_floor_from_one_canonical_expression() -> None:
+    """No family member may spell the floor derivation for itself (task 4320).
+
+    THE HOLE THIS CLOSES, in the family's own words. Until this guard existed,
+    ``test_tests_scripts_module_config.py``'s derivation test carried a scope
+    paragraph conceding that ``_min_budget`` there "is a LOCAL copy ... nothing
+    here can observe a sibling's expression: if ``test_scripts_module_config.py``
+    changed its own inline derivation, every assertion below would still pass",
+    and that "real cross-file enforcement — one guard reading every family
+    member's published pair and checking the derivation holds for all of them —
+    would be a new mechanism rather than an amendment, and is filed as a
+    follow-up instead of being claimed here". This IS that follow-up. Before it,
+    the derivation existed in THREE spellings — two ``def _min_budget`` copies
+    and one inlined ``(int(2 * W) // 100) * 100`` — and nothing in the repo could
+    observe drift between them.
+
+    WHY IT LIVES HERE. This file is the family's designated anti-drift member:
+    it already owns ``MEASURED_BY_SIBLING_GUARD`` (the table pointing at the
+    owning guards) and ``KNOWN_MODULE_CONFIG_PREFIXES`` (the floor that stops a
+    shrunken discovery set passing vacuously). A cross-file check belongs with
+    the tables it makes checkable, not in either publisher — a publisher checking
+    its sibling is exactly the guard-couples-guard shape this directory refuses.
+
+    SEVEN ASSERTIONS, each closing a distinct way the derivation can rot:
+
+      (1) FLOOR SET. Every path in ``FAMILY_PUBLISHER_PATHS`` exists and yields
+          a pair, and the discovered prefixes are EXACTLY
+          ``FAMILY_PUBLISHED_PREFIXES``. Without this the loop below passes on
+          an empty or shrunken set — the vacuous-pass hole
+          ``KNOWN_MODULE_CONFIG_PREFIXES`` closes for the sibling guard.
+
+      (2) THE MEASUREMENT IS A MEASUREMENT. ``MEASURED_SUITE_WORST_SECS`` must
+          be a plain numeric literal, not a computed expression. A measurement
+          that is itself derived from something has no provenance a yaml block
+          can record, and would let the pair be satisfied by two expressions
+          that agree with each other and with no observed run.
+
+      (3) THE FLOOR IS DERIVED, NOT TRANSCRIBED. The ``MIN_MODULE_BUDGET_SECS``
+          expression must REFERENCE ``MEASURED_SUITE_WORST_SECS`` by name. This
+          is the rot task 3703 fixed for ONE file and nothing enforced for the
+          others: a hand-set ``MIN_MODULE_BUDGET_SECS = 1800`` evaluates fine
+          and agrees with today's measurement, then silently stops agreeing the
+          next time the measurement moves. It now fails HERE, cross-file.
+
+      (4) ONE CANONICAL DERIVATION. The expression is evaluated in a namespace
+          whose ONLY bindings are the published worst and
+          ``module_budget_family.min_budget`` — deliberately without
+          ``__builtins__``. So ``min_budget(MEASURED_SUITE_WORST_SECS)``
+          succeeds, while a local ``_min_budget`` copy or an inlined
+          ``(int(2 * W) // 100) * 100`` raises ``NameError`` and fails here.
+          That is what makes "one canonical expression" a mechanism rather than
+          a convention: re-spelling the derivation locally is now impossible to
+          land green, whatever value it happens to produce today.
+
+      (5) SAME SHAPE. The evaluated value equals ``min_budget(published
+          worst)``. (4) rejects a different SPELLING; (5) rejects a different
+          MEANING — a 3x multiple, or a round-UP, reached through the canonical
+          helper.
+
+      (6) RAISE-TOGETHER MADE STRUCTURAL. For each family prefix, the
+          PRODUCTION-discovered ``verify_command_timeout_secs`` (via
+          ``config._discover_module_configs``, not a yaml re-read) is declared
+          and is >= ``min_budget(published worst)``. Every yaml in the family
+          carries a RAISE-TOGETHER rule in prose; this makes refreshing a
+          measurement without raising its budget fail in ONE place for the WHOLE
+          family, and keeps it failing even if an owning guard is later deleted
+          or weakened. Task 4320's own step 1 is the worked example: the trigger
+          fired, and this assertion is where it would have fired even had the
+          owning guard not existed.
+
+      (7) ``MEASURED_BY_SIBLING_GUARD`` BECOMES CHECKED, NOT DOCUMENTED. Every
+          key in that table resolves to a pair the reader actually FOUND. That
+          table's whole purpose is to say "this module's provenance lives over
+          there" instead of copying a number here; until now nothing verified
+          the pointer still landed on a guard that publishes one. A pointer that
+          silently stops resolving is worse than a copied number, because it
+          reads as delegation rather than as a gap.
+
+    ASSERTS ON STRUCTURE AND VALUES, NEVER ON PROSE. Every check above is
+    against a parsed AST node, an evaluated expression, or a ModuleConfig field.
+    Nothing here reads a docstring, a comment or a string literal — the same
+    line ``test_every_discovered_module_config_declares_its_own_verify_budget``
+    draws when it declines to regex ``MODULE_BUDGET_EXCLUSIONS`` justifications.
+    """
+    # ---- (1) FLOOR SET -----------------------------------------------------
+    absent = [str(p) for p in FAMILY_PUBLISHER_PATHS if not p.is_file()]
+    assert not absent, (
+        f'module_budget_family.FAMILY_PUBLISHER_PATHS names {absent} which do '
+        f'not exist (task 4320). Either a publisher was renamed — in which case '
+        f'update FAMILY_PUBLISHER_PATHS — or it was deleted, in which case the '
+        f'family has lost a member and every assertion below would go quiet '
+        f'about it rather than failing'
+    )
+
+    pairs = published_pairs()
+
+    assert len(pairs) == len(FAMILY_PUBLISHER_PATHS), (
+        f'module_budget_family.published_pairs() returned {len(pairs)} pair(s) '
+        f'{sorted(pairs)} for {len(FAMILY_PUBLISHER_PATHS)} publisher file(s) '
+        f'(task 4320). A publisher that no longer defines a module-level '
+        f'MODULE_PREFIX yields no pair at all, so it would drop out of every '
+        f'check below silently'
+    )
+    assert set(pairs) == FAMILY_PUBLISHED_PREFIXES, (
+        f'the budget family publishes pairs for {sorted(pairs)}, expected '
+        f'exactly {sorted(FAMILY_PUBLISHED_PREFIXES)} (task 4320). This floor '
+        f'exists so the per-pair assertions below cannot pass VACUOUSLY on a '
+        f'shrunken set — the same hole KNOWN_MODULE_CONFIG_PREFIXES closes for '
+        f'the coverage guard. If a module genuinely joined or left the family, '
+        f'update FAMILY_PUBLISHED_PREFIXES and FAMILY_PUBLISHER_PATHS together'
+    )
+
+    discovered = _discovered()
+
+    for prefix, pair in sorted(pairs.items()):
+        # ---- (2) THE MEASUREMENT IS A MEASUREMENT --------------------------
+        assert pair.worst_source is not None, (
+            f'{prefix}: {pair.path.name} defines no module-level '
+            f'MEASURED_SUITE_WORST_SECS (task 4320), so this family member '
+            f'publishes a floor with no measurement behind it. The pair is the '
+            f'unit — a floor without its worst run is a number with no '
+            f'provenance, which is what the whole family exists to prevent'
+        )
+        worst_node = ast.parse(pair.worst_source, mode='eval').body
+        assert (
+            isinstance(worst_node, ast.Constant)
+            and isinstance(worst_node.value, (int, float))
+            and not isinstance(worst_node.value, bool)
+        ), (
+            f'{prefix}: MEASURED_SUITE_WORST_SECS in {pair.path.name} is '
+            f'`{pair.worst_source}`, which is not a plain numeric literal '
+            f'(task 4320). A MEASUREMENT is transcribed from an observed run '
+            f'and recorded run-by-run in the owning yaml\'s PER-MODULE VERIFY '
+            f'BUDGET block; a computed one has no run behind it, and would let '
+            f'this pair be satisfied by two expressions that agree with each '
+            f'other and with nothing that was ever measured'
+        )
+        assert pair.worst is not None, (
+            f'{prefix}: MEASURED_SUITE_WORST_SECS in {pair.path.name} could not '
+            f'be read as a literal value (task 4320): {pair.worst_source!r}'
+        )
+
+        # ---- (3) THE FLOOR IS DERIVED, NOT TRANSCRIBED ---------------------
+        assert pair.floor_source is not None, (
+            f'{prefix}: {pair.path.name} defines no module-level '
+            f'MIN_MODULE_BUDGET_SECS (task 4320), so it records a measurement '
+            f'that gates nothing'
+        )
+        floor_names = {
+            node.id
+            for node in ast.walk(ast.parse(pair.floor_source, mode='eval'))
+            if isinstance(node, ast.Name)
+        }
+        assert 'MEASURED_SUITE_WORST_SECS' in floor_names, (
+            f'{prefix}: MIN_MODULE_BUDGET_SECS in {pair.path.name} is '
+            f'`{pair.floor_source}`, which does not REFERENCE '
+            f'MEASURED_SUITE_WORST_SECS (task 4320) — it is transcribed rather '
+            f'than derived. That is the exact rot task 3703 repaired for '
+            f'tests/scripts and which nothing enforced for the rest of the '
+            f'family: a hand-set floor agrees with the measurement on the day '
+            f'it is written and then silently stops agreeing, and only a '
+            f'reviewer ever caught it. Names referenced: {sorted(floor_names)}'
+        )
+
+        # ---- (4) ONE CANONICAL DERIVATION ----------------------------------
+        assert pair.error is None and pair.floor is not None, (
+            f'{prefix}: MIN_MODULE_BUDGET_SECS in {pair.path.name} is '
+            f'`{pair.floor_source}`, which does not evaluate against the ONE '
+            f'canonical derivation (task 4320): {pair.error}. The expression is '
+            f'evaluated with only `min_budget` and `MEASURED_SUITE_WORST_SECS` '
+            f'bound and no __builtins__, so a locally re-spelled derivation — a '
+            f'`def _min_budget` copy, or an inlined `(int(2 * W) // 100) * 100` '
+            f'— raises NameError HERE even when it computes the right number '
+            f'today. Import module_budget_family.min_budget and call it: the '
+            f'family may hold exactly one implementation of this expression'
+        )
+
+        # ---- (5) SAME SHAPE ------------------------------------------------
+        expected_floor = min_budget(pair.worst)
+        assert pair.floor == expected_floor, (
+            f'{prefix}: MIN_MODULE_BUDGET_SECS in {pair.path.name} evaluates to '
+            f'{pair.floor}, but min_budget(MEASURED_SUITE_WORST_SECS='
+            f'{pair.worst}) is {expected_floor} (task 4320). Assertion (4) '
+            f'rejects a different SPELLING of the derivation; this one rejects a '
+            f'different MEANING reached through the canonical helper — a '
+            f'different multiple, or a round-UP where the family rounds DOWN'
+        )
+
+        # ---- (6) RAISE-TOGETHER MADE STRUCTURAL ----------------------------
+        mc = discovered.get(prefix)
+        assert mc is not None, (
+            f'{prefix} publishes a measurement/floor pair in {pair.path.name} '
+            f'but config._discover_module_configs no longer registers a module '
+            f'config at that prefix (task 4320), so the floor gates nothing in '
+            f'production'
+        )
+        assert mc.verify_command_timeout_secs is not None, (
+            f'{prefix}/orchestrator.yaml declares no verify_command_timeout_secs '
+            f'(task 4320) while {pair.path.name} publishes a derived floor of '
+            f'{pair.floor}s for it, so the module silently inherits the '
+            f'repo-root whole-fleet ceiling and the floor is decorative'
+        )
+        assert mc.verify_command_timeout_secs >= expected_floor, (
+            f'{prefix}/orchestrator.yaml declares '
+            f'verify_command_timeout_secs={mc.verify_command_timeout_secs}, '
+            f'below the {expected_floor}s floor min_budget derives from '
+            f'MEASURED_SUITE_WORST_SECS={pair.worst} in {pair.path.name} '
+            f'(task 4320). THIS IS THE RAISE-TOGETHER RULE, enforced rather '
+            f'than merely written in that yaml\'s provenance block: a refreshed '
+            f'measurement must be accompanied by a raised budget IN THE SAME '
+            f'CHANGE. Raise the yaml — never lower the measurement, and never '
+            f'hand-set the floor back'
+        )
+
+    # ---- (7) MEASURED_BY_SIBLING_GUARD BECOMES CHECKED ---------------------
+    unresolved = sorted(set(MEASURED_BY_SIBLING_GUARD) - set(pairs))
+    assert not unresolved, (
+        f'MEASURED_BY_SIBLING_GUARD points at an owning guard for '
+        f'{unresolved}, but module_budget_family.published_pairs() found no '
+        f'published (measurement, floor) pair for those prefixes (task 4320). '
+        f'That table exists so this file does not become a SECOND home for a '
+        f'measurement; the price is that its entries are pointers, and a '
+        f'pointer that has stopped resolving reads as delegation while '
+        f'delegating to nothing. Either restore the pair in the owning guard, '
+        f'or move the prefix into MEASURED_MODULE_SUITE_WORST_SECS and record '
+        f'the figure here. Pairs found: {sorted(pairs)}'
+    )
