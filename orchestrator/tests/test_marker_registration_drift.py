@@ -70,14 +70,7 @@ from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 # This guard sweeps every *.py under orchestrator/tests/ -- 535 files at
 # authorship time -- and ast.parse()s each one; its module-scoped
-# `_real_tree_sweep` fixture measured ~5.6s for ~494 files. CPU/IO-heavy work
-# that can exceed the pyproject's 60s per-test default under `-n auto` xdist
-# oversubscription.
-# Under pytest-timeout's thread method a breach does NOT fail the test -- it
-# os._exit()s the xdist worker ("node down: Not properly terminated"), and
-# `--max-worker-restart=0` then declines to replace it, degrading the run to a
-# TRUNCATED whole-suite session whose surviving failure names whichever
-# innocent guard merely shared the dead worker.
+# `_real_tree_sweep` fixture measured ~5.6s for ~494 files.
 # WHY A MODULE-LEVEL MARK when this file already carries two
 # @pytest.mark.timeout(120) DECORATORS on the tests that consume that fixture:
 # the decorators still WIN where present -- get_closest_marker resolves the
@@ -90,13 +83,10 @@ from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
 # sound LOWER bound on every collected item) rather than "some timeout mark
 # somewhere in the file" (an UPPER bound), and why this file is the 12th
 # member of the family rather than an exception to it.
-# Opt into the pyproject-sanctioned "Slow tests opt out with
-# @pytest.mark.timeout(N)" mechanism (orchestrator/pyproject.toml:154).
-# WHOLE_TREE_SCAN_TEST_TIMEOUT is `5 * PYPROJECT_DEFAULT_TIMEOUT` (300s) in
-# _orch_helpers.py -- DERIVED from the very ini default being cleared, so it
-# tracks that setting instead of drifting from it. Coverage of this family is
-# ENFORCED, not sprinkled: test_whole_tree_scan_timeout_guard.py recomputes
-# the census from source on every run and fails a scanner that loses this.
+# WHY 300s, the thread-mode os._exit() cost model it clears, and the guard that
+# ENFORCES this mark rather than trusting it to be sprinkled: see
+# WHOLE_TREE_SCAN_TEST_TIMEOUT in _orch_helpers.py, and
+# test_whole_tree_scan_timeout_guard.py (task 4215).
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 

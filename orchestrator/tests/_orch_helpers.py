@@ -110,10 +110,20 @@ PYPROJECT_DEFAULT_TIMEOUT = 60
 
 # task 4215: per-test ceiling for the family of guard tests that sweep the
 # WHOLE tree -- `rglob('*.py')` over ~500 files, `ast.parse` on each -- and so
-# cannot be sized by the ordinary 60s default.  Coverage of this family is
-# ENFORCED, not sprinkled: test_whole_tree_scan_timeout_guard.py recomputes the
-# census from source on every run and fails a scanner that lacks a module-level
-# `pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)`.
+# cannot be sized by the ordinary 60s default.  This comment is the SINGLE
+# home of that rationale: the ~13 modules that carry the mark point HERE
+# instead of repeating it, so switching `timeout_method`, retuning the
+# multiple, or revising the measurements is one edit rather than fourteen.
+#
+# It is the pyproject's own sanctioned escape hatch -- "Slow tests opt out
+# with `@pytest.mark.timeout(N)`" (orchestrator/pyproject.toml:154) -- applied
+# at MODULE level, which is the only form that is a sound LOWER bound on every
+# collected item (a per-test decorator leaves any test added later at the
+# default).  A tighter decorator still WINS where one is present, so the
+# module mark narrows nothing.  Coverage of the family is ENFORCED, not
+# sprinkled: test_whole_tree_scan_timeout_guard.py recomputes the census from
+# source on every run and fails a scanner that lacks the mark OR pins it below
+# this ceiling.
 #
 # MECHANISM -- why a breach here is far more expensive than a red test:
 #   * `timeout_method = "thread"` (pyproject.toml:153) means pytest-timeout
@@ -135,6 +145,12 @@ PYPROJECT_DEFAULT_TIMEOUT = 60
 #   * xdist worker deaths were then observed at loadavg 250-423, one further
 #     inflation step past the 60s default (esc-3980-1 on branch task/3980,
 #     esc-3787-1 on branch task/3787).
+#   THREE members crashed that way -- test_event_loop_antipattern_guard.py,
+#   test_merge_queue_reachback_patch_guard.py and
+#   test_serial_merge_worker_import_guard.py -- which is what makes this a
+#   FAMILY defect rather than three accidents, and why the rest are marked
+#   preemptively: a marked-but-fast test costs nothing, while an
+#   unmarked-and-slow one costs a whole session.
 # 300s is ~36x the unloaded worst case and ~10x the measured-under-load worst
 # case.  DERIVED from PYPROJECT_DEFAULT_TIMEOUT because that ini default IS the
 # hazard being cleared -- deliberately NOT from HEAVY_BARRIER_TEST_TIMEOUT,

@@ -33,6 +33,14 @@ truncated verify.
 
 NOT widening the global ``timeout``: that would blunt the 60s ceiling for the
 other ~16000 tests, which is exactly the ceiling that catches real hangs.
+
+WHERE THE RATIONALE LIVES.  The mechanism is restated here because this is the
+module a failing run points at, but the CANONICAL home -- the derivation of the
+ceiling, the full measurement record, and the escalation references -- is the
+``WHOLE_TREE_SCAN_TEST_TIMEOUT`` comment in ``_orch_helpers.py``.  The ~13
+modules that carry the mark point THERE rather than repeating it, so retuning
+the multiple or switching ``timeout_method`` is one edit plus this file, not
+fourteen.
 """
 from __future__ import annotations
 
