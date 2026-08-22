@@ -1106,7 +1106,12 @@ def score_unlabeled_query(
 #: The bake-off helpers this module re-exports BY IDENTITY (INV-5).  A module
 #: constant rather than a literal inside `__getattr__` so the test suite can
 #: assert the invariant over the WHOLE set instead of hand-picked names —
-#: `_rate` went unasserted for exactly that reason (task 4583).
+#: `_rate` went unasserted for exactly that reason (task 4583).  Nothing
+#: inside THIS module reads through the re-export itself — `_score_window`,
+#: `aggregate_unlabeled` and the render helpers all call `bake_off()._mean` /
+#: `bake._rate` / `bake_off()._cell` directly — so `__getattr__` exists
+#: purely as a test-visibility hook onto the bake-off's definitions, not
+#: because production code depends on it (task 4583 amendment).
 _REEXPORTED_FROM_BAKE_OFF = ('_mean', '_rate', '_cell')
 
 
