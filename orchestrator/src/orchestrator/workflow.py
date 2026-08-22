@@ -10004,6 +10004,66 @@ class TaskWorkflow:
 
         return self.artifacts.aggregate_reviews()
 
+    def _salvageable_verdict_payload(self, role: AgentRole) -> dict | None:
+        """Return the on-disk verdict payload for *role* iff it is well-formed
+        and self-consistent, else ``None``.
+
+        Single validation seam shared by BOTH of ``_run_reviewer``'s salvage
+        paths — the normal post-invocation gate and the exception guard around
+        the ``_invoke`` await (task 3639) — so the two cannot drift apart.
+
+        A payload is trusted only when every clause holds:
+
+        * the envelope parses to a dict (``read_verdict`` already returns
+          ``None`` for a missing or corrupt file);
+        * its ``'verdict'`` member is itself a dict — an envelope missing the
+          payload key entirely is untrusted (defensive extraction);
+        * that payload's own ``verdict`` is in ``{PASS, ISSUES_FOUND}``;
+        * its ``reviewer`` names THIS role.
+
+        The identity clause is defense-in-depth.  ``_submit_review_verdict``
+        (``mcp/verdict_tools.py:86-95``) already rejects a mismatch at WRITE
+        time because "the artifact filename is authoritative for this role",
+        so only a corrupt, hand-edited or cross-role artifact can reach disk
+        under someone else's name.  It still matters: ``_run_reviewer``'s
+        return is mirrored verbatim into ``reviews/<role>.json`` (``_review``
+        -> ``artifacts.write_review``), and that mirror — despite
+        ``write_review``'s "debugging aid, not load-bearing" docstring
+        (``artifacts.py:851-852``) — is the SOLE input to
+        ``aggregate_reviews()``, which makes the blocking-issue decision.  A
+        cross-role payload returned verbatim would be filed, and its issues
+        counted, under the wrong reviewer's name.
+
+        Deliberately does NOT consider the invocation result.  Whether a run
+        that ended badly may still be salvaged is the CALLER's judgement, and
+        it differs by path: the normal gate excludes ``result.timed_out``, the
+        exception guard excludes ``TimeoutError`` — the same wall-clock-kill
+        exclusion expressed in each path's own vocabulary.
+        """
+        assert self.artifacts is not None
+        envelope = self.artifacts.read_verdict(role.name)
+        if not isinstance(envelope, dict):
+            return None
+        payload = envelope.get('verdict')
+        if not isinstance(payload, dict):
+            return None
+        if payload.get('verdict') not in {'PASS', 'ISSUES_FOUND'}:
+            return None
+        if payload.get('reviewer') != role.name:
+            logger.warning(
+                'Task %s: verdict artifact for %s carries reviewer %r — '
+                'refusing to attribute another role\'s verdict; failing safe',
+                self.task_id, role.name, payload.get('reviewer'),
+                extra={
+                    'event': 'reviewer_verdict_identity_mismatch',
+                    'task_id': str(self.task_id),
+                    'role': role.name,
+                    'payload_reviewer': str(payload.get('reviewer')),
+                },
+            )
+            return None
+        return payload
+
     async def _run_reviewer(
         self, role: AgentRole, diff: str,
         amendment_suggestions: list[dict] | None = None,
@@ -10050,12 +10110,21 @@ class TaskWorkflow:
         # used despite `not result.success`).  What still fails safe:
         #   - no verdict file / unparseable envelope / malformed payload;
         #   - an inner verdict outside {PASS, ISSUES_FOUND};
+        #   - a payload whose `reviewer` names a DIFFERENT role (task 3639);
         #   - ANY timed-out invocation (`result.timed_out`), whose verdict
         #     may be from a partial, aborted run — precisely the case the
         #     original fail-safe exists for.
         # The `ended_awaiting_background` false positive itself is task
         # 3639's; this only stops it from destroying a verdict we already
         # have.
+        #
+        # Well-formedness AND cross-role self-consistency both live in
+        # `_salvageable_verdict_payload`, so this gate and the exception guard
+        # around the `_invoke` await validate identically (task 3639).
+        payload = self._salvageable_verdict_payload(role)
+        # The diagnostic below must tell "no verdict file at all" apart from
+        # "file present but unusable", which `payload is None` alone cannot —
+        # hence this direct envelope read alongside the helper's.
         envelope = self.artifacts.read_verdict(role.name)
         if envelope is None and result.success:
             # Observability (reviewer_comprehensive amendment, task 2484):
@@ -10081,10 +10150,8 @@ class TaskWorkflow:
                     'exists) — reviewer did not call submit_review_verdict',
                     self.task_id, role.name, verdicts_dir,
                 )
-        payload = envelope.get('verdict') if isinstance(envelope, dict) else None
         if (
-            not isinstance(payload, dict)
-            or payload.get('verdict') not in {'PASS', 'ISSUES_FOUND'}
+            payload is None
             # A timed-out run stays fail-safe even with a well-formed verdict
             # on disk — it was killed mid-flight, so the verdict may be from
             # a partial pass.  Note `not result.success` is deliberately NOT
