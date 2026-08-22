@@ -47,6 +47,7 @@ from fused_memory.reconciliation.stale_status_snapshot_edge_sweep import (
     build_supersede_fact,
     extract_blocked_assertion_task_ids,
     extract_snapshot_edge_task_ids,
+    extract_snapshot_edge_task_ids_by_marker_class,
     flatten_dedup_edges,
     select_stale_status_snapshot_edges,
     sweep_stale_status_snapshot_edges,
@@ -1465,6 +1466,80 @@ _BLOCKED_EXTRACTION_CASES: tuple[tuple[str, set[int]], ...] = (
     ('Task 5 is pending', set()),
     ('The active pending tasks are [7, 9]', set()),
     ('Task 7 is stalled', set()),
+    # --- rejections the blocked family must INHERIT from the union family ---
+    # (amendment, reviewer_comprehensive correctness-over-selection finding,
+    # task 3037).  Every one of these is a prepositional-complement
+    # enumeration: the DEPENDENCIES / REVIEWS / MERGES / STATUSES are what the
+    # copula predicates, so no enumerated id is its subject and no id is
+    # asserted blocked.  The union family already refuses all of them
+    # (measured -> set() at HEAD=fe8e74c12c); the expectations below are
+    # set() because the blocked family must refuse them for the SAME reason,
+    # not because 'blocked' fails to appear.
+    #
+    # Do NOT 'fix' these expectations to {1030} / {1031}.  That is what the
+    # branch tip actually returned, and it was the bug: the blocked family's
+    # own plural_enum needs the literal 'blocked' marker, so it never built
+    # the enumeration span the union family rejected, and the trailing
+    # 'in blocked status' let its individual arm claim the repeated 'task N'
+    # reference inside a span already established to be a preposition's
+    # complement.  See _extract_ids's rejected_spans threading.
+    ('Dependencies for tasks 1020 and task 1030 are pending in blocked status', set()),
+    ('Reviews of tasks 1020 and task 1030 are pending in blocked status', set()),
+    ('The merges of tasks 1020 and task 1030 are pending in blocked status', set()),
+    ('Statuses of tasks 1020 and task 1030 are pending in blocked status', set()),
+    (
+        'Dependencies for tasks 1020, task 1030 and task 1031 are pending in blocked status',
+        set(),
+    ),
+)
+
+# The subset-property corpus, deliberately DISJOINT from
+# _BLOCKED_EXTRACTION_CASES above and GENERATED from axes rather than
+# hand-picked instances (amendment, reviewer_comprehensive
+# correctness-over-selection finding, task 3037).
+#
+# Why generated. The subset property USED to parametrize over
+# _BLOCKED_EXTRACTION_CASES — the same hand-picked table the positive tests
+# are drawn from — so it could only ever re-confirm cases someone had already
+# thought of, and it passed for the whole life of the over-selection bug. A
+# property that ranges over the same inputs as the examples is not a property
+# test; it is the examples again.
+#
+# The four axes are chosen to be exactly where the defect lives:
+#   heads   — one prepositional-complement subject per distinct
+#             _ENUM_PREP_WORDS preposition class, since the union family's
+#             rejection is what the blocked family must inherit;
+#   enums   — with and without the REPEATED 'task N' reference token, which
+#             is what let an anchored arm reach into a rejected span, and
+#             with and without a leading determiner, which defeats a
+#             fixed-width lookbehind;
+#   markers — every union marker class including 'blocked' itself, so the
+#             cross-family cases and the same-family control are both
+#             covered;
+#   tails   — the trailing fragments that give the blocked family a literal
+#             'blocked' token the union enumeration span does not contain,
+#             which is the precondition for the two families disagreeing.
+#
+# MEASURED: 800 facts, 64 subset violations at HEAD=fe8e74c12c (RED), 0 once
+# _extract_ids threads the union family's rejected spans into the blocked
+# family.
+_SUBSET_PROPERTY_CORPUS: tuple[str, ...] = tuple(
+    f'{head} {enum} are {marker} {tail}'
+    for head in (
+        'Dependencies for', 'Reviews of', 'The merges of', 'Statuses of',
+        'Notes on', 'Comments about', 'Work by', 'Blockers between',
+    )
+    for enum in (
+        'tasks 1020 and task 1030',
+        'tasks 1020, task 1030 and task 1031',
+        'the tasks 1020 and 1030',
+        'tasks 1020 and 1030',
+    )
+    for marker in ('pending', 'active', 'in progress', 'blocked', 'stalled')
+    for tail in (
+        '', 'in blocked status', '; task 1040 is blocked', 'and blocked',
+        'blocked tasks: 55, 66',
+    )
 )
 
 
@@ -1639,19 +1714,41 @@ class TestExtractBlockedAssertionTaskIds:
         """Every case above, driven from the shared table."""
         assert extract_blocked_assertion_task_ids(fact) == expected
 
-    @pytest.mark.parametrize(('fact', '_expected'), _BLOCKED_EXTRACTION_CASES)
-    def test_blocked_ids_are_always_a_subset_of_union_ids(self, fact, _expected):
-        """extract_blocked_assertion_task_ids(f) <= extract_snapshot_edge_task_ids(f).
+    @pytest.mark.parametrize('fact', _SUBSET_PROPERTY_CORPUS)
+    def test_blocked_ids_are_always_a_subset_of_union_ids(self, fact):
+        """``blocked_ids <= all_ids`` over a GENERATED corpus, not the example table.
 
-        True by construction — the blocked family is the union family with
-        its marker alternation narrowed to 'blocked' — and pinned here so a
-        future edit that lets the blocked family reach an id the union family
-        does not fails immediately. A blocked id outside the union set would
-        mean the sweep could select an edge on an id it never put into its
-        get_statuses census, i.e. cross-reference against a status it never
-        looked up.
+        A blocked id outside the union set means the sweep can select an edge
+        on an id it never put into its get_statuses census — i.e.
+        cross-reference an assertion against a status it never looked up —
+        and then permanently retire that edge. Over-selection is the
+        direction this module's docstring calls unrecoverable, so this
+        property is the one that must hold for inputs nobody enumerated.
+
+        Driven from _SUBSET_PROPERTY_CORPUS rather than
+        _BLOCKED_EXTRACTION_CASES on purpose (amendment,
+        reviewer_comprehensive correctness-over-selection finding, task
+        3037). The previous version parametrized over the same hand-picked
+        table as the positive tests, which is exactly why it could not catch
+        the prepositional-complement over-selection: the offending shapes
+        were not in the table, so the 'property' only ever re-checked known
+        examples. See that constant for the axes and the measured numbers.
+
+        Both sets are read off ONE
+        extract_snapshot_edge_task_ids_by_marker_class call rather than two
+        public-accessor calls, so the property is checked against the single
+        extraction implementation the sweep actually uses — two calls could
+        agree while the one-pass path the sweep takes disagrees.
         """
-        assert extract_blocked_assertion_task_ids(fact) <= extract_snapshot_edge_task_ids(fact)
+        result = extract_snapshot_edge_task_ids_by_marker_class(fact)
+
+        assert result.blocked_ids <= result.all_ids, (
+            f'blocked_ids escaped all_ids for {fact!r}: '
+            f'blocked_ids={result.blocked_ids!r} all_ids={result.all_ids!r}. '
+            f'The extra ids {result.blocked_ids - result.all_ids!r} would be '
+            f'cross-referenced against a get_statuses census that never '
+            f'contained them, and the edge retired on the result.'
+        )
 
 # --------------------------------------------------------------------------- #
 # extract_snapshot_edge_task_ids — catastrophic-backtracking regression
@@ -2667,6 +2764,69 @@ class TestSweepStaleStatusSnapshotEdgesCore:
             'genitive shape, and ALL THREE of 1020/1030/1031 from the pairwise shape '
             'rather than only the first, which is the precise gap the finding reports'
         )
+
+    @pytest.mark.asyncio
+    async def test_prepositional_complement_enumeration_is_never_retired(self):
+        """A prepositional-complement enumeration must survive the sweep whole —
+        no invalidation, no superseding write. (amendment,
+        reviewer_comprehensive correctness-over-selection finding, task 3037)
+
+        'Dependencies for tasks 1020 and task 1030 are pending in blocked
+        status' asserts that the DEPENDENCIES are pending, in blocked status.
+        It asserts nothing whatever about the STATUS of task 1020 or task
+        1030, so no rule may retire it. The terminal rule already declines
+        (the union extractor refuses the whole fact -> set(), so the edge is
+        never even a candidate); the blocked rule at the branch tip did not,
+        because its own family never built the enumeration span the union
+        family rejected and its individual arm then claimed the repeated
+        'task 1030' reference inside it.
+
+        This is the leg that makes the extractor finding a DATA-LOSS bug
+        rather than a curiosity, which is why it is pinned at the sweep layer
+        and not only at the extractor. MEASURED at HEAD=fe8e74c12c, this
+        exact input produced stats {'scanned': 1, 'candidate_edges': 1,
+        'invalidated': 1, 'superseded': 1}: update_edge(invalid_at=...)
+        PERMANENTLY retired a TRUE edge, and add_memory additionally wrote
+        'As of <date>, task 1030 has status pending.' — attributing a status
+        to a subject the fact never made a claim about. Under-selection
+        self-heals on the next cycle; this does not.
+        """
+        memory_service = _make_memory_service()
+        taskmaster = _make_taskmaster()
+
+        true_edge = {
+            'uuid': 'edge-prepositional-complement',
+            'fact': 'Dependencies for tasks 1020 and task 1030 are pending in blocked status',
+            'name': '',
+        }
+        memory_service.graphiti.get_all_valid_edges = AsyncMock(
+            return_value={'entity-a': [true_edge]},
+        )
+        # Both ids POSITIVELY KNOWN and != 'blocked', so the blocked rule
+        # fires the moment the extractor hands it either of them: the census
+        # is deliberately not the thing standing between this edge and
+        # retirement.
+        taskmaster.get_statuses = AsyncMock(
+            return_value={'1020': 'pending', '1030': 'pending'},
+        )
+
+        stats = await sweep_stale_status_snapshot_edges(
+            memory_service, taskmaster, 'test_project', '/tmp/reify',
+            run_id='run-3037-overselection', now=datetime(2026, 8, 22, 12, 0, tzinfo=UTC),
+        )
+
+        assert stats == {
+            'scanned': 1, 'candidate_edges': 0,
+            'invalidated': 0, 'errors': 0,
+            'superseded': 0, 'supersede_errors': 0,
+            'supersede_skipped': 0,
+        }, (
+            f'Expected the prepositional-complement enumeration scanned but never '
+            f'selected — it asserts nothing about task 1020 or 1030 — got stats={stats!r}'
+        )
+
+        memory_service.update_edge.assert_not_awaited()
+        memory_service.add_memory.assert_not_awaited()
 
 
 class TestSweepStaleStatusSnapshotEdgesBlockedRuleAndCounters:
