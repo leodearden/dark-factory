@@ -12068,6 +12068,77 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             return None
         return ProbePlacement(depth=d, base=base)
 
+    async def _deep_chain_placement(self, item: SpeculativeItem) -> ChainResult | None:
+        """Decide whether THIS second-slot dispatch should verify a deep CHAIN
+        tip instead of the item's own adjacent merge commit (task 3185, PRD γ).
+
+        The deep twin of :meth:`_probe_verify_placement`, and deliberately the
+        same shape: a slot-1 guard, a hoisted zero-cost kill-switch guard, then
+        the pure policy.  The one structural difference is what a firing
+        placement MEANS.  A :class:`ProbePlacement` only RELABELS the dispatch's
+        depth/base attribution — the verify still exercises *item*'s own tree
+        (its "KNOWN PHASE-1 LIMITATION").  A :class:`ChainResult` genuinely
+        REDIRECTS it: :meth:`_run_inflight_verify` verifies ``chain.tip`` inside
+        ``chain.lane``, a cumulative tree containing *item* plus every chained
+        successor.  That redirect is the capability γ adds.
+
+        Returns ``None`` to mean **"take today's adjacent-verify path,
+        unchanged"** — and on every ``None`` path here that is byte-identical
+        to pre-γ dispatch, not merely equivalent in effect, because no chain
+        code has run.
+
+        The guards, in order, and why that order:
+
+          1. ``not item.speculative`` -> ``None``.  **Slot 1 is never chained.**
+             The head item is merged onto REAL main and is the pipeline's trust
+             anchor: its verdict is the one :meth:`_finalize_inflight` lands a
+             CAS advance on.  Chaining it would make that anchor a verdict about
+             a cumulative tree instead of about the item being landed.
+          2. ``cap = item.request.config.merge_deep.chain_cap; cap <= 0`` ->
+             ``None``.  α's shipped kill switch, hoisted ABOVE the queue scan
+             for the same reason :meth:`_probe_verify_placement` hoists its
+             ``probe_fraction`` guard: under stock config every speculative
+             dispatch takes this branch, so the default path must not pay for
+             an O(n) walk whose result the policy would only discard.  The cost
+             disappears, not just the output.  Read LIVE off the dispatching
+             item's config (never cached at construction), so an operator's
+             green-tier ``reload_config`` — which mutates the held
+             :class:`~orchestrator.config.MergeDeepConfig` in place — takes
+             effect on the very next dispatch, in both directions.
+          3. ``d = self._deep_target_depth(cap, 1 + len(self.chain_snapshot()))``
+             -> ``None`` -> ``None``.  Delegates the
+             ``min(queue_len, cap, halving_state)`` invariant to
+             :func:`select_chain_depth` rather than re-deriving it, so the
+             formula lives in exactly one place.  ``queue_len`` counts the
+             DISPATCHING item as chain item #1 (hence the ``1 +``), matching
+             the 1-indexed unit both policy functions document.  A ``None``
+             here is either the ``queue >= 2`` gate or the d=1 floor.
+
+        Reads, never mutates: :meth:`chain_snapshot` is a pure reader (it must
+        never pop, transition, or resolve), and this method touches neither
+        ``_verifier_queue`` nor ``_inflight`` nor the halving state —
+        :meth:`_note_chain_outcome` is the sole writer of the latter, and it is
+        driven by the tip VERDICT, not by a dispatch decision.
+
+        Returns:
+            A non-empty :class:`ChainResult` that HOLDS its scratch lane (the
+            caller must release it exactly once — see
+            :meth:`_run_inflight_verify`'s chain arm), or ``None``.
+        """
+        if not item.speculative:
+            return None
+        cap = item.request.config.merge_deep.chain_cap
+        if cap <= 0:
+            return None
+        queue_len = 1 + len(self.chain_snapshot())
+        d = self._deep_target_depth(cap, queue_len)
+        if d is None:
+            return None
+        # step-14 (task 3185) lands the bounded build_chain call here. Until
+        # then the gate is complete but inert: every path returns None, so
+        # dispatch is unchanged even with the cap turned on.
+        return None
+
     # ── MQ-invariants iota (task 1994): resource-conservation audits ────────
     #
     # Two pure, fail-safe audit methods mirroring the two_layer_invariants
@@ -19386,6 +19457,19 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # blanket `depth + 1` would over-count precisely that case (a
         # non-speculative re-merge dispatched against a non-empty frontier).
         chain_items = (self._verify_frontier_depth() + 1) if item.speculative else 1
+        # task 3185 (PRD γ): the DEEP gate, consulted at the same seam as the
+        # probe above so both second-slot policies live in one place. Unlike
+        # the probe -- which only relabels this dispatch's depth/base -- a
+        # firing chain REDIRECTS the verify onto a cumulative tip.
+        #
+        # Inert today: _deep_chain_placement returns None on every path until
+        # step-14 lands the bounded build, so this is one guard check and
+        # nothing else. ORDERING HAZARD for whoever lands that build: a
+        # non-empty ChainResult HOLDS a scratch lane whose release is the
+        # CALLER's obligation (ChainResult docstring, "Lane ownership"), so
+        # the build must not land ahead of step-16's consumer here -- a
+        # discarded result would leak the lane on every deep dispatch.
+        await self._deep_chain_placement(item)
         verify_task: asyncio.Task = asyncio.ensure_future(  # type: ignore[type-arg]
             self._run_inflight_verify(
                 item, lease, depth=depth, probe_base=probe_base,
