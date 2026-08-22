@@ -129,9 +129,14 @@ test_command: "uv run --project shared pytest tests/scripts/ --tb=short -q --tim
 #     = mc`), not by command, so a SCOPED verify whose touched files span both
 #     scripts/ and tests/scripts/ also runs it twice.
 #
-# That cuts against this file's own premise — the 600s budget below is sized
-# for a ~39% run-to-run spread attributed to host oversubscription, and
+# That cuts against this file's own premise — the 1000s budget below is sized
+# for a 2.91x run-to-run spread attributed to host oversubscription, and
 # duplicate execution is itself a contributor to that oversubscription.
+#   CORRECTED IN PLACE (task 4320): this paragraph said "the 600s budget below
+#   ... a ~39% run-to-run spread". Both figures moved when the suite was
+#   re-measured — the budget to 1000s and the measured band to 2.91x
+#   (136.37s -> 397.47s on byte-identical input) — and the point they support is
+#   unchanged and now stronger, not weaker.
 #
 # OWNED BY TASK 3383, not by this file and not by task 3460. It is documented
 # rather than fixed because the real fix is a dedupe-by-command guard in
@@ -314,40 +319,107 @@ type_check_command: "uv run --project shared pyright tests/scripts/"
 #                                    on a 32-core host
 #     185.29s wall / 180.47s pytest  task 3703 pre-1 run B, same base, same
 #                                    counts, rc=0; loadavg 61.43 at start
+#     353.63s, 374.40s               esc-4240-1 / esc-4240-3, recorded on the
+#                                    task 4240 branch — a tree carrying that
+#                                    task's extra module. Both derive the SAME
+#                                    700s floor as the worst below, so nothing
+#                                    here hinges on which of the three is
+#                                    largest
+#     136.37s wall / 132.95s pytest  task 4320 architect sweep run 1, branch
+#                                    task/4320 at base 5c9d4817fb; rc=0, 1256
+#                                    passed / 2 skipped / 6 deselected; loadavg
+#                                    263.26 -> 51.45 on a 32-core host
+#     153.57s wall / 149.97s pytest  architect run 2, same base/counts, rc=0;
+#                                    loadavg 51.45 -> 69.83
+#     283.00s wall / 270.40s pytest  architect run 3, same base/counts, rc=0;
+#                                    loadavg 69.83 -> 119.24
+#     397.47s wall                   architect run 4, same base/counts, rc=0;
+#                                    loadavg 119.24 -> 187.04.  <-- WORST ON
+#                                    RECORD; this is the figure sized against
+#     323.88s wall                   architect run 5, same base/counts, rc=0;
+#                                    loadavg 187.04 -> 130.22
+#     234.34s wall / 230.67s pytest  task 4320 pre-1 run 1, same base; rc=0,
+#                                    1256 passed / 2 skipped / 6 deselected;
+#                                    loadavg 97.08 -> 154.41
+#     215.70s wall / 212.52s pytest  pre-1 run 2, same base/counts, rc=0;
+#                                    loadavg 154.41 -> 103.93
+#     172.19s wall / 167.41s pytest  pre-1 run 3, same base/counts, rc=0;
+#                                    loadavg 103.93 -> 80.03
+#     195.36s wall / 188.50s pytest  pre-1 run 4, same base/counts, rc=0;
+#                                    loadavg 80.03 -> 85.81
+#     148.20s wall / 145.77s pytest  pre-1 run 5, same base/counts, rc=0;
+#                                    loadavg 85.81 -> 103.79
 #
 #   FALLBACK-PATH runs — NOT this command; the fleet chain's legs narrowed to a
 #   tests/scripts diff. Kept for history, never for sizing:
 #     105-127s                       four runs (task 3062, esc-3062-3)
 #
-# Size against 233.50s — the largest figure across every VERBATIM run, and
-# measured on the same command this file declares. 600s is ~2.6x it. The
-# 233.50s / 167.73s spread (~39%) between two runs of an identical command on
-# one host is itself the reason for that much headroom: this box is
-# oversubscribed by concurrent orchestrator work, exactly as the same day
-# esc-3062-3 was logged showed the orchestrator segment swing 1157.62s ->
-# 1366.23s (~18%). pre-1's two fresh runs (146.93s and 185.29s) both came in
-# BELOW 233.50s at loadavg 51-61, which is why the sizing rule is the worst RUN
-# and never the mean or the freshest: a fresh-only figure would have LOWERED
-# the floor. Still tight enough to surface a genuine hang in minutes rather
-# than in the ~50 the whole-fleet ceiling permits.
+# SIZING (task 4320). Size against 397.47s — the largest figure across every
+# VERBATIM run above, measured on the command this file declares. 1000s is
+# 2.52x it, which is this family's own convention for the multiple (this module
+# sat at 600/233.50 = 2.57x until today; scripts/ sits at 2400/930.59 = 2.58x),
+# and it clears the 700s floor the owning guard DERIVES from the same figure
+# (2 * 397.47 -> 794.94 -> 700) by 1.43x — scripts/ sits at 1.33x above its own.
+# Sizing at exactly 700 would leave 1.76x headroom over the worst run, THINNER
+# than the 2.91x band measured below on byte-identical input, i.e. it would
+# re-create the false-infra_timeout-on-the-green-path failure this per-module
+# budget exists to stop. Still 3.6x under the repo-root 3600s warm ceiling, and
+# still tight enough to surface a genuine hang in minutes rather than in the ~50
+# the whole-fleet ceiling permits.
 #
-# SUITE GROWTH, measured in pre-1 and recorded so nobody reads 233.50s as a
-# CURRENT figure: at 9d6af5289f this suite collected 369 tests; it now collects
-# 1072 (1072 passed / 2 skipped / 6 deselected). The 233.50s worst run is
-# therefore a LOWER BOUND on today's contended worst case. Do NOT scale it by
-# the test-count ratio — RE-MEASURE under load before tightening this budget
-# against it.
+# THE BAND IS 2.91x ON IDENTICAL INPUT, which is what makes "the worst RUN,
+# never the mean and never the freshest" operative rather than stylistic: the
+# ten task-4320 runs above span 136.37s -> 397.47s for a BYTE-IDENTICAL command
+# on a BYTE-IDENTICAL tree within one session. All five of task 4320's own pre-1
+# runs came in BELOW 397.47s — the freshest at 148.20s — so a freshest-only rule
+# would have LOWERED this floor from 700 back to 400 and left the then-declared
+# 600s budget passing. The inconvenient runs are recorded for exactly that
+# reason.
+#
+# LOADAVG DOES NOT PREDICT WALL CLOCK HERE, so the annotations above are
+# PROVENANCE and not a normalisation knob. The FASTEST run of the architect
+# sweep started at the HIGHEST load of its five (136.37s at 263.26) and the
+# SLOWEST at 119.24 (397.47s); in the pre-1 sweep run 3 started at a higher load
+# than run 4 (103.93 vs 80.03) and finished FASTER (172.19s vs 195.36s). A
+# figure annotated "recorded at loadavg N" therefore CANNOT be scaled back to a
+# clean-host number — RE-MEASURE instead.
+#
+# CORRECTED IN PLACE (task 4320), never silently swapped. This block used to say
+# "Size against 233.50s ... 600s is ~2.6x it", and under a SUITE GROWTH heading
+# that 233.50s "is therefore a LOWER BOUND on today's contended worst case ...
+# RE-MEASURE under load before tightening this budget against it". Both halves
+# are now false: the suite HAS been re-measured under load (the ten VERBATIM
+# runs above, at 1256 passed / 2 skipped / 6 deselected against the 369 of the
+# 233.50s run), and what survived is 397.47s, not 233.50s. Corrected rather than
+# deleted, because that caveat is why the re-measurement happened; corrected
+# rather than left standing, because an authoritative-reading comment a later
+# change has falsified is the defect this whole family exists to remove.
+#
+# PROVENANCE CAVEAT RETIRED (task 4320): the 353.63s / 374.40s figures were
+# recorded on the task 4240 branch and could be argued to be inflated by that
+# task's extra module. 397.47s was measured on a tree WITHOUT it, at ~57 FEWER
+# collected tests, and still exceeds both — so the caveat is settled by
+# construction rather than by subtraction, and no figure above needs discounting.
 #
 # Every figure is recorded rather than only the convenient one: task 3350
 # exists because a single unrecorded estimate ("Full warm verify here is
 # ~2 min") was left standing in the root yaml until it was off by an order of
 # magnitude.
 #
-# RAISE-TOGETHER RULE. If this suite's measured cost grows toward 600s,
-# re-measure and raise BOTH this value and MEASURED_SUITE_WORST_SECS in
-# tests/scripts/test_tests_scripts_module_config.py, from which
-# MIN_MODULE_BUDGET_SECS follows BY DERIVATION (_min_budget: ~2x the worst run,
-# floored to the nearest 100s) — never quietly widen one without the other.
+# RAISE-TOGETHER RULE. If this suite's measured cost grows toward the value
+# declared below, re-measure and raise BOTH that value and
+# MEASURED_SUITE_WORST_SECS in tests/scripts/test_tests_scripts_module_config.py,
+# from which MIN_MODULE_BUDGET_SECS follows BY DERIVATION (_min_budget: ~2x the
+# worst run, floored to the nearest 100s) — never quietly widen one without the
+# other.
+#   IT HAS NOW FIRED ONCE, and this records how it was discharged (task 4320).
+#   The re-measurement moved MEASURED_SUITE_WORST_SECS 233.50 -> 397.47, the
+#   derived floor followed 400 -> 700 with no hand edit, and the then-declared
+#   600 went RED on the owning guard's `budget >= MIN_MODULE_BUDGET_SECS`
+#   assertion — exactly one failure, which is the rule working rather than a
+#   regression. The declared budget was raised 600 -> 1000 in the SAME change,
+#   which is what "never one without the other" requires of a reader who trips
+#   this trigger next.
 #   CORRECTED IN PLACE (task 3703): this rule used to say "raise BOTH this
 #   value and the >= 300s floor asserted in test_tests_scripts_module_config
 #   .py". There is no hand-set floor to raise any more — that guard now derives
@@ -370,7 +442,7 @@ type_check_command: "uv run --project shared pyright tests/scripts/"
 # config.verify_cold_command_timeout_secs (5400) — per the
 # verify._resolve_verify_timeout cascade, cited by SYMBOL, not file:line, since
 # a prior numeric pin here had already rotted onto unrelated code within a week
-# of being written — NOT to the 600 below, which is the warm budget only. Under
+# of being written — NOT to the 1000 below, which is the warm budget only. Under
 # a merge-role cold verify (this file's commands run VERBATIM under
 # merge_verify_breadth: "full", noted above), the cascade instead consults
 # config.merge_verify_cold_command_timeout_secs (7200) FIRST: that value ships
@@ -380,4 +452,4 @@ type_check_command: "uv run --project shared pyright tests/scripts/"
 # test_tests_scripts_module_config.py::
 # test_tests_scripts_is_a_registered_module_config already records for
 # lock_depth.
-verify_command_timeout_secs: 600
+verify_command_timeout_secs: 1000

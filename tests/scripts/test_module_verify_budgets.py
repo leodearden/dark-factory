@@ -475,19 +475,26 @@ MEASURED_BY_SIBLING_GUARD: dict[str, str] = {
         'uses.'
     ),
     'tests/scripts': (
-        'MEASURED worst run 233.50s recorded in tests/scripts/orchestrator.yaml, '
-        'whose provenance block also carries that module\'s later runs; the '
+        'The measured worst run is recorded in tests/scripts/orchestrator.yaml, '
+        "whose PER-MODULE VERIFY BUDGET block carries every run behind it; the "
         'owning guard is tests/scripts/test_tests_scripts_module_config.py, '
-        'which pins MEASURED_SUITE_WORST_SECS = 233.50 with '
-        'MIN_MODULE_BUDGET_SECS DERIVED from it by the same expression '
-        '_min_budget uses. HISTORY, kept because it is why this family derives '
-        'rather than hand-sets: that guard USED to pin 127.0 with a hand-set '
-        '300s floor (task 3350), so the yaml\'s 233.50s figure was gated by '
-        'nothing and only a reviewer caught it; task 3703 refreshed the '
-        'constant and made the floor derived, so it is now gated. Excluded '
-        'here to avoid creating a SECOND copy of the measurement — a copy that '
-        'would have to be raised in lockstep, which is the drift this dict '
-        'exists to avoid.'
+        'which pins MEASURED_SUITE_WORST_SECS with MIN_MODULE_BUDGET_SECS '
+        'DERIVED from it by the same expression _min_budget uses. NO FIGURE IS '
+        'QUOTED HERE, corrected in place by task 4320: this entry used to read '
+        '"MEASURED worst run 233.50s ... which pins MEASURED_SUITE_WORST_SECS = '
+        '233.50", and both numbers went stale the moment task 4320 re-measured '
+        'the suite and moved that constant to a larger figure. A quoted number '
+        'is a THIRD copy that has to be raised in lockstep with the yaml and '
+        'the owning guard — the exact drift this dict exists to avoid, '
+        'reintroduced inside the dict itself. What survives is the POINTER, '
+        'which cannot go stale that way and which '
+        'test_the_budget_family_derives_every_floor_from_one_canonical_expression '
+        'now checks actually resolves to a published pair. HISTORY, kept '
+        'because it is why this family derives rather than hand-sets: that '
+        'guard USED to pin 127.0 with a hand-set 300s floor (task 3350), so '
+        "the yaml's own worst-run figure was gated by nothing and only a "
+        'reviewer caught it; task 3703 refreshed the constant and made the '
+        'floor derived, so it is now gated.'
     ),
 }
 
