@@ -210,6 +210,25 @@ def _make_item(
     )
 
 
+def _ephemeral_merge_wt(git_ops: GitOps, tag: str) -> Path:
+    """Create (and return) a stand-in ephemeral ``_merge-<tag>`` worktree dir.
+
+    Real dispatch hands `RealMergeItem.merge_wt` an ephemeral `_merge-<uuid>`
+    minted by `merge_to_main`.  Tests that reach code which DISPOSES of that
+    worktree must not pass the repo root in its place: γ's chain arm calls
+    `_cleanup_owned_merge_worktree(item.merge_wt)`, whose rmtree fallback would
+    then delete the fixture repo out from under the test (and every later git
+    call in it) — a destructive pass, not a real one.
+
+    Deliberately NOT created on disk: materialising ``worktree_base`` by hand
+    makes ``acquire_spec_lane``'s create-once pool-storage check see a
+    directory it did not provision and cold-fall-back, silently turning every
+    warm ``_spec-`` lane assertion in this module vacuous.  A bare path is
+    enough — disposal of a missing worktree is a no-op either way.
+    """
+    return git_ops.worktree_base / f'_merge-{tag}'
+
+
 def _make_worker(git_ops: GitOps) -> SpeculativeMergeWorker:
     """Build a bare SpeculativeMergeWorker for unit tests (no harness wiring)."""
     return SpeculativeMergeWorker(git_ops, asyncio.Queue())
@@ -1202,7 +1221,10 @@ class TestRunInflightVerifyChainRedirect:
             _make_req(tid, tid, config, git_repo) for tid in ('102', '103')
         )
         worker._frozen_inflight_entries = lambda: [object()] * frontier  # type: ignore[assignment,method-assign]
-        item = _make_item(_make_req('101', '101', config, git_repo), head, git_repo)
+        item = _make_item(
+            _make_req('101', '101', config, git_repo), head,
+            _ephemeral_merge_wt(git_ops, 'redirect'),
+        )
         chain = await worker._deep_chain_placement(item)
         assert chain is not None and len(chain.links) == 2, 'fixture must build a chain'
         return git_ops, worker, item, chain, head
@@ -1362,8 +1384,7 @@ class TestRunInflightVerifyChainRedirect:
         the I6 worktree-ledger audit once it ages past the grace window.
         """
         git_ops, worker, item, chain, _head = await self._fixture(git_repo)
-        ephemeral = git_ops.worktree_base / '_merge-deadbeef'
-        ephemeral.mkdir(parents=True, exist_ok=True)
+        ephemeral = _ephemeral_merge_wt(git_ops, 'deadbeef')
         item.merge_wt = ephemeral
         worker._register_owned_merge_worktree(ephemeral)
         _spy_post_merge_verify(monkeypatch)
@@ -1412,3 +1433,171 @@ class TestRunInflightVerifyChainRedirect:
             'warmth) to _finalize_inflight rather than disposing of it here'
         )
         await worker._release_or_cleanup(res.merge_wt, spec_warm=res.spec_warm)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# step-17: RED — the NON-ADOPTION invariant (γ's soundness fence).
+#
+# THE rule this whole task is fenced by: a tip verdict proves the CUMULATIVE
+# tree, never the dispatching item's own SUBSET tree. Letting it reach
+# _finalize_inflight's CAS advance would land I1 from a tree nothing ever
+# verified — the new false-green path the PRD forbids ("Landing safety is
+# structural... There is no new false-green path").
+#
+# So BOTH arms — tip pass and tip fail — requeue. This is also the exact seam
+# δ (task 3186) replaces: it swaps the PASS arm for the in-order CAS walk over
+# `chain.links`, and that is the ONLY place adoption may be introduced.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(180)
+class TestDeepTipVerifyNeverAdopts:
+    """Nothing lands via the chain in γ — on either arm."""
+
+    async def _fixture(self, git_repo: Path, monkeypatch, *, passed: bool):
+        """Drive one deep tip verify to *passed* and return the whole scene.
+
+        Returns ``(git_ops, worker, item, chain, res, store, queued_reqs)``.
+        ``advance_main`` is spied (not stubbed to fail) so a violation shows up
+        as a recorded call rather than as an unrelated exception.
+        """
+        git_ops = _make_git_ops(git_repo, size=2)
+        config = _make_config(git_repo, chain_cap=6)
+        await _create_branch_editing(git_repo, 'task/101', 'a.txt', 'edit-101\n')
+        for tid, fn in (('102', 'b.txt'), ('103', 'c.txt')):
+            await _create_branch_editing(git_repo, f'task/{tid}', fn, f'edit-{tid}\n')
+        head = await _merge_commit_off_main(git_repo, 'task/101', '101')
+        worker = _make_worker(git_ops)
+        worker._lane_buffers['normal'].extend(
+            _make_req(tid, tid, config, git_repo) for tid in ('102', '103')
+        )
+        store = _CapturingEventStore()
+        worker._event_store = store
+        item = _make_item(
+            _make_req('101', '101', config, git_repo), head,
+            _ephemeral_merge_wt(git_ops, 'nonadopt'),
+        )
+        chain = await worker._deep_chain_placement(item)
+        assert chain is not None and len(chain.links) == 2
+
+        advances: list = []
+        monkeypatch.setattr(
+            git_ops, 'advance_main',
+            lambda *a, **k: advances.append((a, k)) or asyncio.sleep(0),
+        )
+        _spy_post_merge_verify(
+            monkeypatch, outcome=None if passed else _fail_verify_result(),
+        )
+        queued_reqs = list(worker._lane_buffers['normal'])
+        main_before = await _rev_parse(git_repo, 'main')
+
+        res = await worker._run_inflight_verify(item, _local_lease(), chain=chain)
+
+        assert advances == [], 'a tip verdict must never reach advance_main'
+        assert await _rev_parse(git_repo, 'main') == main_before
+        return git_ops, worker, item, chain, res, store, queued_reqs
+
+    @pytest.mark.parametrize('passed', [True, False], ids=['tip-pass', 'tip-fail'])
+    async def test_requeues_instead_of_resolving_on_both_arms(
+        self, git_repo: Path, monkeypatch, passed: bool,
+    ):
+        """REQUEUED sentinel + the request genuinely back on ``_queue``.
+
+        A requeue is a DEFER, not a resolution: the Future stays PENDING and
+        the waiter receives the outcome of the RE-dispatch.  The three effects
+        must all fire, which is why this goes through ``_requeue_request`` (the
+        chokepoint enforced by
+        test_merge_queue_lifecycle_registry.py::TestRequeueRecipeHasASingleChokepoint)
+        rather than a bare ``_queue.put_nowait``.
+        """
+        from orchestrator.merge_types import InflightStatus
+
+        _git_ops, worker, item, _chain, res, _store, _q = await self._fixture(
+            git_repo, monkeypatch, passed=passed,
+        )
+
+        assert res.status == InflightStatus.REQUEUED
+        assert res.outcome is None, 'a defer renders no MergeOutcome at all'
+        assert res.merge_wt is None, 'the chain arm disposes its own worktrees'
+        assert not item.request.result.done(), 'a requeue is a defer, not a resolution'
+        assert worker._queue.qsize() == 1
+        assert worker._queue.get_nowait() is item.request
+
+    @pytest.mark.parametrize('passed', [True, False], ids=['tip-pass', 'tip-fail'])
+    async def test_emits_no_merge_attempt_and_no_blocked_outcome(
+        self, git_repo: Path, monkeypatch, passed: bool,
+    ):
+        """Deep fails never feed workflow.py's ``consecutive_merge_thrash`` ladder.
+
+        That ladder means "the SAME mechanical merge failure repeated", and it
+        is fed by `merge_attempt` events and blocked `MergeOutcome`s.  A deep
+        tip fail is neither — it is a defer — so two consecutive ones must
+        leave the ladder's inputs completely untouched.  This is the same
+        false-positive-escalation class ``build_chain``'s own decision-4
+        purity comment guards against upstream.
+        """
+        _git_ops, _worker, item, _chain, res, store, _q = await self._fixture(
+            git_repo, monkeypatch, passed=passed,
+        )
+
+        assert store.events_of(EventType.merge_attempt) == []
+        assert res.outcome is None
+        assert not item.request.result.done()
+
+    async def test_tip_fail_halves_the_state_and_leaves_the_queue_intact(
+        self, git_repo: Path, monkeypatch,
+    ):
+        """PRD boundary row "Tip fail leaves queue intact": zero landings.
+
+        The chained items were merged only inside the scratch lane, so after a
+        red tip they are still buffered, in the same order, with no outcome and
+        no conflict rendered for any of them — build_chain's decision-4 purity
+        surviving all the way through its first real caller.
+        """
+        _git_ops, worker, _item, _chain, _res, store, queued = await self._fixture(
+            git_repo, monkeypatch, passed=False,
+        )
+
+        assert worker._chain_halving_state == 1, '3 built items -> max(1, 3 // 2)'
+        assert list(worker._lane_buffers['normal']) == queued, 'same items, same order'
+        assert all(not r.result.done() for r in queued)
+        assert store.events_of(EventType.merge_attempt) == []
+
+    async def test_tip_pass_resets_the_halving_state(
+        self, git_repo: Path, monkeypatch,
+    ):
+        """A green tip resets to the ``None`` sentinel — but still lands nothing."""
+        _git_ops, worker, _item, _chain, _res, _store, queued = await self._fixture(
+            git_repo, monkeypatch, passed=True,
+        )
+
+        assert worker._chain_halving_state is None
+        assert list(worker._lane_buffers['normal']) == queued
+
+    @pytest.mark.parametrize('passed', [True, False], ids=['tip-pass', 'tip-fail'])
+    async def test_finalize_disposes_the_entry_without_a_phantom_head(
+        self, git_repo: Path, monkeypatch, passed: bool,
+    ):
+        """``_finalize_inflight`` returns False and strands no finalize head.
+
+        The REQUEUED sentinel is checked ABOVE the VERIFYING -> FINALIZING hop
+        precisely so a requeued item is never recorded as finalizing; a
+        phantom head there wedges the whole queue behind an entry that will
+        never complete.
+        """
+        from orchestrator.merge_types import InflightEntry
+
+        _git_ops, worker, item, chain, res, _store, _q = await self._fixture(
+            git_repo, monkeypatch, passed=passed,
+        )
+        done: asyncio.Future = asyncio.get_running_loop().create_future()
+        done.set_result(res)
+        entry = InflightEntry(
+            item=item, lease=_local_lease(), verify_task=done,  # type: ignore[arg-type]
+            merge_wt=item.merge_wt, was_speculative=True, chain=chain,
+        )
+
+        assert await worker._finalize_inflight(entry) is False
+        assert worker._finalizing_head_entry() is None
+        assert not item.request.result.done()
