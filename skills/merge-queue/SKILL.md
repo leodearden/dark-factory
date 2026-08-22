@@ -202,7 +202,7 @@ The outcome arrives from either the submit call (terminal at submit time) or the
 2. Determine how — and whether — to poll it per [Follow the superseded successor](#follow-the-superseded-successor) above; the handle depends on whether the value is an `mr-*` request id or a `coalesce-*` train id.
 3. When the successor reaches a terminal state, handle it exactly as you would handle that status for your own request (e.g., `done` → update task status; `conflict` → resolve and resubmit your branch).
 
-Your branch lands when the successor lands — but for a `coalesce-*` absorption of a non-tip member, that is confirmed via the tip's merge marker and this task's own scheduler status, not via `merge_status` (see the linked subsection).
+Your branch lands when the successor lands — but for a `coalesce-*` absorption of a non-tip member, that is confirmed via the tip's merge marker and this task's own scheduler status, not via `merge_status`, and that confirmation holds even though the branch's own ancestry check stays rc=1 permanently (see the linked subsection).
 
 ### 5. Abandoning a submission (merge_cancel)
 
