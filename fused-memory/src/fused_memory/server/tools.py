@@ -398,10 +398,11 @@ Write operations:
 
 Read operations:
 - search: Unified search across both stores with automatic routing. Finding any member of a
-  consolidated cluster also surfaces that topic's CANONICAL record, promoted to first and
-  flagged topic_anchored=True (its relevance_score is not meaningful — it is pinned by order,
-  and the window stays exactly `limit` long, so the pin costs the lowest-ranked result its
-  slot). NOTE this is currently a no-op for almost every search: stamping coverage, not
+  consolidated cluster IN YOUR RESULT WINDOW also surfaces that topic's CANONICAL record,
+  promoted to first and flagged topic_anchored=True (its relevance_score is not meaningful —
+  it is pinned by order, and the window stays exactly `limit` long, so the pin costs the
+  lowest-ranked result its slot; topics are read from the window you see, never from hits
+  that were cut). NOTE this is currently a no-op for almost every search: stamping coverage, not
   ranking, is the binding constraint, and that coverage is still being built out.
 - get_entity: Direct entity lookup in the knowledge graph
 - get_episodes: Retrieve raw episode history
@@ -3316,9 +3317,12 @@ def create_mcp_server(
 
             TOPIC-PINNED RESULTS (task 3111).  Every result carries a
             'topic_anchored' bool.  When True, that result was PROMOTED into
-            the window BY RULE rather than earned its place by rank: a search
-            whose results carry a metadata.topic looks up that topic's
-            canonical:true record and seats it first.  'relevance_score' is NOT
+            the window BY RULE rather than earned its place by rank: when a
+            record IN THE RETURNED WINDOW carries a metadata.topic, that
+            topic's canonical:true record is looked up and seated first.
+            Topics are harvested from the window you actually see, never from
+            lower-ranked hits that were cut — so a pin can only ever cost you a
+            slot for a cluster you genuinely matched.  'relevance_score' is NOT
             meaningful for such a result — it is pinned by ORDER, never by
             score.  Promotion is not addition: the window stays exactly `limit`
             long, so a pin costs the lowest-ranked result its slot.  This
