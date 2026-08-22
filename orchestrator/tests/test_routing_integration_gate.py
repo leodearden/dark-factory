@@ -94,7 +94,7 @@ hand-built ``PlanShape``.
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -125,10 +125,18 @@ from orchestrator.config import (
     apply_reload,
     load_config,
 )
-from orchestrator.event_store import EventType
+from orchestrator.digest import (
+    CostStats,
+    DigestInputs,
+    EscalationStats,
+    model_role_rollup,
+    render_digest_markdown,
+)
+from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps
 from orchestrator.harness import TaskReport
 from orchestrator.review_checkpoint import ReviewCheckpoint
+from orchestrator.run_store import RunStore
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.verify import VerifyResult
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
@@ -1703,3 +1711,233 @@ class TestOutOfBandParity:
         # direct, observable witness of that honest "no task association"
         # contract.
         assert entries[0]['task_id'] is None
+
+
+# ---------------------------------------------------------------------------
+# Boundary scenario 12 -- the rollup renders per-(model×role) rows from rows
+# a real rig run produced (plan step-10).
+# ---------------------------------------------------------------------------
+
+
+class _CostedInvokeStub:
+    """Bare ``invoke_agent`` double (mirrors ``_MinimalRouteRecorder``) that
+    returns a caller-fixed ``cost_usd``/``turns`` ``AgentResult`` instead of
+    the zero-valued defaults -- this scenario's $/done and turn-cap-
+    saturation assertions need real, non-accidental numbers to distinguish
+    "computed correctly" from "happens to be zero"."""
+
+    def __init__(self, *, cost_usd: float, turns: int) -> None:
+        self._cost_usd = cost_usd
+        self._turns = turns
+        self.calls: list[dict[str, object]] = []
+
+    async def invoke_agent(self, **kwargs) -> AgentResult:
+        self.calls.append(kwargs)
+        return AgentResult(
+            success=True, output='OK', cost_usd=self._cost_usd, turns=self._turns,
+        )
+
+
+class TestRollupRendersRigProducedRows:
+    """PRD boundary scenario 12: ``digest.model_role_rollup`` and
+    ``render_digest_markdown`` surface real rows a real rig run produced --
+    turning ``test_harness_digest_rollup.py``'s hand-seeded-fixture unit
+    proof into an end-to-end one.
+
+    Points a REAL ``CostStore``, ``EventStore`` and ``RunStore`` at ONE tmp
+    ``runs.db`` (they share one file in production -- harness.py:1373-1398)
+    and drives ``TaskWorkflow._invoke`` directly for TWO task dispatches
+    sharing one run_id -- mirrors ``TestByteEquivalenceThroughTheRig``'s /
+    ``TestUnknownRuleKeyRejectedPriorRulesStillRoute``'s direct-``_invoke``
+    idiom, since only the resolved route and the telemetry rows it produces
+    are under test, not a full ``run()`` state machine. Dispatch #1 resolves
+    implementer at the stock config layer; dispatch #2 pins the SAME role to
+    a distinct model via ``model_overrides`` -- so the rollup has >=2
+    distinct (model, role) cells for one role, per the plan.
+
+    ``task_results`` rows are HARNESS-owned (written by ``Harness._run_slot``
+    from a ``TerminalReport``/``workflow.metrics`` this suite's direct-
+    ``_invoke`` calls never accumulate through that path -- see module
+    docstring's seam discussion). Rather than fabricate them with a raw SQL
+    INSERT -- which would bypass the schema the rollup's JOIN depends on --
+    the DONE/BLOCKED outcome rows below are written through the REAL
+    ``RunStore.save_task_result`` API, from a ``TaskReport`` built with this
+    test's own known values.
+    """
+
+    @staticmethod
+    def _task_report(
+        *, task_id: str, title: str, outcome: WorkflowOutcome, cost_usd: float,
+    ) -> TaskReport:
+        return TaskReport(
+            task_id=task_id, title=title, outcome=outcome, cost_usd=cost_usd,
+            completed_at=datetime.now(UTC).isoformat(),
+        )
+
+    @pytest.fixture
+    def stock_config(self, git_repo: Path, code_default_config) -> OrchestratorConfig:
+        return OrchestratorConfig(
+            project_root=git_repo,
+            max_concurrent_tasks=1,
+            max_execute_iterations=5,
+            max_verify_attempts=3,
+            max_review_cycles=2,
+            git=GitConfig(
+                main_branch='main',
+                branch_prefix='task/',
+                remote='origin',
+                worktree_dir='.worktrees',
+            ),
+            sandbox=SandboxConfig(enabled=False),
+        )
+
+    @pytest.mark.asyncio
+    async def test_rollup_renders_rows_the_rig_produced(
+        self, stock_config, git_ops, task_assignment, git_repo, tmp_path, monkeypatch,
+    ):
+        runs_db = tmp_path / 'runs.db'
+        run_id = 'rig-run-1'
+        event_store = EventStore(runs_db, run_id)
+        cost_store = CostStore(runs_db)
+        await cost_store.open()
+        try:
+            # RunStore's schema (task_results) isn't created by EventStore/
+            # CostStore -- construct it on the shared file up front (schema
+            # creation is a __init__ side effect, and the same instance is
+            # reused for the writes below), mirroring
+            # test_harness_digest_rollup.py's identical idiom.
+            run_store = RunStore(runs_db)
+
+            impl_max_turns = stock_config.max_turns.implementer
+            assert impl_max_turns > 1, 'test needs headroom for an unsaturated call'
+
+            # -- Dispatch #1 (task 42): stock config-layer model. One call
+            # below the turn cap (unsaturated).
+            stub1 = _CostedInvokeStub(cost_usd=2.50, turns=impl_max_turns - 1)
+            workflow1, _s1 = _build_workflow(stock_config, git_ops, task_assignment, stub1)
+            workflow1.event_store = event_store
+            workflow1.cost_store = cost_store
+            workflow1.plan = {'steps': [{'id': 's1', 'status': 'pending'}]}
+            workflow1.modules = ['lib']
+            monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub1.invoke_agent)
+
+            await workflow1._invoke(IMPLEMENTER, 'impl prompt', git_repo)
+            # Confirms the premise (no policy rule fires for this tiny plan)
+            # rather than silently asserting the wrong cell below.
+            assert stub1.calls[-1]['model'] == stock_config.models.implementer
+
+            # -- Dispatch #2 (task 43): model_overrides pins the SAME role to
+            # a DIFFERENT model -- the second distinct (model, role) cell the
+            # plan requires. At (not over) the turn cap (saturated).
+            assert stock_config.models.implementer != 'haiku'
+            task_2 = {
+                'id': '43',
+                'title': 'Routing boundary task 2',
+                'description': 'Exercise the real _invoke routing-resolution path',
+                'status': 'pending',
+                'metadata': {'files': ['lib'], 'model_overrides': {'implementer': 'haiku'}},
+                'dependencies': [],
+            }
+            assignment_2 = TaskAssignment(task_id='43', task=task_2, modules=['lib'])
+            stub2 = _CostedInvokeStub(cost_usd=1.25, turns=impl_max_turns)
+            workflow2, _s2 = _build_workflow(stock_config, git_ops, assignment_2, stub2)
+            workflow2.event_store = event_store
+            workflow2.cost_store = cost_store
+            workflow2.plan = {'steps': [{'id': 's1', 'status': 'pending'}]}
+            workflow2.modules = ['lib']
+            monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub2.invoke_agent)
+
+            await workflow2._invoke(IMPLEMENTER, 'impl prompt', git_repo)
+            assert stub2.calls[-1]['model'] == 'haiku'
+
+            # A role that emitted invocation_end but was never routed through
+            # _invoke in this window, so it carries NO routing_decision/
+            # max_turns -- written via the real EventStore.emit() API
+            # (never raw SQL) to prove assertion (c)'s fail-open half: a role
+            # with no measurable cap reports None, not a misleading 0%/100%.
+            event_store.emit(
+                EventType.invocation_end, task_id='42', role='judge',
+                data={'turns': 3, 'success': True},
+            )
+
+            # task_results: HARNESS-owned rows (see class docstring) --
+            # written through the real RunStore API, never raw SQL.
+            run_store.save_task_result(
+                run_id,
+                self._task_report(
+                    task_id='42', title='Routing boundary task',
+                    outcome=WorkflowOutcome.DONE, cost_usd=2.50,
+                ),
+                stock_config.fused_memory.project_id,
+            )
+            run_store.save_task_result(
+                run_id,
+                self._task_report(
+                    task_id='43', title='Routing boundary task 2',
+                    outcome=WorkflowOutcome.BLOCKED, cost_usd=1.25,
+                ),
+                stock_config.fused_memory.project_id,
+            )
+
+            window_start_iso = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
+            window_end_iso = (datetime.now(UTC) + timedelta(hours=1)).isoformat()
+            rollup = model_role_rollup(runs_db, window_start_iso, window_end_iso)
+
+            rows_by_cell = {(r.model, r.role): r for r in rollup.rows}
+            stock_cell = rows_by_cell[(stock_config.models.implementer, 'implementer')]
+            override_cell = rows_by_cell[('haiku', 'implementer')]
+
+            # (a) both expected cells are present with the right invocation_count.
+            assert stock_cell.invocation_count == 1
+            assert override_cell.invocation_count == 1
+
+            # (b) done/blocked counts and rates reflect the seeded outcomes;
+            # cost_per_done is None (not 0.0) for the cell with zero DONE
+            # tasks -- digest.py's documented None-not-zero contract.
+            assert stock_cell.done_count == 1
+            assert stock_cell.blocked_count == 0
+            assert stock_cell.done_rate == pytest.approx(1.0)
+            assert stock_cell.blocked_rate == pytest.approx(0.0)
+            assert stock_cell.cost_per_done == pytest.approx(2.50)
+
+            assert override_cell.done_count == 0
+            assert override_cell.blocked_count == 1
+            assert override_cell.done_rate == pytest.approx(0.0)
+            assert override_cell.blocked_rate == pytest.approx(1.0)
+            assert override_cell.cost_per_done is None
+
+            # (c) turn_cap_saturation: implementer emitted a routing_decision
+            # carrying max_turns for both calls (one under cap, one at cap:
+            # 1 hit / 2 = 50%); judge emitted invocation_end but no
+            # routing_decision in this window, so it fails open to None.
+            assert rollup.turn_cap_saturation['implementer'] == pytest.approx(0.5)
+            assert rollup.turn_cap_saturation['judge'] is None
+
+            # Render: the rollup section header, both cells, and the
+            # turn-cap-saturation lines all appear in the rendered digest.
+            digest_inputs = DigestInputs(
+                window_start_iso=window_start_iso, window_end_iso=window_end_iso,
+                escalation_stats=EscalationStats(), done_count=1,
+                cost_stats=CostStats(), parked_live=0, parked_window_churn=0,
+                ewa_value=0.0, ewa_threshold=0.0, tripped=False,
+                anomaly_flags={}, watcher_clusters=[], dry_run_proposals=[],
+                model_role_rollup=rollup,
+            )
+            rendered = render_digest_markdown(digest_inputs)
+
+            assert '## Per-(model×role) rollup' in rendered
+            assert (
+                '| model | role | invocations | done% | blocked% | cap-hit% | $/done |'
+                in rendered
+            )
+            expected_stock_line = (
+                f'| {stock_config.models.implementer} | implementer | 1 | '
+                '100.0% | 0.0% | 0.0% | $2.50 |'
+            )
+            assert expected_stock_line in rendered
+            assert '| haiku | implementer | 1 | 0.0% | 100.0% | 0.0% | — |' in rendered
+            assert '### Turn-cap saturation (per role)' in rendered
+            assert '- implementer: 50.0%' in rendered
+            assert '- judge: n/a' in rendered
+        finally:
+            await cost_store.close()
