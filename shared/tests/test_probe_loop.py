@@ -1138,10 +1138,11 @@ class TestRunProbeSpawnFault:
 
         assert result is False
         mock_terminate.assert_awaited_once()
-        args, kwargs = mock_terminate.await_args
-        assert args[0] is proc
-        assert args[1] == proc.pid, 'the pgid captured at spawn, not a re-read one'
-        assert kwargs == {'grace_secs': 5.0}
+        call = mock_terminate.await_args
+        assert call is not None
+        assert call.args[0] is proc
+        assert call.args[1] == proc.pid, 'the pgid captured at spawn, not a re-read one'
+        assert call.kwargs == {'grace_secs': 5.0}
 
     async def test_non_oserror_at_spawn_is_not_a_spawn_fault(self):
         """A RuntimeError from the spawn still returns False.
