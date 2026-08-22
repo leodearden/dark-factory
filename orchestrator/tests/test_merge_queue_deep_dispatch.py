@@ -45,7 +45,12 @@ from orchestrator.config import GitConfig, MergeDeepConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_queue import MergeRequest, SpeculativeMergeWorker
-from orchestrator.merge_types import MergeResult, QueuedBranch, RealMergeItem
+from orchestrator.merge_types import (
+    ChainResult,
+    MergeResult,
+    QueuedBranch,
+    RealMergeItem,
+)
 
 # ── repo fixtures (adapted from test_merge_queue_build_chain.py:47-102) ───────
 
@@ -573,3 +578,230 @@ class TestChainHalvingWorkerState:
 
         assert list(worker._recent_verify_outcomes) == outcomes_before
         assert worker._probe_round_counter == counter_before
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# step-11: RED — the deep GATE, and the kill-switch byte-identity guarding it
+#
+# `_deep_chain_placement(item)` is the slot-2 policy hook: the deep twin of
+# `_probe_verify_placement` (merge_queue.py:11988), structured identically —
+# a slot-1 guard, then a HOISTED zero-cost kill-switch guard, then the pure
+# policy, then (step-14) the bounded git work.
+#
+# Everything below asserts a NEGATIVE — the gate declines — so each test also
+# proves the decline COSTS NOTHING: no `build_chain`, no `_spec-` lane, and,
+# on the two guards that precede it, not even the O(n) `chain_snapshot()`
+# scan. "No cost, not merely no effect" is the byte-identity claim the PRD
+# makes for the shipped `chain_cap=0` default, and it is only checkable by
+# spying the work that must NOT happen.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _spy_build_chain(monkeypatch, result: ChainResult | None = None) -> list[dict]:
+    """Replace ``orchestrator.merge_queue.build_chain`` with a recorder.
+
+    Returns the list of recorded call kwargs (``{'git_ops', 'queue_snapshot',
+    'head_merge_commit', 'cap', 'target_depth'}``) — step-11 asserts it stays
+    EMPTY on every declining path; step-13 reads its contents.
+
+    *result* defaults to a ZERO-LINK :class:`ChainResult`, which per its
+    docstring never holds a lane — so a stubbed call can never leak one, and
+    these gate tests stay valid once step-14 lands the real build.
+    """
+    calls: list[dict] = []
+
+    async def _recording(git_ops, queue_snapshot, head_merge_commit, *, cap, target_depth):
+        calls.append({
+            'git_ops': git_ops,
+            'queue_snapshot': tuple(queue_snapshot),
+            'head_merge_commit': head_merge_commit,
+            'cap': cap,
+            'target_depth': target_depth,
+        })
+        return result if result is not None else ChainResult(links=[], tip=head_merge_commit)
+
+    monkeypatch.setattr('orchestrator.merge_queue.build_chain', _recording)
+    return calls
+
+
+def _spy_chain_snapshot(worker: SpeculativeMergeWorker, monkeypatch) -> list[int]:
+    """Wrap ``worker.chain_snapshot`` with a call recorder; return the record list.
+
+    ``chain_snapshot()`` is an O(n) walk of every lane buffer, so it is the
+    cheapest observable proof that a guard short-circuited BEFORE the scan
+    rather than after it — the difference between the kill switch costing
+    nothing and merely doing nothing.
+    """
+    seen: list[int] = []
+    original = worker.chain_snapshot
+
+    def _recording():
+        out = original()
+        seen.append(len(out))
+        return out
+
+    monkeypatch.setattr(worker, 'chain_snapshot', _recording)
+    return seen
+
+
+@pytest.mark.asyncio
+class TestDeepChainPlacementGate:
+    """`_deep_chain_placement` declines — and costs nothing while declining."""
+
+    async def _fixture(
+        self, git_repo: Path, monkeypatch, *, chain_cap: int, queued: int,
+    ) -> tuple[SpeculativeMergeWorker, RealMergeItem, OrchestratorConfig, list[dict], list[str], list[int]]:
+        """Build worker + a slot-2 item + *queued* buffered requests, all spied.
+
+        Returns ``(worker, item, config, build_chain_calls, spec_lane_acquires,
+        chain_snapshot_calls)``.  No real merge commit is needed: every
+        step-11 path declines before touching git, and a test that reached git
+        with this fake SHA would fail loudly rather than silently pass.
+        """
+        git_ops = _make_git_ops(git_repo)
+        config = _make_config(git_repo, chain_cap=chain_cap)
+        worker = _make_worker(git_ops)
+        worker._lane_buffers['normal'].extend(
+            _make_req(str(200 + i), str(200 + i), config, git_repo)
+            for i in range(queued)
+        )
+        item = _make_item(
+            _make_req('101', '101', config, git_repo), 'beef' * 10, git_repo,
+        )
+        return (
+            worker, item, config,
+            _spy_build_chain(monkeypatch),
+            _count_spec_lane_acquires(git_ops, monkeypatch),
+            _spy_chain_snapshot(worker, monkeypatch),
+        )
+
+    async def test_cap_zero_kill_switch_costs_nothing(self, git_repo, monkeypatch):
+        """cap=0 (the shipped default) declines without ANY work, deep queue or not.
+
+        The hoisted guard must sit BEFORE the ``chain_snapshot()`` scan, so
+        under stock config a speculative dispatch pays literally nothing for
+        the feature being compiled in.
+        """
+        worker, item, _cfg, built, lanes, scans = await self._fixture(
+            git_repo, monkeypatch, chain_cap=0, queued=5,
+        )
+
+        assert await worker._deep_chain_placement(item) is None
+        assert built == []
+        assert lanes == []
+        assert scans == [], 'cap=0 must short-circuit BEFORE the O(n) queue scan'
+
+    async def test_non_speculative_item_is_never_chained(self, git_repo, monkeypatch):
+        """Slot 1 — the head trust anchor — is unchanged by contract, at ANY cap.
+
+        Its tree is merged onto REAL main; chaining onto it would make the one
+        verify the pipeline trusts for landing a cumulative tree instead.
+        """
+        git_ops = _make_git_ops(git_repo)
+        config = _make_config(git_repo, chain_cap=6)
+        worker = _make_worker(git_ops)
+        worker._lane_buffers['normal'].extend(
+            _make_req(str(300 + i), str(300 + i), config, git_repo) for i in range(5)
+        )
+        built = _spy_build_chain(monkeypatch)
+        lanes = _count_spec_lane_acquires(git_ops, monkeypatch)
+        scans = _spy_chain_snapshot(worker, monkeypatch)
+        head_item = _make_item(
+            _make_req('101', '101', config, git_repo), 'beef' * 10, git_repo,
+            speculative=False,
+        )
+
+        assert await worker._deep_chain_placement(head_item) is None
+        assert built == []
+        assert lanes == []
+        assert scans == [], 'the slot-1 guard must precede the queue scan too'
+
+    async def test_queue_shorter_than_two_declines(self, git_repo, monkeypatch):
+        """An empty unfrozen suffix means ``queue_len == 1`` — nothing to chain ONTO.
+
+        Distinct from the kill switch: here the gate is ENABLED, so the scan
+        legitimately runs and it is the pure ``queue >= 2`` policy gate that
+        declines.  Asserting the scan DID happen is what stops this test from
+        passing for the wrong reason (an over-eager cap guard).
+        """
+        worker, item, _cfg, built, lanes, scans = await self._fixture(
+            git_repo, monkeypatch, chain_cap=6, queued=0,
+        )
+
+        assert await worker._deep_chain_placement(item) is None
+        assert built == []
+        assert lanes == []
+        assert scans, 'an enabled cap must reach the queue scan before declining'
+
+    async def test_d1_floor_runs_no_chain_code(self, git_repo, monkeypatch):
+        """At the halving floor the gate declines, so dispatch IS today's path.
+
+        ``_chain_halving_state == 1`` makes ``select_chain_depth`` return
+        ``None`` (its ``< 2`` floor), and because the gate then declines
+        before building anything, the floor round is byte-identical to the
+        ordinary adjacent speculative verify BY CONSTRUCTION.
+        """
+        worker, item, _cfg, built, lanes, _scans = await self._fixture(
+            git_repo, monkeypatch, chain_cap=6, queued=5,
+        )
+        worker._chain_halving_state = 1
+
+        assert await worker._deep_chain_placement(item) is None
+        assert built == []
+        assert lanes == [], 'the d=1 floor must not acquire a chain-build lane'
+
+    async def test_delegates_to_the_pure_policy_counting_the_dispatching_item(
+        self, git_repo, monkeypatch,
+    ):
+        """The gate consults ``_deep_target_depth(cap, 1 + len(snapshot))``.
+
+        Two contracts in one call record:
+
+          * DELEGATION — the ``min(queue_len, cap, halving_state)`` invariant
+            is written down once, in :func:`select_chain_depth`; the gate must
+            route through :meth:`_deep_target_depth` rather than re-derive it.
+          * UNIT — ``queue_len`` is 1-INDEXED and counts the DISPATCHING item
+            as chain item #1, so 5 buffered requests give 6, not 5.  Getting
+            this off by one would silently shorten (or over-run) every chain.
+
+        This also keeps ``test_d1_floor_runs_no_chain_code`` honest: it proves
+        the gate reaches the policy at all, so the floor test cannot pass
+        merely because the gate is wedged shut for every halving state.
+        """
+        worker, item, _cfg, _built, _lanes, _scans = await self._fixture(
+            git_repo, monkeypatch, chain_cap=6, queued=5,
+        )
+        seen: list[tuple[int, int]] = []
+        original = worker._deep_target_depth
+        monkeypatch.setattr(
+            worker, '_deep_target_depth',
+            lambda cap, queue_len: (seen.append((cap, queue_len)),
+                                    original(cap, queue_len))[1],
+        )
+        worker._chain_halving_state = 2
+
+        await worker._deep_chain_placement(item)
+
+        assert seen == [(6, 6)], 'cap read live; queue_len counts the dispatcher'
+
+    async def test_cap_is_read_live_off_the_item_config(self, git_repo, monkeypatch):
+        """PRD decision 7: flipping the knob flips the gate with no worker rebuild.
+
+        ``chain_cap`` is green-tier hot-reloadable, and ``_set_leaf`` mutates
+        the held :class:`MergeDeepConfig` IN PLACE (config.py:1011-1017), so
+        the gate must re-read ``item.request.config.merge_deep.chain_cap`` on
+        every call rather than cache it at construction.  Same worker, same
+        item, same config OBJECT across both calls — only the leaf changes.
+        """
+        worker, item, config, built, _lanes, scans = await self._fixture(
+            git_repo, monkeypatch, chain_cap=0, queued=5,
+        )
+
+        assert await worker._deep_chain_placement(item) is None
+        assert scans == [] and built == []
+
+
+        config.merge_deep.chain_cap = 6  # operator hot-reloads the knob ON
+        await worker._deep_chain_placement(item)
+
+        assert scans, 'the flipped-on cap must be observed on the very next call'
