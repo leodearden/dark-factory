@@ -17,12 +17,17 @@ through to the synthesized ERROR fallback instead. Cases (c)-(e) (absent /
 stale / malformed verdict => ERROR) already hold pre-δ, by coincidence —
 the old cascade also defaults to ERROR on unparseable/absent output — and
 are included as fail-safe/I-FRESH regression guards, not new RED behavior
-(mirrors the merger test's case (f)). Case (f) here (invocation failure
-=> ERROR even with a written verdict) is a task 2484 amendment-pass
-addition, closing a gap versus the merger's own case (f)
-(``test_invocation_failure_still_blocks``): pre-amendment,
-``_run_reviewer`` trusted a written verdict regardless of
-``result.success``.
+(mirrors the merger test's case (f)). Cases (f1)-(f3) pin the *narrowed*
+I-FAIL-SAFE contract for an unsuccessful invocation. fe37ca04a8 (task 2484
+amendment pass) made ``not result.success`` a short-circuit disjunct ahead
+of the payload check, so ANY unsuccessful run yielded ERROR even with a
+schema-valid verdict on disk; because ``cli_invoke`` downgrades ``success``
+on a ~98%-false-positive ``ended_awaiting_background`` flag (task 3639),
+that discarded 13+ valid verdicts across 8 tasks in 20 days. The gate now
+salvages a well-formed verdict from a failed-but-not-timed-out run (f1),
+mirroring the architect's ``_finalized_at`` plan salvage, while still
+synthesizing ERROR when nothing valid is on disk (f2) or the run timed out
+(f3).
 """
 
 from __future__ import annotations
@@ -57,7 +62,7 @@ class TestReviewerGrantSurface:
 
 def _invoke_writes_review_verdict(
     f, *, verdict: str | None, issues: list | None = None, summary: str = '',
-    output: str = '', success: bool = True,
+    output: str = '', success: bool = True, timed_out: bool = False,
 ) -> Callable:
     """Build an ``_invoke`` side_effect that optionally writes a reviewer
     verdict to ``verdicts/reviewer_comprehensive.json``.
@@ -77,7 +82,7 @@ def _invoke_writes_review_verdict(
                     'summary': summary,
                 }),
             )
-        return AgentResult(success=success, output=output)
+        return AgentResult(success=success, output=output, timed_out=timed_out)
 
     return _side_effect
 
@@ -221,20 +226,99 @@ class TestRunReviewerVerdictRouting:
 
         assert result['verdict'] == 'ERROR'
 
-    async def test_invocation_failure_is_failsafe_error(self, tmp_path: Path):
-        """(f) ``_invoke`` success=False is fail-safe ERROR regardless of a
-        written verdict (preservation guard; mirrors the merger's
-        ``test_invocation_failure_still_blocks``).
+    @pytest.mark.parametrize('verdict', ['PASS', 'ISSUES_FOUND'])
+    async def test_invocation_failure_salvages_written_verdict(
+        self, tmp_path: Path, verdict: str,
+    ):
+        """(f1) ``_invoke`` success=False but NOT timed out, with a
+        well-formed verdict on disk => the verdict is salvaged, not
+        discarded.
 
-        A verdict written before an invocation failure (crash / max_turns /
-        budget exhaustion) is untrusted — the invocation itself must also
-        report success for its verdict to be authoritative (amendment,
-        task 2484).
+        AMENDS the pre-narrowing pin (``test_invocation_failure_is_failsafe_
+        error``, fe37ca04a8), which asserted ERROR here. ``result.success``
+        is not a trustworthy proxy for "the reviewer did not decide": a run
+        that reaches ``end_turn`` and writes a schema-valid verdict is
+        downgraded to success=False by ``cli_invoke``'s
+        ``ended_awaiting_background`` flag, ~98% of the time spuriously
+        (task 3639). Mirrors the architect's ``_finalized_at`` plan salvage
+        in ``_plan``.
+        """
+        f = self._setup(tmp_path)
+        issues = (
+            [{
+                'severity': 'blocking',
+                'location': 'src/foo.py:1',
+                'category': 'bug',
+                'description': 'desc',
+                'suggested_fix': 'fix',
+            }]
+            if verdict == 'ISSUES_FOUND' else []
+        )
+        f.wf._invoke = AsyncMock(  # type: ignore[method-assign]
+            side_effect=_invoke_writes_review_verdict(
+                f, verdict=verdict, issues=issues, summary='Decided.',
+                output='ok', success=False,
+            ),
+        )
+
+        result = await f.wf._run_reviewer(REVIEWER_COMPREHENSIVE, 'diff')
+
+        assert result == {
+            'reviewer': 'reviewer_comprehensive',
+            'verdict': verdict,
+            'issues': issues,
+            'summary': 'Decided.',
+        }
+
+    async def test_invocation_failure_without_verdict_is_failsafe_error(
+        self, tmp_path: Path,
+    ):
+        """(f2) success=False with NO verdict on disk stays fail-safe ERROR
+        — the narrowing salvages a written verdict, it does not invent one.
         """
         f = self._setup(tmp_path)
         f.wf._invoke = AsyncMock(  # type: ignore[method-assign]
             side_effect=_invoke_writes_review_verdict(
-                f, verdict='PASS', summary='Looks good.', output='ok', success=False,
+                f, verdict=None, output='crashed before deciding', success=False,
+            ),
+        )
+
+        result = await f.wf._run_reviewer(REVIEWER_COMPREHENSIVE, 'diff')
+
+        assert result['verdict'] == 'ERROR'
+        assert result['reviewer'] == 'reviewer_comprehensive'
+
+    async def test_invocation_failure_with_invalid_verdict_is_failsafe_error(
+        self, tmp_path: Path,
+    ):
+        """(f2b) success=False with an out-of-set inner verdict stays
+        fail-safe ERROR — salvage requires a *well-formed* payload.
+        """
+        f = self._setup(tmp_path)
+        f.wf._invoke = AsyncMock(  # type: ignore[method-assign]
+            side_effect=_invoke_writes_review_verdict(
+                f, verdict='MAYBE', summary='unsure', output='ok', success=False,
+            ),
+        )
+
+        result = await f.wf._run_reviewer(REVIEWER_COMPREHENSIVE, 'diff')
+
+        assert result['verdict'] == 'ERROR'
+
+    async def test_timed_out_invocation_is_failsafe_error(self, tmp_path: Path):
+        """(f3) a TIMED-OUT invocation is fail-safe ERROR even with a
+        well-formed verdict on disk.
+
+        This is the residue of the fe37ca04a8 invariant that survives the
+        narrowing: a wall-clock kill aborts the run mid-flight, so a verdict
+        it left behind may reflect a partial pass over the diff — exactly
+        the case the original fail-safe exists for.
+        """
+        f = self._setup(tmp_path)
+        f.wf._invoke = AsyncMock(  # type: ignore[method-assign]
+            side_effect=_invoke_writes_review_verdict(
+                f, verdict='PASS', summary='Looks good.', output='ok',
+                success=False, timed_out=True,
             ),
         )
 

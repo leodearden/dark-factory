@@ -9842,15 +9842,36 @@ class TaskWorkflow:
 
         # Read the reviewer's structured verdict instead of the
         # structured_output/json.loads cascade (task 2484 / PRD task δ).
-        # Defensive extraction mirrors the merger's read_verdict handling
-        # in _resolve_and_resubmit (workflow.py:7114): a dict envelope with
-        # a dict 'verdict' payload carrying verdict∈{PASS,ISSUES_FOUND} is
-        # trusted only when the invocation itself also reported success —
-        # an invocation failure (crash / max_turns / budget exhaustion) is
-        # untrusted even if it happened to write a verdict before failing;
-        # anything else (absent, cleared, malformed, or unsuccessful)
-        # degrades to the role's existing worst-case ERROR disposition
-        # (I-FAIL-SAFE).
+        # A dict envelope with a dict 'verdict' payload carrying
+        # verdict∈{PASS,ISSUES_FOUND} is trusted; anything else (absent,
+        # cleared, malformed) degrades to the role's worst-case ERROR
+        # disposition (I-FAIL-SAFE).
+        #
+        # DELIBERATE NARROWING of I-FAIL-SAFE (was: fe37ca04a8, 2026-07-17,
+        # "fail-safe ERROR on reviewer invocation failure, even with a
+        # written verdict").  That commit added `not result.success` as a
+        # short-circuit disjunct AHEAD of the payload inspection, so a
+        # reviewer that ran cleanly to end_turn and wrote a schema-valid
+        # verdict had it overwritten with ERROR whenever the run-level
+        # success flag was false.  `result.success` turned out to be
+        # unreliable in exactly that direction: cli_invoke downgrades an
+        # otherwise-successful run via `ended_awaiting_background`, which
+        # task 3639 measures as ~98% false-positive — 13+ discarded valid
+        # verdicts across 8 tasks in 20 days, each retry re-hitting the same
+        # short-circuit and re-burning a full reviewer panel.
+        #
+        # So a well-formed verdict ON DISK is now trusted even when the
+        # invocation reported failure, mirroring the architect's plan
+        # salvage (`_plan`, workflow.py:4481-4503: a `_finalized_at` plan is
+        # used despite `not result.success`).  What still fails safe:
+        #   - no verdict file / unparseable envelope / malformed payload;
+        #   - an inner verdict outside {PASS, ISSUES_FOUND};
+        #   - ANY timed-out invocation (`result.timed_out`), whose verdict
+        #     may be from a partial, aborted run — precisely the case the
+        #     original fail-safe exists for.
+        # The `ended_awaiting_background` false positive itself is task
+        # 3639's; this only stops it from destroying a verdict we already
+        # have.
         envelope = self.artifacts.read_verdict(role.name)
         if envelope is None and result.success:
             # Observability (reviewer_comprehensive amendment, task 2484):
@@ -9878,9 +9899,13 @@ class TaskWorkflow:
                 )
         payload = envelope.get('verdict') if isinstance(envelope, dict) else None
         if (
-            not result.success
-            or not isinstance(payload, dict)
+            not isinstance(payload, dict)
             or payload.get('verdict') not in {'PASS', 'ISSUES_FOUND'}
+            # A timed-out run stays fail-safe even with a well-formed verdict
+            # on disk — it was killed mid-flight, so the verdict may be from
+            # a partial pass.  Note `not result.success` is deliberately NOT
+            # a disjunct here any more (see the narrowing note above).
+            or result.timed_out
         ):
             return {
                 'reviewer': role.name,
@@ -9888,6 +9913,13 @@ class TaskWorkflow:
                 'issues': [],
                 'summary': f'Reviewer emitted no/invalid verdict: {result.output[:200]}',
             }
+        if not result.success:
+            logger.warning(
+                'Task %s: reviewer %s invocation reported failure but a '
+                'well-formed %s verdict is on disk — salvaging instead of '
+                'discarding (see I-FAIL-SAFE narrowing above; task 3639)',
+                self.task_id, role.name, payload.get('verdict'),
+            )
         return payload
 
     def _suggestions_in_scope(self, suggestions: list[dict]) -> list[dict]:
