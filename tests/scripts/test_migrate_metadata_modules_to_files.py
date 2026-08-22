@@ -356,8 +356,9 @@ class _CannedServer:
     ``main_async`` builds its client with ``async with FusedMemoryClient(url)``,
     so the seam for a serverless end-to-end test is the class name in the
     module namespace, not the instance. This object is callable (standing in for
-    the constructor) and is its own async context manager, yielding the
-    :class:`_CannedProject` every root then shares.
+    the constructor) and is its own async context manager, yielding the one
+    double every root then shares — :class:`_CannedProject` or, since the
+    amendment pass, :class:`_UnreadableProject`.
 
     Driving the REAL ``main_async`` rather than re-deriving its arithmetic here
     is the point: the per-project line and the ``---- summary ----`` totals are
@@ -365,21 +366,30 @@ class _CannedServer:
     recomputed them from the returned counts could not see them go wrong.
     """
 
-    def __init__(self, project: _CannedProject) -> None:
+    def __init__(self, project: Any) -> None:
         self._project = project
 
     def __call__(self, server_url: str) -> _CannedServer:
         return self
 
-    async def __aenter__(self) -> _CannedProject:
+    async def __aenter__(self) -> Any:
         return self._project
 
     async def __aexit__(self, *exc: Any) -> None:
         return None
 
 
-def _run_main(monkeypatch: Any, client: _CannedProject, *, dry_run: bool = False) -> int:
-    """Drive ``main_async`` end to end against *client*, one project root."""
+def _run_main(monkeypatch: Any, client: Any, *, dry_run: bool = False) -> int:
+    """Drive ``main_async`` end to end against *client*, one project root.
+
+    ``client: Any`` for the same reason :func:`_run` above takes ``Any``, and it
+    is not laziness: the two doubles that drive this — :class:`_CannedProject`
+    and :class:`_UnreadableProject` — deliberately share no base class, and the
+    production function underneath declares its parameter NOMINALLY
+    (``client: FusedMemoryClient``), so no structural type admits either one.
+    This was annotated ``_CannedProject`` when that was the only double; the
+    amendment pass added the second and the type gate caught the stale name.
+    """
     monkeypatch.setattr(migrate_mod, 'FusedMemoryClient', _CannedServer(client))
     return asyncio.run(main_async(argparse.Namespace(
         server_url='http://127.0.0.1:9', dry_run=dry_run, project_roots=['/p'],
