@@ -1118,8 +1118,14 @@ class TestDumpFetchesFlag:
         )) == 0
 
         doc = json.loads(cache.read_text(encoding='utf-8'))
-        assert set(doc['arms']) == set(mod.ARM_SHAPES)
-        assert set(doc['provenance']['corpus_fingerprints']) == set(mod.ARM_SHAPES)
+        # A default run is probe-ON, so the dump covers the three read arms
+        # PLUS one pass per regrowth mode -- each seeded over its own injected
+        # corpus, so each needs its own fingerprint or a replay could silently
+        # serve one mode's fetches for the other.
+        expected = set(mod.ARM_SHAPES) | {
+            mod.regrowth_pass_key(mode) for mode in mod.REGROWTH_MODES}
+        assert set(doc['arms']) == expected
+        assert set(doc['provenance']['corpus_fingerprints']) == expected
         # The live-only values, taken from the run rather than defaulted.
         assert doc['provenance']['embedder_model'] == 'text-embedding-3-small'
         assert doc['provenance']['search_limit'] == mod.DEFAULT_SEARCH_LIMIT
