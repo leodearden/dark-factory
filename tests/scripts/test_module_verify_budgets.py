@@ -46,9 +46,11 @@ pin is worse than no pin because it reads as authoritative.
 from __future__ import annotations
 
 import ast
+import os
 import pathlib
 
 import pytest
+import yaml
 from module_budget_family import (
     FAMILY_PUBLISHER_PATHS,
     min_budget,
@@ -901,4 +903,88 @@ def test_the_budget_family_derives_every_floor_from_one_canonical_expression() -
         f'delegating to nothing. Either restore the pair in the owning guard, '
         f'or move the prefix into MEASURED_MODULE_SUITE_WORST_SECS and record '
         f'the figure here. Pairs found: {sorted(pairs)}'
+    )
+
+
+def test_root_config_fixture_anchors_this_worktrees_own_yaml(
+    root_config: OrchestratorConfig,
+) -> None:
+    """The shared ``root_config`` fixture must pin the config to THIS worktree's yaml.
+
+    Task 4320. Three near-identical ``_root_config`` helpers used to live in this
+    directory — one in each member of the budget-guard family — and the anchoring
+    they performed was load-bearing rather than hygiene. De-triplicating them into
+    a single ``tests/scripts/conftest.py`` fixture is only safe if the BEHAVIOUR
+    survives the move, so this pins the behaviour rather than the arrangement.
+
+    Nothing here asserts about naming, placement or prose. Three properties, each
+    the negation of a way the anchor can silently stop working:
+
+      (a) THE ANCHOR IS APPLIED. ``ORCH_CONFIG_PATH`` names THIS worktree's
+          ``dark-factory-orchestrator.yaml`` while the test runs.
+          ``project_root`` is only a model FIELD and selects nothing:
+          ``OrchestratorConfig.settings_customise_sources`` builds its
+          ``YamlSettingsSource`` from ``os.environ['ORCH_CONFIG_PATH']`` alone,
+          falling back to a CWD-relative ``config.yaml``. Both ambient states are
+          wrong in OPPOSITE directions — UNSET (the state inside verify, which
+          scrubs the whole ``ORCH_`` prefix) collapses every value to the
+          pydantic defaults, while SET as an operator's shell has it points at
+          whichever checkout that orchestrator serves, so every assertion would
+          be about a DIFFERENT checkout and would report green on a worktree that
+          had regressed.
+
+      (b) THE YAML WAS ACTUALLY READ. The returned config's ``test_command`` and
+          ``verify_command_timeout_secs`` equal what ``yaml.safe_load`` reads
+          from that exact file. Asserted AGAINST THE FILE rather than against
+          pinned literals, deliberately: pinning the warm ceiling as a number
+          here would create a second copy of a value the root yaml owns, and it
+          would start failing the day that yaml is legitimately retuned.
+
+      (c) IT IS NOT A DEFAULTS COLLAPSE. ``test_command`` is not the pydantic
+          default ``'pytest'``. This is the SILENT failure mode: a missing or
+          unset ``config_path`` makes ``YamlSettingsSource`` SKIP the file rather
+          than raise, so a broken anchor yields a fully-populated config of
+          DEFAULTS with no error anywhere. (a) and (b) would both still hold if
+          the repo happened to declare exactly the defaults; (c) is what makes
+          the distinction observable at all.
+    """
+    expected_path = REPO_ROOT / 'dark-factory-orchestrator.yaml'
+
+    # (a) THE ANCHOR IS APPLIED.
+    assert os.environ.get('ORCH_CONFIG_PATH') == str(expected_path), (
+        f'ORCH_CONFIG_PATH is {os.environ.get("ORCH_CONFIG_PATH")!r} during this '
+        f'test, not {str(expected_path)!r} (task 4320). The root_config fixture '
+        f'exists to pin config loading to THIS worktree; project_root is only a '
+        f'model field and selects nothing, so without the env var the config is '
+        f'read from whatever checkout the ambient environment points at — or, '
+        f'when unset, from nowhere at all'
+    )
+
+    # (b) THE YAML WAS ACTUALLY READ — compared against the file, not a literal.
+    declared = yaml.safe_load(expected_path.read_text(encoding='utf-8'))
+    assert root_config.test_command == declared['test_command'], (
+        f'root_config.test_command is {root_config.test_command!r} but '
+        f'{expected_path.name} declares {declared["test_command"]!r} '
+        f'(task 4320) — the fixture did not load this worktree\'s yaml'
+    )
+    assert (
+        root_config.verify_command_timeout_secs
+        == declared['verify_command_timeout_secs']
+    ), (
+        f'root_config.verify_command_timeout_secs is '
+        f'{root_config.verify_command_timeout_secs} but {expected_path.name} '
+        f'declares {declared["verify_command_timeout_secs"]} (task 4320). Every '
+        f'"strictly below the root warm ceiling" assertion in this directory is '
+        f'read through this fixture, so a wrong value here silently changes what '
+        f'those assertions mean'
+    )
+
+    # (c) IT IS NOT A DEFAULTS COLLAPSE.
+    assert root_config.test_command != 'pytest', (
+        "root_config.test_command is the pydantic default 'pytest' (task 4320), "
+        'which is what OrchestratorConfig yields when YamlSettingsSource finds '
+        'no file — it SKIPS a non-existent config_path rather than raising, so '
+        'a broken anchor produces a fully-populated config of DEFAULTS and no '
+        'error anywhere. That silence is the whole reason the fixture asserts '
+        'the path is a real file before setting the env var'
     )
