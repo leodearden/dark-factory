@@ -37,6 +37,8 @@ import asyncio
 import json
 from typing import Any
 
+import httpx
+
 # scripts/ is put on sys.path by tests/scripts/conftest.py at collection time,
 # and — as of task 3456 — is ALSO listed (with scripts/legibility) in
 # [tool.pyright] extraPaths in the root pyproject.toml, so this import resolves
@@ -50,6 +52,14 @@ from migrate_metadata_modules_to_files import (
     _migrate_one_project,
     main_async,
 )
+
+# The SIBLING script's copy of the same reply-classification contract, imported
+# only by the drift guard at the bottom of this file. Resolvable for the same
+# reason `migrate_metadata_modules_to_files` is: tests/scripts/conftest.py puts
+# scripts/ on sys.path at collection time. This is a SOURCE module, not a test
+# module — the "never import one test module from another" rule this file
+# records elsewhere is untouched.
+from repair_wiped_metadata_files import classify_reply
 
 # The repo root's conftest.py puts shared/src on sys.path for the whole suite,
 # so this needs no bootstrap of its own. Imported to assert the WRITTEN list
@@ -444,7 +454,11 @@ def test_the_per_project_line_and_the_summary_both_name_sanitized_empty(monkeypa
     per_project, summary = out.split('---- summary ----')
     assert 'sanitized_empty' in per_project
     assert 'sanitized_empty: 1' in summary
-    assert 'copied' in summary and 'dropped' in summary
+    # VALUES, not bare key names. `'copied' in summary` was near-tautological:
+    # `copied` is a substring of the `copied_modules→files` label and of the
+    # summary key itself, so it held whatever the counts were — including the
+    # pre-fix arithmetic this test exists to reject.
+    assert 'copied: 1' in summary and 'dropped: 1' in summary
 
 
 def _terminal(task_id: str, status: str, **meta: Any) -> dict:
@@ -563,9 +577,28 @@ REJECTION_REPLIES = [
     'not a dict at all',
 ]
 
+#: The two shapes the TRANSPORT stamps rather than the tool body — kept in
+#: their own vector because the sibling script's classifier does NOT yet reject
+#: them (see the drift guard at the bottom of this file). Both are NON-EMPTY
+#: dicts with no `error` and no `success` key, so before these checks existed
+#: they reached the success branch: a silent success inside the very predicate
+#: added to abolish silent successes.
+TRANSPORT_REJECTION_REPLIES = [
+    # `call_tool`'s not-JSON fallback. FastMCP-level failures that never enter
+    # an `@mcp_tool_errors`-decorated body — argument validation, the
+    # `_install_safe_tool_wrapper` backstop — stringify exactly like this.
+    {migrate_mod.RAW_REPLY_KEY: 'Error calling tool update_task: boom'},
+    # The MCP envelope's own `isError` flag, which `call_tool` stamps on.
+    {migrate_mod.MCP_IS_ERROR_KEY: True, 'id': '9'},
+]
+
 
 def _reply_ids() -> list[str]:
     return ['lock_charter_error', 'success_false', 'empty_dict', 'non_dict']
+
+
+def _transport_reply_ids() -> list[str]:
+    return ['raw_unparsed_text', 'mcp_is_error_flag']
 
 
 def test_a_rejected_write_is_counted_as_a_failure_not_as_a_migration():
@@ -580,7 +613,12 @@ def test_a_rejected_write_is_counted_as_a_failure_not_as_a_migration():
     present in ``failed``: double-counting it would keep the copied/dropped
     figures wrong in exactly the direction that hides the problem.
     """
-    for reply, name in zip(REJECTION_REPLIES, _reply_ids(), strict=True):
+    cases = list(zip(
+        REJECTION_REPLIES + TRANSPORT_REJECTION_REPLIES,
+        _reply_ids() + _transport_reply_ids(),
+        strict=True,
+    ))
+    for reply, name in cases:
         client = _CannedProject(
             [_task('r1', modules=['scripts/a.py'])],
             update_reply=lambda args, _r=reply: _r,
@@ -774,3 +812,429 @@ def test_a_second_pass_over_the_migrated_metadata_is_a_no_op():
         0, 0, 0, 0,
     )
     assert second.visited == len(OUTCOME_CASES)
+
+
+# ---------------------------------------------------------------------------
+# Amendment pass: shapes the migration must refuse rather than silently absorb.
+# ---------------------------------------------------------------------------
+
+
+def test_a_non_list_modules_is_named_as_a_failure_and_never_written():
+    """A bare-string ``modules`` must NOT be quietly emptied into a clean report.
+
+    THIS IS THE SILENT-DESTRUCTION SHAPE. ``metadata`` is free-form JSON and
+    malformed scalars demonstrably exist in these corpora — this migration's
+    own run hit reify 5050, whose ``metadata.milestone`` is the bool ``true``
+    where a mapping is required. Nothing makes ``modules`` immune.
+
+    Every step downstream degrades quietly rather than raising:
+    ``strip_directory_locks`` iterates its argument, so ``'scripts/a.py'``
+    explodes into single characters; none is a file path; the sanitised list is
+    empty; the outcome reads as the perfectly innocuous ``sanitized_empty``;
+    and the ``metadata_mode='replace'`` write drops the ``modules`` key
+    outright. Scope destroyed, report clean, ``failed`` zero.
+
+    Asserting NO WRITE AT ALL, not merely the counter: the report being right
+    is worth little if the record was already emptied on the way to it.
+    """
+    for value, name in [
+        ('scripts/a.py', 'bare string'),
+        ({'scripts/a.py': True}, 'dict'),
+        (7, 'int'),
+    ]:
+        client = _CannedProject([_task('m1', modules=value)])
+
+        counts = _run(client)
+
+        assert client.updates == [], name
+        assert counts.failed == 1, name
+        assert (counts.copied, counts.sanitized_empty, counts.dropped) == (0, 0, 0), name
+
+
+def test_a_non_list_files_is_refused_for_the_same_reason():
+    """The other free-form key on the same write. Same degradation, same refusal.
+
+    ``files`` reaches the payload verbatim on the drop branch, so a malformed
+    one would be re-sent as-is under replace mode — and a truthy non-list would
+    also be walked character-by-character by the directory-lock pre-check.
+    """
+    client = _CannedProject([_task('f1', modules=['scripts/a.py'], files='src/b.py')])
+
+    counts = _run(client)
+
+    assert client.updates == []
+    assert counts.failed == 1
+
+
+def test_the_malformed_record_is_named_on_stderr_with_its_type(capsys):
+    """An operator has to be told WHICH record and WHAT shape, not just a total.
+
+    The type name is what turns the line into an actionable one: a ``str``
+    ``modules`` is a mis-serialised list and a ``dict`` is something else
+    entirely, and the repair differs.
+    """
+    _run(_CannedProject([_task('m1', modules='scripts/a.py')]))
+
+    err = capsys.readouterr().err
+    assert 'm1' in err
+    assert 'malformed modules' in err
+    assert 'str' in err
+
+
+def test_a_malformed_record_is_reported_by_the_dry_run_too(capsys):
+    """The dry-run must surface it, because the dry-run is what the claim is read off.
+
+    The migration's user-observable signal is "the final dry-run reports zero
+    pending actions". A record the live path would refuse, but the dry-run
+    passed over in silence, would let that claim be made over a corpus still
+    holding an unmigratable task.
+    """
+    counts = _run(_CannedProject([_task('m1', modules='scripts/a.py')]), dry_run=True)
+
+    assert counts.failed == 1
+    assert 'malformed modules' in capsys.readouterr().err
+
+
+def test_a_drop_branch_task_whose_files_carry_directory_locks_cannot_converge(capsys):
+    """The gate the COPY branch was sanitised against, tripped by the DROP branch.
+
+    The drop branch re-sends the task's pre-existing ``files`` verbatim, and
+    ``metadata_mode='replace'`` means ``_reject_directory_locks_in_update_metadata``
+    inspects the whole payload's ``files`` rather than the delta. So a task
+    whose own ``files`` already holds a directory-shaped entry is rejected on
+    every pass, forever: it can never converge, and a run reporting it as a
+    ``dropped`` success would keep claiming progress it never made.
+
+    Reported as a NAMED FAILURE rather than sanitised: unlike the copy branch —
+    where ``files`` is empty and there is nothing to lose — sanitising here
+    would silently narrow a scope the record actually carries. The migration's
+    job is to move ``modules``, not to edit anyone's ``files``.
+    """
+    client = _CannedProject([
+        _task('d1', modules=['crates/reify-core'], files=['orchestrator/tests/']),
+    ])
+
+    counts = _run(client)
+
+    assert client.updates == []
+    assert (counts.failed, counts.dropped) == (1, 0)
+    err = capsys.readouterr().err
+    assert 'd1' in err
+    assert 'orchestrator/tests/' in err
+
+
+def test_the_undroppable_task_is_surfaced_by_the_dry_run_as_well(capsys):
+    """Same reasoning as the malformed record: the dry-run is the evidence surface."""
+    counts = _run(
+        _CannedProject([
+            _task('d1', modules=['crates/reify-core'], files=['orchestrator/tests/']),
+        ]),
+        dry_run=True,
+    )
+
+    assert counts.failed == 1
+    assert 'directory-shaped' in capsys.readouterr().err
+
+
+def test_a_file_level_files_list_still_drops_cleanly():
+    """THE POSITIVE CONTROL for the pre-check: an ordinary drop is untouched by it.
+
+    A gate-conformance check that also rejected conformant payloads would turn
+    the entire drop branch — 426 of the 437 live pending actions — into
+    failures.
+    """
+    client = _CannedProject([_task('d2', modules=['crates/reify-core'], files=['src/b.py'])])
+
+    counts = _run(client)
+
+    assert _written(client, 'd2')['files'] == ['src/b.py']
+    assert (counts.failed, counts.dropped) == (0, 1)
+
+
+# ---------------------------------------------------------------------------
+# Amendment pass: a root that was never read is not a clean root.
+# ---------------------------------------------------------------------------
+
+
+class _UnreadableProject:
+    """A root whose ``get_tasks`` never yields a task list.
+
+    Two failure modes, one double: the call RAISES, or it ANSWERS with
+    something carrying no positive signal. They are covered together because
+    they produce the IDENTICAL zeroed per-root line, which is the whole bug.
+
+    ``update_task`` is asserted-unreachable rather than stubbed: a root whose
+    tasks could not be read must never reach the write path at all.
+    """
+
+    def __init__(self, *, raises: Exception | None = None, reply: Any = None) -> None:
+        self._raises = raises
+        self._reply = reply
+        self.updates: list[dict] = []
+
+    async def call_tool(self, name: str, arguments: dict) -> Any:
+        if name != 'get_tasks':
+            raise AssertionError(f'unreadable root must not reach {name}')
+        if self._raises is not None:
+            raise self._raises
+        return self._reply
+
+
+def test_a_root_whose_read_raises_is_counted_as_read_failed(capsys):
+    """``visited=0 failed=0`` must not be the report for a root nobody could read.
+
+    This is the same silent-success class the write path already closed, left
+    open on the read path. The task's headline claim — "six of seven roots are
+    at zero pending" — is transcribed from exactly this per-root line, so a
+    root the script never managed to read is otherwise indistinguishable from a
+    root that is genuinely finished.
+
+    ``RuntimeError`` rather than a transport error so the retry ladder does not
+    fire: the retry path has its own tests below.
+    """
+    counts = _run(_UnreadableProject(raises=RuntimeError('connection refused')))
+
+    assert counts.read_failed == 1
+    assert (counts.visited, counts.copied, counts.dropped, counts.failed) == (0, 0, 0, 0)
+    err = capsys.readouterr().err
+    assert 'RuntimeError' in err
+    assert 'connection refused' in err
+
+
+def test_a_read_that_answers_with_no_task_list_is_also_read_failed():
+    """The server ANSWERING uselessly is as unread as the server not answering.
+
+    Every shape here is one this script's own transport can deliver: a bare
+    ``{}`` from ``_post``'s 202/empty-body return, an error reply from
+    ``@mcp_tool_errors``, the ``_raw`` not-JSON fallback, and a non-dict. The
+    read is classified with the same predicate as the write, because the
+    question is the same one: does this reply carry a positive signal.
+    """
+    for reply, name in [
+        ({}, 'empty dict'),
+        ({'error': 'boom', 'error_type': 'TaskNotFoundError'}, 'error reply'),
+        ({migrate_mod.RAW_REPLY_KEY: 'Error calling tool get_tasks'}, 'raw text'),
+        ('not a dict', 'non dict'),
+    ]:
+        counts = _run(_UnreadableProject(reply=reply))
+
+        assert counts.read_failed == 1, name
+        assert counts.visited == 0, name
+
+
+def test_an_empty_but_readable_project_is_not_a_read_failure():
+    """THE POSITIVE CONTROL: a project with no tasks reads fine and is clean.
+
+    ``{'tasks': []}`` carries a positive signal — the server answered with a
+    list that happens to be empty. Conflating it with an unreadable root would
+    make three of the seven live corpora permanently red.
+    """
+    counts = _run(_CannedProject([]))
+
+    assert (counts.read_failed, counts.visited) == (0, 0)
+
+
+def test_a_read_failure_reaches_the_operator_and_the_exit_status(monkeypatch, capsys):
+    """It has to be visible on the per-root line, in the summary, AND in ``$?``.
+
+    A migration that could not read a root and still exited 0 will be recorded
+    as a green run by anything driving it non-interactively — and the run
+    evidence for this task is transcribed from precisely this stdout.
+    """
+    rc = _run_main(monkeypatch, _UnreadableProject(raises=RuntimeError('nope')))
+
+    assert rc != 0
+    per_project, summary = capsys.readouterr().out.split('---- summary ----')
+    assert 'read_failed=1' in per_project
+    assert 'read_failed: 1' in summary
+
+
+# ---------------------------------------------------------------------------
+# Amendment pass: transport failures are named, and retried.
+# ---------------------------------------------------------------------------
+
+
+def test_a_transport_failure_names_the_exception_class(monkeypatch, capsys):
+    """``httpx.ReadTimeout`` stringifies to ``''``. The class name is the whole message.
+
+    NOT HYPOTHETICAL: the live run of this migration lost four writes this way
+    and printed four bare ``update_task raised:`` lines with nothing after the
+    colon. The operator could not tell "retry it" from "escalate it" without
+    re-measuring by hand, which is exactly what had to happen.
+    """
+    monkeypatch.setattr(migrate_mod, 'CALL_RETRY_BACKOFF_S', 0)
+
+    def _always_times_out(args: dict) -> dict:
+        raise httpx.ReadTimeout('')
+
+    counts = _run(_CannedProject(
+        [_task('t1', modules=['scripts/a.py'])], update_reply=_always_times_out,
+    ))
+
+    assert counts.failed == 1
+    err = capsys.readouterr().err
+    assert 'ReadTimeout' in err
+    assert 't1' in err
+
+
+def test_a_transient_transport_failure_is_retried_rather_than_lost(monkeypatch):
+    """The write is idempotent, so the four Class-B losses were absorbable in-script.
+
+    A full replace-mode payload computed from the task's own metadata can be
+    re-sent any number of times to the same effect, which is what makes the
+    retry safe. The live run needed a hand-driven targeted retry pass to
+    recover these; this removes that step.
+    """
+    monkeypatch.setattr(migrate_mod, 'CALL_RETRY_BACKOFF_S', 0)
+    attempts: list[dict] = []
+
+    def _flaky(args: dict) -> dict:
+        attempts.append(args)
+        if len(attempts) < migrate_mod.CALL_RETRY_ATTEMPTS:
+            raise httpx.ReadTimeout('')
+        return {'success': True}
+
+    client = _CannedProject(
+        [_task('t1', modules=['scripts/a.py'])], update_reply=_flaky,
+    )
+
+    counts = _run(client)
+
+    assert len(attempts) == migrate_mod.CALL_RETRY_ATTEMPTS
+    assert (counts.copied, counts.failed) == (1, 0)
+    assert _written(client, 't1')['files'] == ['scripts/a.py']
+
+
+def test_a_server_rejection_is_never_retried(monkeypatch):
+    """A GUARD MUST NOT BE RETRIED INTO SUBMISSION — and structurally cannot be.
+
+    Only ``httpx.TransportError`` is retried, and a server-side rejection never
+    raises at all: ``@mcp_tool_errors`` converts it into an ordinary reply. So a
+    rejected write is attempted exactly ONCE, which is what keeps a retry
+    ladder from turning a deterministic gate failure into N identical ones in
+    the log — and from hammering a server that is refusing on purpose.
+    """
+    monkeypatch.setattr(migrate_mod, 'CALL_RETRY_BACKOFF_S', 0)
+    client = _CannedProject(
+        [_task('r1', modules=['scripts/a.py'])],
+        update_reply=lambda args: {'error': 'lock charter', 'error_type': 'GuardError'},
+    )
+
+    counts = _run(client)
+
+    assert len(client.updates) == 1
+    assert counts.failed == 1
+
+
+# ---------------------------------------------------------------------------
+# Amendment pass: the transport must PRODUCE the shapes the classifier rejects.
+# ---------------------------------------------------------------------------
+
+
+def _call_tool_against(result: dict) -> Any:
+    """Drive the REAL ``call_tool`` with ``_post`` stubbed. No socket, as ever."""
+    client = FusedMemoryClient('http://127.0.0.1:9')
+
+    async def _fake_post(payload: dict) -> dict:
+        return result
+
+    client._post = _fake_post
+    return asyncio.run(client.call_tool('update_task', {}))
+
+
+def test_call_tool_marks_an_unparseable_text_reply_instead_of_swallowing_it():
+    """The classifier can only reject ``_raw`` if the transport still produces it.
+
+    Pinned end to end — the transport's fallback and the classifier's verdict —
+    because the two halves are what make the hole closed: a reply the script
+    cannot parse must arrive at the classifier wearing a marker, and the
+    classifier must call that marker a failure.
+    """
+    reply = _call_tool_against({'result': {'content': [
+        {'type': 'text', 'text': 'Error calling tool update_task: boom'},
+    ]}})
+
+    assert reply[migrate_mod.RAW_REPLY_KEY].startswith('Error calling tool')
+    assert migrate_mod.write_failure_reason(reply) is not None
+
+
+def test_call_tool_propagates_the_mcp_is_error_flag():
+    """``isError`` lives on the ENVELOPE, so a successful-looking payload can carry it.
+
+    FastMCP sets it for failures that never enter an ``@mcp_tool_errors``-
+    decorated body at all — argument validation, the
+    ``_install_safe_tool_wrapper`` backstop — and those payloads have no
+    ``error`` key inside them. Discarding the flag left the classifier
+    structurally unable to see that whole class.
+    """
+    reply = _call_tool_against({'result': {
+        'isError': True,
+        'structuredContent': {'id': '9', 'status': 'pending'},
+    }})
+
+    assert reply[migrate_mod.MCP_IS_ERROR_KEY] is True
+    assert migrate_mod.write_failure_reason(reply) is not None
+
+
+def test_call_tool_leaves_an_ordinary_success_reply_unmarked():
+    """THE POSITIVE CONTROL: neither marker appears on a clean reply."""
+    reply = _call_tool_against({'result': {
+        'structuredContent': {'id': '9', 'status': 'pending'},
+    }})
+
+    assert reply == {'id': '9', 'status': 'pending'}
+    assert migrate_mod.write_failure_reason(reply) is None
+
+
+# ---------------------------------------------------------------------------
+# Amendment pass: drift guard against the sibling script's copy.
+# ---------------------------------------------------------------------------
+
+
+def test_the_two_reply_classifiers_agree_on_every_shared_shape():
+    """DRIFT GUARD. ``write_failure_reason`` and ``classify_reply`` are twins.
+
+    ``scripts/repair_wiped_metadata_files.py:classify_reply`` implements the
+    same four load-bearing checks in the same order, with the same
+    ``error_type`` naming and the same falsy-``success`` rule. Deduplicating
+    them is not available in the obvious direction — repair imports
+    :class:`FusedMemoryClient` FROM this script's module, so importing back
+    would invert the layering — and the reverse (repair delegating to this one)
+    is a change to a file this task holds no lock on.
+
+    So the copies stay, and this pins them together instead: the house pattern
+    already used for the other deliberate duplicate in this repo
+    (``shared/locking`` vs ``lock_charter_guard.py``, held by explicit equality
+    drift-guard tests). Feed the shared vector through both, assert the
+    verdicts match. Without it, one copy can move and nothing goes red.
+    """
+    for reply, name in zip(REJECTION_REPLIES, _reply_ids(), strict=True):
+        assert migrate_mod.write_failure_reason(reply) is not None, name
+        assert classify_reply(reply).ok is False, name
+
+    for reply in [{'success': True}, {'id': '9', 'status': 'pending'}]:
+        assert migrate_mod.write_failure_reason(reply) is None, reply
+        assert classify_reply(reply).ok is True, reply
+
+
+def test_the_known_divergence_between_the_two_classifiers_is_pinned_not_assumed():
+    """The drift the guard above cannot fix, recorded as an executable fact.
+
+    This script's classifier is STRICTLY STRICTER than the sibling's: it
+    rejects the two transport-stamped shapes, and ``classify_reply`` still
+    passes them. That is real drift and it is one-directional — the sibling has
+    the hole this amendment closed here.
+
+    Pinned rather than left implicit so the follow-up that makes
+    ``classify_reply`` delegate to :func:`write_failure_reason` FLIPS these
+    assertions and is forced to notice, instead of a silent behaviour change in
+    a script that repairs live task metadata. The divergence is safe in the
+    meantime because it is one-way: nothing this script accepts is rejected
+    over there.
+    """
+    for reply, name in zip(
+        TRANSPORT_REJECTION_REPLIES, _transport_reply_ids(), strict=True,
+    ):
+        assert migrate_mod.write_failure_reason(reply) is not None, name
+        # The DEBT, asserted: the sibling copy still reads these as successes.
+        assert classify_reply(reply).ok is True, name
