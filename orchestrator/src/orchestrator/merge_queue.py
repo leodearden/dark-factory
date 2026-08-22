@@ -2459,6 +2459,7 @@ async def _run_post_merge_verify(
     main_health_probe_handles: _MainHealthProbeHandles | None = None,
     depth: int | None = None,
     speculative: bool | None = None,
+    chain_items: int = 1,
     merge_base_sha: str | None = None,
     main_sha: str | None = None,
 ) -> MergeOutcome | None:
@@ -2578,6 +2579,17 @@ async def _run_post_merge_verify(
         speculative: Mirrors ``item.speculative``; threaded straight into
             ``pool.dispatch`` alongside *depth*.  ``None`` (default) keeps
             every existing caller byte-identical.
+        chain_items: 1-indexed count of queued items contained in the tree
+            this verify exercises (task 3185, PRD γ); threaded straight into
+            ``pool.dispatch`` alongside *depth*/*speculative*, at the initial
+            dispatch AND at BOTH retry dispatches — a retry re-verifies the
+            same tree, so dropping back to the default there would understate
+            depth in exactly the rows the deep-fail-rate reader keys on.
+            Unlike *depth*/*speculative* this defaults to ``1``, not ``None``:
+            a count of items in a verified tree has a smallest TRUTHFUL value
+            of 1, so every existing caller (``reverify_member_solo``,
+            ``_do_train_merge``, ``merge_gates._reverify_rebased_tree``) keeps
+            emitting an honest single-item count with no edit.
         merge_base_sha: Dispatch-time merge-base SHA (task 2383 β, 2357:
             caller-supplied, never re-derived here).  Paired with *main_sha*
             to classify a non-preexisting task-fault failure via
@@ -2815,7 +2827,10 @@ async def _run_post_merge_verify(
         ):
             await stack.enter_async_context(git_ops.merge_verify_lease())
 
-        verify = await pool.dispatch(merge_sha, spec, depth=depth, speculative=speculative)
+        verify = await pool.dispatch(
+            merge_sha, spec, depth=depth, speculative=speculative,
+            chain_items=chain_items,
+        )
 
         # Transient-infra (disk pressure) retry: an ENOSPC failure is
         # often a self-healing host condition.  Prune stale _merge-*
@@ -2836,6 +2851,7 @@ async def _run_post_merge_verify(
                 )
                 verify = await pool.dispatch(
                     merge_sha, spec, attempt=1, depth=depth, speculative=speculative,
+                    chain_items=chain_items,
                 )
         # Classified infra-transient retry (task ν, verify-scope-inversion-prd.md):
         # a failing VerifyResult whose category is policy-table infra-transient
@@ -2943,7 +2959,8 @@ async def _run_post_merge_verify(
                     req.task_id, verify.category, retries[req.task_id], budget, narrowed,
                 )
                 verify = await pool.dispatch(
-                    merge_sha, spec, attempt=retries[req.task_id], depth=depth, speculative=speculative,
+                    merge_sha, spec, attempt=retries[req.task_id], depth=depth,
+                    speculative=speculative, chain_items=chain_items,
                 )
 
     # Invoke the optional result-capture callback (PRD §10 invariant 6(b)):

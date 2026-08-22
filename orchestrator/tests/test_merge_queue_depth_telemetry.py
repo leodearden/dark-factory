@@ -285,6 +285,9 @@ class TestRunPostMergeVerifyChainItemsPlumbing:
         config = _make_bare_config()
         req = _make_request('t-chain', 'task/t-chain', tmp_path, config)
         git_ops = _make_git_ops_mock()
+        # The ENOSPC arm prunes stale merge worktrees before its retry; the
+        # shared mock does not stub it, and a bare MagicMock is not awaitable.
+        git_ops.prune_stale_merge_worktrees = AsyncMock(return_value=[])
         captured: list[dict] = []
         seq = list(results)
 
