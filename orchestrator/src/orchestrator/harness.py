@@ -12338,14 +12338,51 @@ class Harness:
         consecutive_unclean: int = 0
         consecutive_degenerate_clean: int = 0  # task 1430: exponential floor on fast-clean exits
         while True:
+            # Best-effort digest check (task 1327) — runs on EVERY supervisor
+            # iteration, ahead of the empty-queue precheck below (task 4559).
+            # Single call site: it applies to the bypass, clean and unclean
+            # paths alike, and is deliberately NOT duplicated into the bypass
+            # branch.
+            #
+            # It used to sit after the rotation, which made it unreachable
+            # exactly when it matters most: once the EWA breaker halts
+            # dispatch the L1 queue drains, the precheck below starts
+            # returning False, and its `continue` returns to the loop top —
+            # never reaching the digest.  A paused fleet could therefore never
+            # re-evaluate the EWA that paused it, which is why both 2026
+            # paused windows produced zero digests.
+            #
+            # The digest stays gated on the event-count threshold inside
+            # _maybe_write_digest, so running it per poll interval rather than
+            # per rotation is a cheap no-op on most iterations.
+            #
+            # Never allowed to break the supervisor: CancelledError re-raised,
+            # AttributeError re-raised (task 1449: surfaces state-init drift to
+            # tests rather than converting it to a silent warning log),
+            # every other runtime exception logged and swallowed.
+            try:
+                await self._maybe_write_digest()
+            except asyncio.CancelledError:
+                raise
+            except AttributeError:
+                raise  # task 1449: surface fixture-drift / state-init bugs to tests
+            except Exception:
+                logger.warning(
+                    '_maybe_write_digest raised unexpectedly in supervisor loop '
+                    '(best-effort swallowed)',
+                    exc_info=True,
+                )
+
             # task 2629: pre-boot empty-queue precheck.  Skip the (expensive)
             # rotation launch entirely when the L1 queue has no actionable
             # work; fails open (see _watcher_has_actionable_l1) so a precheck
             # bug can never silently stop real L1 handling.  Deliberately
             # placed before `start = time.monotonic()` and does not touch the
-            # clean/unclean/degenerate counters, the guards, or
-            # _maybe_write_digest — this is a pure pre-boot bypass, not a
-            # rotation outcome.
+            # clean/unclean/degenerate counters or the guards — this is a pure
+            # pre-boot bypass, not a rotation outcome.  It is also genuinely
+            # unaffected by the digest check, which now runs ABOVE it (task
+            # 4559); before that hoist this comment's claim was false, because
+            # the `continue` below skipped the digest's only call site.
             if not self._watcher_has_actionable_l1():
                 poll = self.config.watcher_empty_queue_poll_secs
                 logger.debug(
@@ -12384,25 +12421,6 @@ class Harness:
                 and bool(getattr(result, 'success', False))
                 and not bool(getattr(result, 'timed_out', False))
             )
-
-            # Best-effort digest check after each rotation (task 1327).
-            # Single call site — applies to both clean and unclean paths.
-            # Never allowed to break the supervisor: CancelledError re-raised,
-            # AttributeError re-raised (task 1449: surfaces state-init drift to
-            # tests rather than converting it to a silent warning log),
-            # every other runtime exception logged and swallowed.
-            try:
-                await self._maybe_write_digest()
-            except asyncio.CancelledError:
-                raise
-            except AttributeError:
-                raise  # task 1449: surface fixture-drift / state-init bugs to tests
-            except Exception:
-                logger.warning(
-                    '_maybe_write_digest raised unexpectedly in supervisor loop '
-                    '(best-effort swallowed)',
-                    exc_info=True,
-                )
 
             if clean:
                 # Healthy rotation completed — reset backoff.

@@ -2194,9 +2194,18 @@ class TestHarnessEwaTrip:
 
 
 class TestWatcherSupervisorCallsMaybeWriteDigest:
-    """Tests that _watcher_supervisor_loop calls _maybe_write_digest after each rotation.
+    """Tests that _watcher_supervisor_loop calls _maybe_write_digest.
 
     Task 1327 — AFK hardening (step-24 impl).
+
+    Task 4559 moved the single call site from after the rotation to the TOP of
+    the loop body, above the empty-queue precheck, so a paused-and-drained
+    fleet still re-evaluates the EWA that paused it.  The digest therefore runs
+    once per supervisor ITERATION rather than once per completed rotation.
+    Each fixture below enters two iterations (the second one cancels at the
+    rotation), so the expected await count is 2, not 1.  What these tests pin
+    is unchanged: clean AND unclean rotations both reach the digest, and a
+    raising digest never breaks the supervisor.
     """
 
     @pytest.mark.asyncio
@@ -2223,7 +2232,12 @@ class TestWatcherSupervisorCallsMaybeWriteDigest:
         with patch('asyncio.sleep', side_effect=fast_sleep), pytest.raises(asyncio.CancelledError):
             await harness._watcher_supervisor_loop()
 
-        harness._maybe_write_digest.assert_awaited_once()
+        # Two iterations are entered; the digest runs at the top of each
+        # (task 4559 hoist).
+        assert harness._maybe_write_digest.await_count == 2, (
+            f'Expected one digest check per supervisor iteration (2 iterations '
+            f'entered); await_count={harness._maybe_write_digest.await_count}'
+        )
 
     @pytest.mark.asyncio
     async def test_unclean_exit_also_triggers_maybe_write_digest(
@@ -2254,7 +2268,12 @@ class TestWatcherSupervisorCallsMaybeWriteDigest:
         with patch('asyncio.sleep', side_effect=fast_sleep), pytest.raises(asyncio.CancelledError):
             await harness._watcher_supervisor_loop()
 
-        harness._maybe_write_digest.assert_awaited_once()
+        # Two iterations are entered; the digest runs at the top of each
+        # (task 4559 hoist).
+        assert harness._maybe_write_digest.await_count == 2, (
+            f'Expected one digest check per supervisor iteration (2 iterations '
+            f'entered); await_count={harness._maybe_write_digest.await_count}'
+        )
 
     @pytest.mark.asyncio
     async def test_maybe_write_digest_raising_does_not_break_supervisor(
@@ -2291,8 +2310,12 @@ class TestWatcherSupervisorCallsMaybeWriteDigest:
             f'Supervisor must loop to next rotation after digest failure; '
             f'rotation_count={rotation_count}'
         )
-        # _maybe_write_digest was called once (on the first rotation).
-        harness._maybe_write_digest.assert_awaited_once()
+        # The digest ran (and raised) at the top of BOTH iterations — proving
+        # the swallow keeps the loop alive every time, not just once.
+        assert harness._maybe_write_digest.await_count == 2, (
+            f'Expected one digest check per supervisor iteration (2 iterations '
+            f'entered); await_count={harness._maybe_write_digest.await_count}'
+        )
 
 
 # ---------------------------------------------------------------------------
