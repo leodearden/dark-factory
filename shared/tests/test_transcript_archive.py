@@ -1652,11 +1652,11 @@ class TestRestoreArchivedTranscript:
 
         monkeypatch.setattr(transcript_archive_module.shutil, 'copyfile', _boom)
 
-        with caplog.at_level(logging.WARNING, logger='shared.transcript_archive'):
-            with pytest.raises(OSError) as excinfo:
-                restore_archived_transcript(
-                    root, task_id, sid, config_dir, strict=True
-                )
+        with (
+            caplog.at_level(logging.WARNING, logger='shared.transcript_archive'),
+            pytest.raises(OSError) as excinfo,
+        ):
+            restore_archived_transcript(root, task_id, sid, config_dir, strict=True)
 
         assert excinfo.value.errno == errno.ENOSPC
         warnings = [r for r in caplog.records if r.levelno == logging.WARNING]

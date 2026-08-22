@@ -12405,13 +12405,26 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             # up") and so could not answer the archive-coverage question
             # caveat U2 poses.  Four disjoint values:
             #   'disabled'  — restore_from_archive is off; nothing was tried.
-            #   'miss'      — the archive holds no entry for this session.
-            #                 THIS is the archive-coverage signal: a steady
-            #                 pre_flight count that is overwhelmingly 'miss'
-            #                 means archives are not being written, not that
-            #                 the restore is broken.
-            #   'fault'     — the restore raised (malformed transcript_archive
-            #                 root, None project_root, unreadable archive).
+            #   'miss'      — the archive genuinely holds no entry for this
+            #                 session, and NOTHING ELSE: the restore is called
+            #                 with strict=True, so a fault raises instead of
+            #                 returning the same None a miss does. Before that
+            #                 this value meant "no entry OR the restore blew up
+            #                 quietly", which made it useless as the signal it
+            #                 is meant to be. THIS is the archive-coverage
+            #                 signal: a steady pre_flight count that is
+            #                 overwhelmingly 'miss' means archives are not
+            #                 being written, not that the restore is broken.
+            #   'fault'     — the restore raised. TWO classes, both landing in
+            #                 the one handler below: archive-root COMPOSITION
+            #                 (malformed transcript_archive root, None
+            #                 project_root — resolve_archive_root is not
+            #                 total), and restore-INTERNAL I/O (unreadable
+            #                 archive, ENOSPC part-way, corrupt gzip member, an
+            #                 unwritable destination parent). The second class
+            #                 is the majority of what really happens and is
+            #                 reachable only because of that strict=True; it
+            #                 used to be swallowed and mis-counted as 'miss'.
             #   'published' — the restore claimed success and the CLI-facing
             #                 locator STILL cannot see the result.  Pathological
             #                 and unreachable by construction (a published

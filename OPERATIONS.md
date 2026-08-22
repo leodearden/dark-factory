@@ -1501,7 +1501,7 @@ broken, so split on it before concluding anything:
 | `restore` | What it means | What to do |
 |---|---|---|
 | `miss` | The durable archive holds no entry for that session. | **Archive-coverage problem, not a resume problem** — work the archival subsection above (`transcript_archive:` WARNINGs, archival-storm L1). |
-| `fault` | The restore itself raised — malformed `transcript_archive.root`, a `None` `project_root`, an unreadable archive. | Grep the log for `session_resume_restore_fault`; it is a config/IO fault, and the dispatch degraded to FRESH rather than failing. |
+| `fault` | The restore itself raised. Two classes: **archive-root composition** (malformed `transcript_archive.root`, a `None` `project_root`) and **restore-internal I/O** (unreadable archive, ENOSPC part-way, corrupt gzip member, an unwritable destination parent) — the second is the common one. | Grep the log for `session_resume_restore_fault` (dispatch layer: task, role, session) and `transcript_restore_fault` (helper layer: `errno`, `path`). The two fire as a **pair for one fault**, so count one of them, not their sum. It is a config/IO fault, and the dispatch degraded to FRESH rather than failing. |
 | `disabled` | `session_resume.restore_from_archive` is off. | Expected while the kill switch is pulled; the veto and these events keep running so you do not go blind. |
 | `published` | The restore reported success and the CLI-facing locator still could not see it. | Unreachable by construction — a real occurrence is a bug in the restore/locator pair, not an operations issue. Escalate with the session id. |
 
@@ -1536,6 +1536,9 @@ expected; what matters is *why*, and the `restore` split above answers it
 without a filesystem sweep. `restore='miss'` dominating means **archives are
 missing** — the transcript was gone and there was nothing to rehydrate from, so
 work archive coverage (the `OK`/`MISS` loop above) rather than the resume path.
+That advice is sound *because* faults no longer land in `miss`: the restore is
+called in strict mode, so a broken restore raises into `fault` instead of
+returning the same empty-handed `None` an absent archive does.
 `restore='fault'` dominating means the restore path itself is broken and
 coverage is a red herring. Note `restore='published'` should never appear at
 all: a published restore satisfies the corroboration, so no veto — and no

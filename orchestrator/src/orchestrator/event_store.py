@@ -295,8 +295,12 @@ class EventType(StrEnum):
     #                --resume the CLI would reject. data: {stage, session_id,
     #                role, restore} — `restore` is the rehydration OUTCOME, one
     #                of 'disabled' (session_resume.restore_from_archive off),
-    #                'miss' (no archive entry for that session — the
-    #                archive-COVERAGE signal), 'fault' (the restore raised) or
+    #                'miss' (the archive genuinely holds no entry for that
+    #                session and nothing else — the archive-COVERAGE signal),
+    #                'fault' (the restore raised: archive-root composition OR
+    #                the restore's own I/O, the latter reaching this arm only
+    #                because _invoke calls the helper with strict=True — see
+    #                the restore_outcome vocabulary comment in workflow.py) or
     #                'published' (restore claimed success yet the CLI-facing
     #                locator still cannot see it: pathological, unreachable by
     #                construction, counted rather than assumed away).
