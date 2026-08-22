@@ -4424,6 +4424,16 @@ def _install_driver_doubles(
 #: doubles would spend seconds proving nothing extra.
 _SMALL_RUN = {'cluster_limit': 2, 'distractor_limit': 12, 'project_suffix': 'utest'}
 
+#: The same run with the +1-re-emission probe OFF, for the assertions below
+#: whose subject IS the six-arm pipeline's shape — "three collections", "one
+#: fetch per arm", "this exact teardown set".  Those stay pinned to three
+#: because that is what they are about; the probed counterparts live in
+#: `TestRunBakeOffRegrowthWiring`, which owns the two injected passes.  The
+#: assertions that are about a SEAM rather than a count (the queue repoint,
+#: the api-key clear, the seeding bound, the serial fetch) deliberately keep
+#: the probe on, so they cover its passes too.
+_SIX_ARM_RUN = {**_SMALL_RUN, 'regrowth': False}
+
 
 class TestEphemeralCollectionIdentity:
     """A collection nobody can reap is a leak, so its NAME is a contract."""
@@ -4557,7 +4567,7 @@ class TestRunBakeOffWiring:
         mod = _mod()
         _install_driver_doubles(monkeypatch)
 
-        report = await mod.run_bake_off(**_SMALL_RUN)
+        report = await mod.run_bake_off(**_SIX_ARM_RUN)
 
         service = _FakeMemoryService.instances[-1]
         assert len(_FakeMemoryService.instances) == 1
@@ -4727,7 +4737,10 @@ class TestRunBakeOffWiring:
         await mod.run_bake_off(**_SMALL_RUN)
 
         instances = _FakeMemoryService.instances[-1].mem0.instances
-        assert len(instances) == 3
+        # Every seeded project, the two INJECTED passes included: they go
+        # through the same `seed_arm`, so an unstubbed instance there is the
+        # same contended write, in a collection nobody was watching.
+        assert len(instances) == len(mod.ARM_SHAPES) + len(mod.REGROWTH_MODES)
         for instance in instances.values():
             assert instance.db.add_history is not _FakeInstance._SENTINEL
             assert instance.db.add_history('anything', keyword=1) is None
@@ -4748,7 +4761,12 @@ class TestRunBakeOffWiring:
         for project_id, content in added:
             by_project.setdefault(project_id, set()).add(content)
 
-        assert len(by_project) == 3
+        # Including the two injected passes: `regrowth_corpus` is the ratified
+        # arm's records PLUS the re-emissions, so a pass that lost the slab
+        # would be ranking against a thinner field than its own baseline —
+        # and the delta would report the missing contamination, not the
+        # re-emission.
+        assert len(by_project) == len(mod.ARM_SHAPES) + len(mod.REGROWTH_MODES)
         for contents in by_project.values():
             assert slab_contents <= contents
 
@@ -4850,7 +4868,13 @@ class TestRunBakeOffWiring:
         searches = _FakeMemoryService.instances[-1].mem0.searches
         issued = [(project_id, query) for project_id, query, _ in searches]
         assert len(issued) == len(set(issued))          # no query issued twice
-        assert len({project_id for project_id, _ in issued}) == 3
+        # One project per seeded corpus, the two injected passes included:
+        # the probe's THREE read arms are scored off one fetch each for the
+        # same reason the pin variants are — three ANN draws would make the
+        # read-arm comparison uncontrolled and triple its cost.
+        assert len({project_id for project_id, _ in issued}) == (
+            len(mod.ARM_SHAPES) + len(mod.REGROWTH_MODES)
+        )
 
     async def test_the_guard_probe_over_fetches_to_cover_its_own_removal(
         self, monkeypatch,
@@ -4911,7 +4935,10 @@ class TestRunBakeOffWiring:
         monkeypatch.setattr(mod, 'fetch_arm', _capture)
         await mod.run_bake_off(**_SMALL_RUN)
 
-        assert len(captured) == len(mod.ARM_SHAPES)  # the probe path ran per arm
+        # Per seeded corpus, injected passes included: those carry the same
+        # `status_quo`-free flat peers, but the drop is provenance-based and
+        # has to hold for a corpus the arm loop never built.
+        assert len(captured) == len(mod.ARM_SHAPES) + len(mod.REGROWTH_MODES)
         # status_quo stores the alpha record verbatim under its own memory_id,
         # so this is the arm where a self-hit is even possible.  Checked
         # per-cluster: another cluster's probe record is a legitimate hit.
@@ -4928,7 +4955,7 @@ class TestRunBakeOffWiring:
         drops = _install_driver_doubles(monkeypatch)
         expected = set(mod.ephemeral_collections(suffix='utest').values())
 
-        await mod.run_bake_off(**_SMALL_RUN)
+        await mod.run_bake_off(**_SIX_ARM_RUN)
 
         assert len(drops.calls) == 2
         assert set(drops.calls[0]) == expected
@@ -4944,7 +4971,7 @@ class TestRunBakeOffWiring:
         expected = set(mod.ephemeral_collections(suffix='utest').values())
 
         with pytest.raises(RuntimeError, match='qdrant went away'):
-            await mod.run_bake_off(**_SMALL_RUN)
+            await mod.run_bake_off(**_SIX_ARM_RUN)
 
         assert set(drops.calls[-1]) == expected
         assert _FakeMemoryService.instances[-1].closed is True

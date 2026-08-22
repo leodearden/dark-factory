@@ -133,6 +133,26 @@ forbids the suppression filter leaking into ``MemoryService.search``, where
 it would break ``mem0_dedup.find_prior_memories``' post-filter and hide
 candidates from the write guard.
 
+THE +1-RE-EMISSION REGROWTH PROBE (task 4012)
+--------------------------------------------
+esc-3200-3 was a SPLIT ratification: Option C's WRITE shape was ratified, no
+read transform was, and the read choice was delegated to 4004 (which selected
+the promoting topic pin).  Neither answered what ONE organic re-emission of
+an already-canonical claim costs retrieval under that shape, or whether the
+selected transform absorbs it.  So on top of the six arms, every default run
+also seeds the ratified ``c_peers`` corpus PLUS one near-duplicate
+re-emission per topic — twice, once ``unstamped`` (no ``topic`` key at all,
+the organically observed case) and once ``stamped`` (the write path's best
+case) — and scores each injected pass under three READ arms: ``flat``,
+``additive_pin`` and 4004's selected ``promoting_pin``.  The un-injected
+baseline is the ratified arm's OWN rankings, so a delta contains the
+re-emission's contribution and not ANN noise between two seedings.  The
+deltas, and the ``stamped - unstamped`` difference that is what task 4006's
+stamping campaign buys, land in the report's ``regrowth`` block and its
+``## Regrowth deltas`` section.  ``--no-regrowth`` skips it, and the block is
+then an explicit ``None`` rather than an absent key.  NO threshold is
+asserted on any delta (gate G6).
+
 STRUCTURE
 ---------
 A thick **pure core** (loaders, arm materialization, read transforms,
@@ -4630,6 +4650,35 @@ async def run_arm(
 #: would omit the transform 4004 actually selected.
 REGROWTH_SHAPE = 'c_peers'
 
+
+def regrowth_pass_key(mode: str) -> str:
+    """The cache slot and collection name for one injected pass.
+
+    Named a "pass key" rather than a shape because it is NOT one: the
+    injected corpus is still the ratified ``c_peers`` write shape, and the
+    ``SeededArm`` built over it keeps ``shape == REGROWTH_SHAPE`` so
+    :func:`read_path` behaves identically.  What this key distinguishes is
+    which CORPUS was seeded, which is exactly what the fetch cache and the
+    Qdrant collection have to tell apart.
+
+    Underscores only, already lowercase.  :func:`arm_project_id`
+    interpolates this into a project id that ``Scope`` canonicalizes
+    (lowercased, ``-`` to ``_``), so a key that canonicalized differently
+    would have mem0 write to one collection name while the teardown swept
+    another — a collection leaked on every run, under the reapable prefix
+    but never actually reaped.
+
+    Carries the mode in the name so a leaked collection is attributable in
+    the reaper's output rather than merely present.
+    """
+    if mode not in REGROWTH_MODES:
+        raise ValueError(
+            f'unknown regrowth mode {mode!r} — the probe measures exactly '
+            f'{REGROWTH_MODES} (REGROWTH_MODES)'
+        )
+    return f'{REGROWTH_SHAPE}_regrowth_{mode}'
+
+
 #: The three read arms, pinned by EQUALITY like ``ARM_SHAPES``.
 REGROWTH_READ_ARMS: tuple[str, ...] = ('flat', 'additive_pin', 'promoting_pin')
 
@@ -4727,6 +4776,23 @@ def _pluck_regrowth_metrics(measurement: dict[str, Any]) -> dict[str, Any]:
         for metric, (block, key) in zip(
             _regrowth_metric_keys(), REGROWTH_METRICS, strict=True,
         )
+    }
+
+
+def _plucked_regrowth_arms(
+    measurements: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """:func:`measure_regrowth_arms`' full blocks, projected per arm.
+
+    The seam between the two halves of the probe: the fan-out returns whole
+    ``measure_arm`` blocks (which is what makes each arm's numbers auditable
+    against the arm tables), while the delta arithmetic is defined over the
+    flat ``REGROWTH_METRICS`` projection.  Both drivers go through here, so
+    a live block and a replayed one cannot be projected differently.
+    """
+    return {
+        arm: _pluck_regrowth_metrics(measurement)
+        for arm, measurement in measurements.items()
     }
 
 
@@ -4874,16 +4940,28 @@ async def run_bake_off(
     project_suffix: str | None = None,
     dump_fetches_to: str | Path | None = None,
     replay_fetches_from: str | Path | None = None,
+    regrowth: bool = True,
 ) -> dict[str, Any]:
     """Seed, query, measure, tear down — and return the validated report.
 
     Fixtures are loaded and cross-validated FIRST, before a collection
     exists: a fixture checked after seeding would leave three live
-    collections behind on every typo.
+    collections behind on every typo.  The injection slab is loaded on the
+    same road and under the same rule, but only when *regrowth* is set — a
+    probe-less run must not fail on a fixture it never reads.
+
+    *regrowth* defaults to ON.  This artifact is gate leaf eta's input and
+    esc-3200-3 asked for these deltas by name; a probe that had to be opted
+    INTO would go missing again exactly the way it went missing the first
+    time, and the artifact would carry no trace of the omission.  When it is
+    off the report's ``regrowth`` key is an explicit ``None``.
 
     Raises :class:`FixtureError` for any fixture problem, and re-raises
     anything a live run throws — but never without tearing down, because the
-    failure that leaks is the mid-run one.
+    failure that leaks is the mid-run one.  The two INJECTED passes seed into
+    two more ephemeral collections, and both ``drop_collections`` calls name
+    them: a probe that leaked one would leave it live on every run while the
+    report it returned looked perfect.
     """
     from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
     from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
@@ -4896,10 +4974,22 @@ async def run_bake_off(
     cross_validate_fixtures(
         clusters=clusters, topics=topics, claims=claims, queries=queries,
     )
+    # Loaded and cross-validated against the FULL claim set, before the
+    # subset and before a collection exists — the same rule the five above
+    # follow.  Validating only the subset would let a smoke run pass over a
+    # slab that is broken outside its two clusters.
+    injections: list[RegrowthInjection] = []
+    if regrowth:
+        injections = load_regrowth_injections(DEFAULT_REGROWTH_INJECTION_PATH)
+        cross_validate_regrowth_injections(injections=injections, claims=claims)
 
     clusters, topics, claims, queries = _subset(
         clusters, topics, claims, queries, cluster_limit,
     )
+    # The injections follow their clusters.  A `--clusters N` run that kept
+    # the whole slab would inject re-emissions of claims it never seeded,
+    # and every one of them would be scored as a miss.
+    injections = [i for i in injections if i.cluster_id in clusters]
     if distractor_limit is not None:
         distractors = distractors[:distractor_limit]
 
@@ -4928,9 +5018,18 @@ async def run_bake_off(
             alpha_fixture=alpha_fixture, registry=registry,
             arm_claims=arm_claims, query_set=query_set,
             distractor_slab=distractor_slab, seed_concurrency=seed_concurrency,
+            injections=injections,
         )
 
     collections = ephemeral_collections(suffix=project_suffix)
+    if regrowth:
+        # Merged into the SAME dict the pre-run sweep and the `finally`
+        # teardown both iterate, rather than tracked alongside it: a second
+        # collection list is a second thing to forget.
+        collections.update(ephemeral_collections(
+            shapes=tuple(regrowth_pass_key(mode) for mode in REGROWTH_MODES),
+            suffix=project_suffix,
+        ))
 
     config = (config or FusedMemoryConfig()).model_copy(deep=True)
     config.mem0.collection_prefix = ephemeral_collection_prefix()
@@ -4982,10 +5081,13 @@ async def run_bake_off(
     arms: dict[str, Any] = {}
     fetched_by_shape: dict[str, dict[str, dict[str, list[ScoredHit]]]] = {}
     records_by_shape: dict[str, list[ArmRecord]] = {}
+    baseline: dict[str, dict[str, Any]] = {}
+    after_by_mode: dict[str, dict[str, dict[str, Any]]] = {}
     try:
         drop_collections(collections.values(), qdrant_url=qdrant_url)
         await memory.initialize()
         guard_threshold = resolve_guard_threshold(memory)
+        base_records: list[ArmRecord] = []
         for shape in ARM_SHAPES:
             records = materialize_arm(shape, clusters, claims, topics, distractors)
             seeded = _index_arm(
@@ -5001,8 +5103,19 @@ async def run_bake_off(
             # always was.  The rankings handed to `run_arm` are the same
             # objects that get dumped, so the cache cannot describe a fetch
             # that differs from the one measured.
+            #
+            # The probe additionally captures the RATIFIED arm's fetches,
+            # because they ARE its baseline: `measure_arm` is pure over
+            # `(SeededArm, fetched)`, so the un-injected side is scored from
+            # the very rankings the decision table above is built from.  A
+            # separately seeded control collection would put HNSW
+            # insertion-order noise between the two sides — exactly the
+            # difference a delta must not contain.
+            capture = dump_fetches_to is not None or (
+                regrowth and shape == REGROWTH_SHAPE
+            )
             fetched: dict[str, dict[str, list[ScoredHit]]] | None = None
-            if dump_fetches_to is not None:
+            if capture:
                 fetched = await fetch_arm(
                     memory.mem0, seeded, queries, probes, limit=limit,
                 )
@@ -5013,10 +5126,59 @@ async def run_bake_off(
                 limit=limit, estimator=estimator,
                 guard_threshold=guard_threshold, fetched=fetched,
             ))
+            if regrowth and shape == REGROWTH_SHAPE:
+                base_records = records
+                baseline = _plucked_regrowth_arms(measure_regrowth_arms(
+                    seeded, fetched, queries=queries, probes=probes,
+                    estimator=estimator, guard_threshold=guard_threshold,
+                    limit=limit,
+                ))
+
+        # The two injected passes, INSIDE the try so the `finally` below
+        # still reaps their collections when one of them raises mid-seed.
+        for mode in REGROWTH_MODES if regrowth else ():
+            key = regrowth_pass_key(mode)
+            injected = regrowth_corpus(
+                base_records, injections, claims, clusters, mode=mode,
+            )
+            # `shape` stays REGROWTH_SHAPE, never the pass key: the pass key
+            # names the collection and the cache slot, and `read_path`
+            # branches on `seeded.shape`.  Passing the key here would silently
+            # take the grouped-read branch out of play for a corpus that is
+            # still the ratified flat one.
+            seeded_pass = _index_arm(
+                REGROWTH_SHAPE,
+                arm_project_id(key, suffix=project_suffix),
+                collections[key],
+                injected,
+                claims,
+            )
+            await seed_arm(memory.mem0, seeded_pass, concurrency=seed_concurrency)
+            injected_fetched = await fetch_arm(
+                memory.mem0, seeded_pass, queries, probes, limit=limit,
+            )
+            fetched_by_shape[key] = injected_fetched
+            records_by_shape[key] = injected
+            after_by_mode[mode] = _plucked_regrowth_arms(measure_regrowth_arms(
+                seeded_pass, injected_fetched, queries=queries, probes=probes,
+                estimator=estimator, guard_threshold=guard_threshold,
+                limit=limit,
+            ))
     finally:
         await memory.close()
         drop_collections(collections.values(), qdrant_url=qdrant_url)
         shutil.rmtree(queue_dir, ignore_errors=True)
+
+    # Pure, and computed before the dump so the cache's fixture list and the
+    # protocol block's are decided by the same value.
+    regrowth_block: dict[str, Any] | None = None
+    if regrowth:
+        regrowth_block = build_regrowth_block(
+            baseline=baseline,
+            after_by_mode=after_by_mode,
+            injections=injections,
+            fixture_path=DEFAULT_REGROWTH_INJECTION_PATH,
+        )
 
     # AFTER the measurement, and after teardown: a cache written mid-run would
     # survive a run that then died before reporting, and would then be
@@ -5026,21 +5188,20 @@ async def run_bake_off(
             dump_fetches_to, fetched_by_shape,
             provenance=fetch_cache_provenance(
                 records_by_shape=records_by_shape,
-                fixtures=[
+                # The injection slab joins the digest list only on a probed
+                # run.  Additive: `load_fetches` compares fixtures as a
+                # path -> sha MAPPING over the CALLER's list, so a wider cache
+                # still satisfies `read_transform_selection`'s narrower
+                # five-fixture check.
+                fixtures=_protocol_fixture_paths([
                     alpha_fixture, registry, arm_claims, query_set,
                     distractor_slab,
-                ],
+                ], regrowth=regrowth_block),
                 search_limit=limit,
                 guard_threshold=guard_threshold,
                 embedder_model=config.embedder.model,
             ),
         )
-
-    # The two injected passes are wired into the drivers in the next step;
-    # until they are, no run produces a block, and BOTH the report's
-    # `regrowth` key and the fixture-provenance claim below correctly say so
-    # rather than claiming a fixture this run never opened.
-    regrowth_block: dict[str, Any] | None = None
 
     return build_report(
         arms=arms,
@@ -5068,6 +5229,11 @@ async def run_bake_off(
             'clusters_measured': len(clusters),
             'queries_measured': len(queries),
             'guard_probes_measured': len(probes),
+            # Same reason `clusters_measured` is here: a reader holding the
+            # artifact must not have to infer the probe's coverage from
+            # whether a table looks populated.
+            'regrowth_probed': bool(regrowth),
+            'regrowth_injections_measured': len(injections),
             'collections': sorted(collections.values()),
             # Explicit `None` rather than an absent key: every measured cell
             # in a replayed report is identical to a live one, so a reader has
@@ -5097,6 +5263,7 @@ async def _replay_bake_off(
     query_set: str | Path,
     distractor_slab: str | Path,
     seed_concurrency: int,
+    injections: list[RegrowthInjection],
 ) -> dict[str, Any]:
     """The same report, recomputed from a committed cache. No network at all.
 
@@ -5109,6 +5276,14 @@ async def _replay_bake_off(
     ``guard_threshold`` and ``embedder_model`` come from the cache's
     provenance because they are live-only values (:3264, :3297); defaulting
     either would feed the threshold replay a number the store never produced.
+
+    The regrowth probe replays on the same terms: both injected corpora are
+    rebuilt locally from *injections* and joined to their own cached pass
+    keys, so a replayed block is a real measurement rather than a
+    transcription of one and must come out byte-identical to the live one.
+    An EMPTY *injections* list is how a ``--no-regrowth`` replay says so —
+    the two pass keys are then never requested, which is what keeps a cache
+    dumped before this probe existed replayable for the six arms.
     """
     provenance = load_fetch_provenance(cache_path)
     for key in ('guard_threshold', 'embedder_model'):
@@ -5157,11 +5332,52 @@ async def _replay_bake_off(
             fetched=replayed[shape],
         ))
 
-    # The two injected passes are wired into the drivers in the next step;
-    # until they are, no run produces a block, and BOTH the report's
-    # `regrowth` key and the fixture-provenance claim below correctly say so
-    # rather than claiming a fixture this run never opened.
     regrowth_block: dict[str, Any] | None = None
+    if injections:
+        seeded_by_pass = {
+            regrowth_pass_key(mode): _index_arm(
+                # REGROWTH_SHAPE, not the pass key — see the live driver.
+                REGROWTH_SHAPE,
+                arm_project_id(regrowth_pass_key(mode), suffix=project_suffix),
+                f'<replay:{regrowth_pass_key(mode)}>',
+                regrowth_corpus(
+                    seeded_by_shape[REGROWTH_SHAPE].records,
+                    injections, claims, clusters, mode=mode,
+                ),
+                claims,
+            )
+            for mode in REGROWTH_MODES
+        }
+        # A SECOND `load_fetches`, with the injection slab as its own
+        # expectation, rather than folding a sixth path into the call above.
+        # The five originals must keep verifying on their own: a cache dumped
+        # before this probe existed (4004's committed `e2_fetch_cache.json`,
+        # which `read_transform_selection` reads) carries no injection digest,
+        # and a merged list would make it unloadable for the E2 arms.
+        replayed_passes = load_fetches(
+            cache_path, seeded_by_pass,
+            expect_query_ids=[query.query_id for query in queries],
+            expect_limit=limit,
+            expect_fixtures=[DEFAULT_REGROWTH_INJECTION_PATH],
+        )
+        regrowth_block = build_regrowth_block(
+            baseline=_plucked_regrowth_arms(measure_regrowth_arms(
+                seeded_by_shape[REGROWTH_SHAPE], replayed[REGROWTH_SHAPE],
+                queries=queries, probes=probes, estimator=estimator,
+                guard_threshold=guard_threshold, limit=limit,
+            )),
+            after_by_mode={
+                mode: _plucked_regrowth_arms(measure_regrowth_arms(
+                    seeded_by_pass[regrowth_pass_key(mode)],
+                    replayed_passes[regrowth_pass_key(mode)],
+                    queries=queries, probes=probes, estimator=estimator,
+                    guard_threshold=guard_threshold, limit=limit,
+                ))
+                for mode in REGROWTH_MODES
+            },
+            injections=injections,
+            fixture_path=DEFAULT_REGROWTH_INJECTION_PATH,
+        )
 
     return build_report(
         arms=arms,
@@ -5185,8 +5401,10 @@ async def _replay_bake_off(
             'clusters_measured': len(clusters),
             'queries_measured': len(queries),
             'guard_probes_measured': len(probes),
+            'regrowth_probed': regrowth_block is not None,
+            'regrowth_injections_measured': len(injections),
             # EMPTY, not the names a live run would have used: this run
-            # created no collection, and printing three it never touched would
+            # created no collection, and printing five it never touched would
             # put an unmeasured resource into the audit trail.
             'collections': [],
             'replayed_from': str(cache_path),
@@ -5244,6 +5462,16 @@ def build_parser() -> Any:
     parser.add_argument('--replay-fetches', default=None,
                         help=('measure from a dumped ranking cache instead of '
                               'seeding: no Qdrant, no embedder, no collections'))
+    # Default ON, and only turnable OFF.  The artifact is gate leaf eta's
+    # input and esc-3200-3 asked for these deltas by name: an opt-IN probe
+    # would go missing again exactly the way it went missing the first time,
+    # and the artifact would carry no trace of the omission.
+    parser.add_argument('--no-regrowth', dest='regrowth', action='store_false',
+                        default=True,
+                        help=('skip the +1-re-emission regrowth probe: two '
+                              'fewer seeded collections and two fewer fetch '
+                              'passes, and the report carries an explicit '
+                              'null regrowth block'))
     return parser
 
 
@@ -5289,6 +5517,7 @@ async def _run(args: Any) -> int:
             project_suffix=args.project_suffix,
             dump_fetches_to=args.dump_fetches,
             replay_fetches_from=args.replay_fetches,
+            regrowth=args.regrowth,
         )
     except FixtureError as exc:
         print(f'fixture error: {exc}', file=sys.stderr)
