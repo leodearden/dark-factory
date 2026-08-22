@@ -18,6 +18,14 @@ addressed here at all. What IS in this repo's control, and what this
 constant targets, is the RETRY facet: an agent that reads the rejection
 correctly does not need three wasted turns to recover from it.
 
+A second finding shares this module rather than a sibling file: census
+2026-08-21 §1.1 (`plans/confusion-census-2026-08-21.md`, task 4578) is a
+THIRD `InputValidationError` shape — a call that parsed fine and named a
+real, accepted parameter, but omitted a required sibling. That shape is
+named `MISSING_REQUIRED_PARAMETER_REJECTION` and composes into
+`TOOL_CALL_REJECTION_GUIDANCE` alongside the original two-shape text above;
+this module now anchors two census findings under one splice unit.
+
 Its real effect is on model behaviour and is not unit-testable, but silent
 removal during a prompt refactor is a genuine regression — the repo
 sanctions exactly this kind of "mandated token present in each role prompt"
@@ -35,6 +43,7 @@ from __future__ import annotations
 
 from orchestrator.agents.roles import (
     BACKGROUND_WAIT_GUIDANCE,
+    MISSING_REQUIRED_PARAMETER_REJECTION,
     ROLES,
     TOOL_CALL_REJECTION_GUIDANCE,
 )
@@ -94,6 +103,35 @@ def test_tool_call_rejection_guidance_is_nonempty() -> None:
         'for this constant still passes when it is — the empty string is a '
         'substring of anything — so this assertion is the sole guard against '
         'the census-4273 guidance being silently dropped in a prompt refactor.'
+    )
+
+
+def test_missing_required_parameter_shape_is_a_nonempty_brace_free_constant() -> None:
+    """The third-shape constant exists, is non-empty, and stays brace-free.
+
+    Mirrors `test_tool_call_rejection_guidance_is_nonempty` for the
+    non-empty half — the same vacuous-containment risk applies once this
+    constant is composed into `TOOL_CALL_REJECTION_GUIDANCE` in step-4: an
+    emptied constant would still satisfy every `in` check written against
+    it. Mirrors `test_wait_pattern_constants_have_no_literal_braces` for the
+    brace-free half — role prompts are concatenated with plain `+`, never
+    f-string-interpolated, and staying brace-free keeps this constant safe
+    at any future interpolating splice site.
+    """
+    assert MISSING_REQUIRED_PARAMETER_REJECTION.strip(), (
+        'MISSING_REQUIRED_PARAMETER_REJECTION is empty. Every containment test '
+        'written against it — including its own composition into '
+        'TOOL_CALL_REJECTION_GUIDANCE — still passes when it is, since the '
+        'empty string is a substring of anything; this assertion is the sole '
+        'guard against the census-4578 guidance being silently dropped.'
+    )
+    assert '{' not in MISSING_REQUIRED_PARAMETER_REJECTION and (
+        '}' not in MISSING_REQUIRED_PARAMETER_REJECTION
+    ), (
+        'MISSING_REQUIRED_PARAMETER_REJECTION contains a literal brace. Role '
+        'prompts are deliberately not f-strings, but this constant is held '
+        'brace-free defensively so it stays interpolation-safe if a future '
+        'splice site needs it.'
     )
 
 
