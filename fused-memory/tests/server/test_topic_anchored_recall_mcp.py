@@ -223,3 +223,130 @@ class TestGuardSeamStillAdmitsDissimilarWrites:
 
         # The pre-check's own search performed the anchor lookup.
         assert service.mem0.scroll_by_metadata.await_count >= 1
+
+
+_CHILD_ID = 'amendment-0001'
+_CHILD_BODY = 'The amendment that narrows the gate decision rule to layout v3.'
+
+
+class TestPinnedCanonicalWithChildrenInTheWindow:
+    """THE INTERESTING HALF of the composition proof with task 3129.
+
+    The class above covers only the NEGATIVE grouping interaction (a
+    child-SHAPED canonical is refused). This covers the positive one: a
+    canonical reached BOTH by the pin (index 0, relevance_score 0.0) AND by
+    upward resolution from a lower-ranked child hit. That path lands in
+    ``group_search_results``' ``existing is not None`` branch, which keeps the
+    FIRST entry's position and takes ``max(...)`` of the two scores — so the
+    pin's slot 0 must survive the dedup, the pinned entry must gain its
+    ``grouped`` block, and the canonical must be emitted exactly ONCE.
+
+    Nothing else asserts this: it is precisely where a pinned record could be
+    silently duplicated, demoted to the child's rank, or emitted without the
+    grouping the MCP boundary exists to add.
+    """
+
+    @staticmethod
+    def _amendment_child_hit() -> dict:
+        """A child of the canonical, as Mem0Backend.search returns it."""
+        return {
+            'id': _CHILD_ID,
+            'memory': _CHILD_BODY,
+            'score': 0.81,
+            'metadata': {
+                'category': 'procedural_knowledge',
+                'topic': _TOPIC,
+                'kind': 'amendment',
+                'parent_id': _CANONICAL_ID,
+            },
+        }
+
+    @classmethod
+    def _wire_children(cls, service) -> None:
+        """Dispatch the two backend reads by FILTER, not by call order.
+
+        The anchor lookup and the amendment-digest scroll both land on
+        ``scroll_by_metadata``, and grouping issues its counts concurrently, so
+        a positional ``side_effect`` list would bind the wrong answer to the
+        wrong question the moment either call order changed.
+        """
+        service.mem0.search = AsyncMock(return_value={'results': [
+            _sibling(1),
+            cls._amendment_child_hit(),
+        ]})
+
+        async def _scroll(_scope, filters, _limit):
+            if filters.get('canonical') is True:
+                return [_canonical_payload()]
+            if filters.get('parent_id') == _CANONICAL_ID:
+                return [{
+                    'id': _CHILD_ID,
+                    'created_at': '2026-08-11T00:00:00+00:00',
+                    'metadata': {'kind': 'amendment', 'parent_id': _CANONICAL_ID,
+                                 'data': _CHILD_BODY},
+                }]
+            return []
+
+        async def _count(_scope, filters):
+            if filters.get('parent_id') != _CANONICAL_ID:
+                return 0
+            return 0 if filters.get('kind') == 'sighting' else 1
+
+        service.mem0.scroll_by_metadata = AsyncMock(side_effect=_scroll)
+        service.mem0.count_by_metadata = AsyncMock(side_effect=_count)
+
+    @pytest.mark.asyncio
+    async def test_pin_keeps_slot_zero_and_absorbs_its_matched_child(self, service):
+        self._wire_children(service)
+        server = create_mcp_server(service)
+
+        response = await server._tool_manager.call_tool('search', {
+            'query': 'which harness layout does the gate decision rule accept',
+            'project_id': _PROJECT_ID,
+            'categories': ['procedural_knowledge'],
+            'stores': ['mem0'],
+            'limit': 5,
+        })
+
+        results = response['results']
+        assert [r['id'] for r in results].count(_CANONICAL_ID) == 1, (
+            'reached both by the pin and by upward resolution — still ONE entry'
+        )
+        first = results[0]
+        assert first['id'] == _CANONICAL_ID
+        assert first['topic_anchored'] is True, (
+            "the dedup keeps the FIRST entry, so it must be the PIN's dump — "
+            'an upward-resolved parent would carry topic_anchored False'
+        )
+        # The child folded into the pin rather than surviving as its own hit.
+        assert _CHILD_ID not in [r['id'] for r in results]
+        grouped = first['grouped']
+        assert grouped['amendment_count'] == 1
+        assert [a['id'] for a in grouped['amendments']] == [_CHILD_ID]
+        # Pinned in full by _pin_matched_child: a swallowed child's text must
+        # never be less reachable than it was before grouping ran.
+        assert grouped['amendments'][0]['content'] == _CHILD_BODY
+
+    @pytest.mark.asyncio
+    async def test_dedup_keeps_the_higher_score_without_moving_the_pin(self, service):
+        """``max(...)`` of the two scores, at the PIN's position.
+
+        The pin is scored 0.0 by contract (order-only, never a synthetic
+        score), so the surviving entry takes the child's real RRF score — while
+        staying exactly where the pin put it.
+        """
+        self._wire_children(service)
+        server = create_mcp_server(service)
+
+        response = await server._tool_manager.call_tool('search', {
+            'query': 'harness layout gate',
+            'project_id': _PROJECT_ID,
+            'categories': ['procedural_knowledge'],
+            'stores': ['mem0'],
+            'limit': 5,
+        })
+
+        first = response['results'][0]
+        assert first['id'] == _CANONICAL_ID
+        assert first['relevance_score'] > 0.0
+        assert response['results'][1]['id'] == 'sibling-1'
