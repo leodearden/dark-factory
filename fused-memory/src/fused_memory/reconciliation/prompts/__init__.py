@@ -237,6 +237,27 @@ work against it.\
 # reaches whenever it files informational / cross_project findings), and cite_task returns
 # it from BOTH in-run cited-task folds (task-2425 project-scoped, task-2432 entity-scoped,
 # the latter with no stage carve-out) — so the salvage protocol has to reach all of them.
+# Canonical finding-provenance metadata keys (esc-3796-1, task 4373).
+#
+# The recon prompts have always mandated CAPTURING a Stage-1 `finding_id`, but
+# never said WHERE to persist it on a task filed from that finding. Neither key
+# has a code writer — the PROMPT is the writer — so an unnamed key is an
+# uninstructed one, and the corpus duly forked into 64 bespoke spellings. These
+# constants are the ratified names, single-sourced: every prompt surface that
+# names a finding-provenance metadata key interpolates them, so the three
+# stages cannot drift apart and a future rename is one edit rather than a hunt.
+#
+# Deliberately plain string literals, NOT imported from
+# `shared.task_metadata`: this module imports stdlib only, and widening the
+# prompt-import path to reach the allowlist would couple prompt rendering to
+# the task-metadata package for a two-token agreement. That agreement is
+# enforced instead by tests/test_finding_provenance_prompt_guidance.py, which
+# cross-checks both constants against `parse_metadata` — where this repo
+# already puts its drift guards.
+FINDING_ID_METADATA_KEY = 'source_finding_id'
+FINDING_MEMORY_IDS_METADATA_KEY = 'related_memory_ids'
+
+
 # Do NOT re-inline a per-stage copy; reword HERE. Keep the enumeration open-ended rather
 # than counting the paths: an exact count that a real response can contradict tells an
 # agent the shape it just received cannot occur, which is exactly what invites the
@@ -440,7 +461,15 @@ def _render_recon_report_tool_guidance(
     return (
         'The harness calls `mcp__recon-report__start_report` for you before the stage begins'
         f' — do NOT call it yourself. For each finding, call `{add_finding_call}`'
-        ' and capture the `finding_id` from the response. Then attach typed citations:\n'
+        ' and capture the `finding_id` from the response.'
+        ' When that finding\'s provenance is persisted on a task, the canonical'
+        f' metadata keys are `metadata.{FINDING_ID_METADATA_KEY}` for the'
+        ' `finding_id` captured verbatim above, and'
+        f' `metadata.{FINDING_MEMORY_IDS_METADATA_KEY}` for the memory ids that'
+        ' finding cites. Those two spellings are the whole vocabulary: never'
+        ' invent a per-topic variant of either name. A genuinely one-off'
+        ' annotation belongs under the `x_` namespace instead, which is'
+        ' silently allowed. Then attach typed citations:\n'
         f'- `{cite_entity_call}` —'
         ' pass the ENTITY NAME (not a UUID); the server resolves the UUID internally.\n'
         f'- `{cite_edge_call}` —'
