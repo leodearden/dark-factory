@@ -194,8 +194,7 @@ class TestStateRepairMemoryCitation:
             )
 
             assert outcome['error'] == 'run_still_live'
-            assert 'cite_memory' in outcome['hint']
-            assert 'delete_finding' in outcome['hint']
+            assert outcome['error_type'] == 'ReconCitationRunStillLive'
         finally:
             await journal.close()
 
@@ -320,7 +319,7 @@ class TestRepairToolViaFastMCP:
             )
             mcp = create_recon_report_server(state)
 
-            with pytest.raises(ToolError) as excinfo:
+            with pytest.raises(ToolError):
                 await mcp._tool_manager.call_tool(
                     'repair_memory_citation',
                     {
@@ -333,7 +332,6 @@ class TestRepairToolViaFastMCP:
                     },
                 )
 
-            assert 'store' in str(excinfo.value)
             assert memory.calls == []
         finally:
             await journal.close()

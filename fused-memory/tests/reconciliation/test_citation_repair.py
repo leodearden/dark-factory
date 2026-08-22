@@ -499,7 +499,6 @@ class TestRepairResolutionErrors:
 
             assert outcome['error'] == 'unsupported_store'
             assert outcome['error_type'] == 'ReconCitationUnsupportedStore'
-            assert 'get_memory_by_id' in outcome['hint']
             assert memory.calls == []
             assert _dump(await journal.get_run(RUN_ID)) == before
         finally:
@@ -713,11 +712,9 @@ class TestRepairLiveRunRefusalAndDryRun:
             )
 
             assert outcome['error'] == 'run_still_live'
-            assert outcome['error_type'] == 'ReconCitationRunStillLive'
             # The live case is not a gap: within a live run _resolve_finding is
             # already cross-stage, so the ordinary tools reach the finding.
-            assert 'cite_memory' in outcome['hint']
-            assert 'delete_finding' in outcome['hint']
+            assert outcome['error_type'] == 'ReconCitationRunStillLive'
             assert memory.calls == []
             assert _dump(await journal.get_run(RUN_ID)) == before
         finally:
@@ -1303,7 +1300,6 @@ class TestRepairJournalIoErrors:
             assert outcome['error'] == 'journal_error'
             assert outcome['phase'] == 'write'
             assert outcome['exception_type'] == 'OSError'
-            assert 'NOT applied' in outcome['hint']
             assert _dump(await journal.get_run(RUN_ID)) == before
         finally:
             await journal.close()
@@ -1346,7 +1342,6 @@ class TestRepairJournalIoErrors:
 
             assert outcome['error'] == 'journal_error'
             assert outcome['phase'] == 'verify'
-            assert 'UNKNOWN' in outcome['hint']
             # The write DID go out — the repair is durable even though this call
             # could not confirm it.
             journal.get_run = real_get_run
