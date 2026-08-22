@@ -117,16 +117,27 @@ Verified first-hand, so the PRD is not sold on a false urgency:
 - **Scheduling is not blocked** — but this is an *inference*, not the measured zero an earlier draft
   claimed. `has_live_claimant(row, now, ttl=300s)` returns **False** on real leaked rows (run
   directly against four of them, with a synthetic-fresh positive control returning `True`). The
-  earlier "zero `dispatch refused: live claimant` lines against 168,458 journal lines" was **wrong on
-  both halves**: the real 7-day fleet corpus is **989,331** lines (`orchestrator-dark-factory`
-  557,007 + `orchestrator-reify` 432,324), and it contains **one** hit, not zero —
-  `Task 6218 dispatch refused: live claimant 'run-277928f28748/6218-39c75d2c/pid=1805896'`
-  (2026-08-18). The grep string is byte-identical to the emitter's format string
-  (`scheduler.py:4941-4945`), so the search was sound and the zero was simply false. Inspecting that
-  hit rescues the conclusion: `pid=1805896` is the pid of the emitting process itself, i.e. a **fresh
-  self-claim inside the C3.1 teardown window** — the gate working as designed, not a leaked row
-  blocking dispatch. **No leaked row has been observed to block a dispatch; that is a reasoned
-  inference from one inspected hit, not a measured absence.**
+  earlier "zero `dispatch refused: live claimant` lines against a control of 168,458 journal lines"
+  was wrong, and its first correction was wrong too. **State the journal claim carefully or not at
+  all** — it decays fast:
+
+  - The journal retains only what has not rotated. As of 2026-08-22 the earliest retained entry for
+    **both** units is `2026-08-18T20:47` — a **~3.5-day** window, not 7 days — and
+    `journalctl --since "7 days ago"` silently returns only the retained subset, so any
+    "N lines over 7 days" denominator is mislabelled by construction.
+  - Within the retained window the refusal string appears **0** times today. A refusal *was*
+    observed on 2026-08-18 (`Task 6218 … pid=1805896` — the emitting process's own pid, i.e. a fresh
+    self-claim inside the C3.1 teardown window, the gate working as designed). That entry has since
+    **aged out and is no longer reproducible.**
+  - The emitter is a **format string** (`scheduler.py:4939-4943`,
+    `'Task %s dispatch refused: live claimant %r (task 2408 mechanism 1)'`), so grepping the literal
+    *including* `%s`/`%r` returns a guaranteed zero. Grep the stable prefix
+    `dispatch refused: live claimant`, always against a known-positive control.
+
+  **Conclusion at its real strength:** no leaked row has been *observed* to block a dispatch, and the
+  one refusal ever inspected was a live self-claim rather than a leaked row. That is an inference
+  from a single expired observation — **not** a measured absence, and not re-verifiable from today's
+  journal.
 - **Completion is not blocked** — demonstrated by the 4028 write above.
 - **Dependency release is not blocked.** `_deps_satisfied` (`scheduler.py:4319-4328`) does not read
   the claimant. (It *could*: alongside `status_map: dict[str, str]` it also receives
@@ -153,13 +164,12 @@ Four mechanisms, one repair.
    `is_stranded_blocked` and (negated) `has_live_claimant`, and all three already delegate to it.
    The only duplication is the verbatim `metadata.infra_hold` block copied at `:137-139` and
    `:180-182`, which the new predicate absorbs. The same module also gains the two predicates the
-   contract needs (`violates_terminal_claimant_invariant`, `is_stale_nonterminal_claimant`) and the
-   shared `DEFAULT_CLAIMANT_HEARTBEAT_TTL`, so ε and ζ consume one definition instead of minting
-   their own.
-4. **Detect violations on a recurring census** — a terminal row observed carrying a claimant is a
-   logical error: log a structured fact per row and file one born-at-L2 escalation per episode,
-   never raising. The detector runs as a **recurring invocation of the ζ census**, not as a hook in
-   the reconcile sweep — see D8 for why the sweep cannot host it.
+   contract needs (`violates_terminal_claimant_invariant`, `is_stale_hygiene_tier_claimant`) and the
+   shared `DEFAULT_CLAIMANT_HEARTBEAT_TTL`, repointing the four existing hand-maintained TTL copies
+   at it so ζ — and the detection PRD after it — consume one definition instead of minting more.
+4. **Detection is deferred** — a terminal row carrying a claimant is a logical error, but the
+   unattended alarm gets its own PRD (D8). What lands here is the *substrate* for it: α's executable
+   predicate and ζ's on-demand census, so an operator can observe the invariant today.
 5. **Repair the existing rows** with a corroborating, staleness-gated operator script.
 
 ## Resolved design decisions
@@ -224,7 +234,7 @@ metadata check "becomes permanently dead but harmless" post-omega4. Retain it �
 costs nothing — but boundary test B9 pins a shape with zero live instances, and this PRD should not
 claim the carve-out is protecting live traffic.
 
-### D5 — Alarm shape: loud, deduped, never raising
+### D5 — Alarm shape (carried forward to the detection PRD, not built here)
 
 The detector runs one census pass over every row (D8). A synchronous `assert` anywhere on a shared
 path would propagate and collateral-strand siblings — the failure class the isolation guard at
@@ -251,13 +261,24 @@ path would propagate and collateral-strand siblings — the failure class the is
   obligation this PRD does not budget for. The closest in-repo analogue —
   `TaskWorkflow._escalate_scope_invariant_violation` (`workflow.py:14183`), literally an
   invariant-violation escalation — reuses an existing category and discriminates on a load-bearing
-  `summary` substring. ε copies that. It also keeps the PRD's "no novel substrate" claim true.
+  `summary` substring. **But the transplant fails**: that precedent is born at **L0**
+  (`severity='blocking'`, no `level` ⇒ default 0) and its discriminator is consumed by an L0-only
+  reaper (`if esc.level != 0: continue`, `harness.py:11831`), so a born-at-L2 record changes level,
+  role and severity and no consumer can see it. `infra_issue` is also the largest category in both
+  corpora (829/2,693 on dark-factory, 13 already pending at L2). The detection PRD must pick a
+  discriminator that actually discriminates.
 - **`agent_role='orchestrator-deterministic'` is load-bearing, not decoration.** It is in
   `L2_AUTO_CLOSE_DENY_ROLES` (`escalation/authority.py:94`). Without it the record matches the
   `stale_task_scoped` auto-close class, which is **category- and role-agnostic**
   (`authority.py:210-213`) and keys on evidence text matching `status\s*[=:]\s*(done|cancelled)`
-  plus a task citation — precisely what ε's own evidence says. Since `get_pending_escalations` is
-  pending-only, an auto-close would make ε's signal silently read zero.
+  alone (the evidence field is **one OR-group of three alternatives**, `authority.py:214-227` — not
+  `status=done` AND a citation, as an earlier draft said). Note the regex reads the **`resolution`
+  string supplied at close time** (`authority.py:264`), not the record's own `evidence`/`summary`.
+  And the role denylist governs only `authority.py`: a **second closer**,
+  `Harness._revalidate_open_deterministic_escalation` (`harness.py:13138-13187`), bypasses it and its
+  predicate is exactly `category == 'infra_issue'` **and** `agent_role in
+  _DETERMINISTIC_ESCALATION_SENTINEL_ROLES` — the same pair. Today only the sentinel failing to
+  resolve to a real task saves it. The detection PRD owns this analysis.
 - **Dedup uses `get_by_task(<sentinel>, status='pending', level=2)`, never `has_open_l1`** — the
   latter is hardcoded `level=1` (`escalation/queue.py:683`; `:671` is the `def`) and would never
   match, a trap already documented at `merge_queue.py:1100-1104`. A per-task id would file one
@@ -272,7 +293,7 @@ that because `_migrate_v3_to_v4` is self-gating and deliberately leaves `user_ve
 residual duplicate `candidate_key`s remain (`sqlite_task_backend.py:68-73` — literally true), a
 chained v5 step "would silently never run on a DB parked at 3". **That inference is false as coded**:
 `_migrate` reads `PRAGMA user_version` exactly once (`:328`) and the `if version < 4:` branch
-(`:406-411`) never advances the local variable, so an appended `if version < 5:` step in the same
+(`:407-412`) never advances the local variable, so an appended `if version < 5:` step in the same
 style would see `version == 3` and **run**. The argument is withdrawn.
 
 The decision stands on the writer-semantics ground alone, which is sufficient: the repair must write
@@ -294,7 +315,7 @@ requirements, each from a first-hand finding:
    The holder set is read via `get_scheduler_state` / `read_scheduler_state`
    (`fused_memory.mcp_tools.scheduler_state`), whose on-disk field is `current_holders` in
    `data/orchestrator/scheduler_state.json` — note there is **no symbol named "lane-holder"** in the
-   tree; that spelling appears only in this PRD's prose.
+   tree (the phrase occurs elsewhere only as merge-lane prose).
 2. **Import the TTL, never mint one.** Five hand-maintained copies of the 10-minute staleness
    window already exist (`task_ground_truth.py:274`, `harness.py:248`,
    `dashboard/data/tasks.py:283`, `live_workflow_detector.py:270`, `artifacts.py:1339` as `600.0`),
@@ -312,9 +333,9 @@ requirements, each from a first-hand finding:
    nor a pid to probe. ζ must not fail closed on it: `_claimant_liveness_stranded` already treats a
    missing heartbeat as stranded, so routing through the shared predicate resolves it — but ζ's spec
    must say so explicitly, or the alarm fires on that row forever and D7 is violated for exactly the
-   row this PRD counts. (That row also falsifies `tools.py:938-946`, which asserts a claimant is
+   row this PRD counts. (That row also falsifies `tools.py:948-952`, which asserts a claimant is
    "always machine-composed by `compose_claimant_run_id()` … never freeform text" — the same
-   stale-comment class β already corrects one screen below at `:1406-1407`. β corrects both.)
+   stale-comment class β already corrects one screen below at `:1328-1329`. β corrects both.)
 
 ### D7 — Repair must precede the alarm
 
@@ -325,7 +346,7 @@ already terminal** — a `done` row carrying a claimant cannot be healed by re-w
 The stronger claim an earlier draft made — that *no code path can heal an existing row* — is **false**
 and is withdrawn. `TaskInterceptor.set_task_claimant` (`:1341`) is a thin delegate to
 `SqliteTaskBackend.set_task_claimant` (`:2210`) with **no status gate whatsoever**, and it is exposed
-as an MCP tool (`tools.py:7710`); passing `claimant_run_id=None, heartbeat_at=None` heals a terminal
+as an MCP tool (`tools.py:7673`); passing `claimant_run_id=None, heartbeat_at=None` heals a terminal
 row today. ζ's whole design depends on that being true, and task 3996 records Stage 2 having already
 used it once by hand.
 
@@ -334,7 +355,7 @@ _automatically_.** Healing requires the deliberate write ζ performs, so enablin
 repair runs would alarm on legacy residue that no running code will ever clear. The DAG enforces the
 ordering.
 
-### D8 — Detection is a recurring census, not a hook in the reconcile sweep
+### D8 — Detection is deferred to its own PRD (the sweep cannot host it, and the census needs a design)
 
 The obvious site for the alarm — inside `_resolve_live_claimant` or `derive_truth`, where the row is
 already fetched — **cannot observe a single violation.** Established first-hand:
@@ -363,30 +384,83 @@ that never sees the violation; D7's "would fire the L2 immediately" was inverted
   honours — and it would be **blind to `sqlite_task_backend.py:705`**, the raw-SQL self-heal that
   bypasses the choke point entirely and is the one remaining minter after β.
 
-**The census wins on three counts.** It is the only vantage point matching C4-E1's universal
-quantifier (every row, regardless of status); it is the only one that catches the `:705` bypass; and
-it moves the escalation `submit` — a flock plus a durable temp-fd fsync plus a directory fsync
-(`escalation/queue.py:392-412`) — **off the orchestrator's asyncio event-loop thread**, discharging
-INV-8 rather than arguing about it.
+**A recurring census was the chosen replacement, and it did not survive its own gate walk.** Three
+justifications were offered for it and all three were falsified:
 
-The cost, stated plainly: **detection is no longer real-time.** Latency equals the census cadence.
-That is acceptable because the violation is a data-integrity defect with no live consequence (see
-*Current impact*), not an outage — and because ε alarms on a condition that, post-β, only a rare
-raw-SQL path can create.
+- *"It is the only vantage point that catches the `sqlite_task_backend.py:705` raw-SQL bypass."*
+  **`:705` is unreachable.** Both entries to `_migrate_v3_to_v4` gate on `user_version < 4`
+  (`_migrate` `:330-331` with `_SCHEMA_VERSION = 4`; `reaudit_candidate_key_index` `:2311-2313` and
+  again under the lock at `:2322-2324`), and **all nine task DBs on this host read
+  `user_version = 4`** with zero residual duplicate `candidate_key` groups. It can only fire on a DB
+  parked at v3; none exists.
+- *"`category='infra_issue'` keeps the record discriminable."* `infra_issue` is the **largest
+  category in both corpora** — 829/2,693 records on dark-factory (30.8%), **13 already pending at
+  L2** — and 665/2,052 on reify. The verbatim summary substring would be doing 100% of the
+  discrimination.
+- *"It copies the `_escalate_scope_invariant_violation` precedent."* That precedent is **born at L0**
+  (`severity='blocking'`, `agent_role='orchestrator'`, no `level` ⇒ default 0) and its discriminator
+  is consumed by an **L0-only** reaper (`_is_scope_divergence_orphan`, filtered by
+  `if esc.level != 0: continue` at `harness.py:11831`). A born-at-L2 detector changes level, role
+  *and* severity, so the consumer can never see it. The transplant copies the fragile half — a prose
+  substring held in manual lockstep — and drops the half that made it work.
+
+Four further gaps were found and none is tactical: the census has **no named invocation mechanism**
+(process, timer, ladder slot, project scope, or target queue — and escalation queues are
+**per-project**, so "one record fleet-wide" is undefined across 7 queues); its **auto-resolve can
+silence it permanently**, because "N consecutive clean passes" is satisfied identically by health and
+by a census that cannot read its corpus; a **second closer**
+(`Harness._revalidate_open_deterministic_escalation`, `harness.py:13138-13187`) bypasses
+`authority.py` entirely and its predicate is *exactly* `category == 'infra_issue'` **and**
+`agent_role in _DETERMINISTIC_ESCALATION_SENTINEL_ROLES` — the very pair chosen to defeat the *first*
+closer; and C4-E1's heartbeat race (above) would make it alarm on routine completions.
+
+**Decision: detection is out of scope for this PRD and gets its own design pass.** The enforcement
+and repair halves (α, β, γ, δ, ζ, η) are independently valuable, independently verifiable, and
+urgent — the hygiene tier re-accumulated 26 rows in 13 hours during authoring. Holding them behind a
+detector that has now failed two design passes serves nobody. The blindness finding above is the
+durable result to carry forward: **whatever builds the detector must not site it in the reconcile
+sweep**, and must answer the four gaps.
 
 ## Contract (B+H)
 
-**Invariant C4-E1.** For any task row: `status ∈ TERMINAL ⇒ claimant_run_id IS NULL AND heartbeat_at
-IS NULL`.
+**Invariant C4-E1.** For any task row: `status ∈ TERMINAL ⇒ claimant_run_id IS NULL`.
+
+**The assertion is on `claimant_run_id` alone, deliberately.** An earlier draft required
+`heartbeat_at IS NULL` too, and that form is unachievable: `_claimant_heartbeat_loop`
+(`workflow.py:2504-2508`) ticks `set_task_claimant(task_id, heartbeat_at=…)` every
+`claimant_heartbeat_interval_secs` (default **60 s**, `config.py:2979`) with **no status gate**,
+while `_stop_claimant_heartbeat` runs only from `_on_terminal_cleanups` (`workflow.py:3169`) —
+*after* `mark_done` is called from inside the workflow body. So β clears both columns on the terminal
+write and the next tick re-stamps `heartbeat_at`, leaving `(done, NULL, fresh heartbeat)` for up to a
+minute after **every ordinary completion**. Under the two-column form that is a violation minted by a
+hot path on routine traffic.
+
+The existing safety comment on `_stop_claimant_heartbeat` — *"Called first from
+`_on_terminal_cleanups` (before the harness clears the claimant at slot release) so the loop can
+never race a post-clear re-stamp"* — is true only of the **slot-release** clear. β introduces a
+second, earlier clear the guarantee never covered: the argument survives the words but not the
+referent.
+
+`claimant_run_id` is the column that means ownership, and no reader is fooled by a bare heartbeat
+(`has_live_claimant` requires a claimant; `_claimant_liveness_stranded` reports stranded on a NULL
+one), so narrowing costs nothing. β still writes **both** columns NULL; the residual
+`(NULL, timestamp)` untidiness is accepted, and moving the heartbeat stop ahead of the terminal write
+is a follow-up, not this PRD's job. D3's alarmable tier is likewise "a terminal row carrying a
+**claimant**", which this now matches exactly.
 
 It ships as an **executable predicate, not prose**: α exports
 `violates_terminal_claimant_invariant(task)` from `shared/src/shared/task_claimant.py`, and β's
-tests, ε's detector and ζ's census all call it rather than re-expressing it. This is INV-1
+tests and ζ's census both call it rather than re-expressing it, and the detection PRD inherits it
+instead of minting a third copy. This is INV-1
 `contracts-machine-checked`, and it is load-bearing rather than tidy: without a single definition,
-ε and ζ would each hand-maintain their own copy of the invariant *plus* D3's two-tier
-invariant/hygiene split, and those copies must agree byte-for-byte or the alarm and the repair
-disagree about what counts as a violation. D3's hygiene tier gets the same treatment
-(`is_stale_nonterminal_claimant(task, now, ttl)`).
+ζ and a future detector would each hand-maintain their own copy of the invariant *plus* D3's
+two-tier split, and those copies must agree byte-for-byte or the repair and the alarm disagree about
+what counts as a violation. D3's hygiene tier gets the same treatment
+(`is_stale_hygiene_tier_claimant(task, now, ttl)` — named for the **tier**, not for
+"non-terminal", because the hygiene scope is the explicit allowlist
+`{pending, deferred, review, merge-deferred}` and NOT all seven non-terminal statuses: `in-progress`
+is the task-2588 un-claim class D2 rejects, and `infra-hold` legitimately carries arbitrarily-stale
+claimants for weeks per the status-producer audit).
 
 **C4-E2 (write rule).** `TaskInterceptor._apply_status_transition` is the sole enforcing choke point.
 When `status ∈ TERMINAL` and the caller did not explicitly supply `claimant_run_id`, both columns are
@@ -409,12 +483,12 @@ become a real UPDATE.
 TTL-based, status-agnostic, `metadata.infra_hold`-respecting. `is_stranded` and
 `is_stranded_blocked` are its status-gated specialisations and must delegate, not duplicate.
 
-**C4-E7 (violation).** An observed violation of C4-E1 is a logical error: alarmed loudly and
-structurally, never raised, never silently absorbed. Observation happens on the **recurring census**
-(D8), which is the only vantage point that sees every row regardless of status — and therefore the
-only one that can also catch the `sqlite_task_backend.py:705` raw-SQL writer that bypasses the choke
-point. A filing failure is itself logged at WARNING with `exc_info=True`, so the fail-soft path
-cannot degrade to silence (INV-4 `storm-escape-required`).
+**C4-E7 (violation).** An observed violation of C4-E1 is a logical error: it must be surfaced
+loudly and structurally, never raised, never silently absorbed. **This PRD delivers the detection
+*substrate* but not the detector** (D8): α exports `violates_terminal_claimant_invariant` and ζ
+reports every violating row through `--dry-run` / `--json`, so an operator can observe the invariant
+on demand today. The recurring, unattended alarm is deferred to the detection PRD, which owns the
+invocation model, the discriminator, the closer analysis, and the re-arm control.
 
 ## Boundary-test sketch (B+H)
 
@@ -432,12 +506,11 @@ Facing both the producer (interceptor) and consumer (reader) sides of the seam.
 | B8 | consumer | fresh claimant on `blocked` is still live | `blocked`, claimant fresh | `_resolve_live_claimant` → `Claimant(DB)`; classify → LEAVE (the teardown window keeps working) |
 | B9 | consumer | infra_hold carve-out survives | `in-progress`, `metadata.infra_hold`, stale heartbeat | `is_stranded_any_status` → `False`; **not** `REVERT_TO_PENDING` |
 | B10 | consumer | C3.1 window is not broken | `pending` + fresh claimant (live workflow mid-teardown) | `_eligible_for_dispatch` still refuses dispatch |
-| B11 | alarm | violation alarms once | two terminal rows carrying claimants in one census pass | one ERROR per row; exactly **one** L2 escalation filed |
-| B12 | alarm | alarm never crashes the census | escalation queue raising on `submit` | the census still completes and still reports both rows; the filing failure is logged at WARNING with a traceback (mutation-tested) |
-| B13 | producer | δ clears **then** flips | `in-progress` row whose claimant is dead | after the sweep, `get_task` shows `claimant_run_id: null` **and** `status: pending` |
-| B14 | producer | δ's crash window is backstopped | fault injected between δ's clear and its flip | row is left `(in-progress, NULL)` — never `(pending, stale claimant)` — and the next sweep still reverts it |
-| B15 | repair | ζ refuses a row that changed under it | census sees `done`+claimant; row is reopened to `in-progress` with a fresh claimant before apply | ζ's per-row re-read skips it; the live claimant survives |
-| B16 | repair | ζ handles a claimant with no heartbeat | row `cancelled`, claimant freeform prose, `heartbeat_at IS NULL` (reify 5225's shape) | classified stale via the shared predicate and repaired — not skipped as un-corroboratable |
+| B11 | producer | δ clears **then** flips | `in-progress` row whose claimant is dead | after the sweep, `get_task` shows `claimant_run_id: null` **and** `status: pending` |
+| B12 | producer | δ's crash window is backstopped | fault injected between δ's clear and its flip | row is left `(in-progress, NULL)` — never `(pending, stale claimant)` — and the next sweep still reverts it |
+| B13 | repair | ζ refuses a row that changed under it | census sees `done`+claimant; row is reopened to `in-progress` with a fresh claimant before apply | ζ's per-row re-read skips it; the live claimant survives |
+| B14 | repair | ζ handles a claimant with no heartbeat | row `cancelled`, claimant freeform prose, `heartbeat_at IS NULL` (reify 5225's shape) | classified stale via the shared predicate and repaired — not skipped as un-corroboratable |
+| B15 | producer | the heartbeat race is benign under C4-E1 | claimed `in-progress` row completed via `mark_done` while its heartbeat loop is live | immediately after the `done` write both columns are NULL; within one heartbeat interval `heartbeat_at` may be re-stamped while `claimant_run_id` stays NULL — **not** a C4-E1 violation |
 
 ## Pre-conditions for activating
 
@@ -445,7 +518,7 @@ None external. Every substrate capability is present on main @ `7cb0ef2e0c` (G3,
 
 | Capability | Evidence |
 |---|---|
-| `_CLAIMANT_WIRE_UNSET` sentinel distinguishing unsupplied from explicit-null | `fused-memory/src/fused_memory/server/tools.py:946`, defaults at `:7603-7604`, `:7714-7715` |
+| `_CLAIMANT_WIRE_UNSET` sentinel distinguishing unsupplied from explicit-null | `fused-memory/src/fused_memory/server/tools.py:953`, defaults at `:7566-7567`, `:7677-7678` |
 | Single enforcing funnel for both status writers | `middleware/task_interceptor.py:871` `_apply_status_transition`, reached from `:833-848` and `:857-867` |
 | Sole **status-write** SQL emitter for the columns | `backends/sqlite_task_backend.py:1922` `_write_status_and_verify`, tri-state block `:1969-1981`. (Not the *only* emitter: `set_task_claimant` at `:2210` writes them too — D6 depends on that — and the raw-SQL self-heal at `:705` writes `status` without them.) |
 | Columns-absent fail-safe | `sqlite_task_backend.py:1970`, pinned by `tests/test_sqlite_task_backend.py:682` |
@@ -453,8 +526,6 @@ None external. Every substrate capability is present on main @ `7cb0ef2e0c` (G3,
 | `set_task_claimant` writer that does not bump `updated_at` | `sqlite_task_backend.py:2265-2268` |
 | Born-at-L2 escalation idiom from orchestrator code | `orchestrator/merge_queue.py:1140-1163`, `proc_supervision.py:205-226` |
 | `_RECOVERY` row (g) `RE_FILE_ESCALATION` exists to become reachable | `task_ground_truth.py:838`; keyed on the 5-tuple `(BLOCKED, no-open-escalation, GONE_NO_MARKER, False, None)` at `:838-839` — γ's demo must satisfy all five, and `_RECOVERY` is a dict consumed by exact-key lookup (`:916`), so no row can shadow another |
-| `release_workflow` refuses to park an infra-hold row (production site) | `escalation/server.py:2678` — cited alongside `escalation/tests/test_release_workflow.py:320`, since a test docstring is weak evidence for a load-bearing claim |
-| `escalation_queue` handle already plumbed into `TaskGroundTruth` | `task_ground_truth.py:364`, `:372` — ε needs no new wiring for its `None` early-return |
 
 No novel substrate is introduced.
 
@@ -474,9 +545,15 @@ control (df `blocked` 22 / `deferred` 12 / `in-progress` 11; reify `in-progress`
 
 **Both are correctly KEEP, and `infra-hold` is keep *by design*, not by accident.** It means a hold on
 a live, verify-complete branch whose worktree is preserved; clearing its claimant would be actively
-wrong. Three mechanisms already depend on that: `release_workflow` refuses to park it
-(`escalation/tests/test_release_workflow.py:320` — "the status IS the hold"), `is_stranded` hard-gates
-on `in-progress`, and `_RECONCILE_SWEEP_STATUSES` (`harness.py:238`) excludes it.
+wrong. Two mechanisms already depend on that: `is_stranded` hard-gates on `in-progress`, and
+`_RECONCILE_SWEEP_STATUSES` (`harness.py:238`) excludes it.
+
+A third was claimed and does not hold up: `release_workflow` is said to "refuse to park" an
+infra-hold row, citing `escalation/tests/test_release_workflow.py:320` ("the status IS the hold").
+The production guard is `if cur == 'in-progress':` (`escalation/server.py:2678`), and the string
+`infra-hold` does not appear anywhere in that module — so the non-parking is **incidental** (an
+infra-hold row simply is not `in-progress`), not a deliberate refusal. The test docstring asserts an
+intent the code does not separately encode. Keep the conclusion, drop the third leg.
 
 **Consequence for C4-E6 — gate on the TTL, never on mere presence.** infra-hold holds run for weeks
 (one reify task sat 18+ days), so a legitimately-kept claimant there will be arbitrarily stale. Any
@@ -485,7 +562,7 @@ therefore correct; the pre-existing raw-presence check at `task_interceptor.py:2
 combine guard, `pending` targets only) is **not**, and is noted as inherited, not introduced, by this
 PRD.
 
-**β additionally corrects the stale comment at `tools.py:1405-1407`**, which asserts "No current writer
+**β additionally corrects the stale comment at `tools.py:1328-1329`**, which asserts "No current writer
 emits 'infra-hold', so this is inert today" — falsified on this same HEAD by `workflow.py:7385` and by
 the 15 journal writes. It sits in the file β edits, and it is the likeliest source of the earlier wrong
 inventory, so leaving it would re-seed the same error.
@@ -520,18 +597,16 @@ amends all three sites**, not just C4 — that is why η's signal greps for thre
 ## Decomposition plan
 
 Phase 1 — foundation (α). Phase 2 — enforcement slice (β, γ, δ). Phase 3 — repair (ζ).
-Phase 4 — detection (ε). **Repair precedes detection by design** (D7): nothing heals an existing
-row automatically, so arming the alarm first would fire it on residue no running code will clear.
-η rides along with β.
+η rides along with β. **Detection is deliberately absent** — see D8; it gets its own PRD, and D7's
+repair-before-detection ordering is preserved for free because nothing here arms an alarm.
 
 | Label | Title | Modules | Kind | Observable signal | Prereqs |
 |---|---|---|---|---|---|
-| **α** | Add the shared claimant predicates: `is_stranded_any_status`, `violates_terminal_claimant_invariant`, `is_stale_nonterminal_claimant`, `DEFAULT_CLAIMANT_HEARTBEAT_TTL` | `shared` | intermediate | Unlocks **γ, ζ and ε**: the status-agnostic liveness predicate γ repoints onto, plus the C4-E1 and hygiene-tier predicates and the single TTL constant that ζ's census and ε's detector both consume instead of minting their own | — |
-| **β** | Clear the claimant columns on entry to a terminal status at the fused-memory choke point; correct three falsified comments in the files it touches | `fused-memory` | intermediate (unlocks ζ, ε, η) | Through the product's own read path: `set_task_status(id,'done')` on a claimed row, then `get_task(id)` returns `claimant_run_id: null` / `heartbeat_at: null`; a `blocked` write on the same row leaves both intact | — |
-| **γ** | Repoint `_resolve_live_claimant` at the status-agnostic predicate; invert the blocked-is-live pin | `orchestrator` | **leaf** | A `blocked` task whose branch is gone with no merge marker, carrying a claimant stale past the TTL, holding **no open escalation at any level**, and not `task_kind='deterministic'`, now has a `stranded_blocked` L1 filed for it by the reconcile sweep — visible via `get_task_escalations(<id>)` — where today the sweep classifies LEAVE and files nothing | α |
-| **δ** | Clear the claimant before the reconcile revert-to-pending flip | `orchestrator` | intermediate (unlocks ζ) | After the stranded sweep reverts a task, `get_task` shows `claimant_run_id: null` (today it shows the dead run's id) | — |
-| **ζ** | `scripts/clear_leaked_claimants.py` — corroborating, staleness-gated census + repair | `scripts` | intermediate (unlocks ε) | `--dry-run` prints, and `--json` emits, a per-status/per-tier violation census for each supplied project root — enumerating task **4028** among the terminal-tier violations; after `--apply`, an immediate re-run reports **zero terminal-tier violations among the rows the apply pass enumerated**, with any row that newly went stale during the window listed separately as `arrived_during_window` rather than counted as failure | α, β, δ |
-| **ε** | Recurring census detector: alarm a terminal row carrying a claimant as a logical error (born-at-L2, sentinel-deduped) | `scripts`, `orchestrator` | **leaf** | A seeded terminal row carrying a claimant makes the next census pass file exactly one born-at-L2 record: `get_pending_escalations(level=2)` returns one row with `severity='critical'`, `category='infra_issue'` and a summary containing the verbatim discriminator `claimant invariant violation`, filed under the process sentinel rather than the violating task's id; a second seeded violating row in the same pass leaves that count at **one**, while each row gets its own ERROR log line | β, ζ |
+| **α** | Add the shared claimant predicates (`is_stranded_any_status`, `violates_terminal_claimant_invariant`, `is_stale_hygiene_tier_claimant`) and export `DEFAULT_CLAIMANT_HEARTBEAT_TTL`, **repointing the four existing hand-maintained TTL copies at it** | `shared`, `orchestrator`, `dashboard`, `fused-memory` | intermediate | Unlocks **γ and ζ**: the status-agnostic liveness predicate γ repoints onto, plus the C4-E1 predicate and single TTL constant ζ's census consumes instead of minting its own. Observable through the consumers: after α, `git grep -c 'timedelta(minutes=10)'` over the four repointed sites returns **0** where it returns 4 today | — |
+| **β** | Clear the claimant columns on entry to a terminal status at the fused-memory choke point; correct the two falsified comments in the file it edits (`tools.py:1328-1329` infra-hold-is-inert, `tools.py:948-952` claimant-is-never-freeform) | `fused-memory` | intermediate (unlocks ζ, η) | Through the product's own read path: `set_task_status(id,'done')` on an **`in-progress`** claimed row, then `get_task(id)` returns `claimant_run_id: null` / `heartbeat_at: null`; a `blocked` write on the same row leaves both intact; and the same `done` write on an **already-`done`** claimed row (with no `done_provenance` supplied) returns `{'no_op': True}` and leaves the claimant intact, pinning D7's ordering necessity | — |
+| **γ** | Repoint `_resolve_live_claimant` at the status-agnostic predicate; invert the blocked-is-live pin | `orchestrator` | **leaf** | A `blocked` task whose branch is gone with no merge marker, carrying a claimant stale past the TTL, holding **no open escalation at any level**, carrying **no `metadata.deploy_state`** and not `task_kind='deterministic'`, on an orchestrator with `stranded_blocked_escalate_enabled` (default) and an escalation queue wired, now has a `stranded_blocked` L1 (`agent_role='harness-stranded-blocked-reaper'`, `level=1`) filed for it by the next reconcile sweep — visible via `get_task_escalations(<id>)` — where today the sweep classifies LEAVE and files nothing | α |
+| **δ** | Extract `Scheduler.clear_claim_then_set_status` and call it from both the stranded-blocked sweep and the reconcile revert-to-pending flip; fix the two rotted slot-release citations in `scheduler.py` | `orchestrator` | intermediate (unlocks ζ) | After the stranded sweep reverts a task, `get_task` shows `claimant_run_id: null` (today it shows the dead run's id) | — |
+| **ζ** | `scripts/clear_leaked_claimants.py` — corroborating, staleness-gated census + repair | `scripts` | **leaf** | `--dry-run` prints, and `--json` emits, a per-status/per-tier violation census for each supplied project root — enumerating task **4028** (or a named equivalent, re-verified live at run time) among the terminal-tier violations; after `--apply`, an immediate re-run reports **zero terminal-tier violations among the rows the apply pass enumerated and did not skip**, with every remaining row accounted for in exactly one named bucket: `repaired`, `skipped_changed_under_us` (D6.1's per-row re-read declined it, reported with the observed delta), or `arrived_during_window` (newly qualified after the census snapshot) — none of which counts as failure | α, β, δ |
 | **η** | Amend the origin contract: C4 pointer, D4's mechanism sentence, and acceptance test A5 | `plans` | **leaf** (non-code) | `git grep -n 'claimant-invariant-enforcement' -- plans/task-status-authority-prd.md` returns hits in **all three** places — the `### C4 — claimant/heartbeat columns` section, D4's clearing-mechanism sentence, and an annotation on acceptance test A5 — where it returns **zero** hits today | β |
 
 **η routing note.** η is a genuinely non-code leaf. `planning_mode` bypasses the curator-side routing
@@ -545,97 +620,93 @@ tasks already carry it). η's docs-only signal is acceptable *because* the chang
 nature; it is not a code task closing via a docs commit (the shape G2 rejects), and the signal is a
 `git grep` rather than a prose assertion so it is falsifiable by inspection.
 
-**G2 note.** The batch has **four intermediates — α, β, δ and ζ** — and three true DAG sinks: γ, ε
-and η. (An earlier draft called α "the only intermediate"; that was wrong, and it would have misled
-whoever wired the dependency edges.) Each intermediate names the task(s) it unlocks in the table
-above, satisfying G2 step 3.
+**G2 note.** The batch has **three intermediates — α, β and δ** — and three true DAG sinks: γ, ζ
+and η. Each intermediate names the task(s) it unlocks in the table above, satisfying G2 step 3.
+(Note α's row says it unlocks γ and ζ; there is no α→η or α→γ→ζ shortcut to wire — the edges are
+exactly α→γ, α→ζ, β→ζ, β→η, δ→ζ.)
 
-Every task nonetheless carries a signal observable through a product read path (`get_task`,
-`get_task_escalations`, `get_pending_escalations`), a CLI output difference (ζ), or a `git grep` (η)
-— deliberately stronger than G2 requires, since step 2 obliges only the sinks. **None rests on "a
-unit test passes against synthetic input."**
+Every task carries a signal observable through a product read path (`get_task`,
+`get_task_escalations`), a CLI output difference (ζ), or a `git grep` (α, η) — deliberately stronger
+than G2 requires, since step 2 obliges only the sinks. **None rests on "a unit test passes against
+synthetic input."**
 
 Two honest caveats on observability, recorded rather than papered over:
 
-- **γ and ε need seeded rows.** There are currently **zero** `blocked` rows carrying a claimant
-  fleet-wide, and after ζ runs there will be zero terminal violations either. Both signals are
-  demonstrated against a deliberately seeded row. That is not the shape G2 rejects — the observation
-  is still made through the product's own read path, on the real code path, with a real escalation
-  record — but neither can be demonstrated against found traffic.
+- **γ needs a seeded row.** There are currently **zero** `blocked` rows carrying a claimant
+  fleet-wide, so γ's signal is demonstrated against a deliberately seeded row. That is not the shape
+  G2 rejects — the observation is still made through the product's own read path, on the real code
+  path, producing a real escalation record — but it cannot be demonstrated against found traffic.
+  The one short-circuit that could pre-empt it, `_maybe_submit_stranded_verified_green`, is
+  **structurally unreachable** for γ's shape: it requires `resolve_branch_sha` to resolve the branch,
+  and `GONE_NO_MARKER` is reached precisely *because* that same call already returned None.
 - **δ is not operator-invocable.** The reconcile sweep fires at startup and on cadence
   (`harness.py:2490`, `:2163`, `:2621`); demonstrating δ needs a restart or a wait.
 
 **G6 note.** ζ's signal asserts a number (zero), so it needs an achievability basis — and the basis
-an earlier draft gave was **contradicted by this PRD's own Residual section**. That draft claimed
-that after β and δ land "the residual set is exactly the 105 pre-existing rows". It is not: β closes
-only TERMINAL writes and δ closes only the `harness.py:6174` revert; **neither closes process
-death**, which this PRD elsewhere credits with the bulk of the corpus. On a live fleet the number is
-a moving target — reify ran 48 concurrent heartbeating workflows during authoring, and any row whose
-heartbeat crosses the TTL between `--apply` and the re-run newly qualifies.
+an earlier draft gave was contradicted by this PRD's own Residual section. β closes only TERMINAL
+writes and δ only the `harness.py:6174` revert; **neither closes process death**, so on a live fleet
+the total is a moving target.
 
-The predicate is therefore scoped to what is actually achievable, and is **closed over an enumerated
-set rather than over time**: *zero terminal-tier violations **among the rows the apply pass
-enumerated***, with newly-stale arrivals reported separately as `arrived_during_window`. It is also
-deliberately the **stale** tier (D3), because a fresh claimant on a non-terminal row is legal during
-the C3.1 window and must not count as failure.
+**But the tier that matters is stable, and that is the real basis.** Re-measured across one day
+(2026-08-21 → 08-22) the fleet total fell 104 → 84 — *entirely* in the hygiene tier (reify `pending`
+39 → 20) — while the **terminal tier held at exactly 29** (28 `done` + 1 `cancelled`) on both days.
+The invariant-tier corpus ζ actually repairs is not churning; only the hygiene tier is. ζ's predicate
+is therefore stated against the terminal tier and closed over an **enumerated set** rather than over
+time: *zero terminal-tier violations among the rows the apply pass enumerated and did not skip*, with
+every other row landing in exactly one named bucket (`repaired`, `skipped_changed_under_us`,
+`arrived_during_window`), none of which counts as failure.
 
-**The zero also carries a named positive control.** A census that cannot read its corpus also prints
-zero, so the post-apply zero is unfalsifiable on its own. Task **4028** (dark-factory, `status=done`,
-carrying `run-a1d3b5dba75a/4028-ba4c3e3e/pid=1807449`, heartbeat `2026-08-19T21:57:20Z`) is a live
-C4-E1 violation measured during authoring; ζ's `--dry-run` must enumerate it (or a named equivalent)
-*before* `--apply`, or the zero afterwards proves nothing.
-
-ε depends on ζ so detection is not armed against legacy residue (D7), and on β so the dominant mint
-path is closed first.
+**The zero carries a named positive control.** A census that cannot read its corpus also prints zero.
+Task **4028** (dark-factory, `status=done`, `run-a1d3b5dba75a/4028-ba4c3e3e/pid=1807449`, heartbeat
+`2026-08-19T21:57:20Z`) is a live C4-E1 violation re-verified through `get_task` on 2026-08-22; ζ's
+`--dry-run` must enumerate it (or a named equivalent, re-verified at run time) *before* `--apply`, or
+the zero afterwards proves nothing.
 
 **G7 walk.** Re-derived against `docs/legibility/design-invariants.md` (8 invariants, INV-1..INV-8,
-no drift). Several claims in an earlier draft of this paragraph were false; the resolutions below
-are the ones actually adopted.
+no drift), twice — the second walk was run against the amended plan and found four hits the first
+could not see. Resolutions actually adopted:
 
 - **`contracts-machine-checked`** — resolved in α. C4-E1 and D3's hygiene tier ship as exported
-  predicates that β's tests, ε and ζ all call. *Previously false:* the draft claimed the invariant
-  "ships as an executable predicate" while no task delivered one — α delivered only C4-E**6**, the
-  read predicate.
-- **`structured-facts-at-failure`** — ε emits task id / status / claimant / heartbeat as fields and
-  populates the escalation record's `evidence` list (one capped entry per violating row), so a human
-  reading the L2 need not scrape the ERROR log to learn *which* rows violated. ζ emits `--json`.
-  *Previously incomplete:* the draft's ζ reported its census in prose only.
+  predicates that β's tests and ζ both call. *Previously false:* an earlier draft claimed the
+  invariant "ships as an executable predicate" while no task delivered one — α delivered only
+  C4-E**6**, the read predicate.
+- **`no-lockstep-duplication` / α (TTL)** — **redesigned, scope grown deliberately.** Exporting a
+  constant while leaving the five hand-maintained copies standing would be a net *regression* (six
+  sites, not one). α therefore repoints the four that are genuinely the same threshold
+  (`task_ground_truth.py:274`, `harness.py:248`, `dashboard/data/tasks.py:283`,
+  `live_workflow_detector.py:270`); `artifacts.py:1339`'s `600.0` is a `plan.lock` threshold on a
+  different mechanism and is annotated as coincidentally-equal, not repointed. The objection that the
+  dashboard cannot import shared is false — `dashboard/pyproject.toml:21` already declares
+  `dark-factory-shared`, as do all four packages. Two of the existing copies already cite stale
+  anchors, which is the decay this closes.
+- **`no-lockstep-duplication` / δ** — **redesigned.** δ no longer adds a third hand-written
+  clear-then-flip pair; it extracts `Scheduler.clear_claim_then_set_status(task_id, status)` and
+  both `scheduler.py:6430-6431` and `harness.py:6174` call it. There is no harness/scheduler seam to
+  cross — `Harness.scheduler` is a `Scheduler` and δ's site already calls
+  `self.scheduler.set_task_status`. The extraction also collapses the two rotted slot-release
+  citations (`scheduler.py:6307`, `:6422`, both pointing at `harness.py:5693-5696`; actual
+  `harness.py:8873`) into one docstring. This matters because the PRD's own Background argues that
+  convention-propagated-by-imitation is this defect's root cause; a waiver here would be
+  self-refuting.
+  > `G7 waiver: no-lockstep-duplication — the third clear-then-flip site, scripts/consume_redispatch_requests.py::_apply_repend, is an out-of-process consumer reaching fused-memory through an MCP client with a different call signature (client.set_task_claimant(task_id, project_root, ...)), so it cannot call the in-process Scheduler helper this batch extracts. Its ordering is additionally strictly stronger (a rejected clear ABORTs rather than proceeding best-effort), so rendering it from the shared site would be a behaviour regression. Mitigation: the extracted helper's docstring becomes the single normative statement of the ordering rule, and _apply_repend's docstring is repointed at it by symbol name rather than line anchor — its current citation (scheduler.py:5726-5736) has already rotted, which is the failure this waiver bounds rather than denies.`
+- **`structured-facts-at-failure`** — ζ emits `--json` per the house pattern
+  (`scripts/repair_wiped_metadata_files.py:1120`, `scripts/audit_combine_gate_marker_loss.py:1162`),
+  so "zero" is machine-readable rather than recovered by parsing prose.
 - **`corroborate-before-acting`** — ζ re-reads **each row** immediately before its own write, in
-  addition to the batch-level holder intersection (D6.1). *Previously insufficient:* an aggregate
-  pre-flight cannot catch a row reopened between census and apply.
-- **`storm-escape-required`** — the durable sentinel dedup bounds the L2 to one per episode, and it
-  genuinely survives restart (`get_by_task(<sentinel>, status='pending', level=2)` reads from disk,
-  so a crash-loop files one record, not one per restart). The gap the draft missed is the
-  **fail-soft path**: the mandated `try/except` and the `escalation_queue is None` early return
-  would degrade to silence. Both now log at WARNING with `exc_info=True`, per
-  `task_ground_truth.py:729-734` and `harness.py:8089`.
-- **`no-lockstep-duplication`** — D1 reuses `TERMINAL` rather than minting a parallel set, and α's
-  shared predicates stop ε and ζ each hand-maintaining the invariant. *Previously false:* the draft
-  said "α deletes the duplicated liveness cores". There are none — `_claimant_liveness_stranded`
-  (`task_claimant.py:63`) is already the single shared core and all three predicates already
-  delegate to it. The only duplication is the two-line `metadata.infra_hold` block at `:137-139` /
-  `:180-182`. ζ additionally imports the TTL rather than minting a sixth copy.
+  addition to the batch-level holder intersection (D6.1). An aggregate pre-flight cannot catch a row
+  reopened between census and apply; B13 pins it.
 - **`status-matches-liveness`** — this PRD is INV-6's converse. **δ's clear-then-flip ordering is
-  correct and does not violate INV-6's "successor status before the claim is released" clause**,
-  and it is worth stating why rather than leaving a reader to trip over the apparent contradiction:
-  INV-6's ordering clause governs an exit from a *claimed* state, whereas δ acts on a row whose
-  claimant is already established dead, making δ the crash backstop INV-6 explicitly sanctions.
-  Reversing it would be actively worse — a crash between the two writes would leave
-  `(pending, stale claimant)`, re-minting this PRD's own defect, and a late-landing clear could NULL
-  a fresh claimant stamped by a concurrent dispatcher. `scheduler.py:6421-6429` already reasons this
-  out in-source. The second clause ("what test pins every exit?") was a real gap: δ had no boundary
-  row, now B13/B14.
-- **`holds-owned-and-bounded`** — ε's L2 is a human-owned hold with the L2 watcher as exit, **plus
-  an auto-resolve**: after N consecutive clean census passes the sentinel record is resolved,
-  re-arming the detector. Without it the hold suppresses its own detector — while the sentinel L2
-  sits pending, `get_by_task` returns non-empty and ε goes quiet — which is INV-7's own cited
-  failure. The idiom is `_file_watcher_outage_l2` / `_resolve_watcher_outage_l2`
-  (`harness.py:8030`, `:8091`).
-- **`loop-thread-occupancy-bounded`** — **discharged by D8, not waived.** The flag was real: the
-  originally-proposed site is on the asyncio event-loop thread and `EscalationQueue.submit` is a
-  flock plus two fsyncs. Moving detection to the census takes that write off the loop thread
-  entirely. Recording the disposition here rather than deferring it to the implementer, since
-  "confirm at implementation time" is not one of G7's two dispositions.
+  correct**, independently re-derived twice: INV-6's ordering clause governs an exit from a *claimed*
+  state, whereas δ acts on a row whose claimant is already established dead, making δ the crash
+  backstop INV-6 explicitly sanctions. Reversing it would leave `(pending, stale claimant)` on a
+  crash — re-minting this PRD's own defect — and would let a late clear NULL a concurrent
+  dispatcher's fresh stamp. `scheduler.py:6421-6429` reasons this out in-source. The second clause
+  ("what test pins every exit?") was a real gap: δ had no boundary row, now B11/B12.
+- **`storm-escape-required`**, **`holds-owned-and-bounded`**, **`loop-thread-occupancy-bounded`** —
+  all three attached to the detector, which D8 removes from this batch. They are **carried forward as
+  open requirements on the detection PRD**, not silently dropped: it must answer who runs the census,
+  what bounds its fan-out, what notices when it stops, and how a re-arm distinguishes "clean" from
+  "blind".
 
 ## Out of scope
 
@@ -651,12 +722,21 @@ are the ones actually adopted.
   it would be "promoted to an alarm site"; no task in this decomposition delivers that, and the
   promise is withdrawn rather than left unowned.* It already logs at INFO
   (`scheduler.py:4939-4943`), which is sufficient.
+- **The unattended detector.** A recurring alarm on C4-E1 is deferred to its own PRD (D8). This
+  batch ships the substrate — α's executable predicate and ζ's on-demand census — so the invariant is
+  observable today; it does not ship the alarm. The detection PRD inherits four unmet requirements:
+  an invocation model (process, cadence, project scope, and which of the **7 per-project** escalation
+  queues receives the record), a discriminator that actually discriminates (`infra_issue` is 30.8% of
+  the dark-factory corpus), a full closer analysis (`authority.py`'s denylist governs only one of at
+  least three closers), and a re-arm that can tell "clean" from "blind".
 - **Preventing the raw-SQL bypass at `sqlite_task_backend.py:705`.** The v3→v4 duplicate-
   `candidate_key` self-heal writes `status='cancelled'` in raw SQL, bypassing
-  `_apply_status_transition` entirely and leaving the claimant untouched. After β it is the only
-  remaining minter of fresh C4-E1 violations. It is **covered by detection, not prevention**: ε's
-  census sees it (D8), whereas a choke-point fix by construction cannot. Changing that write is a
-  migration-path decision with its own blast radius and is deliberately not taken here.
+  `_apply_status_transition` and leaving the claimant untouched. **It is currently unreachable** —
+  both entries gate on `user_version < 4` and all nine task DBs on this host read 4, with zero
+  residual duplicate groups — so it can only fire on a DB parked at v3. Recorded as a conditional
+  residual, not an active hazard; an earlier draft called it "the only remaining minter after β",
+  which was wrong twice over (it is unreachable, and `set_task_claimant` is MCP-exposed with no
+  status gate).
 - **Having the heartbeat loop re-stamp `claimant_run_id`.** Only relevant to a `pending` clear, which
   D2 rejects.
 - **Backfilling other projects' corpora beyond dark-factory and reify.** ζ takes project roots as
@@ -707,21 +787,19 @@ staleness excludes the C3.1 window — not a widening of the write rule.
 
 ## Open questions (tactical)
 
-1. **ε's sentinel spelling.** A single fleet-wide constant (e.g. `claimant-invariant-violation`) vs
-   one per project id. **Suggested resolution:** fleet-wide single constant; per-project only if the
-   single record proves hard to attribute. Note the sentinel must be a **durable string**, not a
-   per-process value — dedup reads it back off disk via `get_by_task`, which is what makes a
-   restart-loop file one record rather than one per restart. Decide during ε.
-2. **Whether ζ should also report the non-terminal stale-claimant tier by default or only under a
-   flag.** **Suggested resolution:** report both tiers, repair only what the flags select. ζ must
-   in any case name its hygiene-tier status scope **explicitly** — `{pending, deferred, review,
-   merge-deferred}` — rather than deriving it as "non-terminal": `in-progress` is non-terminal, and
-   clearing an `in-progress` claimant is the task-2588 un-claim class D2 rejects *and* would blind
-   `is_stranded`, the reaper's own detector. (reify held 48 claimant-bearing `in-progress` rows
-   during authoring; they are excluded today only because they were fresh.) Decide during ζ.
-3. **ε's census cadence and its N-clean-passes auto-resolve threshold.** Both are tactical numbers,
-   not design choices. Decide during ε.
+1. **Whether ζ should report the hygiene tier by default or only under a flag.** **Suggested
+   resolution:** report both tiers, repair only what the flags select. The hygiene scope is
+   **already decided and is not tactical** — it is the explicit allowlist
+   `{pending, deferred, review, merge-deferred}`, encoded in α's
+   `is_stale_hygiene_tier_claimant` rather than derived as "non-terminal": `in-progress` is the
+   task-2588 un-claim class D2 rejects (and clearing it would blind `is_stranded`, the reaper's own
+   detector), and `infra-hold` legitimately carries weeks-stale claimants per the status-producer
+   audit. Only the default-vs-flag presentation is left to ζ.
+2. **ζ's `--apply` batch size / whether to require an explicit `--project-root` per run rather than
+   defaulting to both.** Operator-ergonomics only. Decide during ζ.
 
-*(The former Open Question 3 — whether ε's check belongs inside `_resolve_live_claimant` or
-`derive_truth` — is closed by D8: neither, because both sit inside a sweep that cannot see a
-terminal row.)*
+*(Two former open questions are closed. "Where does ε's check belong — `_resolve_live_claimant` or
+`derive_truth`?" is answered by D8: neither, because both sit inside a sweep that cannot see a
+terminal row. "What is ε's sentinel spelling?" moves to the detection PRD, where it is **not**
+tactical: any spelling `scheduler.get_task` can resolve to a real task hands the record to a second
+closer the role denylist does not govern.)*
