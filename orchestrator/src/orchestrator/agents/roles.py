@@ -1577,12 +1577,16 @@ resolved -- which is why the steward must never try to auto-resolve one.
 could not park project_root's dirty tracked WIP, so the queue halts once rather
 than failing task after task.
 
-Membership here is a correctness requirement, not a preference: it is checked
-against the harness gate at CI time by
-``test_roles_merge_halt_safety.test_safety_rule_categories_match_the_harness_gate``,
-and every member is required to be named in :data:`MERGE_HALT_SAFETY_RULE` by
-its sibling test.  Task 3870 corrected the same two-of-three framing twice and
-it recurred both times, because no site was mechanically tied to the gate.
+Membership here is a correctness requirement, not a preference.  It is checked
+against the harness gate at CI time -- textually by
+``test_roles_merge_halt_safety.test_safety_rule_categories_match_the_harness_gate``
+and behaviourally by that file's
+``TestHaltCategoriesAreBehaviourallyLoadBearing``, which drives
+``_rehydrate_merge_halt`` once per member -- and every member is required to be
+named in :data:`MERGE_HALT_SAFETY_RULE` (with no non-member named there) by its
+sibling tests.  WHY those anchors exist is recorded ONCE, in
+``orchestrator/tests/test_roles_merge_halt_safety.py``'s module docstring; cite
+it, do not restate it here.
 
 When task 3859 lands a shared ``MERGE_HALT_CATEGORIES`` constant, REPLACE this
 tuple with an import of it rather than letting it become a fourth independent
@@ -1622,18 +1626,23 @@ MERGE_HALT_SAFETY_RULE: str = """\
 
 Lifted out of STEWARD's inline prompt body into a named constant (task 4130) so
 ``test_roles_merge_halt_safety.py`` can guard it structurally.  That file's
-family rule -- stated in ``test_roles_wait_pattern.py`` -- is that the only
-sanctioned assertion shape is ``SOME_CONSTANT in ROLES[name].system_prompt``,
-"never a string literal asserted against a constant's prose"; with the rule
-inline there was nothing named to assert against, so the categories could (and
-did, three times) drift out of sync with the harness gate unnoticed.
+module docstring is the canonical account of why -- the drift history, the
+``test_roles_*.py`` family's "no string-literal pins" assertion rule, and the
+safety consequence of a category the steward is never told about.  Cite it; do
+not restate it here.
 
-Every member of :data:`MERGE_HALT_ESCALATION_CATEGORIES` must be named here.
-The destructive-command prohibition and the ``level=1`` re-escalate recourse
-deliberately live in this SAME constant as the category list, so no future
-prompt refactor can splice the categories away from the prohibition that makes
-them load-bearing, or leave the handler forbidden every action with no stated
-alternative."""
+Every member of :data:`MERGE_HALT_ESCALATION_CATEGORIES` must be named here,
+and nothing category-shaped may be named here that is NOT a member (both
+directions are tested).  The destructive-command prohibition and the
+``level=1`` re-escalate recourse deliberately live in this SAME constant as the
+category list, so no future prompt refactor can splice the categories away from
+the prohibition that makes them load-bearing, or leave the handler forbidden
+every action with no stated alternative.
+
+The rule TEXT above necessarily carries its own copy of the ``refs/stash``
+prohibition: CLAUDE.md is canonical for it, but a system prompt cannot follow a
+cross-reference.  The operator docs are under no such constraint and cite
+CLAUDE.md instead."""
 
 
 _STEWARD_MEMORY_TOOLS = [

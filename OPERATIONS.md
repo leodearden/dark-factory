@@ -499,12 +499,10 @@ does **not** release the halt.
   shared main-checkout-hygiene fault rather than a fault of the merging task,
   so the queue halts once instead of failing task after task. Inspect the main
   checkout's uncommitted work and commit it — or get its owner to. **Do not
-  reach for `git stash`**: CLAUDE.md forbids it in *any* dark-factory checkout,
-  `project_root` or task worktree, because `refs/stash` is a single ref shared
-  by every worktree in the checkout (it is not per-worktree) and the merge
-  worker's advance path consumes the same stack — so a stash you push can be
-  popped out from under you, and a pop on a clean tree can apply an unrelated
-  task's WIP into it (incident 13674d3c68). Park WIP as commits on a branch.
+  reach for `git stash`**: it is forbidden in *any* dark-factory checkout,
+  `project_root` or task worktree, for the reasons stated canonically in
+  CLAUDE.md § "Working in the main checkout" (incident 13674d3c68). Park WIP as
+  commits on a branch instead.
 
 Resolve the halt-owner escalation specifically (check `get_merge_halt_status`
 if unsure which one owns it) — `resolve_issue` on it un-halts the whole
