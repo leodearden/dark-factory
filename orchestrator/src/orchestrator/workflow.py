@@ -10082,7 +10082,52 @@ class TaskWorkflow:
         # this same worktree (mirrors _resolve_and_resubmit's pre-spawn
         # clear, workflow.py:7073-7075).
         self.artifacts.clear_verdict(role.name)
-        result = await self._invoke(role, prompt, self.worktree)
+        # EXCEPTION-PATH completion of b4fe7171d3's I-FAIL-SAFE narrowing
+        # (task 3639).  That commit removed `not result.success` from the
+        # gate below, but an exception escaping this await bypasses the gate
+        # ENTIRELY — it is raised one line after clear_verdict(), long before
+        # the read_verdict() salvage.  `_review` then treats the exception as
+        # a first-class outcome: its gather(..., return_exceptions=True)
+        # captures it, the retry loop re-enters _run_reviewer whose
+        # clear_verdict() destroys the recoverable verdict PERMANENTLY, and
+        # on exhaustion it synthesizes {'verdict': 'ERROR', 'issues': []}
+        # without ever consulting disk.  That is the esc-5777-7 shape: a good
+        # verdicts/ artifact and an ERROR reviews/ mirror seconds later.
+        # Salvage must therefore run here, BEFORE any respawn.
+        try:
+            result = await self._invoke(role, prompt, self.worktree)
+        except TimeoutError:
+            # Ordered first: TimeoutError IS an Exception subclass and would
+            # otherwise be swallowed below.  Exception-path analogue of the
+            # `result.timed_out` exclusion in the gate — a wall-clock kill can
+            # land mid-write, so its artifact may reflect a partial pass.
+            #
+            # asyncio.CancelledError needs no clause of its own: it is a
+            # BaseException in 3.13, so `except Exception` excludes it by
+            # construction and cooperative cancellation keeps propagating,
+            # mirroring _invoke's own preserve-and-re-raise contract.
+            raise
+        except Exception as exc:
+            payload = self._salvageable_verdict_payload(role)
+            if payload is None:
+                # Nothing recoverable — task 3321's no-emit case.  Propagate
+                # so _review's retry + synthesized-ERROR fail-safe is intact.
+                raise
+            logger.warning(
+                'Task %s: reviewer %s invocation raised %s but a well-formed '
+                '%s verdict is on disk — salvaging instead of discarding '
+                '(task 3639)',
+                self.task_id, role.name, type(exc).__name__,
+                payload.get('verdict'),
+                extra={
+                    'event': 'reviewer_verdict_salvaged_from_exception',
+                    'task_id': str(self.task_id),
+                    'role': role.name,
+                    'verdict': str(payload.get('verdict')),
+                    'exc_type': type(exc).__name__,
+                },
+            )
+            return payload
 
         # Read the reviewer's structured verdict instead of the
         # structured_output/json.loads cascade (task 2484 / PRD task δ).
