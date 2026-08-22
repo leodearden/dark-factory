@@ -108,6 +108,30 @@ class TestCrossLayerIdentityLockstep:
             f'({CURATOR_ADJUDICATION_MISSING_CATEGORY!r}) must be denied auto-close'
         )
 
+    def test_runner_milestone_categories_are_in_the_deny_list(self) -> None:
+        """The runner's OTHER two born-at-L2 categories stay denied too.
+
+        Reviewer amendment: 'milestone_gate' and 'milestone_check_failed' sit in
+        the same denylist with the same exposure as the curator category above,
+        so pinning only the curator one would leave the identical silent-rename
+        hole open on its siblings — and leave a reader of authority.py with an
+        unexplained asymmetry between members of one frozenset.
+
+        Asserted in a SEPARATE test from the curator pin (not appended to it) so
+        a milestone rename and a curator rename identify themselves distinctly
+        in the failure report.
+        """
+        from orchestrator.deterministic_runner import (
+            MILESTONE_CHECK_FAILED_CATEGORY,
+            MILESTONE_GATE_CATEGORY,
+        )
+
+        for category in (MILESTONE_GATE_CATEGORY, MILESTONE_CHECK_FAILED_CATEGORY):
+            assert category in L2_AUTO_CLOSE_DENY_CATEGORIES, (
+                f'The category the DeterministicRunner actually files '
+                f'({category!r}) must be denied auto-close'
+            )
+
 
 class TestL2AutoCloseClass:
     """``l2_auto_close_class`` — the narrow above-ceiling ``close_only`` carve-out.

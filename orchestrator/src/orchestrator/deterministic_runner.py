@@ -522,16 +522,27 @@ OPERATIONAL_LLM_GATE_MARKER_KEY: str = 'x_operational_llm_gate'
 # grouping by prefix, to conflate two unrelated actors.  The `human_curator_`
 # prefix pairs the stamp unambiguously with its marker.
 
-# The escalation category filed when a curator gate resumes unadjudicated.
+# The born-at-L2 escalation categories this runner files — EVERY one of which
+# `escalation.authority.L2_AUTO_CLOSE_DENY_CATEGORIES` must refuse to auto-close.
 #
-# DUPLICATED — not imported — in
-# `escalation.authority.L2_AUTO_CLOSE_DENY_CATEGORIES`, which must never
-# auto-close it (task 3181).  escalation is the lower fleet-wide package and
-# must not import orchestrator, so the two literals are pinned in lockstep by
-# the cross-layer TEST import in `escalation/tests/test_authority.py`, mirroring
-# the `_WATCHER_AUTO_IDENTITY` convention documented in authority.py's module
-# docstring.  If this string changes, update both sides together.
+# DUPLICATED — not imported — in that denylist (task 3181).  escalation is the
+# lower fleet-wide package and must not import orchestrator, so each pair of
+# literals is pinned in lockstep by the cross-layer TEST imports in
+# `escalation/tests/test_authority.py`, mirroring the `_WATCHER_AUTO_IDENTITY`
+# convention documented in authority.py's module docstring.  If any of these
+# strings changes, update both sides together.
+#
+# All three are named here rather than just the curator one (reviewer
+# amendment): they are siblings with identical exposure, so pinning one and
+# leaving the others as bare literals would leave a reader of the denylist an
+# unexplained asymmetry — and would leave the same silent-rename hole open on
+# the unpinned members.  `curator_adjudication_missing` is the re-ask raised
+# when a `human_curator_gate` task resumes with no `human_curator_adjudicated_at`
+# stamp; `milestone_gate` is the gate itself; `milestone_check_failed` is a
+# failed predicate check.
 CURATOR_ADJUDICATION_MISSING_CATEGORY: str = 'curator_adjudication_missing'
+MILESTONE_GATE_CATEGORY: str = 'milestone_gate'
+MILESTONE_CHECK_FAILED_CATEGORY: str = 'milestone_check_failed'
 
 # Rendered in place of the configured project_root when the runner's duck-typed
 # `scheduler` collaborator cannot supply a usable one.  A VISIBLE placeholder,
@@ -2132,7 +2143,7 @@ class DeterministicRunner:
                 task_id=task_id,
                 agent_role=DETERMINISTIC_AGENT_ROLE,
                 severity='critical',
-                category='milestone_gate',
+                category=MILESTONE_GATE_CATEGORY,
                 summary=summary,
                 detail=detail,
                 options=list(gate_options),
@@ -2226,7 +2237,7 @@ class DeterministicRunner:
                 task_id=task_id,
                 agent_role=DETERMINISTIC_AGENT_ROLE,
                 severity='critical',
-                category='milestone_check_failed',
+                category=MILESTONE_CHECK_FAILED_CATEGORY,
                 summary=summary[:200],
                 detail=detail,
                 level=2,
