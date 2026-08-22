@@ -32,6 +32,8 @@ synthesizing ERROR when nothing valid is on disk (f2) or the run timed out
 
 from __future__ import annotations
 
+import asyncio
+import json
 from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -443,3 +445,274 @@ class TestReviewerIdentityGate:
         result = await f.wf._run_reviewer(REVIEWER_COMPREHENSIVE, 'diff')
 
         assert result == payload
+
+
+def _invoke_writes_then_raises(
+    f, exc: BaseException, *, verdict: str | None = 'PASS',
+    issues: list | None = None, summary: str = 'Decided.',
+) -> Callable:
+    """Build an ``_invoke`` side_effect that (optionally) writes a valid
+    reviewer verdict and THEN raises *exc*.
+
+    Models the real failure shape this closes: the reviewer agent runs to
+    ``end_turn`` and calls ``submit_review_verdict`` — the verdict is on
+    disk — and the invocation then dies in the post-agent work that shares
+    the same await (transcript archival, telemetry, transport teardown).
+    """
+
+    def _side_effect(*args, **kwargs):
+        if verdict is not None:
+            f.artifacts.write_verdict(
+                'reviewer_comprehensive',
+                _envelope('reviewer_comprehensive', 'sid', {
+                    'reviewer': 'reviewer_comprehensive',
+                    'verdict': verdict,
+                    'issues': issues or [],
+                    'summary': summary,
+                }),
+            )
+        raise exc
+
+    return _side_effect
+
+
+def _suggestion_issues(n: int) -> list[dict]:
+    """*n* schema-shaped suggestion-severity issues."""
+    return [{
+        'severity': 'suggestion',
+        'location': f'src/mod_{i}.py:{i + 1}',
+        'category': 'quality',
+        'description': f'suggestion {i}',
+        'suggested_fix': f'fix {i}',
+    } for i in range(n)]
+
+
+@pytest.mark.asyncio
+class TestExceptionPathSalvage:
+    """An exception escaping ``_invoke`` must not discard a well-formed
+    on-disk verdict, and must not burn a retry.
+
+    ``b4fe7171d3`` narrowed the post-invocation gate so a failed-but-written
+    verdict is salvaged — but an exception escaping the ``_invoke`` await
+    bypasses that gate ENTIRELY (the await sits one line after
+    ``clear_verdict()``, and the ``read_verdict`` salvage is never reached).
+    ``_review`` then treats the exception as a first-class outcome: its
+    ``gather(..., return_exceptions=True)`` captures it, the retry loop
+    re-enters ``_run_reviewer`` whose ``clear_verdict()`` destroys the
+    recoverable verdict permanently, and on exhaustion it synthesizes
+    ``{'verdict': 'ERROR', 'issues': []}`` without ever consulting disk.
+
+    That is the esc-5777-7 shape: a good ``verdicts/`` artifact and an ERROR
+    ``reviews/`` mirror written seconds later.
+    """
+
+    def _setup(self, tmp_path: Path):
+        f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
+        f.wf.briefing.build_reviewer_prompt = AsyncMock(return_value='prompt')
+        return f
+
+    @pytest.mark.parametrize('verdict', ['PASS', 'ISSUES_FOUND'])
+    async def test_exception_after_verdict_written_is_salvaged(
+        self, tmp_path: Path, verdict: str,
+    ):
+        """A well-formed verdict on disk survives an exception from ``_invoke``."""
+        f = self._setup(tmp_path)
+        issues = _suggestion_issues(1) if verdict == 'ISSUES_FOUND' else []
+        f.wf._invoke = AsyncMock(  # type: ignore[method-assign]
+            side_effect=_invoke_writes_then_raises(
+                f, RuntimeError('transport closed'),
+                verdict=verdict, issues=issues,
+            ),
+        )
+
+        result = await f.wf._run_reviewer(REVIEWER_COMPREHENSIVE, 'diff')
+
+        assert result == {
+            'reviewer': 'reviewer_comprehensive',
+            'verdict': verdict,
+            'issues': issues,
+            'summary': 'Decided.',
+        }
+
+    async def test_exception_without_verdict_still_propagates(self, tmp_path: Path):
+        """Nothing on disk => the exception propagates unchanged.
+
+        Task 3321's no-emit case: ``_review``'s existing retry + synthesized
+        ERROR fail-safe must be untouched. Salvage recovers a verdict that
+        exists; it never invents one.
+        """
+        f = self._setup(tmp_path)
+        f.wf._invoke = AsyncMock(  # type: ignore[method-assign]
+            side_effect=_invoke_writes_then_raises(
+                f, RuntimeError('died before deciding'), verdict=None,
+            ),
+        )
+
+        with pytest.raises(RuntimeError, match='died before deciding'):
+            await f.wf._run_reviewer(REVIEWER_COMPREHENSIVE, 'diff')
+
+    async def test_timeout_exception_is_not_salvaged(self, tmp_path: Path):
+        """``TimeoutError`` propagates even with a valid verdict on disk.
+
+        Exception-path analogue of the already-pinned ``result.timed_out``
+        exclusion (``test_timed_out_invocation_is_failsafe_error``): a
+        wall-clock kill can land mid-write, so its artifact may reflect a
+        partial pass over the diff.
+        """
+        f = self._setup(tmp_path)
+        f.wf._invoke = AsyncMock(  # type: ignore[method-assign]
+            side_effect=_invoke_writes_then_raises(f, TimeoutError('wall clock')),
+        )
+
+        with pytest.raises(TimeoutError):
+            await f.wf._run_reviewer(REVIEWER_COMPREHENSIVE, 'diff')
+
+    async def test_cancellation_is_never_swallowed(self, tmp_path: Path):
+        """``asyncio.CancelledError`` propagates even with a verdict on disk.
+
+        Cooperative cancellation (a clean SIGTERM shutdown) must never be
+        converted into a salvage — mirrors ``_invoke``'s own
+        preserve-and-re-raise contract.
+        """
+        f = self._setup(tmp_path)
+        f.wf._invoke = AsyncMock(  # type: ignore[method-assign]
+            side_effect=_invoke_writes_then_raises(f, asyncio.CancelledError()),
+        )
+
+        with pytest.raises(asyncio.CancelledError):
+            await f.wf._run_reviewer(REVIEWER_COMPREHENSIVE, 'diff')
+
+    async def test_exception_with_invalid_verdict_propagates(self, tmp_path: Path):
+        """An out-of-set inner verdict is not salvageable => propagate."""
+        f = self._setup(tmp_path)
+        f.wf._invoke = AsyncMock(  # type: ignore[method-assign]
+            side_effect=_invoke_writes_then_raises(
+                f, RuntimeError('transport closed'), verdict='MAYBE',
+            ),
+        )
+
+        with pytest.raises(RuntimeError, match='transport closed'):
+            await f.wf._run_reviewer(REVIEWER_COMPREHENSIVE, 'diff')
+
+    async def test_exception_with_cross_role_verdict_propagates(self, tmp_path: Path):
+        """A cross-role payload is not salvageable => propagate.
+
+        Proves the exception path routes through the SAME
+        ``_salvageable_verdict_payload`` seam as the normal gate, rather
+        than re-implementing a laxer check.
+        """
+        f = self._setup(tmp_path)
+
+        def _side_effect(*args, **kwargs):
+            f.artifacts.write_verdict(
+                'reviewer_comprehensive',
+                _envelope('reviewer_comprehensive', 'sid', {
+                    'reviewer': 'reviewer_security',
+                    'verdict': 'PASS',
+                    'issues': [],
+                    'summary': 'Not mine.',
+                }),
+            )
+            raise RuntimeError('transport closed')
+
+        f.wf._invoke = AsyncMock(side_effect=_side_effect)  # type: ignore[method-assign]
+
+        with pytest.raises(RuntimeError, match='transport closed'):
+            await f.wf._run_reviewer(REVIEWER_COMPREHENSIVE, 'diff')
+
+
+@pytest.mark.asyncio
+class TestReviewMirrorCarriesSalvagedVerdict:
+    """``_review``'s ``reviews/<role>.json`` mirror — the esc-5777-7 surface.
+
+    The escalation was observed AT the mirror (a good ``verdicts/`` artifact
+    and an ``{'verdict': 'ERROR', 'issues': []}`` ``reviews/`` file written
+    18s later), and no existing test drives ``_review`` at all. The mirror is
+    what ``aggregate_reviews()`` reads, so a discarded verdict there is what
+    actually loses the reviewer's issues.
+
+    (``ALL_REVIEWERS`` is a single comprehensive reviewer today, so these
+    drive the whole panel through one role.)
+    """
+
+    def _setup(self, tmp_path: Path, *, retries: int = 2):
+        f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
+        f.wf.briefing.build_reviewer_prompt = AsyncMock(return_value='prompt')
+        f.wf.git_ops.get_diff_from_base = AsyncMock(return_value='diff')
+        f.wf.git_ops.get_diff_from_main = AsyncMock(return_value='diff')
+        f.wf.config.reviewer_stagger_secs = 0
+        f.wf.config.max_reviewer_retries = retries
+        return f
+
+    def _mirror(self, f) -> dict:
+        return json.loads(
+            (f.artifacts.root / 'reviews' / 'reviewer_comprehensive.json').read_text(),
+        )
+
+    async def test_mirror_carries_verdict_salvaged_from_exception(
+        self, tmp_path: Path,
+    ):
+        """An exception after the verdict was written must not blank the mirror."""
+        f = self._setup(tmp_path)
+        issues = _suggestion_issues(6)
+        f.wf._invoke = AsyncMock(  # type: ignore[method-assign]
+            side_effect=_invoke_writes_then_raises(
+                f, RuntimeError('transport closed'),
+                verdict='ISSUES_FOUND', issues=issues, summary='Six things.',
+            ),
+        )
+
+        aggregation = await f.wf._review()
+
+        mirror = self._mirror(f)
+        assert mirror['verdict'] == 'ISSUES_FOUND'
+        assert mirror['issues'] == issues
+        assert mirror['reviewer'] == 'reviewer_comprehensive'
+        # No retry burned => no clear_verdict() destroyed the recoverable
+        # verdict. In the pre-fix shape this is 1 + max_reviewer_retries.
+        assert f.wf._invoke.call_count == 1
+        assert aggregation.reviewer_errors == []
+        assert len(aggregation.suggestions) == 6
+
+    async def test_mirror_carries_verdict_salvaged_from_failed_invocation(
+        self, tmp_path: Path,
+    ):
+        """Regression pin for ``b4fe7171d3``: the non-exception salvage
+        (success=False, verdict written, no raise) already reaches the mirror.
+        """
+        f = self._setup(tmp_path)
+        issues = _suggestion_issues(6)
+        f.wf._invoke = AsyncMock(  # type: ignore[method-assign]
+            side_effect=_invoke_writes_review_verdict(
+                f, verdict='ISSUES_FOUND', issues=issues, summary='Six things.',
+                output='ok', success=False,
+            ),
+        )
+
+        aggregation = await f.wf._review()
+
+        mirror = self._mirror(f)
+        assert mirror['verdict'] == 'ISSUES_FOUND'
+        assert mirror['issues'] == issues
+        assert f.wf._invoke.call_count == 1
+        assert aggregation.reviewer_errors == []
+
+    async def test_mirror_is_error_when_nothing_salvageable(self, tmp_path: Path):
+        """Fail-safe intact: an exception with no verdict on disk still
+        retries and still lands the synthesized ERROR mirror.
+        """
+        f = self._setup(tmp_path, retries=2)
+        f.wf._invoke = AsyncMock(  # type: ignore[method-assign]
+            side_effect=_invoke_writes_then_raises(
+                f, RuntimeError('died before deciding'), verdict=None,
+            ),
+        )
+
+        aggregation = await f.wf._review()
+
+        mirror = self._mirror(f)
+        assert mirror['verdict'] == 'ERROR'
+        assert mirror['issues'] == []
+        assert mirror['summary'].startswith('Reviewer exception:')
+        assert f.wf._invoke.call_count == 3  # initial + 2 retries
+        assert aggregation.reviewer_errors == ['reviewer_comprehensive']
