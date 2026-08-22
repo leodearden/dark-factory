@@ -2853,7 +2853,7 @@ class TestInv5IsLoadOrderIndependent:
     def test_an_unknown_attribute_still_raises(self):
         """The PEP 562 hook must not turn typos into silent bake-off lookups."""
         with pytest.raises(AttributeError):
-            _mod()._definitely_not_a_real_name
+            _ = _mod()._definitely_not_a_real_name
 
 
 # ===========================================================================
