@@ -55,8 +55,13 @@ def escalation_id_lock(queue_dir: Path, escalation_id: str) -> Iterator[None]:
     GLOB INVISIBILITY:
     The sidecar ends in ``.lock`` and does NOT match the ``esc-*.json`` glob
     used by get_pending / get_by_task / make_id / iter_all_escalation_paths.
-    Lock files are intentionally never deleted or renamed (stable inode);
-    accumulation at current queue volumes is acceptable.
+    It is never RENAMED or replaced — that is the stable-inode contract above
+    (task 1609) and the whole reason the sidecar exists.  It IS unlinked, in
+    exactly one place: ``sweep.reap_orphan_locks``, the server-start pass that
+    stops the root accumulating a sidecar per dead id.  That pass only ever
+    touches a DEAD id — one whose record is absent from both the queue root and
+    the archive — and ``make_id``'s monotonic durable counter can never re-mint
+    such an id, so no future writer can want the inode it removes.
 
     Usage::
 
@@ -84,6 +89,13 @@ def escalation_id_lock(queue_dir: Path, escalation_id: str) -> Iterator[None]:
 # rather than evicted piecemeal (simple, and negative-cache staleness is
 # already bounded by the next self-archival — see _archive_resolved).
 _ARCHIVE_NEGATIVE_CACHE_MAX_SIZE = 10_000
+
+# Suffix marking a durable per-task_id sequence counter, ``esc-{task_id}.seq``.
+# TWO coupled consumers, which is why it is a shared constant rather than a
+# literal at either site: ``make_id`` NAMES the counter with it, and
+# ``sweep.reap_orphan_locks`` uses it as its never-reap guard (a counter has no
+# ``.json`` record, so it would otherwise look permanently orphaned).
+SEQ_COUNTER_SUFFIX = '.seq'
 
 # Hard cap on the NUMBER of Escalation.amendments entries (see add_members_to_l2,
 # the SOLE writer and sole trimmer).  Worst case is repeated folds of one cluster
@@ -1692,7 +1704,7 @@ class EscalationQueue:
         stable ``esc-{task_id}.seq.json.lock`` sidecar inode and never
         observe the same counter value.
         """
-        counter_id = f'esc-{task_id}.seq'
+        counter_id = f'esc-{task_id}{SEQ_COUNTER_SUFFIX}'
         counter_path = self.queue_dir / counter_id
         with escalation_id_lock(self.queue_dir, counter_id):
             current = 0
