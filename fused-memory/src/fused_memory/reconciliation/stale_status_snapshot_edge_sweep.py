@@ -116,6 +116,30 @@ constant — do not restate them here.)
   parameter today; the two rules retire an edge on very different
   triggers, so a residual that is tolerable under one can be intolerable
   under the other.  (amendment, task 3037)
+- WHAT ACTUALLY MAKES THAT SUBSET PROPERTY HOLD — and it is NOT pattern
+  nesting, which is what this list claimed until it was measured false.
+  Two mechanisms, both in
+  ``extract_snapshot_edge_task_ids_by_marker_class``: the union family's
+  prepositional-complement ``rejected_spans`` are THREADED into the
+  blocked call, and the returned ``blocked_ids`` are INTERSECTED with
+  ``all_ids`` at the seam.  The general warning, which is the part worth
+  carrying forward: ALGORITHM DATA computed inside ``_extract_ids`` is
+  PER-FAMILY, and must be threaded explicitly whenever it can only NARROW
+  a family's result — sharing the pattern builder does not carry it.  The
+  bug this closes: ``rejected_spans`` is built from a family's OWN
+  ``plural_enum`` matches, and the blocked family's ``plural_enum``
+  requires the literal 'blocked' marker, so an enumeration the union
+  family rejected on a 'pending' marker was never built by the blocked
+  family, suppressed nothing there, and let its individual arm extract an
+  id the union family had deliberately refused — over-selection, the
+  unrecoverable direction.  Note the ONE piece of per-family data that is
+  already safe and must be LEFT ALONE:
+  ``patterns.reject_list_after_task_ref`` is True for the blocked family
+  only, so it makes that family reject MORE (the transitive-verb reading
+  'Task 5 blocked tasks: 142, 148').  It narrows blocked relative to
+  union, which PRESERVES the subset property rather than breaking it.
+  (amendment, reviewer_comprehensive correctness-over-selection finding,
+  task 3037)
 
 Known residuals (deliberate; all fail-safe/under-selection unless noted)
 — shape-by-shape detail lives at the matching constant:
@@ -219,6 +243,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import NamedTuple
 
@@ -1253,16 +1278,24 @@ def extract_blocked_assertion_task_ids(fact: str | None) -> set[int]:
 
     The blocked-scoped counterpart of ``extract_snapshot_edge_task_ids``:
     same gate -> plural-with-prepositional-complement-rejection -> anchored
-    paths -> aggregate-segment algorithm, same rejected-span suppression, run
-    against the BLOCKED pattern family instead of the union family. Always a
-    SUBSET of the union result, by construction (both families come from
-    ``_build_snapshot_patterns``, and the blocked family's marker alternation
-    is a subset of the union's) — pinned by a test.
+    paths -> aggregate-segment algorithm, run against the BLOCKED pattern
+    family instead of the union family.
+
+    Always a SUBSET of the union result — but NOT, as this docstring claimed
+    until it was measured false, merely because both families come from
+    ``_build_snapshot_patterns`` with nesting marker alternations. Shared
+    patterns do not share the rejected-span suppression, which is algorithm
+    data computed per family. The containment holds because
+    ``extract_snapshot_edge_task_ids_by_marker_class`` threads the union
+    family's rejected spans into this family's call and intersects the result
+    at the seam; see there. (amendment, reviewer_comprehensive
+    correctness-over-selection finding, task 3037)
 
     ONE guard is blocked-family-only, and it too narrows: an aggregate list
     whose introducer follows a task reference in the same clause is dropped,
     so the transitive-verb reading 'Task 5 blocked tasks: 142, 148' does not
-    reach the blocked rule. See ``_list_is_governed_by_task_ref``.
+    reach the blocked rule. Narrowing blocked relative to union is the safe
+    asymmetry — it preserves containment. See ``_list_is_governed_by_task_ref``.
 
     Why this exists (task 3037). ``extract_snapshot_edge_task_ids`` returns
     the UNION over every status marker, so it cannot say WHICH ids a fact
@@ -1293,8 +1326,14 @@ def extract_blocked_assertion_task_ids(fact: str | None) -> set[int]:
 class SnapshotEdgeIds(NamedTuple):
     """One edge fact's extracted task ids, split by marker class (task 3037).
 
-    ``blocked_ids`` is always a SUBSET of ``all_ids`` — both come from the
-    same builder's pattern families, whose marker alternations nest.
+    ``blocked_ids`` is always a SUBSET of ``all_ids``. NOT because the
+    families' marker alternations nest — that was the original claim and it
+    was measured FALSE — but because
+    ``extract_snapshot_edge_task_ids_by_marker_class`` threads the union
+    family's rejected spans into the blocked call and then intersects the two
+    sets at the seam. See that function for both mechanisms and for why
+    pattern nesting is not sufficient. (amendment, reviewer_comprehensive
+    correctness-over-selection finding, task 3037)
     """
 
     #: Every id the fact asserts as active/pending/blocked/stalled/in-progress.
@@ -1346,17 +1385,79 @@ def extract_snapshot_edge_task_ids_by_marker_class(fact: str | None) -> Snapshot
         # family is a subset of this gate, so one scan settles both.
         return SnapshotEdgeIds(all_ids=set(), blocked_ids=set())
 
-    all_ids = _extract_ids(fact, _UNION_PATTERNS)
+    union = _extract_ids(fact, _UNION_PATTERNS)
     if not _BLOCKED_MARKER_RE.search(fact):
-        return SnapshotEdgeIds(all_ids=all_ids, blocked_ids=set())
+        return SnapshotEdgeIds(all_ids=union.ids, blocked_ids=set())
+
+    # THREAD the union family's prepositional-complement rejections into the
+    # blocked family. A rejected span is, by construction, a region
+    # established to be a PREPOSITION'S COMPLEMENT, so no id inside it is the
+    # copula's subject — whichever family, and whichever pattern, found it.
+    # That is verbatim the argument _extract_ids already gives for applying a
+    # rejection across all three anchored paths; it extends across the two
+    # FAMILIES for exactly the same reason, and that is where it was missed.
+    #
+    # Load-bearing, not tidiness. rejected_spans is computed per call from
+    # THIS family's plural_enum matches, and the blocked family's plural_enum
+    # needs the literal 'blocked' marker — so an enumeration the union family
+    # rejected on a 'pending'/'active'/'in progress'/'stalled' marker was
+    # never built by the blocked family, suppressed nothing, and left its
+    # individual arm free to claim a repeated 'task N' reference inside a
+    # region already ruled out:
+    #
+    #     'Dependencies for tasks 1020 and task 1030 are pending in blocked
+    #      status'  ->  union set(), blocked {1030}   (MEASURED, pre-fix)
+    #
+    # i.e. an edge asserting the DEPENDENCIES are pending was retired, and a
+    # status attributed to a subject the fact never made a claim about.
+    # (amendment, reviewer_comprehensive correctness-over-selection finding,
+    # task 3037)
+    blocked = _extract_ids(
+        fact, _BLOCKED_PATTERNS, inherited_rejected_spans=union.rejected_spans,
+    )
 
     return SnapshotEdgeIds(
-        all_ids=all_ids,
-        blocked_ids=_extract_ids(fact, _BLOCKED_PATTERNS),
+        all_ids=union.ids,
+        # INTERSECT AT THE SEAM. Be honest about what this is: with the
+        # threading above in place it is MEASURED to be a no-op across the
+        # whole 800-fact _SUBSET_PROPERTY_CORPUS, so it is NOT the fix — it is
+        # what makes this NamedTuple's containment claim true BY CONSTRUCTION
+        # rather than by argument, at the cost of one set intersection on the
+        # small minority of edges that clear the _BLOCKED_MARKER_RE pre-gate.
+        #
+        # It exists because the ORIGINAL 'by construction' argument (the
+        # marker alternations nest, therefore the results nest) is UNSOUND for
+        # regex families in general, independently of the bug above:
+        # finditer is non-overlapping, so narrowing an alternation can delete
+        # an earlier match and thereby UNSHADOW a later one the wider family
+        # never reported. The intersection bounds that entire class of future
+        # surprise in the safe direction — under-selection self-heals on the
+        # next cycle, over-selection retires a live edge forever.
+        blocked_ids=blocked.ids & union.ids,
     )
 
 
-def _extract_ids(fact: str, patterns: _SnapshotPatterns) -> set[int]:
+class _ExtractionResult(NamedTuple):
+    """One family's extracted ids plus the rejected spans it established.
+
+    The spans are returned rather than kept private because they are the one
+    piece of ALGORITHM DATA that must cross the family boundary — see
+    ``_extract_ids``'s ``inherited_rejected_spans`` parameter.
+    """
+
+    #: Ids this family attributed to the copula's subject.
+    ids: set[int]
+    #: Enumeration spans established to be a preposition's complement,
+    #: inherited from the caller plus this family's own rejections.
+    rejected_spans: tuple[tuple[int, int], ...]
+
+
+def _extract_ids(
+    fact: str,
+    patterns: _SnapshotPatterns,
+    *,
+    inherited_rejected_spans: Sequence[tuple[int, int]] = (),
+) -> _ExtractionResult:
     """Run one already-gated *fact* through one marker family's five paths.
 
     The single shared implementation of steps 2-6 of
@@ -1366,10 +1467,22 @@ def _extract_ids(fact: str, patterns: _SnapshotPatterns) -> set[int]:
     extractors cannot drift in their ALGORITHM the way hand-copied patterns
     would have let them drift in their GRAMMAR.
 
+    ``inherited_rejected_spans`` carries the prepositional-complement
+    rejections ANOTHER family already established on the same fact, and the
+    returned ``rejected_spans`` carries this family's own on top of them.
+    That threading is load-bearing, not an optimisation — see
+    ``extract_snapshot_edge_task_ids_by_marker_class``, and the warning about
+    per-family algorithm data in this module's docstring. Sharing the pattern
+    BUILDER does not share this: ``rejected_spans`` is computed here, per
+    call, from THIS family's own ``plural_enum`` matches, so a span the union
+    family rejects is one the narrower blocked family may never build at all.
+    (amendment, reviewer_comprehensive correctness-over-selection finding,
+    task 3037)
+
     Pure: no I/O, no side effects.
     """
     ids: set[int] = set()
-    rejected_spans: list[tuple[int, int]] = []
+    rejected_spans: list[tuple[int, int]] = [*inherited_rejected_spans]
 
     for enum in patterns.plural_enum.finditer(fact):
         # Subjecthood guard, second half: reject an enumeration that is a
@@ -1422,7 +1535,7 @@ def _extract_ids(fact: str, patterns: _SnapshotPatterns) -> set[int]:
         segment = COUNT_QUANTITY_RE.sub(' ', _list_segment(fact, intro.end(), intro.group('open')))
         ids.update(int(tok) for tok in _BARE_DIGIT_RE.findall(segment))
 
-    return ids
+    return _ExtractionResult(ids=ids, rejected_spans=tuple(rejected_spans))
 
 
 # --------------------------------------------------------------------------- #
