@@ -110,6 +110,7 @@ from _workflow_helpers import (
     _init_repo,
     wire_metadata_backend,
 )
+from pydantic import ValidationError
 from shared.cost_store import CostStore
 
 from orchestrator.agents.invoke import AgentResult
@@ -1395,3 +1396,142 @@ class TestSimpleTaskModelReloadReachesTheSeam:
         assert st_events, f'expected a simple_task routing_decision event: {rec.events!r}'
         assert st_events[-1]['data']['model'] == _PINNED_SIMPLE_TASK_RELOAD_MODEL
         assert st_events[-1]['data']['source_layer'] == 'config'
+
+
+# ---------------------------------------------------------------------------
+# Boundary scenario 11 -- an unknown policy-rule key is rejected, the live
+# config's prior rules survive untouched, AND still govern a real dispatch
+# afterward (plan step-8).
+# ---------------------------------------------------------------------------
+
+
+class TestUnknownRuleKeyRejectedPriorRulesStillRoute:
+    """PRD boundary scenario 11: an operator yaml edit whose policy rule
+    carries an unknown ``match``/``set`` key is rejected, the live config's
+    prior rules survive untouched (the rollback half), and -- the
+    integration half that distinguishes this from the existing unit test
+    (``test_routing_reload.py``:112-160) -- those prior rules did not
+    merely survive in memory: they still GOVERN a real dispatch through the
+    rig afterward.
+
+    MECHANISM NOTE: ``RuleMatch``/``RuleSet``'s ``extra='forbid'``
+    (config.py:380/406) rejects the unknown key at ``OrchestratorConfig``
+    CONSTRUCTION time -- i.e. inside ``load_config()`` while building the
+    candidate "fresh" config -- raising ``pydantic.ValidationError`` naming
+    the key, BEFORE ``apply_reload`` is ever reached. Verified directly
+    against ``test_routing_reload.py``'s existing, merged
+    ``TestUnknownRuleKeyFailsClosedBeforeApply`` class, whose own docstring
+    states this precisely: "an invalid fresh config...raises
+    pydantic.ValidationError naming the key at OrchestratorConfig
+    construction time, BEFORE apply_reload is ever reached". This class's
+    mechanism mirrors that exactly -- it is NOT ``apply_reload``'s separate
+    hybrid-invariant rollback path (config.py:5394-5413), which only fires
+    when a fresh config that IS individually valid combines with ``live``
+    into an invalid CROSS-FIELD hybrid (e.g. the steward-timeout
+    invariant); an ``extra='forbid'`` violation can never produce an
+    individually-valid ``fresh`` to reach that path in the first place, so
+    ``apply_reload`` is never called below -- there is nothing valid for it
+    to reload.
+    """
+
+    @pytest.fixture
+    def stock_config(self, git_repo: Path, code_default_config) -> OrchestratorConfig:
+        return OrchestratorConfig(
+            project_root=git_repo,
+            max_concurrent_tasks=1,
+            max_execute_iterations=5,
+            max_verify_attempts=3,
+            max_review_cycles=2,
+            git=GitConfig(
+                main_branch='main',
+                branch_prefix='task/',
+                remote='origin',
+                worktree_dir='.worktrees',
+            ),
+            sandbox=SandboxConfig(enabled=False),
+        )
+
+    @pytest.mark.asyncio
+    async def test_unknown_match_key_rejected_live_unchanged_and_still_routes(
+        self, stock_config, git_ops, task_assignment, git_repo, tmp_path, monkeypatch,
+    ):
+        # Premise: the shipped large-plan-steps rule (defaults.yaml:257) is
+        # live under code_default_config -- the "known-good rule set...that
+        # demonstrably fires" this scenario needs.
+        assert any(r.id == 'large-plan-steps' for r in stock_config.routing.rules)
+
+        rules_before = list(stock_config.routing.rules)
+        ladder_before = list(stock_config.routing.ladder)
+        allowed_models_before = list(stock_config.routing.allowed_models)
+        ceilings_before = dict(stock_config.routing.per_model_daily_ceiling_usd)
+
+        bad_yaml = tmp_path / 'bad-match.yaml'
+        bad_yaml.write_text(yaml.safe_dump({
+            'routing': {
+                'rules': [
+                    {'id': 'bad-rule', 'match': {'plan_vibes': 3}, 'set': {'model': 'opus'}},
+                ],
+            },
+        }))
+
+        # (a) the reload FAILS: fresh construction itself raises, naming the
+        # unknown key (see class docstring's MECHANISM NOTE).
+        with pytest.raises(ValidationError, match='plan_vibes'):
+            load_config(bad_yaml)
+
+        # (b) live is unchanged -- by id/value, not just count (the rollback
+        # half). No code path ran that could have mutated it: rules survive
+        # by identity, and no partial mutation of ladder/allowed_models/
+        # ceilings leaked in from the rejected candidate.
+        assert stock_config.routing.rules == rules_before
+        assert [r.id for r in stock_config.routing.rules] == [r.id for r in rules_before]
+        assert stock_config.routing.ladder == ladder_before
+        assert stock_config.routing.allowed_models == allowed_models_before
+        assert stock_config.routing.per_model_daily_ceiling_usd == ceilings_before
+
+        # (c) the integration half: the prior rules did not merely survive
+        # in memory -- they still GOVERN a real dispatch afterward. Mirrors
+        # TestByteEquivalenceThroughTheRig's rust-heuristic-parity idiom:
+        # seed workflow.plan/modules directly and drive _invoke, since only
+        # the resolved route matters here.
+        stub = _MinimalRouteRecorder()
+        workflow, _scheduler = _build_workflow(stock_config, git_ops, task_assignment, stub)
+        rec = _RecordingEventStore()
+        workflow.event_store = rec
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
+
+        workflow.plan = {'steps': [{'id': f's{i}', 'status': 'pending'} for i in range(12)]}
+        workflow.modules = ['lib']
+
+        await workflow._invoke(IMPLEMENTER, 'impl prompt', git_repo)
+
+        assert stub.calls[-1]['model'] == 'opus'
+        impl_data = [
+            e for e in _routing_events(rec) if e['data']['role'] == 'implementer'
+        ][-1]['data']
+        assert impl_data['source_layer'] == 'policy_rule'
+        assert impl_data['rule_id'] == 'large-plan-steps'
+
+    def test_unknown_set_key_rejected(self, tmp_path: Path) -> None:
+        """Symmetric sub-test: ``RuleSet``'s own ``extra='forbid'``
+        (config.py:406) protects the ``set:`` vocabulary via the identical
+        construction-time mechanism -- proven once here rather than
+        re-running the full (b)/(c) proof above, since post-rejection
+        routing behavior is identical regardless of which closed-vocabulary
+        class caught the typo.
+        """
+        bad_yaml = tmp_path / 'bad-set.yaml'
+        bad_yaml.write_text(yaml.safe_dump({
+            'routing': {
+                'rules': [
+                    {
+                        'id': 'bad-rule',
+                        'match': {'role': ['implementer']},
+                        'set': {'model_typo': 'opus'},
+                    },
+                ],
+            },
+        }))
+
+        with pytest.raises(ValidationError, match='model_typo'):
+            load_config(bad_yaml)
