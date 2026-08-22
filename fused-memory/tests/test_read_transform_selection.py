@@ -76,6 +76,35 @@ def _bake_off() -> types.ModuleType:
     return _load_script(BAKE_OFF_PATH, 'bake_off_storage_shape')
 
 
+def _assert_reexported_from_bake_off(mod: types.ModuleType, name: str) -> None:
+    """INV-5: `mod.<name>` is the bake-off's definition, not a local restatement.
+
+    Asserts identity against the LIVE `sys.modules` entry, not against a
+    cached module instance or a metadata tuple (task 4583 amendment).  An
+    earlier version compared `(fn.__module__, fn.__qualname__)` instead of
+    identity, on the claim that this was "strictly stronger" than `is` —
+    that claim was false: `functools.wraps` copies both attributes onto a
+    wrapper, so a local re-implementation that delegates its metadata would
+    still pass it.  This version instead re-derives the SAME live object the
+    re-export just resolved through: `getattr(mod, name)` forces
+    `read_transform_selection.__getattr__` to call the script's own
+    `bake_off()`, which loads-and-registers
+    `sys.modules['bake_off_storage_shape']` if nothing is registered yet, or
+    reuses whatever is already there; re-reading that `sys.modules` entry
+    immediately afterwards reads the exact object `__getattr__` just used.
+    That makes the check order-independent BY CONSTRUCTION — it never
+    depends on which instance xdist scheduling happened to register, nor on
+    `_bake_off()`'s own `functools.cache` (which this helper never calls) —
+    while still catching a local shadow: any re-implementation, wrapped or
+    not, is a different object than whatever lives at
+    `sys.modules['bake_off_storage_shape']` under this name.
+    """
+    import sys  # noqa: PLC0415
+
+    fn = getattr(mod, name)  # forces bake_off() to load+register if absent
+    assert fn is getattr(sys.modules['bake_off_storage_shape'], name)
+
+
 # ---------------------------------------------------------------------------
 # Hand-built ranked lists
 # ---------------------------------------------------------------------------
@@ -2422,7 +2451,8 @@ class TestNoneNeverAveragesInAsZero:
     def test_it_delegates_to_the_bake_offs_mean(self):
         """INV-5: there is not a second mean in this repo."""
         mod = _mod()
-        assert mod._mean is _bake_off()._mean
+        _assert_reexported_from_bake_off(mod, '_mean')
+        assert mod._mean([None, None]) is None
 
     def test_an_empty_row_set_aggregates_to_none_not_zero(self):
         mod = _mod()
@@ -2749,7 +2779,121 @@ class TestTheNoMeasurementConvention:
     def test_it_reuses_the_bake_offs_cell_renderer(self):
         """INV-5: there is not a second `—` convention in this repo."""
         mod = _mod()
-        assert mod._cell is _bake_off()._cell
+        _assert_reexported_from_bake_off(mod, '_cell')
+        assert mod._cell(None) == _bake_off()._NO_MEASUREMENT
+
+
+class TestInv5IsLoadOrderIndependent:
+    """The committed INV-5 checks must hold no matter which sibling loads
+    `bake_off_storage_shape` last (task 4583).
+
+    `_bake_off()` (:74-76) is `functools.cache`d, so once it has been called
+    the returned module instance never changes — but a sibling test module's
+    own loader (or a second direct call to this file's `_load_script`, as
+    below) can still register a *different*, independently `exec_module`d
+    instance under `sys.modules['bake_off_storage_shape']` at any time.
+    `read_transform_selection.bake_off()` has no such cache: it reads
+    `sys.modules` live on every call.  So `mod._cell is _bake_off()._cell`
+    compares "whatever is in `sys.modules` right now" against "whatever
+    `_bake_off()` cached the first time it ran" — two objects that are only
+    guaranteed equal when nothing has clobbered `sys.modules` in between,
+    which is exactly the guarantee xdist scheduling does not provide.  This
+    class reproduces that clobber deterministically, in-process, instead of
+    depending on which worker happens to run a given test first.
+    """
+
+    def _clobber_bake_off_module(self):
+        """Register a fresh, independently-exec'd `bake_off_storage_shape`.
+
+        Returns whatever was previously registered (or ``None``) so the
+        caller can restore it afterwards.  Uses this file's own
+        `_load_script`, which — unlike the production script's loader —
+        unconditionally execs a new module and overwrites `sys.modules`,
+        exactly what a sibling test module's load does.
+        """
+        import sys  # noqa: PLC0415
+
+        saved = sys.modules.get('bake_off_storage_shape')
+        _load_script(BAKE_OFF_PATH, 'bake_off_storage_shape')
+        return saved
+
+    def _restore_bake_off_module(self, saved):
+        import sys  # noqa: PLC0415
+
+        if saved is None:
+            sys.modules.pop('bake_off_storage_shape', None)
+        else:
+            sys.modules['bake_off_storage_shape'] = saved
+
+    def test_the_committed_inv5_checks_survive_a_reloaded_bake_off(self):
+        """Every INV-5 re-export must survive a clobbered `sys.modules`.
+
+        Asserts directly through `_assert_reexported_from_bake_off` instead
+        of instantiating sibling test classes and calling their methods by
+        name (task 4583 amendment): the original version coupled this test
+        to `TestTheNoMeasurementConvention`/`TestNoneNeverAveragesInAsZero`'s
+        method names for no benefit — a rename, a move, or an added fixture
+        parameter on either would break this test for reasons unrelated to
+        the invariant.  Walking `_REEXPORTED_FROM_BAKE_OFF` also covers
+        `_rate`, which the sibling-method version never touched.
+
+        Re-clobbers immediately before EACH name for the same reason the
+        original did: a single clobber only reddens the first name checked,
+        because resolving any re-export re-syncs `sys.modules` via the
+        bake-off's own `bake_off()` loader.
+
+        Under the current, order-independent-by-construction assertion
+        helper, this can no longer actually go red — the helper reads
+        `sys.modules` live on both sides of its own comparison, so a clobber
+        in between can't desynchronize it, and this test never calls the
+        test file's cached `_bake_off()` either, so it leaves no cache /
+        `sys.modules` divergence behind it.  It stays as a regression guard
+        on the HELPER itself: if a future change reintroduces a cached- or
+        provenance-based comparison — the exact bug task 4583 fixed — this
+        is the test that would catch it, where a non-clobbering call site
+        might pass by luck.
+        """
+        for name in _mod()._REEXPORTED_FROM_BAKE_OFF:
+            saved = self._clobber_bake_off_module()
+            try:
+                _assert_reexported_from_bake_off(_mod(), name)
+            finally:
+                self._restore_bake_off_module(saved)
+
+    def test_every_reexported_name_is_the_bake_offs_definition(self):
+        """INV-5 covers the whole re-export set, not two hand-picked names.
+
+        `_rate` has never had an INV-5 assertion because the re-export set
+        used to be a bare literal inside `__getattr__`'s body, not
+        introspectable from outside it — a fourth re-export could have been
+        added with no check at all.  `_REEXPORTED_FROM_BAKE_OFF` (task 4583)
+        closes that gap: this test walks it instead of hand-picking names.
+
+        The `>=` (not `==`) is deliberate (task 4583 amendment): a name
+        ADDED to the constant tomorrow is covered by this loop with no test
+        edit needed — the whole point of hoisting the set out of
+        `__getattr__` — while a name REMOVED still fails loudly here.
+        """
+        mod = _mod()
+        names = mod._REEXPORTED_FROM_BAKE_OFF
+        assert set(names) >= {'_mean', '_rate', '_cell'}, names
+        for name in names:
+            _assert_reexported_from_bake_off(mod, name)
+
+        # `_rate` has no dedicated INV-5 test class of its own the way
+        # `_mean`/`_cell` do, so its behavioural half — the actual
+        # none-is-not-a-measured-zero discipline this re-export exists to
+        # protect, not just its definition site — is pinned here (task 4583
+        # amendment).  Confirmed exploitable: a mutant `_rate` returning
+        # `0.0` instead of `None` for a zero denominator passed the full
+        # suite with only the identity/provenance check in place.
+        assert mod._rate(0, 0) is None
+        assert mod._rate(1, 2) == 0.5
+
+    def test_an_unknown_attribute_still_raises(self):
+        """The PEP 562 hook must not turn typos into silent bake-off lookups."""
+        with pytest.raises(AttributeError):
+            _ = _mod()._definitely_not_a_real_name
 
 
 # ===========================================================================
