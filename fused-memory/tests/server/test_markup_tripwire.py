@@ -41,6 +41,20 @@ _STORM = {
     'hint': 'the leak is active; DF 3083 owns the root cause',
 }
 
+#: The shape the ONE live producer actually sends — ``project``/``outcome``,
+#: singular, no ``projects``. ``shared.mcp_markup_middleware`` declares THREE
+#: storm outcomes (:135-138) and fires ``_record_storm`` for each of them
+#: (:497, :513, :520), so all three arrive at this one filer and it may not
+#: hardcode any of them.
+_REJECTED_STORM = {
+    'count': 3,
+    'threshold': 3,
+    'window_seconds': 3600.0,
+    'outcome': 'rejected',
+    'project': '/project-a',
+}
+_REPAIRED_STORM = {**_REJECTED_STORM, 'outcome': 'repaired'}
+
 
 # ---------------------------------------------------------------------------
 # Tier-1 same-file drift guard.
@@ -260,7 +274,16 @@ class TestEmitMarkupStormEscalation:
         assert '3083' in routing_text, (
             f'must still name DF 3083, as the closed predecessor: {payload!r}'
         )
-        assert 'rejected_writes_in_window=4' in detail, f'must state the count: {detail!r}'
+        # The count's key is outcome-NEUTRAL and static (task 4505): this one
+        # filer serves all three of the middleware's outcomes, and a key naming
+        # one of them contradicts its own content on the other two. Static, and
+        # not interpolated from the outcome, because greppability across records
+        # is the one property an operator relies on. Anchored on both sides so
+        # the old `rejected_writes_in_window=4` cannot satisfy it by substring.
+        assert '\nwrites_in_window=4\n' in detail, f'must state the count: {detail!r}'
+        assert 'outcome=' in detail, (
+            f'the count is a count of ONE outcome; name it: {detail!r}'
+        )
         assert 'window_seconds=3600.0' in detail, f'must state the window: {detail!r}'
         # A burst cannot span projects (task 4505): the live producer keys one
         # StormCounter per (project, outcome) pair, so the window holds one
@@ -271,6 +294,141 @@ class TestEmitMarkupStormEscalation:
         assert 'projects_in_window' not in detail, (
             f'the count cannot span projects, so it must not be hedged: {detail!r}'
         )
+
+    # -- outcome fidelity (task 4505) -----------------------------------
+    #
+    # The middleware fires a storm for each of THREE outcomes — 'repaired',
+    # 'rejected', 'unrepairable' (mcp_markup_middleware.py:135-138, recorded at
+    # :497, :513, :520) — and every one reaches this single filer. A 'repaired'
+    # burst is a burst of calls that all SUCCEEDED (the middleware says so at
+    # :899), so a record describing them as rejections states a number the
+    # triager cannot reproduce: grepping their own journal for rejections finds
+    # zero. Naming an outcome the burst did not have is the same defect as
+    # stating a count the burst did not have.
+
+    @staticmethod
+    def _filed(tmp_path, storm) -> dict:
+        """File *storm* and read the single record back off disk."""
+        esc_id = emit_markup_storm_escalation(str(tmp_path), storm)
+        assert esc_id is not None
+        files = list((tmp_path / 'data' / 'escalations').glob('esc-*.json'))
+        assert len(files) == 1, f'expected exactly one escalation file, found: {files}'
+        payload = json.loads(files[0].read_text())
+        assert payload['id'] == esc_id
+        return payload
+
+    def test_a_repaired_burst_is_not_described_as_rejected(self, tmp_path):
+        """The headline. Today this record claims writes were rejected when the
+        burst it describes consists entirely of calls that SUCCEEDED.
+
+        The word is asserted absent from BOTH fields, because the false claim is
+        not confined to the count's label: the detail's prose says the tripwire
+        "rejected multiple writes" and the summary says "MCP write(s) rejected",
+        and each is read by a different consumer.
+        """
+        if not markup_tripwire.HAS_ESCALATION:
+            assert emit_markup_storm_escalation(str(tmp_path), _REPAIRED_STORM) is None
+            return
+
+        payload = self._filed(tmp_path, _REPAIRED_STORM)
+
+        assert 'repaired' in payload['summary'], (
+            f"must name the burst's own outcome: {payload['summary']!r}"
+        )
+        both = f'{payload["summary"]}\n{payload["detail"]}'
+        assert 'rejected' not in both, (
+            f'nothing was rejected in a repaired burst — a triager grepping '
+            f'their journal for rejections finds zero: {both!r}'
+        )
+
+    def test_a_rejected_burst_still_reads_as_rejected(self, tmp_path):
+        """The other half, so (a) cannot be satisfied by dropping the outcome
+        word altogether. Rejections are still the common case and must still be
+        named as rejections.
+
+        The count is asserted as an EXACT LABELLED substring: a bare `'3' in
+        summary` is vacuous here, because 'window_seconds=3600.0' and the
+        routing text both carry a 3.
+        """
+        if not markup_tripwire.HAS_ESCALATION:
+            assert emit_markup_storm_escalation(str(tmp_path), _REJECTED_STORM) is None
+            return
+
+        payload = self._filed(tmp_path, _REJECTED_STORM)
+
+        assert '3 MCP write(s) rejected' in payload['summary'], (
+            f'a rejected burst must still read as rejected: {payload["summary"]!r}'
+        )
+
+    def test_the_summary_alone_answers_how_many_of_what_for_whom(self, tmp_path):
+        """Asserted against the SUMMARY ONLY — never the detail — because that
+        is all a compact consumer is given.
+
+        escalation/src/escalation/server.py:409-420 projects `summary` into both
+        `_COMPACT_ESCALATION_FIELDS` and `_COMPACT_PENDING_FIELDS` and
+        explicitly DROPS `detail` as "the unbounded free-text field that
+        motivated compact mode". So the L1 escalation watcher and
+        get_pending_escalations(compact=True) see the summary and nothing else:
+        a qualifier that lives only in the detail is structurally unreadable.
+        That is the whole reason this task exists — esc-markup-tripwire-6 was
+        triaged off a summary that answered 'how many' with a number pooled
+        across two projects and named no scope at all.
+        """
+        if not markup_tripwire.HAS_ESCALATION:
+            assert emit_markup_storm_escalation(str(tmp_path), _REJECTED_STORM) is None
+            return
+
+        summary = self._filed(tmp_path, _REJECTED_STORM)['summary']
+
+        # how many, and of what — one labelled substring, so neither can be
+        # dropped without failing here.
+        assert '3 MCP write(s) rejected' in summary, (
+            f'the summary must carry the count and the outcome: {summary!r}'
+        )
+        # for whom.
+        assert 'in this project' in summary, (
+            f"the summary must scope the count to this project's own "
+            f'contribution: {summary!r}'
+        )
+
+    def test_a_storm_of_unknown_outcome_claims_no_outcome_it_did_not_measure(
+        self, tmp_path
+    ):
+        """Degenerate and legacy shapes must keep working — and must not be
+        relabelled 'rejected' on the way.
+
+        Both cases are live: `{}` is what test_tolerates_a_storm_dict_missing_keys
+        files, and `{'count': 9}` is the squatter that
+        tests/test_markup_guard_fused_memory.py files to reproduce the anchor
+        squat. Absent is not zero and absent is not 'rejected'; equally, the
+        outcome slot must not render the bare string 'None', which is a
+        confident claim about something never measured. Trading a false
+        'rejected' for either is the same class of defect this task closes.
+        """
+        if not markup_tripwire.HAS_ESCALATION:
+            pytest.skip('escalation package unavailable in this environment')
+
+        for storm in ({}, {'count': 9}):
+            queue_root = tmp_path / f'root-{len(storm)}'
+            queue_root.mkdir()
+
+            payload = self._filed(queue_root, storm)
+
+            # Still filed and still routable — this is when an operator needs it
+            # most, so a missing number may not degrade the record's usefulness.
+            assert payload['category'] == 'mcp_markup_write_storm'
+            assert 'toolcall-markup-containment-prd.md' in payload['detail'], (
+                f'must still route at the live successor PRD: {payload!r}'
+            )
+            summary = payload['summary']
+            assert 'rejected' not in summary, (
+                f'no outcome was measured, so none may be claimed: {summary!r}'
+            )
+            # Positional, not a bare `'None' not in summary`: an absent count
+            # and window legitimately render None elsewhere in this sentence.
+            assert 'write(s) None' not in summary, (
+                f"the outcome slot must not read 'None': {summary!r}"
+            )
 
     def test_escalation_id_is_greppable_via_the_stable_anchor(self, tmp_path):
         """The anchor is stable so ids form one greppable series per project."""
