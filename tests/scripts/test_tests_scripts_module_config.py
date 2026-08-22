@@ -38,6 +38,7 @@ import pathlib
 
 import pytest
 import yaml
+from module_budget_family import min_budget
 from orchestrator.config import OrchestratorConfig, _discover_module_configs
 from orchestrator.module_charter import derive_modules
 
@@ -469,38 +470,6 @@ def test_executed_for_touched_is_hermetic_against_the_ambient_orch_config_path(
     )
 
 
-def _min_budget(worst: float) -> int:
-    """~2x the worst measured run, rounded DOWN to the nearest 100s.
-
-    The EXACT expression both sibling guards use for their own floors
-    (``test_scripts_module_config.MIN_MODULE_BUDGET_SECS``, task 3458, and
-    ``test_module_verify_budgets._min_budget``, task 3473), COPIED rather than
-    imported so the three cannot drift in SHAPE while staying free to fail
-    INDEPENDENTLY — a test file importing a sibling test file couples two
-    guards that must be able to fail apart, the convention
-    ``test_module_verify_budgets.py``'s header states. The price of that
-    convention, stated rather than glossed: nothing in THIS file can observe a
-    sibling's copy, so
-    ``test_min_module_budget_is_derived_from_the_measured_worst_run`` pins the
-    SHAPE of the expression below against synthetic cases and claims no more
-    than that.
-
-    DERIVED from the measurement rather than hand-set beside it, because that
-    exact pair has already rotted once undetected — in THIS file: a hand-set
-    300s floor left standing against a 127.0s figure while
-    ``tests/scripts/orchestrator.yaml`` had since recorded a 233.50s worst run
-    of the command this module actually declares (task 3703,
-    reviewer-flagged; both sibling guards had NAMED the staleness in prose,
-    which is precisely what a comment can do and an assertion could not).
-
-    DEGENERATES TO ZERO for cheap suites — ``_min_budget(22.49) == 0``, the
-    sampler case ``test_module_verify_budgets.py`` records — which would make
-    the floor assertion below VACUOUS. Assertion (iii) of the derivation test
-    pins that this suite is not in that regime.
-    """
-    return (int(2 * worst) // 100) * 100
-
-
 # The tests/scripts suite's own measured wall-clock. EVERY recorded run, the
 # inconvenient ones included: task 3350 exists because a single unrecorded
 # estimate ("Full warm verify here is ~2 min") was left standing in the root
@@ -588,10 +557,18 @@ def _min_budget(worst: float) -> int:
 # construction rather than by subtraction, and no figure here needs discounting.
 MEASURED_SUITE_WORST_SECS = 397.47
 # DERIVED from the measurement above, never hand-set beside it, so the two
-# cannot silently diverge again — see _min_budget's docstring for the rot that
-# motivated this and test_min_module_budget_is_derived_from_the_measured_worst_run
-# for the guard that now makes it a property. 2 * 397.47 -> 794.94 -> 700.
-MIN_MODULE_BUDGET_SECS = _min_budget(MEASURED_SUITE_WORST_SECS)
+# cannot silently diverge again — see module_budget_family.min_budget's docstring
+# for the rot that motivated this and
+# test_min_module_budget_is_derived_from_the_measured_worst_run for the guard
+# that makes it a property here. 2 * 397.47 -> 794.94 -> 700.
+#
+# CORRECTED IN PLACE (task 4320): this used to call a LOCAL `_min_budget` copy
+# defined a few lines above, one of three spellings of a single derivation
+# across this family. The copy is gone and the canonical implementation is
+# imported; the guard's own claim is stronger for it, not weaker, because
+# test_module_verify_budgets.py now checks cross-file that every family member
+# calls that one implementation.
+MIN_MODULE_BUDGET_SECS = min_budget(MEASURED_SUITE_WORST_SECS)
 
 
 def test_min_module_budget_is_derived_from_the_measured_worst_run() -> None:
@@ -604,21 +581,33 @@ def test_min_module_budget_is_derived_from_the_measured_worst_run() -> None:
     declares — so the yaml's own worst figure was gated by NOTHING, and the two
     sibling guards could only NAME the staleness in their comment blocks
     (``test_scripts_module_config.py``'s ``MIN_MODULE_BUDGET_SECS`` comment and
-    ``test_module_verify_budgets.py``'s ``_min_budget`` docstring both call it
+    ``module_budget_family.min_budget``'s docstring, which inherited it from
+    ``test_module_verify_budgets.py``, both call it
     out verbatim) rather than fail on it. Deriving the floor is what turns that
     from a documented observation into a property.
 
-    SCOPE, NARROWED TO WHAT IS ACTUALLY VERIFIED (task 3703 amendment pass,
-    reviewer-flagged: this docstring previously described (i) as cross-file
-    enforcement, which it is not and cannot be). ``_min_budget`` is a LOCAL
-    copy, per the family's no-cross-import convention, so nothing here can
-    observe a sibling's expression: if ``test_scripts_module_config.py``
-    changed its own inline derivation, every assertion below would still pass.
-    (i) is a purity check on THIS file's copy, (ii) is an edit tripwire on THIS
-    file's pair. Real cross-file enforcement — one guard reading every family
-    member's published pair and checking the derivation holds for all of them —
-    would be a new mechanism rather than an amendment, and is filed as a
-    follow-up instead of being claimed here.
+    SCOPE (task 3703 amendment pass, CORRECTED IN PLACE by task 4320). This
+    paragraph used to read: "``_min_budget`` is a LOCAL copy, per the family's
+    no-cross-import convention, so nothing here can observe a sibling's
+    expression: if ``test_scripts_module_config.py`` changed its own inline
+    derivation, every assertion below would still pass ... Real cross-file
+    enforcement — one guard reading every family member's published pair and
+    checking the derivation holds for all of them — would be a new mechanism
+    rather than an amendment, and is filed as a follow-up instead of being
+    claimed here."
+
+    THAT FOLLOW-UP IS TASK 4320 AND IT LANDED. There is no local copy any more:
+    ``min_budget`` is imported from ``module_budget_family``, the family's one
+    implementation, and ``test_module_verify_budgets.py::
+    test_the_budget_family_derives_every_floor_from_one_canonical_expression``
+    reads EVERY member's published pair and evaluates each floor expression in a
+    namespace holding only that helper and the published worst — so a sibling
+    re-spelling its derivation now fails there. The three assertions below are
+    unchanged in what they claim, and are strictly stronger than they were:
+    (i) pins the SHAPE of the one shared implementation rather than of this
+    file's private copy, and (ii) remains an edit tripwire on THIS file's pair.
+    The no-cross-import convention is untouched — this file imports a NON-TEST
+    helper, not a sibling guard, and still fails entirely on its own.
 
     Three claims, each falsifiable on its own:
 
@@ -635,15 +624,15 @@ def test_min_module_budget_is_derived_from_the_measured_worst_run() -> None:
         task targets, so it is not reintroduced in the test against it.
 
     (ii) An EDIT TRIPWIRE, not a property: ``MIN_MODULE_BUDGET_SECS`` is
-        DEFINED as ``_min_budget(MEASURED_SUITE_WORST_SECS)`` a few lines above,
+        DEFINED as ``min_budget(MEASURED_SUITE_WORST_SECS)`` a few lines above,
         so this can only fail if a future edit puts a literal back in its place
         — which is precisely the rot described above, and precisely what the
         two sibling guards' comments could name but not catch.
 
-    (iii) The derivation is NON-DEGENERATE for this suite. ``_min_budget``
+    (iii) The derivation is NON-DEGENERATE for this suite. ``min_budget``
         floors to the nearest 100s, so a cheap suite derives a floor of ZERO:
         ``test_module_verify_budgets.py`` documents exactly that case for
-        sampler (``_min_budget(22.49) == 0``), where the corresponding budget
+        sampler (``min_budget(22.49) == 0``), where the corresponding budget
         assertion becomes VACUOUSLY true. At this suite's measured cost it does
         not degenerate, and this pins that — so assertion (b) of
         ``test_tests_scripts_module_carries_its_own_tight_verify_budget`` below
@@ -656,8 +645,8 @@ def test_min_module_budget_is_derived_from_the_measured_worst_run() -> None:
     #    50.0 -> 100  does not degenerate at the boundary
     #    49.9 ->   0  degenerates just below it (the regime (iii) rules out)
     for worst, expected in ((100.0, 200), (299.9, 500), (50.0, 100), (49.9, 0)):
-        assert _min_budget(worst) == expected, (
-            f'_min_budget({worst}) == {_min_budget(worst)}, expected {expected} '
+        assert min_budget(worst) == expected, (
+            f'min_budget({worst}) == {min_budget(worst)}, expected {expected} '
             '(task 3703). The family derivation is ~2x the worst measured run '
             'floored to the nearest 100s; a different multiple, or rounding UP '
             "instead of DOWN, changes the SHAPE of this file's floor and must "
@@ -668,10 +657,10 @@ def test_min_module_budget_is_derived_from_the_measured_worst_run() -> None:
     # rotted once here (see the docstring). Written derivation-first rather than
     # constant-first only because ruff's SIM300 reads the other order as a Yoda
     # condition; equality is symmetric and the claim is unchanged.
-    assert _min_budget(MEASURED_SUITE_WORST_SECS) == MIN_MODULE_BUDGET_SECS, (
+    assert min_budget(MEASURED_SUITE_WORST_SECS) == MIN_MODULE_BUDGET_SECS, (
         f'MIN_MODULE_BUDGET_SECS = {MIN_MODULE_BUDGET_SECS} but '
-        f'_min_budget(MEASURED_SUITE_WORST_SECS={MEASURED_SUITE_WORST_SECS}) = '
-        f'{_min_budget(MEASURED_SUITE_WORST_SECS)} (task 3703) — a literal has '
+        f'min_budget(MEASURED_SUITE_WORST_SECS={MEASURED_SUITE_WORST_SECS}) = '
+        f'{min_budget(MEASURED_SUITE_WORST_SECS)} (task 3703) — a literal has '
         'been put back where the derivation was. Raise '
         'MEASURED_SUITE_WORST_SECS from a fresh measurement and let the floor '
         'follow; do not hand-set the floor'
@@ -681,9 +670,9 @@ def test_min_module_budget_is_derived_from_the_measured_worst_run() -> None:
     assert MIN_MODULE_BUDGET_SECS > 0, (
         f'MIN_MODULE_BUDGET_SECS derives to {MIN_MODULE_BUDGET_SECS} from '
         f'MEASURED_SUITE_WORST_SECS={MEASURED_SUITE_WORST_SECS} (task 3703). '
-        '_min_budget floors to the nearest 100s, so a worst run under 50s '
+        'min_budget floors to the nearest 100s, so a worst run under 50s '
         'derives a ZERO floor — the degenerate case test_module_verify_budgets.py '
-        'records for sampler (_min_budget(22.49) == 0), where the >= floor '
+        'records for sampler (min_budget(22.49) == 0), where the >= floor '
         'assertion passes for ANY declared budget. This suite measures far above '
         'that, so a zero here means the measurement was lost, not that the suite '
         'got cheap'
@@ -697,7 +686,7 @@ def test_tests_scripts_module_carries_its_own_tight_verify_budget() -> None:
     sides are bounded:
 
     - Below (b): at least ``MIN_MODULE_BUDGET_SECS``, which is not a literal
-      but ``_min_budget(MEASURED_SUITE_WORST_SECS)`` — ~2x the worst RECORDED
+      but ``min_budget(MEASURED_SUITE_WORST_SECS)`` — ~2x the worst RECORDED
       run of this module's VERBATIM test_command, floored to the nearest 100s.
       An achievable floor derived from measurement, not a guess, and derived
       rather than transcribed so it cannot fall out of step with the figure it
@@ -742,13 +731,13 @@ def test_tests_scripts_module_carries_its_own_tight_verify_budget() -> None:
         f'own declared test_command is {MEASURED_SUITE_WORST_SECS}s'
     )
 
-    # (b) Measurement-derived floor — DERIVED by _min_budget from
+    # (b) Measurement-derived floor — DERIVED by min_budget from
     # MEASURED_SUITE_WORST_SECS, not hand-set beside it (task 3703).
     assert mc.verify_command_timeout_secs >= MIN_MODULE_BUDGET_SECS, (
         f'{MODULE_PREFIX} verify_command_timeout_secs='
         f'{mc.verify_command_timeout_secs} is below the '
         f'{MIN_MODULE_BUDGET_SECS}s floor (task 3350). That floor is not a '
-        f'literal: it is _min_budget(MEASURED_SUITE_WORST_SECS='
+        f'literal: it is min_budget(MEASURED_SUITE_WORST_SECS='
         f'{MEASURED_SUITE_WORST_SECS}), ~2x the worst RECORDED run of this '
         "module's VERBATIM test_command floored to the nearest 100s — see the "
         'provenance block above that constant for every run behind it. A budget '

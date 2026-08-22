@@ -77,7 +77,7 @@ DF_CONFIG_PATH = REPO_ROOT / 'dark-factory-orchestrator.yaml'
 # PER-MODULE VERIFY BUDGET block, and is the SINGLE durable home for those
 # numbers; .task/measurements.md holds the raw sweep log but is worktree-local
 # scratch and does not survive. Only the scalar W is duplicated here, and only
-# because the guard computes ``_min_budget(W)`` from it — which is exactly why
+# because the guard computes ``min_budget(W)`` from it — which is exactly why
 # every one of those yaml blocks carries a RAISE-TOGETHER rule naming its entry
 # in this table. Reproducing the per-run tables here as well would create a
 # THIRD copy to raise in lockstep, which is the drift this file already declines
@@ -135,7 +135,7 @@ DF_CONFIG_PATH = REPO_ROOT / 'dark-factory-orchestrator.yaml'
 #                 driver collision); nothing here is sized from it.
 #
 #   sampler       MAKES ASSERTION (b)'s DEGENERACY CONCRETE, so it is stated
-#                 here as well as in the test docstring: `_min_budget(22.49)` ==
+#                 here as well as in the test docstring: `min_budget(22.49)` ==
 #                 `(int(44.98) // 100) * 100` == 0, so (b) asserts `budget >= 0`
 #                 for sampler — literally unfalsifiable. What carries this module
 #                 is (a) declared-at-all, (c) strictly-below-root, (d) honoured
@@ -171,34 +171,6 @@ SAMPLE_TOUCHED_FILE: dict[str, str] = {
     'sampler': 'sampler/src/sampler/__init__.py',
     'cockpit': 'cockpit/src/cockpit/__init__.py',
 }
-
-
-def _min_budget(worst: float) -> int:
-    """~2x the worst measured run, rounded DOWN to the nearest 100s.
-
-    The EXACT expression task 3458 uses for
-    ``test_scripts_module_config.MIN_MODULE_BUDGET_SECS``, reused verbatim so
-    the guards cannot silently drift in SHAPE. DERIVED from the measurement
-    rather than hand-set, because that exact pair HAD already rotted once
-    undetected: the tests/scripts sibling hard-coded its floor at 300s against
-    a 127.0s worst run while its own yaml had since recorded 233.50s, and
-    nothing in the repo could fail on it — a reviewer caught it, which is not a
-    mechanism.
-
-    That rot is FIXED (task 3703):
-    ``test_tests_scripts_module_config.py`` now holds
-    ``MEASURED_SUITE_WORST_SECS = 233.50`` with its floor derived by this same
-    expression, and pins the shape with ``_min_budget(930.59) == 1800`` against
-    the sibling's published pair. All three guards in the family now derive.
-    The history is kept rather than deleted because it is the REASON for the
-    derivation, and a reader who finds only the rule learns nothing about why
-    a hand-set floor is not an acceptable substitute.
-
-    DEGENERATES TO ZERO for cheap suites — see the parametrized test's
-    docstring, where the consequence is spelled out rather than left for a
-    reader to discover.
-    """
-    return (int(2 * worst) // 100) * 100
 
 
 def _discovered() -> dict:
@@ -298,7 +270,7 @@ def test_module_carries_its_own_measured_verify_budget(
     (a) DECLARED AT ALL. Otherwise ``verify._resolve_verify_timeout`` falls
         hard through to the repo-root whole-fleet ceiling — a budget sized for
         nine suites chained into one shell command, applied to one suite.
-    (b) At least ``_min_budget(W)``, ~2x the worst measured run.
+    (b) At least ``min_budget(W)``, ~2x the worst measured run.
     (c) STRICTLY below the repo-root warm ceiling: a real narrowing rather
         than a relabelling. A per-module budget at or above the global one
         surfaces a hang no sooner than the fleet ceiling already would.
@@ -329,7 +301,7 @@ def test_module_carries_its_own_measured_verify_budget(
       Detecting that requires RE-MEASUREMENT, which a table cannot do to
       itself.
     * ASSERTION (b) DEGENERATES FOR CHEAP SUITES AND IS VACUOUS FOR SOME
-      MODULES HERE. ``_min_budget`` floors to the nearest 100s, so any suite
+      MODULES HERE. ``min_budget`` floors to the nearest 100s, so any suite
       whose worst run is under 50s yields a floor of 0 and (b) asserts
       ``budget >= 0`` — literally unfalsifiable. sampler's worst run is
       22.49s, giving exactly that. For such modules the load-bearing
@@ -362,9 +334,9 @@ def test_module_carries_its_own_measured_verify_budget(
         f'the fleet ceiling (~an hour), not in minutes'
     )
 
-    # (b) Measurement-derived floor. VACUOUS where _min_budget degenerates to
+    # (b) Measurement-derived floor. VACUOUS where min_budget degenerates to
     # 0 (any suite under ~50s) — see the docstring; not silently so.
-    floor = _min_budget(worst)
+    floor = min_budget(worst)
     assert mc.verify_command_timeout_secs >= floor, (
         f'{prefix} verify_command_timeout_secs='
         f'{mc.verify_command_timeout_secs} is below the {floor}s floor derived '
@@ -477,15 +449,16 @@ MEASURED_BY_SIBLING_GUARD: dict[str, str] = {
         'MEASURED_SUITE_WORST_SECS = 930.59 in '
         'tests/scripts/test_scripts_module_config.py (task 3458), sourced from '
         "scripts/orchestrator.yaml's own PER-MODULE VERIFY BUDGET block, whose "
-        'floor is DERIVED from that constant by the same expression _min_budget '
-        'uses.'
+        'floor is DERIVED from that constant by module_budget_family.min_budget, '
+        'the family\'s one implementation of that expression.'
     ),
     'tests/scripts': (
         'The measured worst run is recorded in tests/scripts/orchestrator.yaml, '
         "whose PER-MODULE VERIFY BUDGET block carries every run behind it; the "
         'owning guard is tests/scripts/test_tests_scripts_module_config.py, '
         'which pins MEASURED_SUITE_WORST_SECS with MIN_MODULE_BUDGET_SECS '
-        'DERIVED from it by the same expression _min_budget uses. NO FIGURE IS '
+        'DERIVED from it by module_budget_family.min_budget, the same one '
+        'implementation. NO FIGURE IS '
         'QUOTED HERE, corrected in place by task 4320: this entry used to read '
         '"MEASURED worst run 233.50s ... which pins MEASURED_SUITE_WORST_SECS = '
         '233.50", and both numbers went stale the moment task 4320 re-measured '

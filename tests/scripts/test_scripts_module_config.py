@@ -66,6 +66,7 @@ import tomllib
 from typing import Any
 
 import pytest
+from module_budget_family import min_budget
 from orchestrator.config import OrchestratorConfig, _discover_module_configs
 from orchestrator.module_charter import derive_modules
 
@@ -1863,15 +1864,31 @@ MEASURED_SUITE_WORST_SECS = 930.59
 # exist to remove — and this one had already been falsified by its own
 # follow-up (task 3703 amendment pass, reviewer-flagged).
 #
-# NO FIGURE OF THE SIBLING'S IS REPEATED HERE, deliberately. Cross-module
+# NO FIGURE OF THE SIBLING'S IS REPEATED HERE, deliberately, and that is
+# unchanged by task 4320 even though the DERIVATION is now shared. Cross-module
 # provenance has ONE home — the MEASURED_BY_SIBLING_GUARD table in
 # tests/scripts/test_module_verify_budgets.py — so that a re-measurement over
 # there does not have to be chased into this comment, which is the lockstep
-# duplication that table's own comment exists to refuse.
+# duplication that table's own comment exists to refuse. Importing
+# module_budget_family.min_budget imports an EXPRESSION, not a MEASUREMENT: this
+# module's worst-run figure above stays this module's own, and the sibling's
+# stays the sibling's.
 #
 # ~2x the worst observed run, rounded DOWN to the nearest 100s:
 # 2 * 930.59 -> 1861.18 -> 1800.
-MIN_MODULE_BUDGET_SECS = (int(2 * MEASURED_SUITE_WORST_SECS) // 100) * 100
+#
+# CORRECTED IN PLACE (task 4320): this line used to INLINE that expression as
+# `(int(2 * MEASURED_SUITE_WORST_SECS) // 100) * 100`, which was the third
+# spelling of one derivation across this family — the other two being a
+# `def _min_budget` copy in each sibling guard. Nothing could observe drift
+# between them, so the family's shared shape was a convention rather than a
+# property. It is now a property: test_module_verify_budgets.py::
+# test_the_budget_family_derives_every_floor_from_one_canonical_expression
+# evaluates this expression in a namespace holding only `min_budget` and
+# `MEASURED_SUITE_WORST_SECS` and NO __builtins__, so re-inlining it here would
+# raise NameError on `int` and fail there — even though it would still compute
+# 1800 today.
+MIN_MODULE_BUDGET_SECS = min_budget(MEASURED_SUITE_WORST_SECS)
 
 
 def test_scripts_module_carries_its_own_measured_verify_budget(
