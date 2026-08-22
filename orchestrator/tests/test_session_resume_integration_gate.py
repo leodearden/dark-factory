@@ -34,6 +34,7 @@ the invoke-driver's ``TaskArtifacts(cwd)`` uses the legacy ``.task`` root that
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import os
@@ -908,6 +909,8 @@ async def test_b1r_restore_fault_degrades_to_a_fresh_dispatch(
     fresh = cap.kwargs['session_id']
     assert fresh != session_id
     uuid.UUID(fresh)
+    assert cap.workflow._pending_resume_session_id is None
+    assert cap.workflow._pending_resume_role is None
     # (b) loud, and greppable by the structured event name.
     assert any(
         r.levelname == 'WARNING'
@@ -923,6 +926,67 @@ async def test_b1r_restore_fault_degrades_to_a_fresh_dispatch(
     assert len(failed) == 1
     assert failed[0]['data']['stage'] == 'pre_flight'
     assert failed[0]['data']['restore'] == 'fault'
+
+
+@pytest.mark.asyncio
+async def test_b1r_an_internal_restore_fault_is_a_fault_not_a_miss(
+    harness: Harness, tmp_path: Path, caplog,
+):
+    """The MAJORITY of real restore faults must land in ``fault``, not ``miss``.
+
+    The row above injects the only fault the arm site could originally see: a
+    ``TypeError`` out of ``resolve_archive_root``.  Every OTHER real fault —
+    an unreadable archive, ENOSPC part-way, a corrupt gzip member, a config
+    dir whose parent is a regular file — happens INSIDE
+    ``restore_archived_transcript``, which is total by default and answers all
+    of them with the same ``None`` a plain miss returns.  The arm site's
+    ``else`` arm then stamps ``'miss'``, telling an operator to go work archive
+    COVERAGE while the restore path itself is the broken thing — the exact
+    misdiagnosis the outcome-string split exists to prevent, applied to almost
+    the whole fault population.
+
+    The fault is injected at ``shutil.copyfile`` — inside the helper, past
+    every early-return — so this row pins the classification of a fault the
+    caller cannot see unaided, rather than re-pinning the one it already could.
+    """
+    task_id, session_id = '90', 'uuid-b1r-internal-fault'
+    _setup_warm_lane_session(harness, task_id, session_id, role='implementer')
+    harness.config.session_resume = SessionResumeConfig()
+    await harness._recover_crashed_tasks()
+    recovered = harness._recovered_sessions[task_id]
+    store = _RecordingEventStore()
+
+    with patch(
+        'shared.transcript_archive.shutil.copyfile',
+        side_effect=OSError(errno.ENOSPC, 'No space left on device'),
+    ):
+        cap = await _drive_resumed_invoke(
+            tmp_path, recovered, IMPLEMENTER, caplog, task_id=task_id,
+            seed_archive=True, event_store=store,
+        )
+
+    # (a) still a FRESH dispatch: a broken restore costs context, never a
+    # dispatch, and the doomed session id is consumed so it cannot be retried
+    # forever.
+    assert cap.kwargs['resume_session_id'] is None
+    fresh = cap.kwargs['session_id']
+    assert fresh != session_id
+    uuid.UUID(fresh)
+    assert cap.workflow._pending_resume_session_id is None
+    assert cap.workflow._pending_resume_role is None
+    # (b) classified as what it IS.  The archive was seeded and present, so
+    # 'miss' here would be a lie about coverage, not merely a coarse label.
+    failed = store.of_type(EventType.session_resume_failed)
+    assert len(failed) == 1
+    assert failed[0]['data']['stage'] == 'pre_flight'
+    assert failed[0]['data']['restore'] == 'fault'
+    # (c) and greppable at the dispatch layer, same as the composition fault.
+    assert any(
+        r.levelname == 'WARNING'
+        and getattr(r, 'event', '') == 'session_resume_restore_fault'
+        and session_id in r.getMessage()
+        for r in caplog.records
+    )
 
 
 class _RecordingEventStore:
@@ -978,6 +1042,9 @@ async def test_b1e_veto_emits_session_resume_failed_pre_flight(
     )
 
     assert cap.kwargs['resume_session_id'] is None
+    uuid.UUID(cap.kwargs['session_id'])
+    assert cap.workflow._pending_resume_session_id is None
+    assert cap.workflow._pending_resume_role is None
     failed = store.of_type(EventType.session_resume_failed)
     assert len(failed) == 1
     assert failed[0]['data'] == {
