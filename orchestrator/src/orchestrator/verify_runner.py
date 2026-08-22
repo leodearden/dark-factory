@@ -897,7 +897,7 @@ class LocalRunner:
                 # disarm the INV-4 streak for exactly the compound failure most
                 # likely to occur under load — and would REGRESS an emission that
                 # happened inline before the recorder was split out.
-                flake_suppression=scoped.flake_suppression,
+                flake_suppression=getattr(scoped, 'flake_suppression', None),
             )
 
         return scoped
@@ -2299,11 +2299,12 @@ class VerifyRunnerPool:
         # Guarded on the dataclass type rather than on `is not None`, so a payload that
         # somehow arrived as a bare dict degrades to an un-stamped observation instead
         # of raising `TypeError` out of `replace` and into the merge path.
-        if isinstance(result.flake_suppression, flake_ledger.FlakeSuppression):
+        carried = getattr(result, 'flake_suppression', None)
+        if isinstance(carried, flake_ledger.FlakeSuppression):
             result = dataclasses.replace(
                 result,
                 flake_suppression=dataclasses.replace(
-                    result.flake_suppression, runner=actual_runner.name,
+                    carried, runner=actual_runner.name,
                 ),
             )
 

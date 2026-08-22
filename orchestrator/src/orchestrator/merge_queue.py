@@ -32,6 +32,7 @@ from orchestrator.critical_gate import critical_filing_gate
 from orchestrator.delivered_checks import gate_mark_done_on_delivered_checks
 from orchestrator.dry_run_unblock import run_dry_run_unblock
 from orchestrator.event_store import EventStore, EventType
+from orchestrator.flake_recorder import record_merge_flake_suppression
 from orchestrator.git_ops import (
     PERSISTENT_MERGE_WORKTREE_NAME,
     AdvanceOutcome,
@@ -2457,6 +2458,49 @@ def _merge_boundary_module_configs(
     return effective_merge_module_configs(config, module_configs)
 
 
+def _record_flake_observation(
+    result: VerifyResult,
+    req: MergeRequest,
+    *,
+    merge_sha: str,
+    event_store: EventStore | None,
+    escalation_queue: Any,
+) -> None:
+    """Record whatever flake observation *result* carries (PRD task ε, §5.8).
+
+    Binds this call site's context once — project root, project id, merge SHA,
+    task id and both stores — so the two recording points below cannot drift
+    apart in what they attribute an observation to.
+
+    THE topology rule ε encodes: the DISCRIMINATOR runs where the WORKTREE is
+    (local host or remote runner — only there can the failing tests be re-run);
+    the RECORDER runs HERE, on the dispatcher, because ``_run_post_merge_verify``
+    is the only scope where a local OR remote ``VerifyResult`` sits alongside an
+    ``EventStore``, an escalation queue, ``project_root``, ``merge_sha`` and
+    ``task_id`` at once.
+
+    That co-location is what makes the three side-effects — the durable
+    ``flake_occurrence`` row, the ``merge_flake_suppressed`` fact and the INV-4
+    storm-streak bump — unconditional BY CONSTRUCTION rather than dependent on
+    which host happened to run the verify.  Before ε they fired inline inside the
+    producer, so a REMOTE verify landed none of the three: no ledger call existed
+    at all, the remote host has no event store, and its streak counter died with
+    its process.
+
+    Never raises (the recorder owns that guarantee), so a lost measurement can
+    never fail a verify or stall the merge queue.
+    """
+    record_merge_flake_suppression(
+        result,
+        project_root=req.config.project_root,
+        project_id=req.config.fused_memory.project_id,
+        merge_sha=merge_sha,
+        task_id=req.task_id,
+        event_store=event_store,
+        escalation_queue=escalation_queue,
+    )
+
+
 async def _run_post_merge_verify(
     git_ops: GitOps,
     req: MergeRequest,
@@ -3001,6 +3045,20 @@ async def _run_post_merge_verify(
                     chain_build_ms=chain_build_ms,
                 )
 
+    # Task ε: record the SETTLED dispatched verdict's flake observation.
+    #
+    # Placed after BOTH retry loops (ENOSPC and infra-transient) have finished
+    # rebinding `verify`, so a superseded attempt never writes rows of its own.
+    # Nothing is lost by waiting: a suppression PASSES, so a suppressed result is
+    # never itself retried — only a still-red or infra-transient result re-enters
+    # a loop, and its own observation is superseded along with its verdict.
+    _record_flake_observation(
+        verify, req,
+        merge_sha=merge_sha,
+        event_store=event_store,
+        escalation_queue=escalation_queue,
+    )
+
     # Invoke the optional result-capture callback (PRD §10 invariant 6(b)):
     # called with the FINAL VerifyResult (after any ENOSPC retry) so the
     # warm per-test results are always the last-observed verify for this commit.
@@ -3086,6 +3144,18 @@ async def _run_post_merge_verify(
                         git_ops.merge_verify_lease(lane_dir=merge_wt)
                     )
                 local_verify = await cross_check_runner.run_merge_verify(merge_sha, spec)
+            # Task ε: the cross-check ran its OWN merge gate on the local trust
+            # anchor, so it can carry its own observation.  Its LocalRunner had
+            # both stores wired before ε and therefore emitted + bumped inline;
+            # recording it here is what keeps this detective-control path from
+            # regressing.  Inside the `try`, after the await, so a raised verify
+            # (handled below) records nothing — there is no verdict to record.
+            _record_flake_observation(
+                local_verify, req,
+                merge_sha=merge_sha,
+                event_store=event_store,
+                escalation_queue=escalation_queue,
+            )
         except RunnerUnavailable as exc:
             # Fail-safe: a closed/flaky laptop trust-anchor must never block a
             # remote green (symmetric with DriftDetector's Invariant 5).
