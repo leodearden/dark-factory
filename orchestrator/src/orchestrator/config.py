@@ -5173,6 +5173,25 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         'backfill_safety_factor',
         'backfill_min_samples',
         'backfill_max_park_age_secs',
+        # Digest + EWA breaker knobs (task 4559).  Explicit literals for the
+        # same reason as the backfill_* group above: these are FLAT top-level
+        # fields, not a submodel, so _submodel_leaf_paths does not apply.
+        # Safe by construction — every one is read FRESH inside
+        # _maybe_write_digest on each check, so a reload cannot split in-flight
+        # state.  Green-tier on purpose, the same argument already written for
+        # zero_progress_requeue and recovery_emission above: a detector you can
+        # only retune by restarting is one that gets silenced by ignoring it.
+        # Here the asymmetry was worse than inert — recovery_emission.* let an
+        # operator quiet a noisy ALARM live, while the BREAKER that halts
+        # fleet-wide dispatch could only be retuned by restarting every
+        # orchestrator.  This changes the reload TIER only:
+        # digest_ewa_threshold's VALUE stays at its default (a retune was
+        # deliberately declined — see the field's own docstring).
+        'digest_enabled',
+        'digest_every_n_escalations',
+        'digest_dir',
+        'digest_ewa_alpha',
+        'digest_ewa_threshold',
         'starvation_watchdog.enabled',
         'starvation_watchdog.skip_threshold',
         'starvation_watchdog.idle_secs',
