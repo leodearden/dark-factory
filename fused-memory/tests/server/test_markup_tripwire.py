@@ -24,6 +24,7 @@ import json
 
 import pytest
 from shared import toolcall_markup
+from shared.mcp_markup_middleware import OUTCOMES
 
 from fused_memory.server import markup_tripwire
 from fused_memory.server.markup_tripwire import (
@@ -317,49 +318,75 @@ class TestEmitMarkupStormEscalation:
         assert payload['id'] == esc_id
         return payload
 
-    def test_a_repaired_burst_is_not_described_as_rejected(self, tmp_path):
-        """The headline. Today this record claims writes were rejected when the
-        burst it describes consists entirely of calls that SUCCEEDED.
+    @pytest.mark.parametrize('outcome', OUTCOMES)
+    def test_each_outcome_names_itself_and_no_other(self, tmp_path, outcome):
+        """The headline, over EVERY outcome the middleware can send.
 
-        The word is asserted absent from all THREE operator-facing fields,
-        because the false claim is not confined to the count's label: the
-        summary says "MCP write(s) rejected", the detail's attach-instruction
-        says "from the rejection responses", and `suggested_action` says
-        "from the rejection logs" — and each is read by a different consumer.
+        Parameterised off ``shared.mcp_markup_middleware.OUTCOMES`` rather than
+        re-spelling the three words here, so an outcome added there arrives with
+        a test rather than with a silently unasserted record. The earlier
+        revision pinned two of the three, and the one it left out is the one
+        that matters most at this filer's live call site: ``install_markup_guard``
+        refuses any policy but ``REJECT_WITH_REPAIR``, so ``repaired`` cannot
+        fire here at all while ``unrepairable`` — the burst that LOSES the
+        caller's data — can. 'unrepairable' also carries no 'reject' stem, so
+        the stem needle below would not have caught it being mislabelled.
 
-        `suggested_action` is NOT a low-visibility afterthought. It sits in
-        exactly the same read-tier as the summary:
-        escalation/src/escalation/server.py:409-414 lists it in
-        `_COMPACT_ESCALATION_FIELDS` beside `summary`, and :420 carries both
-        into `_COMPACT_PENDING_FIELDS`, while `detail` is dropped BY NAME as
-        "the unbounded free-text field that motivated compact mode". So the L1
+        The record must name its OWN outcome in the summary and no other
+        outcome anywhere an operator reads, because a record naming an outcome
+        the burst did not have states a number the triager cannot reproduce
+        from their own journal — the same defect as stating a count the burst
+        did not have. Before task 4505 every record said 'rejected', so a burst
+        of REPAIRS (calls that all SUCCEEDED) was filed as N rejections that
+        never happened.
+
+        All THREE operator-facing fields are scanned, not just the count's
+        label, because each is read by a different consumer and the false claim
+        reached all three: the summary said "MCP write(s) rejected", the
+        detail's attach-instruction said "from the rejection responses", and
+        ``suggested_action`` said "from the rejection logs".
+
+        ``suggested_action`` is NOT a low-visibility afterthought. It sits in
+        the same read-tier as the summary: ``escalation.server`` lists it in
+        ``_COMPACT_ESCALATION_FIELDS`` beside ``summary`` and carries both into
+        ``_COMPACT_PENDING_FIELDS``, while ``detail`` is dropped BY NAME as "the
+        unbounded free-text field that motivated compact mode". So the L1
         escalation watcher and get_pending_escalations(compact=True) read this
-        field having never seen the detail — the same citation that justified
-        fixing the summary, followed through to its third field.
+        field having never seen the detail.
 
         THE NEEDLE IS THE STEM 'reject', NOT 'rejected'. Do not "simplify" it
-        back: the defective text reads "the rejection logs", and 'rejected' is
+        back: the defective text read "the rejection logs", and 'rejected' is
         NOT a substring of 'rejection' (r-e-j-e-c-t-e-d vs r-e-j-e-c-t-i-o-n),
-        so the narrower needle passes today over defective text and guards
-        nothing. The stem catches 'rejected', 'rejection' and 'rejections'
-        alike, and a correct repaired record carries none of them.
+        so the narrower needle passes over defective text and guards nothing.
+        The stem is applied only to outcomes that do not carry it themselves,
+        which is why it is derived from *outcome* rather than hardcoded.
         """
         if not markup_tripwire.HAS_ESCALATION:
-            assert emit_markup_storm_escalation(str(tmp_path), _REPAIRED_STORM) is None
+            storm = {**_REJECTED_STORM, 'outcome': outcome}
+            assert emit_markup_storm_escalation(str(tmp_path), storm) is None
             return
 
-        payload = self._filed(tmp_path, _REPAIRED_STORM)
+        payload = self._filed(tmp_path, {**_REJECTED_STORM, 'outcome': outcome})
 
-        assert 'repaired' in payload['summary'], (
+        assert outcome in payload['summary'], (
             f"must name the burst's own outcome: {payload['summary']!r}"
         )
         compact_plus_detail = (
             f'{payload["summary"]}\n{payload["detail"]}\n{payload["suggested_action"]}'
         )
-        assert 'reject' not in compact_plus_detail.lower(), (
-            f'nothing was rejected in a repaired burst — a triager grepping '
-            f'their journal for rejections finds zero: {compact_plus_detail!r}'
-        )
+        for other in OUTCOMES:
+            if other == outcome:
+                continue
+            assert other not in compact_plus_detail, (
+                f'this burst was {outcome!r}, so no field may describe it as '
+                f'{other!r} — a triager grepping their journal for {other!r} '
+                f'finds nothing: {compact_plus_detail!r}'
+            )
+        if 'reject' not in outcome:
+            assert 'reject' not in compact_plus_detail.lower(), (
+                f'nothing was rejected in a {outcome!r} burst, in any spelling '
+                f'("rejection", "rejections"): {compact_plus_detail!r}'
+            )
 
     def test_a_rejected_burst_still_reads_as_rejected(self, tmp_path):
         """The other half, so (a) cannot be satisfied by dropping the outcome
