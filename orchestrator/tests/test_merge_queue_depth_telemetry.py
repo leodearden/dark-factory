@@ -42,7 +42,11 @@ from orchestrator.merge_queue import (
     SpeculativeMergeWorker,
     classify_and_merge,
 )
-from orchestrator.merge_types import QueuedBranch
+from orchestrator.merge_types import (
+    InflightStatus,
+    InflightVerifyResult,
+    QueuedBranch,
+)
 from orchestrator.verify import VerifyResult
 
 
@@ -396,6 +400,179 @@ class TestRunInflightVerifyDepthWiring:
 
         assert captured.get('depth') == 2
         assert captured.get('speculative') is True
+
+
+# ---------------------------------------------------------------------------
+# step-9 RED / step-10 GREEN (task 3185, PRD γ): _dispatch_item computes a
+# TRUTHFUL chain_items and threads it through _run_inflight_verify.
+#
+# chain_items is a fact about the TREE ACTUALLY VERIFIED, so it is derived from
+# _verify_frontier_depth() directly and NEVER from the local `depth` variable,
+# which a firing ProbePlacement may have relabelled into an attribution fact
+# about a stack that was never verified.  That divergence is the whole point of
+# the field — see ProbePlacement's KNOWN PHASE-1 LIMITATION note.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRunInflightVerifyChainItemsWiring:
+    """_run_inflight_verify forwards chain_items into _run_post_merge_verify."""
+
+    def _item_and_lease(self, tmp_path: Path, *, speculative: bool = True):
+        from orchestrator.verify_runner import HostLease
+
+        config = _make_bare_config()
+        req = _make_request('t-ci-wire', 'task/t-ci-wire', tmp_path, config)
+        item = RealMergeItem(
+            request=req,
+            merge_result=MergeResult(
+                success=True, merge_commit='deadbeef', merge_worktree=tmp_path,
+            ),
+            merge_wt=tmp_path,
+            base_sha='dead' * 10,
+            speculative=speculative,
+        )
+        lease = HostLease(name='laptop', runner=_fake_pass_runner(), is_local=False)
+        return item, lease
+
+    async def _captured_kwargs(self, tmp_path: Path, **verify_kwargs) -> dict:
+        item, lease = self._item_and_lease(tmp_path)
+        captured: dict = {}
+
+        async def _fake_run_post_merge_verify(*_args, **kwargs):
+            captured.update(kwargs)
+            return None  # pass
+
+        worker = SpeculativeMergeWorker(git_ops=MagicMock(), queue=asyncio.Queue())
+        with patch(
+            'orchestrator.merge_queue._run_post_merge_verify',
+            _fake_run_post_merge_verify,
+        ):
+            await worker._run_inflight_verify(item, lease, **verify_kwargs)
+        return captured
+
+    async def test_chain_items_is_forwarded(self, tmp_path: Path) -> None:
+        captured = await self._captured_kwargs(tmp_path, depth=2, chain_items=3)
+
+        assert captured.get('chain_items') == 3
+
+    async def test_omitted_chain_items_defaults_to_one(self, tmp_path: Path) -> None:
+        """Keeps _merge_queue_harness.drive_verify_and_advance and the other
+        direct-call test paths byte-identical."""
+        captured = await self._captured_kwargs(tmp_path, depth=2)
+
+        assert captured.get('chain_items') == 1
+
+
+@pytest.mark.asyncio
+class TestDispatchItemComputesTruthfulChainItems:
+    """_dispatch_item derives chain_items from the frontier, not from `depth`.
+
+    Slot 1 (non-speculative) is merged onto REAL MAIN, so its tree contains
+    exactly itself — a flat 1 regardless of what else is in flight.  Slot 2
+    (speculative) is merged onto the frozen tip, so its tree is the frozen
+    prefix plus itself — frontier + 1.
+    """
+
+    def _worker_with_frontier(self, frontier: int) -> SpeculativeMergeWorker:
+        worker = SpeculativeMergeWorker(git_ops=MagicMock(), queue=asyncio.Queue())
+        worker._frozen_inflight_entries = lambda: [  # type: ignore[method-assign]
+            _sentinel_entry() for _ in range(frontier)
+        ]
+        return worker
+
+    async def _dispatch_kwargs(
+        self, tmp_path: Path, *, frontier: int, speculative: bool, probe=None,
+    ) -> dict:
+        """Drive _dispatch_item far enough to capture _run_inflight_verify's kwargs."""
+        from orchestrator.verify_runner import HostLease
+
+        config = _make_bare_config()
+        req = _make_request('t-ci-disp', 'task/t-ci-disp', tmp_path, config)
+        item = RealMergeItem(
+            request=req,
+            merge_result=MergeResult(
+                success=True, merge_commit='cafebabe', merge_worktree=tmp_path,
+            ),
+            merge_wt=tmp_path,
+            base_sha='dead' * 10,
+            speculative=speculative,
+        )
+        worker = self._worker_with_frontier(frontier)
+        if probe is not None:
+            worker._probe_verify_placement = lambda _i: probe  # type: ignore[method-assign]
+
+        captured: dict = {}
+
+        async def _fake_run_inflight_verify(_item, _lease, **kwargs):
+            captured.update(kwargs)
+            return InflightVerifyResult(
+                outcome=None, merge_wt=None, status=InflightStatus.REQUEUED,
+            )
+
+        worker._run_inflight_verify = _fake_run_inflight_verify  # type: ignore[method-assign]
+        lease = HostLease(name='laptop', runner=_fake_pass_runner(), is_local=False)
+        worker._acquire_host_lease_for = AsyncMock(  # type: ignore[method-assign]
+            return_value=(lease, None),
+        )
+
+        entry = await worker._dispatch_item(item)
+        if entry is not None and entry.verify_task is not None:
+            await entry.verify_task
+        return captured
+
+    async def test_non_speculative_head_item_is_one(self, tmp_path: Path) -> None:
+        """Slot 1 with an empty frontier: its tree is exactly itself."""
+        captured = await self._dispatch_kwargs(
+            tmp_path, frontier=0, speculative=False,
+        )
+
+        assert captured['chain_items'] == 1
+
+    async def test_non_speculative_item_with_a_verify_in_flight_is_still_one(
+        self, tmp_path: Path,
+    ) -> None:
+        """The case a naive ``depth + 1`` gets WRONG.
+
+        A non-speculative re-merge dispatched while another verify is in flight
+        has frontier == 1, but it is merged onto REAL MAIN — its tree contains
+        only itself, so chain_items is 1, not 2.
+        """
+        captured = await self._dispatch_kwargs(
+            tmp_path, frontier=1, speculative=False,
+        )
+
+        assert captured['chain_items'] == 1
+
+    async def test_speculative_item_is_frontier_plus_one(
+        self, tmp_path: Path,
+    ) -> None:
+        for frontier in (0, 1, 3):
+            captured = await self._dispatch_kwargs(
+                tmp_path, frontier=frontier, speculative=True,
+            )
+            assert captured['chain_items'] == frontier + 1, f'frontier={frontier}'
+
+    async def test_a_firing_probe_relabels_depth_but_not_chain_items(
+        self, tmp_path: Path,
+    ) -> None:
+        """The assertion that encodes "supersedes reliance on the broken label".
+
+        A firing ProbePlacement overrides the dispatched ``depth`` (that is its
+        entire job — an attribution fact about an already-built stack), but
+        chain_items is derived from _verify_frontier_depth() and must be
+        UNCHANGED at frontier + 1: the probe never redirected what is verified,
+        so the tree still contains only the frontier plus this item.
+        """
+        from orchestrator.merge_queue import ProbePlacement
+
+        captured = await self._dispatch_kwargs(
+            tmp_path, frontier=1, speculative=True,
+            probe=ProbePlacement(depth=5, base='f' * 40),
+        )
+
+        assert captured['depth'] == 5             # relabelled, as today
+        assert captured['chain_items'] == 2       # frontier(1) + 1, untouched
 
 
 # ---------------------------------------------------------------------------
