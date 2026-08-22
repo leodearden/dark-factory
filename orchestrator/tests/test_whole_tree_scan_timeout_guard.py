@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import ast
 import tomllib
+from pathlib import Path
 
 import pytest
 from _orch_helpers import (
@@ -46,6 +47,8 @@ from _orch_helpers import (
     WHOLE_TREE_SCAN_TEST_TIMEOUT,
 )
 
+from orchestrator.pytest_markers import module_level_marker_names
+
 # This module is ITSELF a member of the family it polices -- the invariant
 # below rglob()s every *.py under this directory and ast.parse()s each one --
 # so it carries the very mark it demands instead of exempting itself.  The
@@ -53,6 +56,23 @@ from _orch_helpers import (
 # idiom is spelled out in that test's docstring; skipping itself would exempt
 # the one file most certain to need the mark.
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
+
+# This directory, resolved from THIS FILE and never from the process CWD:
+# merge-verify runs pytest from the orchestrator/ cwd while a plain
+# `pytest orchestrator/tests` runs from the repo root, and the census must come
+# out identical under both.  Same idiom as
+# test_marker_registration_drift.py:597-601.
+_TESTS_DIR = Path(__file__).resolve().parent
+
+# Anti-vacuity FLOORS, not equalities -- 535 files and 12 scanners measured at
+# authorship time -- so the guard survives the tree growing while still failing
+# loudly if the sweep itself ever breaks (a wrong _TESTS_DIR, a read that
+# silently yields nothing, a detector rotted to always-False).  The house
+# pattern for exactly this risk: test_marker_registration_drift.py:602-604's
+# _MIN_EXPECTED_TEST_FILES, test_killpg_frozen_pgid_guard.py's measured file
+# floor, test_serial_merge_worker_import_guard.py::test_allowlist_has_no_stale_entries.
+_MIN_EXPECTED_TEST_FILES = 400
+_MIN_EXPECTED_SCANNERS = 10
 
 # Resolved from _orch_helpers' shared anchor, which is itself resolved from
 # THAT file and never from the process CWD: merge-verify runs pytest from the
@@ -366,3 +386,88 @@ def test_detector_flags_a_synthetic_new_scanner() -> None:
         'the detector must flag a newly-added whole-tree scanner; if this '
         'fails, the family invariant below is passing vacuously'
     )
+
+
+# ---------------------------------------------------------------------------
+# The family invariant: the actual ratchet.
+#
+# Allowlist-free and TOTAL -- every whole-tree scanner under this directory
+# must carry the mark, with no frozen residual to rot. The census is recomputed
+# from source on every run, so the Nth new scanner fails at commit time instead
+# of os._exit()ing an xdist worker in someone else's verify.
+# ---------------------------------------------------------------------------
+
+
+def test_whole_tree_scanners_carry_module_level_timeout_mark() -> None:
+    """Every whole-tree ``*.py`` scanner here needs a MODULE-LEVEL timeout mark.
+
+    Why module-level rather than "a timeout mark somewhere in the file": only a
+    module-level ``pytestmark`` is a statically sound LOWER BOUND on every
+    collected item's marker set -- the documented contract of
+    :func:`orchestrator.pytest_markers.module_level_marker_names`, which is
+    IMPORTED here rather than re-derived. A decorator-aware sweep (e.g.
+    test_marker_registration_drift.py's ``_applied_marker_names``) is an
+    explicit UPPER bound: a file with three tests where only one is decorated
+    would read as "has timeout" while the other two sit at the 60s cliff, which
+    is precisely the defect this guard exists to stop. An existing tighter
+    per-test decorator still WINS where present -- verified empirically: with
+    ``pytestmark = pytest.mark.timeout(300)`` plus ``@pytest.mark.timeout(7)``
+    on one test, ``get_closest_marker('timeout').args`` is ``(7,)`` for the
+    decorated test and ``(300,)`` for the bare one -- so the module-level mark
+    acts purely as a FLOOR and narrows nothing.
+
+    NO SKIP-SELF, deliberately, and stated here because it inverts a convention
+    a reviewer will expect. Five sibling guards (test_prune_chokepoint_guard.py:164,
+    test_event_loop_antipattern_guard.py:81, and the serial-merge-worker,
+    reachback and lock-release guards) carry a ``_THIS_FILE``/``continue``
+    skip-self because their forbidden pattern necessarily appears in their own
+    detector code, making self-inclusion a guaranteed false positive. The
+    opposite holds here: this module genuinely IS a whole-tree AST scanner and
+    genuinely IS exposed to the same worker-death cliff, so skipping itself
+    would exempt the one file most certain to need the mark. Its own
+    ``pytestmark`` is at the top of this file.
+    """
+    scanners: list[Path] = []
+    offenders: list[str] = []
+    examined = 0
+
+    for py_file in sorted(_TESTS_DIR.rglob('*.py')):
+        examined += 1
+        source = py_file.read_text(encoding='utf-8')
+        if not _scans_whole_tree_py(source):
+            continue
+        scanners.append(py_file)
+        if 'timeout' not in module_level_marker_names(source):
+            offenders.append(f'{py_file.name}: no module-level pytestmark timeout')
+
+    assert examined >= _MIN_EXPECTED_TEST_FILES, (
+        f'only {examined} .py files examined under {_TESTS_DIR} (expected at '
+        f'least {_MIN_EXPECTED_TEST_FILES}) -- the sweep itself is broken, so '
+        'this guard would pass vacuously rather than because the family is '
+        'clean.'
+    )
+    assert len(scanners) >= _MIN_EXPECTED_SCANNERS, (
+        f'only {len(scanners)} whole-tree scanner(s) detected among {examined} '
+        f'files (expected at least {_MIN_EXPECTED_SCANNERS}) -- '
+        '_scans_whole_tree_py has probably stopped matching, so this guard '
+        'would pass vacuously. Found: '
+        f'{sorted(f.name for f in scanners)}'
+    )
+
+    if offenders:
+        offender_list = '\n  '.join(offenders)
+        raise AssertionError(
+            f'{len(offenders)} whole-tree AST-scanning test module(s) under '
+            f'{_TESTS_DIR.name}/ lack a module-level timeout mark. Add\n\n'
+            '    from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT\n'
+            '    pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)\n\n'
+            'at module level in each. These modules rglob() every *.py in the '
+            'repo and ast.parse() each one; under `-n auto` that has been '
+            'MEASURED at 30.75s per call at loadavg 120-176, against the 60s '
+            f'default in {ORCH_PYPROJECT.name}. Exceeding it does NOT fail the '
+            "test: pytest-timeout's thread method os._exit()s the whole xdist "
+            'worker, and --max-worker-restart=0 then truncates the ENTIRE suite '
+            'run and reports the failure against some innocent guard that '
+            'merely shared the dead worker (esc-3980-1, esc-3787-1).'
+            f'\n\nUnmarked scanners:\n  {offender_list}'
+        )
