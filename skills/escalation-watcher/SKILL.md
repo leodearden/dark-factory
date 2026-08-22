@@ -595,7 +595,7 @@ explicit "I'll be away" or a long silence after one. Three behavioural shifts:
      gate procedure and applicability rule). If the gate does not launch (abort / over-cap /
      already-attempted) OR the launched sub-agent aborts, leave the escalation pending and add
      it to the digest — do NOT spawn an interactive `/unblock`.
-   - **`wip_conflict` / `unmerged_state` / `dependency_discovered`-with-no-task / `design_concern` /
+   - **`wip_conflict` / `unmerged_state` / `stash_failed` / `dependency_discovered`-with-no-task / `design_concern` /
      `risk_identified` / `infra_issue` / `recon_*`:** leave pending + digest. These need a human;
      a terminal nobody attends just clutters. Append `<esc-id>` to the wrapper-owned exclude-file
      (see "Starting the watcher" above) for each item left pending so the initial scan does not
@@ -951,16 +951,17 @@ debugging the branch's own diff, and it must not be counted as a flake.
 
 If the low-risk auto-unblock gate applies — see [Low-risk auto-unblock gate (B3)](#low-risk-auto-unblock-gate-b3) — try it first.
 
-### `wip_conflict` / `unmerged_state` (blocking, halt-owner)
+### `wip_conflict` / `unmerged_state` / `stash_failed` (blocking, halt-owner)
 
 These escalations mean the **merge queue is globally halted** — no other task can merge until exactly one of them (the "halt owner") is resolved. The orchestrator records which escalation owns the halt on the merge worker (`_halt_owner_esc_id`); resolving that specific escalation via MCP un-halts the queue. Resolving any other escalation — even another `wip_conflict` — will NOT release the halt (fixed 2026-04-19; prior code relied on a category heuristic that caused phantom-L1 bugs like esc-1888-57).
 
-Two flavours:
+Three flavours:
 - **`wip_conflict`** — the merge queue tripped on uncommitted work in `project_root`. Three sub-variants distinguishable from the `detail`:
   - WIP overlaps the merge diff (merge did not land; workflow will retry after resolution).
   - Stash pop conflicted after the merge landed (merge IS on main; WIP preserved on `wip/recovery-<task>-<ts>`).
   - Stash pop conflicted on CAS-failure path (merge did NOT land; WIP on recovery branch; task blocks).
 - **`unmerged_state`** — `project_root` already had UU/AA/DD markers before the merge attempted to advance (pre-existing corruption, not caused by this merge).
+- **`stash_failed`** — the merge queue could not park `project_root`'s dirty tracked WIP before advancing (task 2758). Like the other two this is a shared main-checkout-hygiene fault rather than a fault of the merging task, so the queue halts once instead of failing task after task.
 
 As with `task_failure`, check for a `disposition` in the block reason / `failure_diagnostic`
 before assuming this is a raw conflict to resolve mechanically — see
@@ -971,8 +972,9 @@ resolution, and is never a flake.
 **Never auto-resolve** — `manual_intervention` is authoritative. The human has to inspect `project_root`:
 - For `wip_conflict`: recovery branch named in the detail preserves the user's WIP; they may need to cherry-pick or reapply before resolving.
 - For `unmerged_state`: run `git status` in `project_root`; UU/AA/DD files need `git mergetool`, manual edit, or `git reset` depending on intent.
+- For `stash_failed`: inspect the main checkout's uncommitted work and commit it — or get its owner to. **Do not reach for `git stash`**: CLAUDE.md forbids it in *any* dark-factory checkout, `project_root` or task worktree, because `refs/stash` is a single ref shared by every worktree in the checkout (it is not per-worktree) and the merge worker's advance path consumes the same stack — so a stash you push can be popped out from under you, and a pop on a clean tree can apply an unrelated task's WIP into it (incident 13674d3c68). Park WIP as commits on a branch.
 
-**Spawn an interactive `/unblock` session** via `/spawn` (`prompt="/unblock <task_id> (esc <escalation_id>, <wip_conflict|unmerged_state>, <severity>: <summary>)"`, `terminal_title="unblock:<project>#<task_id> <short-slug>"` — e.g. `unblock:df#2085 routing-mechanism`; abbreviate the project token per the emergent convention — `cwd=<project_root>`, `skip_permissions=true`) so the human can see the recovery branch, inspect `project_root`, and resolve the escalation when finished. The trailing `(esc ...)` context is additive only (see the additive-context convention note above).
+**Spawn an interactive `/unblock` session** via `/spawn` (`prompt="/unblock <task_id> (esc <escalation_id>, <wip_conflict|unmerged_state|stash_failed>, <severity>: <summary>)"`, `terminal_title="unblock:<project>#<task_id> <short-slug>"` — e.g. `unblock:df#2085 routing-mechanism`; abbreviate the project token per the emergent convention — `cwd=<project_root>`, `skip_permissions=true`) so the human can see the recovery branch, inspect `project_root`, and resolve the escalation when finished. The trailing `(esc ...)` context is additive only (see the additive-context convention note above).
 
 **Phantom-halt check:** if the orchestrator log shows "Merge queue un-halted: halt owner &lt;esc.id&gt; resolved" but the escalation file still has `status: pending`, that is a bug — report to the human; do **not** silently dismiss. (Historical context: pre-fix, this was a common symptom of the category-match un-halt bug.)
 
