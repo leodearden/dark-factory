@@ -258,7 +258,7 @@ After a successful direct merge:
 | Outcome `conflict` | Fix in worktree, resubmit |
 | Outcome `blocked` | Read reason, fix, resubmit |
 | Outcome `done` or `already_merged` | Update task status, clean up |
-| Outcome `superseded` | `mr-*` → poll by `request_id`. `coalesce-*` → not pollable; use the branch handle + ancestry check. Never direct-merge, never resubmit. See [Follow the superseded successor](#follow-the-superseded-successor). |
+| Outcome `superseded` | `mr-*` → poll by `request_id`. `coalesce-*` → not pollable; use the branch handle + ancestry check, but a non-tip member's rc=1 there is normal and permanent — confirm via the tip's merge marker, scheduler status, or `git cherry` content check instead of ancestry. Never direct-merge, never resubmit. See [Follow the superseded successor](#follow-the-superseded-successor). |
 | Outcome `needs_rebase` — auto-rebase succeeded | Queue re-processed automatically; no action needed |
 | Outcome `needs_rebase` — real conflict or cap | Fix conflict in worktree, resubmit (or unblock if cap reached) |
 | Abandon a queued submission | `merge_cancel(request_id)` — the only explicit-cancellation path |
