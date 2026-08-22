@@ -47,7 +47,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Protocol, runtime_checkable
 
-from orchestrator import verify
+from orchestrator import flake_ledger, verify
 from orchestrator.config import ModuleConfig
 from orchestrator.verify import VerifyResult, _archive_merge_verify_logs
 from orchestrator.verify_cancel import HEARTBEAT_INTERVAL_SECS
@@ -363,14 +363,45 @@ class MergeVerifySpec:
 def result_to_dict(vr: VerifyResult) -> dict:
     """Serialise a VerifyResult to a plain dict of JSON-native types.
 
-    Uses ``dataclasses.asdict`` which recursively converts nested dataclasses
-    and preserves all field types (all VerifyResult fields are JSON-native).
+    Uses ``dataclasses.asdict``, which recursively converts nested dataclasses and
+    preserves all field types.  Every field is JSON-native EXCEPT ``flake_suppression``
+    (task 3789 ε), which is a nested ``FlakeSuppression``: ``asdict`` flattens it to a
+    dict here, and ``json.dumps`` flattens its ``StrEnum`` members to their values and
+    its tuple to an array — so this direction still needs no special handling.  The
+    asymmetry is entirely on the READ side; see :func:`result_from_dict`.
     """
     return dataclasses.asdict(vr)
 
 
 def result_from_dict(d: dict) -> VerifyResult:
-    """Reconstruct a VerifyResult from a dict (as produced by result_to_dict)."""
+    """Reconstruct a VerifyResult from a dict (as produced by result_to_dict).
+
+    Generic ``VerifyResult(**d)`` for every field but one.  ``flake_suppression`` (task
+    3789 ε) is a nested dataclass, so ``asdict``/JSON hands it back as a plain dict with
+    ``verdict``/``call_site`` as strings and ``test_ids`` as a list — passing that
+    straight through would leave the field's TYPED annotation a lie on exactly the
+    deserialized path it exists to serve.  Rebuild it first, in the same
+    ``d.get(key)`` / ``X(v) if v is not None else None`` shape
+    ``MergeVerifySpec.from_dict`` uses for its optional nested ``global_verify_command``
+    (:339, :351-353) — this file's established idiom for a newly-added optional field.
+
+    ``flake_suppression_from_wire`` NEVER raises: a malformed sub-payload degrades to
+    ``None`` with a loud warning, because anything raising out of here becomes a
+    ``RunnerUnavailable`` at :1447 and costs a whole local re-verify.
+
+    The codec's strictness is otherwise UNCHANGED — an unknown top-level key is still a
+    ``TypeError`` (pinned by test_verify_runner's characterization tests), the
+    pre-existing behaviour shared by every optional field added before this one.
+    """
+    # `isinstance` guard, not a bare `d.get`: a buggy remote can send a valid JSON
+    # LIST, and that must keep failing exactly as it does today — `VerifyResult(**d)`
+    # raising TypeError, which RemoteRunner catches at :1447 — instead of a fresh
+    # AttributeError that no handler on the merge path expects.
+    if isinstance(d, dict):
+        raw = d.get('flake_suppression')
+        if raw is not None:
+            # Shallow COPY — never mutate the caller's dict, which it may still inspect.
+            d = {**d, 'flake_suppression': flake_ledger.flake_suppression_from_wire(raw)}
     return VerifyResult(**d)
 
 
