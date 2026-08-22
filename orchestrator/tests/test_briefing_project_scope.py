@@ -16,6 +16,7 @@ See ``orchestrator/src/orchestrator/agents/briefing.py``:
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import logging
 from pathlib import Path
@@ -379,14 +380,64 @@ class TestOriginTagKeyDriftGuard:
     it, and a safeguard that never fires returns ``nested_dropped == 0`` —
     indistinguishable from "nothing foreign was found". That is exactly the
     failure this file otherwise cannot detect.
+
+    The stamper is loaded BY PATH from this worktree, not through the normal
+    import machinery, so the assertion compares THIS branch's stamper against
+    THIS branch's reader. Resolving ``fused_memory`` by import name instead
+    picks up whichever editable install the active virtualenv points at — on
+    a task worktree that is the MAIN checkout, whose ``grouped_read`` predates
+    this branch and carries no ``ORIGIN_PROJECT_TAG_KEYS`` at all. Measured:
+    under ``/home/leo/src/dark-factory/.venv`` the import resolved to
+    ``<main checkout>/fused-memory/.../grouped_read.py`` and this test raised
+    ``AttributeError``, while under the worktree's own ``.venv`` it resolved
+    in-tree and passed — i.e. by-name resolution made the guard's verdict a
+    property of the ENVIRONMENT rather than of the two constants, and would
+    equally report a spurious GREEN once this work lands on main.
     """
 
     def test_grouped_read_mirrors_the_briefing_tag_keys(self):
-        # Skip-if-unimportable: fused-memory is a sibling package, not a
-        # declared dependency, so an orchestrator-only environment is a
-        # legitimate gap rather than a failure (same pattern as
-        # ``tests/test_reopen_sticks_e2e.py``).
-        grouped_read = pytest.importorskip('fused_memory.server.grouped_read')
+        # Load the IN-TREE stamper by file location. parents[2] of
+        # ``orchestrator/tests/<this file>`` is the worktree root, mirroring
+        # ``tests/conftest.py``'s documented "local src takes precedence"
+        # intent, which front-loads orchestrator/shared/escalation src but
+        # deliberately not fused-memory/src. Kept inside the test body rather
+        # than at module scope: grouped_read's absolute ``fused_memory.*``
+        # imports drag in graphiti_core, and every xdist worker would pay that
+        # cost merely to COLLECT the other tests in this file.
+        fm_grouped_read = (
+            Path(__file__).resolve().parents[2]
+            / 'fused-memory'
+            / 'src'
+            / 'fused_memory'
+            / 'server'
+            / 'grouped_read.py'
+        )
+        if not fm_grouped_read.exists():
+            pytest.skip(f'fused-memory sibling package not present at {fm_grouped_read}')
+
+        spec = importlib.util.spec_from_file_location('_fm_grouped_read', fm_grouped_read)
+        assert spec is not None and spec.loader is not None
+        grouped_read = importlib.util.module_from_spec(spec)
+        try:
+            # ImportError ONLY. That covers the legitimate gap this guard is
+            # allowed to skip on — fused-memory's own dependencies absent in an
+            # orchestrator-only environment. It must NOT cover AttributeError
+            # on the constant itself: a missing stamper key IS the drift this
+            # test exists to catch, and skipping on it would rebuild the
+            # original defect in a quieter form. The module is never inserted
+            # into ``sys.modules``, so the rest of the session is unaffected.
+            spec.loader.exec_module(grouped_read)
+        except ImportError as exc:
+            pytest.skip(f'fused-memory not importable in this environment: {exc}')
+
+        # Provenance: pins that the tuple just read really is this worktree's.
+        # Without it, an editable install rooted at the MAIN checkout silently
+        # shadows the branch's source — the exact way this test first went red.
+        assert Path(grouped_read.__file__).resolve() == fm_grouped_read.resolve(), (
+            'the stamper was loaded from outside this worktree, so the '
+            'comparison below would not be branch-against-branch. '
+            f'loaded={grouped_read.__file__!r} expected={str(fm_grouped_read)!r}'
+        )
 
         assert grouped_read.ORIGIN_PROJECT_TAG_KEYS == FOREIGN_PROJECT_TAG_KEYS, (
             'grouped_read.ORIGIN_PROJECT_TAG_KEYS (the STAMPER) and '
