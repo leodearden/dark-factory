@@ -8714,52 +8714,58 @@ async def confirm_merge_verify_flake_suppressible(
     *,
     worktree: Path,
     module_configs: list[ModuleConfig],
-) -> list[str] | None:
+) -> FlakeSuppression:
     """THIN WRAPPER: is *failing_result* a suppressible CPU-starvation flake?
 
     Holds NO re-run logic of its own. It asks THE discriminator —
     :func:`confirm_isolated_rerun_verdict` with ``call_site='merge_gate'`` —
-    and maps the returned verdict onto this gate's long-standing
-    ``list[str] | None`` contract. Everything substantive (the node-id ->
-    subproject mapping rules and their ambiguity handling, *module_configs*
+    and returns its observation UNCHANGED. Everything substantive (the node-id
+    -> subproject mapping rules and their ambiguity handling, *module_configs*
     provenance, the SAME-TREE / forced-serial / generous-timeout re-run
     composition, and this site's calibration in ``_CALL_SITE_POLICY``) is
     documented THERE, so it is stated once: two gates asking the same question
     through one implementation cannot drift into two different notions of
     "passes in isolation" (PRD §8.1, INV-5).
 
-    Returns the examined node-id list ONLY on ``passes_in_isolation`` — every
-    named failing test demonstrably PASSED on a scoped + forced-serial +
-    generous-timeout isolated re-run in the GIVEN merge *worktree* at the merge
-    SHA (INV-3: the exact tree being gated; no ``git worktree add``/``remove``,
-    no cleanup ``finally``). Single-shot per node-id group (PRD §5.1), not the
-    sweep's 2-attempt loop — the merge_gate policy's engine.
+    It survives as a function, rather than being inlined into its one caller,
+    because it is the merge gate's NAMED entry point — the exact role
+    :func:`_main_probe_failure_is_isolated_flake` plays for the probe — and it
+    is where ``call_site=FlakeCallSite.merge_gate`` is bound, once.
 
-    Returns ``None`` for EVERY other verdict — ``fails_in_isolation`` and BOTH
-    flavours of ``unconfirmable`` alike (no recoverable node-id from an
-    opaque/lint/type failure; a node-id mapping to no given subproject; an
-    infra-sentinel re-run category, which is never trusted as confirmation).
-    That collapse is deliberate: it is what makes the extraction provably
-    behaviour-preserving here. Fail CLOSED — never mask a REAL red — and NEVER
-    raise, because the merge path (merge_queue.py) has no ``VerifyInfraError``
-    handler and an uncaught raise there stalls the merge queue; the
-    discriminator's INV-1 owns that guarantee now (an unexpected exception
-    becomes ``fails_in_isolation``, which lands here as ``None``). The finer
-    ``unconfirmable`` distinction is visible to the discriminator's consumers
-    and deliberately invisible to this one — widening this return type is task
-    γ's work, not this extraction's.
+    ``passes_in_isolation`` means every named failing test demonstrably PASSED
+    on a scoped + forced-serial + generous-timeout isolated re-run in the GIVEN
+    merge *worktree* at the merge SHA (INV-3: the exact tree being gated; no
+    ``git worktree add``/``remove``, no cleanup ``finally``). Single-shot per
+    node-id group (PRD §5.1), not the sweep's 2-attempt loop — the merge_gate
+    policy's engine.
+
+    The verdict is returned WHOLE (task ε). β mapped every non-suppressing
+    verdict onto a shared ``None``, which made the extraction provably
+    behaviour-preserving but discarded the observation at exactly the point it
+    became knowable: ``fails_in_isolation`` (a REAL red) and ``unconfirmable``
+    (we could not tell — no recoverable node-id from an opaque/lint/type
+    failure; a node-id mapping to no given subproject; an infra-sentinel re-run
+    category, which is never trusted as confirmation) are different facts, and
+    θ's class-1 health check is an unconfirmable RATE that cannot be computed
+    from a ``None``. The caller — ``apply_merge_flake_suppression`` — still
+    suppresses on ``passes_in_isolation`` alone, so the GATE's behaviour is
+    unchanged; what changes is that the reason now reaches the dispatcher's
+    recorder instead of being dropped here.
+
+    Fail CLOSED — never mask a REAL red — and NEVER raise, because the merge
+    path (merge_queue.py) has no ``VerifyInfraError`` handler and an uncaught
+    raise there stalls the merge queue; the discriminator's INV-1 owns that
+    guarantee (an unexpected exception becomes ``fails_in_isolation``, which is
+    "merge stays red" rather than "we could not tell").
 
     Empty *module_configs* / files-not-on-disk (unit-test fakes) naturally map
-    nothing -> ``None``, which keeps existing ``LocalRunner.run_merge_verify``
-    tests byte-identical.
+    nothing -> ``unconfirmable``, which suppresses nothing and so keeps existing
+    ``LocalRunner.run_merge_verify`` tests byte-identical in outcome.
     """
-    suppression = await confirm_isolated_rerun_verdict(
+    return await confirm_isolated_rerun_verdict(
         worktree, config, module_configs, failing_result,
         call_site=FlakeCallSite.merge_gate,
     )
-    if suppression.verdict is FlakeVerdict.passes_in_isolation:
-        return list(suppression.test_ids)
-    return None
 
 
 # ---------------------------------------------------------------------------
