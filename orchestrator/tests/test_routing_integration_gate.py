@@ -95,7 +95,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _recording_event_store import _RecordingEventStore
@@ -106,6 +106,9 @@ from _workflow_helpers import (
     _init_repo,
 )
 
+from orchestrator.agents.invoke import AgentResult
+from orchestrator.agents.roles import ARCHITECT, DEBUGGER, IMPLEMENTER
+from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig, SandboxConfig
 from orchestrator.event_store import EventType
 from orchestrator.git_ops import GitOps
@@ -227,6 +230,47 @@ def _routing_events(rec: _RecordingEventStore) -> list[dict]:
     return [entry for (etype, entry) in rec.events if etype == EventType.routing_decision]
 
 
+class _MinimalRouteRecorder:
+    """Bare ``invoke_agent`` double for scenarios that drive ``_invoke``
+    DIRECTLY rather than through a full ``workflow.run()`` cycle — no
+    plan.json / git side effects needed, only the resolved route at the CLI
+    seam. Mirrors ``test_config_reload_integration_gate.StubInvoke``: records
+    every call's kwargs (in call order) and returns a canned success result.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    async def invoke_agent(self, **kwargs) -> AgentResult:
+        self.calls.append(kwargs)
+        return AgentResult(success=True, output='OK')
+
+
+def _config_key(role_name: str) -> str:
+    """Reviewer* collapse, reconstructed independently of
+    ``orchestrator.routing._config_key`` — mirrors
+    ``test_routing_byte_equivalence.py``:73-80's documented rationale:
+    invariant 3 is defined as matching "the same config fields", so the
+    expected side must not import the resolver's own private helper (that
+    would let a bug in the helper mask itself)."""
+    return 'reviewer' if role_name.startswith('reviewer') else role_name
+
+
+def _expected_from_config(
+    cfg: OrchestratorConfig, role_name: str,
+) -> tuple[str, str, float, int]:
+    """The pre-epsilon resolution: config.models/effort/budgets/max_turns
+    read by the reviewer-collapsed key, with no further logic — what a stock
+    dispatch (no overrides, no matching rule) must byte-equal."""
+    key = _config_key(role_name)
+    return (
+        getattr(cfg.models, key),
+        getattr(cfg.effort, key),
+        getattr(cfg.budgets, key),
+        getattr(cfg.max_turns, key),
+    )
+
+
 def _mock_verify_passes() -> AsyncMock:
     """A ``run_scoped_verification`` double that always reports success.
 
@@ -344,3 +388,215 @@ class TestInvalidOverrideFallsThroughFailSafe:
         impl_history = [h for h in history if h['role'] == 'implementer']
         assert impl_history, f'expected an implementer entry in routing history: {history!r}'
         assert impl_history[-1]['rejected'] == ['metadata_override:model-not-in-allowlist']
+
+
+# ---------------------------------------------------------------------------
+# Boundary scenario 3 — byte-equivalence, integration half (plan step-2).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestByteEquivalenceThroughTheRig:
+    """PRD boundary scenario 3, integration half: a full stock dispatch (no
+    overrides, shipped default rules) resolves every in-band role's (model,
+    effort, max_turns) exactly as pre-epsilon ``_invoke`` did — reading
+    ``config.models``/``effort``/``max_turns`` by the reviewer-collapsed
+    key — and the ``routing_decision`` event's ``budget_usd`` matches
+    ``config.budgets`` the same way. Also proves the theta plan-shape rule
+    fires off the REAL ``self.plan`` (not a hand-built ``PlanShape``).
+
+    Uses the opt-in ``code_default_config`` conftest fixture so "stock"
+    means the bundled ``defaults.yaml`` — the autouse ``_isolate_orch_config``
+    otherwise pins ``ORCH_CONFIG_PATH`` at the repo's live operational yaml,
+    which drifts and would make "stock" mean the wrong thing.
+
+    The flat 12-role table (every role ``_invoke``-addressable, including
+    out-of-band-only roles) stays owned by
+    ``test_routing_byte_equivalence.ALL_DISPATCHABLE_ROLES`` — this class's
+    distinct, non-duplicative claim is the INTEGRATION half: the roles a
+    real dispatch actually invokes reach the CLI seam with byte-identical
+    stock values.
+    """
+
+    #: The role set a conflict-free ``workflow.run()`` dispatch actually
+    #: invokes: MERGER is deliberately excluded here -- it is only dispatched
+    #: from ``_resolve_and_resubmit`` when a real merge conflict occurs
+    #: (workflow.py:10859), which this trivial-repo happy path never
+    #: produces (empirically confirmed: a conflict-free DONE dispatch never
+    #: touches it). ``test_merger_byte_equivalent_through_conflict_resolution``
+    #: below covers merger's byte-equivalence separately, through the same
+    #: real seam, by driving that method directly -- the established pattern
+    #: for exercising it (test_verdict_servers_integration_gate.
+    #: TestMergerBoundary), since a synthetic conflict never needs a genuine
+    #: git conflict to construct.
+    _RUN_ROLES = frozenset({'architect', 'implementer', 'reviewer_comprehensive', 'judge'})
+
+    @pytest.fixture
+    def stock_config(self, git_repo: Path, code_default_config) -> OrchestratorConfig:
+        return OrchestratorConfig(
+            project_root=git_repo,
+            max_concurrent_tasks=1,
+            max_execute_iterations=5,
+            max_verify_attempts=3,
+            max_review_cycles=2,
+            git=GitConfig(
+                main_branch='main',
+                branch_prefix='task/',
+                remote='origin',
+                worktree_dir='.worktrees',
+            ),
+            sandbox=SandboxConfig(enabled=False),
+            # Opt-in (default False): brings 'judge' into the in-band role
+            # set this single dispatch invokes, alongside architect/
+            # implementer/reviewer*/merger. Does not change dispatch control
+            # flow here — the EXECUTE loop's own pending-steps check already
+            # terminates naturally once the implementer's one invocation
+            # completes both PLAN steps (workflow.py:7920), independent of
+            # the judge's verdict — it only adds one extra judge invocation
+            # to observe.
+            judge_after_each_iteration=True,
+        )
+
+    async def test_stock_dispatch_matches_config_byte_for_byte(
+        self, stock_config, git_ops, task_assignment, monkeypatch,
+    ):
+        stub = _RoutingRecorderStub()
+        workflow, _scheduler = _build_workflow(stock_config, git_ops, task_assignment, stub)
+        rec = _RecordingEventStore()
+        workflow.event_store = rec
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification', _mock_verify_passes(),
+        )
+
+        outcome = (await workflow.run()).outcome
+        assert outcome == WorkflowOutcome.DONE
+
+        # (b) the recorder covered the FULL in-band role set this real
+        # dispatch invokes -- a silently-skipped role fails loudly here.
+        # Pointer: the flat 12-role table (every role _invoke can address,
+        # including out-of-band-only roles) lives in
+        # test_routing_byte_equivalence.ALL_DISPATCHABLE_ROLES.
+        assert set(stub.route_by_role) == self._RUN_ROLES
+
+        # (a)/(c) for EVERY observed role: the seam's (model, effort,
+        # max_turns) match config byte-for-byte, and the routing_decision
+        # event's budget_usd matches config.budgets the same way, with every
+        # event resolved at the config layer, no rule, no rejection.
+        for role_name in self._RUN_ROLES:
+            route = stub.route_by_role[role_name]
+            expected_model, expected_effort, expected_budget, expected_max_turns = (
+                _expected_from_config(stock_config, role_name)
+            )
+            assert route['model'] == expected_model, role_name
+            assert route['effort'] == expected_effort, role_name
+            assert route['max_turns'] == expected_max_turns, role_name
+
+            role_events = [e for e in _routing_events(rec) if e['data']['role'] == role_name]
+            assert role_events, f'expected a routing_decision event for {role_name}'
+            data = role_events[-1]['data']
+            # Assert budget on the EVENT, not the seam's max_budget_usd kwarg
+            # -- data['budget_usd'] is the authoritative mirror
+            # _record_routing_decision writes for cost triage (the
+            # out-of-band sibling, test_routing_dispatch.
+            # TestAppliedBudgetAnnotation, documents why an applied-budget
+            # caller-enforced cap is annotated onto the event rather than
+            # trusted from the seam kwarg alone).
+            assert data['budget_usd'] == expected_budget, role_name
+            assert data['source_layer'] == 'config', role_name
+            assert data['rule_id'] is None, role_name
+            assert data['rejected'] == [], role_name
+
+    async def test_rust_shaped_plan_upgrades_implementer_and_debugger_not_architect(
+        self, stock_config, git_ops, task_assignment, git_repo, monkeypatch,
+    ):
+        """(c) Rust-heuristic parity through the rig: a plan shaped like the
+        historical crates/-only ``rust-large-plan-implementer`` heuristic
+        (>=12 steps across >=3 distinct ``crates/``-prefixed modules) still
+        upgrades implementer/debugger via the generalized ``large-plan-steps``
+        rule (defaults.yaml:257) — while architect, not in that rule's role
+        list, is NOT upgraded (stays source_layer='config').
+
+        Drives ``_invoke`` directly (not a full ``workflow.run()``): only the
+        resolved route matters here, so ``workflow.plan``/``workflow.modules``
+        are seeded directly rather than produced by a real architect stub.
+        """
+        stub = _MinimalRouteRecorder()
+        workflow, _scheduler = _build_workflow(stock_config, git_ops, task_assignment, stub)
+        rec = _RecordingEventStore()
+        workflow.event_store = rec
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
+
+        workflow.plan = {'steps': [{'id': f's{i}', 'status': 'pending'} for i in range(12)]}
+        workflow.modules = [
+            'crates/alpha/src/lib.rs', 'crates/beta/src/lib.rs', 'crates/gamma/src/lib.rs',
+        ]
+
+        await workflow._invoke(IMPLEMENTER, 'impl prompt', git_repo)
+        await workflow._invoke(DEBUGGER, 'debug prompt', git_repo)
+        await workflow._invoke(ARCHITECT, 'arch prompt', git_repo)
+
+        assert stub.calls[0]['model'] == 'opus'  # implementer, upgraded
+        assert stub.calls[1]['model'] == 'opus'  # debugger, upgraded
+        # architect: not in large-plan-steps' role list -- unaffected, but
+        # its stock config model already happens to be 'opus' too, so the
+        # discriminating assertion below is source_layer/rule_id, not model.
+        assert stub.calls[2]['model'] == stock_config.models.architect
+
+        impl_data = [e for e in _routing_events(rec) if e['data']['role'] == 'implementer'][-1]['data']
+        assert impl_data['source_layer'] == 'policy_rule'
+        assert impl_data['rule_id'] == 'large-plan-steps'
+
+        dbg_data = [e for e in _routing_events(rec) if e['data']['role'] == 'debugger'][-1]['data']
+        assert dbg_data['source_layer'] == 'policy_rule'
+        assert dbg_data['rule_id'] == 'large-plan-steps'
+
+        arch_data = [e for e in _routing_events(rec) if e['data']['role'] == 'architect'][-1]['data']
+        assert arch_data['source_layer'] == 'config'
+        assert arch_data['rule_id'] is None
+
+    async def test_merger_byte_equivalent_through_conflict_resolution(
+        self, stock_config, git_ops, task_assignment, tmp_path, monkeypatch,
+    ):
+        """merger is conditionally invoked -- only from
+        ``TaskWorkflow._resolve_and_resubmit`` when a real merge conflict
+        occurs (workflow.py:10859) -- so it never appears in the conflict-free
+        ``_RUN_ROLES`` dispatch above. Drive that method directly (mirrors
+        ``test_verdict_servers_integration_gate.TestMergerBoundary``), the
+        same real seam as everywhere else in this suite, to prove merger's
+        stock resolution is ALSO byte-equivalent.
+        """
+        stub = _RoutingRecorderStub()
+        workflow, _scheduler = _build_workflow(stock_config, git_ops, task_assignment, stub)
+        rec = _RecordingEventStore()
+        workflow.event_store = rec
+        _seed_workflow_artifacts(workflow, tmp_path=tmp_path)
+        workflow.git_ops.rebase_onto_main = AsyncMock()  # type: ignore[method-assign]
+        workflow._submit_to_merge_queue = AsyncMock(  # type: ignore[method-assign]
+            return_value=WorkflowOutcome.DONE,
+        )
+        workflow._mark_blocked = AsyncMock(  # type: ignore[method-assign]
+            return_value=WorkflowOutcome.BLOCKED,
+        )
+        workflow._write_merge_failure_review = MagicMock()  # type: ignore[method-assign]
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
+
+        # Outcome is irrelevant here (AgentStub._merger writes no verdict, so
+        # this fails safe to BLOCKED) -- only the ROUTE reaching the real
+        # seam is under test.
+        await workflow._resolve_and_resubmit('task/42', 'conflict in lib.py', merge_phase=True)
+
+        expected_model, expected_effort, expected_budget, expected_max_turns = (
+            _expected_from_config(stock_config, 'merger')
+        )
+        assert stub.route_by_role['merger']['model'] == expected_model
+        assert stub.route_by_role['merger']['effort'] == expected_effort
+        assert stub.route_by_role['merger']['max_turns'] == expected_max_turns
+
+        merger_events = [e for e in _routing_events(rec) if e['data']['role'] == 'merger']
+        assert merger_events, f'expected a merger routing_decision event: {rec.events!r}'
+        data = merger_events[-1]['data']
+        assert data['budget_usd'] == expected_budget
+        assert data['source_layer'] == 'config'
+        assert data['rule_id'] is None
+        assert data['rejected'] == []
