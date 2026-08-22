@@ -889,6 +889,15 @@ class LocalRunner:
                 summary=summary,
                 timed_out=timed_out,
                 category=category,
+                # Task ε: carry the merge-flake observation through this FRESH
+                # result.  The scoped red WAS observed (and possibly suppressed),
+                # so the observation must still reach the dispatcher's recorder
+                # even though the unscoped gate independently failed the merge.
+                # Dropping it here would under-count the ledger and silently
+                # disarm the INV-4 streak for exactly the compound failure most
+                # likely to occur under load — and would REGRESS an emission that
+                # happened inline before the recorder was split out.
+                flake_suppression=scoped.flake_suppression,
             )
 
         return scoped
