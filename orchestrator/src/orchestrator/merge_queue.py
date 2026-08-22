@@ -12089,7 +12089,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             return None
         return ProbePlacement(depth=d, base=base)
 
-    async def _deep_chain_placement(self, item: SpeculativeItem) -> ChainResult | None:
+    async def _deep_chain_placement(self, item: RealMergeItem) -> ChainResult | None:
         """Decide whether THIS second-slot dispatch should verify a deep CHAIN
         tip instead of the item's own adjacent merge commit (task 3185, PRD γ).
 
@@ -12167,12 +12167,20 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # the queue THROUGH this item, and seeding at the frozen tip would skip
         # it -- a hole that breaks the in-order prefix property δ's CAS walk
         # depends on.
+        base = item.merge_result.merge_commit
+        if base is None:
+            # Unreachable in practice -- a RealMergeItem only exists for a
+            # SUCCESSFUL merge -- but the field is Optional, and a chain seeded
+            # at a None base would be a chain with no anchor. Decline rather
+            # than assert: this is the OPTIONAL deep path, and it must never be
+            # the thing that crashes a dispatch.
+            return None
         try:
             async with asyncio.timeout(CHAIN_BUILD_TIMEOUT_SECS):
                 result = await build_chain(
                     self._git_ops,
                     self.chain_snapshot(),
-                    item.merge_result.merge_commit,
+                    base,
                     cap=cap - 1,
                     target_depth=d - 1,
                 )
@@ -17146,7 +17154,17 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         lease: Any,  # HostLease
         depth: int | None = None,
         probe_base: str | None = None,
+        # KEYWORD-ONLY (task 3185): both are additive telemetry/policy kwargs
+        # that every caller already passes by name.  Pinning them past the `*`
+        # keeps the POSITIONAL arity of this method frozen at four, so the
+        # `(item, lease, depth=None, probe_base=None, **_kw)` stubs that stand
+        # in for it across the suite (e.g.
+        # test_merge_queue_speculative_probe.py's probe fakes, which document
+        # exactly this intent) stay signature-compatible as later scopes add
+        # more of them.
+        *,
         chain_items: int = 1,
+        chain: ChainResult | None = None,
     ) -> InflightVerifyResult:
         """Run the verify portion for one in-flight item.
 
@@ -17222,16 +17240,76 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             verified tree has a smallest truthful value of 1, so the shim /
             harness / direct-call paths that omit it stay byte-identical in
             meaning as well as in behaviour.
+        chain: A non-empty :class:`~orchestrator.merge_types.ChainResult` from
+            :meth:`_deep_chain_placement` (task 3185, PRD γ) — the DEEP-CHAIN
+            REDIRECT, and the capability that separates γ from task 2359's
+            probe.  ``probe_base`` directly above is a RELABEL: it changes the
+            attribution facts fed to the merge-skew classifier and nothing
+            else, so the verify still exercises ``item``'s own tree (its
+            "KNOWN PHASE-1 LIMITATION").  ``chain`` genuinely REDIRECTS: this
+            verify runs against ``chain.tip`` inside ``chain.lane`` — a
+            cumulative tree containing *item* plus every chained successor —
+            and ``item``'s own merge commit and merge worktree are not
+            exercised at all.
+
+            Four consequences, each pinned by
+            test_merge_queue_deep_dispatch.py::TestRunInflightVerifyChainRedirect:
+
+            1. The LOCAL warm-swap block is bypassed entirely.  The lane
+               ALREADY holds the tip, so a second
+               :func:`_acquire_warm_verify_worktree` would take a DIFFERENT
+               lane, re-check-out a DIFFERENT commit, and can resolve to the
+               serial ``_merge-verify`` lane that
+               :func:`~orchestrator.merge_liveness.acquire_chain_build_lane`
+               explicitly refuses (DF-3071).  ``_is_warm_path`` therefore comes
+               from ``chain.lane_warm``, and ``_verify_attempt_count`` (staged
+               inside that block) is left untouched — an attempt that never
+               ran the warm acquire must not advance the cold-verify safety
+               valve.
+            2. ``chain_items`` is EXTENDED by ``len(chain.links)``: the caller
+               passes the frontier-derived count for *item* alone, and the
+               links actually BUILT are added here.  A 6-target that truncated
+               after 2 links emits the 2, never the 6 — the field is a fact
+               about the tree that ran.
+            3. The lane is released EXACTLY ONCE, in the ``finally`` below, on
+               the pass / fail / exception exits alike.  ``ChainResult``'s
+               "Lane ownership" contract makes that release the caller's
+               obligation, and this method is that caller.
+            4. The disposition is NON-ADOPTING — see the block comment at the
+               chain arm's exit for the soundness rule.
+
+            ``None`` (default) is every existing caller and is byte-identical
+            to pre-γ dispatch.
         """
         req = item.request
-        merge_wt = item.merge_wt
-        assert merge_wt is not None
-        merge_commit = item.merge_result.merge_commit
-        assert merge_commit is not None
-        merge_commit = merge_commit.strip()
+        # ── task 3185 (PRD γ): THE DEEP-CHAIN REDIRECT ──────────────────────
+        # The two facts every path below is written against — WHAT is verified
+        # and WHERE — are chosen here, once, so no downstream branch has to
+        # re-derive them or remember to consult `chain`.
+        if chain is not None:
+            merge_wt = chain.lane
+            assert merge_wt is not None, (
+                'a non-empty ChainResult always HOLDS a lane (merge_types.py, '
+                '"Lane ownership") — a None lane here means _deep_chain_placement '
+                'returned an empty result it should have declined'
+            )
+            merge_commit = chain.tip.strip()
+            # The caller's `chain_items` counts the frontier plus the
+            # dispatching item; the links actually BUILT are added here (never
+            # the target that was requested — see the docstring, consequence 2).
+            chain_items = chain_items + len(chain.links)
+        else:
+            merge_wt = item.merge_wt
+            assert merge_wt is not None
+            merge_commit = item.merge_result.merge_commit
+            assert merge_commit is not None
+            merge_commit = merge_commit.strip()
 
         _warm_results: dict[str, str] = {}
-        _is_warm_path = False
+        # On the chain arm the lane's warmth is decided by the BUILD's
+        # acquisition (acquire_chain_build_lane -> acquire_spec_lane), not by a
+        # warm swap that never runs here.
+        _is_warm_path = chain.lane_warm if chain is not None else False
         _warm_capture: list[VerifyResult] = []
         # PRD verify-retry-failed-only D4 (§5.4): attempt-0 verdict sink populated
         # by _run_post_merge_verify ONLY on a corroborated narrowed retry; unioned
@@ -17245,8 +17323,70 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         verify_task: asyncio.Task | None = None
         _ru_owned_by_handler = False
 
+        # Idempotency latch for the chain-lane release below.  The lane must go
+        # back to the pool exactly once: twice would return a FREE lane to the
+        # pool a second time, never would strand a `_spec-` slot for the life of
+        # the process.  Several exits can each reach a release site, so the
+        # latch — not call-site discipline — is what makes "exactly once"
+        # structural.
+        _chain_lane_released = False
+
+        async def _release_chain_lane() -> None:
+            """Return the chain's scratch lane to the pool, at most once."""
+            nonlocal _chain_lane_released
+            if chain is None or _chain_lane_released:
+                return
+            _chain_lane_released = True
+            await release_chain_build_lane(
+                self._git_ops, chain.lane, warm=chain.lane_warm,
+            )
+
+        async def _dispose_verify_worktree() -> None:
+            """Dispose of the worktree THIS verify ran in, routing by arm.
+
+            The abort/defer/error branches below all need "give back whatever
+            I was verifying in", but the two arms answer that differently: the
+            ordinary arm owns an ephemeral (or warm-swapped) merge worktree and
+            routes through :meth:`_release_or_cleanup`, while the chain arm is
+            sitting in a POOL-OWNED ``_spec-`` lane that must go back through
+            :func:`~orchestrator.merge_liveness.release_chain_build_lane`.
+            Handing a chain lane to ``_release_or_cleanup`` with
+            ``spec_warm=False`` would ``git worktree remove`` a pooled lane —
+            a permanently lost slot, and the exact hazard
+            ``_release_or_cleanup``'s own "WHICH ONE DO I CALL?" rule warns
+            about.  Routing here (rather than at six call sites) is what keeps
+            that a one-place decision.
+            """
+            if chain is not None:
+                await _release_chain_lane()
+                return
+            await self._release_or_cleanup(merge_wt, spec_warm=_spec_warm)
+
         try:
-            if lease.is_local:
+            if chain is not None:
+                # ── task 3185 (PRD γ): the chain arm's worktree bookkeeping ──
+                # The lane already holds the tip (build_chain merged the whole
+                # chain in it), so there is nothing to swap INTO — hence the
+                # `chain is None` guard on the warm-swap block below.  What
+                # remains is the mirror image of that block's own
+                # `_deregister_owned_merge_worktree(item.merge_wt)` line: the
+                # ephemeral `_merge-<uuid>` this item was merged in is now dead
+                # weight, and BOTH ways of leaving it behind are bugs.  Left
+                # REGISTERED, `_touch_owned_merge_worktrees` re-pins its root
+                # mtime every heartbeat and `keep_worktrees` exempts it from
+                # reaping — immortal.  Left on disk UNREGISTERED, it trips the
+                # I6 `worktree_ledger_violations` audit once it ages past the
+                # grace window.  `_cleanup_owned_merge_worktree` does both
+                # halves in the deregister-before-cleanup order that keeps a
+                # failed git cleanup from immortalising the ledger entry.
+                #
+                # Dropping the worktree does NOT endanger the item's merge
+                # COMMIT: the chain lane has descendants of it checked out, so
+                # it stays reachable — and the request is re-queued from here
+                # anyway (see the non-adopting exit), so it will be re-merged
+                # from scratch rather than reusing this tree.
+                await self._cleanup_owned_merge_worktree(item.merge_wt)
+            if lease.is_local and chain is None:
                 # ── LOCAL path: persistent warm-merge-verify worktree swap ──
                 # Mirrors _verify_and_advance (PRD §10 κ): increment the attempt
                 # counter, check the safety valve, swap to the warm persistent
@@ -17416,7 +17556,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # over the operator-halt re-queue when both hold simultaneously.
                 if self._request_abandoned(req):
                     await self._teardown_verify_task(lease, verify_task, req.task_id)
-                    await self._release_or_cleanup(merge_wt, spec_warm=_spec_warm)
+                    await _dispose_verify_worktree()
                     # task 2420 amend (reviewer finding, resource_cleanup): this
                     # request is DROPPED (sole waiter gave up) — the per-task
                     # dead-verify-abort counter has no further purpose for it,
@@ -17456,7 +17596,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         req.task_id,
                     )
                     await self._teardown_verify_task(lease, verify_task, req.task_id)
-                    await self._release_or_cleanup(merge_wt, spec_warm=_spec_warm)
+                    await _dispose_verify_worktree()
                     self._requeue_request(req)
                     # task 3003 amend (robustness): an operator-halt requeue is
                     # NOT a contended-lane defer — a verify was running, so the
@@ -17577,7 +17717,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         self.MAX_INFLIGHT_DEAD_VERIFY_ABORTS,
                     )
                     await self._teardown_verify_task(lease, verify_task, req.task_id)
-                    await self._release_or_cleanup(merge_wt, spec_warm=_spec_warm)
+                    await _dispose_verify_worktree()
                     # task 3003 amend (robustness): a dead/hung verify — abort or
                     # busy-loop cap — is not lane contention either (the verify
                     # got as far as running), so neither branch below may leave a
@@ -17653,12 +17793,20 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # time; that guard exists only for the routes this handler never
             # sees (external cancellation of the outer task).
             _ru_owned_by_handler = True
+            # task 3185 (PRD γ): on the CHAIN arm, `merge_wt` is the chain's
+            # pooled `_spec-` lane, which the `finally` below returns to the
+            # pool.  Handing it out here would have _finalize_inflight's
+            # deferred `_release_or_cleanup(vr.merge_wt, spec_warm=False)`
+            # `git worktree remove` an already-FREE pooled lane — a
+            # permanently lost slot.  None is also the TRUTH for this arm: the
+            # chain path owns its own worktree disposal end to end, so there is
+            # nothing left for the chokepoint to dispose of.
             return InflightVerifyResult(
                 outcome=None,
-                merge_wt=merge_wt,
+                merge_wt=None if chain is not None else merge_wt,
                 status=InflightStatus.RUNNER_UNAVAILABLE,
                 reason=str(exc),
-                spec_warm=_spec_warm,
+                spec_warm=False if chain is not None else _spec_warm,
             )
         except (MergeVerifyLeaseContended, MergeVerifyLeaseHeld) as exc:
             # The shared merge-verify <lane_dir>.lock was unavailable, so the
@@ -17802,7 +17950,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # guarantee in production.
                 self._contended_lease_cap_outs += 1
                 _cap_out_n = self._contended_lease_cap_outs
-                await self._release_or_cleanup(merge_wt, spec_warm=_spec_warm)
+                await _dispose_verify_worktree()
                 logger.error(
                     'Task %s: merge-verify lane has been unavailable for %.0fs '
                     'across %d consecutive deferred attempts (%s) — resolving '
@@ -17895,7 +18043,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 )
             # The ephemeral worktree and its disk are freed BEFORE the backoff
             # below, never held across it.
-            await self._release_or_cleanup(merge_wt, spec_warm=_spec_warm)
+            await _dispose_verify_worktree()
             # task 3003 (review fix 1): throttle the re-attempt to a minimum
             # INTER-ATTEMPT PERIOD.  The two bounded-wait raisers have already
             # burned wait_secs inside the acquire, so they sleep 0 here and
@@ -17952,7 +18100,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 f'Task {req.task_id}: verify end '
                 f'(merge={merge_commit[:8]}, error)'
             )
-            await self._release_or_cleanup(merge_wt, spec_warm=_spec_warm)
+            await _dispose_verify_worktree()
             # task 2420 amend (reviewer finding, resource_cleanup): this is a
             # terminal 'blocked' resolution via a generic exception — pop the
             # per-task dead-verify-abort counter here too so a stale count
@@ -18108,6 +18256,23 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             req.task_id, lease.name, _orphan_exc,
                         )
 
+            # ── task 3185 (PRD γ): THE chain-lane release ────────────────
+            # ChainResult's "Lane ownership" contract hands the caller a lane
+            # it MUST return exactly once; this is that site, and putting it in
+            # the `finally` is what makes "every exit" structural rather than a
+            # per-branch discipline that a future edit could forget.  It covers
+            # the tip pass, the tip fail, all three abort branches, both defer
+            # arms, and any exception — the latch inside `_release_chain_lane`
+            # absorbs the branches that already disposed via
+            # `_dispose_verify_worktree`.  A no-op when `chain is None`.
+            #
+            # Deliberately placed AFTER the orphan guard above, not before it:
+            # the guard is what proves the inner verify task is dead, and
+            # returning the lane to the pool while a verify subprocess is still
+            # running inside it would let the next chain build check the lane
+            # out from under it.
+            await _release_chain_lane()
+
         # task 2420 amend (reviewer finding #1): verify_task returned a
         # result HERE at all — pass, fail, or skipped — which proves this
         # task's verify subprocess was not hung.  Clear the per-task
@@ -18122,6 +18287,59 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # task 3003: pop the streak's start stamp in lockstep, so the next
         # streak measures its own elapsed span from its own first defer.
         self._clear_contended_lease_streak(req.task_id)
+
+        if chain is not None:
+            # ══ task 3185 (PRD γ): THE NON-ADOPTING EXIT ═══════════════════
+            #
+            # SOUNDNESS RULE — a tip verdict proves the CUMULATIVE tree, never
+            # the dispatching item's own SUBSET tree.  `out is None` here means
+            # "item + every chained successor, merged together, is green"; it
+            # does NOT license landing item alone, whose tree was never
+            # verified.  Letting this verdict reach _finalize_inflight's CAS
+            # advance would land work from a tree nothing ever ran — precisely
+            # the new false-green path the PRD forbids ("Landing safety is
+            # structural... There is no new false-green path").
+            #
+            # So BOTH arms — tip pass and tip fail — take the REQUEUED
+            # sentinel: nothing lands via the chain in γ, the items stay
+            # queued, and each takes its ordinary sequential path.  δ (task
+            # 3186) replaces the PASS arm with the in-order CAS walk over
+            # `chain.links`, and that is the ONLY place adoption may ever be
+            # introduced.
+            #
+            # A corollary the PRD's boundary sketch calls out: REQUEUED emits
+            # no `merge_attempt` and no blocked `MergeOutcome`, so consecutive
+            # deep fails cannot feed workflow.py's `consecutive_merge_thrash`
+            # ladder — the same false-positive-escalation class build_chain's
+            # own decision-4 purity comment guards against upstream.
+            #
+            # The halving state is fed the BUILT depth in chain-item units
+            # (the dispatching item is #1), not the target that was requested,
+            # so a fail halves off what actually ran.  `out is None` is this
+            # method's own vocabulary for a pass; a low-disk `verify_skipped`
+            # therefore counts as not-a-pass, which is the conservative
+            # direction (it walks toward the d=1 floor, never inflating depth).
+            # An EXCEPTION exit never reaches here at all — an infra error is
+            # not a tip verdict and must not move the policy.
+            _chain_depth = 1 + len(chain.links)
+            self._note_chain_outcome(out is None, _chain_depth)
+            logger.info(
+                'Task %s: deep tip verify end (tip=%s, items=%d, passed=%s) — '
+                're-queuing; γ dispatches deep chains but lands nothing (δ/3186 '
+                'owns the in-order prefix walk)',
+                req.task_id, merge_commit[:8], _chain_depth, out is None,
+            )
+            # TEMPORARY, COMPLETED IN STEP-18 (task 3185): the REQUEUED
+            # sentinel is returned here, but `self._requeue_request(req)` — the
+            # enforced single chokepoint that actually puts the request back on
+            # `_queue` and re-arms the ledger + lifecycle registry — lands with
+            # step-18's tests.  Until then the request is deferred without
+            # being re-filed.  Unreachable under the shipped `chain_cap=0`.
+            return InflightVerifyResult(
+                outcome=None,
+                merge_wt=None,
+                status=InflightStatus.REQUEUED,
+            )
 
         if out is None:
             logger.info(
@@ -19536,24 +19754,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # firing chain REDIRECTS the verify onto a cumulative tip.
         #
         # A non-empty ChainResult HOLDS a scratch lane whose release is the
-        # CALLER's obligation (ChainResult docstring, "Lane ownership").
-        #
-        # TEMPORARY, DELETE IN STEP-16 (task 3185): step-16 threads `chain`
-        # into _run_inflight_verify, which then owns the tip verify AND the
-        # single release. Until it does, this dispatch has no consumer for the
-        # chain, so it releases the lane immediately and takes today's path --
-        # wasteful under a non-zero cap, but sound, and unreachable under the
-        # shipped chain_cap=0 default. Landing the build (step-14) without this
-        # would leak one lane per deep dispatch.
-        _chain = await self._deep_chain_placement(item)
-        if _chain is not None:
-            await release_chain_build_lane(
-                self._git_ops, _chain.lane, warm=_chain.lane_warm,
-            )
+        # CALLER's obligation (ChainResult docstring, "Lane ownership").  That
+        # obligation is DISCHARGED BY _run_inflight_verify, in its `finally`,
+        # on every exit -- so the chain must be handed to it unconditionally
+        # once built.  Do not add an early return or a raise between this line
+        # and the ensure_future below: the lane would leak.
+        chain = await self._deep_chain_placement(item)
         verify_task: asyncio.Task = asyncio.ensure_future(  # type: ignore[type-arg]
             self._run_inflight_verify(
                 item, lease, depth=depth, probe_base=probe_base,
-                chain_items=chain_items,
+                chain_items=chain_items, chain=chain,
             )
         )
 
@@ -19561,10 +19771,15 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             item=item,
             lease=lease,
             verify_task=verify_task,
+            # The item's OWN ephemeral worktree, deliberately, even on the
+            # chain arm: _run_inflight_verify disposes of it there and returns
+            # merge_wt=None, so nothing downstream double-disposes.  This field
+            # is the pre-verify fact; vr.merge_wt is the post-verify one.
             merge_wt=item.merge_wt,
             was_speculative=item_was_speculative,
             started_at=time.time(),
             permit=item_permit,
+            chain=chain,
         )
 
 

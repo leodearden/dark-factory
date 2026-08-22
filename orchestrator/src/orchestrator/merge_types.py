@@ -1432,6 +1432,18 @@ class InflightEntry:
     verify_result  : set when the verify has completed (pass=None; fail=VerifyResult)
     status         : optional sentinel string ('DROPPED', 'REQUEUED', 'RUNNER_UNAVAILABLE')
                      returned by _run_inflight_verify to signal special handling by _finalize_inflight
+    chain          : the :class:`ChainResult` this dispatch's verify was
+                     REDIRECTED onto (task 3185, PRD γ), or ``None`` on the
+                     ordinary adjacent-verify path.  Recorded for disposition
+                     and diagnosis only: γ reads it nowhere but the dispatch
+                     seam that set it, because a tip verdict is deliberately
+                     non-adopting (see _run_inflight_verify's chain arm).  δ
+                     (task 3186) is what consumes ``links`` — the in-order CAS
+                     walk that lands the verified prefix.  NOTE the lane
+                     referenced here is already RELEASED by the time
+                     _finalize_inflight sees this entry: _run_inflight_verify
+                     returns it to the pool in its own ``finally``, so this
+                     field is never a release handle.
     """
 
     item: SpeculativeItem
@@ -1444,6 +1456,7 @@ class InflightEntry:
     status: InflightStatus | None = None    # sentinel: DROPPED / REQUEUED / RUNNER_UNAVAILABLE / ABANDONED_PREDISPATCH / REQUEUED_PREDISPATCH
     started_at: float | None = None         # time.time() at dispatch construction (≈ verify start)
     permit: SpecPermit | None = None        # ζ: speculation-slot token owned by PermitLedger; threaded/released by η
+    chain: ChainResult | None = None        # γ (task 3185): the deep chain this verify was redirected onto
 
     def __post_init__(self) -> None:
         """Enforce the I2-shadow invariant (task 1990 / MQ-invariants ε).

@@ -757,7 +757,14 @@ async def acquire_chain_build_lane(
     branching.
 
     Delegates to :meth:`~orchestrator.git_ops.GitOps.acquire_spec_lane` — the
-    single lane the whole chain build (and, later, γ's tip verify) runs in.
+    single lane the whole chain build AND γ's tip verify run in.  γ (task
+    3185) has landed: ``SpeculativeMergeWorker._run_inflight_verify`` now
+    verifies ``ChainResult.tip`` inside THIS lane rather than acquiring a
+    verify worktree of its own, and releases it — once, in its ``finally``,
+    on every exit — via :func:`release_chain_build_lane`.  That is why the
+    serial-lane refusal below is load-bearing twice over: borrowing
+    ``_merge-verify`` would make both the build and the subsequent verify
+    contend with the serial head verify.
     That method already handles knob-off (``spec_warm_lane_pool is None``) and
     pool exhaustion by cold-falling-back to
     :meth:`~orchestrator.git_ops.GitOps.create_throwaway_verify_worktree` with

@@ -917,6 +917,7 @@ class TestDeepChainPlacementBuild:
         # queue_len = 1 + 2 = 3, cap 6, no halving -> d = 3 (items).
         assert call['cap'] == 5, 'cap - 1: extra links beyond the dispatching item'
         assert call['target_depth'] == 2, 'd - 1, same unit conversion'
+        assert res is not None
         await merge_liveness.release_chain_build_lane(
             git_ops, res.lane, warm=res.lane_warm,
         )
@@ -1016,6 +1017,7 @@ class TestDeepChainPlacementBuild:
             queued=[('102', 'b.txt', 'edit-102\n'), ('103', 'c.txt', 'edit-103\n')],
         )
         # A first-item conflict is the realistic way to get a zero-link result.
+        assert item.merge_result.merge_commit is not None
         built = _spy_build_chain(monkeypatch, ChainResult(
             links=[], tip=item.merge_result.merge_commit,
             truncated_at='102', truncated_reason='conflict',
@@ -1102,25 +1104,25 @@ def _local_lease():
     return HostLease(name='local', runner=runner, is_local=True)
 
 
-def _spy_warm_acquire(monkeypatch) -> list[tuple]:
-    """Record every ``_acquire_warm_verify_worktree`` call; return the record list.
-
-    The chain arm must not call it AT ALL: the chain lane already holds the
-    tip, and a second acquisition would take a DIFFERENT lane, re-check-out a
-    different commit, and can land on the serial ``_merge-verify`` lane that
-    ``acquire_chain_build_lane`` explicitly refuses (merge_liveness.py:806-814,
-    DF-3071).
-    """
-    calls: list[tuple] = []
-
-    async def _recording(git_ops, req, merge_wt, merge_commit, **kwargs):
-        calls.append((merge_wt, merge_commit, kwargs))
-        return merge_wt, False
-
-    monkeypatch.setattr(
-        'orchestrator.merge_queue._acquire_warm_verify_worktree', _recording,
-    )
-    return calls
+# NOTE ON HOW THE WARM-SWAP BYPASS IS OBSERVED (no reach-back patch).
+#
+# The obvious spy — ``monkeypatch.setattr('orchestrator.merge_queue.
+# _acquire_warm_verify_worktree', ...)`` — is a merge_queue reach-back patch,
+# frozen by test_merge_queue_reachback_patch_guard.py.  Repointing it at the
+# DEFINING module (``orchestrator.merge_liveness``) would not work either:
+# ``_run_inflight_verify`` resolves the name through merge_queue's own module
+# global, so a merge_liveness patch sits off the resolution path and any
+# "was not called" assertion would pass VACUOUSLY — exactly the failure mode
+# that guard exists to prevent.
+#
+# So the bypass is observed through the warm-swap block's REAL, externally
+# visible effects instead, which is a stronger test anyway:
+#   * ``git_ops.acquire_spec_lane`` — what _acquire_warm_verify_worktree calls
+#     for a speculative item with the lane pool on (merge_liveness.py:715-731).
+#     Spied on the GitOps INSTANCE via ``_count_spec_lane_acquires``, which is
+#     not a module reach-back at all.
+#   * ``worker._verify_attempt_count`` — staged and committed INSIDE that
+#     block, and the driver of the periodic cold-verify safety valve.
 
 
 def _spy_post_merge_verify(monkeypatch, outcome=None, *, raises=None) -> list[dict]:
@@ -1215,7 +1217,6 @@ class TestRunInflightVerifyChainRedirect:
         handed to the verify.
         """
         git_ops, worker, item, chain, head = await self._fixture(git_repo)
-        _spy_warm_acquire(monkeypatch)
         posted = _spy_post_merge_verify(monkeypatch)
 
         await worker._run_inflight_verify(item, _local_lease(), chain=chain)
@@ -1226,23 +1227,31 @@ class TestRunInflightVerifyChainRedirect:
         assert posted[0]['merge_sha'] != head == item.merge_result.merge_commit
         assert posted[0]['merge_wt'] != item.merge_wt
 
-    async def test_warm_acquire_is_not_called_on_the_chain_arm(
+    async def test_warm_swap_is_bypassed_on_the_chain_arm(
         self, git_repo: Path, monkeypatch,
     ):
         """The lane already holds the tip — a second acquisition would be wrong.
 
-        It would take a DIFFERENT lane, re-check-out a different commit, and
-        could land on the serial ``_merge-verify`` lane that
+        It would take a DIFFERENT lane, re-check-out a DIFFERENT commit, and
+        could resolve to the serial ``_merge-verify`` lane that
         ``acquire_chain_build_lane`` explicitly refuses (DF-3071).
+
+        Observed through the block's real effects rather than a spy on the
+        function itself — see the note above ``_local_lease``.  This is a
+        LOCAL lease deliberately: ``lease.is_local`` is what selects the block,
+        so a remote lease would skip it for an unrelated reason and make the
+        assertion vacuous.
         """
-        _git_ops, worker, item, chain, _head = await self._fixture(git_repo)
-        warm = _spy_warm_acquire(monkeypatch)
+        git_ops, worker, item, chain, _head = await self._fixture(git_repo)
+        # Installed AFTER the build, so the chain's own single acquisition is
+        # excluded and this list counts only what the VERIFY would take.
+        lanes = _count_spec_lane_acquires(git_ops, monkeypatch)
         _spy_post_merge_verify(monkeypatch)
         before = worker._verify_attempt_count
 
         await worker._run_inflight_verify(item, _local_lease(), chain=chain)
 
-        assert warm == [], 'chain arm must bypass the warm-swap block entirely'
+        assert lanes == [], 'chain arm must not acquire a second verify lane'
         assert worker._verify_attempt_count == before, (
             'the attempt counter is staged INSIDE the warm-swap block, so a '
             'bypassed block must leave the cold-verify safety valve untouched'
@@ -1258,7 +1267,6 @@ class TestRunInflightVerifyChainRedirect:
         was asked for.
         """
         _git_ops, worker, item, chain, _head = await self._fixture(git_repo, frontier=1)
-        _spy_warm_acquire(monkeypatch)
         posted = _spy_post_merge_verify(monkeypatch)
 
         await worker._run_inflight_verify(
@@ -1282,7 +1290,6 @@ class TestRunInflightVerifyChainRedirect:
         from orchestrator.warm_lane_pool import LaneState
 
         git_ops, worker, item, chain, _head = await self._fixture(git_repo)
-        _spy_warm_acquire(monkeypatch)
         _spy_post_merge_verify(
             monkeypatch,
             outcome=_fail_verify_result() if verdict == 'fail' else None,
@@ -1311,7 +1318,6 @@ class TestRunInflightVerifyChainRedirect:
         ran rather than off the target that was requested.
         """
         _git_ops, worker, item, chain, _head = await self._fixture(git_repo)
-        _spy_warm_acquire(monkeypatch)
         _spy_post_merge_verify(
             monkeypatch, outcome=None if passed else _fail_verify_result(),
         )
@@ -1334,7 +1340,6 @@ class TestRunInflightVerifyChainRedirect:
         on repeated infra noise and silently disable deep merge-ahead.
         """
         _git_ops, worker, item, chain, _head = await self._fixture(git_repo)
-        _spy_warm_acquire(monkeypatch)
         _spy_post_merge_verify(monkeypatch, raises=RuntimeError('verify exploded'))
         noted: list[tuple] = []
         monkeypatch.setattr(
@@ -1361,7 +1366,6 @@ class TestRunInflightVerifyChainRedirect:
         ephemeral.mkdir(parents=True, exist_ok=True)
         item.merge_wt = ephemeral
         worker._register_owned_merge_worktree(ephemeral)
-        _spy_warm_acquire(monkeypatch)
         _spy_post_merge_verify(monkeypatch)
         cleaned: list[Path] = []
         monkeypatch.setattr(
@@ -1379,24 +1383,32 @@ class TestRunInflightVerifyChainRedirect:
     ):
         """Every existing caller (``chain=None``) is untouched.
 
-        Warm-swap still runs, the item's OWN merge commit is what gets
-        verified, and nothing is released as a chain lane.
+        The REAL warm-swap runs (no stub), the item's OWN merge commit is what
+        gets verified, ``chain_items`` is the default 1, nothing is released as
+        a chain lane, and ``merge_wt`` is still handed back to
+        ``_finalize_inflight`` for disposal at its chokepoint.
         """
-        _git_ops, worker, item, chain, head = await self._fixture(git_repo)
-        warm = _spy_warm_acquire(monkeypatch)
+        git_ops, worker, item, chain, head = await self._fixture(git_repo)
+        await merge_liveness.release_chain_build_lane(
+            git_ops, chain.lane, warm=chain.lane_warm,
+        )
+        lanes = _count_spec_lane_acquires(git_ops, monkeypatch)
         posted = _spy_post_merge_verify(monkeypatch)
         released = _spy_chain_lane_release(monkeypatch)
+        before = worker._verify_attempt_count
 
         res = await worker._run_inflight_verify(item, _local_lease())
 
-        assert len(warm) == 1, 'warm-swap must still run on the ordinary path'
+        assert lanes == [item.merge_result.merge_commit], (
+            'the ordinary path still routes a speculative LOCAL verify through '
+            'the warm-swap block into a _spec- lane'
+        )
+        assert worker._verify_attempt_count == before + 1
         assert posted[0]['merge_sha'] == head == item.merge_result.merge_commit
-        assert posted[0]['merge_wt'] == item.merge_wt
         assert posted[0]['chain_items'] == 1, 'default: a one-item tree'
         assert released == [], 'no chain, nothing to release'
-        assert res.merge_wt == item.merge_wt, (
-            'the ordinary pass path still hands merge_wt to _finalize_inflight'
+        assert res.merge_wt is not None and res.spec_warm is True, (
+            'the ordinary pass path still hands the verified worktree (and its '
+            'warmth) to _finalize_inflight rather than disposing of it here'
         )
-        await merge_liveness.release_chain_build_lane(
-            worker._git_ops, chain.lane, warm=chain.lane_warm,
-        )
+        await worker._release_or_cleanup(res.merge_wt, spec_warm=res.spec_warm)
