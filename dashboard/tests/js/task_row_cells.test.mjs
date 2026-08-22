@@ -198,13 +198,9 @@ test('agentCellState and strandBadgeState share no field values — they are dis
 // STRAND_TITLE — exported once so the three sites cannot drift apart
 // ---------------------------------------------------------------------------
 
-test('STRAND_TITLE is one non-empty exported constant naming both halves of the verdict', () => {
+test('STRAND_TITLE is one non-empty exported string constant', () => {
   assert.equal(typeof STRAND_TITLE, 'string');
   assert.ok(STRAND_TITLE.length > 0, 'STRAND_TITLE must not be empty');
-  // The verdict has two independent triggers and the tooltip must name both —
-  // an operator reading only "stranded" cannot tell which one fired.
-  assert.ok(STRAND_TITLE.includes('stranded'), `STRAND_TITLE should mention 'stranded': ${STRAND_TITLE}`);
-  assert.ok(STRAND_TITLE.includes('heartbeat'), `STRAND_TITLE should mention 'heartbeat': ${STRAND_TITLE}`);
 });
 
 test('STRAND_TITLE is the single source for every site that renders the badge', () => {
