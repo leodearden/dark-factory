@@ -985,10 +985,11 @@ human_decomposed, grammar_confirmed, invariants, optimistic_path,
 capability_manifest, curator_action, curator_justification, combined_at,
 gate_escalated_at, before_done_ran_at, before_done_verified_at,
 before_done_verified_pid, files_tagged_at, files_tagged_empty,
-source_finding_id, stage1_finding_id, origin_finding_id, spawned_from,
-program, program_stream, stream, cross_repo, cross_repo_project,
-human_curator_gate, human_curator_adjudicated_at, last_blocked_at,
-recurrence, execution_class
+source_finding_id, stage1_finding_id, origin_finding_id,
+related_memory_ids, spawned_from, program, program_stream, stream,
+cross_repo, cross_repo_project, human_curator_gate,
+human_curator_adjudicated_at, last_blocked_at, recurrence,
+execution_class
 ```
 <!-- /tier-a-blessed-keys-mirror -->
 
@@ -1010,17 +1011,30 @@ moved or made lazy, and it is what makes
 `x_`-namespace it, which for a submodel-backed key with live readers is the
 correct refusal. Every other key in this list is unregistered.
 
-The finding-provenance trio (`source_finding_id`, `stage1_finding_id`,
-`origin_finding_id`) is the one Tier-A family that does **not** meet the
-"already relied on by real writers" criterion stated above: it has no code
-reader and no code writer, and is a pure LLM prose convention. It was
-blessed by `esc-3796-1` (2026-08-17) on corpus-dominance grounds instead,
-because leaving the dominant spellings unblessed is what manufactures the
-census noise the scan exists to surface. The per-key census behind that
-ruling is a point-in-time measurement rather than an invariant, so it is
-transcribed in one place only — the comment beside the entries in
-`shared/src/shared/task_metadata.py` — and cited by id everywhere else. See
-Tier-B below for which spelling to use in new writes.
+The finding-provenance family — the id trio (`source_finding_id`,
+`stage1_finding_id`, `origin_finding_id`) plus `related_memory_ids` — is the
+one Tier-A family that does **not** meet the "already relied on by real
+writers" criterion stated above: it has no code reader and no code writer,
+and is a pure LLM prose convention. It was blessed by `esc-3796-1`
+(2026-08-17) on corpus-dominance grounds instead, because leaving the
+dominant spellings unblessed is what manufactures the census noise the scan
+exists to surface. The per-key census behind that ruling is a point-in-time
+measurement rather than an invariant, so it is transcribed in one place only
+— the comment beside the entries in `shared/src/shared/task_metadata.py` —
+and cited by id everywhere else. See Tier-B below for which spelling to use
+in new writes.
+
+Where the id trio names **which finding** a task was spawned from,
+`related_memory_ids` is the **memory-ids half** of that same family, naming
+the memory ids the finding cites. It carries the same qualification as the
+trio (no code reader, no code writer, blessed on corpus-dominance grounds by
+`esc-3796-1`, not on the "already relied on by real writers" criterion), and
+was canonicalized from the strongest already-existing plural spelling rather
+than minted fresh. The family is no longer writer-less in practice: the
+recon **Stage 1/2 prompts now name both canonical keys literally**
+(`fused-memory/src/fused_memory/reconciliation/prompts/`), so the prompt is
+the writer. Grepping for a *code* writer and finding none is therefore not
+evidence that these entries are dead.
 
 `cross_repo` + `cross_repo_project` are the cross-repo deliverable marker
 (§3.2.1): auto-set by the fused-memory submit path when a task's
@@ -1155,6 +1169,15 @@ describes. That is not just documented: it is pinned by
 `test_finding_provenance_near_miss_aliases_still_warn`
 (`shared/tests/test_task_metadata.py`), so blessing one of these spellings
 fails the suite instead of silently voiding this table's drift signal.
+
+**`related_memory_ids` is the canonical plural memory-ids spelling.** Any
+per-topic variant of it — `origin_memory_ids` and the other ad-hoc plural
+spellings in the corpus — is drift, and a genuinely one-off annotation
+belongs under the Tier-C `x_` namespace below rather than as a bespoke
+top-level key. (No alias row is listed for it above: this task measured
+`origin_memory_ids` and `memory_ids` only, and the table's preamble asserts
+that every alias it lists still emits `unknown_key` — a claim that cannot be
+made for spellings not measured.)
 
 **`stage1_finding_id` is not an alias.** It is a distinct canonical Tier-A
 key in its own right, naming the Stage-1 finding specifically, and is
