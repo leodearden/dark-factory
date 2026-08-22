@@ -95,6 +95,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 from _recording_event_store import _RecordingEventStore
@@ -109,6 +110,8 @@ from orchestrator.config import GitConfig, OrchestratorConfig, SandboxConfig
 from orchestrator.event_store import EventType
 from orchestrator.git_ops import GitOps
 from orchestrator.scheduler import TaskAssignment
+from orchestrator.verify import VerifyResult
+from orchestrator.workflow import WorkflowOutcome
 
 # ---------------------------------------------------------------------------
 # Fixtures — file-local, mirroring test_workflow_e2e.py:153-203 /
@@ -222,3 +225,122 @@ def _routing_events(rec: _RecordingEventStore) -> list[dict]:
     ``['data']`` for the payload fields.
     """
     return [entry for (etype, entry) in rec.events if etype == EventType.routing_decision]
+
+
+def _mock_verify_passes() -> AsyncMock:
+    """A ``run_scoped_verification`` double that always reports success.
+
+    Mirrors ``test_workflow_e2e.TestHappyPath.test_single_task_completes``'s
+    patch — every scenario in this suite that drives a full ``workflow.run()``
+    to DONE needs the VERIFY phase to pass without a real pytest/ruff/pyright
+    invocation.
+    """
+    return AsyncMock(return_value=VerifyResult(
+        passed=True, test_output='OK', lint_output='',
+        type_output='', summary='All checks passed',
+    ))
+
+
+# ---------------------------------------------------------------------------
+# Boundary scenarios 1, 2 — metadata.model_overrides at the real seam
+# (plan step-1).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestOverrideWinsAtTheSeam:
+    """PRD boundary scenario 1: a per-role ``metadata.model_overrides`` entry
+    outranks the static per-role config layer, and the winning model actually
+    reaches the CLI seam (not just ``resolve_route``'s return value) — while a
+    non-overridden role in the same dispatch is untouched (per-role, not
+    global)."""
+
+    async def test_override_reaches_seam_and_is_per_role(
+        self, config, git_ops, task_assignment, monkeypatch,
+    ):
+        # config.models.implementer is 'sonnet' at stock config (defaults.yaml)
+        # -- distinct from the 'haiku' override below, so the layers genuinely
+        # disagree and only a real seam proof can show which one actually won.
+        assert config.models.implementer != 'haiku'
+        task_assignment.task['metadata']['model_overrides'] = {'implementer': 'haiku'}
+
+        stub = _RoutingRecorderStub()
+        workflow, _scheduler = _build_workflow(config, git_ops, task_assignment, stub)
+        rec = _RecordingEventStore()
+        workflow.event_store = rec
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification', _mock_verify_passes(),
+        )
+
+        outcome = (await workflow.run()).outcome
+
+        # (a) the override reached the CLI seam, not just the resolver.
+        assert stub.route_by_role['implementer']['model'] == 'haiku'
+
+        # (b) the implementer's routing_decision event names the override
+        # layer and carries no rejection.
+        impl_events = [e for e in _routing_events(rec) if e['data']['role'] == 'implementer']
+        assert impl_events, f'expected an implementer routing_decision event: {rec.events!r}'
+        assert impl_events[-1]['data']['source_layer'] == 'metadata_override'
+        assert impl_events[-1]['data']['rejected'] == []
+
+        # (c) a NON-overridden role in the same dispatch still resolves at the
+        # config layer -- proving the override is per-role, not global.
+        assert stub.route_by_role['architect']['model'] == config.models.architect
+        arch_events = [e for e in _routing_events(rec) if e['data']['role'] == 'architect']
+        assert arch_events, f'expected an architect routing_decision event: {rec.events!r}'
+        assert arch_events[-1]['data']['source_layer'] == 'config'
+
+        # (d) the dispatch reaches DONE.
+        assert outcome == WorkflowOutcome.DONE
+
+
+@pytest.mark.asyncio
+class TestInvalidOverrideFallsThroughFailSafe:
+    """PRD boundary scenario 2: a ``model_overrides`` entry that fails
+    allowlist validation is REJECTED, resolution falls through to the next
+    layer, and the dispatch is never blocked by the mis-config (invariant 2)."""
+
+    async def test_invalid_override_falls_through_to_config_layer(
+        self, config, git_ops, task_assignment, monkeypatch,
+    ):
+        assert 'gpt-9' not in config.routing.allowed_models
+        task_assignment.task['metadata']['model_overrides'] = {'implementer': 'gpt-9'}
+
+        stub = _RoutingRecorderStub()
+        workflow, _scheduler = _build_workflow(config, git_ops, task_assignment, stub)
+        rec = _RecordingEventStore()
+        workflow.event_store = rec
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification', _mock_verify_passes(),
+        )
+
+        outcome = (await workflow.run()).outcome
+
+        # (a) the seam saw the fallen-through config-layer model, NOT 'gpt-9'.
+        assert stub.route_by_role['implementer']['model'] == config.models.implementer
+        assert stub.route_by_role['implementer']['model'] != 'gpt-9'
+
+        # (b) the implementer event records the exact rejection reason and the
+        # layer resolution actually fell through to.
+        impl_events = [e for e in _routing_events(rec) if e['data']['role'] == 'implementer']
+        assert impl_events, f'expected an implementer routing_decision event: {rec.events!r}'
+        assert impl_events[-1]['data']['rejected'] == ['metadata_override:model-not-in-allowlist']
+        assert impl_events[-1]['data']['source_layer'] == 'config'
+
+        # (c) invariant 2: a routing mis-config never blocks a dispatch.
+        assert outcome == WorkflowOutcome.DONE
+
+        # (d) the rejection is mirrored onto task metadata. `routing.latest`
+        # reflects whichever role's _record_routing_decision ran LAST in this
+        # dispatch -- EVERY invocation overwrites it (workflow.py:12718) -- so
+        # by the time run() reaches DONE it holds a later role's (e.g.
+        # reviewer/merger) clean decision, not implementer's. `history` is the
+        # durable per-invocation record (bounded at 5, well above this
+        # dispatch's invocation count), so scan it for implementer's own entry.
+        history = workflow.task['metadata']['routing']['history']
+        impl_history = [h for h in history if h['role'] == 'implementer']
+        assert impl_history, f'expected an implementer entry in routing history: {history!r}'
+        assert impl_history[-1]['rejected'] == ['metadata_override:model-not-in-allowlist']
