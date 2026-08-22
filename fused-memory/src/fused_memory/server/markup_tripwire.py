@@ -49,6 +49,7 @@ a recurrence against its successor ``plans/toolcall-markup-containment-prd.md``.
 
 from __future__ import annotations
 
+import ast
 import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -141,10 +142,42 @@ _CATEGORY: str = 'mcp_markup_write_storm'
 # (``_ESCALATION_CATEGORY`` = 'mcp_markup_residue', ``_ESCALATION_OWNER`` =
 # 'l2-escalation-watcher', ``_ESCALATION_LEVEL`` = 2), read off the record rather
 # than re-authored here; these are fallbacks for a record that omits them.
+# The detail's outcome line, spelled ONCE: `emit_markup_storm_escalation`
+# writes it and `_recorded_outcome` reads it back off an already-open record to
+# tell an operator when a burst folded into a record naming a different
+# outcome. Two spellings would make that comparison silently always-differ.
+_DETAIL_OUTCOME_KEY: str = 'outcome='
+
 _RESIDUE_ANCHOR_TASK_ID: str = 'markup-residue'
 _RESIDUE_AGENT_ROLE: str = 'fused-memory/markup-guard'
 _RESIDUE_CATEGORY: str = 'mcp_markup_residue'
 _RESIDUE_LEVEL: int = 2
+
+
+def _recorded_outcome(escalation: Any) -> str | None:
+    """The outcome an ALREADY-OPEN storm record was filed with, or ``None``.
+
+    Read back off that record's own ``outcome=`` detail line — the very line
+    :func:`emit_markup_storm_escalation` writes — because the anchor dedup is
+    outcome-AGNOSTIC and an operator has to be told when a burst folded into a
+    record that names a different outcome.
+
+    ``None`` for a record that names none, which covers both a degenerate storm
+    and a record filed by another producer squatting the shared anchor. NEVER
+    raises: it feeds a log line on a path whose only job is to return an id.
+    """
+    detail = getattr(escalation, 'detail', None)
+    if not isinstance(detail, str):
+        return None
+    for line in detail.splitlines():
+        if not line.startswith(_DETAIL_OUTCOME_KEY):
+            continue
+        try:
+            value = ast.literal_eval(line[len(_DETAIL_OUTCOME_KEY):].strip())
+        except (ValueError, SyntaxError):
+            return None
+        return value if isinstance(value, str) and value else None
+    return None
 
 
 def emit_markup_storm_escalation(
@@ -218,6 +251,20 @@ def emit_markup_storm_escalation(
     leak running for hours would otherwise file one escalation per window, so
     those collapse into the single open record until an operator resolves it.
 
+    That dedup is deliberately outcome-AGNOSTIC — one open record per running
+    leak, not one per outcome — so a later burst of a DIFFERENT outcome folds
+    into a record naming the FIRST outcome observed. Left implicit that is the
+    outcome-fidelity defect above wearing a second hat: the surviving record
+    would name an outcome while a more serious burst (``unrepairable`` loses
+    caller data) went unnamed. Two things keep it honest instead. The record
+    SAYS the outcome and count are the first burst's rather than a running
+    total, and a fold whose outcome DIFFERS is logged here at ERROR carrying
+    the ``markup_guard_storm`` token the record's own remedy tells the triager
+    to grep — so the burst the queue does not name is still findable beside the
+    guard's own per-burst line. Do not make the summary's outcome sound like a
+    running tally, and do not downgrade that ERROR: the queue is not the only
+    channel precisely because it holds one record.
+
     *anchor_task_id* selects WHICH anchor that dedup keys on, and is threaded
     through both the lookup and the filing so a caller can never file under one
     anchor while deduping against another. It exists because the default anchor
@@ -255,6 +302,19 @@ def emit_markup_storm_escalation(
         )
         return None
 
+    count = storm.get('count')
+    window_seconds = storm.get('window_seconds')
+    # isinstance-guarded rather than truthy-cast, for the reason the middleware
+    # guards its own identity fields: a caller that sent a non-string has not
+    # named an outcome, and str(None) would put the literal 'None' into an
+    # operator-facing sentence as though it had been measured.
+    #
+    # Resolved BEFORE the dedup check, not beside the detail it feeds: the
+    # suppression path below has to name the outcome of the burst it is
+    # dropping, and cannot do that from a variable bound after it returns.
+    outcome = storm.get('outcome')
+    outcome = outcome if isinstance(outcome, str) and outcome else None
+
     # Best-effort dedup: a read failure falls THROUGH to filing rather than
     # bailing out — losing duplicate-suppression is strictly better than losing
     # the alarm for an actively running leak.
@@ -268,21 +328,38 @@ def emit_markup_storm_escalation(
         )
         existing = []
     if existing:
-        logger.info(
-            'markup_tripwire: %s already open for project_root=%r (storm %r now); '
-            'not filing a duplicate',
-            existing[0].id, project_root, storm,
-        )
+        open_outcome = _recorded_outcome(existing[0])
+        if open_outcome == outcome:
+            logger.info(
+                'markup_tripwire: %s already open for project_root=%r (storm %r now); '
+                'not filing a duplicate',
+                existing[0].id, project_root, storm,
+            )
+        else:
+            # ERROR, not info: the queue is about to say nothing at all about
+            # THIS outcome (see the docstring's dedup paragraph), so this line
+            # is the operator's only record of it beyond the guard's own
+            # per-burst line — and it carries the same 'markup_guard_storm'
+            # token, so one grep finds the folded burst next to the named one.
+            logger.error(
+                'markup_tripwire: markup_guard_storm SUPPRESSED — %s is already open '
+                'for project_root=%r naming outcome=%r, so this %r burst of %r '
+                'write(s) in %rs gets no record of its own; resolve that escalation '
+                'to let the next burst file. storm=%r',
+                existing[0].id, project_root, open_outcome, outcome, count,
+                window_seconds, storm,
+            )
         return existing[0].id
-
-    count = storm.get('count')
-    window_seconds = storm.get('window_seconds')
-    # isinstance-guarded rather than truthy-cast, for the reason the middleware
-    # guards its own identity fields: a caller that sent a non-string has not
-    # named an outcome, and str(None) would put the literal 'None' into an
-    # operator-facing sentence as though it had been measured.
-    outcome = storm.get('outcome')
-    outcome = outcome if isinstance(outcome, str) and outcome else None
+    # Conditional, because the sentence it feeds points AT the outcome line:
+    # with no outcome measured that line reads `outcome=None`, and telling the
+    # triager it "names what the guard did" points them at a value that names
+    # nothing — the same claim-you-cannot-reproduce defect, one field over.
+    outcome_sentence = (
+        'the outcome line above names what the guard did with them'
+        if outcome else
+        'no outcome was recorded with this burst, so the outcome line above '
+        "names none — the guard's own per-call log lines name it"
+    )
     detail = '\n'.join([
         f'project_root={project_root!r}',
         # The producer keys one StormCounter per (project, outcome) pair
@@ -295,7 +372,7 @@ def emit_markup_storm_escalation(
         # project_root", both left over from the per-SERVER MarkupStormCounter
         # task 4458 retired. That pooling is what filed esc-markup-tripwire-6
         # into reify's queue stating 3, for a window reify contributed 1 to.
-        f'outcome={outcome!r}',
+        f'{_DETAIL_OUTCOME_KEY}{outcome!r}',
         # The key is outcome-NEUTRAL and STATIC. Neutral because this filer
         # serves all three of the middleware's outcomes and a key naming one of
         # them contradicts its own content on the other two; static — never
@@ -307,10 +384,23 @@ def emit_markup_storm_escalation(
         '',
         'The fused-memory MCP write guard (tasks 3141, 4458) flagged multiple '
         'writes carrying raw MCP envelope markup within one rolling window; '
-        'the outcome above states what it did with them. A '
+        f'{outcome_sentence}. A '
         'burst means the upstream harness serialization leak is ACTIVE right '
         'now, not that the guard is misfiring — do NOT disable it, or '
         'further specimens will land permanently in the corpus.',
+        '',
+        # The dedup that keeps this to ONE open record is outcome-agnostic, so
+        # the record has to say so itself: an operator reading it must not take
+        # the outcome and count for a running tally of everything since. The
+        # folded bursts are not lost — each is logged as its own
+        # markup_guard_storm ERROR line, and a fold naming a DIFFERENT outcome
+        # is logged again by this filer when it suppresses it.
+        'This is the ONE open record for this project until an operator '
+        'resolves it: later bursts fold into it and file nothing of their own, '
+        'so the outcome and the count above describe the FIRST burst observed '
+        'and are not a running total. Every burst, folded or not, is logged by '
+        "the guard as its own 'markup_guard_storm' line — that is where a "
+        'later burst with a different outcome is visible.',
         '',
         'DF task 3083 delivered the root cause and the Qdrant payload '
         'text-match read tool, but it is DONE and CLOSED to appends — nothing '
@@ -338,9 +428,10 @@ def emit_markup_storm_escalation(
             # to answer how many, of what, and for whom on its own.
             summary=(
                 f'{count} MCP write(s) {outcome or "flagged"} for leaked '
-                f'envelope markup in this project in {window_seconds}s — '
-                'serialization leak active '
-                '(see plans/toolcall-markup-containment-prd.md)'
+                f'envelope markup in this project in {window_seconds}s '
+                '(the FIRST burst observed; later bursts of any outcome fold '
+                'into this record until it is resolved) — serialization leak '
+                'active (see plans/toolcall-markup-containment-prd.md)'
             ),
             detail=detail,
             # Compact-projected BESIDE the summary (escalation/server.py:409-414
