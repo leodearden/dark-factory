@@ -85,6 +85,14 @@ def min_budget(worst: float) -> int:
     ``MIN_MODULE_BUDGET_SECS`` must be ``min_budget(MEASURED_SUITE_WORST_SECS)``
     — not a re-spelling that happens to agree, and not a literal.
 
+    ORIGIN: the expression is task 3458's, written for
+    ``test_scripts_module_config.MIN_MODULE_BUDGET_SECS``. The copies this
+    module replaced each recorded that they reused it "verbatim so the guards
+    cannot silently drift in SHAPE" — the right goal, pursued by the one method
+    that cannot achieve it, since verbatim reuse by copying is exactly what
+    nothing can verify stayed verbatim. The goal is unchanged; it is now met by
+    there being one expression rather than three agreeing ones.
+
     DERIVED FROM THE MEASUREMENT RATHER THAN HAND-SET BESIDE IT, because that
     exact pair has already rotted once undetected. ``test_tests_scripts_module_
     config.py`` held a HAND-SET ``MIN_MODULE_BUDGET_SECS = 300`` against a

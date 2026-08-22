@@ -73,6 +73,17 @@ def root_config(monkeypatch: pytest.MonkeyPatch) -> OrchestratorConfig:
     the de-triplication as a follow-up because conftest.py was outside task
     3703's locked scope. That follow-up is task 4320 and it landed here.
 
+    THE SAME DEFECT HAD ALREADY BEEN FIXED ONCE AT A NARROWER SCOPE, and that
+    lineage is kept because it is the argument for fixing it at THIS scope. The
+    deleted ``test_scripts_module_config.py`` copy carried the note that "task
+    3458's amendment pass extracted this from three near-identical copies —
+    see git history for the pre-extraction shape": three copies WITHIN that one
+    file. Collapsing them there was right and did not generalise, so the
+    triplication simply reappeared one level up, as one copy per file, and
+    survived two further tasks that each touched the family. A convention that
+    has to be re-applied by hand at every scope is not a mechanism; a
+    directory-wide fixture is where this one stops recurring.
+
     A FIXTURE IS STRUCTURALLY STRONGER THAN A CALLED HELPER, not merely tidier.
     Two guards in this directory turn on ORDER — they build the anchored config
     FIRST and poison ``ORCH_CONFIG_PATH`` SECOND, to show the config was read

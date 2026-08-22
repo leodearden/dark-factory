@@ -23,12 +23,51 @@ test_tests_scripts_module_carries_its_own_tight_verify_budget`` (task 3350).
 Their scalar ``MEASURED_SUITE_WORST_SECS`` / ``MIN_MODULE_BUDGET_SECS`` pair is
 promoted here to per-module tables and the single test to a parametrization.
 
-HELPERS ARE COPIED, NOT IMPORTED, deliberately. A test file importing a sibling
-test file couples two guards that must be able to fail independently, and
-``_root_config`` in particular carries a load-bearing ``ORCH_CONFIG_PATH``
+CORRECTED IN PLACE (task 4320), never silently rewritten. This header used to
+read: "HELPERS ARE COPIED, NOT IMPORTED, deliberately. A test file importing a
+sibling test file couples two guards that must be able to fail independently,
+and ``_root_config`` in particular carries a load-bearing ``ORCH_CONFIG_PATH``
 anchor whose absence silently collapses every config value to pydantic
 defaults — it must be visibly present in the file that depends on it rather
-than inherited from a neighbour.
+than inherited from a neighbour."
+
+BOTH HALVES OF THAT ARE NOW FALSE, and they were false in different ways.
+
+The FIRST half over-generalised a sound argument. What the argument actually
+supports is narrower: a test file must not import a SIBLING TEST FILE, because
+that couples two guards which have to be able to fail independently and lets a
+regression in one silence the other. It does not reach a shared NON-TEST
+module, and it never reached ``conftest.py`` — pytest's idiomatic home for
+exactly this. Generalised to "helpers are copied", it licensed the triplication
+task 4320 removed: three verbatim ``_root_config`` helpers and three spellings
+of one budget derivation, none of which any mechanism could see drift between.
+This file now imports ``min_budget``, ``FAMILY_PUBLISHER_PATHS`` and
+``published_pairs`` from ``module_budget_family`` — a non-test sibling, on the
+``setup_host_sections`` / ``systemd_unit_invariants`` precedent already
+established in this directory — and every guard in the family still fails
+entirely on its own.
+
+The SECOND half named the wrong remedy for a real hazard. The
+``ORCH_CONFIG_PATH`` anchor IS load-bearing exactly as described, and its
+absence does silently collapse every config value to the pydantic defaults. But
+VISIBILITY was never what enforced it — three copies is three places for the
+anchor to be dropped from, and one of them had already been drafted without it.
+It now lives once, as the ``root_config`` fixture in ``tests/scripts/
+conftest.py``, where it is stronger than a copied helper in two ways: fixture
+setup runs BEFORE the test body, so the anchor-then-poison ordering two guards
+in this family depend on is structural rather than a comment; and
+``test_root_config_fixture_anchors_this_worktrees_own_yaml`` below pins the
+behaviour the move had to preserve, which no copy ever did.
+
+READING A SIBLING IS NOT IMPORTING IT, and this file now does the former on
+purpose. ``published_pairs`` ``ast``-parses each publisher's SOURCE rather than
+importing it, because importing would hand back only the already-evaluated
+``MIN_MODULE_BUDGET_SECS`` int — which is precisely what cannot tell a
+derivation from a literal that happens to agree with it today. So the
+"GENERALISED FROM, not imported from" framing above still holds literally, and
+is now also load-bearing in a second sense: no publisher is imported, no
+publisher imports this file, and the coupling runs only through source text
+this guard reads and can report on by name.
 
 PLACEMENT. ``tests/scripts/`` rather than a per-module ``tests/`` dir, and NOT
 appended to ``test_fallback_verify_config.py``. That file is listed in task
