@@ -51,6 +51,7 @@ import subprocess
 import threading
 import time
 import uuid
+from collections import Counter
 from collections.abc import (
     AsyncIterator,
     Awaitable,
@@ -9514,7 +9515,7 @@ class GitOps:
             # every other git failure here — None routes to `diff_failed` and
             # present=False.  Without this the exception escapes through
             # commit_effect_present_in_main and validate_landing_evidence
-            # into the dispatch gate.  :meth:`_main_line_set` guards the
+            # into the dispatch gate.  :meth:`_main_line_counts` guards the
             # identical call for the identical reason.
             return None
         if rc != 0:
@@ -9559,6 +9560,100 @@ class GitOps:
                 if body:
                     removed.append(body)
         return added, removed
+
+    async def _batch_added_line_counts(
+        self, base_sha: str, anchor_sha: str, paths: list[str],
+    ) -> dict[str, int] | None:
+        """Added-line counts for *paths* in TWO subprocesses instead of N.
+
+        Only ever called for the paths that did NOT diverge from main
+        (amendment pass, review finding).  Those paths need nothing but their
+        added-line COUNT: their survival ratio is 1.0 by construction, and the
+        vacuous arm cannot fail for them either — ``diff --name-only <anchor>
+        <main>`` reporting nothing means the trees agree at that path, so
+        either it is absent on both sides (the anchor's deletion still holds)
+        or the blob oids match, and :meth:`_vacuous_path_survives` returns
+        True on both of those branches without consulting a line at all.
+        Issuing the per-path ``git diff`` for them anyway cost ~5 subprocesses
+        each (1 diff, plus 4 existence/oid reads for a vacuous one) on what
+        the docstrings above correctly call the COMMON path, re-run for every
+        landing candidate on every 15s dispatch tick.  A clean landing that
+        touches 200 files with 3 diverged paid ~985 of them for nothing.
+
+        NOT ``--numstat``, which would be one call rather than two: numstat
+        counts BLANK added lines, which :meth:`_anchor_diff_lines` drops.  A
+        fully-surviving path contributes ``(n, n)`` to the aggregate, so
+        inflating ``n`` pulls the ratio toward 1.0 — a calibration shift in
+        the false-ACCEPT direction, against thresholds measured under the
+        non-blank rule.  This reads the same ``--unified=0`` patch the
+        per-path path reads, with the same hunk-state classifier, so the
+        counts are IDENTICAL by construction rather than approximately equal.
+
+        Attribution is by ORDER, never by name: file blocks come back in the
+        same order as ``--name-only -z``'s authoritative path list, so no
+        pathname is ever parsed out of patch text — the desync hazard
+        :meth:`_anchor_diff_lines` avoids by scoping one diff per path is
+        avoided here by not reading names at all.
+
+        Returns None — meaning "fall back to the per-path reads" — on any git
+        failure, on a non-UTF-8 patch, on a block/path count mismatch, or when
+        the returned path set differs from the requested one.  That last guard
+        matters: restricting the pathspec to the whole clean set can let git
+        pair a rename it could not see per-path, collapsing two requested
+        paths into one block.  Every one of these is a fall-back to the slower
+        but definitive path, never a fabricated count.
+        """
+        rc, order_out, _ = await _run(
+            [
+                'git', '-c', 'core.quotePath=false',
+                'diff', '--name-only', '-z', base_sha, anchor_sha, '--', *paths,
+            ],
+            cwd=self.project_root,
+        )
+        if rc != 0:
+            return None
+        ordered = [f for f in order_out.split('\0') if f]
+        if set(ordered) != set(paths) or len(ordered) != len(paths):
+            return None
+        try:
+            rc, patch_out, _ = await _run(
+                [
+                    'git', '-c', 'core.quotePath=false',
+                    'diff', '--unified=0', base_sha, anchor_sha, '--', *paths,
+                ],
+                cwd=self.project_root,
+            )
+        except UnicodeDecodeError:
+            return None
+        if rc != 0:
+            return None
+        counts: list[int] = []
+        added = 0
+        in_hunk = False
+        started = False
+        for line in patch_out.split('\n'):
+            if line.startswith('diff --git '):
+                # A new file block: bank the previous one and re-arm.  Under
+                # `--unified=0` every in-hunk content line carries a '+'/'-'
+                # column, so this prefix at column 0 is unambiguously a header.
+                if started:
+                    counts.append(added)
+                started, added, in_hunk = True, 0, False
+                continue
+            if not started:
+                continue
+            if line.startswith('@@'):
+                in_hunk = True
+                continue
+            if not in_hunk or not line:
+                continue
+            if line.startswith('+') and line[1:].strip():
+                added += 1
+        if started:
+            counts.append(added)
+        if len(counts) != len(ordered):
+            return None
+        return dict(zip(ordered, counts, strict=True))
 
     async def _path_exists_at(self, rev: str, path: str) -> bool:
         """True iff *path* resolves to a blob at *rev*."""
@@ -9620,21 +9715,59 @@ class GitOps:
         if anchor_oid is not None and anchor_oid == main_oid:
             return True
         if removed:
-            main_lines = await self._main_line_set(path, main_sha)
+            main_lines = await self._main_line_counts(path, main_sha)
             if main_lines is None:
                 return False
             return not any(line in main_lines for line in removed)
         # Content differs with nothing measurable (e.g. a clobbered binary).
         return False
 
-    async def _main_line_set(self, path: str, main_sha: str) -> set[str] | None:
-        """Return the set of stripped, non-blank lines of *path* at *main_sha*.
+    async def _main_line_counts(
+        self, path: str, main_sha: str,
+    ) -> Counter[str] | None:
+        """Return the MULTISET of stripped, non-blank lines of *path* at *main_sha*.
+
+        A ``Counter``, not a ``set``, and the difference runs in the
+        false-ACCEPT direction — the one direction this check must never take
+        (amendment pass, review finding).  Survival is counted as a multiset
+        intersection (``min(added_count, main_count)`` per distinct line), so
+        a line the anchor added N times can contribute at most as many
+        survivors as main actually still carries.  Under set membership a
+        deliverable that adds a repeated boilerplate line — a manifest entry,
+        a duplicated import block, N copies of ``return None`` — scored ALL N
+        of them as surviving whenever main retained even ONE, and could clear
+        the 0.98 aggregate while genuinely reverted.  The same coincidence
+        hazard is already documented on the removed-line side in
+        :meth:`_vacuous_path_survives` ("18 of its 45 removed lines present
+        again at main by short-common-line coincidence"); this is its
+        added-line twin.
+
+        Residual (accepted, and monotone in the SAFE direction): a line can
+        still be counted as surviving when main's copies of it live somewhere
+        unrelated in the same file rather than where the anchor put them.
+        Closing that needs positional matching, which re-introduces the
+        re-indentation false positive :meth:`_anchor_diff_lines` deliberately
+        removed.  Multiset counting can only ever LOWER a ratio relative to
+        set membership, so every acceptance anchor that passed the recorded
+        measurement still passes.
 
         None means the blob could not be read as text — the path is absent at
         main, or its content is not decodable (a binary blob would raise
         ``UnicodeDecodeError`` inside :func:`_run`'s ``.decode()``).  Callers
         treat None as "nothing survives here", which is the fail-safe
         direction: never claim an effect is present on doubt.
+
+        KNOWN GAP — a rename performed by MAIN after the landing.  This reads
+        *path* at ``main_sha`` under its ORIGINAL name, so if a later commit
+        on main simply MOVED the deliverable, ``git show`` fails, None comes
+        back, and every one of that path's added lines counts as lost even
+        though all of them sit at main under the new name.  That is a
+        false-POSITIVE (a spurious reject), i.e. the fail-safe direction, and
+        it is pinned by
+        ``test_main_renaming_the_deliverable_after_landing_reads_as_absent``.
+        Closing it would mean resolving the path through
+        ``git diff --name-status -M`` before the read, which loosens the
+        predicate and so needs its own corpus re-measurement.
         """
         try:
             rc, content, _ = await _run(
@@ -9645,7 +9778,9 @@ class GitOps:
             return None
         if rc != 0:
             return None
-        return {stripped for line in content.split('\n') if (stripped := line.strip())}
+        return Counter(
+            stripped for line in content.split('\n') if (stripped := line.strip())
+        )
 
     async def _compare_touched_paths_to_main(
         self, anchor_sha: str, touched: list[str], base_sha: str, main_sha: str,
@@ -9666,12 +9801,17 @@ class GitOps:
            both reported instances) but it no longer decides anything, so
            ``diverged_paths`` is now populated on ``present=True`` verdicts
            too.  It also does real work here: a path that did NOT diverge is
-           byte-identical at main, so its survival is exactly 1.0 and needs no
-           blob read at all.
+           byte-identical at main, so its survival is exactly 1.0, it cannot
+           fail the vacuous arm either, and the whole clean set is costed in
+           ONE batched read (:meth:`_batch_added_line_counts`) rather than ~5
+           subprocesses per path.
 
-        2. **Per-path added lines and their survival** — for each touched path
-           the lines the anchor added since *base_sha*, and what fraction of
-           them are still members of main's line-set for that path.
+        2. **Per-path added lines and their survival** — for each DIVERGED
+           path the lines the anchor added since *base_sha*, and how many of
+           them main's copy of that path still carries.  Counted as a MULTISET
+           intersection (:meth:`_main_line_counts`), so N copies of a repeated
+           boilerplate line cannot all score as surviving because main kept
+           one.
 
         3. **The verdict** — aggregate survival at or above
            ``_EFFECT_SURVIVAL_AGGREGATE_THRESHOLD``, AND every path carrying
@@ -9729,51 +9869,81 @@ class GitOps:
         worst_guarded_survival: float | None = None
         guard_failed = False
 
+        # Paths that did NOT diverge need only their added-line count, so they
+        # are read in ONE batch rather than ~5 subprocesses each; None means
+        # the batch could not be trusted and every path falls back below.
+        clean_paths = [p for p in touched if p not in diverged_set]
+        clean_counts: dict[str, int] = {}
+        if clean_paths:
+            clean_counts = await self._batch_added_line_counts(
+                base_sha, anchor_sha, clean_paths,
+            ) or {}
+
         vacuous_seen: list[str] = []
         for path in touched:
-            diff_lines = await self._anchor_diff_lines(base_sha, anchor_sha, path)
-            if diff_lines is None:
-                return CommitEffectProbe(
-                    present=False,
-                    diverged_paths=diverged,
-                    anchor_sha=anchor_sha,
-                    failure='diff_failed',
-                    **thresholds,
-                )
-            added, removed = diff_lines
-            if not added:
-                # Zero added lines: an added-lines test is trivially true
-                # here, so this path is decided by its own shape's arm (b3).
-                vacuous_seen.append(path)
-                if not await self._vacuous_path_survives(
-                    anchor_sha, path, removed, main_sha,
-                ):
-                    # Short-circuit naming the OFFENDER.  This runs before the
-                    # aggregate is known on purpose, but it can only ever add
-                    # a rejection: a failed vacuous path is decisive on its
-                    # own, and the text arm below cannot rescue it.
+            fast_added = clean_counts.get(path)
+            if fast_added is not None:
+                # Byte-identical at main (or absent on both sides): survival is
+                # 1.0 by construction and the vacuous arm cannot fail — see
+                # :meth:`_batch_added_line_counts` for the proof — so this path
+                # needs no blob read and no existence probe at all.
+                if fast_added == 0:
+                    vacuous_seen.append(path)
+                    continue
+                added_count = survived = fast_added
+            else:
+                diff_lines = await self._anchor_diff_lines(base_sha, anchor_sha, path)
+                if diff_lines is None:
                     return CommitEffectProbe(
                         present=False,
                         diverged_paths=diverged,
                         anchor_sha=anchor_sha,
-                        failure='vacuous_effect_absent',
-                        vacuous_paths=(path,),
+                        failure='diff_failed',
                         **thresholds,
                     )
-                continue
-            if path in diverged_set:
-                main_lines = await self._main_line_set(path, main_sha)
-                survived = (
-                    0 if main_lines is None
-                    else sum(1 for line in added if line in main_lines)
-                )
-            else:
-                # Byte-identical at main: every added line is still there.
-                survived = len(added)
-            total_added += len(added)
+                added, removed = diff_lines
+                if not added:
+                    # Zero added lines: an added-lines test is trivially true
+                    # here, so this path is decided by its own shape's arm (b3).
+                    vacuous_seen.append(path)
+                    if not await self._vacuous_path_survives(
+                        anchor_sha, path, removed, main_sha,
+                    ):
+                        # Short-circuit naming the OFFENDER.  This runs before
+                        # the aggregate is known on purpose, but it can only
+                        # ever add a rejection: a failed vacuous path is
+                        # decisive on its own, and the text arm below cannot
+                        # rescue it.
+                        return CommitEffectProbe(
+                            present=False,
+                            diverged_paths=diverged,
+                            anchor_sha=anchor_sha,
+                            failure='vacuous_effect_absent',
+                            vacuous_paths=(path,),
+                            **thresholds,
+                        )
+                    continue
+                added_count = len(added)
+                if path in diverged_set:
+                    main_counts = await self._main_line_counts(path, main_sha)
+                    if main_counts is None:
+                        survived = 0
+                    else:
+                        # MULTISET intersection, not set membership: a line the
+                        # anchor added N times may contribute at most as many
+                        # survivors as main actually still carries.
+                        added_counts = Counter(added)
+                        survived = sum(
+                            min(n, main_counts[line])
+                            for line, n in added_counts.items()
+                        )
+                else:
+                    # Byte-identical at main: every added line is still there.
+                    survived = added_count
+            total_added += added_count
             total_survived += survived
-            ratio = survived / len(added)
-            if len(added) >= _EFFECT_SURVIVAL_PER_FILE_MIN_ADDED_LINES:
+            ratio = survived / added_count
+            if added_count >= _EFFECT_SURVIVAL_PER_FILE_MIN_ADDED_LINES:
                 if worst_guarded_survival is None or ratio < worst_guarded_survival:
                     worst_guarded_survival = ratio
                     worst_guarded_path = path
@@ -9921,8 +10091,13 @@ class GitOps:
         every added line in place and reads as PRESENT.
 
         What remains is a genuinely narrower tail: a heavy REWRITE that
-        replaces most of the branch's added lines, or a revert paired
-        with unrelated additions in the same files, can still land inside
+        replaces most of the branch's added lines, a revert paired with
+        unrelated additions in the same files, or a later commit on main
+        that RENAMES the deliverable's file (survival is read per path
+        under the anchor's own name, so a pure move reads as a total
+        loss — see :meth:`_main_line_counts`'s KNOWN GAP and
+        ``test_main_renaming_the_deliverable_after_landing_reads_as_absent``)
+        can still land inside
         the residual band the threshold cannot separate from a real
         revert.  The full corpus puts that tail at roughly 60% of
         currently-rejected merges still rejected — much smaller than

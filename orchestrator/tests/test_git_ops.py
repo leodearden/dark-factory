@@ -5241,40 +5241,129 @@ class TestCommitEffectSurvival:
             == _EFFECT_SURVIVAL_PER_FILE_MIN_ADDED_LINES
         )
 
-    async def test_threshold_constants_match_the_full_corpus_measurement(
-        self,
+    async def test_repeated_added_lines_survive_only_as_often_as_main_kept_them(
+        self, git_ops: GitOps, git_repo: Path,
     ) -> None:
-        """REGRESSION PIN on the constants, so a silent retune is caught.
+        """Survival is a MULTISET intersection, not set membership.
 
-        These are not guessed.  They come from the full-corpus sweep recorded
-        in task 3116 ``metadata.x_effect_survival_measurement`` (2827 merges,
-        2822 usable, measured at main 5bd7fd8489).  Residual still-absent
-        among the 2680 currently-rejected merges:
+        Every other fixture here uses ``_numbered``, whose lines are unique by
+        construction — which is exactly why set membership looked correct.
+        Real deliverables are not unique: a manifest gains 40 near-identical
+        entries, a module gains 40 ``return None`` guards, a config gains a
+        repeated import block.  Under set membership main retaining ONE copy
+        scored ALL 40 as surviving, so a reverted deliverable cleared the 0.98
+        aggregate.  That is a false ACCEPT, the one direction this check must
+        never take.
 
-            aggregate      1.00 75.3% | 0.99 66.0% | 0.98 59.3%
-                           0.95 45.9% | 0.90 34.7% | 0.50 12.0%
-            per-file-min   1.00 75.3% | 0.99 73.2% | 0.98 70.2%
-                           0.95 62.8% | 0.90 55.0% | 0.50 26.7%
-
-        Aggregate strictly dominates per-file-minimum at every threshold, so
-        aggregate is the primary unit and per-file-min is disqualified as a
-        standalone one.  Each constant is then the TIGHTEST — most
-        revert-catching — swept value that still satisfies all three
-        acceptance anchors:
-
-          0.98  task 3640's aggregate is 0.9848, so 0.99 and 1.00 reject an
-                anchor; 0.98 is the tightest that passes.
-          0.90  task 3717's worst guarded file is 0.9939 (1322 adds), so 0.90
-                clears with margin and is the tightest swept value.
-          25    task 3640's SKILL.md carries 23 added lines, so floors of 0
-                and 10 reject an anchor; 25 is the SMALLEST floor that passes.
-
-        Net effect: 1050 of 2680 currently-rejected merges recovered (39.2%),
-        with 0 of the 111 near-total-revert tail (aggregate < 0.05) accepted.
+        Here the anchor adds 40 identical lines and a later commit on main
+        keeps exactly one of them.  Correct survival is 1/40 = 0.025.
         """
-        assert _EFFECT_SURVIVAL_AGGREGATE_THRESHOLD == 0.98
-        assert _EFFECT_SURVIVAL_PER_FILE_THRESHOLD == 0.90
-        assert _EFFECT_SURVIVAL_PER_FILE_MIN_ADDED_LINES == 25
+        await _seed_on_main(git_repo, {'manifest.txt': 'seed\n'}, 'seed manifest')
+        repeated = 'entry = shared\n' * 40
+        merge_sha = await _land_branch(
+            git_repo, '9101', {'manifest.txt': 'seed\n' + repeated},
+        )
+        (git_repo / 'manifest.txt').write_text('seed\nentry = shared\n')
+        await _commit_all(git_repo, 'revert all but one copy of the entry')
+
+        probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+
+        assert probe.added_lines_total == 40
+        assert probe.aggregate_survival == pytest.approx(1 / 40), (
+            'main kept ONE copy, so exactly one added line survived — set '
+            'membership would have scored all 40 and accepted the landing'
+        )
+        assert probe.present is False
+        assert probe.failure == 'effect_not_survived'
+
+    async def test_main_renaming_the_deliverable_after_landing_reads_as_absent(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """KNOWN GAP, pinned so it is explicit rather than folklore.
+
+        Survival is read PER PATH under the name the anchor used, so when a
+        later commit on main simply MOVES the deliverable, ``git show
+        <main>:<old path>`` fails, main's line multiset comes back None, and
+        every added line counts as lost — even though all of them are present
+        at main, intact, under the new name.
+
+        This is a false POSITIVE (a spurious reject), i.e. the fail-safe
+        direction, and it is a genuine member of the residual tail
+        :meth:`describe_commit_effect_in_main` describes.  It is NOT closed
+        here: resolving the path through ``git diff --name-status -M`` before
+        the read would loosen the predicate, and every threshold in this
+        module is calibrated against a full-corpus sweep taken WITHOUT that
+        loosening.  Retuning is a measurement, not an edit.
+
+        ``test_pure_rename_resolves_by_blob_not_line_set`` covers the mirror
+        case — a rename performed by the ANCHOR — which is decided correctly.
+        """
+        await _seed_on_main(git_repo, {'mod.py': _numbered('base', 5)}, 'seed mod')
+        merge_sha = await _land_branch(
+            git_repo, '9102',
+            {'mod.py': _numbered('base', 5) + _numbered('deliverable', 40)},
+        )
+
+        assert (await git_ops.describe_commit_effect_in_main(merge_sha)).present, (
+            'precondition: the landing reads as present before the move'
+        )
+
+        rc, _, err = await _run(['git', 'mv', 'mod.py', 'renamed.py'], cwd=git_repo)
+        assert rc == 0, f'rename on main failed: {err}'
+        await _commit_all(git_repo, 'main moves the deliverable to a new path')
+
+        assert _numbered('deliverable', 40) in (git_repo / 'renamed.py').read_text(), (
+            'precondition: every added line is still at main, just moved'
+        )
+
+        probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+
+        assert probe.present is False, (
+            'CURRENT behaviour, deliberately pinned: a move by main reads as '
+            'a total loss. Closing this needs rename resolution plus a '
+            'corpus re-measurement, not a one-line edit'
+        )
+        assert probe.failure == 'effect_not_survived'
+        assert probe.aggregate_survival == 0.0
+
+    async def test_clean_paths_are_costed_in_one_batched_read(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """Paths that did NOT diverge are read in ONE batch, not ~5 subprocesses
+        each.
+
+        This is the COMMON path — re-run for every landing candidate on every
+        15s dispatch tick — and a clean landing touching many files used to
+        pay a full ``git diff`` (plus, for a vacuous path, four existence/oid
+        reads) for each one, all to learn a survival ratio that is 1.0 by
+        construction.  The memo does not save it: a merge landing is exactly
+        what advances main HEAD and invalidates every entry.
+
+        Asserting the COMMAND COUNT is what pins it; the verdict assertions
+        alone pass with the per-path loop restored.
+        """
+        await _seed_on_main(git_repo, {'seed.py': 'seed = 1\n'}, 'seed')
+        files = {f'pkg/mod_{i:02d}.py': _numbered(f'body{i}', 30) for i in range(12)}
+        merge_sha = await _land_branch(git_repo, '9103', files)
+
+        with _git_command_spy() as recorded:
+            probe = await git_ops.describe_commit_effect_in_main(merge_sha)
+            cold = list(recorded)
+
+        assert probe.present is True
+        assert probe.added_lines_total == 12 * 30
+        per_path_diffs = [
+            cmd for cmd in cold
+            if 'diff' in cmd and '--unified=0' in cmd and cmd[-2] == '--'
+        ]
+        assert len(per_path_diffs) <= 1, (
+            f'12 non-diverged paths must not cost a diff each; saw '
+            f'{len(per_path_diffs)} pathspec-scoped unified diffs'
+        )
+        assert len(cold) < 12, (
+            f'the whole clean probe must cost well under one command per '
+            f'touched path; saw {len(cold)}: {cold}'
+        )
 
 
 @pytest.mark.asyncio
@@ -5907,6 +5996,52 @@ class TestCommitEffectProbeMemo:
         recovered = await git_ops.describe_commit_effect_in_main(merge_sha)
         assert recovered.present is True, (
             'the next tick must re-measure, not replay the cached failure'
+        )
+
+    async def test_memo_evicts_the_oldest_entry_at_the_bound(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """(f) The FIFO bound actually holds, and drops the OLDEST entry.
+
+        Every other test in this class exercises the memo's correctness
+        machinery; this one covers the only branch that enforces its stated
+        SIZE bound.  It needs its own test precisely because the memo is a
+        pure optimization: evicting the newest entry, or an off-by-one that
+        drops the entry just inserted, leaves every functional test in this
+        file green while the bound silently stops holding or the cache stops
+        caching.
+
+        The bound is patched down to 2 rather than probing 257 commits — the
+        branch under test is ``len(memo) >= _EFFECT_PROBE_MEMO_MAX_ENTRIES``,
+        and it does not care what the constant is.  All three probes run at
+        ONE fixed main HEAD so the whole-memo staleness clear (a different
+        mechanism, covered above) cannot be what does the dropping.
+        """
+        await _seed_on_main(
+            git_repo,
+            {'a.py': _numbered('a', 30), 'b.py': _numbered('b', 30),
+             'c.py': _numbered('c', 30)},
+            'seed three files',
+        )
+        shas = [
+            await _land_branch(
+                git_repo, f'85{i:02d}',
+                {name: _numbered(name[0], 30) + _numbered(f'add{i}', 30)},
+            )
+            for i, name in enumerate(('a.py', 'b.py', 'c.py'))
+        ]
+        main_sha = await git_ops.get_main_sha()
+        assert main_sha
+
+        with patch('orchestrator.git_ops._EFFECT_PROBE_MEMO_MAX_ENTRIES', 2):
+            for sha in shas:
+                await git_ops.describe_commit_effect_in_main(sha)
+
+        assert list(git_ops._effect_probe_memo) == [
+            (shas[1], main_sha), (shas[2], main_sha),
+        ], (
+            'the bound must hold at 2 and the OLDEST key must be the one '
+            'dropped — the newest probe must still be cached'
         )
 
 
