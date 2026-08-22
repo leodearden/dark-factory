@@ -99,6 +99,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import yaml
 from _recording_event_store import _RecordingEventStore
 from _workflow_helpers import (
     AgentStub,
@@ -112,9 +113,15 @@ from _workflow_helpers import (
 from shared.cost_store import CostStore
 
 from orchestrator.agents.invoke import AgentResult
-from orchestrator.agents.roles import ARCHITECT, DEBUGGER, IMPLEMENTER
+from orchestrator.agents.roles import ARCHITECT, DEBUGGER, IMPLEMENTER, SIMPLE_TASK
 from orchestrator.artifacts import TaskArtifacts
-from orchestrator.config import GitConfig, OrchestratorConfig, SandboxConfig
+from orchestrator.config import (
+    GitConfig,
+    OrchestratorConfig,
+    SandboxConfig,
+    apply_reload,
+    load_config,
+)
 from orchestrator.event_store import EventType
 from orchestrator.git_ops import GitOps
 from orchestrator.harness import TaskReport
@@ -223,6 +230,22 @@ class _RoutingRecorderStub(AgentStub):
             'backend': kwargs.get('backend'),
         }
         return await super().invoke_agent(**kwargs)
+
+    def _detect_role(self, system_prompt: str) -> str:
+        """Extend ``AgentStub._detect_role`` with a SIMPLE_TASK case.
+
+        The shared helper (``_workflow_helpers.py``, imported never edited —
+        see module docstring) has no branch for ``SIMPLE_TASK.system_prompt``
+        ("You are a SIMPLE_TASK agent...") — every existing substring check
+        (architect/implementer/debugger/reviewer/merger/judge) is false for
+        it, so it falls through to ``'unknown'``. Scenario 4 (plan step-7)
+        is the first in this suite to need role='simple_task' keyed
+        recording, so the case is added HERE, in σ's own module-local
+        subclass, rather than touching the shared stub.
+        """
+        if 'SIMPLE_TASK agent' in system_prompt:
+            return 'simple_task'
+        return super()._detect_role(system_prompt)
 
 
 def _routing_events(rec: _RecordingEventStore) -> list[dict]:
@@ -1241,3 +1264,134 @@ class TestSaturationStampRoutesNextDispatchFullPath:
         assert arch_events, f'expected an architect routing_decision event: {rec.events!r}'
         assert arch_events[-1]['data']['rule_id'] == 'simple-saturated-full-path'
         assert arch_events[-1]['data']['source_layer'] == 'policy_rule'
+
+
+# ---------------------------------------------------------------------------
+# Boundary scenario 4 -- models.simple_task is config-visible and flips via
+# hot reload (plan step-7).
+# ---------------------------------------------------------------------------
+
+# Pinned test-only literals. The starting model is deliberately distinct from
+# BOTH ModelsConfig.simple_task's own default ('sonnet') AND the reload
+# target below ('haiku') -- so a field that were silently dataclass-only
+# (yaml ignored) would surface as a loud assertion failure (config.models.
+# simple_task would read back as 'sonnet', not 'opus'), not an accidental
+# pass. The budget/max_turns pins are likewise distinct from their submodel
+# defaults (2.50 / 50) so part (d)'s guard is checking a real value, not a
+# default that would pass whether or not the yaml was honored.
+_PINNED_SIMPLE_TASK_STARTING_MODEL = 'opus'
+_PINNED_SIMPLE_TASK_RELOAD_MODEL = 'haiku'
+_PINNED_SIMPLE_TASK_BUDGET = 3.75
+_PINNED_SIMPLE_TASK_MAX_TURNS = 42
+
+
+def _write_simple_task_orchestrator_yaml(path: Path, simple_task_model: str) -> None:
+    """Write a minimal, self-contained orchestrator.yaml at *path*, pinning
+    ``models.simple_task`` to *simple_task_model* plus the sibling
+    ``budgets.simple_task`` / ``max_turns.simple_task`` submodel leaves.
+
+    Deliberately leaves the DEPRECATED top-level ``simple_task_budget_usd`` /
+    ``simple_task_max_turns`` scalars unset, so they load at their own
+    pydantic defaults (1.50 / 30) and ``_honor_deprecated_simple_task_scalars``
+    (config.py:4527) takes its no-op branch (``raw != raw_default`` is
+    False) on every ``load_config()``/``apply_reload`` call below -- the
+    explicit submodel pins are never at risk of a silent scalar-migration
+    overwrite. ``project_root`` is left unset (defaults to ``Path('.')``,
+    config.py:4338) since this scenario drives ``TaskWorkflow._invoke``
+    directly (never ``.run()``), which never reads it -- mirrors
+    ``test_config_reload_integration_gate._make_reload_harness``'s identical
+    project-root-agnostic minimal yaml. Reimplemented locally rather than
+    importing that file's ``_edit_yaml`` -- see this module's FIXTURES ARE
+    MODULE-LOCAL docstring section.
+    """
+    path.write_text(yaml.safe_dump({
+        'models': {'simple_task': simple_task_model},
+        'budgets': {'simple_task': _PINNED_SIMPLE_TASK_BUDGET},
+        'max_turns': {'simple_task': _PINNED_SIMPLE_TASK_MAX_TURNS},
+        'max_concurrent_tasks': 1,
+        'git': {
+            'main_branch': 'main',
+            'branch_prefix': 'task/',
+            'remote': 'origin',
+            'worktree_dir': '.worktrees',
+        },
+        'sandbox': {'enabled': False},
+    }))
+
+
+class TestSimpleTaskModelReloadReachesTheSeam:
+    """PRD boundary scenario 4: ``models.simple_task`` is config-visible (not
+    dataclass-only, invariant 4) and a hot reload of it reaches the NEXT
+    invocation's real CLI seam.
+
+    Modelled on ``test_config_reload_integration_gate.py``: a real on-disk
+    yaml + real ``load_config()`` + real ``apply_reload()`` (config.py:5373),
+    never a mocked loader. Part (c) drives the reloaded config through a
+    DIRECT ``TaskWorkflow._invoke(...)`` call -- mirroring that file's
+    ``_make_reload_workflow`` / ``workflow._invoke(IMPLEMENTER, 'do the
+    task', tmp_path)`` pattern -- rather than the full ``run()`` state
+    machine: this scenario's claim is narrowly "the reloaded leaf reaches
+    the seam", which needs no plan/worktree machinery (``_invoke`` never
+    reads ``self.artifacts``/``self.git_ops`` when ``self.artifacts is
+    None`` and ``self.config.sandbox.enabled`` is False).
+    """
+
+    @pytest.mark.asyncio
+    async def test_simple_task_model_reload_reaches_the_seam(
+        self, tmp_path: Path, task_assignment: TaskAssignment, monkeypatch,
+    ) -> None:
+        config_path = tmp_path / 'orchestrator.yaml'
+        _write_simple_task_orchestrator_yaml(
+            config_path, _PINNED_SIMPLE_TASK_STARTING_MODEL,
+        )
+        monkeypatch.setenv('ORCH_CONFIG_PATH', str(config_path))
+
+        # (a) config-visible, not dataclass-only: the pinned starting value
+        # round-trips through a real load_config() off the on-disk yaml.
+        live = load_config()
+        assert live.models.simple_task == _PINNED_SIMPLE_TASK_STARTING_MODEL
+
+        # (b) hot reload: rewrite the leaf on disk, load a second config
+        # object off the SAME path, and apply the real diff/apply pipeline.
+        _write_simple_task_orchestrator_yaml(
+            config_path, _PINNED_SIMPLE_TASK_RELOAD_MODEL,
+        )
+        fresh = load_config()
+        report = apply_reload(live, fresh)
+
+        assert report['reloaded'] is True
+        assert report['error'] is None
+        assert 'models.simple_task' in report['applied']
+        assert report['applied']['models.simple_task'] == {
+            'old': _PINNED_SIMPLE_TASK_STARTING_MODEL,
+            'new': _PINNED_SIMPLE_TASK_RELOAD_MODEL,
+        }
+        # apply_reload mutates `live` in place (I3 identity preservation) --
+        # `live` IS the reloaded config object the rig below is built on.
+        assert live.models.simple_task == _PINNED_SIMPLE_TASK_RELOAD_MODEL
+
+        # (d) the deprecated scalars were never set (both loads used them at
+        # their own pydantic defaults), so _honor_deprecated_simple_task_scalars
+        # took its no-op branch on every validation pass -- the explicit
+        # submodel pins from the yaml survive untouched.
+        assert live.budgets.simple_task == _PINNED_SIMPLE_TASK_BUDGET
+        assert live.max_turns.simple_task == _PINNED_SIMPLE_TASK_MAX_TURNS
+
+        # (c) the reload reaches the NEXT invocation's real CLI seam.
+        recorder = _RoutingRecorderStub()
+        workflow, _scheduler = _build_workflow(
+            live, GitOps(live.git, tmp_path), task_assignment, recorder,
+        )
+        rec = _RecordingEventStore()
+        workflow.event_store = rec
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', recorder.invoke_agent)
+
+        await workflow._invoke(SIMPLE_TASK, 'simple task prompt', tmp_path)
+
+        assert recorder.route_by_role['simple_task']['model'] == (
+            _PINNED_SIMPLE_TASK_RELOAD_MODEL
+        )
+        st_events = [e for e in _routing_events(rec) if e['data']['role'] == 'simple_task']
+        assert st_events, f'expected a simple_task routing_decision event: {rec.events!r}'
+        assert st_events[-1]['data']['model'] == _PINNED_SIMPLE_TASK_RELOAD_MODEL
+        assert st_events[-1]['data']['source_layer'] == 'config'
