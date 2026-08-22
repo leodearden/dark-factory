@@ -1086,3 +1086,158 @@ class TestCeilingFallbackDoesNotBlockDispatch:
             assert outcome == WorkflowOutcome.DONE
         finally:
             await cost_store.close()
+
+
+# ---------------------------------------------------------------------------
+# Boundary scenario 8 -- simple_task saturation stamp routes the next
+# dispatch full-path (plan step-6).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestSaturationStampRoutesNextDispatchFullPath:
+    """PRD boundary scenario 8: once a SIMPLE_TASK dispatch demonstrably
+    exhausts its turn cap, ``_stamp_simple_saturated`` (task nu,
+    workflow.py:5157) retires the 'simple' label, and the NEXT dispatch --
+    seeded from that ACTUAL persisted metadata, never a hand-written
+    ``{'simple_saturated': True}`` literal -- takes the full architect path,
+    whose ``routing_decision`` event names the attribution-only
+    ``simple-saturated-full-path`` rule (defaults.yaml:294). That rule is
+    byte-equivalent (the architect's config model is already opus), so the
+    discriminating assertion below is ``rule_id``, not the model.
+
+    Half 1 drives ``_run_simple_task()`` directly against a real
+    ``TaskWorkflow`` -- this method's OWN internal gating (``if not
+    result.success: ...``) is what is under test, not the outer
+    ``_should_run_simple_task()`` dispatch gate -- with
+    ``orchestrator.workflow.invoke_agent`` faked to return the exact
+    ``AgentResult`` shape (``subtype='error_max_turns'``) that
+    ``classify_agent_failure`` maps to ``AgentFailureKind.MAX_TURNS``,
+    matching the real classifier's input contract rather than monkeypatching
+    the classifier itself. The scheduler is wired to a real
+    ``FakeMetadataBackend`` (``wire_metadata_backend``) so the stamp's
+    ``metadata_mode='merge'`` write genuinely persists. Half 2 feeds that
+    ACTUAL persisted metadata dict into a fresh dispatch.
+
+    Uses ``code_default_config`` so the shipped ``simple-saturated-full-path``
+    rule (and ``simple_task_enabled``) are guaranteed live regardless of
+    whether the ambient operational yaml drifts (mirrors
+    ``TestTierStableWithinOneDispatch``'s isolation rationale).
+    """
+
+    @pytest.fixture
+    def stock_config(self, git_repo: Path, code_default_config) -> OrchestratorConfig:
+        return OrchestratorConfig(
+            project_root=git_repo,
+            max_concurrent_tasks=1,
+            max_execute_iterations=5,
+            max_verify_attempts=3,
+            max_review_cycles=2,
+            git=GitConfig(
+                main_branch='main',
+                branch_prefix='task/',
+                remote='origin',
+                worktree_dir='.worktrees',
+            ),
+            sandbox=SandboxConfig(enabled=False),
+        )
+
+    @staticmethod
+    async def _max_turns_invoke(**kwargs) -> AgentResult:
+        """The exact ``AgentResult`` shape ``classify_agent_failure`` maps to
+        ``AgentFailureKind.MAX_TURNS``: a failed, non-timed-out,
+        non-backgrounded, no-api-error-status result whose ``subtype`` is
+        ``'error_max_turns'`` (shared/cli_invoke.py:1167)."""
+        return AgentResult(
+            success=False, output='', subtype='error_max_turns',
+            turns=80, output_tokens=500,
+        )
+
+    async def test_saturation_stamp_then_next_dispatch_routes_full_path(
+        self, stock_config, git_ops, task_assignment, tmp_path, monkeypatch,
+    ):
+        assert stock_config.simple_task_enabled is True
+        task_assignment.task['metadata']['complexity'] = 'simple'
+
+        workflow, scheduler = _build_workflow(
+            stock_config, git_ops, task_assignment, AgentStub(),
+        )
+        _seed_workflow_artifacts(workflow, tmp_path=tmp_path)
+        backend = FakeMetadataBackend()
+        wire_metadata_backend(
+            scheduler, backend, seed=task_assignment.task['metadata'], grants=True,
+        )
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', self._max_turns_invoke)
+
+        # Premise: a clean, un-saturated, author-declared simple task takes
+        # the SIMPLE_TASK path.
+        assert workflow._should_run_simple_task() is True
+
+        # -- Half 1 (WRITE side): a demonstrated turn-cap exhaustion stamps
+        # simple_saturated=True through a genuine scheduler merge write AND
+        # the in-memory task dict.
+        outcome_1 = await workflow._run_simple_task()
+        assert outcome_1 == WorkflowOutcome.REQUEUED
+        assert backend.blob['routing']['simple_saturated'] is True
+        assert workflow.task['metadata']['routing']['simple_saturated'] is True
+        writes_after_round_1 = len(backend.update_task_calls)
+
+        # Idempotence: driving a second demonstrated exhaustion sees ONE
+        # effective state (simple_saturated stays True, not re-toggled) and
+        # contributes exactly one FEWER merge write than round 1:
+        # _stamp_simple_saturated's own early return (already True) skips its
+        # write this time, so only _invoke's routing-decision mirror write
+        # (present both rounds) fires.
+        outcome_2 = await workflow._run_simple_task()
+        assert outcome_2 == WorkflowOutcome.REQUEUED
+        assert backend.blob['routing']['simple_saturated'] is True
+        assert workflow.task['metadata']['routing']['simple_saturated'] is True
+        writes_in_round_2 = len(backend.update_task_calls) - writes_after_round_1
+        assert writes_in_round_2 == writes_after_round_1 - 1, (
+            f'expected round 2 to skip the stamp write (one fewer than round 1); '
+            f'round 1={writes_after_round_1}, round 2={writes_in_round_2}'
+        )
+
+        # -- Half 2 (READ side): dispatch #2 is seeded from the ACTUAL
+        # persisted metadata dict backend.blob just produced -- never a
+        # hand-written {'simple_saturated': True} literal.
+        persisted_metadata = dict(backend.blob)
+        fresh_assignment = TaskAssignment(
+            task_id='42',
+            task={
+                'id': '42',
+                'title': 'Routing boundary task',
+                'description': 'Exercise the real _invoke routing-resolution path',
+                'status': 'pending',
+                'metadata': persisted_metadata,
+                'dependencies': [],
+            },
+            modules=['lib'],
+        )
+
+        recorder = _RoutingRecorderStub()
+        workflow2, _scheduler2 = _build_workflow(
+            stock_config, git_ops, fresh_assignment, recorder,
+        )
+        rec = _RecordingEventStore()
+        workflow2.event_store = rec
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', recorder.invoke_agent)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification', _mock_verify_passes(),
+        )
+
+        # (a) the saturated label is retired -- the full PLAN path runs, not
+        # SIMPLE_TASK.
+        assert workflow2._should_run_simple_task() is False
+
+        outcome = (await workflow2.run()).outcome
+        assert outcome == WorkflowOutcome.DONE
+        assert 'architect' in recorder.route_by_role
+        assert 'simple_task' not in recorder.route_by_role
+
+        # (b) the architect's routing_decision event names the saturation
+        # attribution rule.
+        arch_events = [e for e in _routing_events(rec) if e['data']['role'] == 'architect']
+        assert arch_events, f'expected an architect routing_decision event: {rec.events!r}'
+        assert arch_events[-1]['data']['rule_id'] == 'simple-saturated-full-path'
+        assert arch_events[-1]['data']['source_layer'] == 'policy_rule'
