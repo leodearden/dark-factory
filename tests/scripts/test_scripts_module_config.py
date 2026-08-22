@@ -63,11 +63,12 @@ from __future__ import annotations
 import pathlib
 import shlex
 import tomllib
+from collections.abc import Callable
 from typing import Any
 
 import pytest
 from module_budget_family import min_budget
-from orchestrator.config import OrchestratorConfig, _discover_module_configs
+from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.module_charter import derive_modules
 
 from orchestrator import verify, verify_cmd, verify_plan
@@ -187,52 +188,6 @@ def _root_carve_outs_naming(segment: str) -> list[str]:
             if parts[0] == segment or (parts[0] == '**' and segment in parts[1:]):
                 found.append(f'{key}={entry!r}')
     return found
-
-
-def _discovered() -> dict:
-    return _discover_module_configs(REPO_ROOT)
-
-
-def _executed_for_touched(files: list[str], cfg: OrchestratorConfig):
-    """Run the PRODUCTION plan->execution bridge and return the single executed config.
-
-    ``derive_verify_plan`` decides scope; ``_executed_module_configs_from_plan``
-    renders those PlannedRuns into the exact ModuleConfig ``run_verification``
-    executes. Asserting on THAT is what makes "ruff ran over scripts/" a
-    structural claim rather than an exit-code claim.
-
-    *cfg* IS A REQUIRED PARAMETER, not a convenience (task 3703, applying the
-    shape commit 6c72a7da5a landed in ``test_module_verify_budgets.py``). It
-    must be the config built by the directory-wide ``root_config`` fixture in
-    ``tests/scripts/conftest.py``, whose docstring spells out why
-    the ``ORCH_CONFIG_PATH`` anchor is load-bearing: an unset anchor collapses
-    every value to the pydantic defaults, SILENTLY.
-
-    This helper used to construct its own
-    ``OrchestratorConfig(project_root=REPO_ROOT)``, and in THIS file's call
-    graph that made it ORDERING-DEPENDENT in a way nothing could report.
-    ``test_scripts_module_carries_its_own_measured_verify_budget`` built its
-    anchored config for assertion (c) and only then reached
-    assertion (e)'s call here, so the helper read the right yaml purely as a
-    SIDE EFFECT of that earlier line — while the other three callers
-    (``test_scripts_diff_is_lint_gated``, ``test_scripts_diff_is_type_gated``,
-    ``test_scripts_full_suite_pytest_covers_scripts_tests``) anchored nothing
-    at all and were reading the ambient environment outright. Reordering (c)
-    after (e) would have broken the one working case with no failure signal.
-    Taking the config as an argument makes the dependency structural instead of
-    ordering-dependent.
-
-    The ``lambda _f: None`` worktree_reader keeps this hermetic: no file reads,
-    and nothing classifies STRUCTURAL, so the lint/type legs stay FILE_SCOPED.
-    """
-    mc = _discovered()[MODULE_PREFIX]
-    plan = verify_plan.derive_verify_plan(files, [mc], cfg, lambda _f: None)
-    executed = verify._executed_module_configs_from_plan([mc], plan)
-    assert len(executed) == 1, (
-        f'expected exactly one executed module config for {files!r}, got '
-        f'{[e.prefix for e in executed]!r}'
-    )
-    return executed[0]
 
 
 # The two checker spellings these helpers understand, keyed by the phrase that
@@ -671,8 +626,10 @@ def test_executed_for_touched_is_hermetic_against_the_ambient_orch_config_path(
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
     root_config: OrchestratorConfig,
+    discover_module_configs: Callable[[], dict[str, ModuleConfig]],
+    executed_for_touched: Callable[[str, list[str], OrchestratorConfig], ModuleConfig],
 ) -> None:
-    """``_executed_for_touched`` must not read the ambient ``ORCH_CONFIG_PATH``.
+    """The ``executed_for_touched`` fixture must not read the ambient ``ORCH_CONFIG_PATH``.
 
     Task 3703, reviewer-flagged — the mirror of the repair commit 6c72a7da5a
     landed in ``test_module_verify_budgets.py``, and of the same repair in
@@ -686,7 +643,7 @@ def test_executed_for_touched_is_hermetic_against_the_ambient_orch_config_path(
     THE ORDERING HAZARD THIS FILE CARRIED WAS CONCRETE, and sharper than the
     sibling's. ``test_scripts_module_carries_its_own_measured_verify_budget``
     built its anchored config for assertion (c) and then called
-    ``_executed_for_touched(...)`` for assertion (e), so that helper read the
+    ``executed_for_touched(...)`` for assertion (e), so that helper read the
     right yaml ONLY as a SIDE EFFECT of an assertion made earlier in the same
     test body. Two edits nobody would think twice about silently broke it:
     reordering (c) after (e), or calling the helper from any of the three tests
@@ -742,7 +699,7 @@ def test_executed_for_touched_is_hermetic_against_the_ambient_orch_config_path(
 
     # (3) The helper must not consult that variable. A helper that builds its
     # own config raises pydantic ValidationError here instead of returning.
-    executed = _executed_for_touched([SAMPLE_TOUCHED_FILE], cfg)
+    executed = executed_for_touched(MODULE_PREFIX, [SAMPLE_TOUCHED_FILE], cfg)
 
     assert executed.prefix == MODULE_PREFIX, (
         f'under a poisoned ORCH_CONFIG_PATH the production bridge executed '
@@ -816,7 +773,7 @@ def test_executed_for_touched_is_hermetic_against_the_ambient_orch_config_path(
     # The module budget survives too: the figure must come from THIS module's
     # yaml, which the poisoned env cannot reach, not from whatever the ambient
     # config declares.
-    declared = _discovered()[MODULE_PREFIX].verify_command_timeout_secs
+    declared = discover_module_configs()[MODULE_PREFIX].verify_command_timeout_secs
     assert executed.verify_command_timeout_secs == declared, (
         f'executed verify_command_timeout_secs='
         f'{executed.verify_command_timeout_secs} under a poisoned '
@@ -825,7 +782,11 @@ def test_executed_for_touched_is_hermetic_against_the_ambient_orch_config_path(
     )
 
 
-def test_scripts_diff_is_lint_gated(root_config: OrchestratorConfig) -> None:
+def test_scripts_diff_is_lint_gated(
+    root_config: OrchestratorConfig,
+    discover_module_configs: Callable[[], dict[str, ModuleConfig]],
+    executed_for_touched: Callable[[str, list[str], OrchestratorConfig], ModuleConfig],
+) -> None:
     """A diff confined to scripts/ must actually run ruff over scripts/.
 
     Five assertions, one contract. (1) and (2) are routing PRECONDITIONS: they
@@ -871,7 +832,7 @@ def test_scripts_diff_is_lint_gated(root_config: OrchestratorConfig) -> None:
         back to this config, which is what the assertions check — is
         depth-invariant and stands unchanged.
     """
-    discovered = _discovered()
+    discovered = discover_module_configs()
 
     # (1) ROUTING PRECONDITION — discovery registers it, under the repo-relative
     # POSIX prefix that for_module resolves by.
@@ -922,7 +883,7 @@ def test_scripts_diff_is_lint_gated(root_config: OrchestratorConfig) -> None:
             'an EMPTY module list and this config would gate nothing'
         )
 
-    executed = _executed_for_touched([SAMPLE_TOUCHED_FILE], root_config)
+    executed = executed_for_touched(MODULE_PREFIX, [SAMPLE_TOUCHED_FILE], root_config)
 
     # (3) THE GATE ITSELF. A None command here is not "lint deferred to some
     # other config" — it is lint DELETED, and it reports green.
@@ -1109,7 +1070,11 @@ def test_root_pyright_extrapaths_resolves_scripts_imports() -> None:
         )
 
 
-def test_scripts_diff_is_type_gated(root_config: OrchestratorConfig) -> None:
+def test_scripts_diff_is_type_gated(
+    root_config: OrchestratorConfig,
+    discover_module_configs: Callable[[], dict[str, ModuleConfig]],
+    executed_for_touched: Callable[[str, list[str], OrchestratorConfig], ModuleConfig],
+) -> None:
     """A diff confined to scripts/ must actually run pyright over scripts/.
 
     The TYPE half of the same contract ``test_scripts_diff_is_lint_gated``
@@ -1164,10 +1129,10 @@ def test_scripts_diff_is_type_gated(root_config: OrchestratorConfig) -> None:
     Cited by SYMBOL, never by file:line, for the reason the module docstring
     records.
     """
-    discovered = _discovered()
+    discovered = discover_module_configs()
     mc = discovered[MODULE_PREFIX]
 
-    executed = _executed_for_touched([SAMPLE_TOUCHED_FILE], root_config)
+    executed = executed_for_touched(MODULE_PREFIX, [SAMPLE_TOUCHED_FILE], root_config)
 
     # (a) THE GATE ITSELF, on the FILE_SCOPED render. A None command here is
     # not "type-checking deferred to some other config" — it is TYPE DELETED,
@@ -1276,7 +1241,9 @@ def test_scripts_diff_is_type_gated(root_config: OrchestratorConfig) -> None:
     )
 
 
-def test_type_gates_resolve_pyright_without_npx() -> None:
+def test_type_gates_resolve_pyright_without_npx(
+    discover_module_configs: Callable[[], dict[str, ModuleConfig]],
+) -> None:
     """Both non-member type gates must resolve pyright through uv, never npx.
 
     Task 4358, mirroring task 3842's switch on the sibling. NOT a style rule —
@@ -1312,7 +1279,7 @@ def test_type_gates_resolve_pyright_without_npx() -> None:
     it was GENERALISED FROM these per-module guards after both existed rather
     than bolted on ahead of them.
     """
-    discovered = _discovered()
+    discovered = discover_module_configs()
 
     # Guarded read, in the .get-based shape _load_root_pyright_config already
     # uses here. Raw chained indexing raises a bare KeyError naming only the
@@ -1426,6 +1393,8 @@ def test_type_gates_resolve_pyright_without_npx() -> None:
 
 def test_scripts_full_suite_pytest_covers_scripts_tests(
     root_config: OrchestratorConfig,
+    discover_module_configs: Callable[[], dict[str, ModuleConfig]],
+    executed_for_touched: Callable[[str, list[str], OrchestratorConfig], ModuleConfig],
 ) -> None:
     """A FULL_SUITE pytest run for the ``scripts`` module must collect scripts/tests/.
 
@@ -1484,7 +1453,7 @@ def test_scripts_full_suite_pytest_covers_scripts_tests(
     and never by an exit code, for the reasons the module docstring records.
     Cited by SYMBOL, never by file:line, for the same reason.
     """
-    discovered = _discovered()
+    discovered = discover_module_configs()
 
     # (1) PRECONDITION. Asserted so a discovery regression cannot make every
     # assertion below vacuous — an absent config would raise a KeyError with no
@@ -1506,8 +1475,8 @@ def test_scripts_full_suite_pytest_covers_scripts_tests(
     # (2) TASK-ROLE ARM 3 — the task-3294 source-only floor, which runs the
     # declared command VERBATIM for any scripts/ production diff.
     cfg = root_config
-    executed_production = _executed_for_touched(
-        [SAMPLE_TOUCHED_PRODUCTION_FILE], cfg
+    executed_production = executed_for_touched(
+        MODULE_PREFIX, [SAMPLE_TOUCHED_PRODUCTION_FILE], cfg
     )
     assert executed_production.test_command is not None, (
         f'executed test_command is None for a diff touching '
@@ -1535,7 +1504,7 @@ def test_scripts_full_suite_pytest_covers_scripts_tests(
 
     # (3) CONFTEST TRIGGER (arm 1) — the sharpest case, because the touched
     # file IS scripts/tests/'s own conftest.
-    executed_conftest = _executed_for_touched([SAMPLE_TOUCHED_CONFTEST], cfg)
+    executed_conftest = executed_for_touched(MODULE_PREFIX, [SAMPLE_TOUCHED_CONFTEST], cfg)
     assert executed_conftest.test_command is not None, (
         f'executed test_command is None for a diff touching '
         f'{SAMPLE_TOUCHED_CONFTEST!r} (task 3460): {_VACUOUS_PASS}'
@@ -1667,7 +1636,7 @@ def _root_scripts_suites_pytest_targets(cfg: OrchestratorConfig) -> list[str]:
 
     *cfg* IS A REQUIRED PARAMETER, not a convenience — the same
     cfg-as-parameter shape commit 6c72a7da5a established for
-    ``_executed_for_touched``, applied here by task 4320 when the file-local
+    ``executed_for_touched``, applied here by task 4320 when the file-local
     anchoring helper became the directory-wide ``root_config`` fixture. A helper
     that anchors for itself can be called from a test that anchors nothing, and
     read whatever ``ORCH_CONFIG_PATH`` the process happened to carry with no
@@ -1708,6 +1677,7 @@ def _root_scripts_suites_pytest_targets(cfg: OrchestratorConfig) -> list[str]:
 
 def test_root_fleet_chain_and_scripts_module_agree_on_the_scripts_suites(
     root_config: OrchestratorConfig,
+    discover_module_configs: Callable[[], dict[str, ModuleConfig]],
 ) -> None:
     """The fleet chain and the ``scripts`` module config must name the SAME suites.
 
@@ -1747,7 +1717,7 @@ def test_root_fleet_chain_and_scripts_module_agree_on_the_scripts_suites(
     """
     root_targets = _root_scripts_suites_pytest_targets(root_config)
 
-    discovered = _discovered()
+    discovered = discover_module_configs()
     assert MODULE_PREFIX in discovered, (
         f'{MODULE_PREFIX}/orchestrator.yaml is not discovered by the production '
         f'config._discover_module_configs walk. Discovered: {sorted(discovered)}'
@@ -1850,6 +1820,8 @@ MIN_MODULE_BUDGET_SECS = min_budget(MEASURED_SUITE_WORST_SECS)
 
 def test_scripts_module_carries_its_own_measured_verify_budget(
     root_config: OrchestratorConfig,
+    discover_module_configs: Callable[[], dict[str, ModuleConfig]],
+    executed_for_touched: Callable[[str, list[str], OrchestratorConfig], ModuleConfig],
 ) -> None:
     """The module must carry its own warm verify budget, narrower than the repo-root ceiling.
 
@@ -1882,7 +1854,7 @@ def test_scripts_module_carries_its_own_measured_verify_budget(
     (``verify._resolve_verify_timeout``) rather than restating it, so the
     assertion cannot drift from the code that implements it.
     """
-    mc = _discovered()[MODULE_PREFIX]
+    mc = discover_module_configs()[MODULE_PREFIX]
 
     # (a) Declared at all — otherwise the global ceiling silently applies.
     assert mc.verify_command_timeout_secs is not None, (
@@ -1949,7 +1921,7 @@ def test_scripts_module_carries_its_own_measured_verify_budget(
     # Passed the SAME cfg assertion (c) already anchored above, rather than
     # letting the helper re-derive one from the env that call left behind —
     # that side effect was the ordering dependency task 3703 removed.
-    executed = _executed_for_touched([SAMPLE_TOUCHED_FILE], cfg)
+    executed = executed_for_touched(MODULE_PREFIX, [SAMPLE_TOUCHED_FILE], cfg)
     assert executed.verify_command_timeout_secs == mc.verify_command_timeout_secs, (
         'the production plan->execution bridge '
         '(verify._executed_module_configs_from_plan) rendered '
@@ -1962,6 +1934,7 @@ def test_scripts_module_carries_its_own_measured_verify_budget(
 
 def test_scripts_module_cold_verify_falls_through_to_the_root_cold_ceiling(
     root_config: OrchestratorConfig,
+    discover_module_configs: Callable[[], dict[str, ModuleConfig]],
 ) -> None:
     """The new WARM budget must NOT narrow the COLD path — a deliberate asymmetry.
 
@@ -1982,7 +1955,7 @@ def test_scripts_module_cold_verify_falls_through_to_the_root_cold_ceiling(
     documented-but-ungated invariant — the same defect class tasks 3445/3460
     closed elsewhere in this file.
     """
-    mc = _discovered()[MODULE_PREFIX]
+    mc = discover_module_configs()[MODULE_PREFIX]
 
     # (a) The deliberate asymmetry: warm is set, cold is not.
     assert mc.verify_command_timeout_secs is not None, (

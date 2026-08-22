@@ -35,14 +35,15 @@ conftest.py puts every subproject's ``src/`` on sys.path.
 from __future__ import annotations
 
 import pathlib
+from collections.abc import Callable
 
 import pytest
 import yaml
 from module_budget_family import min_budget
-from orchestrator.config import OrchestratorConfig, _discover_module_configs
+from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.module_charter import derive_modules
 
-from orchestrator import verify, verify_plan
+from orchestrator import verify
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 
@@ -53,11 +54,9 @@ MODULE_PREFIX = 'tests/scripts'
 SAMPLE_TOUCHED_FILE = 'tests/scripts/test_spawn_claude.py'
 
 
-def _discovered() -> dict:
-    return _discover_module_configs(REPO_ROOT)
-
-
-def test_tests_scripts_is_a_registered_module_config() -> None:
+def test_tests_scripts_is_a_registered_module_config(
+    discover_module_configs: Callable[[], dict[str, ModuleConfig]],
+) -> None:
     """tests/scripts/ must be discovered, and must be REACHABLE by the routing chain.
 
     The five assertions below are one cohesive contract — discovery alone is
@@ -109,7 +108,7 @@ def test_tests_scripts_is_a_registered_module_config() -> None:
     2. Pinning ``== ['tests/scripts']`` would re-encode a falsified constant,
     which is precisely the failure mode task 3350 is repairing elsewhere.
     """
-    discovered = _discovered()
+    discovered = discover_module_configs()
 
     # (1) Discovery registers it at all.
     assert MODULE_PREFIX in discovered, (
@@ -194,43 +193,9 @@ _FLEET_CHAIN_MARKERS = (
 )
 
 
-def _executed_for_touched(files: list[str], cfg: OrchestratorConfig):
-    """Run the PRODUCTION plan->execution bridge and return the single executed config.
-
-    ``derive_verify_plan`` decides scope; ``_executed_module_configs_from_plan``
-    renders those PlannedRuns into the exact ModuleConfig ``run_verification``
-    executes. Asserting on THAT is what makes "the tests/scripts segment ran" a
-    structural claim rather than an exit-code claim.
-
-    *cfg* IS A REQUIRED PARAMETER, not a convenience (task 3703, applying the
-    shape commit 6c72a7da5a landed next door in
-    ``test_module_verify_budgets.py``). It must be the config built by the
-    directory-wide ``root_config`` fixture in ``tests/scripts/conftest.py``,
-    whose docstring spells out why the ``ORCH_CONFIG_PATH``
-    anchor is load-bearing: an unset anchor collapses every value to the
-    pydantic defaults, SILENTLY. This helper used to construct its own
-    ``OrchestratorConfig(project_root=REPO_ROOT)``, and — unlike the sibling
-    guard, whose single anchoring caller at least left the env var set as a
-    SIDE EFFECT of an earlier assertion — NO caller in this file anchored it at
-    all. So it read whatever ambient ``ORCH_CONFIG_PATH`` the process happened
-    to carry, with no failure signal either way. Taking the config as an
-    argument makes the dependency structural instead of ambient.
-
-    The ``lambda _f: None`` worktree_reader keeps this hermetic: no file reads,
-    and nothing classifies STRUCTURAL, so pyright stays FILE_SCOPED.
-    """
-    mc = _discovered()[MODULE_PREFIX]
-    plan = verify_plan.derive_verify_plan(files, [mc], cfg, lambda _f: None)
-    executed = verify._executed_module_configs_from_plan([mc], plan)
-    assert len(executed) == 1, (
-        f'expected exactly one executed module config for {files!r}, got '
-        f'{[e.prefix for e in executed]!r}'
-    )
-    return executed[0]
-
-
 def test_tests_scripts_diff_executes_its_own_suite_and_keeps_lint_and_type(
     root_config: OrchestratorConfig,
+    executed_for_touched: Callable[[str, list[str], OrchestratorConfig], ModuleConfig],
 ) -> None:
     """The task's acceptance criterion, asserted STRUCTURALLY rather than via rc.
 
@@ -253,7 +218,7 @@ def test_tests_scripts_diff_executes_its_own_suite_and_keeps_lint_and_type(
     ``pyright tests/scripts/test_spawn_claude.py`` rc=0). Closing the TEST gap
     must not open a LINT/TYPE one.
     """
-    executed = _executed_for_touched([SAMPLE_TOUCHED_FILE], root_config)
+    executed = executed_for_touched(MODULE_PREFIX, [SAMPLE_TOUCHED_FILE], root_config)
 
     # (a) The tests/scripts segment ACTUALLY RUNS.
     assert executed.test_command is not None, (
@@ -309,8 +274,10 @@ def test_executed_for_touched_is_hermetic_against_the_ambient_orch_config_path(
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
     root_config: OrchestratorConfig,
+    discover_module_configs: Callable[[], dict[str, ModuleConfig]],
+    executed_for_touched: Callable[[str, list[str], OrchestratorConfig], ModuleConfig],
 ) -> None:
-    """``_executed_for_touched`` must not read the ambient ``ORCH_CONFIG_PATH``.
+    """The ``executed_for_touched`` fixture must not read the ambient ``ORCH_CONFIG_PATH``.
 
     Task 3703, reviewer-flagged — the mirror of the repair commit 6c72a7da5a
     landed next door in ``test_module_verify_budgets.py``. This file's helper
@@ -371,7 +338,7 @@ def test_executed_for_touched_is_hermetic_against_the_ambient_orch_config_path(
 
     # (3) The helper must not consult that variable. A helper that builds its
     # own config raises pydantic ValidationError here instead of returning.
-    executed = _executed_for_touched([SAMPLE_TOUCHED_FILE], cfg)
+    executed = executed_for_touched(MODULE_PREFIX, [SAMPLE_TOUCHED_FILE], cfg)
 
     assert executed.prefix == MODULE_PREFIX, (
         f'under a poisoned ORCH_CONFIG_PATH the production bridge executed '
@@ -405,7 +372,7 @@ def test_executed_for_touched_is_hermetic_against_the_ambient_orch_config_path(
     # The module budget survives too: the figure must come from THIS module's
     # yaml, which the poisoned env cannot reach, not from whatever the ambient
     # config declares.
-    declared = _discovered()[MODULE_PREFIX].verify_command_timeout_secs
+    declared = discover_module_configs()[MODULE_PREFIX].verify_command_timeout_secs
     assert executed.verify_command_timeout_secs == declared, (
         f'executed verify_command_timeout_secs='
         f'{executed.verify_command_timeout_secs} under a poisoned '
@@ -545,13 +512,16 @@ def test_min_module_budget_is_derived_from_the_measured_worst_run() -> None:
     implementation, and ``test_module_verify_budgets.py::
     test_the_budget_family_derives_every_floor_from_one_canonical_expression``
     reads EVERY member's published pair and evaluates each floor expression in a
-    namespace holding only that helper and the published worst — so a sibling
-    re-spelling its derivation now fails there. The three assertions below are
-    unchanged in what they claim, and are strictly stronger than they were:
-    (i) pins the SHAPE of the one shared implementation rather than of this
-    file's private copy, and (ii) remains an edit tripwire on THIS file's pair.
-    The no-cross-import convention is untouched — this file imports a NON-TEST
-    helper, not a sibling guard, and still fails entirely on its own.
+    namespace holding only that helper and the published worst — and,
+    separately, requires each member to BIND ``min_budget`` by importing it, so
+    that a sibling re-spelling its derivation fails there under a different name
+    (``NameError`` in that namespace) and under the same name (a module-scope
+    shadow) alike. The three assertions below are unchanged in what they claim,
+    and are strictly stronger than they were: (i) pins the SHAPE of the one
+    shared implementation rather than of this file's private copy, and (ii)
+    remains an edit tripwire on THIS file's pair. The no-cross-import convention
+    is untouched — this file imports a NON-TEST helper and takes conftest
+    fixtures, never a sibling guard, and still fails entirely on its own.
 
     Three claims, each falsifiable on its own:
 
@@ -623,7 +593,9 @@ def test_min_module_budget_is_derived_from_the_measured_worst_run() -> None:
     )
 
 
-def test_tests_scripts_module_carries_its_own_tight_verify_budget() -> None:
+def test_tests_scripts_module_carries_its_own_tight_verify_budget(
+    discover_module_configs: Callable[[], dict[str, ModuleConfig]],
+) -> None:
     """The module must carry its own budget, tighter than the repo-root ceiling.
 
     This is what makes the fix a real NARROWING rather than a relabelling. Two
@@ -657,7 +629,7 @@ def test_tests_scripts_module_carries_its_own_tight_verify_budget() -> None:
     rather than restating it, so the assertion cannot drift from the code that
     implements it.
     """
-    mc = _discovered()[MODULE_PREFIX]
+    mc = discover_module_configs()[MODULE_PREFIX]
 
     # (a) Declared at all — otherwise the global ceiling silently applies. The
     # message cites MEASURED_SUITE_WORST_SECS rather than a literal (task 3703

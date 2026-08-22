@@ -39,13 +39,16 @@ that couples two guards which have to be able to fail independently and lets a
 regression in one silence the other. It does not reach a shared NON-TEST
 module, and it never reached ``conftest.py`` — pytest's idiomatic home for
 exactly this. Generalised to "helpers are copied", it licensed the triplication
-task 4320 removed: three verbatim ``_root_config`` helpers and three spellings
-of one budget derivation, none of which any mechanism could see drift between.
-This file now imports ``min_budget``, ``FAMILY_PUBLISHER_PATHS`` and
-``published_pairs`` from ``module_budget_family`` — a non-test sibling, on the
-``setup_host_sections`` / ``systemd_unit_invariants`` precedent already
-established in this directory — and every guard in the family still fails
-entirely on its own.
+task 4320 removed: three verbatim ``_root_config`` helpers, three verbatim
+``_discovered`` helpers, three byte-identical ``_executed_for_touched`` bodies
+and three spellings of one budget derivation, none of which any mechanism could
+see drift between. This file now imports ``min_budget``,
+``FAMILY_PUBLISHER_PATHS``, ``FAMILY_READER_PATH`` and ``published_pairs`` from
+``module_budget_family`` — a non-test sibling, on the ``setup_host_sections`` /
+``systemd_unit_invariants`` precedent already established in this directory —
+and takes its setup from the ``root_config`` / ``discover_module_configs`` /
+``executed_for_touched`` fixtures in ``tests/scripts/conftest.py``. Every guard
+in the family still fails entirely on its own.
 
 The SECOND half named the wrong remedy for a real hazard. The
 ``ORCH_CONFIG_PATH`` anchor IS load-bearing exactly as described, and its
@@ -57,7 +60,12 @@ conftest.py``, where it is stronger than a copied helper in two ways: fixture
 setup runs BEFORE the test body, so the anchor-then-poison ordering two guards
 in this family depend on is structural rather than a comment; and
 ``test_root_config_fixture_anchors_this_worktrees_own_yaml`` below pins the
-behaviour the move had to preserve, which no copy ever did.
+behaviour the move had to preserve, which no copy ever did. The two remaining
+copied helpers — ``_discovered`` and ``_executed_for_touched`` — followed it
+there in the same task's amendment pass, for the same reason and to the same
+place; note that ``discover_module_configs`` is a CALLABLE rather than a
+pre-built dict precisely so the anti-ambient guards keep reading the production
+walk AFTER they poison the environment.
 
 READING A SIBLING IS NOT IMPORTING IT, and this file now does the former on
 purpose. ``published_pairs`` ``ast``-parses each publisher's SOURCE rather than
@@ -88,6 +96,7 @@ import ast
 import os
 import pathlib
 import textwrap
+from collections.abc import Callable
 
 import pytest
 import yaml
@@ -97,9 +106,9 @@ from module_budget_family import (
     min_budget,
     published_pairs,
 )
-from orchestrator.config import OrchestratorConfig, _discover_module_configs
+from orchestrator.config import ModuleConfig, OrchestratorConfig
 
-from orchestrator import verify, verify_plan
+from orchestrator import verify
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 
@@ -208,57 +217,12 @@ SAMPLE_TOUCHED_FILE: dict[str, str] = {
 }
 
 
-def _discovered() -> dict:
-    """Every module config the PRODUCTION walk registers, keyed by repo-relative prefix.
-
-    Delegates to ``config._discover_module_configs`` rather than globbing
-    ``**/orchestrator.yaml``. A hand-rolled glob run from the main checkout
-    would descend ``.worktrees/`` and ``.venv/``, and would remain free to
-    drift from what the orchestrator actually registers; delegating inherits
-    the production pruning of ``.worktrees``, ``.venv``, ``node_modules``,
-    ``build``, ``target``, ``.claude`` and nested ``.git`` checkouts, and
-    covers configs at ANY depth (``tests/scripts``, not just depth-1 names).
-    """
-    return _discover_module_configs(REPO_ROOT)
-
-
-def _executed_for_touched(prefix: str, files: list[str], cfg: OrchestratorConfig):
-    """Run the PRODUCTION plan->execution bridge and return the single executed config.
-
-    ``derive_verify_plan`` decides scope; ``_executed_module_configs_from_plan``
-    renders those PlannedRuns into the exact ModuleConfig ``run_verification``
-    executes. Asserting on THAT is what makes "the budget survives to
-    execution" a structural claim rather than a claim about the yaml.
-
-    *cfg* IS A REQUIRED PARAMETER, not a convenience. It must be the config
-    built by the directory-wide ``root_config`` fixture in
-    ``tests/scripts/conftest.py``, whose docstring spells out why the
-    ``ORCH_CONFIG_PATH`` anchor is load-bearing: an unset anchor collapses every
-    value to the pydantic defaults, SILENTLY. This helper used to construct its
-    own ``OrchestratorConfig(project_root=REPO_ROOT)`` and read the right yaml
-    only because its caller happened to have called the (then file-local)
-    anchoring helper earlier in the same test body, leaving the env var set as a
-    SIDE EFFECT. Reordering the
-    assertions, or calling this helper from a new test, would have handed it a
-    defaults-collapsed config with no failure signal. Taking the config as an
-    argument makes the dependency structural instead of ordering-dependent.
-
-    The ``lambda _f: None`` worktree_reader keeps this hermetic: no file reads,
-    and nothing classifies STRUCTURAL.
-    """
-    mc = _discovered()[prefix]
-    plan = verify_plan.derive_verify_plan(files, [mc], cfg, lambda _f: None)
-    executed = verify._executed_module_configs_from_plan([mc], plan)
-    assert len(executed) == 1, (
-        f'expected exactly one executed module config for {files!r}, got '
-        f'{[e.prefix for e in executed]!r}'
-    )
-    return executed[0]
-
-
 @pytest.mark.parametrize('prefix', sorted(MEASURED_MODULE_SUITE_WORST_SECS))
 def test_module_carries_its_own_measured_verify_budget(
-    prefix: str, root_config: OrchestratorConfig
+    prefix: str,
+    root_config: OrchestratorConfig,
+    discover_module_configs: Callable[[], dict[str, ModuleConfig]],
+    executed_for_touched: Callable[[str, list[str], OrchestratorConfig], ModuleConfig],
 ) -> None:
     """Each measured module declares a warm budget, narrower than the repo-root ceiling.
 
@@ -310,7 +274,7 @@ def test_module_carries_its_own_measured_verify_budget(
       non-uniform.
     """
     worst = MEASURED_MODULE_SUITE_WORST_SECS[prefix]
-    discovered = _discovered()
+    discovered = discover_module_configs()
 
     assert prefix in discovered, (
         f'{prefix}/orchestrator.yaml is not discovered by the production '
@@ -370,7 +334,7 @@ def test_module_carries_its_own_measured_verify_budget(
     # (e) Survives the PRODUCTION plan -> execution bridge, not just the
     # resolver in isolation. See the docstring for why _apply_cargo_scope makes
     # this a live risk rather than a formality.
-    executed = _executed_for_touched(
+    executed = executed_for_touched(
         prefix, [SAMPLE_TOUCHED_FILE[prefix]], root_config
     )
     assert executed.verify_command_timeout_secs == mc.verify_command_timeout_secs, (
@@ -506,7 +470,9 @@ MODULE_BUDGET_EXCLUSIONS: dict[str, str] = {
 }
 
 
-def test_every_discovered_module_config_declares_its_own_verify_budget() -> None:
+def test_every_discovered_module_config_declares_its_own_verify_budget(
+    discover_module_configs: Callable[[], dict[str, ModuleConfig]],
+) -> None:
     """Every module config defining a test_command must declare a warm budget.
 
     THE ANTI-DRIFT HALF of this file, and the generalisation task 3473 exists
@@ -559,7 +525,7 @@ def test_every_discovered_module_config_declares_its_own_verify_budget() -> None
     """
     discovered = {
         prefix: mc
-        for prefix, mc in _discovered().items()
+        for prefix, mc in discover_module_configs().items()
         if mc.test_command
     }
 
@@ -675,7 +641,9 @@ def test_every_discovered_module_config_declares_its_own_verify_budget() -> None
 FAMILY_PUBLISHED_PREFIXES = frozenset({'scripts', 'tests/scripts'})
 
 
-def test_the_budget_family_derives_every_floor_from_one_canonical_expression() -> None:
+def test_the_budget_family_derives_every_floor_from_one_canonical_expression(
+    discover_module_configs: Callable[[], dict[str, ModuleConfig]],
+) -> None:
     """No family member may spell the floor derivation for itself (task 4320).
 
     THE HOLE THIS CLOSES, in the family's own words. Until this guard existed,
@@ -822,7 +790,7 @@ def test_the_budget_family_derives_every_floor_from_one_canonical_expression() -
         f'update FAMILY_PUBLISHED_PREFIXES and FAMILY_PUBLISHER_PATHS together'
     )
 
-    discovered = _discovered()
+    discovered = discover_module_configs()
 
     for prefix, pair in sorted(pairs.items()):
         # ---- (2) THE MEASUREMENT IS A MEASUREMENT --------------------------
