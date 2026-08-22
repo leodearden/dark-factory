@@ -12444,15 +12444,35 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     restored = restore_archived_transcript(
                         archive_root, str(self.task_id), session_id_val,
                         self._config_dir.path,
+                        # strict=True is what makes the `fault` classification
+                        # below REACHABLE for the faults that actually happen.
+                        # The helper is total by default and answers an
+                        # unreadable archive, an ENOSPC part-way, a corrupt
+                        # gzip member and a plain miss with the same None — so
+                        # without this the `else` arm buckets every one of them
+                        # as `miss` and sends the operator to work archive
+                        # coverage while the restore path is the broken thing.
+                        # Totality is not surrendered, only relocated: the
+                        # exception is caught one frame up, by this same
+                        # handler, and the outcome is still a FRESH dispatch.
+                        # A plain miss still returns None without raising (it
+                        # returns from above the helper's handler), so `miss`
+                        # keeps meaning exactly "the archive holds no entry".
+                        strict=True,
                     )
                 except Exception as exc:
                     # Fall through to the corroboration, which will veto and
                     # dispatch fresh — a broken restore costs context, never a
                     # dispatch.
                     restore_outcome = 'fault'
+                    # Names the whole rehydration, not just the archive-root
+                    # composition: with strict=True the restore's own I/O
+                    # faults land here too, and are in fact the majority of
+                    # what this handler now catches. The `%s` exception tail is
+                    # what tells the operator WHICH of the two it was.
                     logger.warning(
-                        'Task %s [%s]: failed to compose the transcript archive '
-                        'root while rehydrating session %s — proceeding without '
+                        'Task %s [%s]: failed to rehydrate session %s from the '
+                        'durable archive — proceeding without '
                         'a restore: %s',
                         self.task_id, role.name, session_id_val, exc,
                         extra={
