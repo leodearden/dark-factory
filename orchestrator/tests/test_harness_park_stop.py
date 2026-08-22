@@ -286,6 +286,7 @@ class TestHarnessRestartPersistence:
         assert seeder.load_scheduler_pause('dark_factory') is not None, (
             'The row must survive a re-asserted halt'
         )
+        assert harness.event_store is not None, 'The helper wires a real EventStore'
         events = _query_events(harness.event_store, 'scheduler_pause_restored')
         assert len(events) == 1, f'Expected one restored event; got {events}'
         payload = json.loads(events[0]['data'])
@@ -319,6 +320,7 @@ class TestHarnessRestartPersistence:
         assert harness._restored_pause_reason is None, (
             'No L1 may be filed for a halt that was not re-asserted'
         )
+        assert harness.event_store is not None, 'The helper wires a real EventStore'
         events = _query_events(harness.event_store, 'scheduler_pause_restored')
         assert len(events) == 1, f'Expected one restored event; got {events}'
         payload = json.loads(events[0]['data'])
