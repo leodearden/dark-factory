@@ -438,6 +438,301 @@ class TestVerifyResultPlan:
 
 
 # ---------------------------------------------------------------------------
+# Task 3789 (ε) step-3: VerifyResult.flake_suppression — the TYPED wire carrier
+# that moves a discriminator observation from wherever the worktree is to the
+# dispatcher that records it (flake-ledger-prd.md §8, §8.4).
+# ---------------------------------------------------------------------------
+
+
+def _make_suppression(**overrides):
+    """A fully-populated FlakeSuppression; override any field by keyword."""
+    from orchestrator.flake_ledger import FlakeCallSite, FlakeSuppression, FlakeVerdict
+
+    kwargs = {
+        'verdict': FlakeVerdict.passes_in_isolation,
+        'test_ids': ('tests/test_a.py::test_one', 'tests/test_b.py::test_two'),
+        'observed_at': '2026-08-06T12:00:00+00:00',
+        'call_site': FlakeCallSite.merge_gate,
+        'runner': 'remote-lab-1',
+        'psi_cpu_some10': 12.5,
+        'unconfirmable_reason': None,
+    }
+    kwargs.update(overrides)
+    return FlakeSuppression(**kwargs)
+
+
+class TestVerifyResultFlakeSuppressionWire:
+    """VerifyResult carries an optional TYPED `flake_suppression` across the wire.
+
+    Deliberately NOT a plain JSON-native dict like `contention`/`plan`/
+    `failing_test_ids`: PRD §8 specifies a typed carrier and the dispatcher-side
+    recorder consumes a `FlakeSuppression`, so a bare dict would make the annotation
+    a lie on exactly the deserialized path this exists to serve.  `result_to_dict`
+    (asdict) already serialises it losslessly; only `result_from_dict` needs the
+    reconstruction hook — the same shape `MergeVerifySpec.from_dict` uses for its
+    optional nested `global_verify_command`.
+    """
+
+    def test_defaults_to_none(self):
+        """(a) Every existing hand-built VerifyResult is unaffected."""
+        vr = VerifyResult(
+            passed=True, test_output='', lint_output='', type_output='', summary='ok'
+        )
+        assert vr.flake_suppression is None
+
+    def test_round_trips_through_json_as_a_typed_value(self):
+        """(b) The headline: what comes back off the wire is a FlakeSuppression with
+        its enums and tuple intact, not a bare dict of strings and lists.
+
+        Asserted on the FIELD, never via VerifyResult.__eq__ — the field is
+        `compare=False` (see test_differs_only_in_suppression_still_compares_equal),
+        so a whole-object assertion would pass VACUOUSLY here.
+        """
+        from orchestrator.flake_ledger import FlakeCallSite, FlakeSuppression, FlakeVerdict
+
+        s = _make_suppression()
+        vr = VerifyResult(
+            passed=False,
+            test_output='FAILED test_a',
+            lint_output='',
+            type_output='',
+            summary='1 failure',
+            flake_suppression=s,
+        )
+        rt = result_from_json(result_to_json(vr))
+
+        assert isinstance(rt.flake_suppression, FlakeSuppression)
+        assert rt.flake_suppression == s
+        assert rt.flake_suppression.verdict is FlakeVerdict.passes_in_isolation
+        assert rt.flake_suppression.call_site is FlakeCallSite.merge_gate
+        assert isinstance(rt.flake_suppression.test_ids, tuple)
+        assert rt.flake_suppression.test_ids == (
+            'tests/test_a.py::test_one',
+            'tests/test_b.py::test_two',
+        )
+        assert rt.flake_suppression.runner == 'remote-lab-1'
+        assert rt.flake_suppression.psi_cpu_some10 == 12.5
+        assert rt.flake_suppression.observed_at == '2026-08-06T12:00:00+00:00'
+
+    def test_round_trips_an_unconfirmable_observation(self):
+        """(c) §5.5 records the OBSERVATION, not the remedy — an `unconfirmable` rides
+        the wire too, and its reason and NULL psi must survive (None means "PSI was
+        unreadable", never "the host was idle")."""
+        from orchestrator.flake_ledger import FlakeVerdict
+
+        s = _make_suppression(
+            verdict=FlakeVerdict.unconfirmable,
+            test_ids=(),
+            psi_cpu_some10=None,
+            unconfirmable_reason='node-ids mapped to no discovered subproject',
+        )
+        vr = VerifyResult(
+            passed=False,
+            test_output='',
+            lint_output='',
+            type_output='',
+            summary='red',
+            flake_suppression=s,
+        )
+        rt = result_from_json(result_to_json(vr))
+
+        assert rt.flake_suppression == s
+        assert rt.flake_suppression.verdict is FlakeVerdict.unconfirmable
+        assert rt.flake_suppression.test_ids == ()
+        assert rt.flake_suppression.psi_cpu_some10 is None
+        assert (
+            rt.flake_suppression.unconfirmable_reason
+            == 'node-ids mapped to no discovered subproject'
+        )
+
+    def test_to_dict_needs_no_allowlist_change(self):
+        """asdict flattens the nested dataclass and json.dumps flattens its StrEnums —
+        the WRITE half of the codec is untouched by this field."""
+        vr = VerifyResult(
+            passed=True,
+            test_output='',
+            lint_output='',
+            type_output='',
+            summary='ok',
+            flake_suppression=_make_suppression(),
+        )
+        d = result_to_dict(vr)
+        assert isinstance(d['flake_suppression'], dict)
+        payload = json.loads(json.dumps(d, sort_keys=True))
+        assert payload['flake_suppression']['verdict'] == 'passes_in_isolation'
+        assert payload['flake_suppression']['test_ids'] == [
+            'tests/test_a.py::test_one',
+            'tests/test_b.py::test_two',
+        ]
+
+    # -- (d) B13: NEW dispatcher, OLD remote -------------------------------------
+
+    def test_b13_omitted_key_yields_none(self):
+        """B13 — an older remote's payload simply has no such key.  The default
+        applies: no suppression, no ledger row, no crash."""
+        vr = VerifyResult(
+            passed=False, test_output='', lint_output='', type_output='', summary='red'
+        )
+        d = result_to_dict(vr)
+        d.pop('flake_suppression')
+        assert result_from_dict(d).flake_suppression is None
+
+    def test_b13_explicit_null_yields_none(self):
+        payload = json.dumps(
+            {
+                'passed': False,
+                'test_output': '',
+                'lint_output': '',
+                'type_output': '',
+                'summary': 'red',
+                'flake_suppression': None,
+            }
+        )
+        assert result_from_json(payload).flake_suppression is None
+
+    @pytest.mark.parametrize(
+        'malformed',
+        [
+            'passes_in_isolation',
+            {'verdict': 'passes_in_isolation'},
+            [],
+            17,
+        ],
+        ids=['str', 'missing_keys', 'list', 'int'],
+    )
+    def test_b13_malformed_payload_degrades_to_none_without_raising(self, malformed):
+        """A malformed sub-payload must cost ONE observation, not a whole re-verify:
+        anything raising out of result_from_json becomes a RunnerUnavailable at
+        verify_runner.py:1447, which the pool pays for with a local re-run."""
+        payload = json.dumps(
+            {
+                'passed': False,
+                'test_output': '',
+                'lint_output': '',
+                'type_output': '',
+                'summary': 'red',
+                'flake_suppression': malformed,
+            }
+        )
+        rt = result_from_json(payload)
+        assert rt.flake_suppression is None
+        assert rt.passed is False
+        assert rt.summary == 'red'
+
+    def test_from_dict_does_not_mutate_the_callers_dict(self):
+        """The hook rebuilds into a shallow COPY — a caller inspecting the payload it
+        just handed over must not find it silently retyped underneath."""
+        vr = VerifyResult(
+            passed=True,
+            test_output='',
+            lint_output='',
+            type_output='',
+            summary='ok',
+            flake_suppression=_make_suppression(),
+        )
+        d = json.loads(result_to_json(vr))
+        before = json.dumps(d, sort_keys=True)
+        result_from_dict(d)
+        assert json.dumps(d, sort_keys=True) == before
+
+    # -- (e) compare=False -------------------------------------------------------
+
+    def test_differs_only_in_suppression_still_compares_equal(self):
+        """`observed_at` is a wall-clock stamp taken by the discriminator, so two
+        independent runs of the same logical verification carry different values —
+        the identical argument already written out for `duration_secs`.  Without
+        compare=False, attaching the field on the NON-suppressed branch too (which
+        §5.5 requires) would break test_cli's
+        test_verify_merge_cli_wrapper_transparency the moment a failing CLI verify
+        produced an `unconfirmable` observation."""
+        from orchestrator.flake_ledger import FlakeVerdict
+
+        base = dict(
+            passed=False, test_output='', lint_output='', type_output='', summary='red'
+        )
+        a = VerifyResult(**base, flake_suppression=None)
+        b = VerifyResult(**base, flake_suppression=_make_suppression())
+        c = VerifyResult(
+            **base,
+            flake_suppression=_make_suppression(
+                verdict=FlakeVerdict.fails_in_isolation,
+                observed_at='2099-01-01T00:00:00+00:00',
+            ),
+        )
+        assert a == b == c
+
+    def test_field_is_declared_compare_false(self):
+        """Structural pin: a later hand-edit that drops compare=False would break the
+        CLI transparency invariant in a distant file, so assert the declaration."""
+        f = {f.name: f for f in dataclasses.fields(VerifyResult)}['flake_suppression']
+        assert f.compare is False
+        assert f.default is None
+
+    # -- (f) the OTHER skew direction — characterization only --------------------
+
+    def test_characterization_unknown_top_level_key_raises_typeerror(self):
+        """CHARACTERIZATION PIN of PRE-EXISTING behaviour, not a new capability.
+
+        §8.4 says an unknown key "is ignored" by an OLD dispatcher.  It is not:
+        `result_from_dict` is a bare `VerifyResult(**d)`, so an unknown top-level key
+        is a TypeError.  This property is shared by every optional field added before
+        this one (contention, plan, failing_test_ids, failing_leg_categories,
+        trivial), so it is neither introduced nor worsened here — and the OUTCOME
+        still holds (see the twin below): degrade to a local re-verify, never a wrong
+        verdict.  This task deliberately does NOT change the codec's strictness.
+        """
+        payload = json.dumps(
+            {
+                'passed': True,
+                'test_output': '',
+                'lint_output': '',
+                'type_output': '',
+                'summary': 'ok',
+                'a_field_from_a_newer_remote': 1,
+            }
+        )
+        with pytest.raises(TypeError):
+            result_from_json(payload)
+
+    @pytest.mark.asyncio
+    async def test_characterization_remote_typeerror_becomes_runner_unavailable(self):
+        """The twin of the above, at the boundary that matters: RemoteRunner converts
+        that TypeError into RunnerUnavailable (verify_runner.py:1447), which
+        VerifyRunnerPool.dispatch turns into a LOCAL re-verify.  Degraded, never
+        wrong — and never an unhandled crash in the merge path."""
+        from orchestrator.verify_runner import RunnerUnavailable
+
+        async def fake_run(argv, *, cwd=None):
+            if argv[0] == 'git':
+                return (0, '', '')
+            return (
+                0,
+                json.dumps(
+                    {
+                        'passed': True,
+                        'test_output': '',
+                        'lint_output': '',
+                        'type_output': '',
+                        'summary': 'ok',
+                        'a_field_from_a_newer_remote': 1,
+                    }
+                ),
+                '',
+            )
+
+        runner = RemoteRunner(
+            name='laptop',
+            ssh_host='laptop.local',
+            git_remote='origin',
+            cwd='/repo',
+            run=fake_run,
+            id_factory=lambda: 'fixed-id',
+        )
+        with pytest.raises(RunnerUnavailable):
+            await runner.run_merge_verify('abc123', _make_spec())
+
+
+# ---------------------------------------------------------------------------
 # Task 2306 step-3: FLOCK_CONTENTION_CATEGORY + make_flock_contention_result —
 # the contention-result builder consumed by task beta (workstation side).
 # ---------------------------------------------------------------------------
