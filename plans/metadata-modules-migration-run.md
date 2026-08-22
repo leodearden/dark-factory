@@ -153,7 +153,7 @@ match, and `deferred` being a substring of `merge-deferred` makes a
 Every remaining carrier outside these three statuses is accounted for: exactly
 one, reify 5050.
 
-## 6. Disposition of reify 5050 (steward, esc-4528-2)
+## 5. Disposition of reify 5050 (steward, esc-4528-2)
 
 **Accepted as the single documented remainder.** The migration is complete for
 operational purposes; reify 5050 is NOT forced and NOT repaired by this task.
@@ -204,3 +204,61 @@ absorbed:
    directory gate) — if it does, replace-mode fails too and the
    direct-edit conclusion is restored. That is a one-call experiment, not a
    reason to start with the destructive option.
+
+## 6. Re-verification after the amendment pass
+
+The review amendments changed both what the script REFUSES (a malformed
+`modules`/`files`, and a drop-branch task whose pre-existing `files` carries a
+directory-shaped entry the server gate would reject) and what it PRINTS (a new
+`read_failed` column per root and in the summary, so a root that could not be
+read can no longer report the same zeros as a fully-migrated one). Every figure
+above was measured with the pre-amendment script, so the amended one was re-run
+**read-only** over the same seven roots to confirm it still reads the live
+corpora and still agrees.
+
+```bash
+uv run --project shared python scripts/migrate_metadata_modules_to_files.py --dry-run \
+  --project-root ...   # the same seven roots as section 0
+```
+
+| project | visited | copied | sanitized_empty | dropped | failed | read_failed |
+|---|---|---|---|---|---|---|
+| dark-factory | 915 | 0 | 0 | 1 | 0 | 0 |
+| reify | 707 | 0 | 1 | 0 | 0 | 0 |
+| autopilot-video | 6 | 0 | 0 | 0 | 0 | 0 |
+| know-live | 5 | 0 | 0 | 0 | 0 | 0 |
+| pump-web-ui | 4 | 0 | 0 | 0 | 0 | 0 |
+| solar-challenge | 7 | 0 | 0 | 0 | 0 | 0 |
+| solar-challenge-platform | 3 | 0 | 0 | 0 | 0 | 0 |
+| **total** | **1647** | **0** | **1** | **1** | **0** | **0** |
+
+Three things this settles, and one it does not:
+
+1. **`read_failed: 0` on every root.** The read reply is now classified with
+   the same predicate as the write, which was the one amendment carrying a
+   real risk of a false positive — a legitimate `get_tasks` answer misread as
+   "unreadable" would have turned all seven roots red. It does not.
+2. **`failed: 0` on every root.** Neither new refusal fires on live data:
+   there is no malformed `modules`/`files` anywhere in the seven corpora, and
+   no drop-branch task whose pre-existing `files` would trip the gate. Both
+   branches are covered by test only, like the file-shaped copy branch.
+3. **Residual carriers by status are unchanged** except for one reify task that
+   reached `done` in the interval (done 4355 → 4356; cancelled 349 and deferred
+   16 identical). Section 4 stands.
+
+What it does NOT show is a zero-pending corpus, and the reason is live drift
+rather than a regression:
+
+- **reify 5050** is still pending, exactly as section 5 accepts. Unchanged.
+- **dark-factory 3202** is a NEW drop-branch carrier — a task filed with
+  `metadata.modules` *after* the run, so it did not exist for any phase above.
+  It is not forced here: the same discipline section 1 applied to its own
+  baseline divergence ("live, continuously-mutated state; the divergence is
+  immaterial and was not forced"), and an amendment pass is not the place to
+  start writing live task metadata outside its own plan step.
+
+3202 is worth naming rather than waving through, because it is *evidence for*
+the ε leaf: as long as the `modules` boundary exists, new carriers keep being
+filed, and any "the corpora are migrated" claim has a shelf life measured in
+hours. Retiring the boundary is what makes the migration terminal; re-running
+this script is only ever a sweep.
