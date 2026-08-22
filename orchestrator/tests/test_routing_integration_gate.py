@@ -102,6 +102,7 @@ from _recording_event_store import _RecordingEventStore
 from _workflow_helpers import (
     AgentStub,
     FakeMetadataBackend,
+    _build_harness,
     _build_workflow,
     _derive_meta_root_like_production,  # noqa: F401  autouse fixture, see its docstring
     _init_repo,
@@ -114,6 +115,7 @@ from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig, SandboxConfig
 from orchestrator.event_store import EventType
 from orchestrator.git_ops import GitOps
+from orchestrator.harness import TaskReport
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.verify import VerifyResult
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
