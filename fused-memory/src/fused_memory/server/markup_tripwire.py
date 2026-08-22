@@ -236,7 +236,7 @@ def emit_markup_storm_escalation(
     ``markup_guard.py``:383,397) and the per-call ``markup guard: <outcome>
     tool=... agent_id=... project=...`` line (``mcp_markup_middleware.py``
     :615-619). Keep them STATIC — never interpolate the resolved outcome into a
-    suggested grep, for the reason ``writes_in_window=`` is a static key.
+    suggested grep, for the reason the detail's ``count=`` key is static.
 
     NEVER raises. This is called from an MCP write path whose rejection has
     already been decided, so escalation is purely additive: every failure mode
@@ -373,12 +373,17 @@ def emit_markup_storm_escalation(
         # task 4458 retired. That pooling is what filed esc-markup-tripwire-6
         # into reify's queue stating 3, for a window reify contributed 1 to.
         f'{_DETAIL_OUTCOME_KEY}{outcome!r}',
-        # The key is outcome-NEUTRAL and STATIC. Neutral because this filer
-        # serves all three of the middleware's outcomes and a key naming one of
-        # them contradicts its own content on the other two; static — never
-        # interpolated into `repaired_writes_in_window=` — because grepping one
-        # field across every record is the property an operator relies on.
-        f'writes_in_window={count!r}',
+        # The key is outcome-NEUTRAL, STATIC, and spelled the way the SIBLING
+        # filer for this same record kind spells it — `_markup_storm_detail` in
+        # orchestrator/mcp/plan_tools.py emits count/threshold/window_seconds/
+        # outcome. Neutral because this filer serves all three of the
+        # middleware's outcomes and a key naming one of them contradicts its own
+        # content on the other two; static — never interpolated into
+        # `repaired_writes_in_window=` — because grepping one field across every
+        # record is the property an operator relies on, and that property dies
+        # just as fast if the two filers make an operator grep two keys for the
+        # same number.
+        f'count={count!r}',
         f'threshold={storm.get("threshold")!r}',
         f'window_seconds={window_seconds!r}',
         '',

@@ -279,9 +279,13 @@ class TestEmitMarkupStormEscalation:
         # filer serves all three of the middleware's outcomes, and a key naming
         # one of them contradicts its own content on the other two. Static, and
         # not interpolated from the outcome, because greppability across records
-        # is the one property an operator relies on. Anchored on both sides so
-        # the old `rejected_writes_in_window=4` cannot satisfy it by substring.
-        assert '\nwrites_in_window=4\n' in detail, f'must state the count: {detail!r}'
+        # is the one property an operator relies on — which is also why it is
+        # `count=`, the spelling the sibling filer for this same record kind
+        # already uses (`_markup_storm_detail` in orchestrator/mcp/plan_tools.py):
+        # one number, one grep, both boundary guards. Anchored on both sides so
+        # neither the old `rejected_writes_in_window=4` nor a `dedupe_count=4`
+        # can satisfy it by substring.
+        assert '\ncount=4\n' in detail, f'must state the count: {detail!r}'
         assert 'outcome=' in detail, (
             f'the count is a count of ONE outcome; name it: {detail!r}'
         )
