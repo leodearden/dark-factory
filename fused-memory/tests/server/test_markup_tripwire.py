@@ -321,10 +321,28 @@ class TestEmitMarkupStormEscalation:
         """The headline. Today this record claims writes were rejected when the
         burst it describes consists entirely of calls that SUCCEEDED.
 
-        The word is asserted absent from BOTH fields, because the false claim is
-        not confined to the count's label: the detail's prose says the tripwire
-        "rejected multiple writes" and the summary says "MCP write(s) rejected",
-        and each is read by a different consumer.
+        The word is asserted absent from all THREE operator-facing fields,
+        because the false claim is not confined to the count's label: the
+        summary says "MCP write(s) rejected", the detail's attach-instruction
+        says "from the rejection responses", and `suggested_action` says
+        "from the rejection logs" — and each is read by a different consumer.
+
+        `suggested_action` is NOT a low-visibility afterthought. It sits in
+        exactly the same read-tier as the summary:
+        escalation/src/escalation/server.py:409-414 lists it in
+        `_COMPACT_ESCALATION_FIELDS` beside `summary`, and :420 carries both
+        into `_COMPACT_PENDING_FIELDS`, while `detail` is dropped BY NAME as
+        "the unbounded free-text field that motivated compact mode". So the L1
+        escalation watcher and get_pending_escalations(compact=True) read this
+        field having never seen the detail — the same citation that justified
+        fixing the summary, followed through to its third field.
+
+        THE NEEDLE IS THE STEM 'reject', NOT 'rejected'. Do not "simplify" it
+        back: the defective text reads "the rejection logs", and 'rejected' is
+        NOT a substring of 'rejection' (r-e-j-e-c-t-e-d vs r-e-j-e-c-t-i-o-n),
+        so the narrower needle passes today over defective text and guards
+        nothing. The stem catches 'rejected', 'rejection' and 'rejections'
+        alike, and a correct repaired record carries none of them.
         """
         if not markup_tripwire.HAS_ESCALATION:
             assert emit_markup_storm_escalation(str(tmp_path), _REPAIRED_STORM) is None
@@ -335,10 +353,12 @@ class TestEmitMarkupStormEscalation:
         assert 'repaired' in payload['summary'], (
             f"must name the burst's own outcome: {payload['summary']!r}"
         )
-        both = f'{payload["summary"]}\n{payload["detail"]}'
-        assert 'rejected' not in both, (
+        compact_plus_detail = (
+            f'{payload["summary"]}\n{payload["detail"]}\n{payload["suggested_action"]}'
+        )
+        assert 'reject' not in compact_plus_detail.lower(), (
             f'nothing was rejected in a repaired burst — a triager grepping '
-            f'their journal for rejections finds zero: {both!r}'
+            f'their journal for rejections finds zero: {compact_plus_detail!r}'
         )
 
     def test_a_rejected_burst_still_reads_as_rejected(self, tmp_path):
@@ -391,6 +411,47 @@ class TestEmitMarkupStormEscalation:
             f'contribution: {summary!r}'
         )
 
+    def test_the_record_points_at_log_lines_that_actually_exist(self, tmp_path):
+        """The record's whole remedy is "go reproduce this from your own logs",
+        so its grep hints have to name tokens a real emitter actually writes.
+
+        Outcome-independent — a dead pointer is dead for every outcome — so this
+        files the rejected fixture.
+
+        'markup_tripwire_storm' MATCHES NOTHING. `grep -rn markup_tripwire_storm
+        --include=*.py .` over the repo returns exactly one hit: the instruction
+        itself, in markup_tripwire.py. A triager who follows it greps for a
+        token no emitter has ever written and finds zero lines — which is
+        indistinguishable from "the leak stopped", the one conclusion this
+        record exists to prevent.
+
+        'markup_guard_storm' is the real token, emitted by BOTH live producers:
+        shared/src/shared/mcp_markup_middleware.py:682 and
+        fused-memory/src/fused_memory/server/markup_guard.py:383,397. The
+        per-call companion line is `markup guard: <outcome> tool=... agent_id=...
+        project=...` (mcp_markup_middleware.py:615-619). The sibling filer
+        already gets this right — orchestrator/src/orchestrator/mcp/plan_tools.py:1849
+        points operators at 'markup guard:' and 'markup_guard_storm' — so the
+        correct text is precedent here, not invention.
+        """
+        if not markup_tripwire.HAS_ESCALATION:
+            assert emit_markup_storm_escalation(str(tmp_path), _REJECTED_STORM) is None
+            return
+
+        payload = self._filed(tmp_path, _REJECTED_STORM)
+        pointers = f'{payload["detail"]}\n{payload["suggested_action"]}'
+
+        assert 'markup_tripwire_storm' not in pointers, (
+            f'that token has no emitter anywhere in the repo — its only '
+            f'occurrence is this instruction, so the grep it prescribes '
+            f'returns nothing: {pointers!r}'
+        )
+        assert 'markup_guard_storm' in pointers, (
+            f'the record must name the token its own producers actually log '
+            f'(mcp_markup_middleware.py:682, markup_guard.py:383,397): '
+            f'{pointers!r}'
+        )
+
     def test_a_storm_of_unknown_outcome_claims_no_outcome_it_did_not_measure(
         self, tmp_path
     ):
@@ -428,6 +489,24 @@ class TestEmitMarkupStormEscalation:
             # and window legitimately render None elsewhere in this sentence.
             assert 'write(s) None' not in summary, (
                 f"the outcome slot must not read 'None': {summary!r}"
+            )
+            # The same rule on the THIRD compact-projected field. Without this
+            # the neutral-outcome guarantee holds on summary and detail and
+            # silently lapses on suggested_action, which is exactly how the
+            # surviving "the rejection logs" sentence went unnoticed. The stem,
+            # not 'rejected', for the reason recorded on
+            # test_a_repaired_burst_is_not_described_as_rejected.
+            suggested = payload['suggested_action']
+            assert 'reject' not in suggested.lower(), (
+                f'no outcome was measured, so the remedy may not send the '
+                f'triager to rejection logs for a burst that may contain no '
+                f'rejection at all: {suggested!r}'
+            )
+            # This field interpolates nothing, so any 'None' in it would be a
+            # confident claim about something never measured.
+            assert 'None' not in suggested, (
+                f"the remedy must not name an unmeasured outcome as 'None': "
+                f'{suggested!r}'
             )
 
     def test_escalation_id_is_greppable_via_the_stable_anchor(self, tmp_path):
