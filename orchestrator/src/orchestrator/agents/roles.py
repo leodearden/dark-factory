@@ -648,7 +648,7 @@ abandoned work is recorded as a successful run."""
 # sighting every census cycle, and a number baked into a role prompt goes
 # stale silently while "catalogued sightings all show the same shape" stays
 # true.
-TOOL_CALL_REJECTION_GUIDANCE = """
+_TOOL_CALL_REJECTION_KNOWN_SHAPES = """
 ## Reading a tool-call rejection before you retry
 
 `InputValidationError` reports a defect in the CALL you just made, and it
@@ -669,11 +669,12 @@ reports two different shapes, and they need OPPOSITE fixes:
 """
 
 
-# Census-2026-08-21 §1.1 companion to TOOL_CALL_REJECTION_GUIDANCE above (task
-# 4578; plans/confusion-census-2026-08-21.md). A dispatched session called the
-# `Agent` tool supplying only a `prompt` field; the schema also requires
-# `description`, and the omission was rejected by `InputValidationError: The
-# required parameter 'description' is missing` before any sub-agent launched.
+# Census-2026-08-21 §1.1 companion to _TOOL_CALL_REJECTION_KNOWN_SHAPES above
+# (task 4578; plans/confusion-census-2026-08-21.md). A dispatched session
+# called the `Agent` tool supplying only a `prompt` field; the schema also
+# requires `description`, and the omission was rejected by
+# `InputValidationError: The required parameter 'description' is missing`
+# before any sub-agent launched.
 #
 # WHAT IS AND IS NOT ADDRESSED. The CAUSE is upstream of this repository --
 # harness-side tool-call construction for a Claude Code builtin -- and no
@@ -721,6 +722,12 @@ MISSING_REQUIRED_PARAMETER_REJECTION = """\
   that supplied `prompt` and omitted the required `description`, rejected
   before any sub-agent launched.
 """
+
+
+# The single splice unit.  SYSTEM prompts embed THIS, never either half on its
+# own -- test_roles_tool_call_rejection.py asserts the composition so the
+# three shapes cannot drift apart.
+TOOL_CALL_REJECTION_GUIDANCE = _TOOL_CALL_REJECTION_KNOWN_SHAPES + MISSING_REQUIRED_PARAMETER_REJECTION
 
 
 # Canonical rc=0/1/128 check for `git merge-base --is-ancestor`, spliced into
