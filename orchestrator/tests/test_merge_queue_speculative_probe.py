@@ -991,7 +991,10 @@ class TestDispatchItemProbeWiring:
 
         captured: dict = {}
 
-        async def _fake_run_inflight_verify(item, lease, depth=None, probe_base=None):
+        # **_kw absorbs telemetry kwargs _dispatch_item forwards but this
+        # test does not assert on (task 3185 added chain_items), so a
+        # future additive kwarg cannot break these probe assertions.
+        async def _fake_run_inflight_verify(item, lease, depth=None, probe_base=None, **_kw):
             captured['depth'] = depth
             captured['probe_base'] = probe_base
             return InflightVerifyResult(outcome=None, merge_wt=item.merge_wt)
@@ -1029,7 +1032,10 @@ class TestDispatchItemProbeWiring:
 
         captured: dict = {}
 
-        async def _fake_run_inflight_verify(item, lease, depth=None, probe_base=None):
+        # **_kw absorbs telemetry kwargs _dispatch_item forwards but this
+        # test does not assert on (task 3185 added chain_items), so a
+        # future additive kwarg cannot break these probe assertions.
+        async def _fake_run_inflight_verify(item, lease, depth=None, probe_base=None, **_kw):
             captured['depth'] = depth
             captured['probe_base'] = probe_base
             return InflightVerifyResult(outcome=None, merge_wt=item.merge_wt)

@@ -17002,6 +17002,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         lease: Any,  # HostLease
         depth: int | None = None,
         probe_base: str | None = None,
+        chain_items: int = 1,
     ) -> InflightVerifyResult:
         """Run the verify portion for one in-flight item.
 
@@ -17059,6 +17060,24 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             :class:`ProbePlacement`'s docstring for the full caveat and the
             deferred follow-up (redirecting dispatch itself onto the deep
             tip) that would close this gap.
+        chain_items: 1-indexed count of queued items contained in the tree
+            this verify ACTUALLY EXERCISES (task 3185, PRD γ), computed
+            synchronously by the caller (_dispatch_item) and forwarded into
+            _run_post_merge_verify alongside depth/speculative.
+
+            Deliberately contrasts with ``depth`` directly above: ``depth``
+            is an ATTRIBUTION label that a firing probe relabels onto a
+            deeper stack which this verify never touched, whereas
+            ``chain_items`` is a fact about the tree that actually ran. That
+            is why the caller derives it from _verify_frontier_depth()
+            rather than from its local ``depth`` variable, and why a
+            consumer wanting real cumulative-diff coverage reads this field
+            and not that one.
+
+            Defaults to ``1`` — NOT ``None`` — because a count of items in a
+            verified tree has a smallest truthful value of 1, so the shim /
+            harness / direct-call paths that omit it stay byte-identical in
+            meaning as well as in behaviour.
         """
         req = item.request
         merge_wt = item.merge_wt
@@ -17180,6 +17199,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 ),
                 depth=depth,
                 speculative=item.speculative,
+                chain_items=chain_items,
                 merge_base_sha=merge_base_sha,
                 main_sha=main_sha,
             ))
@@ -19349,8 +19369,28 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         placement = self._probe_verify_placement(item)
         depth = placement.depth if placement is not None else self._verify_frontier_depth()
         probe_base = placement.base if placement is not None else None
+        # task 3185 (PRD γ): the TRUTHFUL 1-indexed count of items in the tree
+        # this verify actually exercises -- the honest depth signal `depth`
+        # above cannot be, and the one ε's deep-fail-rate reader keys on.
+        #
+        # Reads _verify_frontier_depth() DIRECTLY rather than reusing the
+        # local `depth`: a firing ProbePlacement has already overwritten
+        # `depth` with an attribution fact about a deeper already-built stack
+        # that this dispatch does NOT verify (see ProbePlacement's KNOWN
+        # PHASE-1 LIMITATION). Deriving chain_items from that would import the
+        # probe-era off-by-one this field exists to replace.
+        #
+        # The non-speculative arm is a FLAT 1, not `frontier + 1`: a slot-1
+        # item is merged onto REAL MAIN, so its tree contains exactly itself
+        # no matter how many other verifies are in flight ahead of it. A
+        # blanket `depth + 1` would over-count precisely that case (a
+        # non-speculative re-merge dispatched against a non-empty frontier).
+        chain_items = (self._verify_frontier_depth() + 1) if item.speculative else 1
         verify_task: asyncio.Task = asyncio.ensure_future(  # type: ignore[type-arg]
-            self._run_inflight_verify(item, lease, depth=depth, probe_base=probe_base)
+            self._run_inflight_verify(
+                item, lease, depth=depth, probe_base=probe_base,
+                chain_items=chain_items,
+            )
         )
 
         return InflightEntry(
