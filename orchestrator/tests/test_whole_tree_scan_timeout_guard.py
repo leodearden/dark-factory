@@ -133,3 +133,162 @@ class TestTimeoutConstants:
             'xdist worker deaths this guard exists to prevent were seen at '
             'loadavg 250-423; anything tighter re-arms that cliff.'
         )
+
+
+# ---------------------------------------------------------------------------
+# _scans_whole_tree_py(source) -- inline-fixture unit tests.
+#
+# Same shape as the sibling guards this module polices
+# (test_raw_semaphore_access_guard.py, test_prune_chokepoint_guard.py): a pure
+# `_find_X(source)` detector exercised against synthetic snippets, so each
+# branch is pinned directly instead of only ever being reached via the real
+# tree -- which goes green by construction once step-6 lands and would
+# otherwise leave the detector's negative cases untested forever.
+# ---------------------------------------------------------------------------
+
+
+def test_detector_flags_rglob_py() -> None:
+    """The canonical whole-tree sweep: ``rglob('*.py')``."""
+    source = (
+        "def scan(root):\n"
+        "    return sorted(root.rglob('*.py'))\n"
+    )
+    assert _scans_whole_tree_py(source) is True
+
+
+def test_detector_flags_glob_py() -> None:
+    """Non-recursive ``glob('*.py')`` counts too -- ``orchestrator/src`` alone
+    is already ~250 files, and the cost model is per-file ``ast.parse``, not
+    recursion depth."""
+    source = (
+        "def scan(root):\n"
+        "    return sorted(root.glob('*.py'))\n"
+    )
+    assert _scans_whole_tree_py(source) is True
+
+
+def test_detector_ignores_non_py_directory_sweep() -> None:
+    """``glob('*/src/*')`` is NOT a Python-source sweep.
+
+    This is the real pattern at test_killpg_frozen_pgid_guard.py:433-434, and
+    it is what stops the detector reading that file's directory walks as the
+    thing being guarded -- while its genuine ``rglob('*.py')`` at :447 is still
+    caught by the case above.
+    """
+    source = (
+        "def packages(root):\n"
+        "    return sorted(root.glob('*/src/*'))\n"
+    )
+    assert _scans_whole_tree_py(source) is False
+
+
+def test_detector_ignores_non_py_suffix() -> None:
+    """A wildcard sweep over some other suffix is not this hazard."""
+    source = (
+        "def fixtures(root):\n"
+        "    return sorted(root.rglob('*.txt'))\n"
+    )
+    assert _scans_whole_tree_py(source) is False
+
+
+def test_detector_ignores_literal_filename_without_wildcard() -> None:
+    """``glob('conftest.py')`` names ONE file per directory, not a tree sweep.
+
+    The wildcard requirement is what separates "find this specific file" from
+    "parse every module in the repo".
+    """
+    source = (
+        "def conftests(root):\n"
+        "    return sorted(root.glob('conftest.py'))\n"
+    )
+    assert _scans_whole_tree_py(source) is False
+
+
+def test_detector_ignores_non_literal_pattern() -> None:
+    """A variable pattern is unknowable statically, so it is NOT flagged.
+
+    Fail-soft direction, matching the fail-soft ``SyntaxError`` polarity below:
+    this guard is a FLOOR on coverage, never a claim of totality (see
+    ``_scans_whole_tree_py``'s "known limitation" note).
+    """
+    source = (
+        "def scan(root, pattern):\n"
+        "    return sorted(root.rglob(pattern))\n"
+    )
+    assert _scans_whole_tree_py(source) is False
+
+
+def test_detector_ignores_zero_arg_glob_without_raising() -> None:
+    """``rglob()`` with no args must return False, not IndexError.
+
+    Not valid at runtime, but it is valid SYNTAX -- and a detector that blows
+    up on a half-typed call would turn every unrelated guard red mid-edit.
+    """
+    source = (
+        "def broken(root):\n"
+        "    return sorted(root.rglob())\n"
+    )
+    assert _scans_whole_tree_py(source) is False
+
+
+def test_detector_ignores_module_with_no_glob_at_all() -> None:
+    """The overwhelmingly common case: a module that never sweeps anything."""
+    source = (
+        "import json\n"
+        "\n"
+        "def load(path):\n"
+        "    return json.loads(path.read_text())\n"
+    )
+    assert _scans_whole_tree_py(source) is False
+
+
+def test_detector_ignores_docstring_mention() -> None:
+    """A docstring or comment merely MENTIONING the pattern is not flagged --
+    proves the detector is AST-based, not a text grep. This module's own
+    docstring is full of such mentions."""
+    source = (
+        '"""Sweeps the tree with rglob(\'*.py\') and parses each file."""\n'
+        "# root.rglob('*.py') -- example only, not a real call\n"
+    )
+    assert _scans_whole_tree_py(source) is False
+
+
+def test_detector_fails_soft_on_syntax_error() -> None:
+    """An unparseable file yields False rather than propagating.
+
+    Deliberately the polarity of the sibling guards (test_prune_chokepoint_guard.py:138-141,
+    test_raw_semaphore_access_guard.py:76-79 both ``except SyntaxError: return []``)
+    and deliberately NOT test_marker_registration_drift.py's loud polarity: a
+    mid-edit or intentionally-malformed fixture file under this directory must
+    not turn a timeout-coverage guard red.
+    """
+    assert _scans_whole_tree_py('def f(:\n') is False
+
+
+# ---------------------------------------------------------------------------
+# Required fixture: demonstrate fail-on-new.
+#
+# The real tree is green by construction after step-6, so without this the
+# detector could silently rot into always-False and the family invariant would
+# pass vacuously. (The invariant carries its own anti-vacuity floor as well.)
+# ---------------------------------------------------------------------------
+
+
+def test_detector_flags_a_synthetic_new_scanner() -> None:
+    """A brand-new whole-tree scanner -- the 13th member of the family -- is
+    caught by the detector, demonstrated against a synthetic module rather
+    than waiting for a real one to be added and crash someone's verify run."""
+    synthetic_source = (
+        "import ast\n"
+        "from pathlib import Path\n"
+        "\n"
+        "_TESTS_DIR = Path(__file__).parent\n"
+        "\n"
+        "def test_some_new_invariant() -> None:\n"
+        "    for py_file in sorted(_TESTS_DIR.rglob('*.py')):\n"
+        "        ast.parse(py_file.read_text(encoding='utf-8'))\n"
+    )
+    assert _scans_whole_tree_py(synthetic_source) is True, (
+        'the detector must flag a newly-added whole-tree scanner; if this '
+        'fails, the family invariant below is passing vacuously'
+    )
