@@ -94,6 +94,7 @@ hand-built ``PlanShape``.
 from __future__ import annotations
 
 import asyncio
+import copy
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -105,6 +106,7 @@ from _recording_event_store import _RecordingEventStore
 from _workflow_helpers import (
     AgentStub,
     FakeMetadataBackend,
+    FakeScheduler,
     _build_harness,
     _build_workflow,
     _derive_meta_root_like_production,  # noqa: F401  autouse fixture, see its docstring
@@ -179,6 +181,34 @@ def config(git_repo: Path) -> OrchestratorConfig:
         # parse. These scenarios exercise routing/workflow logic, not
         # sandboxing — keep sandbox off for hermeticity (mirrors
         # test_workflow_e2e.py's config fixture).
+        sandbox=SandboxConfig(enabled=False),
+    )
+
+
+@pytest.fixture
+def stock_config(git_repo: Path, code_default_config) -> OrchestratorConfig:
+    """Module-level counterpart to ``config`` above, pinned to the bundled
+    ``defaults.yaml`` via the opt-in ``code_default_config`` conftest
+    fixture (see module docstring's CONFIG section) rather than the autouse
+    ``_isolate_orch_config`` -- shared by every scenario whose claim is
+    specifically about CODE DEFAULTS (byte-equivalence, tier/saturation rule
+    liveness, reload/reject starting state, digest rollup). Classes that
+    need a variant override this fixture by the same name (the standard
+    pytest fixture-override pattern) rather than redefining it wholesale --
+    see ``TestByteEquivalenceThroughTheRig`` below.
+    """
+    return OrchestratorConfig(
+        project_root=git_repo,
+        max_concurrent_tasks=1,
+        max_execute_iterations=5,
+        max_verify_attempts=3,
+        max_review_cycles=2,
+        git=GitConfig(
+            main_branch='main',
+            branch_prefix='task/',
+            remote='origin',
+            worktree_dir='.worktrees',
+        ),
         sandbox=SandboxConfig(enabled=False),
     )
 
@@ -363,6 +393,43 @@ def _mock_verify_passes() -> AsyncMock:
     ))
 
 
+def _make_rig(
+    config: OrchestratorConfig,
+    git_ops: GitOps,
+    assignment: TaskAssignment,
+    stub: AgentStub,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    fake_verify: bool = True,
+) -> tuple[TaskWorkflow, FakeScheduler, _RecordingEventStore]:
+    """The rig-setup preamble shared by most scenarios below: build a
+    ``TaskWorkflow``/``FakeScheduler`` via ``_build_workflow``, attach a
+    fresh ``_RecordingEventStore``, and inject *stub* at the real seam
+    (``monkeypatch.setattr('orchestrator.workflow.invoke_agent', ...)`` --
+    see module docstring's SEAM section).
+
+    ``fake_verify=True`` (the default) additionally monkeypatches
+    ``run_scoped_verification`` to :func:`_mock_verify_passes`, for
+    scenarios that drive a full ``workflow.run()`` to DONE. Pass
+    ``fake_verify=False`` for scenarios that drive ``_invoke`` (or another
+    internal method) directly and never reach the VERIFY phase, or that
+    need to install their own bespoke verification double afterward --
+    callers remain free to add further ``monkeypatch.setattr`` calls, seed
+    ``workflow.plan``/``.modules``/``.cost_store``, or wire a
+    ``FakeMetadataBackend`` onto the returned ``scheduler`` after calling
+    this.
+    """
+    workflow, scheduler = _build_workflow(config, git_ops, assignment, stub)
+    rec = _RecordingEventStore()
+    workflow.event_store = rec  # type: ignore[assignment]
+    monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
+    if fake_verify:
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification', _mock_verify_passes(),
+        )
+    return workflow, scheduler, rec
+
+
 # ---------------------------------------------------------------------------
 # Boundary scenarios 1, 2 — metadata.model_overrides at the real seam
 # (plan step-1).
@@ -387,13 +454,7 @@ class TestOverrideWinsAtTheSeam:
         task_assignment.task['metadata']['model_overrides'] = {'implementer': 'haiku'}
 
         stub = _RoutingRecorderStub()
-        workflow, _scheduler = _build_workflow(config, git_ops, task_assignment, stub)
-        rec = _RecordingEventStore()
-        workflow.event_store = rec  # type: ignore[assignment]
-        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
-        monkeypatch.setattr(
-            'orchestrator.workflow.run_scoped_verification', _mock_verify_passes(),
-        )
+        workflow, _scheduler, rec = _make_rig(config, git_ops, task_assignment, stub, monkeypatch)
 
         outcome = (await workflow.run()).outcome
 
@@ -431,13 +492,7 @@ class TestInvalidOverrideFallsThroughFailSafe:
         task_assignment.task['metadata']['model_overrides'] = {'implementer': 'gpt-9'}
 
         stub = _RoutingRecorderStub()
-        workflow, _scheduler = _build_workflow(config, git_ops, task_assignment, stub)
-        rec = _RecordingEventStore()
-        workflow.event_store = rec  # type: ignore[assignment]
-        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
-        monkeypatch.setattr(
-            'orchestrator.workflow.run_scoped_verification', _mock_verify_passes(),
-        )
+        workflow, _scheduler, rec = _make_rig(config, git_ops, task_assignment, stub, monkeypatch)
 
         outcome = (await workflow.run()).outcome
 
@@ -510,41 +565,29 @@ class TestByteEquivalenceThroughTheRig:
     _RUN_ROLES = frozenset({'architect', 'implementer', 'reviewer_comprehensive', 'judge'})
 
     @pytest.fixture
-    def stock_config(self, git_repo: Path, code_default_config) -> OrchestratorConfig:
-        return OrchestratorConfig(
-            project_root=git_repo,
-            max_concurrent_tasks=1,
-            max_execute_iterations=5,
-            max_verify_attempts=3,
-            max_review_cycles=2,
-            git=GitConfig(
-                main_branch='main',
-                branch_prefix='task/',
-                remote='origin',
-                worktree_dir='.worktrees',
-            ),
-            sandbox=SandboxConfig(enabled=False),
-            # Opt-in (default False): brings 'judge' into the in-band role
-            # set this single dispatch invokes, alongside architect/
-            # implementer/reviewer*/merger. Does not change dispatch control
-            # flow here — the EXECUTE loop's own pending-steps check already
-            # terminates naturally once the implementer's one invocation
-            # completes both PLAN steps (workflow.py:7920), independent of
-            # the judge's verdict — it only adds one extra judge invocation
-            # to observe.
-            judge_after_each_iteration=True,
-        )
+    def stock_config(self, stock_config: OrchestratorConfig) -> OrchestratorConfig:
+        """Override (standard pytest fixture-override pattern, same name
+        requesting the outer module-level fixture) rather than a wholesale
+        redefinition: derive this class's variant from the shared stock
+        config via ``model_copy`` so the two never drift apart on the
+        fields they share.
+
+        Opt-in (default False): brings 'judge' into the in-band role set
+        this single dispatch invokes, alongside architect/implementer/
+        reviewer*/merger. Does not change dispatch control flow here -- the
+        EXECUTE loop's own pending-steps check already terminates naturally
+        once the implementer's one invocation completes both PLAN steps
+        (workflow.py:7920), independent of the judge's verdict -- it only
+        adds one extra judge invocation to observe.
+        """
+        return stock_config.model_copy(update={'judge_after_each_iteration': True})
 
     async def test_stock_dispatch_matches_config_byte_for_byte(
         self, stock_config, git_ops, task_assignment, monkeypatch,
     ):
         stub = _RoutingRecorderStub()
-        workflow, _scheduler = _build_workflow(stock_config, git_ops, task_assignment, stub)
-        rec = _RecordingEventStore()
-        workflow.event_store = rec  # type: ignore[assignment]
-        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
-        monkeypatch.setattr(
-            'orchestrator.workflow.run_scoped_verification', _mock_verify_passes(),
+        workflow, _scheduler, rec = _make_rig(
+            stock_config, git_ops, task_assignment, stub, monkeypatch,
         )
 
         outcome = (await workflow.run()).outcome
@@ -600,10 +643,9 @@ class TestByteEquivalenceThroughTheRig:
         are seeded directly rather than produced by a real architect stub.
         """
         stub = _MinimalRouteRecorder()
-        workflow, _scheduler = _build_workflow(stock_config, git_ops, task_assignment, stub)  # type: ignore[arg-type]
-        rec = _RecordingEventStore()
-        workflow.event_store = rec  # type: ignore[assignment]
-        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
+        workflow, _scheduler, rec = _make_rig(  # type: ignore[arg-type]
+            stock_config, git_ops, task_assignment, stub, monkeypatch, fake_verify=False,
+        )
 
         workflow.plan = {'steps': [{'id': f's{i}', 'status': 'pending'} for i in range(12)]}
         workflow.modules = [
@@ -645,9 +687,9 @@ class TestByteEquivalenceThroughTheRig:
         stock resolution is ALSO byte-equivalent.
         """
         stub = _RoutingRecorderStub()
-        workflow, _scheduler = _build_workflow(stock_config, git_ops, task_assignment, stub)
-        rec = _RecordingEventStore()
-        workflow.event_store = rec  # type: ignore[assignment]
+        workflow, _scheduler, rec = _make_rig(
+            stock_config, git_ops, task_assignment, stub, monkeypatch, fake_verify=False,
+        )
         _seed_workflow_artifacts(workflow, tmp_path=tmp_path)
         workflow.git_ops.rebase_onto_main = AsyncMock()  # type: ignore[method-assign]
         workflow._submit_to_merge_queue = AsyncMock(  # type: ignore[method-assign]
@@ -657,7 +699,6 @@ class TestByteEquivalenceThroughTheRig:
             return_value=WorkflowOutcome.BLOCKED,
         )
         workflow._write_merge_failure_review = MagicMock()  # type: ignore[method-assign]
-        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
 
         # Outcome is irrelevant here (AgentStub._merger writes no verdict, so
         # this fails safe to BLOCKED) -- only the ROUTE reaching the real
@@ -717,22 +758,9 @@ class TestTierStableWithinOneDispatch:
     (workflow.py:12701-12717), which would make assertion (c) vacuous.
     """
 
-    @pytest.fixture
-    def stock_config(self, git_repo: Path, code_default_config) -> OrchestratorConfig:
-        return OrchestratorConfig(
-            project_root=git_repo,
-            max_concurrent_tasks=1,
-            max_execute_iterations=5,
-            max_verify_attempts=3,
-            max_review_cycles=2,
-            git=GitConfig(
-                main_branch='main',
-                branch_prefix='task/',
-                remote='origin',
-                worktree_dir='.worktrees',
-            ),
-            sandbox=SandboxConfig(enabled=False),
-        )
+    # stock_config: uses the module-level fixture (declared next to `config`
+    # above) unmodified -- see that fixture's docstring for why it is shared
+    # rather than redefined per class.
 
     async def test_routing_tier_stable_across_verify_debug_iterations(
         self, stock_config, git_ops, task_assignment, monkeypatch,
@@ -741,14 +769,13 @@ class TestTierStableWithinOneDispatch:
         task_assignment.task['metadata']['routing'] = {'routing_tier': 1}
 
         stub = _RoutingRecorderStub()
-        workflow, scheduler = _build_workflow(stock_config, git_ops, task_assignment, stub)
-        rec = _RecordingEventStore()
-        workflow.event_store = rec  # type: ignore[assignment]
+        workflow, scheduler, rec = _make_rig(
+            stock_config, git_ops, task_assignment, stub, monkeypatch, fake_verify=False,
+        )
         backend = FakeMetadataBackend()
         wire_metadata_backend(
             scheduler, backend, seed=task_assignment.task['metadata'], grants=True,  # type: ignore[arg-type]
         )
-        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
 
         # False, False, then True FOREVER -- not just for 3 calls. A full
         # dispatch to DONE calls run_scoped_verification again in the merge
@@ -863,22 +890,9 @@ class TestRetryTierBumpAcrossDispatches:
     (READ) half, that routing_tier is stable within one dispatch.
     """
 
-    @pytest.fixture
-    def stock_config(self, git_repo: Path, code_default_config) -> OrchestratorConfig:
-        return OrchestratorConfig(
-            project_root=git_repo,
-            max_concurrent_tasks=1,
-            max_execute_iterations=5,
-            max_verify_attempts=3,
-            max_review_cycles=2,
-            git=GitConfig(
-                main_branch='main',
-                branch_prefix='task/',
-                remote='origin',
-                worktree_dir='.worktrees',
-            ),
-            sandbox=SandboxConfig(enabled=False),
-        )
+    # stock_config: uses the module-level fixture (declared next to `config`
+    # above) unmodified -- see that fixture's docstring for why it is shared
+    # rather than redefined per class.
 
     @staticmethod
     def _seed_metadata() -> dict:
@@ -954,12 +968,8 @@ class TestRetryTierBumpAcrossDispatches:
         assert stock_config.models.implementer == 'sonnet'  # so opus below is a genuine +1 rung
 
         stub = _RoutingRecorderStub()
-        workflow, _scheduler = _build_workflow(stock_config, git_ops, fresh_assignment, stub)
-        rec = _RecordingEventStore()
-        workflow.event_store = rec  # type: ignore[assignment]
-        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
-        monkeypatch.setattr(
-            'orchestrator.workflow.run_scoped_verification', _mock_verify_passes(),
+        workflow, _scheduler, rec = _make_rig(
+            stock_config, git_ops, fresh_assignment, stub, monkeypatch,
         )
 
         outcome = (await workflow.run()).outcome
@@ -1058,14 +1068,10 @@ class TestCeilingFallbackDoesNotBlockDispatch:
             await self._seed_opus_spend(cost_store, total_usd=self._CEILING_USD)
 
             stub = _RoutingRecorderStub()
-            workflow, _scheduler = _build_workflow(config, git_ops, task_assignment, stub)
-            workflow.cost_store = cost_store
-            rec = _RecordingEventStore()
-            workflow.event_store = rec  # type: ignore[assignment]
-            monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
-            monkeypatch.setattr(
-                'orchestrator.workflow.run_scoped_verification', _mock_verify_passes(),
+            workflow, _scheduler, rec = _make_rig(
+                config, git_ops, task_assignment, stub, monkeypatch,
             )
+            workflow.cost_store = cost_store
 
             outcome = (await workflow.run()).outcome
 
@@ -1102,14 +1108,10 @@ class TestCeilingFallbackDoesNotBlockDispatch:
             await self._seed_opus_spend(cost_store, total_usd=self._CEILING_USD - 5.0)
 
             stub = _RoutingRecorderStub()
-            workflow, _scheduler = _build_workflow(config, git_ops, task_assignment, stub)
-            workflow.cost_store = cost_store
-            rec = _RecordingEventStore()
-            workflow.event_store = rec  # type: ignore[assignment]
-            monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
-            monkeypatch.setattr(
-                'orchestrator.workflow.run_scoped_verification', _mock_verify_passes(),
+            workflow, _scheduler, rec = _make_rig(
+                config, git_ops, task_assignment, stub, monkeypatch,
             )
+            workflow.cost_store = cost_store
 
             outcome = (await workflow.run()).outcome
 
@@ -1160,22 +1162,9 @@ class TestSaturationStampRoutesNextDispatchFullPath:
     ``TestTierStableWithinOneDispatch``'s isolation rationale).
     """
 
-    @pytest.fixture
-    def stock_config(self, git_repo: Path, code_default_config) -> OrchestratorConfig:
-        return OrchestratorConfig(
-            project_root=git_repo,
-            max_concurrent_tasks=1,
-            max_execute_iterations=5,
-            max_verify_attempts=3,
-            max_review_cycles=2,
-            git=GitConfig(
-                main_branch='main',
-                branch_prefix='task/',
-                remote='origin',
-                worktree_dir='.worktrees',
-            ),
-            sandbox=SandboxConfig(enabled=False),
-        )
+    # stock_config: uses the module-level fixture (declared next to `config`
+    # above) unmodified -- see that fixture's docstring for why it is shared
+    # rather than redefined per class.
 
     @staticmethod
     async def _max_turns_invoke(**kwargs) -> AgentResult:
@@ -1215,22 +1204,55 @@ class TestSaturationStampRoutesNextDispatchFullPath:
         assert outcome_1 == WorkflowOutcome.REQUEUED
         assert backend.blob['routing']['simple_saturated'] is True
         assert workflow.task['metadata']['routing']['simple_saturated'] is True
-        writes_after_round_1 = len(backend.update_task_calls)
+
+        # Two writes landed in round 1: _invoke's routing-decision mirror
+        # (fires first, so it still reads simple_saturated=False -- nothing
+        # has stamped yet) then the stamp write itself (flips False->True;
+        # _stamp_simple_saturated carries `latest`/`history` forward
+        # unchanged, unlike the mirror's own with_decision -- task_metadata.
+        # RoutingState). Asserted on each write's OWN identity (its
+        # simple_saturated value), not a bare count: a count-only assertion
+        # would also pass in the degenerate regression where the mirror
+        # write silently stopped firing and only the stamp write landed --
+        # asserting the FIRST call still shows False catches that.
+        assert len(backend.update_task_calls) == 2, (
+            f'expected exactly 2 writes in round 1 (mirror + stamp): '
+            f'{backend.update_task_calls!r}'
+        )
+        round_1_mirror_write, round_1_stamp_write = backend.update_task_calls
+        assert round_1_mirror_write['metadata']['routing']['simple_saturated'] is False, (
+            f"_invoke's mirror write in round 1 fires BEFORE the stamp -- it "
+            f'must still see simple_saturated=False: {round_1_mirror_write!r}'
+        )
+        assert round_1_stamp_write['metadata']['routing']['simple_saturated'] is True, (
+            f'the stamp write itself must flip simple_saturated to True: '
+            f'{round_1_stamp_write!r}'
+        )
 
         # Idempotence: driving a second demonstrated exhaustion sees ONE
-        # effective state (simple_saturated stays True, not re-toggled) and
-        # contributes exactly one FEWER merge write than round 1:
-        # _stamp_simple_saturated's own early return (already True) skips its
-        # write this time, so only _invoke's routing-decision mirror write
-        # (present both rounds) fires.
+        # effective state (simple_saturated stays True, not re-toggled).
+        # _stamp_simple_saturated's own early return (already True) skips
+        # its write this time, so exactly one NEW write lands -- _invoke's
+        # routing-decision mirror -- and it must still carry
+        # simple_saturated=True forward. This is the assertion that
+        # actually pins "the mirror keeps firing every round": a bare
+        # count-delta (as before) would accept round 2 contributing ZERO
+        # writes just as readily as one, provided round 1 had also
+        # regressed to one write -- 0 == 1 - 1 is a false positive for the
+        # same regression the round-1 checks above already guard against.
         outcome_2 = await workflow._run_simple_task()
         assert outcome_2 == WorkflowOutcome.REQUEUED
         assert backend.blob['routing']['simple_saturated'] is True
         assert workflow.task['metadata']['routing']['simple_saturated'] is True
-        writes_in_round_2 = len(backend.update_task_calls) - writes_after_round_1
-        assert writes_in_round_2 == writes_after_round_1 - 1, (
-            f'expected round 2 to skip the stamp write (one fewer than round 1); '
-            f'round 1={writes_after_round_1}, round 2={writes_in_round_2}'
+        new_calls_in_round_2 = backend.update_task_calls[2:]
+        assert len(new_calls_in_round_2) == 1, (
+            f'expected exactly 1 NEW write in round 2 (mirror only, stamp '
+            f'skipped by its own early return): {new_calls_in_round_2!r}'
+        )
+        round_2_mirror_write = new_calls_in_round_2[0]
+        assert round_2_mirror_write['metadata']['routing']['simple_saturated'] is True, (
+            f"_invoke's mirror write in round 2 must still fire and carry "
+            f'simple_saturated=True forward: {round_2_mirror_write!r}'
         )
 
         # -- Half 2 (READ side): dispatch #2 is seeded from the ACTUAL
@@ -1251,14 +1273,8 @@ class TestSaturationStampRoutesNextDispatchFullPath:
         )
 
         recorder = _RoutingRecorderStub()
-        workflow2, _scheduler2 = _build_workflow(
-            stock_config, git_ops, fresh_assignment, recorder,
-        )
-        rec = _RecordingEventStore()
-        workflow2.event_store = rec  # type: ignore[assignment]
-        monkeypatch.setattr('orchestrator.workflow.invoke_agent', recorder.invoke_agent)
-        monkeypatch.setattr(
-            'orchestrator.workflow.run_scoped_verification', _mock_verify_passes(),
+        workflow2, _scheduler2, rec = _make_rig(
+            stock_config, git_ops, fresh_assignment, recorder, monkeypatch,
         )
 
         # (a) the saturated label is retired -- the full PLAN path runs, not
@@ -1391,12 +1407,10 @@ class TestSimpleTaskModelReloadReachesTheSeam:
 
         # (c) the reload reaches the NEXT invocation's real CLI seam.
         recorder = _RoutingRecorderStub()
-        workflow, _scheduler = _build_workflow(
-            live, GitOps(live.git, tmp_path), task_assignment, recorder,
+        workflow, _scheduler, rec = _make_rig(
+            live, GitOps(live.git, tmp_path), task_assignment, recorder, monkeypatch,
+            fake_verify=False,
         )
-        rec = _RecordingEventStore()
-        workflow.event_store = rec  # type: ignore[assignment]
-        monkeypatch.setattr('orchestrator.workflow.invoke_agent', recorder.invoke_agent)
 
         await workflow._invoke(SIMPLE_TASK, 'simple task prompt', tmp_path)
 
@@ -1445,22 +1459,9 @@ class TestUnknownRuleKeyRejectedPriorRulesStillRoute:
     to reload.
     """
 
-    @pytest.fixture
-    def stock_config(self, git_repo: Path, code_default_config) -> OrchestratorConfig:
-        return OrchestratorConfig(
-            project_root=git_repo,
-            max_concurrent_tasks=1,
-            max_execute_iterations=5,
-            max_verify_attempts=3,
-            max_review_cycles=2,
-            git=GitConfig(
-                main_branch='main',
-                branch_prefix='task/',
-                remote='origin',
-                worktree_dir='.worktrees',
-            ),
-            sandbox=SandboxConfig(enabled=False),
-        )
+    # stock_config: uses the module-level fixture (declared next to `config`
+    # above) unmodified -- see that fixture's docstring for why it is shared
+    # rather than redefined per class.
 
     @pytest.mark.asyncio
     async def test_unknown_match_key_rejected_live_unchanged_and_still_routes(
@@ -1471,7 +1472,6 @@ class TestUnknownRuleKeyRejectedPriorRulesStillRoute:
         # demonstrably fires" this scenario needs.
         assert any(r.id == 'large-plan-steps' for r in stock_config.routing.rules)
 
-        rules_before = list(stock_config.routing.rules)
         ladder_before = list(stock_config.routing.ladder)
         allowed_models_before = list(stock_config.routing.allowed_models)
         ceilings_before = dict(stock_config.routing.per_model_daily_ceiling_usd)
@@ -1486,16 +1486,23 @@ class TestUnknownRuleKeyRejectedPriorRulesStillRoute:
         }))
 
         # (a) the reload FAILS: fresh construction itself raises, naming the
-        # unknown key (see class docstring's MECHANISM NOTE).
+        # unknown key (see class docstring's MECHANISM NOTE). Byte-identical
+        # to test_routing_reload.TestUnknownRuleKeyFailsClosedBeforeApply.
+        # test_unknown_match_key_raises_naming_the_key -- kept here (rather
+        # than assumed) only because it is the necessary precondition for
+        # part (c) below: there is nothing to prove "prior rules still
+        # route" without first proving the bad reload actually failed.
         with pytest.raises(ValidationError, match='plan_vibes'):
             load_config(bad_yaml)
 
-        # (b) live is unchanged -- by id/value, not just count (the rollback
-        # half). No code path ran that could have mutated it: rules survive
-        # by identity, and no partial mutation of ladder/allowed_models/
-        # ceilings leaked in from the rejected candidate.
-        assert stock_config.routing.rules == rules_before
-        assert [r.id for r in stock_config.routing.rules] == [r.id for r in rules_before]
+        # (b) live is unchanged on the fields this test doesn't hand off to
+        # test_routing_reload.py: no partial mutation of ladder/
+        # allowed_models/ceilings leaked in from the rejected candidate.
+        # Rules-identity survival (`live.routing.rules == rules_before`) is
+        # already covered by test_routing_reload.
+        # TestUnknownRuleKeyFailsClosedBeforeApply.
+        # test_prior_live_rules_untouched_when_fresh_construction_raises --
+        # not re-asserted here.
         assert stock_config.routing.ladder == ladder_before
         assert stock_config.routing.allowed_models == allowed_models_before
         assert stock_config.routing.per_model_daily_ceiling_usd == ceilings_before
@@ -1506,10 +1513,9 @@ class TestUnknownRuleKeyRejectedPriorRulesStillRoute:
         # seed workflow.plan/modules directly and drive _invoke, since only
         # the resolved route matters here.
         stub = _MinimalRouteRecorder()
-        workflow, _scheduler = _build_workflow(stock_config, git_ops, task_assignment, stub)  # type: ignore[arg-type]
-        rec = _RecordingEventStore()
-        workflow.event_store = rec  # type: ignore[assignment]
-        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
+        workflow, _scheduler, rec = _make_rig(  # type: ignore[arg-type]
+            stock_config, git_ops, task_assignment, stub, monkeypatch, fake_verify=False,
+        )
 
         workflow.plan = {'steps': [{'id': f's{i}', 'status': 'pending'} for i in range(12)]}
         workflow.modules = ['lib']
@@ -1523,29 +1529,14 @@ class TestUnknownRuleKeyRejectedPriorRulesStillRoute:
         assert impl_data['source_layer'] == 'policy_rule'
         assert impl_data['rule_id'] == 'large-plan-steps'
 
-    def test_unknown_set_key_rejected(self, tmp_path: Path) -> None:
-        """Symmetric sub-test: ``RuleSet``'s own ``extra='forbid'``
-        (config.py:406) protects the ``set:`` vocabulary via the identical
-        construction-time mechanism -- proven once here rather than
-        re-running the full (b)/(c) proof above, since post-rejection
-        routing behavior is identical regardless of which closed-vocabulary
-        class caught the typo.
-        """
-        bad_yaml = tmp_path / 'bad-set.yaml'
-        bad_yaml.write_text(yaml.safe_dump({
-            'routing': {
-                'rules': [
-                    {
-                        'id': 'bad-rule',
-                        'match': {'role': ['implementer']},
-                        'set': {'model_typo': 'opus'},
-                    },
-                ],
-            },
-        }))
-
-        with pytest.raises(ValidationError, match='model_typo'):
-            load_config(bad_yaml)
+    # A symmetric "unknown set: key" sub-test is deliberately NOT duplicated
+    # here: RuleSet's own extra='forbid' (config.py:406) is the identical
+    # construction-time mechanism as RuleMatch's above, and is already
+    # covered end to end by test_routing_reload.
+    # TestUnknownRuleKeyFailsClosedBeforeApply.
+    # test_unknown_set_key_raises_naming_the_key -- post-rejection routing
+    # behavior does not depend on which closed-vocabulary class caught the
+    # typo, so re-proving (a)-(c) for it here would add no new coverage.
 
 
 # ---------------------------------------------------------------------------
@@ -1774,22 +1765,9 @@ class TestRollupRendersRigProducedRows:
             completed_at=datetime.now(UTC).isoformat(),
         )
 
-    @pytest.fixture
-    def stock_config(self, git_repo: Path, code_default_config) -> OrchestratorConfig:
-        return OrchestratorConfig(
-            project_root=git_repo,
-            max_concurrent_tasks=1,
-            max_execute_iterations=5,
-            max_verify_attempts=3,
-            max_review_cycles=2,
-            git=GitConfig(
-                main_branch='main',
-                branch_prefix='task/',
-                remote='origin',
-                worktree_dir='.worktrees',
-            ),
-            sandbox=SandboxConfig(enabled=False),
-        )
+    # stock_config: uses the module-level fixture (declared next to `config`
+    # above) unmodified -- see that fixture's docstring for why it is shared
+    # rather than redefined per class.
 
     @pytest.mark.asyncio
     async def test_rollup_renders_rows_the_rig_produced(
