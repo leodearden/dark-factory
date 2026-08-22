@@ -8,6 +8,7 @@ import logging
 import os
 import subprocess
 import time
+from collections.abc import Mapping
 from pathlib import Path
 from unittest.mock import patch
 
@@ -4959,7 +4960,7 @@ async def _seed_on_main(
 async def _land_branch(
     repo: Path,
     task_id: str,
-    files: dict[str, str | bytes] | None = None,
+    files: Mapping[str, str | bytes] | None = None,
     *,
     deletes: tuple[str, ...] = (),
     renames: tuple[tuple[str, str], ...] = (),
