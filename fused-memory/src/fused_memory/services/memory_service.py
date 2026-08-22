@@ -4106,11 +4106,61 @@ class MemoryService:
         # reload and would have to stay restart-only.
         if resolve_topic_anchor_enabled(self):
             try:
-                anchor_topics = extract_anchor_topics(results, max_topics=_MAX_ANCHOR_TOPICS)
+                # HARVEST FROM THE WINDOW THE CALLER WILL ACTUALLY SEE, not from the
+                # full merged list.  `results` here still holds every merged hit, and
+                # the slice to `limit` happens below — so harvesting from all of it
+                # would let a topic carried ONLY by an out-of-window record pull in a
+                # canonical that then DISPLACES an in-window record the caller would
+                # otherwise have been shown.  That inverts the contract both
+                # agent-facing docstrings state ("finding any member of a consolidated
+                # cluster also surfaces that topic's canonical"): the agent would pay
+                # the displacement for a cluster it never found a member of.  It also
+                # spends a Qdrant round-trip per invisible topic on the hot path.
+                anchor_topics = extract_anchor_topics(
+                    results[:limit], max_topics=_MAX_ANCHOR_TOPICS
+                )
+                # FAN OUT, don't serialize.  The lookups are fully independent reads
+                # (`pinned_ids` is a post-hoc dedup and `pin_at` is pure ordering —
+                # neither is an input to any lookup), and this seam is the hottest read
+                # path in the system: every agent search AND every procedural_knowledge
+                # write's near-dup pre-check.  Serialized, the cap would add up to
+                # _MAX_ANCHOR_TOPICS round-trips of latency instead of one round-trip's
+                # worth.  No semaphore, unlike grouped_read._bounded_gather: that
+                # module's fan-out is sized by the CALLER's result list (up to the
+                # search tool's 1000-hit clamp), whereas this one is bounded at 3 by
+                # _MAX_ANCHOR_TOPICS before it starts.
+                payload_sets = await gather_collect(
+                    self.get_memories_by_metadata(
+                        project_id,
+                        {'topic': topic, 'canonical': True},
+                        limit=_ANCHOR_SCROLL_LIMIT,
+                    )
+                    for topic in anchor_topics
+                )
+                for payloads in payload_sets:
+                    # gather_collect CAPTURES per-item exceptions rather than raising
+                    # (its documented Pass-2 "caller classifies" contract).  Re-raise
+                    # the first so the two-tier band below classifies a fan-out failure
+                    # exactly as it classified a sequential await: a wiring bug stays
+                    # loud, a backend fault still fails open.
+                    if isinstance(payloads, Exception):
+                        raise payloads
+
+                # BUILD INTO A LOCAL COPY and rebind only on FULL success, so the
+                # fail-open below can honestly promise the un-pinned list.  Mutating
+                # `results` in place would leave the first topic's pin applied when the
+                # second one raised — a partially-transformed list is not the "returning
+                # un-pinned results" the WARNING claims.
+                pinned = list(results)
                 # Two distinct topics can legitimately resolve to the SAME canonical, so
                 # pinned ids are tracked across the loop: without this the second topic
                 # would pin an already-pinned record a second time.
                 pinned_ids: set[str] = set()
+                # Flags are applied only once the whole loop has succeeded: setting
+                # `topic_anchored` on a moved result mutates an object SHARED with
+                # `results`, so an eager write would survive the fail-open rebind and
+                # leak a half-applied pin into the "untouched" list.
+                to_flag: list[MemoryResult] = []
                 # Pins accumulate in TOPIC-RANK order: each lands just after the
                 # previously-pinned ones rather than at index 0, so the canonical of the
                 # highest-ranked topic stays ahead of the next topic's.  A plain
@@ -4119,12 +4169,7 @@ class MemoryService:
                 # below can only ever find `existing >= pin_at` and its pop cannot
                 # disturb them.
                 pin_at = 0
-                for topic in anchor_topics:
-                    payloads = await self.get_memories_by_metadata(
-                        project_id,
-                        {'topic': topic, 'canonical': True},
-                        limit=_ANCHOR_SCROLL_LIMIT,
-                    )
+                for payloads in payload_sets:
                     canonical = select_canonical_payload(
                         payloads,
                         allowed_categories=set(categories) if categories else None,
@@ -4148,18 +4193,41 @@ class MemoryService:
                     # on, the near-duplicate write guard first among them.  Only the
                     # ORDER changes, plus the topic_anchored flag.
                     existing = next(
-                        (i for i, r in enumerate(results) if r.id == canonical_id), None
+                        (i for i, r in enumerate(pinned) if r.id == canonical_id), None
                     )
                     if existing is not None:
-                        moved = results.pop(existing)
-                        moved.topic_anchored = True
-                        results.insert(pin_at, moved)
+                        moved = pinned.pop(existing)
+                        to_flag.append(moved)
+                        pinned.insert(pin_at, moved)
                         pin_at += 1
                         continue
 
                     payload_meta = canonical.get('metadata') or {}
-                    # SCORE CONTRACT: the injected anchor carries the RAW scroll payload
-                    # as its metadata and must never gain a 'store_score'.  The
+                    # WIRE SHAPE: partition the raw payload and put only the CUSTOM half
+                    # on the wire, exactly as grouped_read._promoted_parent does for the
+                    # structurally identical raw-payload -> search-hit conversion.
+                    # split_managed_metadata is the DECIDED HOME for that partition
+                    # (INV-5), so this reuses it rather than re-deriving the key set.
+                    # Forwarding the raw payload would give ONE canonical two different
+                    # wire shapes depending on how it was reached — pinned vs. direct
+                    # hit — leaking hash/user_id/role to the MCP consumer and emitting
+                    # the body text TWICE (once as `content`, once as metadata['data']),
+                    # which also works against this arm's measured 1070 tokens/query on
+                    # the hottest read path in the system.
+                    #
+                    # `content` still reads the RAW payload: 'data' is a mem0-MANAGED
+                    # key, so it lands in `managed`, never in the custom half that goes
+                    # on the wire.  `created_at` comes off the scroll dict's top-level
+                    # key — get_memories_by_metadata's documented return shape — which
+                    # scroll_by_metadata lifts from that same managed payload key.
+                    managed, custom = split_managed_metadata(dict(payload_meta))
+                    created_at = canonical.get('created_at')
+                    if not isinstance(created_at, str):
+                        created_at = managed.get('created_at')
+                    # SCORE CONTRACT: the injected anchor must never gain a
+                    # 'store_score' — note the split above cannot introduce one,
+                    # since a raw scroll payload has no such key and only
+                    # _search_mem0 ever stamps it.  The
                     # write-time near-duplicate guard reads the cosine from
                     # metadata['store_score'] and qualifies on `>= threshold`
                     # (near_duplicate_guard.find_near_duplicate_memory :114-121, via
@@ -4181,17 +4249,24 @@ class MemoryService:
                     # a CHILD-shaped hit into its parent, which is why
                     # select_canonical_payload excludes child-shaped payloads outright
                     # rather than trusting writes to be well-formed.)
-                    results.insert(pin_at, MemoryResult(
+                    pinned.insert(pin_at, MemoryResult(
                         id=canonical_id,
                         content=_mem0_content(payload_meta),
-                        category=_mem0_category(payload_meta),
+                        category=_mem0_category(custom),
                         source_store=SourceStore.mem0,
                         relevance_score=0.0,
-                        metadata=payload_meta,
-                        created_at=canonical.get('created_at'),
+                        metadata=custom,
+                        created_at=created_at if isinstance(created_at, str) else None,
                         topic_anchored=True,
                     ))
                     pin_at += 1
+
+                # COMMIT POINT.  Nothing above this line has touched `results` or any
+                # object reachable from it, so every `raise` between here and the `try`
+                # leaves the un-pinned list exactly as the sort/filter tail produced it.
+                for result in to_flag:
+                    result.topic_anchored = True
+                results = pinned
             except (TypeError, AttributeError, NameError):
                 # A wiring/programming bug — e.g. a future signature change to
                 # get_memories_by_metadata or to the topic_anchor selectors —
@@ -4208,8 +4283,15 @@ class MemoryService:
                 # this one Qdrant read timeout would break every search in the
                 # system — and get_memories_by_metadata genuinely PROPAGATES a
                 # TimeoutError (unlike Mem0Backend.search, which swallows into
-                # {}), so that is a live path, not a hypothetical.  `results` is
-                # left exactly as the sort/filter tail produced it.
+                # {}), so that is a live path, not a hypothetical.
+                #
+                # `results` is left exactly as the sort/filter tail produced it
+                # — including its ORDER and every result's topic_anchored flag —
+                # because the pins are built into a local copy and both the copy
+                # and the flags are committed in one step at the end of the
+                # `try`.  An ALL-OR-NOTHING pin, not a partial one: a list
+                # carrying the first topic's pin and not the second's would be a
+                # third state neither this WARNING nor any caller expects.
                 logger.warning(
                     'topic-anchored recall failed; returning un-pinned results',
                     exc_info=True,

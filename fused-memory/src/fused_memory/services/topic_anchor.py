@@ -24,10 +24,23 @@ scored at — claim recall 1.00, 1070.27 tokens/query against a 1181.29 baseline
 
 The two rejected arms are rejected for reasons that have not changed:
 
-* the TOPIC-KEYED GROUPED READ is excluded outright on LANDABILITY — it needs
-  a ``contested`` metadata key, and ``RESERVED_VOCABULARY_KEYS`` in
-  ``memory_metadata.py`` is ``{topic, canonical, kind, parent_id, supersedes}``.
-  There is no ``contested``, so that arm cannot be built at all today.
+* the TOPIC-KEYED GROUPED READ is excluded outright on LANDABILITY, and the
+  reason is NARROWER than "the ``contested`` key does not exist".  A spelling
+  does exist in this tree: ``grouped_read.CONTESTED_METADATA_KEY``
+  (``x_contested``), placed in the Tier-C ``x_`` experimental namespace
+  precisely so it needs no amendment to task 3195's closed
+  ``RESERVED_VOCABULARY_KEYS`` set, and ``grouped_read.is_contested_child``
+  already reads it.  What is missing is a WRITER: nothing under ``src/``
+  stamps that key, and task 4004's stated basis for the exclusion is exactly
+  that ``contested`` "has no writer, and no adjudication surface anywhere in
+  the running system".  So PRD V2's esc-5712 protection — a contested child is
+  NEVER suppressed — cannot be satisfied by any suppressing arm today, and
+  every suppressing arm ships without it.  The precondition for re-deciding is
+  a writer plus an adjudication surface, NOT a vocabulary amendment.
+  4004 says expressly that this is "an exclusion on landability, not a
+  measurement verdict", so do not restate it as one: that arm's measured row
+  is reported in full so a later reader with a LIVE ``contested`` key can
+  re-decide from the numbers.
 * the TOPIC-DIVERSITY CAP scores 0.63 claim recall and drops ranked records.
 
 Do not "simplify" that choice back into an argument.  Re-opening the arm

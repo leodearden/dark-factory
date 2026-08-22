@@ -19,6 +19,7 @@ composition proof lives in ``tests/server/test_topic_anchored_recall_mcp.py``.
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -599,3 +600,239 @@ class TestTopicPinFailOpenAndGating:
         assert service.mem0.scroll_by_metadata.await_count == 1
         assert results[0].id == _CANONICAL_ID
         assert results[0].topic_anchored is True
+
+
+class TestPinnedAnchorWireShape:
+    """ONE canonical must look the same however it was reached (INV-5).
+
+    ``get_memories_by_metadata`` hands back the FULL raw Qdrant payload,
+    whereas ``_search_mem0`` builds a hit's ``metadata`` from mem0's
+    already-normalized ``item['metadata']`` — the mem0-owned keys stripped.
+    Forwarding the raw payload would give the same record two different wire
+    shapes depending on whether it arrived by the pin or by its own cosine,
+    leaking ``hash``/``user_id``/``role`` to the MCP consumer and emitting the
+    body text twice (once as ``content``, once as ``metadata['data']``).
+    ``grouped_read._promoted_parent`` already solved this for the structurally
+    identical case, via ``mem0_client.split_managed_metadata``.
+    """
+
+    _MANAGED_NOISE = {
+        'data': _CANONICAL_BODY,
+        'hash': 'ab' * 16,
+        'user_id': _PROJECT_ID,
+        'agent_id': 'claude-interactive',
+        'role': 'user',
+        'updated_at': '2026-08-10T00:00:00+00:00',
+    }
+
+    @pytest.mark.asyncio
+    async def test_pinned_metadata_matches_the_same_record_as_a_direct_hit(self, service):
+        """Key-set parity against the DIRECT-HIT shape, modulo the score keys.
+
+        ``store_rank``/``store_score`` are stamped by ``_search_mem0`` onto a
+        cosine hit and must NOT appear on a pinned one — that absence is the
+        write-guard contract (see ``TestTopicPinScoreContract``) — so they are
+        the one sanctioned difference. Everything else must agree.
+        """
+        # The same record reached BOTH ways: as a scroll payload (pinned) and
+        # as a cosine hit (direct). The scroll payload carries the mem0-managed
+        # noise a raw Qdrant payload really has; the search item does not.
+        service.mem0.search = AsyncMock(return_value={'results': [
+            _sibling(1),
+            {
+                'id': _CANONICAL_ID,
+                'memory': _CANONICAL_BODY,
+                'score': 0.61,
+                'metadata': {
+                    'category': 'procedural_knowledge',
+                    'topic': _TOPIC,
+                    'canonical': True,
+                },
+            },
+        ]})
+        service.mem0.scroll_by_metadata = AsyncMock(return_value=[])
+        direct = await service.search(
+            query=_QUERY, project_id=_PROJECT_ID,
+            categories=['procedural_knowledge'], stores=['mem0'], limit=5,
+        )
+        direct_hit = next(r for r in direct if r.id == _CANONICAL_ID)
+
+        service.mem0.search = AsyncMock(return_value={'results': [_sibling(1)]})
+        service.mem0.scroll_by_metadata = AsyncMock(
+            return_value=[_canonical_payload(**self._MANAGED_NOISE)]
+        )
+        anchored = await service.search(
+            query=_QUERY, project_id=_PROJECT_ID,
+            categories=['procedural_knowledge'], stores=['mem0'], limit=5,
+        )
+
+        pin = anchored[0]
+        assert pin.id == _CANONICAL_ID
+        assert pin.topic_anchored is True
+        assert set(pin.metadata) == set(direct_hit.metadata) - {'store_rank', 'store_score'}
+
+    @pytest.mark.asyncio
+    async def test_mem0_managed_keys_never_reach_the_wire(self, service):
+        """No hash/user_id/role leak, and no second copy of the body."""
+        service.mem0.search = AsyncMock(return_value={'results': [_sibling(1)]})
+        service.mem0.scroll_by_metadata = AsyncMock(
+            return_value=[_canonical_payload(**self._MANAGED_NOISE)]
+        )
+
+        results = await service.search(
+            query=_QUERY, project_id=_PROJECT_ID,
+            categories=['procedural_knowledge'], stores=['mem0'], limit=5,
+        )
+
+        pin = results[0]
+        assert set(pin.metadata) & set(self._MANAGED_NOISE) == set()
+        # The body is carried ONCE, as content — not duplicated into metadata,
+        # which would work against this arm's measured tokens/query budget on
+        # the hottest read path in the system.
+        assert pin.content == _CANONICAL_BODY
+        assert _CANONICAL_BODY not in str(pin.metadata)
+        # The custom half survives intact: stripping is scoped to mem0's keys.
+        assert pin.metadata['topic'] == _TOPIC
+        assert pin.metadata['canonical'] is True
+        assert pin.category is not None and pin.category.value == 'procedural_knowledge'
+        assert pin.created_at == '2026-08-09T00:00:00+00:00'
+
+
+class TestAnchorTopicsComeFromTheReturnedWindow:
+    """Harvest topics from the window the CALLER sees, not from every merged hit.
+
+    ``results`` still holds every merged hit when the anchoring block runs; the
+    slice to ``limit`` happens after it. Harvesting from all of it would let a
+    topic carried ONLY by an out-of-window record pull in a canonical that then
+    DISPLACES an in-window record the caller would otherwise have been shown —
+    inverting the contract both agent-facing docstrings state ("finding any
+    member of a consolidated cluster also surfaces that topic's canonical").
+    """
+
+    @pytest.mark.asyncio
+    async def test_out_of_window_topic_does_not_fire_the_pin(self, service):
+        """The only carrier of 'topic-b' ranks below the window: no lookup, no pin."""
+        service.mem0.search = AsyncMock(return_value={'results': [
+            *[_sibling(n, topic=None) for n in range(1, 6)],
+            _sibling(6, topic='topic-b'),
+        ]})
+        service.mem0.scroll_by_metadata = AsyncMock(
+            return_value=[_canonical_payload('canonical-b', topic='topic-b')]
+        )
+
+        results = await service.search(
+            query=_QUERY, project_id=_PROJECT_ID,
+            categories=['procedural_knowledge'], stores=['mem0'], limit=5,
+        )
+
+        service.mem0.scroll_by_metadata.assert_not_awaited()
+        assert [r.id for r in results] == [f'sibling-{n}' for n in range(1, 6)]
+        assert not any(r.topic_anchored for r in results)
+
+    @pytest.mark.asyncio
+    async def test_in_window_topic_still_fires(self, service):
+        """The paired positive, so the test above cannot pass by pinning nothing ever."""
+        service.mem0.search = AsyncMock(return_value={'results': [
+            _sibling(1, topic='topic-b'),
+            *[_sibling(n, topic=None) for n in range(2, 7)],
+        ]})
+        service.mem0.scroll_by_metadata = AsyncMock(
+            return_value=[_canonical_payload('canonical-b', topic='topic-b')]
+        )
+
+        results = await service.search(
+            query=_QUERY, project_id=_PROJECT_ID,
+            categories=['procedural_knowledge'], stores=['mem0'], limit=5,
+        )
+
+        service.mem0.scroll_by_metadata.assert_awaited_once()
+        assert results[0].id == 'canonical-b'
+        assert results[0].topic_anchored is True
+
+
+class TestAnchorLookupsAreConcurrent:
+    """The per-topic lookups fan OUT; they are not serialized.
+
+    They are fully independent reads — the only cross-iteration state is a
+    post-hoc dedup set and an insertion index, neither an input to any lookup —
+    and this seam is the hottest read path in the system: every agent search
+    AND every procedural_knowledge write's near-dup pre-check. Serialized, the
+    topic cap would cost up to ``_MAX_ANCHOR_TOPICS`` round-trips of latency
+    instead of one round-trip's worth.
+    """
+
+    @pytest.mark.asyncio
+    async def test_lookups_overlap_in_flight(self, service):
+        """Deterministic, not timing-based: a barrier every lookup must reach.
+
+        Each lookup blocks on an ``asyncio.Barrier`` sized to the number of
+        topics, so the barrier can only release if all of them are in flight at
+        once. A sequential implementation deadlocks here and the ``wait_for``
+        below fails the test with a TimeoutError instead of hanging the suite.
+        """
+        topics = ['topic-a', 'topic-b', 'topic-c']
+        barrier = asyncio.Barrier(len(topics))
+
+        async def _blocking_scroll(_scope, filters, _limit):
+            await barrier.wait()
+            topic = filters['topic']
+            return [_canonical_payload(f'canonical-{topic}', topic=topic)]
+
+        service.mem0.search = AsyncMock(return_value={
+            'results': [_sibling(n, topic=t) for n, t in enumerate(topics, start=1)]
+        })
+        service.mem0.scroll_by_metadata = AsyncMock(side_effect=_blocking_scroll)
+
+        results = await asyncio.wait_for(
+            service.search(
+                query=_QUERY, project_id=_PROJECT_ID,
+                categories=['procedural_knowledge'], stores=['mem0'], limit=10,
+            ),
+            timeout=10,
+        )
+
+        assert service.mem0.scroll_by_metadata.await_count == 3
+        # Concurrency must not disturb TOPIC-RANK ordering of the pins.
+        assert [r.id for r in results[:3]] == [f'canonical-{t}' for t in topics]
+
+
+class TestFailOpenLeavesNoPartialPin:
+    """Fail-open is ALL-OR-NOTHING, exactly as its WARNING claims.
+
+    With more than one anchor topic, a failure while resolving the second must
+    not leave the first topic's pin applied: a list carrying one pin and not
+    the other is a third state neither the log line nor any caller expects. The
+    flag matters as much as the order — ``topic_anchored`` is set on a result
+    object SHARED with the pre-pin list, so an eager write would leak through
+    any rebind.
+    """
+
+    @pytest.mark.asyncio
+    async def test_second_topic_failing_reverts_the_first_topics_pin(self, service, caplog):
+        """RED against an in-place implementation: topic-a's pin would survive."""
+        canonical_a = {
+            'id': 'canonical-a',
+            'memory': 'the canonical for topic-a, ranked last in its own cluster',
+            'score': 0.60,
+            'metadata': {'category': 'procedural_knowledge', 'topic': 'topic-a',
+                         'canonical': True},
+        }
+        service.mem0.search = AsyncMock(return_value={'results': [
+            _sibling(1, topic='topic-a'),
+            _sibling(2, topic='topic-b'),
+            canonical_a,
+        ]})
+        service.mem0.scroll_by_metadata = AsyncMock(side_effect=[
+            [_canonical_payload('canonical-a', topic='topic-a')],
+            TimeoutError('qdrant scroll'),
+        ])
+
+        with caplog.at_level('WARNING'):
+            results = await service.search(
+                query=_QUERY, project_id=_PROJECT_ID,
+                categories=['procedural_knowledge'], stores=['mem0'], limit=10,
+            )
+
+        assert [r.id for r in results] == ['sibling-1', 'sibling-2', 'canonical-a']
+        assert not any(r.topic_anchored for r in results)
+        assert any('topic-anchored' in record.message for record in caplog.records)
