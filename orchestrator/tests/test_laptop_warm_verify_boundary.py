@@ -1901,23 +1901,71 @@ def test_parse_flock_gate_waits_returns_empty_for_uninstrumented_stderr():
 #   would still get the real production default instead of a silently
 #   disabled tree-kill (amendment-pass fix: an earlier draft wrapped
 #   ``fire`` itself and dropped the kill in that branch).
-# * orchestrator.cli.fire_watchdog_kill is wrapped to intercept its
-#   ``exit_fn`` argument: the wrapped exit_fn computes
-#   elapsed = time.monotonic() - t0, prints
-#   ``__WATCHDOG_GATE__ fire_delay=<elapsed>`` to stderr (flushed
-#   explicitly, since the real exit_fn is os._exit, which skips normal
-#   buffer flushing), then delegates to the real exit_fn. Because
-#   fire_watchdog_kill's own body calls ``exit_fn(exit_code)`` as its LAST
-#   action -- after the SIGTERM -> grace_secs sleep -> re-snapshot ->
-#   SIGKILL escalation has fully run -- the reported fire_delay is the FULL
-#   armed -> kill-escalation-complete window, covering both overrides
-#   (amendment-pass fix: an earlier draft stopped the clock at the ``fire``
-#   callback's entry, before the grace sleep, so
-#   ORCH_WATCHDOG_KILL_GRACE_SECS was armed but never actually exercised by
-#   the ceiling assertion below).
+# * orchestrator.cli.fire_watchdog_kill is wrapped to intercept TWO of its
+#   injectable arguments:
+#     - ``sleep``: replaced with a stopwatch wrapper that records how long
+#       the SIGTERM -> SIGKILL grace pause ACTUALLY took, so
+#       ORCH_WATCHDOG_KILL_GRACE_SECS is a MEASURED term rather than an
+#       assumed one.  cli.py:773 calls
+#       ``fire_watchdog_kill(pgid, grace_secs=grace_secs)`` with no
+#       ``sleep=``, so this injection displaces no production argument (and
+#       it falls back to the caller's own ``sleep`` if one is ever passed,
+#       exactly as the ``exit_fn`` interception does).
+#     - ``exit_fn``: the wrapped exit_fn prints the marker line to stderr
+#       (flushed explicitly, since the real exit_fn is os._exit, which
+#       skips normal buffer flushing), then delegates to the real exit_fn.
 #
-# The reported fire_delay is therefore immune to outer scheduler noise and
-# the storm that falsified the old wall-clock assertion.
+#   The reported fire_delay is RECONSTRUCTED from two measured terms rather
+#   than read off a single clock:
+#
+#       fire_delay = (t_fire_entry - t0) + observed_grace_sleep
+#
+#   where t_fire_entry is monotonic() at ENTRY to the wrapped
+#   fire_watchdog_kill -- which genuinely is the fire-callback entry,
+#   because cli.py's ``_on_watchdog_fire`` (cli.py:771-773) resolves the
+#   ``fire_watchdog_kill`` module global at CALL time and therefore lands in
+#   the already-wrapped callable.  No wrapper around ``fire`` itself is
+#   needed, so the warning above against wrapping ``fire`` stays honoured.
+#
+# THIRD CORRECTION (this pass -- task 4559 verify).  Commit aa3095175c
+# ("amend: measure the full watchdog arm-to-kill window, not just
+# fire-callback entry") moved the stop point from fire-callback ENTRY to
+# post-kill inside exit_fn, precisely so ORCH_WATCHDOG_KILL_GRACE_SECS came
+# under the ceiling assertion -- right in intent, but over-inclusive in
+# extent.  Stopping the clock in exit_fn also swept in fire_watchdog_kill's
+# TWO ppid_map_provider() calls (verify_cancel.py:774 before the SIGTERM
+# sweep and verify_cancel.py:782 after the grace sleep; each is a full
+# /proc iterdir plus one read_text() per pid -- read_ppid_map,
+# verify_cancel.py:165).  Neither walk is an env-override quantity under
+# test, and both scale with machine load: measured across a ~300x load
+# swing the two walks moved 0.56s -> 2.60s while the heartbeat wait held at
+# 0.513-0.530s and the grace sleep at 0.200-0.217s, carrying the total to
+# 5.18s -- past the 4.0s ceiling -- on a tree where BOTH overrides were
+# correctly wired.  That is the same load-sensitive-proxy defect as the
+# 19.75s outer wall clock, merely relocated inside the child.
+#
+# The reconstruction above is the third position, and it keeps what each
+# earlier one had to trade away: the heartbeat override stays asserted via
+# (t_fire_entry - t0), as in the pre-amendment form; the kill-grace
+# override stays asserted via observed_grace_sleep, as the amendment
+# intended; and the /proc walks -- which appear in neither override -- are
+# excluded from both terms.  The ceiling stays at 4.0s deliberately: it is
+# the DISCRIMINANT (the nearest broken shape -- kill-grace regressed to its
+# 5.0s production default with the heartbeat still wired -- lands at ~5.5s),
+# so the MEASUREMENT was the thing to fix, never the threshold.
+#
+# Because observed_grace_sleep is measured rather than assumed, a silent
+# failure of the ``sleep=`` injection would zero that term and quietly
+# retire the kill-grace axis from the ceiling.  The marker line therefore
+# carries ``grace=`` alongside ``fire_delay=``, and the ceiling test
+# asserts the grace pause was actually OBSERVED -- see
+# WATCHDOG_KILL_GRACE_OVERRIDE_SECS.  This class of test has now been
+# mis-measured three times (2921's outer wall clock -> 4248 falsified it at
+# 19.75s -> 4474 moved the clock inside the child but left the /proc walks
+# in); that non-vacuity guard is what stops a fourth.
+#
+# The reported fire_delay is therefore immune both to outer scheduler noise
+# and to the /proc-walk cost that machine load makes unbounded.
 # ---------------------------------------------------------------------------
 
 #: Marker token the instrumented bootstrap prints, one line per watchdog fire.
@@ -1929,7 +1977,7 @@ WATCHDOG_GATE_MARKER = '__WATCHDOG_GATE__'
 #: places rather than two hand-written copies that can silently drift apart
 #: (amendment-pass fix -- see test_watchdog_gate_timing_bootstrap_parses_
 #: its_own_marker_lines).
-WATCHDOG_GATE_LINE_FMT = f'{WATCHDOG_GATE_MARKER} fire_delay=%.4f'
+WATCHDOG_GATE_LINE_FMT = f'{WATCHDOG_GATE_MARKER} fire_delay=%.4f grace=%.4f'
 
 WATCHDOG_GATE_TIMING_BOOTSTRAP = f"""
 import os, sys, time
@@ -1945,16 +1993,36 @@ def _timed_start_stdin_watchdog(pgid, **kwargs):
     return _real_start_stdin_watchdog(pgid, **kwargs)
 
 
-def _timed_fire_watchdog_kill(pgid, *, exit_fn=None, **kwargs):
+def _timed_fire_watchdog_kill(pgid, *, exit_fn=None, sleep=None, **kwargs):
+    # Entry to THIS wrapper is the fire-callback entry: cli.py's
+    # _on_watchdog_fire resolves the fire_watchdog_kill module global at call
+    # time, so it lands here.  Snapshot before delegating, so the two
+    # load-sensitive /proc walks inside the real body stay OUT of the
+    # heartbeat term.
+    _t_fire_entry = time.monotonic()
     _real_exit = exit_fn if exit_fn is not None else os._exit
+    _real_sleep = sleep if sleep is not None else time.sleep
+    _observed_grace = [0.0]
+
+    def _timed_sleep(secs):
+        _s0 = time.monotonic()
+        try:
+            return _real_sleep(secs)
+        finally:
+            _observed_grace[0] += time.monotonic() - _s0
 
     def _timed_exit(code):
-        _elapsed = time.monotonic() - _t0
-        print('{WATCHDOG_GATE_LINE_FMT}' % _elapsed, file=sys.stderr)
+        _elapsed = (_t_fire_entry - _t0) + _observed_grace[0]
+        print(
+            '{WATCHDOG_GATE_LINE_FMT}' % (_elapsed, _observed_grace[0]),
+            file=sys.stderr,
+        )
         sys.stderr.flush()
         _real_exit(code)
 
-    return _real_fire_watchdog_kill(pgid, exit_fn=_timed_exit, **kwargs)
+    return _real_fire_watchdog_kill(
+        pgid, exit_fn=_timed_exit, sleep=_timed_sleep, **kwargs
+    )
 
 
 _cli.start_stdin_watchdog = _timed_start_stdin_watchdog
@@ -1962,14 +2030,38 @@ _cli.fire_watchdog_kill = _timed_fire_watchdog_kill
 _cli.main()
 """
 
+
+class WatchdogGateFire(NamedTuple):
+    """One instrumented ``fire_watchdog_kill`` call inside the child.
+
+    ``fire_delay_secs`` is the reconstructed
+    ``(t_fire_entry - t0) + grace_secs`` window -- the heartbeat wait plus
+    the observed SIGTERM->SIGKILL grace pause, deliberately EXCLUDING
+    ``fire_watchdog_kill``'s two load-sensitive /proc walks (see the banner
+    above).  ``grace_secs`` is broken out separately so the ceiling test can
+    assert that term was actually observed rather than silently defaulted to
+    zero by a failed ``sleep=`` injection.
+    """
+
+    fire_delay_secs: float
+    grace_secs: float
+
+
 _WATCHDOG_GATE_RE = re.compile(
-    re.escape(WATCHDOG_GATE_MARKER) + r' fire_delay=(?P<fire_delay>\S+)'
+    re.escape(WATCHDOG_GATE_MARKER)
+    + r' fire_delay=(?P<fire_delay>\S+) grace=(?P<grace>\S+)'
 )
 
 
-def parse_watchdog_gate_fire_delays(stderr: str) -> list[float]:
+def parse_watchdog_gate_fire_delays(stderr: str) -> list[WatchdogGateFire]:
     """Parse the :data:`WATCHDOG_GATE_TIMING_BOOTSTRAP` lines out of a child's stderr."""
-    return [float(m.group('fire_delay')) for m in _WATCHDOG_GATE_RE.finditer(stderr)]
+    return [
+        WatchdogGateFire(
+            fire_delay_secs=float(m.group('fire_delay')),
+            grace_secs=float(m.group('grace')),
+        )
+        for m in _WATCHDOG_GATE_RE.finditer(stderr)
+    ]
 
 
 def test_watchdog_gate_timing_bootstrap_parses_its_own_marker_lines():
@@ -1988,12 +2080,15 @@ def test_watchdog_gate_timing_bootstrap_parses_its_own_marker_lines():
     sync by discipline.
     """
     emitted = (
-        f'{WATCHDOG_GATE_LINE_FMT % 0.6931}\n'
+        f'{WATCHDOG_GATE_LINE_FMT % (0.6931, 0.2003)}\n'
         'some unrelated stderr chatter\n'
-        f'{WATCHDOG_GATE_LINE_FMT % 14.9807}\n'
+        f'{WATCHDOG_GATE_LINE_FMT % (14.9807, 5.0012)}\n'
     )
 
-    assert parse_watchdog_gate_fire_delays(emitted) == [0.6931, 14.9807]
+    assert parse_watchdog_gate_fire_delays(emitted) == [
+        WatchdogGateFire(fire_delay_secs=0.6931, grace_secs=0.2003),
+        WatchdogGateFire(fire_delay_secs=14.9807, grace_secs=5.0012),
+    ]
 
 
 def test_parse_watchdog_gate_fire_delays_returns_empty_for_uninstrumented_stderr():
@@ -2126,10 +2221,13 @@ def test_flock_wait_env_override_speeds_up_contention_result(tmp_path):
 
 
 #: Ceiling on the CLI's own measured watchdog delay -- armed (immediately
-#: before the watchdog thread's blocking select loop starts) to the kill
-#: escalation finishing (immediately before fire_watchdog_kill's
-#: unconditional self-exit), reported by the child's own clock via
-#: WATCHDOG_GATE_TIMING_BOOTSTRAP. This is deliberately NOT just "halfway
+#: before the watchdog thread's blocking select loop starts) to the
+#: fire callback's entry, PLUS the observed SIGTERM->SIGKILL grace pause,
+#: reported by the child's own clock via WATCHDOG_GATE_TIMING_BOOTSTRAP.
+#: Those two terms are exactly the two env overrides under test; the two
+#: /proc walks inside fire_watchdog_kill are load-sensitive and belong to
+#: neither, so they are deliberately excluded (third correction -- see the
+#: banner above WATCHDOG_GATE_TIMING_BOOTSTRAP). This is deliberately NOT just "halfway
 #: between the fully-wired and fully-un-wired extremes": it also has to
 #: catch either override being wired while the OTHER silently regresses to
 #: its production default, e.g. only ORCH_WATCHDOG_KILL_GRACE_SECS stops
@@ -2143,6 +2241,12 @@ def test_flock_wait_env_override_speeds_up_contention_result(tmp_path):
 #: FLOCK_WAIT_CEILING_SECS, just against two failure axes instead of one.
 WATCHDOG_FIRE_DELAY_CEILING_SECS = 4.0
 
+#: The two env-override values the ceiling test threads into the child, named
+#: once so the ``extra_env`` it spawns with and the assertions it makes about
+#: what came back cannot drift apart.
+WATCHDOG_HEARTBEAT_OVERRIDE_SECS = 0.5
+WATCHDOG_KILL_GRACE_OVERRIDE_SECS = 0.2
+
 
 @pytest.mark.timeout(180)  # task 4474: one subprocess, wedge-detector wait widened
 def test_watchdog_timeout_env_override_fires_fast_without_heartbeat(tmp_path):
@@ -2152,9 +2256,13 @@ def test_watchdog_timeout_env_override_fires_fast_without_heartbeat(tmp_path):
     a heartbeat, asserting the watchdog fires and self-exits non-zero.
 
     task 4474 (de-flake): the assertion is on the delay the CLI's OWN clock
-    measured -- armed to kill-escalation-complete, covering BOTH overrides
-    under test -- reported by :data:`WATCHDOG_GATE_TIMING_BOOTSTRAP` from
-    inside the child, NOT on an outer wall-clock measurement.
+    measured -- armed to fire-callback entry, plus the observed kill grace,
+    covering BOTH overrides under test and nothing else -- reported by
+    :data:`WATCHDOG_GATE_TIMING_BOOTSTRAP` from inside the child, NOT on an
+    outer wall-clock measurement.  (Task 4559 verify, third correction: the
+    window deliberately EXCLUDES fire_watchdog_kill's two /proc walks, which
+    belong to neither override and grow without bound under load -- see the
+    banner above WATCHDOG_GATE_TIMING_BOOTSTRAP.)
 
     Task 2921 measured this as an OUTER wall-clock quantity -- pgid-file
     appearance to proc.wait() return -- reasoning that absorbing the
@@ -2179,9 +2287,12 @@ def test_watchdog_timeout_env_override_fires_fast_without_heartbeat(tmp_path):
     so an un-wired override still shows up as a ~15s delay (10.0s heartbeat
     timeout + 5.0s kill grace) -- see WATCHDOG_FIRE_DELAY_CEILING_SECS for
     the exact discriminant, including the two partial-regression shapes.
-    Its one failure mode -- the CLI reaching the watchdog/kill by some path
-    other than the patched module-level names, leaving zero observations and
-    a vacuously-true ceiling -- is closed by the non-vacuity assertion below.
+    Its two failure modes are both closed by non-vacuity assertions below:
+    the CLI reaching the watchdog/kill by some path other than the patched
+    module-level names (leaving zero observations and a vacuously-true
+    ceiling), and the ``sleep=`` injection failing to land (leaving the
+    reconstructed delay's grace term at 0.0, which would silently drop
+    ORCH_WATCHDOG_KILL_GRACE_SECS out of the ceiling rather than fail it).
     """
     repo, head_sha = _setup_verify_repo(tmp_path)
     cfg_file = tmp_path / 'config.yaml'
@@ -2195,8 +2306,8 @@ def test_watchdog_timeout_env_override_fires_fast_without_heartbeat(tmp_path):
         cfg_file=cfg_file,
         request_id=REQUEST_ID,
         extra_env={
-            'ORCH_WATCHDOG_HEARTBEAT_TIMEOUT_SECS': '0.5',
-            'ORCH_WATCHDOG_KILL_GRACE_SECS': '0.2',
+            'ORCH_WATCHDOG_HEARTBEAT_TIMEOUT_SECS': str(WATCHDOG_HEARTBEAT_OVERRIDE_SECS),
+            'ORCH_WATCHDOG_KILL_GRACE_SECS': str(WATCHDOG_KILL_GRACE_OVERRIDE_SECS),
         },
         bootstrap=WATCHDOG_GATE_TIMING_BOOTSTRAP,
     )
@@ -2255,14 +2366,14 @@ def test_watchdog_timeout_env_override_fires_fast_without_heartbeat(tmp_path):
         f'expected non-zero exit (watchdog self-kill), got {proc.returncode}'
     )
 
-    fire_delays = parse_watchdog_gate_fire_delays(stderr.decode(errors='replace'))
-    # Non-vacuity guard: mirrors the flock twin's -- the ceiling assertion
+    fires = parse_watchdog_gate_fire_delays(stderr.decode(errors='replace'))
+    # Non-vacuity guard #1: mirrors the flock twin's -- the ceiling assertion
     # below is a max() over these observations, so an empty list would pass
     # by default. Zero observations means the CLI no longer calls
     # start_stdin_watchdog/fire_watchdog_kill through the module-level
     # ``orchestrator.cli`` names the bootstrap patches -- a real signal that
     # this test stopped measuring anything, not a pass.
-    assert fire_delays, (
+    assert fires, (
         'no instrumented watchdog-gate observation on the child stderr -- '
         'the timing bootstrap patches orchestrator.cli.start_stdin_watchdog '
         'and orchestrator.cli.fire_watchdog_kill, so zero observations means '
@@ -2270,13 +2381,42 @@ def test_watchdog_timeout_env_override_fires_fast_without_heartbeat(tmp_path):
         f'and the ceiling assertion below would be vacuous; '
         f'stderr={stderr_tail(stderr)!r}'
     )
-    longest = max(fire_delays)
+    # Non-vacuity guard #2 (task 4559 verify, the third correction -- see the
+    # banner above WATCHDOG_GATE_TIMING_BOOTSTRAP). fire_delay is now
+    # RECONSTRUCTED as (t_fire_entry - t0) + observed_grace_sleep so the two
+    # load-sensitive /proc walks stay out of it. That makes the kill-grace
+    # axis depend on the bootstrap's ``sleep=`` injection actually landing:
+    # if fire_watchdog_kill ever stopped accepting ``sleep`` or stopped
+    # sleeping, the grace term would silently collapse to 0.0, every
+    # fire_delay would shrink, and the ceiling would keep passing while
+    # having quietly stopped covering ORCH_WATCHDOG_KILL_GRACE_SECS at all.
+    # A real time.sleep(grace) can only overshoot its argument, never
+    # undershoot it, so requiring the observed pause to reach the override is
+    # safe under any load -- and a grace that regressed to the 5.0s
+    # production default is NOT filtered out here on purpose: it flows into
+    # fire_delay and is caught by the ceiling below, which is the axis that
+    # is supposed to catch it.
+    unmeasured = [f for f in fires if f.grace_secs < WATCHDOG_KILL_GRACE_OVERRIDE_SECS]
+    assert not unmeasured, (
+        f'the SIGTERM->SIGKILL grace pause was not observed at its '
+        f'{WATCHDOG_KILL_GRACE_OVERRIDE_SECS}s override on '
+        f'{len(unmeasured)} of {len(fires)} fire(s): {unmeasured}. '
+        f'fire_delay is reconstructed as (fire-entry - armed) + observed '
+        f'grace, so an unobserved grace term silently retires '
+        f'ORCH_WATCHDOG_KILL_GRACE_SECS from the ceiling assertion below '
+        f'rather than failing it -- the bootstrap\'s sleep= injection into '
+        f'fire_watchdog_kill is no longer taking effect; '
+        f'stderr={stderr_tail(stderr)!r}'
+    )
+    longest = max(f.fire_delay_secs for f in fires)
     assert longest < WATCHDOG_FIRE_DELAY_CEILING_SECS, (
         f'expected the CLI-measured watchdog delay (heartbeat wait + kill '
-        f'grace) to be well under the 15s production window (10s heartbeat '
-        f'timeout + 5s kill grace) given the 0.5s+0.2s env overrides -- '
-        f'longest={longest:.2f}s over {len(fire_delays)} fire(s): '
-        f'{fire_delays}; the watchdog env overrides are not fully wired up'
+        f'grace, excluding fire_watchdog_kill\'s /proc walks) to be well '
+        f'under the 15s production window (10s heartbeat timeout + 5s kill '
+        f'grace) given the '
+        f'{WATCHDOG_HEARTBEAT_OVERRIDE_SECS}s+{WATCHDOG_KILL_GRACE_OVERRIDE_SECS}s '
+        f'env overrides -- longest={longest:.2f}s over {len(fires)} fire(s): '
+        f'{fires}; the watchdog env overrides are not fully wired up'
     )
 
 
