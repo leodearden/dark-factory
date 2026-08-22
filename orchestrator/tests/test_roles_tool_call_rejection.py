@@ -274,3 +274,73 @@ def test_guidance_placement_is_structural() -> None:
         'It must immediately follow BACKGROUND_WAIT_GUIDANCE where that block '
         'is present, or be the first `##`-headed section where it is absent.'
     )
+
+
+def test_missing_required_parameter_shape_is_composed_into_the_splice_unit() -> None:
+    """``TOOL_CALL_REJECTION_GUIDANCE`` carries the third shape too.
+
+    Mirrors `test_combined_guidance_composes_both_rules`. The composed
+    constant is the SINGLE splice unit and the two halves must never be
+    spliced apart: a role that received only the two known shapes would
+    mis-route a missing-required-parameter rejection into the deferred-tool
+    bullet, which is the exact confusion this task closes.
+    """
+    assert MISSING_REQUIRED_PARAMETER_REJECTION in TOOL_CALL_REJECTION_GUIDANCE, (
+        'TOOL_CALL_REJECTION_GUIDANCE no longer contains '
+        'MISSING_REQUIRED_PARAMETER_REJECTION. The two halves must NEVER be '
+        'spliced apart: a role that received only the two known shapes would '
+        'mis-route a missing-required-parameter rejection into the '
+        'deferred-tool bullet — the exact confusion census-2026-08-21 §1.1 '
+        '(task 4578) closes.'
+    )
+
+
+def test_missing_required_parameter_shape_appears_exactly_once_per_role() -> None:
+    """No duplicate splice, and no role silently missing the composed unit.
+
+    Mirrors `test_combined_guidance_appears_exactly_once_per_role`. Unlike
+    `test_guidance_appears_exactly_once_per_role` above, a count of 0 is NOT
+    skipped here: with the composition pinned by the test above, a zero
+    count for THIS constant means the composed TOOL_CALL_REJECTION_GUIDANCE
+    splice itself is missing from that role, and a count of 2 means a stale
+    bare `+ MISSING_REQUIRED_PARAMETER_REJECTION` tail survives beside the
+    composed splice at one of the 8 sites.
+    """
+    offenders = {}
+    for name in sorted(_UNPINNED_PROMPT_ROLES):
+        count = ROLES[name].system_prompt.count(MISSING_REQUIRED_PARAMETER_REJECTION)
+        if count != 1:
+            offenders[name] = count
+
+    assert offenders == {}, (
+        f'Roles whose MISSING_REQUIRED_PARAMETER_REJECTION splice count is not '
+        f'exactly 1: {offenders}. A count of 0 means the composed '
+        'TOOL_CALL_REJECTION_GUIDANCE splice itself is missing from that role; '
+        'a count of 2 means a stale bare `+ MISSING_REQUIRED_PARAMETER_REJECTION` '
+        'tail survives beside it — delete the tail, it is now redundant.'
+    )
+
+
+def test_artifact_pinned_role_does_not_carry_missing_required_parameter_shape() -> None:
+    """The negative half, scoped to the new half specifically.
+
+    Mirrors `test_artifact_pinned_role_does_not_carry_guidance` above, and
+    guards the same accidental-splice risk
+    `test_excluded_roles_do_not_carry_combined_guidance` guards for the wait
+    block: a hand-splice of just the new bullet into `reviewer_comprehensive`
+    would not be caught by the whole-constant negative test above if some
+    future edit spliced the two halves separately instead of composing them.
+    """
+    offenders = sorted(
+        name
+        for name in ROLES
+        if name not in _UNPINNED_PROMPT_ROLES
+        and MISSING_REQUIRED_PARAMETER_REJECTION in ROLES[name].system_prompt
+    )
+
+    assert offenders == [], (
+        f'Roles carrying MISSING_REQUIRED_PARAMETER_REJECTION without an '
+        f'unpinned prompt: {offenders}. A PromptSpec-backed role may silently '
+        'drop a splice at runtime — either remove it, or if the role '
+        'genuinely gained an unpinned prompt, add it to _UNPINNED_PROMPT_ROLES.'
+    )
