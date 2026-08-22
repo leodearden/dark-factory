@@ -5203,11 +5203,22 @@ class TestCommitEffectSurvival:
     ) -> None:
         """The probe must carry WHY, not just THAT.
 
-        ``format_unattributed_landing_detail`` renders this verbatim into the
-        escalation a human reads, so the probe has to name the ratio measured,
-        the thresholds and floor actually applied, and the worst offending
-        guarded path.  An escalation that says only "effect absent" is what
-        cost days of misdiagnosis twice.
+        The probe has to name the ratio measured, the thresholds and floor
+        actually applied, and the worst offending guarded path.  An
+        escalation that says only "effect absent" is what cost days of
+        misdiagnosis twice.
+
+        THIS test asserts the dataclass only.  That those fields actually
+        reach the escalation body is a separate seam, pinned in
+        ``test_landing_evidence.py`` by
+        ``test_probe_carries_the_survival_facts_that_decided_it`` (threading
+        through ``_record_effect_divergence``) and
+        ``test_survival_measurement_is_rendered_not_just_carried``
+        (rendering).  Stated explicitly because this docstring previously
+        claimed ``format_unattributed_landing_detail`` "renders this
+        verbatim" while nothing rendered it at all — the same
+        prose-asserts-an-unimplemented-behaviour defect this task exists to
+        remove.
         """
         await _seed_on_main(git_repo, {'mod.py': _numbered('base', 10)}, 'seed mod')
         merge_sha = await _land_branch(

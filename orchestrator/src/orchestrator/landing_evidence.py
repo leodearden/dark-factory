@@ -675,6 +675,75 @@ def format_unattributed_landing_detail(
     return summary, detail
 
 
+def _survival_lines(probe: dict[str, Any]) -> list[str]:
+    """Render the part-(b) survival MEASUREMENT that decided the verdict.
+
+    Returns [] for a probe that carries no survival keys at all — a legacy
+    probe, or one written before this was threaded through — so an older
+    caller still renders cleanly rather than printing "None/None".
+
+    This is the block that answers "why was this rejected?".  The diverged
+    paths above it are a demoted diagnostic; these numbers are the decision.
+    The denominator is printed with the ratio on purpose: 2/3 lines
+    surviving and 2000/3000 are the same ratio and warrant very different
+    confidence, and a bare "0.67" invites over-trusting a 3-line sample.
+    Thresholds are printed beside the values they gate so the reader can see
+    WHICH arm failed without reading the source, and so a later retune shows
+    up in the escalation instead of silently changing what the number means.
+    """
+    if 'aggregate_survival' not in probe:
+        return []
+
+    lines: list[str] = []
+    aggregate = probe.get('aggregate_survival')
+    total = probe.get('added_lines_total') or 0
+    threshold = probe.get('aggregate_threshold')
+
+    if aggregate is None:
+        lines.append(
+            'survival: not measured — no touched path contributed any added '
+            'lines (all vacuous), or resolution failed before the '
+            'measurement stage'
+        )
+    else:
+        survived = round(aggregate * total)
+        verdict_word = (
+            'BELOW threshold' if threshold is not None and aggregate < threshold
+            else 'at or above threshold'
+        )
+        gate = '' if threshold is None else f', threshold {threshold}'
+        lines.append(
+            f'survival (aggregate): {aggregate:.4f} — about {survived} of '
+            f'{total} added lines still present at main{gate} '
+            f'[{verdict_word}]'
+        )
+
+    worst_path = probe.get('worst_guarded_path')
+    worst = probe.get('worst_guarded_survival')
+    if worst_path and worst is not None:
+        per_file = probe.get('per_file_threshold')
+        floor = probe.get('per_file_min_added_lines')
+        gate = '' if per_file is None else f', threshold {per_file}'
+        scope = '' if floor is None else f' (guard applies at >= {floor} added lines)'
+        state = (
+            'BELOW threshold' if per_file is not None and worst < per_file
+            else 'at or above threshold'
+        )
+        lines.append(
+            f'worst guarded file: {worst_path} at {worst:.4f}{gate} '
+            f'[{state}]{scope}'
+        )
+
+    vacuous = probe.get('vacuous_paths')
+    if vacuous:
+        lines.append(
+            'vacuous paths (zero added lines — decided by deletion/rename/'
+            'blob comparison, not by line survival):'
+        )
+        lines.extend(f'  - {path}' for path in vacuous)
+    return lines
+
+
 def _render_effect_divergence(
     verdict: LandingEvidenceVerdict,
 ) -> tuple[str, str]:
@@ -689,6 +758,14 @@ def _render_effect_divergence(
     already contained the paths, but nothing pointed a reader at them.
     Naming them under a header is the one line that resolves the
     "is this a revert or just skew?" question the reason prose now poses.
+
+    The paths are followed by :func:`_survival_lines`, the part-(b)
+    MEASUREMENT that actually decided the verdict.  Order is deliberate and
+    the header says so: paths first because they are the most legible line
+    in the escalation, but explicitly labelled a diagnostic, because since
+    the survival semantics they no longer decide anything.  Printing them
+    alone would show the reader everything except the basis of the
+    rejection.
     """
     if verdict.reason != 'effect_absent':
         return '', ''
@@ -706,9 +783,14 @@ def _render_effect_divergence(
     if not paths:
         failure = probe.get('effect_failure')
         if failure:
+            # Still emit the survival block: on a structural failure it says
+            # "not measured", which is the fact the reader needs — silence
+            # here would read as "measured and fine".
+            tail = _survival_lines(probe)
+            suffix = ('\n' + '\n'.join(tail)) if tail else ''
             return (
                 'no path divergence recorded — the effect check failed '
-                f'structurally: {failure}\n\n'
+                f'structurally: {failure}{suffix}\n\n'
             ), ''
         # The decision said absent but the re-probe says present: main HEAD
         # advanced between the two calls.  Render the race rather than let

@@ -396,6 +396,54 @@ class TestValidateLandingEvidenceEffectDivergenceProbe:
             verdict.probe['effect_check_sha'],
         )
 
+    async def test_probe_carries_the_survival_facts_that_decided_it(self) -> None:
+        """The part-(b) measurement must be threaded from CommitEffectProbe
+        into ``verdict.probe``, not left in the dataclass.
+
+        Without this the escalation can name the diverged paths — which part
+        (b) demoted to a diagnostic — while omitting the aggregate/per-file
+        numbers that ARE the decision, so the reader sees everything except
+        the basis of the rejection.
+        """
+        citation = 'a' * 40
+        git_ops = _git_ops(
+            citation=citation,
+            is_ancestor_map={(citation, 'task/42'): False},
+            effect_present=False,
+            effect_probe=CommitEffectProbe(
+                present=False,
+                diverged_paths=('src/core.py',),
+                anchor_sha='c' * 40,
+                failure='effect_not_survived',
+                aggregate_survival=0.5,
+                added_lines_total=60,
+                worst_guarded_path='src/core.py',
+                worst_guarded_survival=0.45,
+                aggregate_threshold=0.98,
+                per_file_threshold=0.9,
+                per_file_min_added_lines=25,
+                vacuous_paths=('gone.py',),
+            ),
+        )
+
+        verdict = await validate_landing_evidence(
+            git_ops, '42', 'task/42', branch_tip_sha=None,
+        )
+
+        assert verdict.probe['aggregate_survival'] == 0.5
+        assert verdict.probe['added_lines_total'] == 60
+        assert verdict.probe['worst_guarded_path'] == 'src/core.py'
+        assert verdict.probe['worst_guarded_survival'] == 0.45
+        assert verdict.probe['aggregate_threshold'] == 0.98
+        assert verdict.probe['per_file_threshold'] == 0.9
+        assert verdict.probe['per_file_min_added_lines'] == 25
+        assert verdict.probe['vacuous_paths'] == ['gone.py']
+
+        # End to end: the facts reach the escalation body, not just the dict.
+        _, detail = format_unattributed_landing_detail('42', 'task/42', verdict)
+        assert '0.5000' in detail
+        assert '60' in detail
+
     async def test_candidate_reject_threads_diverged_paths_into_probe(self) -> None:
         """(b) CANDIDATE mode carries the same enrichment, anchored on the
         candidate sha the decision used.
@@ -572,6 +620,99 @@ class TestFormatUnattributedLandingDetail:
     where a reword can be judged against the semantics, rather than by tests
     that only notice the text changed.
     """
+
+    def test_survival_measurement_is_rendered_not_just_carried(self) -> None:
+        """The part-(b) numbers that DECIDED the verdict must reach the human.
+
+        ``diverged_paths`` is explicitly demoted by part (b) to a diagnostic
+        that "no longer decides anything".  An escalation that printed only
+        the paths would show the reader everything except the basis of the
+        rejection — and invite precisely the "it says diverged, so it was
+        reverted" leap this whole task exists to stop.
+
+        Asserted on RUNTIME DATA (the ratio, its denominator and the
+        threshold all come from the probe), not on wording.
+        """
+        _, detail = format_unattributed_landing_detail(
+            '42', 'task/42',
+            _verdict(
+                'effect_absent',
+                diverged_paths=['src/core.py'],
+                effect_failure='effect_not_survived',
+                aggregate_survival=0.5,
+                added_lines_total=60,
+                aggregate_threshold=0.98,
+            ),
+        )
+
+        assert '0.5000' in detail, 'the measured ratio must appear'
+        assert '60' in detail, 'the denominator must appear beside the ratio'
+        assert '0.98' in detail, 'the threshold applied must appear'
+        assert 'BELOW threshold' in detail
+
+    def test_worst_guarded_file_is_named_with_its_floor(self) -> None:
+        """The per-file guard is what names a reverted deliverable hidden
+        behind a healthy aggregate, so the escalation must say WHICH file and
+        at what floor the guard even applied.
+        """
+        _, detail = format_unattributed_landing_detail(
+            '42', 'task/42',
+            _verdict(
+                'effect_absent',
+                diverged_paths=['src/core.py'],
+                aggregate_survival=0.99,
+                added_lines_total=2000,
+                aggregate_threshold=0.98,
+                worst_guarded_path='src/deliverable.py',
+                worst_guarded_survival=0.10,
+                per_file_threshold=0.9,
+                per_file_min_added_lines=25,
+            ),
+        )
+
+        assert 'src/deliverable.py' in detail
+        assert '0.1000' in detail
+        assert '25' in detail, 'the added-lines floor the guard applies at'
+
+    def test_unmeasured_survival_says_so_rather_than_rendering_none(self) -> None:
+        """An all-vacuous branch has aggregate_survival None.  Silence would
+        read as "measured and fine"; a bare "None" reads as a bug.
+        """
+        _, detail = format_unattributed_landing_detail(
+            '42', 'task/42',
+            _verdict(
+                'effect_absent',
+                diverged_paths=['obsolete.py'],
+                effect_failure='vacuous_effect_absent',
+                aggregate_survival=None,
+                added_lines_total=0,
+                vacuous_paths=['obsolete.py'],
+            ),
+        )
+
+        assert 'not measured' in detail.lower()
+        assert 'survival: None' not in detail
+        assert 'vacuous' in detail.lower()
+
+    def test_probe_without_survival_keys_renders_cleanly(self) -> None:
+        """A legacy probe carrying only the part-(a) keys must not sprout a
+        half-empty survival block — the seven other gate-wiring test files
+        construct exactly that shape.
+
+        Asserted against the BLOCK MARKERS, not the bare word 'survival':
+        the reason prose legitimately says "did not SURVIVE" and "survival
+        semantics", so a substring check on 'survival' would fail here for
+        reasons having nothing to do with the block.
+        """
+        _, detail = format_unattributed_landing_detail(
+            '42', 'task/42',
+            _verdict('effect_absent', diverged_paths=['a.py']),
+        )
+
+        assert 'survival (aggregate)' not in detail
+        assert 'worst guarded file' not in detail
+        assert 'not measured' not in detail
+        assert 'a.py' in detail
 
     def test_diverged_paths_render_in_a_labelled_block(self) -> None:
         """(b) The path must appear under its own LABELLED header, not merely
