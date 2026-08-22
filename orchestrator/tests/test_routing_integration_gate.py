@@ -389,7 +389,7 @@ class TestOverrideWinsAtTheSeam:
         stub = _RoutingRecorderStub()
         workflow, _scheduler = _build_workflow(config, git_ops, task_assignment, stub)
         rec = _RecordingEventStore()
-        workflow.event_store = rec
+        workflow.event_store = rec  # type: ignore[assignment]
         monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
         monkeypatch.setattr(
             'orchestrator.workflow.run_scoped_verification', _mock_verify_passes(),
@@ -433,7 +433,7 @@ class TestInvalidOverrideFallsThroughFailSafe:
         stub = _RoutingRecorderStub()
         workflow, _scheduler = _build_workflow(config, git_ops, task_assignment, stub)
         rec = _RecordingEventStore()
-        workflow.event_store = rec
+        workflow.event_store = rec  # type: ignore[assignment]
         monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
         monkeypatch.setattr(
             'orchestrator.workflow.run_scoped_verification', _mock_verify_passes(),
@@ -541,7 +541,7 @@ class TestByteEquivalenceThroughTheRig:
         stub = _RoutingRecorderStub()
         workflow, _scheduler = _build_workflow(stock_config, git_ops, task_assignment, stub)
         rec = _RecordingEventStore()
-        workflow.event_store = rec
+        workflow.event_store = rec  # type: ignore[assignment]
         monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
         monkeypatch.setattr(
             'orchestrator.workflow.run_scoped_verification', _mock_verify_passes(),
@@ -600,9 +600,9 @@ class TestByteEquivalenceThroughTheRig:
         are seeded directly rather than produced by a real architect stub.
         """
         stub = _MinimalRouteRecorder()
-        workflow, _scheduler = _build_workflow(stock_config, git_ops, task_assignment, stub)
+        workflow, _scheduler = _build_workflow(stock_config, git_ops, task_assignment, stub)  # type: ignore[arg-type]
         rec = _RecordingEventStore()
-        workflow.event_store = rec
+        workflow.event_store = rec  # type: ignore[assignment]
         monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
 
         workflow.plan = {'steps': [{'id': f's{i}', 'status': 'pending'} for i in range(12)]}
@@ -647,7 +647,7 @@ class TestByteEquivalenceThroughTheRig:
         stub = _RoutingRecorderStub()
         workflow, _scheduler = _build_workflow(stock_config, git_ops, task_assignment, stub)
         rec = _RecordingEventStore()
-        workflow.event_store = rec
+        workflow.event_store = rec  # type: ignore[assignment]
         _seed_workflow_artifacts(workflow, tmp_path=tmp_path)
         workflow.git_ops.rebase_onto_main = AsyncMock()  # type: ignore[method-assign]
         workflow._submit_to_merge_queue = AsyncMock(  # type: ignore[method-assign]
@@ -743,10 +743,10 @@ class TestTierStableWithinOneDispatch:
         stub = _RoutingRecorderStub()
         workflow, scheduler = _build_workflow(stock_config, git_ops, task_assignment, stub)
         rec = _RecordingEventStore()
-        workflow.event_store = rec
+        workflow.event_store = rec  # type: ignore[assignment]
         backend = FakeMetadataBackend()
         wire_metadata_backend(
-            scheduler, backend, seed=task_assignment.task['metadata'], grants=True,
+            scheduler, backend, seed=task_assignment.task['metadata'], grants=True,  # type: ignore[arg-type]
         )
         monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
 
@@ -916,7 +916,7 @@ class TestRetryTierBumpAcrossDispatches:
         harness = _build_harness(stock_config)
         backend = FakeMetadataBackend()
         seed_metadata = self._seed_metadata()
-        wire_metadata_backend(harness.scheduler, backend, seed=seed_metadata, grants=True)
+        wire_metadata_backend(harness.scheduler, backend, seed=seed_metadata, grants=True)  # type: ignore[arg-type]
 
         task_assignment.task['metadata'] = self._seed_metadata()
         blocked_report = TaskReport(
@@ -956,7 +956,7 @@ class TestRetryTierBumpAcrossDispatches:
         stub = _RoutingRecorderStub()
         workflow, _scheduler = _build_workflow(stock_config, git_ops, fresh_assignment, stub)
         rec = _RecordingEventStore()
-        workflow.event_store = rec
+        workflow.event_store = rec  # type: ignore[assignment]
         monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
         monkeypatch.setattr(
             'orchestrator.workflow.run_scoped_verification', _mock_verify_passes(),
@@ -982,7 +982,7 @@ class TestRetryTierBumpAcrossDispatches:
         harness = _build_harness(stock_config)
         backend = FakeMetadataBackend()
         seed_metadata = self._seed_metadata()
-        wire_metadata_backend(harness.scheduler, backend, seed=seed_metadata, grants=True)
+        wire_metadata_backend(harness.scheduler, backend, seed=seed_metadata, grants=True)  # type: ignore[arg-type]
 
         task_assignment.task['metadata'] = self._seed_metadata()
         done_report = TaskReport(
@@ -1061,7 +1061,7 @@ class TestCeilingFallbackDoesNotBlockDispatch:
             workflow, _scheduler = _build_workflow(config, git_ops, task_assignment, stub)
             workflow.cost_store = cost_store
             rec = _RecordingEventStore()
-            workflow.event_store = rec
+            workflow.event_store = rec  # type: ignore[assignment]
             monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
             monkeypatch.setattr(
                 'orchestrator.workflow.run_scoped_verification', _mock_verify_passes(),
@@ -1105,7 +1105,7 @@ class TestCeilingFallbackDoesNotBlockDispatch:
             workflow, _scheduler = _build_workflow(config, git_ops, task_assignment, stub)
             workflow.cost_store = cost_store
             rec = _RecordingEventStore()
-            workflow.event_store = rec
+            workflow.event_store = rec  # type: ignore[assignment]
             monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
             monkeypatch.setattr(
                 'orchestrator.workflow.run_scoped_verification', _mock_verify_passes(),
@@ -1200,7 +1200,7 @@ class TestSaturationStampRoutesNextDispatchFullPath:
         _seed_workflow_artifacts(workflow, tmp_path=tmp_path)
         backend = FakeMetadataBackend()
         wire_metadata_backend(
-            scheduler, backend, seed=task_assignment.task['metadata'], grants=True,
+            scheduler, backend, seed=task_assignment.task['metadata'], grants=True,  # type: ignore[arg-type]
         )
         monkeypatch.setattr('orchestrator.workflow.invoke_agent', self._max_turns_invoke)
 
@@ -1255,7 +1255,7 @@ class TestSaturationStampRoutesNextDispatchFullPath:
             stock_config, git_ops, fresh_assignment, recorder,
         )
         rec = _RecordingEventStore()
-        workflow2.event_store = rec
+        workflow2.event_store = rec  # type: ignore[assignment]
         monkeypatch.setattr('orchestrator.workflow.invoke_agent', recorder.invoke_agent)
         monkeypatch.setattr(
             'orchestrator.workflow.run_scoped_verification', _mock_verify_passes(),
@@ -1395,7 +1395,7 @@ class TestSimpleTaskModelReloadReachesTheSeam:
             live, GitOps(live.git, tmp_path), task_assignment, recorder,
         )
         rec = _RecordingEventStore()
-        workflow.event_store = rec
+        workflow.event_store = rec  # type: ignore[assignment]
         monkeypatch.setattr('orchestrator.workflow.invoke_agent', recorder.invoke_agent)
 
         await workflow._invoke(SIMPLE_TASK, 'simple task prompt', tmp_path)
@@ -1506,9 +1506,9 @@ class TestUnknownRuleKeyRejectedPriorRulesStillRoute:
         # seed workflow.plan/modules directly and drive _invoke, since only
         # the resolved route matters here.
         stub = _MinimalRouteRecorder()
-        workflow, _scheduler = _build_workflow(stock_config, git_ops, task_assignment, stub)
+        workflow, _scheduler = _build_workflow(stock_config, git_ops, task_assignment, stub)  # type: ignore[arg-type]
         rec = _RecordingEventStore()
-        workflow.event_store = rec
+        workflow.event_store = rec  # type: ignore[assignment]
         monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
 
         workflow.plan = {'steps': [{'id': f's{i}', 'status': 'pending'} for i in range(12)]}
@@ -1669,7 +1669,7 @@ class TestOutOfBandParity:
         mcp = MagicMock()
         mcp.mcp_config_json.return_value = {'mcpServers': {}}
         cp = ReviewCheckpoint(self._deep_reviewer_config(), mcp, None)
-        cp.event_store = rec
+        cp.event_store = rec  # type: ignore[assignment]
 
         stub = _MinimalRouteRecorder()
         monkeypatch.setattr('orchestrator.review_checkpoint.invoke_agent', stub.invoke_agent)
@@ -1814,7 +1814,7 @@ class TestRollupRendersRigProducedRows:
             # -- Dispatch #1 (task 42): stock config-layer model. One call
             # below the turn cap (unsaturated).
             stub1 = _CostedInvokeStub(cost_usd=2.50, turns=impl_max_turns - 1)
-            workflow1, _s1 = _build_workflow(stock_config, git_ops, task_assignment, stub1)
+            workflow1, _s1 = _build_workflow(stock_config, git_ops, task_assignment, stub1)  # type: ignore[arg-type]
             workflow1.event_store = event_store
             workflow1.cost_store = cost_store
             workflow1.plan = {'steps': [{'id': 's1', 'status': 'pending'}]}
@@ -1840,7 +1840,7 @@ class TestRollupRendersRigProducedRows:
             }
             assignment_2 = TaskAssignment(task_id='43', task=task_2, modules=['lib'])
             stub2 = _CostedInvokeStub(cost_usd=1.25, turns=impl_max_turns)
-            workflow2, _s2 = _build_workflow(stock_config, git_ops, assignment_2, stub2)
+            workflow2, _s2 = _build_workflow(stock_config, git_ops, assignment_2, stub2)  # type: ignore[arg-type]
             workflow2.event_store = event_store
             workflow2.cost_store = cost_store
             workflow2.plan = {'steps': [{'id': 's1', 'status': 'pending'}]}
