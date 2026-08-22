@@ -5,7 +5,7 @@ import dataclasses
 import json
 from pathlib import Path
 from typing import Any, ClassVar
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _orch_helpers import pydantic_spec
@@ -1636,6 +1636,140 @@ class TestDispatchChainItems:
         assert data['runner'] == 'local'      # the fallback ran
         assert data['chain_items'] == 7       # ...and telemetry survived it
 
+
+# ---------------------------------------------------------------------------
+# Task 3789 (ε) step-13: dispatch re-stamps FlakeSuppression.runner
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestDispatchStampsFlakeSuppressionRunner:
+    """``VerifyRunnerPool.dispatch`` re-stamps the carried observation's ``runner``.
+
+    ``FlakeSuppression.runner`` means WHERE the isolated re-run actually executed.
+    The discriminator stamps ``'local'`` — honest, but host-RELATIVE: on a remote
+    runner it means "local to that remote", and read back on the dispatcher it is
+    simply wrong.  Left uncorrected, the ledger's ``runner`` column would read
+    ``'local'`` for every observation in the fleet, which is exactly the column θ's
+    class-3 systemic check reads to tell a bad HOST from a bad SUITE.
+
+    ``dispatch`` is the only scope that knows which runner really ran, and it knows
+    it only AFTER the ``RunnerUnavailable``->local fallback — which is what makes
+    ``merge_queue``'s own ``runner`` parameter an unreliable source and puts the
+    stamp here rather than at the recorder's call site.
+    """
+
+    @staticmethod
+    def _runner(name: str, *, is_local: bool, result=None, unavailable: bool = False):
+        from orchestrator.verify_runner import RunnerUnavailable
+
+        r = MagicMock(spec=VerifyRunner)
+        r.name = name
+        r.is_local = is_local
+        r.run_merge_verify = AsyncMock(
+            side_effect=RunnerUnavailable(f'{name} down') if unavailable else None,
+            return_value=result,
+        )
+        return r
+
+    @staticmethod
+    def _result_with(suppression):
+        return _make_pass_result(
+            category='merge_flake_suppressed', flake_suppression=suppression,
+        )
+
+    async def test_remote_dispatch_restamps_the_runner_name(self):
+        """(a) The headline: a remote's honest self-report of ``'local'`` becomes the
+        remote's NAME, and nothing else about the observation is disturbed."""
+        from orchestrator.verify_runner import VerifyRunnerPool
+
+        s = _make_suppression(runner='local')
+        remote = self._runner('remote-lab-1', is_local=False, result=self._result_with(s))
+        pool = VerifyRunnerPool([remote])
+
+        result = await pool.dispatch('sha1', _make_spec())
+
+        assert result.flake_suppression is not None
+        assert result.flake_suppression.runner == 'remote-lab-1'
+        # Every other field survives untouched — the stamp is a correction of ONE
+        # column, not a re-derivation of the observation.
+        assert result.flake_suppression == dataclasses.replace(s, runner='remote-lab-1')
+
+    async def test_local_dispatch_leaves_local(self):
+        """(b) On a local dispatch the discriminator's stamp was already right, so
+        the correction is a no-op rather than a rename."""
+        from orchestrator.verify_runner import VerifyRunnerPool
+
+        s = _make_suppression(runner='local')
+        local = self._runner('local', is_local=True, result=self._result_with(s))
+        pool = VerifyRunnerPool([local])
+
+        result = await pool.dispatch('sha1', _make_spec())
+
+        assert result.flake_suppression is not None
+        assert result.flake_suppression.runner == 'local'
+
+    async def test_runner_unavailable_fallback_stamps_the_runner_that_actually_ran(self):
+        """(c) The case that decides WHERE the stamp lives.
+
+        The remote is selected and dies; the LOCAL runner produces the observation.
+        The stamp must name the runner that actually ran, never the one that was
+        selected — otherwise a fallback verify would file its flakes against an
+        innocent host, and that host is precisely what θ's class-3 check indicts.
+        """
+        from orchestrator.verify_runner import VerifyRunnerPool
+
+        # A deliberately WRONG incoming value, so a missing stamp cannot pass by
+        # coincidence and a stamp taken from `selected` fails loudly.
+        s = _make_suppression(runner='stale-stamp')
+        remote = self._runner('remote-lab-1', is_local=False, unavailable=True)
+        local = self._runner('local', is_local=True, result=self._result_with(s))
+        pool = VerifyRunnerPool([remote, local])
+
+        result = await pool.dispatch('sha1', _make_spec())
+
+        assert result.flake_suppression is not None
+        assert result.flake_suppression.runner == 'local'
+
+    async def test_no_suppression_passes_through_untouched(self):
+        """(d) B13 — an old remote carries no observation at all.  The stamp must be
+        a no-op on None, not an AttributeError inside the merge path."""
+        from orchestrator.verify_runner import VerifyRunnerPool
+
+        remote = self._runner('remote-lab-1', is_local=False, result=_make_pass_result())
+        pool = VerifyRunnerPool([remote])
+
+        result = await pool.dispatch('sha1', _make_spec())
+
+        assert result.flake_suppression is None
+        assert result.passed is True
+
+    async def test_stamping_is_pure(self):
+        """(e) ``dispatch`` stays a TRANSPORT concern: it corrects one field and
+        records nothing.  Recording belongs to the dispatcher's merge path, which
+        alone holds the project root, merge SHA and task id — and doing it twice
+        would double-count every observation in the ledger."""
+        from orchestrator import flake_recorder
+        from orchestrator.verify_runner import VerifyRunnerPool
+
+        flake_recorder._merge_flake_suppression_streak = 0
+        remote = self._runner(
+            'remote-lab-1', is_local=False,
+            result=self._result_with(_make_suppression(runner='local')),
+        )
+        emitted = []
+        event_store = MagicMock()
+        event_store.emit = MagicMock(side_effect=lambda *a, **kw: emitted.append(a[0]))
+
+        record = MagicMock()
+        with patch.object(flake_recorder, 'record_merge_flake_suppression', record):
+            pool = VerifyRunnerPool([remote], event_store=event_store, task_id='t-1')
+            await pool.dispatch('sha1', _make_spec())
+
+        record.assert_not_called()
+        # The pre-existing merge_verify telemetry is unaffected; nothing else is emitted.
+        assert emitted == [EventType.merge_verify]
+        assert flake_recorder._merge_flake_suppression_streak == 0
 
 # ---------------------------------------------------------------------------
 # retry_scope_event_fields — merge_verify event honesty (task 2837, PRD D5)
