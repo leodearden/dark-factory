@@ -57,6 +57,17 @@ ONE string constant, and ``test_safety_rule_is_spliced_into_steward_prompt``
 asserts that whole constant reaches the steward.  Splitting them apart is not
 expressible without deleting the constant, which that test already fails on.
 
+THE TWO ANCHORS, added in the task 4130 review.  The prose checks above only
+prove the constants agree with each other; two further tests prove the tuple
+agrees with the SYSTEM.  ``test_safety_rule_categories_match_the_harness_gate``
+reads the gate's set literal out of ``harness.py``'s source, and
+``TestHaltCategoriesAreBehaviourallyLoadBearing`` drives
+``Harness._rehydrate_merge_halt`` once per tuple member (plus one non-member)
+and asserts the halt is actually restored.  The behavioural pair is the
+refactor-proof half: it keeps holding when task 3859 replaces the literal with
+a shared constant, at which point the source-scrape can be retired rather than
+maintained.
+
 Sites are cited BY NAME, never by line number.  Every line number in this
 task's own brief had already gone stale before the work started, which is the
 same drift class the file exists to end.
@@ -68,6 +79,19 @@ import inspect
 import re
 
 import pytest
+
+# ``harness`` is a pytest FIXTURE (a real Harness wrapping a real
+# EscalationQueue); importing it binds it as a module-level name so pytest
+# resolves it by name in the behavioural tests below.  Reusing
+# ``test_halt_owner``'s fixtures rather than re-deriving them keeps this file's
+# behavioural anchor pinned to the SAME setup the halt-owner suite exercises --
+# cross-module test-helper imports are established practice here (see
+# test_laptop_warm_verify_boundary.py, test_lane_lock_leak_guard.py).
+from test_halt_owner import (  # noqa: F401 -- `harness` is a fixture used by name
+    _FakeMergeWorker,
+    _make_wip_esc,
+    harness,
+)
 
 from orchestrator.agents.roles import (
     MERGE_HALT_ESCALATION_CATEGORIES,
@@ -81,6 +105,66 @@ from orchestrator.harness import Harness
 # a hand-written expected set in this file would drift exactly the way the
 # prose drifted three times.
 _GATE_PATTERN = r'esc\.category in \{([^}]*)\}'
+
+# Category-shaped tokens in the rule prose, for the REVERSE coherence check.
+# Deliberately suffix-anchored rather than a hand-listed vocabulary: the
+# escalation ``category`` field is a free-form ``str`` (escalation/models.py
+# notes the vocabulary is "prose, not a checked contract"), so there is no
+# vocabulary constant to compare against.
+_CATEGORY_TOKEN_PATTERN = r'\b[a-z][a-z0-9_]*_(?:conflict|state|failed)\b'
+
+# A category the gate does NOT hold, for the negative behavioural case.  Real
+# (``orchestrator/src/orchestrator/merge_queue.py`` files it) and deliberately
+# merge-adjacent: a category that merely *sounds* unrelated would not
+# discriminate a gate that had been widened to "anything merge-ish".
+_NON_HALT_CATEGORY = 'verify_host_unreachable'
+
+
+def _scrape_gate_categories() -> set[str]:
+    """Read the authoritative category set out of the harness gate's source.
+
+    Two hardenings over a bare ``re.search`` (task 4130 review), both aimed at
+    the same failure mode -- an anchor that reports a *confusing* divergence
+    rather than a real one:
+
+    * The method's DOCSTRING is stripped first.  That docstring already names
+      all three categories in prose, and an edit that phrased it as
+      ``esc.category in {...}`` would shadow the real gate and produce a bogus
+      "diverged from [...]" failure pointing at a comment.
+    * ``re.findall`` replaces ``re.search``, and anything other than EXACTLY
+      ONE occurrence fails loudly.  ``re.search`` silently takes the first of
+      several, so a second gate added to the method would be checked by
+      nothing at all.
+
+    ``harness.py`` is READ here, never modified.
+    """
+    src = inspect.getsource(Harness._rehydrate_merge_halt)
+    doc = Harness._rehydrate_merge_halt.__doc__
+    if doc:
+        src = src.replace(doc, '')
+
+    matches = re.findall(_GATE_PATTERN, src)
+
+    if len(matches) != 1:
+        pytest.fail(
+            f'Expected exactly ONE `esc.category in {{...}}` set literal in '
+            f'`Harness._rehydrate_merge_halt` (excluding its docstring); found '
+            f'{len(matches)}: {matches}.  This anchor is DELIBERATELY loud '
+            'rather than skipped: a silent skip would quietly restore the '
+            'unanchored state that let this drift recur three times.\n\n'
+            'If there are now TWO gates, the membership has more than one '
+            'authority and this test can no longer name it -- collapse them '
+            'into one.  If there are ZERO, the foreseeable benign trigger is '
+            'task 3859 replacing the literal with a shared '
+            '`MERGE_HALT_CATEGORIES` constant.  If that has landed, REWIRE '
+            'this test and '
+            '`orchestrator.agents.roles.MERGE_HALT_ESCALATION_CATEGORIES` to '
+            'import that constant instead of re-spelling the membership a '
+            'fourth time -- do not delete this anchor, and do not soften it '
+            'into a skip.'
+        )
+
+    return set(re.findall(r"'([^']+)'", matches[0]))
 
 
 def test_merge_halt_constants_are_nonempty() -> None:
@@ -165,25 +249,7 @@ def test_safety_rule_categories_match_the_harness_gate() -> None:
 
     ``harness.py`` is READ here, never modified.
     """
-    src = inspect.getsource(Harness._rehydrate_merge_halt)
-    match = re.search(_GATE_PATTERN, src)
-
-    if match is None:
-        pytest.fail(
-            'Could not locate the `esc.category in {...}` set literal in '
-            '`Harness._rehydrate_merge_halt`.  This anchor is DELIBERATELY '
-            'loud rather than skipped: a silent skip would quietly restore the '
-            'unanchored state that let this drift recur three times.\n\n'
-            'The foreseeable benign trigger is task 3859 replacing the literal '
-            'with a shared `MERGE_HALT_CATEGORIES` constant.  If that has '
-            'landed, REWIRE this test and '
-            '`orchestrator.agents.roles.MERGE_HALT_ESCALATION_CATEGORIES` to '
-            'import that constant instead of re-spelling the membership a '
-            'fourth time — do not delete this anchor, and do not soften it '
-            'into a skip.'
-        )
-
-    gate_categories = set(re.findall(r"'([^']+)'", match.group(1)))
+    gate_categories = _scrape_gate_categories()
     assert gate_categories == set(MERGE_HALT_ESCALATION_CATEGORIES), (
         f'MERGE_HALT_ESCALATION_CATEGORIES '
         f'{sorted(MERGE_HALT_ESCALATION_CATEGORIES)} has diverged from the '
@@ -197,3 +263,117 @@ def test_safety_rule_categories_match_the_harness_gate() -> None:
         'by editing the tuple alone; the whole point is that the two cannot '
         'drift apart unnoticed.'
     )
+
+
+def test_safety_rule_names_no_category_outside_the_tuple() -> None:
+    """THE REVERSE DIRECTION: no STALE category is left behind in the prose.
+
+    ``test_every_halt_category_is_named_in_the_safety_rule`` is one-directional
+    -- it catches a member missing from the prose, but not prose naming a
+    member that no longer exists.  Without this test, REMOVING a category from
+    the harness gate (which the gate-match anchor forces you to mirror in the
+    tuple) while leaving its name in the rule passes every other assertion
+    here, and the steward reads a prohibition naming a category that no longer
+    exists.  That is the same stale-framing class this file exists to end,
+    pointed the other way.
+
+    Suffix-anchored on ``_conflict`` / ``_state`` / ``_failed`` rather than
+    listing a vocabulary: a future category with a different suffix is caught
+    by the gate anchor and the forward containment test, so the coverage gap
+    here is bounded and deliberate.
+    """
+    named = set(re.findall(_CATEGORY_TOKEN_PATTERN, MERGE_HALT_SAFETY_RULE))
+    stale = sorted(named - set(MERGE_HALT_ESCALATION_CATEGORIES))
+    assert stale == [], (
+        f'MERGE_HALT_SAFETY_RULE names category-shaped token(s) {stale} that '
+        f'are not in MERGE_HALT_ESCALATION_CATEGORIES '
+        f'{sorted(MERGE_HALT_ESCALATION_CATEGORIES)}.  Either the category was '
+        'dropped from the harness gate and its name is now stale prose in the '
+        "steward's rule -- delete it -- or the rule gained a category the gate "
+        'does not actually halt on, which tells the steward to hands-off an '
+        'escalation that never stops the merge queue.  Do NOT silence this by '
+        'widening the tuple; the tuple must equal the gate.'
+    )
+
+
+class TestHaltCategoriesAreBehaviourallyLoadBearing:
+    """THE BEHAVIOURAL ANCHOR: each tuple member really does own a halt.
+
+    ``test_safety_rule_categories_match_the_harness_gate`` pins the tuple to the
+    TEXTUAL form of ``harness.py``.  That is deliberately loud but brittle:
+    switching the gate to double quotes, hoisting it to a module-level
+    frozenset, or building it from a constant all trip the scrape.  These tests
+    pin the SAME invariant through behaviour, so they survive every one of
+    those refactors -- including task 3859's shared-constant extraction, after
+    which the source-scrape can be deleted and this class kept.
+
+    Fixtures (``harness``, ``_FakeMergeWorker``, ``_make_wip_esc``) are reused
+    from ``test_halt_owner.py``, whose
+    ``TestRehydrateMergeHalt::test_rehydrate_restores_from_stash_failed``
+    establishes the pattern.  The difference that earns this class its place:
+    those tests enumerate categories by hand, so a fourth category added to the
+    gate is covered by nothing there.  This one iterates
+    ``MERGE_HALT_ESCALATION_CATEGORIES``, so a category added to the tuple is
+    automatically required to behave like a halt owner.
+    """
+
+    @pytest.mark.parametrize('category', MERGE_HALT_ESCALATION_CATEGORIES)
+    def test_each_category_restores_the_halt(
+        self, harness: Harness, category: str
+    ) -> None:
+        """A pending level-1 escalation of each member re-owns the halt."""
+        worker = _FakeMergeWorker()
+        harness._merge_worker = worker  # type: ignore[assignment]
+        queue = harness._escalation_queue
+        assert queue is not None
+
+        esc = _make_wip_esc(queue, '4130', category=category)
+
+        result = harness._rehydrate_merge_halt()
+
+        assert result == esc.id, (
+            f'A preserved level-1 `{category}` L1 did not re-own the merge '
+            f'halt on restart, but `{category}` is in '
+            'MERGE_HALT_ESCALATION_CATEGORIES -- so the steward is told never '
+            'to auto-resolve it on the grounds that it halts the queue, while '
+            'the queue does not actually halt for it.  Either the tuple '
+            'overstates the gate or the gate lost a category.'
+        )
+        assert worker.is_wip_halted is True
+        assert worker.halt_owner_esc_id == esc.id
+
+    def test_a_non_member_category_does_not_restore_the_halt(
+        self, harness: Harness
+    ) -> None:
+        """The negative half: a non-member L1 leaves the queue running.
+
+        Without it the parametrized test above would still pass against a gate
+        widened to halt on EVERY level-1 escalation -- which would silently
+        turn every unrelated L1 into a full merge-queue stop.
+        """
+        assert _NON_HALT_CATEGORY not in MERGE_HALT_ESCALATION_CATEGORIES, (
+            f'`{_NON_HALT_CATEGORY}` is this test\'s NON-member control and has '
+            'become a real halt category.  Pick a different non-member control '
+            'rather than deleting this test -- and make sure the new member is '
+            "named in the steward's MERGE_HALT_SAFETY_RULE and in "
+            "OPERATIONS.md's merge-halt section."
+        )
+
+        worker = _FakeMergeWorker()
+        harness._merge_worker = worker  # type: ignore[assignment]
+        queue = harness._escalation_queue
+        assert queue is not None
+
+        _make_wip_esc(queue, '4130', category=_NON_HALT_CATEGORY)
+
+        result = harness._rehydrate_merge_halt()
+
+        assert result is None
+        assert worker.is_wip_halted is False, (
+            f'A pending level-1 `{_NON_HALT_CATEGORY}` halted the merge queue. '
+            'Either the gate has been widened past the categories the steward '
+            'is told about, or this control category was added to it -- in '
+            'both cases MERGE_HALT_ESCALATION_CATEGORIES and '
+            'MERGE_HALT_SAFETY_RULE now understate what stops the queue.'
+        )
+        assert worker.halt_owner_esc_id is None
