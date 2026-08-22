@@ -2281,6 +2281,32 @@ class VerifyRunnerPool:
                 raise
         duration_ms = round((time.monotonic() - t0) * 1000)
 
+        # Task 3789 (ε): re-stamp the carried observation's `runner`.
+        #
+        # `FlakeSuppression.runner` means WHERE the isolated re-run executed, and the
+        # discriminator can only stamp 'local' — a host-RELATIVE truth that reads as a
+        # lie once the observation crosses the wire.  THIS is the only scope that knows
+        # which runner really ran, and it knows it only HERE, after the
+        # RunnerUnavailable->local fallback above: `merge_queue` passes a `runner`
+        # argument reflecting the runner it INTENDED, so recording the correction at
+        # the recorder's call site would file a fallback verify's flakes against an
+        # innocent remote.  θ's class-3 systemic check reads this column to tell a bad
+        # HOST from a bad SUITE, so a fleet-wide 'local' would make that undecidable.
+        #
+        # A pure `dataclasses.replace` and nothing else: `dispatch` is a TRANSPORT
+        # concern, and the ledger write / event / streak bump belong to
+        # `flake_recorder` on the merge path (recording here too would double-count).
+        # Guarded on the dataclass type rather than on `is not None`, so a payload that
+        # somehow arrived as a bare dict degrades to an un-stamped observation instead
+        # of raising `TypeError` out of `replace` and into the merge path.
+        if isinstance(result.flake_suppression, flake_ledger.FlakeSuppression):
+            result = dataclasses.replace(
+                result,
+                flake_suppression=dataclasses.replace(
+                    result.flake_suppression, runner=actual_runner.name,
+                ),
+            )
+
         if self._event_store is not None:
             self._event_store.emit(
                 EventType.merge_verify,
