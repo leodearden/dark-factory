@@ -5093,7 +5093,8 @@ def census_config_keys(config_path: Path) -> ConfigKeyCensus:
     ``config_key_census.ignore`` entry).
 
     Three-way contract when no census is possible.  The KEY LISTS stay fail-open
-    — an unreadable file, a malformed document, or a parsed-but-non-mapping
+    — an unreadable file (missing, permission-denied, a directory, or bytes that
+    are not valid UTF-8), a malformed document, or a parsed-but-non-mapping
     document all yield empty ``unknown``/``ignored`` and never raise, because the
     census cannot detect keys it cannot parse and load_config surfaces parse
     errors loudly on its own path.  But each of those shapes ALSO sets
@@ -5105,7 +5106,13 @@ def census_config_keys(config_path: Path) -> ConfigKeyCensus:
     try:
         with open(config_path) as f:
             tree = yaml.safe_load(f)
-    except OSError as e:
+    except (OSError, UnicodeDecodeError) as e:
+        # UnicodeDecodeError is a ValueError, NOT an OSError, and it surfaces
+        # lazily from inside safe_load()'s read rather than from open() — so
+        # without it named here a non-UTF-8 file is the one "could not be read
+        # at all" shape that escapes BOTH handlers, propagating out of a
+        # function documented to never raise and giving check-config a
+        # traceback where the structured diagnostic belongs.
         return ConfigKeyCensus([], [], f'cannot read {config_path}: {e}')
     except yaml.YAMLError as e:
         return ConfigKeyCensus([], [], f'invalid YAML in {config_path}: {e}')

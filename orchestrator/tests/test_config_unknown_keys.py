@@ -15,10 +15,12 @@ import pytest
 import yaml
 from click.testing import CliRunner
 
+import orchestrator.config
 from orchestrator.cli import main
 from orchestrator.config import (
     RELOADABLE_FIELDS,
     ConfigIgnoredKey,
+    ConfigKeyCensus,
     ConfigKeyCensusConfig,
     ConfigUnknownKey,
     OrchestratorConfig,
@@ -554,6 +556,8 @@ def test_config_key_census_ignore_is_green_tier():
 # `unknown`/`ignored` mean for anyone already reading them.
 
 _MALFORMED_YAML = 'git:\n  remote: origin\n bad_indent: [1,\n'
+# Bytes no UTF-8 decoder will accept (0xff is never a valid start byte).
+_NON_UTF8_BYTES = b'git:\n  remote: \xff\xfe origin\n'
 
 
 def test_malformed_yaml_sets_parse_error(tmp_path):
@@ -599,6 +603,25 @@ def test_unreadable_file_sets_parse_error(tmp_path):
         assert census.unknown == []
     finally:
         p.chmod(0o644)  # so tmp_path teardown cannot fail
+
+
+def test_non_utf8_file_sets_parse_error(tmp_path):
+    """The subtlest "cannot be read at all" shape: the decode happens LAZILY
+    inside ``yaml.safe_load(f)``'s read, not in ``open()``, and the resulting
+    UnicodeDecodeError is a ValueError — neither an OSError nor a yaml.YAMLError.
+    Unless the read guard names it, it is the one unreadable file that escapes
+    both handlers and propagates out of a function contracted never to raise."""
+    p = tmp_path / 'latin1.yaml'
+    p.write_bytes(_NON_UTF8_BYTES)
+
+    census = census_config_keys(p)  # must NOT raise
+
+    assert census.parse_error is not None
+    assert str(p) in census.parse_error
+    assert census.unknown == []
+    assert census.ignored == []
+    # ...and the fail-open wrapper stays fail-open for this shape too.
+    assert census_unknown_config_keys(p) == []
 
 
 @pytest.mark.parametrize(
@@ -679,8 +702,12 @@ def test_check_config_malformed_yaml_exits_nonzero(tmp_path):
     assert 'Error' in result.output
     assert 'YAML' in result.output
     # Errors go to stderr so a script's stdout capture cannot mistake the
-    # diagnostic for a report.
+    # diagnostic for a report.  `result.output` is the COMBINED stream under
+    # click 8.3, so the positive on stderr alone would still pass if the
+    # diagnostic were ALSO echoed to stdout — the negative on the stdout-only
+    # view is what actually pins the split.
     assert 'Error' in result.stderr
+    assert result.stdout == '', f'diagnostic leaked to stdout: {result.stdout!r}'
 
 
 def test_check_config_directory_path_exits_nonzero(tmp_path):
@@ -733,15 +760,54 @@ def test_check_config_empty_file_still_exits_zero(tmp_path):
     assert 'OK:' in result.output
 
 
-def test_check_config_parse_failure_suppresses_the_ignored_section(tmp_path):
-    """With nothing parsed, the informational "excused from the census" block is
-    vacuous by construction — printing it next to the error would imply the file
-    was inspected and found to contain deliberately-excused keys."""
+def test_check_config_non_utf8_file_exits_nonzero(tmp_path):
+    """A file whose bytes are not valid UTF-8 is unreadable in the same
+    operator-visible sense as a permission-denied one, and must produce the same
+    structured diagnostic — not a Python traceback."""
+    p = tmp_path / 'latin1.yaml'
+    p.write_bytes(_NON_UTF8_BYTES)
+
+    result = CliRunner().invoke(main, ['check-config', '--config', str(p)])
+
+    assert result.exit_code == 1, result.output
+    assert 'OK:' not in result.output
+    assert str(p) in result.output
+    assert 'Error' in result.output
+    assert 'Traceback' not in result.output
+
+
+def test_check_config_parse_failure_suppresses_the_ignored_section(tmp_path, monkeypatch):
+    """The parse_error guard must return BEFORE the informational block — an
+    ORDERING claim, which needs a fixture that can actually violate it.
+
+    A real unparseable file returns ``ignored=[]`` by construction, so the
+    existing ``if census.ignored:`` guard would skip the block even with the
+    early exit deleted: such a fixture pins nothing beyond what the sibling
+    malformed-YAML test already covers.  Forcing the otherwise-unreachable
+    combination of a parse_error AND a populated ``ignored`` list is what makes
+    the ordering observable.  With nothing parsed, listing keys as "excused from
+    the census" would tell an operator the file WAS inspected and found to hold
+    deliberately-excused keys — the same false reassurance as the `OK:`.
+    """
     p = tmp_path / 'broken_with_x.yaml'
     p.write_text('x_custom: 1\ngit:\n  remote: origin\n bad_indent: [1,\n')
+
+    # check_config imports census_config_keys from orchestrator.config INSIDE
+    # the function body, so the lookup happens at call time and patching the
+    # module attribute takes effect.
+    monkeypatch.setattr(
+        orchestrator.config,
+        'census_config_keys',
+        lambda _path: ConfigKeyCensus(
+            [],
+            [ConfigIgnoredKey('x_custom', 'reserved_prefix')],
+            f'invalid YAML in {p}: mapping values are not allowed here',
+        ),
+    )
 
     result = CliRunner().invoke(main, ['check-config', '--config', str(p)])
 
     assert result.exit_code == 1, result.output
     assert 'OK:' not in result.output
     assert 'excused from the census' not in result.output
+    assert 'x_custom' not in result.output

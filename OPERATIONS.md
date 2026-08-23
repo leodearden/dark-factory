@@ -733,10 +733,11 @@ Three outcomes:
 
 - exit **1** — at least one genuinely-unknown key was found;
 - exit **1** — the file could not be read or parsed **at all**: malformed
-  YAML, a directory, an unreadable file, or a top-level document that is
-  not a mapping. A census of nothing is not a clean census, so the gate
-  refuses to print `OK` and instead names the file and the underlying
-  fault (a YAML error renders line and column);
+  YAML, a directory, an unreadable file (permission-denied, or bytes that
+  are not valid UTF-8), or a top-level document that is not a mapping. A
+  census of nothing is not a clean census, so the gate refuses to print
+  `OK` and instead names the file and the underlying fault (a YAML error
+  renders line and column);
 - exit **0** — otherwise, *including* when excused keys were listed, and
   including a legitimately **empty** project YAML (which means "use all
   defaults").
