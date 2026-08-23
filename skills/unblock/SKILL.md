@@ -560,9 +560,27 @@ The merge procedure is iterative — don't assume one pass will be enough:
   # The trailing `echo` is REQUIRED -- see the [canonical ancestry
   # check](#branch-on-main) above for why: without it, "on main" and "NOT on
   # main" print identical empty output and exit 0, indistinguishable.
-  # rc=0 (on main): proceed to step 8 with the landing SHA from `git log --format=%H -1 main`:
-  #   done_provenance={"kind": "found_on_main", "commit": "<sha>", "note": "<cite the providing task or commit>"}
-  #   (git log gives the merge commit; git merge-base gives the common ancestor, NOT the merge commit)
+  # rc=0 (on main): the branch genuinely IS an ancestor of main, so the merge that landed
+  #   it is on main and cites it by subject. Derive the landing SHA with the SAME
+  #   exact-subject search the rc=128 arm below uses -- one derivation for both arms:
+  #     git log main --fixed-strings --grep="Merge task/<TASK_ID> into main" \
+  #         --max-count=1 --format=%H
+  #   Non-empty → proceed to step 8 with that SHA as
+  #     done_provenance={"kind": "found_on_main", "commit": "<sha>", "note": "<cite the providing task or commit>"}
+  #   Empty → fall back to the ancestry path. The rev-range is valid on THIS arm precisely
+  #     because rc=0 (not rc=128) means the branch ref still exists:
+  #       git rev-list --ancestry-path --merges task/<TASK_ID>..main | tail -1
+  #     `git rev-list` lists newest-first and `--ancestry-path` excludes commits reachable
+  #     from the branch, so `tail -1` is the OLDEST merge on the path from this branch into
+  #     main -- the merge that landed it. Before stamping, confirm the result IS a merge
+  #     whose second parent is in this branch's history; do not trust it blind.
+  #   BOTH empty → do NOT stamp anything. Nothing on main cites this task and no merge on
+  #     the ancestry path brought it in, which is the same not-landed signal step 7's
+  #     polled-done bullet and its `already_merged` bullet already rule on: stop and report
+  #     rather than stamping `done`.
+  #   The exact-subject search finds the merge commit that CITES this task; `git merge-base`
+  #     gives the common ancestor, and an unscoped `git log -1 main` gives main's tip --
+  #     neither of those two is this task's landing commit.
   #   `found_on_main` requires `note` as well as `commit` — see step 8's payload bullets.
   # rc=128 (branch ref gone — already cleaned up after a successful merge): do NOT read
   #   this as "not on main". Run the exact-subject merge-marker search from the canonical
@@ -575,6 +593,8 @@ The merge procedure is iterative — don't assume one pass will be enough:
   #                it takes no task argument and would report "landed" for every rc=128.)
   # rc=1 (genuinely not on main) AND queue healthy: loop back to step 7 (resubmit).
   ```
+  **Never derive the provenance SHA from `git log --format=%H -1 main`** <!-- provenance-guard: negative --> — it takes no task argument, so it yields main's CURRENT HEAD, which is this task's merge commit only when this task's merge happens to be the newest commit on main; on a live merge queue it usually is not, and you would stamp an unrelated task's merge as this one's landing commit. This is the same failure the rc=128 bullet's unfiltered-`git log main --merges` prohibition and step 7's polled-done bullet already rule out, for the same reason: the server's only `done_provenance` backstop is `git merge-base --is-ancestor <sha> main`, which passes for **every** recent commit on main, so nothing downstream would catch the misattribution. Both derivations above take a task argument; that is what makes them safe.
+
   **Never fall back to direct merge in response to `unknown`** — `unknown` means the server lost its record, not that the merge failed. **This block's `resubmit` line does not apply to the `poll_by == "branch"` arm** — there nothing was ever enqueued, so `unknown` is that arm's expected live state, not a lost record; that arm never reaches this bullet as a terminal state (it's excluded from step 7's terminal set) — it arrives here only via the branch arm's 20-minute deadline, and the action there is to run the same [canonical ancestry check](#branch-on-main) once more (rc=128 marker search included) and STOP and report to the human only if it still comes back not-landed, rather than resubmitting.
 
 - `poll["state"] == "superseded"` → this request was superseded by another one. Two distinct
@@ -738,12 +758,30 @@ git merge-base --is-ancestor task/<TASK_ID> main; rc=$?; echo "ancestry rc=$rc"
 # The trailing `echo` is REQUIRED -- see the [canonical ancestry
 # check](#branch-on-main) above for why: without it, "on main" and "NOT on
 # main" print identical empty output and exit 0, indistinguishable.
-# rc=0 (on main): treat as done; proceed to step 8 with the landing SHA from `git log --format=%H -1 main`:
-#   done_provenance={"kind": "found_on_main", "commit": "<sha>", "note": "<cite the providing task or commit>"}
+# rc=0 (on main): treat as done. The branch genuinely IS an ancestor of main, so the merge
+#   that landed it is on main and cites it by subject. Derive the landing SHA with the SAME
+#   exact-subject search the canonical check's rc=128 arm uses -- one derivation, both arms:
+#     git log main --fixed-strings --grep="Merge task/<TASK_ID> into main" \
+#         --max-count=1 --format=%H
+#   Non-empty → proceed to step 8 with that SHA as
+#     done_provenance={"kind": "found_on_main", "commit": "<sha>", "note": "<cite the providing task or commit>"}
+#   Empty → fall back to the ancestry path. The rev-range is valid on THIS arm precisely
+#     because rc=0 (not rc=128) means the branch ref still exists:
+#       git rev-list --ancestry-path --merges task/<TASK_ID>..main | tail -1
+#     `git rev-list` lists newest-first and `--ancestry-path` excludes commits reachable
+#     from the branch, so `tail -1` is the OLDEST merge on the path from this branch into
+#     main -- the merge that landed it. Before stamping, confirm the result IS a merge whose
+#     second parent is in this branch's history; do not trust it blind.
+#   BOTH empty → do NOT stamp anything. Nothing on main cites this task and no merge on the
+#     ancestry path brought it in, which is the same not-landed signal step 7's polled-done
+#     bullet and its `already_merged` bullet already rule on: stop and report rather than
+#     stamping `done`.
 # rc=128 (branch ref gone after a successful merge + cleanup): NOT the same as rc=1 —
 #   run the merge-marker search from the canonical check above before concluding anything
 # rc=1 (not on main): the merge did not land; decide whether to resubmit or discard
 ```
+**Never derive the provenance SHA from `git log --format=%H -1 main`** <!-- provenance-guard: negative --> — it takes no task argument, so it yields main's CURRENT HEAD, which is this task's merge commit only when this task's merge happens to be the newest commit on main; on a live merge queue it usually is not, and you would stamp an unrelated task's merge as this one's landing commit. The server's only `done_provenance` backstop is `git merge-base --is-ancestor <sha> main`, which passes for **every** recent commit on main, so nothing downstream would catch the misattribution — the same reason the [canonical ancestry check](#branch-on-main)'s prohibitions give. Both derivations above take a task argument; that is what makes them safe.
+
 Never fall back to direct merge in response to `unknown` — `unknown` means the server lost its record, not that the merge failed.
 
 *If this is an escalated task (pending escalation, agent is paused):*
