@@ -24,13 +24,17 @@ two ruff measurements the decision rests on.
 """
 
 import asyncio
+import logging
 import subprocess
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
 from orchestrator import verify
+from orchestrator.config import ModuleConfig, OrchestratorConfig
+from orchestrator.verify import run_verification
 
 
 class TestRunCmdThreadsWorktreeIntoRuffCache:
@@ -178,3 +182,123 @@ class TestRuffProbeResolution:
         )
         assert proc.returncode == 0, f'`{sys.executable} -m ruff` unavailable: {proc.stderr}'
         assert proc.stdout.startswith('ruff ')
+
+
+def _module_config(**overrides):
+    """A minimal three-leg module config whose lint leg names ruff.
+
+    Module-local rather than imported from a sibling admission test: each of
+    those files states the same self-containment rationale, and a conftest.py
+    edit would trip verify.py's ``has_conftest``.
+    """
+    kwargs = dict(
+        prefix='pkg',
+        test_command='pytest tests/',
+        lint_command='ruff check scripts/',
+        type_check_command='pyright',
+        concurrent_verify=False,
+    )
+    kwargs.update(overrides)
+    return ModuleConfig(**kwargs)
+
+
+def _escape_records(caplog):
+    # Read the marker EAGERLY, before the filter: inside the comprehension the
+    # `and` chain short-circuits whenever no WARNING was emitted, so a missing
+    # marker would silently yield [] and let the NEGATIVE test pass vacuously.
+    marker = verify._RUFF_ESCAPE_MARKER
+    return [
+        r for r in caplog.records
+        if r.name == 'orchestrator.verify'
+        and r.levelno == logging.WARNING
+        and marker in r.getMessage()
+    ]
+
+
+async def _verify_with_stubbed_spawn(worktree, tmp_path, *, lint_rc: int):
+    """Drive the REAL run_verification lint leg with only the SPAWN stubbed.
+
+    The detector itself is left live — it is the thing under test — so this is
+    a genuine wiring proof rather than a mock asserting against itself.
+    """
+    async def spy_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+        rc = lint_rc if 'ruff' in cmd else 0
+        return rc, ('E501 line too long\n' if rc else ''), False
+
+    config = OrchestratorConfig(
+        verify_admission_slots_dir=str(tmp_path / 'slots'),
+        verify_admission_task_slots=1,
+    )
+    with patch('orchestrator.verify._run_cmd', side_effect=spy_run_cmd):
+        return await run_verification(
+            worktree=worktree,
+            config=config,
+            module_config=_module_config(),
+            role='task',
+            attempt_id=None,
+        )
+
+
+class TestEscapeIsReportedLoudly:
+    """An escaping worktree must produce ONE structured WARNING — and nothing else.
+
+    Deliberately NOT fatal.  Hard-failing an escaping worktree would red every
+    stale-based worktree on the host simultaneously; that is the fleet-wide
+    outage mode pyproject.toml's ``[tool.ruff]`` block explicitly warns against
+    ("a red lint_command … blocks every merge, review checkpoint and main-tip
+    sweep repo-wide, on branches carrying no defect at all").  So the escaping
+    worktree is still judged on its own lint output, and the diagnostic rides
+    alongside as an interpretation layered ON TOP — the same shape as the
+    mis-resolved-interpreter record in ``_run_or_skip_timed``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_escaping_worktree_emits_one_diagnostic(
+        self, geometry, tmp_path, caplog,
+    ):
+        parent, worktree, _target = geometry
+        _write_project(worktree, 'wtproj', declares_ruff=False)
+
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.verify'):
+            result = await _verify_with_stubbed_spawn(worktree, tmp_path, lint_rc=0)
+
+        records = _escape_records(caplog)
+        assert len(records) == 1, f'expected exactly one record, got {records}'
+        message = records[0].getMessage()
+        # (i) the worktree root and (ii) the FOREIGN settings path actually
+        # resolved — asserted as the measured paths, not as prose.
+        assert str(worktree) in message
+        assert str(parent / 'pyproject.toml') in message
+        # (iii) the remediation, keyed on its stable phrase rather than wording
+        assert 'merge main forward' in message
+
+        # ...and the diagnostic did NOT red the leg: a green lint stays green.
+        assert result.passed is True
+
+    @pytest.mark.asyncio
+    async def test_diagnostic_does_not_alter_the_lint_verdict(
+        self, geometry, tmp_path, caplog,
+    ):
+        _parent, worktree, _target = geometry
+        _write_project(worktree, 'wtproj', declares_ruff=False)
+
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.verify'):
+            result = await _verify_with_stubbed_spawn(worktree, tmp_path, lint_rc=1)
+
+        assert len(_escape_records(caplog)) == 1
+        # The escaping worktree is still judged on its OWN lint output.
+        assert result.passed is False
+        assert 'E501 line too long' in result.lint_output
+
+    @pytest.mark.asyncio
+    async def test_sound_worktree_emits_nothing(self, geometry, tmp_path, caplog):
+        # The NEGATIVE case is what keeps the signal rare and therefore
+        # meaningful: a worktree resolving its own config must be silent.
+        _parent, worktree, _target = geometry
+        _write_project(worktree, 'wtproj', declares_ruff=True)
+
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.verify'):
+            result = await _verify_with_stubbed_spawn(worktree, tmp_path, lint_rc=0)
+
+        assert _escape_records(caplog) == []
+        assert result.passed is True
