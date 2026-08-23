@@ -67,6 +67,7 @@ _LIVENESS_DISCLOSURE_KEYS = _mod._LIVENESS_DISCLOSURE_KEYS
 # make these aliases stale.
 POINT_IN_TIME_CHECK_RE = _mod.POINT_IN_TIME_CHECK_RE
 LIVE_TASK_STATUS_RE = _mod.LIVE_TASK_STATUS_RE
+TASK_REF_RE = _mod.TASK_REF_RE
 _LIVE_FIELD_NAMES = _mod._LIVE_FIELD_NAMES
 apply_deletions = _mod.apply_deletions
 resolve_ann_threshold = _mod.resolve_ann_threshold
@@ -5161,7 +5162,15 @@ def _span_days(earlier: str, later: str) -> float:
 # cannot tell "the clause derived it" from "the clause derived nothing and the
 # seed supplied it". Seeding a sentinel splits them: the sentinel is the seed's
 # contribution, and `_CORE_FACT_STRANDED` can only have come from a clause.
-_SENTINEL_CORE_FACT = '<sentinel-core-fact-no-clause-can-derive>'
+#
+# It names ONE field TWICE on purpose. A clause-scoped key is only ADDED for a
+# record whose whole-record key is divergent -- a coherent record gains nothing
+# from clause scoping but a weaker, punctuation-sensitive key -- so a sentinel
+# that named each field once would close that gate and make every assertion
+# below read `{sentinel}` no matter what the clauses say. The values are
+# unforgeable for a second reason too: `<` and `>` are outside
+# `_LIVE_FIELD_SCAN_RE`'s bare value class, so no content can produce them.
+_SENTINEL_CORE_FACT = 'status=<sentinel-one>|status=<sentinel-two>'
 
 
 class TestLivenessSnapshotSubjectFacts:
@@ -5195,6 +5204,13 @@ class TestLivenessSnapshotSubjectFacts:
     subject's clause, so not splitting is indistinguishable from splitting
     correctly and nothing is there to detect. That is why the multi-task
     record carries the load here and must not be reduced to a single subject.
+
+    The seeded sentinel is DIVERGENT (it names `status` twice), which is what
+    opens the gate on the clause scan at all. These four records are coherent,
+    so in production they key on the whole-record union alone and their two
+    groups come from that key, exactly as before the rescope -- what is
+    measured here is that the clause TECHNIQUE resolves subject -> fact on
+    this real content, which is what the divergent path depends on.
     """
 
     def test_a_single_task_snapshot_keys_its_one_subject(self):
@@ -5278,13 +5294,17 @@ class TestLivenessSubjectFactsFallback:
             metadata={'task_id': '94', 'related_task_ids': ['777']},
         )
 
-        facts = liveness_snapshot_subject_facts(record, _CORE_FACT_STRANDED)
+        facts = liveness_snapshot_subject_facts(record, _SENTINEL_CORE_FACT)
 
         assert set(facts) == {'94', '777'}, (
             'the metadata-only subject is keyed, not dropped'
         )
-        assert facts['94'] == {_CORE_FACT_STRANDED}, 'from its own clause'
-        assert facts['777'] == {_CORE_FACT_STRANDED}, 'from the whole-record union'
+        assert facts['94'] == {_SENTINEL_CORE_FACT, _CORE_FACT_STRANDED}, (
+            'the prose subject gains a key from its own clause'
+        )
+        assert facts['777'] == {_SENTINEL_CORE_FACT}, (
+            'the metadata-only one gains nothing and keeps the record key alone'
+        )
 
     def test_a_prose_subject_whose_clause_asserts_nothing_falls_back(self):
         """The REAL 1eef7df7: clause 6 names task 99 with no assignment.
@@ -5299,10 +5319,14 @@ class TestLivenessSubjectFactsFallback:
         """
         record = {r['id']: r for r in _liveness_corpus()}['1eef7df7']
 
-        facts = liveness_snapshot_subject_facts(record, _CORE_FACT_STRANDED)
+        facts = liveness_snapshot_subject_facts(record, _SENTINEL_CORE_FACT)
 
-        assert facts['99'] == {_CORE_FACT_STRANDED}, (
+        assert facts['99'] == {_SENTINEL_CORE_FACT}, (
             'keyed on the whole-record union, exactly as before the rescope'
+        )
+        assert facts['94'] == {_SENTINEL_CORE_FACT, _CORE_FACT_STRANDED}, (
+            'and its clause-bearing sibling in the SAME record does gain one -- '
+            'so 99 fell back, it was not the whole scan coming back empty'
         )
 
         groups, _ = find_liveness_snapshot_recurrences(_liveness_corpus())
@@ -5332,8 +5356,8 @@ class TestLivenessSubjectFactsFallback:
         assert record_key == 'claimant_run_id=null|heartbeat_at=null|status=done. now', (
             'the record-level read is whole -- only the CLAUSE is truncated'
         )
-        assert liveness_snapshot_subject_facts(record, record_key) == {
-            '94': {record_key},
+        assert liveness_snapshot_subject_facts(record, _SENTINEL_CORE_FACT) == {
+            '94': {_SENTINEL_CORE_FACT},
         }, 'the subject falls back rather than vanishing from the report'
 
     def test_the_fallback_adds_no_disclosure_counter(self):
@@ -5389,6 +5413,12 @@ class TestLivenessSubjectFactsIsAdditive:
     membership that existed before the rescope therefore still exists, which is
     what makes "clause scoping can only ADD recall" a true statement about the
     mechanism rather than an aspiration about the common case.
+
+    A record whose union key is COHERENT, like both of these, is now given no
+    clause-scoped key at all -- a second guard on the same invariant, and the
+    one that keeps grouping from turning on where the author put a full stop.
+    The partial key survives only where it earns its keep, on a DIVERGENT
+    record, and the test below pins that the seed still sits beside it there.
     """
 
     def _pair(self) -> list[dict]:
@@ -5410,13 +5440,17 @@ class TestLivenessSubjectFactsIsAdditive:
             'clauses, which is a clause-scoping question, not a reading one'
         )
 
-        # The projection: both carry the record key; B carries its partial too.
+        # The projection: the record key, and for B no weaker key beside it.
         assert liveness_snapshot_subject_facts(a, _CORE_FACT_STRANDED) == {
             '94': {_CORE_FACT_STRANDED},
         }
         assert liveness_snapshot_subject_facts(b, _CORE_FACT_STRANDED) == {
-            '94': {_CORE_FACT_STRANDED, 'status=in-progress'},
-        }, 'the clause-scoped partial is ADDED beside the record key, not swapped in'
+            '94': {_CORE_FACT_STRANDED},
+        }, (
+            'B says the SAME coherent thing as A, split over two clauses -- '
+            'keying it on `status=in-progress` as well would make grouping '
+            'turn on the full stop, and swapping it in would drop the group'
+        )
 
         # And therefore the group survives the rescope.
         groups, disclosure = find_liveness_snapshot_recurrences(self._pair())
@@ -5430,21 +5464,93 @@ class TestLivenessSubjectFactsIsAdditive:
             'invisible -- the group itself is the only observable'
         )
 
-    def test_two_groups_for_one_subject_come_back_in_a_stable_order(self):
-        """RED for DETERMINISM, not recall -- the sort tie dual keying reaches.
+    def test_a_divergent_records_incomplete_clause_keeps_the_seed_beside_it(self):
+        """Where the partial key DOES survive, the seed survives with it.
 
-        Two records of the SPLIT shape bucket subject 94 twice: once at the
-        whole-record key, once at the clause-scoped `status=in-progress`. Both
-        groups carry the same category, the same subject and the same first
-        member id, so the three-component sort key does not discriminate them
-        and their order falls out of dict insertion -- breaking the Returns
+        Task 94's clause here names only `status`; task 96's names all three.
+        The union is a chimera, so clause scoping engages -- and the partial
+        `status=in-progress` is ADDED, not swapped in. Swapping would vacate
+        the whole-record bucket 94 shares with any other record asserting the
+        same chimera, which is the regression this class exists to catch.
+        """
+        record = _memory('divergent-partial', _LIVENESS_DIVERGENT_PARTIAL_94,
+                         category=_OS, metadata={'task_id': '94'})
+
+        assert extract_liveness_snapshot_fact(record) == _CORE_FACT_DIVERGENT
+
+        assert liveness_snapshot_subject_facts(record, _CORE_FACT_DIVERGENT) == {
+            '94': {_CORE_FACT_DIVERGENT, 'status=in-progress'},
+            '96': {_CORE_FACT_DIVERGENT, _CORE_FACT_DONE},
+        }, 'the incomplete clause key sits BESIDE the seed, never in place of it'
+
+
+# A record whose whole-record key names `status` TWICE -- the chimera that
+# matches no single-task snapshot, and the only shape given a clause-scoped
+# key. The partial variant assigns task 94 one field and task 96 all three, so
+# 94's clause key is a strict subset of the union.
+_LIVENESS_DIVERGENT_94_96 = (
+    'Point-in-time liveness check performed 2026-07-26 on task 94: '
+    'status="in-progress", claimant_run_id=null, heartbeat_at=null. '
+    'Separately on task 96: status="done", claimant_run_id=null, '
+    'heartbeat_at=null.'
+)
+_LIVENESS_DIVERGENT_PARTIAL_94 = (
+    'Point-in-time liveness check performed 2026-07-26 on task 94: '
+    'status="in-progress". Separately on task 96: status="done", '
+    'claimant_run_id=null, heartbeat_at=null.'
+)
+_CORE_FACT_DIVERGENT = (
+    'claimant_run_id=null|heartbeat_at=null|status=done|status=in-progress'
+)
+_CORE_FACT_DONE = 'claimant_run_id=null|heartbeat_at=null|status=done'
+
+
+class TestLivenessOneSubjectOneGroupPerMemberSet:
+    """Dual keying never reports one subject TWICE over the same members.
+
+    `liveness_snapshot_recurrences` is an ARMED `higher_is_worse` count, so a
+    structural doubling on a whole content shape is a false accretion signal,
+    not a cosmetic one -- and a duplicate row in the details table for the
+    human reading it. Only a DIVERGENT record is given two keys at all, so
+    this is where the collapse is exercised; the richer key wins it, which is
+    always the whole-record one, so the survivor is the group that predates
+    clause scoping.
+    """
+
+    def _divergent(self, record_id: str, created_at: str) -> dict:
+        return _dated(record_id, _LIVENESS_DIVERGENT_94_96, created_at,
+                      category=_OS, metadata={'task_id': '94'})
+
+    def test_identical_divergent_records_report_one_group_per_subject(self):
+        """Four buckets, two findings: each subject is keyed twice over the
+        SAME two members, so half the buckets are the same finding restated.
+        """
+        corpus = [self._divergent('D1', _TS_94_JUL24),
+                  self._divergent('D2', _TS_REVERIFY)]
+
+        groups, disclosure = find_liveness_snapshot_recurrences(corpus)
+
+        assert [(g['subject_task_id'], g['core_fact'], g['member_ids'])
+                for g in groups] == [
+            ('94', _CORE_FACT_DIVERGENT, ['D1', 'D2']),
+            ('96', _CORE_FACT_DIVERGENT, ['D1', 'D2']),
+        ], 'one group per subject -- not one per (subject, key)'
+        assert set(disclosure.values()) == {0}
+
+    def test_two_groups_for_one_subject_come_back_in_a_stable_order(self):
+        """The sort tie dual keying still reaches, once the members DIFFER.
+
+        Adding a single-task snapshot of task 94 grows the clause-scoped
+        bucket to three members while the chimera bucket keeps two, so both
+        survive the collapse. They share category, subject and first member
+        id, and only `core_fact` discriminates them -- without that tiebreak
+        their order falls out of dict insertion, breaking the Returns
         contract's promise that two identical runs serialise byte-identically.
-        `core_fact` ascending is the stated tiebreak.
         """
         corpus = [
-            _dated('P', _LIVENESS_94_SPLIT_CLAUSES, _TS_94_JUL24,
-                   category=_OS, metadata={'task_id': '94'}),
-            _dated('Q', _LIVENESS_94_SPLIT_CLAUSES, _TS_REVERIFY,
+            self._divergent('D1', _TS_94_JUL24),
+            self._divergent('D2', _TS_REVERIFY),
+            _dated('E', _LIVENESS_SNAPSHOT_94_JUL24, _TS_96_JUL24,
                    category=_OS, metadata={'task_id': '94'}),
         ]
 
@@ -5452,8 +5558,9 @@ class TestLivenessSubjectFactsIsAdditive:
 
         assert [(g['subject_task_id'], g['core_fact'], g['member_ids'])
                 for g in groups] == [
-            ('94', _CORE_FACT_STRANDED, ['P', 'Q']),
-            ('94', 'status=in-progress', ['P', 'Q']),
+            ('94', _CORE_FACT_DIVERGENT, ['D1', 'D2']),
+            ('94', _CORE_FACT_STRANDED, ['D1', 'D2', 'E']),
+            ('96', _CORE_FACT_DIVERGENT, ['D1', 'D2']),
         ], 'sorted by core_fact ascending once category/subject/first-id tie'
 
 
@@ -6181,22 +6288,32 @@ _LONG_PROSE_NO_MARKER = (
 
 
 class _CountingPattern:
-    """A delegating stand-in for a compiled pattern that counts `.search`.
+    """A delegating stand-in for a compiled pattern that counts consults.
 
     Delegates to the real pattern rather than stubbing it, so behaviour is
     unchanged and the class below measures COST, not semantics. It exposes
-    `search` and nothing else on purpose: if the implementation ever reaches
-    for `.match`/`.findall`/`.finditer` on this pattern, the AttributeError
+    `search` and `findall` and nothing else on purpose: if the implementation
+    ever reaches for `.match`/`.finditer` on this pattern, the AttributeError
     surfaces that here instead of letting an uncounted consult pass as free.
+
+    `findall` records the STRING it was handed rather than a bare tally,
+    because the budget that matters for `TASK_REF_RE` is per-argument: one
+    whole-content pass plus N per-clause ones is the intended shape, and a
+    tally alone cannot tell that from two whole-content passes.
     """
 
     def __init__(self, pattern):
         self._pattern = pattern
         self.searches = 0
+        self.findall_args: list[str] = []
 
     def search(self, string, *args, **kwargs):
         self.searches += 1
         return self._pattern.search(string, *args, **kwargs)
+
+    def findall(self, string, *args, **kwargs):
+        self.findall_args.append(string)
+        return self._pattern.findall(string, *args, **kwargs)
 
 
 class TestLivenessDetectorRegexBudget:
@@ -6321,6 +6438,58 @@ class TestLivenessDetectorRegexBudget:
             ('96', ['08aa0017', '1eef7df7']),
         ]
         assert disclosure == dict.fromkeys(_LIVENESS_DISCLOSURE_KEYS, 0)
+
+    def test_the_subject_set_is_read_off_the_content_exactly_once(
+        self, monkeypatch,
+    ):
+        """`TASK_REF_RE` sees the WHOLE content once per record, never twice.
+
+        `find_liveness_snapshot_recurrences` needs the subject set for the
+        untasked disclosure and `liveness_snapshot_subject_facts` needs the
+        same set to key on. Deriving it in both places ran this pattern over
+        the full content a second time per record -- on top of the per-clause
+        reads -- in a module that budgets regex consults per record, so the
+        set is threaded through instead. Pinned by ARGUMENT, not by total: a
+        per-clause consult must never be mistaken for the whole-content one.
+        """
+        counter = _CountingPattern(TASK_REF_RE)
+        monkeypatch.setattr(_mod, 'TASK_REF_RE', counter)
+
+        find_liveness_snapshot_recurrences([
+            _dated('6b245659', _LIVENESS_SNAPSHOT_94_JUL24, _TS_94_JUL24,
+                   category=_OS, metadata={'task_id': '94'}),
+        ])
+
+        assert counter.findall_args == [_LIVENESS_SNAPSHOT_94_JUL24], (
+            'one whole-content pass, and a COHERENT record never reaches the '
+            'clause scan at all'
+        )
+
+    def test_a_divergent_record_reads_the_content_once_then_its_clauses(
+        self, monkeypatch,
+    ):
+        """The gate open, the budget unchanged: the extra reads are CLAUSES.
+
+        The sibling above cannot see this, because a coherent record skips the
+        clause scan entirely -- so without this test "threaded, not
+        re-derived" would be pinned only on the path that does no clause work.
+        """
+        counter = _CountingPattern(TASK_REF_RE)
+        monkeypatch.setattr(_mod, 'TASK_REF_RE', counter)
+
+        find_liveness_snapshot_recurrences([
+            _dated('D', _LIVENESS_DIVERGENT_94_96, _TS_REVERIFY,
+                   category=_OS, metadata={'task_id': '94'}),
+        ])
+
+        assert counter.findall_args.count(_LIVENESS_DIVERGENT_94_96) == 1, (
+            'still ONE whole-content pass with the clause scan running'
+        )
+        assert all(arg in _LIVENESS_DIVERGENT_94_96
+                   for arg in counter.findall_args[1:]), (
+            'every other consult is a clause of that content, not another '
+            'pass over the whole of it'
+        )
 
     def test_the_public_extractor_keeps_its_single_arg_contract(self, consults):
         """Still one argument, still None/key — and free on a marker-free record."""

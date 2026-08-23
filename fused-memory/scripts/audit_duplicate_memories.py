@@ -677,102 +677,99 @@ def liveness_snapshot_subject_task_ids(record: dict) -> set[str]:
     return subjects
 
 
+def _asserts_one_field_twice(core_fact: str) -> bool:
+    """Does a whole-record key carry TWO values for ONE field?
+
+    Reads the KEY, not the content: pairs are `|`-joined and no value can
+    contain a `|` (`_LIVE_FIELD_SCAN_RE` excludes it from both branches), so
+    this costs a split and no regex consult. True means the record's union key
+    is a CHIMERA no single-task snapshot can ever match -- the one shape
+    clause scoping exists to rescue.
+    """
+    seen: set[str] = set()
+    for pair in core_fact.split('|'):
+        field = pair.split('=', 1)[0]
+        if field in seen:
+            return True
+        seen.add(field)
+    return False
+
+
 def liveness_snapshot_subject_facts(
-    record: dict, core_fact: str,
+    record: dict, core_fact: str, *, subjects: set[str] | None = None,
 ) -> dict[str, set[str]]:
     """WHAT each subject of a liveness snapshot is asserted to be.
 
     The per-subject sibling of ``liveness_snapshot_subject_task_ids``: that one
-    answers WHICH tasks a record is about, this one answers what the record
-    says about each of them. Splits the content into clauses with
-    ``task_filter._CLAUSE_SPLIT_RE``, reads each clause's task refs
-    (``TASK_REF_RE``) and its ``<field>=<value>`` assignments separately, and
-    unions a clause's pairs into every subject that clause NAMES — the
-    technique ``task_filter.find_conflicting_task_status_ids`` uses. A
-    multi-task re-verification reporting DIVERGENT values per task therefore
-    joins each subject's own group instead of matching neither.
+    answers WHICH tasks a record is about, this one what it says about each.
 
-    An unreadable CLAUSE cannot poison a key. ``_readable_field_pairs(clause)
-    or set()`` folds "this clause names no field" and "a boundary landed
-    inside a value" into the same nothing-to-contribute outcome, which is sound
-    HERE — though it would not be at record level — because the caller has
-    already put the record through the record-level gate, which returns
-    ``(True, None)`` unless every recognised field in the whole content reads
-    whole. A clause the reader declines is therefore a clause-boundary
-    artifact, never a field this detector failed to see; that clause adds no
-    key rather than adding one built from a survivors-only fragment, and the
-    subject keeps the whole-record key it always carries.
+    Every subject keys on *core_fact* — always, unconditionally. A
+    clause-scoped key is ADDED beside it, never substituted, and only when
+    *core_fact* names one field twice: that union is a chimera no single-task
+    snapshot can match, which is the divergence this projection exists to
+    rescue. A COHERENT union gains nothing from clause scoping — every clause
+    key is then a strict WEAKENING of it — and adding one would make grouping
+    turn on where the author put a full stop, since ``.`` and a newline are
+    both clause boundaries. Gating on divergence also skips the clause scan
+    entirely for the overwhelmingly common coherent record.
+
+    The clause-scoped key comes from splitting the content with
+    ``task_filter._CLAUSE_SPLIT_RE`` and reading each clause's task refs
+    (``TASK_REF_RE``) and ``<field>=<value>`` assignments separately — the
+    technique ``task_filter.find_conflicting_task_status_ids`` uses — unioned
+    over the clauses that NAME the subject. A clause ``_readable_field_pairs``
+    declines contributes nothing rather than a survivors-only fragment: the
+    record-level gate has already proved every recognised field in the whole
+    content reads whole, so an unreadable CLAUSE is a boundary landing inside
+    a value, never a field this detector failed to see.
 
     Args:
         record: A memory dict the caller has already classified as a liveness
             snapshot.
         core_fact: That record's whole-record key, taken as a PARAMETER rather
-            than re-derived. Calling ``extract_liveness_snapshot_fact`` here
-            would consult the quadratic ``POINT_IN_TIME_CHECK_RE`` a SECOND
-            time per record, which ``TestLivenessDetectorRegexBudget``'s
-            consult-count pins forbid. It is also what EVERY subject keys on:
-            clause scoping ADDS a second key beside it, never replaces it.
+            than re-derived — ``extract_liveness_snapshot_fact`` would consult
+            the quadratic ``POINT_IN_TIME_CHECK_RE`` a SECOND time per record,
+            which ``TestLivenessDetectorRegexBudget``'s consult-count pins
+            forbid.
+        subjects: That record's subject set, threaded for the same reason: the
+            caller already derives it for the untasked disclosure, and
+            re-deriving costs a second whole-content ``TASK_REF_RE`` pass.
+            Defaults to ``liveness_snapshot_subject_task_ids(record)``.
 
     Returns:
         ``{subject_task_id: {facts to bucket it under}}``, carrying EVERY
-        subject ``liveness_snapshot_subject_task_ids`` resolves. Each set
-        ALWAYS contains *core_fact*, plus that subject's clause-scoped fact
-        when its clauses carried readable assignments. Does not mutate
-        *record*.
-
-        Because *core_fact* is unconditional, every bucket membership that
-        predates the rescope survives it: this projection is ADDITIVE by
-        construction, not by a case analysis over which clause shapes happen
-        to be complete. The weaker justification this docstring used to carry
-        — "the fallback reproduces the pre-rescope key exactly" — was false,
-        because that fallback fires only on an EMPTY clause-scoped set: a
-        subject whose clause named only SOME of the record's fields keyed on a
-        partial fact that matched nothing, silently vacating its whole-record
-        bucket with no counter moving (``TestLivenessSubjectFactsIsAdditive``).
+        subject. Each set ALWAYS contains *core_fact*, plus the subject's
+        clause-scoped fact under the divergence rule above. Because
+        *core_fact* is unconditional this projection is ADDITIVE by
+        construction — no pre-rescope bucket membership can be vacated, so it
+        warrants no new ``_LIVENESS_DISCLOSURE_KEYS`` counter
+        (``TestLivenessSubjectFactsIsAdditive``). Does not mutate *record*.
     """
+    if subjects is None:
+        subjects = liveness_snapshot_subject_task_ids(record)
+
     scoped: dict[str, set[str]] = {}
-    for clause in _CLAUSE_SPLIT_RE.split(record.get('content') or ''):
-        if not clause.strip():
-            continue
-        refs = {str(ref) for ref in TASK_REF_RE.findall(clause)}
-        if not refs:
-            continue
-        # `or set()` is safe: the record-level gate already proved every
-        # recognised field in this record reads whole, so an unreadable CLAUSE
-        # is a clause boundary landing inside a value, not a poisoned key —
-        # it contributes nothing and the subject falls back below.
-        pairs = _readable_field_pairs(clause) or set()
-        for ref in refs:
-            scoped.setdefault(ref, set()).update(pairs)
+    if _asserts_one_field_twice(core_fact):
+        for clause in _CLAUSE_SPLIT_RE.split(record.get('content') or ''):
+            if not clause.strip():
+                continue
+            refs = {str(ref) for ref in TASK_REF_RE.findall(clause)}
+            if not refs:
+                continue
+            pairs = _readable_field_pairs(clause) or set()
+            for ref in refs:
+                scoped.setdefault(ref, set()).update(pairs)
 
     facts: dict[str, set[str]] = {}
-    for subject in liveness_snapshot_subject_task_ids(record):
-        pairs = scoped.get(subject)
-        # SEED the whole-record union UNCONDITIONALLY, then ADD the
-        # clause-scoped key beside it. This ordering is the whole monotonicity
-        # argument: every `(category, subject, core_fact)` bucket a record
-        # joined before the rescope, it still joins, whatever its clauses did
-        # or did not say — so clause scoping can only ADD recall (divergent
-        # per-task snapshots now group) and can never remove it. A
-        # clause-scoped key that REPLACED this one would not be additive: a
-        # subject whose clause carried only SOME of the record's fields would
-        # key on a partial fact matching nothing and quietly leave its old
-        # bucket (`TestLivenessSubjectFactsIsAdditive`).
-        #
-        # Three shapes add nothing and leave the set a singleton
-        # (`TestLivenessSubjectFactsFallback`): a ref living only in
-        # `metadata.task_id`/`related_task_ids`, a prose ref whose own clause
-        # carries no readable assignment (real: subject 99 in 1eef7df7), and a
-        # clause boundary landing inside a quoted value. That is a consequence
-        # of the seed, not a separate rule.
-        #
-        # Warrants no new `_LIVENESS_DISCLOSURE_KEYS` counter, re-derived from
-        # the seed: no pre-rescope bucket membership is ever vacated, so there
-        # is nothing here to disclose as lost. A subject dropped instead WOULD
-        # be a loss, and would need one.
+    for subject in subjects:
+        # SEED unconditionally, ADD beside it — the whole monotonicity
+        # argument. A clause-scoped key that REPLACED this one would not be
+        # additive: a subject whose clause carried only SOME of the record's
+        # fields would key on a partial fact matching nothing and quietly
+        # leave the bucket it used to share.
         keys = {core_fact}
-        if pairs:
-            keys.add('|'.join(sorted(pairs)))
+        if clause_pairs := scoped.get(subject):
+            keys.add('|'.join(sorted(clause_pairs)))
         facts[subject] = keys
     return facts
 
@@ -827,8 +824,9 @@ def find_liveness_snapshot_recurrences(
     Buckets by ``(category, subject_task_id, core_fact)`` and emits every
     bucket with >= 2 members — the same >= 2 rule ``cluster_memories_by_pairs``
     already applies, so "what counts as a group" does not acquire a second
-    meaning. Grouping is PER CATEGORY for the same reason ``build_sweep_plan``
-    clusters per category: a preference and an observation that happen to
+    meaning. The one subtraction is the same-member collapse below, which
+    drops a restatement rather than a finding. Grouping is PER CATEGORY for
+    the same reason ``build_sweep_plan`` clusters per category: a preference and an observation that happen to
     report the same live fields are different kinds of knowledge, and unioning
     them would be cross-store conflation rather than deduplication.
 
@@ -838,54 +836,43 @@ def find_liveness_snapshot_recurrences(
     of those buckets carries that subject's OWN fact, not one key shared
     across every subject the record happens to mention.
 
-    A subject can own TWO buckets for one record: its clause-scoped fact and
-    the whole-record union. The two COINCIDE whenever a subject's clauses
-    account for every field the record reads — the common case, and why the
-    two real groups above are unchanged — so the second bucket only
-    materialises when they differ. The accepted cost, deliberate: when BOTH
-    keys reach >= 2 members the same subject is reported twice, at two
-    different ``core_fact`` values. Tolerable for the reason this whole class
-    is tolerable — report-only, never reaching ``delete_candidates`` — so
-    over-firing costs a reviewer one glance and never data.
+    A subject can own two buckets for one record — its clause-scoped fact and
+    the whole-record union — but never two GROUPS over the SAME member set: a
+    clause-scoped bucket reaching identical membership is one finding keyed
+    twice, and ``liveness_snapshot_recurrences`` is an ARMED count. The richer
+    key wins that collapse — always the whole-record one, since a clause key's
+    pairs are a subset — so the survivor is the group that predates clause
+    scoping.
 
     The core fact is keyed PER SUBJECT by ``liveness_snapshot_subject_facts``,
     which splits the content into clauses with ``task_filter._CLAUSE_SPLIT_RE``
-    and keys each subject on the clause(s) naming it — the technique
-    ``task_filter.find_conflicting_task_status_ids`` uses. A multi-task
+    and adds each subject's own clause-scoped key beside the whole-record one
+    — but ONLY for a record whose union key names one field twice. A multi-task
     re-verification reporting DIVERGENT values per task therefore joins each
-    subject's own group, where the earlier whole-record union key matched
-    neither single-task snapshot and the recurrence went unreported. Pinned by
-    ``test_divergent_per_task_statuses_group_per_subject``.
+    subject's own group, where that union matched neither single-task snapshot
+    and the recurrence went unreported (pinned by
+    ``test_divergent_per_task_statuses_group_per_subject``). A record whose
+    union is COHERENT keys exactly as it did before clause scoping, so
+    grouping never turns on where the author put a full stop — ``.`` and
+    a newline are both clause boundaries, and every clause key of a coherent
+    record is a strict weakening of it.
 
     EVERY subject buckets under the whole-record union key unconditionally,
-    with its clause-scoped key added beside it. That — not any fallback — is
-    what makes the rescope monotone: a bucket membership that existed before
-    clause scoping cannot be vacated by it, so the rescope can only ADD
-    recall, never remove it, and grows no new disclosure counter. The two
-    halves are pinned separately, and a reader who lands on only the second
-    gets an incomplete picture: ``TestLivenessSubjectFactsIsAdditive`` covers
-    clause evidence that is non-empty but INCOMPLETE (where a replacing key
-    would silently drop the old bucket), ``TestLivenessSubjectFactsFallback``
-    covers clause evidence that is ABSENT, whose three shapes — a ref living
-    only in ``metadata.task_id`` / ``related_task_ids``, a prose ref whose own
-    clause carries no readable assignment (real: subject 99 in 1eef7df7), and
-    a clause boundary landing inside a quoted value — simply add nothing and
-    leave the subject on the whole-record key alone.
+    which is what makes the rescope monotone: a bucket membership that existed
+    before clause scoping cannot be vacated by it, so the rescope can only ADD
+    recall and grows no new disclosure counter
+    (``TestLivenessSubjectFactsIsAdditive``, ``TestLivenessSubjectFactsFallback``).
 
-    This was not viable when the detector was first written: ``_CLAUSE_SPLIT_RE``
-    split on EVERY ``.``, shattering ``dark-factory-orchestrator.yaml`` and
-    ``CLAUDE.md:95`` mid-sentence, and the nearby reference is written
-    ``task/94``, which ``TASK_REF_RE``'s ``\\s*#?\\s*`` separator did not
-    match — together they returned the EMPTY SET on all four real records.
-    Task 3403 narrowed the dot and widened the separator at the source
-    (``\\.(?!\\w)|[;\\n!?]`` and ``\\s*[#/]?\\s*`` respectively), and this
-    rescope RE-MEASURED the technique against those same four records
-    (6b245659, 08aa0017, 68dd5f93, 1eef7df7) rather than assuming it now
-    returns non-empty: subjects 94 and 96 each key at
-    ``claimant_run_id=null|heartbeat_at=null|status=in-progress`` from their
-    own clauses, so the two real groups survive. That measurement lives in
-    ``TestLivenessSnapshotSubjectFacts``, where a regression in either shared
-    regex fails naming the subject and the fact rather than an absent group.
+    Clause scoping was INERT when the detector was first written:
+    ``_CLAUSE_SPLIT_RE`` split on EVERY ``.``, shattering
+    ``dark-factory-orchestrator.yaml`` mid-sentence, and the real content
+    writes ``task/94``, which ``TASK_REF_RE``'s separator did not match —
+    together the EMPTY SET on all four real records. Task 3403 fixed both at
+    the source, and this rescope RE-MEASURED the technique against those same
+    four records rather than assuming it now returns non-empty. That
+    measurement lives in ``TestLivenessSnapshotSubjectFacts``, where a
+    regression in either shared regex fails naming the subject and the fact
+    rather than an absent group.
 
     Args:
         memories: Raw memory list (any/all categories).
@@ -903,10 +890,9 @@ def find_liveness_snapshot_recurrences(
         timestamp reports None for all three rather than fabricating a span.
         Groups are sorted by ``(category, subject_task_id, first member id,
         core_fact)`` so two identical runs serialise byte-identically.
-        ``core_fact`` is load-bearing, not decoration: one subject can now own
-        two groups — its clause-scoped fact and the whole-record union — over
-        the SAME members, which the first three components do not
-        discriminate. Does not mutate *memories* or its dicts.
+        ``core_fact`` is load-bearing, not decoration: one subject can own two
+        groups whose member sets DIFFER but whose first member id is shared,
+        which the first three components do not discriminate. Does not mutate *memories* or its dicts.
 
         *disclosure* carries every ``_LIVENESS_DISCLOSURE_KEYS`` counter —
         ``liveness_snapshot_untasked`` (a recognised snapshot that resolves to
@@ -946,10 +932,11 @@ def find_liveness_snapshot_recurrences(
             # A recognised snapshot no bucket can hold: real recall, counted
             # rather than invisible.
             disclosure['liveness_snapshot_untasked'] += 1
-        # PER SUBJECT, from the clause(s) that name it — not one whole-record
-        # key attributed to every subject alike.
+        # PER SUBJECT. `subjects` is threaded in rather than re-derived: it
+        # is the same set, and re-deriving costs a second whole-content
+        # `TASK_REF_RE` pass per record.
         for subject, subject_facts in liveness_snapshot_subject_facts(
-            record, core_fact,
+            record, core_fact, subjects=subjects,
         ).items():
             # `sorted`, not bare set iteration: insertion order decides
             # nothing stable across runs, and the Returns contract promises
@@ -987,6 +974,28 @@ def find_liveness_snapshot_recurrences(
             'span_days': span_days,
         })
 
+    # One subject, ONE group per member set. A clause-scoped bucket that
+    # reaches the identical membership as the whole-record bucket is the same
+    # finding keyed twice, and `liveness_snapshot_recurrences` is an ARMED
+    # `higher_is_worse` count — a structural 2x there is a false accretion
+    # signal, and a duplicate row for the human reader. The richer key wins,
+    # which is always the whole-record one (a clause key's pairs are a subset
+    # of the record's), so the survivor is the group that predates clause
+    # scoping; `core_fact` breaks a tie no pair-count can.
+    survivors: dict[tuple[Any, str, tuple[str, ...]], dict[str, Any]] = {}
+    for group in groups:
+        ident = (
+            group['category'], group['subject_task_id'],
+            tuple(str(member) for member in group['member_ids']),
+        )
+        rank = (str(group['core_fact']).count('|'), str(group['core_fact']))
+        held = survivors.get(ident)
+        if held is None or rank > (
+            str(held['core_fact']).count('|'), str(held['core_fact'])
+        ):
+            survivors[ident] = group
+
+    groups = list(survivors.values())
     groups.sort(key=lambda g: (
         str(g['category']), g['subject_task_id'], str(g['member_ids'][0]),
         str(g['core_fact']),
