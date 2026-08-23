@@ -2645,6 +2645,17 @@ class TestDeepDispatchRoundsIntegration:
         assert verdicts == [False, True, True, False], (
             'head=False, deep(6)=True, halved(3)=True, floor(adjacent)=False'
         )
+        # The nullable companion must agree with the SAME classifier, event for
+        # event: `chain_build_ms` is the per-round DISPATCH STALL, so a
+        # non-None on a round that chained nothing would attribute a build cost
+        # to a build that never happened, and a None on a deep round would hide
+        # the stall η1 reads it for.  Asserted against `verdicts` rather than
+        # re-derived, so the two fields cannot drift apart.
+        stalls = [e['data']['chain_build_ms'] for e in events]
+        assert [v is not None for v in stalls] == verdicts, (
+            'chain_build_ms is non-None exactly on the chain_items >= 2 rounds'
+        )
+        assert all(isinstance(v, int) and v >= 0 for v in stalls if v is not None)
 
     async def test_a_deep_round_is_frontier_independent_on_the_chain_arm(
         self, tmp_path: Path, monkeypatch,

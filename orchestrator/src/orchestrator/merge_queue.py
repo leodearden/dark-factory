@@ -6284,6 +6284,18 @@ async def build_chain(
     outside.  Until then the cost is at least observable: every build that
     reaches the merge loop logs ``elapsed_ms`` on its one-line summary.
 
+    γ took the SECOND option (``_deep_chain_placement`` wraps this in
+    ``asyncio.timeout(CHAIN_BUILD_TIMEOUT_SECS)``), which BOUNDS the dispatch
+    stall but does not remove it: the build is still awaited inline, so for its
+    duration ``_verifier_loop`` cannot run FINALIZE-HEAD.  The residual stall is
+    therefore MEASURED rather than assumed — ``_deep_chain_placement`` stamps
+    the caller-side wall clock onto ``ChainResult.build_ms`` (covering the lane
+    acquisition and the timeout wrapper as well as this body) and γ emits it as
+    ``chain_build_ms`` on the merge_verify event, where η1 reads it alongside
+    drain-time.  The first option — build off the dispatch path, consume on a
+    later round — remains open to a later leaf if that measurement says the
+    stall matters.
+
     Args:
         git_ops: Live :class:`~orchestrator.git_ops.GitOps` instance.
         queue_snapshot: The unfrozen suffix in pick order, from
@@ -20197,12 +20209,18 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # the probe -- which only relabels this dispatch's depth/base -- a
             # firing chain REDIRECTS the verify onto a cumulative tip.
             #
-            # A non-empty ChainResult HOLDS a scratch lane whose release is the
-            # CALLER's obligation (ChainResult docstring, "Lane ownership").  That
-            # obligation is DISCHARGED BY _run_inflight_verify, in its `finally`,
-            # on every exit -- so the chain must be handed to it unconditionally
-            # once built.  Do not add an early return or a raise between this line
-            # and the ensure_future below: the lane would leak.
+            # A non-empty ChainResult HOLDS a scratch lane whose release is
+            # the CALLER's obligation (ChainResult docstring, "Lane
+            # ownership").  That obligation is DISCHARGED BY
+            # _run_inflight_verify, in its `finally`, on every exit -- so the
+            # chain must be handed to it unconditionally once built.  Do not
+            # add an early return or a raise between this line and the
+            # ensure_future below: the lane would leak.
+            #
+            # The enclosing LEASE/PERMIT LEAK GUARD does not disturb this: its
+            # `except` hands back the LEASE and the PERMIT only, never a lane,
+            # precisely because a lane can never be in this frame's hands when
+            # it fires (see the next paragraph).
             #
             # The line below can itself RAISE CancelledError (task 3185 review fix
             # 2: _deep_chain_placement deliberately does not absorb an external
