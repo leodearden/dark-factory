@@ -1769,12 +1769,14 @@ class _DeepScene:
 
 
 async def _make_deep_scene(
-    repo: Path, *, chain_cap: int, script: list[bool], monkeypatch,
+    repo: Path, *, chain_cap: int, script: list[bool] | None, monkeypatch,
     allocator=None,
 ) -> _DeepScene:
     """Build a scene whose verify oracle returns *script* verdicts in order.
 
-    *script* is one bool per round (``True`` == the verify passed).  When
+    *script* is one bool per round (``True`` == the verify passed), or ``None``
+    to install no oracle at all and let the REAL ``_run_post_merge_verify``
+    run — which is what drives the true ``merge_verify`` emission site.  When
     *allocator* is given it is installed on the worker BEFORE first use, so
     ``_ensure_host_allocator``'s cache check (merge_queue.py:10288) short-
     circuits and the real one is never built.
