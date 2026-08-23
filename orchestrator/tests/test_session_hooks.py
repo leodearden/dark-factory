@@ -1455,24 +1455,133 @@ def test_parent_pid_of_returns_none_for_an_unresolvable_pid() -> None:
     assert sh._parent_pid_of(-1) is None
 
 
-def test_nested_claude_liveness_pid_prefers_the_grandparent(
+def _install_fake_tree(
+    monkeypatch: pytest.MonkeyPatch,
+    chain: list[tuple[int, str]],
+) -> None:
+    """Simulate a process tree for the ancestor walk.
+
+    *chain* is ordered child-first and starts at THIS process's parent, as
+    ``(pid, comm)`` pairs. ``os.getppid`` is pinned to ``chain[0]`` so the
+    walk starts inside the simulation rather than at the real parent.
+    """
+    parents = {pid: chain[i + 1][0] for i, (pid, _) in enumerate(chain[:-1])}
+    comms = dict(chain)
+    monkeypatch.setattr(sh.os, 'getppid', lambda: chain[0][0])
+    monkeypatch.setattr(sh, '_parent_pid_of', lambda pid: parents.get(pid))
+    monkeypatch.setattr(sh, '_process_comm', lambda pid: comms.get(pid))
+
+
+# The tree measured end-to-end with a probe hook on claude 2.1.241. The
+# `sh -c` wrapper Claude Code interposes is the level a fixed-depth
+# grandparent lookup mistook for the firing claude.
+_REAL_HOOK_CHAIN = [
+    (2028035, 'hook.sh'),
+    (2028032, 'sh'),
+    (2025347, 'claude'),
+    (2025344, 'bash'),
+]
+
+
+def test_owning_claude_pid_skips_the_shell_wrapper_claude_code_interposes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # claude -> <hook>.sh -> python, so the grandparent IS the nested claude
-    # whose death should make the forked record reclaimable.
-    monkeypatch.setattr(sh, '_parent_pid_of', lambda _pid: 424242)
-    assert sh._nested_claude_liveness_pid() == 424242
+    # Regression pin for the task-4193 review finding: the real tree is
+    # `claude -> sh -c -> hook.sh -> python`, so the GRANDPARENT (2028032)
+    # is the ephemeral `sh`, not the claude. Resolving by identity must
+    # reach past it to 2025347 -- otherwise `_owner_ppid_verdict` compares
+    # one level short and judges every genuine owner an inheritor.
+    _install_fake_tree(monkeypatch, _REAL_HOOK_CHAIN)
+    assert sh._owning_claude_pid() == 2025347
 
 
-@pytest.mark.parametrize('unresolvable', [None, 1])
+def test_owning_claude_pid_still_resolves_without_a_shell_wrapper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Identity resolution is indifferent to whether the wrapper is present,
+    # so a harness that execs the hook directly still resolves.
+    _install_fake_tree(monkeypatch, [(500, 'hook.sh'), (400, 'claude')])
+    assert sh._owning_claude_pid() == 400
+
+
+def test_owner_ppid_verdict_accepts_the_genuine_owner_through_the_wrapper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # End-to-end over the measured tree: CLAUDE_SPAWN_OWNER_PPID carries the
+    # payload bash (2025344), i.e. the firing claude's DIRECT parent. The
+    # verdict must be True -- the pre-fix grandparent lookup returned False.
+    _install_fake_tree(monkeypatch, _REAL_HOOK_CHAIN)
+    assert sh._owner_ppid_verdict({'CLAUDE_SPAWN_OWNER_PPID': '2025344'}) is True
+
+
+def test_owner_ppid_verdict_still_rejects_a_nested_claude(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A nested `claude -p` from an agent's Bash tool: its own first claude
+    # ancestor is ITSELF, whose parent is the tool's shell -- not the
+    # inherited payload-bash pid, so it mismatches and is judged an
+    # inheritor even though it carries the env var verbatim.
+    _install_fake_tree(
+        monkeypatch,
+        [
+            (900035, 'hook.sh'),
+            (900032, 'sh'),
+            (900010, 'claude'),  # the NESTED claude
+            (900005, 'bash'),  # the Bash tool's shell
+            (2025347, 'claude'),  # the owner, further up
+            (2025344, 'bash'),
+        ],
+    )
+    assert sh._owner_ppid_verdict({'CLAUDE_SPAWN_OWNER_PPID': '2025344'}) is False
+
+
+def test_owning_claude_pid_returns_none_when_no_claude_ancestor_is_found(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # No /proc (macOS), a mid-read race, or a hook reparented away: the
+    # answer is "cannot prove ownership", never a guessed pid.
+    _install_fake_tree(monkeypatch, [(500, 'hook.sh'), (400, 'bash'), (300, 'init')])
+    assert sh._owning_claude_pid() is None
+
+
+def test_owning_claude_pid_walk_is_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A claude sitting deeper than the bound is not reached, so a runaway
+    # walk can never reach init and mint a bogus owner.
+    chain = [(1000 - i, 'bash') for i in range(sh._MAX_CLAUDE_ANCESTOR_HOPS)]
+    chain.append((1000 - sh._MAX_CLAUDE_ANCESTOR_HOPS, 'claude'))
+    _install_fake_tree(monkeypatch, chain)
+    assert sh._owning_claude_pid() is None
+
+
+def test_nested_claude_liveness_pid_is_the_nested_claude_not_the_wrapper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Second task-4193 review finding: stamping the `sh` wrapper's pid
+    # (2028032) gave a forked-inheritor record an ALREADY-DEAD launcher_pid,
+    # so `stale_pid` could reap the record of a still-running nested
+    # session. The stamped pid must be the claude itself.
+    _install_fake_tree(monkeypatch, _REAL_HOOK_CHAIN)
+    assert sh._nested_claude_liveness_pid() == 2025347
+
+
 def test_nested_claude_liveness_pid_falls_back_to_the_durable_pid(
     monkeypatch: pytest.MonkeyPatch,
-    unresolvable: int | None,
 ) -> None:
     # No /proc, a mid-read race, or a hook reparented to init: degrade to
     # the coarse-but-durable pid rather than guessing.
-    monkeypatch.setattr(sh, '_parent_pid_of', lambda _pid: unresolvable)
+    monkeypatch.setattr(sh, '_owning_claude_pid', lambda: None)
     assert sh._nested_claude_liveness_pid() == sh._hand_launched_liveness_pid()
+
+
+def test_process_comm_returns_none_for_an_unresolvable_pid() -> None:
+    # Never raises -- the same best-effort contract as _parent_pid_of.
+    assert sh._process_comm(-1) is None
+
+
+def test_process_comm_reads_this_process_name() -> None:
+    assert sh._process_comm(os.getpid()) is not None
 
 
 def test_forked_inheritor_record_gets_a_pid_that_dies_with_it(

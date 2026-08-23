@@ -605,28 +605,70 @@ def _parent_pid_of(pid: int) -> int | None:
     return None
 
 
+#: How far up the ancestor chain ``_owning_claude_pid`` will look for the
+#: firing ``claude``. The measured tree needs 3 hops (``hook.sh -> sh ->
+#: claude``); the headroom absorbs an extra wrapper level without ever
+#: letting a reparented hook walk to init.
+_MAX_CLAUDE_ANCESTOR_HOPS = 6
+
+
+def _process_comm(pid: int) -> str | None:
+    """``/proc/<pid>/comm`` for *pid*, stripped, or None.
+
+    Returns None -- never raises -- on a platform with no ``/proc``, on a
+    race where *pid* exits mid-read, and on any unreadable body, so callers
+    can treat the answer as a best-effort hint.
+    """
+    try:
+        return Path(f'/proc/{pid}/comm').read_text().strip()
+    except OSError:
+        return None
+
+
 def _owning_claude_pid() -> int | None:
     """The pid of the ``claude`` process that fired THIS hook event, or None.
 
-    The hook process tree is ``claude -> <hook>.sh -> python``, so this
-    process's grandparent IS the claude that fired the event -- the same
-    resolution ``_nested_claude_liveness_pid`` already relies on, reused here
-    as an OWNERSHIP discriminator rather than a liveness one.
+    Resolved by IDENTITY, not by a fixed depth: walk up from
+    ``os.getppid()`` and return the first ancestor whose
+    ``/proc/<pid>/comm`` is ``claude``.
 
-    Note what this is NOT: an ancestry test. "Is this process a descendant of
-    the spawn launcher" cannot discriminate, because a nested ``claude`` is
-    also a descendant (task 4193 detail item 4). This is an EQUALITY test on
-    one specific process's identity: a ``/clear`` or an automatic compaction
-    happens INSIDE the owning process, which keeps its pid, whereas a nested
+    A fixed depth is wrong. Claude Code runs a hook command through a
+    SHELL, so the real tree is ``claude -> sh -c -> <hook>.sh -> python``
+    and this process's grandparent is the ephemeral ``sh`` wrapper, not
+    ``claude``. Measured end-to-end with a probe hook on claude 2.1.241::
+
+        2028041(python3) -> 2028035(hook.sh) -> 2028032(sh) -> 2025347(claude)
+
+    Taking the grandparent there yields the ``sh`` pid, whose parent IS the
+    claude -- so ``_owner_ppid_verdict``'s comparison against
+    ``CLAUDE_SPAWN_OWNER_PPID`` (the payload bash, i.e. claude's parent)
+    came out one level short and judged every GENUINE owner an inheritor,
+    reintroducing the very task-2511 split this module exists to prevent
+    (task 4193 review). Walking to the first ``claude`` ancestor is immune
+    to that wrapper level whether or not it is present.
+
+    Note what this is NOT: an ancestry test against the spawn launcher.
+    "Is this process a descendant of the launcher" cannot discriminate,
+    because a nested ``claude`` is also a descendant (task 4193 detail item
+    4). This resolves ONE specific process's identity, which callers then
+    compare by EQUALITY: a ``/clear`` or an automatic compaction happens
+    INSIDE the owning process and keeps its pid, whereas a nested
     ``claude`` is a different process and can never present the same one.
+    A nested ``claude``'s own first ``claude`` ancestor is ITSELF, whose
+    parent is the agent's Bash-tool shell -- so it still mismatches.
 
-    Returns None -- never raises -- wherever the grandparent cannot be
-    resolved (no ``/proc``, a mid-read race, a reparented hook). Callers
-    treat None as "cannot prove ownership" and take the fail-safe branch.
+    Returns None -- never raises -- wherever no ``claude`` ancestor is
+    found within ``_MAX_CLAUDE_ANCESTOR_HOPS`` (no ``/proc`` on macOS, a
+    mid-read race, a reparented hook). Callers treat None as "cannot prove
+    ownership" and take the fail-safe branch.
     """
-    grandparent = _parent_pid_of(os.getppid())
-    if grandparent is not None and grandparent > 1:
-        return grandparent
+    pid: int | None = os.getppid()
+    for _ in range(_MAX_CLAUDE_ANCESTOR_HOPS):
+        if pid is None or pid <= 1:
+            return None
+        if _process_comm(pid) == 'claude':
+            return pid
+        pid = _parent_pid_of(pid)
     return None
 
 
@@ -701,20 +743,25 @@ def _nested_claude_liveness_pid() -> int:
     Nested invocation is routine agent behaviour, so that is registry growth
     proportional to it (task 4193 review).
 
-    The hook process tree is ``claude -> <hook>.sh -> python``, so THIS
-    process's grandparent is the nested ``claude`` itself -- exactly the
-    process whose exit should make the record reclaimable. Falls back to
-    ``_hand_launched_liveness_pid()`` whenever the grandparent cannot be
-    resolved (no ``/proc``, a mid-read race, or a hook reparented to init),
-    i.e. degrades to the durable-but-coarse pid rather than guessing. Note
-    the fallback is only ever *coarser*: ``stale_pid`` also requires
-    ``NON_TERMINAL_HEARTBEAT_TTL`` of silence, so a mis-resolved pid cannot
-    reap a record that is still being written to.
+    ``_owning_claude_pid()`` resolves the nested ``claude`` itself --
+    exactly the process whose exit should make the record reclaimable. It
+    is reused here rather than re-deriving the ancestry inline: the earlier
+    inline copy took this process's GRANDPARENT, which the real
+    ``claude -> sh -c -> <hook>.sh -> python`` tree makes the ephemeral
+    ``sh`` wrapper. That wrapper exits milliseconds after the hook returns,
+    so a forked-inheritor record was stamped with an ALREADY-DEAD
+    ``launcher_pid`` and ``stale_pid`` could reclaim the record of a live
+    nested session -- a long ``claude -p`` that emits no hook events for an
+    hour would vanish from the cockpit mid-run (task 4193 review).
+
+    Falls back to ``_hand_launched_liveness_pid()`` whenever no ``claude``
+    ancestor can be resolved (no ``/proc``, a mid-read race, or a hook
+    reparented to init), i.e. degrades to the durable-but-coarse pid rather
+    than guessing. Note the fallback is only ever *coarser*: ``stale_pid``
+    also requires ``NON_TERMINAL_HEARTBEAT_TTL`` of silence, so a
+    mis-resolved pid cannot reap a record that is still being written to.
     """
-    grandparent = _parent_pid_of(os.getppid())
-    if grandparent is not None and grandparent > 1:
-        return grandparent
-    return _hand_launched_liveness_pid()
+    return _owning_claude_pid() or _hand_launched_liveness_pid()
 
 
 def _resolve_parent_session_id(env: Mapping[str, str]) -> str | None:
