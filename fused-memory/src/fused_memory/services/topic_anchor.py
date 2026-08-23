@@ -245,14 +245,38 @@ def select_canonical_payload(
     timestamp string — chronological for the offset-normalized ISO-8601 Mem0
     stamps, and harmless otherwise because ``id`` still totalizes the order.
 
-    Pure and synchronous: does no I/O and raises nothing on malformed input.
+    Pure and synchronous: does no I/O and raises nothing on malformed input —
+    and the guard covers the ARGUMENTS too, not only the payload metadata: a
+    non-list *payloads*, and a non-``str`` ``category`` under a non-``None``
+    *allowed_categories*, both degrade rather than raise.  That makes the
+    promise checkable rather than aspirational.
     """
+    if not isinstance(payloads, list):
+        return None
+
     survivors: list[dict] = []
     for payload in payloads:
         meta = _canonical_meta(payload)
         if meta is None:
             continue
-        if allowed_categories is not None and meta.get('category') not in allowed_categories:
+        # LOAD-BEARING, not defensive boilerplate.  These are FULL raw Qdrant
+        # payloads with no read-time schema enforcement, and ``x in some_set``
+        # evaluates ``hash(x)`` — so a bare membership test raises TypeError on
+        # an unhashable list/dict value.  That is NOT a fail-open here: the
+        # caller's two-tier band deliberately RE-RAISES TypeError
+        # (``memory_service.search``; identically ``server/tools.py:3102`` for
+        # the near-duplicate pre-check), so an unguarded read converts ONE
+        # malformed canonical into a hard failure of every category-scoped
+        # search in the system and of every procedural_knowledge write on that
+        # topic.  Read the value BEFORE testing membership; ``isinstance(...,
+        # str)`` also excludes bool/int/None without a separate clause, the same
+        # way ``_is_child_shaped`` guards ``kind``.  EXCLUDE on an unreadable
+        # category, never admit: anchoring may change WHICH member of the
+        # permitted set is returned, never widen it.
+        category = meta.get('category')
+        if allowed_categories is not None and (
+            not isinstance(category, str) or category not in allowed_categories
+        ):
             continue
         if not include_planned and meta.get('planned') is True:
             continue
