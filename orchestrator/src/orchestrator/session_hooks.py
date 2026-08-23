@@ -1153,17 +1153,22 @@ def _launch_window_withholding_expired(
 ) -> bool:
     """Has *prior* sat in the unbound launch window past the withhold bound?
 
-    Fail-soft in the direction of WITHHOLDING: a missing or unparseable
-    ``start_ts`` returns False, keeping today's behaviour, since an
-    unreadable clock is no evidence the spawn is stuck.
+    Fail-soft in the direction of EXPIRED, not withholding: a missing or
+    unparseable ``start_ts`` returns True. ``start_ts`` defaults to ``''``
+    on ``SessionRecord``, so treating an unreadable clock as "still within
+    the window" would let a record with no clock at all withhold FOREVER --
+    exactly the permanently-blind failure ``_LAUNCH_WINDOW_WITHHOLD_MAX_SECS``
+    exists to bound (L2 ruling esc-4193-8 item 4-iii: "a permanently-withheld
+    record is worse than a stale status"). An unclocked LAUNCHING record
+    cannot be SHOWN to be within the window, so it is treated as past it.
     """
     raw = (prior.start_ts or '').strip()
     if not raw:
-        return False
+        return True
     try:
         started = datetime.fromisoformat(raw)
     except ValueError:
-        return False
+        return True
     if started.tzinfo is None:
         started = started.replace(tzinfo=UTC)
     return (datetime.now(UTC) - started).total_seconds() > _LAUNCH_WINDOW_WITHHOLD_MAX_SECS

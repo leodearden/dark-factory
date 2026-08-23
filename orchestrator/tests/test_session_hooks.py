@@ -1648,6 +1648,7 @@ def test_refresh_path_does_not_bind_a_still_launching_record(tmp_path: Path) -> 
             project='cockpit',
             prompt='/spawn cockpit',
             launcher_pid=3215100,
+            start_ts=datetime.now(UTC).isoformat(),
         ),
         root=tmp_path,
     )
@@ -1680,7 +1681,8 @@ def test_refresh_path_withholds_a_question_during_the_unbound_launch_window(
     slug = 'session-cockpit-3215103'
     sr.write_record(
         sr.SessionRecord(
-            session_slug=slug, status=sr.Status.LAUNCHING, launcher_pid=3215103
+            session_slug=slug, status=sr.Status.LAUNCHING, launcher_pid=3215103,
+            start_ts=datetime.now(UTC).isoformat(),
         ),
         root=tmp_path,
     )
@@ -3361,6 +3363,85 @@ def test_withholding_expires_so_a_stuck_record_is_never_blind_forever(
     # The expiry buys VISIBILITY, not ownership: provenance is still
     # unproven, so the record stays unbound and open for its true owner
     # rather than being claimed by whoever broke the deadlock (esc-4193-10).
+    assert record.claude_session_id is None
+
+
+def test_missing_start_ts_expires_immediately_instead_of_withholding_forever(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # start_ts defaults to '' on SessionRecord. Treating that as "still
+    # within the window" (the old behaviour) would let a record with no
+    # clock at all withhold FOREVER -- the exact permanently-blind failure
+    # _LAUNCH_WINDOW_WITHHOLD_MAX_SECS exists to bound (esc-4193-8 item
+    # 4-iii). An unclocked record cannot be SHOWN to be within the window,
+    # so it must be treated as expired and become visible immediately.
+    slug = 'session-cockpit-4661001'
+    sr.write_record(
+        sr.SessionRecord(
+            session_slug=slug, status=sr.Status.LAUNCHING, launcher_pid=4661001,
+            start_ts='',
+        ),
+        root=tmp_path,
+    )
+    env = {'CLAUDE_SPAWN_SESSION_ID': slug}
+    monkeypatch.setattr(sh, '_owning_claude_pid', lambda: None)
+
+    sh.run_stop({'session_id': 'uuid-noclock', 'cwd': '/home/leo/src/dark-factory'}, env, root=tmp_path)
+
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.status is sr.Status.IDLE
+    assert record.claude_session_id is None
+
+
+def test_unparseable_start_ts_expires_immediately_instead_of_withholding_forever(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A corrupt/garbage start_ts is no more evidence the spawn is healthy
+    # than a missing one -- same fail-soft-to-expired direction applies.
+    slug = 'session-cockpit-4661002'
+    sr.write_record(
+        sr.SessionRecord(
+            session_slug=slug, status=sr.Status.LAUNCHING, launcher_pid=4661002,
+            start_ts='not-a-timestamp',
+        ),
+        root=tmp_path,
+    )
+    env = {'CLAUDE_SPAWN_SESSION_ID': slug}
+    monkeypatch.setattr(sh, '_owning_claude_pid', lambda: None)
+
+    sh.run_stop({'session_id': 'uuid-garbage', 'cwd': '/home/leo/src/dark-factory'}, env, root=tmp_path)
+
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.status is sr.Status.IDLE
+    assert record.claude_session_id is None
+
+
+def test_naive_start_ts_is_treated_as_utc_and_still_expires_past_the_bound(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A tz-naive ISO timestamp (no offset) must be assumed UTC rather than
+    # rejected as unparseable, and the usual bound comparison still applies.
+    slug = 'session-cockpit-4661003'
+    stale_naive = (
+        datetime.now(UTC) - timedelta(seconds=sh._LAUNCH_WINDOW_WITHHOLD_MAX_SECS + 60)
+    ).replace(tzinfo=None)
+    sr.write_record(
+        sr.SessionRecord(
+            session_slug=slug, status=sr.Status.LAUNCHING, launcher_pid=4661003,
+            start_ts=stale_naive.isoformat(),
+        ),
+        root=tmp_path,
+    )
+    env = {'CLAUDE_SPAWN_SESSION_ID': slug}
+    monkeypatch.setattr(sh, '_owning_claude_pid', lambda: None)
+
+    sh.run_stop({'session_id': 'uuid-naive', 'cwd': '/home/leo/src/dark-factory'}, env, root=tmp_path)
+
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.status is sr.Status.IDLE
     assert record.claude_session_id is None
 
 
