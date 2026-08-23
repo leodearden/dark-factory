@@ -3708,8 +3708,113 @@ def _target_subprocess_env(
 # ``ruff check --show-settings`` prints ``Settings path: "<abs path>"`` as its
 # second line.  Matched by PREFIX, never by line index — ruff is free to add a
 # preamble line and an index match would then silently read the wrong thing.
+#
+# SECOND PARSER OF THE SAME OUTPUT: ``_show_settings_field`` in
+# tests/scripts/test_worktree_ruff_config_boundary.py reads these same
+# ``--show-settings`` lines with its own copy of the prefixes (that directory
+# verifies without the orchestrator package on sys.path, so it cannot import
+# this one).  If ruff renames or reformats the lines, BOTH sites need the edit:
+# this one degrades to silence, that one fails loudly, and neither points at
+# the other unless this comment says so.
 _RUFF_SETTINGS_PATH_PREFIX = 'Settings path:'
 _RUFF_PROBE_TIMEOUT_S = 20.0
+# Bound on the fallback probe-target search (below).  A cap, not a tuning knob:
+# a DIAGNOSTIC must never walk a large tree looking for something to measure.
+_RUFF_PROBE_SCAN_DIR_LIMIT = 64
+_RUFF_PROBE_SKIP_DIRS = frozenset({
+    '.git', '.venv', 'venv', '.worktrees', '__pycache__', 'node_modules',
+    'target', '.mypy_cache', '.ruff_cache', '.pytest_cache', 'build', 'dist',
+})
+
+
+def _ruff_probe_binary(worktree: Path, env: dict[str, str]) -> list[str]:
+    """Resolve WHICH ruff the escape probe should run — best effort, and say so.
+
+    The probe is an INTERPRETATION of a lint leg it does not itself run, so
+    fidelity matters: the leg resolves ruff through the TARGET's own toolchain
+    (``uv run --project … ruff``, under a PATH ``_target_subprocess_env``
+    deliberately scrubs of the orchestrator venv), while the cheapest probe
+    would just be ``sys.executable -m ruff`` — the ORCHESTRATOR's ruff, a
+    possibly different version, and absent entirely for a target whose verify
+    env never installed one.  Preference order, most faithful first:
+
+    1. ``<worktree>/.venv/bin/ruff`` — the target's own venv, which is what a
+       workspace-scoped ``uv run`` resolves.
+    2. ``ruff`` on the SCRUBBED PATH — what a bare ``ruff`` in the configured
+       lint command would resolve in the same env the leg runs under.
+    3. ``sys.executable -m ruff`` — the orchestrator's own ruff, the honest
+       last resort.
+
+    Rung 3 may measure a different ruff than the one that produced the verdict,
+    so the emitted diagnostic NAMES the binary it used rather than implying the
+    leg's own.  Total and non-raising: an unreadable path just falls through.
+    """
+    root = Path(worktree)
+    local = root / '.venv' / 'bin' / 'ruff'
+    try:
+        if local.is_file() and os.access(local, os.X_OK):
+            return [str(local)]
+    except OSError:
+        pass
+    on_path = shutil.which('ruff', path=env.get('PATH'))
+    if on_path:
+        return [on_path]
+    return [sys.executable, '-m', 'ruff']
+
+
+def _ruff_probe_target(worktree: Path) -> Path | None:
+    """The file to ask ruff about, or None when the worktree offers none.
+
+    Normally the worktree's own root ``pyproject.toml``: that is the probe
+    which answers the question actually being asked ("does the ROOT config
+    escape?").
+
+    When the root carries no pyproject.toml at all — a project rooted on
+    ``ruff.toml``/``setup.cfg``, a polyglot repo, or a branch that deleted it —
+    ruff would exit with "No files found under the given path", print no
+    settings line, and the detector would go SILENT on precisely the geometry
+    most likely to escape (no root pyproject ⇒ certainly no root
+    ``[tool.ruff]``).  So fall back to a real ``.py`` file, breadth-first and
+    SHALLOWEST-first: the closer the probe file sits to the worktree root, the
+    fewer intervening configs can answer for it.  A deep file under a workspace
+    MEMBER would resolve that member's own ``[tool.ruff]`` and report "no
+    escape" for a reason that has nothing to do with the root.
+
+    Bounded by ``_RUFF_PROBE_SCAN_DIR_LIMIT`` directories and pruned of vendor/
+    cache/nested-worktree dirs; returns None rather than scanning further, and
+    the caller logs that give-up at DEBUG so the silence stays diagnosable.
+    """
+    root = Path(worktree)
+    default = root / 'pyproject.toml'
+    try:
+        if default.is_file():
+            return default
+    except OSError:
+        return None
+    queue: list[Path] = [root]
+    visited = 0
+    while queue and visited < _RUFF_PROBE_SCAN_DIR_LIMIT:
+        current = queue.pop(0)
+        visited += 1
+        try:
+            entries = sorted(current.iterdir())
+        except OSError:
+            continue
+        subdirs: list[Path] = []
+        for entry in entries:
+            try:
+                if entry.is_file() and entry.suffix == '.py':
+                    return entry
+                if (
+                    entry.is_dir()
+                    and not entry.name.startswith('.')
+                    and entry.name not in _RUFF_PROBE_SKIP_DIRS
+                ):
+                    subdirs.append(entry)
+            except OSError:
+                continue
+        queue.extend(subdirs)
+    return None
 
 
 def _ruff_settings_path(worktree: Path, target: Path | None = None) -> Path | None:
@@ -3721,49 +3826,80 @@ def _ruff_settings_path(worktree: Path, target: Path | None = None) -> Path | No
     pyproject.toml — reading a rule set from another checkout's UNCOMMITTED
     working tree.  This helper measures that rather than assuming it.
 
-    *target* defaults to the worktree's own root ``pyproject.toml``, which is
-    the probe that answers the question actually being asked ("does the ROOT
-    config escape?").  Do NOT default it to the worktree directory: ruff then
-    resolves settings for whichever file its traversal happens to reach first,
-    which in this repo is a workspace MEMBER carrying its own ``[tool.ruff]``,
-    and the answer would be about that member instead of the root.
+    *target* defaults to ``_ruff_probe_target(worktree)`` — the worktree's own
+    root ``pyproject.toml``, or the shallowest ``.py`` file when there is none.
+    Do NOT default it to the worktree DIRECTORY: ruff then resolves settings for
+    whichever file its traversal happens to reach first, which in this repo is a
+    workspace MEMBER carrying its own ``[tool.ruff]``, and the answer would be
+    about that member instead of the root.
+
+    Runs the binary ``_ruff_probe_binary`` selects, which is a best-effort stand
+    -in for the lint leg's own ruff and may be a different build of it — see
+    that helper, and note the emitted diagnostic names the binary it used.
 
     TOTAL AND NON-RAISING by construction: a missing ruff, an unreadable cwd, a
-    timeout or an unparseable line all return None.  This is a diagnostic and
-    must be structurally incapable of reddening a verify by itself.  One
-    subprocess, ``--no-cache``, short timeout.
+    timeout, an absent probe target or an unparseable line all return None.
+    This is a diagnostic and must be structurally incapable of reddening a
+    verify by itself.  Every give-up is logged at DEBUG with its REASON —
+    ``probe target missing`` / ``ruff unavailable`` / ``no settings line`` — so
+    the silence is diagnosable rather than merely quiet.  One subprocess,
+    ``--no-cache``, short timeout.
+
+    SYNCHRONOUS on purpose (one blocking ``subprocess.run``); every async caller
+    must reach it through ``asyncio.to_thread`` — see ``_report_ruff_config_escape``.
     """
-    probe = Path(worktree) / 'pyproject.toml' if target is None else Path(target)
+    probe = _ruff_probe_target(worktree) if target is None else Path(target)
+    if probe is None:
+        logger.debug(
+            'ruff config-escape probe gave up on %s: probe target missing '
+            '(no root pyproject.toml, and no .py file within %d directories)',
+            worktree, _RUFF_PROBE_SCAN_DIR_LIMIT,
+        )
+        return None
+    env = _target_subprocess_env(None, worktree=Path(worktree))
+    argv = _ruff_probe_binary(Path(worktree), env)
     try:
         proc = subprocess.run(
-            [
-                sys.executable, '-m', 'ruff', 'check',
-                '--no-cache', '--show-settings', str(probe),
-            ],
+            [*argv, 'check', '--no-cache', '--show-settings', str(probe)],
             cwd=str(worktree),
-            env=_target_subprocess_env(None, worktree=Path(worktree)),
+            env=env,
             capture_output=True,
             text=True,
             timeout=_RUFF_PROBE_TIMEOUT_S,
         )
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.debug(
+            'ruff config-escape probe gave up on %s: ruff unavailable (%s): %s',
+            worktree, ' '.join(argv), exc,
+        )
         return None
     for line in proc.stdout.splitlines():
         if not line.startswith(_RUFF_SETTINGS_PATH_PREFIX):
             continue
         value = line[len(_RUFF_SETTINGS_PATH_PREFIX):].strip().strip('"')
-        return Path(value) if value else None
+        if value:
+            return Path(value)
+        break
+    logger.debug(
+        'ruff config-escape probe gave up on %s: no settings line for %s '
+        '(rc=%d, probe=%s); stderr: %s',
+        worktree, probe, proc.returncode, ' '.join(argv), proc.stderr.strip()[:400],
+    )
     return None
 
 
 def _settings_path_escapes(settings: Path | None, worktree: Path) -> bool:
     """True iff *settings* is a real path lying OUTSIDE *worktree*.
 
-    The single escape predicate, shared by ``_ruff_config_escapes`` and by the
-    reporter — one detection site, never a second copy of the comparison.
+    The single escape predicate — one detection site, never a second copy of
+    the comparison.  Callers (production and test alike) compose it with
+    ``_ruff_settings_path``; there is deliberately no third helper wrapping the
+    pair, because a test-only wrapper can drift out of agreement with the real
+    call path without any test noticing.
+
     Fail-safe in the QUIET direction: an unmeasurable probe (``None``) or an
-    unresolvable path reports False, so a broken or absent ruff produces silence
-    rather than a spurious diagnostic.
+    unresolvable path reports False, so a broken or absent ruff produces
+    silence rather than a spurious diagnostic.
     """
     if settings is None:
         return False
@@ -3773,17 +3909,28 @@ def _settings_path_escapes(settings: Path | None, worktree: Path) -> bool:
         return False
 
 
-def _ruff_config_escapes(worktree: Path, target: Path | None = None) -> bool:
-    """True iff ruff's resolved settings for *target* live OUTSIDE *worktree*."""
-    return _settings_path_escapes(_ruff_settings_path(worktree, target), worktree)
-
-
 # Stable, greppable token carried by the escape diagnostic, so an operator (and
 # the guard test) can key on the RECORD rather than on its prose.
 _RUFF_ESCAPE_MARKER = 'ruff-config-escapes-worktree'
+# The remediation, as a named constant: it is the one part of the message with
+# behavioural weight (an operator acts on it), so the guard asserts THIS rather
+# than a literal phrase that a wording edit would redden for no reason.
+_RUFF_ESCAPE_REMEDIATION = (
+    "merge main forward so this branch's own root pyproject.toml declares "
+    '[tool.ruff]'
+)
+# One-record-per-WORKTREE latch, module-level on purpose.  ``verify_all_modules``
+# gathers one ``run_verification`` per module config (and the merge lane fans out
+# similarly), so a latch scoped to a single call would still emit the same
+# multi-line WARNING — and spawn the same probe — once per module for one
+# worktree.  The answer is a property of the worktree's base, which cannot change
+# under a running orchestrator, so the process-lifetime key is the honest scope:
+# at most one probe and one record per worktree per fleet-deploy window.  Keyed
+# on the RESOLVED path so ``.worktrees/77`` and its symlinked spelling collapse.
+_RUFF_ESCAPE_REPORTED: set[str] = set()
 
 
-def _report_ruff_config_escape(worktree: Path, *, latch: set[str]) -> None:
+async def _report_ruff_config_escape(worktree: Path) -> None:
     """Emit the ONE non-fatal diagnostic for a worktree whose ruff config escapes.
 
     Deliberately an INTERPRETATION layered on top of the lint leg, never a
@@ -3795,17 +3942,30 @@ def _report_ruff_config_escape(worktree: Path, *, latch: set[str]) -> None:
     property of the BRANCH'S BASE AGE, not of the code under review, so the
     branch must still be judged on its own lint output.
 
-    *latch* makes this at most ONE probe (and one record) per verify run rather
-    than one per command: the answer cannot change within a run, and the probe
-    costs a subprocess.  Structurally non-fatal — nothing here propagates.
+    ASYNC because the probe is a blocking ``subprocess.run``: it runs on a
+    worker thread via ``asyncio.to_thread`` so it cannot stall the event loop
+    that is concurrently streaming and wall-clock-timing other verify legs
+    (``verify_all_modules`` gathers one ``run_verification`` per module).  Every
+    other potentially-blocking call in this module observes the same rule.
+
+    Structurally non-fatal — nothing here propagates.
     """
-    if _RUFF_ESCAPE_MARKER in latch:
-        return
-    latch.add(_RUFF_ESCAPE_MARKER)
     try:
-        settings = _ruff_settings_path(worktree)
+        key = str(Path(worktree).resolve())
+    except OSError:
+        key = str(worktree)
+    if key in _RUFF_ESCAPE_REPORTED:
+        return
+    _RUFF_ESCAPE_REPORTED.add(key)
+    try:
+        settings = await asyncio.to_thread(_ruff_settings_path, Path(worktree))
         if not _settings_path_escapes(settings, worktree):
             return
+        probe = ' '.join(
+            _ruff_probe_binary(
+                Path(worktree), _target_subprocess_env(None, worktree=Path(worktree)),
+            )
+        )
         logger.warning(
             'Lint gate ruff config ESCAPES this worktree (%s): ruff resolved its '
             'settings from %s — a file OUTSIDE the worktree, in the parent '
@@ -3815,11 +3975,13 @@ def _report_ruff_config_escape(worktree: Path, *, latch: set[str]) -> None:
             'own root declares no [tool.ruff] inherits whatever the parent '
             'currently has. The lint verdict below is UNCHANGED and still '
             'yours to act on; this line only explains why its rule set may not '
-            "match this branch's. Remediation: merge main forward so this "
-            "branch's own root pyproject.toml declares [tool.ruff]. "
-            '(%s; task 3922)',
+            "match this branch's. Remediation: %s. Measured by a best-effort "
+            'probe (%s), which may be a different build of ruff than the lint '
+            'leg itself resolved. (%s; task 3922)',
             worktree,
             settings,
+            _RUFF_ESCAPE_REMEDIATION,
+            probe,
             _RUFF_ESCAPE_MARKER,
         )
     except Exception:
@@ -5229,12 +5391,6 @@ async def run_verification(
             infix = ''
         return verify_dir / f'attempt-{current_attempt}{infix}.{label}.log'
 
-    # One-probe-per-verify latch for the ruff config-escape diagnostic (task
-    # 3922). The answer is a property of the worktree, so it cannot change
-    # within a run; without this the probe would respawn on every retry and
-    # every leg, and the operator would read the same line N times.
-    _ruff_escape_latch: set[str] = set()
-
     async def _run_or_skip_timed(
         cmd: str | None,
         *,
@@ -5495,11 +5651,14 @@ async def run_verification(
         # interpreter record below for the same reason: this is the single
         # post-_run_cmd path, so the record is structurally at-most-once.
         # Gated to where it can be true at all — a ruff-bearing LINT leg, whose
-        # cwd is the worktree root verbatim. Fires on green legs too: the escape
-        # is about which RULE SET ran, which is exactly the question a green
-        # result cannot answer for itself.
+        # cwd is the worktree root verbatim. The GATE is load-bearing, not
+        # decorative: without it the probe would spawn on the test and type
+        # legs too, where its answer is meaningless (pinned by
+        # test_verify_ruff_config_boundary.py::TestEscapeProbeIsGated). Fires
+        # on green legs too: the escape is about which RULE SET ran, which is
+        # exactly the question a green result cannot answer for itself.
         if label == 'lint' and 'ruff' in config_cmd:
-            _report_ruff_config_escape(worktree, latch=_ruff_escape_latch)
+            await _report_ruff_config_escape(worktree)
         if rc != 0 and is_interpreter_missing_workspace_packages(out):
             logger.error(
                 'Verification %r check failed against a Python interpreter that '

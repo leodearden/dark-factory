@@ -14,7 +14,7 @@ The adopted fix has two halves, and this module guards both:
   root, verbatim, for the lint leg) into ``_target_subprocess_env`` so every
   verify spawn gets a worktree-local ``RUFF_CACHE_DIR``.  Measured rule-neutral
   on ruff 0.15.9, hence applied unconditionally.
-* the CONFIG half is made LOUD, not fixed — see ``_ruff_config_escapes``.  It
+* the CONFIG half is made LOUD, not fixed — see ``_settings_path_escapes``.  It
   cannot be fixed safely at the gate (a ``--config`` pin aimed at a rule-less
   pyproject silently falls back to ruff's built-in defaults) and it must not be
   fatal (hard-failing would red every stale-based worktree at once).
@@ -27,6 +27,7 @@ import asyncio
 import logging
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -36,6 +37,21 @@ import pytest
 from orchestrator import verify
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.verify import run_verification
+
+
+@pytest.fixture(autouse=True)
+def _clear_escape_latch():
+    """The escape latch is MODULE-LEVEL (one record per worktree per process),
+    so clear it around every test.
+
+    Each test builds its own tmp_path geometry and therefore its own latch key,
+    but pinning that independence here means a future test reusing a path can
+    never silently observe another test's suppression.
+    """
+    verify._RUFF_ESCAPE_REPORTED.clear()
+    yield
+    verify._RUFF_ESCAPE_REPORTED.clear()
+
 
 
 class TestRunCmdThreadsWorktreeIntoRuffCache:
@@ -121,10 +137,24 @@ def geometry(tmp_path):
     return parent, worktree, target
 
 
+def _escapes(worktree: Path, target: Path | None = None) -> bool:
+    """Compose exactly what production composes: probe, then predicate.
+
+    Deliberately a TEST-LOCAL composition rather than a helper in verify.py.  A
+    convenience wrapper living in production code with no production caller can
+    drift out of agreement with the real call path — the reporter could change
+    its predicate and the wrapper would keep asserting the old behaviour green.
+    These two calls are the ones ``_report_ruff_config_escape`` makes.
+    """
+    return verify._settings_path_escapes(
+        verify._ruff_settings_path(worktree, target), worktree,
+    )
+
+
 class TestRuffConfigEscapeDetector:
     """``_ruff_settings_path`` must report WHERE ruff actually resolved its
-    settings, and ``_ruff_config_escapes`` must say whether that landed outside
-    the worktree.
+    settings, and ``_settings_path_escapes`` must say whether that landed
+    outside the worktree.
 
     The config half of the defect is deliberately NOT fixed — it cannot be,
     safely — so the deliverable is that it becomes visible.  These tests pin
@@ -146,10 +176,10 @@ class TestRuffConfigEscapeDetector:
         # (the never-skip doctrine of tests/scripts/test_nonmember_ruff_config.py).
         assert settings is not None, 'ruff did not report a settings path'
         assert settings == parent / 'pyproject.toml'
-        assert verify._ruff_config_escapes(worktree, target) is True
+        assert _escapes(worktree, target) is True
         # and the default probe target (the worktree's own root pyproject)
         # reaches the same verdict, which is the form the detector uses.
-        assert verify._ruff_config_escapes(worktree) is True
+        assert _escapes(worktree) is True
 
     def test_sound_worktree_resolves_its_own_config(self, geometry):
         _parent, worktree, target = geometry
@@ -159,8 +189,8 @@ class TestRuffConfigEscapeDetector:
 
         assert settings is not None, 'ruff did not report a settings path'
         assert settings == worktree / 'pyproject.toml'
-        assert verify._ruff_config_escapes(worktree, target) is False
-        assert verify._ruff_config_escapes(worktree) is False
+        assert _escapes(worktree, target) is False
+        assert _escapes(worktree) is False
 
     def test_detector_is_total_and_never_raises(self, tmp_path):
         # A ruff failure, a timeout or an unparseable line must degrade to
@@ -168,7 +198,7 @@ class TestRuffConfigEscapeDetector:
         # must be incapable of reddening a verify by itself.
         missing = tmp_path / 'nope'
         assert verify._ruff_settings_path(missing, missing / 'x.py') is None
-        assert verify._ruff_config_escapes(missing) is False
+        assert _escapes(missing) is False
 
 
 class TestRuffProbeResolution:
@@ -219,15 +249,34 @@ def _escape_records(caplog):
     ]
 
 
-async def _verify_with_stubbed_spawn(worktree, tmp_path, *, lint_rc: int):
+async def _verify_with_stubbed_spawn(
+    worktree,
+    tmp_path,
+    *,
+    lint_rc: int,
+    lint_timed_out: bool = False,
+    max_retries: int = 0,
+    lint_marker: str = 'ruff',
+    **module_overrides: Any,
+):
     """Drive the REAL run_verification lint leg with only the SPAWN stubbed.
 
     The detector itself is left live — it is the thing under test — so this is
     a genuine wiring proof rather than a mock asserting against itself.
+
+    *lint_timed_out* + *max_retries* drive the retry loop, which only re-runs on
+    a PURE timeout failure; *module_overrides* reach ``_module_config`` so a
+    test can point the lint leg at a non-ruff linter, and *lint_marker* is the
+    substring identifying that leg's command to the stub.
     """
     async def spy_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
-        rc = lint_rc if 'ruff' in cmd else 0
-        return rc, ('E501 line too long\n' if rc else ''), False
+        if lint_marker not in cmd:
+            return 0, '', False
+        return (
+            lint_rc,
+            ('E501 line too long\n' if lint_rc else ''),
+            lint_timed_out,
+        )
 
     config = OrchestratorConfig(
         verify_admission_slots_dir=str(tmp_path / 'slots'),
@@ -237,9 +286,10 @@ async def _verify_with_stubbed_spawn(worktree, tmp_path, *, lint_rc: int):
         return await run_verification(
             worktree=worktree,
             config=config,
-            module_config=_module_config(),
+            module_config=_module_config(**module_overrides),
             role='task',
             attempt_id=None,
+            max_retries=max_retries,
         )
 
 
@@ -273,8 +323,11 @@ class TestEscapeIsReportedLoudly:
         # resolved — asserted as the measured paths, not as prose.
         assert str(worktree) in message
         assert str(parent / 'pyproject.toml') in message
-        # (iii) the remediation, keyed on its stable phrase rather than wording
-        assert 'merge main forward' in message
+        # (iii) the remediation — asserted as the named CONSTANT, never as a
+        # literal phrase: what has behavioural weight is that the operator is
+        # told what to do, not the particular wording, and pinning prose makes
+        # a copy edit red for no behavioural reason.
+        assert verify._RUFF_ESCAPE_REMEDIATION in message
 
         # ...and the diagnostic did NOT red the leg: a green lint stays green.
         assert result.passed is True
@@ -306,3 +359,218 @@ class TestEscapeIsReportedLoudly:
 
         assert _escape_records(caplog) == []
         assert result.passed is True
+
+
+class TestEscapeProbeIsGated:
+    """The probe must fire on a RUFF LINT leg and nowhere else.
+
+    Both properties below are invisible to the tests above, because the latch
+    collapses any number of extra probes into a single record: deleting the
+    ``label == 'lint' and 'ruff' in config_cmd`` gate, or re-scoping the latch
+    per attempt, leaves them green while the cost (one blocking subprocess per
+    extra leg / per retry) is real.  So these assert on the PROBE COUNT, via a
+    spy that delegates to the live helper rather than replacing it — the record
+    the other tests read stays genuine.
+    """
+
+    @pytest.fixture
+    def probe_spy(self):
+        calls: list[Path] = []
+        real = verify._ruff_settings_path
+
+        def counting(worktree, target=None):
+            calls.append(Path(worktree))
+            return real(worktree, target)
+
+        with patch('orchestrator.verify._ruff_settings_path', new=counting):
+            yield calls
+
+    @pytest.mark.asyncio
+    async def test_non_ruff_lint_command_never_probes(
+        self, geometry, tmp_path, caplog, probe_spy,
+    ):
+        # An escaping worktree, but a lint leg that does not run ruff: the
+        # question the probe answers ("which ruff rule set ran?") is not even
+        # being asked, so asking it would spend a subprocess on nothing and
+        # report an escape that no gate is reading.
+        _parent, worktree, _target = geometry
+        _write_project(worktree, 'wtproj', declares_ruff=False)
+
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.verify'):
+            result = await _verify_with_stubbed_spawn(
+                worktree, tmp_path, lint_rc=0,
+                lint_command='flake8 .', lint_marker='flake8',
+            )
+
+        assert probe_spy == [], f'probed on a non-ruff lint leg: {probe_spy}'
+        assert _escape_records(caplog) == []
+        assert result.passed is True
+
+    @pytest.mark.asyncio
+    async def test_retries_do_not_respawn_the_probe(
+        self, geometry, tmp_path, caplog, probe_spy,
+    ):
+        # The stated reason the latch exists. A pure-timeout lint failure with
+        # max_retries=1 runs the lint leg TWICE; the probe must still fire once.
+        _parent, worktree, _target = geometry
+        _write_project(worktree, 'wtproj', declares_ruff=False)
+
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.verify'):
+            result = await _verify_with_stubbed_spawn(
+                worktree, tmp_path, lint_rc=124, lint_timed_out=True,
+                max_retries=1,
+            )
+
+        assert result.timed_out is True, 'the retry path was not exercised'
+        assert len(probe_spy) == 1, f'probe respawned across retries: {probe_spy}'
+        assert len(_escape_records(caplog)) == 1
+
+    @pytest.mark.asyncio
+    async def test_second_module_on_one_worktree_does_not_reprobe(
+        self, geometry, tmp_path, caplog, probe_spy,
+    ):
+        # ``verify_all_modules`` gathers one ``run_verification`` per module
+        # config against the SAME worktree. A latch scoped to a single call
+        # would emit the whole multi-line WARNING once per module.
+        _parent, worktree, _target = geometry
+        _write_project(worktree, 'wtproj', declares_ruff=False)
+
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.verify'):
+            await _verify_with_stubbed_spawn(worktree, tmp_path, lint_rc=0)
+            await _verify_with_stubbed_spawn(
+                worktree, tmp_path, lint_rc=0, prefix='other',
+            )
+
+        assert len(probe_spy) == 1, f'probed once per module: {probe_spy}'
+        assert len(_escape_records(caplog)) == 1
+
+
+class TestProbeTargetFallback:
+    """A worktree with no root ``pyproject.toml`` must still be measurable.
+
+    That geometry (a project rooted on ruff.toml/setup.cfg, a polyglot repo, a
+    branch that deleted the file) is the one MOST likely to escape — no root
+    pyproject means certainly no root ``[tool.ruff]`` — and it is exactly where
+    a probe aimed at ``<worktree>/pyproject.toml`` gets "No files found under
+    the given path", prints no settings line, and goes silent.  Loud over
+    silent: fall back to a real .py file, and log the give-up when there is not
+    even one.
+    """
+
+    def test_falls_back_to_a_real_py_file(self, geometry):
+        parent, worktree, _target = geometry
+        # No pyproject.toml at the worktree root at all.
+        assert not (worktree / 'pyproject.toml').exists()
+
+        assert verify._ruff_probe_target(worktree) == worktree / 'scripts' / 's.py'
+        settings = verify._ruff_settings_path(worktree)
+        assert settings == parent / 'pyproject.toml'
+        assert _escapes(worktree) is True
+
+    def test_root_pyproject_still_wins_when_present(self, geometry):
+        _parent, worktree, _target = geometry
+        _write_project(worktree, 'wtproj', declares_ruff=True)
+
+        # The default probe stays the ROOT config question; the .py fallback is
+        # a fallback, not a co-equal choice.
+        assert verify._ruff_probe_target(worktree) == worktree / 'pyproject.toml'
+
+    def test_fallback_prefers_the_shallowest_file(self, tmp_path):
+        # Shallowest-first is load-bearing: a deep file under a workspace
+        # MEMBER would resolve that member's own [tool.ruff] and report "no
+        # escape" for a reason that has nothing to do with the worktree root.
+        (tmp_path / 'member' / 'src').mkdir(parents=True)
+        (tmp_path / 'member' / 'src' / 'deep.py').write_text('x = 1\n')
+        (tmp_path / 'conftest.py').write_text('x = 1\n')
+
+        assert verify._ruff_probe_target(tmp_path) == tmp_path / 'conftest.py'
+
+    def test_fallback_skips_vendor_and_cache_dirs(self, tmp_path):
+        for skipped in ('.venv', '.git', 'node_modules', '.worktrees'):
+            (tmp_path / skipped).mkdir()
+            (tmp_path / skipped / 'x.py').write_text('x = 1\n')
+
+        assert verify._ruff_probe_target(tmp_path) is None
+
+    def test_give_up_is_logged_at_debug_with_a_reason(self, tmp_path, caplog):
+        # Silence must stay DIAGNOSABLE: no settings path, but a DEBUG line
+        # naming which of the three give-up reasons fired.
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.verify'):
+            assert verify._ruff_settings_path(tmp_path) is None
+
+        assert any(
+            'probe target missing' in r.getMessage()
+            for r in caplog.records
+            if r.levelno == logging.DEBUG
+        ), [r.getMessage() for r in caplog.records]
+
+
+class TestProbeBinaryResolution:
+    """The probe names WHICH ruff it ran, because it may not be the leg's own.
+
+    The lint leg resolves ruff through the target's toolchain; the cheapest
+    probe would be ``sys.executable -m ruff`` — the ORCHESTRATOR's ruff, a
+    possibly different build.  The resolution order narrows that gap, and the
+    diagnostic states the substitution instead of implying fidelity it lacks.
+    """
+
+    def test_prefers_the_worktree_venv_ruff(self, tmp_path):
+        local = tmp_path / '.venv' / 'bin'
+        local.mkdir(parents=True)
+        ruff = local / 'ruff'
+        ruff.write_text('#!/bin/sh\nexit 0\n')
+        ruff.chmod(0o755)
+
+        assert verify._ruff_probe_binary(tmp_path, {'PATH': '/nonexistent'}) == [str(ruff)]
+
+    def test_falls_back_to_path_then_to_the_orchestrators_module(self, tmp_path):
+        on_path = tmp_path / 'bin'
+        on_path.mkdir()
+        ruff = on_path / 'ruff'
+        ruff.write_text('#!/bin/sh\nexit 0\n')
+        ruff.chmod(0o755)
+
+        assert verify._ruff_probe_binary(tmp_path, {'PATH': str(on_path)}) == [str(ruff)]
+        assert verify._ruff_probe_binary(tmp_path, {'PATH': str(tmp_path / 'empty')}) == [
+            sys.executable, '-m', 'ruff',
+        ]
+
+
+class TestProbeDoesNotBlockTheEventLoop:
+    """The probe is a blocking ``subprocess.run``; it must not run ON the loop.
+
+    ``verify_all_modules`` gathers one ``run_verification`` per module while
+    each verify leg is streaming subprocess output and being wall-clock-timed,
+    so a probe executed inline would stall those reads for its whole duration
+    (up to ``_RUFF_PROBE_TIMEOUT_S`` = 20s) and could push a concurrent leg over
+    its timeout.  Every other potentially-blocking call in verify.py observes
+    the same rule; this pins it for the probe.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_loop_keeps_running_during_the_probe(self, geometry, tmp_path):
+        parent, worktree, _target = geometry
+        _write_project(worktree, 'wtproj', declares_ruff=False)
+        ticks = 0
+
+        async def ticker():
+            nonlocal ticks
+            while True:
+                ticks += 1
+                await asyncio.sleep(0.005)
+
+        def slow_blocking_probe(wt, target=None):
+            # Stands in for the real subprocess.run: blocking, and long enough
+            # that an on-loop call is unmistakable in the tick count.
+            time.sleep(0.25)
+            return parent / 'pyproject.toml'
+
+        with patch('orchestrator.verify._ruff_settings_path', new=slow_blocking_probe):
+            beat = asyncio.create_task(ticker())
+            await asyncio.sleep(0)
+            await verify._report_ruff_config_escape(worktree)
+            beat.cancel()
+
+        # On-loop the count is ~1; off-loop it is ~50. The threshold is far
+        # from both, so this is a structural claim, not a timing race.
+        assert ticks > 5, f'event loop was starved during the probe (ticks={ticks})'
