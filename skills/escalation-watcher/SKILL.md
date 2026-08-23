@@ -1049,18 +1049,22 @@ resolution, and is never a flake.
 
 ### `scope_violation` (info or blocking)
 
-Agent discovered it needs modules beyond its assigned scope.
+Agent discovered it needs to touch files beyond its assigned scope.
 
-1. Extend the required modules in task metadata via `mcp__fused-memory__update_task`
-2. Re-pend the task — it will be dispatched with the expanded module lock set:
-   ```
-   mcp__escalation__resolve_issue(
-     escalation_id="...",
-     resolution="Scope expanded to include [modules]. Task re-pends with updated module locks.",
-     action='resume',   # flips blocked→pending; task redispatches with expanded scope
-     resolved_by="escalation-watcher"
-   )
-   ```
+Resolve with `action='resume'`, carrying the scope grant as `granted_files` — a single call, no task-metadata edit:
+```
+mcp__escalation__resolve_issue(
+  escalation_id="...",
+  resolution="Scope expanded to include [<files>]; resuming.",
+  action='resume',   # flips blocked→pending; task redispatches with expanded scope
+  granted_files=["<project-relative file path>", ...],   # file-level paths, not module names
+  resolved_by="escalation-watcher"
+)
+```
+
+`granted_files` is what actually widens scope: it is persisted on the escalation record, and on resume the orchestrator folds the grant into `plan.files` / `metadata.files` / file-locks before the agent is re-dispatched. Keep `resolution` as human-readable rationale — omit `granted_files` and the grant exists only as prose, so the resumed agent's briefing will not reflect the expanded scope.
+
+Do **not** try to widen scope by writing `modules` into task metadata. Lock derivation (`Scheduler._get_modules`) reads `metadata.files` and has never read that key, so such a write is a silent no-op that reports success. A lock conflict on the grant is handled orchestrator-side — the task requeues rather than resuming under another task's lock.
 
 ### `dependency_discovered` (info or blocking)
 
