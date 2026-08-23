@@ -1203,6 +1203,17 @@ class ChainResult:
       expected outcomes and are deliberately NOT collapsed into it, so ε's
       deep-fail reader is not inflated with non-faults.
     * ``lane`` / ``lane_warm`` — the ONE scratch worktree holding ``tip``.
+    * ``build_ms`` — wall-clock milliseconds the build cost, stamped by γ's
+      caller (``_deep_chain_placement``) rather than by ``build_chain``
+      itself, so it measures the FULL stall the dispatch loop pays: lane
+      acquisition, the sequential merges, and the ``asyncio.timeout`` wrapper's
+      own overhead.  ``None`` on any result ``build_chain`` returned directly
+      to a caller that did not stamp it.  γ emits it as the ``chain_build_ms``
+      field on the same ``merge_verify`` event that carries ``chain_items``,
+      because the build is awaited INLINE on the dispatch path: for its whole
+      duration ``_verifier_loop`` cannot run FINALIZE-HEAD, and that per-round
+      stall must be attributable to the chain rather than misread as verify
+      time (see the Caller-cost note on ``build_chain``).
 
     **Decision #4 — the ``truncated_at`` item MUST NOT have any outcome
     emitted for it.**  A chain conflict at position j may be a conflict with
@@ -1225,6 +1236,7 @@ class ChainResult:
     truncated_reason: str | None = None
     lane: Path | None = None
     lane_warm: bool = False
+    build_ms: int | None = None
 
     @property
     def depth(self) -> int:

@@ -129,6 +129,31 @@ class EventType(StrEnum):
     #                probe-era `depth` values are excluded from calibration.
     #                `chain_items` is derived from the tree that actually ran
     #                and carries no such caveat.
+    # PLUS its always-present-but-NULLABLE companion (task 3185 amend,
+    # reviewer_comprehensive performance):
+    #   chain_build_ms  int | None.  Wall-clock milliseconds the deep chain
+    #                build that produced this verify's tree cost.  None
+    #                whenever no chain was built -- i.e. on every event with
+    #                chain_items == 1, which under the shipped chain_cap=0
+    #                kill switch is EVERY event.  Non-None therefore implies
+    #                chain_items >= 2, and the two fields are read together.
+    #                Nullable where chain_items is not, and correctly so: a
+    #                verify that chained nothing paid no build, so there IS a
+    #                genuine "absent" state here and 0 would be a lie rather
+    #                than an absence (whereas every verify exercises at least
+    #                one item, so chain_items has no absent state at all).
+    #                WHY IT EXISTS: the chain build is awaited INLINE on the
+    #                merge worker's dispatch path, so for its whole duration
+    #                _verifier_loop cannot run FINALIZE-HEAD -- an
+    #                already-green head verify can neither finalize nor land,
+    #                and nothing else can dispatch.  That is a per-round
+    #                DISPATCH STALL, not verify time, and the PRD's whole
+    #                justification for deep merge-ahead is throughput, so the
+    #                cost must be measurable before ζ raises the cap.  η1 reads
+    #                it alongside drain-time for exactly that attribution.
+    #                Measured by _deep_chain_placement, not by build_chain, so
+    #                it covers the FULL stall: lane acquisition, the sequential
+    #                merges, and the asyncio.timeout wrapper's overhead.
     merge_verify = 'merge_verify'
     # A merge-role scoped-verify red that the isolated-rerun-confirm gate
     # (verify.apply_merge_flake_suppression, PRD task α) demonstrated was a

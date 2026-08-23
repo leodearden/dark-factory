@@ -1916,6 +1916,7 @@ class VerifyRunnerPool:
         depth: int | None = None,
         speculative: bool | None = None,
         chain_items: int = 1,
+        chain_build_ms: int | None = None,
     ) -> VerifyResult:
         """Run the verify bundle and emit a merge_verify event.
 
@@ -1949,6 +1950,19 @@ class VerifyRunnerPool:
         ``None`` default would emit ``chain_items: null`` for exactly those
         and break both the contract and η1's reader
         (``scripts/merge-deep-canary-predicate.sh``).
+
+        ``chain_build_ms`` (task 3185 amend) is the wall-clock cost of the
+        deep chain build that produced this verify's tree, in milliseconds.
+        Unlike ``chain_items`` it DOES default to ``None``, and correctly so:
+        a verify that chained nothing paid no build, so there is a genuine
+        "absent" state to represent and 0 would be a lie.  It is emitted
+        always-present-but-nullable for the same reason ``depth`` is — a
+        reader does a plain ``data.get('chain_build_ms')`` with no
+        per-event schema branching.  It exists because the build is awaited
+        INLINE on the merge worker's dispatch path, so it is a per-round
+        DISPATCH STALL (no head can be finalized or landed while it runs) that
+        must never be mistaken for verify time; η1 reads it alongside
+        drain-time.  Non-``None`` implies ``chain_items >= 2``.
 
         ``chain_items`` SUPERSEDES ``depth`` as the honest depth signal: a
         firing speculation probe (task 2359) relabels ``depth`` into an
@@ -2067,6 +2081,7 @@ class VerifyRunnerPool:
                     # actually verified -- always >= 1, never None. See
                     # dispatch()'s docstring for why the default is 1.
                     'chain_items': chain_items,
+                    'chain_build_ms': chain_build_ms,
                     # task 2837 (PRD verify-retry-failed-only D5): retry_scope +
                     # retry_subset_sizes — always-present (None for a full/legacy
                     # verify), derived from the D2 failed-only contract carried in

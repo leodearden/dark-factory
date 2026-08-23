@@ -1196,7 +1196,31 @@ class TestDispatchChainItems:
         data = kwargs['data']
         assert data['chain_items'] == 1
         assert isinstance(data['chain_items'], int)
-        assert data['chain_items'] is not None
+        # ``chain_build_ms`` is the nullable companion: a bare dispatch chained
+        # nothing, so it paid no build.  Present-but-None, never absent, so a
+        # reader does a plain .get() with no per-event schema branching.
+        assert 'chain_build_ms' in data
+        assert data['chain_build_ms'] is None
+
+    async def test_explicit_chain_build_ms_is_emitted_verbatim(self):
+        """The per-round DISPATCH STALL reaches telemetry alongside chain_items.
+
+        Non-None implies a chain was built, so it always rides with
+        ``chain_items >= 2``; η1 reads the pair against drain-time so a
+        dispatch stall cannot be misattributed to verify time.
+        """
+        from orchestrator.event_store import EventType
+
+        pool, emitted = self._make_local_pool()
+
+        await pool.dispatch(
+            'sha-deep', _make_spec(), chain_items=3, chain_build_ms=1234,
+        )
+
+        (event_type,), kwargs = emitted[-1]
+        assert event_type == EventType.merge_verify
+        assert kwargs['data']['chain_build_ms'] == 1234
+        assert kwargs['data']['chain_items'] == 3
 
     async def test_explicit_chain_items_is_emitted_verbatim(self):
         from orchestrator.event_store import EventType
