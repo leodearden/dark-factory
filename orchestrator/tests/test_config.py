@@ -2397,6 +2397,33 @@ class TestConfigReload:
             f'be in RELOADABLE_FIELDS'
         )
 
+    @pytest.mark.parametrize('path', [
+        'digest_enabled',
+        'digest_every_n_escalations',
+        'digest_dir',
+        'digest_ewa_alpha',
+        'digest_ewa_threshold',
+    ])
+    def test_digest_knobs_are_reloadable(self, path):
+        """Task 4559: the EWA breaker's own knobs are green-tier.
+
+        Closes an asymmetry that is worse than inert: `recovery_emission.*` is
+        already green-tier, so an operator can silence a noisy alarm live — but
+        the breaker that alarm competes with HALTS FLEET-WIDE DISPATCH and,
+        until this entry existed, could only be retuned by restarting every
+        orchestrator.
+
+        Safe by construction: all five are read FRESH inside
+        `_maybe_write_digest` (harness.py:15036, 15046, 15106, 15110, 15125),
+        so no in-flight state can be split by a mid-process change.
+
+        Reload TIER only — `digest_ewa_threshold`'s VALUE is untouched.
+        """
+        assert path in RELOADABLE_FIELDS, (
+            f'{path!r} is read fresh on every digest check and is expected to be '
+            f'hot-reloadable, but is missing from RELOADABLE_FIELDS'
+        )
+
 
 class TestSimpleTaskRoleConfigAddressability:
     """Routing alpha (plans/adaptive-model-routing-prd.md): simple_task is a

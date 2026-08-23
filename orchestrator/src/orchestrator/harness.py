@@ -2003,11 +2003,22 @@ class Harness:
         Attributes
         ----------
         _escalation_event_count:
-            Incremented on every escalation submit/resolve callback.
+            Incremented on every escalation submit/resolve callback.  This is
+            the digest GATE: it decides WHEN a digest fires (task 1327).
         _last_digest_event_count:
             Snapshot of the count at the last digest write.
+        _escalation_submit_count:
+            Incremented on escalation SUBMISSION only.  This is the EWA
+            NUMERATOR (task 4559).  Splitting it from the gate is what stops a
+            backlog drain — resolutions, which are the healthy signal — from
+            re-tripping the breaker that the backlog caused.  The gate
+            deliberately keeps counting resolutions so that a pure-drain
+            window still fires a digest and still decays the EWA.
+        _last_digest_submit_count:
+            Snapshot of the submissions count at the last digest write.
         _ewa_value:
-            Current EWA state (process-local; resets on restart).
+            Current EWA state.  Persisted on the scheduler_state pause row and
+            restored on startup (task 4559); otherwise process-local.
         _last_digest_window_end_iso:
             ISO timestamp of the last digest window's end; set to start time
             on first run.  Note: done_count comes from EventStore
@@ -2016,6 +2027,8 @@ class Harness:
         """
         self._escalation_event_count: int = 0
         self._last_digest_event_count: int = 0
+        self._escalation_submit_count: int = 0
+        self._last_digest_submit_count: int = 0
         self._ewa_value: float = 0.0
         self._last_digest_window_end_iso: str = ''
 
@@ -12325,14 +12338,51 @@ class Harness:
         consecutive_unclean: int = 0
         consecutive_degenerate_clean: int = 0  # task 1430: exponential floor on fast-clean exits
         while True:
+            # Best-effort digest check (task 1327) — runs on EVERY supervisor
+            # iteration, ahead of the empty-queue precheck below (task 4559).
+            # Single call site: it applies to the bypass, clean and unclean
+            # paths alike, and is deliberately NOT duplicated into the bypass
+            # branch.
+            #
+            # It used to sit after the rotation, which made it unreachable
+            # exactly when it matters most: once the EWA breaker halts
+            # dispatch the L1 queue drains, the precheck below starts
+            # returning False, and its `continue` returns to the loop top —
+            # never reaching the digest.  A paused fleet could therefore never
+            # re-evaluate the EWA that paused it, which is why both 2026
+            # paused windows produced zero digests.
+            #
+            # The digest stays gated on the event-count threshold inside
+            # _maybe_write_digest, so running it per poll interval rather than
+            # per rotation is a cheap no-op on most iterations.
+            #
+            # Never allowed to break the supervisor: CancelledError re-raised,
+            # AttributeError re-raised (task 1449: surfaces state-init drift to
+            # tests rather than converting it to a silent warning log),
+            # every other runtime exception logged and swallowed.
+            try:
+                await self._maybe_write_digest()
+            except asyncio.CancelledError:
+                raise
+            except AttributeError:
+                raise  # task 1449: surface fixture-drift / state-init bugs to tests
+            except Exception:
+                logger.warning(
+                    '_maybe_write_digest raised unexpectedly in supervisor loop '
+                    '(best-effort swallowed)',
+                    exc_info=True,
+                )
+
             # task 2629: pre-boot empty-queue precheck.  Skip the (expensive)
             # rotation launch entirely when the L1 queue has no actionable
             # work; fails open (see _watcher_has_actionable_l1) so a precheck
             # bug can never silently stop real L1 handling.  Deliberately
             # placed before `start = time.monotonic()` and does not touch the
-            # clean/unclean/degenerate counters, the guards, or
-            # _maybe_write_digest — this is a pure pre-boot bypass, not a
-            # rotation outcome.
+            # clean/unclean/degenerate counters or the guards — this is a pure
+            # pre-boot bypass, not a rotation outcome.  It is also genuinely
+            # unaffected by the digest check, which now runs ABOVE it (task
+            # 4559); before that hoist this comment's claim was false, because
+            # the `continue` below skipped the digest's only call site.
             if not self._watcher_has_actionable_l1():
                 poll = self.config.watcher_empty_queue_poll_secs
                 logger.debug(
@@ -12371,25 +12421,6 @@ class Harness:
                 and bool(getattr(result, 'success', False))
                 and not bool(getattr(result, 'timed_out', False))
             )
-
-            # Best-effort digest check after each rotation (task 1327).
-            # Single call site — applies to both clean and unclean paths.
-            # Never allowed to break the supervisor: CancelledError re-raised,
-            # AttributeError re-raised (task 1449: surfaces state-init drift to
-            # tests rather than converting it to a silent warning log),
-            # every other runtime exception logged and swallowed.
-            try:
-                await self._maybe_write_digest()
-            except asyncio.CancelledError:
-                raise
-            except AttributeError:
-                raise  # task 1449: surface fixture-drift / state-init bugs to tests
-            except Exception:
-                logger.warning(
-                    '_maybe_write_digest raised unexpectedly in supervisor loop '
-                    '(best-effort swallowed)',
-                    exc_info=True,
-                )
 
             if clean:
                 # Healthy rotation completed — reset backoff.
@@ -13520,6 +13551,9 @@ class Harness:
         # callbacks cannot cause a double-skip between the threshold check and the advance.
         # May drift by a small constant under concurrency; not a correctness gate.
         self._escalation_event_count += 1  # task 1327 AFK hardening
+        # A submission advances the EWA numerator as well as the gate; a
+        # resolution (below) advances the gate ONLY.  Task 4559.
+        self._escalation_submit_count += 1  # task 4559 — EWA numerator
         event = self._escalation_events.get(escalation.task_id)
         if event:
             event.set()
@@ -13590,7 +13624,12 @@ class Harness:
     def _on_escalation_resolved(self, escalation) -> None:
         """Callback when an escalation is resolved — wake the waiting workflow."""
         # Increment for any status transition (resolved or dismissed) — both are
-        # escalation events that the EWA digest needs to count.
+        # escalation events, and resolutions feed the digest GATE so that a
+        # window which only drains a backlog still fires a digest (and, with a
+        # zero numerator, decays the EWA).  They deliberately do NOT feed the
+        # EWA NUMERATOR: _escalation_submit_count is bumped in _on_escalation
+        # only, so resolving an escalation can no longer re-trip the breaker
+        # that filing it caused.  Task 4559.
         # Best-effort observability counter — same concurrency caveat as _on_escalation
         # above; _maybe_write_digest snapshots it at entry to avoid double-skip drift.
         self._escalation_event_count += 1  # task 1327 AFK hardening
@@ -14838,7 +14877,24 @@ class Harness:
         """Pause the scheduler so acquire_next() returns None until resumed.
 
         1. Delegates to ``scheduler.pause(reason)`` (idempotent in-memory state).
-        2. Persists via ``RunStore.save_scheduler_pause`` (best-effort).
+        2. Persists via ``RunStore.save_scheduler_pause`` (best-effort),
+           including the live ``_ewa_value`` (task 4559).  The value is
+           recorded for EVERY pause class, not just ``ewa_trip_*``: it is
+           operator EVIDENCE and forensic record, never a trip flag — the
+           pause class is carried by *reason*, which is also the only thing
+           the restore-time predicate keys on.  Seven ``scheduler_pause_restored``
+           events across four pause classes showed a restart re-asserted the
+           halt while losing the number behind it, so the evidence-vs-halt
+           asymmetry is structural to ``pause_scheduler`` rather than
+           EWA-specific, and is fixed here for all classes at once.
+           This write is the trip-TIME snapshot.  While an ``ewa_trip_`` halt
+           is subsequently HELD, ``_maybe_write_digest`` step (13b) refreshes
+           the same column on every digest step, so the stored scalar tracks
+           the decaying statistic rather than freezing at the tripping value —
+           without which the restart-time predicate re-check below could never
+           observe recovery.  That refresh is scoped to ``ewa_trip_`` rows;
+           for every other class the trip-time snapshot written here is the
+           forensic record and is never overwritten.
         3. Emits ``EventType.scheduler_paused`` (best-effort).
         4. Logs a WARNING so the operator sees it.
         5. Files an auto-resumable scheduler-pause L1 — unless ``file_escalation``
@@ -14875,6 +14931,7 @@ class Harness:
                     reason=reason,
                     pause_at_iso=datetime.now(UTC).isoformat(),
                     set_by_run_id=self._run_id,
+                    ewa_value=self._ewa_value,  # task 4559 — evidence, every class
                 )
             except Exception:
                 logger.warning('pause_scheduler: failed to persist pause state', exc_info=True)
@@ -14943,6 +15000,39 @@ class Harness:
         Logs a WARNING with the persisted reason and pause_at so the operator
         is alerted on startup.  Any failure is caught and logged but never
         blocks startup.
+
+        Task 4559 — restart-time predicate re-check.  SCOPE, stated precisely,
+        because it sits next to something deliberately excluded: this is NOT an
+        auto-resume of a live pause.  Nothing new reads ``_ewa_value`` to
+        unpause a running scheduler.  What this declines to do is RE-ASSERT,
+        across a process boundary, a halt whose stored predicate no longer
+        holds.  It is scoped strictly to ``ewa_trip_*`` — the one pause class
+        whose predicate is a stored scalar and can therefore be re-evaluated.
+        Park-stop, cost-ceiling and operator halts are restored blind exactly
+        as before (task 3328: 'Non-5xx park-stop pauses NEVER auto-resume'), as
+        is an ``ewa_trip_*`` row with a NULL value — a row predating the
+        migration — which fails safe toward KEEPING the halt when the predicate
+        is unknowable, never toward releasing it.
+
+        What makes that re-check reachable at all is ``_maybe_write_digest``
+        step (13b): while an ``ewa_trip_`` halt is held it refreshes the stored
+        ``ewa_value`` on every digest step, so the number read here is the EWA
+        as of the last digest before shutdown, not the trip-time snapshot.
+        Without that refresh the stored value would be >= the threshold by
+        construction and this branch could only ever fire because an operator
+        RAISED ``digest_ewa_threshold`` — never because the backlog drained.
+
+        The stored value is written back to LIVE state (``self._ewa_value``)
+        only for an ``ewa_trip_*`` row — the same predicate that governs the
+        halt decision, and the one class whose stored scalar IS the live
+        statistic.  For every other pause class it is forensic evidence about
+        a value that never tripped anything: seeding it would leave a latent
+        EWA trip input that ``resume_scheduler`` never clears (it resets only
+        on ``ewa_trip_`` reasons), turning a park-stop restart into a head
+        start toward the threshold.  The evidence is not lost by that
+        narrowing — every pause class still carries ``ewa_value`` on the
+        ``scheduler_pause_restored`` event and in the startup WARNING, which is
+        where an operator reads it.
         """
         if not self._run_store:
             return
@@ -14962,12 +15052,60 @@ class Harness:
                     pause_at,
                     restored_from_run_id,
                 )
-                self.scheduler.pause(reason)
-                # Stash the reason so run() can file the L1 escalation once the
-                # escalation queue exists (this runs at line ~492, before
-                # _start_escalation_server creates _escalation_queue).  See
-                # _file_restored_pause_escalation.
-                self._restored_pause_reason = reason
+                ewa_value = record.get('ewa_value')
+                threshold = self.config.digest_ewa_threshold
+                # One class test, two decisions — hoisted to a single local so
+                # the live-state restore and the halt re-assertion below can
+                # never drift apart (task 4559).
+                is_ewa_trip = reason.startswith('ewa_trip_')
+
+                # Restore the value into LIVE state only for an ewa_trip_ row,
+                # the one class whose stored scalar IS the live statistic.  For
+                # any other class it is forensic evidence about a value that
+                # never tripped anything; seeding it would leave a head start
+                # toward the threshold that resume_scheduler never clears.
+                if is_ewa_trip and ewa_value is not None:
+                    self._ewa_value = ewa_value
+
+                # Re-assert unless this is an ewa_trip_ pause whose stored
+                # predicate demonstrably no longer holds.  A missing value is
+                # an unknowable predicate, so it re-asserts.
+                reassert = not (
+                    is_ewa_trip
+                    and ewa_value is not None
+                    and ewa_value < threshold
+                )
+
+                if reassert:
+                    self.scheduler.pause(reason)
+                    # Stash the reason so run() can file the L1 escalation once
+                    # the escalation queue exists (this runs at line ~492, before
+                    # _start_escalation_server creates _escalation_queue).  See
+                    # _file_restored_pause_escalation.
+                    self._restored_pause_reason = reason
+                    disposition = 'predicate still holds or is not re-checkable'
+                else:
+                    # Do NOT pause, and do NOT set _restored_pause_reason — no
+                    # L1 may be filed for a halt that is not being re-asserted.
+                    logger.warning(
+                        'Scheduler pause NOT re-asserted: persisted EWA %.4f is '
+                        'below the current threshold %.4f, so the stored trip '
+                        'predicate no longer holds. reason=%r  (task 4559)',
+                        ewa_value, threshold, reason,
+                    )
+                    disposition = 'ewa below threshold — halt not re-asserted'
+                    try:
+                        self._run_store.clear_scheduler_pause(
+                            self.config.fused_memory.project_id,
+                        )
+                    except Exception:
+                        # A clear failure must not break startup; the row simply
+                        # survives to be re-evaluated on the next restart.
+                        logger.warning(
+                            '_load_persisted_scheduler_pause: failed to clear the '
+                            'stale pause row', exc_info=True,
+                        )
+
                 # Emit a distinct event so the timeline self-documents
                 # cross-run continuity.  Operators querying the event log
                 # for a run that starts with dispatch halted can see WHY
@@ -14979,6 +15117,10 @@ class Harness:
                             'reason': reason,
                             'pause_at': pause_at,
                             'restored_from_run_id': restored_from_run_id,
+                            'reasserted': reassert,
+                            'ewa_value': ewa_value,
+                            'ewa_threshold': threshold,
+                            'disposition': disposition,
                         },
                     )
         except Exception:
@@ -15000,9 +15142,11 @@ class Harness:
 
         Algorithm:
         1. Early-return when digest_enabled=False.
-        2. Snapshot _escalation_event_count (best-effort; see note below).
-        3. Early-return when (snapshot - last_count) < N.
-        4. Snapshot escalation delta.
+        2. Snapshot _escalation_event_count AND _escalation_submit_count
+           (best-effort; see note below).
+        3. Early-return when (event snapshot - last event count) < N.
+        4. Compute both step deltas: the lifecycle-event diff (the GATE) and
+           the submissions diff (the EWA NUMERATOR).
         5. Compute window (last window_end → now).
         6. Aggregate escalation stats (fail-open).
         7. Count done tasks in EventStore (fail-open).
@@ -15017,37 +15161,64 @@ class Harness:
         13. Advance counters/state using the snapshot from step 2 (not the
             live counter), so that concurrent callbacks firing inside this
             function do not silently skip counted events.
+        13b. If an ``ewa_trip_`` halt is currently HELD, refresh the persisted
+            ``scheduler_state.ewa_value`` so the stored scalar tracks the
+            decaying live statistic instead of freezing at the trip-time
+            snapshot (fail-open; see the inline note).
         14. If tripped and not already paused, call pause_scheduler (post-write).
 
-        Note on _escalation_event_count: callbacks fire inline on the asyncio
-        event loop thread, so there are no real concurrent writers — the
-        snapshot at step 2 guards against the logical interleaving where a
-        callback runs at an await point inside this function, not against torn
-        integer writes.  Snapshotting once at step 2 makes the threshold check
-        and the advance consistent — concurrent callbacks cannot cause a
-        "double-skip" where the advance overshoots the events that triggered
-        this digest.  The counter is best-effort observability; a small drift
-        is acceptable.
+        Note on the two counters (task 4559): _escalation_event_count counts
+        every escalation-lifecycle callback (submit AND resolve) and is the
+        digest GATE; _escalation_submit_count counts submissions only and is
+        the EWA NUMERATOR.  The gate deliberately keeps counting resolutions.
+        A submissions-only gate would mean a pure-drain window — many
+        resolutions, zero submissions — fires NO digest at all, so a tripped
+        EWA would freeze at its trip value forever, re-creating the
+        re-evaluation dead end that the supervisor-loop hoist closes.  Keeping
+        the gate unchanged means a drain window still fires a digest, and with
+        a zero numerator that digest DECAYS the EWA, so draining a backlog
+        heals the breaker instead of re-tripping it.
 
-        Task 1327 AFK hardening.
+        Both counters follow the same snapshot discipline: callbacks fire
+        inline on the asyncio event loop thread, so there are no real
+        concurrent writers — the snapshots at step 2 guard against the logical
+        interleaving where a callback runs at an await point inside this
+        function, not against torn integer writes.  Snapshotting once at step 2
+        makes the threshold check and the advance consistent — concurrent
+        callbacks cannot cause a "double-skip" where the advance overshoots the
+        events that triggered this digest.  The counters are best-effort
+        observability; a small drift is acceptable.
+
+        Task 1327 AFK hardening; task 4559 gate/numerator split.
         """
         try:
             # (1) Early-return if disabled.
             if not self.config.digest_enabled:
                 return
 
-            # (2) Snapshot _escalation_event_count so the threshold check (3)
-            # and the advance (13) are consistent even if a concurrent callback
-            # increments the live counter between those two reads.
+            # (2) Snapshot both counters so the threshold check (3) and the
+            # advance (13) are consistent even if a concurrent callback
+            # increments a live counter between those two reads.  The
+            # submissions snapshot obeys the same once-at-entry discipline as
+            # the event snapshot (task 4559) — otherwise a submission arriving
+            # at an await point below would be skipped by the advance instead
+            # of counted in the next digest step.
             event_count_snapshot = self._escalation_event_count
+            submit_count_snapshot = self._escalation_submit_count
 
-            # (3) Early-return if not enough new events.
+            # (3) Early-return if not enough new events.  The GATE is the
+            # lifecycle-event diff (submits + resolves) — unchanged by task
+            # 4559, deliberately: see the two-counter note in the docstring.
             diff = event_count_snapshot - self._last_digest_event_count
             if diff < self.config.digest_every_n_escalations:
                 return
 
-            # (4) Snapshot escalation delta.
-            escalations_in_step = diff
+            # (4) Step deltas.  The EWA NUMERATOR is the submissions diff, not
+            # the lifecycle-event diff (task 4559): counting resolutions here
+            # meant a single escalation contributed twice and a backlog drain
+            # re-tripped the breaker that the backlog caused.  A pure-drain
+            # window yields 0 here, which update_ewa turns into pure decay.
+            submissions_in_step = submit_count_snapshot - self._last_digest_submit_count
 
             # (5) Compute window timestamps.
             window_end = datetime.now(UTC).isoformat()
@@ -15101,7 +15272,7 @@ class Harness:
             # source of truth so the EWA input matches the rendered digest figure.
             new_ewa = digest_mod.update_ewa(
                 prev_ewa=self._ewa_value,
-                escalations_in_step=escalations_in_step,
+                escalations_in_step=submissions_in_step,
                 done_in_step=done_count,
                 alpha=self.config.digest_ewa_alpha,
             )
@@ -15149,6 +15320,9 @@ class Harness:
                 dry_run_proposals=[],
                 model_role_rollup=model_role_rollup,
                 stale_lane_census=stale_lane_census,
+                # Task 4559: surface the split that produced new_ewa.
+                submissions_in_step=submissions_in_step,
+                lifecycle_events_in_step=diff,
             )
 
             digest_mod.write_digest_entry(digest_dir, inputs)
@@ -15159,10 +15333,79 @@ class Harness:
             # silently skipped — they will be counted in the next digest step.
             self._ewa_value = new_ewa
             self._last_digest_event_count = event_count_snapshot
+            self._last_digest_submit_count = submit_count_snapshot
             self._last_digest_window_end_iso = window_end
+
+            # (13b) While an ewa_trip_ halt is HELD, keep the persisted scalar
+            # tracking the live statistic (task 4559 amendment).
+            #
+            # pause_scheduler is otherwise the only writer, and step (14) below
+            # only fires `if tripped and not is_paused` — so once the halt is
+            # asserted the row would freeze at the trip-time value forever,
+            # even as this method decays _ewa_value on every drain window.  Two
+            # things broke as a result: the restart-time predicate re-check in
+            # _load_persisted_scheduler_pause could essentially never observe
+            # recovery (a stored value is by construction >= the threshold at
+            # write time, so `ewa_value < threshold` was only reachable if an
+            # operator RAISED digest_ewa_threshold), and a restart re-seeded
+            # _ewa_value with the stale high number, discarding the decay the
+            # drain had achieved — on the 8h fleet-redeploy cadence, on every
+            # restart.  Refreshing here is what makes "draining heals the
+            # breaker" survive a process boundary rather than being reset by it.
+            #
+            # Scoped to ewa_trip_ pauses for the same reason the restore is
+            # (see _load_persisted_scheduler_pause): that is the one class whose
+            # stored scalar IS the live statistic.  For every other class the
+            # value is trip-time forensic evidence about the pause, and
+            # overwriting it with an unrelated later number would destroy it.
+            #
+            # The check below is a cheap PRE-FILTER, not the enforcement point:
+            # it reads the IN-MEMORY reason, which can disagree with the row's
+            # stored reason (Scheduler.pause is first-wins in memory;
+            # save_scheduler_pause is INSERT OR REPLACE, last-wins on disk — so
+            # a park-stop trip during a held ewa_trip_ halt is an in-memory
+            # no-op that still rewrites the row).  refresh_scheduler_pause_ewa
+            # re-tests the prefix against the ROW's own pause_reason in its
+            # WHERE clause; that is what actually protects a non-EWA row's
+            # forensic value.  Do not drop it in favour of this check.
+            #
+            # Best-effort with its own guard: a persistence hiccup must never
+            # break the digest, and this is observability plus a restart hint,
+            # never a correctness gate.
+            if (
+                self._run_store
+                and self.scheduler.is_paused
+                and (self.scheduler.pause_reason or '').startswith('ewa_trip_')
+            ):
+                try:
+                    self._run_store.refresh_scheduler_pause_ewa(
+                        self.config.fused_memory.project_id,
+                        new_ewa,
+                    )
+                except Exception:
+                    logger.warning(
+                        '_maybe_write_digest: failed to refresh persisted EWA '
+                        'on the held pause row (fail-open)',
+                        exc_info=True,
+                    )
 
             # (14) EWA trip: pause scheduler AFTER the digest is written so the
             # markdown captures the trip-causing state.
+            #
+            # There is deliberately NO symmetric release edge here: a held
+            # ewa_trip_ halt is never lifted in-process, however far the
+            # statistic has decayed.  Today an ewa_trip_ halt is released only
+            # by an operator / auto-watcher resume, or by a RESTART, where
+            # _load_persisted_scheduler_pause re-tests the stored predicate and
+            # declines to re-assert it.  That asymmetry — a restart can release
+            # a decayed halt, a running process never does — is a known and
+            # filed gap, not an oversight: adding the release edge means
+            # deciding whether an EWA-tripped scheduler may auto-resume, which
+            # plans/stranding-remediation-scheduler-ergonomics-prd.md section 4
+            # excludes, task 2890 reserves for a human, and task 3328 carves
+            # out.  Owned by the follow-up filed from this task's amendment
+            # pass (agent-followup-4559-inprocess-ewa-release); do not add an
+            # auto-resume here without engaging those three first.
             if tripped and not self.scheduler.is_paused:
                 await self.pause_scheduler(f'ewa_trip_{new_ewa:.4f}')
 
