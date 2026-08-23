@@ -657,3 +657,91 @@ def test_census_stays_fail_open_for_non_cli_consumers(tmp_path):
     p = tmp_path / 'broken.yaml'
     p.write_text(_MALFORMED_YAML)
     assert census_unknown_config_keys(p) == []
+
+
+# --- (k) check-config fails CLOSED on a config it could not inspect -----------
+#
+# The single load-bearing regression claim in every one of these is
+# `'OK:' not in result.output`.  That affirmative string is what an operator
+# reads before a restart (OPERATIONS.md §6a: "Verify with check-config first"),
+# and it must never appear for a file that was not parsed at all.
+
+
+def test_check_config_malformed_yaml_exits_nonzero(tmp_path):
+    p = tmp_path / 'broken.yaml'
+    p.write_text(_MALFORMED_YAML)
+
+    result = CliRunner().invoke(main, ['check-config', '--config', str(p)])
+
+    assert result.exit_code == 1, result.output
+    assert 'OK:' not in result.output
+    assert str(p) in result.output
+    assert 'Error' in result.output
+    assert 'YAML' in result.output
+    # Errors go to stderr so a script's stdout capture cannot mistake the
+    # diagnostic for a report.
+    assert 'Error' in result.stderr
+
+
+def test_check_config_directory_path_exits_nonzero(tmp_path):
+    """click.Path(exists=True) defaults to dir_okay=True, so a directory sails
+    past the option's own guard and only open() rejects it."""
+    result = CliRunner().invoke(main, ['check-config', '--config', str(tmp_path)])
+
+    assert result.exit_code == 1, result.output
+    assert 'OK:' not in result.output
+    assert str(tmp_path) in result.output
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason='root bypasses file permissions')
+def test_check_config_unreadable_via_env_path_exits_nonzero(tmp_path, monkeypatch):
+    """The ORCH_CONFIG_PATH route's only guard is exists(), so an unreadable
+    file reaches the census with nothing in between."""
+    p = _write_yaml(tmp_path, {'max_concurrent_tasks': 3}, name='locked.yaml')
+    p.chmod(0o000)
+    monkeypatch.setenv('ORCH_CONFIG_PATH', str(p))
+    try:
+        result = CliRunner().invoke(main, ['check-config'])
+
+        assert result.exit_code == 1, result.output
+        assert 'OK:' not in result.output
+        assert str(p) in result.output
+    finally:
+        p.chmod(0o644)  # so tmp_path teardown cannot fail
+
+
+def test_check_config_non_mapping_document_exits_nonzero(tmp_path):
+    p = tmp_path / 'list.yaml'
+    p.write_text('- a\n- b\n')
+
+    result = CliRunner().invoke(main, ['check-config', '--config', str(p)])
+
+    assert result.exit_code == 1, result.output
+    assert 'OK:' not in result.output
+    assert 'mapping' in result.output
+
+
+def test_check_config_empty_file_still_exits_zero(tmp_path):
+    """DELIBERATE non-regression boundary: an empty project YAML means "all
+    defaults" and is a real, valid operator configuration — it must stay clean."""
+    p = tmp_path / 'empty.yaml'
+    p.write_text('')
+
+    result = CliRunner().invoke(main, ['check-config', '--config', str(p)])
+
+    assert result.exit_code == 0, result.output
+    assert 'OK:' in result.output
+
+
+def test_check_config_parse_failure_suppresses_the_ignored_section(tmp_path):
+    """With nothing parsed, the informational "excused from the census" block is
+    vacuous by construction — printing it next to the error would imply the file
+    was inspected and found to contain deliberately-excused keys."""
+    p = tmp_path / 'broken_with_x.yaml'
+    p.write_text('x_custom: 1\ngit:\n  remote: origin\n bad_indent: [1,\n')
+
+    result = CliRunner().invoke(main, ['check-config', '--config', str(p)])
+
+    assert result.exit_code == 1, result.output
+    assert 'OK:' not in result.output
+    assert 'excused from the census' not in result.output
