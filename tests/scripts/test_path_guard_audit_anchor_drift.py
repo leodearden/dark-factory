@@ -17,20 +17,32 @@ regression presents as an unbounded rotation spin that resolves nothing. A
 ``stamp_triage`` does not stop it either: the precheck reads ``status``/``level``
 only, never ``triaged_at``.
 
-STDLIB + PYTEST ONLY, AND NOT BY PREFERENCE. ``tests/scripts/orchestrator.yaml``
-runs this directory as ``uv run --project shared pytest tests/scripts/``.
-MEASURED under that interpreter, not assumed: ``orchestrator`` and ``escalation``
-ARE importable; ``fused_memory`` is NOT (``ModuleNotFoundError``). So for the
-producer the ``ast`` route is forced outright — there is no import to fall back
-on.
+STDLIB ONLY, AND WHY — stated from measurement, because getting this wrong in
+either direction is easy. ``tests/scripts/orchestrator.yaml`` runs this directory
+as ``uv run --project shared pytest tests/scripts/``, and none of ``orchestrator``,
+``escalation`` or ``fused_memory`` is INSTALLED in that project's venv (``uv sync
+--project shared`` prunes them). But they are all three IMPORTABLE under the real
+pytest invocation anyway: the ROOT ``conftest.py`` inserts every subproject's
+``src/`` onto ``sys.path``. Measured, all OK: ``from orchestrator import
+verify_cmd``, ``import escalation.server``, ``import
+fused_memory.middleware.scope_violation_escalator``.
 
-For the other two it is chosen, and for a reason that outlives the packaging:
-what this module asserts about is the WORKTREE SOURCE, and an import resolves the
-INSTALLED package instead. Worktrees share the main checkout's ``.venv``
-(OPERATIONS.md §10 carries this as a known trap), so an import-based guard would
-happily read main's ``resolve_issue`` signature while the branch under test
-changed it — green here, red at merge, for a difference this guard exists to see.
-Parsing the file on disk is the only oracle that is actually about this branch.
+(Do not re-derive this with a bare ``uv run --project shared python -c 'import
+orchestrator'``. That "succeeds" and proves nothing: with the repo root on
+``sys.path`` the bare directory matches as an empty NAMESPACE package —
+``__file__`` is ``None`` and the submodule import then fails.)
+
+So ``ast`` here is a CHOICE, not a necessity — except for
+``function_body_constants``, where it is unavoidable: a function's body literals
+cannot be recovered from an imported object at all, and
+``test_lock_derivation_reads_files_not_modules`` is exactly that question. The
+rest follow it for consistency, and for two modest reasons that hold on their
+own: parsing has no import side effects, so this guard cannot be reddened by an
+unrelated import-time failure in a package it does not test (the producer carries
+an optional-dependency import block and module-level logger setup it has no
+business executing); and it reads the committed source text directly, so the
+seven ``src`` dirs conftest puts on ``sys.path`` can never decide WHICH copy of
+the producer the assertions are about.
 
 STRUCTURE, NEVER WORDING. The consumer half is read from a bare
 ``<!-- path-guard-anchors:begin/end -->`` marker span holding backticked tokens
@@ -227,7 +239,7 @@ def producer_constants() -> dict[str, str]:
     assert not missing, (
         f"could not recover {missing} as module-level string constants from "
         f"{ESCALATOR_SRC.relative_to(REPO_ROOT)} (task 3465). This guard AST-parses "
-        f"that module (fused_memory is not importable under `--project shared`); if a "
+        f"the committed source rather than importing the module; if a "
         f"constant was renamed, moved into a class, or computed from an f-string, "
         f"update the names in REQUIRED_PRODUCER_CONSTANTS here AND the "
         f"discriminator tokens declared in the `path-guard-anchors` span of "
@@ -541,8 +553,8 @@ def function_params(src: pathlib.Path, name: str) -> set[str]:
     assert len(matches) == 1, (
         f"expected exactly one function named {name!r} in "
         f"{src.relative_to(REPO_ROOT)}, found {len(matches)} (task 3465). This "
-        f"guard AST-parses the worktree source rather than importing the installed "
-        f"package (worktrees share main's .venv); a rename must fail HERE, "
+        f"guard AST-parses the committed source rather than importing the module; "
+        f"a rename must fail HERE, "
         f"rather than emptying the check."
     )
 
