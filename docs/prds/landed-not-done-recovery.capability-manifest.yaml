@@ -1,0 +1,944 @@
+prd: docs/prds/landed-not-done-recovery.md
+schema_version: 1
+tasks:
+- label: α
+  task_id: null
+  title: Emit a disposition when the dispatch gate declines a landing (NOT FILED -
+    superseded by task 4496)
+  note: NOT FILED. Task 4496 (pending, high, dependencies=[]) already owns this exact
+    site (harness.py:11687, the ancestry arm's silent return False) with the same
+    structured-record-not-escalation remedy, and strictly supersets it by also covering
+    _reconcile_one_stranded (:5702) and the delivered_checks wiring. Task 4501 already
+    depends on 4496 landing. Retained here so the B13 binding has a home and so whoever
+    works 4496 inherits the D6 constraint and the release-edge gap.
+  capabilities:
+  - name: alpha-site-has-no-competing-queued-producer
+    binding: producer-collision - task 4496 (pending/high, deps=[], metadata.files
+      includes orchestrator/src/orchestrator/harness.py) scope item 1 reads verbatim
+      'Sites 1 and 4 emit a STRUCTURED EVENT on reject (runs.db events table), NOT
+      an escalation', naming harness.py:11671 (ancestry) and :5702 (_reconcile_one_stranded).
+      That is this leaf plus a second site. RESOLVED by not filing alpha; theta depends
+      on 4496 instead.
+    verdict: FAIL
+    delivered_check:
+      kind: manual
+      reason: a queued-elsewhere duplicate producer is resolved by task wiring, not
+        by a pattern in the tree; resolution applied at decompose (alpha not filed)
+  - name: recovery-disposition-adapter-already-wired
+    binding: capability→producer (wired) - grep:orchestrator/src/orchestrator/harness.py:9643
+      _emit_recovery_disposition, 10 live call sites; RecoverySite.already_landed_gate
+      (recovery_emission.py:149) already emits twice from this very gate (:11593 provenance_arbitration,
+      :11625 escalation_pinned)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: already true on main - substrate the work writes through, not something
+        it delivers; an expect:present grep would be satisfied today
+  - name: site-does-not-charge-the-streak-alarm
+    binding: 'constraint D6 is a PRESERVE, not a build - recovery_emission.py:163-167
+      already omits already_landed_gate from STREAK_CHARGING_SITES and names the omission
+      as deliberate. CORRECTION: D6''s stated backstop veto_streak_min_span_secs never
+      runs for a non-charging site (emit_recovery_veto_streak_escalation is called
+      only behind ''if site in STREAK_CHARGING_SITES'', harness.py:9755), so the site
+      has no bound today and 4496 must supply one.'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: an expect:absent grep is VACUOUS here - the pattern is 0 today and must
+        stay 0, failing the false-before/true-after rule; this is a regression guard
+        pinned by boundary row B13
+  - name: release-edge-for-the-new-decline-signature
+    binding: capability→producer (wired but incomplete) - _emit_recovery_disposition
+      calls tracker.observe(site, task_id, signature) (harness.py:9747) on every emission,
+      but the gate's only pop, _clear_recovery_veto_streak (harness.py:11655), fires
+      on the escalation path ABOVE all git work. A decline signature accumulated below
+      it has no release edge, so this per-TICK site would grow one tracker entry per
+      ever-declined task.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the observable is tracker footprint after a decline-then-recover cycle;
+        both _clear_recovery_veto_streak call sites already exist so a present-grep
+        is satisfied today
+  - name: decline-reason-vocabulary-choice
+    binding: leaf-owned ruling (PRD Open Question 3) - reuse LeaveReason (recovery_emission.py:170,
+      6 members, all escalation/claimant/deploy-shaped) versus mapping the landing
+      contract's own reason at the emission boundary
+    verdict: OPEN
+    delivered_check:
+      kind: manual
+      reason: the owning task must MAKE this decision; anchoring a grep on either
+        candidate name would pre-empt the ruling
+- label: β
+  task_id: 4645
+  title: Stop a stale preexisting_main_break vetoing an on-main self-heal
+  note: The only leaf whose PRD anchors survived the drift check verbatim on d8f165756b
+    (:5262-5270, :5281, :5286, :5566, :5596).
+  capabilities:
+  - name: on-main-and-off-main-upgrades-are-separate-call-sites
+    binding: capability→producer (wired) - grep:orchestrator/src/orchestrator/harness.py:5562-5571
+      (on-main, MARK_DONE_WITH_PROVENANCE) and :5592-5599 (off-main, RE_FILE_ESCALATION)
+      each call _only_merge_remediable independently at :5566 and :5596. D3's premise
+      that widening the shared frozenset would also widen the off-main clause is CONFIRMED.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: which of two structurally identical clauses consumes which set is a
+        call-graph property; pinned by boundary rows B7 and B8
+  - name: second-category-set-derived-from-the-shared-one
+    binding: capability→producer - D3 mandates a distinct on-main set spelled MERGE_REMEDIABLE_ESC_CATEGORIES
+      | {'preexisting_main_break'}. Deriving rather than re-listing is the INV-5 shape.
+      Measured 0 occurrences of the union form in harness.py; control MERGE_REMEDIABLE_ESC_CATEGORIES
+      = 3.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: MERGE_REMEDIABLE_ESC_CATEGORIES \|
+      paths:
+      - orchestrator/src/orchestrator/harness.py
+      expect: present
+  - name: preexisting-main-break-is-a-live-category-with-real-producers
+    binding: 'capability→producer (wired) - filed at workflow.py:10740/:10783/:10798
+      and merge_queue.py:1518 with suggested_action=''await_preexisting_main_hotfix'',
+      gated by config.escalate_preexisting_main_break (config.py:2962, default True).
+      Measured 0 in harness.py; control stranded_blocked = 29. SCOPING: 99 hits under
+      orchestrator/ and 10 files under docs/+plans/, so the file scope is load-bearing.'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: preexisting_main_break
+      paths:
+      - orchestrator/src/orchestrator/harness.py
+      expect: present
+  - name: escalation-ref-carries-a-populated-category
+    binding: 'field-population - EscalationRef.category: str = '''' (task_ground_truth.py:226)
+      is written NON-SENTINEL from row.category at task_ground_truth.py:740; _only_merge_remediable
+      already reads ref.category (harness.py:5303). The set-membership test being
+      widened reads a real value, not a default.'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the field is already populated and already read; a present-grep on ref.category
+        is satisfied today
+  - name: human-concern-escalation-still-vetoes
+    binding: rejection-mechanism (preserved) - _only_merge_remediable (harness.py:5300-5305)
+      is all(...) over the set, so ONE non-member yields False. B8's design_concern
+      case is refused by the same expression whichever set is passed; the narrowing
+      is a set change, never a predicate change.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: boundary row B8 is a behaviour assertion over a seeded escalation; a
+        grep cannot distinguish a narrowed set from a blanket one
+  - name: 3541-supersession-recorded-not-relitigated
+    binding: 'capability→producer - task 3541 owns the general classify_pins veto
+      collapse and is pending on 3533/3540/3550/3563/3976; this leaf is a declared
+      one-category stopgap (PRD Cross-PRD table and Out of scope). 3541 replaces the
+      predicate; this leaf only changes which set one clause passes it. Lock-contention
+      note: beta, 3541 and 3539 all edit harness.py''s :5281-5600 veto region.'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: G4 seam ownership is an authoring judgement, not a dispatch-time check
+- label: γ
+  task_id: 4646
+  title: Preserve the LandedOutbox row for parked tasks
+  note: 'Module set widened at decompose to include harness.py: the operator-visible
+    half of the signal is the summary line at harness.py:11232-11244, so a label added
+    only in merge_queue.py would be read by nothing (G1 orphan). File-lock contention
+    with pending task 4497, which also owns merge_queue.py.'
+  capabilities:
+  - name: rc3-branch-is-one-three-line-site
+    binding: 'capability→producer (wired) - grep:orchestrator/src/orchestrator/merge_queue.py:6544-6546
+      verbatim on this HEAD: ''if status in WORKFLOW_PRESERVE_STATUSES: / outbox.consume(row.task_id)
+      / return already_done_pruned''. WORKFLOW_PRESERVE_STATUSES imported at :197
+      from orchestrator.task_status; members are done/cancelled/deferred/blocked/merge-deferred.'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: which of the four outbox.consume call sites got split is a control-flow
+        property; pinned by boundary row B9
+  - name: terminal-status-set-exists-and-is-importable
+    binding: 'capability→producer (wired) - TERMINAL_STATUSES: frozenset[str] at orchestrator/src/orchestrator/task_status.py:57,
+      exported in __all__ at :94, from the SAME module merge_queue.py already imports
+      WORKFLOW_PRESERVE_STATUSES from (:197). The done/cancelled split reuses an existing
+      set rather than minting a literal (INV-5). Measured 0 in merge_queue.py; control
+      WORKFLOW_PRESERVE_STATUSES = 4.'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: TERMINAL_STATUSES
+      paths:
+      - orchestrator/src/orchestrator/merge_queue.py
+      expect: present
+  - name: parked-disposition-label-distinct-from-pruned
+    binding: capability→producer - the PRD signal requires the outcome label distinguish
+      pruned from skipped-parked. Measured 0 occurrences repo-wide today (not even
+      in PRD prose), so this pattern cannot be satisfied by a neighbouring name. Control
+      already_done_pruned = 7.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: skipped_parked
+      paths:
+      - orchestrator/src/orchestrator/merge_queue.py
+      expect: present
+  - name: tally-key-pre-registered-or-the-label-is-swallowed
+    binding: rejection-mechanism (observed hazard) - reconcile_landed_outbox does
+      report[disposition] += 1 INSIDE the per-row try/except whose handler tallies
+      'errors' (merge_queue.py:6788-6797). An unregistered label raises KeyError and
+      is silently absorbed as an error rather than surfaced, so the report dict at
+      :6775-6783 must gain the key alongside its seven siblings, all initialised to
+      0.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '''skipped_parked'':[[:space:]]*0'
+      paths:
+      - orchestrator/src/orchestrator/merge_queue.py
+      expect: present
+  - name: dispatch-gate-bool-mapping-defaults-correctly
+    binding: 'capability→producer (wired) - reconcile_landed_task returns ''disposition
+      not in (pruned_not_landed, delivered_checks_withheld)'' (merge_queue.py:6719),
+      so a new label added WITHOUT touching that tuple maps to True = do-not-dispatch,
+      the correct answer for a landed parked task. Safe, but a default: the leaf must
+      state it rather than inherit it.'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the correct outcome is that a tuple is deliberately NOT edited; a grep
+        cannot assert a considered non-edit
+  - name: operator-read-path-is-the-harness-info-summary
+    binding: capability→producer - the disposition an operator reads is harness.py:11232-11244,
+      a %d format string naming each label explicitly via report.get(key, 0). A label
+      added only in merge_queue.py is counted and never displayed. This is why harness.py
+      joins the module set.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: skipped_parked=%d
+      paths:
+      - orchestrator/src/orchestrator/harness.py
+      expect: present
+  - name: outbox-row-is-a-real-durable-artifact
+    binding: 'capability→producer (wired) - LandedOutbox(data/orchestrator/landed_outbox.json)
+      at merge_queue.py:9091; the live file is 2201 bytes holding real rows. consume()
+      (landed_outbox.py:115-125) is the ONLY deleter and flushes through the fsync''d
+      _save_raw chokepoint - ''a consumed row does not resurrect after a restart''.
+      Read path for a surviving row: LandedOutbox.all() (:111), one production caller
+      (merge_queue.py:6784).'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: B9's observable is the presence of a row in a runtime data file after
+        a reconcile pass, not a pattern in the tree
+  - name: retained-row-is-a-hold-and-needs-an-owner-plus-a-bound
+    binding: 'G7 holds-owned-and-bounded - ''terminal status still consumes'' bounds
+      only the happy path. Mitigating evidence: merge_queue.py:6757 already characterises
+      RC-3 as ''a PURE crash-recovery backstop'' because every happy path consumes
+      inline via MergeProvenance.consume (tasks 2681, 2280), so the preserved population
+      is crash-window rows in parked statuses only. Residual gap: eta reaches neither
+      deferred, nor real metadata.train members, nor deleted tasks, so those retain
+      a row with no exit owner - the leaf must name eta as owner, surface row age,
+      and escalate past a configured age.'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: boundedness is an argument over the consume call graph plus a new age
+        escalation; the terminal-consumes half is pinned by B9's second clause
+- label: δ
+  task_id: 4647
+  title: 'branch_work_landed: patch-id attribution + no-op rejection'
+  note: 'landing_evidence.py is NOT a new file - it is a 1,096-line shared authority
+    (tasks 2678/3103/3116) with 7 production call sites. Two PRD premises drifted:
+    the byte-identity claim (task 3116, landed 12h40m after the PRD''s baseline) and
+    the D2 git_ops anchors (~+1,040 lines).'
+  capabilities:
+  - name: landing-evidence-module-already-exists-delta-extends-it
+    binding: 'capability→producer (wired; PRD premise CORRECTED) - orchestrator/src/orchestrator/landing_evidence.py
+      is 1096 lines on this HEAD, NOT the new file the PRD Contract implies. Seven
+      production call sites already delegate to it: harness.py:5702/:11671/:11713/:11741,
+      merge_queue.py:14241, escalation/server.py:3506/:3552. Measured 0 for ''async
+      def branch_work_landed''; control ''async def validate_landing_evidence'' =
+      1.'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: async def branch_work_landed
+      paths:
+      - orchestrator/src/orchestrator/landing_evidence.py
+      expect: present
+  - name: landing-verdict-dataclass-does-not-collide
+    binding: 'capability→producer - LandingEvidenceVerdict (frozen; accepted/evidence_sha/reason/probe)
+      already occupies this concept at landing_evidence.py:189, and TaskWorkflow._branch_work_landed_on_main
+      (workflow.py:13251, called at :2738 and :13805) is a SIXTH landing predicate
+      one underscore from the contract''s chosen name. SCOPING PROOF: bare ''branch_work_landed''
+      returns 3 under orchestrator/src and 14 repo-wide, all neighbouring names or
+      PRD prose - the ''async def'' prefix and the file scope are both load-bearing.'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: class LandingVerdict
+      paths:
+      - orchestrator/src/orchestrator/landing_evidence.py
+      expect: present
+  - name: degenerate-branch-check-already-implemented
+    binding: 'capability→producer (wired) - boundary row B6 needs no new algorithm:
+      branch_is_degenerate (landing_evidence.py:137) plus is_valid_sha_40 (:122) already
+      answer ''did this branch ever advance past branch_base_sha'', consumed at five
+      production sites (harness.py x3 via Harness._branch_is_degenerate, escalation/server.py:2291
+      and :3471). This leaf only surfaces it as the contract''s degenerate_branch
+      REASON.'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: degenerate_branch
+      paths:
+      - orchestrator/src/orchestrator/landing_evidence.py
+      expect: present
+  - name: patch-id-containment-helper-exists-and-is-reusable
+    binding: 'capability→producer (wired; D2 anchors CORRECTED) - merge_queue.patch_content_contained
+      (merge_queue.py:3740-3767) runs ''git cherry upstream head'' and returns ''every
+      commit already present by patch-id'', which IS this leaf''s attribution primitive.
+      D2''s anchors are stale: git_ops'' own git cherry is at :8784 (in rebase_preserving_task_commits)
+      not :8544-8555, and ''git patch-id --stable'' is at :10308/:10318 (in find_equivalent_commit)
+      not :9229-9245. IMPORT-CYCLE CONSTRAINT: merge_queue.py:46-49 imports FROM landing_evidence,
+      so a top-level reverse import is a cycle; use the house function-scoped lazy
+      import (precedent merge_queue.py:816).'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: patch_content_contained
+      paths:
+      - orchestrator/src/orchestrator/landing_evidence.py
+      expect: present
+  - name: no-op-rejection-reason-in-the-closed-vocabulary
+    binding: capability→producer - Contract invariant 2 plus the normative ordering
+      rule (the no-op check runs BEFORE patch-id acceptance). The reason spelling
+      is fixed by the Contract regardless of where the primitive lands, so it binds
+      independently of Open Question 2. Measured 0 in any .py; the 4 repo-wide hits
+      are all PRD prose, which the paths scope excludes.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: no_op_landing
+      paths:
+      - orchestrator/src/orchestrator/landing_evidence.py
+      expect: present
+  - name: reason-codes-must-be-registered-in-reason-explanations
+    binding: 'rejection-mechanism (observed hazard) - format_unattributed_landing_detail
+      does _REASON_EXPLANATIONS.get(verdict.reason, f''Unrecognized reason code: {verdict.reason}'')
+      at landing_evidence.py:762, and the dict at :715 holds exactly TWO reject codes
+      (no_citation, effect_absent). Any contract code not registered renders that
+      literal string into the escalation a human reads. no_attribution is the contract''s
+      rename of no_citation, which makes registration the load-bearing half of the
+      rename.'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '''no_attribution'''
+      paths:
+      - orchestrator/src/orchestrator/landing_evidence.py
+      expect: present
+  - name: closed-reason-and-method-vocabularies-are-machine-checked
+    binding: 'G7 contracts-machine-checked - the Contract''s ''reason: str  # closed
+      vocabulary'' and ''method: str'' are prose only, and the module''s EXISTING
+      vocabulary is likewise prose-only and degrades on an unknown code (landing_evidence.py:762),
+      i.e. discovered by failure. House pattern is enum.StrEnum (RecoverySite, LeaveReason,
+      PinClass). Declare both vocabularies as StrEnum and pin that every member has
+      an explanation entry.'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the enum's name is this leaf's to choose; a premature pattern would
+        pre-empt it. Pinned by the vocabulary-completeness test the leaf must add.
+  - name: verdict-must-carry-a-probe-for-the-escalating-arms
+    binding: 'producer-extent-short - the PRD''s LandingVerdict declares four fields
+      (accepted, evidence_sha, reason, method) and NO probe. But harness.py:11719
+      and :11747 pass their verdict to _file_unattributed_landing_escalation -> landing_evidence.file_unattributed_landing_escalation
+      (:1014, typed ''verdict: LandingEvidenceVerdict'') and format_unattributed_landing_detail
+      (:740), whose bodies render verdict.probe, _render_effect_divergence(verdict)
+      and _render_delivered_checks_differential(verdict). A four-field verdict would
+      silently empty the L1 escalation body (INV-2 structured-facts-at-failure). RESOLUTION:
+      this leaf carries a probe mapping forward on the new verdict; epsilon must not
+      repoint an escalating arm until it does.'
+    verdict: FAIL
+    delivered_check:
+      kind: manual
+      reason: resolution is a spec amendment recorded in the PRD (correction 6bis)
+        and in this leaf's task text, not a pattern on the tree
+  - name: the-decay-premise-has-shifted-under-the-prd
+    binding: 'capability→producer (PRD premise PARTIALLY FALSIFIED) - task 3116 landed
+      40c39cd8ee at 2026-08-22T20:41, 12h40m AFTER the PRD baseline e0c859f566 (08:01),
+      replacing commit_effect_present_in_main''s byte-identity with a THRESHOLD LINE-SURVIVAL
+      test (_EFFECT_SURVIVAL_AGGREGATE_THRESHOLD=0.98 git_ops.py:1113, _PER_FILE_THRESHOLD=0.90
+      :1121, _PER_FILE_MIN_ADDED_LINES=25 :1128). 3116''s measurement: of 2680 previously-rejected
+      merges it now accepts 1050 (39.2%), residual 60.8%. Only branch_content_in_main
+      (git_ops.py:9155) still ends in byte-identity diff --quiet - and that is the
+      dispatch gate''s third-arm ENTRY CONDITION, so B1 decay survives where it matters.
+      This leaf must re-derive D1''s precision arithmetic on the residual.'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: a semantics change in a dependency is verified by reading the predicate
+        and its thresholds, not by a pattern; the retirement itself is epsilon's edit
+  - name: caller-enumeration-for-epsilons-scope-limit
+    binding: producer-extent (measured, D1 scope limit) - commit_effect_present_in_main
+      has exactly TWO production callers, both inside validate_landing_evidence (landing_evidence.py:637
+      CANDIDATE, :697 DISCOVERY). branch_content_in_main has exactly ONE (harness.py:11733).
+      Tier-3.5 reaches both only transitively. So epsilon's in-scope set is 3 production
+      sites, not the open-ended list D1 implies. The eighth landing-detection site,
+      merge_queue.py:14241 (_redrive_coalesce_members), is NOT named by D1's 'dispatch
+      gate, Tier-3.5' wording and must be ruled explicitly in or out.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: an enumeration delivered as a record is a document, not a symbol; re-measure
+        at dispatch rather than pattern-matching a stale list
+  - name: git-error-is-a-fail-soft-that-needs-a-counter
+    binding: 'G7 storm-escape-required - Contract invariant 4 maps any git failure
+      to accepted=False, a fail-soft degradation with no counter: a repo lock, corrupt
+      object or unresolvable ref silently reads as ''not landed'' and the task re-dispatches.
+      git_error must never be collapsed into not_landed by any consumer, must expose
+      a per-reason tally, and must escalate past a configured rate. It is the one
+      reason whose repetition means the detector is broken, not the task unlanded.'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: a rate-escalation threshold is a runtime property; the leaf chooses
+        the config key name
+  - name: where-the-no-op-primitive-lives
+    binding: 'leaf-owned ruling (PRD Open Question 2) - standalone in git_ops versus
+      inline in branch_work_landed. Measured: NO empty-net-diff / no-op predicate
+      exists anywhere under orchestrator/src or escalation/src today, so there is
+      nothing to reuse and nothing to collide with.'
+    verdict: OPEN
+    delivered_check:
+      kind: manual
+      reason: the leaf must MAKE this decision; anchoring on either home would pre-empt
+        it
+- label: ε
+  task_id: 4648
+  title: Point the dispatch gate and Tier-3.5 at the new landing contract
+  note: Re-scoped at decompose. Tasks 4496 (harness.py x4) and 4498 (escalation/server.py
+    x2) already own these call sites and are unstarted, so this leaf is re-pointing
+    ONLY and depends on both. Task 4500 (capstone) asserts a count of seven wired
+    validate_landing_evidence call sites - do not change that signature or count.
+  capabilities:
+  - name: branch-work-landed-contract-from-delta
+    binding: capability→producer - producer:task-δ upstream (in-batch, DAG δ→ε). δ
+      ADDS branch_work_landed to the EXISTING landing_evidence.py, which already exports
+      validate_landing_evidence (:527), LandingEvidenceVerdict (:189), branch_is_degenerate
+      (:137). Measured 0 for the pattern; control 'def validate_landing_evidence'
+      = 1.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def branch_work_landed\(
+      paths:
+      - orchestrator/src/orchestrator/landing_evidence.py
+      expect: present
+  - name: dispatch-gate-ancestry-arm-repointed
+    binding: 'capability→producer (wired) - grep:orchestrator/src/orchestrator/harness.py:11671
+      the ancestry arm already calls validate_landing_evidence and returns False silently
+      on reject (:11676-11687). This is the B1/B2 site: reached only after is_ancestor(branch,
+      main), so a sync-merge tip (B2) enters here. Measured 4 validate_landing_evidence
+      call sites in harness.py, 0 branch_work_landed.'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: branch_work_landed\(
+      paths:
+      - orchestrator/src/orchestrator/harness.py
+      expect: present
+  - name: tier-3-5-repointed-through-the-runtime-reverse-import
+    binding: capability→producer (wired) - grep:escalation/src/escalation/server.py:3441-3445
+      a runtime-only 'from orchestrator.landing_evidence import ...' inside the Tier-3.5
+      fire-safe try/except (orchestrator depends on escalation, not the reverse).
+      δ's new symbol arrives through the SAME lazy import, so no new layering. Measured
+      6 validate_landing_evidence hits in server.py, 0 branch_work_landed.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: branch_work_landed
+      paths:
+      - escalation/src/escalation/server.py
+      expect: present
+  - name: decaying-content-equivalence-entry-condition-retired
+    binding: rejection-mechanism (expect absent after) - grep:orchestrator/src/orchestrator/harness.py:11733
+      'if await self.git_ops.branch_content_in_main(branch):' gates the gate's THIRD
+      arm. Task 3116 relaxed commit_effect_present_in_main to threshold line-survival
+      but did NOT touch branch_content_in_main, whose docstring still requires byte-identity
+      (git_ops.py:9155). That byte-identity is B1's decay, and it is the arm's ENTRY
+      CONDITION, not an inner guard - so B1 is unmet unless this call goes. Measured
+      1 today; false-before/true-after.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: self\.git_ops\.branch_content_in_main
+      paths:
+      - orchestrator/src/orchestrator/harness.py
+      expect: absent
+  - name: task-1175-mischaracterisation-corrected-in-git-ops
+    binding: rejection-mechanism (expect absent after) - the PRD cites ONE anchor
+      (git_ops.py:8981); on this HEAD the false sentence appears TWICE, at :9249-9250
+      (describe_commit_effect_in_main) and :10021-10022 (commit_effect_present_in_main),
+      because task 3116 split the probe from its one-line wrapper. Measured 2 in git_ops.py,
+      2 repo-wide.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: a later commit on main removed the deliverable
+      paths:
+      - orchestrator/src/orchestrator/git_ops.py
+      expect: absent
+  - name: task-1175-mischaracterisation-corrected-in-the-stranded-sweep
+    binding: rejection-mechanism (expect absent after) - harness.py:5693-5695. NOTE
+      this anchor is in _reconcile_one_stranded (the STRANDED SWEEP), not the dispatch
+      gate, and pending task 4496 item 3 independently owns the same honesty fix at
+      the same function - another reason for the 4496 dependency edge. Measured 1
+      in harness.py, 1 repo-wide.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: stamped done unconditionally \(the task-1175 clobber
+      paths:
+      - orchestrator/src/orchestrator/harness.py
+      expect: absent
+  - name: rejected-verdict-carries-structured-facts-for-the-escalating-arms
+    binding: 'producer-extent-short on δ - the PRD''s LandingVerdict has no probe
+      field, but harness.py:11719 and :11747 pass their verdict to _file_unattributed_landing_escalation
+      -> file_unattributed_landing_escalation (:1014) and format_unattributed_landing_detail
+      (:740), whose bodies render verdict.probe, _render_effect_divergence and _render_delivered_checks_differential.
+      Repointing those arms at a four-field verdict silently empties the L1 escalation
+      body (INV-2). RESOLUTION: δ carries probe forward (PRD correction 6bis); this
+      leaf must not repoint an escalating arm until it does.'
+    verdict: FAIL
+    delivered_check:
+      kind: manual
+      reason: resolution is a spec amendment recorded in PRD correction 6bis and in
+        delta's task text, not a pattern on the tree
+  - name: landing-evidence-call-site-set-is-owned-by-three-pending-tasks
+    binding: 'duplicate-owner / capstone-precondition - landing_evidence.py:585-591
+      names the owners by task id, all pending: 4496 harness.py x4, 4497 merge_queue.py
+      x1, 4498 escalation/server.py x2, 4500 CAPSTONE. 4500''s text: ''PRECONDITION
+      - VERIFY BEFORE EDITING. Confirm all seven production call sites actually pass
+      the parameter.'' RESOLVED at decompose by depending on 4496 and 4498, and by
+      requiring that validate_landing_evidence''s public signature and call-site count
+      are preserved (branch_work_landed becomes the producer beneath it, not a replacement
+      at the call sites).'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: a DAG/ownership constraint discharged by dependency wiring at commit_planning,
+        not expressible as a pattern
+- label: ζ
+  task_id: 4649
+  title: Extract the git-authority landing tier out of the escalation server
+  note: D8's premise is WRONG in its specifics and RIGHT in its conclusion. The two
+    helpers are NOT nested inside merge_status (:3287) - they are siblings of it inside
+    create_server (:596), which is why _git_authority_task_metadata is also called
+    from the merge_request fast path at :2293. They remain uncallable from outside,
+    so the extraction is still required - but it serves TWO tools, and the second
+    is unpinned.
+  capabilities:
+  - name: git-authority-tier-is-nested-in-create-server-not-in-merge-status
+    binding: 'capability→producer (wired) - grep:escalation/src/escalation/server.py:3195
+      _found_on_main_response and :3240 _git_authority_task_metadata are both at 4-space
+      indent inside create_server (:596); merge_status is at :3287, AFTER both. D8''s
+      ''closures inside the merge_status tool'' is falsified by position and by the
+      :2293 caller. The operational conclusion survives: both capture create_server''s
+      parameters, so neither is importable.'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def _found_on_main_response
+      paths:
+      - escalation/src/escalation/server.py
+      expect: absent
+  - name: the-tier-serves-two-tools-not-one
+    binding: capability→producer (wired) - grep:escalation/src/escalation/server.py:2293
+      _git_authority_task_metadata(tid, site='merge_request') on the merge_request
+      fast path, plus :3468 and :3529 inside merge_status. Its own docstring (:3252-3258)
+      states the merge_request contract explicitly. An extraction scoped to what merge_status
+      used would be extent-short by exactly one caller. Measured 4 lines match - 1
+      def + 3 calls.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def _git_authority_task_metadata
+      paths:
+      - escalation/src/escalation/server.py
+      expect: absent
+  - name: merge-request-surface-is-unpinned-and-needs-a-new-test
+    binding: producer-extent-short on the declared signal - the leaf's signal says
+      the existing suite 'stays green - behaviour-preserving by construction'. True
+      for merge_status (test_merge_status_git_authority.py, 28 tests, 9 real create_server
+      constructions, real-git fixture at :157). But that file contains ZERO references
+      to merge_request, whose degenerate-branch guard at :2287-2296 is the second
+      consumer. 'Green by construction' is only half the surface; the leaf must ADD
+      a pin for merge_request.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the deliverable is a new test for an uncovered surface; its name is
+        the leaf's to choose
+  - name: closure-captures-must-become-explicit-parameters
+    binding: capability→producer (wired) - grep:escalation/src/escalation/server.py:596-607
+      create_server(queue, merge_queue, orch_config, event_store, harness, ...). _git_authority_task_metadata
+      reads the captured harness (:3269-3272); the Tier-3.5 body reads captured harness,
+      orch_config (:3425-3436) and request_id. The extraction is behaviour-preserving
+      only if all three become parameters - there is no module-level fallback for
+      any of them.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: parameterisation of a captured name is a signature property of a module
+        that does not exist yet; pinned by the existing suite staying green
+  - name: existing-suite-drives-the-real-tool-through-create-server
+    binding: 'capability→producer (wired) - escalation/tests/test_merge_status_git_authority.py:233
+      ''create_server(esc_queue, harness=stub_harness, orch_config=config)'' (9 such
+      constructions), real-git fixture at :157/:164, genuine GitOps assertion at :1290.
+      CAVEAT re-verified at :244-247: it deliberately avoids assert_called_once_with,
+      so a SIGNATURE change is invisible to it - fine for this leaf (no signature
+      change), and exactly why it will not catch epsilon''s repoint.'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the suite IS the check - a behaviour-preserving extraction is verified
+        by running it, not by a pattern
+  - name: runtime-reverse-import-moves-with-the-tier
+    binding: 'capability→producer (wired) - grep:escalation/src/escalation/server.py:3435-3445
+      the lazy ''from orchestrator.landing_evidence import ...'' exists because escalation
+      must not statically depend on orchestrator. The extracted module inherits that
+      constraint verbatim: the import stays runtime-only and inside the fire-safe
+      wrapper, or an ImportError stops degrading to Tier-4 unknown.'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: '''still lazy AND still inside the try/except'' is a control-flow property;
+        a grep for the import string cannot distinguish module-level from function-level
+        placement'
+  - name: structured-facts-on-the-metadata-fetch-outcome
+    binding: G7 structured-facts-at-failure - _git_authority_task_metadata returns
+      {} on EVERY failure mode (no harness, no scheduler attribute, get_task raising,
+      genuinely metadata-less task; :3240 docstring), so a caller cannot recover what
+      the emitter knew. The extracted API must return the fetch outcome alongside
+      the metadata (a metadata_unavailable flag or tri-state - the same discipline
+      as escalation_store_unavailable). merge_status keeps failing open exactly as
+      today so the extraction stays behaviour-preserving; the flag exists so eta's
+      writer can treat 'could not read metadata' as 'cannot verify the degeneracy
+      guard' rather than 'no degeneracy'.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: a tri-state return on a module that does not exist yet; the leaf chooses
+        the field name
+  - name: extracted-module-placement
+    binding: 'leaf-owned ruling (PRD Open Question 4, added at decompose) - escalation/src/escalation/git_authority.py
+      is recommended: orchestrator/pyproject.toml:20 declares escalation as a workspace
+      dependency, so eta can import it STATICALLY. shared/ would instead place a runtime
+      reverse-import of orchestrator.landing_evidence inside shared/ - strictly worse
+      layering than the status quo.'
+    verdict: OPEN
+    delivered_check:
+      kind: manual
+      reason: a placement decision the leaf must make; no pattern can be written until
+        the module has a name
+- label: η
+  task_id: 4651
+  title: Periodic status-agnostic landed reconciler with a writer
+  note: 'Takes an out-of-batch dependency on task 4623: D7''s fold as literally specified
+    is in-progress-gated and would skip every landed parked task, greening B12 while
+    B11 reds. Also carries an UNRESOLVED conflict with pending task 3539, which targets
+    the same population with the remedy the PRD''s Sketch rejects.'
+  capabilities:
+  - name: landing-contract-available-upstream
+    binding: capability→producer - producer:task-δ upstream (DAG δ→η). The writer
+      needs a verdict that is non-decaying (invariant 1) and no-op-rejecting (invariant
+      2), which is δ's B1-B6 signal.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: async def branch_work_landed
+      paths:
+      - orchestrator/src/orchestrator/landing_evidence.py
+      expect: present
+  - name: git-authority-tier-importable-upstream
+    binding: 'capability→producer - producer:task-ζ upstream (DAG ζ→η). The static
+      import direction is legal: orchestrator/pyproject.toml:20 declares escalation
+      as a workspace dependency and escalation declares no orchestrator dependency,
+      so this is the FORWARD edge. Extent caveat: ζ''s declared signal covers only
+      ''merge_status stays green + importable''; η additionally needs the tier to
+      accept an injected git_ops/orch_config/harness rather than reading create_server''s
+      captures - covered by ζ''s closure-captures capability.'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: zeta's module has no name yet (see its OPEN placement capability), so
+        no path can be scoped
+  - name: landed-outbox-row-survives-for-parked-statuses-upstream
+    binding: capability→producer - producer:task-γ upstream (DAG γ→η). Today merge_queue.py:6544-6546
+      consumes and returns already_done_pruned, and LandedOutbox.consume durably deletes
+      (landed_outbox.py:115-125). γ splits it and adds a distinguishable label; the
+      durable artifact η re-reads is data/orchestrator/landed_outbox.json (merge_queue.py:9091).
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: skipped_parked
+      paths:
+      - orchestrator/src/orchestrator/merge_queue.py
+      expect: present
+  - name: live-claimancy-fold-usable-for-parked-statuses
+    binding: 'producer-extent-short, resolved by an OUT-OF-BATCH dependency on task
+      4623 - D7 asks for ''the same discipline _RECOVERY encodes by folding live_claimant
+      into its key''. That fold is _resolve_live_claimant (task_ground_truth.py:520),
+      whose DB-claimant leg is ''if is_stranded(...): return None'' (:576), and shared.task_claimant.is_stranded
+      returns False unconditionally when status != in-progress (:129-131). Its own
+      docstring (:547-560) states the consequence: a non-in-progress task with a crash-left
+      claimant_run_id ''is treated as LIVE here regardless of heartbeat age'', pinned
+      by test_stale_db_claimant_on_blocked_task_is_treated_as_live_by_design. This
+      leaf''s population is precisely pending/blocked/merge-deferred, so the fold
+      reports LIVE forever and B11 can never fire. is_stranded_any_status measures
+      0 in ANY .py (14 repo-wide, all docs prose) - it is task 4618, and the repoint
+      is task 4623. PARTIAL substrate that DOES exist and IS wired: shared.task_claimant.has_live_claimant
+      (:187, status-agnostic, used by _eligible_for_dispatch at scheduler.py:4934)
+      returns the correct answer for both B11 and B12 but folds the HEARTBEAT leg
+      only, not scheduler.is_actively_held or the plan.lock leg.'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: is_stranded_any_status
+      paths:
+      - orchestrator/src/orchestrator/task_ground_truth.py
+      expect: present
+  - name: train-discriminator-and-the-5488-early-return
+    binding: 'capability→producer (wired) - grep:orchestrator/src/orchestrator/harness.py:5488
+      ''if status == merge-deferred: ... return None'' in _reconcile_one_stranded,
+      documented at :5477-5480 as belt-and-suspenders on the _RECONCILE_SWEEP_STATUSES
+      filter; D5 requires it stays. metadata.train is a real, read dict (scheduler.py:2577/:2587-2588/:4409/:4426,
+      workflow.py:1486/:1825, dashboard active_tasks.py:282) with a typed shape TrainMembership
+      at git_ops.py:229. It is machine-written by the train worker and is NOT in shared/task_metadata.py''s
+      blessed-key registry - consistent, but worth noting.'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: D5 is a PRESERVATION requirement - the guard is present today, so an
+        expect:present grep is vacuous. Pinned by boundary row B10.
+  - name: recovery-disposition-site-for-the-new-writer
+    binding: capability→producer (wired) - recovery_emission.RecoverySite is the closed
+      site vocabulary (:126-149) and build_recovery_payload (:462) / emit_recovery_event
+      (:512) are the shared emitters used by five sites. This leaf adds a sixth member.
+      Unlike already_landed_gate it runs at SWEEP cadence, so per G7 storm-escape-required
+      it SHOULD join STREAK_CHARGING_SITES (:163-167) - D6's exclusion names already_landed_gate
+      only. Measured 0; control already_landed_gate = 4.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: landed_reconciler|landed_recovery_sweep
+      paths:
+      - orchestrator/src/orchestrator/recovery_emission.py
+      expect: present
+  - name: recovery-disposition-read-path-is-operator-observable
+    binding: 'capability→producer (wired) - the chain is landed and needs NO change
+      for a new site: emit_recovery_event -> EventStore (event_store.py:627, sqlite
+      at data/orchestrator/runs.db, harness.py:2228) -> MCP get_scheduler_events ->
+      dashboard/src/dashboard/data/scheduler.py:112-116 _RECOVERY_EVENT_TYPES with
+      its own 200-row budget so recovery rows cannot be starved by task_skipped. The
+      dashboard filters on event TYPE, not site, so a new RecoverySite is visible
+      with zero dashboard work.'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: already true on main - the read path the signal is observed through,
+        not something this leaf delivers
+  - name: attributed-provenance-writer-exists-and-is-wired
+    binding: 'capability→producer (wired) - grep:orchestrator/src/orchestrator/harness.py:6226
+      _mark_in_progress_done -> scheduler.mark_done(kind=''found_on_main'', ...),
+      the correct provenance kind for finding tasks already on main. It already owns
+      the StaleEvidenceRejection -> ProvenanceConflictSink path. Extent note: its
+      name and its worktree-cleanup side effects are in-progress-shaped; writing for
+      pending/merge-deferred must confirm those are correct for a task that never
+      had a live worktree.'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the observable is a get_task read showing status=done with done_provenance
+        kind='found_on_main'; pinned by B11
+  - name: corroborate-status-and-claimant-at-the-write-choke-point
+    binding: 'G7 corroborate-before-acting - D7 covers claimancy but not STATUS: the
+      pass classifies from a snapshot and then writes done. The PRD''s own D5 blames
+      a 240ms-stale get_statuses read for mis-parking task 2724, and a status-agnostic
+      pass takes far longer than 240ms. Re-read live status AND claimant immediately
+      before the write, inside the same choke point, and abort if either changed.
+      The git landing evidence is ground truth and needs no re-read; the task-store
+      state does.'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: a re-read-then-abort sequence inside a choke point is a control-flow
+        property, not a pattern
+  - name: per-tick-work-is-bounded-by-config
+    binding: capability→producer - G7 storm-escape-required. House shape is a named
+      config leaf + defaults.yaml entry (precedent stranded_reconcile_enabled / stranded_reconcile_interval_secs,
+      harness.py:2088-2096, default 900.0). The candidate set is status-agnostic (930
+      non-terminal tasks in the PRD's own sweep), so the cap must LOG what it dropped
+      and resume from a rotating cursor - never a silent truncation. Measured 0 for
+      any landed_reconcile* leaf; control stranded_reconcile_interval_secs = 1 across
+      both files.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: landed_reconcile[a-z_]*_(interval_secs|enabled|max[a-z_]*)
+      paths:
+      - orchestrator/src/orchestrator/config.py
+      - orchestrator/src/orchestrator/defaults.yaml
+      expect: present
+  - name: loop-thread-occupancy-stays-bounded
+    binding: G7 loop-thread-occupancy-bounded, BOTH limbs. Limb 1 is not the git calls
+      - GitOps already uses asyncio.create_subprocess_exec (git_ops.py:1322) and the
+      repo already uses asyncio.to_thread for blocking flock legs (:340, :365, :1705).
+      The blocking work is the synchronous filesystem and store I/O inside derive_truth
+      / _resolve_live_claimant (worktree_resolver, worktree_path.exists(), the .task-meta
+      plan.lock read, _resolve_open_escalations), which runs on the loop thread. Offload
+      per-task resolution via asyncio.to_thread. Limb 2 is the fan-out cap above.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: '''no blocking call on the loop thread'' is a whole-function property;
+        a grep for to_thread cannot prove the absence of a blocking call elsewhere'
+  - name: conflict-with-task-3539-on-the-same-population
+    binding: 'duplicate-owner, UNRESOLVED - task 3539 (pending/high) targets the same
+      landed pending/blocked/merge-deferred population from the same 930-task sweep,
+      but its remedy is adding _RECOVERY rows, which the PRD''s Sketch lists under
+      ''Explicitly not done''. Load-bearing regardless of which task survives: 3539
+      records that after a pin was genuinely lifted, ''within ~15 minutes the row
+      was status=PENDING, not done. Something re-pended it rather than recovering
+      it.'' This leaf''s writer will race that same re-pender and must identify it
+      before writing.'
+    verdict: OPEN
+    delivered_check:
+      kind: manual
+      reason: a human must rule on which task survives; the re-pender investigation
+        is this leaf's work either way
+  - name: reconciler-cadence
+    binding: leaf-owned ruling (PRD Open Question 1) - BackgroundService (background_service.py:52)
+      is registered 7 times in harness.py; the stranded sweep's registration is at
+      :2088-2096 gated on config.stranded_reconcile_enabled, with an independent-cadence
+      precedent at :2097-2100 (main-tip-sweep). Reusing it with an independent interval
+      is a two-field change.
+    verdict: OPEN
+    delivered_check:
+      kind: manual
+      reason: a cadence decision the leaf must make; the config-key check above covers
+        whichever shape it picks
+- label: θ
+  task_id: 4652
+  title: 'Integration gate: the landed-recovery boundary suite (B1-B13)'
+  note: 'Prereqs corrected at decompose: B13 belongs to task 4496 (alpha''s superseding
+    owner), not to a filed leaf, so this leaf depends on 4496 rather than alpha.'
+  capabilities:
+  - name: b1-b13-matrix-as-one-suite
+    binding: 'capability→producer - the suite IS this leaf''s deliverable and its
+      own observable signal (G2 C-as-integration-gate). Thirteen rows spanning three
+      packages: B1-B6 face δ''s producer, B7/B8 face β, B9 faces γ, B10-B12 face η,
+      B13 faces task 4496. This manifest FIXES a module identity token so the batch
+      has one mechanical handle on ''the suite exists''. Measured 0 repo-wide; control
+      validate_landing_evidence in the two test trees = 66.'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: landed_recovery_boundary
+      paths:
+      - orchestrator/tests
+      - escalation/tests
+      expect: present
+  - name: real-git-fixture-substrate
+    binding: 'capability→producer (wired) - a real-git fixture is the house pattern:
+      orchestrator/tests/test_git_ops.py:4222 is an existing real-git class for branch_content_in_main
+      and :4354 for commit_effect_present_in_main (B1/B4 shapes, including a real
+      reverted-merge at :4522 and an octopus case at :4608). The pattern is a per-file
+      COPY of git_repo(tmp_path) + _init_repo(repo) (escalation/tests/test_merge_status_git_authority.py:157/:164,
+      orchestrator/tests/_workflow_helpers.py:772, 8+ others) - there is NO shared
+      helper, only the autoused isolation guard assert_isolated_git_repo (orchestrator/tests/_orch_helpers.py:1234).
+      Reuse one, do not mint a tenth copy.'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: fixture reuse-vs-duplication is a reading judgement; the isolation guard
+        already exists and is autoused
+  - name: all-producers-are-upstream
+    binding: DAG-direction (anti-inversion) - prereqs are β, γ, ε, η in-batch plus
+      4496 out-of-batch, with this leaf as the DAG sink. No capability it asserts
+      is owned by a task that depends on it. δ and ζ reach it transitively through
+      ε and η.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: an upstream DAG edge is verified by the dependency wiring at commit_planning,
+        not by a pattern in the suite's own file
+  - name: b7-b8-need-betas-on-main-only-category-set
+    binding: capability→producer - producer:task-β upstream. Today _only_merge_remediable
+      screens against MERGE_REMEDIABLE_ESC_CATEGORIES (3 hits in harness.py) and preexisting_main_break
+      appears ZERO times in harness.py - so B7 fails today by construction and B8
+      passes vacuously. D3 requires a SECOND set consumed only by the on-main clause
+      (:5566), never the off-main one (:5596); B8 is the pin that the narrowing did
+      not become a blanket.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: preexisting_main_break
+      paths:
+      - orchestrator/src/orchestrator/harness.py
+      expect: present
+  - name: b9-needs-gammas-parked-vs-pruned-label
+    binding: 'capability→producer - producer:task-γ upstream. B9 asserts BOTH halves:
+      the row survives for merge-deferred AND a done task''s row is still consumed.
+      The distinguishable outcome label is what makes the first half assertable without
+      peeking at the JSON - today RC-3 returns one label for both.'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: skipped_parked
+      paths:
+      - orchestrator/src/orchestrator/merge_queue.py
+      expect: present
+  - name: b4-b6-reason-vocabulary-is-assertable
+    binding: 'capability→producer - producer:task-δ upstream (transitively through
+      ε). B4 asserts reason=''no_op_landing'' and B6 reason=''degenerate_branch''.
+      Measured: no_op_landing = 0 in orchestrator/tests (4 repo-wide, ALL PRD prose);
+      control effect_absent = 69 in the two test trees. degenerate_branch is partially
+      served today - branch_is_degenerate (landing_evidence.py:137) exists with 34
+      test hits - but it returns a bool, not a reason code.'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: no_op_landing
+      paths:
+      - orchestrator/tests
+      expect: present
+  - name: b13-requires-a-disposition-with-no-escalation-and-no-streak-charge
+    binding: 'capability→producer - producer:task-4496 upstream (OUT OF BATCH, replacing
+      leaf alpha). The two negative halves are already true on main and must STAY
+      true: RecoverySite.already_landed_gate is absent from STREAK_CHARGING_SITES
+      (recovery_emission.py:163-167) and the gate''s ancestry arm already argues against
+      escalating (harness.py:11676-11687). The positive half - an emitted disposition
+      carrying the decline reason - is 4496''s deliverable.'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: D6 is a double negative (no escalation, no streak charge) plus a positive
+        emission; only the suite can assert all three at once
+  - name: b11-b12-inherit-etas-live-claimancy-dependency
+    binding: DAG-direction, inherited - B12's precondition (in-progress, fresh heartbeat)
+      is handled correctly by today's fold, but B11's population (merge-deferred,
+      no train) is exactly where is_stranded's in-progress gate makes every crash-left
+      claimant read LIVE. A suite that greens B12 while B11 reds is the expected outcome
+      of shipping eta without task 4623. RESOLVED at decompose by wiring eta -> 4623;
+      this row records that theta is the task that would otherwise surface it, at
+      integration-gate cost.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: inherited; discharged by eta's out-of-batch dependency on 4623, verified
+        by the dependency wiring
