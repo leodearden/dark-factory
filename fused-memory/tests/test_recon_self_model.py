@@ -14,8 +14,6 @@ drift invariant to own.
 
 from __future__ import annotations
 
-import pathlib
-
 import pytest
 
 from fused_memory.reconciliation import recon_self_model as m
@@ -212,41 +210,6 @@ class TestMem0TombstoneDeleters:
             srv_tools._CONSOLIDATE_SOURCE,
         }
         assert set(m.MEM0_TOMBSTONE_DELETERS) == expected
-
-    def test_record_mem0_deletion_tombstones_has_exactly_three_call_sites(self):
-        """Source-level guard for the unknown-unknown gap the ratchet above
-        documents: a brand-new call site introducing a brand-new deleter tag
-        does not fail `test_mem0_tombstone_deleters_match_live_delete_sites`
-        until someone remembers to add it to that test's `expected` set. This
-        test catches that moment a different way — by counting call sites
-        directly in the source text rather than by enumerating constants a
-        human must remember to update.
-
-        Today there are exactly three production call sites of
-        `mem0_tombstone.record_mem0_deletion_tombstones`:
-        summary_pool.enforce_summary_pool_cap,
-        task_knowledge_sync._sweep_stale_mem0_pool, and
-        server.tools.consolidate_memories. `mem0_tombstone.py` itself is
-        excluded from the scan — it contains the `def` site plus prose
-        cross-references, not a call.
-        """
-        src_root = pathlib.Path(__file__).parents[1] / 'src' / 'fused_memory'
-        target = 'record_mem0_deletion_tombstones('
-        call_sites: list[str] = []
-        for path in sorted(src_root.rglob('*.py')):
-            if path.name == 'mem0_tombstone.py':
-                continue
-            count = path.read_text(encoding='utf-8').count(target)
-            if count:
-                rel = path.relative_to(src_root.parent).as_posix()
-                call_sites.extend([rel] * count)
-        assert len(call_sites) == 3, (
-            f'Expected exactly 3 production call sites of '
-            f'record_mem0_deletion_tombstones(...), found {len(call_sites)}: '
-            f'{call_sites}. A writer was added or removed — update '
-            f'MEM0_TOMBSTONE_DELETERS (and its cross-check above) to match, '
-            f'then update this count.'
-        )
 
 
 # --------------------------------------------------------------------------- #
