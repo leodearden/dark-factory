@@ -299,6 +299,15 @@ the project being swept is not the primary one. `main()` then logs the
 EFFECTIVE per-project mode, so the journal reports coverage rather than
 intent.
 
+That line names the REASON, not just the outcome, because an empty terminal-id
+set is reached four different ways and they are four different operational
+states: `--terminal-drain` not requested, the primary-project guard narrowing
+a sibling, an unconfigured/failed task backend, and a primary project that
+genuinely has zero terminal tasks. `_resolve_terminal_task_ids` therefore
+returns `(ids, mode)` and `_effective_mode_label` renders each distinctly —
+notably `terminal-drain (0 terminal task ids)` for the authoritative zero, so
+a nightly whose task store failed to open no longer reads like a healthy one.
+
 Why: the sweep resolves terminal task ids from exactly one task store, and
 `run()` matches markers against that set by **plain string membership**. Task
 ids are small integers, so a sibling project's marker whose `task_id` merely
@@ -323,20 +332,35 @@ anyway; its absence mis-firing costs records that survive nowhere.
 **not** emptiness. `build_known_projects_map` seeds its candidates with the
 primary root *before* extending with the env roots, so an unset
 `DASHBOARD_KNOWN_PROJECT_ROOTS` yields a one-entry map, never an empty one —
-an `if not project_ids` check is unreachable in exactly the degradation it
-looks like it guards. Two cases are distinguished:
+an `if not known_projects` check is unreachable in exactly the degradation it
+looks like it guards. Three cases are distinguished:
 
-- **the env var is set but names roots absent from the resolved map** — a
-  genuine degradation (typo, unreadable/moved checkout, a project_id already
-  claimed under first-wins). The missing roots are named individually.
+- **a named root that is not a directory on this host** — a typo, or a
+  moved/unmounted checkout. `Path.resolve()` is non-strict, so the builder
+  *admits* such a root under a basename-derived project_id rather than
+  skipping it: the nightly then sweeps a phantom project that enumerates 0,
+  deletes 0 and exits 0 — a silent green. Named individually.
+- **a named root whose resolved path is absent from the map** — its
+  project_id was claimed first by a root listed earlier (`first-wins`, with
+  the primary root seeded first), so that checkout is never swept. Named
+  individually.
 - **the env var is unset** — the map is primary-only, so coverage is
   single-project and the census is not fleet-wide. Reported, but *not* a hard
   failure: a legitimately single-project install would otherwise
   warn-as-error forever.
 
-The predicate compares resolved project **ids**, not root counts, because the
-live registry lists the primary root too and the builder drops it as a
-duplicate id — a count comparison would cry degradation on every healthy run.
+The predicate compares each env-named root's **resolved path** against the
+map's values — the very strings the builder stored. Not root counts: the live
+registry lists the primary root too and the builder drops it as a duplicate
+id, so a count comparison would cry degradation on every healthy run (a path
+comparison is duplicate-proof, since the repeated primary root resolves to a
+path that *is* in the map). And not resolved **ids**, which was the original
+implementation and could not fire for either cause it named: a nonexistent
+root is admitted under an id that IS in the map, and a first-wins collision
+leaves the dropped root's id in the map as the winner's. `_known_projects_map`
+returns the whole `{project_id: project_root}` map for this reason — one
+derivation, read by both consumers (`--list-known-projects` prints
+`sorted(...)` of the keys), with no second manifest read per root.
 
 ## Why no `--check` in the recurring service
 
