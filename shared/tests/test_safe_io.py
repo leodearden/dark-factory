@@ -845,7 +845,14 @@ class TestAtomicWriteRaceSafety:
 # follow-up ticket ``tkt_0RRXRQQ4MYPYZ2XSX459W29AZ6``.
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-_SRC_TREES = ('shared/src', 'orchestrator/src', 'escalation/src')
+_SRC_TREES = (
+    'shared/src',
+    'orchestrator/src',
+    'escalation/src',
+    'fused-memory/src',
+    'fused-memory/scripts',
+    'scripts',
+)
 
 # Every (module, function) in the three trees that renames a path into place,
 # with the reason it is not calling atomic_write_text.  Adding an entry is a
