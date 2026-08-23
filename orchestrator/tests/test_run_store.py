@@ -538,6 +538,49 @@ class TestSchedulerStatePersistence:
             f"proj-b's row must be untouched; got {other['ewa_value']!r}"
         )
 
+    def test_refresh_is_scoped_to_ewa_trip_rows(self, tmp_path):
+        """A non-``ewa_trip_`` row's trip-time ``ewa_value`` survives a refresh.
+
+        Task 4559 review remediation.  ``pause_scheduler``'s docstring promises
+        the trip-time snapshot is "never overwritten" for non-EWA pause
+        classes, but nothing enforced it.  The caller's step-13b guard keys on
+        the IN-MEMORY ``scheduler.pause_reason``, which is first-wins
+        (``Scheduler.pause`` keeps the ORIGINAL reason when already paused),
+        while this row is last-wins (``save_scheduler_pause`` is INSERT OR
+        REPLACE).  Those two diverge: hold an ``ewa_trip_`` halt, then let a
+        park-stop trip call ``pause_scheduler`` — an in-memory no-op that still
+        rewrites the row to reason='park-stop...'.  Memory then still reads
+        ``ewa_trip_``, so every subsequent digest step overwrote the park-stop
+        row's forensic value with the decaying live EWA.  The WHERE clause is
+        what actually enforces the documented scope; the harness-side guard is
+        a cheap pre-filter, not the sole enforcement point.
+        """
+        store = RunStore(tmp_path / 'runs.db')
+        store.start_run('run-1', 'proj-a', '2026-05-14T10:00:00+00:00')
+        store.save_scheduler_pause(
+            project_id='proj-a',
+            reason='park-stop: 5 blocked tasks',
+            pause_at_iso='2026-05-14T10:05:00+00:00',
+            set_by_run_id='run-1',
+            ewa_value=42.0,
+        )
+
+        refreshed = store.refresh_scheduler_pause_ewa('proj-a', 1.5)
+
+        assert refreshed is False, (
+            'Expected False — a park-stop row is not an ewa_trip_ row, so there '
+            'is nothing to refresh'
+        )
+        result = store.load_scheduler_pause('proj-a')
+        assert result is not None
+        assert result['ewa_value'] == pytest.approx(42.0), (
+            'A non-ewa_trip_ row carries trip-time forensic evidence about ITS '
+            f'own pause and must survive a refresh; got {result["ewa_value"]!r}'
+        )
+        assert result['reason'] == 'park-stop: 5 blocked tasks', (
+            f'reason must be untouched; got {result["reason"]!r}'
+        )
+
     def test_clear_removes_row(self, tmp_path):
         """clear_scheduler_pause causes subsequent load to return None."""
         store = RunStore(tmp_path / 'runs.db')
