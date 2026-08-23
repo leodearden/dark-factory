@@ -191,15 +191,37 @@ def _is_owner_only_session_start(hook_input: Mapping[str, Any]) -> bool:
     )
 
 
-def _env_slug_is_owned(
+def _env_slug_ownership(
     slug: str,
     hook_input: Mapping[str, Any],
     root: Path | str | None,
     *,
     env: Mapping[str, str],
     allow_remint: bool = False,
-) -> bool:
+) -> tuple[bool, bool]:
     """Is the inherited CLAUDE_SPAWN_SESSION_ID *slug* THIS session's own?
+
+    Returns ``(owned, may_bind)``. ``owned`` is the adopt/fork answer
+    documented below. ``may_bind`` is the SEPARATE question of whether this
+    event may stamp its ``session_id`` onto the adopted record, and the two
+    are deliberately not the same bit: adopting is fail-soft (it degrades to
+    the pre-task-4193 collapse-onto-one-record behaviour), but BINDING is
+    not -- a binding is permanent, so an event that adopts merely because
+    ownership could not be DISPROVED must not also claim the record. Doing
+    both is what let a nested ``claude`` capture an unbound spawn record and
+    exile its true owner one event later (task 4193 review, esc-4193-10).
+
+    So ``may_bind`` is False on exactly one shape: an inherited env slug
+    whose record carries NO binding yet AND whose ownership is merely
+    unproven (``_owner_ppid_verdict`` returns None -- a session spawned by a
+    pre-task-4193 spawn-claude.sh, every record already live on deploy day,
+    or a platform with no ``/proc`` such as macOS). There the record is left
+    OPEN for its true owner, which is precisely the "leave them unbound and
+    let the fork rule apply only to newly-spawned sessions" disposition the
+    L2 ruling (item 8) sanctions for the in-flight fleet. It is True
+    everywhere else, including every hand-launched and forked-inheritor
+    slug: those embed the stdin ``session_id`` in the slug itself, so a
+    binding there is tautological and can never mismatch.
 
     The hook stdin ``session_id`` is the only discriminator: a nested claude
     is also a descendant of the original launcher, so PID lineage cannot
@@ -243,13 +265,17 @@ def _env_slug_is_owned(
     """
     hook_session_id = _hook_session_id(hook_input)
     if not hook_session_id:
-        return True
+        # No discriminator at all, and nothing to bind either: the 'unknown'
+        # slug fallback is deliberately not a valid binding.
+        return True, True
     try:
         record = session_registry.read_record(slug, root=root)
     except FileNotFoundError:
         # No record yet: this hook event IS the slug's first sight. Its own
         # arm, above the broad one, so an ordinary fresh spawn logs nothing.
-        return True
+        # Binding still needs positive proof: an unbound slug with no record
+        # is the same open-for-its-owner shape as an unbound record.
+        return True, _owner_ppid_verdict(env) is True
     except Exception:
         # A corrupt body, an unreadable fleet root, anything: an ownership
         # probe that cannot answer must degrade to the pre-task-4193
@@ -262,16 +288,21 @@ def _env_slug_is_owned(
             slug,
             exc_info=True,
         )
-        return True
+        return True, False
     bound = (record.claude_session_id or '').strip()
     if not bound:
         # No binding yet, so the stdin session_id proves nothing: whoever
         # arrives first would otherwise capture the spawn-created record,
         # inverting ownership permanently. Fall back to the stateless
-        # owner-provenance probe, which needs no persisted field.
-        return _owner_ppid_verdict(env) is not False
+        # owner-provenance probe, which needs no persisted field. Note the
+        # asymmetry between the two bits: a merely-unproven event (verdict
+        # None) ADOPTS -- the fail-soft direction -- but does NOT bind, so
+        # the record stays open for its true owner instead of being
+        # captured by whoever happened to arrive first.
+        verdict = _owner_ppid_verdict(env)
+        return verdict is not False, verdict is True
     if bound == hook_session_id:
-        return True
+        return True, True
     # A re-mint is forgiven only when the OWNING PROCESS is the one
     # presenting it. The `source` string alone proves the emitter holds *a*
     # session, not *this* one -- and automatic compaction fires
@@ -280,7 +311,9 @@ def _env_slug_is_owned(
     # at stamp time is the discriminator: /clear and compaction happen
     # inside the owning process and keep its pid; a nested claude cannot.
     if not (allow_remint and _is_owner_only_session_start(hook_input)):
-        return False
+        # Forked onto the hand-launched keying, whose slug embeds this very
+        # session_id: binding there is tautological, never a capture.
+        return False, True
     owner_pid = record.claude_owner_pid
     current_pid = _owning_claude_pid()
     if owner_pid is None or current_pid is None:
@@ -292,8 +325,27 @@ def _env_slug_is_owned(
         # on every routine automatic compaction, a universal regression
         # strictly worse than the rare inversion it would prevent
         # (task 4193 L2 ruling item 4-ii).
-        return True
-    return owner_pid == current_pid
+        return True, True
+    return owner_pid == current_pid, True
+
+
+def _env_slug_is_owned(
+    slug: str,
+    hook_input: Mapping[str, Any],
+    root: Path | str | None,
+    *,
+    env: Mapping[str, str],
+    allow_remint: bool = False,
+) -> bool:
+    """Adopt-or-fork half of ``_env_slug_ownership`` -- see its docstring.
+
+    Kept as the narrow, boolean question for callers that only need the
+    identity decision; the binding decision travels separately, through
+    ``_resolve_hook_slug``.
+    """
+    return _env_slug_ownership(
+        slug, hook_input, root, env=env, allow_remint=allow_remint
+    )[0]
 
 
 def _resolve_hook_slug(
@@ -302,8 +354,8 @@ def _resolve_hook_slug(
     root: Path | str | None,
     *,
     allow_remint: bool = False,
-) -> tuple[str, str | None]:
-    """Resolve ``(slug, rejected_env_slug)`` for one hook event.
+) -> tuple[str, str | None, bool]:
+    """Resolve ``(slug, rejected_env_slug, may_bind)`` for one hook event.
 
     ``slug`` is exactly what ``hook_session_slug`` returns -- see its
     docstring for the adoption / fall-through contract.
@@ -321,7 +373,14 @@ def _resolve_hook_slug(
     session, so it must not be copied onto the new record wholesale --
     ``run_session_start`` uses this bit to tell the two apart.
 
-    *allow_remint* is forwarded to ``_env_slug_is_owned``; SessionStart is
+    ``may_bind`` is ``_env_slug_ownership``'s second bit: whether this event
+    is allowed to stamp its ``session_id`` onto the record the slug resolves
+    to. It is False only for an adopted-but-unproven inherited env slug --
+    adoption is fail-soft, a permanent binding is not (see that function's
+    docstring). Callers that would bind must honour it; callers that only
+    need an identity can ignore it.
+
+    *allow_remint* is forwarded to ``_env_slug_ownership``; SessionStart is
     the only caller that sets it.
     """
     spawn_session_id = (env.get('CLAUDE_SPAWN_SESSION_ID') or '').strip() or None
@@ -331,10 +390,11 @@ def _resolve_hook_slug(
         # (task 4112) intact, and means an adversarial env token can no more
         # escape sessions_dir when READ than when written.
         candidate = session_registry.sanitize_slug(spawn_session_id)
-        if _env_slug_is_owned(
+        owned, may_bind = _env_slug_ownership(
             candidate, hook_input, root, env=env, allow_remint=allow_remint
-        ):
-            return candidate, None
+        )
+        if owned:
+            return candidate, None, may_bind
         rejected = candidate
 
     identity = resolve_hook_identity(hook_input, env)
@@ -349,7 +409,8 @@ def _resolve_hook_slug(
         identity.task_id,
         session_id,  # type: ignore[arg-type]
     )
-    return slug, rejected
+    # This slug embeds session_id itself, so binding it is tautological.
+    return slug, rejected, True
 
 
 def hook_session_slug(
@@ -399,8 +460,9 @@ def hook_session_slug(
     the record instead of forking -- see ``_env_slug_is_owned``.
 
     Thin wrapper over ``_resolve_hook_slug``, which additionally reports
-    WHETHER an inherited env slug was rejected; callers that enrich a record
-    need that bit, callers that only need an identity do not.
+    WHETHER an inherited env slug was rejected and whether this event may
+    BIND the record it resolved to; callers that enrich or bind a record
+    need those bits, callers that only need an identity do not.
     """
     return _resolve_hook_slug(hook_input, env, root, allow_remint=allow_remint)[0]
 
@@ -855,8 +917,11 @@ def run_session_start(
     (no CLAUDE_SPAWN_SESSION_ID) are unaffected -- they still key on
     session_id exactly as before.
 
-    Ownership binding (task 4193): the first hook event to adopt a slug
-    also stamps its own Claude Code ``session_id`` into
+    Ownership binding (task 4193): the first hook event to adopt a slug AND
+    positively prove its ownership (``_env_slug_ownership``'s ``may_bind``
+    bit -- an adopted-but-unproven event refreshes the record without
+    claiming it, leaving it open for its true owner) also stamps its own
+    Claude Code ``session_id`` into
     ``record.claude_session_id`` (see ``_bind_claude_session_id``), folded
     into the single ``write_record`` below. The binding is never overwritten
     afterwards -- bind-once is what makes it a stable discriminator between
@@ -880,7 +945,9 @@ def run_session_start(
     ``_nested_claude_liveness_pid`` so the forked record stays reapable.
     """
     identity = resolve_hook_identity(hook_input, env)
-    slug, forked_from = _resolve_hook_slug(hook_input, env, root, allow_remint=True)
+    slug, forked_from, may_bind = _resolve_hook_slug(
+        hook_input, env, root, allow_remint=True
+    )
     try:
         record = session_registry.read_record(slug, root=root)
     except FileNotFoundError:
@@ -921,9 +988,16 @@ def run_session_start(
     if display is not None:
         record.display = display
     # This path always writes, so the return value is deliberately ignored.
-    _bind_claude_session_id(
-        record, hook_input, allow_rebind=_is_owner_only_session_start(hook_input)
-    )
+    # `may_bind` is the guard, not `forked_from`: an adopted-but-UNPROVEN
+    # inherited slug must refresh the record it adopted without CLAIMING it
+    # (see `_env_slug_ownership`), or a nested claude captures the
+    # spawn-created record permanently and exiles the owner on its next
+    # event -- the inversion task 2511 fixed, re-introduced from the other
+    # side (esc-4193-10).
+    if may_bind:
+        _bind_claude_session_id(
+            record, hook_input, allow_rebind=_is_owner_only_session_start(hook_input)
+        )
     session_registry.write_record(record, root=root)
     return record
 
@@ -1109,7 +1183,7 @@ def _run_status_refresh_and_retitle(
     merely slow -- trading a rare stale status for a routine wrong one.
     """
     identity = resolve_hook_identity(hook_input, env)
-    slug = hook_session_slug(hook_input, env, root=root)
+    slug, _rejected, may_bind = _resolve_hook_slug(hook_input, env, root)
     prior = _prior_record_or_none(slug, root)
     # Decide the launch window BEFORE the refresh: refresh_record is a
     # read-modify-WRITE, so passing the status here at all would already have
@@ -1123,7 +1197,11 @@ def _run_status_refresh_and_retitle(
     )
     # Bind on the record refresh_record RETURNED (post-status-flip), and write
     # after both mutations, so status, question and binding land atomically.
-    bound = not in_launch_window and _bind_claude_session_id(record, hook_input)
+    bound = (
+        not in_launch_window
+        and may_bind
+        and _bind_claude_session_id(record, hook_input)
+    )
     stamp_question = question is not None and not in_launch_window
     if stamp_question:
         record.question = question

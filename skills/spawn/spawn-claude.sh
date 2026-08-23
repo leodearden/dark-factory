@@ -211,9 +211,16 @@ fi
 # only addition here.
 #
 #   1. ONCE THE RECORD IS BOUND -- the stdin session_id. The first hook
-#      event to adopt a slug binds its own Claude Code session_id into
+#      event to adopt a slug AND prove its ownership (via discriminator 2)
+#      binds its own Claude Code session_id into
 #      record.claude_session_id (orchestrator/session_hooks.py,
-#      _bind_claude_session_id), and any later hook arriving with a
+#      _bind_claude_session_id). Adoption alone is deliberately not enough:
+#      adopting is fail-soft, but a binding is permanent, so an event whose
+#      ownership is merely UNPROVEN (a session spawned before this script
+#      exported OWNER_PPID, every record already live on deploy day, or a
+#      platform with no /proc such as macOS) adopts the record WITHOUT
+#      claiming it -- leaving it open for its true owner instead of letting
+#      a nested claude capture it. Any later hook arriving with a
 #      DIFFERENT stdin session_id is recognised as an inheritor-not-owner:
 #      hook_session_slug falls through to the hand-launched
 #      build_session_slug keying, so that nested claude gets its OWN record
