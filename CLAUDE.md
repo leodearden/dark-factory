@@ -95,6 +95,27 @@ That prints `<venv>/lib/python3.13/site-packages/uvicorn` in ~0.4s (measured
 default `timeout` and returned nothing (exit 143). That `timeout` can be raised,
 but raising it is the wrong fix: the scoped query above is ~300x faster.
 
+Third-party packages resolve under `<venv>/lib/python3.X/site-packages/`.
+First-party workspace members do NOT: they are installed **editable**, so they
+resolve into a checkout's `src/` tree instead. WHICH checkout is the question
+that matters — from a worktree shell that inherited main's `VIRTUAL_ENV`,
+`import <member>` hands you MAIN's source, not the code you just edited in your
+worktree. That is the mechanism behind the `OPERATIONS.md` Troubleshooting row
+for a task blocking at VERIFY with an `AttributeError` for code it just wrote.
+
+<!-- import-provenance-check:begin
+     Also EXECUTED verbatim by
+     tests/scripts/test_package_source_lookup_convention.py, which asserts the
+     INVERSE of the check above: this one must resolve into a checkout's `src/`
+     tree, never under `site-packages`. -->
+- **First-party import provenance**: `python -c 'import shared; print(shared.__file__)'`
+<!-- import-provenance-check:end -->
+
+Any workspace member works; `shared` is used because it is the one member every
+`uv run --project shared` environment installs. A cold-verified worktree
+resolves to its OWN tree, an un-synced one to the main checkout — both are
+correct, and knowing which you are in is the whole point of asking.
+
 ## Memory Usage
 
 ### When to read memory
