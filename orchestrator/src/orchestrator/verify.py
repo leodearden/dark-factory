@@ -3957,7 +3957,13 @@ async def _run_cmd(
     # venv/uv activation vars + the venv bin dir from PATH, sets
     # PYTHONUNBUFFERED, and reapplies the caller overlay (`env`) LAST so reify's
     # RUSTC_WRAPPER/CARGO_*/jobserver vars and DF_VERIFY_ROLE always win.
-    subprocess_env: dict[str, str] = _target_subprocess_env(env)
+    # `cwd` doubles as the ruff-cache anchor (task 3922): for the lint leg it is
+    # the worktree ROOT verbatim, so <cwd>/.ruff_cache terminates ruff's cache
+    # walk-up at the worktree boundary instead of letting it escape into the
+    # parent checkout's shared .ruff_cache.  Both spawn branches below read this
+    # same dict, so the one thread-through covers systemd-run --scope and the
+    # plain create_subprocess_shell path alike.
+    subprocess_env: dict[str, str] = _target_subprocess_env(env, worktree=cwd)
 
     proc = None
     pgid: int | None = None
