@@ -566,20 +566,36 @@ def test_anchor_crosscheck_skips_a_marked_negative_anchor() -> None:
 #   * `\` continuation inside `#`-prefixed comment lines in a fenced block;
 #   * a prose SOFT-WRAP with NO `\` at all, inside an inline-backtick span.
 # A first prototype that joined only on `\` silently under-reported 6 of the 7
-# real sites, missing the soft-wrapped one. So this FLATTENS — newline +
-# markdown indent + optional `#` prefix + optional trailing `\` collapse to a
-# single space — mirroring the collapse `_provenance_literals` already does
-# for multi-line payloads. The `[ \t]+` after the newline is what keeps some
-# structure: a line starting at column 0 is never joined to the one above.
-_JOIN_RE = re.compile(r"[ \t]*\\?\n[ \t]+(?:#[ \t]*)?")
+# real sites, missing the soft-wrapped one. So this FLATTENS — mirroring the
+# collapse `_provenance_literals` already does for multi-line payloads — under
+# two rules that are deliberately NOT the same rule:
+#   1. A trailing `\` is a SHELL line continuation, so it joins unconditionally,
+#      whatever the next line's prefix. This matters because the runbook's two
+#      fenced ancestry blocks comment at different depths — one at `  #`, one at
+#      `#` in column 0 — and a rule that demanded an indent would silently stop
+#      recognising a wrapped command in the column-0 block.
+#   2. A soft-wrap with no `\` joins only when the next line is INDENTED. That
+#      is what keeps some structure in the flattened document: an unindented
+#      line is never joined to the one above, so a match cannot wander across a
+#      paragraph boundary.
+_JOIN_RE = re.compile(
+    r"[ \t]*\\\n[ \t]*(?:#[ \t]*)?"  # rule 1: explicit shell continuation
+    r"|[ \t]*\n[ \t]+(?:#[ \t]*)?"  # rule 2: indented soft-wrap
+)
 
 # A git invocation that EMITS a commit SHA: an explicit `--format=%H`, or a
-# bare `git rev-list` (which prints SHAs by default). Bounded repetition, and
+# `git rev-list` (which prints SHAs by default). Bounded repetition, and
 # `` ` ``/newline excluded, so a match can never run away across the flattened
 # document and swallow unrelated text into "the command".
+#
+# The rev-list arm requires WHITESPACE-THEN-ARGUMENTS, which is what keeps a
+# bare prose mention of `` `git rev-list` `` — the doc explains what the
+# command does before showing it — from being read as a derivation and failing
+# as "unscoped". A zero-argument `git rev-list` derives nothing (it is an error
+# at the shell); only an invocation carrying arguments can be scoped or not.
 _SHA_DERIVATION_RE = re.compile(
     r"git\s+(?:log|rev-list|rev-parse)\b[^`\n]{0,400}?--format=%H"
-    r"|git\s+rev-list\b[^`\n|;]{0,200}"
+    r"|git\s+rev-list\b[ \t]+[^`\n|;]{0,200}"
 )
 
 # The two forms that make a derivation THIS task's. Either the exact-subject
@@ -830,11 +846,22 @@ def test_derivation_scan_joins_a_backslash_continuation_in_a_fenced_block() -> N
     assert _is_task_scoped(found[0].command)
 
 
-def test_derivation_scan_joins_a_commented_continuation_in_a_fenced_block() -> None:
-    """Wrapping style 2 of 3 — `\\` continuation across `#`-prefixed lines."""
+@pytest.mark.parametrize("comment_indent", ["  ", ""], ids=["indented", "column-0"])
+def test_derivation_scan_joins_a_commented_continuation_in_a_fenced_block(
+    comment_indent: str,
+) -> None:
+    """Wrapping style 2 of 3 — `\\` continuation across `#`-prefixed lines.
+
+    Run at BOTH comment depths the runbook actually uses: the `unknown`-poll
+    ancestry block comments at `  #`, the `merge_cancel` one at `#` in column
+    0. A join rule that demanded an indent would recognise the first and
+    silently miss the second — and "silently miss" here means an unscoped
+    derivation slips past the guard entirely.
+    """
     found = _fixture_derivations(
-        '  #     git log main --fixed-strings --grep="Merge task/<TASK_ID> into main" \\\n'
-        "  #         --max-count=1 --format=%H\n"
+        f'{comment_indent}#     git log main --fixed-strings '
+        f'--grep="Merge task/<TASK_ID> into main" \\\n'
+        f"{comment_indent}#         --max-count=1 --format=%H\n"
     )
     assert [d.command for d in found] == [
         'git log main --fixed-strings --grep="Merge task/<TASK_ID> into main" '
@@ -897,6 +924,28 @@ def test_derivation_scan_ignores_git_commands_that_emit_no_sha() -> None:
         )
         == []
     )
+
+
+def test_derivation_scan_ignores_a_bare_command_name_mentioned_in_prose() -> None:
+    """Naming a command is not deriving with it.
+
+    The runbook explains what the ancestry-path fallback does — "`git rev-list`
+    lists newest-first" — right beside the invocation. A zero-argument mention
+    carries no task argument by construction and derives nothing, so reading it
+    as a derivation would fail the doc for explaining itself.
+    """
+    assert (
+        _fixture_derivations(
+            "`git rev-list` lists newest-first, and `--ancestry-path` excludes "
+            "commits reachable from the branch.\n"
+        )
+        == []
+    )
+    # An invocation that DOES carry arguments is still caught, scoped or not —
+    # so it is the absence of arguments doing the work here, not the wording.
+    unscoped = _fixture_derivations("Run `git rev-list --merges main | head -1`.\n")
+    assert len(unscoped) == 1
+    assert not _is_task_scoped(unscoped[0].command)
 
 
 def test_flatten_offsets_map_every_character_back_to_the_original() -> None:
