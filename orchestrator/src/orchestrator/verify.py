@@ -3709,13 +3709,13 @@ def _target_subprocess_env(
 # second line.  Matched by PREFIX, never by line index — ruff is free to add a
 # preamble line and an index match would then silently read the wrong thing.
 #
-# SECOND PARSER OF THE SAME OUTPUT: ``_show_settings_field`` in
-# tests/scripts/test_worktree_ruff_config_boundary.py reads these same
-# ``--show-settings`` lines with its own copy of the prefixes (that directory
-# verifies without the orchestrator package on sys.path, so it cannot import
-# this one).  If ruff renames or reformats the lines, BOTH sites need the edit:
-# this one degrades to silence, that one fails loudly, and neither points at
-# the other unless this comment says so.
+# SECOND READER OF THE SAME OUTPUT: ``_show_settings_field`` in
+# tests/scripts/test_worktree_ruff_config_boundary.py parses these same
+# ``--show-settings`` lines.  It IMPORTS the constant below rather than copying
+# it, precisely because the two sites fail differently when ruff reformats its
+# output — this one degrades to silence (a diagnostic that stops diagnosing),
+# that one fails loudly — so a divergent copy could sit unnoticed.  Renaming
+# this constant is therefore safe; changing its VALUE moves both readers.
 _RUFF_SETTINGS_PATH_PREFIX = 'Settings path:'
 _RUFF_PROBE_TIMEOUT_S = 20.0
 # Bound on the fallback probe-target search (below).  A cap, not a tuning knob:

@@ -36,9 +36,7 @@ that motivated the task.
 WHY HERE AND NOT IN ``orchestrator/tests/``. ``tests/scripts/`` carries its own
 module config (``tests/scripts/orchestrator.yaml``) with
 ``merge_verify_breadth: full``, so this guard actually runs on the merge gate
-rather than only when the orchestrator package is in scope. That placement is
-also why nothing here imports ``orchestrator`` — the package is not on sys.path
-for this directory's verify, hence the duplicated output parser flagged below.
+rather than only when the orchestrator package is in scope.
 
 COST. Exactly five ruff subprocesses for the whole module, computed once in a
 module-scoped fixture — this directory is a merge gate.
@@ -51,6 +49,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from orchestrator.verify import _RUFF_SETTINGS_PATH_PREFIX
 
 _MEMBER_SELECT = '["E", "F", "UP", "B", "SIM", "I"]'
 
@@ -59,17 +58,17 @@ _MEMBER_SELECT = '["E", "F", "UP", "B", "SIM", "I"]'
 # sets distinguishable: a probe emitting only F-codes could not tell them apart.
 _PROBE_SOURCE = 'import sys\nimport os\n\nprint(os.getcwd())\n'
 
-# SECOND PARSER OF THE SAME OUTPUT — read this before editing either copy.
-# orchestrator/src/orchestrator/verify.py parses these same `--show-settings`
-# lines in `_ruff_settings_path`, keyed on its own `_RUFF_SETTINGS_PATH_PREFIX`.
-# The duplication is forced: this directory verifies without the orchestrator
-# package on sys.path (see the module docstring), so it cannot import that
-# constant. If ruff ever renames or reformats these lines, BOTH sites need the
-# edit — and they fail DIFFERENTLY, which is the trap: the production parser
-# degrades to silence (a diagnostic that stops diagnosing) while this guard
-# fails loudly in another file, giving whoever fixes one no signal the other
-# exists. Hence this comment, and its mirror in verify.py.
-_SETTINGS_PATH_PREFIX = 'Settings path:'
+# SAME OUTPUT, PARSED IN TWO PLACES — so the settings-path prefix is IMPORTED
+# from production rather than copied. verify._ruff_settings_path reads these
+# same `--show-settings` lines for the escape diagnostic; if ruff renames or
+# reformats them the two sites fail DIFFERENTLY (production degrades to
+# silence — a diagnostic that stops diagnosing — while this guard fails
+# loudly), so a private copy here would let whoever fixes one never learn the
+# other exists. Importing makes that impossible: this file measures the real
+# constant. (`tests/scripts/` can import orchestrator — the uv workspace puts
+# every member on sys.path; test_fallback_verify_config.py does the same.)
+# _CACHE_DIR_PREFIX has no production counterpart: only this guard reads it.
+_SETTINGS_PATH_PREFIX = _RUFF_SETTINGS_PATH_PREFIX
 _CACHE_DIR_PREFIX = 'cache_dir ='
 
 
