@@ -3643,7 +3643,11 @@ def _strip_venv_bin_from_path(path: str | None, venv: str | None) -> str | None:
     return os.pathsep.join(kept)
 
 
-def _target_subprocess_env(extra: dict[str, str] | None) -> dict[str, str]:
+def _target_subprocess_env(
+    extra: dict[str, str] | None,
+    *,
+    worktree: Path | None = None,
+) -> dict[str, str]:
     """Build the subprocess env for a TARGET project's verify/build/test spawn.
 
     Starts from ``os.environ`` minus the orchestrator's own venv/uv activation
@@ -3657,6 +3661,22 @@ def _target_subprocess_env(extra: dict[str, str] | None) -> dict[str, str]:
     ``DF_VERIFY_ROLE`` plus reify's ``RUSTC_WRAPPER`` / ``CARGO_*`` / jobserver
     vars) LAST, so target-supplied vars always win — an ``ORCH_*`` var a caller
     intentionally injects therefore survives the scrub.
+
+    When *worktree* is given, also injects ``RUFF_CACHE_DIR=<worktree>/.ruff_cache``
+    so ruff's cache resolution TERMINATES at the worktree boundary (task 3922).
+    This is the SAME cross-checkout-coupling class as the ghost-venv scrub
+    above: ruff resolves both its config and its cache by walking parent dirs
+    up from each linted file, so a task worktree whose own root declares no
+    ``[tool.ruff]`` walks out into the PARENT checkout and shares the parent's
+    ``.ruff_cache`` with every concurrently-verifying sibling — coupling a
+    merge gate to another checkout's UNCOMMITTED working tree.  Measured on
+    ruff 0.15.9 in exactly that geometry, ``RUFF_CACHE_DIR`` redirects
+    ``cache_dir`` while leaving the resolved ``Settings path`` and the emitted
+    rule codes byte-identical; that rule-neutrality is what makes it safe to
+    apply unconditionally, at any branch base age.  (A ``--config`` pin is NOT:
+    aimed at a pyproject declaring no ``[tool.ruff]`` it silently falls back to
+    ruff's built-in defaults — a false green.  See pyproject.toml's
+    ``[tool.ruff]`` decision block.)
     """
     venv = os.environ.get('VIRTUAL_ENV')
     env = {
@@ -3668,6 +3688,8 @@ def _target_subprocess_env(extra: dict[str, str] | None) -> dict[str, str]:
     if stripped_path is not None:
         env['PATH'] = stripped_path
     env['PYTHONUNBUFFERED'] = '1'
+    if worktree is not None:
+        env['RUFF_CACHE_DIR'] = str(Path(worktree) / '.ruff_cache')
     if extra:
         env.update(extra)
     return env
