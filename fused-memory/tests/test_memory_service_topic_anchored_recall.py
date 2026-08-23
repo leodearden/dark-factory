@@ -515,6 +515,40 @@ class TestTopicPinFailOpenAndGating:
             )
 
     @pytest.mark.asyncio
+    async def test_malformed_scrolled_category_degrades_rather_than_raising(self, service):
+        """A MALFORMED PAYLOAD IS NOT A WIRING BUG — and must not be routed as one.
+
+        The scroll returns FULL raw Qdrant payloads with no read-time schema
+        enforcement, so an unhashable ``category`` (a list here) is reachable.
+        ``x in some_set`` evaluates ``hash(x)``, so an unguarded membership test
+        raises ``TypeError`` — which the band directly above deliberately
+        RE-RAISES.  One malformed record would therefore hard-fail every
+        category-scoped search in the system.
+
+        And not only reads: this exact call shape IS the near-duplicate guard's
+        pre-check (server/tools.py:3090-3096), which calls MemoryService.search
+        DIRECTLY, and whose own band re-raises TypeError identically at
+        tools.py:3102 — so the raise would have blocked every
+        procedural_knowledge WRITE on that topic too.
+
+        Deliberately asserts NO warning: the correct fix makes the selector
+        DEGRADE (return None), so the pin is skipped exactly as it is for any
+        other non-canonical scroll row.  The fail-open band is not the mechanism
+        here, and pinning a log line would freeze the wrong contract.
+        """
+        malformed = _canonical_payload()
+        malformed['metadata']['category'] = ['procedural_knowledge']
+        _seed(service, scroll=[malformed])
+
+        results = await service.search(
+            query=_QUERY, project_id=_PROJECT_ID,
+            categories=['procedural_knowledge'], stores=['mem0'], limit=5,
+        )
+
+        assert [r.id for r in results] == [f'sibling-{n}' for n in range(1, 6)]
+        assert not any(r.topic_anchored for r in results)
+
+    @pytest.mark.asyncio
     async def test_kill_switch_disables_the_lookup_entirely(self, service):
         """reconciliation.topic_anchored_recall_enabled=False => no I/O, no change."""
         _seed(service)

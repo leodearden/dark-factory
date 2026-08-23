@@ -9,6 +9,7 @@ composition proof lives in ``tests/server/test_topic_anchored_recall_mcp.py``.
 from __future__ import annotations
 
 import types
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 from fused_memory.models.enums import MemoryCategory, SourceStore
@@ -395,6 +396,85 @@ class TestSelectCanonicalPayload:
                                             include_planned=False)
 
         assert selected is not None and selected['id'] == 'c1'
+
+    def test_unhashable_category_under_a_scope_degrades_instead_of_raising(self):
+        """`x in some_set` evaluates hash(x) — an unhashable payload value RAISES.
+
+        The metadata here is a FULL raw Qdrant payload with no read-time schema
+        enforcement, so a list/dict under the ``category`` key is reachable.  A
+        raise is not a fail-open at this seam: MemoryService.search's band is
+        ``except (TypeError, AttributeError, NameError): raise``, and the
+        near-duplicate pre-check at server/tools.py:3102 re-raises identically —
+        so ONE malformed record would hard-fail every category-scoped search
+        AND every procedural_knowledge write on that topic.
+
+        ``test_malformed_payloads_degrade_to_not_canonical`` misses this because
+        it only ever passes ``allowed_categories=None``, which short-circuits
+        the membership test before it can hash anything.
+        """
+        for unhashable in (['procedural_knowledge'], {'name': 'procedural_knowledge'}):
+            payloads = [_payload('c1', category=unhashable)]
+
+            assert select_canonical_payload(
+                payloads,
+                allowed_categories={'procedural_knowledge'},
+                include_planned=False,
+            ) is None, f'{unhashable!r} must degrade, not raise'
+
+    def test_hashable_non_str_categories_are_excluded(self):
+        """allowed_categories holds category STRINGS, so a non-str never matches.
+
+        ``True`` is called out deliberately: ``True == 1`` in Python, so a
+        truthiness- or equality-based guard could admit it.  Exclusion — never
+        admission — is the only safe degradation, since allowed_categories is a
+        NARROWING the caller asked for.
+        """
+        for non_str in (1, None, True):
+            payloads = [_payload('c1', category=non_str)]
+
+            assert select_canonical_payload(
+                payloads,
+                allowed_categories={'procedural_knowledge'},
+                include_planned=False,
+            ) is None, f'{non_str!r} must not read as an allowed category'
+
+    def test_unhashable_category_does_not_shadow_a_real_canonical(self):
+        """NO-SHADOW: the guard degrades the junk row only, never the real one.
+
+        Mirrors ``test_malformed_payloads_do_not_shadow_a_real_canonical`` for
+        the scoped path — a fix that bailed out of the whole selection on the
+        first unreadable category would silently suppress a canonical the
+        caller is entitled to.
+        """
+        payloads = [
+            _payload('junk', category=['procedural_knowledge']),
+            _payload('c1', category='procedural_knowledge'),
+        ]
+
+        selected = select_canonical_payload(
+            payloads,
+            allowed_categories={'procedural_knowledge'},
+            include_planned=False,
+        )
+
+        assert selected is not None and selected['id'] == 'c1'
+
+    def test_non_list_payloads_argument_degrades_instead_of_raising(self):
+        """The ARGUMENT is guarded too, not just the payload metadata.
+
+        ``get_memories_by_metadata`` is declared to return a list, but the
+        docstring's "raises nothing on malformed input" promise is only
+        checkable if a non-list argument degrades as well; ``None`` currently
+        raises ``TypeError: 'NoneType' object is not iterable`` straight through
+        the caller's re-raising band.  Typed ``Any`` on purpose — passing a
+        wrongly-typed argument IS the scenario under test.
+        """
+        malformed_args: list[Any] = [None, {'id': 'c1', 'metadata': {'canonical': True}}]
+
+        for arg in malformed_args:
+            assert select_canonical_payload(
+                arg, allowed_categories=None, include_planned=False
+            ) is None, f'{arg!r} must degrade, not raise'
 
 
 def _memory_service_with_reconciliation(**leaves: object) -> types.SimpleNamespace:
