@@ -1485,22 +1485,179 @@ class TestRunInflightVerifyChainRedirect:
     async def test_note_chain_outcome_is_silent_when_the_verify_raises(
         self, git_repo: Path, monkeypatch,
     ):
-        """An infra error is NOT a tip verdict, so it must not halve the state.
+        """An infra error is NOT a tip verdict, and NOT the item's fault either.
 
         Halving off a RuntimeError would walk the policy down to the d=1 floor
-        on repeated infra noise and silently disable deep merge-ahead.
+        on repeated infra noise and silently disable deep merge-ahead — the
+        two original assertions here.
+
+        REVIEW FIX 3 adds the other half.  The verify ran against ``chain.tip``
+        — a CUMULATIVE tree containing this item PLUS every chained successor's
+        content — so an error raised out of it is no more attributable to this
+        item than a tip PASS is.  γ's soundness fence at the non-adopting exit
+        only guarded the pass/fail return path, so the argument held in the
+        green direction and failed in the red one: a chain-caused
+        ``Verification error:`` terminally blocked a request whose own subset
+        tree was never even run.
         """
+        from orchestrator.merge_types import InflightStatus
+        from orchestrator.warm_lane_pool import LaneState
+
         _git_ops, worker, item, chain, _head = await self._fixture(git_repo)
+        store = _CapturingEventStore()
+        worker._event_store = store
         _spy_post_merge_verify(monkeypatch, raises=RuntimeError('verify exploded'))
+        released = _spy_chain_lane_release(monkeypatch)
         noted: list[tuple] = []
         monkeypatch.setattr(
             worker, '_note_chain_outcome', lambda p, d: noted.append((p, d)),
         )
 
-        await worker._run_inflight_verify(item, _local_lease(), chain=chain)
+        res = await worker._run_inflight_verify(item, _local_lease(), chain=chain)
 
+        # PRESERVED: an infra error is not a tip verdict.
         assert noted == []
         assert worker._chain_halving_state is None
+        # NEW: it is not a resolution either — it is a defer.
+        assert not item.request.result.done(), (
+            'a chain-arm error must not resolve the dispatching item: the tree '
+            'that blew up was not its own'
+        )
+        assert res.status is InflightStatus.REQUEUED
+        assert res.outcome is None, 'a defer renders no MergeOutcome at all'
+        assert worker._queue.qsize() == 1
+        assert worker._queue.get_nowait() is item.request
+        # ...and therefore never feeds workflow.py's consecutive_merge_thrash
+        # ladder, the same boundary row the pass/fail arms already honour.
+        assert store.events_of(EventType.merge_attempt) == []
+        # The lane release lives in the `finally`, so this already holds —
+        # asserted so the new early return cannot regress it.
+        assert released == [(chain.lane, chain.lane_warm)], 'exactly one release'
+        assert _lane_states(_git_ops) == [LaneState.FREE, LaneState.FREE]
+        assert worker.worktree_ledger_violations(grace_secs=0.0) == []
+        assert worker.speculation_accounting_violations() == []
+
+    async def test_a_chain_arm_error_suppresses_the_next_chain_for_that_task(
+        self, git_repo: Path, monkeypatch,
+    ):
+        """THE LOOP GUARD: a requeue that rebuilt the same chain would spin.
+
+        The requeue above sends the item straight back for re-dispatch.  If the
+        next dispatch built the SAME chain and hit the SAME error, nothing would
+        ever converge — so after a chain-arm error the next placement for that
+        task declines, and the re-dispatch verifies the item's OWN subset tree,
+        which is the tree whose verdict is actually attributable to it.
+
+        Declines at ZERO cost: no ``build_chain`` call at all.
+        """
+        _git_ops, worker, item, chain, _head = await self._fixture(git_repo)
+        _spy_post_merge_verify(monkeypatch, raises=RuntimeError('verify exploded'))
+
+        await worker._run_inflight_verify(item, _local_lease(), chain=chain)
+
+        built = _spy_build_chain(monkeypatch, passthrough=True)
+        assert await worker._deep_chain_placement(item) is None
+        assert built == [], 'a suppressed task must not pay for a build at all'
+
+    async def test_chain_suppression_is_one_shot_and_self_clearing(
+        self, git_repo: Path, monkeypatch,
+    ):
+        """One bad round must not disable deep merge-ahead for the task forever.
+
+        The counter is popped at the existing unconditional "the verify
+        returned a result at all" reset site, so a single infra blip costs
+        exactly one non-chained round.
+        """
+        _git_ops, worker, item, chain, _head = await self._fixture(git_repo)
+        _spy_post_merge_verify(monkeypatch, raises=RuntimeError('verify exploded'))
+        await worker._run_inflight_verify(item, _local_lease(), chain=chain)
+
+        # The re-dispatch: no chain (suppressed), and the verify returns
+        # normally this time — which is what clears the suppression.
+        posted = _spy_post_merge_verify(monkeypatch, outcome=None)
+        res = await worker._run_inflight_verify(item, _local_lease())
+        assert len(posted) == 1, 'the ordinary arm ran'
+        if res.merge_wt is not None:
+            await worker._release_or_cleanup(res.merge_wt, spec_warm=res.spec_warm)
+
+        built = _spy_build_chain(monkeypatch, passthrough=True)
+        again = await worker._deep_chain_placement(item)
+        assert len(built) == 1, 'chaining is re-enabled after a clean round'
+        assert again is not None
+        await merge_liveness.release_chain_build_lane(
+            _git_ops, again.lane, warm=again.lane_warm,
+        )
+
+    async def test_repeated_chain_arm_errors_resolve_terminally_at_the_cap(
+        self, git_repo: Path, monkeypatch,
+    ):
+        """An unbounded defer is its own wedge — the ping-pong must terminate.
+
+        ``MAX_CHAIN_VERIFY_ERRORS`` is monkeypatched small, following the
+        ``MAX_INFLIGHT_DEAD_VERIFY_ABORTS`` convention.  Seeded one below the
+        cap so this call is the repeat, not the first offence.
+        """
+        from orchestrator.merge_types import InflightStatus
+
+        _git_ops, worker, item, chain, _head = await self._fixture(git_repo)
+        monkeypatch.setattr(
+            type(worker), 'MAX_CHAIN_VERIFY_ERRORS', 2, raising=False,
+        )
+        monkeypatch.setattr(
+            worker, '_chain_verify_errors', {item.request.task_id: 1}, raising=False,
+        )
+        _spy_post_merge_verify(monkeypatch, raises=RuntimeError('verify exploded'))
+
+        res = await worker._run_inflight_verify(item, _local_lease(), chain=chain)
+
+        assert item.request.result.done(), 'at the cap the defer must terminate'
+        outcome = item.request.result.result()
+        assert outcome.status == 'blocked'
+        assert outcome.reason.startswith('Verification error:')
+        assert res.status is not InflightStatus.REQUEUED
+        assert worker._queue.qsize() == 0, 'a capped exit does not requeue'
+
+    async def test_the_chain_error_counter_starts_empty_on_a_fresh_worker(
+        self, git_repo: Path,
+    ):
+        """The state exists and is empty at construction (no stale suppression)."""
+        git_ops = _make_git_ops(git_repo, size=2)
+        worker = _make_worker(git_ops)
+
+        assert worker._chain_verify_errors == {}
+        assert isinstance(type(worker).MAX_CHAIN_VERIFY_ERRORS, int)
+        assert type(worker).MAX_CHAIN_VERIFY_ERRORS >= 1
+
+    async def test_chain_none_with_a_raising_verify_is_byte_identical_to_today(
+        self, git_repo: Path, monkeypatch,
+    ):
+        """NEGATIVE CONTROL — the always-on fence.
+
+        The head path and the shipped ``chain_cap=0`` default must not observe
+        REVIEW FIX 3 at all: a raising verify with no chain still resolves the
+        request terminally as ``blocked``, exactly as before γ.  Pairs with
+        ``test_chain_none_is_byte_identical_to_todays_path`` on the pass path.
+        """
+        from orchestrator.merge_types import InflightStatus
+
+        git_ops, worker, item, chain, _head = await self._fixture(git_repo)
+        await merge_liveness.release_chain_build_lane(
+            git_ops, chain.lane, warm=chain.lane_warm,
+        )
+        _spy_post_merge_verify(monkeypatch, raises=RuntimeError('verify exploded'))
+
+        res = await worker._run_inflight_verify(item, _local_lease())
+
+        assert item.request.result.done(), 'no chain: the ordinary terminal path'
+        outcome = item.request.result.result()
+        assert outcome.status == 'blocked'
+        assert outcome.reason.startswith('Verification error:')
+        assert res.outcome is outcome
+        assert res.status is not InflightStatus.REQUEUED
+        assert worker._queue.qsize() == 0, 'no requeue on the ordinary arm'
+        assert worker._chain_verify_errors == {}, (
+            'the ordinary arm must not touch the chain-error counter'
+        )
 
     async def test_item_ephemeral_worktree_is_disposed_not_stranded(
         self, git_repo: Path, monkeypatch,
