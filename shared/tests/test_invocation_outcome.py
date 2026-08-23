@@ -586,6 +586,50 @@ class TestClassifyInvocationCliLocalError:
         outcome = classify_invocation(result, strict_confirm=True)
         assert outcome == CliLocalError(marker='permission denied')
 
+    def test_unresolvable_resume_session_is_cli_local_error(self):
+        """A `--resume` the CLI cannot resolve is a LOCAL error, never a cap.
+
+        The CLI resolves the session id against the on-disk transcript store and
+        exits BEFORE contacting the API, so a usage cap can never be the cause.
+        Its shape — zero cost, one turn, sub-5s — is exactly the shape
+        ``invoke_with_cap_retry``'s heuristic safety net reads as "a cap hit with
+        an unrecognised message format", so without a POSITIVE non-cap
+        attribution here a HEALTHY account gets marked CAPPED.
+
+        This is LATENT-FRAGILITY hardening with ZERO live occurrences, not an
+        active incident: real resume failures currently exceed the net's 5000 ms
+        floor. It is the same class as the reify-3604 ``CliLocalError`` escape
+        and the 2026-07-29 ``ServerError`` escape — a third instance.
+
+        The string and its STDERR placement were measured against Claude Code
+        CLI 2.1.236 on 2026-08-19, not guessed.
+        """
+        result = AgentResult(
+            success=False,
+            output='',
+            stderr=(
+                'No conversation found with session ID: '
+                '4aed993b-20c0-4b91-a8dd-60180e7db2e0'
+            ),
+        )
+        outcome = classify_invocation(result, strict_confirm=True)
+        assert outcome == CliLocalError(marker='no conversation found with session id')
+
+    def test_unresolvable_resume_session_match_is_case_insensitive(self):
+        """The table is matched against ``combined.lower()``, so an upper-cased
+        variant must classify identically — the CLI's exact casing is not a
+        thing this escape may depend on."""
+        result = AgentResult(
+            success=False,
+            output='',
+            stderr=(
+                'NO CONVERSATION FOUND WITH SESSION ID: '
+                '4AED993B-20C0-4B91-A8DD-60180E7DB2E0'
+            ),
+        )
+        outcome = classify_invocation(result, strict_confirm=True)
+        assert isinstance(outcome, CliLocalError)
+
     def test_marker_in_output_not_just_stderr(self):
         result = AgentResult(success=False, output='unrecognized arguments: --foo', stderr='')
         outcome = classify_invocation(result, strict_confirm=True)

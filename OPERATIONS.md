@@ -529,6 +529,8 @@ takes no arguments: it always re-reads that process's own
 - Scheduler and watcher tuning knobs
 - `review.*` checkpoint knobs
 - `unblock_auto.*`
+- `session_resume.*` (whole submodel, including the `restore_from_archive`
+  rehydration kill switch — see [§14](#14-transcript-preservation--the-archival-guard))
 - `verify_env`
 - The `git.offline_lane_*` leaf tunables
 - `config_key_census.*` (the unknown-key census escape hatch — see
@@ -1445,7 +1447,102 @@ fall back to a fresh dispatch on re-dispatch — check the orchestrator log for
 `transcript_archive:` WARNINGs and for an open archival-storm L1.
 
 Note this task makes the archive *exist*; whether a given session actually
-resumes from it is task 3578's separate eligibility guard.
+resumes from it is task 3578's separate eligibility guard — see the next
+subsection.
+
+### Resuming from the archive, and measuring the resumes that are lost
+
+Making the archive *exist* (above) is not the same as a session actually
+resuming from it. Task 3578 wires the two together at the dispatch path and
+instruments what still gets lost.
+
+**What now happens on a resumed dispatch.** Immediately before arming
+`--resume`, `TaskWorkflow._invoke` corroborates the recovered session against
+`self._config_dir` — the directory it is about to export as
+`CLAUDE_CONFIG_DIR`, which under a pooled warm lane is *not* the boot-time
+path the harness eligibility guard checked. If the transcript is not there, it
+is rehydrated from the durable archive (`restore_archived_transcript`, which
+decompresses a legacy `.jsonl.gz` and publishes atomically). If it still is not
+there, the resume is **vetoed**: the task dispatches FRESH with a new session
+id rather than arming a `--resume` the CLI would reject before it ever contacts
+the API. Both outcomes are journalled — INFO `rehydrated session … from the
+durable archive`, WARNING `has no transcript under … — dispatching FRESH`.
+
+**The knob.** `session_resume.restore_from_archive` (default `true`) is the
+reversible kill switch for the rehydration *specifically*. **Green tier** — the
+whole `session_resume` submodel hot-reloads via `reload_config` ([§6](#6-config-reload-vs-restart)).
+Distinct from `session_resume.enabled`, which kills the whole feature at the
+harness guard: turning restoration off alone keeps the veto, its WARNING and
+the events below, so you do not go blind on the population while you have it
+disabled. It deliberately does **not** consult `transcript_archive.enabled` —
+with archival off there is simply nothing on disk to find, and gating on the
+flag would add a second source of truth that can disagree with the filesystem
+(archival on last week still leaves restorable archives today).
+
+**The event.** `session_resume_failed` in `runs.db` records an adopted resume
+that still failed to happen — a population that was previously journal-only and
+runs.db-invisible, because the CLI exits before contacting the API so no cost,
+cap or outcome row ever recorded the loss. `data.stage` splits it:
+
+| `stage` | Meaning | `data` |
+|---|---|---|
+| `pre_flight` | We corroborated, found nothing (and could not rehydrate), and dispatched fresh. | `{stage, session_id, role, restore}` — `restore` is the rehydration **outcome**: `disabled` \| `miss` \| `fault` \| `published` (see below) |
+| `cli` | The resume WAS armed and the CLI rejected it; `invoke_with_cap_retry` retried fresh and returned a **success**, so nothing else records the loss. | `{stage, session_id, session_ids, role, fallbacks}` — `fallbacks` is the count of fresh retries this one invocation had to make, `session_ids` the ids they dropped (oldest first; `session_id` is the first, i.e. the resume the orchestrator adopted) |
+
+```sql
+SELECT json_extract(data, '$.stage') AS stage, COUNT(*)
+  FROM events WHERE event_type = 'session_resume_failed'
+ GROUP BY stage;
+```
+
+`data.restore` on the `pre_flight` rows is what tells you *which* thing is
+broken, so split on it before concluding anything:
+
+| `restore` | What it means | What to do |
+|---|---|---|
+| `miss` | The durable archive holds no entry for that session. | **Archive-coverage problem, not a resume problem** — work the archival subsection above (`transcript_archive:` WARNINGs, archival-storm L1). |
+| `fault` | The restore itself raised. Two classes: **archive-root composition** (malformed `transcript_archive.root`, a `None` `project_root`) and **restore-internal I/O** (unreadable archive, ENOSPC part-way, corrupt gzip member, an unwritable destination parent) — the second is the common one. | Grep the log for `session_resume_restore_fault` (dispatch layer: task, role, session) and `transcript_restore_fault` (helper layer: `errno`, `path`). The two fire as a **pair for one fault**, so count one of them, not their sum. It is a config/IO fault, and the dispatch degraded to FRESH rather than failing. |
+| `disabled` | `session_resume.restore_from_archive` is off. | Expected while the kill switch is pulled; the veto and these events keep running so you do not go blind. |
+| `published` | The restore reported success and the CLI-facing locator still could not see it. | Unreachable by construction — a real occurrence is a bug in the restore/locator pair, not an operations issue. Escalate with the session id. |
+
+```sql
+SELECT json_extract(data, '$.restore') AS restore, COUNT(*)
+  FROM events WHERE event_type = 'session_resume_failed'
+   AND json_extract(data, '$.stage') = 'pre_flight'
+ GROUP BY restore;
+```
+
+**Do not add it to the per-dispatch ratio denominator.** `session_resume`,
+`session_resume_fallback` and `session_resume_capped` are emitted by the
+`_run_slot` guard exactly once per **dispatch**; `session_resume_failed` is
+emitted by `_invoke`, once per **invocation**, and one dispatch invokes several
+roles. Summing them compares populations counted on different units and
+silently inflates the attempt count. Read it against `session_resume` alone:
+*of the resumes we decided to make, how many did not survive to the agent?*
+
+That reading holds because BOTH stages are subsets of the adopted-resume
+population by construction: `pre_flight` fires only where a recovered session
+was about to be armed, and `cli` fires only when `_invoke` actually armed one.
+The underlying `AgentResult.resume_fallbacks` counter is *wider* than that — it
+also counts a resume `invoke_with_cap_retry` re-armed internally after a cap
+hit, which a plain fresh dispatch can reach — so the emit is gated on the
+orchestrator's own armed session id. Without that gate the ratio would count
+invocations that never resumed anything and could exceed 1.
+
+**Caveat U2 — the fallback rate will not go to zero.** What *removes* the live
+transcript from a lane's config dir is still unknown. This work restores from
+the archive; it does not stop the removal. So a steady `pre_flight` count is
+expected; what matters is *why*, and the `restore` split above answers it
+without a filesystem sweep. `restore='miss'` dominating means **archives are
+missing** — the transcript was gone and there was nothing to rehydrate from, so
+work archive coverage (the `OK`/`MISS` loop above) rather than the resume path.
+That advice is sound *because* faults no longer land in `miss`: the restore is
+called in strict mode, so a broken restore raises into `fault` instead of
+returning the same empty-handed `None` an absent archive does.
+`restore='fault'` dominating means the restore path itself is broken and
+coverage is a red herring. Note `restore='published'` should never appear at
+all: a published restore satisfies the corroboration, so no veto — and no
+event — follows it. Its absence is not evidence about archive coverage.
 
 ---
 

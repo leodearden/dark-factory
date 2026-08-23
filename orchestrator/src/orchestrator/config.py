@@ -838,9 +838,18 @@ class SessionResumeConfig(BaseModel):
     ``enabled=false`` is the kill switch: no ``--resume`` is ever injected
     (B6), and no ``session_resume_*`` event or streak is produced.
 
+    ``restore_from_archive=false`` is the NARROWER kill switch (task 3578):
+    the ``_invoke`` arm site stops rehydrating a missing transcript from the
+    durable archive, but eligibility, corroboration and every
+    ``session_resume_*`` event carry on. It exists so a suspected restore
+    regression is reversible without going blind on the resume population,
+    which is what disabling ``enabled`` would cost.
+
     Mirrors DeliveredChecksConfig's shape (a kill switch plus ge-bounded
-    int knobs); all five leaves are green-tier hot-reloadable via the
-    ``session_resume`` whole-submodel group in RELOADABLE_FIELDS.
+    int knobs); all leaves are green-tier hot-reloadable via the
+    ``session_resume`` whole-submodel group in RELOADABLE_FIELDS —
+    ``_submodel_leaf_paths`` enumerates ``model_fields`` dynamically, so a
+    new leaf joins the green tier with no RELOADABLE_FIELDS edit.
     """
 
     enabled: bool = Field(
@@ -849,6 +858,26 @@ class SessionResumeConfig(BaseModel):
             'Set to false to disable warm-lane session resume entirely — no '
             '--resume is ever injected (B6), and the _run_slot guard emits no '
             'session_resume_* event and feeds no fallback-storm streak.'
+        ),
+    )
+    restore_from_archive: bool = Field(
+        default=True,
+        description=(
+            'Set to false to stop TaskWorkflow._invoke rehydrating a recovered '
+            "session's transcript from the durable archive into the config dir "
+            'it is about to export as CLAUDE_CONFIG_DIR. The reversible kill '
+            'switch for the ARM-SITE RESTORATION specifically (task 3578) — '
+            'distinct from `enabled`, which kills the whole feature at the '
+            'harness guard. With this false, an ineligible resume still '
+            'degrades to fresh dispatch and still emits its event, so an '
+            'operator can disable restoration without going blind on the '
+            'population it was meant to fix. '
+            'Deliberately does NOT consult transcript_archive.enabled, reusing '
+            "Harness._archive_available's recorded argument: with archival off "
+            'there is simply nothing on disk to find, and gating on the flag '
+            'would add a second source of truth that can disagree with the '
+            'filesystem — archival switched on last week still leaves '
+            'restorable archives today.'
         ),
     )
     freshness_window_secs: int = Field(

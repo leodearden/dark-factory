@@ -36,6 +36,7 @@ from shared.cli_invoke import (
     is_timed_out_with_progress,
     is_zero_output_timeout,
     read_transcript_records,
+    transcript_exists,
 )
 from shared.config_dir import TaskConfigDir
 from shared.cost_store import CostStore
@@ -43,7 +44,12 @@ from shared.prompt_artifact import PromptArtifactStore, default_artifacts_root
 from shared.task_claimant import compose_claimant_run_id
 from shared.task_metadata import RetryLedger, RoutingDecisionMirror, RoutingState
 from shared.task_statuses import TaskStatus
-from shared.transcript_archive import archive_before_delete, archive_task_transcripts
+from shared.transcript_archive import (
+    archive_before_delete,
+    archive_task_transcripts,
+    resolve_archive_root,
+    restore_archived_transcript,
+)
 
 from orchestrator import chronic_flake
 from orchestrator.agents.invoke import AgentResult, invoke_agent
@@ -12370,18 +12376,217 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             and self._pending_resume_role == role.name
         ):
             session_id_val = self._pending_resume_session_id
-            resume_session_id = session_id_val
-            # Adopted resume: bump the cumulative count off the recovered base,
-            # then reset it (consumed-on-first-use, mirroring the session-id/
-            # role resets below).
-            resume_count_to_write = self._pending_resume_count + 1
+            # REHYDRATE FIRST, then corroborate — the order is load-bearing, so
+            # the check below sees the restored state rather than vetoing a
+            # session we could have saved.
+            #
+            # Under a pooled warm lane the config dir we are about to export has
+            # NEVER seen this session's JSONL: the dir that held it was destroyed
+            # at lane teardown. The durable archive under project_root outlives
+            # that teardown, so restoring from it is what makes the resume real
+            # instead of a silent fresh start.
+            #
+            # The transcript_exists precondition is an optimisation, not a
+            # correctness guard — restore_archived_transcript has its own
+            # no-clobber check keyed on the same locator — but it keeps the
+            # common already-live path from paying for an archive glob.
+            #
+            # Gated on session_resume.restore_from_archive (the NARROW kill
+            # switch: eligibility, corroboration and every session_resume_*
+            # event carry on without it) and deliberately NOT on
+            # transcript_archive.enabled, reusing Harness._archive_available's
+            # recorded argument: with archival off there is nothing on disk to
+            # find, and gating on the flag would add a second source of truth
+            # that can disagree with the filesystem.
+            # What the rehydration below actually DID, reported on the veto
+            # event as data.restore.  An OUTCOME STRING, not a bool: a bool
+            # collapsed three materially different states into one False
+            # ("we never tried", "the archive had nothing", "the restore blew
+            # up") and so could not answer the archive-coverage question
+            # caveat U2 poses.  Four disjoint values:
+            #   'disabled'  — restore_from_archive is off; nothing was tried.
+            #   'miss'      — the archive genuinely holds no entry for this
+            #                 session, and NOTHING ELSE: the restore is called
+            #                 with strict=True, so a fault raises instead of
+            #                 returning the same None a miss does. Before that
+            #                 this value meant "no entry OR the restore blew up
+            #                 quietly", which made it useless as the signal it
+            #                 is meant to be. THIS is the archive-coverage
+            #                 signal: a steady pre_flight count that is
+            #                 overwhelmingly 'miss' means archives are not
+            #                 being written, not that the restore is broken.
+            #   'fault'     — the restore raised. TWO classes, both landing in
+            #                 the one handler below: archive-root COMPOSITION
+            #                 (malformed transcript_archive root, None
+            #                 project_root — resolve_archive_root is not
+            #                 total), and restore-INTERNAL I/O (unreadable
+            #                 archive, ENOSPC part-way, corrupt gzip member, an
+            #                 unwritable destination parent). The second class
+            #                 is the majority of what really happens and is
+            #                 reachable only because of that strict=True; it
+            #                 used to be swallowed and mis-counted as 'miss'.
+            #   'published' — the restore claimed success and the CLI-facing
+            #                 locator STILL cannot see the result.  Pathological
+            #                 and unreachable by construction (a published
+            #                 restore satisfies the corroboration, so no veto
+            #                 follows) — emitted rather than assumed away, so
+            #                 that if it ever does happen it is countable.
+            restore_outcome = 'disabled'
+            if (
+                self.config.session_resume.restore_from_archive
+                and self._config_dir is not None
+                and not transcript_exists(self._config_dir.path, session_id_val)
+            ):
+                try:
+                    # The single-home composition helper, NOT an open-coded
+                    # `project_root / root` — that spelling already drifted
+                    # across five sites once (INV-5).
+                    #
+                    # Guarded because resolve_archive_root is deliberately NOT
+                    # total: under a config regression either operand can be a
+                    # type Path.__truediv__ refuses (a None project_root, a
+                    # non-PathLike root from malformed YAML) and it raises
+                    # TypeError — here, on the production dispatch path. Same
+                    # guard and same reasoning Harness._archive_available records
+                    # for the identical composition: unguarded, a mere config
+                    # regression would escalate into a dispatch fault.
+                    archive_root = resolve_archive_root(
+                        self.config.project_root,
+                        self.config.transcript_archive.root,
+                    )
+                    restored = restore_archived_transcript(
+                        archive_root, str(self.task_id), session_id_val,
+                        self._config_dir.path,
+                        # strict=True is what makes the `fault` classification
+                        # below REACHABLE for the faults that actually happen.
+                        # The helper is total by default and answers an
+                        # unreadable archive, an ENOSPC part-way, a corrupt
+                        # gzip member and a plain miss with the same None — so
+                        # without this the `else` arm buckets every one of them
+                        # as `miss` and sends the operator to work archive
+                        # coverage while the restore path is the broken thing.
+                        # Totality is not surrendered, only relocated: the
+                        # exception is caught one frame up, by this same
+                        # handler, and the outcome is still a FRESH dispatch.
+                        # A plain miss still returns None without raising (it
+                        # returns from above the helper's handler), so `miss`
+                        # keeps meaning exactly "the archive holds no entry".
+                        strict=True,
+                    )
+                except Exception as exc:
+                    # Fall through to the corroboration, which will veto and
+                    # dispatch fresh — a broken restore costs context, never a
+                    # dispatch.
+                    restore_outcome = 'fault'
+                    # Names the whole rehydration, not just the archive-root
+                    # composition: with strict=True the restore's own I/O
+                    # faults land here too, and are in fact the majority of
+                    # what this handler now catches. The `%s` exception tail is
+                    # what tells the operator WHICH of the two it was.
+                    logger.warning(
+                        'Task %s [%s]: failed to rehydrate session %s from the '
+                        'durable archive — proceeding without '
+                        'a restore: %s',
+                        self.task_id, role.name, session_id_val, exc,
+                        extra={
+                            'event': 'session_resume_restore_fault',
+                            'task_id': str(self.task_id),
+                            'session_id': session_id_val,
+                            'role': role.name,
+                        },
+                    )
+                else:
+                    restore_outcome = 'published' if restored is not None else 'miss'
+                    if restored is not None:
+                        logger.info(
+                            'Task %s [%s]: rehydrated session %s from the '
+                            'durable archive %s -> %s',
+                            self.task_id, role.name, session_id_val,
+                            archive_root, restored,
+                            extra={
+                                'event': 'session_resume_restored',
+                                'task_id': str(self.task_id),
+                                'session_id': session_id_val,
+                                'role': role.name,
+                            },
+                        )
+            # RE-CORROBORATE against the config dir we are about to USE.
+            #
+            # The harness eligibility guard (_session_resume_eligible) checks a
+            # BOOT-TIME snapshot path — the config dir that existed when
+            # recovery ran.  self._config_dir is constructed fresh (see
+            # _setup_worktree) from whatever lane was acquired AFTERWARDS, and
+            # _recycle_config_dir can replace it again mid-workflow.  Under a
+            # pooled warm lane those two can name different directories, and
+            # self._config_dir is the one exported as CLAUDE_CONFIG_DIR
+            # (cli_invoke's _build_agent_env) — so it, not the snapshot, is what
+            # --resume will actually be resolved against.  Arming off the
+            # snapshot alone makes the CLI exit `No conversation found with
+            # session ID` before it ever contacts the API: a wasted dispatch
+            # that emits no runs.db event at all.
+            #
+            # config_dir is None -> arm as today.  Scoping copied verbatim from
+            # the precedent at cli_invoke.py's cap-hit resume guard (whose own
+            # comment says it mirrors this orchestrator guard): without a
+            # concrete directory there is no correct place to glob, so the veto
+            # is scoped to "we have a directory and the transcript is provably
+            # not in it".
+            corroborated = self._config_dir is None or transcript_exists(
+                self._config_dir.path, session_id_val,
+            )
+            # Consume the pending fields on EITHER branch (consumed-on-first-use,
+            # mirroring the session-id/role resets this block already did): a
+            # sid we just proved unreachable must not be re-attempted on every
+            # subsequent invocation of this role.
+            pending_count = self._pending_resume_count
             self._pending_resume_session_id = None
             self._pending_resume_role = None
             self._pending_resume_count = 0
-            logger.info(
-                'Task %s [%s]: resuming prior session %s via --resume',
-                self.task_id, role.name, session_id_val,
-            )
+            if corroborated:
+                resume_session_id = session_id_val
+                # Adopted resume: bump the cumulative count off the recovered
+                # base (it was reset above, consumed-on-first-use).
+                resume_count_to_write = pending_count + 1
+                logger.info(
+                    'Task %s [%s]: resuming prior session %s via --resume',
+                    self.task_id, role.name, session_id_val,
+                )
+            else:
+                vetoed_session_id = session_id_val
+                session_id_val = str(uuid.uuid4())
+                resume_count_to_write = 0
+                logger.warning(
+                    'Task %s [%s]: recovered session %s has no transcript under '
+                    '%s — dispatching FRESH as %s instead of arming a --resume '
+                    'the CLI would reject (context from the prior attempt is lost)',
+                    self.task_id, role.name, vetoed_session_id,
+                    self._config_dir.path if self._config_dir else None,
+                    session_id_val,
+                    extra={
+                        'event': 'session_resume_failed',
+                        'stage': 'pre_flight',
+                        'task_id': str(self.task_id),
+                        'session_id': vetoed_session_id,
+                        'role': role.name,
+                    },
+                )
+                # …and make it MEASURABLE, not just greppable. This population
+                # was previously journal-only and runs.db-invisible: the CLI
+                # exits before contacting the API, so no cost/cap/outcome row
+                # ever recorded that the session was lost. Per-INVOCATION, so
+                # it is deliberately NOT part of the _run_slot guard's
+                # per-dispatch ratio denominator — see EventType's taxonomy.
+                if self.event_store:
+                    self.event_store.emit(
+                        EventType.session_resume_failed,
+                        task_id=self.task_id,
+                        data={
+                            'stage': 'pre_flight',
+                            'session_id': vetoed_session_id,
+                            'role': role.name,
+                            'restore': restore_outcome,
+                        },
+                    )
         else:
             session_id_val = str(uuid.uuid4())
             resume_count_to_write = 0
@@ -12559,6 +12764,61 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                         },
                     )
         completed_at = datetime.now(UTC).isoformat()
+
+        # The CLI-stage half of session_resume_failed (task 3578): we DID arm
+        # --resume, the CLI rejected the session, and invoke_with_cap_retry
+        # retried fresh and handed back a SUCCESS. Nothing else records that —
+        # from runs.db the invocation looks perfect, so the lost transcript was
+        # invisible. `shared` has no event store, so the count rides out on
+        # AgentResult.resume_fallbacks and is turned into an event here.
+        #
+        # getattr with a default, not attribute access: several suites hand
+        # _invoke a stand-in result object, and instrumentation must never be
+        # the thing that raises on the production dispatch path.
+        #
+        # Per-INVOCATION, like the pre_flight stage — deliberately NOT a fourth
+        # term in the _run_slot guard's per-dispatch ratio denominator (see
+        # EventType's taxonomy note).
+        #
+        # GATED ON OUR OWN ARMED RESUME, not on the counter alone. cli_invoke
+        # increments resume_fallbacks for ANY resumed attempt that failed
+        # non-cap and was retried fresh — including a resume its retry loop
+        # re-armed ITSELF after a cap hit (invoke_kwargs['resume_session_id'] =
+        # result.session_id). A plain FRESH dispatch that hits a cap can
+        # therefore come back with a non-zero count while no resume was ever
+        # adopted here; counting those would inflate exactly the ratio
+        # OPERATIONS.md tells operators to read against session_resume ("of the
+        # resumes we DECIDED to make, how many did not survive?") and could
+        # push it above 1. resume_session_id is non-None iff the arm site above
+        # corroborated and adopted, which is that predicate exactly.
+        resume_fallbacks = getattr(result, 'resume_fallbacks', 0)
+        if resume_fallbacks and resume_session_id and self.event_store:
+            # …and name the session actually LOST, which session_id_val often
+            # is not: cli_invoke's _reset_for_fresh_retry regenerates the
+            # pre-allocated id, and a cap re-arm replaces the armed id with
+            # result.session_id. The carrier keeps every dropped id in order;
+            # the first is the resume we adopted, so it is the scalar
+            # data.session_id, with the full list alongside for the
+            # multi-fallback invocations. Falls back to our own armed id if an
+            # older shared/ (or a suite stand-in) carries no list.
+            lost_session_ids = [
+                str(s) for s in
+                (getattr(result, 'resume_fallback_session_ids', ()) or ())
+            ]
+            self.event_store.emit(
+                EventType.session_resume_failed,
+                task_id=self.task_id,
+                data={
+                    'stage': 'cli',
+                    'session_id': (
+                        lost_session_ids[0] if lost_session_ids
+                        else resume_session_id
+                    ),
+                    'session_ids': lost_session_ids,
+                    'role': role.name,
+                    'fallbacks': resume_fallbacks,
+                },
+            )
 
         # Record the last successfully-completed role (updated only on success,
         # mirrors the cost-accumulation path below — failed/raised invocations

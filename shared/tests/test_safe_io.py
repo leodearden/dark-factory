@@ -907,6 +907,23 @@ _ALLOWED_RENAMERS = {
         'BEFORE the replace, and atomic_write_text exposes no pre-replace seam '
         'for that — a now-stamped archive reads to gc_agent_transcripts as a '
         'reset retention age.',
+    ('shared/src/shared/transcript_archive.py', 'restore_archived_transcript'):
+        'The INVERSE of _archive_one above and in exactly its category: it '
+        'COPIES an existing archived transcript back into a config dir rather '
+        'than writing new text. The same two specifics rule out '
+        'atomic_write_text: (1) the payload is a multi-MB agent-session JSONL '
+        'moved with shutil.copyfile (or streamed through gzip.open + '
+        'copyfileobj for the pre-3618 .jsonl.gz corpus) so peak RSS stays flat, '
+        'whereas atomic_write_text takes a str already fully in memory; '
+        '(2) os.utime mirrors the ARCHIVE mtime onto the staging file BEFORE '
+        'the replace, and atomic_write_text exposes no pre-replace seam for '
+        'that — a now-stamped restore reads to the next archival pass as newer '
+        'than its own archive and is pointlessly re-archived over it. The '
+        'staging+os.replace publish is load-bearing rather than decorative: the '
+        'claude CLI PARSES the transcript rather than stat-ing it (a zero-byte '
+        'file and a preamble-only file both yield `No conversation found with '
+        'session ID`, measured on CLI 2.1.236), so a torn restore would arm '
+        '--resume against a file the CLI then rejects. Added by task 3578.',
     ('shared/src/shared/transcript_archive.py', '_move_to_archive'):
         'MOVES an existing transcript rather than writing new text — the '
         'sibling of _archive_one above, and the same category as escalation '
