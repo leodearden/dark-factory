@@ -611,15 +611,19 @@ class TestTopicPinFailOpenAndGating:
         assert service.mem0.scroll_by_metadata.await_count == _MAX_ANCHOR_TOPICS
 
     @pytest.mark.asyncio
-    async def test_fires_for_the_near_dup_guards_exact_call_shape(self, service):
+    async def test_fires_for_a_scoped_agent_search(self, service):
         """SCOPED-SEARCH OBLIGATION, per the task's SEAM CORRECTION.
 
         Anchoring is contractually required to fire for scoped searches, not
-        only unscoped auto-routed ones. This is the near-duplicate guard's
-        literal pre-check shape (server/tools.py:3090-3096), which calls
-        MemoryService.search DIRECTLY and therefore bypasses MCP grouping —
-        `stores` only short-circuits ROUTING, never the sort/filter/anchor/
-        truncate tail.
+        only unscoped auto-routed ones: `stores` only short-circuits ROUTING,
+        never the sort/filter/anchor/truncate tail. This is precisely why the
+        pin lands at the service seam and not at the MCP boundary, where a
+        direct MemoryService.search caller would never reach it.
+
+        NOTE this asserts the DEFAULT (`anchor_topics` unset). It deliberately
+        no longer claims to mirror the near-duplicate guard's call: that guard
+        now opts OUT — see TestAnchorTopicsOptOut for why a candidate-set
+        consumer must, and for the assertion that it really does.
         """
         _seed(service)
 
@@ -870,3 +874,83 @@ class TestFailOpenLeavesNoPartialPin:
         assert [r.id for r in results] == ['sibling-1', 'sibling-2', 'canonical-a']
         assert not any(r.topic_anchored for r in results)
         assert any('topic-anchored' in record.message for record in caplog.records)
+
+
+class TestAnchorTopicsOptOut:
+    """`anchor_topics=False` is the escape hatch for CANDIDATE-SET consumers.
+
+    The pin PROMOTES rather than adds — the window stays exactly ``limit``
+    long — so every pin evicts the lowest-ranked genuine hit. That trade is
+    right for an agent-facing read and WRONG for a machine consumer that reads
+    the window as a candidate set and post-filters or thresholds it. Those
+    consumers (the procedural_knowledge near-duplicate WRITE guard, the recon
+    idempotency check, the Stage-2 marker sweep) opt out here; the tests that
+    they REALLY pass the flag live next to each caller's own suite, while the
+    hazard itself is proven below.
+    """
+
+    @pytest.mark.asyncio
+    async def test_opt_out_suppresses_the_lookup_entirely(self, service):
+        """Cheapest possible opt-out: no scroll round-trip, not even a filtered one."""
+        _seed(service)
+
+        results = await service.search(
+            query=_QUERY, project_id=_PROJECT_ID,
+            categories=['procedural_knowledge'], stores=['mem0'], limit=5,
+            anchor_topics=False,
+        )
+
+        assert service.mem0.scroll_by_metadata.await_count == 0
+        assert [r.id for r in results] == [f'sibling-{n}' for n in range(1, 6)]
+        assert not any(r.topic_anchored for r in results)
+
+    @pytest.mark.asyncio
+    async def test_default_is_on_so_a_forgetful_caller_gets_todays_behaviour(self, service):
+        """The flag is an OPT-OUT, never an opt-in.
+
+        A future machine consumer that forgets it degrades to the
+        already-shipped anchored behaviour, not to a silent correctness bug in
+        the other direction (an agent seam quietly losing its canonical).
+        """
+        _seed(service)
+
+        results = await service.search(
+            query=_QUERY, project_id=_PROJECT_ID,
+            categories=['procedural_knowledge'], stores=['mem0'], limit=5,
+        )
+
+        assert results[0].id == _CANONICAL_ID
+
+    @pytest.mark.asyncio
+    async def test_opt_out_preserves_the_rank_five_hit_the_pin_would_evict(self, service):
+        """THE HAZARD, stated concretely at the near-dup guard's limit=5.
+
+        The guard qualifies a candidate on ``metadata['store_score'] >=
+        threshold``, and a pinned canonical deliberately carries NO
+        ``store_score`` (TestTopicPinScoreContract) — so a pin is a candidate
+        slot spent on a record the guard can never qualify. With the pin on,
+        the rank-5 sibling — which here IS the true near-duplicate — is pushed
+        out of a 5-deep window and the guard would return None, landing the
+        duplicate. Opting out keeps it.
+        """
+        _seed(service)
+
+        anchored = await service.search(
+            query=_QUERY, project_id=_PROJECT_ID,
+            categories=['procedural_knowledge'], stores=['mem0'], limit=5,
+        )
+        opted_out = await service.search(
+            query=_QUERY, project_id=_PROJECT_ID,
+            categories=['procedural_knowledge'], stores=['mem0'], limit=5,
+            anchor_topics=False,
+        )
+
+        # Both windows honour the limit contract; only their CONTENTS differ.
+        assert len(anchored) == len(opted_out) == 5
+        # The pin displaced the rank-5 sibling...
+        assert 'sibling-5' not in {r.id for r in anchored}
+        # ...and consumed a slot with a record carrying no comparable cosine.
+        assert anchored[0].metadata.get('store_score') is None
+        # The opt-out keeps every genuine candidate, all of them scored.
+        assert [r.id for r in opted_out] == [f'sibling-{n}' for n in range(1, 6)]
+        assert all(r.metadata.get('store_score') is not None for r in opted_out)

@@ -165,16 +165,22 @@ class TestSearchSeamComposesWithGroupedRead:
 
 
 class TestGuardSeamStillAdmitsDissimilarWrites:
-    """A canonical joining the candidate set must not become a spurious block."""
+    """The write guard's candidate set is NOT anchored, and still admits writes.
+
+    The pre-check calls MemoryService.search DIRECTLY, so it would otherwise
+    run the anchoring block on every procedural_knowledge write. It opts out
+    (``anchor_topics=False``) because it reads its 5 results as a candidate
+    set rather than a presentation — see
+    ``test_pin_never_reaches_the_guards_candidate_set`` for the full rationale.
+    """
 
     @pytest.mark.asyncio
     async def test_dissimilar_procedural_knowledge_write_is_not_blocked(self, service):
-        """The pin reaches the guard's limit=5 pre-check and the write goes through.
+        """An un-anchored pre-check still admits a genuinely dissimilar write.
 
-        The pre-check calls MemoryService.search DIRECTLY, so grouping is
-        bypassed and the anchoring block runs on every procedural_knowledge
-        write. Every sibling here is below the 0.92 threshold and the injected
-        anchor carries no store_score at all, so nothing qualifies.
+        Every sibling here is below the 0.92 threshold, so nothing qualifies
+        and the write goes through. This is the end-to-end proof that opting
+        out of anchoring did not disturb the guard's admit path.
         """
         _seed(service)
         service.config.reconciliation = types.SimpleNamespace(
@@ -200,8 +206,25 @@ class TestGuardSeamStillAdmitsDissimilarWrites:
         service.add_memory.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_pin_reaches_the_guards_candidate_set(self, service):
-        """Corroborates the mechanism: the pre-check search really is anchored."""
+    async def test_pin_never_reaches_the_guards_candidate_set(self, service):
+        """REGRESSION GUARD: the write guard's pre-check must NOT be anchored.
+
+        This assertion is deliberately INVERTED from its original form, which
+        asserted the pin *did* reach this candidate set and so encoded the
+        defect rather than the contract. The guard reads its 5 results as a
+        CANDIDATE SET and qualifies each on ``metadata['store_score'] >=
+        threshold``; a pinned canonical carries no ``store_score`` at all, so
+        every pin would spend one of those 5 slots on a record the guard can
+        never qualify — while evicting a genuine cosine hit, because the pin
+        promotes rather than adds. That shrinks an effective 5-candidate set
+        toward 2 on exactly the consolidated topics this guard protects, and
+        lets a true near-duplicate at rank 5 land as a duplicate.
+
+        The guard therefore passes ``anchor_topics=False`` (server/tools.py).
+        Asserting ZERO scroll round-trips also pins the cheap-gate ordering:
+        the opt-out is checked before the harvest, so an opted-out caller pays
+        no lookup at all.
+        """
         _seed(service)
         service.config.reconciliation = types.SimpleNamespace(
             procedural_knowledge_near_dup_guard_enabled=True,
@@ -221,8 +244,8 @@ class TestGuardSeamStillAdmitsDissimilarWrites:
             'project_id': _PROJECT_ID,
         })
 
-        # The pre-check's own search performed the anchor lookup.
-        assert service.mem0.scroll_by_metadata.await_count >= 1
+        # The pre-check's own search did NOT perform an anchor lookup.
+        assert service.mem0.scroll_by_metadata.await_count == 0
 
 
 _CHILD_ID = 'amendment-0001'

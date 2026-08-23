@@ -95,10 +95,11 @@ if TYPE_CHECKING:
     from fused_memory.models.memory import MemoryResult
 
 # Blast-radius caps, NOT tuning knobs — deliberately not config leaves.
-# MemoryService.search is on the hot path for every agent read AND for every
-# procedural_knowledge write (the near-dup guard's pre-check), so the cost this
-# transform can add to a single search is bounded here by construction rather
-# than left to an operator to get right.
+# MemoryService.search is on the hot path for every agent read, so the cost
+# this transform can add to a single search is bounded here by construction
+# rather than left to an operator to get right.  (Candidate-set consumers such
+# as the near-dup guard's pre-check opt out entirely via `anchor_topics=False`
+# and never reach these selectors at all.)
 #
 # Most distinct topics anchored per search => at most this many extra backend
 # round-trips, whatever the result window contains.
@@ -264,11 +265,12 @@ def select_canonical_payload(
         # evaluates ``hash(x)`` — so a bare membership test raises TypeError on
         # an unhashable list/dict value.  That is NOT a fail-open here: the
         # caller's two-tier band deliberately RE-RAISES TypeError
-        # (``memory_service.search``; identically ``server/tools.py:3102`` for
+        # (``memory_service.search``; identically ``server/tools.py`` for
         # the near-duplicate pre-check), so an unguarded read converts ONE
         # malformed canonical into a hard failure of every category-scoped
-        # search in the system and of every procedural_knowledge write on that
-        # topic.  Read the value BEFORE testing membership; ``isinstance(...,
+        # AGENT search in the system.  (Not of procedural_knowledge writes: that
+        # pre-check opts out of anchoring and never reaches this selector.)
+        # Read the value BEFORE testing membership; ``isinstance(...,
         # str)`` also excludes bool/int/None without a separate clause, the same
         # way ``_is_child_shaped`` guards ``kind``.  EXCLUDE on an unreadable
         # category, never admit: anchoring may change WHICH member of the

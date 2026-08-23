@@ -3957,6 +3957,7 @@ class MemoryService:
         session_id: str | None = None,
         causation_id: str | None = None,
         include_planned: bool = False,
+        anchor_topics: bool = True,
     ) -> list[MemoryResult]:
         """Unified search across both stores with automatic fan-out.
 
@@ -3987,6 +3988,41 @@ class MemoryService:
         ``degraded`` / ``failed_stores`` / ``failure_diagnostics`` and
         per-store error absorption are unchanged: a store that raises or times
         out is absorbed, and the surviving store's results are still returned.
+
+        ``anchor_topics`` (task 3111).  Topic-anchored recall is a PROMOTION,
+        not an addition: the returned window stays exactly ``limit`` long, so
+        each pinned canonical evicts the lowest-ranked genuine hit.  That trade
+        is right for an AGENT-FACING read, where surfacing a cluster's
+        canonical is worth one marginal tail result, and WRONG for a
+        correctness-critical machine consumer that treats the window as a
+        candidate set.  Pass ``anchor_topics=False`` from any caller which:
+
+          - thresholds or post-filters the window and would silently lose a
+            genuine candidate to displacement — the procedural_knowledge
+            near-duplicate WRITE guard (``server/tools.py``, which searches at
+            ``limit=5``) is the sharp case.  A pinned canonical deliberately
+            carries NO ``metadata['store_score']`` (see the score contract
+            below), so it can never qualify in ``find_near_duplicate_memory``:
+            every pin is a candidate slot spent on a record the guard must
+            ignore, shrinking an effective 5-candidate set toward 2 on exactly
+            the consolidated topics the guard exists to protect.
+          - is an IDEMPOTENCY check, where a displaced prior record reads as
+            "absent" and causes a duplicate WRITE
+            (``reconciliation/mem0_dedup.find_prior_memories``).
+          - sweeps for markers, where a displaced marker is silently "not
+            swept this cycle"
+            (``reconciliation/stages/task_knowledge_sync._query_stage2_flags``).
+
+        The default stays ``True`` because the agent-facing seams are the
+        majority of call sites and are the ones this task exists to fix; the
+        flag is an explicit OPT-OUT so a future machine consumer that forgets
+        it degrades to today's already-shipped behaviour rather than to a
+        silent correctness bug.  The pin is NOT relocated to the MCP boundary:
+        a non-suppressing pin is contractually placed at this seam (task 3111
+        scope note) so that ``stores=['mem0']`` / category-scoped agent
+        searches are anchored too, unlike the SUPPRESSING grouped read, which
+        PRD V2 bars from this seam precisely because it would blind these same
+        machine consumers with no way to opt out.
         """
         scope = Scope(project_id=project_id, agent_id=agent_id, session_id=session_id)
 
@@ -4104,7 +4140,12 @@ class MemoryService:
         # genuinely green-tier hot-reloadable (config/reload.py's reload-safety
         # rule); a construction-captured value would not observe an in-place
         # reload and would have to stay restart-only.
-        if resolve_topic_anchor_enabled(self):
+        # GATE 1 (per-call): `anchor_topics=False` is the caller asserting it
+        # reads this window as a CANDIDATE SET, not as a presentation — see the
+        # docstring.  Checked FIRST and cheaply, so an opted-out caller pays
+        # neither the config read nor the harvest.  Gate 2 is the live,
+        # green-tier config knob.
+        if anchor_topics and resolve_topic_anchor_enabled(self):
             try:
                 # HARVEST FROM THE WINDOW THE CALLER WILL ACTUALLY SEE, not from the
                 # full merged list.  `results` here still holds every merged hit, and
@@ -4116,14 +4157,20 @@ class MemoryService:
                 # cluster also surfaces that topic's canonical"): the agent would pay
                 # the displacement for a cluster it never found a member of.  It also
                 # spends a Qdrant round-trip per invisible topic on the hot path.
-                anchor_topics = extract_anchor_topics(
+                # NAMED `topics_to_anchor`, not `anchor_topics`: the latter is now
+                # the boolean OPT-OUT PARAMETER of this method, and reusing it here
+                # would shadow it — silently making the gate above unreachable to any
+                # later read of the flag within this block.
+                topics_to_anchor = extract_anchor_topics(
                     results[:limit], max_topics=_MAX_ANCHOR_TOPICS
                 )
                 # FAN OUT, don't serialize.  The lookups are fully independent reads
                 # (`pinned_ids` is a post-hoc dedup and `pin_at` is pure ordering —
                 # neither is an input to any lookup), and this seam is the hottest read
-                # path in the system: every agent search AND every procedural_knowledge
-                # write's near-dup pre-check.  Serialized, the cap would add up to
+                # path in the system: every agent search runs it.  (The
+                # procedural_knowledge near-dup pre-check does NOT — it opts out via
+                # `anchor_topics=False` — so it pays none of this.)  Serialized,
+                # the cap would add up to
                 # _MAX_ANCHOR_TOPICS round-trips of latency instead of one round-trip's
                 # worth.  No semaphore, unlike grouped_read._bounded_gather: that
                 # module's fan-out is sized by the CALLER's result list (up to the
@@ -4135,7 +4182,7 @@ class MemoryService:
                         {'topic': topic, 'canonical': True},
                         limit=_ANCHOR_SCROLL_LIMIT,
                     )
-                    for topic in anchor_topics
+                    for topic in topics_to_anchor
                 )
                 for payloads in payload_sets:
                     # gather_collect CAPTURES per-item exceptions rather than raising

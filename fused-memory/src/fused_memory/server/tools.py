@@ -3099,6 +3099,18 @@ def create_mcp_server(
                     categories=['procedural_knowledge'],
                     stores=['mem0'],
                     limit=5,
+                    # OPT OUT of topic-anchored recall (task 3111).  These 5
+                    # slots are a CANDIDATE SET, not a presentation: the pin
+                    # promotes rather than adds, so each pinned canonical would
+                    # evict the lowest-ranked genuine cosine hit from a window
+                    # only 5 deep.  Worse, a pinned canonical deliberately
+                    # carries no metadata['store_score'], so it can never
+                    # qualify in find_near_duplicate_memory -- every pin is a
+                    # slot spent on a record this guard must ignore.  Leaving
+                    # it on would let a true near-duplicate sitting at rank 5
+                    # fall off the end, return None, and land the duplicate on
+                    # exactly the consolidated topics this guard protects.
+                    anchor_topics=False,
                 )
             except (TypeError, AttributeError, NameError):
                 # These indicate a wiring/programming bug (e.g. a future
