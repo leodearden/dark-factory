@@ -98,11 +98,24 @@ class EventType(StrEnum):
     # runtime mining (milestone 5254) reads a uniform data.get('retry_scope')
     # and can NEVER miscount a narrowed retry as a full green gate.
     # PLUS one always-present deep merge-ahead key (task 3185, PRD γ):
-    #   chain_items  int, ALWAYS >= 1, NEVER None.  The 1-indexed count of
-    #                queued items contained in the tree this verify actually
-    #                exercised.  1 = an ordinary single-item verify (head or
+    #   chain_items  int, ALWAYS >= 1, NEVER None.  The count, in CHAIN-ITEM
+    #                units, of the items contained in the tree this verify
+    #                actually exercised: the dispatching item is chain item #1
+    #                and each chained successor actually built adds one.
+    #                1 = an ordinary single-item verify (head or
     #                adjacent speculative); >= 2 = a deep merge-ahead tip
-    #                verify covering that many stacked items.  The floor is 1
+    #                verify covering that many stacked items.
+    #                DELIBERATELY FRONTIER-INDEPENDENT: an ordinary adjacent
+    #                speculative verify is 1 no matter how many other verifies
+    #                are in flight ahead of it (that height is `depth`'s job,
+    #                below), so under the shipped merge_deep.chain_cap=0 kill
+    #                switch NOTHING can emit >= 2.  That is precisely what
+    #                scripts/merge-deep-canary-predicate.sh:84 depends on --
+    #                it classifies a deep verify as `chain_items >= 2`, and
+    #                that expression is both ζ's "first deep verify observed"
+    #                deploy signal and η1's deep-fail-rate DENOMINATOR.  A
+    #                frontier-inclusive reading would fire it on day one and
+    #                count rounds that chained nothing.  The floor is 1
     #                rather than 0/None because every merge verify exercises
     #                at least the item it was created for, so there is no
     #                "absent" state to represent -- which is what lets a

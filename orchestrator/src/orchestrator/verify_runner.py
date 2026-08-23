@@ -1931,9 +1931,14 @@ class VerifyRunnerPool:
         kwargs get ``None`` for each, which is byte-identical to pre-2340
         behaviour aside from the two extra always-present keys.
 
-        ``chain_items`` (task 3185, PRD γ decision 8) is the **1-indexed count
-        of queued items contained in the tree this verify actually
-        exercised**.  It defaults to ``1``, deliberately NOT to ``None`` the
+        ``chain_items`` (task 3185, PRD γ decision 8) is the **count, in
+        CHAIN-ITEM units, of the items contained in the tree this verify
+        actually exercised** — the dispatching item is chain item #1 and each
+        chained successor actually built adds one.  It is deliberately
+        frontier-INDEPENDENT: a verify that chained nothing is 1 however many
+        other verifies are in flight, which is what makes ``chain_items >= 2``
+        a sound deep-verify discriminator.  It defaults to ``1``, deliberately
+        NOT to ``None`` the
         way ``depth``/``speculative`` do, for two reasons.  (1) Semantics: a
         count of items in a verified tree has a smallest TRUTHFUL value of
         1 — every merge verify exercises at least the one item it was created

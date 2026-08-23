@@ -1228,7 +1228,13 @@ class ChainResult:
 
     @property
     def depth(self) -> int:
-        """Number of chained links — the value γ emits as ``chain_items``."""
+        """Number of chained links — items ADDITIONAL to the dispatching one.
+
+        Off by one from the ``chain_items`` telemetry field on purpose: the
+        dispatching item is chain item #1 and is not a link, so γ emits
+        ``1 + depth`` (merge_queue.py, ``_run_inflight_verify``'s chain arm).
+        A 2-link chain is ``depth == 2`` and ``chain_items == 3``.
+        """
         return len(self.links)
 
 

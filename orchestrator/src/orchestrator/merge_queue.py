@@ -2579,12 +2579,17 @@ async def _run_post_merge_verify(
         speculative: Mirrors ``item.speculative``; threaded straight into
             ``pool.dispatch`` alongside *depth*.  ``None`` (default) keeps
             every existing caller byte-identical.
-        chain_items: 1-indexed count of queued items contained in the tree
-            this verify exercises (task 3185, PRD γ); threaded straight into
+        chain_items: Count, in CHAIN-ITEM units, of the items contained in the
+            tree this verify exercises (task 3185, PRD γ) — the dispatching
+            item is chain item #1, and each chained successor actually BUILT
+            adds one.  Deliberately frontier-INDEPENDENT: an ordinary verify
+            that chained nothing is 1 no matter how many other verifies are in
+            flight, which is what makes ``chain_items >= 2`` a sound
+            deep-verify discriminator.  Threaded straight into
             ``pool.dispatch`` alongside *depth*/*speculative*, at the initial
             dispatch AND at BOTH retry dispatches — a retry re-verifies the
             same tree, so dropping back to the default there would understate
-            depth in exactly the rows the deep-fail-rate reader keys on.
+            the chain in exactly the rows the deep-fail-rate reader keys on.
             Unlike *depth*/*speculative* this defaults to ``1``, not ``None``:
             a count of items in a verified tree has a smallest TRUTHFUL value
             of 1, so every existing caller (``reverify_member_solo``,
@@ -17262,19 +17267,28 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             :class:`ProbePlacement`'s docstring for the full caveat and the
             deferred follow-up (redirecting dispatch itself onto the deep
             tip) that would close this gap.
-        chain_items: 1-indexed count of queued items contained in the tree
-            this verify ACTUALLY EXERCISES (task 3185, PRD γ), computed
-            synchronously by the caller (_dispatch_item) and forwarded into
+        chain_items: Count, in CHAIN-ITEM units, of the items contained in
+            the tree this verify ACTUALLY EXERCISES (task 3185, PRD γ) — the
+            dispatching item is chain item #1 — forwarded into
             _run_post_merge_verify alongside depth/speculative.
+
+            The caller (_dispatch_item) always passes a flat ``1``: a
+            dispatch that builds no chain contributes exactly the one item it
+            was created for.  Only the ``chain`` arm below raises it, and it
+            COMPUTES ``1 + len(chain.links)`` outright rather than
+            accumulating onto this value.
 
             Deliberately contrasts with ``depth`` directly above: ``depth``
             is an ATTRIBUTION label that a firing probe relabels onto a
             deeper stack which this verify never touched, whereas
-            ``chain_items`` is a fact about the tree that actually ran. That
-            is why the caller derives it from _verify_frontier_depth()
-            rather than from its local ``depth`` variable, and why a
-            consumer wanting real cumulative-diff coverage reads this field
-            and not that one.
+            ``chain_items`` is a fact about the tree that actually ran.  It
+            is also deliberately frontier-INDEPENDENT (the frozen-prefix
+            height is ``depth``'s job, unchanged), because
+            ``chain_items >= 2`` is the deep-verify discriminator that
+            scripts/merge-deep-canary-predicate.sh:84 keys on — and under the
+            shipped ``chain_cap=0`` kill switch nothing chains, so nothing may
+            emit ``>= 2``.  A consumer wanting real cumulative-diff coverage
+            reads this field and not that one.
 
             Defaults to ``1`` — NOT ``None`` — because a count of items in a
             verified tree has a smallest truthful value of 1, so the shim /
@@ -17306,11 +17320,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                inside that block) is left untouched — an attempt that never
                ran the warm acquire must not advance the cold-verify safety
                valve.
-            2. ``chain_items`` is EXTENDED by ``len(chain.links)``: the caller
-               passes the frontier-derived count for *item* alone, and the
-               links actually BUILT are added here.  A 6-target that truncated
-               after 2 links emits the 2, never the 6 — the field is a fact
-               about the tree that ran.
+            2. ``chain_items`` is RECOMPUTED here as ``1 + len(chain.links)``
+               — the dispatching item as chain item #1, plus the links
+               actually BUILT.  Computed, not accumulated: the caller's value
+               is deliberately ignored on this arm so the emitted unit is a
+               fact about the verified tree and cannot drift with the caller's
+               own derivation.  A 6-target that truncated after 2 links emits
+               3, never 7 and never 6.
             3. The lane is released EXACTLY ONCE, in the ``finally`` below, on
                the pass / fail / exception exits alike.  ``ChainResult``'s
                "Lane ownership" contract makes that release the caller's
@@ -17334,10 +17350,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 'returned an empty result it should have declined'
             )
             merge_commit = chain.tip.strip()
-            # The caller's `chain_items` counts the frontier plus the
-            # dispatching item; the links actually BUILT are added here (never
-            # the target that was requested — see the docstring, consequence 2).
-            chain_items = chain_items + len(chain.links)
+            # COMPUTED, not accumulated: the dispatching item is chain item #1
+            # and the links actually BUILT follow it (never the target that was
+            # requested — see the docstring, consequence 2). Deliberately does
+            # NOT read the caller's `chain_items`, so the emitted unit is a
+            # fact about the verified tree and cannot drift if the caller's own
+            # derivation ever changes.
+            chain_items = 1 + len(chain.links)
         else:
             merge_wt = item.merge_wt
             assert merge_wt is not None
@@ -19809,23 +19828,42 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         placement = self._probe_verify_placement(item)
         depth = placement.depth if placement is not None else self._verify_frontier_depth()
         probe_base = placement.base if placement is not None else None
-        # task 3185 (PRD γ): the TRUTHFUL 1-indexed count of items in the tree
-        # this verify actually exercises -- the honest depth signal `depth`
-        # above cannot be, and the one ε's deep-fail-rate reader keys on.
+        # task 3185 (PRD γ): the count of items in the tree this verify
+        # actually exercises, in CHAIN-ITEM UNITS -- the honest coverage signal
+        # `depth` above cannot be, and the one ε's deep-fail-rate reader keys
+        # on.
         #
-        # Reads _verify_frontier_depth() DIRECTLY rather than reusing the
-        # local `depth`: a firing ProbePlacement has already overwritten
-        # `depth` with an attribution fact about a deeper already-built stack
-        # that this dispatch does NOT verify (see ProbePlacement's KNOWN
-        # PHASE-1 LIMITATION). Deriving chain_items from that would import the
-        # probe-era off-by-one this field exists to replace.
+        # THE UNIT. The dispatching item is chain item #1, and a dispatch that
+        # builds no chain contributes exactly that one item -- so this is a
+        # flat 1 on BOTH arms. Only _run_inflight_verify's deep-chain arm adds
+        # more, and it COMPUTES `1 + len(chain.links)` outright rather than
+        # accumulating onto this value.
         #
-        # The non-speculative arm is a FLAT 1, not `frontier + 1`: a slot-1
-        # item is merged onto REAL MAIN, so its tree contains exactly itself
-        # no matter how many other verifies are in flight ahead of it. A
-        # blanket `depth + 1` would over-count precisely that case (a
-        # non-speculative re-merge dispatched against a non-empty frontier).
-        chain_items = (self._verify_frontier_depth() + 1) if item.speculative else 1
+        # DELIBERATELY FRONTIER-INDEPENDENT, and no frontier is read here at
+        # all. Folding the frozen-prefix height in would make an ORDINARY
+        # adjacent speculative verify emit >= 2 whenever another verify is in
+        # flight, which destroys the field's only job: `chain_items >= 2` is
+        # the deep-verify discriminator (scripts/merge-deep-canary-predicate.sh:84,
+        # ζ's "first deep verify observed" deploy signal, η1's deep-fail-rate
+        # DENOMINATOR). Under the shipped `chain_cap=0` kill switch nothing can
+        # chain, so nothing may emit >= 2 -- otherwise the canary fires on day
+        # one and measures rounds that chained nothing.
+        #
+        # NOTHING IS LOST. The frozen-prefix height is exactly what the
+        # separate, always-present `depth` field above has always carried, and
+        # it is unchanged by this. The two fields answer different questions:
+        # `depth` is an ATTRIBUTION label (a firing ProbePlacement relabels it
+        # onto a deeper already-built stack this dispatch never verifies -- see
+        # its KNOWN PHASE-1 LIMITATION), whereas `chain_items` is a fact about
+        # the tree that actually ran.
+        #
+        # PRD-WORDING NUANCE, so the next reader does not "fix" this back to
+        # the frontier-inclusive reading: the PRD's "1-indexed count of items
+        # in the verified tree" is 1-indexed about the CHAIN (item #1, #2, ...
+        # walking down chain.links), not about the queue's frozen prefix. The
+        # prefix is the BASE this item was merged onto, not a member of the
+        # chain that was built and verified on top of it.
+        chain_items = 1
         # task 3185 (PRD γ): the DEEP gate, consulted at the same seam as the
         # probe above so both second-slot policies live in one place. Unlike
         # the probe -- which only relabels this dispatch's depth/base -- a
