@@ -9,6 +9,7 @@ orchestrator/src/orchestrator/verify.py: ``_VENV_ISOLATION_KEYS`` /
 """
 
 import os
+from pathlib import Path
 
 from orchestrator import verify
 from orchestrator.verify import (
@@ -102,6 +103,42 @@ class TestTargetSubprocessEnvScrub:
         assert env["PATH"] == "/home/leo/.cargo/bin:/usr/bin"
         assert env["PYTHONUNBUFFERED"] == "1"
 
+
+
+class TestRuffCacheIsWorktreeLocal:
+    """The ruff cache dir must terminate at the worktree boundary (task 3922).
+
+    ruff resolves BOTH its config and its cache by walking parent dirs up from
+    each linted file.  A task worktree whose own root declares no
+    ``[tool.ruff]`` therefore escapes: the walk reaches the PARENT checkout's
+    pyproject.toml and, with it, the parent's ``.ruff_cache`` — so a merge gate
+    running inside ``.worktrees/<id>`` reads and writes cache state shared with
+    every concurrently-verifying sibling and with the parent's UNCOMMITTED
+    working tree.
+
+    Measured on ruff 0.15.9 in exactly that geometry: setting
+    ``RUFF_CACHE_DIR`` redirects the reported ``cache_dir`` while leaving the
+    resolved ``Settings path`` AND the emitted rule codes byte-identical
+    ({I001, F401} both ways).  That rule-neutrality is what licenses applying
+    the lever UNCONDITIONALLY — to every worktree at any base age — instead of
+    a ``--config`` pin, which was measured to silently fall back to ruff's
+    built-in defaults ({F401} only) when aimed at a rule-less pyproject.
+    """
+
+    def test_worktree_local_ruff_cache_dir_is_injected(self, monkeypatch):
+        fake_environ = {
+            "VIRTUAL_ENV": ORCH_VENV,
+            "PATH": f"{ORCH_VENV}/bin:/usr/bin",
+            "HOME": "/home/leo",
+        }
+        monkeypatch.setattr(verify.os, "environ", fake_environ)
+
+        env = _target_subprocess_env(None, worktree=Path("/w/.worktrees/77"))
+
+        assert env["RUFF_CACHE_DIR"] == "/w/.worktrees/77/.ruff_cache"
+        # the rest of the scrub is unchanged by the new parameter
+        assert env["PYTHONUNBUFFERED"] == "1"
+        assert "VIRTUAL_ENV" not in env
 
 class TestOrchEnvScrub:
     """The orchestrator's ``ORCH_*`` control-plane namespace must not leak into
