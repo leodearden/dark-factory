@@ -420,6 +420,18 @@ mcp__escalation__resolve_issue(
 
 Then continue to the next escalation — the steps below apply only to records whose `task_id` is a real task.
 
+##### Any other `scope_violation`: probe the task before acting
+
+Before the steps below, probe the subject task once — the same get-task-then-branch idiom [`stranded_blocked`](#stranded_blocked) uses to re-verify its predicate:
+
+```
+task = mcp__fused-memory__get_task(id=<task_id>, project_root=<project_root>)
+```
+
+**If no such task exists**, the record is filed under a synthetic anchor this recipe has not been taught about. Do **not** `resume` — a resume on a non-existent task is a no-op that leaves the record `pending` and the supervisor spinning. Close it exactly as the named branch above does (`action='close_only'`, `resolution_class='benign'`), naming the unrecognised anchor verbatim in the `resolution`, and emit the digest line under the same `### Auto-closed L1 (path-guard synthetic-anchor audit)` heading with `mode=unrecognised-anchor` — so an operator can see that a NEW producer appeared rather than having it silently absorbed. This is not hypothetical: the same producer module already files a FOURTH synthetic anchor (`adjudicator-budget-defect`), under a different category, that this recipe deliberately does not handle.
+
+**If the task DOES exist**, fall through to the steps below unchanged. This branch must never close a record whose task exists — that would silently drop real scope work.
+
 1. Resolve with `action='resume'`, carrying the grant as `granted_files`:
    ```
    mcp__escalation__resolve_issue(
