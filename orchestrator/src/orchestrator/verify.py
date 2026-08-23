@@ -3756,20 +3756,77 @@ def _ruff_settings_path(worktree: Path, target: Path | None = None) -> Path | No
     return None
 
 
-def _ruff_config_escapes(worktree: Path, target: Path | None = None) -> bool:
-    """True iff ruff's resolved settings for *target* live OUTSIDE *worktree*.
+def _settings_path_escapes(settings: Path | None, worktree: Path) -> bool:
+    """True iff *settings* is a real path lying OUTSIDE *worktree*.
 
-    Fail-safe in the quiet direction: an unmeasurable probe (``None`` from
-    ``_ruff_settings_path``) reports False, so a broken or absent ruff produces
-    silence rather than a spurious diagnostic.
+    The single escape predicate, shared by ``_ruff_config_escapes`` and by the
+    reporter — one detection site, never a second copy of the comparison.
+    Fail-safe in the QUIET direction: an unmeasurable probe (``None``) or an
+    unresolvable path reports False, so a broken or absent ruff produces silence
+    rather than a spurious diagnostic.
     """
-    settings = _ruff_settings_path(worktree, target)
     if settings is None:
         return False
     try:
         return not settings.resolve().is_relative_to(Path(worktree).resolve())
     except OSError:
         return False
+
+
+def _ruff_config_escapes(worktree: Path, target: Path | None = None) -> bool:
+    """True iff ruff's resolved settings for *target* live OUTSIDE *worktree*."""
+    return _settings_path_escapes(_ruff_settings_path(worktree, target), worktree)
+
+
+# Stable, greppable token carried by the escape diagnostic, so an operator (and
+# the guard test) can key on the RECORD rather than on its prose.
+_RUFF_ESCAPE_MARKER = 'ruff-config-escapes-worktree'
+
+
+def _report_ruff_config_escape(worktree: Path, *, latch: set[str]) -> None:
+    """Emit the ONE non-fatal diagnostic for a worktree whose ruff config escapes.
+
+    Deliberately an INTERPRETATION layered on top of the lint leg, never a
+    verdict — exactly the shape of the mis-resolved-interpreter record in
+    ``_run_or_skip_timed``.  Hard-failing an escaping worktree was rejected:
+    it would red every stale-based worktree on the host at once (286 of 567
+    carried no ``[tool.ruff]`` at time of writing), the fleet-wide outage mode
+    pyproject.toml's ``[tool.ruff]`` block warns against.  The escape is a
+    property of the BRANCH'S BASE AGE, not of the code under review, so the
+    branch must still be judged on its own lint output.
+
+    *latch* makes this at most ONE probe (and one record) per verify run rather
+    than one per command: the answer cannot change within a run, and the probe
+    costs a subprocess.  Structurally non-fatal — nothing here propagates.
+    """
+    if _RUFF_ESCAPE_MARKER in latch:
+        return
+    latch.add(_RUFF_ESCAPE_MARKER)
+    try:
+        settings = _ruff_settings_path(worktree)
+        if not _settings_path_escapes(settings, worktree):
+            return
+        logger.warning(
+            'Lint gate ruff config ESCAPES this worktree (%s): ruff resolved its '
+            'settings from %s — a file OUTSIDE the worktree, in the parent '
+            "checkout's working tree, which this branch does not control and "
+            'which may be uncommitted. ruff walks parent dirs up from each '
+            'linted file and a git root does not stop it, so a worktree whose '
+            'own root declares no [tool.ruff] inherits whatever the parent '
+            'currently has. The lint verdict below is UNCHANGED and still '
+            'yours to act on; this line only explains why its rule set may not '
+            "match this branch's. Remediation: merge main forward so this "
+            "branch's own root pyproject.toml declares [tool.ruff]. "
+            '(%s; task 3922)',
+            worktree,
+            settings,
+            _RUFF_ESCAPE_MARKER,
+        )
+    except Exception:
+        # Intentionally blind: a DIAGNOSTIC must never be able to red a verify,
+        # so every failure mode degrades to a DEBUG line and silence. The
+        # helpers above are already total; this is the belt-and-braces layer.
+        logger.debug('ruff config-escape probe failed; skipping', exc_info=True)
 
 
 @dataclass(frozen=True)
@@ -5172,6 +5229,12 @@ async def run_verification(
             infix = ''
         return verify_dir / f'attempt-{current_attempt}{infix}.{label}.log'
 
+    # One-probe-per-verify latch for the ruff config-escape diagnostic (task
+    # 3922). The answer is a property of the worktree, so it cannot change
+    # within a run; without this the probe would respawn on every retry and
+    # every leg, and the operator would read the same line N times.
+    _ruff_escape_latch: set[str] = set()
+
     async def _run_or_skip_timed(
         cmd: str | None,
         *,
@@ -5428,6 +5491,15 @@ async def run_verification(
         # regex. The raw pyright text still streams to the per-leg log file
         # untouched; this line is an interpretation layered ON TOP of it, not a
         # replacement for it (loud-over-silent-degradation).
+        # Ruff config-escape diagnostic (task 3922), sited alongside the
+        # interpreter record below for the same reason: this is the single
+        # post-_run_cmd path, so the record is structurally at-most-once.
+        # Gated to where it can be true at all — a ruff-bearing LINT leg, whose
+        # cwd is the worktree root verbatim. Fires on green legs too: the escape
+        # is about which RULE SET ran, which is exactly the question a green
+        # result cannot answer for itself.
+        if label == 'lint' and 'ruff' in config_cmd:
+            _report_ruff_config_escape(worktree, latch=_ruff_escape_latch)
         if rc != 0 and is_interpreter_missing_workspace_packages(out):
             logger.error(
                 'Verification %r check failed against a Python interpreter that '
