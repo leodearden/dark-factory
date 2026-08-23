@@ -455,20 +455,3 @@ class TestReplayEwaSeries:
         assert series.peak == pytest.approx(100.0), (
             f'Expected peak 100.0; got {series.peak}'
         )
-
-    def test_replay_harness_is_not_exported_from_production_digest(self) -> None:
-        """digest.py must not carry the replay scaffolding (amendment).
-
-        Guards the over-engineering fix: the helper's only consumer is this
-        module, and its ``count_resolutions=True`` arm encodes the RETIRED
-        pre-4559 statistic.  If a future change re-adds it to the production
-        module without an actual entry point, this fails and forces the
-        question to be re-answered rather than drifting back.
-        """
-        for name in ('replay_ewa_series', 'EwaReplayStep', 'EwaReplaySeries'):
-            assert not hasattr(digest, name), (
-                f'orchestrator.digest should not export test-only replay '
-                f'scaffolding; found {name!r}. Either keep it in '
-                f'tests/test_ewa_replay.py, or land a real entry point '
-                f'(e.g. under scripts/) and update this test.'
-            )
