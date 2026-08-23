@@ -31,6 +31,28 @@ task worktree at HEAD ``446ba24fbc``:
     interpreter rather than guessed: the main checkout's ``.venv`` is CPython
     3.13.9, several cold-verified ``.worktrees/*/.venv`` are CPython 3.14.0, and
     this task's own worktree had no ``.venv`` at all.
+  - A first-party workspace member is installed EDITABLE, so it resolves into a
+    checkout's ``src/`` tree rather than into ``site-packages``:
+    ``import shared`` -> ``<checkout>/shared/src/shared/__init__.py`` in 0.081s.
+    That inverse is the whole reason there are two markers and two tests; a
+    single assertion covering both would have to be a disjunction that certifies
+    neither.
+
+WHY THE PROVENANCE CHECK PROBES ``shared`` AND NOT ``orchestrator``. Measured in
+this task's worktree, not assumed. This suite's own ``test_command`` is
+``uv run --project shared pytest ...``; when that command has to CREATE the
+worktree ``.venv`` it installs shared's closure only — 87 packages, with
+``shared`` itself editable and no ``orchestrator``. A subprocess probing
+``orchestrator`` there does not fail loudly: the repo root is on ``sys.path``
+for a ``python -c``, so the ``orchestrator/`` DIRECTORY is picked up as a
+NAMESPACE package and ``orchestrator.__file__`` prints ``None`` — the exact
+shadowing hazard the root ``conftest.py`` docstring exists to prevent, which it
+handles for the in-process case only (a subprocess inherits none of its
+``sys.path`` work). ``shared`` is the one member this command guarantees is
+installed as a regular editable package, so probing it keeps a red here meaning
+"the documented recipe is wrong" rather than "this venv was provisioned
+narrowly". The ``exists()`` assertion below still catches the namespace case
+loudly if it ever arises.
 
 WHY ``sys.executable``, AND WHY ``timeout=60`` INSTEAD OF A WALL-CLOCK ASSERT.
 Two separate hazards. (1) ``verify._target_subprocess_env`` — cited by SYMBOL,
@@ -67,6 +89,7 @@ import re
 import shlex
 import subprocess
 import sys
+import tomllib
 
 import pytest
 
@@ -74,8 +97,16 @@ REPO_ROOT = pathlib.Path(__file__).parents[2]
 
 CLAUDE_MD_PATH = REPO_ROOT / "CLAUDE.md"
 
+PYPROJECT_PATH = REPO_ROOT / "pyproject.toml"
+
 PACKAGE_SOURCE_MARKER = "package-source-lookup"
 PACKAGE_SOURCE_LABEL = "Third-party package source"
+
+IMPORT_PROVENANCE_MARKER = "import-provenance-check"
+IMPORT_PROVENANCE_LABEL = "First-party import provenance"
+
+# `import alpha, os` / `import alpha` — the module the documented -c body probes.
+_IMPORTED_MODULE = re.compile(r"\bimport\s+([A-Za-z_][A-Za-z0-9_]*)")
 
 # The documented recipe must be an INTERPRETER QUERY. This is the shape that
 # distinguishes it from the `find /` scan the task exists to retire.
@@ -333,4 +364,108 @@ def test_documented_package_source_lookup_resolves_a_third_party_package():
         f"resolves into a checkout's src/ tree), the recipe no longer "
         f"demonstrates what the surrounding section claims — probe a genuinely "
         f"third-party package instead."
+    )
+
+
+def _workspace_member_modules():
+    """Importable module names of the ``[tool.uv.workspace].members`` directories.
+
+    Read live from the root ``pyproject.toml`` rather than hardcoded, so that a
+    workspace-member rename cannot silently un-test the provenance check: the
+    cross-check below goes loudly red naming the live member set instead.
+
+    Normalises directory name -> module name with ``.replace("-", "_")``, since
+    ``fused-memory`` imports as ``fused_memory``. Both the member list and every
+    normalised name are asserted non-empty — a discovery that silently matches
+    nothing turns every downstream assertion green while checking nothing at all,
+    which is strictly worse than no guard because the check still reports
+    success.
+
+    ``tomllib`` is stdlib on 3.11+ and this repo requires ``>=3.11``, so no
+    dependency is added to a suite that runs under ``uv run --project shared``.
+    """
+    data = tomllib.loads(PYPROJECT_PATH.read_text(encoding="utf-8"))
+    members = data["tool"]["uv"]["workspace"]["members"]
+    assert members, (
+        f"[tool.uv.workspace].members in {PYPROJECT_PATH} is empty (task 3959) — "
+        f"the first-party cross-check below would pass vacuously"
+    )
+
+    modules = {member.rstrip("/").rsplit("/", 1)[-1].replace("-", "_") for member in members}
+    assert all(modules), (
+        f"a workspace member in {PYPROJECT_PATH} normalised to an empty module "
+        f"name (task 3959): members={members!r}"
+    )
+    return modules
+
+
+def test_documented_import_provenance_check_resolves_to_a_checkout_source_tree():
+    """CLAUDE.md's first-party recipe must resolve into a checkout's ``src/`` tree.
+
+    This is the DISCRIMINATING half, and the reason the two markers are separate:
+    a first-party workspace member is installed EDITABLE, so it lands in a
+    checkout's source tree, which is the exact inverse of the third-party
+    assertion above. That is also the concrete mechanism behind the OPERATIONS.md
+    Troubleshooting symptom "a task blocks at VERIFY with ``AttributeError`` for
+    code it just wrote" — from a worktree shell that inherited main's
+    ``VIRTUAL_ENV``, a first-party import gives you MAIN's source, not the
+    worktree edits.
+
+    DELIBERATELY NOT ASSERTED: that the resolved path is under ``REPO_ROOT``. In
+    a cold-verified worktree running its own ``.venv`` the editable install
+    correctly points at THAT worktree; from an un-synced worktree it correctly
+    resolves to the main checkout. Both are valid, and pinning either would go
+    red in the other environment.
+    """
+    command = _marked_command(
+        CLAUDE_MD_PATH.read_text(encoding="utf-8"),
+        IMPORT_PROVENANCE_MARKER,
+        IMPORT_PROVENANCE_LABEL,
+    )
+    body = _interpreter_query_body(command, IMPORT_PROVENANCE_MARKER)
+
+    # The probe must be FIRST-PARTY, cross-checked against the live workspace
+    # table. Probing a third-party package here would make the site-packages
+    # assertion below fail for the right-looking wrong reason.
+    imported = _IMPORTED_MODULE.findall(body)
+    assert imported, (
+        f"could not find an `import <module>` in the {IMPORT_PROVENANCE_MARKER!r} "
+        f"command documented in CLAUDE.md (task 3959): {body!r}"
+    )
+    probed = imported[0]
+    members = _workspace_member_modules()
+    assert probed in members, (
+        f"the {IMPORT_PROVENANCE_MARKER!r} command documented in CLAUDE.md probes "
+        f"{probed!r}, which is not a workspace member (task 3959). Live members, "
+        f"normalised to module names: {sorted(members)}. This marker documents "
+        f"FIRST-PARTY import provenance — editable installs resolving into a "
+        f"checkout's src/ tree — so it must probe a workspace member. If a member "
+        f"was renamed, update the command in CLAUDE.md to match."
+    )
+
+    resolved = _run_documented_query(body, IMPORT_PROVENANCE_MARKER)
+    resolved_path = pathlib.Path(resolved)
+    assert resolved_path.exists(), (
+        f"the {IMPORT_PROVENANCE_MARKER!r} command documented in CLAUDE.md printed "
+        f"{resolved!r}, which does not exist (task 3959). A printed 'None' means "
+        f"{probed!r} was NOT installed in {sys.executable}'s environment and the "
+        f"repo-root directory of the same name was picked up as a NAMESPACE "
+        f"package instead — provision the venv (`uv sync --all-packages`) rather "
+        f"than weakening this assertion."
+    )
+    assert "site-packages" not in resolved_path.parts, (
+        f"the {IMPORT_PROVENANCE_MARKER!r} command documented in CLAUDE.md resolved "
+        f"{probed!r} to {resolved!r}, which is UNDER site-packages (task 3959). "
+        f"This marker exists to demonstrate the opposite of the "
+        f"{PACKAGE_SOURCE_MARKER!r} one: a first-party workspace member is "
+        f"installed editable, so it must resolve into a checkout's source tree. A "
+        f"copied-in (non-editable) install would silently give agents main's "
+        f"stale code, which is the failure this check surfaces."
+    )
+    assert "src" in resolved_path.parts, (
+        f"the {IMPORT_PROVENANCE_MARKER!r} command documented in CLAUDE.md resolved "
+        f"{probed!r} to {resolved!r}, which has no `src/` segment (task 3959) — "
+        f"this repo's members all live at <pkg>/src/<pkg>/, so the resolved path "
+        f"does not look like a checkout source tree at all. Which tree it actually "
+        f"resolved to is named above; read it before changing anything."
     )
