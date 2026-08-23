@@ -64,6 +64,37 @@ cd fused-memory && uv sync
 
 Full fresh-machine walkthrough: `SETUP.md`.
 
+### Locating installed code
+
+The uv workspace has ONE root `.venv` per tree — `<project_root>/.venv` (CPython
+3.13.9, uv 0.11.6 in the main checkout). None of the seven workspace members
+carries its own. A task worktree gets an INDEPENDENT root `.venv`, not a share
+of main's, once it has been cold-verified — `verify_cold_preprovision_command:
+"uv sync --all-packages"` runs *inside* the worktree, and such a venv can even
+be a different interpreter (measured: several `.worktrees/*/.venv` are CPython
+3.14.0 against main's 3.13.9). Before that it has no `.venv` at all. Meanwhile
+an agent Bash session typically inherits `VIRTUAL_ENV` and a bare `python` from
+the MAIN checkout's `.venv` even when cwd is a worktree.
+
+So the venv path is **not derivable from your cwd**. Ask the interpreter; never
+guess a path.
+
+<!-- package-source-lookup:begin
+     This command is EXECUTED verbatim by
+     tests/scripts/test_package_source_lookup_convention.py. Edit it into
+     anything that is not a `python -c` interpreter query and that guard goes
+     red — that is deliberate, and it is what keeps this recipe honest. -->
+- **Third-party package source**: `python -c 'import uvicorn, os; print(os.path.dirname(uvicorn.__file__))'`
+<!-- package-source-lookup:end -->
+
+That prints `<venv>/lib/python3.13/site-packages/uvicorn` in ~0.4s (measured
+0.396s); grep inside that directory for whatever you actually wanted.
+
+**Never `find /` for an installed package.** The scan this replaces —
+`find / -path '*/uvicorn/config.py'` — blew through the Bash tool's 120000ms
+default `timeout` and returned nothing (exit 143). That `timeout` can be raised,
+but raising it is the wrong fix: the scoped query above is ~300x faster.
+
 ## Memory Usage
 
 ### When to read memory
