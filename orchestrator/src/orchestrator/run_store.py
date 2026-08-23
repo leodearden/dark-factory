@@ -458,7 +458,9 @@ class RunStore:
             conn.close()
 
     def refresh_scheduler_pause_ewa(self, project_id: str, ewa_value: float) -> bool:
-        """Update ONLY ``ewa_value`` on an existing pause row.  Returns True if one existed.
+        """Update ONLY ``ewa_value``, and only on a held ``ewa_trip_`` pause row.
+
+        Returns True if such a row existed and was updated.
 
         Task 4559 amendment.  ``save_scheduler_pause`` writes a trip-TIME
         snapshot, and it is the only writer, so once a halt is asserted the
@@ -478,12 +480,31 @@ class RunStore:
         ``set_by_run_id`` are left untouched so the row keeps recording WHEN
         and WHY the halt was asserted while ``ewa_value`` tracks the live
         statistic.  The bool return lets the caller distinguish "refreshed"
-        from "no row" without a second read.
+        from "no ``ewa_trip_`` row to refresh" without a second read.
+
+        The ``ewa_trip_`` scope is enforced HERE, in the WHERE clause, not only
+        at the call site.  ``_maybe_write_digest`` step (13b) does pre-filter on
+        ``scheduler.pause_reason``, but that is the IN-MEMORY reason and the two
+        can diverge: ``Scheduler.pause`` is first-wins in memory while
+        ``save_scheduler_pause`` is INSERT OR REPLACE, i.e. last-wins on disk.
+        A held ``ewa_trip_`` halt plus a later ``pause_scheduler('park-stop: …')``
+        — an in-memory no-op that still rewrites the row — would otherwise let
+        every subsequent digest step overwrite that park-stop row's trip-time
+        ``ewa_value`` with the decaying EWA, destroying the forensic evidence
+        ``pause_scheduler`` promises is never overwritten for non-EWA classes.
+        For ``ewa_trip_`` rows alone the stored scalar IS the live statistic;
+        for every other class it is evidence about that pause.
         """
         conn = self._connect()
         try:
+            # substr(...) rather than LIKE 'ewa_trip_%': in SQL LIKE, `_` is a
+            # single-character WILDCARD, so that pattern would also match
+            # reasons like 'ewaXtripY...'.  substr is an exact prefix test and
+            # mirrors the caller's Python `startswith('ewa_trip_')` byte for
+            # byte.  len('ewa_trip_') == 9.
             cursor = conn.execute(
-                'UPDATE scheduler_state SET ewa_value = ? WHERE project_id = ?',
+                'UPDATE scheduler_state SET ewa_value = ? '
+                "WHERE project_id = ? AND substr(pause_reason, 1, 9) = 'ewa_trip_'",
                 (ewa_value, project_id),
             )
             conn.commit()
