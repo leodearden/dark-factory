@@ -768,9 +768,18 @@ class TestRenderDigestMarkdown:
             f'Expected the submissions figure to be labelled as the numerator; '
             f'got section:\n{ewa_section}'
         )
-        assert '4' in ewa_section, f'Expected the submissions figure 4; got:\n{ewa_section}'
-        assert '20' in ewa_section, (
-            f'Expected the lifecycle-event (gate) figure 20; got:\n{ewa_section}'
+        # Anchored on the FULL rendered line, not a bare substring: the same
+        # section also renders '- Value / threshold: 2.5000 / 3.0000', so a
+        # loose `'4' in ewa_section` would pass on a stray digit from a float
+        # and go vacuously true if _make_digest_inputs's ewa_value/threshold
+        # ever changed -- even with both lines missing entirely.
+        assert '- Submissions in step (EWA numerator): 4' in ewa_section, (
+            f'Expected the submissions figure rendered as its own labelled '
+            f'line; got section:\n{ewa_section}'
+        )
+        assert '- Lifecycle events in step (digest gate): 20' in ewa_section, (
+            f'Expected the lifecycle-event (gate) figure rendered as its own '
+            f'labelled line; got section:\n{ewa_section}'
         )
 
     def test_digest_inputs_new_fields_default_to_zero(self) -> None:
