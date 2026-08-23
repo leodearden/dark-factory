@@ -28,6 +28,7 @@ import logging
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -184,14 +185,17 @@ class TestRuffProbeResolution:
         assert proc.stdout.startswith('ruff ')
 
 
-def _module_config(**overrides):
+def _module_config(**overrides: Any) -> ModuleConfig:
     """A minimal three-leg module config whose lint leg names ruff.
 
     Module-local rather than imported from a sibling admission test: each of
     those files states the same self-containment rationale, and a conftest.py
     edit would trip verify.py's ``has_conftest``.
     """
-    kwargs = dict(
+    # Annotated dict[str, Any], matching the sibling admission tests: an
+    # inferred dict[str, str | bool] makes every ModuleConfig kwarg a pyright
+    # error at the ** expansion.
+    kwargs: dict[str, Any] = dict(
         prefix='pkg',
         test_command='pytest tests/',
         lint_command='ruff check scripts/',
