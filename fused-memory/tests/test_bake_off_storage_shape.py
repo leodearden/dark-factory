@@ -661,7 +661,10 @@ def _regrowth_arm(mode: str) -> tuple:
     ))
 
 
-def _indexed(records) -> object:
+def _indexed(records):
+    """Returns the module's `SeededArm`; unannotated so its attributes stay
+    reachable — the dynamic `_mod()` import makes the type `Any`, and naming
+    it `object` here instead hid every field behind an attribute error."""
     mod = _mod()
     return mod._index_arm(
         'c_peers', 'p', 'c', list(records), _committed_inputs()['claims'],

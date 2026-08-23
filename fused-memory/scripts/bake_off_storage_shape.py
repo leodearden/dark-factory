@@ -5128,8 +5128,13 @@ async def run_bake_off(
             ))
             if regrowth and shape == REGROWTH_SHAPE:
                 base_records = records
+                # Read back through `fetched_by_shape` rather than the local
+                # `fetched`: `capture` is true whenever this branch is, so the
+                # two name the SAME object, but the dict's value type is
+                # non-optional.  A broken invariant then surfaces as a
+                # KeyError here instead of measuring against a silent `None`.
                 baseline = _plucked_regrowth_arms(measure_regrowth_arms(
-                    seeded, fetched, queries=queries, probes=probes,
+                    seeded, fetched_by_shape[shape], queries=queries, probes=probes,
                     estimator=estimator, guard_threshold=guard_threshold,
                     limit=limit,
                 ))
