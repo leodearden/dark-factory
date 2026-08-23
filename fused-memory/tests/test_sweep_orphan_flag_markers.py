@@ -2621,102 +2621,177 @@ class TestKnownProjectsCoverageIssue:
     EMPTINESS IS THE WRONG KEY. ``build_known_projects_map`` seeds its
     candidates with the primary root BEFORE extending with the env roots, so
     an unset DASHBOARD_KNOWN_PROJECT_ROOTS yields a ONE-entry map, never an
-    empty one: the ``if not project_ids`` guard is unreachable in exactly the
-    degradation it was written to catch, and the nightly drain narrows to a
-    single project at exit 0, silently.
+    empty one: the ``if not known_projects`` guard is unreachable in exactly
+    the degradation it was written to catch, and the nightly drain narrows to
+    a single project at exit 0, silently.
 
-    Two cases must be told apart:
-      (i)  the env var is SET but names roots that did not make it into the
-           resolved map — a genuine degradation (typo, unreadable root, a
-           project moved), warned about LOUDLY and named root-by-root;
-      (ii) the env var is UNSET — the map is primary-only, so coverage is
-           single-project and the census is not fleet-wide. Reported, but NOT
-           as a hard failure: a legitimately single-project install would
-           otherwise warn-as-error forever.
+    DRIVEN END-TO-END, ON PURPOSE (task 2917 amendment,
+    reviewer_comprehensive #2). Every test here sets the real env var against
+    real tmp_path roots and feeds the real ``_known_projects_map()`` output
+    into the predicate. The previous version stubbed BOTH sides —
+    monkeypatching ``resolve_project_id_for_root`` AND hand-passing the
+    resolved id list — so it asserted on a (root_named, id_absent) state the
+    real pipeline provably cannot produce, and stayed green no matter what
+    the registry builder did.
+
+    Three cases must be told apart:
+      (i)   a named root that IS NOT A DIRECTORY (typo, moved/unmounted
+            checkout). ``Path.resolve()`` is non-strict, so the builder
+            ADMITS it under a basename-derived id — the sweep runs a phantom
+            project that enumerates 0, deletes 0 and exits 0;
+      (ii)  a named root whose resolved path is ABSENT from the map, i.e. its
+            project_id was claimed first by another root (first-wins). That
+            checkout is never swept;
+      (iii) the env var is UNSET — primary-only coverage. Reported, but NOT
+            as a hard failure: a legitimately single-project install would
+            otherwise warn-as-error forever.
     """
 
     @staticmethod
-    def _stub_root_ids(monkeypatch, mapping):
-        import fused_memory.models.scope as scope
+    def _resolve_pair(monkeypatch, primary_root, named_roots=None):
+        """Run the REAL resolution pair: build the registry exactly as
+        ``--list-known-projects`` does, then judge coverage on THAT map.
 
-        monkeypatch.setattr(
-            scope, 'resolve_project_id_for_root',
-            lambda root: mapping[str(root)],
+        Returns ``(known_map, issue)`` so a test can assert on both what the
+        builder actually produced and what the predicate said about it.
+        """
+        monkeypatch.setenv('PROJECT_ROOT', str(primary_root))
+        if named_roots is None:
+            monkeypatch.delenv('DASHBOARD_KNOWN_PROJECT_ROOTS', raising=False)
+        else:
+            monkeypatch.setenv(
+                'DASHBOARD_KNOWN_PROJECT_ROOTS',
+                ','.join(str(root) for root in named_roots),
+            )
+        known = _mod._known_projects_map()
+        return known, _mod._known_projects_coverage_issue(known)
+
+    @staticmethod
+    def _mkroot(parent, name):
+        root = parent / name
+        root.mkdir(parents=True)
+        return root
+
+    def test_unset_env_reports_single_project_coverage(self, monkeypatch, tmp_path):
+        """Case (iii): primary-only is legible, not silent."""
+        primary = self._mkroot(tmp_path, 'dark-factory')
+
+        known, issue = self._resolve_pair(monkeypatch, primary, named_roots=None)
+
+        assert list(known) == ['dark_factory'], (
+            f'The primary root is always seeded, so an unset env var yields a '
+            f'ONE-entry map -- the exact state an emptiness check cannot see; '
+            f'got {known!r}'
         )
-
-    def test_unset_env_reports_single_project_coverage(self, monkeypatch):
-        """Case (ii): primary-only is legible, not silent."""
-        monkeypatch.delenv('DASHBOARD_KNOWN_PROJECT_ROOTS', raising=False)
-
-        issue = _mod._known_projects_coverage_issue(['dark_factory'])
-
         assert issue is not None, (
             'A primary-only map must be REPORTED: it is the exact degradation '
-            'an empty-list check can never see, since the primary root is '
+            'an empty-map check can never see, since the primary root is '
             'always seeded into the map.'
         )
         assert 'DASHBOARD_KNOWN_PROJECT_ROOTS' in issue, issue
         assert 'dark_factory' in issue, issue
 
-    def test_env_set_but_under_resolved_is_reported_root_by_root(self, monkeypatch):
-        """Case (i): a named root that did not survive into the map is the
-        loud one — the operator needs to know WHICH root vanished."""
-        monkeypatch.setenv(
-            'DASHBOARD_KNOWN_PROJECT_ROOTS', '/a/dark-factory,/b/reify',
+    def test_named_root_that_is_not_a_directory_is_reported_root_by_root(
+        self, monkeypatch, tmp_path,
+    ):
+        """Case (i), and the reason id-membership was the wrong test.
+
+        A nonexistent root is NOT skipped by build_known_projects_map --
+        ``Path(raw).resolve()`` is non-strict, so the root is admitted under a
+        basename-derived project_id. Its id IS therefore in the map, an
+        id-membership predicate reports clean, and the wrapper goes on to
+        sweep a phantom project that counts 0 and exits 0. Asserted here on
+        the REAL map so the dead branch cannot come back.
+        """
+        primary = self._mkroot(tmp_path, 'dark-factory')
+        present = self._mkroot(tmp_path, 'reify')
+        gone = tmp_path / 'gone-project'  # deliberately never created
+
+        known, issue = self._resolve_pair(monkeypatch, primary, [present, gone])
+
+        assert 'gone_project' in known, (
+            f'Premise of this test: the builder ADMITS a nonexistent root '
+            f'(resolve() is non-strict), which is why membership-by-id cannot '
+            f'detect it; got {known!r}'
         )
-        self._stub_root_ids(monkeypatch, {
-            '/a/dark-factory': 'dark_factory',
-            '/b/reify': 'reify',
-        })
-
-        issue = _mod._known_projects_coverage_issue(['dark_factory'])
-
         assert issue is not None, (
-            'A root named in the env var but absent from the resolved map is a '
-            'genuine degradation and must not pass quietly.'
+            'A named root that is not a directory is a genuine degradation -- '
+            'it becomes a phantom project the sweep runs for nothing -- and '
+            'must not pass quietly.'
         )
-        assert '/b/reify' in issue, (
-            f'Expected the MISSING root to be named so the warning is '
+        assert str(gone) in issue, (
+            f'Expected the BROKEN root to be named so the warning is '
             f'actionable; got {issue!r}'
         )
-        assert '/a/dark-factory' not in issue, (
-            f'Expected only the missing root to be named, not the resolved '
+        assert str(present) not in issue, (
+            f'Expected only the broken root to be named, not the healthy '
             f'ones; got {issue!r}'
         )
 
-    def test_fully_resolved_multi_project_map_is_quiet(self, monkeypatch):
-        """No degradation, no noise — otherwise the warning stops being read."""
-        monkeypatch.setenv(
-            'DASHBOARD_KNOWN_PROJECT_ROOTS', '/a/dark-factory,/b/reify',
-        )
-        self._stub_root_ids(monkeypatch, {
-            '/a/dark-factory': 'dark_factory',
-            '/b/reify': 'reify',
-        })
+    def test_first_wins_collision_is_reported(self, monkeypatch, tmp_path):
+        """Case (ii): two real roots claiming ONE project_id.
 
-        assert _mod._known_projects_coverage_issue(['dark_factory', 'reify']) is None
+        build_known_projects_map keeps the first and drops the second, so the
+        dropped checkout is never swept. Its id is still in the map (the
+        winner's), which is the second reason an id-membership test was
+        structurally blind here -- coverage must be judged by resolved PATH.
+        """
+        primary = self._mkroot(tmp_path, 'dark-factory')
+        winner = self._mkroot(tmp_path / 'a', 'reify')
+        loser = self._mkroot(tmp_path / 'b', 'reify')
+
+        known, issue = self._resolve_pair(monkeypatch, primary, [winner, loser])
+
+        assert known.get('reify') == str(winner), (
+            f'Premise: first-wins keeps the earlier root; got {known!r}'
+        )
+        assert issue is not None, (
+            'A root whose project_id was already claimed is silently dropped '
+            'by the builder and never swept -- that must be reported.'
+        )
+        assert str(loser) in issue, (
+            f'Expected the DROPPED root to be named; got {issue!r}'
+        )
+        assert str(winner) not in issue, (
+            f'Expected the surviving root not to be named; got {issue!r}'
+        )
+
+    def test_fully_resolved_multi_project_map_is_quiet(self, monkeypatch, tmp_path):
+        """No degradation, no noise — otherwise the warning stops being read."""
+        primary = self._mkroot(tmp_path, 'dark-factory')
+        reify = self._mkroot(tmp_path, 'reify')
+        autotrade = self._mkroot(tmp_path, 'autotrade')
+
+        known, issue = self._resolve_pair(monkeypatch, primary, [reify, autotrade])
+
+        assert sorted(known) == ['autotrade', 'dark_factory', 'reify'], known
+        assert issue is None, issue
 
     def test_primary_root_repeated_in_the_env_var_is_not_a_degradation(
-        self, monkeypatch,
+        self, monkeypatch, tmp_path,
     ):
         """MEASURED on the live registry: DASHBOARD_KNOWN_PROJECT_ROOTS lists
         the primary root too, and build_known_projects_map drops it as a
         duplicate project_id (logged at INFO). A naive count comparison
         (len(map) < 1 + len(named)) would therefore cry degradation on every
-        healthy nightly run. Comparing resolved IDS is what makes the
-        predicate correct."""
-        monkeypatch.setenv(
-            'DASHBOARD_KNOWN_PROJECT_ROOTS',
-            '/a/dark-factory,/b/reify',
-        )
-        self._stub_root_ids(monkeypatch, {
-            '/a/dark-factory': 'dark_factory',
-            '/b/reify': 'reify',
-        })
+        healthy nightly run, and so would a path check that ignored the
+        first-wins dedup. Built for real here -- the env var names the primary
+        root itself -- rather than re-running the previous test's fixture
+        (task 2917 amendment, reviewer_comprehensive #3).
+        """
+        primary = self._mkroot(tmp_path, 'dark-factory')
+        reify = self._mkroot(tmp_path, 'reify')
 
-        # The map has exactly the two ids; the primary root's id simply
-        # coincides with a named one.
-        assert _mod._known_projects_coverage_issue(['dark_factory', 'reify']) is None
+        known, issue = self._resolve_pair(monkeypatch, primary, [primary, reify])
+
+        assert sorted(known) == ['dark_factory', 'reify'], (
+            f'The repeated primary root must be DEDUPED, not duplicated; '
+            f'got {known!r}'
+        )
+        assert issue is None, (
+            f'The repeated primary root resolves to a path that IS in the map, '
+            f'so it is not a degradation; got {issue!r}'
+        )
 
 
 class TestTerminalDrainIsPrimaryProjectOnly:
@@ -2834,7 +2909,7 @@ class TestTerminalDrainIsPrimaryProjectOnly:
 
 
 class TestListKnownProjects:
-    """_known_project_ids() — the registry-backed resolution behind
+    """_known_projects_map() — the registry-backed resolution behind
     --list-known-projects (task 2917 EDIT 1).
 
     The nightly wrapper previously swept exactly ONE project (the sweep's
@@ -2845,17 +2920,26 @@ class TestListKnownProjects:
     host-specific root list into a committed unit file.
 
     Fail-safe posture mirrors _resolve_terminal_task_ids: any failure
-    degrades to [] (logged at WARNING) rather than propagating.
+    degrades to {} (logged at WARNING) rather than propagating.
+
+    It returns the MAP, not just the ids: --list-known-projects prints
+    sorted(map) while _known_projects_coverage_issue judges coverage against
+    map.values(), so both consumers read ONE derivation of each root (task
+    2917 amendment, reviewer_comprehensive #6).
     """
 
-    def test_returns_sorted_project_ids_from_the_registry(self, monkeypatch):
+    def test_returns_the_registry_map_verbatim(self, monkeypatch):
         import fused_memory.models.scope as scope
 
         monkeypatch.setattr(
             scope, 'build_known_projects_map',
             lambda *_a, **_kw: {'reify': '/b', 'dark_factory': '/a'},
         )
-        assert _mod._known_project_ids() == ['dark_factory', 'reify']
+        assert _mod._known_projects_map() == {'reify': '/b', 'dark_factory': '/a'}, (
+            'The roots must survive the call: the coverage predicate compares '
+            'env-named roots against these VALUES, and re-deriving them is '
+            'what made it fragile.'
+        )
 
     def test_passes_project_root_env_through_as_primary_root(self, monkeypatch):
         """PROJECT_ROOT is the seam the wrapper already exports, so the
@@ -2872,14 +2956,14 @@ class TestListKnownProjects:
         monkeypatch.setattr(scope, 'build_known_projects_map', _capture)
         monkeypatch.setenv('PROJECT_ROOT', '/srv/some-checkout')
 
-        assert _mod._known_project_ids() == ['dark_factory']
+        assert _mod._known_projects_map() == {'dark_factory': '/srv/some-checkout'}
         assert seen['primary_root'] == '/srv/some-checkout'
         # extra_roots left None so the registry defaults it from
         # known_project_roots_from_env() (DASHBOARD_KNOWN_PROJECT_ROOTS) --
         # the wrapper must not re-derive that list itself.
         assert seen['extra_roots'] is None
 
-    def test_degrades_to_empty_list_when_registry_raises(self, monkeypatch, caplog):
+    def test_degrades_to_empty_map_when_registry_raises(self, monkeypatch, caplog):
         """Fail-safe, not fail-open: a broken registry must not take down the
         nightly drain, but it must be visible in the journal."""
         import fused_memory.models.scope as scope
@@ -2890,9 +2974,9 @@ class TestListKnownProjects:
         monkeypatch.setattr(scope, 'build_known_projects_map', _boom)
 
         with caplog.at_level(logging.WARNING):
-            assert _mod._known_project_ids() == []
+            assert _mod._known_projects_map() == {}
         assert any(
             'registry exploded' in r.getMessage()
-            or '_known_project_ids' in r.getMessage()
+            or '_known_projects_map' in r.getMessage()
             for r in caplog.records
         ), f'Expected a WARNING naming the failure; got {[r.getMessage() for r in caplog.records]}'

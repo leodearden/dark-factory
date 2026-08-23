@@ -1281,8 +1281,18 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
-def _known_project_ids() -> list[str]:
-    """Best-effort resolve every registered project_id, for ``--list-known-projects``.
+def _known_projects_map() -> dict[str, str]:
+    """Best-effort resolve the registered ``{project_id: project_root}`` map.
+
+    Backs ``--list-known-projects`` (which prints ``sorted()`` of the keys) and
+    :func:`_known_projects_coverage_issue` (which judges coverage against the
+    VALUES). Returning the MAP rather than just the ids is what lets the
+    coverage predicate compare against the registry builder's own single
+    derivation of each root instead of re-deriving one itself (task 2917
+    amendment, reviewer_comprehensive #6): two independent derivations of the
+    same value made the predicate fragile — a symlinked root resolves
+    differently in each path — and it re-read every project manifest a second
+    time on every nightly run.
 
     Why this lives in the sweep script rather than inline in
     ``scripts/fused-memory-flag-marker-sweep.sh``: the wrapper needs a list of
@@ -1298,12 +1308,14 @@ def _known_project_ids() -> list[str]:
     here reuses the one registry builder and keeps the wrapper a plain loop.
 
     Fail-safe posture mirrors :func:`_resolve_terminal_task_ids`: any failure
-    (import error, unreadable root, broken registry) degrades to ``[]``,
+    (import error, unreadable root, broken registry) degrades to ``{}``,
     logged at WARNING with a traceback, rather than raising. ``main`` turns an
-    empty list into a non-zero exit so the degradation is still loud.
+    empty map into a non-zero exit so the degradation is still loud.
 
     Returns:
-        Sorted list of registered project_id strings; ``[]`` on any failure.
+        ``{project_id: resolved project_root}`` for every registered project,
+        exactly as :func:`~fused_memory.models.scope.build_known_projects_map`
+        built it; ``{}`` on any failure.
     """
     try:
         from fused_memory.models import scope  # noqa: PLC0415
@@ -1316,46 +1328,65 @@ def _known_project_ids() -> list[str]:
         # extra_roots left None on purpose: build_known_projects_map then
         # defaults it from known_project_roots_from_env(), so the
         # DASHBOARD_KNOWN_PROJECT_ROOTS parse has exactly one owner.
-        return sorted(scope.build_known_projects_map(primary_root))
+        return scope.build_known_projects_map(primary_root)
     except Exception:
         logger.warning(
-            '_known_project_ids: could not resolve the registered-project map; '
-            'degrading to an empty list (the caller reports this as a non-zero '
+            '_known_projects_map: could not resolve the registered-project map; '
+            'degrading to an empty map (the caller reports this as a non-zero '
             'exit rather than silently sweeping nothing)',
             exc_info=True,
         )
-        return []
+        return {}
 
 
-def _known_projects_coverage_issue(project_ids: list[str]) -> str | None:
-    """Describe how far short of fleet-wide the resolved project list falls.
+def _known_projects_coverage_issue(known: dict[str, str]) -> str | None:
+    """Describe how far short of fleet-wide the resolved project map falls.
 
     EMPTINESS IS THE WRONG KEY for this, which is why this predicate exists
-    separately from :func:`_known_project_ids`' own ``[]`` fail-safe.
+    separately from :func:`_known_projects_map`' own ``{}`` fail-safe.
     :func:`~fused_memory.models.scope.build_known_projects_map` seeds its
     candidate list with the PRIMARY root before extending it with the env
     roots, so an unset ``DASHBOARD_KNOWN_PROJECT_ROOTS`` produces a ONE-entry
-    map, never an empty one — an ``if not project_ids`` check is unreachable
-    in exactly the degradation it looks like it guards, and the nightly drain
+    map, never an empty one — an ``if not known`` check is unreachable in
+    exactly the degradation it looks like it guards, and the nightly drain
     narrows to a single project at exit 0, silently.
 
-    Two cases, deliberately told apart:
-      (i)  the env var is SET but names roots absent from *project_ids* — a
-           genuine degradation (typo, unreadable root, a project moved). The
-           missing roots are named individually so the warning is actionable.
-      (ii) the env var is UNSET — the map is primary-only, so coverage is
-           single-project and the census is not fleet-wide. Reported, but the
-           caller must NOT treat it as a hard failure: a legitimately
-           single-project install would otherwise warn-as-error forever.
+    Judged against the registry's OWN derivation. Each env-named root is
+    compared by RESOLVED PATH against ``known.values()`` — the very strings
+    ``build_known_projects_map`` stored — so this predicate never re-derives a
+    project_id (task 2917 amendment, reviewer_comprehensive #1/#6). The
+    previous id-membership test could not fire for either cause it named:
+    a first-wins collision leaves the dropped root's id in the map (so the
+    test passes), and a nonexistent root is ADMITTED to the map rather than
+    skipped, because ``Path.resolve()`` is non-strict.
 
-    Compares resolved project_IDS rather than counting roots. MEASURED on the
+    Three cases, deliberately told apart:
+      (i)   the env var is SET and names a root that IS NOT A DIRECTORY on
+            this host — a typo, or a moved/unmounted checkout. The registry
+            admits it anyway under a basename-derived project_id, so the
+            nightly sweep runs that phantom id, enumerates 0, deletes 0 and
+            exits 0: the SILENT green this whole feature exists to close.
+      (ii)  the env var is SET and names a root whose resolved path is ABSENT
+            from the map — its project_id was already claimed by an earlier
+            root (``build_known_projects_map`` is first-wins, primary seeded
+            first), or the path could not be resolved at all. That checkout is
+            NOT swept.
+      (iii) the env var is UNSET — the map is primary-only, so coverage is
+            single-project and the census is not fleet-wide. Reported, but the
+            caller must NOT treat it as a hard failure: a legitimately
+            single-project install would otherwise warn-as-error forever.
+
+    Counting roots is NOT a substitute for any of the above. MEASURED on the
     live registry, ``DASHBOARD_KNOWN_PROJECT_ROOTS`` lists the primary root
     too, and ``build_known_projects_map`` drops it as a duplicate project_id
     (logged at INFO) — so ``len(map) < 1 + len(named_roots)`` would cry
-    degradation on every healthy nightly run.
+    degradation on every healthy nightly run. Comparing resolved PATHS is
+    duplicate-proof: the repeated primary root resolves to a path that IS in
+    ``known.values()``.
 
     Args:
-        project_ids: The list :func:`_known_project_ids` resolved.
+        known: The ``{project_id: project_root}`` map
+            :func:`_known_projects_map` resolved.
 
     Returns:
         A human-readable degradation description, or ``None`` when coverage is
@@ -1368,7 +1399,7 @@ def _known_projects_coverage_issue(project_ids: list[str]) -> str | None:
 
         named_roots = scope.known_project_roots_from_env()
         if not named_roots:
-            resolved = ', '.join(project_ids) if project_ids else '<none>'
+            resolved = ', '.join(sorted(known)) if known else '<none>'
             return (
                 f'{scope.KNOWN_PROJECT_ROOTS_ENV} is UNSET, so the '
                 f'registered-project map is PRIMARY-ONLY ({resolved}). Coverage '
@@ -1379,21 +1410,51 @@ def _known_projects_coverage_issue(project_ids: list[str]) -> str | None:
                 f'fused-memory.service unit, not in the repo .env.'
             )
 
-        known = set(project_ids)
-        missing = [
-            root for root in named_roots
-            if scope.resolve_project_id_for_root(root) not in known
-        ]
-        if missing:
-            return (
-                f'{scope.KNOWN_PROJECT_ROOTS_ENV} names '
-                f'{len(named_roots)} root(s), but {len(missing)} of them did not '
-                f'resolve into the registered-project map: {", ".join(missing)}. '
-                f'Those projects will NOT be swept. Likely causes: a typo in the '
-                f'root path, an unreadable/moved checkout, or a project_id that '
-                f'collides with one already claimed (first-wins).'
+        registered_roots = set(known.values())
+        phantom: list[str] = []   # case (i): named, but not a directory
+        unmapped: list[str] = []  # case (ii): named, but absent from the map
+        for raw in named_roots:
+            # Path.is_dir() swallows OSError (ENOENT, ELOOP, ENAMETOOLONG) and
+            # answers False, which is exactly the verdict wanted here.
+            if not Path(raw).is_dir():
+                phantom.append(raw)
+                continue
+            try:
+                resolved_root = str(Path(raw).resolve())
+            except OSError:
+                unmapped.append(raw)
+                continue
+            if resolved_root not in registered_roots:
+                unmapped.append(raw)
+
+        problems: list[str] = []
+        if phantom:
+            problems.append(
+                f'{len(phantom)} of them IS NOT A DIRECTORY on this host: '
+                f'{", ".join(phantom)}. Path.resolve() is non-strict, so '
+                f'build_known_projects_map ADMITS such a root under a '
+                f'basename-derived project_id instead of skipping it — the '
+                f'nightly sweep then runs that phantom id, enumerates 0 '
+                f'markers, deletes 0 and exits 0 (a SILENT green). Likely '
+                f'cause: a typo in the root path, or a moved/unmounted '
+                f'checkout.'
             )
-        return None
+        if unmapped:
+            problems.append(
+                f'{len(unmapped)} of them did not make it into the '
+                f'registered-project map: {", ".join(unmapped)}. '
+                f'build_known_projects_map is first-wins on project_id (the '
+                f'primary root is seeded first), so such a root lost its id to '
+                f'one listed earlier, or could not be resolved at all. Those '
+                f'projects will NOT be swept.'
+            )
+        if not problems:
+            return None
+        return (
+            f'{scope.KNOWN_PROJECT_ROOTS_ENV} names {len(named_roots)} root(s) '
+            f'and the registered-project map covers {len(known)} project(s), '
+            f'but ' + ' '.join(problems)
+        )
     except Exception:
         logger.warning(
             '_known_projects_coverage_issue: could not evaluate registry '
@@ -1447,7 +1508,7 @@ async def _resolve_terminal_task_ids(project_id: str) -> set[str]:
     unit-testable site that every caller — including a hand-typed
     ``--project-id <other> --terminal-drain --apply`` — passes through, and it
     keeps the wrapper a plain loop (the same rationale recorded in
-    :func:`_known_project_ids`).
+    :func:`_known_projects_map`).
 
     Args:
         project_id: The project this sweep run will operate on, i.e.
@@ -1523,20 +1584,20 @@ def main() -> int:
     # Resolution-only mode: return BEFORE any MemoryService is constructed, so
     # listing the fleet needs no live store connection at all.
     if args.list_known_projects:
-        project_ids = _known_project_ids()
+        known_projects = _known_projects_map()
         # Coverage is reported on its OWN predicate, not on emptiness: the
         # primary root is always seeded into the map, so the most likely
         # degradation (DASHBOARD_KNOWN_PROJECT_ROOTS never reaching this
         # process) yields a one-entry list that the emptiness check below can
         # never see. Warned, but NOT fatal -- a single-project install is
         # legitimate, and warn-as-error there would be noise forever.
-        coverage_issue = _known_projects_coverage_issue(project_ids)
+        coverage_issue = _known_projects_coverage_issue(known_projects)
         if coverage_issue:
             logger.warning(
                 'sweep_orphan_flag_markers --list-known-projects: %s',
                 coverage_issue,
             )
-        if not project_ids:
+        if not known_projects:
             logger.warning(
                 'sweep_orphan_flag_markers --list-known-projects: resolved NO '
                 'registered projects. DASHBOARD_KNOWN_PROJECT_ROOTS is the '
@@ -1546,7 +1607,7 @@ def main() -> int:
                 'silently sweeping nothing.'
             )
             return 1
-        for project_id in project_ids:
+        for project_id in sorted(known_projects):
             print(project_id)
         return 0
 
