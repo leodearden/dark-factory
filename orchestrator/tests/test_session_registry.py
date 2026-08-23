@@ -43,8 +43,9 @@ def _make_record(**overrides: object) -> sr.SessionRecord:
     Every field is given a concrete, distinguishable value so a round-trip
     test can catch a field being dropped/mis-typed; ``overrides`` lets a
     test tweak just the field(s) it cares about. Includes the C1 schema
-    extensions (parent_session_id/spawn_mode/display/question) alongside the
-    original rail fields.
+    extensions (parent_session_id/spawn_mode/display/question) and the
+    task-4193 hook-owner binding (claude_session_id) alongside the original
+    rail fields.
     """
     # Declared as a bare `dict` (not `dict[str, object]`) so pyright treats it
     # as dict[Unknown, Unknown] at the **fields unpack below -- mirrors
@@ -72,6 +73,7 @@ def _make_record(**overrides: object) -> sr.SessionRecord:
             kind='wm', wm_title='unblock:df#2085 slug', wm_window_id='0x1a', tmux_target=None
         ),
         'question': sr.Question(text='approve rollout?', asked_at='2026-07-07T00:00:00+00:00'),
+        'claude_session_id': 'uuid-claude-abc123',
     }
     fields.update(overrides)
     return sr.SessionRecord(**fields)
@@ -209,6 +211,9 @@ def test_session_record_parses_rail_vintage_dict_migration_free() -> None:
     assert record.spawn_mode == sr.SpawnMode.CHILD
     assert record.display is None
     assert record.question is None
+    # Task 4193's additive hook-owner binding: absent on disk -> None, no
+    # migration required.
+    assert record.claude_session_id is None
 
 
 def test_schema_minor_is_int_bumped() -> None:
@@ -217,6 +222,31 @@ def test_schema_minor_is_int_bumped() -> None:
     # The PERSISTED major must stay migration-free: bumping it would make
     # rail-vintage and C1 records version-distinguishable on disk.
     assert sr.SCHEMA_VERSION == 1
+
+
+# ---------------------------------------------------------------------------
+# Task 4193: SessionRecord.claude_session_id (hook-owner binding)
+# ---------------------------------------------------------------------------
+
+
+def test_session_record_round_trip_includes_claude_session_id() -> None:
+    r = _make_record()
+    assert sr.SessionRecord.from_dict(r.to_dict()) == r
+    assert sr.SessionRecord.from_json(r.to_json()) == r
+    # The wire key is pinned by name: session_hooks reads it back off disk.
+    assert r.to_dict()['claude_session_id'] == 'uuid-claude-abc123'
+
+    # The unbound shape a spawn-claude.sh `launching` write produces (no hook
+    # has claimed the slug yet) must round-trip just as losslessly.
+    r_unbound = _make_record(claude_session_id=None)
+    assert sr.SessionRecord.from_dict(r_unbound.to_dict()) == r_unbound
+    assert sr.SessionRecord.from_json(r_unbound.to_json()) == r_unbound
+    assert r_unbound.to_dict()['claude_session_id'] is None
+
+
+def test_session_record_defaults_claude_session_id_to_none() -> None:
+    record = sr.SessionRecord(session_slug='s', status=sr.Status.LAUNCHING)
+    assert record.claude_session_id is None
 
 
 def test_spawn_mode_enum_values() -> None:
