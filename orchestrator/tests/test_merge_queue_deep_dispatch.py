@@ -1013,6 +1013,105 @@ class TestDeepChainPlacementBuild:
         assert reached, 'the stall must be reached, so the cancel lands in the merge loop'
         assert _lane_states(git_ops) == [LaneState.FREE], 'deadline must not strand a lane'
 
+    async def test_external_cancellation_propagates_and_leaks_no_lane(
+        self, git_repo: Path, monkeypatch, caplog,
+    ):
+        """REVIEW FIX 2: a cancel from OUTSIDE must not be absorbed into ``None``.
+
+        ``asyncio.timeout`` converts its OWN expiry into ``TimeoutError``
+        (3.11+), so a ``CancelledError`` that escapes the context manager can
+        ONLY be an external cancellation of the verifier-loop task.  Catching
+        it alongside ``TimeoutError`` CONSUMES the cancel request: the coroutine
+        returns ``None`` and ``_dispatch_item`` runs on as if nothing happened
+        — breaking the "CancelledError is never absorbed" invariant
+        ``_verifier_loop`` states.
+
+        The REAL ``build_chain`` runs (only the per-item merge is stalled, on
+        an Event so it can never return on its own), which is what makes the
+        lane assertions real: its own ``except BaseException`` arm is what
+        returns the lane on the cancellation path.
+        """
+        import logging
+
+        from orchestrator.warm_lane_pool import LaneState
+
+        git_ops, worker, item, _head, _cfg = await self._fixture(
+            git_repo, chain_cap=6,
+            queued=[('102', 'b.txt', 'edit-102\n'), ('103', 'c.txt', 'edit-103\n')],
+        )
+        entered = asyncio.Event()
+        never = asyncio.Event()
+
+        async def _stalled_merge(_lane, _branch):
+            entered.set()
+            await never.wait()
+
+        monkeypatch.setattr(git_ops, 'merge_branch_into_worktree', _stalled_merge)
+        caplog.set_level(logging.WARNING, logger='orchestrator.merge_queue')
+
+        task = asyncio.ensure_future(worker._deep_chain_placement(item))
+        # Wait on the stub's own signal, never a sleep: the cancel has to land
+        # INSIDE the build, and a timed guess races the lane acquisition.
+        await asyncio.wait_for(entered.wait(), timeout=60)
+        task.cancel()
+        await asyncio.wait([task])
+
+        assert task.cancelled() is True, (
+            'the cancel must be HONOURED, not absorbed — absorbing it shows up '
+            'as an ordinary None return, which is why "no exception" is not '
+            'the assertion here'
+        )
+        assert not [
+            r for r in caplog.records
+            if 'exceeded' in r.message or 'falling back to the adjacent' in r.message
+        ], (
+            'a cancel is not a deadline overrun — logging the timeout WARNING '
+            'sends an operator hunting a wedged lane that does not exist'
+        )
+        assert _lane_states(git_ops) == [LaneState.FREE], 'no stranded lane'
+        assert worker.worktree_ledger_violations(grace_secs=0.0) == []
+        assert worker.speculation_accounting_violations() == []
+
+    async def test_cancelling_the_enclosing_dispatch_stops_the_dispatch(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """REVIEW FIX 2, where the real hazard lives: the ENCLOSING task.
+
+        ``_deep_chain_placement`` is awaited inline by ``_dispatch_item``, which
+        the verifier loop runs as a task.  If the cancel is swallowed down in
+        the placement, ``_dispatch_item`` sails on past it and
+        ``ensure_future(self._run_inflight_verify(...))`` launches a whole
+        verify for a dispatch that was cancelled — so the observable is not
+        just "the exception vanished" but "work happened after the cancel".
+        """
+        repo = await _fresh_repo(tmp_path, 'cancel-dispatch')
+        scene = await _make_deep_scene(
+            repo, chain_cap=6, script=[True], monkeypatch=monkeypatch,
+        )
+        entered = asyncio.Event()
+        never = asyncio.Event()
+
+        async def _blocking_build(*_a, **_kw):
+            entered.set()
+            await never.wait()
+            raise AssertionError('unreachable: the build must not return on its own')
+
+        monkeypatch.setattr('orchestrator.merge_queue.build_chain', _blocking_build)
+        item = _make_item(
+            _make_req('101', '101', scene.config, repo), scene.head,
+            _ephemeral_merge_wt(scene.git_ops, 'cancel-dispatch'),
+        )
+
+        task = asyncio.ensure_future(scene.worker._dispatch_item(item))
+        await asyncio.wait_for(entered.wait(), timeout=60)
+        task.cancel()
+        await asyncio.wait([task])
+
+        assert task.cancelled() is True, 'the dispatch must not survive its cancel'
+        assert scene.calls == [], (
+            'a cancelled dispatch must never go on to launch a verify'
+        )
+
     async def test_zero_link_result_declines_without_double_releasing(
         self, git_repo: Path, monkeypatch,
     ):
