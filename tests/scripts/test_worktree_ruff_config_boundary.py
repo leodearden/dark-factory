@@ -2,37 +2,25 @@
 
 WHY THIS FILE EXISTS. Task 3922's decision — fix the CACHE half of ruff's
 worktree escape unconditionally, and make the CONFIG half LOUD rather than
-"fixed" — rests on exactly two measurements. Both are properties of ruff's
-config-resolution behaviour, so neither survives as prose: a future author
-reading only the code would see a `RUFF_CACHE_DIR` injection plus a warning and
-reasonably ask "why not just pass `--config` and be done?". This file answers
-that in the only currency that cannot rot — a measurement that re-runs on every
-merge.
+"fixed" — rests on exactly two measurements of ruff's config-resolution
+behaviour. Neither survives as prose: a future author reading only the code
+would see a ``RUFF_CACHE_DIR`` injection plus a warning and reasonably ask "why
+not just pass ``--config`` and be done?". This file answers that in the only
+currency that cannot rot — a measurement that re-runs on every merge.
 
-THE DEFECT BEING REASONED ABOUT. ruff resolves its config and its cache by
-walking parent directories up from each linted file, and a git VCS root does
-NOT halt that walk. A task worktree at ``<parent>/.worktrees/<id>`` whose own
-root ``pyproject.toml`` carries no ``[tool.ruff]`` therefore resolves the PARENT
-checkout's table — reading a rule set out of another checkout's working tree,
-which the branch does not control and which may be uncommitted. Measured on
-this host at filing time: 286 of 567 worktrees carrying a pyproject.toml had no
-``[tool.ruff]``.
+THE ARGUMENT ITSELF IS NOT REPEATED HERE. It lives once, in the repo-root
+pyproject.toml ``[tool.ruff]`` comment block, section "THE SAME WALK-UP, SEEN
+FROM A TASK WORKTREE (task 3922)": the escape geometry, the 286-of-567 blast
+radius, why ``--config`` and rebase-as-policy were rejected, and why the
+diagnostic is non-fatal. Read that first; this module only PINS the two
+measurements it rests on, one class each:
 
-(a) WHY ``--config`` WAS REJECTED. Aimed at a pyproject that declares no
-``[tool.ruff]``, ``--config`` neither merges nor resumes the walk-up: it pins
-that file and falls through to ruff's BUILT-IN defaults, silently dropping
-``UP``/``B``/``SIM``/``I``. On the 286 stale worktrees that converts a
-transiently OVER-strict gate into a permanently UNDER-strict green — "a rule set
-nobody chose applies silently", the exact failure the repo-root ``[tool.ruff]``
-block (task 3457) exists to eliminate, and the same carve-out flag shape
-``test_scripts_module_config.py::_narrowing_flag_args`` already refuses for
-pyright's ``-p /tmp/lax.json``.
-
-(b) WHY ``RUFF_CACHE_DIR`` COULD BE APPLIED UNCONDITIONALLY. It is rule-NEUTRAL:
-it moves ``cache_dir`` and changes nothing else — not the resolved settings
-path, not the emitted rule codes. That neutrality is the whole licence for
-applying it to every worktree at any branch base age without auditing which
-ones are stale.
+(a) ``--config`` aimed at a pyproject declaring no ``[tool.ruff]`` STRICTLY
+    NARROWS the rule set (it falls through to ruff's built-in defaults) — the
+    false green that rules out "simplifying" the fix into a pin.
+(b) ``RUFF_CACHE_DIR`` is rule-NEUTRAL: it moves ``cache_dir`` and changes
+    neither the resolved settings path nor the emitted rule codes — the licence
+    for applying the cache fix to every worktree at any base age.
 
 WHY SETS, NEVER COUNTS OR EXIT CODES. ``ruff check`` exits 0 both when the right
 rules ran and when a narrower set ran clean; an exit code cannot carry the
@@ -48,7 +36,9 @@ that motivated the task.
 WHY HERE AND NOT IN ``orchestrator/tests/``. ``tests/scripts/`` carries its own
 module config (``tests/scripts/orchestrator.yaml``) with
 ``merge_verify_breadth: full``, so this guard actually runs on the merge gate
-rather than only when the orchestrator package is in scope.
+rather than only when the orchestrator package is in scope. That placement is
+also why nothing here imports ``orchestrator`` — the package is not on sys.path
+for this directory's verify, hence the duplicated output parser flagged below.
 
 COST. Exactly five ruff subprocesses for the whole module, computed once in a
 module-scoped fixture — this directory is a merge gate.
@@ -69,6 +59,16 @@ _MEMBER_SELECT = '["E", "F", "UP", "B", "SIM", "I"]'
 # sets distinguishable: a probe emitting only F-codes could not tell them apart.
 _PROBE_SOURCE = 'import sys\nimport os\n\nprint(os.getcwd())\n'
 
+# SECOND PARSER OF THE SAME OUTPUT — read this before editing either copy.
+# orchestrator/src/orchestrator/verify.py parses these same `--show-settings`
+# lines in `_ruff_settings_path`, keyed on its own `_RUFF_SETTINGS_PATH_PREFIX`.
+# The duplication is forced: this directory verifies without the orchestrator
+# package on sys.path (see the module docstring), so it cannot import that
+# constant. If ruff ever renames or reformats these lines, BOTH sites need the
+# edit — and they fail DIFFERENTLY, which is the trap: the production parser
+# degrades to silence (a diagnostic that stops diagnosing) while this guard
+# fails loudly in another file, giving whoever fixes one no signal the other
+# exists. Hence this comment, and its mirror in verify.py.
 _SETTINGS_PATH_PREFIX = 'Settings path:'
 _CACHE_DIR_PREFIX = 'cache_dir ='
 
@@ -107,7 +107,11 @@ def _rule_codes(proc) -> set[str]:
 
 
 def _show_settings_field(proc, prefix: str) -> str:
-    """Read one ``--show-settings`` field, matched by PREFIX not by line index."""
+    """Read one ``--show-settings`` field, matched by PREFIX not by line index.
+
+    Mirrors ``verify._ruff_settings_path``'s parse of the same output — see the
+    cross-reference on the prefix constants above.
+    """
     for line in proc.stdout.splitlines():
         if line.startswith(prefix):
             return line[len(prefix):].strip().strip('"').strip("'").strip('"')
