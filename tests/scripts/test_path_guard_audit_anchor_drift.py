@@ -55,6 +55,29 @@ BOTH tests fail identically. Verbatim, line-wrapped only for this docstring::
     FAILED tests/scripts/test_path_guard_audit_anchor_drift.py::test_declared_agent_role_matches_the_producer
     2 failed in 0.08s
 
+MEASURED RED for the OPERATOR half, against the SKILL.md span already in place —
+``OPERATIONS.md`` has no ``path-guard-esc-ids`` span yet, so Extractor C raises::
+
+    E   AssertionError: expected exactly one '<!-- path-guard-esc-ids:begin
+    E   -->' marker in OPERATIONS.md, found 0 (task 3465). That span declares
+    E   the escalation-id prefixes an operator greps to identify path-guard
+    E   synthetic-anchor audit records. If it was deleted, restore it; if it was
+    E   duplicated, one of the two copies is unpinned and free to drift.
+    E   assert 0 == 1
+    FAILED ...::test_operations_declares_an_esc_id_prefix_for_every_scope_violation_anchor
+    FAILED ...::test_no_declared_prefix_is_dead
+    FAILED ...::test_the_blocking_adjudicator_record_is_not_swallowed
+    3 failed, 2 passed in 0.17s
+
+THREE, NOT TWO. ``test_the_blocking_adjudicator_record_is_not_swallowed`` is a
+STANDING isolation guard, not part of that RED — it was expected to pass already
+against the SKILL.md span. It does not, because it reads BOTH spans and so hits
+the same missing-marker raise first. Recorded as measured rather than as
+predicted, and not worked around: an isolation invariant that skipped the span it
+cannot read would be exactly the vacuous pass this module's extractors exist to
+prevent. It goes green with the other two in the same step, and from then on its
+value is that it fails the day someone widens a prefix.
+
 OUT OF SCOPE. ``fused-memory/src/fused_memory/middleware/scope_violation_escalator.py``
 is READ-ONLY to this module — it is AST-parsed, never imported and never edited.
 Re-gating the producer is explicitly not the remedy: the unconditional census is
@@ -73,9 +96,19 @@ ESCALATOR_SRC = (
     / "fused-memory/src/fused_memory/middleware/scope_violation_escalator.py"
 )
 SKILL_DOC = REPO_ROOT / "skills/escalation-watcher-auto/SKILL.md"
+OPERATIONS_DOC = REPO_ROOT / "OPERATIONS.md"
 
 ANCHORS_BEGIN = "<!-- path-guard-anchors:begin -->"
 ANCHORS_END = "<!-- path-guard-anchors:end -->"
+
+ESC_IDS_BEGIN = "<!-- path-guard-esc-ids:begin -->"
+ESC_IDS_END = "<!-- path-guard-esc-ids:end -->"
+
+# ``EscalationQueue.make_id`` mints ``esc-<task_id>-<n>``, and the producer's own
+# module comment gives ``esc-task-path-guard-37`` as the worked example. So the id
+# an operator greps is DERIVED from the anchor, never independently authored — the
+# whole point of pinning the two.
+ESC_ID_PREFIX = "esc-"
 
 # The budget-misconfig record shares this producer module but NOTHING else: it is
 # category 'adjudicator_config_defect', agent_role 'fused-memory/path-scope-adjudicator'
@@ -214,6 +247,49 @@ def declared_discriminators() -> set[str]:
     )
 
 
+def declared_escalation_id_prefixes() -> set[str]:
+    """Escalation-id prefixes OPERATIONS.md tells an operator to grep for.
+
+    A trailing ``*`` is stripped: ``esc-task-path-guard*`` is how an operator
+    actually types the glob, and the doc should read the way the command is run.
+    Everything else is returned verbatim — normalising further would silently
+    canonicalise away a real difference.
+    """
+    tokens = marked_tokens(
+        OPERATIONS_DOC.read_text(encoding="utf-8"),
+        ESC_IDS_BEGIN,
+        ESC_IDS_END,
+        str(OPERATIONS_DOC.relative_to(REPO_ROOT)),
+        "declares the escalation-id prefixes an operator greps to identify "
+        "path-guard synthetic-anchor audit records.",
+    )
+    return {token.rstrip("*") for token in tokens} - {""}
+
+
+def declared_task_id_prefixes() -> set[str]:
+    """The SKILL.md span's tokens MINUS the producer's ``agent_role`` value.
+
+    The branch's discriminator is a disjunction — ``agent_role`` equality OR an
+    id prefix — so the one span legitimately holds tokens of two different kinds.
+    Partitioning by "is this the live ``_AGENT_ROLE`` value?" rather than by a
+    hard-coded list keeps both halves honest at once: if the producer renames the
+    role, ``test_declared_agent_role_matches_the_producer`` goes red AND the now
+    unclassifiable stale token falls into this set, where
+    ``test_no_declared_prefix_is_dead`` reports it as dead. Neither rename can
+    hide behind the other.
+    """
+    declared = declared_discriminators()
+    agent_role = producer_constants()["_AGENT_ROLE"]
+    prefixes = declared - {agent_role}
+    assert prefixes, (
+        f"the `path-guard-anchors` span in {SKILL_DOC.relative_to(REPO_ROOT)} "
+        f"declares only the agent_role token {agent_role!r} and no anchor prefix "
+        f"at all (task 3465) — the id-prefix half of the branch's discriminator "
+        f"would be pinned by nothing. Declared: {sorted(declared)}"
+    )
+    return prefixes
+
+
 def test_every_scope_violation_anchor_is_covered_by_a_declared_prefix():
     """Every live synthetic anchor is recognised by the watcher's branch.
 
@@ -262,3 +338,122 @@ def test_declared_agent_role_matches_the_producer():
         f"exact string; if the producer's role was renamed, update the token in "
         f"the marker span to match."
     )
+
+
+def test_operations_declares_an_esc_id_prefix_for_every_scope_violation_anchor():
+    """The id an operator greps is DERIVED from the producer's anchor.
+
+    ``EscalationQueue.make_id`` mints ``esc-<task_id>-<n>``, so ``esc-`` +
+    anchor is not a convention this guard invents — it is the id the queue
+    actually produces. Pinning it stops OPERATIONS.md from carrying a hand-typed
+    prefix that quietly stops matching the day the anchor is renamed, which is
+    precisely when an operator most needs the grep to work.
+    """
+    declared = declared_escalation_id_prefixes()
+    anchors = scope_violation_anchors()
+
+    uncovered = [
+        ESC_ID_PREFIX + anchor
+        for anchor in sorted(anchors)
+        if not any(
+            (ESC_ID_PREFIX + anchor).startswith(token) for token in declared
+        )
+    ]
+    assert not uncovered, (
+        f"{OPERATIONS_DOC.relative_to(REPO_ROOT)} declares no escalation-id "
+        f"prefix covering {uncovered} (task 3465).\n"
+        f"  live anchors ({ESCALATOR_SRC.relative_to(REPO_ROOT)}): {sorted(anchors)}\n"
+        f"  declared prefixes (`path-guard-esc-ids` span, trailing `*` stripped): "
+        f"{sorted(declared)}\n"
+        f"An operator following the troubleshooting row would grep a prefix that "
+        f"matches none of the records causing the symptom. Add the missing "
+        f"prefix to the marker span."
+    )
+
+
+def test_no_declared_prefix_is_dead():
+    """A prefix declared in either doc must still match something live.
+
+    This is the half that catches a producer RENAME. The coverage tests above
+    only notice an anchor nothing covers; a STALE token left behind after a
+    rename is invisible to them — and stale is the dangerous direction, because
+    the branch then silently stops firing while both docs still read as if it
+    does. Here the orphaned token has nothing to match and goes red by name.
+    """
+    anchors = scope_violation_anchors()
+    live_esc_ids = {ESC_ID_PREFIX + anchor for anchor in anchors}
+
+    dead_task_prefixes = [
+        token
+        for token in sorted(declared_task_id_prefixes())
+        if not any(anchor.startswith(token) for anchor in anchors)
+    ]
+    assert not dead_task_prefixes, (
+        f"the `path-guard-anchors` span in {SKILL_DOC.relative_to(REPO_ROOT)} "
+        f"declares {dead_task_prefixes}, which prefixes no live scope_violation "
+        f"anchor (task 3465).\n"
+        f"  live anchors ({ESCALATOR_SRC.relative_to(REPO_ROOT)}): {sorted(anchors)}\n"
+        f"A dead prefix means the audit-only branch no longer fires on anything: "
+        f"the records go back to sitting pending at level 1 and respawning "
+        f"watcher rotations. If the producer's anchor was renamed, rename the "
+        f"token here to match it."
+    )
+
+    dead_esc_prefixes = [
+        token
+        for token in sorted(declared_escalation_id_prefixes())
+        if not any(esc_id.startswith(token) for esc_id in live_esc_ids)
+    ]
+    assert not dead_esc_prefixes, (
+        f"{OPERATIONS_DOC.relative_to(REPO_ROOT)} declares escalation-id prefixes "
+        f"{dead_esc_prefixes}, which cover no live `esc-<anchor>` (task 3465).\n"
+        f"  live esc-id stems: {sorted(live_esc_ids)}\n"
+        f"The documented grep would return nothing for the symptom the "
+        f"troubleshooting row describes. Update the token in the "
+        f"`path-guard-esc-ids` span to match the renamed anchor."
+    )
+
+
+def test_the_blocking_adjudicator_record_is_not_swallowed():
+    """No declared token may reach the budget-misconfig record.
+
+    That record is ``category='adjudicator_config_defect'``,
+    ``agent_role='fused-memory/path-scope-adjudicator'``, ``severity='blocking'``
+    and genuinely needs an operator; the producer's own comment calls it
+    "deliberately distinct from the scope_violation family so operators can
+    immediately tell these apart". It is not hypothetical collateral — it lives
+    in the SAME producer module as the anchors this guard pins, so an over-broad
+    future prefix is one edit away from routing a blocking operator record into
+    a benign auto-close, silently.
+
+    This is a STANDING guard, not the RED of the step that added it: it passes
+    against today's tokens, and its whole value is that it fails the day someone
+    widens a prefix.
+    """
+    constants = producer_constants()
+    budget_anchor = constants[BUDGET_MISCONFIG_ANCHOR_CONST]
+    budget_esc_id = ESC_ID_PREFIX + budget_anchor
+    budget_role = constants["_BUDGET_MISCONFIG_AGENT_ROLE"]
+
+    declared = {
+        str(SKILL_DOC.relative_to(REPO_ROOT)): declared_discriminators(),
+        str(OPERATIONS_DOC.relative_to(REPO_ROOT)): declared_escalation_id_prefixes(),
+    }
+
+    for doc_label, tokens in declared.items():
+        swallowing = sorted(
+            token
+            for token in tokens
+            if budget_anchor.startswith(token)
+            or budget_esc_id.startswith(token)
+            or token == budget_role
+        )
+        assert not swallowing, (
+            f"{doc_label} declares {swallowing}, which reaches the "
+            f"budget-misconfig record (anchor {budget_anchor!r}, esc-id stem "
+            f"{budget_esc_id!r}, agent_role {budget_role!r}) — task 3465.\n"
+            f"That record is category='adjudicator_config_defect', "
+            f"severity='blocking' and needs a human. A discriminator that "
+            f"matches it would auto-close it as benign, silently. Narrow the "
+            f"token so it covers only the scope_violation family."
+        )
