@@ -3688,6 +3688,14 @@ def _target_subprocess_env(
     if stripped_path is not None:
         env['PATH'] = stripped_path
     env['PYTHONUNBUFFERED'] = '1'
+    # This assignment's POSITION is load-bearing, not incidental: it must stay
+    # strictly ABOVE the `extra` overlay so an operator's `verify_env`
+    # RUFF_CACHE_DIR keeps winning (pinned by
+    # test_verify_env.py::TestRuffCacheIsWorktreeLocal::
+    # test_caller_overlay_still_wins_over_injected_cache_dir — move it below
+    # and that test goes red).  And it fires ONLY on an explicit *worktree*:
+    # never synthesise one from os.getcwd(), which would silently re-point the
+    # cache for every non-verify caller that shares this builder.
     if worktree is not None:
         env['RUFF_CACHE_DIR'] = str(Path(worktree) / '.ruff_cache')
     if extra:
