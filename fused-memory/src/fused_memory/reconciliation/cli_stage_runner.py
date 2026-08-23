@@ -96,6 +96,28 @@ DISALLOW_RECON_REPORT_LEDGER_WRITES = [
     'mcp__recon-report__write_entity_standing_decision',
 ]
 
+# Recon-report tools that write to the reconciliation JOURNAL (disallowed in
+# Stage 3 only).
+# task 3065: repair_memory_citation is the second recon-report tool that writes
+# past in-process ReconReportState — it rewrites the durable `runs.stage_reports`
+# blob of an ALREADY-COMPLETED run, to re-point or drop a cited memory id that no
+# longer resolves. It is a SEPARATE sublist from the ledger writes above because
+# the journal is not the ledger: same class of hazard, different store, and
+# keeping them distinct keeps each name honest and each stage's grant
+# independently adjustable.
+#
+# Denied in Stage 3 alone. Stage 3 (integrity_check) is read-only by contract AND
+# is the stage that DETECTS a dangling cross-run citation; letting it also repair
+# would break that contract and collapse detect-and-repair into one unaccountable
+# actor. Stage 1 keeps it because Stage 1 is where a supersession deletes the
+# predecessor memory — i.e. where cross-run citations become dangling in the
+# first place — and it is already citation_verifier's own caller, so repair-at-
+# source belongs there. Stage 2 keeps it because Stage 2 is the remediation stage
+# whose blocked repair attempt originated this task.
+DISALLOW_RECON_REPORT_JOURNAL_WRITES = [
+    'mcp__recon-report__repair_memory_citation',
+]
+
 # Escalation READ tools (disallowed in every stage — task 3163,
 # plans/escalation-store-ambiguity-prd.md task α).
 #
@@ -171,6 +193,7 @@ STAGE3_DISALLOWED = (
     DISALLOW_TASK_WRITES
     + DISALLOW_MEMORY_WRITES
     + DISALLOW_RECON_REPORT_LEDGER_WRITES
+    + DISALLOW_RECON_REPORT_JOURNAL_WRITES
     + DISALLOW_ESCALATION_READS
     + DISALLOW_BUILTIN
 )
@@ -182,6 +205,17 @@ STAGE3_DISALLOWED = (
 # CARVE-OUT (task 2895 β): write_entity_standing_decision is the exception — the first
 # recon-report tool with a durable SQLite-ledger write. It IS blocked in Stage 1 and
 # Stage 3 (via DISALLOW_RECON_REPORT_LEDGER_WRITES above) and callable only in Stage 2.
+# CARVE-OUT (task 3065): repair_memory_citation is the SECOND such exception — the first
+# recon-report tool that writes to the reconciliation JOURNAL, rewriting the durable
+# `runs.stage_reports` blob of an already-completed run to re-point or drop a cited
+# memory id that no longer resolves. It is denied in Stage 3 ONLY (via
+# DISALLOW_RECON_REPORT_JOURNAL_WRITES above), because Stage 3 is read-only by contract
+# and is the stage that DETECTS dangling citations — detect and repair must not be the
+# same actor. Stage 1 keeps it (Stage 1's supersessions are what strand the citation in
+# the first place, and it already calls citation_verifier); Stage 2 keeps it (it is the
+# remediation stage whose blocked attempt originated the task). The two carve-outs stay
+# on separate sublists on purpose: the ledger and the journal are different stores, and a
+# single list named for one of them would lie about the other.
 
 # Output schema for stage reports
 STAGE_REPORT_SCHEMA: dict[str, Any] = {
