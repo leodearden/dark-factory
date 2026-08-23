@@ -831,18 +831,39 @@ class TestAtomicWriteRaceSafety:
 # exactly how the first ten accumulated (two of them carried a docstring
 # saying they were copied because "there is no atomic writer in shared/ to
 # reuse").  These tests are the fence: a NEW rename-into-place inside the
-# THREE TREES LISTED BELOW fails loudly and points the author at this module.
+# SIX TREES LISTED BELOW fails loudly and points the author at this module.
 #
 # SCOPE LIMIT — the fence is narrower than "the repo", and saying so matters
-# more than the fence looking complete.  ``_SRC_TREES`` omits ``fused-memory/
-# src`` and ``scripts/``, where six unmigrated hand-rolled writers already
-# live: curator_escalator.py:224, event_queue.py:536 and :833,
-# manifest_stamping.py:269, orchestrator-watchdog.py:854,
-# legibility/codebook.py:575 and legibility/census.py:602.  A new copy in
-# either of those trees passes this guard silently.  Extending the trees to
-# cover them — and relocating this cross-package guard out of ``shared/tests``,
-# where it currently reaches up into two sibling packages — is tracked as
-# follow-up ticket ``tkt_0RRXRQQ4MYPYZ2XSX459W29AZ6``.
+# more than the fence looking complete.  Task 3388 widened ``_SRC_TREES`` from
+# three trees to six: ``shared/src``, ``orchestrator/src``, ``escalation/src``,
+# ``fused-memory/src``, ``fused-memory/scripts`` and ``scripts``.
+#
+# THE COUNT, CORRECTED BY MEASUREMENT.  Widening surfaced SEVENTEEN unmigrated
+# hand-rolled writers, not the six this block used to enumerate — and not the
+# six the follow-up ticket that tracked the widening enumerated either.  Both
+# of those counts were arrived at by reading; the detector disagreed with both.
+# So: trust ``_find_renamers`` over any prose count in this file, this sentence
+# included, and re-run it rather than re-trusting the sentence.  A fence sized
+# from stale prose is not a fence, which is the whole reason 3388 existed.
+#
+# STILL NOT SCANNED, stated with COUNTS rather than bare directory names so the
+# claim is falsifiable (measured at main 86db695984): ``cockpit/src`` 2
+# (priority.py::save_priorities, ui_config.py::save_ui_config), filed as a
+# follow-up; ``dashboard/src`` 0; ``sampler/src`` 0; ``skills`` 0; the
+# repo-root ``tests/`` 0.
+#
+# TEST DIRECTORIES.  ``fused-memory/scripts`` and ``scripts`` are scanned
+# WHOLESALE, tests included, rather than through an exclusion mirroring the
+# ``*/src`` convention: a flat operator directory has no ``src/`` boundary to
+# mirror, and the one place a regrown production writer could hide is precisely
+# a directory somebody decided not to look at.  That is free today — the test
+# dirs INSIDE the scanned trees are clean: ``shared/tests`` 0, ``fused-memory/
+# tests`` 0, ``scripts/tests`` 0.  Stated in that scoped form deliberately: the
+# general claim "test trees are clean" is FALSE at this base, because
+# ``orchestrator/tests`` carries 2 renamers and ``escalation/tests`` 1.  Neither
+# sits inside a scanned tree, so neither affects red/green — but they are live
+# evidence that test directories do accumulate this pattern over time, and so
+# that an exclusion would not have stayed harmless.
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _SRC_TREES = (
@@ -854,7 +875,7 @@ _SRC_TREES = (
     'scripts',
 )
 
-# Every (module, function) in the three trees that renames a path into place,
+# Every (module, function) in the six trees that renames a path into place,
 # with the reason it is not calling atomic_write_text.  Adding an entry is a
 # deliberate act that needs a reason; growing this set silently is the failure
 # mode the guard exists to prevent.
@@ -967,6 +988,146 @@ _ALLOWED_RENAMERS = {
         'failure into PlanWriteError naming both the original and resolved '
         'paths. A follow-up may widen atomic_write_text; it must not be forced '
         'through the current signature.',
+    # --- Sites surfaced by task 3388's widening of _SRC_TREES to six trees.
+    # Each reason below was written from READING that site, not pattern-matched
+    # from a neighbour: an entry whose reason came from the entry above it is
+    # indistinguishable from a triaged decision and is worse than no entry.
+    # Where an argument already exists above, it is CITED rather than re-argued.
+    ('fused-memory/src/fused_memory/middleware/curator_escalator.py', 'CuratorEscalator._persist_state'):
+        'DETECTOR-NESTING ARTIFACT — this function contains no rename of its '
+        'own. The os.replace lives in the nested ``_write`` closure, which is '
+        'allowlisted separately below; the outer name is reported only because '
+        '_find_renamers uses ast.walk, which descends into nested functions '
+        '(the limitation its docstring states). There is nothing here to '
+        'migrate, and no semantic justification is offered because there is '
+        'none to offer — the entry exists solely to keep the detector honest.',
+    (
+        'fused-memory/src/fused_memory/middleware/curator_escalator.py',
+        'CuratorEscalator._persist_state._write',
+    ):
+        'Out of task 3223 enumerated scope; left alone deliberately. This is '
+        'the real writer, and a migration must preserve two properties '
+        'atomic_write_text does not offer today: a per-writer temp name '
+        '``<state>.{pid}.{id(payload)}.tmp`` (mirroring event_queue.py\'s '
+        'disjoint-path discipline, so two writers can never share a temp path '
+        'even if they bypass _persist_lock), and the asyncio.to_thread offload '
+        'that keeps the blocking I/O off the event loop under burst load.',
+    ('fused-memory/src/fused_memory/reconciliation/backlog_policy.py', 'BacklogPolicy._restore_policy_keys'):
+        'Out of task 3223 enumerated scope; left alone deliberately. Re-merges '
+        'the policy-only keys that closing a halt strips (project_id, '
+        'error_type, backlog, threshold) back onto the persisted record via '
+        'tmp.write_text + tmp.replace. Best-effort by construction — every '
+        'failure is logged and swallowed so a record that IS closed but lost '
+        'its forensic keys is never misreported as un-closed.',
+    ('fused-memory/src/fused_memory/reconciliation/event_queue.py', 'EventQueue._rotate_dead_letter'):
+        'MOVES existing files: cascade-rotates dead_letter.jsonl -> .1 -> .2 '
+        '-> ... There is no content string, only os.replace(src, dst) per '
+        'slot, so this is the same class as escalation sweep._atomic_move / '
+        'queue._archive_resolved and atomic_write_text has nothing to be '
+        'handed.',
+    ('fused-memory/src/fused_memory/reconciliation/event_queue.py', 'EventQueue.replay_dead_letters'):
+        'MOVES an existing file: os.replace snapshots each dead-letter file '
+        'onto a ``.replaying`` sibling as an atomic CLAIM — race-safe against '
+        'concurrent _write_dead_letter appends and self-guarding against '
+        're-replay, since a second call finds nothing left to snapshot. A '
+        'claim, not a write; same class as escalation sweep._atomic_move / '
+        'queue._archive_resolved.',
+    ('fused-memory/src/fused_memory/server/manifest_stamping.py', '_stamp_capability_manifests_impl'):
+        'Out of task 3223 enumerated scope; left alone deliberately. A genuine '
+        'writer: yaml.safe_dump into a uniquely-named '
+        '``<sidecar>.{pid}.{id(raw)}.tmp`` sibling, then os.replace. Its '
+        'surrounding comment already documents the one tradeoff a migration '
+        'must not silently change — a hard kill between write and replace can '
+        'leave a .tmp sibling, which is harmless only because sidecar '
+        'discovery matches the exact derived rel path and never a .tmp suffix.',
+    ('fused-memory/scripts/bake_off_storage_shape.py', '_atomic_write_text'):
+        'Out of task 3223 enumerated scope; left alone deliberately — but note '
+        'what this entry COSTS, because leaving that implicit would hide a '
+        'silenced assertion behind an allowlist line. '
+        'test_atomic_write_text_helpers_only_delegate ``continue``s on '
+        'anything in _ALLOWED_RENAMERS, so this entry also silences the '
+        'delegate check for this name: a NON-delegating helper carrying the '
+        'consolidated name — a full inlined mkstemp + os.replace body — '
+        'survives here on purpose, in a one-off benchmark script. It is the '
+        'single strongest candidate for the next migration, and it is the '
+        'reason 3388 widened to fused-memory/scripts rather than stopping at '
+        'fused-memory/src as its own ticket text proposed.',
+    ('fused-memory/scripts/memory_eval_retrieval_probe.py', 'write_report_text'):
+        'Out of task 3223 enumerated scope; left alone deliberately. Its '
+        'docstring already argues the atomicity (the memory-eval leaves share '
+        'one artifact root that the dashboard reads as plain files, so a '
+        'truncated report beside a valid metrics artifact is the one state to '
+        'exclude) and records that the mechanism is COPIED rather than '
+        'imported because shared\'s own _atomic_write_text is module-private. '
+        'That reason is retired by the PUBLIC safe_io.atomic_write_text, which '
+        'is what makes this a migration candidate rather than an exception.',
+    ('fused-memory/scripts/memory_eval_staleness_sweep.py', 'write_report_text'):
+        'Out of task 3223 enumerated scope; left alone deliberately. The '
+        'sibling of memory_eval_retrieval_probe.write_report_text above — its '
+        'own docstring says the mechanism is copied \'(β does the same)\' — '
+        'same shared artifact root, same mkstemp + os.replace, same candidacy. '
+        'Migrate the two together or the copy-from-a-neighbour habit survives.',
+    ('scripts/consume_redispatch_requests.py', 'archive_request'):
+        'MOVES an existing file: os.replace of an APPLIED request into the '
+        '``consumed/`` subdirectory, to keep an audit trail of what was '
+        'actioned that the snapshot directory cannot provide. Same class as '
+        'escalation sweep._atomic_move / queue._archive_resolved.',
+    ('scripts/dashboard-watchdog.py', 'save_state'):
+        'STDLIB-ONLY STANDALONE ENTRYPOINT — the same constraint already '
+        'recorded above for session_registry._atomic_write_text, so that '
+        'argument is not restated. This is a ``#!/usr/bin/env python3`` '
+        'systemd/cron oneshot; verified by reading its imports (contextlib, '
+        'json, os, subprocess, sys, tempfile, time, urllib) that it pulls in '
+        'nothing outside the stdlib, so a module-scope `from shared import '
+        'safe_io` would need an install or a sys.path graft it does not have. '
+        'This is NOT a blanket \'scripts/ cannot import shared\': '
+        'scripts/legibility/census.py does exactly that, via a '
+        '__file__-relative sys.path insert.',
+    ('scripts/legibility/census.py', 'advance_census_state'):
+        'Out of task 3223 enumerated scope; left alone deliberately. '
+        'mkstemp(prefix=\'.census-state-\') + os.replace. This module is '
+        'census-state.json\'s SOLE writer, so a migration must keep the '
+        'always-present ``last_census_done_count`` key — serialised as JSON '
+        'null when the count could not be observed, never omitted as falsy — '
+        'which is what lets zeta\'s compute_tasks_landed fail safe.',
+    ('scripts/legibility/codebook.py', 'dump'):
+        'Out of task 3223 enumerated scope; left alone deliberately. '
+        'mkstemp(prefix=\'.codebook-\') + os.replace of a canonical '
+        'block-style yaml document written behind a fixed HEADER comment. Sole '
+        'writer of the legibility pipeline\'s canonical registry, and '
+        'byte-stable given byte-stable input so a no-change night commits '
+        'nothing — a migration must not perturb either property.',
+    ('scripts/legibility/trickle_state.py', 'record_run'):
+        'Out of task 3223 enumerated scope; left alone deliberately. '
+        'Same-directory mkstemp + os.replace of the trickle-state document the '
+        'function also returns; ordinary write path with no seam of its own.',
+    ('scripts/migrate_transcript_archive_gunzip.py', 'gunzip_one'):
+        'PRE-REPLACE SEAM, and the same one already recorded above for shared '
+        'transcript_archive._archive_one — cited rather than re-argued. It '
+        'decompresses to a staging sibling, corroborates the read-back, then '
+        'os.utime mirrors the SOURCE mtime onto staging BEFORE the replace, '
+        'because that mtime is the retention age gc_agent_transcripts keys on '
+        'and the source is gone by the end. atomic_write_text exposes no '
+        'pre-replace seam, and the payload is decompressed bytes on disk '
+        'rather than a str already in memory.',
+    ('scripts/orchestrator-watchdog.py', '_atomic_write_json'):
+        'STDLIB-ONLY STANDALONE ENTRYPOINT — as dashboard-watchdog.save_state '
+        'above, and session_registry._atomic_write_text before it. A '
+        '``#!/usr/bin/env python3`` systemd/cron oneshot; verified by reading '
+        'its imports that the only addition beyond dashboard-watchdog\'s set '
+        'is shlex, i.e. still stdlib. Note this IS already a consolidation '
+        '(task 3764 extracted it so the mkdir/mktemp/write/rename dance is '
+        'defined once for every watchdog state file rather than per call '
+        'site), so the duplication here is one deep, not per-writer.',
+    ('scripts/sweep_toolcall_markup.py', 'write_repaired'):
+        'PRE-REPLACE VERIFICATION SEAM — the same seam already recorded above '
+        'for plan_tools._atomic_write_plan, whose ordering this function\'s '
+        'docstring says it follows, so that argument is not restated. Between '
+        'reading and swapping it RE-READS the target and confirms it is still '
+        'the bytes the repair was computed from, as late as possible before '
+        'the os.replace, returning a WriteFailure (REASON_CHANGED_UNDER_US) '
+        'rather than silently reverting somebody else\'s concurrent write. '
+        'atomic_write_text has no pre-replace inspection hook.',
 }
 
 
