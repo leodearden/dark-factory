@@ -12229,7 +12229,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     cap=cap - 1,
                     target_depth=d - 1,
                 )
-        except (TimeoutError, asyncio.CancelledError):
+        except TimeoutError:
             # FAIL-OPEN. An overrun is not a merge fault, so it must not fail
             # the dispatch -- it degrades to today's adjacent verify. Safe to
             # impose from out here because build_chain's own `except
@@ -12238,6 +12238,27 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # inside CHAIN_BUILD_TIMEOUT_SECS means a wedged lane or a
             # pathological repo, and a silent degrade is exactly what the
             # no-silent-fail-soft design invariant forbids.
+            #
+            # DELIBERATELY NARROW -- `asyncio.CancelledError` is NOT caught
+            # here, and must not be added. `asyncio.timeout` converts its OWN
+            # expiry into TimeoutError (3.11+), so a CancelledError escaping
+            # the context manager above can ONLY be EXTERNAL cancellation of
+            # the verifier-loop task. Absorbing it would CONSUME the cancel
+            # request and let _dispatch_item run on to launch a whole verify
+            # for a dispatch that was cancelled -- breaking the "CancelledError
+            # is never absorbed" invariant _verifier_loop states, and logging
+            # the "exceeded %.0fs" WARNING below at an operator hunting a
+            # wedged lane that does not exist. CancelledError derives from
+            # BaseException, not Exception, so the fail-open arm directly below
+            # does not re-catch it either: it propagates, as it must.
+            #
+            # The task-4306 `current_task().cancelling() > 0` discrimination
+            # (see the verify-await site) is deliberately NOT copied here, and
+            # adding it "for consistency" would be wrong: that idiom exists to
+            # tell a LEGITIMATE self-cancel from an external one, and there is
+            # no legitimate self-cancel on this path -- `asyncio.timeout` has
+            # already claimed its own expiry as TimeoutError, so nothing but an
+            # external cancel can reach this frame as a CancelledError.
             logger.warning(
                 'deep chain build exceeded %.0fs for %s (target_depth=%d) -- '
                 'falling back to the adjacent verify',
