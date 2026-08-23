@@ -536,6 +536,7 @@ class TestVerifyResultFlakeSuppressionWire:
         )
         rt = result_from_json(result_to_json(vr))
 
+        assert rt.flake_suppression is not None
         assert rt.flake_suppression == s
         assert rt.flake_suppression.verdict is FlakeVerdict.unconfirmable
         assert rt.flake_suppression.test_ids == ()
@@ -647,7 +648,7 @@ class TestVerifyResultFlakeSuppressionWire:
         produced an `unconfirmable` observation."""
         from orchestrator.flake_ledger import FlakeVerdict
 
-        base = dict(
+        base: dict[str, Any] = dict(
             passed=False, test_output='', lint_output='', type_output='', summary='red'
         )
         a = VerifyResult(**base, flake_suppression=None)

@@ -497,7 +497,11 @@ class TestFlakeSuppressionFromWire:
 
     def test_round_trip_of_an_unconfirmable_observation(self) -> None:
         """(a), for the verdict that carries a reason and may name no tests."""
-        from orchestrator.flake_ledger import FlakeVerdict, flake_suppression_from_wire
+        from orchestrator.flake_ledger import (
+            FlakeSuppression,
+            FlakeVerdict,
+            flake_suppression_from_wire,
+        )
 
         s = _suppression(
             verdict=FlakeVerdict.unconfirmable,
@@ -506,6 +510,7 @@ class TestFlakeSuppressionFromWire:
             unconfirmable_reason='node-ids mapped to no discovered subproject',
         )
         rt = flake_suppression_from_wire(self._wire(s))
+        assert isinstance(rt, FlakeSuppression)
         assert rt == s
         assert rt.verdict is FlakeVerdict.unconfirmable
         assert rt.test_ids == ()
@@ -552,13 +557,18 @@ class TestFlakeSuppressionFromWire:
     def test_an_unknown_extra_key_is_dropped_and_the_rest_reconstructs(self) -> None:
         """(d) Forward-compat with a NEWER producer: a field this version has never
         heard of must not cost the observation it rides along with."""
-        from orchestrator.flake_ledger import FlakeVerdict, flake_suppression_from_wire
+        from orchestrator.flake_ledger import (
+            FlakeSuppression,
+            FlakeVerdict,
+            flake_suppression_from_wire,
+        )
 
         s = _suppression()
         d = self._wire(s)
         d['some_field_from_the_future'] = {'nested': [1, 2, 3]}
 
         rt = flake_suppression_from_wire(d)
+        assert isinstance(rt, FlakeSuppression)
         assert rt == s
         assert rt.verdict is FlakeVerdict.passes_in_isolation
         assert not hasattr(rt, 'some_field_from_the_future')

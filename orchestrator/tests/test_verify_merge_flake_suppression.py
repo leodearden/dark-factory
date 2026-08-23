@@ -840,6 +840,7 @@ class TestApplyMergeFlakeSuppression:
         # object, and `compare=False` on flake_suppression is what keeps the
         # equality (and test_cli's wrapper-transparency invariant) intact.
         assert result == failing
+        assert result.flake_suppression is not None
         assert result.flake_suppression is s
         assert result.flake_suppression.verdict is FlakeVerdict.fails_in_isolation
 
@@ -864,6 +865,7 @@ class TestApplyMergeFlakeSuppression:
 
         assert result.passed is False
         assert result == failing
+        assert result.flake_suppression is not None
         assert result.flake_suppression is s
         assert (
             result.flake_suppression.unconfirmable_reason
@@ -1209,7 +1211,9 @@ class TestLocalRunnerMergeFlakeSuppressionHook:
                 run_scoped=AsyncMock(return_value=_result(False)),
                 run_unscoped=AsyncMock(return_value=_clean_unscoped_gate()),
                 task_id='2768',
-                escalation_queue=_FakeEscalationQueue(),
+                # pyright agreeing the parameter is gone IS the static half of
+                # this assertion; the raises() below is the runtime half.
+                escalation_queue=_FakeEscalationQueue(),  # type: ignore[reportCallIssue]
             )
 
     def test_init_defaults_event_store_to_none_and_still_runs_the_gate(
