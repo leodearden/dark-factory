@@ -433,10 +433,22 @@ class TestOriginTagKeyDriftGuard:
         # Provenance: pins that the tuple just read really is this worktree's.
         # Without it, an editable install rooted at the MAIN checkout silently
         # shadows the branch's source — the exact way this test first went red.
-        assert Path(grouped_read.__file__).resolve() == fm_grouped_read.resolve(), (
+        # Bound to a local first: ``ModuleType.__file__`` is typed
+        # ``str | None`` (a namespace/builtin module has none), so feeding it
+        # straight to ``Path()`` is a type error even though
+        # ``spec_from_file_location`` always populates it. Asserting rather
+        # than defaulting keeps an unpopulated ``__file__`` a FAILURE of the
+        # provenance check, never a silent pass.
+        loaded_file = grouped_read.__file__
+        assert loaded_file is not None, (
+            'the loaded module has no __file__, so its provenance cannot be '
+            'established and the branch-against-branch comparison below would '
+            'be unverifiable.'
+        )
+        assert Path(loaded_file).resolve() == fm_grouped_read.resolve(), (
             'the stamper was loaded from outside this worktree, so the '
             'comparison below would not be branch-against-branch. '
-            f'loaded={grouped_read.__file__!r} expected={str(fm_grouped_read)!r}'
+            f'loaded={loaded_file!r} expected={str(fm_grouped_read)!r}'
         )
 
         assert grouped_read.ORIGIN_PROJECT_TAG_KEYS == FOREIGN_PROJECT_TAG_KEYS, (
