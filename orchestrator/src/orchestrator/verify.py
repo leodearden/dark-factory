@@ -12,6 +12,8 @@ import os
 import re
 import shlex
 import shutil
+import subprocess
+import sys
 import time
 import uuid
 import xml.etree.ElementTree as ET
@@ -3701,6 +3703,73 @@ def _target_subprocess_env(
     if extra:
         env.update(extra)
     return env
+
+
+# ``ruff check --show-settings`` prints ``Settings path: "<abs path>"`` as its
+# second line.  Matched by PREFIX, never by line index — ruff is free to add a
+# preamble line and an index match would then silently read the wrong thing.
+_RUFF_SETTINGS_PATH_PREFIX = 'Settings path:'
+_RUFF_PROBE_TIMEOUT_S = 20.0
+
+
+def _ruff_settings_path(worktree: Path, target: Path | None = None) -> Path | None:
+    """Report WHERE ruff actually resolves its settings for *target* (task 3922).
+
+    ruff resolves its config by walking parent directories up from each linted
+    file, and a git VCS root does NOT halt that walk.  A task worktree whose own
+    root declares no ``[tool.ruff]`` therefore resolves the PARENT checkout's
+    pyproject.toml — reading a rule set from another checkout's UNCOMMITTED
+    working tree.  This helper measures that rather than assuming it.
+
+    *target* defaults to the worktree's own root ``pyproject.toml``, which is
+    the probe that answers the question actually being asked ("does the ROOT
+    config escape?").  Do NOT default it to the worktree directory: ruff then
+    resolves settings for whichever file its traversal happens to reach first,
+    which in this repo is a workspace MEMBER carrying its own ``[tool.ruff]``,
+    and the answer would be about that member instead of the root.
+
+    TOTAL AND NON-RAISING by construction: a missing ruff, an unreadable cwd, a
+    timeout or an unparseable line all return None.  This is a diagnostic and
+    must be structurally incapable of reddening a verify by itself.  One
+    subprocess, ``--no-cache``, short timeout.
+    """
+    probe = Path(worktree) / 'pyproject.toml' if target is None else Path(target)
+    try:
+        proc = subprocess.run(
+            [
+                sys.executable, '-m', 'ruff', 'check',
+                '--no-cache', '--show-settings', str(probe),
+            ],
+            cwd=str(worktree),
+            env=_target_subprocess_env(None, worktree=Path(worktree)),
+            capture_output=True,
+            text=True,
+            timeout=_RUFF_PROBE_TIMEOUT_S,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    for line in proc.stdout.splitlines():
+        if not line.startswith(_RUFF_SETTINGS_PATH_PREFIX):
+            continue
+        value = line[len(_RUFF_SETTINGS_PATH_PREFIX):].strip().strip('"')
+        return Path(value) if value else None
+    return None
+
+
+def _ruff_config_escapes(worktree: Path, target: Path | None = None) -> bool:
+    """True iff ruff's resolved settings for *target* live OUTSIDE *worktree*.
+
+    Fail-safe in the quiet direction: an unmeasurable probe (``None`` from
+    ``_ruff_settings_path``) reports False, so a broken or absent ruff produces
+    silence rather than a spurious diagnostic.
+    """
+    settings = _ruff_settings_path(worktree, target)
+    if settings is None:
+        return False
+    try:
+        return not settings.resolve().is_relative_to(Path(worktree).resolve())
+    except OSError:
+        return False
 
 
 @dataclass(frozen=True)
