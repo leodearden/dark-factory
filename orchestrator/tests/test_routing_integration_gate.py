@@ -94,7 +94,6 @@ hand-built ``PlanShape``.
 from __future__ import annotations
 
 import asyncio
-import copy
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -643,8 +642,8 @@ class TestByteEquivalenceThroughTheRig:
         are seeded directly rather than produced by a real architect stub.
         """
         stub = _MinimalRouteRecorder()
-        workflow, _scheduler, rec = _make_rig(  # type: ignore[arg-type]
-            stock_config, git_ops, task_assignment, stub, monkeypatch, fake_verify=False,
+        workflow, _scheduler, rec = _make_rig(
+            stock_config, git_ops, task_assignment, stub, monkeypatch, fake_verify=False,  # type: ignore[arg-type]
         )
 
         workflow.plan = {'steps': [{'id': f's{i}', 'status': 'pending'} for i in range(12)]}
@@ -1513,8 +1512,8 @@ class TestUnknownRuleKeyRejectedPriorRulesStillRoute:
         # seed workflow.plan/modules directly and drive _invoke, since only
         # the resolved route matters here.
         stub = _MinimalRouteRecorder()
-        workflow, _scheduler, rec = _make_rig(  # type: ignore[arg-type]
-            stock_config, git_ops, task_assignment, stub, monkeypatch, fake_verify=False,
+        workflow, _scheduler, rec = _make_rig(
+            stock_config, git_ops, task_assignment, stub, monkeypatch, fake_verify=False,  # type: ignore[arg-type]
         )
 
         workflow.plan = {'steps': [{'id': f's{i}', 'status': 'pending'} for i in range(12)]}
