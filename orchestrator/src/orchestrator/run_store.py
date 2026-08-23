@@ -457,6 +457,40 @@ class RunStore:
         finally:
             conn.close()
 
+    def refresh_scheduler_pause_ewa(self, project_id: str, ewa_value: float) -> bool:
+        """Update ONLY ``ewa_value`` on an existing pause row.  Returns True if one existed.
+
+        Task 4559 amendment.  ``save_scheduler_pause`` writes a trip-TIME
+        snapshot, and it is the only writer, so once a halt is asserted the
+        stored scalar freezes at the tripping value even as the live EWA decays
+        across subsequent digest steps.  That froze two things solid: the
+        restart-time predicate re-check in
+        ``Harness._load_persisted_scheduler_pause`` could essentially never
+        fire (a stored value is by construction >= the threshold at write
+        time), and a restart re-seeded live ``_ewa_value`` with the stale high
+        number, discarding whatever decay the drain had achieved.  On the 8h
+        fleet-redeploy cadence a paused unit therefore reset its healing
+        progress on every restart.
+
+        This is deliberately an UPDATE, never an upsert: with no pause row
+        there is nothing to refresh, and inserting one would fabricate a halt
+        out of a routine digest step.  ``reason``, ``pause_at`` and
+        ``set_by_run_id`` are left untouched so the row keeps recording WHEN
+        and WHY the halt was asserted while ``ewa_value`` tracks the live
+        statistic.  The bool return lets the caller distinguish "refreshed"
+        from "no row" without a second read.
+        """
+        conn = self._connect()
+        try:
+            cursor = conn.execute(
+                'UPDATE scheduler_state SET ewa_value = ? WHERE project_id = ?',
+                (ewa_value, project_id),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+        finally:
+            conn.close()
+
     def load_scheduler_pause(self, project_id: str) -> dict | None:
         """Return the persisted pause record for *project_id*, or ``None``.
 

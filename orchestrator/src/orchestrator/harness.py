@@ -14887,6 +14887,14 @@ class Harness:
            halt while losing the number behind it, so the evidence-vs-halt
            asymmetry is structural to ``pause_scheduler`` rather than
            EWA-specific, and is fixed here for all classes at once.
+           This write is the trip-TIME snapshot.  While an ``ewa_trip_`` halt
+           is subsequently HELD, ``_maybe_write_digest`` step (13b) refreshes
+           the same column on every digest step, so the stored scalar tracks
+           the decaying statistic rather than freezing at the tripping value —
+           without which the restart-time predicate re-check below could never
+           observe recovery.  That refresh is scoped to ``ewa_trip_`` rows;
+           for every other class the trip-time snapshot written here is the
+           forensic record and is never overwritten.
         3. Emits ``EventType.scheduler_paused`` (best-effort).
         4. Logs a WARNING so the operator sees it.
         5. Files an auto-resumable scheduler-pause L1 — unless ``file_escalation``
@@ -15005,6 +15013,14 @@ class Harness:
         is an ``ewa_trip_*`` row with a NULL value — a row predating the
         migration — which fails safe toward KEEPING the halt when the predicate
         is unknowable, never toward releasing it.
+
+        What makes that re-check reachable at all is ``_maybe_write_digest``
+        step (13b): while an ``ewa_trip_`` halt is held it refreshes the stored
+        ``ewa_value`` on every digest step, so the number read here is the EWA
+        as of the last digest before shutdown, not the trip-time snapshot.
+        Without that refresh the stored value would be >= the threshold by
+        construction and this branch could only ever fire because an operator
+        RAISED ``digest_ewa_threshold`` — never because the backlog drained.
 
         The stored value is written back to LIVE state (``self._ewa_value``)
         only for an ``ewa_trip_*`` row — the same predicate that governs the
@@ -15145,6 +15161,10 @@ class Harness:
         13. Advance counters/state using the snapshot from step 2 (not the
             live counter), so that concurrent callbacks firing inside this
             function do not silently skip counted events.
+        13b. If an ``ewa_trip_`` halt is currently HELD, refresh the persisted
+            ``scheduler_state.ewa_value`` so the stored scalar tracks the
+            decaying live statistic instead of freezing at the trip-time
+            snapshot (fail-open; see the inline note).
         14. If tripped and not already paused, call pause_scheduler (post-write).
 
         Note on the two counters (task 4559): _escalation_event_count counts
@@ -15315,6 +15335,49 @@ class Harness:
             self._last_digest_event_count = event_count_snapshot
             self._last_digest_submit_count = submit_count_snapshot
             self._last_digest_window_end_iso = window_end
+
+            # (13b) While an ewa_trip_ halt is HELD, keep the persisted scalar
+            # tracking the live statistic (task 4559 amendment).
+            #
+            # pause_scheduler is otherwise the only writer, and step (14) below
+            # only fires `if tripped and not is_paused` — so once the halt is
+            # asserted the row would freeze at the trip-time value forever,
+            # even as this method decays _ewa_value on every drain window.  Two
+            # things broke as a result: the restart-time predicate re-check in
+            # _load_persisted_scheduler_pause could essentially never observe
+            # recovery (a stored value is by construction >= the threshold at
+            # write time, so `ewa_value < threshold` was only reachable if an
+            # operator RAISED digest_ewa_threshold), and a restart re-seeded
+            # _ewa_value with the stale high number, discarding the decay the
+            # drain had achieved — on the 8h fleet-redeploy cadence, on every
+            # restart.  Refreshing here is what makes "draining heals the
+            # breaker" survive a process boundary rather than being reset by it.
+            #
+            # Scoped to ewa_trip_ pauses for the same reason the restore is
+            # (see _load_persisted_scheduler_pause): that is the one class whose
+            # stored scalar IS the live statistic.  For every other class the
+            # value is trip-time forensic evidence about the pause, and
+            # overwriting it with an unrelated later number would destroy it.
+            #
+            # Best-effort with its own guard: a persistence hiccup must never
+            # break the digest, and this is observability plus a restart hint,
+            # never a correctness gate.
+            if (
+                self._run_store
+                and self.scheduler.is_paused
+                and (self.scheduler.pause_reason or '').startswith('ewa_trip_')
+            ):
+                try:
+                    self._run_store.refresh_scheduler_pause_ewa(
+                        self.config.fused_memory.project_id,
+                        new_ewa,
+                    )
+                except Exception:
+                    logger.warning(
+                        '_maybe_write_digest: failed to refresh persisted EWA '
+                        'on the held pause row (fail-open)',
+                        exc_info=True,
+                    )
 
             # (14) EWA trip: pause scheduler AFTER the digest is written so the
             # markdown captures the trip-causing state.

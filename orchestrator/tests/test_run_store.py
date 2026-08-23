@@ -465,6 +465,79 @@ class TestSchedulerStatePersistence:
             f'Expected most-recent reason; got {result["reason"]!r}'
         )
 
+    def test_refresh_updates_only_ewa_value(self, tmp_path):
+        """refresh_scheduler_pause_ewa rewrites the scalar and nothing else (task 4559).
+
+        The stored value must track the DECAYING live statistic while a halt is
+        held; reason/pause_at/set_by_run_id must keep recording when and why
+        the halt was asserted.
+        """
+        store = RunStore(tmp_path / 'runs.db')
+        store.start_run('run-1', 'proj-a', '2026-05-14T10:00:00+00:00')
+        store.save_scheduler_pause(
+            project_id='proj-a',
+            reason='ewa_trip_73.5900',
+            pause_at_iso='2026-05-14T10:05:00+00:00',
+            set_by_run_id='run-1',
+            ewa_value=73.59,
+        )
+
+        refreshed = store.refresh_scheduler_pause_ewa('proj-a', 12.25)
+
+        assert refreshed is True, 'Expected True when a pause row existed'
+        result = store.load_scheduler_pause('proj-a')
+        assert result is not None
+        assert result['ewa_value'] == pytest.approx(12.25), (
+            f'Expected the decayed value 12.25; got {result["ewa_value"]!r}'
+        )
+        assert result['reason'] == 'ewa_trip_73.5900', (
+            f'reason must be untouched; got {result["reason"]!r}'
+        )
+        assert result['pause_at'] == '2026-05-14T10:05:00+00:00', (
+            f'pause_at must be untouched; got {result["pause_at"]!r}'
+        )
+        assert result['set_by_run_id'] == 'run-1', (
+            f'set_by_run_id must be untouched; got {result["set_by_run_id"]!r}'
+        )
+
+    def test_refresh_without_a_pause_row_is_a_no_op(self, tmp_path):
+        """With no pause row there is nothing to refresh — and none is fabricated.
+
+        This is an UPDATE, deliberately not an upsert: inserting here would
+        turn a routine digest step into a persisted halt that a restart would
+        then restore.
+        """
+        store = RunStore(tmp_path / 'runs.db')
+        store.start_run('run-1', 'proj-a', '2026-05-14T10:00:00+00:00')
+
+        refreshed = store.refresh_scheduler_pause_ewa('proj-a', 5.0)
+
+        assert refreshed is False, 'Expected False when no pause row existed'
+        assert store.load_scheduler_pause('proj-a') is None, (
+            'refresh must never CREATE a pause row — that would fabricate a halt'
+        )
+
+    def test_refresh_is_scoped_to_the_named_project(self, tmp_path):
+        """Another project's pause row is untouched by a refresh."""
+        store = RunStore(tmp_path / 'runs.db')
+        store.start_run('run-1', 'proj-a', '2026-05-14T10:00:00+00:00')
+        for project in ('proj-a', 'proj-b'):
+            store.save_scheduler_pause(
+                project_id=project,
+                reason='ewa_trip_30.0000',
+                pause_at_iso='2026-05-14T10:05:00+00:00',
+                set_by_run_id='run-1',
+                ewa_value=30.0,
+            )
+
+        store.refresh_scheduler_pause_ewa('proj-a', 1.5)
+
+        other = store.load_scheduler_pause('proj-b')
+        assert other is not None
+        assert other['ewa_value'] == pytest.approx(30.0), (
+            f"proj-b's row must be untouched; got {other['ewa_value']!r}"
+        )
+
     def test_clear_removes_row(self, tmp_path):
         """clear_scheduler_pause causes subsequent load to return None."""
         store = RunStore(tmp_path / 'runs.db')

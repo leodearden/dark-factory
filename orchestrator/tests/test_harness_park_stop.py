@@ -2260,6 +2260,167 @@ class TestHarnessEwaTrip:
         )
         mock_run_store.save_scheduler_pause.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_held_ewa_trip_pause_refreshes_the_persisted_value(
+        self, tmp_path: Path, _cost_store_factory
+    ) -> None:
+        """A drain step under a HELD ewa_trip_ halt rewrites the stored scalar (task 4559).
+
+        Without this the persisted value is a trip-TIME snapshot that nothing
+        ever refreshes: ``pause_scheduler`` is the only writer and the trip
+        path only fires ``if tripped and not is_paused``.  Two things break as
+        a result — the restart-time predicate re-check in
+        ``_load_persisted_scheduler_pause`` can essentially never observe
+        recovery (a stored value is >= the threshold by construction at write
+        time), and a restart re-seeds live ``_ewa_value`` with the stale high
+        number, discarding the decay the drain achieved.  On the 8h
+        fleet-redeploy cadence that reset the healing progress on every
+        restart, which is precisely the mechanism this task introduces.
+
+        Drain window: 10 lifecycle events (the gate), ZERO submissions (the
+        numerator), so update_ewa reduces to pure decay 0.7 * 73.59 = 51.513.
+        """
+        harness, mock_run_store, _ = _make_harness_with_mocks(tmp_path)
+        harness.config = OrchestratorConfig(
+            project_root=tmp_path,
+            digest_every_n_escalations=1,
+            digest_ewa_threshold=24.6,
+            digest_ewa_alpha=0.3,
+        )
+        harness.cost_store = await _cost_store_factory()
+        harness._ewa_value = 73.59               # the recorded 2026-08-20 trip value
+        await harness.pause_scheduler('ewa_trip_73.5900')
+        mock_run_store.reset_mock()              # drop the pause-time save
+
+        # A pure-drain window: resolutions advance the GATE, nothing advances
+        # the NUMERATOR.
+        harness._escalation_event_count = 10
+        harness._last_digest_event_count = 0
+        harness._escalation_submit_count = 0
+        harness._last_digest_submit_count = 0
+
+        await harness._maybe_write_digest()
+
+        mock_run_store.refresh_scheduler_pause_ewa.assert_called_once()
+        args = mock_run_store.refresh_scheduler_pause_ewa.call_args.args
+        assert args[1] == pytest.approx(0.7 * 73.59), (
+            f'Expected the decayed value 0.7*73.59 persisted; got {args[1]!r}'
+        )
+        assert harness._ewa_value == pytest.approx(args[1]), (
+            'The refreshed row must carry the SAME number as live state, '
+            f'else a restart re-seeds a different one; live={harness._ewa_value} '
+            f'persisted={args[1]}'
+        )
+        # The halt itself is untouched — this refreshes evidence, it does not
+        # resume anything (live auto-resume is explicitly out of scope).
+        assert harness.scheduler.is_paused is True, (
+            'Refreshing the stored value must never release the halt'
+        )
+        mock_run_store.save_scheduler_pause.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_non_ewa_pause_is_not_refreshed(
+        self, tmp_path: Path, _cost_store_factory
+    ) -> None:
+        """A park-stop halt keeps its trip-time evidence — the refresh is ewa_trip_ only.
+
+        Same scoping as the restore-time predicate: ``ewa_trip_`` is the one
+        pause class whose stored scalar IS the live statistic.  For every other
+        class the value is forensic evidence ABOUT that pause, and overwriting
+        it with an unrelated later EWA would destroy it.
+        """
+        harness, mock_run_store, _ = _make_harness_with_mocks(tmp_path)
+        harness.config = OrchestratorConfig(
+            project_root=tmp_path,
+            digest_every_n_escalations=1,
+            digest_ewa_threshold=24.6,
+            digest_ewa_alpha=0.3,
+        )
+        harness.cost_store = await _cost_store_factory()
+        harness._ewa_value = 4.2
+        await harness.pause_scheduler('park-stop: 5 blocked')
+        mock_run_store.reset_mock()
+
+        harness._escalation_event_count = 10
+        harness._last_digest_event_count = 0
+        harness._escalation_submit_count = 0
+        harness._last_digest_submit_count = 0
+
+        await harness._maybe_write_digest()
+
+        mock_run_store.refresh_scheduler_pause_ewa.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_unpaused_digest_step_does_not_refresh(
+        self, tmp_path: Path, _cost_store_factory
+    ) -> None:
+        """With no halt held there is no row to refresh, so the write is skipped.
+
+        Guards against turning every digest step into a needless DB write —
+        and, with RunStore's UPDATE-not-upsert semantics, against any reading
+        in which a routine step could fabricate a pause row.
+        """
+        harness, mock_run_store, _ = _make_harness_with_mocks(tmp_path)
+        harness.config = OrchestratorConfig(
+            project_root=tmp_path,
+            digest_every_n_escalations=1,
+            digest_ewa_threshold=1_000_000_000.0,  # never trips
+            digest_ewa_alpha=0.3,
+        )
+        harness.cost_store = await _cost_store_factory()
+        harness._escalation_event_count = 3
+        harness._last_digest_event_count = 0
+        harness._escalation_submit_count = 3
+        harness._last_digest_submit_count = 0
+
+        await harness._maybe_write_digest()
+
+        assert harness.scheduler.is_paused is False, 'Fixture sanity: not paused'
+        mock_run_store.refresh_scheduler_pause_ewa.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_refresh_failure_is_fail_open(
+        self, tmp_path: Path, _cost_store_factory
+    ) -> None:
+        """A RunStore hiccup during the refresh must not break the digest.
+
+        The refresh is observability plus a restart hint, never a correctness
+        gate — the same fail-open contract the rest of ``_maybe_write_digest``
+        holds to.  The digest file and the advanced counters must survive it.
+        """
+        harness, mock_run_store, _ = _make_harness_with_mocks(tmp_path)
+        harness.config = OrchestratorConfig(
+            project_root=tmp_path,
+            digest_every_n_escalations=1,
+            digest_ewa_threshold=24.6,
+            digest_ewa_alpha=0.3,
+        )
+        harness.cost_store = await _cost_store_factory()
+        harness._ewa_value = 73.59
+        await harness.pause_scheduler('ewa_trip_73.5900')
+        mock_run_store.reset_mock()
+        mock_run_store.refresh_scheduler_pause_ewa.side_effect = sqlite3.OperationalError(
+            'database is locked'
+        )
+
+        harness._escalation_event_count = 10
+        harness._last_digest_event_count = 0
+        harness._escalation_submit_count = 0
+        harness._last_digest_submit_count = 0
+
+        await harness._maybe_write_digest()
+
+        files = list((tmp_path / 'data' / 'digests').glob('digest-*.md'))
+        assert len(files) == 1, f'Expected the digest to still be written; got {files}'
+        assert harness._last_digest_event_count == 10, (
+            'Counters must still advance when the refresh fails; got '
+            f'{harness._last_digest_event_count}'
+        )
+        assert harness._ewa_value == pytest.approx(0.7 * 73.59), (
+            'Live EWA state must still decay when the refresh fails; got '
+            f'{harness._ewa_value}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # TestWatcherSupervisorCallsMaybeWriteDigest (step-23)
