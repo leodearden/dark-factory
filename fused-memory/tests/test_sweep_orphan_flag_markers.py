@@ -3057,3 +3057,112 @@ class TestListKnownProjects:
             or '_known_projects_map' in r.getMessage()
             for r in caplog.records
         ), f'Expected a WARNING naming the failure; got {[r.getMessage() for r in caplog.records]}'
+
+
+class TestMainListKnownProjects:
+    """main() --list-known-projects — the branch the nightly wrapper consumes
+    with `$( ... )` word-splitting (task 2917 amendment,
+    reviewer_comprehensive #5).
+
+    Every contract here is read by BASH, not by Python, and the wrapper-side
+    tests substitute a fake recorder for this script — so without these, a
+    regression in any of the three silently changes what the nightly sweeps:
+
+      * stdout is EXACTLY one project_id per line and nothing else. Any stray
+        stdout write is word-split into an extra `--project-id` the wrapper
+        then sweeps;
+      * exit 1 when the registry resolves empty. That non-zero is what trips
+        the wrapper's narrow-and-warn fallback; `_known_projects_map` returning
+        `{}` is tested on its own, but the exit code that turns it into a
+        caller-visible signal is what the wrapper actually keys on;
+      * NO MemoryService and NO FusedMemoryConfig are constructed on this path.
+        That is why the wrapper can resolve the project list before the stores
+        are known reachable.
+    """
+
+    @staticmethod
+    def _no_store(monkeypatch):
+        """Make ANY live-store construction an immediate, loud failure."""
+        def _forbidden(*_args, **_kwargs):
+            raise AssertionError(
+                'the --list-known-projects path must not touch the live stores'
+            )
+
+        monkeypatch.setattr(
+            'fused_memory.config.schema.FusedMemoryConfig', _forbidden,
+        )
+        monkeypatch.setattr(
+            'fused_memory.services.memory_service.MemoryService', _forbidden,
+        )
+        monkeypatch.setattr(_mod.asyncio, 'run', _forbidden)
+
+    def _run(self, monkeypatch, resolved):
+        monkeypatch.setattr(
+            sys, 'argv', ['sweep_orphan_flag_markers.py', '--list-known-projects'],
+        )
+        monkeypatch.setattr(_mod, '_known_projects_map', lambda: resolved)
+        self._no_store(monkeypatch)
+        return _mod.main()
+
+    def test_prints_one_sorted_project_id_per_line_and_nothing_else(
+        self, monkeypatch, capsys,
+    ):
+        exit_code = self._run(
+            monkeypatch, {'reify': '/b', 'dark_factory': '/a', 'autotrade': '/c'},
+        )
+        out = capsys.readouterr().out
+
+        assert exit_code == 0
+        assert out == 'autotrade\ndark_factory\nreify\n', (
+            f'The wrapper word-splits this stdout straight into --project-id '
+            f'arguments, so it must carry the ids and NOTHING else (sorted, so '
+            f'the journal order is stable); got {out!r}'
+        )
+
+    def test_json_report_is_not_printed_on_this_path(self, monkeypatch, capsys):
+        """The sweeping path ends with `print(json.dumps(report))`. If that
+        ever leaked into this branch every JSON token would become a swept
+        project_id."""
+        self._run(monkeypatch, {'dark_factory': '/a'})
+        out = capsys.readouterr().out
+
+        assert out.split() == ['dark_factory'], (
+            f'Expected exactly the id list; got {out!r}'
+        )
+
+    def test_empty_registry_exits_1_with_no_stdout(self, monkeypatch, capsys):
+        """The wrapper's narrow-and-warn fallback triggers on the EXIT CODE.
+        A 0 here would leave PROJECT_IDS empty-but-successful and the drain
+        would silently sweep nothing."""
+        exit_code = self._run(monkeypatch, {})
+        out = capsys.readouterr().out
+
+        assert exit_code == 1, (
+            f'An unresolvable registry must be a caller-visible signal, not a '
+            f'quiet success; got exit {exit_code}'
+        )
+        assert out == '', (
+            f'Nothing may reach stdout when there is no list to emit -- the '
+            f'wrapper only checks emptiness of what it captured; got {out!r}'
+        )
+
+    def test_reports_the_coverage_degradation_without_polluting_stdout(
+        self, monkeypatch, capsys, caplog,
+    ):
+        """A primary-only map is warned about (it is the degradation an
+        emptiness check can never see) — but on the LOG, never on stdout."""
+        monkeypatch.delenv('DASHBOARD_KNOWN_PROJECT_ROOTS', raising=False)
+
+        with caplog.at_level(logging.WARNING, logger='sweep_orphan_flag_markers'):
+            exit_code = self._run(monkeypatch, {'dark_factory': '/a'})
+        out = capsys.readouterr().out
+
+        assert exit_code == 0
+        assert out == 'dark_factory\n', out
+        assert any(
+            'DASHBOARD_KNOWN_PROJECT_ROOTS' in r.getMessage()
+            for r in caplog.records
+        ), (
+            'A primary-only map must still be REPORTED at WARNING; got '
+            f'{[r.getMessage() for r in caplog.records]}'
+        )
