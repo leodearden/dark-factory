@@ -15359,6 +15359,16 @@ class Harness:
             # value is trip-time forensic evidence about the pause, and
             # overwriting it with an unrelated later number would destroy it.
             #
+            # The check below is a cheap PRE-FILTER, not the enforcement point:
+            # it reads the IN-MEMORY reason, which can disagree with the row's
+            # stored reason (Scheduler.pause is first-wins in memory;
+            # save_scheduler_pause is INSERT OR REPLACE, last-wins on disk — so
+            # a park-stop trip during a held ewa_trip_ halt is an in-memory
+            # no-op that still rewrites the row).  refresh_scheduler_pause_ewa
+            # re-tests the prefix against the ROW's own pause_reason in its
+            # WHERE clause; that is what actually protects a non-EWA row's
+            # forensic value.  Do not drop it in favour of this check.
+            #
             # Best-effort with its own guard: a persistence hiccup must never
             # break the digest, and this is observability plus a restart hint,
             # never a correctness gate.
