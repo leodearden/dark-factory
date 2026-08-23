@@ -2297,9 +2297,14 @@ class TestResolveTerminalTaskIds:
         )
 
         with caplog.at_level(logging.WARNING, logger='sweep_orphan_flag_markers'):
-            result = await _mod._resolve_terminal_task_ids('dark_factory')
+            result, mode = await _mod._resolve_terminal_task_ids('dark_factory')
 
         assert result == set()
+        assert mode == 'unconfigured', (
+            f'An unconfigured taskmaster must be reported as its OWN mode, not '
+            f'as a bare empty set: the journal line renders it differently from '
+            f'a backend that failed and from a genuine zero; got {mode!r}'
+        )
         assert not any(
             record.name == 'sweep_orphan_flag_markers' for record in caplog.records
         ), f'Expected no WARNING logs, got: {[r.message for r in caplog.records]}'
@@ -2337,9 +2342,14 @@ class TestResolveTerminalTaskIds:
         )
 
         with caplog.at_level(logging.WARNING, logger='sweep_orphan_flag_markers'):
-            result = await _mod._resolve_terminal_task_ids('dark_factory')
+            result, mode = await _mod._resolve_terminal_task_ids('dark_factory')
 
         assert result == set()
+        assert mode == 'resolution-failed', (
+            f'A raising backend must be distinguishable from a narrowed sweep '
+            f'and from a genuine zero, or a nightly whose task store failed to '
+            f'open reads like a healthy one; got {mode!r}'
+        )
         matching = [
             record for record in caplog.records
             if record.name == 'sweep_orphan_flag_markers' and record.levelno == logging.WARNING
@@ -2860,8 +2870,13 @@ class TestTerminalDrainIsPrimaryProjectOnly:
         seen = self._rig(monkeypatch, primary_id='dark_factory')
 
         with caplog.at_level(logging.WARNING, logger='sweep_orphan_flag_markers'):
-            result = await _mod._resolve_terminal_task_ids('reify')
+            result, mode = await _mod._resolve_terminal_task_ids('reify')
 
+        assert mode == 'narrowed-non-primary', (
+            f'The narrowing is the whole point of the guard, so it must be '
+            f'reported as a mode and not inferred from an empty set; got '
+            f'{mode!r}'
+        )
         assert result == set(), (
             f"Expected NO terminal ids for a non-primary project (they would be "
             f"matched against reify's markers by plain string membership); "
@@ -2898,14 +2913,76 @@ class TestTerminalDrainIsPrimaryProjectOnly:
         sweep still resolves terminal ids exactly as before."""
         seen = self._rig(monkeypatch, primary_id='dark_factory')
 
-        result = await _mod._resolve_terminal_task_ids('dark_factory')
+        result, mode = await _mod._resolve_terminal_task_ids('dark_factory')
 
+        assert mode == 'terminal-drain', (
+            f'The working case must report the mode that actually ran; got '
+            f'{mode!r}'
+        )
         assert result == {'11', '13'}, (
             f'Expected the primary project to keep its terminal-drain set; '
             f'got {result!r}'
         )
         assert seen['constructed'] == 1
         assert seen['get_statuses_roots'] == ['/srv/dark-factory']
+
+
+class TestEffectiveModeLabel:
+    """_effective_mode_label() — the per-project coverage line in the journal
+    (task 2917 amendment, reviewer_comprehensive #4).
+
+    The line previously read `'terminal-drain (N)' if terminal_task_ids else
+    'age-only'`, keying on the TRUTHINESS of the resolved set. That collapses
+    four operational states into one word, and the state an operator most
+    needs to tell apart -- the PRIMARY project resolving zero terminal ids
+    because its task store failed to open -- then reads identically to a
+    correctly narrowed sibling project. The stated goal of the line is to
+    report coverage rather than intent; these tests pin that it does.
+    """
+
+    def test_terminal_drain_reports_the_count_including_zero(self):
+        """Zero terminal ids on the primary project is a REAL terminal-drain
+        run, not an age-only one: the set is authoritative and empty."""
+        assert _mod._effective_mode_label('terminal-drain', set()) == (
+            'terminal-drain (0 terminal task ids)'
+        )
+        assert _mod._effective_mode_label('terminal-drain', {'1', '2'}) == (
+            'terminal-drain (2 terminal task ids)'
+        )
+
+    @pytest.mark.parametrize(
+        'mode,expected_marker',
+        [
+            ('narrowed-non-primary', 'NARROWED'),
+            ('unconfigured', 'NO '),
+            ('resolution-failed', 'FAILED'),
+            ('not-requested', 'not requested'),
+        ],
+    )
+    def test_every_empty_set_reason_renders_distinctly(self, mode, expected_marker):
+        label = _mod._effective_mode_label(mode, set())
+        assert label.startswith('age-only ('), label
+        assert expected_marker in label, (
+            f'Mode {mode!r} must say WHY the sweep was age-only; got {label!r}'
+        )
+
+    def test_the_four_age_only_reasons_are_not_the_same_string(self):
+        """A regression that mapped two reasons to one label would defeat the
+        whole point, and would pass every test above."""
+        labels = {
+            _mod._effective_mode_label(mode, set())
+            for mode in (
+                'narrowed-non-primary', 'unconfigured',
+                'resolution-failed', 'not-requested',
+            )
+        }
+        assert len(labels) == 4, f'Expected four distinct labels, got {labels!r}'
+
+    def test_an_unlabelled_mode_is_loud_rather_than_mislabelled_age_only(self):
+        """Fail-visible: a mode added to the resolver without a label must not
+        silently print `age-only` for something that may not be age-only."""
+        label = _mod._effective_mode_label('brand-new-mode', set())
+        assert 'brand-new-mode' in label and 'UNKNOWN' in label, label
 
 
 class TestListKnownProjects:

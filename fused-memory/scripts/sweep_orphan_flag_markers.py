@@ -1465,8 +1465,17 @@ def _known_projects_coverage_issue(known: dict[str, str]) -> str | None:
         return None
 
 
-async def _resolve_terminal_task_ids(project_id: str) -> set[str]:
+async def _resolve_terminal_task_ids(project_id: str) -> tuple[set[str], str]:
     """Best-effort resolve terminal-status task ids for ``--terminal-drain``.
+
+    Returns the ids AND the REASON they came out that way (task 2917
+    amendment, reviewer_comprehensive #4). An empty set is reached four
+    different ways, and the journal must not spell them the same word: a
+    correctly narrowed sibling project, an unconfigured taskmaster, a backend
+    that failed to open, and a primary project that genuinely has zero
+    terminal tasks are four distinct operational states. Only the caller's
+    ``--terminal-drain`` flag is missing from that list, and ``main`` supplies
+    ``'not-requested'`` for it without calling this function at all.
 
     Mirrors
     ``fused_memory.reconciliation.stages.task_knowledge_sync._resolve_terminal_task_ids``'s
@@ -1515,9 +1524,18 @@ async def _resolve_terminal_task_ids(project_id: str) -> set[str]:
             ``args.project_id``.
 
     Returns:
-        Set of task_id strings whose status is terminal (``done`` or
-        ``cancelled`` per ``shared.task_statuses.TERMINAL``); empty set on
-        any failure, unconfigured taskmaster, or a non-primary *project_id*.
+        ``(task_ids, mode)``. *task_ids* is the set of task_id strings whose
+        status is terminal (``done`` or ``cancelled`` per
+        ``shared.task_statuses.TERMINAL``); empty on any failure,
+        unconfigured taskmaster, or a non-primary *project_id*. *mode* is one
+        of :data:`_EFFECTIVE_MODE_LABELS`' keys plus ``'terminal-drain'``:
+
+          ``'terminal-drain'``       resolved from this project's own task
+                                     store; the set is authoritative, ZERO
+                                     included.
+          ``'narrowed-non-primary'`` the primary-project guard fired.
+          ``'unconfigured'``         no taskmaster on this process.
+          ``'resolution-failed'``    the backend raised; see the WARNING.
     """
     try:
         from shared.task_statuses import TERMINAL as TERMINAL_STATUSES  # noqa: PLC0415
@@ -1528,7 +1546,7 @@ async def _resolve_terminal_task_ids(project_id: str) -> set[str]:
 
         config = FusedMemoryConfig()
         if config.taskmaster is None:
-            return set()
+            return set(), 'unconfigured'
 
         # Resolved with the same rename-stable resolver the registry builder
         # uses, so a manifest-declared id (not the directory basename) is
@@ -1549,7 +1567,7 @@ async def _resolve_terminal_task_ids(project_id: str) -> set[str]:
                 project_id, primary_project_id, config.taskmaster.project_root,
                 project_id, project_id,
             )
-            return set()
+            return set(), 'narrowed-non-primary'
 
         backend = SqliteTaskBackend(config.taskmaster)
         await backend.start()
@@ -1559,7 +1577,7 @@ async def _resolve_terminal_task_ids(project_id: str) -> set[str]:
             await backend.close()
         return {
             str(tid) for tid, status in statuses.items() if status in TERMINAL_STATUSES
-        }
+        }, 'terminal-drain'
     except Exception:
         # exc_info=True (task 2596 amendment, reviewer_comprehensive #3): a
         # genuine wiring failure (wrong attr, backend import error) must
@@ -1570,7 +1588,58 @@ async def _resolve_terminal_task_ids(project_id: str) -> set[str]:
             'failed; falling back to age-only sweep (terminal_task_ids=set()).',
             exc_info=True,
         )
-        return set()
+        return set(), 'resolution-failed'
+
+
+# Human-readable rendering of every NON-terminal-drain outcome, keyed by the
+# mode :func:`_resolve_terminal_task_ids` reports. Keeping the strings here
+# rather than inline at the log site is what stops the producer and the
+# formatter drifting apart (task 2917 amendment, reviewer_comprehensive #4).
+_EFFECTIVE_MODE_LABELS: dict[str, str] = {
+    'narrowed-non-primary': (
+        'age-only (--terminal-drain requested, but NARROWED: this process is '
+        'configured with another project\'s task store -- see the WARNING '
+        'above)'
+    ),
+    'unconfigured': (
+        'age-only (--terminal-drain requested, but this process has NO '
+        'taskmaster configured, so no terminal ids exist to drain)'
+    ),
+    'resolution-failed': (
+        'age-only (--terminal-drain requested, but terminal-id resolution '
+        'FAILED -- see the WARNING with the traceback above)'
+    ),
+    'not-requested': 'age-only (--terminal-drain not requested)',
+}
+
+
+def _effective_mode_label(mode: str, terminal_task_ids: set[str]) -> str:
+    """Render the per-project coverage line for the journal.
+
+    Why not ``'terminal-drain' if terminal_task_ids else 'age-only'``: keying
+    on the truthiness of the SET collapses four states into one word, and the
+    one an operator most needs to tell apart -- the primary project resolving
+    ZERO terminal ids because the task store failed to open -- then reads
+    identically to a correctly narrowed sibling project. A nightly whose task
+    backend is broken must not look like a healthy one.
+
+    Args:
+        mode: The mode :func:`_resolve_terminal_task_ids` reported, or
+            ``'not-requested'`` when ``--terminal-drain`` was never passed.
+        terminal_task_ids: The resolved set, used only for its size.
+
+    Returns:
+        A single-line description of the mode that ACTUALLY ran.
+    """
+    if mode == 'terminal-drain':
+        return f'terminal-drain ({len(terminal_task_ids)} terminal task ids)'
+    return _EFFECTIVE_MODE_LABELS.get(
+        mode,
+        # Unreachable by construction; still legible if a new mode is added
+        # to the resolver without a label, rather than silently printing
+        # "age-only" for something that is not age-only.
+        f'UNKNOWN mode {mode!r} (treated as age-only)',
+    )
 
 
 def main() -> int:
@@ -1618,22 +1687,22 @@ def main() -> int:
         config = FusedMemoryConfig()
         memory = MemoryService(config)
         now_dt = datetime.now(UTC)
-        terminal_task_ids = (
-            await _resolve_terminal_task_ids(args.project_id)
-            if args.terminal_drain
-            else set()
-        )
+        if args.terminal_drain:
+            terminal_task_ids, drain_mode = await _resolve_terminal_task_ids(
+                args.project_id
+            )
+        else:
+            terminal_task_ids, drain_mode = set(), 'not-requested'
         # Census honesty (task 2917 EDIT 1): the wrapper loops over the whole
         # registered fleet and requests --terminal-drain uniformly, but the
         # guard above narrows every non-primary project to age-only. Say which
         # mode ACTUALLY ran, per project, so the journal reports coverage
-        # rather than intent.
+        # rather than intent -- including WHY, since four different states
+        # produce an empty set (task 2917 amendment).
         logger.info(
             'sweep_orphan_flag_markers: project_id=%s effective mode=%s',
             args.project_id,
-            f'terminal-drain ({len(terminal_task_ids)} terminal task ids)'
-            if terminal_task_ids
-            else 'age-only',
+            _effective_mode_label(drain_mode, terminal_task_ids),
         )
         try:
             await memory.initialize()
