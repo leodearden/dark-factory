@@ -3833,9 +3833,9 @@ def _ruff_settings_path(worktree: Path, target: Path | None = None) -> Path | No
     workspace MEMBER carrying its own ``[tool.ruff]``, and the answer would be
     about that member instead of the root.
 
-    Runs the binary ``_ruff_probe_binary`` selects, which is a best-effort stand
-    -in for the lint leg's own ruff and may be a different build of it — see
-    that helper, and note the emitted diagnostic names the binary it used.
+    Runs whichever binary ``_ruff_probe_binary`` selects: a best-effort stand-in
+    for the lint leg's own ruff, possibly a different build of it — see that
+    helper, and note the emitted diagnostic names the binary it used.
 
     TOTAL AND NON-RAISING by construction: a missing ruff, an unreadable cwd, a
     timeout, an absent probe target or an unparseable line all return None.
