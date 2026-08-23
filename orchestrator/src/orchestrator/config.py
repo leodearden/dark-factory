@@ -5228,6 +5228,11 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         # orchestrator.  This changes the reload TIER only:
         # digest_ewa_threshold's VALUE stays at its default (a retune was
         # deliberately declined — see the field's own docstring).
+        # OPERATIONS.md §"Config reload vs restart" (the operator-facing tier
+        # authority) and plans/config-hot-reload-prd.md do NOT yet enumerate
+        # these five; both files are outside task 4559's assigned scope, so
+        # that bullet is owned by task 4632.  Until it lands, this list is the
+        # only place an operator can learn the breaker is live-retunable.
         'digest_enabled',
         'digest_every_n_escalations',
         'digest_dir',

@@ -15381,6 +15381,21 @@ class Harness:
 
             # (14) EWA trip: pause scheduler AFTER the digest is written so the
             # markdown captures the trip-causing state.
+            #
+            # There is deliberately NO symmetric release edge here: a held
+            # ewa_trip_ halt is never lifted in-process, however far the
+            # statistic has decayed.  Today an ewa_trip_ halt is released only
+            # by an operator / auto-watcher resume, or by a RESTART, where
+            # _load_persisted_scheduler_pause re-tests the stored predicate and
+            # declines to re-assert it.  That asymmetry — a restart can release
+            # a decayed halt, a running process never does — is a known and
+            # filed gap, not an oversight: adding the release edge means
+            # deciding whether an EWA-tripped scheduler may auto-resume, which
+            # plans/stranding-remediation-scheduler-ergonomics-prd.md section 4
+            # excludes, task 2890 reserves for a human, and task 3328 carves
+            # out.  Owned by the follow-up filed from this task's amendment
+            # pass (agent-followup-4559-inprocess-ewa-release); do not add an
+            # auto-resume here without engaging those three first.
             if tripped and not self.scheduler.is_paused:
                 await self.pause_scheduler(f'ewa_trip_{new_ewa:.4f}')
 
