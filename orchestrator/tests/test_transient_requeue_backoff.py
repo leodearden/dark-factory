@@ -390,27 +390,49 @@ class TestReleaseArmsJitteredBackoff:
         assert armed == [5.0, 10.0, 20.0, 20.0]
 
     def test_dispatch_eligibility_honours_the_longer_deadline(self):
-        """The existing cooldown gate reads the longer deadline unchanged.
+        """The REAL ``_eligible_for_dispatch`` gate refuses for the full 120s.
 
-        n=3 at the upper edge arms 120s: still cooling at +60s (where the old
-        flat 30s would already have expired), eligible again past 120s.  The
-        gate itself is untouched — ``_requeue_until`` keeps its plain
-        ``dict[str, float]`` monotonic-deadline shape.
+        This is the product-visible point of the whole task: the longer
+        cooldown must actually keep the task off the dispatch path.  So it
+        drives the gate itself rather than re-reading ``_requeue_until`` —
+        comparing the stored deadline against the clock that just set it is a
+        tautology that would still pass if the gate at scheduler.py:5059 were
+        deleted or inverted.
+
+        n=3 at the upper edge arms 120s: still refused at +60s, where the old
+        flat 30s would already have let the task back in; eligible again once
+        the deadline passes.
         """
         clock = [1000.0]
         scheduler = _clocked_scheduler(clock, jitter_source=lambda lo, hi: hi)
         for _ in range(3):
             armed = _arm_transient(scheduler, clock, 'T1')
         assert armed == 120.0
-        deadline = scheduler._requeue_until['T1']
 
-        clock[0] += 60.0
-        assert scheduler._time_source() < deadline, 'must still be cooling at +60s'
-        scheduler._gc_expired_cooldowns()
-        assert 'T1' in scheduler._requeue_until
+        task = {'id': 'T1', 'status': 'pending', 'dependencies': []}
+        status_map = {'T1': 'pending'}
+
+        # Sanity: the gate is otherwise satisfied, so a False below can only
+        # be the cooldown.  Proven by clearing the deadline and re-asking.
+        without_cooldown = dict(scheduler._requeue_until)
+        scheduler._requeue_until.clear()
+        assert scheduler._eligible_for_dispatch(task, 'T1', status_map)[0] is True
+        scheduler._requeue_until = without_cooldown
+
+        clock[0] += 30.0
+        assert scheduler._eligible_for_dispatch(task, 'T1', status_map)[0] is False, (
+            'the old flat 30s cooldown would have expired here'
+        )
+        clock[0] += 30.0
+        assert scheduler._eligible_for_dispatch(task, 'T1', status_map)[0] is False, (
+            'still inside the 120s transient backoff at +60s'
+        )
 
         clock[0] += 61.0
-        assert scheduler._time_source() >= deadline
+        assert scheduler._eligible_for_dispatch(task, 'T1', status_map)[0] is True, (
+            'eligible again once the 120s deadline passes'
+        )
+        # The per-tick sweep then drops both the deadline and its meta.
         scheduler._gc_expired_cooldowns()
         assert 'T1' not in scheduler._requeue_until
 

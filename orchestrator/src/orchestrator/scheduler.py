@@ -524,6 +524,20 @@ def is_transient_api_requeue(
     return is_server_error_status(int(m.group(1)))
 
 
+# Hard ceiling on the exponent used by `transient_requeue_cooldown` (task 3317
+# amend).  `base * 2**(exp - 1)` is a Python int shift with an UNBOUNDED
+# exponent, and `float * huge_int` raises `OverflowError: int too large to
+# convert to float` past ~1024 bits.  `n` is the task's transient requeue
+# count, bounded in practice by `transient_requeue_cap` — but that field is
+# validated only `ge=1`, so an operator who raises it into the thousands would
+# turn every transient arming into an exception raised out of
+# `Scheduler.release`.  Clamping is SEMANTICS-PRESERVING: the envelope is
+# already `min(cap_secs, ...)`, and reaching this ceiling would need
+# `cap_secs > base_secs * 2**63` (~9.2e18x — a cooldown of ~292 billion years
+# at base 1s), which no reachable config can express.
+_MAX_BACKOFF_EXPONENT = 64
+
+
 def transient_requeue_cooldown(
     n: int,
     *,
@@ -576,7 +590,11 @@ def transient_requeue_cooldown(
         the un-jittered envelope it was drawn from.
     """
     uniform = rng or random.uniform
-    exp = max(1, int(n))
+    # Clamped at BOTH ends: `>= 1` so a degenerate count can only degrade
+    # toward a full base cooldown, `<= _MAX_BACKOFF_EXPONENT` so an oversized
+    # `transient_requeue_cap` cannot make the shift overflow float (see the
+    # constant's comment).  Both bounds are semantics-preserving.
+    exp = min(max(1, int(n)), _MAX_BACKOFF_EXPONENT)
     envelope = min(cap_secs, base_secs * (2 ** (exp - 1)))
     return uniform(envelope / 2, envelope), envelope
 
@@ -2003,8 +2021,10 @@ class Scheduler:
         # "now": _build_snapshot_payload content-dedups the snapshot to
         # throttle disk writes, so a field recomputed per tick (a naive
         # `remaining_secs`) would make every payload byte-different and defeat
-        # the throttle.  Written in `release`, popped in lockstep by
-        # `_gc_expired_cooldowns` so an entry can never outlive its deadline.
+        # the throttle.  Written by `_arm_requeue_cooldown` (from `release`);
+        # popped in lockstep by `_gc_expired_cooldowns` so an entry can never
+        # outlive its deadline, and EARLIER by `clear_requeue_count` when the
+        # task reaches a terminal outcome and is no longer waiting to retry.
         self._requeue_cooldown_meta: dict[str, dict] = {}
         # Per-task dispatch timestamps (monotonic) for the dispatch-cooldown
         # gate.  Set immediately after a successful dispatch; cleared when the
@@ -7429,8 +7449,14 @@ class Scheduler:
           genuine one; ``envelope_secs`` is the un-jittered ceiling the armed
           value was drawn from (``armed`` always lies in
           ``[envelope/2, envelope]``).  Entries appear at arming and are
-          dropped by ``_gc_expired_cooldowns`` when the deadline passes, so
-          the key answers "which tasks are cooling, and for how long".
+          dropped either by ``clear_requeue_count`` (the task reached a
+          terminal outcome — DONE, or blocked by cap exhaust) or by
+          ``_gc_expired_cooldowns`` once the deadline passes.  The key
+          therefore answers "which tasks are cooling, and for how long",
+          with ONE bounded imprecision: the GC runs once per tick from
+          ``acquire_next``, so an expired entry can linger until the next
+          tick.  Compare ``expires_at`` against now rather than treating
+          mere presence as proof a task is still cooling.
           ``armed_at``/``expires_at`` are ISO-8601 WALL-clock strings —
           restart-comparable and operator-readable, answering "when does this
           task come back" — while the internal ``_requeue_until`` deadline
@@ -7946,6 +7972,92 @@ class Scheduler:
         self.release(task_id, requeued=True)
         return False
 
+    def _arm_requeue_cooldown(self, task_id: str, armed_n: int | None) -> None:
+        """Write *task_id*'s re-dispatch cooldown deadline and snapshot meta.
+
+        Extracted from :meth:`release` (task 3317 amend) for ONE reason: this
+        is the only fallible work in that method, and it runs BEFORE
+        ``lock_table.release``.  The pre-3317 arming was a single float add
+        that could not raise; it is now an exponential shift, an injectable
+        rng call, a wall-clock read and a ``timedelta`` construction.  An
+        exception escaping any of those would skip the lock-table release,
+        the reservation cleanup, ``_hold_history.forget`` and
+        ``_settle_backfill_grant`` — stranding the task's module locks with
+        no owner left to free them.  That is exactly the stuck-lock hazard
+        contract C5 / task 3818 exists to prevent
+        (``test_lock_release_single_writer_guard.py``), so this method is
+        TOTAL: it always arms something and never propagates.
+
+        *armed_n* is the consumed ``_pending_transient_cooldown`` stamp —
+        ``None`` for a genuine / unstamped requeue (flat cooldown), else the
+        post-increment transient count driving the jittered exponential.
+
+        On an unexpected failure it logs at ERROR with the full traceback and
+        the inputs, then falls back to the pre-3317 flat
+        ``requeue_cooldown_secs``.  That is a fail-soft, but a LOUD one, and
+        the alternative it replaces is a wedged module lock: a
+        too-short cooldown is recoverable on the next tick, a lock nobody
+        holds is not.  The fallback touches only a float add and an attribute
+        read — the same two operations the rest of the scheduler already
+        depends on — so it cannot itself raise where the caller could not.
+        """
+        try:
+            if armed_n is None:
+                cooldown = envelope = self.config.requeue_cooldown_secs
+            else:
+                cooldown, envelope = transient_requeue_cooldown(
+                    armed_n,
+                    base_secs=self.config.transient_requeue_backoff_base_secs,
+                    cap_secs=self.config.transient_requeue_backoff_cap_secs,
+                    rng=self._jitter_source,
+                )
+            # Operator-facing record of what was just armed.  JSON-native
+            # primitives ONLY (float/bool/int/str) and nothing derived from
+            # "now" — see the _requeue_cooldown_meta declaration for why.
+            #
+            # armed_at/expires_at are ISO-8601 STRINGS, never datetime
+            # objects: the production writer serialises with
+            # `json.dumps(state, default=str)`, which would silently
+            # stringify a datetime into a shape `read_scheduler_state`
+            # cannot round-trip — a loud TypeError is what the strings buy.
+            # The wall clock is read ONCE and expires_at derived from that
+            # same value, so `expires_at - armed_at` is exactly armed_secs;
+            # two _wall_now() calls would let the pair drift apart.
+            armed_at = self._wall_now()
+            meta = {
+                'armed_secs': round(cooldown, 3),
+                'envelope_secs': round(envelope, 3),
+                'transient': armed_n is not None,
+                'transient_count': armed_n or 0,
+                'armed_at': armed_at.isoformat(),
+                'expires_at': (armed_at + timedelta(seconds=cooldown)).isoformat(),
+            }
+        except Exception:
+            logger.exception(
+                'Task %s: transient requeue cooldown arming failed '
+                '(n=%r, base=%r, cap=%r) — falling back to the flat %.1fs '
+                'cooldown so the module locks below still release. '
+                'Check transient_requeue_backoff_{base,cap}_secs and '
+                'transient_requeue_cap.',
+                task_id,
+                armed_n,
+                self.config.transient_requeue_backoff_base_secs,
+                self.config.transient_requeue_backoff_cap_secs,
+                self.config.requeue_cooldown_secs,
+            )
+            cooldown = self.config.requeue_cooldown_secs
+            meta = None
+        self._requeue_until[task_id] = self._time_source() + cooldown
+        if meta is None:
+            # Drop rather than publish a half-built entry: `requeue_cooldowns`
+            # promises a fixed six-field JSON-native shape, and a partial one
+            # would be worse to read than an absent one.  The deadline above
+            # still gates re-dispatch, and `_gc_expired_cooldowns` tolerates a
+            # deadline with no meta behind it.
+            self._requeue_cooldown_meta.pop(task_id, None)
+        else:
+            self._requeue_cooldown_meta[task_id] = meta
+
     def release(self, task_id: str, *, requeued: bool = False) -> None:
         """Release all module locks for a task and clear dispatch guard.
 
@@ -7974,6 +8086,11 @@ class Scheduler:
         ``_requeue_until``'s value type is unchanged — a monotonic deadline
         float — because the eligibility readers, the per-tick GC sweep and
         several tests all depend on that shape.
+
+        The arming itself is delegated to :meth:`_arm_requeue_cooldown`, which
+        is TOTAL by construction: it is the only fallible work in this method
+        and it runs ahead of the lock-table release, so an exception escaping
+        it would strand this task's module locks.
         """
         self._dispatched.discard(task_id)
         self._dispatched_priority.pop(task_id, None)
@@ -7984,37 +8101,7 @@ class Scheduler:
         # leaked into whatever armed next.
         armed_n = self._pending_transient_cooldown.pop(task_id, None)
         if requeued:
-            if armed_n is None:
-                cooldown = envelope = self.config.requeue_cooldown_secs
-            else:
-                cooldown, envelope = transient_requeue_cooldown(
-                    armed_n,
-                    base_secs=self.config.transient_requeue_backoff_base_secs,
-                    cap_secs=self.config.transient_requeue_backoff_cap_secs,
-                    rng=self._jitter_source,
-                )
-            self._requeue_until[task_id] = self._time_source() + cooldown
-            # Operator-facing record of what was just armed.  JSON-native
-            # primitives ONLY (float/bool/int/str) and nothing derived from
-            # "now" — see the _requeue_cooldown_meta declaration for why.
-            #
-            # armed_at/expires_at are ISO-8601 STRINGS, never datetime
-            # objects: the production writer serialises with
-            # `json.dumps(state, default=str)`, which would silently
-            # stringify a datetime into a shape `read_scheduler_state`
-            # cannot round-trip — a loud TypeError is what the strings buy.
-            # The wall clock is read ONCE and expires_at derived from that
-            # same value, so `expires_at - armed_at` is exactly armed_secs;
-            # two _wall_now() calls would let the pair drift apart.
-            armed_at = self._wall_now()
-            self._requeue_cooldown_meta[task_id] = {
-                'armed_secs': round(cooldown, 3),
-                'envelope_secs': round(envelope, 3),
-                'transient': armed_n is not None,
-                'transient_count': armed_n or 0,
-                'armed_at': armed_at.isoformat(),
-                'expires_at': (armed_at + timedelta(seconds=cooldown)).isoformat(),
-            }
+            self._arm_requeue_cooldown(task_id, armed_n)
         modules = list(self.lock_table._held.get(task_id, set()))
         self.lock_table.release(task_id)
         # Defensive: clear any reservations still owned by this task.
@@ -8819,6 +8906,25 @@ class Scheduler:
         # count that no longer exists, so leaving it would arm a backoff sized
         # from a cleared history.
         self._pending_transient_cooldown.pop(task_id, None)
+        # ...and the operator-facing snapshot entry for an ALREADY-armed
+        # cooldown (task 3317 amend).  Both callers are TERMINAL for the
+        # retry lane — DONE (task recovered) and cap-exhaust (task blocked,
+        # awaiting a human) — so the task is by definition no longer waiting
+        # to retry.  Pre-3317 the residue was invisible bookkeeping swept
+        # within 30s; with the backoff the stale window stretches to 900s, and
+        # `requeue_cooldowns` is now an operator-facing key whose entries read
+        # as "this task is waiting to retry" (with a future `expires_at`).
+        #
+        # `_requeue_until` is deliberately NOT popped here.  It gates
+        # DISPATCH, and dropping it would change behaviour: a task that
+        # transiently requeued, completed DONE and is later REOPENED would
+        # skip the remainder of its cooldown.  Leaving it is inert — the
+        # status gate in `_eligible_for_dispatch` already refuses a
+        # non-pending task, and `_gc_expired_cooldowns` sweeps it at the
+        # deadline.  Popping only the meta keeps the documented lockstep
+        # invariant (meta never OUTLIVES its deadline) strictly tighter, and
+        # the GC's `.pop(..., None)` already tolerates the gap.
+        self._requeue_cooldown_meta.pop(task_id, None)
 
     async def trigger_retry_cap_exhausted(
         self,
