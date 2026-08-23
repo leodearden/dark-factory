@@ -18,10 +18,19 @@ regression presents as an unbounded rotation spin that resolves nothing. A
 only, never ``triaged_at``.
 
 STDLIB + PYTEST ONLY, AND NOT BY PREFERENCE. ``tests/scripts/orchestrator.yaml``
-runs this directory as ``uv run --project shared pytest tests/scripts/``, and the
-``shared`` project does not have ``fused_memory``, ``escalation`` or
-``orchestrator`` installed. Importing the producer is IMPOSSIBLE here, so every
-producer constant is recovered by parsing the source with ``ast``.
+runs this directory as ``uv run --project shared pytest tests/scripts/``.
+MEASURED under that interpreter, not assumed: ``orchestrator`` and ``escalation``
+ARE importable; ``fused_memory`` is NOT (``ModuleNotFoundError``). So for the
+producer the ``ast`` route is forced outright — there is no import to fall back
+on.
+
+For the other two it is chosen, and for a reason that outlives the packaging:
+what this module asserts about is the WORKTREE SOURCE, and an import resolves the
+INSTALLED package instead. Worktrees share the main checkout's ``.venv``
+(OPERATIONS.md §10 carries this as a known trap), so an import-based guard would
+happily read main's ``resolve_issue`` signature while the branch under test
+changed it — green here, red at merge, for a difference this guard exists to see.
+Parsing the file on disk is the only oracle that is actually about this branch.
 
 STRUCTURE, NEVER WORDING. The consumer half is read from a bare
 ``<!-- path-guard-anchors:begin/end -->`` marker span holding backticked tokens
@@ -218,7 +227,7 @@ def producer_constants() -> dict[str, str]:
     assert not missing, (
         f"could not recover {missing} as module-level string constants from "
         f"{ESCALATOR_SRC.relative_to(REPO_ROOT)} (task 3465). This guard AST-parses "
-        f"that module because it cannot be imported under `--project shared`; if a "
+        f"that module (fused_memory is not importable under `--project shared`); if a "
         f"constant was renamed, moved into a class, or computed from an f-string, "
         f"update the names in REQUIRED_PRODUCER_CONSTANTS here AND the "
         f"discriminator tokens declared in the `path-guard-anchors` span of "
@@ -532,8 +541,8 @@ def function_params(src: pathlib.Path, name: str) -> set[str]:
     assert len(matches) == 1, (
         f"expected exactly one function named {name!r} in "
         f"{src.relative_to(REPO_ROOT)}, found {len(matches)} (task 3465). This "
-        f"guard AST-parses that module because it cannot be imported under "
-        f"`--project shared`; a rename must fail HERE, naming the function, "
+        f"guard AST-parses the worktree source rather than importing the installed "
+        f"package (worktrees share main's .venv); a rename must fail HERE, "
         f"rather than emptying the check."
     )
 
