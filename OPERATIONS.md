@@ -729,11 +729,25 @@ uv run --project orchestrator orchestrator check-config \
     --config /path/to/dark-factory-orchestrator.yaml
 ```
 
-Exit **1** iff at least one genuinely-unknown key is found; exit **0**
-otherwise — *including* when excused keys were listed. It calls the census
-directly rather than building a validated config, so it still reports
-phantom keys when the config has an unrelated value-level validation error
-that a full load would raise on first.
+Three outcomes:
+
+- exit **1** — at least one genuinely-unknown key was found;
+- exit **1** — the file could not be read or parsed **at all**: malformed
+  YAML, a directory, an unreadable file, or a top-level document that is
+  not a mapping. A census of nothing is not a clean census, so the gate
+  refuses to print `OK` and instead names the file and the underlying
+  fault (a YAML error renders line and column);
+- exit **0** — otherwise, *including* when excused keys were listed, and
+  including a legitimately **empty** project YAML (which means "use all
+  defaults").
+
+It calls the census directly rather than building a validated config, so it
+still reports phantom keys when the config has an unrelated value-level
+validation error that a full load would raise on first.
+
+The second case is what makes "Verify with `check-config` first" (under
+[Clearing the escalation](#clearing-the-escalation), below) trustworthy:
+the gate speaks for a config only when it actually inspected one.
 
 Each unknown key may carry a placement hint (`→ did you mean
 git.spare_warm_lanes?`). **Hints are advisory**: a hint is a *name* match
