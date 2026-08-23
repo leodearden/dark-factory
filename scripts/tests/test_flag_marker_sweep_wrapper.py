@@ -93,7 +93,7 @@ def _recorded_envs(state_path):
 
 def _run_wrapper(
     tmp_path, *, exit_code=0, extra_env=None, dotenv_contents=None,
-    project_ids="dark_factory",
+    project_ids: str | None = "dark_factory",
 ):
     """Run fused-memory-flag-marker-sweep.sh with FLAG_MARKER_SWEEP_CMD
     pointed at the fake recorder and REPO pointed at a tmp dir with no
