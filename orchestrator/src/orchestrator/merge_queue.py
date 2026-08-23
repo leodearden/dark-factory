@@ -20019,6 +20019,15 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # on every exit -- so the chain must be handed to it unconditionally
         # once built.  Do not add an early return or a raise between this line
         # and the ensure_future below: the lane would leak.
+        #
+        # The line below can itself RAISE CancelledError (task 3185 review fix
+        # 2: _deep_chain_placement deliberately does not absorb an external
+        # cancel), and that does NOT violate the invariant above.  A cancel
+        # there lands INSIDE the build, before any ChainResult is returned, so
+        # no lane is ever in this frame's hands -- build_chain's own
+        # `except BaseException` arm is what returns it.  The obligation only
+        # begins once `chain` is bound, and from that point to the
+        # ensure_future there is still nothing that can raise.
         chain = await self._deep_chain_placement(item)
         verify_task: asyncio.Task = asyncio.ensure_future(  # type: ignore[type-arg]
             self._run_inflight_verify(

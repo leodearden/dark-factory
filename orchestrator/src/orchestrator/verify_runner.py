@@ -1938,8 +1938,8 @@ class VerifyRunnerPool:
         frontier-INDEPENDENT: a verify that chained nothing is 1 however many
         other verifies are in flight, which is what makes ``chain_items >= 2``
         a sound deep-verify discriminator.  It defaults to ``1``, deliberately
-        NOT to ``None`` the
-        way ``depth``/``speculative`` do, for two reasons.  (1) Semantics: a
+        NOT to ``None`` the way ``depth``/``speculative`` do, for two
+        reasons.  (1) Semantics: a
         count of items in a verified tree has a smallest TRUTHFUL value of
         1 — every merge verify exercises at least the one item it was created
         for — so there is no "absent" state to represent, and ``None`` would
