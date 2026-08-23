@@ -373,7 +373,7 @@ These categories require only admin-level MCP operations. Dispatch them directly
 
 #### `scope_violation`
 
-Agent discovered it needs modules beyond its assigned scope.
+Agent discovered it needs to touch files beyond its assigned scope.
 
 ##### Path-guard synthetic-anchor audit records (no real task — close, do not resume)
 
@@ -420,22 +420,24 @@ mcp__escalation__resolve_issue(
 
 Then continue to the next escalation — the steps below apply only to records whose `task_id` is a real task.
 
-1. Extend the required modules in task metadata:
-   ```
-   mcp__fused-memory__update_task(id=<task_id>, project_root=<project_root>,
-     updates={"metadata": {"modules": [<existing> + <new_module>]}})
-   ```
-2. Resolve with action='resume':
+1. Resolve with `action='resume'`, carrying the grant as `granted_files`:
    ```
    mcp__escalation__resolve_issue(
      escalation_id="...",
-     resolution="Scope expanded to include [modules]; resuming — task re-pends (blocked→pending) and the scheduler re-dispatches with the updated module locks.",
+     resolution="Scope expanded to include [<files>]; resuming.",
      action='resume',
+     granted_files=["<project-relative file path>", ...],
      resolved_by="escalation-watcher-auto",
      resolution_class="actionable"
    )
    ```
-3. Add to digest: `DISPATCHED: scope_violation — <task_id> — scope expanded to [modules]`
+   `granted_files` takes **file-level, project-relative paths** — not module names, not directories. That distinction is load-bearing: the old form of this recipe was module-shaped, and a module name passed here is not a file the orchestrator can add to the plan.
+
+   **`granted_files` is what actually widens scope.** It is persisted on the escalation record, and on resume the orchestrator unions the grants across the task's resolved escalations and folds them into `plan.files` / `metadata.files` / file-locks before the agent is re-dispatched. Keep `resolution` as human-readable rationale only — omitting `granted_files` means the grant exists only as prose and the resumed agent's briefing will not reflect the expanded scope. (Same rule the steward role is given verbatim in `orchestrator/src/orchestrator/agents/roles.py`.)
+
+   A lock conflict is handled orchestrator-side: the scope-widening choke point returns False and the task requeues rather than resuming under another task's file lock. You do **not** need to pre-check locks.
+
+2. Add to digest: `DISPATCHED: scope_violation — <task_id> — scope expanded to [granted files]`
 
 #### `dependency_discovered`
 
@@ -817,7 +819,7 @@ Exit reason: <"escalation limit reached" | "time limit reached">
 Mode: <"L2-promotion (promote_to_l2 available)" | "LEGACY (promote_to_l2 not available)">
 
 ### Dispatched (autonomous)
-- DISPATCHED: scope_violation — task-42 — scope expanded to [orchestrator/src/orchestrator/harness.py] [actionable]
+- DISPATCHED: scope_violation — task-42 — scope expanded to [orchestrator/src/orchestrator/harness.py] via granted_files [actionable]
 - DISPATCHED: cleanup_needed — task-99 — dead code in scheduler.py flagged for follow-up [actionable]
 - DISPATCHED: dependency_discovered — task-77 → depends on task-55 [actionable]
 
