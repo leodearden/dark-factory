@@ -466,12 +466,18 @@ class TestRunInflightVerifyChainItemsWiring:
 
 @pytest.mark.asyncio
 class TestDispatchItemComputesTruthfulChainItems:
-    """_dispatch_item derives chain_items from the frontier, not from `depth`.
+    """_dispatch_item emits chain_items in CHAIN-ITEM units: a flat 1.
 
-    Slot 1 (non-speculative) is merged onto REAL MAIN, so its tree contains
-    exactly itself — a flat 1 regardless of what else is in flight.  Slot 2
-    (speculative) is merged onto the frozen tip, so its tree is the frozen
-    prefix plus itself — frontier + 1.
+    A dispatch contributes exactly one chain item — the dispatching item
+    itself, chain item #1 — and only the deep-chain arm of
+    ``_run_inflight_verify`` adds more (``1 + len(chain.links)``).  That holds
+    for slot 1 (merged onto REAL MAIN) and slot 2 (merged onto the frozen tip)
+    alike, and at every verify frontier: the value is deliberately
+    frontier-INDEPENDENT so that ``chain_items >= 2`` is a sound
+    deep-verify discriminator and ``chain_cap=0`` can never emit it.
+
+    The frozen-prefix height is not lost — it is what the separate,
+    always-present ``depth`` field has always carried.
     """
 
     def _worker_with_frontier(self, frontier: int) -> SpeculativeMergeWorker:
@@ -544,14 +550,25 @@ class TestDispatchItemComputesTruthfulChainItems:
 
         assert captured['chain_items'] == 1
 
-    async def test_speculative_item_is_frontier_plus_one(
+    async def test_speculative_item_is_one_in_chain_item_units(
         self, tmp_path: Path,
     ) -> None:
+        """CHAIN-ITEM units, frontier-INDEPENDENT.
+
+        A dispatch that builds no chain contributes exactly one chain item —
+        itself — so a slot-2 item emits 1 at every frontier, exactly as a
+        slot-1 item does.  Folding the frozen-prefix height in here would make
+        ``chain_items >= 2`` fire on ordinary adjacent verifies and destroy its
+        value as the deep-verify discriminator that
+        scripts/merge-deep-canary-predicate.sh:84 keys on.  The frontier height
+        is not lost: it is carried, unchanged, by the separate ``depth`` field.
+        """
         for frontier in (0, 1, 3):
             captured = await self._dispatch_kwargs(
                 tmp_path, frontier=frontier, speculative=True,
             )
-            assert captured['chain_items'] == frontier + 1, f'frontier={frontier}'
+            assert captured['chain_items'] == 1, f'frontier={frontier}'
+            assert captured['depth'] == frontier, 'the height still rides `depth`'
 
     async def test_a_firing_probe_relabels_depth_but_not_chain_items(
         self, tmp_path: Path,
@@ -559,10 +576,13 @@ class TestDispatchItemComputesTruthfulChainItems:
         """The assertion that encodes "supersedes reliance on the broken label".
 
         A firing ProbePlacement overrides the dispatched ``depth`` (that is its
-        entire job — an attribution fact about an already-built stack), but
-        chain_items is derived from _verify_frontier_depth() and must be
-        UNCHANGED at frontier + 1: the probe never redirected what is verified,
-        so the tree still contains only the frontier plus this item.
+        entire job — an attribution fact about an already-built stack), but the
+        probe never redirected what is VERIFIED, so no chain item was added and
+        ``chain_items`` stays at the one item this dispatch actually exercises.
+
+        The point is if anything sharper in chain-item units: ``depth`` is
+        relabelled all the way to the probe's 5 while ``chain_items`` does not
+        move off 1 — the two fields visibly answer different questions.
         """
         from orchestrator.merge_queue import ProbePlacement
 
@@ -572,7 +592,7 @@ class TestDispatchItemComputesTruthfulChainItems:
         )
 
         assert captured['depth'] == 5             # relabelled, as today
-        assert captured['chain_items'] == 2       # frontier(1) + 1, untouched
+        assert captured['chain_items'] == 1       # one item verified, untouched
 
 
 # ---------------------------------------------------------------------------

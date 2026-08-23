@@ -1307,20 +1307,25 @@ class TestRunInflightVerifyChainRedirect:
     async def test_chain_items_counts_the_actually_built_depth(
         self, git_repo: Path, monkeypatch,
     ):
-        """``chain_items == frontier + 1 + len(chain.links)`` — what actually ran.
+        """``chain_items == 1 + len(chain.links)`` — what actually ran.
 
-        A 6-target that only built 2 links must emit 3 at frontier 0, never 7:
-        the field is a fact about the tree that ran, not about the target that
-        was asked for.
+        A 6-target that only built 2 links must emit 3, never 7: the field is a
+        fact about the tree that ran, not about the target that was asked for.
+
+        The arm COMPUTES the value rather than ACCUMULATING onto the caller's
+        — which is why a deliberately wrong ``chain_items=99`` is passed here
+        and 3 is still required.  That is what makes the emitted unit
+        frontier-independent by construction, so it cannot silently regress if
+        ``_dispatch_item``'s own derivation ever changes again.
         """
         _git_ops, worker, item, chain, _head = await self._fixture(git_repo, frontier=1)
         posted = _spy_post_merge_verify(monkeypatch)
 
         await worker._run_inflight_verify(
-            item, _local_lease(), chain=chain, chain_items=2,  # frontier 1 + 1
+            item, _local_lease(), chain=chain, chain_items=99,  # deliberately wrong
         )
 
-        assert posted[0]['chain_items'] == 4 == 1 + 1 + len(chain.links)
+        assert posted[0]['chain_items'] == 3 == 1 + len(chain.links)
 
     @pytest.mark.parametrize(
         'verdict', ['pass', 'fail', 'raise'], ids=['tip-pass', 'tip-fail', 'verify-raises'],
@@ -1770,7 +1775,7 @@ class _DeepScene:
 
 async def _make_deep_scene(
     repo: Path, *, chain_cap: int, script: list[bool] | None, monkeypatch,
-    allocator=None,
+    allocator=None, frontier: int = 0,
 ) -> _DeepScene:
     """Build a scene whose verify oracle returns *script* verdicts in order.
 
@@ -1780,6 +1785,17 @@ async def _make_deep_scene(
     *allocator* is given it is installed on the worker BEFORE first use, so
     ``_ensure_host_allocator``'s cache check (merge_queue.py:10288) short-
     circuits and the real one is never built.
+
+    *frontier* seeds ``_verify_frontier_depth()`` — a pure ``len()`` over
+    ``_frozen_inflight_entries()`` — with that many opaque sentinels, using the
+    idiom already at test_merge_queue_depth_telemetry.py:477-482
+    (``_worker_with_frontier`` + ``_sentinel_entry``) and at this module's
+    ``TestRunInflightVerifyChainRedirect._fixture``.  It has to be STUBBED
+    rather than driven: ``_dispatch_item`` never appends to ``_inflight`` (the
+    only ``self._inflight.append`` is ``_inflight_append``, merge_queue.py:15693,
+    which only the MERGER loop calls), so a scene driven purely through
+    ``_dispatch_item`` has a structurally empty frontier and every
+    ``frontier + 1`` arithmetic is observationally identical to a flat ``1``.
     """
     git_ops = _make_git_ops(repo, size=2)
     config = _make_config(repo, chain_cap=chain_cap)
@@ -1795,6 +1811,10 @@ async def _make_deep_scene(
     )
     if allocator is not None:
         worker._host_allocator = allocator
+    if frontier:
+        worker._frozen_inflight_entries = (  # type: ignore[assignment,method-assign]
+            lambda: [object()] * frontier
+        )
     scene = _DeepScene(git_ops, config, worker, head, repo, store)
 
     # ── the round recorder, installed ONCE ───────────────────────────────────
@@ -1852,6 +1872,21 @@ def _round_transcript(scene: _DeepScene, idx: int) -> dict:
         'result_status': rec['result'].status,
         'result_has_worktree': rec['result'].merge_wt is not None,
     }
+
+
+def _canary_says_deep(data: dict) -> bool:
+    """The SHIPPED deep-verify classifier, transcribed verbatim.
+
+    Copied character for character from ``scripts/merge-deep-canary-predicate.sh:84``
+    (η1's ``deep = [... if isinstance(d.get("chain_items"), int) and
+    d["chain_items"] >= 2]``) rather than restated in the assertion's own
+    words.  A restatement would drift the moment the emitter's unit changed —
+    which is exactly the emitter/reader units mismatch this transcription
+    exists to fence.  ζ's "first ``chain_items >= 2`` verify observed" deploy
+    signal and η1's deep-fail-rate DENOMINATOR are both this expression, so if
+    it disagrees with the emitter the canary is silently measuring nothing.
+    """
+    return isinstance(data.get('chain_items'), int) and data['chain_items'] >= 2
 
 
 @pytest.mark.asyncio
@@ -1947,8 +1982,9 @@ class TestDeepDispatchRoundsIntegration:
         assert deep.lanes[-1] == deep.calls[2]['item'].merge_result.merge_commit
         assert flat.lanes == [flat.calls[0]['item'].merge_result.merge_commit]
 
+    @pytest.mark.parametrize('frontier', [0, 2], ids=['frontier-0', 'frontier-2'])
     async def test_every_merge_verify_carries_chain_items(
-        self, tmp_path: Path, monkeypatch,
+        self, tmp_path: Path, monkeypatch, frontier: int,
     ):
         """(c) η1's reader can see a deep verify at all.
 
@@ -1958,16 +1994,23 @@ class TestDeepDispatchRoundsIntegration:
         (``VerifyRunnerPool.dispatch``) over a mixed run — a slot-1 head
         verify, a deep tip verify, a halved tip verify and a floor verify —
         and requires the field present, integral and truthful on all of them.
+
+        Parameterised over the verify frontier, and the expected list is the
+        SAME at both: ``chain_items`` is in CHAIN-ITEM units and is
+        deliberately frontier-INDEPENDENT.  At ``frontier=0`` the list was
+        already this, so the parameterisation is what converts a vacuous pass
+        into a real pin — a frontier-derived emitter would produce
+        ``[1, 8, 5, 3]`` at ``frontier=2`` and fail here.
         """
         from orchestrator.verify_runner import HostLease
 
-        repo = await _fresh_repo(tmp_path, 'events')
+        repo = await _fresh_repo(tmp_path, f'events{frontier}')
         lease = HostLease(
             name='laptop', runner=_fake_pass_runner(), is_local=False,
         )
         scene = await _make_deep_scene(
             repo, chain_cap=6, script=None, monkeypatch=monkeypatch,
-            allocator=_StubRemoteAllocator(lease),
+            allocator=_StubRemoteAllocator(lease), frontier=frontier,
         )
 
         # slot 1 (the trust anchor) — never chained, so a flat 1.
@@ -2010,6 +2053,132 @@ class TestDeepDispatchRoundsIntegration:
         assert [e['data']['chain_items'] for e in events] == [1, 6, 3, 1]
         deep_events = [e for e in events if e['data']['chain_items'] >= 2]
         assert len(deep_events) == 2, 'η1 must be able to SEE a deep verify'
+
+    async def test_non_chain_speculative_dispatch_emits_one_at_any_frontier(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """REVIEW FIX 1: the SHIPPED default (``chain_cap=0``) emits a flat 1.
+
+        The coverage hole this closes: no test anywhere combined "non-chain
+        speculative dispatch" with "a non-empty verify frontier" AND the real
+        ``VerifyRunnerPool.dispatch`` emission.  ``_make_deep_scene`` never
+        populated ``_inflight`` (so its frontier was structurally 0 and
+        ``frontier + 1`` was indistinguishable from ``1``), while the only
+        non-empty-frontier tests stub ``_run_inflight_verify`` out and never
+        reach the emitter at all.
+
+        ``chain_items`` is in CHAIN-ITEM units: the dispatching item is chain
+        item #1 and a dispatch that built no chain contributes exactly that
+        one item.  The frozen-prefix height it used to (wrongly) fold in is
+        still carried, unchanged, by the separate always-present ``depth``.
+        """
+        from orchestrator.verify_runner import HostLease
+
+        repo = await _fresh_repo(tmp_path, 'flat-frontier')
+        lease = HostLease(
+            name='laptop', runner=_fake_pass_runner(), is_local=False,
+        )
+        scene = await _make_deep_scene(
+            repo, chain_cap=0, script=None, monkeypatch=monkeypatch,
+            allocator=_StubRemoteAllocator(lease), frontier=2,
+        )
+
+        await scene.round_(tag='flat-frontier')
+
+        assert scene.built == [], 'cap=0 is the kill switch: no chain was built'
+        assert scene.calls[0]['chain'] is None
+        events = scene.store.events_of(EventType.merge_verify)
+        assert len(events) == 1
+        data = events[0]['data']
+        assert data['chain_items'] == 1, (
+            'a speculative dispatch with no chain verifies exactly one item, '
+            'no matter how many other verifies are in flight ahead of it'
+        )
+        # The frontier height is not LOST — it moved to the field that owns it.
+        assert data['depth'] == 2, 'the frozen-prefix height still rides `depth`'
+
+    async def test_the_shipped_canary_classifier_fires_only_on_deep_rounds(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """REVIEW FIX 1: agreement with η1's own expression, not a restatement.
+
+        Applies ``scripts/merge-deep-canary-predicate.sh:84``'s classifier
+        verbatim (see ``_canary_says_deep``) to a mixed run and requires it
+        True for the genuine deep rounds and False for the head, adjacent and
+        floor rounds.  A frontier-derived ``chain_items`` would make the
+        adjacent round at ``frontier >= 1`` classify as "deep", inflating η1's
+        deep-fail-rate denominator with rounds that chained nothing and firing
+        ζ's "first deep verify observed" signal on day one under the shipped
+        ``chain_cap=0``.
+        """
+        from orchestrator.verify_runner import HostLease
+
+        repo = await _fresh_repo(tmp_path, 'canary')
+        lease = HostLease(
+            name='laptop', runner=_fake_pass_runner(), is_local=False,
+        )
+        scene = await _make_deep_scene(
+            repo, chain_cap=6, script=None, monkeypatch=monkeypatch,
+            allocator=_StubRemoteAllocator(lease), frontier=2,
+        )
+
+        # slot 1 (head, non-speculative) — see the sibling test for why
+        # base_sha must be REAL MAIN here.
+        head_item = _make_item(
+            _make_req('101', '101', scene.config, repo), scene.head,
+            _ephemeral_merge_wt(scene.git_ops, 'can-head'), speculative=False,
+            base_sha=await _rev_parse(repo, 'main'),
+        )
+        entry = await scene.worker._dispatch_item(head_item)
+        assert entry is not None and entry.verify_task is not None
+        await entry.verify_task
+        await scene.worker._host_allocator.release(entry.lease)
+        _vr = scene.calls[-1]['result']
+        if _vr.merge_wt is not None:
+            await scene.worker._release_or_cleanup(
+                _vr.merge_wt, spec_warm=_vr.spec_warm,
+            )
+
+        for state, tag in ((None, 'can-deep'), (3, 'can-halved'), (1, 'can-floor')):
+            scene.worker._chain_halving_state = state
+            await scene.round_(tag=tag)
+
+        events = scene.store.events_of(EventType.merge_verify)
+        assert len(events) == 4
+        verdicts = [_canary_says_deep(e['data']) for e in events]
+        assert verdicts == [False, True, True, False], (
+            'head=False, deep(6)=True, halved(3)=True, floor(adjacent)=False'
+        )
+
+    async def test_a_deep_round_is_frontier_independent_on_the_chain_arm(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """REVIEW FIX 1: a 2-link chain at frontier 2 emits 3, never 5.
+
+        The chain arm COMPUTES ``1 + len(chain.links)`` rather than
+        accumulating onto whatever the caller passed, so the emitted unit is a
+        fact about the verified tree — the dispatching item plus the links that
+        were actually built — and carries no frontier contribution at all.
+        """
+        from orchestrator.verify_runner import HostLease
+
+        repo = await _fresh_repo(tmp_path, 'deep-frontier')
+        lease = HostLease(
+            name='laptop', runner=_fake_pass_runner(), is_local=False,
+        )
+        scene = await _make_deep_scene(
+            repo, chain_cap=3, script=None, monkeypatch=monkeypatch,
+            allocator=_StubRemoteAllocator(lease), frontier=2,
+        )
+
+        await scene.round_(tag='deep-frontier')
+
+        chain = scene.calls[0]['chain']
+        assert chain is not None and len(chain.links) == 2, 'fixture must chain'
+        events = scene.store.events_of(EventType.merge_verify)
+        assert len(events) == 1
+        assert events[0]['data']['chain_items'] == 3 == 1 + len(chain.links)
+        assert _canary_says_deep(events[0]['data']) is True
 
     async def test_conservation_holds_across_the_whole_run(
         self, git_repo: Path, monkeypatch,
