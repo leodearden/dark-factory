@@ -8944,6 +8944,19 @@ class SpeculativeMergeWorker(_WipHaltMixin):
     # worker.MAX_INFLIGHT_DEAD_VERIFY_ABORTS = 2) for fast, deterministic
     # coverage.  Mirrors the VERIFY_ABANDON_POLL_SECS monkeypatch convention.
     MAX_INFLIGHT_DEAD_VERIFY_ABORTS: int = 3
+    # task 3185 (PRD γ, review fix 3): busy-loop guard for the deep-chain arm's
+    # NON-ADOPTING error exit, shaped exactly like the counter above.  A verify
+    # that RAISES against `chain.tip` is not attributable to the dispatching
+    # item (the tree was cumulative), so it defers instead of blocking — but a
+    # defer that re-chained and re-raised would ping-pong forever.  The FIRST
+    # error suppresses chaining for that task (so the re-dispatch verifies its
+    # OWN subset tree, whose verdict IS attributable); after this many
+    # CONSECUTIVE chain-arm errors the request falls through to today's
+    # terminal 'blocked' resolution instead, because an unbounded defer is its
+    # own wedge.  Cleared the moment a verify for that task returns a result at
+    # all, so a single infra blip costs exactly one non-chained round.  Class
+    # attribute so tests can monkeypatch it small.
+    MAX_CHAIN_VERIFY_ERRORS: int = 3
     # task 2828 amend (reviewer_comprehensive, robustness): after this many
     # CONSECUTIVE contended-lease requeues for the same task_id, the per-requeue
     # WARNING rises to an ERROR naming the streak length. A contended-lease
@@ -9331,6 +9344,18 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # an unbounded busy-loop.  Cleared on a successful verify for that
         # task so a later transient hang starts counting fresh.
         self._inflight_dead_verify_aborts: dict[str, int] = {}
+        # task 3185 (PRD γ, review fix 3): per-task consecutive DEEP-CHAIN-ARM
+        # verify-error counter.  Same shape and lifecycle as the dict directly
+        # above.  Incremented when `_run_inflight_verify`'s generic exception
+        # handler fires WHILE a chain is in play — an error out of a cumulative
+        # tip tree is not attributable to the dispatching item, so that arm
+        # defers rather than resolving.  A non-zero count makes
+        # `_deep_chain_placement` decline for that task, so the re-dispatch
+        # verifies the item's OWN subset tree; popped at the unconditional "the
+        # verify returned a result at all" reset site, so suppression is
+        # one-shot and self-clearing and no stale entry lingers for a task that
+        # later exits some other way.
+        self._chain_verify_errors: dict[str, int] = {}
         # task 2828 amend (reviewer_comprehensive, robustness): per-task
         # consecutive contended-lease requeue counter.  Incremented each time
         # merge_verify_lease raises MergeVerifyLeaseContended and the item is
@@ -9910,18 +9935,20 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         test_merge_queue_lifecycle_registry.py's
         ``TestRequeueRecipeHasASingleChokepoint``, which fails if any
         ``_queue.put_nowait`` or ``on_requeued`` call site appears outside this
-        method. Its six callers are the head-failure cascade's downstream
+        method. Its seven callers are the head-failure cascade's downstream
         self-requeue, the operator-halt mid-verify abort, the dead-verify
         no-progress abort, the ``MergeVerifyLeaseContended`` defer, the
         pre-dispatch operator halt in :meth:`_dispatch_item`, and — task 3185,
-        PRD γ — the deep-tip verify's NON-ADOPTING exit in
-        :meth:`_run_inflight_verify`. That sixth site is the odd one out in
-        WHY it defers: the other five are all "something went wrong, come back
-        later", while it defers a verify that ran perfectly and may well have
-        PASSED. A tip verdict proves the cumulative tree, never the
-        dispatching item's own subset tree, so adopting it would land work
-        from a tree nothing verified; requeuing is how γ dispatches deep
-        chains while landing nothing at all.
+        PRD γ — the deep-tip verify's two NON-ADOPTING exits in
+        :meth:`_run_inflight_verify`: the tip pass/fail exit and (review fix 3)
+        the chain-arm ``except Exception`` exit. Those last two are the odd
+        ones out in WHY they defer: the other five are all "something went
+        wrong, come back later", while these defer because the verdict is
+        about the WRONG TREE. A tip verdict proves the cumulative tree, never
+        the dispatching item's own subset tree — so adopting it would land work
+        from a tree nothing verified (the pass arm) or terminally fail a task
+        whose own tree was never run (the error arm). Requeuing is how γ
+        dispatches deep chains while landing nothing and blaming nothing.
 
         Three effects, and all three are load-bearing:
 
@@ -12171,6 +12198,17 @@ class SpeculativeMergeWorker(_WipHaltMixin):
              green-tier ``reload_config`` — which mutates the held
              :class:`~orchestrator.config.MergeDeepConfig` in place — takes
              effect on the very next dispatch, in both directions.
+          2b. ``self._chain_verify_errors.get(task_id)`` -> ``None``.  Task
+             3185 review fix 3's LOOP GUARD.  A verify that RAISED on the chain
+             arm was not attributed to this item (the tree was cumulative), so
+             the request was DEFERRED rather than blocked — and a defer that
+             re-chained into the same error would ping-pong forever.  Declining
+             sends the re-dispatch down the ordinary path, where it verifies the
+             item's OWN subset tree and gets a verdict that IS attributable to
+             it.  Sits AFTER the kill switch so the stock path still pays
+             nothing, and BEFORE the queue scan so a suppressed task pays no
+             O(n) walk either.  One-shot: the counter is popped the moment a
+             verify for that task returns a result at all.
           3. ``d = self._deep_target_depth(cap, 1 + len(self.chain_snapshot()))``
              -> ``None`` -> ``None``.  Delegates the
              ``min(queue_len, cap, halving_state)`` invariant to
@@ -12195,6 +12233,18 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             return None
         cap = item.request.config.merge_deep.chain_cap
         if cap <= 0:
+            return None
+        if self._chain_verify_errors.get(item.request.task_id):
+            # Guard 2b (task 3185 review fix 3): this task's LAST chain-arm
+            # verify raised, and that error was NOT attributed to it -- the
+            # request was deferred rather than blocked. Chaining it again would
+            # rebuild the same chain into the same error, forever. Decline so
+            # the re-dispatch verifies the item's OWN subset tree, whose verdict
+            # IS attributable to it.
+            #
+            # Placed AFTER the kill-switch guard so the stock path still pays
+            # nothing, and BEFORE chain_snapshot() so a suppressed task pays no
+            # O(n) scan either.
             return None
         queue_len = 1 + len(self.chain_snapshot())
         d = self._deep_target_depth(cap, queue_len)
@@ -18193,6 +18243,61 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # much later unrelated streak would inherit it and cap out on its
             # very first defer.
             self._clear_contended_lease_streak(req.task_id)
+            if chain is not None:
+                # ══ task 3185 (PRD γ, review fix 3): NON-ADOPTING ON ERROR ══
+                #
+                # The SAME soundness rule as the pass/fail exit below, in the
+                # red direction: this verify ran against `chain.tip`, a
+                # CUMULATIVE tree containing `item` PLUS every chained
+                # successor's content.  An error out of that tree is no more
+                # attributable to `item` than a tip PASS is, so blocking the
+                # dispatching request on it would terminally fail a task whose
+                # own subset tree was never even run.  Defer instead: the item
+                # stays queued and takes its ordinary sequential path, exactly
+                # as on the tip-pass and tip-fail arms.
+                #
+                # NOT `_note_chain_outcome`: an infra error is not a tip
+                # verdict and must not move the halving policy (the exit block
+                # below states that contract -- "An EXCEPTION exit never
+                # reaches here at all").
+                #
+                # NOT a lane release either: `_release_chain_lane()` in the
+                # `finally` already covers every exit including this one, and
+                # its internal latch makes a second release a no-op -- adding
+                # one here would be the double-release that latch exists to
+                # absorb.
+                _chain_errs = self._chain_verify_errors.get(req.task_id, 0) + 1
+                self._chain_verify_errors[req.task_id] = _chain_errs
+                if _chain_errs < self.MAX_CHAIN_VERIFY_ERRORS:
+                    logger.warning(
+                        'Task %s: deep tip verify RAISED against tip=%s '
+                        '(%s) -- NOT attributed to this task (the tree was '
+                        'cumulative); re-queuing, and the next dispatch for it '
+                        'will verify its own subset tree [%d/%d]',
+                        req.task_id, merge_commit[:8], exc,
+                        _chain_errs, self.MAX_CHAIN_VERIFY_ERRORS,
+                    )
+                    self._requeue_request(req)
+                    return InflightVerifyResult(
+                        outcome=None,
+                        merge_wt=None,
+                        status=InflightStatus.REQUEUED,
+                    )
+                # At the cap: a bounded ping-pong must still TERMINATE, so fall
+                # through to today's terminal resolution.  Reaching here means
+                # the loop guard already forced MAX_CHAIN_VERIFY_ERRORS - 1
+                # un-chained re-dispatches that ALSO raised, which is an error
+                # the chain cannot be blamed for.
+                logger.error(
+                    'Task %s: %d consecutive deep-chain verify errors -- '
+                    'resolving terminally instead of re-queuing again',
+                    req.task_id, _chain_errs,
+                )
+                # Terminal exits do not reach the unconditional reset site
+                # below, so pop here for the same reason the dead-verify-abort
+                # counter is popped a few lines up: a stale count must not
+                # linger for a task_id that leaves via this path.
+                self._chain_verify_errors.pop(req.task_id, None)
             err_outcome = MergeOutcome('blocked', reason=f'Verification error: {exc}')
             if not req.result.done():
                 req.result.set_result(err_outcome)
@@ -18362,6 +18467,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # toward MAX_INFLIGHT_DEAD_VERIFY_ABORTS even though a verify
         # genuinely ran to completion in between.
         self._inflight_dead_verify_aborts.pop(req.task_id, None)
+        # task 3185 (PRD γ, review fix 3): same statement group, same argument —
+        # a verify that returned a result at all did NOT raise, so this task's
+        # deep-chain-arm error streak is broken.  Popping here is what makes the
+        # chain suppression ONE-SHOT and self-clearing: a single infra blip costs
+        # exactly one non-chained round rather than disabling deep merge-ahead
+        # for the task for the life of the worker.
+        self._chain_verify_errors.pop(req.task_id, None)
         # task 2828 amend: the verify actually RAN (lease was acquired), so any
         # prior contended-lease requeue streak for this task is broken — reset it.
         # task 3003: pop the streak's start stamp in lockstep, so the next
@@ -18379,6 +18491,17 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # advance would land work from a tree nothing ever ran — precisely
             # the new false-green path the PRD forbids ("Landing safety is
             # structural... There is no new false-green path").
+            #
+            # The rule is SYMMETRIC, and both directions are enforced (task
+            # 3185 review fix 3): because the tip's verdict is about the
+            # cumulative tree, it may neither LAND the item on a tip pass (this
+            # exit) nor BLOCK it on a tip ERROR (the `chain is not None` branch
+            # in the `except Exception` handler above, which defers by the same
+            # REQUEUED recipe).  The green half alone is not the fence — a
+            # chain-caused `Verification error:` terminally failing a task
+            # whose own tree was never run is the same unsound attribution
+            # pointing the other way.  δ (3186) replaces only the PASS arm; the
+            # exception arm stays non-adopting under δ too.
             #
             # So BOTH arms — tip pass and tip fail — take the REQUEUED
             # sentinel: nothing lands via the chain in γ, the items stay
