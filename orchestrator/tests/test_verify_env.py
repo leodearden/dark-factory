@@ -140,6 +140,34 @@ class TestRuffCacheIsWorktreeLocal:
         assert env["PYTHONUNBUFFERED"] == "1"
         assert "VIRTUAL_ENV" not in env
 
+    def test_caller_overlay_still_wins_over_injected_cache_dir(self, monkeypatch):
+        # An operator's `verify_env` (module or top-level, merged by
+        # _resolve_verify_env) must stay authoritative — same contract the
+        # CARGO_INCREMENTAL case above pins for os.environ.  This is what
+        # keeps the injection's POSITION (above `env.update(extra)`) load
+        # bearing: move it below and this assertion goes red.
+        fake_environ = {"PATH": "/usr/bin", "RUFF_CACHE_DIR": "/ambient/cache"}
+        monkeypatch.setattr(verify.os, "environ", fake_environ)
+
+        env = _target_subprocess_env(
+            {"RUFF_CACHE_DIR": "/operator/chosen"},
+            worktree=Path("/w/.worktrees/77"),
+        )
+
+        assert env["RUFF_CACHE_DIR"] == "/operator/chosen"
+
+    def test_no_worktree_leaves_ruff_cache_dir_untouched(self, monkeypatch):
+        # BACK-COMPAT: non-verify callers (and the project_root path) pass no
+        # worktree, so nothing is injected and any ambient value is preserved
+        # verbatim — the injection must never be synthesised from os.getcwd().
+        fake_environ = {"PATH": "/usr/bin", "RUFF_CACHE_DIR": "/ambient/cache"}
+        monkeypatch.setattr(verify.os, "environ", fake_environ)
+        assert _target_subprocess_env(None)["RUFF_CACHE_DIR"] == "/ambient/cache"
+
+        bare_environ = {"PATH": "/usr/bin"}
+        monkeypatch.setattr(verify.os, "environ", bare_environ)
+        assert "RUFF_CACHE_DIR" not in _target_subprocess_env(None)
+
 class TestOrchEnvScrub:
     """The orchestrator's ``ORCH_*`` control-plane namespace must not leak into
     a TARGET verify/build/test subprocess.
