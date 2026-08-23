@@ -65,8 +65,13 @@ _PROBE_SOURCE = 'import sys\nimport os\n\nprint(os.getcwd())\n'
 # silence — a diagnostic that stops diagnosing — while this guard fails
 # loudly), so a private copy here would let whoever fixes one never learn the
 # other exists. Importing makes that impossible: this file measures the real
-# constant. (`tests/scripts/` can import orchestrator — the uv workspace puts
-# every member on sys.path; test_fallback_verify_config.py does the same.)
+# constant. (`tests/scripts/` CAN import orchestrator, but not because shared's
+# venv carries it — `uv sync --project shared` prunes it. The ROOT conftest.py
+# puts every subproject's src/ on sys.path, so the import resolves under the
+# real `uv run --project shared pytest tests/scripts/` invocation and nowhere
+# else; a bare `python -c "import orchestrator"` proves nothing, since the repo
+# root on sys.path matches the directory as an empty NAMESPACE package.
+# Precedent: test_fallback_verify_config.py imports orchestrator.verify too.)
 # _CACHE_DIR_PREFIX has no production counterpart: only this guard reads it.
 _SETTINGS_PATH_PREFIX = _RUFF_SETTINGS_PATH_PREFIX
 _CACHE_DIR_PREFIX = 'cache_dir ='
