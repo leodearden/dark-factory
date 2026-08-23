@@ -177,6 +177,10 @@ SKILLS_CONSUMING_TESTS = (
     # LOADS AND EXECUTES the real skills/factory-init/scripts/find_escalation_port.py
     # via importlib (task 3705) — a REAL consumer, not a synthetic mention.
     "tests/scripts/test_find_escalation_port.py",
+    # Reads skills/escalation-watcher-auto/SKILL.md AND skills/escalation-watcher/
+    # SKILL.md (task 3465) to cross-check the path-guard anchor mirror and the
+    # granted_files recipe contract.
+    "tests/scripts/test_path_guard_audit_anchor_drift.py",
 )
 
 
