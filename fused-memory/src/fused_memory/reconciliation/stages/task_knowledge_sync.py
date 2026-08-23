@@ -584,6 +584,14 @@ async def _query_stage2_flags(
             project_id=project_id,
             categories=['observations_and_summaries'],
             limit=100,
+            # OPT OUT of topic-anchored recall (task 3111).  This is a marker
+            # SWEEP, not a presentation: the window is post-filtered for Stage-1
+            # flags, and the pin promotes rather than adds, so a pinned
+            # canonical would push a genuine flag past the top-N cutoff.  That
+            # flag would then be silently "not swept or rendered this cycle" --
+            # indistinguishable from the pre-existing top-N risk the docstring
+            # above warns about, but self-inflicted.
+            anchor_topics=False,
         )
     except Exception:
         logger.warning(

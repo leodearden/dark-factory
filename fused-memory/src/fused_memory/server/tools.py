@@ -397,7 +397,13 @@ Write operations:
 - add_memory: Lightweight classified write (skip extraction, direct store)
 
 Read operations:
-- search: Unified search across both stores with automatic routing
+- search: Unified search across both stores with automatic routing. Finding any member of a
+  consolidated cluster IN YOUR RESULT WINDOW also surfaces that topic's CANONICAL record,
+  promoted to first and flagged topic_anchored=True (its relevance_score is not meaningful —
+  it is pinned by order, and the window stays exactly `limit` long, so the pin costs the
+  lowest-ranked result its slot; topics are read from the window you see, never from hits
+  that were cut). NOTE this is currently a no-op for almost every search: stamping coverage, not
+  ranking, is the binding constraint, and that coverage is still being built out.
 - get_entity: Direct entity lookup in the knowledge graph
 - get_episodes: Retrieve raw episode history
 - scan_memory_content: Literal substring scan over Mem0 memory TEXT (deterministic, not semantic) — use when search cannot find a string because it carries no semantic signal
@@ -3093,6 +3099,18 @@ def create_mcp_server(
                     categories=['procedural_knowledge'],
                     stores=['mem0'],
                     limit=5,
+                    # OPT OUT of topic-anchored recall (task 3111).  These 5
+                    # slots are a CANDIDATE SET, not a presentation: the pin
+                    # promotes rather than adds, so each pinned canonical would
+                    # evict the lowest-ranked genuine cosine hit from a window
+                    # only 5 deep.  Worse, a pinned canonical deliberately
+                    # carries no metadata['store_score'], so it can never
+                    # qualify in find_near_duplicate_memory -- every pin is a
+                    # slot spent on a record this guard must ignore.  Leaving
+                    # it on would let a true near-duplicate sitting at rank 5
+                    # fall off the end, return None, and land the duplicate on
+                    # exactly the consolidated topics this guard protects.
+                    anchor_topics=False,
                 )
             except (TypeError, AttributeError, NameError):
                 # These indicate a wiring/programming bug (e.g. a future
@@ -3308,6 +3326,29 @@ def create_mcp_server(
             hit is a child whose parent_id no store could resolve, and it stays
             a top-level hit.  A record that is neither a child nor has children
             carries no 'grouped' key at all.
+
+            TOPIC-PINNED RESULTS (task 3111).  Every result carries a
+            'topic_anchored' bool.  When True, that result was PROMOTED into
+            the window BY RULE rather than earned its place by rank: when a
+            record IN THE RETURNED WINDOW carries a metadata.topic, that
+            topic's canonical:true record is looked up and seated first.
+            Topics are harvested from the window you actually see, never from
+            lower-ranked hits that were cut — so a pin can only ever cost you a
+            slot for a cluster you genuinely matched.  'relevance_score' is NOT
+            meaningful for such a result — it is pinned by ORDER, never by
+            score.  Promotion is not addition: the window stays exactly `limit`
+            long, so a pin costs the lowest-ranked result its slot.  This
+            COMPOSES WITH, rather than replaces, the parent_id grouping
+            described above — pinning happens first, in the service, and
+            grouping then runs over the pinned list.
+
+            HONESTY CAVEAT: on the live corpus today this is a NO-OP for almost
+            every search.  Stamping COVERAGE, not ranking, is the binding
+            constraint — metadata.topic is present on 491 of 49,628 records and
+            metadata.canonical:true on 6 — and coverage is task 4006's scope
+            (still PENDING), not this transform's.  No live-corpus recall
+            improvement is claimed.  Task 3659 (briefing assembler) is a FUTURE
+            consumer, explicitly not a live one.
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
         project_id, err = _canonicalize_project_id_arg(project_id)

@@ -168,6 +168,33 @@ async def test_search_kwargs_forwarded():
     assert call_kwargs.get('limit') == 37
 
 
+@pytest.mark.asyncio
+async def test_search_opts_out_of_topic_anchoring():
+    """REGRESSION GUARD (task 3111, review esc-3111-2).
+
+    This is an IDEMPOTENCY check: the window is post-filtered by task_id, so a
+    prior record displaced out of it reads as "no prior memory" and the caller
+    re-writes a duplicate recon record.  Topic-anchored recall PROMOTES rather
+    than adds -- the window stays exactly `limit` long -- so an anchored pin
+    can only ever cost this window a genuine candidate.  The opt-out must be
+    passed explicitly; the service-side default is True.
+    """
+    from fused_memory.reconciliation.mem0_dedup import find_prior_memory
+
+    memory_service = MagicMock()
+    memory_service.search = AsyncMock(return_value=[])
+
+    await find_prior_memory(
+        memory_service,
+        project_id='p',
+        task_id='42',
+        kind={'flag_type': 'foo'},
+        query='Q',
+    )
+
+    assert memory_service.search.call_args.kwargs.get('anchor_topics') is False
+
+
 # ---------------------------------------------------------------------------
 # Step 13 — multi-key kind discriminator: ALL keys must match
 # ---------------------------------------------------------------------------
