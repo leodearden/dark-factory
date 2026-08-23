@@ -78,6 +78,29 @@ cannot read would be exactly the vacuous pass this module's extractors exist to
 prevent. It goes green with the other two in the same step, and from then on its
 value is that it fails the day someone widens a prefix.
 
+MEASURED RED for the MECHANISM-EXISTS half — the amendment's defect, and the one
+a guard can actually stop recurring: a recipe that names a mechanism which does
+not exist, and so silently no-ops while reporting success::
+
+    E   AssertionError: the `scope_violation` recipe in
+    E   skills/escalation-watcher-auto/SKILL.md never names 'granted_files'
+    E   (task 3465). That parameter on `resolve_issue(action='resume')` is what
+    E   ACTUALLY widens a task's scope — it is folded into plan.files /
+    E   metadata.files / file-locks orchestrator-side. [...]
+    E   AssertionError: the `scope_violation` recipe in
+    E   skills/escalation-watcher-auto/SKILL.md mentions `update_task` alongside
+    E   a ['"modules"'] key (task 3465). ``Scheduler._get_modules`` [...] derives
+    E   locks from ``metadata.files`` and has never read ``metadata.modules``, so
+    E   that write is a silent no-op. [...]
+    FAILED ...::test_both_scope_violation_recipes_name_granted_files
+    FAILED ...::test_no_scope_violation_recipe_writes_metadata_modules
+    2 failed, 7 passed in 0.41s
+
+The other two mechanism tests — ``granted_files`` is a real ``resolve_issue``
+parameter, and ``_get_modules`` reads ``'files'`` and not ``'modules'`` — pass
+already, and that is the point: they are standing PREMISE guards, verified true
+BEFORE the recipes were rewritten to depend on them.
+
 OUT OF SCOPE. ``fused-memory/src/fused_memory/middleware/scope_violation_escalator.py``
 is READ-ONLY to this module — it is AST-parsed, never imported and never edited.
 Re-gating the producer is explicitly not the remedy: the unconditional census is
@@ -109,6 +132,36 @@ ESC_IDS_END = "<!-- path-guard-esc-ids:end -->"
 # an operator greps is DERIVED from the anchor, never independently authored — the
 # whole point of pinning the two.
 ESC_ID_PREFIX = "esc-"
+
+# The MECHANISM-EXISTS half (task 3465 amendment). Both recipes previously told an
+# agent to widen scope by writing ``metadata.modules`` — a key ``Scheduler._get_modules``
+# has never read. Every application of that instruction to a real task id was a
+# silent no-op reporting success. These are the sources whose reality the rewritten
+# recipes now depend on.
+SERVER_SRC = REPO_ROOT / "escalation/src/escalation/server.py"
+SCHEDULER_SRC = REPO_ROOT / "orchestrator/src/orchestrator/scheduler.py"
+
+# Same file as SKILL_DOC, aliased at the name the mechanism tests read it under —
+# one Path object, so the two halves of this module can never point at different
+# copies of the auto skill.
+AUTO_SKILL = SKILL_DOC
+INTERACTIVE_SKILL = REPO_ROOT / "skills/escalation-watcher/SKILL.md"
+
+RESOLVE_ISSUE = "resolve_issue"
+GRANTED_FILES = "granted_files"
+LOCK_DERIVATION_FN = "_get_modules"
+
+_HEADING = re.compile(r"^(#{1,6})\s+(.*)$")
+
+# A ``modules`` key inside a metadata mapping, in the spellings a recipe could
+# plausibly carry. NOT a bare ``modules`` word match: both recipes legitimately
+# use the English word ("needs modules beyond its assigned scope"), and firing on
+# that would pin prose instead of the defect.
+_METADATA_MODULES = (
+    '"modules"',
+    "'modules'",
+    "metadata.modules",
+)
 
 # The budget-misconfig record shares this producer module but NOTHING else: it is
 # category 'adjudicator_config_defect', agent_role 'fused-memory/path-scope-adjudicator'
@@ -457,3 +510,239 @@ def test_the_blocking_adjudicator_record_is_not_swallowed():
             f"matches it would auto-close it as benign, silently. Narrow the "
             f"token so it covers only the scope_violation family."
         )
+
+
+def function_params(src: pathlib.Path, name: str) -> set[str]:
+    """Every parameter name of the function *name* defined in *src*.
+
+    ``ast.walk`` rather than a module-body scan, so a method inside a class body
+    is found — ``resolve_issue`` is registered inside the MCP server factory and
+    ``_get_modules`` is a ``Scheduler`` method, neither at module level.
+
+    Positional-only, positional, keyword-only, ``*args`` and ``**kwargs`` are all
+    included: the question this answers is "can a caller pass this name?", and a
+    parameter's calling convention is not the guard's business.
+    """
+    tree = ast.parse(src.read_text(encoding="utf-8"))
+    matches = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name
+    ]
+    assert len(matches) == 1, (
+        f"expected exactly one function named {name!r} in "
+        f"{src.relative_to(REPO_ROOT)}, found {len(matches)} (task 3465). This "
+        f"guard AST-parses that module because it cannot be imported under "
+        f"`--project shared`; a rename must fail HERE, naming the function, "
+        f"rather than emptying the check."
+    )
+
+    args = matches[0].args
+    params = {
+        arg.arg
+        for arg in (*args.posonlyargs, *args.args, *args.kwonlyargs)
+    }
+    for extra in (args.vararg, args.kwarg):
+        if extra is not None:
+            params.add(extra.arg)
+    return params
+
+
+def function_body_constants(src: pathlib.Path, name: str) -> set[str]:
+    """String constants in the body of *name*, EXCLUDING its docstring.
+
+    Walking the AST rather than the text is what makes this honest: comments are
+    gone by construction, and the docstring is dropped explicitly. Both matter
+    here — ``_get_modules``'s own docstring says "metadata.files" and "modules"
+    in prose, so a text scan would report whatever the prose happens to claim
+    rather than what the code reads.
+    """
+    tree = ast.parse(src.read_text(encoding="utf-8"))
+    matches = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name
+    ]
+    assert len(matches) == 1, (
+        f"expected exactly one function named {name!r} in "
+        f"{src.relative_to(REPO_ROOT)}, found {len(matches)} (task 3465)"
+    )
+
+    func = matches[0]
+    body = func.body
+    if (
+        body
+        and isinstance(body[0], ast.Expr)
+        and isinstance(body[0].value, ast.Constant)
+        and isinstance(body[0].value.value, str)
+    ):
+        body = body[1:]
+
+    constants: set[str] = set()
+    for statement in body:
+        for node in ast.walk(statement):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                constants.add(node.value)
+    return constants
+
+
+def scope_violation_recipe(doc: pathlib.Path) -> str:
+    """The ``scope_violation`` recipe section of *doc*, heading included.
+
+    Matched on the ``scope_violation`` TOKEN in a heading line, not on an exact
+    heading string: the auto skill spells it ``#### `scope_violation``` and the
+    interactive one ``### `scope_violation` (info or blocking)``, and a title
+    tweak must not silently empty this slice. The section runs to the next
+    heading of the SAME-OR-HIGHER level, so subsections the recipe owns (the
+    audit-only branch, the synthetic-anchor safety net) are inside it and the
+    next sibling category is not.
+    """
+    lines = doc.read_text(encoding="utf-8").split("\n")
+
+    start = None
+    level = 0
+    for index, line in enumerate(lines):
+        match = _HEADING.match(line)
+        if match and "scope_violation" in match.group(2):
+            start, level = index, len(match.group(1))
+            break
+    assert start is not None, (
+        f"no heading naming `scope_violation` found in "
+        f"{doc.relative_to(REPO_ROOT)} (task 3465) — every assertion over this "
+        f"recipe would pass vacuously. If the section was renamed, it must still "
+        f"carry the category token so both the guard and a reader can find it."
+    )
+
+    end = len(lines)
+    for index in range(start + 1, len(lines)):
+        match = _HEADING.match(lines[index])
+        if match and len(match.group(1)) <= level:
+            end = index
+            break
+
+    section = "\n".join(lines[start:end])
+    assert section.strip() != lines[start].strip(), (
+        f"the `scope_violation` section of {doc.relative_to(REPO_ROOT)} is a bare "
+        f"heading with no body (task 3465) — the recipe assertions would pass "
+        f"vacuously"
+    )
+    return section
+
+
+def test_granted_files_is_a_real_resolve_issue_parameter():
+    """The scope-expansion mechanism both recipes name actually exists.
+
+    THE point of this guard, and the root defect class of task 3465: a recipe
+    that names a mechanism which does not exist silently no-ops while reporting
+    success. That is exactly what ``metadata.modules`` did — a key
+    ``Scheduler._get_modules`` never read — for every application of the old
+    recipe to a real task id.
+
+    If ``granted_files`` is ever renamed or dropped, the failure surfaces HERE,
+    at merge time, rather than as a rejected tool call inside an autonomous
+    watcher rotation with nobody watching.
+    """
+    params = function_params(SERVER_SRC, RESOLVE_ISSUE)
+
+    assert GRANTED_FILES in params, (
+        f"{RESOLVE_ISSUE}() in {SERVER_SRC.relative_to(REPO_ROOT)} has no "
+        f"{GRANTED_FILES!r} parameter (task 3465). Both `scope_violation` "
+        f"recipes instruct an agent to pass it as the scope-expansion grant — "
+        f"without it those instructions are unexecutable, and an agent following "
+        f"them would have its call rejected mid-rotation. Parameters found: "
+        f"{sorted(params)}"
+    )
+
+
+def test_both_scope_violation_recipes_name_granted_files():
+    """Both tiers must name the real mechanism, not just the auto one.
+
+    The amendment's point 3 exists because the clone was missed once already:
+    the interactive skill carried the same inert-mechanism instruction as the
+    auto skill and was not in the original plan's file list at all. Pinning both
+    is what stops the fix from being applied to one tier and quietly lost in the
+    other.
+    """
+    for doc in (AUTO_SKILL, INTERACTIVE_SKILL):
+        recipe = scope_violation_recipe(doc)
+        assert GRANTED_FILES in recipe, (
+            f"the `scope_violation` recipe in {doc.relative_to(REPO_ROOT)} never "
+            f"names {GRANTED_FILES!r} (task 3465). That parameter on "
+            f"`resolve_issue(action='resume')` is what ACTUALLY widens a task's "
+            f"scope — it is folded into plan.files / metadata.files / file-locks "
+            f"orchestrator-side. A recipe that omits it leaves the grant as prose "
+            f"only, and the resumed agent's briefing never reflects the expanded "
+            f"scope."
+        )
+
+
+def test_no_scope_violation_recipe_writes_metadata_modules():
+    """Neither recipe may instruct a metadata-scoped ``modules`` write.
+
+    ``Scheduler._get_modules`` derives locks from ``metadata.files`` and has
+    never read ``metadata.modules`` (pinned by the test below). A recipe that
+    writes that key produces a silent no-op reporting success — the defect this
+    task exists to remove, not relocate.
+
+    TWO SHAPES, AND ONLY THESE. A quoted ``modules`` key co-occurring with an
+    ``update_task`` mention, and the bare ``metadata.modules`` attribute
+    spelling. Deliberately NOT a bare ``modules`` word match: both recipes
+    legitimately use the English word, and firing on it would pin prose.
+
+    WHAT THIS DOES NOT CATCH, stated so nobody mistakes it for full coverage:
+    the interactive skill's defect was PROSE ("Extend the required modules in
+    task metadata via `update_task`") with no quoted key, so this test was never
+    red for that file. The positive requirement above — name ``granted_files`` —
+    is what covers the prose-form defect. Negative and positive halves together,
+    neither alone.
+    """
+    for doc in (AUTO_SKILL, INTERACTIVE_SKILL):
+        recipe = scope_violation_recipe(doc)
+        label = doc.relative_to(REPO_ROOT)
+
+        if "update_task" in recipe:
+            quoted = [token for token in _METADATA_MODULES[:2] if token in recipe]
+            assert not quoted, (
+                f"the `scope_violation` recipe in {label} mentions `update_task` "
+                f"alongside a {quoted} key (task 3465). ``Scheduler._get_modules`` "
+                f"(orchestrator/src/orchestrator/scheduler.py) derives locks from "
+                f"``metadata.files`` and has never read ``metadata.modules``, so "
+                f"that write is a silent no-op. Pass the paths as "
+                f"``{GRANTED_FILES}`` on `resolve_issue(action='resume')` instead."
+            )
+
+        assert _METADATA_MODULES[2] not in recipe, (
+            f"the `scope_violation` recipe in {label} names "
+            f"``{_METADATA_MODULES[2]}`` (task 3465) — a key nothing reads. Scope "
+            f"is widened by ``{GRANTED_FILES}`` on `resolve_issue`, which the "
+            f"orchestrator folds into plan.files / metadata.files / locks."
+        )
+
+
+def test_lock_derivation_reads_files_not_modules():
+    """The PREMISE that makes the ``granted_files`` rewrite correct.
+
+    Not a restatement of the test above — that one pins what the DOCS say, this
+    one pins what the CODE does. If someone ever teaches ``_get_modules`` to read
+    ``metadata.modules`` again, the recipes' rationale stops holding and both
+    should be revisited; that must arrive as a red test, not as a rediscovery.
+
+    Asserted against ``Constant`` nodes with the docstring dropped, so the
+    docstring's own prose mention of ``metadata.files`` cannot make this pass
+    vacuously.
+    """
+    constants = function_body_constants(SCHEDULER_SRC, LOCK_DERIVATION_FN)
+
+    assert "files" in constants, (
+        f"{LOCK_DERIVATION_FN}() in {SCHEDULER_SRC.relative_to(REPO_ROOT)} no "
+        f"longer reads a 'files' key (task 3465). Both `scope_violation` recipes "
+        f"rest on locks being derived from ``metadata.files`` — if that changed, "
+        f"revisit them. String constants in its body: {sorted(constants)}"
+    )
+    assert "modules" not in constants, (
+        f"{LOCK_DERIVATION_FN}() in {SCHEDULER_SRC.relative_to(REPO_ROOT)} now "
+        f"reads a 'modules' key (task 3465). Task 3465 deleted the "
+        f"``metadata.modules`` write from both `scope_violation` recipes BECAUSE "
+        f"nothing read it. If that premise no longer holds, revisit both recipes "
+        f"rather than silently leaving them inconsistent with the scheduler."
+    )
