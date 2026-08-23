@@ -381,13 +381,6 @@ Agent discovered it needs to touch files beyond its assigned scope.
 - `category == "scope_violation"`
 - `agent_role == "fused-memory/path-guard"` **OR** the escalation id starts with `esc-task-path-guard`
 
-The tokens this branch keys on, mirrored from the producer's constants in `fused-memory/src/fused_memory/middleware/scope_violation_escalator.py` and pinned against them by `tests/scripts/test_path_guard_audit_anchor_drift.py`:
-
-<!-- path-guard-anchors:begin -->
-`task-path-guard`
-`fused-memory/path-guard`
-<!-- path-guard-anchors:end -->
-
 Match on those structural fields plus the summary signature, **never** on `suggested_action` — the advisory mode's `no_action_advisory_only` and the override mode's `review_override_justification` are prose carried for a human reader, shared with unrelated escalation classes, and cannot discriminate this one by itself. Same rule, same reason, as the amend-fold section below.
 
 **Why these must not take the resume path.** They carry a **synthetic anchor** as `task_id` — `task-path-guard` names no task in fused-memory. `mcp__fused-memory__update_task(id=<task_id>)` therefore targets nothing, and a follow-up `resolve_issue(action='resume')` is a no-op that leaves the record `pending`. A pending un-promoted L1 keeps `_watcher_has_actionable_l1` (`orchestrator/src/orchestrator/harness.py:12263`) returning True, which is what respawns rotations forever. A `stamp_triage` does not clear it either: that precheck reads `status`/`level` only, never `triaged_at`. Only a terminal state stops the spin.
