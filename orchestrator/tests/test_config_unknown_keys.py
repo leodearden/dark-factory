@@ -8,6 +8,7 @@ raw-YAML-vs-model pass.  These tests pin the pure census engine.
 """
 
 import logging
+import os
 from pathlib import Path
 
 import pytest
@@ -539,3 +540,120 @@ def test_config_key_census_ignore_is_green_tier():
     not in RELOADABLE_FIELDS, apply_reload would report restart_required and
     that remediation line would be a lie."""
     assert 'config_key_census.ignore' in RELOADABLE_FIELDS
+
+
+# --- (j) unparseable / unreadable config → parse_error sentinel ----------------
+#
+# The census is fail-open BY DESIGN for its non-CLI consumers: a file it cannot
+# read or parse yields empty key lists rather than raising, because load_config
+# surfaces parse errors loudly on its own path.  But an empty census then has two
+# utterly different causes — "parsed, nothing unknown" and "nothing was parsed at
+# all" — and check-config, which deliberately bypasses load_config, could not tell
+# them apart and printed the affirmative `OK:` for a config it never inspected.
+# `parse_error` is the third view that separates the two, WITHOUT changing what
+# `unknown`/`ignored` mean for anyone already reading them.
+
+_MALFORMED_YAML = 'git:\n  remote: origin\n bad_indent: [1,\n'
+
+
+def test_malformed_yaml_sets_parse_error(tmp_path):
+    """Unparseable YAML must not read as a clean census — but must not raise."""
+    p = tmp_path / 'broken.yaml'
+    p.write_text(_MALFORMED_YAML)
+
+    census = census_config_keys(p)  # must NOT raise — fail-open is preserved
+
+    assert isinstance(census.parse_error, str) and census.parse_error, (
+        'expected a non-empty parse_error sentinel for malformed YAML, '
+        f'got {census.parse_error!r}'
+    )
+    # INV-2 structured-facts-at-failure: the operator gets the facts, not just a
+    # refusal — which file, and the underlying yaml diagnostic (MarkedYAMLError
+    # renders file/line/column).
+    assert str(p) in census.parse_error
+    assert 'line' in census.parse_error
+    # ...and the fail-open half is bit-for-bit intact.
+    assert census.unknown == []
+    assert census.ignored == []
+
+
+def test_directory_path_sets_parse_error(tmp_path):
+    """A directory is reachable through --config (click.Path defaults to
+    dir_okay=True), and open() raises IsADirectoryError — an OSError."""
+    census = census_config_keys(tmp_path)
+    assert census.parse_error is not None
+    assert str(tmp_path) in census.parse_error
+    assert census.unknown == []
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason='root bypasses file permissions')
+def test_unreadable_file_sets_parse_error(tmp_path):
+    """An existing-but-unreadable file (the ORCH_CONFIG_PATH route's only guard
+    is exists()) raises PermissionError — also an OSError."""
+    p = _write_yaml(tmp_path, {'max_concurrent_tasks': 3}, name='locked.yaml')
+    p.chmod(0o000)
+    try:
+        census = census_config_keys(p)
+        assert census.parse_error is not None
+        assert str(p) in census.parse_error
+        assert census.unknown == []
+    finally:
+        p.chmod(0o644)  # so tmp_path teardown cannot fail
+
+
+@pytest.mark.parametrize(
+    'body, kind',
+    [('- a\n- b\n', 'list'), ('hello\n', 'str')],
+    ids=['top-level-list', 'bare-scalar'],
+)
+def test_non_mapping_document_sets_parse_error(tmp_path, body, kind):
+    """A document that PARSES but is not a mapping cannot be a config at all, so
+    it must not read as clean either — the census walked nothing."""
+    p = tmp_path / 'notamapping.yaml'
+    p.write_text(body)
+
+    census = census_config_keys(p)
+
+    assert census.parse_error is not None
+    assert 'mapping' in census.parse_error
+    assert kind in census.parse_error
+    assert census.unknown == []
+    assert census.ignored == []
+
+
+@pytest.mark.parametrize(
+    'body', ['', '# nothing here\n'], ids=['empty', 'comments-only']
+)
+def test_empty_document_is_clean_not_a_parse_error(tmp_path, body):
+    """DELIBERATE non-regression boundary: an EMPTY (or comments-only) project
+    YAML legitimately means "use all defaults" — pydantic-settings loads it
+    without complaint — so it is a genuinely CLEAN census, not a parse failure."""
+    p = tmp_path / 'empty.yaml'
+    p.write_text(body)
+
+    census = census_config_keys(p)
+
+    assert census.parse_error is None
+    assert census.unknown == []
+    assert census.ignored == []
+
+
+def test_clean_config_has_no_parse_error(tmp_path):
+    p = _write_yaml(
+        tmp_path,
+        {'max_concurrent_tasks': 3, 'git': {'remote': 'origin'}},
+        name='config.yaml',
+    )
+    census = census_config_keys(p)
+    assert census.parse_error is None
+    assert census.unknown == []
+
+
+def test_census_stays_fail_open_for_non_cli_consumers(tmp_path):
+    """INV-5: the public wrapper's signature and fail-open semantics are
+    UNCHANGED.  Its non-CLI callers (load_config's stash, the born-at-L2) must
+    keep seeing an empty list — not an exception — for a file that cannot be
+    parsed, because load_config raises its own loud, marked parse error."""
+    p = tmp_path / 'broken.yaml'
+    p.write_text(_MALFORMED_YAML)
+    assert census_unknown_config_keys(p) == []
