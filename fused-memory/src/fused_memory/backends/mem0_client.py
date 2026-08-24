@@ -2,7 +2,8 @@
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Sequence
+from contextlib import aclosing
 from typing import Any
 
 from mem0 import AsyncMemory
@@ -1034,30 +1035,41 @@ class Mem0Backend:
         truncated = False
         try:
             # The caller's `limit` rides on the pager's points cap, so the walk
-            # itself has ONE home.  Never `break` out of this loop: the raise is
-            # the only exit, which keeps the async generator closed promptly
-            # instead of leaving it to the GC.
-            async for point in self.scroll_collection_pages(
-                collection_name,
-                scroll_filter=scroll_filter,
-                page_size=page_size,
-                max_pages=max_pages,
-                max_points=limit,
-                with_vectors=False,
-            ):
-                scanned += 1
-                payload: dict[str, Any] = dict(point.payload) if point.payload else {}
-                hits = find_toolcall_xml_leak(_extract_payload_text(payload))
-                if not hits:
-                    continue
-                text = _extract_payload_text(payload) or ''
-                matches.append({
-                    'id': point.id,
-                    'created_at': payload.get('created_at'),
-                    'matched_fragments': [hit.fragment for hit in hits],
-                    'excerpt': text[:_EXCERPT_LEN] + ('…' if len(text) > _EXCERPT_LEN else ''),
-                    'metadata': payload,
-                })
+            # itself has ONE home.  There is deliberately no `break` — the cap
+            # is expressed as max_points so the pager can shrink each request
+            # rather than being stopped from out here.
+            #
+            # `aclosing` rather than a bare `async for` because `async for`
+            # closes the generator only when the ITERATION ends or raises: a
+            # failure in the LOOP BODY below (a malformed payload reaching the
+            # detector) or a cancellation would otherwise leave the pager
+            # suspended mid-walk for the event loop's async-generator hooks to
+            # finalise at some later, unpredictable point.  This makes the
+            # close deterministic on EVERY exit path.
+            async with aclosing(
+                self.scroll_collection_pages(
+                    collection_name,
+                    scroll_filter=scroll_filter,
+                    page_size=page_size,
+                    max_pages=max_pages,
+                    max_points=limit,
+                    with_vectors=False,
+                )
+            ) as pages:
+                async for point in pages:
+                    scanned += 1
+                    payload: dict[str, Any] = dict(point.payload) if point.payload else {}
+                    hits = find_toolcall_xml_leak(_extract_payload_text(payload))
+                    if not hits:
+                        continue
+                    text = _extract_payload_text(payload) or ''
+                    matches.append({
+                        'id': point.id,
+                        'created_at': payload.get('created_at'),
+                        'matched_fragments': [hit.fragment for hit in hits],
+                        'excerpt': text[:_EXCERPT_LEN] + ('…' if len(text) > _EXCERPT_LEN else ''),
+                        'metadata': payload,
+                    })
         except ScrollPointBudgetExhausted:
             # THIS caller's posture, chosen here rather than at the primitive:
             # being stopped by a limit the caller itself passed is an expected
@@ -1088,7 +1100,7 @@ class Mem0Backend:
         max_pages: int = DEFAULT_SCROLL_MAX_PAGES,
         max_points: int | None = None,
         with_vectors: bool = False,
-    ) -> AsyncIterator[Any]:
+    ) -> AsyncGenerator[Any, None]:
         """Yield every Qdrant point in *collection_name*, paging on ``next_offset``.
 
         THE single home for the offset/next_offset walk (INV-5).  Every
@@ -1155,7 +1167,13 @@ class Mem0Backend:
                 so it is opt-in.
 
         Yields:
-            Raw Qdrant point objects, in page order.
+            Raw Qdrant point objects, in page order.  Annotated
+            ``AsyncGenerator`` rather than ``AsyncIterator`` on purpose: the
+            narrower type carries ``aclose()``, so a caller that may abandon
+            the walk part-way (a raise from ITS loop body, a cancellation) can
+            wrap it in :func:`contextlib.aclosing` and close it deterministically
+            instead of leaving it suspended for the event loop's
+            async-generator hooks.  :meth:`scan_payload_text` does exactly that.
 
         Raises:
             ValueError: If *max_points* is given and non-positive — raised on
