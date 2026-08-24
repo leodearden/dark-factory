@@ -48,7 +48,12 @@ from orchestrator.scheduler import (
     SetTaskStatusRejected,
     TerminalExitRejection,
 )
-from orchestrator.workflow import TaskWorkflow, WorkflowOutcome, WorkflowState
+from orchestrator.workflow import (
+    TaskWorkflow,
+    WorkflowCancelled,
+    WorkflowOutcome,
+    WorkflowState,
+)
 from orchestrator.workflow_types import classify_failure
 
 
@@ -450,3 +455,84 @@ class TestSoftCancelFallbackRepends:
 
         assert outcome == WorkflowOutcome.DONE
         assert wf.scheduler.statuses[wf.task_id] == ['done']  # type: ignore[attr-defined]
+
+
+# ---------------------------------------------------------------------------
+# Boundary #14a — DONE-on-cancelled producer #1 (_handle_soft_cancel)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_soft_cancel_on_cancelled_row_returns_cancelled(tmp_path: Path):
+    """A ``cancelled`` row reached via soft cancel exits CANCELLED, not DONE.
+
+    ``_handle_soft_cancel``'s case 1 collapses every member of
+    ``TERMINAL_STATUSES`` onto DONE, so a human cancellation is reported as a
+    completion.  The machine must also be left in ``WorkflowState.CANCELLED``
+    (SM-1 terminal absorption) — which ``_finalise_cancellation`` has already
+    entered by the time this runs, so the helper must be idempotent there.
+    """
+    sched = FakeScheduler()
+    wf = _make_workflow(tmp_path=tmp_path, scheduler=sched)
+    sched.statuses[wf.task_id] = ['cancelled']
+    wf.state = WorkflowState.CANCELLED  # as _finalise_cancellation leaves it
+
+    outcome = await wf._handle_soft_cancel('merge')
+
+    assert outcome == WorkflowOutcome.CANCELLED
+    assert wf.machine.state is WorkflowState.CANCELLED
+    # No 'pending' write: a terminal row is not requeued.
+    assert sched.statuses[wf.task_id] == ['cancelled']
+
+
+@pytest.mark.asyncio
+async def test_soft_cancel_on_done_row_still_returns_done(tmp_path: Path):
+    """Negative control: a ``done`` row still exits DONE (unchanged behaviour)."""
+    sched = FakeScheduler()
+    wf = _make_workflow(tmp_path=tmp_path, scheduler=sched)
+    sched.statuses[wf.task_id] = ['done']
+    wf.state = WorkflowState.CANCELLED
+
+    outcome = await wf._handle_soft_cancel('merge')
+
+    assert outcome == WorkflowOutcome.DONE
+
+
+def test_done_outcome_is_not_allowed_on_a_cancelled_row():
+    """Why boundary #14a is a live crash, not a mislabelling.
+
+    ``_OUTCOME_ALLOWED['done'] == {DONE}``, so run()'s SM-2 exit check raises
+    ``AssertionError`` on a DONE outcome against a ``cancelled`` row; the
+    truthful CANCELLED pairing is consistent by construction.  Tally
+    correctness follows mechanically — ``Harness._compute_tallies`` counts
+    ``report.completed`` as ``outcome == DONE`` only, so a DONE-on-cancelled
+    inflated the completed count.
+    """
+    assert outcome_allows_status(WorkflowOutcome.DONE, 'cancelled') is False
+    assert outcome_allows_status(WorkflowOutcome.CANCELLED, 'cancelled') is True
+
+
+@pytest.mark.asyncio
+async def test_run_soft_cancel_on_cancelled_row_reports_cancelled(tmp_path: Path):
+    """End-to-end: ``run()`` returns CANCELLED and does not trip its own SM-2.
+
+    Today the soft-cancel path returns DONE against the ``cancelled`` row, and
+    ``run()``'s exit check raises
+    ``AssertionError: run()-exit SM-2: outcome ... inconsistent with status
+    'cancelled'`` — so this is a crash out of ``run()``, not a cosmetic
+    mislabel.
+    """
+    sched = FakeScheduler()
+    wf = _make_workflow(tmp_path=tmp_path, scheduler=sched)
+    sched.statuses[wf.task_id] = ['cancelled']
+
+    async def _cancelled_drive():
+        raise WorkflowCancelled(kind='soft')
+
+    wf._drive = _cancelled_drive  # type: ignore[method-assign]
+
+    report = await wf.run()
+
+    assert report.outcome == WorkflowOutcome.CANCELLED
+    assert report.phase is WorkflowState.CANCELLED
+    assert wf.machine.state is WorkflowState.CANCELLED
