@@ -1600,6 +1600,49 @@ class TestDoneProvenanceSection:
             assert header_value not in files
         assert len(files) == len(set(files))
 
+    @pytest.mark.asyncio
+    async def test_single_parent_commit_file_list_unchanged_by_flag(self, tmp_path):
+        """--first-parent -m is a documented, empirically-verified no-op for an
+        ordinary single-parent commit — which is what makes adding the flags
+        a strict improvement rather than a behaviour trade-off for non-merge
+        provenance citations.
+
+        Two checks:
+          1. content — _git_show_name_only on the single-parent commit lists
+             exactly a.txt and b.txt under ``files:``, unchanged by the flags.
+          2. the no-op claim itself, pinned directly rather than restated in
+             prose: raw ``git show --name-only --format=... --no-color <sha>``
+             stdout is byte-identical to the same invocation with
+             ``--first-parent -m`` appended, for a genuine single-parent
+             commit. (Verified by hand during planning: identical md5 on both
+             this repo's real history and a scratch fixture repo.)
+        """
+        import subprocess
+
+        shas = self._init_repo_with_merge(tmp_path)
+
+        block = await _git_show_name_only(
+            ProjectRoot(str(tmp_path)), shas['single'], max_files=50, max_chars=2000,
+        )
+        after_label = block.split('files:', 1)[1]
+        file_lines = sorted(
+            ln.strip() for ln in after_label.splitlines()
+            if ln.strip() and not ln.strip().startswith('...')
+        )
+        assert file_lines == ['a.txt', 'b.txt']
+
+        bare = subprocess.run(
+            ['git', '-C', str(tmp_path), 'show', '--name-only',
+             '--format=%H%n%ai%n%s', '--no-color', shas['single']],
+            check=True, capture_output=True, text=True,
+        ).stdout
+        flagged = subprocess.run(
+            ['git', '-C', str(tmp_path), 'show', '--name-only',
+             '--format=%H%n%ai%n%s', '--no-color', '--first-parent', '-m', shas['single']],
+            check=True, capture_output=True, text=True,
+        ).stdout
+        assert bare == flagged
+
 
 class BaseStageValidationTest:
     """Shared infrastructure for stage validation test classes.
