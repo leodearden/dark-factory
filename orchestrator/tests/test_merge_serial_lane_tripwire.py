@@ -16,6 +16,7 @@ documented in test_merge_skew_tripwire.py:11-14.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -229,3 +230,141 @@ class TestCheckSerialLaneTripwire:
         assessment = check_serial_lane_tripwire(2)
         assert assessment.merge_ahead_bound == 1
         assert assessment.breached is True
+
+
+# ---------------------------------------------------------------------------
+# Step 07 — alarm_serial_lane_breach (acting wrapper)
+# ---------------------------------------------------------------------------
+
+
+class TestAlarmSerialLaneBreach:
+    """``alarm_serial_lane_breach`` is the acting half: WARNING + telemetry.
+
+    Never raises, never blocks, returns None — there is no veto channel a
+    caller could accidentally honour as a hard block (PRD C4: "no hard block").
+    """
+
+    def test_breach_logs_one_warning_and_emits_one_event(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Breached → exactly one WARNING naming the numbers, and one event."""
+        from _recording_event_store import _RecordingEventStore  # noqa: PLC0415
+
+        from orchestrator.merge_liveness import (  # noqa: PLC0415
+            alarm_serial_lane_breach,
+            check_serial_lane_tripwire,
+        )
+
+        assessment = check_serial_lane_tripwire(2, merge_ahead_bound=1, num_hosts=1)
+        rec = _RecordingEventStore()
+        # merge_liveness.py:58 binds logger = getLogger('orchestrator.merge_queue'),
+        # NOT __name__ — filter on that name.
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            result = alarm_serial_lane_breach(
+                assessment,
+                event_store=rec,
+                task_id='5326',
+                branch='task/5326',
+                request_id='mr-29dfdbc2',
+                host='local',
+            )
+
+        assert result is None
+
+        # Match on a SPECIFIC substring, never "some WARNING exists".
+        hits = [r for r in caplog.records if 'serial-lane' in r.getMessage()]
+        assert len(hits) == 1, f'expected exactly one tripwire WARNING; got {hits!r}'
+        msg = hits[0].getMessage()
+        assert hits[0].levelno == logging.WARNING
+        for fact in ('local_inflight=2', 'per_host_bound=1', 'task/5326'):
+            assert fact in msg, f'WARNING must carry {fact!r}; got: {msg!r}'
+
+        # INV-2: the payload carries every fact the emitter held in a variable,
+        # so a consumer never has to log-scrape.
+        events = [e for e in rec.events if e[0] == 'merge_serial_lane_breached']
+        assert len(events) == 1
+        _etype, payload = events[0]
+        assert payload['task_id'] == '5326'
+        assert payload['data'] == {
+            'local_inflight': 2,
+            'per_host_bound': 1,
+            'merge_ahead_bound': 1,
+            'num_hosts': 1,
+            'branch': 'task/5326',
+            'request_id': 'mr-29dfdbc2',
+            'host': 'local',
+        }
+
+    def test_not_breached_is_totally_silent(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """POSITIVE CONTROL (PRD §9 row 10 negative half): no event, no WARNING.
+
+        The bare ``== []`` assertion is safe at THIS layer only: the alarm is
+        called directly, with no worker and hence no ``_note_transition`` in
+        play to pollute either channel.  Step 09's integration-layer positive
+        control MUST filter both channels — do not "helpfully" loosen this one
+        or tighten that one to match.
+        """
+        from _recording_event_store import _RecordingEventStore  # noqa: PLC0415
+
+        from orchestrator.merge_liveness import (  # noqa: PLC0415
+            alarm_serial_lane_breach,
+            check_serial_lane_tripwire,
+        )
+
+        assessment = check_serial_lane_tripwire(1, merge_ahead_bound=1, num_hosts=1)
+        rec = _RecordingEventStore()
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            result = alarm_serial_lane_breach(
+                assessment,
+                event_store=rec,
+                task_id='5326',
+                branch='task/5326',
+                request_id='mr-29dfdbc2',
+                host='local',
+            )
+
+        assert result is None
+        assert rec.events == []
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+    def test_no_event_store_still_logs_the_warning(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A store-less worker still gets the loud log (fail-open on telemetry only)."""
+        from orchestrator.merge_liveness import (  # noqa: PLC0415
+            alarm_serial_lane_breach,
+            check_serial_lane_tripwire,
+        )
+
+        assessment = check_serial_lane_tripwire(2, merge_ahead_bound=1, num_hosts=1)
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            result = alarm_serial_lane_breach(
+                assessment, event_store=None, task_id='5326', branch='task/5326'
+            )
+
+        assert result is None
+        hits = [r for r in caplog.records if 'serial-lane' in r.getMessage()]
+        assert len(hits) == 1, 'the WARNING must not depend on an event store'
+
+    def test_hostile_event_store_cannot_propagate(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A store whose emit() raises must never wedge the dispatch path."""
+        from orchestrator.merge_liveness import (  # noqa: PLC0415
+            alarm_serial_lane_breach,
+            check_serial_lane_tripwire,
+        )
+
+        assessment = check_serial_lane_tripwire(2, merge_ahead_bound=1, num_hosts=1)
+        hostile = MagicMock()
+        hostile.emit = MagicMock(side_effect=RuntimeError('boom'))
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            result = alarm_serial_lane_breach(
+                assessment, event_store=hostile, task_id='5326', branch='task/5326'
+            )
+
+        # No veto channel exists for a caller to accidentally honour as a block.
+        assert result is None
+        hostile.emit.assert_called_once()
