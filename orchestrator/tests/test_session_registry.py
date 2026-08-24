@@ -44,8 +44,8 @@ def _make_record(**overrides: object) -> sr.SessionRecord:
     test can catch a field being dropped/mis-typed; ``overrides`` lets a
     test tweak just the field(s) it cares about. Includes the C1 schema
     extensions (parent_session_id/spawn_mode/display/question) and the
-    task-4193 hook-owner binding (claude_session_id) alongside the original
-    rail fields.
+    task-4193 hook-owner binding (claude_session_id, claude_owner_pid)
+    alongside the original rail fields.
     """
     # Declared as a bare `dict` (not `dict[str, object]`) so pyright treats it
     # as dict[Unknown, Unknown] at the **fields unpack below -- mirrors
@@ -74,6 +74,7 @@ def _make_record(**overrides: object) -> sr.SessionRecord:
         ),
         'question': sr.Question(text='approve rollout?', asked_at='2026-07-07T00:00:00+00:00'),
         'claude_session_id': 'uuid-claude-abc123',
+        'claude_owner_pid': 424242,
     }
     fields.update(overrides)
     return sr.SessionRecord(**fields)
@@ -246,6 +247,63 @@ def test_session_record_round_trip_includes_claude_session_id() -> None:
 
 def test_session_record_defaults_claude_session_id_to_none() -> None:
     record = sr.SessionRecord(session_slug='s', status=sr.Status.LAUNCHING)
+    assert record.claude_session_id is None
+
+
+def test_session_record_round_trip_includes_claude_owner_pid() -> None:
+    # esc-4193-11 suggestion 3: to_dict/from_dict must actually carry
+    # claude_owner_pid -- without a non-None value in _make_record's fields,
+    # the round-trip pin above is vacuous (both sides default to None even
+    # if to_dict silently dropped the key).
+    r = _make_record()
+    assert r.claude_owner_pid == 424242
+    assert r.to_dict()['claude_owner_pid'] == 424242
+    assert sr.SessionRecord.from_dict(r.to_dict()) == r
+    assert sr.SessionRecord.from_json(r.to_json()) == r
+
+
+@pytest.mark.parametrize(
+    ('raw', 'expected'),
+    [
+        (True, None),  # bool is an int subclass; must be rejected before the int check
+        ('x', None),
+        (3.0, None),
+        (0, None),
+        (-1, None),
+        (None, None),
+        (4242, 4242),
+    ],
+)
+def test_coerce_owner_pid(raw: object, expected: int | None) -> None:
+    assert sr._coerce_owner_pid(raw) == expected
+
+
+@pytest.mark.parametrize(
+    ('raw', 'expected'),
+    [
+        (True, None),
+        (123, None),
+        (3.0, None),
+        (None, None),
+        ('', None),
+        ('   ', None),
+        ('uuid-claude-abc123', 'uuid-claude-abc123'),
+        ('  uuid-claude-abc123  ', 'uuid-claude-abc123'),
+    ],
+)
+def test_coerce_session_id(raw: object, expected: str | None) -> None:
+    assert sr._coerce_session_id(raw) == expected
+
+
+def test_session_record_from_dict_coerces_non_str_claude_session_id() -> None:
+    # esc-4193-11 suggestion 2: a hand-edited or future-writer record body
+    # carrying a non-string claude_session_id must not survive into the
+    # SessionRecord -- session_hooks does `(record.claude_session_id or
+    # '').strip()` outside a try/except, so a raw int here would raise
+    # AttributeError and lose the whole hook event.
+    data = _make_record().to_dict()
+    data['claude_session_id'] = 123
+    record = sr.SessionRecord.from_dict(data)
     assert record.claude_session_id is None
 
 

@@ -214,6 +214,24 @@ def _coerce_owner_pid(value: Any) -> int | None:
     return value if value > 0 else None
 
 
+def _coerce_session_id(value: Any) -> str | None:
+    """Read ``claude_session_id`` from a record body, tolerating junk.
+
+    Mirrors ``_coerce_owner_pid``: anything that is not a ``str`` reads as
+    None ("no session id bound") instead of surviving to the hook trio's
+    ``(record.claude_session_id or '').strip()`` call, where a non-str would
+    raise AttributeError outside the ownership probe's try/except and lose
+    the whole hook event. A str value is stripped, and a whitespace-only
+    string also reads as None. Never raises: this is on ``from_dict``'s
+    path, and a hand-edited or older record body must not be what breaks a
+    session hook.
+    """
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip()
+    return stripped or None
+
+
 @dataclass
 class SessionRecord:
     """One session-registry record — ``<fleet_root>/sessions/<slug>/record.json``.
@@ -338,7 +356,7 @@ class SessionRecord:
             spawn_mode=data.get('spawn_mode', SpawnMode.CHILD),
             display=Display.from_dict(display_data) if isinstance(display_data, dict) else None,
             question=Question.from_dict(question_data) if isinstance(question_data, dict) else None,
-            claude_session_id=data.get('claude_session_id'),
+            claude_session_id=_coerce_session_id(data.get('claude_session_id')),
             claude_owner_pid=_coerce_owner_pid(data.get('claude_owner_pid')),
         )
 
