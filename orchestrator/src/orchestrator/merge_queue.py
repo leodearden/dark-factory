@@ -6455,7 +6455,7 @@ async def _journal_landed_then_advance(
     task_id: str,
     branch_tip_sha: str | None,
     advanced_sha: str,
-    merge_wt: Path,
+    merge_wt: Path | None,
     **advance_kwargs: Any,
 ) -> AdvanceOutcome:
     """Record a LandedRow, THEN advance main — single-sourced write-ahead
@@ -6469,6 +6469,14 @@ async def _journal_landed_then_advance(
     keeping the advance call byte-identical to before this helper existed.
     A ``None`` *outbox* (no ``project_root``, e.g. bare-worker tests) no-ops
     the record — the advance still proceeds.
+
+    A ``None`` *merge_wt* is legal and meaningful, not merely tolerated:
+    ``advance_main``'s second parameter is the worktree it would REBASE in
+    when the merge commit is no longer a descendant of main, so passing
+    ``None`` opts out of the rebase-retry entirely and turns that case into
+    an immediate ``'not_descendant'``. That is exactly what task 3186 (PRD δ)
+    wants for a chain-prefix link: the tip verdict was rendered against THESE
+    commits, so rebasing one would land a tree nothing verified.
 
     CAUTION — the row is recorded UNCONDITIONALLY before the outcome of
     ``advance_main`` is known. If the returned :class:`AdvanceOutcome`'s
@@ -18897,6 +18905,217 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         self._redispatch.appendleft(_remerged)
         return False
 
+    def _take_chain_link_request(
+        self, task_id: str,
+    ) -> tuple[str, int, MergeRequest] | None:
+        """Remove and return the first lane-buffered request for *task_id*.
+
+        Returns ``(lane, index, request)`` — the coordinates
+        :meth:`_restore_chain_link_request` needs to put it back EXACTLY where
+        it was if the landing it was taken for does not happen.
+
+        The queue half of δ's walk (task 3186): a chain-landed link must leave
+        the buffers in the same synchronous beat it is resolved, or the merger
+        re-picks a request that is already on main and merges it a second time.
+
+        Search order is ``chain_snapshot``'s — high lane first, FIFO within
+        lane — because that is the order ``build_chain`` itself snapshotted, so
+        a duplicate ``task_id`` (a regenerated request) resolves to the SAME
+        object the chain was built from rather than a later twin.
+
+        Returns ``None`` when the request is no longer buffered.  That is a
+        REAL state, not a defensive branch: ``_run_inflight_verify`` awaits a
+        whole verify between the build and this walk, and the merger loop is
+        free to ``_pop_next_pickable`` a follower during it.  The caller MUST
+        stop the walk on ``None`` — the pipeline has taken ownership of that
+        item elsewhere, and landing it from here would be the double-land the
+        removal above exists to prevent.
+
+        **Cross-writer note.**  ``_lane_buffers``' single-writer owner is
+        ``_merger_task`` (:meth:`_assert_single_writer`), and this runs on
+        ``_verifier_task``.  The mutation is nonetheless safe and deliberate,
+        for the same reason ``stop()``'s drain is (merge_queue.py's "legitimate
+        non-owner drain" comment): the scan and the delete are one synchronous
+        statement pair with no ``await`` between them, so no other coroutine
+        can observe a torn buffer.  ``_assert_single_writer`` is deliberately
+        NOT called — it would fire on this legitimate second writer — and the
+        None-return contract above is what covers the interleaving the guard
+        would otherwise be protecting.
+        """
+        for lane in MERGE_LANES:
+            buf = self._lane_buffers[lane]
+            for idx, buffered in enumerate(buf):
+                if buffered.task_id == task_id:
+                    del buf[idx]
+                    return lane, idx, buffered
+        return None
+
+    def _restore_chain_link_request(
+        self, lane: str, idx: int, req: MergeRequest,
+    ) -> None:
+        """Put a taken-but-not-landed chain link back at its exact position.
+
+        The undo half of :meth:`_take_chain_link_request`, and the reason δ's
+        stale-CAS abort really is "the remaining links stay queued UNTOUCHED"
+        (PRD decision #9) rather than merely "not failed".
+
+        Deliberately NOT :meth:`_requeue_request`: that recipe is for an item
+        that was genuinely IN FLIGHT, and its three effects are all wrong here.
+        It would move the link onto ``_queue`` (losing its lane position and
+        its place in submission order), fire ``on_requeued`` for a round the
+        link never entered, and drive ``_note_requeue`` to attempt
+        ``LANE_BUFFERED -> QUEUED`` — an edge absent from
+        :data:`_LEGAL_TRANSITIONS`, so it would escalate a rejected transition
+        on every deep round that loses a CAS race.  A link that never left its
+        buffer needs no re-arming at all; it needs its slot back.
+        """
+        self._lane_buffers[lane].insert(idx, req)
+
+    async def _land_chain_prefix(self, entry: InflightEntry, head_sha: str) -> None:
+        """Land ``entry.chain.links`` on main, in order, by CAS (task 3186, PRD δ).
+
+        THE adoption site.  γ (task 3185) built the chain, verified its TIP and
+        recorded the verdict, but landed nothing; this is the walk that adopts a
+        green tip, and it runs only from :meth:`_finalize_inflight`'s PASS arm,
+        only after chain item #1 is confirmed on main at *head_sha*.
+
+        SOUNDNESS.  ``links`` is a CONTIGUOUS PREFIX in land order
+        (``build_chain``'s decision-4 purity; :meth:`chain_snapshot`'s refusal
+        of clique-minimality), so every member's landed tree is a SUBSET of the
+        tip tree that just went green — each was verified, cumulatively, by the
+        one verify that passed.  Landing them in that same order, each CASing
+        against its PREDECESSOR's merge commit, reproduces on main exactly the
+        history the tip was built from.
+
+        DECISION #9 — ABORT, NEVER FAIL.  The walk stops at the FIRST advance
+        that does not return ``'advanced'``.  Remaining links are left exactly
+        as they were: still buffered, futures unresolved, no ``merge_attempt``
+        emitted and no ``MergeOutcome('blocked')`` rendered, so they take their
+        ordinary sequential path on a later round.  That silence is
+        load-bearing, not laziness: a rendered failure would feed
+        ``workflow.py``'s ``consecutive_merge_thrash`` ladder a deterministic
+        signature on every deep round — the same false-positive-escalation
+        class ``build_chain``'s decision-4 purity guards against upstream, and
+        the PRD's "deep fails never feed thrash guard" boundary row.
+
+        NO PERMITS ARE TOUCHED.  A chain link never acquired a ``SpecPermit`` or
+        a ``CapPermit`` — it sat in a lane buffer for the whole round — so this
+        walk must never call ``PermitLedger.release`` for it, which asserts on a
+        non-live token and would break the structural identity
+        ``slot_available + len(live) == depth``.  Retirement runs through
+        :meth:`_resolve_or_drop_abandoned` (resolve + ``_retire_item``) alone.
+
+        WHY THE HEAD PATH IS NOT REFACTORED INTO A SHARED HELPER.  The
+        merge_queue.py extraction bar asks for a straight factoring or none at
+        all, and this is not one: the head path owns a CAS RETRY LOOP, an
+        ephemeral/warm ``merge_wt`` to dispose, ``_maybe_schedule_shadow_compare``,
+        ``_maybe_run_drift_check``, ``refresh_warm_base``, a
+        ``_GenerationChainContext`` and a ``started_monotonic`` — none of which
+        a link has (it has no ``RealMergeItem`` at all, only a queued
+        ``MergeRequest`` and a SHA).  Unifying them would need a flag argument
+        per difference, which the local standard rules out.  What IS shared is
+        the terminal TRIO itself: ``_journal_landed_then_advance`` →
+        ``_finalize_advanced_merge`` → ``_resolve_or_drop_abandoned``, called
+        here in the same order and with the same contracts.
+        """
+        chain = entry.chain
+        if chain is None or not chain.links:
+            return
+
+        expected_main = head_sha
+        landed = 0
+        for task_id, merge_commit in chain.links:
+            taken = self._take_chain_link_request(task_id)
+            if taken is None:
+                logger.info(
+                    'deep chain walk: task %s is no longer buffered — stopping '
+                    'after %d link(s); the pipeline owns it elsewhere',
+                    task_id, landed,
+                )
+                break
+            _lane, _idx, link_req = taken
+
+            # `merge_commit^2` is the branch tip build_chain's `--no-ff` merge
+            # incorporated — the same derivation _finalize_advanced_merge
+            # prefers, resolved here as well so the write-ahead LandedRow the
+            # startup reconciler reads is not blank.
+            branch_tip = await _resolve_second_parent(self._git_ops, merge_commit)
+            adv_outcome = await _journal_landed_then_advance(
+                self._landed_outbox, self._git_ops,
+                task_id=link_req.task_id,
+                branch_tip_sha=branch_tip,
+                advanced_sha=merge_commit,
+                # None, deliberately: see _journal_landed_then_advance's own
+                # note.  A link's tree is the one the tip verdict covered, so
+                # opting out of advance_main's rebase-retry is the point — a
+                # rebased link would land a tree nothing verified.
+                merge_wt=None,
+                branch=link_req.branch.full_name,
+                max_attempts=1,
+                expected_main=expected_main,
+                reverify_on_rebase=True,
+            )
+            if adv_outcome.result != 'advanced':
+                # Decision #9: STALE-CAS ABORT.  Silent by design — see the
+                # docstring.  INFO, not WARNING: main moving under a
+                # speculative prefix is an expected race, not a fault.
+                logger.info(
+                    'deep chain walk: advance for task %s returned %r — '
+                    'stopping after %d link(s); the rest stay queued',
+                    task_id, adv_outcome.result, landed,
+                )
+                self._restore_chain_link_request(_lane, _idx, link_req)
+                break
+
+            landed_sha = adv_outcome.advanced_sha or merge_commit
+            outcome = await _finalize_advanced_merge(
+                self._git_ops, link_req, self._event_store,
+                merge_commit_fallback=merge_commit,
+                base_sha=expected_main,
+                # A link has no dispatch stamp — it never dispatched.  None is
+                # forwarded verbatim by _elapsed_ms, so the merge_attempt row
+                # simply carries no duration rather than a fabricated one.
+                started_monotonic=None,
+                cas_retries=self._cas_retries,
+                timeouts=self._post_merge_verify_timeouts,
+                enospc_retries=self._post_merge_verify_enospc_retries,
+                log_label=' (deep chain)',
+                # None, matching trains (PRD D9): γ2 generation auto-chaining
+                # is an equivalence-gate-FAILURE interceptor, and a link that
+                # reaches here was verified as part of the green tip.
+                chain_ctx=None,
+                merged_branch_tip=branch_tip,
+                advanced_sha=adv_outcome.advanced_sha,
+            )
+            # Same ONE-per-landed-item unit as the head's stamp, and the same
+            # placement rule: before the resolve, because the resolve is what
+            # freezes the `merge_finalized` payload.
+            outcome = dataclasses.replace(outcome, landed_via_chain=1)
+            self._resolve_or_drop_abandoned(link_req, outcome)
+            landed += 1
+            expected_main = landed_sha
+
+            if outcome.status == 'done':
+                self._note_merge_landing(link_req.request_id)
+                if outcome.merge_sha is not None:
+                    self._last_known_main_sha = outcome.merge_sha
+                if outcome.merge_sha is not None and self._on_merge_landed is not None:
+                    try:
+                        await self._on_merge_landed(
+                            link_req.task_id, adv_outcome.advanced_sha or expected_main,
+                            outcome.merge_sha,
+                        )
+                    except Exception:
+                        logger.warning(
+                            'on_merge_landed hook raised for task %s; ignoring '
+                            '(fail-open)', link_req.task_id, exc_info=True,
+                        )
+
+        logger.info(
+            'deep chain walk: landed %d of %d chained link(s) on top of %s',
+            landed, len(chain.links), head_sha[:8],
+        )
+
     async def _finalize_inflight(self, entry: InflightEntry) -> bool:
         """Run the CAS advance_main + post-advance work for one in-flight item.
 
@@ -19499,6 +19718,17 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         merged_branch_tip=item.merged_branch_tip,
                         advanced_sha=adv_outcome.advanced_sha,
                     )
+                    # ── task 3186 (PRD δ): the head IS chain item #1 ────────
+                    # Stamped BEFORE the resolve, because the resolve is what
+                    # fires `_on_finalized` and therefore what freezes the
+                    # `merge_finalized` payload η1 reads.  ONE per landed item
+                    # (never the chain size k, never a position) — the unit is
+                    # pinned by the committed consumer, see
+                    # MergeOutcome.landed_via_chain's docstring.  Gated on a
+                    # NON-EMPTY chain so an ordinary sequential landing keeps
+                    # the field absent and falls out of the canary's filter.
+                    if entry.chain is not None and entry.chain.links:
+                        outcome = dataclasses.replace(outcome, landed_via_chain=1)
                     self._resolve_or_drop_abandoned(req, outcome)
                     if outcome.status == 'done':
                         # ι=1894: record clean landing, pop drift base for this req
@@ -19551,6 +19781,20 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         # refresh_warm_base is best-effort and never raises.
                         if merge_wt.name == PERSISTENT_MERGE_WORKTREE_NAME:
                             await self._git_ops.refresh_warm_base()
+                    # ── task 3186 (PRD δ): THE IN-ORDER CAS WALK ────────────
+                    # Chain item #1 (this entry) is now on main; I2..Ik follow,
+                    # in order, on the SAME tip verdict's authority.  Placed
+                    # after the head's whole success block so the walk can
+                    # never run against a head that did not actually land, and
+                    # inside the `result == 'advanced'` arm so a CAS-failed
+                    # head takes the retry loop untouched.
+                    #
+                    # `entry.chain` is read HERE for the first time — γ wrote
+                    # the field (merge_queue.py:20265) and left it write-only
+                    # precisely for this consumer (merge_types.py:1458-1464).
+                    await self._land_chain_prefix(
+                        entry, adv_outcome.advanced_sha or merge_commit,
+                    )
                     advanced = True
                     return True
 

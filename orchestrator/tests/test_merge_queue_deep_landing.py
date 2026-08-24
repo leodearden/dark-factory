@@ -1134,23 +1134,14 @@ class TestInOrderCasWalk:
 
         _spy_post_merge_verify(monkeypatch, outcome=None)
         _spy_chain_lane_release(monkeypatch)
-        # The two post-advance gates, neutralised at their own reach-back
-        # seams so this scene measures the walk, not the gate chain.
-        async def _no_equiv_failure(*_a, **_kw):
-            return []
-
-        async def _clean_pyright(*_a, **_kw):
-            from orchestrator.merge_gates import PostMergePyrightResult
-
-            return PostMergePyrightResult()
-
-        monkeypatch.setattr(
-            'orchestrator.merge_queue._check_post_merge_equivalence',
-            _no_equiv_failure,
-        )
-        monkeypatch.setattr(
-            'orchestrator.merge_queue._check_post_merge_pyright', _clean_pyright,
-        )
+        # BOTH post-advance gates run FOR REAL here, deliberately: they are
+        # part of what the walk must reuse per link, and stubbing them would
+        # have to reach back through `orchestrator.merge_queue.<private>` —
+        # the exact patch surface test_merge_queue_reachback_patch_guard.py
+        # freezes.  The pyright gate quick-exits clean because no module here
+        # defines a `type_check_command` (merge_gates.py:2105-2107), and the
+        # equivalence gate passes because every commit in this scene is a
+        # genuine `--no-ff` merge of the branch it names.
         adv = _spy_advance_main(git_ops, monkeypatch)
 
         res = await worker._run_inflight_verify(item, _local_lease(), chain=chain)
