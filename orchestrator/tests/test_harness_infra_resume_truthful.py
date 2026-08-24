@@ -36,13 +36,20 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from escalation.models import Escalation
+from escalation.queue import EscalationQueue
 from shared.task_claimant import is_stranded
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.event_store import EventType
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.harness import Harness
-from orchestrator.scheduler import TaskAssignment
+from orchestrator.scheduler import (
+    SetTaskStatusRejected,
+    TaskAssignment,
+    TerminalExitRejection,
+)
+from orchestrator.task_status import TERMINAL_STATUSES
 from orchestrator.workflow import TaskWorkflow
 
 # ---------------------------------------------------------------------------
@@ -354,3 +361,224 @@ class TestInfraResumeKeepsBranchKeyedSkip:
             'step-1 was not re-derived — a re-pended task would re-implement it'
         )
         assert steps['step-2']['status'] == 'pending'
+
+
+# ---------------------------------------------------------------------------
+# INV-4: a refused cascade status write must be OBSERVABLE, not swallowed
+# ---------------------------------------------------------------------------
+#
+# All four rejection handlers on the cascade's two resume writes log-and-return
+# today.  A swallowed rejection is a permanent SILENT hold: the escalation is
+# resolved and closed, so nothing will retry, and the row keeps whatever status
+# it had — for an infra-held row, a status no dispatcher will ever pick up.
+#
+# "Retry-then-escalate" resolves to escalate-ONLY here.  Scheduler.set_task_status
+# already owns the transient retry loop (fm_retry_backoffs) and raises
+# SetTaskStatusRejected only for NON-transient rejections, so a
+# SetTaskStatusRejected reaching this caller is by construction post-retry and a
+# caller-level re-retry would be dead code.
+#
+# Carve-out: a TerminalExitRejection whose old_status is terminal is a
+# legitimately-finished row, not a hold.  Nothing is wrong, nobody is stuck, and
+# filing there would be pure noise.
+
+
+def _wire_real_queue(harness: Harness, tmp_path: Path) -> EscalationQueue:
+    """Give the harness a real on-disk EscalationQueue and a recording event store."""
+    queue = EscalationQueue(tmp_path / 'esc')
+    harness._escalation_queue = queue
+    harness.event_store = MagicMock()
+    return queue
+
+
+def _filed_for(queue: EscalationQueue, task_id: str) -> list:
+    return [
+        e for e in queue.get_by_task(task_id, status='pending')
+        if e.agent_role == 'harness-cascade'
+    ]
+
+
+@pytest.mark.asyncio
+class TestCascadeStatusRejectionEscalates:
+    """A refused cascade resume write files a blocking L1 and emits an event."""
+
+    @staticmethod
+    def _infra_row(harness: Harness, tid: str) -> None:
+        harness.scheduler.get_task = AsyncMock(return_value={
+            'id': tid, 'status': 'infra-hold', 'metadata': {},
+        })
+        harness.scheduler.get_status = AsyncMock(return_value='infra-hold')
+
+    @staticmethod
+    def _blocked_row(harness: Harness, tid: str) -> None:
+        harness.scheduler.get_task = AsyncMock(return_value={
+            'id': tid, 'status': 'blocked', 'metadata': {},
+        })
+        harness.scheduler.get_status = AsyncMock(return_value='blocked')
+
+    async def test_infra_resume_rejection_files_one_blocking_l1(
+        self, harness: Harness, tmp_path: Path,
+    ):
+        """(a) A generic SetTaskStatusRejected files exactly one record.
+
+        severity='blocking' and level=1: the row is stuck and needs a human or
+        the auto-watcher, but the agent-filed ceiling is 'blocking' (higher
+        severities are reserved for harness sentinels routing straight to a
+        human).  The detail must carry error_code and raw — without them the
+        operator cannot tell a stale metadata.files rejection from a
+        provenance-gate one.
+        """
+        tid = '3540'
+        queue = _wire_real_queue(harness, tmp_path)
+        self._infra_row(harness, tid)
+        harness.scheduler.set_task_status = AsyncMock(side_effect=SetTaskStatusRejected(
+            task_id=tid, error_code='unknown', raw='backend said no',
+        ))
+
+        await _drive_orphan_resume(harness, _make_infra_esc(task_id=tid))
+
+        filed = _filed_for(queue, tid)
+        assert len(filed) == 1, (
+            f'expected exactly one cascade-rejection escalation, got {filed}'
+        )
+        esc = filed[0]
+        assert esc.severity == 'blocking'
+        assert esc.level == 1
+        assert 'unknown' in (esc.detail or ''), 'detail must name exc.error_code'
+        assert 'backend said no' in (esc.detail or ''), 'detail must carry exc.raw'
+        assert 'pending' in (esc.detail or ''), 'detail must name the refused target'
+
+        emitted = [
+            c for c in harness.event_store.emit.call_args_list  # type: ignore[attr-defined]
+            if c.args and c.args[0] == EventType.escalation_created
+        ]
+        assert emitted, 'no escalation_created event emitted for the filed record'
+
+    async def test_repeated_rejection_files_only_one_record(
+        self, harness: Harness, tmp_path: Path,
+    ):
+        """(b) The same rejection twice must not file twice.
+
+        The cascade fires per resolved escalation, so a persistently-refusing
+        backend would otherwise mint one record per resolution and bury the
+        operator.  NOTE: make_id cannot serve as this guard — it mints a
+        strictly-increasing id per call by design — so the dedup is the
+        established get_by_task(status='pending') + own-agent_role filter.
+        """
+        tid = '3541'
+        queue = _wire_real_queue(harness, tmp_path)
+        self._infra_row(harness, tid)
+        harness.scheduler.set_task_status = AsyncMock(side_effect=SetTaskStatusRejected(
+            task_id=tid, error_code='unknown', raw='backend said no',
+        ))
+
+        await _drive_orphan_resume(harness, _make_infra_esc(task_id=tid))
+        await _drive_orphan_resume(harness, _make_infra_esc(task_id=tid))
+
+        assert len(_filed_for(queue, tid)) == 1, (
+            'second identical rejection filed a duplicate record'
+        )
+
+    @pytest.mark.parametrize('terminal', ['done', 'cancelled'])
+    async def test_terminal_exit_rejection_files_nothing(
+        self, harness: Harness, tmp_path: Path, terminal: str,
+    ):
+        """(c) Carve-out: a legitimately-finished row is not a hold.
+
+        The write was refused because the task already reached a terminal
+        status out of band. There is nothing stuck and nothing to investigate.
+        """
+        assert terminal in TERMINAL_STATUSES, 'setup: parametrized over terminals'
+        tid = '3542'
+        queue = _wire_real_queue(harness, tmp_path)
+        self._infra_row(harness, tid)
+        harness.scheduler.set_task_status = AsyncMock(side_effect=TerminalExitRejection(
+            task_id=tid, old_status=terminal, target_status='pending',
+            raw='terminal-exit gate',
+        ))
+
+        await _drive_orphan_resume(harness, _make_infra_esc(task_id=tid))
+
+        assert _filed_for(queue, tid) == [], (
+            f'filed an escalation for a legitimately {terminal} row — pure noise'
+        )
+
+    async def test_unexpected_exception_arm_also_escalates(
+        self, harness: Harness, tmp_path: Path,
+    ):
+        """(d) The bare `except Exception` arm is the second swallow.
+
+        A TimeoutError / connection drop leaves the row just as stuck as a
+        typed rejection does, so it must be just as loud.
+        """
+        tid = '3543'
+        queue = _wire_real_queue(harness, tmp_path)
+        self._infra_row(harness, tid)
+        harness.scheduler.set_task_status = AsyncMock(
+            side_effect=TimeoutError('fused-memory unreachable'),
+        )
+
+        await _drive_orphan_resume(harness, _make_infra_esc(task_id=tid))
+
+        filed = _filed_for(queue, tid)
+        assert len(filed) == 1, (
+            f'the bare except-Exception arm swallowed the failure: {filed}'
+        )
+        assert 'fused-memory unreachable' in (filed[0].detail or '')
+
+    async def test_table_b_resume_rejection_escalates_symmetrically(
+        self, harness: Harness, tmp_path: Path,
+    ):
+        """(e) Symmetry: the ordinary blocked→pending resume write too.
+
+        Same rule, same carve-out — a swallowed rejection there strands a
+        plain blocked task exactly as permanently.
+        """
+        tid = '3544'
+        queue = _wire_real_queue(harness, tmp_path)
+        self._blocked_row(harness, tid)
+        harness.scheduler.set_task_status = AsyncMock(side_effect=SetTaskStatusRejected(
+            task_id=tid, error_code='unknown', raw='backend said no',
+        ))
+
+        await _drive_orphan_resume(harness, _make_infra_esc(task_id=tid))
+
+        assert len(_filed_for(queue, tid)) == 1
+
+    async def test_table_b_terminal_carve_out_files_nothing(
+        self, harness: Harness, tmp_path: Path,
+    ):
+        """(e) …including the carve-out, which must not diverge between arms."""
+        tid = '3545'
+        queue = _wire_real_queue(harness, tmp_path)
+        self._blocked_row(harness, tid)
+        harness.scheduler.set_task_status = AsyncMock(side_effect=TerminalExitRejection(
+            task_id=tid, old_status='done', target_status='pending',
+            raw='terminal-exit gate',
+        ))
+
+        await _drive_orphan_resume(harness, _make_infra_esc(task_id=tid))
+
+        assert _filed_for(queue, tid) == []
+
+    async def test_nothing_propagates_out_of_the_background_task(
+        self, harness: Harness, tmp_path: Path,
+    ):
+        """Every case above: the caller is fire-and-forget.
+
+        _on_escalation_resolved schedules the cascade and returns; an exception
+        escaping it would surface only as an unretrieved-task-exception warning
+        at GC time, i.e. be lost. The gather in _drive_orphan_resume re-raises
+        anything that escaped, so reaching the assertions IS the check — this
+        test states it explicitly for the no-queue case, where the filer must
+        no-op rather than AttributeError.
+        """
+        tid = '3546'
+        harness._escalation_queue = None   # bare-Harness shape
+        harness.event_store = None
+        self._infra_row(harness, tid)
+        harness.scheduler.set_task_status = AsyncMock(side_effect=SetTaskStatusRejected(
+            task_id=tid, error_code='unknown', raw='backend said no',
+        ))
+
+        await _drive_orphan_resume(harness, _make_infra_esc(task_id=tid))
