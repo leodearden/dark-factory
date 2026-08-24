@@ -6086,11 +6086,19 @@ class Harness:
         # A1 guard (task 2200/ω4): a verify-complete task held by a transient
         # infra failure — first-class status == 'infra-hold', via
         # is_infra_held — must NOT be re-pended by the stranded recovery
-        # sweep.  The open infra_issue L1 is the non-dispatch hold (dispatch
-        # is pending-only; the open L1 suppresses stranded_blocked re-file).
-        # Flipping to pending would force the task to re-win its full
-        # implement footprint in the scheduler's footprint-locked dispatch —
-        # the root cause of the 3465 starvation.
+        # sweep.  The reason is the HOLD itself, not any footprint property:
+        # the infra_issue L1 is still OPEN, meaning the infrastructure fault
+        # has not been fixed, so re-pending would hand the task straight back
+        # to a dispatcher to fail the same way.  The row is meant to sit here
+        # until the escalation RESOLVES, at which point
+        # _cascade_unblock_member re-pends it (task 3538: that resume writes
+        # 'pending' — an 'in-progress' resume was undispatchable and stranded
+        # on the write; see the rationale block on that method).  This guard
+        # is unchanged by 3538 — only the cross-reference is corrected: the
+        # retired "re-pending re-competes for the implement footprint, the
+        # 3465 root cause" framing does not hold, because dispatch is
+        # pending-only and status-first, so a non-pending row never reaches
+        # try_acquire and holds no footprint either way.
         # Guard conditions: is_infra_held(task) AND the branch is
         # non-degenerate (has commits beyond branch_base_sha).  Degenerate
         # branches (provisioned but never implemented) are not protected because
