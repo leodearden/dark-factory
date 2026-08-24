@@ -34,6 +34,21 @@ This repo uses `ruff check` only; `ruff format` is deliberately NOT adopted
 and most files are not format-clean. Do not file or perform
 formatting-cleanup work — see `CONTRIBUTING.md` section 3 (task 3441).
 
+<!-- line-pin-policy:begin — mirrors CONTRIBUTING.md §2; pinned by
+     tests/scripts/test_line_pin_policy.py (markers + non-enforcement only,
+     never the wording). -->
+Cite cross-file references in comments and docstrings as
+`path/to/module.py::symbol`, never `module.py:1234`. The **428** existing
+bare line pins are **tolerated drift, not debt** — ~80% are already stale
+(hand-adjudicated n=49) and none has ever been shown to mislead a reader.
+**Do not file or perform pin-cleanup work, and do not escalate the
+population**; a task or escalation proposing a sweep is correctly closable
+as won't-fix. Fix a pin only in prose your own change introduces or edits.
+Nothing enforces this mechanically, by choice — see `CONTRIBUTING.md` §2
+(esc-3815-7).
+<!-- line-pin-policy:end -->
+
+
 ## Prerequisites
 
 ```bash
