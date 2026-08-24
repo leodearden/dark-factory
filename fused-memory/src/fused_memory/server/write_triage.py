@@ -21,12 +21,18 @@ eventually escalated fail-open event. Silent degradation is the thing being
 prevented, so the fallback is loud in the logs and quiet in the response.
 
 SEAM NOTE (INV-5). Candidate retrieval goes through ``MemoryService.search``
-and nothing else. Task 3111 lands topic-anchored recall AT that seam; routing
-this leaf's retrieval through it means the improvement arrives here for free,
-whereas a topic-aware retrieval built inside this module would be a second
-implementation to keep in sync. 3111 is confirmed NOT landed as of this leaf's
-base, which is the expected state — plain cross-category search is the correct
-retrieval today.
+and nothing else. A topic-aware — or any other — retrieval built inside this
+module would be a second implementation to keep in sync forever, so the seam
+discipline is binding and unconditional.
+
+Going THROUGH the seam is not the same as taking everything it offers.
+Task 3111's topic-anchored recall HAS landed at that seam
+(``MemoryService.search(anchor_topics=...)``, defaulting to ``True``), and
+this module explicitly opts OUT of it: the pin PROMOTES rather than adds, so
+on a consolidated topic it spends candidate slots on records triage can never
+route to. That is an agent-facing read improvement and a machine-consumer
+regression; see :func:`retrieve_candidates` for the full reasoning. Use the
+seam, and pass the flags a candidate-set consumer needs.
 
 The pure/impure split mirrors ``near_duplicate_guard``: pure synchronous
 selectors and defensive ``getattr``-at-every-hop config resolvers, with the
@@ -368,10 +374,18 @@ async def retrieve_candidates(
     added later is triaged without an edit to this module.
 
     (2) Retrieval goes through the ``MemoryService.search`` SEAM and nowhere
-    else. Task 3111 lands topic-anchored recall at that seam; this call
-    inherits it the day it lands. Do NOT build a topic-aware retrieval here —
-    a second implementation is a second thing to keep in sync, and the seam
-    note in this module's docstring exists to forbid exactly that.
+    else, and that discipline is unchanged and still binding: do NOT build a
+    topic-aware — or any other — retrieval here, because a second
+    implementation is a second thing to keep in sync, and the seam note in
+    this module's docstring exists to forbid exactly that.
+
+    What was wrong was the INHERITANCE claim that used to sit here — that
+    task 3111's topic-anchored recall would simply "arrive for free" once it
+    landed. It landed, and it is not free for THIS consumer.
+    ``anchor_topics=False`` is therefore passed explicitly below, with the
+    reasoning at the call. Topic anchoring is an agent-facing READ
+    improvement; a machine consumer that thresholds and post-filters its
+    window must opt out or silently lose genuine candidates to displacement.
 
     COST, stated plainly as the retired guard's call site stated it: this is
     an embedding plus a vector round-trip on EVERY triaged write, so it is on
@@ -389,6 +403,17 @@ async def retrieve_candidates(
         categories=sorted(category.value for category in MEM0_PRIMARY),
         stores=list(_TRIAGE_STORES),
         limit=k,
+        # OPT OUT of topic-anchored recall (task 3111), for the same reason
+        # the retired near-duplicate write guard's call site opts out. These
+        # `k` slots are a CANDIDATE SET, not a presentation: the pin PROMOTES
+        # rather than adds, so the window stays exactly `k` long and each
+        # pinned canonical evicts the lowest-ranked genuine cosine hit. Worse,
+        # a pinned canonical deliberately carries no metadata['store_score']
+        # (services/topic_anchor.py), and `decide_band` drops every candidate
+        # whose cosine is non-numeric -- so a pin can never qualify at ANY
+        # threshold. Every pin is a slot spent on a record triage must ignore,
+        # on exactly the consolidated topics where pins exist.
+        anchor_topics=False,
     )
 
 
