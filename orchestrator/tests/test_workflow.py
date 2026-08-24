@@ -2152,6 +2152,9 @@ class TestHandleSoftCancelOutcome:
 
         scheduler = MagicMock()
         scheduler.get_status = AsyncMock(return_value=status)
+        # Case 3 (spurious wakeup) re-pends the row before its REQUEUED exit
+        # as of task 3538 — a bare MagicMock attribute is not awaitable.
+        scheduler.set_task_status = AsyncMock()
 
         wf = TaskWorkflow(
             assignment=assignment,

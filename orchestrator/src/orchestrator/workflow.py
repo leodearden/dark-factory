@@ -16402,7 +16402,12 @@ Update the plan to address the blocking issues. You may add new steps to the `st
 
         3. Otherwise (cancel event cleared or spurious wakeup) → ``REQUEUED``
            Defensive fallback: re-run the slot once the cancel condition clears.
-           Preserves the original REQUEUED semantics for non-soft-cancel callers.
+           Preserves the original REQUEUED semantics for non-soft-cancel callers,
+           but re-pends the row first via :meth:`_repend_for_requeue` (γ3/D6) so
+           the exit is truthful — otherwise the row is left ``in-progress`` and
+           the harness slot ``finally`` nulls the claimant right after, which is
+           precisely the stranded shape.  If that write reveals a terminal row,
+           the terminal verdict is returned instead of REQUEUED.
 
         **Watcher-race note** — ``_scan_for_terminal_active_tasks`` fires a soft-
         cancel when it observes a terminal status, but by the time this method
@@ -16411,9 +16416,12 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         non-terminal, ``_cancel_event`` is set, and we return ``SOFT_CANCELLED``
         (slot exits with ``requeued=False``) rather than the prior ``REQUEUED``
         (which would have re-dispatched the now-live task).  Recovery for watcher-
-        triggered soft-cancels therefore relies on the scheduler's stranded-in-
-        progress sweep or normal re-dispatch of a ``pending`` task rather than
-        immediate requeue.  The ``release_workflow`` MCP path (human-initiated
+        triggered soft-cancels therefore relies on normal re-dispatch of a
+        ``pending`` task rather than immediate requeue.  (The stranded-in-progress
+        sweep is no longer part of that story for case 3: as of γ3 the fallback
+        re-pends the row itself, so recovery is ordinary dispatch — the sweep
+        cannot be relied on anyway, since it refuses to act while any escalation
+        is open.)  The ``release_workflow`` MCP path (human-initiated
         takeover) is unaffected — ``release_workflow`` always follows a
         ``SOFT_CANCELLED`` exit with an explicit ``set_task_status`` park.
         """
@@ -16431,8 +16439,11 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         if status in TERMINAL_STATUSES:
             return WorkflowOutcome.DONE
         if self._cancel_event.is_set():
+            # No status write: release_workflow owns the park that follows a
+            # SOFT_CANCELLED exit, and writing here would race it.
             return WorkflowOutcome.SOFT_CANCELLED
-        return WorkflowOutcome.REQUEUED
+        outcome = await self._repend_for_requeue()
+        return outcome if outcome is not None else WorkflowOutcome.REQUEUED
 
     @staticmethod
     def _outcome_severity(outcome: StewardOutcome) -> int:
