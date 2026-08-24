@@ -1139,11 +1139,11 @@ class Mem0Backend:
             page_size: Points requested per page (Qdrant ``limit``).
             max_pages: Page budget; exhausting it raises rather than
                 truncating.
-            max_points: Optional cap on how many points to WALK.  ``None``
-                (the default) is inert — the walk is bounded only by
-                *max_pages* — so every caller that does not opt in is
-                structurally unable to see
-                :class:`ScrollPointBudgetExhausted`.
+            max_points: Optional cap on how many points to WALK.  Must be
+                strictly positive when given (see Raises).  ``None`` (the
+                default) is inert — the walk is bounded only by *max_pages* —
+                so every caller that does not opt in is structurally unable to
+                see :class:`ScrollPointBudgetExhausted`.
 
                 The cap is pushed down into the per-page request (each page
                 asks for ``min(page_size, remaining)``), so a capped walk
@@ -1158,6 +1158,16 @@ class Mem0Backend:
             Raw Qdrant point objects, in page order.
 
         Raises:
+            ValueError: If *max_points* is given and non-positive — raised on
+                the first iteration, before any scroll is awaited.  A cap of 0
+                shrinks every page request to zero points, so a walk ending on
+                a ``None`` offset would yield nothing and raise nothing, which
+                is indistinguishable from a genuinely empty collection; a
+                negative cap would additionally send a negative ``limit`` down
+                to the client.  :meth:`scan_payload_text` validates its own
+                *limit* first with a message naming that parameter; this guard
+                is the backstop, so the shared pager can never become the hole
+                that lets one through.
             ScrollPointBudgetExhausted: If *max_points* is consumed while
                 ``next_offset`` is still live.  Deliberately a DISTINCT event
                 from the page budget below, and checked FIRST when a single
@@ -1175,6 +1185,37 @@ class Mem0Backend:
                 :meth:`scroll_by_metadata` / :meth:`get_point_by_id`, so a
                 timed-out read is never mistaken for an empty collection.
         """
+        if max_points is not None and max_points <= 0:
+            raise ValueError(
+                f'scroll_collection_pages max_points must be strictly positive, got '
+                f'{max_points}; a non-positive cap shrinks every page request to zero '
+                'points, so a walk that ends on a None offset yields nothing and raises '
+                'nothing — a result indistinguishable from a genuinely empty collection. '
+                'Same no-silent-wrong-value rule as scan_payload_text\'s limit guard, '
+                'kept here so the shared pager can never become the hole that lets one '
+                'through.'
+            )
+
+        def _point_budget_exhausted(next_offset: Any) -> ScrollPointBudgetExhausted:
+            """Build the points-cap error — ONE home for a message raised twice.
+
+            The cap is checked at two sites (per-yield and post-page) and a
+            copied f-string could drift between them.  A ``None`` offset here
+            is NOT a contradiction and must not read as one: it means the
+            server returned MORE points than the shrunk request asked for, so
+            points were still dropped.
+            """
+            cause = (
+                f'with next_offset={next_offset!r} still live'
+                if next_offset is not None
+                else 'because the server returned more points than the request asked for'
+            )
+            return ScrollPointBudgetExhausted(
+                f'scroll of collection={collection_name!r} exhausted its point budget '
+                f'of {max_points} {cause} — the scan is truncated. Raise max_points to '
+                'walk further.',
+            )
+
         client = await self._get_async_qdrant()
         offset: Any = None
         pages = 0
@@ -1202,11 +1243,7 @@ class Mem0Backend:
                 # Enforced per-YIELD, not per-page: a server that ignores the
                 # shrunk page_limit still cannot walk the caller past its cap.
                 if max_points is not None and yielded >= max_points:
-                    raise ScrollPointBudgetExhausted(
-                        f'scroll of collection={collection_name!r} exhausted its point '
-                        f'budget of {max_points} with next_offset={next_offset!r} still '
-                        f'live — the scan is truncated. Raise max_points to walk further.',
-                    )
+                    raise _point_budget_exhausted(next_offset)
                 yield point
                 yielded += 1
 
@@ -1217,11 +1254,7 @@ class Mem0Backend:
             # The caller's own cap outranks the safety backstop when one page
             # exhausts both — it is the expected outcome, not an internal limit.
             if max_points is not None and yielded >= max_points:
-                raise ScrollPointBudgetExhausted(
-                    f'scroll of collection={collection_name!r} exhausted its point '
-                    f'budget of {max_points} with next_offset={next_offset!r} still '
-                    f'live — the scan is truncated. Raise max_points to walk further.',
-                )
+                raise _point_budget_exhausted(next_offset)
             if pages >= max_pages:
                 raise ScrollPageBudgetExhausted(
                     f'scroll of collection={collection_name!r} exhausted its page budget '
