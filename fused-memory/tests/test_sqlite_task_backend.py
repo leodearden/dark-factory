@@ -575,6 +575,43 @@ async def test_set_task_claimant_no_kwargs_is_a_noop(backend, project_root):
     assert one['heartbeat_at'] is None
 
 
+# ── set_task_claimant terminal tripwire (task 4674, PRD E-3) ───────
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('terminal_status', ['done', 'cancelled'])
+async def test_set_task_claimant_on_terminal_row_logs_error_and_still_persists(
+    backend, project_root, caplog, terminal_status,
+):
+    """A manual claimant mint onto a terminal row logs ONE ERROR tripwire but still persists.
+
+    PRD docs/prds/claimant-invariant-detection.md, contract E-3 / decision D-6:
+    observation, not refusal.
+    """
+    await backend.add_task(project_root=project_root, title='x')
+    await backend.set_task_status('1', terminal_status, project_root=project_root)
+
+    with caplog.at_level(logging.ERROR, logger='fused_memory.backends.sqlite_task_backend'):
+        await backend.set_task_claimant(
+            '1', project_root=project_root,
+            claimant_run_id='run-manual-mint',
+            heartbeat_at='2026-08-24T00:00:00+00:00',
+        )
+
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert len(errors) == 1
+    assert errors[0].message.startswith('claimant_stamped_on_terminal')
+    assert 'task_id=1' in errors[0].message
+    assert f'status={terminal_status}' in errors[0].message
+    assert 'claimant_run_id=run-manual-mint' in errors[0].message
+    assert 'tag=master' in errors[0].message
+
+    one = await backend.get_task('1', project_root=project_root)
+    assert one['claimant_run_id'] == 'run-manual-mint'
+    assert one['heartbeat_at'] == '2026-08-24T00:00:00+00:00'
+    assert one['status'] == terminal_status
+
+
 # ── set_task_status claimant extension (task 2182 step-5/6) ────────
 
 
