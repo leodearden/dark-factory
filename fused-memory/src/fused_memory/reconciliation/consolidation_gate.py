@@ -53,6 +53,7 @@ from fused_memory.memory_metadata import EXPERIMENTAL_KEY_PREFIX
 
 __all__ = [
     'GATE_METADATA_KEY',
+    'render_end_state_brief',
 ]
 
 # The Tier-C ``x_``-prefixed gate block under which a consolidation gate carries
@@ -62,3 +63,52 @@ __all__ = [
 # key passes the metadata boundary silently and generates no unknown-key census
 # line, so it needs no amendment to RESERVED_VOCABULARY_KEYS.
 GATE_METADATA_KEY = f'{EXPERIMENTAL_KEY_PREFIX}recon_consolidation_gate'
+
+
+# --------------------------------------------------------------------------- #
+# Defect 1 — the end-state brief.  Single-sourced: the filed gate's
+# description, the stage prompt section and the closure predicate's docstring
+# all read the SAME text, so the three cannot prescribe different targets.
+# --------------------------------------------------------------------------- #
+
+
+def render_end_state_brief() -> str:
+    """Render the target-shape brief a filed consolidation gate carries.
+
+    This is Defect 1's payload.  Until now
+    ``recon_self_model.render_source_completion_section`` was the entire
+    gate-filing instruction and it named no end state at all, so each gate
+    invented its own.  Reused verbatim by
+    :func:`render_consolidation_gate_section` and embedded in every gate built
+    by :func:`build_consolidation_gate_task`, so the prompt, the filed gate and
+    the closure predicate cannot drift apart.
+    """
+    return (
+        'TARGET END STATE (PRD memory-metadata-vocabulary §3 Option C, '
+        'ratified by gate 3200):\n'
+        ' 1. Split the cluster into N SHORT single-claim peers. Each peer '
+        'states ONE claim; none is a concatenation of the others.\n'
+        ' 2. Every peer carries the same `metadata.topic=<slug>`. That shared '
+        'topic — not a hand-written member list — is what makes the cluster '
+        'findable and is the only working list the closure check reads.\n'
+        ' 3. Exactly ONE peer carries `metadata.canonical: true`, and that '
+        'canonical is itself SHORT: an index/summary claim pointing at its '
+        'peers, never the concatenated body of the cluster.\n'
+        ' 4. That canonical\'s `metadata.supersedes` lists ONLY ids genuinely '
+        'deleted/absorbed. An id that is still live must not appear there.\n'
+        ' 5. Execute the change through the `consolidate_memories` tool\'s '
+        'ratified `retain` arm rather than by hand: retained ids are tagged '
+        'in place with the cluster topic and are never deleted, never given '
+        '`canonical`, never given `parent_id`. Surviving same-topic peers are '
+        'the TARGET, not residue.\n\n'
+        'THE "1 canonical + 1 appendix" ABSORBING END STATE IS RETIRED. Do not '
+        'aim for it. PRD §3 measured the inversion twice: 168c3a6b ranked '
+        '10/10 and was then deleted, and its ~9k-char replacement bbc063a7 was '
+        'ABSENT from a limit=10 window while ten short siblings ranked '
+        '0.66-0.76. Post-consolidation write rate measurably DOUBLED. The '
+        'effect is a property of entry LENGTH, not of those particular '
+        'entries — so an absorbing canonical becomes the least retrievable '
+        'member of its own cluster, and writers who cannot retrieve it keep '
+        'minting entry N+1. Absorbing the cluster into one long record '
+        'therefore defeats the consolidation it was meant to perform.'
+    )
