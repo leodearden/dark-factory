@@ -222,8 +222,11 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
        sha](#deriving-the-landed-sha) below) and use `done_provenance={"kind": "found_on_main",
        "commit": "<sha from the merge-marker search>",
        "note": "merge found already done by worker; sha confirmed via merge-marker search"}`.
-       If the search comes back empty, nothing on main cites this task — treat as **NOT
-       landed** and ABORT rather than stamping provenance.
+       If the search comes back empty, do **not** abort on that alone — you are holding a
+       server-issued `already_merged` verdict, and a fast-forward or coalesce-absorbed
+       landing carries no marker. Run the ancestry disposition in [Deriving the landed
+       sha](#deriving-the-landed-sha) and follow its arms; only its rc=1 / rc=128 arms are
+       NOT landed and ABORT.
        `merge_cancel(request_id)` is a safe no-op (entry is terminal) and may be skipped.
      a. `set_task_status(id=task_id, status="done", project_root=project_root,
         done_provenance=<shape>)`. Choose by HOW `done` was observed:
@@ -239,7 +242,10 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
           "commit": "<recovered sha>", "note": "merge completed per polled merge_status;
           sha recovered via merge-marker search"}`. A polled-done sha MUST be recovered with
           the task-scoped merge-marker search; it is never present in the merge_status
-          response. An empty search means **NOT landed** — ABORT, do not stamp.
+          response. An empty search is **not** by itself a not-landed verdict — you are
+          holding a server-issued polled `done`. Run the ancestry disposition in [Deriving
+          the landed sha](#deriving-the-landed-sha) and follow its arms; ABORT only on its
+          rc=1 / rc=128 arms.
         - **`already_merged` fast-path** and **worker-path**: handled by the sub-case bullets
           above; use the `done_provenance` shape specified there.
      b. **Restore metadata** — `set_task_status` overwrites the metadata blob, nuking
@@ -263,7 +269,10 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
        "commit": "<sha from the merge-marker search>",
        "note": "confirmed on main after unknown merge_status; sha from merge-marker search"}`
        and proceed with sub-steps a–d above.
-     - Not found (search empty) → `mcp__escalation__merge_cancel(request_id)` then **ABORT**.
+     - Search empty → not yet a verdict: run the ancestry disposition in [Deriving the
+       landed sha](#deriving-the-landed-sha). Its rc=0 arm yields a sha — proceed with
+       sub-steps a–d. Only its rc=1 / rc=128 arms are not-landed →
+       `mcp__escalation__merge_cancel(request_id)` then **ABORT**.
 
 ### Deriving the landed sha
 
@@ -274,11 +283,46 @@ main's current HEAD and never from an eyeballed listing:
 git log main --fixed-strings --grep="Merge task/<TASK_ID> into main" --max-count=1 --format=%H
 ```
 
-Non-empty → that sha IS this task's true merge commit. Empty → nothing on main cites this
-task; treat as **NOT landed** and stop, rather than stamping provenance. If the search is
-empty but the branch ref still exists, you may fall back to
-`git rev-list --ancestry-path --merges task/<TASK_ID>..main | tail -1` and verify that sha
-before stamping.
+Non-empty → that sha IS this task's true merge commit; stamp it and stop here.
+
+**An empty marker search is NOT a not-landed verdict.** Two kinds of genuinely-landed work
+carry no `Merge task/<TASK_ID> into main` marker at all: a **fast-forward / already-contained**
+landing (no merge commit is ever created), and a **coalesce-absorbed non-tip train member**,
+which is merged under the *tip* branch's subject (see merge-queue/SKILL.md's "Follow the
+superseded successor", rule 3). Aborting on an empty search alone would abandon merged work
+un-stamped — and at two of the three call sites above you are already holding a server-issued
+`done`/`already_merged` verdict, which you must not override. So resolve it with the ancestry
+check before concluding anything:
+
+```bash
+git merge-base --is-ancestor task/<TASK_ID> main; rc=$?; echo "ancestry rc=$rc"
+```
+
+- **rc=0** → landed; ancestry has proved it, so NOT-landed is ruled out. Look for a group/train
+  merge, and **verify it before stamping** — a non-empty result is not authoritative on its own:
+
+  ```bash
+  c=$(git rev-list --ancestry-path --merges task/<TASK_ID>..main | tail -1)
+  if [ -n "$c" ]; then
+      git merge-base --is-ancestor task/<TASK_ID> "$c^1"
+      echo "contained-before rc=$?"
+  fi
+  ```
+
+  `--ancestry-path task/<TASK_ID>..main` lists every merge that *descends from* this branch, so
+  once the branch is on main it also lists every unrelated merge landed afterwards, and
+  `tail -1` returns the **oldest** of those — the first unrelated task's merge. The containment
+  check on `$c`'s first parent (main just before that merge) decides: `contained-before rc=1` →
+  the branch was not in main before `$c`, so `$c` **is** the merge that brought it in — stamp
+  `{"kind": "found_on_main", "commit": "$c", "note": "absorbed into group merge; sha verified
+  by ancestry containment"}`. `contained-before rc=0` (or `$c` empty) → no merge commit exists
+  for this branch: a fast-forward landing. Stamp the branch tip,
+  `{"kind": "found_on_main", "commit": "<git rev-parse task/<TASK_ID>>", "note": "fast-forward
+  merge, no separate merge commit"}`. `kind='found_on_main'` requires `commit` and `note`, so
+  declining to stamp is not an available option on this arm.
+- **rc=1** (branch exists, not an ancestor of main), or **rc=128** (branch ref gone) *with an
+  empty marker search* → *these* are the genuine not-landed outcomes. Treat as **NOT landed**,
+  `merge_cancel(request_id)` where the call site says so, and **ABORT**.
 
 **Never** derive the sha from `git log --format=%H -1 main` <!-- provenance-guard: negative --> or by eyeballing
 `git log main --oneline -20` <!-- provenance-guard: negative -->. Neither is

@@ -509,23 +509,35 @@ All paths below operate on the **target** project (`$TARGET_PROJECT`), not dark-
    ```
 6. **Update task status**:
    ```
-   set_task_status(id="<task-id>", status="done", project_root="$TARGET_PROJECT", done_provenance={"commit": "<merge-commit-sha>"})
+   set_task_status(id="<task-id>", status="done", project_root="$TARGET_PROJECT", done_provenance={"kind": "merged", "commit": "<merge-commit-sha>"})
    ```
-   Use `{"commit": "<sha>"}` when a merge commit contains the landed work (the normal case). Derive that SHA with a **task-scoped** search, not from main's current HEAD:
+   `kind` is **required** — `_validate_done_provenance` (`fused-memory/src/fused_memory/middleware/task_interceptor.py`) rejects a kind-less blob with `done_provenance.kind is required`, and `DoneProvenance.kind` (`shared/src/shared/task_metadata.py`) has no default. Use `{"kind": "merged", "commit": "<sha>"}` when this branch supplied the merge you just performed (the normal case here); use `{"kind": "found_on_main", "commit": "<sha>", "note": "<why>"}` when the work was already on main. Derive the SHA with a **task-scoped** search, not from main's current HEAD:
 
    ```bash
    git log main --fixed-strings --grep="Merge task/<task-id> into main" --max-count=1 --format=%H
    ```
 
-   Non-empty → that SHA is this task's true merge commit. Empty, but the branch ref still exists → fall back to `git rev-list --ancestry-path --merges task/<task-id>..main | tail -1` and verify it before stamping.
+   Non-empty → that SHA is this task's true merge commit.
 
-   Empty from both → do **not** jump to "NOT landed". First settle the question with the ancestry check, because the two outcomes need opposite actions:
+   Empty, but the branch ref still exists → the branch may have been absorbed into a group/train merge under a *tip* branch's subject, which carries no marker of its own. Look for that merge, but **verify it before stamping** — a non-empty result is not authoritative on its own:
+
+   ```bash
+   c=$(git rev-list --ancestry-path --merges task/<task-id>..main | tail -1)
+   if [ -n "$c" ]; then
+       git merge-base --is-ancestor task/<task-id> "$c^1"
+       echo "contained-before rc=$?"
+   fi
+   ```
+
+   `--ancestry-path task/<task-id>..main` lists every merge that *descends from* this branch — so once the branch is on main it also lists every unrelated merge landed afterwards, and `tail -1` returns the **oldest** of those, i.e. the first unrelated task's merge. The containment check on `$c`'s first parent (main as it stood just before that merge) decides: `contained-before rc=1` → the branch was not in main before `$c`, so `$c` **is** the merge that brought it in — stamp it; `contained-before rc=0` → the branch was already in main, so `$c` is an unrelated later merge — do **not** stamp it, and continue below.
+
+   **No merge commit exists for this branch** (marker empty, and the rev-list candidate either empty or disqualified by the containment check above) → do **not** jump to "NOT landed". Settle it with the ancestry check, because the two outcomes need opposite actions:
 
    ```bash
    git merge-base --is-ancestor task/<task-id> main; rc=$?; echo "ancestry rc=$rc"
    ```
 
-   - **rc=0** → the branch **is** on main; ancestry has proved a landing, so "not landed" is ruled out. Both searches come back empty in exactly two benign cases: a fast-forward landing (no merge commit exists at all), or a merge you performed by hand in step 5 — `git merge --no-ff` writes the subject `Merge branch 'task/<task-id>'`, which the orchestrator-shaped `--grep="Merge task/<task-id> into main"` marker deliberately does not match. Stamp the commit that actually carries the work: the merge commit you just created (`git rev-parse HEAD` on main, for the step-5 manual path), or the branch tip `git rev-parse task/<task-id>` after a fast-forward. Use `{"kind": "found_on_main", "commit": "<that sha>", "note": "fast-forward merge, no separate merge commit"}` (or a note naming the manual merge). `kind='found_on_main'` **requires** `commit` — there is no note-only fallback since the post-3092 hardening — so declining to stamp is not an available option here.
+   - **rc=0** → the branch **is** on main; ancestry has proved a landing, so "not landed" is ruled out. There is no merge commit to find in exactly two benign cases: a fast-forward landing (none is ever created), or a merge you performed by hand in step 5 — `git merge --no-ff` writes the subject `Merge branch 'task/<task-id>'`, which the orchestrator-shaped `--grep="Merge task/<task-id> into main"` marker deliberately does not match. Stamp the commit that actually carries the work: the merge commit you just created (`git rev-parse HEAD` on main, for the step-5 manual path — use `{"kind": "merged", "commit": "<sha>"}`, since this branch supplied that merge), or the branch tip `git rev-parse task/<task-id>` after a fast-forward — use `{"kind": "found_on_main", "commit": "<tip sha>", "note": "fast-forward merge, no separate merge commit"}`. `kind='found_on_main'` **requires** `commit` — there is no note-only fallback since the post-3092 hardening — so declining to stamp is not an available option here.
    - **rc=1** (branch exists, not an ancestor) or **rc=128 with an empty marker search** (branch ref gone, nothing on main cites it) → *these* are the genuine not-landed outcomes. Treat as NOT landed and stop rather than stamping provenance.
 
    Do **not** read the SHA from `git log -1 --format=%H`. <!-- provenance-guard: negative --> That is main's *current HEAD*, which is this task's merge commit only when this merge happens to be the newest commit on main — on a live merge queue it usually is not, so you would record an unrelated task's merge as this one's provenance. The server's only backstop is `git merge-base --is-ancestor <sha> main`, which passes for every recent commit on main and would not catch it.

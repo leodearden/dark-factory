@@ -146,11 +146,26 @@ git merge-base --is-ancestor task/<TASK_ID> main; rc=$?; echo "ancestry rc=$rc"
 #          is this task's merge commit only when this merge happens to be the newest commit
 #          on main — on a live queue it usually is not, so you would stamp an unrelated
 #          task's sha. (git merge-base is also wrong: it gives the common ancestor, NOT the
-#          merge commit.) If the marker search is empty, fall back to
-#          `git rev-list --ancestry-path --merges task/<TASK_ID>..main | tail -1`; if that is
-#          empty too, this is NOT "not landed" — rc=0 already proved the branch IS on main.
-#          It is a fast-forward (or already-contained) landing, where no merge commit exists
-#          to find. Stamp the branch tip instead — `git rev-parse task/<TASK_ID>` (rc=0
+#          merge commit.) If the marker search is empty, a coalesce-absorbed non-tip member
+#          is merged under the TIP branch's subject and carries no marker of its own, so
+#          look for the group merge — but VERIFY it before stamping:
+#            c=$(git rev-list --ancestry-path --merges task/<TASK_ID>..main | tail -1)
+#            if [ -n "$c" ]; then
+#                git merge-base --is-ancestor task/<TASK_ID> "$c^1"
+#                echo "contained-before rc=$?"
+#            fi
+#          A non-empty $c is NOT authoritative on its own. `--ancestry-path
+#          task/<TASK_ID>..main` lists every merge DESCENDED from this branch, so once the
+#          branch is on main it also lists every UNRELATED merge landed AFTERWARDS, and
+#          `tail -1` returns the OLDEST of those — the first unrelated task's merge. The
+#          containment check on $c's FIRST PARENT (main just before that merge) decides:
+#            contained-before rc=1 → the branch was NOT in main before $c, so $c IS the
+#                                    merge that brought it in. Stamp $c (group/train case).
+#            contained-before rc=0 → already in main before $c, so $c is an unrelated later
+#                                    merge. Do NOT stamp it; fall through.
+#          Falling through means no merge commit exists for this branch — a fast-forward
+#          (or already-contained) landing. That is NOT "not landed": rc=0 already proved the
+#          branch IS on main. Stamp the branch tip — `git rev-parse task/<TASK_ID>` (rc=0
 #          guarantees the ref still exists) — with note "fast-forward merge, no separate
 #          merge commit". kind='found_on_main' REQUIRES a commit (no note-only fallback
 #          since the post-3092 hardening), so "do not stamp" is not an option on this arm;

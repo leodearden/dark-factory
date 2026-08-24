@@ -501,23 +501,42 @@ The merge procedure is iterative — don't assume one pass will be enough:
      # the numeric rc is NOT the two-outcome `&& echo` idiom banned above: it
      # prints on every path and keeps all three outcomes distinguishable. Do
      # not "tidy" it away.
-     # rc=0   → landed. Accept as done/found_on_main. Derive the sha from the SAME
-     #          exact-subject marker search the rc=128 arm below runs:
-     #          `git log main --fixed-strings --grep="Merge task/<TASK_ID> into main"
-     #          --max-count=1 --format=%H`. Empty is not "no sha": a coalesce-absorbed
-     #          non-tip member carries no marker of its own, so fall back to
-     #          `git rev-list --ancestry-path --merges task/<TASK_ID>..main | tail -1`,
-     #          the group merge commit, which IS that member's correct provenance.
-     #          Both empty is NOT "not landed" HERE: rc=0 already proved the branch IS
-     #          on main. It means a fast-forward (or already-contained) landing, where
-     #          no merge commit exists to find. Stamp the branch tip instead —
-     #          `git rev-parse task/<TASK_ID>` (rc=0 guarantees the ref still exists) —
-     #          as commit, with note "fast-forward merge, no separate merge commit".
-     #          That is the rule `orchestrator/src/orchestrator/agents/briefing.py` already
-     #          states, and `kind='found_on_main'` REQUIRES a commit (there is no
-     #          commit-less/note-only fallback), so "do not stamp" is not an option here.
-     #          Reserve "do not stamp / not landed" for the rc=1 and empty-marker rc=128
-     #          arms below, where nothing has proved a landing.
+     # rc=0   → landed. Accept as done/found_on_main. Derive the sha with the THREE-STEP
+     #          ladder below — never from main's HEAD, and never from step (2) alone.
+     #        (1) Exact-subject marker search (the same one the rc=128 arm below runs):
+     #              git log main --fixed-strings --grep="Merge task/<TASK_ID> into main" \
+     #                  --max-count=1 --format=%H
+     #            Non-empty → that IS this task's merge commit. Stamp it; stop here.
+     #        (2) Marker empty is not "no sha": a coalesce-absorbed non-tip member is
+     #            merged under the TIP branch's subject and carries no marker of its own,
+     #            so look for the group merge — but VERIFY it before stamping:
+     #              c=$(git rev-list --ancestry-path --merges task/<TASK_ID>..main | tail -1)
+     #              if [ -n "$c" ]; then
+     #                  git merge-base --is-ancestor task/<TASK_ID> "$c^1"
+     #                  echo "contained-before rc=$?"
+     #              fi
+     #            A non-empty $c is NOT authoritative on its own. `--ancestry-path
+     #            task/<TASK_ID>..main` lists every merge that is a DESCENDANT of this
+     #            branch, so once the branch is on main it also lists every UNRELATED
+     #            merge the queue landed AFTERWARDS, and `tail -1` returns the OLDEST of
+     #            those — i.e. the first unrelated task's merge. The containment check
+     #            on $c's FIRST PARENT (main as it stood just before that merge)
+     #            disambiguates:
+     #              contained-before rc=1 → the branch was NOT in main before $c, so $c IS
+     #                                      the merge that brought it in. Stamp $c. (This
+     #                                      is the group/train-merge case.)
+     #              contained-before rc=0 → the branch was ALREADY in main before $c, so $c
+     #                                      is an unrelated later merge. Fall through to (3).
+     #        (3) No merge commit exists for this branch — a fast-forward (or
+     #            already-contained) landing. Stamp the branch tip,
+     #            `git rev-parse task/<TASK_ID>` (rc=0 guarantees the ref still exists),
+     #            with note "fast-forward merge, no separate merge commit". That is the
+     #            rule `orchestrator/src/orchestrator/agents/briefing.py` already states.
+     #          Reaching (3) is NOT "not landed": rc=0 already proved the branch is on
+     #          main, and `kind='found_on_main'` REQUIRES a commit (there is no
+     #          commit-less/note-only fallback), so "do not stamp" is not an option on
+     #          this arm. Reserve it for the rc=1 and empty-marker rc=128 arms below,
+     #          where nothing has proved a landing.
      #          Do NOT use `git log --format=%H -1 main` <!-- provenance-guard: negative --> here: that is main's
      #          CURRENT HEAD, which is this task's merge commit only when this merge
      #          happens to be the newest commit on main — on a live queue it usually is
@@ -545,14 +564,17 @@ The merge procedure is iterative — don't assume one pass will be enough:
        git log main --fixed-strings --grep="Merge task/<TASK_ID> into main" \
            --max-count=1 --format=%H
        ```
-       Thread that SHA into `done_provenance={"commit": "<sha>"}`. **Do not fall back to eyeballing `git log main --oneline | head -5`** — it is not scoped to this task, so any SHA you pick from it is likely an unrelated task's merge, and the server's only provenance backstop (`git merge-base --is-ancestor <sha> main`) passes for every recent commit on main and would not catch it. If the search comes back empty, fall back to `{"note": "<explanation>"}`. Then proceed to step 8.
+       Thread that SHA into `done_provenance={"kind": "merged", "commit": "<sha>"}` — `kind` is **required** (the server rejects a kind-less blob with `done_provenance.kind is required`), and this branch supplied the merge, so `merged` is the right kind. **Do not fall back to eyeballing `git log main --oneline | head -5`** — it is not scoped to this task, so any SHA you pick from it is likely an unrelated task's merge, and the server's only provenance backstop (`git merge-base --is-ancestor <sha> main`) passes for every recent commit on main and would not catch it. If the search comes back empty, do **not** fall back to a note-only `{"note": "<explanation>"}` payload — the server rejects that too; run the [canonical ancestry check](#branch-on-main)'s three-step ladder instead and stamp whatever sha it yields. Then proceed to step 8.
      - `poll["state"] in ("conflict", "blocked", "abandoned", "unknown")` → see *Polled terminal failures* below. **On the unscoped arms (`poll_by` `"branch"` or `"task_id"`) these are UNCONFIRMED** — per the staleness guard above they may be a prior round's record for this same reused branch/task_id rather than this submission's outcome. Before acting on one, re-check `mcp__escalation__get_merge_queue()` and who owns the worktree; if this branch is still in flight, keep polling to the 20-minute ceiling instead of resubmitting on a stale failure.
      - `poll["state"] == "superseded"` → **on the `request_id` arm** (always submission-scoped) follow the train/successor directly. **On the unscoped arms (`poll_by` `"branch"` or `"task_id"`) this is UNCONFIRMED** per the staleness guard above — with a further wrinkle for a coalesce-absorbed member, where that arm's `superseded` can be permanent rather than merely stale. See *Polled terminal failures* below for the full follow-the-train procedure and why ancestry plus the two landing signals there, not re-polling this same handle, is the real resolution.
 
    *(Immediate-response failure edges — `conflict`, `blocked`, `unknown_branch`, `failed`, orchestrator-down — plus the `superseded` absorption edge above, and cancellation, are covered below.)*
 
-8. `set_task_status(id="<TASK_ID>", status="done", project_root="<PROJECT_ROOT>", done_provenance={"commit": "<sha>"})`
-   - Pass `{"commit": "<sha>"}` when the merge landed a single commit on main — thread the SHA from `result["commit"]` for an immediate terminal response, or re-derive from `git log main` for a polled terminal response (see polled-done note above). A `found_on_main` `merge_sha` is safe to stamp only **as returned by the tool** — do not substitute the branch tip or `git merge-base` output for it. Fall back to `{"note": "<one-sentence explanation>"}` for fast-forward or covered-by-sibling cases where no single commit applies.
+8. `set_task_status(id="<TASK_ID>", status="done", project_root="<PROJECT_ROOT>", done_provenance={"kind": "merged", "commit": "<sha>"})`
+   - **`kind` is required on every payload.** The server rejects a kind-less blob with `done_provenance.kind is required`, and there is no note-only payload — `found_on_main` requires **both** `commit` and `note`. So "no single commit applies" is never an escape; derive one.
+   - Pass `{"kind": "merged", "commit": "<sha>"}` when this branch supplied the merge — thread the SHA from `result["commit"]` for an immediate terminal response, or re-derive from `git log main` for a polled terminal response (see polled-done note above).
+   - Pass `{"kind": "found_on_main", "commit": "<sha>", "note": "<one-sentence explanation>"}` when the work was already on main — including the fast-forward and covered-by-sibling cases, where the sha is the branch tip (`git rev-parse task/<TASK_ID>`) or the sibling's landing commit respectively. A `found_on_main` `merge_sha` returned by the tool is safe to stamp only **as returned** — do not substitute the branch tip or `git merge-base` output for it.
+   - If you have no sha in hand, do not guess: run the [canonical ancestry check](#branch-on-main)'s three-step ladder, which yields the correct one on every landed arm.
 9. Clean up: `git worktree remove .worktrees/<TASK_ID>` and `git branch -d task/<TASK_ID>`
 
 **Merge-step failure and abandonment edges:**
@@ -578,16 +600,20 @@ The merge procedure is iterative — don't assume one pass will be enough:
   # The trailing `echo` is REQUIRED -- see the [canonical ancestry
   # check](#branch-on-main) above for why: without it, "on main" and "NOT on
   # main" print identical empty output and exit 0, indistinguishable.
-  # rc=0 (on main): proceed to step 8 with done_provenance kind='found_on_main',
-  #   commit=<landing sha from the SAME exact-subject marker search the rc=128 arm below
-  #   uses: git log main --fixed-strings --grep="Merge task/<TASK_ID> into main"
-  #   --max-count=1 --format=%H>. Empty is not "no sha": a coalesce-absorbed non-tip
-  #   member carries no marker of its own, so fall back to `git rev-list --ancestry-path
-  #   --merges task/<TASK_ID>..main | tail -1`, the group merge commit, which IS that
-  #   member's correct provenance. Both empty is NOT "not landed" HERE: rc=0 already proved
-  #   the branch IS on main, so this is a fast-forward (or already-contained) landing with no
-  #   merge commit to find. Stamp the branch tip — `git rev-parse task/<TASK_ID>` (rc=0
-  #   guarantees the ref exists) — with note "fast-forward merge, no separate merge commit";
+  # rc=0 (on main): proceed to step 8 with done_provenance kind='found_on_main' and the
+  #   landing sha derived by the THREE-STEP ladder in the [canonical ancestry
+  #   check](#branch-on-main) above — do not improvise a shorter version of it:
+  #     (1) marker search `git log main --fixed-strings
+  #         --grep="Merge task/<TASK_ID> into main" --max-count=1 --format=%H` → stamp it;
+  #     (2) marker empty → `c=$(git rev-list --ancestry-path --merges
+  #         task/<TASK_ID>..main | tail -1)`, then CONFIRM with
+  #         `git merge-base --is-ancestor task/<TASK_ID> "$c^1"` — rc=1 means $c really is
+  #         the merge that brought this branch in (stamp $c); rc=0 means $c is an
+  #         unrelated LATER merge that merely descends from this branch (do NOT stamp it);
+  #     (3) otherwise no merge commit exists → fast-forward landing: stamp the branch tip
+  #         `git rev-parse task/<TASK_ID>` with note "fast-forward merge, no separate
+  #         merge commit".
+  #   Reaching (3) is NOT "not landed": rc=0 already proved the branch IS on main, and
   #   kind='found_on_main' REQUIRES a commit, so "do not stamp" is not an available option on
   #   this arm. Reserve not-landed for rc=1 and for rc=128 with an empty marker search.
   #   Do NOT use `git log --format=%H -1 main` <!-- provenance-guard: negative --> here: that is main's CURRENT
@@ -769,16 +795,20 @@ git merge-base --is-ancestor task/<TASK_ID> main; rc=$?; echo "ancestry rc=$rc"
 # check](#branch-on-main) above for why: without it, "on main" and "NOT on
 # main" print identical empty output and exit 0, indistinguishable.
 # rc=0 (on main): treat as done; proceed to step 8 with done_provenance kind='found_on_main'
-#   and the landing sha derived exactly as the [canonical ancestry
-#   check](#branch-on-main) specifies — the exact-subject marker search
-#   `git log main --fixed-strings --grep="Merge task/<TASK_ID> into main" --max-count=1
-#   --format=%H`, falling back when it is empty to `git rev-list --ancestry-path --merges
-#   task/<TASK_ID>..main | tail -1` (the group merge commit, which is a coalesce-absorbed
-#   non-tip member's correct provenance); both empty under rc=0 means a fast-forward
-#   (or already-contained) landing, NOT "not landed" — ancestry already proved otherwise —
-#   so stamp the branch tip `git rev-parse task/<TASK_ID>` with note "fast-forward merge,
-#   no separate merge commit". kind='found_on_main' requires a commit; there is no
-#   note-only fallback, and "not landed" belongs only to the rc=1 / empty-marker rc=128 arms.
+#   and the landing sha derived by the THREE-STEP ladder in the [canonical ancestry
+#   check](#branch-on-main) — run it in full, do not shortcut it:
+#   (1) marker search `git log main --fixed-strings --grep="Merge task/<TASK_ID> into main"
+#       --max-count=1 --format=%H` → stamp it;
+#   (2) marker empty → `c=$(git rev-list --ancestry-path --merges task/<TASK_ID>..main
+#       | tail -1)`, then CONFIRM with `git merge-base --is-ancestor task/<TASK_ID> "$c^1"`:
+#       rc=1 → $c is the merge that brought this branch in, stamp it; rc=0 → $c is an
+#       unrelated later merge that merely descends from this branch, do NOT stamp it;
+#   (3) otherwise no merge commit exists → fast-forward (or already-contained) landing:
+#       stamp the branch tip `git rev-parse task/<TASK_ID>` with note "fast-forward merge,
+#       no separate merge commit".
+#   Reaching (3) is NOT "not landed" — ancestry already proved otherwise. kind='found_on_main'
+#   requires a commit; there is no note-only fallback, and "not landed" belongs only to the
+#   rc=1 / empty-marker rc=128 arms.
 #   Not `git log --format=%H -1 main` <!-- provenance-guard: negative --> — that is main's current HEAD, not this
 #   task's merge commit.
 # rc=128 (branch ref gone after a successful merge + cleanup): NOT the same as rc=1 —
