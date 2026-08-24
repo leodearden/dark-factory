@@ -217,10 +217,13 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
      - **Fast-path** (ancestor short-circuit): no `request_id`; `commit` is the ancestor sha —
        use `done_provenance={"kind": "merged", "commit": "<commit>"}`.
      - **Worker-path** (entry constructed, merge found already done): carries a `request_id`
-       but `commit` may be `null`. If `commit` is null, run `git log main --oneline -20` to
-       confirm the landed sha and use `done_provenance={"kind": "found_on_main",
-       "commit": "<sha from git log main --oneline -20>",
-       "note": "merge found already done by worker; sha confirmed via git log"}`.
+       but `commit` may be `null`. If `commit` is null, recover the landed sha with the
+       **task-scoped merge-marker search** (see [Deriving the landed
+       sha](#deriving-the-landed-sha) below) and use `done_provenance={"kind": "found_on_main",
+       "commit": "<sha from the merge-marker search>",
+       "note": "merge found already done by worker; sha confirmed via merge-marker search"}`.
+       If the search comes back empty, nothing on main cites this task — treat as **NOT
+       landed** and ABORT rather than stamping provenance.
        `merge_cancel(request_id)` is a safe no-op (entry is terminal) and may be skipped.
      a. `set_task_status(id=task_id, status="done", project_root=project_root,
         done_provenance=<shape>)`. Choose by HOW `done` was observed:
@@ -228,13 +231,15 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
           `commit` field (the merge sha) — use
           `done_provenance={"kind": "merged", "commit": "<commit field from merge_request response>"}`.
         - **Polled** (`merge_status` returned `done`): the `merge_status` terminal response
-          carries **no `commit` field** — never assume one is present. Run
-          `git log main --oneline -20` to recover the landed sha, then use
+          carries **no `commit` field** — never assume one is present. Recover the landed
+          sha with the **task-scoped merge-marker search** (see [Deriving the landed
+          sha](#deriving-the-landed-sha) below), then use
           `done_provenance={"kind": "merged", "commit": "<recovered sha>"}` (the server
           ancestor-checks it) or `done_provenance={"kind": "found_on_main",
           "commit": "<recovered sha>", "note": "merge completed per polled merge_status;
-          sha recovered from git log"}`. A polled-done sha MUST be recovered from git log;
-          it is never present in the merge_status response.
+          sha recovered via merge-marker search"}`. A polled-done sha MUST be recovered with
+          the task-scoped merge-marker search; it is never present in the merge_status
+          response. An empty search means **NOT landed** — ABORT, do not stamp.
         - **`already_merged` fast-path** and **worker-path**: handled by the sub-case bullets
           above; use the `done_provenance` shape specified there.
      b. **Restore metadata** — `set_task_status` overwrites the metadata blob, nuking
@@ -250,13 +255,45 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
      `merge_request` path; `abandoned` appears only on the polled `merge_status` path.)
 
    - **`unknown`** (e.g., after an orchestrator restart; `merge_status` carries
-     `hint="check git log main"`): fall back to `git log main --oneline -20` and check whether
-     the task's commit landed on main.
-     - Confirmed on main → success; use `done_provenance={"kind": "found_on_main",
-       "commit": "<sha confirmed on main via git log main --oneline -20>",
-       "note": "confirmed on main after unknown merge_status; sha from git log"}` and proceed
-       with sub-steps a–d above.
-     - Not found → `mcp__escalation__merge_cancel(request_id)` then **ABORT**.
+     `hint="check git log main"`): fall back to the **task-scoped merge-marker search** (see
+     [Deriving the landed sha](#deriving-the-landed-sha) below) to check whether this task's
+     merge landed on main. Do **not** eyeball `git log main --oneline -20`: it is not scoped
+     to this task, so any sha picked from it is likely an unrelated task's merge.
+     - Confirmed on main (search non-empty) → success; use `done_provenance={"kind": "found_on_main",
+       "commit": "<sha from the merge-marker search>",
+       "note": "confirmed on main after unknown merge_status; sha from merge-marker search"}`
+       and proceed with sub-steps a–d above.
+     - Not found (search empty) → `mcp__escalation__merge_cancel(request_id)` then **ABORT**.
+
+### Deriving the landed sha
+
+Every sha recorded in `done_provenance` MUST come from a **task-scoped** search, never from
+main's current HEAD and never from an eyeballed listing:
+
+```bash
+git log main --fixed-strings --grep="Merge task/<TASK_ID> into main" --max-count=1 --format=%H
+```
+
+Non-empty → that sha IS this task's true merge commit. Empty → nothing on main cites this
+task; treat as **NOT landed** and stop, rather than stamping provenance. If the search is
+empty but the branch ref still exists, you may fall back to
+`git rev-list --ancestry-path --merges task/<TASK_ID>..main | tail -1` and verify that sha
+before stamping.
+
+**Never** derive the sha from `git log --format=%H -1 main` or by eyeballing
+`git log main --oneline -20`. <!-- provenance-derivation:negative-example --> Neither is
+scoped to this task: on a live merge queue this task's merge is usually **not** the newest
+commit on main, so you would record an unrelated task's merge as this one's provenance. The
+server's only backstop is `git merge-base --is-ancestor <sha> main`, which passes for every
+recent commit on main and would not catch it.
+
+This mirrors the in-repo authority, `GitOps.find_merge_marker`
+(`orchestrator/src/orchestrator/git_ops.py:7862-7905`). `--fixed-strings` against the exact
+subject from `_merge_subject(branch, main_branch)` (`git_ops.py:1874`, canonical form
+`Merge <full-branch> into <main-branch>`) is what makes it substring-safe: `Merge task/1 into
+main` cannot match inside `Merge task/10 into main`, because the `0` falls where the pattern
+has a space. Do **not** substitute a bare `--grep="task/<TASK_ID>"` — that is BRE, not
+restricted to merge commits, and re-opens the collision.
 
 ## Merge-stage completion mode (block_class == 'merge_verify_red')
 

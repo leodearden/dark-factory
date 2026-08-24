@@ -511,7 +511,17 @@ All paths below operate on the **target** project (`$TARGET_PROJECT`), not dark-
    ```
    set_task_status(id="<task-id>", status="done", project_root="$TARGET_PROJECT", done_provenance={"commit": "<merge-commit-sha>"})
    ```
-   Use `{"commit": "<sha>"}` when a merge commit contains the landed work (the normal case — read the SHA from `git log -1 --format=%H` after the merge). Use `{"note": "<one-sentence explanation>"}` for fast-forward merges or when the work was covered by a sibling task and no single commit applies.
+   Use `{"commit": "<sha>"}` when a merge commit contains the landed work (the normal case). Derive that SHA with a **task-scoped** search, not from main's current HEAD:
+
+   ```bash
+   git log main --fixed-strings --grep="Merge task/<task-id> into main" --max-count=1 --format=%H
+   ```
+
+   Non-empty → that SHA is this task's true merge commit. Empty, but the branch ref still exists → fall back to `git rev-list --ancestry-path --merges task/<task-id>..main | tail -1` and verify it before stamping. Empty from both → nothing on main cites this task; treat as **NOT landed** and stop rather than stamping provenance.
+
+   Do **not** read the SHA from `git log -1 --format=%H`. <!-- provenance-derivation:negative-example --> That is main's *current HEAD*, which is this task's merge commit only when this merge happens to be the newest commit on main — on a live merge queue it usually is not, so you would record an unrelated task's merge as this one's provenance. The server's only backstop is `git merge-base --is-ancestor <sha> main`, which passes for every recent commit on main and would not catch it.
+
+   Use `{"note": "<one-sentence explanation>"}` for fast-forward merges or when the work was covered by a sibling task and no single commit applies.
 7. **Clean up worktree** (from inside `$TARGET_PROJECT`):
    ```bash
    git worktree remove .worktrees/<task-id>

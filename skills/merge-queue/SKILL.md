@@ -139,8 +139,16 @@ git merge-base --is-ancestor task/<TASK_ID> main; rc=$?; echo "ancestry rc=$rc"
 # on every path and keeps all three outcomes distinguishable. Do not "tidy"
 # it away.
 # rc=0   → on main. Treat as done/found_on_main — done_provenance kind='found_on_main',
-#          commit=<landing sha: git log --format=%H -1 main>
-#          (git log gives the merge commit; git merge-base gives the common ancestor, NOT it)
+#          commit=<landing sha from the SAME exact-subject marker search used by the rc=128
+#          arm below: git log main --fixed-strings
+#          --grep="Merge task/<TASK_ID> into main" --max-count=1 --format=%H>
+#          Do NOT use `git log --format=%H -1 main` here: that is main's CURRENT HEAD, which
+#          is this task's merge commit only when this merge happens to be the newest commit
+#          on main — on a live queue it usually is not, so you would stamp an unrelated
+#          task's sha. (git merge-base is also wrong: it gives the common ancestor, NOT the
+#          merge commit.) If the marker search is empty, fall back to
+#          `git rev-list --ancestry-path --merges task/<TASK_ID>..main | tail -1`; if that is
+#          empty too, nothing on main cites the task — do not stamp.
 # rc=128 → branch ref is GONE ("fatal: Not a valid object name"). This is the normal state
 #          AFTER a successful merge + cleanup — NOT "not on main". Search main for THIS
 #          branch's merge commit, by exact subject:
