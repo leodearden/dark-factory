@@ -5507,6 +5507,14 @@ _CORE_FACT_DIVERGENT = (
 )
 _CORE_FACT_DONE = 'claimant_run_id=null|heartbeat_at=null|status=done'
 
+# A record whose WHOLE-record key is exactly the one field `status`. Used to
+# show that a clause-scoped key naming only a STRICT SUBSET of its own
+# record's fields must not join this record's bucket -- a collision the
+# whole-record key would never have produced, because it names only that one
+# field to begin with.
+_LIVENESS_WEAK_WHOLE_94 = ('Point-in-time liveness check performed 2026-07-27 '
+                           'on task 94: status="in-progress".')
+
 
 class TestLivenessOneSubjectOneGroupPerMemberSet:
     """Dual keying never reports one subject TWICE over the same members.
@@ -5930,6 +5938,73 @@ class TestLivenessPartialKeyFalseGroup:
             ('94', ['done', 'ip']),
         ], 'still forms a group -- closing it is out of scope for this task'
         assert set(disclosure.values()) == {0}, 'and not a counted loss either'
+
+
+class TestLivenessClauseFragmentFalseGroup:
+    """A clause-scoped key built from a FRAGMENT of its record must never
+    manufacture a group the whole-record key could not have produced.
+
+    A clause key naming a STRICT SUBSET of the fields its own record was
+    recognised to speak about is the same "key built from a fragment of what
+    the record asserts" that `_classify_liveness_snapshot`'s survivors-only
+    refusal already forbids at the record level -- just reached through
+    clause scoping instead of an unread field. `liveness_snapshot_recurrences`
+    is an ARMED `higher_is_worse` count, so a false group here is a false
+    accretion signal, not a cosmetic one.
+    """
+
+    def test_a_fragment_clause_key_never_joins_an_unrelated_whole_record_bucket(self):
+        # (a) PREMISE, asserted first: the weak-whole record classifies for
+        # the reason this test needs it to, not because it failed to
+        # classify at all.
+        assert _classify_liveness_snapshot(_LIVENESS_WEAK_WHOLE_94) == (
+            True, 'status=in-progress',
+        ), 'the fixture must reach the collision by classifying cleanly'
+
+        # (b) THE PROJECTION. Task 94's clause in the divergent-partial
+        # record names only `status` -- a strict subset of the record's
+        # three-field vocabulary -- so it earns NO clause key. Task 96's
+        # clause names every field the record speaks about, so it keeps its
+        # clause key beside the seed. Asserting BOTH subjects is
+        # load-bearing: it makes the test fail for the fragment reason and
+        # not because clause scoping was disabled wholesale.
+        record = _memory('divergent-partial', _LIVENESS_DIVERGENT_PARTIAL_94,
+                         category=_OS, metadata={'task_id': '94'})
+
+        assert liveness_snapshot_subject_facts(record, _CORE_FACT_DIVERGENT) == {
+            '94': {_CORE_FACT_DIVERGENT},
+            '96': {_CORE_FACT_DIVERGENT, _CORE_FACT_DONE},
+        }, (
+            "94's clause names only `status`, a strict subset of the "
+            "record's {claimant_run_id, heartbeat_at, status} vocabulary, "
+            "so it must earn no clause key; 96's clause names all three "
+            "and must keep its clause key beside the seed"
+        )
+
+        # (c) THE HARM, at the level the ARMED metric counts. D is the
+        # divergent-partial record; W's WHOLE-record key is exactly the one
+        # field 94's clause in D names. Pre-fix, D's clause key for 94
+        # (`status=in-progress`) joins W's whole-record bucket even though
+        # D's own record asserts two more fields about 94 that W says
+        # nothing about.
+        corpus = [
+            _dated('D', _LIVENESS_DIVERGENT_PARTIAL_94, _TS_94_JUL24,
+                   category=_OS, metadata={'task_id': '94'}),
+            _dated('W', _LIVENESS_WEAK_WHOLE_94, _TS_REVERIFY,
+                   category=_OS, metadata={'task_id': '94'}),
+        ]
+
+        groups, disclosure = find_liveness_snapshot_recurrences(corpus)
+
+        assert groups == [], (
+            "a subject named in a clause that omits two of its record's "
+            'three fields must not join an unrelated record whose whole '
+            'assertion is that one field'
+        )
+        assert set(disclosure.values()) == {0}, (
+            'the gate drops an ADDED key while the unconditional seed '
+            'stays, so nothing is vacated and no counter moves'
+        )
 
 
 # The plan keys that existed before task 3098. Pinned so an additive change
