@@ -16391,8 +16391,18 @@ Update the plan to address the blocking issues. You may add new steps to the `st
 
         Three-way decision based on scheduler status and cancel-event state:
 
-        1. ``status in TERMINAL_STATUSES`` → ``DONE``
-           A human marked the task done out-of-band; exit cleanly.
+        1. ``status in TERMINAL_STATUSES`` → the OBSERVED terminal
+           (``DONE`` for a ``done`` row, ``CANCELLED`` for a ``cancelled``
+           one), via :meth:`_observed_terminal_outcome`.
+           A human resolved the task out-of-band; exit cleanly, reporting
+           which terminal it actually was.  Collapsing both onto ``DONE``
+           was not merely imprecise: ``_OUTCOME_ALLOWED['done'] == {DONE}``,
+           so a DONE exit against a ``cancelled`` row fails ``run()``'s SM-2
+           consistency assertion, and the completed tally (``outcome ==
+           DONE``) counted a cancellation as a completion.  The CANCELLED
+           branch also completes SM-1 terminal absorption — though on this
+           path ``_finalise_cancellation`` has already entered CANCELLED, so
+           the mapper's ``is_terminal()`` guard makes it a no-op here.
 
         2. ``self._cancel_event.is_set()`` (pending soft-cancel, non-terminal)
            → ``SOFT_CANCELLED``
@@ -16437,7 +16447,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             f'scheduler status={status!r}'
         )
         if status in TERMINAL_STATUSES:
-            return WorkflowOutcome.DONE
+            return self._observed_terminal_outcome(status)
         if self._cancel_event.is_set():
             # No status write: release_workflow owns the park that follows a
             # SOFT_CANCELLED exit, and writing here would race it.
