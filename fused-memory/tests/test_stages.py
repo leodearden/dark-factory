@@ -1394,11 +1394,14 @@ class TestDoneProvenanceSection:
 
           1. ``single`` — adds a.txt + b.txt (a genuine single-parent commit,
              used to pin ``--first-parent -m`` as a no-op on non-merge commits).
-          2. a ``feature`` branch off commit 1 adds feature.py; main then
-             merges it via ``git merge --no-ff`` — recorded as ``merge``.
-             Plain ``git show --name-only`` reports NOTHING for this commit
-             (git's combined diff is empty for a clean merge); this is the
-             fixture that reproduces the Stage-2 provenance bug.
+          2. a ``feature`` branch off commit 1 adds feature.py plus
+             extra_1.py..extra_4.py (five files total, so max_files
+             truncation is reachable for merge provenance — see
+             test_merge_commit_file_list_respects_max_files_truncation);
+             main then merges it via ``git merge --no-ff`` — recorded as
+             ``merge``. Plain ``git show --name-only`` reports NOTHING for
+             this commit (git's combined diff is empty for a clean merge);
+             this is the fixture that reproduces the Stage-2 provenance bug.
 
         Mirrors the branch/merge sequence in
         fused-memory/tests/test_audit_found_on_main_provenance.py::_build_test_repo,
@@ -1430,6 +1433,8 @@ class TestDoneProvenanceSection:
 
         _git('checkout', '-q', '-b', 'feature')
         (path / 'feature.py').write_text('feature = 1\n')
+        for i in range(1, 5):
+            (path / f'extra_{i}.py').write_text(f'extra_{i} = 1\n')
         _git('add', '-A')
         _git('commit', '-q', '--no-verify', '-m', 'feat: add feature')
         _git('checkout', '-q', 'main')
@@ -1696,6 +1701,36 @@ class TestDoneProvenanceSection:
             ProjectRoot(str(tmp_path / 'nonexistent')), shas['merge'], max_files=50, max_chars=2000,
         )
         assert result == ''
+
+    @pytest.mark.asyncio
+    async def test_merge_commit_file_list_respects_max_files_truncation(self, tmp_path):
+        """max_files truncation, now REACHABLE for merge commits for the
+        first time — previously a merge yielded zero files, so max_files /
+        max_chars could never fire for one. Real merges are large enough to
+        matter (c7dcc4f9d4 brings 47 files against the caller's defaults of
+        max_files_per_task=50 / max_chars_per_task=2000,
+        _render_done_provenance_section), so the truncation path is now
+        genuinely live for merge provenance and must keep working.
+
+        The merge fixture brings in 5 files (feature.py + extra_1..4.py).
+        With a deliberately small max_files=2, exactly 2 entries must be
+        listed and the block must end with a correctly-counted
+        `... (N more)` marker — pinning that the marker isn't silently
+        dropped now that it can actually fire for a merge.
+        """
+        shas = self._init_repo_with_merge(tmp_path)
+
+        block = await _git_show_name_only(
+            ProjectRoot(str(tmp_path)), shas['merge'], max_files=2, max_chars=2000,
+        )
+
+        after_label = block.split('files:', 1)[1]
+        raw_lines = [ln.strip() for ln in after_label.splitlines() if ln.strip()]
+        more_markers = [ln for ln in raw_lines if ln.startswith('...')]
+        file_lines = [ln for ln in raw_lines if not ln.startswith('...')]
+
+        assert len(file_lines) == 2
+        assert more_markers == ['... (3 more)']
 
 
 class BaseStageValidationTest:
