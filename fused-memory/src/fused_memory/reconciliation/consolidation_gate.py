@@ -49,10 +49,18 @@ leaf module with a regression test.  Nothing here may import
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from typing import Any
+
 from fused_memory.memory_metadata import EXPERIMENTAL_KEY_PREFIX
 
 __all__ = [
+    'EXIT_CLOSED',
+    'EXIT_NOT_CLOSED',
     'GATE_METADATA_KEY',
+    'ClosureVerdict',
+    'evaluate_closure',
     'render_end_state_brief',
 ]
 
@@ -112,3 +120,174 @@ def render_end_state_brief() -> str:
         'minting entry N+1. Absorbing the cluster into one long record '
         'therefore defeats the consolidation it was meant to perform.'
     )
+
+
+# --------------------------------------------------------------------------- #
+# Defect 2 — the closure predicate.
+# --------------------------------------------------------------------------- #
+
+#: Exit-code contract, shared by the ``set_task_status`` seam and by
+#: ``scripts/check_consolidation_closure.py`` so the two can never disagree
+#: about what a verdict MEANS.  Derived from ``closed`` in exactly one place
+#: (:func:`_verdict`); nothing else may construct a :class:`ClosureVerdict`.
+EXIT_CLOSED = 0
+EXIT_NOT_CLOSED = 1
+
+
+@dataclass(frozen=True)
+class ClosureVerdict:
+    """The result of asking "is this topic cluster in the Option-C end state?".
+
+    ``reasons`` are STRUCTURED entries (``{'code', 'ids', 'detail'}``), not
+    bare prose, so the interceptor refusal dict and the operator CLI can each
+    render them their own way from one source.  ``waived`` echoes every audited
+    ``considered_and_kept`` entry that actually suppressed a reason, so a
+    waiver is visible in the verdict rather than silently applied.
+    """
+
+    closed: bool
+    reasons: tuple[dict[str, Any], ...]
+    exit_code: int
+    topic: str
+    message: str
+    waived: tuple[dict[str, Any], ...] = ()
+
+
+def _reason(code: str, *, ids: Sequence[Any] = (), detail: str = '') -> dict[str, Any]:
+    """One structured refusal entry.  ``ids`` NAMES the offenders."""
+    return {'code': code, 'ids': [str(i) for i in ids], 'detail': detail}
+
+
+def _verdict(
+    topic: str,
+    reasons: Sequence[dict[str, Any]],
+    *,
+    waived: Sequence[dict[str, Any]] = (),
+    message: str = '',
+) -> ClosureVerdict:
+    """THE single home of the ``closed`` → ``exit_code`` derivation.
+
+    Kept in one place so the boolean and the exit code cannot drift apart:
+    everything that builds a verdict goes through here.
+    """
+    frozen_reasons = tuple(reasons)
+    closed = not frozen_reasons
+    if not message:
+        if closed:
+            message = (
+                f'Topic {topic!r} is in the Option-C end state: one canonical '
+                'over its same-topic peers, nothing claimed-absorbed still live.'
+            )
+        else:
+            codes = ', '.join(sorted({r['code'] for r in frozen_reasons}))
+            message = (
+                f'Topic {topic!r} is NOT closed: {codes}. See reasons for the '
+                'offending ids.'
+            )
+    return ClosureVerdict(
+        closed=closed,
+        reasons=frozen_reasons,
+        exit_code=EXIT_CLOSED if closed else EXIT_NOT_CLOSED,
+        topic=topic,
+        message=message,
+        waived=tuple(waived),
+    )
+
+
+def _payload_meta(payload: Any) -> Mapping[str, Any]:
+    """The metadata mapping of a scrolled payload, defensively.
+
+    Never raises on a malformed row: this predicate's job is to REPORT
+    malformedness, and a predicate that dies on bad input blocks the very
+    gates it exists to adjudicate.
+    """
+    if not isinstance(payload, Mapping):
+        return {}
+    meta = payload.get('metadata')
+    return meta if isinstance(meta, Mapping) else {}
+
+
+def _payload_id(payload: Any) -> str:
+    if not isinstance(payload, Mapping):
+        return ''
+    value = payload.get('id')
+    return str(value) if value is not None else ''
+
+
+def evaluate_closure(
+    gate_block: Any,
+    *,
+    members: Sequence[Any],
+    scroll_total: int | None,
+    scroll_truncated: bool,
+    scroll_available: bool,
+    unstamped_live_ids: Sequence[str] = (),
+) -> ClosureVerdict:
+    """Decide whether a consolidation gate's topic cluster may be CLOSED.
+
+    PURE — no I/O.  *members* are payloads already scrolled by the caller
+    (``{'id', 'created_at', 'metadata'}``, the shape
+    ``MemoryService.get_memories_by_metadata`` returns); the completeness of
+    that scroll is disclosed by *scroll_total* / *scroll_truncated* /
+    *scroll_available*, which are REQUIRED arguments precisely so a caller
+    cannot forget to disclose a partial view.
+
+    THE CENTRAL CORRECTNESS PROPERTY — MEMBERSHIP.  A live entry carrying the
+    gate's ``metadata.topic`` is a legitimate Option-C PEER and is NEVER a
+    refusal on membership grounds.  Under PRD §3 Option C (ratified by gate
+    3200) the target end state is *N short single-claim peers sharing one
+    topic, exactly one canonical*, so those peers are the deliverable, not
+    residue; "regrowth" of same-topic peers is a category error under C (PRD
+    §3 D9a).  A predicate that refused on peer count would make every
+    correctly executed consolidation permanently uncloseable — which is also
+    why enforcing here subsumes task 3084's proposed auto-close by
+    construction.
+
+    It therefore refuses ONLY on cluster malformedness:
+
+    * ``no_canonical`` / ``multiple_canonicals`` — the canonical count is not
+      exactly one.  Canonical is ``meta.get('canonical') is True``, a strict
+      IDENTITY check, single-sourcing the meaning with
+      ``services/topic_anchor.py::select_canonical_payload``; truthiness would
+      admit an int ``1`` (``1 == True`` in Python) and let the read path and
+      this predicate disagree about what canonical means.
+
+    Every offender is collected rather than short-circuited on the first,
+    matching ``server/consolidation.py::validate_consolidate_args``' convention,
+    so a curator gets one complete list instead of N refuse-fix-retry rounds.
+    """
+    block = gate_block if isinstance(gate_block, Mapping) else {}
+    topic = str(block.get('topic') or '')
+
+    reasons: list[dict[str, Any]] = []
+
+    # --- canonical invariant: exactly one strictly-canonical member -------- #
+    canonical_ids = [
+        _payload_id(p) for p in members if _payload_meta(p).get('canonical') is True
+    ]
+    if not canonical_ids:
+        reasons.append(
+            _reason(
+                'no_canonical',
+                detail=(
+                    f'No member of topic {topic!r} carries '
+                    "`metadata.canonical: true` (strict boolean). Option C "
+                    'requires exactly one canonical index claim over the peers.'
+                ),
+            )
+        )
+    elif len(canonical_ids) > 1:
+        reasons.append(
+            _reason(
+                'multiple_canonicals',
+                ids=canonical_ids,
+                detail=(
+                    f'{len(canonical_ids)} members of topic {topic!r} carry '
+                    '`metadata.canonical: true`; Option C permits exactly one. '
+                    'Per-topic uniqueness (3198) ships warn-mode-first, so '
+                    'duplicates land through ordinary writes.'
+                ),
+            )
+        )
+
+    return _verdict(topic, reasons)
