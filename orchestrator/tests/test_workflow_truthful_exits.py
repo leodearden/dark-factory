@@ -389,3 +389,64 @@ async def test_warm_lane_requeue_on_cancelled_row_returns_cancelled(tmp_path: Pa
 
     assert report.outcome == WorkflowOutcome.CANCELLED
     assert wf.machine.state is WorkflowState.CANCELLED
+
+
+# ---------------------------------------------------------------------------
+# Boundary #12b — the soft-cancel spurious-wakeup fallback re-pends the row
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestSoftCancelFallbackRepends:
+    """``_handle_soft_cancel``'s three-way decision table, status-write edition.
+
+    Only case 3 (the spurious-wakeup REQUEUED fallback) changes: it must now
+    write ``pending`` first, for the same reason as the warm-lane clause —
+    returning REQUEUED on an ``in-progress`` row hands the harness slot
+    ``finally`` a claimant-less mid-flight row to strand.  Cases 1 and 2 are
+    negative controls and must not move.
+    """
+
+    def _make(self, tmp_path: Path, *, status: str) -> TaskWorkflow:
+        sched = FakeScheduler()
+        wf = _make_workflow(tmp_path=tmp_path, scheduler=sched)
+        sched.statuses[wf.task_id] = [status]
+        return wf
+
+    async def test_spurious_wakeup_repends_before_requeued(self, tmp_path: Path):
+        """Case 3: non-terminal + cancel_event NOT set → ``pending`` then REQUEUED."""
+        wf = self._make(tmp_path, status='in-progress')
+        assert not wf._cancel_event.is_set()
+
+        outcome = await wf._handle_soft_cancel('merge')
+
+        assert outcome == WorkflowOutcome.REQUEUED
+        assert wf.scheduler.statuses[wf.task_id][-1] == 'pending', (  # type: ignore[attr-defined]
+            'the spurious-wakeup fallback must re-pend before exiting; '
+            f'history={wf.scheduler.statuses[wf.task_id]!r}'  # type: ignore[attr-defined]
+        )
+
+    async def test_soft_cancelled_writes_no_status(self, tmp_path: Path):
+        """Negative control, case 2: SOFT_CANCELLED writes NOTHING.
+
+        ``release_workflow`` owns that park (it always follows a
+        SOFT_CANCELLED exit with an explicit ``set_task_status``), so a write
+        here would double-write and race the human-initiated takeover.
+        """
+        wf = self._make(tmp_path, status='in-progress')
+        wf._cancel_event.set()
+
+        outcome = await wf._handle_soft_cancel('merge')
+
+        assert outcome == WorkflowOutcome.SOFT_CANCELLED
+        assert wf.scheduler.statuses[wf.task_id] == ['in-progress']  # type: ignore[attr-defined]
+
+    async def test_terminal_done_writes_no_pending(self, tmp_path: Path):
+        """Negative control, case 1: a ``done`` row exits DONE with no write."""
+        wf = self._make(tmp_path, status='done')
+        wf._cancel_event.set()  # terminal wins over the event
+
+        outcome = await wf._handle_soft_cancel('merge')
+
+        assert outcome == WorkflowOutcome.DONE
+        assert wf.scheduler.statuses[wf.task_id] == ['done']  # type: ignore[attr-defined]
