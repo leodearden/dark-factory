@@ -4247,6 +4247,27 @@ class TaskKnowledgeSync(BaseStage):
                 corroboration.corroborated, corroboration.corroborated,
             )
 
+        # Loud degradation (task 3051): a record that could not be confirmed
+        # never raises the counter, so the repair task 3046 would have made is
+        # WITHHELD.  Withholding it silently would trade one invisible failure
+        # (an inflated counter) for another (a lost repair), so report it —
+        # under an event name distinct from the undercount repair above, and
+        # with the split spelled out, so an operator can tell "the agent
+        # invented records" (uncorroborated) from "we could not check"
+        # (unresolvable: no project root to ask against, or no taskmaster).
+        shortfall = corroboration.uncorroborated + corroboration.unresolvable
+        if shortfall:
+            logger.warning(
+                'reconciliation.stage2_task_created_records_uncorroborated: run_id=%s '
+                'project_id=%s %d of %d structurally-valid task_created_records could not '
+                'be confirmed to exist via get_task '
+                '(uncorroborated=%d unresolvable=%d) — those records did NOT raise '
+                'tasks_created, which stands at %r.',
+                run_id, self.project_id, shortfall, observed,
+                corroboration.uncorroborated, corroboration.unresolvable,
+                report.stats['tasks_created'],
+            )
+
     async def _maybe_queue_briefing_refresh_tasks(self, run_id: str = '') -> None:
         """Best-effort: queue 'Refresh briefing' tasks for each briefing-known-gaps mismatch.
 
