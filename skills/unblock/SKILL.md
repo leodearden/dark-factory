@@ -501,7 +501,19 @@ The merge procedure is iterative — don't assume one pass will be enough:
      # the numeric rc is NOT the two-outcome `&& echo` idiom banned above: it
      # prints on every path and keeps all three outcomes distinguishable. Do
      # not "tidy" it away.
-     # rc=0   → landed. Accept as done/found_on_main.
+     # rc=0   → landed. Accept as done/found_on_main. Derive the sha from the SAME
+     #          exact-subject marker search the rc=128 arm below runs:
+     #          `git log main --fixed-strings --grep="Merge task/<TASK_ID> into main"
+     #          --max-count=1 --format=%H`. Empty is not "no sha": a coalesce-absorbed
+     #          non-tip member carries no marker of its own, so fall back to
+     #          `git rev-list --ancestry-path --merges task/<TASK_ID>..main | tail -1`,
+     #          the group merge commit, which IS that member's correct provenance.
+     #          Both empty → nothing on main cites this task; do not stamp a sha.
+     #          Do NOT use `git log --format=%H -1 main` <!-- provenance-guard: negative --> here: that is main's
+     #          CURRENT HEAD, which is this task's merge commit only when this merge
+     #          happens to be the newest commit on main — on a live queue it usually is
+     #          not, so you would stamp an unrelated task's sha. (git merge-base is also
+     #          wrong: it gives the common ancestor, NOT the merge commit.)
      # rc=1   → genuinely not on main. Keep polling / resubmit, per the arm.
      # rc=128 → branch ref is GONE ("fatal: Not a valid object name"). This is the
      #          normal state AFTER a successful merge + cleanup — it is NOT "not on
@@ -558,8 +570,18 @@ The merge procedure is iterative — don't assume one pass will be enough:
   # check](#branch-on-main) above for why: without it, "on main" and "NOT on
   # main" print identical empty output and exit 0, indistinguishable.
   # rc=0 (on main): proceed to step 8 with done_provenance kind='found_on_main',
-  #   commit=<landing sha: git log --format=%H -1 main>
-  #   (git log gives the merge commit; git merge-base gives the common ancestor, NOT the merge commit)
+  #   commit=<landing sha from the SAME exact-subject marker search the rc=128 arm below
+  #   uses: git log main --fixed-strings --grep="Merge task/<TASK_ID> into main"
+  #   --max-count=1 --format=%H>. Empty is not "no sha": a coalesce-absorbed non-tip
+  #   member carries no marker of its own, so fall back to `git rev-list --ancestry-path
+  #   --merges task/<TASK_ID>..main | tail -1`, the group merge commit, which IS that
+  #   member's correct provenance. Both empty → nothing on main cites this task; do NOT
+  #   stamp a sha.
+  #   Do NOT use `git log --format=%H -1 main` <!-- provenance-guard: negative --> here: that is main's CURRENT
+  #   HEAD, which is this task's merge commit only when this merge happens to be the
+  #   newest commit on main — on a live queue it usually is not, so you would stamp an
+  #   unrelated task's sha. (git merge-base is also wrong: it gives the common ancestor,
+  #   NOT the merge commit.)
   # rc=128 (branch ref gone — already cleaned up after a successful merge): do NOT read
   #   this as "not on main". Run the exact-subject merge-marker search from the canonical
   #   check above:
@@ -734,6 +756,14 @@ git merge-base --is-ancestor task/<TASK_ID> main; rc=$?; echo "ancestry rc=$rc"
 # check](#branch-on-main) above for why: without it, "on main" and "NOT on
 # main" print identical empty output and exit 0, indistinguishable.
 # rc=0 (on main): treat as done; proceed to step 8 with done_provenance kind='found_on_main'
+#   and the landing sha derived exactly as the [canonical ancestry
+#   check](#branch-on-main) specifies — the exact-subject marker search
+#   `git log main --fixed-strings --grep="Merge task/<TASK_ID> into main" --max-count=1
+#   --format=%H`, falling back when it is empty to `git rev-list --ancestry-path --merges
+#   task/<TASK_ID>..main | tail -1` (the group merge commit, which is a coalesce-absorbed
+#   non-tip member's correct provenance); both empty → do NOT stamp a sha.
+#   Not `git log --format=%H -1 main` <!-- provenance-guard: negative --> — that is main's current HEAD, not this
+#   task's merge commit.
 # rc=128 (branch ref gone after a successful merge + cleanup): NOT the same as rc=1 —
 #   run the merge-marker search from the canonical check above before concluding anything
 # rc=1 (not on main): the merge did not land; decide whether to resubmit or discard
