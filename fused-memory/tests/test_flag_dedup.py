@@ -2729,6 +2729,106 @@ class TestConfirmTaskPresent:
 
 
 # ---------------------------------------------------------------------------
+# task-3051 step-1: safe_get_task (RED tests)
+# ---------------------------------------------------------------------------
+
+
+class TestSafeGetTask:
+    """RED tests for the module-level ``safe_get_task`` (task 3051 step-1).
+
+    ``safe_get_task(taskmaster, task_id, project_root)`` is the single shared
+    one-task fetch every cross-project corroboration path routes through: it
+    returns the raw ``taskmaster.get_task`` result untouched on success and
+    normalises ANY exception to ``{'error': str(exc), 'error_type':
+    type(exc).__name__}``, so ``confirm_task_present`` / ``confirm_task_absent``
+    classify the raised-exception path exactly as they classify the MCP
+    wrapper's own error-dict path. That normalisation is also what lets every
+    caller keep using a PLAIN ``asyncio.gather``.
+
+    It is PUBLIC (no leading underscore) because task 3051 adds a third caller
+    outside this module — ``task_knowledge_sync._corroborate_record_keys`` —
+    and a fourth private copy is exactly what this helper exists to prevent.
+    """
+
+    @pytest.mark.asyncio
+    async def test_returns_task_record_unchanged(self):
+        """A successful task-record result passes through byte-identical."""
+        from fused_memory.reconciliation.flag_dedup import safe_get_task
+
+        record = {'id': '3045', 'title': 'A real task', 'status': 'pending'}
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(return_value=record)
+
+        result = await safe_get_task(taskmaster, '3045', '/repo/df')
+
+        assert result is record
+        assert flag_dedup.confirm_task_present(result) is True
+
+    @pytest.mark.asyncio
+    async def test_returns_error_dict_unchanged(self):
+        """A RETURNED error dict is passed through untouched, not re-wrapped."""
+        from fused_memory.reconciliation.flag_dedup import safe_get_task
+
+        error_dict = {
+            'error': 'TASKMASTER_TOOL_ERROR: No tasks found for ID(s): 9999',
+            'error_type': 'TaskmasterError',
+        }
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(return_value=error_dict)
+
+        result = await safe_get_task(taskmaster, '9999', '/repo/df')
+
+        assert result is error_dict
+        assert flag_dedup.confirm_task_absent(result) is True
+
+    @pytest.mark.asyncio
+    async def test_forwards_task_id_and_project_root_positionally(self):
+        """task_id and project_root are forwarded POSITIONALLY, in that order."""
+        from fused_memory.reconciliation.flag_dedup import safe_get_task
+
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(return_value={'id': '7'})
+
+        await safe_get_task(taskmaster, 7, '/repo/other')
+
+        taskmaster.get_task.assert_awaited_once_with(7, '/repo/other')
+
+    @pytest.mark.asyncio
+    async def test_normalises_not_found_exception_to_absent_error_dict(self):
+        """A RAISED TaskmasterError carrying the canonical not-found phrase
+        normalises to a dict that ``confirm_task_absent`` classifies exactly as
+        it classifies the returned error-dict path."""
+        from fused_memory.reconciliation.flag_dedup import safe_get_task
+
+        exc = TaskmasterError('TASKMASTER_TOOL_ERROR', 'No tasks found for ID(s): 9999')
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(side_effect=exc)
+
+        result = await safe_get_task(taskmaster, '9999', '/repo/df')
+
+        assert result == {'error': str(exc), 'error_type': 'TaskmasterError'}
+        assert flag_dedup.confirm_task_absent(result) is True
+        assert flag_dedup.confirm_task_present(result) is False
+
+    @pytest.mark.asyncio
+    async def test_normalises_generic_exception_to_inconclusive_error_dict(self):
+        """A generic exception normalises to the same shape and is INCONCLUSIVE:
+        neither classifier fires, so it can neither corroborate presence nor
+        confirm absence."""
+        from fused_memory.reconciliation.flag_dedup import safe_get_task
+
+        exc = RuntimeError('backend down')
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(side_effect=exc)
+
+        result = await safe_get_task(taskmaster, '3045', '/repo/df')
+
+        assert result == {'error': 'backend down', 'error_type': 'RuntimeError'}
+        assert flag_dedup.confirm_task_present(result) is False
+        assert flag_dedup.confirm_task_absent(result) is False
+
+
+# ---------------------------------------------------------------------------
 # Step 9: filter_false_absence_flags (RED tests)
 # ---------------------------------------------------------------------------
 
