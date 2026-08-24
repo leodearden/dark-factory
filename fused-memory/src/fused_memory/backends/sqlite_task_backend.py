@@ -2249,7 +2249,12 @@ class SqliteTaskBackend:
                 )
             row_status = row[1]
 
-            if row_status in TERMINAL:
+            # Gate on NULL-ness, not truthiness: an empty-string claimant is
+            # non-NULL and is an anomalous mint worth observing.
+            stamps_non_null_claimant = (
+                claimant_run_id is not _UNSET and claimant_run_id is not None
+            )
+            if stamps_non_null_claimant and row_status in TERMINAL:
                 logger.error(
                     'claimant_stamped_on_terminal: set_task_claimant stamped a claimant '
                     'onto a terminal row — task_id=%s status=%s claimant_run_id=%s '
