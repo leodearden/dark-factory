@@ -1915,6 +1915,8 @@ class VerifyRunnerPool:
         attempt: int = 0,
         depth: int | None = None,
         speculative: bool | None = None,
+        chain_items: int = 1,
+        chain_build_ms: int | None = None,
     ) -> VerifyResult:
         """Run the verify bundle and emit a merge_verify event.
 
@@ -1929,6 +1931,45 @@ class VerifyRunnerPool:
         per-event schema branching.  Bare/legacy callers that omit both
         kwargs get ``None`` for each, which is byte-identical to pre-2340
         behaviour aside from the two extra always-present keys.
+
+        ``chain_items`` (task 3185, PRD γ decision 8) is the **count, in
+        CHAIN-ITEM units, of the items contained in the tree this verify
+        actually exercised** — the dispatching item is chain item #1 and each
+        chained successor actually built adds one.  It is deliberately
+        frontier-INDEPENDENT: a verify that chained nothing is 1 however many
+        other verifies are in flight, which is what makes ``chain_items >= 2``
+        a sound deep-verify discriminator.  It defaults to ``1``, deliberately
+        NOT to ``None`` the way ``depth``/``speculative`` do, for two
+        reasons.  (1) Semantics: a
+        count of items in a verified tree has a smallest TRUTHFUL value of
+        1 — every merge verify exercises at least the one item it was created
+        for — so there is no "absent" state to represent, and ``None`` would
+        be a lie rather than a missing signal.  (2) Contract: the PRD requires
+        the field on EVERY merge verify, and several callers thread no
+        telemetry kwargs at all (``merge_shadow.py:1254``/``:1368``); a
+        ``None`` default would emit ``chain_items: null`` for exactly those
+        and break both the contract and η1's reader
+        (``scripts/merge-deep-canary-predicate.sh``).
+
+        ``chain_build_ms`` (task 3185 amend) is the wall-clock cost of the
+        deep chain build that produced this verify's tree, in milliseconds.
+        Unlike ``chain_items`` it DOES default to ``None``, and correctly so:
+        a verify that chained nothing paid no build, so there is a genuine
+        "absent" state to represent and 0 would be a lie.  It is emitted
+        always-present-but-nullable for the same reason ``depth`` is — a
+        reader does a plain ``data.get('chain_build_ms')`` with no
+        per-event schema branching.  It exists because the build is awaited
+        INLINE on the merge worker's dispatch path, so it is a per-round
+        DISPATCH STALL (no head can be finalized or landed while it runs) that
+        must never be mistaken for verify time; η1 reads it alongside
+        drain-time.  Non-``None`` implies ``chain_items >= 2``.
+
+        ``chain_items`` SUPERSEDES ``depth`` as the honest depth signal: a
+        firing speculation probe (task 2359) relabels ``depth`` into an
+        attribution fact about a stack that was never verified, whereas
+        ``chain_items`` is derived from the tree that actually ran.  See the
+        ``merge_verify`` doc-comment in ``event_store.py`` for the full field
+        note.
 
         Fail-safe (PRD §A Invariant 2 / D5): if the selected runner raises
         RunnerUnavailable, dispatch falls back to the local runner (if
@@ -2036,6 +2077,11 @@ class VerifyRunnerPool:
                     'attempt': attempt,
                     'depth': depth,
                     'speculative': speculative,
+                    # task 3185 (PRD γ): 1-indexed count of items in the tree
+                    # actually verified -- always >= 1, never None. See
+                    # dispatch()'s docstring for why the default is 1.
+                    'chain_items': chain_items,
+                    'chain_build_ms': chain_build_ms,
                     # task 2837 (PRD verify-retry-failed-only D5): retry_scope +
                     # retry_subset_sizes — always-present (None for a full/legacy
                     # verify), derived from the D2 failed-only contract carried in

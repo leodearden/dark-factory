@@ -1203,6 +1203,17 @@ class ChainResult:
       expected outcomes and are deliberately NOT collapsed into it, so ε's
       deep-fail reader is not inflated with non-faults.
     * ``lane`` / ``lane_warm`` — the ONE scratch worktree holding ``tip``.
+    * ``build_ms`` — wall-clock milliseconds the build cost, stamped by γ's
+      caller (``_deep_chain_placement``) rather than by ``build_chain``
+      itself, so it measures the FULL stall the dispatch loop pays: lane
+      acquisition, the sequential merges, and the ``asyncio.timeout`` wrapper's
+      own overhead.  ``None`` on any result ``build_chain`` returned directly
+      to a caller that did not stamp it.  γ emits it as the ``chain_build_ms``
+      field on the same ``merge_verify`` event that carries ``chain_items``,
+      because the build is awaited INLINE on the dispatch path: for its whole
+      duration ``_verifier_loop`` cannot run FINALIZE-HEAD, and that per-round
+      stall must be attributable to the chain rather than misread as verify
+      time (see the Caller-cost note on ``build_chain``).
 
     **Decision #4 — the ``truncated_at`` item MUST NOT have any outcome
     emitted for it.**  A chain conflict at position j may be a conflict with
@@ -1225,10 +1236,17 @@ class ChainResult:
     truncated_reason: str | None = None
     lane: Path | None = None
     lane_warm: bool = False
+    build_ms: int | None = None
 
     @property
     def depth(self) -> int:
-        """Number of chained links — the value γ emits as ``chain_items``."""
+        """Number of chained links — items ADDITIONAL to the dispatching one.
+
+        Off by one from the ``chain_items`` telemetry field on purpose: the
+        dispatching item is chain item #1 and is not a link, so γ emits
+        ``1 + depth`` (merge_queue.py, ``_run_inflight_verify``'s chain arm).
+        A 2-link chain is ``depth == 2`` and ``chain_items == 3``.
+        """
         return len(self.links)
 
 
@@ -1432,6 +1450,18 @@ class InflightEntry:
     verify_result  : set when the verify has completed (pass=None; fail=VerifyResult)
     status         : optional sentinel string ('DROPPED', 'REQUEUED', 'RUNNER_UNAVAILABLE')
                      returned by _run_inflight_verify to signal special handling by _finalize_inflight
+    chain          : the :class:`ChainResult` this dispatch's verify was
+                     REDIRECTED onto (task 3185, PRD γ), or ``None`` on the
+                     ordinary adjacent-verify path.  Recorded for disposition
+                     and diagnosis only: γ reads it nowhere but the dispatch
+                     seam that set it, because a tip verdict is deliberately
+                     non-adopting (see _run_inflight_verify's chain arm).  δ
+                     (task 3186) is what consumes ``links`` — the in-order CAS
+                     walk that lands the verified prefix.  NOTE the lane
+                     referenced here is already RELEASED by the time
+                     _finalize_inflight sees this entry: _run_inflight_verify
+                     returns it to the pool in its own ``finally``, so this
+                     field is never a release handle.
     """
 
     item: SpeculativeItem
@@ -1444,6 +1474,7 @@ class InflightEntry:
     status: InflightStatus | None = None    # sentinel: DROPPED / REQUEUED / RUNNER_UNAVAILABLE / ABANDONED_PREDISPATCH / REQUEUED_PREDISPATCH
     started_at: float | None = None         # time.time() at dispatch construction (≈ verify start)
     permit: SpecPermit | None = None        # ζ: speculation-slot token owned by PermitLedger; threaded/released by η
+    chain: ChainResult | None = None        # γ (task 3185): the deep chain this verify was redirected onto
 
     def __post_init__(self) -> None:
         """Enforce the I2-shadow invariant (task 1990 / MQ-invariants ε).
