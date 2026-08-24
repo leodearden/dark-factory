@@ -4358,9 +4358,9 @@ class TaskWorkflow:
         """Write ``pending`` so a REQUEUED exit is TRUTHFUL, returning a terminal
         override outcome when the row turns out to be terminal, else ``None``.
 
-        The single choke point for the two requeue exits that historically
-        returned ``WorkflowOutcome.REQUEUED`` with NO status write —
-        ``_drive()``'s ``except WarmLaneRequeue`` clause and
+        The single choke point for the two SLOT-EXITING requeue paths that
+        historically returned ``WorkflowOutcome.REQUEUED`` with NO status
+        write — ``_drive()``'s ``except WarmLaneRequeue`` clause and
         ``_handle_soft_cancel``'s spurious-wakeup fallback (PRD γ3 / D6).
         Leaving the row ``in-progress`` there is not merely imprecise: the
         harness's slot ``finally`` nulls the claimant immediately afterwards,
@@ -4373,6 +4373,32 @@ class TaskWorkflow:
         ``_requeue_on_lock_conflict`` above; the write itself is the one
         already used by ``_plan()``'s plan-lock requeue and the
         blocking-dependency requeue.
+
+        SCOPE — "two" is a claim about SLOT EXITS, not about the literal
+        ``return WorkflowOutcome.REQUEUED`` population, which is larger.  The
+        membership test is "does this return hand control back to the harness,
+        so the slot ``finally`` nulls the claimant next?".  The other REQUEUED
+        returns in this file were each checked and are NOT members:
+
+        * ``_handle_wip_conflict`` — its REQUEUED returns into
+          ``_submit_to_merge_queue`` → the merge-retry loop in
+          ``_merge_and_finalise``, whose REQUEUED arm retries the merge
+          IN-PLACE (see MERGE_PHASE_RATIONALE there): the coroutine keeps the
+          slot and stays a LIVE claimant, so no unclaimed ``in-progress`` row
+          exists, and loop exhaustion exits through ``_mark_blocked``, which
+          writes the row itself.  Same for the other in-loop merge handlers
+          and ``_resolve_and_resubmit``, which re-enters the same call.
+        * ``_requeue_on_lock_conflict`` — the row is already re-pended one
+          layer down, by ``Scheduler.handle_blast_radius_expansion``'s
+          acquire-failure branch (it writes ``pending`` before returning
+          False).  Routing it through here would be a duplicate write.
+        * ``_run_simple_task`` — its REQUEUED is an internal fall-through
+          sentinel, consumed by ``_drive()``'s ``else:`` arm (drop the plan,
+          run the architect path); it is never returned to the harness.
+
+        So the strand class this helper closes IS closed for the exits that
+        can produce it.  A future REQUEUED return that EXITS the slot is a new
+        member and belongs here — that, not the count, is the invariant.
 
         Rejection handling (INV-4). ``Scheduler.set_task_status`` already owns
         the transient retry loop and raises ``SetTaskStatusRejected`` only for
