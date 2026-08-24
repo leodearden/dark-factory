@@ -3294,8 +3294,14 @@ def create_mcp_server(
             if triage_decision is not None
             else None
         )
+        # The `triage_decision is not None` conjunct is redundant at runtime
+        # (attach_kind is None whenever triage_decision is), but attach_kind is
+        # computed in a separate expression above, so the type checker cannot
+        # carry that implication across and narrow the Optional here.
         attached_to = (
-            triage_decision.canonical_id if attach_kind is not None else None
+            triage_decision.canonical_id
+            if triage_decision is not None and attach_kind is not None
+            else None
         )
         write_meta = cleaned_meta
         if attached_to is not None:
