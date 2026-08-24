@@ -1,119 +1,148 @@
 prd: docs/prds/recurring-deterministic-tasks.md
 schema_version: 1
 tasks:
-  - label: "r1"
-    task_id: null
-    title: "Recurrence metadata submodel + blessing + guard rules (shape; predicate-kind-only; deploy-kind rejection)"
-    capabilities:
-      - name: "recurrence-submodel-registered"
-        binding: "capability→producer (this task) — Milestone submodel + register pattern verified present to clone; 0-today with control milestone-form=1"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "register_metadata_submodel\\(\\s*.recurrence."
-          paths: ["shared/src/shared/"]
-          expect: present
-      - name: "guard-rule-validates-recurrence"
-        binding: "capability→producer (this task) — _validate_milestone guard-rule precedent verified in deterministic_task_guard.py; 0-today"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "recurrence"
-          paths: ["fused-memory/src/fused_memory/middleware/deterministic_task_guard.py"]
-          expect: present
-      - name: "malformed-and-deploy-kind-rejection"
-        binding: "rejection-mechanism — B6 fixtures observe the ValidationError fire on each malformed shape and on deploy-kind carriers"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "rejection quality judged by B6 boundary fixtures"
-  - label: "r2"
-    task_id: null
-    title: "Interceptor mint-on-terminal at the post-lock seam (dedup, fail-soft ERROR, provenance, at-advance)"
-    capabilities:
-      - name: "mint-hook-at-post-lock-seam"
-        binding: "capability→producer (this task) — post-lock step-5/6 seam verified (STATUS_TRIGGERS discrimination); write lock verified NON-reentrant, seam avoids deadlock; tm.add_task path verified; 0-today"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "recurrence-mint"
-          paths: ["fused-memory/src/fused_memory/"]
-          expect: present
-      - name: "replay-safe-dedup"
-        binding: "corroborate-before-acting — pre-mint check for an existing non-terminal same-key link (B4)"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "replay safety is behavioural (B4)"
-      - name: "mint-failure-fail-soft"
-        binding: "storm-escape — mint failure never fails the status write; structured ERROR + gauge-visible broken state (B5)"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "fail-soft is fault-injected (B5), not greppable"
-  - label: "r3"
-    task_id: null
-    title: "Carrier timeout-leg category -> milestone_check_failed"
-    capabilities:
-      - name: "timeout-leg-category-scoped-to-carriers"
-        binding: "capability→producer (this task) — today-values verified: timeout leg files infra_issue, predicate leg milestone_check_failed; carrier scoping must name recurrence in deterministic_runner.py (0-today; category string itself already present = neighbouring-name trap, deliberately not bound)"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "recurrence"
-          paths: ["orchestrator/src/orchestrator/deterministic_runner.py"]
-          expect: present
-      - name: "category-flip-observed"
-        binding: "rejection-mechanism analogue — B7 observes milestone_check_failed on a seeded carrier timeout where identical setup yields infra_issue today"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "behavioural before/after (B7)"
-  - label: "r4"
-    task_id: null
-    title: "Dashboard chain panel on the invariants endpoint (chain-state function)"
-    capabilities:
-      - name: "chain-panel-served"
-        binding: "capability→producer (this task) — metadata carried per-row by _shape_task verified; endpoint + pool path from detection d1 (cross-PRD dep wired, upstream); 0-today"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "recurrence"
-          paths: ["dashboard/"]
-          expect: present
-      - name: "state-function-total"
-        binding: "field-population — every keyed chain resolves to exactly one of scheduled|overdue|paused|broken|ended; broken renders distinctly, never absent (B5 read side, B8)"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "totality and broken-vs-absent are behavioural (B8)"
-  - label: "r5"
-    task_id: null
-    title: "Watcher checklist chain-triage extension"
-    capabilities:
-      - name: "chain-triage-in-both-main-loops"
-        binding: "capability→producer (this task) — both skills in-repo only; extends detection d2's invariants step (dep wired); 0-today with control reap-decisions=1"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "overdue"
-          paths: ["skills/escalation-watcher/SKILL.md", "skills/recon-escalation-watcher/SKILL.md"]
-          expect: present
-  - label: "r6"
-    task_id: null
-    title: "Seed the first two chains: closure-staleness predicate variant + transcript-check; demonstrate link->successor end-to-end"
-    capabilities:
-      - name: "predicate-variant-script-exists"
-        binding: "capability→producer (this task) — sweep wrapper verified (always-exit-0, rcs captured in vars, stdlib-only); transcript-check command verified runnable; 0-today"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "reify-closure-staleness-predicate"
-          paths: ["scripts/"]
-          expect: present
-      - name: "link-to-successor-e2e"
-        binding: "DAG-direction — mint (r2) and category (r3) produced upstream; the task IS the integration gate (B10)"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "the signal is the product-read-path chain evidence (B10)"
+- label: r1
+  task_id: 4676
+  title: Recurrence metadata submodel + blessing + guard rules (shape; predicate-kind-only;
+    deploy-kind rejection)
+  capabilities:
+  - name: recurrence-submodel-registered
+    binding: capability→producer (this task) — Milestone submodel + register pattern
+      verified present to clone; 0-today with control milestone-form=1
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: register_metadata_submodel\(\s*.recurrence.
+      paths:
+      - shared/src/shared/
+      expect: present
+  - name: guard-rule-validates-recurrence
+    binding: capability→producer (this task) — _validate_milestone guard-rule precedent
+      verified in deterministic_task_guard.py; 0-today
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: recurrence
+      paths:
+      - fused-memory/src/fused_memory/middleware/deterministic_task_guard.py
+      expect: present
+  - name: malformed-and-deploy-kind-rejection
+    binding: rejection-mechanism — B6 fixtures observe the ValidationError fire on
+      each malformed shape and on deploy-kind carriers
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: rejection quality judged by B6 boundary fixtures
+- label: r2
+  task_id: 4677
+  title: Interceptor mint-on-terminal at the post-lock seam (dedup, fail-soft ERROR,
+    provenance, at-advance)
+  capabilities:
+  - name: mint-hook-at-post-lock-seam
+    binding: capability→producer (this task) — post-lock step-5/6 seam verified (STATUS_TRIGGERS
+      discrimination); write lock verified NON-reentrant, seam avoids deadlock; tm.add_task
+      path verified; 0-today
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: recurrence-mint
+      paths:
+      - fused-memory/src/fused_memory/
+      expect: present
+  - name: replay-safe-dedup
+    binding: corroborate-before-acting — pre-mint check for an existing non-terminal
+      same-key link (B4)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: replay safety is behavioural (B4)
+  - name: mint-failure-fail-soft
+    binding: storm-escape — mint failure never fails the status write; structured
+      ERROR + gauge-visible broken state (B5)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: fail-soft is fault-injected (B5), not greppable
+- label: r3
+  task_id: 4678
+  title: Carrier timeout-leg category -> milestone_check_failed
+  capabilities:
+  - name: timeout-leg-category-scoped-to-carriers
+    binding: 'capability→producer (this task) — today-values verified: timeout leg
+      files infra_issue, predicate leg milestone_check_failed; carrier scoping must
+      name recurrence in deterministic_runner.py (0-today; category string itself
+      already present = neighbouring-name trap, deliberately not bound)'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: recurrence
+      paths:
+      - orchestrator/src/orchestrator/deterministic_runner.py
+      expect: present
+  - name: category-flip-observed
+    binding: rejection-mechanism analogue — B7 observes milestone_check_failed on
+      a seeded carrier timeout where identical setup yields infra_issue today
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: behavioural before/after (B7)
+- label: r4
+  task_id: 4679
+  title: Dashboard chain panel on the invariants endpoint (chain-state function)
+  capabilities:
+  - name: chain-panel-served
+    binding: capability→producer (this task) — metadata carried per-row by _shape_task
+      verified; endpoint + pool path from detection d1 (cross-PRD dep wired, upstream);
+      0-today
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: recurrence
+      paths:
+      - dashboard/
+      expect: present
+  - name: state-function-total
+    binding: field-population — every keyed chain resolves to exactly one of scheduled|overdue|paused|broken|ended;
+      broken renders distinctly, never absent (B5 read side, B8)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: totality and broken-vs-absent are behavioural (B8)
+- label: r5
+  task_id: 4680
+  title: Watcher checklist chain-triage extension
+  capabilities:
+  - name: chain-triage-in-both-main-loops
+    binding: capability→producer (this task) — both skills in-repo only; extends detection
+      d2's invariants step (dep wired); 0-today with control reap-decisions=1
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: overdue
+      paths:
+      - skills/escalation-watcher/SKILL.md
+      - skills/recon-escalation-watcher/SKILL.md
+      expect: present
+- label: r6
+  task_id: 4681
+  title: 'Seed the first two chains: closure-staleness predicate variant + transcript-check;
+    demonstrate link->successor end-to-end'
+  capabilities:
+  - name: predicate-variant-script-exists
+    binding: capability→producer (this task) — sweep wrapper verified (always-exit-0,
+      rcs captured in vars, stdlib-only); transcript-check command verified runnable;
+      0-today
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: reify-closure-staleness-predicate
+      paths:
+      - scripts/
+      expect: present
+  - name: link-to-successor-e2e
+    binding: DAG-direction — mint (r2) and category (r3) produced upstream; the task
+      IS the integration gate (B10)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the signal is the product-read-path chain evidence (B10)
