@@ -314,6 +314,17 @@ mcp__escalation__stamp_triage(
 
 **Human-judgment-category guard (`design_concern` / `risk_identified` L2s):** these categories wait on a HUMAN ruling, surfaced through a cockpit DecisionRecord — which you cannot file (you hold no `write-decision`). A probe that only re-checks the *subject task's* status (e.g. `stale_task_scoped`) does NOT handle the human question, and a fresh `triaged_at` from such a probe makes later rotations and the L2 watcher's parked-pile audits skip the record as "handled" while the question was never surfaced — esc-3223-4/-5 kept task 3223 blocked for 11 days exactly this way. For a pending L2 in these two categories, either leave it **unstamped** so a full L2 session picks it up, or stamp it ONLY with a note whose predicate names the visibility gap itself (e.g. `no DecisionRecord exists for this esc-id | probe: cockpit registry lookup -> absent`) — never with a task-status-only predicate that reads as coverage.
 
+**Self-referential-predicate guard (any pending item, any category, any level):** a predicate about
+the record's *own* status — `"still a member of pending esc-X"`, `"esc-X still pending"`, `"this
+record still open"` — is banned as a triage-note predicate. It is machine-checkable and honestly
+re-runnable, yet trivially true for as long as the item is parked, so a stamp built on it reads as
+coverage while measuring nothing: esc-6107-7's member L1s were re-stamped on exactly that predicate
+~30 times over 7.6 days while the question had already been ruled, implemented, and measured on the
+task side (which never bumps the escalation's `updated_at`, so the re-assess trigger above can
+never fire either). Predicates must name a fact about the **world** — the subject task's records,
+its branch, its siblings, a member record's resolution — that could plausibly change while the item
+sits parked.
+
 **`triage_note` MUST carry a verified predicate and the probe that verified it — never a bare conclusion:**
 1. The **PREDICATE** — a machine-checkable condition, e.g. `` `task-604 status==done` `` — not a conclusion like "resume will close it". A conclusion-only note is untrusted prose: exactly this anti-pattern on esc-2584 was empirically refuted twice, costing two churn cycles and five separate `resolve_issue` calls before the item was actually closed.
 2. The **PROBE** used to verify it — command + key output line, e.g. `` `probe: get_task 604 -> status=done` ``. This mirrors the [Auto-closing a rubber-stamp L2](#auto-closing-a-rubber-stamp-l2-narrow-close_only-carve-out) evidence convention (quote a live-probe `key=value` token verbatim) and the [`stranded_blocked`](#stranded_blocked) "re-verify the predicate still holds" pattern — `triage_note` generalizes both into one durable rotation-to-rotation handoff note.

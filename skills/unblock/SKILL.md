@@ -760,6 +760,23 @@ Choose one of these based on the analysis:
 
 - **Fix manually and merge** — if you fix the issue yourself in the worktree, follow the blocked-task merge procedure above.
 
+**If this session RULES an escalated question, write the ruling to the record at ruling time — not
+at session end.** Trigger (already computed, costs nothing): the block cause was a pending
+escalation — any category — that you read in Step 1b, and the session chose an option (with or
+without human ratification) rather than deferring the question. Immediately append the ruling to
+the escalation record: the chosen option, the ruling commit sha, and what remains (e.g. "closure
+deferred pending merge gate"). Use `amend_escalation` once it lands; until then, fold via
+`promote_to_l2` re-passing the record's exact `root_cause` and its existing member ids — the member
+union is a no-op and the fold appends an amendment. The amendment bumps `updated_at`, which is
+exactly what re-arms the watcher's re-verify on a parked record. This is an annotation, not a
+closure — L2 close rules are unchanged. Do NOT defer the record-write behind a merge gate or any
+tail plan: a deferred write is precisely what dies when a session ends early (esc-6107-7 sat
+answered-but-unrecorded for 183h because its close was sequenced behind a merge gate and the
+session stopped first). While you're there, check `get_pending_escalations(task_id="<TASK_ID>")`
+for OTHER pending records on the same task and disposition them in the same sitting — a ruling
+recorded on one twin while another record survives is the same failure class (esc-3875-12 kept a
+Leo-released task pinned 6.8 further days).
+
 ### 4.4: Execute the plan
 
 Exit plan mode and execute. **Keep the task in its current status during the work** — don't manually change it until you've successfully merged or resolved. This prevents the orchestrator from trying to start new agents on it. One deliberate exception: in the blocked-task merge procedure, `release_workflow` intentionally moves an escalated/in-progress task to `blocked` (the reaper-immune holding state) when it releases the slot — that's the safe status to work from, and the final `set_task_status(done)` after merge is then the normal blocked→done transition.
@@ -787,6 +804,10 @@ After this skill completes, the task should be in one of these states:
 | In Progress (escalated) | Escalation resolved, agent resumes | In Progress |
 | In Progress (escalated) | Escalation terminated, work rescheduled | Pending |
 | In Progress (escalated) | Fixed manually, merged to main | Done |
+
+In **every** end state, any escalation this session ruled on must already carry the ruling as an
+amendment on the record itself (Step 4's ruling-time rule). An end state reached with the ruling
+living only in chat, a local todo, or a tail plan is not a valid exit.
 
 ---
 

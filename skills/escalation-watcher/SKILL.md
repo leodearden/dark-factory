@@ -896,6 +896,17 @@ prose, not a substitute for investigation. This is exactly the esc-2584 failure 
 conclusion-only recommendation ("resume will close it") was taken at face value, got refuted, and
 cost two churn cycles and five separate `resolve_issue` calls before the item was actually closed.
 
+**A machine-checkable predicate can still be vacuous: never accept — or write — a predicate about
+the record's own status.** `"still a member of pending esc-X"` / `"esc-X still pending"` passes
+every rule above (named predicate, honest probe, cheap re-run) and carries zero information,
+because it is trivially true for as long as the item stays parked. esc-6107-7's members were
+re-probed on exactly that predicate ~30 times over 7.6 days while the question had been ruled,
+implemented, and measured elsewhere. A parked item's predicate must be about the **world**: has
+the answer appeared? Concretely — a member already ruled (see "Ruled-elsewhere check" below), an
+esc-id-citing correction block in the cluster's task descriptions, or the subject's branch tip
+advancing while the task is blocked/parked (tip-advance on an `in-progress` subject is ordinary
+work, not a signal).
+
 `triaged_by` is server-attributed from the stamping connection's `X-Escalation-Identity` header and
 cannot be spoofed by the caller — the identical non-spoofable attribution contract this skill
 already documents for `resolved_by` (see "Recognizing the supervised auto-watcher's resolutions"
@@ -935,6 +946,47 @@ A sustained burst of truncation files its own `info` infra escalation (under the
 `l2-amendment-truncation` task anchor, not against any real task) saying either the cap is too low
 for the live fold rate or root-cause matching is over-folding unrelated clusters into one L2. If you
 see one, the named L2s are where to look.
+
+### Ruled-elsewhere check (answered-but-unrecorded)
+
+The most expensive queue failure measured to date is a pending L2 whose question has already been
+answered — ruled by a human or an `/unblock` session — with the ruling recorded on a *different*
+surface: a twin L2 over the same member, a sibling task's description, a branch commit. Measured
+2026-08-22→24: five instances (3 `design_concern`, 1 `dependency_discovered`, 1 `infra_issue` —
+the class is **category-agnostic**), 30.2 answered-yet-open days total; worst case, a complete and
+verified fix (task 3875) did not ship for 6.8 days after Leo said "task 3875 is released".
+
+All five shared one fingerprint: the surviving record and the record carrying the ruling had the
+**identical single member id** — one L1 promoted to L2 more than once; ruling one promotion
+cascades down to the member but never sideways to the other L2s built on it. The probe, per
+pending L2 (also runnable across all queues via `scripts/member-chain-sweep.py`, read-only):
+
+- For each id in `.members`, locate the member **across the archive** (`find <queue-dir> -name
+  '<member-id>.json'` — every ruled member is archived by definition), never just the live dir.
+- If the member's status is terminal, **read its `resolution` TEXT — status alone is useless**
+  (both shapes below show `dismissed`):
+  - substantive ruling text ⇒ this L2 is ANSWERED. Recover the ruling verbatim from the record
+    named in `resolved_by` (`l2-cascade:<id>`) rather than re-deriving it.
+  - `"DUPLICATE of esc-X (survivor, stays open)"` ⇒ the **opposite**: a dedup pass deliberately
+    kept THIS record live; the question may be genuinely open.
+
+When the probe fires, the item's ask changes from "human must decide" to **"human must ratify and
+propagate"** — a much cheaper request. Present it that way, with the recovered ruling attached.
+
+**This check is REPORT-ONLY — it must never close anything on its own.** A record can be a
+deliberately-preserved PIN whose value is its *existence*, not its question: esc-3105-3 scores
+15/15 ruled members on this probe and must NOT be closed (it is the last hold on task 3105 /
+task 3546's mu-gate specimen; its sibling 3371 was destroyed by a bulk close cascade on
+2026-08-08; companion esc-3105-5 carries the DO-NOT-CLOSE flag). From the member chain alone, a
+pin and an answered question are indistinguishable. Until task 4377 lands `pin_declared_by` as the
+machine-readable opt-out, the only protection is reading the record and its companions before
+proposing any disposition.
+
+**If you run a dedup/consolidation pass over pending L2s** (the 2026-08-19 sweep was such a pass,
+done by hand): before designating any survivor, run this check on the shared members. Never keep
+an already-answered record open as the survivor — close it against the recovered ruling, recording
+where the ruling lives. The 08-19 pass did the opposite on three clusters and manufactured three
+of the five instances above.
 
 ### `review_suggestions` (info)
 
@@ -1044,6 +1096,15 @@ Architectural or design questions. These already failed steward auto-resolution 
    cockpit queue the human actually reads.
 4. Continue handling other escalations while waiting
 5. Append `<esc-id>` to the wrapper-owned exclude-file (see "Starting the watcher" above) while this item is pending
+
+**While parked, the item must remain falsifiable.** Steps 2+5 park the record and gag its wake
+channel — deliberate, but it makes the parked set a mutation-blind pocket: a task-side ruling
+never touches the record, so nothing bumps `updated_at` when the world answers the question. On
+rotations that revisit the parked set, re-verify with **world-facing** probes only (see "Reading a
+triage-ack annotation" and the "Ruled-elsewhere check" above) — never a predicate about the
+record's own pending status. If a probe fires, the ask flips from "human must decide" to "human
+must ratify and propagate": recover the ruling, present it for ratification, and propagate it into
+the record via amendment. This applies equally to `risk_identified` parks below.
 
 ### `risk_identified` (info)
 
@@ -1250,6 +1311,15 @@ You may still occasionally see multiple *unclustered* L2s that share a root caus
 deduplicates by exact root-cause string, so near-miss hypotheses file separately. When you do, scan
 them for shared files, summaries, or task IDs and handle related ones together, noting the
 relationship in your resolution text.
+
+**At every resolve, look sideways before moving on.** The ruling you write reaches only the record
+you name (plus its downward member cascade — never sibling L2s). Run
+`get_pending_escalations(task_id=...)` for the subject task and scan for other pending L2s sharing
+any member id; disposition them in the same sitting — close them against the same ruling, or park
+them with a world-facing predicate naming where the ruling lives. A ruling recorded on one twin
+while another survives is the answered-but-unrecorded class (see "Ruled-elsewhere check" above);
+all five measured instances were minted exactly this way, in sittings that ruled the record in
+front of them and never looked sideways.
 
 ### Recognizing the supervised auto-watcher's resolutions (not a rogue actor)
 
