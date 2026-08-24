@@ -48,12 +48,14 @@ from audit_wiped_metadata_files import (
     NO_MERGE_EVENT,
 )
 from census_tagger_debris import (
+    _RECONCILIATIONS,
     DEFAULT_JSON_OUT,
     DEFAULT_MD_OUT,
     EXIT_NO_ROOT,
     EXIT_NOTHING_SCANNED,
     EXIT_OK,
     EXIT_STALE,
+    LOCK_RECONCILED,
     NEVER_RECONCILED,
     NO_PRIOR_SCOPE,
     POST_WIPE_OVERWRITE,
@@ -64,6 +66,7 @@ from census_tagger_debris import (
     STATUS_TERMINAL,
     ScopeEvent,
     _connect_readonly,
+    _module_is_explained_by,
     build_report,
     census_project,
     classify_record,
@@ -88,18 +91,47 @@ _BEFORE = "2026-08-01T00:00:00+00:00"
 _AFTER = "2026-08-15T00:00:00+00:00"
 
 
-def _event(timestamp: str, event_type: str = "set_to_plan", event_id: int = 1) -> ScopeEvent:
+# The record's OWN metadata.files — the tagger's surviving guess. Every
+# axis-2 echo test below is a question about whether some event's paths are
+# merely a re-derivation of THIS list.
+_GUESS = ("scripts/census_tagger_debris.py", "tests/scripts/test_census_tagger_debris.py")
+
+
+def _event(
+    timestamp: str,
+    event_type: str = "set_to_plan",
+    event_id: int = 1,
+    files: tuple[str, ...] = ("mod/a.py", "mod/b.py"),
+    fidelity: str = FIDELITY_LOCK_LEVEL,
+) -> ScopeEvent:
+    """A PLAN-level scope event by default (set_to_plan), never a lock.
+
+    ``file_count`` is derived from *files* here for the same reason the loader
+    derives it there: two fields describing one list must not be able to drift.
+    """
     return ScopeEvent(
         timestamp=timestamp,
         event_type=event_type,
         event_id=event_id,
-        fidelity="lock_level",
-        file_count=2,
+        fidelity=fidelity,
+        file_count=len(files),
+        files=files,
+    )
+
+
+def _lock(timestamp: str, modules: tuple[str, ...], event_id: int = 1) -> ScopeEvent:
+    """A lock_acquired scope event carrying *modules* — the echo-test subject."""
+    return _event(
+        timestamp,
+        event_type="lock_acquired",
+        event_id=event_id,
+        files=modules,
+        fidelity=FIDELITY_LOCK_LEVEL,
     )
 
 
 def test_classification_vocabulary_constants_have_exact_string_values():
-    """(a) The six labels are the artifact's public vocabulary.
+    """(a) The seven labels are the artifact's public vocabulary.
 
     DF 3113 P4a and DF 3427 will read these strings out of the committed JSON,
     so a rename is a breaking change to a consumer that cannot see this repo's
@@ -109,6 +141,7 @@ def test_classification_vocabulary_constants_have_exact_string_values():
     assert STATUS_TERMINAL == "terminal"
     assert STATUS_NON_TERMINAL == "non_terminal"
     assert RECONCILED == "plan_reconciled"
+    assert LOCK_RECONCILED == "lock_reconciled"
     assert NEVER_RECONCILED == "never_reconciled"
     assert POST_WIPE_OVERWRITE == "post_wipe_overwrite"
     assert NO_PRIOR_SCOPE == "no_prior_scope"
@@ -117,7 +150,7 @@ def test_classification_vocabulary_constants_have_exact_string_values():
 @pytest.mark.parametrize("status", ["done", "cancelled"])
 def test_terminal_statuses_classify_terminal(status):
     """(b) The terminal axis is the repair's own allowlist, not a re-spelling."""
-    result = classify_record(_STAMP, status, [])
+    result = classify_record(_STAMP, status, [], metadata_files=())
     assert result.status_class == STATUS_TERMINAL
 
 
@@ -128,14 +161,14 @@ def test_every_other_status_classifies_non_terminal(status):
     """(b) An ALLOWLIST, so a status the system grows later falls on the
     non_terminal side — reported as a live victim rather than silently
     excluded from the population the census exists to find."""
-    result = classify_record(_STAMP, status, [])
+    result = classify_record(_STAMP, status, [], metadata_files=())
     assert result.status_class == STATUS_NON_TERMINAL
 
 
 def test_scope_event_after_the_stamp_is_plan_reconciled():
     """(c) A scope event postdating the stamp means the tagger's guess was
     superseded by a real derivation — the record is no longer a live victim."""
-    result = classify_record(_STAMP, "pending", [_event(_AFTER)])
+    result = classify_record(_STAMP, "pending", [_event(_AFTER)], metadata_files=())
     assert result.reconciliation == RECONCILED
     assert result.wipe_signature == NO_PRIOR_SCOPE
 
@@ -143,7 +176,7 @@ def test_scope_event_after_the_stamp_is_plan_reconciled():
 def test_scope_event_before_the_stamp_is_post_wipe_overwrite():
     """(c) A scope event predating the stamp means an authoritative scope
     EXISTED and the tagger stamped over it — the damaging case."""
-    result = classify_record(_STAMP, "pending", [_event(_BEFORE)])
+    result = classify_record(_STAMP, "pending", [_event(_BEFORE)], metadata_files=())
     assert result.wipe_signature == POST_WIPE_OVERWRITE
     assert result.reconciliation == NEVER_RECONCILED
 
@@ -153,7 +186,10 @@ def test_events_on_both_sides_of_the_stamp_yield_both_classifications():
     prior scope AND later reconciled. Collapsing them to one label would lose
     exactly the distinction the repair needs."""
     result = classify_record(
-        _STAMP, "pending", [_event(_BEFORE, event_id=1), _event(_AFTER, event_id=2)]
+        _STAMP,
+        "pending",
+        [_event(_BEFORE, event_id=1), _event(_AFTER, event_id=2)],
+        metadata_files=(),
     )
     assert result.reconciliation == RECONCILED
     assert result.wipe_signature == POST_WIPE_OVERWRITE
@@ -162,7 +198,7 @@ def test_events_on_both_sides_of_the_stamp_yield_both_classifications():
 def test_no_scope_events_at_all_is_never_reconciled_and_no_prior_scope():
     """(c) The live-victim cell: the tagger's guess is still the only scope
     this record has ever had."""
-    result = classify_record(_STAMP, "pending", [])
+    result = classify_record(_STAMP, "pending", [], metadata_files=())
     assert result.reconciliation == NEVER_RECONCILED
     assert result.wipe_signature == NO_PRIOR_SCOPE
 
@@ -175,7 +211,7 @@ def test_event_exactly_at_the_stamp_decides_neither_axis():
     writes are not ordered with respect to each other at equal timestamps, and
     inventing an order would be a guess presented as a measurement.
     """
-    result = classify_record(_STAMP, "pending", [_event(_STAMP)])
+    result = classify_record(_STAMP, "pending", [_event(_STAMP)], metadata_files=())
     assert result.reconciliation == NEVER_RECONCILED
     assert result.wipe_signature == NO_PRIOR_SCOPE
 
@@ -190,7 +226,7 @@ def test_reconciliation_evidence_names_the_deciding_event():
         _event("2026-08-20T00:00:00+00:00", event_type="phase_skipped", event_id=9),
         _event("2026-08-10T00:00:00+00:00", event_type="set_to_plan", event_id=4),
     ]
-    result = classify_record(_STAMP, "pending", events)
+    result = classify_record(_STAMP, "pending", events, metadata_files=())
 
     assert result.reconciliation == RECONCILED
     assert result.reconciled_by.event_type == "set_to_plan"
@@ -205,7 +241,7 @@ def test_overwrite_evidence_names_the_latest_prior_scope_event():
         _event("2026-07-01T00:00:00+00:00", event_type="set_to_plan", event_id=2),
         _event("2026-08-07T00:00:00+00:00", event_type="phase_skipped", event_id=7),
     ]
-    result = classify_record(_STAMP, "done", events)
+    result = classify_record(_STAMP, "done", events, metadata_files=())
 
     assert result.wipe_signature == POST_WIPE_OVERWRITE
     assert result.preceded_by.event_type == "phase_skipped"
@@ -217,18 +253,211 @@ def test_absent_evidence_is_explicitly_null_not_a_missing_key():
     """(e) An unclassified axis still carries its evidence keys, all None. A
     MISSING key in the artifact would be indistinguishable from a serializer
     bug; a present null says "looked, found nothing"."""
-    result = classify_record(_STAMP, "pending", [])
+    result = classify_record(_STAMP, "pending", [], metadata_files=())
 
     assert result.reconciled_by._asdict() == {
         "event_type": None,
         "event_id": None,
         "timestamp": None,
+        "fidelity": None,
     }
     assert result.preceded_by._asdict() == {
         "event_type": None,
         "event_id": None,
         "timestamp": None,
+        "fidelity": None,
     }
+
+
+# ---------------------------------------------------------------------------
+# Axis 2, CORRECTED (review fix, 2026-08-24).
+#
+# THE DEFECT THESE TESTS PIN SHUT. v1 treated ANY post-stamp lock_acquired as
+# proof that a real derivation superseded the tagger's guess. It is not:
+# Scheduler._get_modules (orchestrator/src/orchestrator/scheduler.py:8797-8801)
+# computes the locked module set as derive_modules(metadata["files"], depth) —
+# straight from metadata.files, which for a never-reconciled tagger-stamped
+# record IS the guess. A post-stamp lock is therefore an ECHO of the guess, not
+# evidence against it, and v1 was reporting the majority of live victims to
+# DF 3113 P4a / DF 3427 as already repaired.
+#
+# Every input below is synthetic. The echo test is depth-INVARIANT by
+# construction: files_to_modules truncates each path to `depth` components, so
+# every module derive_modules can emit is a component-wise PREFIX of some entry
+# in files. Equality at one depth would have been wrong — lock_depth is
+# 12/10/4/4/3/unset(2) across the six corpora and CHANGED mid-tagger-era
+# (dark-factory 4->12, reify 4->10).
+# ---------------------------------------------------------------------------
+
+
+def test_lock_reconciled_is_a_third_axis_2_value_beside_the_two_v1_labels():
+    """(a) The two v1 labels KEEP their spellings — DF 3113 P4a and DF 3427
+    join on these strings out of the committed JSON, so renaming either would
+    break a consumer that cannot see this module's constants. The new class is
+    additive."""
+    assert LOCK_RECONCILED == "lock_reconciled"
+    assert RECONCILED == "plan_reconciled"
+    assert NEVER_RECONCILED == "never_reconciled"
+
+
+def test_the_report_vocabulary_enumerates_all_three_reconciliation_values():
+    """(a) build_report iterates THIS tuple to emit its cells, so a value
+    missing here becomes a silently absent count rather than an explicit zero."""
+    assert set(_RECONCILIATIONS) == {RECONCILED, LOCK_RECONCILED, NEVER_RECONCILED}
+    assert len(_RECONCILIATIONS) == 3
+
+
+@pytest.mark.parametrize(
+    ("module", "expected"),
+    [
+        ("a", True),
+        ("a/b", True),
+        ("a/b/c.py", True),
+        ("a/b/", True),
+        ("b", False),
+        ("a/c", False),
+        ("a/b/c.py/d", False),
+        ("", False),
+    ],
+)
+def test_module_prefix_matching_is_component_wise(module, expected):
+    """The helper is a PATH-prefix test on '/'-split components."""
+    assert _module_is_explained_by(module, ("a/b/c.py",)) is expected
+
+
+def test_a_raw_string_prefix_is_not_a_path_prefix():
+    """'a/bcd/e.py'.startswith('a/b') is True and MEANINGLESS. A str.startswith
+    implementation would call an unrelated module an echo and silently downgrade
+    a genuine reconciliation to never_reconciled."""
+    assert _module_is_explained_by("a/b", ("a/bcd/e.py",)) is False
+
+
+def test_a_post_stamp_lock_that_merely_echoes_the_guess_is_not_reconciliation():
+    """(b) THE MANDATED PIN — modules exactly equal to the record's own files.
+
+    The scheduler derived them FROM metadata.files, so they assert nothing the
+    tagger did not already assert. The record is still carrying the guess.
+    """
+    result = classify_record(_STAMP, "pending", [_lock(_AFTER, _GUESS)], _GUESS)
+
+    assert result.reconciliation == NEVER_RECONCILED
+    assert result.reconciled_by._asdict() == {
+        "event_type": None,
+        "event_id": None,
+        "timestamp": None,
+        "fidelity": None,
+    }
+
+
+def test_a_post_stamp_lock_truncated_to_a_shallower_depth_is_still_an_echo():
+    """(b) The second mandated shape: derive_modules TRUNCATES, so the modules
+    are shorter than the files they came from and never equal to them."""
+    files = ("a/b/c/d.py",)
+    result = classify_record(_STAMP, "pending", [_lock(_AFTER, ("a/b",))], files)
+
+    assert result.reconciliation == NEVER_RECONCILED
+
+
+@pytest.mark.parametrize("depth", [1, 2, 3, 4])
+def test_the_echo_test_holds_at_every_derive_depth(depth):
+    """(c) DEPTH INDEPENDENCE — what keeps no lock_depth value baked in.
+
+    lock_depth is 12/10/4/4/3/unset(2) across the six corpora and CHANGED
+    mid-tagger-era, so a test pinning equality at one depth would regress
+    silently the next time an operator retunes it.
+    """
+    files = ("orchestrator/src/orchestrator/scheduler.py",)
+    module = "/".join(files[0].split("/")[:depth])
+    result = classify_record(_STAMP, "pending", [_lock(_AFTER, (module,))], files)
+
+    assert result.reconciliation == NEVER_RECONCILED
+    assert result.reconciled_by.event_type is None
+
+
+def test_a_post_stamp_lock_with_an_unexplained_module_is_lock_reconciled():
+    """(d) A lock naming something the record's own files CANNOT explain did
+    not come from re-deriving them, so it is real evidence — but it gets its
+    OWN label, never plan_reconciled, because a consumer must be able to filter
+    the weaker class out."""
+    lock = _lock(_AFTER, ("shared/", *_GUESS), event_id=12)
+    result = classify_record(_STAMP, "pending", [lock], _GUESS)
+
+    assert result.reconciliation == LOCK_RECONCILED
+    assert result.reconciled_by.event_type == "lock_acquired"
+    assert result.reconciled_by.event_id == 12
+    assert result.reconciled_by.timestamp == _AFTER
+
+
+@pytest.mark.parametrize("event_type", ["set_to_plan", "phase_skipped"])
+def test_a_plan_event_is_never_echo_filtered(event_type):
+    """(e) A plan event is a genuine plan-derived ASSERTION, not a
+    re-derivation of metadata.files, so it counts even when its file list is
+    identical to the guess. Echo-filtering it would erase the one signal the
+    audit's own lens already trusts."""
+    events = [_event(_AFTER, event_type=event_type, event_id=3, files=_GUESS)]
+    result = classify_record(_STAMP, "pending", events, _GUESS)
+
+    assert result.reconciliation == RECONCILED
+    assert result.reconciled_by.event_type == event_type
+
+
+def test_a_plan_event_outranks_a_genuine_lock_even_when_the_lock_came_first():
+    """(e) PRECEDENCE. Axis 2 is not "the earliest post-stamp event" any more:
+    the plan-level assertion is the stronger signal and must never be masked by
+    a weaker lock that merely happens to be older."""
+    lock = _lock("2026-08-09T00:00:00+00:00", ("shared/",), event_id=5)
+    plan = _event(
+        "2026-08-20T00:00:00+00:00", event_type="phase_skipped", event_id=6, files=("x.py",)
+    )
+    result = classify_record(_STAMP, "pending", [lock, plan], _GUESS)
+
+    assert result.reconciliation == RECONCILED
+    assert result.reconciled_by.event_type == "phase_skipped"
+    assert result.reconciled_by.event_id == 6
+
+
+def test_with_no_guess_on_the_record_a_lock_cannot_be_an_echo():
+    """(f) THE reify-5632 SHAPE (metadata.files == []). Nothing can explain the
+    lock's modules, so it is real evidence. Pinned explicitly so an empty guess
+    can never divide-by-zero into a false echo."""
+    result = classify_record(_STAMP, "done", [_lock(_AFTER, ("scripts/",))], ())
+
+    assert result.reconciliation == LOCK_RECONCILED
+    assert result.reconciled_by.event_type == "lock_acquired"
+
+
+def test_a_pre_stamp_lock_echoing_the_guess_is_still_a_post_wipe_overwrite():
+    """(g) THE ASYMMETRY IS DELIBERATE, and this test is what stops a later
+    contributor from "consistently" applying the echo filter to axis 3 too.
+
+    A PRE-stamp lock proves a file-derived scope existed BEFORE the tagger
+    stamped — it cannot be an echo of a guess that did not yet exist. Filtering
+    it would erase exactly the wipe signal the census exists to surface.
+    """
+    result = classify_record(_STAMP, "pending", [_lock(_BEFORE, _GUESS)], _GUESS)
+
+    assert result.wipe_signature == POST_WIPE_OVERWRITE
+    assert result.preceded_by.event_type == "lock_acquired"
+    assert result.preceded_by.timestamp == _BEFORE
+    assert result.reconciliation == NEVER_RECONCILED
+
+
+def test_evidence_carries_the_deciding_events_fidelity_on_both_axes():
+    """(h) A consumer must be able to tell a file_level assertion from a
+    lock_level one WITHOUT re-deriving it — the two are not interchangeable
+    (a module path must never be written back as a plan.files entry)."""
+    plan = _event(
+        _AFTER,
+        event_type="phase_skipped",
+        event_id=2,
+        files=("a.py",),
+        fidelity=FIDELITY_FILE_LEVEL,
+    )
+    prior = _lock(_BEFORE, ("shared/",), event_id=1)
+    result = classify_record(_STAMP, "pending", [plan, prior], _GUESS)
+
+    assert result.reconciled_by.fidelity == FIDELITY_FILE_LEVEL
+    assert result.preceded_by.fidelity == FIDELITY_LOCK_LEVEL
 
 
 # ---------------------------------------------------------------------------
@@ -855,8 +1084,10 @@ def test_coverage_is_always_reported_even_for_a_project_with_no_stamps(tmp_path)
 
 
 def test_a_post_stamp_scope_event_marks_the_record_reconciled(tmp_path):
-    """The axis-2 path through the real loader: an event AFTER the stamp means
-    a real derivation superseded the tagger's guess."""
+    """The axis-2 path through the real loader: a post-stamp lock naming a
+    module the record's own (here absent) files cannot explain is real
+    evidence — and lands in the WEAKER lock_reconciled class, never
+    plan_reconciled. See the axis-2 section above for why."""
     root = _make_project(
         tmp_path,
         tasks=[{"id": 5, "status": "done", "metadata": {"files_tagged_at": _STAMP}}],
@@ -872,7 +1103,7 @@ def test_a_post_stamp_scope_event_marks_the_record_reconciled(tmp_path):
     (record,) = census_project(str(root)).records
 
     assert record.status_class == STATUS_TERMINAL
-    assert record.reconciliation == RECONCILED
+    assert record.reconciliation == LOCK_RECONCILED
     assert record.reconciled_by.timestamp == _AFTER
 
 
@@ -930,7 +1161,7 @@ def test_params_says_how_the_artifact_was_produced(tmp_path):
     assert params["stamp_key"] == "metadata.files_tagged_at"
     assert params["classification"] == {
         "status_class": [STATUS_TERMINAL, STATUS_NON_TERMINAL],
-        "reconciliation": [RECONCILED, NEVER_RECONCILED],
+        "reconciliation": [RECONCILED, LOCK_RECONCILED, NEVER_RECONCILED],
         "wipe_signature": [POST_WIPE_OVERWRITE, NO_PRIOR_SCOPE],
     }
     assert "census_tagger_debris.py" in params["regen_command"]
@@ -946,11 +1177,11 @@ def test_zero_valued_classification_cells_are_present_not_omitted(tmp_path):
     assert block["total_tasks"] == 1
     assert block["stamped_records"] == 1
     assert block["status_class"] == {STATUS_TERMINAL: 0, STATUS_NON_TERMINAL: 1}
-    assert block["reconciliation"] == {RECONCILED: 0, NEVER_RECONCILED: 1}
+    assert block["reconciliation"] == {RECONCILED: 0, LOCK_RECONCILED: 0, NEVER_RECONCILED: 1}
     assert block["wipe_signature"] == {POST_WIPE_OVERWRITE: 0, NO_PRIOR_SCOPE: 1}
 
-    # All eight three-axis intersections, every one present.
-    assert len(block["cells"]) == 8
+    # All twelve three-axis intersections, every one present.
+    assert len(block["cells"]) == 12
     assert block["cells"]["non_terminal|never_reconciled|no_prior_scope"] == 1
     assert block["cells"]["terminal|plan_reconciled|post_wipe_overwrite"] == 0
     assert sum(block["cells"].values()) == block["stamped_records"]
@@ -964,7 +1195,7 @@ def test_a_project_with_no_stamped_records_still_gets_a_full_block(tmp_path):
     assert block["total_tasks"] == 1
     assert block["stamped_records"] == 0
     assert sum(block["cells"].values()) == 0
-    assert len(block["cells"]) == 8
+    assert len(block["cells"]) == 12
 
 
 def test_records_are_totally_ordered_and_never_truncated(tmp_path):
@@ -1416,7 +1647,7 @@ def test_the_required_positive_controls_are_present_and_classified(artifact, pro
 
     assert record["files_tagged_at"]
     assert record["status_class"] in {STATUS_TERMINAL, STATUS_NON_TERMINAL}
-    assert record["reconciliation"] in {RECONCILED, NEVER_RECONCILED}
+    assert record["reconciliation"] in {RECONCILED, LOCK_RECONCILED, NEVER_RECONCILED}
     assert record["wipe_signature"] in {POST_WIPE_OVERWRITE, NO_PRIOR_SCOPE}
 
 
