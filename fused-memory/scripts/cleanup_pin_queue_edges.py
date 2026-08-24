@@ -91,7 +91,32 @@ _AUDIT_PREFIXES = (
 # Pairwise pseudo-facts produced by extracting a reorder event. Two subjects,
 # so extract_priority_override_task_id can never yield a single subject id and
 # the 2781 sweep can never retire them.
-_REORDER_NOISE_RE = re.compile(r'reordered with|pinned (?:before|after)', re.I)
+#
+# BOTH the ordering phrase AND explicit pin-queue context are required, and the
+# caller additionally requires two distinct task refs. An earlier version keyed
+# on the ordering phrase alone and false-positived on ordinary English in the
+# reify graph — 'Failed-event version expectations are pinned before the code
+# under test...' (from a "Task 2554 shipped via ..." episode) and 'The fix task
+# must be pinned before the blocked task can be resolved.' Neither has anything
+# to do with a pin queue. Under-selection is the correct bias here: a missed
+# pseudo-fact is inert, a wrongly-retired true fact is not.
+_REORDER_NOISE_RE = re.compile(
+    r'(?:reordered with|pinned (?:before|after)).*pin queue', re.I | re.S
+)
+
+# Terminal-event assertions: an edge saying an override was CLEARED, or that a
+# task is ABSENT from the queue, states something that is true and STAYS true.
+# The subject's absence from the live overrides table is the very fact such an
+# edge asserts, so the "task absent => stale" rule inverts on it and would
+# retire a correct record. This is the over-match defect already filed as task
+# 4074; reify carries a live specimen (edge 0d3eb1e7, 'All priority overrides
+# for task 4880 have been cleared.', from episode 'Cleared all priority
+# override(s) for task 4880'). Checked BEFORE any staleness classification.
+_TERMINAL_ASSERTION_RE = re.compile(
+    r'\b(?:cleared|clearing|absence|absent|removed|unpinned|no longer|'
+    r'not (?:in|present|pinned))\b',
+    re.I,
+)
 
 # A pin_order value asserted in the edge's own fact text.
 _ASSERTED_PIN_ORDER_RE = re.compile(
@@ -204,11 +229,20 @@ def scan(graph: Any, live: dict[str, dict]) -> list[dict[str, Any]]:
     for c in candidates.values():
         fact = c['fact']
 
-        if _REORDER_NOISE_RE.search(fact):
-            targets.append({**c, 'reason': 'reorder-noise', 'subject': None})
+        # Never retire a terminal-event assertion — see _TERMINAL_ASSERTION_RE.
+        if _TERMINAL_ASSERTION_RE.search(fact):
             continue
 
         ids = set(_TASK_REF_RE.findall(fact))
+
+        # A pairwise pseudo-fact names TWO subjects — that is precisely why no
+        # single-subject extractor can ever attribute or retire it, and it is
+        # the whole justification for retiring it here. Requiring the second
+        # ref keeps ordinary prose that merely mentions a pin queue out.
+        if _REORDER_NOISE_RE.search(fact) and len(ids) >= 2:
+            targets.append({**c, 'reason': 'reorder-noise', 'subject': None})
+            continue
+
         subject: str | None = None
         asserted: int | None = None
         attribution = 'lexical'
@@ -218,11 +252,31 @@ def scan(graph: Any, live: dict[str, dict]) -> list[dict[str, Any]]:
             asserted = int(m.group(1)) if m else None
         else:
             joined = ' | '.join(episodes[e] for e in c['episodes'] if e in episodes)
-            m = _EPISODE_SUBJECT_RE.search(joined)
-            if not m:
+            found = _EPISODE_SUBJECT_RE.findall(joined)
+            if not found:
                 continue  # unattributable even via episode — leave it alone
-            subject, payload = m.group(1), m.group(2)
             attribution = 'episode'
+            subjects = {tid for tid, _ in found}
+            if len(subjects) > 1:
+                # The edge's source episodes name DIFFERENT tasks, so which one
+                # this fact is about cannot be determined. Taking the first
+                # match would be a coin flip that could retire a true fact.
+                # Select only when the edge is stale under EVERY candidate
+                # subject — then the verdict holds whichever is correct. If any
+                # candidate is still live, skip (under-selection is the safe
+                # bias). Real specimen: reify edge 3b111194 'The boost tier is
+                # set to high.', sourced from episodes naming both 4880 and
+                # 5166.
+                if any(live.get(s) is not None for s in subjects):
+                    continue
+                targets.append({
+                    **c, 'reason': 'stale-absent',
+                    'subject': '+'.join(sorted(subjects)),
+                    'attribution': 'episode-multi',
+                })
+                continue
+            subject = next(iter(subjects))
+            payload = next(p for tid, p in found if tid == subject)
             pm = _EPISODE_PIN_ORDER_RE.search(payload)
             asserted = int(pm.group(1)) if pm else None
 
