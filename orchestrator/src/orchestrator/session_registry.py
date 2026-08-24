@@ -2198,12 +2198,78 @@ def resolve_session_pid(env: Mapping[str, str] | None = None) -> int:
         'resolve_session_pid: %s is unset or unusable (%r); the lease pid/liveness '
         'guard is DEGRADED to heartbeat-only staleness. Recording pid 0, which is '
         'never alive, so a crashed holder still ages out and is reaped normally. '
-        'Note: `$$` in a Claude Code Bash tool call is the transient /bin/bash -c '
-        'wrapper, not the session -- use ${CLAUDE_PID:-$PPID}.',
+        'Note: neither `$$` nor `$PPID` substitutes for it -- `$$` in a Claude Code '
+        'Bash tool call is the transient /bin/bash -c wrapper, and `$PPID` is not '
+        'stable across tool calls either. Set $CLAUDE_PID; if you cannot, the lease '
+        'slug is underivable too, so pass an explicit --slug <stable-token>.',
         SESSION_PID_ENV,
         raw,
     )
     return 0
+
+
+def default_lease_slug(
+    name: str, env: Mapping[str, str] | None = None, *, pid: int | None = None
+) -> str | None:
+    """Derive THIS session's lease slug for lease *name*: ``<name>-<session pid>``.
+
+    WHY THIS EXISTS (task 4248). This is ``resolve_session_pid``'s own argument,
+    extended from the pid to the slug. 3994 moved the PID into code because "it
+    depended on every skill doc getting one shell token right" -- and then, in
+    the same change, made the SLUG load-bearing: ``--slug`` became required on
+    ``lease-heartbeat``/``lease-release`` and a mismatch is REFUSED. So the
+    token that decides whether every heartbeat and the final release ACT or are
+    refused was still being assembled in shell, in three SKILL.md files, as
+    ``<role>-<project>-${CLAUDE_PID:-$PPID}`` -- and ``$PPID`` is measurably NOT
+    stable across Claude Code tool calls (1430433 then 1471645, the first
+    already dead), so a session could drift into a slug its own later heartbeat
+    would fail to match. Deriving it HERE makes the correct token structural.
+
+    It must be RE-DERIVABLE rather than carried: each Claude Code Bash tool call
+    is a fresh ``/bin/bash -c``, so a ``SLUG=$(...)`` captured during the claim
+    is gone by the time the heartbeat runs -- the same property that makes ``$$``
+    an unusable pid. Hence a pure function of (name, env), evaluated afresh on
+    every verb, rather than a value threaded through the skills.
+
+    RETURNS None WHEN THE SESSION PID IS UNRESOLVABLE -- deliberately, and
+    specifically NOT ``f'{name}-0'``. ``resolve_session_pid`` may degrade to 0
+    because a pid is a LIVENESS probe and 0 is provably dead, which keeps a
+    crashed holder's lease reapable. A slug is an IDENTITY, and ``{name}-0`` is
+    not unique: two concurrently-degraded sessions contending the same lease
+    name would compute an IDENTICAL slug, so each would pass the other's
+    ``_is_lease_owner`` check and could heartbeat or release the other's lease
+    -- exactly 3994 defect 1 ("any caller may evict/refresh any lease") reopened
+    on the degraded path. Refusing to synthesize a token we cannot make unique
+    is the only answer that keeps the ownership guard honest. The CLI turns the
+    None into a loud ``parser.error`` (exit 2) naming ``$CLAUDE_PID`` and the
+    ``--slug`` override -- the same exit-2 class a slug-less ``lease-claim``
+    already produced pre-4248, so only the DERIVABLE case gains new behaviour.
+
+    SILENT ON THE DEGRADED PATH, on purpose: ``resolve_session_pid`` already
+    emits the loud WARNING for an unresolvable ``CLAUDE_PID``, and the CLI then
+    fails loudly on the None. A warning here would be the third report of one
+    fact. The *name* is passed through verbatim -- a lease slug is never a
+    filesystem path (``lease_path_for_name`` sanitizes only the NAME, and
+    ``sanitize_slug`` applies only to session RECORD slugs), so the ``#`` in a
+    task-scoped ``unblock-df#2085`` needs no escaping; see LeaseHolder.session_slug.
+
+    *pid* ACCEPTS AN ALREADY-RESOLVED session pid, so a caller that also needs
+    the pid for something else resolves it ONCE and derives from that single
+    value. ``main()`` uses this on ``lease-claim``, which writes the pid into
+    the lease body AND embeds it in the slug: two independent
+    ``resolve_session_pid()`` calls would agree only by coincidence, and any
+    later change making that function non-deterministic (a cached value, a
+    fallback probe, a re-read of a mutated env) would silently desynchronise
+    the IDENTITY token from the LIVENESS pid the ``holder_liveness`` probe
+    reads. Passing None keeps the self-contained behaviour: resolve from *env*
+    (defaulting to ``os.environ``). *env* is ignored when *pid* is given --
+    the pid IS the resolution.
+    """
+    if pid is None:
+        pid = resolve_session_pid(env)
+    if pid <= 0:
+        return None
+    return f'{name}-{pid}'
 
 
 LEASE_HEARTBEAT_TTL = timedelta(hours=2)
@@ -3139,12 +3205,18 @@ def _run_reap() -> list[ReapedSessionRecord]:
 def _run_lease_claim(name: str, slug: str, pid: int | None, policy_value: str) -> None:
     """Run the ``lease-claim`` verb: ALWAYS prints a ``decision=<value>`` line + message.
 
-    *pid* is None unless the operator explicitly passed ``--pid``, in which
-    case it wins; otherwise ``resolve_session_pid()`` supplies the real
-    long-lived session pid. Resolving it here rather than in the SKILL.md
-    makes the correct pid STRUCTURAL: the ``--pid $$`` defect (task 3994)
-    existed because it depended on every skill doc getting one shell token
-    right.
+    *pid* is the claimant's long-lived session pid. Resolving it in code
+    rather than in the SKILL.md makes the correct pid STRUCTURAL: the
+    ``--pid $$`` defect (task 3994) existed because it depended on every skill
+    doc getting one shell token right.
+
+    ON THE CLI PATH IT ARRIVES ALREADY RESOLVED (task 4248): ``main()`` resolves
+    the session pid ONCE and hands the same value to ``default_lease_slug`` and
+    to this function, so the pid embedded in the slug and the pid written into
+    the lease body cannot desynchronise. The ``pid is None`` fallback below is
+    therefore a defensive path for a DIRECT caller (a test, a future in-process
+    caller), not the CLI's route -- and it stays, so this function remains
+    correct standalone rather than depending on a caller it cannot see.
 
     This carries its OWN fail-open guard, independent of main()'s outer
     try/except: a fault raised by claim_lease itself (a corrupt lease body,
@@ -3163,17 +3235,35 @@ def _run_lease_claim(name: str, slug: str, pid: int | None, policy_value: str) -
         logger.error('lease-claim %s failed', name, exc_info=True)
         print(f'decision={LeaseDecision.PROCEED.value}')
         print(f'lease-claim {name} faulted; proceeding (fail-open)')
+        # `slug=` is emitted here too, while `holder_liveness=` deliberately is
+        # not: the fault made the HOLDER unknown, not US. This is also where
+        # the line is most useful -- the claim's outcome is least certain.
+        print(f'slug={slug}')
         return
     print(f'decision={claim.decision.value}')
     print(claim.message)
-    # ADDITIVE and LAST (task 3994 defect 4): `decision=` stays line 1 and the
-    # message line 2, so a skill parser that reads only the first two lines is
-    # unaffected -- which is why this is an appended line rather than a fourth
-    # LeaseDecision token a not-yet-reloaded skill would face as an
-    # unrecognised value. Lease SEMANTICS are unchanged: we never auto-steal.
-    # This only lets a stand-down name a machine-readable owner, so a watcher
-    # can file a DecisionRecord for a provably-gone holder instead of exiting
-    # silently (INV-6/INV-7).
+    # ADDITIVE and LAST (task 3994 defect 4; extended by task 4248): `decision=`
+    # stays line 1 and the message line 2, so a skill parser that reads only the
+    # first two lines is unaffected -- which is why these are appended lines
+    # rather than a fourth LeaseDecision token a not-yet-reloaded skill would
+    # face as an unrecognised value. Lease SEMANTICS are unchanged: we never
+    # auto-steal. This only lets a stand-down name a machine-readable owner, so
+    # a watcher can file a DecisionRecord for a provably-gone holder instead of
+    # exiting silently (INV-6/INV-7).
+    #
+    # TWO appended lines now: `holder_liveness=` (about the CONTENDING HOLDER)
+    # and, last, `slug=` (about THIS CALLER). The second exists because the
+    # skills no longer pass `--slug` at all: it makes the CLI-derived identity
+    # LEGIBLE, so an agent whose later heartbeat returns `result=refused` can
+    # cross-check what it claimed as against `lease-show`'s holder_slug. It is a
+    # DIAGNOSTIC, explicitly NOT a value for the skills to thread into the next
+    # verb -- a shell variable cannot survive to the next Claude Code Bash tool
+    # call (each is a fresh `/bin/bash -c`), which is precisely why the
+    # derivation had to move into the CLI rather than be printed for quoting.
+    #
+    # The MUTATING verbs deliberately gain no `slug=` line: `_run_lease_mutation`
+    # already names the presented slug alongside the real holder in its refusal
+    # message, so a second line would restate what the caller was just told.
     #
     # THREE values, not two: an ACQUIRED claim has no contending holder at all
     # -- the holder is this caller -- so it prints `none`. This first shipped
@@ -3186,6 +3276,7 @@ def _run_lease_claim(name: str, slug: str, pid: int | None, policy_value: str) -
     # and must not assert one either way.
     if claim.acquired:
         print('holder_liveness=none')
+        print(f'slug={slug}')
         return
     # A SINGLE signal, deliberately: `orphaned` means exactly "the pid
     # recorded in the lease body is not running". This predicate used to
@@ -3213,6 +3304,8 @@ def _run_lease_claim(name: str, slug: str, pid: int | None, policy_value: str) -
     # deliberate, bounded cost of keeping such a lease reapable at all.
     orphaned = claim.holder is not None and not claim.holder_alive
     print(f'holder_liveness={"orphaned" if orphaned else "held"}')
+    # THIS CALLER's slug, never the holder's -- see the block comment above.
+    print(f'slug={slug}')
 
 
 def _run_lease_mutation(
@@ -3678,14 +3771,25 @@ def _build_parser() -> argparse.ArgumentParser:
 
     lease_claim_p = sub.add_parser('lease-claim', help='claim a single-owner-per-role lease (T7)')
     lease_claim_p.add_argument('--name', required=True, help='lease name, see build_lease_name')
-    lease_claim_p.add_argument('--slug', required=True, help="this claimant's own session_slug")
+    lease_claim_p.add_argument(
+        '--slug',
+        default=None,
+        help="this claimant's own session_slug; defaults to "
+        'default_lease_slug(--name) (`<name>-$CLAUDE_PID`). Only pass this as '
+        'an explicit operator override -- the derived value is what every '
+        'later lease-heartbeat/lease-release re-derives and matches against',
+    )
     lease_claim_p.add_argument(
         '--pid',
         type=int,
         default=None,
         help="this claimant's own long-lived session pid; defaults to "
         'resolve_session_pid() ($CLAUDE_PID). Only pass this as an explicit '
-        'operator override -- never `$$`, which is the transient Bash-tool shell',
+        'operator override -- never `$$`, which is the transient Bash-tool shell. '
+        'This is the lease body\'s LIVENESS pid only: it does not supply the '
+        "slug's identity (which always derives from $CLAUDE_PID), so --pid alone "
+        'does not satisfy an underivable --slug -- lease-heartbeat/lease-release '
+        'have no --pid, and a slug only one verb can derive is not an identity',
     )
     lease_claim_p.add_argument(
         '--policy',
@@ -3700,16 +3804,29 @@ def _build_parser() -> argparse.ArgumentParser:
     lease_release_p = sub.add_parser('lease-release', help='release a held lease')
     lease_release_p.add_argument('--name', required=True)
 
-    # Ownership (task 3994): both MUTATING verbs require the claiming slug.
-    # required=True is deliberate -- a silent no-slug fallback would preserve
-    # the "any caller may evict/refresh any lease" defect indefinitely, since
-    # nothing would ever force the call sites to change. A stale invocation
-    # now fails to ACT rather than succeeding at evicting a live holder.
+    # Ownership (task 3994): both MUTATING verbs act only for the lease's
+    # actual holder, identified by slug. AMENDED BY TASK 4248 -- the slug is
+    # now DERIVED (default_lease_slug, in main()) rather than required from the
+    # caller. That does NOT retract 3994's guard. The defect 3994 fixed was that
+    # both verbs mutated UNCONDITIONALLY, with no ownership check at all; the
+    # check still runs, and it now compares against a slug derived from THIS
+    # caller's own $CLAUDE_PID, so a stranger session derives a different slug
+    # and is still `result=refused` with the lease body untouched. What is
+    # retired is only the requirement that the token be SPELLED IN SHELL, which
+    # is exactly what let it drift: 3994 left three SKILL.md files assembling
+    # `<role>-<project>-${CLAUDE_PID:-$PPID}` by hand, and $PPID is measurably
+    # not stable across Claude Code tool calls. `required=True` was a forcing
+    # function to make the call sites pass a slug at all; the call sites have
+    # now been updated, and the derivation is the stronger guarantee -- a caller
+    # can no longer MIS-spell a token it never spells. An unresolvable
+    # $CLAUDE_PID still exits 2 (see main()); it never falls back silently.
     for _lease_mutation_p in (lease_heartbeat_p, lease_release_p):
         _lease_mutation_p.add_argument(
             '--slug',
-            required=True,
-            help='the slug you claimed this lease with; a mismatch is refused',
+            default=None,
+            help='the slug you claimed this lease with; a mismatch is refused. '
+            'Defaults to default_lease_slug(--name) (`<name>-$CLAUDE_PID`), the '
+            'same derivation lease-claim uses -- pass it only as an operator override',
         )
         _lease_mutation_p.add_argument(
             '--force',
@@ -3790,6 +3907,74 @@ def main(argv: list[str] | None = None) -> int:
     """
     parser = _build_parser()
     args = parser.parse_args(argv)
+
+    # ONE derivation point for the lease slug, shared by all three lease verbs
+    # (task 4248). It lives HERE, in main(), and not inside _run_lease_claim /
+    # _run_lease_mutation, because all three must derive a BYTE-IDENTICAL slug
+    # or the whole scheme fails -- a claim the holder's own later heartbeat
+    # cannot match is precisely the drift this change removes. One shared point
+    # makes that structural instead of a three-way convention nobody enforces.
+    # An explicit --slug always wins: it stays the operator's override.
+    #
+    # ONE PID RESOLUTION TOO. `lease-claim` both WRITES a pid (into the lease
+    # body, for the liveness guard) and EMBEDS one (in the derived slug, as this
+    # session's identity). Resolving twice -- once here for the slug, once
+    # inside _run_lease_claim for the body -- would make the two agree only
+    # because they happen to call the same function today; any later change
+    # making resolve_session_pid non-deterministic (a cache, a fallback probe,
+    # a re-read of a mutated env) would silently desynchronise the identity
+    # token from the pid `holder_liveness` probes. So it is resolved HERE, once,
+    # and handed to BOTH: to default_lease_slug via pid=, and to
+    # _run_lease_claim via args.pid. Pinned by
+    # test_main_lease_claim_derives_the_body_pid_and_the_slug_pid_from_one_resolution.
+    # An explicit --pid is the one case where the two legitimately differ: it
+    # overrides the BODY's liveness pid only, deliberately, and never the slug
+    # -- the identity has to stay derivable by the mutating verbs, which have no
+    # --pid at all (see that flag's help, and the parser.error below).
+    #
+    # Resolution is DEMAND-DRIVEN: an explicit --slug on a mutating verb needs
+    # no pid at all (those verbs never write one), and resolving anyway would
+    # emit resolve_session_pid's degradation WARNING for a fact nothing in that
+    # call depends on -- loud degradation is only useful when it is TRUE of the
+    # work being done.
+    if args.verb in ('lease-claim', 'lease-heartbeat', 'lease-release'):
+        needs_session_pid = args.slug is None or (args.verb == 'lease-claim' and args.pid is None)
+        session_pid = resolve_session_pid() if needs_session_pid else None
+        if args.verb == 'lease-claim' and args.pid is None:
+            args.pid = session_pid
+        if args.slug is None:
+            args.slug = default_lease_slug(args.name, pid=session_pid)
+        # FAIL LOUDLY, never silently. default_lease_slug returns None only
+        # when $CLAUDE_PID is unresolvable, and it refuses to synthesize
+        # `<name>-0` because that token is IDENTICAL for two concurrently-
+        # degraded sessions -- each would then pass the other's
+        # _is_lease_owner check, reopening 3994 defect 1. So we stop here.
+        #
+        # This is NOT a breach of _run_lease_claim's fail-open contract.
+        # Fail-open covers lease-SUBSTRATE faults (a corrupt lease body, an
+        # unwritable leases_dir) -- conditions the caller cannot fix and must
+        # not be blocked by. An underivable slug is a CALLER/ENVIRONMENT INPUT
+        # error, exactly the class argparse already exits 2 for, and it is
+        # fixable at the call site (`--slug`). Note also that pre-4248 a
+        # slug-less lease verb exited 2 as well: the undeterminable case KEEPS
+        # its current exit code, and only the derivable case gained a default.
+        #
+        # parser.error raises SystemExit -- a BaseException -- so it
+        # deliberately escapes main()'s `except Exception`, which swallows
+        # faults and returns 0. That escape is the point: this must reach the
+        # shell as a nonzero exit, not as a silently-successful no-op.
+        if not args.slug:
+            parser.error(
+                f'cannot derive the lease slug for --name {args.name}: ${SESSION_PID_ENV} is '
+                'unset or unusable, so this session has no stable identity to claim, '
+                'heartbeat or release a lease with. Refusing to invent one -- a synthesized '
+                'token would collide with every other degraded session and let each act on '
+                "the other's lease. Fix the environment, or pass an explicit "
+                '--slug <stable-token> that this session will re-use on every later lease verb. '
+                'Note --pid does NOT substitute for --slug: it sets the lease body\'s liveness '
+                'pid, not this session\'s identity, and lease-heartbeat/lease-release have no '
+                '--pid at all -- only --slug is honoured by all three verbs.'
+            )
 
     try:
         if args.verb == 'launching':

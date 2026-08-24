@@ -3723,8 +3723,12 @@ def test_main_lease_claim_on_free_name_acquires_and_prints_decision_token(
     # reads as "someone else has it"). `none` is the third token in the
     # vocabulary, and it is pinned here because nothing else exercises it.
     assert lines[0] == 'decision=acquired'
-    assert lines[-1] == 'holder_liveness=none'
-    assert len(lines) == 3
+    assert lines[2] == 'holder_liveness=none'
+    # Task 4248 appended a `slug=` line after it (pinned in that task's own
+    # section); anchored by INDEX here so this keeps asserting the position of
+    # `holder_liveness`, which is what this test is about, rather than silently
+    # re-aiming at whatever line happens to be last.
+    assert len(lines) == 4
     assert sr.lease_path_for_name('watcher-df', root=tmp_path).is_file()
 
 
@@ -3849,7 +3853,9 @@ def test_main_lease_claim_reports_orphaned_for_a_dead_holder_pid(
     lines = _contend_via_cli(tmp_path, capsys, holder_pid=_DEAD_PID)
 
     assert lines[0] == 'decision=stand-down'
-    assert lines[-1] == 'holder_liveness=orphaned'
+    # Anchored by INDEX, not [-1]: task 4248 appended a `slug=` line after this
+    # one, and [-1] would have silently re-aimed at it instead of failing.
+    assert lines[2] == 'holder_liveness=orphaned'
 
 
 def test_main_lease_claim_reports_held_for_an_unreadable_lease_body(
@@ -3866,7 +3872,8 @@ def test_main_lease_claim_reports_held_for_an_unreadable_lease_body(
 
     assert rc == 0
     # 'unknown' must never be promoted to an orphan finding: fail toward held.
-    assert capsys.readouterr().out.splitlines()[-1] == 'holder_liveness=held'
+    # Index, not [-1] -- task 4248's `slug=` line now follows it.
+    assert capsys.readouterr().out.splitlines()[2] == 'holder_liveness=held'
 
 
 class TestLeaseSlugIsNotASessionRecordKey:
@@ -3886,10 +3893,9 @@ class TestLeaseSlugIsNotASessionRecordKey:
     record slugs look like ``architect-dark_factory-3133-25737ee4-...``.
 
     The namespaces differ in all three segments:
-    - the LEASE slug is claimant-chosen, prescribed by the skills as
-      ``<lease-role>-<project>-<session pid>``
-      (skills/escalation-watcher/SKILL.md:50) — there is no production
-      *builder* for it, only shell in a SKILL.md, so it is spelled out here;
+    - the LEASE slug is ``<lease name>-<session pid>``, built by
+      ``default_lease_slug`` (task 4248 moved it out of shell in the SKILLs and
+      into the CLI, for the reason 3994 moved the pid there);
     - the RECORD slug comes from ``build_session_slug(role, project, task,
       <uniqueness token>)``, where the token is a session UUID for a
       hand-launched session (``session_hooks.hook_session_slug``) and the
@@ -3911,8 +3917,16 @@ class TestLeaseSlugIsNotASessionRecordKey:
     SESSION_UUID = '25737ee4-3b1e-4a7f-9f0e-6a1c2d3e4f50'
 
     def _lease_slug(self, project: str = 'df', pid: int = 1894895) -> str:
-        """The lease slug exactly as skills/escalation-watcher/SKILL.md:50 builds it."""
-        return f'watcher-{project}-{sr.resolve_session_pid({sr.SESSION_PID_ENV: str(pid)})}'
+        """The lease slug exactly as production builds it (task 4248).
+
+        Routed through ``default_lease_slug`` rather than hand-building the
+        f-string: the disjointness this class pins is only interesting if the
+        left-hand side is the REAL lease slug, so the helper must break when
+        production's builder changes shape.
+        """
+        slug = sr.default_lease_slug(f'watcher-{project}', {sr.SESSION_PID_ENV: str(pid)})
+        assert slug is not None  # pid > 0, so the builder always derives here
+        return slug
 
     def _record_slug(self, project: str = 'dark_factory') -> str:
         """The record slug exactly as session_hooks.hook_session_slug builds it."""
@@ -3992,6 +4006,115 @@ def test_resolve_session_pid_defaults_to_os_environ(monkeypatch: pytest.MonkeyPa
     assert sr.resolve_session_pid() == 424242
 
 
+# --- default_lease_slug (task 4248) ----------------------------------------
+#
+# 3994 moved the lease PID into code because it depended on every skill doc
+# getting one shell token right. The SLUG stayed in shell -- and 3994 then made
+# it load-bearing, since a mismatch on `lease-heartbeat`/`lease-release` is
+# REFUSED. These tests pin the builder that moves it into code too.
+
+
+def test_default_lease_slug_reproduces_the_measured_production_slug() -> None:
+    """The defaulted slug is BYTE-IDENTICAL to what the WATCHER skills built.
+
+    ``watcher-df-1894895`` is the slug measured in the live fleet root on
+    2026-08-15 and recorded in ``TestLeaseSlugAndRecordSlugAreDisjoint``. This
+    equality is the back-compat oracle FOR THE TWO WATCHER LEASES ONLY --
+    ``watcher-<project>`` and ``recon-watcher-<project>``, whose pre-4248 skill
+    prescription was already ``<name>-${CLAUDE_PID:-$PPID}``. For those, an
+    IN-FLIGHT session that stops passing ``--slug`` keeps its lease with no
+    restart, because the CLI re-derives exactly the token it claimed with.
+
+    It does NOT generalise to ``/unblock`` -- see
+    ``test_the_unblock_lease_slug_shape_changed_at_4248``, which records that
+    asymmetry rather than leaving this docstring to imply it away.
+    """
+    assert sr.default_lease_slug('watcher-df', {sr.SESSION_PID_ENV: '1894895'}) == 'watcher-df-1894895'
+    assert (
+        sr.default_lease_slug('recon-watcher-df', {sr.SESSION_PID_ENV: '1894895'})
+        == 'recon-watcher-df-1894895'
+    )
+
+
+def test_the_unblock_lease_slug_shape_changed_at_4248() -> None:
+    """The `/unblock` lease slug is NOT back-compatible, and that is recorded here.
+
+    The two watcher skills built ``<lease name>-<pid>``, so deriving from the
+    name reproduces their token exactly. ``/unblock`` did not: its lease NAME
+    is ``unblock-<project>#<TASK_ID>`` (``build_lease_name``'s ``#``) while its
+    skill built the slug with a ``-`` separator and no ``#`` at all. Deriving
+    from the name therefore yields a DIFFERENT token.
+
+    ROLLOUT CONSEQUENCE, stated so nobody rediscovers it from a lingering
+    lease: an `/unblock` session that CLAIMED under the pre-4248 prescription
+    and then releases slug-less gets ``result=refused`` -- non-destructive, but
+    its lease lingers and falsely reports a holder to the next `/unblock` on
+    that task until the 2h ``LEASE_HEARTBEAT_TTL`` ages it out. Such a session
+    must either keep passing its ORIGINAL ``--slug`` on release or accept the
+    TTL wait; ``skills/unblock/SKILL.md`` says so at the release step. Sessions
+    that claim after 4248 are unaffected -- both ends derive the same token.
+    """
+    name = sr.build_lease_name('unblock', 'df', '2085')
+    derived = sr.default_lease_slug(name, {sr.SESSION_PID_ENV: '1894895'})
+
+    assert derived == 'unblock-df#2085-1894895'
+    # The exact string the pre-4248 SKILL.md prescribed, for contrast.
+    assert derived != 'unblock-df-2085-1894895'
+
+
+@pytest.mark.parametrize(
+    'env',
+    [
+        {},
+        {'CLAUDE_PID': ''},
+        {'CLAUDE_PID': '   '},
+        {'CLAUDE_PID': 'not-a-pid'},
+        {'CLAUDE_PID': '0'},
+        {'CLAUDE_PID': '-1'},
+    ],
+    ids=['unset', 'empty', 'blank', 'non-numeric', 'zero', 'negative'],
+)
+def test_default_lease_slug_refuses_to_derive_when_the_session_pid_is_unresolvable(
+    env: dict[str, str],
+) -> None:
+    """An underivable slug is None -- and specifically NOT ``f'{name}-0'``.
+
+    Same parametrize set as ``resolve_session_pid``'s degradation sweep, on
+    purpose: these are exactly the envs where that function degrades to pid 0.
+
+    THE assertion is the second one. ``resolve_session_pid`` may degrade to 0
+    because a pid is a LIVENESS probe and 0 is provably dead, which keeps a
+    crashed holder's lease reapable. A slug is an IDENTITY, and ``{name}-0``
+    is not unique: two concurrently-degraded sessions contending the same lease
+    name would compute an IDENTICAL slug, so each would pass the other's
+    ``_is_lease_owner`` check and could heartbeat or release the other's lease
+    -- 3994 defect 1 ("any caller may evict/refresh any lease") reopened on the
+    degraded path. Refusing to synthesize a token it cannot make unique is the
+    only answer that keeps the ownership guard honest; the CLI then exits 2 and
+    names ``--slug`` as the escape hatch.
+    """
+    assert sr.default_lease_slug('watcher-df', env) is None
+    assert sr.default_lease_slug('watcher-df', env) != 'watcher-df-0'
+
+
+def test_default_lease_slug_defaults_to_os_environ(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv('CLAUDE_PID', '424242')
+    assert sr.default_lease_slug('watcher-df') == 'watcher-df-424242'
+
+
+def test_default_lease_slug_passes_a_task_scoped_name_through_verbatim() -> None:
+    """``build_lease_name``'s ``#`` separator survives into the slug untouched.
+
+    A lease slug is never a filesystem path: ``lease_path_for_name`` sanitizes
+    only the NAME, and ``sanitize_slug`` applies only to session-RECORD slugs.
+    A lease slug lives inside the lease's JSON body and is compared for
+    equality alone, so the task-scoped ``unblock-df#2085`` needs no escaping.
+    """
+    name = sr.build_lease_name('unblock', 'df', '2085')
+    assert name == 'unblock-df#2085'
+    assert sr.default_lease_slug(name, {sr.SESSION_PID_ENV: '55'}) == 'unblock-df#2085-55'
+
+
 def test_a_degraded_pid_lease_still_ages_out_and_is_reaped(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -4055,6 +4178,205 @@ def test_main_lease_claim_explicit_pid_still_overrides_the_env(
     assert sr.LeaseHolder.from_json(lease_path.read_text()).pid == _DEAD_PID
 
 
+def test_main_lease_claim_without_slug_writes_the_derived_lease_slug(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`--slug` is now optional on lease-claim and defaults like `--pid` does.
+
+    Same shape as the `--pid` pair above, on purpose: the two CLI-owned tokens
+    should read as ONE pattern rather than two conventions.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    # Deliberately NOT this process's own pid, so an env-blind implementation
+    # (e.g. one reaching for os.getpid()) cannot pass by coincidence.
+    monkeypatch.setenv('CLAUDE_PID', str(_DEAD_PID))
+
+    rc = sr.main(['lease-claim', '--name', 'watcher-df'])
+
+    assert rc == 0
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    assert (
+        sr.LeaseHolder.from_json(lease_path.read_text()).session_slug
+        == f'watcher-df-{_DEAD_PID}'
+    )
+
+
+def test_main_lease_claim_derives_the_body_pid_and_the_slug_pid_from_one_resolution(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A no-flag claim's IDENTITY pid and its LIVENESS pid come from ONE resolution.
+
+    The slug embeds a pid and the lease body records one. If each were resolved
+    independently they would agree only because both happen to call the same
+    function today: any later change making `resolve_session_pid`
+    non-deterministic (a cache, a fallback probe, a re-read of a mutated env)
+    would silently desynchronise the identity token from the pid
+    `holder_liveness` probes — a lease whose slug names a different session than
+    its own liveness check. So `main()` resolves once and feeds both, and this
+    pins the resulting equality rather than the implementation.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    monkeypatch.setenv('CLAUDE_PID', str(_DEAD_PID))
+
+    rc = sr.main(['lease-claim', '--name', 'watcher-df'])
+
+    assert rc == 0
+    holder = sr.LeaseHolder.from_json(sr.lease_path_for_name('watcher-df', root=tmp_path).read_text())
+    assert holder.pid == int(holder.session_slug.rsplit('-', 1)[1])
+    assert holder.pid == _DEAD_PID
+
+
+def test_an_explicit_pid_does_not_satisfy_an_underivable_slug(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """`--pid` is the body's LIVENESS pid, not this session's IDENTITY.
+
+    The two CLI-owned tokens read as one pattern in the skills ("the CLI owns
+    both"), so an operator on the degraded path may reach for the documented
+    `--pid` and expect it to unblock a slug-less claim. It deliberately does
+    not, and this pins that: `lease-heartbeat`/`lease-release` have no `--pid`
+    at all, so a slug derived from one would be derivable by the CLAIM alone —
+    an identity the session's own later release could not reproduce, which is
+    the exact drift task 4248 removes. `--slug` is the escape hatch precisely
+    because all three verbs honour it. The refusal must SAY so, or the operator
+    just retries with a bigger `--pid`.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    monkeypatch.delenv('CLAUDE_PID', raising=False)
+
+    with pytest.raises(SystemExit) as excinfo:
+        sr.main(['lease-claim', '--name', 'watcher-df', '--pid', str(_DEAD_PID)])
+
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert '--pid' in err
+    assert '--slug' in err
+    assert not sr.lease_path_for_name('watcher-df', root=tmp_path).exists()
+
+
+def test_main_lease_claim_explicit_slug_still_overrides_the_derived_default(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    monkeypatch.setenv('CLAUDE_PID', str(os.getpid()))
+
+    rc = sr.main(['lease-claim', '--name', 'watcher-df', '--slug', 'watcher-df-OPERATOR'])
+
+    assert rc == 0
+    # An explicit --slug remains a deliberate operator override, never shadowed.
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    assert sr.LeaseHolder.from_json(lease_path.read_text()).session_slug == 'watcher-df-OPERATOR'
+
+
+# --- lease-claim's `slug=` diagnostic line (task 4248) ---------------------
+#
+# ADDITIVE and LAST, under 3994's discipline: `decision=` stays line 1 and the
+# human message line 2, so a not-yet-reloaded skill parser reading only the
+# first two lines is unaffected. What the line is FOR, now that the skills no
+# longer pass `--slug`: it makes the CLI-derived identity LEGIBLE, so an agent
+# can cross-check it against `lease-show`'s holder_slug when a heartbeat comes
+# back `result=refused`. It is a diagnostic, NOT a value to thread into the
+# next call -- a shell variable cannot survive to the next Claude Code Bash
+# tool call, which is exactly why the derivation had to move into the CLI.
+
+
+def test_main_lease_claim_prints_the_derived_slug_last_on_the_acquired_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    monkeypatch.setenv('CLAUDE_PID', str(_DEAD_PID))
+
+    rc = sr.main(['lease-claim', '--name', 'watcher-df'])
+
+    assert rc == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0] == 'decision=acquired'
+    assert lines[2] == 'holder_liveness=none'
+    assert lines[3] == f'slug=watcher-df-{_DEAD_PID}'
+    assert len(lines) == 4
+
+
+def test_main_lease_claim_slug_line_names_this_caller_not_the_holder(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """On a stand-down the `slug=` line is about US; `holder_liveness=` is about THEM.
+
+    Confusing the two would make the line actively misleading in the one
+    situation it exists for — reconciling a refusal against `lease-show`.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    _claim_via_cli(slug='watcher-df-OTHER', pid=_DEAD_PID)
+    capsys.readouterr()
+    monkeypatch.setenv('CLAUDE_PID', str(os.getpid()))
+
+    rc = sr.main(['lease-claim', '--name', 'watcher-df'])
+
+    assert rc == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0] == 'decision=stand-down'
+    # DETERMINISTIC, not "either value": the holder above was seeded with
+    # `_DEAD_PID`, which `test_main_lease_claim_reports_orphaned_for_a_dead_holder_pid`
+    # already pins as `orphaned`. Accepting `held` too would buy nothing and
+    # would read as if the outcome were nondeterministic.
+    assert lines[2] == 'holder_liveness=orphaned'
+    assert lines[3] == f'slug=watcher-df-{os.getpid()}'
+    assert 'watcher-df-OTHER' not in lines[3]
+
+
+def test_main_lease_claim_prints_the_slug_line_even_when_it_fails_open(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The fail-open path keeps its 3994 silence about the HOLDER, but not about US.
+
+    `holder_liveness=` stays ABSENT on a substrate fault, deliberately: we know
+    nothing about a holder and must not assert one either way. The slug is a
+    different fact — it is this caller's own derived identity, which the fault
+    did not make unknown — so it is still emitted, and is in fact most useful
+    here, where the claim's outcome is least certain.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    monkeypatch.setenv('CLAUDE_PID', str(_DEAD_PID))
+
+    def _boom(*_args: object, **_kwargs: object) -> sr.LeaseClaim:
+        raise OSError('lease substrate on fire')
+
+    monkeypatch.setattr(sr, 'claim_lease', _boom)
+
+    with caplog.at_level(logging.ERROR):
+        rc = sr.main(['lease-claim', '--name', 'watcher-df'])
+
+    assert rc == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0] == 'decision=proceed'
+    assert lines[2] == f'slug=watcher-df-{_DEAD_PID}'
+    assert not any(line.startswith('holder_liveness=') for line in lines)
+
+
+def test_main_lease_claim_echoes_an_explicit_slug_verbatim(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    monkeypatch.setenv('CLAUDE_PID', str(_DEAD_PID))
+
+    rc = sr.main(['lease-claim', '--name', 'watcher-df', '--slug', 'watcher-df-OPERATOR'])
+
+    assert rc == 0
+    # The line reports the slug ACTUALLY claimed with, not the one that would
+    # have been derived — otherwise it would misreport the override path.
+    assert capsys.readouterr().out.splitlines()[-1] == 'slug=watcher-df-OPERATOR'
+
+
 # --- CLI ownership on the mutating verbs (task 3994 defect 1) -------------
 
 
@@ -4072,19 +4394,173 @@ def _claim_via_cli(slug: str = 'watcher-df-100', pid: int | None = None) -> None
     )
 
 
-@pytest.mark.parametrize('verb', ['lease-heartbeat', 'lease-release'])
-def test_main_lease_mutating_verbs_require_slug(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, verb: str
+@pytest.mark.parametrize('verb', ['lease-claim', 'lease-heartbeat', 'lease-release'])
+def test_main_lease_verbs_refuse_loudly_when_the_slug_cannot_be_derived(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    verb: str,
 ) -> None:
-    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
-    _claim_via_cli()
+    """An underivable slug FAILS LOUDLY — it never drifts to a colliding token.
 
-    # A pre-3994 invocation must now FAIL LOUDLY rather than silently
-    # evicting/refreshing a lease it may not hold. argparse exits 2.
+    This is the half of task 4248 that is not "move it into the CLI": having
+    moved it, the CLI must refuse rather than synthesize. `{name}-0` would be
+    IDENTICAL for two concurrently-degraded sessions, so each would pass the
+    other's `_is_lease_owner` check — 3994 defect 1 reopened. Exit 2 is not a
+    regression: pre-4248 a slug-less lease verb ALSO exited 2, so the
+    underivable case keeps its exit code and only the derivable case changed.
+
+    The stderr assertions matter as much as the code: an operator who is
+    refused must also be told the escape hatch, not merely told no.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    monkeypatch.setenv('CLAUDE_PID', str(os.getpid()))
+    _claim_via_cli()
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    original_body = lease_path.read_text()
+    capsys.readouterr()
+
+    monkeypatch.delenv('CLAUDE_PID', raising=False)
     with pytest.raises(SystemExit) as excinfo:
         sr.main([verb, '--name', 'watcher-df'])
 
     assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert 'CLAUDE_PID' in err
+    assert '--slug' in err
+    # Nothing was mutated on the way out.
+    assert lease_path.read_text() == original_body
+
+
+def test_the_read_only_lease_verbs_stay_usable_when_the_slug_cannot_be_derived(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """DIAGNOSIS must survive the degraded path the exit-2 refusal creates.
+
+    `lease-show` and `lease-reap` are exactly what a refused or degraded
+    operator is sent to next — `_run_lease_mutation`'s `result=refused` message
+    ends "inspect with `lease-show --name <name>`", and both watcher SKILLs say
+    the same — so the guard must cover only the three SLUG-BEARING verbs.
+    Nothing else pins that:
+    the guard is scoped by a hardcoded verb tuple, and widening it (or hoisting
+    it above the verb check) would leave every new test green while removing
+    the operator's only way to see WHY they were refused.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    monkeypatch.setenv('CLAUDE_PID', str(os.getpid()))
+    _claim_via_cli()
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    capsys.readouterr()
+
+    monkeypatch.delenv('CLAUDE_PID', raising=False)
+
+    # Read-only inspection: still prints its normal key=value report.
+    assert sr.main(['lease-show', '--name', 'watcher-df']) == 0
+    shown = dict(line.split('=', 1) for line in capsys.readouterr().out.splitlines())
+    assert shown['name'] == 'watcher-df'
+    assert shown['holder_slug'] == 'watcher-df-100'
+
+    # The sweep: also unguarded, and a live holder is still not reaped.
+    assert sr.main(['lease-reap']) == 0
+    assert lease_path.is_file()
+
+
+def test_an_explicit_slug_is_still_the_escape_hatch_under_an_unresolvable_pid(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The refusal above is escapable, and does not break the degraded-pid path.
+
+    `test_a_degraded_pid_lease_still_ages_out_and_is_reaped` depends on being
+    able to CLAIM a lease with an unresolvable `CLAUDE_PID` (recording pid 0, so
+    a crashed holder still ages out). Refusing to DERIVE a slug must not refuse
+    to ACCEPT one — the operator supplies a stable token and the pid degrades
+    exactly as 3994 designed.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    monkeypatch.delenv('CLAUDE_PID', raising=False)
+
+    rc = sr.main(['lease-claim', '--name', 'watcher-df', '--slug', 'watcher-df-degraded'])
+
+    assert rc == 0
+    holder = sr.LeaseHolder.from_json(sr.lease_path_for_name('watcher-df', root=tmp_path).read_text())
+    assert holder.session_slug == 'watcher-df-degraded'
+    assert holder.pid == 0
+
+
+# `test_main_lease_mutating_verbs_require_slug` lived here until task 4248.
+# It asserted that OMITTING `--slug` exits 2 — true only while the token had
+# to be spelled in shell. It is superseded, not dropped: its surviving half
+# (an UNDERIVABLE slug exits 2 rather than defaulting to a colliding token) is
+# now pinned across all THREE lease verbs by
+# `test_main_lease_verbs_refuse_loudly_when_the_slug_cannot_be_derived`, and
+# the ownership guarantee it was really protecting is pinned directly by
+# `..._still_refuse_a_stranger_with_a_derived_slug` below. It was also quietly
+# env-dependent: it never unset `CLAUDE_PID`, so post-4248 it would pass or
+# fail on ambient environment rather than on behaviour.
+
+
+@pytest.mark.parametrize('verb', ['lease-heartbeat', 'lease-release'])
+def test_main_lease_mutating_verbs_derive_the_owners_slug_when_it_is_omitted(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    verb: str,
+) -> None:
+    """THE POINT of task 4248: the CLI re-derives the same slug across invocations.
+
+    Claim and mutate are separate Claude Code Bash tool calls in production —
+    separate `/bin/bash -c` processes — so nothing can be carried between them.
+    Both derive from `$CLAUDE_PID`, so the owner matches itself without ever
+    spelling the token in shell.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    monkeypatch.setenv('CLAUDE_PID', str(_DEAD_PID))
+    sr.main(['lease-claim', '--name', 'watcher-df'])
+    capsys.readouterr()
+
+    rc = sr.main([verb, '--name', 'watcher-df'])
+
+    assert rc == 0
+    assert capsys.readouterr().out.splitlines()[0] == 'result=applied'
+
+
+@pytest.mark.parametrize('verb', ['lease-heartbeat', 'lease-release'])
+def test_main_lease_mutating_verbs_still_refuse_a_stranger_with_a_derived_slug(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    verb: str,
+) -> None:
+    """THE GUARD TEST: defaulting `--slug` is a CALLER-DERIVED default, not a fallback.
+
+    3994's `required=True` comment reads "a silent no-slug fallback would
+    preserve the 'any caller may evict/refresh any lease' defect indefinitely".
+    This pins that the defect stays fixed. The defect 3994 closed was that both
+    verbs mutated UNCONDITIONALLY — no ownership check ran at all. The check
+    still runs; it now compares against a slug derived from THIS caller's own
+    `$CLAUDE_PID`, so a DIFFERENT session derives a DIFFERENT slug and is
+    refused, with the lease body untouched. What 4248 retires is only the
+    requirement that the token be spelled in shell — which is what let it drift.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    monkeypatch.setenv('CLAUDE_PID', str(_DEAD_PID))
+    sr.main(['lease-claim', '--name', 'watcher-df'])
+    capsys.readouterr()
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    original_body = lease_path.read_text()
+
+    # A different session: same lease name, its own (different) session pid.
+    monkeypatch.setenv('CLAUDE_PID', str(_DEAD_PID - 1))
+    rc = sr.main([verb, '--name', 'watcher-df'])
+
+    assert rc == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0] == 'result=refused'
+    # The human line names the REAL holder — the first session's derived slug.
+    assert f'watcher-df-{_DEAD_PID}' in lines[1]
+    assert lease_path.read_text() == original_body
 
 
 @pytest.mark.parametrize('verb', ['lease-heartbeat', 'lease-release'])
