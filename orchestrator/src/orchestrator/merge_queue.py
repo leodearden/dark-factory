@@ -9970,16 +9970,23 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         self-requeue, the operator-halt mid-verify abort, the dead-verify
         no-progress abort, the ``MergeVerifyLeaseContended`` defer, the
         pre-dispatch operator halt in :meth:`_dispatch_item`, and — task 3185,
-        PRD γ — the deep-tip verify's two NON-ADOPTING exits in
-        :meth:`_run_inflight_verify`: the tip pass/fail exit and (review fix 3)
-        the chain-arm ``except Exception`` exit. Those last two are the odd
-        ones out in WHY they defer: the other five are all "something went
-        wrong, come back later", while these defer because the verdict is
-        about the WRONG TREE. A tip verdict proves the cumulative tree, never
-        the dispatching item's own subset tree — so adopting it would land work
-        from a tree nothing verified (the pass arm) or terminally fail a task
-        whose own tree was never run (the error arm). Requeuing is how γ
-        dispatches deep chains while landing nothing and blaming nothing.
+        PRD γ, narrowed by task 3186, PRD δ — the deep-tip verify's two
+        NON-ADOPTING exits in :meth:`_run_inflight_verify`: the tip-FAIL exit
+        and (review fix 3) the chain-arm ``except Exception`` exit. Those last
+        two are the odd ones out in WHY they defer: the other five are all
+        "something went wrong, come back later", while these defer because the
+        verdict is about the WRONG TREE. A tip verdict proves the cumulative
+        tree, never any individual member's own subset tree — so a red tip
+        names no culprit to blame (the fail arm) and an infra error is not a
+        verdict about anyone at all (the error arm).
+
+        The tip-PASS exit used to be a third such caller and is NOT one any
+        more: δ adopts there, because the cumulative tree that went green is a
+        verified SUPERSET of every contiguous-prefix member, so the whole
+        prefix lands through :meth:`_finalize_inflight`'s in-order CAS walk.
+        A future edit that re-adds a requeue on that arm would double-land the
+        prefix — queued AND landed is exactly what this recipe's three effects
+        exist to make impossible.
 
         Three effects, and all three are load-bearing:
 
@@ -17560,6 +17567,64 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 self._git_ops, chain.lane, warm=chain.lane_warm,
             )
 
+        _chain_item_wt_dropped = False
+        _chain_adopting = False
+
+        async def _drop_chain_item_ephemeral_wt() -> None:
+            """Drop the chain-dispatched item's ephemeral ``_merge-<uuid>``, once.
+
+            ── task 3185 (PRD γ): the chain arm's worktree bookkeeping ──
+            The lane already holds the tip (``build_chain`` merged the whole
+            chain in it), so there is nothing to swap INTO — hence the
+            ``chain is None`` guard on the warm-swap block below.  What remains
+            is the mirror image of that block's own
+            ``_deregister_owned_merge_worktree(item.merge_wt)`` line: the
+            ephemeral ``_merge-<uuid>`` this item was merged in is dead weight,
+            and BOTH ways of leaving it behind are bugs.  Left REGISTERED,
+            ``_touch_owned_merge_worktrees`` re-pins its root mtime every
+            heartbeat and ``keep_worktrees`` exempts it from reaping —
+            immortal.  Left on disk UNREGISTERED, it trips the I6
+            ``worktree_ledger_violations`` audit once it ages past the grace
+            window.  ``_cleanup_owned_merge_worktree`` does both halves in the
+            deregister-before-cleanup order that keeps a failed git cleanup
+            from immortalising the ledger entry.
+
+            ── task 3186 (PRD δ): WHY THIS IS DEFERRED, not eager ──
+            γ dropped this worktree at the TOP of the try, before the verify
+            even started, because the chain arm's every exit re-queued the
+            request — so the tree was guaranteed dead weight.  δ adds one exit
+            where it is NOT: on a green tip the item LANDS, and
+            ``_finalize_inflight``'s PASS arm asserts a non-None ``merge_wt``
+            and threads it into ``advance_main``.  Deferring the drop to the
+            ``finally`` (skipped only on that adopting exit) is what lets the
+            adopting return hand a LIVE worktree onward.
+
+            The alternative — returning ``chain.lane`` — is forbidden:
+            merge_types.py:1458-1464 records that the lane is already back in
+            the pool by the time ``_finalize_inflight`` sees the entry, so it
+            is never a release handle, and disposing it there would
+            ``git worktree remove`` a pooled lane and permanently lose the slot.
+
+            Deferring costs the ephemeral worktree's disk for the length of the
+            verify rather than releasing it up front.  That is the price of the
+            adopting exit, and it is bounded by exactly one worktree per
+            in-flight deep verify.  Nothing else changes: the item stays
+            REGISTERED throughout (so the I6 ledger stays consistent and the
+            heartbeat keeps it alive), and the ``finally`` placement makes the
+            drop structural across the abort, defer, fail and error exits
+            rather than a per-branch discipline a future edit could forget.
+            """
+            nonlocal _chain_item_wt_dropped
+            if chain is None or _chain_item_wt_dropped:
+                return
+            _chain_item_wt_dropped = True
+            # Dropping the worktree does NOT endanger the item's merge COMMIT:
+            # the chain lane has descendants of it checked out, so it stays
+            # reachable — and on every path that reaches here the request is
+            # re-queued, so it will be re-merged from scratch rather than
+            # reusing this tree.
+            await self._cleanup_owned_merge_worktree(item.merge_wt)
+
         async def _dispose_verify_worktree() -> None:
             """Dispose of the worktree THIS verify ran in, routing by arm.
 
@@ -17582,29 +17647,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             await self._release_or_cleanup(merge_wt, spec_warm=_spec_warm)
 
         try:
-            if chain is not None:
-                # ── task 3185 (PRD γ): the chain arm's worktree bookkeeping ──
-                # The lane already holds the tip (build_chain merged the whole
-                # chain in it), so there is nothing to swap INTO — hence the
-                # `chain is None` guard on the warm-swap block below.  What
-                # remains is the mirror image of that block's own
-                # `_deregister_owned_merge_worktree(item.merge_wt)` line: the
-                # ephemeral `_merge-<uuid>` this item was merged in is now dead
-                # weight, and BOTH ways of leaving it behind are bugs.  Left
-                # REGISTERED, `_touch_owned_merge_worktrees` re-pins its root
-                # mtime every heartbeat and `keep_worktrees` exempts it from
-                # reaping — immortal.  Left on disk UNREGISTERED, it trips the
-                # I6 `worktree_ledger_violations` audit once it ages past the
-                # grace window.  `_cleanup_owned_merge_worktree` does both
-                # halves in the deregister-before-cleanup order that keeps a
-                # failed git cleanup from immortalising the ledger entry.
-                #
-                # Dropping the worktree does NOT endanger the item's merge
-                # COMMIT: the chain lane has descendants of it checked out, so
-                # it stays reachable — and the request is re-queued from here
-                # anyway (see the non-adopting exit), so it will be re-merged
-                # from scratch rather than reusing this tree.
-                await self._cleanup_owned_merge_worktree(item.merge_wt)
+            # task 3186 (PRD δ): the chain arm's ephemeral `_merge-<uuid>` used
+            # to be dropped HERE, before the verify.  It now drops in the
+            # `finally` instead, so the one exit that needs it alive — the
+            # adopting tip-pass return — can hand it to the finalize half.  See
+            # `_drop_chain_item_ephemeral_wt`.
             if lease.is_local and chain is None:
                 # ── LOCAL path: persistent warm-merge-verify worktree swap ──
                 # Mirrors _verify_and_advance (PRD §10 κ): increment the attempt
@@ -17770,6 +17817,17 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 )
                 if verify_task in done:
                     out = verify_task.result()
+                    # ── task 3186 (PRD δ): THE ADOPT DECISION ──────────────
+                    # Made HERE, the moment the verdict exists, because the
+                    # `finally` below runs BEFORE the chain arm's exit block
+                    # and must already know whether to drop this item's
+                    # ephemeral worktree or hand it onward.  `out is None` is
+                    # this method's own vocabulary for a pass, so a low-disk
+                    # `verify_skipped` is not-a-pass and does not adopt — the
+                    # conservative direction.  An EXCEPTION never reaches this
+                    # line at all, which is precisely why the error arm stays
+                    # non-adopting (merge_queue.py's soundness rule below).
+                    _chain_adopting = chain is not None and out is None
                     break
                 # Abort trigger 1 — sole-waiter gave up (future cancelled):
                 # DROP the request.  Checked first so a gave-up waiter wins
@@ -18582,6 +18640,18 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # out from under it.
             await _release_chain_lane()
 
+            # ── task 3186 (PRD δ): the chain item's EPHEMERAL worktree ──────
+            # Same "every exit" argument as the lane release directly above,
+            # with one carve-out: the adopting tip-pass exit hands this
+            # worktree to `_finalize_inflight`, which disposes of it through
+            # `_release_or_cleanup` once the CAS advance is done.  Every other
+            # exit — tip fail, all three aborts, both defer arms, and any
+            # exception — re-queues the request, so the tree is dead weight and
+            # drops here.  See `_drop_chain_item_ephemeral_wt` for why this
+            # moved out of the top of the try.
+            if not _chain_adopting:
+                await _drop_chain_item_ephemeral_wt()
+
         # task 2420 amend (reviewer finding #1): verify_task returned a
         # result HERE at all — pass, fail, or skipped — which proves this
         # task's verify subprocess was not hung.  Clear the per-task
@@ -18605,40 +18675,40 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         self._clear_contended_lease_streak(req.task_id)
 
         if chain is not None:
-            # ══ task 3185 (PRD γ): THE NON-ADOPTING EXIT ═══════════════════
+            # ══ task 3186 (PRD δ): THE ONE-DIRECTIONAL ADOPTING EXIT ═══════
             #
-            # SOUNDNESS RULE — a tip verdict proves the CUMULATIVE tree, never
-            # the dispatching item's own SUBSET tree.  `out is None` here means
-            # "item + every chained successor, merged together, is green"; it
-            # does NOT license landing item alone, whose tree was never
-            # verified.  Letting this verdict reach _finalize_inflight's CAS
-            # advance would land work from a tree nothing ever ran — precisely
-            # the new false-green path the PRD forbids ("Landing safety is
-            # structural... There is no new false-green path").
+            # SOUNDNESS RULE (γ's, unchanged) — a tip verdict proves the
+            # CUMULATIVE tree, never any individual member's own SUBSET tree.
+            # `out is None` here means "the dispatching item plus every chained
+            # successor, merged together, is green".
             #
-            # The rule is SYMMETRIC, and both directions are enforced (task
-            # 3185 review fix 3): because the tip's verdict is about the
-            # cumulative tree, it may neither LAND the item on a tip pass (this
-            # exit) nor BLOCK it on a tip ERROR (the `chain is not None` branch
-            # in the `except Exception` handler above, which defers by the same
-            # REQUEUED recipe).  The green half alone is not the fence — a
-            # chain-caused `Verification error:` terminally failing a task
-            # whose own tree was never run is the same unsound attribution
-            # pointing the other way.  δ (3186) replaces only the PASS arm; the
-            # exception arm stays non-adopting under δ too.
+            # WHAT THAT LICENSES, AND WHAT IT DOES NOT.  The chain is a
+            # CONTIGUOUS PREFIX in land order (build_chain's decision-4 purity;
+            # merge_queue.py's `_frozen_base_chain`), so each prefix member's
+            # landed tree is a SUBSET of the tip tree that just went green —
+            # every line of it ran.  A green tip therefore does license landing
+            # the whole prefix, in order, by CAS; that is δ's walk, and it
+            # lives in `_finalize_inflight`, which owns the CAS advance half.
+            # This exit's only job is to say "adopt", by returning an ordinary
+            # PASS-shaped result (`outcome=None`, `status=None`).
             #
-            # So BOTH arms — tip pass and tip fail — take the REQUEUED
-            # sentinel: nothing lands via the chain in γ, the items stay
-            # queued, and each takes its ordinary sequential path.  δ (task
-            # 3186) replaces the PASS arm with the in-order CAS walk over
-            # `chain.links`, and that is the ONLY place adoption may ever be
-            # introduced.
+            # THE OTHER TWO ARMS STAY EXACTLY AS γ SHIPPED THEM, and the
+            # asymmetry is the whole of the licence:
+            #   * A tip FAIL proves the cumulative tree is red.  It does NOT
+            #     identify WHICH member broke it, so terminally failing any of
+            #     them would be the same unsound attribution pointing the other
+            #     way.  It defers, by the REQUEUED recipe below.
+            #   * A chain-arm EXCEPTION is not a tip verdict at all — an infra
+            #     error proves nothing about anyone.  Its branch in the
+            #     `except Exception` handler above defers by the same recipe
+            #     and never reaches this block.
             #
             # A corollary the PRD's boundary sketch calls out: REQUEUED emits
             # no `merge_attempt` and no blocked `MergeOutcome`, so consecutive
             # deep fails cannot feed workflow.py's `consecutive_merge_thrash`
             # ladder — the same false-positive-escalation class build_chain's
-            # own decision-4 purity comment guards against upstream.
+            # own decision-4 purity comment guards against upstream.  δ's walk
+            # preserves that on its own abort path too (see the walk).
             #
             # The halving state is fed the BUILT depth in chain-item units
             # (the dispatching item is #1), not the target that was requested,
@@ -18647,14 +18717,45 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # therefore counts as not-a-pass, which is the conservative
             # direction (it walks toward the d=1 floor, never inflating depth).
             # An EXCEPTION exit never reaches here at all — an infra error is
-            # not a tip verdict and must not move the policy.
+            # not a tip verdict and must not move the policy.  This feed is
+            # SHARED by both arms and stays above the split, so adoption cannot
+            # drift it.
             _chain_depth = 1 + len(chain.links)
             self._note_chain_outcome(out is None, _chain_depth)
+
+            if _chain_adopting:
+                logger.info(
+                    'Task %s: deep tip verify end (tip=%s, items=%d, passed=True) '
+                    '— ADOPTING: handing the prefix to the in-order CAS walk in '
+                    '_finalize_inflight',
+                    req.task_id, merge_commit[:8], _chain_depth,
+                )
+                # THE WORKTREE HANDOFF.  `_finalize_inflight`'s PASS arm
+                # asserts a non-None `merge_wt` and threads it into
+                # `advance_main` (where it is used only for the rebase-retry
+                # path) and then into `_release_or_cleanup` for disposal.  What
+                # it gets is this item's own ephemeral `_merge-<uuid>`, kept
+                # alive for exactly this purpose by the `finally`'s
+                # `_chain_adopting` carve-out.
+                #
+                # NOT `chain.lane`: merge_types.py:1458-1464 records that the
+                # lane is already back in the pool by the time the finalize
+                # half sees the entry, so it is never a release handle, and
+                # disposing it there would `git worktree remove` a pooled lane.
+                # `spec_warm=False` for the same reason — this is an ephemeral
+                # worktree, not a warm `_spec-` lane, and the disposal routes
+                # on that flag.
+                return InflightVerifyResult(
+                    outcome=None,
+                    merge_wt=item.merge_wt,
+                    spec_warm=False,
+                )
+
             logger.info(
-                'Task %s: deep tip verify end (tip=%s, items=%d, passed=%s) — '
-                're-queuing; γ dispatches deep chains but lands nothing (δ/3186 '
-                'owns the in-order prefix walk)',
-                req.task_id, merge_commit[:8], _chain_depth, out is None,
+                'Task %s: deep tip verify end (tip=%s, items=%d, passed=False) '
+                '— re-queuing; a red tip names no culprit, so every chained '
+                'item takes its ordinary sequential path',
+                req.task_id, merge_commit[:8], _chain_depth,
             )
             # THE chokepoint, not a bare put_nowait: all three of its effects
             # are load-bearing here exactly as they are at the operator-halt

@@ -1419,6 +1419,18 @@ def _fake_pass_runner(name: str = 'fake-runner'):
     return fake
 
 
+_NON_ADOPTING_ARMS = [
+    pytest.param(False, None, id='tip-fail'),
+    pytest.param(True, RuntimeError('verify infra exploded'), id='chain-arm-error'),
+]
+"""The two arms that keep γ's REQUEUED recipe verbatim under δ (task 3186).
+
+``(passed, raises)``.  The error arm passes ``passed=True`` deliberately — the
+verdict it would have produced is irrelevant, because the exception preempts it;
+what the arm proves is that an infra error is not a tip verdict at all.
+"""
+
+
 def _fail_verify_result():
     """A failing :class:`VerifyResult` — a RED tip verdict."""
     from orchestrator.verify import VerifyResult
@@ -1899,31 +1911,73 @@ class TestRunInflightVerifyChainRedirect:
             'this terminal exit clears one even if some earlier round set it'
         )
 
-    async def test_item_ephemeral_worktree_is_disposed_not_stranded(
-        self, git_repo: Path, monkeypatch,
-    ):
-        """The item's own merge worktree is unused on this arm — clean it.
+    async def _ephemeral_scene(self, git_repo: Path, monkeypatch, **verify_kw):
+        """Drive the chain arm with a REGISTERED ephemeral worktree.
 
-        The verify runs in the chain lane, so the ephemeral ``_merge-<uuid>``
-        the item was merged in is dead weight.  Leaving it registered pins its
-        mtime forever via the heartbeat; leaving it on disk UNregistered trips
-        the I6 worktree-ledger audit once it ages past the grace window.
+        Returns ``(worker, ephemeral, cleaned, res)`` where *cleaned* records
+        the ``cleanup_merge_worktree`` calls this method made.
         """
         git_ops, worker, item, chain, _head = await self._fixture(git_repo)
         ephemeral = _ephemeral_merge_wt(git_ops, 'deadbeef')
         item.merge_wt = ephemeral
         worker._register_owned_merge_worktree(ephemeral)
-        _spy_post_merge_verify(monkeypatch)
+        _spy_post_merge_verify(monkeypatch, **verify_kw)
         cleaned: list[Path] = []
         monkeypatch.setattr(
             git_ops, 'cleanup_merge_worktree',
             lambda wt: cleaned.append(wt) or asyncio.sleep(0),
         )
 
-        await worker._run_inflight_verify(item, _local_lease(), chain=chain)
+        res = await worker._run_inflight_verify(item, _local_lease(), chain=chain)
+        return worker, ephemeral, cleaned, res
+
+    @pytest.mark.parametrize(('passed', 'raises'), _NON_ADOPTING_ARMS)
+    async def test_item_ephemeral_worktree_is_disposed_not_stranded(
+        self, git_repo: Path, monkeypatch, passed: bool, raises,
+    ):
+        """The item's own merge worktree is unused on these arms — clean it.
+
+        The verify runs in the chain lane, so the ephemeral ``_merge-<uuid>``
+        the item was merged in is dead weight on every exit that re-queues.
+        Leaving it registered pins its mtime forever via the heartbeat; leaving
+        it on disk UNregistered trips the I6 worktree-ledger audit once it ages
+        past the grace window.
+
+        Parametrized by δ (task 3186), which moved this drop out of the top of
+        the try and into the ``finally``, and carved the ADOPTING tip-pass exit
+        out of it — see the sibling test directly below.
+        """
+        worker, ephemeral, cleaned, _res = await self._ephemeral_scene(
+            git_repo, monkeypatch,
+            outcome=None if passed else _fail_verify_result(), raises=raises,
+        )
 
         assert ephemeral not in worker._owned_merge_worktrees
         assert cleaned == [ephemeral]
+
+    async def test_adopting_tip_pass_hands_the_ephemeral_worktree_onward(
+        self, git_repo: Path, monkeypatch,
+    ):
+        """δ (task 3186): a green tip keeps the worktree ALIVE for the walk.
+
+        ``_finalize_inflight``'s PASS arm asserts a non-None ``merge_wt`` and
+        threads it into ``advance_main``, then disposes of it through
+        ``_release_or_cleanup`` — the same handoff the ``chain=None`` path
+        already makes.  So on the one exit that LANDS, this method must not
+        drop the tree, and must not hand back ``chain.lane`` in its place (that
+        lane is already back in the pool; merge_types.py:1458-1464).
+        """
+        worker, ephemeral, cleaned, res = await self._ephemeral_scene(
+            git_repo, monkeypatch, outcome=None,
+        )
+
+        assert cleaned == [], 'the adopting exit hands the tree to the finalize half'
+        assert ephemeral in worker._owned_merge_worktrees, (
+            'still REGISTERED, so the heartbeat keeps it alive and the I6 '
+            'ledger stays consistent until the finalize half disposes of it'
+        )
+        assert res.merge_wt == ephemeral
+        assert res.spec_warm is False, 'an ephemeral worktree is not a warm lane'
 
     async def test_chain_none_is_byte_identical_to_todays_path(
         self, git_repo: Path, monkeypatch,
@@ -1977,18 +2031,6 @@ class TestRunInflightVerifyChainRedirect:
 # keep γ's recipe verbatim and are what this class now pins
 # (merge_queue.py:18623 states the asymmetry in as many words).
 # ═══════════════════════════════════════════════════════════════════════════
-
-
-_NON_ADOPTING_ARMS = [
-    pytest.param(False, None, id='tip-fail'),
-    pytest.param(True, RuntimeError('verify infra exploded'), id='chain-arm-error'),
-]
-"""The two arms that keep γ's REQUEUED recipe verbatim under δ (task 3186).
-
-``(passed, raises)``.  The error arm passes ``passed=True`` deliberately — the
-verdict it would have produced is irrelevant, because the exception preempts it;
-what the arm proves is that an infra error is not a tip verdict at all.
-"""
 
 
 @pytest.mark.asyncio
