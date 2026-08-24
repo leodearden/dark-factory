@@ -352,3 +352,186 @@ class TestClosureSupersedes:
             _member(live),
         ]
         assert _closure(members).closed is True
+
+
+def _waiver(mid, note='curator judged this entry a legitimate separate claim'):
+    return {
+        'id': mid,
+        'note': note,
+        'recorded_at': '2026-08-24T12:00:00+00:00',
+        'recorded_by': 'recon-stage-2',
+    }
+
+
+class TestClosureScrollCompleteness:
+    """Fix (4) — the false-PASS killer.
+
+    ``get_memories_by_metadata`` is a SINGLE Qdrant scroll capped at ``limit``
+    whose ``_next_offset`` is DISCARDED, and it propagates a read
+    ``TimeoutError`` rather than returning ``[]``.  So a partial or absent view
+    is reachable, and a predicate whose entire job is refuting a false closure
+    claim must never read one as closed (INV-3).
+    """
+
+    def test_truncated_scroll_never_closes(self):
+        verdict = _closure(
+            _well_formed_cluster(3), scroll_truncated=True, scroll_total=3
+        )
+        assert verdict.closed is False
+        assert 'scroll_incomplete' in _codes(verdict)
+
+    def test_truncation_reason_discloses_how_much_was_seen(self):
+        """A human must be able to see how much of the cluster was unseen."""
+        verdict = _closure(
+            _well_formed_cluster(3), scroll_truncated=True, scroll_total=3
+        )
+        reason = next(r for r in verdict.reasons if r['code'] == 'scroll_incomplete')
+        assert reason['scroll_total'] == 3
+
+    def test_unavailable_scroll_never_closes(self):
+        verdict = _closure(
+            _well_formed_cluster(2), scroll_available=False, scroll_total=None
+        )
+        assert verdict.closed is False
+        assert 'scroll_unavailable' in _codes(verdict)
+
+    def test_empty_and_unavailable_is_never_nothing_left(self):
+        """The three-way distinction build_consolidation_result already draws:
+        genuinely-empty and never-answered are different outcomes."""
+        verdict = _closure([], scroll_available=False, scroll_total=None)
+        assert verdict.closed is False
+        assert 'scroll_unavailable' in _codes(verdict)
+        # Nothing was SEEN, so nothing about the cluster's content may be
+        # asserted — an absence-based accusation drawn on no view at all
+        # would be a fabrication.
+        assert 'no_canonical' not in _codes(verdict)
+
+    def test_presence_based_defects_survive_truncation(self):
+        """Seeing two canonicals PROVES two canonicals; more rows can only add.
+
+        Truncation makes absence unprovable, not presence.
+        """
+        members = [
+            _member(_uuid(1), canonical=True),
+            _member(_uuid(2), canonical=True),
+        ]
+        codes = _codes(_closure(members, scroll_truncated=True, scroll_total=2))
+        assert 'scroll_incomplete' in codes
+        assert 'multiple_canonicals' in codes
+
+    def test_absence_based_defects_are_suppressed_on_a_partial_view(self):
+        """A canonical beyond the cap is indistinguishable from no canonical,
+        so `no_canonical` on a truncated view would name a defect that may not
+        exist.  The gate still refuses — on the honest reason."""
+        codes = _codes(
+            _closure([_member(_uuid(1))], scroll_truncated=True, scroll_total=1)
+        )
+        assert 'scroll_incomplete' in codes
+        assert 'no_canonical' not in codes
+
+
+class TestClosureAuditedEscape:
+    """Fix (5) — a sanctioned, audited exit, not a rubber stamp.
+
+    Gates routinely sit for days (the Stage-1 stale-gate threshold is 48h), so
+    without an exit a late write against the topic makes a gate permanently
+    uncloseable.
+    """
+
+    def _live_but_claimed_absorbed(self):
+        absorbed = _uuid(3)
+        return absorbed, [
+            _member(_uuid(1), canonical=True, supersedes=[absorbed]),
+            _member(absorbed),
+        ]
+
+    def test_audited_waiver_suppresses_the_refusal(self):
+        absorbed, members = self._live_but_claimed_absorbed()
+        assert _closure(members).closed is False  # baseline: refuses
+        verdict = _closure(
+            members,
+            gate_block={
+                'topic': _TOPIC,
+                'considered_and_kept': [_waiver(absorbed)],
+            },
+        )
+        assert verdict.closed is True
+        assert list(verdict.reasons) == []
+
+    def test_waiver_is_echoed_so_it_is_visible_not_silent(self):
+        absorbed, members = self._live_but_claimed_absorbed()
+        verdict = _closure(
+            members,
+            gate_block={
+                'topic': _TOPIC,
+                'considered_and_kept': [_waiver(absorbed)],
+            },
+        )
+        assert [w['id'] for w in verdict.waived] == [absorbed]
+        assert verdict.waived[0]['note']
+
+    @pytest.mark.parametrize('note', ['', '   ', None])
+    def test_unaudited_waiver_waives_nothing(self, note):
+        """A bare id list must not be a rubber stamp."""
+        absorbed, members = self._live_but_claimed_absorbed()
+        entry = _waiver(absorbed, note=note)
+        if note is None:
+            del entry['note']
+        verdict = _closure(
+            members,
+            gate_block={'topic': _TOPIC, 'considered_and_kept': [entry]},
+        )
+        assert verdict.closed is False
+        codes = _codes(verdict)
+        assert 'unaudited_waiver' in codes
+        # ...and the refusal it tried to waive is still standing.
+        assert 'absorbed_member_still_live' in codes
+        assert list(verdict.waived) == []
+
+    def test_stale_waiver_is_reported_not_silently_ignored(self):
+        """A waiver naming nothing live no longer describes reality."""
+        verdict = _closure(
+            _well_formed_cluster(2),
+            gate_block={
+                'topic': _TOPIC,
+                'considered_and_kept': [_waiver(_uuid(77))],
+            },
+        )
+        assert verdict.closed is False
+        stale = [r for r in verdict.reasons if r['code'] == 'stale_waiver']
+        assert stale and stale[0]['ids'] == [_uuid(77)]
+
+    def test_a_waiver_cannot_wave_through_a_cluster_shape_defect(self):
+        """The escape covers "this live entry is fine", not "ignore the gate".
+
+        Two canonicals is a shape defect to FIX, and naming one of them in
+        considered_and_kept must not close the gate.
+        """
+        members = [
+            _member(_uuid(1), canonical=True),
+            _member(_uuid(2), canonical=True),
+        ]
+        verdict = _closure(
+            members,
+            gate_block={
+                'topic': _TOPIC,
+                'considered_and_kept': [_waiver(_uuid(2))],
+            },
+        )
+        assert verdict.closed is False
+        assert 'multiple_canonicals' in _codes(verdict)
+
+    def test_a_waiver_cannot_wave_through_an_incomplete_view(self):
+        """Completeness is unconditional: you cannot waive not having looked."""
+        absorbed, members = self._live_but_claimed_absorbed()
+        verdict = _closure(
+            members,
+            gate_block={
+                'topic': _TOPIC,
+                'considered_and_kept': [_waiver(absorbed)],
+            },
+            scroll_truncated=True,
+            scroll_total=2,
+        )
+        assert verdict.closed is False
+        assert 'scroll_incomplete' in _codes(verdict)
