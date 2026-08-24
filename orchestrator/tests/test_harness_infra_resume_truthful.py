@@ -561,6 +561,39 @@ class TestCascadeStatusRejectionEscalates:
 
         assert _filed_for(queue, tid) == []
 
+    async def test_table_b_unexpected_exception_arm_also_escalates(
+        self, harness: Harness, tmp_path: Path,
+    ):
+        """(e) …and the NON-rejection escape, which is where symmetry actually bit.
+
+        The Table B arm was once guarded by ``except SetTaskStatusRejected``
+        alone while the infra arm above it had both a typed arm and a blanket
+        one, so the comment claiming the two were "symmetric" was false for
+        precisely the failure that generates cascade resumes in the first
+        place: Scheduler.set_task_status raises a BARE RuntimeError once its
+        transient-retry loop is exhausted (fused-memory restarting), and
+        dispatch_tool can surface bare transport errors — neither is a
+        SetTaskStatusRejected.  _cascade_unblock_member has no outer try and
+        runs fire-and-forget, so the escape was never retrieved and the plain
+        blocked task sat at 'blocked' with NO open record and nothing to retry
+        it.  This pins the claim instead of trusting the comment.
+        """
+        tid = '3547'
+        queue = _wire_real_queue(harness, tmp_path)
+        self._blocked_row(harness, tid)
+        harness.scheduler.set_task_status = AsyncMock(
+            side_effect=TimeoutError('fused-memory unreachable'),
+        )
+
+        await _drive_orphan_resume(harness, _make_infra_esc(task_id=tid))
+
+        filed = _filed_for(queue, tid)
+        assert len(filed) == 1, (
+            f'Table B swallowed a non-rejection failure the infra arm escalates: {filed}'
+        )
+        assert 'fused-memory unreachable' in (filed[0].detail or '')
+        assert 'pending' in (filed[0].detail or ''), 'detail must name the refused target'
+
     async def test_nothing_propagates_out_of_the_background_task(
         self, harness: Harness, tmp_path: Path,
     ):

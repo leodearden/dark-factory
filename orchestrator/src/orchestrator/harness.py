@@ -6394,6 +6394,21 @@ class Harness:
     # task for this condition, matched via get_by_task + this exact role.
     _CASCADE_REJECTION_ROLE: str = 'harness-cascade'
 
+    # Category for the same records.  A NAMED CONSTANT rather than a literal at
+    # the filing site because escalation categories are prose, not a checked
+    # contract: nothing rejects a typo'd category at submit time, and every
+    # categorized reader (auto-watcher triage, category-filtered queue scans)
+    # depends on filer and reader spelling it identically — so the one spelling
+    # this file owns lives in exactly one place.
+    #
+    # escalation/src/escalation/models.py carries a standing REFACTOR TRIGGER
+    # (task 3709) saying the NEXT category addition promotes that prose
+    # vocabulary to an enum or a submit-time lint.  This IS that addition, but
+    # models.py is outside task 3538's locked module scope, so the promotion is
+    # filed as follow-up work instead of done here; this constant is the
+    # interim single source of truth for the spelling.
+    _CASCADE_REJECTION_CATEGORY: str = 'cascade_status_rejection'
+
     def _escalate_cascade_status_rejection(
         self,
         task_id: str,
@@ -6421,11 +6436,14 @@ class Harness:
         and nobody needs to investigate, so it is logged at INFO and NOT filed —
         filing there would be pure noise on a common, benign race.
 
-        Dedup: one open record per task via ``get_by_task(status='pending')``
-        filtered on this class's own ``agent_role``, the same idiom the sentinel
-        escalations above use.  ``make_id`` cannot serve as the guard — it mints
-        a strictly-increasing id per call by design — so a persistently-refusing
-        backend would otherwise file one record per resolved escalation.
+        Dedup: one open record per task via
+        ``get_by_task(status='pending', agent_role=...)`` on this class's own
+        role, the same idiom the sentinel escalations above use — the role
+        filter is the queue's own, applied in its single scan pass rather than
+        re-implemented as a post-filter here.  ``make_id`` cannot serve as the
+        guard — it mints a strictly-increasing id per call by design — so a
+        persistently-refusing backend would otherwise file one record per
+        resolved escalation.
 
         Best-effort and total: a no-op without a queue (bare-Harness unit
         tests), and every internal failure is contained.  The caller is
@@ -6445,10 +6463,10 @@ class Harness:
         if not queue:        # bare-Harness unit tests / lifecycle tests stay green
             return
         try:
-            already = [
-                e for e in queue.get_by_task(task_id, status='pending')
-                if e.agent_role == self._CASCADE_REJECTION_ROLE
-            ]
+            already = queue.get_by_task(
+                task_id, status='pending',
+                agent_role=self._CASCADE_REJECTION_ROLE,
+            )
             if already:
                 logger.warning(
                     'cascade-unblock: %s→%s refused again for task %s; escalation '
@@ -6467,7 +6485,7 @@ class Harness:
                 agent_role=self._CASCADE_REJECTION_ROLE,
                 severity='blocking',
                 level=1,
-                category='cascade_status_rejection',
+                category=self._CASCADE_REJECTION_CATEGORY,
                 summary=(
                     f'Cascade resume failed to set task {task_id} to '
                     f'{target_status!r}'
@@ -14869,6 +14887,27 @@ class Harness:
             # here strands a plain blocked task just as permanently.  The
             # terminal carve-out lives inside the filer, so the common benign
             # TOCTOU-to-terminal race stays quiet.
+            self._escalate_cascade_status_rejection(
+                task_id, _resume_target, e, resolved_by=escalation.resolved_by,
+            )
+        except Exception as e:
+            # The OTHER half of that symmetry, and not defensive padding: the
+            # rejection taxonomy does NOT cover every way this write dies.
+            # Scheduler.set_task_status raises a BARE RuntimeError once its
+            # fm_retry_backoffs() transient loop is exhausted (fused-memory
+            # restarting / MCP unreachable) and dispatch_tool can surface bare
+            # transport errors — neither is a SetTaskStatusRejected.  This
+            # method has no outer try and is scheduled fire-and-forget via
+            # _schedule_coro_threadsafe → create_task, whose only done-callback
+            # discards the task, so an escape here is never retrieved: it
+            # surfaces (at best) as an unretrieved-task-exception warning at GC
+            # time, leaving a plain blocked task at 'blocked' with NO open
+            # record and nothing that will retry — exactly the silent permanent
+            # hold INV-4 exists to close.
+            logger.warning(
+                'cascade-unblock: blocked→%s resume failed for %s',
+                _resume_target, task_id, exc_info=True,
+            )
             self._escalate_cascade_status_rejection(
                 task_id, _resume_target, e, resolved_by=escalation.resolved_by,
             )
