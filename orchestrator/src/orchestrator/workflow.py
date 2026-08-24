@@ -3667,6 +3667,21 @@ class TaskWorkflow:
             self._last_merge_block_reason = None
             self._last_merge_failure_category = ''
             self._last_merge_failure_cause_hint = ''
+            # MERGE_PHASE_RATIONALE (task 3537, spec §8-E2 / INV-6): this is
+            # the ONLY literal merge_phase=True origin in this file — every
+            # other occurrence threads an existing value.  It exists so the
+            # REQUEUED arm below can retry the merge IN-PLACE: this coroutine
+            # keeps the slot and stays a LIVE claimant, so _mark_blocked's
+            # entry gate must NOT re-pend or park the row, and the durable
+            # obligation is carried by metadata.merge_retry_pending (stamped in
+            # _mark_blocked's _requeue) for reconstruction after a restart
+            # mid-retry.  The suppression extends no further than that: the
+            # non-DONE/non-REQUEUED arm a few lines below is a SLOT EXIT, and
+            # its park status is written by _mark_blocked's merge-aware
+            # _park_merge_phase_row target.  Any NEW literal merge_phase=True
+            # call site is only safe under the same condition: the caller keeps
+            # a LIVE claimant and retries in-slot.  Never add one on a path that
+            # EXITS the slot — that leaves an unclaimed in-progress row.
             merge_outcome = await self._submit_to_merge_queue(
                 branch_name, pre_rebased=pre_rebased,
                 merge_phase=True,
@@ -3907,10 +3922,14 @@ class TaskWorkflow:
             await self._wait_for_resolution()
         except _StewardReescalated as reesc:
             # Byte-for-byte the shape at :2643-2647.  merge_phase stays at its
-            # default False so the row actually lands `blocked` (spec S1); the
-            # merge_phase=True carve-out writes no status at all (spec
-            # divergence E2) and this path is exiting the slot, not retrying a
-            # queue submission.
+            # default False so the row lands `blocked` at _mark_blocked's ENTRY
+            # gate (spec S1).  Post-3537 a merge_phase=True call would also
+            # write it — the suppression now covers only the ENTRY transition,
+            # and every slot-exiting return parks the row via
+            # _park_merge_phase_row — but False remains correct and clearer
+            # here: this path exits the slot outright, it does not retry a
+            # queue submission in-place, which is the ONLY thing merge_phase
+            # is for.
             return await self._mark_blocked(
                 'Steward re-escalated to human',
                 detail=_format_reescalation_detail(reesc.escalations),
@@ -6727,8 +6746,8 @@ class TaskWorkflow:
         self._enter_phase(WorkflowState.BLOCKED)
         return WorkflowOutcome.BLOCKED
 
-    async def _persist_blocked_row(self, *, why: str) -> None:
-        """Durably write ``status='blocked'`` for a non-escalating terminal exit.
+    async def _persist_blocked_row(self, *, why: str, status: str = 'blocked') -> None:
+        """Durably write the park *status* for a non-escalating terminal exit.
 
         ``_handle_ready_to_merge_report``'s two success-shaped exits (merge
         enqueued / duplicate skipped) deliberately do NOT route through
@@ -6738,6 +6757,14 @@ class TaskWorkflow:
         merely waiting on its own queued merge.  They still owe the durable row
         write that ``_mark_blocked`` would otherwise have done — see the
         REVERT_TO_PENDING note at the enqueue exit.
+
+        Task 3537 (spec §8-E2 / INV-6) reuses this as ``_mark_blocked``'s
+        MERGE-AWARE park-write target: the ``merge_phase=True`` BLOCKED returns
+        exit the slot and therefore owe the row write, but must not re-enter the
+        plain entry path (whose ``_spawn_dry_run_unblock`` / ``last_blocked_at``
+        side effects belong to the non-merge shape).  *status* defaults to
+        ``'blocked'`` for the original callers and carries ``block_status``
+        through for the new ones (e.g. ``'infra-hold'``).
 
         Fail-safe in both directions, because the merge is ALREADY enqueued by
         the time this runs and must never be undone by a bookkeeping failure:
@@ -6751,19 +6778,19 @@ class TaskWorkflow:
           found_on_main reconciler remains the durable backstop.
         """
         try:
-            await self.scheduler.set_task_status(self.task_id, 'blocked')
+            await self.scheduler.set_task_status(self.task_id, status)
         except TerminalExitRejection as exc:
             logger.info(
-                'Task %s: blocked-row write skipped, row is already terminal '
+                'Task %s: %s-row write skipped, row is already terminal '
                 '(%s) — the merge callback or found_on_main got there first; '
                 'leaving it (%s)',
-                self.task_id, exc.old_status, why,
+                self.task_id, status, exc.old_status, why,
             )
         except Exception as exc:
             logger.warning(
-                'Task %s: blocked-row write failed (%s): %s — continuing; the '
+                'Task %s: %s-row write failed (%s): %s — continuing; the '
                 'found_on_main reconciler is the durable backstop',
-                self.task_id, why, exc,
+                self.task_id, status, why, exc,
             )
 
     def _schedule_architect_merge_done(
@@ -11742,51 +11769,184 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         )
 
         if self.escalation_queue:
-            from escalation.models import Escalation
-
-            train_state = await self._build_train_state()
-
-            # Defensive re-check: the consumer's orphan-halt probe validated
-            # halt_owner_esc_id is None before calling us, but _build_train_state()
-            # contains an await and another coroutine could (theoretically) set the
-            # owner during that window.  In the current serial merge-worker design
-            # this window is unreachable, but re-checking prevents a hard crash
-            # from the 'owner already set' assertion inside set_halt_owner if the
-            # worker ever becomes concurrent.  Mirror the escalation_queue=None
-            # fallback: log a warning and fall through to plain BLOCKED.
-            if (
-                self.merge_worker is not None
-                and self.merge_worker.halt_owner_esc_id is not None
-            ):
-                logger.warning(
-                    'Task %s: halt owner set concurrently during _build_train_state '
-                    '(owner: %r) — skipping duplicate set_halt_owner; plain BLOCKED',
-                    self.task_id, self.merge_worker.halt_owner_esc_id,
-                )
-            else:
-                esc = Escalation(
-                    id=self.escalation_queue.make_id(self.task_id),
-                    task_id=self.task_id,
-                    agent_role='orchestrator',
-                    severity='blocking',
-                    category=category,
-                    summary=summary,
-                    detail=detail,
-                    suggested_action='manual_intervention',
-                    level=1,
-                    worktree=str(self.worktree) if self.worktree else None,
-                    workflow_state=self.state.value,
-                    train_state=train_state,
-                )
-                self._submit_halt_owning_escalation(esc)
-                logger.info(
-                    'Task %s: train halt L1 %r submitted and halt ownership registered',
-                    self.task_id, esc.id,
-                )
+            # ONE implementation of the ordering contract (submit ->
+            # set_halt_owner) and of the defensive owner re-check: the
+            # _build_train_state() await below is precisely the window that
+            # re-check closes — the consumer's orphan-halt probe validated
+            # halt_owner_esc_id is None before calling us, but another
+            # coroutine could (theoretically) set the owner while we await.
+            # Unreachable in the current serial merge-worker design; re-checked
+            # so a future concurrent worker cannot hard-crash on
+            # set_halt_owner's 'owner already set' assertion.
+            self._file_halt_owning_l1(
+                category, summary, detail,
+                train_state=await self._build_train_state(),
+            )
         else:
             self._warn_orphan_halt_no_queue(result.status, train_id=train_id)
 
         return await self._mark_blocked(reason, detail=detail, skip_escalation=True)
+
+    def _file_halt_owning_l1(
+        self, category: str, summary: str, detail: str,
+        *, train_state: object = None,
+    ) -> None:
+        """File the halt-owning L1 for a merge-halt handler.  Non-waiting.
+
+        The ONE implementation of the ``if self.escalation_queue:`` filing
+        block, shared by :meth:`_handle_stash_failed`,
+        :meth:`_handle_unmerged_state`, :meth:`_handle_wip_recovery_no_advance`
+        and — via *train_state* — :meth:`_escalate_train_halt`, whose inline
+        copy this replaced (task 3537, spec §7.9 / §8-E3).  Callers must guard
+        with ``if self.escalation_queue:`` — the ``escalation_queue is None``
+        deployment keeps its :meth:`_warn_orphan_halt_no_queue` fallback.
+
+        *train_state* is the train path's extra escalation payload (PRD §9.8);
+        it stays ``None`` for the single-task callers.  The train caller
+        computes it BEFORE calling, because ``_build_train_state`` contains an
+        await and that await is the window the owner re-check below closes.
+
+        §7.9 constraint (c) — NEVER RE-FILE A SIBLING HALT-CATEGORY RECORD.  If
+        the halt is already owned, do not add a second record IN A HALT
+        CATEGORY: ``harness._rehydrate_merge_halt`` picks the MOST RECENT
+        qualifying record as the owner after a restart, so a duplicate would
+        make the restart re-own the wrong escalation, and ``set_halt_owner``'s
+        owner-collision assertion would hard-crash the handler here.  The
+        trio's callers reach this after ``_map_advance_failure`` engaged an
+        OWNERLESS halt, so in the current serial merge-worker design an owner
+        is not expected — this is the same defensive re-check
+        ``_escalate_train_halt`` used to carry inline.
+
+        ...but that branch still owes THIS task a record (review amendment).
+        Filing nothing left the caller's ``_mark_blocked(skip_escalation=True)``
+        to park a row with ZERO escalations referencing it, and 'blocked with no
+        escalation' is LEAVE-shaped for the ground-truth sweep (see the
+        rationale at :meth:`_persist_blocked_row`'s call site), so nothing would
+        ever re-pend it: resolving the SIBLING's halt-owning L1 unhalts the
+        queue but has no edge back to this task, which would strand blocked
+        indefinitely with no human-visible reason.  So the branch files a
+        NON-OWNING record naming the owner instead.  It is deliberately filed
+        under ``'task_failure'``, NOT under *category*: a non-halt category is
+        invisible to ``_rehydrate_merge_halt``'s filter and to
+        ``_on_escalation_resolved``'s owner check, which is exactly what keeps
+        constraint (c) intact — one halt-OWNING record, plus one plain
+        per-task record that resolves this task and nothing else.
+
+        Delegates to :meth:`_submit_halt_owning_escalation` (submit →
+        set_halt_owner, no wait), NEVER to
+        :meth:`_submit_halt_escalation_and_wait`: the latter's
+        ``except BaseException`` cleanup is the only edge that could unhalt the
+        merge queue on exit, and §7.9 constraint (a) requires these handlers to
+        exit without ever running it.
+        """
+        assert self.escalation_queue is not None, (
+            '_file_halt_owning_l1 requires escalation_queue; callers must '
+            'guard with `if self.escalation_queue:`'
+        )
+        from escalation.models import Escalation
+
+        owner = (
+            self.merge_worker.halt_owner_esc_id
+            if self.merge_worker is not None else None
+        )
+        if owner is not None:
+            logger.warning(
+                'Task %s: merge halt already owned by %r — filing a plain '
+                'non-owning record instead of a duplicate %s halt-category '
+                'one; the existing owner remains the record whose resolution '
+                'unhalts the queue',
+                self.task_id, owner, category,
+            )
+            self._file_non_owning_halt_blocked_record(
+                category, summary, detail, owner=owner, train_state=train_state,
+            )
+            return
+
+        esc = Escalation(
+            id=self.escalation_queue.make_id(self.task_id),
+            task_id=self.task_id,
+            agent_role='orchestrator',
+            severity='blocking',
+            category=category,
+            summary=summary,
+            detail=detail,
+            suggested_action='manual_intervention',
+            level=1,
+            worktree=str(self.worktree) if self.worktree else None,
+            workflow_state=self.state.value,
+            train_state=train_state,  # type: ignore[arg-type]
+        )
+        self._submit_halt_owning_escalation(esc)
+        logger.info(
+            'Task %s: halt-owning L1 %r submitted (category=%s); the merge '
+            'queue stays halted until it is resolved',
+            self.task_id, esc.id, category,
+        )
+
+    def _file_non_owning_halt_blocked_record(
+        self, category: str, summary: str, detail: str,
+        *, owner: str, train_state: object = None,
+    ) -> None:
+        """File this task's human-facing record when a SIBLING owns the halt.
+
+        Purely a discoverability/resolvability record — see the "...but that
+        branch still owes THIS task a record" paragraph in
+        :meth:`_file_halt_owning_l1`.  Two properties are load-bearing:
+
+        * category ``'task_failure'``, never *category*: a halt category here
+          would join ``_rehydrate_merge_halt``'s most-recent-wins candidate set
+          and make a restart re-own the WRONG escalation (§7.9 constraint (c)).
+          The halt category is still named in the text, for the human.
+        * resolving it re-pends THIS task only; the halt itself is released
+          solely by *owner* being resolved.
+
+        Best-effort: a submit failure is logged loudly and swallowed, because
+        the caller's ``_mark_blocked`` row write (INV-6) is the higher-order
+        obligation and must not be lost with it.  Unlike the owning path there
+        is nothing to orphan — the halt already has an owner.
+        """
+        assert self.escalation_queue is not None
+        from escalation.models import Escalation
+
+        try:
+            esc = Escalation(
+                id=self.escalation_queue.make_id(self.task_id),
+                task_id=self.task_id,
+                agent_role='orchestrator',
+                severity='blocking',
+                category='task_failure',
+                summary=(
+                    f'Task {self.task_id} blocked behind an already-owned '
+                    f'merge halt ({category})'
+                )[:200],
+                detail=(
+                    f'{detail}\n\n[halt ownership] The merge-queue halt for '
+                    f'this failure is already owned by escalation {owner}, so '
+                    f'this task filed no second halt-category record (spec '
+                    f'§7.9). Resolving {owner} clears the HALT; resolving THIS '
+                    f'record re-pends task {self.task_id}. Original summary: '
+                    f'{summary}'
+                ),
+                suggested_action='manual_intervention',
+                level=1,
+                worktree=str(self.worktree) if self.worktree else None,
+                workflow_state=self.state.value,
+                train_state=train_state,  # type: ignore[arg-type]
+            )
+            self.escalation_queue.submit(esc)
+        except Exception:
+            logger.exception(
+                'Task %s: could not file the non-owning blocked record behind '
+                'halt owner %r — the task will still be parked blocked, but '
+                'with no escalation naming it',
+                self.task_id, owner,
+            )
+            return
+        logger.info(
+            'Task %s: non-owning L1 %r submitted (halt owned by %r); '
+            'resolving it re-pends this task without touching the halt',
+            self.task_id, esc.id, owner,
+        )
 
     async def _handle_wip_conflict(
         self, result, branch_name: str,
@@ -11878,6 +12038,22 @@ Update the plan to address the blocking issues. You may add new steps to the `st
 
         Unlike ``_handle_wip_recovery`` (which returns DONE because the merge
         landed), this returns BLOCKED because main was NOT advanced.
+
+        ESCALATE-AND-BLOCK (task 3537, spec §7.9 / §8-E3, INV-6 + INV-7) — see
+        :meth:`_handle_stash_failed` for the full rationale.  In short: this
+        handler does NOT await resolution, so the slot/locks/lane/merge queue
+        are freed immediately and the task row is parked ``blocked`` instead of
+        being left ``in-progress`` with no claimant.  The SOLE unhalt edge is
+        the durable record's resolution (harness ``_on_escalation_resolved`` →
+        ``is_halt_owner`` → ``unhalt_wip``), which is why
+        :meth:`_submit_halt_escalation_and_wait` — and its
+        ``except BaseException`` → ``unhalt_wip('workflow_cancelled')`` cleanup
+        — is deliberately not on this path.
+
+        Note the escalation CATEGORY is ``'wip_conflict'``, not the status
+        string: ``_build_wip_halt_escalation_text`` shares one category across
+        the stash-pop-conflict statuses, and both ``_rehydrate_merge_halt`` and
+        ``_on_escalation_resolved`` key on that category.
         """
         recovery_branch = result.recovery_branch or '(unknown)'
         category, summary, detail = self._build_wip_halt_escalation_text(
@@ -11889,27 +12065,17 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         )
 
         if self.escalation_queue:
-            from escalation.models import Escalation
-
-            esc = Escalation(
-                id=self.escalation_queue.make_id(self.task_id),
-                task_id=self.task_id,
-                agent_role='orchestrator',
-                severity='blocking',
-                category=category,
-                summary=summary,
-                detail=detail,
-                suggested_action='manual_intervention',
-                level=1,
-                worktree=str(self.worktree) if self.worktree else None,
-                workflow_state=self.state.value,
-            )
-            await self._submit_halt_escalation_and_wait(esc)
-            logger.info(f'Task {self.task_id}: wip_recovery_no_advance escalation resolved')
+            self._file_halt_owning_l1(category, summary, detail)
         else:
             self._warn_orphan_halt_no_queue(result.status, recovery_branch=recovery_branch)
 
-        return WorkflowOutcome.BLOCKED
+        return await self._mark_blocked(
+            f'Merge halted ({result.status}): stash pop conflicted and main '
+            f'did not advance for task {self.task_id}; WIP preserved on '
+            f'{recovery_branch}',
+            detail=detail,
+            skip_escalation=True,
+        )
 
     async def _handle_unmerged_state(
         self, result, branch_name: str,
@@ -11921,6 +12087,17 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         already in an inconsistent state. Halt stays in effect until a human
         inspects, cleans up project_root (``git mergetool`` / manual
         resolution / ``git reset``), and resolves the escalation.
+
+        ESCALATE-AND-BLOCK (task 3537, spec §7.9 / §8-E3, INV-6 + INV-7) — see
+        :meth:`_handle_stash_failed` for the full rationale.  In short: this
+        handler does NOT await resolution, so the slot/locks/lane/merge queue
+        are freed immediately and the task row is parked ``blocked`` instead of
+        being left ``in-progress`` with no claimant.  The SOLE unhalt edge is
+        the durable record's resolution (harness ``_on_escalation_resolved`` →
+        ``is_halt_owner`` → ``unhalt_wip``), which is why
+        :meth:`_submit_halt_escalation_and_wait` — and its
+        ``except BaseException`` → ``unhalt_wip('workflow_cancelled')`` cleanup
+        — is deliberately not on this path.
         """
         category, summary, detail = self._build_wip_halt_escalation_text(
             result.status, result, branch_name=branch_name,
@@ -11931,29 +12108,16 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         )
 
         if self.escalation_queue:
-            from escalation.models import Escalation
-
-            esc = Escalation(
-                id=self.escalation_queue.make_id(self.task_id),
-                task_id=self.task_id,
-                agent_role='orchestrator',
-                severity='blocking',
-                category=category,
-                summary=summary,
-                detail=detail,
-                suggested_action='manual_intervention',
-                level=1,
-                worktree=str(self.worktree) if self.worktree else None,
-                workflow_state=self.state.value,
-            )
-            await self._submit_halt_escalation_and_wait(esc)
-            logger.info(
-                f'Task {self.task_id}: unmerged_state escalation resolved'
-            )
+            self._file_halt_owning_l1(category, summary, detail)
         else:
             self._warn_orphan_halt_no_queue(result.status)
 
-        return WorkflowOutcome.BLOCKED
+        return await self._mark_blocked(
+            f'Merge halted ({result.status}): project_root has unresolved '
+            f'merge markers, merge for task {self.task_id} did not land',
+            detail=detail,
+            skip_escalation=True,
+        )
 
     async def _handle_stash_failed(
         self, result, branch_name: str,
@@ -11968,6 +12132,30 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         the escalation. Because the halt serializes the fleet, exactly ONE
         halt-owning level-1 escalation is filed (by the halt owner) instead of
         N per-task blocked finalizations. Mirrors ``_handle_unmerged_state``.
+
+        ESCALATE-AND-BLOCK (task 3537, spec §7.9 / §8-E3, INV-6 + INV-7).  This
+        handler does NOT await resolution — it transplants
+        :meth:`_escalate_train_halt`'s shape:
+
+        * The slot, the locks, the lane and the merge queue are released
+          IMMEDIATELY (INV-7 holds-owned-and-bounded); the task re-dispatches
+          once a human clears the halt.
+        * The task row is parked ``blocked`` via ``_mark_blocked`` (INV-6
+          status-matches-liveness) instead of being left ``in-progress`` with no
+          claimant, which is what the old ``return WorkflowOutcome.BLOCKED``
+          did.
+        * The SOLE unhalt edge is the durable record's resolution — harness
+          ``_on_escalation_resolved`` → ``is_halt_owner`` → ``unhalt_wip``, plus
+          ``_rehydrate_merge_halt`` re-owning it across a restart.  Deliberately
+          NOT :meth:`_submit_halt_escalation_and_wait`: that helper's
+          ``except BaseException`` cleanup calls
+          ``unhalt_wip('workflow_cancelled')``, so merely BOUNDING the wait
+          would leave the merge queue one stray cancellation away from
+          un-halting over a dirty project_root.  Not calling it makes the
+          no-unhalt property structural.
+        * ``skip_escalation=True`` keeps this handler's own L1 the sole
+          human-facing record (it short-circuits the steward-facing L0, the
+          steward, and ``_ensure_l1_escalation_for_blocked``).
         """
         category, summary, detail = self._build_wip_halt_escalation_text(
             result.status, result, branch_name=branch_name,
@@ -11980,29 +12168,16 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         )
 
         if self.escalation_queue:
-            from escalation.models import Escalation
-
-            esc = Escalation(
-                id=self.escalation_queue.make_id(self.task_id),
-                task_id=self.task_id,
-                agent_role='orchestrator',
-                severity='blocking',
-                category=category,
-                summary=summary,
-                detail=detail,
-                suggested_action='manual_intervention',
-                level=1,
-                worktree=str(self.worktree) if self.worktree else None,
-                workflow_state=self.state.value,
-            )
-            await self._submit_halt_escalation_and_wait(esc)
-            logger.info(
-                f'Task {self.task_id}: stash_failed escalation resolved'
-            )
+            self._file_halt_owning_l1(category, summary, detail)
         else:
             self._warn_orphan_halt_no_queue(result.status)
 
-        return WorkflowOutcome.BLOCKED
+        return await self._mark_blocked(
+            f'Merge halted ({result.status}): could not park project_root WIP '
+            f'for task {self.task_id}',
+            detail=detail,
+            skip_escalation=True,
+        )
 
     def _write_merge_failure_review(self, category: str, detail: str) -> None:
         """Write a review-format JSON describing a merge failure to .task/reviews/.
@@ -14800,9 +14975,30 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         unaffected by this choice.
         *skip_escalation* suppresses escalation creation when a level-1
         escalation already exists (e.g. steward re-escalated to human).
-        *merge_phase* suppresses task-status transitions (blocked/pending)
-        when the caller will retry the merge in-place rather than requeueing
-        through the scheduler.
+        *merge_phase* suppresses the ENTRY task-status transition
+        (blocked/pending) so the caller can retry the merge in-place rather
+        than requeueing through the scheduler.  It does NOT suppress the park
+        write on the BLOCKED returns that EXIT THE SLOT — those go through the
+        merge-aware :meth:`_persist_blocked_row` target below (task 3537, spec
+        §8-E2, INV-6 status-matches-liveness).
+
+        MERGE_PHASE_RATIONALE (Chesterton's-fence investigation, task 3537):
+        ``git log -S"merge_phase: bool = False"`` yields exactly ONE commit —
+        22918d5c24 "fix(orchestrator): break merge-phase escalation loop"
+        (2026-04-09).  The parameter exists for :meth:`_run_merge_phase`'s
+        in-place merge-retry loop: before it, the merge phase fire-and-forgot
+        to the scheduler via REQUEUED and raced the async merge queue.  The
+        loop's REQUEUED arm genuinely depends on the suppression — it keeps
+        retrying IN-SLOT with a LIVE claimant, so the row must stay
+        ``in-progress`` with the durable obligation carried by
+        ``metadata.merge_retry_pending`` (see ``_requeue`` below).  That is the
+        whole of the dependency; it is NOT a licence for a slot-exiting BLOCKED
+        return to leave the row ``in-progress`` with no claimant.  Deleting
+        this gate outright (writing at ENTRY) would break the fence in the
+        other direction, and SM-2 would not catch it because
+        ``outcome_allows_status('requeued', BLOCKED)`` is True.  The
+        ``StewardTerminalDecision`` non-DONE return is likewise excluded — see
+        the §5 preserve carve-out comment at that return.
         *escalate_to_human* (Fix C) skips the steward entirely and submits
         an L1 escalation immediately.  Use when the caller has determined
         a confirmed loop / unresolvable failure that the steward cannot
@@ -14833,10 +15029,13 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         # VERIFY/REVIEW) BEFORE the `if not merge_phase` branch below calls
         # _enter_phase(BLOCKED) — mirrors the deleted `_last_block_phase =
         # self.state.value` pre-block stash.  Threaded into _record so every
-        # return point (including the merge_phase=True paths, which never
-        # transition) stamps TerminalReport.blocked_from_phase with the phase
+        # return point stamps TerminalReport.blocked_from_phase with the phase
         # this call was entered at, distinct from `phase` (machine.state at
-        # _record time, kept == machine.state for SM-2).
+        # _record time, kept == machine.state for SM-2).  That includes the
+        # merge_phase=True paths: since task 3537 their SLOT-EXITING returns do
+        # transition, via _park_merge_phase_row's _enter_phase(BLOCKED) — the
+        # snapshot must still be taken here, BEFORE any of them runs.  Only the
+        # retry-in-place REQUEUED arm truly never transitions.
         pre_block_state = self.machine.state
 
         def _record(outcome: WorkflowOutcome) -> WorkflowOutcome:
@@ -14975,6 +15174,10 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     reason, detail or reason, category=category,
                     root_cause=root_cause,
                 )
+                await self._park_merge_phase_row(
+                    merge_phase, block_status,
+                    why=f'escalate_to_human short-circuit: {reason[:80]}',
+                )
                 return _record(WorkflowOutcome.BLOCKED)
 
             # Don't create a duplicate if level-1 already pending — but only a
@@ -15090,6 +15293,14 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                         return _record(WorkflowOutcome.DONE)
                     # 'cancelled'/'deferred' are steward-driven terminal or
                     # preserved decisions — no L1 needed, do not requeue.
+                    #
+                    # DELIBERATELY NO park write here (task 3537, spec §5
+                    # preserve carve-out), unlike the two slot-exiting BLOCKED
+                    # returns above/below.  The steward has ALREADY adjudicated
+                    # this row, and the hazard is silent: shared.task_statuses
+                    # .TERMINAL is only {DONE, CANCELLED}, so a 'deferred' row
+                    # would NOT raise TerminalExitRejection and a blanket write
+                    # would clobber a human-visible adjudication with 'blocked'.
                     logger.info(
                         'Task %s: steward-driven status is %s — preserving, '
                         'not re-queueing', self.task_id, outcome.new_status.value,
@@ -15099,10 +15310,29 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 if isinstance(outcome, StewardReescalatedL1):
                     # The steward's _auto_escalate_to_human already filed the
                     # L1 and dismissed its L0 before publishing this outcome —
-                    # nothing left for _mark_blocked to do.
+                    # no ESCALATION left for _mark_blocked to file.
+                    #
+                    # The ROW is still owed, though (task 3537, review
+                    # amendment).  This is a SLOT EXIT — _run_merge_phase
+                    # treats any non-DONE/non-REQUEUED outcome as `return
+                    # merge_outcome` — so under merge_phase=True the entry
+                    # gate's suppression would leave an `in-progress` row with
+                    # no live claimant and an open L1: exactly the unclaimed
+                    # strand this task exists to eliminate, and invisible to
+                    # SM-2 because outcome_allows_status('escalated',
+                    # IN_PROGRESS) is True.  Same _park_merge_phase_row target
+                    # as the two BLOCKED slot exits (no-op when merge_phase is
+                    # False, where the entry gate already wrote the row) —
+                    # which is what makes run()'s ESCALATED-branch comment
+                    # ("status='blocked' was already written") true on every
+                    # path rather than only the non-merge ones.
+                    await self._park_merge_phase_row(
+                        merge_phase, block_status,
+                        why=f'steward re-escalated to human: {reason[:80]}',
+                    )
                     logger.info(
                         'Task %s: L1 escalation open — steward handed '
-                        'off to human; leaving status as-is and exiting',
+                        'off to human; exiting ESCALATED',
                         self.task_id,
                     )
                     return _record(WorkflowOutcome.ESCALATED)
@@ -15259,7 +15489,52 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     '(steward consumer dead; L1 already filed)',
                     self.task_id, len(orphan_l0),
                 )
+        await self._park_merge_phase_row(
+            merge_phase, block_status,
+            why=f'BLOCKED fall-through: {reason[:80]}',
+        )
         return _record(WorkflowOutcome.BLOCKED)
+
+    async def _park_merge_phase_row(
+        self, merge_phase: bool, block_status: str, *, why: str,
+    ) -> None:
+        """Write the park status for a ``merge_phase=True`` SLOT-EXITING return.
+
+        Called from all three of :meth:`_mark_blocked`'s slot-exiting returns —
+        the ``escalate_to_human`` short-circuit, the ``StewardReescalatedL1``
+        ESCALATED hand-off, and the final BLOCKED fall-through.  (The outcome
+        differs; the obligation does not.  ``_run_merge_phase`` exits the slot
+        on any non-DONE/non-REQUEUED outcome, so ESCALATED strands an
+        unclaimed row just as BLOCKED would, and SM-2 cannot see it because
+        ``outcome_allows_status('escalated', IN_PROGRESS)`` is True.)
+
+        No-op when *merge_phase* is False: that call already wrote
+        ``block_status`` at :meth:`_mark_blocked`'s entry gate, and re-writing
+        it here would double-stamp the row (and, on the ``escalate_to_human``
+        short-circuit, could resurrect a row the entry write's
+        ``TerminalExitRejection`` handler deliberately left terminal).
+
+        When *merge_phase* is True the entry gate suppressed the write, but
+        these returns EXIT THE SLOT with no live claimant — so INV-6
+        (status-matches-liveness) obliges the write here instead.  Routed
+        through :meth:`_persist_blocked_row` rather than a bare
+        ``set_task_status`` so this inherits its fail-safe contract: a
+        ``TerminalExitRejection`` is the benign already-terminal race (leave it
+        terminal, never reopen) and any other failure is logged and swallowed
+        with the found_on_main reconciler as the durable backstop.  Byte-for-
+        byte the ``_persist_blocked_row`` + ``_enter_phase(BLOCKED)`` pairing
+        already proven at ``_handle_ready_to_merge_report``, which also runs
+        from the merge region.  ``_record`` reads ``self.machine.state`` at call
+        time, so entering BLOCKED here keeps SM-2's ``report.phase ==
+        machine.state`` assertion satisfied.
+
+        See spec §8-E2 and the MERGE_PHASE_RATIONALE paragraph in
+        :meth:`_mark_blocked`'s docstring for why the entry gate stays.
+        """
+        if not merge_phase:
+            return
+        await self._persist_blocked_row(why=why, status=block_status)
+        self._enter_phase(WorkflowState.BLOCKED)
 
     def _durable_ref_suffix(self) -> str:
         """Durable git identifiers to append to an L1 escalation's detail.
