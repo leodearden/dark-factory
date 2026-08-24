@@ -10603,10 +10603,12 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 merge_phase=merge_phase,
             )
         # ``blocked`` — but first check for the worktree-missing race: if a
-        # human marked the task ``done`` and removed the worktree while the
-        # merge was in flight, the merge worker surfaces a known reason
-        # prefix.  Re-read task status; if terminal, exit cleanly without
-        # creating an escalation.
+        # human resolved the task out-of-band (``done`` OR ``cancelled``) and
+        # removed the worktree while the merge was in flight, the merge worker
+        # surfaces a known reason prefix.  Re-read task status; if terminal,
+        # exit cleanly without creating an escalation, reporting WHICH terminal
+        # it was (γ3 / boundary #14b — collapsing both onto DONE reported a
+        # cancellation as a completion and tripped run()'s SM-2 check).
         from orchestrator.merge_queue import WORKTREE_MISSING_REASON_PREFIX
         if result.reason.startswith(WORKTREE_MISSING_REASON_PREFIX):
             try:
@@ -10620,10 +10622,10 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             if status in TERMINAL_STATUSES:
                 logger.info(
                     f'Task {self.task_id}: worktree missing but task '
-                    f'status={status!r} (terminal) — exiting DONE without '
-                    f'escalation'
+                    f'status={status!r} (terminal) — exiting on that terminal '
+                    f'without escalation'
                 )
-                return WorkflowOutcome.DONE
+                return self._observed_terminal_outcome(status)
         # Drop-guard short-circuit: a real merger-drop is the human-judgement
         # case the gate exists for.  Steward mediation (e.g. mutating plan.json
         # to silence the gate) would undermine the safeguard, so skip the L0
