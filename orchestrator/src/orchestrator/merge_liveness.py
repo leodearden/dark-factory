@@ -848,6 +848,40 @@ async def release_chain_build_lane(
     await git_ops.release_spec_lane(lane, warm=warm)
 
 
+def per_host_inflight_bound(merge_ahead_bound: int, num_hosts: int) -> int:
+    """Worst-case in-flight merge verifies per host: ``ceil(bound / hosts)``.
+
+    THE SINGLE DEFINITION of the per-host bound (INV-5 no-lockstep-duplication:
+    two sites required to agree byte-for-byte are one site plus a call).  Two
+    callers share it and must never drift apart:
+
+    * :func:`enforce_persistent_worktree_serial_lane` — the fail-CLOSED startup
+      guard, which refuses a persistent warm ``_merge-verify`` worktree config
+      whose per-host bound exceeds 1.
+    * :func:`check_serial_lane_tripwire` — the C4 runtime tripwire (PRD
+      merge-worktree-lifecycle-integrity §4 C4, task 2930/η), which must judge
+      an observed concurrency against exactly the bound the startup guard
+      promised.  A tripwire computing a different number would stop matching
+      the invariant it exists to police.
+
+    The ``max(1, ...)`` clamps handle degenerate inputs: *merge_ahead_bound* is
+    always >= 1 in practice (the harness pins ``_k = _MERGE_AHEAD_BOUND = 1``;
+    callers never pass 0 or negative).  The clamps make a nonsense input fail
+    SAFE — the result stays >= 1, so the guard still refuses for any positive
+    bound on a single host and the tripwire still has a real ceiling to compare
+    against — rather than raising ``ZeroDivisionError`` or returning a
+    spuriously permissive 0 that would silently disarm both callers.
+
+    Args:
+        merge_ahead_bound: Effective merge-ahead bound (K).
+        num_hosts: Number of verify hosts sharing the workload.
+
+    Returns:
+        ``ceil(max(1, merge_ahead_bound) / max(1, num_hosts))`` — always >= 1.
+    """
+    return math.ceil(max(1, merge_ahead_bound) / max(1, num_hosts))
+
+
 def enforce_persistent_worktree_serial_lane(
     config: OrchestratorConfig,
     *,
@@ -900,12 +934,13 @@ def enforce_persistent_worktree_serial_lane(
 
     if not config.git.persistent_merge_worktree:
         return None
-    # max(1, ...) clamps degenerate inputs: merge_ahead_bound is always >= 1
-    # in practice (harness pins _k = _MERGE_AHEAD_BOUND = 1; callers never pass
-    # 0 or negative).  The clamp ensures we fail-safe (per_host_inflight stays
-    # >= 1 → guard still raises for any positive bound with a single host) rather
-    # than silently allowing division-by-zero or a spuriously permissive result.
-    per_host_inflight = math.ceil(max(1, merge_ahead_bound) / max(1, num_hosts))
+    # Shared formula (INV-5): see :func:`per_host_inflight_bound` for the
+    # ceil semantics and the fail-SAFE degenerate clamps.  It is deliberately
+    # NOT restated here — the C4 runtime tripwire
+    # (:func:`check_serial_lane_tripwire`) must derive its ceiling from the
+    # identical arithmetic or it stops policing the invariant this guard
+    # promised at startup.
+    per_host_inflight = per_host_inflight_bound(merge_ahead_bound, num_hosts)
     if per_host_inflight > 1:
         raise PersistentWorktreeConfigError(
             f'enforce_persistent_worktree_serial_lane: startup refused — '
