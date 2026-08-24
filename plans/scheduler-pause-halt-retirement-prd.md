@@ -355,8 +355,16 @@ No waivers required.
 - **Retiring or re-measuring the `watcher_guard` halts** (decision 9). They fail decision
   1's re-testability test on the same analogy as EWA and park-stop, but no measurement
   campaign has been run on them and the guard caps a cost runaway; this PRD enumerates
-  them so no call site is unclassified, and deliberately does not act on them. A future
-  PRD that measures them the way `esc-__scheduler__-8` measured the EWA owns the decision.
+  them so no call site is unclassified, and deliberately does not act on them. **Owner
+  filed 2026-08-24: task 4703**, which measures the supervision argument and rules on
+  whether the trip's `pause_scheduler` call survives at all. Its Phase-0 measurement
+  already establishes that the guard has NEVER fired (0 of 356,396 events), that the
+  misconfigured predicate has never come within 3 of its threshold, and — the part that
+  reframes the question — that the SUPERVISOR STOP, not the pause, is what caps the
+  watcher burn: `_check_watcher_guard` stops the supervisor whether or not
+  `pause_scheduler` succeeds. So the cost rationale recorded above may not survive
+  contact with the code; 4703 owns refuting or confirming it. Note task **4000** owns the
+  adjacent misconfigured-counter change and 4703 must not re-open it.
 
 ## 11. Open questions (tactical)
 
