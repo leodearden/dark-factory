@@ -954,3 +954,106 @@ def enforce_persistent_worktree_serial_lane(
             f'git.persistent_merge_worktree.'
         )
     return None
+
+# ---------------------------------------------------------------------------
+# Serial-lane C4 runtime tripwire (task 2930 / PRD η)
+#
+# The RUNTIME counterpart to the fail-CLOSED startup guard above: the guard
+# refuses a CONFIG whose per-host bound exceeds 1; the tripwire observes an
+# ACTUAL concurrency that exceeds it anyway.  DETECTION ONLY — PRD
+# merge-worktree-lifecycle-integrity §4 C4 says "no hard block".
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class SerialLaneAssessment:
+    """Return value from :func:`check_serial_lane_tripwire`.
+
+    All fields are informational and are exactly the facts the alarm's
+    telemetry payload carries (INV-2: a consumer must never have to log-scrape
+    a fact the emitter held in a variable).  Callers treat :attr:`breached` as
+    the decision bit.
+
+    Attributes:
+        local_inflight: Count of LOCAL merge verifies in flight, INCLUDING the
+            dispatch under consideration.
+        per_host_bound: Ceiling from :func:`per_host_inflight_bound`.
+        merge_ahead_bound: The effective merge-ahead bound (K) used.
+        num_hosts: Number of verify hosts used.
+        breached: True iff ``local_inflight > per_host_bound``.
+    """
+
+    local_inflight: int
+    per_host_bound: int
+    merge_ahead_bound: int
+    num_hosts: int
+    breached: bool
+
+
+def check_serial_lane_tripwire(
+    local_inflight: int,
+    *,
+    merge_ahead_bound: int | None = None,
+    num_hosts: int = 1,
+) -> SerialLaneAssessment:
+    """Decide whether the observed local verify concurrency breaches the lane.
+
+    PURE — no logging, no emission, no raising, no I/O.  It returns a verdict
+    and the caller decides what to do with it (:func:`alarm_serial_lane_breach`
+    is the acting wrapper).  Mirrors this module's established
+    :func:`check_merge_liveness_margin` → :class:`MergeLivenessAssessment` →
+    :func:`enforce_merge_liveness_margin` split.
+
+    *local_inflight* INCLUDES the dispatch being considered.  At the production
+    single-host default (``merge_ahead_bound=1``, ``num_hosts=1`` → per-host
+    bound 1) the FIRST local dispatch is ``1 > 1`` → ``breached=False`` and the
+    SECOND is ``2 > 1`` → ``breached=True``.  The normal single-dispatch case
+    is therefore silent BY CONSTRUCTION — there is no suppression state, no
+    dedup and no streak counter anywhere in this tripwire.
+
+    Counterparts:
+
+    * :func:`enforce_persistent_worktree_serial_lane` is the fail-CLOSED
+      STARTUP guard — it refuses a config whose per-host bound exceeds 1.
+    * This function is DETECTION-ONLY per PRD
+      merge-worktree-lifecycle-integrity §4 C4 ("no hard block"): it exists to
+      catch a request-identity leak of the task/5326 class, where two journal
+      entries for one branch were both enqueued and BYPASSED the
+      ``InFlightMergeRegistry`` coalesce gate, producing a concurrency the
+      startup guard's config check could never have predicted.
+
+    Both derive the ceiling from the SAME :func:`per_host_inflight_bound`
+    (INV-5), so the runtime detector always polices exactly the invariant the
+    startup guard promised.
+
+    Args:
+        local_inflight: Local verifies in flight, INCLUDING the new dispatch.
+        merge_ahead_bound: Effective merge-ahead bound; ``None`` resolves the
+            engine constant at CALL time (see the reach-back note below).
+        num_hosts: Number of verify hosts sharing the workload (default 1).
+
+    Returns:
+        A :class:`SerialLaneAssessment` carrying the verdict and its inputs.
+    """
+    # Reach-back (deferred import): _MERGE_AHEAD_BOUND stays in merge_queue.py
+    # (engine constant) and the existing test suite monkeypatches it by string
+    # path at orchestrator.merge_queue._MERGE_AHEAD_BOUND.  A def-time default
+    # would require a top-level `import orchestrator.merge_queue`, which
+    # DEADLOCKS module load (merge_queue's re-export shim needs this module
+    # fully defined first) and would freeze the value past any monkeypatch —
+    # the engine-constant default-argument hazard the module docstring
+    # describes, and the identical shape used by
+    # enforce_persistent_worktree_serial_lane above.
+    from orchestrator.merge_queue import _MERGE_AHEAD_BOUND
+
+    if merge_ahead_bound is None:
+        merge_ahead_bound = _MERGE_AHEAD_BOUND
+
+    bound = per_host_inflight_bound(merge_ahead_bound, num_hosts)
+    return SerialLaneAssessment(
+        local_inflight=local_inflight,
+        per_host_bound=bound,
+        merge_ahead_bound=merge_ahead_bound,
+        num_hosts=num_hosts,
+        breached=local_inflight > bound,
+    )
