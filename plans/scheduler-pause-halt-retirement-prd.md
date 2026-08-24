@@ -83,8 +83,23 @@ Verified to exist on `ccea277b78`:
 
 **Novel substrate, created inside this batch by leaf α (every other leaf depends on it):**
 three additive `scheduler_state` columns — `pause_class TEXT`, `hold_owner TEXT`,
-`expires_at TEXT` — via the `_migrate_scheduler_state_ewa_value` pattern. No other novel
-substrate; the rest is deletion and re-wiring of existing calls.
+`expires_at TEXT` — via the `_migrate_scheduler_state_ewa_value` pattern.
+
+**Second novel substrate, added at decompose (2026-08-24), also owned by α:** a typed
+structured-facts sub-record on the `Escalation` model for a non-halting detector trip.
+§6 invariant 5 requires β/γ's escalations to carry `ratio` / `window_secs` /
+`dones_in_window` / `submissions_in_step` / `ewa` / `threshold` as structured fields
+rather than prose — and no generic key→value payload exists on the record today.
+`Escalation.evidence` is `list[EvidenceEntry]`, whose three fields
+(`observation`, `measured_at`, `ref`) are all prose strings the server stores verbatim
+without shape validation (`escalation/src/escalation/models.py`), so scraping it back is
+exactly the INV-2 failure the invariant forbids. The house pattern for this is a typed
+sub-record on the record itself — `TrainState` and `IndexHealthState` are the two
+in-repo precedents. α owns it because α already owns the batch's substrate and is
+upstream of BOTH consumers; letting β and γ each add their own would be a lock-step
+duplication (INV-5) and a merge race on one file.
+
+No other novel substrate; the rest is deletion and re-wiring of existing calls.
 
 ## 4. Resolved design decisions
 
@@ -240,7 +255,9 @@ Each row faces both the producer (the trip site) and the consumer (the operator 
 - **α — pause-class taxonomy + policy table + `scheduler_state` migration.** Adds
   `pause_class`/`hold_owner`/`expires_at` (additive migration, `_migrate_scheduler_state_ewa_value`
   pattern), the `PauseClass` enum, and the single policy table; converts the
-  `startswith('ewa_trip_')` prose-sniffing sites to enum reads (INV-1). *Intermediate* —
+  `startswith('ewa_trip_')` prose-sniffing sites to enum reads (INV-1), and adds the
+  typed structured-facts sub-record on `Escalation` that §6 invariant 5 requires of β/γ
+  (see §3). *Intermediate* —
   unlocks β, γ, δ, ε, ζ, κ. Signal: `get_scheduler_state` reports a structured
   `pause_class` for a held pause where it previously reported only a prose reason.
 - **β — EWA trip escalates, never halts.** Deletes the `pause_scheduler` call from the
