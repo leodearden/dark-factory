@@ -2,6 +2,7 @@
 
 import logging
 import re
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -4035,16 +4036,48 @@ def _verify_rows(actions: list[dict]) -> list[dict]:
     ]
 
 
-async def _run_done_transition(reconciler, task_id: str = '1') -> dict:
+async def _run_done_transition(
+    reconciler, task_id: str = '1', project_root: str = '/tmp/test',
+) -> dict:
     """Drive a done-transition through the sparse-knowledge verify branch.
 
     mock_memory_service.search defaults to [], so len(related) < 2 and the
     verification branch opens with no extra setup.
+
+    ``project_root`` is overridable (task 4722) because it is now the root the
+    verifier actually verifies against: tests driving a REAL CodebaseVerifier
+    need a real checkout here, and the fail-closed refusal test needs a root
+    that is deliberately NOT one.  The '/tmp/test' default keeps every
+    mocked-verifier caller unchanged.
     """
     return await reconciler.reconcile_task(
         task_id=task_id, transition='done', project_id='test-project',
-        project_root='/tmp/test',
+        project_root=project_root,
         task_before={'id': task_id, 'title': 'Test', 'status': 'in-progress'},
+    )
+
+
+@pytest.mark.asyncio
+async def test_on_task_done_passes_scope_project_root_as_codebase_root(reconciler):
+    """The verifier is pointed at the TASK's project root, not the global one.
+
+    Task 4722 / PRD D3.  ``reconcile_task`` already validates the root and
+    builds a ``ProjectScope`` from it; ``_on_task_done`` hands that same value
+    to ``verify()``, making the caller's scope the single root authority
+    (INV-9).  Before this, every project's claims were verified against the
+    process-global ``explore_codebase_root`` — and 58% of historical gate
+    openings were for non-dark_factory projects.
+    """
+    project_root = '/tmp/some-other-project'
+    assert project_root != reconciler.config.explore_codebase_root
+
+    await _run_done_transition(reconciler, project_root=project_root)
+
+    reconciler.verifier.verify.assert_awaited_once()
+    call_kwargs = reconciler.verifier.verify.call_args.kwargs
+    assert call_kwargs['codebase_root'] == Path(project_root), (
+        f'Expected codebase_root={project_root!r}, got '
+        f'{call_kwargs.get("codebase_root")!r}'
     )
 
 
@@ -4283,7 +4316,7 @@ class TestVerificationFailureAudit:
 
     @pytest.mark.asyncio
     async def test_cli_failure_token_survives_end_to_end_into_the_journal(
-        self, reconciler, journal, config
+        self, reconciler, journal, config, tmp_path
     ):
         """Anti-regression for the WHOLE chain, with no VerificationResult hand-built.
 
@@ -4295,6 +4328,14 @@ class TestVerificationFailureAudit:
         """
         reconciler.verifier = CodebaseVerifier(config.reconciliation)
 
+        # A real checkout-shaped root (task 4722): the verifier now refuses an
+        # unusable root BEFORE spawning an agent, so driving this through the
+        # old '/tmp/test' default would flip the token under test to
+        # 'codebase_root_unresolved' and stop exercising the CLI chain at all.
+        real_root = tmp_path / 'checkout'
+        real_root.mkdir()
+        (real_root / '.git').mkdir()
+
         with patch('fused_memory.reconciliation.verify.AgentLoop') as MockAgentLoop:
             agent = AsyncMock()
             agent.run = AsyncMock(return_value=(
@@ -4303,7 +4344,7 @@ class TestVerificationFailureAudit:
             ))
             MockAgentLoop.return_value = agent
 
-            await _run_done_transition(reconciler)
+            await _run_done_transition(reconciler, project_root=str(real_root))
 
         runs = await journal.get_recent_runs('test-project', limit=1)
         actions = await journal.get_run_actions(runs[0].id)
