@@ -2530,6 +2530,40 @@ class TestMem0BackendScanPayloadText:
         assert any('truncat' in r.message.lower() for r in caplog.records), caplog.text
 
     @pytest.mark.asyncio
+    async def test_a_capped_walk_shrinks_each_page_across_a_page_boundary(self, backend, caplog):
+        """MULTI-PAGE: the cap keeps shrinking as the walk advances.
+
+        Every other truncation test here stops on page 1, so the per-page
+        shrink is only ever observed once — a regression that re-requested the
+        whole remaining budget on each page would over-fetch invisibly.  Drives
+        the REAL pager (raw client mock, not a stub) so the scan's `limit` is
+        pinned all the way down to the wire.
+        """
+        points = [_scan_point(f'id-{i}', {'data': _SCAN_LEAK_TEXT}) for i in range(3)]
+        mock_client = AsyncMock()
+        mock_client.scroll = AsyncMock(
+            side_effect=[(points[:2], 'cursor1'), (points[2:], 'cursor2')]
+        )
+
+        with (
+            patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)),
+            caplog.at_level(logging.WARNING),
+        ):
+            result = await backend.scan_payload_text(
+                scope=Scope(project_id='p'), page_size=2, limit=3
+            )
+
+        assert result['scanned'] == 3
+        assert len(result['matches']) == 3
+        assert result['truncated'] is True
+        limits = [call.kwargs.get('limit') for call in mock_client.scroll.await_args_list]
+        assert limits == [2, 1], (
+            'page 2 must ask only for the remaining budget (limit - scanned); '
+            f'got {limits!r}'
+        )
+        assert any('truncat' in r.message.lower() for r in caplog.records), caplog.text
+
+    @pytest.mark.asyncio
     async def test_untruncated_walk_reports_truncated_false_and_logs_nothing(self, backend, caplog):
         mock_client = AsyncMock()
         mock_client.scroll = AsyncMock(
