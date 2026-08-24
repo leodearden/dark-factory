@@ -2219,6 +2219,52 @@ class TestMem0BackendScanPayloadText:
             await backend.scan_payload_text(scope=Scope(project_id='p'))
 
     @pytest.mark.asyncio
+    async def test_a_failure_in_the_loop_body_still_closes_the_pager(self, backend):
+        """DETERMINISTIC CLOSE on every exit path, not just the loop's own two.
+
+        A bare ``async for`` closes the generator when the ITERATION ends or
+        raises — but an exception from the loop BODY (a malformed payload
+        reaching the detector) or a cancellation is neither, and leaves
+        scroll_collection_pages suspended mid-walk for the event loop's
+        async-generator hooks to finalise at some later, unpredictable point.
+        ``contextlib.aclosing`` is what makes the close deterministic; the
+        never-`break` discipline alone does not buy it.
+
+        The sibling test above exercises a raise FROM the generator, which
+        closes either way — this one is the case that distinguishes them.
+        """
+        closed = False
+
+        def _pager(*args, **kwargs):
+            async def _gen():
+                nonlocal closed
+                try:
+                    yield _scan_point('id-1', {'data': _SCAN_LEAK_TEXT})
+                    yield _scan_point('id-2', {'data': _SCAN_LEAK_TEXT})
+                finally:
+                    closed = True
+
+            return _gen()
+
+        def _explode(_text):
+            raise RuntimeError('malformed payload')
+
+        with (
+            patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=AsyncMock())),
+            patch.object(backend, 'scroll_collection_pages', _pager),
+            patch(
+                'fused_memory.utils.toolcall_xml_leak.find_toolcall_xml_leak', _explode
+            ),
+            pytest.raises(RuntimeError, match='malformed payload'),
+        ):
+            await backend.scan_payload_text(scope=Scope(project_id='p'))
+
+        assert closed, (
+            'the pager must be closed on the way out of a body failure, not left '
+            'suspended for the GC to finalise later'
+        )
+
+    @pytest.mark.asyncio
     async def test_max_pages_is_accepted_and_forwarded_to_the_pager(self, backend):
         """The page budget scan inherits from the shared pager is steerable.
 
