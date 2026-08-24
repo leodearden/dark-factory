@@ -118,9 +118,32 @@ STATUS_TERMINAL = "terminal"
 STATUS_NON_TERMINAL = "non_terminal"
 
 # Axis 2 — reconciliation. Whether a real scope derivation ever SUPERSEDED the
-# tagger's guess. A reconciled record is no longer a victim; a never-reconciled
-# one still has the guess as its live scope.
+# tagger's guess.
+#
+# THREE VALUES, NOT TWO — and the correction is the whole point of schema v2.
+# v1 counted ANY post-stamp ``lock_acquired`` as proof the guess had been
+# superseded. It is not. ``Scheduler._get_modules``
+# (orchestrator/src/orchestrator/scheduler.py:8797-8801) computes the locked
+# module set as ``derive_modules(metadata["files"], depth)`` — STRAIGHT FROM
+# ``metadata.files``, which for a never-reconciled tagger-stamped record IS the
+# tagger's guess. A post-stamp lock is therefore an ECHO of the guess, not an
+# independent scope assertion, for exactly the population this census exists to
+# flag. Measured on the v1 artifact: 278 of 286 plan_reconciled verdicts (97%)
+# rested on a lock alone, and 267 of 507 records were called reconciled while
+# still carrying a non-empty ``metadata.files``.
+#
+#   plan_reconciled  — a set_to_plan / phase_skipped{plan_files} event
+#                      postdates the stamp. A genuine PLAN-derived assertion,
+#                      and the audit module's own lens. The strong signal.
+#   lock_reconciled  — no plan event, but a post-stamp lock names at least one
+#                      module the record's own ``metadata.files`` cannot
+#                      explain, so it was not a re-derivation of the guess.
+#                      Real but WEAKER evidence, given its own label so a
+#                      consumer can filter it rather than having to trust it.
+#   never_reconciled — nothing superseded the guess. It is still this record's
+#                      live scope.
 RECONCILED = "plan_reconciled"
+LOCK_RECONCILED = "lock_reconciled"
 NEVER_RECONCILED = "never_reconciled"
 
 # Axis 3 — wipe signature. Whether an authoritative scope EXISTED BEFORE the
@@ -163,10 +186,17 @@ class ScopeEvent(NamedTuple):
     ``fidelity`` carries the audit's own FIDELITY_* label, which stays
     load-bearing here for the same reason it is there: a lock-level scope is a
     MODULE set, not a plan.files list, and the two must never be conflated by a
-    downstream repair. ``file_count`` is recorded rather than the paths
-    themselves — the census classifies WHEN a scope existed, not what it was,
-    and carrying full path lists for every event would bloat the artifact
-    without informing any of the three axes.
+    downstream repair.
+
+    ``files`` HOLDS THE PATHS, and ``file_count`` is derived from that same
+    list at every construction site so the two cannot drift. v1 kept only the
+    count, on the reasoning that the census classifies WHEN a scope existed
+    rather than what it was; schema v2 makes the paths load-bearing, because
+    the axis-2 echo test asks whether a lock's modules are merely a
+    re-derivation of the record's own ``metadata.files``, which is a question
+    about the paths themselves. THE ARTIFACT STILL EMITS ONLY ``file_count``:
+    the paths stay in memory, so the no-path-bloat property that reasoning
+    protected survives and no JSON row grows.
     """
 
     timestamp: str
@@ -174,24 +204,33 @@ class ScopeEvent(NamedTuple):
     event_id: int
     fidelity: str
     file_count: int
+    files: tuple[str, ...]
 
 
 class ScopeEvidence(NamedTuple):
     """The deciding event behind one classification axis, or all-None.
 
     ALWAYS present on a classification, even when nothing was found: a record
-    whose axis is undecided still carries these three keys set to None. A
+    whose axis is undecided still carries these four keys set to None. A
     MISSING key in the artifact would be indistinguishable from a serializer
     bug, whereas an explicit null says "looked, found nothing" (INV-2 —
     no classification is a prose-only claim).
+
+    ``fidelity`` (schema v2) is the deciding event's own FIDELITY_* label, so a
+    consumer can tell a file-level assertion from a lock-level one WITHOUT
+    re-deriving it from ``event_type``. The two are not interchangeable: a
+    module path must never be written back into ``metadata.files``.
     """
 
     event_type: str | None
     event_id: int | None
     timestamp: str | None
+    fidelity: str | None
 
 
-_NO_EVIDENCE = ScopeEvidence(event_type=None, event_id=None, timestamp=None)
+_NO_EVIDENCE = ScopeEvidence(
+    event_type=None, event_id=None, timestamp=None, fidelity=None
+)
 
 
 class Classification(NamedTuple):
@@ -250,18 +289,85 @@ def _evidence(event: ScopeEvent) -> ScopeEvidence:
         event_type=event.event_type,
         event_id=event.event_id,
         timestamp=event.timestamp,
+        fidelity=event.fidelity,
     )
+
+
+def _path_parts(path: str) -> tuple[str, ...]:
+    """Split a file or module path into its non-empty '/'-separated components.
+
+    Module paths from a lock render with a trailing slash (``"scripts/"``) and
+    file paths do not, so both sides are normalised here rather than at each
+    comparison.
+    """
+    return tuple(part for part in path.split("/") if part)
+
+
+def _module_is_explained_by(module: str, files: tuple[str, ...]) -> bool:
+    """True when *module* is a component-wise PATH PREFIX of some entry in *files*.
+
+    THIS IS THE DEPTH-INVARIANT OF ``derive_modules``. ``files_to_modules``
+    truncates each path to ``depth`` components, so EVERY module it can emit is
+    a prefix of some entry in the file list it was given — whatever ``depth``
+    happened to be. Testing the prefix relation rather than
+    ``derive_modules(files, depth) == modules`` is what keeps this correct
+    without knowing the depth: measured at plan time, ``lock_depth`` is
+    12/10/4/4/3/unset(2) across the six corpora AND changed mid-tagger-era
+    (dark-factory 4->12, reify 4->10), so an equality-at-one-depth test would
+    have silently regressed the first time an operator retuned it.
+
+    Component-wise, never ``str.startswith``: ``"a/bcd/e.py".startswith("a/b")``
+    is True and meaningless, and taking it as a match would call an unrelated
+    module an echo and downgrade a genuine reconciliation to never_reconciled.
+    """
+    parts = _path_parts(module)
+    if not parts:
+        return False
+    # A slice longer than the candidate simply yields the whole candidate,
+    # which cannot equal the longer *parts* — so a module DEEPER than the file
+    # it is compared against falls out as unexplained without a length guard.
+    return any(_path_parts(candidate)[: len(parts)] == parts for candidate in files)
+
+
+def _lock_echoes_guess(event: ScopeEvent, metadata_files: tuple[str, ...]) -> bool:
+    """True when *event*'s module set is fully explained by the record's own files.
+
+    An echo asserts nothing the tagger did not already assert, so it is NOT
+    evidence that the guess was superseded. See the axis-2 vocabulary block.
+    """
+    if not event.files:
+        # Not a scope assertion at all. Treated as an echo — i.e. as NO
+        # evidence of reconciliation — because the alternative would credit an
+        # empty module set with superseding the guess. load_scope_events
+        # already drops these rows; this is a defensive floor, not a live path.
+        return True
+    if not metadata_files:
+        # THE reify-5632 SHAPE (metadata.files == []). With no guess on the
+        # record, NOTHING can explain the lock's modules, so it cannot be a
+        # re-derivation of the guess. Pinned so an empty guess can never
+        # degenerate into a false echo via a vacuous all().
+        return False
+    return all(_module_is_explained_by(module, metadata_files) for module in event.files)
 
 
 def classify_record(
     files_tagged_at: str,
     status: str,
     scope_events: list[ScopeEvent],
+    metadata_files: tuple[str, ...],
 ) -> Classification:
     """Classify one stamped record on all three axes. PURE — no I/O.
 
     *files_tagged_at* is the record's stamp; *scope_events* are every scope
-    event observed for that task, in any order.
+    event observed for that task, in any order; *metadata_files* is that
+    record's CURRENT ``metadata.files`` — for a never-reconciled record, the
+    tagger's surviving guess.
+
+    *metadata_files* IS REQUIRED, deliberately, with no default. Defaulting it
+    to ``()`` would mean "assume this record carries no guess", under which
+    every post-stamp lock reads as genuine and the record is reported as
+    already reconciled — the exact false-repaired verdict schema v2 exists to
+    correct. A caller that forgets it fails loudly at the call site instead.
 
     TIMESTAMP COMPARISON IS STRICT (``>`` / ``<``), DELIBERATELY. An event
     bearing exactly the stamp's instant is evidence of NEITHER reconciliation
@@ -272,11 +378,20 @@ def classify_record(
     written by the same process family at the same offset, so a plain string
     compare is total and correct.
 
-    Evidence selection: the EARLIEST post-stamp event decides reconciliation
-    (the first thing that superseded the guess), and the LATEST pre-stamp event
-    decides the overwrite (the most recent authoritative scope the stamp wrote
-    over). Both are the closest event to the stamp on their side, so the
-    evidence names the write that actually bracketed it.
+    AXIS 2 IS PARTITIONED, NOT MERELY ORDERED. Post-stamp events split into
+    PLAN-level (the audit's own ``_EVENT_PLAN_SOURCES`` — set_to_plan and
+    phase_skipped{plan_files}) and LOCK-level (lock_acquired). A plan event is
+    a genuine plan-derived assertion and always wins, EVEN IF a lock postdates
+    the stamp earlier: the stronger signal must never be masked by the weaker
+    one. A lock counts only if it survives ``_lock_echoes_guess``, and then
+    under its own weaker label. Plan events are never echo-filtered — they are
+    assertions, not re-derivations of ``metadata.files``.
+
+    Evidence selection: the EARLIEST qualifying post-stamp event decides
+    reconciliation (the first thing that superseded the guess), and the LATEST
+    pre-stamp event decides the overwrite (the most recent authoritative scope
+    the stamp wrote over). Both are the closest event to the stamp on their
+    side, so the evidence names the write that actually bracketed it.
 
     The two axes are INDEPENDENT: a record can have been stamped over a prior
     scope AND later reconciled. Collapsing them would lose exactly the
@@ -287,13 +402,29 @@ def classify_record(
     after = [event for event in scope_events if event.timestamp > files_tagged_at]
     before = [event for event in scope_events if event.timestamp < files_tagged_at]
 
-    if after:
+    plan_after = [event for event in after if event.event_type in _EVENT_PLAN_SOURCES]
+    lock_after = [
+        event
+        for event in after
+        if event.event_type not in _EVENT_PLAN_SOURCES
+        and not _lock_echoes_guess(event, metadata_files)
+    ]
+
+    if plan_after:
         reconciliation = RECONCILED
-        reconciled_by = _evidence(min(after, key=lambda event: event.timestamp))
+        reconciled_by = _evidence(min(plan_after, key=lambda event: event.timestamp))
+    elif lock_after:
+        reconciliation = LOCK_RECONCILED
+        reconciled_by = _evidence(min(lock_after, key=lambda event: event.timestamp))
     else:
         reconciliation = NEVER_RECONCILED
         reconciled_by = _NO_EVIDENCE
 
+    # AXIS 3 IS DELIBERATELY NOT ECHO-FILTERED, and this asymmetry is the
+    # correct one: a PRE-stamp lock proves a file-derived scope existed BEFORE
+    # the tagger stamped, so it cannot be an echo of a guess that did not yet
+    # exist. Applying the axis-2 filter here "for consistency" would erase
+    # exactly the wipe signal this census exists to surface.
     if before:
         wipe_signature = POST_WIPE_OVERWRITE
         preceded_by = _evidence(max(before, key=lambda event: event.timestamp))
@@ -440,6 +571,7 @@ def load_scope_events(
                     event_id=event_id,
                     fidelity=fidelity,
                     file_count=len(files),
+                    files=files,
                 )
             )
     finally:
@@ -558,7 +690,9 @@ def census_project(project_root: str) -> ProjectCensus:
     records: list[CensusRecord] = []
     for record in stamped.values():
         events = scope_events.get(str(record.task_id), [])
-        verdict = classify_record(record.files_tagged_at, record.status, events)
+        verdict = classify_record(
+            record.files_tagged_at, record.status, events, record.metadata_files
+        )
         records.append(
             CensusRecord(
                 project_id=project_id,
@@ -612,7 +746,7 @@ SCHEMA_VERSION = 1
 # makes a zero-valued cell present rather than absent — a missing key must
 # never be readable as a zero.
 _STATUS_CLASSES = (STATUS_TERMINAL, STATUS_NON_TERMINAL)
-_RECONCILIATIONS = (RECONCILED, NEVER_RECONCILED)
+_RECONCILIATIONS = (RECONCILED, LOCK_RECONCILED, NEVER_RECONCILED)
 _WIPE_SIGNATURES = (POST_WIPE_OVERWRITE, NO_PRIOR_SCOPE)
 
 # THE ARTIFACT DELIBERATELY CARRIES NO generated_at, timestamp OR SHA, and a
