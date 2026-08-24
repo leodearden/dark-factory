@@ -9322,6 +9322,115 @@ class TestFilterAlreadyTrackedSystemicPatternsCrossProject:
 
 
 # ---------------------------------------------------------------------------
+# task 4711 — widen _NEVER_TRACKED_PHRASES so the pointer-free cross-project
+# filter reaches the "no fix task has been filed" complaint class
+# ---------------------------------------------------------------------------
+
+
+class TestNeverTrackedLexiconWidening:
+    """Tests for task 4711: widen _NEVER_TRACKED_PHRASES to reach the "no fix
+    task has been filed" complaint class — the wording of Leo's 2026-08-17
+    ruling on gate 3841 (originating know_live flag e3527208 / task 598) —
+    which the original five-phrase lexicon (all "never .../no tracked task"
+    variants) does not match.
+
+    RED until step-2 widens _NEVER_TRACKED_PHRASES.
+    """
+
+    #: MEASURED DROP fixture (task 4711 plan): 9 significant terms against
+    #: _make_covering_task's title+description, coverage 0.889 (>= the
+    #: default match_coverage=0.75), precision 0.800 (>= the default
+    #: min_task_term_precision=0.2) — comfortably clears min_key_terms=4.
+    #: Deliberately NOT the bare repro fragment 'no fix task has been filed
+    #: for this recurring finding' from the task description: that fragment
+    #: yields only 2 significant terms ({'fix', 'recurring'}, since
+    #: 'filed'/'file'/'task'/'finding' are already _STOPWORDS), which is
+    #: below min_key_terms=4 and is therefore KEPT unconditionally
+    #: regardless of the lexicon — a drop assertion built on it could never
+    #: pass.
+    _DROP_DESCRIPTION = (
+        'No fix task has been filed for this recurring pattern: the '
+        'remediation payload omits the live workflow signals section.'
+    )
+
+    def _make_flag(self, description: str) -> dict:
+        """A systemic_pattern finding, mirroring _make_never_tracked_flag's
+        shape with *description* swapped in for the "no fix task has been
+        filed" wrapper wording."""
+        return {
+            'task_id': None,
+            'category': 'systemic_pattern',
+            'flag_type': 'systemic_pattern',
+            'description': description,
+            'suggested_action': (
+                'File a task to wire the live workflow signals into the '
+                'remediation payload.'
+            ),
+        }
+
+    def _make_covering_task(self) -> dict:
+        """A task whose title+description covers _DROP_DESCRIPTION's terms.
+
+        Mirrors TestFilterAlreadyTrackedSystemicPatternsCrossProject's
+        _make_covering_task shape, adapted to the remediation-payload prose
+        (MEASURED: 10 task terms, 8 overlap with the 9 finding terms above).
+        """
+        return {
+            'id': '3839',
+            'status': 'pending',
+            'title': 'Wire live workflow signals into the remediation payload',
+            'description': (
+                'The remediation payload omits the live workflow signals '
+                'section for this recurring pattern; wire the signals '
+                'through.'
+            ),
+        }
+
+    # ---- (1) unit: the widened phrase is recognised -----------------------
+
+    def test_no_fix_task_has_been_filed_is_recognised_as_never_tracked_language(self):
+        """(1) UNIT: _asserts_never_tracked recognises the task-named
+        originating phrasing directly, and _is_systemic_pattern_candidate
+        reaches it via a realistic full-length flag description."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _asserts_never_tracked,
+            _is_systemic_pattern_candidate,
+        )
+
+        assert _asserts_never_tracked('no fix task has been filed') is True
+
+        flag = self._make_flag(self._DROP_DESCRIPTION)
+        assert _is_systemic_pattern_candidate(flag) is True, (
+            f'Expected the widened lexicon to reach {flag["description"]!r}'
+        )
+
+    # ---- (2) end-to-end: a foreign-project covering task drops the flag ---
+
+    @pytest.mark.asyncio
+    async def test_foreign_project_covering_task_drops_no_fix_task_filed_flag(self):
+        """(2) END-TO-END: a non-cancelled covering task in a foreign known
+        project drops the widened "no fix task has been filed" finding."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_already_tracked_systemic_patterns,
+        )
+
+        flag = self._make_flag(self._DROP_DESCRIPTION)
+        taskmaster = AsyncMock()
+        taskmaster.get_tasks = AsyncMock(return_value={
+            'tasks': [self._make_covering_task()],
+        })
+
+        result = await filter_already_tracked_systemic_patterns(
+            taskmaster, {'know_live': '/kl'}, [flag],
+        )
+
+        assert result == [], (
+            'A non-cancelled covering task in a foreign known project must '
+            f'DROP the widened "no fix task has been filed" finding; got {result!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
 # task 4381 amendment pass (review fixes) — the bounded, batched and
 # instrumented cross-project fix-task gate
 # ---------------------------------------------------------------------------
