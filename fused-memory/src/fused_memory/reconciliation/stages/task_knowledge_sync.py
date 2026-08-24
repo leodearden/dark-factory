@@ -290,19 +290,21 @@ async def _acknowledge_resolved_stage1_markers(
 _TASK_CREATED_SUCCESS_STATUSES: frozenset[str] = frozenset({'created', 'combined'})
 
 
-def _count_valid_task_created_records(
+def _action_record_keys(
     records: object,
     default_project_id: str | None = None,
-) -> int:
-    """Return the deduped count of confirmed task creations in *records* (task 3046).
+    valid_statuses: frozenset[str] = _TASK_CREATED_SUCCESS_STATUSES,
+) -> set[tuple[str | None, str]]:
+    """Return the deduped ``(project_id, task_id)`` keys of *records* (task 3046).
 
-    *records* is ``report.stats['task_created_records']`` — the action-shaped
-    ground truth the '## Task-Creation Accounting' prompt section mandates
-    Stage 2 append to at the moment each ``resolve_ticket`` call confirms a
-    creation, modeled directly on ``flag_deleted_records``. A record counts
-    only when its ``status`` (case/whitespace-insensitive) is ``created`` or
-    ``combined`` AND it carries a non-empty ``task_id``; ``failed`` is NEVER
-    counted regardless of whether a ``task_id`` is present.
+    *records* is an action-record list such as
+    ``report.stats['task_created_records']`` — the action-shaped ground truth
+    the '## Task-Creation Accounting' prompt section mandates Stage 2 append to
+    at the moment each ``resolve_ticket`` call confirms a creation, modeled
+    directly on ``flag_deleted_records``. A record keys only when its
+    ``status`` (case/whitespace-insensitive) is in *valid_statuses* AND it
+    carries a non-empty ``task_id``; ``failed`` is NEVER counted regardless of
+    whether a ``task_id`` is present.
 
     This is the ``resolve_ticket``-confirmed SUBSET of the '## Verifying Task
     Operations' confirmation rule, not the whole of it: that section also lets
@@ -310,10 +312,10 @@ def _count_valid_task_created_records(
     ``resolve_ticket``'s ``status`` is neither ``created``/``combined``/
     ``failed`` but a ``task_id`` is present and a follow-up ``get_task`` call
     verifies it. That fallback path has no dedicated ``task_created_records``
-    status value and is intentionally NOT counted here — it still
-    contributes to the agent's own self-reported ``tasks_created``, and this
-    helper's result is only ever used to raise that self-report, never lower
-    it, so a ``get_task``-verified creation is never double-counted and never
+    status value and is intentionally NOT keyed here — it still contributes to
+    the agent's own self-reported ``tasks_created``, and this helper's result
+    is only ever used to raise that self-report, never lower it, so a
+    ``get_task``-verified creation is never double-counted and never
     suppressed by this helper (task-3046 amendment: '## Verifying Task
     Operations' intentionally covers a strictly larger set of countable
     creations than this Python subset does — the two are not claimed to be
@@ -331,15 +333,24 @@ def _count_valid_task_created_records(
     the caller's own ``self.project_id`` — so an omitted field cannot
     masquerade as a second, distinct cross-project filing of the same task.
 
+    Returning the KEY SET rather than only its length is what task 3051 needs:
+    ``_corroborate_record_keys`` iterates the actual ``(project_id, task_id)``
+    pairs so each can be confirmed against its OWN project via
+    ``taskmaster.get_task`` before it is allowed to raise a counter.
+    *valid_statuses* is a parameter rather than a constant read for the same
+    reason the key set is returned — the follow-up ``tasks_hints_updated``
+    records work reuses this helper with its own accepted-status vocabulary,
+    so it is a call site rather than a second copy of these rules.
+
     Best-effort and non-raising throughout, mirroring
     ``_acknowledge_resolved_stage1_markers`` above: *records* must be a
-    non-empty ``list`` or this returns ``0``; non-``dict`` entries and
+    non-empty ``list`` or this returns an empty set; non-``dict`` entries and
     entries that raise while being inspected are silently skipped rather
-    than aborting the count — a malformed record degrades to "not counted",
+    than aborting the scan — a malformed record degrades to "not counted",
     never to an exception that would corrupt an otherwise-good stage report.
     """
     if not isinstance(records, list) or not records:
-        return 0
+        return set()
 
     seen: set[tuple[str | None, str]] = set()
     for record in records:
@@ -349,7 +360,7 @@ def _count_valid_task_created_records(
             status = record.get('status')
             if (
                 not isinstance(status, str)
-                or status.strip().lower() not in _TASK_CREATED_SUCCESS_STATUSES
+                or status.strip().lower() not in valid_statuses
             ):
                 continue
             task_id = record.get('task_id')
@@ -367,7 +378,22 @@ def _count_valid_task_created_records(
             continue
         seen.add((project_id_str, task_id_str))
 
-    return len(seen)
+    return seen
+
+
+def _count_valid_task_created_records(
+    records: object,
+    default_project_id: str | None = None,
+) -> int:
+    """Return the deduped count of confirmed task creations in *records* (task 3046).
+
+    A thin documented alias for ``len(_action_record_keys(...))`` — every
+    substantive rule (which statuses count, how keys are built and deduped,
+    the ``default_project_id`` fallback, the non-raising posture) is stated
+    once on :func:`_action_record_keys` so the two cannot drift into two
+    explanations of one rule.
+    """
+    return len(_action_record_keys(records, default_project_id))
 
 
 def _coerce_tasks_created_count(value: object) -> int:
