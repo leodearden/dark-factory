@@ -10368,7 +10368,7 @@ class TestDiscoverForeignFixTaskCitations:
         'The Stage 2 remediation payload omits live workflow signals; '
         'no fix task has been filed.'
     )
-    #: What ``_safe_get_task`` reports for the matched task.  Deliberately
+    #: What ``safe_get_task`` reports for the matched task.  Deliberately
     #: DIFFERENT from the ``get_tasks`` title below so a test can prove the
     #: citation's title is read from the LIVE record rather than from the
     #: bulk listing the match was computed against.
@@ -10464,7 +10464,7 @@ class TestDiscoverForeignFixTaskCitations:
             'a carried-forward complaint already covered by a filed foreign '
             f'task must yield a citation naming it; got {result!r}'
         )
-        # The title comes from the LIVE record (_safe_get_task), not from the
+        # The title comes from the LIVE record (safe_get_task), not from the
         # bulk listing the coverage match was computed against — so a
         # discovered citation corroborates by construction.
         taskmaster.get_task.assert_awaited_once_with('3839', '/df')
