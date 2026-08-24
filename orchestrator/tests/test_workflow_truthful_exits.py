@@ -26,7 +26,7 @@ its truthful outcome through one shared choke point
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 import pytest
 from _orch_helpers import pydantic_spec

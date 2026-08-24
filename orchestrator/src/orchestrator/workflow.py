@@ -14769,6 +14769,48 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             return WorkflowOutcome.CANCELLED
         return None
 
+    def _observed_terminal_outcome(self, status: str | None) -> WorkflowOutcome:
+        """Map an OBSERVED terminal task row onto its truthful outcome.
+
+        The sibling of ``_handle_cancelled_terminal_exit`` above: that one
+        answers "a *rejection* told us the row is cancelled", this one answers
+        "a status *read* told us the row is terminal". Callers have already
+        established ``status in TERMINAL_STATUSES``; this decides which
+        terminal it actually is (PRD γ3 / spec §5, "observed-terminal reported
+        as that terminal").
+
+        ``'cancelled'`` → :attr:`WorkflowOutcome.CANCELLED`, entering
+        ``WorkflowState.CANCELLED`` (SM-1 terminal absorption) — guarded by
+        ``machine.is_terminal()`` because one caller
+        (``_handle_soft_cancel``, reached from ``_finalise_cancellation``)
+        has ALREADY entered CANCELLED, and re-entering an absorbing state
+        would raise ``IllegalTransition`` out of a path with no handler for
+        it. This branch is also a live crash fix, not only a relabelling:
+        ``_OUTCOME_ALLOWED['done'] == {DONE}``
+        (``shared/task_transitions.py``), so the DONE-on-``cancelled`` exits
+        this replaces fail ``run()``'s SM-2 consistency assertion with an
+        ``AssertionError``; ``_OUTCOME_ALLOWED['cancelled'] == {CANCELLED}``
+        makes the truthful pairing consistent by construction. It also
+        de-inflates the completed tally, which counts ``outcome == DONE``.
+
+        Anything else (in practice ``'done'``) → :attr:`WorkflowOutcome.DONE`
+        with the phase deliberately UNTOUCHED. Moving it would be a
+        behaviour change at all three call sites — every existing DONE exit
+        leaves the machine in its working phase, and several tests assert
+        that phase — so the DONE branch stays byte-identical to today and
+        only the cancelled branch is new behaviour.
+        """
+        if status == TaskStatus.CANCELLED.value:
+            logger.info(
+                'Task %s: cancelled out-of-band; aborting gracefully '
+                '(no reopen, no escalation)',
+                self.task_id,
+            )
+            if not self.machine.is_terminal():
+                self._enter_phase(WorkflowState.CANCELLED)
+            return WorkflowOutcome.CANCELLED
+        return WorkflowOutcome.DONE
+
     async def _handle_terminal_exit_on_block(
         self,
         exc: TerminalExitRejection,
