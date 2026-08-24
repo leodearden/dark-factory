@@ -29,7 +29,7 @@ from shared.task_metadata import (
     apply_migrations,
     parse_metadata,
 )
-from shared.task_statuses import TaskStatus
+from shared.task_statuses import TERMINAL, TaskStatus
 
 from fused_memory.backends.task_backend_errors import (
     DoneProvenanceWriteAuthorityError,
@@ -2225,19 +2225,36 @@ class SqliteTaskBackend:
         ``None`` clears it to NULL, and the default ``_UNSET`` leaves it
         untouched. Fails safe (WARNING, no write, no error) when the
         claimant columns are absent from a not-yet-migrated connection.
+
+        Terminal-claimant tripwire (task 4674, PRD
+        ``docs/prds/claimant-invariant-detection.md`` D-6/E-3): when a call
+        persists a non-NULL ``claimant_run_id`` onto a row whose status is
+        in ``shared.task_statuses.TERMINAL``, logs one ERROR beginning with
+        the discriminator ``claimant_stamped_on_terminal``. Observation,
+        not refusal — the write still succeeds.
         """
         await self.ensure_connected()
         tag = tag or DEFAULT_TAG
         tid = _parse_task_id(task_id)
         async with self._write_lock(project_root), self._txn(project_root) as conn:
             cursor = await conn.execute(
-                'SELECT id FROM tasks WHERE tag = ? AND id = ?',
+                'SELECT id, status FROM tasks WHERE tag = ? AND id = ?',
                 (tag, tid),
             )
-            if (await cursor.fetchone()) is None:
+            row = await cursor.fetchone()
+            if row is None:
                 raise TaskmasterError(
                     'TASKMASTER_TOOL_ERROR',
                     f'No tasks found for ID(s): {task_id}',
+                )
+            row_status = row[1]
+
+            if row_status in TERMINAL:
+                logger.error(
+                    'claimant_stamped_on_terminal: set_task_claimant stamped a claimant '
+                    'onto a terminal row — task_id=%s status=%s claimant_run_id=%s '
+                    'tag=%s project_root=%s',
+                    task_id, row_status, claimant_run_id, tag, project_root,
                 )
 
             set_columns: list[str] = []
