@@ -287,9 +287,9 @@ commit on main, so you would record an unrelated task's merge as this one's prov
 server's only backstop is `git merge-base --is-ancestor <sha> main`, which passes for every
 recent commit on main and would not catch it.
 
-This mirrors the in-repo authority, `GitOps.find_merge_marker`
-(`orchestrator/src/orchestrator/git_ops.py:7862-7905`). `--fixed-strings` against the exact
-subject from `_merge_subject(branch, main_branch)` (`git_ops.py:1874`, canonical form
+This mirrors the in-repo authority, `GitOps.find_merge_marker` in
+`orchestrator/src/orchestrator/git_ops.py`. `--fixed-strings` against the exact
+subject from `_merge_subject(branch, main_branch)` (same module, canonical form
 `Merge <full-branch> into <main-branch>`) is what makes it substring-safe: `Merge task/1 into
 main` cannot match inside `Merge task/10 into main`, because the `0` falls where the pattern
 has a space. Do **not** substitute a bare `--grep="task/<TASK_ID>"` — that is BRE, not
