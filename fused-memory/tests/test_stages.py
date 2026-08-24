@@ -45,6 +45,7 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
     IntegrityCheck,
     TaskKnowledgeSync,
     _format_flagged,
+    _git_show_name_only,
     _needs_hint_conversion,
     _queue_briefing_refresh_tasks,
     _render_done_provenance_section,
@@ -1384,6 +1385,58 @@ class TestDoneProvenanceSection:
             ['git', '-C', str(path), 'rev-parse', 'HEAD'],
             check=True, capture_output=True, text=True,
         ).stdout.strip()
+
+    @staticmethod
+    def _init_repo_with_merge(path):
+        """Build a repo with a single-parent commit and a --no-ff merge commit.
+
+        Commit graph on ``main``:
+
+          1. ``single`` — adds a.txt + b.txt (a genuine single-parent commit,
+             used to pin ``--first-parent -m`` as a no-op on non-merge commits).
+          2. a ``feature`` branch off commit 1 adds feature.py; main then
+             merges it via ``git merge --no-ff`` — recorded as ``merge``.
+             Plain ``git show --name-only`` reports NOTHING for this commit
+             (git's combined diff is empty for a clean merge); this is the
+             fixture that reproduces the Stage-2 provenance bug.
+
+        Mirrors the branch/merge sequence in
+        fused-memory/tests/test_audit_found_on_main_provenance.py::_build_test_repo,
+        including its defensive ``commit.gpgsign false`` + ``--no-verify`` on
+        every commit, so a developer's global gpgsign setting or a stray hook
+        can't hang or fail this throwaway repo.
+
+        Returns a dict of full 40-char SHAs: ``{'single': ..., 'merge': ...}``.
+        Does NOT modify ``_init_repo`` — five pre-existing tests depend on its
+        exact linear shape and single-SHA return value.
+        """
+        import subprocess
+
+        def _git(*args):
+            return subprocess.run(
+                ['git', '-C', str(path), *args], check=True, capture_output=True, text=True,
+            ).stdout.strip()
+
+        subprocess.run(['git', 'init', '-q', '-b', 'main', str(path)], check=True)
+        _git('config', 'user.email', 't@e.example')
+        _git('config', 'user.name', 'T')
+        _git('config', 'commit.gpgsign', 'false')
+
+        (path / 'a.txt').write_text('a\n')
+        (path / 'b.txt').write_text('b\n')
+        _git('add', '-A')
+        _git('commit', '-q', '--no-verify', '-m', 'feat: ship a + b')
+        single = _git('rev-parse', 'HEAD')
+
+        _git('checkout', '-q', '-b', 'feature')
+        (path / 'feature.py').write_text('feature = 1\n')
+        _git('add', '-A')
+        _git('commit', '-q', '--no-verify', '-m', 'feat: add feature')
+        _git('checkout', '-q', 'main')
+        _git('merge', '--no-ff', '--no-verify', '-q', '-m', 'Merge feature into main', 'feature')
+        merge = _git('rev-parse', 'HEAD')
+
+        return {'single': single, 'merge': merge}
 
     @pytest.mark.asyncio
     async def test_commit_provenance_renders_file_list(self, mock_deps, tmp_path):
