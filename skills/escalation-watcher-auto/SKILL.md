@@ -293,7 +293,7 @@ On startup and after each watcher fire:
 2. Fetch pending L2s: `mcp__escalation__get_pending_escalations()` → filter `level == 2`, `status == "pending"`
 3. Build the **already-promoted set**: the union of all `members` lists from every pending L2
 4. Set `work_batch` = L1 candidates whose `id` is **not** in the already-promoted set
-5. Filter `work_batch` again — drop any item whose existing triage stamp is still fresh and covering (`triaged_at` set, < ~6h old, `updated_at` not newer than `triaged_at` — treating `updated_at is None` as "not newer", never comparing `None` directly against a timestamp string — note still plausibly covers the record); see [Triage-ack freshness contract](#triage-ack-freshness-contract) below for the exact skip rule
+5. Filter `work_batch` again — drop any item whose existing triage stamp is still fresh and covering (`triaged_at` set, < ~6h old, `updated_at` not newer than `triaged_at` — treating `updated_at is None` as "not newer", never comparing `None` directly against a timestamp string — note still plausibly covers the record); see [Triage-ack freshness contract](#triage-ack-freshness-contract) below for the exact skip rule. **Carve-out — never skip a path-guard synthetic-anchor record on triage freshness:** if the item matches the path-guard discriminator (`category == "scope_violation"` AND (`agent_role == "fused-memory/path-guard"` OR id starts with `esc-task-path-guard`)), keep it in `work_batch` **however fresh its `triaged_at` is**. Rationale in the contract below — a stamp cannot end the respawn loop these records cause, so skipping one merely defers the only action that can.
 
 Handle only the filtered `work_batch` before (re)starting the wait. On first assessment of each surviving item, stamp a triage-ack annotation (below) so later drain cycles can skip it instead of re-deriving its disposition from scratch.
 
@@ -309,6 +309,8 @@ mcp__escalation__stamp_triage(
   triage_note="task-604 status==done | probe: get_task 604 -> status=done",
 )
 ```
+
+**Exception — path-guard synthetic-anchor records are never skip-eligible.** Stamping one is worse than useless: `stamp_triage` changes neither `status` nor `level` (nor `updated_at`), and `_watcher_has_actionable_l1` (`orchestrator/src/orchestrator/harness.py:12302`) reads **only** `status`/`level` — so a stamped record still reports as actionable and still respawns the rotation, while its fresh `triaged_at` makes that rotation drop it at drain step 5 before the auto-close branch is ever consulted. The result is a rotation that boots, drains to an empty `work_batch`, exits, and is immediately respawned, for as long as the stamp stays fresh (~6h). Only a terminal state (`close_only`) ends it. Never stamp these; always handle them.
 
 `triaged_by` is server-attributed from your connection's `X-Escalation-Identity` header (non-spoofable, same contract as `resolved_by` — see [Hard Constraints](#hard-constraints--never-violate)); you do not need to pass it explicitly. Stamping is an **ungated annotation** — unlike `resolve_issue`, it is exempt from the `{0,1}` level cap, so you can stamp a pending L2 you are still forbidden to resolve. It changes neither `status` nor `level` nor `updated_at`.
 
@@ -377,6 +379,8 @@ Agent discovered it needs to touch files beyond its assigned scope.
 
 ##### Path-guard synthetic-anchor audit records (no real task — close, do not resume)
 
+**Handle these even if `triaged_at` is fresh** — they are carved out of the drain-step-5 triage-freshness skip (see [Triage-ack freshness contract](#triage-ack-freshness-contract)). A stamp cannot clear `_watcher_has_actionable_l1`; only the `close_only` below can.
+
 **Class discriminator.** Match a pending L1 escalation where **both** hold:
 - `category == "scope_violation"`
 - `agent_role == "fused-memory/path-guard"` **OR** the escalation id starts with `esc-task-path-guard`
@@ -437,7 +441,13 @@ task = mcp__fused-memory__get_task(id=<task_id>, project_root=<project_root>)
    ```
    `granted_files` takes **file-level, project-relative paths** — not module names, not directories. That distinction is load-bearing: the old form of this recipe was module-shaped, and a module name passed here is not a file the orchestrator can add to the plan.
 
-   **`granted_files` is what actually widens scope.** It is persisted on the escalation record, and on resume the orchestrator unions the grants across the task's resolved escalations and folds them into `plan.files` / `metadata.files` / file-locks before the agent is re-dispatched. Keep `resolution` as human-readable rationale only — omitting `granted_files` means the grant exists only as prose and the resumed agent's briefing will not reflect the expanded scope. (Same rule the steward role is given verbatim in `orchestrator/src/orchestrator/agents/roles.py`.)
+   **Pass `granted_files` — but do NOT assume it takes effect on the next dispatch.** It is persisted durably on the escalation record either way. The fold into `plan.files` / `metadata.files` / file-locks happens at exactly one place: `_collect_granted_files()` (`orchestrator/src/orchestrator/workflow.py:5710`) has a single call site, `workflow.py:2797`, inside the live verify/review loop reached only after `_wait_for_resolution()` returns **for a workflow process that is still alive** — i.e. the **L0, in-workflow** resume path the per-task steward uses. That is why the identical wording is correct in the steward's own role text (`orchestrator/src/orchestrator/agents/roles.py:1683`) and is **not** correct here.
+
+   **You are the L1 watcher, and an L1 `scope_violation` is normally on a `blocked` task whose workflow slot is gone.** Its `_escalation_events` entry has been popped, so resolution takes the orphan branch (`escalation.task_id not in self._escalation_events`, `orchestrator/src/orchestrator/harness.py:13792`) into `_cascade_unblock_member` (`harness.py:14550`), which **only flips `blocked` → `pending`**. It never reads `granted_files`, never calls `_set_task_scope`, and never touches `plan.files` / `metadata.files` / locks. The repo's own spec says so outright: `docs/task-escalation-state-spec.md` **E9** — on the re-pend path “`granted_files` scope grants deliver to nobody”; making them deliver there is proposed as *future* work in `plans/task-escalation-state-graph-prd.md` **D8**.
+
+   **Consequence you must plan around.** A bare `resume` + `granted_files` on a blocked task re-pends it with its ORIGINAL `plan.files`; the re-dispatched agent hits the same scope wall and escalates again — a non-terminating escalate/resume loop. So:
+   - Still pass `granted_files` (it is durable and unions in should this task later reach a live L0 resume) — but treat it as a record, not as a mechanism.
+   - If the widened scope must be effective for the next dispatch, `resume` alone does not deliver it. Prefer `promote_to_l2` so a human can widen scope through a path that actually persists, rather than resuming into the loop above.
 
    A lock conflict is handled orchestrator-side: the scope-widening choke point returns False and the task requeues rather than resuming under another task's file lock. You do **not** need to pre-check locks.
 

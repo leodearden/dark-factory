@@ -1056,13 +1056,17 @@ Resolve with `action='resume'`, carrying the scope grant as `granted_files` — 
 mcp__escalation__resolve_issue(
   escalation_id="...",
   resolution="Scope expanded to include [<files>]; resuming.",
-  action='resume',   # flips blocked→pending; task redispatches with expanded scope
+  action='resume',   # flips blocked→pending; see the caveat below — the re-pend does NOT fold the grant
   granted_files=["<project-relative file path>", ...],   # file-level paths, not module names
   resolved_by="escalation-watcher"
 )
 ```
 
-`granted_files` is what actually widens scope: it is persisted on the escalation record, and on resume the orchestrator folds the grant into `plan.files` / `metadata.files` / file-locks before the agent is re-dispatched. Keep `resolution` as human-readable rationale — omit `granted_files` and the grant exists only as prose, so the resumed agent's briefing will not reflect the expanded scope.
+**Pass `granted_files`, but do not assume it takes effect on the next dispatch.** It is persisted durably on the escalation record either way. The fold into `plan.files` / `metadata.files` / file-locks happens at exactly one place — `_collect_granted_files()` (`orchestrator/src/orchestrator/workflow.py:5710`) has a single call site, `workflow.py:2797`, on the **live L0 in-workflow** resume path (reached only after `_wait_for_resolution()` returns for a still-alive workflow process) → `_set_task_scope`. That is the per-task steward's path, which is why the identical wording is correct in `orchestrator/src/orchestrator/agents/roles.py:1683` and not here.
+
+This queue is L2, and the `scope_violation` items reaching it are normally on a `blocked` task whose workflow slot is gone. Resolution then takes the orphan branch (`orchestrator/src/orchestrator/harness.py:13792`) into `_cascade_unblock_member` (`harness.py:14550`), which **only flips `blocked` → `pending`** — it never reads `granted_files`, never calls `_set_task_scope`, never touches `plan.files` / `metadata.files` / locks. See `docs/task-escalation-state-spec.md` **E9**: on the re-pend path “`granted_files` scope grants deliver to nobody” (delivering them there is *future* work — `plans/task-escalation-state-graph-prd.md` **D8**).
+
+So a bare `resume` + `granted_files` on a blocked task re-pends it with its ORIGINAL `plan.files`, the agent hits the same wall and re-escalates. When the widened scope has to be effective for the next dispatch, `resume` alone will not deliver it — as the human on this queue, widen the task's scope through a path that persists (or hand it to a `/unblock` session) before resuming.
 
 Do **not** try to widen scope by writing `modules` into task metadata. Lock derivation (`Scheduler._get_modules`) reads `metadata.files` and has never read that key, so such a write is a silent no-op that reports success. A lock conflict on the grant is handled orchestrator-side — the task requeues rather than resuming under another task's lock.
 
