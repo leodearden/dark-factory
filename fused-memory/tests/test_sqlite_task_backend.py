@@ -612,6 +612,100 @@ async def test_set_task_claimant_on_terminal_row_logs_error_and_still_persists(
     assert one['status'] == terminal_status
 
 
+@pytest.mark.asyncio
+async def test_set_task_claimant_heartbeat_only_tick_on_terminal_row_is_silent(
+    backend, project_root, caplog,
+):
+    """B9 negative control (PRD-named): a heartbeat-only tick on an already-terminal row
+
+    must not trip the wire — claimant_run_id is left at the _UNSET default (the wire shape
+    orchestrator/workflow.py:2319 produces), so no claimant is persisted by this call.
+    """
+    await backend.add_task(project_root=project_root, title='x')
+    await backend.set_task_claimant(
+        '1', project_root=project_root,
+        claimant_run_id='run-live',
+        heartbeat_at='2026-08-24T00:00:00+00:00',
+    )
+    await backend.set_task_status('1', 'done', project_root=project_root)
+
+    caplog.clear()
+    with caplog.at_level(logging.ERROR, logger='fused_memory.backends.sqlite_task_backend'):
+        await backend.set_task_claimant(
+            '1', project_root=project_root,
+            heartbeat_at='2026-08-24T00:01:00+00:00',
+        )
+
+    tripwire_errors = [
+        r for r in caplog.records
+        if r.levelno >= logging.ERROR and 'claimant_stamped_on_terminal' in r.message
+    ]
+    assert tripwire_errors == [], 'B9 negative control: heartbeat-only tick must stay silent'
+
+    one = await backend.get_task('1', project_root=project_root)
+    assert one['heartbeat_at'] == '2026-08-24T00:01:00+00:00'
+
+
+@pytest.mark.asyncio
+async def test_set_task_claimant_explicit_clear_on_terminal_row_is_silent(
+    backend, project_root, caplog,
+):
+    """The release/un-claim path (harness.py, scheduler.py) fires right as a task goes
+
+    terminal and must never trip the wire — it stamps SQL NULL, not a claimant.
+    """
+    await backend.add_task(project_root=project_root, title='x')
+    await backend.set_task_claimant(
+        '1', project_root=project_root,
+        claimant_run_id='run-live',
+        heartbeat_at='2026-08-24T00:00:00+00:00',
+    )
+    await backend.set_task_status('1', 'done', project_root=project_root)
+
+    caplog.clear()
+    with caplog.at_level(logging.ERROR, logger='fused_memory.backends.sqlite_task_backend'):
+        await backend.set_task_claimant(
+            '1', project_root=project_root,
+            claimant_run_id=None,
+            heartbeat_at=None,
+        )
+
+    tripwire_errors = [
+        r for r in caplog.records
+        if r.levelno >= logging.ERROR and 'claimant_stamped_on_terminal' in r.message
+    ]
+    assert tripwire_errors == [], 'negative control: explicit release/clear must stay silent'
+
+    one = await backend.get_task('1', project_root=project_root)
+    assert one['claimant_run_id'] is None
+    assert one['heartbeat_at'] is None
+
+
+@pytest.mark.asyncio
+async def test_set_task_claimant_on_non_terminal_row_is_silent(
+    backend, project_root, caplog,
+):
+    """The ordinary dispatch claim onto a non-terminal row must stay silent — regression guard."""
+    await backend.add_task(project_root=project_root, title='x')
+    await backend.set_task_status('1', 'in-progress', project_root=project_root)
+
+    with caplog.at_level(logging.ERROR, logger='fused_memory.backends.sqlite_task_backend'):
+        await backend.set_task_claimant(
+            '1', project_root=project_root,
+            claimant_run_id='run-x',
+            heartbeat_at='2026-08-24T00:00:00+00:00',
+        )
+
+    tripwire_errors = [
+        r for r in caplog.records
+        if r.levelno >= logging.ERROR and 'claimant_stamped_on_terminal' in r.message
+    ]
+    assert tripwire_errors == [], 'regression guard: non-terminal row must stay silent'
+
+    one = await backend.get_task('1', project_root=project_root)
+    assert one['claimant_run_id'] == 'run-x'
+
+
 # ── set_task_status claimant extension (task 2182 step-5/6) ────────
 
 
