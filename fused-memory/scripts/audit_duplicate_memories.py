@@ -886,19 +886,21 @@ def find_liveness_snapshot_recurrences(
     twice, and ``liveness_snapshot_recurrences`` is an ARMED count. The richer
     key wins that collapse — always the whole-record one, since a clause key's
     pairs are a subset — so the survivor is the group that predates clause
-    scoping. A clause-scoped bucket only exists at all when
-    ``liveness_snapshot_subject_facts``'s field-vocabulary gate let it
-    through — a clause naming a strict subset of its record's field names
-    earns no bucket, so it can never join some unrelated record's whole-record
-    bucket either.
+    scoping. A clause-scoped bucket only exists when both of
+    ``liveness_snapshot_subject_facts``'s gates below let it through, so a
+    bucket that can never exist can never join some unrelated record's
+    whole-record bucket either.
 
     The core fact is keyed PER SUBJECT by ``liveness_snapshot_subject_facts``,
     which splits the content into clauses with ``task_filter._CLAUSE_SPLIT_RE``
     and adds each subject's own clause-scoped key beside the whole-record one
-    — but ONLY for a record whose union key names one field twice. A multi-task
-    re-verification reporting DIVERGENT values per task therefore joins each
-    subject's own group, where that union matched neither single-task snapshot
-    and the recurrence went unreported (pinned by
+    — but only when BOTH of that function's gates hold: the DIVERGENCE gate
+    (the record's union key names one field twice) and the FIELD-VOCABULARY
+    gate (the clause names every field that union names, not a strict subset
+    of them — a fragment). A multi-task re-verification reporting DIVERGENT
+    values per task therefore joins each subject's own group, where that
+    union matched neither single-task snapshot and the recurrence went
+    unreported (pinned by
     ``test_divergent_per_task_statuses_group_per_subject``). A record whose
     union is COHERENT keys exactly as it did before clause scoping, so
     grouping never turns on where the author put a full stop — ``.`` and
@@ -2159,6 +2161,17 @@ def compute_cluster_metrics(
         # indefinite accretion this detector exists to surface. Emitted for
         # every swept category, empty ones included — an absent metric is
         # indistinguishable from "not measured".
+        #
+        # The value counts GROUPS, one per `(category, subject, member set)`
+        # — not one per bucket. `find_liveness_snapshot_recurrences` collapses
+        # a subject keyed twice over the SAME members (its clause-scoped fact
+        # and its whole-record union) to the single richer-keyed group before
+        # returning, so this reads a regression only on new membership, never
+        # on a second key over membership already counted.
+        # `TestLivenessRecurrenceMetricsUnderDualKeying` arms that guarantee
+        # at THIS layer, not just the detector's own return, so a reader who
+        # changes the keying can see which number moves and where it is
+        # pinned.
         #
         # Carries `details_path` like every other metric whose full shape
         # lives in the companion file: the scalar says HOW MANY groups, but
