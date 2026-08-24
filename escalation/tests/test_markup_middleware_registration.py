@@ -32,6 +32,7 @@ successful recovery. The corpus supplies both shapes instead.
 
 from __future__ import annotations
 
+import contextlib
 import json
 from pathlib import Path
 from typing import Any
@@ -40,7 +41,7 @@ import pytest
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
 from shared.mcp_markup_middleware import MarkupGuardMiddleware, RepairPolicy
-from shared.toolcall_markup import detect
+from shared.toolcall_markup import INVOKE_CLOSER, closer_for, detect
 
 from escalation.models import BORN_AT_L2_SEVERITIES, Escalation
 from escalation.queue import EscalationQueue
@@ -752,3 +753,256 @@ class TestStormBurstAlarm:
             f'{len(mine)}'
         )
         assert mine[0].agent_role == 'harness-markup-guard'
+
+
+# ---------------------------------------------------------------------------
+# The sink receives TWO residue kinds, and their triage is opposite.
+# ---------------------------------------------------------------------------
+
+
+def _leak(absorbed: str, param: str, value: str) -> str:
+    """A ``detail`` that mis-closed and swallowed exactly one parameter.
+
+    Built from ``shared.toolcall_markup``'s own enumeration rather than typed
+    out (INV-5, and the authoring hazard in this task's description): writing an
+    envelope literal verbatim into a source file forces the authoring agent to
+    emit it inside its own tool call, reproducing the defect under repair.
+    """
+    return (
+        absorbed
+        + closer_for('detail')
+        + '\n'
+        # The name-echoing opening tag, built with an escape for the same
+        # reason ``closer_for`` exists: never written verbatim. This is the
+        # dialect the corpus's own repaired specimens carry, and the one
+        # ``shared/tests/test_mcp_markup_middleware.py`` drives the untypable
+        # case with — the canonical ``<parameter name=...>`` opener anchors
+        # ``detect`` at a different literal and reaches the unrepairable path
+        # instead, which is a different test.
+        + '\x3c' + param + '>'
+        + value
+        + closer_for(param)
+        + INVOKE_CLOSER
+    )
+
+
+#: A ``list``-typed recovery that no coercion may believe: valid JSON never
+#: begins here and ends mid-string, so ``_coerce_recovered`` reports it
+#: untypable and FORWARD_REPAIR drops the name rather than forwarding a call
+#: pydantic is certain to reject.
+UNTYPABLE_EVIDENCE = '[{"observation": "the tail was cut off'
+
+
+class TestTheResidueNamesWhoseCallLeaked:
+    """A paging L2 record that attributes to nobody cannot be triaged.
+
+    On THIS server the middleware's ``agent_id``/``project`` axes are
+    structurally ``None``: ``MarkupGuardMiddleware._identity`` resolves them
+    from arguments named ``agent_id`` / ``project_root`` / ``project_id``, and
+    no escalation tool declares any of the three. The record's own ``task_id``
+    is the synthetic ``mcp-markup-residue`` anchor — correctly so, since a
+    live task id at level 2 would halt the very task that leaked. So the
+    middleware's ``subject_*`` axes are the ONLY attribution that ever
+    resolves here, and dropping them leaves a critical record naming nobody
+    while the caller supplied both.
+    """
+
+    async def _refuse(self, tmp_path: Path):
+        record = specimen(UNREPAIRABLE)
+        queue, server = build(tmp_path)
+        async with Client(server) as client:
+            with pytest.raises(ToolError):
+                await client.call_tool(
+                    'escalate_info', {**REQUIRED, record['param']: record['value']}
+                )
+        residues = [
+            esc for esc in queue.get_pending() if esc.category == RESIDUE_CATEGORY
+        ]
+        assert len(residues) == 1
+        return residues[0]
+
+    @pytest.mark.asyncio
+    async def test_the_detail_carries_both_subject_axes(self, tmp_path: Path):
+        residue = await self._refuse(tmp_path)
+
+        assert f"subject_task_id={REQUIRED['task_id']!r}" in residue.detail
+        assert f"subject_agent_role={REQUIRED['agent_role']!r}" in residue.detail
+
+    @pytest.mark.asyncio
+    async def test_the_summary_names_the_subject_too(self, tmp_path: Path):
+        """The L2 watcher's notification shows the SUMMARY, not the detail.
+
+        Same prefix ``orchestrator.mcp.markup_sink.file_residue`` writes, for
+        the same reason: a reader scanning summaries alone must be able to tell
+        whose call leaked without opening every record.
+        """
+        residue = await self._refuse(tmp_path)
+
+        assert residue.summary.startswith(f"[{REQUIRED['task_id']}] ")
+        # The middleware's own sentence still follows it, unmodified.
+        assert 'escalate_info' in residue.summary
+
+    @pytest.mark.asyncio
+    async def test_the_unattributed_axes_are_still_rendered_as_null(
+        self, tmp_path: Path
+    ):
+        """Rendered as the ``None`` they are, never omitted.
+
+        An absent line reads as "not applicable"; ``agent_id=None`` reads as
+        "the guard could not attribute this", which is the true and useful
+        statement.
+        """
+        residue = await self._refuse(tmp_path)
+
+        assert 'agent_id=None' in residue.detail
+        assert 'project=None' in residue.detail
+
+
+class TestTheResidueProseMatchesItsKind:
+    """A refused call and a forwarded-lossily call are NOT the same event.
+
+    The sink receives ``mcp_markup_unrepairable`` (refused: nothing written,
+    the caller was told, a retry may be coming) and
+    ``mcp_markup_unrecovered_param`` (FORWARDED: the call landed incomplete and
+    nobody was told, so no retry is coming and the stored record is already
+    wrong). This server is the only registration site that produces the second
+    kind, because ``_preserve_unrecovered`` is FORWARD_REPAIR-only.
+
+    One hardcoded "the call was refused" sentence made the forwarded record
+    contradict its own summary three lines above it, and the false half is the
+    half that changes what an operator does.
+    """
+
+    async def _residues(self, tmp_path: Path, **call):
+        queue, server = build(tmp_path)
+        async with Client(server) as client:
+            # Suppressed because this helper drives BOTH outcomes: the
+            # unrepairable specimen bounces, the untypable-evidence one lands.
+            # What is asserted is the residue record either way.
+            with contextlib.suppress(ToolError):
+                await client.call_tool('escalate_info', {**REQUIRED, **call})
+        return [
+            esc for esc in queue.get_pending() if esc.category == RESIDUE_CATEGORY
+        ]
+
+    @pytest.mark.asyncio
+    async def test_the_refused_record_says_refused(self, tmp_path: Path):
+        record = specimen(UNREPAIRABLE)
+        residues = await self._residues(
+            tmp_path, **{record['param']: record['value']}
+        )
+
+        assert len(residues) == 1
+        assert 'THE CALL WAS REFUSED' in residues[0].detail
+        assert 'FORWARDED' not in residues[0].detail
+
+    @pytest.mark.asyncio
+    async def test_the_forwarded_record_does_not_claim_a_refusal(
+        self, tmp_path: Path
+    ):
+        """The regression this class exists for, driven end to end.
+
+        A ``list``-typed ``evidence`` recovery that cannot be typed is dropped
+        and preserved; the call itself LANDS. The record describing that must
+        not tell an operator a caller is waiting on a retry.
+        """
+        residues = await self._residues(
+            tmp_path,
+            detail=_leak('Ill-formed.', 'evidence', UNTYPABLE_EVIDENCE),
+        )
+
+        assert len(residues) == 1, (
+            f'expected one unrecovered-param residue, found {len(residues)}'
+        )
+        residue = residues[0]
+        assert residue.detail.count('THE CALL WAS REFUSED') == 0, (
+            'the forwarded-lossily record still claims the call was refused'
+        )
+        assert 'THE CALL WAS FORWARDED WITHOUT THIS PARAMETER' in residue.detail
+        # And the half a reader acts on: nobody is coming back for this.
+        assert 'was NOT told' in residue.detail
+        # The record does not contradict its own summary any more.
+        assert 'forwarded WITHOUT it' in residue.summary
+
+    @pytest.mark.asyncio
+    async def test_the_forwarded_call_really_did_land(self, tmp_path: Path):
+        """The premise of the prose above, asserted rather than assumed.
+
+        If the call had been refused, "forwarded" would be the false half.
+        """
+        queue, server = build(tmp_path)
+        async with Client(server) as client:
+            await client.call_tool('escalate_info', {
+                **REQUIRED,
+                'detail': _leak('Ill-formed.', 'evidence', UNTYPABLE_EVIDENCE),
+            })
+
+        filed = queue.get_by_task(REQUIRED['task_id'])
+        assert len(filed) == 1, 'the FORWARD_REPAIR call must reach the tool'
+        assert filed[0].detail == 'Ill-formed.'
+        # Lossily, exactly as the residue record says: evidence is absent.
+        assert not getattr(filed[0], 'evidence', None)
+
+    @pytest.mark.asyncio
+    async def test_the_forwarded_record_still_carries_the_dropped_value(
+        self, tmp_path: Path
+    ):
+        """It is the only surviving copy — the caller was never told to resend."""
+        residues = await self._residues(
+            tmp_path,
+            detail=_leak('Ill-formed.', 'evidence', UNTYPABLE_EVIDENCE),
+        )
+
+        detail = residues[0].detail
+        assert UNTYPABLE_EVIDENCE in detail
+        assert "field='evidence'" in detail
+        assert f"subject_task_id={REQUIRED['task_id']!r}" in detail
+
+
+class TestAnUnknownResidueKindIsFiledVisibly:
+    """A kind this sink has not been taught is filed, hedged, and logged.
+
+    Dropping a record kind is the silent fail-soft the PRD exists to end, and
+    an unfamiliar record in the queue is a question an operator can answer.
+    Same posture ``orchestrator.mcp.markup_sink`` takes.
+    """
+
+    @pytest.mark.asyncio
+    async def test_it_lands_without_asserting_an_outcome(
+        self, tmp_path: Path, caplog
+    ):
+        queue, server = build(tmp_path)
+        sink = guard_of(server)._escalation_sink
+        assert sink is not None
+
+        with caplog.at_level('WARNING'):
+            # Sync on this server: the queue write is blocking file I/O,
+            # matching every other write here. The middleware awaits an
+            # awaitable and takes a value as-is (``_call_sink``).
+            esc_id = sink({
+                'error_type': 'mcp_markup_something_new',
+                'category': RESIDUE_CATEGORY,
+                'owner': RESIDUE_OWNER,
+                'level': 2,
+                'tool': 'escalate_info',
+                'field': 'detail',
+                'subject_task_id': '3690',
+                'subject_agent_role': 'implementer',
+                'raw_value': 'the payload',
+                'summary': 'A kind from the future.',
+                'suggested_action': 'Recover it.',
+            })
+
+        assert esc_id
+        residue = next(e for e in queue.get_pending() if e.id == esc_id)
+        # Neither outcome is asserted, because neither is known.
+        assert 'THE CALL WAS REFUSED' not in residue.detail
+        assert 'THE CALL WAS FORWARDED' not in residue.detail
+        # The middleware's own words are rendered instead of being dropped.
+        assert 'A kind from the future.' in residue.detail
+        assert 'Recover it.' in residue.detail
+        assert 'the payload' in residue.detail
+        assert "UNRECOGNISED RESIDUE KIND 'mcp_markup_something_new'" in residue.detail
+        assert any(
+            'unrecognised residue kind' in r.getMessage() for r in caplog.records
+        ), 'an unknown kind must be visible in the log, not merely in the queue'

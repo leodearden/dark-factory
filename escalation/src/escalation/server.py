@@ -21,6 +21,10 @@ from shared.branch_names import canonical_queued_branch_name
 # not pull fastmcp into every consumer of the base layer.
 from shared.mcp_markup_middleware import (
     FACT_MARKUP_DETECTED,
+    MARKUP_RESIDUE_ERROR_TYPES,
+    MARKUP_STORM_ERROR_TYPE,
+    MARKUP_UNRECOVERED_PARAM_ERROR_TYPE,
+    MARKUP_UNREPAIRABLE_ERROR_TYPE,
     MarkupGuardMiddleware,
     RepairPolicy,
 )
@@ -556,6 +560,67 @@ _MARKUP_GUARD_AGENT_ROLE = 'harness-markup-guard'
 _MARKUP_RESIDUE_SEVERITY = 'critical'
 
 
+def _markup_residue_prose(record: dict[str, Any]) -> str:
+    """What actually happened to the call, in the reader's own terms.
+
+    DISPATCHED ON ``error_type``, never assumed, because this sink receives two
+    residue kinds whose triage is OPPOSITE and this server is the only site that
+    produces both.  ``MARKUP_UNREPAIRABLE_ERROR_TYPE`` means the call was
+    REFUSED — nothing was written, and the caller was told, so a human may
+    reasonably wait for it to resend.  ``MARKUP_UNRECOVERED_PARAM_ERROR_TYPE``
+    means the call was FORWARDED and LANDED without the parameter, and nobody
+    was told: no retry is coming, and the stored record is already wrong.  One
+    hardcoded "the call was refused" sentence renders the second kind a record
+    that contradicts its own summary three lines above, and the false half is
+    the half that changes what an operator does.
+
+    ``shared.mcp_markup_middleware`` names the kinds precisely so a sink written
+    when only the refusal existed cannot silently mis-file the newer one; this
+    is that sink, matching the set rather than a single name.
+
+    An UNRECOGNISED kind is filed anyway, with a visibly-hedged body that
+    renders the middleware's own ``summary`` and ``suggested_action`` — the same
+    posture ``orchestrator.mcp.markup_sink`` takes.  Dropping a record kind is
+    the silent fail-soft this PRD exists to end, and an unfamiliar record in the
+    queue is a question an operator can answer.
+    """
+    error_type = record.get('error_type')
+    if error_type == MARKUP_UNREPAIRABLE_ERROR_TYPE:
+        return (
+            'THE CALL WAS REFUSED. The leaked fragment\'s own boundary could '
+            'not be determined, so no repair was attempted and nothing was '
+            'guessed. Nothing this call carried reached the escalation store, '
+            'and the caller WAS told: it holds its own copy and can resend, so '
+            'the payload below is a recovery aid rather than the only route '
+            'back to the data.'
+        )
+    if error_type == MARKUP_UNRECOVERED_PARAM_ERROR_TYPE:
+        return (
+            'THE CALL WAS FORWARDED WITHOUT THIS PARAMETER, and it LANDED. The '
+            'value below was recovered from the leak but could not be typed '
+            'against the parameter\'s declared schema, so it was dropped from '
+            'the call rather than passed through untyped. The caller was NOT '
+            'told — nobody is waiting on a retry, and the record that call '
+            'filed is already stored missing this field. The payload below is '
+            'the only surviving copy of it.'
+        )
+    logger.warning(
+        'markup guard: filing an unrecognised residue kind %r — the middleware '
+        'emits something this sink does not know about (known: %s)',
+        error_type, sorted(MARKUP_RESIDUE_ERROR_TYPES),
+    )
+    return '\n'.join([
+        f'UNRECOGNISED RESIDUE KIND {error_type!r}. This sink does not know '
+        'what this call\'s outcome was, so it states neither — the middleware '
+        'grew a record kind that escalation/src/escalation/server.py has not '
+        'been taught. Its own words for what happened follow; treat them, not '
+        'this paragraph, as the account of the call.',
+        '',
+        f'summary: {record.get("summary")!r}',
+        f'suggested_action: {record.get("suggested_action")!r}',
+    ])
+
+
 # Task statuses from which a recovery/redispatch is still possible.  A record
 # on a task outside this set pins nothing: there is no recovery to block.
 _RECOVERABLE_STATUSES = frozenset({'in-progress', 'blocked'})
@@ -790,7 +855,8 @@ def create_server(
         Blocking file I/O inside an async caller, matching every other write on
         this server: ``escalate_info`` reaches ``queue.submit`` the same way.
         """
-        if record.get('error_type') == 'mcp_markup_storm':
+        error_type = record.get('error_type')
+        if error_type == MARKUP_STORM_ERROR_TYPE:
             return _file_markup_storm(record)
 
         # `level` and `category` are read from the RECORD rather than restated,
@@ -798,7 +864,18 @@ def create_server(
         # The fallbacks matter only if that contract is ever violated, and they
         # fail toward L2 rather than toward a silently-L0 record nobody reads.
         level = int(record.get('level') or 2)
+        subject_task_id = record.get('subject_task_id')
         detail = '\n'.join([
+            # WHOSE call leaked. Rendered FIRST and unconditionally because on
+            # this server it is the only attribution that ever resolves: the
+            # middleware's `_identity` reads `agent_id` / `project_root` /
+            # `project_id` off the call's own arguments, and no escalation tool
+            # declares any of the three, so the two fields below it are
+            # structurally None here. The record's own `task_id` is the
+            # synthetic anchor, not the caller's, so without these two lines a
+            # critical L2 record names nobody at all.
+            f'subject_task_id={subject_task_id!r}',
+            f'subject_agent_role={record.get("subject_agent_role")!r}',
             # The OWNER that will exit this hold unprompted (INV-7), read off
             # the record rather than restated: the middleware names it, and a
             # second spelling here could name a consumer that no longer exists.
@@ -810,11 +887,11 @@ def create_server(
             f'project={record.get("project")!r}',
             f'raw_value_chars={len(record.get("raw_value") or "")}',
             '',
-            'RAW PAYLOAD, VERBATIM AND ENTIRE — the only surviving copy. The '
-            'call was refused because the leaked fragment\'s own boundary could '
-            'not be determined, so no repair was attempted and nothing was '
-            'guessed. Recover it for the caller if it is still needed, then '
-            'chase the harness serialization leak that produced it '
+            _markup_residue_prose(record),
+            '',
+            'RAW PAYLOAD, VERBATIM AND ENTIRE — the only surviving copy. '
+            'Recover it for the caller if it is still needed, then chase the '
+            'harness serialization leak that produced it '
             '(plans/toolcall-markup-containment-prd.md).',
             '',
             str(record.get('raw_value') or ''),
@@ -829,7 +906,14 @@ def create_server(
             # born-at-L2 severity onto an L0/L1 record.
             severity=_MARKUP_RESIDUE_SEVERITY if level >= 2 else 'blocking',
             category=str(record.get('category') or 'mcp_markup_residue'),
-            summary=str(record.get('summary') or ''),
+            # The subject is PREFIXED rather than left to the detail: the
+            # record's own task_id is the synthetic anchor, so a reader
+            # scanning summaries alone — which is what the L2 watcher's
+            # notification shows — would otherwise have no way to tell whose
+            # call leaked. Same shape the sibling sink uses.
+            summary=(
+                f'[{subject_task_id}] ' if subject_task_id else ''
+            ) + str(record.get('summary') or ''),
             detail=detail,
             suggested_action=str(record.get('suggested_action') or ''),
             level=level,
