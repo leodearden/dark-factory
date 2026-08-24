@@ -481,3 +481,201 @@ def _canary_predicate_items_per(
         if isinstance(d.get('landed_via_chain'), int) and d['landed_via_chain'] >= 1
     ]
     return (sum(landed) / n_deep) if n_deep else None  # items landed per deep verify run
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# step-01: RED — `landed_via_chain` reaches the merge_finalized payload
+#
+# The carrier, before anything populates it.  `merge_finalized` has exactly ONE
+# emit site (merge_queue.py:4763-4777, the `_on_finalized` done-callback that
+# `enqueue_merge_request` registers at :4785) and `EventStore.emit` applies no
+# schema validation — it just json.dumps()es the dict — so the ONLY thing that
+# can carry a new field to η1's predicate is a new field on `MergeOutcome`
+# threaded into that payload, following the `superseded_by`/`dedupe_fingerprint`
+# /`disposition` optional-metadata precedent (merge_types.py:920).
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _finalized_rows(db_path: Path) -> list[dict]:
+    """Return every ``merge_finalized`` row's parsed ``data`` dict, in order.
+
+    Reads the durable tier through real sqlite (the idiom at
+    test_merge_queue.py:7588-7605) rather than a capturing fake, because the
+    field only reaches η1 if it survives ``json.dumps`` into the ``data``
+    column — a fake that records the dict by reference would pass even for a
+    value the real emit path drops or cannot serialise.
+    """
+    import json
+    import sqlite3
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        rows = conn.execute(
+            "SELECT data FROM events WHERE event_type = 'merge_finalized' "
+            'ORDER BY rowid'
+        ).fetchall()
+    finally:
+        conn.close()
+    return [json.loads(r[0]) for r in rows]
+
+
+@pytest.mark.asyncio
+class TestLandedViaChainCarrier:
+    """``MergeOutcome.landed_via_chain`` → the ``merge_finalized`` payload."""
+
+    def _config(self, tmp_path: Path) -> OrchestratorConfig:
+        return _make_config(tmp_path, chain_cap=6)
+
+    async def test_merge_outcome_defaults_landed_via_chain_to_none(
+        self, tmp_path: Path,
+    ) -> None:
+        """(a) The field exists, defaults to None, and accepts an int.
+
+        Defaulted-to-None is what keeps every EXISTING ``MergeOutcome(...)``
+        construction in the tree untouched — the same shape ``superseded_by``
+        (merge_types.py:949) and ``disposition`` (:955) use.
+        """
+        from orchestrator.merge_types import MergeOutcome
+
+        assert MergeOutcome(status='done').landed_via_chain is None
+        assert MergeOutcome(status='done', landed_via_chain=1).landed_via_chain == 1
+
+    async def test_chain_landing_puts_the_key_in_the_finalized_payload(
+        self, tmp_path: Path,
+    ) -> None:
+        """(b) A landed_via_chain outcome reaches the durable payload."""
+        from orchestrator.event_store import EventStore
+        from orchestrator.merge_queue import enqueue_merge_request
+        from orchestrator.merge_types import MergeOutcome
+
+        config = self._config(tmp_path)
+        db_path = tmp_path / 'runs.db'
+        event_store = EventStore(db_path, 'run-delta-step1')
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        req = _make_req('101', '101', config, tmp_path)
+
+        await enqueue_merge_request(queue, req, event_store)
+        req.result.set_result(
+            MergeOutcome(status='done', merge_sha='abc123', landed_via_chain=1),
+        )
+        await asyncio.sleep(0)  # yield so the done-callback runs
+
+        rows = _finalized_rows(db_path)
+        assert len(rows) == 1
+        assert rows[0]['landed_via_chain'] == 1
+        assert rows[0]['state'] == 'done'
+        assert rows[0]['merge_sha'] == 'abc123'
+
+    async def test_ordinary_landing_is_dropped_by_the_canary_filter(
+        self, tmp_path: Path,
+    ) -> None:
+        """(c) A non-chain landing leaves the key absent-or-None.
+
+        This is the "iff landed by a chain walk" half of the PRD contract, and
+        it is asserted THROUGH the shipped predicate's own filter rather than
+        against the raw payload: η1 keeps a row only when
+        ``isinstance(d.get('landed_via_chain'), int) and >= 1``, so an ordinary
+        sequential landing must fall out of that filter — otherwise every
+        non-deep merge would inflate ``items_per`` and the deploy signal would
+        read a chain that never happened.
+        """
+        from orchestrator.event_store import EventStore
+        from orchestrator.merge_queue import enqueue_merge_request
+        from orchestrator.merge_types import MergeOutcome
+
+        config = self._config(tmp_path)
+        db_path = tmp_path / 'runs.db'
+        event_store = EventStore(db_path, 'run-delta-step1-plain')
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        req = _make_req('102', '102', config, tmp_path)
+
+        await enqueue_merge_request(queue, req, event_store)
+        req.result.set_result(MergeOutcome(status='done', merge_sha='def456'))
+        await asyncio.sleep(0)
+
+        rows = _finalized_rows(db_path)
+        assert len(rows) == 1
+        assert rows[0].get('landed_via_chain') is None
+
+        # Through the shipped filter: one deep verify, zero chain-landed items.
+        items_per = _canary_predicate_items_per(
+            [{'chain_items': 3, 'passed': True}], rows,
+        )
+        assert items_per == 0.0
+
+    async def test_preexisting_payload_keys_are_unchanged(
+        self, tmp_path: Path,
+    ) -> None:
+        """(d) The eight pre-existing keys keep their names and values.
+
+        Adding a key to the single emit site must not rename, drop or reorder
+        what is already there: every existing `merge_finalized` reader (the
+        dashboard, the reconciler, η1's own `state`/`merge_sha` reads) keys off
+        these names.
+        """
+        from orchestrator.event_store import EventStore
+        from orchestrator.merge_queue import enqueue_merge_request
+        from orchestrator.merge_types import MergeOutcome
+
+        config = self._config(tmp_path)
+        db_path = tmp_path / 'runs.db'
+        event_store = EventStore(db_path, 'run-delta-step1-keys')
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        req = _make_req('103', '103', config, tmp_path)
+
+        await enqueue_merge_request(queue, req, event_store)
+        req.result.set_result(MergeOutcome(
+            status='blocked', reason='nope', merge_sha=None,
+            superseded_by='req-xyz',
+        ))
+        await asyncio.sleep(0)
+
+        rows = _finalized_rows(db_path)
+        assert len(rows) == 1
+        assert set(rows[0]) == {
+            'request_id', 'branch', 'state', 'snapshot_tip', 'merge_sha',
+            'superseded_by', 'generation', 'reason', 'landed_via_chain',
+        }
+        assert rows[0]['request_id'] == req.request_id
+        assert rows[0]['branch'] == '103'
+        assert rows[0]['state'] == 'blocked'
+        assert rows[0]['snapshot_tip'] == req.snapshot_tip
+        assert rows[0]['merge_sha'] is None
+        assert rows[0]['superseded_by'] == 'req-xyz'
+        assert rows[0]['generation'] == req.generation
+        assert rows[0]['reason'] == 'nope'
+
+    async def test_terminal_outcome_record_mirrors_the_payload(
+        self, tmp_path: Path,
+    ) -> None:
+        """The hot tier stays in lockstep with the durable tier.
+
+        ``TerminalOutcomeRecord`` (merge_types.py:146) is the in-memory mirror
+        of exactly the payload the emit site writes, and the ring is documented
+        as LOSSLESS on eviction precisely because an evicted id falls through to
+        the `merge_finalized` row.  A hot-tier record missing a field the
+        durable row carries would silently break that equivalence, so the new
+        field rides both or neither.
+        """
+        from orchestrator.event_store import EventStore
+        from orchestrator.merge_queue import enqueue_merge_request
+        from orchestrator.merge_types import MergeOutcome, TerminalOutcomeRetention
+
+        config = self._config(tmp_path)
+        db_path = tmp_path / 'runs.db'
+        event_store = EventStore(db_path, 'run-delta-step1-ring')
+        retention = TerminalOutcomeRetention()
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        req = _make_req('104', '104', config, tmp_path)
+
+        await enqueue_merge_request(
+            queue, req, event_store, retention=retention,
+        )
+        req.result.set_result(
+            MergeOutcome(status='done', merge_sha='cafe01', landed_via_chain=1),
+        )
+        await asyncio.sleep(0)
+
+        record = retention.get(req.request_id)
+        assert record is not None
+        assert record.landed_via_chain == 1
