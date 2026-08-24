@@ -33,8 +33,14 @@ What an operator observes if this PRD lands:
   ages below the ceiling, with a `scheduler_resumed` event naming the evidence — no human.
 - A deliberate operator halt carries a **named owner and a declared expiry**, and on expiry
   it escalates rather than silently persisting or silently resuming.
-- No halt of any class is ever re-asserted across a restart without its predicate being
-  re-tested, in the scheduler **or** the merge queue.
+- No halt is re-asserted across a restart **except where its class policy says so**
+  (§6 contract invariant 3): `cost_ceiling` re-asserts only after its predicate re-test
+  still says breached, and the merge queue's `wip_conflict` rehydration (leaf η) gains the
+  same re-test. `operator` and `watcher_guard` re-assert deliberately — a quiesce and a
+  crashloop guard are *meant* to survive a restart — and that is a policy-table entry an
+  operator can read, not an accident. (Corrected at decompose: the earlier blanket phrasing
+  "no halt of any class … without its predicate being re-tested" contradicted the two
+  re-assert rows in §6's own table.)
 
 ## 1. The load-bearing idea
 
@@ -110,7 +116,15 @@ substrate; the rest is deletion and re-wiring of existing calls.
    decays is never re-asked. Removing that early return — while keeping the *re-pause*
    suppressed — lets the halt clear itself when trailing-24h spend ages below the ceiling.
    This is the only class that gains an automatic live resume.
-5. **Operator halts get an owner and a declared expiry, and never auto-resume.** Expiry
+5. **Operator halts get an owner and a declared expiry, and never auto-resume.** The
+   requirement is keyed on `pause_class` **through the policy table**, never on the
+   `force_halt_scheduler` entry point (ratified 2026-08-24 at decompose): `no_landings`
+   halts through that *same* function (`harness.py`, the no-landings breaker's
+   `force_halt_scheduler(reason=trip.reason)` call), so gating the function
+   unconditionally would reject an automatic breaker's halt for want of an owner it has
+   no basis to invent. `force_halt_scheduler` therefore gains an explicit `pause_class`
+   parameter defaulting to `OPERATOR`, and the mandatory-field check lives in the single
+   policy table (INV-5). Expiry
    raises an escalation and keeps the halt. Auto-resuming a deliberate quiesce (a live
    migration, a recovery pass) is precisely what those halts exist to prevent, so INV-7's
    bound is satisfied by *surfacing*, not by releasing.
@@ -126,6 +140,21 @@ substrate; the rest is deletion and re-wiring of existing calls.
    is **removed as dead code** by leaf β: with no EWA halt there is no halt to re-check.
 8. **Detection is unchanged; only the actuator changes.** The EWA and park-stop detectors
    keep computing and keep reporting. This PRD deletes no telemetry.
+9. **The watcher-guard halts are RETAINED as a recorded exception to decision 1's rule**
+   (ratified 2026-08-24 at decompose, after a call-site census found the §6 enum covered
+   5 of the 7 live pause reasons). `watcher_misconfigured` and `watcher_crashloop`
+   (`harness._check_watcher_guard` → `pause_scheduler`) are, by decision 1's own test,
+   *also* self-destroying: the guard's action stops the watcher supervisor, so no further
+   exits are recorded and the predicate cannot observe its own recovery. They are retained
+   anyway because — unlike EWA and park-stop — **no measurement campaign has been run on
+   them**, and the guard caps a watcher cost-runaway, so retiring it on an unmeasured
+   analogy would trade a known bound for an unknown one. They are enumerated as
+   `watcher_guard` so every live call site carries a class; retiring or re-measuring them
+   is out of scope (§10). Enumerating them is not cosmetic: with a NULL class read as
+   `operator` (open question 3) and decision 5's mandatory owner+expiry, an unenumerated
+   watcher trip would be **rejected at set time and silently fail to halt** — during the
+   cost runaway the guard exists to stop.
+
 
 ## 5. Cross-PRD relationship + seam owners (G4)
 
@@ -136,7 +165,9 @@ substrate; the rest is deletion and re-wiring of existing calls.
 | `plans/stranding-remediation-scheduler-ergonomics-prd.md` | consumes | §4 "Out of scope: Auto-resuming a paused scheduler; changing EWA thresholds" — a ratified decision this PRD reverses | **this PRD** | leaf γ records the amendment + rationale |
 | task **2890** (pending) | consumes | "Resolution stays human-reserved — no auto-resume" | **this PRD** | leaf γ amends |
 | task **2892** (pending, low) | consumes | EWA trip storm-classification annotation on the *pause reason string* | **this PRD** | leaf γ re-points it at the escalation; annotation survives, its carrier changes |
-| task **3876** (pending, high) | produces | merge-halt rehydration re-asserting a `wip_conflict` halt without re-testing its predicate | **this PRD** | folded in as leaf θ |
+| task **3876** (pending, high) | produces | merge-halt rehydration re-asserting a `wip_conflict` halt without re-testing its predicate | **this PRD** | folded in as leaf η |
+| task **4642** (pending, low) | consumes | "a restart can release an `ewa_trip_` halt but a running process never does" — both its acceptable outcomes (A: add an in-process release edge; B: document the asymmetry) are **mooted** by leaf β, which deletes the halt the asymmetry is about | **this PRD** | leaf γ amends + cancels it with a pointer to β |
+| task **4632** (pending, low) | neither | documents the `digest_*` green-tier reload knobs in OPERATIONS.md — adjacent to leaf ι but **not** overlapping (tier documentation vs. the threshold's derivation) | 4632 | unaffected; verified at decompose |
 | reify (fleet peer) | consumes | park-stop retirement is fleet-wide, and reify is where park-stop actually fires | **this PRD**; reify's operator is the consumer to notify | leaf γ |
 
 The api-error PRD's *primary* remedy for the reify park-stop incident is M3 (5xx failures
@@ -155,6 +186,7 @@ class PauseClass(StrEnum):
     PARK_STOP       = 'park_stop'
     COST_CEILING    = 'cost_ceiling'
     NO_LANDINGS     = 'no_landings'
+    WATCHER_GUARD   = 'watcher_guard'
     OPERATOR        = 'operator'
 ```
 
@@ -163,7 +195,8 @@ class PauseClass(StrEnum):
 | `ewa_rate` | **no** — escalate only | no (halt zeroes the denominator) | n/a | n/a | n/a | n/a |
 | `park_stop` | **no** — escalate only | no (halt stops `blocked` transitions) | n/a | n/a | n/a | n/a |
 | `cost_ceiling` | yes | **yes** — trailing-24h spend query | yes | re-test; halt only if still breached | **auto-resume on re-test** | predicate self-clears |
-| `no_landings` | yes | partly (disk yes, landings no) | yes | re-test the disk limb; else re-assert | its own evidence resume, **scoped to its own class** | leaf κ backstop |
+| `no_landings` | yes | partly (disk yes, landings no) | yes | re-test the disk limb; else re-assert | its own evidence resume, **scoped to its own class** | leaf θ backstop |
+| `watcher_guard` | yes — **recorded exception, see decision 9** | no (the guard stops the supervisor, so no further exits are recorded) | yes | re-assert | **never** automatic | leaf θ backstop |
 | `operator` | yes | n/a (deliberate) | yes | re-assert — deliberate holds survive by design | **never** automatic | `hold_owner` + `expires_at` required at set time; expiry escalates, never resumes |
 
 **Invariants.**
@@ -199,6 +232,8 @@ Each row faces both the producer (the trip site) and the consumer (the operator 
 | 9 | No-landings resume cannot clear a foreign hold | `no_landings` breaker's resume condition fires while an `operator` hold is active | the operator hold survives; no `scheduler_resumed` for it |
 | 10 | Merge-halt rehydration re-tests (3876) | preserved pending `wip_conflict` L1; `project_root` clean, no unmerged index | merge queue is **not** halted after restart; a distinguishable log line names the re-tested predicate |
 | 11 | Merge-halt still re-asserts when dirty (3876) | preserved `wip_conflict` L1; `project_root` genuinely has conflict markers | merge queue halted after restart, as today |
+| 12 | A `no_landings` halt needs no owner/expiry | the no-landings breaker trips and calls `force_halt_scheduler(reason=trip.reason)` with no `hold_owner`/`expires_at` | the halt is ACCEPTED and the scheduler pauses; decision 5's mandatory-field check applies only to `pause_class = operator` |
+| 13 | A watcher-guard halt still halts and re-asserts | `watcher_crashloop` threshold reached, then a restart | `scheduler_paused(watcher_guard)`; after restart `scheduler_pause_restored` re-asserts it; no owner/expiry demanded; θ's bound applies |
 
 ## 8. Decomposition plan (leaf → user-observable signal)
 
@@ -210,7 +245,10 @@ Each row faces both the producer (the trip site) and the consumer (the operator 
   `pause_class` for a held pause where it previously reported only a prose reason.
 - **β — EWA trip escalates, never halts.** Deletes the `pause_scheduler` call from the
   digest trip path and, with it, 4559's now-unreachable restart re-check; keeps the
-  persisted `ewa_value` and the digest EWA section as forensics. Signal: boundary rows 1–2.
+  persisted `ewa_value` and the digest EWA section as forensics. Also truths up the
+  `digest_ewa_threshold` comment block in `config.py`, which currently narrates the
+  restart re-check β deletes, and records there that the threshold no longer gates a halt
+  (see ι, which owns the *separate* cold-start arithmetic claim). Signal: boundary rows 1–2.
 - **γ — park-stop trip escalates, never halts + the cross-PRD correction pass.** Same
   actuator change for the `blocked`-transition detector, plus the prose corrections to the
   api-error PRD (decision 11, boundary row 12), the stranding PRD (§4), and amendments to
@@ -230,18 +268,25 @@ Each row faces both the producer (the trip site) and the consumer (the operator 
   to the merge queue's `wip_conflict` rehydration; skip the halt when `project_root` is
   clean and the named worktree has no unmerged index, and annotate the owning escalation so
   it cannot re-arm. Signal: boundary rows 10–11. Independent of α (different subsystem).
-- **θ — INV-7 backstop for the classes that keep a halt.** Any `cost_ceiling` or
-  `no_landings` hold held beyond a configured bound raises a distinct escalation naming the
+- **θ — INV-7 backstop for the classes that keep a halt.** Any `cost_ceiling`,
+  `no_landings` or `watcher_guard` hold held beyond a configured bound raises a distinct escalation naming the
   class and its age. Escalates; does not resume (decision 2). Signal: a synthetic hold aged
   past the bound produces exactly one bounded-hold escalation and the halt persists.
   Depends on α.
-- **ι — config corrections (docs).** `digest_ewa_threshold`'s documented derivation is a
-  **units error** — a *daily* ratio measured on *reify* applied to a 0.5–24h digest step in
-  dark-factory — and the adjacent docstring claim that "reaching 24.6 from a cold start
-  requires sustained high ratios across multiple digest steps" is false: with α=0.3 a
-  single cold step trips at ratio ≥ 82, which is how trips 2 and 4 fired. Correct both, and
-  record that the threshold no longer gates a halt. `task_kind='normal'`, docs-only.
-  Independent.
+- **ι — config corrections (docs).** **RE-SCOPED at decompose (2026-08-24):** the
+  units-error half this PRD described is **already landed** — task 4559 rewrote the
+  `digest_ewa_threshold` provenance comment (`orchestrator/src/orchestrator/config.py`,
+  the comment block above the field's `default=`), which now states outright that the
+  recorded provenance is not reproducible and that the recipe "describes a DAILY EWA over
+  submissions only, while the runtime computes a per-N-lifecycle-event EWA … about 2.06x
+  apart on DF data". Do not re-file it. What SURVIVES and is still false on main is the
+  adjacent claim in the field's own `description=`: "reaching 24.6 from a cold start
+  requires sustained high ratios across multiple digest steps". With `digest_ewa_alpha`
+  0.3 and a cold `EWA(t)=0` the step value is `0.3 × ratio`, so a SINGLE step trips at
+  `ratio ≥ 24.6/0.3 = 82` — which is how trips 2 and 4 fired. Correct that sentence. The
+  paired statement that the threshold no longer gates a halt is **owned by β**, not ι: it
+  only becomes true when β lands, and β is already editing that same comment block to
+  delete 4559's now-dead restart re-check. `task_kind='normal'`, docs-only. Independent.
 - **κ — integration gate: the §7 boundary suite, both sides of the seam.** The leaves above
   each verify their own rows; κ verifies the *composition* — one suite running all eleven
   rows of §7 against a single harness, which is where a policy table honoured correctly at
@@ -283,6 +328,11 @@ No waivers required.
 - The escalation-backlog noise sources that inflate the numerator (`esc-4004-6`'s
   recovery-veto-streak retune). Separate, and unblocked by this PRD.
 - Merge-queue halt semantics beyond 3876's rehydration predicate.
+- **Retiring or re-measuring the `watcher_guard` halts** (decision 9). They fail decision
+  1's re-testability test on the same analogy as EWA and park-stop, but no measurement
+  campaign has been run on them and the guard caps a cost runaway; this PRD enumerates
+  them so no call site is unclassified, and deliberately does not act on them. A future
+  PRD that measures them the way `esc-__scheduler__-8` measured the EWA owns the decision.
 
 ## 11. Open questions (tactical)
 
