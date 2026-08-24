@@ -381,17 +381,16 @@ Agent discovered it needs to touch files beyond its assigned scope.
 - `category == "scope_violation"`
 - `agent_role == "fused-memory/path-guard"` **OR** the escalation id starts with `esc-task-path-guard`
 
-Match on those structural fields plus the summary signature, **never** on `suggested_action` — the advisory mode's `no_action_advisory_only` and the override mode's `review_override_justification` are prose carried for a human reader, shared with unrelated escalation classes, and cannot discriminate this one by itself. Same rule, same reason, as the amend-fold section below.
+Match on those structural fields plus the summary signature, **never** on `suggested_action` — the advisory mode's `no_action_advisory_only` (`fused-memory/src/fused_memory/middleware/scope_violation_escalator.py:121`) and the rejection mode's `resubmit_to_<project>` / `manual_route` (`:281-282`) are prose carried for a human reader, shared with unrelated escalation classes, and cannot discriminate this one by itself. Same rule, same reason, as the amend-fold section below.
 
-**Why these must not take the resume path.** They carry a **synthetic anchor** as `task_id` — `task-path-guard` names no task in fused-memory. `mcp__fused-memory__update_task(id=<task_id>)` therefore targets nothing, and a follow-up `resolve_issue(action='resume')` is a no-op that leaves the record `pending`. A pending un-promoted L1 keeps `_watcher_has_actionable_l1` (`orchestrator/src/orchestrator/harness.py:12263`) returning True, which is what respawns rotations forever. A `stamp_triage` does not clear it either: that precheck reads `status`/`level` only, never `triaged_at`. Only a terminal state stops the spin.
+**Why these must not take the resume path.** They carry a **synthetic anchor** as `task_id` — `task-path-guard` names no task in fused-memory. `mcp__fused-memory__update_task(id=<task_id>)` therefore targets nothing, and a follow-up `resolve_issue(action='resume')` is a no-op that leaves the record `pending`. A pending un-promoted L1 keeps `_watcher_has_actionable_l1` (`orchestrator/src/orchestrator/harness.py:12302`) returning True, which is what respawns rotations forever. A `stamp_triage` does not clear it either: that precheck reads `status`/`level` only, never `triaged_at`. Only a terminal state stops the spin.
 
-**Three modes**, told apart by `task_id` plus the summary signature. All three are handled identically by this branch:
+**Two modes**, told apart by the summary signature (both share the one anchor `task-path-guard`). Both are handled identically by this branch:
 
 | mode | `task_id` | summary signature (verbatim from the producer) |
 |---|---|---|
 | `rejection` | `task-path-guard` | `Misrouted task rejected: cites <paths> (suggested target: <target>)` |
 | `advisory` | `task-path-guard` | `Path-scope ADVISORY: submission not blocked, outcome not yet resolved, cites <paths> (possible owner: <target>)` |
-| `routing-override` | `task-path-guard-override` | the routing-override audit filed by task 3123; the `task-path-guard` prefix above already covers its id and anchor |
 
 **Disposition.** Do **not** call `update_task`. Do **not** call `resolve_issue(action='resume')`. Call exactly:
 
@@ -409,7 +408,7 @@ mcp__escalation__resolve_issue(
 
 **Digest — one line per record, mandatory.** Auto-closing these must never make the path-guard census invisible to an operator:
 
-`AUTO-CLOSED (L1 <escalation_id>): path-guard-audit — mode=<rejection|advisory|routing-override> — synthetic anchor <task_id> (no real task); closed informational [benign]`
+`AUTO-CLOSED (L1 <escalation_id>): path-guard-audit — mode=<rejection|advisory|unrecognised-anchor> — synthetic anchor <task_id> (no real task); closed informational [benign]`
 
 Then continue to the next escalation — the steps below apply only to records whose `task_id` is a real task.
 
@@ -421,7 +420,7 @@ Before the steps below, probe the subject task once — the same get-task-then-b
 task = mcp__fused-memory__get_task(id=<task_id>, project_root=<project_root>)
 ```
 
-**If no such task exists**, the record is filed under a synthetic anchor this recipe has not been taught about. Do **not** `resume` — a resume on a non-existent task is a no-op that leaves the record `pending` and the supervisor spinning. Close it exactly as the named branch above does (`action='close_only'`, `resolution_class='benign'`), naming the unrecognised anchor verbatim in the `resolution`, and emit the digest line under the same `### Auto-closed L1 (path-guard synthetic-anchor audit)` heading with `mode=unrecognised-anchor` — so an operator can see that a NEW producer appeared rather than having it silently absorbed. This is not hypothetical: the same producer module already files a FOURTH synthetic anchor (`adjudicator-budget-defect`), under a different category, that this recipe deliberately does not handle.
+**If no such task exists**, the record is filed under a synthetic anchor this recipe has not been taught about. Do **not** `resume` — a resume on a non-existent task is a no-op that leaves the record `pending` and the supervisor spinning. Close it exactly as the named branch above does (`action='close_only'`, `resolution_class='benign'`), naming the unrecognised anchor verbatim in the `resolution`, and emit the digest line under the same `### Auto-closed L1 (path-guard synthetic-anchor audit)` heading with `mode=unrecognised-anchor` — so an operator can see that a NEW producer appeared rather than having it silently absorbed. This is not hypothetical: the same producer module already files a SECOND synthetic anchor (`adjudicator-budget-defect`, `scope_violation_escalator.py:133`), under a different category, that this recipe deliberately does not handle.
 
 **If the task DOES exist**, fall through to the steps below unchanged. This branch must never close a record whose task exists — that would silently drop real scope work.
 
