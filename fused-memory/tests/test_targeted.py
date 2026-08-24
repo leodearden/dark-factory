@@ -4363,6 +4363,84 @@ class TestVerificationFailureAudit:
         )
 
     @pytest.mark.asyncio
+    async def test_unresolvable_root_is_audited_and_writes_no_memory(
+        self, reconciler, journal, config, mock_memory_service, tmp_path
+    ):
+        """A wrong/unresolvable root can never produce a verdict-bearing write.
+
+        The end-to-end invariant the PRD (D4) pins by test.  A REAL
+        CodebaseVerifier is installed and only AgentLoop is patched, so the
+        refusal has to travel verify.py -> targeted.py -> SQLite exactly the
+        way a genuine CLI failure does.  The point is that the refusal is a
+        first-class AUDITED outcome — not a swallowed no-op, and not the
+        generic 'error' row an exception would leave — while producing no
+        verification memory at all: an agent pointed at the wrong tree finds
+        nothing and would otherwise report `contradicted` against completed
+        work.
+        """
+        reconciler.verifier = CodebaseVerifier(config.reconciliation)
+
+        # An absolute path (require_project_root only validates SHAPE) that is
+        # a real directory but NOT a checkout — the shape that reaches the
+        # verifier today.
+        bad_root = tmp_path / 'not-a-checkout'
+        bad_root.mkdir()
+
+        with patch('fused_memory.reconciliation.verify.AgentLoop') as MockAgentLoop:
+            result = await _run_done_transition(reconciler, project_root=str(bad_root))
+
+            MockAgentLoop.assert_not_called()
+
+        runs = await journal.get_recent_runs('test-project', limit=1)
+        actions = await journal.get_run_actions(runs[0].id)
+
+        outcome_rows = [
+            a for a in _verify_rows(actions) if a['operation'] != 'post_verify_error'
+        ]
+        assert len(outcome_rows) == 1, (
+            f'Expected exactly one verify/codebase outcome row, got '
+            f'{[(a["action_type"], a["target"], a["operation"]) for a in actions]}'
+        )
+        assert outcome_rows[0]['operation'] == 'agent_failed', (
+            f'Expected operation=agent_failed but got {outcome_rows[0]["operation"]!r}'
+        )
+        assert outcome_rows[0]['detail'].get('failure_token') == 'codebase_root_unresolved', (
+            f'Expected the refusal token in detail, got {outcome_rows[0]["detail"]!r}'
+        )
+
+        # Not a verdict, and not the generic exception row.
+        assert not [
+            a for a in _verify_rows(actions)
+            if a['operation'] in ('contradicted', 'confirmed', 'error')
+        ], (
+            f'A refused root is neither a verdict nor a verifier exception, got '
+            f'{[(a["operation"]) for a in _verify_rows(actions)]}'
+        )
+
+        # No verdict-bearing memory write.  The fast-path completion echo still
+        # fires and is explicitly allowed, so the filter is on the metadata
+        # that marks a write as carrying a verification verdict.
+        verdict_writes = [
+            c for c in mock_memory_service.add_memory.call_args_list
+            if 'verification_verdict' in (c.kwargs.get('metadata') or {})
+        ]
+        assert not verdict_writes, (
+            f'A refused root must not write a verification memory, got '
+            f'{[c.kwargs.get("metadata") for c in verdict_writes]}'
+        )
+
+        failed_actions = [
+            a for a in result.get('actions', [])
+            if a['type'] == 'verification_agent_failed'
+        ]
+        assert len(failed_actions) == 1, (
+            f'Expected a verification_agent_failed action, got {result.get("actions")}'
+        )
+        assert failed_actions[0].get('failure_token') == 'codebase_root_unresolved', (
+            f'Expected the token on the action, got {failed_actions[0]!r}'
+        )
+
+    @pytest.mark.asyncio
     async def test_post_verify_write_failure_is_not_attributed_to_the_verifier(
         self, reconciler, journal, mock_memory_service, caplog
     ):

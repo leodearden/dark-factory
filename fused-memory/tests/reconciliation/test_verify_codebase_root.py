@@ -296,13 +296,101 @@ async def test_root_is_per_call_not_per_instance(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Behaviour preservation: a valid root still produces a real verdict
+# Fail-closed refusal on an unusable root (PRD D4, INV-2 + INV-8)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_valid_root_returns_the_agents_verdict(tmp_path):
-    """A usable root still spawns the agent and returns its verdict unchanged."""
+@pytest.mark.parametrize('shape', ['missing', 'not_a_dir', 'no_dot_git'])
+async def test_unusable_root_refuses_without_spawning_an_agent(tmp_path, shape):
+    """An unusable root is refused BEFORE any agent is constructed.
+
+    ``require_project_root`` validates SHAPE only ("non-empty absolute path")
+    — it never stats the path — so a non-existent or non-checkout root really
+    does reach the verifier.  Spawning an agent there is the failure this task
+    closes: it searches a tree that does not contain the work, finds nothing,
+    and returns ``contradicted`` against genuinely-completed work.  Refusing
+    before the spawn is the whole point, which is why ``assert_not_called`` is
+    asserted alongside the returned fields.
+    """
+    if shape == 'missing':
+        bad_root = tmp_path / 'does-not-exist'
+    elif shape == 'not_a_dir':
+        bad_root = tmp_path / 'a-file'
+        bad_root.write_text('not a directory')
+    else:
+        bad_root = tmp_path / 'no-git'
+        bad_root.mkdir()
+
+    patcher, mock_cls, _instance = _mock_agent_loop()
+    try:
+        verifier = CodebaseVerifier(_config())
+        result = await verifier.verify(claim='Task X completed', codebase_root=bad_root)
+    finally:
+        patcher.stop()
+
+    assert result.verdict == VerificationVerdict.inconclusive
+    assert result.agent_failed is True
+    assert result.failure_token == 'codebase_root_unresolved'
+    # The offending path must be legible in the row itself, so an operator
+    # reading the census sees WHICH root failed without re-running anything.
+    assert str(bad_root) in result.summary, result.summary
+
+    mock_cls.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_refusal_uses_stat_only_no_subprocess(tmp_path):
+    """The root check is stat-only — no ``git rev-parse`` probe (INV-8).
+
+    verify() runs on the event loop; a subprocess probe there would block it.
+    """
+    bad_root = tmp_path / 'does-not-exist'
+
+    patcher, _mock_cls, _instance = _mock_agent_loop()
+    try:
+        with patch(
+            'fused_memory.reconciliation.verify.asyncio.create_subprocess_exec',
+            new_callable=AsyncMock,
+        ) as mock_exec:
+            verifier = CodebaseVerifier(_config())
+            result = await verifier.verify(claim='Task X completed', codebase_root=bad_root)
+    finally:
+        patcher.stop()
+
+    assert result.failure_token == 'codebase_root_unresolved'
+    mock_exec.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_git_worktree_root_is_accepted(tmp_path):
+    """A checkout whose ``.git`` is a FILE is usable, not refused.
+
+    Every task in this factory runs in a ``git worktree``, where ``.git`` is a
+    file holding a ``gitdir:`` pointer.  An implementation testing ``.is_dir()``
+    on that entry would refuse the entire population this PRD exists to serve
+    — and in the census that refusal would look identical to a genuinely bogus
+    root.
+    """
+    worktree = tmp_path / 'worktree'
+    worktree.mkdir()
+    (worktree / '.git').write_text('gitdir: /home/leo/src/project/.git/worktrees/wt\n')
+
+    patcher, mock_cls, _instance = _mock_agent_loop()
+    try:
+        verifier = CodebaseVerifier(_config())
+        result = await verifier.verify(claim='Task X completed', codebase_root=worktree)
+    finally:
+        patcher.stop()
+
+    mock_cls.assert_called_once()
+    assert result.agent_failed is False
+    assert result.failure_token == ''
+
+
+@pytest.mark.asyncio
+async def test_valid_root_still_spawns_the_agent(tmp_path):
+    """Positive control: without it, an implementation refusing EVERY root passes."""
     root_a = _git_root(tmp_path, 'root_a')
 
     patcher, mock_cls, _instance = _mock_agent_loop()
@@ -316,3 +404,24 @@ async def test_valid_root_returns_the_agents_verdict(tmp_path):
     assert result.verdict == VerificationVerdict.inconclusive
     assert result.agent_failed is False
     assert result.failure_token == ''
+
+
+@pytest.mark.asyncio
+async def test_refusal_summary_keeps_the_agent_failed_sentinel(tmp_path):
+    """The refusal's summary opens with task 1811's ``agent-failed:`` sentinel.
+
+    _on_task_done logs ``summary`` verbatim in its verification_agent_failed
+    WARNING, so an operator grepping for the sentinel would otherwise miss
+    precisely the failure introduced here.  The structured ``failure_token``
+    stays the machine-readable channel (INV-2) — nothing branches on prose.
+    """
+    bad_root = tmp_path / 'does-not-exist'
+
+    patcher, _mock_cls, _instance = _mock_agent_loop()
+    try:
+        verifier = CodebaseVerifier(_config())
+        result = await verifier.verify(claim='Task X completed', codebase_root=bad_root)
+    finally:
+        patcher.stop()
+
+    assert result.summary.startswith('agent-failed:'), result.summary
