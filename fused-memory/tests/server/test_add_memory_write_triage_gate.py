@@ -73,6 +73,7 @@ def _candidate(
     content: str = _CANONICAL_CONTENT,
     category: MemoryCategory = MemoryCategory.procedural_knowledge,
     store_rank: int = 1,
+    extra_metadata: dict | None = None,
 ) -> MemoryResult:
     """Build the POST-RRF result shape the tool really receives from search().
 
@@ -83,6 +84,11 @@ def _candidate(
 
     ``RRF_K`` comes from production rather than the literal 60, so a retune
     carries this fixture with it.
+
+    ``extra_metadata`` is merged in last and is how a CHILD candidate's shape
+    (``{'kind': ..., 'parent_id': ...}``) is built — children arrive from
+    ``search`` as ordinary hits, because grouping is applied at the MCP
+    boundary and never inside the service.
     """
     return MemoryResult(
         id=id_,
@@ -90,7 +96,11 @@ def _candidate(
         category=category,
         source_store=SourceStore.mem0,
         relevance_score=1.0 / (RRF_K + store_rank),
-        metadata={'store_rank': store_rank, 'store_score': score},
+        metadata={
+            'store_rank': store_rank,
+            'store_score': score,
+            **(extra_metadata or {}),
+        },
     )
 
 
@@ -208,6 +218,48 @@ class TestRestatementIsRedirectedNotRejected:
         )
         assert metadata['kind'] == SIGHTING_KIND, (
             f'a restatement is a SIGHTING, not an amendment: {metadata!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_attaching_to_a_child_winner_lands_under_the_grandparent(
+        self,
+    ) -> None:
+        """No grandchildren: a child winner hoists to its canonical.
+
+        A sighting child stores the restatement text VERBATIM, so on the
+        SECOND restatement of the same fact it is the likeliest max-cosine
+        winner — this is the common case, not a corner one. Attaching to it
+        would write `{parent_id: <the child>}`, and `grouped_read` resolves
+        exactly ONE level, so that grandchild would never fold under the true
+        canonical: a child that exists but never groups, which reads as
+        content loss without being one.
+
+        Asserted end-to-end rather than only at `decide_band`, because the
+        persisted `parent_id` and the ack are what an operator and the
+        grouped read actually see.
+        """
+        mock_service = AsyncMock()
+        _configure_config(mock_service)
+        _configure_pass_through_add_memory(mock_service)
+        mock_service.search.return_value = [
+            _candidate('m1', 0.93, store_rank=2),
+            _candidate(
+                'm2', 0.97,
+                content=_CONTENT,
+                extra_metadata={PARENT_ID_KEY: 'm1', 'kind': SIGHTING_KIND},
+            ),
+        ]
+        server = create_mcp_server(mock_service)
+
+        result = await _call(server)
+
+        assert mock_service.add_memory.await_count == 1
+        metadata = mock_service.add_memory.await_args.kwargs['metadata']
+        assert metadata[PARENT_ID_KEY] == 'm1', (
+            f'must attach to the GRANDPARENT, not the winning child m2: {metadata!r}'
+        )
+        assert result.get(CANONICAL_ID_KEY) == 'm1', (
+            f'the ack must name the canonical, not the child: {result!r}'
         )
 
     @pytest.mark.asyncio

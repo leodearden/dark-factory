@@ -25,6 +25,11 @@ import pytest
 from fused_memory.models.enums import MEM0_PRIMARY, MemoryCategory, SourceStore
 from fused_memory.models.memory import MemoryResult
 from fused_memory.server import write_triage
+from fused_memory.server.grouped_read import (
+    CHILD_KINDS,
+    PARENT_ID_KEY,
+    _parent_id_in_meta,
+)
 from fused_memory.server.write_triage import (
     _DEFAULT_CANDIDATE_K,
     _DEFAULT_WRITE_TRIAGE_ENABLED,
@@ -39,6 +44,7 @@ from fused_memory.server.write_triage import (
     ROUTED_KEY,
     TRIAGE_OUTCOMES,
     TriageFailOpenCounter,
+    _canonical_id_of,
     _stub_judge,
     decide_band,
     emit_triage_fail_open_storm_escalation,
@@ -65,16 +71,25 @@ def _result(
     relevance_score: float = _RRF_RANK1,
     store_rank: int = 1,
     omit_store_score: bool = False,
+    extra_metadata: dict | None = None,
 ) -> MemoryResult:
     """Build a POST-RRF ``MemoryResult``: *score* is the COSINE, in metadata.
 
     ``relevance_score`` defaults to the ordinal RRF value a real rank-1 mem0
     hit carries, deliberately UNRELATED to *score* — so any test that passes
     only because the band router still reads ``relevance_score`` fails.
+
+    ``extra_metadata`` is merged in last and is how a CHILD record's shape is
+    built (``{'kind': ..., 'parent_id': ...}``) — a dict rather than dedicated
+    kwargs, so a malformed shape a real corpus can carry (the key absent, the
+    value None, the value a non-string) is expressible verbatim instead of
+    being normalised away by the fixture.
     """
     metadata: dict = {'store_rank': store_rank}
     if not omit_store_score:
         metadata['store_score'] = score
+    if extra_metadata:
+        metadata.update(extra_metadata)
     return MemoryResult(
         id=id_,
         content=content,
@@ -540,6 +555,147 @@ class TestDecideBand:
         """
         for t_high, t_low in ((None, None), (T_HIGH, T_LOW), (None, T_LOW)):
             assert decide_band([], t_high=t_high, t_low=t_low).outcome == OUTCOME_STORED
+
+    # -- a child candidate must never become a parent (no grandchildren) ----
+    #
+    # `retrieve_candidates` calls `MemoryService.search`, and grouping is
+    # applied at the MCP boundary in `server/tools.py`, NEVER inside the
+    # service — so sighting and amendment children arrive here as ordinary
+    # hits. A sighting child stores the restatement text VERBATIM, which makes
+    # it the LIKELIEST max-cosine winner on the second restatement of the same
+    # fact. Attaching to it would write `{parent_id: <that child>, kind:
+    # sighting}` and produce a grandchild, and `grouped_read`'s parent lookup
+    # resolves exactly ONE level — so the grandchild would never fold under
+    # the true canonical. That is precisely the failure `tools.py`'s import
+    # comment names: "children that exist but never group, which reads as
+    # content loss without being one".
+
+    @pytest.mark.parametrize('child_kind', sorted(CHILD_KINDS))
+    @pytest.mark.parametrize(
+        ('score', 'expected_outcome'),
+        [(0.97, OUTCOME_RESTATED), (0.75, OUTCOME_JUDGE)],
+        ids=['restated-band', 'judge-band'],
+    )
+    def test_a_child_winner_hoists_to_its_canonical(
+        self, child_kind, score, expected_outcome,
+    ) -> None:
+        """The winner's PARENT is the canonical, never the child's own id.
+
+        Asserted at BOTH bands that carry a canonical_id, because both hand
+        one to the attach seam — the deterministic restate path and the judge
+        path alike — so fixing only the restate arm would leave the hole open
+        the moment leaf gamma's judge starts attaching.
+
+        Parametrized over the IMPORTED `CHILD_KINDS` rather than a 'sighting'
+        literal, so an amendment child hoists too and a future child kind
+        carries this test with it instead of quietly opening a new hole.
+        """
+        d = decide_band(
+            [_result('child-1', score,
+                     extra_metadata={'kind': child_kind, PARENT_ID_KEY: 'm1'})],
+            t_high=T_HIGH, t_low=T_LOW,
+        )
+        assert d.canonical_id == 'm1', (
+            f'a {child_kind} child must hoist to its parent, never be attached '
+            f'to: got {d.canonical_id!r}'
+        )
+        assert d.outcome == expected_outcome
+
+    @pytest.mark.parametrize('child_kind', sorted(CHILD_KINDS))
+    def test_hoisting_moves_the_attach_target_and_nothing_else(
+        self, child_kind,
+    ) -> None:
+        """The evidence is REAL — only where it attaches moves.
+
+        The child's measured cosine is what was actually observed against the
+        submitted text, and it is the strongest available evidence that this
+        exact restatement was seen before. Rewriting the reported similarity
+        (to the parent's, or to nothing) would make the ack unable to explain
+        the routing it just performed.
+        """
+        d = decide_band(
+            [_result('child-1', 0.97,
+                     extra_metadata={'kind': child_kind, PARENT_ID_KEY: 'm1'})],
+            t_high=T_HIGH, t_low=T_LOW,
+        )
+        assert d.similarity == pytest.approx(0.97), 'the CHILD\'s cosine is the evidence'
+        assert (d.outcome, d.t_high, d.t_low) == (OUTCOME_RESTATED, T_HIGH, T_LOW)
+
+    @pytest.mark.parametrize(
+        ('label', 'extra'),
+        [
+            ('no kind at all', None),
+            ('kind outside CHILD_KINDS', {'kind': 'note', PARENT_ID_KEY: 'm1'}),
+            ('kind is None', {'kind': None, PARENT_ID_KEY: 'm1'}),
+        ],
+    )
+    def test_a_non_child_candidate_is_never_hoisted(self, label, extra) -> None:
+        """Guards the other direction: over-hoisting is its own corruption.
+
+        A record that merely carries a `parent_id` without a child `kind` is
+        not a child (grouping is strictly BOTH, D5). Attaching to whatever id
+        it happens to name would parent the write onto an unrelated record.
+        """
+        d = decide_band(
+            [_result('m9', 0.97, extra_metadata=extra)], t_high=T_HIGH, t_low=T_LOW,
+        )
+        assert d.canonical_id == 'm9', label
+
+    @pytest.mark.parametrize(
+        ('label', 'extra'),
+        [
+            ('parent_id absent', {'kind': 'sighting'}),
+            ('parent_id is None', {'kind': 'sighting', PARENT_ID_KEY: None}),
+            ('parent_id is empty', {'kind': 'sighting', PARENT_ID_KEY: ''}),
+            ('parent_id is an int', {'kind': 'sighting', PARENT_ID_KEY: 7}),
+            ('parent_id is a list', {'kind': 'sighting', PARENT_ID_KEY: ['m1']}),
+        ],
+    )
+    def test_a_child_with_a_malformed_parent_id_does_not_hoist(
+        self, label, extra,
+    ) -> None:
+        """Matches `_parent_id_in_meta`'s exact rule, so the two cannot disagree.
+
+        A child kind whose parent link is unusable is treated as an ordinary
+        candidate rather than hoisted to a nonsense target: `parent_id` must
+        be a non-empty `str`. Anything else means there is nothing to hoist
+        TO, and inventing one would be worse than attaching to the child.
+        """
+        d = decide_band(
+            [_result('c1', 0.97, extra_metadata=extra)], t_high=T_HIGH, t_low=T_LOW,
+        )
+        assert d.canonical_id == 'c1', label
+
+    @pytest.mark.parametrize(
+        'extra',
+        [
+            None,
+            {},
+            {'kind': 'sighting', PARENT_ID_KEY: 'm1'},
+            {'kind': 'amendment', PARENT_ID_KEY: 'm1'},
+            {'kind': 'sighting'},
+            {'kind': 'sighting', PARENT_ID_KEY: None},
+            {'kind': 'sighting', PARENT_ID_KEY: ''},
+            {'kind': 'sighting', PARENT_ID_KEY: 7},
+            {'kind': 'note', PARENT_ID_KEY: 'm1'},
+            {'kind': None, PARENT_ID_KEY: 'm1'},
+            {PARENT_ID_KEY: 'm1'},
+        ],
+    )
+    def test_the_child_rule_cannot_drift_from_grouped_reads(self, extra) -> None:
+        """DRIFT GUARD: one rule, asserted against the READ side's own function.
+
+        `write_triage` decides where a child's write attaches; `grouped_read`
+        decides where a child is displayed. If those two disagree about what
+        counts as a child, the write lands somewhere the read cannot fold it
+        from — a child that exists but never groups. Asserting equivalence
+        against the landed `_parent_id_in_meta` means a future tightening of
+        the rule in either module cannot silently re-open this hole in the
+        other.
+        """
+        result = _result('own-id', 0.97, extra_metadata=extra)
+        expected = _parent_id_in_meta(result.metadata) or 'own-id'
+        assert _canonical_id_of(result) == expected
 
 
 # ---------------------------------------------------------------------------
