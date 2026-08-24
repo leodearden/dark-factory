@@ -313,6 +313,13 @@ Each row faces both the producer (the trip site) and the consumer (the operator 
   one run, including rows 8–9 with genuinely concurrent holds of different classes.
   Depends on β, γ, δ, ε, ζ, η, θ.
 
+**Routing notes.** All ten tasks are `task_kind='normal'`. ι (docs-only) additionally
+carries `metadata.complexity='simple'` to take the single-agent fast path. Deliberately NOT
+`execution_class='operational'`: that declaration is converted at submit into a deterministic
+always-escalates pure gate — i.e. it routes the work to a human — and Leo ruled (2026-08-24)
+that human attention is reserved for work that genuinely needs it. γ carries prose edits too
+but is NOT `simple`: it also deletes a live actuator, so it is ordinary code work.
+
 Dependencies: α → {β, γ, δ, ε, ζ, θ}; η and ι independent;
 κ → {β, γ, δ, ε, ζ, η, θ}.
 
