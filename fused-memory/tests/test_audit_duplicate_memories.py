@@ -6231,6 +6231,74 @@ class TestLivenessRecurrenceMetrics:
         ))
 
 
+class TestLivenessRecurrenceMetricsUnderDualKeying:
+    """A corpus that has not changed must not read higher because one
+    subject is now keyed twice over the same members.
+
+    Every fixture in `TestLivenessRecurrenceMetrics` runs the REAL corpus,
+    whose four records are COHERENT -- the divergence gate never opens,
+    dual keying is never exercised, and nothing at the metrics layer guards
+    the number `liveness_snapshot_recurrences` actually reports. This class
+    arms that guarantee: the count is GROUPS PER SUBJECT, not buckets per
+    (subject, key), at the layer the regression alarm actually reads --
+    not just at the detector level
+    (`TestLivenessOneSubjectOneGroupPerMemberSet`).
+    """
+
+    def _fixture(self):
+        # Same shape TestLivenessOneSubjectOneGroupPerMemberSet._divergent
+        # builds, so the detector-level and metrics-level pins exercise one
+        # corpus: two identical divergent records, D1/D2, over subjects
+        # 94 and 96 -- four buckets that collapse to two groups.
+        corpus = [
+            _dated('D1', _LIVENESS_DIVERGENT_94_96, _TS_94_JUL24,
+                   category=_OS, metadata={'task_id': '94'}),
+            _dated('D2', _LIVENESS_DIVERGENT_94_96, _TS_REVERIFY,
+                   category=_OS, metadata={'task_id': '94'}),
+        ]
+        plan = build_sweep_plan(corpus)
+        records = {_OS: corpus, _PK: []}
+        return plan, records, split_plan_by_category(plan, (_OS, _PK))
+
+    def test_plan_level_cluster_count_is_collapsed_too(self):
+        plan, _records, _plans = self._fixture()
+
+        assert plan['liveness_snapshot_recurrence_clusters'] == 2, (
+            'four buckets, two findings -- the plan-level count is '
+            'collapsed too, not just the detector return'
+        )
+
+    def test_the_armed_metric_reads_two_not_four(self):
+        _plan, records, plans = self._fixture()
+
+        metrics, _details = compute_cluster_metrics(records, plans, {})
+        metric = _by_id(metrics)[f'liveness_snapshot_recurrences.{_OS}']
+
+        assert metric.kind == 'count', (
+            "the docstring's ARMED claim, checked here rather than only "
+            'asserted in prose'
+        )
+        assert metric.direction == 'higher_is_worse'
+        assert metric.value == 2.0, (
+            'one subject keyed twice over the SAME two members must read '
+            'as ONE group, not two'
+        )
+        assert metric.n == 2, 'n is the exposure: the category corpus size'
+
+    def test_details_table_has_no_duplicate_row(self):
+        _plan, records, plans = self._fixture()
+
+        _metrics, details = compute_cluster_metrics(records, plans, {})
+        table = details['categories'][_OS]['liveness_snapshot_recurrences']
+
+        assert len(table) == 2, 'no duplicate row for the human reader'
+        assert len({(row['subject_task_id'], tuple(row['member_ids']))
+                    for row in table}) == 2, (
+            'two distinct (subject, member_ids) pairs -- the other half of '
+            'the harm a structural doubling would cause'
+        )
+
+
 def _liveness_raw_corpus() -> dict[str, list[dict]]:
     """The real four records in scroll_by_metadata's raw payload shape."""
     return {_OS: [
