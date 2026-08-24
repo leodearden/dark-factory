@@ -104,6 +104,37 @@ basis.**
    **zero** references to `merge_request`. ζ's behaviour-preservation surface is two tools, and the
    second is unpinned.
 
+9. **The η↔3539 "conflict" was a misreading, and is retracted (ruled by Leo 2026-08-24, gate task
+   4673 / `esc-4673-1`).** The decompose walk recorded leaf η and task 3539 as targeting the same
+   population with incompatible remedies. They do not. `_RECOVERY` is consulted only from
+   `_reconcile_one_stranded` (`harness.py:5540`), reached only for statuses in
+   `_RECONCILE_SWEEP_STATUSES = frozenset({'in-progress', 'blocked'})` (`harness.py:238`, filtered
+   upstream at `:4947`). 3539's rows are **all keyed `IN_PROGRESS`**; η owns `pending` and
+   `merge-deferred`, which never reach that table. §Sketch's objection to "adding rows to
+   `_RECOVERY`" is a claim about rows keyed on *parked* statuses and therefore never reached 3539.
+   3539's own 2026-08-22 amendment says the same thing unprompted: *"the recovery table is a second,
+   independent hole."* **The ratified partition:**
+
+   | Owner | Population | Action |
+   |---|---|---|
+   | **η** (task 4651) | landed `pending` · `merge-deferred` | mark done with attributed provenance |
+   | **β** (task 4645) | landed `blocked` | the existing sweep-side upgrade, veto narrowed |
+   | **3539** | `in-progress` + escalation-pinned | `CONVERT_TO_BLOCKED` rows; plus the `plan_files_not_touched` already-landed carve-out in `merge_gates.py` |
+
+   No two-authorities problem: η's only write is `done`, a **terminal absorbing state**, so it cannot
+   oscillate against 3539's anti-churn work. The one adjacency is a *handoff* — a task 3539 converts
+   `in-progress`→`blocked` lands in the sweep's blocked arm, which is β's territory.
+
+10. **3539's unexplained re-pender is identified.** 3539 records that after a pin lifted on task 3717,
+   *"within ~15 minutes the row was status=PENDING … Something re-pended it"*, and names an
+   unconfirmed reconcile-sweep `REVERT_TO_PENDING` as the candidate. It is the mark-done applier's
+   **own reject arm**: `harness.py:5715` calls `validate_landing_evidence(…, candidate_sha=…)` and on
+   `not verdict.accepted` with `status == 'in-progress'` calls `_revert_in_progress_if_no_live_claimant`
+   (`:5721-5723`), which flips the task to `pending`. 3717's branch had been re-seeded from main while
+   its work landed 2026-08-08, so the then-byte-identity effect check failed. There is no second path.
+   The loop's **entry** is decayed landing evidence — leaf δ's subject — and the reject's silence at
+   that site is task 4496's.
+
 ## Background
 
 ### The measured defect
@@ -330,7 +361,7 @@ Sequencing internal to the decomposition (§Decomposition plan): δ before ε an
 | task **4497** (coalesce re-drive call site) | sibling | `merge_queue.py:14241` — the eighth landing-detection site | **4497** | pending/med. File-lock contention with γ (same file, ~7,700 lines apart) |
 | task **4500** (capstone: `delivered_checks` required) | consumes | `validate_landing_evidence`'s signature and its seven wired call sites | **4500** | pending/med, deps `[3116, 4496, 4497, 4498]`. δ/ε **must not** change that signature or the call-site count |
 | task **4606** (`_delivered_checks_differential` hardcodes `'main'`) | sibling | `landing_evidence.py` | **4606** | pending/med — same file as δ; sequence, don't co-run |
-| task **3539** (`CONVERT_TO_BLOCKED` recovery backstop) | **conflicts with leaf η** | the landed-`pending`/`blocked`/`merge-deferred` population | **unresolved** | pending/high. Same population, **contradictory remedy** (3539 adds `_RECOVERY` rows, which §Sketch rejects). 3539 also records that after a pin lifted, *"within ~15 minutes the row was status=PENDING, not done — something re-pended it"*. η must absorb that finding; a human must rule on which task survives |
+| task **3539** (`CONVERT_TO_BLOCKED` recovery backstop) | sibling | `in-progress` + escalation-pinned strands; the `plan_files_not_touched` already-landed carve-out | **3539** | pending/high. **Ruled 2026-08-24 (gate 4673): no conflict — disjoint on status** (correction 9). 3539 is `in-progress`-keyed; η owns `pending`/`merge-deferred`; β owns `blocked`. 3539's re-pender question is answered in correction 10 |
 | task **4501** (14-day reject-event survey) | consumes | the reject events 4496 emits | **4501** | pending/med — depends on 4496 landing; another reason not to duplicate it as α |
 
 Reciprocal-ownership: none. **But the G4 walk at decompose found this table originally omitted the
@@ -549,12 +580,12 @@ Labels are intra-batch prereqs. All modules are under `orchestrator/` unless sta
   Hang it beside the stranded sweep as its own `BackgroundService`
   (`orchestrator/background_service.py:52`; registration precedent `harness.py:2088-2100`) with an
   independent `*_interval_secs` and `*_enabled` — zero new machinery (resolves Open question 1).
-  **⚠ Unresolved conflict with task 3539** (pending/high), which targets the same population from the
-  same 930-task sweep but with the remedy §Sketch explicitly rejects (adding `_RECOVERY` rows). A
-  human must rule on which survives. Regardless of that ruling, η **must absorb 3539's field
-  observation**: after a pin was genuinely lifted, *"within ~15 minutes the row was status=PENDING,
-  not done — something re-pended it rather than recovering it."* η's writer will race that same
-  re-pender; identify it before writing.
+  **Boundary with task 3539 — ruled 2026-08-24 (gate 4673), no conflict.** η owns `pending` and
+  `merge-deferred`; β owns landed `blocked`; 3539 owns `in-progress` + escalation-pinned. Disjoint by
+  construction (correction 9). If η's scope drifts across a line, stop and re-raise rather than
+  absorbing a neighbour's territory. 3539's *"something re-pended it"* is **identified** — the
+  mark-done applier's own reject arm at `harness.py:5715-5723` (correction 10) — so do not spend
+  effort hunting a second re-pender; the same decayed-evidence reject is why δ is a hard prereq.
   G7 `status-matches-liveness` (D7): use `shared.task_claimant.has_live_claimant`
   (`task_claimant.py:187`) **directly**, never `_resolve_live_claimant` — see correction 7. Alarm
   rather than silently skipping when a claimant's heartbeat is older than the TTL.
