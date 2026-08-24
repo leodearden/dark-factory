@@ -15,6 +15,8 @@ rendered prose — NOT verbatim prompt-text equality — mirroring the
 from __future__ import annotations
 
 import dataclasses
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -701,3 +703,105 @@ class TestInertProvenance:
         )
         assert 'scroll_incomplete' in codes
         assert 'unstamped_cluster_member' not in codes
+
+
+# --------------------------------------------------------------------------- #
+# Guard: the seam's import weight, and INV-5's single homes (step-15a)
+# --------------------------------------------------------------------------- #
+
+
+class TestImportLeafAndSingleHomes:
+    """``middleware/task_interceptor.py`` imports this module, so this module's
+    import weight becomes the interceptor's.
+
+    PRD D4 records a MEASURED hard import cycle from a careless import of
+    exactly this kind (``config/schema.py`` -> ``memory_metadata`` ->
+    ``backends.mem0_client`` -> ``config.schema``, raising ``ImportError:
+    cannot import name 'FusedMemoryConfig'``), which is why ``TOPIC_SLUG_RE``
+    got its own stdlib-only leaf module with a regression test. These probe
+    BOTH import orders, because a cycle is directional: whichever module the
+    process reaches first is the one left half-initialised.
+
+    Probed in a FRESH interpreter each time — this test process has already
+    imported both modules at collection, so an in-process ``sys.modules`` check
+    would pass vacuously (the same reasoning as
+    ``test_topic_slug_namespace.py::test_module_is_import_light``).
+    """
+
+    #: Heavy modules the leaf must never pull in. ``targeted``/``harness`` are
+    #: the reconciliation runtime; ``services.memory_service`` and
+    #: ``server.tools`` are the store/MCP layers that import the interceptor
+    #: back.
+    FORBIDDEN = (
+        'fused_memory.reconciliation.targeted',
+        'fused_memory.reconciliation.harness',
+        'fused_memory.services.memory_service',
+        'fused_memory.server.tools',
+    )
+
+    @staticmethod
+    def _probe(body: str):
+        return subprocess.run(
+            [sys.executable, '-c', body], capture_output=True, text=True, timeout=300
+        )
+
+    def test_imports_with_the_interceptor_first(self):
+        """The production order: the seam imports the leaf."""
+        result = self._probe(
+            'import fused_memory.middleware.task_interceptor as ti; '
+            'import fused_memory.reconciliation.consolidation_gate as cg; '
+            'assert ti.GATE_METADATA_KEY is cg.GATE_METADATA_KEY'
+        )
+        assert result.returncode == 0, result.stderr
+
+    def test_imports_with_the_gate_first(self):
+        """The reversed order: a test module (or the CLI) imports the leaf
+        first and the interceptor afterwards.
+
+        A cycle is directional, so passing one order proves nothing about the
+        other — the measured D4 failure only surfaced from one side.
+        """
+        result = self._probe(
+            'import fused_memory.reconciliation.consolidation_gate as cg; '
+            'import fused_memory.middleware.task_interceptor as ti; '
+            'assert ti.GATE_METADATA_KEY is cg.GATE_METADATA_KEY'
+        )
+        assert result.returncode == 0, result.stderr
+
+    def test_module_imports_stay_leaf(self):
+        """Importing the leaf alone must not drag in the reconciliation
+        runtime, the memory service or the MCP tool layer."""
+        forbidden = ', '.join(repr(m) for m in self.FORBIDDEN)
+        result = self._probe(
+            'import sys; '
+            'import fused_memory.reconciliation.consolidation_gate  # noqa: F401\n'
+            f'forbidden = [{forbidden}]\n'
+            'present = [m for m in forbidden if m in sys.modules]\n'
+            'assert not present, present\n'
+        )
+        assert result.returncode == 0, result.stderr
+
+    def test_binds_the_same_normalize_supersedes(self):
+        """INV-5: ``is``, never ``==``. Equality would be satisfied by a
+        re-typed copy of the parser, which is exactly the drift INV-5 forbids
+        and which prose alone cannot prevent.
+        """
+        assert (
+            consolidation_gate.normalize_supersedes
+            is memory_metadata.normalize_supersedes
+        )
+
+    def test_binds_the_same_is_full_uuid(self):
+        from fused_memory.utils import validation
+
+        assert consolidation_gate.is_full_uuid is validation.is_full_uuid
+
+    def test_binds_the_same_is_valid_topic_slug(self):
+        """The single home is the stdlib-only ``topic_slug`` leaf; going
+        through ``memory_metadata``'s re-export must reach the SAME object, or
+        the one topic namespace (PRD D4) has quietly split in two.
+        """
+        import fused_memory.topic_slug as ts
+
+        assert consolidation_gate.is_valid_topic_slug is ts.is_valid_topic_slug
+        assert memory_metadata.is_valid_topic_slug is ts.is_valid_topic_slug
