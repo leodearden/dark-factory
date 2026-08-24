@@ -38,9 +38,11 @@ from fused_memory.reconciliation.flag_dedup import (
     _normalize_content_description,
     acknowledge_resolved_flags,
     compute_flag_signature,
+    confirm_task_present,
     filter_blocked_snapshot_findings,
     filter_contamination_ceiling_findings,
     filter_false_phantom_task_creation_flags,
+    safe_get_task,
 )
 from fused_memory.reconciliation.mem0_tombstone import (
     is_protected_audit_record,
@@ -431,6 +433,144 @@ def _coerce_tasks_created_count(value: object) -> int:
         except ValueError:
             return 0
     return 0
+
+
+class _RecordCorroboration(NamedTuple):
+    """Outcome of corroborating a set of action-record keys (task 3051).
+
+    The three buckets PARTITION the input keys — ``corroborated`` +
+    ``uncorroborated`` + ``unresolvable`` always equals the number of
+    well-formed keys handed in — so no key can be silently dropped and an
+    operator can tell "the agent invented records" (uncorroborated: we asked
+    and the task is not there) from "we could not check" (unresolvable: no
+    project root to ask against, or no taskmaster at all).
+    """
+
+    #: The keys ``taskmaster.get_task`` positively confirmed exist.
+    corroborated_keys: set[tuple[str | None, str]]
+    #: Keys looked up whose result did NOT positively confirm presence.
+    uncorroborated: int
+    #: Keys no lookup could be issued for (unresolvable project, or the
+    #: corroboration pass could not run at all).
+    unresolvable: int
+
+    @property
+    def corroborated(self) -> int:
+        """Number of positively-confirmed keys (derived, cannot drift)."""
+        return len(self.corroborated_keys)
+
+
+def _normalize_record_keys(keys: object) -> list[tuple[Any, Any]]:
+    """Best-effort projection of *keys* to a list of well-formed 2-tuples.
+
+    Non-raising: a non-iterable, or an entry that is not a 2-tuple, degrades
+    to "no such key" rather than to an exception.
+    """
+    normalized: list[tuple[Any, Any]] = []
+    try:
+        for key in keys or ():
+            if isinstance(key, tuple) and len(key) == 2:
+                normalized.append(key)
+    except TypeError:
+        return []
+    return normalized
+
+
+async def _corroborate_record_keys(
+    taskmaster: Any,
+    known_projects: dict[str, str] | None,
+    keys: object,
+) -> _RecordCorroboration:
+    """Confirm each ``(project_id, task_id)`` key against its OWN project (task 3051).
+
+    Structurally mirrors
+    :func:`~fused_memory.reconciliation.flag_dedup.filter_false_phantom_task_creation_flags`:
+    resolve each key's ``project_id`` to a root via *known_projects*, batch
+    every resolvable lookup into ONE flat ``asyncio.gather`` of
+    :func:`~fused_memory.reconciliation.flag_dedup.safe_get_task` coroutines,
+    and classify each result with
+    :func:`~fused_memory.reconciliation.flag_dedup.confirm_task_present`.
+    Resolving per key (rather than against this stage's own root) is what makes
+    a task filed by Cross-Project Routing corroborable at all: Taskmaster ids
+    are per-project sequential integers, so the wrong root routinely lands on
+    an unrelated task that merely shares the id.
+
+    Fail-CLOSED on the increment: a key whose lookup raises, returns not-found,
+    returns an inconclusive error, or cannot be issued at all is NOT
+    corroborated, mirroring ``confirm_task_present``'s documented posture that
+    "an uncertain or absent result must never be treated as corroboration that
+    a task exists".
+
+    Fail-SAFE for the stage: the whole body is wrapped defensively and
+    degrades to "nothing corroborated, everything unresolvable" rather than
+    raising, matching the non-raising contract
+    :func:`_acknowledge_resolved_stage1_markers` and
+    :func:`_action_record_keys` already document. That is safe because the
+    only consumer — the ``tasks_created`` repair in
+    :meth:`TaskKnowledgeSync._apply_post_flight_guards` — is UPWARD-ONLY, so
+    withholding corroboration can only ever leave a self-reported counter
+    untouched; it can never move one down.
+
+    A falsy *taskmaster* or falsy/empty *known_projects* short-circuits with
+    zero I/O and every key counted unresolvable, so the lost repair is
+    reported rather than silently absorbed.
+
+    Args:
+        taskmaster: Object with an async ``get_task(task_id, project_root)``
+            method, typically ``self.taskmaster``.
+        known_projects: Map of ``project_id -> project_root``, typically
+            ``self.known_projects``.
+        keys: The deduped ``(project_id, task_id)`` pairs from
+            :func:`_action_record_keys`.
+
+    Returns:
+        A :class:`_RecordCorroboration` partitioning the well-formed keys.
+    """
+    normalized = _normalize_record_keys(keys)
+    total = len(normalized)
+    if not taskmaster or not known_projects or not total:
+        return _RecordCorroboration(set(), 0, total)
+
+    try:
+        resolvable: list[tuple[tuple[Any, Any], str]] = []
+        unresolvable = 0
+        for key in normalized:
+            project_id = key[0]
+            root = known_projects.get(project_id) if project_id else None
+            if not root:
+                # No root to ask against -> we could not CHECK (distinct from
+                # having checked and found nothing).  Issues no lookup.
+                unresolvable += 1
+                continue
+            resolvable.append((key, root))
+
+        if not resolvable:
+            return _RecordCorroboration(set(), 0, unresolvable)
+
+        # PLAIN gather — safe_get_task normalises every exception to an error
+        # dict, so no return_exceptions=True is needed (see
+        # tests/test_gather_convention_guard.py).
+        results: list[Any] = await asyncio.gather(
+            *[safe_get_task(taskmaster, key[1], root) for key, root in resolvable]
+        )
+
+        corroborated_keys: set[tuple[str | None, str]] = set()
+        uncorroborated = 0
+        for (key, _root), result in zip(resolvable, results, strict=True):
+            if confirm_task_present(result):
+                corroborated_keys.add(key)
+            else:
+                uncorroborated += 1
+
+        return _RecordCorroboration(corroborated_keys, uncorroborated, unresolvable)
+    except Exception:
+        logger.warning(
+            'reconciliation._corroborate_record_keys: corroboration pass failed for '
+            '%d record key(s) — degrading to nothing corroborated.',
+            total,
+            exc_info=True,
+        )
+        return _RecordCorroboration(set(), 0, total)
 
 
 def _marker_is_within_run_window(created_at: object, run_window_start: object) -> bool:
