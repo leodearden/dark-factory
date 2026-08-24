@@ -270,36 +270,96 @@ async def test_repend_for_requeue_logs_other_rejections_and_returns_none(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    'exc',
+    ('exc', 'expected'),
     [
-        SetTaskStatusRejected(task_id='3538', error_code='unknown', raw='r'),
-        TerminalExitRejection(
-            task_id='3538', old_status='done', target_status='pending', raw='r',
+        (SetTaskStatusRejected(task_id='3538', error_code='unknown', raw='r'), None),
+        (
+            TerminalExitRejection(
+                task_id='3538', old_status='done', target_status='pending', raw='r',
+            ),
+            WorkflowOutcome.DONE,
         ),
-        TerminalExitRejection(
-            task_id='3538', old_status='cancelled', target_status='pending', raw='r',
+        (
+            TerminalExitRejection(
+                task_id='3538', old_status='cancelled', target_status='pending',
+                raw='r',
+            ),
+            WorkflowOutcome.CANCELLED,
         ),
-        DoneGateRejection(task_id='3538', missing_files=['a.py'], raw='r'),
+        (DoneGateRejection(task_id='3538', missing_files=['a.py'], raw='r'), None),
+        # NOT a SetTaskStatusRejected — and that is the whole point:
+        # ``Scheduler.set_task_status`` raises a BARE ``RuntimeError`` once its
+        # ``fm_retry_backoffs()`` transient loop is exhausted (scheduler.py:2845),
+        # i.e. the fused-memory-restarting / MCP-unreachable case, which is
+        # precisely the infra degradation that GENERATES warm-lane requeues.
+        (
+            RuntimeError(
+                'set_task_status(3538, pending) failed after 4 transient '
+                'retries: TimeoutError'
+            ),
+            None,
+        ),
+        # ``dispatch_tool`` can also surface a bare transport error.
+        (TimeoutError(), None),
     ],
-    ids=['base', 'terminal-done', 'terminal-cancelled', 'done-gate'],
+    ids=[
+        'base', 'terminal-done', 'terminal-cancelled', 'done-gate',
+        'transient-retries-exhausted', 'bare-transport-error',
+    ],
 )
 async def test_repend_for_requeue_never_reraises(
-    tmp_path: Path, exc: SetTaskStatusRejected,
+    tmp_path: Path, exc: BaseException, expected: WorkflowOutcome | None, caplog,
 ):
-    """(e) No ``SetTaskStatusRejected`` subclass ever escapes the helper.
+    """(e) NOTHING escapes the helper — rejection-shaped or not.
 
     Both call sites sit OUTSIDE ``_drive()``'s ``except SetTaskStatusRejected``
-    handler — the ``WarmLaneRequeue`` clause is its SIBLING, and
-    ``_handle_soft_cancel`` runs from ``run()``'s ``except WorkflowCancelled``
-    — so an escaping rejection would leave ``run()`` uncaught.
+    handler — the ``WarmLaneRequeue`` clause is its SIBLING (so a raise inside
+    it is not caught by later clauses of the same ``try``), and
+    ``_handle_soft_cancel`` runs from inside ``run()``'s ``except
+    WorkflowCancelled`` handler, while ``run()`` catches nothing else.  So any
+    escape destroys the ``TerminalReport`` (the harness sees ``report is
+    None``), skipping ``_apply_retry_cap`` / ``record_requeue`` /
+    ``counts_against_requeue_cap`` bookkeeping entirely AND leaving the row
+    ``in-progress`` for the slot ``finally`` to strand — strictly worse than
+    the pre-γ3 behaviour, which always returned a REQUEUED report.
+
+    ``None`` means "no terminal override — the caller keeps its REQUEUED
+    exit"; a ``WorkflowOutcome`` means the row turned out terminal and that
+    verdict wins.
     """
     wf = _make_workflow(tmp_path=tmp_path)
     wf.scheduler.set_task_status = AsyncMock(side_effect=exc)  # type: ignore[method-assign]
 
-    # Must not raise.
-    result = await wf._repend_for_requeue()
+    with caplog.at_level(logging.ERROR):
+        result = await wf._repend_for_requeue()  # must not raise
 
-    assert result is None or isinstance(result, WorkflowOutcome)
+    assert result is expected
+    if expected is None:
+        assert any(
+            rec.levelno >= logging.ERROR for rec in caplog.records
+        ), f'expected a loud ERROR log for {exc!r}; got {caplog.records!r}'
+
+
+@pytest.mark.asyncio
+async def test_repend_for_requeue_propagates_workflow_cancelled(tmp_path: Path):
+    """(f) ``WorkflowCancelled`` is deliberately NOT swallowed.
+
+    It subclasses ``Exception`` (workflow_types.py:830), so a blanket
+    ``except Exception`` arm would capture it and violate CX-1's "raised by
+    CancellationScope and caught at EXACTLY ONE place — TaskWorkflow.run()",
+    silently downgrading a cancellation into a REQUEUED exit.  (``asyncio.
+    CancelledError`` needs no such carve-out: it derives from
+    ``BaseException`` on this repo's ``>=3.11`` floor.)
+    """
+    wf = _make_workflow(tmp_path=tmp_path)
+    wf.scheduler.set_task_status = AsyncMock(  # type: ignore[method-assign]
+        side_effect=WorkflowCancelled('soft')
+    )
+
+    with pytest.raises(WorkflowCancelled) as caught:
+        await wf._repend_for_requeue()
+
+    assert caught.value.kind == 'soft'
 
 
 # ---------------------------------------------------------------------------
@@ -396,6 +456,57 @@ async def test_warm_lane_requeue_on_cancelled_row_returns_cancelled(tmp_path: Pa
     assert wf.machine.state is WorkflowState.CANCELLED
 
 
+@pytest.mark.asyncio
+async def test_warm_lane_requeue_survives_a_dead_repend_write(tmp_path: Path):
+    """END-TO-END: a re-pend write that DIES must not cost the REQUEUED report.
+
+    ``Scheduler.set_task_status`` raises a bare ``RuntimeError`` when its
+    transient-retry loop is exhausted (scheduler.py:2845) — fused-memory
+    restarting / MCP unreachable, the very condition that produces warm-lane
+    requeues.  Nothing downstream catches it (this clause is a SIBLING of
+    ``_drive()``'s ``except SetTaskStatusRejected`` and ``except Exception``),
+    so an escape makes ``run()`` raise: the harness sees no ``TerminalReport``,
+    ``_apply_retry_cap`` / ``record_requeue`` never run, and the row is left
+    ``in-progress`` for the slot ``finally`` to strand.  The degraded exit must
+    therefore carry the SAME bookkeeping as the healthy one.
+    """
+    exc = WarmLanePoolExhausted("warm-lane pool exhausted for branch '3538'; requeue")
+    sched = FakeScheduler()
+    wf = _make_workflow(tmp_path=tmp_path, scheduler=sched)
+    wf.git_ops.create_worktree = AsyncMock(side_effect=exc)
+    mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
+    wf._mark_blocked = mark_blocked  # type: ignore[method-assign]
+
+    real_set = sched.set_task_status
+
+    async def _die_on_pending(task_id: str, status: str, **kwargs):
+        # Only the re-pend write dies — the dispatch 'in-progress' write ahead
+        # of create_worktree must still land, or the run never reaches the
+        # warm-lane clause at all.
+        if status == 'pending':
+            raise RuntimeError(
+                f'set_task_status({task_id}, {status}) failed after 4 '
+                f'transient retries: TimeoutError'
+            )
+        await real_set(task_id, status, **kwargs)
+
+    sched.set_task_status = _die_on_pending  # type: ignore[method-assign]
+
+    report = await wf.run()  # must NOT raise
+
+    disp = classify_failure(exc)
+    assert report.outcome == WorkflowOutcome.REQUEUED
+    assert report.reason == disp.reason_prefix
+    assert report.phase == wf.machine.state
+    assert report.blocked_from_phase == wf.machine.state
+    assert report.counts_against_requeue_cap == disp.counts_against_requeue_cap
+    mark_blocked.assert_not_awaited()
+    # Degraded but no worse than the pre-γ3 floor: the row is left exactly
+    # where that code always left it, and SM-2 still passes
+    # (``_OUTCOME_ALLOWED['requeued']`` admits IN_PROGRESS today).
+    assert sched.statuses[wf.task_id][-1] == 'in-progress'
+
+
 # ---------------------------------------------------------------------------
 # Boundary #12b — the soft-cancel spurious-wakeup fallback re-pends the row
 # ---------------------------------------------------------------------------
@@ -430,6 +541,29 @@ class TestSoftCancelFallbackRepends:
             'the spurious-wakeup fallback must re-pend before exiting; '
             f'history={wf.scheduler.statuses[wf.task_id]!r}'  # type: ignore[attr-defined]
         )
+
+    async def test_spurious_wakeup_still_requeues_when_the_repend_write_dies(
+        self, tmp_path: Path,
+    ):
+        """Case 3, degraded: a dead re-pend write still returns REQUEUED.
+
+        This method runs from inside ``run()``'s ``except WorkflowCancelled``
+        handler and ``run()`` catches nothing else, so an escaping
+        ``RuntimeError`` from the exhausted transient-retry loop would take
+        ``run()`` down with it.
+        """
+        wf = self._make(tmp_path, status='in-progress')
+        wf.scheduler.set_task_status = AsyncMock(  # type: ignore[method-assign]
+            side_effect=RuntimeError(
+                'set_task_status(3538, pending) failed after 4 transient '
+                'retries: TimeoutError'
+            )
+        )
+        assert not wf._cancel_event.is_set()
+
+        outcome = await wf._handle_soft_cancel('merge')  # must not raise
+
+        assert outcome == WorkflowOutcome.REQUEUED
 
     async def test_soft_cancelled_writes_no_status(self, tmp_path: Path):
         """Negative control, case 2: SOFT_CANCELLED writes NOTHING.
