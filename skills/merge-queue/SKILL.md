@@ -142,7 +142,7 @@ git merge-base --is-ancestor task/<TASK_ID> main; rc=$?; echo "ancestry rc=$rc"
 #          commit=<landing sha from the SAME exact-subject marker search used by the rc=128
 #          arm below: git log main --fixed-strings
 #          --grep="Merge task/<TASK_ID> into main" --max-count=1 --format=%H>
-#          Do NOT use `git log --format=%H -1 main` here: that is main's CURRENT HEAD, which
+#          Do NOT use `git log --format=%H -1 main` <!-- provenance-guard: negative --> here: that is main's CURRENT HEAD, which
 #          is this task's merge commit only when this merge happens to be the newest commit
 #          on main — on a live queue it usually is not, so you would stamp an unrelated
 #          task's sha. (git merge-base is also wrong: it gives the common ancestor, NOT the

@@ -280,8 +280,8 @@ empty but the branch ref still exists, you may fall back to
 `git rev-list --ancestry-path --merges task/<TASK_ID>..main | tail -1` and verify that sha
 before stamping.
 
-**Never** derive the sha from `git log --format=%H -1 main` or by eyeballing
-`git log main --oneline -20`. <!-- provenance-derivation:negative-example --> Neither is
+**Never** derive the sha from `git log --format=%H -1 main` <!-- provenance-guard: negative --> or by eyeballing
+`git log main --oneline -20`. Neither is
 scoped to this task: on a live merge queue this task's merge is usually **not** the newest
 commit on main, so you would record an unrelated task's merge as this one's provenance. The
 server's only backstop is `git merge-base --is-ancestor <sha> main`, which passes for every
