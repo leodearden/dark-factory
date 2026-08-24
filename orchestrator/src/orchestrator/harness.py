@@ -14589,28 +14589,73 @@ class Harness:
 
         # A1 guard (task 2200/ω4): an infra-held task (first-class status ==
         # 'infra-hold', via is_infra_held) is a verify-complete branch held by
-        # a transient infra failure.  Checked BEFORE the blocked-only gate
-        # below — an infra-held task's status is 'infra-hold', never
-        # 'blocked', so this must run first or the gate would skip it
-        # entirely.  Flipping to 'pending' would force the task to re-compete
-        # for its implement footprint in the scheduler's footprint-locked
-        # dispatch — the 3465 starvation root cause.  Instead resume-at-verify:
-        # set in-progress (the scheduler already skips re-implement for
-        # branches with prior work via _has_prior_implementation).  There is
-        # no metadata flag to clear anymore — the status IS the hold.
+        # a transient infra failure.  The branch is KEPT — checked BEFORE the
+        # blocked-only gate below, because an infra-held task's status is
+        # 'infra-hold', never 'blocked', so without this pre-gate the gate
+        # would skip the row entirely and it would never resume at all.  There
+        # is no metadata flag to clear anymore — the status IS the hold.
+        #
+        # The RESUME TARGET is 'pending' (task 3538 / PRD γ3, D6).  It used to
+        # be 'in-progress', defended by a no-recompete argument that does not
+        # survive contact with the code:
+        #
+        #   - Dispatch is pending-only and status-first:
+        #     Scheduler._eligible_for_dispatch returns early at
+        #     `status != 'pending'`, BEFORE any lock work, and every candidate
+        #     list is filtered to pending.  So an 'in-progress' row is never
+        #     dispatched and never reaches try_acquire — it holds no footprint
+        #     and blocks nobody (the slot exit already released every module
+        #     lock via Scheduler.release).
+        #   - This is the ORPHAN path: no live workflow, so nothing stamps a
+        #     claimant and nothing heartbeats.  An 'in-progress' write here
+        #     lands the row in exactly the shape shared.task_claimant.is_stranded
+        #     is defined to detect — stranded on the write.
+        #   - The only route from that row back to execution was therefore the
+        #     stranded sweep's _RECOVERY row (c) REVERT_TO_PENDING
+        #     (shared.task_ground_truth), firing at
+        #     stranded_reconcile_interval_secs cadence — which writes 'pending'
+        #     and re-competes for the footprint anyway.  No-recompete was
+        #     deferred by up to one sweep interval, never delivered; and
+        #     because row (c) is keyed on `has_open_escalation is False`, any
+        #     record still open left the task there forever (the 3465-shaped
+        #     starvation this branch claimed to prevent).  The HOLD-side guard
+        #     in _revert_in_progress_if_no_live_claimant does not protect it
+        #     either: that guard tests is_infra_held, which is status-keyed and
+        #     already False the moment this line writes 'in-progress'.
+        #   - Resume-at-verify is NOT lost, because it was never status-keyed.
+        #     It is delivered branch-side by TaskWorkflow._has_prior_implementation
+        #     (worktree base_commit + durable iteration log) gating the
+        #     plan-step re-derivation, plus green_checkpoint_at_tip.  The
+        #     retired comment attributed that skip to the scheduler; there is
+        #     no _has_prior_implementation in scheduler.py.
+        #     See test_harness_infra_resume_truthful.py, which pins the skip
+        #     across infra-hold/in-progress/pending row statuses alike.
+        #   - Claim-then-status (stamp a claimant, then write 'in-progress')
+        #     was considered and rejected: Scheduler.set_task_claimant swallows
+        #     every exception and never raises, so a silently-failed stamp
+        #     reproduces the identical strand with nothing to catch; and a
+        #     stamp carrying a FRESH heartbeat with no heartbeat loop behind it
+        #     makes is_stranded False, converting the strand into a permanent
+        #     SILENT hold until claimant_liveness_ttl_secs expires — strictly
+        #     worse than the bug it replaces.
+        #
+        # Deliberately NOT routed through the reblock guard: that guard exists
+        # to damp blocked→pending churn, and withholding a legitimate infra
+        # resume would re-create the starvation this change removes.
+        #
         # Migration-window caveat (review amendment, task 2200): this check
         # cannot see a legacy metadata.infra_hold-only row (status still
-        # 'blocked') — it falls through to the ordinary Table B resume below
-        # and re-competes for its footprint.  See
-        # orchestrator.task_status.is_infra_held's docstring for the
-        # accepted-risk rationale and the operator follow-up.
+        # 'blocked') — it falls through to the ordinary Table B resume below,
+        # which now targets the same 'pending'.  See
+        # orchestrator.task_status.is_infra_held's docstring.
         _infra_task = await self.scheduler.get_task(task_id)
         if is_infra_held(_infra_task):
             try:
-                await self.scheduler.set_task_status(task_id, 'in-progress')
+                await self.scheduler.set_task_status(task_id, 'pending')
                 logger.info(
-                    'cascade-unblock: task %s is infra-held — resuming at '
-                    'verify (infra-hold→in-progress) via %s',
+                    'cascade-unblock: task %s is infra-held — re-pending for '
+                    'dispatch (infra-hold→pending; resume-at-verify is '
+                    'branch-keyed, not status-keyed) via %s',
                     task_id, escalation.resolved_by,
                 )
             except SetTaskStatusRejected as e:
