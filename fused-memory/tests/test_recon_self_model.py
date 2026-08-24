@@ -18,6 +18,13 @@ import pytest
 
 from fused_memory.reconciliation import recon_self_model as m
 from fused_memory.reconciliation import standing_decision_constants as sdc
+from fused_memory.reconciliation.consolidation_gate import (
+    GATE_METADATA_KEY,
+    render_consolidation_gate_section,
+    render_end_state_brief,
+)
+from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
+from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
 
 # --------------------------------------------------------------------------- #
 # Static vocabulary constants (step-1/2)
@@ -540,3 +547,71 @@ class TestRenderInvestigationOutcomeSection:
         assert 'entity_uuid' in text
         assert 'actionable' in text
         assert 'run_id' in text
+
+
+class TestRenderConsolidationGateSection:
+    """render_consolidation_gate_section() is Defect 1's prompt-side payload
+    (task 3112).
+
+    Until it landed, render_source_completion_section was the WHOLE gate-filing
+    instruction and it named no end state, so each filed gate invented its own
+    (DF gates 2969/2973/3011/3016/3036/3063/3092). This section supplies the
+    Option-C shape and points the closure predicate and the prompt at one text.
+
+    Load-bearing-token assertions only, following TestRenderSourceCompletionSection.
+    """
+
+    def test_returns_non_empty_str(self):
+        text = render_consolidation_gate_section()
+        assert isinstance(text, str)
+        assert text.strip()
+
+    def test_names_the_option_c_end_state(self):
+        text = render_consolidation_gate_section()
+        assert 'metadata.topic' in text
+        assert 'metadata.canonical' in text
+
+    def test_instructs_the_filer_to_emit_a_topic_not_a_member_list(self):
+        """A hand-written enumeration is what DF gate 3036 did, and a later
+        cycle extended it 7->8 while it still defined 'done'."""
+        text = render_consolidation_gate_section()
+        assert GATE_METADATA_KEY in text
+        assert 'build_consolidation_gate_task' in text
+
+    def test_states_the_gate_cannot_be_closed_over_a_malformed_cluster(self):
+        """The refusal is the user-observable signal; the filer must know it
+        exists before they file, not discover it at close time."""
+        text = render_consolidation_gate_section()
+        lowered = text.lower()
+        assert 'set_task_status' in text
+        assert 'refus' in lowered or 'cannot be closed' in lowered
+
+    def test_reuses_the_end_state_brief_verbatim(self):
+        """One text for the prompt, the filed gate description and the
+        predicate's target — so they cannot drift into disagreeing."""
+        assert render_end_state_brief() in render_consolidation_gate_section()
+
+    def test_both_stage_prompts_embed_it(self):
+        """Stage 1 and Stage 2 both hold the memory-mutation tools, so both can
+        reach the point of filing a gate."""
+        section = render_consolidation_gate_section()
+        assert section in STAGE1_SYSTEM_PROMPT
+        assert section in STAGE2_SYSTEM_PROMPT
+
+    def test_it_sits_alongside_the_source_completion_section(self):
+        assert m.render_source_completion_section(can_file_tasks=False) in (
+            STAGE1_SYSTEM_PROMPT
+        )
+        assert m.render_source_completion_section(can_file_tasks=True) in (
+            STAGE2_SYSTEM_PROMPT
+        )
+
+    def test_source_completion_defers_to_it_for_gate_shape(self):
+        """The two sections must not give the stages conflicting consolidation
+        instructions. render_source_completion_section's silence on shape IS
+        Defect 1's root cause, so it now names this section as the authority."""
+        for can_file in (True, False):
+            text = m.render_source_completion_section(can_file_tasks=can_file)
+            assert 'Consolidation Gate' in text, (
+                f'can_file_tasks={can_file} must point at the gate section'
+            )
