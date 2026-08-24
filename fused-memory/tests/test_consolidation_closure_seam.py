@@ -21,6 +21,7 @@ import pytest
 import pytest_asyncio
 
 from fused_memory.middleware.task_interceptor import TaskInterceptor
+from fused_memory.models.scope import resolve_project_id
 from fused_memory.reconciliation.consolidation_gate import GATE_METADATA_KEY
 from fused_memory.reconciliation.event_buffer import EventBuffer
 
@@ -59,14 +60,14 @@ def _scroll(members, *, total=None, raises=None):
     """A stand-in for the injected memory scroll."""
     calls = []
 
-    async def scroll(filters, *, limit):
-        calls.append({'filters': filters, 'limit': limit})
+    async def scroll(filters, *, limit, project_id):
+        calls.append({'filters': filters, 'limit': limit, 'project_id': project_id})
         if raises is not None:
             raise raises
         return list(members)
 
-    async def count(filters):
-        calls.append({'count': filters})
+    async def count(filters, *, project_id):
+        calls.append({'count': filters, 'project_id': project_id})
         if raises is not None:
             raise raises
         return len(members) if total is None else total
@@ -147,7 +148,9 @@ class TestSeamRefusal:
         taskmaster.set_task_status.assert_not_called()
         taskmaster.set_status_and_stamp_audit.assert_not_called()
         reconciler.reconcile_task.assert_not_called()
-        stats = await event_buffer.get_stats()
+        stats = await event_buffer.get_buffer_stats(
+            resolve_project_id(_PROJECT_ROOT)
+        )
         assert stats['size'] == 0
 
     @pytest.mark.asyncio
@@ -267,7 +270,18 @@ class TestSeamShapeAndPrecedence:
         scroll = _scroll(_WELL_FORMED)
         interceptor.set_consolidation_scroll(scroll)
         await _set_done(interceptor)
-        assert any(
+        assert scroll.calls
+        assert all(
             call.get('filters', call.get('count')) == {'topic': _TOPIC}
             for call in scroll.calls
         )
+
+    @pytest.mark.asyncio
+    async def test_the_scroll_is_scoped_to_the_tasks_project(self, interceptor):
+        """A cross-project scroll would judge one project's gate against
+        another project's memories."""
+        scroll = _scroll(_WELL_FORMED)
+        interceptor.set_consolidation_scroll(scroll)
+        await _set_done(interceptor)
+        expected = resolve_project_id(_PROJECT_ROOT)
+        assert all(call['project_id'] == expected for call in scroll.calls)

@@ -853,6 +853,18 @@ async def run_server():
         )
 
         ticket_store = await _build_ticket_store(Path(config.reconciliation.data_dir))
+        # Task 3112: project_id-adapting wrappers over the deterministic
+        # metadata scroll, for the consolidation-gate closure check. The
+        # service methods take project_id first positionally; the interceptor
+        # passes it by keyword because it resolves scope per task.
+        async def _closure_scroll(filters, *, limit, project_id):
+            return await memory_service.get_memories_by_metadata(
+                project_id, filters, limit=limit
+            )
+
+        async def _closure_count(filters, *, project_id):
+            return await memory_service.count_memories_by_metadata(project_id, filters)
+
         task_interceptor = TaskInterceptor(
             taskmaster, targeted, event_buffer,
             config=config, escalator=curator_escalator,
@@ -872,6 +884,12 @@ async def run_server():
             targeted.task_interceptor = task_interceptor
         # Wire the write journal so task writes leave durable audit rows.
         task_interceptor.set_write_journal(write_journal)
+        # Task 3112: the consolidation-gate closure scroll. Dormant until
+        # wired, so this is the ONLY thing that arms the close-time refusal.
+        # memory_service is already in scope at both construction sites.
+        task_interceptor.set_consolidation_scroll(
+            _closure_scroll, count=_closure_count
+        )
 
         # PRD γ (task 1546): Pre-build recon_report components here — before
         # ReconciliationHarness is constructed — so the SAME ReconReportState
@@ -949,6 +967,12 @@ async def run_server():
         )
         await task_interceptor.start()
         task_interceptor.set_write_journal(write_journal)
+        # Task 3112: the consolidation-gate closure scroll. Dormant until
+        # wired, so this is the ONLY thing that arms the close-time refusal.
+        # memory_service is already in scope at both construction sites.
+        task_interceptor.set_consolidation_scroll(
+            _closure_scroll, count=_closure_count
+        )
 
     # Create MCP server with both memory and task tools
     mcp = create_mcp_server(
