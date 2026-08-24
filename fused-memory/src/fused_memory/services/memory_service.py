@@ -1756,6 +1756,8 @@ def _candidate_pool(
     referents: frozenset[Referent],
     cited: frozenset[Referent],
     endpoint: Referent,
+    ambiguous: frozenset[Referent],
+    source: str,
 ) -> frozenset[Referent]:
     """The evidence rule, before either endpoint is subtracted.
 
@@ -1789,7 +1791,45 @@ def _candidate_pool(
     misattribution this PRD exists to prevent, and polluting the rate leaf iota
     samples with a finding that has no observable defect.
 
-    THE GUARD IS TESTED FIRST, AND THAT ORDER IS LOAD-BEARING — not stylistic.
+    THE CORROBORATION GUARD IS NOT SUFFICIENT ON ITS OWN, and two further vetoes
+    sit beside it because it closes only the SUBSET of that shape where the fact
+    happens to name the endpoint. An LLM-paraphrased fact that restates no task
+    number at all ("the merge worker completed it") is the routine extraction
+    outcome, and on such a fact ``cited`` is empty, so the corroboration guard
+    cannot fire and the unguarded fallback re-manufactures exactly the
+    ``resolvable=True``-onto-the-ambient-task instruction described above.
+
+    VETO 1 — AN AMBIGUOUS ENDPOINT (PRD boundary row "Ambiguous scan | ref routed
+    to ``.ambiguous``; treated as undeclared; recorded, not guessed"). γ routes a
+    number claimed by BOTH a bare own-project mention and a foreign-qualified
+    reference to ``LabelScan.ambiguous`` and EXCLUDES it from ``.referents``, on
+    purpose. ε then drops ``.ambiguous`` from the wire, so a consumer reading only
+    the decoded set sees an ambiguous endpoint as a plain non-member —
+    indistinguishable from a genuine conflation (``_encode_referents``:
+    "AMBIGUITY IS DELIBERATELY NOT THREADED — READ THIS BEFORE WRITING ZETA").
+    ζ therefore RE-DERIVES the producer's ambiguity set from ``content`` and
+    suppresses the pool for any endpoint in it: an ambiguous reference must be
+    RECORDED and LEFT ALONE, never handed to eta as destructive repair surgery.
+    Tested FIRST, ahead of even the corroboration guard, because it is the
+    strongest "do not touch this" signal available and must hold whatever the
+    fact happens to cite.
+
+    VETO 2 — A ``source='metadata'`` FALLBACK. ``resolve_referents`` ranks ambient
+    ``metadata['task_id']`` ABOVE the content-derived scan, and its own docstring
+    names the resulting mismatch as deliberately NOT a conflict: "An agent working
+    on task 3668 legitimately writes memories about Task 2500". A referent set
+    bridged from the task an agent merely HAPPENS to be dispatched on is not a
+    claim about which node any particular edge belongs on, so it must not become a
+    repair target by default. The whole-declared-set fallback is therefore
+    suppressed for ``source='metadata'``; ``'declared'`` (the caller stated its
+    referents) and ``'derived'`` (they were scanned out of this very content) keep
+    the fallback, because there the declared set genuinely IS evidence about the
+    content. The ``cited & referents`` intersection survives on every source: a
+    fact that names a declared referent is per-EDGE evidence regardless of how the
+    declaration was sourced.
+
+    THE CORROBORATION GUARD IS TESTED FIRST OF THE TWO CITATION RULES, AND THAT
+    ORDER IS LOAD-BEARING — not stylistic.
     Behind the intersection short-circuit the guard is UNREACHABLE for every
     fact that cites the endpoint AND some declared referent, which is not an
     exotic shape but the same legitimate ambient-task write one sentence longer:
@@ -1819,11 +1859,25 @@ def _candidate_pool(
         referents: The set the write declared itself to be about.
         cited: The referents this edge's own fact mentions.
         endpoint: The referent the flagged endpoint currently parses as — read
-            ONLY to ask whether the fact corroborates it. The subtraction of the
-            endpoint from the pool stays in :func:`_candidate_targets`, so this
-            function remains "which referents is there evidence for", not "which
-            targets survive".
+            ONLY to ask whether the fact corroborates it, and whether it was
+            ambiguous. The subtraction of the endpoint from the pool stays in
+            :func:`_candidate_targets`, so this function remains "which referents
+            is there evidence for", not "which targets survive".
+        ambiguous: The referents the EPISODE CONTENT was ambiguous about, as
+            re-derived by :meth:`MemoryService._verify_episode_referents` from
+            ``scan_content(content, group_id=...).ambiguous``. Already through
+            :func:`~fused_memory.utils.referent_resolution.local_referent`, so it
+            compares equal to *endpoint* on a self-qualified spelling.
+        source: The ``ReferentSource`` :func:`_decode_referents` read off the
+            queue payload — one of :data:`REFERENT_SOURCES`. Read ONLY to decide
+            whether the whole-declared-set fallback is licensed (veto 2 above).
     """
+    if endpoint in ambiguous:
+        # VETO 1. The episode content itself could not say which project's task
+        # this number denotes, so there is nothing here to repair TOWARDS.
+        # Ahead of the corroboration guard deliberately: an ambiguous endpoint is
+        # unrepairable whatever the fact happens to cite.
+        return frozenset()
     if endpoint in cited:
         # The fact names the node this edge end is already on. It is evidence
         # FOR the current attachment, never for repointing it elsewhere, so the
@@ -1839,6 +1893,13 @@ def _candidate_pool(
     corroborated_citations = cited & referents
     if corroborated_citations:
         return corroborated_citations
+    if source == 'metadata':
+        # VETO 2. The fact cites no declared referent, and the declaration is
+        # only the task this agent happened to be dispatched on — ambient
+        # context, not an assertion about where this edge belongs. Falling back
+        # to it here is what would manufacture the misattribution this PRD
+        # exists to prevent on the dominant legitimate write shape.
+        return frozenset()
     return referents
 
 
@@ -1848,6 +1909,8 @@ def _candidate_targets(
     cited: frozenset[Referent],
     endpoint: Referent,
     other_endpoint: Referent | None,
+    ambiguous: frozenset[Referent],
+    source: str,
 ) -> tuple[Referent, ...]:
     """Which referent could this misattached edge end correctly point at?
 
@@ -1857,12 +1920,13 @@ def _candidate_targets(
 
     The rule, in order:
 
-    1. ``pool = _candidate_pool(referents=..., cited=..., endpoint=...)`` — the
-       fact-cited intersection when it is non-empty; else the whole declared set,
-       UNLESS the fact cites the endpoint itself, in which case the fact
-       corroborates the current attachment and the pool is empty. See that
-       function for why the corroboration guard is load-bearing on the dominant
-       ``source='metadata'`` write shape.
+    1. ``pool = _candidate_pool(...)`` — the fact-cited intersection when it is
+       non-empty; else the whole declared set, UNLESS one of three vetoes
+       empties it: the fact cites the endpoint itself (corroboration), the
+       endpoint referent was AMBIGUOUS in the episode content, or the
+       declaration came from ambient ``source='metadata'`` and the fact cites no
+       declared referent. See that function for why each is load-bearing on the
+       dominant legitimate write shape.
     2. Subtract *endpoint*, the referent this finding is ABOUT. A "repair" onto
        the node the edge is already attached to is not a repair — and is not
        even a harmless no-op, because :meth:`_intended_endpoint_uuid` resolves
@@ -1911,6 +1975,10 @@ def _candidate_targets(
             type rather than accepting a ``None`` no call site can produce.
         other_endpoint: The referent at the edge's OTHER end, or ``None`` when
             that end is not a task node at all.
+        ambiguous: The referents the EPISODE CONTENT was ambiguous about.
+            Forwarded verbatim to :func:`_candidate_pool` (veto 1).
+        source: The ``ReferentSource`` the declaration came from. Forwarded
+            verbatim to :func:`_candidate_pool` (veto 2).
 
     Returns:
         The surviving candidates, sorted by ``(kind, project_id, number)``.
@@ -1924,6 +1992,7 @@ def _candidate_targets(
     # AbstractSet[_T_co | None], so no explicit `- {None}` branch is needed.
     pool = _candidate_pool(
         referents=referents, cited=cited, endpoint=endpoint,
+        ambiguous=ambiguous, source=source,
     ) - {endpoint, other_endpoint}
     return tuple(sorted(pool, key=lambda r: (r.kind, r.project_id, r.number)))
 
@@ -1934,6 +2003,8 @@ def _unresolvable_reason(
     cited: frozenset[Referent],
     endpoint: Referent,
     other_endpoint: Referent | None,
+    ambiguous: frozenset[Referent],
+    source: str,
 ) -> str:
     """Why :func:`_candidate_targets` could not determine a correct target.
 
@@ -1955,6 +2026,11 @@ def _unresolvable_reason(
             empty declared set).
         endpoint: The referent the flagged endpoint currently parses as.
         other_endpoint: The referent at the edge's other end, or ``None``.
+        ambiguous: The referents the EPISODE CONTENT was ambiguous about — the
+            same set :func:`_candidate_pool` vetoed on, read here for the SAME
+            reason ``cited`` is: an emptied pool cannot say WHICH veto emptied
+            it, and the three vetoes need three different explanations.
+        source: The ``ReferentSource`` the declaration came from, likewise.
     """
     if len(candidates) > 1:
         return (
@@ -1971,12 +2047,35 @@ def _unresolvable_reason(
     # "the fact says this edge belongs where it is" is the reason an operator
     # (and leaf eta) actually needs. It also cannot be inferred from `pool`,
     # which the guard deliberately empties.
+    #
+    # AMBIGUITY OUTRANKS CORROBORATION here, mirroring the veto order in
+    # `_candidate_pool`: when the content could not say which project's task the
+    # number denotes, that is the fact about this row an operator (and eta) most
+    # needs, and it holds whatever the edge fact happens to cite.
+    if endpoint in ambiguous:
+        return (
+            f'the endpoint referent {endpoint.node_name!r} was AMBIGUOUS in the '
+            'episode content — claimed by both a bare own-project mention and a '
+            'foreign-qualified reference — so it is treated as undeclared rather '
+            'than as a conflation; recorded, not guessed at'
+        )
     if endpoint in cited:
         return (
             f"the edge's own fact cites {endpoint.node_name!r}, the endpoint it "
             'landed on, which corroborates the current attachment; the declared '
             'referent set is not evidence for repointing it, so this is '
             'recorded, not repaired'
+        )
+    if source == 'metadata' and not pool:
+        # Veto 2. Reached only when neither veto above fired and the fact cited
+        # no declared referent, so the ONLY thing that could have supplied a
+        # target was the whole-declared-set fallback the source suppresses.
+        return (
+            "the write's referent set was bridged from ambient "
+            "metadata['task_id'] rather than declared or derived from the "
+            'content, and this edge\'s fact cites no declared referent; the task '
+            'an agent happens to be dispatched on is not evidence about which '
+            'node this edge belongs on, so this is recorded, not repaired'
         )
     if endpoint in pool:
         return (
@@ -3122,7 +3221,8 @@ class MemoryService:
         return fixed
 
     async def _verify_episode_referents(
-        self, result: Any, *, group_id: str, referents: ReferentSet
+        self, result: Any, *, group_id: str, referents: ReferentSet,
+        content: str = '', referent_source: str = 'derived',
     ) -> ReferentStats:
         """Verify each edge hangs off a node this write is actually ABOUT.
 
@@ -3189,6 +3289,35 @@ class MemoryService:
         than one means it is not, and the finding is recorded with
         ``resolvable=False`` and a reason rather than dropped or guessed at.
 
+        AMBIGUITY IS RE-DERIVED HERE, NOT READ OFF THE WIRE, and that is by
+        epsilon's explicit instruction (``_encode_referents``: "AMBIGUITY IS
+        DELIBERATELY NOT THREADED — READ THIS BEFORE WRITING ZETA"). Gamma routes
+        a number claimed by BOTH a bare own-project mention and a
+        foreign-qualified reference in the same content to
+        ``LabelScan.ambiguous`` and EXCLUDES it from ``.referents`` — "recorded,
+        not guessed" — and epsilon's two-key blob carries only ``.source`` and
+        ``.refs``. A consumer reading the decoded set alone therefore cannot tell
+        an AMBIGUOUS endpoint from a genuine conflation: both are simply
+        non-members. Since ``.ambiguous`` is
+        ``scan_content(content, group_id=group_id).ambiguous`` verbatim on every
+        precedence path — a pure function of ``(content, group_id)``, independent
+        of source — this pass recovers the producer's exact set from
+        ``payload['content']``, which ``_execute_graphiti_write`` already holds.
+        An endpoint in that set is still DETECTED and RECORDED (it really is
+        outside the declared set), but never made ``resolvable``: the PRD's
+        boundary row is "treated as undeclared; recorded, not guessed". The
+        veto itself lives in :func:`_candidate_pool` beside its two siblings, so
+        all three read at ONE site (INV-5).
+
+        The re-derivation is a SECOND SCAN SITE, which gamma's own comment flags
+        as the kind of lockstep duplication canonical_labels exists to prevent.
+        Carrying ``'ambiguous'`` as a third wire key is the better long-term
+        shape and is epsilon's filed follow-up; it is not done here because it
+        would widen a frozen contract every test in
+        tests/test_referent_queue_threading.py pins. Scanned ONCE per episode,
+        after the edgeless early-out, so the clean path pays for it only when
+        there is something to check.
+
         An EMPTY *referents* makes the whole pass a no-op, honouring the contract
         ``resolve_referents`` publishes in its own docstring ("an EMPTY
         ``.referents`` carries nothing to test membership against, so a downstream
@@ -3203,6 +3332,15 @@ class MemoryService:
             group_id: The project graph this episode was written to.
             referents: The referent set leaf epsilon decoded off the queue
                 payload — what this write DECLARED itself to be about.
+            content: The episode body, threaded from ``payload['content']``, so
+                this pass can RE-DERIVE the producer's ambiguity set (see the
+                AMBIGUITY paragraph above). Defaults to ``''`` — no content, no
+                ambiguity — which is the pre-threading behaviour exactly.
+            referent_source: The ``ReferentSource`` leaf epsilon decoded
+                alongside *referents*, one of :data:`REFERENT_SOURCES`. Read only
+                by :func:`_candidate_pool`, to decide whether the
+                whole-declared-set fallback is licensed. Defaults to
+                ``'derived'``, the source on which that rule is unchanged.
 
         Returns:
             A :class:`ReferentStats` recording what was walked and every finding.
@@ -3223,6 +3361,22 @@ class MemoryService:
         )
         if not edges:
             return stats
+
+        # The producer's ambiguity set, re-derived from the episode body — see
+        # the AMBIGUITY paragraph above for why it is re-derived rather than read
+        # off the wire. THROUGH `local_referent`, for the same reason the
+        # endpoint parse below is: `scan_content` preserves the qualifier it
+        # read, so a self-qualified ambiguous mention ('dark_factory:2500') would
+        # otherwise compare unequal to the locally-classified endpoint referent
+        # and the veto would silently miss.
+        #
+        # PERMISSIVE mode (no `known_project_ids`), matching gamma's own choice —
+        # the producer scanned in that mode too, and this must recover the
+        # producer's set, not a differently-parameterized one.
+        ambiguous = frozenset(
+            local_referent(ref, group_id=group_id)
+            for ref in scan_content(content, group_id=group_id).ambiguous
+        ) if content else frozenset()
 
         # The episode's own node names, which is all the detection needs — see
         # the parse_node_name invariance note above. Same defensive
@@ -3379,6 +3533,8 @@ class MemoryService:
                     cited=cited,
                     endpoint=endpoint_referent,
                     other_endpoint=other_referent,
+                    ambiguous=ambiguous,
+                    source=referent_source,
                 )
                 resolvable = len(candidates) == 1
                 stats.findings.append(ReferentFinding(
@@ -3396,10 +3552,13 @@ class MemoryService:
                         pool=_candidate_pool(
                             referents=referent_set, cited=cited,
                             endpoint=endpoint_referent,
+                            ambiguous=ambiguous, source=referent_source,
                         ),
                         cited=cited,
                         endpoint=endpoint_referent,
                         other_endpoint=other_referent,
+                        ambiguous=ambiguous,
+                        source=referent_source,
                     ),
                 ))
 
@@ -3480,7 +3639,8 @@ class MemoryService:
             return None
         return rows[0]['uuid'] if len(rows) == 1 else None
     async def _reconcile_episode_identity(
-        self, result: Any, *, group_id: str, referents: ReferentSet = ()
+        self, result: Any, *, group_id: str, referents: ReferentSet = (),
+        content: str = '', referent_source: str = 'derived',
     ) -> ReconcileStats:
         """Fold the seven post-write identity/verification sweeps into one call.
 
@@ -3603,6 +3763,7 @@ class MemoryService:
             '_verify_episode_referents',
             self._verify_episode_referents(
                 result, group_id=group_id, referents=referents,
+                content=content, referent_source=referent_source,
             ),
             ReferentStats(),
         )
@@ -3773,6 +3934,16 @@ class MemoryService:
             )
             reconcile_stats = await self._reconcile_episode_identity(
                 result, group_id=payload['group_id'], referents=referents,
+                # BOTH halves of what zeta needs beyond the decoded set:
+                # `content` so it can re-derive the producer's ambiguity set
+                # (epsilon drops `.ambiguous` from the wire on purpose), and
+                # `referent_source` so an ambient `metadata['task_id']`
+                # declaration is never mistaken for evidence about which node an
+                # edge belongs on. The FULL content, not the 200-char journal
+                # excerpt above -- a truncated body would silently lose the
+                # second half of an ambiguity pair.
+                content=payload['content'],
+                referent_source=referent_source,
             )
             logger.debug(
                 'Reconciled episode identity for group_id=%r: %r',

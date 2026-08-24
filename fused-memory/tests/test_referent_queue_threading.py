@@ -1120,10 +1120,16 @@ class TestExecuteGraphitiWriteHandsReferentsToZeta:
         lock = service.graphiti._identity_lock_for('test')
         observed = {}
 
-        async def _probe(result, *, group_id, referents):
+        async def _probe(result, *, group_id, referents, content, referent_source):
             observed['locked'] = lock.locked()
             observed['same_lock'] = service.graphiti._identity_lock_for(group_id) is lock
             observed['referents'] = referents
+            # zeta re-derives the producer's ambiguity set from the FULL episode
+            # body, and reads the source to decide whether the whole-declared-set
+            # fallback is licensed -- both must reach it through this same locked
+            # call, not a second unlocked one.
+            observed['content'] = content
+            observed['referent_source'] = referent_source
             return {}
 
         service._reconcile_episode_identity = AsyncMock(side_effect=_probe)
@@ -1136,4 +1142,8 @@ class TestExecuteGraphitiWriteHandsReferentsToZeta:
         assert observed['locked'] is True
         assert observed['same_lock'] is True
         assert observed['referents'] == (Referent(number='3127'),)
+        # The FULL body, not the 200-char journal excerpt: a truncated content
+        # would silently lose the second half of an ambiguity pair.
+        assert observed['content'] == 'test content'
+        assert observed['referent_source'] == 'derived'
         assert lock.locked() is False, 'the lock must be released on return'

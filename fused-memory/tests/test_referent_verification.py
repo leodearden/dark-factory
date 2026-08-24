@@ -1027,6 +1027,7 @@ class TestCandidateTargetSelection:
             cited=frozenset({Referent(number='3075')}),
             endpoint=Referent(number='3074'),
             other_endpoint=None,
+            ambiguous=frozenset(), source='derived',
         ) == (Referent(number='3075'),)
 
     def test_it_falls_back_to_the_declared_set_when_the_intersection_is_empty(self):
@@ -1039,6 +1040,7 @@ class TestCandidateTargetSelection:
             cited=frozenset({Referent(number='77')}),
             endpoint=Referent(number='99'),
             other_endpoint=None,
+            ambiguous=frozenset(), source='derived',
         ) == (Referent(number='10'),)
 
     def test_the_other_endpoint_is_subtracted_so_no_repair_forms_a_self_loop(self):
@@ -1049,6 +1051,7 @@ class TestCandidateTargetSelection:
             cited=frozenset({Referent(number='2519')}),
             endpoint=Referent(number='2520'),
             other_endpoint=Referent(number='2519'),
+            ambiguous=frozenset(), source='derived',
         ) == ()
 
     def test_the_order_is_deterministic_and_not_frozenset_iteration_order(self):
@@ -1062,13 +1065,16 @@ class TestCandidateTargetSelection:
         })
         first = _candidate_targets(referents=refs, cited=frozenset(),
                                    endpoint=Referent(number='99'),
-                                   other_endpoint=None)
+                                   other_endpoint=None,
+                                   ambiguous=frozenset(), source='derived')
 
         assert first == tuple(sorted(first, key=lambda r: (r.kind, r.project_id,
                                                            r.number)))
         assert _candidate_targets(referents=refs, cited=frozenset(),
                                   endpoint=Referent(number='99'),
-                                  other_endpoint=None) == first
+                                  other_endpoint=None,
+                                  ambiguous=frozenset(),
+                                  source='derived') == first
 
     def test_the_flagged_endpoint_is_subtracted_so_no_repair_targets_the_node_it_is_already_on(self):
         """A "repair" onto the node the edge is ALREADY attached to is not a
@@ -1091,6 +1097,7 @@ class TestCandidateTargetSelection:
             cited=frozenset({Referent(number='77')}),
             endpoint=Referent(number='3074'),
             other_endpoint=None,
+            ambiguous=frozenset(), source='derived',
         ) == ()
 
     def test_both_endpoints_are_subtracted_together(self):
@@ -1102,6 +1109,7 @@ class TestCandidateTargetSelection:
             cited=frozenset(),
             endpoint=Referent(number='3074'),
             other_endpoint=Referent(number='3075'),
+            ambiguous=frozenset(), source='derived',
         ) == ()
 
     def test_the_membership_arm_is_unaffected_by_the_endpoint_subtraction(self):
@@ -1115,6 +1123,7 @@ class TestCandidateTargetSelection:
             cited=frozenset(),
             endpoint=Referent(number='99'),
             other_endpoint=None,
+            ambiguous=frozenset(), source='derived',
         ) == (Referent(number='10'), Referent(number='11'))
 
 
@@ -1136,6 +1145,7 @@ class TestCandidateTargetSelection:
             cited=frozenset({Referent(number='2500')}),
             endpoint=Referent(number='2500'),
             other_endpoint=None,
+            ambiguous=frozenset(), source='derived',
         ) == ()
 
     def test_corroboration_outranks_a_non_empty_intersection(self):
@@ -1162,6 +1172,7 @@ class TestCandidateTargetSelection:
             cited=frozenset({Referent(number='2500'), Referent(number='3668')}),
             endpoint=Referent(number='2500'),
             other_endpoint=None,
+            ambiguous=frozenset(), source='derived',
         ) == ()
 
     def test_the_guard_cannot_fire_on_the_pairing_arm_so_mode_iii_still_resolves(self):
@@ -1179,6 +1190,7 @@ class TestCandidateTargetSelection:
             cited=frozenset({Referent(number='3075')}),
             endpoint=Referent(number='3074'),
             other_endpoint=None,
+            ambiguous=frozenset(), source='derived',
         ) == (Referent(number='3075'),)
 
 
@@ -1198,6 +1210,7 @@ class TestUnresolvableReason:
             pool=frozenset({Referent(number='10'), Referent(number='11')}),
             endpoint=Referent(number='99'),
             other_endpoint=None,
+            ambiguous=frozenset(), source='derived',
         )
 
         assert 'Task 10' in reason and 'Task 11' in reason
@@ -1213,6 +1226,7 @@ class TestUnresolvableReason:
             pool=frozenset({Referent(number='3074')}),
             endpoint=Referent(number='3074'),
             other_endpoint=None,
+            ambiguous=frozenset(), source='derived',
         )
 
         assert 'Task 3074' in reason
@@ -1229,6 +1243,7 @@ class TestUnresolvableReason:
             pool=frozenset({Referent(number='2519')}),
             endpoint=Referent(number='2520'),
             other_endpoint=Referent(number='2519'),
+            ambiguous=frozenset(), source='derived',
         )
 
         assert 'Task 2519' in reason
@@ -1240,11 +1255,13 @@ class TestUnresolvableReason:
         already_attached = _unresolvable_reason(
             (), cited=frozenset(), pool=frozenset({Referent(number='3074')}),
             endpoint=Referent(number='3074'), other_endpoint=None,
+            ambiguous=frozenset(), source='derived',
         )
         self_loop = _unresolvable_reason(
             (), cited=frozenset(), pool=frozenset({Referent(number='2519')}),
             endpoint=Referent(number='2520'),
             other_endpoint=Referent(number='2519'),
+            ambiguous=frozenset(), source='derived',
         )
 
         assert already_attached != self_loop
@@ -1261,6 +1278,7 @@ class TestUnresolvableReason:
             pool=frozenset({Referent(number='3074'), Referent(number='3075')}),
             endpoint=Referent(number='3074'),
             other_endpoint=Referent(number='3075'),
+            ambiguous=frozenset(), source='derived',
         )
 
         assert 'already' in reason
@@ -1278,6 +1296,7 @@ class TestUnresolvableReason:
             pool=frozenset(),
             endpoint=Referent(number='2500'),
             other_endpoint=Referent(number='3668'),
+            ambiguous=frozenset(), source='derived',
         )
 
         assert 'Task 2500' in reason
@@ -1390,8 +1409,11 @@ class TestCorroboratedEndpointIsNeverRepointed:
         """The guard is narrow: it fires only when the fact cites the ENDPOINT.
 
         Same referent set, same arm — but the fact names a DIFFERENT task than
-        the node the edge landed on, so the declared-set fallback still supplies
-        the repair target. This is the five-PRD-case signature.
+        the node the edge landed on, so on a ``'derived'`` declaration the
+        declared-set fallback still supplies the repair target. This is the
+        five-PRD-case signature. The ``'metadata'`` counterpart, where the
+        fallback is vetoed instead, is
+        :class:`TestTheMetadataSourceVetoesTheDeclaredSetFallback`.
         """
         result = _episode(
             edges=[_edge('e1', fact='Task 2500 was completed by the merge worker',
@@ -1402,11 +1424,187 @@ class TestCorroboratedEndpointIsNeverRepointed:
 
         stats = await service._verify_episode_referents(
             result, group_id='dark_factory', referents=(Referent(number='3668'),),
+            referent_source='derived',
         )
 
         assert len(stats.findings) == 1
         assert stats.findings[0].resolvable is True
         assert stats.findings[0].intended_referent == Referent(number='3668')
+
+
+class TestTheMetadataSourceVetoesTheDeclaredSetFallback:
+    """PRD: an ambient ``metadata['task_id']`` declaration is not evidence
+    about which node any particular edge belongs on.
+
+    ``resolve_referents`` ranks ``metadata['task_id']`` ABOVE the content-derived
+    scan and names the resulting mismatch as deliberately NOT a conflict ("An
+    agent working on task 3668 legitimately writes memories about Task 2500").
+    The corroboration guard closes only the subset of that shape where the fact
+    happens to NAME the endpoint; an LLM paraphrase restating no task number at
+    all is the routine extraction outcome, and on it the guard cannot fire.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_paraphrased_fact_on_a_metadata_write_is_recorded_not_repaired(
+        self, service,
+    ):
+        """The dominant legitimate write shape must NOT become a repair.
+
+        Agent dispatched on task 3668 writes about Task 2500; the extraction
+        lands the edge (correctly) on the Task 2500 node with a paraphrased fact
+        naming no number. Membership fires — 2500 is not declared — but there is
+        nothing to repoint TO, so the finding is recorded with a reason.
+        """
+        result = _episode(
+            edges=[_edge('e1', fact='the merge worker completed it',
+                         source='n-2500', target='n-worker')],
+            nodes=[MockNode(name='Task 2500', uuid='n-2500'),
+                   MockNode(name='merge worker', uuid='n-worker')],
+        )
+
+        stats = await service._verify_episode_referents(
+            result, group_id='dark_factory',
+            referents=(Referent(number='3668'),),
+            content='Task 2500 was completed by the merge worker',
+            referent_source='metadata',
+        )
+
+        assert len(stats.findings) == 1
+        finding = stats.findings[0]
+        assert finding.check == 'set-membership'
+        assert finding.resolvable is False
+        assert finding.intended_referent is None
+        assert 'ambient' in finding.reason and 'recorded, not repaired' in finding.reason
+        # No node lookup is issued for an unresolvable finding.
+        service.graphiti.get_nodes_by_exact_name.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_fact_citing_a_declared_referent_still_resolves_on_metadata(
+        self, service,
+    ):
+        """The veto suppresses only the whole-declared-set FALLBACK.
+
+        ``cited & referents`` is per-EDGE evidence — the fact itself names a
+        declared referent — and survives on every source.
+        """
+        result = _episode(
+            edges=[_edge('e1', fact='Task 3668 superseded the earlier plan',
+                         source='n-2500', target='n-plan')],
+            nodes=[MockNode(name='Task 2500', uuid='n-2500'),
+                   MockNode(name='earlier plan', uuid='n-plan')],
+        )
+
+        stats = await service._verify_episode_referents(
+            result, group_id='dark_factory',
+            referents=(Referent(number='3668'),),
+            referent_source='metadata',
+        )
+
+        assert len(stats.findings) == 1
+        assert stats.findings[0].resolvable is True
+        assert stats.findings[0].intended_referent == Referent(number='3668')
+
+
+class TestTheAmbiguousScanBoundaryRow:
+    """PRD boundary row: "Ambiguous scan | ref routed to ``.ambiguous``;
+    treated as undeclared; recorded, not guessed".
+
+    Leaf epsilon drops ``.ambiguous`` from the wire on purpose, so zeta
+    RE-DERIVES it from ``content``; without that, an ambiguous endpoint is
+    indistinguishable from a genuine conflation and gets a destructive repair
+    instruction instead of being recorded and left alone.
+    """
+
+    @pytest.mark.asyncio
+    async def test_an_ambiguous_endpoint_is_recorded_but_never_resolvable(
+        self, service,
+    ):
+        content = (
+            'Task 3127 was reconciled; see reify:3127 for the mirror. '
+            'Task 3200 tracks it.'
+        )
+        result = _episode(
+            edges=[_edge('e1', fact='the mirror was reconciled',
+                         source='n-3127', target='n-mirror')],
+            nodes=[MockNode(name='Task 3127', uuid='n-3127'),
+                   MockNode(name='mirror', uuid='n-mirror')],
+        )
+
+        stats = await service._verify_episode_referents(
+            result, group_id='dark_factory',
+            referents=(Referent(number='3200'),),
+            content=content,
+            referent_source='derived',
+        )
+
+        assert len(stats.findings) == 1
+        finding = stats.findings[0]
+        assert finding.check == 'set-membership'
+        assert finding.endpoint_referent == Referent(number='3127')
+        assert finding.resolvable is False
+        assert finding.intended_referent is None
+        assert 'AMBIGUOUS' in finding.reason
+        assert 'recorded, not guessed at' in finding.reason
+        service.graphiti.get_nodes_by_exact_name.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_self_qualified_ambiguous_spelling_still_vetoes(self, service):
+        """The ambiguity set goes through `local_referent` like the endpoint
+        parse does, so a self-qualified endpoint node name compares equal to the
+        locally-classified ambiguous mention rather than sneaking past the veto.
+        """
+        content = (
+            'Task 3127 was reconciled; see reify:3127 for the mirror. '
+            'Task 3200 tracks it.'
+        )
+        result = _episode(
+            edges=[_edge('e1', fact='the mirror was reconciled',
+                         source='n-3127', target='n-mirror')],
+            nodes=[MockNode(name='dark_factory:3127', uuid='n-3127'),
+                   MockNode(name='mirror', uuid='n-mirror')],
+        )
+
+        stats = await service._verify_episode_referents(
+            result, group_id='dark_factory',
+            referents=(Referent(number='3200'),),
+            content=content,
+            referent_source='derived',
+        )
+
+        assert len(stats.findings) == 1
+        assert stats.findings[0].resolvable is False
+        assert 'AMBIGUOUS' in stats.findings[0].reason
+
+    @pytest.mark.asyncio
+    async def test_an_unambiguous_endpoint_on_the_same_content_still_resolves(
+        self, service,
+    ):
+        """The veto is NARROW: it fires only for the contested number.
+
+        Same content, same declaration — but the edge landed on Task 3129, which
+        the content never contested, so the row remains a repairable conflation.
+        """
+        content = (
+            'Task 3127 was reconciled; see reify:3127 for the mirror. '
+            'Task 3200 tracks it.'
+        )
+        result = _episode(
+            edges=[_edge('e1', fact='the deploy pipeline was retried',
+                         source='n-3129', target='n-x')],
+            nodes=[MockNode(name='Task 3129', uuid='n-3129'),
+                   MockNode(name='deploy pipeline', uuid='n-x')],
+        )
+
+        stats = await service._verify_episode_referents(
+            result, group_id='dark_factory',
+            referents=(Referent(number='3200'),),
+            content=content,
+            referent_source='derived',
+        )
+
+        assert len(stats.findings) == 1
+        assert stats.findings[0].resolvable is True
+        assert stats.findings[0].intended_referent == Referent(number='3200')
 
 
 def _rows(*uuids) -> list[dict]:
