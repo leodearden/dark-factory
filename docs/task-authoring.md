@@ -512,6 +512,24 @@ token (`migration`, `architecture`, `integration test`, `design ... new`,
 **Hard escape:** `metadata.force_full_path = true` always forces the full
 architect path regardless of `complexity`.
 
+### `execution_class` routes to a HUMAN — it is not "non-code work"
+
+`metadata.execution_class` answers **who executes the task at dispatch**, not
+what kind of edit it is. `'operational'` (and `'decision'`) are converted **at
+submit** by `TaskInterceptor._inject_deterministic_pure_gate` into
+`task_kind='deterministic'` + `always_escalates=True` — a pure gate whose only
+dispatch action is a born-at-L2 escalation **to a human**. Human attention is
+the bottleneck; use these values only for work that genuinely requires an
+operator (a ruling, an action no agent can take).
+
+**A docs/comments/rename edit is agent work**: file it `task_kind='normal'` +
+`metadata.complexity='simple'` (the fast path above — its stated scope names
+docs edits). This mistake — declaring a mechanical docs leaf `'operational'`
+because it "isn't code" — has been made by multiple independent sessions
+(ruled by Leo 2026-08-24; tasks 4626/4671/4675/4680 were retyped out of it).
+The conversion is currently **silent** in the `submit_task` response; a
+submit-time notice + metadata provenance stamp is filed as its own task.
+
 ---
 
 ## 5. Deterministic tasks (`task_kind='deterministic'`)
@@ -1079,6 +1097,8 @@ make it a broader vocabulary decision (bless / promote to a typed field /
 retire) than a single-task cleanup should settle. Originally recorded as
 Finding 5 of the toolcall-markup-containment capability manifest. The
 count is still climbing — 253 at that PRD's decompose, 272 here.
+**Semantics** (what the key actually does at submit): §4's
+"`execution_class` routes to a HUMAN" subsection.
 
 **The `x_` sweep** was scoped to task 3083 alone, not the corpus, because
 a ~30-task metadata rewrite has a very different blast radius from one
