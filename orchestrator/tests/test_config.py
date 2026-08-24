@@ -2154,6 +2154,140 @@ class TestParkBackfillConfig:
         )
 
 
+class TestTransientRequeueBackoffConfig:
+    """The two jittered-backoff knobs (task 3317 / PRD contract C3).
+
+    ``envelope(n) = min(cap, base * 2**(n-1))`` with equal jitter
+    ``U(envelope/2, envelope)``, applied ONLY to transient-classified
+    requeues.  Genuine requeues keep the flat ``requeue_cooldown_secs``.
+    """
+
+    def test_backoff_base_default_is_thirty_seconds(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        assert OrchestratorConfig().transient_requeue_backoff_base_secs == 30.0
+
+    def test_backoff_cap_default_is_fifteen_minutes(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        assert OrchestratorConfig().transient_requeue_backoff_cap_secs == 900.0
+
+    def test_both_knobs_are_floats(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        config = OrchestratorConfig()
+        assert isinstance(config.transient_requeue_backoff_base_secs, float)
+        assert isinstance(config.transient_requeue_backoff_cap_secs, float)
+
+    @pytest.mark.parametrize('field', [
+        'transient_requeue_backoff_base_secs',
+        'transient_requeue_backoff_cap_secs',
+    ])
+    @pytest.mark.parametrize('bad', [0.0, -1.0])
+    def test_non_positive_values_rejected(self, field, bad, monkeypatch, tmp_path):
+        """A zero/negative cooldown would reinstate the tight-loop pathology.
+
+        This task exists precisely to remove a hot retry loop (2026-07-29
+        provider outage: 67 starts in one half-hour bucket), so a config that
+        could arm a zero-length cooldown must fail loudly at load rather than
+        silently restore it.
+        """
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        with pytest.raises(ValidationError):
+            OrchestratorConfig(**{field: bad})
+
+    def test_defaults_yaml_carries_both_keys(self, monkeypatch, tmp_path):
+        """The packaged defaults.yaml agrees with the pydantic defaults.
+
+        Loaded through the same entry point the sibling defaults.yaml-parity
+        tests use, so the layering (packaged defaults.yaml -> project yaml ->
+        Field default) is not re-implemented here.
+        """
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        config = OrchestratorConfig()
+        defaults = _load_package_defaults()
+        assert 'transient_requeue_backoff_base_secs' in defaults
+        assert 'transient_requeue_backoff_cap_secs' in defaults
+        assert (
+            config.transient_requeue_backoff_base_secs
+            == defaults['transient_requeue_backoff_base_secs']
+            == 30.0
+        )
+        assert (
+            config.transient_requeue_backoff_cap_secs
+            == defaults['transient_requeue_backoff_cap_secs']
+            == 900.0
+        )
+
+    def test_flat_genuine_requeue_cooldown_is_untouched(self, monkeypatch, tmp_path):
+        """The genuine-requeue lane keeps its flat 30s cooldown.
+
+        The backoff is a transient-only carve-out; a genuine requeue must
+        still arm exactly ``requeue_cooldown_secs``.
+        """
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        assert OrchestratorConfig().requeue_cooldown_secs == 30.0
+
+    @pytest.mark.parametrize('leaf', [
+        'transient_requeue_backoff_base_secs',
+        'transient_requeue_backoff_cap_secs',
+    ])
+    def test_backoff_leaves_are_green_tier_reloadable(self, leaf):
+        """Both knobs are hot-reloadable (green tier; PRD open question 2).
+
+        Retuning the backoff during a live provider outage is exactly when
+        an operator needs it, so a restart-only tier would make the knob
+        useless at the moment it matters.
+        """
+        assert leaf in RELOADABLE_FIELDS, (
+            f"'{leaf}' must be in RELOADABLE_FIELDS (green-tier hot-reloadable, "
+            'in the # Scheduler tuning slice alongside fairness.skip_threshold)'
+        )
+
+    def test_apply_reload_mutates_backoff_knobs_in_place(self, monkeypatch, tmp_path):
+        """apply_reload applies both leaves to the LIVE config object.
+
+        In-place mutation is what makes the green tier work without a reload
+        hook: ``Scheduler.release()`` reads ``self.config.<knob>`` at ARM
+        time, and the Scheduler holds this same object, so the next arming
+        sees the new value.
+        """
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        live = OrchestratorConfig()
+        fresh = OrchestratorConfig(
+            transient_requeue_backoff_base_secs=5.0,
+            transient_requeue_backoff_cap_secs=20.0,
+        )
+        report = apply_reload(live, fresh)
+        assert report['reloaded'] is True
+        assert report['error'] is None
+        assert report['applied'] == {
+            'transient_requeue_backoff_base_secs': {'old': 30.0, 'new': 5.0},
+            'transient_requeue_backoff_cap_secs': {'old': 900.0, 'new': 20.0},
+        }
+        assert report['restart_required'] == {}
+        assert live.transient_requeue_backoff_base_secs == 5.0
+        assert live.transient_requeue_backoff_cap_secs == 20.0
+
+    @pytest.mark.parametrize('leaf', [
+        'transient_requeue_backoff_base_secs',
+        'transient_requeue_backoff_cap_secs',
+    ])
+    def test_reloadable_names_resolve_on_a_default_config(self, leaf, monkeypatch, tmp_path):
+        """Typo gate: each RELOADABLE_FIELDS literal must be a real attribute.
+
+        Mirrors ``test_every_path_resolves_on_default_config`` — a misspelled
+        entry would silently no-op inside diff_config/apply_reload.
+        """
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        assert getattr(OrchestratorConfig(), leaf) > 0.0
+
+
 class TestVerifyInfraRetryConfig:
     """Tests for verify_infra_retry_* config fields (step-5)."""
 
