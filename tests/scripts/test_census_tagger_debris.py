@@ -67,6 +67,7 @@ from census_tagger_debris import (
     ScopeEvent,
     _connect_readonly,
     _module_is_explained_by,
+    _record_to_dict,
     build_report,
     census_project,
     classify_record,
@@ -868,6 +869,51 @@ def test_a_mixed_lock_drops_only_the_sentinel(tmp_path):
     assert events[0].file_count == 1
 
 
+def test_every_scope_event_carries_its_sentinel_stripped_paths(tmp_path):
+    """schema v2: the PATHS are load-bearing, not just the count — the axis-2
+    echo test asks whether a lock's modules are a re-derivation of the record's
+    own metadata.files, which is a question about the paths themselves."""
+    db_path = _make_runs_db(
+        tmp_path,
+        [
+            {
+                "event_type": "lock_acquired",
+                "task_id": 4514,
+                "data": {"modules": ["task-4514", "a/b.py"]},
+            },
+            {"event_type": "set_to_plan", "task_id": 4514, "data": {"files": ["x.py", "y.py"]}},
+            {"event_type": "phase_skipped", "task_id": 4514, "data": {"plan_files": ["p.py"]}},
+        ],
+    )
+    events = load_scope_events(str(db_path), {"4514"})["4514"]
+
+    # The synthetic sentinel is stripped from what the lock RECORDS, not just
+    # from the count — otherwise the echo test would compare against a path
+    # that never existed.
+    assert [event.files for event in events] == [("a/b.py",), ("x.py", "y.py"), ("p.py",)]
+
+
+def test_file_count_can_never_drift_from_the_paths_it_counts(tmp_path):
+    """Two fields describing one list. Derived at the single construction
+    site, and asserted here so a later edit cannot set them independently."""
+    db_path = _make_runs_db(
+        tmp_path,
+        [
+            {
+                "event_type": "lock_acquired",
+                "task_id": 7,
+                "data": {"modules": ["task-7", "a/", "b/"]},
+            },
+            {"event_type": "phase_skipped", "task_id": 7, "data": {"plan_files": ["p.py"]}},
+        ],
+    )
+    events = load_scope_events(str(db_path), {"7"})["7"]
+
+    assert events
+    for event in events:
+        assert event.file_count == len(event.files)
+
+
 @pytest.mark.parametrize(
     ("label", "event"),
     [
@@ -1107,6 +1153,101 @@ def test_a_post_stamp_scope_event_marks_the_record_reconciled(tmp_path):
     assert record.reconciled_by.timestamp == _AFTER
 
 
+def _echo_project(tmp_path, modules, files=("orchestrator/src/orchestrator/scheduler.py",), name="proj"):
+    """A stamped record whose ONLY post-stamp scope event is a lock."""
+    return _make_project(
+        tmp_path,
+        name=name,
+        tasks=[
+            {
+                "id": 5,
+                "status": "pending",
+                "metadata": {"files_tagged_at": _STAMP, "files": list(files)},
+            }
+        ],
+        events=[
+            {
+                "event_type": "lock_acquired",
+                "task_id": 5,
+                "timestamp": _AFTER,
+                "data": {"modules": list(modules)},
+            }
+        ],
+    )
+
+
+def test_a_lock_echoing_the_records_own_files_is_not_reconciliation_end_to_end(tmp_path):
+    """(c) THE STEP-18 UNIT PIN, RE-ASSERTED THROUGH THE REAL LOADERS. A
+    correct classify_record wired up wrongly — metadata_files not threaded from
+    the record — would still pass the unit tests and fail here."""
+    root = _echo_project(tmp_path, modules=["orchestrator/src"])
+    (record,) = census_project(str(root)).records
+
+    assert record.reconciliation == NEVER_RECONCILED
+    assert record.reconciled_by.event_type is None
+    assert record.reconciled_by.fidelity is None
+
+
+def test_a_lock_with_an_unexplained_module_is_lock_reconciled_end_to_end(tmp_path):
+    """(c) The other side of the same wiring: a module the record's own files
+    cannot explain is real evidence, in the weaker class."""
+    root = _echo_project(tmp_path, modules=["orchestrator/src", "shared/"])
+    (record,) = census_project(str(root)).records
+
+    assert record.reconciliation == LOCK_RECONCILED
+    assert record.reconciled_by.event_type == "lock_acquired"
+    assert record.reconciled_by.fidelity == FIDELITY_LOCK_LEVEL
+
+
+def test_the_emitted_row_states_the_fidelity_behind_each_axis(tmp_path):
+    """(b) A consumer joining this artifact must be able to tell a file-level
+    assertion from a lock-level one without re-deriving it from event_type."""
+    root = _make_project(
+        tmp_path,
+        tasks=[
+            {
+                "id": 5,
+                "status": "pending",
+                "metadata": {"files_tagged_at": _STAMP, "files": ["scripts/a.py"]},
+            }
+        ],
+        events=[
+            {
+                "event_type": "lock_acquired",
+                "task_id": 5,
+                "timestamp": _BEFORE,
+                "data": {"modules": ["scripts"]},
+            },
+            {
+                "event_type": "phase_skipped",
+                "task_id": 5,
+                "timestamp": _AFTER,
+                "data": {"plan_files": ["scripts/a.py"]},
+            },
+        ],
+    )
+    (record,) = census_project(str(root)).records
+    row = _record_to_dict(record)
+
+    assert row["reconciled_by"]["fidelity"] == FIDELITY_FILE_LEVEL
+    assert row["preceded_by"]["fidelity"] == FIDELITY_LOCK_LEVEL
+
+
+def test_an_undecided_axis_emits_fidelity_present_and_null(tmp_path):
+    """(b) THE ALL-KEYS-ALWAYS RULE (INV-2). A missing key must never be
+    readable as "not looked" — the null is the measurement."""
+    root = _make_project(
+        tmp_path,
+        tasks=[{"id": 5, "status": "pending", "metadata": {"files_tagged_at": _STAMP}}],
+    )
+    (record,) = census_project(str(root)).records
+    row = _record_to_dict(record)
+
+    for key in ("reconciled_by", "preceded_by"):
+        assert set(row[key]) == {"event_type", "event_id", "timestamp", "fidelity"}
+        assert row[key]["fidelity"] is None
+
+
 def test_project_id_is_the_root_basename_with_underscores(tmp_path):
     """The six corpora spell their ids with underscores where the directory
     uses hyphens (solar-challenge-platform -> solar_challenge_platform). The
@@ -1141,13 +1282,18 @@ def _stamped(task_id, status="pending", files=("a.py",)):
     }
 
 
-def test_schema_version_is_the_first_key_and_is_one(tmp_path):
+def test_schema_version_is_the_first_key_and_is_two(tmp_path):
     """(a) First key, so a reader opening the raw JSON sees the version before
-    anything it would have to interpret under that version."""
+    anything it would have to interpret under that version.
+
+    v2, not v1: axis 2 gained a value and every evidence object gained a key,
+    so a consumer written against v1 must be able to DETECT the change. That is
+    exactly what schema_version is for.
+    """
     report = build_report([_census(tmp_path, tasks=[_stamped(1)])])
 
     assert next(iter(report)) == "schema_version"
-    assert report["schema_version"] == SCHEMA_VERSION == 1
+    assert report["schema_version"] == SCHEMA_VERSION == 2
 
 
 def test_params_says_how_the_artifact_was_produced(tmp_path):
@@ -1185,6 +1331,18 @@ def test_zero_valued_classification_cells_are_present_not_omitted(tmp_path):
     assert block["cells"]["non_terminal|never_reconciled|no_prior_scope"] == 1
     assert block["cells"]["terminal|plan_reconciled|post_wipe_overwrite"] == 0
     assert sum(block["cells"].values()) == block["stamped_records"]
+
+
+def test_every_project_block_carries_a_lock_reconciled_count_even_at_zero(tmp_path):
+    """(d) schema v2 added an axis-2 value. A consumer that reads
+    `reconciliation[lock_reconciled]` must find a 0, not a KeyError, for a
+    project that happens to have none."""
+    report = build_report([_census(tmp_path, tasks=[_stamped(1)])])
+    block = report["projects"]["proj"]
+
+    assert block["reconciliation"][LOCK_RECONCILED] == 0
+    # 2 status classes x 2 wipe signatures = 4 cells mention the new value.
+    assert sum(1 for cell in block["cells"] if LOCK_RECONCILED in cell) == 4
 
 
 def test_a_project_with_no_stamped_records_still_gets_a_full_block(tmp_path):
@@ -1302,6 +1460,36 @@ def test_the_markdown_covers_every_swept_project_including_empty_ones(tmp_path):
     assert "know_live" in markdown
     assert NEVER_RECONCILED in markdown
     assert "census_tagger_debris.py" in markdown
+
+
+def test_the_markdown_gives_each_axis_2_value_its_own_column(tmp_path):
+    """(f) An operator reads the markdown. Three classes collapsed into one
+    "reconciled" column would hide exactly the distinction schema v2 adds."""
+    markdown = render_markdown(build_report([_census(tmp_path, tasks=[_stamped(1)])]))
+    header = next(line for line in markdown.splitlines() if line.startswith("| project |"))
+
+    for label in ("plan reconciled", "lock reconciled", "never reconciled"):
+        assert label in header, header
+
+
+def test_the_markdown_states_that_a_lock_is_derived_from_metadata_files(tmp_path):
+    """(f) THE CAVEAT, in the operator's own terms. Without it a reader takes
+    `lock_reconciled` at face value — which is precisely the v1 defect, moved
+    from the code into the reader's head."""
+    markdown = render_markdown(
+        build_report([_census(tmp_path, tasks=[_stamped(1)])])
+    ).lower()
+
+    # a lock's modules come FROM metadata.files, so it is not independent
+    assert "derived from `metadata.files`" in markdown
+    assert "not an independent scope derivation" in markdown
+    # ...therefore it is the weaker class, and the consumer must choose
+    assert "weaker signal than `plan_reconciled`" in markdown
+    assert "decide for itself" in markdown
+    # ...while plan_reconciled is the genuine article
+    assert "genuine plan-derived assertion" in markdown
+    # ...and a lock_reconciled record may still be carrying the guess
+    assert "may still be carrying the tagger's guess" in markdown
 
 
 def test_rendering_is_deterministic_and_ends_with_one_trailing_newline(tmp_path):
@@ -1656,7 +1844,12 @@ def test_every_record_carries_its_complete_evidence_key_set(artifact):
     deciding event for each axis, with an explicit null where there was none."""
     for record in artifact["records"]:
         for key in ("reconciled_by", "preceded_by"):
-            assert set(record[key]) == {"event_type", "event_id", "timestamp"}, record["task_id"]
+            assert set(record[key]) == {
+                "event_type",
+                "event_id",
+                "timestamp",
+                "fidelity",
+            }, record["task_id"]
         assert record["merge_signature"]
 
 
