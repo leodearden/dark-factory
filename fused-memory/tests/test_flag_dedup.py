@@ -9564,6 +9564,30 @@ class TestNeverTrackedLexiconWidening:
             'never-tracked candidate'
         )
 
+    # ---- (7) structural invariant: every entry retains a negation token ---
+
+    def test_every_lexicon_entry_retains_a_negation_token(self):
+        """(b) STRUCTURAL INVARIANT: every _NEVER_TRACKED_PHRASES entry must
+        contain at least one negation token ('no', 'never', 'not'), so a
+        future append that drops the negation fails at test time instead of
+        silently inverting the filter's meaning — see the negation-flip
+        guard above and the docstring on _NEVER_TRACKED_PHRASES.
+
+        First test in the repo to reference _NEVER_TRACKED_PHRASES directly.
+        """
+        from fused_memory.reconciliation.flag_dedup import _NEVER_TRACKED_PHRASES
+
+        negation_tokens = ('no', 'never', 'not')
+        offenders = [
+            phrase for phrase in _NEVER_TRACKED_PHRASES
+            if not any(token in phrase for token in negation_tokens)
+        ]
+        assert offenders == [], (
+            'Every _NEVER_TRACKED_PHRASES entry must contain a negation '
+            f'token (no/never/not) or it can match the OPPOSITE claim; '
+            f'offending entries: {offenders!r}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # task 4381 amendment pass (review fixes) — the bounded, batched and
