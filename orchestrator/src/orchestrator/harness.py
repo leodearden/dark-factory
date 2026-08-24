@@ -121,6 +121,7 @@ from orchestrator.scheduler import (
     SchedulerCallbacks,
     SetTaskStatusRejected,
     StaleEvidenceRejection,
+    TerminalExitRejection,
 )
 from orchestrator.service_restart import (
     FLEET_DEPLOY_CLOCK_RELPATH,
@@ -6379,6 +6380,135 @@ class Harness:
             suggested_action='investigate_persistence_layer_rejection',
         )
         self._escalation_queue.submit(esc)
+
+    # agent_role for cascade status-write rejection escalations. Doubles as the
+    # dedup key (see _escalate_cascade_status_rejection): one open record per
+    # task for this condition, matched via get_by_task + this exact role.
+    _CASCADE_REJECTION_ROLE: str = 'harness-cascade'
+
+    def _escalate_cascade_status_rejection(
+        self,
+        task_id: str,
+        target_status: str,
+        exc: BaseException,
+        *,
+        resolved_by: str | None,
+    ) -> None:
+        """Surface a refused cascade resume write instead of swallowing it (INV-4).
+
+        ``_cascade_unblock_member`` runs fire-and-forget after an escalation
+        RESOLVES.  If its status write is refused and we only log, the outcome
+        is a permanent SILENT hold: the escalation is already closed so nothing
+        will retry, and the task keeps a status the dispatcher will never pick
+        up.  This filer is the loud half.
+
+        "Retry-then-escalate" resolves to escalate-ONLY here, deliberately:
+        :meth:`Scheduler.set_task_status` already owns the transient retry loop
+        (``fm_retry_backoffs()``) and raises ``SetTaskStatusRejected`` only for
+        NON-transient rejections, so an exception reaching this caller is by
+        construction post-retry and a caller-level re-retry would be dead code.
+
+        Carve-out: a :class:`TerminalExitRejection` whose ``old_status`` is
+        terminal is a legitimately-finished row, not a hold.  Nothing is stuck
+        and nobody needs to investigate, so it is logged at INFO and NOT filed —
+        filing there would be pure noise on a common, benign race.
+
+        Dedup: one open record per task via ``get_by_task(status='pending')``
+        filtered on this class's own ``agent_role``, the same idiom the sentinel
+        escalations above use.  ``make_id`` cannot serve as the guard — it mints
+        a strictly-increasing id per call by design — so a persistently-refusing
+        backend would otherwise file one record per resolved escalation.
+
+        Best-effort and total: a no-op without a queue (bare-Harness unit
+        tests), and every internal failure is contained.  The caller is
+        fire-and-forget, so an exception escaping here would surface only as an
+        unretrieved-task-exception at GC time — i.e. be lost.
+        """
+        if isinstance(exc, TerminalExitRejection) and exc.old_status in TERMINAL_STATUSES:
+            logger.info(
+                'cascade-unblock: resume of task %s to %r refused because the row '
+                'is already %s — legitimately finished out of band, not a hold; '
+                'not escalating',
+                task_id, target_status, exc.old_status,
+            )
+            return
+
+        queue = getattr(self, '_escalation_queue', None)
+        if not queue:        # bare-Harness unit tests / lifecycle tests stay green
+            return
+        try:
+            already = [
+                e for e in queue.get_by_task(task_id, status='pending')
+                if e.agent_role == self._CASCADE_REJECTION_ROLE
+            ]
+            if already:
+                logger.warning(
+                    'cascade-unblock: %s→%s refused again for task %s; escalation '
+                    '%s is already open — not filing a duplicate',
+                    task_id, target_status, task_id, already[0].id,
+                )
+                return
+
+            from escalation.models import Escalation  # noqa: PLC0415
+
+            error_code = getattr(exc, 'error_code', type(exc).__name__)
+            raw = getattr(exc, 'raw', str(exc))
+            esc = Escalation(
+                id=queue.make_id(task_id),
+                task_id=task_id,
+                agent_role=self._CASCADE_REJECTION_ROLE,
+                severity='blocking',
+                level=1,
+                category='cascade_status_rejection',
+                summary=(
+                    f'Cascade resume failed to set task {task_id} to '
+                    f'{target_status!r}'
+                )[:200],
+                detail=(
+                    f'set_task_status({task_id!r}, {target_status!r}) was refused '
+                    f'while resuming the task after an escalation resolved.\n\n'
+                    f'error_code: {error_code}\n'
+                    f'raw: {raw}\n'
+                    f'resolved_by: {resolved_by}\n\n'
+                    f'The resolving escalation is already closed, so NOTHING WILL '
+                    f'RETRY this write — the task is left in whatever status it '
+                    f'held and will not be dispatched. Manual investigation '
+                    f'required: re-drive the row to {target_status!r} once the '
+                    f'rejection cause is cleared.\n\n'
+                    f'Note this rejection is already post-retry — '
+                    f'Scheduler.set_task_status exhausts the transient backoff '
+                    f'loop and raises only for non-transient rejections.'
+                ),
+                suggested_action='investigate_persistence_layer_rejection',
+            )
+            queue.submit(esc)
+            try:
+                if self.event_store:
+                    self.event_store.emit(
+                        EventType.escalation_created,
+                        task_id=task_id,
+                        data={
+                            'escalation_id': esc.id,
+                            'category': esc.category,
+                            'severity': esc.severity,
+                            'level': esc.level,
+                            'reason': 'cascade-status-write-rejected',
+                        },
+                    )
+            except Exception:
+                # Isolated from the outer handler: the record is already filed,
+                # so a failure here is an observability-only miss, never a
+                # "failed to escalate" condition.
+                logger.warning(
+                    'cascade-unblock: escalation %s filed but escalation_created '
+                    'emit failed', esc.id, exc_info=True,
+                )
+        except Exception:
+            logger.error(
+                'cascade-unblock: failed to escalate the refused %s→%s write for '
+                'task %s — the row is stuck with NO open record',
+                task_id, target_status, task_id, exc_info=True,
+            )
 
     # Synthetic task_id for scheduler-pause escalations.  Filename-safe for
     # EscalationQueue.make_id (yields esc-__scheduler__-N); never a real task,
@@ -14664,10 +14794,16 @@ class Harness:
                     '(TOCTOU race or guard): %s',
                     task_id, e,
                 )
-            except Exception:
+                self._escalate_cascade_status_rejection(
+                    task_id, 'pending', e, resolved_by=escalation.resolved_by,
+                )
+            except Exception as e:
                 logger.warning(
                     'cascade-unblock: infra-hold resume failed for %s',
                     task_id, exc_info=True,
+                )
+                self._escalate_cascade_status_rejection(
+                    task_id, 'pending', e, resolved_by=escalation.resolved_by,
                 )
             return
 
@@ -14720,6 +14856,13 @@ class Harness:
             logger.warning(
                 'cascade-unblock: refused to flip %s (TOCTOU race or guard): %s',
                 task_id, e,
+            )
+            # Symmetric with the infra arm above (INV-4): a swallowed rejection
+            # here strands a plain blocked task just as permanently.  The
+            # terminal carve-out lives inside the filer, so the common benign
+            # TOCTOU-to-terminal race stays quiet.
+            self._escalate_cascade_status_rejection(
+                task_id, _resume_target, e, resolved_by=escalation.resolved_by,
             )
 
     def get_merge_halt_status(self) -> dict[str, Any]:
