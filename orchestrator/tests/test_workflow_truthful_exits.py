@@ -81,10 +81,16 @@ def _make_workflow(
 
     sched = scheduler if scheduler is not None else FakeScheduler()
 
+    git_ops = MagicMock()
+    # run()'s terminal cleanup awaits this whenever the machine ends in
+    # DONE/CANCELLED — a bare MagicMock is not awaitable, so the CANCELLED
+    # exits exercised below need a real coroutine here.
+    git_ops.release_lane_for_terminal_task = AsyncMock()
+
     wf = TaskWorkflow(
         assignment=assignment,
         config=config,
-        git_ops=MagicMock(),
+        git_ops=git_ops,
         scheduler=sched,  # type: ignore[arg-type]
         briefing=MagicMock(),
         mcp=MagicMock(),
@@ -366,6 +372,11 @@ async def test_warm_lane_requeue_on_cancelled_row_returns_cancelled(tmp_path: Pa
 
     async def _reject_pending(task_id: str, status: str, **kwargs):
         if status == 'pending':
+            # Faithful double: the server refuses BECAUSE the row is already
+            # 'cancelled', so the observable row must say so too — otherwise
+            # get_status would still report 'in-progress' and run()'s SM-2
+            # exit check would fire on a state production never produces.
+            sched.statuses.setdefault(task_id, []).append('cancelled')
             raise TerminalExitRejection(
                 task_id=task_id, old_status='cancelled',
                 target_status='pending', raw='terminal-exit gate',

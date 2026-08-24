@@ -2965,6 +2965,21 @@ class TaskWorkflow:
                 'Task %s: warm-lane requeue (%s, counts_against_requeue_cap=%s): %s',
                 self.task_id, block_reason, disp.counts_against_requeue_cap, e,
             )
+            # γ3/D6: make the REQUEUED exit TRUTHFUL — re-pend the row BEFORE
+            # returning, so the harness slot `finally` (which nulls the
+            # claimant right after) cannot leave the `(in-progress, NULL
+            # claimant)` strand shape behind for a merely transient capacity
+            # signal.  NOTE this clause is a SIBLING of `except
+            # SetTaskStatusRejected` above, not nested inside it: a rejection
+            # raised here escapes _drive() and run() has no handler for it, so
+            # the write MUST stay locally guarded — which is exactly what
+            # _repend_for_requeue does (it never re-raises).  A non-None
+            # return means the row is terminal and that verdict WINS over the
+            # requeue intent; return it directly without stashing the REQUEUED
+            # report, so run()'s SM-2 exit check sees a consistent pair.
+            repend_outcome = await self._repend_for_requeue()
+            if repend_outcome is not None:
+                return repend_outcome
             # TerminalReport.phase is machine.state — this path never calls
             # _enter_phase, so it is the pre-existing working phase (PLAN,
             # since create_worktree runs before the first _enter_phase call
