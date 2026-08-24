@@ -2970,10 +2970,16 @@ class TaskWorkflow:
             # claimant right after) cannot leave the `(in-progress, NULL
             # claimant)` strand shape behind for a merely transient capacity
             # signal.  NOTE this clause is a SIBLING of `except
-            # SetTaskStatusRejected` above, not nested inside it: a rejection
-            # raised here escapes _drive() and run() has no handler for it, so
-            # the write MUST stay locally guarded — which is exactly what
-            # _repend_for_requeue does (it never re-raises).  A non-None
+            # SetTaskStatusRejected` above, not nested inside it: ANYTHING
+            # raised here escapes _drive() and run() has no handler for it
+            # (run() catches only WorkflowCancelled), which would destroy the
+            # REQUEUED TerminalReport built below and with it the retry-cap
+            # bookkeeping — so the write MUST stay locally guarded.  That is
+            # exactly what _repend_for_requeue delivers: it never re-raises,
+            # including for the bare RuntimeError Scheduler.set_task_status
+            # raises when its transient-retry loop is exhausted (the sole
+            # deliberate exception is WorkflowCancelled, re-raised so CX-1's
+            # single catch site keeps its monopoly).  A non-None
             # return means the row is terminal and that verdict WINS over the
             # requeue intent; return it directly without stashing the REQUEUED
             # report, so run()'s SM-2 exit check sees a consistent pair.
@@ -4387,11 +4393,33 @@ class TaskWorkflow:
           narrowing of that row to ``{PENDING}`` is what will make this case
           loud at ``run()``'s SM-2 check, and that is the correct owner.
 
-        This helper must NEVER re-raise: both call sites sit OUTSIDE
-        ``_drive()``'s ``except SetTaskStatusRejected`` handler (the
-        ``WarmLaneRequeue`` clause is its SIBLING; ``_handle_soft_cancel``
-        runs from ``run()``'s ``except WorkflowCancelled``), so an escaping
-        rejection would leave ``run()`` entirely uncaught.
+        This helper never re-raises, and that is delivered BY CONSTRUCTION
+        (the terminal ``except Exception`` arm), not merely by the rejection
+        taxonomy above.  Both call sites are structurally unable to catch an
+        escape: the ``WarmLaneRequeue`` clause is a SIBLING of ``_drive()``'s
+        ``except SetTaskStatusRejected`` / ``except Exception``, so a raise
+        inside it is not caught by later clauses of the same ``try``; and
+        ``_handle_soft_cancel`` runs from INSIDE ``run()``'s ``except
+        WorkflowCancelled`` handler, while ``run()`` catches nothing else.  So
+        an escape does not merely lose the write — it destroys the
+        ``TerminalReport`` (the harness sees ``report is None``), skipping the
+        ``_apply_retry_cap`` / ``record_requeue`` /
+        ``counts_against_requeue_cap`` bookkeeping entirely, AND leaves the row
+        ``in-progress`` for the slot ``finally`` to strand: strictly worse than
+        the pre-γ3 behaviour this method exists to improve on.  The concrete
+        escape the blanket arm closes is the ``RuntimeError`` family from
+        ``Scheduler.set_task_status``'s exhausted ``fm_retry_backoffs()``
+        transient loop (fused-memory restarting / MCP unreachable) — which is
+        precisely the infra degradation that GENERATES warm-lane requeues.
+
+        That arm deliberately does NOT escalate.  It mirrors the non-terminal
+        rejection arm's policy exactly — log loudly, keep the REQUEUED exit —
+        because the condition it handles is transient infra degradation during
+        a capacity event, so escalating would fire an L1 on every blip; and the
+        row is left in the same state the pre-γ3 code always left it.
+        ``WorkflowCancelled`` is carved out and re-raised: it subclasses
+        ``Exception``, so the blanket arm would otherwise capture the ONE typed
+        cancellation signal CX-1 requires be caught only in ``run()``.
         """
         try:
             await self.scheduler.set_task_status(self.task_id, 'pending')
@@ -4402,6 +4430,31 @@ class TaskWorkflow:
                 'Task %s: re-pend before requeue REJECTED (%s — %s); exiting '
                 'REQUEUED with the row left in-progress',
                 self.task_id, exc.error_code, exc.raw,
+            )
+        except WorkflowCancelled:
+            # Load-bearing, NOT defensive noise: WorkflowCancelled subclasses
+            # Exception (workflow_types.py), so the blanket arm below would
+            # otherwise swallow it and violate CX-1's "raised by
+            # CancellationScope and caught at EXACTLY ONE place —
+            # TaskWorkflow.run()", silently downgrading a cancellation into a
+            # REQUEUED exit.  Do not "simplify" this away.
+            # (asyncio.CancelledError needs no arm: it derives from
+            # BaseException on this repo's >=3.11 floor, so hard-cancel
+            # injection propagates past `except Exception` untouched.)
+            raise
+        except Exception as exc:
+            # The non-rejection escape: Scheduler.set_task_status raises a BARE
+            # RuntimeError once its fm_retry_backoffs() transient loop is
+            # exhausted, and dispatch_tool can surface bare transport errors —
+            # neither is a SetTaskStatusRejected, and NOTHING at either call
+            # site would catch them (see the docstring).  Same policy as the
+            # rejection arm above: loud, but the caller keeps its REQUEUED exit
+            # with the row left in-progress — degraded, and no worse than the
+            # pre-γ3 code that always exited REQUEUED without any write.
+            logger.error(
+                'Task %s: re-pend before requeue FAILED (%r); exiting '
+                'REQUEUED with the row left in-progress',
+                self.task_id, exc,
             )
         return None
 
