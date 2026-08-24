@@ -937,6 +937,93 @@ class TestMem0BackendScrollCollectionPages:
         assert got == points[:2], f'must not yield past the cap; got {len(got)} points'
 
     @pytest.mark.asyncio
+    async def test_a_server_over_return_says_so_instead_of_naming_a_live_offset(self, backend):
+        """The over-return message must not read as a self-contradiction.
+
+        When the server ignores the shrunk request on the FINAL page, the cap
+        fires with ``next_offset=None``.  The truncation is real — points WERE
+        dropped — but describing a ``None`` offset as "still live" reads as
+        nonsense to whoever finds it in a log, so that case names the actual
+        cause instead.
+        """
+        from fused_memory.backends.mem0_client import ScrollPointBudgetExhausted
+
+        points = [self._make_mock_point(f'id-{i}') for i in range(5)]
+        client = _paging_client([(points, None)])
+
+        with (
+            patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=client)),
+            pytest.raises(ScrollPointBudgetExhausted) as excinfo,
+        ):
+            await _drain(backend.scroll_collection_pages('fused_reify', page_size=256, max_points=2))
+
+        message = str(excinfo.value)
+        assert 'still live' not in message, (
+            f'a None offset must not be described as a live cursor; got {message!r}'
+        )
+        assert 'more points than' in message, (
+            f'the message must name the real cause — a server over-return; got {message!r}'
+        )
+        assert 'fused_reify' in message, 'the message must still name the collection'
+        assert '2' in message, 'the message must still name the cap'
+
+    @pytest.mark.asyncio
+    async def test_the_cap_shrinks_each_page_by_what_was_already_yielded(self, backend):
+        """MULTI-PAGE: the remaining budget, not the whole budget, sizes page N.
+
+        Every other cap test terminates on page 1, which leaves the
+        ``- yielded`` term in ``min(page_size, max_points - yielded)``
+        unpinned: a regression to ``min(page_size, max_points)`` would
+        re-request the full budget on every page after the first (over-fetching
+        exactly what the cap exists to avoid) and still pass all of them.
+        """
+        from fused_memory.backends.mem0_client import ScrollPointBudgetExhausted
+
+        points = [self._make_mock_point(f'id-{i}') for i in range(3)]
+        client = _paging_client([(points[:2], 'off-1'), (points[2:], 'off-2')])
+        got: list = []
+
+        with (
+            patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=client)),
+            pytest.raises(ScrollPointBudgetExhausted),
+        ):
+            async for point in backend.scroll_collection_pages(
+                'c', page_size=2, max_points=3
+            ):
+                got.append(point)
+
+        assert got == points, 'all three capped points are yielded before the raise'
+        limits = [call.kwargs.get('limit') for call in client.scroll.await_args_list]
+        assert limits == [2, 1], (
+            'page 2 must ask for only the REMAINING budget (max_points - yielded); '
+            f'got {limits!r}'
+        )
+
+    @pytest.mark.parametrize('max_points', [0, -1])
+    @pytest.mark.asyncio
+    async def test_a_non_positive_points_cap_raises_before_any_scroll(self, backend, max_points):
+        """The backstop for the guard scan_payload_text already has.
+
+        ``max_points=0`` shrinks every page request to ``limit=0``; if the
+        server then hands back an empty page with ``next_offset=None`` the walk
+        ends having yielded nothing and raised nothing — indistinguishable from
+        a genuinely empty collection, which is the silent-clean-sweep failure
+        the sibling ``limit <= 0`` guard exists to prevent.  A negative cap
+        additionally sends a negative ``limit`` down to the client.  This
+        method is public, so it owns the guard rather than trusting the one
+        opt-in caller that happens to pre-validate today.
+        """
+        client = _paging_client([([], None)])
+
+        with (
+            patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=client)),
+            pytest.raises(ValueError, match='strictly positive'),
+        ):
+            await _drain(backend.scroll_collection_pages('c', max_points=max_points))
+
+        client.scroll.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_a_hung_page_request_raises_instead_of_hanging(self, backend):
         """A wedged socket fails loudly rather than hanging a ~30-page scan forever.
 
