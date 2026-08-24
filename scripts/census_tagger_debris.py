@@ -733,14 +733,36 @@ def census_project(project_root: str) -> ProjectCensus:
 # ---------------------------------------------------------------------------
 # The report.
 #
-# SCHEMA_VERSION 1 — the initial shape: schema_version, params, projects
-# (per-project totals plus per-axis and eight-cell counts), records (the
-# COMPLETE population, never truncated), coverage. Bump this and record what
-# changed right here, the way census_memory_metadata.py:446-458 does, so a
-# consumer reading an older artifact can tell what it is looking at.
+# Bump this and record what changed right here, the way
+# census_memory_metadata.py:446-458 does, so a consumer reading an older
+# artifact can tell what it is looking at.
+#
+# v1 — the initial shape: schema_version, params, projects (per-project totals
+#      plus per-axis and eight-cell counts), records (the COMPLETE population,
+#      never truncated), coverage.
+#
+# v2 — THE AXIS-2 CORRECTION. v1's defect in one line: it counted ANY
+#      post-stamp lock_acquired as proof the tagger's guess had been
+#      superseded, but the scheduler derives a lock's module set FROM
+#      metadata.files, so for a never-reconciled record that lock is an echo of
+#      the guess and v1 reported the majority of live victims as repaired.
+#      What changed:
+#        * axis 2 gained a third value, ``lock_reconciled``. Per-project
+#          ``reconciliation`` blocks gain that key and ``cells`` goes 8 -> 12.
+#        * ``plan_reconciled`` NARROWED to genuine plan-derived assertions
+#          (set_to_plan / phase_skipped{plan_files}) — the audit's own lens.
+#        * post-stamp locks are ECHO-FILTERED against the record's own
+#          ``metadata.files``; a surviving one classifies ``lock_reconciled``,
+#          never ``plan_reconciled``.
+#        * every evidence object (``reconciled_by`` / ``preceded_by``) gained
+#          a ``fidelity`` key, present-and-null when the axis is undecided.
+#      DF 3113 P4a and DF 3427 MUST re-read: a record they saw as
+#      plan_reconciled under v1 may be lock_reconciled or never_reconciled
+#      here, and the never_reconciled population is materially larger.
+#      Axis 1, axis 3 and every other key are unchanged.
 # ---------------------------------------------------------------------------
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # The vocabulary, ordered. Iterating THIS rather than the observed data is what
 # makes a zero-valued cell present rather than absent — a missing key must
@@ -923,19 +945,43 @@ def render_markdown(report: dict) -> str:
         "## Classification vocabulary",
         "",
         f"- **status_class** — `{STATUS_TERMINAL}` (status in {{done, cancelled}}) vs `{STATUS_NON_TERMINAL}`.",
-        f"- **reconciliation** — `{RECONCILED}` if a real scope event postdates the stamp",
-        f"  (the tagger's guess was superseded); `{NEVER_RECONCILED}` if none does, meaning the",
-        "  guess is still this record's live scope.",
+        f"- **reconciliation** — `{RECONCILED}` if a genuine plan-derived assertion",
+        "  (a `set_to_plan` or `phase_skipped` event) postdates the stamp, meaning the",
+        f"  tagger's guess was superseded; `{LOCK_RECONCILED}` if only a `lock_acquired`",
+        "  event does, and that lock named at least one module the record's own",
+        f"  `metadata.files` cannot explain; `{NEVER_RECONCILED}` if neither does, meaning",
+        "  the guess is still this record's live scope. Read the caveat below before",
+        f"  treating `{LOCK_RECONCILED}` as repaired.",
         f"- **wipe_signature** — `{POST_WIPE_OVERWRITE}` if an authoritative scope event predates",
         f"  the stamp (the tagger stamped over it); `{NO_PRIOR_SCOPE}` otherwise.",
         "- **merge_signature** — the audit's own `merge_finalized` verdict",
         "  (`audit_wiped_metadata_files.classify_wipe_signature`), carried as correlating",
         "  evidence in the vocabulary both consumers already speak.",
         "",
+        f"### Why `{LOCK_RECONCILED}` is a weaker signal than `{RECONCILED}`",
+        "",
+        "A `lock_acquired` event's module set is **derived from `metadata.files`** by the",
+        "scheduler — `Scheduler._get_modules` computes it as",
+        "`derive_modules(metadata['files'], depth)` — so a lock is",
+        "**not an independent scope derivation**. For a record still carrying the tagger's",
+        "guess, the lock is an ECHO of that guess and proves nothing about it. This census",
+        "therefore discounts any",
+        "post-stamp lock whose modules are fully explained by the record's own",
+        f"`metadata.files`, and reports the rest as `{LOCK_RECONCILED}` rather than folding",
+        f"them into `{RECONCILED}`.",
+        "",
+        f"A record counted `{LOCK_RECONCILED}` **may still be carrying the tagger's guess** as",
+        "its live scope: all that is known is that some lock named a module the guess",
+        f"cannot account for. Only `{RECONCILED}` reflects a genuine plan-derived assertion.",
+        f"A consumer must **decide for itself** whether to treat `{LOCK_RECONCILED}` records",
+        "as repaired — the class is reported separately precisely so that choice is",
+        "available rather than made here.",
+        "",
         "## Per-project counts",
         "",
-        "| project | total tasks | stamped | terminal | non-terminal | reconciled | never reconciled | post-wipe overwrite | event log |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
+        "| project | total tasks | stamped | terminal | non-terminal | plan reconciled "
+        "| lock reconciled | never reconciled | post-wipe overwrite | event log |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
     ]
     for project_id in sorted(projects):
         block = projects[project_id]
@@ -944,6 +990,7 @@ def render_markdown(report: dict) -> str:
             f"| {block['status_class'][STATUS_TERMINAL]} "
             f"| {block['status_class'][STATUS_NON_TERMINAL]} "
             f"| {block['reconciliation'][RECONCILED]} "
+            f"| {block['reconciliation'][LOCK_RECONCILED]} "
             f"| {block['reconciliation'][NEVER_RECONCILED]} "
             f"| {block['wipe_signature'][POST_WIPE_OVERWRITE]} "
             f"| {'read' if block['event_log_read'] else 'UNREADABLE'} |"
@@ -954,8 +1001,14 @@ def render_markdown(report: dict) -> str:
         "## Three-axis cells",
         "",
         "Every cell is emitted even at zero: a missing count must never be readable as",
-        "a zero. The live-victim cell for the repair pipeline is",
-        f"`{STATUS_NON_TERMINAL}|{NEVER_RECONCILED}|{POST_WIPE_OVERWRITE}`.",
+        "a zero. The strict live-victim cell for the repair pipeline is",
+        f"`{STATUS_NON_TERMINAL}|{NEVER_RECONCILED}|{POST_WIPE_OVERWRITE}` — live work whose",
+        "scope was overwritten and never superseded.",
+        "",
+        f"`{STATUS_NON_TERMINAL}|{LOCK_RECONCILED}|{POST_WIPE_OVERWRITE}` is the SECOND cell a",
+        "repair must consider: those records may still be carrying the guess (see the",
+        "caveat above). Whether they belong in the population is the consumer's call —",
+        "which is why the two cells are counted apart rather than merged.",
         "",
         "| project | cell | count |",
         "| --- | --- | ---: |",
