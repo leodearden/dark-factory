@@ -18,12 +18,44 @@ that boundary row 4 pins.
 from __future__ import annotations
 
 import json
+import sys
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.scheduler import Scheduler, transient_requeue_cooldown
+
+# ``fused_memory`` is a SIBLING workspace member, not an orchestrator
+# dependency, so its importability here is an environment accident rather than
+# a guarantee.  The verify lane runs ``cd orchestrator && uv run pytest``,
+# which makes rootdir the SUBPROJECT — the repo-root conftest.py that
+# sys.path-injects every subproject's src is never loaded (same reasoning as
+# the git-isolation note in orchestrator/tests/conftest.py).  That leaves the
+# uv workspace's editable-install .pth as the only route in, and .pth files
+# are read ONCE, at interpreter startup, by whichever member uv last synced
+# for.  A worker that starts before such a sync never sees it: that is how
+# ``TestBoundaryRow4ViaGetSchedulerState`` below failed with
+# ``ModuleNotFoundError: No module named 'fused_memory'`` across four xdist
+# workers in a full-suite run while passing in isolation.
+#
+# APPEND, never insert(0, ...).  This directory contributes only the
+# ``fused_memory`` package, so appending cannot shadow anything the conftest's
+# src insertions already resolve.  When the editable install IS present,
+# sys.path already holds this exact string and the guard no-ops.
+#
+# A bare path append is sufficient — no fused-memory third-party dependency
+# needs to be installed: ``fused_memory.mcp_tools.scheduler_state`` imports
+# stdlib only (json, logging, time, pathlib) and both parent ``__init__``s are
+# bare docstrings.  Deliberately NOT ``pytest.importorskip`` (the idiom in
+# test_reopen_sticks_e2e.py, which needs fused-memory's real backends): this
+# class is the only gate driving boundary row 4 through the genuine product
+# read path, and skipping it exactly when the venv is mid-sync would make that
+# gate vacuous in the lane it is meant to protect.
+_FUSED_MEMORY_SRC = Path(__file__).resolve().parents[2] / 'fused-memory' / 'src'
+if _FUSED_MEMORY_SRC.is_dir() and str(_FUSED_MEMORY_SRC) not in sys.path:
+    sys.path.append(str(_FUSED_MEMORY_SRC))
 
 # Contract C3 defaults, and the closed-form envelope they produce.  Every
 # assertion below is exact arithmetic — no numeric tolerance guesswork.
