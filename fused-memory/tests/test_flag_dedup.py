@@ -9368,16 +9368,19 @@ class TestNeverTrackedLexiconWidening:
             ),
         }
 
-    def _make_covering_task(self) -> dict:
+    def _make_covering_task(self, status: str = 'pending') -> dict:
         """A task whose title+description covers _DROP_DESCRIPTION's terms.
 
         Mirrors TestFilterAlreadyTrackedSystemicPatternsCrossProject's
         _make_covering_task shape, adapted to the remediation-payload prose
         (MEASURED: 10 task terms, 8 overlap with the 9 finding terms above).
+        *status* is parameterised (default 'pending') so the
+        permanent-silencing guard below can reuse this same covering-task
+        prose with status='cancelled'.
         """
         return {
             'id': '3839',
-            'status': 'pending',
+            'status': status,
             'title': 'Wire live workflow signals into the remediation payload',
             'description': (
                 'The remediation payload omits the live workflow signals '
@@ -9427,6 +9430,138 @@ class TestNeverTrackedLexiconWidening:
         assert result == [], (
             'A non-cancelled covering task in a foreign known project must '
             f'DROP the widened "no fix task has been filed" finding; got {result!r}'
+        )
+
+    # ---- (3) permanent-silencing guard: cancelled-only coverage keeps -----
+
+    @pytest.mark.asyncio
+    async def test_cancelled_only_covering_task_does_not_drop_the_flag(self):
+        """(a) PERMANENT-SILENCING GUARD: a CANCELLED-only covering task must
+        NOT drop the widened finding — mirrors
+        TestFilterAlreadyTrackedSystemicPatternsCrossProject's
+        test_cancelled_task_returned_by_backend_does_not_drop_the_flag. A
+        cancelled task means the work was explicitly abandoned, so letting
+        it suppress would silence this complaint forever.
+        """
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_already_tracked_systemic_patterns,
+        )
+
+        flag = self._make_flag(self._DROP_DESCRIPTION)
+        taskmaster = AsyncMock()
+        taskmaster.get_tasks = AsyncMock(return_value={
+            'tasks': [self._make_covering_task(status='cancelled')],
+        })
+
+        result = await filter_already_tracked_systemic_patterns(
+            taskmaster, {'know_live': '/kl'}, [flag],
+        )
+
+        assert result == [flag], (
+            'A CANCELLED-only covering task must NOT drop the widened '
+            f'"no fix task has been filed" finding; got {result!r}'
+        )
+
+    # ---- (4) precision-floor guard: below-coverage near-miss keeps --------
+
+    #: MEASURED near-miss KEEP fixture (task 4711 plan): 13 significant
+    #: terms, coverage 0.692 (< the default match_coverage=0.75), precision
+    #: 0.750 — a genuine near-miss rather than a trivially-unrelated task at
+    #: coverage 0.0, so this test actually exercises the match_coverage
+    #: floor rather than passing vacuously.
+    _NEAR_MISS_DESCRIPTION = (
+        'This recurring finding has been reconfirmed across multiple '
+        'cycles but no fix task has been filed: the remediation payload '
+        'omits the live workflow signals section.'
+    )
+
+    def _make_near_miss_covering_task(self) -> dict:
+        """A task that covers most, but not enough, of _NEAR_MISS_DESCRIPTION.
+
+        MEASURED: 12 task terms, 9 overlap with the 13 finding terms above
+        -> coverage 0.692 (below match_coverage=0.75), precision 0.750.
+        """
+        return {
+            'id': '3839',
+            'status': 'pending',
+            'title': 'Wire live workflow signals into the remediation payload',
+            'description': (
+                "The remediation payload omits its live-workflow signals "
+                "section; wire the live workflow signals through so the "
+                "reconfirmed recurring finding is addressed."
+            ),
+        }
+
+    @pytest.mark.asyncio
+    async def test_below_coverage_near_miss_keeps_the_flag(self):
+        """(b) PRECISION-FLOOR GUARD: a near-miss covering task below
+        match_coverage must KEEP the widened finding, not drop it."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_already_tracked_systemic_patterns,
+        )
+
+        flag = self._make_flag(self._NEAR_MISS_DESCRIPTION)
+        taskmaster = AsyncMock()
+        taskmaster.get_tasks = AsyncMock(return_value={
+            'tasks': [self._make_near_miss_covering_task()],
+        })
+
+        result = await filter_already_tracked_systemic_patterns(
+            taskmaster, {'know_live': '/kl'}, [flag],
+        )
+
+        assert result == [flag], (
+            'A covering task below match_coverage must KEEP the widened '
+            f'finding, not drop it; got {result!r}'
+        )
+
+    # ---- (5) negation-flip guard -------------------------------------------
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            'A fix task has been filed for this recurring finding (dark_factory 3839).',
+            'A follow-up task has been filed and is pending.',
+            'Task 3833 has been filed to cover this pattern.',
+        ],
+        ids=[
+            'fix-task-has-been-filed',
+            'follow-up-task-has-been-filed',
+            'task-has-been-filed',
+        ],
+    )
+    def test_negation_flip_text_is_not_a_candidate(self, text):
+        """(c) NEGATION-FLIP GUARD: text announcing a task DOES exist must
+        NOT be classified as never-tracked language — a dropped negation
+        token would match the OPPOSITE claim and permanently silence a
+        finding whose complaint is already answered."""
+        from fused_memory.reconciliation.flag_dedup import _is_systemic_pattern_candidate
+
+        flag = self._make_flag(text)
+        assert _is_systemic_pattern_candidate(flag) is False, (
+            f'Expected {text!r} (a task DOES exist) to NOT be a never-tracked candidate'
+        )
+
+    # ---- (6) generic-term guard ---------------------------------------------
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            'The git working tree has untracked files that the operator decision path ignores.',
+            'This flag has no task_id attached, so Stage 2 cannot route it.',
+        ],
+        ids=['git-untracked-files', 'no-task-id-attached'],
+    )
+    def test_generic_term_text_is_not_a_candidate(self, text):
+        """(d) GENERIC-TERM GUARD: unrelated systemic findings that happen to
+        contain a bare generic term ('untracked', 'no task') must NOT be
+        classified as never-tracked language."""
+        from fused_memory.reconciliation.flag_dedup import _is_systemic_pattern_candidate
+
+        flag = self._make_flag(text)
+        assert _is_systemic_pattern_candidate(flag) is False, (
+            f'Expected {text!r} (an unrelated systemic finding) to NOT be a '
+            'never-tracked candidate'
         )
 
 
