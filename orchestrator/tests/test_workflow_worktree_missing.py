@@ -24,7 +24,12 @@ from orchestrator.merge_queue import (
     MergeOutcome,
     MergeRequest,
 )
-from orchestrator.workflow import TaskWorkflow, WorkflowCancelled, WorkflowOutcome
+from orchestrator.workflow import (
+    TaskWorkflow,
+    WorkflowCancelled,
+    WorkflowOutcome,
+    WorkflowState,
+)
 
 
 def _make_workflow(
@@ -110,6 +115,47 @@ async def test_worktree_missing_with_terminal_status_returns_done(
     outcome = await wf._submit_to_merge_queue('task/999', pre_rebased=False)
 
     assert outcome == WorkflowOutcome.DONE
+    write_review.assert_not_called()
+    mark_blocked.assert_not_awaited()
+    wf.scheduler.get_status.assert_awaited_once_with('999')
+
+
+@pytest.mark.asyncio
+async def test_worktree_missing_with_cancelled_status_returns_cancelled(
+    tmp_path: Path, monkeypatch,
+):
+    """Human CANCELLED the task → worktree-missing → short-circuit to CANCELLED.
+
+    Task 3538 / boundary #14b: this fallback used to collapse every
+    ``TERMINAL_STATUSES`` member onto DONE, so a cancellation was reported as
+    a completion.  That is a live crash as well as a lie —
+    ``_OUTCOME_ALLOWED['done'] == {DONE}``, so the DONE exit fails ``run()``'s
+    SM-2 consistency check against the ``cancelled`` row — and it inflated the
+    completed tally, which counts ``outcome == DONE``.  The CANCELLED branch
+    also enters ``WorkflowState.CANCELLED`` from MERGE (SM-1 terminal
+    absorption).  Sits beside the ``done`` case above so the two terminal rows
+    read as one decision table.
+    """
+    wf = _make_workflow(tmp_path=tmp_path)
+    wf.state = WorkflowState.MERGE  # where this fallback is reached from
+    wf.scheduler.get_status = AsyncMock(return_value='cancelled')
+    write_review = MagicMock()
+    wf._write_merge_failure_review = write_review  # type: ignore[method-assign]
+    mark_blocked = AsyncMock()
+    wf._mark_blocked = mark_blocked  # type: ignore[method-assign]
+
+    _patch_enqueue_with_outcome(
+        monkeypatch,
+        MergeOutcome(
+            'blocked',
+            reason=f'{WORKTREE_MISSING_REASON_PREFIX}: /tmp/gone',
+        ),
+    )
+
+    outcome = await wf._submit_to_merge_queue('task/999', pre_rebased=False)
+
+    assert outcome == WorkflowOutcome.CANCELLED
+    assert wf.machine.state is WorkflowState.CANCELLED
     write_review.assert_not_called()
     mark_blocked.assert_not_awaited()
     wf.scheduler.get_status.assert_awaited_once_with('999')
