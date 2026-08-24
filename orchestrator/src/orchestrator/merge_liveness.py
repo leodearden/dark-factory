@@ -1057,3 +1057,98 @@ def check_serial_lane_tripwire(
         num_hosts=num_hosts,
         breached=local_inflight > bound,
     )
+
+
+def alarm_serial_lane_breach(
+    assessment: SerialLaneAssessment,
+    *,
+    event_store: Any = None,
+    task_id: str | None = None,
+    branch: str | None = None,
+    request_id: str | None = None,
+    host: str | None = None,
+) -> None:
+    """Log a WARNING and emit telemetry when *assessment* reports a breach.
+
+    The acting wrapper for :func:`check_serial_lane_tripwire` (PRD
+    merge-worktree-lifecycle-integrity §4 C4 / §9 row 10, task 2930/η) and the
+    SOLE emit site for :attr:`~orchestrator.event_store.EventType.merge_serial_lane_breached`.
+
+    NEVER raises, NEVER blocks, always returns ``None``.  There is deliberately
+    no veto channel — no return code, no exception — that a caller could
+    accidentally honour as a hard block, because C4 is explicit that the
+    dispatch is NOT blocked.  The corollary is that enforcement can never later
+    be bolted on by making this function raise: its call site in
+    ``SpeculativeMergeWorker._inflight_append`` wraps it in a fail-open
+    ``except Exception`` that would swallow the raise silently.
+
+    EVERY breach reports — no rate-limit, no per-episode dedup, no streak gate.
+    Suppression would itself be a fail-soft path (which INV-4 would then oblige
+    to carry its own escalation), and a breach is rare by construction: it means
+    a request-identity leak bypassed the ``InFlightMergeRegistry`` coalesce gate.
+    Each occurrence is a distinct dispatch with its own branch/request_id, so
+    collapsing them would destroy the attribution an operator needs.  The
+    normal single-dispatch case stays silent via the ``not breached`` early
+    return below, not via a suppression rule.
+
+    Args:
+        assessment: Verdict from :func:`check_serial_lane_tripwire`.
+        event_store: Optional event store (duck-typed ``Any`` — this module
+            holds no top-level ``orchestrator.event_store`` import); when
+            provided a ``merge_serial_lane_breached`` event is emitted.
+        task_id: Dispatching item's task_id, for the event key.
+        branch: Bare branch id of the offending dispatch.
+        request_id: Merge-request id of the offending dispatch.
+        host: Lease host name (``'local'`` for the serial lane).
+    """
+    if not assessment.breached:
+        return
+
+    logger.warning(
+        'merge serial-lane tripwire BREACHED: concurrent LOCAL merge verifies '
+        'exceed the per-host in-flight bound — '
+        'local_inflight=%d per_host_bound=%d merge_ahead_bound=%d num_hosts=%d '
+        'branch=%s request_id=%s host=%s. '
+        'The persistent warm _merge-verify lane is serial-lane-only per host '
+        '(shared target/), so concurrent local verifies can corrupt each other. '
+        'DETECTION ONLY (PRD C4): the dispatch was NOT blocked. This indicates a '
+        'probable request-identity leak of the task/5326 class — two merge '
+        'requests for one branch both enqueued, bypassing the '
+        'InFlightMergeRegistry coalesce gate.',
+        assessment.local_inflight,
+        assessment.per_host_bound,
+        assessment.merge_ahead_bound,
+        assessment.num_hosts,
+        branch,
+        request_id,
+        host,
+    )
+
+    if event_store is not None:
+        # Guarded emit, copying this module's own precedent in
+        # _alarm_verify_host_unreachable (function-local EventType import so no
+        # top-level orchestrator.event_store import is needed here).  The real
+        # EventStore.emit is synchronous and documented "Never raises", so the
+        # try/except is belt-and-braces for a duck-typed or mock store that
+        # DOES raise — the tripwire must never propagate into the dispatch path.
+        try:
+            from orchestrator.event_store import EventType
+            event_store.emit(
+                EventType.merge_serial_lane_breached,
+                task_id=task_id,
+                phase='merge',
+                data={
+                    'local_inflight': assessment.local_inflight,
+                    'per_host_bound': assessment.per_host_bound,
+                    'merge_ahead_bound': assessment.merge_ahead_bound,
+                    'num_hosts': assessment.num_hosts,
+                    'branch': branch,
+                    'request_id': request_id,
+                    'host': host,
+                },
+            )
+        except Exception:
+            logger.warning(
+                'merge serial-lane tripwire: telemetry emit failed (the WARNING '
+                'above still stands)', exc_info=True,
+            )
