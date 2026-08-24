@@ -25,8 +25,9 @@ its truthful outcome through one shared choke point
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _orch_helpers import pydantic_spec
@@ -34,6 +35,11 @@ from _workflow_helpers import FakeScheduler
 from shared.task_transitions import outcome_allows_status
 
 from orchestrator.config import OrchestratorConfig
+from orchestrator.scheduler import (
+    DoneGateRejection,
+    SetTaskStatusRejected,
+    TerminalExitRejection,
+)
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome, WorkflowState
 
 
@@ -150,3 +156,127 @@ def test_observed_terminal_outcome_is_sm2_consistent(tmp_path: Path, status: str
     result = wf._observed_terminal_outcome(status)
 
     assert outcome_allows_status(result, status) is True
+
+
+# ---------------------------------------------------------------------------
+# _repend_for_requeue — the shared "make a REQUEUED exit truthful" choke point
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_repend_for_requeue_writes_pending_and_returns_none(tmp_path: Path):
+    """(a) Happy path: writes ``pending`` exactly once, returns ``None``.
+
+    ``None`` means "no terminal override — caller keeps its REQUEUED exit".
+    The write must land BEFORE the caller returns, so that by the time the
+    harness's slot ``finally`` nulls the claimant the row is ``pending``, not
+    the ``(in-progress, NULL claimant)`` strand shape.
+    """
+    sched = FakeScheduler()
+    wf = _make_workflow(tmp_path=tmp_path, scheduler=sched)
+
+    result = await wf._repend_for_requeue()
+
+    assert result is None
+    assert sched.statuses[wf.task_id] == ['pending']
+
+
+@pytest.mark.asyncio
+async def test_repend_for_requeue_maps_cancelled_rejection_to_cancelled(
+    tmp_path: Path,
+):
+    """(b) ``TerminalExitRejection(old_status='cancelled')`` → CANCELLED.
+
+    Delegated to ``_observed_terminal_outcome``, so the machine also enters
+    CANCELLED — the terminal row wins over the caller's REQUEUED intent.
+    """
+    wf = _make_workflow(tmp_path=tmp_path)
+    wf.scheduler.set_task_status = AsyncMock(  # type: ignore[method-assign]
+        side_effect=TerminalExitRejection(
+            task_id=wf.task_id, old_status='cancelled',
+            target_status='pending', raw='terminal-exit gate',
+        )
+    )
+
+    result = await wf._repend_for_requeue()
+
+    assert result is WorkflowOutcome.CANCELLED
+    assert wf.machine.state is WorkflowState.CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_repend_for_requeue_maps_done_rejection_to_done(tmp_path: Path):
+    """(c) ``TerminalExitRejection(old_status='done')`` → DONE, phase unmoved."""
+    wf = _make_workflow(tmp_path=tmp_path)
+    wf.scheduler.set_task_status = AsyncMock(  # type: ignore[method-assign]
+        side_effect=TerminalExitRejection(
+            task_id=wf.task_id, old_status='done',
+            target_status='pending', raw='terminal-exit gate',
+        )
+    )
+
+    result = await wf._repend_for_requeue()
+
+    assert result is WorkflowOutcome.DONE
+    assert wf.machine.state is WorkflowState.PLAN
+
+
+@pytest.mark.asyncio
+async def test_repend_for_requeue_logs_other_rejections_and_returns_none(
+    tmp_path: Path, caplog,
+):
+    """(d) A non-terminal ``SetTaskStatusRejected`` is loud (ERROR) but not fatal.
+
+    The caller keeps its REQUEUED exit — the row stays ``in-progress``, which
+    ``_OUTCOME_ALLOWED['requeued']`` still permits today; task θ's narrowing to
+    ``{PENDING}`` is what will make this case loud at the SM-2 check.
+    """
+    wf = _make_workflow(tmp_path=tmp_path)
+    wf.scheduler.set_task_status = AsyncMock(  # type: ignore[method-assign]
+        side_effect=SetTaskStatusRejected(
+            task_id=wf.task_id, error_code='unknown', raw='server said no',
+        )
+    )
+
+    with caplog.at_level(logging.ERROR):
+        result = await wf._repend_for_requeue()
+
+    assert result is None
+    assert any(
+        rec.levelno >= logging.ERROR and 'unknown' in rec.getMessage()
+        for rec in caplog.records
+    ), f'expected an ERROR log naming the error_code; got {caplog.records!r}'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'exc',
+    [
+        SetTaskStatusRejected(task_id='3538', error_code='unknown', raw='r'),
+        TerminalExitRejection(
+            task_id='3538', old_status='done', target_status='pending', raw='r',
+        ),
+        TerminalExitRejection(
+            task_id='3538', old_status='cancelled', target_status='pending', raw='r',
+        ),
+        DoneGateRejection(task_id='3538', missing_files=['a.py'], raw='r'),
+    ],
+    ids=['base', 'terminal-done', 'terminal-cancelled', 'done-gate'],
+)
+async def test_repend_for_requeue_never_reraises(
+    tmp_path: Path, exc: SetTaskStatusRejected,
+):
+    """(e) No ``SetTaskStatusRejected`` subclass ever escapes the helper.
+
+    Both call sites sit OUTSIDE ``_drive()``'s ``except SetTaskStatusRejected``
+    handler — the ``WarmLaneRequeue`` clause is its SIBLING, and
+    ``_handle_soft_cancel`` runs from ``run()``'s ``except WorkflowCancelled``
+    — so an escaping rejection would leave ``run()`` uncaught.
+    """
+    wf = _make_workflow(tmp_path=tmp_path)
+    wf.scheduler.set_task_status = AsyncMock(side_effect=exc)  # type: ignore[method-assign]
+
+    # Must not raise.
+    result = await wf._repend_for_requeue()
+
+    assert result is None or isinstance(result, WorkflowOutcome)
