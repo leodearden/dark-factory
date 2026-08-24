@@ -235,6 +235,18 @@ class EventType(StrEnum):
     # escalation (task 2757; Reify 5120 RCA RC-2).  task_id-keyed; payload shape:
     # {reason, category, failure_category, cause_hint}.
     merge_blocked = 'merge_blocked'
+    # PRD merge-worktree-lifecycle-integrity §4 C4 (task 2930/η): the serial-lane
+    # TRIPWIRE — a second concurrent LOCAL merge verify was dispatched while the
+    # _MERGE_AHEAD_BOUND-derived per-host in-flight bound is 1.  DETECTION ONLY:
+    # the dispatch is NOT blocked (C4: "no hard block"); this is the cheap net for
+    # a request-identity leak of the task/5326 class (two journal entries for one
+    # branch, both enqueued — 2026-07-22 12:10:26).  Sole emit site:
+    # merge_liveness.alarm_serial_lane_breach, reached from
+    # SpeculativeMergeWorker._inflight_append.  data:
+    #   {local_inflight, per_host_bound, merge_ahead_bound, num_hosts,
+    #    branch, request_id, host}
+    # task_id = the dispatching item's task_id; phase = 'merge'.
+    merge_serial_lane_breached = 'merge_serial_lane_breached'
     speculative_merge = 'speculative_merge'
     speculative_discard = 'speculative_discard'
     # Emitted by verify.run_scoped_verification when the merge gate (the
