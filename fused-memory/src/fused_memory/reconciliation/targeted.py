@@ -686,6 +686,13 @@ class TargetedReconciler:
                     claim=f"Task '{title}' has been completed",
                     context=f'Task details: {task.get("details") or description}',
                     scope_hints=_extract_scope_hints(task),
+                    # PRD D3 (task 4722): the task's OWN project root, taken
+                    # from the scope this run already validated — not the
+                    # process-global `explore_codebase_root`.  58% of
+                    # historical gate openings were for non-dark_factory
+                    # projects, every one of them verified against the wrong
+                    # tree.
+                    codebase_root=Path(scope.project_root),
                 )
                 # ── verify/codebase audit row contract (task 4343) ──────────
                 # Exactly ONE *outcome* row per invocation of this branch, so

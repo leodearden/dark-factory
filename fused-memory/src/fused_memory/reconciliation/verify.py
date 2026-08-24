@@ -57,7 +57,13 @@ class CodebaseVerifier:
     """Spawns an isolated explore agent to verify factual claims against the codebase."""
 
     def __init__(self, config: ReconciliationConfig):
-        self.codebase_root = Path(config.explore_codebase_root).resolve()
+        # PRD D3 (task 4722): NO codebase root is held here.  Reconciliation is
+        # multi-project, and the caller's already-validated ProjectScope is the
+        # single root authority (INV-9) — a root cached on the instance would
+        # be correct for at most one project per process.  `config` survives
+        # because it still carries the AGENT settings (model, provider,
+        # timeouts, max steps); `config.explore_codebase_root` is no longer
+        # read on this path at all.
         self.config = config
 
     async def verify(
@@ -65,9 +71,23 @@ class CodebaseVerifier:
         claim: str,
         context: str = '',
         scope_hints: list[str] | None = None,
+        *,
+        codebase_root: Path,
     ) -> VerificationResult:
-        """Verify a factual claim against the codebase."""
-        codebase_root = self.codebase_root
+        """Verify a factual claim against the codebase rooted at ``codebase_root``.
+
+        ``codebase_root`` is per-call and REQUIRED (keyword-only, no default):
+        the caller supplies the root of the project whose claim this is, and
+        that one value drives the tool closures, their path-escape guards, the
+        prompt, and the agent's cwd.  A default would silently reinstate the
+        process-global root for any caller that forgot the argument.
+
+        This reverses task 2548 item 2, which deleted verify()'s unused
+        ``project_id`` parameter as dead code: the parameter was not the
+        mistake, the missing wiring was — and the thing the verifier actually
+        needs is a filesystem root, not a logical id.
+        """
+        codebase_root = Path(codebase_root).resolve()
 
         tools: dict[str, ToolDefinition] = {}
 
@@ -286,7 +306,7 @@ class CodebaseVerifier:
 {hint_text}
 
 ### Codebase Root
-{self.codebase_root}
+{codebase_root}
 
 Investigate this claim against the codebase and call `verification_complete` with your findings.
 """
@@ -296,6 +316,9 @@ Investigate this claim against the codebase and call `verification_complete` wit
             system_prompt=EXPLORE_AGENT_SYSTEM_PROMPT,
             tools=tools,
             terminal_tool='verification_complete',
+            # The agent explores the TARGET project (task 4722): its cwd, and
+            # so the CLAUDE.md the CLI auto-loads, must be that project's.
+            cwd=codebase_root,
         )
 
         result, _ = await agent.run(prompt)
