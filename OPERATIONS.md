@@ -509,6 +509,99 @@ if unsure which one owns it) — `resolve_issue` on it un-halts the whole
 queue. If the log shows the halt cleared but the escalation record still
 shows `pending`, that's a genuine bug, not something to dismiss.
 
+#### `park_lock_contended` — a blocked merge, **not** a halt
+
+Contrast the two categories above, and `stash_failed` (which *does* halt:
+`project_root` carries dirty tracked files that could not be parked — a
+shared hygiene fault that recurs identically for every subsequent task).
+`park_lock_contended` is the opposite and **never halts the queue**: a
+foreign git process held `project_root`'s `.git/index.lock` — dominantly a
+`git commit --only` holding it across its pre-commit hook (see CLAUDE.md
+§"Working in the main checkout"). `advance_main` stands off for up to
+`git.merge_park_lock_grace_seconds` (default 300s) and, if the lock is
+still held, gives up having modified **nothing** — no ref move, no tree
+write, no park, and the foreign lock left strictly alone.
+
+That one merge is reported as a per-task **blocked** merge whose reason
+names the lock path, how long it had been held, and how long we waited.
+This is the ordinary, self-clearing shape — note that it ends there, with
+**no** recovery sentence:
+
+> `advance_main deferred: a foreign git process held /…/.git/index.lock
+> for 301s (waited 300s). The merge did NOT land and NOTHING in
+> project_root was modified. … transient and will be retried on
+> re-dispatch.`
+
+If the foreign lock appeared *mid-park* — after the pre-snapshot gate
+probed it clear — `advance_main` already knew which uncommitted tracked
+files it was about to park, and the reason names them so you can see
+whether real WIP is implicated:
+
+> `… Uncommitted tracked WIP in project_root at the moment of contention:
+> CLAUDE.md, docs/task-authoring.md.`
+
+That clause is absent on the ordinary gate path, where the dirty snapshot
+has not been taken yet and no WIP is known to be at risk.
+
+A normal `git commit --only` whose pre-commit hook outlives the 300s
+grace produces exactly that: a blocked merge, **no** recovery advice, and
+**nothing for you to do** — it is retried on re-dispatch.
+
+There is exactly one genuine operator action, and it is triggered by the
+lock having **already been older, the moment the merge worker first
+observed it, than the staleness floor** — not by the age in the line
+above. That post-wait age necessarily exceeds the grace whenever we
+waited the grace out (it is the initial age *plus* the wait), so it says
+nothing about staleness; the 301s example above is a perfectly live
+commit. The distinguishing sentence is spelled out in the reason and
+simply does not appear otherwise:
+
+> `… The lock was ALREADY 3600s old when the merge worker FIRST observed
+> it — older than the 300s staleness floor (max of the configured 300s
+> grace and the 300s pre-commit budget) — so it is likely a crashed-git
+> leftover rather than a live commit: confirm no git process is running
+> in project_root, then clear it with rm -f /…/.git/index.lock.`
+
+The floor is `max(git.merge_park_lock_grace_seconds, 300s)`, **not** the
+configured grace alone. Tuning the grace *down* (including to `0`, the
+probe-only fail-fast off-switch) shortens how long the worker **waits**;
+it must never widen what counts as a crashed leftover, or a live
+half-second-old `git commit --only` would be reported as one. Tuning the
+grace *up* does raise the bar — an operator who allows longer hooks has
+declared locks that old to be normal.
+
+Only when you see that sentence should you clear the lock by hand, and
+only after confirming no git process is running in `project_root`. The
+advice is gated this narrowly because `rm -f` on a **live** commit's
+index lock corrupts that in-flight commit — the same reason
+`advance_main` never removes the lock itself.
+
+A lock that is *already* past the staleness floor when first observed
+**skips the wait entirely** — it is reported immediately, with the same
+recovery sentence. Waiting cannot change a verdict that is already
+"crashed leftover", and the merge worker is serialized, so burning the
+full grace on every queued task until you clear the file would just be a
+slow-motion version of the stall this whole mechanism removes. So the
+blocked reason for a leftover reads `waited 0s`; that is correct, not a
+mis-report.
+
+One window the gate cannot cover: it is a *probe*, so a foreign process
+can still grab the index between it and the post-advance
+`read-tree -u --reset HEAD` that syncs `project_root` to the new HEAD. By
+then main has already landed, so this is **not** reported as
+`park_lock_contended`; instead the sync stands off for the same grace and
+**retries in place**. If both attempts fail you get a
+`read-tree failed after advancing main — working tree is stale` ERROR in
+the log with the merge still reported as `advanced` — at which point
+`project_root`'s tree is genuinely out of sync with `main` and a manual
+`git -C <project_root> read-tree -u --reset HEAD` (after confirming no
+git process is running there) is the fix. Left alone, the next advance
+reads the whole old-main→new-main delta as dirty WIP.
+
+The stand-off budget is **green tier** — retune it live with
+`mcp__escalation__reload_config`, no restart (the value is re-read per
+advance).
+
 ---
 
 ## 6. Config reload vs restart
@@ -532,6 +625,9 @@ takes no arguments: it always re-reads that process's own
 - `session_resume.*` (whole submodel, including the `restore_from_archive`
   rehydration kill switch — see [§14](#14-transcript-preservation--the-archival-guard))
 - `verify_env`
+- `git.merge_park_lock_grace_seconds` (the `advance_main` index-lock
+  stand-off budget — re-read per advance, see
+  [§"Merge-halt semantics"](#merge-halt-semantics-wip_conflict--unmerged_state))
 - The `git.offline_lane_*` leaf tunables
 - `config_key_census.*` (the unknown-key census escape hatch — see
   [§6a](#6a-unknown-config-key-census); green-tier on purpose, so a

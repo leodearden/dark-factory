@@ -104,6 +104,7 @@ AdvanceResult = Literal[
     'stash_failed', 'wip_overlap', 'pop_conflict',
     'unmerged_state', 'pop_conflict_no_advance',
     'rebased_pending_reverify', 'conflict_markers',
+    'park_lock_contended',
 ]
 
 
@@ -203,15 +204,66 @@ def is_wip_safety_commit(subject: str) -> bool:
 MERGE_PARK_REF = 'refs/dark-factory/merge-park'
 
 
+# Poll cadence (seconds) for GitOps._await_index_lock_clear's stand-off on a
+# FOREIGN <git-dir>/index.lock, and how often that wait re-announces itself.
+# Deliberately module constants, not config knobs: the operator-facing budget
+# is the single `git.merge_park_lock_grace_seconds` knob — these only control
+# how finely that budget is sampled and how chatty a long wait is.
+_INDEX_LOCK_POLL_INTERVAL_S = 1.0
+_INDEX_LOCK_WARN_INTERVAL_S = 30.0
+
+# Floor (seconds) an index.lock's PRE-wait age must clear before it may be
+# treated as a crashed-git LEFTOVER rather than a live commit.  This repo's
+# documented pre-commit budget (CLAUDE.md instructs `timeout: 300000` for a
+# commit that stages Python), so a lock older than this outlived the longest
+# legitimate hook run.
+#
+# Single source of truth for two collaborating call sites, deliberately
+# defined HERE because the import direction is merge_gates -> git_ops and
+# never the reverse:
+#   * `GitOps._await_index_lock_clear` short-circuits its stand-off once the
+#     pre-wait age clears max(grace, this) — waiting cannot change a verdict
+#     that is already "leftover", it only costs the SERIALIZED merge worker
+#     the whole grace per queued task.
+#   * `merge_gates._map_advance_failure` (which aliases this as
+#     `_STALE_LOCK_FLOOR_S`) uses the SAME bar to decide whether to offer the
+#     destructive `rm -f <lock>` recovery.
+# They must never drift: a short-circuit at a lower bar than the advice bar
+# would skip the wait and then NOT explain why.
+_INDEX_LOCK_STALE_FLOOR_S = 300.0
+
+
 class MergeParkError(Exception):
     """Base class for failures parking pre-advance WIP on MERGE_PARK_REF.
 
     Raised by :meth:`GitOps._park_wip_on_private_ref` when the ``git stash
     create`` / ``git update-ref`` infra sequence itself fails (not a
-    contention condition — see :class:`MergeParkContentionError` for that).
+    contention condition — see :class:`MergeParkContentionError` and
+    :class:`MergeParkLockContentionError` for those).
     ``advance_main`` catches this and returns the existing
     ``AdvanceResult 'stash_failed'`` code (loud CRITICAL log + permanent
     halt to prevent code loss).
+    """
+
+
+class MergeParkLockContentionError(MergeParkError):
+    """Raised when the park failed because a FOREIGN git process holds
+    project_root's ``<git-dir>/index.lock``.
+
+    Transient, never a queue halt: ``advance_main`` maps this to the
+    ``AdvanceResult 'park_lock_contended'`` code, which is DELIBERATELY
+    absent from ``merge_queue._HALT_ADVANCE_RESULTS``.  The dominant cause is
+    a concurrent ``git commit --only <path>`` in project_root, which holds
+    the index lock for the ENTIRE pre-commit hook run — self-clearing, unlike
+    the shared-hygiene fault that ``'stash_failed'`` reports.
+
+    Classification MUST be by positive lock-FILE detection, never by stderr
+    matching: verified on git 2.43.0, ``git stash create`` under a held
+    ``index.lock`` exits **rc=1 with EMPTY stdout AND EMPTY stderr** (while
+    ``git status --porcelain`` and ``git diff --name-only`` both still
+    succeed with rc=0).  There is simply no stderr text to classify on — which
+    is also why the resulting halt escalation used to read
+    ``rc=1, stdout='', stderr=''``.  See :meth:`GitOps._index_lock_state`.
     """
 
 
@@ -12541,6 +12593,19 @@ class GitOps:
           existed — a stale or contended ref that is never overwritten
           (:class:`MergeParkContentionError`).  Permanent; halt merge to
           prevent code loss.  See :meth:`GitOps._park_wip_on_private_ref`.
+        * ``'park_lock_contended'`` — a FOREIGN git process holds
+          project_root's ``<git-dir>/index.lock``, so this advance stood off
+          and touched NOTHING (no ref move, no tree write, no park, and the
+          foreign lock left strictly alone).  TRANSIENT and retryable —
+          explicitly CONTRASTED with ``'stash_failed'``: that code reports a
+          shared-hygiene fault needing a human, while this one reports a
+          self-clearing condition whose dominant cause is a concurrent
+          ``git commit --only`` holding the index lock across its pre-commit
+          hook.  Accordingly it is DELIBERATELY absent from
+          ``merge_queue._HALT_ADVANCE_RESULTS`` and maps to a per-task
+          ``MergeOutcome('blocked')``, never a queue halt.  The stand-off
+          budget is ``git.merge_park_lock_grace_seconds`` (default 300s,
+          matching the documented pre-commit budget).
         * ``'pop_conflict_no_advance'`` — CAS ``update-ref`` failed AND the
           subsequent stash pop conflicted.  The merge did NOT land.  WIP is
           preserved on a ``wip/recovery-*`` branch; routes to a human-level
@@ -12774,6 +12839,99 @@ class GitOps:
         if rc == 0 and current_branch.strip() == self.config.main_branch:
             is_on_main = True
 
+            # ── Foreign index-lock stand-off (task 3060) ─────────────────
+            # A concurrent `git commit --only <path>` in project_root holds
+            # <git-dir>/index.lock for the ENTIRE pre-commit hook run (this
+            # repo's hook runs pyright; CLAUDE.md instructs callers to pass
+            # `timeout: 300000`).  Under that lock `git stash create` exits
+            # rc=1 with EMPTY stdout AND stderr (verified, git 2.43.0), so
+            # the park below would fail and return the queue-HALTING
+            # 'stash_failed'.  Never park through a foreign lock:
+            # _park_wip_on_private_ref ends with `read-tree -u --reset HEAD`,
+            # which would clobber the in-flight commit's staged/working
+            # state.  When another process owns the index the only safe
+            # action is to touch nothing and come back later.
+            #
+            # This gate is deliberately placed HERE — keyed on `is_on_main`,
+            # BEFORE the dirty-file snapshot below — not inside the
+            # `if dirty_tracked:` park block, for two reasons:
+            #
+            #  (i) It covers the CLEAN-tree path's post-advance
+            #      `read-tree -u --reset HEAD` sync as well as the park.  That
+            #      sync's failure is only LOGGED while the outcome still
+            #      reports 'advanced', so on a CLEAN tree (where no park is
+            #      attempted at all) a foreign lock would silently land main
+            #      with a stale project_root tree — and the NEXT advance
+            #      would then read the whole old-main→new-main delta as
+            #      "dirty" WIP, cascading into wip_overlap/park damage.
+            #      NOTE this gate is a PROBE, so it narrows but cannot close
+            #      that window: a lock taken AFTER it still reaches the sync.
+            #      The dirty path re-probes mid-park (see the
+            #      `except MergeParkLockContentionError` handler below); the
+            #      sync closes its own residual window with a bounded
+            #      stand-off + retry at the read-tree site itself, because by
+            #      then main has already landed and 'park_lock_contended'
+            #      would be a lie.
+            #  (ii) The dirty-file snapshot is now taken AFTER the lock
+            #      clears, so it can never record the half-written state of
+            #      an in-flight `git commit --only`.  A stale snapshot would
+            #      mis-drive both the wip_overlap check and the park.
+            #
+            # It is deliberately NOT hoisted above the pre-existing
+            # unmerged-state gate: that gate's `git status --porcelain` read
+            # succeeds under a held lock (verified rc=0) and cannot
+            # false-positive from a concurrent `commit --only` (which never
+            # creates unmerged entries), so its precedence is preserved.
+            #
+            # The grace is re-read PER ADVANCE (never captured at startup)
+            # so a green-tier reload of git.merge_park_lock_grace_seconds
+            # takes effect on the very next advance.  On the clean happy
+            # path this costs exactly one stat().
+            grace_s = float(self.config.merge_park_lock_grace_seconds)
+            cleared, waited, initial_age = await self._await_index_lock_clear(
+                timeout_s=grace_s,
+                context=f'advance_main for {branch or merge_sha[:8]}',
+            )
+            if not cleared:
+                lock_path = await self._index_lock_path()
+                _, lock_age = await self._index_lock_state()
+                logger.warning(
+                    'Foreign git index lock still held in project_root after '
+                    '%.1fs — standing off; the merge did NOT land and nothing '
+                    'in project_root was modified. lock=%s age=%.1fs',
+                    waited, lock_path, lock_age,
+                )
+                # Mirrors the _last_overlap_files / _last_stash_dirty_files
+                # side channels so _map_advance_failure can name the lock in
+                # the per-task blocked reason.  'dirty_files' is empty on
+                # this path by construction — the snapshot below has not been
+                # taken yet, so no WIP is known to be at risk — and the mapper
+                # renders its "WIP at risk" clause only when the list is
+                # non-empty (the TOCTOU path below, which DOES know the
+                # files).  The key is kept PRESENT so the mapper needs no
+                # shape branching.  _last_stash_dirty_files is left untouched,
+                # so the stash_failed escalation text is unaffected.
+                #
+                # 'age_seconds' and 'initial_age_seconds' differ BY DESIGN and
+                # are not interchangeable.  The former is re-probed here, so
+                # it necessarily includes the stand-off (initial + waited +
+                # epsilon) — a true, useful fact for the operator-facing
+                # reason, but useless as a staleness signal because it exceeds
+                # the grace for a 2-second-old live commit exactly as it does
+                # for an hour-old crashed leftover.  The latter predates the
+                # wait and is the only one a staleness verdict may key on.
+                # 'grace_seconds' travels alongside so the downstream mapper
+                # stays a pure function of this dict.
+                self._last_park_lock_info = {
+                    'lock_path': str(lock_path),
+                    'age_seconds': lock_age,
+                    'waited_seconds': waited,
+                    'initial_age_seconds': initial_age,
+                    'grace_seconds': grace_s,
+                    'dirty_files': [],
+                }
+                return AdvanceOutcome('park_lock_contended')
+
             # Check for uncommitted changes (staged or unstaged)
             _, porcelain, _ = await _run(
                 ['git', 'status', '--porcelain'],
@@ -12834,6 +12992,41 @@ class GitOps:
                 if dirty_tracked:
                     try:
                         await self._park_wip_on_private_ref(branch or merge_sha[:8])
+                    except MergeParkLockContentionError as e:
+                        # SUBCLASS FIRST — the MergeParkError handler below
+                        # would otherwise swallow this and reinstate the
+                        # queue halt.  A foreign git process grabbed the
+                        # index inside the TOCTOU window between the gate
+                        # above and `git stash create`; transient, so
+                        # dispose of it exactly as the gate does.
+                        lock_path = await self._index_lock_path()
+                        _, lock_age = await self._index_lock_state()
+                        logger.warning(
+                            'Foreign git index lock appeared mid-park — '
+                            'standing off; the merge did NOT land. lock=%s '
+                            'age=%.1fs error=%s',
+                            lock_path, lock_age, e,
+                        )
+                        # A lock that appeared DURING the park is by
+                        # definition live, not a crashed leftover — the gate
+                        # above probed it absent moments ago.  Reporting the
+                        # freshly observed age as 'initial_age_seconds' (no
+                        # stand-off ran, so it is already a pre-wait value)
+                        # therefore yields a NOT-stale verdict downstream,
+                        # which is the correct answer for this shape: no
+                        # destructive `rm -f` advice for a lock we watched
+                        # appear.
+                        self._last_park_lock_info = {
+                            'lock_path': str(lock_path),
+                            'age_seconds': lock_age,
+                            'waited_seconds': 0.0,
+                            'initial_age_seconds': lock_age,
+                            'grace_seconds': float(
+                                self.config.merge_park_lock_grace_seconds,
+                            ),
+                            'dirty_files': sorted(dirty_tracked),
+                        }
+                        return AdvanceOutcome('park_lock_contended')
                     except MergeParkContentionError as e:
                         # The merge worker is serialized, so a resolvable
                         # MERGE_PARK_REF here is either an invariant
@@ -12968,6 +13161,55 @@ class GitOps:
                 ['git', 'read-tree', '-u', '--reset', 'HEAD'],
                 cwd=self.project_root,
             )
+            if sync_rc != 0:
+                # ── Residual TOCTOU window at the sync ───────────────
+                # advance_main's pre-snapshot gate is a PROBE, so a foreign
+                # `git commit --only` can still grab the index between it and
+                # this sync — and on the CLEAN-tree path there is no park,
+                # hence no mid-park re-probe to catch it.  Left alone, that is
+                # exactly the silent failure the gate exists to prevent: main
+                # LANDS while project_root's tree stays stale, and the NEXT
+                # advance reads the whole old-main→new-main delta as "dirty"
+                # WIP, cascading into wip_overlap/park damage.
+                #
+                # Returning 'park_lock_contended' here would be a LIE —
+                # update-ref has already run, main HAS moved.  So the recovery
+                # is to retry IN PLACE: stand off for the same bounded grace,
+                # then re-run the sync.  Re-probed first so a genuine
+                # (lock-free) read-tree fault is not silently delayed by a
+                # pointless retry; `_await_index_lock_clear` also short-
+                # circuits an already-stale lock, so the worst case is one
+                # grace, not an unbounded stall.
+                held, held_age = await self._index_lock_state()
+                if held:
+                    logger.warning(
+                        'read-tree after advancing main failed while a '
+                        'foreign git index lock is held (age=%.1fs) — '
+                        'standing off and retrying the sync rather than '
+                        'leaving project_root stale. error=%s',
+                        held_age, sync_err,
+                    )
+                    cleared, waited, _pre_age = await self._await_index_lock_clear(
+                        timeout_s=float(
+                            self.config.merge_park_lock_grace_seconds,
+                        ),
+                        context=(
+                            'post-advance tree sync for '
+                            f'{branch or merge_sha[:8]}'
+                        ),
+                    )
+                    if cleared:
+                        sync_rc, _, sync_err = await _run(
+                            ['git', 'read-tree', '-u', '--reset', 'HEAD'],
+                            cwd=self.project_root,
+                        )
+                        if sync_rc == 0:
+                            logger.info(
+                                'read-tree retry succeeded after waiting '
+                                '%.1fs for the foreign index lock to clear — '
+                                'project_root is in sync with the new HEAD.',
+                                waited,
+                            )
             if sync_rc != 0:
                 logger.error(
                     'read-tree failed after advancing main — working tree '
@@ -13260,6 +13502,179 @@ class GitOps:
         )
         return 'error'
 
+    async def _index_lock_path(self) -> Path:
+        """Resolve project_root's ``<git-dir>/index.lock`` path, memoised.
+
+        Fast path: when ``<project_root>/.git`` is a real DIRECTORY (the
+        ordinary layout) the answer is ``<project_root>/.git/index.lock``
+        with no subprocess at all — this sits on advance_main's hot path and
+        must not cost a fork on the clean happy path.  Fallback: for the
+        ``.git``-FILE layout (a linked worktree / submodule) ask git itself
+        via ``rev-parse --absolute-git-dir``.
+
+        Memoised on the instance because a repository's git-dir does not move
+        under a live GitOps.
+        """
+        cached = getattr(self, '_index_lock_path_cache', None)
+        if cached is not None:
+            return cached
+
+        dot_git = self.project_root / '.git'
+        if dot_git.is_dir():
+            resolved = dot_git / 'index.lock'
+        else:
+            rc, git_dir, _ = await _run(
+                ['git', 'rev-parse', '--absolute-git-dir'],
+                cwd=self.project_root,
+            )
+            if rc == 0 and git_dir.strip():
+                resolved = Path(git_dir.strip()) / 'index.lock'
+            else:
+                # Last resort: assume the ordinary layout rather than
+                # raising.  A wrong path degrades to "no lock detected",
+                # i.e. exactly today's behaviour — never worse.
+                resolved = dot_git / 'index.lock'
+
+        self._index_lock_path_cache: Path = resolved
+        return resolved
+
+    async def _index_lock_state(self) -> tuple[bool, float]:
+        """Return ``(present, age_seconds)`` for project_root's index lock.
+
+        ``age_seconds`` is derived from the lock file's mtime and is what
+        distinguishes an in-flight pre-commit hook (young) from a crashed-git
+        leftover (older than the configured grace) in the operator-facing
+        reason.  Returns ``(False, 0.0)`` when absent; a ``stat`` race (the
+        lock vanishing between ``exists`` and ``stat``) is treated as absent,
+        which is the truth a moment later anyway.
+        """
+        lock_path = await self._index_lock_path()
+        try:
+            mtime = lock_path.stat().st_mtime
+        except (FileNotFoundError, NotADirectoryError):
+            return (False, 0.0)
+        except OSError:
+            # Unreadable for some other reason — do not invent contention.
+            return (False, 0.0)
+        return (True, max(0.0, time.time() - mtime))
+
+    async def _await_index_lock_clear(
+        self, *, timeout_s: float, context: str,
+    ) -> tuple[bool, float, float]:
+        """Wait (bounded by *timeout_s*) for project_root's index lock to clear.
+
+        Returns ``(cleared, waited_seconds, initial_age_seconds)``.
+
+        ``initial_age_seconds`` is the lock's age measured BEFORE the
+        stand-off begins (0.0 when no lock was held).  It is the ONLY age that
+        distinguishes a crashed-git leftover from a live commit, because any
+        age read after the wait necessarily includes the wait: a lock created
+        2s before a 300s stand-off reports 302s afterwards, exactly like an
+        hour-old leftover reports 3900s.  Callers making a staleness judgement
+        must use this value, never the post-wait age.
+
+        The happy path — no lock — costs exactly one ``stat``: no subprocess,
+        no sleep, no await of anything real, so a clean repo behaves
+        byte-identically to before this gate existed.
+
+        ``timeout_s == 0`` still PROBES (probe-only fail-fast): the off-switch
+        disables the WAIT, never the classification, because parking through a
+        foreign process's index lock would clobber the in-flight commit's
+        staged/working state.  A long stand-off is loud rather than silent —
+        a WARNING naming the lock path, its current age and *context* is
+        emitted at most every ~30s while waiting.
+
+        Uses a MONOTONIC clock for the deadline so a wall-clock adjustment
+        mid-wait cannot extend or truncate the budget.
+
+        An ALREADY-STALE lock (pre-wait age past
+        ``max(timeout_s, _INDEX_LOCK_STALE_FLOOR_S)``) short-circuits the wait
+        entirely — see the inline rationale below.
+        """
+        held, age = await self._index_lock_state()
+        if not held:
+            return (True, 0.0, 0.0)
+
+        # Bind the pre-wait observation to a local the poll loop cannot
+        # clobber — the loop rebinds `age` on every probe, which is exactly
+        # how this (the only staleness-bearing) measurement used to be lost.
+        initial_age = age
+        lock_path = await self._index_lock_path()
+
+        # ── Already-stale short-circuit ──────────────────────────────
+        # Do not burn the grace on a lock downstream has already decided is a
+        # crashed-git leftover.  `merge_gates._map_advance_failure` renders
+        # its `rm -f` recovery advice from exactly this pre-wait age against
+        # exactly this threshold (_INDEX_LOCK_STALE_FLOOR_S, which it aliases
+        # as _STALE_LOCK_FLOOR_S), so once the bar is cleared no amount of
+        # waiting can change the verdict — it only costs the SERIALIZED merge
+        # worker the full grace for EVERY queued task until an operator clears
+        # the file, which is a slow-motion version of the stall this gate
+        # exists to remove.  The returned (False, 0.0, initial_age) drives the
+        # identical downstream verdict and advice, minus the dead wall-clock.
+        #
+        # Strictly `>` and keyed on the PRE-wait age, mirroring the mapper: a
+        # young lock (the ordinary docs-direct-commit-on-main window) always
+        # gets its full stand-off, which is the case the wait is FOR.
+        stale_floor = max(max(0.0, timeout_s), _INDEX_LOCK_STALE_FLOOR_S)
+        if initial_age > stale_floor:
+            logger.warning(
+                'Foreign git index lock in project_root is ALREADY %.0fs old '
+                '(past the %.0fs staleness floor) — skipping the stand-off, a '
+                'crashed-git leftover will not clear by waiting. lock=%s '
+                'context=%s',
+                initial_age, stale_floor, lock_path, context,
+            )
+            return (False, 0.0, initial_age)
+
+        started = time.monotonic()
+        deadline = started + max(0.0, timeout_s)
+        # Cap the poll interval so a sub-second timeout_s still yields at
+        # least one further probe rather than sleeping past its own deadline.
+        interval = min(_INDEX_LOCK_POLL_INTERVAL_S, max(0.0, timeout_s)) or \
+            _INDEX_LOCK_POLL_INTERVAL_S
+        last_warned = started
+
+        logger.warning(
+            'Foreign git index lock held in project_root — standing off for '
+            'up to %.0fs before giving up. lock=%s age=%.1fs context=%s',
+            max(0.0, timeout_s), lock_path, age, context,
+        )
+
+        while time.monotonic() < deadline:
+            await asyncio.sleep(min(interval, max(0.0, deadline - time.monotonic())))
+            held, age = await self._index_lock_state()
+            waited = time.monotonic() - started
+            if not held:
+                logger.info(
+                    'Foreign git index lock cleared after %.1fs — proceeding '
+                    'with advance. lock=%s context=%s',
+                    waited, lock_path, context,
+                )
+                return (True, waited, initial_age)
+            now = time.monotonic()
+            if now - last_warned >= _INDEX_LOCK_WARN_INTERVAL_S:
+                last_warned = now
+                logger.warning(
+                    'Still waiting on a foreign git index lock in '
+                    'project_root after %.1fs (of %.0fs). lock=%s age=%.1fs '
+                    'context=%s',
+                    waited, max(0.0, timeout_s), lock_path, age, context,
+                )
+
+        # Final probe so a lock that cleared inside the last poll interval
+        # is not misreported as still held at the deadline.
+        held, _age = await self._index_lock_state()
+        waited = time.monotonic() - started
+        if not held:
+            logger.info(
+                'Foreign git index lock cleared after %.1fs — proceeding '
+                'with advance. lock=%s context=%s',
+                waited, lock_path, context,
+            )
+            return (True, waited, initial_age)
+        return (False, waited, initial_age)
+
     async def _park_wip_on_private_ref(self, label: str) -> None:
         """Park uncommitted WIP in project_root onto MERGE_PARK_REF.
 
@@ -13280,6 +13695,26 @@ class GitOps:
         exists — the merge worker is serialized, so a resolvable ref here is
         either an invariant violation or a crash-leftover holding real,
         unrecovered WIP; it is never overwritten.
+        Raises :class:`MergeParkLockContentionError` (a ``MergeParkError``
+        SUBCLASS, so it must be caught FIRST) instead of the generic
+        ``MergeParkError`` when the ``git stash create`` failure happens
+        while a FOREIGN git process holds ``<git-dir>/index.lock`` —
+        transient contention rather than a park infra fault.  That re-probe
+        closes the TOCTOU window advance_main's pre-park gate cannot cover.
+
+        The transient classification is DELIBERATELY confined to the
+        stash-create site, which is the only failure that leaves NOTHING
+        behind: no ref, no tree write.  A ``read-tree`` failure happens
+        AFTER ``update-ref`` has already created MERGE_PARK_REF, so
+        classifying it transient would return a per-task
+        ``'park_lock_contended'`` (no cleanup, no apply) while leaving the
+        ref dangling — and the NEXT advance's single-flight guard would then
+        raise :class:`MergeParkContentionError` and halt the whole queue.
+        That converts a transient race into a guaranteed later halt, so the
+        read-tree site keeps the loud generic ``MergeParkError``
+        (``'stash_failed'``) with the WIP safe on the ref.  It also keeps
+        the ``'park_lock_contended'`` operator message's "NOTHING in
+        project_root was modified" claim (merge_gates) factually true.
         """
         # Single-flight guard: explicit pre-check so a stale/contended ref
         # fails loudly with a clear message rather than via the terser
@@ -13301,6 +13736,20 @@ class GitOps:
         )
         stash_sha = stash_sha.strip()
         if stash_rc != 0 or not stash_sha:
+            # Re-probe the index lock: advance_main's gate cannot cover the
+            # TOCTOU window where a concurrent `git commit --only` grabs the
+            # index right after the probe.  Under a held lock this failure is
+            # rc=1 with EMPTY stdout AND stderr (git 2.43), so the message
+            # interpolated below carries no diagnostic signal at all —
+            # positive lock detection is the only available classifier.
+            lock_held, lock_age = await self._index_lock_state()
+            if lock_held:
+                raise MergeParkLockContentionError(
+                    f'git stash create failed because a foreign git process '
+                    f'holds {await self._index_lock_path()} '
+                    f'(age={lock_age:.1f}s) — transient contention, not a '
+                    f'park infra failure (rc={stash_rc})'
+                )
             raise MergeParkError(
                 f'git stash create failed or produced no commit (rc={stash_rc}, '
                 f'stdout={stash_sha!r}, stderr={stash_err!r})'
@@ -13326,6 +13775,17 @@ class GitOps:
             cwd=self.project_root,
         )
         if reset_rc != 0:
+            # NO lock re-probe here, deliberately — unlike the stash-create
+            # site above, this failure happens AFTER update-ref created
+            # MERGE_PARK_REF.  Raising the transient subclass would make
+            # advance_main return 'park_lock_contended', which neither
+            # deletes the ref nor sets did_park, so nothing ever applies or
+            # cleans it up; the next advance's single-flight guard would
+            # then hit MergeParkContentionError -> 'stash_failed' and halt
+            # the entire queue.  Keeping the loud generic MergeParkError
+            # here trades a same-cycle halt (WIP safe on the ref, one
+            # recovery) for a guaranteed later one, and keeps
+            # 'park_lock_contended' honestly meaning "nothing was modified".
             raise MergeParkError(
                 f'read-tree -u --reset HEAD failed after parking WIP on '
                 f'{MERGE_PARK_REF} (rc={reset_rc}, stderr={reset_err!r}) — '

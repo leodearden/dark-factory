@@ -1769,6 +1769,32 @@ class GitConfig(BaseModel):
             'only costs granularity.'
         ),
     )
+    merge_park_lock_grace_seconds: float = Field(
+        default=300.0,
+        ge=0,
+        description=(
+            'How long (seconds) advance_main waits for a FOREIGN '
+            '<git-dir>/index.lock in project_root to clear before giving up '
+            'and returning the transient `park_lock_contended` result. A '
+            'concurrent `git commit --only <path>` holds the index lock for '
+            'the ENTIRE pre-commit hook run, and under a held lock '
+            '`git stash create` exits rc=1 with EMPTY stdout AND stderr — so '
+            'advance_main would otherwise return `stash_failed` and halt the '
+            'whole merge queue. The 300s default matches this repo\'s '
+            'documented pre-commit budget (CLAUDE.md instructs '
+            '`timeout: 300000` because the hook runs pyright), so an ordinary '
+            'docs-direct-commit-on-main merely DELAYS a merge instead of '
+            'halting the queue. 0 disables only the WAIT (probe-only '
+            'fail-fast): the lock is still probed and a held lock is still '
+            'classified as `park_lock_contended` — never a silent fail-soft, '
+            'because parking through a foreign process\'s index lock would '
+            'clobber the in-flight commit\'s staged/working state. This knob '
+            'governs the WAIT only: the crashed-leftover verdict that offers '
+            'an operator destructive `rm -f <lock>` recovery keys on '
+            'max(this, merge_gates._STALE_LOCK_FLOOR_S), so lowering it (0 '
+            'included) never widens what counts as a stale lock.'
+        ),
+    )
     offline_lane_red_advances_before_blocker: int = Field(
         default=3,
         ge=1,
@@ -5323,6 +5349,11 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         'git.offline_lane_test_threads',
         'git.offline_lane_poll_interval_secs',
         'git.offline_lane_red_advances_before_blocker',
+        # advance_main's foreign-index-lock stand-off budget (task 3060) —
+        # a leaf-mutation-only tuning knob re-read per advance (never
+        # captured at startup), so a reload takes effect on the very next
+        # advance and an operator can retune the stand-off live.
+        'git.merge_park_lock_grace_seconds',
         # Generic per-project offline-lane commands + legacy-numeric gate (task
         # 2789, D6 green-tier): the worker re-reads config.git each _run_once,
         # so the command list, per-command priorities, and the legacy-numeric
