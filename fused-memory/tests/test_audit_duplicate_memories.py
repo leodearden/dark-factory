@@ -5170,6 +5170,16 @@ def _span_days(earlier: str, later: str) -> float:
 # below read `{sentinel}` no matter what the clauses say. The values are
 # unforgeable for a second reason too: `<` and `>` are outside
 # `_LIVE_FIELD_SCAN_RE`'s bare value class, so no content can produce them.
+#
+# It also names the SAME THREE field names -- `claimant_run_id`,
+# `heartbeat_at`, `status` -- as every real record it is seeded against.
+# `liveness_snapshot_subject_facts`'s field-vocabulary gate only ADDS a
+# clause-derived key when the clause names the SAME field-NAME set as the
+# seeded core_fact, so a sentinel with a narrower vocabulary (`status` alone,
+# say) would close that second gate regardless of what the real record's
+# clauses say, and every assertion below would silently degrade to
+# `{sentinel}` for a FIXTURE reason rather than the behaviour these classes
+# claim to measure.
 _SENTINEL_CORE_FACT = (
     'claimant_run_id=<sentinel>|heartbeat_at=<sentinel>|'
     'status=<sentinel-one>|status=<sentinel-two>'
@@ -5519,7 +5529,7 @@ _CORE_FACT_DONE = 'claimant_run_id=null|heartbeat_at=null|status=done'
 # record's fields must not join this record's bucket -- a collision the
 # whole-record key would never have produced, because it names only that one
 # field to begin with.
-_LIVENESS_WEAK_WHOLE_94 = ('Point-in-time liveness check performed 2026-07-27 '
+_LIVENESS_WEAK_WHOLE_94 = ('Point-in-time liveness check performed 2026-07-26 '
                            'on task 94: status="in-progress".')
 
 
@@ -5968,32 +5978,35 @@ class TestLivenessClauseFragmentFalseGroup:
             True, 'status=in-progress',
         ), 'the fixture must reach the collision by classifying cleanly'
 
-        # (b) THE PROJECTION. Task 94's clause in the divergent-partial
-        # record names only `status` -- a strict subset of the record's
-        # three-field vocabulary -- so it earns NO clause key. Task 96's
-        # clause names every field the record speaks about, so it keeps its
-        # clause key beside the seed. Asserting BOTH subjects is
-        # load-bearing: it makes the test fail for the fragment reason and
-        # not because clause scoping was disabled wholesale.
+        # (b) PREMISE: task 94's clause in the divergent-partial record
+        # earns no clause-derived key of its own (the full projection,
+        # including 96's surviving clause key beside the seed, is pinned by
+        # TestLivenessSubjectFactsIsAdditive::
+        # test_a_divergent_records_incomplete_clause_earns_no_bucket_of_its_own
+        # -- not re-asserted here). Checking it here too means the corpus
+        # below can only produce (c)'s harm through the unconditional seed,
+        # never a surviving clause key.
         record = _memory('divergent-partial', _LIVENESS_DIVERGENT_PARTIAL_94,
                          category=_OS, metadata={'task_id': '94'})
 
-        assert liveness_snapshot_subject_facts(record, _CORE_FACT_DIVERGENT) == {
-            '94': {_CORE_FACT_DIVERGENT},
-            '96': {_CORE_FACT_DIVERGENT, _CORE_FACT_DONE},
-        }, (
+        subject_facts = liveness_snapshot_subject_facts(record, _CORE_FACT_DIVERGENT)
+        assert subject_facts['94'] == {_CORE_FACT_DIVERGENT}, (
             "94's clause names only `status`, a strict subset of the "
             "record's {claimant_run_id, heartbeat_at, status} vocabulary, "
-            "so it must earn no clause key; 96's clause names all three "
-            "and must keep its clause key beside the seed"
+            'so it must earn no clause key of its own'
         )
 
         # (c) THE HARM, at the level the ARMED metric counts. D is the
         # divergent-partial record; W's WHOLE-record key is exactly the one
-        # field 94's clause in D names. Pre-fix, D's clause key for 94
-        # (`status=in-progress`) joins W's whole-record bucket even though
-        # D's own record asserts two more fields about 94 that W says
-        # nothing about.
+        # field `status=in-progress`. D's own RECORD-level vocabulary is
+        # three fields wide -- claimant_run_id, heartbeat_at, status -- but
+        # that width comes entirely from what D says about task 96; D's own
+        # clause about 94 says only `status`, the same one field W's whole
+        # record says. Pre-fix, D's clause key for 94 joined W's
+        # whole-record bucket anyway, because the gate compares against
+        # D's RECORD-level vocabulary, not what is complete for subject 94
+        # specifically (see liveness_snapshot_subject_facts's docstring for
+        # that trade-off).
         corpus = [
             _dated('D', _LIVENESS_DIVERGENT_PARTIAL_94, _TS_94_JUL24,
                    category=_OS, metadata={'task_id': '94'}),
