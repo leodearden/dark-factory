@@ -1709,6 +1709,52 @@ curator:
   enabled: true
 """
 
+# A nested value with an interior comment AND an interior blank separator.
+# Both used to reset the "keep this key's children" flag, so every child after
+# the first one was silently dropped -- config data loss on exactly the failure
+# mode preservation exists to prevent, and config.yaml's commenting style makes
+# a commented nested value near-certain.
+WITH_A_COMMENTED_NESTED_VALUE = """\
+write_triage:
+  # a future knob
+  future_map:
+    a: 1
+    # explanatory note about b
+    b: 2
+  another: 3
+  t_high: 0.11
+  t_low: 0.05
+  calibration_report_path: old/report.json
+"""
+
+WITH_A_BLANK_INSIDE_A_NESTED_VALUE = """\
+write_triage:
+  future_map:
+    a: 1
+
+    b: 2
+  another: 3
+  t_high: 0.11
+  t_low: 0.05
+  calibration_report_path: old/report.json
+"""
+
+# config.yaml's actual shape since task 3357: a hand-written prose run at the
+# very END of the block, belonging to no key.
+WITH_A_TRAILING_COMMENT_RUN = """\
+write_triage:
+  enabled: true
+  t_high: 0.11
+  t_low: 0.05
+  calibration_report_path: old/report.json
+  # EVIDENCE STATUS (hand-added prose — no numbers here).
+  # - procedural_knowledge: has its own cutoff above.
+
+curator:
+  enabled: true
+"""
+
+
 # A knob this writer has never heard of. The preservation rule is "keep what
 # this writer does not own", not an allowlist of two names -- a future leaf's
 # knob must not be silently dropped by a recalibration that predates it.
@@ -1976,6 +2022,66 @@ class TestWriteTriageConfigBlock:
             _mod().write_triage_config_block(WITH_OPERATOR_KNOBS, None, None, 'r.json')
         assert 'enabled: true' in WITH_OPERATOR_KNOBS
         assert 'candidate_k: 32' in WITH_OPERATOR_KNOBS
+
+    def test_a_comment_inside_a_nested_value_does_not_sever_its_children(self) -> None:
+        """A commented nested value must round-trip WHOLE.
+
+        The child run is decided by the key above it, not by whatever
+        punctuation sits between two children. Resetting the keep-children
+        flag on an interior comment dropped `b: 2` outright — silent config
+        data loss, invisible to any assertion that only checks the first
+        child.
+        """
+        out = _call(WITH_A_COMMENTED_NESTED_VALUE)
+        parsed = yaml.safe_load(out)['write_triage']
+        assert parsed['future_map'] == {'a': 1, 'b': 2}
+        assert parsed['another'] == 3
+        assert '    # explanatory note about b' in out.splitlines()
+
+    def test_a_blank_line_inside_a_nested_value_does_not_sever_its_children(self) -> None:
+        """The blank-line branch had the same defect as the comment branch.
+
+        Asserted separately because the two are separate branches: a fix that
+        only re-arms on comments would leave this one losing children.
+        """
+        parsed = yaml.safe_load(_call(WITH_A_BLANK_INSIDE_A_NESTED_VALUE))['write_triage']
+        assert parsed['future_map'] == {'a': 1, 'b': 2}
+        assert parsed['another'] == 3
+
+    def test_a_trailing_comment_run_survives_and_stays_at_the_end(self) -> None:
+        """Hand-written prose that belongs to no key is still operator content.
+
+        config.yaml carries exactly this shape (the `# EVIDENCE STATUS` note).
+        Position is load-bearing, not cosmetic: re-emitted ABOVE the fence it
+        would become "a comment run followed by an owned key" on the next
+        parse and be dropped, so it would survive one run and vanish on the
+        second. Keeping it at the end is what makes it a fixed point.
+        """
+        out = _call(WITH_A_TRAILING_COMMENT_RUN)
+        body = _block_lines(out)
+        assert '  # EVIDENCE STATUS (hand-added prose — no numbers here).' in body
+        assert '  # - procedural_knowledge: has its own cutoff above.' in body
+        fence = body.index('  # CALIBRATION OUTPUT — do not hand-edit.')
+        assert body.index('  # EVIDENCE STATUS (hand-added prose — no numbers here).') > fence
+        assert body.index('  enabled: true') < fence
+        assert _call(out) == out, 'the trailing run must survive a SECOND run too'
+
+    def test_the_shipped_config_block_round_trips_byte_for_byte(self) -> None:
+        """The end-to-end guard: recalibrating to the values already in the
+        file must be a no-op diff. Any preserved-content bug — a dropped
+        nested child, a dropped prose run, a moved line — shows up here as a
+        spurious diff on the real file rather than on a fixture."""
+        shipped = (
+            Path(__file__).resolve().parents[1] / 'config' / 'config.yaml'
+        ).read_text()
+        block = yaml.safe_load(shipped)['write_triage']
+        assert _mod().write_triage_config_block(
+            shipped,
+            block['t_high'],
+            block['t_low'],
+            block['calibration_report_path'],
+            t_high_by_category=block.get('t_high_by_category'),
+        ) == shipped
 
     def test_the_surrounding_config_still_survives_with_knobs_present(self) -> None:
         """Preservation must not widen (or narrow) what the span scan eats."""

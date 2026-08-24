@@ -408,9 +408,9 @@ write_triage:
   # machine-readable record is the report's per_category section, which
   # the calibration guard test binds. A later --write-config run replaces
   # the four CALIBRATION keys above and PRESERVES the hand-set operator
-  # knobs at the top of this block (task 3127), but it still drops THIS
-  # trailing note: preservation attaches a comment run to the key beneath
-  # it, and this run has no key beneath it. The report survives it.)
+  # knobs at the top of this block -- this trailing note included (task
+  # 3127): a comment run with no key beneath it is re-emitted HERE, at the
+  # end of the block, which is what lets it survive repeated runs.)
   # - procedural_knowledge: has its own cutoff above, derived from that
   #   category's own 242 duplicate / 3328 negative labeled pairs.
   # - observations_and_summaries: NO cutoff. Refusal reason

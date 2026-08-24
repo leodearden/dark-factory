@@ -654,51 +654,80 @@ _CALIBRATION_OWNED_KEYS = frozenset({
 })
 
 
-def _preserved_block_lines(lines: Sequence[str]) -> list[str]:
-    """The lines of an existing ``write_triage:`` body this writer does not own.
+def _preserved_block_lines(lines: Sequence[str]) -> tuple[list[str], list[str]]:
+    """Split an existing ``write_triage:`` body into the parts this writer does not own.
 
-    *lines* is the block body only (the ``write_triage:`` line excluded). A
-    two-space-indented ``key:`` line whose key is not in
-    ``_CALIBRATION_OWNED_KEYS`` is preserved, together with the run of comment
-    lines immediately above it (its explanatory note) and any deeper-indented
-    child lines below it (its nested value). A comment run that is followed by
-    an OWNED key -- the ``# CALIBRATION OUTPUT`` fence and its explanation --
-    is dropped, because the rebuilt block re-emits its own copy.
+    *lines* is the block body only (the ``write_triage:`` line excluded).
+    Returns ``(preserved, trailing)``:
+
+    * ``preserved`` — every two-space-indented ``key:`` line whose key is not
+      in ``_CALIBRATION_OWNED_KEYS``, together with the run of comment lines
+      immediately above it (its explanatory note) and ALL deeper-indented
+      child lines below it (its nested value), interior comments and blank
+      separators included. A comment run that is followed by an OWNED key --
+      the ``# CALIBRATION OUTPUT`` fence and its explanation -- is dropped,
+      because the rebuilt block re-emits its own copy.
+    * ``trailing`` — a comment run at the very END of the body, with no key
+      beneath it. This is hand-written operator prose (config.yaml's
+      ``# EVIDENCE STATUS`` note); it belongs to no key, so it is re-emitted
+      at the END of the rebuilt block rather than above the fence. Putting it
+      back where it was found is what makes it survive repeated runs: emitted
+      above the fence it would become a comment run followed by an owned key
+      on the NEXT parse, and be dropped -- present-then-gone rather than
+      preserved.
+
+    ``keeping_children`` is (re)decided ONLY at an indent<=2 key line. An
+    interior comment or blank line inside a nested value must NOT end the
+    child run: doing so silently discarded every child after the first
+    interior comment, which is the exact config data loss this function
+    exists to prevent.
 
     Line-oriented for the same reason the caller is: pyyaml is the only YAML
     dependency, and a safe_dump round-trip would strip config.yaml's
     operator-facing comments.
     """
     kept: list[str] = []
-    pending_comments: list[str] = []
+    # Comment/blank lines whose fate is not yet decided: they belong to
+    # whatever line comes next, and are discarded if that line is dropped (or
+    # if nothing follows a blank-terminated run).
+    pending: list[str] = []
     keeping_children = False
     for line in lines:
         stripped = line.strip()
         if not stripped:
-            # A blank line ends any comment run and any child block; it is
-            # never itself preserved, so the rebuilt block cannot accumulate
-            # a growing run of separators across successive runs.
-            pending_comments = []
-            keeping_children = False
+            # A blank line is a separator, never content on its own. Inside a
+            # preserved key's nested value it is BUFFERED and flushed with the
+            # next kept line, so the block's internal spacing round-trips;
+            # elsewhere it ends -- and discards -- any comment run above it,
+            # so the rebuilt block cannot accumulate a growing run of
+            # separators across successive runs.
+            if keeping_children:
+                pending.append(line)
+            else:
+                pending.clear()
             continue
         if stripped.startswith('#'):
-            pending_comments.append(line)
-            keeping_children = False
+            pending.append(line)
             continue
         indent = len(line) - len(line.lstrip())
         if indent > 2:
-            # A child of whatever key we last saw.
+            # A child of whatever indent<=2 key we last saw.
             if keeping_children:
+                kept.extend(pending)
                 kept.append(line)
+            pending.clear()
             continue
         key = stripped.split(':', 1)[0].strip()
         keeping_children = key not in _CALIBRATION_OWNED_KEYS
         if keeping_children:
-            kept.extend(pending_comments)
+            kept.extend(pending)
             kept.append(line)
-        pending_comments = []
-    return kept
-
+        pending.clear()
+    # Whatever is still pending is a comment run with no key beneath it. Only
+    # the comments are kept (a trailing blank run is pure separator); they are
+    # returned separately so the caller can re-emit them at the end.
+    trailing = [line for line in pending if line.strip()]
+    return kept, trailing
 
 
 def write_triage_config_block(
@@ -718,7 +747,11 @@ def write_triage_config_block(
     This writer OWNS exactly four keys -- ``t_high``, ``t_low``,
     ``calibration_report_path``, ``t_high_by_category`` -- and PRESERVES
     everything else it finds in the block, comments and nested values
-    included, re-emitting it above the calibration fence. The rule is
+    included, re-emitting it above the calibration fence. The one exception
+    is a trailing comment run that belongs to no key, which is re-emitted
+    BELOW the derived keys, where it was found -- see
+    ``_preserved_block_lines`` for why position is what makes it survive a
+    second run. The rule is
     "preserve what this writer does not own", not an allowlist of known
     knobs, so a key a later leaf adds is not dropped by a recalibration that
     predates it. The reason it matters: ``write_triage.enabled`` is a
@@ -791,10 +824,17 @@ def write_triage_config_block(
     # Hand-set knobs found in the existing block, re-emitted ABOVE the
     # calibration fence so the shipped file's layout round-trips unchanged and
     # the derived and hand-set halves stay visually separable.
-    preserved = (
-        ''.join(_preserved_block_lines(lines[start + 1:end]))
-        if start is not None else ''
+    preserved_lines, trailing_lines = (
+        _preserved_block_lines(lines[start + 1:end])
+        if start is not None else ([], [])
     )
+    preserved = ''.join(preserved_lines)
+    # Hand-written prose that belonged to no key is re-emitted at the END,
+    # where it was found -- see _preserved_block_lines. Above the fence it
+    # would be swallowed by the next run's "comment run above an owned key"
+    # rule, which is how config.yaml's `# EVIDENCE STATUS` note used to be
+    # lost.
+    trailing = ''.join(trailing_lines)
 
     block = (
         f'{_BLOCK_KEY}\n'
@@ -810,6 +850,7 @@ def write_triage_config_block(
         f'  t_low: {t_low}\n'
         f'  calibration_report_path: {report_path}\n'
         f'{by_category}'
+        f'{trailing}'
     )
 
     if start is None:
