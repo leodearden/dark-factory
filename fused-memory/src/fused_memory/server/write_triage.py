@@ -446,6 +446,22 @@ async def retrieve_candidates(
     swallowing here would turn a wiring bug — a renamed kwarg, a changed
     signature — into a silent "no candidates found" that routes every write to
     ``stored`` with nothing to tell it apart from a genuinely novel corpus.
+
+    BUT AN EXCEPTION IS ONLY HALF THE FAILURE SURFACE, and the smaller half.
+    ``MemoryService.search`` does NOT raise on a store outage: it catches the
+    store exception (or cancels the store on timeout), logs
+    ``search.store_failed``, and returns an EMPTY ``SearchResults`` carrying
+    ``degraded=True`` and ``failed_stores``. So a mem0 outage — the dominant
+    retrieval failure — reaches this function as an ordinary empty result,
+    not as a raise. The `except` arm in :func:`triage_write` therefore catches
+    only wiring bugs (a renamed kwarg → ``TypeError``, a bad category/store
+    string → ``ValueError``); the outage is caught by that function's explicit
+    ``degraded`` check instead.
+
+    This is why the ``SearchResults`` object is returned UN-TRANSFORMED — no
+    slice, no comprehension, no ``sorted()``. Those all return a plain
+    ``list`` and silently drop ``degraded``/``failed_stores``, which would
+    re-hide the outage from the only code positioned to count it.
     """
     return await memory_service.search(
         query=content,
@@ -658,6 +674,37 @@ async def triage_write(
         k = resolve_candidate_k(memory_service)
         t_high, t_low = resolve_bands(memory_service)
         results = await retrieve_candidates(memory_service, content, project_id, k)
+        # A RETRIEVAL OUTAGE DOES NOT ARRIVE AS AN EXCEPTION. This check is
+        # not defensive tidiness — without it the fail-open apparatus cannot
+        # see the failure mode it was built for. ``MemoryService.search``
+        # ABSORBS every store exception and every store timeout: it logs
+        # `search.store_failed`, appends to `failed_stores`, and returns an
+        # EMPTY ``SearchResults`` with ``degraded=True`` rather than raising.
+        # So when mem0 is down or slow — the dominant retrieval failure, and
+        # the one INV-4 names first — the `except` arm below never fires,
+        # `decide_band([])` returns `stored`, the counter never increments,
+        # and every write in the outage is stored untriaged and
+        # indistinguishable from a genuinely novel corpus. That is precisely
+        # the silent degradation this module exists to prevent.
+        #
+        # The degrade metadata is readable here ONLY because
+        # `retrieve_candidates` returns the SearchResults object
+        # un-transformed: `degraded`/`failed_stores` do NOT survive a slice,
+        # a comprehension, or a sorted() (see `memory_service.SearchResults`'s
+        # own warning). Do not "clean up" that return into a list.
+        #
+        # ANY degraded retrieval is a fail-open here, with no partial-result
+        # subtlety, because `_TRIAGE_STORES` is the single store `mem0`:
+        # degraded can only mean the one store triage depends on failed, so
+        # the candidate slate is empty-or-unusable, never merely thinner.
+        if getattr(results, 'degraded', False):
+            failed = getattr(results, 'failed_stores', None)
+            _record_fail_open(
+                counter, project_id,
+                RuntimeError(f'search degraded: failed_stores={failed!r}'),
+                stage='retrieve',
+            )
+            return BandDecision(OUTCOME_STORED, None, None, t_high, t_low)
         decision = decide_band(results, t_high=t_high, t_low=t_low)
     except Exception as exc:  # noqa: BLE001 — C1: nothing escapes this path.
         _record_fail_open(counter, project_id, exc, stage='retrieve')

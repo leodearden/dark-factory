@@ -54,7 +54,7 @@ from fused_memory.server.write_triage import (
     retrieve_candidates,
     triage_write,
 )
-from fused_memory.services.memory_service import RRF_K
+from fused_memory.services.memory_service import RRF_K, SearchResults
 
 # The real post-RRF relevance_score for a rank-1 hit, from production rather
 # than restated as the literal 60 — see test_near_duplicate_guard.py.
@@ -846,6 +846,27 @@ class TestRetrieveCandidates:
         with pytest.raises(RuntimeError):
             await retrieve_candidates(service, 'c', 'p', 20)
 
+    @pytest.mark.asyncio
+    async def test_the_degrade_metadata_survives_this_helper(self) -> None:
+        """The un-transformed return is what makes an OUTAGE detectable.
+
+        A store outage does not raise out of `MemoryService.search` — it comes
+        back as an empty `SearchResults` carrying `degraded=True`. That flag is
+        `triage_write`'s only signal, and it does NOT survive a slice, a
+        comprehension, or a `sorted()` (SearchResults' own documented warning:
+        those return a plain `list`). So "tidying" the return here would
+        silently re-hide every retrieval outage from the counter.
+        """
+        results = SearchResults([], degraded=True, failed_stores=['mem0'])
+        service = self._service(results=results)
+
+        got = await retrieve_candidates(service, 'c', 'p', 20)
+
+        assert getattr(got, 'degraded', False) is True, (
+            'degrade metadata was dropped — triage_write can no longer see an outage'
+        )
+        assert getattr(got, 'failed_stores', None) == ['mem0']
+
 
 # ---------------------------------------------------------------------------
 # Fail-open + storm counter (INV-4)
@@ -989,6 +1010,79 @@ class TestTriageWriteFailsOpen:
 
         assert decision.outcome == OUTCOME_STORED
         assert counter.live_count() == 1
+
+    @pytest.mark.asyncio
+    async def test_a_degraded_search_stores_and_counts_once(self) -> None:
+        """THE OUTAGE DOES NOT RAISE — this is the failure the alarm is for.
+
+        `MemoryService.search` absorbs every store exception and every store
+        timeout: it logs `search.store_failed` and returns an EMPTY
+        `SearchResults` with `degraded=True`, never a raise. So the mem0
+        outage that INV-4 names first arrives as an ordinary empty result. Had
+        `triage_write` relied on its `except` arm alone, `decide_band([])`
+        would answer `stored`, the counter would stay at zero, and every write
+        in the outage would be stored untriaged and indistinguishable from a
+        genuinely novel corpus — the silent degradation, undetected by the
+        apparatus built to detect it.
+
+        The stub returns the REAL `SearchResults` type, not a raising mock,
+        precisely because a raising mock is not how search fails.
+        """
+        counter = TriageFailOpenCounter(time_provider=_Clock())
+        service = self._service(search=AsyncMock(return_value=SearchResults(
+            [], degraded=True, failed_stores=['mem0'],
+        )))
+
+        decision = await triage_write(
+            service, content='c', project_id='p', counter=counter,
+        )
+
+        assert decision.outcome == OUTCOME_STORED, 'the write is never blocked'
+        assert counter.live_count() == 1, 'the outage must be counted (INV-4)'
+
+    @pytest.mark.asyncio
+    async def test_a_degraded_search_counts_even_when_it_returned_candidates(
+        self,
+    ) -> None:
+        """A partial slate is not a thinner slate — `_TRIAGE_STORES` is one store.
+
+        `degraded` can only mean mem0 — the sole store triage searches —
+        failed or timed out, so whatever leaked through is an arbitrary
+        fragment of the corpus. Banding on it would let a high-scoring
+        survivor `restated`-attach a write whose true canonical was in the
+        part that never came back.
+        """
+        counter = TriageFailOpenCounter(time_provider=_Clock())
+        service = self._service(search=AsyncMock(return_value=SearchResults(
+            [_result('m1', 0.97)], degraded=True, failed_stores=['mem0'],
+        )))
+
+        decision = await triage_write(
+            service, content='c', project_id='p', counter=counter,
+        )
+
+        assert decision.outcome == OUTCOME_STORED, f'{decision!r}'
+        assert decision.canonical_id is None, 'nothing may attach to a partial slate'
+        assert counter.live_count() == 1
+
+    @pytest.mark.asyncio
+    async def test_a_healthy_empty_search_counts_zero(self) -> None:
+        """The other side of the boundary: an empty corpus is not an outage.
+
+        `SearchResults([])` with `degraded=False` is what a genuinely novel
+        write looks like. If that counted, the counter would storm on a fresh
+        project and the alarm would be trained away before it ever fired for
+        real.
+        """
+        counter = TriageFailOpenCounter(time_provider=_Clock())
+        service = self._service(search=AsyncMock(return_value=SearchResults([])))
+
+        decision = await triage_write(
+            service, content='c', project_id='p', counter=counter,
+        )
+
+        assert decision.outcome == OUTCOME_STORED
+        assert counter.live_count() == 0, 'a novel write is not a fail-open'
 
     @pytest.mark.asyncio
     async def test_a_raising_judge_stores_and_counts_once(self) -> None:

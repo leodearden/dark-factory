@@ -46,7 +46,7 @@ from fused_memory.server.write_triage import (
     TRIAGE_OUTCOMES,
     TriageFailOpenCounter,
 )
-from fused_memory.services.memory_service import RRF_K
+from fused_memory.services.memory_service import RRF_K, SearchResults
 
 _PROJECT_ID = 'dark_factory'
 
@@ -716,6 +716,38 @@ class TestC1HoldsEndToEnd:
         mock_service.add_memory.assert_awaited_once()
         assert mock_service.add_memory.await_args.kwargs['content'] == _CONTENT
         assert counter.live_count() == 1, 'the degradation must be counted (INV-4)'
+
+    @pytest.mark.asyncio
+    async def test_a_degraded_search_still_stores_the_write_and_counts(
+        self, monkeypatch,
+    ) -> None:
+        """The outage shape, end to end — and it does NOT raise.
+
+        The sibling test above stubs `search` with `side_effect=RuntimeError`,
+        which is NOT how a mem0 outage reaches this path: `MemoryService.search`
+        catches the store exception (and cancels the store on timeout), logs
+        `search.store_failed`, and returns an EMPTY `SearchResults` with
+        `degraded=True`. Stubbing the REAL return shape is the whole point of
+        this test — with a raising mock the suite passes while an actual
+        outage stores every write untriaged, uncounted and unescalated.
+        """
+        counter = self._install_counter(monkeypatch)
+        mock_service = AsyncMock()
+        _configure_config(mock_service, enabled=True)
+        _configure_pass_through_add_memory(mock_service)
+        mock_service.search.return_value = SearchResults(
+            [], degraded=True, failed_stores=['mem0'],
+        )
+        server = create_mcp_server(mock_service)
+
+        result = await _call(server)
+
+        assert result[ROUTED_KEY] == OUTCOME_STORED, f'{result!r}'
+        assert 'error' not in result, f'a fail-open must not error the write: {result!r}'
+        assert 'error_type' not in result, f'{result!r}'
+        mock_service.add_memory.assert_awaited_once()
+        assert mock_service.add_memory.await_args.kwargs['content'] == _CONTENT
+        assert counter.live_count() == 1, 'the outage must be counted (INV-4)'
 
     @pytest.mark.asyncio
     async def test_a_wiring_bug_class_also_stores_rather_than_erroring(
