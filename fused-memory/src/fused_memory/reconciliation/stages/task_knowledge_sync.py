@@ -4117,8 +4117,8 @@ class TaskKnowledgeSync(BaseStage):
         (task 2224), so post-hoc detection is redundant.
 
         ``report.stats['tasks_created']`` (task 3046) is also normalized here,
-        plus repaired — UPWARD ONLY — against ``report.stats['task_created_records']``,
-        the action-shaped ground truth the '## Task-Creation Accounting' prompt
+        plus repaired — UPWARD ONLY — from ``report.stats['task_created_records']``,
+        the action-shaped record list the '## Task-Creation Accounting' prompt
         section mandates Stage 2 append to at the moment each ``resolve_ticket``
         call confirms a creation. ``submit_task``/``resolve_ticket`` are not
         journaled, so unlike the flag counters above, ``tasks_created`` has no
@@ -4132,16 +4132,39 @@ class TaskKnowledgeSync(BaseStage):
         (e.g. ``"3"``) can never look like an undercount and get overwritten
         downward — the coerced value is always what ends up in
         ``report.stats['tasks_created']``, so normalization is real even when no
-        repair fires. The deduped valid-record count (project-scoped via
-        :func:`_count_valid_task_created_records`'s ``default_project_id``, so a
-        record with an omitted ``project_id`` collapses onto this stage's own
+        repair fires.
+
+        That record list is NOT trusted as unverified ground truth (task 3051).
+        It is itself pure LLM self-report — nothing journals it — so a mistaken
+        or hallucinated entry would otherwise inflate ``tasks_created`` with no
+        external check, violating the standard that a stat may only increment
+        after the underlying MCP operation is confirmed to have succeeded. Each
+        deduped ``(project_id, task_id)`` key from :func:`_action_record_keys`
+        (project-scoped via its ``default_project_id``, so a record with an
+        omitted ``project_id`` collapses onto this stage's own
         ``self.project_id`` rather than masquerading as a second cross-project
-        filing) is always published as ``report.stats['task_created_records_valid']``;
-        when it exceeds the coerced self-reported ``tasks_created``, the pre-repair
-        raw value is stashed under ``report.stats['tasks_created_reported']``,
-        ``tasks_created`` is overwritten, and a WARNING is logged. Never clamped
-        downward — task 2230 (W5-mu) deliberately removed symmetric clamping of
-        Stage 2's self-reported counters from this method.
+        filing) is therefore resolved to its OWN project's root via
+        ``self.known_projects`` and confirmed with ``taskmaster.get_task`` by
+        :func:`_corroborate_record_keys` before it may raise the counter.
+
+        The fail direction is CLOSED on the increment and SAFE for the stage: a
+        key whose lookup raises, returns not-found, returns an inconclusive
+        error, or cannot be issued at all does not count, but because the
+        repair is upward-only that can only ever WITHHOLD a repair — it never
+        moves a counter down (task 2230 / W5-mu deliberately removed symmetric
+        clamping of Stage 2's self-reported counters from this method), never
+        raises, and never aborts the stage.
+
+        Four record stats are always published so the outcome is auditable
+        rather than silent: ``task_created_records_valid`` (the deduped
+        STRUCTURALLY-valid record count, unchanged in meaning — pre-
+        corroboration), plus ``task_created_records_corroborated`` /
+        ``_uncorroborated`` / ``_unresolvable``, which partition it and let an
+        operator distinguish "the agent invented records" from "we could not
+        check". When the CORROBORATED count exceeds the coerced self-reported
+        ``tasks_created``, the pre-repair raw value is stashed under
+        ``report.stats['tasks_created_reported']``, ``tasks_created`` is
+        overwritten, and a WARNING is logged.
 
         Args:
             report: The ``StageReport`` returned by ``super().run()``.
@@ -4186,28 +4209,42 @@ class TaskKnowledgeSync(BaseStage):
         # proactive/cross-project filing is recovered here instead of lost
         # (run 507bc25b reported tasks_created=0 while filing task 3045).
         report.stats.setdefault('tasks_created', 0)
-        observed = _count_valid_task_created_records(
+        record_keys = _action_record_keys(
             report.stats.get('task_created_records'),
             default_project_id=self.project_id,
         )
+        observed = len(record_keys)
         report.stats['task_created_records_valid'] = observed
         reported = report.stats.get('tasks_created')
         # Coerce before comparing (task-3046 amendment): a non-int self-report
         # (e.g. "3" or 3.0) must not collapse to 0 and look like an undercount
-        # relative to `observed` — that would silently move a legitimately
-        # larger self-report DOWN, which the upward-only contract forbids.
-        # The coerced value is written back unconditionally so the "normalize"
-        # half of this block is real even when no repair fires.
+        # relative to the corroborated count — that would silently move a
+        # legitimately larger self-report DOWN, which the upward-only contract
+        # forbids.  The coerced value is written back unconditionally so the
+        # "normalize" half of this block is real even when no repair fires.
         reported_int = _coerce_tasks_created_count(reported)
         report.stats['tasks_created'] = reported_int
-        if observed > reported_int:
+
+        # Corroborate before repairing (task 3051).  The record list is LLM
+        # self-report, so it may only RAISE the counter for records whose task
+        # get_task confirms actually exists, each checked against its own
+        # project's root.  Fail-closed on the increment, never on the stage.
+        corroboration = await _corroborate_record_keys(
+            self.taskmaster, self.known_projects, record_keys,
+        )
+        report.stats['task_created_records_corroborated'] = corroboration.corroborated
+        report.stats['task_created_records_uncorroborated'] = corroboration.uncorroborated
+        report.stats['task_created_records_unresolvable'] = corroboration.unresolvable
+
+        if corroboration.corroborated > reported_int:
             report.stats['tasks_created_reported'] = reported
-            report.stats['tasks_created'] = observed
+            report.stats['tasks_created'] = corroboration.corroborated
             logger.warning(
                 'reconciliation.stage2_tasks_created_undercount: run_id=%s project_id=%s '
-                'self-reported tasks_created=%r but %d confirmed task_created_records were '
-                'emitted — repairing upward to %d.',
-                run_id, self.project_id, reported, observed, observed,
+                'self-reported tasks_created=%r but %d task_created_records were confirmed '
+                'to exist via get_task — repairing upward to %d.',
+                run_id, self.project_id, reported,
+                corroboration.corroborated, corroboration.corroborated,
             )
 
     async def _maybe_queue_briefing_refresh_tasks(self, run_id: str = '') -> None:
