@@ -2249,19 +2249,6 @@ class SqliteTaskBackend:
                 )
             row_status = row[1]
 
-            # Gate on NULL-ness, not truthiness: an empty-string claimant is
-            # non-NULL and is an anomalous mint worth observing.
-            stamps_non_null_claimant = (
-                claimant_run_id is not _UNSET and claimant_run_id is not None
-            )
-            if stamps_non_null_claimant and row_status in TERMINAL:
-                logger.error(
-                    'claimant_stamped_on_terminal: set_task_claimant stamped a claimant '
-                    'onto a terminal row — task_id=%s status=%s claimant_run_id=%s '
-                    'tag=%s project_root=%s',
-                    task_id, row_status, claimant_run_id, tag, project_root,
-                )
-
             set_columns: list[str] = []
             set_values: list[Any] = []
             if claimant_run_id is not _UNSET:
@@ -2289,6 +2276,26 @@ class SqliteTaskBackend:
                 f'UPDATE tasks SET {set_clause} WHERE tag = ? AND id = ?',
                 set_values,
             )
+
+            # Emit AFTER the UPDATE, not beside the SELECT above: the two
+            # early returns between them (no-kwargs no-op; claimant-columns-
+            # absent fail-safe) write NOTHING, and E-3 scopes the ERROR to a
+            # call that actually PERSISTS a non-NULL claimant. Emitting
+            # earlier would fire this tripwire for a write that never
+            # happened — do not hoist it back up.
+            #
+            # Gate on NULL-ness, not truthiness: an empty-string claimant is
+            # non-NULL and is an anomalous mint worth observing.
+            stamps_non_null_claimant = (
+                claimant_run_id is not _UNSET and claimant_run_id is not None
+            )
+            if stamps_non_null_claimant and row_status in TERMINAL:
+                logger.error(
+                    'claimant_stamped_on_terminal: set_task_claimant stamped a claimant '
+                    'onto a terminal row — task_id=%s status=%s claimant_run_id=%s '
+                    'tag=%s project_root=%s',
+                    task_id, row_status, claimant_run_id, tag, project_root,
+                )
         return {
             'id': task_id,
             'message': f'Updated claimant fields for task {task_id}',
