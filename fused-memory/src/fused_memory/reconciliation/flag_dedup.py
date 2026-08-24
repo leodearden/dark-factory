@@ -3262,14 +3262,47 @@ _NON_CANCELLED_TASK_STATUSES: list[str] = sorted(
 )
 
 #: Fixed lexicon of phrases that assert an idea/pattern was never converted
-#: into a tracked task.  Case-insensitive substring match, mirroring
+#: into a tracked task.  Case-insensitive substring match
+#: (:func:`_asserts_never_tracked`), mirroring
 #: _CORRECTION_LANGUAGE_SUBSTRINGS' fixed-lexicon approach.
+#:
+#: **Every entry MUST retain a negation token** ('no ', 'never', or 'not ').
+#: Because matching is plain case-insensitive substring containment, an
+#: entry that drops its negation matches the OPPOSITE claim: e.g. 'fix task
+#: has been filed' (no negation) matches 'A fix task has been filed for
+#: this recurring finding' — a finding announcing that a task DOES exist —
+#: which would let this filter DROP a real, unresolved complaint and
+#: silence it permanently. This is why 'has been filed', 'task has been
+#: filed' and 'fix task has been filed' are deliberately NOT entries here,
+#: even though they would otherwise widen coverage.
+#:
+#: The seven 'no fix task has been filed'..'not been filed' entries were
+#: added by task 4711 to reach the "no fix task has been filed" complaint
+#: class — the wording of Leo's 2026-08-17 ruling on gate 3841, from the
+#: originating know_live flag e3527208 / dark_factory task 598 — which the
+#: original five "never .../no tracked task" entries did not match. Two
+#: other candidates were considered and deliberately EXCLUDED as
+#: over-broad: 'untracked' (matches unrelated findings like 'The git
+#: working tree has untracked files ...' — cf. flag_types
+#: untracked_process_gap, git_working_tree_missing_operator_decision) and
+#: 'no task' (matches 'This flag has no task_id attached, so Stage 2
+#: cannot route it.'). See TestNeverTrackedLexiconWidening in
+#: test_flag_dedup.py for the reproduced counterexamples backing both
+#: exclusions.
+#:
+#: _STOPWORDS is deliberately NOT extended with 'fix' even though it is now
+#: boilerplate from the "no fix task has been filed" wrapper: stopwording a
+#: term shrinks the denominator of every candidate's coverage computation,
+#: which makes the filter strictly LOOSER (more false drops) for every
+#: caller of _significant_terms, not just this widened class.
 _NEVER_TRACKED_PHRASES: frozenset[str] = frozenset({
     'never converted to a tracked task',
     'was never converted to a task',
     'never tracked',
     'never filed as a task',
     'no tracked task',
+    # task 4711 additions — see the docstring above for the negation-token
+    # invariant and the deliberately excluded 'untracked' / 'no task'.
     'no fix task has been filed',
     'no task has been filed',
     'no fix task',
