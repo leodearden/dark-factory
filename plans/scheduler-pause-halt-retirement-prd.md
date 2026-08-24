@@ -356,8 +356,12 @@ No waivers required.
   1's re-testability test on the same analogy as EWA and park-stop, but no measurement
   campaign has been run on them and the guard caps a cost runaway; this PRD enumerates
   them so no call site is unclassified, and deliberately does not act on them. **Owner
-  filed 2026-08-24: task 4703**, which measures the supervision argument and rules on
-  whether the trip's `pause_scheduler` call survives at all. Its Phase-0 measurement
+  filed 2026-08-24: task 4703**, which measures the supervision argument, feeding **human
+  gate 4721** where Leo rules on whether the trip's `pause_scheduler` call survives at all.
+  The chain is `4703 → 4721 → 4000`: the gate is a `deterministic` / `always_escalates`
+  pure gate, so the ruling is mechanically required rather than left to an agent's prose
+  instruction, and task 4000 (the change that raises the odds of this guard firing) cannot
+  dispatch until it is resolved. Its Phase-0 measurement
   already establishes that the guard has NEVER fired (0 of 356,396 events), that the
   misconfigured predicate has never come within 3 of its threshold, and — the part that
   reframes the question — that the SUPERVISOR STOP, not the pause, is what caps the
