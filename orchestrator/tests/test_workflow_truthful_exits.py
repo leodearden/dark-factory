@@ -35,12 +35,21 @@ from _workflow_helpers import FakeScheduler
 from shared.task_transitions import outcome_allows_status
 
 from orchestrator.config import OrchestratorConfig
+from orchestrator.git_ops import (
+    WarmLaneDiskPressure,
+    WarmLanePoolExhausted,
+    WarmLanePoolHardDown,
+    WarmLaneRequeue,
+    WarmLaneReseedContaminated,
+    WarmLaneSoftPressure,
+)
 from orchestrator.scheduler import (
     DoneGateRejection,
     SetTaskStatusRejected,
     TerminalExitRejection,
 )
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome, WorkflowState
+from orchestrator.workflow_types import classify_failure
 
 
 def _make_workflow(
@@ -280,3 +289,92 @@ async def test_repend_for_requeue_never_reraises(
     result = await wf._repend_for_requeue()
 
     assert result is None or isinstance(result, WorkflowOutcome)
+
+
+# ---------------------------------------------------------------------------
+# Boundary #12a — the warm-lane REQUEUED exit re-pends the row
+# ---------------------------------------------------------------------------
+
+WARM_LANE_EXCS = [
+    WarmLanePoolExhausted("warm-lane pool exhausted for branch '3538'; requeue"),
+    WarmLaneDiskPressure("warm-lane seed disk pressure for branch '3538'; requeue"),
+    WarmLanePoolHardDown("warm-lane base absent (pool hard-down) for '3538'; requeue"),
+    WarmLaneSoftPressure("warm-lane soft pressure for branch '3538'; requeue"),
+    WarmLaneReseedContaminated("warm-lane reseed contaminated for '3538'; requeue"),
+    WarmLaneRequeue("bare warm-lane requeue for branch '3538'"),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'exc', WARM_LANE_EXCS, ids=[type(e).__name__ for e in WARM_LANE_EXCS],
+)
+async def test_warm_lane_requeue_repends_the_row(
+    tmp_path: Path, exc: WarmLaneRequeue,
+):
+    """run()'s warm-lane REQUEUED exit leaves the row ``pending``, not stranded.
+
+    Today this path returns REQUEUED with NO status write, so the row stays
+    ``in-progress`` (written by ``_setup_worktree_and_artifacts``) and the
+    harness slot ``finally`` then nulls the claimant — the exact
+    ``(in-progress, NULL claimant)`` strand shape.  After the fix the last
+    status row is ``pending``, so ordinary dispatch recovers the task and
+    recovery no longer depends on the stranded sweep (which refuses to act
+    while any escalation is open).
+    """
+    sched = FakeScheduler()
+    wf = _make_workflow(tmp_path=tmp_path, scheduler=sched)
+    wf.git_ops.create_worktree = AsyncMock(side_effect=exc)
+    mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
+    wf._mark_blocked = mark_blocked  # type: ignore[method-assign]
+
+    report = await wf.run()
+
+    # (1) the row is re-pended at exit
+    assert sched.statuses[wf.task_id][-1] == 'pending', (
+        f'expected the row re-pended before the REQUEUED exit; '
+        f'history={sched.statuses[wf.task_id]!r}'
+    )
+    # (2) the TerminalReport is otherwise UNCHANGED (behaviour-parity guard
+    #     for the disposition-table single-sourcing tests)
+    disp = classify_failure(exc)
+    assert report.outcome == WorkflowOutcome.REQUEUED
+    assert report.reason == disp.reason_prefix
+    assert report.phase == wf.machine.state
+    assert report.blocked_from_phase == wf.machine.state
+    assert report.counts_against_requeue_cap == disp.counts_against_requeue_cap
+    # (3) no block path taken
+    mark_blocked.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_warm_lane_requeue_on_cancelled_row_returns_cancelled(tmp_path: Path):
+    """A cancelled row observed by the re-pend write wins over the requeue intent.
+
+    ``set_task_status('pending')`` raises ``TerminalExitRejection(old_status=
+    'cancelled')``; ``run()`` must return CANCELLED (not REQUEUED) and the
+    rejection must NOT escape — this clause is a SIBLING of ``_drive()``'s
+    ``except SetTaskStatusRejected``, so nothing downstream would catch it.
+    """
+    sched = FakeScheduler()
+    wf = _make_workflow(tmp_path=tmp_path, scheduler=sched)
+    wf.git_ops.create_worktree = AsyncMock(
+        side_effect=WarmLanePoolExhausted('pool exhausted; requeue')
+    )
+
+    real_set = sched.set_task_status
+
+    async def _reject_pending(task_id: str, status: str, **kwargs):
+        if status == 'pending':
+            raise TerminalExitRejection(
+                task_id=task_id, old_status='cancelled',
+                target_status='pending', raw='terminal-exit gate',
+            )
+        await real_set(task_id, status, **kwargs)
+
+    sched.set_task_status = _reject_pending  # type: ignore[method-assign]
+
+    report = await wf.run()
+
+    assert report.outcome == WorkflowOutcome.CANCELLED
+    assert wf.machine.state is WorkflowState.CANCELLED
