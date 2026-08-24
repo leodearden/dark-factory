@@ -72,7 +72,11 @@ import pytest
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.reconciliation import StageId, StageReport
 from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
-from fused_memory.reconciliation.stages.task_knowledge_sync import TaskKnowledgeSync
+from fused_memory.reconciliation.stages.task_knowledge_sync import (
+    _TASK_CREATED_SUCCESS_STATUSES,
+    TaskKnowledgeSync,
+    _action_record_keys,
+)
 
 # ── Shared harness ───────────────────────────────────────────────────────────
 #
@@ -237,3 +241,160 @@ class TestAuditHarness:
         await asyncio.gather(*(stub.get_task(i, '/repo/df') for i in range(4)))
 
         assert stub.max_concurrent == 4
+
+
+# ── step-3: _action_record_keys ──────────────────────────────────────────────
+
+
+class _ExplodingRecord(dict):
+    """A dict-shaped record that raises while being inspected."""
+
+    def get(self, key, default=None):  # type: ignore[override]
+        raise ValueError(f'record inspection exploded on {key!r}')
+
+
+class TestActionRecordKeys:
+    """``_action_record_keys(records, default_project_id, valid_statuses)``.
+
+    The corroboration pass needs the actual ``(project_id, task_id)`` pairs, not
+    just how many there are, so task 3046's counting logic is factored into a
+    helper that RETURNS the deduped key set. Every rule 3046 established must
+    survive that move — these pins are the guard against silent drift, and
+    ``_count_valid_task_created_records`` becomes ``len()`` of this.
+
+    ``valid_statuses`` is a parameter (not a hardcoded constant read) because
+    the follow-up ``tasks_hints_updated`` records work reuses this helper with
+    its own accepted-status vocabulary.
+    """
+
+    def test_returns_a_set_of_project_task_pairs(self):
+        keys = _action_record_keys(
+            [
+                {'action': 'task_created', 'task_id': '3045', 'status': 'created',
+                 'project_id': 'dark_factory'},
+            ],
+        )
+
+        assert keys == {('dark_factory', '3045')}
+        assert isinstance(keys, set)
+
+    @pytest.mark.parametrize(
+        'status',
+        ['created', 'CREATED', ' Created ', 'combined', 'COMBINED', '\tcombined\n'],
+    )
+    def test_status_match_is_case_and_whitespace_insensitive(self, status):
+        keys = _action_record_keys(
+            [{'task_id': '1', 'status': status, 'project_id': 'p'}],
+        )
+
+        assert keys == {('p', '1')}
+
+    @pytest.mark.parametrize('status', ['failed', 'FAILED', ' failed ', 'pending', '', None, 7])
+    def test_non_accepted_status_never_keys_even_with_a_task_id(self, status):
+        """`failed` is never counted regardless of a present task_id."""
+        keys = _action_record_keys(
+            [{'task_id': '3045', 'status': status, 'project_id': 'p'}],
+        )
+
+        assert keys == set()
+
+    @pytest.mark.parametrize('task_id', [None, '', '   '])
+    def test_missing_or_blank_task_id_is_skipped(self, task_id):
+        keys = _action_record_keys(
+            [{'task_id': task_id, 'status': 'created', 'project_id': 'p'}],
+        )
+
+        assert keys == set()
+
+    def test_same_numeric_id_under_two_projects_is_two_keys(self):
+        """Taskmaster ids are per-project, so cross-project routing filing id
+        3045 into two projects is TWO tasks, not one duplicate report."""
+        keys = _action_record_keys(
+            [
+                {'task_id': 3045, 'status': 'created', 'project_id': 'dark_factory'},
+                {'task_id': '3045', 'status': 'created', 'project_id': 'reify'},
+            ],
+        )
+
+        assert keys == {('dark_factory', '3045'), ('reify', '3045')}
+
+    def test_duplicate_records_collapse_to_one_key(self):
+        keys = _action_record_keys(
+            [
+                {'task_id': 3045, 'status': 'created', 'project_id': 'dark_factory'},
+                {'task_id': ' 3045 ', 'status': 'combined', 'project_id': ' dark_factory'},
+            ],
+        )
+
+        assert keys == {('dark_factory', '3045')}
+
+    @pytest.mark.parametrize('project_id', [None, '', '   '])
+    def test_missing_or_blank_project_id_falls_back_to_default(self, project_id):
+        """An omitted project_id must not masquerade as a second, distinct
+        cross-project filing of the same task."""
+        keys = _action_record_keys(
+            [
+                {'task_id': '3045', 'status': 'created', 'project_id': project_id},
+                {'task_id': '3045', 'status': 'created', 'project_id': 'dark_factory'},
+            ],
+            default_project_id='dark_factory',
+        )
+
+        assert keys == {('dark_factory', '3045')}
+
+    def test_absent_project_id_key_falls_back_to_default(self):
+        keys = _action_record_keys(
+            [{'task_id': '3045', 'status': 'created'}],
+            default_project_id='dark_factory',
+        )
+
+        assert keys == {('dark_factory', '3045')}
+
+    def test_default_project_id_defaults_to_none(self):
+        keys = _action_record_keys([{'task_id': '3045', 'status': 'created'}])
+
+        assert keys == {(None, '3045')}
+
+    @pytest.mark.parametrize(
+        'records',
+        [None, 'not-a-list', 42, {}, {'task_id': '1'}, [], ()],
+        ids=['none', 'str', 'int', 'empty-dict', 'dict', 'empty-list', 'tuple'],
+    )
+    def test_non_list_or_empty_input_returns_empty_set(self, records):
+        assert _action_record_keys(records) == set()
+
+    def test_non_dict_and_exploding_entries_are_skipped_not_propagated(self):
+        """A malformed record degrades to 'not counted', never to an exception
+        that would corrupt an otherwise-good stage report."""
+        keys = _action_record_keys(
+            [
+                None,
+                'x',
+                ['a'],
+                _ExplodingRecord(task_id='9', status='created', project_id='p'),
+                {'task_id': '3045', 'status': 'created', 'project_id': 'dark_factory'},
+            ],
+        )
+
+        assert keys == {('dark_factory', '3045')}
+
+    def test_valid_statuses_parameter_is_honoured(self):
+        """A custom accepted-status set changes which records key — the seam
+        the follow-up tasks_hints_updated work reuses."""
+        records = [
+            {'task_id': '1', 'status': 'created', 'project_id': 'p'},
+            {'task_id': '2', 'status': 'updated', 'project_id': 'p'},
+        ]
+
+        assert _action_record_keys(records) == {('p', '1')}
+        assert _action_record_keys(records, valid_statuses=frozenset({'updated'})) == {('p', '2')}
+
+    def test_default_valid_statuses_is_the_task_created_vocabulary(self):
+        records = [
+            {'task_id': str(i), 'status': status, 'project_id': 'p'}
+            for i, status in enumerate(sorted(_TASK_CREATED_SUCCESS_STATUSES))
+        ]
+
+        assert _action_record_keys(records) == {
+            ('p', str(i)) for i in range(len(_TASK_CREATED_SUCCESS_STATUSES))
+        }
