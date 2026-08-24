@@ -53,7 +53,11 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from fused_memory.memory_metadata import EXPERIMENTAL_KEY_PREFIX
+from fused_memory.memory_metadata import (
+    EXPERIMENTAL_KEY_PREFIX,
+    normalize_supersedes,
+)
+from fused_memory.utils.validation import is_full_uuid
 
 __all__ = [
     'EXIT_CLOSED',
@@ -260,6 +264,11 @@ def evaluate_closure(
     topic = str(block.get('topic') or '')
 
     reasons: list[dict[str, Any]] = []
+    # Case-folded so a rendering difference between the scroll row and the
+    # stored metadata cannot manufacture a false `absorbed_member_still_live`
+    # (nor hide a real one): `is_full_uuid` tolerates case for the same
+    # reason — casing is a rendering choice, not a different identifier.
+    live_ids = {_payload_id(p).lower() for p in members if _payload_id(p)}
 
     # --- canonical invariant: exactly one strictly-canonical member -------- #
     canonical_ids = [
@@ -290,4 +299,86 @@ def evaluate_closure(
             )
         )
 
+    # --- absorbed-actually-gone: the canonical's supersedes claim ---------- #
+    # Only the CANONICAL's claim is the cluster's claim.  A non-canonical
+    # peer's stale supersedes is not what the gate asserted, and reading it
+    # would refuse gates over other clusters' history.
+    if len(canonical_ids) == 1:
+        canonical = next(
+            p for p in members if _payload_meta(p).get('canonical') is True
+        )
+        reasons.extend(
+            _classify_supersedes(
+                _payload_meta(canonical).get('supersedes'),
+                live_ids=live_ids,
+                topic=topic,
+            )
+        )
+
     return _verdict(topic, reasons)
+
+
+def _classify_supersedes(
+    raw: Any,
+    *,
+    live_ids: set[str],
+    topic: str,
+) -> list[dict[str, Any]]:
+    """Classify each member of the canonical's ``supersedes`` claim.
+
+    Goes through the SHARED :func:`normalize_supersedes` — never a second
+    ``supersedes`` parser (INV-5); that helper's own docstring names this
+    closure predicate as one of its two designated readers.  It accepts
+    ``None`` (nothing absorbed), the legacy SCALAR spelling (81 live records
+    predate 3196's migration) as a one-member list, and a list as itself — so
+    a bare 36-char uuid string is one member here, never 36 characters.
+
+    It also deliberately never DROPS a malformed member, so this function can
+    reject one BY NAME (``malformed_supersedes_member``) rather than raising.
+    Raising would permanently block exactly the gates whose metadata is
+    already malformed — the census counts 3 short-hex and 8 non-string live.
+
+    Three outcomes per member:
+
+    * not a canonical full uuid -> ``malformed_supersedes_member``
+    * well-formed and STILL in the live topic scroll ->
+      ``absorbed_member_still_live`` (the curator claimed it was deleted; it
+      is not)
+    * well-formed and absent -> correctly folded, no reason
+    """
+    malformed: list[Any] = []
+    still_live: list[str] = []
+    for member in normalize_supersedes(raw):
+        if not is_full_uuid(member):
+            malformed.append(member)
+        elif str(member).lower() in live_ids:
+            still_live.append(str(member))
+
+    reasons: list[dict[str, Any]] = []
+    if still_live:
+        reasons.append(
+            _reason(
+                'absorbed_member_still_live',
+                ids=still_live,
+                detail=(
+                    f"The canonical of topic {topic!r} claims these ids in "
+                    '`metadata.supersedes`, but the live topic scroll still '
+                    'returns them. Either they were never deleted, or they '
+                    'must not be claimed as superseded.'
+                ),
+            )
+        )
+    if malformed:
+        reasons.append(
+            _reason(
+                'malformed_supersedes_member',
+                ids=malformed,
+                detail=(
+                    f"The canonical of topic {topic!r} carries "
+                    '`metadata.supersedes` members that are not canonical '
+                    '36-char dashed uuids, so their closure cannot be checked '
+                    'against the scroll. Fix or drop them.'
+                ),
+            )
+        )
+    return reasons
