@@ -12,7 +12,8 @@ questions — this doc does not restate them (per INV-5
 question, Read the normative doc, not this one. INV-1..5 fixtures were
 seeded 2026-07-14; INV-6..7 fixtures were added 2026-08-02 with the
 task/escalation state-graph invariants; INV-8 fixtures were added
-2026-08-06 with the loop-occupancy invariant.
+2026-08-06 with the loop-occupancy invariant; INV-9 fixtures were added
+2026-08-24 with the one-fact-one-home invariant.
 
 **Two fixture shapes.** Each invariant below carries exactly two seeded
 violations — both expressions of the SAME underlying violation, so the two
@@ -54,8 +55,9 @@ records the verdict each yields against the expected slug. Columns:
 | Match | `Y` if the verdict's slug equals the expected slug, else `N` |
 
 Acceptance: every fixture flags with the correct slug. The base table
-holds 10 rows (INV-1..5); the 2026-08-02 addendum adds 4 (INV-6..7) and
-the 2026-08-06 addendum adds 2 (INV-8) — 16 rows cumulative, all `Y`.
+holds 10 rows (INV-1..5); the 2026-08-02 addendum adds 4 (INV-6..7), the
+2026-08-06 addendum adds 2 (INV-8), and the 2026-08-24 addendum adds 2
+(INV-9) — 18 rows cumulative, all `Y`.
 
 ## INV-1 `contracts-machine-checked`
 
@@ -356,6 +358,47 @@ async def build_status_payload(board) -> dict:
 {"invariant": "loop-thread-occupancy-bounded", "file": "dashboard/src/dashboard/status_badges.py", "line": 5, "issue": "build_status_payload runs a blocking git subprocess per task on the event-loop thread over the uncapped active_tasks set — nothing offloads the call and nothing bounds the item count, so worst-case occupancy scales with board size", "severity": "high"}
 ```
 
+## INV-9 `one-fact-one-home`
+
+### PRD-leaf-shaped (`INV-9-PRD`)
+
+> When the identity-mode question is settled, record the decision in the
+> task's description, restate it in the PRD's §4 so future readers see it
+> there too, and update the capability manifest's prose copy of the
+> identity rule to match. The escalation that raised the question closes
+> in a later cleanup pass.
+
+**Expected disposition**: `flag: one-fact-one-home`
+
+**Redesign that clears it**: Pick the home (the escalation record
+carries the ruling via amendment/resolution, anchored to the ruling
+commit); the task description, PRD, and manifest each gain a dated
+POINTER (`esc-id + commit + date`) rather than a restated copy; and the
+record-write happens at ruling time, not in a later pass — a deferred
+write is what dies with the session.
+
+### Code-snippet-shaped (`INV-9-CODE`)
+
+```python
+def record_ruling(task, ruling: str) -> None:
+    # write the decision everywhere readers might look
+    task.description = f"RULED: {ruling}\n\n" + task.description
+    update_task(task)
+    prd = Path(task.prd_path).read_text()
+    Path(task.prd_path).write_text(
+        prd.replace("## Open questions",
+                    f"## Open questions\n\nRESOLVED: {ruling}")
+    )
+    # the escalation record that asked the question is left for cleanup;
+    # nothing links the copies or says which one wins
+```
+
+**Expected `invariant_findings` entry**:
+
+```json
+{"invariant": "one-fact-one-home", "file": "orchestrator/src/orchestrator/ruling_writer.py", "line": 3, "issue": "record_ruling writes the same ruling as independent prose into the task description and the PRD while the escalation record that owns the question is never updated — three copies, no designated home, no pointers, no reconciler, so the copies drift the moment any one is corrected", "severity": "warning"}
+```
+
 ## Rehearsal verdict table
 
 Walked 2026-07-14 against `skills/prd/references/gates.md` §"G7 — Design
@@ -462,6 +505,28 @@ independently of the narrowing — the call is neither non-blocking nor
 offloaded. The narrowing is monotone (it can only shrink what INV-8
 flags), so the other fixtures' single-invariant isolation is preserved a
 fortiori. The verdicts and count above stand as written.
+
+### Addendum — INV-9 walk (2026-08-24)
+
+Walked against the as-landed G7 text (both paths: the normative walk,
+which Reads the doc at run time and auto-extended to INV-9 with no edit;
+and the trigger-shape fallback, which never auto-extends and gained an
+INV-9 entry in the same change) and the Step 5.5 audit text. The same
+snapshot caveat applies: the Verdict column transcribes phrasing as it
+read on 2026-08-24, not a live pin.
+
+| Fixture ID | Shape | Invariant | Expected slug | Verdict (as-landed text yields) | Match |
+|---|---|---|---|---|---|
+| `INV-9-PRD` | PRD | INV-9 one-fact-one-home | `one-fact-one-home` | Normative path: G7's walk of the checkable question ("which surface is the home, and do the others point at it rather than restate it?") fires — the row restates the ruling into three surfaces, names no home, and defers the question-owning record's update to "a later cleanup pass". Fallback path: the new trigger-shape entry ("a world-fact written into a second record/store as an independent copy, with no designated home, pointer discipline, or reconciler") fires on the same row → `flag: one-fact-one-home` | Y |
+| `INV-9-CODE` | CODE | INV-9 one-fact-one-home | `one-fact-one-home` | Step 5.5 (unchanged — Reads the doc generically) applies INV-9's question to `record_ruling`: three independent prose copies, the question-owning record never written, nothing links the copies or names a winner → `invariant_findings` entry with `invariant="one-fact-one-home"`, `severity="warning"` | Y |
+
+**Addendum result: 2/2 match** (cumulative 18/18). Isolation re-checked
+while walking: no other trigger shape fires on either INV-9 fixture —
+the copies are prose world-facts, not lock-step logic, constants, or
+prompt text (`no-lockstep-duplication`'s scope; INV-9's own rule text
+draws that seam explicitly), there is no fallback/suppressor (INV-4),
+no log-scrape of emitter-known facts (INV-2), and the defect is writing
+copies, not acting on a stale one (not INV-3).
 
 ## Reconciliation — 2026-07-14 base walk
 
