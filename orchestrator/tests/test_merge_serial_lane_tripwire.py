@@ -125,3 +125,107 @@ class TestSerialLaneGuardUsesSharedBound:
             'a raise here means the guard still recomputes the formula inline'
         )
         fake.assert_called_once_with(2, 1)
+
+
+# ---------------------------------------------------------------------------
+# Step 03 — check_serial_lane_tripwire (pure decision)
+# ---------------------------------------------------------------------------
+
+
+class TestCheckSerialLaneTripwire:
+    """``check_serial_lane_tripwire`` is the PURE C4 decision.
+
+    No I/O, no logging, no emission — it returns a :class:`SerialLaneAssessment`
+    and the caller decides what to do.  ``local_inflight`` is the count of LOCAL
+    verifies in flight INCLUDING the dispatch under consideration, so at bound=1
+    the FIRST local dispatch is ``1 > 1`` → False (the positive control holds by
+    construction, not via a suppression rule) and the SECOND is ``2 > 1`` → True.
+    """
+
+    def test_single_local_dispatch_at_bound_1_is_not_breached(self) -> None:
+        """POSITIVE CONTROL: one local verify at bound=1 is the normal case."""
+        from orchestrator.merge_liveness import check_serial_lane_tripwire  # noqa: PLC0415
+
+        assessment = check_serial_lane_tripwire(1, merge_ahead_bound=1, num_hosts=1)
+        assert assessment.breached is False
+
+    def test_second_concurrent_local_dispatch_is_breached(self) -> None:
+        """The C4 condition (§9 row 10): 2 local verifies at per-host bound 1."""
+        from orchestrator.merge_liveness import check_serial_lane_tripwire  # noqa: PLC0415
+
+        assessment = check_serial_lane_tripwire(2, merge_ahead_bound=1, num_hosts=1)
+        assert assessment.breached is True
+
+    def test_third_local_dispatch_is_also_breached(self) -> None:
+        """Fires for EVERY excess dispatch, not just the second."""
+        from orchestrator.merge_liveness import check_serial_lane_tripwire  # noqa: PLC0415
+
+        assessment = check_serial_lane_tripwire(3, merge_ahead_bound=1, num_hosts=1)
+        assert assessment.breached is True
+
+    def test_idle_lane_is_not_breached(self) -> None:
+        """Zero local verifies in flight cannot breach a bound of 1."""
+        from orchestrator.merge_liveness import check_serial_lane_tripwire  # noqa: PLC0415
+
+        assessment = check_serial_lane_tripwire(0, merge_ahead_bound=1, num_hosts=1)
+        assert assessment.breached is False
+
+    def test_multi_host_k2_one_local_verify_is_not_breached(self) -> None:
+        """K=2 across 2 hosts → per-host bound 1; one local verify is legal.
+
+        Mirrors the harness's ``num_hosts=_k`` wiring (harness.py:10258-10260),
+        where the per-host bound is always 1.
+        """
+        from orchestrator.merge_liveness import check_serial_lane_tripwire  # noqa: PLC0415
+
+        assessment = check_serial_lane_tripwire(1, merge_ahead_bound=2, num_hosts=2)
+        assert assessment.breached is False
+        assert assessment.per_host_bound == 1
+
+    def test_multi_host_k2_two_local_verifies_is_breached(self) -> None:
+        """K=2 across 2 hosts still allows only ONE verify per host."""
+        from orchestrator.merge_liveness import check_serial_lane_tripwire  # noqa: PLC0415
+
+        assessment = check_serial_lane_tripwire(2, merge_ahead_bound=2, num_hosts=2)
+        assert assessment.breached is True
+
+    def test_assessment_carries_the_structured_facts_it_used(self) -> None:
+        """INV-2: the payload facts are on the assessment, at the values used."""
+        from orchestrator.merge_liveness import (  # noqa: PLC0415
+            SerialLaneAssessment,
+            check_serial_lane_tripwire,
+        )
+
+        assessment = check_serial_lane_tripwire(3, merge_ahead_bound=4, num_hosts=2)
+        assert isinstance(assessment, SerialLaneAssessment)
+        assert assessment.local_inflight == 3
+        assert assessment.per_host_bound == 2  # ceil(4/2)
+        assert assessment.merge_ahead_bound == 4
+        assert assessment.num_hosts == 2
+        assert assessment.breached is True  # 3 > 2
+
+    def test_bound_defaults_to_engine_constant_resolved_at_call_time(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Omitted bound reaches back to merge_queue._MERGE_AHEAD_BOUND AT CALL TIME.
+
+        A def-time default would need a top-level ``import
+        orchestrator.merge_queue`` in merge_liveness (module-load deadlock — the
+        shim needs merge_liveness fully defined first) AND would defeat this
+        monkeypatch, which the suite already relies on for
+        ``enforce_persistent_worktree_serial_lane``.
+        """
+        from orchestrator.merge_liveness import check_serial_lane_tripwire  # noqa: PLC0415
+
+        monkeypatch.setattr('orchestrator.merge_queue._MERGE_AHEAD_BOUND', 4)
+        assessment = check_serial_lane_tripwire(2)
+        assert assessment.merge_ahead_bound == 4
+        assert assessment.breached is False  # 2 > ceil(4/1)=4 is False
+
+    def test_unpatched_bound_default_is_the_real_engine_constant(self) -> None:
+        """Unpatched, the reach-back yields the real _MERGE_AHEAD_BOUND (1)."""
+        from orchestrator.merge_liveness import check_serial_lane_tripwire  # noqa: PLC0415
+
+        assessment = check_serial_lane_tripwire(2)
+        assert assessment.merge_ahead_bound == 1
+        assert assessment.breached is True
