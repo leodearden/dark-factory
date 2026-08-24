@@ -650,8 +650,12 @@ tasks:
   title: Periodic status-agnostic landed reconciler with a writer
   note: 'Takes an out-of-batch dependency on task 4623: D7''s fold as literally specified
     is in-progress-gated and would skip every landed parked task, greening B12 while
-    B11 reds. Also carries an UNRESOLVED conflict with pending task 3539, which targets
-    the same population with the remedy the PRD''s Sketch rejects.'
+    B11 reds. The conflict with pending task 3539 previously recorded here was a MISREADING
+    and is RETRACTED - ruled by Leo 2026-08-24 via gate task 4673 / esc-4673-1, recorded
+    on main in f34b4bce0b as PRD corrections 9-10. The populations are disjoint on status:
+    3539''s rows are all keyed IN_PROGRESS, and this leaf owns pending/merge-deferred,
+    which are filtered out at harness.py:4959-4960 and never reach _RECOVERY. See the
+    boundary-with-task-3539 capability below.'
   capabilities:
   - name: landing-contract-available-upstream
     binding: capability→producer - producer:task-δ upstream (DAG δ→η). The writer
@@ -807,20 +811,42 @@ tasks:
       kind: manual
       reason: '''no blocking call on the loop thread'' is a whole-function property;
         a grep for to_thread cannot prove the absence of a blocking call elsewhere'
-  - name: conflict-with-task-3539-on-the-same-population
-    binding: 'duplicate-owner, UNRESOLVED - task 3539 (pending/high) targets the same
-      landed pending/blocked/merge-deferred population from the same 930-task sweep,
-      but its remedy is adding _RECOVERY rows, which the PRD''s Sketch lists under
-      ''Explicitly not done''. Load-bearing regardless of which task survives: 3539
-      records that after a pin was genuinely lifted, ''within ~15 minutes the row
-      was status=PENDING, not done. Something re-pended it rather than recovering
-      it.'' This leaf''s writer will race that same re-pender and must identify it
-      before writing.'
-    verdict: OPEN
+  - name: boundary-with-task-3539-disjoint-on-status
+    binding: 'RULED 2026-08-24 by Leo (gate task 4673 / esc-4673-1), recorded on main
+      in f34b4bce0b as PRD corrections 9-10. This row was previously authored as a
+      duplicate-owner row awaiting an operator ruling on which of the two tasks survived;
+      that framing was a MISREADING and is RETRACTED (the ruling has been given, and its
+      answer is that the premise was wrong). Both tasks proceed; neither is merged,
+      re-scoped away or cancelled.
+      The populations are disjoint on status: _RECOVERY is read only by classify_recovery
+      (task_ground_truth.py:916), whose only production callers reach it inside
+      _reconcile_one_stranded, which the sweep enters only for _RECONCILE_SWEEP_STATUSES
+      = frozenset({''in-progress'',''blocked''}) (harness.py:238, filtered at :4959-4960).
+      3539''s added rows are all keyed IN_PROGRESS; this leaf owns pending/merge-deferred,
+      which never reach that table; landed blocked is task 4645''s veto narrowing.
+      ASYMMETRY, recorded because it is load-bearing: that proof binds 3539 STRUCTURALLY,
+      but this leaf''s actor is a new BackgroundService living outside both _RECOVERY and
+      _RECONCILE_SWEEP_STATUSES, so on THIS side the boundary is convention, not structure,
+      and nothing currently machine-checks the status filter. Keep the write filter to
+      pending/merge-deferred; if scope drifts across a line, stop and re-raise.
+      Two supporting claims made when this was ruled do NOT survive re-measurement and
+      must not be reused as safety arguments: (1) "done is a terminal absorbing state"
+      is false - shared/task_transitions.py:222 makes done->anything legal on reopen, and
+      _handle_terminal_exit_on_block reopens done->blocked in production; the no-oscillation
+      conclusion holds here only via the interceptor''s separate ancestry gate. (2) the
+      3539->4645 adjacency is NOT a handoff that completes: 3539''s rows fire only on
+      has_open_escalation, so the converted task arrives blocked still pinned, typically
+      category=task_failure (workflow.py:14957), which _only_merge_remediable (harness.py:5299,
+      an all() over frozenset({''stranded_blocked''}) at :5294, widened by 4645 only by
+      {''preexisting_main_break''}) rejects - so 4645''s upgrade never fires and the task
+      rests blocked+pinned until a human or task 3541 closes the record. Corrected in the
+      texts of tasks 4645 and 3539 on 2026-08-24.'
+    verdict: PASS
     delivered_check:
       kind: manual
-      reason: a human must rule on which task survives; the re-pender investigation
-        is this leaf's work either way
+      reason: an ownership boundary ruled by a human; 3539's half is structurally
+        enforced by _RECONCILE_SWEEP_STATUSES, but this leaf's half is a write-filter
+        convention with no automated check today
   - name: reconciler-cadence
     binding: leaf-owned ruling (PRD Open Question 1) - BackgroundService (background_service.py:52)
       is registered 7 times in harness.py; the stranded sweep's registration is at
