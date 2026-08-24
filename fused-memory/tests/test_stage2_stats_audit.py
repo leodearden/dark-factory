@@ -76,6 +76,7 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
     _TASK_CREATED_SUCCESS_STATUSES,
     TaskKnowledgeSync,
     _action_record_keys,
+    _corroborate_record_keys,
 )
 
 # ── Shared harness ───────────────────────────────────────────────────────────
@@ -398,3 +399,217 @@ class TestActionRecordKeys:
         assert _action_record_keys(records) == {
             ('p', str(i)) for i in range(len(_TASK_CREATED_SUCCESS_STATUSES))
         }
+
+
+# ── step-5: _corroborate_record_keys ─────────────────────────────────────────
+
+
+class _ExplodingProjects(dict):
+    """A known_projects mapping that raises while being resolved."""
+
+    def get(self, key, default=None):  # type: ignore[override]
+        raise ValueError(f'project resolution exploded on {key!r}')
+
+
+def _totals_account_for_every_key(result, keys) -> bool:
+    """No key may be silently dropped: the three buckets must partition them."""
+    return result.corroborated + result.uncorroborated + result.unresolvable == len(keys)
+
+
+class TestCorroborateRecordKeys:
+    """``_corroborate_record_keys(taskmaster, known_projects, keys)`` (task 3051).
+
+    The corroboration pass that makes ``tasks_created``'s upward repair
+    confirmed-action-only: each ``(project_id, task_id)`` key is resolved to
+    its OWN project root via ``known_projects`` and confirmed with
+    ``taskmaster.get_task`` + ``flag_dedup.confirm_task_present``.
+
+    Fail-CLOSED on the increment (an unverifiable key never counts as
+    corroborated) but fail-SAFE for the stage: it never raises, so a bug here
+    can only ever withhold a repair, never abort an otherwise-good report.
+    """
+
+    @pytest.mark.asyncio
+    async def test_present_task_in_a_resolvable_project_is_corroborated(self):
+        stub = _StubTaskmaster(results={('3045', '/repo/df'): _task_record('3045')})
+        keys = {('dark_factory', '3045')}
+
+        result = await _corroborate_record_keys(stub, {'dark_factory': '/repo/df'}, keys)
+
+        assert result.corroborated == 1
+        assert result.corroborated_keys == {('dark_factory', '3045')}
+        assert result.uncorroborated == 0
+        assert result.unresolvable == 0
+        assert _totals_account_for_every_key(result, keys)
+        assert stub.calls == [('3045', '/repo/df')]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'get_task_result',
+        [
+            {'error': 'No tasks found for ID(s): 3045', 'error_type': 'TaskmasterError'},
+            {'error': 'Connection timeout', 'error_type': 'TimeoutError'},
+            None,
+            {},
+            'a task exists',
+            42,
+            [],
+        ],
+        ids=['not-found', 'generic-error', 'none', 'empty-dict', 'str', 'int', 'list'],
+    )
+    async def test_non_present_results_are_uncorroborated_never_corroborated(
+        self, get_task_result,
+    ):
+        """Absent, inconclusive, and non-dict results all fail closed."""
+        stub = _StubTaskmaster(results={('3045', '/repo/df'): get_task_result})
+        keys = {('dark_factory', '3045')}
+
+        result = await _corroborate_record_keys(stub, {'dark_factory': '/repo/df'}, keys)
+
+        assert result.corroborated == 0
+        assert result.corroborated_keys == set()
+        assert result.uncorroborated == 1
+        assert result.unresolvable == 0
+        assert _totals_account_for_every_key(result, keys)
+
+    @pytest.mark.asyncio
+    async def test_raising_get_task_is_uncorroborated_not_an_exception(self):
+        stub = _StubTaskmaster(results={('3045', '/repo/df'): RuntimeError('backend down')})
+        keys = {('dark_factory', '3045')}
+
+        result = await _corroborate_record_keys(stub, {'dark_factory': '/repo/df'}, keys)
+
+        assert result.corroborated == 0
+        assert result.uncorroborated == 1
+        assert result.unresolvable == 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('project_id', ['unknown_project', None, ''])
+    async def test_unresolvable_project_issues_no_lookup(self, project_id):
+        """A project we cannot resolve to a root is UNRESOLVABLE ('we could not
+        check'), distinct from uncorroborated ('we checked and it is not
+        there') — and costs no get_task round-trip."""
+        stub = _StubTaskmaster()
+        keys = {(project_id, '3045')}
+
+        result = await _corroborate_record_keys(stub, {'dark_factory': '/repo/df'}, keys)
+
+        assert result.corroborated == 0
+        assert result.uncorroborated == 0
+        assert result.unresolvable == 1
+        assert _totals_account_for_every_key(result, keys)
+        assert stub.calls == []
+
+    @pytest.mark.asyncio
+    async def test_each_key_is_looked_up_in_its_own_project_root(self):
+        """A cross-project key is checked against ITS project, not this
+        stage's — Taskmaster ids are per-project, so the wrong root would
+        routinely land on an unrelated task sharing the id."""
+        stub = _StubTaskmaster(results={
+            ('3045', '/repo/df'): _task_record('3045'),
+            ('3045', '/repo/reify'): _not_found('3045'),
+        })
+        keys = {('dark_factory', '3045'), ('reify', '3045')}
+
+        result = await _corroborate_record_keys(
+            stub, {'dark_factory': '/repo/df', 'reify': '/repo/reify'}, keys,
+        )
+
+        assert result.corroborated_keys == {('dark_factory', '3045')}
+        assert result.corroborated == 1
+        assert result.uncorroborated == 1
+        assert result.unresolvable == 0
+        assert sorted(stub.calls) == [('3045', '/repo/df'), ('3045', '/repo/reify')]
+
+    @pytest.mark.asyncio
+    async def test_mixed_batch_partitions_every_key(self):
+        stub = _StubTaskmaster(results={
+            ('1', '/repo/df'): _task_record('1'),
+            ('2', '/repo/df'): _not_found('2'),
+        })
+        keys = {('dark_factory', '1'), ('dark_factory', '2'), ('nowhere', '3')}
+
+        result = await _corroborate_record_keys(stub, {'dark_factory': '/repo/df'}, keys)
+
+        assert result.corroborated_keys == {('dark_factory', '1')}
+        assert (result.corroborated, result.uncorroborated, result.unresolvable) == (1, 1, 1)
+        assert _totals_account_for_every_key(result, keys)
+
+    @pytest.mark.asyncio
+    async def test_all_lookups_are_dispatched_as_one_concurrent_batch(self):
+        """One flat gather, not a sequential await loop: peak in-flight
+        lookups must equal the number of resolvable keys."""
+        stub = _StubTaskmaster()
+        keys = {('dark_factory', str(i)) for i in range(5)}
+
+        await _corroborate_record_keys(stub, {'dark_factory': '/repo/df'}, keys)
+
+        assert len(stub.calls) == 5
+        assert stub.max_concurrent == 5
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'taskmaster_arg, known_projects_arg',
+        [
+            (None, {'dark_factory': '/repo/df'}),
+            (False, {'dark_factory': '/repo/df'}),
+            ('STUB', None),
+            ('STUB', {}),
+        ],
+        ids=['taskmaster-none', 'taskmaster-false', 'known-projects-none', 'known-projects-empty'],
+    )
+    async def test_falsy_taskmaster_or_known_projects_short_circuits(
+        self, taskmaster_arg, known_projects_arg,
+    ):
+        """Corroboration cannot run at all: nothing corroborated, every key
+        counted UNRESOLVABLE so the withheld repair stays visible, no I/O."""
+        stub = _StubTaskmaster()
+        taskmaster = stub if taskmaster_arg == 'STUB' else taskmaster_arg
+        keys = {('dark_factory', '3045'), ('reify', '9')}
+
+        result = await _corroborate_record_keys(taskmaster, known_projects_arg, keys)
+
+        assert result.corroborated == 0
+        assert result.corroborated_keys == set()
+        assert result.uncorroborated == 0
+        assert result.unresolvable == 2
+        assert _totals_account_for_every_key(result, keys)
+        assert stub.calls == []
+
+    @pytest.mark.asyncio
+    async def test_empty_keys_is_a_no_op(self):
+        stub = _StubTaskmaster()
+
+        result = await _corroborate_record_keys(stub, {'dark_factory': '/repo/df'}, set())
+
+        assert (result.corroborated, result.uncorroborated, result.unresolvable) == (0, 0, 0)
+        assert result.corroborated_keys == set()
+        assert stub.calls == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'keys',
+        [None, 'not-a-set', 42, {('dark_factory', None)}, {('dark_factory', 3045)}],
+        ids=['none', 'str', 'int', 'none-task-id', 'int-task-id'],
+    )
+    async def test_never_raises_on_malformed_keys(self, keys):
+        result = await _corroborate_record_keys(
+            _StubTaskmaster(), {'dark_factory': '/repo/df'}, keys,
+        )
+
+        assert result.corroborated == 0
+
+    @pytest.mark.asyncio
+    async def test_exploding_known_projects_degrades_to_nothing_corroborated(self):
+        """A defect in the corroboration pass itself must never abort an
+        otherwise-good stage report — it degrades to 'we could not check'."""
+        keys = {('dark_factory', '3045'), ('reify', '9')}
+
+        result = await _corroborate_record_keys(
+            _StubTaskmaster(), _ExplodingProjects(dark_factory='/repo/df'), keys,
+        )
+
+        assert result.corroborated == 0
+        assert result.corroborated_keys == set()
+        assert result.unresolvable == 2
+        assert _totals_account_for_every_key(result, keys)
