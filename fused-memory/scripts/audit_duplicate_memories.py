@@ -208,6 +208,15 @@ from fused_memory.reconciliation.task_filter import (
     # the two soft-block write gates, which is why `STRICT_CLAUSE_BOUNDARY_RE`
     # is the WRONG constant here: its narrow alphabet is precisely what
     # returned the empty set on all four real records.
+    #
+    # Report-only bounds what `--apply` can DELETE, not what the metric
+    # series can ALARM on: `liveness_snapshot_recurrences` is a
+    # `count`/`higher_is_worse` metric, so a group this splitter manufactures
+    # is a false accretion signal until the next run, not a harmless one a
+    # reviewer's glance fully absorbs. That is why
+    # `liveness_snapshot_subject_facts` gates a clause-scoped key on TWO
+    # conditions — divergence, and field-vocabulary equality with the
+    # record's own key — rather than trusting the widened splitter alone.
     _CLAUSE_SPLIT_RE,
     LIVE_TASK_STATUS_RE,
     POINT_IN_TIME_CHECK_RE,
