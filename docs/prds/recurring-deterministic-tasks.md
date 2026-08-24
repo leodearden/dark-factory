@@ -212,9 +212,12 @@ to one late run.
 | **r5** | Watcher checklist chain-triage extension | `skills` | **leaf** (non-code) | `git grep -n 'overdue\|broken' -- skills/escalation-watcher/SKILL.md skills/recon-escalation-watcher/SKILL.md` shows the chain-triage rule added to the invariants step in both files | r4, **d2** (detection PRD) |
 | **r6** | Seed the first two chains: predicate variant of the reify closure-staleness sweep + transcript-check; demonstrate link→successor end-to-end | `scripts`, task filing | **leaf** (integration gate) | B10 through the product read path: `get_task` shows link-1 `done` with `done_provenance.kind='deterministic-milestone'` and link-2 minted with advanced `at` + `minted_from`; the chain panel lists both chains | r2, r3 |
 
-**Routing notes.** r5 is a genuinely non-code leaf: `metadata.execution_class='operational'`.
-r6 is `task_kind='normal'` (it writes the predicate-variant script and files carriers); the
-carriers it files are themselves `task_kind='deterministic'`.
+**Routing notes.** All tasks are `task_kind='normal'`; r5 (a docs-only edit) additionally
+carries `metadata.complexity='simple'` for the single-agent fast path — deliberately NOT
+`execution_class='operational'`, which converts at submit into an always-escalates pure gate
+routing the work to a human (Leo's 2026-08-24 ruling: reserve human attention for work that
+needs it). r6 writes the predicate-variant script and files carriers; the carriers it files
+are themselves `task_kind='deterministic'`.
 
 **G1.** The mechanism's consumers are real and in-batch: r6 converts two currently-dead
 documented jobs into the first chains (the integration gate), and the ε-detection PRD's ε.2

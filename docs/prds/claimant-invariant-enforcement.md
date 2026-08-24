@@ -641,6 +641,15 @@ tasks already carry it). η's docs-only signal is acceptable *because* the chang
 nature; it is not a code task closing via a docs commit (the shape G2 rejects), and the signal is a
 `git grep` rather than a prose assertion so it is falsifiable by inspection.
 
+> **[2026-08-24 update — superseded as filed.]** The `execution_class='operational'` declaration
+> is converted at submit into a deterministic always-escalates **pure gate**
+> (`TaskInterceptor._inject_deterministic_pure_gate`) — i.e. it routes the edit to a human at
+> dispatch. Leo ruled that human attention is reserved for work that genuinely needs it, and η is
+> a mechanical three-site prose edit an agent can execute; task **4626 was therefore retyped** to
+> `task_kind='normal'` + `metadata.complexity='simple'` (the single-agent fast path, whose stated
+> scope includes docs edits). Future docs-only leaves should file that shape directly; see the
+> routing notes in `docs/prds/claimant-invariant-detection.md`.
+
 **G2 note.** The batch has **three intermediates — α, β and δ** — and three true DAG sinks: γ, ζ
 and η. Each intermediate names the task(s) it unlocks in the table above, satisfying G2 step 3.
 (Note α's row says it unlocks γ and ζ; there is no α→η or α→γ→ζ shortcut to wire — the edges are

@@ -225,9 +225,12 @@ delivery statement and the re-arm trigger; OPERATIONS.md §4 gains the operator 
 | **d4** | `set_task_claimant` terminal-observation ERROR (extend the in-txn SELECT to `status`) | `fused-memory` | **leaf** | Against a seeded `done` row: `set_task_claimant(id, claimant_run_id='x', heartbeat_at=now)` emits the structured ERROR line (journal-visible) and the write persists; a heartbeat-only call on the same row emits nothing (B8/B9) | — |
 | **d5** | Amend C4-E2/C4-E7 in the enforcement PRD + OPERATIONS.md §4 operator subsection (gauge, census, re-arm trigger, ε.2 pointer) | `docs`, `plans` | **leaf** (non-code) | `git grep -n 'claimant-invariant-detection' -- docs/prds/claimant-invariant-enforcement.md OPERATIONS.md` returns hits in the C4-E2 clause, the C4-E7 clause, and the OPERATIONS §4 subsection, where it returns zero today | d1, d3, d4 |
 
-**Routing notes.** d2 and d5 are genuinely non-code leaves: `metadata.execution_class =
-'operational'` (the η/4626 precedent; `unknown_key`-warning-free is not expected — the key is
-established practice). All others `task_kind='normal'`.
+**Routing notes.** All tasks are `task_kind='normal'`; d2 and d5 (docs-only edits) additionally
+carry `metadata.complexity='simple'` to take the single-agent fast path. Deliberately NOT
+`execution_class='operational'`: that declaration is converted at submit into a deterministic
+always-escalates pure gate — i.e. it routes the work to a human — and Leo ruled (2026-08-24)
+that human attention is reserved for work that genuinely needs it; these are mechanical prose
+edits an agent executes. (The η/4626 precedent was retyped the same way under the same ruling.)
 
 **G2 note.** d1 is the sole intermediate; it names d2/d5 (and recurrence r4) as its unlocks and
 still carries a direct product signal. d3/d4's signals are demonstrated against seeded rows —
