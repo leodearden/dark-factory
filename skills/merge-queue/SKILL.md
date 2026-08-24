@@ -148,7 +148,13 @@ git merge-base --is-ancestor task/<TASK_ID> main; rc=$?; echo "ancestry rc=$rc"
 #          task's sha. (git merge-base is also wrong: it gives the common ancestor, NOT the
 #          merge commit.) If the marker search is empty, fall back to
 #          `git rev-list --ancestry-path --merges task/<TASK_ID>..main | tail -1`; if that is
-#          empty too, nothing on main cites the task — do not stamp.
+#          empty too, this is NOT "not landed" — rc=0 already proved the branch IS on main.
+#          It is a fast-forward (or already-contained) landing, where no merge commit exists
+#          to find. Stamp the branch tip instead — `git rev-parse task/<TASK_ID>` (rc=0
+#          guarantees the ref still exists) — with note "fast-forward merge, no separate
+#          merge commit". kind='found_on_main' REQUIRES a commit (no note-only fallback
+#          since the post-3092 hardening), so "do not stamp" is not an option on this arm;
+#          it belongs to rc=1 and to rc=128 with an empty marker search only.
 # rc=128 → branch ref is GONE ("fatal: Not a valid object name"). This is the normal state
 #          AFTER a successful merge + cleanup — NOT "not on main". Search main for THIS
 #          branch's merge commit, by exact subject:

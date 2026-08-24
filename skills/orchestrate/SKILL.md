@@ -517,11 +517,20 @@ All paths below operate on the **target** project (`$TARGET_PROJECT`), not dark-
    git log main --fixed-strings --grep="Merge task/<task-id> into main" --max-count=1 --format=%H
    ```
 
-   Non-empty → that SHA is this task's true merge commit. Empty, but the branch ref still exists → fall back to `git rev-list --ancestry-path --merges task/<task-id>..main | tail -1` and verify it before stamping. Empty from both → nothing on main cites this task; treat as **NOT landed** and stop rather than stamping provenance.
+   Non-empty → that SHA is this task's true merge commit. Empty, but the branch ref still exists → fall back to `git rev-list --ancestry-path --merges task/<task-id>..main | tail -1` and verify it before stamping.
+
+   Empty from both → do **not** jump to "NOT landed". First settle the question with the ancestry check, because the two outcomes need opposite actions:
+
+   ```bash
+   git merge-base --is-ancestor task/<task-id> main; rc=$?; echo "ancestry rc=$rc"
+   ```
+
+   - **rc=0** → the branch **is** on main; ancestry has proved a landing, so "not landed" is ruled out. Both searches come back empty in exactly two benign cases: a fast-forward landing (no merge commit exists at all), or a merge you performed by hand in step 5 — `git merge --no-ff` writes the subject `Merge branch 'task/<task-id>'`, which the orchestrator-shaped `--grep="Merge task/<task-id> into main"` marker deliberately does not match. Stamp the commit that actually carries the work: the merge commit you just created (`git rev-parse HEAD` on main, for the step-5 manual path), or the branch tip `git rev-parse task/<task-id>` after a fast-forward. Use `{"kind": "found_on_main", "commit": "<that sha>", "note": "fast-forward merge, no separate merge commit"}` (or a note naming the manual merge). `kind='found_on_main'` **requires** `commit` — there is no note-only fallback since the post-3092 hardening — so declining to stamp is not an available option here.
+   - **rc=1** (branch exists, not an ancestor) or **rc=128 with an empty marker search** (branch ref gone, nothing on main cites it) → *these* are the genuine not-landed outcomes. Treat as NOT landed and stop rather than stamping provenance.
 
    Do **not** read the SHA from `git log -1 --format=%H`. <!-- provenance-guard: negative --> That is main's *current HEAD*, which is this task's merge commit only when this merge happens to be the newest commit on main — on a live merge queue it usually is not, so you would record an unrelated task's merge as this one's provenance. The server's only backstop is `git merge-base --is-ancestor <sha> main`, which passes for every recent commit on main and would not catch it.
 
-   Use `{"note": "<one-sentence explanation>"}` for fast-forward merges or when the work was covered by a sibling task and no single commit applies.
+   A note-only `{"note": "<one-sentence explanation>"}` payload is **no longer accepted** — the post-3092 hardening requires a commit on every kind. For a fast-forward merge, or when the work was covered by a sibling task, still cite a commit: `{"kind": "found_on_main", "commit": "<branch tip, or the sibling's landing sha>", "note": "<one-sentence explanation>"}`, derived task-scoped as above.
 7. **Clean up worktree** (from inside `$TARGET_PROJECT`):
    ```bash
    git worktree remove .worktrees/<task-id>

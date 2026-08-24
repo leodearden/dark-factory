@@ -508,7 +508,16 @@ The merge procedure is iterative — don't assume one pass will be enough:
      #          non-tip member carries no marker of its own, so fall back to
      #          `git rev-list --ancestry-path --merges task/<TASK_ID>..main | tail -1`,
      #          the group merge commit, which IS that member's correct provenance.
-     #          Both empty → nothing on main cites this task; do not stamp a sha.
+     #          Both empty is NOT "not landed" HERE: rc=0 already proved the branch IS
+     #          on main. It means a fast-forward (or already-contained) landing, where
+     #          no merge commit exists to find. Stamp the branch tip instead —
+     #          `git rev-parse task/<TASK_ID>` (rc=0 guarantees the ref still exists) —
+     #          as commit, with note "fast-forward merge, no separate merge commit".
+     #          That is the rule `orchestrator/src/orchestrator/agents/briefing.py` already
+     #          states, and `kind='found_on_main'` REQUIRES a commit (there is no
+     #          commit-less/note-only fallback), so "do not stamp" is not an option here.
+     #          Reserve "do not stamp / not landed" for the rc=1 and empty-marker rc=128
+     #          arms below, where nothing has proved a landing.
      #          Do NOT use `git log --format=%H -1 main` <!-- provenance-guard: negative --> here: that is main's
      #          CURRENT HEAD, which is this task's merge commit only when this merge
      #          happens to be the newest commit on main — on a live queue it usually is
@@ -575,8 +584,12 @@ The merge procedure is iterative — don't assume one pass will be enough:
   #   --max-count=1 --format=%H>. Empty is not "no sha": a coalesce-absorbed non-tip
   #   member carries no marker of its own, so fall back to `git rev-list --ancestry-path
   #   --merges task/<TASK_ID>..main | tail -1`, the group merge commit, which IS that
-  #   member's correct provenance. Both empty → nothing on main cites this task; do NOT
-  #   stamp a sha.
+  #   member's correct provenance. Both empty is NOT "not landed" HERE: rc=0 already proved
+  #   the branch IS on main, so this is a fast-forward (or already-contained) landing with no
+  #   merge commit to find. Stamp the branch tip — `git rev-parse task/<TASK_ID>` (rc=0
+  #   guarantees the ref exists) — with note "fast-forward merge, no separate merge commit";
+  #   kind='found_on_main' REQUIRES a commit, so "do not stamp" is not an available option on
+  #   this arm. Reserve not-landed for rc=1 and for rc=128 with an empty marker search.
   #   Do NOT use `git log --format=%H -1 main` <!-- provenance-guard: negative --> here: that is main's CURRENT
   #   HEAD, which is this task's merge commit only when this merge happens to be the
   #   newest commit on main — on a live queue it usually is not, so you would stamp an
@@ -761,7 +774,11 @@ git merge-base --is-ancestor task/<TASK_ID> main; rc=$?; echo "ancestry rc=$rc"
 #   `git log main --fixed-strings --grep="Merge task/<TASK_ID> into main" --max-count=1
 #   --format=%H`, falling back when it is empty to `git rev-list --ancestry-path --merges
 #   task/<TASK_ID>..main | tail -1` (the group merge commit, which is a coalesce-absorbed
-#   non-tip member's correct provenance); both empty → do NOT stamp a sha.
+#   non-tip member's correct provenance); both empty under rc=0 means a fast-forward
+#   (or already-contained) landing, NOT "not landed" — ancestry already proved otherwise —
+#   so stamp the branch tip `git rev-parse task/<TASK_ID>` with note "fast-forward merge,
+#   no separate merge commit". kind='found_on_main' requires a commit; there is no
+#   note-only fallback, and "not landed" belongs only to the rc=1 / empty-marker rc=128 arms.
 #   Not `git log --format=%H -1 main` <!-- provenance-guard: negative --> — that is main's current HEAD, not this
 #   task's merge commit.
 # rc=128 (branch ref gone after a successful merge + cleanup): NOT the same as rc=1 —

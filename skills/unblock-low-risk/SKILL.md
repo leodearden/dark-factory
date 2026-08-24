@@ -257,7 +257,7 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
    - **`unknown`** (e.g., after an orchestrator restart; `merge_status` carries
      `hint="check git log main"`): fall back to the **task-scoped merge-marker search** (see
      [Deriving the landed sha](#deriving-the-landed-sha) below) to check whether this task's
-     merge landed on main. Do **not** eyeball `git log main --oneline -20`: it is not scoped
+     merge landed on main. Do **not** eyeball `git log main --oneline -20` <!-- provenance-guard: negative -->: it is not scoped
      to this task, so any sha picked from it is likely an unrelated task's merge.
      - Confirmed on main (search non-empty) → success; use `done_provenance={"kind": "found_on_main",
        "commit": "<sha from the merge-marker search>",
@@ -281,7 +281,7 @@ empty but the branch ref still exists, you may fall back to
 before stamping.
 
 **Never** derive the sha from `git log --format=%H -1 main` <!-- provenance-guard: negative --> or by eyeballing
-`git log main --oneline -20`. Neither is
+`git log main --oneline -20` <!-- provenance-guard: negative -->. Neither is
 scoped to this task: on a live merge queue this task's merge is usually **not** the newest
 commit on main, so you would record an unrelated task's merge as this one's provenance. The
 server's only backstop is `git merge-base --is-ancestor <sha> main`, which passes for every
