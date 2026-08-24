@@ -630,7 +630,14 @@ def render_source_completion_section(*, can_file_tasks: bool) -> str:
         'File ONLY that residual irreversible judgment call as a task, with '
         "`metadata.execution_class='operational'` and "
         "`metadata.operational_mode='gate'` (the human-gated routing mode, not "
-        "the `'llm'` mode). " + residual_clause
+        "the `'llm'` mode). " + residual_clause + '\n\n'
+        'The "## Consolidation Gate" section is the AUTHORITY for what that '
+        'gate must contain — its target end state, its topic working key, and '
+        'the closure check that refuses to let it close over a malformed '
+        'cluster. Follow it rather than inventing a shape here; this section '
+        'named no end state at all until task 3112, which is why filed gates '
+        'each invented their own (see '
+        '`reconciliation.consolidation_gate::render_consolidation_gate_section`).'
     )
 
 

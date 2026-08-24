@@ -1,5 +1,8 @@
 """System prompt for Stage 2: Task-Knowledge Sync."""
 
+from fused_memory.reconciliation.consolidation_gate import (
+    render_consolidation_gate_section,
+)
 from fused_memory.reconciliation.policies.autopilot_video import (
     AUTOPILOT_VIDEO_CONTAMINATION_GUARDRAIL as _AUTOPILOT_VIDEO_CONTAMINATION_GUARDRAIL,
 )
@@ -72,6 +75,8 @@ returned. Treat as success, not failure.
 {render_source_completion_section(can_file_tasks=True)}
 
 {render_predicate_contradiction_section()}
+
+{render_consolidation_gate_section()}
 
 ## Splitting Tasks (do NOT create subtasks)
 Subtask creation is **not available** in this stage (blocked via `DISALLOW_SUBTASK_CREATE`). \

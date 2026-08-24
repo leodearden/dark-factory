@@ -69,6 +69,7 @@ __all__ = [
     'ConsolidationGateSpec',
     'build_consolidation_gate_task',
     'evaluate_closure',
+    'render_consolidation_gate_section',
     'render_end_state_brief',
 ]
 
@@ -730,4 +731,46 @@ def build_consolidation_gate_task(
         priority=priority,
         task_kind='deterministic',
         metadata=metadata,
+    )
+
+
+def render_consolidation_gate_section() -> str:
+    """Render the consolidation-gate filing-convention prompt section (task
+    3112), mirroring ``render_predicate_contradiction_section``'s style.
+
+    Interpolated into BOTH stage system prompts — Stage 1 and Stage 2 each hold
+    the memory-mutation tools, so either can reach the point of filing a gate.
+    It reuses :func:`render_end_state_brief` VERBATIM, so the prompt, the filed
+    gate's description and the closure predicate's target are one text and
+    cannot drift into disagreeing.
+    """
+    return (
+        '## Consolidation Gate\n'
+        'When a memory consolidation reaches an irreversible, content-losing '
+        'judgment call, file it as a human gate — but file it with a TARGET '
+        'and a working key, not just a description of the problem. A gate that '
+        'does not say what "done" looks like gets a different answer from '
+        'every cycle that reads it.\n\n'
+        'HOW: build the submission with `build_consolidation_gate_task('
+        "topic='<slug>', rationale=...)` (module "
+        '`fused_memory.reconciliation.consolidation_gate`) and submit its '
+        '`as_submit_task_kwargs()`. It emits an '
+        "`execution_class='operational'` + `operational_mode='gate'` task whose "
+        f'`metadata.{GATE_METADATA_KEY}.topic` carries the cluster TOPIC.\n\n'
+        'EMIT THE TOPIC, NOT A MEMBER LIST. The live `metadata.topic` scroll is '
+        'the working list. A hand-written enumeration is accepted only as inert '
+        "provenance (`authoritative: false`) and can never make a gate "
+        'closeable — a hand-written list goes stale the moment the next cycle '
+        'writes to the cluster, and a stale list that still defines "done" is '
+        'worse than no list.\n\n'
+        'THE GATE REFUSES TO CLOSE OVER A MALFORMED CLUSTER. '
+        '`set_task_status(<gate>, done)` re-runs the closure check against the '
+        'live same-topic scroll and REFUSES — naming the offending ids — when '
+        'the cluster is not well-formed, when an id claimed in '
+        '`supersedes` is still live, or when the scroll could not be completed. '
+        'Surviving same-topic PEERS are never a refusal: they are the target '
+        'end state. If a live entry was considered and deliberately kept, '
+        f'record it in `metadata.{GATE_METADATA_KEY}.considered_and_kept` as '
+        '`{id, note, recorded_at, recorded_by}` — the `note` is mandatory, and '
+        'a waiver without one waives nothing.\n\n' + render_end_state_brief()
     )
