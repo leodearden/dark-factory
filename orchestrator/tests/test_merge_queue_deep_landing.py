@@ -55,6 +55,7 @@ from typing import Literal
 
 import pytest
 
+from orchestrator import merge_queue
 from orchestrator.config import GitConfig, MergeDeepConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps, _run
@@ -361,6 +362,86 @@ def _fail_verify_result():
         passed=False, test_output='tip is red', lint_output='', type_output='',
         summary='fail', category='',
     )
+
+
+# ── dispatch-scene spies (cloned from test_merge_queue_deep_dispatch.py) ─────
+
+
+async def _merge_commit_off_main(repo: Path, branch: str, label: str) -> str:
+    """Return a REAL merge commit of *branch* into main, WITHOUT advancing main.
+
+    Stands in for the dispatching item's ``merge_result.merge_commit``.  It must
+    not be reachable from ``main``, or every "landed on main" assertion below
+    would hold vacuously before the walk ever ran.
+    """
+    await _run(['git', 'checkout', '-b', f'_tmp-{label}', 'main'], cwd=repo)
+    await _run(['git', 'merge', '--no-ff', '-m', f'merge {branch}', branch], cwd=repo)
+    sha = await _rev_parse(repo)
+    await _run(['git', 'checkout', 'main'], cwd=repo)
+    return sha
+
+
+def _spy_post_merge_verify(monkeypatch, outcome=None, *, raises=None) -> list[dict]:
+    """Replace ``_run_post_merge_verify`` with a recorder returning *outcome*.
+
+    ``outcome=None`` is a PASS in this function's vocabulary; a
+    :class:`VerifyResult` is a FAIL.  *raises* makes the verify blow up
+    instead, which is the third exit — the one that stays NON-adopting under δ
+    (merge_queue.py:18623).
+    """
+    calls: list[dict] = []
+
+    async def _recording(git_ops, req, merge_wt, **kwargs):
+        calls.append({'merge_wt': merge_wt, **kwargs})
+        if raises is not None:
+            raise raises
+        return outcome
+
+    monkeypatch.setattr(
+        'orchestrator.merge_queue._run_post_merge_verify', _recording,
+    )
+    return calls
+
+
+def _spy_chain_lane_release(monkeypatch) -> list[tuple]:
+    """Record ``release_chain_build_lane`` calls WITHOUT suppressing them.
+
+    Passthrough, not a stub: the lane must genuinely go back to FREE, so the
+    pool-state assertions stay real while the call count stays observable.
+    The ChainResult "Lane ownership" contract is EXACTLY-once, and δ adds a
+    fourth exit to the three γ shipped — so this is what proves the adopting
+    exit did not skip, nor double, the release.
+    """
+    calls: list[tuple] = []
+    real = merge_queue.release_chain_build_lane
+
+    async def _recording(git_ops, lane, *, warm):
+        calls.append((lane, warm))
+        return await real(git_ops, lane, warm=warm)
+
+    monkeypatch.setattr(
+        'orchestrator.merge_queue.release_chain_build_lane', _recording,
+    )
+    return calls
+
+
+def _spy_advance_main(git_ops: GitOps, monkeypatch) -> list[tuple]:
+    """Record every ``advance_main`` call as ``(merge_sha, expected_main)``.
+
+    Spied on the GitOps INSTANCE (not a merge_queue module reach-back, which
+    test_merge_queue_reachback_patch_guard.py freezes) and PASSTHROUGH, so main
+    really moves and the recorded ``expected_main`` chain can be checked against
+    real history.  Template: test_merge_speculation.py:2280-2295.
+    """
+    calls: list[tuple] = []
+    real = git_ops.advance_main
+
+    async def _recording(merge_sha, merge_worktree=None, **kwargs):
+        calls.append((merge_sha, kwargs.get('expected_main'), merge_worktree))
+        return await real(merge_sha, merge_worktree, **kwargs)
+
+    monkeypatch.setattr(git_ops, 'advance_main', _recording)
+    return calls
 
 
 # ── quiescence oracle (from test_merge_queue_invariant_integration_gate.py:508) ─
@@ -679,3 +760,252 @@ class TestLandedViaChainCarrier:
         record = retention.get(req.request_id)
         assert record is not None
         assert record.landed_via_chain == 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# step-03: RED — the tip-pass ADOPTION signal out of `_run_inflight_verify`
+#
+# γ's "THE NON-ADOPTING EXIT" (merge_queue.py:18603-18663) sends BOTH arms
+# through `_requeue_request` + the REQUEUED sentinel.  δ replaces ONLY the PASS
+# arm: the tip's verdict is about the CUMULATIVE tree, which is a verified
+# SUPERSET of every prefix member, so a green tip licenses landing the whole
+# prefix — while a tip FAIL (which proves nothing about any individual member)
+# and a chain-arm EXCEPTION (which proves nothing about anyone at all) both
+# stay exactly as γ shipped them.  That asymmetry is the whole of δ's licence,
+# and merge_queue.py:18623 states it in as many words.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(180)
+class TestTipPassAdoptionSignal:
+    """The adopting exit: a PASS-shaped result the finalize half can walk."""
+
+    async def _scene(
+        self, git_repo: Path, monkeypatch, *, passed: bool = True, raises=None,
+    ):
+        """Drive one deep tip verify and return the scene.
+
+        Mirrors γ's `TestDeepTipVerifyNeverAdopts._fixture` so the two modules'
+        claims are about the SAME scene and the narrowing in that class can be
+        read against this one.  ``advance_main`` is left un-spied here: this
+        class is about the SIGNAL `_run_inflight_verify` returns, not about
+        what the finalize half then does with it (step-05 owns that).
+        """
+        git_ops = _make_git_ops(git_repo, size=2)
+        config = _make_config(git_repo, chain_cap=6)
+        await _create_branch_editing(git_repo, 'task/101', 'a.txt', 'edit-101\n')
+        for tid, fn in (('102', 'b.txt'), ('103', 'c.txt')):
+            await _create_branch_editing(git_repo, f'task/{tid}', fn, f'edit-{tid}\n')
+        head = await _merge_commit_off_main(git_repo, 'task/101', '101')
+        worker = _make_worker(git_ops)
+        worker._lane_buffers['normal'].extend(
+            _make_req(tid, tid, config, git_repo) for tid in ('102', '103')
+        )
+        store = _CapturingEventStore()
+        worker._event_store = store
+        item = _make_item(
+            _make_req('101', '101', config, git_repo), head,
+            _ephemeral_merge_wt(git_ops, 'adopt'),
+        )
+        chain = await worker._deep_chain_placement(item)
+        assert chain is not None and len(chain.links) == 2
+
+        _spy_post_merge_verify(
+            monkeypatch,
+            outcome=None if passed else _fail_verify_result(),
+            raises=raises,
+        )
+        releases = _spy_chain_lane_release(monkeypatch)
+        queued = list(worker._lane_buffers['normal'])
+
+        res = await worker._run_inflight_verify(item, _local_lease(), chain=chain)
+        return git_ops, worker, item, chain, res, store, queued, releases
+
+    async def test_tip_pass_returns_an_adopting_result(
+        self, git_repo: Path, monkeypatch,
+    ):
+        """(a) PASS-shaped, not REQUEUED — and the request is NOT re-queued.
+
+        `_finalize_inflight` routes on exactly two things: the sentinel (checked
+        ABOVE the VERIFYING -> FINALIZING hop) and `vr.outcome`.  An adopting
+        exit must therefore present as an ordinary pass — `outcome is None` AND
+        `status is None` — or the walk's own arm is unreachable.
+
+        The negative half matters just as much: a request that is BOTH queued
+        and landed is the double-land hazard `_requeue_request`'s three effects
+        exist to make impossible.  So the queue must stay empty and the
+        request-liveness ledger must show no requeue.
+        """
+        _g, worker, item, _chain, res, _store, _q, _rel = await self._scene(
+            git_repo, monkeypatch, passed=True,
+        )
+
+        assert res.outcome is None, 'a green tip renders no failure outcome'
+        assert res.status is None, (
+            'the REQUEUED sentinel is checked above the FINALIZING hop, so an '
+            'adopting exit must not carry it'
+        )
+        assert res.merge_wt is not None, (
+            "_finalize_inflight's PASS arm asserts merge_wt is not None and "
+            'threads it into advance_main'
+        )
+        assert worker._queue.qsize() == 0, 'an adopted item is not re-queued'
+        assert not item.request.result.done(), (
+            'the verify half never resolves the future — the finalize half does'
+        )
+
+    async def test_the_adopting_result_never_carries_the_chain_lane(
+        self, git_repo: Path, monkeypatch,
+    ):
+        """The lane is already RELEASED by the time the finalize half runs.
+
+        merge_types.py:1458-1464 states it for `InflightEntry.chain`, and it is
+        equally true of the result: `_release_chain_lane()` fires in
+        `_run_inflight_verify`'s own `finally`, so handing the lane onward would
+        give `_finalize_inflight` a POOL-OWNED path it would then dispose a
+        second time — permanently losing a `_spec-` slot, the exact hazard
+        `_release_or_cleanup`'s "WHICH ONE DO I CALL?" rule warns about.
+        """
+        _g, _w, _item, chain, res, _store, _q, _rel = await self._scene(
+            git_repo, monkeypatch, passed=True,
+        )
+
+        assert res.merge_wt != chain.lane
+        assert res.spec_warm is False, (
+            'a non-lane worktree must not be routed as a warm _spec- lane'
+        )
+
+    async def test_the_chain_lane_is_released_exactly_once_on_the_adopting_exit(
+        self, git_repo: Path, monkeypatch,
+    ):
+        """(e) δ adds a FOURTH exit to the three γ shipped; the latch still holds.
+
+        ChainResult's "Lane ownership" contract is exactly-once, and putting
+        the release in the `finally` is what makes "every exit" structural.  An
+        adopting exit that skipped it would strand the lane checked out
+        forever; one that doubled it would hand the same slot to two builders.
+        """
+        git_ops, _w, _item, chain, _res, _store, _q, releases = await self._scene(
+            git_repo, monkeypatch, passed=True,
+        )
+
+        assert len(releases) == 1
+        assert releases[0][0] == chain.lane
+        from orchestrator.warm_lane_pool import LaneState
+
+        pool = git_ops.spec_warm_lane_pool
+        assert pool is not None
+        assert all(st is LaneState.FREE for st in pool._lanes.values()), (
+            'the lane must genuinely be back in the pool, not merely counted'
+        )
+
+    async def test_tip_pass_still_feeds_the_halving_reset_exactly_once(
+        self, git_repo: Path, monkeypatch,
+    ):
+        """(b) `_note_chain_outcome(True, 1 + len(chain.links))` is unchanged.
+
+        The halving state machine is fed the BUILT depth in chain-item units;
+        adoption must not disturb that feed, or a green deep round would stop
+        resetting the bisector and the walk would ratchet downward forever.
+        """
+        notes: list[tuple] = []
+
+        def _install(worker: SpeculativeMergeWorker) -> None:
+            """Wrap `_note_chain_outcome` PASSTHROUGH on the worker instance.
+
+            Instance-level, not a module patch: the halving state must really
+            move, so the reset assertion below stays a fact about production
+            code rather than about the spy.
+            """
+            real_note = worker._note_chain_outcome
+
+            def _recording(passed_: bool, depth: int) -> None:
+                notes.append((passed_, depth))
+                real_note(passed_, depth)
+
+            worker._note_chain_outcome = _recording  # type: ignore[method-assign]
+
+        git_ops = _make_git_ops(git_repo, size=2)
+        config = _make_config(git_repo, chain_cap=6)
+        await _create_branch_editing(git_repo, 'task/101', 'a.txt', 'edit-101\n')
+        for tid, fn in (('102', 'b.txt'), ('103', 'c.txt')):
+            await _create_branch_editing(git_repo, f'task/{tid}', fn, f'edit-{tid}\n')
+        head = await _merge_commit_off_main(git_repo, 'task/101', '101')
+        worker = _make_worker(git_ops)
+        worker._lane_buffers['normal'].extend(
+            _make_req(tid, tid, config, git_repo) for tid in ('102', '103')
+        )
+        worker._event_store = _CapturingEventStore()
+        item = _make_item(
+            _make_req('101', '101', config, git_repo), head,
+            _ephemeral_merge_wt(git_ops, 'halving'),
+        )
+        chain = await worker._deep_chain_placement(item)
+        assert chain is not None and len(chain.links) == 2
+        _install(worker)
+        _spy_post_merge_verify(monkeypatch, outcome=None)
+
+        await worker._run_inflight_verify(item, _local_lease(), chain=chain)
+
+        assert notes == [(True, 3)], '1 dispatching item + 2 links'
+        assert worker._chain_halving_state is None, 'a pass resets the bisector'
+
+    async def test_tip_fail_arm_is_byte_identical_to_gamma(
+        self, git_repo: Path, monkeypatch,
+    ):
+        """(c) A red tip still defers: REQUEUED, queued, no outcome, no event.
+
+        δ's licence is one-directional.  A tip FAIL says the cumulative tree is
+        red; it does NOT identify WHICH member broke it, so terminally failing
+        any of them would be the same unsound attribution pointing the other
+        way — and would feed `consecutive_merge_thrash` a deterministic
+        signature on every retry.
+        """
+        from orchestrator.merge_types import InflightStatus
+
+        _g, worker, item, _chain, res, store, queued, releases = await self._scene(
+            git_repo, monkeypatch, passed=False,
+        )
+
+        assert res.status == InflightStatus.REQUEUED
+        assert res.outcome is None, 'a defer renders no MergeOutcome at all'
+        assert res.merge_wt is None, 'the fail arm disposes its own worktrees'
+        assert not item.request.result.done()
+        assert worker._queue.qsize() == 1
+        assert worker._queue.get_nowait() is item.request
+        assert list(worker._lane_buffers['normal']) == queued, 'same items, same order'
+        assert all(not r.result.done() for r in queued)
+        assert store.events_of(EventType.merge_attempt) == []
+        assert worker._chain_halving_state == 1, '3 built items -> max(1, 3 // 2)'
+        assert len(releases) == 1
+
+    async def test_chain_arm_exception_stays_non_adopting(
+        self, git_repo: Path, monkeypatch,
+    ):
+        """(d) An infra ERROR is not a tip verdict — merge_queue.py:18623.
+
+        A green tip is a verified SUPERSET of every prefix member, which is
+        what licenses δ's adoption.  An exception proves nothing about anyone,
+        so the exception arm keeps γ's recipe verbatim: suppress the next
+        chain for this task, requeue, land nothing.
+        """
+        from orchestrator.merge_types import InflightStatus
+
+        _g, worker, item, _chain, res, store, queued, releases = await self._scene(
+            git_repo, monkeypatch, passed=True,
+            raises=RuntimeError('verify infra exploded'),
+        )
+
+        assert res.status == InflightStatus.REQUEUED
+        assert res.outcome is None
+        assert not item.request.result.done()
+        assert worker._queue.qsize() == 1
+        assert worker._queue.get_nowait() is item.request
+        assert '101' in worker._chain_error_suppressed, (
+            'the one-shot suppression is what makes an infra blip cost exactly '
+            'one non-chained round'
+        )
+        assert list(worker._lane_buffers['normal']) == queued
+        assert store.events_of(EventType.merge_attempt) == []
+        assert len(releases) == 1

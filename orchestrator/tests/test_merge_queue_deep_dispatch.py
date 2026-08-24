@@ -1962,31 +1962,55 @@ class TestRunInflightVerifyChainRedirect:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# step-17: RED — the NON-ADOPTION invariant (γ's soundness fence).
+# step-17: RED — the NON-ADOPTION invariant, NARROWED by δ (task 3186).
 #
 # THE rule this whole task is fenced by: a tip verdict proves the CUMULATIVE
-# tree, never the dispatching item's own SUBSET tree. Letting it reach
-# _finalize_inflight's CAS advance would land I1 from a tree nothing ever
-# verified — the new false-green path the PRD forbids ("Landing safety is
-# structural... There is no new false-green path").
+# tree, never the dispatching item's own SUBSET tree.
 #
-# So BOTH arms — tip pass and tip fail — requeue. This is also the exact seam
-# δ (task 3186) replaces: it swaps the PASS arm for the in-order CAS walk over
-# `chain.links`, and that is the ONLY place adoption may be introduced.
+# The rule is SYMMETRIC, and γ enforced BOTH halves by requeuing on both arms.
+# δ licenses exactly ONE of them: the tip's tree is a verified SUPERSET of
+# every prefix member, so a GREEN tip does license landing the whole prefix —
+# and δ's in-order CAS walk over `chain.links` is where that happens
+# (test_merge_queue_deep_landing.py).  Nothing else moved.  A tip FAIL still
+# proves only that the cumulative tree is red, never WHICH member broke it, and
+# a chain-arm EXCEPTION proves nothing about anyone at all — so those two arms
+# keep γ's recipe verbatim and are what this class now pins
+# (merge_queue.py:18623 states the asymmetry in as many words).
 # ═══════════════════════════════════════════════════════════════════════════
+
+
+_NON_ADOPTING_ARMS = [
+    pytest.param(False, None, id='tip-fail'),
+    pytest.param(True, RuntimeError('verify infra exploded'), id='chain-arm-error'),
+]
+"""The two arms that keep γ's REQUEUED recipe verbatim under δ (task 3186).
+
+``(passed, raises)``.  The error arm passes ``passed=True`` deliberately — the
+verdict it would have produced is irrelevant, because the exception preempts it;
+what the arm proves is that an infra error is not a tip verdict at all.
+"""
 
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(180)
 class TestDeepTipVerifyNeverAdopts:
-    """Nothing lands via the chain in γ — on either arm."""
+    """The two arms that STAY non-adopting under δ: tip fail, and tip error.
 
-    async def _fixture(self, git_repo: Path, monkeypatch, *, passed: bool):
-        """Drive one deep tip verify to *passed* and return the whole scene.
+    Narrowed by δ (task 3186), which took over the PASS arm — see the banner
+    above.  ``ARM`` below is the parametrize vocabulary these tests share.
+    """
+
+    async def _fixture(
+        self, git_repo: Path, monkeypatch, *, passed: bool, raises=None,
+    ):
+        """Drive one deep tip verify to *passed* (or *raises*) and return the scene.
 
         Returns ``(git_ops, worker, item, chain, res, store, queued_reqs)``.
         ``advance_main`` is spied (not stubbed to fail) so a violation shows up
-        as a recorded call rather than as an unrelated exception.
+        as a recorded call rather than as an unrelated exception.  Note this is
+        still meaningful on the PASS arm under δ: δ's walk lives in the
+        FINALIZE half, so ``_run_inflight_verify`` alone must still reach no
+        CAS advance on any arm.
         """
         git_ops = _make_git_ops(git_repo, size=2)
         config = _make_config(git_repo, chain_cap=6)
@@ -2014,6 +2038,7 @@ class TestDeepTipVerifyNeverAdopts:
         )
         _spy_post_merge_verify(
             monkeypatch, outcome=None if passed else _fail_verify_result(),
+            raises=raises,
         )
         queued_reqs = list(worker._lane_buffers['normal'])
         main_before = await _rev_parse(git_repo, 'main')
@@ -2024,9 +2049,9 @@ class TestDeepTipVerifyNeverAdopts:
         assert await _rev_parse(git_repo, 'main') == main_before
         return git_ops, worker, item, chain, res, store, queued_reqs
 
-    @pytest.mark.parametrize('passed', [True, False], ids=['tip-pass', 'tip-fail'])
-    async def test_requeues_instead_of_resolving_on_both_arms(
-        self, git_repo: Path, monkeypatch, passed: bool,
+    @pytest.mark.parametrize(('passed', 'raises'), _NON_ADOPTING_ARMS)
+    async def test_requeues_instead_of_resolving_on_the_non_adopting_arms(
+        self, git_repo: Path, monkeypatch, passed: bool, raises,
     ):
         """REQUEUED sentinel + the request genuinely back on ``_queue``.
 
@@ -2036,11 +2061,15 @@ class TestDeepTipVerifyNeverAdopts:
         chokepoint enforced by
         test_merge_queue_lifecycle_registry.py::TestRequeueRecipeHasASingleChokepoint)
         rather than a bare ``_queue.put_nowait``.
+
+        δ (task 3186) took the PASS arm — see
+        test_merge_queue_deep_landing.py::TestTipPassAdoptionSignal for the
+        adopting exit's own contract.
         """
         from orchestrator.merge_types import InflightStatus
 
         _git_ops, worker, item, _chain, res, _store, _q = await self._fixture(
-            git_repo, monkeypatch, passed=passed,
+            git_repo, monkeypatch, passed=passed, raises=raises,
         )
 
         assert res.status == InflightStatus.REQUEUED
@@ -2050,9 +2079,9 @@ class TestDeepTipVerifyNeverAdopts:
         assert worker._queue.qsize() == 1
         assert worker._queue.get_nowait() is item.request
 
-    @pytest.mark.parametrize('passed', [True, False], ids=['tip-pass', 'tip-fail'])
+    @pytest.mark.parametrize(('passed', 'raises'), _NON_ADOPTING_ARMS)
     async def test_emits_no_merge_attempt_and_no_blocked_outcome(
-        self, git_repo: Path, monkeypatch, passed: bool,
+        self, git_repo: Path, monkeypatch, passed: bool, raises,
     ):
         """Deep fails never feed workflow.py's ``consecutive_merge_thrash`` ladder.
 
@@ -2064,7 +2093,7 @@ class TestDeepTipVerifyNeverAdopts:
         purity comment guards against upstream.
         """
         _git_ops, _worker, item, _chain, res, store, _q = await self._fixture(
-            git_repo, monkeypatch, passed=passed,
+            git_repo, monkeypatch, passed=passed, raises=raises,
         )
 
         assert store.events_of(EventType.merge_attempt) == []
@@ -2093,7 +2122,15 @@ class TestDeepTipVerifyNeverAdopts:
     async def test_tip_pass_resets_the_halving_state(
         self, git_repo: Path, monkeypatch,
     ):
-        """A green tip resets to the ``None`` sentinel — but still lands nothing."""
+        """A green tip resets to the ``None`` sentinel.
+
+        Kept on the PASS arm after δ narrowed this class, because it is a claim
+        about the HALVING FEED, not about adoption: δ moved the landing into the
+        finalize half and left ``_note_chain_outcome(out is None, 1 + links)``
+        exactly where γ put it.  The fixture's own ``advances == []`` assertion
+        still holds for the same reason — ``_run_inflight_verify`` reaches no
+        CAS advance on any arm, δ included.
+        """
         _git_ops, worker, _item, _chain, _res, _store, queued = await self._fixture(
             git_repo, monkeypatch, passed=True,
         )
@@ -2101,9 +2138,9 @@ class TestDeepTipVerifyNeverAdopts:
         assert worker._chain_halving_state is None
         assert list(worker._lane_buffers['normal']) == queued
 
-    @pytest.mark.parametrize('passed', [True, False], ids=['tip-pass', 'tip-fail'])
+    @pytest.mark.parametrize(('passed', 'raises'), _NON_ADOPTING_ARMS)
     async def test_finalize_disposes_the_entry_without_a_phantom_head(
-        self, git_repo: Path, monkeypatch, passed: bool,
+        self, git_repo: Path, monkeypatch, passed: bool, raises,
     ):
         """``_finalize_inflight`` returns False and strands no finalize head.
 
@@ -2115,7 +2152,7 @@ class TestDeepTipVerifyNeverAdopts:
         from orchestrator.merge_types import InflightEntry
 
         _git_ops, worker, item, chain, res, _store, _q = await self._fixture(
-            git_repo, monkeypatch, passed=passed,
+            git_repo, monkeypatch, passed=passed, raises=raises,
         )
         done: asyncio.Future = asyncio.get_running_loop().create_future()
         done.set_result(res)
