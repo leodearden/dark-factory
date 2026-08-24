@@ -3270,6 +3270,13 @@ _NEVER_TRACKED_PHRASES: frozenset[str] = frozenset({
     'never tracked',
     'never filed as a task',
     'no tracked task',
+    'no fix task has been filed',
+    'no task has been filed',
+    'no fix task',
+    'no follow-up task',
+    'no task exists',
+    'never been filed',
+    'not been filed',
 })
 
 #: Small English + domain stopword set for _significant_terms.  The domain
