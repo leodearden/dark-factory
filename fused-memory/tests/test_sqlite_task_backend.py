@@ -760,7 +760,7 @@ async def test_set_task_status_without_claimant_kwargs_leaves_claimant_intact(ba
     assert one['heartbeat_at'] == '2026-07-07T00:00:00+00:00'
 
 
-def _make_v2_stamped_db_without_claimant_columns(db_path: Path) -> None:
+def _make_v2_stamped_db_without_claimant_columns(db_path: Path, *, status: str = 'pending') -> None:
     """Create a tasks.db in the v1 shape but stamped ``user_version = 2`` (columns absent).
 
     Simulates a connection whose claimant columns never got ALTERed in —
@@ -769,6 +769,10 @@ def _make_v2_stamped_db_without_claimant_columns(db_path: Path) -> None:
     candidate_key step (the v1->v2 claimant ALTER is gated on ``version < 2``
     and is skipped for an already-v2 DB), so the claimant columns stay
     absent, exercising set_task_status's fail-safe (WARNING, no error) path.
+
+    ``status`` seeds the single row's status column (default ``'pending'``,
+    matching every pre-existing caller); pass e.g. ``'done'`` to exercise
+    the fail-safe path on an already-terminal row.
     """
     import sqlite3
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -802,7 +806,8 @@ def _make_v2_stamped_db_without_claimant_columns(db_path: Path) -> None:
     """)
     conn.execute(
         "INSERT INTO tasks (tag, id, title, status, updated_at) "
-        "VALUES ('master', 1, 'stranded-shape task', 'pending', '2026-01-01T00:00:00.000Z')",
+        "VALUES ('master', 1, 'stranded-shape task', ?, '2026-01-01T00:00:00.000Z')",
+        (status,),
     )
     conn.execute("PRAGMA user_version = 2")
     conn.commit()
@@ -867,6 +872,43 @@ async def test_set_task_claimant_fails_safe_when_columns_absent(tmp_path, caplog
 
     warning_msgs = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
     assert warning_msgs, 'Expected a WARNING when claimant columns are absent'
+
+
+@pytest.mark.asyncio
+async def test_set_task_claimant_columns_absent_on_terminal_row_emits_no_tripwire(
+    tmp_path, caplog,
+):
+    """A call that writes NOTHING (claimant-columns-absent fail-safe) must not trip the wire.
+
+    E-3 scopes the ERROR to a call that PERSISTS a non-NULL claimant; the fail-safe path
+    returns early before the UPDATE ever runs.
+    """
+    project_root = str(tmp_path / 'proj')
+    db_path = Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
+    _make_v2_stamped_db_without_claimant_columns(db_path, status='done')
+
+    cfg = TaskmasterConfig(project_root=str(tmp_path))
+    b = SqliteTaskBackend(cfg)
+    await b.start()
+    try:
+        with caplog.at_level(logging.WARNING, logger='fused_memory.backends.sqlite_task_backend'):
+            result = await b.set_task_claimant(
+                '1', project_root=project_root,
+                claimant_run_id='run-x', heartbeat_at='2026-08-24T00:00:00+00:00',
+            )
+    finally:
+        await b.close()
+
+    assert 'Claimant columns unavailable' in result['message']
+
+    warning_msgs = [
+        r.message for r in caplog.records
+        if r.levelno >= logging.WARNING and 'columns absent' in r.message
+    ]
+    assert warning_msgs, 'Expected the pre-existing fail-safe WARNING to still fire'
+
+    tripwire_msgs = [r.message for r in caplog.records if 'claimant_stamped_on_terminal' in r.message]
+    assert tripwire_msgs == [], 'A no-write fail-safe call must never trip the wire'
 
 
 # ── status vocabulary guard ─────────────────────────────────────────
