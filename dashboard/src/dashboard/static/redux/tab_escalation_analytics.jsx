@@ -1,7 +1,9 @@
 /* Escalation Analytics tab — Origin / Lifespan / Workflow lifecycle panels.
  *
- * No JS test runner in this project (see scheduler_drawer.jsx comment).
- * Wiring contracts are verified via Python source-assertion tests in
+ * No JS test runner for .jsx in this project (see scheduler_drawer.jsx
+ * comment) — but the pure decisions lifted OUT of this file are covered
+ * by `node --test` under dashboard/tests/js/. Wiring contracts are
+ * verified via Python tests in
  * dashboard/tests/test_tab_escalation_analytics.py.
  *
  * Load order: tabs.jsx → tab_escalation_analytics.jsx → app.jsx
@@ -12,6 +14,7 @@ const { useState: uS, useEffect: uE } = React;
 const DF = window.DF_DATA;
 const { ProjectGroup, Segmented, fmtUptime, fmtDateTime, taskId } = window.DF_SHELL;
 const C = window.DF_CHARTS;
+const { pinningBadgeState } = window.DF_PINS_RECOVERY;
 const { LifecycleFlowDiagram } = window.DF_ESC_FLOW || {};
 
 // ── Local helpers (tab_escalations.jsx-compatible copies; not exported from
@@ -411,6 +414,23 @@ function LifespanPanel({ lifespan, win, generatedAt }) {
                 <td className="num mono">
                   {fmtUptime(item.age_secs)}
                   {item.breach_6h && <span className="badge bad" style={{ marginLeft: 6, fontSize: 9 }}>6h+</span>}
+                  {/* Truthiness, deliberately: the backend OMITS pins_recovery
+                      when the annotation is unknown (that project's escalation
+                      MCP was unreadable, or the record carried none), so this
+                      draws nothing for both false and undefined. There is no
+                      negated arm — "does not pin" over an unclassified record
+                      would be a claim nobody made. That decision, and the
+                      tooltip it builds, live in pins_recovery.js (shared with
+                      the escalations tab's StatTile) and are covered by
+                      dashboard/tests/js/pins_recovery.test.mjs. */}
+                  {(() => {
+                    const pb = pinningBadgeState(item);
+                    return pb && (
+                      <span className={pb.cls} style={{ marginLeft: 6, fontSize: 9 }} title={pb.title}>
+                        {pb.label}
+                      </span>
+                    );
+                  })()}
                 </td>
               </tr>
             ))}

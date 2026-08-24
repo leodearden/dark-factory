@@ -34,7 +34,6 @@ from fused_memory.reconciliation.flag_dedup import (
     filter_stale_count_snapshot_corrections,
     filter_terminal_metadata_flags,
 )
-from fused_memory.reconciliation.policies import DARK_FACTORY_PROJECT_ID
 from fused_memory.reconciliation.prompts import _STAGE1_PROJECT_ID_GUIDELINE
 from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
 from fused_memory.reconciliation.recon_pool_map import (
@@ -316,10 +315,12 @@ class MemoryConsolidator(BaseStage):
             # the e61b38f9/1938 false-positive incident: Stage 1 asserted an idea
             # was never converted to a tracked task despite a done dark_factory
             # task already implementing it (which spawned duplicate task 2412).
-            # dark_factory's project_root is resolved from known_projects (the
-            # harness cross-project routing map) rather than a hardcoded path, so
-            # this naturally no-ops when dark_factory is not a registered project.
-            # Uses get_tasks(statuses=['done']) rather than the semantic
+            # The whole cross-project routing map is handed over (task 4381):
+            # the filter fans one get_tasks out per known project and matches on
+            # TEXT coverage, where a same-project match is genuine evidence — so
+            # unlike dedup_flags' foreign-only cited-task gate below, ALL known
+            # projects are queried.  It naturally no-ops when known_projects is
+            # empty.  Uses get_tasks(statuses=...) rather than the semantic
             # search_tasks named in the task description: search_tasks lives only
             # on TaskInterceptor/the MCP wrapper, not on TaskBackendProtocol, so it
             # is unreachable from self.taskmaster (a raw SqliteTaskBackend) here —
@@ -327,7 +328,7 @@ class MemoryConsolidator(BaseStage):
             _before_already_tracked_filter = len(report.items_flagged)
             report.items_flagged = await filter_already_tracked_systemic_patterns(
                 taskmaster=self.taskmaster,
-                dark_factory_root=self.known_projects.get(DARK_FACTORY_PROJECT_ID),
+                known_projects=self.known_projects,
                 flags=report.items_flagged,
             )
             report.stats['systemic_pattern_already_tracked_dropped'] = (
@@ -337,11 +338,35 @@ class MemoryConsolidator(BaseStage):
             # suppression gate (filter_suppressed) as its first step, so suppression
             # drops can be isolated below and excluded from acknowledgment.
             _pre_dedup_flags = list(report.items_flagged)
+            _dedup_stats: dict[str, int] = {}
             report.items_flagged = await dedup_flags(
                 memory_service=self.memory,
                 project_id=self.project_id,
                 run_id=run_id,
                 flags=report.items_flagged,
+                # Cross-project fix-task suppression (task 4381): without BOTH
+                # of these, dedup_flags' HIT-path gate degrades to a silent
+                # no-op by design.
+                taskmaster=self.taskmaster,
+                known_projects=self.known_projects,
+                # Out-dict for dedup_flags' own drop counters (task 4381
+                # amendment) — see the report.stats publication below.
+                stats=_dedup_stats,
+            )
+            # Every sibling filter in this chain publishes its drop count; the
+            # cross-project gate now does too, so an operator reading a cycle
+            # report can tell "a foreign fix task resolved this" apart from "a
+            # stage1_flag_suppression record hid this" — two very different
+            # signals that the signature diff below deliberately merges.
+            report.stats['stage1_flag_cross_project_fix_task_suppressed'] = int(
+                _dedup_stats.get('cross_project_fix_task_suppressed', 0)
+            )
+            # Findings whose cited fix task is already done yet which keep
+            # recurring: suppression EXPIRED and they were surfaced again
+            # (dedup_flags logs each at WARNING).  A non-zero value here means
+            # a landed fix did not stop its finding.
+            report.stats['stage1_flag_cross_project_fix_task_suppression_exhausted'] = int(
+                _dedup_stats.get('cross_project_fix_task_suppression_exhausted', 0)
             )
             # One-time completion markers dedup_flags emitted-then-self-deleted this
             # cycle (task-2312) — counts flags annotated completion_marker_self_deleted
@@ -350,11 +375,23 @@ class MemoryConsolidator(BaseStage):
                 1 for f in report.items_flagged
                 if f.get('completion_marker_self_deleted') is True
             )
-            # Signatures dropped specifically by dedup_flags' internal suppression
-            # gate: present before dedup_flags, absent after.  dedup_flags never
-            # drops a flag for any other reason — a HIT or MISS always keeps the
-            # flag (annotated or not) — so this diff isolates suppression drops
-            # without an extra Mem0 search.
+            # Signatures dropped INSIDE dedup_flags: present before, absent
+            # after.  As of task 4381 dedup_flags drops for TWO reasons — its
+            # filter_suppressed gate, and a ledger HIT whose cited_tasks resolve
+            # to a live, non-cancelled fix task in a FOREIGN known project — so
+            # this diff no longer isolates suppression alone.  Both causes are
+            # deliberately folded into `suppressed_signatures` here, and are
+            # therefore EXCLUDED from acknowledge_resolved_flags below.  That is
+            # correct for the same reason the existing suppression carve-out is:
+            # a cross-project fix task that has been FILED has not yet LANDED, so
+            # the marker must retain its recurrence history for the day that task
+            # is cancelled or closed without landing the fix — exactly like "a
+            # suppression means the issue is intentionally hidden, not resolved".
+            # The two causes cannot be told apart by this diff — dedup_flags
+            # returns only a list — so the cross-project count is reported
+            # separately above, out of dedup_flags' `stats` out-dict, alongside
+            # the `reconciliation.stage1_flag_cross_project_fix_task_suppressed`
+            # INFO log that names the specific fix task behind each drop.
             _post_dedup_signatures = {
                 sig for f in report.items_flagged
                 if (sig := (compute_flag_signature(f) or compute_content_fingerprint_signature(f)))
@@ -594,14 +631,33 @@ class MemoryConsolidator(BaseStage):
                 report.stats['degenerate_task_nodes_swept'] = sweep_stats['deleted']
                 report.stats['degenerate_task_nodes_scanned'] = sweep_stats['scanned']
 
-        # ── Stale task-status snapshot edge sweep (task 2613) ──────────────────
+        # ── Stale task-status snapshot edge sweep (tasks 2613, 3037) ──────────
         # Invalidate VALID (invalid_at IS NULL) task-status-snapshot Graphiti
-        # edges whose asserted active/pending/in-progress status now contradicts
-        # a terminal (done/cancelled) task, via a deterministic direct-lookup
-        # sweep (never semantic search). Best-effort: a sweep failure must never
-        # abort the stage or leave a partial/incorrect stat — it is logged and
-        # swallowed, and no stale_status_snapshot_edges_* stat is set for this
-        # cycle.
+        # edges whose asserted status is now contradicted, via a deterministic
+        # direct-lookup sweep (never semantic search). Two selection rules:
+        #   - the TERMINAL rule (task 2613): an asserted active/pending/
+        #     in-progress status contradicted by a terminal (done/cancelled)
+        #     task;
+        #   - the BLOCKED-ASSERTION rule (task 3037): an asserted BLOCKED
+        #     status contradicted by ANY other positively-known status —
+        #     'pending', 'in-progress', 'review', … — not merely a terminal
+        #     one. Without it a blocked->pending unblock left 'Task N remains
+        #     blocked' asserted as current until the task eventually reached
+        #     done, which is most of a task's life.
+        # Second half of the blocked rule's deterministic step: after each
+        # successful blocked-rule invalidation the sweep writes ONE superseding
+        # resulting-state-only temporal_fact per contradicted task per cycle,
+        # so the graph records what replaced the retired assertion instead of
+        # merely losing it — surfaced here as stale_blocked_edges_superseded.
+        # Its two failure modes are surfaced beside it rather than left to the
+        # log: a bare superseded=0 cannot distinguish "no blocked edge needed
+        # superseding this cycle" from "every superseding write failed" or
+        # "the per-cycle write ceiling truncated them" — the same
+        # 0-vs-N ambiguity this task was filed against.  (amendment,
+        # reviewer_comprehensive observability finding)
+        # Best-effort: a sweep failure must never abort the stage or leave a
+        # partial/incorrect stat — it is logged and swallowed, and NONE of
+        # these stats is set for this cycle.
         try:
             snapshot_sweep_stats = await sweep_stale_status_snapshot_edges(
                 self.memory, self.taskmaster, self.project_id, self.project_root,
@@ -623,6 +679,15 @@ class MemoryConsolidator(BaseStage):
             )
             report.stats['stale_status_snapshot_edges_scanned'] = (
                 snapshot_sweep_stats['scanned']
+            )
+            report.stats['stale_blocked_edges_superseded'] = (
+                snapshot_sweep_stats['superseded']
+            )
+            report.stats['stale_blocked_edges_supersede_errors'] = (
+                snapshot_sweep_stats['supersede_errors']
+            )
+            report.stats['stale_blocked_edges_supersede_skipped'] = (
+                snapshot_sweep_stats['supersede_skipped']
             )
 
         # ── Stale priority-override / pin-queue edge sweep (task 2781) ─────────

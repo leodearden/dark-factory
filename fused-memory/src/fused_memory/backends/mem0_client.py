@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+from collections.abc import AsyncIterator
 from typing import Any
 
 from mem0 import AsyncMemory
@@ -30,6 +31,64 @@ def _extract_payload_text(payload: dict[str, Any]) -> str | None:
         if isinstance(value, str) and value:
             return value
     return None
+
+
+#: Default cap on how many pages a single full-enumeration scroll may walk.
+#: A pager with no budget loops forever if Qdrant keeps handing back a live
+#: ``next_offset``, so the budget travels with the loop.  THE single home for
+#: this number: ``scripts/census_memory_metadata.DEFAULT_MAX_PAGES`` aliases
+#: it rather than restating 200 (INV-5).
+DEFAULT_SCROLL_MAX_PAGES = 200
+
+
+class ScrollPageBudgetExhausted(RuntimeError):
+    """A paged scroll consumed *max_pages* with ``next_offset`` still live.
+
+    The stream is TRUNCATED, so the pager raises rather than ending short —
+    a caller that folded a short stream into counters would under-report with
+    no error surface (INV-2 no-silent-fail-soft).
+
+    ``scripts/census_memory_metadata.CensusScanIncomplete`` is a module-level
+    ALIAS of this class (not a subclass): the census's ``except
+    CensusScanIncomplete`` must catch exactly what the backend raises.
+    """
+
+
+def is_missing_collection_error(exc: BaseException) -> bool:
+    """True iff *exc* is Qdrant's "that collection doesn't exist" 404.
+
+    A collection that was never provisioned holds no memories, so the honest
+    answer for a read against it is an EMPTY RESULT — semantically the same 0
+    / ``[]`` that ``task_curator.corpus_count``/``search_corpus`` return for an
+    absent collection, and distinct from a failure to read.
+
+    Everything else returns False and MUST keep propagating to the caller's
+    error path: a non-404 ``UnexpectedResponse`` (a real backend failure), a
+    generic exception, and above all a ``TimeoutError`` — rendering a
+    transient failure as "no data" is precisely the silent fail-soft the
+    no-silent-fail invariant bans.  Matching is therefore narrow by
+    construction (404 AND the message), so a 404 raised about some other
+    Qdrant resource can never be read as an empty collection.
+
+    Callers that degrade on this predicate should still say so out loud (log
+    the missing collection), so an operator can tell "collection absent" from
+    "collection genuinely empty".
+    """
+    from qdrant_client.http.exceptions import UnexpectedResponse  # noqa: PLC0415
+
+    if not isinstance(exc, UnexpectedResponse) or exc.status_code != 404:
+        return False
+    content = exc.content
+    if isinstance(content, bytes | bytearray):
+        content = content.decode('utf-8', errors='replace')
+    text = str(content).lower()
+    # BOTH tokens, never the phrase alone: Qdrant words several other not-found
+    # errors identically ("Snapshot `x` doesn't exist!", alias/shard variants),
+    # and only the COLLECTION one means "zero memories".  Requiring 'collection'
+    # is what makes the narrowness the docstring promises actually hold.
+    # Verified against a live Qdrant scroll on an absent collection:
+    # {"status":{"error":"Not found: Collection `x` doesn't exist!"}}.
+    return "doesn't exist" in text and 'collection' in text
 
 
 # ---------------------------------------------------------------------------
@@ -540,6 +599,84 @@ class Mem0Backend:
         )
         return result.count
 
+    def _build_payload_filter(self, filters: dict[str, Any]):
+        """Build the Qdrant payload ``Filter`` for a key→value equality dict.
+
+        THE single construction site for this filter (INV-5).  Every
+        metadata-addressed Qdrant read in this class routes through here:
+        :meth:`count_by_metadata`, :meth:`scroll_by_metadata` and
+        :meth:`scroll_all_by_metadata`.
+
+        This is a correctness requirement, not tidiness.  The metadata census
+        (``scripts/census_memory_metadata.py``) reconciles its SCROLL against
+        :meth:`count_by_metadata`'s COUNT to decide ``coverage.complete``.  If
+        the two filter constructions ever drifted, that reconciliation would
+        silently compare two *different* point sets and still report complete
+        coverage — a no-silent-fail violation with no error surface.  The
+        sharing is pinned by an equality assertion at each entry point in
+        ``tests/test_mem0_client.py::TestMem0BackendPayloadFilterSingleHome``.
+
+        Args:
+            filters: Non-empty dict of key→value equality filters.  Mem0
+                stores ``add_memory(metadata=...)`` fields as top-level keys
+                on the Qdrant payload, so ``{'source': 'X'}`` matches against
+                ``payload.source == 'X'``.
+
+        Returns:
+            A ``qdrant_client.http.models.Filter`` whose ``must`` list holds
+            one ``FieldCondition``/``MatchValue`` per item, in dict-insertion
+            order.
+
+        Raises:
+            ValueError: If *filters* is empty — an unfiltered ``Filter``
+                selects the WHOLE collection, which is a bug at every caller.
+                Callers validate first with their own message naming the right
+                unfiltered alternative (``count()`` / ``get_all()``); this
+                guard is the backstop so the shared builder can never become
+                the hole that lets one through.
+        """
+        if not filters:
+            raise ValueError(
+                '_build_payload_filter requires at least one filter; '
+                'an empty filter would select every point in the collection',
+            )
+        from qdrant_client.http import models as qmodels  # noqa: PLC0415
+
+        must: list[qmodels.Condition] = [
+            qmodels.FieldCondition(key=k, match=qmodels.MatchValue(value=v))
+            for k, v in filters.items()
+        ]
+        return qmodels.Filter(must=must)
+
+    def _normalise_point(self, point: Any, *, with_vectors: bool) -> dict[str, Any]:
+        """Normalise one raw Qdrant point into the standard record dict.
+
+        THE single home for this shape (INV-5), shared by the list-returning
+        :meth:`scroll_by_metadata` and the streaming
+        :meth:`scroll_all_by_metadata` so the two APIs cannot drift in what a
+        record looks like — a caller migrating between them must see
+        byte-identical dicts.
+
+        Returns ``{'id', 'created_at', 'metadata'}`` where ``created_at`` is
+        the raw string from the payload (or ``None`` if absent) and
+        ``metadata`` is the full payload dict.  When *with_vectors* is True
+        the record additionally carries ``'vector'``; that key is absent
+        entirely when False.
+        """
+        payload: dict[str, Any] = dict(point.payload) if point.payload else {}
+        record: dict[str, Any] = {
+            'id': point.id,
+            'created_at': payload.get('created_at'),
+            'metadata': payload,
+        }
+        if with_vectors:
+            # getattr-with-default, not point.vector: Qdrant can return a
+            # point carrying no vector at all.  Degrade to None so the
+            # caller can count it as a disclosure — raising here would
+            # discard an entire otherwise-good scan over one bad point.
+            record['vector'] = getattr(point, 'vector', None)
+        return record
+
     async def count_by_metadata(
         self,
         scope: Scope,
@@ -566,15 +703,9 @@ class Mem0Backend:
                 'count_by_metadata requires at least one filter; '
                 'use count() to count all memories in the collection',
             )
-        from qdrant_client.http import models as qmodels  # noqa: PLC0415
-
         collection_name = scope.mem0_collection_name(self.config.mem0.collection_prefix)
         client = await self._get_async_qdrant()
-        must: list[qmodels.Condition] = [
-            qmodels.FieldCondition(key=k, match=qmodels.MatchValue(value=v))
-            for k, v in filters.items()
-        ]
-        qdrant_filter = qmodels.Filter(must=must)
+        qdrant_filter = self._build_payload_filter(filters)
         result = await asyncio.wait_for(
             client.count(
                 collection_name=collection_name,
@@ -647,15 +778,9 @@ class Mem0Backend:
                 'scroll_by_metadata requires at least one filter; '
                 'use get_all() to retrieve all memories in the collection',
             )
-        from qdrant_client.http import models as qmodels  # noqa: PLC0415
-
         collection_name = scope.mem0_collection_name(self.config.mem0.collection_prefix)
         client = await self._get_async_qdrant()
-        must: list[qmodels.Condition] = [
-            qmodels.FieldCondition(key=k, match=qmodels.MatchValue(value=v))
-            for k, v in filters.items()
-        ]
-        qdrant_filter = qmodels.Filter(must=must)
+        qdrant_filter = self._build_payload_filter(filters)
         points, _next_offset = await asyncio.wait_for(
             client.scroll(
                 collection_name=collection_name,
@@ -667,21 +792,7 @@ class Mem0Backend:
             timeout=self._read_timeout,
         )
 
-        result = []
-        for point in points:
-            payload: dict[str, Any] = dict(point.payload) if point.payload else {}
-            record: dict[str, Any] = {
-                'id': point.id,
-                'created_at': payload.get('created_at'),
-                'metadata': payload,
-            }
-            if with_vectors:
-                # getattr-with-default, not point.vector: Qdrant can return a
-                # point carrying no vector at all.  Degrade to None so the
-                # caller can count it as a disclosure — raising here would
-                # discard an entire otherwise-good scan over one bad point.
-                record['vector'] = getattr(point, 'vector', None)
-            result.append(record)
+        result = [self._normalise_point(point, with_vectors=with_vectors) for point in points]
 
         if len(points) == limit:
             logger.warning(
@@ -868,6 +979,197 @@ class Mem0Backend:
             offset = next_offset
 
         return {'matches': matches, 'scanned': scanned, 'truncated': truncated}
+
+    async def scroll_collection_pages(
+        self,
+        collection_name: str,
+        *,
+        scroll_filter: Any = None,
+        page_size: int = 1000,
+        max_pages: int = DEFAULT_SCROLL_MAX_PAGES,
+        with_vectors: bool = False,
+    ) -> AsyncIterator[Any]:
+        """Yield every Qdrant point in *collection_name*, paging on ``next_offset``.
+
+        THE single home for the offset/next_offset walk (INV-5).  Both
+        full-enumeration callers sit on top of it:
+        :meth:`scroll_all_by_metadata` (Scope+filter-addressed, normalised
+        records — what ``scripts/census_memory_metadata.py`` drives) and
+        ``scripts/consolidate_namespace_families.merge_collection``
+        (raw points, no filter — which enters at THIS layer).
+
+        Deliberately collection-name-addressed rather than
+        :class:`~fused_memory.models.scope.Scope`-addressed, and
+        filter-OPTIONAL, because consolidate_namespace_families scrolls
+        LEGACY mis-named collections (``fused_dark-factory``, ``reify_reify``,
+        ``autopilot_video_autopilot_video``) that a Scope structurally cannot
+        produce, with no filter at all.  Raw points are yielded, not
+        normalised records, because its ``merge_collection`` reads
+        ``point.id``/``point.vector``/``point.payload`` to rebuild
+        ``PointStruct``s.
+
+        Points are yielded one at a time (never accumulated) so a caller
+        folding them into counters holds one page in memory regardless of
+        collection size.
+
+        Args:
+            collection_name: The Qdrant collection, passed through VERBATIM.
+            scroll_filter: Optional pre-built payload ``Filter`` (see
+                :meth:`_build_payload_filter`).  ``None`` scrolls the whole
+                collection — safe here, unlike at the metadata-addressed APIs,
+                because the caller named the collection explicitly.
+            page_size: Points requested per page (Qdrant ``limit``).
+            max_pages: Page budget; exhausting it raises rather than
+                truncating.
+            with_vectors: Fetch each point's stored vector.  Costs bandwidth,
+                so it is opt-in.
+
+        Yields:
+            Raw Qdrant point objects, in page order.
+
+        Raises:
+            ScrollPageBudgetExhausted: If *max_pages* is consumed while
+                ``next_offset`` is still live — the stream is truncated, so it
+                raises instead of ending short.
+            TimeoutError: If a single page request exceeds ``_read_timeout``.
+                PROPAGATED, never swallowed into an empty stream — same
+                posture as :meth:`count_by_metadata` /
+                :meth:`scroll_by_metadata` / :meth:`get_point_by_id`, so a
+                timed-out read is never mistaken for an empty collection.
+        """
+        client = await self._get_async_qdrant()
+        offset: Any = None
+        pages = 0
+        while True:
+            # Bound each PAGE, not the whole scan: a per-scan bound would
+            # abort a long-but-healthy multi-page enumeration.
+            points, next_offset = await asyncio.wait_for(
+                client.scroll(
+                    collection_name=collection_name,
+                    scroll_filter=scroll_filter,
+                    with_payload=True,
+                    with_vectors=with_vectors,
+                    limit=page_size,
+                    offset=offset,
+                ),
+                timeout=self._read_timeout,
+            )
+            pages += 1
+            for point in points:
+                yield point
+
+            if next_offset is None:
+                return
+            if pages >= max_pages:
+                raise ScrollPageBudgetExhausted(
+                    f'scroll of collection={collection_name!r} exhausted its page budget '
+                    f'after {pages} page(s) of {page_size} with next_offset={next_offset!r} '
+                    f'still live — the scan is truncated. Raise max_pages or page_size.',
+                )
+            offset = next_offset
+
+    def scroll_all_by_metadata(
+        self,
+        scope: Scope,
+        filters: dict[str, Any],
+        *,
+        page_size: int = 1000,
+        max_pages: int = DEFAULT_SCROLL_MAX_PAGES,
+        with_vectors: bool = False,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Stream EVERY memory matching *filters*, paging until the match set is exhausted.
+
+        The intended primitive for full-enumeration callers.  Same addressing
+        as :meth:`scroll_by_metadata` (Scope + non-empty equality filters) and
+        the same per-record shape — both normalise through
+        :meth:`_normalise_point` — but this one walks Qdrant's
+        ``next_offset`` to completion instead of returning a single capped
+        page.
+
+        There is deliberately NO ``limit`` and NO truncation warning here:
+        this API does not truncate.  Enumeration is exhaustive, and if the
+        collection is so large that the page budget runs out it RAISES
+        (:class:`ScrollPageBudgetExhausted`) rather than quietly returning a
+        short stream.  ``scroll_by_metadata`` is untouched and keeps its
+        one-shot capped-list semantics for callers that genuinely want a
+        bounded read (``scripts/audit_duplicate_memories.py``).
+
+        Records are yielded one at a time, so a caller folding them into
+        counters (``scripts/census_memory_metadata.py``) holds one page in
+        memory regardless of corpus size.
+
+        Args:
+            scope: Project/agent/session scope — resolves the collection
+                exactly as :meth:`scroll_by_metadata` does.
+            filters: Non-empty dict of key→value equality filters, built into
+                a payload filter by the shared :meth:`_build_payload_filter`
+                so this scroll and :meth:`count_by_metadata` provably select
+                the same points.
+            page_size: Points fetched per Qdrant round-trip.
+            max_pages: Page budget for the whole enumeration.
+            with_vectors: Lift each point's stored vector onto its record.
+
+        Yields:
+            ``{'id', 'created_at', 'metadata'}`` dicts (plus ``'vector'`` when
+            *with_vectors*) — identical in shape to
+            :meth:`scroll_by_metadata`'s list elements.
+
+        Argument validation is EAGER: the ``ValueError`` (and any error from
+        resolving the collection or building the payload filter) raises when
+        this method is CALLED, matching the coroutine sibling
+        :meth:`scroll_by_metadata`, so a caller that builds the stream and
+        then conditionally never iterates it still gets the error. Only the
+        paging is deferred — this is a plain ``def`` returning
+        :meth:`_scroll_all_records`, because an ``async def`` containing
+        ``yield`` would be an async-generator function whose body, guard
+        included, does not run until the first ``__anext__``.
+
+        Raises:
+            ValueError: If *filters* is empty — at CALL time.
+            ScrollPageBudgetExhausted: If the enumeration is truncated by the
+                page budget.
+            TimeoutError: If a single page exceeds the read timeout —
+                propagated, never swallowed into an empty stream.
+        """
+        if not filters:
+            raise ValueError(
+                'scroll_all_by_metadata requires at least one filter; '
+                'use get_all() to retrieve all memories in the collection',
+            )
+        collection_name = scope.mem0_collection_name(self.config.mem0.collection_prefix)
+        scroll_filter = self._build_payload_filter(filters)
+        return self._scroll_all_records(
+            collection_name,
+            scroll_filter,
+            page_size=page_size,
+            max_pages=max_pages,
+            with_vectors=with_vectors,
+        )
+
+    async def _scroll_all_records(
+        self,
+        collection_name: str,
+        scroll_filter: Any,
+        *,
+        page_size: int,
+        max_pages: int,
+        with_vectors: bool,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Lazy paging half of :meth:`scroll_all_by_metadata`.
+
+        Assumes PRE-VALIDATED arguments — the public method is the sole entry
+        point and owns the empty-filters guard, the collection resolution and
+        the payload-filter build. See it for the streaming, budget and
+        timeout contracts.
+        """
+        async for point in self.scroll_collection_pages(
+            collection_name,
+            scroll_filter=scroll_filter,
+            page_size=page_size,
+            max_pages=max_pages,
+            with_vectors=with_vectors,
+        ):
+            yield self._normalise_point(point, with_vectors=with_vectors)
 
     async def get_point_by_id(self, memory_id: str, scope: Scope) -> dict[str, Any] | None:
         """Direct Qdrant point-fetch by id (non-semantic) → raw payload dict, or None.

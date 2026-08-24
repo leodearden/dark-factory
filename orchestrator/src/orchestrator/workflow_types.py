@@ -133,6 +133,22 @@ class TerminalReport:
     # Defaults True so every pre-existing construction site (DONE/CANCELLED
     # and all non-warm-lane block paths) is unchanged and keeps counting.
     counts_against_requeue_cap: bool = True
+    # Task 3315 (PRD `plans/server-side-api-error-handling-prd.md` task β,
+    # contract C2): the STRUCTURED HTTP status of a server-side API failure,
+    # carried verbatim from ``AgentResult.api_error_status`` (via
+    # ``shared.cli_invoke.classify_agent_failure``).  This is the PRIMARY
+    # transient-requeue routing signal (INV-1 "structured field over regex"),
+    # replacing the regex-over-prose match on the block reason — which
+    # survives only as a legacy fallback in
+    # ``scheduler.is_transient_api_requeue``.  The thread is
+    # ``TerminalReport -> TaskReport ->
+    # Scheduler.record_requeue(api_error_status=...) ->
+    # is_transient_api_requeue``.
+    # PRODUCERS — the phases that actually SET this on a REQUEUED report —
+    # land in the sibling PRD tasks γ (execute), η (review) and θ
+    # (planning/simple_task); it therefore defaults ``None`` at every
+    # construction site today, exactly like every other additive field here.
+    api_error_status: int | None = None
 
 
 class RequeueKind(enum.Enum):

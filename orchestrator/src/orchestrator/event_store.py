@@ -272,6 +272,61 @@ class EventType(StrEnum):
     session_resume_fallback = 'session_resume_fallback'
     session_resume_capped = 'session_resume_capped'
 
+    # session_resume_failed (task 3578) — a resume that was ADOPTED by the
+    # _run_slot guard above and then still failed to happen. It closes the
+    # population that was previously journal-only and runs.db-INVISIBLE: an
+    # armed --resume whose transcript the CLI could not resolve exits before it
+    # ever contacts the API, so none of the three events above, and no cost or
+    # cap row, ever recorded that the session was lost.
+    #
+    # NOT part of the ratio recipe's denominator above, and this is the one
+    # thing to get right when querying it. The three events above are emitted by
+    # the _run_slot guard, exactly once per DISPATCH that carried a recovered
+    # session. This one is emitted by TaskWorkflow._invoke, i.e. once per
+    # INVOCATION — and a single dispatch invokes several roles — so adding it to
+    # that sum would compare populations counted on different units and silently
+    # inflate the attempt count.
+    #
+    # data.stage splits the two ways an adopted resume dies:
+    #   pre_flight — _invoke corroborated the session against the config dir it
+    #                was about to export as CLAUDE_CONFIG_DIR, found no
+    #                transcript there (and could not rehydrate one from the
+    #                durable archive), and dispatched FRESH instead of arming a
+    #                --resume the CLI would reject. data: {stage, session_id,
+    #                role, restore} — `restore` is the rehydration OUTCOME, one
+    #                of 'disabled' (session_resume.restore_from_archive off),
+    #                'miss' (the archive genuinely holds no entry for that
+    #                session and nothing else — the archive-COVERAGE signal),
+    #                'fault' (the restore raised: archive-root composition OR
+    #                the restore's own I/O, the latter reaching this arm only
+    #                because _invoke calls the helper with strict=True — see
+    #                the restore_outcome vocabulary comment in workflow.py) or
+    #                'published' (restore claimed success yet the CLI-facing
+    #                locator still cannot see it: pathological, unreachable by
+    #                construction, counted rather than assumed away).
+    #   cli        — the resume WAS armed and the CLI rejected it;
+    #                invoke_with_cap_retry silently retried fresh and returned a
+    #                SUCCESS, so nothing else anywhere records the loss. data:
+    #                {stage, session_id, session_ids, role, fallbacks}, where
+    #                `fallbacks` is AgentResult.resume_fallbacks — the count of
+    #                fresh retries this one invocation had to make — and
+    #                `session_ids` are the ids those retries dropped, oldest
+    #                first (`session_id` is the first of them, i.e. the resume
+    #                the orchestrator itself adopted). Emitted ONLY when _invoke
+    #                armed the resume: the shared/ counter also increments for a
+    #                resume its retry loop re-armed internally after a cap hit,
+    #                which a plain fresh dispatch can reach, and counting those
+    #                would inflate the ratio below past 1.
+    #
+    # SQL split, alongside the existing '$.reason' / '$.archive_available' ones:
+    #   SELECT json_extract(data, '$.stage') AS stage, COUNT(*)
+    #     FROM events WHERE event_type = 'session_resume_failed'
+    #    GROUP BY stage;
+    # Read it against session_resume (the adopted-resume count) rather than
+    # against the three-event sum: it answers "of the resumes we decided to
+    # make, how many did not survive to the agent?".
+    session_resume_failed = 'session_resume_failed'
+
     # Scheduler fairness
     task_skipped = 'task_skipped'
     reservation_installed = 'reservation_installed'
@@ -530,6 +585,53 @@ class EventType(StrEnum):
     #   writable set so an operator can diff exactly what a given invocation
     #   could touch (INV-2 structured facts). Consumed by γ1's soak predicate.
     sandbox_applied = 'sandbox_applied'
+
+    # Recovery-decision emission (PRD plans/task-escalation-state-graph-prd.md
+    # D5; spec docs/task-escalation-state-spec.md S6/E12; task beta 3535).  The
+    # canonical WHY lives in orchestrator/src/orchestrator/recovery_emission.py
+    # (module docstring) — every other site carries a pointer, never a copy.
+    #
+    # Both members share ONE payload key vocabulary:
+    #   {task_id, site, shape, reason, escalation_ids, ages_secs, measured_at,
+    #    store_unavailable, streak}
+    #   site           — a RecoverySite member naming WHICH veto/LEAVE site
+    #                    spoke (the deterministic-recon pair deliberately use
+    #                    two distinct labels so their duplication is countable).
+    #   shape          — the pipe-joined 5-tuple task_ground_truth._shape keys
+    #                    the _RECOVERY table on, rendered by render_shape.
+    #   reason         — the closed LeaveReason vocabulary: escalation_pinned,
+    #                    escalation_store_unavailable, unmapped_shape,
+    #                    live_claimant, deploy_phase_in_flight,
+    #                    provenance_arbitration.
+    #   escalation_ids — the open records that held it, bucketed by
+    #                    escalation.pins.classify_pins
+    #                    ({dead_l0, queue_handoff, non_pinning}).
+    #   ages_secs      — {escalation_id: seconds}, a MAPPING (join by id, never
+    #                    by position); an unparseable timestamp maps to null
+    #                    rather than dropping the id.
+    # task_id is ALSO a first-class column, so these rows stay joinable against
+    # task_completed / escalation_created.
+    #
+    # The discriminator between the two:
+    #   recovery_vetoed — an open escalation actively vetoed a recovery /
+    #     redispatch / done-flip / dispatch that would OTHERWISE have been
+    #     taken.  Something was held back, and the payload names by what:
+    #     reason escalation_pinned, or provenance_arbitration for the
+    #     already-landed gate's contested-task withhold.
+    #   recovery_left   — a LEAVE fall-through for a NON-veto reason: an
+    #     unmapped shape, an in-flight deploy phase, or escalation_store_
+    #     unavailable.  Nothing was held back by a record; the site simply had
+    #     no mapped action (or could not read the store to find out).
+    #
+    # Read these as STATE, not as a rate.  Emission is signature-transition-
+    # gated (new-or-changed (site, task_id) veto signature, plus exactly once at
+    # the streak threshold crossing) rather than one row per observation,
+    # because two of the sites run per dispatch TICK and unconditional emission
+    # would storm the store (INV-4).  Per-sweep cadence is carried by the
+    # reconcile sweep's always-logged summary line instead.  The ABSENCE of
+    # these rows for a stranded task is therefore meaningful: nothing held it.
+    recovery_vetoed = 'recovery_vetoed'
+    recovery_left = 'recovery_left'
 
 
 class EventStore:

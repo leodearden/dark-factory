@@ -11,14 +11,19 @@ Covers:
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import os
 from datetime import UTC, datetime
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from shared import invocation_outcome
+from shared.cli_invoke import AgentResult
 from shared.config_models import AccountConfig, UsageCapConfig
+from shared.invocation_outcome import AuthFailed, auth_failure_reason, classify_invocation
 from shared.usage_gate import AccountState, UsageGate
 
 
@@ -88,6 +93,25 @@ class TestAuthFailedPersistsResetsAt:
     text contains a "resets …" phrase. Source of truth for cap-time parsing
     is the gate's _parse_resets_at; the dashboard reads what we persist
     rather than re-parsing the reason string itself.
+
+    DECIDED SHAPE (task 4042) — do not "helpfully" re-disable this branch.
+    Restoring the 401/403 response-body snippet re-armed the ``'resets' in
+    reason.lower()`` branch in ``_handle_auth_failure``, which was unreachable
+    dead code while the reason was always the bare ``HTTP 401``. Two halves are
+    deliberately pinned here:
+
+      1. The branch IS allowed to fire — a 401/403 body carrying a genuinely
+         parseable "resets in 3h" persists a REAL ETA. The line predates the
+         regression (93baf1193a < b68eea415b), so suppressing it would invent
+         new behaviour.
+      2. An UNPARSEABLE "resets" hint persists NOTHING rather than a fabricated
+         hour. The branch's original parser was the forked
+         ``usage_gate._parse_resets_at``, which returns ``now + 1h`` on parse
+         failure; the dashboard (``dashboard/data/costs.py::_extract_resets_at``)
+         surfaces the persisted value verbatim as a real reset ETA, so that
+         would put a fabricated recovery time on a revoked token — violating
+         PRD 7.1.a ("an unknown reset time must be reported as explicitly
+         unknown, never fabricated").
     """
 
     def _capture_fired_details(self, gate: UsageGate) -> list[tuple[str, str, str]]:
@@ -183,6 +207,176 @@ class TestAuthFailedPersistsResetsAt:
         details = json.loads(details_json)
         assert 'resets_at' not in details
         assert details['reason'] == 'HTTP 403: token has been revoked'
+
+    def test_unparseable_resets_hint_persists_no_resets_at(self):
+        """Half 2 of the decided shape: a "resets" substring with no parseable
+        phrase must persist NOTHING, not a fabricated now+1h.
+        """
+        import json
+        gate = _make_gate(['a'])
+        captured = self._capture_fired_details(gate)
+        reason = 'HTTP 401: your admin resets access quarterly'
+        gate._handle_auth_failure(reason, oauth_token='fake-token-a')
+        _, _, details_json = captured[0]
+        details = json.loads(details_json)
+        assert 'resets_at' not in details
+        assert details['reason'] == reason
+
+    def test_parseable_resets_in_401_body_persists_real_resets_at(self):
+        """Half 1 of the decided shape: the branch is deliberately allowed to
+        fire, so a genuinely parseable reset time in a 401 body is surfaced.
+        """
+        import json
+        from datetime import datetime as _dt
+        from datetime import timedelta as _td
+        gate = _make_gate(['a'])
+        captured = self._capture_fired_details(gate)
+        before = _dt.now(UTC)
+        gate._handle_auth_failure(
+            'HTTP 401: token rejected, quota resets in 3h',
+            oauth_token='fake-token-a',
+        )
+        _, _, details_json = captured[0]
+        details = json.loads(details_json)
+        assert 'resets_at' in details
+        assert details['resets_at'].endswith('+00:00')
+        parsed = _dt.fromisoformat(details['resets_at'])
+        # Generous window so this cannot flake on the real wall clock.
+        assert before + _td(hours=2, minutes=50) <= parsed <= before + _td(hours=3, minutes=10)
+
+    def test_pure_revocation_body_persists_reason_but_no_resets_at(self):
+        """End-to-end through the real seam: classifier -> reason renderer ->
+        gate. The restored snippet must reach PERSISTED state (the whole point
+        of task 4042), and a revocation body carries no reset ETA.
+        """
+        import json
+        gate = _make_gate(['a'])
+        captured = self._capture_fired_details(gate)
+        result = AgentResult(
+            success=False,
+            output=(
+                '{"type":"error","error":{"type":"authentication_error",'
+                '"message":"OAuth token has been revoked"}}'
+            ),
+            api_error_status=401,
+        )
+        outcome = classify_invocation(result, strict_confirm=True)
+        assert isinstance(outcome, AuthFailed)
+        gate._handle_auth_failure(auth_failure_reason(outcome), oauth_token='fake-token-a')
+        _, _, details_json = captured[0]
+        details = json.loads(details_json)
+        assert 'OAuth token has been revoked' in details['reason']
+        assert 'resets_at' not in details
+
+
+#: shared/tests/test_auth_failed.py -> parents[0]=shared/tests, parents[1]=shared,
+#: parents[2]=repo root. Mirrors capability_manifest_corpus.REPO_ROOT; correct
+#: inside a `.worktrees/<id>` checkout too.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+#: Package source trees that ship production code able to reach the fork. Scoped
+#: to `<pkg>/src` on purpose: `.worktrees/` sits at the REPO root, so unlike a
+#: root-level rglob (the trap capability_manifest_corpus.py documents) this walk
+#: cannot wander into a sibling task's checkout.
+_PRODUCTION_SRC_ROOTS = ('shared/src', 'orchestrator/src')
+
+#: The ONE module allowed to call the bare `_parse_resets_at` name: it is where
+#: the non-fabricating copy is defined, so an unqualified call there is
+#: unambiguous. Everywhere else the convention (already followed by
+#: shared/src/shared/usage_gate.py's `import ... as _parse_resets_at_strict`) is
+#: to import it under the explicit alias, so a reader can tell at the call site
+#: WHICH of the two copies is running.
+_STRICT_PARSE_OWNER = 'shared/src/shared/invocation_outcome.py'
+
+
+def _parse_resets_at_call_sites() -> list[str]:
+    """Every `_parse_resets_at(...)` CALL in the production source trees.
+
+    AST-based, not grep-based: the fork and its history are discussed at
+    length in comments and docstrings across both `usage_gate.py` copies, and
+    a textual scan would count that prose as callers. Only `ast.Call` nodes
+    count, so `_parse_resets_at_strict(...)` (a different name) and every
+    mention in prose are excluded by construction.
+    """
+    sites: list[str] = []
+    for rel_root in _PRODUCTION_SRC_ROOTS:
+        root = _REPO_ROOT / rel_root
+        # Loud, not silently narrowed: a guard that quietly stops scanning a
+        # tree it can no longer find is worse than no guard.
+        assert root.is_dir(), f'production source root missing: {root}'
+        for path in sorted(root.rglob('*.py')):
+            source = path.read_text(encoding='utf-8')
+            lines = source.splitlines()
+            # ast.walk is breadth-first, so a single file's hits are not
+            # source-ordered; the caller sorts what it reports.
+            for node in ast.walk(ast.parse(source, filename=str(path))):
+                if not isinstance(node, ast.Call):
+                    continue
+                func = node.func
+                if isinstance(func, ast.Name):
+                    called = func.id
+                elif isinstance(func, ast.Attribute):
+                    called = func.attr
+                else:
+                    continue
+                if called == '_parse_resets_at':
+                    rel = path.relative_to(_REPO_ROOT)
+                    sites.append(f'{rel}:{node.lineno}: {lines[node.lineno - 1].strip()}')
+    return sorted(sites)
+
+
+class TestFabricatingForkHasNoProductionCallers:
+    """`usage_gate._parse_resets_at` (the fabricating fork) must stay caller-free.
+
+    Task 4042 moved the fork's ONE live call site — `_handle_auth_failure` —
+    onto the non-fabricating `shared.invocation_outcome` copy, because
+    restoring the 401/403 body snippet re-armed the `'resets' in reason.lower()`
+    branch: a body merely CONTAINING the substring "resets" without a parseable
+    phrase would otherwise persist an invented `now + 1h` recovery time onto a
+    revoked token (PRD 7.1.a — see `TestAuthFailedPersistsResetsAt` above).
+
+    DELETING the fork was deliberately out of scope: ~20 tests across `shared`
+    and `orchestrator` pin its `now + 1h` fallback contract, and
+    `orchestrator/src/orchestrator/usage_gate.py` re-exports it. So it stays
+    importable, and "do not wire new callers onto it" lived only as prose in a
+    docstring. This is the mechanical enforcement of that sentence: it fails
+    the moment production code calls the bare name anywhere outside the module
+    that DEFINES the strict copy.
+
+    If this fails because the fork was legitimately retired, delete the fork's
+    definition and this class together — do not relax the assertion.
+    """
+
+    def test_scan_finds_the_known_strict_call_site(self):
+        # Anti-vacuity: proves the AST walk actually resolves calls, so a
+        # future rename cannot turn the guard below into a no-op that passes
+        # because it found nothing at all.
+        sites = _parse_resets_at_call_sites()
+        assert sites, 'AST scan found no _parse_resets_at call anywhere — guard is vacuous'
+
+    def test_only_the_strict_copy_owner_calls_the_bare_name(self):
+        # Exact file match, not a prefix match — and NO assertion on the call
+        # COUNT: a legitimate new call to the strict copy inside its own module
+        # must not fail this guard.
+        offenders = [
+            s for s in _parse_resets_at_call_sites()
+            if s.split(':', 1)[0] != _STRICT_PARSE_OWNER
+        ]
+        assert offenders == [], (
+            'new production caller(s) of the bare `_parse_resets_at` name: '
+            f'{offenders}. Outside {_STRICT_PARSE_OWNER} this resolves to the '
+            'FABRICATING fork in shared/src/shared/usage_gate.py (or its '
+            'orchestrator re-export), which invents `now + 1h` on parse '
+            'failure. Import the strict copy as `_parse_resets_at_strict` '
+            'instead — see TestAuthFailedPersistsResetsAt for why.'
+        )
+
+    def test_handle_auth_failure_does_not_import_the_fork(self):
+        # Belt-and-braces on the specific regression: the module that owns
+        # _handle_auth_failure must reach the strict copy under its alias.
+        import shared.usage_gate as usage_gate_module
+
+        assert usage_gate_module._parse_resets_at_strict is invocation_outcome._parse_resets_at
 
 
 @pytest.mark.asyncio

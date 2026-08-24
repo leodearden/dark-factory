@@ -15,27 +15,58 @@ SCOPING layer, by widening to the owning module's FULL_SUITE — never by
 softening rc=5 in the classification layer (``verify_classify.py`` carries that
 invariant verbatim and is untouched by this task).
 
+BOTH ARMS (task 3513).  Task 3494 closed only ``_derive_module_runs`` arm 4.
+The twin in ``_derive_fallback_runs`` — the branch that fires when a project
+registers NO module_configs — has the identical failure mode, and dark-factory's
+own root ``pyproject.toml`` carries ``-m 'not smoke'``, so the ingredient is
+present; only this repo's registered module_configs keep the branch unreachable
+here.  It is reachable in other projects dark-factory targets.
+
+The two arms share ONE probe (``verify_plan.deselecting_expression_for_command``)
+so they can never disagree about which commands are refused or where the ini
+file is looked for.  The fallback arm needs one extra layer: that branch hands
+``run_verification`` the ModuleConfig rather than the plan, so the widening is
+applied to the ALREADY-EXECUTED config
+(``verify_plan.widen_fallback_for_marker_deselection``) and the plan record is
+reconciled to match (``verify._executed_fallback_plan``'s ``pytest_reason``).
+Taking the executed config is also what makes the over-fire task 3494's
+docstring feared structurally impossible: by then any subproject rescoping has
+already happened, so the command's own shape decides.
+
 This module unit-tests the pure static detector (``orchestrator.pytest_markers``)
 against synthetic strings, then pins the wired ``derive_verify_plan`` behaviour —
-including the real-config incident golden — at the end.
+including the real-config incident golden — then the shared probe, the fallback
+widener's refusal and positive halves, the plan-record reconciliation, and
+finally the end-to-end pin through ``run_scoped_verification``'s fallback branch.
 """
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 import yaml
+from test_verify import _real_worktree_reader
 from test_verify_plan import DATA_MODULE_DIFF, ROOT_CONFTEST_DIFF, SOURCE_ONLY_DIFF
+from test_verify_scope_kappa import _executed_module_configs, _run_verification_spy
 
-from orchestrator.config import ModuleConfig
+from orchestrator import verify, verify_plan
+from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.pytest_markers import (
     deselecting_expression_for_targets,
     expression_definitely_deselects,
     module_level_marker_names,
     resolve_marker_expression,
 )
+from orchestrator.verify import run_scoped_verification
 from orchestrator.verify_cmd import parse_config_command
-from orchestrator.verify_plan import ScopeKind, VerifyPlan, derive_verify_plan
+from orchestrator.verify_plan import (
+    ScopeKind,
+    VerifyPlan,
+    derive_verify_plan,
+    deselecting_expression_for_command,
+    widen_fallback_for_marker_deselection,
+)
 
 # ---------------------------------------------------------------------------
 # resolve_marker_expression (step-1: RED)
@@ -802,3 +833,614 @@ class TestWarmLaneBashRealConfigRegression:
         assert run.scoped_targets == ()
         assert mc.test_command is not None
         assert run.cmd == parse_config_command(mc.test_command)
+
+
+# ---------------------------------------------------------------------------
+# The FALLBACK (no-module_configs) arm — task 3513, the 3494 twin
+# ---------------------------------------------------------------------------
+#
+# Task 3494 closed the "path says COLLECTABLE_TEST, pytest collects zero -> rc=5
+# -> false RED" defect in ``_derive_module_runs`` arm 4 only.  The twin arm in
+# ``_derive_fallback_runs`` (fires when a project registers NO module_configs)
+# has the identical failure mode: a repo root carrying
+# ``addopts = "-m 'not X'"`` plus a diff touching only X-marked test files still
+# plans — and, crucially, EXECUTES — a zero-collecting file-scoped run.
+#
+# The two arms share ONE probe (``deselecting_expression_for_command``) so they
+# can never disagree about which commands are refused or where the ini file is
+# looked for; a divergence there would reopen exactly the over-fire risk task
+# 3494's docstring feared.
+
+#: Every ``*.py`` these readers serve is module-level ``slow``-marked, and every
+#: ``*pyproject.toml`` deselects ``slow`` — so a REFUSAL test can never pass
+#: vacuously through a missing file.  If the guard under test stopped firing,
+#: the widening would happen and the assertion would fail.
+_SLOW_MARKED_SOURCE = 'import pytest\npytestmark = pytest.mark.slow\n\n\ndef test_x():\n    pass\n'
+_UNMARKED_PLAIN_SOURCE = 'import pytest\n\n\ndef test_y():\n    pass\n'
+
+
+def _permissive_reader(
+    reads: list[str],
+    overrides: dict[str, str | None] | None = None,
+):
+    """A recording reader that says "yes, widen" to everything it is not overridden on.
+
+    Serves ``_DESELECTING_PYPROJECT`` at EVERY ``*pyproject.toml`` path and
+    ``_SLOW_MARKED_SOURCE`` at every ``*.py`` path, recording each read into
+    *reads*.  *overrides* wins where present (a ``None`` value models a file the
+    reader cannot read — a directory, or a missing path).
+
+    Same injected seam as ``verify_plan``'s ``worktree_reader``
+    (``Callable[[str], str | None]``); no new I/O is introduced.
+    """
+    over = overrides or {}
+
+    def read(path: str) -> str | None:
+        reads.append(path)
+        if path in over:
+            return over[path]
+        if path.endswith('pyproject.toml'):
+            return _DESELECTING_PYPROJECT
+        if path.endswith('.py'):
+            return _SLOW_MARKED_SOURCE
+        return None
+
+    return read
+
+
+class TestDeselectingExpressionForCommand:
+    """``deselecting_expression_for_command(test_command, targets, worktree_reader)``.
+
+    Task 3494's probe, promoted to a public pure function taking a COMMAND
+    STRING instead of a ModuleConfig, so the module arm and the new fallback
+    arm share one implementation of "which commands are refused" and "where the
+    ini file is looked for".  Returns the effective ``-m`` expression iff it
+    provably deselects EVERY target; None — "keep today's FILE_SCOPED
+    behaviour" — in every other case.
+
+    *targets* are worktree-ROOT-relative (the reader's frame), while the
+    command's own targets may be cwd-relative; only the CONFIG path follows the
+    command's ``cwd_rel``.
+    """
+
+    def test_marked_target_under_a_deselecting_root_returns_the_expression(self):
+        """The positive case: the bare fallback shape, root pyproject, marked target."""
+        reads: list[str] = []
+        assert deselecting_expression_for_command(
+            'pytest mod/tests/test_a.py',
+            ['mod/tests/test_a.py'],
+            _permissive_reader(reads),
+        ) == 'not slow'
+
+    def test_a_command_without_a_cwd_reads_the_repo_root_config(self):
+        """WHERE: no ``cd``/``--directory`` means pytest's rootdir IS the repo root."""
+        reads: list[str] = []
+        deselecting_expression_for_command(
+            'pytest mod/tests/test_a.py', ['mod/tests/test_a.py'], _permissive_reader(reads),
+        )
+        assert 'pyproject.toml' in reads
+        assert 'mod/pyproject.toml' not in reads
+
+    def test_a_cd_command_reads_that_subprojects_config_not_the_root(self):
+        """The anti-over-fire pin: the probe follows the command's effective rootdir.
+
+        ``cd sub && uv run pytest ...`` roots at ``sub``, so a root-only
+        ``addopts`` must never be what proves the deselection.
+        """
+        reads: list[str] = []
+        read = _permissive_reader(reads)
+        assert deselecting_expression_for_command(
+            'cd sub && uv run pytest tests/test_a.py', ['sub/tests/test_a.py'], read,
+        ) == 'not slow'
+        assert 'sub/pyproject.toml' in reads
+        assert 'pyproject.toml' not in reads, 'root config is not this command\'s rootdir'
+
+    #: ``npm test`` and ``./scripts/test.sh`` both parse OPAQUE; a pyproject's
+    #: addopts describe a suite neither command ever invokes, so consulting them
+    #: would widen on a false premise.
+    @pytest.mark.parametrize('test_command', ['npm test', './scripts/test.sh'])
+    def test_a_non_pytest_command_is_refused(self, test_command):
+        """GUARD 1."""
+        reads: list[str] = []
+        assert deselecting_expression_for_command(
+            test_command, ['mod/tests/test_a.py'], _permissive_reader(reads),
+        ) is None
+        assert not any(p.endswith('pyproject.toml') for p in reads), 'refused before any read'
+
+    def test_a_raw_retained_chain_is_refused(self):
+        """GUARD 2: a chained command hides both its rootdir and which clause is scoped."""
+        reads: list[str] = []
+        assert deselecting_expression_for_command(
+            'cd sub && uv run pytest x && cd .. && pytest y',
+            ['sub/tests/test_a.py'],
+            _permissive_reader(reads),
+        ) is None
+        assert not any(p.endswith('pyproject.toml') for p in reads), 'refused before any read'
+
+    def test_a_none_command_is_refused(self):
+        """No command means no suite to reason about."""
+        reads: list[str] = []
+        assert deselecting_expression_for_command(
+            None, ['mod/tests/test_a.py'], _permissive_reader(reads),
+        ) is None
+        assert reads == []
+
+    def test_empty_targets_never_widen(self):
+        """An empty target list is refused, never treated as vacuously all-deselected."""
+        reads: list[str] = []
+        assert deselecting_expression_for_command(
+            'pytest', [], _permissive_reader(reads),
+        ) is None
+
+    def test_one_unmarked_target_is_enough_to_refuse(self):
+        """ALL, not ANY — a single still-collecting target means the run is not empty."""
+        reads: list[str] = []
+        read = _permissive_reader(reads, {'mod/tests/test_b.py': _UNMARKED_PLAIN_SOURCE})
+        assert deselecting_expression_for_command(
+            'pytest mod/tests/test_a.py mod/tests/test_b.py',
+            ['mod/tests/test_a.py', 'mod/tests/test_b.py'],
+            read,
+        ) is None
+
+    def test_an_unreadable_target_is_refused(self):
+        """A None answer proves nothing — the fail-safe direction."""
+        reads: list[str] = []
+        read = _permissive_reader(reads, {'mod/tests/test_a.py': None})
+        assert deselecting_expression_for_command(
+            'pytest mod/tests/test_a.py', ['mod/tests/test_a.py'], read,
+        ) is None
+
+    def test_a_cli_dash_m_that_reselects_the_bucket_is_refused(self):
+        """Last-wins: a CLI ``-m slow`` SELECTS the marked target the addopts dropped."""
+        reads: list[str] = []
+        assert deselecting_expression_for_command(
+            'pytest -m slow mod/tests/test_a.py',
+            ['mod/tests/test_a.py'],
+            _permissive_reader(reads),
+        ) is None
+
+
+def _fallback_mc(test_command: str | None) -> ModuleConfig:
+    """The shape ``verify._build_fallback_config`` emits, with *test_command* substituted.
+
+    ``prefix='__fallback__'`` and the lint/type-check commands are carried so
+    every assertion below can check that widening touches the pytest slot ONLY —
+    marker deselection is a pytest-only concern.
+    """
+    return ModuleConfig(
+        prefix='__fallback__',
+        test_command=test_command,
+        lint_command='ruff check tests/test_a.py',
+        type_check_command='pyright tests/test_a.py',
+    )
+
+
+class TestWidenFallbackRefuses:
+    """``widen_fallback_for_marker_deselection(fallback, reader)`` — the REFUSAL half.
+
+    The one-directional fail-safe: this function takes the ALREADY-EXECUTED
+    fallback ModuleConfig (post ``_build_fallback_config`` + ``_apply_cargo_scope``),
+    so the executed command's OWN SHAPE — never a guess about which branch
+    produced it — decides.  Every shape ``_build_fallback_config`` can emit that
+    must not widen is pinned here, and each returns the input ModuleConfig
+    unchanged (identity, not merely equality) with a None reason.
+
+    Every reader serves a DESELECTING pyproject at EVERY ``*pyproject.toml``
+    path AND a ``slow``-marked module at EVERY ``*.py`` path, so no refusal can
+    pass vacuously: if the guard under test stopped firing, the widening would.
+    """
+
+    @staticmethod
+    def _refuses(test_command: str | None, overrides: dict[str, str | None] | None = None):
+        """Assert *test_command* is refused, and return the reads for further checks."""
+        reads: list[str] = []
+        fallback = _fallback_mc(test_command)
+        widened, reason = widen_fallback_for_marker_deselection(
+            fallback, _permissive_reader(reads, overrides),
+        )
+        assert widened is fallback, 'a refusal must return the input config untouched'
+        assert reason is None
+        return reads
+
+    def test_no_test_command_is_refused(self):
+        """``_build_fallback_config``'s "no collectable tests" branch leaves it None."""
+        assert self._refuses(None) == []
+
+    def test_the_mixed_root_plus_subproject_chain_is_refused(self):
+        """Task 2368's shape parses raw-retained: which clause gets scoped is unrecoverable."""
+        reads = self._refuses(
+            'cd sub && uv run pytest tests/test_a.py && cd .. && pytest tests/test_b.py',
+        )
+        assert not any(p.endswith('pyproject.toml') for p in reads), 'refused before any read'
+
+    def test_the_uv_extras_shape_is_refused(self):
+        """Task 2641's ``uv run --extra dev pytest`` also parses raw-retained."""
+        reads = self._refuses('cd sub && uv run --extra dev pytest tests/test_a.py')
+        assert not any(p.endswith('pyproject.toml') for p in reads), 'refused before any read'
+
+    @pytest.mark.parametrize('test_command', ['npm test', './scripts/test.sh'])
+    def test_a_non_pytest_command_is_refused(self, test_command):
+        """A pyproject's addopts describe a suite these commands never invoke."""
+        self._refuses(test_command)
+
+    #: A configured suite is run VERBATIM by ``_build_fallback_config`` (never
+    #: file-scoped), so it has no file targets to drop — nothing to widen.
+    @pytest.mark.parametrize('test_command', ['pytest', "uv run pytest -m 'not slow'"])
+    def test_an_unscoped_suite_has_nothing_to_widen(self, test_command):
+        self._refuses(test_command)
+
+    #: The conftest branch emits a DIRECTORY target (``_fallback_pytest_targets``),
+    #: and a configured ``pytest tests/`` is directory-shaped too.  The
+    #: ``is_file()``-guarded worktree reader answers None for a directory, so no
+    #: proof of deselection can exist — the refusal is structural, not incidental.
+    @pytest.mark.parametrize(
+        'test_command', ['pytest . mod/tests/test_a.py', 'pytest mod/tests'],
+    )
+    def test_a_directory_target_is_unprovable_and_refused(self, test_command):
+        self._refuses(test_command)
+
+    def test_one_unmarked_target_is_enough_to_refuse(self):
+        """ALL, not ANY — a single still-collecting file means the run is not empty."""
+        self._refuses(
+            'pytest mod/tests/test_a.py mod/tests/test_b.py',
+            {'mod/tests/test_b.py': _UNMARKED_PLAIN_SOURCE},
+        )
+
+    def test_a_rootdir_declaring_no_marker_expression_is_refused(self):
+        """No ``-m`` anywhere means nothing was deselected — today's FILE_SCOPED run stands."""
+        self._refuses(
+            'pytest mod/tests/test_a.py', {'pyproject.toml': _PLAIN_PYPROJECT},
+        )
+
+
+class TestWidenFallbackWidensOnFullDeselection:
+    """``widen_fallback_for_marker_deselection`` — the POSITIVE half.
+
+    The remedy mirrors task 3494's arm 4a exactly: drop the file targets and
+    run the same command's full suite, rather than SKIP.  The task-1852 SKIP
+    precedent applies only where there is NO suite at all to run; here the very
+    existence of an ``-m`` expression at the command's rootdir is evidence of a
+    real marker-partitioned suite.  Skipping would turn a false RED into a
+    silent no-coverage GREEN.
+
+    Widening is DEGRADATION, not verification: the widened run applies the SAME
+    addopts, so the trigger files stay deselected.  The reason is the only
+    channel that can say so (FULL_SUITE forbids ``scoped_targets``), so every
+    assertion below checks it names the files as NOT executed.
+    """
+
+    def test_the_root_shape_widens_and_preserves_every_other_command(self):
+        """THE defect: a bare ``pytest <file>`` under a deselecting repo root."""
+        reads: list[str] = []
+        fallback = _fallback_mc('pytest tests/test_smoke.py')
+        read = _permissive_reader(reads, {
+            'pyproject.toml': _pyproject('"-m \'not smoke\'"'),
+            'tests/test_smoke.py': 'import pytest\npytestmark = pytest.mark.smoke\n',
+        })
+        widened, reason = widen_fallback_for_marker_deselection(fallback, read)
+
+        assert widened.test_command == 'pytest', 'targets dropped, command otherwise intact'
+        assert reason is not None
+        # Marker deselection is a pytest-only concern: nothing else may move.
+        assert widened.prefix == fallback.prefix
+        assert widened.lint_command == fallback.lint_command
+        assert widened.type_check_command == fallback.type_check_command
+
+    def test_the_reason_names_the_files_this_run_still_does_not_execute(self):
+        """Mirrors arm 4a's wording, so ONE operator-facing phrase covers the class."""
+        reads: list[str] = []
+        read = _permissive_reader(reads, {
+            'pyproject.toml': _pyproject('"-m \'not smoke\'"'),
+            'tests/test_smoke.py': 'import pytest\npytestmark = pytest.mark.smoke\n',
+        })
+        _, reason = widen_fallback_for_marker_deselection(
+            _fallback_mc('pytest tests/test_smoke.py'), read,
+        )
+        assert reason is not None
+        assert reason.startswith('pytest: ')
+        assert 'tests/test_smoke.py' in reason
+        assert 'not smoke' in reason
+        assert 'NOT executed' in reason
+        assert 'rc=5' in reason
+
+    def test_multiple_marked_targets_widen_and_are_all_named(self):
+        """ALL deselected — and the reason accounts for every file that goes unrun."""
+        reads: list[str] = []
+        widened, reason = widen_fallback_for_marker_deselection(
+            _fallback_mc('pytest tests/test_a.py tests/test_b.py'), _permissive_reader(reads),
+        )
+        assert widened.test_command == 'pytest'
+        assert reason is not None
+        assert 'tests/test_a.py' in reason
+        assert 'tests/test_b.py' in reason
+
+    def test_the_subproject_shape_widens_against_its_own_rootdir(self):
+        """``cd sub && uv run pytest <file>`` — task 2344's rescoping, unscoped in place.
+
+        The executed command's targets are SUB-relative while the reader is
+        worktree-ROOT-relative, so the widener must resolve them through
+        ``cwd_rel`` before handing them to the probe.
+        """
+        reads: list[str] = []
+        read = _permissive_reader(reads, {
+            # ONLY the subproject deselects; the root declares no -m at all.
+            'pyproject.toml': _PLAIN_PYPROJECT,
+            'sub/tests/test_smoke.py': 'import pytest\npytestmark = pytest.mark.slow\n',
+        })
+        widened, reason = widen_fallback_for_marker_deselection(
+            _fallback_mc('cd sub && uv run pytest tests/test_smoke.py'), read,
+        )
+        assert widened.test_command == 'cd sub && uv run pytest'
+        assert reason is not None
+        assert 'sub/tests/test_smoke.py' in reason, 'reason names the root-relative path'
+        assert 'sub/tests/test_smoke.py' in reads, 'target resolved into the reader\'s frame'
+        assert 'sub/pyproject.toml' in reads
+
+    def test_a_root_only_addopts_never_widens_a_subproject_command(self):
+        """THE anti-over-fire pin: the config a ``cd sub`` command's rootdir may not see.
+
+        pytest would walk UP to the repo root when ``sub/pyproject.toml``
+        declares no ini_options — a walk this probe deliberately does not model.
+        Refusing is an UNDER-fire, the one direction task 3494 permits.
+        """
+        reads: list[str] = []
+        read = _permissive_reader(reads, {
+            'sub/pyproject.toml': _PLAIN_PYPROJECT,
+            'sub/tests/test_smoke.py': 'import pytest\npytestmark = pytest.mark.slow\n',
+        })
+        fallback = _fallback_mc('cd sub && uv run pytest tests/test_smoke.py')
+        widened, reason = widen_fallback_for_marker_deselection(fallback, read)
+        assert widened is fallback
+        assert reason is None
+
+
+@pytest.mark.usefixtures('code_default_config')
+class TestExecutedFallbackPlanRecordsTheWidening:
+    """``verify._executed_fallback_plan(plan, fallback, pytest_reason=...)``.
+
+    In the fallback branch the plan is a RECORD, not the execution driver:
+    ``run_scoped_verification`` hands ``run_verification`` the ModuleConfig, not
+    the plan.  The widening therefore happens to the EXECUTED config, and this
+    reconciliation is what keeps the record honest about it.
+
+    The fact is passed EXPLICITLY rather than re-derived here: after widening,
+    a ``test_command == 'pytest'`` is byte-identical to an un-widened bare
+    default suite, so this layer cannot tell the two apart and would have to
+    re-run the probe — a second call, and a second chance to disagree with the
+    executed layer.
+
+    ``code_default_config`` is required: the autouse ``_isolate_orch_config``
+    fixture pins ORCH_CONFIG_PATH at the real dark-factory-orchestrator.yaml,
+    whose configured ``test_command`` would take the "configured suite runs
+    verbatim" arm instead of the bare-default file-scoped one this task is about.
+    """
+
+    _WIDENED_REASON = (
+        "pytest: touched test file(s) tests/test_smoke.py are ALL deselected by the "
+        "effective -m 'not smoke' — fallback full suite instead of a zero-collecting "
+        'file-scoped run (rc=5); those file(s) stay deselected in this run too and '
+        'are NOT executed by it'
+    )
+
+    @staticmethod
+    def _decision_plan(files: list[str], tmp_path: Path):
+        """The fallback-branch DECISION plan, from the bare-default config."""
+        config = OrchestratorConfig(project_root=tmp_path)
+        assert config.test_command == 'pytest', (
+            'premise: only the bare default reaches the file-scoped fallback arm'
+        )
+        return verify_plan.derive_verify_plan(files, [], config, lambda _p: None)
+
+    @staticmethod
+    def _widened_fallback() -> ModuleConfig:
+        """What ``widen_fallback_for_marker_deselection`` handed the executor."""
+        return ModuleConfig(
+            prefix='__fallback__',
+            test_command='pytest',
+            lint_command='ruff check tests/test_smoke.py',
+            type_check_command='pyright tests/test_smoke.py',
+        )
+
+    def test_the_pytest_run_records_the_widening(self, tmp_path):
+        plan = self._decision_plan(['tests/test_smoke.py'], tmp_path)
+        decided = _run_for(plan, '__fallback__', 'pytest:')
+        assert decided is not None
+        assert decided.scope_kind is ScopeKind.FILE_SCOPED
+
+        executed = verify._executed_fallback_plan(
+            plan, self._widened_fallback(), pytest_reason=self._WIDENED_REASON,
+        )
+        run = _run_for(executed, '__fallback__', 'pytest:')
+        assert run is not None
+        assert run.scope_kind is ScopeKind.FULL_SUITE
+        assert run.reason == self._WIDENED_REASON
+        # PlannedRun's invariant: scoped_targets is non-empty iff FILE_SCOPED.
+        assert run.scoped_targets == ()
+        # cmd is still the raw-wrapped EXECUTED command the reconciliation builds.
+        assert run.cmd is not None
+        assert run.cmd.raw == 'pytest'
+
+    def test_the_other_tool_slots_are_untouched(self, tmp_path):
+        """Task 3219's scoped_targets propagation must not regress on lint/pyright."""
+        plan = self._decision_plan(['tests/test_smoke.py'], tmp_path)
+        executed = verify._executed_fallback_plan(
+            plan, self._widened_fallback(), pytest_reason=self._WIDENED_REASON,
+        )
+        for tool_word in ('lint:', 'pyright:'):
+            before = _run_for(plan, '__fallback__', tool_word)
+            after = _run_for(executed, '__fallback__', tool_word)
+            assert after is not None and before is not None
+            assert after.scope_kind is ScopeKind.FILE_SCOPED
+            assert after.reason == before.reason
+            assert after.scoped_targets == before.scoped_targets == ('tests/test_smoke.py',)
+
+    def test_omitting_the_reason_is_byte_identical_to_today(self, tmp_path):
+        """The default path must not move — the widening is strictly opt-in."""
+        plan = self._decision_plan(['tests/test_smoke.py'], tmp_path)
+        fallback = self._widened_fallback()
+        assert (
+            verify._executed_fallback_plan(plan, fallback).to_dict()
+            == verify._executed_fallback_plan(plan, fallback, pytest_reason=None).to_dict()
+        )
+
+    def test_a_skipped_pytest_slot_does_not_crash(self, tmp_path):
+        """A source-only diff skips pytest; only the 'pytest:'-prefixed run may move."""
+        plan = self._decision_plan(['src/mod.py'], tmp_path)
+        decided = _run_for(plan, '__fallback__', 'pytest:')
+        assert decided is not None
+        assert decided.scope_kind is ScopeKind.SKIPPED
+
+        executed = verify._executed_fallback_plan(
+            plan,
+            ModuleConfig(prefix='__fallback__', lint_command='ruff check src/mod.py'),
+            pytest_reason=self._WIDENED_REASON,
+        )
+        lint = _run_for(executed, '__fallback__', 'lint:')
+        assert lint is not None
+        assert lint.reason == 'lint: file-scoped to touched file(s)'
+        assert lint.scope_kind is ScopeKind.FILE_SCOPED
+
+    def test_the_no_py_files_shape_passes_through_unchanged(self, tmp_path):
+        """A run with no recognised tool prefix is not keyed to any ModuleConfig slot."""
+        plan = self._decision_plan(['src/lib.rs'], tmp_path)
+        assert len(plan.runs) == 1
+
+        executed = verify._executed_fallback_plan(
+            plan,
+            ModuleConfig(prefix='__fallback__', test_command='pytest'),
+            pytest_reason=self._WIDENED_REASON,
+        )
+        assert executed.runs == plan.runs
+
+
+#: A worktree-root pyproject whose addopts deselect ``smoke`` — the ingredient
+#: dark-factory's own root pyproject.toml carries, and the reason this defect
+#: class is reachable in any project that registers no module_configs.
+_SMOKE_DESELECTING_PYPROJECT = _pyproject('"-m \'not smoke\'"')
+_SMOKE_MARKED_SOURCE = 'import pytest\npytestmark = pytest.mark.smoke\n\n\ndef test_s():\n    pass\n'
+
+
+@pytest.mark.usefixtures('code_default_config')
+class TestRunScopedVerificationWidensTheFallback:
+    """End-to-end through ``verify.run_scoped_verification``'s FALLBACK branch.
+
+    The layer that matters: unlike the module-config branch (plan-authoritative
+    via ``_executed_module_configs_from_plan``), this branch hands
+    ``run_verification`` the ModuleConfig, NOT the plan.  A fix confined to the
+    plan record would produce an honest record and the SAME rc=5 false RED, so
+    these assertions are on what was actually handed to the executor.
+
+    ``code_default_config`` is required — see
+    ``TestExecutedFallbackPlanRecordsTheWidening``'s docstring for why the
+    ambient config would otherwise take the "configured suite runs verbatim" arm.
+    """
+
+    @staticmethod
+    async def _run(tmp_path: Path, sources: dict[str, str], pyproject_text: str | None):
+        """Drive the fallback branch over a real worktree; return (executed_mc, result)."""
+        if pyproject_text is not None:
+            (tmp_path / 'pyproject.toml').write_text(pyproject_text)
+        for rel, text in sources.items():
+            path = tmp_path / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text)
+
+        config = OrchestratorConfig(project_root=tmp_path)
+        assert config.test_command == 'pytest', (
+            'premise: only the bare default reaches the file-scoped fallback arm'
+        )
+        spy = _run_verification_spy()
+        with patch.object(verify, 'run_verification', new=spy):
+            result = await run_scoped_verification(
+                tmp_path, config, [], task_files=list(sources),
+            )
+        executed = _executed_module_configs(spy)
+        assert len(executed) == 1, 'the fallback branch runs exactly one config'
+        return executed[0], result
+
+    @staticmethod
+    def _plan_pytest_run(result) -> dict:
+        """The ``'__fallback__'`` pytest run recorded on ``VerifyResult.plan``."""
+        assert result.plan is not None
+        return next(
+            r for r in result.plan['runs']
+            if r['module_prefix'] == '__fallback__' and r['reason'].startswith('pytest:')
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_executed_command_is_widened_not_zero_collecting(self, tmp_path: Path):
+        """Without the fix this executes 'pytest tests/test_smoke.py' and rc=5 REDs."""
+        executed, _ = await self._run(
+            tmp_path,
+            {'tests/test_smoke.py': _SMOKE_MARKED_SOURCE},
+            _SMOKE_DESELECTING_PYPROJECT,
+        )
+        assert executed.test_command == 'pytest'
+        assert executed.prefix == '__fallback__'
+        # pytest-only concern: the other slots keep whatever
+        # _build_fallback_config rendered for them.
+        assert executed.lint_command is not None
+        assert 'tests/test_smoke.py' in executed.lint_command
+        assert executed.type_check_command is not None
+        assert 'tests/test_smoke.py' in executed.type_check_command
+
+    @pytest.mark.asyncio
+    async def test_the_recorded_plan_matches_what_executed(self, tmp_path: Path):
+        """Both layers must move together, or the plan describes a run that never happened."""
+        _, result = await self._run(
+            tmp_path,
+            {'tests/test_smoke.py': _SMOKE_MARKED_SOURCE},
+            _SMOKE_DESELECTING_PYPROJECT,
+        )
+        run = self._plan_pytest_run(result)
+        assert run['scope_kind'] == str(ScopeKind.FULL_SUITE)
+        assert run['scoped_targets'] == []
+        assert 'tests/test_smoke.py' in run['reason']
+        assert 'not smoke' in run['reason']
+        assert 'NOT executed' in run['reason']
+
+    @pytest.mark.asyncio
+    async def test_an_unmarked_target_still_runs_file_scoped(self, tmp_path: Path):
+        """CONTROL: a target that genuinely vanishes must still rc=5 RED.
+
+        Widening only ever on positive proof — never a blanket "file-scoped
+        pytest is risky, run everything".
+        """
+        executed, result = await self._run(
+            tmp_path,
+            {'tests/test_plain.py': _UNMARKED_PLAIN_SOURCE},
+            _SMOKE_DESELECTING_PYPROJECT,
+        )
+        assert executed.test_command == 'pytest tests/test_plain.py'
+        run = self._plan_pytest_run(result)
+        assert run['scope_kind'] == str(ScopeKind.FILE_SCOPED)
+        assert run['scoped_targets'] == ['tests/test_plain.py']
+
+    @pytest.mark.asyncio
+    async def test_a_marked_target_without_addopts_does_not_widen(self, tmp_path: Path):
+        """CONTROL: the marker alone proves nothing — the -m expression is the proof."""
+        executed, result = await self._run(
+            tmp_path, {'tests/test_smoke.py': _SMOKE_MARKED_SOURCE}, _PLAIN_PYPROJECT,
+        )
+        assert executed.test_command == 'pytest tests/test_smoke.py'
+        assert self._plan_pytest_run(result)['scope_kind'] == str(ScopeKind.FILE_SCOPED)
+
+    def test_the_decision_function_itself_stays_pure(self, tmp_path: Path):
+        """The fix lives in the EXECUTED layer: derive_verify_plan is unmoved.
+
+        Its raw return value is still the idealized FILE_SCOPED decision — it
+        cannot see the rescoping ``_build_fallback_config`` performs, which is
+        exactly why the widening cannot live there.
+        """
+        (tmp_path / 'pyproject.toml').write_text(_SMOKE_DESELECTING_PYPROJECT)
+        (tmp_path / 'tests').mkdir()
+        (tmp_path / 'tests' / 'test_smoke.py').write_text(_SMOKE_MARKED_SOURCE)
+
+        plan = derive_verify_plan(
+            ['tests/test_smoke.py'], [], OrchestratorConfig(project_root=tmp_path),
+            _real_worktree_reader(tmp_path),
+        )
+        run = _run_for(plan, '__fallback__', 'pytest:')
+        assert run is not None
+        assert run.scope_kind is ScopeKind.FILE_SCOPED
+        assert run.scoped_targets == ('tests/test_smoke.py',)

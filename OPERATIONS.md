@@ -171,6 +171,36 @@ the task tree directly. For status of a *running* orchestrator's live
 state, prefer the fused-memory/escalation MCP reads in [§4](#4-watching-a-run)
 or the dashboard.
 
+### Reading the flake ledger
+
+```bash
+cd <dark-factory-repo>
+uv run --project orchestrator orchestrator flake-ledger --config /path/to/target/dark-factory-orchestrator.yaml
+```
+
+Prints three things: **open flake debt** (each suppressed test with its
+owning task id and how long the debt has been open), **per-test recurrence
+chains** (how many times a test has been re-suppressed, and when and by
+which commit it was last resolved), and **three health counters** — gate
+blind, non-convergence, and systemic. Like `orchestrator status` it reads
+persisted state and needs no running orchestrator.
+
+It is strictly read-only: it opens no debt, files no task, resolves
+nothing and escalates nothing. It will not create a ledger DB for a
+project that has none, and it will not add the flake tables to a
+`runs.db` that lacks them — it prints `NO LEDGER` / `NO FLAKE TABLES`
+and exits 0 instead.
+
+**Read the header line before the counters.** A report only measures
+anything when the ledger was actually readable. If the header says
+`NO LEDGER`, `NO FLAKE TABLES`, or `LEDGER UNREADABLE` (a corrupt,
+truncated, or locked `runs.db`), every counter below it reads
+`status: not measured` and none of the numbers are a reading — that is
+a broken or absent ledger to go fix, not a clean bill of health. A
+`WARNING: … TRUNCATED` line means the opposite problem: the window held
+more occurrences than one read returns, so the counters cover a partial
+window.
+
 ### Stopping gracefully
 
 Send `SIGTERM` to the **innermost `orchestrator` process**, not the shell
@@ -221,8 +251,8 @@ For any project running unattended, keep one long-running
    automatically inside the orchestrator itself.
 3. Handles each pending escalation, dispatching by category:
    - `review_issues` / `task_failure` / `wip_conflict` / `unmerged_state` /
-     unmatched `dependency_discovered` / blocking `cleanup_needed` → spawn
-     an interactive `/unblock` session via `/spawn`.
+     `stash_failed` / unmatched `dependency_discovered` / blocking
+     `cleanup_needed` → spawn an interactive `/unblock` session via `/spawn`.
    - `scope_violation` / matched `dependency_discovered` → resolve
      directly.
    - `design_concern` / `risk_identified` → always a human judgment call —
@@ -449,9 +479,9 @@ what you intended — the parameter ordering matters (`action` before a long
 free-text `resolution`) and a mis-ordered call can silently record the
 wrong action.
 
-### Merge-halt semantics (`wip_conflict` / `unmerged_state`)
+### Merge-halt semantics (`wip_conflict` / `unmerged_state` / `stash_failed`)
 
-These two escalation categories mean the **entire merge queue is halted**
+These three escalation categories mean the **entire merge queue is halted**
 — no other task can merge until the one escalation that owns the halt is
 resolved. The orchestrator tracks exactly one "halt owner" escalation
 internally; resolving any *other* escalation, even another `wip_conflict`,
@@ -464,11 +494,113 @@ does **not** release the halt.
   (`UU`/`AA`/`DD`) *before* the merge queue tried to advance — pre-existing
   corruption, not caused by the attempted merge. Needs `git mergetool`,
   manual resolution, or `git reset`, depending on intent.
+- `stash_failed` — the merge queue could not park `project_root`'s dirty
+  tracked WIP before advancing (task 2758). Like the other two this is a
+  shared main-checkout-hygiene fault rather than a fault of the merging task,
+  so the queue halts once instead of failing task after task. Inspect the main
+  checkout's uncommitted work and commit it — or get its owner to. **Do not
+  reach for `git stash`**: it is forbidden in *any* dark-factory checkout,
+  `project_root` or task worktree, for the reasons stated canonically in
+  CLAUDE.md § "Working in the main checkout" (incident 13674d3c68). Park WIP as
+  commits on a branch instead.
 
 Resolve the halt-owner escalation specifically (check `get_merge_halt_status`
 if unsure which one owns it) — `resolve_issue` on it un-halts the whole
 queue. If the log shows the halt cleared but the escalation record still
 shows `pending`, that's a genuine bug, not something to dismiss.
+
+#### `park_lock_contended` — a blocked merge, **not** a halt
+
+Contrast the two categories above, and `stash_failed` (which *does* halt:
+`project_root` carries dirty tracked files that could not be parked — a
+shared hygiene fault that recurs identically for every subsequent task).
+`park_lock_contended` is the opposite and **never halts the queue**: a
+foreign git process held `project_root`'s `.git/index.lock` — dominantly a
+`git commit --only` holding it across its pre-commit hook (see CLAUDE.md
+§"Working in the main checkout"). `advance_main` stands off for up to
+`git.merge_park_lock_grace_seconds` (default 300s) and, if the lock is
+still held, gives up having modified **nothing** — no ref move, no tree
+write, no park, and the foreign lock left strictly alone.
+
+That one merge is reported as a per-task **blocked** merge whose reason
+names the lock path, how long it had been held, and how long we waited.
+This is the ordinary, self-clearing shape — note that it ends there, with
+**no** recovery sentence:
+
+> `advance_main deferred: a foreign git process held /…/.git/index.lock
+> for 301s (waited 300s). The merge did NOT land and NOTHING in
+> project_root was modified. … transient and will be retried on
+> re-dispatch.`
+
+If the foreign lock appeared *mid-park* — after the pre-snapshot gate
+probed it clear — `advance_main` already knew which uncommitted tracked
+files it was about to park, and the reason names them so you can see
+whether real WIP is implicated:
+
+> `… Uncommitted tracked WIP in project_root at the moment of contention:
+> CLAUDE.md, docs/task-authoring.md.`
+
+That clause is absent on the ordinary gate path, where the dirty snapshot
+has not been taken yet and no WIP is known to be at risk.
+
+A normal `git commit --only` whose pre-commit hook outlives the 300s
+grace produces exactly that: a blocked merge, **no** recovery advice, and
+**nothing for you to do** — it is retried on re-dispatch.
+
+There is exactly one genuine operator action, and it is triggered by the
+lock having **already been older, the moment the merge worker first
+observed it, than the staleness floor** — not by the age in the line
+above. That post-wait age necessarily exceeds the grace whenever we
+waited the grace out (it is the initial age *plus* the wait), so it says
+nothing about staleness; the 301s example above is a perfectly live
+commit. The distinguishing sentence is spelled out in the reason and
+simply does not appear otherwise:
+
+> `… The lock was ALREADY 3600s old when the merge worker FIRST observed
+> it — older than the 300s staleness floor (max of the configured 300s
+> grace and the 300s pre-commit budget) — so it is likely a crashed-git
+> leftover rather than a live commit: confirm no git process is running
+> in project_root, then clear it with rm -f /…/.git/index.lock.`
+
+The floor is `max(git.merge_park_lock_grace_seconds, 300s)`, **not** the
+configured grace alone. Tuning the grace *down* (including to `0`, the
+probe-only fail-fast off-switch) shortens how long the worker **waits**;
+it must never widen what counts as a crashed leftover, or a live
+half-second-old `git commit --only` would be reported as one. Tuning the
+grace *up* does raise the bar — an operator who allows longer hooks has
+declared locks that old to be normal.
+
+Only when you see that sentence should you clear the lock by hand, and
+only after confirming no git process is running in `project_root`. The
+advice is gated this narrowly because `rm -f` on a **live** commit's
+index lock corrupts that in-flight commit — the same reason
+`advance_main` never removes the lock itself.
+
+A lock that is *already* past the staleness floor when first observed
+**skips the wait entirely** — it is reported immediately, with the same
+recovery sentence. Waiting cannot change a verdict that is already
+"crashed leftover", and the merge worker is serialized, so burning the
+full grace on every queued task until you clear the file would just be a
+slow-motion version of the stall this whole mechanism removes. So the
+blocked reason for a leftover reads `waited 0s`; that is correct, not a
+mis-report.
+
+One window the gate cannot cover: it is a *probe*, so a foreign process
+can still grab the index between it and the post-advance
+`read-tree -u --reset HEAD` that syncs `project_root` to the new HEAD. By
+then main has already landed, so this is **not** reported as
+`park_lock_contended`; instead the sync stands off for the same grace and
+**retries in place**. If both attempts fail you get a
+`read-tree failed after advancing main — working tree is stale` ERROR in
+the log with the merge still reported as `advanced` — at which point
+`project_root`'s tree is genuinely out of sync with `main` and a manual
+`git -C <project_root> read-tree -u --reset HEAD` (after confirming no
+git process is running there) is the fix. Left alone, the next advance
+reads the whole old-main→new-main delta as dirty WIP.
+
+The stand-off budget is **green tier** — retune it live with
+`mcp__escalation__reload_config`, no restart (the value is re-read per
+advance).
 
 ---
 
@@ -490,7 +622,12 @@ takes no arguments: it always re-reads that process's own
 - Scheduler and watcher tuning knobs
 - `review.*` checkpoint knobs
 - `unblock_auto.*`
+- `session_resume.*` (whole submodel, including the `restore_from_archive`
+  rehydration kill switch — see [§14](#14-transcript-preservation--the-archival-guard))
 - `verify_env`
+- `git.merge_park_lock_grace_seconds` (the `advance_main` index-lock
+  stand-off budget — re-read per advance, see
+  [§"Merge-halt semantics"](#merge-halt-semantics-wip_conflict--unmerged_state))
 - The `git.offline_lane_*` leaf tunables
 - `config_key_census.*` (the unknown-key census escape hatch — see
   [§6a](#6a-unknown-config-key-census); green-tier on purpose, so a
@@ -1291,6 +1428,217 @@ This is a known, accepted cost of not letting an agent delete live data, not
 a defect. It closes when you complete the sequence above. Validation for the
 migration itself was done at full scale: a dry run over all 4,574 live files
 decompressed and decoded every one of them with zero failures.
+
+---
+
+## 14. Transcript preservation & the archival guard
+
+Agent transcripts are the only durable record of what an agent actually did,
+and the substrate `--resume` reads. Task 3619 (leaf 2 of
+`plans/transcript-preservation-seam-prd.md` §8) changed *when* they are made
+durable. This is the operator-facing surface of that change.
+
+### Archival is a precondition of deletion, not a step before it
+
+Every path that deletes a per-task config dir now goes through
+`shared.transcript_archive.archive_before_delete`, which archives first and
+deletes only what it has made durable. The three sites are
+`TaskWorkflow._cleanup_config_dir`, `_recycle_config_dir`, and the
+`GitOps.cleanup_worktree` backstop.
+
+The call is **synchronous** on purpose. It used to be
+`await asyncio.to_thread(...)`, which meant a SIGTERM arriving mid-teardown
+cancelled the archive and destroyed the transcript anyway — the failure this
+task exists to remove. There is nothing left to cancel: same-filesystem
+archival is an `os.rename` (O(1) metadata), and the cross-device fallback is a
+copy of a file whose median size is 381 KB.
+
+**Consequence for you:** you can no longer lose a transcript by restarting the
+orchestrator at the wrong moment. A transcript is either archived or still on
+disk.
+
+### A failed archive holds the transcript — and only the transcript
+
+When a transcript cannot be made durable (disk full, permissions, read-only
+remount), `archive_before_delete` **holds** that `.jsonl` in place rather than
+deleting it. Everything else in the config dir is deleted **unconditionally**:
+`.credentials.json`, the `~/.claude` settings symlinks (unlinked, never
+followed), `sessions/`, `telemetry/`, and every other non-transcript member.
+
+That scoping is the point. A permanently-failing archive must never convert
+into an unbounded hold on a credential-bearing directory. If the purge itself
+somehow leaves `.credentials.json` behind, that is reported loudly through the
+same archival-failure counter — it is not allowed to be silent.
+
+At the `cleanup_worktree` backstop a held transcript is destroyed moments
+later by `git worktree remove --force`. That is deliberate: the guard's
+promise is that *it* never deletes an un-archived transcript, and blocking
+worktree removal would trade a bounded, counted, escalated transcript loss for
+an unbounded hold on a worktree and its lane slot.
+
+### The boot-time sweeper covers the SIGKILL tail
+
+Nothing above runs when the process is SIGKILLed.
+`Harness._sweep_orphaned_transcripts` runs at startup, inside crash recovery
+(after the pool-storage guard, before any worktree is cleaned up), and
+archives whatever transcripts survive in
+`<worktree>/.task/claude-config-*/`. It also drains the held
+backlog from the previous point — which is what bounds a hold to "until the
+next process start".
+
+It **only ever copies**. The worktrees it walks are the ones recovery is about
+to adopt; moving a transcript out from under a session that is about to
+`--resume` would degrade that resume to a fresh dispatch. Deletion stays with
+the teardown sites, which know the session is finished.
+
+The sweep is deadline-bounded (30s). A truncated pass logs a WARNING naming
+itself `INCOMPLETE` with the examined/archived counts — if you see it, the
+untouched worktrees are simply swept at the next start.
+
+### The archival-storm L1
+
+One failed archive is routine and only increments a counter. A **burst** files
+one L1, deduped so a runaway files once, not hundreds of times:
+
+| | |
+|---|---|
+| Sentinel / role | `__transcript_archival_storm__` / `orchestrator-transcript-archival-storm` |
+| Severity | `blocking`, `category=infra_issue`, level 1 |
+| Knobs | `transcript_archive.storm_threshold` (default 5), `transcript_archive.storm_window_secs` (default 600.0) |
+| Tier | **Green** — both hot-reload via `reload_config`, and are read live on every failure (no restart needed) |
+
+The escalation names the archive root, the failing paths, and the errnos
+symbolically (`ENOSPC(28)`, `EACCES(13)`, …) — that distinction *is* the next
+action. Check, in order: free space and inode headroom on the archive root;
+that the path exists and is writable by this process (a read-only remount
+looks exactly like a permissions failure); and that the archive root is on the
+expected device. Held transcripts are retried automatically by the next
+start's sweeper, so a fixed root self-heals on restart with no manual copy.
+
+### Verifying the fix on your own host
+
+The claim is scoped to the **post-fix cohort** — sessions preserved by a
+restart that ran this code. Archive coverage of sessions preserved by a
+SIGTERM restart should read 100%, against the 12.5% (2 of 16) measured
+2026-08-04 before the guard existed. The historical cohort is not
+retroactively recoverable, so do not expect an all-time number to move.
+
+After a graceful restart with sessions in flight, from `project_root`:
+
+```bash
+for sc in .worktrees/*/.task/agent_session.json; do
+  [ -e "$sc" ] || continue
+  sid=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("session_id",""))' "$sc")
+  [ -n "$sid" ] || continue
+  if compgen -G "data/orchestrator/agent-transcripts/*/*/$sid.jsonl" >/dev/null; then
+    echo "OK   $sid"
+  else
+    echo "MISS $sid  ($sc)"
+  fi
+done
+```
+
+Every preserved session should print `OK`. A `MISS` means that session will
+fall back to a fresh dispatch on re-dispatch — check the orchestrator log for
+`transcript_archive:` WARNINGs and for an open archival-storm L1.
+
+Note this task makes the archive *exist*; whether a given session actually
+resumes from it is task 3578's separate eligibility guard — see the next
+subsection.
+
+### Resuming from the archive, and measuring the resumes that are lost
+
+Making the archive *exist* (above) is not the same as a session actually
+resuming from it. Task 3578 wires the two together at the dispatch path and
+instruments what still gets lost.
+
+**What now happens on a resumed dispatch.** Immediately before arming
+`--resume`, `TaskWorkflow._invoke` corroborates the recovered session against
+`self._config_dir` — the directory it is about to export as
+`CLAUDE_CONFIG_DIR`, which under a pooled warm lane is *not* the boot-time
+path the harness eligibility guard checked. If the transcript is not there, it
+is rehydrated from the durable archive (`restore_archived_transcript`, which
+decompresses a legacy `.jsonl.gz` and publishes atomically). If it still is not
+there, the resume is **vetoed**: the task dispatches FRESH with a new session
+id rather than arming a `--resume` the CLI would reject before it ever contacts
+the API. Both outcomes are journalled — INFO `rehydrated session … from the
+durable archive`, WARNING `has no transcript under … — dispatching FRESH`.
+
+**The knob.** `session_resume.restore_from_archive` (default `true`) is the
+reversible kill switch for the rehydration *specifically*. **Green tier** — the
+whole `session_resume` submodel hot-reloads via `reload_config` ([§6](#6-config-reload-vs-restart)).
+Distinct from `session_resume.enabled`, which kills the whole feature at the
+harness guard: turning restoration off alone keeps the veto, its WARNING and
+the events below, so you do not go blind on the population while you have it
+disabled. It deliberately does **not** consult `transcript_archive.enabled` —
+with archival off there is simply nothing on disk to find, and gating on the
+flag would add a second source of truth that can disagree with the filesystem
+(archival on last week still leaves restorable archives today).
+
+**The event.** `session_resume_failed` in `runs.db` records an adopted resume
+that still failed to happen — a population that was previously journal-only and
+runs.db-invisible, because the CLI exits before contacting the API so no cost,
+cap or outcome row ever recorded the loss. `data.stage` splits it:
+
+| `stage` | Meaning | `data` |
+|---|---|---|
+| `pre_flight` | We corroborated, found nothing (and could not rehydrate), and dispatched fresh. | `{stage, session_id, role, restore}` — `restore` is the rehydration **outcome**: `disabled` \| `miss` \| `fault` \| `published` (see below) |
+| `cli` | The resume WAS armed and the CLI rejected it; `invoke_with_cap_retry` retried fresh and returned a **success**, so nothing else records the loss. | `{stage, session_id, session_ids, role, fallbacks}` — `fallbacks` is the count of fresh retries this one invocation had to make, `session_ids` the ids they dropped (oldest first; `session_id` is the first, i.e. the resume the orchestrator adopted) |
+
+```sql
+SELECT json_extract(data, '$.stage') AS stage, COUNT(*)
+  FROM events WHERE event_type = 'session_resume_failed'
+ GROUP BY stage;
+```
+
+`data.restore` on the `pre_flight` rows is what tells you *which* thing is
+broken, so split on it before concluding anything:
+
+| `restore` | What it means | What to do |
+|---|---|---|
+| `miss` | The durable archive holds no entry for that session. | **Archive-coverage problem, not a resume problem** — work the archival subsection above (`transcript_archive:` WARNINGs, archival-storm L1). |
+| `fault` | The restore itself raised. Two classes: **archive-root composition** (malformed `transcript_archive.root`, a `None` `project_root`) and **restore-internal I/O** (unreadable archive, ENOSPC part-way, corrupt gzip member, an unwritable destination parent) — the second is the common one. | Grep the log for `session_resume_restore_fault` (dispatch layer: task, role, session) and `transcript_restore_fault` (helper layer: `errno`, `path`). The two fire as a **pair for one fault**, so count one of them, not their sum. It is a config/IO fault, and the dispatch degraded to FRESH rather than failing. |
+| `disabled` | `session_resume.restore_from_archive` is off. | Expected while the kill switch is pulled; the veto and these events keep running so you do not go blind. |
+| `published` | The restore reported success and the CLI-facing locator still could not see it. | Unreachable by construction — a real occurrence is a bug in the restore/locator pair, not an operations issue. Escalate with the session id. |
+
+```sql
+SELECT json_extract(data, '$.restore') AS restore, COUNT(*)
+  FROM events WHERE event_type = 'session_resume_failed'
+   AND json_extract(data, '$.stage') = 'pre_flight'
+ GROUP BY restore;
+```
+
+**Do not add it to the per-dispatch ratio denominator.** `session_resume`,
+`session_resume_fallback` and `session_resume_capped` are emitted by the
+`_run_slot` guard exactly once per **dispatch**; `session_resume_failed` is
+emitted by `_invoke`, once per **invocation**, and one dispatch invokes several
+roles. Summing them compares populations counted on different units and
+silently inflates the attempt count. Read it against `session_resume` alone:
+*of the resumes we decided to make, how many did not survive to the agent?*
+
+That reading holds because BOTH stages are subsets of the adopted-resume
+population by construction: `pre_flight` fires only where a recovered session
+was about to be armed, and `cli` fires only when `_invoke` actually armed one.
+The underlying `AgentResult.resume_fallbacks` counter is *wider* than that — it
+also counts a resume `invoke_with_cap_retry` re-armed internally after a cap
+hit, which a plain fresh dispatch can reach — so the emit is gated on the
+orchestrator's own armed session id. Without that gate the ratio would count
+invocations that never resumed anything and could exceed 1.
+
+**Caveat U2 — the fallback rate will not go to zero.** What *removes* the live
+transcript from a lane's config dir is still unknown. This work restores from
+the archive; it does not stop the removal. So a steady `pre_flight` count is
+expected; what matters is *why*, and the `restore` split above answers it
+without a filesystem sweep. `restore='miss'` dominating means **archives are
+missing** — the transcript was gone and there was nothing to rehydrate from, so
+work archive coverage (the `OK`/`MISS` loop above) rather than the resume path.
+That advice is sound *because* faults no longer land in `miss`: the restore is
+called in strict mode, so a broken restore raises into `fault` instead of
+returning the same empty-handed `None` an absent archive does.
+`restore='fault'` dominating means the restore path itself is broken and
+coverage is a red herring. Note `restore='published'` should never appear at
+all: a published restore satisfies the corroboration, so no veto — and no
+event — follows it. Its absence is not evidence about archive coverage.
 
 ---
 

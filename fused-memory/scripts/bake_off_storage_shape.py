@@ -140,6 +140,40 @@ metrics, report rendering) with zero network, fully exercised in the merge
 lane, plus a thin **live driver** (``seed_arm`` / ``run_arm`` /
 ``run_bake_off`` / ``_run``) that is the only part touching Qdrant or an
 embedder.
+
+WHY THERE IS NO STORE-MUTATION PREFLIGHT HERE (an observation, task 4293)
+------------------------------------------------------------------------
+``fused_memory.utils.store_mutation_preflight.assert_store_mutation_allowed``
+is the fail-closed capability probe the shared-store mutators in
+``fused-memory/scripts/`` call before their first write.  The live driver's
+two mutations — ``drop_collections``' ``delete_collection`` and
+``seed_arm``'s ``backend.add`` — are unprobed, and that is a decision rather
+than an omission.  Measured against this file AS IT STANDS at task 4293; not
+a standing exemption for whatever it becomes:
+
+  * its blast radius is bounded to scratch substrate, statically.
+    ``run_bake_off`` force-sets ``config.mem0.collection_prefix =
+    ephemeral_collection_prefix()`` on its own config copy, and that prefix is
+    ``load_cleanup_script().E2_BAKEOFF_PREFIX`` — the SAME constant the reaper
+    ``scripts/cleanup_test_collections.py`` allowlists, read from the reaper
+    itself.  No CLI flag reaches the prefix (``--project-suffix`` moves the
+    suffix only), so no invocation can point these deletes or writes at a
+    ``fused``-prefixed production collection;
+  * it does not write mem0's shared SQLite history: ``seed_arm`` stubs
+    ``instance.db.add_history`` per instance before the first ``add`` (that
+    writer is process-shared, xdist-contended, and read-only in the sandbox —
+    see ``seed_arm``'s own docstring).  So the capability the preflight probes
+    for is not one the seeding path needs.
+
+THE RESIDUAL, stated rather than papered over: ``run_bake_off`` builds a real
+``MemoryService(config)`` and awaits ``memory.initialize()``, which runs
+Graphiti startup maintenance — index creation plus the W6-ε dup-uuid-edge
+scan-and-REPAIR — against the production FalkorDB, under no prefix bound at
+all.  That is NOT covered by anything above, and it is not specific to this
+script: no ``run()``-level guard in any of the scripts task 4293 guarded
+dominates ``initialize()`` either, because ``initialize()`` runs before
+``run()`` is called.  It is a systemic gap tracked by tasks 4318 and 4350, and
+is deliberately not claimed as handled here.
 """
 from __future__ import annotations
 
@@ -540,7 +574,9 @@ DISTRACTOR_ROLE = 'distractor'
 #: report diff stops being signal.  The namespace is a fixed literal — a
 #: value derived at runtime would reintroduce exactly the nondeterminism
 #: this avoids.  It also keeps the ids canonical 36-char dashed UUIDs, which
-#: is what β's ``parent_id`` shape rule (``_is_full_uuid``) requires.
+#: is what the ``parent_id`` shape rule
+#: (``fused_memory.utils.validation.is_full_uuid``, enforced by β's
+#: ``validate_memory_metadata``) requires.
 _E2_ID_NAMESPACE = uuid.UUID('6f2b7c14-9a3d-4e58-8b71-2c5d0a4f9e63')
 
 
@@ -1362,13 +1398,26 @@ def as_memory_results(hits: list[ScoredHit]) -> list[Any]:
     """Adapt arm hits to the ``MemoryResult`` objects the selector takes.
 
     ``find_near_duplicate_memory`` reads ``.category`` and ``.source_store``
-    as ENUMS and ``.relevance_score`` as a float.  Dicts would raise; dicts
-    of plain strings would be worse — every enum comparison would silently
-    fail and the report would state "the guard never fires" for every arm.
+    as ENUMS and the per-store cosine from ``.metadata['store_score']``.
+    Dicts would raise; dicts of plain strings would be worse — every enum
+    comparison would silently fail and the report would state "the guard never
+    fires" for every arm.
+
+    Since task 3658 the cosine's home is ``metadata['store_score']``:
+    ``MemoryService.search`` puts an ORDINAL Reciprocal Rank Fusion value in
+    ``relevance_score`` (rank-1 is 1/61 ~ 0.0164), so the guard thresholds on
+    the metadata field instead.  This adapter therefore reproduces the real
+    post-fusion shape — the arm's cosine in ``store_score``, the fused ordinal
+    in ``relevance_score`` — rather than the pre-3658 shape.  Putting the
+    cosine anywhere else here would make guard_adequacy report
+    ``guard_matched: False`` for every arm in the program: the same silent
+    "the guard never fires" corruption this docstring already warns about,
+    arrived at by a different route.
 
     Rank order is preserved: the selector takes the max by score, but the
     report quotes the matched id back against the ranked window, and a
     reordering adapter would make that evidence point at the wrong record.
+    ``store_rank`` is the 1-based position in that same window.
 
     A category the enum does not know becomes ``None`` rather than a guess —
     that record is exactly what the selector's defensive filter exists to
@@ -1379,9 +1428,10 @@ def as_memory_results(hits: list[ScoredHit]) -> list[Any]:
     """
     from fused_memory.models.enums import MemoryCategory, SourceStore  # noqa: PLC0415
     from fused_memory.models.memory import MemoryResult  # noqa: PLC0415
+    from fused_memory.services.memory_service import RRF_K  # noqa: PLC0415
 
     results = []
-    for hit in hits:
+    for rank, hit in enumerate(hits, start=1):
         raw_category = hit.record.metadata.get('category')
         try:
             category = MemoryCategory(raw_category)
@@ -1392,7 +1442,8 @@ def as_memory_results(hits: list[ScoredHit]) -> list[Any]:
             content=hit.record.content,
             category=category,
             source_store=SourceStore.mem0,
-            relevance_score=hit.relevance_score,
+            relevance_score=1.0 / (RRF_K + rank),
+            metadata={'store_rank': rank, 'store_score': hit.relevance_score},
         ))
     return results
 
@@ -3016,6 +3067,473 @@ async def fetch_arm(
     return {'queries': fetched_queries, 'probes': fetched_probes}
 
 
+# ---------------------------------------------------------------------------
+# The fetch cache — replaying a live run's rankings without a live run
+# ---------------------------------------------------------------------------
+#
+# :func:`fetch_arm` above is the ONLY thing in this experiment that costs an
+# embedder call and a live Qdrant collection.  Everything downstream of it —
+# :func:`read_path`, :func:`rescore`, :func:`measure_arm`, :func:`build_report`,
+# :func:`render_markdown` — is pure, and ``measure_arm``'s docstring says so
+# explicitly (no store, no await).  Dumping ``fetch_arm``'s return value at
+# this seam and replaying it therefore makes every read-side variant free
+# forever, and makes the metric code unit-testable against REAL rankings
+# rather than only hand-built ones.
+#
+# WHAT IS STORED, and why it is only this:
+#
+#   ``record_id`` and ``relevance_score``.  Nothing else.
+#
+#   NOT mem0's point id.  :func:`_search` joins its results back through
+#   ``seeded.by_stored_id[item['id']]``, and ``Mem0Backend.add`` pins
+#   ``infer=False`` — which routes to mem0's fresh-uuid ``_create_memory``
+#   path.  ``item['id']`` is therefore newly minted on EVERY seeding run, so a
+#   cache keyed on it is replayable exactly once and then rehydrates to an
+#   empty ranking, which this script's whole posture forbids publishing as a
+#   measured zero.  :func:`_derive_record_id` is uuid5-deterministic over
+#   ``(shape, key)`` and :func:`materialize_arm` is pure over the committed
+#   fixtures, so the join key is stable across runs by construction.
+#
+#   NOT the record body.  It is fully reconstructible from the committed
+#   fixtures via ``materialize_arm``, so storing it would make the cache both
+#   large and — the real objection — capable of DISAGREEING with the fixtures
+#   it claims to describe, with no way for a reader to tell which won.
+
+#: Bumped when the on-disk cache layout changes incompatibly.  A replay is a
+#: measurement, so an unreadable cache must fail rather than degrade.
+FETCH_CACHE_SCHEMA_VERSION = 1
+
+
+class FetchCacheError(RuntimeError):
+    """A fetch cache cannot be trusted to describe the corpus being replayed.
+
+    A sibling of :class:`FixtureError`/:class:`SeedingError`/
+    :class:`MeasurementError`, and raised for the same reason they are: a
+    replayed report is indistinguishable from a live one in the artifact, so
+    every way the cache can be wrong has to be loud at load time rather than
+    silently producing a plausible table.
+    """
+
+
+def corpus_fingerprint(records: list[ArmRecord]) -> str:
+    """sha256 over what a replay must agree with the dump about.
+
+    ``(record_id, content, sorted metadata)`` — all three, because all three
+    feed retrieval: the id is the cache's join key, the content is what was
+    embedded, and the metadata is what every read transform branches on.  A
+    fingerprint over ids alone would pass cleanly through a fixture edit that
+    rewrote every body.
+
+    SORTED, so the digest answers a set question ("does the cache describe
+    THIS corpus?") rather than a sequence one.  ``materialize_arm`` is already
+    deterministically ordered, so this is never exercised by the real
+    pipeline; it is chosen so that a reordering cannot raise a false alarm
+    while every content/id/metadata change still does.
+
+    ``json.dumps(sort_keys=True)`` rather than ``str(dict)`` so the digest
+    does not depend on metadata insertion order either.
+    """
+    import hashlib  # noqa: PLC0415
+
+    digest = hashlib.sha256()
+    for record_id, content, metadata in sorted(
+        (
+            record.record_id,
+            record.content,
+            json.dumps(record.metadata, sort_keys=True, default=str),
+        )
+        for record in records
+    ):
+        # Length-prefixed, so two different corpora cannot collide by
+        # straddling a separator that happens to occur inside a body.
+        for part in (record_id, content, metadata):
+            digest.update(f'{len(part)}:'.encode())
+            digest.update(part.encode('utf-8'))
+    return digest.hexdigest()
+
+
+def fixture_digests(paths: list[str | Path]) -> list[dict[str, Any]]:
+    """Repo-relative path + sha256 of each fixture's CONTENT.
+
+    Deliberately not folded into :func:`fixture_provenance`, which stamps the
+    last-touching COMMIT.  The two answer different questions and the cache
+    needs both: a commit sha is the blind-authoring audit trail, but it does
+    not move when a fixture is edited in the working tree — which is exactly
+    the drift that silently invalidates a dumped cache.
+
+    Paths are reported repo-relative for the same reason
+    :func:`fixture_provenance` does it (:1852): an artifact naming somebody's
+    absolute home-directory checkout is neither reproducible nor readable by
+    anyone else.
+    """
+    import hashlib  # noqa: PLC0415
+
+    repo_root = _PACKAGE_ROOT.parent
+    rows: list[dict[str, Any]] = []
+    for raw in paths:
+        path = Path(raw).resolve()
+        try:
+            relative = str(path.relative_to(repo_root))
+        except ValueError:
+            relative = path.name
+        rows.append({
+            'path': relative,
+            'sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+        })
+    return rows
+
+
+def fetch_cache_provenance(
+    *,
+    records_by_shape: dict[str, list[ArmRecord]],
+    fixtures: list[str | Path],
+    search_limit: int,
+    guard_threshold: float,
+    embedder_model: str,
+) -> dict[str, Any]:
+    """Everything a replayed report needs that the rankings do not carry.
+
+    ``guard_threshold`` and ``embedder_model`` ride along because they are the
+    only other LIVE-ONLY values that reach the report's protocol block
+    (:3264, :3297): ``resolve_guard_threshold`` navigates a real
+    ``MemoryService`` to find the threshold production would run at, and the
+    embedder model comes off the live config.  Without them a replayed report
+    is unbuildable — not merely less detailed — and defaulting either would
+    feed the threshold replay a number the store never produced.
+    """
+    return {
+        'corpus_fingerprints': {
+            shape: corpus_fingerprint(records)
+            for shape, records in sorted(records_by_shape.items())
+        },
+        'fixtures': fixture_digests(list(fixtures)),
+        'search_limit': int(search_limit),
+        'guard_threshold': float(guard_threshold),
+        'embedder_model': embedder_model,
+    }
+
+
+def _serialize_ranking(hits: list[ScoredHit]) -> list[list[Any]]:
+    """One ranked list as ``[[record_id, score], ...]``, in RANK ORDER.
+
+    A list of pairs rather than an object keyed by record id: every metric in
+    this experiment is rank-based, so order IS the data, and a JSON object
+    would invite a re-sort that no downstream assertion could detect.
+    """
+    return [
+        [hit.record.record_id, float(hit.relevance_score)] for hit in hits
+    ]
+
+
+def fetches_to_document(
+    arms: dict[str, dict[str, dict[str, list[ScoredHit]]]],
+    *,
+    provenance: dict[str, Any],
+) -> dict[str, Any]:
+    """The on-disk form of one run's fetches: a pure ranking map.
+
+    *arms* maps each shape to that shape's :func:`fetch_arm` result.  Pure —
+    the caller is still measuring off these same lists (``run_arm`` calls
+    ``measure_arm`` twice off one fetch), so nothing here may mutate them.
+
+    *provenance* is REQUIRED, not defaulted.  A cache with no fingerprint can
+    never be loaded (:func:`_check_corpus_fingerprint` refuses it), so making
+    it optional would only move the failure to load time — i.e. to AFTER a
+    full live seeding run had already been spent producing an unusable file.
+    """
+    if not provenance:
+        raise FetchCacheError(
+            'refusing to dump a fetch cache with no provenance block. Without '
+            'a per-shape corpus fingerprint the cache can never be verified '
+            'against the fixtures it is replayed over, and `load_fetches` '
+            'would refuse it — after a full seeding run had been spent '
+            'producing it. Build the block with `fetch_cache_provenance`.'
+        )
+    return {
+        'schema_version': FETCH_CACHE_SCHEMA_VERSION,
+        'provenance': dict(provenance),
+        'arms': {
+            shape: {
+                'queries': {
+                    query_id: _serialize_ranking(hits)
+                    for query_id, hits in sorted(fetched['queries'].items())
+                },
+                'probes': {
+                    cluster_id: _serialize_ranking(hits)
+                    for cluster_id, hits in sorted(fetched['probes'].items())
+                },
+            }
+            for shape, fetched in sorted(arms.items())
+        },
+    }
+
+
+def dump_fetches(
+    path: str | Path,
+    arms: dict[str, dict[str, dict[str, list[ScoredHit]]]],
+    *,
+    provenance: dict[str, Any],
+) -> Path:
+    """Write the fetch cache atomically, byte-stably.
+
+    ``sort_keys=True`` on top of the sorted comprehensions above because the
+    cache is a COMMITTED artifact: a re-dump of the same fetches must diff
+    cleanly, and JSON object order otherwise follows insertion order — which
+    follows query-set iteration order, which is not a property anyone should
+    have to keep stable by hand.
+    """
+    target = Path(path)
+    _atomic_write_text(
+        target,
+        json.dumps(
+            fetches_to_document(arms, provenance=provenance),
+            indent=2, sort_keys=True,
+        ) + '\n',
+    )
+    return target
+
+
+def _rehydrate_ranking(
+    seeded: SeededArm, entries: Any, *, shape: str, kind: str, key: str,
+) -> list[ScoredHit]:
+    """One cached ranking back to ``list[ScoredHit]``, joined to THIS arm."""
+    hits: list[ScoredHit] = []
+    for entry in entries:
+        if not isinstance(entry, list) or len(entry) != 2:
+            raise FetchCacheError(
+                f'fetch cache entry for {shape}/{kind}/{key} is {entry!r}, not '
+                f'a [record_id, score] pair. Skipping it would shrink a '
+                f'measured ranking silently.'
+            )
+        record_id, score = entry
+        record = seeded.records_by_id.get(record_id)
+        if record is None:
+            raise FetchCacheError(
+                f'fetch cache names record {record_id!r} in {shape}/{kind}/'
+                f'{key}, which this run did not materialize. The cache and the '
+                f'fixtures describe different corpora — dropping the hit would '
+                f'silently shrink the measured ranking (the same refusal '
+                f'`_search` makes for an unseeded point). Re-dump the cache '
+                f'against the current fixtures.'
+            )
+        hits.append(ScoredHit(record=record, relevance_score=float(score)))
+    return hits
+
+
+def _read_fetch_cache(path: str | Path) -> tuple[Path, dict[str, Any]]:
+    """The parsed cache document, or a named refusal."""
+    target = Path(path)
+    try:
+        doc = json.loads(target.read_text(encoding='utf-8'))
+    except FileNotFoundError as exc:
+        raise FetchCacheError(
+            f'no fetch cache at {target} — a replay measures nothing without '
+            f'one. Produce it with --dump-fetches on a live run.'
+        ) from exc
+    except json.JSONDecodeError as exc:
+        raise FetchCacheError(
+            f'fetch cache at {target} is not valid JSON: {exc}'
+        ) from exc
+
+    version = doc.get('schema_version')
+    if version != FETCH_CACHE_SCHEMA_VERSION:
+        raise FetchCacheError(
+            f'fetch cache at {target} is schema version {version!r}, but this '
+            f'build reads version {FETCH_CACHE_SCHEMA_VERSION}.'
+        )
+    return target, doc
+
+
+def load_fetch_provenance(path: str | Path) -> dict[str, Any]:
+    """The dump's provenance block — the live-only half of a replayed report.
+
+    Separate from :func:`load_fetches` because the driver needs it BEFORE it
+    has materialized anything (``guard_threshold`` and ``embedder_model`` go
+    into the protocol block), and because reading it must not require the
+    caller to have already built every arm.
+    """
+    _, doc = _read_fetch_cache(path)
+    provenance = doc.get('provenance')
+    if not isinstance(provenance, dict):
+        raise FetchCacheError(
+            f'fetch cache at {Path(path)} carries no provenance block, so the '
+            f'guard threshold and embedder model this run was measured at are '
+            f'unknown. Defaulting either would feed the threshold replay a '
+            f'number the store never produced.'
+        )
+    return provenance
+
+
+def _check_corpus_fingerprint(
+    target: Path, provenance: dict[str, Any], shape: str, seeded: SeededArm,
+) -> None:
+    """Refuse a cache whose corpus is not the one being replayed.
+
+    The failure this exists for is silent by construction: a stale cache still
+    LOADS, it just describes records that no longer exist, and the replayed
+    report is indistinguishable from a fresh measurement.
+    """
+    cached = (provenance.get('corpus_fingerprints') or {}).get(shape)
+    if cached is None:
+        raise FetchCacheError(
+            f'fetch cache at {target} carries no corpus fingerprint for shape '
+            f'{shape!r}, so it cannot be checked against the fixtures this run '
+            f'materialized — and an unverifiable cache replayed as a '
+            f'measurement is exactly the silent staleness the fingerprint '
+            f'exists to catch. Re-dump the cache with --dump-fetches.'
+        )
+    local = corpus_fingerprint(seeded.records)
+    if cached != local:
+        raise FetchCacheError(
+            f'fetch cache at {target} was dumped against a different {shape!r} '
+            f'corpus: cached fingerprint {cached}, but the fixtures in this '
+            f'tree materialize {local} ({len(seeded.records)} records). THE '
+            f'FIXTURES MOVED — the cached rankings name records that no longer '
+            f'exist, or omit records that now do, so replaying them would '
+            f'publish a stale ranking as a fresh measurement. Re-run the '
+            f'seeding pass with --dump-fetches.'
+        )
+
+
+def _check_fixture_digests(
+    target: Path, provenance: dict[str, Any], expect_fixtures: list[str | Path],
+) -> None:
+    """Refuse a cache whose fixtures are not the ones being replayed.
+
+    The corpus fingerprint does NOT cover this: :func:`materialize_arm` takes
+    no queries, so the fingerprint is structurally blind to the query set.
+    Edit a query's ``text`` while keeping its ``query_id`` and every
+    fingerprint still matches, while the cached rankings — fetched against the
+    old text — become a measurement of a question nobody asked.
+
+    Compared as a ``path -> sha256`` MAPPING, never positionally:
+    :func:`fixture_digests` emits in the caller's argument order, so a caller
+    that merely reordered its list would otherwise be told the fixtures moved.
+    """
+    cached = provenance.get('fixtures')
+    if not isinstance(cached, list):
+        raise FetchCacheError(
+            f'fetch cache at {target} records no fixture digests, so the '
+            f'fixtures it was fetched over cannot be compared with the ones in '
+            f'this tree. The per-shape corpus fingerprint does not cover this: '
+            f'`materialize_arm` takes no queries, so a query-set edit leaves '
+            f'every fingerprint intact. Re-dump the cache with --dump-fetches.'
+        )
+    cached_by_path = {
+        str(row.get('path')): str(row.get('sha256'))
+        for row in cached if isinstance(row, dict)
+    }
+    for row in fixture_digests(list(expect_fixtures)):
+        was = cached_by_path.get(row['path'])
+        if was is None:
+            raise FetchCacheError(
+                f'fetch cache at {target} was dumped over a different fixture '
+                f'set: it carries no digest for {row["path"]} (it carries '
+                f'{sorted(cached_by_path)}). A cache that never saw a fixture '
+                f'cannot answer for it.'
+            )
+        if was != row['sha256']:
+            raise FetchCacheError(
+                f'fetch cache at {target} was dumped against a different '
+                f'{row["path"]}: cached sha256 {was}, but the file in this '
+                f'tree hashes to {row["sha256"]}. THE FIXTURES MOVED — the '
+                f'cached rankings answer the OLD file, and replaying them '
+                f'would publish them as a fresh measurement. (The corpus '
+                f'fingerprint cannot catch a query-set edit: `materialize_arm` '
+                f'takes no queries.) Re-run the seeding pass with '
+                f'--dump-fetches.'
+            )
+
+
+def load_fetches(
+    path: str | Path,
+    seeded_by_shape: dict[str, SeededArm],
+    *,
+    expect_query_ids: list[str] | None = None,
+    expect_limit: int | None = None,
+    expect_fixtures: list[str | Path] | None = None,
+) -> dict[str, dict[str, dict[str, list[ScoredHit]]]]:
+    """Replay a dumped run's rankings against locally materialized arms.
+
+    Returns exactly what :func:`fetch_arm` would have returned for each
+    requested shape, so ``measure_arm`` cannot tell a replay from a live run —
+    which is the point, and also why every disagreement between the cache and
+    the corpus has to raise HERE instead of surfacing downstream as a
+    plausible-looking table.
+
+    Iterates the CALLER's shapes, not the cache's: a cache carrying extra
+    shapes is merely wider than this run needs, but a requested shape it does
+    not carry would otherwise be measured as an arm with no queries.
+
+    *expect_query_ids*, *expect_limit* and *expect_fixtures* are the
+    truncation, depth and fixture-drift guards.  All three are opt-in so the
+    pure round-trip tests can exercise the join without a full query set, and
+    all three are supplied by the live driver.
+    """
+    target, doc = _read_fetch_cache(path)
+    provenance = load_fetch_provenance(path)
+    cached_arms = doc.get('arms')
+    if not isinstance(cached_arms, dict):
+        raise FetchCacheError(
+            f'fetch cache at {target} carries no "arms" block.'
+        )
+
+    if expect_limit is not None:
+        cached_limit = provenance.get('search_limit')
+        if cached_limit is None:
+            raise FetchCacheError(
+                f'fetch cache at {target} does not record the search limit it '
+                f'was fetched at, so it cannot be checked against the '
+                f'requested depth of {expect_limit}.'
+            )
+        if int(cached_limit) < int(expect_limit):
+            raise FetchCacheError(
+                f'fetch cache at {target} was fetched at limit '
+                f'{int(cached_limit)}, shallower than the requested limit '
+                f'{int(expect_limit)}. Replaying it would measure every arm '
+                f'over a {int(cached_limit)}-deep window while the report '
+                f'claimed {int(expect_limit)} — a silently DIFFERENT '
+                f'experiment, not a smaller one. (A deeper cache is fine: '
+                f'`read_path` truncates to the reader budget anyway.)'
+            )
+
+    if expect_fixtures is not None:
+        _check_fixture_digests(target, provenance, expect_fixtures)
+
+    replayed: dict[str, dict[str, dict[str, list[ScoredHit]]]] = {}
+    for shape, seeded in seeded_by_shape.items():
+        block = cached_arms.get(shape)
+        if block is None:
+            raise FetchCacheError(
+                f'fetch cache at {target} has no rankings for shape {shape!r} '
+                f'(it carries {sorted(cached_arms)}). Measuring that arm from '
+                f'an absent cache would publish an empty ranking as a zero.'
+            )
+        _check_corpus_fingerprint(target, provenance, shape, seeded)
+
+        cached_queries = block.get('queries') or {}
+        if expect_query_ids is not None:
+            missing = [q for q in expect_query_ids if q not in cached_queries]
+            if missing:
+                raise FetchCacheError(
+                    f'fetch cache at {target} is TRUNCATED for shape {shape!r}: '
+                    f'{len(missing)} of {len(expect_query_ids)} requested '
+                    f'queries have no cached ranking, e.g. {missing[:5]}. '
+                    f'Measuring the arm anyway would score it over a subset of '
+                    f'the query set while the report claimed the whole one.'
+                )
+        replayed[shape] = {
+            kind: {
+                key: _rehydrate_ranking(
+                    seeded, entries, shape=shape, kind=kind, key=key,
+                )
+                for key, entries in sorted((block.get(kind) or {}).items())
+            }
+            for kind in ('queries', 'probes')
+        }
+    return replayed
+
+
 def read_path(
     seeded: SeededArm, hits: list[ScoredHit], k: int, *, pin: bool,
 ) -> list[ArmRecord]:
@@ -3380,9 +3898,22 @@ async def run_arm(
     limit: int,
     estimator: tuple[str, Any],
     guard_threshold: float,
+    fetched: dict[str, dict[str, list[ScoredHit]]] | None = None,
 ) -> dict[str, dict[str, Any]]:
-    """One shape's two rows of the decision table, off ONE set of fetches."""
-    fetched = await fetch_arm(backend, seeded, queries, probes, limit=limit)
+    """One shape's two rows of the decision table, off ONE set of fetches.
+
+    *fetched* lets the caller supply the ranked lists instead of paying for
+    them — either because it already fetched them in order to dump the cache,
+    or because it replayed them from one.  ``measure_arm`` cannot tell the
+    difference, which is exactly the property that makes the cache sound: a
+    replayed row is computed by the same code over the same rankings.
+
+    When it is ``None`` the arm fetches for itself, so every existing caller
+    behaves exactly as before.  *backend* is then required; on the replay path
+    it is unused and may be ``None``.
+    """
+    if fetched is None:
+        fetched = await fetch_arm(backend, seeded, queries, probes, limit=limit)
     return {
         seeded.shape: measure_arm(
             seeded, fetched, pin=False, queries=queries, probes=probes,
@@ -3434,6 +3965,8 @@ async def run_bake_off(
     limit: int = DEFAULT_SEARCH_LIMIT,
     seed_concurrency: int = SEED_CONCURRENCY,
     project_suffix: str | None = None,
+    dump_fetches_to: str | Path | None = None,
+    replay_fetches_from: str | Path | None = None,
 ) -> dict[str, Any]:
     """Seed, query, measure, tear down — and return the validated report.
 
@@ -3470,6 +4003,26 @@ async def run_bake_off(
             probes.append((cluster_id, probe))
 
     estimator = resolve_token_estimator()
+
+    # The REPLAY short-circuit, taken before a single live resource is
+    # acquired.  Not "the same driver with the searches skipped": no
+    # `MemoryService` is constructed, so no durable write queue is recovered
+    # and no config is deep-copied and repointed; no `ephemeral_collections`
+    # are created and — the one that could damage a concurrent run — no
+    # `drop_collections` is issued.  A replay is a pure computation over a
+    # committed file, and anything less than that would make replaying unsafe
+    # to do while a live bake-off is running.
+    if replay_fetches_from is not None:
+        return await _replay_bake_off(
+            replay_fetches_from,
+            clusters=clusters, topics=topics, claims=claims, queries=queries,
+            distractors=distractors, probes=probes, limit=limit,
+            estimator=estimator, project_suffix=project_suffix,
+            alpha_fixture=alpha_fixture, registry=registry,
+            arm_claims=arm_claims, query_set=query_set,
+            distractor_slab=distractor_slab, seed_concurrency=seed_concurrency,
+        )
+
     collections = ephemeral_collections(suffix=project_suffix)
 
     config = (config or FusedMemoryConfig()).model_copy(deep=True)
@@ -3520,28 +4073,61 @@ async def run_bake_off(
     # on the happy path.
     memory = MemoryService(config)
     arms: dict[str, Any] = {}
+    fetched_by_shape: dict[str, dict[str, dict[str, list[ScoredHit]]]] = {}
+    records_by_shape: dict[str, list[ArmRecord]] = {}
     try:
         drop_collections(collections.values(), qdrant_url=qdrant_url)
         await memory.initialize()
         guard_threshold = resolve_guard_threshold(memory)
         for shape in ARM_SHAPES:
+            records = materialize_arm(shape, clusters, claims, topics, distractors)
             seeded = _index_arm(
                 shape,
                 arm_project_id(shape, suffix=project_suffix),
                 collections[shape],
-                materialize_arm(shape, clusters, claims, topics, distractors),
+                records,
                 claims,
             )
             await seed_arm(memory.mem0, seeded, concurrency=seed_concurrency)
+            # Fetched HERE rather than inside `run_arm` only when the cache is
+            # being written, so the unflagged path is byte-for-byte the run it
+            # always was.  The rankings handed to `run_arm` are the same
+            # objects that get dumped, so the cache cannot describe a fetch
+            # that differs from the one measured.
+            fetched: dict[str, dict[str, list[ScoredHit]]] | None = None
+            if dump_fetches_to is not None:
+                fetched = await fetch_arm(
+                    memory.mem0, seeded, queries, probes, limit=limit,
+                )
+                fetched_by_shape[shape] = fetched
+                records_by_shape[shape] = records
             arms.update(await run_arm(
                 memory.mem0, seeded, queries=queries, probes=probes,
                 limit=limit, estimator=estimator,
-                guard_threshold=guard_threshold,
+                guard_threshold=guard_threshold, fetched=fetched,
             ))
     finally:
         await memory.close()
         drop_collections(collections.values(), qdrant_url=qdrant_url)
         shutil.rmtree(queue_dir, ignore_errors=True)
+
+    # AFTER the measurement, and after teardown: a cache written mid-run would
+    # survive a run that then died before reporting, and would then be
+    # replayable as a complete measurement it never was.
+    if dump_fetches_to is not None:
+        dump_fetches(
+            dump_fetches_to, fetched_by_shape,
+            provenance=fetch_cache_provenance(
+                records_by_shape=records_by_shape,
+                fixtures=[
+                    alpha_fixture, registry, arm_claims, query_set,
+                    distractor_slab,
+                ],
+                search_limit=limit,
+                guard_threshold=guard_threshold,
+                embedder_model=config.embedder.model,
+            ),
+        )
 
     return build_report(
         arms=arms,
@@ -3569,6 +4155,120 @@ async def run_bake_off(
             'queries_measured': len(queries),
             'guard_probes_measured': len(probes),
             'collections': sorted(collections.values()),
+            # Explicit `None` rather than an absent key: every measured cell
+            # in a replayed report is identical to a live one, so a reader has
+            # no other way to tell which they are holding.  A key that is
+            # merely absent on the live path would make "not replayed" and
+            # "written by a build that predates the cache" the same reading.
+            'replayed_from': None,
+        },
+    )
+
+
+async def _replay_bake_off(
+    cache_path: str | Path,
+    *,
+    clusters: dict[str, CalibrationCluster],
+    topics: dict[str, RegistryTopic],
+    claims: list[ArmClaim],
+    queries: list[Query],
+    distractors: list[Distractor],
+    probes: list[tuple[str, dict[str, Any]]],
+    limit: int,
+    estimator: tuple[str, Any],
+    project_suffix: str | None,
+    alpha_fixture: str | Path,
+    registry: str | Path,
+    arm_claims: str | Path,
+    query_set: str | Path,
+    distractor_slab: str | Path,
+    seed_concurrency: int,
+) -> dict[str, Any]:
+    """The same report, recomputed from a committed cache. No network at all.
+
+    Every arm is materialized locally — ``materialize_arm`` is pure over the
+    committed fixtures and ``_derive_record_id`` is uuid5-deterministic — and
+    the cached rankings are joined back onto those records.  ``measure_arm``
+    then runs exactly as it does live, which is what makes a replayed row a
+    real measurement rather than a transcription of one.
+
+    ``guard_threshold`` and ``embedder_model`` come from the cache's
+    provenance because they are live-only values (:3264, :3297); defaulting
+    either would feed the threshold replay a number the store never produced.
+    """
+    provenance = load_fetch_provenance(cache_path)
+    for key in ('guard_threshold', 'embedder_model'):
+        if provenance.get(key) is None:
+            raise FetchCacheError(
+                f'fetch cache at {cache_path} does not record {key!r}, which '
+                f'is a LIVE-ONLY value the report\'s protocol block needs '
+                f'(:3264, :3297). Defaulting it would publish a number this '
+                f'run never measured. Re-dump the cache with --dump-fetches.'
+            )
+
+    seeded_by_shape = {
+        shape: _index_arm(
+            shape,
+            arm_project_id(shape, suffix=project_suffix),
+            # No collection exists on this path, and naming the one a live run
+            # WOULD have used would put a fabricated resource into any error
+            # message raised from here.
+            f'<replay:{shape}>',
+            materialize_arm(shape, clusters, claims, topics, distractors),
+            claims,
+        )
+        for shape in ARM_SHAPES
+    }
+    replayed = load_fetches(
+        cache_path, seeded_by_shape,
+        expect_query_ids=[query.query_id for query in queries],
+        expect_limit=limit,
+        # The same five paths, in the same order, that the protocol block
+        # stamps below (:4197-4199) and that the live dump records.
+        expect_fixtures=[
+            alpha_fixture, registry, arm_claims, query_set, distractor_slab,
+        ],
+    )
+
+    guard_threshold = float(provenance['guard_threshold'])
+    arms: dict[str, Any] = {}
+    for shape in ARM_SHAPES:
+        # Through `run_arm` rather than calling `measure_arm` twice here, so
+        # "an arm's two rows" has exactly one definition and a replayed row
+        # cannot drift from a live one.  `backend` is None: with `fetched`
+        # supplied, `run_arm` never reaches it.
+        arms.update(await run_arm(
+            None, seeded_by_shape[shape], queries=queries, probes=probes,
+            limit=limit, estimator=estimator, guard_threshold=guard_threshold,
+            fetched=replayed[shape],
+        ))
+
+    return build_report(
+        arms=arms,
+        audit_recall=audit_recall_over_labeled_fixture(
+            load_labeled_fixture(alpha_fixture),
+        ),
+        protocol={
+            'blind_authoring': BLIND_AUTHORING_PROTOCOL,
+            'fixtures': fixture_provenance([
+                alpha_fixture, registry, arm_claims, query_set, distractor_slab,
+            ]),
+            'token_estimator': estimator[0],
+            'guard_threshold': guard_threshold,
+            'distractor_slab_size': len(distractors),
+            'embedder_model': provenance['embedder_model'],
+            'search_limit': limit,
+            'guard_fetch_limit_floor': GUARD_FETCH_LIMIT,
+            'guard_replay_window': GUARD_TOP_K,
+            'seed_concurrency': seed_concurrency,
+            'clusters_measured': len(clusters),
+            'queries_measured': len(queries),
+            'guard_probes_measured': len(probes),
+            # EMPTY, not the names a live run would have used: this run
+            # created no collection, and printing three it never touched would
+            # put an unmeasured resource into the audit trail.
+            'collections': [],
+            'replayed_from': str(cache_path),
         },
     )
 
@@ -3613,6 +4313,16 @@ def build_parser() -> Any:
                         help='where to write the machine-readable report')
     parser.add_argument('--md-out', default=str(DEFAULT_REPORT_MD),
                         help='where to write the operator-facing report')
+    # Both default to None, so an unflagged run is exactly the run it always
+    # was — and `TestBuildParser`, which asserts defaults by attribute rather
+    # than flag-set exhaustiveness, keeps passing untouched.
+    parser.add_argument('--dump-fetches', default=None,
+                        help=('after measuring, write every arm ranking to '
+                              'this path so read-side variants can be scored '
+                              'later without a reseed'))
+    parser.add_argument('--replay-fetches', default=None,
+                        help=('measure from a dumped ranking cache instead of '
+                              'seeding: no Qdrant, no embedder, no collections'))
     return parser
 
 
@@ -3622,7 +4332,28 @@ async def _run(args: Any) -> int:
     A fixture failure must not overwrite a good committed report with a
     partial one — the artifact is the gate's input, and a silently truncated
     decision table reads exactly like a measured one.
+
+    Exit 3 for a fetch-cache problem, also with NO artifact written, and for
+    the same reason: a replay against a cache that does not describe this
+    corpus would publish a stale ranking as a fresh measurement, and the
+    artifact gives a reader no way to tell.
     """
+    if args.dump_fetches is not None and args.replay_fetches is not None:
+        # Named, not silently resolved in favour of one. Preferring either
+        # would make the run's provenance a coin flip: the artifact does not
+        # say which won, so a reader could not tell a measurement from a
+        # replay of one.
+        print(
+            'cannot pass --dump-fetches and --replay-fetches together: '
+            '--dump-fetches records the rankings a LIVE run measured, while '
+            '--replay-fetches measures from rankings a previous run already '
+            'recorded. Doing both would either re-dump what was just replayed '
+            '(a no-op that overwrites the cache with itself) or silently pick '
+            'one and leave the report unable to say which.',
+            file=sys.stderr,
+        )
+        return 2
+
     try:
         report = await run_bake_off(
             alpha_fixture=args.alpha_fixture,
@@ -3635,10 +4366,15 @@ async def _run(args: Any) -> int:
             limit=args.limit,
             seed_concurrency=args.seed_concurrency,
             project_suffix=args.project_suffix,
+            dump_fetches_to=args.dump_fetches,
+            replay_fetches_from=args.replay_fetches,
         )
     except FixtureError as exc:
         print(f'fixture error: {exc}', file=sys.stderr)
         return 2
+    except FetchCacheError as exc:
+        print(f'fetch cache error: {exc}', file=sys.stderr)
+        return 3
 
     json_path, md_path = write_artifacts(report, args.json_out, args.md_out)
     print(f'wrote {json_path}')

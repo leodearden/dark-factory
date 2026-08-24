@@ -21,7 +21,10 @@ load_dotenv()
 
 from functools import partial  # noqa: E402
 
+from shared.mcp_markup_middleware import RepairPolicy  # noqa: E402
+
 from fused_memory.config.schema import FusedMemoryConfig  # noqa: E402
+from fused_memory.server.markup_guard import install_markup_guard  # noqa: E402
 from fused_memory.server.tools import (  # noqa: E402
     _checkpoint_overrides_db_if_exists,
     create_mcp_server,
@@ -886,6 +889,12 @@ async def run_server():
             memory_service=memory_service,
             task_interceptor=task_interceptor,
             known_projects=_known_projects_map,
+            # task 3065: repair_memory_citation needs the durable journal to
+            # reach a CLOSED run's findings — recon-report's own in-process
+            # state is TTL-evicted (300s) and GC'd at run quiescence, so it
+            # cannot serve a repair of a run that completed days ago. Safe to
+            # pass here: recon_journal was constructed and initialize()d above.
+            recon_journal=recon_journal,
         )
 
         # Task 2624: wire the code-enforced before/after live-task-write
@@ -951,12 +960,11 @@ async def run_server():
         known_projects=_known_projects_map,
     )
 
-    # Defence-in-depth wrapper at FastMCP's central tool-dispatch chokepoint.
-    # Catches BaseException escapes (SystemExit, BaseExceptionGroup, etc.) that
-    # would otherwise poison StreamableHTTPSessionManager's shared task group
-    # and cascade into uvicorn's main loop. Re-raises CancelledError because
-    # it is required for asyncio cancellation semantics.
-    _install_safe_tool_wrapper(mcp)
+    # Both ToolManager.call_tool wrappers, in the ONE order that works. The
+    # ordering rationale lives on the helper, and is pinned by
+    # tests/test_markup_guard_fused_memory.py::TestInstallationOrder rather
+    # than by this comment.
+    _install_tool_dispatch_guards(mcp, known_projects=_known_projects_map)
 
     mcp.settings.host = config.server.host
     mcp.settings.port = config.server.port
@@ -1113,6 +1121,10 @@ async def run_server():
             # so the harness and the uvicorn server share the SAME ReconReportState
             # object. For reconciliation-disabled runs, build them now.
             if recon_report_state is None:
+                # No recon_journal here, deliberately (task 3065): this is the
+                # reconciliation-DISABLED path, where no journal was ever opened.
+                # repair_memory_citation then answers journal_unavailable, which
+                # is the honest result — there is no durable run history to repair.
                 recon_report_state, _, _pre_recon_uv_config = _build_recon_report_components(
                     config,
                     memory_service=memory_service,
@@ -1702,6 +1714,59 @@ def _install_safe_tool_wrapper(mcp: Any) -> None:
     tool_manager._fused_memory_safe_wrapped = True
 
 
+def _install_tool_dispatch_guards(
+    mcp: Any, *, known_projects: dict[str, str] | None = None
+) -> None:
+    """Install both ``ToolManager.call_tool`` wrappers, in the ONE order that works.
+
+    Two independent concerns share this chokepoint, and the order they are
+    installed in is not cosmetic — it decides which one ends up OUTSIDE, and
+    therefore what the caller sees when both fire:
+
+    1. :func:`_install_safe_tool_wrapper` — defence-in-depth. Catches
+       BaseException escapes (SystemExit, BaseExceptionGroup, ...) that would
+       otherwise poison StreamableHTTPSessionManager's shared task group and
+       cascade into uvicorn's main loop. Re-raises CancelledError, which
+       asyncio cancellation semantics require.
+    2. :func:`~fused_memory.server.markup_guard.install_markup_guard` — the
+       write-boundary markup guard (task 4458, PRD
+       ``plans/toolcall-markup-containment-prd.md``). Rejects a call whose
+       argument absorbed MCP tool-call envelope markup and hands the caller a
+       ``repaired_call`` to resubmit verbatim.
+
+    DO NOT tidy these two calls into the other order. The guard REJECTS by
+    raising :class:`fastmcp.exceptions.ToolError` — measured as the only shape
+    that survives every output schema, since a returned dict is destroyed by
+    the output validation of any tool annotated ``-> str``. Installed second it
+    is the OUTER wrapper, so that ToolError reaches the lowlevel server intact.
+    Installed FIRST it ends up inside ``_safe_call_tool``, which catches
+    BaseException and flattens the rejection into its own
+    ``{'error': str, 'error_type': 'ToolError'}`` shape: ``repaired_call``
+    stops being a key the caller can read and survives only as text inside an
+    opaque string, so the agent cannot resubmit the repair.
+
+    Nor can that be fixed by teaching ``_safe_call_tool`` to re-raise ToolError:
+    the bundled ``Tool.run`` wraps EVERY tool-body exception into ToolError, so
+    such an exemption would gut the containment ``tests/test_tool_safe_wrapper.py``
+    pins. Order is the whole mechanism.
+
+    *known_projects* is run_server's ``project_id -> project_root`` registry,
+    which the guard's storm-escalation sink uses to place a burst in the right
+    queue.
+
+    REJECT_WITH_REPAIR is the PRD's declared tier for fused-memory (section 4,
+    C2), declared HERE at the interception point rather than inferred per tool
+    (INV-1). This is also the primary server only: the recon-report server
+    hosts no write tools and keeps the bare defence-in-depth wrapper.
+    """
+    _install_safe_tool_wrapper(mcp)
+    install_markup_guard(
+        mcp,
+        policy=RepairPolicy.REJECT_WITH_REPAIR,
+        known_projects=known_projects,
+    )
+
+
 def _build_uvicorn_config(
     app: Any,
     *,
@@ -1741,6 +1806,8 @@ def _build_recon_report_components(
     memory_service: Any = None,
     task_interceptor: Any = None,
     known_projects: dict[str, str] | None = None,
+    *,
+    recon_journal: Any = None,
 ) -> tuple[Any, Any, Any]:  # (ReconReportState, FastMCP, uvicorn.Config)
     """Construct the recon_report state, FastMCP server, and uvicorn.Config.
 
@@ -1749,6 +1816,14 @@ def _build_recon_report_components(
 
     Optional service args (task β): when provided they are injected into the
     returned ReconReportState so cite_* tools can validate citations at call time.
+
+    Args:
+        recon_journal: the open ReconciliationJournal (task 3065), used solely by
+            ``repair_memory_citation`` to reach the durable ``runs.stage_reports``
+            blob of an already-completed run.  Only the reconciliation-ENABLED
+            boot path has one; the disabled path passes nothing and the tool then
+            degrades to a structured ``journal_unavailable`` refusal rather than
+            half-working against a store that does not exist.
 
     Returns:
         (ReconReportState, FastMCP, uvicorn.Config)
@@ -1774,6 +1849,7 @@ def _build_recon_report_components(
         memory_service=memory_service,
         task_interceptor=task_interceptor,
         store=recon_report_store,
+        journal=recon_journal,
     )
     if known_projects is not None:
         state.known_projects = known_projects

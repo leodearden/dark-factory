@@ -16,7 +16,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, TypeGuard
+from typing import IO, TYPE_CHECKING, Any, TypeGuard
 
 # VllmBridge depends on aiohttp, which is not installed in every consumer
 # environment (e.g. dashboard's venv).  Tolerate ImportError so that callers
@@ -45,11 +45,20 @@ _CAP_HIT_COOLDOWN_SECS = 5.0
 _MAX_CAP_COOLDOWN_SECS = 300.0
 # Bounded retry budget for a pre-turn CLI rejection (task 3143 / esc-3118-1):
 # the CLI exited on argument validation before contacting the API, so nothing
-# was billed and no work was lost — a free retry.  ONE is deliberate: a single
-# rejection is consistent with a transient race delivering the prompt to the
-# child's stdin, but a SECOND consecutive one is deterministic (a genuinely
-# blank prompt, a broken argv, a wrapper that never pipes stdin) and must reach
-# a human via the normal steward/escalation path instead of looping.
+# was billed and no work was lost — a free retry.  ONE is deliberate: any
+# SECOND consecutive rejection is deterministic (a genuinely blank prompt, a
+# broken argv, a wrapper that never pipes stdin) and must reach a human via the
+# normal steward/escalation path instead of looping.
+#
+# NOTE (task 3147): this was originally written when a single rejection was
+# thought to be MOST likely a transient race delivering the prompt to the
+# child's stdin.  That race was subsequently confirmed by reproduction AND
+# structurally closed on BOTH runners — the payload is now pre-materialized
+# into an fd before execve (see _materialize_stdin), so a stalled event loop
+# can no longer starve the child.  A rejection reaching here is therefore now
+# much more likely to be the DETERMINISTIC kind.  The retry is retained as a
+# backstop for those genuinely deterministic causes, which 3147 does not make
+# impossible — it is no longer the race mitigation it was written to be.
 _MAX_CLI_INPUT_REJECTED_RETRIES = 1
 # Poll interval for the two-regime liveness watchdog in _run_subprocess.
 # Each tick reads the on-disk transcript to check for assistant turns; the
@@ -68,6 +77,13 @@ _WATCHDOG_MIN_POLL_SECS = 0.01
 # Still floored by _WATCHDOG_MIN_POLL_SECS and clamped by time-to-idle-kill /
 # time-to-absolute-cap so a kill boundary is never overshot by a full poll.
 _WATCHDOG_WORKING_POLL_SECS = 60.0
+# The unreadable-transcript storm escape (task 4003) has no constant of its own:
+# it fires on wall-clock, at the caller's `startup_grace_secs`, which is already
+# defined as "how long before we may conclude something is wrong".  A poll-count
+# threshold would mean two unrelated durations in the two regimes above (5s vs
+# 60s per poll) and, in the startup regime, would fire ~15s after spawn — inside
+# the MCP-init window a healthy stage routinely spends before the CLI writes its
+# first record.  See `note_unreadable_transcript`.
 # Per-caller cap-wait policy (post-1365 audit, task 1401)
 # ─────────────────────────────────────────────────────────────────────────────
 # _DEFAULT_CAP_WAIT_SANITY_SECS (14 days) is inherited by callers that do NOT
@@ -117,6 +133,37 @@ _WATCHDOG_WORKING_POLL_SECS = 60.0
 #                                         is caught and converted to a
 #                                         retryable 'infra_failure' proposal
 #                                         entry instead of raising.
+#
+# orchestrator/evals/runner.py            _EVAL_CAP_WAIT_SANITY_SECS = 1800 s (30 min).
+#   (run_architect_eval invocation)       One cell of a bounded, queue-blocking
+#                                         eval campaign; the 14-day default
+#                                         would park the whole campaign on a
+#                                         single capped cell.
+#                                         AllAccountsCappedException is caught
+#                                         and recorded as a `cap_exhausted:`
+#                                         marker on the cell (tainted, so the
+#                                         cell is EXCLUDED from the reported
+#                                         mean rather than scored a fabricated
+#                                         0.0), never raised.  No
+#                                         max_cap_retries: cooldown doubles per
+#                                         pool cycle, so a fixed count would
+#                                         give a BIGGER account pool LESS
+#                                         wall-clock patience.
+#
+# SCOPE OF EVERY BOUND IN THIS TABLE (task 3630 amendment, reviewer:
+# robustness).  cap_wait_sanity_secs is consulted at exactly one place —
+# _check_cap_wait — which runs in the cap-hit branch AFTER an invocation
+# returned and was classified as a cap.  It therefore bounds cap-RETRY
+# patience.  It does NOT bound the gate's own all-accounts-capped wait: the
+# next loop iteration re-enters usage_gate.invoke_slot -> before_invoke, which
+# ends in an unbounded `await self._open.wait()` (usage_gate.py) released only
+# by a real cap reset or a successful resume probe.  So a caller whose pool is
+# ALREADY frozen when it starts can still block for hours despite a 120 s or
+# 1800 s policy here.  Every caller in this table inherits that gap; none of
+# them currently compensates for it.  Closing it belongs HERE, inside the
+# wrapper, where a wait in before_invoke is definitionally a cap wait and can
+# be attributed correctly — a caller-side asyncio.wait_for cannot tell a frozen
+# pool from a slow agent and would misattribute the latter.
 # ─────────────────────────────────────────────────────────────────────────────
 _DEFAULT_CAP_WAIT_SANITY_SECS = 14 * 86400  # 14 days: outer sanity bound for patient cap waits
 _CAP_WAIT_LOG_INTERVAL_SECS = 600.0  # emit at most one cap_wait log per ~10 min
@@ -160,6 +207,7 @@ __all__ = [
     'is_server_error_status',
     'is_timed_out_with_progress',
     'is_zero_output_timeout',
+    'note_unreadable_transcript',
     'read_transcript_records',
     'require_non_blank_prompt',
     'transcript_exists',
@@ -313,6 +361,33 @@ class AgentResult:
       Empty string when the invocation did not time out.  Persisted to
       ``.task/zero_output_evidence-iter{N}.json`` by the workflow's
       ``_capture_zero_output_evidence`` helper (task 1739).
+    - ``resume_fallbacks``: how many times THIS invocation armed ``--resume``
+      and had to fall back to a fresh session because the resume itself failed
+      (task 3578).  Stamped by ``invoke_with_cap_retry`` at its single return
+      point from a loop-local counter — the retry loop rebinds ``result`` on
+      every pass, so a count stamped onto a discarded attempt would be lost by
+      construction.  ``shared`` has no event store, so this field is the
+      carrier the orchestrator reads to emit ``session_resume_failed``
+      (``stage='cli'``) for a resume the CLI rejected: previously that loss was
+      invisible in runs.db, because the loop retried fresh and returned a
+      SUCCESS.  Counts fallbacks TAKEN, not resumes armed — a resume that
+      succeeded leaves it 0.
+
+      READ THE PREDICATE EXACTLY: it counts every resumed attempt this loop
+      made that then failed non-cap, which includes a resume **the loop itself
+      re-armed** after a cap hit (the cap branch sets
+      ``invoke_kwargs['resume_session_id'] = result.session_id``).  A caller
+      that never passed ``resume_session_id`` can therefore still come back
+      with a non-zero count, so a consumer asking "did the resume *I* adopted
+      survive?" must corroborate against its OWN armed session id rather than
+      treat this counter as that answer.
+    - ``resume_fallback_session_ids``: the session ids those fallbacks actually
+      dropped, oldest first, one per increment of ``resume_fallbacks``.  The
+      count alone cannot name them: ``_reset_for_fresh_retry`` regenerates the
+      pre-allocated ``session_id`` and a cap re-arm replaces the armed id with
+      ``result.session_id``, so neither the caller's id nor the final
+      ``result.session_id`` is reliably the session that was lost.  A tuple
+      (not a list) so the default is a safe immutable dataclass default.
     """
 
     success: bool
@@ -335,6 +410,8 @@ class AgentResult:
     ended_awaiting_background: bool = False
     api_error_status: int | None = None
     proc_tree: str = ''
+    resume_fallbacks: int = 0
+    resume_fallback_session_ids: tuple[str, ...] = ()
     transcript_turns: int | None = None
     """Number of assistant turns found in the on-disk JSONL transcript, or None
     when the transcript could not be read or located.  Stamped on the
@@ -431,6 +508,101 @@ def count_transcript_turns(
     if records is None:
         return None
     return sum(1 for r in records if r.get('type') == 'assistant')
+
+
+def note_unreadable_transcript(
+    elapsed_secs: float,
+    *,
+    grace_secs: float,
+    config_dir: object,
+    session_id: str,
+    label: str,
+) -> bool:
+    """Escape hatch for the silent ``count_transcript_turns() is None`` degrade.
+
+    THIS LOGS; IT DOES NOT KILL.  The conservative degrade it observes is
+    correct and stays exactly as it is — the watchdog must never kill on an
+    unreadable transcript, because "unreadable" is indistinguishable from
+    "not written yet".  What was wrong was that it ran *silently*.
+
+    This is the storm escape for a fail-soft that ran silently for three weeks.
+    From 2026-07-18 (task 2744) to 2026-08-11 (task 4003) every reconciliation
+    stage had its ``CLAUDE_CONFIG_DIR`` outside the sandbox writable set, so the
+    CLI could never write a transcript; every poll read None; the liveness
+    watchdog degraded to inert and every cap-retry force-freshed instead of
+    resuming, and neither fail-soft said anything the operator could see.
+
+    SCOPE — this covers the WATCHDOG path only.  The cap-retry force-fresh is
+    the OTHER consumer of the same unreadable transcript, but it is not routed
+    through here: it already emits its own WARNING at the point of decision
+    ("capped session ... has no transcript under ... — retrying FRESH"), which
+    names the session it is about to drop.  It is a one-shot decision, not a
+    poll loop, so it has no streak to latch and needs no escape; do not read
+    this helper as covering it.
+
+    WALL-CLOCK, NOT POLL COUNT.  The bound is ``grace_secs`` — the caller's
+    existing "how long before we may conclude something is wrong" budget — and
+    NOT a number of polls.  A poll count means two unrelated durations in the
+    watchdog's two regimes (``_WATCHDOG_POLL_SECS`` = 5 s vs
+    ``_WATCHDOG_WORKING_POLL_SECS`` = 60 s), and in the startup regime three
+    polls is ~15 s after spawn, which a healthy recon stage routinely spends on
+    MCP server init before the CLI lays down its first record.  That would fire
+    the WARNING once on every healthy invocation — exactly the "tuned out"
+    failure mode this exists to avoid.
+
+    STATELESS BY DESIGN — the caller owns the once-per-crossing latch.  Every
+    call at or past the bound fires, so a caller that invokes this on every poll
+    of a long wedged run WILL storm; ``_run_subprocess`` latches a local
+    ``unreadable_escape_fired`` and clears it on any readable read, so a later
+    relapse is a new crossing and fires again.  The latch is deliberately not a
+    module global: a global would make concurrent invocations in one process
+    silence each other.
+
+    Scope: only invocations configured with BOTH ``config_dir`` and
+    ``session_id`` reach here, i.e. roles that are SUPPOSED to have a
+    transcript.  A role with neither is not expected to have one and its Nones
+    mean nothing.  (Both call sites are already inside branches requiring them,
+    so no additional guard is needed here.)
+
+    Deliberately a log rather than an escalation call: ``shared`` sits at the
+    bottom of the dependency stack and must not take an import edge on the
+    escalation client.
+
+    Args:
+        elapsed_secs: Seconds since the watchdog started for this invocation.
+        grace_secs: The bound past which an unreadable transcript is a defect
+            rather than patience (``_run_subprocess`` passes its
+            ``startup_grace_secs``).
+        config_dir: The ``CLAUDE_CONFIG_DIR`` the transcript was expected under.
+        session_id: The session whose transcript could not be read.
+        label: The invocation label (which agent/model), for the log line.
+
+    Returns:
+        True if this call fired the escape, False if it is still inside grace.
+    """
+    if elapsed_secs < grace_secs:
+        return False
+
+    logger.warning(
+        'Transcript UNREADABLE %.1fs after spawn (grace=%.1fs) — '
+        'label=%s session_id=%s config_dir=%s. This invocation was configured '
+        'with both config_dir and session_id, so it is SUPPOSED to have a '
+        'transcript; an unreadable one means the transcript is not being '
+        'written at all (a sandbox/permission or path problem), not that the '
+        'agent is slow. Consequences, both silent by design until now: the '
+        'liveness watchdog is degraded to INERT for this invocation (it never '
+        'kills on None), and any cap-retry will force-fresh instead of '
+        'resuming, losing the session. Archetype: the recon Landlock instance, '
+        '2026-07-18 -> 2026-08-11, where the per-run CLAUDE_CONFIG_DIR sat '
+        'outside the sandbox writable set (task 4003). Check that config_dir '
+        'is inside the sandbox writable set and that the path exists.',
+        elapsed_secs,
+        grace_secs,
+        label,
+        session_id,
+        config_dir,
+    )
+    return True
 
 
 # Background-management tool names that "reap" a launched background task — a
@@ -659,6 +831,18 @@ def is_cli_invocation_rejected(result: AgentResult) -> bool:
     with ``turns=0``, ``cost_usd=0.0``, ``duration_ms=17331``,
     ``timed_out=False``, and empty stdout.
 
+    CAUSE CONFIRMED AND FIXED (task 3147) — do not re-investigate.  The
+    observed payload above was reproduced against the real CLI (v2.1.226) and
+    against ``_run_subprocess`` itself: the spawn path passed a bare
+    ``stdin=PIPE`` and left the prompt to be written by the EVENT LOOP after
+    ``execve``, so any loop stall past the CLI's ~3s stdin deadline lost the
+    run.  (The otherwise-puzzling multi-second ``duration_ms`` on a run that
+    never reached a turn is the CLI's teardown, which runs long AFTER it has
+    already given up on stdin.)  The fix pre-materializes the payload into an
+    fd before spawn on BOTH runners — see ``_materialize_stdin``.  What can
+    still legitimately arrive here is the deterministic family: a blank
+    prompt, a broken argv, or a wrapper that never pipes stdin.
+
     Deliberately contrasted with ``is_zero_output_timeout``: that predicate is
     keyed to the TIMEOUT family (it returns False immediately unless
     ``result.timed_out``), so it always misses this failure — which is exactly
@@ -713,11 +897,19 @@ def require_non_blank_prompt(
     ``cmd = ['claude', '--print', '--output-format', 'json']`` and NEVER
     appends a positional prompt or a ``-`` stdin marker (unlike the codex
     backend in ``orchestrator/agents/invoke.py``, which passes its own input
-    argument).  The prompt is delivered solely by
-    ``stdin_data = prompt.encode()``, and a blank one pipes happily — the CLI
+    argument).  The prompt is delivered solely on stdin — ``stdin_data =
+    prompt.encode()``, pre-materialized into an unlinked temp file and handed
+    to the child as an already-open fd (task 3147; see ``_materialize_stdin``)
+    — and a blank one is delivered just as happily as a real one.  The CLI
     then exits on argument validation with an opaque
     "Input must be provided either through stdin or as a prompt argument"
     error, zero-cost and zero-turn, with no indication that WE sent nothing.
+
+    That argv shape is why this guard is load-bearing and why the delivery
+    mechanism may never move to argv: with no positional prompt and no ``-``
+    marker, the CLI cannot distinguish "empty input" from "no input", so both
+    a blank prompt and (before 3147) an undelivered one produced the identical
+    opaque error.  Pinned by ``test_argv_never_carries_the_user_prompt``.
 
     Called at every boundary that can originate an invocation, so the failure
     surfaces at the caller that built the blank prompt — with *context* naming
@@ -1502,6 +1694,17 @@ async def invoke_with_cap_retry(
     # controls: (1) skip confirm, (2) mark capped=True in cost_store
     started_at = ''
     completed_at = ''
+    # Loop-local, stamped onto the RETURNED result at the single exit below
+    # (task 3578).  Must live out here rather than on any individual result:
+    # the retry loop rebinds `result` on every pass, so a count written to the
+    # failed resume's result object is discarded along with it.
+    resume_fallbacks = 0
+    # The ids those fallbacks dropped, in order — same lifetime and same
+    # reasoning as the counter above.  Kept alongside rather than derived at
+    # the exit: by then _reset_for_fresh_retry has already regenerated the
+    # pre-allocated session_id, so the lost id is unrecoverable from the
+    # returned result.
+    resume_fallback_session_ids: list[str] = []
 
     # Default to Claude-specific invocation when no invoke_fn was provided
     invoke: Callable[..., Awaitable[AgentResult]] = invoke_fn or invoke_claude_agent
@@ -1672,6 +1875,12 @@ async def invoke_with_cap_retry(
                 # argument validation BEFORE contacting the API.  The agent was
                 # never asked anything, nothing was billed and no transcript
                 # exists — so this is a free retry, not an agent failure.
+                # Since task 3147 the TRANSIENT cause (a stalled event loop
+                # missing the child's stdin deadline) is structurally closed on
+                # both runners, so what reaches here should now be the
+                # deterministic family — for which the single retry is a
+                # backstop that buys one more attempt before escalating, not a
+                # fix.  See _MAX_CLI_INPUT_REJECTED_RETRIES.
                 #
                 # POSITIONING is load-bearing in two directions:
                 # - ABOVE the heuristic cap safety-net below: the CLI's stdin
@@ -2107,6 +2316,25 @@ async def invoke_with_cap_retry(
                 # live-continuation caller's original_prompt (resume_delivers_prompt=True)
                 # is only valid inside the resumed session, not a brand-new one.
                 if not result.success and invoke_kwargs.get('resume_session_id'):
+                    # This branch — and ONLY this branch — is the population
+                    # task 3578 measured: 28 occurrences where a resume was
+                    # armed, the CLI rejected it, and the loop retried fresh
+                    # and returned a SUCCESS, leaving no runs.db event at all.
+                    # Deliberately NOT folded in with the cap-hit
+                    # 'fresh (transcript unreachable)' path above: that one is
+                    # already visible as a cap_hit event, and counting both
+                    # here would conflate two populations with different causes.
+                    #
+                    # NOTE the armed id here is not necessarily the CALLER's:
+                    # after a cap hit this loop re-arms a resume of its own
+                    # (result.session_id), and that re-armed resume can land in
+                    # this branch too.  Record WHICH session each fallback lost
+                    # so the consumer can name it instead of guessing from a
+                    # pre-allocated id the fresh retry has already replaced.
+                    resume_fallbacks += 1
+                    resume_fallback_session_ids.append(
+                        str(invoke_kwargs['resume_session_id']),
+                    )
                     logger.warning(
                         f'{label}: resume failed (session_id={invoke_kwargs["resume_session_id"]}), '
                         f'retrying fresh',
@@ -2120,6 +2348,8 @@ async def invoke_with_cap_retry(
                 break
 
     result.account_name = account_name
+    result.resume_fallbacks = resume_fallbacks
+    result.resume_fallback_session_ids = tuple(resume_fallback_session_ids)
     if cost_store:
         try:
             await cost_store.save_invocation(
@@ -2375,7 +2605,12 @@ async def _invoke_claude(
         strict_mcp_config=strict_mcp_config,
     )
 
-    # User prompt is piped via stdin to avoid ARG_MAX on large payloads
+    # User prompt goes over stdin, never argv, to avoid ARG_MAX on large
+    # payloads (and to keep it out of `ps` output and systemd scope names).
+    # _run_subprocess pre-materializes these bytes into an unlinked temp file
+    # BEFORE spawning, rather than writing them to a pipe afterwards, so a
+    # stalled event loop cannot make the child miss its ~3s stdin deadline
+    # (task 3147 — see _materialize_stdin).
     stdin_data = prompt.encode()
 
     # Strip ANTHROPIC_API_KEY so `claude` falls back to OAuth
@@ -2618,6 +2853,19 @@ def _cpu_govern_prefix(env: dict[str, str]) -> list[str]:
     process-group kill logic in ``_run_subprocess`` are unaffected.  Cargo and
     rustc children inherit the cgroup scope via fork, which is the intended
     effect for DF-1.
+
+    TIMING (task 3147): the wrapper performs TWO blocking ``systemd-run --user
+    --scope`` D-Bus round-trips — a probe plus the real exec — before the CLI
+    itself execs.  That measurably WIDENS the window between spawn and the
+    child's first read of stdin.  It was investigated as a suspect for the
+    esc-3118-1 starvation race and REFUTED as the cause (it is inert in the
+    live deployment: ``cpu_governance.exec_path`` is unset, so
+    ``resolved_exec_path()`` returns None and this function emits nothing); the
+    cause was the parent writing the prompt to a pipe AFTER ``execve``.  It is
+    harmless now that the payload is pre-materialized before spawn — and that
+    is exactly why the delivery must not be "optimized" back to a lazily-written
+    pipe: this wrapper would widen the window that fix closed.  Pinned by
+    ``TestStdinStarvationRace::test_stdin_survives_govern_and_nice_wrapper_chain``.
     """
     raw = env.pop('DF_AGENT_CPU_GOVERN', None)
     if not raw:
@@ -2670,6 +2918,87 @@ def _cpu_priority_prefix(env: dict[str, str]) -> list[str]:
     return ['nice', '-n', str(n)]
 
 
+def _materialize_stdin(stdin_data: bytes) -> IO[bytes]:
+    """Write *stdin_data* into an unlinked temp file and return it positioned at 0.
+
+    THE INVARIANT: the payload is resident in the kernel BEFORE ``execve``, so
+    the child's very first ``read(0)`` succeeds no matter how long — or how
+    badly — the parent's event loop is stalled.
+
+    This closes the race confirmed under task 3147 (esc-3118-1, and the
+    esc-3072-1 / 3111-1 / 3112-1 / 3113-1 burst that landed within 7 seconds of
+    it).  The previous shape spawned with ``stdin=PIPE`` and then handed the
+    bytes to ``communicate(input=...)``, i.e. the payload was written to the
+    child's pipe BY THE EVENT LOOP, after the child had already exec'd and
+    started counting.  The claude CLI gives up on an empty stdin after ~3s
+    ('no stdin data received in 3s') and — because its argv carries neither a
+    positional prompt nor a ``-`` stdin marker (see ``build_claude_argv``) — it
+    cannot tell "input is coming" from "there is no input", so it exits on
+    ARGUMENT VALIDATION pre-first-turn: ``turns=0``, ``cost_usd=0.0``,
+    ``timed_out=False``, empty stdout.  Any loop stall >= that deadline in the
+    window between exec and the write was silently, unrecoverably fatal, and
+    the orchestrator runs one event loop across up to 48 concurrent agents.
+
+    ``tempfile.TemporaryFile()`` is unlinked at creation (Linux ``O_TMPFILE``),
+    so the payload never appears in the filesystem namespace, needs no
+    ``temp_files`` bookkeeping or ``finally`` unlink, and its inode is
+    reclaimed when the last fd closes even if the process is killed mid-spawn.
+    A pre-filled ``os.pipe()`` was measured to close the race too but is
+    capacity-bounded (65536 bytes by default, 1 MiB ceiling via
+    ``/proc/sys/fs/pipe-max-size``): writing a larger payload would block the
+    parent BEFORE spawn with no reader attached — a deadlock strictly worse
+    than the bug.  Briefing prompts routinely exceed 64 KiB.
+
+    Raises rather than falling back to ``stdin=PIPE``.  A silent fallback would
+    reintroduce this exact race in precisely the degraded conditions (disk
+    pressure, exhausted fds) where the loop is most likely to be stalled, and
+    would do so invisibly — see the ``no-silent-fail-soft`` design invariant.
+    On failure the file is closed before re-raising so no fd is leaked.
+
+    THE RETURNED FD IS READ-ONLY.  ``tempfile.TemporaryFile()`` opens ``'w+b'``
+    (``O_RDWR``), and fd 0 is inherited by the child's WHOLE subtree — bwrap,
+    the systemd-run scope, ``nice``, the CLI, and every tool the agent itself
+    spawns.  The shape this replaced handed the child the read end of a pipe,
+    so a writable stdin would have been a silent widening of what that subtree
+    can do to its own input.  The payload is therefore re-opened ``O_RDONLY``
+    through ``/proc/self/fd/N`` — same still-unlinked inode, no filesystem
+    name, fresh description already at offset 0 — and the read-write handle is
+    closed.
+
+    That narrowing is deliberately BEST-EFFORT and logs when it is skipped,
+    which is not the same fail-soft the paragraph above forbids: the
+    race-closing invariant (payload resident in the kernel before ``execve``)
+    holds identically either way, so a host without ``/proc`` degrades to
+    today's read-write fd rather than losing every spawn.  A ``stdin=PIPE``
+    fallback would instead give up the invariant itself, which is why that one
+    raises.
+    """
+    # noqa SIM115: a context manager is exactly wrong here — the fd must
+    # OUTLIVE this call.  It is handed to create_subprocess_exec so the child
+    # can dup it, and the caller closes the parent's handle immediately after
+    # spawn (that close is what delivers EOF to the child).
+    f = tempfile.TemporaryFile()  # noqa: SIM115
+    try:
+        f.write(stdin_data)
+        f.flush()
+        f.seek(0)  # only load-bearing on the read-write fallback arm below
+    except BaseException:
+        f.close()
+        raise
+
+    try:
+        ro = open(f'/proc/self/fd/{f.fileno()}', 'rb')  # noqa: SIM115 — see above
+    except OSError as e:
+        logger.warning(
+            f'stdin payload could not be narrowed to a read-only fd ({e}); '
+            f'handing the child the read-write handle instead. The task-3147 '
+            f'pre-materialization invariant is unaffected.'
+        )
+        return f
+    f.close()
+    return ro
+
+
 async def _run_subprocess(
     cmd: list[str],
     cwd: Path,
@@ -2685,8 +3014,13 @@ async def _run_subprocess(
 ) -> _SubprocessResult:
     """Run a subprocess, log output.
 
-    *stdin_data*, when set, is piped to the process's stdin.  This avoids
-    passing large payloads as command-line arguments (which hit ARG_MAX).
+    *stdin_data*, when set, is delivered on the process's stdin.  This avoids
+    passing large payloads as command-line arguments (which hit ARG_MAX).  It
+    is NOT written through a pipe by the event loop: it is pre-materialized
+    into an unlinked temp file handed to the child as an already-open fd, so
+    the payload is readable before ``execve`` and cannot be lost to an
+    event-loop stall (task 3147 — see ``_materialize_stdin``).  ``None`` leaves
+    stdin inherited from the parent.
 
     *working_idle_secs* / *absolute_cap_secs*, when BOTH set, extend the
     WORKING regime past *timeout_seconds* while the transcript keeps
@@ -2710,15 +3044,28 @@ async def _run_subprocess(
     # (PRD C-G1).
     spawn_cmd = _cpu_govern_prefix(env) + _cpu_priority_prefix(env) + cmd
 
-    proc = await asyncio.create_subprocess_exec(
-        *spawn_cmd,
-        cwd=str(cwd),
-        env=env,
-        stdin=asyncio.subprocess.PIPE if stdin_data is not None else None,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        start_new_session=True,
-    )
+    # Pre-materialize the prompt BEFORE the child exists (task 3147).  The
+    # bytes must be in the kernel before execve, or a stalled event loop can
+    # miss the CLI's ~3s stdin deadline and lose the run — see
+    # _materialize_stdin's docstring for the confirmed failure mode.
+    # stdin_data is None must still yield stdin=None (inherited).
+    stdin_file = _materialize_stdin(stdin_data) if stdin_data is not None else None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *spawn_cmd,
+            cwd=str(cwd),
+            env=env,
+            stdin=stdin_file,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+    finally:
+        # Close the parent's handle as soon as the child has its own dup — this
+        # is what guarantees the child sees EOF at the end of the payload.  In
+        # a `finally` so a raising create_subprocess_exec cannot leak the fd.
+        if stdin_file is not None:
+            stdin_file.close()
     # Capture pgid at spawn (pgid == pid under start_new_session).  Never
     # refresh via os.getpgid() later — the PID may be reused post-reap.
     pgid = proc.pid
@@ -2752,8 +3099,21 @@ async def _run_subprocess(
             # updated together whenever a later poll observes MORE turns.
             last_progress_turns: int | None = None
             last_progress_monotonic: float | None = None
+            # Once-per-crossing latch for the unreadable-transcript storm escape
+            # (task 4003).  `note_unreadable_transcript` is stateless and fires on
+            # EVERY call past the grace bound, so the latch is what keeps a wedged
+            # invocation — which polls its transcript for the whole of a long run —
+            # to a single WARNING.  Cleared by any successful read, so a transcript
+            # that goes unreadable again later is a new crossing and fires again.
+            # Local, not a module global: two concurrent invocations in one process
+            # must not silence each other.
+            unreadable_escape_fired = False
 
-            comm_task = asyncio.ensure_future(proc.communicate(input=stdin_data))
+            # No `input=`: stdin was pre-materialized as a real fd before spawn
+            # (task 3147), so communicate() performs reads only.  That also keeps
+            # the SECOND communicate() inside the SIGTERM grace window below
+            # valid, since there is no PIPE for it to try to re-write.
+            comm_task = asyncio.ensure_future(proc.communicate())
 
             while True:
                 elapsed = time.monotonic() - watchdog_start
@@ -2840,7 +3200,17 @@ async def _run_subprocess(
                 # unaffected — it is a separate, one-shot read outside this loop.
                 if not seen_turn and config_dir and session_id:
                     n = count_transcript_turns(config_dir, session_id)
-                    if n is not None:
+                    if n is None:
+                        if not unreadable_escape_fired:
+                            unreadable_escape_fired = note_unreadable_transcript(
+                                time.monotonic() - watchdog_start,
+                                grace_secs=startup_grace_secs,
+                                config_dir=config_dir,
+                                session_id=session_id,
+                                label=model,
+                            )
+                    else:
+                        unreadable_escape_fired = False
                         live_turns = n
                         if n >= 1:
                             seen_turn = True
@@ -2848,9 +3218,20 @@ async def _run_subprocess(
                             last_progress_monotonic = time.monotonic()
                 elif extension_engaged and config_dir and session_id:
                     n = count_transcript_turns(config_dir, session_id)
-                    if n is not None and (last_progress_turns is None or n > last_progress_turns):
-                        last_progress_turns = n
-                        last_progress_monotonic = time.monotonic()
+                    if n is None:
+                        if not unreadable_escape_fired:
+                            unreadable_escape_fired = note_unreadable_transcript(
+                                time.monotonic() - watchdog_start,
+                                grace_secs=startup_grace_secs,
+                                config_dir=config_dir,
+                                session_id=session_id,
+                                label=model,
+                            )
+                    else:
+                        unreadable_escape_fired = False
+                        if last_progress_turns is None or n > last_progress_turns:
+                            last_progress_turns = n
+                            last_progress_monotonic = time.monotonic()
 
                 elapsed = time.monotonic() - watchdog_start
                 # Re-derive fresh (not the top-of-loop value) so a seen_turn
@@ -2861,6 +3242,17 @@ async def _run_subprocess(
 
                 # Startup-regime kill: explicit 0-turn read AND grace expired.
                 # NEVER kill on None (unreadable transcript) — conservative degrade.
+                # That degrade is now LOGGED (note_unreadable_transcript, above)
+                # once the SAME startup_grace_secs bound this kill uses has
+                # passed: a role configured WITH config_dir and session_id is
+                # supposed to HAVE a transcript, so one still unreadable at the
+                # point we would have killed on an explicit 0 is a defect, not
+                # patience.  The comment alone was not enough — it was correct
+                # and present the whole time recon's per-run CLAUDE_CONFIG_DIR sat
+                # outside the sandbox writable set (2026-07-18 -> 2026-08-11, task
+                # 4003), during which this branch degraded to inert on every poll
+                # of every stage and said nothing.  The kill decision is unchanged;
+                # only its silence is.
                 if not seen_turn and live_turns == 0 and elapsed >= startup_grace_secs:
                     logger.warning(
                         f'Startup wedge detected after {elapsed:.1f}s '

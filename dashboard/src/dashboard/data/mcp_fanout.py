@@ -37,8 +37,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from collections.abc import Awaitable, Callable, Sequence
+from pathlib import Path
 from typing import Generic, TypeVar
 
 import httpx
@@ -67,6 +69,29 @@ _FANOUT_REWARN_EVERY = 500
 _failure_streaks: dict[tuple[str, str], int] = {}
 
 
+class PreformattedFanoutError(ValueError):
+    """A fan-out failure whose message is ALREADY a rendered ``'Type: message'``.
+
+    :func:`first_success` renders every caught exception through
+    :func:`describe_exc`, which unconditionally prepends
+    ``type(exc).__name__``. A call site that has already formatted the *real*
+    cause — because it caught it, logged it, and re-raised to signal
+    fall-through — therefore reached the operator doubled:
+    ``'ValueError: ConnectError: refused'`` in the ``cancel_ticket`` 502
+    ``detail`` and in the dashboard's offline pill. Raise this instead of a
+    bare ``ValueError`` when the message you pass is final.
+
+    Subclassing ``ValueError`` (rather than adding a new type to
+    ``first_success``'s catch tuple) keeps control flow and every caller's own
+    ``except ValueError`` unchanged. A marker type is used rather than having
+    ``describe_exc`` sniff the message for an existing ``'Type: message'``
+    shape because sniffing is a heuristic on operator-visible text: any
+    legitimate message whose first token happened to look like an identifier
+    followed by ``': '`` would be silently stripped of its real type name,
+    with no way for a call site to opt out.
+    """
+
+
 def describe_exc(exc: BaseException) -> str:
     """Render *exc* as ``'Type: message'``, or just ``'Type'`` when empty.
 
@@ -76,9 +101,81 @@ def describe_exc(exc: BaseException) -> str:
     bare ``str(exc)`` turns those into content-free log lines ("failed for
     <url>: ") and content-free offline pills; always naming the type keeps
     client-side saturation distinguishable from a genuinely dead endpoint.
+
+    A non-empty :class:`PreformattedFanoutError` is the one exception: its
+    message is already a rendered cause, so it is returned verbatim rather
+    than gaining a second prefix. An *empty* one still falls through to the
+    generic path above, so opting in can never reintroduce the content-free
+    line this function exists to prevent.
     """
     text = str(exc)
+    if isinstance(exc, PreformattedFanoutError) and text:
+        return text
     return f'{type(exc).__name__}: {text}' if text else type(exc).__name__
+
+
+def project_label(project_root: str | os.PathLike[str]) -> str:
+    """Render *project_root* as the short project name the UI labels it with.
+
+    The basename, falling back to the full string for a root with no basename
+    (``'/'``) so a label can never degrade to empty. This is the single
+    definition of that rule for the fan-out cluster — :func:`fanout_label`
+    composes it rather than re-deriving it.
+
+    ``active_tasks._project_label`` and ``redux_api._project_label`` are
+    independent hand-rolled copies of the same rule. They are not imported here
+    (``active_tasks`` imports from ``tasks``, which imports this module), which
+    also means the delegation can only run the other way: those two can
+    eventually call *this*, collapsing three copies onto one. That cross-module
+    edit is out of task 4133's module lock and is filed as follow-up work; until
+    it lands, the three definitions must be kept string-identical by hand.
+    """
+    root_str = str(project_root)
+    return Path(root_str).name or root_str
+
+
+def fanout_label(base: str, project_root: str | os.PathLike[str]) -> str:
+    """Compose a per-project-root fan-out log label, ``'base[project-name]'``.
+
+    **Every fan-out caller parameterized by project_root MUST compose its
+    ``log_label`` through this helper.** The contract is not cosmetic — it is
+    what makes the transition-only policy above hold at all:
+
+    - the throttle key is ``(log_label, url)``;
+    - ONE fused-memory URL serves *every* project_root, so a fixed literal
+      label collapses all roots onto a single key;
+    - :func:`note_fanout_success` **pops** that key, so a healthy root's
+      success in the same UI poll cycle clears a broken root's open streak.
+      The broken root's next failure is therefore ``streak == 1`` again,
+      re-arming the opening WARNING *and* adding a 'recovered' WARNING —
+      every cycle, indefinitely. That is precisely the sustained flood the
+      transition-only policy exists to prevent (task 3871), reintroduced
+      through the key rather than the level.
+
+    A collapsed key also erases the diagnosis: the message names only the
+    shared URL, so the operator cannot tell *which* project_root is down.
+
+    The discriminator is :func:`project_label` — the basename, deliberately
+    string-identical to ``active_tasks._project_label`` /
+    ``redux_api._project_label`` so operator log labels match the project chips
+    the UI already renders. ``mcp_fanout``, the leaf of this cluster, is the
+    helper's home (see :func:`project_label`) and this docstring is the single
+    place the convention is written down.
+
+    **The guarantee above assumes project-root basenames are distinct.** Two
+    configured roots sharing one (``/srv/team-a/app`` and ``/srv/team-b/app``,
+    or two checkouts both named ``dark-factory``) collapse back onto a single
+    key and reintroduce both failure modes described above. That assumption is
+    pre-existing and system-wide rather than introduced here —
+    ``scheduler``'s ``label_to_root = {_project_label(r): r for r in ...}``
+    already silently drops one of two same-basename roots, and ``redux_api``
+    keys its whole per-project payload on the same basename — so this helper
+    inherits it deliberately instead of diverging from every other project
+    label the dashboard renders. For ``list_tickets`` the unambiguous full root
+    is in any case still in the message body (metrics appends
+    ``(project_root=...)``).
+    """
+    return f'{base}[{project_label(project_root)}]'
 
 
 def log_fanout_failure(log_label: str, url: str, exc: BaseException) -> None:
@@ -236,15 +333,32 @@ class TTLCache(Generic[V]):
     is intentional: a non-cacheable result must not be handed to every other
     waiter when a subsequent attempt might succeed.
 
-    **Unbounded key space is a caller assumption, not a guarantee.** Neither
-    ``_store`` nor ``_locks`` ever evict individual entries — only the
-    blanket ``clear()`` resets them — so a distinct key accumulates a store
-    slot and a ``Lock`` forever once created. This is safe for the current
-    callers (each keyed by a small, bounded set of project roots), but a
-    future high-cardinality key space (e.g. keyed per-request or per-user)
-    would leak locks and stale entries indefinitely; such a caller should
-    add its own eviction or key externally.
+    **Key space is bounded by disuse, not by cardinality.** A key that stops
+    being requested is reclaimed: :meth:`_evict_expired` drops store entries
+    older than ``_EVICTION_TTL_MULTIPLE`` times the TTL, along with their
+    idle locks, and ``get_or_refresh`` runs it on the cold path — the same
+    path that mints new keys, so growth and reclamation are coupled by
+    construction. An entry past its TTL is already unservable (``get_fresh``
+    enforces the TTL and is the only reader), so eviction reclaims memory
+    with NO semantic change; the multiple is margin against a callable
+    ``ttl_seconds`` that returns a larger value later.
+
+    This makes a HIGH-CARDINALITY key space safe, which it previously was
+    not. It used to be true that "neither ``_store`` nor ``_locks`` ever
+    evict individual entries", and callers were told to key externally or
+    add their own eviction. ``fetch_tasks`` then acquired a key derived from
+    a paging offset computed off a live, monotonically-growing task count —
+    minting a fresh key on every task completion, each permanently retaining
+    a 400-row task list plus a ``Lock`` (task 3857 review). A caller cannot
+    add eviction from outside (``_store`` is private), so the fix belongs
+    here. Steady-state size is now "keys requested within the eviction
+    horizon", regardless of how many distinct keys the caller has ever used.
     """
+
+    # Multiple of the TTL after which an untouched entry is evicted. Entries
+    # are unservable past 1x the TTL, so anything >= 1 is semantically free;
+    # 4 leaves margin for a callable TTL that grows between calls.
+    _EVICTION_TTL_MULTIPLE = 4
 
     def __init__(self, ttl_seconds: float | Callable[[], float]):
         self._ttl_fn: Callable[[], float] = (
@@ -260,6 +374,62 @@ class TTLCache(Generic[V]):
             return cached[1]
         return None
 
+    def _evict_expired(self) -> int:
+        """Drop store entries past the eviction horizon and their idle locks.
+
+        Returns the number of store entries dropped (for tests/observability).
+
+        Safe by construction, in two independent senses:
+
+        * SEMANTICALLY — an evicted entry is older than the TTL, and
+          :meth:`get_fresh` (the only reader of ``_store``) already refuses
+          to serve those. Eviction therefore changes no observable value,
+          only resident memory.
+        * CONCURRENTLY — this method is fully synchronous, so it runs to
+          completion without yielding to another coroutine, and a lock is
+          dropped only when it is neither held nor awaited. A coroutine that
+          has taken a lock object from ``_locks`` reaches ``lock.acquire()``
+          with no intervening await (see ``get_or_refresh``), so it cannot be
+          suspended between ``setdefault`` and entering ``acquire()``.
+
+          ``locked()`` alone would NOT be enough, which is why the predicate
+          below also checks for waiters. ``asyncio.Lock.release()`` clears
+          its ``_locked`` flag and merely SCHEDULES the first waiter's
+          future; between that release and the waiter's task actually
+          resuming, ``locked()`` reads False while a queued waiter is very
+          much still using the lock. A sweep landing in that window — reached
+          on any cold miss, and the key is absent from ``_store`` exactly
+          during an outage, since ``cache_ok`` stores nothing then — would
+          otherwise drop the lock, the next caller would ``setdefault`` a
+          fresh one, and the two would refresh concurrently.
+
+          The waiter probe reads ``asyncio.Lock``'s private ``_waiters``
+          defensively via ``getattr``: if a future CPython drops the
+          attribute, the predicate degrades to the ``locked()``-only test and
+          the cost is at most one duplicate refresh in that narrow window —
+          never corruption, and never a wrong value (the two refreshes write
+          the same key). Dropping a genuinely idle lock is safe regardless:
+          the next caller for that key simply creates a new one.
+        """
+        horizon = self._ttl_fn() * self._EVICTION_TTL_MULTIPLE
+        now = time.monotonic()
+        stale = [k for k, (stamp, _) in self._store.items() if (now - stamp) >= horizon]
+        for key in stale:
+            del self._store[key]
+        # A lock still guarding a live entry is kept, so single-flight for an
+        # actively-used key is never disturbed by a sweep.  ``_waiters`` covers
+        # the released-but-not-yet-resumed window in which ``locked()`` lies —
+        # see the docstring.
+        idle = [
+            k for k, lk in self._locks.items()
+            if k not in self._store
+            and not lk.locked()
+            and not getattr(lk, '_waiters', None)
+        ]
+        for key in idle:
+            del self._locks[key]
+        return len(stale)
+
     async def get_or_refresh(
         self,
         key: str,
@@ -273,6 +443,13 @@ class TTLCache(Generic[V]):
         a per-key lock, re-checks freshness (another waiter may have just
         filled it), and — if still cold — runs ``refresh()`` and stores the
         result iff ``cache_ok(value)``.
+
+        The cold path also sweeps expired entries (:meth:`_evict_expired`).
+        That is deliberately the ONLY sweep site: a cold miss is exactly when
+        a new key can be minted, so reclamation runs at the same rate as
+        growth and a hot warm-path hit stays lock-free and O(1). The sweep is
+        O(store size) but happens only when an ``await refresh()`` — a
+        network round trip — is about to run, which dwarfs it.
         """
         fresh = self.get_fresh(key)
         if fresh is not None:
@@ -284,6 +461,7 @@ class TTLCache(Generic[V]):
             if fresh is not None:
                 return fresh
 
+            self._evict_expired()
             value = await refresh()
             if cache_ok(value):
                 self._store[key] = (time.monotonic(), value)

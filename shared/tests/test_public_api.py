@@ -100,6 +100,7 @@ class TestModuleLevelAll:
             'is_server_error_status',
             'is_timed_out_with_progress',
             'is_zero_output_timeout',
+            'note_unreadable_transcript',
             'read_transcript_records',
             'require_non_blank_prompt',
             'transcript_exists',

@@ -4,9 +4,19 @@ Non-fixture helpers (MockEdge, make_rebuild_detail, extract_cypher, …)
 live in `_fm_helpers.py` — a uniquely-named sibling module — so they can
 be imported from test files without conflicting with sibling subprojects'
 conftests under `sys.modules['conftest']`.
+
+Testing a `scripts/` script? `scripts/` is not a package and is not on
+PYTHONPATH, so import it with `from _fm_helpers import
+load_script_module` rather than writing another local
+`spec_from_file_location` loader: the shared one reuses an already-loaded
+module for the same file instead of re-executing it under the same
+`sys.modules` key, and refuses to shadow a module it did not install.
+Many older test modules still carry their own copy (task 3895 migrates
+them); don't add one (task 3738).
 """
 
 import os
+import re
 import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -170,7 +180,40 @@ def make_graph_mock():
         [[1, 'label'], [1, 'properties'], [1, 'types'], [1, 'options'],
          [1, 'language'], [1, 'stopwords'], [1, 'entitytype'], [1, 'status'],
          [1, 'info']]
+
+    CYPHER DISPATCH (task 4340).  Both mocks answer per the cypher they are
+    given, rather than returning one static result for everything:
+
+      - a cypher containing ``count(``      -> ``[[len(rows)]]``, a single row
+      - a cypher containing ``SKIP n LIMIT m`` -> ``rows[n : n + m]``
+      - anything else                       -> ``rows``, exactly as before
+
+    This exists because two whole-graph reads are now paginated, and a
+    paginated read issues a single-row ``count(*)`` census probe before its
+    SKIP/LIMIT pages.  A static fixture would answer that census with a page
+    of edge rows, whose first column is a uuid string — ``int('node-1')``
+    raises, the count is unusable, and every caller would silently flip to
+    ``complete=False`` plus a WARNING.  A shared fixture that lies about the
+    read shape it stands in for is worse than a per-test patch: the next
+    person to paginate something rediscovers the same trap.
+
+    This fixture deliberately does NOT simulate the server's
+    ``RESULTSET_SIZE`` truncation.  ONE double owns that behaviour —
+    ``test_graph_read_pagination.FakeCappedGraph``, which also carries the
+    stateful query log the truncation tests need — because two doubles that
+    both claim to stand in for the same server drift, and the drift shows up
+    as a test that passes against a fake nothing else agrees with.  A test
+    that needs the cap should use that one.
     """
+    skip_limit_re = re.compile(r'SKIP\s+(\d+)\s+LIMIT\s+(\d+)', re.IGNORECASE)
+    # Deliberately NARROW: only a query whose entire projection is a bare row
+    # count is a census probe. A loose `'count(' in cypher` test also captures
+    # ordinary queries that return a count as one column among several — e.g.
+    # find_duplicate_entity_nodes' `RETURN n.uuid, ..., count(e)` — and would
+    # hand them a single-column [[n]] row, raising IndexError deep inside the
+    # method under test rather than anywhere near the fixture.
+    census_re = re.compile(r'RETURN\s+count\(\*\)\s*$', re.IGNORECASE)
+
     def _factory(
         rows: list[list] | None = None,
         *,
@@ -180,21 +223,36 @@ def make_graph_mock():
     ) -> MagicMock:
         header_value = header if header is not None else []
         if ro_rows is not None or q_rows is not None:
-            ro_result = MagicMock()
-            ro_result.result_set = ro_rows if ro_rows is not None else (rows or [])
-            ro_result.header = header_value
-            q_result = MagicMock()
-            q_result.result_set = q_rows if q_rows is not None else (rows or [])
-            q_result.header = header_value
+            ro_row_data = ro_rows if ro_rows is not None else (rows or [])
+            q_row_data = q_rows if q_rows is not None else (rows or [])
         else:
-            ro_result = MagicMock()
-            ro_result.result_set = rows if rows is not None else []
-            ro_result.header = header_value
-            q_result = ro_result
+            ro_row_data = rows if rows is not None else []
+            q_row_data = ro_row_data
+
+        def _make_side_effect(row_data: list[list]):
+            def _respond(cypher='', params=None, *args, **kwargs) -> MagicMock:
+                text = cypher if isinstance(cypher, str) else ''
+                if census_re.search(text.strip()):
+                    # A single-row aggregate: never truncated by the row cap,
+                    # and it agrees with the pages by construction.
+                    result_set = [[len(row_data)]]
+                else:
+                    match = skip_limit_re.search(text)
+                    if match:
+                        skip, limit = int(match.group(1)), int(match.group(2))
+                        result_set = row_data[skip: skip + limit]
+                    else:
+                        result_set = row_data
+                result = MagicMock()
+                result.result_set = result_set
+                result.header = header_value
+                return result
+
+            return _respond
 
         graph_mock = MagicMock()
-        graph_mock.query = AsyncMock(return_value=q_result)
-        graph_mock.ro_query = AsyncMock(return_value=ro_result)
+        graph_mock.query = AsyncMock(side_effect=_make_side_effect(q_row_data))
+        graph_mock.ro_query = AsyncMock(side_effect=_make_side_effect(ro_row_data))
         return graph_mock
 
     return _factory

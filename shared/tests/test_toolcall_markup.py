@@ -783,7 +783,10 @@ class TestMarkupOverrideLifecycle:
             3.5,
             True,
             ['allow_mcp_markup'],
-            object(),
+            # Bare sentinel: an explicit id, because repr(object()) embeds a heap
+            # address that differs per process and makes pytest-xdist abort the
+            # whole suite on a collection-consistency mismatch.
+            pytest.param(object(), id='<bare object()>'),
         ],
         ids=repr,
     )

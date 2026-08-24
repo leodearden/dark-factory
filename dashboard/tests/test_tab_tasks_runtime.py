@@ -10,59 +10,38 @@ from __future__ import annotations
 import re
 
 import pytest
-from starlette.testclient import TestClient
-
-
-@pytest.fixture(scope='module')
-def _client():
-    from dashboard.app import app
-
-    with TestClient(app) as c:
-        yield c
-
-
-@pytest.fixture(scope='module')
-def tab_tasks_jsx_body(_client):
-    return _client.get('/static/redux/tab_tasks.jsx').text
-
-
-def _extract_function_body(source: str, func_name: str) -> str:
-    """Extract the source text of a top-level ``function <func_name>(`` up to
-    (but not including) the next top-level ``function`` declaration, or to
-    end-of-file if it's the last one.
-
-    Used to scope structural assertions to a single component's render
-    function so an assertion can't be accidentally satisfied by an unrelated
-    component elsewhere in the same file (mirrors
-    test_tab_orchestrators.py's identically-named helper).
-    """
-    start_match = re.search(rf'^function {re.escape(func_name)}\(', source, re.MULTILINE)
-    assert start_match is not None, f'function {func_name}( not found in tab_tasks.jsx'
-    start = start_match.start()
-    next_match = re.search(r'^function \w+\(', source[start + 1 :], re.MULTILINE)
-    end = start + 1 + next_match.start() if next_match else len(source)
-    return source[start:end]
+from _dashboard_helpers import extract_function_body
 
 
 @pytest.fixture(scope='module')
 def task_detail_body(tab_tasks_jsx_body):
-    """TaskDetail's own source text, scoped away from the other component
-    functions (TaskGraph, PrdBox, TasksTab, ...) in the same file."""
-    return _extract_function_body(tab_tasks_jsx_body, 'TaskDetail')
+    """TaskDetail's brace-delimited body, signature excluded.
+
+    Scoped away from the other component functions (TaskGraph, PrdBox,
+    TasksTab, ...) in the same file so an assertion cannot be satisfied by an
+    unrelated component.
+    """
+    return extract_function_body(tab_tasks_jsx_body, 'TaskDetail')
 
 
 @pytest.fixture(scope='module')
 def task_graph_body(tab_tasks_jsx_body):
-    """TaskGraph's own source text, scoped away from the other component
-    functions in the same file."""
-    return _extract_function_body(tab_tasks_jsx_body, 'TaskGraph')
+    r"""TaskGraph's brace-delimited body, signature excluded.
+
+    Scoped away from the other component functions in the same file.  Note
+    `function TaskGraphEdges(` is declared EARLIER in tab_tasks.jsx: only the
+    extractor's trailing `\s*\(` keeps it from answering this request.
+    """
+    return extract_function_body(tab_tasks_jsx_body, 'TaskGraph')
 
 
 @pytest.fixture(scope='module')
 def fmt_age_body(tab_tasks_jsx_body):
-    """fmtAge's own source text, scoped away from the other functions in the
-    same file."""
-    return _extract_function_body(tab_tasks_jsx_body, 'fmtAge')
+    """fmtAge's brace-delimited body, signature excluded.
+
+    Scoped away from the other functions in the same file.
+    """
+    return extract_function_body(tab_tasks_jsx_body, 'fmtAge')
 
 
 class TestTaskDetailRuntimeFields:

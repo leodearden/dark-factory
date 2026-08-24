@@ -17,6 +17,7 @@ from fused_memory.models.reconciliation import (
     EventType,
     ReconciliationEvent,
 )
+from fused_memory.reconciliation.throughput import utc_hour_bucket
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +64,22 @@ CREATE TABLE IF NOT EXISTS deferred_writes (
     attempt_count INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_dw_project_claimed ON deferred_writes(project_id, claimed_at);
+
+-- Task 3049: durable hourly inflow record.  event_buffer rows are DELETEd by
+-- cleanup_drained once they are drained and older than max_age_seconds
+-- (default 3600s), so arrival history otherwise survives ~1 hour, not a week.
+-- cleanup_drained rolls the rows it is about to delete into this aggregate in
+-- the SAME transaction as the DELETE, which is what makes the count exact:
+-- an event is either still live in event_buffer or already counted here,
+-- never both and never neither.  Idempotent DDL, so existing DBs pick the
+-- table up on their next initialize().
+CREATE TABLE IF NOT EXISTS event_arrival_hourly (
+    project_id TEXT NOT NULL,
+    hour_bucket TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    event_count INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (project_id, hour_bucket, event_type)
+);
 """
 
 # Maximum number of replay attempts before a deferred write is treated as a poison-pill
@@ -1096,23 +1113,98 @@ class EventBuffer:
     # ── Maintenance ────────────────────────────────────────────────────
 
     async def cleanup_drained(self, max_age_seconds: float = 3600.0) -> int:
-        """Delete drained events older than cutoff, skipping locked projects."""
+        """Delete drained events older than cutoff, skipping locked projects.
+
+        Task 3049: before deleting, roll the very same rows up into
+        ``event_arrival_hourly`` so the project's arrival history survives the
+        DELETE.  This is the only ``DELETE FROM event_buffer`` in the codebase
+        — the single chokepoint where inflow history is destroyed — so rolling
+        up here captures 100% of events regardless of which drain path
+        (``drain`` / ``drain_oldest_chunk`` / ``drain_by_ids``) marked them.
+
+        The rollup runs inside the SAME ``_txn()`` as the DELETE, and takes its
+        rows FROM that delete via ``DELETE ... RETURNING`` (SQLite >= 3.35,
+        already relied on by ``services/durable_queue.py``).  That is the
+        correctness property: each row is counted exactly once, because it is
+        either still live in ``event_buffer`` (countable directly) or in the
+        aggregate (countable there), never both and never neither.  Deriving
+        the aggregated set from the deletion itself — rather than re-evaluating
+        the same predicate in a separate SELECT — is what makes the two halves
+        structurally incapable of disagreeing, and it halves the scan cost of a
+        sweep that runs every 50s against a table that can hold six-figure row
+        counts after a deep backlog drain.  In particular the lock exclusion is
+        honoured by construction: a locked project's rows are not deleted, so
+        they are not returned, so they are not rolled up — they simply roll up
+        on the later sweep that does delete them.
+
+        A row whose timestamp cannot be parsed is still DELETED; it is only
+        left out of the rollup, with a structured warning naming it.  Bucketing
+        raises ``ValueError`` on a malformed timestamp and this transaction is
+        the ONLY path that prunes the buffer, so letting one poison row abort
+        it would wedge cleanup permanently (the caller logs a WARNING and
+        retries every 50s forever) and grow ``event_buffer`` without bound.
+        Losing one row from an inflow aggregate is a rounding error; losing the
+        only pruning path is an outage.
+
+        Returns:
+            The number of rows deleted — counted from the RETURNING output, so
+            it stays exact regardless of how the driver reports ``rowcount``
+            for a returning statement.
+        """
         cutoff = datetime.fromtimestamp(
             datetime.now(UTC).timestamp() - max_age_seconds,
             tz=UTC,
         ).isoformat()
         async with self._txn() as db:
-            cursor = await db.execute(
+            async with db.execute(
                 """DELETE FROM event_buffer
                    WHERE status = 'drained'
                      AND timestamp < ?
                      AND project_id NOT IN (
                          SELECT project_id FROM reconciliation_locks
-                     )""",
+                     )
+                   RETURNING project_id, timestamp, event_type""",
                 (cutoff,),
-            )
-            rowcount = cursor.rowcount
-        return rowcount
+            ) as cursor:
+                # Materialised eagerly: fetchall() is typed Iterable[Row], and
+                # these rows are both counted (len) and iterated below, AFTER
+                # the cursor context has exited.
+                deleted = list(await cursor.fetchall())
+
+            counts: dict[tuple[str, str, str], int] = {}
+            for row in deleted:
+                # Bucket by PARSING, never by a SQL comparison against a
+                # datetime('now') literal — see throughput's METHOD NOTE:
+                # event_buffer.timestamp carries an offset and is
+                # 'T'-separated, so string-comparing it against SQLite's
+                # space-separated render collapses a whole day into one bucket.
+                try:
+                    bucket = utc_hour_bucket(row['timestamp'])
+                except ValueError as exc:
+                    logger.warning(
+                        'event_buffer.rollup_unparseable_timestamp',
+                        extra={
+                            'project_id': row['project_id'],
+                            'event_type': row['event_type'],
+                            'timestamp': row['timestamp'],
+                            'error': str(exc),
+                        },
+                    )
+                    continue
+                key = (row['project_id'], bucket, row['event_type'])
+                counts[key] = counts.get(key, 0) + 1
+
+            if counts:
+                await db.executemany(
+                    """INSERT INTO event_arrival_hourly
+                           (project_id, hour_bucket, event_type, event_count)
+                       VALUES (?, ?, ?, ?)
+                       ON CONFLICT(project_id, hour_bucket, event_type)
+                       DO UPDATE SET event_count = event_count + excluded.event_count""",
+                    [(pid, bucket, etype, n) for (pid, bucket, etype), n in counts.items()],
+                )
+
+        return len(deleted)
 
     async def request_trigger(self, project_id: str) -> None:
         """Manually request a reconciliation trigger for a project.

@@ -67,8 +67,7 @@ for _p in (str(_REPO_ROOT / 'scripts'), str(_REPO_ROOT / 'scripts' / 'legibility
 
 # The `# type: ignore[reportMissingImports]` is not a defect being papered over:
 # these resolve at RUNTIME via the `sys.path.append` above, but pyright is
-# invoked from escalation/ (`uv run --project escalation --directory escalation
-# pyright src/ tests/`), whose `[tool.pyright] extraPaths` cannot see repo-root
+# invoked from escalation/ (`uv run --directory escalation pyright src/ tests/`), whose `[tool.pyright] extraPaths` cannot see repo-root
 # scripts/. The idiom is the repo's established one for a cross-package consumer
 # of legibility scripts -- see shared/tests/toolcall_markup_corpus_extract.py and
 # fused-memory/scripts/memory_eval_transcript_corpus.py, which carry it verbatim.

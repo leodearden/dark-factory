@@ -32,6 +32,7 @@ from dashboard.data import redux_api
 from dashboard.data.active_tasks import (
     _MAX_CANCELLED_PER_PROJECT,
     _MAX_DONE_PER_PROJECT,
+    _all_project_roots,
     collect_tasks_with_counts,
 )
 from dashboard.data.burndown import (
@@ -40,6 +41,7 @@ from dashboard.data.burndown import (
     aggregate_burndown_series,
     collect_snapshot,
     downsample,
+    ensure_snapshot_columns,
 )
 from dashboard.data.cap_history import (
     AccountsSummary,
@@ -63,9 +65,14 @@ from dashboard.data.escalation_analytics import (
     archive_scan_succeeded,
     build_escalation_analytics,
 )
-from dashboard.data.escalations import build_escalation_queues
+from dashboard.data.escalations import build_escalation_queues, fetch_pins_recovery
 from dashboard.data.load import get_load_metrics
-from dashboard.data.mcp_fanout import TTLCache, first_success
+from dashboard.data.mcp_fanout import (
+    PreformattedFanoutError,
+    TTLCache,
+    describe_exc,
+    first_success,
+)
 from dashboard.data.memory_evals import build_memory_evals, root_scan_succeeded
 from dashboard.data.merge_halt import get_merge_halt_status
 from dashboard.data.merge_queue import (
@@ -208,6 +215,23 @@ class _BurndownStore(AsyncSqliteBase):
     def connection(self) -> aiosqlite.Connection:
         """Public accessor for the open connection; raises RuntimeError if not opened."""
         return self._require_conn()
+
+    async def open(self) -> None:
+        """Open, then bring an existing DB up to the current column set.
+
+        ``BURNDOWN_SCHEMA`` is applied with ``CREATE TABLE IF NOT EXISTS``, so a
+        burndown.db created before a column was added never gains it from the
+        DDL alone.  Migrating here — before ``_burndown_loop`` can run — is what
+        keeps the collector from ever meeting an un-migrated table.  Closes the
+        connection on failure so a half-open store is never left behind.
+        """
+        await super().open()
+        try:
+            await ensure_snapshot_columns(self.connection)
+            await self.connection.commit()
+        except BaseException:
+            await self.close()
+            raise
 
 
 class _MetricsStore(AsyncSqliteBase):
@@ -799,22 +823,100 @@ async def api_tasks(request: Request) -> JSONResponse:
     Each task in ACTIVE_TASKS includes a ``meta_files`` field (taskmaster
     ``metadata.files``) that is retained on the wire for debugging and tooling.
     No frontend UI reads it directly — lock display routes through D.SCHEDULER.
+
+    **Four distinct failure facts (plus a denominator), deliberately not
+    collapsed:**
+
+    - ``TASKS_OFFLINE`` — NO root produced rows and at least one root
+      DEMONSTRABLY failed. One fused-memory URL serves every root, so that is
+      the observable proxy for "fused-memory itself is unreachable", and it is
+      the only state the global banner's copy ("fused-memory offline — task
+      data unavailable") actually describes.
+
+      The demonstrably-failed conjunct is what keeps a pure budget expiry
+      (every root merely degraded, nothing proven down) from claiming an
+      outage. The no-root-succeeded conjunct is why the test is *not* the
+      tighter ``len(offline) == total_roots``: the handler's own budget caps
+      how many roots can even reach the offline state. In the hang case each
+      root burns up to ``_TASKS_PER_PROJECT_BUDGET`` before ``wait_for`` cuts
+      it, and a cut root lands in ``degraded``, not ``offline`` — so with
+      ``_TASKS_TOTAL_BUDGET / _TASKS_PER_PROJECT_BUDGET`` under three, at most
+      a couple of roots per render can ever be marked offline. Requiring ALL
+      of them to be would have made this flag unreachable on a nine-root
+      config for the most likely total outage, leaving the payload to say
+      "unavailable for 2 of 9" plus "timed out for 7 of 9" and never the
+      thing that was actually true.
+    - ``TASKS_OFFLINE_PROJECTS`` — the roots whose fetch DEMONSTRABLY failed.
+      Non-empty with ``TASKS_OFFLINE`` false is the normal partial case.
+    - ``TASKS_COUNT_UNKNOWN_PROJECTS`` — roots whose ACTIVE rows loaded fine
+      but whose compact status map did not, so the done count is UNKNOWN and
+      the terminal window was skipped. Neither offline nor degraded: without
+      a list of their own they would render as a healthy project with a
+      confident "0 done".
+    - ``TASKS_DEGRADED_PROJECTS`` — roots the handler ran out of budget for
+      (see ``collect_tasks_with_counts``). Their state is UNKNOWN, not bad:
+      nothing was proven unreachable, so degradation ALONE never raises the
+      offline flag, not even when every root degrades. It can only ever fail
+      to VETO the flag, alongside a root that did demonstrably fail.
+    - ``TASKS_PROJECT_COUNT`` — N: how many roots were fanned out over. The
+      banner's "k of N" phrasing needs a denominator drawn from the SAME
+      population as its numerator, and the client's only other candidate
+      (``PROJECTS``, from /api/v2/dashboard/orchestrators) is a different one —
+      a root with no orchestrator, or an orchestrator with no task root, makes
+      the two diverge and the notice understate the outage. The handler must
+      compute this anyway to decide ``TASKS_OFFLINE``, so emitting it costs
+      nothing and removes a client-side re-derivation that could drift.
+
+    ``TASKS_OFFLINE`` used to be ``bool(offline_projects)``. That is what made
+    the banner claim a total outage over eight healthy projects' rows carried
+    in the very same payload — one unreachable root out of nine was enough.
+    Collapsing any of these four into the others reintroduces that lie.
     """
     config: DashboardConfig = request.app.state.config
     http_client: httpx.AsyncClient = request.app.state.http_client
-    # Single-pass: fetch_tasks once per project, derive both active rows and
-    # done counts from the same snapshot — no second fetch_statuses round-trip.
-    active, offline_projects, done_counts = await collect_tasks_with_counts(
+    # Bounded fan-out, two-to-three MCP calls per project: one `statuses`-
+    # narrowed active fetch and one compact get_statuses map (concurrent),
+    # plus a page_size/offset window over terminal rows only when a terminal
+    # cap is actually requested. See _shape_one_project's docstring for why
+    # each call is needed and what the window's disclosed narrowing costs.
+    #
+    # This comment used to read "single-pass: fetch_tasks once per project ...
+    # no second fetch_statuses round-trip". That described the unnarrowed
+    # whole-tree fetch this handler was changed to stop issuing, and
+    # fetch_statuses is now exactly the second round-trip it denied.
+    (
+        active, offline_projects, done_counts,
+        degraded_projects, count_unknown_projects,
+    ) = await collect_tasks_with_counts(
         http_client, config,
         max_done_per_project=_MAX_DONE_PER_PROJECT,
         max_cancelled_per_project=_MAX_CANCELLED_PER_PROJECT,
         resolve_external=True,
     )
+    # Same enumerator the collector walks, so N here is the same N it fanned
+    # out over. ``bool(total_roots)`` guards the degenerate no-roots config:
+    # 0 == 0 would otherwise declare an outage with nothing configured to fail.
+    total_roots = len(_all_project_roots(config))
+    # "No root succeeded" — the three lists are disjoint by construction (each
+    # root appends to exactly one of them, then ``continue``s), so a root that
+    # is in neither of these two either produced rows or produced rows with an
+    # unknown count; both veto the flag. A set, not a sum, so a duplicate
+    # label can only ever UNDERcount and fail safe (flag stays False).
+    no_rows_anywhere = (
+        len(set(offline_projects) | set(degraded_projects)) == total_roots
+    )
+    # ...and the same N goes on the wire as TASKS_PROJECT_COUNT, so the banner
+    # denominates over the population its numerator is drawn from.
     return JSONResponse(
         {
             'ACTIVE_TASKS': active,
-            'TASKS_OFFLINE': bool(offline_projects),
+            'TASKS_OFFLINE': (
+                bool(total_roots) and bool(offline_projects) and no_rows_anywhere
+            ),
             'TASKS_OFFLINE_PROJECTS': offline_projects,
+            'TASKS_DEGRADED_PROJECTS': degraded_projects,
+            'TASKS_COUNT_UNKNOWN_PROJECTS': count_unknown_projects,
+            'TASKS_PROJECT_COUNT': total_roots,
             'DONE_COUNTS': done_counts,
         }
     )
@@ -1056,8 +1158,12 @@ async def api_performance(request: Request) -> JSONResponse:
 # only its message arg — NOT the response body — so the cap defends
 # against long message strings rather than response-body leakage.  The
 # WARNING log still records the full untruncated exception text.
-# Intentionally cancel-handler-scoped for now; other proxy handlers can
-# adopt the same constant if they gain an equivalent truncation path.
+# Also adopted by _scheduler_proxy, whose hand-rolled `str(exc)[:200]` was the
+# "equivalent truncation path" this comment anticipated; the name is kept for
+# its original site rather than renamed across both.  Note the two caps differ
+# slightly in what they bound: the cancel handler truncates str(exc) and then
+# prefixes the type, while _scheduler_proxy truncates the already-rendered
+# 'Type: message' — so the type name there is inside the cap, never after it.
 _CANCEL_DETAIL_EXC_CHAR_LIMIT = 200
 
 
@@ -1124,7 +1230,14 @@ async def api_curator_cancel(request: Request) -> JSONResponse:
             ValueError,
         ) as exc:
             logger.warning('cancel_ticket failed for %s: %s', url, exc)
-            raise ValueError(
+            # PreformattedFanoutError, not ValueError: the message below is
+            # already a rendered 'Type: message', and first_success renders
+            # every caught exception through describe_exc — which would
+            # prepend a second type name, surfacing 'ValueError: ConnectError:
+            # refused' in the 502 detail and the offline pill. See that
+            # class's docstring. str(exc) (NOT the composed string) is what
+            # gets truncated, so the cap bounds the exception text alone.
+            raise PreformattedFanoutError(
                 f'{type(exc).__name__}: {str(exc)[:_CANCEL_DETAIL_EXC_CHAR_LIMIT]}'
             ) from exc
         if result.get('error') == 'not_found':
@@ -1309,6 +1422,7 @@ async def api_scheduler(request: Request) -> JSONResponse:
         events_by_task,
         offline_projects,
         paused_projects,
+        recovery_events,
     ), snapshot_at = await get_scheduler_snapshot(http_client, config)
     return JSONResponse(
         redux_api.shape_scheduler(
@@ -1318,6 +1432,7 @@ async def api_scheduler(request: Request) -> JSONResponse:
             events_by_task=events_by_task,
             offline_projects=offline_projects,
             paused_projects=paused_projects,
+            recovery_events=recovery_events,
             snapshot_at=snapshot_at,
         )
     )
@@ -1360,8 +1475,18 @@ async def _scheduler_proxy(
             httpx.HTTPStatusError,
             ValueError,
         ) as exc:
-            logger.warning('%s failed for %s: %s', tool_name, url, exc)
-            raise ValueError(str(exc)[:200]) from exc
+            # describe_exc, not the bare exc: several exceptions on this path
+            # stringify to '' (most importantly httpx.PoolTimeout, i.e. THIS
+            # client's pool is saturated rather than the server being down), so
+            # a bare str(exc) made both this WARNING and the 502 detail
+            # content-free.  PreformattedFanoutError, not ValueError: the
+            # message is already a rendered 'Type: message' and first_success
+            # renders every caught exception through describe_exc again, which
+            # would prepend a second type name.  Mirrors the cancel_ticket
+            # fan-out above — the two proxies must render errors identically.
+            detail = describe_exc(exc)
+            logger.warning('%s failed for %s: %s', tool_name, url, detail)
+            raise PreformattedFanoutError(detail[:_CANCEL_DETAIL_EXC_CHAR_LIMIT]) from exc
         # Guard the not_found mapping with isinstance: an MCP tool that
         # returns a list or None (buggy/older server) would AttributeError
         # on `.get(...)` and escape as a 500.  Defensive at the single
@@ -1730,11 +1855,33 @@ async def api_escalation_analytics(request: Request) -> JSONResponse:
     cache forever in front of the very walk it protects.
     """
     config: DashboardConfig = request.app.state.config
+    http_client: httpx.AsyncClient = request.app.state.http_client
     project_dirs = _analytics_project_dirs(config)
     key = str(project_dirs)
 
     async def _refresh() -> dict:
-        return await asyncio.to_thread(build_escalation_analytics, project_dirs)
+        # The pins_recovery fan-out is async and MUST stay on this side of the
+        # to_thread boundary: build_escalation_analytics is the pure-sync
+        # archive walker, and an MCP round-trip inside it would block a worker
+        # thread on the network. It runs inside _refresh (not per request) so
+        # it is paid only on a cache miss, giving the annotation the same ~60s
+        # freshness as the payload it rides in — a fresher annotation could not
+        # be shown anyway, since the cache serves the whole dict.
+        #
+        # fetch_pins_recovery already isolates per-project failures (an
+        # unreachable orchestrator maps to None, i.e. unknown, and never sinks
+        # its siblings). This guard covers only the unexpected: whatever the
+        # cause, the analytics tab must still render, one annotation short.
+        try:
+            pins = await fetch_pins_recovery(http_client, config.escalation_urls)
+        except Exception as exc:  # noqa: BLE001 — the tab must survive this
+            logger.warning(
+                'pins_recovery fan-out failed (analytics served unannotated): %s', exc,
+            )
+            pins = None
+        return await asyncio.to_thread(
+            build_escalation_analytics, project_dirs, pins_by_project=pins,
+        )
 
     result = await _analytics_cache.get_or_refresh(
         key, _refresh, cache_ok=archive_scan_succeeded,

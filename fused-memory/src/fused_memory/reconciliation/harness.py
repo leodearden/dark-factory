@@ -26,6 +26,7 @@ from fused_memory.backends.falkor_indices import (
     expected_index_set,
     normalize_index_records,
 )
+from fused_memory.backends.mem0_client import is_missing_collection_error
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.mcp_tools.scheduler_state import read_scheduler_state
 from fused_memory.models.reconciliation import (
@@ -200,6 +201,38 @@ _DEAD_OWNER_STORM_FINDING: dict[str, Any] = {
 # duration), long enough to filter transient findings.
 _INTEGRITY_FINDING_RECURRENCE_THRESHOLD = 4
 
+# Task 3049 amendment: hard ceiling on the EFFECTIVE value of
+# config.max_backlog_remediation_deferrals, derived from the threshold above so
+# the two can never desynchronise.
+#
+# Derivation.  A deferred cycle produces ONE completed run (the parent) instead
+# of the usual two (parent + remediation), and _finding_persistence_count counts
+# completed runs that re-flag a finding.
+#
+# The count the gate reads must include the remediation run's OWN re-flag.
+# _run_remediation_pass calls journal.complete_run(run_id, 'completed') and
+# journal.update_run_stage_reports(run_id, ...) BEFORE reaching the persistence
+# gate, and the findings still actionable at that gate are by construction the
+# ones in that same run's integrity_check.items_flagged.  So the cycle that
+# finally remediates after D consecutive deferrals reads
+#
+#     persistence = D (deferred parents) + 1 (this cycle's parent)
+#                     + 1 (this cycle's own remediation run)
+#                 = D + 2
+#
+# The un-deferred baseline (D = 0) is therefore 2 — pinned by
+# test_harness.py::...unresolved_after_remediation_suppressed, which asserts
+# persistence == 2 with no prior runs seeded — and escalation fires on the
+# SECOND failed remediation, matching the module note above that a threshold of
+# 4 'fires after 2 complete reconciliation cycles'.
+#
+# Requiring D + 2 < _INTEGRITY_FINDING_RECURRENCE_THRESHOLD, i.e.
+# D <= THRESHOLD - 3, preserves what that counter MEANS: 'this finding recurs
+# DESPITE remediation'.  Above the ceiling, a backlogged project would escalate
+# recon_integrity_issue on the FIRST failed remediation instead of the second —
+# a throughput lever silently changing escalation semantics.
+_MAX_BACKLOG_REMEDIATION_DEFERRALS = _INTEGRITY_FINDING_RECURRENCE_THRESHOLD - 3
+
 # Task 1669: suppress re-firing of a finding whose matching escalation was
 # resolved within this window.  Beyond it, a recurrence re-escalates so a
 # re-emerging problem is not hidden forever.  Value is a policy threshold —
@@ -340,6 +373,32 @@ class TierConfig:
     memory_limit: int = 250
 
 
+def is_backlog_size(buffer_size: int, config) -> bool:
+    """True iff ``buffer_size`` puts a project in backlog mode.
+
+    Task 3049 — the SINGLE definition of the backlog-mode threshold.  Three
+    behaviours key off 'is this project backlogged': BacklogIterator's decision
+    to drain in chunks, the opus/sonnet tier selection, and ``_maybe_remediate``'s
+    decision to defer its inline remediation pass.  All three call this, so a
+    retune of either knob moves them together and they cannot desynchronise.
+
+    Deliberately a module-level PURE function over (size, config) rather than a
+    harness method: ``BacklogIterator`` holds its own injected ``config`` and
+    ``buffer``, and reaching through to the harness would silently compute the
+    answer against the harness's objects instead of the iterator's.
+
+    Args:
+        buffer_size: Buffered event count for the project.
+        config: Any object exposing ``buffer_size_threshold`` and
+            ``opus_threshold_ratio``.
+
+    Returns:
+        ``size > buffer_size_threshold * opus_threshold_ratio``, strictly: at
+        exactly the threshold the project is NOT in backlog mode.
+    """
+    return buffer_size > config.buffer_size_threshold * config.opus_threshold_ratio
+
+
 def build_stale_run_diagnostics(
     run: ReconciliationRun,
     lock_holder: str | None,
@@ -397,12 +456,27 @@ def _cycle_summary_ledger_write_missing(report: object, stage_prefix: str) -> bo
 
     *stage_prefix* is ``'stage1'`` or ``'stage2'``, selecting the
     ``<prefix>_cycle_summary_ledger_written`` /
-    ``<prefix>_cycle_summary_degraded_backstop`` stat names.
+    ``<prefix>_cycle_summary_degraded_backstop`` /
+    ``<prefix>_cycle_summary_write_recovered_backstop`` stat names.
     """
     stats = getattr(report, 'stats', None)
     if not isinstance(stats, dict):
         return False
     if stats.get(f'{stage_prefix}_cycle_summary_degraded_backstop') is True:
+        return False
+    if stats.get(f'{stage_prefix}_cycle_summary_write_recovered_backstop') is True:
+        # Task 4186: the write-recovered arm has already re-attempted AND
+        # CONFIRMED a landed row for this identity — it leaves
+        # ``<prefix>_cycle_summary_ledger_written`` at its in-stage 0 by
+        # design, so without this clause the driver's ``finally`` would
+        # re-fire the arm after the pre-Stage-3 flush (the caller that makes
+        # a pre-``finally`` marker reachable at all) already recovered it:
+        # duplicating the best-effort Mem0 mirror write and the pool-cap
+        # trim, and logging a second, misleading
+        # ``..._cycle_summary_write_recovered`` WARNING for one recovery.
+        # ``is True`` ONLY — a ``False``/absent marker means the attempt did
+        # not confirm (writer returned falsy or raised), so the ``finally``
+        # must still get its last chance.
         return False
     return stats.get(f'{stage_prefix}_cycle_summary_ledger_written') == 0
 
@@ -430,6 +504,13 @@ def _stage1_ledger_write_missing(report: object) -> bool:
     ``stats['stage1_cycle_summary_degraded_backstop'] = True``), so the two
     arms of ``_ensure_stage1_cycle_summary`` can never double-process the
     same run.
+
+    Likewise excludes a report whose write-recovery already CONFIRMED a
+    landed row (``stats['stage1_cycle_summary_write_recovered_backstop'] is
+    True``, task 4186), so the driver's ``finally`` does not re-fire the arm
+    after the pre-Stage-3 flush recovered it. ``is True`` only: a ``False``
+    marker means that attempt did not confirm, and the ``finally`` keeps its
+    last chance.
 
     Returns False for anything whose ``.stats`` isn't a dict — including a
     non-``StageReport`` object (e.g. a plain dict, the shape
@@ -469,6 +550,13 @@ def _stage2_ledger_write_missing(report: object) -> bool:
     (stamped ``stats['stage2_cycle_summary_degraded_backstop'] = True``), so
     the two arms of ``_ensure_stage2_cycle_summary`` can never double-process
     the same run.
+
+    Likewise excludes a report whose write-recovery already CONFIRMED a
+    landed row (``stats['stage2_cycle_summary_write_recovered_backstop'] is
+    True``, task 4186), so the driver's ``finally`` does not re-fire the arm
+    after the pre-Stage-3 flush recovered it. ``is True`` only: a ``False``
+    marker means that attempt did not confirm, and the ``finally`` keeps its
+    last chance.
 
     Returns False for anything whose ``.stats`` isn't a dict — including a
     non-``StageReport`` object (e.g. a plain dict, the shape
@@ -609,6 +697,15 @@ class ReconciliationHarness:
         # ONE loud recon_resume_failure_storm escalation instead of silent churn.
         self._resume_failures: deque[tuple[datetime, str]] = deque()
         self._last_resume_failure_storm_escalation_at: datetime | None = None
+
+        # Task 3049 lever 1: per-project count of CONSECUTIVE full cycles whose
+        # inline remediation tail was deferred because the project was still in
+        # backlog mode (see _maybe_remediate).  Reset to 0 the moment a
+        # remediation pass actually dispatches, so it measures the current
+        # deferral streak, not lifetime deferrals.  Deliberately in-memory:
+        # a restart resets every streak to 0, which only makes remediation run
+        # SOONER than the bound would have — the fail-safe direction.
+        self._remediation_deferrals: dict[str, int] = {}
 
         # Usage gate (multi-account cap failover)
         self.usage_gate: UsageGate | None = None
@@ -1399,6 +1496,9 @@ class ReconciliationHarness:
             None when statuses is empty (fail-open: no supersede attempted, and
             no memory-service calls are made).  Otherwise a record dict:
               - found=False when no cached project_status_correction memory exists.
+              - found=False plus collection_missing=True when the project's Mem0
+                collection was never provisioned — an empty result, NOT an
+                error (task 2949); logged at INFO so found=False stays legible.
               - diverged=False, superseded=False when the cached memory matches
                 the live census (no-op).
               - diverged=True, superseded=True, memory_id, old, new when the
@@ -1414,10 +1514,46 @@ class ReconciliationHarness:
             return None
 
         try:
-            memories = await self.memory.get_memories_by_metadata(
-                project_id=project_id,
-                filters={'kind': 'project_status_correction'},
-            )
+            try:
+                memories = await self.memory.get_memories_by_metadata(
+                    project_id=project_id,
+                    filters={'kind': 'project_status_correction'},
+                )
+            except Exception as exc:
+                # A project whose Qdrant collection was never provisioned has no
+                # cached corrections — an EMPTY RESULT, not a failed read.  Left
+                # to the outer handler it would return an `error` record that
+                # Stage 3 re-flags as an unresolved integrity issue every cycle
+                # (task 2949).  Narrow by construction: anything else — a 500, a
+                # TimeoutError, any other exception — re-raises into the outer
+                # handler unchanged, so real failures still surface loudly.
+                #
+                # DELIBERATELY SCOPED to this call site.  The same un-provisioned
+                # collection still raises from every other Mem0 read in the cycle
+                # (targeted.py, standing_decision_writer.py, summary_pool.py,
+                # scope_freshness.py, stages/task_knowledge_sync.py all reach the
+                # same scroll_by_metadata), so a brand-new project can still see
+                # errors from those paths.  Task 2949 scopes the fix to the
+                # status_correction path and keeps scroll_by_metadata's
+                # no-silent-fail contract untouched for its other callers —
+                # including hot pool-GC loops that would pay for a proactive
+                # collection_exists round-trip.  Generalising the degradation to
+                # the whole read surface is filed as a follow-up.
+                if not is_missing_collection_error(exc):
+                    raise
+                logger.info(
+                    'reconciliation.status_correction_collection_missing',
+                    extra={'project_id': project_id},
+                )
+                return {
+                    'available': True,
+                    'found': False,
+                    'diverged': False,
+                    'superseded': False,
+                    # Distinguishes "collection absent" from "collection
+                    # genuinely empty" for an operator reading found=False.
+                    'collection_missing': True,
+                }
             if not memories:
                 return {
                     'available': True,
@@ -2441,7 +2577,9 @@ class ReconciliationHarness:
     async def _select_tier(self, project_id: ProjectId) -> TierConfig:
         """Choose model tier based on buffer size."""
         buffer_count = (await self.buffer.get_buffer_stats(project_id)).get('size', 0)
-        use_opus = buffer_count > (self.config.buffer_size_threshold * self.config.opus_threshold_ratio)
+        # Same predicate as BacklogIterator.should_iterate and the remediation
+        # deferral gate (task 3049): 'backlogged' means one thing here.
+        use_opus = is_backlog_size(buffer_count, self.config)
 
         if use_opus:
             return TierConfig(
@@ -3068,6 +3206,15 @@ class ReconciliationHarness:
 
         # Fetch filtered task tree once for the whole cycle (ref: task 455)
         filtered_task_tree = await self._fetch_filtered_task_tree(project_root)
+        # Task 4115: the instant every heartbeat_at in filtered_task_tree was
+        # read. Stamped HERE, immediately after the fetch returns — not later,
+        # e.g. at the _maybe_remediate call below — because the S1->S3 stage
+        # loop that follows is minutes of LLM work and the remediation
+        # live-workflow gate's heartbeat TTL is only 10 minutes (task 2964).
+        # Threaded through to _maybe_remediate -> _run_remediation_pass so the
+        # gate ages a cited task's heartbeat against the actual read, not a
+        # fresh clock taken well after it.
+        filtered_task_tree_fetched_at = datetime.now(UTC)
 
         # Fetch authoritative task-count census and cross-verify against tree (task 1785)
         statuses = await self._fetch_task_count_census(project_root)
@@ -3142,6 +3289,50 @@ class ReconciliationHarness:
 
                     current_stage_name = stage_key
                     _active.stage(current_stage_name)
+
+                    # Task 4186 — pre-Stage-3 cycle_summary flush.
+                    #
+                    # (1) WHY BEFORE STAGE 3, not in the finally: Stage 3's
+                    #     presence check is ledger-PRIMARY
+                    #     (get_cycle_summary_presence -> get_by_identity) and its
+                    #     prompt rules `ledger_available:true, present:false`
+                    #     GENUINELY ABSENT -> missing_knowledge / actionable /
+                    #     reconstruct, which _maybe_remediate below turns into a
+                    #     real Stage 1 + Stage 2 LLM pass. A CURRENT-cycle in-stage
+                    #     write failure must therefore be re-attempted before Stage
+                    #     3 is dispatched; the finally's re-attempt lands after both
+                    #     Stage 3 and remediation, too late to be seen.
+                    # (2) WHY AT THE TOP OF THE STAGE-3 ITERATION, not right after
+                    #     Stage 2 returns: `current_stage_name` is already
+                    #     'integrity_check' here, so _ensure_stage1_cycle_summary's
+                    #     arm 1 (fabricate-on-raise, gated
+                    #     `current_stage_name == memory_consolidator and no report`)
+                    #     is structurally unreachable and ONLY the write-recovered
+                    #     arms can fire. Anchoring the flush to the READER's
+                    #     dispatch also keeps it correct if the stage list is ever
+                    #     reordered, and it naturally no-ops on a resumed run whose
+                    #     Stage 3 is skipped above.
+                    # (3) WHY THIS IS SAFE: both methods are already never-raise
+                    #     (each swallows BaseException), shield their writes, and
+                    #     are idempotent on the ledger's 5-part identity
+                    #     (ON CONFLICT) — so this is a pure REORDER of arms that
+                    #     would have fired anyway, and can never manufacture a row
+                    #     the cycle would not otherwise have ended with.
+                    #
+                    # The finally-block call STAYS: it remains the terminal
+                    # backstop for paths this flush cannot reach (a stage that
+                    # raised before Stage 3, an interrupted/resumed run) and the
+                    # last chance after a flush attempt that did not CONFIRM (the
+                    # write-missing predicate excludes only a marker that is True).
+                    # _run_remediation_pass carries the identical flush; all four
+                    # sites go through _flush_cycle_summaries, so the arms and
+                    # their load-bearing Stage-1-before-Stage-2 order cannot
+                    # drift between drivers or between flush and finally.
+                    if stage_key == StageId.integrity_check.value:
+                        await self._flush_cycle_summaries(
+                            run, run_id, project_id, current_stage_name,
+                            cycle_start_time,
+                        )
 
                     # Apply tier limits, prior S3 findings, cycle fence, and task tree to Stage 1
                     if isinstance(stage, MemoryConsolidator):
@@ -3232,10 +3423,13 @@ class ReconciliationHarness:
                     await self._spawn_judge(run_id, project_id)
 
                 # Remediation pass: thread scope resolved above (task 1163) and pass
-                # pre-fetched tree to avoid a redundant fetch (ref: task 478).
+                # pre-fetched tree to avoid a redundant fetch (ref: task 478), plus
+                # the instant it was read so the live-workflow gate ages heartbeats
+                # against that read, not a fresh clock (task 4115).
                 await self._maybe_remediate(project_id, run_id, run, tier,
                                             scope=scope,
-                                            filtered_task_tree=filtered_task_tree)
+                                            filtered_task_tree=filtered_task_tree,
+                                            filtered_task_tree_fetched_at=filtered_task_tree_fetched_at)
 
                 logger.info(
                     'reconciliation.run_completed',
@@ -3340,16 +3534,20 @@ class ReconciliationHarness:
                 )
                 raise
             finally:
-                await self._ensure_stage1_cycle_summary(
+                # TERMINAL backstop. Task 4186 hoisted a copy of this call to
+                # the top of the Stage-3 iteration above (the pre-Stage-3
+                # flush); this stays as the last resort for the paths that flush
+                # cannot reach — a stage that raised before Stage 3, an
+                # interrupted/resumed run — and as the second attempt after a
+                # flush attempt that did not CONFIRM. A flush that DID confirm
+                # makes it no-op via _cycle_summary_ledger_write_missing's
+                # write-recovered exclusion, so one recovery logs one WARNING.
+                # Stays before update_run_stage_reports so the persisted
+                # stage_reports copy captures whatever markers either arm
+                # stamped; the Stage-1-strictly-before-Stage-2 order the pair
+                # fires in is single-sourced on the helper (task 3732).
+                await self._flush_cycle_summaries(
                     run, run_id, project_id, current_stage_name, cycle_start_time,
-                )
-                # Strictly AFTER the Stage 1 arm (task 3732): that arm is
-                # pre-existing, load-bearing behaviour and a Stage 2 backstop
-                # fault must never be able to starve it. Both stay before
-                # update_run_stage_reports so the persisted stage_reports copy
-                # captures whatever markers either arm stamped.
-                await self._ensure_stage2_cycle_summary(
-                    run, run_id, project_id, cycle_start_time,
                 )
                 await self.journal.update_run_stage_reports(run_id, run.stage_reports)
                 # Task 2744/σ: GC this run's per-run recon CLI config dir on every
@@ -3402,11 +3600,18 @@ class ReconciliationHarness:
         resolves the module-level ``write_stage{1,2}_cycle_summary`` global at
         call time, so tests patching that name still intercept the write.
 
-        Marker discipline (task 2734, corrected task 3732 amendment): the
-        writer serializes ``report.stats`` into the ledger row's
-        ``payload_json`` synchronously at call time (see ``write_cycle_summary``'s
-        docstring), so the ``<prefix>_cycle_summary_write_recovered_backstop``
-        marker has to already be on whatever report the writer sees. It is
+        Marker discipline (task 2734, corrected task 3732 amendment):
+        *writer* resolves to an ``async def`` (``write_stage{1,2}_cycle_summary``)
+        — calling it only creates a coroutine, so it serializes
+        ``report.stats`` into the ledger row's ``payload_json`` only once the
+        shielded task below takes its first step, never synchronously at call
+        time (see ``write_cycle_summary``'s docstring). Because that
+        serialization is deferred, the
+        ``<prefix>_cycle_summary_write_recovered_backstop`` marker has to
+        already be on whatever report object the writer was handed when it
+        was called — mutating the live *report* in place instead would not be
+        observed until that later first step, by which point this method may
+        already have "corrected" it back to ``False``. So the writer is
         handed a COPY stamped ``True`` rather than this method mutating the
         live *report* across the ``asyncio.shield`` boundary. That distinction
         is load-bearing on exactly the path the shield exists for: if the
@@ -3426,6 +3631,14 @@ class ReconciliationHarness:
         ``get_cycle_summary_presence`` reads — neither marker, and not
         ``<prefix>_cycle_summary_ledger_written``, which is left at its
         in-stage value of 0 either way.
+
+        Task 4186 gave the live report's marker a second reader: it is now
+        READ BACK by :func:`_cycle_summary_ledger_write_missing` as the
+        "already recovered, do not re-fire" gate, so the driver's ``finally``
+        no-ops after the pre-Stage-3 flush confirmed a row. That is precisely
+        why the live report must keep being stamped with only the CONFIRMED
+        outcome: an over-claiming ``True`` would suppress the ``finally``'s
+        last-chance re-attempt for a row that never landed.
         """
         marker = f'{stage_prefix}_cycle_summary_write_recovered_backstop'
         stamped = report.model_copy(
@@ -3486,45 +3699,68 @@ class ReconciliationHarness:
         raises propagates to the caller's swallow, so a ledger fault means no
         degraded row rather than a possible clobber.
 
+        The read runs INSIDE the ``asyncio.shield`` below, never ahead of it:
+        ``asyncio.shield`` only protects work once its coroutine exists as its
+        own Task, so an unshielded read ahead of the shield would raise
+        ``CancelledError`` on exactly the already-being-cancelled path the
+        shield exists for — landing no row at all, silently, since the
+        caller swallows ``BaseException``. The shield therefore covers the
+        read and the write as one uninterruptible unit; a caller passing
+        *skip_if_row_exists=False* still performs no read at all, shielded or
+        not.
+
         Finally, when the run already carries an ``_error`` record, the arm
         stamps its outcome there as a breadcrumb rather than adding a new
         top-level ``stage_reports`` key — the same place operators already look
         for a failed cycle's diagnosis.
         """
-        # The read-back is skipped when no ledger is wired: there is then no row
-        # to clobber (and the upsert itself is a no-op). Both callers that pass
+        # ledger may be None (no ReconLedgerStore wired): there is then no row
+        # to clobber, and the upsert itself is a no-op. Both callers that pass
         # skip_if_row_exists already gate on the ledger being present, so this
         # is a type-narrowing belt-and-braces, not a live path.
         ledger = getattr(self.memory, 'recon_ledger', None)
-        if skip_if_row_exists and ledger is not None:
-            existing = await ledger.get_by_identity(
-                project_id,
-                'cycle_summary',
-                task_id='',
-                flag_type=stage_id.value,
-                run_id=run_id,
-            )
-            if existing is not None:
-                logger.info(
-                    f'reconciliation.{stage_prefix}_cycle_summary_backstop_row_present',
-                    extra={'run_id': run_id, 'project_id': project_id},
-                )
-                return
 
-        degraded_report = StageReport(
-            stage=stage_id,
-            # Whole-cycle anchor, not the stage's real start (see docstring).
-            started_at=cycle_start_time,
-            completed_at=datetime.now(UTC),
-            items_flagged=[],
-            stats={f'{stage_prefix}_cycle_summary_degraded_backstop': True},
-            # Zeroed means "unrecoverable", NOT "no work happened" (see docstring).
-            llm_calls=0,
-            tokens_used=0,
-        )
-        # Shielded against a second cancellation arriving mid-write; the write
-        # keeps running to completion in its own Task.
-        ledger_written = await asyncio.shield(writer(degraded_report))
+        async def _read_then_write() -> tuple[bool, bool | None]:
+            """Returns ``(skipped, ledger_written)``. Run as ONE shielded unit
+            (see the call site below) so a second cancellation arriving while
+            the clobber-guard read is in flight cannot separate the read from
+            the write it gates — see the skip_if_row_exists docstring
+            paragraph above.
+            """
+            if skip_if_row_exists and ledger is not None:
+                existing = await ledger.get_by_identity(
+                    project_id,
+                    'cycle_summary',
+                    task_id='',
+                    flag_type=stage_id.value,
+                    run_id=run_id,
+                )
+                if existing is not None:
+                    return True, None
+
+            degraded_report = StageReport(
+                stage=stage_id,
+                # Whole-cycle anchor, not the stage's real start (see docstring).
+                started_at=cycle_start_time,
+                completed_at=datetime.now(UTC),
+                items_flagged=[],
+                stats={f'{stage_prefix}_cycle_summary_degraded_backstop': True},
+                # Zeroed means "unrecoverable", NOT "no work happened" (see docstring).
+                llm_calls=0,
+                tokens_used=0,
+            )
+            return False, await writer(degraded_report)
+
+        # Shielded against a second cancellation arriving mid-read or
+        # mid-write; the read-then-write keeps running to completion in its
+        # own Task even if this method's own task is cancelled again.
+        skipped, ledger_written = await asyncio.shield(_read_then_write())
+        if skipped:
+            logger.info(
+                f'reconciliation.{stage_prefix}_cycle_summary_backstop_row_present',
+                extra={'run_id': run_id, 'project_id': project_id},
+            )
+            return
         logger.warning(
             f'reconciliation.{stage_prefix}_cycle_summary_backstop_fired',
             extra={
@@ -3537,6 +3773,54 @@ class ReconciliationHarness:
         if isinstance(error_record, dict):
             error_record[f'{stage_prefix}_cycle_summary_backstop_written'] = ledger_written
 
+    async def _flush_cycle_summaries(
+        self,
+        run: ReconciliationRun,
+        run_id: str,
+        project_id: str,
+        current_stage_name: str | None,
+        anchor: datetime,
+    ) -> None:
+        """Fire both cycle-summary backstop arms for *run_id*, Stage 1 first.
+
+        Single-sourced call pair for the FOUR sites that need it — each of the
+        two S1→S2→S3 drivers (:meth:`run_full_cycle` and
+        :meth:`_run_remediation_pass`) calls it twice:
+
+        - as task 4186's **pre-Stage-3 flush**, at the top of the Stage-3
+          iteration, so a current-cycle in-stage write failure is re-attempted
+          BEFORE Stage 3's ledger-primary presence check can read the row as
+          genuinely absent (the full why lives at those call sites);
+        - from its ``finally``, as the **terminal backstop** for the paths the
+          flush cannot reach and as the last chance after a flush attempt that
+          did not CONFIRM.
+
+        It exists because the pair's ORDER is load-bearing and must not be able
+        to drift between those sites: Stage 1 runs STRICTLY FIRST so a Stage-2
+        backstop fault can never starve that pre-existing arm (task 3732). That
+        is the same argument that put the arm BODIES in
+        :meth:`_reattempt_cycle_summary_write` /
+        :meth:`_write_degraded_cycle_summary` — "so a fix to either arm cannot
+        be applied to one stage and forgotten on the other" — applied one level
+        up, to the sequence itself.
+
+        *anchor* is the cycle-anchor timestamp the degraded-synth paths stamp
+        when a stage's real ``started_at`` is unrecoverable: ``cycle_start_time``
+        on a full cycle, ``run.started_at`` on a remediation pass (that driver
+        has no separate local). *current_stage_name* is read only by Stage 1's
+        arm-1 gate.
+
+        Never raises: both callees swallow ``BaseException`` themselves and
+        shield their own writes, which is what makes it safe to await unshielded
+        from a ``finally``.
+        """
+        await self._ensure_stage1_cycle_summary(
+            run, run_id, project_id, current_stage_name, anchor,
+        )
+        await self._ensure_stage2_cycle_summary(
+            run, run_id, project_id, anchor,
+        )
+
     async def _ensure_stage1_cycle_summary(
         self,
         run: ReconciliationRun,
@@ -3547,10 +3831,11 @@ class ReconciliationHarness:
     ) -> None:
         """Guarantee a Stage 1 ``cycle_summary`` ledger row exists for *run_id*.
 
-        Structural backstop with two independent arms, both firing from the
-        harness's two S1→S2→S3 drivers' ``finally`` blocks
-        (:meth:`run_full_cycle` and :meth:`_run_remediation_pass`) so this
-        runs on every exit path of either:
+        Structural backstop with two independent arms, both firing through
+        :meth:`_flush_cycle_summaries` — which the harness's two S1→S2→S3
+        drivers (:meth:`run_full_cycle` and :meth:`_run_remediation_pass`)
+        call from their ``finally`` blocks, so this runs on every exit path of
+        either, and again as task 4186's pre-Stage-3 flush:
 
         - **Arm 1** (task 2440) — Stage 1's own turn raised before ``run()``
           could return a report at all (its in-stage write,
@@ -3703,8 +3988,8 @@ class ReconciliationHarness:
         Stage 2 ran but its row did not land (task 3732).
 
         Stage-2 counterpart of :meth:`_ensure_stage1_cycle_summary`, fired
-        from the same two S1→S2→S3 drivers' ``finally`` blocks
-        (:meth:`run_full_cycle` and :meth:`_run_remediation_pass`), and
+        from the same :meth:`_flush_cycle_summaries` call pair (both S1→S2→S3
+        drivers' ``finally`` blocks, plus task 4186's pre-Stage-3 flush), and
         deliberately NARROWER than the Stage 1 method in one decisive way:
         it has no analogue of Stage 1's arm 1 (synthesize a row when the
         stage produced no report at all). Fabricating a summary for a cycle
@@ -3808,8 +4093,9 @@ class ReconciliationHarness:
 
         Must never raise: awaited unshielded in the ``finally``, immediately
         before ``update_run_stage_reports``, and AFTER
-        :meth:`_ensure_stage1_cycle_summary` so a fault here can never starve
-        that pre-existing arm. An exception escaping would replace whatever
+        :meth:`_ensure_stage1_cycle_summary` (an order now single-sourced on
+        :meth:`_flush_cycle_summaries`) so a fault here can never starve that
+        pre-existing arm. An exception escaping would replace whatever
         exception is already propagating and skip that persistence call, so
         the body swallows ``BaseException`` and each write itself runs under
         ``asyncio.shield`` to survive a second cancellation arriving
@@ -4245,6 +4531,28 @@ class ReconciliationHarness:
             )
             return False
 
+    async def _backlog_state(self, project_id: str) -> tuple[bool, int]:
+        """``(in_backlog, buffer_size)`` from ONE buffer read.
+
+        Task 3049: the pair is returned together so a caller that both gates on
+        the answer and reports the depth (``_maybe_remediate``'s deferral log)
+        uses the SAME number for both.  Two separate reads could straddle an
+        arrival or a drain and log a depth at or below the threshold next to a
+        'deferred because backlogged' message.
+
+        The read is deliberately FRESH rather than a flag threaded down from
+        BacklogIterator: that makes the gate stateless and self-terminating —
+        as the backlog drains the buffer falls back under the threshold and
+        remediation resumes on its own, notably on the
+        ``backlog_final_consolidation`` pass which runs after the chunks with
+        a drained buffer. It also correctly covers the non-iterator path, where
+        a plain full cycle whose buffer has meanwhile grown past the threshold
+        defers too. Cost is one indexed COUNT(*) against a ~945s cycle.
+        """
+        stats = await self.buffer.get_buffer_stats(project_id)
+        size = stats.get('size', 0)
+        return is_backlog_size(size, self.config), size
+
     async def _maybe_remediate(
         self,
         project_id: str,
@@ -4254,8 +4562,25 @@ class ReconciliationHarness:
         *,
         scope: ProjectScope,
         filtered_task_tree: FilteredTaskTree | None = None,
+        filtered_task_tree_fetched_at: datetime | None = None,
     ) -> None:
-        """Extract Stage 3 findings from the parent run and trigger remediation if needed."""
+        """Extract Stage 3 findings from the parent run and trigger remediation if needed.
+
+        Task 3049 lever 1 — this runs as an INLINE TAIL of every completed
+        run_full_cycle, so in backlog mode every BacklogIterator chunk drags its
+        own zero-event remediation pass along behind it (measured at ~44% of
+        backlog-mode drain wall-clock on reify, 2026-07-25).  The gate just
+        before the _run_remediation_pass dispatch below defers that tail while
+        the project is still in backlog mode, bounded by
+        config.max_backlog_remediation_deferrals.  See the comment at the gate
+        for why deferring is lossless and self-terminating.
+
+        filtered_task_tree_fetched_at must accompany filtered_task_tree: it is
+        the instant that tree was read (stamped by run_full_cycle right after
+        its fetch, task 4115). This method is a pure pass-through — it forwards
+        the pair verbatim to _run_remediation_pass without re-stamping or
+        defaulting either value.
+        """
         try:
             s3_report = parent_run.stage_reports.get('integrity_check')
             if s3_report is None:
@@ -4395,6 +4720,68 @@ class ReconciliationHarness:
             if not to_remediate:
                 return
 
+            # Task 3049 lever 1: while the project is still in backlog mode,
+            # DEFER this inline remediation pass rather than running it now.
+            #
+            # Placed here — after the non-actionable, placeholder and
+            # open-escalation filters — so a deferral is only ever recorded for
+            # findings that would genuinely have been remediated; the earlier
+            # filters' logging/escalation side effects still happen every cycle.
+            #
+            # WHY THIS IS LOSSLESS: the parent run's Stage-3 findings were
+            # already persisted by update_run_stage_reports (in run_full_cycle,
+            # BEFORE this method is called) and are forward-fed into the next
+            # cycle's S1/S2 by _get_prior_s3_findings.  Deferring therefore
+            # delays remediation; it never drops a finding.
+            #
+            # WHY IT SELF-TERMINATES: _backlog_state re-reads the buffer, so
+            # as the backlog drains the answer flips on its own — notably on
+            # BacklogIterator's backlog_final_consolidation pass, which runs
+            # against a drained buffer.  No flag has to be threaded down, and
+            # the non-iterator path (a plain cycle whose buffer meanwhile grew
+            # past the threshold) is covered by the same predicate.
+            #
+            # WHY THE BOUND: without it, a project whose buffer never falls
+            # below the threshold would starve remediation indefinitely.
+            # max_backlog_remediation_deferrals caps the consecutive streak; 0
+            # disables deferral entirely (exact pre-3049 behaviour).
+            #
+            # WHY THE CEILING: the streak also has to leave the persistence
+            # counter's meaning intact — see _MAX_BACKLOG_REMEDIATION_DEFERRALS.
+            # The config field is schema-bounded to the same ceiling; the min()
+            # here is what ENFORCES it at the point of use, so a duck-typed or
+            # hand-patched config cannot quietly buy more rope than the
+            # escalation semantics can absorb.
+            configured_deferrals = getattr(
+                self.config, 'max_backlog_remediation_deferrals', 0)
+            max_deferrals = min(configured_deferrals, _MAX_BACKLOG_REMEDIATION_DEFERRALS)
+            deferred_so_far = self._remediation_deferrals.get(project_id, 0)
+            if max_deferrals > 0 and deferred_so_far < max_deferrals:
+                # ONE buffer read, on the defer path only: the depth that gates
+                # is the depth that gets logged.  Two reads could straddle an
+                # arrival or a drain and print a size at or below the threshold
+                # next to a 'deferred because backlogged' message.
+                in_backlog, buffer_size = await self._backlog_state(project_id)
+                if in_backlog:
+                    self._remediation_deferrals[project_id] = deferred_so_far + 1
+                    logger.info(
+                        'reconciliation.remediation_deferred_backlog',
+                        extra={
+                            'project_id': project_id,
+                            'parent_run_id': parent_run_id,
+                            'deferred_finding_count': len(to_remediate),
+                            'buffer_size': buffer_size,
+                            'consecutive_deferrals': self._remediation_deferrals[project_id],
+                            'max_backlog_remediation_deferrals': max_deferrals,
+                            'configured_max_backlog_remediation_deferrals':
+                                configured_deferrals,
+                        },
+                    )
+                    return
+
+            # Dispatching (or the bound was reached) — the streak is over.
+            self._remediation_deferrals[project_id] = 0
+
             logger.info(
                 f'Remediation: {len(to_remediate)} actionable findings from run {parent_run_id}, '
                 f'triggering second pass'
@@ -4407,6 +4794,7 @@ class ReconciliationHarness:
                 project_id, parent_run_id, to_remediate, tier,
                 scope=scope,
                 filtered_task_tree=filtered_task_tree,
+                filtered_task_tree_fetched_at=filtered_task_tree_fetched_at,
             )
         except Exception as e:
             logger.error(f'Remediation check failed for run {parent_run_id}: {e}')
@@ -4425,6 +4813,7 @@ class ReconciliationHarness:
         *,
         scope: ProjectScope,
         filtered_task_tree: FilteredTaskTree | None = None,
+        filtered_task_tree_fetched_at: datetime | None = None,
     ) -> None:
         """Run a focused S1→S2→S3 pass to remediate actionable findings.
 
@@ -4437,6 +4826,17 @@ class ReconciliationHarness:
         tree is fetched via _fetch_filtered_task_tree.  Callers that already hold
         a fetched tree (e.g. run_full_cycle) should pass it through to avoid a
         redundant taskmaster round-trip.
+
+        filtered_task_tree_fetched_at must accompany filtered_task_tree and be
+        timezone-aware: it is the instant that tree was READ (task 4115),
+        consumed below to age cited tasks' heartbeats against the read rather
+        than against a fresh clock taken after this pass's S1→S2→S3 stages.
+        Ignored when filtered_task_tree is None (the self-fetch path stamps
+        its own instant); if filtered_task_tree is given without it, or with
+        a naive (tzinfo-less) datetime, falls back to datetime.now(UTC) with a
+        WARNING log — the pre-4115 behaviour existing direct callers depend on
+        for the omitted case, extended to fail loud rather than silently
+        suppressing every escalation in the pass on a malformed one.
         """
         project_root = scope.project_root
         # Defense-in-depth assert deliberately omitted.  A registry-bound check such
@@ -4470,12 +4870,74 @@ class ReconciliationHarness:
             },
         )
 
-        # Use caller-supplied tree if available; otherwise fetch (ref: task 455, task 478)
-        remediation_tree = (
-            filtered_task_tree
-            if filtered_task_tree is not None
-            else await self._fetch_filtered_task_tree(project_root)
-        )
+        # Task 4115: resolve the tree and the instant it was read as ONE unit
+        # (ref: task 455, task 478 for the caller-supplied-tree short-circuit
+        # itself), so a caller's read instant can never be paired with a tree
+        # it does not describe. Caller-supplied tree: honour the caller's read
+        # instant when given AND timezone-aware; otherwise fall back to a
+        # fresh now() with a WARNING trace — loud rather than silent, since a
+        # caller that drops or malforms the instant regresses straight back to
+        # the pre-4115 bug this task fixes (repo loud-over-silent-degradation
+        # norm). A naive (tzinfo-less) instant is treated the same as a
+        # missing one rather than handed to corroboration_for_task as-is:
+        # has_live_claimant compares it against timezone-aware heartbeats, and
+        # the resulting TypeError is caught and swallowed several frames down
+        # (see the `except Exception as _corr_exc` below), which would
+        # otherwise leave corroborated=None and silently suppress every
+        # stranded-work escalation in the pass — the opposite of this gate's
+        # fail-safe direction. The WARNING fallback is otherwise exactly the
+        # pre-4115 behaviour, which the ~30 existing direct
+        # _run_remediation_pass callers that pass a tree without an instant
+        # depend on. Self-fetch: always stamp a fresh now() — a caller instant
+        # (if one was even supplied) describes a different tree, or no tree at
+        # all, and must never leak onto the tree just fetched here.
+        #
+        # Task 2964: `_tasks_snapshot_at` is the instant the per-task snapshot
+        # below (task_by_id, and therefore every heartbeat_at it carries) was
+        # read. It is threaded into corroboration_for_task ONLY to age-check
+        # that snapshot's own heartbeat_at against DEFAULT_HEARTBEAT_TTL, so it
+        # must be the snapshot's clock, not the clock at the moment the gate
+        # runs: the gate fires AFTER the focused S1→S2→S3 stages, i.e. after
+        # minutes of LLM work, and the TTL is 10 minutes — comparable to a
+        # whole pass. Using a fresh now() there would age a heartbeat that was
+        # fresh when read past the TTL purely because the pass was slow,
+        # reporting corroborated=False for a task that is in fact live and
+        # filing a spurious stranded-work escalation — task 4115 found this
+        # happening on exactly the caller-supplied-tree path, the one
+        # production always takes (run_full_cycle threads its pre-stage-loop
+        # fetch straight through): this stamp used to be an unconditional
+        # datetime.now(UTC) taken here regardless of which tree was in play,
+        # so a caller's own (earlier, more accurate) read instant was silently
+        # discarded. Pinning the clock to the read makes the verdict "was
+        # there a fresh per-task signal in the snapshot we hold" — evaluable,
+        # and biased toward suppression (the fail-safe direction) rather than
+        # toward escalating. task_by_id's own staleness is pre-existing and
+        # orthogonal.
+        _tasks_snapshot_at: datetime
+        if filtered_task_tree is not None:
+            remediation_tree = filtered_task_tree
+            if (
+                filtered_task_tree_fetched_at is not None
+                and filtered_task_tree_fetched_at.tzinfo is not None
+            ):
+                _tasks_snapshot_at = filtered_task_tree_fetched_at
+            else:
+                logger.warning(
+                    'reconciliation.remediation_tree_read_instant_missing',
+                    extra={
+                        'project_id': project_id,
+                        'parent_run_id': parent_run_id,
+                        'reason': (
+                            'naive_datetime'
+                            if filtered_task_tree_fetched_at is not None
+                            else 'not_supplied'
+                        ),
+                    },
+                )
+                _tasks_snapshot_at = datetime.now(UTC)
+        else:
+            remediation_tree = await self._fetch_filtered_task_tree(project_root)
+            _tasks_snapshot_at = datetime.now(UTC)
 
         # Task 2031/2067: a {str(task_id): task dict} map derived from
         # remediation_tree in a single pass, used by the live-workflow gate below
@@ -4513,21 +4975,6 @@ class ReconciliationHarness:
             if not isinstance(t, dict) or t.get('id') is None:
                 continue
             task_by_id[str(t.get('id'))] = t
-
-        # Task 2964: the instant task_by_id (and therefore every heartbeat_at it
-        # carries) was read. `now` is threaded into corroboration_for_task ONLY to
-        # age-check that snapshot's own heartbeat_at against DEFAULT_HEARTBEAT_TTL,
-        # so it must be the snapshot's clock, not the clock at the moment the gate
-        # runs: the gate fires AFTER the focused S1→S2→S3 stages, i.e. after minutes
-        # of LLM work, and the TTL is 10 minutes — comparable to a whole pass. Using
-        # a fresh now() there would age a heartbeat that was fresh when read past the
-        # TTL purely because the pass was slow, reporting corroborated=False for a
-        # task that is in fact live and filing a spurious stranded-work escalation.
-        # Pinning the clock to the read makes the verdict "was there a fresh
-        # per-task signal in the snapshot we hold" — evaluable, and biased toward
-        # suppression (the fail-safe direction) rather than toward escalating.
-        # task_by_id's own staleness is pre-existing and orthogonal.
-        _tasks_snapshot_at: datetime = datetime.now(UTC)
 
         current_stage_name: str | None = None
 
@@ -4653,6 +5100,29 @@ class ReconciliationHarness:
             reports = []
             for stage in stages:
                 current_stage_name = stage.stage_id.value
+
+                # Task 4186 — pre-Stage-3 cycle_summary flush, the very same
+                # call run_full_cycle makes (see the long WHY comment there);
+                # both go through _flush_cycle_summaries so the two drivers
+                # cannot drift. Same defect on this driver: a Stage-2 in-stage write that failed transiently is
+                # only re-attempted in the finally below, i.e. AFTER this pass's
+                # own Stage 3 has already read the ledger and ruled the summary
+                # genuinely absent. The stakes differ — this driver's Stage-3
+                # findings feed the persistence-gated escalation path, so a
+                # false "summary missing" here costs an escalation rather than a
+                # second remediation pass — but the window is the same one.
+                #
+                # Anchored at run.started_at because this driver has no separate
+                # cycle_start_time local, exactly as its own finally already is.
+                # The helper's Stage 1 arm is INERT here by that arm's
+                # run_type != RunType.remediation gate (a remediation pass's
+                # Stage 1 deliberately writes no summary of its own), so it can
+                # never fabricate a Stage-1 row.
+                if current_stage_name == StageId.integrity_check.value:
+                    await self._flush_cycle_summaries(
+                        run, run_id, project_id, current_stage_name,
+                        run.started_at,
+                    )
 
                 report = await stage.run(
                     [], watermark, reports, run_id, model=tier.model,
@@ -4977,20 +5447,24 @@ class ReconciliationHarness:
             )
 
         finally:
-            await self._ensure_stage1_cycle_summary(
+            # TERMINAL backstop, mirroring run_full_cycle's: task 4186 hoisted a
+            # copy of this call to the top of the Stage-3 iteration above (the
+            # pre-Stage-3 flush). This stays as the last resort for the paths
+            # that flush cannot reach — a stage that raised before Stage 3 — and
+            # as the second attempt after a flush attempt that did not CONFIRM.
+            # A flush that DID confirm makes it no-op via
+            # _cycle_summary_ledger_write_missing's write-recovered exclusion.
+            #
+            # Task 3732: unlike the helper's Stage 1 arm — which deliberately
+            # no-ops on a remediation pass, since Stage 1 skips its own summary
+            # write there — the Stage 2 backstop is wired into this driver with
+            # NO remediation exclusion: Stage 2's in-stage write is unconditional
+            # by explicit design, so a lost row here is a genuine gap. Anchored
+            # at run.started_at (this driver has no separate cycle_start_time
+            # local), and placed strictly before update_run_stage_reports so the
+            # persisted copy captures whatever markers either arm stamped.
+            await self._flush_cycle_summaries(
                 run, run_id, project_id, current_stage_name, run.started_at,
-            )
-            # Task 3732: unlike the Stage 1 arm — which deliberately no-ops on a
-            # remediation pass, since Stage 1 skips its own summary write there —
-            # the Stage 2 backstop is wired into this driver with NO remediation
-            # exclusion: Stage 2's in-stage write is unconditional by explicit
-            # design, so a lost row here is a genuine gap. Anchored at
-            # run.started_at (this driver has no separate cycle_start_time local),
-            # exactly as the Stage 1 call above. Placed strictly after it so a
-            # Stage 2 fault can never starve that arm, and strictly before
-            # update_run_stage_reports so the persisted copy captures its markers.
-            await self._ensure_stage2_cycle_summary(
-                run, run_id, project_id, run.started_at,
             )
             await self.journal.update_run_stage_reports(run_id, run.stage_reports)
             # Task 2744: GC this remediation run's per-run recon CLI config dir on
@@ -5025,11 +5499,18 @@ class BacklogIterator:
         self.time_provider = time_provider
 
     async def should_iterate(self, project_id: str) -> bool:
-        """Buffer count > 150% of trigger threshold."""
+        """Buffer count > 150% of trigger threshold.
+
+        Task 3049: the threshold has exactly ONE definition — the pure
+        module-level :func:`is_backlog_size`, which the harness's
+        ``_backlog_state`` (and through it ``_maybe_remediate``'s deferral
+        gate) and ``_select_tier`` call too.  Evaluated here against THIS
+        iterator's own injected ``config`` and ``buffer`` rather than reaching
+        through to the harness's, so a caller that constructs an iterator with
+        different collaborators gets an answer computed from them.
+        """
         stats = await self.buffer.get_buffer_stats(project_id)
-        count = stats.get('size', 0)
-        threshold = self.config.buffer_size_threshold * self.config.opus_threshold_ratio
-        return count > threshold
+        return is_backlog_size(stats.get('size', 0), self.config)
 
     async def run(self, project_id: str) -> None:
         """Process backlog in token-budgeted chunks, oldest-first.

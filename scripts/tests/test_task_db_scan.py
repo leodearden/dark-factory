@@ -537,6 +537,11 @@ def test_run_scan_cli_prints_exactly_the_render_output(tmp_path, capsys):
 # ---------------------------------------------------------------------------
 
 # --- AUDIT_EXIT_* constants ------------------------------------------------
+#
+# Numerically frozen in lockstep with repair_wiped_metadata_files.py's EXIT_*
+# ladder; guard: tests/scripts/test_repair_wiped_metadata_files.py::
+# test_exit_codes_stay_in_lockstep_with_the_shared_audit_ladder (task 3817,
+# rationale in _task_db_scan.py's module docstring).
 
 def test_audit_exit_constants_carry_the_documented_values():
     assert AUDIT_EXIT_OK == 0

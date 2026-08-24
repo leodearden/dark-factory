@@ -1579,6 +1579,7 @@ async def test_tombstone_round_trips_from_writer_to_memory_service(store, mock_c
         'deleter',
         'deleting_run_id',
         'deleted_at',
+        'absorbed_by',
         'kind',
         'record_type',
         'source',
@@ -1591,6 +1592,10 @@ async def test_tombstone_round_trips_from_writer_to_memory_service(store, mock_c
     assert tombstone['deleter'] == 'stage1_cycle_summary_trim'
     assert tombstone['deleting_run_id'] == 'run-deleter'
     assert tombstone['deleted_at'] == '2026-07-20T00:00:00+00:00'
+    # A TRIM sweep absorbs nothing into anything, so the reverse pointer is
+    # present and None (task 3133). Present, because only presence tells an
+    # auditor "nothing absorbed it" rather than "this row predates the field".
+    assert tombstone['absorbed_by'] is None
     assert tombstone['kind'] == 'cycle_summary'
     assert tombstone['record_type'] == 'ledger_stamp'
     assert tombstone['source'] == 'cycle_summary_mirror'

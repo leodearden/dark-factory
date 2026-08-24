@@ -177,6 +177,23 @@ class TestNormalizeSupersedes:
         assert normalize_supersedes(once) == once
 
 
+class TestFullUuidPredicateSingleHome:
+    """The canonical-full-UUID predicate has ONE home (task 3132, leaf η)."""
+
+    def test_module_uses_the_canonical_predicate_not_a_local_copy(self):
+        """Identity, not equality — a re-typed local copy is what INV-5 forbids.
+
+        This module legitimately IMPORTS the predicate: it calls it in
+        `validate_memory_metadata`'s `supersedes` member-shape guard and its
+        `parent_id` shape guard.  Pinned here so the surviving import is not
+        mistaken for a leftover of the retired alias and "cleaned up".
+        """
+        from fused_memory import memory_metadata as mm
+        from fused_memory.utils import validation
+
+        assert mm.is_full_uuid is validation.is_full_uuid
+
+
 class TestKindRegistry:
     """`KIND_REGISTRY` — PRD D3's closed registry, grandfathered from the census.
 

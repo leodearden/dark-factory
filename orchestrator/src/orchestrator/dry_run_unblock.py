@@ -27,6 +27,7 @@ from shared.cli_invoke import (
     is_zero_output_timeout,
 )
 from shared.config_dir import TaskConfigDir
+from shared.transcript_archive import archive_task_transcripts
 
 from orchestrator.agents.invoke import invoke_agent  # noqa: E402
 from orchestrator.agents.skill_prompt import load_skill_system_prompt
@@ -202,6 +203,12 @@ _DISALLOWED_TOOLS: list[str] = [
     'mcp__fused-memory__set_task_status',
     'mcp__fused-memory__update_task',
     'mcp__fused-memory__delete_memory',
+    # Strictly more destructive than delete_memory above (task 3133): one
+    # call deletes N records, patches M retained peers and re-homes their
+    # children. A dry run's whole premise is that it observes without
+    # mutating, so leaving this unlisted would not degrade a dry run — it
+    # would falsify it.
+    'mcp__fused-memory__consolidate_memories',
     'mcp__fused-memory__remove_task',
 ]
 
@@ -439,26 +446,121 @@ async def run_dry_run_unblock(
         result = None
     finally:
         if config_dir is not None:
-            if preserve_config_dir:
-                # Not independently reaped here: this dir lives under
-                # <worktree>/.task/, which GitOps.cleanup_worktree() removes
-                # wholesale (`git worktree remove --force`) when the worktree
-                # is torn down — see the .task/ contamination-prevention
-                # notes atop git_ops.py. The forensic window is bounded by
-                # the worktree's lifetime, not unbounded.
-                logger.warning(
-                    'dry_run_unblock: config dir preserved for forensic analysis '
-                    '(doubly-wedged investigation) for task %s → %s',
-                    task_id, config_dir.path,
-                )
-            else:
-                try:
-                    config_dir.cleanup()
-                except Exception as exc:
+            # Archival is nested in its own try/finally so the preserve-or-
+            # cleanup branch below ALWAYS runs, even when the archival above
+            # propagates. Only one thing can propagate out of it — a
+            # CancelledError from the `await` (loop teardown / SIGTERM), which
+            # is deliberately re-raised rather than swallowed — and before this
+            # hook existed the dir was unconditionally reaped on that path.
+            # This dir holds a `.credentials.json`, so letting a cancellation
+            # skip teardown would be a real (if worktree-lifetime-bounded)
+            # regression introduced purely by inserting a new await AHEAD of
+            # the teardown. TaskWorkflow._invoke's hook needs no such nesting:
+            # it sits at the END of its own finally, so re-raising there costs
+            # nothing.
+            try:
+                # Producer hook (task 3271), mirroring the archival hook in
+                # TaskWorkflow._invoke's finally (orchestrator/workflow.py).
+                # Archive the investigation's transcripts to the durable root
+                # OUTSIDE the worktree BEFORE either exit branch disposes of
+                # the dir.
+                #
+                # Deliberately ABOVE `if preserve_config_dir:`, not inside its
+                # `else`. The regression cause (commit 7a07c40820, which
+                # introduced the per-investigation config dir near the top of
+                # this function) left BOTH branches lossy: the cleanup branch
+                # rmtree's the dir outright, and the forensic preserve branch
+                # only DEFERS the loss to `git worktree remove --force`. No
+                # backstop covers the deferred case either —
+                # GitOps.cleanup_worktree composes its archival target by
+                # literal f-string, `worktree / '.task' /
+                # f'claude-config-{branch}'`, with no glob and no
+                # CONFIG_DIR_PREFIX import, so `claude-config-{task_id}-unblock`
+                # can never match it. One call here covers both exits; the
+                # preserved case is also the highest-value one, firing only on
+                # a doubly-wedged investigation.
+                #
+                # Bound OUTSIDE the inner try so a mis-shaped config surfaces
+                # rather than being mistaken for an archival failure, and so
+                # the disabled path never spins up a worker thread. Mirrors
+                # TaskWorkflow._invoke (`ta = self.config.transcript_archive;
+                # if ta.enabled and ...`) and GitOps.cleanup_worktree
+                # (`if self.transcript_archive is not None and
+                # self.transcript_archive.enabled:`), so all three producers
+                # consult the one knob identically — which is what makes the
+                # config's documented "disable archival entirely" contract true
+                # fleet-wide rather than true-for-two-of-three.
+                ta = config.transcript_archive
+                if ta.enabled:
+                    try:
+                        await asyncio.to_thread(
+                            archive_task_transcripts,
+                            config_dir.path,
+                            # Plain task_id key, no subkey:
+                            # legibility.inventory._archive_enc derives the
+                            # encoded cwd as parts[1] of the archive-root-
+                            # relative path, so a `<task_id>/unblock/...` layout
+                            # would put the literal 'unblock' there, match no
+                            # project prefix, and have _enumerate silently skip
+                            # every archived investigation. Session ids are
+                            # fresh uuid4s, so sharing the key with the task's
+                            # own roles cannot collide.
+                            task_id,
+                            # session_id=None → whole-dir sweep of
+                            # projects/**/*.jsonl, as GitOps.cleanup_worktree's
+                            # teardown backstop passes. This dir is exclusive to
+                            # THIS investigation, so nothing foreign is
+                            # over-captured, and it captures BOTH the wedged
+                            # first attempt and the fresh-session retry — the
+                            # wedge being the diagnostically interesting one —
+                            # without threading a mutable last-session-id out of
+                            # the _one_attempt closure.
+                            None,
+                            archive_root=config.project_root / ta.root,
+                        )
+                    except asyncio.CancelledError:
+                        # Cooperative cancellation is a BaseException and must
+                        # propagate; deliberately NOT caught by the except
+                        # below. The enclosing finally still reaps the dir.
+                        raise
+                    except Exception:
+                        # Defense-in-depth for a finally that awaits
+                        # cross-module work. archive_task_transcripts is total
+                        # by contract (per-file OSErrors are caught + counted
+                        # inside it, never re-raised) but its top-level
+                        # Path/archive_root construction is not individually
+                        # guarded, and this finally may be unwinding an
+                        # in-flight exception that must not be replaced. Loud,
+                        # not silent: logged as a structured fact matching the
+                        # extra= shape _record_failure already emits.
+                        logger.warning(
+                            'dry_run_unblock: transcript archival failed for task %s',
+                            task_id,
+                            exc_info=True,
+                            extra={'task_id': task_id},
+                        )
+            finally:
+                if preserve_config_dir:
+                    # Not independently reaped here: this dir lives under
+                    # <worktree>/.task/, which GitOps.cleanup_worktree()
+                    # removes wholesale (`git worktree remove --force`) when
+                    # the worktree is torn down — see the .task/
+                    # contamination-prevention notes atop git_ops.py. The
+                    # forensic window is bounded by the worktree's lifetime,
+                    # not unbounded.
                     logger.warning(
-                        'dry_run_unblock: failed to clean up config dir for task %s: %s',
-                        task_id, exc,
+                        'dry_run_unblock: config dir preserved for forensic analysis '
+                        '(doubly-wedged investigation) for task %s → %s',
+                        task_id, config_dir.path,
                     )
+                else:
+                    try:
+                        config_dir.cleanup()
+                    except Exception as exc:
+                        logger.warning(
+                            'dry_run_unblock: failed to clean up config dir for task %s: %s',
+                            task_id, exc,
+                        )
 
     # Stamp the git anchor and typed block_class onto the entry at a single
     # point so all six shapes (ok, investigation_failed, budget_exhausted,

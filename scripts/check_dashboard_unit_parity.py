@@ -230,8 +230,16 @@ def _log(message: str, *, stream=None) -> None:
 # surface this script's test suite reads (mod.parse_unit_directives,
 # mod._join_continuations) intact, so that suite is the extraction's own
 # regression net.
+#
+# find_dropins moved there too, for a sharper version of the same reason: it
+# was already forked, code-identical, between this file and
+# check_orchestrator_unit_parity.py, and check_lms_unit_parity.py would have
+# been a third copy. Re-exported on the same terms -- this suite's existing
+# find_dropins tests still call mod.find_dropins and are what proves the lift
+# was behaviour-preserving.
 from systemd_unit_parity import (  # noqa: E402  (kept beside the other parser code)
     _join_continuations,  # noqa: F401  (re-exported: read by the test suite)
+    find_dropins,
     parse_unit_directives,
 )
 
@@ -752,31 +760,6 @@ def compare_unit(
     drifts.extend(_compare_env_matches_directive(spec, repo, installed))
 
     return drifts
-
-
-def find_dropins(installed_dir: pathlib.Path, unit_name: str) -> list[pathlib.Path]:
-    """Return the ``.conf`` drop-ins systemd would layer over *unit_name*.
-
-    ``systemctl --user edit`` does not modify the unit file; it writes
-    ``<unit>.d/override.conf`` beside it, and systemd merges that over the
-    unit at load time.  Reading only ``<installed-dir>/<unit>`` is therefore
-    blind to it: a drop-in setting ``Restart=always`` or ``TimeoutStopSec=90``
-    leaves every compared directive matching while the RUNNING configuration
-    is not the committed one — the precise claim this gate exists to make
-    checkable.
-
-    Not hypothetical on this host: no dashboard unit has a drop-in today, but
-    ``~/.config/systemd/user/orchestrator-reify.service.d/`` exists, so the
-    mechanism is already in live use here.
-
-    Returns the sorted ``.conf`` files, or ``[]`` when the directory is absent
-    or holds none (systemd ignores non-``.conf`` files there, so this counts
-    exactly what would take effect).
-    """
-    dropin_dir = installed_dir / f"{unit_name}.d"
-    if not dropin_dir.is_dir():
-        return []
-    return sorted(p for p in dropin_dir.glob("*.conf") if p.is_file())
 
 
 # ---------------------------------------------------------------------------

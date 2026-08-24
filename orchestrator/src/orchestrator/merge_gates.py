@@ -34,7 +34,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from orchestrator.event_store import EventStore
-from orchestrator.git_ops import GitOps, _run
+from orchestrator.git_ops import _INDEX_LOCK_STALE_FLOOR_S, GitOps, _run
 from orchestrator.merge_types import (
     MergeOutcome,
     MergeRequest,
@@ -715,7 +715,7 @@ async def _map_advance_failure(
 
     Handles ``wip_overlap``, ``pop_conflict``, ``unmerged_state``,
     ``pop_conflict_no_advance``, ``not_descendant``, ``contaminated``,
-    and ``stash_failed``.
+    ``stash_failed``, and ``park_lock_contended``.
 
     ``stash_failed`` (task 2758) HALTS the queue and returns a distinct
     ``stash_failed`` outcome — it is a SHARED main-checkout-hygiene fault
@@ -726,6 +726,21 @@ async def _map_advance_failure(
     remain per-branch, per-task ``blocked`` with no halt — they are content
     problems specific to one branch that do NOT recur for other tasks (same
     reasoning as the ``conflict_markers`` per-branch → no-halt branch).
+
+    ``park_lock_contended`` (task 3060) does **NOT** halt, and its absence
+    from ``merge_queue._HALT_ADVANCE_RESULTS`` is deliberate.  The
+    superficial similarity to ``stash_failed`` (both mean "advance_main
+    could not safely touch project_root") hides the distinction that
+    matters: ``stash_failed`` reports a shared main-checkout-hygiene fault
+    that PERSISTS until a human cleans up, so every subsequent task would
+    fail identically; ``park_lock_contended`` reports a foreign git process
+    transiently owning project_root's index — dominantly a
+    ``git commit --only`` holding the lock across its pre-commit hook —
+    which SELF-CLEARS in seconds-to-minutes.  advance_main has already stood
+    off for the whole ``git.merge_park_lock_grace_seconds`` budget before
+    returning it, and modified nothing, so the correct disposition is a
+    per-task ``blocked`` that retries on re-dispatch.  Halting the queue for
+    it is exactly the recurring halt task 3060 removed.
 
     Does **not** handle ``cas_failed``
     (per-worker retry orchestration is a preserved difference) or the
@@ -865,6 +880,109 @@ async def _map_advance_failure(
                 f'(task {task_id})'
             ),
             dirty_files=dirty,
+        )
+
+    if result == 'park_lock_contended':
+        # TRANSIENT foreign-process contention (task 3060) — deliberately NOT
+        # a halt, and deliberately absent from merge_queue._HALT_ADVANCE_
+        # RESULTS.  Contrast stash_failed above: that is a shared
+        # main-checkout-HYGIENE fault that recurs identically for every
+        # subsequent task until a human intervenes, so collapsing it to one
+        # halt is right.  This one is a bounded, SELF-CLEARING window — a
+        # foreign `git commit --only <path>` holds project_root's index lock
+        # across its pre-commit hook — and advance_main already stood off for
+        # the whole configured grace before giving up, having modified
+        # NOTHING.  Halting the queue for it produced the 2+/day halt this
+        # branch exists to remove.
+        cas_retries.pop(task_id, None)
+        info = getattr(git_ops, '_last_park_lock_info', None) or {}
+        lock_path = info.get('lock_path') or '<unknown>'
+        age = info.get('age_seconds')
+        waited = info.get('waited_seconds')
+        age_txt = f'{age:.0f}s' if isinstance(age, int | float) else 'unknown'
+        waited_txt = f'{waited:.0f}s' if isinstance(waited, int | float) else 'unknown'
+        # Staleness keys ONLY on the age observed BEFORE the stand-off.
+        #
+        # The previous test (`waited > 0 and age > waited`) was wrong and must
+        # not be reintroduced: on the gate path `age_seconds` is re-probed
+        # AFTER the wait (git_ops.advance_main), so it always equals
+        # initial_age + waited + epsilon.  `age > waited` therefore reduces to
+        # `initial_age > -epsilon` — true for a 2-second-old live commit
+        # exactly as for an hour-old leftover — and handed destructive `rm -f`
+        # advice to every ordinary docs-direct-commit-on-main that outlived
+        # the grace.  Only a pre-wait age carries staleness information.
+        #
+        # Both isinstance guards are load-bearing: a missing key yields None,
+        # which must degrade to not-stale (no destructive advice), never
+        # raise.  And the grace is read from the side channel, NEVER through
+        # git_ops.config — this mapper's tests pass a bare MagicMock whose
+        # auto-vivified attribute would make the comparison raise TypeError.
+        # The dict is the whole input, by the same discipline as the
+        # `getattr(git_ops, '_last_park_lock_info', None) or {}` read above.
+        #
+        # And the bar is max(grace, _STALE_LOCK_FLOOR_S), never the grace
+        # alone: grace is tunable to 0 (the blessed probe-only fail-fast
+        # off-switch), at which value EVERY age exceeds it and a live
+        # half-second-old commit would be handed `rm -f`.  See
+        # _STALE_LOCK_FLOOR_S for the full rationale.
+        initial_age = info.get('initial_age_seconds')
+        grace = info.get('grace_seconds')
+        threshold = (
+            max(float(grace), _STALE_LOCK_FLOOR_S)
+            if isinstance(grace, int | float) and not isinstance(grace, bool)
+            else None
+        )
+        stale = (
+            isinstance(initial_age, int | float)
+            and not isinstance(initial_age, bool)
+            and threshold is not None
+            and initial_age > threshold
+        )
+        recovery = (
+            f' The lock was ALREADY {initial_age:.0f}s old when the merge '
+            f'worker FIRST observed it — older than the {threshold:.0f}s '
+            f'staleness floor (max of the configured {grace:.0f}s grace and '
+            f'the {_STALE_LOCK_FLOOR_S:.0f}s pre-commit budget) — so it is '
+            f'likely a crashed-git leftover rather than a live commit: '
+            f'confirm no git process is running in project_root, then clear '
+            f'it with `rm -f {lock_path}`.'
+            if stale else ''
+        )
+        # WIP-at-risk clause.  Populated ONLY on the mid-park (TOCTOU) path,
+        # where advance_main had already taken the dirty snapshot before the
+        # foreign lock appeared; empty on the pre-snapshot gate path, where
+        # no WIP is known.  Mirrors what `stash_failed` above already reports,
+        # so an operator reading either reason learns the same thing about
+        # which uncommitted work is implicated.
+        at_risk = [str(f) for f in (info.get('dirty_files') or [])]
+        wip_txt = (
+            f' Uncommitted tracked WIP in project_root at the moment of '
+            f'contention: {", ".join(at_risk[:20])}'
+            f'{f" (+{len(at_risk) - 20} more)" if len(at_risk) > 20 else ""}.'
+            if at_risk else ''
+        )
+        # WORDING CONSTRAINT — do not reintroduce the token 'ff' (as in
+        # "stood off") or the word 'advanced' anywhere in this reason.
+        # workflow.py's blocked path infers the merge-failure review category
+        # with a bare substring test
+        # (`'ff' in reason.lower() or 'advanced' in reason.lower()`
+        # -> category 'merge_ff_failed'), which then flows into
+        # `_write_merge_failure_review`, the merge_blocked event's
+        # data.category, and the signature-aware L1 dedup key.  "stood off"
+        # matched it, durably filing every index-lock stand-off as a
+        # fast-forward failure.  Pinned by
+        # test_reason_is_not_miscategorised_as_a_ff_failure.
+        return MergeOutcome(
+            'blocked',
+            reason=(
+                f'advance_main deferred: a foreign git process held '
+                f'{lock_path} for {age_txt} (waited {waited_txt}). The merge '
+                f'did NOT land and NOTHING in project_root was modified. This '
+                f'is the docs-direct-commit-on-main window — a '
+                f'`git commit --only` holding the index lock across its '
+                f'pre-commit hook — which is transient and will be retried on '
+                f're-dispatch.{wip_txt}{recovery} (task {task_id})'
+            ),
         )
 
     # not_descendant / contaminated — per-branch permanent failure (no halt)
@@ -1689,6 +1807,30 @@ async def _check_post_merge_equivalence(
 # the overlap status unknowable.  Any non-empty list causes the caller to
 # re-verify (fail-CLOSED policy).
 _OVERLAP_GIT_ERROR_SENTINEL = ['<git-error: re-verify required>']
+
+# Floor (seconds) an index.lock's PRE-wait age must clear before
+# `_map_advance_failure` will call it a crashed-git leftover and offer the
+# destructive `rm -f <lock>` recovery (task 3060, step-19).
+#
+# The threshold CANNOT be the configured grace alone.  `git.merge_park_lock_
+# grace_seconds` is operator-tunable all the way down to 0 — a blessed,
+# documented probe-only fail-fast off-switch (see GitConfig.merge_park_lock_
+# grace_seconds and test_zero_is_accepted_as_probe_only_off_switch) — and at
+# grace=0 EVERY age exceeds the grace, so a keyed-on-grace-alone test hands
+# `rm -f` advice to a live 0.5s-old `git commit --only`.  Deleting a live
+# commit's index.lock corrupts that in-flight commit, so staleness keys on
+# max(grace, this floor): a lock older than this repo's documented pre-commit
+# budget is the only defensible crashed-leftover signal, INDEPENDENT of how
+# the operator tuned the WAIT.  Equal to the GitConfig default (pinned by
+# test_floor_matches_the_documented_pre_commit_budget); not imported FROM
+# orchestrator.config because that is a TYPE_CHECKING-only import here.
+#
+# Aliased from git_ops rather than re-declared: `_await_index_lock_clear`
+# short-circuits its stand-off on the SAME bar (waiting cannot change a
+# verdict that is already "crashed leftover"), and a drift between the two
+# would mean skipping the wait without then explaining why.  The import
+# direction merge_gates -> git_ops is already established above.
+_STALE_LOCK_FLOOR_S = _INDEX_LOCK_STALE_FLOOR_S
 
 
 async def _rebase_delta_touched_overlap(

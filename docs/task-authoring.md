@@ -841,11 +841,23 @@ user_observable_signal, consumer_ref, substrate_confirmed,
 human_decomposed, grammar_confirmed, invariants, optimistic_path,
 capability_manifest, curator_action, curator_justification, combined_at,
 gate_escalated_at, before_done_ran_at, before_done_verified_at,
-before_done_verified_pid, files_tagged_at, origin_finding_id,
-spawned_from, program, program_stream, stream, cross_repo,
-cross_repo_project, human_curator_gate,
-human_curator_adjudicated_at, last_blocked_at
+before_done_verified_pid, files_tagged_at, source_finding_id,
+stage1_finding_id, origin_finding_id, spawned_from, program,
+program_stream, stream, cross_repo, cross_repo_project,
+human_curator_gate, human_curator_adjudicated_at, last_blocked_at
 ```
+
+The finding-provenance trio (`source_finding_id`, `stage1_finding_id`,
+`origin_finding_id`) is the one Tier-A family that does **not** meet the
+"already relied on by real writers" criterion stated above: it has no code
+reader and no code writer, and is a pure LLM prose convention. It was
+blessed by `esc-3796-1` (2026-08-17) on corpus-dominance grounds instead,
+because leaving the dominant spellings unblessed is what manufactures the
+census noise the scan exists to surface. The per-key census behind that
+ruling is a point-in-time measurement rather than an invariant, so it is
+transcribed in one place only — the comment beside the entries in
+`shared/src/shared/task_metadata.py` — and cited by id everywhere else. See
+Tier-B below for which spelling to use in new writes.
 
 `cross_repo` + `cross_repo_project` are the cross-repo deliverable marker
 (§3.2.1): auto-set by the fused-memory submit path when a task's
@@ -933,13 +945,36 @@ after which the resume path nonetheless closed the task.
 
 These aliases are deliberately *not* on the Tier-A allowlist, so each still
 emits `code=unknown_key` as a greppable drift signal until the caller is
-fixed to use the canonical spelling:
+fixed to use the canonical spelling — with one documented exception,
+`origin_finding_id`, noted under the table:
 
 | Canonical | Aliases to avoid |
 |---|---|
 | `prd_path` + `prd_task_label` | `prd`, `prd_ref`, `prd_leaf` |
 | `invariants` | `inv` |
 | `related_tasks` | `related_task`, `related_df_tasks`, `related_task_examples` |
+| `source_finding_id` | `origin_finding_id`, `origin_finding`, `origin_stage1_finding_id`, `source_finding`, `finding_id` |
+
+**The finding-provenance row splits into two classes** (ruling:
+`esc-3796-1`, 2026-08-17). `origin_finding_id` is the **retired** alias and
+is the exception to the paragraph above: it stays Tier-A blessed and
+therefore stays **silent**, because the landed tasks carrying it are mostly
+terminal and so mechanically un-rewritable, and task 3796 **rejected data
+migration** — so no landed task is being rewritten, and un-blessing it would
+manufacture exactly the census noise this ruling removes. It is
+documented-as-retired, not un-blessed; do not expect drift lines for it, and
+use `source_finding_id` in new writes. The remaining near-miss family —
+`origin_finding`, `origin_stage1_finding_id`, `source_finding`, `finding_id`
+— is unblessed and does still emit `unknown_key` exactly as the paragraph
+describes. That is not just documented: it is pinned by
+`test_finding_provenance_near_miss_aliases_still_warn`
+(`shared/tests/test_task_metadata.py`), so blessing one of these spellings
+fails the suite instead of silently voiding this table's drift signal.
+
+**`stage1_finding_id` is not an alias.** It is a distinct canonical Tier-A
+key in its own right, naming the Stage-1 finding specifically, and is
+deliberately **not** something to migrate to `source_finding_id` — only the
+`origin_`-prefixed near-miss `origin_stage1_finding_id` is drift.
 
 ### Tier-C: ad-hoc keys
 
@@ -1056,7 +1091,10 @@ script's "no reader anywhere" grep argument covers only its six built-in
 default keys, so when you re-run it with your own `--keys` it validates
 them first and refuses an already-`x_`-prefixed key, a typed
 `TaskMetadata` field or a Tier-A blessed key — its read-back proves the
-rename *landed*, never that the rename was *safe*.
+rename *landed*, never that the rename was *safe*. Each run also writes
+its own timestamped pre-write snapshot and never overwrites an existing
+one — a path you named is refused, one the script chose steps aside — so
+the re-run prescribed here cannot cost you the original row.
 
 **The write-path blocker** is why the third row is still open, and it
 bounds both of the others: `update_task` rejects any metadata payload

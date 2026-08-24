@@ -319,6 +319,361 @@ class TestReachBackRouting:
         )
 
 
+# ---------------------------------------------------------------------------
+# FIX 2 (task 2886, PRD leaf δ §3.4): off-lane sampling of MAP-LESS lands.
+#
+# _maybe_schedule_shadow_compare early-returned on empty warm_results, so the
+# two populations that CAN actually diverge were NEVER sampled:
+#   * trivial-pass lands (ran no suite → empty per-test map), and
+#   * remote-verdict lands (verify ran off the warm local _merge-verify lane).
+# The empty-warm_results early-return is removed: when cadence is due, a
+# map-less land is routed to a COARSE suite-level compare instead of being
+# silently skipped.  A land WITH a per-test map still uses the per-test
+# _run_shadow_compare (unchanged).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestScheduleShadowCompareMapLess:
+    """FIX 2 scheduling: map-less (empty warm_results) lands are still sampled."""
+
+    async def test_empty_warm_results_schedules_coarse_compare(
+        self, tmp_path: Path,
+    ) -> None:
+        """Empty warm_results + due cadence ⇒ a COARSE compare task is scheduled.
+
+        RED today: ``_maybe_schedule_shadow_compare`` early-returns on empty
+        ``warm_results`` (merge_shadow.py ~1162-1163), so no task is ever
+        scheduled for a map-less land and ``worker._shadow_compare_tasks`` stays
+        empty.  The coarse coroutine must be dispatched via the merge_queue
+        reach-back seam (``orchestrator.merge_queue._run_coarse_shadow_compare``),
+        NOT the per-test ``_run_shadow_compare``.
+        """
+        from orchestrator.merge_shadow import _maybe_schedule_shadow_compare
+
+        git_ops = MagicMock()
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            git=GitConfig(
+                warm_verify_shadow_compare=True,
+                warm_verify_shadow_compare_every_n_merges=1,
+            ),
+        )
+        req = MagicMock()
+        req.config = config
+
+        worker = MagicMock()
+        worker._shadow_state_path = tmp_path / 'warm_verify_shadow.json'
+        worker._shadow_compare_tasks = set()
+
+        coarse = AsyncMock(return_value=None)
+        # The per-test compare MUST NOT be used for a map-less land.
+        per_test = AsyncMock(side_effect=AssertionError(
+            'per-test _run_shadow_compare must not be scheduled for a map-less land'
+        ))
+
+        with (
+            # create=True: the reach-back target does not exist until the impl
+            # step adds the coroutine + shim re-export; this keeps the RED
+            # failure the scheduling assertion, not a patch-time AttributeError.
+            patch('orchestrator.merge_queue._run_coarse_shadow_compare', coarse,
+                  create=True),
+            patch('orchestrator.merge_queue._run_shadow_compare', per_test),
+        ):
+            await _maybe_schedule_shadow_compare(
+                worker, git_ops, req, 'commit-sha', {}, None, None,
+            )
+            assert len(worker._shadow_compare_tasks) == 1, (
+                'expected a coarse shadow-compare task to be scheduled for a '
+                'map-less (empty warm_results) land'
+            )
+            task = next(iter(worker._shadow_compare_tasks))
+            await task
+
+        per_test.assert_not_called()
+        coarse.assert_awaited_once()
+
+    async def test_empty_warm_results_persists_cadence_when_not_due(
+        self, tmp_path: Path,
+    ) -> None:
+        """A map-less land that is NOT yet due still increments persisted cadence.
+
+        With ``every_n_merges=3`` the first map-less land is under cadence: no
+        task is scheduled, but the persisted counter must advance to 1 so the
+        map-less population contributes to the cadence exactly like a
+        map-bearing land (no silent cadence loss).
+        """
+        from orchestrator.merge_shadow import (
+            _load_shadow_compare_state,
+            _maybe_schedule_shadow_compare,
+        )
+
+        git_ops = MagicMock()
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            git=GitConfig(
+                warm_verify_shadow_compare=True,
+                warm_verify_shadow_compare_every_n_merges=3,
+                # Isolate the count leg: push the nightly-timer leg far into the
+                # future so it never fires (last_shadow_run_at starts at 0.0, so
+                # a default 86400 s interval would trivially be "due" against a
+                # 2026 wall clock and mask the count-leg cadence under test).
+                warm_verify_shadow_compare_nightly_interval_secs=1e12,
+            ),
+        )
+        req = MagicMock()
+        req.config = config
+
+        worker = MagicMock()
+        worker._shadow_state_path = tmp_path / 'warm_verify_shadow.json'
+        worker._shadow_compare_tasks = set()
+
+        coarse = AsyncMock(return_value=None)
+        with patch('orchestrator.merge_queue._run_coarse_shadow_compare', coarse,
+                   create=True):
+            await _maybe_schedule_shadow_compare(
+                worker, git_ops, req, 'commit-sha', {}, None, None,
+            )
+
+        assert len(worker._shadow_compare_tasks) == 0, (
+            'under cadence (1 of 3), no compare task should be scheduled'
+        )
+        coarse.assert_not_awaited()
+        state = _load_shadow_compare_state(worker._shadow_state_path)
+        assert state.merges_since_last_shadow == 1, (
+            'a map-less land must still advance the persisted cadence counter'
+        )
+
+
+@pytest.mark.asyncio
+class TestCoarseShadowCompare:
+    """FIX 2: the COARSE suite-level compare coroutine (task 2886, step-9/10).
+
+    A map-less warm-passed land (trivial-pass / remote-verdict) is compared
+    against a cold FULL-gate verify.  The warm land implicitly PASSED (it
+    landed), so:
+
+    * cold FULL-gate FAIL  ⇒ born-at-L2 suspected-red alarm,
+    * cold FULL-gate PASS  ⇒ ``verdict_parity_ok`` (coarse=True),
+    * empty/unparseable cold ⇒ inconclusive no-op (build/compile/infra hiccup —
+      mirrors ``_run_shadow_compare``'s inconclusive guard).
+
+    The cold FULL-gate verify is exercised through the merge_queue reach-back
+    seam (``orchestrator.merge_queue._run_cold_shadow_verify_suite``) so a test
+    patch controls the suite-level :class:`VerifyResult` without shelling out.
+    """
+
+    @staticmethod
+    def _req() -> MagicMock:
+        req = MagicMock()
+        req.task_id = 'task-coarse-shadow'
+        req.task_files = None
+        req.module_configs = []
+        return req
+
+    @staticmethod
+    def _esc_queue() -> MagicMock:
+        eq = MagicMock()
+        eq.has_open_l1.return_value = False
+        eq.make_id.side_effect = lambda sentinel: f'id::{sentinel}'
+        return eq
+
+    async def test_cold_fail_vs_warm_passed_alarms_born_at_l2(self) -> None:
+        """cold FULL-gate FAIL on a map-less warm-passed land ⇒ born-at-L2 alarm."""
+        from orchestrator.event_store import EventType
+        from orchestrator.merge_shadow import _run_coarse_shadow_compare
+
+        git_ops = MagicMock()
+        req = self._req()
+        esc_queue = self._esc_queue()
+        event_store = MagicMock()
+
+        # Cold suite genuinely RAN (FAIL + PASS lines) and FAILED.
+        cold_fail = VerifyResult(
+            passed=False,
+            test_output='FAIL [0.20s] pkg mod::test_x\nPASS [0.01s] pkg mod::test_y',
+            lint_output='', type_output='', summary='cold full-gate suite failed',
+        )
+        with patch(
+            'orchestrator.merge_queue._run_cold_shadow_verify_suite',
+            AsyncMock(return_value=cold_fail), create=True,
+        ):
+            await _run_coarse_shadow_compare(
+                git_ops, req, 'deadbeefcafef00d', esc_queue, event_store,
+            )
+
+        esc_queue.submit.assert_called_once()
+        esc = esc_queue.submit.call_args.args[0]
+        assert esc.level == 2, 'coarse divergence must be born at L2'
+        assert esc.severity == 'critical'
+        assert esc.agent_role.startswith('orchestrator-'), (
+            'agent_role must carry the orchestrator- harness-sentinel prefix'
+        )
+        blob = f'{esc.summary}\n{esc.detail}'
+        assert 'deadbeef' in blob, 'escalation must name the merge commit'
+        assert 'landed' in blob.lower(), (
+            'detail must state the warm merge ALREADY LANDED'
+        )
+        assert 'main' in blob.lower(), 'detail must state main may be red'
+        # A divergence alarm must NOT also emit a parity-ok event.
+        for call in event_store.emit.call_args_list:
+            assert call.args[0] != EventType.verdict_parity_ok
+
+    async def test_cold_pass_emits_coarse_parity_ok_no_alarm(self) -> None:
+        """cold FULL-gate PASS ⇒ verdict_parity_ok(coarse=True), no escalation."""
+        from orchestrator.event_store import EventType
+        from orchestrator.merge_shadow import _run_coarse_shadow_compare
+
+        git_ops = MagicMock()
+        req = self._req()
+        esc_queue = self._esc_queue()
+        event_store = MagicMock()
+
+        cold_pass = VerifyResult(
+            passed=True,
+            test_output='PASS [0.01s] pkg mod::test_x\nPASS [0.02s] pkg mod::test_y',
+            lint_output='', type_output='', summary='cold full-gate suite passed',
+        )
+        with patch(
+            'orchestrator.merge_queue._run_cold_shadow_verify_suite',
+            AsyncMock(return_value=cold_pass), create=True,
+        ):
+            await _run_coarse_shadow_compare(
+                git_ops, req, 'cafef00ddeadbeef', esc_queue, event_store,
+            )
+
+        esc_queue.submit.assert_not_called()
+        event_store.emit.assert_called_once()
+        assert event_store.emit.call_args.args[0] == EventType.verdict_parity_ok
+        data = event_store.emit.call_args.kwargs['data']
+        assert data.get('coarse') is True, (
+            'the coarse parity-ok event must carry a coarse=True flag'
+        )
+
+    async def test_empty_cold_is_inconclusive_no_alarm_no_event(self) -> None:
+        """Empty/unparseable cold with NO build category (OOM/transport/disk
+        hiccup in the throwaway worktree) ⇒ inconclusive no-op."""
+        from orchestrator.merge_shadow import _run_coarse_shadow_compare
+
+        git_ops = MagicMock()
+        req = self._req()
+        esc_queue = self._esc_queue()
+        event_store = MagicMock()
+
+        # Cold leg produced no parseable map AND carries no recognised build
+        # category (an OOM/transport/disk hiccup in the throwaway worktree, not a
+        # genuine warm-pass/cold-fail flip) → must NOT alarm.
+        cold_broken = VerifyResult(
+            passed=False,
+            test_output='Killed (OOM): the throwaway verify worktree ran out of memory\n',
+            lint_output='', type_output='', summary='cold verify infra hiccup',
+            category='',
+        )
+        with patch(
+            'orchestrator.merge_queue._run_cold_shadow_verify_suite',
+            AsyncMock(return_value=cold_broken), create=True,
+        ):
+            await _run_coarse_shadow_compare(
+                git_ops, req, 'facefeed12345678', esc_queue, event_store,
+            )
+
+        esc_queue.submit.assert_not_called()
+        event_store.emit.assert_not_called()
+
+    async def test_cold_build_failure_no_map_alarms_born_at_l2(self) -> None:
+        """A cold FULL-gate FAIL with a build/compile category but ZERO parseable
+        test lines (the landed commit does not build) ⇒ born-at-L2 alarm, NOT a
+        swallowed inconclusive (task 2886 reviewer robustness amendment).
+
+        For the map-less population this coarse path is the SOLE detector, so a
+        red main whose commit never compiled must not be silently dropped.
+        """
+        from orchestrator.event_store import EventType
+        from orchestrator.merge_shadow import _run_coarse_shadow_compare
+
+        git_ops = MagicMock()
+        req = self._req()
+        esc_queue = self._esc_queue()
+        event_store = MagicMock()
+
+        # Suite NEVER BUILT: compile error emits build errors + zero test lines,
+        # so parse_per_test_results() is empty — but the category identifies a
+        # genuine build failure of the landed commit.
+        cold_build_fail = VerifyResult(
+            passed=False,
+            test_output='error[E0433]: failed to resolve: use of undeclared crate\n',
+            lint_output='', type_output='', summary='cold FULL-gate build failed',
+            category='compile_error',
+        )
+        with patch(
+            'orchestrator.merge_queue._run_cold_shadow_verify_suite',
+            AsyncMock(return_value=cold_build_fail), create=True,
+        ):
+            await _run_coarse_shadow_compare(
+                git_ops, req, 'badc0de099887766', esc_queue, event_store,
+            )
+
+        # Born-at-L2 alarm fired despite the empty per-test map.
+        esc_queue.submit.assert_called_once()
+        esc = esc_queue.submit.call_args.args[0]
+        assert esc.level == 2, 'a build-never-built cold FAIL must be born at L2'
+        assert esc.severity == 'critical'
+        assert 'badc0de0' in f'{esc.summary}\n{esc.detail}'
+        # It is an alarm, not a parity-ok.
+        for call in event_store.emit.call_args_list:
+            assert call.args[0] != EventType.verdict_parity_ok
+
+    async def test_infra_category_no_map_is_inconclusive_no_alarm(self) -> None:
+        """A cold FAIL with an INFRA-transient category (e.g. disk_full) and no
+        parseable map stays inconclusive — infra hiccups must NOT alarm even
+        though they carry a category (guards against over-alarming)."""
+        from orchestrator.merge_shadow import _run_coarse_shadow_compare
+
+        git_ops = MagicMock()
+        req = self._req()
+        esc_queue = self._esc_queue()
+        event_store = MagicMock()
+
+        cold_infra = VerifyResult(
+            passed=False,
+            test_output='No space left on device while writing target/\n',
+            lint_output='', type_output='', summary='cold verify disk full',
+            category='disk_full',
+        )
+        with patch(
+            'orchestrator.merge_queue._run_cold_shadow_verify_suite',
+            AsyncMock(return_value=cold_infra), create=True,
+        ):
+            await _run_coarse_shadow_compare(
+                git_ops, req, 'd15cfull01020304', esc_queue, event_store,
+            )
+
+        esc_queue.submit.assert_not_called()
+        event_store.emit.assert_not_called()
+
+    async def test_cold_leg_exception_is_swallowed(self) -> None:
+        """A cold-leg exception is swallowed (WARNING) — never crashes the worker."""
+        from orchestrator.merge_shadow import _run_coarse_shadow_compare
+
+        git_ops = MagicMock()
+        req = self._req()
+        esc_queue = self._esc_queue()
+        event_store = MagicMock()
+
+        with patch(
+            'orchestrator.merge_queue._run_cold_shadow_verify_suite',
+            AsyncMock(side_effect=RuntimeError('cold worktree exploded')),
+            create=True,
+        ):
+            # Must NOT raise.
+            await _run_coarse_shadow_compare(
+                git_ops, req, 'c0ffee00c0ffee00', esc_queue, event_store,
+            )
+
+        esc_queue.submit.assert_not_called()
+        event_store.emit.assert_not_called()
+
+
 def test_merge_queue_reexports_identical_objects() -> None:
     """merge_queue re-exports the SAME objects from merge_shadow (shim identity).
 

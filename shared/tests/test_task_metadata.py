@@ -1768,10 +1768,17 @@ class TestParseMetadataFailurePolicy:
         assert warnings[0].field == 'mystery_field'
         assert model.model_dump()['mystery_field'] == 'v'
 
-    # A representative spread of the 40 Tier-A blessed conventional keys
-    # (see _BLESSED_METADATA_KEYS), plus one genuine control key
-    # (mystery_zzz) that must still warn. RED: none of the blessed keys are
-    # skipped yet, so each one currently emits its own unknown_key warning.
+    # A representative spread of the Tier-A blessed conventional keys (see
+    # _BLESSED_METADATA_KEYS), plus one genuine control key (mystery_zzz)
+    # that must still warn. RED: none of the blessed keys are skipped yet, so
+    # each one currently emits its own unknown_key warning.
+    #
+    # Deliberately a PARTIAL sample, and deliberately carrying no count of
+    # the allowlist: full per-key coverage is the parametrized test below,
+    # which reads the frozenset directly. A newly blessed key belongs there
+    # (for free) and in its own dedicated test (for the rationale) — adding
+    # it here too is a third copy that carries no incremental signal and
+    # forces a hand re-count on every future blessing.
     _BLESSED_SAMPLE_BLOB = {
         'source': 'x',
         'modules': ['a'],
@@ -1820,12 +1827,12 @@ class TestParseMetadataFailurePolicy:
         assert dumped['prd_path'] == blob['prd_path']
 
     # Table-driven over the FULL _BLESSED_METADATA_KEYS frozenset (imported
-    # directly), rather than the hand-maintained partial sample above (which
-    # only covers 25 of the 40 entries). Every key gets its own parametrized
-    # case, so a typo'd or accidentally-unskipped entry fails immediately
-    # instead of silently reappearing as unknown_key census noise, and the
-    # test stays in lockstep as the allowlist grows -- no manual sample to
-    # update.
+    # directly), rather than the hand-maintained partial sample above. Every
+    # key gets its own parametrized case, so a typo'd or accidentally-
+    # unskipped entry fails immediately instead of silently reappearing as
+    # unknown_key census noise, and the test stays in lockstep as the
+    # allowlist grows -- no manual sample to update, and no sample-vs-set
+    # cross-count to re-derive by hand.
     @pytest.mark.parametrize(
         'blessed_key', sorted(task_metadata_module._BLESSED_METADATA_KEYS)
     )
@@ -1933,6 +1940,82 @@ class TestParseMetadataFailurePolicy:
         ]
         assert offending == [], (
             f'Expected no unknown_key warning for last_blocked_at; got: {offending}'
+        )
+
+    def test_finding_provenance_metadata_keys_are_blessed(self):
+        """The finding-provenance family must not census-warn (esc-3796-1, 2026-08-17).
+
+        `source_finding_id` is ratified as the CANONICAL key naming the finding
+        a task was spawned from; `stage1_finding_id` is a distinct canonical
+        key naming a Stage-1 finding specifically, NOT an alias of it.
+
+        `origin_finding_id` is asserted here too because it is the RETIRED
+        alias that nonetheless STAYS blessed: task 3796 rejected data
+        migration, so the landed tasks carrying it cannot be rewritten and
+        un-blessing it would manufacture exactly the unknown_key census noise
+        this change exists to remove. A later cleanup must not drop it
+        silently.
+
+        The ruling is a corpus-DOMINANCE one, and unusually for a Tier-A entry
+        this family has no code reader and no code writer. Basis and census
+        figures: esc-3796-1 (2026-08-17), transcribed once beside the entries
+        in shared/src/shared/task_metadata.py and deliberately not restated
+        here — a point-in-time measurement kept in three places ages into two
+        stale copies.
+
+        RED until 'source_finding_id' and 'stage1_finding_id' are added to
+        _BLESSED_METADATA_KEYS.
+        """
+        _, warnings = parse_metadata(
+            {'source_finding_id': 'f1', 'stage1_finding_id': 'f2'}, direction='read'
+        )
+        unknown_key_fields = {w.field for w in warnings if w.code == 'unknown_key'}
+        assert 'source_finding_id' not in unknown_key_fields, (
+            f'Expected no unknown_key warning for source_finding_id; got: {sorted(unknown_key_fields)}'
+        )
+        assert 'stage1_finding_id' not in unknown_key_fields, (
+            f'Expected no unknown_key warning for stage1_finding_id; got: {sorted(unknown_key_fields)}'
+        )
+
+        # The retired alias stays blessed by design (esc-3796-1 / task 3796
+        # rejected migration); parsed separately so a regression names which
+        # spelling broke rather than collapsing into the assertions above.
+        _, retired_warnings = parse_metadata({'origin_finding_id': 'f1'}, direction='read')
+        retired_offending = [
+            w
+            for w in retired_warnings
+            if w.code == 'unknown_key' and w.field == 'origin_finding_id'
+        ]
+        assert retired_offending == [], (
+            'origin_finding_id must stay blessed as the documented-as-retired alias '
+            f'(esc-3796-1; task 3796 rejected migration); got: {retired_offending}'
+        )
+
+    @pytest.mark.parametrize(
+        'near_miss_alias',
+        ['origin_finding', 'origin_stage1_finding_id', 'source_finding', 'finding_id'],
+    )
+    def test_finding_provenance_near_miss_aliases_still_warn(self, near_miss_alias):
+        """The near-miss spellings must KEEP emitting unknown_key (esc-3796-1).
+
+        The negative half of the test above, and the one assertion the Tier-B
+        table actually rests on: `origin_finding_id` is silent by design, so
+        the drift signal for that family lives entirely in these four
+        near-miss spellings. `code=unknown_key` is what an operator greps for
+        to find callers still on a wrong spelling — blessing one of these, or
+        promoting it to a typed `TaskMetadata` field, would void that contract
+        with no other test failing and leave the grep silently returning
+        nothing.
+
+        This asserts parser BEHAVIOUR (warning emitted / not emitted), not the
+        wording of docs/task-authoring.md §8 — so it is a real contract test,
+        not a documentation meta-test.
+        """
+        _, warnings = parse_metadata({near_miss_alias: 'v'}, direction='read')
+        unknown_key_fields = {w.field for w in warnings if w.code == 'unknown_key'}
+        assert near_miss_alias in unknown_key_fields, (
+            f'{near_miss_alias} must stay unblessed so its drift line keeps appearing '
+            f'in the census; got warnings: {warnings}'
         )
 
     def test_deterministic_invariant_violation_write_enforce_raises(self):

@@ -5,6 +5,7 @@ without sys.path pollution — mirrors the pattern in test_cleanup_count_snapsho
 """
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import logging
 import sys
@@ -40,6 +41,29 @@ def _load_module() -> types.ModuleType:
 
 
 _mod = _load_module()
+
+
+@pytest.fixture(autouse=True)
+def _neutralise_store_mutation_preflight(monkeypatch):
+    """Keep this MOCK-unit suite independent of the REAL ``~/.mem0``.
+
+    ``run(..., apply=True)`` runs a fail-closed capability preflight before it
+    counts or scrolls (task 4127). That probe touches the real filesystem, so
+    without this fixture every ``--apply`` test would pass or fail according to
+    whether the machine running pytest happens to be able to write mem0's
+    history directory -- and it genuinely cannot inside an agent sandbox, which
+    is the whole reason the guard exists. This suite is deliberately MOCK-unit
+    (an AsyncMock service, no live Qdrant), so the environment must not be an
+    input to it.
+
+    ``TestRunApplyStoreMutationPreflight`` re-rigs this per test -- to refuse,
+    to record, or to pass -- so the guard's own behaviour is still pinned
+    explicitly rather than assumed away.
+
+    Deliberately NOT ``raising=False``: if the guard is ever removed from the
+    script this fixture must break loudly rather than silently no-op.
+    """
+    monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', lambda **_kw: None)
 
 
 # ===========================================================================
@@ -1747,19 +1771,25 @@ class TestResolveCheckExitCode:
             },
         }
 
-    def test_blind_spot_does_not_change_exit_code_by_default(self):
-        """BACKWARD COMPATIBILITY, the load-bearing case.
+    def test_blind_spot_fails_the_check_verdict_by_default(self):
+        """ARMED BY DEFAULT (task 3923), the load-bearing case.
 
-        scripts/fused-memory-flag-marker-check.sh is ALREADY wired as a
-        before_done.script predicate for a deterministic watch task. A blind
-        spot must not silently start failing that gate: without the opt-in
-        flag, a report with blind_spot=True and total_source=0 still holds.
+        This test previously asserted the OPPOSITE, on the premise that the
+        check wrapper "is ALREADY wired as a before_done.script predicate
+        for a deterministic watch task" and so must not start failing. That
+        premise is now false — the gate's only consumer, task 2902, is done
+        — which is what licenses the inversion. Ruling:
+        docs/flag-marker-sweep-recurring.md §"Decision (task 3923)".
+
+        The explicit keyword is still honoured (see
+        test_blind_spot_fails_when_opted_in); what changes is that omitting
+        it no longer downgrades an OBSERVED blind spot to a pass.
         """
         report = self._blind_spot_report(blind_spot=True)
-        assert _mod._resolve_check_exit_code(report, max_backlog=0) == 0
+        assert _mod._resolve_check_exit_code(report, max_backlog=0) == 1
         assert _mod._resolve_check_exit_code(
-            report, max_backlog=0, fail_on_blind_spot=False,
-        ) == 0
+            report, max_backlog=0, fail_on_blind_spot=True,
+        ) == 1
 
     def test_blind_spot_fails_when_opted_in(self):
         """With --fail-on-blind-spot, an observed blind spot is exit 1 even
@@ -1807,6 +1837,47 @@ class TestResolveCheckExitCode:
             report_violated, max_backlog=0, fail_on_blind_spot=True,
         ) == 1
 
+    # -----------------------------------------------------------------
+    # Armed-by-default properties (task 3923)
+    # -----------------------------------------------------------------
+
+    def test_opting_out_relaxes_only_the_vacuity_check_not_the_backlog(self):
+        """The escape hatch must never MASK a real finding.
+
+        --no-fail-on-blind-spot exists for an ad-hoc census, where an
+        operator wants the plain backlog number without the vacuity
+        veto. It must not become a blanket 'exit 0' — a residual backlog
+        over the ceiling is a substantive violation that the opt-out has
+        no business suppressing.
+        """
+        report = self._blind_spot_report(blind_spot=True, total_source=7)
+        assert _mod._resolve_check_exit_code(
+            report, max_backlog=0, fail_on_blind_spot=False,
+        ) == 1
+
+    def test_failed_probe_never_fails_the_gate_under_the_armed_default(self):
+        """ANTI-FLAP, asserted with NO keyword so the new default is what
+        is under test rather than assumed to have survived the flip.
+
+        run() already forces blind_spot=False whenever the adjacent
+        population could not be observed, so a transient Qdrant blip
+        yields 'unobservable', not 'observed blind spot'. Arming the
+        default must not convert missing evidence into a failure — the
+        gate escalates on observed divergence only.
+        """
+        report = self._blind_spot_report(blind_spot=False, probe_failed=True)
+        assert _mod._resolve_check_exit_code(report, max_backlog=0) == 0
+
+    def test_report_without_cross_check_block_resolves_under_armed_default(self):
+        """A report shape predating the cross_check block (task 3897) must
+        still resolve through the backlog path rather than raising, now
+        that the blind-spot branch is reached by default. Asserted with no
+        keyword: the .get chain is what keeps the armed default safe on an
+        older/cached report."""
+        assert _mod._resolve_check_exit_code(
+            {'before': {'total_source': 0, 'total_with_kind': 0}}, max_backlog=0,
+        ) == 0
+
 
 # ===========================================================================
 # Tests: _build_parser (task 2596 CLI surface)
@@ -1833,11 +1904,14 @@ class TestBuildParser:
         assert args.check is False
         assert args.max_backlog == 0
         assert args.terminal_drain is False
-        # task 3897: OFF by default. The flag_for_stage2 pool is a healthy
-        # rolling 14-day window, so a gate keyed on its non-emptiness would
-        # fail forever — the same footgun already documented for
-        # --max-backlog 0 against undated markers.
-        assert args.fail_on_blind_spot is False
+        # task 3923: the RAW parser leaves the tri-state sentinel UNRESOLVED
+        # (None = "nobody asked"). _parse_args resolves it to True after its
+        # cross-flag validation — see TestParseArgs. The distinction is
+        # load-bearing: keying the requires---check rejection on `is not
+        # None` is what lets the nightly `--apply --terminal-drain` run
+        # (which passes neither spelling) parse cleanly instead of being
+        # rejected with exit 2 by an armed default it never asked for.
+        assert args.fail_on_blind_spot is None
 
     def test_fail_on_blind_spot_opt_in(self):
         """--fail-on-blind-spot is a store_true opt-in (task 3897)."""
@@ -1956,11 +2030,78 @@ class TestParseArgs:
 
     def test_pre_existing_invocations_are_unaffected(self):
         """Every shape that predates the flag still parses unchanged — the
-        validation must not narrow the existing CLI contract."""
-        assert _mod._parse_args([]).fail_on_blind_spot is False
+        validation must not narrow the existing CLI contract.
+
+        task 3923: the bare-dry-run assertion flips False -> True because
+        _parse_args now RESOLVES the tri-state sentinel to the armed
+        default. The contract that must not narrow is that these shapes
+        still PARSE; what the resolved default is is asserted here, and its
+        irrelevance to the non---check paths is pinned by
+        test_nightly_sweep_argv_still_parses_under_the_armed_default.
+        """
+        assert _mod._parse_args([]).fail_on_blind_spot is True
         assert _mod._parse_args(['--check']).check is True
         assert _mod._parse_args(['--apply', '--terminal-drain']).apply is True
         assert _mod._parse_args(['--check', '--max-backlog', '5']).max_backlog == 5
+
+    # -----------------------------------------------------------------
+    # --no-fail-on-blind-spot escape hatch + armed default (task 3923)
+    # -----------------------------------------------------------------
+
+    def test_nightly_sweep_argv_still_parses_under_the_armed_default(self):
+        """THE REGRESSION GUARD THIS WHOLE SENTINEL EXISTS FOR.
+
+        This is the exact argv scripts/fused-memory-flag-marker-sweep.sh
+        passes from the nightly systemd service. Implementing task 3923's
+        armed default the naive way — flipping argparse's default from
+        False to True — would make the pre-existing requires---check
+        validation fire on this shape, rejecting EVERY nightly run with
+        exit 2 and turning a working timer into a permanent systemd
+        `failed` state. That is the perpetual-failure footgun
+        docs/flag-marker-sweep-recurring.md's "Why no --check in the
+        recurring service" section exists to prevent.
+
+        The resolved default is True here but reaches nothing: main()
+        consults _resolve_check_exit_code only under --check, which this
+        invocation does not pass.
+        """
+        args = _mod._parse_args(['--apply', '--terminal-drain'])
+        assert args.check is False
+        assert args.fail_on_blind_spot is True
+
+    def test_opt_out_with_check_parses(self):
+        """--no-fail-on-blind-spot is the ad-hoc-census escape hatch: it
+        yields exactly False, not the None sentinel, so an explicit opt-out
+        is distinguishable from 'nobody asked'."""
+        args = _mod._parse_args(['--check', '--no-fail-on-blind-spot', '--max-backlog', '5'])
+        assert args.check is True
+        assert args.fail_on_blind_spot is False
+        assert args.max_backlog == 5
+
+    def test_opt_out_without_check_is_also_rejected_with_exit_2(self, capsys):
+        """The rejection is symmetric across BOTH spellings.
+
+        --no-fail-on-blind-spot without --check is just as inert as the
+        opt-in spelling: it reaches an exit code only through the --check
+        verdict path. Accepted silently it would hand an operator the
+        impression they had relaxed a gate that was never running — the
+        same silent-no-op class the opt-in rejection already covers, so it
+        errors out rather than no-op'ing.
+        """
+        with pytest.raises(SystemExit) as exc_info:
+            _mod._parse_args(['--no-fail-on-blind-spot'])
+        assert exc_info.value.code == 2
+        stderr = capsys.readouterr().err
+        # Assert the CROSS-FLAG error specifically, not merely exit 2:
+        # argparse's own 'unrecognized arguments' also exits 2 and echoes
+        # the flag name, so a laxer assertion would pass today (before the
+        # flag exists) and could never detect the flag being dropped later.
+        assert 'requires --check' in stderr, (
+            f'Expected the cross-flag rejection, not an unknown-flag error: {stderr!r}'
+        )
+        assert '--no-fail-on-blind-spot' in stderr, (
+            f'Expected an error naming the spelling actually passed, got: {stderr!r}'
+        )
 
 
 # ===========================================================================
@@ -1972,11 +2113,13 @@ class TestMainExitCode:
     """main() is the only place args.fail_on_blind_spot reaches
     _resolve_check_exit_code.
 
-    A regression dropping that keyword would revert to the parameter default
-    (False) and leave every other test in this file green while the opt-in
-    gate silently stopped escalating — so the wiring is asserted end-to-end
-    here (argv -> parse -> exit code), with the live MemoryService
-    construction short-circuited at asyncio.run.
+    Since task 3923 armed the blind-spot policy by default, that keyword is
+    what carries an operator's EXPLICIT --no-fail-on-blind-spot opt-out down
+    to the verdict. A regression dropping it would silently re-arm the gate
+    for a caller who asked to relax it, while leaving every other test in
+    this file green — so the wiring is asserted end-to-end here (argv ->
+    parse -> exit code), with the live MemoryService construction
+    short-circuited at asyncio.run.
     """
 
     _BLIND_SPOT_REPORT = {
@@ -2010,11 +2153,38 @@ class TestMainExitCode:
             monkeypatch, ['--check', '--fail-on-blind-spot'], self._BLIND_SPOT_REPORT,
         ) == 1
 
-    def test_check_alone_still_holds_on_the_same_report(self, monkeypatch, capsys):
-        """The already-wired esc-2866-1 O2 watch task's contract: the same
-        report, without the opt-in, still resolves to 0 via backlog_verdict."""
+    def test_check_alone_now_fails_on_the_same_report(self, monkeypatch, capsys):
+        """END-TO-END proof the armed default reaches the exit code (3923).
+
+        This previously asserted 0, citing "the already-wired esc-2866-1 O2
+        watch task's contract". That watch (task 2902) is done, so the
+        contract it protected is discharged — see
+        docs/flag-marker-sweep-recurring.md §"Decision (task 3923)".
+
+        Bare `--check` on a report whose enumeration matched nothing while
+        an adjacent population is non-empty must now be exit 1. Asserting
+        it through main() rather than _resolve_check_exit_code directly is
+        the point: it proves the armed default survives the full argv ->
+        _parse_args (sentinel resolution) -> main() -> verdict path, which
+        a unit-level assertion on the function default alone would miss.
+        """
         assert self._run_main(
             monkeypatch, ['--check'], self._BLIND_SPOT_REPORT,
+        ) == 1
+
+    def test_opt_out_returns_to_the_plain_backlog_verdict(self, monkeypatch, capsys):
+        """The escape hatch, end to end (task 3923).
+
+        An operator taking an ad-hoc census with
+        `--check --no-fail-on-blind-spot` still gets the plain backlog
+        verdict — 0 on this report, whose total_source is 0. Paired with
+        test_check_alone_now_fails_on_the_same_report, this pins that the
+        SAME report resolves differently based solely on the opt-out
+        reaching the verdict, which is what proves main() forwards the
+        parsed value rather than re-deriving a default.
+        """
+        assert self._run_main(
+            monkeypatch, ['--check', '--no-fail-on-blind-spot'], self._BLIND_SPOT_REPORT,
         ) == 0
 
     def test_opt_in_without_check_never_reaches_the_sweep(self, monkeypatch, capsys):
@@ -2115,3 +2285,262 @@ class TestResolveTerminalTaskIds:
         assert 'RuntimeError' in caplog.text and 'boom' in caplog.text, (
             f'Expected the traceback text in caplog output, got: {caplog.text!r}'
         )
+
+
+# ===========================================================================
+# Tests: --apply store-mutation preflight
+# ===========================================================================
+
+class TestRunApplyStoreMutationPreflight:
+    """``--apply`` refuses to START when this process cannot write mem0's store.
+
+    Ported from ``test_sweep_toolcall_xml_leak.TestRunApplyStoreMutationPreflight``
+    (task 3686), which is the in-repo precedent for this contract.
+
+    ``delete_orphan_markers`` fans its deletes out through
+    ``asyncio.gather(..., return_exceptions=True)`` and tallies per-record
+    results rather than aborting, so in a write-denied environment it would
+    delete Qdrant points one at a time and record each history-write failure as
+    an individual error -- mem0's ``_delete_memory`` removes the point BEFORE
+    writing its SQLite history, so each of those "errors" is an
+    already-destroyed record. Only a run-wide probe ahead of the counts bounds
+    that.
+    """
+
+    _NEUTRAL_NOW = datetime(2026, 1, 1, tzinfo=UTC)
+
+    def _args(
+        self,
+        apply: bool = True,
+        project_id: str = 'dark_factory',
+        max_age_days: int = 14,
+    ):
+        """Mirror of ``TestRun._args``."""
+        import types as _types
+        return _types.SimpleNamespace(
+            apply=apply, project_id=project_id, max_age_days=max_age_days,
+        )
+
+    def _service(self) -> AsyncMock:
+        """AsyncMock service holding two deletable orphans."""
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = _counts(source=[3, 1], kind=[1, 1])
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=[
+            _member('v1'),
+            _orphan('o1'),
+            _orphan('o2'),
+        ])
+        memory_service.delete_memory = AsyncMock(return_value=None)
+        return memory_service
+
+    @staticmethod
+    def _deny(monkeypatch):
+        """Rig the preflight to refuse, as it would inside an agent sandbox."""
+        def _raise(*_args, **_kwargs):
+            raise _mod.StoreMutationUnavailable('SENTINEL-store-unwritable')
+
+        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', _raise)
+
+    @staticmethod
+    def _fail_closed_records(caplog) -> list:
+        """The guard site's OWN diagnosis, isolated from ``main``'s generic
+        handler.
+
+        Both emit ERROR from this script's logger, so neither the level nor the
+        logger name can tell them apart -- only the fail-closed marker and the
+        remedy can, and carrying those is the entire reason the site-specific
+        message exists. ``main`` logs "fatal error during sweep", which tells
+        an operator reading the journal nothing about what was refused or what
+        to do instead.
+
+        Pinned on those two clauses ONLY -- the marker and the remedy noun --
+        so every other word of the message stays free to reword.
+
+        Asserting on message CONTENT is deliberate, and is the narrow exception
+        to the repo's don't-pin-guard-message-prose norm (task 3799): the record
+        this test is about is defined BY its content. Level and logger name are
+        shared with ``main``'s own ERROR record, and mere record-existence would
+        still pass if the whole diagnosis were replaced by "boom" -- precisely
+        the regression this exists to catch. Verified non-vacuous: mutating the
+        marker in the script turns this assertion red (task 4127 amendment).
+        """
+        return [
+            r for r in caplog.records
+            if r.name == 'sweep_orphan_flag_markers'
+            and r.levelno >= logging.ERROR
+            and 'NOT started (fail-closed)' in r.getMessage()
+            and 'MCP server' in r.getMessage()
+        ]
+
+    @pytest.mark.asyncio
+    async def test_apply_performs_zero_mutations_when_the_store_is_unwritable(
+        self, monkeypatch
+    ):
+        """The whole point: refuse to start rather than half-complete."""
+        self._deny(monkeypatch)
+        memory_service = self._service()
+
+        with pytest.raises(
+            _mod.StoreMutationUnavailable, match='SENTINEL-store-unwritable'
+        ):
+            await _mod.run(
+                self._args(apply=True), memory_service, now=self._NEUTRAL_NOW,
+                terminal_task_ids=set(),
+            )
+
+        memory_service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_guard_sits_before_every_backend_read(self, monkeypatch):
+        """It aborts without a single round-trip: three counts (the two before-
+        counts plus the flag_for_stage2 census) and the scroll enumeration are
+        all skipped in an environment that was never going to be allowed to
+        delete."""
+        self._deny(monkeypatch)
+        memory_service = self._service()
+
+        with pytest.raises(_mod.StoreMutationUnavailable):
+            await _mod.run(
+                self._args(apply=True), memory_service, now=self._NEUTRAL_NOW,
+                terminal_task_ids=set(),
+            )
+
+        memory_service.count_memories_by_metadata.assert_not_awaited()
+        memory_service.get_memories_by_metadata.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_dry_run_is_never_gated_on_write_capability(self, monkeypatch):
+        """A read-only run mutates nothing, so it must not require the ability
+        to mutate -- the sweep report stays obtainable from anywhere."""
+        self._deny(monkeypatch)
+        memory_service = self._service()
+
+        report = await _mod.run(
+            self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+            terminal_task_ids=set(),
+        )
+
+        assert report['dry_run'] is True
+        assert set(report['orphan_ids']) == {'o1', 'o2'}
+        assert report['orphan_count'] == 2
+        memory_service.count_memories_by_metadata.assert_awaited()
+        memory_service.get_memories_by_metadata.assert_awaited()
+        memory_service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_apply_is_unchanged_when_the_preflight_passes(self, monkeypatch):
+        """Happy path: a writable environment sweeps exactly as before."""
+        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', lambda **_kw: None)
+        memory_service = self._service()
+
+        report = await _mod.run(
+            self._args(apply=True), memory_service, now=self._NEUTRAL_NOW,
+            terminal_task_ids=set(),
+        )
+
+        assert memory_service.delete_memory.await_count == 2
+        assert report['dry_run'] is False
+        assert report['deleted'] == 2
+        assert 'after' in report
+
+    @pytest.mark.asyncio
+    async def test_the_probe_names_the_operation_being_gated(self, monkeypatch):
+        """The refusal has to be attributable in a log, so the operation string
+        identifies this script and its mutating mode."""
+        calls: list[dict] = []
+        monkeypatch.setattr(
+            _mod, 'assert_store_mutation_allowed', lambda **kw: calls.append(kw)
+        )
+        memory_service = self._service()
+
+        await _mod.run(
+            self._args(apply=True), memory_service, now=self._NEUTRAL_NOW,
+            terminal_task_ids=set(),
+        )
+
+        assert len(calls) == 1, 'probed ONCE per run, not once per orphan'
+        assert 'sweep_orphan_flag_markers' in calls[0]['operation']
+        assert '--apply' in calls[0]['operation']
+
+    def test_the_refusal_is_loud_and_reaches_mains_fatal_abort_path(
+        self, monkeypatch, caplog
+    ):
+        """Pinned surfacing: ``StoreMutationUnavailable`` subclasses
+        ``RuntimeError``, so it IS caught by ``main``'s blanket
+        ``except Exception``, which logs and returns 2.
+
+        That handler labels it a generic fatal sweep error, which is precisely
+        why the guard site's own ``logger.error`` must carry the fail-closed
+        diagnosis before the raise. Both halves are asserted end-to-end: the
+        exit code is non-zero, never 0, AND the journal an operator reads
+        carries the diagnosis rather than only "fatal error during sweep".
+        """
+        self._deny(monkeypatch)
+        memory_service = self._service()
+        monkeypatch.setattr(
+            sys, 'argv', ['sweep_orphan_flag_markers.py', '--apply'],
+        )
+        real_asyncio_run = asyncio.run
+
+        def _drive(coro, *_a, **_kw):
+            coro.close()  # never construct the live MemoryService
+            return real_asyncio_run(
+                _mod.run(
+                    self._args(apply=True), memory_service, now=self._NEUTRAL_NOW,
+                    terminal_task_ids=set(),
+                )
+            )
+
+        monkeypatch.setattr(_mod.asyncio, 'run', _drive)
+
+        with caplog.at_level(logging.ERROR):
+            exit_code = _mod.main()
+
+        assert exit_code == 2
+        assert self._fail_closed_records(caplog), (
+            "main's blanket handler only says 'fatal error during sweep', so "
+            'the guard site must log the fail-closed diagnosis itself; got: '
+            f'{[r.getMessage() for r in caplog.records]}'
+        )
+        memory_service.delete_memory.assert_not_awaited()
+
+    def test_a_denied_check_predicate_never_reports_a_satisfied_backlog(
+        self, monkeypatch, caplog
+    ):
+        """``--apply --check --max-backlog N`` is a ``before_done.script``
+        predicate mode: its exit code is a deterministic gate's verdict.
+
+        A fail-closed guard that let that gate read as PASSED would be worse
+        than no guard at all -- it would convert "this process may not mutate
+        the store" into "the backlog is within budget". Pin that the refusal
+        wins: exit 2, never the predicate's 0.
+        """
+        self._deny(monkeypatch)
+        memory_service = self._service()
+        monkeypatch.setattr(
+            sys, 'argv',
+            ['sweep_orphan_flag_markers.py', '--apply', '--check', '--max-backlog', '100'],
+        )
+        real_asyncio_run = asyncio.run
+
+        def _drive(coro, *_a, **_kw):
+            coro.close()
+            return real_asyncio_run(
+                _mod.run(
+                    self._args(apply=True), memory_service, now=self._NEUTRAL_NOW,
+                    terminal_task_ids=set(),
+                )
+            )
+
+        monkeypatch.setattr(_mod.asyncio, 'run', _drive)
+
+        with caplog.at_level(logging.ERROR):
+            exit_code = _mod.main()
+
+        assert exit_code == 2, 'a refused --apply must never satisfy the --check gate'
+        assert self._fail_closed_records(caplog), (
+            'a gate that fails must say WHY it failed -- an exit 2 with no '
+            'fail-closed diagnosis is indistinguishable from a crashed sweep; '
+            f'got: {[r.getMessage() for r in caplog.records]}'
+        )
+        memory_service.delete_memory.assert_not_awaited()

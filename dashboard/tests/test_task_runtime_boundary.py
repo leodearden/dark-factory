@@ -48,12 +48,36 @@ def _shape_task(task_id: int, title: str, status: str) -> dict:
 
 
 def _register_fetch_tasks(monkeypatch, tasks: list[dict]) -> None:
-    """Monkeypatch fetch_tasks to return a fixed dashboard-shaped task list."""
+    """Monkeypatch fetch_tasks (and its compact map) to a fixed shaped task list.
 
-    async def _fake_fetch_tasks(client, config, project_root):
-        return list(tasks)
+    ``_shape_one_project`` narrows its fetch server-side and reads its counts
+    from ``fetch_statuses`` (task 3857), so the fake honours ``statuses`` /
+    ``page_size`` / ``offset`` — emulating the substrate's row filter and
+    ascending-id slice — and derives the compact map from the same list.
+    Ignoring the narrowing would hand the whole list to both fetch calls and
+    duplicate every row; leaving ``fetch_statuses`` unpatched would reach for
+    the network.
+    """
+
+    async def _fake_fetch_tasks(
+        client, config, project_root, *,
+        statuses=None, page_size=None, offset=0, timeout=None,
+    ):
+        rows = list(tasks)
+        if statuses is not None:
+            rows = [r for r in rows if r.get('status') in statuses]
+        rows.sort(key=lambda r: r.get('id') or 0)  # ORDER BY id ASC
+        if page_size is not None:
+            rows = rows[offset:offset + page_size]
+        return rows
+
+    async def _fake_fetch_statuses(client, config, project_root):
+        return {
+            r['id']: r.get('status') for r in tasks if isinstance(r.get('id'), int)
+        }
 
     monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake_fetch_tasks)
+    monkeypatch.setattr('dashboard.data.active_tasks.fetch_statuses', _fake_fetch_statuses)
 
 
 def _producer_wire_entry(

@@ -174,6 +174,9 @@ SKILLS_CONSUMING_TESTS = (
     SKILLS_PY_RUFF_PROBE,
     # Reads skills/spawn/spawn-claude.sh to cross-check a bash/Python mirror.
     "scripts/tests/test_legibility_inventory.py",
+    # LOADS AND EXECUTES the real skills/factory-init/scripts/find_escalation_port.py
+    # via importlib (task 3705) — a REAL consumer, not a synthetic mention.
+    "tests/scripts/test_find_escalation_port.py",
 )
 
 
@@ -450,7 +453,8 @@ def _pytest_collected_dirs(cmd: str) -> list[str]:
     base main ``7c6039327d`` rather than assumed:
 
     1. ``--directory``. Most module ``test_command``s are
-       ``uv run --project X --directory X pytest tests/ ...`` — the target
+       ``uv run --directory X pytest tests/ ...`` (task 3830 retired the
+       former ``--project X --directory X`` pairing) — the target
        ``tests/`` is relative to ``X``, not to the worktree root. Ignoring the
        ``--directory`` prefix would resolve ``orchestrator``'s target to a
        repo-root ``tests/`` that no consumer test lives under, silently

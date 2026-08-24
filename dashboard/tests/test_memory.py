@@ -8,68 +8,14 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
+from _dashboard_helpers import (
+    cold_session_responses,
+    mcp_init_response,
+    mcp_notify_response,
+    mcp_tool_response,
+)
 
 from dashboard.data.memory import get_curator_state
-
-
-def _make_mcp_response(inner_dict: dict, request_id: int = 1) -> httpx.Response:
-    """Build a mock MCP JSON-RPC response wrapping *inner_dict*."""
-    body = {
-        'jsonrpc': '2.0',
-        'id': request_id,
-        'result': {
-            'content': [
-                {'type': 'text', 'text': json.dumps(inner_dict)},
-            ]
-        },
-    }
-    return httpx.Response(
-        200, json=body,
-        headers={'mcp-session-id': 'test-session-id'},
-    )
-
-
-def _make_init_response(request_id: int = 1) -> httpx.Response:
-    """Build a mock MCP initialize response."""
-    body = {
-        'jsonrpc': '2.0',
-        'id': request_id,
-        'result': {
-            'protocolVersion': '2025-03-26',
-            'capabilities': {'tools': {}},
-            'serverInfo': {'name': 'test', 'version': '0.1'},
-        },
-    }
-    return httpx.Response(
-        200, json=body,
-        headers={'mcp-session-id': 'test-session-id'},
-    )
-
-
-def _make_notify_response() -> httpx.Response:
-    """Build a 202 Accepted response for notifications."""
-    return httpx.Response(202, headers={'mcp-session-id': 'test-session-id'})
-
-
-def _cold_session_responses(
-    inner: dict, url: str = 'http://localhost:8000',
-) -> list[httpx.Response]:
-    """The three responses a COLD McpSession consumes, in post order.
-
-    ``mcp_tool_call`` against a cold session issues ``initialize``, then
-    ``notifications/initialized``, then ``tools/call`` — three HTTP posts.
-    An AsyncMock client bypasses MockTransport, which is what normally
-    attaches ``.request``, so each response needs it set by hand or
-    ``raise_for_status()`` raises RuntimeError even on a 200.
-    """
-    responses = [
-        _make_init_response(),
-        _make_notify_response(),
-        _make_mcp_response(inner),
-    ]
-    for resp in responses:
-        resp.request = httpx.Request('POST', f'{url.rstrip("/")}/mcp')
-    return responses
 
 
 class _SessionAwareHandler:
@@ -110,17 +56,17 @@ class _SessionAwareHandler:
         self.calls.append(body)
 
         if method == 'initialize':
-            return _make_init_response(request_id)
+            return mcp_init_response(request_id)
 
         if method.startswith('notifications/'):
-            return _make_notify_response()
+            return mcp_notify_response()
 
         # tools/call
         if self.error_on_tool:
             raise self.error_on_tool
         if self.error_status:
             return httpx.Response(self.error_status, text='Server Error')
-        return _make_mcp_response(self.tool_response, request_id)
+        return mcp_tool_response(self.tool_response, request_id)
 
 
 class TestSessionAwareHandler:
@@ -272,10 +218,10 @@ class TestMcpToolCall:
             method = body.get('method', '')
             rid = body.get('id', 1)
             if method == 'initialize':
-                return _make_init_response(rid)
+                return mcp_init_response(rid)
             if method.startswith('notifications/'):
-                return _make_notify_response()
-            return _make_mcp_response({'ok': True}, rid)
+                return mcp_notify_response()
+            return mcp_tool_response({'ok': True}, rid)
 
         transport = httpx.MockTransport(handler)
         async with httpx.AsyncClient(transport=transport) as client:
@@ -300,7 +246,7 @@ class TestDashboardClientOpIdInjection:
         from dashboard.data.memory import McpSession
 
         session = McpSession('http://localhost:8000')
-        resp = _make_mcp_response({'ok': True})
+        resp = mcp_tool_response({'ok': True})
         # MockTransport normally attaches the request; set it here since we
         # bypass the transport and return the response from a mocked client.
         resp.request = httpx.Request('POST', 'http://localhost:8000/mcp')
@@ -322,7 +268,7 @@ class TestDashboardClientOpIdInjection:
         from dashboard.data.memory import McpSession
 
         session = McpSession('http://localhost:8000')
-        resp = _make_mcp_response({'ok': True})
+        resp = mcp_tool_response({'ok': True})
         resp.request = httpx.Request('POST', 'http://localhost:8000/mcp')
         mock_client = AsyncMock()
         mock_client.post.return_value = resp
@@ -356,7 +302,7 @@ class TestMcpToolCallTimeoutBudget:
         from dashboard.data.memory import mcp_tool_call
 
         mock_client = AsyncMock()
-        mock_client.post.side_effect = _cold_session_responses({'ok': True})
+        mock_client.post.side_effect = cold_session_responses({'ok': True})
 
         result = await mcp_tool_call(
             mock_client, 'http://localhost:8000', 'get_status', {}, timeout=2.0,
@@ -379,7 +325,7 @@ class TestMcpToolCallTimeoutBudget:
         from dashboard.data.memory import mcp_tool_call
 
         mock_client = AsyncMock()
-        mock_client.post.side_effect = _cold_session_responses({'ok': True})
+        mock_client.post.side_effect = cold_session_responses({'ok': True})
 
         await mcp_tool_call(mock_client, 'http://localhost:8000', 'get_status', {})
 
@@ -413,7 +359,7 @@ class TestAggregateTimeoutBudget:
         # second, which serves a full cold-session sequence.
         mock_client.post.side_effect = [
             httpx.ConnectError('refused'),
-            *_cold_session_responses({'graphiti': {'connected': True}}, url_b),
+            *cold_session_responses({'graphiti': {'connected': True}}, url_b),
         ]
 
         result = await get_memory_status(mock_client, two_url_config, timeout=3.0)
@@ -435,7 +381,7 @@ class TestAggregateTimeoutBudget:
 
         _url_a, url_b = two_url_config.fused_memory_urls
         mock_client = AsyncMock()
-        mock_client.post.side_effect = _cold_session_responses({'ok': True}, url_b)
+        mock_client.post.side_effect = cold_session_responses({'ok': True}, url_b)
 
         await get_memory_status(mock_client, two_url_config)
 
@@ -450,8 +396,8 @@ class TestAggregateTimeoutBudget:
         mock_client = AsyncMock()
         # get_queue_stats visits ALL urls — two cold sessions, six posts.
         mock_client.post.side_effect = [
-            *_cold_session_responses(stats, url_a),
-            *_cold_session_responses(stats, url_b),
+            *cold_session_responses(stats, url_a),
+            *cold_session_responses(stats, url_b),
         ]
 
         result = await get_queue_stats(mock_client, two_url_config, timeout=3.0)
@@ -471,8 +417,8 @@ class TestAggregateTimeoutBudget:
         stats = {'counts': {'graphiti': 1}, 'oldest_pending_age_seconds': 2.0}
         mock_client = AsyncMock()
         mock_client.post.side_effect = [
-            *_cold_session_responses(stats, url_a),
-            *_cold_session_responses(stats, url_b),
+            *cold_session_responses(stats, url_a),
+            *cold_session_responses(stats, url_b),
         ]
 
         await get_queue_stats(mock_client, two_url_config)
@@ -499,8 +445,8 @@ class TestRemainingHelpersThreadTheirBudget:
         mock_client = AsyncMock()
         # get_wal_status collects from ALL urls — two cold sessions, six posts.
         mock_client.post.side_effect = [
-            *_cold_session_responses(payload, url_a),
-            *_cold_session_responses(payload, url_b),
+            *cold_session_responses(payload, url_a),
+            *cold_session_responses(payload, url_b),
         ]
 
         result = await get_wal_status(mock_client, two_url_config, timeout=3.0)
@@ -519,8 +465,8 @@ class TestRemainingHelpersThreadTheirBudget:
         payload = {'stores': {}}
         mock_client = AsyncMock()
         mock_client.post.side_effect = [
-            *_cold_session_responses(payload, url_a),
-            *_cold_session_responses(payload, url_b),
+            *cold_session_responses(payload, url_a),
+            *cold_session_responses(payload, url_b),
         ]
 
         await get_wal_status(mock_client, two_url_config)
@@ -537,7 +483,7 @@ class TestRemainingHelpersThreadTheirBudget:
         mock_client = AsyncMock()
         mock_client.post.side_effect = [
             httpx.ConnectError('refused'),
-            *_cold_session_responses({'paused': False}, url_b),
+            *cold_session_responses({'paused': False}, url_b),
         ]
 
         result = await get_curator_state(mock_client, two_url_config, timeout=3.0)
@@ -558,7 +504,7 @@ class TestRemainingHelpersThreadTheirBudget:
 
         _url_a, url_b = two_url_config.fused_memory_urls
         mock_client = AsyncMock()
-        mock_client.post.side_effect = _cold_session_responses({'paused': False}, url_b)
+        mock_client.post.side_effect = cold_session_responses({'paused': False}, url_b)
 
         await get_curator_state(mock_client, two_url_config)
 
@@ -604,10 +550,10 @@ class TestMcpHeaders:
             method = body.get('method', '')
             rid = body.get('id', 1)
             if method == 'initialize':
-                return _make_init_response(rid)
+                return mcp_init_response(rid)
             if method.startswith('notifications/'):
-                return _make_notify_response()
-            return _make_mcp_response({'ok': True}, rid)
+                return mcp_notify_response()
+            return mcp_tool_response({'ok': True}, rid)
 
         transport = httpx.MockTransport(handler)
         async with httpx.AsyncClient(transport=transport) as client:
@@ -631,10 +577,10 @@ class TestMcpHeaders:
             method = body.get('method', '')
             rid = body.get('id', 1)
             if method == 'initialize':
-                return _make_init_response(rid)
+                return mcp_init_response(rid)
             if method.startswith('notifications/'):
-                return _make_notify_response()
-            return _make_mcp_response({'ok': True}, rid)
+                return mcp_notify_response()
+            return mcp_tool_response({'ok': True}, rid)
 
         transport = httpx.MockTransport(handler)
         async with httpx.AsyncClient(transport=transport) as client:
@@ -862,9 +808,9 @@ class TestMalformedResponse:
             method = body.get('method', '')
             rid = body.get('id', 1)
             if method == 'initialize':
-                return _make_init_response(rid)
+                return mcp_init_response(rid)
             if method.startswith('notifications/'):
-                return _make_notify_response()
+                return mcp_notify_response()
             return httpx.Response(
                 200,
                 json={'jsonrpc': '2.0', 'id': rid, 'result': {}},
@@ -886,9 +832,9 @@ class TestMalformedResponse:
             method = body.get('method', '')
             rid = body.get('id', 1)
             if method == 'initialize':
-                return _make_init_response(rid)
+                return mcp_init_response(rid)
             if method.startswith('notifications/'):
-                return _make_notify_response()
+                return mcp_notify_response()
             return httpx.Response(
                 200,
                 json={'jsonrpc': '2.0', 'id': rid, 'result': {'content': []}},
@@ -917,9 +863,9 @@ class TestMcpToolCallLogging:
             method = body.get('method', '')
             rid = body.get('id', 1)
             if method == 'initialize':
-                return _make_init_response(rid)
+                return mcp_init_response(rid)
             if method.startswith('notifications/'):
-                return _make_notify_response()
+                return mcp_notify_response()
             return httpx.Response(
                 200,
                 json={

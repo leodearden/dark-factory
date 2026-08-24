@@ -35,6 +35,27 @@ from fused_memory.topic_slug import (
 # read and applied leaves from this default file.
 DEFAULT_CONFIG_PATH = 'config/config.yaml'
 
+# Task 3049 amendment: ceiling (and default) for
+# ReconciliationConfig.max_backlog_remediation_deferrals.
+#
+# Deferring the inline remediation pass is a THROUGHPUT lever, and it must not
+# become an escalation-semantics change: a deferred cycle writes one completed
+# run instead of two, so after D consecutive deferrals the cycle that finally
+# remediates sees D deferred parents + this cycle's parent + this cycle's OWN
+# remediation run (which completes and persists its stage reports before the
+# escalation gate reads the count) = D + 2 completed runs re-flagging the
+# finding.  Keeping D + 2 below
+# reconciliation.harness._INTEGRITY_FINDING_RECURRENCE_THRESHOLD (= 4) — i.e.
+# D <= 1 — keeps that counter meaning 'recurs DESPITE remediation'.  The
+# un-deferred baseline is D = 0 → 2, so escalation still needs a second failed
+# remediation, exactly as without this lever.
+#
+# Restated here rather than imported because config.schema must not import the
+# reconciliation harness (which imports this module).  The derivation is pinned
+# against the live harness constant by a runtime test in tests/test_harness.py,
+# and the harness independently clamps to the same ceiling at the point of use.
+MAX_BACKLOG_REMEDIATION_DEFERRALS_CEILING = 1
+
 
 class YamlSettingsSource(PydanticBaseSettingsSource):
     """Custom settings source for loading from YAML files."""
@@ -1377,6 +1398,20 @@ class ReconciliationConfig(BaseModel):
     # sandbox_recon_writable_extras: additional paths to add to the writable set
     #   (e.g. a uvx/pip cache dir used by a stdio MCP server).  Empty by default;
     #   use only when an MCP server genuinely needs to write outside /tmp.
+    #
+    #   Do NOT add the recon CLAUDE_CONFIG_DIR here.  The PER-RUN dir is granted
+    #   AUTOMATICALLY per invocation by cli_stage_runner.run_stage_via_cli, which
+    #   appends `config_dir.path` to whatever is configured here (append, never
+    #   replace) and has resolve_recon_sandbox_wrap verify the containment.
+    #
+    #   In particular, NEVER add the config-dir BASE — `recon_config_base_dir(
+    #   data_dir)`, i.e. `<data_dir>/recon-config`.  That is the root under which
+    #   EVERY run's `claude-config-<run_id>/.credentials.json` lives, so granting
+    #   it would give every reconciliation stage write access to every other run's
+    #   OAuth credentials — a capability that does not exist today.  If a stage is
+    #   failing with a "CLAUDE_CONFIG_DIR is OUTSIDE the sandbox writable set"
+    #   error, the computed per-run grant has been lost; restore it rather than
+    #   widening this list (task 4003).
     sandbox_recon_agents: bool = Field(default=True)
     sandbox_recon_writable_extras: list[str] = Field(default_factory=list)
 
@@ -1662,6 +1697,27 @@ class ReconciliationConfig(BaseModel):
     sonnet_model: str = Field(default='sonnet')
     opus_model: str = Field(default='opus')
     opus_threshold_ratio: float = Field(default=1.5)
+    max_backlog_remediation_deferrals: int = Field(
+        default=MAX_BACKLOG_REMEDIATION_DEFERRALS_CEILING,
+        ge=0, le=MAX_BACKLOG_REMEDIATION_DEFERRALS_CEILING,
+        description=(
+            'Task 3049. Number of CONSECUTIVE full cycles for which the inline '
+            'remediation pass may be deferred while the project is in backlog '
+            'mode (buffer size > buffer_size_threshold * opus_threshold_ratio). '
+            'Remediation is an unconditional inline tail of every completed '
+            'run_full_cycle and BacklogIterator runs each chunk as its own full '
+            'cycle, so every chunk otherwise drags in a zero-event remediation '
+            'pass — measured at ~44% of backlog-mode drain wall-clock. Deferring '
+            'is lossless: Stage-3 findings are already persisted in '
+            'stage_reports.integrity_check.items_flagged before this point and '
+            'forward-fed into the next cycle. The cap bounds the debt — after '
+            'this many consecutive deferrals the pass runs anyway, so a '
+            'persistently-deep backlog cannot starve remediation. 0 disables '
+            'deferral entirely, restoring pre-task-3049 behaviour. Bounded '
+            'above by MAX_BACKLOG_REMEDIATION_DEFERRALS_CEILING so the streak '
+            'cannot outlast the integrity-finding recurrence threshold.'
+        ),
+    )
     sonnet_episode_limit: int = Field(default=125)
     sonnet_memory_limit: int = Field(default=250)
     opus_episode_limit: int = Field(default=500)
@@ -1769,6 +1825,37 @@ class ReconciliationConfig(BaseModel):
         ),
     )
 
+    # Topic-anchored canonical recall (task 3111): the READ-side counterpart to the
+    # write-side duplicate guards above. Consolidating a near-duplicate cluster into
+    # one canonical makes that canonical the LEAST retrievable member of its own
+    # cluster -- it is long and general, each surviving sibling is a tighter cosine
+    # match -- so at limit=5 the window fills with siblings and the record that
+    # answers the question never appears. Same ownership note as the near-dup fields
+    # above: enforced in the SERVICE read path (services/topic_anchor.py::
+    # resolve_topic_anchor_enabled + the anchoring block in MemoryService.search),
+    # colocated on ReconciliationConfig because it is the retrieval-side counterpart
+    # to the same duplicate-accretion problem Stage-1 consolidation creates, NOT
+    # because the reconciliation subsystem executes it. Read live per
+    # MemoryService.search off the shared config object, so it satisfies the
+    # reload.py live-read reload-safety rule.
+    topic_anchored_recall_enabled: bool = Field(
+        default=True,
+        description=(
+            'Enable the topic-anchored canonical pin in MemoryService.search. When '
+            "True, a search whose Mem0 results carry a metadata.topic looks up that "
+            "topic's canonical:true record and PROMOTES it to index 0 of the returned "
+            'window, flagged topic_anchored=True. Green-tier hot-reloadable via the '
+            'reload_config MCP tool (read live per MemoryService.search by '
+            'resolve_topic_anchor_enabled in services/topic_anchor.py, off the shared '
+            'config object and never captured at construction, so a reload takes '
+            'effect on the next search with no restart). The promoting pin is the arm '
+            "SELECTED BY MEASUREMENT in task 4004 (plans/read-transform-selection-"
+            'report.md, recommendation.arm = promoting_pin): claim recall 1.00 at '
+            '1070.27 tokens/query against a 1181.29 baseline, dropping no ranked '
+            'records. False disables the transform entirely, so every search skips '
+            'the extra backend round-trip.'
+        ),
+    )
 
 class TicketJanitorConfig(BaseModel):
     """Background sweep that surfaces failed tickets to the orchestrator.
@@ -1845,8 +1932,23 @@ class CuratorConfig(BaseModel):
     pool_dependency_cap: int = Field(default=3)
     pool_total_cap: int = Field(default=30)
 
-    # Lock-key depth must match the scheduler's lock_depth to make module-pool
-    # matching scheduler-consistent. Default 2 matches shared.locking defaults.
+    # COARSE FALLBACK ONLY — this is not the depth the curator normally uses.
+    # Module-pool keys must match the *scheduler's* lock_depth to be
+    # scheduler-consistent, and that depth is per-project (measured 2026-08-07
+    # across the fleet this one server serves: 3, 4, 4, 4, 4, 10, 12). The
+    # curator resolves it per call from <project_root>'s scheduler_state.json
+    # snapshot via ``effective_lock_depth``; this scalar is used only when no
+    # snapshot exists (a freshly onboarded project whose orchestrator has never
+    # run) or it is unreadable. Deliberately COARSE rather than a guess at the
+    # fleet's usual value: a too-fine key under-matches, missing the
+    # overlapping task every time, and costs a DUPLICATE TASK. A too-coarse
+    # key over-matches, which is usually just one LLM look at an irrelevant
+    # pool entry — but not always free: the module stream is ordered by status
+    # and priority, NOT by relevance, then truncated at pool_module_cap, so a
+    # very coarse key against a deep project can push the genuinely
+    # overlapping task past the cap and produce the same duplicate. Coarse
+    # degrades only past the cap where fine fails always, hence the direction;
+    # the fallback is still a fallback, not a good operating point.
     lock_depth: int = Field(default=2)
 
     # Idempotency cache: skip re-invoking the LLM for the same candidate payload

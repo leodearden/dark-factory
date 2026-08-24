@@ -10,10 +10,14 @@ colliding with sibling subprojects' helpers.
 import asyncio
 import contextlib
 import functools
+import importlib.util
 import inspect
 import json
 import os
+import pathlib
 import re
+import sys
+import types
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -1272,3 +1276,184 @@ async def reap_leaked_ticket_workers() -> int:
         if task.done():
             reaped += 1
     return reaped
+
+
+# ---------------------------------------------------------------------------
+# Non-package script loading — shared by test_sweep_toolcall_xml_leak.py and
+# test_toolcall_xml_leak_sweep_artifacts.py (task 3738; originally two
+# independent copies of the same loader).
+# ---------------------------------------------------------------------------
+
+# sys.modules keys this helper itself installed. Only these may be REPLACED by
+# a later load of a different file under the same key -- see the shadowing
+# guard in load_script_module().
+_LOADED_SCRIPT_MODULE_NAMES: set[str] = set()
+
+
+def load_script_module(
+    script_path: pathlib.Path, mod_name: str | None = None
+) -> types.ModuleType:
+    """Load a non-package script (e.g. under ``scripts/``) by file path.
+
+    ``scripts/`` is not a package and its modules are not on ``PYTHONPATH``,
+    so this is how a script's pure functions get imported into a test without
+    ``sys.path`` pollution. *mod_name* defaults to the file stem and is the
+    key the module is registered under in ``sys.modules``.
+
+    An already-loaded module for the SAME file is reused rather than
+    re-executed: two independent test modules loading the same script under
+    the same *mod_name* would otherwise make the second load silently
+    replace the first module object in ``sys.modules`` -- two live module
+    objects whose identity depends on collection order. Harmless while only
+    pure functions are used, but a latent hazard the moment anything holds
+    module state.
+
+    A ``sys.modules`` entry this helper did NOT install is never replaced:
+    that raises ``ImportError`` instead. The stem default makes accidental
+    collisions easy to write (``scripts/config.py``, ``scripts/utils.py``,
+    ``scripts/types.py`` are ordinary script names), and a silent replacement
+    persists for the rest of the pytest process, so the damage would surface
+    as an unrelated test failing far away. Deliberate key SHARING -- two test
+    modules loading the same script, or a test loading a different file under
+    a key this helper owns -- is unaffected.
+    """
+    name = mod_name or script_path.stem
+    cached = sys.modules.get(name)
+    cached_file = getattr(cached, '__file__', None)
+    if cached is not None and cached_file is not None and (
+        pathlib.Path(cached_file).resolve() == script_path.resolve()
+    ):
+        return cached
+    if cached is not None and name not in _LOADED_SCRIPT_MODULE_NAMES:
+        raise ImportError(
+            f'refusing to shadow already-imported module {name!r} '
+            f'(from {cached_file!r}) with {script_path}; '
+            'pass an explicit mod_name that does not collide'
+        )
+    spec = importlib.util.spec_from_file_location(name, script_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f'Cannot load {script_path}')
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    _LOADED_SCRIPT_MODULE_NAMES.add(name)
+    try:
+        spec.loader.exec_module(module)  # type: ignore[union-attr]
+    except Exception:
+        # The failed load left nothing installed under *name*, so ownership
+        # lapses with it: a later real import of that name must be protected
+        # by the guard above rather than treated as this helper's to replace.
+        sys.modules.pop(name, None)
+        _LOADED_SCRIPT_MODULE_NAMES.discard(name)
+        raise
+    return module
+
+
+# ---------------------------------------------------------------------------
+# Cross-run citation repair fixtures (task 3065)
+#
+# Shared by BOTH tests/reconciliation/test_citation_repair.py and
+# tests/server/test_recon_report_citation_repair.py — one definition here rather
+# than a copy in each module, so the journal shape the repair path reads and the
+# lookup verdicts it branches on cannot drift between the two suites.
+# ---------------------------------------------------------------------------
+
+
+async def build_journal_with_closed_run(
+    tmp_path: Any,
+    *,
+    run_id: str,
+    project_id: str = 'reify',
+    status: str = 'completed',
+    stage: str = 'memory_consolidator',
+    findings: list[dict[str, Any]],
+    extra_stage_reports: dict[str, Any] | None = None,
+):
+    """Open a real ``ReconciliationJournal`` holding one run with ``findings``.
+
+    A REAL journal on a tmp_path SQLite file, not a fake: the repair path's whole
+    reason to exist is that a closed run's findings live only in the journal's
+    ``runs.stage_reports`` blob, so a test that stubbed the round-trip would stop
+    exercising the one thing under test (``StageReport`` parse on read,
+    ``model_dump(mode='json')`` re-serialize on write).
+
+    ``findings`` becomes ``stage_reports[stage].items_flagged``.
+    ``extra_stage_reports`` is merged in verbatim AFTER that entry, so a caller
+    can seed a second real stage or a raw non-``StageReport`` entry
+    (``{'_error': {...}}``) to prove the stage scan tolerates it.
+
+    Returns the OPEN journal — the caller closes it (``await journal.close()``).
+    """
+    from datetime import UTC, datetime
+
+    from fused_memory.models.reconciliation import (
+        ReconciliationRun,
+        RunStatus,
+        RunType,
+        StageId,
+        StageReport,
+    )
+    from fused_memory.reconciliation.journal import ReconciliationJournal
+
+    journal = ReconciliationJournal(pathlib.Path(tmp_path))
+    await journal.initialize()
+    now = datetime.now(UTC)
+    # ``status``/``stage`` stay plain ``str`` in the signature so a caller writes
+    # the same literal the journal row holds; coerced here because the model
+    # fields are StrEnums (pydantic would coerce anyway — this just makes the
+    # conversion visible to the type checker rather than implicit).
+    await journal.start_run(
+        ReconciliationRun(
+            id=run_id,
+            project_id=project_id,
+            run_type=RunType.full,
+            trigger_reason='test',
+            started_at=now,
+            completed_at=None if status == 'running' else now,
+            status=RunStatus(status),
+        )
+    )
+    reports: dict[str, Any] = {
+        stage: StageReport(
+            stage=StageId(stage),
+            started_at=now,
+            completed_at=now,
+            items_flagged=findings,
+        )
+    }
+    reports.update(extra_stage_reports or {})
+    await journal.update_run_stage_reports(run_id, reports)
+    return journal
+
+
+class FakeMemoryLookup:
+    """Async ``get_memory_by_id`` stub with an explicit per-id verdict.
+
+    The map's value decides the branch, so a test states which of the THREE
+    outcomes it means without any implicit default:
+
+    - ``dict``      -> the memory resolves (live);
+    - ``None``      -> genuinely absent (the only verdict that licenses a repair);
+    - ``Exception`` -> the backend RAISED (unknown, never "absent").
+
+    An id missing from the map resolves to ``None``, matching the real service's
+    not-found return. ``calls`` records every ``(project_id, memory_id)`` in
+    order, so a test can assert a gate fired BEFORE any lookup was attempted.
+
+    Deliberately exposes NO ``get_memory``: ``citation_repair`` reads the
+    replacement's fingerprint off the raw Qdrant payload this returns, not
+    through ``MemoryService.get_memory`` (whose mem0 fingerprint is
+    structurally ``{category: None, agent_id: None, ...}`` — see
+    ``citation_repair._fingerprint_from_record``). A test that needs to pin
+    that non-call subclasses this and adds a recording ``get_memory``.
+    """
+
+    def __init__(self, memories: dict[str, Any] | None = None):
+        self.memories: dict[str, Any] = dict(memories or {})
+        self.calls: list[tuple[str, str]] = []
+
+    async def get_memory_by_id(self, project_id: str, memory_id: str) -> Any:
+        self.calls.append((project_id, memory_id))
+        verdict = self.memories.get(memory_id)
+        if isinstance(verdict, BaseException):
+            raise verdict
+        return verdict

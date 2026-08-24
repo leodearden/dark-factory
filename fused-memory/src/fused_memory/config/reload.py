@@ -53,6 +53,15 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
     # knobs above; _iter_leaves treats the whole list[ProceduralTopicCluster]
     # as a single atomic leaf, so the clusters list reloads atomically (task 2845).
     'reconciliation.procedural_knowledge_topic_guard_clusters',
+    # Read live per MemoryService.search by resolve_topic_anchor_enabled
+    # (services/topic_anchor.py) off the shared memory_service.config.reconciliation
+    # object — never captured at construction — so an in-place reload flips the
+    # topic-anchored canonical pin on the NEXT search without a restart (task
+    # 3111; see TestTopicAnchoredRecallReloadTier, which pins both the live-read
+    # property and the resulting search behaviour change). Registration is
+    # LOAD-BEARING, not cosmetic: anything absent from this frozenset silently
+    # degrades to restart-only.
+    'reconciliation.topic_anchored_recall_enabled',
     # Write-triage band thresholds (task 3130). Written by
     # scripts/calibrate_write_triage.py --write-config, which derives them from
     # measured similarity distributions -- so hot-reload is what lets a

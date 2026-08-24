@@ -9,6 +9,7 @@ back out of the implementation under test.
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from datetime import datetime
 
@@ -16,7 +17,7 @@ import _hold_history_fixtures as F
 import pytest
 
 from orchestrator.event_store import EventStore
-from orchestrator.hold_history import HoldHistory, HoldSpan, iter_hold_spans
+from orchestrator.hold_history import HoldHistory, HoldSpan, iter_hold_spans, modules_of
 
 
 def _offset(posix_seconds: float) -> float:
@@ -1163,7 +1164,7 @@ def test_predicted_remaining_is_scoped_to_the_asking_task():
 # Each branch below exists to keep bad data out of the window rather than to
 # implement a feature, so none of them is reachable from the canonical trace.
 # Left untested, a regression that made one of them swallow REAL data (say
-# ``_modules_of`` returning [] for a well-formed payload) would pass the whole
+# ``modules_of`` returning [] for a well-formed payload) would pass the whole
 # suite — the failure is silent by construction, which is exactly why it needs
 # a direct test rather than incidental coverage.
 
@@ -1230,9 +1231,10 @@ def test_a_lock_row_with_an_unusable_payload_opens_nothing(data):
 
 
 def test_a_bare_string_modules_payload_is_read_as_one_module():
-    """analyze_modules.py:135-136 tolerates the same shape.  It is coerced, not
-    dropped: a string is unambiguous about which single module it names, so
-    discarding it would throw away a real hold."""
+    """It is coerced, not dropped: a string is unambiguous about which single
+    module it names, so discarding it would throw away a real hold.  (Both
+    consumers now get this from ``modules_of``; analyze_modules carried its own
+    copy of the coercion until task 3869.)"""
     rows = [
         dict(F.row(1, 0, 'lock_acquired', task_id='T1'), data={'modules': 'orchestrator/src'}),
         F.release(2, 60, 'T1', ['orchestrator/src']),
@@ -1271,6 +1273,116 @@ def test_record_ignores_an_empty_module_key():
     history.record('', 100.0)
 
     assert history.sample_count(['']) == 0
+
+
+# ===========================================================================
+# modules_of — the ONE "which modules does this event name" rule
+# ===========================================================================
+#
+# Public (task 3869) because ``analyze_modules`` needs the same answer for its
+# dispatch/skip counters, which ``iter_hold_spans`` does not supply.  The
+# alternative — a second copy of the coercion in the CLI — is the lockstep
+# duplication INV-5 exists to forbid, so the rule is pinned directly here
+# rather than only through the spans it feeds.
+
+
+def test_modules_of_returns_the_payload_list_verbatim_and_in_order():
+    """Order is part of the contract: ``analyze_modules`` renders these keys."""
+    row = F.acquire(1, 0, 'T1', ['shared/src', 'orchestrator/src'])
+
+    assert modules_of(row) == ['shared/src', 'orchestrator/src']
+
+
+def test_modules_of_coerces_a_bare_string_to_a_one_element_list():
+    """A string is unambiguous about which single module it names, so coercing
+    keeps a real hold that dropping would throw away."""
+    row = dict(F.row(1, 0, 'lock_acquired', task_id='T1'), data={'modules': 'orchestrator/src'})
+
+    assert modules_of(row) == ['orchestrator/src']
+
+
+@pytest.mark.parametrize(
+    'row',
+    [
+        pytest.param({'event_type': 'lock_acquired'}, id='no-data-key'),
+        pytest.param({'data': None}, id='data-is-None'),
+        pytest.param({'data': 'orchestrator/src'}, id='data-is-not-a-dict'),
+        pytest.param({'data': ['orchestrator/src']}, id='data-is-a-list'),
+        pytest.param({'data': {'modules': 42}}, id='modules-is-not-a-list-or-str'),
+        pytest.param({'data': {'modules': None}}, id='modules-is-None'),
+        pytest.param({'data': {}}, id='modules-key-absent'),
+    ],
+)
+def test_modules_of_returns_empty_for_every_unusable_payload(row):
+    """No modules means no keys — never a phantom '' or 'None' module."""
+    assert modules_of(row) == []
+
+
+def test_modules_of_drops_non_string_and_empty_entries_inside_the_list():
+    """``modules`` is reconstructed from a JSON payload, so the annotation
+    cannot enforce its element type.  An empty-string key would collect samples
+    under a module no lock event can ever name again."""
+    row = dict(F.row(1, 0, 'lock_acquired', task_id='T1'), data={'modules': ['ok', '', 3, None]})
+
+    assert modules_of(row) == ['ok']
+
+
+def test_modules_of_survives_an_unhashable_entry():
+    """De-duplication must not turn junk into a crash.
+
+    ``modules`` is reconstructed from JSON, so it can carry a nested list —
+    unhashable, and therefore fatal to ``dict.fromkeys`` if the de-dup ran
+    before the type filter.  It is dropped like any other non-string.
+    """
+    row = dict(F.row(1, 0, 'lock_acquired', task_id='T1'),
+               data={'modules': ['ok/src', ['nested'], {'k': 'v'}]})
+
+    assert modules_of(row) == ['ok/src']
+
+
+def test_modules_of_de_duplicates_a_repeated_module():
+    """One event names a module once, however many times its payload repeats it.
+
+    Not cosmetic: ``_apply_acquire`` reads the second occurrence as a
+    DOUBLE-ACQUIRE against the span the first just opened (see the next test).
+    """
+    row = F.acquire(1, 0, 'T1', ['shared/src', 'orchestrator/src', 'shared/src'])
+
+    assert modules_of(row) == ['shared/src', 'orchestrator/src'], \
+        'de-duplicated, and in FIRST-seen order'
+
+
+def test_a_repeated_module_in_one_acquire_yields_no_phantom_span():
+    """The end-to-end consequence of the de-dup, pinned on the spans themselves.
+
+    Without it the second ``shared/src`` force-closes the span the first opened
+    at the very same timestamp, so a clean 60s pair reported TWO samples — a
+    0.0s ``truncated`` one and the real one — halving the mean and inventing a
+    censoring signal out of nothing.
+    """
+    rows = [
+        F.acquire(1, 0, 'T1', ['shared/src', 'shared/src']),
+        F.release(2, 60, 'T1', ['shared/src']),
+    ]
+
+    spans = list(iter_hold_spans(rows))
+
+    assert len(spans) == 1
+    assert spans[0].duration == pytest.approx(60.0)
+    assert spans[0].truncated is False
+
+
+def test_the_live_feed_de_duplicates_a_repeated_module_too():
+    """``observe_acquired`` shares ``_clean_modules`` with the durable seed, so
+    the live feed cannot drift into recording the phantom span the seed no
+    longer produces."""
+    history = HoldHistory(min_samples=1)
+
+    history.observe_acquired('T1', ['shared/src', 'shared/src'], at=_at(0))
+    history.observe_released('T1', ['shared/src'], at=_at(60))
+
+    assert history.sample_count(['shared/src']) == 1
+    assert history.predicted_hold(['shared/src']) == pytest.approx(60.0)
 
 
 # ===========================================================================
@@ -1468,3 +1580,180 @@ def test_the_default_staleness_ceiling_is_a_day():
 
     assert history.predicted_remaining('T1', now=_at(86_000)) == pytest.approx(0.0)
     assert history.predicted_remaining('T1', now=_at(86_401)) is None
+
+
+# --- the staleness backstop is PER-KEY, not per-task -----------------------
+#
+# The ceiling asks "is THIS hold bookkeeping residue?" — a per-hold question.
+# Answering it by dropping the whole task took a live sibling hold down with
+# the phantom: no prediction for a task that really is holding, and the live
+# hold's real ``lock_released`` then arrives at an ``_open`` map that no longer
+# has its span, so ``_apply_release`` discards it as an orphan and a genuinely
+# observed hold never becomes a sample.
+
+
+def test_a_stale_hold_does_not_discard_a_live_sibling_hold():
+    """The headline case: one phantom must not cost the task its prediction."""
+    history = _history_of({'fresh/src': [100.0] * 3}, min_samples=3, stale_open_secs=1000.0)
+    history.observe_acquired('T1', ['ghost/src'], at=_at(0))       # release never arrived
+    history.observe_acquired('T1', ['fresh/src'], at=_at(1500))    # genuinely live
+
+    assert history.predicted_remaining('T1', now=_at(1540)) == pytest.approx(60.0)
+    assert history.open_modules('T1') == ['fresh/src']
+
+
+def test_the_surviving_hold_still_records_its_sample_on_release():
+    """The collateral half: sweeping the live span orphans its real release.
+
+    ``_apply_release`` records nothing for a module with no open span, so a
+    hold the feed observed end to end would never become a sample — the
+    predictor silently degrading its own training data.
+    """
+    history = _history_of({'fresh/src': [100.0] * 3}, min_samples=3, stale_open_secs=1000.0)
+    history.observe_acquired('T1', ['ghost/src'], at=_at(0))
+    history.observe_acquired('T1', ['fresh/src'], at=_at(1500))
+
+    history.predicted_remaining('T1', now=_at(1540))
+    history.observe_released('T1', ['fresh/src'], at=_at(1560))
+
+    assert history.sample_count(['fresh/src']) == 4
+
+
+def test_the_remainder_measures_from_the_earliest_SURVIVING_hold():
+    """The earliest-open rule survives the sweep — applied to the LIVE holds.
+
+    Measuring from the phantom (t=0) is what the ceiling rejects; measuring
+    from the latest (1700 -> 350.0) would under-count elapsed, the optimistic
+    direction the rule exists to refuse.  1500 is the answer: 150.0.
+    """
+    history = _history_of(
+        {'b/src': [400.0] * 3, 'c/src': [400.0] * 3}, min_samples=3, stale_open_secs=1000.0
+    )
+    history.observe_acquired('T1', ['ghost/src'], at=_at(0))
+    history.observe_acquired('T1', ['b/src'], at=_at(1500))
+    history.observe_acquired('T1', ['c/src'], at=_at(1700))
+
+    assert history.predicted_remaining('T1', now=_at(1750)) == pytest.approx(150.0)
+    assert history.open_modules('T1') == ['b/src', 'c/src']
+
+
+def test_every_open_hold_stale_still_refuses_and_empties_the_task():
+    """The backstop keeps its purpose: nothing survives, so nothing is answered."""
+    history = _history_of({'a/src': [100.0] * 3}, min_samples=3, stale_open_secs=1000.0)
+    history.observe_acquired('T1', ['a/src'], at=_at(0))
+    history.observe_acquired('T1', ['b/src'], at=_at(100))
+
+    assert history.predicted_remaining('T1', now=_at(2000)) is None
+    assert history.open_modules('T1') == []
+
+
+def test_the_stale_sweep_is_scoped_to_the_asking_task():
+    """It sweeps the asking task's keys, never the whole ``_open`` map."""
+    history = _history_of({'fresh/src': [100.0] * 3}, min_samples=3, stale_open_secs=1000.0)
+    history.observe_acquired('T1', ['ghost/src'], at=_at(0))
+    history.observe_acquired('T1', ['fresh/src'], at=_at(1500))
+    history.observe_acquired('T2', ['t2ghost/src'], at=_at(0))
+
+    history.predicted_remaining('T1', now=_at(1540))
+
+    assert history.open_modules('T2') == ['t2ghost/src']
+
+
+def test_forget_is_still_all_or_nothing_when_only_some_holds_are_stale():
+    """The contract this deliberately does NOT change.
+
+    ``forget`` answers a different question — ``Scheduler.release`` is the
+    single writer that drops ALL of a task's locks — so it must not inherit the
+    per-key rule the staleness backstop needs.
+    """
+    history = _history_of({'fresh/src': [100.0] * 3}, min_samples=3, stale_open_secs=1000.0)
+    history.observe_acquired('T1', ['ghost/src'], at=_at(0))
+    history.observe_acquired('T1', ['fresh/src'], at=_at(1500))
+
+    assert history.forget('T1') == 2
+    assert history.open_modules('T1') == []
+
+
+# --- what the staleness warning tells the operator -------------------------
+#
+# This is the ONE channel that says which entries the backstop consumed, so a
+# message that over-claims sends an operator hunting a hold that is still live.
+# The two outcomes the sweep can now produce — a partial drop that still
+# answers, and an all-stale drop that refuses — must be distinguishable here.
+
+
+def _warnings(caplog):
+    """The records this module emitted, never another logger's."""
+    return [r for r in caplog.records if r.name == 'orchestrator.hold_history']
+
+
+def test_the_stale_warning_names_only_the_holds_it_dropped(caplog):
+    history = _history_of({'fresh/src': [100.0] * 3}, min_samples=3, stale_open_secs=1000.0)
+    history.observe_acquired('T1', ['ghost/src'], at=_at(0))
+    history.observe_acquired('T1', ['fresh/src'], at=_at(1500))
+
+    with caplog.at_level(logging.WARNING, logger='orchestrator.hold_history'):
+        assert history.predicted_remaining('T1', now=_at(1540)) == pytest.approx(60.0)
+
+    records = _warnings(caplog)
+    assert len(records) == 1
+    # The facts, off the %-args rather than the rendered prose — the wording is
+    # the operator's to reword, the args are the contract.
+    assert records[0].args[0] == 'T1'
+    assert records[0].args[1] == 1                  # one hold consumed
+    assert records[0].args[3] == ['ghost/src']      # and it names exactly that one
+    # The one property only the whole rendered line can carry: a live hold must
+    # not appear anywhere in it, however the message is phrased.
+    assert 'fresh/src' not in records[0].getMessage()
+
+
+def test_the_stale_warning_reports_the_surviving_hold_count(caplog):
+    """The partial drop and the total drop must be distinguishable."""
+    partial = _history_of({'fresh/src': [100.0] * 3}, min_samples=3, stale_open_secs=1000.0)
+    partial.observe_acquired('T1', ['ghost/src'], at=_at(0))
+    partial.observe_acquired('T1', ['fresh/src'], at=_at(1500))
+
+    with caplog.at_level(logging.WARNING, logger='orchestrator.hold_history'):
+        assert partial.predicted_remaining('T1', now=_at(1540)) == pytest.approx(60.0)
+    assert _warnings(caplog)[-1].args[1] == 1  # dropped
+    assert _warnings(caplog)[-1].args[4] == 1  # survived
+
+    caplog.clear()
+    all_stale = _history_of({'a/src': [100.0] * 3}, min_samples=3, stale_open_secs=1000.0)
+    all_stale.observe_acquired('T1', ['a/src'], at=_at(0))
+    all_stale.observe_acquired('T1', ['b/src'], at=_at(100))
+
+    with caplog.at_level(logging.WARNING, logger='orchestrator.hold_history'):
+        assert all_stale.predicted_remaining('T1', now=_at(2000)) is None
+    assert _warnings(caplog)[-1].args[1] == 2  # dropped
+    assert _warnings(caplog)[-1].args[4] == 0  # nothing survived
+
+
+def test_the_sweep_warns_once_per_missed_release_not_once_per_call(caplog):
+    """The sweep must DELETE, not just report — this method runs per scan.
+
+    ``predicted_remaining`` is called once per blocking holder per park owner
+    per scored scan (``_compute_provable_assembly_delay``), so a sweep that
+    computed ``dropped`` without removing the keys would keep every other
+    assertion here green while logging a WARNING per holder per tick forever.
+    """
+    history = _history_of({'fresh/src': [100.0] * 3}, min_samples=3, stale_open_secs=1000.0)
+    history.observe_acquired('T1', ['ghost/src'], at=_at(0))
+    history.observe_acquired('T1', ['fresh/src'], at=_at(1500))
+
+    with caplog.at_level(logging.WARNING, logger='orchestrator.hold_history'):
+        assert history.predicted_remaining('T1', now=_at(1540)) == pytest.approx(60.0)
+        assert history.predicted_remaining('T1', now=_at(1540)) == pytest.approx(60.0)
+
+    assert len(_warnings(caplog)) == 1
+
+
+def test_a_task_holding_only_fresh_locks_says_nothing(caplog):
+    """The quiet happy path — the overwhelmingly common one."""
+    history = _history_of({'fresh/src': [100.0] * 3}, min_samples=3, stale_open_secs=1000.0)
+    history.observe_acquired('T1', ['fresh/src'], at=_at(1500))
+
+    with caplog.at_level(logging.WARNING, logger='orchestrator.hold_history'):
+        assert history.predicted_remaining('T1', now=_at(1540)) == pytest.approx(60.0)
+
+    assert _warnings(caplog) == []

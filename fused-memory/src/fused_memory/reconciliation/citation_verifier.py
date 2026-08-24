@@ -1,8 +1,9 @@
 """Citation integrity for Stage-1 reconciliation (tasks 2978, 3108).
 
-This module owns one invariant end-to-end: **a cited memory id must resolve.**
-It covers both halves of that invariant, so there is one owner rather than two
-mechanisms that can drift.
+This module owns one invariant for the run in flight: **a cited memory id must
+resolve.** It covers both halves of that invariant *within the current run*, so
+there is one owner rather than two mechanisms that can drift. The closed-run
+half lives next door — see "Where this module stops" below.
 
 Half 1 — recon-report citations (task 2978). ``verify_cited_memories`` walks
 each finding's ``cited_memories`` list and re-resolves every cited Mem0 id
@@ -22,6 +23,22 @@ execute AFTER the delete and could only report damage. Their stats therefore
 ride back on the ``delete_memory`` response under ``citation_repoint`` and
 deliberately carry NO ``stage1_`` prefix — they are tool-response stats, not
 stage-report stats.
+
+**Where this module stops** (task 3065). Both halves above act on state that is
+still in flight: ``verify_cited_memories`` drops phantom citations from the
+CURRENT run's in-progress report, and the repoint helpers rewrite live task
+metadata at the moment of deletion. Neither can reach a finding whose owning run
+already completed — that run's recon-report state is TTL-evicted (300s) and its
+shadow rows are GC'd at quiescence, so within minutes the only surviving copy is
+the journal's durable ``runs.stage_reports`` blob.
+
+Repairing a citation *there* is ``reconciliation/citation_repair.py``. The
+boundary is the run's lifetime, not the kind of defect: while a run is live this
+module owns the invariant and ``citation_repair`` refuses (``run_still_live``);
+once the run is closed, ``citation_repair.repair_memory_citation`` is the only
+thing that can reach the finding, and it rewrites the journal blob. It reuses
+this module's lookup primitive and its three-way found/absent/raised verdict on
+purpose, so the two owners cannot disagree about what a backend timeout means.
 
 **A tombstone is provenance, never a live pointer.** This is the one rationale
 the rest of the module refers back to rather than restating.

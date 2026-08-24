@@ -547,7 +547,10 @@ class TestMaterializeBGroupedArm:
             assert kind in KIND_REGISTRY
 
     def test_parent_ids_are_canonical_dashed_uuids(self):
-        """β's `_is_full_uuid` rule: 36 chars, dashed, and its own str() round-trip.
+        """The `parent_id` shape rule: 36 chars, dashed, own str() round-trip.
+
+        The rule is `fused_memory.utils.validation.is_full_uuid`, enforced by
+        β's `validate_memory_metadata`.
 
         A short hex id or a bare hex32 would trip `invalid_parent_id_shape`,
         so the arm cannot mint ids casually.
@@ -2174,9 +2177,17 @@ class TestGuardAdequacyUsesTheRealSelector:
         assert len(seen['results']) == 1
 
     def test_it_hands_the_selector_real_memory_result_objects(self, monkeypatch):
-        """The selector reads `.category` / `.source_store` as ENUMS and
-        `.relevance_score`; dicts would raise, and dicts-with-strings would
-        silently fail every comparison and report "guard never fires"."""
+        """The selector reads `.category` / `.source_store` as ENUMS and the
+        cosine from `.metadata['store_score']`; dicts would raise, and
+        dicts-with-strings would silently fail every comparison and report
+        "guard never fires".
+
+        The cosine's placement is asserted because getting it wrong is silent:
+        since task 3658 the guard thresholds on `metadata['store_score']`, so
+        an adapter that left the cosine in `relevance_score` would make
+        guard_adequacy report `guard_matched: False` for every arm in the
+        program rather than raising.
+        """
         from fused_memory.models.enums import MemoryCategory, SourceStore  # noqa: PLC0415
         from fused_memory.models.memory import MemoryResult  # noqa: PLC0415
         from fused_memory.server import near_duplicate_guard  # noqa: PLC0415
@@ -2193,8 +2204,14 @@ class TestGuardAdequacyUsesTheRealSelector:
         assert all(isinstance(r, MemoryResult) for r in captured)
         assert captured[0].category is MemoryCategory.procedural_knowledge
         assert captured[0].source_store is SourceStore.mem0
-        assert captured[0].relevance_score == 0.95
         assert captured[0].id == 's0'
+        # The arm's cosine, where the guard actually reads it.
+        assert captured[0].metadata['store_score'] == 0.95
+        assert captured[1].metadata['store_score'] == 0.10
+        # ...and the post-fusion shape production really produces: a 1-based
+        # window rank and the ordinal RRF value, not the cosine.
+        assert [r.metadata['store_rank'] for r in captured] == [1, 2]
+        assert captured[0].relevance_score == pytest.approx(1.0 / 61)
 
     def test_the_adapter_preserves_rank_order(self):
         """The selector takes the max by score, but the report quotes the

@@ -23,6 +23,54 @@ import subprocess
 import pytest
 
 # ---------------------------------------------------------------------------
+# Unit-file section parsing, and the orchestrator template glob
+#
+# Lifted here by task 3746, when the setup-host.sh installer suite and the
+# SETUP.md operator-remediation suite moved out of
+# tests/scripts/test_orchestrator_service_files.py into
+# tests/scripts/test_setup_host_unit_installation.py.  Both helpers were
+# private to that module; the split puts a consumer on BOTH sides of it — the
+# per-unit shape suite that stayed, and the installer / operator-doc suites
+# that left — which is exactly this module's admission criterion.
+#
+# Duplicating them into the new module instead is what the origin module's own
+# docstring argued against, and for parse_sections it would have produced the
+# THIRD hand-copy in this directory: tests/scripts/test_orchestrator_watchdog.py
+# still carries a private _unit_sections copy of the same six lines.
+#
+# Neither helper carries a test function here (this module holds none); their
+# guards stay in test_orchestrator_service_files.py, which still owns
+# test_orchestrator_service_glob_covers_all_known_units for the glob and
+# exercises parse_sections through the [Unit]/[Service] placement suite.
+# ---------------------------------------------------------------------------
+
+REPO_ROOT = pathlib.Path(__file__).parents[2]
+
+
+def parse_sections(content: str) -> dict[str, list[str]]:
+    """Split unit-file text into {section_name: [lines]} (header line excluded)."""
+    sections: dict[str, list[str]] = {}
+    current: str | None = None
+    for line in content.splitlines():
+        if line.startswith("[") and line.endswith("]"):
+            current = line[1:-1]
+            sections[current] = []
+        elif current is not None:
+            sections[current].append(line)
+    return sections
+
+
+# Discovered by glob rather than hand-listed, so a new orchestrator template is
+# covered by every consuming guard the day it lands.  The counterpart guard
+# test_orchestrator_service_glob_covers_all_known_units pins the glob against a
+# known-basename set, so a glob that silently matched nothing cannot make the
+# suites that iterate this list pass vacuously.
+ALL_ORCHESTRATOR_SERVICE_FILES = sorted(
+    (REPO_ROOT / "scripts").glob("orchestrator-*.service")
+)
+
+
+# ---------------------------------------------------------------------------
 # Installed-unit location
 #
 # Where setup-host.sh actually writes.  Lifted here by task 3763 from
@@ -69,6 +117,113 @@ def require_installed_unit(basename: str) -> pathlib.Path:
             "runner with no installed orchestrator units)"
         )
     return path
+
+
+# ---------------------------------------------------------------------------
+# The `--config` argument of an ExecStart=
+#
+# LIFT TRIGGER: a SECOND consumer appeared.  The canonical parser lived in
+# tests/scripts/test_orchestrator_service_files.py, task 3642 hand-copied it
+# (and CANONICAL_CONFIG_BASENAME) into test_know_live_installed_unit_parity.py,
+# and task 3773 lifted both here — same trigger and same reasoning that brought
+# systemctl_user_show here under task 3763, except that these two copies had
+# ALREADY drifted, answering a dangling `--config` two different ways.
+#
+# The single reconciled contract that resolved that drift is stated ONCE, on
+# config_arg_from_exec_start below; every other site in this directory points
+# at that docstring rather than restating it, because prose copies drift the
+# same way code copies do and nothing keeps them in step.
+#
+# WHAT DID NOT MOVE, and why: `_exec_start_line` (file content -> the
+# ExecStart= line) stayed in test_orchestrator_service_files.py and
+# `_argv_from_exec_start_show` (systemctl struct -> argv) stayed in
+# test_know_live_installed_unit_parity.py.  Each still has exactly ONE
+# consumer, and this module's lift trigger is a second consumer, not proximity
+# or tidiness: lifting a single-consumer helper buys no de-duplication while
+# widening this module's surface.  Their negative-case guards stay with them,
+# per the same convention that kept systemctl_user_show's where it was written.
+# ---------------------------------------------------------------------------
+
+# CLAUDE.md makes `<project_root>/dark-factory-orchestrator.yaml` the
+# canonical, REQUIRED filename: the dashboard's escalation-URL discovery
+# (`_discover_escalation_urls`) keys on that exact string, and legacy spellings
+# (`orchestrator.yaml`, `orchestrator-config.yaml`, `orchestrator/config.yaml`)
+# are honoured only as a discovery fallback for not-yet-migrated projects,
+# never as a supported choice for new ones.
+CANONICAL_CONFIG_BASENAME = "dark-factory-orchestrator.yaml"
+
+
+class MalformedExecStart(ValueError):
+    """A unit's ExecStart= is broken — never a legitimate "no --config" answer.
+
+    Kept distinct from the ``None`` return below so the two can be handled
+    oppositely: ``None`` means "this unit takes no ``--config``" and callers
+    SKIP on it, while this class means the unit (or the parser) is defective
+    and must FAIL.  Which inputs land where is the contract on
+    config_arg_from_exec_start below, stated there once.
+
+    Also raised by callers that own the OTHER half of a parse — locating the
+    ExecStart= text before the scan sees it (cf. test_orchestrator_service_
+    files._exec_start_line) — so a broken unit surfaces as one class whichever
+    layer notices it first.
+    """
+
+
+def config_arg_from_exec_start(
+    exec_start_value: str, unit_name: str = "<unit>"
+) -> str | None:
+    """Return the `--config` argument in *exec_start_value*, or None if absent.
+
+    THE CONTRACT, stated here ONCE — every other site points at this docstring.
+
+    None means exactly ONE thing: the string carries no ``--config`` flag at
+    all.  That is a real answer, not a parse failure — orchestrator-watchdog.
+    service runs a probe script that takes no ``--config`` — and callers SKIP
+    on it, so the watchdog is not dragged into an invariant that does not apply
+    to it.  Every OTHER way of producing no value raises MalformedExecStart: a
+    dangling ``--config`` as the final token, and the ``--config=`` spelling
+    with an empty value.  Both describe a unit that would start the
+    orchestrator with no config path at all, and collapsing either into None is
+    how a guard waves through the drift it exists to catch.  Verified before
+    the two copies were reconciled onto this contract: every committed unit
+    uses the space-separated form with a real path, so tightening moved no live
+    verdict — only the failure text.  (A caller that has to LOCATE the
+    ExecStart= text first owns the third no-value case, a unit with no usable
+    ExecStart= line, and raises the same class for the same reason.)
+
+    *exec_start_value* may be a whole ``ExecStart=`` line, just its value, or
+    the ``argv[]=`` segment of a ``systemctl show`` struct: the scan looks only
+    for ``--config`` tokens and is prefix-agnostic.  That looseness is not
+    laxity — the three call sites genuinely hold those three shapes, and
+    normalising at the boundary would have meant three wrappers or three
+    copies.  *unit_name* is pure diagnostics, interpolated into both raises so
+    the caller's context (a unit path, or a ``systemctl --user show ...``
+    provenance string) survives into the failure; the messages say "command
+    line" rather than "ExecStart= line" precisely because two of those three
+    accepted shapes are not one.
+    """
+    tokens = exec_start_value.split()
+    for i, token in enumerate(tokens):
+        if token == "--config":
+            if i + 1 >= len(tokens):
+                raise MalformedExecStart(
+                    f"{unit_name}: `--config` is the last token of the command "
+                    "line inspected, with no value after it. The orchestrator "
+                    "would start with no config path at all. Command line "
+                    f"inspected: {' '.join(tokens)!r}"
+                )
+            return tokens[i + 1]
+        if token.startswith("--config="):
+            value = token.split("=", 1)[1]
+            if not value:
+                raise MalformedExecStart(
+                    f"{unit_name}: `--config=` carries an empty value. The "
+                    "orchestrator would start with no config path at all — the "
+                    "same defect as a dangling `--config`, in the other "
+                    f"spelling. Command line inspected: {' '.join(tokens)!r}"
+                )
+            return value
+    return None
 
 
 # ---------------------------------------------------------------------------

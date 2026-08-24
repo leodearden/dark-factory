@@ -2874,6 +2874,100 @@ class TestStaleStatusSnapshotEdgeSweepWiring:
         )
 
     @pytest.mark.asyncio
+    async def test_run_retires_a_stale_blocked_assertion_and_supersedes_it(self):
+        """The headline stat assertion for task 3037.
+
+        One blocked-assertion edge whose task has since been unblocked to
+        'pending', beside a genuinely-still-blocked control edge. run() must
+        retire ONLY the unblocked one — end-to-end through the real
+        sweep_stale_status_snapshot_edges orchestration and the wired backend
+        calls — and surface it in
+        report.stats['stale_status_snapshot_edges_invalidated'].
+
+        This is the reading the task was filed against: the sweep reported
+        invalidated=0 of 6312 scanned on a cycle where a blocked edge WAS
+        retired, because the terminal-only selection rule never selected it
+        and the Stage-1 agent had to retire it ad hoc via the MCP tool —
+        where no sweep counter can observe it. Routing the blocked rule
+        through the same counted loop is what makes the stat true.
+
+        report.stats['stale_blocked_edges_superseded'] is asserted on the
+        same run so the new deterministic step's OWN effect is observable in
+        Stage-1 stats, not merely inside the sweep's return value.
+        """
+        stage = _make_consolidator(project_root='/tmp/reify')
+
+        unblocked_edge = {
+            'uuid': 'edge-2848',
+            'fact': 'Task 2848 remains blocked as of 2026-07-22',
+            'name': '',
+        }
+        still_blocked_edge = {
+            'uuid': 'edge-3001', 'fact': 'Task 3001 is blocked.', 'name': '',
+        }
+        stage.memory.graphiti.get_all_valid_edges = AsyncMock(
+            return_value={'entity-a': [unblocked_edge, still_blocked_edge]},
+        )
+        assert stage.taskmaster is not None  # AsyncMock() from _make_consolidator
+        stage.taskmaster.get_statuses = AsyncMock(
+            return_value={'2848': 'pending', '3001': 'blocked'},
+        )
+        stage.memory.update_edge = AsyncMock()
+        stage.memory.add_memory = AsyncMock()
+
+        base_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+        )
+
+        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='test_project'),
+                prior_reports=[],
+                run_id='run-3037-wiring',
+            )
+
+        stage.memory.update_edge.assert_awaited_once()
+        assert stage.memory.update_edge.await_args is not None
+        assert stage.memory.update_edge.await_args.args[0] == 'edge-2848', (
+            'Expected update_edge awaited for the unblocked task\'s edge only — '
+            'the still-blocked control edge must survive; got '
+            f'{stage.memory.update_edge.await_args!r}'
+        )
+
+        assert report.stats.get('stale_status_snapshot_edges_invalidated') == 1, (
+            "Expected report.stats['stale_status_snapshot_edges_invalidated'] == 1 "
+            f'for the blocked->pending retirement; got stats={report.stats!r}. '
+            'A 0 here is the 0-of-N reading this task was filed against.'
+        )
+        assert report.stats.get('stale_status_snapshot_edges_scanned') == 2
+
+        assert report.stats.get('stale_blocked_edges_superseded') == 1, (
+            "Expected report.stats['stale_blocked_edges_superseded'] == 1 so the "
+            "new deterministic step's own effect is observable in Stage-1 stats; "
+            f'got stats={report.stats!r}'
+        )
+
+        # The superseding write's two failure modes are surfaced beside its
+        # success count, so a 0 there is readable. Without them an operator
+        # cannot tell "nothing needed superseding" from "every write failed"
+        # or "the per-cycle ceiling truncated them" — the log is the channel
+        # this task established is insufficient. (amendment,
+        # reviewer_comprehensive observability finding)
+        assert report.stats.get('stale_blocked_edges_supersede_errors') == 0, (
+            f'Expected the supersede-failure counter surfaced at 0 on a clean '
+            f'run rather than absent; got stats={report.stats!r}'
+        )
+        assert report.stats.get('stale_blocked_edges_supersede_skipped') == 0, (
+            f'Expected the ceiling-truncation counter surfaced at 0 on a clean '
+            f'run rather than absent; got stats={report.stats!r}'
+        )
+
+    @pytest.mark.asyncio
     async def test_sweep_failure_is_swallowed_and_other_stats_remain_intact(self):
         """sweep_stale_status_snapshot_edges raising must not blow up run() or
         blank other stats — mirrors the degenerate-sweep backstop.
@@ -2934,6 +3028,16 @@ class TestStaleStatusSnapshotEdgeSweepWiring:
             'stale_status_snapshot_edges_invalidated stat'
         )
         assert 'stale_status_snapshot_edges_scanned' not in report.stats
+        for key in (
+            'stale_blocked_edges_superseded',
+            'stale_blocked_edges_supersede_errors',
+            'stale_blocked_edges_supersede_skipped',
+        ):
+            assert key not in report.stats, (
+                f'The task-3037 stat {key!r} follows the same convention as its '
+                'siblings: a failed sweep sets NO key at all, rather than a 0 '
+                'that would read as "the sweep ran and found nothing"'
+            )
 
 
 class TestStalePriorityOverrideEdgeSweepWiring:
@@ -3175,16 +3279,18 @@ class TestAlreadyTrackedSystemicPatternWiring:
         )
 
     @pytest.mark.asyncio
-    async def test_finding_kept_when_dark_factory_not_a_known_project(self):
-        """No-op guard: finding survives when known_projects lacks 'dark_factory'.
+    async def test_finding_kept_when_no_known_projects_are_registered(self):
+        """No-op guard: finding survives when known_projects is empty.
 
-        Exercises the fail-open path when the harness never registers
-        dark_factory (e.g. a single-project test/deployment harness) — the
-        resolved dark_factory_root is None, so the filter must degrade to a
-        pass-through rather than erroring or dropping anything.
+        Exercises the fail-open path when the harness never populates the
+        cross-project routing map (e.g. a single-project test/deployment
+        harness) — the filter is handed an empty known_projects (task 4381
+        widened the parameter from a single resolved dark_factory_root) and
+        must degrade to a pass-through rather than erroring or dropping
+        anything.
         """
         stage = _make_consolidator(project_root='/tmp/reify')
-        stage.known_projects = {}  # dark_factory not registered
+        stage.known_projects = {}  # no cross-project routing map
         assert stage.taskmaster is not None  # AsyncMock() from _make_consolidator
         stage.taskmaster.get_tasks = AsyncMock(return_value={
             'tasks': [self._make_matching_done_task()],
@@ -3215,8 +3321,330 @@ class TestAlreadyTrackedSystemicPatternWiring:
             )
 
         assert never_tracked_flag in report.items_flagged, (
-            'Finding must be KEPT when dark_factory is not in known_projects '
+            'Finding must be KEPT when known_projects is empty '
             f'(no-op guard); got items_flagged={report.items_flagged!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# ---- task 4381 step-11 ----
+# RED: MemoryConsolidator must feed dedup_flags the cross-project map.
+# ---------------------------------------------------------------------------
+
+
+class TestDedupFlagsCrossProjectWiring:
+    """MemoryConsolidator.run() must hand dedup_flags the cross-project map
+    (task 4381), so its HIT-path fix-task suppression gate can run at all.
+
+    Without ``taskmaster=`` AND ``known_projects=``, dedup_flags degrades to
+    its pre-4381 behaviour by design — a silent no-op that no other assertion
+    in the suite would catch.
+
+    RED until step-12 wires both kwargs through.
+    """
+
+    def _make_flag(self) -> dict:
+        return {
+            'task_id': '598',
+            'flag_type': 'remediation_payload_live_workflow_signals_gap',
+            'description': 'the remediation payload omits live workflow signals',
+            'cited_tasks': [{'project_id': 'dark_factory', 'task_id': '3839', 'title': 'Fix'}],
+        }
+
+    async def _run_with_dedup_mock(self, stage, flags, dedup_mock):
+        base_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=list(flags),
+            stats={},
+        )
+        with (
+            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                new=dedup_mock,
+            ),
+        ):
+            return await stage.run(
+                events=[],
+                watermark=Watermark(project_id='test_project'),
+                prior_reports=[],
+                run_id='run-4381-step11',
+            )
+
+    @pytest.mark.asyncio
+    async def test_run_passes_taskmaster_and_known_projects_to_dedup_flags(self):
+        """run() forwards self.taskmaster and self.known_projects."""
+        stage = _make_consolidator(project_root='/tmp/reify')
+        stage.known_projects = {'dark_factory': '/df'}
+        assert stage.taskmaster is not None  # AsyncMock() from _make_consolidator
+        stage.taskmaster.get_tasks = AsyncMock(return_value={'tasks': []})
+        dedup_mock = AsyncMock(side_effect=lambda **kw: kw['flags'])
+
+        await self._run_with_dedup_mock(stage, [self._make_flag()], dedup_mock)
+
+        assert dedup_mock.await_count >= 1, 'dedup_flags must be called'
+        assert dedup_mock.await_args is not None
+        kwargs = dedup_mock.await_args.kwargs
+        assert kwargs.get('taskmaster') is stage.taskmaster, (
+            'run() must pass taskmaster= to dedup_flags or the cross-project '
+            f'suppression gate can never run; got kwargs={sorted(kwargs)!r}'
+        )
+        assert kwargs.get('known_projects') == {'dark_factory': '/df'}, (
+            'run() must pass known_projects= to dedup_flags; got '
+            f'known_projects={kwargs.get("known_projects")!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_default_empty_known_projects_still_completes(self):
+        """Degradation guard: a stage with the default known_projects={} still
+        completes and keeps the flag, so the wiring cannot regress into a hard
+        dependency on cross-project routing."""
+        stage = _make_consolidator(project_root='/tmp/reify')
+        stage.known_projects = {}
+        assert stage.taskmaster is not None
+        stage.taskmaster.get_tasks = AsyncMock(return_value={'tasks': []})
+        flag = self._make_flag()
+        dedup_mock = AsyncMock(side_effect=lambda **kw: kw['flags'])
+
+        report = await self._run_with_dedup_mock(stage, [flag], dedup_mock)
+
+        assert flag in report.items_flagged, (
+            f'the flag must survive without cross-project routing; got {report.items_flagged!r}'
+        )
+        assert dedup_mock.await_args is not None
+        assert dedup_mock.await_args.kwargs.get('known_projects') == {}, (
+            'the empty map must still be forwarded verbatim; got '
+            f'{dedup_mock.await_args.kwargs.get("known_projects")!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Task 4381 (amendment pass — code-review fix): integration coverage for the
+# acknowledge carve-out memory_consolidator.run() documents but nothing tested.
+# TestDedupFlagsCrossProjectWiring above patches dedup_flags out entirely, so a
+# cross-project drop never flowed through the _pre_dedup_flags /
+# _post_dedup_signatures diff.  This class runs the REAL dedup_flags against a
+# REAL ReconLedgerStore instead.
+# ---------------------------------------------------------------------------
+
+
+class TestCrossProjectSuppressedFlagIsNotAcknowledged:
+    """A flag dropped by dedup_flags' cross-project fix-task gate must NOT be
+    handed to acknowledge_resolved_flags (task 4381).
+
+    ``run()`` folds every drop made INSIDE dedup_flags into
+    ``suppressed_signatures`` and subtracts that set from ``dropped_flags``, so
+    the flag's ``stage1_flag_marker`` keeps its recurrence history for the day
+    the cross-project fix task is cancelled or closed without landing — a FILED
+    fix task is not a LANDED one.
+
+    Exercised end-to-end: no dedup_flags patch, a real ledger-backed marker
+    (the gate is HIT-only, so the signature must have been seen in a prior
+    run), and a live non-cancelled FOREIGN fix task resolved through the real
+    ``taskmaster.get_task``.  Fails if a future refactor moves the gate before
+    the ``_pre_dedup_flags`` snapshot or moves the drop out of ``dedup_flags``:
+    either way the drop stops being classified as suppression and the
+    signature reaches ``acknowledge_resolved_flags``.
+
+    A second, genuinely-moot flag (``stale_metadata`` on a done task, dropped
+    by filter_terminal_metadata_flags BEFORE the snapshot) rides along as the
+    positive control, so the carve-out assertion cannot pass merely because
+    ``resolved_flags`` was empty.
+    """
+
+    PROJECT_ID = 'test_project'
+    PROJECT_ROOT = '/tmp/reify'
+    FOREIGN_PROJECT = 'dark_factory'
+    FOREIGN_ROOT = '/df'
+    FIX_TASK_ID = '3839'
+    FIX_TASK_TITLE = 'Feed live workflow signals into the remediation payload'
+    SUPPRESSED_FLAG_TYPE = 'remediation_payload_live_workflow_signals_gap'
+    SUPPRESSED_TASK_ID = '598'
+    MOOT_TASK_ID = '777'
+    MOOT_FLAG_TYPE = 'stale_metadata'
+
+    @pytest_asyncio.fixture
+    async def ledger_store(self, tmp_path):
+        from fused_memory.reconciliation.recon_ledger import ReconLedgerStore
+
+        s = ReconLedgerStore(tmp_path / 'reconciliation.db')
+        await s.initialize()
+        yield s
+        await s.close()
+
+    async def _seed_prior_marker(self, ledger_store) -> None:
+        """Seed the prior-cycle stage1_flag_marker the HIT-only gate needs.
+
+        Mirrors tests/test_flag_dedup.py::_seed_marker: dedup identity is
+        (project_id, 'stage1_flag_marker', task_id, flag_type, run_id='') —
+        the originating run_id rides in payload_json, not the PK.  The
+        identity's task component is the flag's SIGNATURE component, not its
+        top-level task_id: compute_flag_signature unions the top-level id with
+        every cited_tasks id, so this flag keys on '3839,598'.  Derived from
+        compute_flag_signature rather than hardcoded so a future change to the
+        union rule cannot silently turn this seed into a MISS (which would
+        make the whole test pass vacuously — the gate is HIT-only).
+        """
+        from fused_memory.reconciliation.flag_dedup import compute_flag_signature
+        from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord
+
+        signature = compute_flag_signature(self._suppressed_flag())
+        assert signature is not None, 'the suppressed flag must have a signature'
+        sig_task_id, sig_flag_type = signature
+
+        await ledger_store.upsert(ReconLedgerRecord(
+            project_id=self.PROJECT_ID,
+            record_kind='stage1_flag_marker',
+            payload_json=json.dumps({
+                'source': 'stage1_flag_marker',
+                'kind': 'stage1_flag_marker',
+                'task_id': sig_task_id,
+                'flag_type': sig_flag_type,
+                'run_id': 'run-4381-prior',
+                'last_seen_run_id': 'run-4381-prior',
+            }),
+            state='active',
+            created_at='2026-08-01T00:00:00+00:00',
+            task_id=sig_task_id,
+            flag_type=sig_flag_type,
+            run_id='',
+            expires_at='2099-01-01T00:00:00+00:00',
+        ))
+
+    def _suppressed_flag(self) -> dict:
+        """The recurring finding whose fix task was filed in a FOREIGN project.
+
+        Cites its own subject task first — the shape the live e3527208 repro
+        had — to prove the FOREIGN-ONLY skip in
+        _resolve_live_cross_project_fix_task does not swallow the real
+        cross-project citation behind it.
+        """
+        return {
+            'task_id': self.SUPPRESSED_TASK_ID,
+            'flag_type': self.SUPPRESSED_FLAG_TYPE,
+            'description': 'the remediation payload omits live workflow signals',
+            'cited_tasks': [
+                {
+                    'project_id': self.PROJECT_ID,
+                    'task_id': self.SUPPRESSED_TASK_ID,
+                    'title': 'the finding subject itself',
+                },
+                {
+                    'project_id': self.FOREIGN_PROJECT,
+                    'task_id': self.FIX_TASK_ID,
+                    'title': self.FIX_TASK_TITLE,
+                },
+            ],
+        }
+
+    def _moot_flag(self) -> dict:
+        """Positive control: dropped by filter_terminal_metadata_flags (a done
+        task), i.e. genuinely moot, so its signature MUST be acknowledged."""
+        return {
+            'task_id': self.MOOT_TASK_ID,
+            'flag_type': self.MOOT_FLAG_TYPE,
+            'description': 'metadata blob references a retired field',
+        }
+
+    async def _run(self, ledger_store, *, fix_task_status: str) -> tuple[StageReport, AsyncMock]:
+        """Run the full Stage-1 filter chain with the REAL dedup_flags.
+
+        Only acknowledge_resolved_flags is patched — it is the observation
+        point, and leaving it real would exercise the ledger reclaim path
+        instead of the carve-out under test.
+        """
+        stage = _make_consolidator(project_root=self.PROJECT_ROOT)
+        assert stage.memory is not None  # AsyncMock() from _make_consolidator
+        assert stage.taskmaster is not None
+        stage.memory.recon_ledger = ledger_store
+        stage.known_projects = {self.FOREIGN_PROJECT: self.FOREIGN_ROOT}
+
+        async def _get_task(task_id, project_root):
+            if str(task_id) == self.FIX_TASK_ID and project_root == self.FOREIGN_ROOT:
+                return {
+                    'id': self.FIX_TASK_ID,
+                    'title': self.FIX_TASK_TITLE,
+                    'status': fix_task_status,
+                }
+            if str(task_id) == self.MOOT_TASK_ID and project_root == self.PROJECT_ROOT:
+                return {'id': self.MOOT_TASK_ID, 'title': 'a finished task', 'status': 'done'}
+            return {
+                'error': f'No tasks found for ID(s): {task_id}',
+                'error_type': 'TaskmasterError',
+            }
+
+        stage.taskmaster.get_task = AsyncMock(side_effect=_get_task)
+        ack_mock = AsyncMock(return_value=1)
+        base_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[self._suppressed_flag(), self._moot_flag()],
+            stats={},
+        )
+        with (
+            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.'
+                'acknowledge_resolved_flags',
+                new=ack_mock,
+            ),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id=self.PROJECT_ID),
+                prior_reports=[],
+                run_id='run-4381-ack-carveout',
+            )
+        return report, ack_mock
+
+    @pytest.mark.asyncio
+    async def test_cross_project_drop_is_excluded_from_acknowledge(self, ledger_store):
+        from fused_memory.reconciliation.flag_dedup import compute_flag_signature
+
+        await self._seed_prior_marker(ledger_store)
+
+        report, ack_mock = await self._run(ledger_store, fix_task_status='pending')
+
+        suppressed_sig = compute_flag_signature(self._suppressed_flag())
+        moot_sig = compute_flag_signature(self._moot_flag())
+
+        # Non-vacuity: the real gate actually fired this cycle.
+        surviving_sigs = [compute_flag_signature(f) for f in report.items_flagged]
+        assert suppressed_sig not in surviving_sigs, (
+            'the cross-project fix-task gate must DROP the flag, otherwise the '
+            f'carve-out below is never exercised; got {report.items_flagged!r}'
+        )
+
+        assert ack_mock.await_args is not None, 'acknowledge_resolved_flags must be awaited'
+        resolved = ack_mock.await_args.kwargs['resolved_flags']
+        resolved_sigs = [compute_flag_signature(f) for f in resolved]
+        # Positive control: a genuinely-moot drop IS acknowledged, so the
+        # assertion below cannot pass on an empty resolved_flags list.
+        assert moot_sig in resolved_sigs, (
+            'the terminal-metadata drop is moot and must still be acknowledged; '
+            f'got {resolved!r}'
+        )
+        assert suppressed_sig not in resolved_sigs, (
+            'a cross-project fix-task drop is a SUPPRESSION, not a resolution: '
+            'its stage1_flag_marker must keep its recurrence history for the day '
+            'the filed fix task is cancelled without landing. A signature reaching '
+            'acknowledge_resolved_flags means the drop escaped suppressed_signatures '
+            '(gate moved before the _pre_dedup_flags snapshot, or out of '
+            f'dedup_flags entirely); got {resolved!r}'
+        )
+
+        # Ledger-level restatement: the marker row itself survives the cycle,
+        # re-upserted active by dedup_flags BEFORE the gate ran.
+        assert suppressed_sig is not None
+        marker = await ledger_store.get_by_identity(
+            self.PROJECT_ID, 'stage1_flag_marker', suppressed_sig[0], suppressed_sig[1], '',
+        )
+        assert marker is not None and marker.state == 'active', (
+            'the suppressed flag\'s marker must survive un-reclaimed; '
+            f'got {marker!r}'
         )
 
 
@@ -3400,6 +3828,51 @@ class TestMemoryConsolidatorGateBacklogWiring:
         assert gate_backlog[0].task_id == '645'
         assert report.stats['stage1_gate_backlog_stalled'] == 1
         assert report.stats['stage1_gate_backlog_escalated'] == 1
+
+    @pytest.mark.asyncio
+    async def test_two_cycles_fold_into_one_record(self, tmp_path, monkeypatch):
+        """(a2) Two consecutive run() cycles over the same stale gate → ONE record.
+
+        End-to-end proof of the signal this task exists to produce: a gate that
+        stays past its threshold accumulates ``dedupe_count`` on a single pending
+        escalation instead of vanishing after cycle 1 (old has_open_l1 skip) or
+        minting a fresh record every cycle.  ``stage1_gate_backlog_stalled`` keeps
+        reporting the gate every cycle; ``stage1_gate_backlog_escalated`` keeps its
+        NEW-filings-only meaning and drops to 0 on the fold cycle.
+        """
+        from escalation.queue import EscalationQueue
+
+        stage = _make_consolidator(project_root='/tmp/reify')
+        queue = EscalationQueue(tmp_path / 'gate_esc')
+        stage._escalation_queue = queue
+        stage.filtered_task_tree = self._make_tree([_blocked_gate_task('645', hours_ago=49)])
+
+        report1 = await self._run(stage, monkeypatch, 'run-gate-cycle-1')
+        pending = queue.get_pending()
+        assert len(pending) == 1
+        parent_id = pending[0].id
+        assert report1.stats['stage1_gate_backlog_stalled'] == 1
+        assert report1.stats['stage1_gate_backlog_escalated'] == 1
+
+        report2 = await self._run(stage, monkeypatch, 'run-gate-cycle-2')
+
+        pending = [
+            e for e in queue.get_pending()
+            if e.category == 'reconciliation_stale_gate_backlog'
+        ]
+        assert len(pending) == 1, (
+            'cycle 2 must fold, not mint a second record; got '
+            f'{[e.id for e in pending]}'
+        )
+        assert pending[0].id == parent_id, 'the fold target must be the SAME record'
+        assert pending[0].dedupe_count == 1
+
+        # The gate is still stalled and still reported as such...
+        assert report2.stats['stage1_gate_backlog_stalled'] == 1
+        # ...but nothing NEW was filed, so the escalated stat stays new-filings-only.
+        # Counting folds here would make it identically equal to _stalled every
+        # cycle, destroying the new-vs-recurring distinction for operators.
+        assert report2.stats['stage1_gate_backlog_escalated'] == 0
 
     @pytest.mark.asyncio
     async def test_fresh_gate_no_escalation_stats_zero(self, tmp_path, monkeypatch):

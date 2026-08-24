@@ -22,6 +22,7 @@ import logging
 from datetime import UTC, datetime
 
 import aiosqlite
+from shared.phantom_verdict import is_phantom_verdict_json
 
 from dashboard.data.db import with_db
 from dashboard.data.utils import parse_utc, resolve_now
@@ -325,21 +326,50 @@ async def get_burst_state(
 async def get_latest_verdict(db: aiosqlite.Connection | None) -> dict | None:
     """Return the most recent judge verdict, or None if none exist.
 
-    Returns dict with: run_id, severity, action_taken, reviewed_at.
+    Returns dict with: run_id, severity, action_taken, reviewed_at, is_phantom.
+
+    ``is_phantom`` marks a verdict the reconciliation judge FABRICATED because
+    it could not parse its own model output (``Judge._parse_verdict``'s except
+    block) — the run went unreviewed, so its stored ``severity='serious'`` is
+    a placeholder, not a finding any judge made.  Classified by
+    :func:`shared.phantom_verdict.is_phantom_verdict_row`, the one home of that
+    rule (this package deliberately does not depend on ``fused-memory``).
+
+    **Annotates rather than filters, and never rewrites.**  A phantom being the
+    NEWEST verdict is itself real signal an operator needs: it means the most
+    recent run was not reviewed at all.  Silently advancing to the previous
+    genuine verdict would present a stale review as current — replacing one lie
+    with another — and rewriting the severity here would contradict task 3070's
+    decision to leave the rows intact for forensics.  So the phantom's own
+    ``severity`` and ``action_taken`` are reported verbatim and the renderer
+    decides how to present them.
+
+    ``findings`` is selected only to classify (via
+    :func:`shared.phantom_verdict.is_phantom_verdict_json`, which owns the
+    decode too) and is deliberately NOT returned: ``/api/v2/dashboard/recon``
+    is a poll endpoint and the boolean is the whole answer.
     """
     async def _query(db: aiosqlite.Connection) -> dict | None:
         async with db.execute(
-            'SELECT run_id, severity, action_taken, reviewed_at'
+            'SELECT run_id, severity, action_taken, reviewed_at, findings'
             ' FROM judge_verdicts ORDER BY reviewed_at DESC LIMIT 1',
         ) as cursor:
             row = await cursor.fetchone()
         if row is None:
             return None
+        # The raw-column decode lives in shared alongside the predicate, not
+        # here: journal.get_stats reads the same column and needs the identical
+        # preamble, and a copy in each consumer is how the non-mapping-element
+        # gap got past both.  A malformed or NULL column degrades to "not a
+        # phantom" (the row is still shown, just unannotated) and never raises
+        # — with_db catches only sqlite3.OperationalError/OSError, so an
+        # escaping AttributeError would 500 the whole /recon poll payload.
         return {
             'run_id': row['run_id'],
             'severity': row['severity'],
             'action_taken': row['action_taken'],
             'reviewed_at': row['reviewed_at'],
+            'is_phantom': is_phantom_verdict_json(row['severity'], row['findings']),
         }
 
     return await with_db(db, _query, None)

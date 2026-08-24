@@ -3159,3 +3159,173 @@ class TestMemoryMetadataConfig:
 
         assert d.restart_required[f'memory_metadata.{field}'] == {'old': old, 'new': not old}
         assert f'memory_metadata.{field}' not in d.applied_candidates
+
+
+# ── max_backlog_remediation_deferrals (task 3049) ────────────────────
+#
+# Bounds how long the inline remediation pass may be deferred while a project
+# is in backlog mode.  An UNBOUNDED gate would let a persistently-deep backlog
+# starve remediation indefinitely, turning a throughput fix into an integrity
+# regression; a consecutive-deferral cap makes the debt bounded and explicit.
+
+
+def test_max_backlog_remediation_deferrals_defaults_to_the_ceiling():
+    """Default is the largest streak the escalation semantics can absorb."""
+    from fused_memory.config.schema import MAX_BACKLOG_REMEDIATION_DEFERRALS_CEILING
+
+    assert ReconciliationConfig().max_backlog_remediation_deferrals == 1
+    assert (ReconciliationConfig().max_backlog_remediation_deferrals
+            == MAX_BACKLOG_REMEDIATION_DEFERRALS_CEILING)
+
+
+def test_max_backlog_remediation_deferrals_rejects_a_negative_value():
+    """A negative cap is meaningless — reject rather than silently coercing."""
+    with pytest.raises(ValidationError):
+        ReconciliationConfig(max_backlog_remediation_deferrals=-1)
+
+
+def test_max_backlog_remediation_deferrals_accepts_zero_as_the_off_switch():
+    """0 disables deferral entirely, restoring exact pre-task-3049 behaviour.
+
+    One int knob subsumes the on/off switch, so there is no second boolean
+    that can disagree with it.
+    """
+    assert ReconciliationConfig(max_backlog_remediation_deferrals=0
+                                ).max_backlog_remediation_deferrals == 0
+
+
+def test_max_backlog_remediation_deferrals_rejects_more_rope_than_the_ceiling():
+    """A longer streak would change escalation semantics, so the schema refuses it.
+
+    A deferred cycle writes ONE completed run instead of two, and
+    _finding_persistence_count counts completed runs that re-flag a finding —
+    including the remediating cycle's own remediation run, which completes
+    before the escalation gate reads the count (so the gate sees D + 2).
+    Past the ceiling a backlogged project accumulates enough re-flaggings to
+    reach _INTEGRITY_FINDING_RECURRENCE_THRESHOLD without a single remediation
+    attempt having run, so the first failed remediation escalates immediately
+    instead of the second.  Rejecting at config-load is louder than
+    letting the operator believe the extra rope was granted.
+    """
+    from fused_memory.config.schema import MAX_BACKLOG_REMEDIATION_DEFERRALS_CEILING
+
+    assert ReconciliationConfig(
+        max_backlog_remediation_deferrals=MAX_BACKLOG_REMEDIATION_DEFERRALS_CEILING
+    ).max_backlog_remediation_deferrals == MAX_BACKLOG_REMEDIATION_DEFERRALS_CEILING
+
+    with pytest.raises(ValidationError):
+        ReconciliationConfig(
+            max_backlog_remediation_deferrals=MAX_BACKLOG_REMEDIATION_DEFERRALS_CEILING + 1
+        )
+    with pytest.raises(ValidationError):
+        ReconciliationConfig(max_backlog_remediation_deferrals=20)
+
+
+def test_shipped_config_max_backlog_remediation_deferrals_is_within_the_ceiling(
+    monkeypatch,
+):
+    """The SHIPPED config.yaml value must itself satisfy the bound.
+
+    The schema would reject a larger value at load, so this pins that the file
+    an operator actually runs cannot be the thing that fails config load.
+    """
+    from fused_memory.config.schema import MAX_BACKLOG_REMEDIATION_DEFERRALS_CEILING
+
+    cfg = _shipped_reconciliation_config(monkeypatch)
+    assert 0 <= cfg.max_backlog_remediation_deferrals <= (
+        MAX_BACKLOG_REMEDIATION_DEFERRALS_CEILING)
+
+
+# ── the capacity claim as a checkable config invariant (task 3049) ────
+#
+# Lever 2 is a CLAIM about the shipped config: that the steady-state batch is
+# big enough to amortise the ~900s fixed per-cycle cost, and that the resulting
+# rate clears the observed burst inflow.  A claim that lives only in a decision
+# doc drifts silently the first time someone retunes a ratio.  These tests bind
+# the claim to the SHIPPED yaml, so the config and the arithmetic cannot part
+# ways without a red test naming exactly which one moved.
+
+
+def _shipped_reconciliation_config(monkeypatch):
+    """Load reconciliation config from the real deployment YAML."""
+    yaml_path = Path(__file__).resolve().parent.parent / 'config' / 'config.yaml'
+    assert yaml_path.is_file(), f'expected config.yaml at {yaml_path}'
+    monkeypatch.setenv('CONFIG_PATH', str(yaml_path))
+    return FusedMemoryConfig().reconciliation
+
+
+def test_shipped_config_steady_state_batch_amortises_the_fixed_cycle_cost(monkeypatch):
+    """buffer_size_threshold * conditional_trigger_ratio must clear the min batch.
+
+    T(B) = F + c*B with F ~ 900s is almost entirely FIXED cost, so a small
+    batch pays that 900s over very few events.  At the pre-3049 ratio of 0.2 the
+    quiescent trigger fires at 250 * 0.2 = 50 events — 20.5 s/event predicted,
+    matching the 18.9 s/event measured on 2026-07-25.  The claim is that the
+    shipped batch is at least STEADY_STATE_AMORTISATION_MIN_BATCH.
+    """
+    from fused_memory.reconciliation.throughput import (
+        STEADY_STATE_AMORTISATION_MIN_BATCH,
+    )
+
+    cfg = _shipped_reconciliation_config(monkeypatch)
+    batch = int(cfg.buffer_size_threshold * cfg.conditional_trigger_ratio)
+
+    assert batch >= STEADY_STATE_AMORTISATION_MIN_BATCH, (
+        f'shipped config triggers a steady-state batch of {batch} events '
+        f'(buffer_size_threshold={cfg.buffer_size_threshold} * '
+        f'conditional_trigger_ratio={cfg.conditional_trigger_ratio}), below the '
+        f'{STEADY_STATE_AMORTISATION_MIN_BATCH} needed to amortise the fitted '
+        f'~900s fixed per-cycle cost. Either raise the ratio or re-derive the '
+        f'constant from live data via '
+        f'`python -m fused_memory.reconciliation.throughput`.'
+    )
+
+
+def test_shipped_config_batch_clears_the_observed_burst_inflow(monkeypatch):
+    """The shipped batch's predicted rate must sustain more than the burst inflow.
+
+    This is ask (c): the threshold has to encode a real capacity claim.  With
+    lever 1 removing the remediation duty cycle, the shipped batch must yield a
+    sustainable events/day that clears the ~3.5k/day burst measured on reify.
+    """
+    from fused_memory.reconciliation.throughput import (
+        FITTED_CYCLE_FIXED_SECONDS,
+        FITTED_CYCLE_MARGINAL_SECONDS,
+        OBSERVED_BURST_EVENTS_PER_DAY,
+        capacity_verdict,
+        seconds_per_event,
+        sustainable_events_per_day,
+    )
+
+    cfg = _shipped_reconciliation_config(monkeypatch)
+    batch = int(cfg.buffer_size_threshold * cfg.conditional_trigger_ratio)
+
+    rate = seconds_per_event(
+        batch, FITTED_CYCLE_FIXED_SECONDS, FITTED_CYCLE_MARGINAL_SECONDS,
+    )
+    sustainable = sustainable_events_per_day(rate, 0.0, 1.0)
+    verdict = capacity_verdict(sustainable, OBSERVED_BURST_EVENTS_PER_DAY)
+
+    assert verdict['verdict'] == 'sufficient', (
+        f'shipped batch of {batch} events predicts {rate:.2f} s/event => '
+        f'{sustainable:.0f} events/day, which does not clear the observed '
+        f'{OBSERVED_BURST_EVENTS_PER_DAY}/day burst '
+        f'(headroom {verdict["headroom_ratio"]:.2f}x).'
+    )
+
+
+def test_shipped_config_max_staleness_still_bounds_latency(monkeypatch):
+    """Raising the trigger ratio must not remove the latency backstop.
+
+    The quiescent trigger is not the only way a cycle starts: max_staleness
+    fires independently of conditional_trigger_ratio (event_buffer.py:359), so
+    a bigger batch delays the quiescent trigger without letting an event sit
+    unbounded.  If that backstop were ever disabled, lever 2's latency argument
+    would be void.
+    """
+    cfg = _shipped_reconciliation_config(monkeypatch)
+
+    assert cfg.max_staleness_seconds > 0, (
+        'lever 2 raises the steady-state batch on the explicit premise that '
+        'max_staleness_seconds still bounds per-event latency independently'
+    )

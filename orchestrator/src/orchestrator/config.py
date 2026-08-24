@@ -838,9 +838,18 @@ class SessionResumeConfig(BaseModel):
     ``enabled=false`` is the kill switch: no ``--resume`` is ever injected
     (B6), and no ``session_resume_*`` event or streak is produced.
 
+    ``restore_from_archive=false`` is the NARROWER kill switch (task 3578):
+    the ``_invoke`` arm site stops rehydrating a missing transcript from the
+    durable archive, but eligibility, corroboration and every
+    ``session_resume_*`` event carry on. It exists so a suspected restore
+    regression is reversible without going blind on the resume population,
+    which is what disabling ``enabled`` would cost.
+
     Mirrors DeliveredChecksConfig's shape (a kill switch plus ge-bounded
-    int knobs); all five leaves are green-tier hot-reloadable via the
-    ``session_resume`` whole-submodel group in RELOADABLE_FIELDS.
+    int knobs); all leaves are green-tier hot-reloadable via the
+    ``session_resume`` whole-submodel group in RELOADABLE_FIELDS —
+    ``_submodel_leaf_paths`` enumerates ``model_fields`` dynamically, so a
+    new leaf joins the green tier with no RELOADABLE_FIELDS edit.
     """
 
     enabled: bool = Field(
@@ -849,6 +858,26 @@ class SessionResumeConfig(BaseModel):
             'Set to false to disable warm-lane session resume entirely — no '
             '--resume is ever injected (B6), and the _run_slot guard emits no '
             'session_resume_* event and feeds no fallback-storm streak.'
+        ),
+    )
+    restore_from_archive: bool = Field(
+        default=True,
+        description=(
+            'Set to false to stop TaskWorkflow._invoke rehydrating a recovered '
+            "session's transcript from the durable archive into the config dir "
+            'it is about to export as CLAUDE_CONFIG_DIR. The reversible kill '
+            'switch for the ARM-SITE RESTORATION specifically (task 3578) — '
+            'distinct from `enabled`, which kills the whole feature at the '
+            'harness guard. With this false, an ineligible resume still '
+            'degrades to fresh dispatch and still emits its event, so an '
+            'operator can disable restoration without going blind on the '
+            'population it was meant to fix. '
+            'Deliberately does NOT consult transcript_archive.enabled, reusing '
+            "Harness._archive_available's recorded argument: with archival off "
+            'there is simply nothing on disk to find, and gating on the flag '
+            'would add a second source of truth that can disagree with the '
+            'filesystem — archival switched on last week still leaves '
+            'restorable archives today.'
         ),
     )
     freshness_window_secs: int = Field(
@@ -1090,6 +1119,43 @@ class TranscriptArchiveConfig(BaseModel):
         ),
     )
     retention: RetentionConfig = Field(default_factory=RetentionConfig)
+    storm_threshold: int = Field(
+        default=5,
+        ge=1,
+        description=(
+            'Archival-failure burst detector (task 3619, INV-4): how many '
+            'per-file archive failures within storm_window_secs constitute a '
+            'storm worth one L1 escalation. One failure is routine and is '
+            'already counted + logged by shared.transcript_archive; a BURST '
+            'is the systemic condition (archive root full, unmounted, or '
+            'permission-denied) an operator has to act on. Harness reads this '
+            'LIVE on every failure, so a hot reload takes effect without a '
+            'restart.'
+            ' Must be >= 1, matching session_resume.fallback_storm_threshold: '
+            'both leaves are green-tier hot-reloadable and are read LIVE on '
+            'every failure, so an unbounded 0 or negative would take effect '
+            'immediately and fire the L1 on the very first routine failure, '
+            'with no validation error and no log line to say so.'
+        ),
+    )
+    storm_window_secs: float = Field(
+        default=600.0,
+        gt=0,
+        description=(
+            'Rolling window for storm_threshold, and the rate limit between '
+            'archival-storm escalations — at most one L1 per window, on top '
+            'of the has_open_l1 dedup. Also read LIVE on every failure. '
+            'Must be > 0, matching session_resume.storm_window_secs. A value '
+            '<= 0 does not merely shrink the window, it DISABLES the '
+            'detector permanently and silently: StormCounter._prune uses a '
+            'half-open window (events[0] <= cutoff), so a zero window makes '
+            'the cutoff equal now and the event record() just appended is '
+            'popped again — the count is always 0 and no burst can ever '
+            'fire. Exactly the silent-degradation-on-misconfiguration this '
+            'escalation exists to prevent, so it is rejected loudly at '
+            'validation instead.'
+        ),
+    )
 
 
 class FusedMemoryConfig(BaseModel):
@@ -1701,6 +1767,32 @@ class GitConfig(BaseModel):
             'the merge and the notifiee call); correctness lives in the '
             'run-start head snapshot, not the trigger, so a missed trigger '
             'only costs granularity.'
+        ),
+    )
+    merge_park_lock_grace_seconds: float = Field(
+        default=300.0,
+        ge=0,
+        description=(
+            'How long (seconds) advance_main waits for a FOREIGN '
+            '<git-dir>/index.lock in project_root to clear before giving up '
+            'and returning the transient `park_lock_contended` result. A '
+            'concurrent `git commit --only <path>` holds the index lock for '
+            'the ENTIRE pre-commit hook run, and under a held lock '
+            '`git stash create` exits rc=1 with EMPTY stdout AND stderr — so '
+            'advance_main would otherwise return `stash_failed` and halt the '
+            'whole merge queue. The 300s default matches this repo\'s '
+            'documented pre-commit budget (CLAUDE.md instructs '
+            '`timeout: 300000` because the hook runs pyright), so an ordinary '
+            'docs-direct-commit-on-main merely DELAYS a merge instead of '
+            'halting the queue. 0 disables only the WAIT (probe-only '
+            'fail-fast): the lock is still probed and a held lock is still '
+            'classified as `park_lock_contended` — never a silent fail-soft, '
+            'because parking through a foreign process\'s index lock would '
+            'clobber the in-flight commit\'s staged/working state. This knob '
+            'governs the WAIT only: the crashed-leftover verdict that offers '
+            'an operator destructive `rm -f <lock>` recovery keys on '
+            'max(this, merge_gates._STALE_LOCK_FLOOR_S), so lowering it (0 '
+            'included) never widens what counts as a stale lock.'
         ),
     )
     offline_lane_red_advances_before_blocker: int = Field(
@@ -2353,6 +2445,83 @@ class ZeroProgressRequeueConfig(BaseModel):
             'positive. 900s (15 min) of CONTINUOUS zero progress is well '
             'past any contention blip but still hours short of the 46h '
             'origin incident.'
+        ),
+    )
+
+
+class RecoveryEmissionConfig(BaseModel):
+    """Structured recovery-decision emission (task 3535, PRD D5).
+
+    Every veto/LEAVE site in the recovery machinery — the reconcile sweep, the
+    scheduler's stranded-blocked redispatch phase, the deterministic recon
+    pair, the already-landed dispatch gate — emits a structured
+    ``recovery_vetoed`` / ``recovery_left`` event describing the decision it
+    ALREADY made.  This section changes NO disposition; the canonical
+    explanation (including why emission is signature-transition-gated rather
+    than one row per observation) is documented once, canonically, in
+    ``orchestrator.recovery_emission``'s module docstring.  Read that before
+    retuning anything here.
+
+    The streak alarm predicate is two-dimensional like ``zero_progress_requeue``
+    — ``veto_streak_threshold`` consecutive IDENTICAL vetoes AND
+    ``veto_streak_min_span_secs`` of wall clock — for the same reason: a streak
+    count alone would page a human for a hold that is only seconds old.
+
+    Ships ENABLED: emission is the whole deliverable, and shipping it off would
+    leave every strand unexplained.  ``streak_escalation_enabled`` is the
+    separate, narrower kill switch for the only part that WRITES to the
+    escalation queue.  All fields are green-tier hot-tunable via
+    RELOADABLE_FIELDS, so a noisy detector can be retuned or silenced live.
+    """
+
+    enabled: bool = Field(
+        default=True,
+        description=(
+            'Set to false to disable structured recovery-decision emission '
+            '(recovery_vetoed / recovery_left events and the veto streak '
+            'counter). Shipped enabled — without it a stranded task held by '
+            'an open escalation leaves no machine-readable trace of WHAT held '
+            'it. Disabling suppresses new emissions only; it never changes a '
+            'recovery disposition, in either direction.'
+        ),
+    )
+    veto_streak_threshold: int = Field(
+        default=3,
+        ge=1,
+        description=(
+            'Consecutive IDENTICAL vetoes of the same (site, task) before a '
+            'blocking L1 is filed against the streak sentinel (both this AND '
+            'veto_streak_min_span_secs must be satisfied). Must be >= 1. A '
+            'DIFFERENT veto signature restarts the count, so the alarm only '
+            'ever describes N genuinely identical consecutive holds.'
+        ),
+    )
+    veto_streak_min_span_secs: float = Field(
+        default=1500.0,
+        ge=0.0,
+        description=(
+            'Wall-clock seconds the veto streak must ALSO span before a '
+            'blocking L1 is filed. Set to 0 to alarm on streak count alone. '
+            'The default is derived, not picked: stranded_reconcile_interval_'
+            'secs and deterministic_recon_sweep_interval_secs are both 900.0s, '
+            'so three consecutive sweeps span 1800s at the threshold crossing '
+            'and 1500s clears that with 300s of jitter headroom. It is ALSO '
+            'the backstop that makes it impossible for a per-dispatch-TICK '
+            'veto site to file an L1 within seconds of a strand appearing '
+            'should a future site charge the counter by mistake (only the '
+            'sweep-frequency sites charge it today).'
+        ),
+    )
+    streak_escalation_enabled: bool = Field(
+        default=True,
+        description=(
+            'Set to false to keep emitting recovery_vetoed / recovery_left '
+            'events while suppressing the blocking L1 the veto streak files. '
+            'The narrower kill switch: this is the only part of the mechanism '
+            'that WRITES to the escalation queue, so an operator can silence '
+            'a noisy alarm without losing the telemetry that explains it. '
+            'Disabling suppresses new filings only; an already-filed L1 still '
+            'auto-resolves when its veto stops.'
         ),
     )
 
@@ -3915,15 +4084,35 @@ class OrchestratorConfig(BaseSettings):
     )
 
     # Digest + EWA trip (AFK hardening, task 1327).
-    # Every digest_every_n_escalations escalation-lifecycle events (both submit
-    # AND resolve callbacks each count), _maybe_write_digest() writes an append-only
-    # markdown file to digest_dir summarising recent activity.
-    # The EWA of escalations/done is updated each digest step; when it exceeds
+    # Every digest_every_n_escalations escalation-lifecycle events,
+    # _maybe_write_digest() writes an append-only markdown file to digest_dir
+    # summarising recent activity.
+    #
+    # GATE and NUMERATOR are two different counters (task 4559):
+    #   * the digest GATE counts escalation-LIFECYCLE events — both the submit
+    #     AND the resolve callback each count.  Unchanged, deliberately: a
+    #     window that only DRAINS a backlog must still fire a digest, or a
+    #     tripped EWA could never be re-evaluated.
+    #   * the EWA NUMERATOR counts SUBMISSIONS only.  Resolving an escalation
+    #     is work being cleared, not a new fault; counting it inflated the
+    #     ratio exactly while the backlog was being drained.  A pure-drain
+    #     window now has numerator 0, so the EWA decays — draining HEALS the
+    #     breaker instead of re-tripping it.
+    #
+    # The EWA of submissions/done is updated each digest step; when it exceeds
     # digest_ewa_threshold, Harness.pause_scheduler('ewa_trip_<value>') is called.
-    # digest_ewa_alpha: smoothing factor for EWA(t+1) = alpha*(esc/max(done,1)) + (1-alpha)*EWA(t).
-    # digest_ewa_threshold default: reify 23-day baseline mean+2σ ≈ 24.6; see task 1327 notes.
-    # EWA state is process-local (reset on orchestrator restart — consistent with
-    # park-stop and watcher-supervisor counters, documented in design decisions).
+    # digest_ewa_alpha: smoothing factor for EWA(t+1) = alpha*(subs/max(done,1)) + (1-alpha)*EWA(t).
+    # digest_ewa_threshold default: reify 23-day baseline mean+2σ ≈ 24.6 — that
+    # provenance is NOT reproducible; see the field's own comment below.
+    #
+    # EWA state is process-local EXCEPT across an ewa_trip_ pause (task 4559):
+    # pause_scheduler persists the tripping value on the scheduler_state row, and
+    # _load_persisted_scheduler_pause restores it and RE-TESTS the predicate before
+    # re-asserting the halt — a stored value now below the (possibly retuned)
+    # threshold is not re-asserted, and the row is cleared.  A NULL value (a row
+    # predating the migration) or any non-ewa_trip pause reason is restored blind,
+    # exactly as before.  With no pause row the EWA still starts at 0.0 on process
+    # start.
     # EWA is also reset to 0.0 on resume_scheduler() when pause was caused by ewa_trip.
     digest_enabled: bool = Field(
         default=True,
@@ -3940,7 +4129,10 @@ class OrchestratorConfig(BaseSettings):
             'each increment this counter — a single escalation that is later resolved '
             'contributes 2 events) that must accumulate since the last digest before '
             'the next digest is written. A value of 10 therefore means ~5 distinct '
-            'escalations resolved, or ~10 unresolved escalations submitted. Task 1327.'
+            'escalations resolved, or ~10 unresolved escalations submitted. This '
+            'gates the DIGEST only: the EWA numerator counts SUBMISSIONS alone, so '
+            'a window that merely drains a backlog still fires a digest but adds '
+            'nothing to the numerator (task 4559). Task 1327.'
         ),
     )
     digest_dir: str = Field(
@@ -3960,20 +4152,38 @@ class OrchestratorConfig(BaseSettings):
         ),
     )
     digest_ewa_threshold: float = Field(
-        # Rounded from reify 23-day baseline: EWA-smoothed(alpha=0.3) daily
-        # escalation/done ratio, mean=21.05 + 2*stddev=3.51 ≈ 24.56.
-        # Full derivation in task 1327 completion notes (fused-memory).
-        # Re-derive with: walk reify/data/escalations/ (23 days), get daily
-        # done counts, compute ratio/day, EWA-smooth with alpha=0.3, mean+2σ.
+        # Recorded provenance: reify 23-day baseline, EWA-smoothed(alpha=0.3)
+        # daily escalation/done ratio, mean=21.05 + 2*stddev=3.51 ≈ 24.56
+        # (task 1327 completion notes, fused-memory).
+        #
+        # That provenance is NOT reproducible (task 4559).  The recipe it
+        # carried — walk reify/data/escalations/, get daily done counts,
+        # compute ratio/day, EWA-smooth, mean+2σ — describes a DAILY EWA over
+        # submissions only, while the runtime computes a per-N-lifecycle-event
+        # EWA; the two are about 2.06x apart on DF data, and reify's own
+        # realised series gives mean+2σ = 14.13, not 24.6.  DF-native
+        # equivalents span 13.0-62.3 depending on how the window is
+        # constructed, and move 26-29% when the two observed trips are
+        # excluded — so this is not a stable estimator and re-deriving it
+        # would only replace one arbitrary number with another.
+        #
+        # A retune was therefore DELIBERATELY DECLINED by task 4559 in favour
+        # of fixing the statistic itself (submissions-only numerator), which
+        # changes what the threshold is measured against.  Do not treat 24.6
+        # as empirically derived; treat it as a held-constant while the
+        # corrected series accumulates.  The knob is now hot-reloadable
+        # (RELOADABLE_FIELDS), so a future retune needs no fleet restart.
         default=24.6,
         gt=0.0,
         description=(
             'EWA threshold above which the scheduler is paused via '
-            'pause_scheduler(\'ewa_trip_<value>\'). Default derived from '
-            'reify 23-day escalation/done ratio history (mean+2σ≈24.6). '
-            'EWA starts at 0.0 on process start; reaching 24.6 from a cold '
-            'start requires sustained high ratios across multiple digest steps. '
-            'Task 1327.'
+            'pause_scheduler(\'ewa_trip_<value>\'). The recorded provenance of '
+            'the 24.6 default (reify 23-day escalation/done history, mean+2σ) '
+            'is not reproducible and a retune was deliberately declined — see '
+            'the comment above the default. EWA starts at 0.0 on process start '
+            '(unless restored from a persisted ewa_trip pause row, task 4559); '
+            'reaching 24.6 from a cold start requires sustained high ratios '
+            'across multiple digest steps. Task 1327.'
         ),
     )
 
@@ -4101,6 +4311,14 @@ class OrchestratorConfig(BaseSettings):
     # only detector for requeue loops the per-task requeue cap cannot see.
     zero_progress_requeue: ZeroProgressRequeueConfig = Field(
         default_factory=ZeroProgressRequeueConfig
+    )
+
+    # Structured recovery-decision emission (task 3535, PRD D5). An absent
+    # stanza in orchestrator.yaml yields the ENABLED-by-default instance —
+    # without it a stranded task held by an open escalation leaves no
+    # machine-readable trace of what held it.
+    recovery_emission: RecoveryEmissionConfig = Field(
+        default_factory=RecoveryEmissionConfig
     )
 
     # κ: shared sccache backend (the laptop warm multiplier)
@@ -4996,6 +5214,13 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
     # detector you can only silence by restarting is one that gets silenced by
     # ignoring it instead.
     _submodel_leaf_paths('zero_progress_requeue', ZeroProgressRequeueConfig),
+    # Structured recovery-decision emission (task 3535) — same
+    # whole-submodel-group idiom, and green-tier for the same reason: an
+    # operator must be able to retune the streak threshold, or silence a noisy
+    # detector, WITHOUT a fleet restart.  streak_escalation_enabled in
+    # particular is the narrow kill switch for the only part that writes to the
+    # escalation queue, and a kill switch behind a restart is not one.
+    _submodel_leaf_paths('recovery_emission', RecoveryEmissionConfig),
     # Variable-depth speculative verify placement (task 2359) — a new
     # dedicated submodel, same whole-submodel-group idiom: every probe knob
     # (probe_fraction/probe_depths/suppress_flake_rate) is green-tier
@@ -5044,6 +5269,30 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         'backfill_safety_factor',
         'backfill_min_samples',
         'backfill_max_park_age_secs',
+        # Digest + EWA breaker knobs (task 4559).  Explicit literals for the
+        # same reason as the backfill_* group above: these are FLAT top-level
+        # fields, not a submodel, so _submodel_leaf_paths does not apply.
+        # Safe by construction — every one is read FRESH inside
+        # _maybe_write_digest on each check, so a reload cannot split in-flight
+        # state.  Green-tier on purpose, the same argument already written for
+        # zero_progress_requeue and recovery_emission above: a detector you can
+        # only retune by restarting is one that gets silenced by ignoring it.
+        # Here the asymmetry was worse than inert — recovery_emission.* let an
+        # operator quiet a noisy ALARM live, while the BREAKER that halts
+        # fleet-wide dispatch could only be retuned by restarting every
+        # orchestrator.  This changes the reload TIER only:
+        # digest_ewa_threshold's VALUE stays at its default (a retune was
+        # deliberately declined — see the field's own docstring).
+        # OPERATIONS.md §"Config reload vs restart" (the operator-facing tier
+        # authority) and plans/config-hot-reload-prd.md do NOT yet enumerate
+        # these five; both files are outside task 4559's assigned scope, so
+        # that bullet is owned by task 4632.  Until it lands, this list is the
+        # only place an operator can learn the breaker is live-retunable.
+        'digest_enabled',
+        'digest_every_n_escalations',
+        'digest_dir',
+        'digest_ewa_alpha',
+        'digest_ewa_threshold',
         'starvation_watchdog.enabled',
         'starvation_watchdog.skip_threshold',
         'starvation_watchdog.idle_secs',
@@ -5100,6 +5349,11 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         'git.offline_lane_test_threads',
         'git.offline_lane_poll_interval_secs',
         'git.offline_lane_red_advances_before_blocker',
+        # advance_main's foreign-index-lock stand-off budget (task 3060) —
+        # a leaf-mutation-only tuning knob re-read per advance (never
+        # captured at startup), so a reload takes effect on the very next
+        # advance and an operator can retune the stand-off live.
+        'git.merge_park_lock_grace_seconds',
         # Generic per-project offline-lane commands + legacy-numeric gate (task
         # 2789, D6 green-tier): the worker re-reads config.git each _run_once,
         # so the command list, per-command priorities, and the legacy-numeric

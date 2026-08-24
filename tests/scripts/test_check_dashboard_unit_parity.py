@@ -24,11 +24,20 @@ tests/scripts/test_check_fused_memory_unit_parity.py::_load_checker.
 import importlib.util
 import os
 import pathlib
+import re
 import subprocess
 import sys
 import types
 
 import pytest
+from setup_host_sections import (
+    checker_repo,
+    run_section,
+    setup_host_text,
+    slice_section,
+    usage_error_checker,
+    write_checker,
+)
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 CHECKER_PATH = REPO_ROOT / "scripts" / "check_dashboard_unit_parity.py"
@@ -2318,3 +2327,880 @@ def test_checker_subprocess_unit_flag_narrows_the_run(tmp_path: pathlib.Path):
 
     full = _run_checker(repo, installed)
     assert full.returncode == 1, full.stdout
+
+
+# ---------------------------------------------------------------------------
+# The section-8 PRE-INSTALL gate in setup-host.sh is wired so it can actually
+# stop something
+# ---------------------------------------------------------------------------
+#
+# Everything above tests the CHECKER. This group tests its WIRING — the block
+# in scripts/setup-host.sh section 8 that runs it, decides what its exit status
+# meant, and then installs.
+#
+# The defect these pin: that block believed a bare exit status, and 2 is
+# overloaded three ways — the checker's benign "not yet installed", `python3`
+# refusing to open a missing script, and argparse rejecting an unknown flag. So
+# renaming the checker or one of its flags made the installer print a
+# reassuring "not yet installed in ... (installing below)" and overwrite the
+# units anyway: a gate reporting green because it never ran, which is the exact
+# silent-drift failure the checker exists to catch, reproduced one level up in
+# its own wiring.
+#
+# Nothing here touches ~/.config/systemd/user or real systemd: REPO_ROOT and
+# UNIT_DIR are tmp_path trees and `systemctl` is a PATH stub that exits 0.
+
+# Anchored on the block's hoisted `_dash_parity_script=` assignment — CODE, and
+# unique to this site — so a reworded section comment cannot turn CI red for no
+# behavioural change. The end anchor is the install's own `ok` line, because
+# this slice must cover the render/cp/enable that FOLLOWS the gate: whether the
+# units still land is half of what these tests assert.
+_SECTION_8_START = "_dash_parity_script="
+_SECTION_8_END = 'ok "Dashboard units installed'
+
+# The argparse-shaped stub: exit 2, usage-shaped stderr, and no
+# [dashboard_unit_parity] report — what renaming a flag would actually produce.
+_USAGE_ERROR_CHECKER = usage_error_checker(
+    CHECKER_PATH.name,
+    "[-h] [--installed-dir INSTALLED_DIR] [--repo-root REPO_ROOT]",
+    "--installed-dir",
+)
+
+
+def _gate_repo(
+    tmp_path: pathlib.Path,
+    mod: types.ModuleType,
+    *,
+    checker_body: str | None = None,
+    with_checker: bool = True,
+) -> pathlib.Path:
+    """_fake_repo plus the scripts/ files the installer slice reads.
+
+    The real checker is copied in (with its sibling systemd_unit_parity import)
+    so the gate drives the real one; only the TREE is fake.
+    """
+    repo = _fake_repo(tmp_path, mod)
+    (repo / "scripts").mkdir(parents=True, exist_ok=True)
+    (repo / "scripts" / "dashboard.service.template").write_text(
+        (REPO_ROOT / "scripts" / "dashboard.service.template").read_text(
+            encoding="utf-8"
+        ),
+        encoding="utf-8",
+    )
+    if with_checker:
+        write_checker(
+            repo,
+            CHECKER_PATH.name,
+            body=checker_body,
+            siblings=("systemd_unit_parity.py",),
+        )
+    return repo
+
+
+def _run_section_8(
+    tmp_path: pathlib.Path, repo: pathlib.Path, unit_dir: pathlib.Path
+) -> subprocess.CompletedProcess:
+    """Run the section-8 slice. UV_PATH is set upstream in the real script."""
+    return run_section(
+        tmp_path,
+        slice_section(_SECTION_8_START, _SECTION_8_END),
+        repo_root=repo,
+        unit_dir=unit_dir,
+        env_extra={"UV_PATH": "/usr/bin/uv"},
+    )
+
+
+def _assert_units_installed(repo: pathlib.Path, unit_dir: pathlib.Path) -> None:
+    """The install ran: template rendered, both watchdog units copied."""
+    rendered = unit_dir / _DASHBOARD_SERVICE
+    assert rendered.is_file(), f"{_DASHBOARD_SERVICE} was not rendered into {unit_dir}"
+    text = rendered.read_text(encoding="utf-8")
+    assert "__REPO_ROOT__" not in text and "__UV_PATH__" not in text, (
+        f"The template placeholders were not substituted:\n{text}"
+    )
+    for name in (_WATCHDOG_SERVICE, _WATCHDOG_TIMER):
+        installed = unit_dir / name
+        assert installed.is_file(), f"{name} was not copied into {unit_dir}"
+        assert installed.read_text(encoding="utf-8") == (
+            repo / "dashboard" / name
+        ).read_text(encoding="utf-8"), f"{name} is not the committed copy"
+
+
+def test_section_8_missing_checker_does_not_read_as_not_yet_installed(
+    tmp_path: pathlib.Path,
+):
+    """EXIT-CODE COLLISION: `python3 <missing script>` also exits 2.
+
+    2 is the checker's benign "not yet installed in $UNIT_DIR (installing
+    below)". If the checker were renamed or moved, python3's own 2 would land
+    in that branch and the operator would be told the host was simply
+    un-provisioned — when in fact nothing was ever checked.
+    """
+    mod = _load_checker()
+    repo = _gate_repo(tmp_path, mod, with_checker=False)
+    unit_dir = _installed_from(
+        tmp_path, mod, repo, edits={_WATCHDOG_TIMER: ("[Timer]", "[Timer]\nAccuracySec=5s")}
+    )
+
+    result = _run_section_8(tmp_path, repo, unit_dir)
+
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert "not yet installed" not in result.stdout, (
+        "A missing checker was reported as the benign 'not yet installed on "
+        f"this host'.\n{result.stdout}"
+    )
+    assert "FAIL " in result.stdout, (
+        f"A gate that did not run must say so loudly.\n{result.stdout}"
+    )
+    _assert_units_installed(repo, unit_dir)
+    assert "SKIPPING" not in result.stdout, result.stdout
+
+
+def test_section_8_usage_error_does_not_read_as_not_yet_installed(
+    tmp_path: pathlib.Path,
+):
+    """SAME COLLISION, second source: argparse exits 2 on any usage error.
+
+    The [dashboard_unit_parity] tag, not the exit code, is what makes a status
+    believable — and the checker puts that tag on EVERY line it emits
+    (test_main_every_emitted_line_carries_the_log_tag), so its absence is
+    conclusive.
+    """
+    mod = _load_checker()
+    repo = _gate_repo(tmp_path, mod, checker_body=_USAGE_ERROR_CHECKER)
+    unit_dir = _installed_from(
+        tmp_path, mod, repo, edits={_WATCHDOG_TIMER: ("[Timer]", "[Timer]\nAccuracySec=5s")}
+    )
+
+    result = _run_section_8(tmp_path, repo, unit_dir)
+
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert "not yet installed" not in result.stdout, result.stdout
+    assert "FAIL " in result.stdout, (
+        f"A gate that did not run must say so loudly.\n{result.stdout}"
+    )
+    _assert_units_installed(repo, unit_dir)
+    assert "SKIPPING" not in result.stdout, result.stdout
+
+
+def test_section_8_installs_even_when_the_gate_did_not_run(tmp_path: pathlib.Path):
+    """DELIBERATE DIVERGENCE from the orchestrator gate: the install is UNCONDITIONAL.
+
+    The orchestrator gate makes its install opt-in (DF_INSTALL_ORCH_UNITS=1)
+    because there the COMMITTED side is sometimes the wrong one — two committed
+    units name --config paths that do not exist on this host, so copying them
+    would break those orchestrators on their next restart. Every one of those
+    facts inverts here, so this must NOT grow the same switch:
+
+    1. The install IS the remediation path. setup-host.sh says so directly
+       ("the install below is itself the remediation"), and the checker ships
+       no --fix precisely because re-running this installer is how a fix
+       propagates.
+    2. The checker's own report tells the operator to run setup-host.sh
+       (test_main_report_points_at_the_remediation_command). Refusing to
+       install on a bad verdict would close a circular dead end: the checker
+       says "run setup-host.sh", and setup-host.sh answers "I decline, because
+       of what the checker just reported."
+    3. The incident this checker was built around has the INSTALLED side stale,
+       not the committed side. Gating the install would hold that supervision
+       gap open indefinitely.
+
+    So the fix changes only the EPISTEMICS, never the action: the operator
+    stops being told a check passed when none ran. The units still land.
+    """
+    mod = _load_checker()
+    repo = _gate_repo(tmp_path, mod, with_checker=False)
+    unit_dir = tmp_path / "installed"
+
+    result = _run_section_8(tmp_path, repo, unit_dir)
+
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    _assert_units_installed(repo, unit_dir)
+    assert "SKIPPING" not in result.stdout, (
+        "The section-8 install must stay unconditional — see the docstring.\n"
+        f"{result.stdout}"
+    )
+
+
+def test_section_8_reports_parity_and_installs(tmp_path: pathlib.Path):
+    """Happy path — the fix must not degenerate into 'always report failure'."""
+    mod = _load_checker()
+    repo = _gate_repo(tmp_path, mod)
+    unit_dir = _installed_from(tmp_path, mod, repo)
+
+    result = _run_section_8(tmp_path, repo, unit_dir)
+
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert "already at parity" in result.stdout, result.stdout
+    assert "FAIL " not in result.stdout, result.stdout
+    _assert_units_installed(repo, unit_dir)
+
+
+def test_section_8_reports_drift_and_still_installs(tmp_path: pathlib.Path):
+    """Real drift stays a warning naming the report — and the install proceeds.
+
+    The exit-1 wording deliberately says "drift OR unverifiable state", because
+    1 also covers a vanished committed unit and a drop-in override, which the
+    checker words apart. Naming only DRIFT would collapse that distinction.
+    """
+    mod = _load_checker()
+    repo = _gate_repo(tmp_path, mod)
+    unit_dir = _installed_from(
+        tmp_path,
+        mod,
+        repo,
+        edits={_DASHBOARD_SERVICE: ("TimeoutStopSec=15", "TimeoutStopSec=30")},
+    )
+
+    result = _run_section_8(tmp_path, repo, unit_dir)
+
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert "drift or unverifiable state" in result.stdout, result.stdout
+    assert "FAIL " not in result.stdout, (
+        f"Drift is a real verdict from a gate that RAN.\n{result.stdout}"
+    )
+    _assert_units_installed(repo, unit_dir)
+
+
+def test_section_8_reports_not_yet_installed_on_a_bare_host(tmp_path: pathlib.Path):
+    """The benign branch must survive: a real exit 2 still reads as 'not yet installed'."""
+    mod = _load_checker()
+    repo = _gate_repo(tmp_path, mod)
+    unit_dir = tmp_path / "installed"
+
+    result = _run_section_8(tmp_path, repo, unit_dir)
+
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert "not yet installed" in result.stdout, result.stdout
+    assert "FAIL " not in result.stdout, (
+        f"A genuine 'not yet installed' is a real verdict.\n{result.stdout}"
+    )
+    _assert_units_installed(repo, unit_dir)
+
+
+# ---------------------------------------------------------------------------
+# The section-12 POST-INSTALL check in setup-host.sh
+# ---------------------------------------------------------------------------
+#
+# Same checker, second call site. This one runs AFTER the install, so a
+# mismatch does not mean "the host drifted" — it means the install did not
+# take. No install follows it, so these assertions are output-only.
+#
+# It carries the identical exit-2 defect, and here the false green is the
+# strongest of the three: a post-install check that silently never ran is the
+# LAST word the operator reads about whether the install took.
+
+# Anchored on the block's hoisted `_dash_post_parity_script=` assignment, for
+# the same reason as section 8: code, unique to this site, and the same line the
+# sweep below discovers — not the section comment, whose wording is not a
+# behavioural contract.
+_SECTION_12_START = "_dash_post_parity_script="
+_SECTION_12_END = "\nfi\n"
+
+
+def _run_section_12(
+    tmp_path: pathlib.Path, repo: pathlib.Path, unit_dir: pathlib.Path
+) -> subprocess.CompletedProcess:
+    return run_section(
+        tmp_path,
+        slice_section(_SECTION_12_START, _SECTION_12_END),
+        repo_root=repo,
+        unit_dir=unit_dir,
+    )
+
+
+def test_section_12_missing_checker_does_not_read_as_section_8_did_not_run(
+    tmp_path: pathlib.Path,
+):
+    """EXIT-CODE COLLISION: `python3 <missing script>` also exits 2.
+
+    2 here is "not installed in $UNIT_DIR (section 8 did not run?)" — already a
+    diagnosis, and the wrong one. A renamed or moved checker would send the
+    operator to investigate an install that in fact completed, while the thing
+    that actually failed (the check itself) goes unreported.
+    """
+    mod = _load_checker()
+    repo = _gate_repo(tmp_path, mod, with_checker=False)
+    unit_dir = _installed_from(tmp_path, mod, repo)
+
+    result = _run_section_12(tmp_path, repo, unit_dir)
+
+    assert result.returncode == 0, (
+        "The check is non-fatal — fail() only printfs, so it must not abort the "
+        f"health-check section.\n{result.stdout}\n{result.stderr}"
+    )
+    assert "not installed in" not in result.stdout, result.stdout
+    assert "section 8 did not run" not in result.stdout, (
+        "A missing checker was diagnosed as a failed section-8 install.\n"
+        f"{result.stdout}"
+    )
+    assert "FAIL " in result.stdout, (
+        f"A check that did not run must say so loudly.\n{result.stdout}"
+    )
+
+
+def test_section_12_usage_error_does_not_read_as_section_8_did_not_run(
+    tmp_path: pathlib.Path,
+):
+    """SAME COLLISION, second source: argparse exits 2 on any usage error."""
+    mod = _load_checker()
+    repo = _gate_repo(tmp_path, mod, checker_body=_USAGE_ERROR_CHECKER)
+    unit_dir = _installed_from(tmp_path, mod, repo)
+
+    result = _run_section_12(tmp_path, repo, unit_dir)
+
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert "not installed in" not in result.stdout, result.stdout
+    assert "section 8 did not run" not in result.stdout, result.stdout
+    assert "FAIL " in result.stdout, (
+        f"A check that did not run must say so loudly.\n{result.stdout}"
+    )
+
+
+def test_section_12_reports_install_verified_on_parity(tmp_path: pathlib.Path):
+    """Happy path — the fix must not degenerate into 'always report failure'."""
+    mod = _load_checker()
+    repo = _gate_repo(tmp_path, mod)
+    unit_dir = _installed_from(tmp_path, mod, repo)
+
+    result = _run_section_12(tmp_path, repo, unit_dir)
+
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert "install verified" in result.stdout, result.stdout
+    assert "FAIL " not in result.stdout, result.stdout
+
+
+def test_section_12_reports_the_install_did_not_take_on_drift(
+    tmp_path: pathlib.Path,
+):
+    """Drift AFTER installing is a real verdict — and keeps its drop-in guidance.
+
+    A drop-in override survives reinstallation because setup-host.sh does not
+    touch <unit>.d/ directories, so the operator must be told to remove it by
+    hand. That guidance has to survive the rewrite.
+    """
+    mod = _load_checker()
+    repo = _gate_repo(tmp_path, mod)
+    unit_dir = _installed_from(
+        tmp_path,
+        mod,
+        repo,
+        edits={_DASHBOARD_SERVICE: ("TimeoutStopSec=15", "TimeoutStopSec=30")},
+    )
+
+    result = _run_section_12(tmp_path, repo, unit_dir)
+
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert "AFTER installing" in result.stdout, result.stdout
+    assert "drop-in" in result.stdout, (
+        f"The drop-in guidance must survive the rewrite.\n{result.stdout}"
+    )
+    assert "FAIL " not in result.stdout, (
+        f"Post-install drift is a real verdict from a check that RAN.\n{result.stdout}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# The shared `_parity_verdict` classifier
+# ---------------------------------------------------------------------------
+#
+# The five gate blocks each answered the same two questions by hand: is the
+# checker's own tag in what it printed, and what did its exit status mean.
+# setup-host.sh answers them ONCE, in a bash helper, and each site keeps its own
+# wording and severity. This is the behavioural table for that helper.
+#
+# Sliced and run rather than read as text: the classification is the thing under
+# test, and a `[[ ]]` pattern that reads correctly can still match wrongly.
+
+_VERDICT_START = "_parity_verdict() {"
+_VERDICT_END = "\n}\n"
+
+_VERDICT_TAG = "[dashboard_unit_parity]"
+
+# The two real exit-2 imposters, verbatim in shape. Both carry BRACKETED
+# lookalikes -- argparse's flag spellings, python3's errno -- which is why they
+# are inputs here and not merely in the per-site tests: a classifier that
+# matched brackets loosely would hand the gate a verdict the checker never gave.
+_ARGPARSE_IMPOSTER = (
+    "usage: check_dashboard_unit_parity.py [-h] [--repo-root REPO_ROOT] [--fix]\n"
+    "check_dashboard_unit_parity.py: error: unrecognized arguments: --bogus"
+)
+_MISSING_SCRIPT_IMPOSTER = (
+    "python3: can't open file '/repo/scripts/check_dashboard_unit_parity.py': "
+    "[Errno 2] No such file or directory"
+)
+
+_TAGGED_REPORT = f"{_VERDICT_TAG} [ok] units match the committed copies"
+
+
+@pytest.mark.parametrize(
+    "out,status,expected",
+    [
+        # Tagged: the checker RAN and its status is a verdict about the host.
+        (_TAGGED_REPORT, 0, "parity"),
+        (_TAGGED_REPORT, 2, "absent"),
+        (_TAGGED_REPORT, 1, "finding"),
+        # Any other status is still a finding, never silently benign: 127 is
+        # `command not found` and 3 is a status no checker documents, and both
+        # mean something happened that the caller must not wave through.
+        (_TAGGED_REPORT, 127, "finding"),
+        (_TAGGED_REPORT, 3, "finding"),
+        # UNTAGGED — the load-bearing half. A status the checker never produced
+        # must not be classifiable as a verdict about the host, and that holds
+        # for EVERY status including the two that would otherwise read benign.
+        ("", 0, "unreported"),
+        ("", 1, "unreported"),
+        ("", 2, "unreported"),
+        ("[ok] parity — all required directives present.", 0, "unreported"),
+        (_ARGPARSE_IMPOSTER, 2, "unreported"),
+        (_MISSING_SCRIPT_IMPOSTER, 2, "unreported"),
+    ],
+    ids=[
+        "tagged-0-parity", "tagged-2-absent", "tagged-1-finding",
+        "tagged-127-finding", "tagged-3-finding",
+        "untagged-empty-0", "untagged-empty-1", "untagged-empty-2",
+        "untagged-legacy-marker-0",
+        "imposter-argparse-2", "imposter-missing-script-2",
+    ],
+)
+def test_parity_verdict_classifies(
+    tmp_path: pathlib.Path, out: str, status: int, expected: str
+):
+    """One classifier, four tokens: unreported | parity | absent | finding.
+
+    `unreported` outranks the status entirely — a checker whose tag is absent
+    did not report, so nothing it exited with says anything about this host.
+    Only after the tag is seen does the status get read.
+
+    The helper is sliced explicitly rather than relied on from the shared
+    preamble, so this test names its own subject and would still fail loudly if
+    the preamble stopped carrying it.
+    """
+    section = slice_section(_VERDICT_START, _VERDICT_END) + (
+        f'_parity_verdict "$OUT" "$STATUS" {_VERDICT_TAG!r}\n'
+    )
+
+    repo = tmp_path / "repo"
+    (repo / "scripts").mkdir(parents=True)
+    result = run_section(
+        tmp_path,
+        section,
+        repo_root=repo,
+        unit_dir=tmp_path / "units",
+        env_extra={"OUT": out, "STATUS": str(status)},
+    )
+
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert result.stdout.strip() == expected, (
+        f"out={out!r} status={status} -> {result.stdout.strip()!r}, "
+        f"expected {expected!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Structural sweep: no parity-checker call site may branch on a bare status
+# ---------------------------------------------------------------------------
+#
+# The three tests above pin the three call sites that exist TODAY. This sweep
+# pins the RULE, so a fourth gate added later cannot reintroduce the defect
+# without failing here. Sites are DERIVED from the file text rather than
+# hardcoded, so a new checker is covered the moment it is wired up.
+
+# A site is a line that USES the checker path — hoists it into the block's
+# `_<gate>_parity_script` variable, or hands it straight to `python3`. Both
+# forms are matched, so a future gate wired either way is swept the moment it
+# lands; the prefix must sit IMMEDIATELY before the path, so a `python3 ...`
+# mentioned earlier in a message cannot drag a later prose path in with it.
+#
+# A bare mention is NOT a site, and the distinction is load-bearing rather than
+# cosmetic: `_orch_skip_reason`'s fallback arm names
+# `scripts/check_orchestrator_unit_parity.py` inside a printf as the remedy for
+# an unknown verdict kind. Matching any occurrence read that remediation text as
+# a fifth call site and sliced a block from mid-`case` to the next column-0
+# `fi` — an unbalanced fragment bash rejects with a syntax error, which is a
+# vacuous case: it fails (or would "pass" a no-output assertion) for reasons
+# having nothing to do with the rule under test. This is also the convention
+# setup_host_sections.py's module docstring already states.
+_PARITY_SCRIPT_RE = re.compile(
+    r"(?:parity_script=|python3\s+)"          # the path is USED, not merely named
+    r"\"?(?:\$\{?REPO_ROOT\}?/)?"             # optional "$REPO_ROOT/ prefix
+    r"scripts/(check_\w+_unit_parity\.py)"
+)
+
+# Deliberate, updated by hand when a site is added or removed. Today: the
+# orchestrator gate, the section-8 dashboard pre-install gate, the section-12
+# fused-memory health check, the section-12 dashboard post-install check, and
+# the section-12 lms-arm@ health check.
+#
+# The lms-arm@ site is why this number is 5 and not 4: it landed on main from
+# task 3775 while this change was in flight, carrying the same bare `-eq 2`
+# read, and the sweep DISCOVERED it rather than being told about it. That is
+# the mechanism working, not a surprise to paper over — the count moved in the
+# same commit that fixed the site.
+#
+# An inequality would let the post-install site — the one this change fixes —
+# be deleted outright with the guard still green, and the sweep below runs one
+# case per DISCOVERED site, so there is no cap to keep a new one from being
+# inspected.
+_KNOWN_PARITY_CALL_SITES = 5
+
+
+def _parity_call_sites() -> list[tuple[int, str, str]]:
+    """Every parity-checker call site, as (line number, checker filename, block).
+
+    A site is a NON-COMMENT line that USES a `scripts/check_*_unit_parity.py`
+    path — either the hoisted `_x_parity_script="..."` assignment or a direct
+    `python3 "..."` invocation (see `_PARITY_SCRIPT_RE`). Its block runs to the
+    next column-0 `fi`, which closes the enclosing verdict construct at all
+    sites.
+
+    Lines that merely NAME a checker are excluded, whether or not they are
+    comments: the fused-memory block cites
+    `tests/scripts/test_check_fused_memory_unit_parity.py` by name, and the
+    orchestrator block's unknown-kind arm prints its checker's path as the
+    remedy. A citation is not a call site, and slicing a block from one yields
+    a bash fragment that cannot run.
+    """
+    text = setup_host_text()
+    sites: list[tuple[int, str, str]] = []
+    offset = 0
+    for lineno, line in enumerate(text.splitlines(), start=1):
+        start = offset
+        offset += len(line) + 1
+        if line.lstrip().startswith("#"):
+            continue
+        match = _PARITY_SCRIPT_RE.search(line)
+        if not match:
+            continue
+        end = text.find("\nfi\n", start)
+        assert end != -1, (
+            f"No column-0 `fi` closes the parity block starting at line {lineno}."
+        )
+        sites.append((lineno, match.group(1), text[start : end + len("\nfi\n")]))
+    return sites
+
+
+def test_the_sweep_finds_every_known_parity_call_site():
+    """Guard against a vacuous sweep: matching nothing must not read as passing."""
+    sites = _parity_call_sites()
+
+    assert len(sites) == _KNOWN_PARITY_CALL_SITES, (
+        f"Expected {_KNOWN_PARITY_CALL_SITES} parity call sites (orchestrator, "
+        f"dashboard pre-install, fused-memory, dashboard post-install, lms-arm@); found "
+        f"{len(sites)}: {[(lineno, name) for lineno, name, _ in sites]}. "
+        "Adding or removing a site is a deliberate act — update the count here "
+        "in the same change. If the sweep below stops matching, it silently "
+        "stops guarding anything."
+    )
+
+
+# Collected at import time from the file itself, so a fifth call site becomes a
+# fifth CASE automatically. (The previous shape — a fixed `range(8)` with a
+# skip for out-of-range indices — silently never inspected a ninth site: the
+# same "green because it never ran" failure this whole change is about,
+# reproduced one level up in its own guard.)
+_PARITY_CALL_SITES = _parity_call_sites()
+
+
+# A repo file a block refuses to run without, named literally in one of its
+# `[ -f "$REPO_ROOT/..." ]` guards. The lms-arm@ gate has two such inputs (its
+# checker AND the committed unit template); the other four have only the
+# checker, which they reach through their `_<gate>_parity_script` variable and
+# so never spell here.
+_GUARDED_REPO_INPUT_RE = re.compile(
+    r"\[\s*!?\s*-f\s+\"\$\{?REPO_ROOT\}?/(?P<path>[\w./@+-]+)\"\s*\]"
+)
+
+
+def _materialize_guarded_inputs(repo: pathlib.Path, block: str, checker: str):
+    """Create every OTHER repo input the block's existence guards require.
+
+    Without this, a gate guarding on a second file short-circuits to its
+    "inputs absent" arm and never reaches the status handling under test — a
+    vacuous case. Not silent if this stops matching: the case-1 assertion below
+    demands a loud line, and a short-circuited block emits none.
+
+    The checker itself is deliberately NOT created here; whether it exists is
+    exactly what the two cases vary.
+    """
+    for match in _GUARDED_REPO_INPUT_RE.finditer(block):
+        path = match.group("path")
+        if path.endswith(checker):
+            continue
+        target = repo / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.touch()
+
+
+@pytest.mark.parametrize(
+    "lineno,checker,block",
+    _PARITY_CALL_SITES,
+    ids=[f"L{lineno}-{name}" for lineno, name, _ in _PARITY_CALL_SITES],
+)
+def test_every_parity_call_site_refuses_a_status_the_checker_did_not_produce(
+    tmp_path: pathlib.Path, lineno: int, checker: str, block: str
+):
+    """No call site may report a verdict its checker never gave.
+
+    Exit 2 is overloaded three ways — the checker's own benign verdict,
+    `python3` refusing to open a missing script, and argparse rejecting an
+    unknown flag. So each site is RUN here against both non-checker sources of
+    a 2, and neither may end in a verdict about this host.
+
+    ASSERTED PER CASE, because the two differ in what a site can honestly say:
+
+    * The checker EXISTS and exits 2 without reporting (a renamed flag). The
+      block ran something and got back a status it cannot interpret, so it must
+      refuse LOUDLY — a `FAIL ` or a `WARN ` — and may not answer with `OK ` or
+      an `==> ` info, which are the shapes of a verdict about the host. This
+      case is what pins the rule at every site: an existence guard cannot
+      short-circuit it, so the status handling always runs.
+    * The checker is ABSENT. A site with an existence guard never invokes
+      `python3` at all and says so — at whatever severity its gate speaks in,
+      `fail()` for the four that may fail, `info()` for the warn-only lms-arm@
+      gate whose own suite forbids `fail` outright
+      (test_setup_host_lms_parity_gate.py::test_the_lms_gate_is_warn_only).
+      Both are honest, and severity alone cannot tell an honest "the checker is
+      not here" from a dishonest "not installed on this host". So this case
+      pins only the outcome no vocabulary makes acceptable: never `OK `, never
+      a claim of parity from a checker that could not even be opened.
+
+    Requiring `fail()` specifically, as this test first did, was a vocabulary
+    assumption rather than a rule: it could not be satisfied by a gate that is
+    deliberately warn-only, which is what the lms-arm@ site is.
+
+    Behavioural on purpose. The predecessor asserted on setup-host.sh's SOURCE
+    SPELLING (a literal `grep -q`, a POSIX `[ -f `), which rejected strictly
+    more robust code: matching the marker with bash's own `[[ ]]`/`case`
+    instead of `printf | grep -q` removes a real SIGPIPE misread, and the
+    lexical form called that a regression. It also checked ordering by textual
+    offset, so a site that validated in dead code and then branched on the bare
+    status would have passed. Running the block answers the question the
+    spelling was standing in for, and leaves a future author free to write the
+    guard however reads best.
+
+    WHAT THIS DOES NOT PIN, measured by mutation: deleting a site's `[ ! -f ]`
+    existence guard does NOT fail here, and correctly so. Without it `python3`
+    reaches a script that is not there, exits 2 with no marker on stdout, and
+    the output validation refuses that status exactly as before — so the
+    epistemics survive and only the operator-facing wording gets worse. The
+    marker check is the load-bearing guard; the existence test is legibility.
+    Deleting the output validation instead (the real defect) does fail here —
+    at every site, in the renamed-flag case.
+    """
+    cases = (
+        ("a renamed or moved checker (python3 itself exits 2)", None, False),
+        (
+            "a renamed flag (argparse exits 2)",
+            usage_error_checker(checker, "[-h] [--some-flag SOME_FLAG]", "--some-flag"),
+            True,
+        ),
+    )
+
+    for index, (label, body, with_checker) in enumerate(cases):
+        work = tmp_path / f"case{index}"
+        work.mkdir()
+        repo = checker_repo(work, checker, body=body, with_checker=with_checker)
+        _materialize_guarded_inputs(repo, block, checker)
+        result = run_section(
+            work,
+            block,
+            repo_root=repo,
+            unit_dir=work / "installed",
+            # Set upstream in the real script; only the section-8 slice reads it.
+            env_extra={"UV_PATH": "/usr/bin/uv"},
+        )
+        out = result.stdout + result.stderr
+
+        assert "OK " not in out, (
+            f"The parity call site at setup-host.sh:{lineno} reported PARITY "
+            f"with {label} — a green verdict on the strength of an exit status "
+            f"its checker never produced.\n{out}\n---\n{block}"
+        )
+
+        if not with_checker:
+            # Nothing was invoked, so saying so at any severity is honest; see
+            # the docstring for why severity cannot separate the two cases here.
+            continue
+
+        assert "FAIL " in out or "WARN " in out, (
+            f"The parity call site at setup-host.sh:{lineno} ran with {label} "
+            f"and never said so. A status the checker did not produce must be "
+            f"reported loudly, not read as a verdict.\n{out}\n---\n{block}"
+        )
+        assert "==> " not in out, (
+            f"The parity call site at setup-host.sh:{lineno} emitted an info() "
+            f"line with {label} — it reported something about this host on the "
+            f"strength of an exit status the checker never produced.\n{out}\n"
+            f"---\n{block}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# One shape at every site
+# ---------------------------------------------------------------------------
+#
+# The behavioural table above proves the classifier is RIGHT; these prove it is
+# the only classifier anyone uses. That is a separate claim, and the one a
+# half-refactor breaks: extracting the helper while leaving three sites on the
+# hand-rolled chain leaves the codebase with two shapes for one rule, so every
+# later sweep has to bless both and the next author has to guess which is
+# canonical. Task 3557 named that outcome as the reason it declined to extract
+# the helper at all rather than extract it halfway.
+#
+# Structural on purpose, unlike the behavioural sweep below it. Running a block
+# cannot see the difference between a site that called the helper and a site
+# that inlined an identical copy of it — both produce the correct verdict today
+# and only one of them stays correct when the helper changes.
+
+
+# A definition of the helper, in either of bash's two spellings.
+_DEFINITION_RE = re.compile(r"(?:function\s+)?_parity_verdict\s*(?:\(\s*\))?\s*\{")
+
+
+def test_the_verdict_helper_is_defined_exactly_once():
+    """One definition, or the sites do not share a classifier at all.
+
+    A second copy — a `_parity_verdict()` redefined lower in the file, or a
+    per-section variant — would silently win for every site below it under
+    bash's last-definition-wins rule, which is precisely the two-shapes state
+    the extraction exists to remove. The behavioural table slices the FIRST
+    definition, so a divergent second copy would not show up there.
+
+    Counted after `lstrip()`, and allowing the `function` keyword: an INDENTED
+    redefinition — inside an `if` block above the last three sites, say — is
+    still in the one shared scope and still wins for everything below it.
+    Measured: anchoring at column 0 kept the suite green with exactly such a
+    copy in place.
+    """
+    text = setup_host_text()
+    definitions = [
+        lineno
+        for lineno, line in enumerate(text.splitlines(), start=1)
+        if not line.lstrip().startswith("#")
+        and _DEFINITION_RE.match(line.lstrip())
+    ]
+
+    assert len(definitions) == 1, (
+        f"`_parity_verdict` is defined {len(definitions)} times in "
+        f"setup-host.sh (lines {definitions}). Under bash's "
+        "last-definition-wins rule a second copy silently takes over every "
+        "call site below it, so the five gates would stop sharing one "
+        "classifier while every test here still passed."
+    )
+
+
+def test_the_verdict_helper_precedes_every_call_site():
+    """Defined above the first site, because bash resolves a function at CALL time.
+
+    A definition placed after a call site is not a style problem: the site runs
+    `_parity_verdict: command not found`, and under `set -e` that ABORTS the
+    installer at that line (measured: `set -euo pipefail; v="$(missing_fn a)"`
+    exits 127). Bring-up dies partway through, mid-section, with whatever the
+    earlier sections already wrote to the host left in place. The five sites
+    share one shell scope, so ONE position satisfies all of them.
+    """
+    text = setup_host_text()
+    definitions = [
+        lineno
+        for lineno, line in enumerate(text.splitlines(), start=1)
+        if not line.lstrip().startswith("#")
+        and _DEFINITION_RE.match(line.lstrip())
+    ]
+    assert definitions, (
+        "`_parity_verdict` is not defined anywhere in setup-host.sh, so every "
+        "call site below would abort the installer with `command not found`."
+    )
+    definition = definitions[0]
+    first_site = min(lineno for lineno, _, _ in _parity_call_sites())
+
+    assert definition < first_site, (
+        f"`_parity_verdict` is defined at setup-host.sh:{definition}, BELOW "
+        f"the first parity call site at line {first_site}. Bash resolves a "
+        "function when the call runs, so that site would invoke a name that "
+        "does not exist yet."
+    )
+
+
+@pytest.mark.parametrize(
+    "lineno,checker,block",
+    _PARITY_CALL_SITES,
+    ids=[f"L{lineno}-{name}" for lineno, name, _ in _PARITY_CALL_SITES],
+)
+def test_every_parity_call_site_routes_through_the_shared_verdict_helper(
+    lineno: int, checker: str, block: str
+):
+    """Every site classifies through `_parity_verdict`, none by hand.
+
+    Collected from the sweep, so a sixth site added tomorrow is held to this
+    rule without anyone remembering to add it here.
+
+    Matched as a CALL, not as a substring. `"_parity_verdict" in block` is
+    vacuous here and was measured so: every site declares a
+    `_<gate>_parity_verdict` variable, and each of those names CONTAINS
+    `_parity_verdict`, so the declaration alone satisfies a substring test
+    while the site classifies by hand underneath. Comments are stripped for
+    the same reason — a site whose only mention of the helper is a comment
+    saying it should use one is exactly the state this forbids.
+    """
+    code = "\n".join(
+        line for line in block.splitlines() if not line.lstrip().startswith("#")
+    )
+    called = re.search(r"(?:^|[\s;&|(`]|\$\()_parity_verdict\b", code, re.MULTILINE)
+
+    assert called is not None, (
+        f"The parity call site at setup-host.sh:{lineno} ({checker}) never "
+        "CALLS `_parity_verdict` (a `_<gate>_parity_verdict` variable name "
+        "does not count). It is classifying the checker's output by hand, "
+        "which is the two-shapes-for-one-rule state the shared helper exists "
+        f"to remove.\n{block}"
+    )
+
+
+# A bare status read, e.g. `[ "$_fm_parity_exit" -eq 2 ]`. Matched on the
+# VARIABLE, not on the operator alone: `_orch_install_blocked` and the verdict
+# token comparisons are legitimate arithmetic/string tests in these same
+# blocks, and forbidding the operators outright would forbid those too.
+#
+# Every way bash can interrogate that variable, not just `-eq`. An earlier
+# version matched `-eq` only, and `[ "$_x_parity_exit" = 2 ]`, `-ne`, a `case`
+# over the status and an arithmetic `(( ))` all walked past it — a guard whose
+# docstring claims the status is read in exactly one place has to mean every
+# spelling of "read", or the site just picks another one.
+#
+# `==?` deliberately carries no trailing `\b`: a word boundary after `=` never
+# matches, which silently empties that alternative while the test keeps
+# passing. The interrogation forms are the two that do not spell the variable
+# with a leading `$`.
+_BARE_STATUS_READ_RE = re.compile(
+    r"case\s+\"?\$\{?_\w*parity_exit\}?\"?"           # case "$_x_parity_exit" in
+    r"|\(\(\s*[^)\n]*_\w*parity_exit\b"               # (( _x_parity_exit == 2 ))
+    r"|\$\{?_\w*parity_exit\}?\"?\s*(?:-(?:eq|ne|gt|lt|ge|le)\b|==?)"
+)
+
+
+@pytest.mark.parametrize(
+    "lineno,checker,block",
+    _PARITY_CALL_SITES,
+    ids=[f"L{lineno}-{name}" for lineno, name, _ in _PARITY_CALL_SITES],
+)
+def test_no_parity_call_site_branches_on_a_bare_exit_status(
+    lineno: int, checker: str, block: str
+):
+    """The exit status is read ONCE, inside the helper, never at a site.
+
+    This is the half-refactor guard with teeth: a site could call
+    `_parity_verdict` for its logging and still branch on `-eq 2` underneath,
+    which reads as converted and behaves as it always did. The status is still
+    captured and still PASSED to the helper — that is the interface — it just
+    may not be interpreted here.
+    """
+    bare = _BARE_STATUS_READ_RE.search(block)
+
+    assert bare is None, (
+        f"The parity call site at setup-host.sh:{lineno} ({checker}) still "
+        f"branches on its raw exit status ({bare.group(0)!r} at offset "
+        f"{bare.start()}). Exit 2 is overloaded three ways, so interpreting "
+        "the status anywhere but inside `_parity_verdict` re-creates the "
+        f"defect the helper centralises.\n{block}"
+    )

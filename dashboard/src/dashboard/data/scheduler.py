@@ -38,6 +38,22 @@ Shape contract (returned by collect_scheduler_state):
         Each entry: {'project': str, 'reason': str | None}
         Empty list when no project is paused or snapshots lack the is_paused key
         (safe degradation for pre-upgrade on-disk snapshots).
+
+    recovery_events: dict[str, list[dict]]  — sweep events that are NOT
+        ``task_skipped``, keyed by project label.  Each row is the raw event
+        dict copied and tagged with ``project`` (Taskmaster ids are
+        project-scoped, so an untagged flat row would be unattributable).
+
+        Three-state, deliberately: a label present with ``[]`` means the read
+        succeeded and there were no sweeps; a label ABSENT means the project is
+        offline (it appears in ``offline_projects`` instead).  Collapsing the
+        two would read a dead orchestrator as "no recovery activity".
+
+        These rows come from their OWN get_scheduler_events request with their
+        own row budget (``_RECOVERY_EVENTS_LIMIT``), never a shared one with
+        the high-rate ``task_skipped`` fetch — otherwise skip rows could
+        exhaust the budget and an empty tail would be projected as a confident
+        zero.  See ``_RECOVERY_EVENTS_LIMIT`` for the full rationale.
 """
 
 from __future__ import annotations
@@ -51,7 +67,7 @@ from shared.locking import files_to_modules, modules_conflict
 
 from dashboard.config import DashboardConfig
 from dashboard.data.active_tasks import _all_project_roots, _project_label, collect_active_tasks
-from dashboard.data.mcp_fanout import TTLCache, first_success
+from dashboard.data.mcp_fanout import TTLCache, fanout_label, first_success
 from dashboard.data.memory import mcp_tool_call
 from dashboard.data.utils import resolve_now
 
@@ -79,6 +95,37 @@ _SCHEDULER_TTL_SECONDS: float = 5.0
 # ever changes (mirrors the producer→reader hardening from task-1188).
 # 200 matches the current effective cap so no sparkline data is lost.
 _SCHEDULER_EVENTS_LIMIT: int = 200
+# The skip-sparkline request's event_types.  Named (rather than inlined) so the
+# two independently-budgeted requests below read symmetrically.
+_SKIP_EVENT_TYPES: list[str] = ['task_skipped']
+# Recovery/strand sweep event types (PRD plans/task-escalation-state-graph-prd.md
+# D2/§β, spec S6).  get_scheduler_events reads <project_root>/data/orchestrator/
+# runs.db — the very EventStore the recovery sweep emits into — but the request
+# below used to hard-filter to ['task_skipped'], so those rows landed invisibly.
+#
+# These are plain STRINGS by design, never an orchestrator EventType import:
+# the emitter (task β/3535) is a SIBLING of this projection, not a dependency,
+# so importing an enum member that does not exist yet would fail at import time
+# and take the whole dashboard down.  The MCP tool filters on the stored string
+# either way, so an unrecognised name is simply matched by nothing.
+_RECOVERY_EVENT_TYPES: tuple[str, ...] = (
+    'recovery_vetoed',
+    'recovery_left',
+    'strand_converted',
+)
+# Recovery rows get their OWN limit because they get their own request.  A
+# single widened request would have shared one 200-row budget across both
+# classes over the same 1-hour window, and the two classes have wildly
+# different rates: a contended scheduler emits one task_skipped per pass per
+# undispatchable task and would realistically exhaust 200/hour on skips alone,
+# crowding the rare recovery rows out of the response entirely.  The dashboard
+# would then see an empty recovery tail and project `recovery_event_counts
+# [label] = 0` — a CONFIDENT ZERO derived from a truncation, i.e. exactly the
+# unknown-collapsed-into-zero failure the three-state contract in this module's
+# docstring (and in redux_api.shape_scheduler) exists to prevent.  Two requests
+# with two budgets means neither class can starve the other, so a 0 here is
+# always a real 0.
+_RECOVERY_EVENTS_LIMIT: int = 200
 # Constant cache key — the cache holds exactly one entry (see the
 # single-config assumption in get_scheduler_snapshot's docstring below).
 _SCHEDULER_CACHE_KEY = 'scheduler'
@@ -103,7 +150,7 @@ async def get_scheduler_snapshot(
     client: httpx.AsyncClient,
     config: DashboardConfig,
 ) -> tuple[tuple, str]:
-    """Return cached scheduler snapshot ``(six_tuple, snapshot_at)``.
+    """Return cached scheduler snapshot ``(state_tuple, snapshot_at)``.
 
     Calls :func:`collect_scheduler_state` at most once per
     ``_SCHEDULER_TTL_SECONDS`` interval (default 5 s).  Because the
@@ -136,9 +183,9 @@ async def get_scheduler_snapshot(
         # snapshot where some projects are offline.  Caching a partial result
         # avoids re-running a multi-second fan-out that would just report the
         # same offline state again; ≤5 s of stale-offline is acceptable.
-        six_tuple = await collect_scheduler_state(client, config)
+        state_tuple = await collect_scheduler_state(client, config)
         snapshot_at = datetime.now(UTC).isoformat()  # clock-exempt: single-capture writer
-        return six_tuple, snapshot_at
+        return state_tuple, snapshot_at
 
     return await _scheduler_cache.get_or_refresh(_SCHEDULER_CACHE_KEY, _refresh)
 
@@ -576,7 +623,10 @@ async def collect_scheduler_state(
     config: DashboardConfig,
     *,
     now: datetime | None = None,
-) -> tuple[list[dict], list[dict], list[dict], dict[str, dict], list[str], list[dict]]:
+) -> tuple[
+    list[dict], list[dict], list[dict], dict[str, dict], list[str], list[dict],
+    dict[str, list[dict]],
+]:
     """Fan out over all configured project roots and aggregate scheduler state.
 
     For each project root:
@@ -592,7 +642,8 @@ async def collect_scheduler_state(
     row and sparkline in one collection shares a single reference instant.
 
     Returns:
-        ``(rows, modules, pin_queue, events_by_task, offline_projects, paused_projects)``
+        ``(rows, modules, pin_queue, events_by_task, offline_projects,
+        paused_projects, recovery_events)``
 
         rows:             Composed task rows (see module docstring).
         modules:          Sorted module-contention list.
@@ -603,6 +654,10 @@ async def collect_scheduler_state(
                           for projects whose scheduler is park-stop paused.
                           Empty list when no project is paused or the snapshot
                           lacks ``is_paused`` (pre-upgrade on-disk degradation).
+        recovery_events:  ``{project_label: [event_row, ...]}`` for every sweep
+                          event that is NOT ``task_skipped``.  Present-with-``[]``
+                          means the project answered and had no sweeps; ABSENT
+                          means offline (see module docstring).
     """
     effective_now = resolve_now(now)
     since = effective_now - timedelta(hours=1)
@@ -618,33 +673,75 @@ async def collect_scheduler_state(
         if _project_label(root) not in offline_projects
     ]
 
-    async def _one_project(root) -> tuple[str, dict | None, list[dict]]:
-        """Fetch snapshot + events for one project root.
+    async def _one_project(root) -> tuple[str, dict | None, list[dict], list[dict]]:
+        """Fetch snapshot + skip events + recovery events for one project root.
 
         Delegates the per-URL failover to ``mcp_fanout.first_success``: URLs
         are tried sequentially and the first success wins; on a transport
         error or soft failure the failing URL's cached MCP session is
         invalidated and the next URL is tried.
 
-        Simplicity trade-off: if the snapshot call succeeds on url1 but the
-        events call raises, the whole pair is re-issued against url2 rather
-        than retrying only the events leg — both calls live inside one
-        ``_call(url)`` coroutine, so a failure anywhere in it re-runs both on
-        the next URL.  This amplifies load slightly on the surviving URL but
-        keeps the retry logic single-axis; both calls are idempotent and
-        small, so the re-fetch is cheap.
+        Simplicity trade-off: if the snapshot call succeeds on url1 but either
+        events call raises, the whole TRIPLE is re-issued against url2 rather
+        than retrying only the failing leg — all three calls live inside one
+        ``_call(url)`` coroutine, so a failure anywhere in it re-runs all three
+        on the next URL.  This amplifies load slightly on the surviving URL but
+        keeps the retry logic single-axis; the calls are idempotent and small,
+        so the re-fetch is cheap.
 
-        Returns ``(label, snapshot, events)`` on success — ``snapshot`` may be
-        ``{}`` for a project with no scheduler state yet (online but empty),
-        and is normalised to ``{}`` if the MCP server returns a non-dict
-        (defensive — older/buggy servers should never crash the aggregator).
-        Returns ``(label, None, [])`` when every URL fails; the ``None``
-        sentinel lets the caller distinguish *offline* from *online-but-empty*
-        so a legitimately quiescent project is never misclassified as offline.
+        The two events calls are deliberately SEPARATE requests rather than one
+        widened ``event_types`` list — see ``_RECOVERY_EVENTS_LIMIT``: sharing
+        one row budget lets high-rate skip rows crowd out the rare recovery
+        rows, which the projection would then report as a confident zero.
+
+        Returns ``(label, snapshot, skip_events, recovery_events)`` on success —
+        ``snapshot`` may be ``{}`` for a project with no scheduler state yet
+        (online but empty), and is normalised to ``{}`` if the MCP server
+        returns a non-dict (defensive — older/buggy servers should never crash
+        the aggregator).  Returns ``(label, None, [], [])`` when every URL
+        fails; the ``None`` sentinel lets the caller distinguish *offline* from
+        *online-but-empty* so a legitimately quiescent project is never
+        misclassified as offline.
         """
         label = _project_label(root)
 
-        async def _call(url: str) -> tuple[dict, list[dict]]:
+        async def _fetch_events(
+            url: str, event_types: list[str], limit: int, kind: str,
+        ) -> list[dict]:
+            """Read one event class for this root, normalised to a list."""
+            events_raw = await mcp_tool_call(
+                client,
+                url,
+                'get_scheduler_events',
+                {
+                    'project_root': str(root),
+                    'since': since.isoformat(),
+                    # list(...) so a caller can never mutate the module constant
+                    # through the recorded MCP argument dict.
+                    'event_types': list(event_types),
+                    'limit': limit,
+                },
+            )
+            if isinstance(events_raw, list):
+                events: list[dict] = events_raw
+            elif isinstance(events_raw, dict):
+                # events may be wrapped: {'events': [...]}
+                events = events_raw.get('events') or []
+            else:
+                events = []
+            # Each class has its own budget, so one can no longer starve the
+            # other — but a class can still saturate its OWN limit.  Log it
+            # loudly: a truncated tail is a lower bound, never a total.
+            if len(events) >= limit:
+                logger.warning(
+                    'get_scheduler_events[%s] (%s) returned %d rows at its '
+                    'limit=%d cap — that event tail is TRUNCATED; counts drawn '
+                    'from it are a lower bound, not a total.',
+                    label, kind, len(events), limit,
+                )
+            return events
+
+        async def _call(url: str) -> tuple[dict, list[dict], list[dict]]:
             snapshot = await mcp_tool_call(
                 client,
                 url,
@@ -656,33 +753,26 @@ async def collect_scheduler_state(
             # `.get(...)` calls.  Treat as online-but-empty.
             if not isinstance(snapshot, dict):
                 snapshot = {}
-            events_raw = await mcp_tool_call(
-                client,
-                url,
-                'get_scheduler_events',
-                {
-                    'project_root': str(root),
-                    'since': since.isoformat(),
-                    'event_types': ['task_skipped'],
-                    'limit': _SCHEDULER_EVENTS_LIMIT,
-                },
+            skip_events = await _fetch_events(
+                url, _SKIP_EVENT_TYPES, _SCHEDULER_EVENTS_LIMIT, 'skip',
             )
-            if isinstance(events_raw, list):
-                events: list[dict] = events_raw
-            elif isinstance(events_raw, dict):
-                # events may be wrapped: {'events': [...]}
-                events = events_raw.get('events') or []
-            else:
-                events = []
-            return snapshot, events
+            recovery_events = await _fetch_events(
+                url, list(_RECOVERY_EVENT_TYPES), _RECOVERY_EVENTS_LIMIT,
+                'recovery',
+            )
+            return snapshot, skip_events, recovery_events
 
-        snapshot, events = await first_success(
+        snapshot, skip_events, recovery_events = await first_success(
             config.fused_memory_urls,
             _call,
-            log_label=f'get_scheduler_state[{label}]',
-            offline_result=lambda errs: (None, []),
+            # String-identical to the former f'get_scheduler_state[{label}]' —
+            # fanout_label's basename form IS _project_label's. Routed through
+            # the helper so all four fan-out sites share one definition of the
+            # per-project-root throttle-key convention (see its docstring).
+            log_label=fanout_label('get_scheduler_state', root),
+            offline_result=lambda errs: (None, [], []),
         )
-        return label, snapshot, events
+        return label, snapshot, skip_events, recovery_events
 
     # Build a label→root map for O(1) lookup after asyncio.gather.
     # (A linear next(...) search over roots_to_query would be O(n²) in the
@@ -705,12 +795,15 @@ async def collect_scheduler_state(
     # `${row.project}/${row.task_id}` to match this key.
     all_events_by_task: dict[str, dict] = {}
     all_paused_projects: list[dict] = []
+    # Keyed by project label; see the shape contract in the module docstring —
+    # present-with-[] means "read succeeded, no sweeps", absent means offline.
+    all_recovery_events: dict[str, list[dict]] = {}
 
     for result in per_project_results:
         if isinstance(result, BaseException):
             logger.warning('_one_project raised unexpectedly: %s', result)
             continue
-        label, snapshot, events = result
+        label, snapshot, skip_events, recovery_events = result
 
         # None snapshot means every URL failed (offline); {} means online-but-empty.
         if snapshot is None:
@@ -809,12 +902,46 @@ async def collect_scheduler_state(
                 'project_root': str(root),
             })
 
+        skip_list = skip_events if isinstance(skip_events, list) else []
+        recovery_list = (
+            recovery_events if isinstance(recovery_events, list) else []
+        )
+
+        # Sweep-event partition (PRD D2/§β, spec S6) — everything that is NOT
+        # task_skipped is a recovery/strand row and belongs to its own surface,
+        # not the skip sparkline.  Registered unconditionally (even when empty)
+        # because reaching this line means the project answered: the key's
+        # presence is what distinguishes online-but-quiet from offline.
+        #
+        # The task_skipped exclusion is belt-and-braces: the recovery request
+        # asks only for _RECOVERY_EVENT_TYPES, so a skip row here would mean
+        # the server ignored event_types.  Filtering anyway keeps the partition
+        # true by construction rather than by trusting the producer.
+        #
+        # Rows are COPIED before tagging — `recovery_events` aliases the MCP
+        # result the caller may still hold.
+        recovery_rows = [
+            {**ev, 'project': label}
+            for ev in recovery_list
+            if isinstance(ev, dict) and ev.get('event_type') != 'task_skipped'
+        ]
+        all_recovery_events.setdefault(label, []).extend(recovery_rows)
+
         # Per-task event sparklines — keyed by composite '{label}/{tid}' to
         # avoid silent overwrite when the same numeric task_id appears in two
         # project roots (see NOTE above).
-        events_list = events if isinstance(events, list) else []
+        #
+        # Built from task_skipped rows ONLY.  `_skip_event_sparkline` returns
+        # its empty shape when its `events` argument is empty, not when the
+        # post-filter skip list is — so admitting a recovery-only task here
+        # would mint a `{label}/{tid}` key holding a full label array of zeros,
+        # and tab_scheduler.jsx would render a flat-zero sparkline in a drawer
+        # that previously showed none.  The key space stays exactly what it was
+        # before the recovery classes were projected.
         by_task: dict[str, list] = {}
-        for ev in events_list:
+        for ev in skip_list:
+            if not isinstance(ev, dict) or ev.get('event_type') != 'task_skipped':
+                continue
             tid = str(ev.get('task_id') or '')
             by_task.setdefault(tid, []).append(ev)
         for tid, task_events in by_task.items():
@@ -823,7 +950,15 @@ async def collect_scheduler_state(
                 task_events, since=since, until=effective_now
             )
 
-    return all_rows, all_modules, all_pin_queue, all_events_by_task, offline_projects, all_paused_projects
+    return (
+        all_rows,
+        all_modules,
+        all_pin_queue,
+        all_events_by_task,
+        offline_projects,
+        all_paused_projects,
+        all_recovery_events,
+    )
 
 
 def _merge_module_lists(

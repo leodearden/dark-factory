@@ -199,6 +199,15 @@ directly, not just interactive agents.
   `pyright skipped (no Python changes)` and is quick. When a commit does stage
   Python, pass `timeout: 300000` (or higher) to `Bash`, or run detached via
   `setsid` and poll, rather than letting the default timeout kill it mid-hook.
+- `git commit --only` holds `.git/index.lock` for that **entire** hook run,
+  and under a held lock `git stash create` fails silently (rc=1, empty
+  stdout *and* stderr). The merge worker therefore **stands off** for up to
+  `git.merge_park_lock_grace_seconds` (default 300s, matching the pre-commit
+  budget above) whenever `project_root` has main checked out and the index
+  lock is held: a docs-direct-commit-on-main now merely *delays* a merge
+  instead of halting the queue, and no operator rescue is needed for this
+  case. If the grace still expires, that one merge is blocked per-task (see
+  `park_lock_contended` in `OPERATIONS.md`) — the queue keeps running.
 - **Never** run `git stash` in **any** dark-factory checkout — `project_root`
   or a `.worktrees/<id>` task worktree. `refs/stash` is a single ref in the
   shared `.git` dir and is *not* per-worktree, so every checkout pushes onto

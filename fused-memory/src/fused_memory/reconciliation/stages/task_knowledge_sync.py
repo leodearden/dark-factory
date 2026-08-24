@@ -9,7 +9,7 @@ import itertools
 import json
 import logging
 import sys
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
@@ -584,6 +584,14 @@ async def _query_stage2_flags(
             project_id=project_id,
             categories=['observations_and_summaries'],
             limit=100,
+            # OPT OUT of topic-anchored recall (task 3111).  This is a marker
+            # SWEEP, not a presentation: the window is post-filtered for Stage-1
+            # flags, and the pin promotes rather than adds, so a pinned
+            # canonical would push a genuine flag past the top-N cutoff.  That
+            # flag would then be silently "not swept or rendered this cycle" --
+            # indistinguishable from the pre-existing top-N risk the docstring
+            # above warns about, but self-inflicted.
+            anchor_topics=False,
         )
     except Exception:
         logger.warning(
@@ -868,20 +876,57 @@ STAGE2_PERSISTENCE_MARKER_MAX_AGE_DAYS: int = 14
 _STAGE2_PERSISTENCE_MARKER_GC_SWEEP_SOURCE = 'stage2_persistence_marker_gc_sweep'
 
 # Age-based GC for the legacy Mem0 stage1_flag_marker pool (task 2853).
-# Task 2406 retired the Mem0 stage1_flag_marker mirror write — markers now
-# persist only to the recon_ledger SQLite table (see _gc_recon_markers /
+# Task 2406 retired the CANONICAL Mem0 stage1_flag_marker mirror write
+# (flag_dedup._persist_marker) — markers from that path now persist only
+# to the recon_ledger SQLite table (see _gc_recon_markers /
 # ReconLedgerStore.gc above, which reaps ledger rows only). Task 2228 W5-κ
 # deleted the prior in-cycle Mem0 sweeps for this source (_sweep_stale_flag_
 # markers, _sweep_terminal_task_flag_markers) on the assumption that the
 # ledger gc() pass fully replaced them; it does not reach Mem0, so the
 # pre-2406 Mem0 pool was left with no in-cycle collector for any project.
-# Since the write path is fully retired, every remaining Mem0
-# stage1_flag_marker record is dead weight; 14 days reuses the
-# STAGE2_PERSISTENCE_MARKER_MAX_AGE_DAYS / task-1944 convention as a
-# conservative, consistent aging cutoff rather than deleting immediately.
+# The canonical write path is retired. A second path also produced this
+# shape (task 3915): an LLM recon agent's add_memory call wrote a
+# stage1_flag_marker record directly to Mem0, tagged with metadata.kind
+# rather than metadata.source (measured live counts: know_live 0 records
+# under {'source': 'stage1_flag_marker'} vs 1 under
+# {'kind': 'stage1_flag_marker'} — marker a5732b3b, agent_id
+# 'recon-stage-task_knowledge_sync', 37 days old at measurement time).
+# That write is now REJECTED outright by the task-2596 add_memory gate
+# (server/tools.py:2978-2993, error flag_marker_write_blocked) for any
+# 'recon-stage-*' agent_id — the leaked marker predates that gate rather
+# than evidencing a live bypass; the only residual write hole is a
+# non-'recon-stage-*' agent_id, which the gate's prefix check does not
+# reach. See _STAGE1_FLAG_MARKER_MEM0_ENUM_FILTER_VARIANTS below. 14 days
+# reuses the STAGE2_PERSISTENCE_MARKER_MAX_AGE_DAYS / task-1944 convention
+# as a conservative, consistent aging cutoff rather than deleting
+# immediately.
 _STAGE1_FLAG_MARKER_MEM0_SOURCE = 'stage1_flag_marker'
 STAGE1_FLAG_MARKER_MEM0_MAX_AGE_DAYS: int = 14
 _STAGE1_FLAG_MARKER_GC_SWEEP_SOURCE = 'stage1_flag_marker_gc_sweep'
+
+# Enumeration filter variants for the pool above (task 3915). The canonical
+# retired writer (flag_dedup._persist_marker, flag_dedup.py:849-856) always
+# set BOTH 'source' and 'kind' to 'stage1_flag_marker'. At least one legacy
+# record (measured: know_live marker a5732b3b, 37 days old, agent_id
+# 'recon-stage-task_knowledge_sync') was instead written by an LLM recon
+# agent via the add_memory MCP tool, which set 'kind' but omitted 'source'
+# entirely — the same un-normalized-LLM-metadata failure class task 2966
+# already documented for flag_for_stage2 (see the type-drift note below).
+# That specific write shape now predates the task-2596 add_memory gate
+# (server/tools.py:2978-2993), which rejects it outright for any
+# 'recon-stage-*' agent_id; the residual write hole is a
+# non-'recon-stage-*' agent_id, which nothing at the add_memory boundary
+# normalizes. A {'source': ...}-only filter therefore silently misses that
+# cohort forever: measured live counts are know_live: 0 under
+# {'source': 'stage1_flag_marker'} vs 1 under {'kind': 'stage1_flag_marker'}.
+# Qdrant payload filters are AND-only within one dict, so a
+# source=X OR kind=X predicate cannot be expressed in a single call — each
+# variant must be enumerated separately and the results unioned by id (see
+# _sweep_stale_mem0_pool's enum_filters parameter).
+_STAGE1_FLAG_MARKER_MEM0_ENUM_FILTER_VARIANTS: tuple[dict, ...] = (
+    {'source': _STAGE1_FLAG_MARKER_MEM0_SOURCE},
+    {'kind': _STAGE1_FLAG_MARKER_MEM0_SOURCE},
+)
 
 # Age-based GC for the Mem0-only flag_for_stage2 Stage-1 -> Stage-2 relay pool
 # (task 2966). flag_for_stage2 markers are written ONLY to Mem0 by the
@@ -1082,9 +1127,12 @@ async def _gc_recon_markers(
             Defaults to ``datetime.now(UTC)``; tests inject a fixed value.
             Normalized via :func:`_assume_utc` and rendered with
             ``.isoformat()`` to match the writer format used by
-            ``flag_dedup._persist_flag_marker``, so the ledger's
-            lexicographic TEXT comparison against stored ``expires_at``
-            values is correct.
+            ``flag_dedup.dedup_flags``, which writes
+            ``expires_at=(now + timedelta(days=14)).isoformat()`` from a
+            ``datetime.now(UTC)`` inline in the ledger upsert (no separate
+            helper — the marker write is not factored out), so the
+            ledger's lexicographic TEXT comparison against stored
+            ``expires_at`` values is correct.
 
     Returns:
         Number of rows deleted by the ``gc()`` pass (``0`` on any failure or
@@ -1133,7 +1181,7 @@ async def _sweep_stale_mem0_pool(
     now: datetime | None = None,
     scroll_limit: int = 1000,
     count_short_circuit: bool = False,
-    enum_filters: dict | None = None,
+    enum_filters: dict | Sequence[dict] | None = None,
 ) -> int:
     """Shared age-GC skeleton for a single-source Mem0 marker pool.
 
@@ -1152,6 +1200,27 @@ async def _sweep_stale_mem0_pool(
     with a missing or unparseable ``created_at`` are KEPT (never deleted) —
     a fail-safe KEEP-on-uncertainty posture shared with every other marker
     sweep in this module.
+
+    **Multi-variant union (task 3915):** a pool is not always identifiable
+    by a single payload filter — e.g. the legacy ``stage1_flag_marker``
+    pool has members carrying ``metadata.source='stage1_flag_marker'``,
+    others carrying only ``metadata.kind='stage1_flag_marker'`` (an
+    under-normalized LLM ``add_memory`` write), and Qdrant payload filters
+    are AND-only within one dict, so a ``source=X OR kind=X`` predicate
+    cannot be expressed in a single call. ``enum_filters`` therefore
+    accepts either one filter dict or a sequence of filter-dict variants;
+    each variant is enumerated (and, under ``count_short_circuit``,
+    counted) separately, and the per-variant results are unioned by
+    ``id`` (first occurrence wins, insertion order preserved) before the
+    single shared age-filter -> delete -> tombstone tail below — so a
+    member matched by more than one variant (e.g. the canonical
+    both-keys-present shape) is neither double-deleted nor double-counted.
+    When more than one filter variant is in play, the merged members are
+    also checked for the drifted ``kind``-present/``source``-absent shape;
+    if any are found, ONE purely-diagnostic WARNING names the count so a
+    still-live under-normalized ``add_memory`` writer surfaces instead of
+    silently refilling the pool this sweep just drained (task 3915 step-8;
+    never raises, never alters the member list or returned count).
 
     **Protected-mirror invariant (task 3041): this skeleton NEVER deletes a
     ``kind='cycle_summary'`` / ``record_type='ledger_stamp'`` record**, no
@@ -1205,49 +1274,126 @@ async def _sweep_stale_mem0_pool(
             to ``datetime.now(UTC)``; tests inject a fixed value.
         scroll_limit: Max records to enumerate in one scroll (default 1000).
         count_short_circuit: When ``True``, probe
-            ``memory_service.count_memories_by_metadata`` first and return
-            ``0`` immediately on a confirmed exact-zero count — skipping the
-            larger scroll entirely. Fails OPEN: an exception, or any result
-            other than exactly ``0``, falls straight through to the normal
-            scroll path unchanged — so this can only ever skip a scroll that
-            would itself have found nothing. Intended for a pool whose write
-            path is fully retired (task 2853 review, efficiency finding),
-            where the scroll would otherwise run forever against an
-            already-empty pool; deliberately NOT used for a still-active
-            pool, where the count is almost never zero and the extra
-            round-trip would be pure overhead.
-        enum_filters: Overrides the enumeration/count filter dict when the
-            pool cannot be identified by a ``{'source': source}`` payload
-            filter (e.g. a marker with no ``source`` field at all). Defaults
-            to ``None``, which preserves the ``{'source': source}`` filter
-            used by every caller before task 2966. When given, it is applied
-            verbatim to BOTH the ``count_short_circuit`` probe and the
-            enumeration scroll — ``source`` itself still supplies the
-            human-readable log label regardless.
+            ``memory_service.count_memories_by_metadata`` once per filter
+            variant first, and return ``0`` immediately ONLY when EVERY
+            variant confirms an exact-zero count — skipping the larger
+            scroll entirely. Fails OPEN per probe: an exception, a non-
+            ``int`` result, or any result other than exactly ``0`` on ANY
+            variant means the whole probe is inconclusive, and falls
+            straight through to the normal multi-variant scroll path
+            unchanged — so this can only ever skip a scroll that would
+            itself have found nothing (task 3915: an any-variant-zero rule
+            would reintroduce the exact bug this parameter's stricter
+            all-variants-zero rule fixes — a pool can be simultaneously
+            zero under one variant's filter and non-empty under another's).
+            Intended for a pool whose write path is fully retired (task
+            2853 review, efficiency finding), where the scroll would
+            otherwise run forever against an already-empty pool;
+            deliberately NOT used for a still-active pool, where the count
+            is almost never zero and the extra round-trip would be pure
+            overhead.
+        enum_filters: Overrides the enumeration/count filter when the pool
+            cannot be identified by a single ``{'source': source}`` payload
+            filter (e.g. a marker with no ``source`` field at all, or one
+            identifiable only by the union of more than one key spelling).
+            Defaults to ``None``, which preserves the ``{'source': source}``
+            filter used by every caller before task 2966. Accepts either a
+            single filter ``dict`` (applied verbatim to BOTH the
+            ``count_short_circuit`` probe and the enumeration scroll, byte-
+            for-byte the pre-3915 behaviour) or a ``Sequence[dict]`` of
+            filter variants (task 3915), each probed/enumerated separately
+            and unioned by ``id`` — see the "Multi-variant union" note
+            above. ``source`` itself always supplies the human-readable log
+            label regardless of which filter(s) are actually applied.
 
     Returns:
         Number of memories successfully deleted (0 if nothing is stale, on
         enumeration failure, or on a confirmed-empty count short-circuit).
     """
-    filters = enum_filters if enum_filters is not None else {'source': source}
+    # Normalize enum_filters to a list of one-or-more filter variants (task
+    # 3915): a bare dict is the pre-3915 single-filter shape (one-element
+    # list); None preserves the {'source': source} default; a Sequence[dict]
+    # (e.g. _STAGE1_FLAG_MARKER_MEM0_ENUM_FILTER_VARIANTS) is a pool that
+    # cannot be identified by any single payload filter and must be
+    # enumerated once per variant, unioned below.
+    if enum_filters is None:
+        filter_variants: list[dict] = [{'source': source}]
+    elif isinstance(enum_filters, dict):
+        filter_variants = [enum_filters]
+    else:
+        filter_variants = list(enum_filters)
 
     if count_short_circuit:
-        try:
-            count = await memory_service.count_memories_by_metadata(
-                project_id=project_id,
-                filters=filters,
-            )
-        except Exception:
-            count = None
-        if count == 0:
+        # Short-circuit ONLY when EVERY variant probe confirms an exact
+        # count of 0 — an any-variant-zero rule would reintroduce the task
+        # 3915 bug: know_live's {'source': ...} probe reports 0 today, and
+        # short-circuiting on it alone is exactly what hid the leaked
+        # {'kind': ...}-only marker. Each probe keeps the original
+        # try/except -> None fail-open shape, so a backend error can never
+        # be read as an empty pool; a non-int result (an unexpected return
+        # shape) is treated the same as a non-zero result, mirroring the
+        # isinstance(..., int) strictness _warn_on_flag_for_stage2_type_drift
+        # already established for this same kind of probe.
+        #
+        # Breaks out as soon as one variant fails to confirm zero (task
+        # 3915 review, efficiency finding): the outcome is already decided
+        # at that point — no later variant's result can flip
+        # all_variants_confirmed_zero back to True — so probing the
+        # remaining variants would be a wasted round-trip per variant.
+        all_variants_confirmed_zero = True
+        for variant_filters in filter_variants:
+            try:
+                count = await memory_service.count_memories_by_metadata(
+                    project_id=project_id,
+                    filters=variant_filters,
+                )
+            except Exception:
+                count = None
+            if not isinstance(count, int) or count != 0:
+                all_variants_confirmed_zero = False
+                break
+        if all_variants_confirmed_zero:
             return 0
 
+    # Enumerate each filter variant and union the results by id (first
+    # occurrence wins) so a member matched by more than one variant (e.g.
+    # the canonical both-keys-present shape) is neither double-deleted nor
+    # double-counted. Any enumeration failure aborts the whole sweep for
+    # this cycle rather than operating on a partial picture of the pool —
+    # the same fail-safe posture as the prior single-filter enumeration.
     try:
-        members = await memory_service.get_memories_by_metadata(
-            project_id=project_id,
-            filters=filters,
-            limit=scroll_limit,
-        )
+        members: list[dict] = []
+        seen_ids: set = set()
+        for variant_filters in filter_variants:
+            variant_members = await memory_service.get_memories_by_metadata(
+                project_id=project_id,
+                filters=variant_filters,
+                limit=scroll_limit,
+            )
+            if len(variant_members) >= scroll_limit:
+                # Each filter variant has its own scroll_limit budget (task
+                # 3915): naming the variant filter lets the operator tell
+                # which key spelling is backlogged rather than just "this
+                # pool has more than scroll_limit records" undifferentiated.
+                logger.warning(
+                    'reconciliation.%s: enumerated %d of scroll_limit=%d %s records via filter '
+                    '%r — scroll cap reached; older stale markers may remain uncollected this '
+                    'cycle; re-run with a higher scroll_limit.',
+                    log_name, len(variant_members), scroll_limit, source, variant_filters,
+                    extra={'project_id': project_id, 'run_id': run_id},
+                )
+            for member in variant_members:
+                mid = member.get('id')
+                # Skip falsy ids here too — exactly as the age-filter loop
+                # below already does — so a None/'' id from one variant's
+                # scroll can never occupy the seen-ids set and mask a
+                # DIFFERENT id-less member surfaced by another variant.
+                if not mid:
+                    continue
+                if mid in seen_ids:
+                    continue
+                seen_ids.add(mid)
+                members.append(member)
     except Exception:
         logger.warning(
             'reconciliation.%s: get_memories_by_metadata failed for project_id=%s; skipping sweep',
@@ -1256,17 +1402,63 @@ async def _sweep_stale_mem0_pool(
         )
         return 0
 
-    if len(members) >= scroll_limit:
-        logger.warning(
-            'reconciliation.%s: enumerated %d of scroll_limit=%d %s records — scroll cap '
-            'reached; older stale markers may remain uncollected this cycle; re-run with a '
-            'higher scroll_limit.',
-            log_name, len(members), scroll_limit, source,
-            extra={'project_id': project_id, 'run_id': run_id},
-        )
-
     if not members:
         return 0
+
+    if len(filter_variants) > 1:
+        # Under-tagged-marker drift diagnostic (task 3915 step-8). The union
+        # filter above now REACHES a member carrying only the drifted `kind`
+        # spelling with no `source` key at all — the exact shape that let
+        # marker a5732b3b hide from the pre-fix {'source': ...}-only filter
+        # for 37 days. Reaping the backlog fixes the SYMPTOM; the WRITE PATH
+        # that produced it (an LLM `add_memory` call with un-normalized
+        # metadata) is now REJECTED for 'recon-stage-*' agent_ids by the
+        # task-2596 add_memory gate (server/tools.py:2978-2993, error
+        # flag_marker_write_blocked) — the measured leaked record predates
+        # that gate rather than evidencing a live bypass. The residual hole
+        # is a non-'recon-stage-*' agent_id, which the gate's prefix check
+        # does not reach, so a loud signal here still earns its keep rather
+        # than sending an operator hunting for an already-gated writer.
+        # Mirrors _warn_on_flag_for_stage2_type_drift's posture (task 2966)
+        # for the identical un-normalized-LLM-metadata failure class:
+        # purely diagnostic, never raises, never alters `members` or the
+        # returned count. Gated to multi-variant pools only, so the two
+        # single-dict callers (_sweep_stale_persistence_markers,
+        # _sweep_stale_mem0_flag_for_stage2_markers) keep byte-for-byte
+        # unchanged log output.
+        try:
+            under_tagged_count = sum(
+                1
+                for member in members
+                if isinstance(member.get('metadata'), dict)
+                and 'source' not in member['metadata']
+                and member['metadata'].get('kind') == source
+            )
+            if under_tagged_count > 0:
+                logger.warning(
+                    'reconciliation.%s: %d %s record(s) carry kind=%r with no source '
+                    'key — invisible to the pre-3915 {"source": ...}-only filter. '
+                    'These under-tagged records predate (or bypass) the task-2596 '
+                    'add_memory gate (server/tools.py:2978, error '
+                    'flag_marker_write_blocked), which rejects this exact shape for '
+                    'any recon-stage-* agent_id; if this recurs, check for a '
+                    'non-recon-stage-* writer, which the gate does not cover '
+                    '(task 3915).',
+                    log_name, under_tagged_count, source, source,
+                    extra={
+                        'project_id': project_id,
+                        'run_id': run_id,
+                        'log_name': log_name,
+                    },
+                )
+        except Exception:
+            logger.warning(
+                'reconciliation.%s: under-tagged-marker drift diagnostic raised; '
+                'skipping (fail-safe, does not affect the sweep count).',
+                log_name,
+                exc_info=True,
+                extra={'project_id': project_id, 'run_id': run_id},
+            )
 
     cutoff = _assume_utc(now or datetime.now(UTC)) - timedelta(days=max_age_days)
 
@@ -1474,20 +1666,35 @@ async def _sweep_stale_mem0_flag_markers(
 
     Delegates to :func:`_sweep_stale_mem0_pool` (task 2853 amendment) for the
     shared enumerate -> age-filter -> gather_collect-delete -> count
-    skeleton, with a distinct source filter, delete ``_source`` tag, and
-    max-age constant from :func:`_sweep_stale_persistence_markers` — see
-    that function's docstring for the fail-safe posture and for its
+    skeleton, with the multi-variant
+    :data:`_STAGE1_FLAG_MARKER_MEM0_ENUM_FILTER_VARIANTS` filter — NOT a
+    single ``{'source': ...}`` filter (task 3915: this pool cannot be
+    identified that way; measured live counts are know_live 0 records under
+    ``{'source': 'stage1_flag_marker'}`` vs 1 under
+    ``{'kind': 'stage1_flag_marker'}`` — a legacy record that predates the
+    task-2596 add_memory gate, server/tools.py:2978-2993, which now rejects
+    that write shape for any ``recon-stage-*`` agent_id) — plus a distinct
+    delete ``_source``
+    tag and max-age constant from :func:`_sweep_stale_persistence_markers` —
+    see that function's docstring for the fail-safe posture and for its
     protected-mirror invariant (task 3041): a ``kind='cycle_summary'`` /
     ``record_type='ledger_stamp'`` record is never deleted by this sweep,
-    whatever this pool's filter matches.
+    whatever this pool's filter(s) match.
 
     Passes ``count_short_circuit=True`` (task 2853 review, efficiency
-    finding): this pool's write path is fully retired, so once the legacy
+    finding): this pool's canonical write path is fully retired, and the
+    task-2596 add_memory gate (server/tools.py:2978-2993) now blocks the
+    ``recon-stage-*`` write path too (task 3915) — so once the legacy
     records age past the cutoff and are drained, every subsequent cycle
-    would otherwise re-scroll an already-empty pool forever. A cheap
-    ``count_memories_by_metadata`` probe short-circuits that steady state;
-    see :func:`_sweep_stale_mem0_pool`'s docstring for why this is safe to
-    fail open.
+    would otherwise re-scroll an already-empty pool forever. Cheap
+    ``count_memories_by_metadata`` probes short-circuit that steady state —
+    one probe per :data:`_STAGE1_FLAG_MARKER_MEM0_ENUM_FILTER_VARIANTS`
+    entry (task 3915), returning early ONLY when EVERY variant confirms an
+    exact-zero count, so a pool that is zero under ``{'source': ...}`` but
+    non-zero under ``{'kind': ...}`` (know_live's measured leak) still falls
+    through to the full multi-variant scroll; see
+    :func:`_sweep_stale_mem0_pool`'s docstring for the full all-variants-zero
+    rule and why this is safe to fail open.
 
     Args:
         memory_service: Service with ``get_memories_by_metadata``,
@@ -1516,6 +1723,7 @@ async def _sweep_stale_mem0_flag_markers(
         now=now,
         scroll_limit=scroll_limit,
         count_short_circuit=True,
+        enum_filters=_STAGE1_FLAG_MARKER_MEM0_ENUM_FILTER_VARIANTS,
     )
 
 
@@ -3193,15 +3401,24 @@ class TaskKnowledgeSync(BaseStage):
         )
 
         # Legacy Mem0 stage1_flag_marker pool (task 2853): task 2406 retired
-        # its mirror write (markers now persist only to the recon_ledger,
-        # reaped above by _gc_recon_markers), and task 2228 W5-κ deleted the
-        # prior in-cycle Mem0 sweep for this source on the assumption that
-        # the ledger gc() pass replaced it — it does not reach Mem0, so the
-        # pre-2406 pool was left uncollected for every project (the
-        # operational sweep_orphan_flag_markers.py systemd timer only
-        # targets dark_factory by default). Runs unconditionally every cycle,
-        # per-project, so each project self-heals its own legacy pool;
-        # explicit zero for the same reason as the two GC stats above.
+        # the CANONICAL mirror write (markers from that path now persist
+        # only to the recon_ledger, reaped above by _gc_recon_markers), and
+        # task 2228 W5-κ deleted the prior in-cycle Mem0 sweep for this
+        # source on the assumption that the ledger gc() pass replaced it —
+        # it does not reach Mem0, so the pre-2406 pool was left uncollected
+        # for every project (the operational sweep_orphan_flag_markers.py
+        # systemd timer only targets dark_factory by default). A second
+        # write path — an LLM recon agent's add_memory call — also landed a
+        # stage1_flag_marker record in Mem0 tagged only with metadata.kind,
+        # not metadata.source (measured: know_live 0 under
+        # {'source': 'stage1_flag_marker'} vs 1 under
+        # {'kind': 'stage1_flag_marker'}), before the task-2596 add_memory
+        # gate (server/tools.py:2978-2993) started rejecting that write for
+        # any 'recon-stage-*' agent_id — this sweep enumerates the union of
+        # both spellings to reap that legacy backlog regardless (task 3915).
+        # Runs unconditionally every cycle, per-project, so each project
+        # self-heals its own legacy pool; explicit zero for the same reason
+        # as the two GC stats above.
         report.stats['stale_mem0_flag_markers_gc_swept'] = await _sweep_stale_mem0_flag_markers(
             self.memory, self.project_id, run_id,
         )

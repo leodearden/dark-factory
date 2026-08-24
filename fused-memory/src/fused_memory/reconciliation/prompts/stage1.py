@@ -177,6 +177,12 @@ must carry the same count and both count only writes where `memory_ids` was non-
 
 {_STAGE1_GRAPHITI_QUEUED_GUIDANCE}
 
+Note that the stats verifier may report a LOWER final count than you did, because a write \
+you correctly counted can later be dead-lettered by the durable queue after this stage has \
+already finished — the verifier counts only writes that LANDED. That specific divergence is \
+expected and is not a self-reporting error on your part. Report what the responses actually \
+returned to you; do not try to anticipate or adjust for later write failures.
+
 ## Verifying update_edge writes (Task 1145 Guard 2)
 Every `mcp__fused-memory__update_edge` MCP response now includes a `verified: bool` field \
 driven by a server-side fact-text readback. After persisting the edge, the server calls \
@@ -199,7 +205,7 @@ count as successful edge updates. This prevents silent write failures from infla
 `edges_updated` stat and triggering false-positive judge passes.
 
 ## Verifying add_finding responses
-A `mcp__fused-memory__add_finding` (recon_report) call is a successful new filing ONLY \
+A `mcp__recon-report__add_finding` (recon_report) call is a successful new filing ONLY \
 when its response contains a `finding_id` key. You MUST capture that `finding_id` \
 **verbatim** from the actual tool response, and you may cite or echo it ONLY when you \
 hold a genuine successful `add_finding` response from this turn. **Never** state that a \
@@ -339,6 +345,29 @@ Temporal Limitation` below: (1) `update_edge(invalid_at=now)` on the stale edge,
 separate resulting-state-only `add_memory(category='temporal_facts')` call for the new fact. \
 Never combine the two into a single before/after narrative write.
 
+**Already done for you — blocked-status snapshot edges (task 3037).** A deterministic \
+Stage-1 sweep (`stale_status_snapshot_edge_sweep`) performs this exact two-step on EVERY \
+cycle for edges asserting that a task is blocked: it invalidates any such edge whose task \
+now has a different positively-known status (pending, in-progress, review, done, …), and \
+writes the superseding resulting-state-only fact itself, in the form \
+`"As of <YYYY-MM-DD>, task <N> has status <S>."` So do **not** go hunting for \
+blocked-status snapshot edges to retire by hand: for the shapes the sweep reaches, it will \
+have done both halves before you see them, and a redundant manual `update_edge` is \
+invisible to `report.stats['stale_status_snapshot_edges_invalidated']` — that gap is \
+precisely what produced a reported reading of 0 invalidated out of 6312 edges scanned on a \
+cycle where a blocked edge really had been retired by hand.
+
+**But the sweep has documented residuals it structurally cannot reach** (an aggregate whose \
+status marker is not adjacent to the list noun, an adverbial preamble, a wide open-class gap \
+between the task reference and the marker, an aggregate list that follows a task reference in \
+the same clause). For those the edge is genuinely stale and nothing else will retire it until \
+the task eventually reaches done/cancelled. So if you find a blocked-status snapshot edge you \
+can show the sweep missed: **fix it AND flag it** — perform the two-step yourself, and say so \
+in your cycle summary (which edge, which fact text, which task) so the selection rule can be \
+corrected at the source. Do not silently leave a stale assertion standing to protect the \
+stat's fidelity: the stat counts SWEEP work by design, and your hand-retirement being absent \
+from it is exactly what the cycle-summary note is for.
+
 ## update_edge Temporal Limitation (Task 1145 Guard 3 workaround)
 `mcp__fused-memory__update_edge` does NOT expose a `valid_at` parameter. When you update \
 a temporal or snapshot edge's fact text via `update_edge`, the edge's `valid_at` timestamp \
@@ -350,6 +379,14 @@ Task 1145 Guard 3 is shipped):
 1. Call `update_edge(edge_uuid=..., invalid_at=now)` — marks the old edge superseded.
 2. Call `add_memory(category='temporal_facts', content=<new fact>)` — Graphiti assigns \
    current time as `valid_at`, ensuring accurate temporal ordering in search results.
+
+**Scope carve-out**: this two-step remains YOUR job for NON-snapshot temporal edge updates \
+(status flips, decision retractions, and any other specific known edge you are updating). \
+The one case already automated is BLOCKED-status snapshot edges, which the deterministic \
+`stale_status_snapshot_edge_sweep` invalidates and supersedes on every cycle — see \
+"Already done for you" under `### Resulting-state-only temporal_facts` above. Do not \
+duplicate the sweep's work there; the one exception is an edge you can show it missed, \
+which you fix AND flag per that section.
 
 **Encoding effective dates in fact text**: when writing a temporal-fact snapshot via \
 `add_memory(category='temporal_facts')`, encode the effective ISO date directly in the \

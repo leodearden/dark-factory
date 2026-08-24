@@ -128,6 +128,29 @@ def test_mock_gate_defaults_include_release_probe_slot():
     )
 
 
+async def test_mock_gate_auth_failed_reason_mirrors_production():
+    """The SHIPPED mock-gate double must not drift from production on the
+    AuthFailed arm (task 4042).
+
+    ``make_gate_mock``'s ``_slot_report`` is a mirror of production
+    ``InvokeSlot.report``, and its own docstring requires it byte-for-byte in
+    step. Once production renders the reason via ``auth_failure_reason``, a
+    hand-built ``f'HTTP {status}'`` here would make every downstream consumer
+    of the double assert against a reason shape production no longer emits.
+    """
+    gate = _mock_gate()
+    async with gate.invoke_slot() as slot:
+        slot.report(AuthFailed(status=401, body='OAuth token has been revoked'))
+    assert gate._handle_auth_failure.call_args.args[0] == (
+        'HTTP 401: OAuth token has been revoked'
+    )
+
+    bodiless = _mock_gate()
+    async with bodiless.invoke_slot() as slot:
+        slot.report(AuthFailed(status=401))
+    assert bodiless._handle_auth_failure.call_args.args[0] == 'HTTP 401'
+
+
 # ---------------------------------------------------------------------------
 # Probe-release fidelity: production InvokeSlot vs. the MagicMock double
 # ---------------------------------------------------------------------------
@@ -2801,6 +2824,34 @@ class TestInvokeSlotReport:
         slot.report(AuthFailed(status=403))
 
         assert acct.phase == AccountPhase.AUTH_FAILED
+        assert slot._settled is True
+
+    def test_auth_failed_reason_carries_body_snippet(self):
+        """The response-body snippet must reach the gate, not just the status.
+
+        The bare 'HTTP 403' cannot distinguish OAuth revocation from expiry from
+        an org-policy block — the distinction b68eea415b dropped (task 4042).
+        """
+        gate = make_gate(['a'])
+        _acct, slot = _make_probe_in_flight_slot(gate)
+        gate._handle_auth_failure = MagicMock(return_value=True)
+
+        slot.report(AuthFailed(status=403, body='OAuth token has been revoked'))
+
+        assert gate._handle_auth_failure.call_args.args[0] == (
+            'HTTP 403: OAuth token has been revoked'
+        )
+        # The settle-in-finally invariant must not be disturbed.
+        assert slot._settled is True
+
+    def test_auth_failed_reason_is_bare_status_when_body_empty(self):
+        gate = make_gate(['a'])
+        _acct, slot = _make_probe_in_flight_slot(gate)
+        gate._handle_auth_failure = MagicMock(return_value=True)
+
+        slot.report(AuthFailed(status=401))
+
+        assert gate._handle_auth_failure.call_args.args[0] == 'HTTP 401'
         assert slot._settled is True
 
     def test_near_cap_annotates_releases_probe_and_settles(self):

@@ -38,8 +38,16 @@ from shared.invocation_outcome import (
     CapHit,
     InvocationOutcome,
     NearCap,
+    auth_failure_reason,
     classify_invocation,
 )
+
+# Aliased on import: this module defines its own _parse_resets_at below, and a
+# same-name import would shadow it — breaking the
+# orchestrator/src/orchestrator/usage_gate.py re-export and its tests. The two
+# differ deliberately: the strict copy returns None on parse failure, the local
+# fork fabricates `now + 1h` (see the note at its definition).
+from shared.invocation_outcome import _parse_resets_at as _parse_resets_at_strict
 from shared.proc_group import terminate_process_group
 
 if TYPE_CHECKING:
@@ -492,7 +500,13 @@ class InvokeSlot:
           it) and the account is left AVAILABLE.
         - AuthFailed -> ``_handle_auth_failure`` (-> AUTH_FAILED; a no-op if
           already CAPPED — CAPPED takes precedence, per that handler's own
-          guard). Scope-blind.
+          guard). Scope-blind. The reason string is rendered by the
+          single-sourced ``invocation_outcome.auth_failure_reason``: it carries
+          the 401/403 response-body snippet when the classifier captured one
+          (``HTTP 401: <snippet>``), and stays the bare ``HTTP {status}`` when
+          it did not. That reason is both logged at WARNING and persisted into
+          the ``auth_failed`` cost event, so the snippet is what distinguishes
+          OAuth revocation from expiry from an org-policy block after the fact.
         - NearCap -> ``_handle_near_cap_warning`` (annotation only, forwarding
           ``self.scope``), then ``release_probe_slot``.
         - Anything else (ZeroOutputWedge/CliLocalError/Failure) ->
@@ -546,7 +560,7 @@ class InvokeSlot:
                 # by before_invoke's predicate forever.
                 self._gate.release_probe_slot(token)
             elif isinstance(outcome, AuthFailed):
-                self._gate._handle_auth_failure(f'HTTP {outcome.status}', token)
+                self._gate._handle_auth_failure(auth_failure_reason(outcome), token)
             elif isinstance(outcome, NearCap):
                 self._gate._handle_near_cap_warning(outcome.reason, token, scope=self.scope)
                 self._gate.release_probe_slot(token)
@@ -1450,12 +1464,25 @@ class UsageGate:
 
         logger.warning(f'Account {acct.name} AUTH-FAILED: {reason}')
         if acct.phase not in (AccountPhase.AUTH_FAILED, AccountPhase.CAPPED):
-            # In production, HTTP 429 with "out of extra usage" carries a
-            # "resets ..." phrase in the body — parse and persist it so the
-            # dashboard can surface a reset ETA without re-parsing reason
-            # strings downstream. Skip the 1h fallback when there's no
-            # "resets" hint at all (true 401/403 token revocation).
-            resets_at = _parse_resets_at(reason) if 'resets' in reason.lower() else None
+            # Serves a 401/403 whose restored response-body snippet (task 4042)
+            # carries a genuine "resets ..." phrase — parse and persist it so
+            # the dashboard can surface a reset ETA without re-parsing reason
+            # strings downstream. Skip entirely when there's no "resets" hint at
+            # all (true 401/403 token revocation).
+            #
+            # Uses the STRICT parser deliberately: the module-local
+            # _parse_resets_at fork fabricates `now + 1h` on parse failure,
+            # which dashboard/data/costs.py::_extract_resets_at would then
+            # surface verbatim as a real recovery ETA on a revoked token. The
+            # strict copy returns None instead, so an unparseable hint is
+            # reported as explicitly UNKNOWN rather than invented (PRD 7.1.a —
+            # the invariant stated at invocation_outcome.py's _parse_resets_at).
+            # Both copies agree exactly on every parseable phrase.
+            #
+            # (The old comment here justified the branch by "HTTP 429 ... routed
+            # through _handle_auth_failure", which was stale: classify_invocation
+            # narrows AuthFailed to {401, 403} and routes 429 to CapHit.)
+            resets_at = _parse_resets_at_strict(reason) if 'resets' in reason.lower() else None
             # _transition owns: the phase write, near_cap clear, the
             # centralized _open recompute, cancelling/starting the
             # opposite/matching background task, the auth_failed cost event,
@@ -2270,6 +2297,26 @@ def _parse_resets_at(text: str) -> datetime:
     - "resets Mar 30, 6pm (Europe/London)" (date + time + tz)
     - "resets 9pm (Europe/London)" / "resets 3:00 AM (US/Pacific)"
     - Falls back to 1 hour from now
+
+    NO PRODUCTION CALLERS as of task 4042. This is the fabricating fork of
+    ``shared.invocation_outcome._parse_resets_at``: it invents ``now + 1h`` on
+    parse failure, where the strict copy returns ``None`` (PRD 7.1.a — an
+    unknown reset time must be reported as explicitly unknown, never
+    fabricated). Both live paths now use the strict copy: ``classify_invocation``
+    for its CapHit tier, and ``_handle_auth_failure`` via
+    ``_parse_resets_at_strict``. What survives here is the re-export consumed by
+    ``orchestrator/src/orchestrator/usage_gate.py`` and the ~20 tests across
+    ``shared`` and ``orchestrator`` that pin the ``now + 1h`` fallback contract —
+    which is why task 4042 did not simply delete it. Retiring or repairing this
+    fork is a separate cleanup, not a rider on a regression fix; do not add new
+    callers.
+
+    "Do not add new callers" is ENFORCED, not just asked for:
+    ``shared/tests/test_auth_failed.py::TestFabricatingForkHasNoProductionCallers``
+    AST-scans ``shared/src`` + ``orchestrator/src`` and fails on any call to the
+    bare ``_parse_resets_at`` name outside the module defining the strict copy.
+    If you are retiring this fork, delete that guard class along with this
+    definition.
     """
     # Relative: "resets in Xh", "resets in Xm", "resets in Xd"
     m = re.search(r'resets\s+in\s+(\d+)\s*([hmd])', text, re.IGNORECASE)

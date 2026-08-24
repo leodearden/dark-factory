@@ -23,8 +23,11 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import sys
 import types
+from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -64,6 +67,7 @@ validate_migration_keys = _mod.validate_migration_keys
 UnsafeMigrationKeyError = _mod.UnsafeMigrationKeyError
 write_backup = _mod.write_backup
 default_backup_path = _mod.default_backup_path
+recovery_pointer = _mod.recovery_pointer
 _verify_read_back = _mod._verify_read_back
 
 
@@ -608,3 +612,583 @@ def test_cli_defaults_to_dry_run_and_requires_apply_to_write():
 
     applied_args = build_parser().parse_args(['--task-id', '3083', '--apply'])
     assert applied_args.apply is True
+
+
+# --- case 12: the per-run pre-write snapshot --------------------------------
+#
+# docs/task-authoring.md §8 points the future corpus-wide sweep at "a mechanical
+# per-task re-run" of this script with different `--keys`. With a FIXED default
+# backup path, run 1 writes the TRUE pre-migration row and run 2 writes the
+# already-partially-migrated row straight over it — silently destroying the one
+# durable copy of the original, which is the exact artifact `write_backup`'s
+# docstring says the whole SAFETY section exists to produce. These tests pin
+# that every run gets its own file, and that an occupied path is refused rather
+# than clobbered.
+
+
+def _deep_copy(value):
+    """Round-trip through JSON — the same isolation idiom `_run_verify` uses."""
+    return json.loads(json.dumps(value, default=str))
+
+
+_PENDING_TASK_ROW = {
+    **_BEFORE_TASK,
+    # A metadata-only write must not move `status`, and `_verify_read_back`'s
+    # check (e) asserts exactly that — so the fake serves a non-terminal status
+    # and the end-to-end runs below prove it is carried through untouched.
+    'status': 'pending',
+}
+
+
+class _FakeClient:
+    """A scripted stand-in for the sibling JSON-RPC client.
+
+    Serves `get_task` from ONE stored row and applies `update_task` by
+    REPLACING that row's metadata with `json.loads(args['metadata'])` — the
+    contract `build_update_payload` writes against (`metadata_mode='replace'`,
+    blob serialized with `json.dumps`). Because the row lives on the instance,
+    a second `main_async` run against the same fake observes the
+    already-partially-migrated row, which is what makes the per-task re-run
+    that docs/task-authoring.md §8 prescribes reproducible with no server.
+
+    Every call is recorded on `self.calls`, so a test can assert a write was
+    never even attempted. `get_task_script` overrides successive `get_task`
+    replies (`None` = serve the live row; a callable is handed a copy of the
+    live row and returns the payload) for the read-back-failure cases, and
+    `update_task_error` / `update_task_result` override the write itself for
+    the two post-write exits that never reach the read-back.
+    """
+
+    def __init__(self, url: str = 'http://fake.invalid', *, row: dict | None = None):
+        self.url = url
+        self.row: dict = _deep_copy(row if row is not None else _PENDING_TASK_ROW)
+        self.calls: list[tuple[str, dict]] = []
+        # Per-call `get_task` replies: a payload to return verbatim, a callable
+        # handed a copy of the live row, or None to serve the live row.
+        self.get_task_script: list[dict | Callable[[dict], dict] | None] = []
+        self._get_task_calls = 0
+        # Raised AFTER the row is mutated: a lost reply on an already-committed
+        # write, which is the state the recovery pointer exists for.
+        self.update_task_error: Exception | None = None
+        # Returned verbatim INSTEAD of writing: a server rejection, where
+        # nothing committed.
+        self.update_task_result: dict | None = None
+
+    @property
+    def tools_called(self) -> list[str]:
+        return [name for name, _ in self.calls]
+
+    async def __aenter__(self) -> _FakeClient:
+        return self
+
+    async def __aexit__(self, *exc) -> None:
+        return None
+
+    async def call_tool(self, name: str, arguments: dict) -> dict:
+        self.calls.append((name, _deep_copy(arguments)))
+        if name == 'get_task':
+            index = self._get_task_calls
+            self._get_task_calls += 1
+            override = (
+                self.get_task_script[index] if index < len(self.get_task_script) else None
+            )
+            if override is not None:
+                return override(_deep_copy(self.row)) if callable(override) else override
+            return _deep_copy(self.row)
+        if name == 'update_task':
+            if self.update_task_result is not None:
+                return self.update_task_result
+            self.row['metadata'] = json.loads(arguments['metadata'])
+            if self.update_task_error is not None:
+                raise self.update_task_error
+            return {
+                'id': self.row['id'],
+                'message': f'Successfully updated task {self.row["id"]}',
+                'updated': ['metadata'],
+                'updated_task': _deep_copy(self.row),
+            }
+        raise AssertionError(f'unexpected tool call: {name!r}')
+
+
+def _fake_client_cls(client: _FakeClient) -> type:
+    """Wrap one fake in the CLASS shape `main_async` expects.
+
+    `main_async` resolves `client_cls = _load_sibling_client()` and then does
+    `async with client_cls(url) as client`, so the monkeypatch seam has to
+    yield a class, not an instance. Binding that class to a single shared
+    `_FakeClient` is what lets two consecutive `main_async` runs see ONE
+    evolving task row.
+    """
+
+    class _BoundFakeClient:
+        def __init__(self, url: str):
+            client.url = url
+
+        async def __aenter__(self) -> _FakeClient:
+            return await client.__aenter__()
+
+        async def __aexit__(self, *exc) -> None:
+            return await client.__aexit__(*exc)
+
+    return _BoundFakeClient
+
+
+def _install_fake_client(monkeypatch, client: _FakeClient) -> _FakeClient:
+    monkeypatch.setattr(_mod, '_load_sibling_client', lambda: _fake_client_cls(client))
+    return client
+
+
+def test_default_backup_path_is_stamped_per_run():
+    """Two runs against the SAME task must not land on the same artifact.
+
+    The task-scoped default of case 11 protects task 3083 from task 3141; it
+    does nothing about 3083's own second run, which is precisely the workflow
+    docs/task-authoring.md §8 prescribes.
+    """
+    # Read through `_mod`, never a module-level copy: the end-to-end tests
+    # below monkeypatch `_mod.DEFAULT_BACKUP_DIR`, and a rebound copy would
+    # silently keep pointing at the real /tmp.
+    at_0930 = default_backup_path('3083', now=datetime(2026, 8, 15, 9, 30, 0, tzinfo=UTC))
+    assert at_0930 == _mod.DEFAULT_BACKUP_DIR / 'task-3083-metadata-before-20260815T093000Z.json'
+
+    at_0935 = default_backup_path('3083', now=datetime(2026, 8, 15, 9, 35, 0, tzinfo=UTC))
+    assert at_0935 != at_0930
+    assert '3083' in at_0935.name
+    assert at_0935.suffix == '.json'
+
+
+@pytest.mark.asyncio
+async def test_documented_per_task_rerun_keeps_the_true_pre_migration_backup(
+    monkeypatch, tmp_path,
+):
+    """The end-to-end loss this task exists to close.
+
+    Two `--apply` runs against one task with different `--keys` — verbatim the
+    "mechanical per-task re-run" of docs/task-authoring.md §8 — and neither
+    passes `--backup-path`, so both resolve the default. Run 2 observes the
+    partially-migrated row (the fake persists the write), so if both runs
+    shared one path the only surviving snapshot would be the one that ALREADY
+    has `x_origin_escalation` in it — useless for recovering the original.
+
+    `DEFAULT_BACKUP_DIR` is monkeypatched to `tmp_path` so the assertion is
+    still about the DEFAULT path while the suite (which runs `-n auto`) writes
+    nothing into a shared /tmp; `_utcnow` is pinned to two instants so "two
+    runs, minutes apart" needs no sleep and the assertion stays exact.
+    """
+    _install_fake_client(monkeypatch, _FakeClient())
+    monkeypatch.setattr(_mod, 'DEFAULT_BACKUP_DIR', tmp_path)
+    stamps = iter([
+        datetime(2026, 8, 15, 9, 30, 0, tzinfo=UTC),
+        datetime(2026, 8, 15, 9, 35, 0, tzinfo=UTC),
+    ])
+    monkeypatch.setattr(_mod, '_utcnow', lambda: next(stamps))
+
+    first = build_parser().parse_args(
+        ['--task-id', '3083', '--keys', 'origin_escalation', '--apply'],
+    )
+    assert await _mod.main_async(first) == 0
+    second = build_parser().parse_args(
+        ['--task-id', '3083', '--keys', 'origin_reify_task', '--apply'],
+    )
+    assert await _mod.main_async(second) == 0
+
+    written = sorted(tmp_path.glob('*.json'))
+    assert len(written) == 2, f'each run must get its own snapshot; got {written}'
+
+    run_1 = json.loads(written[0].read_text())['metadata']
+    assert 'origin_escalation' in run_1, 'run 1 captured the TRUE pre-migration row'
+    assert 'x_origin_escalation' not in run_1
+    assert 'origin_reify_task' in run_1
+
+    run_2 = json.loads(written[1].read_text())['metadata']
+    assert 'x_origin_escalation' in run_2, 'run 2 captured the partially-migrated row'
+    assert 'origin_reify_task' in run_2
+
+
+def test_write_backup_refuses_to_overwrite_an_existing_snapshot(tmp_path):
+    """The stamped default does not cover an explicit `--backup-path`.
+
+    Reusing one path across runs is the obvious habit once you have used the
+    flag at all, and a same-second re-run collides on the stamp too. Both land
+    on an occupied path, where the earlier file may be the TRUE pre-migration
+    row — so the write is refused rather than silently replaced.
+
+    `isinstance(exc, OSError)` is load-bearing, not ceremony: `main_async`
+    already wraps `write_backup` in `except OSError` and turns any failure
+    into "Refusing to write without a recoverable snapshot" BEFORE
+    `update_task` is reached. A refusal outside that hierarchy would escape as
+    a traceback while the write went ahead — reintroducing exactly the class
+    of failure this guard exists to close.
+    """
+    path = tmp_path / 'nested' / 'before.json'
+    true_pre_migration_row = _deep_copy(_PENDING_TASK_ROW)
+    already_migrated_row = _deep_copy(_PENDING_TASK_ROW)
+    already_migrated_row['metadata'] = {
+        'x_origin_escalation': already_migrated_row['metadata']['origin_escalation'],
+    }
+
+    write_backup(path, true_pre_migration_row)
+
+    with pytest.raises(FileExistsError) as caught:
+        write_backup(path, already_migrated_row)
+
+    assert isinstance(caught.value, OSError), 'main_async catches OSError, so this must be one'
+    assert str(path) in str(caught.value)
+
+    survivor = json.loads(path.read_text())
+    assert survivor == true_pre_migration_row, 'the earlier snapshot must survive intact'
+    assert 'origin_escalation' in survivor['metadata']
+
+
+@pytest.mark.asyncio
+async def test_main_async_refuses_the_write_when_the_backup_path_is_already_taken(
+    monkeypatch, tmp_path, capsys,
+):
+    """An occupied backup path must stop the run BEFORE update_task.
+
+    The whole point of the snapshot is that the write is never attempted
+    without a recoverable copy of the row. Refusing to overwrite is only safe
+    if it is also fatal — a refusal that let the write proceed would leave the
+    operator with a committed change and someone else's backup.
+    """
+    client = _install_fake_client(monkeypatch, _FakeClient())
+    occupied = tmp_path / 'before.json'
+    sentinel = '{"an earlier run": "wrote this"}'
+    occupied.write_text(sentinel)
+
+    args = build_parser().parse_args([
+        '--task-id', '3083', '--keys', 'origin_escalation',
+        '--apply', '--backup-path', str(occupied),
+    ])
+
+    assert await _mod.main_async(args) == 1
+    assert 'update_task' not in client.tools_called, 'no write without a fresh snapshot'
+
+    err = capsys.readouterr().err
+    assert str(occupied) in err
+    assert 'Refusing to write without a recoverable snapshot' in err
+    assert occupied.read_text() == sentinel, 'the occupying file is left byte-identical'
+
+
+def test_default_backup_path_shape_advertises_the_stamp_without_resolving_it():
+    """The shape is the resolved path with the instant left as a placeholder.
+
+    A dry run cannot honestly print a resolved path — the `--apply` that
+    actually writes it runs in a different second — so it prints this instead.
+    Rendering both from one template is what keeps the advertised shape and
+    the real filename from drifting apart.
+    """
+    shape = _mod.default_backup_path_shape('3083')
+
+    assert '<UTC-stamp>' in shape
+    assert '3083' in shape
+    assert shape.endswith('.json')
+
+    resolved = default_backup_path('3083', now=datetime(2026, 8, 15, 9, 30, 0, tzinfo=UTC))
+    assert shape.replace('<UTC-stamp>', '20260815T093000Z') == str(resolved)
+
+
+@pytest.mark.asyncio
+async def test_dry_run_advertises_the_shape_it_cannot_yet_resolve(
+    monkeypatch, tmp_path, capsys,
+):
+    """A rehearsal must not name a file the later --apply will never write.
+
+    Rehearse-then-apply is the workflow this script is built around, and under
+    a fixed default path the printed `Backup:` line was authoritative. With a
+    per-run stamp it no longer can be, so the dry run stops pretending: it
+    prints the shape and says when the name is chosen.
+
+    `_utcnow` is monkeypatched to RAISE, which is the actual assertion — a dry
+    run that resolved an instant at all would blow up here rather than quietly
+    printing a stale one.
+    """
+    _install_fake_client(monkeypatch, _FakeClient())
+    monkeypatch.setattr(_mod, 'DEFAULT_BACKUP_DIR', tmp_path)
+
+    def _no_clock_in_a_dry_run():
+        raise AssertionError('a dry run must not resolve a backup instant')
+
+    monkeypatch.setattr(_mod, '_utcnow', _no_clock_in_a_dry_run)
+
+    args = build_parser().parse_args(['--task-id', '3083', '--keys', 'origin_escalation'])
+    assert await _mod.main_async(args) == 0
+
+    out = capsys.readouterr().out
+    assert '<UTC-stamp>' in out
+    assert 'resolved at write time' in out
+    assert not re.search(r'\d{8}T\d{6}Z', out), 'no resolved instant in a rehearsal'
+    assert list(tmp_path.iterdir()) == [], 'a dry run writes nothing'
+
+
+@pytest.mark.asyncio
+async def test_an_explicit_backup_path_is_printed_verbatim_in_a_dry_run(
+    monkeypatch, tmp_path, capsys,
+):
+    """An operator-chosen path IS authoritative, so it is printed as given.
+
+    The shape exists because a machine-chosen name is not knowable until write
+    time. `--backup-path` is knowable — it was typed — and rehearsing it has to
+    show exactly the file the apply will create.
+    """
+    _install_fake_client(monkeypatch, _FakeClient())
+    chosen = tmp_path / 'chosen.json'
+
+    args = build_parser().parse_args(
+        ['--task-id', '3083', '--keys', 'origin_escalation', '--backup-path', str(chosen)],
+    )
+    assert await _mod.main_async(args) == 0
+
+    out = capsys.readouterr().out
+    assert str(chosen) in out
+    assert '<UTC-stamp>' not in out
+
+
+@pytest.mark.asyncio
+async def test_a_same_second_default_collision_steps_aside_instead_of_aborting(
+    monkeypatch, tmp_path, capsys,
+):
+    """A machine-chosen name that collides gets disambiguated, not refused.
+
+    "Move it aside, or pass a different --backup-path" is sound advice about a
+    path the operator chose and nonsense about one they never saw. Two runs
+    inside one second is the only way the stamped default collides, and the
+    script can simply pick the next free name — the create stays exclusive, so
+    the safety property (never replace an existing snapshot) is untouched.
+    """
+    _install_fake_client(monkeypatch, _FakeClient())
+    monkeypatch.setattr(_mod, 'DEFAULT_BACKUP_DIR', tmp_path)
+    monkeypatch.setattr(
+        _mod, '_utcnow', lambda: datetime(2026, 8, 15, 9, 30, 0, tzinfo=UTC),
+    )
+
+    first = build_parser().parse_args(
+        ['--task-id', '3083', '--keys', 'origin_escalation', '--apply'],
+    )
+    assert await _mod.main_async(first) == 0
+    second = build_parser().parse_args(
+        ['--task-id', '3083', '--keys', 'origin_reify_task', '--apply'],
+    )
+    assert await _mod.main_async(second) == 0, 'a machine-chosen collision must not abort'
+
+    stamped = tmp_path / 'task-3083-metadata-before-20260815T093000Z.json'
+    stepped_aside = tmp_path / 'task-3083-metadata-before-20260815T093000Z-2.json'
+    assert sorted(p.name for p in tmp_path.iterdir()) == sorted(
+        [stamped.name, stepped_aside.name]
+    )
+    assert str(stepped_aside) in capsys.readouterr().out, 'the run names what it actually wrote'
+
+    run_1 = json.loads(stamped.read_text())['metadata']
+    assert 'origin_escalation' in run_1, 'run 1 still holds the TRUE pre-migration row'
+    assert 'x_origin_escalation' not in run_1
+    run_2 = json.loads(stepped_aside.read_text())['metadata']
+    assert 'x_origin_escalation' in run_2
+
+
+def test_stepping_aside_gives_up_after_a_bounded_number_of_tries(tmp_path):
+    """Bounded, so a wedged directory fails loudly instead of spinning.
+
+    Giving up is the same refusal as an occupied explicit path — a
+    `FileExistsError`, hence an `OSError`, hence `main_async`'s existing
+    "Refusing to write without a recoverable snapshot" before any write.
+    """
+    base = tmp_path / 'before.json'
+    base.write_text('{}')
+    (tmp_path / 'before-2.json').write_text('{}')
+
+    with pytest.raises(FileExistsError) as caught:
+        _mod.write_backup_at_a_free_path(base, _deep_copy(_PENDING_TASK_ROW), attempts=2)
+
+    assert isinstance(caught.value, OSError), 'main_async catches OSError, so this must be one'
+    assert str(base) in str(caught.value)
+
+
+# --- case 13: every post-write exit points at the backup --------------------
+#
+# Once `update_task` has committed, this process's memory is no longer the only
+# copy of the original row — the snapshot on disk is — but the operator only
+# learns WHERE that snapshot is if the read-back ran and reported drift. If the
+# read-back itself raises (`_fetch_task` on an unexpected payload,
+# `_coerce_metadata` on a non-dict blob), the exception unwinds out of
+# `main_async` as a bare stack trace at precisely the moment the recovery
+# instruction matters most: the write has landed and is UNVERIFIED.
+
+
+def _apply_args(backup_path, keys: str = 'origin_escalation'):
+    """`--apply` against task 3083 with an explicit, per-test backup path."""
+    return build_parser().parse_args([
+        '--task-id', '3083', '--keys', keys, '--apply', '--backup-path', str(backup_path),
+    ])
+
+
+class _SimulatedTransportFailure(Exception):
+    """Stands in for an `httpx.ReadTimeout` on the write POST.
+
+    Spelled locally rather than raising the real httpx type: this module is
+    deliberately importable with no network stack, and the guard under test
+    catches `Exception`, so the concrete class is not what is being pinned.
+    """
+
+
+def _drop_a_sibling_key(row: dict) -> dict:
+    """A read-back row that lost an untouched sibling — `_verify_read_back`'s
+    existing `(c) key-set drift` problem, i.e. the post-write exit that ALREADY
+    prints the pointer."""
+    return {**row, 'metadata': {k: v for k, v in row['metadata'].items() if k != 'source'}}
+
+
+@pytest.mark.asyncio
+async def test_read_back_fetch_failure_still_prints_the_recovery_pointer(
+    monkeypatch, tmp_path, capsys,
+):
+    """The write committed; the verification fetch then failed.
+
+    An unverified committed write is exactly the situation the snapshot exists
+    for, so this exit must name it — not hand back a traceback and a non-zero
+    exit for the operator to interpret.
+    """
+    client = _install_fake_client(monkeypatch, _FakeClient())
+    client.get_task_script = [None, {'unexpected': 'shape'}]
+    backup = tmp_path / 'fetch-failure.json'
+
+    assert await _mod.main_async(_apply_args(backup)) == 1
+
+    err = capsys.readouterr().err
+    assert str(backup) in err
+    assert 'recover from there' in err
+    assert backup.exists(), 'the pointer must not name a file that was never written'
+
+
+@pytest.mark.asyncio
+async def test_read_back_verification_exception_still_prints_the_recovery_pointer(
+    monkeypatch, tmp_path, capsys,
+):
+    """The fetch succeeded and the VERIFICATION raised.
+
+    Proves the guard wraps the whole post-write read-back block rather than
+    just the fetch: `_coerce_metadata`, inside `_verify_read_back`, raises on a
+    stored blob that is not a dict, which is a real shape a damaged row can
+    have.
+    """
+    _install_fake_client(monkeypatch, _FakeClient())
+
+    def _boom(**kwargs):
+        raise RuntimeError('boom')
+
+    monkeypatch.setattr(_mod, '_verify_read_back', _boom)
+    backup = tmp_path / 'verify-exception.json'
+
+    assert await _mod.main_async(_apply_args(backup)) == 1
+
+    err = capsys.readouterr().err
+    assert str(backup) in err
+    assert 'recover from there' in err
+    assert backup.exists()
+
+
+@pytest.mark.asyncio
+async def test_recovery_pointer_is_identical_on_the_drift_exit_and_the_exception_exit(
+    monkeypatch, tmp_path, capsys,
+):
+    """One sentence, two exits, no drift.
+
+    The defect is precisely that one post-write exit knows about the snapshot
+    and the other does not. Two hand-written copies of the instruction would
+    restore that asymmetry the moment either is edited, so this pins the
+    rendered sentence VERBATIM on both exits rather than substring-matching a
+    fragment in each.
+    """
+    drift_client = _install_fake_client(monkeypatch, _FakeClient())
+    drift_client.get_task_script = [None, _drop_a_sibling_key]
+    drift_backup = tmp_path / 'drift.json'
+    assert await _mod.main_async(_apply_args(drift_backup)) == 1
+    drift_err = capsys.readouterr().err
+    assert 'key-set drift' in drift_err, 'this must be the EXISTING reported-drift exit'
+
+    crash_client = _install_fake_client(monkeypatch, _FakeClient())
+    crash_client.get_task_script = [None, {'unexpected': 'shape'}]
+    crash_backup = tmp_path / 'crash.json'
+    assert await _mod.main_async(_apply_args(crash_backup)) == 1
+    crash_err = capsys.readouterr().err
+
+    assert recovery_pointer(drift_backup) in drift_err
+    assert recovery_pointer(crash_backup) in crash_err
+
+
+@pytest.mark.asyncio
+async def test_read_back_exception_still_surfaces_the_underlying_cause(
+    monkeypatch, tmp_path, capsys,
+):
+    """Swallowing the exception must not cost the operator the diagnosis.
+
+    The complaint is that a stack trace arrives INSTEAD of the recovery
+    instruction; the fix is both, not a trade.
+    """
+    client = _install_fake_client(monkeypatch, _FakeClient())
+    client.get_task_script = [None, {'unexpected': 'shape'}]
+    backup = tmp_path / 'cause.json'
+
+    assert await _mod.main_async(_apply_args(backup)) == 1
+
+    err = capsys.readouterr().err
+    assert 'get_task returned an unexpected payload' in err
+    assert recovery_pointer(backup) in err
+
+
+@pytest.mark.asyncio
+async def test_write_call_that_never_returns_still_prints_the_recovery_pointer(
+    monkeypatch, tmp_path, capsys,
+):
+    """The write POST raised; the server may have committed anyway.
+
+    This is the likeliest real instance of "committed but UNVERIFIED": the
+    sibling client is an `httpx.AsyncClient(timeout=30.0)` and the payload is a
+    whole-blob replace of a ~20 KB row, so a read timeout on a write the server
+    did apply is far more plausible than the malformed read-back payloads the
+    tests above drive. The fake mutates the row BEFORE raising, exactly as a
+    server that committed and then lost the reply.
+    """
+    client = _install_fake_client(monkeypatch, _FakeClient())
+    client.update_task_error = _SimulatedTransportFailure(
+        'ReadTimeout: the server sent no reply within 30.0s',
+    )
+    backup = tmp_path / 'transport-failure.json'
+
+    assert await _mod.main_async(_apply_args(backup)) == 1
+
+    err = capsys.readouterr().err
+    assert recovery_pointer(backup) in err
+    assert 'UNVERIFIED' in err
+    assert 'ReadTimeout' in err, 'the underlying cause must survive the guard too'
+    assert backup.exists(), 'the pointer must not name a file that was never written'
+    assert 'x_origin_escalation' in client.row['metadata'], (
+        'the fake must model the dangerous case: the write DID land'
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_rejected_write_does_not_print_the_recovery_pointer(
+    monkeypatch, tmp_path, capsys,
+):
+    """A REJECTION is not a committed write, so it must NOT name the snapshot.
+
+    `assert_write_accepted` fires when the server answers with a
+    `success=False` envelope: it replied, it refused, and the stored row is
+    exactly the one just read. There is nothing to recover, and pointing at the
+    snapshot anyway would teach an operator to discount the sentence on the
+    exits where it is load-bearing.
+    """
+    client = _install_fake_client(monkeypatch, _FakeClient())
+    client.update_task_result = {
+        'success': False,
+        'error': 'metadata replace refused',
+        'error_type': 'ValidationError',
+    }
+    backup = tmp_path / 'rejected.json'
+
+    assert await _mod.main_async(_apply_args(backup)) == 1
+
+    err = capsys.readouterr().err
+    assert 'was REJECTED by the server' in err
+    assert 'recover from there' not in err, 'nothing committed, so nothing to recover'
+    assert client.row['metadata'] == _PENDING_TASK_ROW['metadata'], 'the row is untouched'

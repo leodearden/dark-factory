@@ -47,34 +47,44 @@ python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py lea
 # Claim watcher-<project> (e.g. watcher-df) — STAND_DOWN policy: a live duplicate wins the lease
 # and this session must exit rather than run a second watch loop against the same project.
 python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py lease-claim \
-  --name watcher-<project> --slug "watcher-<project>-${CLAUDE_PID:-$PPID}" --policy stand-down
+  --name watcher-<project> --policy stand-down
 ```
 
-**Never `$$` — it is both the wrong pid and an unusable slug.** Inside a Claude Code Bash tool call
-`$$` is the transient `/bin/bash -c` wrapper, dead the instant the call returns; the long-lived
-`claude` process is `$CLAUDE_PID` (fall back to `$PPID`). Verify with:
+**Do not assemble the slug (or the pid) in shell — the CLI owns both.** `--slug` is **optional** and
+defaults to `<--name>-$CLAUDE_PID`; `--pid` is optional and resolves from `$CLAUDE_PID` the same way.
+Pass either **only** as a deliberate operator override. Both are derived rather than documented for
+one reason (tasks 3994, 4248): the token is load-bearing on *every* heartbeat and on the final
+release, and it must not depend on this document getting one shell token right — which is exactly
+how it went wrong before. Note it must be **re-derivable**, not carried: each Bash tool call is a
+fresh `/bin/bash -c`, so a `SLUG=$(...)` you capture here is gone by the next call. That is why the
+CLI re-derives it on every verb instead of you passing it along.
+
+**Never `$$`, and never `$PPID`.** Inside a Claude Code Bash tool call `$$` is the transient
+`/bin/bash -c` wrapper, dead the instant the call returns. `$PPID` is **not** stable across tool
+calls either (measured: 1430433, then 1471645 on the next call, the first already dead) — a slug
+built on it would not match the one your own later heartbeat presents. The long-lived `claude`
+process is `$CLAUDE_PID`. Verify with:
 
 ```bash
-ps -o comm= -p "${CLAUDE_PID:-$PPID}"   # prints: claude
+ps -o comm= -p "$CLAUDE_PID"   # prints: claude
 ```
 
-This bit twice over (task 3994). A `$$` **pid** made the lease's liveness guard inert — every holder
-read as dead, so the lease silently degraded to a bare heartbeat TTL. A `$$` **slug** is worse now
-that ownership is enforced: every Bash tool call gets a fresh `$$`, so the slug you claimed with
-would never match the one your own later `lease-heartbeat`/`lease-release` present, and every one of
-them would be refused. `${CLAUDE_PID:-$PPID}` is stable across tool calls — that is exactly why it
-works as the slug.
-
-`--pid` is now **optional**: omitted, the CLI resolves it from `$CLAUDE_PID` itself, so the correct
-pid no longer depends on this document getting one shell token right. Pass `--pid <n>` only as a
-deliberate operator override. If `$CLAUDE_PID` is unset the CLI records **pid 0** — a sentinel that
-reads as never-alive, so the lease degrades to heartbeat-only staleness (loudly logged) rather than
-recording some other durable-but-unrelated pid that would make the lease unreapable forever. On that
-path the body's pid won't match the `$PPID` in your slug; pass `--pid "$PPID"` explicitly if you want
-the two to agree.
+If `$CLAUDE_PID` is unresolvable **and** `--slug` is omitted, the lease verbs **exit 2** with a
+message naming both, rather than silently drifting to a slug your own later heartbeat would fail to
+match. The CLI deliberately will not invent one: a synthesized token would be identical for every
+degraded session, so each could act on the others' leases. Supply `--slug <stable-token>` to proceed
+(re-use the same token on every later lease verb). `--pid` does **not** substitute: it sets the lease
+body's liveness pid, not your identity, and `lease-heartbeat`/`lease-release` have no `--pid` at all
+— only `--slug` is honoured by all three verbs. On that path the CLI records **pid 0** — a
+sentinel that reads as never-alive, so the lease degrades to heartbeat-only staleness (loudly
+logged) rather than recording some durable-but-unrelated pid that would make it unreapable forever.
 
 Parse the printed lines: `decision=<acquired|stand-down|proceed>`, a human-readable message, then
-`holder_liveness=<none|held|orphaned>`.
+`holder_liveness=<none|held|orphaned>`, then `slug=<the slug this claim used>`.
+- **`slug=`** reports the identity the CLI derived for *you* (never the holder's). Quote it to the
+  user when useful, and compare it against `lease-show`'s `holder_slug` if a later heartbeat comes
+  back `result=refused`. It is a **diagnostic only** — do not carry it into the next call; the CLI
+  re-derives it.
 - **`decision=acquired` or `decision=proceed`**: continue into the Main Loop below. `proceed` is the
   fail-open outcome (see below) and is handled identically to `acquired`. An acquired claim prints
   `holder_liveness=none` — there is no contending holder, the lease is yours; a faulted (`proceed`)
@@ -96,8 +106,13 @@ Parse the printed lines: `decision=<acquired|stand-down|proceed>`, a human-reada
   python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py write-decision \
     --id watcher-lease-orphan-<project> --project <project> \
     --text "watcher-<project> lease held by orphaned holder <holder_slug> (pid <holder_pid> not running, heartbeat <n>s ago); no live L2 consumer until it is reclaimed" \
-    --session-id "watcher-<project>-${CLAUDE_PID:-$PPID}"
+    --escalations-dir <project_root>/data/escalations \
+    --session-id "watcher-<project>-${CLAUDE_PID:-unknown}"
   ```
+
+  `--session-id` is a best-effort **provenance label** with no ownership semantics — unlike the lease
+  slug, which the CLI owns (above). It is deliberately not fail-loud: a watcher that cannot file a
+  DecisionRecord is strictly worse than one that files it with a degraded label.
 
   Do **not** force-release it on this evidence alone — `holder_liveness` is a single-signal
   diagnostic, and a dead-*looking* holder that is merely quiet is the duplicate-spawn incident. This
@@ -139,13 +154,14 @@ logged loudly by `session_registry` and reported back as `decision=proceed` — 
 
 **Heartbeat + release.** Once claimed, touch the lease every Main Loop cycle (see "Starting the
 watcher" below) so it never appears stale to another session's claim attempt, and release it when
-the watch session ends (clean exit, or the human stops it). Both verbs **require** the slug you
-claimed with — a mismatch is refused, so no other session can evict your lease, and no stranger can
-keep a dead holder's lease alive forever:
+the watch session ends (clean exit, or the human stops it). Both verbs act **only for the holder** —
+a mismatched slug is refused, so no other session can evict your lease, and no stranger can keep a
+dead holder's lease alive forever. You do not pass the slug: the CLI derives the same one it derived
+at claim time (see "Claiming the Watcher Lease" above), which is what makes the two match:
 
 ```bash
 python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py lease-release \
-  --name watcher-<project> --slug "watcher-<project>-${CLAUDE_PID:-$PPID}"
+  --name watcher-<project>
 ```
 
 Both print `result=<applied|forced|absent|refused|faulted>` as their first line:
@@ -200,12 +216,23 @@ Check for all pending L2 escalations — **compact** to keep context small:
 mcp__escalation__get_pending_escalations(level=2, compact=True)
 ```
 
-`compact=True` returns the triage fields (`id`, `task_id`, `category`, `severity`, `level`,
-`status`, `summary`, `suggested_action`, `timestamp`) plus the triage-ack annotation fields
-(`triaged_at`, `triaged_by`, `triage_note`, `updated_at` — see "Reading a triage-ack annotation"
-below), and drops the heavy free-text/cluster fields (`detail`, `members`, `options`, `root_cause`,
-`train_state`, …). Triage from that; fetch the full record with `get_escalation(id)` **only** for
-the one item you're about to act on — and prefer doing that full read inside the handling sub-agent
+`compact=True` returns the triage fields plus the triage-ack annotation fields (`triaged_at`,
+`triaged_by`, `triage_note`, `updated_at` — see "Reading a triage-ack annotation" below), and
+drops the heavy free-text/cluster fields (`detail`, `options`, `train_state`, …). The tool's own
+docstring carries the authoritative list — read it there rather than trusting a copy in this
+file, which is how this paragraph went stale before.
+
+**`root_cause` and `member_ids` ARE returned** (task 3997) — they were dropped until then.
+Operationally that is what makes a drain self-sufficient: you can rebuild the already-promoted
+set as {`root_cause` of the pending L2s} ∪ {their `member_ids`} from the drain ALONE, so a
+rotation that inherits no session memory does not re-promote a cluster its predecessor already
+promoted. `member_ids` is the projection of the record's `members` list; the raw `members` key
+stays dropped, as does `detail` — the unbounded free-text field compact mode exists to keep out
+of your context.
+
+Triage from that; fetch the full record with `get_escalation(id)` **only** for
+the one item you're about to act on (and when you do, read its `amendments` —
+see "Reading preserved framing" below) — and prefer doing that full read inside the handling sub-agent
 (see Context Conservation). During an AFK window the pending pile grows, and a full-dict drain every
 cycle is the dominant context sink — `compact=True` is what keeps a long-running session alive.
 
@@ -289,14 +316,15 @@ Watcher Lease" above):
 
 ```bash
 python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py lease-heartbeat \
-  --name watcher-<project> --slug "watcher-<project>-${CLAUDE_PID:-$PPID}"
+  --name watcher-<project>
 ```
 
 This is what makes a second session's `lease-claim` observe this session as "alive" and stand down —
-there is no need to separately pgrep/ps-tree for other watcher processes. `--slug` must be the exact
-slug you claimed with; `result=refused` means you are not the holder and your heartbeat did **not**
-land — investigate with `lease-show` (see "Claiming the Watcher Lease" above) rather than repeating
-the call with `--force`.
+there is no need to separately pgrep/ps-tree for other watcher processes. The CLI re-derives your
+slug, so it matches the claim automatically; `result=refused` means you are not the holder and your
+heartbeat did **not** land — investigate with `lease-show` and compare its `holder_slug` against the
+`slug=` line your `lease-claim` printed (see "Claiming the Watcher Lease" above) rather than
+repeating the call with `--force`.
 
 **`result=absent` on a heartbeat is not idempotence — it means your lease is GONE** (reaped after a
 TTL lapse, or force-released by an operator). You are now running **un-leased**: a duplicate watcher
@@ -369,23 +397,55 @@ already reads it breaks.
 ```bash
 python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py write-decision \
   --id <stable-id> --project <project> --text "<one-line question>" \
+  --escalations-dir <project_root>/data/escalations \
   [--task-id <task_id>] [--escalation-id <escalation_id>] \
-  [--session-id "watcher-<project>-${CLAUDE_PID:-$PPID}"] \
-  [--severity <esc.severity>] [--escalations-dir <project_root>/data/escalations]
+  [--session-id "watcher-<project>-${CLAUDE_PID:-unknown}"] \
+  [--severity <esc.severity>]
 ```
 
 - **`--id`**: a stable id you can recompute idempotently for the same pending item — the
   escalation id (`esc-42-1`) is usually the natural choice. Re-filing the same id overwrites the
-  prior record rather than duplicating it (`write-decision` always writes the whole file).
-  **INTERIM RULE — check before you overwrite.** Decision ids are fleet-global, so *another*
-  watcher (notably the recon watcher, which runs its own queue) may already have filed a decision
-  for the same underlying human gate under this id. Before filing, check whether a decision for
-  that id already exists and is still `open`; if it is, do **not** overwrite it — a second watcher
-  observing the same gate must enrich or no-op, never clobber richer context or downgrade an
-  existing record's severity. Park your own record and add the id to your handled set instead.
+  prior record rather than duplicating it.
+  **You no longer have to pre-check before filing (task 3559).** Decision ids are fleet-global, so
+  *another* watcher (notably the recon watcher, which runs its own queue) may already have filed a
+  decision for the same underlying human gate under this id. The verb now handles that for you: if
+  an `open` record already exists at this id and was filed from a **different** `--escalations-dir`,
+  your filing **enriches** it instead of overwriting — non-empty fields survive, fields the first
+  filer left empty are filled from yours, `severity` takes the **max** of the two and is never
+  downgraded, and `filed_at`/`state`/`manual_boost` stay with the first filer (so you cannot reset
+  an operator's cockpit boost or re-open a closed row). Just file; you do not need to look first.
+  **One field is exempt from "empty ones are filled": `--escalation-id`.** It travels *with*
+  `--escalations-dir` as a pair and is never filled from the other filer across a queue boundary,
+  because `esc-<taskid>-<n>` ids are unique only within one queue and the reaper joins on the
+  (queue, id) pair — a borrowed id would resolve against an unrelated escalation in the adopting
+  queue. Two things that means for you:
+  - Always pass `--escalation-id` alongside `--escalations-dir`: they name the id and the namespace
+    it lives in, and a filing that supplies the queue but not the id cannot upgrade a legacy
+    unstamped record.
+  - If a legacy record already holds a *different* escalation id under an unknown queue, your
+    filing is refused with a `WARNING` and the record deliberately stays a visible cockpit row
+    rather than being silently repointed — that is the fail-OPEN direction, and the remedy is the
+    back-fill (`scripts/backfill_decision_queue_stamp.py`), which actually investigates provenance.
+
   (Observed with `esc-5914-1`, where both queues surfaced the same reify gate; that duplicate
   landing on one id is the *correct* outcome — one question, one cockpit row — but only if the
   second filer doesn't degrade the first one's record.)
+  Two deliberate limits: a re-file from the **same** queue is still a plain idempotent whole-file
+  overwrite — that is the restart promise above, and you are the sole authority on your own
+  escalation — and only an `open` record is protected, since a filing against an `answered` one is
+  a new ask rather than an enrichment of a live question. Even that same-queue overwrite holds
+  `filed_at` and `manual_boost` back, though: queue age and the operator's cockpit boost are never
+  yours to revise, so your restart cannot bump a row to the top of the age ordering or silently
+  drop a boost an operator set between your two filings.
+
+  **Across *projects*, a shared id is a collision, not a shared gate.** Decision ids are
+  fleet-global while `esc-<taskid>-<n>` numbering restarts per project, so `esc-42-1` under two
+  different `--project` values names two unrelated gates. A filing whose `--project` differs from
+  the `open` record already at that id is therefore **refused** with an `ERROR` — nothing written,
+  rc still 0 — because merging would hide your ask inside the other project's cockpit row and
+  overwriting would delete that row. Your ask still reaches the human through the in-session note
+  / afk-digest line this filing accompanies; if you need the cockpit row too, re-file under an id
+  that is unique fleet-wide.
 - **`--text`**: the one-line question a human needs to answer — the same summary you'd otherwise
   only give in-session or in the digest.
 - **`--task-id` / `--escalation-id` / `--session-id`**: thread through whatever you have — the
@@ -395,17 +455,24 @@ python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py wri
   `info`/`blocking`/`critical`/`urgent`). This now weights the cockpit decision-queue rank, so a
   freshly-filed `critical`/`urgent` park surfaces at the top of the queue instead of being buried
   under stale awaiting-input sessions.
-- **`--escalations-dir`**: the escalation **queue** your `--escalation-id` belongs to — for this
-  watcher, `<project_root>/data/escalations`. It must name the SAME queue you later pass to
+- **`--escalations-dir`** (**mandatory**): the escalation **queue** your `--escalation-id` belongs
+  to — for this watcher, `<project_root>/data/escalations`. It must name the SAME queue you later pass to
   `reap-decisions` (below). Decision records are fleet-global while an escalation id
   (`esc-<taskid>-<n>`) is unique only *within* one queue, and a project can run several
   (dark_factory also runs `data/reconciliation/escalations` over the same id namespace), so this is
   what lets the reaper join a decision back to the right per-queue id namespace instead of matching
   an unrelated same-named escalation. Stored normalized, so any spelling of the same directory
-  works. Omitting it files a queue-less record — see the reaper caveat below.
+  works. **You can no longer file without it** (task 3559): omit the flag and the verb exits 2 with
+  nothing filed, and pass it empty and it refuses with a loud error and prints no id — so if the id
+  doesn't come back on stdout, your filing did not land. There is no watcher for which this is a
+  burden: it is the same directory you already pass to `reap-decisions`.
   There is a third value the field can hold: `<unknown>` (`session_registry.UNKNOWN_QUEUE`) —
-  "this record's owning queue was investigated and could not be determined". You never write it;
-  task 3640's back-fill did, for legacy records whose escalation id resolved in several queues at
+  "this record's owning queue was investigated and could not be determined". You never write it —
+  and that is now enforced, not just asked: `write-decision` **rejects**
+  `--escalations-dir <unknown>` outright, because a record stamped that way is refused by *every*
+  reaper and could only ever be closed by hand. It stays valid on the back-fill path
+  (`set_decision_escalations_dir`), which is where task 3640 wrote it, for legacy records whose
+  escalation id resolved in several queues at
   once. It is **not** a respelling of the queue-less `''` state: `''` means *nobody told us* and
   falls back to project-only scoping, while `<unknown>` means *we looked and could not tell* and
   the reaper refuses to close it at all.
@@ -439,11 +506,17 @@ The join is scoped on **two** axes, project *and* queue: a decision stamped (via
 here is skipped outright, so your reaper can never close the recon watcher's decisions against
 your own same-named escalations. A decision filed **without** `--escalations-dir` — every record
 predating that flag — falls back to project-only scoping and therefore has **no** such protection:
-it can still be closed by whichever queue's reaper reaches it first. That is the reason to always
-pass the flag when filing. Task 3640 then **back-filled** the pre-existing open population, so
-that unprotected set is now drained rather than merely shrinking as new records are filed — but
-only for records that existed at back-fill time. A decision you file today without the flag lands
-straight back in it.
+it can still be closed by whichever queue's reaper reaches it first. Task 3640 **back-filled** that
+pre-existing open population, and task 3559 made the flag mandatory at the verb, so the unprotected
+set can no longer regrow through `write-decision` — which is what makes the back-fill terminal
+rather than a recurring chore. It can now only shrink.
+
+On a **MODE 2** cross-queue collapse — both queues surfacing the *same* human gate onto one
+decision id (see the recon watcher's MODE 1 / MODE 2 taxonomy) — the stamp that survives is the
+**first** filer's queue, since a second filing enriches rather than overwrites. The field holds one
+queue, not a list, so the other queue's reaper still skips that record; the trade is that the
+outcome is now deterministic (first filer) instead of depending on who happened to write last. The
+verb logs a warning naming both queues when it discards one.
 
 A decision stamped `<unknown>` is **refused**, not closed: its owning queue was investigated and
 could not be determined, so *no* reaper may close it and it stays a visible cockpit row until a
@@ -538,7 +611,7 @@ explicit "I'll be away" or a long silence after one. Three behavioural shifts:
      gate procedure and applicability rule). If the gate does not launch (abort / over-cap /
      already-attempted) OR the launched sub-agent aborts, leave the escalation pending and add
      it to the digest — do NOT spawn an interactive `/unblock`.
-   - **`wip_conflict` / `unmerged_state` / `dependency_discovered`-with-no-task / `design_concern` /
+   - **`wip_conflict` / `unmerged_state` / `stash_failed` / `dependency_discovered`-with-no-task / `design_concern` /
      `risk_identified` / `infra_issue` / `recon_*`:** leave pending + digest. These need a human;
      a terminal nobody attends just clutters. Append `<esc-id>` to the wrapper-owned exclude-file
      (see "Starting the watcher" above) for each item left pending so the initial scan does not
@@ -809,7 +882,8 @@ above — **a starting point, not a verdict**.
 - `triaged_at` is older than roughly 6 hours, or
 - the record changed since triage — `updated_at` is **not** `None` **and** is newer than
   `triaged_at` (e.g. the L2 cluster gained a new member via `promote_to_l2` after the stamp was
-  written). `updated_at` defaults to `None` (never bumped) until the record's first real content
+  written, its severity was promoted, or a later fold carried in NEW FRAMING — see "Reading
+  preserved framing" below). `updated_at` defaults to `None` (never bumped) until the record's first real content
   change, so a triaged record with no changes since still reads `updated_at = None` — treat that as
   "not newer than `triaged_at`", never as an ordering comparison between `None` and a timestamp
   string.
@@ -826,6 +900,41 @@ cost two churn cycles and five separate `resolve_issue` calls before the item wa
 cannot be spoofed by the caller — the identical non-spoofable attribution contract this skill
 already documents for `resolved_by` (see "Recognizing the supervised auto-watcher's resolutions"
 below).
+
+### Reading preserved framing (`amendments`)
+
+A pending L2 is a **cluster**, and `escalation-watcher-auto` re-promotes the same cluster every
+time it finds more L1s matching that root cause. Each of those folds carries its own
+`root_cause`/`evidence`/`options`/`summary` — the promoting rotation's current read of the problem,
+which is often sharper than the first one. Until task 3997 all of it was discarded on the floor
+(measured: 336,875 characters). It is now kept.
+
+**When you pull the full record with `get_escalation(id)`, read `amendments` alongside the record's
+own framing.** The two are different things and the distinction is the whole point:
+
+- The record's OWN `root_cause` / `detail` / `options` / `summary` are the **original** framing,
+  from the promote that minted the L2. They are immutable — a fold never overwrites them, so the
+  decision context a human started reading cannot shift under them.
+- `amendments` is an append-only list of what **later folds** carried in, oldest first, each with
+  the `agent_role` that submitted it and a queue-stamped `timestamp`. The **last** entry is the
+  most recent read of the cluster; if it disagrees with the record's own framing, that disagreement
+  is the signal — either the cluster drifted, or root-cause matching folded in something that does
+  not belong.
+- Framing byte-identical to what the record already says is **not** re-recorded, so every entry
+  present is a genuine reframing rather than a re-promote echo.
+
+Two counters say what was NOT kept — check them before treating the list as complete:
+
+- `amendments_truncated > 0` — older entries were shed at the cap (oldest-first). The record's own
+  original framing is unaffected; only intermediate reframings were lost.
+- `amendments_chars_elided > 0` — individual fields were long enough to be clipped at the per-field
+  cap. Elision is marked in-band (`[... N char(s) elided ...]`), so a field ending in that marker is
+  the head of what was submitted, not all of it.
+
+A sustained burst of truncation files its own `info` infra escalation (under the synthetic
+`l2-amendment-truncation` task anchor, not against any real task) saying either the cap is too low
+for the live fold rate or root-cause matching is over-folding unrelated clusters into one L2. If you
+see one, the named L2s are where to look.
 
 ### `review_suggestions` (info)
 
@@ -858,16 +967,17 @@ debugging the branch's own diff, and it must not be counted as a flake.
 
 If the low-risk auto-unblock gate applies — see [Low-risk auto-unblock gate (B3)](#low-risk-auto-unblock-gate-b3) — try it first.
 
-### `wip_conflict` / `unmerged_state` (blocking, halt-owner)
+### `wip_conflict` / `unmerged_state` / `stash_failed` (blocking, halt-owner)
 
 These escalations mean the **merge queue is globally halted** — no other task can merge until exactly one of them (the "halt owner") is resolved. The orchestrator records which escalation owns the halt on the merge worker (`_halt_owner_esc_id`); resolving that specific escalation via MCP un-halts the queue. Resolving any other escalation — even another `wip_conflict` — will NOT release the halt (fixed 2026-04-19; prior code relied on a category heuristic that caused phantom-L1 bugs like esc-1888-57).
 
-Two flavours:
+Three flavours:
 - **`wip_conflict`** — the merge queue tripped on uncommitted work in `project_root`. Three sub-variants distinguishable from the `detail`:
   - WIP overlaps the merge diff (merge did not land; workflow will retry after resolution).
   - Stash pop conflicted after the merge landed (merge IS on main; WIP preserved on `wip/recovery-<task>-<ts>`).
   - Stash pop conflicted on CAS-failure path (merge did NOT land; WIP on recovery branch; task blocks).
 - **`unmerged_state`** — `project_root` already had UU/AA/DD markers before the merge attempted to advance (pre-existing corruption, not caused by this merge).
+- **`stash_failed`** — the merge queue could not park `project_root`'s dirty tracked WIP before advancing (task 2758). Like the other two this is a shared main-checkout-hygiene fault rather than a fault of the merging task, so the queue halts once instead of failing task after task.
 
 As with `task_failure`, check for a `disposition` in the block reason / `failure_diagnostic`
 before assuming this is a raw conflict to resolve mechanically — see
@@ -878,8 +988,10 @@ resolution, and is never a flake.
 **Never auto-resolve** — `manual_intervention` is authoritative. The human has to inspect `project_root`:
 - For `wip_conflict`: recovery branch named in the detail preserves the user's WIP; they may need to cherry-pick or reapply before resolving.
 - For `unmerged_state`: run `git status` in `project_root`; UU/AA/DD files need `git mergetool`, manual edit, or `git reset` depending on intent.
+- For `stash_failed`: inspect the main checkout's uncommitted work and commit it — or get its owner to. **Do not reach for `git stash`**: CLAUDE.md forbids it in *any* dark-factory checkout, `project_root` or task worktree, because `refs/stash` is a single ref shared by every worktree in the checkout (it is not per-worktree) and the merge worker's advance path consumes the same stack — so a stash you push can be popped out from under you, and a pop on a clean tree can apply an unrelated task's WIP into it (incident 13674d3c68). Park WIP as commits on a branch.
+  - **Sub-variant:** if the detail/log instead shows `CRITICAL: stale refs/dark-factory/merge-park present`, that's a stale `MERGE_PARK_REF` left over from a prior crash — it holds real, unrecovered WIP that the code deliberately refuses to overwrite. Committing `project_root`'s current dirty files is not enough here: the stale ref itself is what's blocking the next park attempt, so the halt recurs immediately on the next advance. Recovery means inspecting and draining that ref first — e.g. `git branch <recovery-name> refs/dark-factory/merge-park` to make its WIP reachable, then `git update-ref -d refs/dark-factory/merge-park` to free it — before cleaning up `project_root`.
 
-**Spawn an interactive `/unblock` session** via `/spawn` (`prompt="/unblock <task_id> (esc <escalation_id>, <wip_conflict|unmerged_state>, <severity>: <summary>)"`, `terminal_title="unblock:<project>#<task_id> <short-slug>"` — e.g. `unblock:df#2085 routing-mechanism`; abbreviate the project token per the emergent convention — `cwd=<project_root>`, `skip_permissions=true`) so the human can see the recovery branch, inspect `project_root`, and resolve the escalation when finished. The trailing `(esc ...)` context is additive only (see the additive-context convention note above).
+**Spawn an interactive `/unblock` session** via `/spawn` (`prompt="/unblock <task_id> (esc <escalation_id>, <wip_conflict|unmerged_state|stash_failed>, <severity>: <summary>)"`, `terminal_title="unblock:<project>#<task_id> <short-slug>"` — e.g. `unblock:df#2085 routing-mechanism`; abbreviate the project token per the emergent convention — `cwd=<project_root>`, `skip_permissions=true`) so the human can see the recovery branch, inspect `project_root`, and resolve the escalation when finished. The trailing `(esc ...)` context is additive only (see the additive-context convention note above).
 
 **Phantom-halt check:** if the orchestrator log shows "Merge queue un-halted: halt owner &lt;esc.id&gt; resolved" but the escalation file still has `status: pending`, that is a bug — report to the human; do **not** silently dismiss. (Historical context: pre-fix, this was a common symptom of the category-match un-halt bug.)
 
@@ -965,7 +1077,8 @@ Technical debt or cleanup discovered during development.
           "escalation_id": escalation_id,
           "suggestion_hash": suggestion_hash,   # (escalation_id, suggestion_hash) is the idempotency key
           "spawn_context": "steward-triage",
-          "modules": ["<path/to/module>"],
+          # sparse is fine — the architect widens scope at plan time. File paths only (a directory is rejected); use [] to defer entirely.
+          "files": ["<path/to/file.py>"],
       },
   )
   ticket = submit_result["ticket"]

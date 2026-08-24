@@ -2397,6 +2397,33 @@ class TestConfigReload:
             f'be in RELOADABLE_FIELDS'
         )
 
+    @pytest.mark.parametrize('path', [
+        'digest_enabled',
+        'digest_every_n_escalations',
+        'digest_dir',
+        'digest_ewa_alpha',
+        'digest_ewa_threshold',
+    ])
+    def test_digest_knobs_are_reloadable(self, path):
+        """Task 4559: the EWA breaker's own knobs are green-tier.
+
+        Closes an asymmetry that is worse than inert: `recovery_emission.*` is
+        already green-tier, so an operator can silence a noisy alarm live — but
+        the breaker that alarm competes with HALTS FLEET-WIDE DISPATCH and,
+        until this entry existed, could only be retuned by restarting every
+        orchestrator.
+
+        Safe by construction: all five are read FRESH inside
+        `_maybe_write_digest` (harness.py:15036, 15046, 15106, 15110, 15125),
+        so no in-flight state can be split by a mid-process change.
+
+        Reload TIER only — `digest_ewa_threshold`'s VALUE is untouched.
+        """
+        assert path in RELOADABLE_FIELDS, (
+            f'{path!r} is read fresh on every digest check and is expected to be '
+            f'hot-reloadable, but is missing from RELOADABLE_FIELDS'
+        )
+
 
 class TestSimpleTaskRoleConfigAddressability:
     """Routing alpha (plans/adaptive-model-routing-prd.md): simple_task is a
@@ -3251,11 +3278,39 @@ class TestSessionResumeConfig:
             'session_resume.max_resumes_per_task',
             'session_resume.fallback_storm_threshold',
             'session_resume.storm_window_secs',
+            'session_resume.restore_from_archive',
         ):
             assert leaf in RELOADABLE_FIELDS, (
                 f'{leaf} must be a member of RELOADABLE_FIELDS '
                 '(green-tier hot-reloadable via _submodel_leaf_paths)'
             )
+
+    def test_restore_from_archive_defaults_on(self):
+        """task 3578: the arm-site rehydration ships ON, with its own switch.
+
+        Distinct from `enabled`, which kills the whole feature at the harness
+        guard: an operator can disable ARCHIVE RESTORATION specifically while
+        keeping the eligibility instrumentation, so a suspected restore
+        regression is reversible without going blind on the resume population.
+        """
+        from orchestrator.config import SessionResumeConfig
+
+        assert SessionResumeConfig().restore_from_archive is True
+        assert OrchestratorConfig().session_resume.restore_from_archive is True
+
+    def test_restore_from_archive_round_trips_from_yaml(self, tmp_path):
+        """The switch is settable from dark-factory-orchestrator.yaml."""
+        cfg_path = tmp_path / 'orch.yaml'
+        cfg_path.write_text(
+            'session_resume:\n  restore_from_archive: false\n'
+        )
+        config = load_config(cfg_path)
+
+        assert config.session_resume.restore_from_archive is False
+        # The sibling leaves keep their defaults — a partial block must not
+        # reset the rest of the submodel.
+        assert config.session_resume.enabled is True
+        assert config.session_resume.max_resumes_per_task == 3
 
 
 # ---------------------------------------------------------------------------
@@ -3588,4 +3643,151 @@ class TestCoerceTierUnrecognizedValueDedup:
         assert len(_cfg._warned_priority_values) <= cap, (
             f"dedupe memo grew to {len(_cfg._warned_priority_values)} "
             f"entries, exceeding cap {cap}"
+        )
+
+
+class TestRecoveryEmissionConfig:
+    """The structured recovery-decision emission knobs (task 3535).
+
+    PRD ``plans/task-escalation-state-graph-prd.md`` D5.  The canonical WHY
+    for the mechanism lives in
+    ``orchestrator/src/orchestrator/recovery_emission.py`` (module docstring);
+    this class only pins the operator-facing surface.
+    """
+
+    def test_section_is_registered_on_orchestrator_config(self):
+        """OrchestratorConfig exposes recovery_emission with the shipped defaults.
+
+        Registration is load-bearing, not cosmetic: ``model_config`` sets
+        ``extra='ignore'``, so an UNREGISTERED yaml block is silently dropped
+        and the operator edits a stanza that does nothing.
+        """
+        from orchestrator.config import OrchestratorConfig
+
+        cfg = OrchestratorConfig()
+        assert hasattr(cfg, 'recovery_emission'), (
+            'recovery_emission must be a registered field, or its yaml block '
+            'is silently dropped by extra="ignore"'
+        )
+        # Ships ENABLED: emission is the whole deliverable of task 3535, and
+        # shipping it off would leave every strand unexplained.
+        assert cfg.recovery_emission.enabled is True
+        assert cfg.recovery_emission.veto_streak_threshold == 3
+        assert cfg.recovery_emission.veto_streak_min_span_secs == 1500.0
+        # The narrower kill switch for the only part that WRITES to the
+        # escalation queue — separate from `enabled` on purpose.
+        assert cfg.recovery_emission.streak_escalation_enabled is True
+
+    def test_veto_streak_threshold_must_be_at_least_one(self):
+        """threshold=0 would file an L1 on the very first observed veto."""
+        from orchestrator.config import RecoveryEmissionConfig
+
+        with pytest.raises(ValidationError):
+            RecoveryEmissionConfig(veto_streak_threshold=0)
+        with pytest.raises(ValidationError):
+            RecoveryEmissionConfig(veto_streak_threshold=-1)
+
+    def test_veto_streak_min_span_secs_must_not_be_negative(self):
+        """0 is legal (disables the time half); negative is nonsense."""
+        from orchestrator.config import RecoveryEmissionConfig
+
+        assert RecoveryEmissionConfig(veto_streak_min_span_secs=0).veto_streak_min_span_secs == 0.0
+        with pytest.raises(ValidationError):
+            RecoveryEmissionConfig(veto_streak_min_span_secs=-1)
+
+    def test_defaults_yaml_block_matches_the_field_defaults(self):
+        """The shipped stanza must not drift from the pydantic defaults.
+
+        YamlSettingsSource layers defaults.yaml UNDER the project YAML, so the
+        STANZA — not the ``Field(default=...)`` — is what actually applies.  A
+        drifted stanza would silently win.
+        """
+        defaults = _load_package_defaults()
+        assert 'recovery_emission' in defaults, (
+            'the shipped defaults.yaml must declare the recovery_emission: '
+            'block so the knobs are discoverable without reading pydantic source'
+        )
+        block = defaults['recovery_emission']
+        assert block['enabled'] is True
+        assert block['veto_streak_threshold'] == 3
+        assert block['veto_streak_min_span_secs'] == 1500.0
+        assert block['streak_escalation_enabled'] is True
+
+    def test_leaves_are_green_tier_hot_reloadable(self):
+        """Every leaf is in RELOADABLE_FIELDS (whole-submodel-group idiom).
+
+        An operator must be able to retune the threshold or silence a noisy
+        detector live — a detector you can only silence by restarting the
+        fleet is one that gets silenced by ignoring it instead.
+        """
+        from orchestrator.config import RecoveryEmissionConfig
+
+        for leaf in RecoveryEmissionConfig.model_fields:
+            assert f'recovery_emission.{leaf}' in RELOADABLE_FIELDS, (
+                f'recovery_emission.{leaf} must be green-tier hot-reloadable; '
+                'register the whole submodel via _submodel_leaf_paths so new '
+                'leaves are covered automatically'
+            )
+# ---------------------------------------------------------------------------
+# task 3060: git.merge_park_lock_grace_seconds — the advance_main index-lock
+# stand-off knob
+# ---------------------------------------------------------------------------
+
+
+class TestMergeParkLockGraceSeconds:
+    """`GitConfig.merge_park_lock_grace_seconds` bounds how long
+    `advance_main` waits for a FOREIGN `<git-dir>/index.lock` in project_root
+    to clear before giving up and returning `park_lock_contended`.
+
+    The 300s default matches this repo's documented pre-commit budget
+    (CLAUDE.md instructs `timeout: 300000` because the hook runs pyright), so
+    an ordinary docs-direct-commit-on-main — which holds the index lock for
+    the entire hook run — is waited out rather than halting the merge queue.
+    """
+
+    def test_default_is_300_seconds(self):
+        """Default 300.0s == the documented 5-minute pre-commit budget."""
+        from orchestrator.config import GitConfig
+
+        assert GitConfig().merge_park_lock_grace_seconds == 300.0
+
+    def test_round_trips_override(self):
+        """An explicit override round-trips verbatim."""
+        from orchestrator.config import GitConfig
+
+        assert GitConfig(merge_park_lock_grace_seconds=42.5).merge_park_lock_grace_seconds == 42.5
+
+    def test_zero_is_accepted_as_probe_only_off_switch(self):
+        """0 is VALID (`ge=0`, not `gt=0`): it disables only the WAIT.
+
+        The lock is still probed and a held lock is still classified as
+        `park_lock_contended` — the off-switch can never restore the
+        data-loss risk of parking through a foreign process's index lock,
+        and it must never become a silent fail-soft.
+        """
+        from orchestrator.config import GitConfig
+
+        assert GitConfig(merge_park_lock_grace_seconds=0).merge_park_lock_grace_seconds == 0
+
+    def test_rejects_negative(self):
+        """A negative grace is nonsensical — `ge=0` must reject it."""
+        from orchestrator.config import GitConfig
+
+        with pytest.raises(ValidationError):
+            GitConfig(merge_park_lock_grace_seconds=-1)
+
+    def test_is_green_tier_reloadable(self):
+        """Green-tier: an operator can retune the stand-off live via
+        `mcp__escalation__reload_config`, like its `git.offline_lane_*`
+        leaf neighbours. The value is re-read per advance, not captured at
+        startup, so a leaf mutation takes effect on the very next advance.
+
+        NOTE: `GitConfig` has no whole-submodel `_submodel_leaf_paths` group
+        in RELOADABLE_FIELDS (`git.main_branch` is asserted ABSENT above), so
+        this membership requires an EXPLICIT registration line.
+        """
+        assert 'git.merge_park_lock_grace_seconds' in RELOADABLE_FIELDS, (
+            'git.merge_park_lock_grace_seconds must be a member of '
+            'RELOADABLE_FIELDS (green-tier hot-reloadable, explicitly '
+            'registered beside the git.offline_lane_* leaves)'
         )

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import io
 import json
+import sys
 import warnings
 from pathlib import Path
 
@@ -35,7 +36,6 @@ from _cross_account_evidence import (
     format_run_evidence,
     select_token_pair,
 )
-from _oauth_accounts import ALL_TOKEN_LETTERS
 
 from shared.cli_invoke import AgentResult
 
@@ -588,48 +588,6 @@ class TestEmitRunEvidence:
         assert json.loads(lines[0])['r2_output'] == 'line one\nline two\nZEPPELIN'
 
 
-@pytest.fixture
-def reload_integration_module(monkeypatch):
-    """Reload ``test_cli_invoke_integration`` under a controlled fake environ.
-
-    Yields ``reload(**tokens)`` -> the reloaded module.  Every
-    ``CLAUDE_OAUTH_TOKEN_*`` letter and the override var are cleared first, so
-    the machine's real ``.env`` (which has A..G all set) cannot leak in and make
-    these assertions environment-dependent.  Neither the letter set nor the
-    override var name is restated here — they are imported from
-    ``_oauth_accounts`` and ``_cross_account_evidence`` respectively, so this
-    fixture cannot become the copy that drifts (task 3700).
-
-    ``test_oauth_accounts.py`` holds ``reload_module_under_env``, a strict
-    generalisation of this fixture over the module name.  The two coexist only
-    because pytest fixtures are module-scoped by visibility and the shared home
-    for one would be ``conftest.py``, outside task 3700's lock set; consolidating
-    there is filed as follow-up.
-
-    Reloading mutates the module object other collected items may hold, so on
-    teardown the real environment is restored (``monkeypatch.undo()`` first,
-    since this fixture finalises BEFORE monkeypatch's own teardown) and the
-    module is reloaded once more under it — no reload side effect escapes.
-    """
-    import importlib
-
-    module = importlib.import_module('test_cli_invoke_integration')
-
-    def _reload(**tokens: str):
-        for ch in ALL_TOKEN_LETTERS:
-            monkeypatch.delenv(f'CLAUDE_OAUTH_TOKEN_{ch}', raising=False)
-        monkeypatch.delenv(PAIR_OVERRIDE_VAR, raising=False)
-        for name, value in tokens.items():
-            monkeypatch.setenv(name, value)
-        return importlib.reload(module)
-
-    try:
-        yield _reload
-    finally:
-        monkeypatch.undo()
-        importlib.reload(module)
-
-
 class TestIntegrationModuleUsesSelectTokenPair:
     """The integration module must RESOLVE its pair through ``select_token_pair``.
 
@@ -641,8 +599,9 @@ class TestIntegrationModuleUsesSelectTokenPair:
     pair could not be aimed.
     """
 
-    def test_override_steers_the_module_level_pair(self, reload_integration_module):
-        module = reload_integration_module(
+    def test_override_steers_the_module_level_pair(self, reload_module_under_env):
+        module = reload_module_under_env(
+            'test_cli_invoke_integration',
             CLAUDE_OAUTH_TOKEN_B='tok-b',
             CLAUDE_OAUTH_TOKEN_C='tok-c',
             CLAUDE_OAUTH_TOKEN_F='tok-f',
@@ -654,9 +613,10 @@ class TestIntegrationModuleUsesSelectTokenPair:
         assert (name_b, tok_b) == ('CLAUDE_OAUTH_TOKEN_C', 'tok-c')
 
     def test_falls_back_to_first_two_available_without_override(
-        self, reload_integration_module
+        self, reload_module_under_env
     ):
-        module = reload_integration_module(
+        module = reload_module_under_env(
+            'test_cli_invoke_integration',
             CLAUDE_OAUTH_TOKEN_C='tok-c',
             CLAUDE_OAUTH_TOKEN_E='tok-e',
             CLAUDE_OAUTH_TOKEN_F='tok-f',
@@ -668,10 +628,11 @@ class TestIntegrationModuleUsesSelectTokenPair:
         ]
 
     def test_account_a_is_the_session_starting_account(
-        self, reload_integration_module
+        self, reload_module_under_env
     ):
         """The control/baseline tests must run on account A, not on token index 0."""
-        module = reload_integration_module(
+        module = reload_module_under_env(
+            'test_cli_invoke_integration',
             CLAUDE_OAUTH_TOKEN_B='tok-b',
             CLAUDE_OAUTH_TOKEN_C='tok-c',
             CLAUDE_OAUTH_TOKEN_G='tok-g',
@@ -679,10 +640,11 @@ class TestIntegrationModuleUsesSelectTokenPair:
         )
         assert module._ACCOUNT_A == ('CLAUDE_OAUTH_TOKEN_G', 'tok-g')
 
-    def test_bad_override_does_not_crash_collection(self, reload_integration_module):
+    def test_bad_override_does_not_crash_collection(self, reload_module_under_env):
         """A mis-set override must skip the cross-account test, not break the
         whole module's collection — and it must NOT silently run the default pair."""
-        module = reload_integration_module(
+        module = reload_module_under_env(
+            'test_cli_invoke_integration',
             CLAUDE_OAUTH_TOKEN_B='tok-b',
             CLAUDE_OAUTH_TOKEN_C='tok-c',
             CROSS_ACCOUNT_RESUME_TOKENS='F,C',  # F is unset here
@@ -694,7 +656,7 @@ class TestIntegrationModuleUsesSelectTokenPair:
         assert module._ACCOUNT_A == ('CLAUDE_OAUTH_TOKEN_B', 'tok-b')
 
     def test_mis_set_override_warns_about_the_account_a_fallback(
-        self, reload_integration_module
+        self, reload_module_under_env
     ):
         """The ``_ACCOUNT_A`` fallback above must not be SILENT.
 
@@ -707,7 +669,8 @@ class TestIntegrationModuleUsesSelectTokenPair:
         account and report it healthy right before spending the window on it.
         """
         with pytest.warns(UserWarning) as caught:
-            module = reload_integration_module(
+            module = reload_module_under_env(
+                'test_cli_invoke_integration',
                 CLAUDE_OAUTH_TOKEN_B='tok-b',
                 CLAUDE_OAUTH_TOKEN_C='tok-c',
                 CROSS_ACCOUNT_RESUME_TOKENS='F,C',  # F is unset here
@@ -719,7 +682,7 @@ class TestIntegrationModuleUsesSelectTokenPair:
         assert module._ACCOUNT_A == ('CLAUDE_OAUTH_TOKEN_B', 'tok-b')
 
     def test_no_override_and_too_few_accounts_does_not_warn(
-        self, reload_integration_module
+        self, reload_module_under_env
     ):
         """The warning is about a MIS-SET override, not about a small pool.
 
@@ -728,19 +691,62 @@ class TestIntegrationModuleUsesSelectTokenPair:
         """
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter('always')
-            module = reload_integration_module(CLAUDE_OAUTH_TOKEN_C='tok-c')
+            module = reload_module_under_env(
+                'test_cli_invoke_integration', CLAUDE_OAUTH_TOKEN_C='tok-c'
+            )
         assert module._ACCOUNT_PAIR is None
         assert module._PAIR_ERROR is not None
         assert not [
             w for w in caught if 'CROSS_ACCOUNT_RESUME_TOKENS' in str(w.message)
         ]
 
-    def test_single_token_leaves_pair_unset(self, reload_integration_module):
-        module = reload_integration_module(CLAUDE_OAUTH_TOKEN_C='tok-c')
+    def test_single_token_leaves_pair_unset(self, reload_module_under_env):
+        module = reload_module_under_env(
+            'test_cli_invoke_integration', CLAUDE_OAUTH_TOKEN_C='tok-c'
+        )
         assert module._ACCOUNT_PAIR is None
         assert module._ACCOUNT_A == ('CLAUDE_OAUTH_TOKEN_C', 'tok-c')
 
-    def test_no_tokens_leaves_both_unset(self, reload_integration_module):
-        module = reload_integration_module()
+    def test_no_tokens_leaves_both_unset(self, reload_module_under_env):
+        module = reload_module_under_env('test_cli_invoke_integration')
         assert module._ACCOUNT_PAIR is None
         assert module._ACCOUNT_A is None
+
+    def test_cold_import_already_sees_the_controlled_environ(
+        self, reload_module_under_env, monkeypatch
+    ):
+        """The environ must be cleared before ``import_module``, not just before ``reload``.
+
+        The fixture is called from inside the TEST BODY (unlike the fixture it
+        replaced, which imported during fixture SETUP), so a caller's
+        ``catch_warnings`` / ``pytest.warns`` region is already open when the
+        target module is first imported.  If that FIRST — cold — import runs
+        under the operator's real environ, its import-time side effects escape
+        into the caller's recording region: a real ``CROSS_ACCOUNT_RESUME_TOKENS``
+        naming an unset letter makes the sibling
+        ``test_no_override_and_too_few_accounts_does_not_warn`` FAIL, and makes
+        ``test_mis_set_override_warns_about_the_account_a_fallback`` pass
+        VACUOUSLY on somebody else's warning.
+
+        This test is hermetic: it synthesizes the operator condition rather than
+        reading the machine's env, so it pins the contract identically on a box
+        where the override happens to be unset.
+        """
+        # The operator condition, injected — an override naming an unset letter.
+        monkeypatch.setenv(PAIR_OVERRIDE_VAR, 'F,C')
+        monkeypatch.delenv('CLAUDE_OAUTH_TOKEN_F', raising=False)
+        # Force the import to be COLD, reproducing a run of this file on its own
+        # (nothing holds a module-level reference to it — test_oauth_accounts.py
+        # imports it inside a test function — so dropping it here is safe).
+        sys.modules.pop('test_cli_invoke_integration', None)
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter('always')
+            module = reload_module_under_env(
+                'test_cli_invoke_integration', CLAUDE_OAUTH_TOKEN_C='tok-c'
+            )
+        assert not [w for w in caught if PAIR_OVERRIDE_VAR in str(w.message)], [
+            str(w.message) for w in caught
+        ]
+        # ...and the reload really did happen, under the fake env.
+        assert module._ACCOUNT_A == ('CLAUDE_OAUTH_TOKEN_C', 'tok-c')

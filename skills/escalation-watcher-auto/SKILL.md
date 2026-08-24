@@ -127,10 +127,36 @@ result = mcp__escalation__promote_to_l2(
     options=["A: ...", "B: ...", "C: ...", "D: something else"],
     summary="<one-line cluster hypothesis>",
     category="<category>",                # e.g. "infra_issue", "design_concern"
-    severity="blocking",                  # default; use "critical" for urgent
+    # severity: OMIT IT. Omitted = inherited as max(member severities).
+    # See "Severity of a promoted L2" below before passing it explicitly.
 )
-# result: {'id': <l2_id>, 'status': 'created'|'updated', 'members': [...]}
+# result: {'id': <l2_id>, 'status': 'created'|'updated', 'members': [...],
+#          'severity': <what was actually filed>}
 ```
+
+### Severity of a promoted L2
+
+1. **Omit `severity` and the L2 inherits the highest severity among its
+   members.** This is what you want in the overwhelming majority of cases —
+   an L2 clustering purely-informational L1s is itself informational, and
+   filing it as `blocking` puts a human in the loop for something no member
+   claimed was blocking.
+
+2. **Pass it EXPLICITLY and UPWARD when your RCA concluded the cluster is
+   collectively worse than any individual member** — a set of individually
+   informational findings that together indicate a real blocker. This remains
+   fully available and is *not* discouraged; it is a judgement you are expected
+   to make when the evidence supports it. Say so in `evidence` when you do.
+
+3. **Never pass a severity LOWER than the members' max to quiet a record.**
+   Post-mint the server enforces a monotonic floor: an L2's severity is
+   non-decreasing after it is minted, so a demotion on an append is ignored.
+   (At mint time a lower explicit value *is* honoured — but if you find
+   yourself reaching for it, the honest move is usually to not promote at all.)
+
+4. **The response carries `severity`** — report the value actually filed in the
+   rotation digest, not the one you asked for. On an `'updated'` result it is
+   the post-floor value, which may be higher than your argument.
 
 ### Case A — single judgement-class item (1-member L2)
 
@@ -556,6 +582,8 @@ mcp__escalation__promote_to_l2(
   ],
   summary="bad merge on main — recovery ref-move required",
   category="infra_issue",
+  # Explicit upward override, deliberate: main being RED blocks the whole fleet
+  # regardless of how any individual member happened to be filed.
   severity="blocking",
 )
 ```
@@ -627,7 +655,7 @@ mcp__escalation__promote_to_l2(
   options=["A: restart the affected service", "B: investigate logs/connectivity", "C: pause orchestration until resolved", "D: something else"],
   summary="Infrastructure issue: " + <summary>,
   category="infra_issue",
-  severity="blocking",
+  # severity omitted — inherited from the clustered members.
 )
 ```
 
