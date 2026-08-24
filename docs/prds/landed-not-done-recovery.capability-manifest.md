@@ -141,7 +141,9 @@ survive re-measurement: `done` is not an absorbing state (`shared/task_transitio
 `task_failure`, which β's narrowed veto does not admit, so it rests there until a human closes the
 record. Tasks 4645 and 3539 were corrected accordingly on 2026-08-24.
 
-**Recheck 2026-08-24 (PRD correction 11) — five new bindings on η.** The asymmetry flagged above is
+**Recheck 2026-08-24 (PRD correction 11) — five new bindings on η.** *Code anchors in this
+paragraph and in the five new sidecar bindings verified against main `ea876cb624` (2026-08-24);
+cite-by-symbol elsewhere and re-locate lines at implementation time.* The asymmetry flagged above is
 now closed on η's side: two `grep` checks pin the write filter to a single-line
 `_LANDED_RECONCILE_STATUSES` frozenset whose members are drawn only from `{pending, merge-deferred}`,
 and to that constant actually being *consulted*. Both were exercised against positive and negative

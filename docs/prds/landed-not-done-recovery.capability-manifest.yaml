@@ -859,7 +859,7 @@ tasks:
       reason: a cadence decision the leaf must make; the config-key check above covers
         whichever shape it picks
   - name: write-filter-pinned-to-pending-and-merge-deferred
-    binding: 'G4 partition enforcement, added at the 2026-08-24 recheck (PRD correction
+    binding: 'Anchors as of main ea876cb624 (2026-08-24); re-locate at implementation time. G4 partition enforcement, added at the 2026-08-24 recheck (PRD correction
       11d). The ratified partition binds 3539 STRUCTURALLY - _RECOVERY is read only by
       classify_recovery (task_ground_truth.py:916), reached only inside _reconcile_one_stranded
       (harness.py:5479, its recovery_for call at :5553), entered only for _RECONCILE_SWEEP_STATUSES
@@ -879,7 +879,7 @@ tasks:
       - orchestrator/src/orchestrator/harness.py
       expect: present
   - name: status-filter-is-consulted-not-merely-declared
-    binding: capability→producer (anti-orphan) - the twin of the check above. A declared-but-unused
+    binding: Anchors as of main ea876cb624 (2026-08-24); re-locate at implementation time. capability→producer (anti-orphan) - the twin of the check above. A declared-but-unused
       constant satisfies the membership assertion while the writer filters on something
       else, which is the declared-only FAIL shape. This pattern is non-vacuous against
       its twin because the "= frozenset({...})" declaration line cannot contain "in
@@ -892,7 +892,7 @@ tasks:
       - orchestrator/src/orchestrator/harness.py
       expect: present
   - name: writer-routes-through-the-shared-mark-done-capability-gate
-    binding: 'capability→producer (wired), added at the 2026-08-24 recheck (PRD correction
+    binding: 'Anchors as of main ea876cb624 (2026-08-24); re-locate at implementation time. capability→producer (wired), added at the 2026-08-24 recheck (PRD correction
       11c). _mark_in_progress_done (harness.py:6239) is a THIN WRAPPER over scheduler.mark_done
       and carries no capability guard of its own; each of its four production callers
       applies Harness._delivered_checks_block (:6193 -> delivered_checks.gate_mark_done_on_delivered_checks)
@@ -909,7 +909,7 @@ tasks:
         function; pinned by a boundary row asserting the done-write is withheld when a
         declared delivered_check is absent from main
   - name: escalation-pin-veto-honoured-at-the-done-write
-    binding: 'G7 corroborate-before-acting / safety parity, added at the 2026-08-24 recheck
+    binding: 'Anchors as of main ea876cb624 (2026-08-24); re-locate at implementation time. G7 corroborate-before-acting / safety parity, added at the 2026-08-24 recheck
       (PRD correction 11c). _already_landed_dispatch_gate refuses its own auto-done when
       classify_pins(...).vetoes_done_flip is True (harness.py:11578, :11648) - an open
       record at ANY level (:11536-11543), with info severity the ONLY carve-out (escalation/src/escalation/pins.py:144-147,
@@ -926,7 +926,7 @@ tasks:
         grep is vacuous; the observable is the pair of boundary rows (blocking record
         vetoes, info-only record does not)
   - name: pre-existing-done-writers-over-this-population
-    binding: 'capability→producer (authority survey), added at the 2026-08-24 recheck
+    binding: 'Anchors as of main ea876cb624 (2026-08-24); re-locate at implementation time. capability→producer (authority survey), added at the 2026-08-24 recheck
       (PRD correction 11b). This leaf is NOT the sole done-writer over pending/merge-deferred.
       merge_queue.reconcile_landed_row RC-2 (merge_queue.py:6685, kind=merged) reaches
       exactly pending, because RC-3 at :6616 short-circuits every WORKFLOW_PRESERVE_STATUSES
