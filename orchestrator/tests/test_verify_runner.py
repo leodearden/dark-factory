@@ -1999,11 +1999,13 @@ class TestRunMergeVerifyOnWorktree:
         """Task 4536, constraint 2: the registry install must REBIND the dict,
         never mutate it in place.
 
-        ``model_copy`` shares ``__pydantic_private__`` BY REFERENCE with the
-        source, so a ``.clear()``/``.update()`` spelling would reach through the
-        copy and silently corrupt the CALLER's config — the object cli.py loaded
-        from disk and may still use. This is why the rebind is load-bearing
-        rather than stylistic.
+        ``model_copy`` rebuilds the ``__pydantic_private__`` MAPPING as a fresh
+        dict but carries its VALUES over unchanged — so the copy's
+        ``_module_configs`` is initially the SAME dict object as the caller's.
+        A ``.clear()``/``.update()`` spelling would therefore reach through that
+        shared value and silently corrupt the CALLER's config — the object
+        cli.py loaded from disk and may still use — while a rebind cannot. This
+        is why the rebind is load-bearing rather than stylistic.
         """
         from orchestrator.verify_runner import run_merge_verify_on_worktree
 
@@ -2044,9 +2046,10 @@ class TestRunMergeVerifyOnWorktree:
         )
 
         assert caller_config._module_configs is original_dict, (
-            'the caller\'s registry dict object must be untouched — an in-place '
-            'mutation of the COPY reaches through the shared __pydantic_private__ '
-            'and corrupts the caller\'s config'
+            'the caller\'s registry dict object must be untouched — the copy\'s '
+            '_module_configs starts out as the SAME dict object, so an in-place '
+            'mutation of the COPY reaches through that shared value and '
+            'corrupts the caller\'s config'
         )
         assert caller_config._module_configs == original_items, (
             f'the caller\'s registry contents must be unchanged; got '

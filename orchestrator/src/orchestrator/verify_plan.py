@@ -899,13 +899,10 @@ def effective_merge_module_configs(
     it in ``verify_runner.run_merge_verify_on_worktree``) and the merge-flake
     suppression gate then receive the IDENTICAL set BY CONSTRUCTION, rather
     than by an assertion that two sites independently agree. The parenthetical
-    REMOTE leg was only made true by task 4536: that reconstruction now also
-    INSTALLS the spec's set as the config's module registry before this helper
-    reads it, so the ``config.module_configs_or_empty`` read below is the
-    DISPATCHER's set on the remote path rather than the remote host's own
-    ``_discover_module_configs`` walk. Until then it was aspirational — a
-    stale/divergent laptop checkout could both drop modules the spec named and
-    inject ones it never did. Before this helper the expansion was
+    REMOTE leg was only made true by task 4536, which installs the spec's set
+    as that reconstructed config's registry — see
+    ``verify_runner.run_merge_verify_on_worktree``; until then it was
+    aspirational. Before this helper the expansion was
     reimplemented inline at two sites inside
     ``run_scoped_verification``, each rebinding a local that never propagated
     out: the run executed the full registry while the suppression gate still
@@ -921,13 +918,9 @@ def effective_merge_module_configs(
     already resolved the set.
 
     WHOSE REGISTRY the full-breadth branch reads depends on the path, and both
-    answers are the dispatching side's by construction (task 4536): on the
-    genuinely LOCAL merge path it is the merging host's own discovery walk,
-    which IS the source the passed set was derived from; on the CLI/REMOTE path
-    (``orchestrator verify-merge``) it is the set the wire spec shipped,
-    installed onto the reconstructed config by
-    ``verify_runner.run_merge_verify_on_worktree``. There is deliberately no
-    third answer — the remote host's own walk never decides a merge.
+    answers are the dispatching side's by construction — which is which, and
+    why there is deliberately no third answer, is documented once at
+    ``verify_runner.run_merge_verify_on_worktree`` (task 4536).
 
     The empty-registry fallback is a deliberate SAFE DEGRADE: a project with
     no registered modules returns the passed set rather than ``[]``, so the

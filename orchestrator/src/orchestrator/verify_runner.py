@@ -597,6 +597,29 @@ async def run_merge_verify_on_worktree(
     # LocalRunner directly in merge_queue.py — so host discovery survives there
     # by construction.
     #
+    # KNOWN CONSEQUENCE — reverse-dependency widening degrades to a no-op on
+    # this leg under merge_verify_breadth='scoped' (amendment, review
+    # suggestion 1). verify._reverse_dependency_module_configs (task 2607)
+    # resolves a triggered dependent's BASE ModuleConfig out of this same
+    # registry. At breadth='scoped' the installed registry is exactly the
+    # spec's set, which is exactly the set already in that call's
+    # `already_scoped` — so any dependent it would widen to is by construction
+    # absent from the registry and the lookup returns None. Previously the
+    # remote host's own walk supplied it. This is a deliberate, narrow trade:
+    # a dispatcher-authoritative registry is worth strictly more than a
+    # widening resolved from a checkout the dispatcher never vouched for (and
+    # the pre-4536 alternative was to widen using the HOST's command, which is
+    # the very infidelity this install closes). It is latent, not live —
+    # _REVERSE_TEST_DEPENDENTS maps only orchestrator→escalation; dark_factory
+    # runs breadth='full', where escalation is always already_scoped and the
+    # widening is a no-op regardless; reify registers no 'orchestrator'
+    # prefix. The real fix is to resolve the widening at the DISPATCHING
+    # boundary (beside merge_queue._merge_boundary_module_configs) so widened
+    # dependents ride the wire spec — out of scope here (merge_queue.py is not
+    # locked by this task); filed as a follow-up. The skip is no longer
+    # silent: verify._reverse_dependency_module_configs logs a warning naming
+    # the unresolvable dependent.
+    #
     # Spelling constraints (all verified against the installed pydantic):
     #  - DIRECT private-attribute assignment, never an entry in `config_update`.
     #    `_module_configs` is a PrivateAttr, not a model field, so
@@ -605,9 +628,15 @@ async def run_merge_verify_on_worktree(
     #    __dict__ shadowing, a later normal write would be silently swallowed,
     #    and the shadow would propagate into further copies. Direct assignment
     #    is the repo-wide blessed idiom (see config.load_config).
-    #  - REBIND the whole dict, never mutate in place: model_copy shares
-    #    __pydantic_private__ BY REFERENCE with the source, so an in-place
-    #    .clear()/.update() would corrupt the CALLER's config registry.
+    #  - REBIND the whole dict, never mutate in place. model_copy rebuilds the
+    #    __pydantic_private__ MAPPING as a fresh dict (BaseModel.__copy__), so
+    #    a rebind here cannot reach back into the source — but it carries the
+    #    VALUES over unchanged, which means the copy's `_module_configs` is
+    #    initially the SAME dict object as the caller's. Rebinding is therefore
+    #    safe; an in-place .clear()/.update() would reach through that shared
+    #    value and corrupt the CALLER's config registry — the object cli.py
+    #    loaded from disk and may still use. Pinned by
+    #    test_verify_runner.test_caller_config_registry_is_not_mutated.
     #  - UNCONDITIONAL, including `{}` for a zero-module spec. `{}` is the
     #    documented "discovery ran and found no subprojects" value (distinct
     #    from the None "never ran" sentinel) — exactly the claim a zero-module
