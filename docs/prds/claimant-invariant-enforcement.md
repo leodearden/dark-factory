@@ -441,12 +441,33 @@ never race a post-clear re-stamp"* — is true only of the **slot-release** clea
 second, earlier clear the guarantee never covered: the argument survives the words but not the
 referent.
 
-`claimant_run_id` is the column that means ownership, and no reader is fooled by a bare heartbeat
-(`has_live_claimant` requires a claimant; `_claimant_liveness_stranded` reports stranded on a NULL
-one), so narrowing costs nothing. β still writes **both** columns NULL; the residual
-`(NULL, timestamp)` untidiness is accepted, and moving the heartbeat stop ahead of the terminal write
-is a follow-up, not this PRD's job. D3's alarmable tier is likewise "a terminal row carrying a
-**claimant**", which this now matches exactly.
+`claimant_run_id` is the column that means ownership, and the residue is **provably inert, not merely
+harmless**: `_claimant_liveness_stranded` (`shared/src/shared/task_claimant.py:63`) reads
+`claimant_run_id` **first** and returns "no live claimant" on a NULL/blank one *before it ever parses
+`heartbeat_at`*. Every liveness predicate in the repo delegates to that core, and the dashboard only
+carries the column through for display — so a `(NULL, timestamp)` row cannot influence any liveness
+decision anywhere. Narrowing is therefore not a weakening; it states the invariant on the column that
+carries the meaning. D3's alarmable tier is likewise "a terminal row carrying a **claimant**", which
+this now matches exactly.
+
+β still writes **both** columns NULL. The residual `(NULL, timestamp)` untidiness is accepted.
+
+**The narrowing is load-bearing, not a stopgap — do not "fix" it later by moving the heartbeat stop
+and re-widening C4-E1 to both columns.** Cancelling the heartbeat task does not un-send an
+already-dispatched MCP write, so an in-flight tick can still land after the terminal write however
+early the stop is moved. Moving it takes the residue from *systematic* (every completion, up to one
+interval) to *sporadic* — and a sporadically-false invariant driving an alarm is worse than a
+systematically-false one, because it yields a flaky, hard-to-reproduce signal instead of one you can
+reason about. The narrow form is true by construction; the wide form cannot be made true.
+
+Stopping the loop after a terminal write is still worthwhile **as hygiene of the heartbeat loop**
+(it stops writing freshness for a claim that no longer exists) and is filed separately. Note the
+placement: **after a confirmed-successful terminal write, never before it.** Stopping ahead of the
+write means a *failed* write leaves a live workflow holding a claim nobody is refreshing — it ages
+past the TTL, the reconcile sweep classifies the row stranded, and dispatch can re-enter a live
+worktree. That is precisely the hazard D2 exists to prevent, traded for cosmetic tidiness. (An
+earlier revision of this paragraph prescribed "ahead of the terminal write"; that prescription was
+wrong and is withdrawn.)
 
 It ships as an **executable predicate, not prose**: α exports
 `violates_terminal_claimant_invariant(task)` from `shared/src/shared/task_claimant.py`, and β's
