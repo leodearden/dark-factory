@@ -55,6 +55,7 @@ from typing import Any
 
 from fused_memory.memory_metadata import (
     EXPERIMENTAL_KEY_PREFIX,
+    is_valid_topic_slug,
     normalize_supersedes,
 )
 from fused_memory.utils.validation import is_full_uuid
@@ -65,6 +66,8 @@ __all__ = [
     'GATE_METADATA_KEY',
     'WAIVABLE_REASON_CODES',
     'ClosureVerdict',
+    'ConsolidationGateSpec',
+    'build_consolidation_gate_task',
     'evaluate_closure',
     'render_end_state_brief',
 ]
@@ -375,6 +378,27 @@ def evaluate_closure(
             )
         )
 
+    # --- unstamped cluster members: the ONE thing provenance may add ------- #
+    # A member the detector observed live but which never got stamped into the
+    # topic is invisible to the scroll, so it can only reach the predicate this
+    # way.  ABSENCE-based (not-stamped is indistinguishable from past-the-cap),
+    # so it is suppressed on a truncated view for the same reason
+    # `no_canonical` is.
+    stray = [str(i) for i in unstamped_live_ids if str(i)]
+    if stray and not scroll_truncated:
+        reasons.append(
+            _reason(
+                'unstamped_cluster_member',
+                ids=stray,
+                detail=(
+                    'These ids are live members of the cluster but do not carry '
+                    f'`metadata.topic={topic!r}`, so the topic scroll cannot see '
+                    'them. Stamp them into the topic or delete them — an '
+                    'unstamped member is a member the next reader will not find.'
+                ),
+            )
+        )
+
     # --- the audited escape, applied LAST ---------------------------------- #
     reasons, waived = _apply_waivers(
         block,
@@ -558,3 +582,152 @@ def _apply_waivers(
             )
         )
     return kept, applied
+
+
+# --------------------------------------------------------------------------- #
+# The recon-side filing convention — a direct sibling of
+# ``predicate_contradiction.py``'s frozen-spec + as_submit_task_kwargs() +
+# build_*_task() + render_*_section() template.
+# --------------------------------------------------------------------------- #
+
+_GATE_EXECUTION_CLASS = 'operational'
+_GATE_OPERATIONAL_MODE = 'gate'
+
+
+@dataclass(frozen=True)
+class ConsolidationGateSpec:
+    """An assembled, not-yet-submitted consolidation gate.
+
+    ``as_submit_task_kwargs()`` returns a dict splattable directly into
+    ``mcp__fused-memory__submit_task`` (the caller adds ``project_root``),
+    matching ``predicate_contradiction.py::PredicateContradictionTask``.
+    """
+
+    title: str
+    description: str
+    priority: str
+    task_kind: str
+    metadata: dict[str, Any]
+
+    def as_submit_task_kwargs(self) -> dict[str, Any]:
+        """Return the submit_task keyword arguments for this gate."""
+        return {
+            'title': self.title,
+            'description': self.description,
+            'priority': self.priority,
+            'task_kind': self.task_kind,
+            'metadata': self.metadata,
+        }
+
+
+def _default_title(topic: str) -> str:
+    return f'Consolidation gate: topic {topic}'
+
+
+def _default_description(topic: str, rationale: str) -> str:
+    parts = [
+        'A memory consolidation reached an irreversible, content-losing '
+        'judgment call that must not be resolved silently. This is the human '
+        f'gate for topic `{topic}`.\n',
+        'The WORKING LIST is the live `metadata.topic` scroll for that topic — '
+        'never a hand-written member list. Any enumeration carried in this '
+        "task's metadata is inert provenance (`authoritative: false`) and "
+        'cannot make this gate closeable.\n',
+    ]
+    if rationale.strip():
+        parts.append(f'Judgment call: {rationale.strip()}\n')
+    parts.append(
+        'This gate CANNOT be closed while the live same-topic scroll shows the '
+        'cluster is not well-formed: `set_task_status(..., done)` re-runs the '
+        'check and refuses with the offending ids. Run '
+        '`scripts/check_consolidation_closure.py` to see the same verdict by '
+        'hand.\n'
+    )
+    parts.append(render_end_state_brief())
+    return '\n'.join(parts)
+
+
+def build_consolidation_gate_task(
+    *,
+    topic: str,
+    rationale: str = '',
+    observed_members: Sequence[str] = (),
+    report_run: str | None = None,
+    detector: str | None = None,
+    authoritative: bool = False,
+    considered_and_kept: Sequence[Mapping[str, Any]] = (),
+    priority: str = 'medium',
+    title: str | None = None,
+    description: str | None = None,
+) -> ConsolidationGateSpec:
+    """Build the ``operational`` + ``operational_mode='gate'`` consolidation gate.
+
+    PURE — no filesystem or network I/O.
+
+    The submission is a DETERMINISTIC PURE GATE: ``task_kind='deterministic'``
+    with ``always_escalates=True`` and no ``before_done``.  That combination is
+    not a stylistic choice — ``deterministic_task_guard`` invariant 2 rejects a
+    deterministic task that neither runs an action nor escalates, and invariant
+    3b rejects ``always_escalates`` on a normal task, so it is the only legal
+    shape for a pure human gate.  It is also exactly what
+    ``TaskInterceptor._inject_deterministic_pure_gate`` produces, so the
+    declared submission and the post-coercion task agree either way.  No
+    ``before_done`` is referenced: that coercion unconditionally pops one, and
+    ``docs/task-authoring.md`` records that ``before_done.kind='predicate'``
+    forbids ``always_escalates=True``, so a pure gate structurally cannot carry
+    one.
+
+    *observed_members* / *report_run* / *detector* are INERT PROVENANCE in leaf
+    kappa's (task 3136) report shape.  ``authoritative`` is hard-set to
+    ``False`` whatever the caller passes: the live topic scroll is the sole
+    working list, and provenance can only ever ADD a refusal (an id live but
+    never stamped into the topic), never grant a pass.  That is what makes
+    "inert" a structural property rather than a promise — pinned by the test
+    asserting :func:`evaluate_closure` returns an identical verdict with and
+    without it.  Contrast DF gate 3036, whose hand-written enumeration under an
+    invented ``metadata.memory_ids`` key was extended 7 to 8 by a later cycle
+    while it still defined "done".
+
+    Raises:
+        ValueError: if *topic* is not a well-formed topic slug.  Validated
+            through the shared :func:`is_valid_topic_slug` — one namespace,
+            shared with ``ProceduralTopicCluster.topic_id`` (PRD D4) — because
+            a gate filed against a topic the closure scroll could never match
+            would be permanently uncloseable.
+    """
+    if not is_valid_topic_slug(topic):
+        raise ValueError(
+            f'topic={topic!r} is not a well-formed topic slug, so the closure '
+            'scroll could never match its cluster and the gate would be '
+            'permanently uncloseable. Topics are lowercase alphanumeric '
+            'hyphen-separated (see fused_memory.topic_slug.is_valid_topic_slug '
+            '— one namespace shared with ProceduralTopicCluster.topic_id).'
+        )
+
+    gate_block: dict[str, Any] = {'topic': topic}
+    if considered_and_kept:
+        gate_block['considered_and_kept'] = [dict(e) for e in considered_and_kept]
+    if observed_members or report_run or detector:
+        gate_block['provenance'] = {
+            'report_run': report_run,
+            'observed_members': [str(m) for m in observed_members],
+            'detector': detector,
+            # Hard-set, never read from the caller: see the docstring.
+            'authoritative': False,
+        }
+
+    metadata: dict[str, Any] = {
+        'task_kind': 'deterministic',
+        'always_escalates': True,
+        'execution_class': _GATE_EXECUTION_CLASS,
+        'operational_mode': _GATE_OPERATIONAL_MODE,
+        GATE_METADATA_KEY: gate_block,
+    }
+
+    return ConsolidationGateSpec(
+        title=title or _default_title(topic),
+        description=description or _default_description(topic, rationale),
+        priority=priority,
+        task_kind='deterministic',
+        metadata=metadata,
+    )
