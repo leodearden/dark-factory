@@ -1521,6 +1521,46 @@ class TestDoneProvenanceSection:
         # git show failed → no files line
         assert 'files:' not in section
 
+    @pytest.mark.asyncio
+    async def test_merge_commit_reports_first_parent_file_list(self, tmp_path):
+        """Merge commits must report the files they actually brought in.
+
+        Plain ``git show --name-only`` on a merge commit shows git's COMBINED
+        diff, which lists only paths differing from ALL parents — empty for a
+        clean (conflict-free) merge. Measured against five real merge commits
+        in this repo's own history: bare ``git show --name-only`` returns 0
+        files where ``git show --name-only --first-parent -m`` returns the
+        real count:
+
+            47780f693d (Merge task/2737 into main): 0 vs 13
+            ca7459b0a9 (Merge task/4293 into main): 0 vs 23
+            c7dcc4f9d4 (Merge task/3543 into main): 0 vs 47
+            24a8729c5f (Merge task/4097 into main): 0 vs 9
+            3765f4587d (Merge task/3369 into main): 0 vs 8
+
+        This matters because the Stage-2 prompt
+        (fused_memory/reconciliation/prompts/stage2.py) gates
+        '"Task N shipped via <file>"' edges on exactly this ``files:`` list —
+        a blind list means Stage-2 either authors no shipped-via edges for a
+        merge, or (worse, when the merge resolved a conflict) authors them
+        against a misleading conflict-only subset naming files the task
+        never actually touched.
+        """
+        shas = self._init_repo_with_merge(tmp_path)
+
+        block = await _git_show_name_only(
+            ProjectRoot(str(tmp_path)), shas['merge'], max_files=50, max_chars=2000,
+        )
+
+        assert 'feature.py' in block
+        assert 'files:' in block
+        after_label = block.split('files:', 1)[1]
+        file_lines = [
+            ln.strip() for ln in after_label.splitlines()
+            if ln.strip() and not ln.strip().startswith('...')
+        ]
+        assert len(file_lines) >= 1
+
 
 class BaseStageValidationTest:
     """Shared infrastructure for stage validation test classes.
