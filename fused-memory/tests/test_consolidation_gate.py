@@ -15,14 +15,18 @@ rendered prose — NOT verbatim prompt-text equality — mirroring the
 from __future__ import annotations
 
 import dataclasses
+from pathlib import Path
 
 import pytest
 
 from fused_memory import memory_metadata
+from fused_memory.middleware.deterministic_task_guard import deterministic_task_error
+from fused_memory.middleware.execution_class_guard import execution_class_error
 from fused_memory.reconciliation import consolidation_gate
 from fused_memory.reconciliation.consolidation_gate import (
     GATE_METADATA_KEY,
     ClosureVerdict,
+    build_consolidation_gate_task,
     evaluate_closure,
     render_end_state_brief,
 )
@@ -535,3 +539,165 @@ class TestClosureAuditedEscape:
         )
         assert verdict.closed is False
         assert 'scroll_incomplete' in _codes(verdict)
+
+
+class TestBuildConsolidationGateTask:
+    """The recon-side filing convention, modelled on PredicateContradictionTask."""
+
+    def test_spec_is_a_frozen_dataclass(self):
+        spec = build_consolidation_gate_task(topic=_TOPIC)
+        assert dataclasses.is_dataclass(spec)
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            spec.title = 'x'
+
+    def test_as_submit_task_kwargs_is_exactly_the_submit_task_key_set(self):
+        """Splattable straight into submit_task, matching the sibling builder."""
+        kwargs = build_consolidation_gate_task(topic=_TOPIC).as_submit_task_kwargs()
+        assert set(kwargs) == {
+            'title',
+            'description',
+            'priority',
+            'task_kind',
+            'metadata',
+        }
+
+    def test_metadata_carries_the_topic_as_the_working_key(self):
+        meta = build_consolidation_gate_task(topic=_TOPIC).metadata
+        assert meta[GATE_METADATA_KEY]['topic'] == _TOPIC
+
+    def test_metadata_routes_through_the_pure_gate_path(self):
+        """execution_class + operational_mode are what make this a human gate,
+        and what the step-12 seam triggers on."""
+        meta = build_consolidation_gate_task(topic=_TOPIC).metadata
+        assert meta['execution_class'] == 'operational'
+        assert meta['operational_mode'] == 'gate'
+
+    def test_the_submission_satisfies_the_deterministic_pure_gate_invariant(self):
+        """A deterministic task with no before_done MUST always escalate, or
+        deterministic_task_guard rejects it as an ill-formed no-op."""
+        spec = build_consolidation_gate_task(topic=_TOPIC)
+        assert deterministic_task_error(
+            spec.task_kind, spec.metadata, str(Path.cwd())
+        ) is None
+        assert 'before_done' not in spec.metadata
+
+    def test_execution_class_is_accepted_for_a_recon_stage_filer(self):
+        """Enforcement fires only for a 'recon-stage-*' agent_id, which is
+        exactly who files these gates."""
+        spec = build_consolidation_gate_task(topic=_TOPIC)
+        assert (
+            execution_class_error(spec.metadata, 'recon-stage-2', str(Path.cwd()))
+            is None
+        )
+
+    @pytest.mark.parametrize(
+        'bad', ['Not A Slug', 'trailing-', 'has_underscore', '', 'UPPER', None]
+    )
+    def test_a_non_slug_topic_fails_loud_naming_it(self, bad):
+        """One namespace is shared with ProceduralTopicCluster.topic_id (D4);
+        a gate filed against an unmatched topic could never be closed because
+        the closure scroll would never find its cluster."""
+        with pytest.raises(ValueError) as exc:
+            build_consolidation_gate_task(topic=bad)
+        assert repr(bad) in str(exc.value) or str(bad) in str(exc.value)
+
+    def test_description_embeds_the_end_state_brief(self):
+        """The filed gate and the prompt cannot disagree about the target."""
+        spec = build_consolidation_gate_task(topic=_TOPIC)
+        assert render_end_state_brief() in spec.description
+
+    def test_title_and_description_are_overridable(self):
+        spec = build_consolidation_gate_task(
+            topic=_TOPIC, title='T', description='D'
+        )
+        assert spec.title == 'T' and spec.description == 'D'
+
+
+class TestInertProvenance:
+    """An enumeration is PROVENANCE, never the working list.
+
+    The prior plan made enumerations unconstructible, which collided head-on
+    with PRD leaf κ (task 3136), whose report framing gives gate metadata
+    ``{report_run, observed_members, detector, authoritative: false}``.
+    Accepting it as inert lets both compose.
+    """
+
+    def test_enumeration_is_stored_in_the_kappa_report_shape(self):
+        spec = build_consolidation_gate_task(
+            topic=_TOPIC,
+            observed_members=[_uuid(1), _uuid(2)],
+            report_run='run-abc',
+            detector='topic-cluster-scan',
+        )
+        prov = spec.metadata[GATE_METADATA_KEY]['provenance']
+        assert set(prov) == {
+            'report_run',
+            'observed_members',
+            'detector',
+            'authoritative',
+        }
+        assert prov['observed_members'] == [_uuid(1), _uuid(2)]
+        assert prov['report_run'] == 'run-abc'
+        assert prov['detector'] == 'topic-cluster-scan'
+
+    def test_authoritative_is_forced_false_even_when_the_caller_says_true(self):
+        """This is what makes 'inert' structural rather than aspirational."""
+        spec = build_consolidation_gate_task(
+            topic=_TOPIC, observed_members=[_uuid(1)], authoritative=True
+        )
+        assert spec.metadata[GATE_METADATA_KEY]['provenance']['authoritative'] is False
+
+    def test_no_provenance_block_when_nothing_was_enumerated(self):
+        spec = build_consolidation_gate_task(topic=_TOPIC)
+        assert 'provenance' not in spec.metadata[GATE_METADATA_KEY]
+
+    def test_provenance_never_grants_a_pass(self):
+        """THE inertness property: same live members, identical verdict with
+        and without a provenance list.
+
+        DF gate 3036's hand-written enumeration under an invented
+        `metadata.memory_ids` key was extended 7->8 by a later cycle while it
+        still defined 'done'. A list that cannot change the verdict cannot do
+        that.
+        """
+        members = [_member(_uuid(1)), _member(_uuid(2))]  # no canonical: refuses
+        bare = _closure(members, gate_block={'topic': _TOPIC})
+        with_prov = _closure(
+            members,
+            gate_block={
+                'topic': _TOPIC,
+                'provenance': {
+                    'report_run': 'run-abc',
+                    'observed_members': [_uuid(1), _uuid(2), _uuid(3)],
+                    'detector': 'topic-cluster-scan',
+                    'authoritative': False,
+                },
+            },
+        )
+        assert bare == with_prov
+
+    def test_provenance_can_still_ADD_a_refusal(self):
+        """A cluster member that is live but never got stamped into the topic
+        is the one thing provenance may contribute — a refusal, never a pass."""
+        stray = _uuid(42)
+        verdict = _closure(
+            _well_formed_cluster(2), unstamped_live_ids=[stray]
+        )
+        assert verdict.closed is False
+        named = [
+            r for r in verdict.reasons if r['code'] == 'unstamped_cluster_member'
+        ]
+        assert named and named[0]['ids'] == [stray]
+
+    def test_an_unstamped_member_is_absence_based_so_truncation_suppresses_it(self):
+        """Past the scroll cap, 'not stamped' and 'not seen' are the same."""
+        codes = _codes(
+            _closure(
+                _well_formed_cluster(2),
+                unstamped_live_ids=[_uuid(42)],
+                scroll_truncated=True,
+                scroll_total=2,
+            )
+        )
+        assert 'scroll_incomplete' in codes
+        assert 'unstamped_cluster_member' not in codes
