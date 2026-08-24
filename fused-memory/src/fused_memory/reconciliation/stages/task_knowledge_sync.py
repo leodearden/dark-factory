@@ -4641,7 +4641,7 @@ async def _git_show_name_only(
     max_files: int,
     max_chars: int,
 ) -> str:
-    """Run ``git show --name-only --format=%H%n%ai%n%s <commit>`` and truncate.
+    """Run ``git show --name-only --format=%H%n%ai%n%s --first-parent -m <commit>`` and truncate.
 
     Returns a short text block:
 
@@ -4652,6 +4652,20 @@ async def _git_show_name_only(
           path/to/file1
           path/to/file2
           ... (N more)
+
+    Passes ``--first-parent -m`` so a no-ff merge commit reports the files it
+    actually brought in. Without these flags, git shows a merge commit's
+    COMBINED diff — the paths differing from ALL parents — which is EMPTY for
+    a clean merge and a misleading conflict-resolution-only subset for a
+    merge that resolved a conflict. The Stage-2 prompt
+    (``fused_memory/reconciliation/prompts/stage2.py``) gates "Task N shipped
+    via <file>" edges on exactly this ``files:`` list, so a blind or
+    misleading list let Stage-2 author edges naming files a task never
+    touched. Mirrors the sibling
+    ``scripts/audit_found_on_main_provenance.py::_git_show_files``, which
+    documents the same fix for the same reason. ``--first-parent -m`` is a
+    verified no-op for an ordinary single-parent commit, so this is a strict
+    improvement over the prior invocation.
 
     Returns an empty string on subprocess failure — the caller still emits the
     commit SHA header, just without the file list. We deliberately don't raise
@@ -4666,6 +4680,8 @@ async def _git_show_name_only(
             '--name-only',
             '--format=%H%n%ai%n%s',
             '--no-color',
+            '--first-parent',
+            '-m',
             commit,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
