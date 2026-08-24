@@ -165,6 +165,14 @@ class TerminalOutcomeRecord:
     """Generation of the merge request that produced this record (γ2 provenance)."""
     reason: str | None = field(default=None, kw_only=True)
     """MergeOutcome.reason for failure outcomes (empty string normalized to None)."""
+    landed_via_chain: int | None = field(default=None, kw_only=True)
+    """Mirrors :attr:`MergeOutcome.landed_via_chain` (task 3186 δ) — ``1`` when
+    a deep merge-ahead chain walk landed this item, else None.
+
+    Carried here because this ring and the ``merge_finalized`` row are two
+    tiers of ONE record: the ring is documented as lossless on eviction
+    precisely because an evicted id falls through to the durable row, so a
+    field on one tier and not the other would break that equivalence."""
 
 
 class TerminalOutcomeRetention:
@@ -969,6 +977,24 @@ class MergeOutcome:
     INDETERMINATE (evidence exists) emits a row, a skipped or fail-open one
     (nothing gathered) emits none. ``None`` for callers that do not populate
     it."""
+    landed_via_chain: int | None = None
+    """``1`` on an item landed by a deep merge-ahead chain walk (task 3186 δ);
+    ``None`` for every ordinary sequential landing — the "iff landed by a chain
+    walk" half of the PRD contract.  Each of the k items a walk lands carries
+    its own ``1``, so a walk contributes exactly k.
+
+    THE UNIT IS PINNED BY A COMMITTED CONSUMER, not by prose.
+    ``scripts/merge-deep-canary-predicate.sh:89-91`` already computes
+    ``items_per = sum(landed_via_chain over all merge_finalized) / n_deep``
+    and calls the result "items landed per deep verify run".  That arithmetic
+    is only correct if the per-walk contributions SUM to the number of items
+    the walk landed — which ``1``-per-landed-item satisfies by construction.
+    Stamping the chain size k on every one of k items would report k²/n_deep
+    instead, and stamping 1-indexed positions would report k(k+1)/2; η1's
+    filter (``isinstance(..., int) and >= 1``) is also why a walk that lands
+    nothing emits no value at all rather than a ``0``.  See
+    test_merge_queue_deep_landing.py, which asserts the encoding through a
+    verbatim transcription of that predicate rather than restating it."""
 
 
 @dataclass
