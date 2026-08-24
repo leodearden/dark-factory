@@ -4333,6 +4333,63 @@ class TaskWorkflow:
         )
         return WorkflowOutcome.REQUEUED
 
+    async def _repend_for_requeue(self) -> WorkflowOutcome | None:
+        """Write ``pending`` so a REQUEUED exit is TRUTHFUL, returning a terminal
+        override outcome when the row turns out to be terminal, else ``None``.
+
+        The single choke point for the two requeue exits that historically
+        returned ``WorkflowOutcome.REQUEUED`` with NO status write —
+        ``_drive()``'s ``except WarmLaneRequeue`` clause and
+        ``_handle_soft_cancel``'s spurious-wakeup fallback (PRD γ3 / D6).
+        Leaving the row ``in-progress`` there is not merely imprecise: the
+        harness's slot ``finally`` nulls the claimant immediately afterwards,
+        producing exactly the ``(in-progress, NULL claimant)`` shape
+        ``shared.task_claimant.is_stranded`` is defined to detect, so a
+        transient capacity signal degenerates into a strand recoverable only
+        by the stranded sweep — which refuses to act while ANY escalation is
+        open. Ordering therefore matters: the write must land BEFORE the
+        caller returns. Same helper-per-family precedent as
+        ``_requeue_on_lock_conflict`` above; the write itself is the one
+        already used by ``_plan()``'s plan-lock requeue and the
+        blocking-dependency requeue.
+
+        Rejection handling (INV-4). ``Scheduler.set_task_status`` already owns
+        the transient retry loop and raises ``SetTaskStatusRejected`` only for
+        NON-transient, logically-refused writes, so a rejection arriving here
+        is by construction post-retry — a caller-level re-retry would be dead
+        code that only delays the loud signal. What remains is to classify it:
+
+        * ``TerminalExitRejection`` — the row is terminal; defer to
+          ``_observed_terminal_outcome(exc.old_status)`` and return its
+          verdict, which the caller returns INSTEAD of REQUEUED (a terminal
+          row wins over a requeue intent). Bypass-done discrimination is
+          deliberately NOT performed here: introducing phantom-done policy on
+          a requeue path would be new policy surface, and the any-level
+          dispatch gate already owns done-legitimacy.
+        * anything else — log at ERROR and return ``None``. The caller keeps
+          its REQUEUED exit and the row stays ``in-progress``, which
+          ``_OUTCOME_ALLOWED['requeued']`` still permits today; task θ's
+          narrowing of that row to ``{PENDING}`` is what will make this case
+          loud at ``run()``'s SM-2 check, and that is the correct owner.
+
+        This helper must NEVER re-raise: both call sites sit OUTSIDE
+        ``_drive()``'s ``except SetTaskStatusRejected`` handler (the
+        ``WarmLaneRequeue`` clause is its SIBLING; ``_handle_soft_cancel``
+        runs from ``run()``'s ``except WorkflowCancelled``), so an escaping
+        rejection would leave ``run()`` entirely uncaught.
+        """
+        try:
+            await self.scheduler.set_task_status(self.task_id, 'pending')
+        except TerminalExitRejection as exc:
+            return self._observed_terminal_outcome(exc.old_status)
+        except SetTaskStatusRejected as exc:
+            logger.error(
+                'Task %s: re-pend before requeue REJECTED (%s — %s); exiting '
+                'REQUEUED with the row left in-progress',
+                self.task_id, exc.error_code, exc.raw,
+            )
+        return None
+
     async def _plan(self) -> WorkflowOutcome:
         """Invoke the architect to produce a plan."""
         assert self.worktree is not None and self.artifacts is not None
