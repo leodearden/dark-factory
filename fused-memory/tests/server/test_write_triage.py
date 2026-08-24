@@ -445,6 +445,33 @@ class TestDecideBand:
         assert d.outcome == OUTCOME_RESTATED
         assert d.canonical_id == 'm1'
 
+    def test_a_topic_anchored_pin_never_wins_over_a_scored_candidate(self) -> None:
+        """A pinned canonical is a SPENT slot, never a routing target.
+
+        Topic anchoring (task 3111) promotes a cluster's canonical to the head
+        of a search window without widening it, and deliberately stamps NO
+        `metadata['store_score']` on the pin (`services/topic_anchor.py`) —
+        a missing cosine means NOT COMPARABLE, so the pin can never qualify at
+        any threshold. `retrieve_candidates` therefore passes
+        `anchor_topics=False`, but this asserts the OTHER half of the
+        contract: if that opt-out is ever reverted, a pin arriving at the head
+        of the candidate set must still not change where the write routes.
+
+        Otherwise the failure would be invisible here and only show up as
+        quietly-worse recall in production — the eviction is a routing change,
+        so it is asserted as one.
+        """
+        results = [
+            # Pin shape: promoted to the head of the window, no store_score.
+            _result('pinned-canonical', None, omit_store_score=True),
+            _result('m1', 0.62),
+            _result('m2', 0.97),
+        ]
+        d = decide_band(results, t_high=T_HIGH, t_low=T_LOW)
+        assert d.canonical_id == 'm2', 'the max SCORED cosine must win, never the pin'
+        assert d.outcome == OUTCOME_RESTATED
+        assert d.similarity == pytest.approx(0.97)
+
     def test_the_decision_quotes_the_numbers_that_produced_it(self) -> None:
         """Inspectable, so the ack can say WHY without recomputing anything."""
         d = decide_band([_result('m1', 0.97)], t_high=T_HIGH, t_low=T_LOW)
@@ -562,6 +589,42 @@ class TestRetrieveCandidates:
         assert kwargs['project_id'] == 'dark_factory'
         assert kwargs['stores'] == ['mem0']
         assert kwargs['limit'] == 20
+        assert kwargs['anchor_topics'] is False
+
+    @pytest.mark.asyncio
+    async def test_topic_anchored_recall_is_opted_out_of(self) -> None:
+        """`anchor_topics=False` is a CORRECTNESS pin, not a style preference.
+
+        Topic anchoring (task 3111) is a PROMOTION, not an addition: the
+        returned window stays exactly `limit` long, so every pinned canonical
+        EVICTS the lowest-ranked genuine hit. `MemoryService.search`'s own
+        docstring names this caller class and mandates the opt-out — a
+        consumer that thresholds and post-filters its window must pass False
+        or silently lose genuine candidates to displacement.
+
+        The eviction is not merely a wash here, it is a pure loss: a pinned
+        canonical deliberately carries NO `metadata['store_score']`
+        (`services/topic_anchor.py`), and `decide_band` drops every candidate
+        whose cosine is non-numeric — so a pin can never qualify at ANY
+        threshold. Each pin is therefore a candidate slot spent on a record
+        triage is structurally required to ignore, on exactly the consolidated
+        topics where pins exist.
+
+        Three landed sibling consumers already opt out for the same reason,
+        all of them candidate-set/idempotency consumers exactly like this one:
+        `reconciliation/mem0_dedup.py`, `reconciliation/stages/
+        task_knowledge_sync.py`, and the retired near-duplicate write guard in
+        `server/tools.py`, whose call-site comment explains this hazard
+        verbatim.
+
+        The default is True, so the omission is silent and degrades in the
+        WRONG direction — nothing errors, the window is merely quietly worse.
+        That is why it is pinned explicitly rather than left to the default.
+        """
+        service = self._service()
+        await retrieve_candidates(service, 'c', 'p', 20)
+
+        assert service.search.await_args.kwargs['anchor_topics'] is False
 
     @pytest.mark.asyncio
     async def test_the_categories_are_every_mem0_primary_category(self) -> None:
