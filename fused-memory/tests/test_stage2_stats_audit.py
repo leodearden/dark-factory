@@ -838,3 +838,228 @@ class TestPostFlightRepairIsCorroborated:
 
         assert report.stats['tasks_created'] == 1
         assert stub.calls == [('77', '/repo/reify')]
+
+
+# ── step-9: loud degradation when corroboration cannot run ───────────────────
+
+_UNCORROBORATED_EVENT = 'reconciliation.stage2_task_created_records_uncorroborated'
+
+
+def _uncorroborated_warnings(caplog) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno == logging.WARNING and _UNCORROBORATED_EVENT in r.getMessage()
+    ]
+
+
+def _two_records() -> list[dict]:
+    return [
+        {'action': 'task_created', 'task_id': '3045', 'status': 'created',
+         'project_id': 'dark_factory'},
+        {'action': 'task_created', 'task_id': '3046', 'status': 'created',
+         'project_id': 'dark_factory'},
+    ]
+
+
+class TestPostFlightLoudDegradation:
+    """A withheld repair must be LOUD, never silent (task 3051).
+
+    Fail-closed corroboration trades one invisible failure (an inflated
+    counter) for another — a lost repair — unless the withholding is
+    reported. Per the project's loud-over-silent-degradation norm and the
+    no-silent-fail-soft design invariant, every configuration in which
+    corroboration cannot run publishes the full record-stat split AND emits a
+    WARNING distinct from the undercount-repair one, so an operator can tell
+    "the agent invented records" from "we could not check".
+    """
+
+    def _degraded_stages(self):
+        """The three ways corroboration can fail to confirm anything."""
+        no_taskmaster = _make_stage(known_projects=_KNOWN_PROJECTS)
+        no_taskmaster.taskmaster = None
+
+        no_projects = _make_stage(taskmaster=_StubTaskmaster())
+        assert no_projects.known_projects == {}
+
+        all_raise = _make_stage(
+            known_projects=_KNOWN_PROJECTS,
+            taskmaster=_StubTaskmaster(default=RuntimeError('backend down')),
+        )
+        return {
+            'no-taskmaster': no_taskmaster,
+            'empty-known-projects': no_projects,
+            'every-lookup-raises': all_raise,
+        }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'which', ['no-taskmaster', 'empty-known-projects', 'every-lookup-raises'],
+    )
+    async def test_no_repair_and_the_self_report_stands(self, which):
+        stage = self._degraded_stages()[which]
+        report = _make_report({
+            'tasks_created': '1',
+            'task_created_records': _two_records(),
+        })
+
+        await stage._apply_post_flight_guards(report, [], 'test-run-3051')
+
+        # Coerced (str -> int) but never repaired upward from the records.
+        assert report.stats['tasks_created'] == 1
+        assert isinstance(report.stats['tasks_created'], int)
+        assert 'tasks_created_reported' not in report.stats
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'which', ['no-taskmaster', 'empty-known-projects', 'every-lookup-raises'],
+    )
+    async def test_every_valid_record_is_accounted_for(self, which):
+        """The withheld repair is visible: all four record stats are present
+        and the three corroboration buckets partition the valid records."""
+        stage = self._degraded_stages()[which]
+        report = _make_report({
+            'tasks_created': 0,
+            'task_created_records': _two_records(),
+        })
+
+        await stage._apply_post_flight_guards(report, [], 'test-run-3051')
+
+        valid = report.stats['task_created_records_valid']
+        assert valid == 2
+        assert report.stats['task_created_records_corroborated'] == 0
+        buckets = (
+            report.stats['task_created_records_uncorroborated']
+            + report.stats['task_created_records_unresolvable']
+        )
+        assert buckets == valid
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'which', ['no-taskmaster', 'empty-known-projects', 'every-lookup-raises'],
+    )
+    async def test_exactly_one_distinct_warning_names_the_run_and_the_shortfall(
+        self, which, caplog,
+    ):
+        """One WARNING per cycle, under an event name distinct from
+        stage2_tasks_created_undercount, carrying run_id, project_id and the
+        number of records that could not be corroborated."""
+        stage = self._degraded_stages()[which]
+        report = _make_report({
+            'tasks_created': 0,
+            'task_created_records': _two_records(),
+        })
+
+        with caplog.at_level(logging.WARNING, logger=_REPAIR_LOGGER):
+            await stage._apply_post_flight_guards(report, [], 'test-run-3051')
+
+        warnings = _uncorroborated_warnings(caplog)
+        assert len(warnings) == 1
+        assert 'test-run-3051' in warnings[0]
+        assert _TEST_PROJECT_ID in warnings[0]
+        assert '2' in warnings[0]
+        assert _undercount_warnings(caplog) == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'which', ['no-taskmaster', 'empty-known-projects', 'every-lookup-raises'],
+    )
+    async def test_the_rest_of_the_guard_still_runs(self, which):
+        """Degradation is confined to the tasks_created repair: the guard does
+        not raise and still normalizes the flag counters and publishes the
+        marker-acknowledgment count."""
+        stage = self._degraded_stages()[which]
+        report = _make_report({'task_created_records': _two_records()})
+
+        await stage._apply_post_flight_guards(report, [], 'test-run-3051')
+
+        assert report.stats['stage1_analytical_findings_processed'] == 0
+        assert report.stats['stage1_mem0_flags_processed'] == 0
+        assert report.stats['stage2_flag_markers_acknowledged'] == 0
+
+    @pytest.mark.asyncio
+    async def test_no_warning_when_there_is_nothing_to_corroborate(self, caplog):
+        """The WARNING fires only when a structurally-valid record failed to
+        corroborate — an empty/absent record list is not a degradation."""
+        stage = _make_stage(known_projects=_KNOWN_PROJECTS)
+        stage.taskmaster = None
+        report = _make_report({'tasks_created': 0, 'task_created_records': []})
+
+        with caplog.at_level(logging.WARNING, logger=_REPAIR_LOGGER):
+            await stage._apply_post_flight_guards(report, [], 'test-run-3051')
+
+        assert _uncorroborated_warnings(caplog) == []
+
+    @pytest.mark.asyncio
+    async def test_no_warning_when_every_record_corroborates(self, caplog):
+        stub = _StubTaskmaster(results={
+            ('3045', '/repo/df'): _task_record('3045'),
+            ('3046', '/repo/df'): _task_record('3046'),
+        })
+        stage = _make_stage(known_projects=_KNOWN_PROJECTS, taskmaster=stub)
+        report = _make_report({'tasks_created': 2, 'task_created_records': _two_records()})
+
+        with caplog.at_level(logging.WARNING, logger=_REPAIR_LOGGER):
+            await stage._apply_post_flight_guards(report, [], 'test-run-3051')
+
+        assert report.stats['task_created_records_corroborated'] == 2
+        assert _uncorroborated_warnings(caplog) == []
+
+    @pytest.mark.asyncio
+    async def test_partial_corroboration_repairs_and_warns_about_the_remainder(
+        self, caplog,
+    ):
+        """Both WARNINGs can legitimately fire in one cycle: the repair moved
+        up to what WAS confirmed, and the rest is reported as unconfirmed."""
+        stub = _StubTaskmaster(results={('3045', '/repo/df'): _task_record('3045')})
+        stage = _make_stage(known_projects=_KNOWN_PROJECTS, taskmaster=stub)
+        report = _make_report({'tasks_created': 0, 'task_created_records': _two_records()})
+
+        with caplog.at_level(logging.WARNING, logger=_REPAIR_LOGGER):
+            await stage._apply_post_flight_guards(report, [], 'test-run-3051')
+
+        assert report.stats['tasks_created'] == 1
+        assert len(_undercount_warnings(caplog)) == 1
+        assert len(_uncorroborated_warnings(caplog)) == 1
+
+
+class TestPostFlightFlagCountersAreNeverClamped:
+    """Audit conclusion for the adjacent flag counters, as executable behaviour.
+
+    ``prompts/stage2.py`` claimed the framework clamps
+    ``stage1_mem0_flags_processed`` against ``flag_deleted_records`` and
+    ``stage1_analytical_findings_processed`` against
+    ``len(prior_reports[0].items_flagged)``. Neither clamp has existed since
+    tasks 2229/2230 (W5-mu) — ``_apply_post_flight_guards`` only
+    ``setdefault``-normalizes both keys. These pins keep that true (and are
+    what makes the step-11 prompt correction verifiable in code rather than
+    prose).
+    """
+
+    @pytest.mark.asyncio
+    async def test_self_reported_flag_counters_survive_untouched(self):
+        stage = _make_stage(known_projects=_KNOWN_PROJECTS, taskmaster=_StubTaskmaster())
+        prior = _make_report({})
+        prior.items_flagged = [{'id': str(i)} for i in range(4)]
+        report = _make_report({
+            'stage1_analytical_findings_processed': 1,
+            'stage1_mem0_flags_processed': 5,
+            'flag_deleted_records': [
+                {'action': 'flag_deleted', 'flag_id': f'flag-{i}'} for i in range(2)
+            ],
+        })
+
+        await stage._apply_post_flight_guards(report, [prior], 'test-run-3051')
+
+        assert report.stats['stage1_analytical_findings_processed'] == 1
+        assert report.stats['stage1_mem0_flags_processed'] == 5
+
+    @pytest.mark.asyncio
+    async def test_absent_flag_counters_default_to_zero(self):
+        stage = _make_stage(known_projects=_KNOWN_PROJECTS, taskmaster=_StubTaskmaster())
+        report = _make_report({})
+
+        await stage._apply_post_flight_guards(report, [], 'test-run-3051')
+
+        assert report.stats['stage1_analytical_findings_processed'] == 0
+        assert report.stats['stage1_mem0_flags_processed'] == 0
