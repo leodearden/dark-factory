@@ -5,8 +5,8 @@ machine-readable twin: `docs/prds/landed-not-done-recovery.capability-manifest.y
 
 Mechanises G3 + G6 per leaf: every capability each task's signal asserts, bound to evidence, so a
 dispatch-time architect diffs intent against substrate instead of re-deriving the check.
-**68 capabilities across 8 labels — 61 PASS, 4 OPEN, 3 FAIL.** 29 mechanical `delivered_check`s
-(copied into producer `metadata.delivered_checks` at `commit_planning`), 39 `manual` (recorded here,
+**73 capabilities across 8 labels — 66 PASS, 4 OPEN, 3 FAIL.** 31 mechanical `delivered_check`s
+(copied into producer `metadata.delivered_checks` at `commit_planning`), 42 `manual` (recorded here,
 excluded from the dispatch gate).
 
 ## The three FAIL bindings, and how each was discharged
@@ -134,12 +134,29 @@ are all keyed `IN_PROGRESS`; η owns `pending`/`merge-deferred`, filtered out at
 and never reaching `_RECOVERY`; landed `blocked` is β's. That proof binds 3539 *structurally* — η's
 own actor sits outside `_RECOVERY` and `_RECONCILE_SWEEP_STATUSES`, so on η's side the boundary is
 convention with no automated check. The *"something re-pended it"* question is **answered**: it is the
-mark-done applier's own reject arm (`harness.py:5715-5723`), so η need not hunt a re-pender — but the
+mark-done applier's own reject arm (`harness.py:5715-5731`), so η need not hunt a re-pender — but the
 same decayed-evidence reject is why δ is a hard prereq. Two claims made when this was ruled do **not**
 survive re-measurement: `done` is not an absorbing state (`shared/task_transitions.py:222`), and the
 3539→β adjacency is not a handoff that completes — a converted task arrives blocked still pinned on
 `task_failure`, which β's narrowed veto does not admit, so it rests there until a human closes the
 record. Tasks 4645 and 3539 were corrected accordingly on 2026-08-24.
+
+**Recheck 2026-08-24 (PRD correction 11) — five new bindings on η.** The asymmetry flagged above is
+now closed on η's side: two `grep` checks pin the write filter to a single-line
+`_LANDED_RECONCILE_STATUSES` frozenset whose members are drawn only from `{pending, merge-deferred}`,
+and to that constant actually being *consulted*. Both were exercised against positive and negative
+fixtures before filing — the membership pattern rejects `{'pending','blocked'}`,
+`{'in-progress','merge-deferred'}` and any three-member set, and the use pattern cannot be satisfied
+by the declaration line. Three `manual` bindings record what no pattern can express: η is **not** the
+sole `done`-writer over its population (`reconcile_landed_row` RC-2 at `merge_queue.py:6685` reaches
+`pending`; `redrive_member`/`mark_member_done` at `harness.py:1330`/`:1270` reach `merge-deferred`),
+and `metadata.train` is not what separates them — it is written only by the off-by-default atomic-train
+former (`workflow.py:1954-1956`), while a coalesce member carries none; the real separator is liveness
+of the `GroupMergeRequest`. `_mark_in_progress_done` (`harness.py:6239`) carries **no** capability
+guard of its own — all four callers apply `_delivered_checks_block` (`:6193`) first — and
+`classify_pins(...).vetoes_done_flip` (`harness.py:11648`, `info` carved out at
+`escalation/src/escalation/pins.py:237-238`) must be honoured, with 3 live vetoing specimens and 2
+`info`-only controls measured on `ea876cb624`.
 
 ### θ — the integration gate (leaf; prereqs β, γ, ε, η, 4496)
 A genuine DAG sink. Two rows are currently vacuous-by-construction, which is the honest false-before
