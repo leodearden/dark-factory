@@ -361,6 +361,49 @@ _ESCALATION_CATEGORY = 'mcp_markup_residue'
 _ESCALATION_OWNER = 'l2-escalation-watcher'
 _ESCALATION_LEVEL = 2
 
+# --- The record vocabulary every sink dispatches on (INV-5) ----------------
+#
+# PUBLIC and exported, because these names are read at the OTHER end of the
+# injected-sink boundary: every concrete sink branches on ``error_type`` to
+# decide which record it is holding. Spelling them at each sink is how the two
+# ends drift — a rename here would leave every sink silently taking its
+# fall-through branch, which for the residue kinds means filing a
+# maximum-severity escalation carrying an empty payload. Named once here, the
+# rename is a single edit and an import error rather than a quiet mis-file.
+
+#: A call REFUSED because the leaked fragment's boundary could not be found.
+MARKUP_UNREPAIRABLE_ERROR_TYPE = 'mcp_markup_unrepairable'
+
+#: A call FORWARDED lossily: one recovered slice could not be typed against its
+#: declared schema, so it was dropped from the call and preserved instead.
+#: FORWARD_REPAIR only — see :meth:`MarkupGuardMiddleware._preserve_unrecovered`.
+MARKUP_UNRECOVERED_PARAM_ERROR_TYPE = 'mcp_markup_unrecovered_param'
+
+#: Every kind that carries a ``raw_value`` a sink must PRESERVE. A sink matches
+#: this set rather than one name, so the kind added above cannot fall through a
+#: sink written when only the refusal kind existed.
+MARKUP_RESIDUE_ERROR_TYPES = frozenset({
+    MARKUP_UNREPAIRABLE_ERROR_TYPE,
+    MARKUP_UNRECOVERED_PARAM_ERROR_TYPE,
+})
+
+#: A rate alarm about the window, carrying no payload of its own.
+MARKUP_STORM_ERROR_TYPE = 'mcp_markup_storm'
+
+#: The queue CATEGORY a boundary guard's burst alarm is filed under — one
+#: spelling for every ``MarkupGuardMiddleware`` registration site, because a
+#: burst on the escalation server and a burst on verdict-tools are the same
+#: alarm class about the same harness leak, and an operator query or dashboard
+#: filter keyed on one must not silently miss the others. The middleware itself
+#: files nothing, so this is declared here purely so a FOURTH registration site
+#: inherits the name instead of minting a fifth spelling.
+#:
+#: ``fused_memory.server.markup_tripwire``'s ``mcp_markup_write_storm`` is
+#: DELIBERATELY not this: that tripwire fires at memory-WRITE time on content
+#: that already landed, not at an MCP tool boundary, so it is a different
+#: condition an operator triages differently.
+MARKUP_BOUNDARY_STORM_CATEGORY = 'mcp_markup_boundary_storm'
+
 #: Surfaced on the FORWARDED call, whose caller is NOT bounced and would
 #: otherwise have no way to learn that its arguments were altered.
 _FORWARD_HINT = (
@@ -622,6 +665,43 @@ class MarkupGuardMiddleware(Middleware):
 
         return _text('agent_id'), _text('project_root') or _text('project_id')
 
+    @staticmethod
+    def _subject(arguments: Mapping[str, Any]) -> tuple[str | None, str | None]:
+        """The ``(task_id, agent_role)`` the CALLER declared about itself.
+
+        A SECOND, disjoint attribution axis from :meth:`_identity`, added
+        because the first one comes back empty on exactly the servers whose
+        surfaces carry the answer. Measured: a real leaked ``escalate_info``
+        sent with ``task_id='9999'`` / ``agent_role='implementer-9999'`` filed
+        a residue record naming neither, because no tool on the escalation
+        server declares ``agent_id`` / ``project_root`` / ``project_id`` —
+        so a CRITICAL, level-2 record whose own suggested_action says "recover
+        the raw_value for the caller" named a caller no operator could
+        determine. The payload was preserved and unroutable.
+
+        ``task_id`` and ``agent_role`` are read because they are what the
+        escalation surface (``escalate_info`` / ``escalate_blocker``) and the
+        orchestrator's tool surfaces actually declare, and both are REQUIRED
+        parameters there — so on the servers where this resolves at all, it
+        resolves for every call rather than for a lucky subset.
+
+        Kept SEPARATE from ``_identity`` rather than folded into it, and the
+        distinction is not cosmetic: ``_identity`` answers "which agent process
+        is leaking", which is what the storm counter keys on and what an
+        operator chasing the harness bug needs; this answers "whose data is in
+        this record", which is what an operator RETURNING the payload needs.
+        A record can legitimately have one and not the other.
+
+        Same narrow rules as ``_identity``: arguments only, non-string values
+        yield ``None``, and nothing is guessed or defaulted — an unattributed
+        record is better than a confidently misattributed one.
+        """
+        def _text(key: str) -> str | None:
+            value = arguments.get(key)
+            return value if isinstance(value, str) else None
+
+        return _text('task_id'), _text('agent_role')
+
     # -- schema resolution ------------------------------------------------
 
     @staticmethod
@@ -691,7 +771,10 @@ class MarkupGuardMiddleware(Middleware):
                 outcome=_OUTCOME_UNREPAIRABLE, misclose=None, recovered=(),
             )
             storm = await self._record_storm(_OUTCOME_UNREPAIRABLE, identity[1])
-            await self._refuse_unrepairable(name, identity, param, value, pattern, storm)
+            await self._refuse_unrepairable(
+                name, identity, self._subject(arguments),
+                param, value, pattern, storm,
+            )
 
         # ONE application point, serving BOTH tiers. The recovered map is typed
         # against the invoked tool's live schema here, before either policy
@@ -761,7 +844,8 @@ class MarkupGuardMiddleware(Middleware):
         residue_id = None
         if unrecovered:
             residue_id = await self._preserve_unrecovered(
-                name, identity, param, pattern, unrecovered,
+                name, identity, self._subject({**arguments, **fix.recovered}),
+                param, pattern, unrecovered,
             )
         return await self._forward(
             context, call_next, arguments, param, fix, storm,
@@ -946,7 +1030,7 @@ class MarkupGuardMiddleware(Middleware):
             return
         await self._call_sink(
             self._escalation_sink,
-            {'error_type': 'mcp_markup_storm', **storm},
+            {'error_type': MARKUP_STORM_ERROR_TYPE, **storm},
             'escalation',
         )
 
@@ -963,7 +1047,7 @@ class MarkupGuardMiddleware(Middleware):
         return payload
 
     async def _refuse_unrepairable(
-        self, name, identity, param, value, pattern, storm
+        self, name, identity, subject, param, value, pattern, storm
     ) -> NoReturn:
         """ONE refusal, shared by both tiers, when the boundary is a guess.
 
@@ -990,8 +1074,9 @@ class MarkupGuardMiddleware(Middleware):
         # leaking — an operator reading one and acting on the other would
         # otherwise be chasing two different callers.
         agent_id, project = identity
+        subject_task_id, subject_agent_role = subject
         escalation_id = await self._file_residue_escalation({
-            'error_type': 'mcp_markup_unrepairable',
+            'error_type': MARKUP_UNREPAIRABLE_ERROR_TYPE,
             'category': _ESCALATION_CATEGORY,
             # INV-7: a machine-readable owner plus a bound. This hold is a
             # queue-backed handoff to a supervised consumer, so the bound is
@@ -1004,6 +1089,12 @@ class MarkupGuardMiddleware(Middleware):
             'matched_pattern': pattern,
             'agent_id': agent_id,
             'project': project,
+            # WHOSE call leaked, as the caller itself declared it. Distinct
+            # from agent_id/project above, which answer "which process is
+            # leaking"; these answer "who is waiting on this data", and on the
+            # escalation surface they are the only two that resolve at all.
+            'subject_task_id': subject_task_id,
+            'subject_agent_role': subject_agent_role,
             # FULL and VERBATIM, deliberately unlike build_markup_block's
             # 200-char content_excerpt. That excerpt is a diagnostic sitting
             # beside a payload the caller still holds; this is the only
@@ -1028,7 +1119,7 @@ class MarkupGuardMiddleware(Middleware):
                 'whose own boundary cannot be determined, so no repair was '
                 'attempted.'
             ),
-            'error_type': 'mcp_markup_unrepairable',
+            'error_type': MARKUP_UNREPAIRABLE_ERROR_TYPE,
             'outcome': _OUTCOME_UNREPAIRABLE,
             'tool': name,
             'field': param,
@@ -1085,7 +1176,8 @@ class MarkupGuardMiddleware(Middleware):
         return escalation_id
 
     async def _preserve_unrecovered(
-        self, name, identity, param, pattern, unrecovered: Mapping[str, str],
+        self, name, identity, subject, param, pattern,
+        unrecovered: Mapping[str, str],
     ) -> str | None:
         """Queue the slices FORWARD_REPAIR dropped, so nothing is destroyed.
 
@@ -1106,6 +1198,7 @@ class MarkupGuardMiddleware(Middleware):
         runs on a path whose outcome (forward) is already decided.
         """
         agent_id, project = identity
+        subject_task_id, subject_agent_role = subject
         residue_id = None
         for field, raw in sorted(unrecovered.items()):
             residue_id = await self._file_residue_escalation({
@@ -1113,7 +1206,7 @@ class MarkupGuardMiddleware(Middleware):
                 # differ in the one way that matters to whoever reads the queue:
                 # this call SUCCEEDED, lossily, and no caller was bounced — so
                 # nobody is waiting on a retry, and nobody was told.
-                'error_type': 'mcp_markup_unrecovered_param',
+                'error_type': MARKUP_UNRECOVERED_PARAM_ERROR_TYPE,
                 'category': _ESCALATION_CATEGORY,
                 'owner': _ESCALATION_OWNER,
                 'level': _ESCALATION_LEVEL,
@@ -1122,6 +1215,11 @@ class MarkupGuardMiddleware(Middleware):
                 'matched_pattern': pattern,
                 'agent_id': agent_id,
                 'project': project,
+                # Same two axes as the refusal record carries, for the same
+                # reason: nobody was BOUNCED on this path, so the subject is
+                # the only route back to a caller that was never told.
+                'subject_task_id': subject_task_id,
+                'subject_agent_role': subject_agent_role,
                 'raw_value': raw,
                 'summary': (
                     f'Recovered {name}.{field} could not be typed against its '
