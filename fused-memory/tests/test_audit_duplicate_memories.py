@@ -5170,7 +5170,10 @@ def _span_days(earlier: str, later: str) -> float:
 # below read `{sentinel}` no matter what the clauses say. The values are
 # unforgeable for a second reason too: `<` and `>` are outside
 # `_LIVE_FIELD_SCAN_RE`'s bare value class, so no content can produce them.
-_SENTINEL_CORE_FACT = 'status=<sentinel-one>|status=<sentinel-two>'
+_SENTINEL_CORE_FACT = (
+    'claimant_run_id=<sentinel>|heartbeat_at=<sentinel>|'
+    'status=<sentinel-one>|status=<sentinel-two>'
+)
 
 
 class TestLivenessSnapshotSubjectFacts:
