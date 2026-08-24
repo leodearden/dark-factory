@@ -17,6 +17,37 @@ logger = logging.getLogger(__name__)
 # than allowed to bloat the audit row's detail JSON.
 _MAX_FAILURE_TOKEN_LEN = 64
 
+# The failure token for a codebase root that is not a usable checkout.
+#
+# This is a CLOSED-VOCABULARY census value: it lands in the `detail` JSON of
+# a `verify|codebase|agent_failed` row (task 4343's audit contract) and is
+# what an operator GROUPs BY in reconciliation.db to size this failure mode.
+# Rename it only together with the dashboards and queries that read it, and
+# never let it become agent-controlled — every other token on this path goes
+# through _as_failure_token precisely because the agent can influence those.
+CODEBASE_ROOT_UNRESOLVED = 'codebase_root_unresolved'
+
+
+def _is_usable_codebase_root(root: Path) -> bool:
+    """Whether ``root`` looks like a checkout the explore agent can search.
+
+    Stat-only by design (INV-8): verify() runs on the event loop, so a
+    ``git rev-parse --show-toplevel`` probe — stricter, but a subprocess —
+    is deliberately not used.
+
+    ``.exists()`` and not ``.is_dir()`` on the ``.git`` entry: in a
+    ``git worktree`` checkout — which is how this factory runs every task,
+    and how the non-dark_factory projects this check exists to serve are laid
+    out — ``.git`` is a FILE holding a ``gitdir:`` pointer.  Requiring a
+    directory would refuse exactly that population.
+
+    No try/except: ``Path.is_dir()`` and ``Path.exists()`` already swallow
+    ``OSError``/``ValueError`` internally and return False, so an unreadable
+    or malformed path fails closed by construction.  Wrapping them would
+    imply a hazard that is not there.
+    """
+    return root.is_dir() and (root / '.git').exists()
+
 
 def _as_failure_token(value: object) -> str:
     """Coerce an AgentLoop warning value into a storable failure token.
@@ -88,6 +119,35 @@ class CodebaseVerifier:
         needs is a filesystem root, not a logical id.
         """
         codebase_root = Path(codebase_root).resolve()
+
+        # ── Fail-closed root pre-flight (PRD D4) ───────────────────────────
+        # Refuse BEFORE building any tools or constructing the agent.  The
+        # failure being closed is an agent pointed at the WRONG tree: it
+        # searches, finds nothing, and returns `contradicted` against
+        # genuinely-completed work — so a refusal that happened after the
+        # spawn would not close it at all.
+        #
+        # The refusal rides task 4343's existing audited agent-failure path
+        # unchanged: _on_task_done writes one census-visible
+        # `verify|codebase|agent_failed` row carrying the token, logs the
+        # summary, and writes NO memory.  No new model field, no new branch
+        # in targeted.py.
+        if not _is_usable_codebase_root(codebase_root):
+            logger.warning('verification_root_unresolved root=%s', codebase_root)
+            return VerificationResult(
+                verdict=VerificationVerdict.inconclusive,
+                confidence=0.0,
+                evidence=[],
+                # Task 1811's human-facing sentinel prefix plus the offending
+                # path, so an operator grepping 'agent-failed:' still sees
+                # this failure and can tell WHICH root was refused.  The
+                # structured failure_token stays the machine-readable
+                # channel (INV-2) — nothing branches on this prose.
+                summary=f'agent-failed:{CODEBASE_ROOT_UNRESOLVED}: {codebase_root}',
+                git_context=None,
+                agent_failed=True,
+                failure_token=CODEBASE_ROOT_UNRESOLVED,
+            )
 
         tools: dict[str, ToolDefinition] = {}
 
