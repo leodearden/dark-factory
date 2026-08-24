@@ -218,3 +218,137 @@ class TestClosureVerdictContract:
     def test_message_is_non_empty_on_both_arms(self):
         assert _closure(_well_formed_cluster(2)).message.strip()
         assert _closure([_member(_uuid(1))]).message.strip()
+
+
+class TestClosureSupersedes:
+    """Fix (2) — an id claimed absorbed must actually be gone."""
+
+    def test_scalar_legacy_supersedes_is_one_member_not_36_characters(self):
+        """The corpus carries 81 records with a SCALAR supersedes.
+
+        Iterating that string character-by-character would manufacture 36
+        bogus ids and refuse the gate systematically — the exact false
+        refusal the prior plan would have produced.
+        """
+        absorbed = _uuid(50)
+        scalar = _closure([_member(_uuid(1), canonical=True, supersedes=absorbed)])
+        listed = _closure([_member(_uuid(1), canonical=True, supersedes=[absorbed])])
+        assert scalar.closed is True
+        # Same input, two spellings — identical verdict, not merely both closed.
+        assert scalar == listed
+        # No character-shaped id may appear anywhere in the verdict.
+        for reason in scalar.reasons:
+            assert all(len(i) != 1 for i in reason['ids'])
+
+    def test_scalar_legacy_supersedes_still_detects_a_live_member(self):
+        """The scalar shape must go through the SAME classification, not be
+        waved through as 'unparseable so fine'."""
+        absorbed = _uuid(2)
+        members = [
+            _member(_uuid(1), canonical=True, supersedes=absorbed),
+            _member(absorbed),
+        ]
+        verdict = _closure(members)
+        assert verdict.closed is False
+        assert 'absorbed_member_still_live' in _codes(verdict)
+
+    @pytest.mark.parametrize('value', [None, []])
+    def test_nothing_absorbed_is_accepted(self, value):
+        members = [_member(_uuid(1), canonical=True)]
+        if value is not None:
+            members[0]['metadata']['supersedes'] = value
+        verdict = _closure(members)
+        assert verdict.closed is True
+
+    def test_absorbed_member_still_live_names_the_id(self):
+        """The curator claimed it was deleted; the live scroll says otherwise."""
+        absorbed = _uuid(3)
+        members = [
+            _member(_uuid(1), canonical=True, supersedes=[absorbed, _uuid(90)]),
+            _member(_uuid(2)),
+            _member(absorbed),
+        ]
+        verdict = _closure(members)
+        assert verdict.closed is False
+        named = [r for r in verdict.reasons if r['code'] == 'absorbed_member_still_live']
+        assert named and named[0]['ids'] == [absorbed]
+        # The correctly-folded member contributes nothing.
+        assert _uuid(90) not in repr(verdict.reasons)
+
+    def test_absorbed_member_comparison_is_case_insensitive(self):
+        """A casing difference between the scroll row and the stored metadata
+        must not manufacture a false absorbed_member_still_live, nor hide a
+        real one: is_full_uuid tolerates case because casing is a rendering
+        choice, not a different identifier."""
+        absorbed = _uuid(4)
+        members = [
+            _member(_uuid(1), canonical=True, supersedes=[absorbed.upper()]),
+            _member(absorbed),
+        ]
+        verdict = _closure(members)
+        assert 'absorbed_member_still_live' in _codes(verdict)
+
+    @pytest.mark.parametrize(
+        'malformed',
+        ['deadbeef', 12345, None, '00000000000040008000000000000001'],
+        ids=['short_hex', 'int', 'none', 'undashed_32'],
+    )
+    def test_malformed_supersedes_member_is_named_never_raised(self, malformed):
+        """normalize_supersedes deliberately PRESERVES malformed members (the
+        census counts 3 short-hex and 8 non-string live) so a validator can
+        reject them by name.  A raising predicate would permanently block
+        exactly those gates."""
+        members = [_member(_uuid(1), canonical=True, supersedes=[malformed])]
+        verdict = _closure(members)
+        assert verdict.closed is False
+        named = [
+            r for r in verdict.reasons if r['code'] == 'malformed_supersedes_member'
+        ]
+        assert named and named[0]['ids'] == [str(malformed)]
+
+    def test_every_offender_is_collected_not_short_circuited(self):
+        live = _uuid(5)
+        members = [
+            _member(_uuid(1), canonical=True, supersedes=[live, 'deadbeef']),
+            _member(live),
+        ]
+        codes = _codes(_closure(members))
+        assert 'absorbed_member_still_live' in codes
+        assert 'malformed_supersedes_member' in codes
+
+    def test_uses_the_shared_supersedes_parser(self, monkeypatch):
+        """INV-5 single-home lock — there is never a SECOND supersedes parser.
+
+        BEHAVIORAL, following
+        ``test_targeted.py::test_targeted_uses_the_shared_supersedes_parser``:
+        an identity assertion is near-tautological (a plain ``from ... import``
+        always yields it) and still passes on the realistic violation, which is
+        inlining ``isinstance(v, str)`` shape logic at the call site while
+        leaving the now-unused import in place.  ``normalize_supersedes``' own
+        docstring names this closure predicate as one of its two designated
+        readers.
+        """
+        seen = []
+
+        def _sentinel_parser(value):
+            seen.append(value)
+            return ['deadbeef']
+
+        monkeypatch.setattr(
+            consolidation_gate, 'normalize_supersedes', _sentinel_parser
+        )
+        # Under the REAL parser this is 'nothing absorbed' and closes; the
+        # refusal can only come from the patched shared name being called.
+        verdict = _closure([_member(_uuid(1), canonical=True)])
+        assert seen == [None], 'the raw metadata value must reach the shared parser'
+        assert 'malformed_supersedes_member' in _codes(verdict)
+
+    def test_only_the_canonical_supersedes_is_read(self):
+        """A non-canonical peer's stale supersedes is not the cluster's claim."""
+        live = _uuid(6)
+        members = [
+            _member(_uuid(1), canonical=True),
+            _member(_uuid(2), supersedes=[live]),
+            _member(live),
+        ]
+        assert _closure(members).closed is True
