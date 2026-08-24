@@ -1227,7 +1227,12 @@ REVIEWER_COMPREHENSIVE = _reviewer_role(
     'documentation drift is a real concern, fix the source doc once and move '
     'on. Exception: a one-line `assert Foo.__doc__` existence check inside '
     'an API-surface contract test is fine. Do NOT propose "harden the '
-    'docstring-pin regex" as a follow-up — that just deepens the hole.',
+    'docstring-pin regex" as a follow-up — that just deepens the hole. '
+    'NOT IN SCOPE: a check that a cited IDENTIFIER RESOLVES to a real symbol. '
+    'The discriminator is executable — if fully rewording the surrounding '
+    'sentence while keeping the identifier leaves the check green, it is '
+    'referential integrity, not a wording pin. See '
+    '`orchestrator/tests/test_marker_registration_drift.py`.',
 )
 
 
