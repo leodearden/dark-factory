@@ -572,12 +572,11 @@ class TestVerdictToolsResidueChannelIsShared:
         # record under a live task id would halt the task whose verdict leaked.
         assert not spec.residue_anchor_task_id.isdigit()
 
-    def test_residue_is_queued_as_an_escalation_not_dropped_in_the_worktree(
+    @pytest.mark.asyncio
+    async def test_residue_is_queued_as_an_escalation_not_dropped_in_the_worktree(
         self, tmp_path,
     ):
         """The primary channel is the queue, and the fallback is NOT taken."""
-        import asyncio
-
         from orchestrator.mcp import markup_sink, verdict_tools
 
         submitted: list[Any] = []
@@ -614,7 +613,7 @@ class TestVerdictToolsResidueChannelIsShared:
             'level': 2,
             'raw_value': 'THE ONLY SURVIVING COPY',
         }
-        esc_id = asyncio.run(sink(record))
+        esc_id = await sink(record)
 
         assert esc_id == 'esc-verdict-tools-markup-residue-1'
         assert not fell_back, (
@@ -635,12 +634,11 @@ class TestVerdictToolsResidueChannelIsShared:
         assert "owner='l2-escalation-watcher'" in filed.detail
         assert 'verdict-tools' in filed.detail
 
-    def test_worktree_file_is_the_floor_when_the_queue_cannot_be_opened(
+    @pytest.mark.asyncio
+    async def test_worktree_file_is_the_floor_when_the_queue_cannot_be_opened(
         self, tmp_path,
     ):
         """Strictly better than losing the payload; strictly worse than a queue."""
-        import asyncio
-
         from orchestrator.artifacts import TaskArtifacts
         from orchestrator.mcp import markup_sink, verdict_tools
 
@@ -654,22 +652,21 @@ class TestVerdictToolsResidueChannelIsShared:
             open_channel=lambda root: None,
             last_resort=artifacts.write_markup_residue,
         )
-        locator = asyncio.run(sink({
+        locator = await sink({
             'error_type': markup_sink.MARKUP_RESIDUE_ERROR_TYPE,
             'tool': 'submit_review_verdict',
             'field': 'issues',
             'raw_value': 'THE ONLY SURVIVING COPY',
-        }))
+        })
         assert locator, 'a queue outage must not silently destroy the payload'
         # A bare filename, resolved against the artifacts root it was written to.
         assert 'THE ONLY SURVIVING COPY' in (artifacts.root / locator).read_text()
 
-    def test_a_sink_that_can_reach_nothing_returns_none_rather_than_lying(
+    @pytest.mark.asyncio
+    async def test_a_sink_that_can_reach_nothing_returns_none_rather_than_lying(
         self, tmp_path,
     ):
         """The refusal hint must never promise a preservation that did not happen."""
-        import asyncio
-
         from orchestrator.mcp import markup_sink, verdict_tools
 
         sink = markup_sink.make_escalation_sink(
@@ -680,4 +677,4 @@ class TestVerdictToolsResidueChannelIsShared:
             open_channel=lambda root: None,
             last_resort=None,
         )
-        assert asyncio.run(sink({'error_type': 'mcp_markup_unrepairable'})) is None
+        assert await sink({'error_type': 'mcp_markup_unrepairable'}) is None

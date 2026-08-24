@@ -1360,7 +1360,7 @@ class TestCoercionNeverGuesses:
         # guard here, not merely no worse.
         assert h.recorder.args['detail'] == 'Ill-formed.'
 
-        warning = result.meta['markup_repair']
+        warning = meta_of(result)['markup_repair']
         assert warning['outcome'] == 'repaired'
         assert warning['unrecovered_params'] == ['evidence']
         assert 'evidence' not in warning['recovered_params']
@@ -1403,7 +1403,7 @@ class TestCoercionNeverGuesses:
         assert residue['level'] == 2
         assert residue['category'] == 'mcp_markup_residue'
         # And the forwarded caller is pointed at it by id.
-        assert result.meta['markup_repair']['unrecovered_residue_id'] is not None
+        assert meta_of(result)['markup_repair']['unrecovered_residue_id'] is not None
 
     async def test_reject_with_repair_keeps_the_undecodable_value_verbatim(self):
         """The drop is FORWARD_REPAIR's alone.
