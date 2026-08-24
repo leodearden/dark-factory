@@ -5467,14 +5467,16 @@ class TestLivenessSubjectFactsIsAdditive:
             'invisible -- the group itself is the only observable'
         )
 
-    def test_a_divergent_records_incomplete_clause_keeps_the_seed_beside_it(self):
-        """Where the partial key DOES survive, the seed survives with it.
+    def test_a_divergent_records_incomplete_clause_earns_no_bucket_of_its_own(self):
+        """An INCOMPLETE clause earns no bucket; the seed is never swapped out.
 
         Task 94's clause here names only `status`; task 96's names all three.
-        The union is a chimera, so clause scoping engages -- and the partial
-        `status=in-progress` is ADDED, not swapped in. Swapping would vacate
-        the whole-record bucket 94 shares with any other record asserting the
-        same chimera, which is the regression this class exists to catch.
+        The union is a chimera, so clause scoping engages -- but 94's clause
+        names a strict SUBSET of the record's field vocabulary, so it earns no
+        clause key of its own (`TestLivenessClauseFragmentFalseGroup` pins the
+        harm this prevents). The invariant this class exists for still holds:
+        the seed is never SWAPPED OUT -- 94 keeps the whole-record union it
+        shares with any other record asserting the same chimera.
         """
         record = _memory('divergent-partial', _LIVENESS_DIVERGENT_PARTIAL_94,
                          category=_OS, metadata={'task_id': '94'})
@@ -5482,9 +5484,14 @@ class TestLivenessSubjectFactsIsAdditive:
         assert extract_liveness_snapshot_fact(record) == _CORE_FACT_DIVERGENT
 
         assert liveness_snapshot_subject_facts(record, _CORE_FACT_DIVERGENT) == {
-            '94': {_CORE_FACT_DIVERGENT, 'status=in-progress'},
+            '94': {_CORE_FACT_DIVERGENT},
             '96': {_CORE_FACT_DIVERGENT, _CORE_FACT_DONE},
-        }, 'the incomplete clause key sits BESIDE the seed, never in place of it'
+        }, (
+            "94's incomplete clause earns no bucket of its own, but its seed "
+            '-- the whole-record union -- is never swapped out; '
+            "96's clause names the record's full field vocabulary and keeps "
+            'its clause key beside the seed'
+        )
 
 
 # A record whose whole-record key names `status` TWICE -- the chimera that

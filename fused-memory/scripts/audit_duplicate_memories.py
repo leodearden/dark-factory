@@ -677,22 +677,27 @@ def liveness_snapshot_subject_task_ids(record: dict) -> set[str]:
     return subjects
 
 
-def _asserts_one_field_twice(core_fact: str) -> bool:
-    """Does a whole-record key carry TWO values for ONE field?
+def _key_field_names(core_fact: str) -> list[str]:
+    """Field names a `|`-joined core_fact key names, in order, duplicates kept.
 
     Reads the KEY, not the content: pairs are `|`-joined and no value can
     contain a `|` (`_LIVE_FIELD_SCAN_RE` excludes it from both branches), so
-    this costs a split and no regex consult. True means the record's union key
-    is a CHIMERA no single-task snapshot can ever match -- the one shape
-    clause scoping exists to rescue.
+    this costs a split and no regex consult. The single read both
+    `_asserts_one_field_twice` and `liveness_snapshot_subject_facts`'s
+    field-vocabulary gate consume, kept as ONE copy rather than two hand-rolled
+    splits that could drift apart.
     """
-    seen: set[str] = set()
-    for pair in core_fact.split('|'):
-        field = pair.split('=', 1)[0]
-        if field in seen:
-            return True
-        seen.add(field)
-    return False
+    return [pair.split('=', 1)[0] for pair in core_fact.split('|')]
+
+
+def _asserts_one_field_twice(core_fact: str) -> bool:
+    """Does a whole-record key carry TWO values for ONE field?
+
+    True means the record's union key is a CHIMERA no single-task snapshot
+    can ever match -- the one shape clause scoping exists to rescue.
+    """
+    names = _key_field_names(core_fact)
+    return len(names) != len(set(names))
 
 
 def liveness_snapshot_subject_facts(
@@ -712,6 +717,25 @@ def liveness_snapshot_subject_facts(
     turn on where the author put a full stop, since ``.`` and a newline are
     both clause boundaries. Gating on divergence also skips the clause scan
     entirely for the overwhelmingly common coherent record.
+
+    A clause-scoped key clears a SECOND gate before it is added: it must name
+    the SAME SET of field NAMES as *core_fact* itself, not merely a non-empty
+    one. Divergence DUPLICATES a field name — the name set is unchanged — while
+    a FRAGMENT (a clause that names only some of the fields its record was
+    recognised to speak about) OMITS one, shrinking the name set. Field-NAME-set
+    equality is what separates the case clause scoping exists for from the case
+    that manufactures a group the whole-record key never would have. A
+    PAIR-level "not a strict subset of *core_fact*" predicate does NOT work
+    here — do not "simplify" it back to one: a divergent record's union key is
+    the UNION of the conflicting values, so the GOOD clause key (e.g.
+    ``claimant_run_id=null|heartbeat_at=null|status=in-progress``) IS a strict
+    pair-subset of the union (e.g.
+    ``claimant_run_id=null|heartbeat_at=null|status=done|status=in-progress``)
+    — that predicate would kill the exact case this rescope exists to serve.
+    A clause key that SURVIVES this gate therefore states its record's whole
+    field vocabulary for its subject, so when it collides with another
+    record's whole-record key, both sides assert the same COMPLETE fact about
+    the same subject — a true recurrence, not a fragment collision.
 
     The clause-scoped key comes from splitting the content with
     ``task_filter._CLAUSE_SPLIT_RE`` and reading each clause's task refs
@@ -739,8 +763,8 @@ def liveness_snapshot_subject_facts(
     Returns:
         ``{subject_task_id: {facts to bucket it under}}``, carrying EVERY
         subject. Each set ALWAYS contains *core_fact*, plus the subject's
-        clause-scoped fact under the divergence rule above. Because
-        *core_fact* is unconditional this projection is ADDITIVE by
+        clause-scoped fact under the divergence and field-vocabulary gates
+        above. Because *core_fact* is unconditional this projection is ADDITIVE by
         construction — no pre-rescope bucket membership can be vacated, so it
         warrants no new ``_LIVENESS_DISCLOSURE_KEYS`` counter
         (``TestLivenessSubjectFactsIsAdditive``). Does not mutate *record*.
@@ -759,6 +783,17 @@ def liveness_snapshot_subject_facts(
             pairs = _readable_field_pairs(clause) or set()
             for ref in refs:
                 scoped.setdefault(ref, set()).update(pairs)
+
+    # SECOND gate: a clause key earns its bucket only when it names the SAME
+    # field-NAME set as the record's own union key -- see the docstring's
+    # field-vocabulary paragraph for why this must be a name-SET comparison,
+    # not a pair-subset one. A subject dropped here still keys on the
+    # unconditional seed below, so this cannot vacate a bucket.
+    record_fields = set(_key_field_names(core_fact))
+    scoped = {
+        ref: pairs for ref, pairs in scoped.items()
+        if {pair.split('=', 1)[0] for pair in pairs} == record_fields
+    }
 
     facts: dict[str, set[str]] = {}
     for subject in subjects:
@@ -842,7 +877,11 @@ def find_liveness_snapshot_recurrences(
     twice, and ``liveness_snapshot_recurrences`` is an ARMED count. The richer
     key wins that collapse — always the whole-record one, since a clause key's
     pairs are a subset — so the survivor is the group that predates clause
-    scoping.
+    scoping. A clause-scoped bucket only exists at all when
+    ``liveness_snapshot_subject_facts``'s field-vocabulary gate let it
+    through — a clause naming a strict subset of its record's field names
+    earns no bucket, so it can never join some unrelated record's whole-record
+    bucket either.
 
     The core fact is keyed PER SUBJECT by ``liveness_snapshot_subject_facts``,
     which splits the content into clauses with ``task_filter._CLAUSE_SPLIT_RE``
