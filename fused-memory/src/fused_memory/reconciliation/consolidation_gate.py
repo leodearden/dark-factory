@@ -63,6 +63,7 @@ __all__ = [
     'EXIT_CLOSED',
     'EXIT_NOT_CLOSED',
     'GATE_METADATA_KEY',
+    'WAIVABLE_REASON_CODES',
     'ClosureVerdict',
     'evaluate_closure',
     'render_end_state_brief',
@@ -157,9 +158,20 @@ class ClosureVerdict:
     waived: tuple[dict[str, Any], ...] = ()
 
 
-def _reason(code: str, *, ids: Sequence[Any] = (), detail: str = '') -> dict[str, Any]:
-    """One structured refusal entry.  ``ids`` NAMES the offenders."""
-    return {'code': code, 'ids': [str(i) for i in ids], 'detail': detail}
+def _reason(
+    code: str,
+    *,
+    ids: Sequence[Any] = (),
+    detail: str = '',
+    **extra: Any,
+) -> dict[str, Any]:
+    """One structured refusal entry.  ``ids`` NAMES the offenders.
+
+    *extra* carries code-specific structured facts (e.g. ``scroll_total``) as
+    FIELDS rather than buried in prose, so the seam, the CLI and a human all
+    read the same number instead of parsing a sentence.
+    """
+    return {'code': code, 'ids': [str(i) for i in ids], 'detail': detail, **extra}
 
 
 def _verdict(
@@ -270,11 +282,57 @@ def evaluate_closure(
     # reason — casing is a rendering choice, not a different identifier.
     live_ids = {_payload_id(p).lower() for p in members if _payload_id(p)}
 
+    # --- completeness FIRST, and unconditional ----------------------------- #
+    # A predicate whose entire job is refuting a false closure claim must not
+    # pass on a view it knows is partial or absent (INV-3: an actor that cannot
+    # corroborate must not act; PRD δ: a disagreement is never downgraded to
+    # "no children").  Neither of these can be waived — you cannot waive not
+    # having looked.
+    if not scroll_available:
+        # Nothing was SEEN, so nothing about the cluster's content may be
+        # asserted and no waiver can be judged against reality.  Returning here
+        # rather than falling through is what keeps this from fabricating an
+        # absence-based accusation out of an empty *members*.
+        return _verdict(
+            topic,
+            [
+                _reason(
+                    'scroll_unavailable',
+                    detail=(
+                        f'The live scroll for topic {topic!r} did not answer, so '
+                        'the cluster could not be checked. This is NOT "nothing '
+                        'left": an unanswered read and a genuinely empty topic '
+                        'are different outcomes (the same three-way distinction '
+                        '`build_consolidation_result` draws).'
+                    ),
+                    scroll_total=scroll_total,
+                )
+            ],
+        )
+    if scroll_truncated:
+        reasons.append(
+            _reason(
+                'scroll_incomplete',
+                detail=(
+                    f'The live scroll for topic {topic!r} hit its cap after '
+                    f'{scroll_total} members, and `_next_offset` is discarded, so '
+                    'members beyond it were never seen. A partial view cannot '
+                    'establish closure.'
+                ),
+                scroll_total=scroll_total,
+            )
+        )
+
     # --- canonical invariant: exactly one strictly-canonical member -------- #
     canonical_ids = [
         _payload_id(p) for p in members if _payload_meta(p).get('canonical') is True
     ]
-    if not canonical_ids:
+    if not canonical_ids and not scroll_truncated:
+        # ABSENCE-based, so it is only sound on a COMPLETE view: a canonical
+        # sitting past the scroll cap is indistinguishable from no canonical at
+        # all, and accusing the cluster of a defect that may not exist would be
+        # a fabrication.  The gate still refuses — on `scroll_incomplete`, the
+        # reason that is actually true.
         reasons.append(
             _reason(
                 'no_canonical',
@@ -286,6 +344,8 @@ def evaluate_closure(
             )
         )
     elif len(canonical_ids) > 1:
+        # PRESENCE-based, so truncation does not weaken it: seeing two
+        # canonicals proves two canonicals, and unseen rows can only add more.
         reasons.append(
             _reason(
                 'multiple_canonicals',
@@ -315,7 +375,13 @@ def evaluate_closure(
             )
         )
 
-    return _verdict(topic, reasons)
+    # --- the audited escape, applied LAST ---------------------------------- #
+    reasons, waived = _apply_waivers(
+        block,
+        reasons,
+        live_universe=live_ids | {str(i).lower() for i in unstamped_live_ids},
+    )
+    return _verdict(topic, reasons, waived=waived)
 
 
 def _classify_supersedes(
@@ -382,3 +448,113 @@ def _classify_supersedes(
             )
         )
     return reasons
+
+
+#: The ONLY reason codes an audited waiver may suppress. Both are of the form
+#: "this specific LIVE entry is a problem" — the judgment call a curator can
+#: legitimately have already made. Deliberately NOT waivable: the completeness
+#: codes (you cannot waive not having looked), `no_canonical` /
+#: `multiple_canonicals` (a cluster-shape defect to FIX, not to excuse), and
+#: `malformed_supersedes_member` (a metadata defect to fix). Keeping the set
+#: closed and named is what stops the escape becoming a gate kill-switch.
+WAIVABLE_REASON_CODES = frozenset(
+    {'absorbed_member_still_live', 'unstamped_cluster_member'}
+)
+
+
+def _apply_waivers(
+    block: Mapping[str, Any],
+    reasons: list[dict[str, Any]],
+    *,
+    live_universe: set[str],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Apply the gate block's ``considered_and_kept`` audit list.
+
+    WHY THE ESCAPE EXISTS.  Gates routinely sit for days — the Stage-1
+    stale-gate backlog threshold is 48h
+    (``reconciliation/stages/memory_consolidator.py``) — so an entry written
+    against the topic by an unrelated agent AFTER the curator made their
+    judgment would otherwise leave the gate permanently uncloseable with no
+    sanctioned exit.  A predicate with no exit is a predicate operators route
+    around.
+
+    WHY IT IS NOT A RUBBER STAMP.  Three properties, each pinned by a test:
+    only :data:`WAIVABLE_REASON_CODES` can be suppressed at all; every entry
+    needs a non-empty ``note`` or it waives nothing and says so
+    (``unaudited_waiver``); and a waiver naming nothing live is reported
+    (``stale_waiver``) rather than silently ignored, so a waiver list cannot
+    quietly rot into a permanent bypass.  Applied waivers are echoed on
+    ``ClosureVerdict.waived`` so the exit is visible in the verdict itself.
+
+    WHY THE KEY IS ``considered_and_kept`` AND NOT ``retain``.  ``retain`` is
+    already taken, with a different meaning: it is the INPUT arm of
+    ``consolidate_memories`` (gate 3200's ratified default — ids tagged in
+    place with the cluster topic, never deleted, never given ``canonical`` or
+    ``parent_id``).  Reusing that word for a gate-closure waiver would give one
+    term two jobs across two subsystems.  Living inside the Tier-C
+    ``x_recon_consolidation_gate`` block also means the key needs no amendment
+    to ``RESERVED_VOCABULARY_KEYS`` (a closed five-key set) and produces no
+    unknown-key census noise.
+
+    Entry shape: ``{'id', 'note', 'recorded_at', 'recorded_by'}``.
+    """
+    raw = block.get('considered_and_kept')
+    if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
+        return reasons, []
+
+    applied: list[dict[str, Any]] = []
+    unaudited: list[Any] = []
+    stale: list[Any] = []
+    waived_ids: set[str] = set()
+
+    for entry in raw:
+        if not isinstance(entry, Mapping):
+            unaudited.append(entry)
+            continue
+        entry_id = entry.get('id')
+        note = entry.get('note')
+        if not isinstance(note, str) or not note.strip():
+            unaudited.append(entry_id)
+            continue
+        if str(entry_id).lower() not in live_universe:
+            stale.append(entry_id)
+            continue
+        waived_ids.add(str(entry_id).lower())
+        applied.append(dict(entry))
+
+    kept: list[dict[str, Any]] = []
+    for reason in reasons:
+        if reason['code'] not in WAIVABLE_REASON_CODES:
+            kept.append(reason)
+            continue
+        remaining = [i for i in reason['ids'] if i.lower() not in waived_ids]
+        if not remaining:
+            continue  # every offender in this reason was audited and kept
+        kept.append({**reason, 'ids': remaining})
+
+    if unaudited:
+        kept.append(
+            _reason(
+                'unaudited_waiver',
+                ids=unaudited,
+                detail=(
+                    'Each `considered_and_kept` entry needs a non-empty `note` '
+                    'recording WHY the entry was kept. A bare id list is not an '
+                    'audit trail, so these entries waived nothing.'
+                ),
+            )
+        )
+    if stale:
+        kept.append(
+            _reason(
+                'stale_waiver',
+                ids=stale,
+                detail=(
+                    'These `considered_and_kept` entries name ids that are not '
+                    'live, so the waiver no longer describes reality. Remove '
+                    'them rather than leaving a list that silently grants '
+                    'nothing.'
+                ),
+            )
+        )
+    return kept, applied
