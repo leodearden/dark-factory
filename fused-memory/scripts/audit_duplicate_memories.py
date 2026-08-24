@@ -686,17 +686,25 @@ def liveness_snapshot_subject_task_ids(record: dict) -> set[str]:
     return subjects
 
 
+def _field_names(pairs: Iterable[str]) -> list[str]:
+    """Field names of an iterable of `<field>=<value>` pairs, duplicates kept.
+
+    The one split both `_key_field_names` (a core_fact's `|`-joined pairs)
+    and `liveness_snapshot_subject_facts`'s field-vocabulary gate (a
+    clause's pair set) route through, so the module keeps a single copy of
+    this read rather than two hand-rolled ones that could drift apart.
+    """
+    return [pair.split('=', 1)[0] for pair in pairs]
+
+
 def _key_field_names(core_fact: str) -> list[str]:
     """Field names a `|`-joined core_fact key names, in order, duplicates kept.
 
     Reads the KEY, not the content: pairs are `|`-joined and no value can
     contain a `|` (`_LIVE_FIELD_SCAN_RE` excludes it from both branches), so
-    this costs a split and no regex consult. The single read both
-    `_asserts_one_field_twice` and `liveness_snapshot_subject_facts`'s
-    field-vocabulary gate consume, kept as ONE copy rather than two hand-rolled
-    splits that could drift apart.
+    this costs a split and no regex consult.
     """
-    return [pair.split('=', 1)[0] for pair in core_fact.split('|')]
+    return _field_names(core_fact.split('|'))
 
 
 def _asserts_one_field_twice(core_fact: str) -> bool:
@@ -746,6 +754,22 @@ def liveness_snapshot_subject_facts(
     record's whole-record key, both sides assert the same COMPLETE fact about
     the same subject — a true recurrence, not a fragment collision.
 
+    The comparison target, *core_fact*, is the RECORD's whole-document union
+    — the field vocabulary named anywhere in the record, across every
+    subject's clauses — not a vocabulary re-derived for one subject alone.
+    That is a deliberate, CONSERVATIVE choice with a known recall cost: a
+    clause can be a COMPLETE statement about its own subject and still be
+    dropped, when some OTHER subject's clause in the same record names
+    additional fields the first clause does not. ``_LIVENESS_DIVERGENT_PARTIAL_94``
+    is exactly this shape — task 94's clause names only ``status``, which is
+    the entire claim any clause in that record ever makes about task 94, yet
+    it is dropped because task 96's separate clause names two more fields
+    elsewhere in the same content (``TestLivenessClauseFragmentFalseGroup``
+    pins the resulting refusal). The trade is accepted because the failure
+    direction is safe: dropping a key can only cost a report-only group,
+    never manufacture a false one, and it never vacates the subject's own
+    unconditional *core_fact* bucket.
+
     The clause-scoped key comes from splitting the content with
     ``task_filter._CLAUSE_SPLIT_RE`` and reading each clause's task refs
     (``TASK_REF_RE``) and ``<field>=<value>`` assignments separately — the
@@ -793,16 +817,21 @@ def liveness_snapshot_subject_facts(
             for ref in refs:
                 scoped.setdefault(ref, set()).update(pairs)
 
-    # SECOND gate: a clause key earns its bucket only when it names the SAME
-    # field-NAME set as the record's own union key -- see the docstring's
-    # field-vocabulary paragraph for why this must be a name-SET comparison,
-    # not a pair-subset one. A subject dropped here still keys on the
-    # unconditional seed below, so this cannot vacate a bucket.
-    record_fields = set(_key_field_names(core_fact))
-    scoped = {
-        ref: pairs for ref, pairs in scoped.items()
-        if {pair.split('=', 1)[0] for pair in pairs} == record_fields
-    }
+    if scoped:
+        # SECOND gate: a clause key earns its bucket only when it names the
+        # SAME field-NAME set as the record's own union key -- see the
+        # docstring's field-vocabulary paragraph for why this must be a
+        # name-SET comparison, not a pair-subset one, and for the known
+        # recall trade this record-level comparison makes. A subject
+        # dropped here still keys on the unconditional seed below, so this
+        # cannot vacate a bucket. Guarded on `scoped` so the overwhelmingly
+        # common coherent record (or a divergent one whose clauses named no
+        # subject) does no extra work here either.
+        record_fields = set(_key_field_names(core_fact))
+        scoped = {
+            ref: pairs for ref, pairs in scoped.items()
+            if set(_field_names(pairs)) == record_fields
+        }
 
     facts: dict[str, set[str]] = {}
     for subject in subjects:
