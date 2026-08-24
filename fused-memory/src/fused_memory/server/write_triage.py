@@ -50,6 +50,7 @@ from typing import TYPE_CHECKING, Any
 from shared.storm_counter import StormCounter
 
 from fused_memory.models.enums import MEM0_PRIMARY
+from fused_memory.server.grouped_read import CHILD_KINDS, PARENT_ID_KEY
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -268,6 +269,44 @@ def _cosine_of(result: MemoryResult) -> float | None:
     return None
 
 
+def _canonical_id_of(result: MemoryResult) -> str:
+    """The id a write should attach to for *result* — hoisting a CHILD.
+
+    A sighting or amendment record is itself attached to something, and
+    ``grouped_read`` resolves exactly ONE level of parentage. Attaching to a
+    child would therefore create a GRANDCHILD that can never fold under the
+    true canonical — a child that exists but never groups, which reads as
+    content loss without being one. So when *result* is a child, this returns
+    its ``parent_id``; otherwise it returns the record's own id.
+
+    Why hoist rather than EXCLUDE children from the candidate set: a sighting
+    child holds the restatement text VERBATIM, which makes it the strongest
+    available evidence that this exact restatement was seen before, and the
+    likeliest max-cosine hit on the second restatement of a fact. Dropping it
+    would lose that signal entirely and route a genuine restatement to
+    ``stored`` whenever the canonical happens to be worded differently.
+
+    The other half of the trade, stated honestly: hoisting can attach to a
+    parent id whose record was since deleted. That is at worst the
+    pre-existing dangling-parent condition ``grouped_read`` already tolerates,
+    whereas attaching to a child creates a guaranteed-broken grandchild that
+    one-level grouping can NEVER fold.
+
+    The child rule mirrors ``grouped_read._parent_id_in_meta`` rule-for-rule —
+    a child ``kind`` AND a non-empty ``str`` ``parent_id``, with a malformed
+    parent link falling back to the record's own id — and both the kind set
+    and the metadata key are IMPORTED from that module rather than spelled as
+    literals (INV-5), because a drift between the write side and the read side
+    is exactly what produces an unfoldable child.
+    """
+    meta = result.metadata or {}
+    if meta.get('kind') in CHILD_KINDS:
+        parent_id = meta.get(PARENT_ID_KEY)
+        if isinstance(parent_id, str) and parent_id:
+            return parent_id
+    return result.id
+
+
 def decide_band(
     results: list[MemoryResult],
     *,
@@ -318,6 +357,13 @@ def decide_band(
     judge, and NOTHING takes the autonomous ``restated`` path. Do not "fix"
     this into an assertion that a deterministic band always exists.
 
+    ``canonical_id`` is a CANONICAL id, not merely "the winning result's id":
+    a winner that is itself a sighting or amendment child is HOISTED to its
+    parent by :func:`_canonical_id_of`, so the attach can never produce a
+    grandchild that one-level grouping cannot fold. Only the attach TARGET
+    moves — ``similarity`` stays the winner's own measured cosine, because
+    that is the evidence actually observed against the submitted text.
+
     Pure and synchronous: does no I/O, takes no service, and raises nothing on
     empty input.
     """
@@ -340,9 +386,13 @@ def decide_band(
     # t_high None => empty deterministic band => the judge takes everything
     # from t_low up. See the docstring: this is measured, not a fallback.
     if t_high is not None and similarity >= t_high:
-        return BandDecision(OUTCOME_RESTATED, best.id, similarity, t_high, t_low)
+        return BandDecision(
+            OUTCOME_RESTATED, _canonical_id_of(best), similarity, t_high, t_low,
+        )
 
-    return BandDecision(OUTCOME_JUDGE, best.id, similarity, t_high, t_low)
+    return BandDecision(
+        OUTCOME_JUDGE, _canonical_id_of(best), similarity, t_high, t_low,
+    )
 
 
 # --- candidate retrieval ----------------------------------------------------
