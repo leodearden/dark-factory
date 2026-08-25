@@ -81,11 +81,74 @@ Consequences for the decomposition: δ's *plan* work is nearly a no-op — its r
 
 Corrupted strings include cases where `rationale` was absorbed into `decision`, so the design rationale a future architect reads is another field's text. Retained plans are a survivor sample; most worktrees are deleted post-merge, so the historical total is larger.
 
+**δ's sweep was RUN on 2026-08-19 — and had never been run before.** The script landed with task 3691 on
+2026-08-15, but its `--apply` was never invoked against production data: a dry-run on 2026-08-19 still offered
+repairs on records archived as far back as **2026-07-20**. The applied run reports `2800 files scanned · 214 strings
+detected · **29 repaired** across 27 files · 0 write failures · 0 did-not-converge`, and the verifying second run
+reports **0 repairable** — δ's own acceptance invariant. **84 strings remain permanently unrepairable** and were
+deliberately left alone; 101 more are prose quoting the sentinels (documents *about* this leak, including the plans
+of 3083, 3141, 3689 and 3697) and are correctly untouched. That ~2× documentation-vs-damage split is why the
+collection predicate must be applied *on top of* the unrepairable verdict — a bare `detect()` census roughly doubles
+the number. Per operator decision the sweep is **not** put on a timer: γ is the door-closing fix, and a recurring
+cleanup would only make an open door survivable.
+
+**Two corpora §2.4 did not enumerate, both measured 2026-08-19.** (1) `.worktrees/.task-meta/*/plan.json` — the
+durable store the live lanes symlink into — holds 1,436 plans, 61 carrying residue, of which 33 belong to lanes that
+no longer exist. Neither sweep lane reaches those: δ globs `.worktrees-orphaned/*/.task/plan.json` and exactly **one**
+orphaned lane exists. Accepted as a transient irrelevance by operator decision — dead lanes are not read. (2) Live
+plans carry **19 hard-damage strings across 16 tasks**; three of those tasks (3382, 4081 pending; 3133 blocked) are
+plans an implementer will read *next*, and ε repairs them only on the next plan-tools read.
+
 **Sweep hazard pinned for δ:** `docs/task-recovery-2026-05-13/worktree-inventory.json` is git-tracked, legitimately contains predicate matches, and is replicated into every worktree — a loose glob hits it ~47 times. A sloppy sweep would rewrite committed evidence.
 
 ### 2.5 Containment *where installed* works — which is why the gap is the story
 
 Exhaustive scan: 21,064 Mem0 records, 41 legacy specimens, newest `2026-07-30T05:07:34Z` — **21 minutes before 3141 merged** (`da94baf14a`, 07-30 05:28:07Z). Zero new specimens in six days. The tripwire is not the problem; its *coverage* is.
+
+**Recurrence log** (live specimens observed after this PRD was written). Entries at a *gated* boundary are blocked writes — the gate holding, not landed damage. Entries at an *ungated* boundary are landed damage, and are the direct evidence for γ. A third class, *ungated + lazy read-repair* (plan-tools' boundary today), is **also landed damage at write time** — the inbound argument is ungated, so the corrupt value lands on disk — but unlike the ungated fused-memory/escalation boundaries it does not stay corrupt silently: a *subsequent* plan-tools read repairs it and writes the repaired document back, and discloses the repair on that later call's response. Damage now, convergence later, disclosure later still; see the 2026-08-16 entries below:
+
+| Observed | Boundary | Reported `matched_pattern` | Outcome |
+|---|---|---|---|
+| 2026-08-15 (task 4156, esc-4156-1) | `add_memory.content` (`procedural_knowledge`) | closing `content` tag | Rejected `McpEnvelopeMarkupWriteRejected`; immediate retry of the same semantic content landed clean (`bf93699b-35ac-4d98-a90b-55a56e5bd0d5`, `stores_written=['mem0']`). Nothing persisted corrupt. |
+| 2026-08-17 (task 4193, esc-4193-2) | `add_memory.content` (`procedural_knowledge`) — **gated** | closing `content` tag | Rejected `McpEnvelopeMarkupWriteRejected`; storm block fired at **3/3** in a 3600s window (`esc-markup-tripwire-12`). Immediate resubmission of equivalent content landed clean (`5047308d-d83b-4c31-b90b-68fe025b2664`, `stores_written=['mem0']`). Nothing persisted corrupt. |
+| 2026-08-17 (task 4193, **esc-4193-2 itself**) | `escalate_info.detail` — **ungated** | none — there is no gate at this boundary to report one | **Landed damage.** The filing that reported the row above was corrupted by the same defect. `detail` over-consumed its own closing position and absorbed both following parameters; the stored record carries `suggested_action=""` and `evidence=[]`. Confirmed by reading the record back via `get_escalation`. |
+| 2026-08-20 (task 3886, esc-3886-1) | `add_memory.content` — **gated** | closing `content` tag | Rejected `McpEnvelopeMarkupWriteRejected`; the leaked fragment was the closing `content` tag followed by the next parameter's opening tag for `category`, serialised into the tail of `content`. Immediate resubmission of the identical prose with `category` passed as a proper parameter landed clean (`7c1b0952-2813-4fbc-b6bd-3a309bb3d29f`, `stores_written=['mem0']`). Nothing persisted corrupt. **Contrast with 08-17:** the `escalate_info.detail` boundary that reported this one did NOT absorb the same failure — esc-3886-1's stored record carries a populated `suggested_action` and a 2-entry `evidence` list (confirmed by reading the record back). Same ungated boundary, same act, no landed damage — consistent with §2.5's "transient for that call pair" reading rather than a payload property. |
+
+The 08-17 pair is the sharpest evidence in this document for the coverage thesis, because both halves occurred in the **same act**: the gated `add_memory.content` boundary blocked the corrupt write and the clean resubmission landed, while the ungated `escalate_info.detail` boundary silently absorbed the identical failure shape *in the very filing that reported it* — dropping exactly the parameter §2.6 already ranks among the most-lost (`escalate_info.suggested_action` ×13). The filing agent could not have noticed: it never reads its own record back. Two consequences worth carrying into γ. First, this specimen would have been caught had the boundary been gated — its dialect is the well-formed `</parameter>` closer followed by the next parameter's opening tag, and that opening-tag literal is already in `MCP_MARKUP_PATTERNS` (§2.2). Second, it is landed damage now sitting in `data/escalations/**`, i.e. δ's sweep lane, which is one more specimen than the ~50 §2.4 measured. Neither number needs editing — §2.4 already says to re-measure at sweep time.
+
+The 08-15 entry is consistent with §2.1: `add_memory.content` remains the single most-hit fused-memory parameter (90 of 96), the leak was **transient for that call pair** rather than a property of the payload text, and the gated boundary behaved exactly as designed. It is evidence for the *coverage* thesis, not against the tripwire — the ungated boundaries in §2.3 would have absorbed the same specimen silently.
+
+**Recurrence log continued (2026-08-16 → 2026-08-20).** This backlog of accumulated recurrence datapoints is consolidated here in a single append so the log stays current through 2026-08-20. Reading note: the two tables below are grouped by source record — the order each sweep landed in this document — not sorted by observed date. The 2026-08-16 table immediately below is positioned after the original log's 2026-08-20 row (esc-3886-1, above) even though 08-16 is the earlier calendar date; the second 2026-08-20 table further below adds two more specimens from a separate, later escalation. Check each row's own Observed column rather than assuming date order across tables.
+
+Datapoints swept from task 4107's info-note **esc-4107-1** (filed 2026-08-16 by 4107's architect, resolved the same day by 4107's steward, per the note's own suggested action — *"fold into plans/toolcall-markup-containment-prd.md as a recurrence datapoint; no action needed on task 4107"*):
+
+| Observed | Boundary | Reported `matched_pattern` | Outcome |
+|---|---|---|---|
+| 2026-08-16 (task 4107 architect planning session, esc-4107-1) | `add_design_decision.rationale` (plan-tools) — **ungated + lazy read-repair** | the invoke closer (misclose: the `rationale` closing tag) | Three consecutive calls, each landing its corrupt `rationale` on disk unguarded, then repaired by the *next* call's `_read_plan_repaired` and disclosed on **that** later response under `markup_repairs` (outcome "repaired", collection `design_decisions`, index 0/1/2 — the index advancing across calls is the lag itself: call N reports the repair of call N−1's record). **The write lands corrupt and is repaired lazily**, not clean-on-arrival. |
+| 2026-08-16 (task 4107 architect planning session, esc-4107-1) | `add_memory.content` (fused-memory) — **gated** | closing `content` tag | Rejected `McpEnvelopeMarkupWriteRejected`; a verbatim resubmit landed clean (memory `62a1d125-65c1-404f-8642-3fdc0e201e5b`, `stores_written=['mem0']`). Nothing persisted corrupt. |
+
+Four recurrences total, in one session (note filed 2026-08-16T04:48:24Z, resolved 2026-08-16T13:49:05Z by claude-task-4107-steward; observations at HEAD=`14da8a8023`). The note records two observations of its own, both carried forward here: the leak is not confined to one server or one param name — it followed the same caller across servers inside a single session — and the two servers handle it inconsistently (plan-tools accepts the corrupt write and repairs it on a later read, reporting the repair on that later response; fused-memory rejects up front, so the write is lost until resubmitted), which a caller cannot predict.
+
+The two 2026-08-19 recurrences the task spec attributed to esc-4107-1 cannot be traced to that record: esc-4107-1 was filed *and* resolved entirely on 2026-08-16, and contains no 08-19 observation. What the archive holds for 2026-08-19 is two storm-tripwire firings — esc-markup-tripwire-18 (18:39:03Z) and -20 (20:00:43Z), each an aggregate rejected-write counter ("3 MCP writes rejected in 3600s") — each promoted to its own L2 cluster record by the escalation-watcher (esc-markup-tripwire-19 and -21 respectively, whose sole `members` entry is the firing it wraps, not an independent occurrence). All four records carry an empty `evidence` list and are attributed to no task. They corroborate the leak being live on 08-19, but are a different observation class — an aggregate counter and its cluster-promotion wrapper, not a per-boundary specimen — and are named as such here rather than tabled as two esc-4107-1 specimens.
+
+The pre-existing 2026-08-20 row above (task 3886, esc-3886-1) already satisfies this backlog's 08-20 datapoint.
+
+**Significance.** Three of the four 08-16 hits landed at a boundary outside fused-memory — plan-tools' `add_design_decision` — inside the same session as the fused-memory hit. That is direct live evidence the defect is caller-side and server-agnostic, not a fused-memory phenomenon: the §2.3 blast-radius thesis. These three are the *ungated + lazy read-repair* class named in the preamble above, and the mechanism is visible in code, not just behaviour: `_create_plan` carries an explicit comment (`orchestrator/src/orchestrator/mcp/plan_tools.py`) that guarding inbound arguments is "the write-time middleware's job" — and that middleware is registered nowhere yet (verified below). `_add_design_decision` calls `_read_plan_repaired` *first*, repairing whatever is already on disk, then appends the caller's new, **unrepaired** `rationale` and writes it — exactly the lag esc-4107-1 records (the `markup_repairs` disclosure arriving on a later call's response, not the offending one), and exactly the residue §2.4 measures as **19 hard-damage strings across 16 tasks** in live plans that "ε repairs only on the next plan-tools read".
+
+That divergence from fused-memory's reject-and-lose behaviour is the pre-γ status quo, not a newly discovered gap: §4 C2 already declares both fused-memory and plan-tools `REJECT_WITH_REPAIR`, and §9's γ2 (plan-tools, task 4457) together with γ3 (fused-memory, task 4458) are the registration leaves that make that declaration true everywhere. (esc-4107-1's own resolution — written 2026-08-16, before the 2026-08-19 three-way γ split recorded in §9 — attributed this registration work to a single task 3690; that task is now γ1, scoped to escalation/verdict-tools only, so the plan-tools/fused-memory registration it described now belongs to γ2/γ3.) Verified at HEAD by 4107's steward (esc-4107-1 resolution, paragraph 2): grepping `MarkupGuardMiddleware` / `add_middleware` across `orchestrator/src`, `escalation/src`, `fused-memory/src` and `shared/src` returns only the class definition in `shared/src/shared/mcp_markup_middleware.py` plus a docstring cross-reference in `shared/src/shared/toolcall_markup.py` — the middleware is registered on no server yet. A future reader must not re-file the inconsistent-handling observation as a fresh gap; γ2/γ3 already own it.
+
+**Additional 2026-08-20 material**, filed by the L2 escalation-watcher resolving esc-markup-tripwire-23 — Specimen 2 from its 2026-08-20T10:38 amendment, Specimen 3 from the escalation's resolution (2026-08-20T15:11:24Z, after the amendment):
+
+| Observed | Boundary | Reported `matched_pattern` | Outcome |
+|---|---|---|---|
+| 2026-08-20T10:36 (task 3886, review-fix planning session) — **Specimen 2** | `add_memory.content` — **gated** | closing `content` tag | Rejected `McpEnvelopeMarkupWriteRejected` (field=`content`, matched pattern = the closing `content` tag, per the amendment). **Two** `add_memory` calls issued in a **single parallel tool-call block** both leaked identically at the same boundary — same fragment dialect as esc-3886-1's row above (the closing `content` tag followed by the next parameter's opening tag, serialised into `content`'s tail). Both legs re-emitted clean after reordering so `content` was the **last** parameter; nothing persisted corrupt (mem0 writes `9e0184ac...`/`f3541b8e...`, truncated prefixes as given by the source amendment). |
+| 2026-08-20 (produced live while the escalation-watcher filed task 4296's follow-up ticket, resolving esc-markup-tripwire-23) — **Specimen 3** | `submit_task.description` — **gated** | the parameter opening tag | Rejected `McpEnvelopeMarkupWriteRejected`. Emission order was `project_root` / `title` / `description` / `priority` / `metadata` — `description` absorbed the following `priority` parameter's opening tag. The retry changed only the parameter order (`description` emitted **last**), kept the prose byte-identical, and landed clean; that write is what created this task's (4296's) ticket. |
+
+**Open hypothesis (not implemented or tested — documentation only): parameter order.** Two specimens above now anchor this directly. **Specimen 2**: both legs of one parallel `add_memory` batch failed together at the same boundary, and both landed clean once `content` was moved to last. **Specimen 3**: a reject-to-clean flip driven only by parameter position, with byte-identical prose — the sharpest single datapoint here, since it holds the payload constant and varies only order. A per-call transient predicts neither observation; both point toward a positional / per-serialization defect rather than a payload property.
+
+This bears on the 2026-08-20 esc-3886-1 row above, whose own conclusion is "consistent with §2.5's transient-for-that-call-pair reading rather than a payload property" — flagged here as a tension between rows rather than resolved; esc-3886-1's own recorded conclusion is left as-is. B4/§2.1's "already last, nothing dropped" observation is consistent with this reading, but it is a single retrospective row and is not the load-bearing evidence; Specimens 2 and 3 above are.
+
+Still correlational and small (n=2 in one turn; n=1 reject plus n=1 clean retry): the retry-luck confound is real — this PRD records several immediate-retry-landed-clean cases — so Specimen 3 alone does not distinguish position from retry-luck. The controlled experiment that would: compare FIRST-attempt leak rates across parameter positions, holding prose constant. Noted here as a candidate follow-up investigation, not a conclusion; no code or test changes accompany this note, and the controlled experiment itself is out of this documentation-only task's file scope — tracked separately as task 4558 ("Controlled experiment: does MCP tool-call parameter order affect envelope-markup leak rate?", filed 2026-08-20, priority low, pending as of this writing).
 
 ### 2.6 The corruption is deterministically repairable
 
@@ -104,7 +167,7 @@ shared/src/shared/toolcall_markup.py
   ├─ detect(value)            -> MarkupHit | None       (single pattern source, INV-5)
   ├─ repair(value, param, schema_params, supplied)
   │                           -> Repair(clean_value, recovered:{name:value}) | Unrepairable
-  └─ FIXTURES: 334 real specimens committed as the regression pin
+  └─ FIXTURES: 504 real specimens committed as the regression pin
 
 shared/src/shared/mcp_markup_middleware.py
   MarkupGuardMiddleware(policy: RepairPolicy, exempt_tools: frozenset)
@@ -143,7 +206,7 @@ def repair(value: str, param: str, schema_params: Collection[str],
 - `repair` is pure, synchronous, and never raises for any input.
 - `clean_value` is always a **prefix** of the input — the repairer never invents or reorders caller text.
 - `recovered` values are verbatim substrings of the input — the repairer never synthesises a value.
-- Determinism: identical input ⇒ identical output. Pinned by the 334-specimen corpus.
+- Determinism: identical input ⇒ identical output. Pinned by the committed 504-record corpus (see §9 α on why that is not the survey's 334).
 
 ### C2 — Boundary policy contract (`MarkupGuardMiddleware`)
 
@@ -186,6 +249,10 @@ Every rewrite is **atomic**: repair into a temp file in the same directory, veri
 
 - **D6 — Claude Code builtin tools are out of scope.** `Agent` (2) and `Edit` (1, itself a false positive — the test fixture in `test_toolcall_xml_leak.py`) are not our servers. The middleware cannot reach them; the upstream report (θ) is the only lever.
 
+- **D8 — plan-tools COMPOSES the middleware with ε's read-time repair; neither skips nor supersedes.** *(γ2, task 4457)* The three options were enumerated as γ2 requires. **Skip** fails: ε cannot reject, cannot see inbound arguments, cannot recover a swallowed REQUIRED parameter, and `_create_plan` is deliberately unhooked from it — while plan-tools owns **52 of the 95** unrepairable specimens. **Supersede** fails on POPULATION: ε's is damage *already landed* in stored `plan.json` (19 hard-damage strings across 16 tasks, three still live — 3382 and 4081 pending, 3133 blocked), none of which the middleware repairs, because it only ever sees what an agent is sending *now*. **Compose** holds: different layers over different populations — inbound arguments at the FastMCP request layer versus stored state at read time inside the tool body. INV-5 forbids a second *enumeration* of the literals and there is none (both delegate every accept/refuse decision to `shared.toolcall_markup`); D1 forbids per-boundary *call sites* in place of a blanket middleware, and ε is a different layer, not a per-boundary call site. Two consequences are pinned by test rather than left to inference: under `REJECT_WITH_REPAIR` no middleware-repaired value ever reaches storage, so ε can never re-report the same damage as a second fact; and a rejected call short-circuits the tool body, so pre-existing stored damage is **deferred** to the next accepted call, never lost.
+
+- **D9 — Residue escalations are filed under a NON-TASK anchor, never under the leaking task's id.** *(γ2, task 4457 — binding on every registration site, γ1 and γ3 included.)* The middleware declares residue at `level=2` (INV-7: the L2 watcher is its owner), and in this repo a *pending* `level>=2` escalation carrying a live task id is a stop-the-line event for that task: `workflow._is_gating_escalation` gates on `level >= 2`, `_check_escalations` looks records up by task id alone, and `_wait_for_resolution` raises `_StewardReescalated`, which `run()` turns into `_mark_blocked`. Filing residue under the live id would therefore convert **one** leaked tool call — a ~0.27% harness serialization defect — into a human-gated task halt, and would contradict the refusal hint the same guard ships, which tells the caller to resend from its own copy and carry on. The anchor changes only *where* the record is filed: level, owner and category stay the middleware's, so it still reaches the L2 watcher, and the subject task rides in the summary and detail. This matches `markup_tripwire`'s existing `markup-tripwire` anchor. A registration site that genuinely wants to halt the caller's task must say so at the filing site and pin it with a test — it is never the default.
+
 - **D7 — The upstream defect is not fixable here.** The originating error is model-side (wrong closing-tag dialect); the *amplification* — silently over-consuming and dropping parameters instead of raising a parse error — is the harness parser's. Neither is in this repo. Everything in this PRD is containment, recovery and repair.
 
 ---
@@ -195,12 +262,12 @@ Every rewrite is **atomic**: repair into a temp file in the same directory, veri
 | Assumed capability | Verification | Result |
 |---|---|---|
 | `fastmcp.server.middleware.Middleware` with `on_call_tool` | `uv run python -c "import fastmcp; from fastmcp.server.middleware import Middleware"` | ✅ fastmcp **3.2.2**, `on_call_tool` present |
-| `FastMCP.add_middleware` | `hasattr(FastMCP,'add_middleware')` | ✅ True |
+| `FastMCP.add_middleware` | `hasattr(FastMCP,'add_middleware')` | ⚠️ **True for the STANDALONE `fastmcp` class ONLY.** Re-probed 2026-08-19: `fused-memory/server/tools.py:17` imports `mcp.server.fastmcp.FastMCP` — the MCP SDK's *bundled* class — where `add_middleware` and `get_tool` are both **False**. This row was verified against one class and applied to four sites. See γ3. |
 | Middleware sees tool name + arguments | live probe, `context.message.name` / `.arguments` | ✅ `demo`, `{'content':…,'category':'orig'}` |
 | Middleware can read the tool's parameter schema | live probe, `context.fastmcp_context.fastmcp.get_tool(n).parameters['properties']` | ✅ `['category','content','project_id']` — **the validation substrate is real** |
 | Mutated arguments reach the tool | live probe, set `arguments['category']='REPAIRED'` | ✅ tool returned `ok:…|REPAIRED|None` — **forward-repair is implementable** |
 | `dark-factory-shared` importable from all three packages | `pyproject.toml` workspace dep + live imports | ✅ fused-memory, orchestrator, escalation all import `shared.*` today |
-| The four registration sites | grep `FastMCP(` | ✅ `tools.py:1038`, `plan_tools.py:596`, `verdict_tools.py:172`, `escalation/server.py:307` |
+| The four registration sites | grep `FastMCP(` | ⚠️ Sites exist, but a **name match does not distinguish the two FastMCP classes**, which is how the row above passed green for a site lacking the capability. Anchors are also stale — re-measured on `f15a796313`: `tools.py:1060`, `plan_tools.py:1553`, `verdict_tools.py:172`, `escalation/server.py:649`. Re-grep; they move. |
 | `EscalationQueue` for residue escalations | already used by `markup_tripwire.emit_markup_storm_escalation` | ✅ |
 | 334-specimen corpus extractable | `data/orchestrator/agent-transcripts/**/*.jsonl.gz` | ✅ 334 collected, 308 repair, 26 escalate |
 
@@ -247,7 +314,8 @@ No reciprocal-ownership ambiguity: 3083 and 3141 are both terminal, so this PRD 
 
 **α — `shared.toolcall_markup`: detector, deterministic repairer, committed fixture corpus.** *(intermediate — unlocks β, δ, ε, ζ, θ)*
 Modules: `shared/src/shared/toolcall_markup.py`, `shared/tests/`, `shared/tests/fixtures/toolcall_markup_corpus.jsonl`.
-Implements C1. Extracts the 334 real specimens from the archived transcripts into a committed corpus (tool, param, supplied keys, raw value) and pins the repairer against it.
+Implements C1. Extracts the real specimens from the archived transcripts into a committed corpus (tool, param, supplied keys, raw value) and pins the repairer against it.
+*Two numbers, both correct — do not reconcile them by editing one.* **334 / 308 / 26** is the **2026-08-05 survey**, measured over that window's transcripts (§2.3, §2.6, §5 D2, §6, and the G6 note below all quote it). **504 records, 443 repaired / 61 unrepairable** is the **committed corpus** at `shared/tests/fixtures/toolcall_markup_corpus.jsonl` as extraction actually landed it — re-derived from that file 2026-08-15 (task 4022). Where this document states a present-tense fact about the committed file (§4 C1 determinism, §10 B13, §11 open question 3) it uses the 504 figures; where it reports what the survey found, it keeps 334.
 *Unlocks:* β (the middleware imports `detect`/`repair`), δ, ε.
 *Evidence:* each corpus record carries its **expected outcome** (`repaired` with the expected recovered-parameter names, or `unrepairable`), committed alongside the specimens; replay asserts the repairer matches every committed expectation, that replay is byte-identical across two runs, and that D5 holds for every repaired case (`clean_value` is a prefix of the input; every recovered value is a verbatim substring).
 *G6 note — deliberately not a bare threshold.* The reference implementation scores **308 repaired / 26 unrepairable (92.2%)**, and that is the basis for expecting a high rate; but the signal is agreement-with-committed-expectations, not a literal count. A correct implementation that repairs *more* of the 26 ambiguous cases must update the expectation file in the same commit — which is a reviewable improvement, not a RED test. Pinning the literal 308 would make a better repairer look like a regression.
@@ -258,10 +326,52 @@ Implements C2: `RepairPolicy.{REJECT_WITH_REPAIR,FORWARD_REPAIR}`, `exempt_tools
 *Unlocks:* γ (registration on the four servers).
 *Evidence:* against an in-process `FastMCP` harness, a corrupted call under each policy produces the contracted outcome; a burst of repairs fires the storm escalation (INV-4).
 
-**γ — Register the middleware on all four servers; retire the in-line gates.** *(leaf)* · depends: β
-Modules: `fused-memory/src/fused_memory/server/tools.py`, `orchestrator/src/orchestrator/mcp/plan_tools.py`, `orchestrator/src/orchestrator/mcp/verdict_tools.py`, `escalation/src/escalation/server.py`.
-Registers with the declared per-server policy from C2 and removes the four `_markup_gate` call sites (D1, INV-5).
-*Signal:* a live `submit_task` whose description carries `</description>` + `<parameter name="priority">low` is **rejected with `repaired_call` containing `priority: "low"`**; a live `escalate_info` with the same defect **lands with `suggested_action` populated** and emits `markup_repaired` — both observable through the tool response and the filed escalation record, not by reading storage.
+**γ — SPLIT THREE WAYS 2026-08-19 (operator decision).** The single γ leaf declared all four servers and was
+therefore **never dispatched once** — `data/orchestrator/runs.db` carries zero events of any type for task 3690
+across four months, because the task required simultaneous module locks on the two hottest files in the repo
+(61 pending/in-progress tasks declare `fused-memory/server/tools.py`, 26 declare `escalation/server.py`). Two
+further reasons to split rather than re-pin: plan-tools acquired a *second* mechanism after decompose (ε, task
+3692) and needs an explicit D1 ruling, and fused-memory turns out not to support the middleware at all (§6).
+Nothing about the contracts changed — only the packaging.
+
+**γ1 — Register on the escalation and verdict-tools servers (the `FORWARD_REPAIR` pair).** *(leaf, task 3690)* · depends: β
+Modules: `escalation/src/escalation/server.py`, `orchestrator/src/orchestrator/mcp/verdict_tools.py`.
+Absorbs task **4180** (cancelled into it): same escalation-server slice, and its "reject vs stamp vs recover vs log"
+design question is already answered by C2 (`FORWARD_REPAIR` *is* its option (c)). Carries 4180's one non-obvious
+finding — `escalate_info.evidence` is **list-typed** while `Repair.recovered` is `dict[str, str]` and the middleware
+applies it as a bare `arguments.update` with no coercion, a case B3's str-typed specimen never exercises.
+*Signal:* a live `escalate_info` with a mis-closed `detail` **lands with `suggested_action` populated and `evidence`
+restored as a list**, and emits `markup_repaired` — where the identical call today lands with both silently at their
+defaults. This is where the *silent* damage actually is: a swallowed **required** parameter raises loudly in pydantic,
+a swallowed **optional** one just takes its default, and `escalate_info` requires only its first four.
+
+**γ2 — Register on plan-tools, and rule on the overlap with ε.** *(leaf, task 4457)* · depends: β
+Modules: `orchestrator/src/orchestrator/mcp/plan_tools.py`.
+ε (3692) landed `_with_markup_repairs` in this same file: **read-time** lazy repair of stored `plan.json` with
+write-back, which cannot reject, memoizes refusals per process, and whose `plan_markup_repaired` log line has **no
+sink** and whose `markup_repairs` fact has **no consumer**. `_create_plan` is deliberately unhooked with a comment
+delegating inbound arguments to this middleware. Complementary in principle — but D1/INV-5 requires the ruling be
+made, tested, and written down, not left implicit.
+*Signal:* as the original γ's `submit_task` row (B1/B2), on a plan-tools write tool.
+*RULED 2026-08-19 (task 4457) — **COMPOSE**, recorded as D8 in §5.* The registration site is
+`create_server` in `orchestrator/src/orchestrator/mcp/plan_tools.py`: `REJECT_WITH_REPAIR` with an
+explicitly empty `exempt_tools`, both declared at the site (INV-1), plus a real `escalation_sink`
+filing residue and storm records to the project's `EscalationQueue` — without it, this server's 52
+unrepairable specimens would go from *corrupt but present* to *silently absent*, while the
+middleware's own hint promises the payload is preserved in the escalation it names. `fact_sink`
+is deliberately left unwired and the site records why. Residue is filed under a **non-task anchor**
+so preserving a payload never halts the run that produced it — recorded as D9 in §5, and binding on
+γ1 and γ3 as well.
+
+**γ3 — Adapt the guard to fused-memory's bundled FastMCP; cover the two ungated write tools; only then retire the in-line gates.** *(leaf, task 4458)* · depends: β
+Modules: `fused-memory/src/fused_memory/server/tools.py`, `fused-memory/src/fused_memory/server/main.py`.
+Choose between migrating to standalone `fastmcp` and adapting through the existing `_safe_call_tool` chokepoint in
+`server/main.py` (an in-repo precedent for a single interception point on this server). New coverage: `add_system_record`
+(`:3102`) and `update_memory` (`:4316`), both ungated, both Mem0 writers, both optional-tailed.
+⚠️ **The in-line gates are retired only after the replacement is live and demonstrated.** This is the one boundary whose
+containment provably works — Mem0 is frozen at 40 legacy specimens since **2026-07-30**, Graphiti at 14 since
+**2026-07-29** (both re-measured 2026-08-19; Graphiti had never been scanned before, as `scan_memory_content` is
+Mem0/Qdrant-only). Retiring early would open the only door that is currently shut.
 
 **δ — Retro-sweep of terminal state, atomic.** *(leaf)* · depends: α
 Modules: `scripts/sweep_toolcall_markup.py`, `scripts/tests/`.
@@ -292,7 +402,9 @@ Re-point `docs/prds/memory-write-path-convergence.md` §8's "XML-leak cure" row 
 ### DAG
 
 ```
-α ──┬── β ── γ ── ι
+α ──┬── β ──┬── γ1 ──┐
+    │        ├── γ2 ──┼── ι
+    │        └── γ3 ──┘
     ├── δ
     ├── ε
     ├── ζ
@@ -332,13 +444,16 @@ No waivers required.
 | B10 | Storm escape fires | 3 repairs within the window on one project | Storm escalation filed once, naming outcome `repaired` |
 | B11 | Sweep atomicity | δ interrupted between temp-write and replace | Target file unchanged and still parses; no partial JSON |
 | B12 | Lazy write-back under concurrency | ε repairs a live plan while a task reads it | Reader observes either the old or the repaired file, never a partial one |
-| B13 | Corpus determinism | replay all 334 specimens twice | Byte-identical results both runs; every outcome matches the committed per-specimen expectation (reference: 308 repaired / 26 unrepairable) |
+| B13 | Corpus determinism | replay all 504 specimens twice | Byte-identical results both runs; every outcome matches the committed per-specimen expectation (reference: 443 repaired / 61 unrepairable) |
+| B14 | REQUIRED absorbed parameter is recoverable | `add_memory.content` absorbs the REQUIRED `project_id`, which is then absent from the call; both tiers | `on_call_tool` runs before pydantic validation, so the repair is reached: `REJECT_WITH_REPAIR` bounces with `repaired_call.project_id` and `error_type=mcp_markup_detected` (NOT a missing-required-field error) and nothing is written; `FORWARD_REPAIR` executes the tool bound to a required argument that was never on the wire |
+| B15 | The ordering's one precondition | the same call with `strict_input_validation=True` | Middleware never runs; caller gets `Input validation error`; NO `markup_detected` fact and NO storm count — every required-parameter leak is silently unrepairable. Registration (γ) must not enable it |
 
 ---
 
 ## 11. Open questions (tactical, implementation-time)
 
 1. **Middleware ordering.** If a server later adds a second middleware, does the markup guard run first? **Suggested resolution:** register it first and assert its position in a test. Decide during γ.
+   *Partly settled (task 4022, empirically, fastmcp 3.2.2).* The FRAMEWORK-ordering half is no longer open: `on_call_tool` runs strictly BEFORE pydantic argument validation, so a REQUIRED absorbed parameter is recoverable — boundary rows B14/B15, with the one precondition that `strict_input_validation` stays off. This item's actual question — ordering relative to a SECOND middleware, if one is ever added — is untouched by that and remains for γ.
 2. **`add_system_record` / `update_memory` policy tier.** Both are fused-memory writes, so they inherit `REJECT_WITH_REPAIR`; `add_system_record` is recon-stage-only and may not retry. **Suggested resolution:** start with the server default, revisit if the storm counter shows rejections there. Decide during γ.
-3. **Fixture corpus size in-repo.** 334 raw values include long text; the committed corpus may be large. **Suggested resolution:** store truncated-but-sufficient values (tail + 200 chars of lead-in) if size is a problem, keeping the 26 unrepairable cases verbatim. Decide during α.
+3. **Fixture corpus size in-repo.** 504 raw values include long text; the committed corpus may be large. **Suggested resolution:** store truncated-but-sufficient values (tail + 200 chars of lead-in) if size is a problem, keeping the 61 unrepairable cases verbatim. Decide during α.
 4. **Retention of the archived transcripts.** The corpus is extracted from `agent-transcripts/`, which is retention-bounded. **Suggested resolution:** the committed corpus is the durable artifact; no dependency on the archive after α.

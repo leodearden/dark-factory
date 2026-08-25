@@ -20,6 +20,7 @@ class TestTopLevelImports:
             AllAccountsCappedException,
             CostStore,
             IllegalTransitionError,
+            ProbeSpawnError,
             SessionBudgetExhausted,
             UsageCapConfig,
             UsageGate,
@@ -30,12 +31,14 @@ class TestTopLevelImports:
             files_to_modules,
             invoke_claude_agent,
             invoke_with_cap_retry,
+            is_cli_invocation_rejected,
             is_timed_out_with_progress,
             is_zero_output_timeout,
             load_json_or_warn,
             modules_conflict,
             normalize_lock,
             read_transcript_records,
+            require_non_blank_prompt,
         )
 
         assert AgentResult is not None
@@ -43,6 +46,13 @@ class TestTopLevelImports:
         assert invoke_with_cap_retry is not None
         assert is_zero_output_timeout is not None
         assert is_timed_out_with_progress is not None
+        # esc-3118-1 (task 3143): the pre-first-turn transport rejection predicate
+        # and the non-blank-prompt precondition are consumed OUT of package (the
+        # orchestrator's sandboxed claude path calls the latter), so they must be
+        # importable from the blessed top-level surface rather than reached for
+        # inside the submodule.
+        assert is_cli_invocation_rejected is not None
+        assert require_non_blank_prompt is not None
         assert count_transcript_turns is not None
         assert read_transcript_records is not None
         assert UsageGate is not None
@@ -50,6 +60,7 @@ class TestTopLevelImports:
         assert AccountPhase is not None
         assert SessionBudgetExhausted is not None
         assert IllegalTransitionError is not None
+        assert ProbeSpawnError is not None
         assert AccountConfig is not None
         assert UsageCapConfig is not None
         assert CostStore is not None
@@ -87,10 +98,13 @@ class TestModuleLevelAll:
             'ended_awaiting_background_for_session',
             'invoke_claude_agent',
             'invoke_with_cap_retry',
+            'is_cli_invocation_rejected',
             'is_server_error_status',
             'is_timed_out_with_progress',
             'is_zero_output_timeout',
+            'note_unreadable_transcript',
             'read_transcript_records',
+            'require_non_blank_prompt',
             'transcript_exists',
         }
 
@@ -105,6 +119,7 @@ class TestModuleLevelAll:
             'InvokeSlot',
             'SessionBudgetExhausted',
             'IllegalTransitionError',
+            'ProbeSpawnError',
         }
 
     def test_config_models_all(self):
@@ -138,7 +153,8 @@ class TestModuleLevelAll:
             'normalize_lock',
             'files_to_modules',
             'modules_conflict',
-            'CODE_EXTENSIONS',
+            'FILE_EXTENSIONS',
+            'EXTENSIONLESS_FILENAMES',
             'is_file_path',
             'directory_locks',
             'strip_directory_locks',
@@ -154,7 +170,7 @@ class TestModuleLevelAll:
         from shared import safe_io
 
         assert hasattr(safe_io, '__all__'), 'safe_io must define __all__'
-        assert set(safe_io.__all__) == {'load_json_or_warn'}
+        assert set(safe_io.__all__) == {'atomic_write_text', 'load_json_or_warn'}
 
     def test_mcp_idempotency_all(self):
         from shared import mcp_idempotency
@@ -234,6 +250,56 @@ class TestInitAllCompleteness:
             assert private == [], (
                 f'{name}.__all__ must not contain private symbols: {private}'
             )
+
+
+class TestProbeSpawnErrorContract:
+    """Pin the shape of `ProbeSpawnError`, not just its presence in `__all__`.
+
+    Task 4512. The exception exists to carry ONE distinction the old `return
+    False` could not: "the cap-resume probe could not be spawned at all" (a
+    host fault) versus "the probe ran and the account is still capped". Two
+    properties of the class are load-bearing for that distinction, and neither
+    is implied by the name appearing in `__all__`:
+
+      - it must NOT be an `OSError` subclass. `_run_probe` classifies a spawn
+        fault by catching `OSError` around `create_subprocess_exec`; if
+        `ProbeSpawnError` were itself an `OSError`, any `except OSError` arm
+        downstream (including a future one) could silently reabsorb it and
+        restore exactly the swallow this task removes;
+      - it must carry the failing binary and the originating `OSError` as
+        attributes AND render both in `str(exc)`, because the operator-facing
+        signal ("which binary, and why") has to survive both a structured
+        handler reading `.binary`/`.cause` and a bare `logger.error('%s', exc)`.
+    """
+
+    def test_probe_spawn_error_is_a_plain_exception_not_an_oserror(self):
+        from shared.usage_gate import ProbeSpawnError
+
+        assert issubclass(ProbeSpawnError, Exception)
+        assert not issubclass(ProbeSpawnError, OSError), (
+            'ProbeSpawnError must NOT derive from OSError: an `except OSError` '
+            'arm anywhere downstream would reabsorb it and re-hide the '
+            'infrastructure fault as an ordinary probe failure.'
+        )
+
+    def test_probe_spawn_error_exposes_binary_and_cause(self):
+        from shared.usage_gate import ProbeSpawnError
+
+        cause = FileNotFoundError(2, 'No such file or directory', 'claude')
+        exc = ProbeSpawnError('claude', cause)
+
+        assert exc.binary == 'claude'
+        assert exc.cause is cause
+        assert isinstance(exc.cause, OSError)
+
+    def test_probe_spawn_error_message_names_binary_and_cause(self):
+        from shared.usage_gate import ProbeSpawnError
+
+        cause = FileNotFoundError(2, 'No such file or directory', 'claude')
+        rendered = str(ProbeSpawnError('claude', cause))
+
+        assert 'claude' in rendered, rendered
+        assert 'No such file or directory' in rendered, rendered
 
 
 class TestPEP561:

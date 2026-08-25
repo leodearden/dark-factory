@@ -38,8 +38,16 @@ from shared.invocation_outcome import (
     CapHit,
     InvocationOutcome,
     NearCap,
+    auth_failure_reason,
     classify_invocation,
 )
+
+# Aliased on import: this module defines its own _parse_resets_at below, and a
+# same-name import would shadow it — breaking the
+# orchestrator/src/orchestrator/usage_gate.py re-export and its tests. The two
+# differ deliberately: the strict copy returns None on parse failure, the local
+# fork fabricates `now + 1h` (see the note at its definition).
+from shared.invocation_outcome import _parse_resets_at as _parse_resets_at_strict
 from shared.proc_group import terminate_process_group
 
 if TYPE_CHECKING:
@@ -54,6 +62,7 @@ __all__ = [
     'AccountPhase',
     'SessionBudgetExhausted',
     'IllegalTransitionError',
+    'ProbeSpawnError',
 ]
 # NOTE: AccountLease is intentionally NOT listed here even though it is part
 # of this module's public surface (consumed by callers of
@@ -82,6 +91,21 @@ CREDENTIALS_PATH = Path.home() / '.claude' / '.credentials.json'
 # promptly (self-correcting). Deliberately a small internal responsiveness
 # constant, not an operator knob.
 _SCOPE_WAIT_REPOLL_CEIL_SECS = 5.0
+
+# Consecutive spawn failures on ONE account before the gate latches
+# `probe_infra_fault` (task 4512). Greater than 1 so a single transient spawn
+# error cannot flap the latch; small so a real host fault — a missing binary, a
+# broken self-update symlink, an unresolvable PATH — is named within a few
+# probe cycles instead of hours. Counted CONSECUTIVELY rather than over a
+# window (cf. shared/storm_counter.py): a spawn error immediately followed by a
+# probe that RAN is genuinely transient and must clear, whereas a windowed
+# counter would still latch on three errors interleaved with successes. A run
+# ends either way it can end — a probe that RAN, or the account leaving the
+# probing phases (see _reset_probe_spawn_failures) — so the count reaching the
+# threshold really does mean that many failures back to back.
+# Deliberately an internal constant, not an operator knob — it tunes how
+# quickly a fault is NAMED, not whether the fault is tolerated.
+_SPAWN_FAULT_THRESHOLD = 3
 
 # Probe config-dir naming (task 3086). _PROBE_TASK_ID_PREFIX is the task_id
 # stem handed to TaskConfigDir; _PROBE_DIR_PREFIX is the resulting on-disk
@@ -186,6 +210,40 @@ class IllegalTransitionError(Exception):
     ``_LEGAL_TRANSITIONS``. Account state is left unchanged."""
 
 
+class ProbeSpawnError(Exception):
+    """The cap-resume probe could not be SPAWNED at all (task 4512).
+
+    An INFRASTRUCTURE fault — a missing or non-executable ``claude`` binary, a
+    broken self-update symlink, an unresolvable PATH — never a usage cap. The
+    distinction matters because the two are indistinguishable downstream once
+    collapsed: :meth:`UsageGate._run_probe` used to swallow the spawn's
+    ``FileNotFoundError`` and return the same ``False`` it returns for "the
+    probe ran and the account is still capped", so
+    :meth:`UsageGate._account_resume_probe_loop` took the cap path, invented a
+    reset time an hour out, and reported a synthetic countdown forever. A
+    permanent host fault presented as a self-inflicted usage cap.
+
+    INVARIANT: raised ONLY when the spawn itself failed. A non-zero exit, a
+    probe timeout, a mid-read ``BrokenPipeError``, or a successfully parsed cap
+    message all mean the probe RAN, and all keep their existing ``bool``
+    verdict. Callers rely on that: a raised ProbeSpawnError is proof that
+    nothing was learned about the account's capacity.
+
+    Deliberately derives from ``Exception``, NOT from ``OSError``, even though
+    it always wraps one. An ``except OSError`` arm anywhere downstream would
+    otherwise reabsorb it and restore exactly the swallow it exists to remove.
+
+    Attributes:
+        binary: The command that could not be spawned (``cmd[0]``).
+        cause: The originating ``OSError`` from ``create_subprocess_exec``.
+    """
+
+    def __init__(self, binary: str, cause: OSError) -> None:
+        super().__init__(f'probe binary {binary!r} could not be spawned: {cause}')
+        self.binary = binary
+        self.cause = cause
+
+
 # Legal phase edges (PRD §7.3, task W4-γ). Any edge not listed here raises
 # IllegalTransitionError from _transition unless called with force=True (the
 # escape hatch reserved for _on_sighup_async's operator-driven hard reset).
@@ -255,6 +313,15 @@ class AccountState:
     near_cap: bool = False
     auth_failed_at: datetime | None = None
     auth_reprobe_task: asyncio.Task | None = field(default=None, repr=False)
+    # CONSECUTIVE probe-spawn failures (task 4512), reset to 0 by any probe
+    # that actually RAN — whatever its verdict — and by this account leaving
+    # the CAPPED/AUTH_FAILED set, after which it spawns no probes at all and
+    # so can never produce that proof itself. Deliberately NOT part of the
+    # AccountPhase machine: a spawn fault says nothing about this account's
+    # capacity, so it must not move the account off CAPPED/AUTH_FAILED, and
+    # inventing a phase for it would need edges into and out of every existing
+    # one. It is host state that happens to be observed per account.
+    probe_spawn_failures: int = 0
     # Monotonic counter bumped once per successful `_transition` edge (task
     # W4-δ, PRD §7.4). Lets a capturer of an `AccountLease` (see below)
     # detect whether the account has re-transitioned since the lease was
@@ -422,6 +489,10 @@ class InvokeSlot:
 
         Forwards ``self.scope`` (PRD task β) so a scoped cap detected here
         attributes to only this account's model-scope.
+
+        Settling suppresses ``invoke_slot()``'s ``__aexit__`` safety net, so
+        settling here also releases the PROBE_IN_FLIGHT claim explicitly
+        (task 4096) — see the comment below for why it is unconditional.
         """
         hit = self._gate.detect_cap_hit(
             stderr,
@@ -431,6 +502,15 @@ class InvokeSlot:
             scope=self.scope,
         )
         if hit:
+            # Settling below suppresses invoke_slot()'s __aexit__ safety net, so
+            # the PROBE_IN_FLIGHT claim must be released here (task 4096) —
+            # mirroring report()'s arms. A guarded no-op whenever the gate
+            # handler already moved the account off PROBE_IN_FLIGHT (the
+            # unscoped CapHit -> CAPPED case), so the general path is unchanged.
+            # It is load-bearing for the two handlers that take no phase
+            # transition at all: the SCOPED _handle_cap_detected branch
+            # (invariant S5) and _handle_near_cap_warning in EITHER scope.
+            self._gate.release_probe_slot(self.token)
             self._settled = True
         return hit
 
@@ -456,10 +536,14 @@ class InvokeSlot:
         caller discipline (PRD §7.4, task W4-ε): ``_settled`` is set in a
         ``finally`` so every variant leaves the slot settled exactly once.
         The PROBE_IN_FLIGHT claim taken by ``before_invoke()`` is released on
-        every path — OK/CapHit/AuthFailed release it as a side effect of
-        their phase transition; NearCap and the no-phase-change variants
-        (ZeroOutputWedge/CliLocalError/Failure) release it explicitly via
-        ``release_probe_slot`` since they don't otherwise touch phase.
+        every path — OK/AuthFailed and an UNSCOPED CapHit release it as a side
+        effect of their phase transition; a SCOPED CapHit (which takes no phase
+        transition at all — see below), NearCap, and the no-phase-change
+        variants (ZeroOutputWedge/CliLocalError/Failure) release it explicitly
+        via ``release_probe_slot`` since they don't otherwise touch phase. The
+        CapHit arm calls ``release_probe_slot`` unconditionally: it is a
+        guarded no-op once the account is already CAPPED, so one call covers
+        both scopes (task 4096).
 
         Dispatches to the gate's existing handlers — this method owns no
         transition logic of its own:
@@ -468,11 +552,20 @@ class InvokeSlot:
           ``near_cap``). Does not accumulate cost — ``OK`` carries none; cost
           stays a caller concern (``confirm()`` / ``on_agent_complete``).
         - CapHit -> ``_handle_cap_detected`` (-> CAPPED), forwarding
-          ``self.scope`` (PRD task β): a scoped cap attributes to only this
-          account's model-scope and leaves the account phase AVAILABLE.
+          ``self.scope`` (PRD task β), then ``release_probe_slot``: a scoped
+          cap attributes to only this account's model-scope and takes no phase
+          transition, so the probe claim is released explicitly there (a no-op
+          on the unscoped path, where the CAPPED transition already released
+          it) and the account is left AVAILABLE.
         - AuthFailed -> ``_handle_auth_failure`` (-> AUTH_FAILED; a no-op if
           already CAPPED — CAPPED takes precedence, per that handler's own
-          guard). Scope-blind.
+          guard). Scope-blind. The reason string is rendered by the
+          single-sourced ``invocation_outcome.auth_failure_reason``: it carries
+          the 401/403 response-body snippet when the classifier captured one
+          (``HTTP 401: <snippet>``), and stays the bare ``HTTP {status}`` when
+          it did not. That reason is both logged at WARNING and persisted into
+          the ``auth_failed`` cost event, so the snippet is what distinguishes
+          OAuth revocation from expiry from an org-policy block after the fact.
         - NearCap -> ``_handle_near_cap_warning`` (annotation only, forwarding
           ``self.scope``), then ``release_probe_slot``.
         - Anything else (ZeroOutputWedge/CliLocalError/Failure) ->
@@ -510,8 +603,23 @@ class InvokeSlot:
                     token,
                     scope=self.scope,
                 )
+                # Unconditional, mirroring the NearCap arm (task 4096). The
+                # general (scope=None) path is unaffected: _handle_cap_detected
+                # has already transitioned the account to CAPPED, and
+                # release_probe_slot is guarded on `phase == PROBE_IN_FLIGHT`,
+                # so this is a no-op there — the exact idempotency pinned by
+                # test_usage_gate_exhaustive.py::TestReleaseProbeSlot::
+                # test_noop_after_handle_cap_detected_already_cleared. The
+                # SCOPED path needs it: _handle_cap_detected's `scope is not
+                # None` branch deliberately bypasses _transition (invariant S5)
+                # and returns before any phase write, so without this the
+                # PROBE_IN_FLIGHT claim taken by before_invoke() is never
+                # released, and `finally: _settled = True` below also suppresses
+                # invoke_slot()'s __aexit__ safety net — the account is skipped
+                # by before_invoke's predicate forever.
+                self._gate.release_probe_slot(token)
             elif isinstance(outcome, AuthFailed):
-                self._gate._handle_auth_failure(f'HTTP {outcome.status}', token)
+                self._gate._handle_auth_failure(auth_failure_reason(outcome), token)
             elif isinstance(outcome, NearCap):
                 self._gate._handle_near_cap_warning(outcome.reason, token, scope=self.scope)
                 self._gate.release_probe_slot(token)
@@ -574,6 +682,9 @@ class UsageGate:
         self._last_scope_account: dict[str, str] = {}
         self._background_tasks: set[asyncio.Task] = set()  # prevent GC of fire-and-forget tasks
         self._shutting_down: bool = False
+        # Latched description of an infrastructure fault stopping probes from
+        # running at all (task 4512). None whenever probes can spawn.
+        self._probe_infra_fault: str | None = None
 
         self._accounts: list[AccountState] = self._init_accounts()
         # Reclaim dead-PID probe dirs left behind by earlier processes BEFORE
@@ -740,6 +851,29 @@ class UsageGate:
             old_phase == AccountPhase.PROBE_IN_FLIGHT and new_phase == AccountPhase.AVAILABLE
         ):
             acct.probe_count = 0
+        if old_phase in (AccountPhase.CAPPED, AccountPhase.AUTH_FAILED) and new_phase not in (
+            AccountPhase.CAPPED,
+            AccountPhase.AUTH_FAILED,
+        ):
+            # Task 4512 review fix. probe_spawn_failures counts CONSECUTIVE
+            # failures to SPAWN a probe, and only CAPPED/AUTH_FAILED accounts
+            # spawn probes (_account_resume_probe_loop and _reprobe_account
+            # respectively). An account leaving that set stops producing
+            # evidence, so a counter left behind here is stale forever: it
+            # both pins the latch UNHEALTHY after the host is fixed and lets a
+            # single later transient error trip the >1 threshold. Belongs here
+            # rather than in each caller for the same reason probe_count does
+            # — this method is the sole writer of `phase`, and the two paths
+            # that stranded the counter (_refresh_capped_accounts' clock-driven
+            # CAPPED -> PROBING, _on_sighup_async's hard reset) were missed
+            # precisely because they never touch the probe machinery.
+            #
+            # Note the condition is "leaves the blocked SET", not "leaves
+            # CAPPED": CAPPED <-> AUTH_FAILED both still probe, so evidence
+            # must keep accumulating across that edge.
+            self._reset_probe_spawn_failures(
+                acct, reason=f'account left {old_phase.value} for {new_phase.value}'
+            )
 
         # --- Force hard-reset cleanup (operator-driven, SIGHUP only) ------
         # force=True is reserved for _on_sighup_async's per-account hard
@@ -755,6 +889,12 @@ class UsageGate:
                 acct.auth_reprobe_task.cancel()
             acct.probe_count = 0
             acct.resets_at = None
+            # Covers the AVAILABLE -> AVAILABLE self-loop the blocked-set
+            # block above cannot see (task 4512 review): SIGHUP discards every
+            # account's cap/auth evidence, so it must discard the spawn-fault
+            # evidence with it rather than stay latched on counts it has just
+            # invalidated.
+            self._reset_probe_spawn_failures(acct, reason='operator hard reset (SIGHUP)')
 
         # --- Centralized _open recompute (DD-5) ---------------------------
         if any(a.phase in (AccountPhase.AVAILABLE, AccountPhase.PROBING) for a in self._accounts):
@@ -1310,6 +1450,10 @@ class UsageGate:
             # account-level cap_hit event site, so the scoped path deliberately
             # bypasses it and fires its own cap_hit event (scope detail added)
             # to preserve observability without transitioning the account.
+            # Consequence (task 4096): because this branch takes NO phase
+            # transition, a caller holding a PROBE_IN_FLIGHT claim owns
+            # releasing it — this handler will not do it for them (see
+            # InvokeSlot.report / InvokeSlot.detect_cap_hit).
             # resets_at is the value the generic classifier already parsed
             # (decision 2); an unknown (None) is stored verbatim — the
             # None-backoff policy is γ's (task 2857).
@@ -1411,12 +1555,25 @@ class UsageGate:
 
         logger.warning(f'Account {acct.name} AUTH-FAILED: {reason}')
         if acct.phase not in (AccountPhase.AUTH_FAILED, AccountPhase.CAPPED):
-            # In production, HTTP 429 with "out of extra usage" carries a
-            # "resets ..." phrase in the body — parse and persist it so the
-            # dashboard can surface a reset ETA without re-parsing reason
-            # strings downstream. Skip the 1h fallback when there's no
-            # "resets" hint at all (true 401/403 token revocation).
-            resets_at = _parse_resets_at(reason) if 'resets' in reason.lower() else None
+            # Serves a 401/403 whose restored response-body snippet (task 4042)
+            # carries a genuine "resets ..." phrase — parse and persist it so
+            # the dashboard can surface a reset ETA without re-parsing reason
+            # strings downstream. Skip entirely when there's no "resets" hint at
+            # all (true 401/403 token revocation).
+            #
+            # Uses the STRICT parser deliberately: the module-local
+            # _parse_resets_at fork fabricates `now + 1h` on parse failure,
+            # which dashboard/data/costs.py::_extract_resets_at would then
+            # surface verbatim as a real recovery ETA on a revoked token. The
+            # strict copy returns None instead, so an unparseable hint is
+            # reported as explicitly UNKNOWN rather than invented (PRD 7.1.a —
+            # the invariant stated at invocation_outcome.py's _parse_resets_at).
+            # Both copies agree exactly on every parseable phrase.
+            #
+            # (The old comment here justified the branch by "HTTP 429 ... routed
+            # through _handle_auth_failure", which was stale: classify_invocation
+            # narrows AuthFailed to {401, 403} and routes 429 to CapHit.)
+            resets_at = _parse_resets_at_strict(reason) if 'resets' in reason.lower() else None
             # _transition owns: the phase write, near_cap clear, the
             # centralized _open recompute, cancelling/starting the
             # opposite/matching background task, the auth_failed cost event,
@@ -1479,8 +1636,15 @@ class UsageGate:
     async def _reprobe_account(self, acct: AccountState) -> None:
         """Reload env, refresh the account token, and probe once.
 
-        On success: clear ``auth_failed`` + ``auth_failed_at`` and reopen the
-        global gate. On failure: leave ``auth_failed`` set; caller retries.
+        Three outcomes, not two:
+
+        - probe ran and SUCCEEDED: clear ``auth_failed`` + ``auth_failed_at``
+          and reopen the global gate;
+        - probe ran and FAILED: leave ``auth_failed`` set; caller retries;
+        - probe could not be SPAWNED (``ProbeSpawnError``, task 4512): a host
+          fault, carrying no evidence about this token at all. Recorded on the
+          gate's shared spawn-fault accounting and the account left
+          ``AUTH_FAILED``.
         """
         load_dotenv(override=True)
         token_env = self._token_env_for(acct)
@@ -1491,7 +1655,22 @@ class UsageGate:
                 acct.token = fresh
 
         logger.info(f'Account {acct.name}: firing auth re-probe')
-        ok = await self._run_probe(acct)
+        try:
+            ok = await self._run_probe(acct)
+        except ProbeSpawnError as exc:
+            # The probe could not be spawned — a host fault, not evidence
+            # about this token. Record it and stay AUTH_FAILED: an account we
+            # could not VERIFY must not be read as recovered.
+            #
+            # Caught HERE rather than left to _auth_reprobe_loop's broad
+            # `except Exception`, which would downgrade it to a WARNING
+            # ('auth re-probe raised') and re-hide the one signal that says
+            # this is not an auth problem. Returning early also skips the
+            # 'auth re-probe failed — staying auth_failed' line below, which
+            # asserts a probe that ran.
+            self._note_probe_spawn_failure(acct, exc)
+            return
+        self._clear_probe_spawn_failures(acct)
         if ok:
             if acct.phase == AccountPhase.AUTH_FAILED:
                 # _transition owns: the phase write, clearing auth_failed_at,
@@ -1707,6 +1886,176 @@ class UsageGate:
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
 
+    # --- Probe-spawn infrastructure faults (task 4512) -------------------
+    #
+    # `shared` cannot import `escalation` — the dependency runs the other way
+    # (see shared/mcp_markup_middleware.py:34-42) — so this gate cannot file
+    # one itself. It does what its same-layer peer `ApiHealthGate` does
+    # instead: EXPOSE the condition (`probe_infra_fault`, the analogue of
+    # `ApiHealthGate.is_degraded`) plus CostStore rows as forensics, and leave
+    # the escalation lifecycle to a downstream consumer that may legally
+    # import `escalation`.
+
+    @property
+    def probe_infra_fault(self) -> str | None:
+        """Latched description of an infrastructure fault preventing probes
+        from running at all, or None when probes can spawn.
+
+        NOT a usage cap: no amount of waiting clears it — an operator must fix
+        the host. That distinction is the whole point of the field, so a
+        consumer reading it may treat it as an actionable, non-self-healing
+        condition.
+        """
+        return getattr(self, '_probe_infra_fault', None)
+
+    def _note_probe_spawn_failure(self, acct: AccountState, exc: ProbeSpawnError) -> None:
+        """Record that a probe for *acct* could not be spawned.
+
+        Loud immediately, latched only at the threshold. Every fault is an
+        ERROR the moment it happens, so a transient one is never silent; the
+        latch is the durable "an operator must fix this host" claim, and
+        staking that on a single failure would flap.
+
+        The COUNT, unlike the log line, is only kept for an account that is
+        still in a probing phase — see the guard below.
+        """
+        # Task 4512 review fix: the accumulate side is narrowed to the same
+        # set as the clear-side vote in `_reset_probe_spawn_failures`, and for
+        # the same reason. `probe_spawn_failures` counts CONSECUTIVE spawn
+        # failures, and only CAPPED/AUTH_FAILED accounts spawn probes on a
+        # cadence (`_account_resume_probe_loop` / `_auth_reprobe_loop`), so
+        # only they can ever produce the probe that zeroes the count again.
+        #
+        # `_on_sighup_async` is the path that proved it: it force-resets EVERY
+        # account to AVAILABLE (which zeroes the counter via `_transition`)
+        # and only THEN fans out `_reprobe_account` over all of them. On a
+        # broken host that left every AVAILABLE account holding a count of 1
+        # that nothing would ever clear — `_transition`'s reset fires on
+        # LEAVING the blocked set, and AVAILABLE -> CAPPED is an ENTRY — so a
+        # later, genuine outage latched after only _SPAWN_FAULT_THRESHOLD - 1
+        # real consecutive failures. That is the stale-counter defect
+        # `TestStaleSpawnFailureCounter` exists to prevent, in miniature.
+        #
+        # Narrowing here rather than adding an entry-side reset in
+        # `_transition` keeps ONE rule ("the count is a probing-phase
+        # quantity") instead of two compensating ones, and holds for a
+        # non-probing account that never re-enters the blocked set at all.
+        # The fault itself is still reported at ERROR either way: it is the
+        # COUNT, not the fault, that is meaningless for an account with no
+        # probe loop to clear it.
+        if not (acct.capped or acct.auth_failed):
+            logger.error(
+                'Account %s: probe could not be spawned: binary %r — %s. '
+                'This is an INFRASTRUCTURE FAULT, not a usage cap. NOT '
+                'counted toward the fault latch: the account is %s, which '
+                'runs no probe loop, so it could never produce the probe '
+                'that clears the count.',
+                acct.name,
+                exc.binary,
+                exc.cause,
+                acct.phase.value,
+            )
+            return
+
+        acct.probe_spawn_failures += 1
+        logger.error(
+            'Account %s: probe could not be spawned (%d consecutive): '
+            'binary %r — %s. This is an INFRASTRUCTURE FAULT, not a usage '
+            'cap: the probe never ran, so nothing is known about this '
+            "account's capacity.",
+            acct.name,
+            acct.probe_spawn_failures,
+            exc.binary,
+            exc.cause,
+        )
+
+        # getattr, not a bare read: gates built via `UsageGate.__new__` (see
+        # orchestrator/tests/_orch_helpers.py) assign their fields by hand and
+        # never learn about ones added later. Same idiom as `_shutting_down`.
+        latching = (
+            acct.probe_spawn_failures >= _SPAWN_FAULT_THRESHOLD
+            and getattr(self, '_probe_infra_fault', None) is None
+        )
+        if latching:
+            self._probe_infra_fault = (
+                f'probe binary {exc.binary!r} could not be spawned '
+                f'({exc.cause}) — {acct.probe_spawn_failures} consecutive '
+                f'failures on account {acct.name}'
+            )
+            logger.error(
+                'UsageGate marked UNHEALTHY: probes cannot run — %s. '
+                'Capped accounts cannot be verified and will not resume '
+                'until this is fixed.',
+                self._probe_infra_fault,
+            )
+            # A NEW event_type in this gate's vocabulary, joining cap_hit,
+            # near_cap, auth_failed, auth_resumed, resumed, failover and
+            # lease_stale. Deliberately distinct from cap_hit: a host fault
+            # recorded as cap telemetry is the same "indistinguishable from a
+            # real cap" defect this task removes, just at the data layer —
+            # cap dashboards and cap-history queries would absorb it as load.
+            # Additive for existing readers:
+            # dashboard/.../cap_history.py filters event_type IN
+            # ('cap_hit','resumed') and so is unaffected.
+            self._fire_cost_event(
+                acct.name,
+                'probe_infra_fault',
+                json.dumps({
+                    'binary': exc.binary,
+                    'cause': str(exc.cause),
+                    'consecutive': acct.probe_spawn_failures,
+                }),
+            )
+
+    def _clear_probe_spawn_failures(self, acct: AccountState) -> None:
+        """Record that a probe for *acct* actually RAN, whatever its verdict.
+
+        Recovery is proof-based, never time-based: a probe that returned at
+        all proves the binary is resolvable again. The latch clears only once
+        no account that STILL SPAWNS PROBES has a pending run of failures, so
+        a fleet-wide fault that has healed on one account of six stays
+        reported until the rest confirm it too.
+        """
+        self._reset_probe_spawn_failures(acct, reason='a probe spawned successfully')
+
+    def _reset_probe_spawn_failures(self, acct: AccountState, *, reason: str) -> None:
+        """Zero *acct*'s consecutive spawn-failure count and re-evaluate the latch.
+
+        The shared core behind both ways a pending run of failures can END:
+
+        - a probe for *acct* actually RAN (:meth:`_clear_probe_spawn_failures`)
+          — positive proof the binary is resolvable again; or
+        - *acct* LEFT the probing phases (:meth:`_transition`) — after which it
+          can never produce that proof, because only CAPPED/AUTH_FAILED
+          accounts spawn probes at all.
+
+        Both must re-evaluate the latch rather than merely zero the field: a
+        count the gate has just declared meaningless would otherwise keep
+        reporting the gate UNHEALTHY forever (task 4512 review).
+
+        The zeroing deliberately precedes the re-evaluation, so the account
+        being reset never vetoes its own clear.
+        """
+        acct.probe_spawn_failures = 0
+        if any(a.probe_spawn_failures for a in self._accounts if a.capped or a.auth_failed):
+            # Only CAPPED/AUTH_FAILED accounts spawn probes
+            # (_account_resume_probe_loop and _reprobe_account respectively),
+            # so only they can still produce the evidence that would clear
+            # their own counter. An account outside that set holding a
+            # non-zero count is by definition stale — it will never probe
+            # again to zero it — and letting it vote here is what made the
+            # latch unclearable (task 4512 review). The property's contract
+            # is "None whenever probes CAN spawn", and a non-probing account
+            # says nothing about that.
+            return
+        if getattr(self, '_probe_infra_fault', None) is not None:
+            logger.info(
+                'UsageGate probe infrastructure fault CLEARED for account %s: %s',
+                acct.name,
+                reason,
+            )
+        self._probe_infra_fault = None
+
     async def _refresh_capped_accounts(self) -> bool:
         """Check reset times for all capped accounts. Return True if any uncapped."""
         now = datetime.now(UTC)
@@ -1739,24 +2088,48 @@ class UsageGate:
         Fires a minimal Claude invocation (haiku, 1 turn) to verify the
         account actually has capacity.  Only uncaps the account on success.
         """
-        while acct.capped:
-            target = acct.resets_at
-            if target is None:
-                target = datetime.now(UTC) + timedelta(hours=1)
-                logger.warning(f'Account {acct.name}: no resets_at — defaulting to 1h')
+        # Set once the last probe could not be SPAWNED (task 4512). Starts
+        # False because the first iteration has no evidence either way: at
+        # that instant a host fault and a genuine cap are indistinguishable,
+        # so it must take the cap path — the same one a real cap takes.
+        spawn_faulted = False
 
+        while acct.capped:
             base = self._config.probe_interval_secs
             ceiling = self._config.max_probe_interval_secs
             interval = min(base * (2**acct.probe_count), ceiling)
 
-            remaining = max(0, (target - datetime.now(UTC)).total_seconds())
-            sleep_for = min(interval, remaining) if remaining > 0 else 0
+            if spawn_faulted:
+                # The last probe could not be spawned at all. That is a host
+                # fault, not a cap: this account's real reset time is UNKNOWN
+                # and must not be invented. Retry at the plain backoff cadence
+                # so recovery is noticed once the binary is resolvable again,
+                # but report no countdown and write no resets_at. The account
+                # stays CAPPED — we could not verify capacity, and a real
+                # invocation would die at the same missing binary anyway.
+                sleep_for = interval
+                logger.info(
+                    'Account %s: probe could not be spawned — retrying in '
+                    '%.0fs (reset time unknown; NOT a usage cap)',
+                    acct.name, sleep_for,
+                )
+            else:
+                # --- unchanged cap path -------------------------------------
+                target = acct.resets_at
+                if target is None:
+                    target = datetime.now(UTC) + timedelta(hours=1)
+                    logger.warning(f'Account {acct.name}: no resets_at — defaulting to 1h')
+
+                remaining = max(0, (target - datetime.now(UTC)).total_seconds())
+                sleep_for = min(interval, remaining) if remaining > 0 else 0
+
+                if sleep_for > 0:
+                    logger.info(
+                        f'Account {acct.name}: sleeping {sleep_for:.0f}s '
+                        f'(probe #{acct.probe_count + 1}, resets in {remaining:.0f}s)',
+                    )
 
             if sleep_for > 0:
-                logger.info(
-                    f'Account {acct.name}: sleeping {sleep_for:.0f}s '
-                    f'(probe #{acct.probe_count + 1}, resets in {remaining:.0f}s)',
-                )
                 try:
                     await asyncio.sleep(sleep_for)
                 except asyncio.CancelledError:
@@ -1771,7 +2144,19 @@ class UsageGate:
                 f'Account {acct.name}: firing probe #{acct.probe_count}',
             )
 
-            ok = await self._run_probe(acct)
+            try:
+                ok = await self._run_probe(acct)
+            except ProbeSpawnError as exc:
+                # probe_count was already incremented above, deliberately: the
+                # retry cadence must keep backing off toward the ceiling
+                # rather than hot-spinning on a missing binary. What this
+                # branch removes is only the FABRICATED reset time.
+                spawn_faulted = True
+                self._note_probe_spawn_failure(acct, exc)
+                continue
+
+            spawn_faulted = False
+            self._clear_probe_spawn_failures(acct)
 
             if ok:
                 # _refresh_capped_accounts runs from before_invoke OUTSIDE
@@ -1811,6 +2196,18 @@ class UsageGate:
 
         Returns ``True`` if the invocation succeeded (no cap hit), ``False``
         otherwise.  Uses haiku to minimise cost (~$0.001 per probe).
+
+        Raises:
+            ProbeSpawnError: The probe could not be SPAWNED (task 4512) — the
+                binary is missing, non-executable, or otherwise unstartable.
+                A ``bool`` return always means the probe RAN, so ``False`` is
+                real evidence the account is still blocked; the exception
+                means no evidence was gathered at all. The return TYPE is
+                deliberately left a ``bool`` rather than widened to a
+                tri-state: ~60 call sites across three packages stub this
+                method with ``AsyncMock(return_value=True/False)``, and a new
+                enum member would silently compare unequal to those and be
+                re-read as "still capped".
         """
         _PROBE_TIMEOUT = 30
 
@@ -1840,8 +2237,18 @@ class UsageGate:
             env['CLAUDE_CODE_OAUTH_TOKEN'] = acct.token
         env['CLAUDE_CONFIG_DIR'] = str(config_dir.path)
 
-        proc: asyncio.subprocess.Process | None = None
-        pgid: int | None = None
+        # The spawn is guarded SEPARATELY from the read (task 4512), and the
+        # separation is structural rather than a matter of arm ordering.
+        # On py3.13 `issubclass(TimeoutError, OSError)` is True and
+        # `asyncio.TimeoutError is TimeoutError`, so an `except OSError` arm
+        # sharing a try with `communicate()` — at ANY position ahead of the
+        # existing `except TimeoutError` — would silently reclassify every
+        # 30-second probe timeout as a missing-binary host fault. Keeping the
+        # OSError arm on a try that cannot raise TimeoutError (no timeout is
+        # applied to the spawn) means a later edit reshuffling handlers cannot
+        # reintroduce that. It also gets a second case right for free: a
+        # mid-read BrokenPipeError/ConnectionResetError is an OSError, but the
+        # probe DID run, so it correctly keeps its `False` verdict below.
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -1850,8 +2257,27 @@ class UsageGate:
                 env=env,
                 start_new_session=True,
             )
-            # Capture pgid at spawn (pgid == pid under start_new_session).
-            pgid = proc.pid
+        except OSError as exc:
+            logger.error(
+                'Account %s: probe binary %r could not be spawned: %s — '
+                'INFRASTRUCTURE FAULT, not a usage cap',
+                acct.name, cmd[0], exc,
+            )
+            raise ProbeSpawnError(cmd[0], exc) from exc
+        except Exception as exc:
+            # Deliberately NARROWER than the OSError arm above. Splitting the
+            # try moved the spawn out from under the read's generic handler,
+            # so this restores it — a non-OSError here is a caller-side bug or
+            # a mocking accident, not evidence about the host, and must not
+            # latch the gate unhealthy. asyncio.CancelledError is a
+            # BaseException and so still propagates past this, keeping the
+            # shutdown-drain contract intact.
+            logger.warning(f'Account {acct.name}: probe error: {exc}')
+            return False
+
+        # Capture pgid at spawn (pgid == pid under start_new_session).
+        pgid = proc.pid
+        try:
             stdout_bytes, stderr_bytes = await asyncio.wait_for(
                 proc.communicate(),
                 timeout=_PROBE_TIMEOUT,
@@ -1870,6 +2296,15 @@ class UsageGate:
             raise
         except Exception as exc:
             logger.warning(f'Account {acct.name}: probe error: {exc}')
+            # Symmetric with the TimeoutError/CancelledError arms above (task
+            # 4512 review). We are past the split try, so the spawn SUCCEEDED
+            # and `claude` is live in its own session/process group
+            # (start_new_session=True). A mid-read failure — BrokenPipeError,
+            # ConnectionResetError, a decode error — would otherwise orphan
+            # that group with nothing left to reap it. No `is not None` guard
+            # is needed on proc/pgid: unlike before the split, both are
+            # unconditionally bound by the time control reaches here.
+            await terminate_process_group(proc, pgid, grace_secs=5.0)
             return False
 
         stdout_text = stdout_bytes.decode(errors='replace') if stdout_bytes else ''
@@ -2092,11 +2527,27 @@ class UsageGate:
             self._transition(acct, AccountPhase.AVAILABLE)
 
     def release_probe_slot(self, oauth_token: str | None) -> None:
-        """Release a probe slot claimed by before_invoke() when invoke raises an exception.
+        """Release a probe claim taken by before_invoke() on any path that does
+        not itself transition phase.
 
-        Called in the except handler of invoke_with_cap_retry / _invoke_with_session
-        to clean up probe state when the invoke call raises (subprocess failure,
-        CancelledError, etc.) before confirm_account_ok() or detect_cap_hit() can run.
+        Three callers, none of which the account's phase machine settles on its
+        own (task 4096 widened this from exception-only):
+
+        - **Exception** — the except handler of invoke_with_cap_retry /
+          _invoke_with_session, when the invoke call raises (subprocess failure,
+          CancelledError, etc.) before confirm_account_ok() or detect_cap_hit()
+          can run; and ``invoke_slot()``'s ``__aexit__`` safety net.
+        - **Scoped cap** — ``_handle_cap_detected``'s ``scope is not None``
+          branch writes ``scope_caps[scope]`` and deliberately bypasses
+          ``_transition`` (invariant S5), so the account-level claim is left for
+          the caller: see ``InvokeSlot.report`` / ``InvokeSlot.detect_cap_hit``.
+        - **Near-cap** — ``_handle_near_cap_warning`` is annotation-only in
+          EITHER scope and never transitions phase.
+
+        An UNSCOPED cap needs no call here (``_handle_cap_detected`` already
+        transitioned the account to CAPPED), but the callers above make it
+        unconditionally: the ``phase == PROBE_IN_FLIGHT`` guard below makes it a
+        no-op, which is cheaper than re-deriving what the handler just did.
 
         Effects (only when probe_in_flight is True on the matched account):
         - Clears probe_in_flight
@@ -2109,7 +2560,7 @@ class UsageGate:
         - probe_in_flight is False on the matched account (nothing to release)
 
         Does NOT touch near_cap or capped — those flags track cap status, which
-        is orthogonal to whether an exception occurred during invocation.
+        is orthogonal to why the probe claim is being handed back.
         """
         if not oauth_token:
             return
@@ -2118,12 +2569,13 @@ class UsageGate:
             return
         if acct.phase == AccountPhase.PROBE_IN_FLIGHT:
             logger.info(
-                f'Account {acct.name}: probe slot released after exception — opening to all tasks',
+                f'Account {acct.name}: probe slot released — opening to all tasks',
             )
             # _transition owns: the phase write, probe_count reset, and the
             # centralized _open recompute. clear_near_cap=False preserves
             # this method's documented "does NOT touch near_cap" contract —
-            # this is an exception path, orthogonal to cap status.
+            # releasing the claim is orthogonal to cap status on every caller
+            # (exception, scoped cap, near-cap).
             self._transition(acct, AccountPhase.AVAILABLE, clear_near_cap=False)
 
     def lease_is_current(self, lease: AccountLease) -> bool:
@@ -2214,6 +2666,26 @@ def _parse_resets_at(text: str) -> datetime:
     - "resets Mar 30, 6pm (Europe/London)" (date + time + tz)
     - "resets 9pm (Europe/London)" / "resets 3:00 AM (US/Pacific)"
     - Falls back to 1 hour from now
+
+    NO PRODUCTION CALLERS as of task 4042. This is the fabricating fork of
+    ``shared.invocation_outcome._parse_resets_at``: it invents ``now + 1h`` on
+    parse failure, where the strict copy returns ``None`` (PRD 7.1.a — an
+    unknown reset time must be reported as explicitly unknown, never
+    fabricated). Both live paths now use the strict copy: ``classify_invocation``
+    for its CapHit tier, and ``_handle_auth_failure`` via
+    ``_parse_resets_at_strict``. What survives here is the re-export consumed by
+    ``orchestrator/src/orchestrator/usage_gate.py`` and the ~20 tests across
+    ``shared`` and ``orchestrator`` that pin the ``now + 1h`` fallback contract —
+    which is why task 4042 did not simply delete it. Retiring or repairing this
+    fork is a separate cleanup, not a rider on a regression fix; do not add new
+    callers.
+
+    "Do not add new callers" is ENFORCED, not just asked for:
+    ``shared/tests/test_auth_failed.py::TestFabricatingForkHasNoProductionCallers``
+    AST-scans ``shared/src`` + ``orchestrator/src`` and fails on any call to the
+    bare ``_parse_resets_at`` name outside the module defining the strict copy.
+    If you are retiring this fork, delete that guard class along with this
+    definition.
     """
     # Relative: "resets in Xh", "resets in Xm", "resets in Xd"
     m = re.search(r'resets\s+in\s+(\d+)\s*([hmd])', text, re.IGNORECASE)

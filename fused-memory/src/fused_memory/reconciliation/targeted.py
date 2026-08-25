@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from fused_memory.config.schema import FusedMemoryConfig
+from fused_memory.memory_metadata import normalize_supersedes
 from fused_memory.middleware.task_interceptor import (
     _extract_metadata_files,
     _missing_files,
@@ -32,6 +33,7 @@ from fused_memory.reconciliation.task_filter import (
 from fused_memory.reconciliation.verify import CodebaseVerifier
 from fused_memory.services.memory_service import MemoryService
 from fused_memory.services.orchestrator_detector import is_orchestrator_live_for
+from fused_memory.utils.task_dependency_ids import task_dependency_ids
 from fused_memory.utils.validation import InputValidationError, require_project_root
 
 # Defensive import — escalation is an optional workspace package (mirrors
@@ -674,13 +676,63 @@ class TargetedReconciler:
 
         # 2. If sparse knowledge, verify against codebase and write findings
         if len(related) < 2:
+            # Declared OUTSIDE the try so the except arm can always read it:
+            # False means the verifier itself never produced an outcome, True
+            # means the outcome row already landed and any later raise belongs
+            # to a downstream stage (the memory write), not to the verifier.
+            verify_audited = False
             try:
                 verification = await self.verifier.verify(
                     claim=f"Task '{title}' has been completed",
                     context=f'Task details: {task.get("details") or description}',
                     scope_hints=_extract_scope_hints(task),
                 )
-                if verification.verdict in ('confirmed', 'contradicted'):
+                # ── verify/codebase audit row contract (task 4343) ──────────
+                # Exactly ONE *outcome* row per invocation of this branch, so
+                # the record is a complete census by construction:
+                #   action_type='verify', target='codebase'
+                #   operation ∈ {confirmed, contradicted, inconclusive,
+                #                agent_failed}  from here, plus 'error' from
+                #                the except arm below when the verifier itself
+                #                raised before producing any outcome.
+                # The except arm may ALSO emit a non-outcome 'post_verify_error'
+                # row — when the verifier answered and a later stage inside this
+                # same try (the memory write) raised.  So the outcome census is
+                #   SELECT operation, COUNT(*) FROM run_actions
+                #    WHERE action_type='verify' AND operation != 'post_verify_error'
+                # and it stays exact: no invocation is missing, none double-counted.
+                # Recording only the failure outcomes would leave "the agent
+                # failed" distinguishable from "genuinely inconclusive" solely
+                # by a row being present vs absent — and absence already means
+                # "this branch never opened" for the overwhelming majority of
+                # runs.  Mirrors task 1184's distinct-verb precedent below.
+                outcome = 'agent_failed' if verification.agent_failed else str(verification.verdict)
+                audit_detail = {'task_id': task_id, 'verdict': str(verification.verdict)}
+                if verification.failure_token:
+                    audit_detail['failure_token'] = verification.failure_token
+                await self.journal.add_run_action(
+                    run_id, 'verify', 'codebase', outcome, audit_detail,
+                    causation_id=run_id,
+                )
+                verify_audited = True
+
+                # An agent that never produced a parseable verdict returns the
+                # caller-supplied default ('inconclusive'), which collides with
+                # a legitimate healthy verdict — so this branch MUST be tested
+                # before any branch that reads `verdict`, and MUST read the
+                # structured `agent_failed` flag rather than sniffing the
+                # 'agent-failed:' prefix out of `summary` prose (INV-2
+                # structured-facts-at-failure).
+                if verification.agent_failed:
+                    logger.warning(
+                        'verification_agent_failed task=%s token=%s summary=%s',
+                        task_id, verification.failure_token, verification.summary,
+                    )
+                    result['actions'].append({
+                        'type': 'verification_agent_failed',
+                        'failure_token': verification.failure_token,
+                    })
+                elif verification.verdict in ('confirmed', 'contradicted'):
                     written = await self._fenced_add_memory(
                         content=f"Completed task '{title}': {verification.summary}",
                         category='observations_and_summaries',
@@ -703,8 +755,45 @@ class TargetedReconciler:
                          'deferred': not written},
                         causation_id=run_id,
                     )
+                else:
+                    # Honest inconclusive: the agent looked and found nothing
+                    # either way.  No memory write (there is no finding to
+                    # record) and deliberately NO warning — this is a healthy
+                    # outcome, not an error.  The audit row above is what
+                    # separates it from the agent_failed case that used to be
+                    # byte-identical to it.
+                    result['actions'].append({'type': 'verification_inconclusive'})
             except Exception as e:
                 logger.warning(f'Verification failed for task {task_id}: {e}')
+                # Task 4343: the RAISED failure path is the live one —
+                # agent_llm_provider defaults to 'claude_cli' and _call_llm_cli
+                # raises RuntimeError(build_failure_message(...)) when the CLI
+                # reports failure — and until now it left nothing durable.
+                # add_run_action swallows its own exceptions internally
+                # (journal.py:828+), so recording here cannot escalate a verify
+                # failure into a crash.  The try boundary above is deliberately
+                # NOT widened: _fenced_add_memory stays inside it and keeps
+                # failing closed exactly as before.
+                #
+                # But `_fenced_add_memory` is INSIDE this try and genuinely can
+                # raise (unguarded self.memory.add_memory / buffer.defer_write
+                # network calls), so this arm is reachable with the outcome row
+                # already written.  Attributing that to the verifier would both
+                # double-count the census and blame the wrong stage — the
+                # verifier answered 'confirmed'; it was the write that failed.
+                # Hence the distinct operation + explicit 'stage' in detail.
+                if verify_audited:
+                    stage, operation = 'post_verify_write', 'post_verify_error'
+                    action_kind = 'post_verification_error'
+                else:
+                    stage, operation = 'verify', 'error'
+                    action_kind = 'verification_error'
+                result['actions'].append({'type': action_kind, 'error': str(e)[:200]})
+                await self.journal.add_run_action(
+                    run_id, 'verify', 'codebase', operation,
+                    {'task_id': task_id, 'error': str(e)[:500], 'stage': stage},
+                    causation_id=run_id,
+                )
 
         # 3. Check dependent tasks — are they unblocked?
         try:
@@ -714,8 +803,8 @@ class TargetedReconciler:
                 for t in all_tasks:
                     if not isinstance(t, dict):
                         continue
-                    deps = t.get('dependencies', [])
-                    if task_id in [str(d) for d in deps]:
+                    deps = task_dependency_ids(t)
+                    if task_id in deps:
                         all_deps_done = all(
                             any(
                                 str(dt.get('id')) == str(dep_id) and dt.get('status') == 'done'
@@ -1140,7 +1229,7 @@ class TargetedReconciler:
                 if isinstance(escalation_id_raw, str) and escalation_id_raw
                 else None
             )
-            deps = [str(d) for d in (t.get('dependencies') or [])]
+            deps = task_dependency_ids(t)
 
             is_spawn_from_parent = spawned_from_str == parent_id_str
             is_dependent = parent_id_str in deps
@@ -1417,8 +1506,23 @@ def _is_authoritative_resolution(metadata: dict) -> bool:
 
     A memory is authoritative when its metadata carries EITHER:
 
-    - a truthy ``supersedes`` marker — the established superseding-memory
-      convention (harness.py:849); or
+    - ANY TRUTHY MEMBER of the ``supersedes`` list, as normalized by
+      :func:`~fused_memory.memory_metadata.normalize_supersedes` (PRD D2 /
+      task 3196) — the established superseding-memory convention. The writer
+      is ``ReconciliationHarness._reconcile_status_correction``, which emits
+      the canonical list shape; the legacy SCALAR shape stays tolerated on
+      read for the ~81 pre-migration corpus records (no corpus rewrite in
+      this leaf — PRD D2 defers retro normalization to leaf θ's stamping
+      sweep), which is exactly what the shared normalizer absorbs. See that
+      normalizer's docstring for the full writer/reader map; THIS docstring
+      is the single home of the truthiness rationale that follows.
+      Member-level truthiness (``any(...)``), not
+      container truthiness: ``normalize_supersedes('')`` returns ``['']``, so
+      ``bool(...)`` of the container would flip a falsy legacy scalar to
+      authoritative. ``any(...)`` reproduces the pre-3196 behaviour on every
+      pinned shape and additionally treats ``['']``/``[None]`` as
+      non-authoritative — a list whose only member is empty is not a
+      supersession edge; or
     - a truthy ``_STAGE2_SUPPRESS_KEY`` (``stage2_suppress``) marker whose
       ``source`` is NOT this reconciler's own echo (``source != _ECHO_SOURCE``)
       — Stage 2's real, task_id-scoped "Completion-Note Suppression Pre-Check
@@ -1461,7 +1565,7 @@ def _is_authoritative_resolution(metadata: dict) -> bool:
     """
     if not isinstance(metadata, dict):
         return False
-    if metadata.get('supersedes'):
+    if any(normalize_supersedes(metadata.get('supersedes'))):
         return True
     return bool(metadata.get(_STAGE2_SUPPRESS_KEY)) and metadata.get('source') != _ECHO_SOURCE
 

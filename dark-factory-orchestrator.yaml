@@ -1,7 +1,62 @@
 # Dark Factory — project-specific orchestrator overrides.
 # Core defaults are in the orchestrator package (defaults.yaml).
 
-max_concurrent_tasks: 24
+max_concurrent_tasks: 48
+
+# lock_depth 4→12 (Leo 2026-08-07): make module locks effectively file-granular.
+# Until now dark-factory never set this key at all — it silently inherited the
+# package-bundled orchestrator/src/orchestrator/defaults.yaml:7 value of 4
+# (itself layered over the pydantic Field default of 2). That inheritance, not a
+# decision, is what set the granularity.
+#
+# THE MECHANISM. normalize_lock() truncates a path to its first N components, so
+# "directory-granular locking" is really depth-N truncation, and which files
+# coarsen is an accident of tree shape. Measured on the 2398-file tracked corpus:
+# 1859 files (77.5%) are ≤4 components and ALREADY take file-granular locks; the
+# 539 (22.5%) that coarsen are 507 SOURCE files / 32 fixtures, because CLAUDE.md's
+# <pkg>/src/<pkg>/<subpkg>/<file>.py convention pushes source to depth 5. Reify's
+# crates/<crate>/src/<file>.rs sits at exactly 4, so its coarsening lands on test
+# fixtures (660 of 880) instead. Same ratio, opposite blast radius.
+# The coarsening is ANTI-CORRELATED with coupling: shared/src/shared/locking.py —
+# imported by both orchestrator and fused_memory, the most cross-coupled file here
+# — is depth 4 and already file-locked, while middleware/lock_charter_guard.py
+# collapses into a 28-file directory. It was never buying semantic safety.
+#
+# MEASURED COST/BENEFIT (2026-08-07, 472 live pending+in-progress charters).
+# Cost: total lock keys 1969 → 2101, a 1.07x table growth (median keys/task stays
+# 3), because only the deep quarter is affected. At max_concurrent_tasks 48 the
+# realistic held-key count goes ~200 → ~214; _count_conflicts is O(held × keys).
+# Benefit: at that instant the 11 held coarsened keys locked 463 tracked files
+# while their holders declared 21 — 442 files (95.5%) locked as pure collateral,
+# 18.4% of the whole repo. Worst single key: orchestrator/src/orchestrator/evals,
+# 280 files locked by a task declaring 3.
+#
+# WHY 12 AND NOT REIFY'S 10. Same reasoning, re-measured for this tree: reify's
+# empirical max real path depth is 6 (hence 10 = pure headroom), dark-factory's is
+# 9 — one transcript_corpus fixture, with 106 files at depth 8. 12 leaves 3
+# components of headroom so no CURRENT path coarsens and generated fixture corpora
+# can deepen without silently re-introducing a coarse lock. Re-measure with
+# `git ls-files | awk -F/ '{print NF}' | sort -n | tail -1` if that stops holding.
+#
+# SAFE for the same reason it was safe at reify: correctness rests on BRE
+# (acquire-before-edit) + full-workspace merge-verify, NOT on lock coarseness.
+# Finer locks only shift more weight onto BRE re-pends and merge-verify
+# RED-requeue (accepted cost).
+#
+# WHAT THIS DOES NOT FIX, stated because the csv incident's own escalations got
+# this wrong. It does NOT unpark a task that genuinely shares a FILE with a
+# holder: task 3248 and holder 3455 both declared middleware/task_interceptor.py,
+# so they collide at any depth. What it fixes is the ESCAPE HATCH — esc-3536-8's
+# option (c), splitting the urgent leaf into its own task, was blocked at depth 4
+# (the leaf's guard file coarsened onto the held directory) and dispatches
+# cleanly at depth 12. A 17h unbreakable deadlock becomes one with a one-move out.
+# The residual — charters declaring files the task never edits (3248 declared 4
+# files containing ZERO occurrences of the symbol it renames) — is a task-authoring
+# and curator-combine problem, not a lock-depth one.
+#
+# RED TIER: lock_depth is not in RELOADABLE_FIELDS. This takes effect at the next
+# orchestrator restart, not on reload_config.
+lock_depth: 12
 
 # Verification commands (dark-factory multi-subproject layout)
 # test_command fans out per-subproject so each runs in its own venv with its
@@ -248,12 +303,20 @@ lint_command: "uv run ruff check shared escalation fused-memory orchestrator das
 # _discover_module_configs registers a module iff the directory DIRECTLY
 # contains an `orchestrator.yaml` carrying at least one overridable field, and
 # it SKIPS prefix == '.'. A skills/orchestrator.yaml (prefix `skills`, depth 1)
-# is well inside the effective lock_depth of 4 — the package-bundled
-# orchestrator/src/orchestrator/defaults.yaml ships lock_depth: 4, layered over
-# the pydantic Field default of 2 — so it WOULD be discovered. Registering one
-# is feasible. It is declined. And it could never cover conftest.py or
-# df_pytest_isolation.py regardless, so widening the head above was REQUIRED
-# independent of this decision.
+# is inside lock_depth at EVERY layer the config can resolve — the pydantic
+# Field default, the package-bundled defaults.yaml, and this project's own
+# override alike — so it WOULD be discovered. Registering one is feasible. It
+# is declined. And it could never cover conftest.py or df_pytest_isolation.py
+# regardless, so widening the head above was REQUIRED independent of this
+# decision.
+#
+#   CORRECTED IN PLACE (task 3866), same treatment this block gives its own
+#   superseded premises. This used to read "well inside the effective
+#   lock_depth of 4", which stopped being true when `lock_depth` moved 4 -> 12
+#   (line 59 of this file). The conclusion never depended on the number: depth
+#   1 is inside 2, 4 and 12 alike. So it is now stated as the invariant rather
+#   than re-pinned to 12 — the next retune of that knob falsifies nothing here
+#   and needs no edit to this comment.
 #
 # THE DECIDING FACT, which is what turns a deferral into a decision, and which
 # 3485 could not see because the lever did not exist until its own commit
@@ -304,6 +367,8 @@ lint_command: "uv run ruff check shared escalation fused-memory orchestrator das
 #       skills/**/*.py and RUNS ruff over them (the deciding fact above).
 #   scripts/tests/test_legibility_inventory.py    — reads
 #       skills/spawn/spawn-claude.sh to cross-check a bash/Python encoder mirror.
+#   tests/scripts/test_find_escalation_port.py    — LOADS AND EXECUTES the real
+#       skills/factory-init/scripts/find_escalation_port.py (task 3705).
 # So the union includes orchestrator/tests/ — the fleet's largest suite —
 # duplicated on every review checkpoint, main-tip sweep and merge full-verify.
 # That is far worse than the single-suite duplication 3485 assumed, and it
@@ -527,19 +592,54 @@ type_check_command: "cd fused-memory && npx pyright && cd ../orchestrator && npx
 # was consuming 76% of the old per-command ceiling.
 #
 # WHERE "tight timeouts surface hangs" LIVES NOW: on the PER-MODULE budgets —
-# each subproject's own orchestrator.yaml, plus tests/scripts/orchestrator.yaml's
-# 600s — not on starving the whole-fleet fallback chain. The tight-timeout
-# rationale still holds and is unchanged in KIND: a genuine hang should still
-# surface on the first verify that touches the module, not 8 days later at a
-# post-completion full review. But that property cannot hold at the FLEET level,
-# because a ceiling a green run cannot clear surfaces nothing but false
-# infra_timeouts. It holds per-module, where each suite's real cost is known.
+# each subproject's own orchestrator.yaml — not on starving the whole-fleet
+# fallback chain. The tight-timeout rationale still holds and is unchanged in
+# KIND: a genuine hang should still surface on the first verify that touches the
+# module, not 8 days later at a post-completion full review. But that property
+# cannot hold at the FLEET level, because a ceiling a green run cannot clear
+# surfaces nothing but false infra_timeouts. It holds per-module, where each
+# suite's real cost is known.
+#
+# THE ACTUAL DISPOSITION, because the sentence above used to overclaim it and
+# that is exactly how the gap went unnoticed (task 3473). When 3473 was filed
+# this claim was true for ONE discovered module config; when it was planned,
+# three. It is now true of EVERY discovered module config EXCEPT `orchestrator`.
+# Each declared budget is sized from that module's own measured worst run at
+# ~2.6x, floored at 600s, and they range from 600s to 2400s — the per-module
+# yamls carry the figures and the derivation, and are the single place those
+# numbers live. They are deliberately NOT copied here: a second copy of a
+# measurement is a second thing to raise in lockstep, which is the drift the
+# RAISE-TOGETHER rule in each provenance block exists to prevent.
+#
+# `orchestrator` is the one exception, and it is a REPORTED gap rather than a
+# hidden one: it declares no budget and so still falls through to the 3600 below
+# (verify._resolve_verify_timeout does not "inherit-ish" — an unset module knob
+# is a HARD fall-through to this value). Closing it is task 3353's scope, not
+# 3473's. That is not mere deference: 3353 has since been rewritten to split or
+# shard the orchestrator suite, so a budget sized now against today's unsharded
+# 1366.23s figure would be invalidated by 3353's own change rather than refined
+# by it. It is carried as the single documented entry in MODULE_BUDGET_EXCLUSIONS
+# with a stated deletion condition — once orchestrator/orchestrator.yaml declares
+# its own verify_command_timeout_secs, delete that entry and the coverage guard
+# picks it up with no further edit.
+#
+# WHAT KEEPS THAT PARAGRAPH TRUE rather than merely asserted:
+# tests/scripts/test_module_verify_budgets.py::
+# test_every_discovered_module_config_declares_its_own_verify_budget. It walks
+# what config._discover_module_configs actually REGISTERS rather than a frozen
+# list, so a newly-registered module config landing with no budget fails it with
+# no edit to the guard.
+#
+# The two values below are UNCHANGED by task 3473 and must stay that way. They
+# bound the whole-fleet fallback chain, and every per-module budget asserts
+# strictly-below against 3600 — lowering it would break those assertions across
+# the board as well as the floor guard named next.
 # Guarded by tests/scripts/test_fallback_verify_config.py::
 # test_fallback_verify_budget_clears_the_measured_fleet_chain_floor.
 #
-# BE PRECISE ABOUT WHAT THAT GUARD DOES, because overclaiming it would repeat
-# this comment's own original sin. It asserts the measured floor rather than
-# pinning a value, so it catches anyone LOWERING this budget back below
+# BE PRECISE ABOUT WHAT THAT FLEET-CHAIN-FLOOR GUARD DOES, because overclaiming
+# it would repeat this comment's own original sin. It asserts the measured floor
+# rather than pinning a value, so it catches anyone LOWERING this budget below
 # 1838.60s. It does NOT detect suite growth: MEASURED_FLEET_SEGMENT_SECS is a
 # frozen literal table, so if the orchestrator segment doubles tomorrow the
 # table still reads 1366.23, the floor still reads 1838.60, and the guard stays
@@ -589,6 +689,54 @@ verify_cold_preprovision_command: "uv sync --all-packages"
 # invariant I3 preserves this explicit override until then).
 verify_admission_slots_dir: "/tmp/df-verify-slots-1000-dark_factory"
 
+# INTERIM PARTIAL cap (operator decision, Leo 2026-08-19, esc-5984-3) on the
+# pytest-xdist worker count for the verify TEST LEG.
+#
+# THIS BLOCK IS THE SINGLE SOURCE OF TRUTH for the decision. The T6 report's
+# dated addendum and orchestrator/tests/test_verify_pytest_n_operator_cap.py
+# each point HERE and deliberately keep only what is local to them, rather than
+# re-paraphrasing what follows: several copies of one rationale drift apart
+# silently, which is the same failure this key's guard test exists to prevent.
+#
+# REACHES ROLES {task, background} ONLY. `merge` is deliberately never
+# -n-capped: it bypasses admission slot-counting and is latency-critical
+# (verify.py gates the cap on `role in {'task','background'}`).
+#
+# INTERIM, PENDING TASK 3589 — do NOT close 3589 on the back of this. 3589 puts
+# `-n 8` in `addopts` (orchestrator/pyproject.toml, fused-memory/pyproject.toml)
+# and thereby ALSO covers merge verifies, the offline lane, and agent-initiated
+# pytest inside the implement phase — none of which this knob reaches, since it
+# lives entirely inside verify.py and nothing outside it is touched. When 3589
+# lands, reconcile the two to the same value and state in that commit which
+# layer is authoritative.
+#
+# GREEN-TIER hot-reloadable (RELOADABLE_FIELDS, config.py:5250): reverting to
+# "auto" (or deleting this key) restores the previous behaviour instantly, with
+# no restart and no code change.
+#
+# MEASURED BASIS FOR 8, from task 3589's loaded-host ladder:
+#   - vs n=16: ~108% wall clock at ~61% of CPU-seconds and ~50% of RAM.
+#   - vs n=32: both FASTER (9.31s vs 12.27s) AND 2.7x cheaper in CPU-seconds.
+#   - ~446 MB per-worker RSS, so a fleet drops ~14.3 GB -> ~3.6 GB against
+#     orchestrator-dark-factory.service's 13 GiB memory.current / 11.6 GiB anon
+#     (re-measured 2026-08-19, unchanged from 2026-08-03).
+#
+# CONTRARY EVIDENCE — explicitly considered, not overridden by oversight:
+# plans/verify-oversubscription-benchmark-2026-07-14.md (the T6 report)
+# recommended KEEPING 'auto', because no clean idle window was obtainable on
+# this host, and nominated `-n 16` as the next candidate. That candidate was
+# considered and not chosen. 3589's loaded-host ladder POSTDATES the report.
+# Anyone reopening the value question must reconcile BOTH sources rather than
+# cite either alone; that report carries a dated addendum pointing back here.
+#
+# The CODE DEFAULT is unchanged at 'auto' — this is a deployment-value
+# decision for dark_factory, not a change to what the knob ships as.
+#
+# EXECUTABLE HALF: orchestrator/tests/test_verify_pytest_n_operator_cap.py
+# pins this value and its role gating. Its EXPECTED_COMMITTED_PYTEST_N must
+# move in the SAME COMMIT as any change to the value below.
+verify_admission_pytest_n: "8"
+
 # Fused memory HTTP server — port 8002
 # Port scheme: reify=xxx0, autopilot-video=xxx1, dark-factory=xxx2
 fused_memory:
@@ -605,8 +753,43 @@ escalation:
 # Per-role turn budgets. Raising the architect budget is a direct response to
 # silent max_turns exits on large-scope tasks: the architect now has headroom
 # to verify premises and produce a plan without the CLI truncating mid-tool-call.
+#
+# reviewer 30 -> 60 (2026-08-17, from the task-3543 /unblock investigation).
+# A cap is a runaway guard, not a throttle on normal operation — and 30 had
+# become the latter. Measured over 475 reviewer_comprehensive invocations
+# since 2026-08-10 (orchestrator journal):
+#   - 19.6% of ALL invocations exceeded 30 turns; 24.0% hit one cap or the other
+#   - of 79 failures, 43 sat at EXACTLY turns=31 and only 11 were anything
+#     other than a cap hit — i.e. 86% of reviewer failures were caps, not faults
+#   - successful reviews have p50=19, p90=31, p95=33, max=43 turns, so the cap
+#     was firing BELOW the 90th percentile of normal successful operation
+# 60 leaves ~40% headroom over the observed max while still catching a runaway.
+# Direct precedent: simple_task was raised 30 -> 50 (task 2797) at 28.6%
+# saturation, described there as "the worst of any role"; reviewer was in the
+# same class. Note the observed maxima are CENSORED by the caps themselves, so
+# true demand may run higher — prefer generosity on the next re-baseline too.
+# The mislabeling that let this hide (cap exhaustion reported as
+# "infrastructure errors after retries") is tracked as task 3321.
 max_turns:
   architect: 120
+  reviewer: 60
+
+# Per-role per-invocation dollar ceilings. reviewer 5.0 -> 12.0, same
+# investigation and same rationale as the max_turns.reviewer raise above.
+#   - 5.3% of the 475 invocations hit the $5.00 ceiling; task 3543 alone burned
+#     ~$48 across ten attempts to obtain ONE usable verdict
+#   - $268 of $908 total reviewer spend (29.5%) went to cap-killed runs that
+#     produced nothing at all
+#   - successful reviews cost p50=$1.46, p95=$3.10, max=$4.92 — the ceiling sat
+#     barely above the largest legitimate review, so it bit the tail hard
+# $12 is ~4x p95 and ~2.4x the observed max, and fits the existing ladder
+# (architect 15, deep_reviewer 15, implementer 10). Cross-check against the
+# 60-turn cap: at the observed ~$0.085/turn mean, 60 turns is ~$5, so neither
+# cap masks the other.
+# EXPECTED TO REDUCE net spend: a cap-killed run burns the FULL ceiling, yields
+# nothing, and is then retried up to 4 more times.
+budgets:
+  reviewer: 12.0
 
 # Trailing-24h spend ceiling. Default $200 was a backstop from before the
 # multi-account failover landed — with Anthropic's per-account caps as the

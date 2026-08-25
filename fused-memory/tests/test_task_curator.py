@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import uuid
 from pathlib import Path
@@ -18,9 +19,15 @@ from shared.prompt_artifact import (
     PromptSpec,
     compose_prompt,
 )
+from shared.task_statuses import TaskStatus
 
 from fused_memory.backends.task_backend_errors import TaskmasterError, TaskNotFoundError
 from fused_memory.config.schema import CuratorConfig, FusedMemoryConfig
+from fused_memory.mcp_tools import scheduler_state as scheduler_state_mod
+from fused_memory.mcp_tools.scheduler_state import (
+    clear_lock_depth_cache,
+    effective_lock_depth,
+)
 from fused_memory.middleware.candidate_key import compute_candidate_key
 from fused_memory.middleware.task_curator import (
     _CURATOR_PROMPT_HARNESS_VERSION,
@@ -37,11 +44,11 @@ from fused_memory.middleware.task_curator import (
     _parse_decision_dict,
     _PoolEntry,
     _scale_budget,
-    _task_dependencies,
     _task_files,
     _to_pool_entry,
     _trim_pool,
     flatten_task_tree,
+    is_combine_eligible_status,
     normalize_title,
 )
 
@@ -75,20 +82,14 @@ class TestTaskFiles:
         assert _task_files(task) == ['src/a.py']
 
 
-class TestTaskDependencies:
-    def test_list(self):
-        assert _task_dependencies({'dependencies': ['1', '2', '3']}) == ['1', '2', '3']
-
-    def test_csv_fallback(self):
-        assert _task_dependencies({'dependencies': '1, 2,3'}) == ['1', '2', '3']
-
-    def test_empty(self):
-        assert _task_dependencies({}) == []
-        assert _task_dependencies({'dependencies': None}) == []
-
-
 class TestToPoolEntry:
-    def test_pending_is_combine_eligible(self):
+    def test_maps_task_fields(self):
+        """Field mapping only — combine_eligible is covered by the class below.
+
+        (The per-status eligibility assertions that used to live here are
+        subsumed by ``TestCombineEligibilityNoDivergence``, which parametrizes
+        the same call over the full status vocabulary.)
+        """
         task = {
             'id': '42',
             'title': 'Fix parser',
@@ -101,15 +102,8 @@ class TestToPoolEntry:
         entry = _to_pool_entry(task, source='module', lock_depth=2)
         assert entry is not None
         assert entry.task_id == '42'
-        assert entry.combine_eligible is True
         assert entry.source == 'module'
         assert entry.module_keys == ['src/parser.py']
-
-    def test_done_is_not_combine_eligible(self):
-        task = {'id': '1', 'title': 'x', 'status': 'done'}
-        entry = _to_pool_entry(task, source='module', lock_depth=2)
-        assert entry is not None
-        assert entry.combine_eligible is False
 
     def test_missing_id_returns_none(self):
         entry = _to_pool_entry({'title': 'x'}, source='module', lock_depth=2)
@@ -117,6 +111,79 @@ class TestToPoolEntry:
 
     def test_none_returns_none(self):
         assert _to_pool_entry(None, source='module', lock_depth=2) is None
+
+
+class TestIsCombineEligibleStatus:
+    """The ONE shared combine STATUS predicate (task 4035).
+
+    Selection (``_to_pool_entry.combine_eligible``) and execution
+    (``task_interceptor._execute_combine``) previously hand-copied
+    ``status == 'pending'`` and silently diverged, letting combines land on
+    non-pending targets mid-planning. These tests pin the single definition;
+    the SELECTION call site is pinned to it by
+    ``TestCombineEligibilityNoDivergence`` below, and the EXECUTION call site
+    by ``test_curator_combine_execution_matches_shared_predicate`` in
+    ``test_task_interceptor.py``.
+    """
+
+    @pytest.mark.parametrize('status', list(TaskStatus))
+    def test_pending_only_over_full_vocabulary(self, status: TaskStatus):
+        expected = status is TaskStatus.PENDING
+        assert is_combine_eligible_status(status.value) is expected
+
+    def test_in_progress_is_not_eligible(self):
+        """THE BUG, kept as a named regression case though the sweep above covers it.
+
+        An in-progress target sailed through the old execution guard; naming
+        the incident status explicitly is what makes a future deletion of this
+        behaviour read as deliberate rather than as parametrize-list churn.
+        """
+        assert is_combine_eligible_status('in-progress') is False
+
+    @pytest.mark.parametrize(
+        'status',
+        [
+            'unknown',
+            '',
+            'PENDING',  # wrong case is not the canonical spelling
+            'Pending',
+            ' pending ',
+            'pending-review',
+        ],
+    )
+    def test_unrecognised_status_fails_closed(self, status: str):
+        assert is_combine_eligible_status(status) is False
+
+
+class TestCombineEligibilityNoDivergence:
+    """INV-5 anti-divergence pin for the SELECTION site only.
+
+    Scope is deliberately narrow: these assertions drive
+    ``_to_pool_entry`` and say nothing about the interceptor. Because
+    ``_to_pool_entry`` calls ``is_combine_eligible_status`` directly, they
+    fail only if that call is deleted or re-forked into a second literal —
+    which is exactly the selection-side half of the 20.2% race.
+
+    The EXECUTION site (``task_interceptor._execute_combine``, the half that
+    actually diverged and caused the incident) cannot be covered from here;
+    it is pinned by ``test_curator_combine_execution_matches_shared_predicate``
+    in ``test_task_interceptor.py``, which drives the real combine path over
+    the same full vocabulary.
+    """
+
+    @pytest.mark.parametrize('status', list(TaskStatus))
+    def test_pool_entry_agrees_with_shared_predicate(self, status: TaskStatus):
+        task = {'id': '42', 'title': 'Fix parser', 'status': status.value}
+        entry = _to_pool_entry(task, source='module', lock_depth=2)
+        assert entry is not None
+        assert entry.combine_eligible is is_combine_eligible_status(status.value)
+
+    def test_pool_entry_agrees_on_unknown_status(self):
+        """A task dict with no status reads as 'unknown' — both sides refuse it."""
+        entry = _to_pool_entry({'id': '42', 'title': 'x'}, source='module', lock_depth=2)
+        assert entry is not None
+        assert entry.combine_eligible is is_combine_eligible_status('unknown')
+        assert entry.combine_eligible is False
 
 
 class TestFlattenTaskTree:
@@ -343,7 +410,7 @@ def _pool_with_ids(*pairs: tuple[str, str]) -> list[_PoolEntry]:
             status=status,
             priority='medium',
             source='module',
-            combine_eligible=(status == 'pending'),
+            combine_eligible=is_combine_eligible_status(status),
         )
         for tid, status in pairs
     ]
@@ -6169,6 +6236,65 @@ class TestCuratorPromptLoaderWiringSingle:
         )
 
 
+class TestCuratorPromptResolveFailSafe:
+    """``_resolve_curator_prompt``'s docstring leans on "PromptArtifactStore.
+    resolve never raises ... so the curator's best-effort contract is
+    preserved", and it runs on every live reconciliation cycle. Pin that
+    dependency at the consumer boundary so a future refactor reintroducing the
+    raise fails where it actually hurts.
+    """
+
+    def test_resolve_curator_prompt_degrades_when_provenance_sidecar_becomes_unreadable(
+        self, tmp_path
+    ):
+        """A *good* pin must degrade to the in-code baseline, not raise.
+
+        Deliberately starts from a working pin and asserts the curator serves
+        the composed pinned text, so breaking the sidecar afterwards proves a
+        degradation. Asserting only the post-break state would hold just as
+        well for a key that was never pinned at all, which is a weaker claim
+        than the docstring this test exists to pin.
+
+        Synchronous — the guard under test is reached before any LLM call, so
+        no ``invoke_with_cap_retry`` patch and no event loop are needed.
+        """
+        config = _make_config()
+        store = PromptArtifactStore(tmp_path)
+        curator = TaskCurator(config=config, taskmaster=None, prompt_store=store)
+
+        heuristics = 'PINNED: prefer combining aggressively when in doubt.'
+        provenance = ArtifactProvenance(
+            **_prompt_artifact_provenance_kwargs(harness_version=_CURATOR_PROMPT_HARNESS_VERSION)
+        )
+        store.pin(
+            CURATOR_SINGLE_SPEC.prompt_id,
+            config.curator.model,
+            _CURATOR_PROMPT_HARNESS_VERSION,
+            heuristics=heuristics,
+            provenance=provenance,
+        )
+
+        # Premise: the curator genuinely serves this pin before the break.
+        assert curator._resolve_curator_prompt(CURATOR_SINGLE_SPEC) == compose_prompt(
+            CURATOR_SINGLE_SPEC.contract, heuristics,
+        )
+
+        # Now make the sidecar unreadable in place — directory-in-place-of-file,
+        # the uid-independent trigger (chmod 0o000 is a no-op under root).
+        provenance_path = store._key_dir(
+            CURATOR_SINGLE_SPEC.prompt_id,
+            config.curator.model,
+            _CURATOR_PROMPT_HARNESS_VERSION,
+        ) / 'provenance.json'
+        provenance_path.unlink()
+        provenance_path.mkdir()
+
+        assert (
+            curator._resolve_curator_prompt(CURATOR_SINGLE_SPEC)
+            == CURATOR_SINGLE_SPEC.in_code_constant
+        )
+
+
 # ----------------------------------------------------------------------
 # Prompt-loader wiring — batch-call path (task 2494 step-5/step-6)
 # ----------------------------------------------------------------------
@@ -6360,3 +6486,324 @@ class TestCuratorDeterministicRefusal:
 
         assert decision is not None and decision.action == "refuse"
         assert payload_hash not in curator._decision_cache
+
+
+# Sentinel for _write_snapshot: OMIT the lock_depth key entirely, as distinct
+# from writing an explicit JSON null for it.
+_NO_LOCK_DEPTH_KEY = object()
+
+
+class TestPerProjectLockDepth:
+    """lock_depth must be resolved PER PROJECT from the scheduler snapshot.
+
+    fused-memory is one server serving many projects whose orchestrators run
+    at different effective depths (3..12 across the fleet). A single global
+    scalar is wrong for nearly all of them, so the curator reads the depth the
+    orchestrator itself published in ``scheduler_state.json``.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clear_memo(self):
+        """Reset the per-project memo around every test in this class.
+
+        ``effective_lock_depth`` memoises for ``_LOCK_DEPTH_TTL_SECONDS``, so
+        without this a test that rewrites a snapshot under a path another test
+        already resolved would read a stale value. Cleared both before and
+        after so neither direction of leakage is possible.
+        """
+        clear_lock_depth_cache()
+        yield
+        clear_lock_depth_cache()
+
+    @staticmethod
+    def _write_snapshot(root: Path, depth: object = _NO_LOCK_DEPTH_KEY) -> None:
+        """Write a scheduler snapshot under ``root``.
+
+        ``depth`` is written verbatim — including an explicit JSON ``null``.
+        Pass ``_NO_LOCK_DEPTH_KEY`` (the default) to OMIT the key entirely.
+        The two are genuinely different bodies: before the sentinel existed
+        this helper omitted the key whenever ``depth is None``, which silently
+        made the ``None`` parametrize case below byte-identical to
+        ``test_snapshot_without_lock_depth_falls_back_coarse`` and left an
+        explicit ``"lock_depth": null`` untested.
+        """
+        d = root / 'data' / 'orchestrator'
+        d.mkdir(parents=True, exist_ok=True)
+        # dict[str, object] is required, not cosmetic: the seed value infers as
+        # dict[str, dict[...]], and ``depth`` is deliberately typed ``object``
+        # so the sentinel and the unusable values (0, -1, True, '12', 4.0,
+        # None) can all be written verbatim.
+        body: dict[str, object] = {'parks': {}, 'current_holders': {}}
+        if depth is not _NO_LOCK_DEPTH_KEY:
+            body['lock_depth'] = depth
+        (d / 'scheduler_state.json').write_text(json.dumps(body))
+
+    @staticmethod
+    async def _module_stream(project_root: str, files: list[str]) -> list:
+        """Assemble a corpus for one project and return its module stream.
+
+        The candidate payload is identical for every caller, so the only thing
+        that can vary the resulting ``module_keys`` is the depth resolved for
+        ``project_root``.
+        """
+        config = _make_config()
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(return_value=None)
+        taskmaster.get_tasks = AsyncMock(return_value={
+            'tasks': [{
+                'id': '300',
+                'title': 'Pending work in same file',
+                'status': 'pending',
+                'priority': 'medium',
+                'files_to_modify': files,
+            }],
+        })
+        curator = TaskCurator(config=config, taskmaster=taskmaster)
+
+        async def fail_collection(*a, **k):
+            raise RuntimeError('no qdrant')
+
+        with patch.object(curator, '_ensure_collection', side_effect=fail_collection):
+            pool, _sizes = await curator._build_corpus(
+                CandidateTask(title='New bug', files_to_modify=files),
+                project_id='p', project_root=project_root,
+            )
+        return [e for e in pool if e.source == 'module']
+
+    def test_snapshot_present_yields_that_depth(self, tmp_path):
+        self._write_snapshot(tmp_path, 12)
+        assert effective_lock_depth(str(tmp_path), 2) == 12
+
+    def test_missing_snapshot_falls_back_coarse(self, tmp_path):
+        # Freshly onboarded project: orchestrator has never run. Must NOT
+        # raise, must NOT invent a fleet-typical value like 4 — coarse is the
+        # fail-safe direction for a dedup tool.
+        assert effective_lock_depth(str(tmp_path / 'never-run'), 2) == 2
+
+    def test_snapshot_without_lock_depth_falls_back_coarse(self, tmp_path):
+        self._write_snapshot(tmp_path)
+        # Pin the sentinel's meaning: this body really has NO key, which is a
+        # different body from the explicit-null case parametrized below.
+        body = json.loads(
+            (tmp_path / 'data' / 'orchestrator' / 'scheduler_state.json').read_text(),
+        )
+        assert 'lock_depth' not in body
+        assert effective_lock_depth(str(tmp_path), 2) == 2
+
+    def test_unreadable_snapshot_falls_back_coarse(self, tmp_path):
+        d = tmp_path / 'data' / 'orchestrator'
+        d.mkdir(parents=True)
+        (d / 'scheduler_state.json').write_text('{not json')
+        assert effective_lock_depth(str(tmp_path), 2) == 2
+
+    @pytest.mark.parametrize('bad', [0, -1, True, '12', 4.0, None])
+    def test_unusable_depth_values_fall_back_coarse(self, tmp_path, bad):
+        # bool is an int subclass; True must never be read as depth 1. ``None``
+        # is written as an explicit JSON null here (see _write_snapshot), so it
+        # is a distinct body from the key-omitted case above rather than a
+        # duplicate of it.
+        self._write_snapshot(tmp_path, bad)
+        assert effective_lock_depth(str(tmp_path), 2) == 2
+
+    @pytest.mark.parametrize('body', ['null', '[]', '[1, 2]', '"x"', '3'])
+    def test_non_object_snapshot_body_falls_back_coarse(self, tmp_path, body):
+        """A valid-JSON body that is not an object must not raise.
+
+        ``read_scheduler_state`` returns ``json.loads`` output unchecked, so
+        these bodies reach the depth resolver as a non-dict. Without a guard
+        the ``.get`` raises AttributeError, which escapes ``_build_corpus``;
+        ``curate``/``prepare_candidate`` catch that by degrading to an empty
+        pool, i.e. dedup is skipped and a DUPLICATE TASK is filed — the exact
+        failure the coarse fallback exists to prevent. The contract is that
+        depth resolution NEVER raises.
+        """
+        d = tmp_path / 'data' / 'orchestrator'
+        d.mkdir(parents=True)
+        (d / 'scheduler_state.json').write_text(body)
+        assert effective_lock_depth(str(tmp_path), 2) == 2
+
+    def test_two_project_roots_in_one_process_yield_two_depths(self, tmp_path):
+        """The multi-project property — a single-project test cannot show it.
+
+        This is the assertion that fails against the old global scalar.
+        """
+        shallow = tmp_path / 'shallow-project'
+        deep = tmp_path / 'deep-project'
+        self._write_snapshot(shallow, 4)
+        self._write_snapshot(deep, 12)
+
+        assert effective_lock_depth(str(shallow), 2) == 4
+        assert effective_lock_depth(str(deep), 2) == 12
+        # ...and interleaved, to rule out any cached/global first-wins value.
+        assert effective_lock_depth(str(shallow), 2) == 4
+
+    @pytest.mark.asyncio
+    async def test_module_keys_differ_per_project_in_assembled_pool(self, tmp_path):
+        """USER-OBSERVABLE SIGNAL: same candidate payload, two projects,
+        module-stream keys computed at each project's own depth."""
+        shallow = tmp_path / 'shallow-project'
+        deep = tmp_path / 'deep-project'
+        self._write_snapshot(shallow, 4)
+        self._write_snapshot(deep, 12)
+
+        files = ['a/b/c/d/e/f.py']
+
+        shallow_entries = await self._module_stream(str(shallow), files)
+        deep_entries = await self._module_stream(str(deep), files)
+
+        assert shallow_entries and deep_entries, 'module stream should match in both'
+        shallow_keys = set(shallow_entries[0].module_keys)
+        deep_keys = set(deep_entries[0].module_keys)
+
+        assert shallow_keys == {'a/b/c/d'}
+        assert deep_keys == {'a/b/c/d/e/f.py'}
+        assert shallow_keys != deep_keys, (
+            'module keys must reflect each project\'s own depth; identical keys '
+            'mean a single global scalar is still in use'
+        )
+
+    def test_falsy_project_root_falls_back_coarse_not_ambient_cwd(
+        self, tmp_path, monkeypatch,
+    ):
+        """A falsy project_root must NOT leak the ambient project's depth.
+
+        ``Path('')`` normalises to ``Path('.')``, so without a guard the
+        helper reads ``./data/orchestrator/scheduler_state.json`` — the
+        snapshot of whatever project the fused-memory server process happens
+        to be rooted in. The task's user-observable signal requires the coarse
+        fallback "rather than raising or silently using another project's
+        value", and a silent cross-project leak is strictly worse than a
+        coarse key (see the asymmetry argument in ``effective_lock_depth``).
+
+        DEFENCE IN DEPTH, not a live production bug: the production path
+        reaches the curator through ``submit_task``, whose
+        ``_normalize_project_root`` -> ``validate_project_root`` already hard-
+        rejects an empty/non-absolute project_root (task 3291). The guard
+        matters because ``effective_lock_depth`` is a module-level public
+        helper importable by callers that do not cross that wire boundary —
+        ``middleware/recon_write_policy.py`` already imports this module's
+        ``read_scheduler_state`` directly.
+        """
+        self._write_snapshot(tmp_path, 12)
+        monkeypatch.chdir(tmp_path)
+
+        # Sanity: the ambient CWD really does publish a depth-12 snapshot, so
+        # a 2 below is the guard working and not an empty tmp dir.
+        assert effective_lock_depth(str(tmp_path), 2) == 12
+
+        assert effective_lock_depth('', 2) == 2
+        # ``None`` used to reach the fallback only incidentally, via the broad
+        # ``except`` (logging a NoneType/__fspath__ warning); the falsy guard
+        # now handles it deliberately, and the signature admits ``str | Path |
+        # None`` so that is a typed contract rather than an accident. Pin it so
+        # it stays a decision.
+        assert effective_lock_depth(None, 2) == 2
+
+    @pytest.mark.asyncio
+    async def test_assembled_pool_uses_config_scalar_when_no_snapshot(self, tmp_path):
+        """The curator-level fallback, asserted on the assembled pool.
+
+        The bare-helper tests above pin the fallback on ``effective_lock_depth``
+        itself; this pins that ``_build_corpus`` actually passes
+        ``config.curator.lock_depth`` as that fallback. A refactor that dropped
+        the ``default`` argument at the call site would leave every helper test
+        green and only fail here.
+        """
+        never_run = tmp_path / 'never-run-project'
+        never_run.mkdir()
+        assert _make_config().curator.lock_depth == 2, 'test assumes the coarse scalar'
+
+        entries = await self._module_stream(str(never_run), ['a/b/c/d/e/f.py'])
+
+        assert entries, 'module stream should still match on the fallback depth'
+        # depth 2 — the config scalar — not the fleet-typical 4 and not the 12
+        # a neighbouring project's snapshot might carry.
+        assert set(entries[0].module_keys) == {'a/b'}
+
+    def test_repeated_calls_read_the_snapshot_once(self, tmp_path, monkeypatch):
+        """The read is memoised per project, not repeated per candidate.
+
+        ``_build_corpus`` calls this once per candidate, so an unmemoised
+        helper re-reads and re-parses the same snapshot once per candidate in
+        a batch — a blocking read on the event loop for a value that cannot
+        change between them.
+        """
+        self._write_snapshot(tmp_path, 12)
+        reads: list[str] = []
+        real = scheduler_state_mod.read_scheduler_state
+
+        def counting(root):
+            reads.append(str(root))
+            return real(root)
+
+        monkeypatch.setattr(scheduler_state_mod, 'read_scheduler_state', counting)
+
+        for _ in range(5):
+            assert effective_lock_depth(str(tmp_path), 2) == 12
+        assert len(reads) == 1, f'expected one read, got {len(reads)}'
+
+        # A different project is a different memo key — it must still read.
+        other = tmp_path / 'other-project'
+        self._write_snapshot(other, 4)
+        assert effective_lock_depth(str(other), 2) == 4
+        assert len(reads) == 2
+
+    def test_memo_is_bounded_and_resettable(self, tmp_path, monkeypatch):
+        """Within the TTL the memo holds; past it the new value is picked up.
+
+        ``lock_depth`` only changes at orchestrator restart, so bounded
+        staleness is the deliberate trade — but it must be BOUNDED, not
+        process-lifetime, because fused-memory outlives many restarts.
+        """
+        self._write_snapshot(tmp_path, 4)
+        assert effective_lock_depth(str(tmp_path), 2) == 4
+
+        self._write_snapshot(tmp_path, 12)
+        assert effective_lock_depth(str(tmp_path), 2) == 4, 'memo should still hold'
+
+        clear_lock_depth_cache()
+        assert effective_lock_depth(str(tmp_path), 2) == 12
+
+        # And the TTL itself is consulted at read time, not just the reset
+        # hook: with it at zero, an entry written by one call is already
+        # expired by the next, so the new snapshot value wins with no reset.
+        # (Clear first — the entry cached above still carries the full-TTL
+        # deadline, which no later TTL change retroactively shortens.)
+        monkeypatch.setattr(scheduler_state_mod, '_LOCK_DEPTH_TTL_SECONDS', 0.0)
+        clear_lock_depth_cache()
+        self._write_snapshot(tmp_path, 4)
+        assert effective_lock_depth(str(tmp_path), 2) == 4
+        self._write_snapshot(tmp_path, 10)
+        assert effective_lock_depth(str(tmp_path), 2) == 10
+
+    def test_coarse_fallback_is_logged_once_per_project(
+        self, tmp_path, monkeypatch, caplog,
+    ):
+        """A project silently running on the fallback must be diagnosable.
+
+        Otherwise an unexpectedly-missing snapshot shows up only as subtly
+        worse curator decisions. One line per project_root, not one per
+        candidate — TTL forced to zero here so the memo does not mask the
+        repeat calls this is asserting are deduped by the log's own bookkeeping.
+        """
+        monkeypatch.setattr(scheduler_state_mod, '_LOCK_DEPTH_TTL_SECONDS', 0.0)
+        missing = tmp_path / 'never-run'
+        other_missing = tmp_path / 'also-never-run'
+        healthy = tmp_path / 'healthy'
+        self._write_snapshot(healthy, 12)
+
+        with caplog.at_level(logging.INFO, logger=scheduler_state_mod.__name__):
+            for _ in range(3):
+                assert effective_lock_depth(str(missing), 2) == 2
+            assert effective_lock_depth(str(other_missing), 2) == 2
+            assert effective_lock_depth(str(healthy), 2) == 12
+
+        messages = [
+            r.getMessage() for r in caplog.records
+            if 'coarse fallback' in r.getMessage()
+        ]
+        assert len(messages) == 2, f'expected one line per project, got {messages}'
+        assert any(str(missing) in m for m in messages)
+        assert any(str(other_missing) in m for m in messages)
+        # A project whose snapshot resolves cleanly says nothing.
+        assert not any(str(healthy) in m for m in messages)

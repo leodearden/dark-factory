@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class EventType(StrEnum):
@@ -179,13 +179,53 @@ class VerificationVerdict(StrEnum):
 
 
 class VerificationResult(BaseModel):
-    """Result from the explore agent's codebase verification."""
+    """Result from the explore agent's codebase verification.
+
+    ``verdict`` alone can NEVER be used to detect an agent failure: on the
+    failure path it equals the caller-supplied ``default_verdict``
+    ('inconclusive' at the verify.py call site), which collides with a
+    perfectly legitimate healthy verdict.  That collision is the bug task 4343
+    fixes — "the agent never produced a verdict" and "the agent looked and
+    found nothing either way" were byte-identical records.  Read
+    ``agent_failed`` to tell them apart.
+    """
 
     verdict: VerificationVerdict
     confidence: float = Field(ge=0.0, le=1.0)
     evidence: list[dict] = Field(default_factory=list)
     summary: str = ''
     git_context: dict | None = None
+    # True iff the agent loop failed to produce a parseable verdict (task 4343).
+    # Sourced from AgentVerdict.failed, which the emitter already had in a
+    # variable — INV-2 structured-facts-at-failure: consumers must branch on
+    # this field, never on the 'agent-failed:' prefix inside `summary`.
+    agent_failed: bool = False
+    # Machine-readable failure token: 'cli_output_empty', 'cli_output_unparseable',
+    # 'no_tool_calls', 'max_steps_reached', 'verify_failed', ...  Empty string on
+    # the success path, so a non-empty value is itself a failure signal.
+    failure_token: str = ''
+
+    @model_validator(mode='after')
+    def _failure_fields_agree(self) -> 'VerificationResult':
+        """`agent_failed` and a non-empty `failure_token` must co-occur.
+
+        The two fields encode the same fact from different angles — the boolean
+        is what consumers branch on, the token is what they store and group by —
+        so an unvalidated pair is redundant state that can silently desync.  A
+        desync produces exactly the ambiguity task 4343 closes: an
+        ``agent_failed`` audit row carrying no token (undiagnosable), or an
+        ``inconclusive`` row carrying a ``failure_token`` in its detail (a
+        healthy outcome that reads as a failure).  Fail loudly at construction
+        instead: every caller either has both or neither.
+        """
+        if bool(self.failure_token) != self.agent_failed:
+            raise ValueError(
+                'agent_failed and failure_token must agree: got '
+                f'agent_failed={self.agent_failed!r}, '
+                f'failure_token={self.failure_token!r} — set both on a failure '
+                'and neither on success'
+            )
+        return self
 
 
 def _normalize_project_id(v: object, *, allow_empty: bool = False) -> object:

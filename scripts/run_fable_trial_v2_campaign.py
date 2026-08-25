@@ -20,19 +20,32 @@ would cross the eval-framework-revival lane's single-ownership boundary. The
 instrument (``run_ofat_stage``, ``build_plan_quality_report``,
 ``produced_a_plan``, ``get_config_by_name``) is CONSUMED UNMODIFIED.
 
-TWO RULES A LATER READER MUST NOT UNDO
---------------------------------------
+THREE RULES A LATER READER MUST NOT UNDO
+----------------------------------------
 1. ``--q-ceiling`` is never defaulted. The plan-quality threshold that decides
    which fixtures are DISCARDED as ceiling-saturated is empirically anchored:
    derived in γ1 from v1 incumbent cells on validly-referenced fixtures,
    recorded provisional, and ratified or adjusted by Leo at γ2. A default here
    would silently become the de facto threshold and pre-empt that ruling (G6).
-2. ``judged_without_reference`` reads UNMEASURED, never ``0``, whenever ANY
-   architect cell lacks the key. Its producer is eval-revival σ (task 3628);
-   until that lands, reporting ``0`` would let ``plan_quality`` read as fully
-   validity-bounded when nothing bounded it. Mirrors ``report.py``'s own
-   ``mean_plan_quality=None`` convention — "we measured nothing" must never read
-   as "it scored nothing".
+2. ``judged_without_reference`` reads UNMEASURED, never ``0``, whenever any cell
+   in the ADMITTED pool lacks the key. Its producer is eval-revival σ (task
+   3628), which has landed — but ``--results-dir`` still replays artifacts
+   written before it, and on those, reporting ``0`` would let ``plan_quality``
+   read as fully validity-bounded when nothing bounded it. Mirrors
+   ``report.py``'s own ``mean_plan_quality=None`` convention — "we measured
+   nothing" must never read as "it scored nothing".
+
+   The count is SURFACED from ``build_plan_quality_report`` rather than derived
+   here, so the two surfaces cannot disagree about it. It once WAS derived here,
+   over every architect cell rather than over the admitted pool, and one keyless
+   (pre-σ) cap-tainted cell was enough to make this driver print ``unmeasured``
+   while the report object it had just built printed ``1``.
+
+   Rules 2 and 3 scope to deliberately DIFFERENT populations. Say so, or the
+   next reader will "restore consistency" and reintroduce exactly that bug: rule
+   2 bounds a per-candidate plan_quality AGGREGATE, so it spans exactly the cells
+   that contributed a score; rule 3 answers a PER-CELL banding question, where a
+   cap-tainted cell is already handled one rung earlier.
 3. Reference validity is read PER CELL (``MARKER_KEY not in metrics`` -> not
    known-good), never from a run-level flag. The run-level
    :func:`marker_available` survives only as a DISPLAY flag on the bands dict
@@ -65,6 +78,15 @@ for _rel in ('orchestrator/src', 'shared/src', 'escalation/src'):
     _p = str(_REPO_ROOT / _rel)
     if _p not in sys.path:
         sys.path.insert(0, _p)
+# scripts/ itself: implicit on sys.path[0] when run standalone (Python adds the
+# main script's own dir), and explicit via scripts/tests/conftest.py under
+# pytest — but not guaranteed when this module is imported as a library from
+# elsewhere, so make it explicit here too (idempotent).
+_p = str(_REPO_ROOT / 'scripts')
+if _p not in sys.path:
+    sys.path.insert(0, _p)
+
+from _eval_results_io import load_results_from_dir  # noqa: E402
 
 # β1's (task 3631) v2 hard-fixture pool. Absent until β1 lands — which is why
 # :func:`resolve_fixture_paths` fails LOUDLY rather than falling back.
@@ -210,9 +232,13 @@ def apply_budgets(candidates: list[Any], budgets: dict[str, float]) -> list[Any]
 
 # The per-candidate fields copied through from the report layer's accumulator.
 # Named once so the summary and the renderer cannot disagree about the schema.
+# ``judged_without_reference`` is the SAME string as :data:`MARKER_KEY` (spelled
+# literally only because that constant is defined below), and it belongs in this
+# tuple for exactly the reason the others do: it is the report layer's number,
+# surfaced verbatim, never a second derivation.
 _SUMMARY_FIELDS = (
     'config_name', 'n', 'total', 'cap_excluded', 'no_plan', 'plan_rate',
-    'mean_plan_quality',
+    'mean_plan_quality', 'judged_without_reference',
 )
 
 # The per-cell reference-validity marker. Producer is eval-revival σ (task
@@ -252,18 +278,19 @@ def marker_available(results: list[Any]) -> bool:
 def _architect_cells(results: list[Any]) -> list[tuple[str, str, dict[str, Any]]]:
     """``(task_id, config_name, metrics)`` for architect cells only.
 
-    THE ROLE FILTER RUNS FIRST, everywhere — and it is single-sourced HERE so
-    that "everywhere" is checkable rather than aspirational. An implementer run
-    never invokes the plan judge, so it is out of scope by construction; and if
-    the filter ran after the marker check instead, a single implementer cell
-    riding along under the same config name (carrying no marker key, because it
-    never could) would erase a candidate's genuine, complete measurement.
+    THE ROLE FILTER RUNS FIRST — an implementer run never invokes the plan
+    judge, so it is out of scope by construction, and a filter applied after any
+    per-cell test would let one implementer cell riding along under the same
+    config name (carrying no marker key, because it never could) speak for a
+    candidate it says nothing about.
 
-    ``task_id`` rides along so :func:`partition_bands` consumes this same filter
-    rather than re-implementing the ``role_under_test`` test inline. Two copies
-    of a filter documented as load-bearing is one copy too many: a change to what
-    counts as an architect cell would otherwise have to be made twice, with only
-    one of the sites carrying the argument for why it matters.
+    ``task_id`` rides along so :func:`partition_bands` — this function's ONE
+    consumer, since the per-candidate marker counts were retired in favour of
+    ``build_plan_quality_report``'s own architect-only aggregate — consumes this
+    filter rather than re-implementing the ``role_under_test`` test inline. Two
+    copies of a filter documented as load-bearing is one copy too many: a change
+    to what counts as an architect cell would otherwise have to be made twice,
+    with only one of the sites carrying the argument for why it matters.
     """
     cells = []
     for result in results:
@@ -272,64 +299,6 @@ def _architect_cells(results: list[Any]) -> list[tuple[str, str, dict[str, Any]]
             continue
         cells.append((result.task_id, result.config_name, metrics))
     return cells
-
-
-def count_judged_without_reference(
-    results: list[Any], unmeasured: dict[str, int] | None = None,
-) -> dict[str, int | None]:
-    """Per candidate: how many architect cells were judged without a valid reference.
-
-    ``None`` — never ``0`` — for any candidate with even ONE architect cell
-    lacking :data:`MARKER_KEY`. The distinction is the point: ``0`` asserts that
-    we looked at every cell and found none, which would let ``plan_quality``
-    read as fully validity-bounded when in fact nothing bounded it. ``None``
-    says we never measured. This mirrors ``report.py``'s own
-    ``mean_plan_quality=None`` convention, where "we measured nothing" is
-    likewise kept distinct from "it scored nothing".
-
-    PARTIAL MEASUREMENT IS NOT MEASUREMENT, and this is decided PER CELL. An
-    earlier version short-circuited on the run-level :func:`marker_available`,
-    so in a mixed corpus a keyless cell silently scored as ``False`` and the
-    candidate reported a fabricated ``0``. One unmeasured cell means the
-    candidate's bound is unknown, so the honest value is ``None``. Use
-    :func:`count_unmeasured_marker_cells` to see how much of it was unmeasured.
-
-    No edit is needed here when σ lands. The key simply starts appearing on each
-    cell and these ``None``s become real counts.
-
-    *unmeasured* accepts an already-computed
-    :func:`count_unmeasured_marker_cells` map so a caller needing both (as
-    :func:`summarize_candidates` does) scans the cells once instead of three
-    times. It is an optimisation only: omitting it computes the same map here.
-    """
-    counts: dict[str, int | None] = {}
-    if unmeasured is None:
-        unmeasured = count_unmeasured_marker_cells(results)
-    for _task_id, name, metrics in _architect_cells(results):
-        if unmeasured.get(name):
-            counts[name] = None
-            continue
-        counts[name] = (counts.get(name) or 0) + (1 if metrics.get(MARKER_KEY) else 0)
-    return counts
-
-
-def count_unmeasured_marker_cells(results: list[Any]) -> dict[str, int]:
-    """Per candidate: how many architect cells carry NO :data:`MARKER_KEY` at all.
-
-    ``None`` from :func:`count_judged_without_reference` cannot distinguish "1
-    of 50 cells unmeasured" from "50 of 50" — a huge difference to an operator
-    reading γ1's artifact. This count makes a partially-instrumented corpus
-    LEGIBLE rather than merely unknown, which is the loud-over-silent norm
-    applied to the transition state.
-
-    That state is normal, not exotic: γ1's recipe re-runs cap-tainted fixtures,
-    and a re-run after eval-revival σ (task 3628) lands writes cells carrying
-    the key alongside older ones that never could.
-    """
-    counts: dict[str, int] = {}
-    for _task_id, name, metrics in _architect_cells(results):
-        counts[name] = counts.get(name, 0) + (0 if MARKER_KEY in metrics else 1)
-    return counts
 
 
 def summarize_candidates(results: list[Any]) -> list[dict[str, Any]]:
@@ -345,6 +314,16 @@ def summarize_candidates(results: list[Any]) -> list[dict[str, Any]]:
     exactly that second free-to-disagree surface — so this function copies the
     fields through verbatim and adds nothing arithmetic of its own.
 
+    The two σ marker counts (task 3628) are surfaced the same way, and the
+    reason is not tidiness — they WERE re-derived here, and it broke. The local
+    versions aggregated over EVERY architect cell while the report layer counts
+    only the ADMITTED pool, so one keyless (pre-σ) cap-tainted cell made this
+    function print ``unmeasured`` while the report object it had built one line
+    earlier printed ``1``. Counting the admitted pool hides nothing: a
+    cap-tainted cell has no ``plan_quality`` to bound, ``cap_excluded`` already
+    counts it disjointly, and :func:`band_for_cell` still bands that same cell
+    ``unmeasured`` per cell at rung 1.
+
     Why ``plan_rate`` is trustworthy on the no-plan band specifically: it is
     JUDGE-FREE by construction, computed from :func:`produced_a_plan` over the
     PERSISTED ``plan_steps``, so it stays valid on exactly the fixtures where no
@@ -356,20 +335,18 @@ def summarize_candidates(results: list[Any]) -> list[dict[str, Any]]:
     from orchestrator.evals.report import build_plan_quality_report
 
     report = build_plan_quality_report(results)
-    # Scanned ONCE and handed to both consumers: count_judged_without_reference
-    # needs exactly this map to decide unmeasured-vs-counted, and the renderer
-    # needs it to say "unmeasured (N of M cells)".
-    unmeasured_counts = count_unmeasured_marker_cells(results)
-    marker_counts = count_judged_without_reference(results, unmeasured_counts)
     rows = []
     for entry in report['configs']:
+        # MARKER_KEY rides in _SUMMARY_FIELDS with every other surfaced count.
         row = {field: entry[field] for field in _SUMMARY_FIELDS}
-        name = entry['config_name']
-        row[MARKER_KEY] = marker_counts.get(name)
-        # How much of the above was never measured. Carried alongside rather
+        # How much of the above was never measured — carried alongside rather
         # than folded in, because `None` alone cannot distinguish 1-of-50
-        # unmeasured cells from 50-of-50.
-        row[UNMEASURED_CELLS_KEY] = unmeasured_counts.get(name, 0)
+        # unmeasured cells from 50-of-50. Surfaced from the report layer like
+        # every other count here. The artifact key keeps its `_cells` suffix (it
+        # is what the schema pin and any committed γ1 artifact carry); only the
+        # VALUE is single-sourced, which is the property that matters — two
+        # surfaces must not answer one question differently.
+        row[UNMEASURED_CELLS_KEY] = entry['judged_without_reference_unmeasured']
         rows.append(row)
     rows.sort(key=lambda r: r['config_name'])
     return rows
@@ -520,9 +497,13 @@ def format_campaign_report(report: dict[str, Any]) -> str:
     cleanly.
     """
     lines = ['per-candidate summary:']
+    # The marker column is 32 wide, not the 24 its header needs: its widest value
+    # is the mixed-case "unmeasured (N of M scored cells)", and a column narrower
+    # than its own longest value overflows and drags the table's right edge out
+    # of alignment on exactly the rows an operator most needs to read.
     header = (
         f'{"candidate":<26} {"n":>4} {"total":>6} {"cap_excl":>9} {"no_plan":>8} '
-        f'{"plan_rate":>10} {"mean_pq":>10} {MARKER_KEY:>26}'
+        f'{"plan_rate":>10} {"mean_pq":>10} {MARKER_KEY:>32}'
     )
     lines.append(header)
     lines.append('-' * len(header))
@@ -531,17 +512,24 @@ def format_campaign_report(report: dict[str, Any]) -> str:
         marker = _fmt(row.get(MARKER_KEY))
         if row.get(MARKER_KEY) is None:
             unmeasured_marker = True
-            # A PARTIALLY measured corpus reads as "unmeasured (3 of 12 cells)"
-            # rather than a bare word, so an operator can tell a fully pre-σ run
-            # from one re-run cell short of a complete bound.
+            # A PARTIALLY measured corpus reads as "unmeasured (3 of 12 scored
+            # cells)" rather than a bare word, so an operator can tell a fully
+            # pre-σ run from one re-run cell short of a complete bound.
+            #
+            # ONE POPULATION on both sides of the fraction. The numerator counts
+            # keyless cells in the ADMITTED pool, so the denominator is `n` — the
+            # size of that pool — and NOT `total`, which also counts cap-tainted
+            # cells that never had a plan_quality to bound. Quoting the two
+            # against each other would overstate how much of the bound went
+            # unmeasured.
             missing = row.get(UNMEASURED_CELLS_KEY)
             if missing:
-                marker = f'{UNMEASURED} ({missing} of {row["total"]} cells)'
+                marker = f'{UNMEASURED} ({missing} of {row["n"]} scored cells)'
         lines.append(
             f'{row["config_name"]:<26} {_fmt(row["n"]):>4} {_fmt(row["total"]):>6} '
             f'{_fmt(row["cap_excluded"]):>9} {_fmt(row["no_plan"]):>8} '
             f'{_fmt(row["plan_rate"]):>10} {_fmt(row["mean_plan_quality"]):>10} '
-            f'{marker:>26}'
+            f'{marker:>32}'
         )
     missing = report.get('missing_cells')
     if missing and missing['count']:
@@ -591,23 +579,30 @@ def format_campaign_report(report: dict[str, Any]) -> str:
     if unmeasured_marker:
         lines += [
             '',
-            f'LEGEND — {MARKER_KEY} = {UNMEASURED}: at least one architect cell carries '
-            'no',
+            f'LEGEND — {MARKER_KEY} = {UNMEASURED}: at least one SCORED architect cell '
+            'carries no',
             '  reference-validity marker, so NO bound was placed on how far plan_quality '
             'may be',
             '  trusted for that candidate. It is NOT a count of zero. The producer is '
             'eval-revival σ',
-            '  (task 3628); once it lands the key appears on every cell and these read '
-            'as real counts.',
-            f'  "{UNMEASURED} (N of M cells)" is the MIXED case: only N cells lacked the '
-            'marker. That is',
-            '  the normal transition state — a γ1 re-run of cap-tainted fixtures after σ '
-            'lands writes',
-            '  keyed cells alongside older keyless ones — not an exotic one. Partial '
-            'measurement is',
-            '  not measurement, so the bound stays unknown until every cell carries the '
-            'key; and each',
-            '  keyless cell bands intermittent (RETAINED) on its own, never ceiling.',
+            '  (task 3628); cells persisted before it landed carry no key at all, and '
+            'these read as',
+            '  unmeasured rather than as real counts.',
+            f'  "{UNMEASURED} (N of M scored cells)" is the MIXED case: only N of the M '
+            'cells that',
+            '  contributed a score lacked the marker. That is the normal transition state '
+            '— a γ1 re-run',
+            '  of cap-tainted fixtures after σ lands writes keyed cells alongside older '
+            'keyless ones —',
+            '  not an exotic one. Partial measurement is not measurement, so the bound '
+            'stays unknown',
+            '  until every scored cell carries the key.',
+            '  A cap-tainted cell is deliberately NOT in that population: it has no '
+            'plan_quality to',
+            '  bound, cap_excl already counts it, and each keyless cell still bands '
+            'intermittent',
+            '  (RETAINED) on its own, never ceiling — so nothing is hidden by its '
+            'keylessness here.',
         ]
     return '\n'.join(lines)
 
@@ -810,66 +805,6 @@ def filter_campaign_results(
     return kept, dropped
 
 
-def _load_results_from_dir(results_dir: Path) -> list[Any]:
-    """Load every persisted ``EvalResult`` JSON in *results_dir*.
-
-    Filters each loaded dict to the known dataclass fields, mirroring
-    ``runner.load_results``, so a cell persisted before a field existed still
-    loads instead of raising on an unexpected keyword.
-
-    TWO LOUD FAILURES, both because this path is aimed by default at the SHARED
-    packaged results dir holding cells written by many campaigns over time:
-
-    * A MISSING DIR exits naming it. ``Path.glob`` returns EMPTY for a
-      nonexistent dir rather than raising, so without this check a plain typo
-      falls through to :func:`_load_campaign_results`'s zero-survivors branch and
-      gets diagnosed as contamination ("the dir predates this campaign or belongs
-      to another one") when the real problem is the path. Mirrors
-      :func:`resolve_fixture_paths`, which already applies exactly this rule to
-      the other input path.
-    * A MALFORMED FILE exits NAMING THE FILE. One truncated or partial write
-      among hundreds of cells would otherwise take down the whole re-analysis
-      with a bare ``JSONDecodeError`` traceback naming neither the offending file
-      nor the dir — unactionable. Failing loudly rather than skipping is
-      deliberate: a silently skipped cell shifts every count in the report, and
-      this driver's whole thesis is that γ1's calibration is COMPUTED from a
-      pool whose membership is known exactly.
-
-    KNOWN DUPLICATION (deliberate, recorded rather than hidden): the load-and-
-    filter body is a near-verbatim sibling of ``scripts/run_judge_ofat_pilot.py``
-    ``_load_results_from_dir``, which does NOT carry the hardening above. The two
-    copies can now drift. Extracting a shared ``scripts/`` helper would mean
-    editing that sibling script, which is outside this task's locked module set,
-    so it is filed as a follow-up instead of done here.
-    """
-    from orchestrator.evals.runner import EvalResult
-
-    results_dir = Path(results_dir)
-    if not results_dir.is_dir():
-        raise SystemExit(
-            f'Error: results dir not found (or is not a directory): {results_dir}\n'
-            '  This is a path problem, not a contamination problem: Path.glob returns '
-            'empty for a nonexistent dir rather than raising, so without this check the '
-            'typo would be reported downstream as "no in-campaign cells found".'
-        )
-    known = {f.name for f in EvalResult.__dataclass_fields__.values()}
-    results = []
-    for path in sorted(results_dir.glob('*.json')):
-        try:
-            data = json.loads(path.read_text())
-            results.append(EvalResult(**{k: v for k, v in data.items() if k in known}))
-        except (ValueError, OSError, TypeError, AttributeError) as e:
-            raise SystemExit(
-                f'Error: could not load persisted eval cell {path}: '
-                f'{type(e).__name__}: {e}\n'
-                '  Expected a JSON object shaped like EvalResult.to_dict(). A truncated '
-                'or partial write in the shared packaged results dir is the usual cause. '
-                'The file is named rather than skipped: dropping a cell silently would '
-                'shift every count in the report.'
-            ) from e
-    return results
-
-
 def _load_campaign_results(
     results_dir: Path, candidates: list[Any], fixture_paths: list[Path],
 ) -> tuple[list[Any], dict[str, Any]]:
@@ -884,8 +819,13 @@ def _load_campaign_results(
     measured nothing" and "you pointed at the wrong directory" must not share a
     shape — and the latter is by far the likelier cause, given the shared
     packaged results dir this path is aimed at by default.
+
+    The missing-dir / malformed-file hardening lives in the shared
+    :func:`_eval_results_io.load_results_from_dir` (task 3743), not here — it
+    used to be a private copy in this module, near-verbatim duplicated in
+    ``scripts/run_judge_ofat_pilot.py``.
     """
-    loaded = _load_results_from_dir(results_dir)
+    loaded = load_results_from_dir(results_dir)
     candidate_names = {c.name for c in candidates}
     fixture_stems = {p.stem for p in fixture_paths}
     kept, dropped = filter_campaign_results(loaded, candidate_names, fixture_stems)

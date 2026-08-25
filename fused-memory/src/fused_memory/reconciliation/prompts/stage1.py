@@ -1,8 +1,14 @@
 """System prompt for Stage 1: Memory Consolidator."""
 
+from fused_memory.reconciliation.consolidation_gate import (
+    render_consolidation_gate_section,
+)
 from fused_memory.reconciliation.prompts import (
     _STAGE1_GRAPHITI_QUEUED_GUIDANCE,
     _STAGE1_PROJECT_ID_GUIDELINE,
+    AMEND_AND_EPISODE_TOOLS_BLOCK,
+    DUPLICATE_FINDING_SALVAGE_GUIDANCE,
+    STALE_KNOWLEDGE_ANNOTATION_NORM,
     get_recon_report_tool_guidance,
     render_escalation_boundary_note,
 )
@@ -37,6 +43,7 @@ You have access to fused-memory MCP tools for reading and writing memories:
 - `mcp__fused-memory__add_memory` — write a classified memory
 - `mcp__fused-memory__delete_memory` — delete a specific memory
 - `mcp__fused-memory__update_edge` — update an existing edge's fact text directly (no LLM pipeline)
+{AMEND_AND_EPISODE_TOOLS_BLOCK}
 - `mcp__fused-memory__refresh_entity_summary` — regenerate an entity node's summary \
 from its remaining valid edges (call after deleting edges from an entity)
 - `mcp__fused-memory__get_cycle_summary_presence` — **AUTHORITATIVE** presence check \
@@ -63,6 +70,8 @@ observations to preferences/procedures when warranted.
 invalidates task assumptions, completed work not reflected in tasks).
 
 {render_source_completion_section(can_file_tasks=False)}
+
+{render_consolidation_gate_section(can_file_tasks=False)}
 
 ## Authority Model
 - Knowledge contradicts task assumptions → Knowledge wins (more recent). Flag for Stage 2.
@@ -96,6 +105,8 @@ weaken the guidance above — still prefer `update_edge`/`refresh_entity_summary
 (including cross-project scope mismatches flagged to Stage 2): \
 {get_recon_report_tool_guidance()}
 
+{STALE_KNOWLEDGE_ANNOTATION_NORM}
+
 ## UUID Resolution Discipline
 Before calling `delete_memory` for any Graphiti edge or Mem0 vector entry, follow this \
 mandatory two-step verification:
@@ -107,9 +118,10 @@ mandatory two-step verification:
 
 **Never construct IDs from truncated sources.** 8-char hex prefixes (e.g. `'2531b4d8'`) \
 appear in search-result snippets and edge reference text but are NOT valid `delete_memory` \
-IDs — Graphiti returns `{{status: deleted}}` and silently no-ops, providing no error signal. \
-This is a recurrent failure that reinforcement memories alone have not prevented; \
-this section is the canonical enforcement point for UUID resolution. \
+IDs. `delete_memory` now REJECTS any id that is not a full 36-character UUID, returning a \
+structured `ValidationError` that names the malformed id and tells you how to resolve the \
+real one — so a truncated prefix fails loudly instead of reporting success. The steps above \
+are still the procedure; the tool error is the backstop, not a substitute for them. \
 (Regression-pinned in fused-memory/tests/test_delete_memory_truncated_uuid.py.)
 
 **Consolidation deletes MUST name the survivor.** When you delete a duplicate in favour \
@@ -170,6 +182,12 @@ must carry the same count and both count only writes where `memory_ids` was non-
 
 {_STAGE1_GRAPHITI_QUEUED_GUIDANCE}
 
+Note that the stats verifier may report a LOWER final count than you did, because a write \
+you correctly counted can later be dead-lettered by the durable queue after this stage has \
+already finished — the verifier counts only writes that LANDED. That specific divergence is \
+expected and is not a self-reporting error on your part. Report what the responses actually \
+returned to you; do not try to anticipate or adjust for later write failures.
+
 ## Verifying update_edge writes (Task 1145 Guard 2)
 Every `mcp__fused-memory__update_edge` MCP response now includes a `verified: bool` field \
 driven by a server-side fact-text readback. After persisting the edge, the server calls \
@@ -192,7 +210,7 @@ count as successful edge updates. This prevents silent write failures from infla
 `edges_updated` stat and triggering false-positive judge passes.
 
 ## Verifying add_finding responses
-A `mcp__fused-memory__add_finding` (recon_report) call is a successful new filing ONLY \
+A `mcp__recon-report__add_finding` (recon_report) call is a successful new filing ONLY \
 when its response contains a `finding_id` key. You MUST capture that `finding_id` \
 **verbatim** from the actual tool response, and you may cite or echo it ONLY when you \
 hold a genuine successful `add_finding` response from this turn. **Never** state that a \
@@ -201,10 +219,7 @@ in hand.
 
 A response containing an `error` key is NOT a new successful filing — do not invent or \
 count a `finding_id` for it:
-- `duplicate_finding` — an earlier stage of this run already filed the same \
-  (task_id, flag_type) pair. The response includes `existing_finding_id`: attach your \
-  citations to that `existing_finding_id` (the canonical id for this finding) rather \
-  than fabricating a new one.
+{DUPLICATE_FINDING_SALVAGE_GUIDANCE}
 - `run_id_unknown` / `report_already_completed` — nothing was filed. Do not fabricate a \
   `finding_id` or claim the finding was recorded.
 
@@ -335,6 +350,29 @@ Temporal Limitation` below: (1) `update_edge(invalid_at=now)` on the stale edge,
 separate resulting-state-only `add_memory(category='temporal_facts')` call for the new fact. \
 Never combine the two into a single before/after narrative write.
 
+**Already done for you — blocked-status snapshot edges (task 3037).** A deterministic \
+Stage-1 sweep (`stale_status_snapshot_edge_sweep`) performs this exact two-step on EVERY \
+cycle for edges asserting that a task is blocked: it invalidates any such edge whose task \
+now has a different positively-known status (pending, in-progress, review, done, …), and \
+writes the superseding resulting-state-only fact itself, in the form \
+`"As of <YYYY-MM-DD>, task <N> has status <S>."` So do **not** go hunting for \
+blocked-status snapshot edges to retire by hand: for the shapes the sweep reaches, it will \
+have done both halves before you see them, and a redundant manual `update_edge` is \
+invisible to `report.stats['stale_status_snapshot_edges_invalidated']` — that gap is \
+precisely what produced a reported reading of 0 invalidated out of 6312 edges scanned on a \
+cycle where a blocked edge really had been retired by hand.
+
+**But the sweep has documented residuals it structurally cannot reach** (an aggregate whose \
+status marker is not adjacent to the list noun, an adverbial preamble, a wide open-class gap \
+between the task reference and the marker, an aggregate list that follows a task reference in \
+the same clause). For those the edge is genuinely stale and nothing else will retire it until \
+the task eventually reaches done/cancelled. So if you find a blocked-status snapshot edge you \
+can show the sweep missed: **fix it AND flag it** — perform the two-step yourself, and say so \
+in your cycle summary (which edge, which fact text, which task) so the selection rule can be \
+corrected at the source. Do not silently leave a stale assertion standing to protect the \
+stat's fidelity: the stat counts SWEEP work by design, and your hand-retirement being absent \
+from it is exactly what the cycle-summary note is for.
+
 ## update_edge Temporal Limitation (Task 1145 Guard 3 workaround)
 `mcp__fused-memory__update_edge` does NOT expose a `valid_at` parameter. When you update \
 a temporal or snapshot edge's fact text via `update_edge`, the edge's `valid_at` timestamp \
@@ -346,6 +384,14 @@ Task 1145 Guard 3 is shipped):
 1. Call `update_edge(edge_uuid=..., invalid_at=now)` — marks the old edge superseded.
 2. Call `add_memory(category='temporal_facts', content=<new fact>)` — Graphiti assigns \
    current time as `valid_at`, ensuring accurate temporal ordering in search results.
+
+**Scope carve-out**: this two-step remains YOUR job for NON-snapshot temporal edge updates \
+(status flips, decision retractions, and any other specific known edge you are updating). \
+The one case already automated is BLOCKED-status snapshot edges, which the deterministic \
+`stale_status_snapshot_edge_sweep` invalidates and supersedes on every cycle — see \
+"Already done for you" under `### Resulting-state-only temporal_facts` above. Do not \
+duplicate the sweep's work there; the one exception is an edge you can show it missed, \
+which you fix AND flag per that section.
 
 **Encoding effective dates in fact text**: when writing a temporal-fact snapshot via \
 `add_memory(category='temporal_facts')`, encode the effective ISO date directly in the \

@@ -1116,3 +1116,445 @@ class TestIsCrossRepoTask:
         assert is_cross_repo_task([str(inside)], project_root, None) is False
         # A falsy marker is treated as absent.
         assert is_cross_repo_task([str(inside)], project_root, {'cross_repo': False}) is False
+
+
+class TestParkLockContendedIsNotAHaltResult:
+    """The structural contract that makes task 3060's fix work.
+
+    Because `park_lock_contended` is absent from `_HALT_ADVANCE_RESULTS`,
+    merge_queue's existing plumbing already routes it past the halt path
+    untouched — the explicit mapper branch only upgrades the reason text to
+    structured facts. The fix is therefore safe-by-default: an unhandled new
+    code already means "no halt".
+
+    NOTE: test_merge_queue.py::TestHaltAdvanceResults already asserts EXACT
+    frozenset equality against a literal 5-element set, so that pin passes
+    unchanged and that file needs no edit. This assertion is the explicit,
+    NAMED contract for this code, not a duplicate of it — it records WHY
+    park_lock_contended must stay out.
+    """
+
+    def test_park_lock_contended_is_not_a_halt_result(self) -> None:
+        from orchestrator.merge_queue import _HALT_ADVANCE_RESULTS
+
+        assert 'park_lock_contended' not in _HALT_ADVANCE_RESULTS, (
+            'park_lock_contended must NEVER halt the merge queue — adding it '
+            'here reinstates the 2+/day queue halt task 3060 exists to remove'
+        )
+
+
+@pytest.mark.asyncio
+class TestMapAdvanceFailureParkLockContended:
+    """`park_lock_contended` must be disposed of PER TASK, never as a queue
+    halt — the structural contract that makes task 3060's fix work.
+
+    Contrast `stash_failed` (above): that is a SHARED main-checkout-hygiene
+    fault that recurs identically for every subsequent task, so halting
+    collapses N silent per-task blocks into one loud signal.
+    `park_lock_contended` is the opposite — a FOREIGN git process (dominantly
+    a `git commit --only` holding the index lock across its pre-commit hook)
+    owns project_root's index for a bounded, SELF-CLEARING window. Halting
+    the queue for it is the 2+/day halt this task exists to remove.
+    """
+
+    def _make_git_ops(self) -> MagicMock:
+        git_ops = MagicMock()
+        git_ops.push_main = AsyncMock(return_value='pushed')
+        # Same gotcha as TestMapAdvanceFailureStashFailed._make_git_ops: a
+        # bare MagicMock auto-vivifies a TRUTHY child attribute, which would
+        # defeat the mapper's `getattr(..., None) or <default>` fallback. Any
+        # side channel not deliberately set must be deleted.
+        del git_ops._last_stash_dirty_files
+        del git_ops._last_park_lock_info
+        return git_ops
+
+    async def test_park_lock_contended_blocks_without_halting(self) -> None:
+        """Per-task 'blocked' with structured facts; halt/unhalt untouched."""
+        from orchestrator.merge_gates import _map_advance_failure
+
+        git_ops = self._make_git_ops()
+        git_ops._last_park_lock_info = {
+            'lock_path': '/p/.git/index.lock',
+            'age_seconds': 301.0,
+            'waited_seconds': 300.0,
+            # A coherent real shape: the lock was ~1s old when first observed
+            # and the full 300s grace was waited out. (This test asserts
+            # nothing about recovery advice — see the dedicated tests below.)
+            'initial_age_seconds': 1.0,
+            'grace_seconds': 300.0,
+            'dirty_files': [],
+        }
+        halt = MagicMock()
+        unhalt = MagicMock()
+        cas_retries = {'t1': 2}
+
+        outcome = await _map_advance_failure(
+            git_ops, 'park_lock_contended',
+            task_id='t1',
+            merge_commit_fallback='deadbeef',
+            halt=halt,
+            unhalt=unhalt,
+            cas_retries=cas_retries,
+        )
+
+        # (1)/(2) The queue is left strictly alone.
+        halt.assert_not_called()
+        unhalt.assert_not_called()
+
+        # (3) Per-task disposition, reusing the existing status.
+        assert outcome.status == 'blocked'
+
+        # (4) The reason carries the SUBSTANTIVE facts an operator needs —
+        # asserted on the path and the numbers, never on prose wording.
+        assert '/p/.git/index.lock' in outcome.reason
+        assert '301' in outcome.reason, (
+            f'reason must report the observed lock age; got {outcome.reason!r}'
+        )
+        assert '300' in outcome.reason, (
+            f'reason must report how long we waited; got {outcome.reason!r}'
+        )
+        assert 'transient' in outcome.reason.lower(), (
+            f'reason must state this is transient/retried; got {outcome.reason!r}'
+        )
+
+        # (5) Terminal-for-this-attempt bookkeeping.
+        assert 't1' not in cas_retries
+
+    async def test_park_lock_contended_survives_an_unset_side_channel(self) -> None:
+        """Defensive: with _last_park_lock_info unset the mapper must still
+        return a per-task 'blocked' without halting, never raise.
+
+        Mirrors the `getattr(git_ops, '_last_stash_dirty_files', None) or []`
+        idiom — a missing side channel degrades the reason's detail, never
+        the disposition.
+        """
+        from orchestrator.merge_gates import _map_advance_failure
+
+        git_ops = self._make_git_ops()  # side channel deliberately deleted
+        halt = MagicMock()
+
+        outcome = await _map_advance_failure(
+            git_ops, 'park_lock_contended',
+            task_id='t2',
+            merge_commit_fallback='deadbeef',
+            halt=halt,
+            unhalt=MagicMock(),
+            cas_retries={},
+        )
+
+        halt.assert_not_called()
+        assert outcome.status == 'blocked'
+
+    async def _map(self, info: dict | None) -> tuple:
+        """Map a `park_lock_contended` with *info* as the side channel.
+
+        Returns ``(outcome, halt)`` so each caller can assert both the
+        recovery text and the (invariant) non-halting disposition.
+        """
+        from orchestrator.merge_gates import _map_advance_failure
+
+        git_ops = self._make_git_ops()
+        if info is not None:
+            git_ops._last_park_lock_info = info
+        halt = MagicMock()
+        outcome = await _map_advance_failure(
+            git_ops, 'park_lock_contended',
+            task_id='t9',
+            merge_commit_fallback='deadbeef',
+            halt=halt,
+            unhalt=MagicMock(),
+            cas_retries={},
+        )
+        return (outcome, halt)
+
+    async def test_live_commit_shape_gets_no_destructive_advice(self) -> None:
+        """A live `git commit --only` must NEVER be told to `rm -f` its lock.
+
+        This is the headline regression.  Telling an operator to delete a
+        live commit's index.lock corrupts that in-flight commit — the exact
+        destruction the implementation forbids ITSELF from doing elsewhere
+        (see test_foreign_lock_file_is_never_deleted, and git_ops' "the
+        foreign lock left strictly alone").
+
+        The shape below is an ordinary docs-direct-commit-on-main: the lock
+        was 2s old when we first saw it and its pre-commit hook (this repo's
+        runs pyright; CLAUDE.md instructs `timeout: 300000`) merely outlived
+        the 300s grace by a couple of seconds.  Note `age_seconds` (302) is
+        greater than `waited_seconds` (300) — which is why a staleness test
+        keyed on the POST-wait age fires here, wrongly.
+        """
+        outcome, halt = await self._map({
+            'lock_path': '/p/.git/index.lock',
+            'age_seconds': 302.0,
+            'waited_seconds': 300.0,
+            'initial_age_seconds': 2.0,
+            'grace_seconds': 300.0,
+            'dirty_files': [],
+        })
+
+        halt.assert_not_called()
+        assert outcome.status == 'blocked'
+
+        assert 'rm -f' not in outcome.reason, (
+            'a live commit must never be offered destructive lock removal; '
+            f'got {outcome.reason!r}'
+        )
+        assert 'crashed' not in outcome.reason.lower(), (
+            'a 2-second-old lock must not be described as a crashed leftover; '
+            f'got {outcome.reason!r}'
+        )
+
+        # Suppressing the ADVICE must not suppress the DIAGNOSIS.
+        assert '/p/.git/index.lock' in outcome.reason
+        assert '302' in outcome.reason, (
+            f'reason must still report the observed age; got {outcome.reason!r}'
+        )
+        assert '300' in outcome.reason, (
+            f'reason must still report how long we waited; got {outcome.reason!r}'
+        )
+
+    async def test_crashed_leftover_shape_still_gets_the_advice(self) -> None:
+        """A lock already older than a full grace when FIRST observed is the
+        one shape for which `rm -f` is defensible."""
+        outcome, halt = await self._map({
+            'lock_path': '/p/.git/index.lock',
+            'age_seconds': 3900.0,
+            'waited_seconds': 300.0,
+            'initial_age_seconds': 3600.0,
+            'grace_seconds': 300.0,
+            'dirty_files': [],
+        })
+
+        halt.assert_not_called()
+        assert outcome.status == 'blocked'
+
+        assert 'rm -f /p/.git/index.lock' in outcome.reason, (
+            'an hour-old leftover must carry actionable recovery; got '
+            f'{outcome.reason!r}'
+        )
+        # Asserted on the substantive token, never on prose wording: the
+        # advice is only safe when paired with the liveness check.
+        assert 'no git process' in outcome.reason.lower(), (
+            'destructive advice must tell the operator to confirm no git '
+            f'process is running in project_root first; got {outcome.reason!r}'
+        )
+
+    async def test_zero_grace_young_lock_gets_no_destructive_advice(self) -> None:
+        """grace=0 must not turn EVERY lock into a "crashed leftover".
+
+        `git.merge_park_lock_grace_seconds` is tunable to 0 — a blessed,
+        documented probe-only fail-fast off-switch (GitConfig's docstring
+        and test_zero_is_accepted_as_probe_only_off_switch).  A staleness
+        test keyed on the grace ALONE (`initial_age > grace`) makes every
+        non-zero age exceed it, so an ordinary live `git commit --only`
+        whose lock is half a second old gets told to `rm -f` it — deleting
+        a live commit's index.lock and corrupting that in-flight commit.
+
+        Staleness must therefore clear max(grace, _STALE_LOCK_FLOOR_S):
+        how the operator tuned the WAIT carries no information about
+        whether the lock's owner is alive.
+        """
+        for initial_age in (0.5, 2.0, 299.0):
+            outcome, halt = await self._map({
+                'lock_path': '/p/.git/index.lock',
+                'age_seconds': initial_age,
+                'waited_seconds': 0.0,
+                'initial_age_seconds': initial_age,
+                'grace_seconds': 0.0,
+                'dirty_files': [],
+            })
+
+            halt.assert_not_called()
+            assert outcome.status == 'blocked'
+            assert 'rm -f' not in outcome.reason, (
+                f'a {initial_age}s-old lock under a grace=0 off-switch is a '
+                'live commit, not a crashed leftover, and must never be '
+                f'offered destructive lock removal; got {outcome.reason!r}'
+            )
+            assert 'crashed' not in outcome.reason.lower(), (
+                f'a {initial_age}s-old lock must not be described as a '
+                f'crashed leftover; got {outcome.reason!r}'
+            )
+            # Suppressing the ADVICE must not suppress the DIAGNOSIS.
+            assert '/p/.git/index.lock' in outcome.reason
+
+    async def test_zero_grace_still_reaches_the_floor_for_a_real_leftover(
+        self,
+    ) -> None:
+        """The floor SUPPRESSES false positives; it must not suppress the
+        one true positive.  An hour-old lock is a crashed-git leftover
+        whatever the grace is tuned to — including the grace=0 off-switch.
+        """
+        outcome, halt = await self._map({
+            'lock_path': '/p/.git/index.lock',
+            'age_seconds': 3600.0,
+            'waited_seconds': 0.0,
+            'initial_age_seconds': 3600.0,
+            'grace_seconds': 0.0,
+            'dirty_files': [],
+        })
+
+        halt.assert_not_called()
+        assert outcome.status == 'blocked'
+        assert 'rm -f /p/.git/index.lock' in outcome.reason, (
+            'an hour-old leftover must still carry actionable recovery even '
+            f'when the wait is switched off; got {outcome.reason!r}'
+        )
+        assert 'no git process' in outcome.reason.lower(), (
+            'destructive advice must remain paired with the liveness check; '
+            f'got {outcome.reason!r}'
+        )
+
+    async def test_a_grace_above_the_floor_still_governs(self) -> None:
+        """The floor is a FLOOR, not a replacement.  With a grace tuned
+        ABOVE the floor, a lock older than the floor but younger than the
+        grace is still an ordinary slow pre-commit hook, not a leftover.
+        """
+        outcome, _halt = await self._map({
+            'lock_path': '/p/.git/index.lock',
+            'age_seconds': 400.0,
+            'waited_seconds': 0.0,
+            'initial_age_seconds': 400.0,   # > 300s floor, < 900s grace
+            'grace_seconds': 900.0,
+            'dirty_files': [],
+        })
+
+        assert 'rm -f' not in outcome.reason, (
+            'an operator who RAISED the grace has declared hooks that long '
+            f'to be normal; got {outcome.reason!r}'
+        )
+
+    async def test_floor_matches_the_documented_pre_commit_budget(self) -> None:
+        """The floor is a literal (orchestrator.config is TYPE_CHECKING-only
+        in merge_gates), so pin it against the config default it mirrors —
+        otherwise the two drift silently.
+
+        (`async` only to satisfy this module's global asyncio pytestmark.)
+        """
+        from orchestrator.config import GitConfig
+        from orchestrator.merge_gates import _STALE_LOCK_FLOOR_S
+
+        assert GitConfig().merge_park_lock_grace_seconds == pytest.approx(
+            _STALE_LOCK_FLOOR_S
+        ), (
+            '_STALE_LOCK_FLOOR_S must track '
+            'GitConfig.merge_park_lock_grace_seconds\'s default (this repo\'s '
+            'documented pre-commit budget)'
+        )
+
+    async def test_missing_staleness_keys_default_to_no_advice(self) -> None:
+        """Absent evidence of staleness is not evidence of staleness.
+
+        A pre-step-15 (legacy) side-channel dict carries neither
+        `initial_age_seconds` nor `grace_seconds`.  The failure mode of a
+        false positive here is data loss, so the conservative default is no
+        advice — and never a raise.
+        """
+        outcome, halt = await self._map({
+            'lock_path': '/p/.git/index.lock',
+            'age_seconds': 3900.0,
+            'waited_seconds': 300.0,
+            'dirty_files': [],
+        })
+
+        halt.assert_not_called()
+        assert outcome.status == 'blocked'
+        assert 'rm -f' not in outcome.reason, (
+            'a side channel with no staleness evidence must not produce '
+            f'destructive advice; got {outcome.reason!r}'
+        )
+
+    async def test_reason_is_not_miscategorised_as_a_ff_failure(self) -> None:
+        """The reason must not trip workflow.py's merge-failure category
+        heuristic into calling an index-lock stand-off a fast-forward failure.
+
+        `workflow.py`'s blocked path infers the review category with a bare
+        substring test:
+
+            elif 'ff' in reason.lower() or 'advanced' in reason.lower():
+                category = 'merge_ff_failed'
+
+        The original wording ("advance_main stood off: ...") contains 'ff'
+        inside "off", so every park_lock_contended block was filed as
+        `merge_ff_failed` — a category that flows into
+        `_write_merge_failure_review`, the `merge_blocked` event's
+        `data.category`, and the signature-aware L1 dedup key, durably
+        polluting the very observability this task adds.
+
+        Asserted by REPLAYING the heuristic verbatim rather than by pinning
+        prose, so any future reword is checked against the real consumer.
+        (A cleaner fix — an explicit reason-prefix short-circuit in
+        workflow.py, as DROPPED_PLAN_TARGETS/TRANSIENT_INFRA/MAIN_HEALTH_RED
+        already have — needs workflow.py, which is outside this task's lock
+        set; filed as follow-up.)
+        """
+        # Benign fixture strings: the substring test also sees the lock path
+        # and any at-risk filenames, which are runtime values this code
+        # cannot constrain — the CONSTANT prose is what is pinned here.
+        outcome, _halt = await self._map({
+            'lock_path': '/p/.git/index.lock',
+            'age_seconds': 3900.0,
+            'waited_seconds': 300.0,
+            'initial_age_seconds': 3600.0,
+            'grace_seconds': 300.0,
+            'dirty_files': ['docs/notes.md'],
+        })
+
+        lowered = outcome.reason.lower()
+        assert 'verification failed' not in lowered
+        assert 'ff' not in lowered, (
+            "the reason must not contain the token 'ff' — workflow.py would "
+            f'file it as merge_ff_failed; got {outcome.reason!r}'
+        )
+        assert 'advanced' not in lowered, (
+            "the reason must not contain 'advanced' — workflow.py would file "
+            f'it as merge_ff_failed; got {outcome.reason!r}'
+        )
+
+    async def test_toctou_dirty_files_are_named_in_the_reason(self) -> None:
+        """The side channel's `dirty_files` must reach the operator.
+
+        On the mid-park (TOCTOU) path advance_main already knows which
+        uncommitted tracked files were about to be parked when the foreign
+        lock appeared.  That is the same fact `stash_failed` reports, and it
+        is what tells an operator whether real WIP is implicated — so it must
+        be named rather than collected and dropped.
+        """
+        outcome, halt = await self._map({
+            'lock_path': '/p/.git/index.lock',
+            'age_seconds': 2.0,
+            'waited_seconds': 0.0,
+            'initial_age_seconds': 2.0,
+            'grace_seconds': 300.0,
+            'dirty_files': ['CLAUDE.md', 'docs/task-authoring.md'],
+        })
+
+        halt.assert_not_called()
+        assert outcome.status == 'blocked'
+        assert 'CLAUDE.md' in outcome.reason, (
+            'the dirty tracked files carried on the side channel must be '
+            f'named in the blocked reason; got {outcome.reason!r}'
+        )
+        assert 'docs/task-authoring.md' in outcome.reason
+
+    async def test_empty_dirty_files_adds_no_wip_clause(self) -> None:
+        """The gate path knows of no WIP, so it must claim none.
+
+        `dirty_files` is `[]` by construction there (the dirty snapshot is
+        taken only AFTER the lock clears), and an empty "WIP at risk:" clause
+        would contradict the reason's own "NOTHING in project_root was
+        modified" statement.
+        """
+        outcome, _halt = await self._map({
+            'lock_path': '/p/.git/index.lock',
+            'age_seconds': 301.0,
+            'waited_seconds': 300.0,
+            'initial_age_seconds': 1.0,
+            'grace_seconds': 300.0,
+            'dirty_files': [],
+        })
+
+        assert 'WIP' not in outcome.reason, (
+            'with no known dirty files the reason must not imply WIP is at '
+            f'risk; got {outcome.reason!r}'
+        )

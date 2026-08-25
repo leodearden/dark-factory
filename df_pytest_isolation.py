@@ -34,18 +34,192 @@ strictly tighter than this one (``cwd.parent`` rather than the basetemp):
 * ``_orch_helpers.git_env_with_ceiling`` — the same ceiling mechanism applied
   per call, on a private env copy.
 
+SECOND DEFENCE — a test run can never falsify a REAL deploy clock.
+
+Task 3797.  ``scripts/restart-all-orchestrators.sh`` resolves its ``CLOCK_FILE``
+from ``$ORCH_FLEET_DEPLOY_CLOCK``, defaulting to
+``$REPO_DIR/data/orchestrator/last_redeploy_orchestrator.json`` — the live
+checkout the script sits in — and stamps it on its verified-fresh exit-0 path.
+``scripts/tests/test_restart_all_orchestrators.py`` drove that path against a
+fake ``systemctl`` without setting the env var, so an ordinary green test run
+wrote a REAL "the fleet just redeployed" stamp.  Nothing distinguishes it from
+a genuine one: ``scripts/orchestrator-watchdog.py`` reads the file and SKIPS
+its staleness pass for ``ORCH_RESTART_MIN_INTERVAL_SECS`` (8h default), so the
+fleet-staleness backstop was silently disarmed for the rest of the day.
+
+Same structure as the ceiling above — pure helpers (``deploy_clock_guard_roots``
+/ ``deploy_clock_snapshot`` / ``deploy_clock_violation_reason``) plus a thin
+session-scoped autouse fixture wiring them — and the same reason for living
+here: the defence must be suite-wide and impossible to opt out of, because the
+defect class is "a spawner that forgets the env var" and the next one has not
+been written yet.
+
+Unlike the ceiling, this one guards TWO roots when it runs inside a task
+worktree: that worktree AND the main checkout enclosing it.  The bash script
+derives its clock path from its own location (so a worktree run hits the
+worktree), but ``scripts/orchestrator-watchdog.py`` HARDCODES ``REPO_DIR``, so
+its fused-memory clock and the fleet script it spawns land in the main checkout
+whichever worktree invoked them.  One root would have left the second protected
+path watched-but-unwritable-to, i.e. green and useless.
+
+THIRD DEFENCE — a test's spawn timeout can never leak a process group.
+
+Task 3798.  Both pytest harnesses that drive
+``scripts/restart-all-orchestrators.sh --drain`` used a plain
+``subprocess.run(..., timeout=N)``.  On POSIX that timeout path ``kill()``s the
+DIRECT CHILD ONLY, so the poll loops the drain script forks outlive it, get
+reparented to ``systemd --user``, and sit spending their grace — 86 concurrent
+orphans on 2026-08-06 and 82 more on 2026-08-07, each holding a hand-typed
+``99999``-second (27.8 HOUR) grace.  That number is the second half of the
+defect: an orphan that lives 27.8h outlives pytest's tmpdir GC, at which point
+its ``PATH`` no longer resolves ``systemctl`` to the test's fake and its
+expiry restarts REAL units and stamps a REAL fleet-deploy clock.
+
+Same structure and the same reason for living here as the two defences above —
+``run_in_new_session`` / ``wait_proof_grace_secs`` / ``leaked_drain_processes``
+as pure helpers plus a thin session-scoped autouse fixture — because the defect
+class is again "a spawner that forgets" and the next one has not been written
+yet.  Centralising the spawn matters twice over here: ``tests/scripts/`` and
+``scripts/tests/`` cannot import each other's test modules, so their two
+copies of this harness could only ever be kept in step by a cross-checking
+test (``test_boundary_fake_systemctl_matches_unit_suite_verbatim`` exists for
+exactly that reason).  This module is the one place BOTH already import.
+
+FOURTH DEFENCE — a test run can never reach the LIVE fleet directory.
+
+Task 3799.  ``ORCH_FLEET_DIR`` was unset for the whole suite, so
+``scripts/restart-all-orchestrators.sh``'s ``FLEET_DIR`` default and
+``drain_check.DEFAULT_FLEET_DIR``
+both fell through to their machine-global default,
+``/home/leo/src/dark-factory/data/fleet``.  That is a CROSS-PROJECT rendezvous
+directory — measured 2026-08-07 and re-measured 2026-08-09 holding live
+heartbeats for SEVEN different projects' orchestrators — so a test-spawned drain
+gate read five other projects' live PRODUCTION heartbeats and decided the real
+fleet's drain state from them.  ``_df_fleet_dir_redirect`` closes that, and
+``_df_no_synthetic_heartbeats_in_live_fleet`` is the regression guard behind it.
+
+The guard is keyed on the SYNTHETIC unit-name prefix rather than on "the fleet
+dir is untouched", and that is the load-bearing detail: the live directory is
+rewritten by the running orchestrators roughly every 30s (six of seven files
+moved between two readings five minutes apart), so an untouched-content guard
+would fail on essentially every run and be indistinguishable from a real leak.
+Keying it on a name no production process can produce is only POSSIBLE because
+the same task renamed every PATH-exposed fixture unit to ``orchestrator-fake*``
+(:data:`SYNTHETIC_UNIT_PREFIX`, enforced at each fake-``systemctl`` seam by
+:func:`assert_synthetic_units`) — which is why the rename and the guard are one
+defence, not two.
+
+WHICH ROOTDIRS THE DRAIN-SCRIPT DEFENCES ARE WIRED INTO, and why the rest are
+deliberately not.  Nine conftests import from this module; the git ceiling and
+the deploy-clock guard are in all nine, while ``_df_no_leaked_drain_processes``
+and task 3799's ``_df_fleet_dir_redirect`` /
+``_df_no_synthetic_heartbeats_in_live_fleet`` are wired only into the ROOT
+conftest (covering ``tests/``) and ``scripts/tests/conftest.py``.  Those are
+exactly the two rootdirs that spawn the drain script — and they are the two the
+incident came from.  The seven subproject rootdirs (``cockpit``, ``dashboard``,
+``escalation``, ``fused-memory``, ``orchestrator``, ``sampler``, ``shared``) run
+as their own pytest sessions from their own venvs, so the root conftest does not
+reach them: no token is stamped, and ``leaked_drain_processes`` fails CLOSED on
+an absent token, so those sessions report all-clear unconditionally rather than
+falsely.  That is a real gap, not a proof of safety: ``orchestrator`` is the one
+to watch, since ``orchestrator/src/orchestrator/service_restart.py`` is the
+PRODUCTION caller of the drain script and its tests today only assert on config
+strings.  Widening the wiring is a mechanical edit to those seven files and is
+out of task 3798's locked scope; until then, read a green subproject run as
+"unmeasured", never as "no leak".
+
+THE WRITE-SIDE GAP IN THAT RATIONALE, stated explicitly rather than left to be
+rediscovered.  "The rootdirs that spawn the drain script" is the right criterion
+for ``_df_no_leaked_drain_processes``, whose hazard is a forked poll loop, but it
+covers only the READ direction of the fleet dir.  ``orchestrator/tests/`` is the
+rootdir of the fleet heartbeat's PRODUCER — ``Harness._write_merge_heartbeat``
+calls ``fleet_heartbeat.resolve_fleet_dir()``, which reads bare ``os.environ`` —
+so an orchestrator test that drives the run loop without setting
+``ORCH_FLEET_DIR`` writes a heartbeat straight into the machine-global
+cross-project directory, and with a REAL unit name that
+``_df_no_synthetic_heartbeats_in_live_fleet`` is deliberately blind to.
+
+Accepted as latent, not safe, on a MEASURED basis: every producer call site in
+``orchestrator/tests/`` today takes an explicit env — both heartbeat-writing
+tests (``test_harness_merge_heartbeat.py``) ``monkeypatch.setenv`` the var first,
+and ``test_fleet_heartbeat.py``'s ``delenv`` case only computes a path and writes
+nothing.  So there is no live leak to fix, and wiring those two fixtures into
+``orchestrator/tests/conftest.py`` is a file outside task 3799's locked scope.
+What would invalidate this: the FIRST orchestrator test that writes a heartbeat
+without an explicit ``ORCH_FLEET_DIR``.  Wire the two fixtures there rather than
+patching that one test — the defect class is "a spawner that forgets", and this
+paragraph exists because the producer's rootdir is where the next forgetful one
+will be written.
+
 Import constraint: STDLIB + PYTEST ONLY.  Every subproject conftest imports this
 module, so it must import cleanly inside every member venv — escalation's lacks
 aiosqlite and stubs ``shared`` in ``sys.modules``, so nothing under ``shared/src``
-may be depended on here.
+may be depended on here.  That is why the protected clock paths below are
+LITERALS rather than an import of
+``orchestrator.service_restart.FLEET_DEPLOY_CLOCK_RELPATH``, exactly as the
+stdlib watchdog and the bash script duplicate it; all four mirrors are pinned
+together by
+``tests/scripts/test_orchestrator_watchdog.py::test_fleet_deploy_clock_path_matches_across_tiers``.
 """
 
 from __future__ import annotations
 
+import contextlib
+import math
 import os
+import signal
+import subprocess
+import time
+import uuid
+from collections.abc import Iterable
 from pathlib import Path
+from typing import Any
 
 import pytest
+
+# ---------------------------------------------------------------------------
+# Shared test-support plumbing for the liveness pins below
+# ---------------------------------------------------------------------------
+
+# pytest's fixture marker is private and has MOVED: <=8.x hangs it off the
+# decorated function as `_pytestfixturefunction`, 9.x wraps the function in a
+# `FixtureFunctionDefinition` carrying `_fixture_function_marker`. Both spellings
+# are accepted, and neither-found is an explicit failure rather than a skipped
+# assertion — a private-API pin that silently stops finding its target is worse
+# than no pin, because it still reads as coverage.
+_FIXTURE_MARKER_ATTRS = ('_fixture_function_marker', '_pytestfixturefunction')
+
+
+def fixture_marker(fixture: object) -> Any:
+    """Return pytest's fixture marker for *fixture*, whatever this pytest calls it.
+
+    Lives HERE rather than in one test module because each of this module's
+    suite-wide defences needs the same "is it really session-scoped and autouse"
+    pin, and the two test roots (``tests/scripts/`` and ``scripts/tests/``)
+    cannot import each other's test modules — this module is the one place both
+    already import.  ``tests/scripts/test_deploy_clock_isolation.py`` still
+    carries a private copy that predates this; de-duplicating it onto this
+    symbol is a one-line edit in a file outside task 3799's locked scope.
+
+    ``Any``, not ``object``, is the honest annotation and is load-bearing for the
+    type gate: the two :data:`_FIXTURE_MARKER_ATTRS` spellings hang DIFFERENT
+    private classes off the fixture, neither of which pytest exports, so there is
+    no real static type covering both — and ``object`` makes every ``.scope`` /
+    ``.autouse`` read at the call site a ``reportAttributeAccessIssue``.  Do not
+    "tighten" this back to ``object``; pin the attributes with assertions
+    instead, as the callers do.
+    """
+    for attr in _FIXTURE_MARKER_ATTRS:
+        marker = getattr(fixture, attr, None)
+        if marker is not None:
+            return marker
+    pytest.fail(
+        f'cannot find pytest\'s fixture marker on {fixture!r} under any of '
+        f'{_FIXTURE_MARKER_ATTRS}. pytest moved its private fixture API again — '
+        'find the new spelling and add it, do NOT delete this assertion.',
+        pytrace=False,
+    )
+
 
 _CEILING_ENV = 'GIT_CEILING_DIRECTORIES'
 
@@ -169,3 +343,1160 @@ def _df_git_ceiling_at_basetemp(tmp_path_factory: pytest.TempPathFactory):
             os.environ.pop(_CEILING_ENV, None)
         else:
             os.environ[_CEILING_ENV] = saved
+
+
+# ---------------------------------------------------------------------------
+# Deploy-clock isolation (task 3797)
+# ---------------------------------------------------------------------------
+
+# Both entries are MIN-INTERVAL deploy clocks: scripts/orchestrator-watchdog.py
+# reads each as "this component was redeployed at <ts>" and SKIPS its staleness
+# pass while the corresponding min-interval window is open (8h by default —
+# ORCH_RESTART_MIN_INTERVAL_SECS / FM_RESTART_MIN_INTERVAL_SECS). Falsifying
+# either one therefore SUPPRESSES a staleness backstop for the rest of the day,
+# invisibly and with every test still green.
+#
+# The fused-memory clock is included even though only the fleet clock has
+# actually been falsified so far, because it is the identical defect class, not
+# an adjacent one: the same watchdog, the same semantics, and it is stamped
+# from a chained `--stamp-fm-deploy-clock` SUBPROCESS — the same shape (a
+# spawned process resolving its target from the environment) that produced the
+# fleet-clock bug.
+#
+# LITERALS, not imports: see the module docstring's import constraint. All four
+# mirrors of these paths are pinned together by
+# tests/scripts/test_orchestrator_watchdog.py::test_fleet_deploy_clock_path_matches_across_tiers.
+PROTECTED_DEPLOY_CLOCK_RELPATHS: tuple[str, ...] = (
+    'data/orchestrator/last_redeploy_orchestrator.json',
+    'data/fused-memory/last_redeploy_fused_memory.json',
+)
+
+# A real clock body is ~70 bytes (`{"ts": <int>, "iso": "<timestamp>"}`), so this
+# truncates nothing legitimate; it exists only so a failure message stays
+# readable if the guard ever fires on a file that is not a clock at all.
+_MAX_CLOCK_BODY_CHARS = 200
+
+
+def deploy_clock_guard_roots(
+    module_root: str | os.PathLike[str],
+) -> tuple[Path, ...]:
+    """Every checkout whose deploy clocks a run in *module_root* must leave alone.
+
+    Always *module_root* itself — the checkout this module sits in, which is the
+    ``REPO_DIR`` ``scripts/restart-all-orchestrators.sh`` derives from its own
+    path, hence the file a forgetful spawner hits in an ordinary worktree run.
+
+    PLUS, when that checkout is a task worktree (``…/.worktrees/<id>``), the MAIN
+    checkout enclosing it.  That second root is not belt-and-braces: the OTHER
+    protected clock is written against a HARDCODED path.
+    ``scripts/orchestrator-watchdog.py`` fixes ``REPO_DIR =
+    "/home/leo/src/dark-factory"``, so its ``FM_DEPLOY_CLOCK_PATH`` default — and
+    the fleet restart script it spawns — resolve into the main checkout no matter
+    which worktree the suite runs from.  A guard rooted only at the worktree would
+    watch a path nothing writes and report all-clear while the REAL production
+    clock was being falsified, which is the same "green and useless" failure the
+    relpath drift pin exists to prevent.
+
+    The cost is accepted deliberately: a GENUINE concurrent redeploy in the
+    machine-operated main checkout now fails a worktree suite too, not just a
+    main-checkout one.  That is the loud-over-silent trade this whole defence is
+    built on, and it is why the failure message prints the absolute path plus
+    both observed bodies — so "real redeploy" is one glance away from "test bug".
+
+    Own checkout FIRST and deduped, so the message names the run's own checkout
+    when both were touched, and so a suite running in the main checkout (where
+    ``module_root`` has no ``.worktrees`` parent) snapshots it exactly once.
+    """
+    root = Path(module_root).resolve()
+    roots = [root]
+    if root.parent.name in _WORKTREE_ROOT_COMPONENTS and len(root.parents) >= 2:
+        enclosing = root.parents[1]
+        if enclosing != root:
+            roots.append(enclosing)
+    return tuple(roots)
+
+
+def deploy_clock_snapshot(
+    root: str | os.PathLike[str],
+) -> dict[str, tuple[bytes, int] | None]:
+    """Record every protected deploy clock under *root*.
+
+    One entry per :data:`PROTECTED_DEPLOY_CLOCK_RELPATHS`, mapping the relpath
+    to ``(bytes, st_mtime_ns)`` when the file exists and ``None`` when it does
+    not.  Absence is a FIRST-CLASS value rather than an omitted key: the common
+    case is absence (a fresh worktree has no ``data/`` dir at all), so "the file
+    was created during the run" — the exact shape of this bug — is only
+    detectable if absence is recorded.
+
+    ``(bytes, st_mtime_ns)`` rather than bytes alone.  ``stamp_fleet_deploy_clock``
+    writes ``{"ts": <integer seconds>, "iso": ...}`` at ONE-SECOND resolution, so
+    two stamps landing inside the same second are byte-identical; mtime is the
+    only remaining signal, and a rapid restamp is precisely what a test suite
+    produces.
+
+    Never raises on a missing file or a missing ``data/`` directory — that is
+    the ordinary state, not an error.
+    """
+    base = Path(root)
+    snapshot: dict[str, tuple[bytes, int] | None] = {}
+    for relpath in PROTECTED_DEPLOY_CLOCK_RELPATHS:
+        target = base / relpath
+        try:
+            snapshot[relpath] = (target.read_bytes(), target.stat().st_mtime_ns)
+        except OSError:
+            snapshot[relpath] = None
+    return snapshot
+
+
+def _clock_change_kind(
+    before: tuple[bytes, int] | None, after: tuple[bytes, int] | None,
+) -> str | None:
+    """Name how a single clock entry changed, or ``None`` if it did not."""
+    if before == after:
+        return None
+    if before is None:
+        return 'CREATED during the test run'
+    if after is None:
+        return 'DELETED during the test run'
+    if before[0] != after[0]:
+        return 'REWRITTEN during the test run (contents changed)'
+    return (
+        'RESTAMPED during the test run (contents identical, mtime moved — the '
+        'clock writes whole seconds, so two stamps in one second look the same)'
+    )
+
+
+def _describe_clock_entry(entry: tuple[bytes, int] | None) -> str:
+    """Render one snapshot reading for the failure message.
+
+    The body is printed, not just the fact that it changed, because
+    distinguishing a test stamp from a GENUINE concurrent redeploy means
+    comparing the ``{ts, iso}`` against the deploy you expect — and by the time
+    anyone reads the failure the file may have moved again, so re-reading it is
+    not a substitute.  Both readings are already in hand in the snapshot tuples;
+    withholding them just makes triage a second investigation.
+    """
+    if entry is None:
+        return 'absent'
+    body, mtime_ns = entry
+    text = body.decode('utf-8', errors='replace').strip()
+    if len(text) > _MAX_CLOCK_BODY_CHARS:
+        text = f'{text[:_MAX_CLOCK_BODY_CHARS]}…(truncated)'
+    return f'{text!r} st_mtime_ns={mtime_ns}'
+
+
+def deploy_clock_violation_reason(
+    before: dict[str, tuple[bytes, int] | None],
+    after: dict[str, tuple[bytes, int] | None],
+    root: str | os.PathLike[str] | None = None,
+) -> str | None:
+    """Explain which protected deploy clock the run falsified, or ``None``.
+
+    Reports the FIRST offending relpath in :data:`PROTECTED_DEPLOY_CLOCK_RELPATHS`
+    order, what happened to it, the before/after readings actually observed, and
+    both readings of that observation — a test that forgot to redirect its clock
+    (the common case, with the concrete remedy) and a genuine concurrent redeploy
+    in a machine-operated checkout (not a bug at all).  Naming only the first
+    would invite the reader to assume whichever one they thought of first.
+
+    *root* is optional and cosmetic-but-load-bearing: pass the checkout the
+    snapshots were taken against and the message names the ABSOLUTE file.  A run
+    guards more than one checkout (see :func:`deploy_clock_guard_roots`), so a
+    bare relpath leaves the reader unable to tell which one was falsified.
+    """
+    for relpath in PROTECTED_DEPLOY_CLOCK_RELPATHS:
+        before_entry, after_entry = before.get(relpath), after.get(relpath)
+        kind = _clock_change_kind(before_entry, after_entry)
+        if kind is None:
+            continue
+        env_var = (
+            'FM_DEPLOY_CLOCK' if 'fused-memory' in relpath else 'ORCH_FLEET_DEPLOY_CLOCK'
+        )
+        where = relpath if root is None else str(Path(root) / relpath)
+        return (
+            f'this test run falsified a REAL deploy clock: {where} was {kind}.\n'
+            f'observed before: {_describe_clock_entry(before_entry)}\n'
+            f'observed after:  {_describe_clock_entry(after_entry)}\n'
+            'scripts/orchestrator-watchdog.py reads that file as "this component '
+            'was redeployed at <ts>" and SKIPS its staleness pass while the '
+            'min-interval window is open (8h by default), so the stamp silently '
+            'disarms staleness recovery for the rest of the day.\n'
+            f'Fix (the usual cause): a test spawned a process that resolved its '
+            f'clock path from the environment and defaulted to the live checkout. '
+            f'Point {env_var} at a tmp file for the whole suite, as '
+            'scripts/tests/conftest.py::_df_fleet_deploy_clock_redirect does, or '
+            'per call, as tests/scripts/test_orchestrator_watchdog.py::'
+            '_boundary_run_drain_script does with its REQUIRED clock_file '
+            'parameter.\n'
+            'Benign alternative, worth ruling out first in a machine-operated '
+            'checkout: a REAL fleet redeploy (the deployed watchdog, or an '
+            'operator running restart-all-orchestrators.sh --drain) fired while '
+            'this suite was running. That is a genuine stamp and not a test bug — '
+            'the two bodies printed above ARE that comparison: check the {ts, iso} '
+            'against the deploy you expect.'
+        )
+    return None
+
+
+@pytest.fixture(scope='session', autouse=True)
+def _df_deploy_clocks_unwritten():
+    """Fail the run if it falsified a REAL deploy clock in any guarded checkout.
+
+    The roots come from :func:`deploy_clock_guard_roots`, seeded with
+    ``Path(__file__).resolve().parent`` — this module SITS at the repo root, and
+    in a task worktree that correctly yields the WORKTREE root, which is
+    precisely the ``REPO_DIR`` that ``scripts/restart-all-orchestrators.sh``
+    computes for its ``CLOCK_FILE`` default.  Under a worktree the enclosing MAIN
+    checkout is guarded too, because ``scripts/orchestrator-watchdog.py``
+    hardcodes its ``REPO_DIR`` and so writes there regardless of which worktree
+    spawned it.  So the guard watches exactly the files a forgetful spawner would
+    hit, in every checkout it could hit them in.
+
+    SESSION scope for the same two reasons ``_df_git_ceiling_at_basetemp``
+    documents — cost (a function-scoped autouse fixture runs once per test,
+    times every xdist worker) and coverage (a write from a module- or
+    session-scoped fixture must be caught too, and that is where expensive
+    subprocess setup tends to live).
+
+    DETECTS ONLY — it never restores or rolls the file back.  The main checkout
+    is machine-operated (CLAUDE.md): the deployed watchdog and a real
+    ``restart-all-orchestrators.sh --drain`` can legitimately stamp the clock
+    while a suite runs there.  A restoring guard would silently roll back a
+    GENUINE fleet-deploy stamp, re-opening the very 8h window this defence
+    exists to close — and doing it invisibly, which is strictly worse than the
+    bug.  Hence the failure message names the benign concurrent-redeploy
+    reading alongside the test-bug one.
+
+    A failure raised in teardown surfaces as a run-level ERROR with a non-zero
+    exit code even when every test passed.  That is the intended loudness: the
+    damage is to production state, not to any one test's result.
+    """
+    roots = deploy_clock_guard_roots(Path(__file__).resolve().parent)
+    before = [(root, deploy_clock_snapshot(root)) for root in roots]
+    try:
+        yield
+    finally:
+        for root, snapshot in before:
+            reason = deploy_clock_violation_reason(
+                snapshot, deploy_clock_snapshot(root), root=root,
+            )
+            if reason is not None:
+                pytest.fail(reason, pytrace=False)
+
+
+# ---------------------------------------------------------------------------
+# Session-isolated spawning (task 3798)
+# ---------------------------------------------------------------------------
+
+# How long the post-kill drain may take before we give up on collecting the
+# child's partial output. Bounded on purpose — see run_in_new_session. Generous
+# because it is a CEILING, not a latency: once the group is SIGKILLed every
+# write end of the pipe is closed and the drain returns in milliseconds.
+_POST_KILL_DRAIN_SECS = 10
+
+# How long to wait for a child we have already SIGKILLed and stopped draining.
+# Short: it has been killed, so this is a reap, not a wait for work to finish.
+_ABANDONED_CHILD_REAP_SECS = 5
+
+
+# ---------------------------------------------------------------------------
+# The wait-proving grace (task 3798, fix (c))
+# ---------------------------------------------------------------------------
+
+# How far the grace must exceed the spawn timeout that will kill it. 4x absorbs
+# scheduling jitter under 32-way xdist load with room to spare, which is the
+# load the existing 20s timeout was itself chosen against.
+WAIT_PROOF_GRACE_MULTIPLIER = 4
+
+# A purely multiplicative grace off a 1-3s timeout lands near the script's own
+# startup cost, so the defer line the test is waiting for might never print.
+WAIT_PROOF_GRACE_FLOOR_SECS = 30
+
+# The other side of the invariant: how long a poller that ESCAPES its kill may
+# live before its own grace expires and it exits.
+#
+# DECLARATIVE — nothing computes from it. It is the budget every value
+# wait_proof_grace_secs() returns is checked against (in the tests, which is
+# where a violation can be caught before it ships), and the number to move if
+# that budget ever needs to change. Do not add an assertion on its magnitude:
+# comparing this literal to another literal in the same file cannot fail except
+# when someone edits it, which the tests here would catch anyway.
+LEAK_SELF_TERMINATION_CEILING_SECS = 90
+
+
+def wait_proof_grace_secs(spawn_timeout_secs: float) -> int:
+    """The grace a wait-proving test should hand the script it spawns.
+
+    Several tests prove ``restart-all-orchestrators.sh`` is genuinely POLLING
+    rather than fail-opening, by setting a grace large enough that the script
+    is still waiting when the test's own short ``subprocess`` timeout kills it,
+    then asserting no restart was recorded. That shape needs a number, and all
+    three sites independently picked ``99999`` — 27.8 HOURS.
+
+    Each choice was locally reasonable: bigger is safer against the ONE
+    constraint the code stated. The unstated second constraint is what this
+    function exists to make explicit, because the number is two things at once:
+
+    * LARGE enough that the wait is provably still a real wait at the moment
+      the caller's own ``subprocess`` timeout kills it — at least
+      :data:`WAIT_PROOF_GRACE_MULTIPLIER` times that timeout, never below
+      :data:`WAIT_PROOF_GRACE_FLOOR_SECS`. Too small and the script force-fires
+      mid-test, records the restart, and the assertion fails.
+    * SMALL enough that a poller which nevertheless escapes the kill
+      self-terminates within :data:`LEAK_SELF_TERMINATION_CEILING_SECS`. Too
+      large and it does not: 86 concurrent orphans on 2026-08-06 and 82 more on
+      2026-08-07, each with 27.8h left to run.
+
+    THE COUNTER-INTUITIVE PART, because it is the objection a reviewer will
+    raise: shrinking the grace makes an escaped orphan reach expiry and issue a
+    REAL ``systemctl --user restart`` SOONER. That is strictly SAFER, not
+    riskier. At 30-80s the fake ``systemctl`` in the test's tmpdir under
+    ``/tmp/pytest-of-<user>/pytest-NNN/`` still exists, so the orphan's PATH
+    still resolves to the FAKE and its restart goes nowhere. It was only the
+    27.8h survivor that outlived pytest's tmpdir GC, fell through to
+    ``/usr/bin/systemctl``, and restarted real units while stamping a real
+    fleet-deploy clock. A short grace is what keeps an escape contained inside
+    the lifetime of its own containment.
+
+    Returns an ``int``: the value is stringified into an env var and compared
+    by bash's integer operators, which reject ``30.0``.
+    """
+    derived = math.ceil(spawn_timeout_secs * WAIT_PROOF_GRACE_MULTIPLIER)
+    return max(WAIT_PROOF_GRACE_FLOOR_SECS, derived)
+
+
+def _unsafe_pgid_reason(pgid: int) -> str | None:
+    """Return why *pgid* is unsafe to ``killpg``, or ``None`` if it is fine.
+
+    Ported (not imported — see the module docstring's stdlib-only constraint)
+    from ``shared.proc_group._unsafe_pgid_reason``, which is the canonical
+    async sibling of this function and the place to look for the full history.
+
+    This is not belt-and-braces. That module's docstring records task 845: a
+    ``killpg`` aimed via ``os.getpgid(pid)`` at a pid the kernel had already
+    RECYCLED resolved to the new owner's group, which in practice was the
+    ``systemd --user`` manager's — and killed the user's entire login session.
+    The hazard is unusually live in this module's case, because the orphans it
+    exists to reap are themselves reparented to ``systemd --user``.
+
+    Takes no ``proc_pid`` companion argument, unlike the ``shared`` version:
+    the single caller captures ``pgid = p.pid`` at the instant of spawn and
+    passes that same value here, so a ``pgid != proc.pid`` check would compare
+    a variable against itself.
+    """
+    if pgid <= 1:
+        return f'pgid <= 1 ({pgid!r})'
+    if pgid == os.getpid():
+        return f'pgid == os.getpid() ({pgid})'
+    try:
+        ppid = os.getppid()
+    except OSError:
+        ppid = None
+    if ppid is not None and pgid == ppid:
+        return f'pgid == os.getppid() ({pgid})'
+    try:
+        own_pgrp = os.getpgrp()
+    except OSError:
+        own_pgrp = None
+    if own_pgrp is not None and pgid == own_pgrp:
+        return f'pgid == os.getpgrp() ({pgid})'
+    return None
+
+
+def run_in_new_session(
+    cmd: list[str],
+    *,
+    env: dict[str, str] | None = None,
+    timeout: float | None = None,
+    cwd: str | os.PathLike[str] | None = None,
+    text: bool = True,
+) -> subprocess.CompletedProcess:
+    """``subprocess.run``, except a timeout kills the whole process GROUP.
+
+    A drop-in for ``subprocess.run(cmd, env=..., capture_output=True,
+    text=True, timeout=...)``: same ``CompletedProcess`` on the ordinary path,
+    same ``subprocess.TimeoutExpired`` with partial output attached on the slow
+    one. Two things differ, both of them the point.
+
+    FIRST — the child leads its own session, and the timeout signals the GROUP.
+    ``subprocess.run``'s timeout path calls ``Popen.kill()``, which signals the
+    direct child and nothing else. A script that backgrounds a poll loop
+    therefore survives its own caller's timeout: the loop is reparented to
+    ``systemd --user`` and keeps running until its grace expires. That is task
+    3798's 86-orphan pileup, and it is only reachable by signalling the group.
+
+    The pgid is CAPTURED as ``p.pid`` immediately after a ``start_new_session=
+    True`` spawn, and that frozen int is what gets signalled. Deliberately NOT
+    ``os.killpg(os.getpgid(p.pid), ...)``, the obvious spelling: once the child
+    is reaped the kernel may reuse its pid, and ``os.getpgid`` on a reused pid
+    returns the NEW owner's group — task 845, where that resolved to the user's
+    ``systemd --user`` session. POSIX guarantees the child is the leader of its
+    own group with ``pgid == pid`` at the instant of a new-session spawn, so
+    capturing it there closes the TOCTOU completely.
+    :func:`_unsafe_pgid_reason` is the residual defence, and a refusal falls
+    back to ``p.kill()`` — the direct child only, i.e. exactly today's
+    behaviour — rather than signalling a group we are unsure of.
+
+    SECOND — the post-kill drain is BOUNDED. This is the non-obvious half, and
+    it is what keeps the DEGRADED paths above safe. A surviving grandchild
+    inherits the stdout/stderr pipe WRITE ENDS, so a drain run against it never
+    sees EOF; unbounded, it blocks forever and the caller's ``timeout=`` stops
+    being a wall-clock bound at all. Measured against real processes: a direct
+    ``communicate()`` after a plain ``kill()`` of such a child does hang.
+
+    Whenever the group kill lands this is moot — the whole group dies, every
+    write end closes, and the drain returns in milliseconds. It becomes real on
+    exactly the two fallbacks: an ``_unsafe_pgid_reason`` refusal and a failed
+    ``killpg``, both of which degrade to ``p.kill()`` and so leave a
+    pipe-holding grandchild alive. Capping at ``_POST_KILL_DRAIN_SECS`` makes
+    the worst case ``timeout + drain`` on every path.
+
+    (For the record, since it is the obvious next question: stock
+    ``subprocess.run`` does NOT hang here. Its POSIX timeout branch calls
+    ``process.wait()``, not a second ``communicate()`` — verified by inspection
+    of CPython. Its defect is solely the un-reached grandchild, not a hang.)
+
+    The re-raised ``TimeoutExpired`` carries whatever was drained, because the
+    existing callers assert on the script's output from the TIMEOUT path (via
+    their ``_decode`` / ``_boundary_decode`` helpers, which normalise both
+    ``bytes`` and ``str`` and so keep working unchanged).
+    """
+    p = subprocess.Popen(
+        cmd,
+        env=env,
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=text,
+        start_new_session=True,
+    )
+    # IMMEDIATELY, and never re-derived: this is the whole task-845 defence.
+    pgid = p.pid
+    try:
+        out, err = p.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_process_group(p, pgid)
+        try:
+            out, err = p.communicate(timeout=_POST_KILL_DRAIN_SECS)
+        except subprocess.TimeoutExpired:
+            # Something still holds the pipe open despite the group kill.
+            # Give up on the output rather than on the timeout: the caller
+            # asked for a bound and gets one.
+            p.kill()
+            _release_abandoned_child(p)
+            out, err = ('', '') if text else (b'', b'')
+        raise subprocess.TimeoutExpired(cmd, timeout, output=out, stderr=err) from None
+    return subprocess.CompletedProcess(cmd, p.returncode, out, err)
+
+
+def _release_abandoned_child(p: subprocess.Popen) -> None:
+    """Reap *p* and close its pipes after a drain we gave up on.
+
+    Reachable only from :func:`run_in_new_session`'s last-resort branch, where
+    the bounded second ``communicate()`` itself timed out. Nothing has waited on
+    the child there and nothing has closed the two pipe fds ``Popen`` opened for
+    it, so without this they survive until ``Popen.__del__`` runs — a
+    ``ResourceWarning`` plus two leaked descriptors PER OCCURRENCE, inside the
+    one module whose whole subject is spawn hygiene. And this is precisely the
+    branch taken when something is STILL holding those pipes, i.e. the one most
+    likely to repeat within a single run.
+
+    Every step is best-effort and swallowed: the caller is already on its way to
+    raising ``TimeoutExpired``, and replacing a legible timeout with a cleanup
+    error would hide the thing the caller actually needs to see.
+    """
+    with contextlib.suppress(Exception):
+        p.wait(timeout=_ABANDONED_CHILD_REAP_SECS)
+    for stream in (p.stdout, p.stderr):
+        if stream is not None:
+            with contextlib.suppress(OSError, ValueError):
+                stream.close()
+
+
+def _kill_process_group(p: subprocess.Popen, pgid: int) -> None:
+    """SIGKILL the captured *pgid*, degrading to the direct child if unsure.
+
+    Every failure mode degrades to ``p.kill()`` rather than propagating: the
+    caller is already on its way to raising ``TimeoutExpired``, and masking
+    that with a signalling error would replace a legible timeout with a
+    confusing one. ``ProcessLookupError`` is the ordinary case of a child that
+    exited between the timeout and the signal.
+    """
+    reason = _unsafe_pgid_reason(pgid)
+    if reason is not None:
+        p.kill()
+        return
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        p.kill()
+
+
+# ---------------------------------------------------------------------------
+# Shared probes for the containment tests (task 3798)
+# ---------------------------------------------------------------------------
+#
+# Three test modules prove "a timeout reaches the grandchild too", one per
+# spawner plus this module's own. They need the same three things: a script that
+# forks a survivor, a way to learn that survivor's pid, and a way to wait for it
+# to die. Those live HERE for exactly the reason `run_in_new_session` does —
+# `tests/scripts/` and `scripts/tests/` cannot import each other's test modules,
+# so a copy in each is a copy that can only be kept in step by hand. Centralising
+# the spawn while leaving its probes triplicated would just move the "which of
+# the copies did I fix" hazard (task 3336;
+# test_boundary_fake_systemctl_matches_unit_suite_verbatim) one function over.
+#
+# The PIPE-HOLDING variant is deliberately NOT here: it is a probe for this
+# module's own bounded drain and has exactly one caller.
+
+# PIPE-CLOSING: the background child redirects its stdio away from the pipes it
+# inherited, so nothing holds their write ends open. That is load-bearing for
+# the two tests that drive the REAL spawners — it makes their assertions depend
+# only on "is the grandchild alive", never on what a spawner does after its
+# kill. Requires LEAK_PIDFILE in the child env.
+PIPE_CLOSING_LEAKER_SRC = '''\
+sleep 300 >/dev/null 2>&1 &
+echo $! > "$LEAK_PIDFILE"
+echo MAIN_UP
+sleep 300
+'''
+
+
+def read_leaked_pid(pidfile: Path, *, timeout: float = 10.0) -> int:
+    """Poll until the leaker has recorded its grandchild's pid, then return it.
+
+    Polls rather than reading once: the file is created by a ``>`` redirection
+    and filled by a separate write, so a single read can catch it empty.
+
+    Fails the calling test if the pid never appears, and says so in those terms
+    — a harness that never spawned proves nothing either way about containment,
+    and must not be mistaken for a leak that was cleaned up.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            text = Path(pidfile).read_text().strip()
+        except OSError:
+            text = ''
+        if text.isdigit():
+            return int(text)
+        if time.monotonic() >= deadline:
+            pytest.fail(
+                f'the leaker never recorded a pid in {pidfile} within {timeout}s '
+                f'(last read: {text!r}); the harness is broken, which says nothing '
+                'either way about process-group containment.',
+                pytrace=False,
+            )
+        time.sleep(0.05)
+
+
+def pid_is_gone(pid: int) -> bool:
+    """Whether *pid* no longer exists. Signal 0 is the standard liveness probe."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        # Alive and owned by someone else — a pid the kernel already recycled.
+        return False
+    return False
+
+
+def wait_pid_gone(pid: int, *, timeout: float = 3.0) -> bool:
+    """Poll for *pid* to disappear, allowing for SIGKILL delivery and reaping."""
+    deadline = time.monotonic() + timeout
+    while True:
+        if pid_is_gone(pid):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+
+
+# ---------------------------------------------------------------------------
+# The in-suite leak guard (task 3798)
+# ---------------------------------------------------------------------------
+
+# Stamped into os.environ for the session, so EVERY spawner that builds its
+# child env from `dict(os.environ)` — both of today's, plus any future one —
+# tags its descendants with no per-spawner change. Same mechanism and same
+# "the defect class is a spawner that forgets" reasoning as 3797's clock
+# redirect.
+LEAK_TOKEN_ENV = 'DF_PYTEST_LEAK_TOKEN'
+
+# The one script whose survivors are worth failing a run over.
+DRAIN_SCRIPT_CMDLINE_MARKER = 'restart-all-orchestrators.sh'
+
+
+def leaked_drain_processes(
+    token: str | None, *, proc_root: str | os.PathLike[str] = Path('/proc'),
+) -> list[tuple[int, str]]:
+    """Every live drain-script process belonging to THIS pytest session.
+
+    Returns ``(pid, cmdline)`` for each process whose ``/proc/<pid>/cmdline``
+    contains :data:`DRAIN_SCRIPT_CMDLINE_MARKER` AND whose
+    ``/proc/<pid>/environ`` carries ``LEAK_TOKEN_ENV=<token>``.
+
+    WHY BOTH, RATHER THAN THE OBVIOUS ``pgrep -f restart-all-orchestrators.sh``:
+
+    * The token is what makes the guard ATTRIBUTABLE. ``merge_verify_breadth:
+      "full"`` means many worktrees run this same suite concurrently, and the
+      main checkout is machine-operated (CLAUDE.md) — the deployed watchdog and
+      the merge coordinator both run ``--drain`` for real. Asserted literally,
+      the bare pgrep is a false-positive generator that fails runs for other
+      people's processes and for genuine production activity. Requiring this
+      session's own token means a match provably belongs to US.
+    * The marker is what keeps the guard QUIET. These two test directories hold
+      ~90 files that spawn subprocesses; scanning for "any surviving descendant"
+      would flake constantly on all of them.
+
+    Fails CLOSED on a falsy token — an empty token must never be read as "match
+    everything", which would turn the guard into a suite-wide false-positive
+    generator the first time the fixture failed to stamp it.
+
+    Every per-pid read is individually guarded: scanning /proc races process
+    exit by construction, and a pid that vanishes mid-scan is the ordinary case,
+    not an error. Mirrors the same invariant in ``shared.proc_group``, the
+    canonical async sibling of this module's process handling.
+    """
+    if not token:
+        return []
+
+    # The exact NUL-delimited assignment, so a token that merely PREFIXES
+    # another session's cannot cross-match. /proc separates entries with NUL
+    # and the first entry has no leading one, hence the two accepted forms.
+    assignment = LEAK_TOKEN_ENV.encode() + b'=' + token.encode() + b'\x00'
+    marker = DRAIN_SCRIPT_CMDLINE_MARKER.encode()
+
+    leaks: list[tuple[int, str]] = []
+    try:
+        entries = sorted(Path(proc_root).iterdir())
+    except OSError:
+        return []
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            cmdline = (entry / 'cmdline').read_bytes()
+            if marker not in cmdline:
+                continue
+            environ = (entry / 'environ').read_bytes()
+        except OSError:
+            continue
+        if not (environ.startswith(assignment) or b'\x00' + assignment in environ):
+            continue
+        # errors='replace' only for the human-readable rendering: environ and
+        # cmdline are raw bytes and need not be valid UTF-8.
+        leaks.append((
+            int(entry.name),
+            cmdline.replace(b'\x00', b' ').decode('utf-8', errors='replace').strip(),
+        ))
+    return leaks
+
+
+def _still_the_drain(
+    pid: int, *, proc_root: str | os.PathLike[str] = Path('/proc'),
+) -> bool:
+    """Whether *pid* is STILL a live drain-script process, re-read right now.
+
+    Called immediately before signalling, never inferred from an earlier sweep.
+    A pid captured during a ``/proc`` scan is stale the instant that scan ends:
+    the process can exit and the kernel can hand its number to something
+    unrelated before the signal lands. Signalling a recycled pid is task 845's
+    failure, recorded in ``shared/src/shared/proc_group.py`` — reached there via
+    ``os.getpgid`` rather than a scan, but the staleness is identical and what
+    it took out was the user's entire ``systemd --user`` login session.
+
+    Checks the MARKER only, deliberately, so both callers can share it: the
+    fixture already established the token during its sweep, while the end-to-end
+    test's reaper is looking at a NESTED session's process and cannot know that
+    session's token at all. The marker is in any case the property that makes a
+    process worth killing — a recycled pid that is somehow also running the
+    drain script is a leak on its own terms.
+    """
+    try:
+        cmdline = (Path(proc_root) / str(pid) / 'cmdline').read_bytes()
+    except OSError:
+        return False
+    return DRAIN_SCRIPT_CMDLINE_MARKER.encode() in cmdline
+
+
+def leaked_drain_process_reason(leaks: list[tuple[int, str]]) -> str | None:
+    """Explain which drain processes this run leaked, or ``None`` if it did not.
+
+    Names every pid and its cmdline, the mechanism, and the remedy SYMBOL —
+    mirroring :func:`deploy_clock_violation_reason`'s convention that a guard's
+    message has to be actionable without a second investigation.
+    """
+    if not leaks:
+        return None
+    listed = '\n'.join(f'  pid {pid}: {cmdline}' for pid, cmdline in leaks)
+    return (
+        f'this test run LEAKED {len(leaks)} drain-script process(es) (task 3798):\n'
+        f'{listed}\n'
+        'Each carries this session\'s own DF_PYTEST_LEAK_TOKEN, so they are '
+        'provably ours — not a concurrent worktree\'s run and not a genuine '
+        'machine-operated --drain.\n'
+        'Mechanism: a spawn whose timeout kill did not reach the process group. '
+        "subprocess.run's timeout path kill()s the DIRECT CHILD only, so a poll "
+        'loop the script forked survives, is reparented to systemd --user, and '
+        'spends its grace unattended — then issues a REAL systemctl restart if '
+        'it outlives the tmpdir holding the fake one.\n'
+        'Fix: spawn via df_pytest_isolation.run_in_new_session, which starts a '
+        'new session and SIGKILLs the whole group on timeout.\n'
+        'These processes have been reaped, so the box is clean; this failure is '
+        'the signal, not the damage.'
+    )
+
+
+@pytest.fixture(scope='session', autouse=True)
+def _df_no_leaked_drain_processes():
+    """Reap, then fail, if this run leaked a drain-script process.
+
+    Stamps a fresh per-session token into ``os.environ`` and, at teardown, scans
+    ``/proc`` for live processes carrying BOTH that token and the drain script's
+    name.  The token lives in the ENVIRONMENT rather than being threaded through
+    any spawner because every spawner here builds its child env from
+    ``dict(os.environ)``: descendants are tagged for free, including the ones
+    nobody has written yet.  Same "the defect class is a spawner that forgets"
+    reasoning as 3797's clock redirect — a per-call-site tag would be opted out
+    of by exactly the spawner this guard exists to catch.
+
+    SESSION scope for the same two reasons ``_df_git_ceiling_at_basetemp`` and
+    ``_df_deploy_clocks_unwritten`` document — cost (a function-scoped autouse
+    fixture runs once per test across ~90 spawning files, times every xdist
+    worker, and each run here is a full /proc sweep) and coverage (a leak from a
+    module- or session-scoped fixture must be caught too, and that is where
+    expensive subprocess setup tends to live).
+
+    ONE DELIBERATE DIVERGENCE from :func:`_df_deploy_clocks_unwritten`, which is
+    DETECT-ONLY: this guard REAPS what it reports.  That guard must not touch
+    what it finds, because the main checkout is machine-operated and rolling a
+    clock back could silently undo a GENUINE fleet-deploy stamp.  Here the token
+    removes that ambiguity entirely — a match provably belongs to THIS session,
+    so it can be neither a concurrent worktree's run nor a real
+    machine-operated ``--drain``.  And leaving a confirmed orphan alive is not
+    neutral: it goes on to spend its grace and then issue a REAL ``systemctl
+    restart``, which is the second-order hazard this task exists to close.  Reap
+    first, then fail — the message is the signal, the kill is the containment.
+
+    A failure raised in teardown surfaces as a run-level ERROR with a non-zero
+    exit code even when every test passed.  That is the intended loudness: the
+    damage is to the box, not to any one test's result.
+
+    KNOWN LIMIT, and it is a real one: this is a BACKSTOP, not the defence.  The
+    sweep happens exactly once, at session teardown, so it can only see leaks
+    still ALIVE at that moment.  :func:`wait_proof_grace_secs` — landed in the
+    same task — caps a leaked poller's life at
+    :data:`LEAK_SELF_TERMINATION_CEILING_SECS`, so on a multi-minute suite a
+    process leaked early self-terminates long before teardown and this guard
+    reports all-clear.  The effective detection window is roughly the last
+    ``LEAK_SELF_TERMINATION_CEILING_SECS`` of a run.  That interaction is
+    deliberate and the right trade — a leak that dies in 90s is not the
+    incident; the 27.8h survivor that outlived pytest's tmpdir GC and restarted
+    REAL units was — but it means a green run is NOT proof that nothing leaked.
+    :func:`run_in_new_session` is the primary defence, and the two behavioural
+    tests that drive the real spawners are what actually pin it.  Making
+    detection continuous (sampling from ``pytest_runtest_teardown``) would close
+    the window at the cost of a /proc sweep per test across ~90 spawning files
+    times every xdist worker; it has not been measured and is not in scope here.
+    """
+    token = uuid.uuid4().hex
+    prior = os.environ.get(LEAK_TOKEN_ENV)
+    os.environ[LEAK_TOKEN_ENV] = token
+    try:
+        yield
+    finally:
+        # Restore BEFORE scanning: nested sessions (this module's own end-to-end
+        # test runs one) must not inherit a token that has stopped being current.
+        if prior is None:
+            os.environ.pop(LEAK_TOKEN_ENV, None)
+        else:
+            os.environ[LEAK_TOKEN_ENV] = prior
+        leaks = leaked_drain_processes(token)
+        reason = leaked_drain_process_reason(leaks)
+        if reason is not None:
+            for pid, _cmdline in leaks:
+                # Re-read /proc before signalling: the sweep above is already
+                # in the past, and a pid that exited since then may have been
+                # recycled onto something unrelated.
+                if not _still_the_drain(pid):
+                    continue
+                # The pid, never os.killpg(pid, ...): a leaked process is by
+                # definition one whose spawner did NOT put it in a session of
+                # its own, so its pid is not necessarily a pgid and signalling
+                # that number as a group could reach an unrelated one — task
+                # 845's failure, recorded in shared/src/shared/proc_group.py.
+                # Killing the drain script itself stops the poll loop, which is
+                # the whole hazard; its `sleep`/`systemctl` children carry no
+                # grace of their own.
+                with contextlib.suppress(OSError):
+                    os.kill(pid, signal.SIGKILL)
+            pytest.fail(reason, pytrace=False)
+
+
+# ---------------------------------------------------------------------------
+# Synthetic fixture unit names (task 3799)
+# ---------------------------------------------------------------------------
+
+# The one prefix that makes a unit name a FIXTURE name.
+#
+# WHY A POSITIVE ALLOWLIST-BY-SHAPE, and not a denylist of the real installed
+# unit names. A denylist needs its own drift pin against the installed fleet (or
+# against the watchdog's WATCHED table) and goes stale SILENTLY the day an
+# eighth project's orchestrator is added — at which point the guard reports
+# all-clear on the newest and least-reviewed real unit. Nothing a future real
+# project can be named will start with `orchestrator-fake`, so the allowlist
+# needs no drift pin and cannot decay. It also keeps the rule readable at the
+# call site: `assert_synthetic_units(units, where=...)` says what it wants,
+# rather than what it happens to know about today.
+#
+# WHY THE NAMES STILL MATCH THE REAL `orchestrator-*.service` GLOB that
+# `scripts/restart-all-orchestrators.sh` passes to `systemctl list-units`. A
+# fixture name OUTSIDE that glob would make the harness less faithful, not
+# safer: the fake would be answering a question the real binary never gets
+# asked, and the very enumeration the tests exist to exercise would stop being
+# modelled. Containment comes from the name not existing as an installed unit,
+# not from it being unenumerable.
+#
+# Deliberately keeps the bare `orchestrator-fake.service` literal in
+# tests/scripts/test_restart_all_orchestrators.py's UNIT_NAME legal — it
+# predates this task and is the precedent the prefix was chosen around.
+SYNTHETIC_UNIT_PREFIX = 'orchestrator-fake'
+
+
+def synthetic_unit(stem: str) -> str:
+    """Build the fixture unit name for *stem* (``'reify'`` → the fake reify unit).
+
+    THE builder for every fake-``systemctl`` fixture in both test roots, so one
+    vocabulary governs them instead of three ad-hoc conventions. Its output is
+    always accepted by :func:`non_synthetic_unit_names` — a round-trip pinned in
+    ``tests/scripts/test_fleet_dir_isolation.py``, because two symbols encoding
+    one convention is exactly how a convention rots.
+
+    *stem* names what the fixture is STANDING IN FOR (``synthetic_unit('reify')``
+    for a test about the reify orchestrator), so the test still reads as being
+    about that unit while the name it puts on ``PATH`` is inert.
+    """
+    return f'{SYNTHETIC_UNIT_PREFIX}-{stem}.service'
+
+
+def non_synthetic_unit_names(units: Iterable[str]) -> list[str]:
+    """Every entry of *units* that is NOT a synthetic fixture unit name.
+
+    Order and duplicates are PRESERVED as given: the failure message names
+    offenders in the caller's own order, so each one maps straight back to its
+    argument position — which a deduping or sorting helper would break for the
+    multi-unit fixtures (``running_units=[...]``) this exists to check.
+
+    Empty in, empty out; a fixture with no units is not an error.
+    """
+    prefix = SYNTHETIC_UNIT_PREFIX
+    return [unit for unit in units if not str(unit).startswith(prefix)]
+
+
+def assert_synthetic_units(units: Iterable[str], *, where: str) -> None:
+    """Fail loudly unless every entry of *units* is a synthetic fixture name.
+
+    Called at each PATH-shimming construction point — the seam where a unit name
+    is handed to a fake ``systemctl`` that a REAL script subprocess will resolve
+    — so it covers fixtures nobody has written yet and is structurally incapable
+    of touching a contract pin. (``tests/scripts/test_orchestrator_watchdog.py``
+    contains ~40 REAL unit-name literals that assert against real production
+    configuration; a guard that grepped test sources would false-positive on
+    every one of them and could only be silenced by an exclusion list, which is
+    itself the thing that rots.)
+
+    *where* is the caller's own ``<file>::<factory>`` label. It is required and
+    keyword-only because the message is read far from here: a bare "a real unit
+    name was used" leaves the reader grepping five files for the seam that fired.
+
+    ``pytest.fail`` (not ``assert``) raises ``Failed``, a BaseException, so a
+    fixture's own ``except Exception`` cannot swallow it; ``pytrace=False``
+    because the traceback into this module tells the reader nothing the message
+    does not.
+    """
+    offenders = non_synthetic_unit_names(units)
+    if not offenders:
+        return
+    listed = ', '.join(repr(offender) for offender in offenders)
+    pytest.fail(
+        f'{where} was handed REAL orchestrator unit name(s): {listed}.\n'
+        'A fake-systemctl fixture shadows `systemctl` only for as long as its '
+        'tmpdir sits on PATH. A poll loop that outlives the test — task 3798 '
+        'measured orphans surviving 27.8 HOURS, well past pytest tmpdir GC — '
+        'resolves /usr/bin/systemctl instead and issues a REAL restart of '
+        'whatever unit name this fixture handed it.\n'
+        f'Fix: build the name with df_pytest_isolation.synthetic_unit(...), e.g. '
+        f'synthetic_unit(\'reify\') -> {synthetic_unit("reify")!r}. Every name it '
+        f'produces starts with {SYNTHETIC_UNIT_PREFIX!r}, matches the real '
+        "`orchestrator-*.service` glob the script enumerates with, and names no "
+        'installed unit — so the worst case above becomes a no-op.\n'
+        'If this name is a CONTRACT PIN rather than a fixture (asserting against '
+        'real production configuration, as the watchdog WATCHED-table tests do), '
+        'it does not belong at a PATH-shimming seam: assert it in-process against '
+        'a monkeypatched subprocess.run instead.',
+        pytrace=False,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Live-fleet isolation (task 3799)
+# ---------------------------------------------------------------------------
+
+_FLEET_DIR_ENV = 'ORCH_FLEET_DIR'
+
+# The machine-global fleet-heartbeat directory.
+#
+# A MACHINE-GLOBAL, CROSS-PROJECT RENDEZVOUS DIRECTORY, not a dark-factory
+# artifact. Measured 2026-08-07 and re-measured 2026-08-09: it holds live
+# heartbeats for SEVEN different projects' orchestrators. It lives under
+# dark-factory/data/ only because dark-factory is the fleet HOST. That is why
+# the bash script's default is absolute while the deploy clock six lines below
+# it is $REPO_DIR-relative — an asymmetry that looks like an oversight and is
+# not, so scripts/restart-all-orchestrators.sh carries the rationale inline and
+# tests/scripts/test_orchestrator_watchdog.py::
+# test_fleet_dir_default_matches_across_tiers pins all four mirrors together.
+#
+# A LITERAL, not an import of drain_check.DEFAULT_FLEET_DIR or
+# orchestrator.fleet_heartbeat.DEFAULT_FLEET_DIR: see the module docstring's
+# import constraint (STDLIB + PYTEST ONLY — escalation's venv stubs `shared`),
+# exactly as PROTECTED_DEPLOY_CLOCK_RELPATHS above is a literal for the same
+# reason. The cross-tier pin is what keeps the four copies honest.
+LIVE_FLEET_DIR = Path('/home/leo/src/dark-factory/data/fleet')
+
+# What a heartbeat file is CALLED, both mid-write and after.
+# `orchestrator.fleet_heartbeat.write_heartbeat` writes `<unit>.json.tmp` and
+# then `os.replace`s it onto `<unit>.json`, so a writer killed between the two
+# leaves ONLY the residue. Both spellings are evidence of the same leak; a
+# tuple (not a bare `.json`) so `str.endswith` takes them in one call and the
+# two rules are visibly one decision.
+HEARTBEAT_SUFFIXES = ('.json', '.json.tmp')
+
+
+def fleet_dir_redirect_violation_reason(
+    value: str | None,
+    basetemp: str | os.PathLike[str],
+) -> str | None:
+    """Explain why *value* is not an acceptable ``ORCH_FLEET_DIR`` redirect.
+
+    ``None`` when the redirect is sound: a non-empty path, inside this run's
+    *basetemp*, and neither the live fleet dir nor anything under it.
+
+    THE RULE LIVES HERE, not in the tests, because BOTH test roots must prove
+    their own wiring and each therefore has its own copy of the test function.
+    Two copies of a ~20-line assertion body drift — these two already had, at
+    birth, in the text of the basetemp message.  Each root keeps the one-line
+    test (which is what proves ITS conftest binding is real) and shares the
+    comparison and the messages, exactly as ``scripts/tests/`` already reuses
+    :func:`deploy_clock_snapshot` rather than re-implementing it.
+
+    Ordered most-specific-first: a value pointing AT the live dir is reported as
+    that, not as the generic "outside basetemp" it also happens to be.
+    """
+    if not value:
+        return (
+            f'{_FLEET_DIR_ENV} is {value!r}. Unset AND empty both fall through '
+            "the script's ${VAR:-…} default to the machine-global "
+            f'{LIVE_FLEET_DIR}, so a test-spawned drain gate reads other '
+            "projects' LIVE production heartbeats. "
+            'Fix: df_pytest_isolation._df_fleet_dir_redirect.'
+        )
+
+    resolved = Path(value).resolve()
+    live = LIVE_FLEET_DIR.resolve()
+    if resolved == live or resolved.is_relative_to(live):
+        return (
+            f'{_FLEET_DIR_ENV}={resolved} is the live fleet dir {live} (or '
+            'inside it). That directory is a MACHINE-GLOBAL, CROSS-PROJECT '
+            "rendezvous dir holding seven projects' live orchestrator "
+            'heartbeats. Fix: df_pytest_isolation._df_fleet_dir_redirect.'
+        )
+
+    basetemp = Path(basetemp).resolve()
+    if not resolved.is_relative_to(basetemp):
+        return (
+            f'{_FLEET_DIR_ENV}={resolved} is outside this run\'s basetemp '
+            f'{basetemp}. The redirect must land in pytest tmp space, or the '
+            'suite is writing heartbeats somewhere that outlives it. '
+            'Fix: df_pytest_isolation._df_fleet_dir_redirect.'
+        )
+
+    return None
+
+
+@pytest.fixture(scope='session', autouse=True)
+def _df_fleet_dir_redirect(tmp_path_factory: pytest.TempPathFactory):
+    """Point ``ORCH_FLEET_DIR`` at a tmp dir for this whole session (task 3799).
+
+    ``scripts/restart-all-orchestrators.sh``'s ``FLEET_DIR`` default and
+    ``drain_check.DEFAULT_FLEET_DIR``
+    both resolve their fleet dir from ``${ORCH_FLEET_DIR:-…}``, defaulting to
+    :data:`LIVE_FLEET_DIR`.  With the var unset — its state in this environment
+    before this fixture — a test-spawned drain gate READS five other projects'
+    LIVE production heartbeats and decides the real fleet's drain state from
+    them.  Nothing about that is visible in a green run.
+
+    A conftest fixture rather than an extra assignment in each spawner, for the
+    reason 3797's clock redirect spells out: the defect class is "a spawner that
+    forgets the env var", so fixing today's spawners leaves the hole open for the
+    next one.  Every spawner — present and future — inherits this for free
+    because each builds its child env from ``dict(os.environ)``.  A per-test or
+    per-call override still WINS, since every spawner applies its own ``env=``
+    last (``scripts/tests/test_restart_all_orchestrators.py``'s ``_run_script``,
+    ``tests/scripts/test_orchestrator_watchdog.py``'s ``_boundary_run_drain_script``).
+    Do not weaken this fixture to make room for one.
+
+    The directory is CREATED and left EMPTY.  That is the correct hermetic
+    default, not a gap: ``drain_check`` classifies a missing heartbeat as
+    ABSENT, which is the script's documented fail-toward-convergence branch, so
+    a spawner that forgets to write its own heartbeats gets a defined, LOCAL
+    answer instead of a reading taken from production.
+
+    SESSION scope for the same two reasons its three sibling defences document —
+    cost (an autouse function-scoped fixture runs once per test across ~90
+    spawning files, times every xdist worker) and coverage (module-/session-scoped
+    fixtures that spawn the script must be covered too, and that is where
+    expensive subprocess setup tends to live).
+
+    Restores the previous value EXACTLY on teardown, POPPING the key when it was
+    absent rather than setting an empty string — an empty ``ORCH_FLEET_DIR`` is
+    not "unset" to a ``${VAR:-…}`` default, so leaking one would fall straight
+    through to the production path, i.e. be its own bug.
+    """
+    saved = os.environ.get(_FLEET_DIR_ENV)
+    fleet_dir = tmp_path_factory.mktemp('fleet-dir')
+    os.environ[_FLEET_DIR_ENV] = str(fleet_dir)
+    try:
+        yield fleet_dir
+    finally:
+        if saved is None:
+            os.environ.pop(_FLEET_DIR_ENV, None)
+        else:
+            os.environ[_FLEET_DIR_ENV] = saved
+
+
+def synthetic_heartbeats_in(fleet_dir: str | os.PathLike[str]) -> list[str]:
+    """Names of the SYNTHETIC-unit heartbeat files sitting in *fleet_dir*.
+
+    Only ``<SYNTHETIC_UNIT_PREFIX>*.json`` — a real unit's heartbeat is IGNORED.
+    That is the property that makes the guard immune to genuine production
+    churn: the live fleet dir is rewritten by the running orchestrators roughly
+    every ~30s, so anything keyed on "did it change" fires constantly, while
+    nothing in production can produce an ``orchestrator-fake*`` name.
+
+    ``.json.tmp`` COUNTS TOO.  ``orchestrator.fleet_heartbeat.write_heartbeat``
+    is a write-then-``os.replace`` atomic writer whose intermediate file is
+    ``<unit>.json.tmp``, so a test-spawned writer killed between the two — the
+    orphan/timeout scenario task 3798 established as this family's hazard model
+    — leaves the residue and never the final name.  That residue is just as
+    attributable and just as much operator debris; reporting all-clear on it
+    would blind the guard to precisely the interrupted-writer case.
+
+    NEVER RAISES.  A missing directory, an unreadable one, a path that is not a
+    directory at all — every one of them is an empty result.  This runs in
+    SESSION TEARDOWN, where an exception would mask whatever the run was
+    actually reporting.
+
+    SORTED, so the failure message is stable across filesystems (readdir order
+    is not guaranteed) and diffable between runs.
+    """
+    try:
+        entries = list(Path(fleet_dir).iterdir())
+    except OSError:
+        return []
+    return sorted(
+        entry.name
+        for entry in entries
+        if entry.name.startswith(SYNTHETIC_UNIT_PREFIX)
+        and entry.name.endswith(HEARTBEAT_SUFFIXES)
+    )
+
+
+def leaked_fleet_heartbeat_reason(names: list[str]) -> str | None:
+    """Explain which synthetic heartbeats leaked into the live fleet dir.
+
+    ``None`` when *names* is empty.  Otherwise names every offending file, the
+    absolute directory, the mechanism and the remedy SYMBOL — the actionable
+    message convention :func:`deploy_clock_violation_reason` and
+    :func:`leaked_drain_process_reason` established, so triage is not a second
+    investigation.
+    """
+    if not names:
+        return None
+    listed = '\n'.join(f'  {name}' for name in names)
+    return (
+        f'this test run LEAKED {len(names)} synthetic heartbeat(s) into the LIVE '
+        f'fleet directory {LIVE_FLEET_DIR} (task 3799):\n'
+        f'{listed}\n'
+        f'Those names start with {SYNTHETIC_UNIT_PREFIX!r}, so they are provably '
+        'test fixtures — no production orchestrator can produce one.\n'
+        'Mechanism: a spawner let ORCH_FLEET_DIR fall through to the '
+        "machine-global default in restart-all-orchestrators.sh's FLEET_DIR / "
+        'drain_check.DEFAULT_FLEET_DIR, so its heartbeat write (or the drain '
+        'gate it drove) landed in the CROSS-PROJECT rendezvous directory that '
+        'seven projects\' '
+        'orchestrators use to decide the real fleet\'s drain state.\n'
+        'Fix: let df_pytest_isolation._df_fleet_dir_redirect cover the spawner '
+        '(bind it in that rootdir\'s conftest), or set ORCH_FLEET_DIR explicitly '
+        'in the call\'s own env=, which is applied after the os.environ copy.\n'
+        'DETECT-ONLY: these files have NOT been deleted. Remove them by hand '
+        'once you have attributed them — and check the other direction too, '
+        'since a leaked heartbeat can also make a REAL drain gate read a '
+        'fixture\'s idea of merge state.'
+    )
+
+
+@pytest.fixture(scope='session', autouse=True)
+def _df_no_synthetic_heartbeats_in_live_fleet():
+    """Fail the run if a synthetic heartbeat appeared in the LIVE fleet dir.
+
+    WHY THIS SHAPE AND NOT "the real data/fleet is untouched (content+mtime)",
+    which is what the task literally proposed.  MEASURED 2026-08-09, two
+    independent readings ~5 minutes apart (mtimes 19:43:46-19:44:05, then
+    19:48:16-19:48:23): SIX of the seven live unit heartbeat files moved between
+    them, because the running orchestrators rewrite their heartbeat roughly every
+    30s (``orchestrator.harness``'s ``write_heartbeat`` call).  An untouched-content
+    guard would therefore fail on essentially every run in every checkout, and
+    its failures would be indistinguishable from a real leak — a false-positive
+    generator, strictly worse than no guard, and the same "green and useless"
+    failure mode this defence family exists to avoid.  Keyed on the SYNTHETIC
+    name it is deterministic instead, cannot fire on genuine production churn,
+    and is strictly more specific about the defect.  It is also only POSSIBLE
+    because task 3799's rename made fixture unit names self-identifying: that is
+    the substantive reason those two halves are one task.
+
+    Snapshots before the session and re-reads at teardown, failing only on a NEW
+    name — a synthetic file that was ALREADY there is someone else's leak (or an
+    earlier run's, not yet cleaned up), and reporting it here would send this
+    run's reader after evidence that predates them.
+
+    DETECT-ONLY — it names the file and does NOT delete it, diverging from its
+    sibling :func:`_df_no_leaked_drain_processes`, which reaps what it reports.
+    That guard can safely reap because its per-session ``DF_PYTEST_LEAK_TOKEN``
+    proves a match belongs to THIS session.  A FILENAME carries no such token.
+    ``data/fleet/`` is machine-global and cross-project, and
+    ``merge_verify_breadth: "full"`` means several worktrees run this suite
+    concurrently, so a deleting guard could remove a CONCURRENT session's
+    evidence — destroying exactly the artifact an operator needs to attribute the
+    leak.  Same stance, and the same reasoning about acting on machine-operated
+    state, as :func:`_df_deploy_clocks_unwritten`.
+
+    Pure-helpers-plus-thin-fixture split and SESSION scope for the same
+    cost/coverage reasons as its three siblings.  A failure raised in teardown
+    surfaces as a run-level ERROR with a non-zero exit even when every test
+    passed.  That is the intended loudness: the damage is to machine-global
+    production state, not to any one test's result.
+    """
+    before = set(synthetic_heartbeats_in(LIVE_FLEET_DIR))
+    try:
+        yield
+    finally:
+        new = [
+            name
+            for name in synthetic_heartbeats_in(LIVE_FLEET_DIR)
+            if name not in before
+        ]
+        reason = leaked_fleet_heartbeat_reason(new)
+        if reason is not None:
+            pytest.fail(reason, pytrace=False)

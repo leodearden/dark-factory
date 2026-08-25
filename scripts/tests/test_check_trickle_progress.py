@@ -19,7 +19,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -76,7 +76,7 @@ def _seed(tmp_path, monkeypatch, *, outcomes, project_id="dark_factory",
     'barren-cut'). The LAST entry's recorded_at is *recorded_at* (default:
     now), so freshness is exercised against the real writer."""
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
-    stamp = recorded_at or datetime.now(timezone.utc)
+    stamp = recorded_at or datetime.now(UTC)
 
     doc = None
     for i, outcome in enumerate(outcomes):
@@ -244,7 +244,7 @@ def test_corrupt_state_file_is_its_own_verdict(tmp_path, monkeypatch):
 def test_stale_recorder_exits_nonzero(tmp_path, monkeypatch):
     """The pipeline stopped writing state at all — distinct from a barren
     streak, and the recorded outcome alone would look healthy."""
-    old = datetime.now(timezone.utc) - timedelta(hours=100)
+    old = datetime.now(UTC) - timedelta(hours=100)
     _seed(tmp_path, monkeypatch, outcomes=["productive"], recorded_at=old)
 
     result, git_marker = _run_probe(tmp_path, "dark_factory", 3, 72)
@@ -258,7 +258,7 @@ def test_stale_recorder_exits_nonzero(tmp_path, monkeypatch):
 
 
 def test_just_inside_the_freshness_window_exits_zero(tmp_path, monkeypatch):
-    recent = datetime.now(timezone.utc) - timedelta(hours=71)
+    recent = datetime.now(UTC) - timedelta(hours=71)
     _seed(tmp_path, monkeypatch, outcomes=["productive"], recorded_at=recent)
 
     result, git_marker = _run_probe(tmp_path, "dark_factory", 3, 72)
@@ -271,7 +271,7 @@ def test_just_inside_the_freshness_window_exits_zero(tmp_path, monkeypatch):
 
 def test_max_age_hours_defaults_to_seventy_two(tmp_path, monkeypatch):
     """Third arg is optional and defaults to kappa's 72h window."""
-    old = datetime.now(timezone.utc) - timedelta(hours=100)
+    old = datetime.now(UTC) - timedelta(hours=100)
     _seed(tmp_path, monkeypatch, outcomes=["productive"], recorded_at=old)
 
     result, git_marker = _run_probe(tmp_path, "dark_factory", 3)

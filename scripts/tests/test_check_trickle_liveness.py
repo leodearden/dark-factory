@@ -27,7 +27,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 SCRIPT = Path(__file__).parent.parent / "legibility" / "check_trickle_liveness.sh"
@@ -177,7 +177,7 @@ def test_script_is_executable():
 
 
 def test_alive_within_window_exits_zero(tmp_path):
-    recent = datetime.now(timezone.utc) - timedelta(hours=2)
+    recent = datetime.now(UTC) - timedelta(hours=2)
     result, git_marker = _run_script(
         tmp_path, "proj_a", 24,
         fields={
@@ -200,7 +200,7 @@ def test_alive_within_window_exits_zero(tmp_path):
 
 
 def test_older_than_window_exits_nonzero(tmp_path):
-    stale = datetime.now(timezone.utc) - timedelta(hours=48)
+    stale = datetime.now(UTC) - timedelta(hours=48)
     result, git_marker = _run_script(
         tmp_path, "proj_a", 24,
         fields={
@@ -218,7 +218,7 @@ def test_older_than_window_exits_nonzero(tmp_path):
 
 
 def test_failed_run_exits_nonzero(tmp_path):
-    recent = datetime.now(timezone.utc) - timedelta(hours=1)
+    recent = datetime.now(UTC) - timedelta(hours=1)
     result, git_marker = _run_script(
         tmp_path, "proj_a", 24,
         fields={

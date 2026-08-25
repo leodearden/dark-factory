@@ -58,6 +58,7 @@ _ALL_CATEGORIES = _mod._ALL_CATEGORIES
 extract_liveness_snapshot_fact = _mod.extract_liveness_snapshot_fact
 _classify_liveness_snapshot = _mod._classify_liveness_snapshot
 liveness_snapshot_subject_task_ids = _mod.liveness_snapshot_subject_task_ids
+liveness_snapshot_subject_facts = _mod.liveness_snapshot_subject_facts
 find_liveness_snapshot_recurrences = _mod.find_liveness_snapshot_recurrences
 _LIVENESS_DISCLOSURE_KEYS = _mod._LIVENESS_DISCLOSURE_KEYS
 # Bound here, off the module, so the regex-budget class below can delegate to
@@ -66,6 +67,7 @@ _LIVENESS_DISCLOSURE_KEYS = _mod._LIVENESS_DISCLOSURE_KEYS
 # make these aliases stale.
 POINT_IN_TIME_CHECK_RE = _mod.POINT_IN_TIME_CHECK_RE
 LIVE_TASK_STATUS_RE = _mod.LIVE_TASK_STATUS_RE
+TASK_REF_RE = _mod.TASK_REF_RE
 _LIVE_FIELD_NAMES = _mod._LIVE_FIELD_NAMES
 apply_deletions = _mod.apply_deletions
 resolve_ann_threshold = _mod.resolve_ann_threshold
@@ -80,6 +82,29 @@ emit_metrics_artifact = _mod.emit_metrics_artifact
 details_artifact_path = _mod.details_artifact_path
 _build_parser = _mod._build_parser
 _run = _mod._run
+
+
+@pytest.fixture(autouse=True)
+def _neutralise_store_mutation_preflight(monkeypatch):
+    """Keep this MOCK-unit suite independent of the REAL ``~/.mem0``.
+
+    ``_run(args)`` with ``--apply`` runs a fail-closed capability preflight
+    before it constructs a MemoryService (task 4127). That probe touches the
+    real filesystem, so without this fixture every ``--apply`` test would pass
+    or fail according to whether the machine running pytest happens to be able
+    to write mem0's history directory -- and it genuinely cannot inside an
+    agent sandbox, which is the whole reason the guard exists. This suite is
+    deliberately MOCK-unit (``_FakeMemoryService``, no live Qdrant), so the
+    environment must not be an input to it.
+
+    ``TestApplyStoreMutationPreflight`` re-rigs this per test -- to refuse, to
+    record, or to pass -- so the guard's own behaviour is still pinned
+    explicitly rather than assumed away.
+
+    Deliberately NOT ``raising=False``: if the guard is ever removed from the
+    script this fixture must break loudly rather than silently no-op.
+    """
+    monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', lambda **_kw: None)
 
 
 # ---------------------------------------------------------------------------
@@ -4573,9 +4598,56 @@ class TestRunWiring:
         assert f'near_duplicate_clusters.{_PK}' in ids
         for key in (*_ANN_DISCLOSURE_KEYS, *_PLAN_DISCLOSURE_KEYS,
                     'ann_query_errors', 'ann_disabled_uncalibrated',
-                    'ann_pooled_fallback_categories'):
+                    'ann_pooled_fallback_categories', 'apply_withheld_clusters'):
             assert f'{key}.{_GLOBAL_SCOPE}' in ids, f'{key} must be disclosed'
         assert f'scan_truncated.{_PK}' in ids
+
+    async def test_the_apply_withheld_gate_becomes_a_metric_series(
+        self, monkeypatch, tmp_path, capsys,
+    ):
+        """A cluster the apply gate withholds must be alarmable, not reported only.
+
+        The plan JSON already carries ``apply_withheld_clusters``, but the plan
+        is not the artifact the eval programme reads — only the metrics series
+        is. Without this metric, a growing share of ``--apply`` coverage
+        silently withheld by the evidence gate would be un-alarmable recall
+        loss.
+        """
+        from shared.memory_eval_metrics import (  # noqa: PLC0415
+            RUN_STAMP_ENV_VAR,
+            load_metric_series,
+        )
+
+        monkeypatch.setenv(RUN_STAMP_ENV_VAR, _STAMP)
+        raw = {_OS: [
+            _raw('m1', 'alpha one', '2026-01-01T00:00:00+00:00', category=_OS,
+                 vector=[1.0, 0.0]),
+            _raw('m2', 'beta two', '2026-01-02T00:00:00+00:00', category=_OS,
+                 vector=[0.0, 1.0]),
+        ]}
+        ann_hits = {(1.0, 0.0): [('m2', 0.95)], (0.0, 1.0): [('m1', 0.95)]}
+        _install_run_doubles(
+            monkeypatch, raw, ann_hits=ann_hits, t_high_by_category={_PK: 0.9},
+        )
+
+        rc = await _run(await self._parse(tmp_path, '--threshold', '0.99'))
+        plan = json.loads(capsys.readouterr().out)
+
+        assert rc == 0, 'a dry run (no --apply) returns cleanly'
+        assert plan['apply_withheld_clusters'] == 1, (
+            'observations_and_summaries has no cutoff of its own, so this '
+            'clique runs on the pooled fallback and is withheld'
+        )
+
+        series = load_metric_series(tmp_path / _EVAL_ID / f'metrics-{_STAMP}.json')
+        by_id = _by_id(series.metrics)
+        metric_id = f'apply_withheld_clusters.{_GLOBAL_SCOPE}'
+        assert metric_id in by_id, 'the gate must be alarmable, not just reported'
+
+        metric = by_id[metric_id]
+        assert metric.value == 1.0
+        assert metric.kind == 'count'
+        assert metric.direction == 'higher_is_worse'
 
     async def test_no_metrics_writes_nothing(self, monkeypatch, tmp_path):
         _install_run_doubles(monkeypatch, {_PK: [_raw('m1', 'x')]})
@@ -4833,6 +4905,98 @@ class TestExtractLivenessSnapshotFact:
         ) is None
 
 
+# The exact pair the task measured live: identical framing and identical
+# readable `claimant_run_id=`/`heartbeat_at=` pairs, differing only in a
+# status value neither the quoted nor the bare branch can read whole (an
+# unterminated quote). Verbatim from the task's reproduction.
+_UNREADABLE_STATUS_IN_PROGRESS = (
+    'Liveness check performed 2026-08-11: '
+    'status="in progress claimant_run_id=null heartbeat_at=null'
+)
+_UNREADABLE_STATUS_DONE = (
+    'Liveness check performed 2026-08-11: '
+    'status="done, unclosed claimant_run_id=null heartbeat_at=null'
+)
+
+
+class TestLivenessSnapshotUnfieldedVerdictIsPerField:
+    """An unreadable field is a WHOLE-RECORD loss, never a key from survivors.
+
+    `_classify_liveness_snapshot` built its key from whatever fields happened
+    to parse and silently dropped the rest: `pairs` accumulated across every
+    match in the content, and `if not pairs: return True, None` only fired
+    when NO field parsed at all. One unreadable field beside a readable
+    sibling therefore produced a KEY, not a loss -- built from the survivors
+    only, so it groups records that assert DIFFERENT facts. Under `--apply` a
+    false cluster like that is an irreversible delete (the same guarantee
+    `extract_liveness_snapshot_fact`'s own docstring already claims). The
+    verdict must be per-field instead: any recognised field whose value
+    cannot be read whole makes the WHOLE record `(True, None)`, exactly like
+    the no-fields-at-all case already does.
+    """
+
+    def test_two_different_unreadable_statuses_do_not_share_a_key(self):
+        """The measured bug: an in-progress and a done snapshot, one key.
+
+        Measured on base: both classify as
+        `(True, 'claimant_run_id=null|heartbeat_at=null')` -- the SAME
+        partial key for two records asserting opposite statuses.
+        """
+        key_a = _classify_liveness_snapshot(_UNREADABLE_STATUS_IN_PROGRESS)
+        key_b = _classify_liveness_snapshot(_UNREADABLE_STATUS_DONE)
+
+        assert key_a == (True, None)
+        assert key_b == (True, None)
+
+        assert extract_liveness_snapshot_fact(
+            _memory('a', _UNREADABLE_STATUS_IN_PROGRESS, category=_OS),
+        ) is None, 'the extractor is a thin projection of the classifier'
+
+    @pytest.mark.parametrize('value', [
+        '"in progress',  # unterminated quote
+        '(unknown)',  # value starts outside the bare class
+        '"a|b"',  # `|` is the key's own pair delimiter
+    ])
+    def test_an_unreadable_value_beside_a_readable_sibling_is_a_whole_record_loss(
+        self, value,
+    ):
+        """A single unreadable field must poison the whole key, not just itself."""
+        content = (
+            'Point-in-time liveness check performed 2026-07-24 on task 94: '
+            f'status={value} claimant_run_id=null'
+        )
+
+        assert _classify_liveness_snapshot(content) == (True, None)
+
+    def test_a_value_that_cleans_to_nothing_is_a_whole_record_loss(self):
+        """A second, distinct route to the same defect -- survives step-2.
+
+        `.rstrip('./:+-')` can reduce a BARE value the pattern DID read (so
+        `quoted`/`bare` are never both `None`, and no unreadable-value
+        verdict ever fires) to the empty string, and the `if cleaned:` guard
+        then silently drops that field while a readable sibling still
+        contributes -- the same partial-key defect, reached without the
+        value ever being unreadable. A field the author WROTE but whose
+        value the reader cannot recover is exactly the case
+        `liveness_snapshot_unfielded` exists to make visible, not silently
+        fold into a key built from the survivors.
+        """
+        content = (
+            'Point-in-time liveness check performed 2026-07-24 on task 94: '
+            'status=--- claimant_run_id=null'
+        )
+        assert _classify_liveness_snapshot(content) == (True, None)
+
+        other = (
+            'Point-in-time liveness check performed 2026-07-24 on task 94: '
+            'status=... claimant_run_id=null'
+        )
+        assert _classify_liveness_snapshot(other) == (True, None), (
+            'a second value that also rstrips to empty must not fabricate '
+            'the same survivors-only key as the one above'
+        )
+
+
 class TestLivenessClassifierIsSingleCopy:
     """One classifier, two callers -- so the extractor's tests test production.
 
@@ -4916,6 +5080,29 @@ class TestLivenessSnapshotSubjectTaskIds:
             _memory('6b245659', _LIVENESS_SNAPSHOT_94_JUL24, category=_OS),
         ) == {'94'}
 
+    def test_slash_form_content_ref_alone_still_groups_a_snapshot(self):
+        """A record whose only task reference is the slash form (task 3403).
+
+        'task/94' is the orchestrator's own branch-name convention and the
+        spelling the real corpus reaches for when a snapshot is about a
+        branch or worktree; before task 3403 widened the shared TASK_REF_RE
+        grammar it was not a reference at all, so such a record had NO
+        subject and was silently ungroupable. MEASURED set() before the
+        widening.
+
+        This is the report-only path (a recurrence report, never a delete
+        candidate), so the widening buys recall here at no risk to the
+        corpus -- which is the recall this task was filed for.
+        """
+        assert liveness_snapshot_subject_task_ids(
+            _memory(
+                'm',
+                'Liveness check performed at 2026-07-24T10:00Z: task/94 '
+                'reports status=in-progress.',
+                category=_OS,
+            ),
+        ) == {'94'}
+
     def test_no_metadata_id_and_no_content_ref_is_empty(self):
         assert liveness_snapshot_subject_task_ids(
             _memory('m', 'a note that names no task at all'),
@@ -4965,6 +5152,416 @@ def _liveness_corpus() -> list[dict]:
 def _span_days(earlier: str, later: str) -> float:
     return (datetime.fromisoformat(later).timestamp()
             - datetime.fromisoformat(earlier).timestamp()) / 86400.0
+
+
+# A core_fact that CANNOT be produced by clause scoping, seeded in place of the
+# real one so the unconditional seed cannot supply the very answer the
+# assertion is checking for. `liveness_snapshot_subject_facts` seeds every
+# subject with `core_fact` and only THEN adds the clause-derived key, and on
+# these four records the two COINCIDE -- so asserting against the real fact
+# cannot tell "the clause derived it" from "the clause derived nothing and the
+# seed supplied it". Seeding a sentinel splits them: the sentinel is the seed's
+# contribution, and `_CORE_FACT_STRANDED` can only have come from a clause.
+#
+# It names ONE field TWICE on purpose. A clause-scoped key is only ADDED for a
+# record whose whole-record key is divergent -- a coherent record gains nothing
+# from clause scoping but a weaker, punctuation-sensitive key -- so a sentinel
+# that named each field once would close that gate and make every assertion
+# below read `{sentinel}` no matter what the clauses say. The values are
+# unforgeable for a second reason too: `<` and `>` are outside
+# `_LIVE_FIELD_SCAN_RE`'s bare value class, so no content can produce them.
+_SENTINEL_CORE_FACT = 'status=<sentinel-one>|status=<sentinel-two>'
+
+
+class TestLivenessSnapshotSubjectFacts:
+    """WHAT each subject is asserted to be -- measured on the FOUR REAL RECORDS.
+
+    The task's own acceptance bar: the rescope is only worth shipping if the
+    detector still fires on the corpus that motivated it. The clause technique
+    returned the EMPTY SET on all four of these records before task 3403
+    narrowed `_CLAUSE_SPLIT_RE`'s dot and widened `TASK_REF_RE`'s separator, so
+    "it works now" is a measurement, not an inference -- and this class is
+    where that measurement lives. If a later edit to either shared regex
+    re-breaks the association, this fails before the group-level tests do,
+    naming the subject and the fact rather than an absent group.
+
+    That last guarantee is only REAL because these tests seed
+    `_SENTINEL_CORE_FACT` rather than `_CORE_FACT_STRANDED`. Asserting against
+    the real fact made this class VACUOUS with respect to the very thing it
+    claims to pin: because the seed is unconditional and coincides with the
+    clause-derived key here, `{_CORE_FACT_STRANDED}` is the result whether the
+    clause scope did all the work or none of it. Measured, not reasoned:
+    monkeypatching `TASK_REF_RE` to a never-matching pattern -- exactly the
+    pre-3403 breakage this class exists to catch -- left the original
+    assertions GREEN. With the sentinel seeded, that same inert regex yields
+    `{_SENTINEL_CORE_FACT}` and the tests fail naming the subject and the
+    missing fact.
+
+    The guarantee is the CLASS's, not each test's, and the two mutants divide
+    unevenly -- also measured. An inert `TASK_REF_RE` is killed by both tests.
+    An inert `_CLAUSE_SPLIT_RE` (one that never splits) is killed only by the
+    multi-task test: with a single-subject record the whole content IS that
+    subject's clause, so not splitting is indistinguishable from splitting
+    correctly and nothing is there to detect. That is why the multi-task
+    record carries the load here and must not be reduced to a single subject.
+
+    The seeded sentinel is DIVERGENT (it names `status` twice), which is what
+    opens the gate on the clause scan at all. These four records are coherent,
+    so in production they key on the whole-record union alone and their two
+    groups come from that key, exactly as before the rescope -- what is
+    measured here is that the clause TECHNIQUE resolves subject -> fact on
+    this real content, which is what the divergent path depends on.
+    """
+
+    def test_a_single_task_snapshot_keys_its_one_subject(self):
+        by_id = {r['id']: r for r in _liveness_corpus()}
+
+        assert liveness_snapshot_subject_facts(
+            by_id['6b245659'], _SENTINEL_CORE_FACT,
+        ) == {'94': {_SENTINEL_CORE_FACT, _CORE_FACT_STRANDED}}
+        assert liveness_snapshot_subject_facts(
+            by_id['08aa0017'], _SENTINEL_CORE_FACT,
+        ) == {'96': {_SENTINEL_CORE_FACT, _CORE_FACT_STRANDED}}
+
+    def test_the_multi_task_reverification_keys_each_subject_from_its_own_clause(self):
+        """1eef7df7: task 94 in clause 0, task 96 four clauses later.
+
+        Both land on the stranded fact from their OWN clause -- which is what
+        keeps `test_exactly_the_two_real_groups` green through the rescope.
+
+        Subject 99 is pinned here as the NEGATIVE, in the same sentinel style:
+        it names no clause carrying a readable assignment, so it comes back
+        with the seed and nothing else. That contrast is what proves 94's and
+        96's facts were clause-DERIVED rather than seeded -- all three subjects
+        share one record and one seed, and only the two with real clause
+        evidence gain a second key. The fallback's own three shapes stay
+        `TestLivenessSubjectFactsFallback`.
+        """
+        record = {r['id']: r for r in _liveness_corpus()}['1eef7df7']
+
+        facts = liveness_snapshot_subject_facts(record, _SENTINEL_CORE_FACT)
+
+        assert facts['94'] == {_SENTINEL_CORE_FACT, _CORE_FACT_STRANDED}
+        assert facts['96'] == {_SENTINEL_CORE_FACT, _CORE_FACT_STRANDED}
+        assert facts['99'] == {_SENTINEL_CORE_FACT}
+
+    def test_the_record_is_not_mutated(self):
+        record = {r['id']: r for r in _liveness_corpus()}['1eef7df7']
+        before = json.dumps(record, sort_keys=True, default=str)
+
+        liveness_snapshot_subject_facts(record, _CORE_FACT_STRANDED)
+
+        assert json.dumps(record, sort_keys=True, default=str) == before
+
+
+class TestLivenessSubjectFactsFallback:
+    """A subject with NO clause-scoped evidence keys on the WHOLE-RECORD union.
+
+    EVERY subject keys on *core_fact* -- always, unconditionally -- and clause
+    scoping ADDS a second key beside it when the subject's clauses carried
+    readable assignments. The three shapes below are the cases where nothing
+    is added, so the set stays the one-element `{core_fact}` this class
+    asserts: a ref that exists only in metadata, a prose ref in a clause
+    carrying no readable assignment, and a clause boundary landing inside a
+    quoted value.
+
+    An earlier reading of this class claimed the rescope "can only ADD recall
+    if a subject the clauses say nothing about keeps exactly the key it had
+    BEFORE the rescope". That condition is real but NOT sufficient, and
+    believing it shipped a regression: a subject whose clause named only SOME
+    of the record's fields keyed on a partial fact instead, silently vacating
+    the whole-record bucket it used to share -- an empty-set-only fallback
+    never fires for it. The invariant that actually holds is the unconditional
+    one above; `TestLivenessSubjectFactsIsAdditive` pins the
+    non-empty-but-incomplete half this class does not reach.
+
+    Because every pre-rescope bucket membership therefore survives, nothing is
+    lost and no new `_LIVENESS_DISCLOSURE_KEYS` counter is warranted -- pinned
+    below, so a later edit that starts dropping these subjects has to change
+    a disclosure contract rather than quietly shrink the report.
+    """
+
+    def test_a_metadata_only_subject_falls_back_to_the_record_key(self):
+        """`related_task_ids` names 777; the content never mentions it.
+
+        No clause can be scoped to a subject the prose does not name, so 777
+        has no clause-level evidence by construction. It is still a subject --
+        `liveness_snapshot_subject_task_ids` resolves it -- so it must still be
+        keyed, and the only honest key is what the record as a whole asserts.
+        """
+        record = _memory(
+            'meta-only', _LIVENESS_SNAPSHOT_94_JUL24, category=_OS,
+            metadata={'task_id': '94', 'related_task_ids': ['777']},
+        )
+
+        facts = liveness_snapshot_subject_facts(record, _SENTINEL_CORE_FACT)
+
+        assert set(facts) == {'94', '777'}, (
+            'the metadata-only subject is keyed, not dropped'
+        )
+        assert facts['94'] == {_SENTINEL_CORE_FACT, _CORE_FACT_STRANDED}, (
+            'the prose subject gains a key from its own clause'
+        )
+        assert facts['777'] == {_SENTINEL_CORE_FACT}, (
+            'the metadata-only one gains nothing and keeps the record key alone'
+        )
+
+    def test_a_prose_subject_whose_clause_asserts_nothing_falls_back(self):
+        """The REAL 1eef7df7: clause 6 names task 99 with no assignment.
+
+        Task 99 is the record's own `metadata.task_id` and appears in prose
+        ("whoever resolves task 99's commit-vs-discard decision"), but that
+        clause carries no `<field>=<value>` at all. The fallback restores
+        exactly today's key for it -- and, because 99 has no second record
+        anywhere in the corpus, it stays the singleton
+        `test_singleton_subject_and_non_snapshot_are_absent` already pins. The
+        fallback must not resurrect it as a false group.
+        """
+        record = {r['id']: r for r in _liveness_corpus()}['1eef7df7']
+
+        facts = liveness_snapshot_subject_facts(record, _SENTINEL_CORE_FACT)
+
+        assert facts['99'] == {_SENTINEL_CORE_FACT}, (
+            'keyed on the whole-record union, exactly as before the rescope'
+        )
+        assert facts['94'] == {_SENTINEL_CORE_FACT, _CORE_FACT_STRANDED}, (
+            'and its clause-bearing sibling in the SAME record does gain one -- '
+            'so 99 fell back, it was not the whole scan coming back empty'
+        )
+
+        groups, _ = find_liveness_snapshot_recurrences(_liveness_corpus())
+
+        assert '99' not in [g['subject_task_id'] for g in groups], (
+            'still a singleton -- the fallback restores recall, not a group'
+        )
+
+    def test_a_clause_split_inside_a_quoted_value_falls_back(self):
+        """`status="done. now"` -- the boundary lands mid-value.
+
+        `_CLAUSE_SPLIT_RE` is a regex over prose, not a parser, so a `.` inside
+        a quoted value splits the clause and leaves task 94's half holding an
+        unterminated `status="done` that `_readable_field_pairs` declines to
+        read. The RECORD-level classifier sees the value whole and keys fine,
+        asserted first so the fixture is known to reach the fallback for the
+        stated reason rather than by failing to classify at all.
+        """
+        content = (
+            'Point-in-time liveness check performed 2026-07-24 on task 94: '
+            'status="done. now", claimant_run_id=null, heartbeat_at=null'
+        )
+        record = _memory('quoted-split', content, category=_OS,
+                         metadata={'task_id': '94'})
+        record_key = extract_liveness_snapshot_fact(record)
+
+        assert record_key == 'claimant_run_id=null|heartbeat_at=null|status=done. now', (
+            'the record-level read is whole -- only the CLAUSE is truncated'
+        )
+        assert liveness_snapshot_subject_facts(record, _SENTINEL_CORE_FACT) == {
+            '94': {_SENTINEL_CORE_FACT},
+        }, 'the subject falls back rather than vanishing from the report'
+
+    def test_the_fallback_adds_no_disclosure_counter(self):
+        """Nothing is lost, so nothing is disclosed as lost.
+
+        The counter set is a contract with the metrics layer; a fallback that
+        reproduces today's key byte-for-byte is not a loss and must not grow
+        it.
+        """
+        _groups, disclosure = find_liveness_snapshot_recurrences(_liveness_corpus())
+
+        assert set(disclosure) == set(_LIVENESS_DISCLOSURE_KEYS)
+        assert set(disclosure.values()) == {0}
+
+
+# ONE clause carrying all three fields, and the SAME fact spread across two
+# clauses -- the ordinary shape, not an exotic one: `\n` is a clause boundary
+# too, so any snapshot naming its task on one line and listing fields on the
+# following lines splits exactly like this. Both records produce the IDENTICAL
+# whole-record key, so they grouped before the rescope.
+_LIVENESS_94_ONE_CLAUSE = (
+    'Point-in-time liveness check performed 2026-07-24 on task 94: get_task '
+    'reports status="in-progress" but claimant_run_id=null and '
+    'heartbeat_at=null.'
+)
+_LIVENESS_94_SPLIT_CLAUSES = (
+    'Point-in-time liveness check performed 2026-07-26 on task 94: get_task '
+    'reports status="in-progress". Separately, claimant_run_id=null and '
+    'heartbeat_at=null were observed for it.'
+)
+
+
+class TestLivenessSubjectFactsIsAdditive:
+    """*core_fact* is among a subject's keys ALWAYS -- the monotonicity proof.
+
+    Clause scoping is only safe on this report-only path if it can add
+    groupings and never take one away. `TestLivenessSubjectFactsFallback`
+    covers the case where a subject's clauses assert NOTHING; this class
+    covers the strictly harder one they do not reach -- clause evidence that
+    is non-empty but INCOMPLETE.
+
+    Measured against the shipped module before this class landed: record B
+    below names task 94 in its first clause and puts the other two fields in a
+    second clause naming no task, so the subject keyed on the partial
+    `status=in-progress`, matched nothing, and the whole-record bucket it had
+    shared with A was silently vacated -- `find_liveness_snapshot_recurrences`
+    returned `[]` with an ALL-ZERO disclosure. A fallback that fires only on
+    the empty set cannot catch that; a non-empty-but-incomplete set wins
+    outright.
+
+    The invariant that closes it: every subject buckets under *core_fact*
+    unconditionally, with the clause-scoped fact ADDED beside it. Every bucket
+    membership that existed before the rescope therefore still exists, which is
+    what makes "clause scoping can only ADD recall" a true statement about the
+    mechanism rather than an aspiration about the common case.
+
+    A record whose union key is COHERENT, like both of these, is now given no
+    clause-scoped key at all -- a second guard on the same invariant, and the
+    one that keeps grouping from turning on where the author put a full stop.
+    The partial key survives only where it earns its keep, on a DIVERGENT
+    record, and the test below pins that the seed still sits beside it there.
+    """
+
+    def _pair(self) -> list[dict]:
+        return [
+            _dated('A', _LIVENESS_94_ONE_CLAUSE, _TS_94_JUL24,
+                   category=_OS, metadata={'task_id': '94'}),
+            _dated('B', _LIVENESS_94_SPLIT_CLAUSES, _TS_REVERIFY,
+                   category=_OS, metadata={'task_id': '94'}),
+        ]
+
+    def test_an_incomplete_clause_still_keeps_the_whole_record_grouping(self):
+        """Asserted in link order, so a failure says WHICH link broke."""
+        a, b = self._pair()
+
+        # PREMISE: these two DID group before the rescope -- one record key.
+        assert extract_liveness_snapshot_fact(a) == _CORE_FACT_STRANDED
+        assert extract_liveness_snapshot_fact(b) == _CORE_FACT_STRANDED, (
+            'the record-level read is whole for both -- only B is SPLIT across '
+            'clauses, which is a clause-scoping question, not a reading one'
+        )
+
+        # The projection: the record key, and for B no weaker key beside it.
+        assert liveness_snapshot_subject_facts(a, _CORE_FACT_STRANDED) == {
+            '94': {_CORE_FACT_STRANDED},
+        }
+        assert liveness_snapshot_subject_facts(b, _CORE_FACT_STRANDED) == {
+            '94': {_CORE_FACT_STRANDED},
+        }, (
+            'B says the SAME coherent thing as A, split over two clauses -- '
+            'keying it on `status=in-progress` as well would make grouping '
+            'turn on the full stop, and swapping it in would drop the group'
+        )
+
+        # And therefore the group survives the rescope.
+        groups, disclosure = find_liveness_snapshot_recurrences(self._pair())
+
+        assert [(g['subject_task_id'], g['core_fact'], g['member_ids'])
+                for g in groups] == [
+            ('94', _CORE_FACT_STRANDED, ['A', 'B']),
+        ], 'exactly the group that existed before clause scoping'
+        assert set(disclosure.values()) == {0}, (
+            'a vacated bucket moves no counter, which is why the regression was '
+            'invisible -- the group itself is the only observable'
+        )
+
+    def test_a_divergent_records_incomplete_clause_keeps_the_seed_beside_it(self):
+        """Where the partial key DOES survive, the seed survives with it.
+
+        Task 94's clause here names only `status`; task 96's names all three.
+        The union is a chimera, so clause scoping engages -- and the partial
+        `status=in-progress` is ADDED, not swapped in. Swapping would vacate
+        the whole-record bucket 94 shares with any other record asserting the
+        same chimera, which is the regression this class exists to catch.
+        """
+        record = _memory('divergent-partial', _LIVENESS_DIVERGENT_PARTIAL_94,
+                         category=_OS, metadata={'task_id': '94'})
+
+        assert extract_liveness_snapshot_fact(record) == _CORE_FACT_DIVERGENT
+
+        assert liveness_snapshot_subject_facts(record, _CORE_FACT_DIVERGENT) == {
+            '94': {_CORE_FACT_DIVERGENT, 'status=in-progress'},
+            '96': {_CORE_FACT_DIVERGENT, _CORE_FACT_DONE},
+        }, 'the incomplete clause key sits BESIDE the seed, never in place of it'
+
+
+# A record whose whole-record key names `status` TWICE -- the chimera that
+# matches no single-task snapshot, and the only shape given a clause-scoped
+# key. The partial variant assigns task 94 one field and task 96 all three, so
+# 94's clause key is a strict subset of the union.
+_LIVENESS_DIVERGENT_94_96 = (
+    'Point-in-time liveness check performed 2026-07-26 on task 94: '
+    'status="in-progress", claimant_run_id=null, heartbeat_at=null. '
+    'Separately on task 96: status="done", claimant_run_id=null, '
+    'heartbeat_at=null.'
+)
+_LIVENESS_DIVERGENT_PARTIAL_94 = (
+    'Point-in-time liveness check performed 2026-07-26 on task 94: '
+    'status="in-progress". Separately on task 96: status="done", '
+    'claimant_run_id=null, heartbeat_at=null.'
+)
+_CORE_FACT_DIVERGENT = (
+    'claimant_run_id=null|heartbeat_at=null|status=done|status=in-progress'
+)
+_CORE_FACT_DONE = 'claimant_run_id=null|heartbeat_at=null|status=done'
+
+
+class TestLivenessOneSubjectOneGroupPerMemberSet:
+    """Dual keying never reports one subject TWICE over the same members.
+
+    `liveness_snapshot_recurrences` is an ARMED `higher_is_worse` count, so a
+    structural doubling on a whole content shape is a false accretion signal,
+    not a cosmetic one -- and a duplicate row in the details table for the
+    human reading it. Only a DIVERGENT record is given two keys at all, so
+    this is where the collapse is exercised; the richer key wins it, which is
+    always the whole-record one, so the survivor is the group that predates
+    clause scoping.
+    """
+
+    def _divergent(self, record_id: str, created_at: str) -> dict:
+        return _dated(record_id, _LIVENESS_DIVERGENT_94_96, created_at,
+                      category=_OS, metadata={'task_id': '94'})
+
+    def test_identical_divergent_records_report_one_group_per_subject(self):
+        """Four buckets, two findings: each subject is keyed twice over the
+        SAME two members, so half the buckets are the same finding restated.
+        """
+        corpus = [self._divergent('D1', _TS_94_JUL24),
+                  self._divergent('D2', _TS_REVERIFY)]
+
+        groups, disclosure = find_liveness_snapshot_recurrences(corpus)
+
+        assert [(g['subject_task_id'], g['core_fact'], g['member_ids'])
+                for g in groups] == [
+            ('94', _CORE_FACT_DIVERGENT, ['D1', 'D2']),
+            ('96', _CORE_FACT_DIVERGENT, ['D1', 'D2']),
+        ], 'one group per subject -- not one per (subject, key)'
+        assert set(disclosure.values()) == {0}
+
+    def test_two_groups_for_one_subject_come_back_in_a_stable_order(self):
+        """The sort tie dual keying still reaches, once the members DIFFER.
+
+        Adding a single-task snapshot of task 94 grows the clause-scoped
+        bucket to three members while the chimera bucket keeps two, so both
+        survive the collapse. They share category, subject and first member
+        id, and only `core_fact` discriminates them -- without that tiebreak
+        their order falls out of dict insertion, breaking the Returns
+        contract's promise that two identical runs serialise byte-identically.
+        """
+        corpus = [
+            self._divergent('D1', _TS_94_JUL24),
+            self._divergent('D2', _TS_REVERIFY),
+            _dated('E', _LIVENESS_SNAPSHOT_94_JUL24, _TS_96_JUL24,
+                   category=_OS, metadata={'task_id': '94'}),
+        ]
+
+        groups, _ = find_liveness_snapshot_recurrences(corpus)
+
+        assert [(g['subject_task_id'], g['core_fact'], g['member_ids'])
+                for g in groups] == [
+            ('94', _CORE_FACT_DIVERGENT, ['D1', 'D2']),
+            ('94', _CORE_FACT_STRANDED, ['D1', 'D2', 'E']),
+            ('96', _CORE_FACT_DIVERGENT, ['D1', 'D2']),
+        ], 'sorted by core_fact ascending once category/subject/first-id tie'
 
 
 class TestFindLivenessSnapshotRecurrences:
@@ -5057,46 +5654,69 @@ class TestFindLivenessSnapshotRecurrences:
 
         assert groups == []
 
-    def test_divergent_per_task_statuses_do_not_group(self):
-        """The KNOWN LIMITATION of the whole-record key, pinned not hidden.
+    def test_divergent_per_task_statuses_group_per_subject(self):
+        """The whole-record limitation, CLOSED: each subject keys on its own clause.
 
-        The core fact is built ONCE PER RECORD by unioning every assignment in
-        its content, then attributed to every subject the record names. When a
-        multi-task re-verification reports DIFFERENT values per task, that
-        merged key matches neither single-task snapshot and both stay
-        singletons.
+        The core fact is no longer built once per record and attributed to
+        every subject it names. `find_liveness_snapshot_recurrences` splits the
+        content into clauses with `task_filter._CLAUSE_SPLIT_RE`, reads the
+        task refs and the `<field>=<value>` assignments of each clause
+        separately, and keys every subject on the union of the clauses that
+        NAME it -- the same idiom `task_filter.find_conflicting_task_status_ids`
+        uses. A multi-task re-verification reporting DIVERGENT values per task
+        therefore joins each subject's own group instead of matching neither.
 
-        The real motivating record (1eef7df7) reports identical values for
-        both its subjects, so the detector fires on the corpus that motivated
-        it. Per-subject clause scoping was tried and rejected on evidence:
-        `_CLAUSE_SPLIT_RE` splits on `.`, shattering filenames mid-sentence,
-        and the real content writes `task/94`, which `TASK_REF_RE` does not
-        match -- it yields the EMPTY SET on all four real records. This is a
-        RECALL gap in a report-only path, never a wrong delete.
+        This was genuinely inert when the detector was written: `_CLAUSE_SPLIT_RE`
+        split on EVERY `.`, shattering filenames mid-sentence, and the real
+        content writes `task/94`, which `TASK_REF_RE` did not match -- together
+        they yielded the EMPTY SET on all four real records. Task 3403 fixed
+        both regexes at the source, and this task re-MEASURED the technique
+        against those same four records (see
+        `TestLivenessSnapshotSubjectFacts`) rather than assuming it now returns
+        non-empty.
+
+        The record-level key is untouched: `extract_liveness_snapshot_fact`
+        still returns ONE merged key per record, asserted below, so the
+        per-subject fact is a genuinely new projection rather than a change to
+        an existing one.
         """
+        # All THREE live fields in EACH per-task clause. Two fields per clause
+        # would key subject 94 at `claimant_run_id=null|status=in-progress`,
+        # which still matches no single-task snapshot -- the divergence would
+        # go unreported for a reason that has nothing to do with clause
+        # scoping, and the test would pass under the OLD implementation too.
         divergent = (
             'Point-in-time liveness check performed 2026-07-26 on task 94: '
-            'status="in-progress", claimant_run_id=null. Separately on task '
-            '96: status="done", claimant_run_id=null.'
+            'status="in-progress", claimant_run_id=null, heartbeat_at=null. '
+            'Separately on task 96: status="done", claimant_run_id=null, '
+            'heartbeat_at=null.'
+        )
+        done_96 = (
+            'Point-in-time liveness check performed 2026-07-24 on task 96: '
+            'status="done", claimant_run_id=null, heartbeat_at=null.'
         )
         corpus = [
-            _dated('6b245659', _LIVENESS_SNAPSHOT_94_JUL24, _TS_94_JUL24,
+            _dated('a94', _LIVENESS_SNAPSHOT_94_JUL24, _TS_94_JUL24,
                    category=_OS, metadata={'task_id': '94'}),
+            _dated('b96', done_96, _TS_96_JUL24,
+                   category=_OS, metadata={'task_id': '96'}),
             _dated('divergent', divergent, _TS_REVERIFY,
                    category=_OS, metadata={'task_id': '99'}),
         ]
 
         groups, disclosure = find_liveness_snapshot_recurrences(corpus)
 
-        assert extract_liveness_snapshot_fact(corpus[1]) == (
-            'claimant_run_id=null|status=done|status=in-progress'
-        ), 'one merged key per record, carrying BOTH statuses'
-        assert groups == [], (
-            'the merged key matches neither single-task snapshot, so the '
-            'recurrence goes unreported -- a recall gap, not a bad delete'
-        )
+        assert extract_liveness_snapshot_fact(corpus[2]) == (
+            'claimant_run_id=null|heartbeat_at=null|status=done|status=in-progress'
+        ), 'the RECORD-level key is still one merged key carrying BOTH statuses'
+        assert [(g['subject_task_id'], g['core_fact'], g['member_ids'])
+                for g in groups] == [
+            ('94', _CORE_FACT_STRANDED, ['a94', 'divergent']),
+            ('96', 'claimant_run_id=null|heartbeat_at=null|status=done',
+             ['b96', 'divergent']),
+        ], 'each subject joins the group its OWN clause asserts'
         assert set(disclosure.values()) == {0}, (
-            'and it is NOT a counted loss: both records classified fine'
+            'and nothing is disclosed as lost: every record classified fine'
         )
 
 
@@ -5205,6 +5825,108 @@ class TestFindLivenessSnapshotRecurrencesDisclosure:
         )
 
         assert set(disclosure.values()) == {0}
+
+
+class TestLivenessPartialKeyFalseGroup:
+    """The actual harm, pinned at the level `--apply` acts on.
+
+    `TestLivenessSnapshotUnfieldedVerdictIsPerField` is a unit-level guard on
+    the classifier; this class exercises `find_liveness_snapshot_recurrences`
+    instead, because the concrete damage this task exists to prevent is a
+    false RECURRENCE GROUP over two records asserting different facts -- and
+    a group is exactly what `--apply` would delete.
+    """
+
+    def test_two_records_with_different_unreadable_statuses_form_no_group(self):
+        """On the base commit these two records DO group -- an in-progress
+        snapshot merged with a done one, sharing the survivors-only key
+        `claimant_run_id=null|heartbeat_at=null`. The loss is now visible on
+        a counter instead of forming a silent, irreversible-under-`--apply`
+        false cluster.
+        """
+        corpus = [
+            _dated('ip', _UNREADABLE_STATUS_IN_PROGRESS, _TS_94_JUL24,
+                   category=_OS, metadata={'task_id': '94'}),
+            _dated('done', _UNREADABLE_STATUS_DONE, _TS_REVERIFY,
+                   category=_OS, metadata={'task_id': '94'}),
+        ]
+
+        groups, disclosure = find_liveness_snapshot_recurrences(corpus)
+
+        assert groups == [], (
+            'an in-progress snapshot and a done one must never group'
+        )
+        assert disclosure == dict.fromkeys(_LIVENESS_DISCLOSURE_KEYS, 0) | {
+            'liveness_snapshot_unfielded': 2,
+        }
+
+    # Recall bound -- the real motivating corpus must keep every key and
+    # count no loss -- is already pinned in full and not re-asserted here:
+    # TestExtractLivenessSnapshotFact.test_all_three_real_snapshots_yield_the_same_key
+    # (the three keys collapse to `_CORE_FACT_STRANDED`),
+    # TestFindLivenessSnapshotRecurrences.test_exactly_the_two_real_groups
+    # (the exact two groups) and TestFindLivenessSnapshotRecurrencesDisclosure
+    # .test_clean_run_zero_fills_every_key (an all-zero disclosure).
+
+    def test_a_quoted_value_containing_a_field_name_is_not_a_loss(self):
+        """The precision guard a naive mention-count fix would fail.
+
+        The inner `claimant_run_id=` sits inside the span already consumed
+        as `status`'s quoted value, so it is a readable value -- not a
+        second, unread mention of a sibling field.
+        """
+        content = (
+            'Point-in-time liveness check performed 2026-07-24 on task 94: '
+            'status="foo claimant_run_id=bar"'
+        )
+
+        key = extract_liveness_snapshot_fact(_memory('x', content, category=_OS))
+
+        assert key == 'status=foo claimant_run_id=bar'
+
+    def test_a_non_assignment_status_can_still_false_group(self):
+        """KNOWN LIMITATION, pinned not hidden -- the same discipline
+        `test_divergent_per_task_statuses_group_per_subject` used for the
+        whole-record-key limitation that task 3891 went on to close.
+
+        This task's fix closes the ASSIGNMENT-form route to a survivors-only
+        key: a `<field>=` written but whose value could not be read. It does
+        not close every route to one. A status spelled `status:` (colon, not
+        `=`) carries no `<field>=` token at all, so `_LIVE_FIELD_SCAN_RE`
+        never matches it there -- it is invisible to the scan rather than an
+        unread mention of it, and the record still keys on whatever OTHER
+        fields parse. Two records asserting opposite statuses through this
+        spelling therefore still share one key and still form one group,
+        pre-existing and unchanged by this task.
+        """
+        done = (
+            'Liveness check performed 2026-08-11 on task 94: status: done, '
+            'claimant_run_id=null, heartbeat_at=null.'
+        )
+        in_progress = (
+            'Liveness check performed 2026-08-11 on task 94: status: '
+            'in-progress, claimant_run_id=null, heartbeat_at=null.'
+        )
+        done_key = _classify_liveness_snapshot(done)
+        in_progress_key = _classify_liveness_snapshot(in_progress)
+
+        assert done_key == in_progress_key, (
+            'the pre-existing gap this task does not close'
+        )
+        assert done_key != (True, None), 'both sides still classify -- no loss'
+
+        corpus = [
+            _dated('done', done, _TS_94_JUL24,
+                   category=_OS, metadata={'task_id': '94'}),
+            _dated('ip', in_progress, _TS_REVERIFY,
+                   category=_OS, metadata={'task_id': '94'}),
+        ]
+        groups, disclosure = find_liveness_snapshot_recurrences(corpus)
+
+        assert [(g['subject_task_id'], g['member_ids']) for g in groups] == [
+            ('94', ['done', 'ip']),
+        ], 'still forms a group -- closing it is out of scope for this task'
+        assert set(disclosure.values()) == {0}, 'and not a counted loss either'
 
 
 # The plan keys that existed before task 3098. Pinned so an additive change
@@ -5566,22 +6288,32 @@ _LONG_PROSE_NO_MARKER = (
 
 
 class _CountingPattern:
-    """A delegating stand-in for a compiled pattern that counts `.search`.
+    """A delegating stand-in for a compiled pattern that counts consults.
 
     Delegates to the real pattern rather than stubbing it, so behaviour is
     unchanged and the class below measures COST, not semantics. It exposes
-    `search` and nothing else on purpose: if the implementation ever reaches
-    for `.match`/`.findall`/`.finditer` on this pattern, the AttributeError
+    `search` and `findall` and nothing else on purpose: if the implementation
+    ever reaches for `.match`/`.finditer` on this pattern, the AttributeError
     surfaces that here instead of letting an uncounted consult pass as free.
+
+    `findall` records the STRING it was handed rather than a bare tally,
+    because the budget that matters for `TASK_REF_RE` is per-argument: one
+    whole-content pass plus N per-clause ones is the intended shape, and a
+    tally alone cannot tell that from two whole-content passes.
     """
 
     def __init__(self, pattern):
         self._pattern = pattern
         self.searches = 0
+        self.findall_args: list[str] = []
 
     def search(self, string, *args, **kwargs):
         self.searches += 1
         return self._pattern.search(string, *args, **kwargs)
+
+    def findall(self, string, *args, **kwargs):
+        self.findall_args.append(string)
+        return self._pattern.findall(string, *args, **kwargs)
 
 
 class TestLivenessDetectorRegexBudget:
@@ -5645,9 +6377,9 @@ class TestLivenessDetectorRegexBudget:
         """The load-bearing case for choosing the BROADER prefilter.
 
         This is the one record class that matches `LIVE_TASK_STATUS_RE` (via
-        the "actively driven by" paraphrase) but NOT
-        `_LIVE_FIELD_ASSIGNMENT_RE`. Prefiltering on the narrower assignment
-        pattern would read as one consult here too, while silently driving
+        the "actively driven by" paraphrase) but produces no match at all
+        against `_LIVE_FIELD_SCAN_RE`. Prefiltering on the narrower scan pattern
+        would read as one consult here too, while silently driving
         `liveness_snapshot_unfielded` to a permanent zero — turning a counted
         loss back into an invisible one.
         """
@@ -5707,6 +6439,58 @@ class TestLivenessDetectorRegexBudget:
         ]
         assert disclosure == dict.fromkeys(_LIVENESS_DISCLOSURE_KEYS, 0)
 
+    def test_the_subject_set_is_read_off_the_content_exactly_once(
+        self, monkeypatch,
+    ):
+        """`TASK_REF_RE` sees the WHOLE content once per record, never twice.
+
+        `find_liveness_snapshot_recurrences` needs the subject set for the
+        untasked disclosure and `liveness_snapshot_subject_facts` needs the
+        same set to key on. Deriving it in both places ran this pattern over
+        the full content a second time per record -- on top of the per-clause
+        reads -- in a module that budgets regex consults per record, so the
+        set is threaded through instead. Pinned by ARGUMENT, not by total: a
+        per-clause consult must never be mistaken for the whole-content one.
+        """
+        counter = _CountingPattern(TASK_REF_RE)
+        monkeypatch.setattr(_mod, 'TASK_REF_RE', counter)
+
+        find_liveness_snapshot_recurrences([
+            _dated('6b245659', _LIVENESS_SNAPSHOT_94_JUL24, _TS_94_JUL24,
+                   category=_OS, metadata={'task_id': '94'}),
+        ])
+
+        assert counter.findall_args == [_LIVENESS_SNAPSHOT_94_JUL24], (
+            'one whole-content pass, and a COHERENT record never reaches the '
+            'clause scan at all'
+        )
+
+    def test_a_divergent_record_reads_the_content_once_then_its_clauses(
+        self, monkeypatch,
+    ):
+        """The gate open, the budget unchanged: the extra reads are CLAUSES.
+
+        The sibling above cannot see this, because a coherent record skips the
+        clause scan entirely -- so without this test "threaded, not
+        re-derived" would be pinned only on the path that does no clause work.
+        """
+        counter = _CountingPattern(TASK_REF_RE)
+        monkeypatch.setattr(_mod, 'TASK_REF_RE', counter)
+
+        find_liveness_snapshot_recurrences([
+            _dated('D', _LIVENESS_DIVERGENT_94_96, _TS_REVERIFY,
+                   category=_OS, metadata={'task_id': '94'}),
+        ])
+
+        assert counter.findall_args.count(_LIVENESS_DIVERGENT_94_96) == 1, (
+            'still ONE whole-content pass with the clause scan running'
+        )
+        assert all(arg in _LIVENESS_DIVERGENT_94_96
+                   for arg in counter.findall_args[1:]), (
+            'every other consult is a clause of that content, not another '
+            'pass over the whole of it'
+        )
+
     def test_the_public_extractor_keeps_its_single_arg_contract(self, consults):
         """Still one argument, still None/key — and free on a marker-free record."""
         no_marker = _memory('prose', _LONG_PROSE_NO_MARKER, category=_OS)
@@ -5741,3 +6525,263 @@ class TestLivenessDetectorRegexBudget:
             ('96', ['08aa0017', '1eef7df7']),
         ]
         assert disclosure == dict.fromkeys(_LIVENESS_DISCLOSURE_KEYS, 0)
+
+
+@pytest.mark.asyncio
+class TestApplyStoreMutationPreflight:
+    """``--apply`` refuses to START when this process cannot write mem0's store.
+
+    Ported from ``test_sweep_toolcall_xml_leak.TestRunApplyStoreMutationPreflight``
+    (task 3686), which is the in-repo precedent for this contract.
+
+    ``apply_deletions`` wraps each ``delete_memory`` in a per-record
+    ``except Exception`` and increments ``delete_errors``, so in a write-denied
+    environment it would produce N logged errors and N already-destroyed
+    Qdrant points -- mem0's ``_delete_memory`` removes the point BEFORE writing
+    its SQLite history. This module's own docstring warns that "under --apply
+    every non-survivor of that chain is an irreversible delete"; the guard is
+    what makes that warning enforceable rather than advisory.
+    """
+
+    @staticmethod
+    def _deny(monkeypatch):
+        """Rig the preflight to refuse, as it would inside an agent sandbox."""
+        def _raise(*_args, **_kwargs):
+            raise _mod.StoreMutationUnavailable('SENTINEL-store-unwritable')
+
+        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', _raise)
+
+    def _raw(self) -> dict:
+        """A real two-member cluster, so ``--apply`` has work to refuse."""
+        return {_PK: [
+            _raw('m1', _VENV_GOTCHA_A, '2026-01-01T00:00:00+00:00'),
+            _raw('m2', _VENV_GOTCHA_B, '2026-01-02T00:00:00+00:00'),
+        ]}
+
+    async def test_apply_never_even_opens_a_client_when_the_store_is_unwritable(
+        self, monkeypatch, tmp_path,
+    ):
+        """The strongest available zero-mutation proof for this script: it
+        cannot delete because it never constructs a MemoryService at all.
+
+        The guard sits ahead of both the config load and the service
+        construction, so a refused --apply also never reaches the
+        ``finally: await memory.close()`` teardown of a service that was never
+        initialized.
+        """
+        self._deny(monkeypatch)
+        _install_run_doubles(monkeypatch, self._raw())
+        args = _build_parser().parse_args([
+            '--project-id', 'p', '--apply', '--threshold', '0.75',
+            '--metrics-root', str(tmp_path),
+        ])
+
+        with pytest.raises(
+            _mod.StoreMutationUnavailable, match='SENTINEL-store-unwritable'
+        ):
+            await _run(args)
+
+        assert _FakeMemoryService.instances == [], (
+            'no MemoryService may be constructed once the preflight has refused'
+        )
+
+    async def test_the_guard_sits_before_the_scan_and_the_ann_fan_out(
+        self, monkeypatch, tmp_path,
+    ):
+        """It aborts without a single Qdrant read: neither ``fetch_memories``'
+        per-category scroll (with_vectors=True) nor ``fetch_ann_neighbors``'
+        per-record query fan-out is paid for."""
+        self._deny(monkeypatch)
+        _install_run_doubles(monkeypatch, self._raw())
+        called: list[str] = []
+        monkeypatch.setattr(
+            _mod, 'fetch_memories',
+            lambda *a, **kw: called.append('fetch_memories'),
+        )
+        monkeypatch.setattr(
+            _mod, 'fetch_ann_neighbors',
+            lambda *a, **kw: called.append('fetch_ann_neighbors'),
+        )
+        args = _build_parser().parse_args([
+            '--project-id', 'p', '--apply', '--threshold', '0.75',
+            '--metrics-root', str(tmp_path),
+        ])
+
+        with pytest.raises(_mod.StoreMutationUnavailable):
+            await _run(args)
+
+        assert called == [], 'the scan must not run once the preflight has refused'
+
+    async def test_a_dry_run_is_never_gated_on_write_capability(
+        self, monkeypatch, tmp_path,
+    ):
+        """A read-only run mutates nothing, so it must not require the ability
+        to mutate -- the audit report stays obtainable from anywhere."""
+        self._deny(monkeypatch)
+        _install_run_doubles(monkeypatch, self._raw())
+        args = _build_parser().parse_args([
+            '--project-id', 'p', '--threshold', '0.75',
+            '--metrics-root', str(tmp_path),
+        ])
+
+        rc = await _run(args)
+
+        assert rc == 0
+        assert _FakeMemoryService.instances[-1].deleted == []
+
+    async def test_apply_is_unchanged_when_the_preflight_passes(
+        self, monkeypatch, tmp_path,
+    ):
+        """Happy path: a writable environment deletes exactly as before."""
+        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', lambda **_kw: None)
+        _install_run_doubles(monkeypatch, self._raw())
+        args = _build_parser().parse_args([
+            '--project-id', 'p', '--apply', '--threshold', '0.75',
+            '--metrics-root', str(tmp_path),
+        ])
+
+        rc = await _run(args)
+
+        assert rc == 0
+        assert _FakeMemoryService.instances[-1].deleted == ['m2'], 'the oldest survives'
+
+    async def test_the_probe_names_the_operation_being_gated(
+        self, monkeypatch, tmp_path,
+    ):
+        """The refusal has to be attributable in a log, so the operation string
+        identifies this script and its mutating mode."""
+        calls: list[dict] = []
+        monkeypatch.setattr(
+            _mod, 'assert_store_mutation_allowed', lambda **kw: calls.append(kw)
+        )
+        _install_run_doubles(monkeypatch, self._raw())
+        args = _build_parser().parse_args([
+            '--project-id', 'p', '--apply', '--threshold', '0.75',
+            '--metrics-root', str(tmp_path),
+        ])
+
+        await _run(args)
+
+        assert len(calls) == 1, 'probed ONCE per run, not once per delete candidate'
+        assert 'audit_duplicate_memories' in calls[0]['operation']
+        assert '--apply' in calls[0]['operation']
+
+    async def test_the_refusal_raises_and_is_never_confusable_with_the_report_shaped_one(
+        self, monkeypatch, tmp_path,
+    ):
+        """``_apply_refusal_reason`` already refuses ``--apply`` on
+        empty-scan/truncation grounds -- but it returns an integer through the
+        NORMAL path, a handled outcome an operator can reasonably read past.
+
+        A write-capability denial is categorically different: proceeding would
+        leave a half-completed, unrecoverable store mutation. So it RAISES
+        rather than degrading into any of this script's ordinary integer
+        returns.
+
+        Rigged with an EMPTY scan -- the exact condition that drives
+        ``_apply_refusal_reason`` to return 1 -- to prove the write-capability
+        refusal wins over, rather than collapsing into, the report-shaped one.
+
+        Scoped to ``_run``: that the raise also survives the trip out through
+        ``main`` is a separate claim, tested in
+        ``TestApplyStoreMutationPreflightThroughMain``.
+        """
+        self._deny(monkeypatch)
+        _install_run_doubles(monkeypatch, {})
+        args = _build_parser().parse_args([
+            '--project-id', 'p', '--apply',
+            '--metrics-root', str(tmp_path),
+        ])
+
+        with pytest.raises(_mod.StoreMutationUnavailable):
+            await _run(args)
+
+        assert _FakeMemoryService.instances == []
+
+
+class TestApplyStoreMutationPreflightThroughMain:
+    """The refusal must survive the trip out through ``main``, not just ``_run``.
+
+    Deliberately a separate, un-``asyncio``-marked class: ``main`` is sync and
+    calls ``asyncio.run`` itself, so it cannot be driven from inside a running
+    loop. Sibling suites (``purge``, ``sweep``, ``prune``) drive ``main`` the
+    same way.
+    """
+
+    @staticmethod
+    def _deny(monkeypatch):
+        """Rig the preflight to refuse, as it would inside an agent sandbox."""
+        def _raise(*_args, **_kwargs):
+            raise _mod.StoreMutationUnavailable('SENTINEL-store-unwritable')
+
+        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', _raise)
+
+    @staticmethod
+    def _fail_closed_records(caplog) -> list:
+        """The guard site's OWN diagnosis.
+
+        ``main`` is three lines with no handler -- the refusal exits the
+        interpreter as an uncaught traceback -- so this ERROR record is the
+        ONLY place the operator is told what was refused and what to do
+        instead. Pinned on the fail-closed marker and the remedy noun ONLY, so
+        every other word of the message stays free to reword.
+
+        Asserting on message CONTENT is deliberate, and is the narrow exception
+        to the repo's don't-pin-guard-message-prose norm (task 3799): the record
+        this test is about is defined BY its content -- mere record-existence
+        would still pass if the whole diagnosis were replaced by "boom",
+        precisely the regression this exists to catch. Verified non-vacuous:
+        mutating the marker in the script turns this assertion red (task 4127
+        amendment).
+        """
+        return [
+            rec for rec in caplog.records
+            if rec.name == 'audit_duplicate_memories'
+            and rec.levelname == 'ERROR'
+            and 'NOT started (fail-closed)' in rec.getMessage()
+            and 'MCP server' in rec.getMessage()
+        ]
+
+    def test_the_refusal_escapes_main_and_is_never_a_report_shaped_return(
+        self, monkeypatch, tmp_path, caplog,
+    ):
+        """``main`` is ``asyncio.run(_run(args))`` with no try/except, and
+        ``_run``'s ordinary outcomes are the integers ``0``/``1`` -- including
+        the ``1`` ``_apply_refusal_reason`` returns for an empty scan.
+
+        So the write-capability refusal must propagate all the way out and exit
+        the interpreter non-zero via an uncaught traceback, never collapsing
+        into either integer on the way. Rigged with the EMPTY scan that drives
+        the report-shaped refusal, so the two are in direct competition.
+
+        ``asyncio.run`` is replaced only to keep the real one reachable; the
+        coroutine really is ``_run(args)`` as ``main`` built it, argv parsing
+        included.
+        """
+        import asyncio  # noqa: PLC0415
+        import sys  # noqa: PLC0415
+
+        self._deny(monkeypatch)
+        _install_run_doubles(monkeypatch, {})
+        monkeypatch.setattr(sys, 'argv', [
+            'audit_duplicate_memories.py', '--project-id', 'p', '--apply',
+            '--metrics-root', str(tmp_path),
+        ])
+        real_asyncio_run = asyncio.run
+        monkeypatch.setattr(
+            _mod.asyncio, 'run', lambda coro, *_a, **_kw: real_asyncio_run(coro),
+        )
+
+        with caplog.at_level('ERROR'), pytest.raises(
+            _mod.StoreMutationUnavailable, match='SENTINEL-store-unwritable'
+        ):
+            _mod.main()
+
+        assert self._fail_closed_records(caplog), (
+            'nothing else explains this traceback -- the guard site must log '
+            'the fail-closed diagnosis before raising; got: '
+            f'{[rec.getMessage() for rec in caplog.records]}'
+        )
+        assert _FakeMemoryService.instances == [], (
+            'the refusal must precede the client, even driven through main'
+        )

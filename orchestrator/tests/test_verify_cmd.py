@@ -28,17 +28,23 @@ from _verify_config_corpus import (
     load_config_scalar,
 )
 
+from orchestrator import verify
 from orchestrator.verify_cmd import (
     _CHAIN_OPERATOR_TOKENS,
     ChainSegment,
     ToolKind,
     VerifyCmd,
+    _has_unspliceable_pytest_invocation,
+    _is_serial_forced,
+    _split_at_unbalanced_close,
+    _unspliceable_pytest_spans,
     apply_pytest_numprocesses,
     cargo_scope,
     describe_dropped_clauses,
     govern_cpu,
     has_unpreserved_chain_clauses,
     parse_config_command,
+    promote_cwd_to_project,
     render,
     reproject,
     scope_to,
@@ -234,11 +240,14 @@ class TestParseConfigCommandUvWrapper:
     def test_uv_run_with_project_and_directory_sets_both(self):
         """--project and --directory can both appear on one `uv run` wrapper.
 
-        Real per-subproject commands (orchestrator.yaml) carry both flags
-        together, e.g. `uv run --project orchestrator --directory
-        orchestrator pyright src/ tests/` — --project selects the venv,
-        --directory shifts cwd. Both must be captured, not just the first
-        one peeled.
+        BACK-COMPAT/ROBUSTNESS coverage, not a mirror of the live configs:
+        task 3830 retired the `--project X --directory X` pairing from every
+        module orchestrator.yaml, which now carries `--directory X` alone.
+        The parser must still capture both, because uv still ACCEPTS the
+        pairing, other projects' configs may still carry it, and a DIFFERING
+        pair (`--project shared --directory scripts`) stays legitimate —
+        --project selects the venv, --directory shifts cwd. Both must be
+        captured, not just the first one peeled.
         """
         cmd = parse_config_command(
             'uv run --project orchestrator --directory orchestrator pyright src/ tests/'
@@ -501,6 +510,113 @@ class TestReproject:
         raw = 'cargo test --workspace && cargo test --workspace'
         cmd = parse_config_command(raw)
         assert reproject(cmd, 'shared') == cmd
+
+
+class TestPromoteCwdToProject:
+    """promote_cwd_to_project(cmd) copies cwd_rel into an EMPTY uv_project.
+
+    ``--directory X`` and ``--project X`` select the same uv project, but
+    ``strip_cwd`` discards only the former — it clears ``cwd_rel`` and
+    deliberately keeps ``uv_project`` ("it selects the venv, independent of
+    cwd"). So a command that expresses its project SOLELY via ``--directory X``
+    loses that selection at scope time and renders as a bare ``uv run <tool>``
+    against the depless workspace root: the 'Failed to spawn: pytest' / exit-127
+    shape of regression ef68777a17 / task 2036. Promoting BEFORE ``strip_cwd``
+    keeps the selection alive (task 3830).
+    """
+
+    def test_promotes_cwd_rel_into_empty_uv_project(self):
+        cmd = parse_config_command('uv run --directory sampler pyright src/ tests/')
+        assert cmd.uv_project == ''
+        assert cmd.cwd_rel == 'sampler'
+        promoted = promote_cwd_to_project(cmd)
+        assert promoted.uv_project == 'sampler'
+        # Promotion ONLY: clearing cwd_rel remains strip_cwd's job, so this
+        # mutator stays composable with (and independent of) it.
+        assert promoted.cwd_rel == 'sampler'
+
+    def test_noop_when_project_already_set(self):
+        """An explicit --project is never second-guessed — reproject's own rule."""
+        cmd = parse_config_command('uv run --project sampler --directory sampler ruff check x')
+        assert promote_cwd_to_project(cmd) == cmd
+
+    def test_noop_when_project_already_set_and_differs_from_directory(self):
+        """A deliberately DIFFERING --project/--directory pair keeps its --project.
+
+        Distinct semantics (run from ``scripts/`` against ``shared``'s
+        project), not the self-defeating same-value pairing task 3830 retires.
+        """
+        cmd = parse_config_command('uv run --project shared --directory scripts ruff check x')
+        assert promote_cwd_to_project(cmd) == cmd
+
+    def test_noop_when_not_uv_wrapped(self):
+        """``cd X && npx pyright`` carries a cwd_rel but no uv context at all.
+
+        ``uv_project is None`` (not uv-wrapped) is distinct from ``''``
+        (uv-wrapped, no explicit --project) — see the tri-state note on
+        ``VerifyCmd.uv_project``. Promoting here would invent a --project for
+        a command that never had a uv wrapper to put it on.
+        """
+        cmd = parse_config_command('cd fused-memory && npx pyright')
+        assert cmd.uv_project is None
+        assert cmd.cwd_rel == 'fused-memory'
+        assert promote_cwd_to_project(cmd) == cmd
+
+    def test_noop_when_no_cwd_set(self):
+        """A bare ``uv run`` has no cwd to promote — that is reproject's case."""
+        cmd = parse_config_command('uv run ruff check x')
+        assert cmd.uv_project == ''
+        assert cmd.cwd_rel is None
+        assert promote_cwd_to_project(cmd) == cmd
+
+    def test_noop_on_opaque(self):
+        cmd = parse_config_command('mypy src/')
+        assert promote_cwd_to_project(cmd) == cmd
+
+    def test_noop_on_raw_retained_chain(self):
+        raw = 'cargo test --workspace && cargo test --workspace'
+        cmd = parse_config_command(raw)
+        assert promote_cwd_to_project(cmd) == cmd
+
+    def test_idempotent(self):
+        cmd = parse_config_command('uv run --directory sampler pyright src/')
+        once = promote_cwd_to_project(cmd)
+        twice = promote_cwd_to_project(once)
+        assert twice == once
+
+
+class TestScopedRenderKeepsDirectoryOnlyProject:
+    """A ``--directory``-only module command must not scope to a BARE ``uv run``.
+
+    The integration hazard task 3830 closes: retiring the self-defeating
+    ``--project X --directory X`` pairing from every module orchestrator.yaml
+    leaves the project expressed solely as ``--directory X``, which
+    ``strip_cwd`` discards. Without the promotion these render project-less at
+    the depless workspace root, where ruff/pyright/pytest are not installed.
+    """
+
+    _FILES = ['sampler/src/a.py']
+    _EXPECTED = 'uv run --project sampler pyright sampler/src/a.py'
+
+    def test_directory_only_command_keeps_its_project(self):
+        scoped = verify._scope_to_keyword(
+            'uv run --directory sampler pyright src/ tests/', 'pyright', self._FILES
+        )
+        assert scoped == self._EXPECTED
+
+    def test_paired_command_scopes_to_the_same_string(self):
+        """Scoped-render EQUIVALENCE: dropping ``--project X`` costs nothing.
+
+        The old paired shape and the new ``--directory``-only shape must scope
+        to the identical string, which is what makes the orchestrator.yaml
+        change render-preserving rather than merely non-fatal.
+        """
+        scoped = verify._scope_to_keyword(
+            'uv run --project sampler --directory sampler pyright src/ tests/',
+            'pyright',
+            self._FILES,
+        )
+        assert scoped == self._EXPECTED
 
 
 class TestCargoScopeStructured:
@@ -857,6 +973,83 @@ _PAREN_PRESERVING_PARAMS = [
     for case_label, raw, template in _PAREN_PRESERVING_CASES
 ]
 
+# (case_label, raw, corrupt_prefix) — task 4121. Every `raw` here is a
+# raw-retained pytest chain (`cmd.raw is not None`, asserted per case rather
+# than assumed) whose `_PYTEST_INVOCATION_RE` span ends INSIDE an unclosed
+# quote, because the regex is quote-blind and stops at the first `&&`/`|`/`;`
+# it sees — even one that lives inside a quoted `-k`/`--deselect` argument.
+#
+# `corrupt_prefix` is the MEASURED truncated span (rstripped), i.e. the text
+# the appender splices onto today. `corrupt_prefix + suffix` therefore
+# reconstructs the exact corrupt substring each mutator produces at baseline
+# (measured: `pytest -k 'a -p no:xdist -o addopts=''` /  `pytest -k 'a -n 4`),
+# which is what makes the negative assertion below name the real defect
+# instead of a generic "flags appeared somewhere".
+_UNTERMINATED_SPAN_CASES = [
+    ('quoted-and-single', "pytest -k 'a && b' tests/ && true", "pytest -k 'a"),
+    ('quoted-and-double', 'pytest -k "a && b" tests/ && true', 'pytest -k "a'),
+    ('quoted-pipe', "pytest -k 'a | b' tests/ && true", "pytest -k 'a"),
+    ('quoted-semicolon', "pytest --deselect 'x;y' tests/ && true", "pytest --deselect 'x"),
+    ('uv-run-prefix', "uv run pytest -k 'a && b' tests/ && true", "pytest -k 'a"),
+    ('inside-subshell', "( cd x && pytest -k 'a && b' tests/ )", "pytest -k 'a"),
+    ('two-invocations', "pytest -k 'a && b' t1/ && pytest t2/", "pytest -k 'a"),
+]
+
+_UNTERMINATED_SPAN_PARAMS = [
+    pytest.param(
+        mutate,
+        raw,
+        f'{corrupt_prefix}{suffix}',
+        id=f'{mutator_label}-{case_label}',
+    )
+    for mutator_label, mutate, suffix in _SUBSHELL_MUTATORS
+    for case_label, raw, corrupt_prefix in _UNTERMINATED_SPAN_CASES
+]
+
+# (case_label, raw, expected_template) — task 4121 amendment, the OTHER
+# direction of the same quote-blindness. `_PYTEST_INVOCATION_RE` also matches
+# the word `pytest` sitting inside ANOTHER command's quoted argument, and such
+# a match is "unterminated" purely because it began mid-string. Measured spans:
+#
+#   'pytest tests/ && echo "pytest done"'
+#     -> ['pytest tests/ ', 'pytest done"']     (2nd starts INSIDE echo's quotes)
+#
+# These chains' REAL invocation is a perfectly clean, spliceable span, so
+# refusing here would disable serial recovery (and the `-n` cap, which refuses
+# identically) for a command that never had the defect. `{suffix}` is
+# substituted per mutator, exactly as `_PAREN_PRESERVING_CASES` does; the
+# quoted `pytest` word must come back BYTE-identical, which also pins that the
+# appender no longer appends junk args to the unrelated `echo` (the pre-4121
+# collateral damage).
+_FALSE_MATCH_CASES = [
+    (
+        'quoted-pytest-word-after',
+        'pytest tests/ && echo "pytest done"',
+        'pytest tests/{suffix} && echo "pytest done"',
+    ),
+    (
+        'quoted-pytest-word-before',
+        'echo "running pytest" && pytest tests/',
+        'echo "running pytest" && pytest tests/{suffix}',
+    ),
+    (
+        'quoted-pytest-word-mid-chain',
+        'pytest tests/ && echo "all pytest suites ok" && ruff check src/',
+        'pytest tests/{suffix} && echo "all pytest suites ok" && ruff check src/',
+    ),
+]
+
+_FALSE_MATCH_PARAMS = [
+    pytest.param(
+        mutate,
+        raw,
+        template.format(suffix=suffix),
+        id=f'{mutator_label}-{case_label}',
+    )
+    for mutator_label, mutate, suffix in _SUBSHELL_MUTATORS
+    for case_label, raw, template in _FALSE_MATCH_CASES
+]
+
 
 class TestSubshellClauseIntegrity:
     """A mutator that appends flags to a raw-retained pytest chain must place
@@ -987,6 +1180,221 @@ class TestSubshellClauseIntegrity:
         result = render(mutate(cmd))
         _assert_bash_parses(result, what=raw)
         assert result == expected
+
+
+class TestUnterminatedQuoteRefusesFlagSplicing:
+    """A raw-chain mutator must REFUSE outright when a matched pytest span ends
+
+    inside an unclosed quote — never splice the recovery flags in there.
+    Task 4121, recovered from task 3650's review (see task 4023).
+
+    Reproduction, measured at main tip ``eec91ee995``::
+
+        parse_config_command("pytest -k 'a && b' tests/ && true")  # raw retained
+        render(serial_pytest(...))
+          == "pytest -k 'a -p no:xdist -o addopts='' && b' tests/ && true"
+        render(apply_pytest_numprocesses(..., '4'))
+          == "pytest -k 'a -n 4 && b' tests/ && true"
+
+    Cause: ``_PYTEST_INVOCATION_RE`` is quote-BLIND, so it stops at the ``&&``
+    that lives INSIDE the ``-k`` quotes and the matched span ends mid-quote;
+    ``_split_at_unbalanced_close`` was handed that span and DISCARDED the
+    ``unterminated`` flag (``chars, _unterminated = ...``), so the suffix went
+    on the end of ``body`` — inside the live quote. The corrupted command
+    still passes ``bash -n``, i.e. a SILENT wrong-tests-run. The full rule and
+    its measurements live in ``verify_cmd._unspliceable_pytest_spans``; this
+    class is the executable pin on it, and deliberately does not restate it.
+    """
+
+    @pytest.mark.parametrize(('mutate', 'raw', 'corrupt_marker'), _UNTERMINATED_SPAN_PARAMS)
+    def test_no_flags_are_spliced_into_an_unterminated_quote(self, mutate, raw, corrupt_marker):
+        cmd = parse_config_command(raw)
+        assert cmd.tool is ToolKind.PYTEST
+        # Else the regex/raw-chain appender this task changes isn't exercised.
+        assert cmd.raw is not None
+
+        result = render(mutate(cmd))
+        # Named first so a regression reports the actual corrupt shape rather
+        # than a whole-string diff, and so a future fix that merely RELOCATES
+        # the splice (rather than refusing) still fails loudly here.
+        assert corrupt_marker not in result, (
+            f'recovery flags spliced into an unterminated quote: {result!r}'
+        )
+        # Byte-identical refusal: the original command is re-run unchanged.
+        assert result == raw
+        _assert_bash_parses(result, what=raw)
+
+    @pytest.mark.parametrize(
+        ('label', 'mutate'),
+        [(label, mutate) for label, mutate, _suffix in _SUBSHELL_MUTATORS],
+        ids=[label for label, _mutate, _suffix in _SUBSHELL_MUTATORS],
+    )
+    def test_a_refused_chain_leaves_every_invocation_alone(self, label, mutate):
+        """Refusal is WHOLE-STRING, not per-span.
+
+        On ``pytest -k 'a && b' t1/ && pytest t2/`` the regex yields two spans
+        with unterminated flags ``[True, False]``: the corrupt
+        ``"pytest -k 'a "`` and a perfectly clean ``'pytest t2/'``. Refusing
+        only the offending span would flag invocation 2 and not invocation 1 —
+        a half-serial chain that ``_is_serial_forced`` still reports as fully
+        serial, which then suppresses a later ``-n`` injection on a command
+        that is not actually serial. So the clean invocation must be left
+        alone too.
+        """
+        raw = "pytest -k 'a && b' t1/ && pytest t2/"
+        cmd = parse_config_command(raw)
+        assert cmd.raw is not None
+
+        result = render(mutate(cmd))
+        assert result == raw, f'{label}: the well-formed `pytest t2/` was rewritten: {result!r}'
+
+    @pytest.mark.parametrize(
+        'raw', [case[1] for case in _UNTERMINATED_SPAN_CASES], ids=[c[0] for c in _UNTERMINATED_SPAN_CASES]
+    )
+    def test_a_refused_serial_rewrite_is_not_reported_as_serial(self, raw):
+        """The second-order hazard: a refused command must not LOOK serial.
+
+        ``_is_serial_forced`` tests ``'no:xdist' in cmd.raw``. At baseline the
+        corrupt rewrite puts that substring inside the ``-k`` quotes, where
+        pytest never sees it as a flag — measured True for all seven cases.
+        ``apply_pytest_numprocesses`` consults exactly this predicate to stay
+        a no-op on already-serial commands, so a falsely-serial command also
+        silently loses its ``-n`` cap.
+        """
+        cmd = parse_config_command(raw)
+        assert cmd.raw is not None
+        assert _is_serial_forced(serial_pytest(cmd)) is False
+
+    def test_split_refuses_a_span_that_ends_mid_quote(self):
+        """The unit-level pin on the discarded flag itself.
+
+        ``None`` means refuse — the convention ``_scan_and_chain(strict=True)``
+        already uses for this same ``unterminated`` flag.
+        """
+        assert _split_at_unbalanced_close("pytest -k 'a ") is None
+
+    @pytest.mark.parametrize(
+        ('segment', 'expected'),
+        [
+            ('pytest -k "a)" tests/ ', ('pytest -k "a)" tests/ ', '')),
+            ('pytest tests/ )', ('pytest tests/ ', ')')),
+        ],
+        ids=['quoted-close-paren', 'subshell-closer'],
+    )
+    def test_split_still_returns_two_tuples_for_balanced_spans(self, segment, expected):
+        """The refusal must not swallow the existing split contract."""
+        assert _split_at_unbalanced_close(segment) == expected
+
+    @pytest.mark.parametrize(
+        'raw',
+        [
+            ROOT_TEST_COMMAND,
+            *[case[1] for case in _PAREN_PRESERVING_CASES],
+        ],
+        ids=['ROOT_TEST_COMMAND', *[case[0] for case in _PAREN_PRESERVING_CASES]],
+    )
+    def test_the_green_corpus_is_not_newly_refused(self, raw):
+        """The over-refusal guard, and the reason it reads the live YAML below.
+
+        A refusal that fires too widely silently disables serial recovery
+        fleet-wide — the same class of silent capability loss this task is
+        fixing, just in the other direction. Every command here was measured
+        to produce ZERO unterminated spans, so none of them may change
+        behaviour: notably ``-k "a)"`` and ``-k "foo("`` from
+        ``_PAREN_PRESERVING_CASES``, whose quotes ARE closed.
+        """
+        assert _has_unspliceable_pytest_invocation(raw) is False
+
+    @pytest.mark.parametrize(('mutate', 'raw', 'expected'), _FALSE_MATCH_PARAMS)
+    def test_a_quoted_pytest_word_elsewhere_does_not_refuse_the_real_invocation(
+        self, mutate, raw, expected
+    ):
+        """The other direction of the same quote-blindness — the over-refusal guard.
+
+        ``_PYTEST_INVOCATION_RE`` matches the word ``pytest`` inside another
+        command's quoted argument too, and such a span is "unterminated" only
+        because the match began mid-string. Treating it as an unspliceable
+        INVOCATION would refuse a chain whose real invocation is a clean,
+        spliceable span — silently disabling serial recovery and the ``-n``
+        cap for a command that never had the defect (the first cut of this
+        task did exactly that; see ``_pytest_invocation_spans``).
+
+        Asserts both halves: the real invocation DOES get its flags, and the
+        quoted ``pytest`` word comes back BYTE-identical — which also pins
+        that the appender no longer appends junk arguments to the unrelated
+        ``echo``, the collateral damage of the pre-refusal behaviour.
+        """
+        cmd = parse_config_command(raw)
+        assert cmd.tool is ToolKind.PYTEST
+        assert cmd.raw is not None
+        assert _unspliceable_pytest_spans(raw) == []
+
+        result = render(mutate(cmd))
+        assert result == expected
+        _assert_bash_parses(result, what=raw)
+
+    def test_the_live_fleet_test_command_is_not_newly_refused(self):
+        """Read from the committed YAML, not a hand-copied literal.
+
+        A future config edit that would newly trip the refusal (and so
+        silently disable serial recovery for the whole fleet) must fail this
+        suite rather than drift past it — the same drift-gate rationale
+        ``_verify_config_corpus`` exists for.
+        """
+        assert (
+            _has_unspliceable_pytest_invocation(load_config_scalar(DF_CONFIG_PATH, 'test_command'))
+            is False
+        )
+
+    @pytest.mark.parametrize(('mutate', 'raw', '_corrupt_marker'), _UNTERMINATED_SPAN_PARAMS)
+    def test_a_refused_rewrite_returns_the_callers_own_command(self, mutate, raw, _corrupt_marker):
+        """IDENTITY, not equality — and why equality cannot pin this.
+
+        The mutators still reach ``replace(cmd, raw=...)`` on the raw branch,
+        and ``_append_to_raw_pytest_invocations`` returns *raw* unchanged on
+        refusal, so an ``==`` version of this assertion passes with the
+        identity guard entirely absent: ``replace`` yields an
+        equal-but-DISTINCT object.
+
+        Identity is what makes verify.py's existing ``if rewritten is parsed:
+        return cmd`` guard fire — ``_serial_pytest_str`` and
+        ``_with_pytest_numprocesses_str`` both hold one — and that guard is
+        the only thing keeping the returned command BYTE-identical rather
+        than a from-scratch ``render()`` re-render, which is merely
+        argv-equivalent. Same rationale ``_with_junitxml_str``'s
+        ``test_noop_is_byte_identical`` records for its own ``is`` assertion.
+
+        Parametrized off ``_UNTERMINATED_SPAN_PARAMS`` — the SAME list the
+        splice test above uses, ignoring only its ``corrupt_marker`` column —
+        rather than re-deriving the mutator x case cross-product inline: two
+        hand-built lists over one corpus are free to drift in ids or filtering
+        while both still look exhaustive.
+        """
+        cmd = parse_config_command(raw)
+        assert cmd.raw is not None
+        assert mutate(cmd) is cmd
+
+    @pytest.mark.parametrize(
+        ('mutate', 'suffix'),
+        [
+            pytest.param(mutate, suffix, id=label)
+            for label, mutate, suffix in _SUBSHELL_MUTATORS
+        ],
+    )
+    def test_the_identity_noop_does_not_over_fire(self, mutate, suffix):
+        """A lazy ``return cmd`` in every raw branch must NOT pass.
+
+        ``_PAREN_PRESERVING_CASES``' keyword-expression row is a raw-retained
+        chain measured to produce ZERO unterminated spans, so it must still
+        be rewritten — a new object, with the flags actually present.
+        """
+        raw = 'pytest -k "not (slow or integration)" tests/ && true'
+        cmd = parse_config_command(raw)
+        assert cmd.raw is not None
+
+        result = mutate(cmd)
+        assert result is not cmd
+        assert render(result) == f'pytest -k "not (slow or integration)" tests/{suffix} && true'
 
 
 class TestSeparateTokenValueFlagBinding:
@@ -1404,16 +1812,19 @@ class TestSplitChainTail:
         assert prefix + tail == raw
 
     def test_accepts_fused_memory_lint_chain_and_preserves_both_checkers(self):
-        """The task's headline case: fused-memory/orchestrator.yaml:11.
+        """The task's headline case: fused-memory/orchestrator.yaml::lint_command.
 
         The ruff clause is segment 0 (the caller will scope it); both
         `python3 .../check_*.py` sibling clauses live in the preserved tail,
         byte-identical to their slice of the config string.
+
+        Labelled by yaml KEY, not line number — the old `:11` label is the
+        rot `_verify_config_corpus.py`'s own provenance convention exists to
+        avoid, and FM_LINT_COMMAND is pinned against the live yaml by
+        `test_verify_config_corpus.py` anyway.
         """
         prefix, tail = split_chain_tail(FM_LINT_COMMAND, 'ruff check')
-        assert prefix == (
-            'uv run --project fused-memory --directory fused-memory ruff check src/ tests/ '
-        )
+        assert prefix == ('uv run --directory fused-memory ruff check src/ tests/ ')
         assert tail == (
             '&& python3 fused-memory/scripts/check_bare_magicmock_config.py fused-memory/tests'
             ' && python3 fused-memory/scripts/check_asyncmock_assertion_style.py fused-memory/tests'

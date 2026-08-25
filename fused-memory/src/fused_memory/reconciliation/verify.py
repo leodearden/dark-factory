@@ -12,6 +12,26 @@ from fused_memory.reconciliation.agent_loop import AgentLoop, ToolDefinition
 
 logger = logging.getLogger(__name__)
 
+# Upper bound on a stored failure token.  Real tokens are ~20 chars; anything
+# longer is not a token an operator can GROUP BY, so it is truncated rather
+# than allowed to bloat the audit row's detail JSON.
+_MAX_FAILURE_TOKEN_LEN = 64
+
+
+def _as_failure_token(value: object) -> str:
+    """Coerce an AgentLoop warning value into a storable failure token.
+
+    Returns '' for anything that is not a non-empty string, so a malformed
+    payload degrades to the next candidate in the preference chain (and
+    ultimately to 'verify_failed') instead of raising ValidationError out of
+    ``VerificationResult`` — which would erase the diagnosis into a generic
+    error row (task 4343).
+    """
+    if not isinstance(value, str):
+        return ''
+    return value.strip()[:_MAX_FAILURE_TOKEN_LEN]
+
+
 EXPLORE_AGENT_SYSTEM_PROMPT = """\
 You are a Codebase Explorer agent. Your job is to verify factual claims against the actual \
 codebase. You are strictly read-only and have no access to memory systems or task systems.
@@ -286,10 +306,44 @@ Investigate this claim against the codebase and call `verification_complete` wit
             error_summary='verify_failed',
         )
         raw = verdict.raw or {}
+        # Task 4343: stop discarding AgentVerdict.failed.  The 'agent-failed:'
+        # prefix that task 1811 put in `summary` is human-facing prose; the
+        # structured fields below are what downstream consumers branch on.
+        #
+        # Preference chain — warning_origin > warning > 'verify_failed':
+        #   * `warning_origin` is the ACTIONABLE diagnosis.  'cli_output_empty'
+        #     (the CLI returned nothing) and 'cli_output_unparseable' (the CLI
+        #     returned junk) call for different operator responses, so the
+        #     specific one wins when AgentLoop.run() supplies it.
+        #   * `warning` is the generic bucket the loop reports for every
+        #     no-tool-call exit; it is the fallback, never blanked.
+        #   * 'verify_failed' must stay in sync with the error_summary=
+        #     'verify_failed' argument passed to extract_agent_verdict just
+        #     above — rename them together or the two silently split.  `raw`
+        #     is {} when the loop returned None/a non-dict, so that shape
+        #     naturally lands here.
+        #
+        # Each candidate goes through _as_failure_token: this is the pydantic
+        # construction boundary, and a non-str under either key would raise
+        # ValidationError below — surfacing as a generic 'error' audit row,
+        # i.e. losing exactly the diagnosis this code exists to preserve.
+        # AgentLoop.run() already gates `warning_origin` on its closed
+        # CLI_WARNING_ORIGINS vocabulary; this is the independent guard at the
+        # consuming end, so a future producer cannot widen the column by
+        # accident.
+        token = ''
+        if verdict.failed:
+            token = (
+                _as_failure_token(raw.get('warning_origin'))
+                or _as_failure_token(raw.get('warning'))
+                or 'verify_failed'
+            )
         return VerificationResult(
             verdict=VerificationVerdict(verdict.verdict),
             confidence=raw.get('confidence', 0.0),
             evidence=raw.get('evidence', []),
             summary=verdict.summary,
             git_context=raw.get('git_context'),
+            agent_failed=verdict.failed,
+            failure_token=token,
         )

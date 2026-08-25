@@ -37,38 +37,21 @@ escaped.
 
 from __future__ import annotations
 
-import importlib.util
+import asyncio
 import json
 import sys
-import types
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from _fm_helpers import load_script_module
 
 from fused_memory.models import SourceStore
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'sweep_toolcall_xml_leak.py'
 
-
-def _load_module() -> types.ModuleType:
-    """Load sweep_toolcall_xml_leak.py from its file path."""
-    mod_name = 'sweep_toolcall_xml_leak'
-    spec = importlib.util.spec_from_file_location(mod_name, SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module
-    try:
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
-
-
-_mod = _load_module()
+_mod = load_script_module(SCRIPT_PATH, mod_name='sweep_toolcall_xml_leak')
 
 _BODY = 'The merge worker consumes the stash stack in project_root.'
 
@@ -284,18 +267,67 @@ class TestResolveExitCode:
         success would make a silently partial sweep look complete."""
         assert _mod.resolve_exit_code(self._report(dry_run=False, truncated=True)) != 0
 
-    @pytest.mark.parametrize('flag', [
-        'content_lost_in_flight',
-        'skipped_not_mem0_routed',
-        'skipped_metadata_would_be_rejected',
-        'record_error',
-    ])
+    # Sourced from the script's own export, not re-typed, so this parametrize
+    # set cannot silently drift from what resolve_exit_code() actually acts on
+    # (task 3738; see also test_toolcall_xml_leak_sweep_artifacts.py's
+    # TestDangerFlagsBindTheProductionVocabulary, which binds the same constant).
+    @pytest.mark.parametrize('flag', _mod.HUMAN_ADJUDICATION_FLAGS)
     def test_every_per_record_failure_flag_exits_non_zero(self, flag):
         """Each of these leaves a record a human still has to adjudicate, so
         none of them may be reported as a clean sweep."""
         report = self._report(dry_run=False, records=[{'id': 'x', flag: True}])
 
         assert _mod.resolve_exit_code(report) != 0
+
+    # The parametrize above pins the CONSUMERS of HUMAN_ADJUDICATION_FLAGS; the
+    # pair below pins the PRODUCER — that resolve_exit_code() actually iterates
+    # the shared constant instead of keeping a private inline copy of the same
+    # four names. Without this, a regression that declared the constant but
+    # reverted the predicate to a hand-inlined or-chain would stay green,
+    # reinstating the very drift hazard task 3738 exists to remove.
+    #
+    # A monkeypatched synthetic fifth name is the probe rather than an
+    # inspect.getsource tripwire: the constant is looked up in module globals at
+    # call time, inside the function body, so patching the module attribute is a
+    # genuine RUNTIME observation of what the predicate reads. (Source-reading
+    # tripwires were deliberately removed from this suite as brittle —
+    # da8e5a4c96; see test_tool_errors.py, test_stages.py, test_mem0_tombstone.py,
+    # test_bulk_reset_guard.py.)
+    _SYNTHETIC_FLAG = 'synthetic_fifth_outcome'
+
+    def test_resolve_exit_code_reads_the_shared_flag_constant(self, monkeypatch):
+        """Grow HUMAN_ADJUDICATION_FLAGS by one name and the predicate must
+        honour it immediately.
+
+        An implementation that iterates the constant picks the new name up for
+        free; a hand-inlined or-chain ignores it and returns 0, which is exactly
+        the silent-green failure this test exists to catch."""
+        monkeypatch.setattr(
+            _mod,
+            'HUMAN_ADJUDICATION_FLAGS',
+            (*_mod.HUMAN_ADJUDICATION_FLAGS, self._SYNTHETIC_FLAG),
+        )
+        report = self._report(
+            dry_run=False, records=[{'id': 'x', self._SYNTHETIC_FLAG: True}]
+        )
+
+        assert _mod.resolve_exit_code(report) != 0
+
+    def test_an_unlisted_record_key_does_not_by_itself_fail_the_sweep(self):
+        """Negative control for the test above, and the reason it MEASURES the
+        constant.
+
+        With HUMAN_ADJUDICATION_FLAGS unpatched, the identical report exits 0 —
+        so the non-zero exit there came from the patched vocabulary and not from
+        a catch-all that treats any truthy record key as danger. Records legally
+        carry plenty of unrelated truthy keys (``repaired``, ``id``, ...), and
+        none of them is a human-adjudication outcome."""
+        assert self._SYNTHETIC_FLAG not in _mod.HUMAN_ADJUDICATION_FLAGS
+        report = self._report(
+            dry_run=False, records=[{'id': 'x', self._SYNTHETIC_FLAG: True}]
+        )
+
+        assert _mod.resolve_exit_code(report) == 0
 
 
 class TestBuildParser:
@@ -427,6 +459,26 @@ def _args(**overrides):
 
 def _record_for(report: dict, memory_id: str) -> dict:
     return next(r for r in report['records'] if r['id'] == memory_id)
+
+
+@pytest.fixture(autouse=True)
+def _neutralise_store_mutation_preflight(monkeypatch):
+    """Keep this MOCK-unit suite independent of the REAL ``~/.mem0``.
+
+    ``run(..., apply=True)`` now runs a fail-closed capability preflight before
+    it scans (task 3686). That probe touches the real filesystem, so without
+    this fixture every ``--apply`` test would pass or fail according to whether
+    the machine running pytest happens to be able to write mem0's history
+    directory — and it genuinely cannot inside an agent sandbox, which is the
+    whole reason the guard exists. This suite is deliberately MOCK-unit (an
+    AsyncMock service, no live Qdrant), so the environment must not be an
+    input to it.
+
+    ``TestRunApplyStoreMutationPreflight`` re-rigs this per test — to refuse,
+    to record, or to pass — so the guard's own behaviour is still pinned
+    explicitly rather than assumed away.
+    """
+    monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', lambda **_kw: None)
 
 
 class TestRunDiscovery:
@@ -1088,6 +1140,140 @@ class TestRunApplyPreflightMetadataGuard:
         assert record['classification'] == 'repairable_tail'
         assert 'skipped_metadata_would_be_rejected' not in record
         assert _mod.resolve_exit_code(report) == 0
+
+
+class TestRunApplyStoreMutationPreflight:
+    """``--apply`` refuses to START when this process cannot write mem0's store.
+
+    The measured incident this guard exists for: this sweep was run under
+    ``--apply`` from a sandboxed agent session. Its repair is delete-then-re-add
+    and the two halves live on different substrates -- the Qdrant delete is a
+    NETWORK call to localhost:6333 (landlock governs the filesystem only, so it
+    succeeded) while mem0's history write is SQLite under ``~/.mem0`` (denied).
+    Memory 7d073281 was removed and never came back.
+
+    Refusing before the first mutation is the only safe response, because
+    ``_repair_record`` calls ``delete_memory`` OUTSIDE any try and mem0's
+    ``_delete_memory`` removes the Qdrant point BEFORE writing history: once a
+    repair starts in a write-denied environment the point is already gone. A
+    per-record probe would detect a fleet-wide condition one record too late.
+    """
+
+    @staticmethod
+    def _deny(monkeypatch):
+        """Rig the preflight to refuse, as it would inside an agent sandbox."""
+        def _raise(*_args, **_kwargs):
+            raise _mod.StoreMutationUnavailable('SENTINEL-store-unwritable')
+
+        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', _raise)
+
+    @pytest.mark.asyncio
+    async def test_apply_performs_zero_mutations_when_the_store_is_unwritable(
+        self, monkeypatch
+    ):
+        """The whole point: refuse to start rather than half-complete."""
+        self._deny(monkeypatch)
+        service = _service([_match('r', _TAIL_LEAK)])
+
+        with pytest.raises(_mod.StoreMutationUnavailable, match='SENTINEL-store-unwritable'):
+            await _mod.run(_args(apply=True), service)
+
+        service.delete_memory.assert_not_awaited()
+        service.add_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_guard_sits_before_the_scan_not_before_the_first_repair(
+        self, monkeypatch
+    ):
+        """It aborts without even scanning -- one probe per run, not per record,
+        and no wasted pagination over a corpus it was never going to repair."""
+        self._deny(monkeypatch)
+        service = _service([_match('r', _TAIL_LEAK)])
+
+        with pytest.raises(_mod.StoreMutationUnavailable):
+            await _mod.run(_args(apply=True), service)
+
+        service.scan_memory_content.assert_not_awaited()
+
+    def test_the_refusal_is_loud_and_reaches_mains_fatal_abort_path(
+        self, monkeypatch, capsys
+    ):
+        """Pinned surfacing: the exception PROPAGATES out of ``run``, so ``main``
+        catches it, prints the partial report with ``aborted: true``, and exits
+        2. A silent zero-exit refusal is the exact failure mode this task
+        exists to prevent, so the non-zero outcome is asserted end-to-end.
+
+        Sync, not async: ``main`` calls ``asyncio.run`` itself. Drives ``main``
+        with ``TestMainEmitsThePartialReport``'s idiom -- pin ``new_progress``
+        to reach main's container, and replace ``asyncio.run`` so ``_run_live``
+        never constructs a real MemoryService.
+        """
+        self._deny(monkeypatch)
+        service = _service([_match('r', _TAIL_LEAK)])
+        monkeypatch.setattr(sys, 'argv', ['sweep_toolcall_xml_leak.py', '--apply'])
+        progress = _mod.new_progress()
+        monkeypatch.setattr(_mod, 'new_progress', lambda: progress)
+        real_asyncio_run = asyncio.run
+
+        def _drive(coro):
+            coro.close()  # never construct the live MemoryService
+            return real_asyncio_run(_mod.run(_args(apply=True), service, progress))
+
+        monkeypatch.setattr(_mod.asyncio, 'run', _drive)
+
+        exit_code = _mod.main()
+
+        assert exit_code == 2
+        report = json.loads(capsys.readouterr().out)
+        assert report['aborted'] is True
+        service.delete_memory.assert_not_awaited()
+        service.add_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_dry_run_is_never_gated_on_write_capability(self, monkeypatch):
+        """A read-only run mutates nothing, so it must not require the ability to
+        mutate. Gating it would break the module's core promise -- that the
+        classification report can always be obtained safely, from anywhere.
+        """
+        self._deny(monkeypatch)
+        service = _service([_match('r', _TAIL_LEAK)])
+
+        report = await _mod.run(_args(), service)
+
+        assert report['dry_run'] is True
+        assert _record_for(report, 'r')['classification'] == 'repairable_tail'
+        service.scan_memory_content.assert_awaited_once()
+        service.delete_memory.assert_not_awaited()
+        assert _mod.resolve_exit_code(report) == 0
+
+    @pytest.mark.asyncio
+    async def test_apply_is_unchanged_when_the_preflight_passes(self, monkeypatch):
+        """Happy path: a writable environment repairs exactly as before."""
+        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', lambda **_kw: None)
+        service = _service([_match('r', _TAIL_LEAK)])
+
+        report = await _mod.run(_args(apply=True), service)
+
+        service.delete_memory.assert_awaited_once()
+        service.add_memory.assert_awaited_once()
+        assert _record_for(report, 'r')['repaired'] is True
+        assert _mod.resolve_exit_code(report) == 0
+
+    @pytest.mark.asyncio
+    async def test_the_probe_names_the_operation_being_gated(self, monkeypatch):
+        """The refusal has to be attributable in a log, so the operation string
+        identifies this script and its mutating mode."""
+        calls: list[dict] = []
+        monkeypatch.setattr(
+            _mod, 'assert_store_mutation_allowed', lambda **kw: calls.append(kw)
+        )
+        service = _service([_match('r', _TAIL_LEAK)])
+
+        await _mod.run(_args(apply=True), service)
+
+        assert len(calls) == 1, 'probed ONCE per run, not once per record'
+        assert 'sweep_toolcall_xml_leak' in calls[0]['operation']
+        assert '--apply' in calls[0]['operation']
 
 
 class TestCarriedMetadata:

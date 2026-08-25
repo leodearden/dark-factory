@@ -16,9 +16,10 @@ sibling of digest.py/codebook.py — deliberately does NOT import the
 heavyweight async ``shared.cli_invoke`` machinery (usage gates, cost
 stores, cap-retry, transcript watchdogs). The real LLM call lives behind
 exactly one swappable seam, the module-level ``_invoke_cli``, which every
-public function accepts as an ``invoke`` override — the LLM is ALWAYS
-mocked in this module's own test suite; no test ever shells out to a real
-model.
+public function accepts as an ``invoke`` override. What no test ever does
+is spawn a REAL model — but the seam ITSELF is exercised, so "the LLM is
+always mocked" is not the same claim as "``_invoke_cli`` never runs": see
+its own docstring for which tests reach it and how they stay free.
 
 Never-fabricate contract (codebook lesson ``one-shot-subagent-contract`` —
 the fail-soft fallback that hid a total outage): a CLI-invocation error,
@@ -30,11 +31,20 @@ batch whose failure fraction STRICTLY exceeds 50% (failed/total > 0.5) is a
 run-level FAILURE: the CLI then writes ZERO coding records and exits
 non-zero. This module never escalates and never writes the codebook —
 that is epsilon/gamma's job.
+
+SKIPPED + COUNTED NOW ALSO MEANS ANNOUNCED (task 4511): every per-digest
+failure is logged at WARNING on ``legibility.coder`` as it happens, naming
+the session and the reason. Counting alone was not enough, because the
+count only ever reaches a human through epsilon's storm escalation — and a
+SUB-storm batch (failed/total <= 0.5) is ``status="ok"``, so those failures
+previously reached no sink whatsoever. Escalation is still not this
+module's job; a journal line is not an escalation.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import re
 import subprocess
@@ -42,9 +52,10 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+import codebook as codebook_mod
 import yaml
 
-import codebook as codebook_mod
+logger = logging.getLogger("legibility.coder")
 
 
 class CoderParseError(Exception):
@@ -273,10 +284,24 @@ def _invoke_cli(
     once, delivering *prompt* via stdin, and return its raw stdout.
 
     This is the ONE real-subprocess boundary in this module -- every
-    public function accepts an ``invoke`` override (this module's own
-    test suite always injects a fake one; no test ever reaches this
-    function). *claude_bin* resolves, in order: the explicit argument,
+    public function accepts an ``invoke`` override, and most tests inject
+    a fake one. *claude_bin* resolves, in order: the explicit argument,
     the ``LEGIBILITY_CLAUDE_BIN`` env var, else the bare ``"claude"``.
+
+    THIS FUNCTION IS ITSELF UNDER TEST -- it is no longer true that "no
+    test ever reaches it", and the resolution order above is exactly what
+    keeps those tests free. Two suites reach it, from two modules:
+    test_legibility_coder.py points *claude_bin* / ``LEGIBILITY_CLAUDE_BIN``
+    at a FAKE ``claude`` script it writes itself (task 4510, argv/stdin
+    delivery, non-zero exit, timeout, and the env-var branch), and
+    test_legibility_nightly.py replays the 2026-08-18 ENOENT incident end
+    to end by pointing ``LEGIBILITY_CLAUDE_BIN`` at a NONEXISTENT path and
+    running ``run_nightly`` with no ``invoke=`` override at all (task
+    4511). Both scrub PATH of any real ``claude`` first and assert
+    ``shutil.which("claude") is None``, because the bare-name fallback at
+    the end of the chain would otherwise turn a regression in the env-var
+    lookup into genuine, billable model calls inside a unit test. Preserve
+    that assertion if you touch the resolution order.
 
     *cwd*, when given, is the directory the headless CLI process RUNS IN;
     ``None`` (the default) is subprocess's own "inherit the parent's
@@ -463,6 +488,50 @@ def code_digests(
     ``failures`` as ``(session, reason)`` pairs (session is ``None`` when
     the crash happened before a session could even be determined).
 
+    EACH FAILURE IS ALSO ANNOUNCED AT WARNING AS IT HAPPENS, through ONE
+    append+log funnel that both failure paths converge on — the isolating
+    ``except`` above and the ``not result.ok`` arm — so neither can drift
+    from the other or be forgotten by a later edit.
+
+    That WARNING is the ONLY sink some failures ever reach. A batch whose
+    failure fraction does not STRICTLY exceed 0.5 (2 of 4, say) returns
+    ``status="ok"``, so epsilon escalates nothing and, before this, those
+    failures were invisible everywhere: not the journal, not an escalation,
+    nowhere. Per-digest lines also keep 38 identical ENOENTs distinguishable
+    from 38 distinct model errors — a distinction epsilon's single joined
+    aggregate detail flattens.
+
+    WARNING rather than ERROR, deliberately: one failed digest does not by
+    itself fail the run. Only the storm does, and that branch's ERROR is
+    emitted by ``nightly.post_escalation``. The reason is logged unbounded;
+    ``_invoke_cli`` already tail-bounds the stderr it embeds.
+
+    TWO CONSUMERS, VERY DIFFERENT VOLUMES — and everything above is the
+    TRICKLE's argument. ``nightly.run_nightly`` codes exactly ONE small
+    batch per night, so its worst case is a handful of lines.
+    ``census.run_mining`` calls this once per MINED BATCH, in a loop that
+    runs until novelty saturates or the batch source exhausts — and a storm
+    batch explicitly does NOT stop mining. So under a SYSTEMIC failure (the
+    ENOENT-on-``claude`` shape) a census emits one WARNING per failed digest
+    per batch, bounded by nothing but the operator's ``--max-batches``. That
+    output is not swallowed: ``nightly._default_census_launcher`` runs
+    census.py with no ``capture_output``, so census inherits the trickle
+    unit's stderr and the volume lands in the same
+    ``journalctl --user -u legibility-trickle@<project>`` an operator reads.
+
+    That volume is ACCEPTED here rather than fixed here, deliberately.
+    Bounding it inside this function cannot work: the flood comes from the
+    batch COUNT, which only the mining loop knows, and a per-batch cap would
+    buy nothing when a batch is already only a handful of digests. The fix,
+    if it ever bites, belongs to ``run_mining``, which already computes
+    ``BatchStats.failed`` per batch and could surface ONE per-batch line
+    naming the DISTINCT reasons — preserving the
+    38-ENOENTs-vs-38-model-errors property without a line per digest. Filed
+    as a follow-up out of task 4511's review (census.py is outside that
+    task's lock). Do NOT instead silence this line or drop it to DEBUG: that
+    restores the sub-storm blind spot above for EVERY caller, including the
+    trickle, to spare a flood only one of them can produce.
+
     ``status`` is ``"failure"`` when ``failed/total`` STRICTLY exceeds
     0.5 — a majority-failure storm — else ``"ok"``. Never escalates,
     never writes the codebook.
@@ -476,13 +545,20 @@ def code_digests(
                 digest_text, codebook, project=project, model=model, invoke=invoke,
             )
         except Exception as exc:  # isolate: one crash can't abort the batch
-            failures.append((None, str(exc)))
-            continue
-
-        if result.ok:
-            records.append(result.record)
+            failure = (None, str(exc))
         else:
-            failures.append((result.session, result.reason))
+            if result.ok:
+                records.append(result.record)
+                continue
+            failure = (result.session, result.reason)
+
+        # ONE append+log site for BOTH failure paths, so they cannot drift
+        # apart and a later edit cannot silence one of them.
+        session, reason = failure
+        logger.warning(
+            "legibility coder: digest failed (session=%s): %s", session, reason,
+        )
+        failures.append(failure)
 
     total = len(digests)
     failed = len(failures)

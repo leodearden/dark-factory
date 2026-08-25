@@ -200,7 +200,9 @@ class TestClassifyInvocationServerErrorPrecedence:
     @pytest.mark.parametrize('status', [401, 403])
     def test_auth_failed_outranks_server_error(self, status: int):
         result = AgentResult(success=False, output='Unauthorized', api_error_status=status)
-        assert classify_invocation(result, strict_confirm=True) == AuthFailed(status=status)
+        assert classify_invocation(result, strict_confirm=True) == AuthFailed(
+            status=status, body='Unauthorized'
+        )
 
     def test_404_stays_model_not_found(self):
         result = AgentResult(

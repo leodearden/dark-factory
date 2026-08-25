@@ -1985,7 +1985,12 @@ class TestRedriveCoalesceMembers:
         )
         assert call.args[2] is None, f'sha must be None when rejected: {call}'
 
-        cast(MagicMock, escalation_queue.has_open_l1).assert_called_with('m1')
+        # Task 3116: the dedup probe is deliberately category-scoped — a bare
+        # task_id matched ANY open L1, so an unrelated escalation silently
+        # suppressed a provenance_unattributed filing (task-4105 blindfold).
+        cast(MagicMock, escalation_queue.has_open_l1).assert_called_with(
+            'm1', category='provenance_unattributed',
+        )
         cast(MagicMock, escalation_queue.submit).assert_called_once()
         esc = cast(MagicMock, escalation_queue.submit).call_args[0][0]
         assert esc.category == 'provenance_unattributed'

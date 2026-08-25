@@ -35,6 +35,27 @@ from fused_memory.topic_slug import (
 # read and applied leaves from this default file.
 DEFAULT_CONFIG_PATH = 'config/config.yaml'
 
+# Task 3049 amendment: ceiling (and default) for
+# ReconciliationConfig.max_backlog_remediation_deferrals.
+#
+# Deferring the inline remediation pass is a THROUGHPUT lever, and it must not
+# become an escalation-semantics change: a deferred cycle writes one completed
+# run instead of two, so after D consecutive deferrals the cycle that finally
+# remediates sees D deferred parents + this cycle's parent + this cycle's OWN
+# remediation run (which completes and persists its stage reports before the
+# escalation gate reads the count) = D + 2 completed runs re-flagging the
+# finding.  Keeping D + 2 below
+# reconciliation.harness._INTEGRITY_FINDING_RECURRENCE_THRESHOLD (= 4) — i.e.
+# D <= 1 — keeps that counter meaning 'recurs DESPITE remediation'.  The
+# un-deferred baseline is D = 0 → 2, so escalation still needs a second failed
+# remediation, exactly as without this lever.
+#
+# Restated here rather than imported because config.schema must not import the
+# reconciliation harness (which imports this module).  The derivation is pinned
+# against the live harness constant by a runtime test in tests/test_harness.py,
+# and the harness independently clamps to the same ceiling at the point of use.
+MAX_BACKLOG_REMEDIATION_DEFERRALS_CEILING = 1
+
 
 class YamlSettingsSource(PydanticBaseSettingsSource):
     """Custom settings source for loading from YAML files."""
@@ -214,6 +235,67 @@ class LLMConfig(BaseModel):
     max_tokens: int = Field(default=4096)
     providers: LLMProvidersConfig = Field(default_factory=LLMProvidersConfig)
 
+    # Which graphiti-core LLM client to construct on the `provider='openai'`
+    # branch (it does NOT affect the anthropic branch).
+    #   'openai'         — graphiti's OpenAIClient, which drives the Responses
+    #                      API (client.responses.create). The shipped default;
+    #                      unchanged behaviour.
+    #   'openai_generic' — graphiti's OpenAIGenericClient, which drives
+    #                      chat.completions. Required for OpenAI-compatible
+    #                      local endpoints (llama.cpp, vLLM, LM Studio, …),
+    #                      which serve chat.completions but not the Responses
+    #                      API. Selecting it also skips the
+    #                      check_openai_responses_api() preflight, which guards
+    #                      a surface this client never touches.
+    client_class: Literal['openai', 'openai_generic'] = Field(default='openai')
+
+    # Structured-output request mode. Applies ONLY when
+    # client_class='openai_generic'; ignored on the 'openai' and anthropic arms.
+    #   'auto'        — graphiti-core 0.28.2's stock, response_model-driven
+    #                   selection: response_format is {'type': 'json_schema'}
+    #                   when a response_model is passed, {'type': 'json_object'}
+    #                   otherwise.
+    #   'json_object' — force {'type': 'json_object'} unconditionally. Needed
+    #                   for the llama.cpp MoE arm, which SILENTLY ignores
+    #                   $ref/$defs in a json_schema response_format
+    #                   (llama.cpp#21228) and so returns off-schema JSON with no
+    #                   error. graphiti-core 0.28.2 ships no upstream knob for
+    #                   this — mode is purely response_model-driven — which is
+    #                   why we own the forcing wrapper
+    #                   (backends/llm_clients.ForceJsonObjectOpenAIGenericClient).
+    structured_output_mode: Literal['auto', 'json_object'] = Field(default='auto')
+
+    @model_validator(mode='after')
+    def _structured_output_mode_requires_the_generic_client(self):
+        """Reject a structured_output_mode that no client would ever honour.
+
+        ``structured_output_mode`` is read on exactly one arm of
+        ``build_llm_client`` — the ``client_class='openai_generic'`` one. An
+        operator who uncomments ``structured_output_mode: "json_object"`` in
+        config.yaml but forgets ``client_class: "openai_generic"`` would
+        otherwise get stock Responses-API behaviour with no warning, no log
+        line and no error, and then debug the very llama.cpp $ref failure the
+        knob was supposed to have fixed. Silent inertness is exactly what
+        docs/legibility/design-invariants.md's no-silent-fail-soft forbids, so
+        the mismatch is a hard config error.
+
+        Note this only fires at CONSTRUCTION. pydantic does not re-run
+        model validators on attribute assignment (``validate_assignment`` is
+        off), so a config mutated after the fact — which is how tests and
+        per-arm harnesses build variants — slips past. ``build_llm_client``
+        carries the matching runtime warning for that path.
+        """
+        if self.structured_output_mode != 'auto' and self.client_class != 'openai_generic':
+            raise ValueError(
+                f"llm.structured_output_mode={self.structured_output_mode!r} requires "
+                f"llm.client_class='openai_generic', but client_class is "
+                f'{self.client_class!r}. The mode is read only when building '
+                'graphiti-core\'s OpenAIGenericClient; on any other arm it would be '
+                "silently ignored. Set client_class: 'openai_generic' alongside it, or "
+                "leave structured_output_mode at its 'auto' default."
+            )
+        return self
+
 
 # --- Embedder ---
 
@@ -284,18 +366,13 @@ class QueueConfig(BaseModel):
     # test_config_schema.py::
     # TestQueueConfigTransientErrorFields::test_transient_error_names_matches_durable_queue_default.
     #
-    # 1936's original wording gave "graphiti_core's NodeNotFoundError — a
-    # graph-visibility race" as the example. That premise was refuted by the
-    # esc-3561-3 investigation (2026-08-03) and the example has been replaced
-    # here to stop propagating it. The authoritative caveat, including the
-    # topology assumption that would make it defensible again, lives beside
-    # DEFAULT_TRANSIENT_ERROR_NAMES in durable_queue.py; task 3585 owns the
-    # removal itself.
+    # Task 3585 removed the not-found family (NodeNotFoundError,
+    # EdgeNotFoundError, EdgesNotFoundError) from this default. The evidence
+    # and the reinstatement condition live in exactly one place — beside
+    # DEFAULT_TRANSIENT_ERROR_NAMES in durable_queue.py — so the two copies of
+    # the LIST never grow two divergent copies of the ARGUMENT.
     transient_max_attempts: int = Field(default=12)
     transient_error_names: list[str] = Field(default_factory=lambda: [
-        'NodeNotFoundError',
-        'EdgeNotFoundError',
-        'EdgesNotFoundError',
         'TimeoutError',
         'ConnectionError',
         'ConnectionResetError',
@@ -629,23 +706,59 @@ class ProceduralTopicCluster(BaseModel):
 def _default_topic_guard_clusters() -> list[ProceduralTopicCluster]:
     """Seed the known-contradictory/recurring procedural_knowledge topic clusters.
 
-    The first three are recurring procedural_knowledge topics that grew
-    several contradictory or paraphrased entries each because every
-    restatement scored BELOW the cosine near-dup threshold. Seeding the two
-    eval-worktree clusters closes task 2845 (gate 2841) AND the sibling
-    venv-shadowing cluster (gate 2844); the pytest-xdist cluster closes task
-    2974 -- it is the topic that originally motivated the guard (9
-    duplicates consolidated into canonical memory 8bb3eb15) but was never
-    itself seeded. Two more clusters (task 3013) seed architect-related
-    families: report_task_already_done / main-reachable-commit, registered
+    These are recurring procedural_knowledge topics that grew several
+    contradictory or paraphrased entries each because every restatement
+    scored BELOW the cosine near-dup threshold. The pytest-xdist cluster
+    closes task 2974 -- it is the topic that originally motivated the guard
+    (9 duplicates consolidated into canonical memory 8bb3eb15) but was never
+    itself seeded. Two clusters (task 3013) seed architect-related families:
+    report_task_already_done / main-reachable-commit, registered
     prospectively ahead of still-open gate 3011; and plan-revalidation after
     requeue/lock, gated to already-adjudicated task 2973 (canonical Mem0
-    entries 6a96a020 / 974b0adb). The sixth (task 3435) seeds the
+    entries 6a96a020 / 974b0adb). The fourth (task 3435) seeds the
     "``ruff format`` is not an enforced gate; only ``ruff check`` / pyright
     gate commits" family, registered prospectively ahead of still-blocked
     gate 3342 -- the first cluster whose corpus spans BOTH
     ``procedural_knowledge`` and ``preferences_and_norms`` (11 + 3 of its 14
-    entries), which is how it grew uncaught.
+    entries), which is how it grew uncaught. The fifth (task 3862) seeds
+    the "``npx pyright`` aborts with npm EACCES on /home/leo/.npm/_cacache"
+    family, registered prospectively ahead of still-blocked gate 3417 -- the
+    first cluster whose 21 members CONTRADICT EACH OTHER on causation rather
+    than merely paraphrasing one another, which is why its phrases are keyed
+    on the invariant symptom instead of the adjudicated correct diagnosis.
+
+    RETIRED -- the two eval-worktree clusters that this seed originally
+    opened with (``eval-worktree-plan-tools-missing``, gate task 2841, and
+    ``eval-worktree-venv-shadowing``, gate task 2844) are BOTH deleted. Do
+    not reinstate either without re-deciding the two points below; the
+    absence of both ids is pinned by
+    ``TestProceduralTopicGuardClustersDefault``.
+
+    1. BOTH GATES ARE CLOSED. Each cluster's hint routed a blocked writer to
+       a human gate task, and tasks 2841 and 2844 are both ``done``. A
+       cluster exists to stop accretion on a topic pending an OPEN human
+       review; once that review closes it is pure cost -- it soft-blocks
+       writes and then hands the writer a remediation instruction pointing
+       at a finished adjudication.
+    2. BOTH DOUBLE-COUNTED A SPELLING VARIANT. Each carried the concept
+       "the eval worktree" as TWO phrase strings (``eval-worktree`` and
+       ``eval worktree``) at ``min_phrase_hits=2``, so a note that merely
+       named the eval worktree in both spellings scored 2 and was blocked
+       with no plan-tools / venv / shadowing content in it at all. This is
+       the same defect class the no-nesting invariant test guards
+       (``test_no_seeded_phrase_nests_inside_another_in_the_same_cluster``)
+       but it slips past that test, because the two spellings are siblings
+       rather than one nesting inside the other. The matcher-level fix --
+       counting spelling variants of one concept once -- is task 4179 and
+       is deliberately NOT part of this seed.
+
+    The plan-tools cluster was retired first, on measured harm: over the
+    archived dispatched-agent corpus it fired 14 of the 30 topic-cluster
+    soft-blocks and 13 of those 14 were OFF-TOPIC false positives (its
+    phrase list was the ordinary vocabulary of the plan subsystem, with no
+    eval-worktree anchor required). The venv-shadowing sibling fired 0 times
+    over the same 24-day corpus, so its removal is cruft removal rather than
+    incident response -- but it carries both defects above, so it goes too.
 
     Task 3054 then made per-phrase distinctiveness expressible: the
     report_task_already_done cluster declares its two identifier-shaped
@@ -658,52 +771,6 @@ def _default_topic_guard_clusters() -> list[ProceduralTopicCluster]:
     Operator-overridable / tunable via config (green-tier hot-reloadable).
     """
     return [
-        ProceduralTopicCluster(
-            topic_id='eval-worktree-plan-tools-missing',
-            phrases=[
-                'plan-tools',
-                'plan_tools',
-                'plan.json',
-                'eval-worktree',
-                'eval worktree',
-                'create_plan',
-                'add_plan_step',
-            ],
-            min_phrase_hits=2,
-            hint=(
-                'Known-contradictory topic (plan-tools MCP server missing in the '
-                'eval worktree) gated to human task 2841. Do NOT add another entry '
-                '-- update/consolidate the existing entries, or add context to gate '
-                'task 2841.'
-            ),
-        ),
-        ProceduralTopicCluster(
-            topic_id='eval-worktree-venv-shadowing',
-            # Reviewer (robustness): the earlier seed paired short, generic tokens
-            # ('shadow', 'pyright', 'conftest', 'site-packages', bare '.venv') that
-            # co-occur in unrelated Python-env notes, so a genuine pyright/conftest
-            # or a plain '.venv'/'site-packages' gotcha could reach min_phrase_hits
-            # on its own and be mis-routed to gate 2844. Narrowed to eval-worktree
-            # anchors plus distinctive multi-word phrases, so a match now requires
-            # the eval-worktree context or an unambiguous venv-shadowing phrase
-            # (mirrors the more distinctive plan-tools cluster above). 'shadow' as a
-            # bare 6-char substring (fires on 'shadowing'/'overshadow'/'shadow copy')
-            # is replaced by the longer 'venv shadowing' / '.venv shadow'.
-            phrases=[
-                'eval-worktree',  # anchor; also substring-matches '.eval-worktrees'
-                'eval worktree',  # anchor (space spelling)
-                'editable install',
-                'venv shadowing',
-                '.venv shadow',
-            ],
-            min_phrase_hits=2,
-            hint=(
-                'Known-contradictory topic (venv / editable-install shadowing in the '
-                'eval worktree) gated to human task 2844. Do NOT add another entry '
-                '-- update/consolidate the existing entries, or add context to gate '
-                'task 2844.'
-            ),
-        ),
         ProceduralTopicCluster(
             topic_id='pytest-xdist-serial-override',
             # This is the topic that ORIGINALLY MOTIVATED this guard (task 2845):
@@ -747,7 +814,10 @@ def _default_topic_guard_clusters() -> list[ProceduralTopicCluster]:
             # git subcommand 'merge-base --is-ancestor', and the hyphenated
             # 'main-reachable' -- none of which is a short generic token that
             # could substring-match unrelated text, so no further narrowing
-            # (unlike venv-shadowing above) is needed. Registered prospectively:
+            # (unlike the now-retired venv-shadowing cluster, whose short
+            # generic tokens had to be narrowed twice before it was deleted
+            # outright -- see the module docstring) is needed. Registered
+            # prospectively:
             # gate task 3011's 12-entry cluster is still open awaiting a
             # consolidation ruling, but this guard is forward-looking (it only
             # blocks NEW near-dup writes), so seeding it now stops that cluster
@@ -797,12 +867,17 @@ def _default_topic_guard_clusters() -> list[ProceduralTopicCluster]:
             # (subcase lost_plan_reconstruction). Standalone generic tokens
             # ('lock', 'requeue', 'plan', 'commit', 'main', 'revalidate') are
             # deliberately excluded -- each could substring-match unrelated
-            # notes on its own (the venv-shadowing over-match lesson above).
+            # notes on its own (the venv-shadowing over-match lesson -- see
+            # the retirement notes in this module's seed docstring).
             # Bare 'create_plan'/'plan.json' are also excluded even though
-            # they'd be on-topic: those already anchor the
-            # eval-worktree-plan-tools-missing cluster, and reusing them here
-            # would blur the two clusters and risk mis-routing a write to the
-            # wrong gate task.
+            # they'd be on-topic. They originally anchored the
+            # eval-worktree-plan-tools-missing cluster and were kept out to
+            # avoid blurring the two; that cluster is now RETIRED, but the
+            # exclusion stands on its own second reason -- bare 'plan.json'
+            # NESTS inside '.task/plan.json' below, so seeding it would let
+            # one occurrence score two hits (see NESTING EXCLUSION), and
+            # bare 'create_plan' is plan-subsystem vocabulary that says
+            # nothing about revalidation.
             #
             # THIRD SUB-CASE (task 3054): warm-lane RESEED. A task dispatched
             # into a recycled lane can find .task/plan.json a DANGLING symlink
@@ -892,7 +967,8 @@ def _default_topic_guard_clusters() -> list[ProceduralTopicCluster]:
             # seeded clusters, not just this one.
             #
             # GENERIC-TOKEN EXCLUSIONS (the venv-shadowing over-match lesson
-            # above): 'lint_command', 'pre-existing' and 'quality gate' are
+            # -- see this module's seed docstring): 'lint_command',
+            # 'pre-existing' and 'quality gate' are
             # too short/generic and would substring-match unrelated config or
             # formatting notes. 'not a quality gate' is excluded for a
             # different, structural reason even though it is a verbatim
@@ -938,6 +1014,211 @@ def _default_topic_guard_clusters() -> list[ProceduralTopicCluster]:
                 'and preferences_and_norms and is still awaiting a consolidation '
                 'ruling. Do NOT add another entry -- update/consolidate the '
                 'existing entries, or add context to gate task 3342.'
+            ),
+        ),
+        ProceduralTopicCluster(
+            topic_id='npx-pyright-eacces-agent-sandbox',
+            # Reviewer (robustness, task 3862): phrases are literal substrings
+            # drawn VERBATIM from gate task 3417's corpus, RE-SCOPED from a
+            # fresh search rather than from any fixed count in 3417's
+            # description (3417's own standing instruction -- the cluster was
+            # still growing, adding 8+ entries in the week to 2026-08-07).
+            # Measured over all 21 members: every one reaches >= 2 distinct
+            # hits, min 2, max 7, 14 distinct hit-profiles. Per-phrase
+            # coverage: 'npx pyright' 21/21, '/home/leo/.npm' 17/21, 'EACCES'
+            # 16/21, '_cacache' / '.venv/bin/pyright' / 'npm_config_cache'
+            # 11/21 each, 'sudo chown -R 1000:1000' 9/21. 'npx pyright' and
+            # 'npm_config_cache' are JOINTLY LOAD-BEARING for the two
+            # at-threshold members (dfdad23e, a883f914, both exactly 2 hits):
+            # dropping either sinks them, and dropping any of the other five
+            # sinks nobody.
+            #
+            # RE-MEASURED 2026-08-15 (amendment pass), because the corpus was
+            # expected to keep growing and a stale coverage claim is worse than
+            # none. A fresh top-25 search on the same query returns 25 distinct
+            # members -- overlapping but NOT identical to the 21 above, since
+            # the search is semantic and limit-bounded: 9 members are new to
+            # the ranking (c368d0f5, 70c6f185, 4ec6d976, 4a4daa2d, 0298502f,
+            # 323055ca, fb415f6b, 33635a94, 6fba3176), 4 of them written that
+            # same day, and 5 of the original 21 fell below the cut. Result on
+            # the enlarged set: min 2 distinct hits, max 7, 16 profiles, and
+            # ZERO members below threshold -- so the seven phrases still cover
+            # the cluster unchanged and no phrase needed adding. 'npx pyright'
+            # is now 25/25, 'EACCES' 19/25, '/home/leo/.npm' 17/25,
+            # '.venv/bin/pyright' 13/25, '_cacache' and 'npm_config_cache'
+            # 12/25, 'sudo chown -R 1000:1000' 9/25. That four of the nine new
+            # members were written on a single day is also the live evidence
+            # for the prospective-registration argument at the end of this
+            # comment.
+            #
+            # SYMPTOM-KEYED RATIONALE -- the reason this seed does not look
+            # like the six above. This cluster's members CONTRADICT EACH OTHER
+            # on causation rather than merely paraphrasing: a0c39676, 92ff6daa
+            # and 03b783d5 assert root-owned npm-cache files and prescribe a
+            # `sudo chown` that is a MEASURED no-op, while 6a02360d, f9c9ea2a,
+            # ae11c43e and 43ac56de carry the corrected agent-sandbox
+            # diagnosis. A guard keyed on the correct diagnosis (sandbox /
+            # landlock / compute_write_set) would therefore block only the
+            # already-right entries and let the harmful chown restatements
+            # keep landing -- inverting the guard's purpose. So the anchors are
+            # the INVARIANT SYMPTOM ('npx pyright', 'EACCES', '_cacache',
+            # '/home/leo/.npm'), which catches both readings with one list.
+            # 'sudo chown -R 1000:1000' is the single wrong-diagnosis phrase
+            # kept: it is the exact npm advice literal including the uid:gid.
+            # Note the MECHANISM, because it constrains what may be dropped
+            # later: min_phrase_hits is 2 and this phrase is NOT declared
+            # sufficient, so a write hooked on the remedy ALONE scores 1 and is
+            # NOT blocked (measured). It reaches 2 only because npm's advice
+            # literal is `sudo chown -R 1000:1000 /home/leo/.npm`, i.e. it
+            # carries the path phrase with it -- measured: the bare remedy
+            # sentence scores 1, the full npm literal scores 2. So chown-only
+            # catchability is a PAIRING with '/home/leo/.npm', not a property
+            # of this phrase; dropping the path phrase would silently take it
+            # away too.
+            #
+            # GENERIC-TOKEN EXCLUSIONS (the venv-shadowing over-match lesson
+            # above): bare 'root-owned' and the verbatim npm string 'cache
+            # folder contains root-owned files' are omitted although both are
+            # among the most literally common strings in the corpus. Measured,
+            # not assumed -- with either seeded, an OFF-HOST generic docker/CI
+            # note ("mounted cache folder contains root-owned files ... EACCES
+            # ... chown the mount") reaches 2 hits and would be soft-blocked
+            # and mis-routed here. That off-host shape, and only that shape, is
+            # what dropping them buys.
+            #
+            # SCOPE CORRECTION (reviewer, task 3862): an earlier revision of
+            # this paragraph also claimed these exclusions were what protected
+            # the pump-web-ui / know-live "architect-level toolchain-cache
+            # redirect" entries that memory f9c9ea2a rules a DIFFERENT failure
+            # class. That was WRONG and is retracted. Those entries run on THIS
+            # host, so they name /home/leo/.npm and _cacache themselves and are
+            # captured by the anchors that were KEPT, not by the ones dropped.
+            # The exposure is real and now recorded honestly as residual (3)
+            # below. Coverage loses nothing: all members still
+            # clear the 2-hit bar without them. 'type_check_command' is
+            # omitted as a config-key name that appears in any module-config
+            # discussion and was measured to cost ZERO coverage when dropped.
+            #
+            # NESTING EXCLUSION: '/home/leo/.npm/_cacache' is omitted because
+            # it NESTS inside both '/home/leo/.npm' and '_cacache', so a
+            # single occurrence would score three distinct hits and satisfy
+            # min_phrase_hits alone. Same hazard as 'ruff format --check'
+            # above; asserted over ALL clusters by
+            # test_no_seeded_phrase_nests_inside_another_in_the_same_cluster.
+            #
+            # THREE ACCEPTED RESIDUALS, all PINNED by positive tests so a
+            # future tuner can tell them from a regression:
+            # (1) entry 37743789, which gate 3417 EXPLICITLY EXCLUDES as a
+            #     distinct root cause (a sandboxed network-fetch hang, fixed
+            #     with `npx --offline`), scores 4 hits and WILL match. This is
+            #     unavoidable: its FIRST symptom is literally the same EACCES
+            #     symptom and the matcher has no negative-phrase arm. No
+            #     phrase separates them either -- the discriminating
+            #     vocabulary lives only in the excluded entry. Accepted
+            #     because the block is SOFT and routes to 3417, whose
+            #     description documents this very exclusion, so the writer
+            #     lands on the right reading.
+            #     (test_known_residual_excluded_offline_hang_entry_matches)
+            # (2) a pyright version-pin note ('.venv/bin/pyright is 1.1.408
+            #     while npx pyright resolves 1.1.411') scores 2. Judged
+            #     ON-TOPIC rather than a false positive: 3417's steward
+            #     addendum wants exactly that version-inequivalence detail
+            #     folded into the canonical entry, since it CORRECTS member
+            #     1db61279's "(same version)" claim.
+            #     (test_known_residual_pyright_version_pin_note_matches)
+            # (3) CROSS-PROJECT over-match, the widest residual of the three
+            #     and the one to read before re-tuning anything. This guard
+            #     runs in add_memory BEFORE the cosine guard and, unlike it, is
+            #     NOT project-scoped: find_matching_topic_cluster() takes only
+            #     (content, clusters), while the cosine path below it passes
+            #     project_id. So the seed fires for EVERY project this server
+            #     serves, and '/home/leo/.npm', '_cacache' and 'EACCES' are
+            #     HOST-wide npm vocabulary -- every sandbox-enabled project on
+            #     this host shares /home/leo. Measured against the live seed: a
+            #     pump-web-ui `npm ci` note (3 hits), a know-live toolchain
+            #     note (3 hits) and an autopilot-video `npx tsc` note (2 hits,
+            #     no pyright at all) are all BLOCKED and routed to dark-factory
+            #     gate 3417, whose "consolidate into the pyright entries"
+            #     instruction is wrong for that writer. Per task 3162's
+            #     2026-08-10 audit these are precisely the gap projects
+            #     (know-live, autopilot-video, pump-web-ui,
+            #     solar-challenge-platform).
+            #     ACCEPTED because no narrowing expressible here fixes it, all
+            #     four candidates measured over the corpus and over the hazard
+            #     notes:
+            #       - min_phrase_hits=3: sinks 4 members AND still blocks the
+            #         pump-web-ui and know-live notes. Strictly worse.
+            #       - drop 'EACCES' + '_cacache' (the reviewer's first
+            #         suggestion): sinks member 3df6017f and STILL blocks the
+            #         know-live note.
+            #       - drop '_cacache' alone: free on today's corpus but closes
+            #         only the `npx tsc` shape; pump-web-ui and know-live still
+            #         block. Buys nothing for the class it targets.
+            #       - drop 'EACCES' + '/home/leo/.npm': closes all three
+            #         measured notes at zero cost ON TODAY'S CORPUS, and is the
+            #         tempting one -- but it guts the guard's PURPOSE. Existing
+            #         members survive only because they happen to spell literal
+            #         paths and commands; three plausible future PARAPHRASES
+            #         ("`npx pyright` aborts with npm EACCES on /home/leo/.npm;
+            #         the cause is the agent sandbox write set") drop from 3
+            #         hits to 1 and would be missed. Paraphrases are exactly
+            #         what this guard exists to catch, so that trade is a loss.
+            #         It also does not close the class: harder cross-project
+            #         shapes still reach 2 via '_cacache' + 'npm_config_cache'.
+            #     The real fix is structural and lives OUTSIDE this file --
+            #     either project-scoping the topic guard (pass project_id, as
+            #     the cosine path does) or giving ProceduralTopicCluster a
+            #     required-anchor arm so 'npx pyright' must be present for the
+            #     host-wide npm phrases to count. Until one of those lands the
+            #     block is SOFT, and the hint below now tells a non-dark-factory
+            #     writer explicitly that this is a known false positive and how
+            #     to proceed.
+            #     (test_known_residual_cross_project_npm_eacces_note_matches)
+            #
+            # Registered PROSPECTIVELY while gate 3417 is still blocked behind
+            # 3524, following the task-3013 and task-3435 precedents: the
+            # guard is forward-looking (it only blocks NEW writes, never
+            # existing entries), so seeding now stops the cluster growing
+            # while the consolidation ruling is parked. Consolidating or
+            # editing the 21 members is deliberately NOT done here -- that is
+            # 3417's content-shaping judgment call.
+            phrases=[
+                'npx pyright',
+                'EACCES',
+                '_cacache',
+                '/home/leo/.npm',
+                '.venv/bin/pyright',
+                'npm_config_cache',
+                'sudo chown -R 1000:1000',
+            ],
+            min_phrase_hits=2,
+            hint=(
+                'Known-contradictory topic (`npx pyright` aborting with npm '
+                'EACCES on /home/leo/.npm/_cacache) gated to human task 3417, '
+                'whose still-growing cluster is awaiting a consolidation '
+                'ruling. The cluster DISAGREES WITH ITSELF, so read this before '
+                'writing: the `sudo chown -R 1000:1000 /home/leo/.npm` remedy '
+                'several existing entries prescribe is a CONFIRMED NO-OP -- the '
+                'tree is already drwxrwxr-x leo:leo and every agent role runs as '
+                'uid 1000, and npm emits that text for any EACCES it cannot '
+                'explain. The verified cause is the landlock write set: '
+                "compute_write_set()'s ALLOW-LIST has no ~/.npm row "
+                '(orchestrator/src/orchestrator/agents/write_set.py), so '
+                'npm cannot write _cacache/_logs and aborts before exec\'ing '
+                'pyright. Task 3162 owns the fix. Do NOT add another entry -- '
+                'update/consolidate the existing entries, or add context to gate '
+                'task 3417. '
+                'CROSS-PROJECT WRITERS: if your note is NOT about dark-factory '
+                "`npx pyright` -- e.g. it is npm EACCES in pump-web-ui, "
+                'know-live, autopilot-video or solar-challenge-platform -- then '
+                'this is a KNOWN FALSE POSITIVE, not a duplicate. This guard is '
+                'not yet project-scoped and /home/leo/.npm, _cacache and EACCES '
+                'are host-wide npm vocabulary shared by every project on this '
+                'host. Do NOT consolidate into gate 3417 and do NOT drop your '
+                "write: re-submit it unchanged with metadata={'allow_near_"
+                "duplicate': True}. Those per-project toolchain-cache-redirect "
+                'gaps are a DIFFERENT failure class (see memory f9c9ea2a) and '
+                'belong to task 3162, not 3417.'
             ),
         ),
     ]
@@ -1117,6 +1398,20 @@ class ReconciliationConfig(BaseModel):
     # sandbox_recon_writable_extras: additional paths to add to the writable set
     #   (e.g. a uvx/pip cache dir used by a stdio MCP server).  Empty by default;
     #   use only when an MCP server genuinely needs to write outside /tmp.
+    #
+    #   Do NOT add the recon CLAUDE_CONFIG_DIR here.  The PER-RUN dir is granted
+    #   AUTOMATICALLY per invocation by cli_stage_runner.run_stage_via_cli, which
+    #   appends `config_dir.path` to whatever is configured here (append, never
+    #   replace) and has resolve_recon_sandbox_wrap verify the containment.
+    #
+    #   In particular, NEVER add the config-dir BASE — `recon_config_base_dir(
+    #   data_dir)`, i.e. `<data_dir>/recon-config`.  That is the root under which
+    #   EVERY run's `claude-config-<run_id>/.credentials.json` lives, so granting
+    #   it would give every reconciliation stage write access to every other run's
+    #   OAuth credentials — a capability that does not exist today.  If a stage is
+    #   failing with a "CLAUDE_CONFIG_DIR is OUTSIDE the sandbox writable set"
+    #   error, the computed per-run grant has been lost; restore it rather than
+    #   widening this list (task 4003).
     sandbox_recon_agents: bool = Field(default=True)
     sandbox_recon_writable_extras: list[str] = Field(default_factory=list)
 
@@ -1402,6 +1697,27 @@ class ReconciliationConfig(BaseModel):
     sonnet_model: str = Field(default='sonnet')
     opus_model: str = Field(default='opus')
     opus_threshold_ratio: float = Field(default=1.5)
+    max_backlog_remediation_deferrals: int = Field(
+        default=MAX_BACKLOG_REMEDIATION_DEFERRALS_CEILING,
+        ge=0, le=MAX_BACKLOG_REMEDIATION_DEFERRALS_CEILING,
+        description=(
+            'Task 3049. Number of CONSECUTIVE full cycles for which the inline '
+            'remediation pass may be deferred while the project is in backlog '
+            'mode (buffer size > buffer_size_threshold * opus_threshold_ratio). '
+            'Remediation is an unconditional inline tail of every completed '
+            'run_full_cycle and BacklogIterator runs each chunk as its own full '
+            'cycle, so every chunk otherwise drags in a zero-event remediation '
+            'pass — measured at ~44% of backlog-mode drain wall-clock. Deferring '
+            'is lossless: Stage-3 findings are already persisted in '
+            'stage_reports.integrity_check.items_flagged before this point and '
+            'forward-fed into the next cycle. The cap bounds the debt — after '
+            'this many consecutive deferrals the pass runs anyway, so a '
+            'persistently-deep backlog cannot starve remediation. 0 disables '
+            'deferral entirely, restoring pre-task-3049 behaviour. Bounded '
+            'above by MAX_BACKLOG_REMEDIATION_DEFERRALS_CEILING so the streak '
+            'cannot outlast the integrity-finding recurrence threshold.'
+        ),
+    )
     sonnet_episode_limit: int = Field(default=125)
     sonnet_memory_limit: int = Field(default=250)
     opus_episode_limit: int = Field(default=500)
@@ -1475,8 +1791,8 @@ class ReconciliationConfig(BaseModel):
     # Write-time TOPIC-keyed cluster guard for procedural_knowledge add_memory writes
     # (task 2845). Complements the cosine near-dup guard above: paraphrased same-topic
     # entries score BELOW any cosine threshold that is also safe for unrelated writes,
-    # so a recurring known-contradictory topic (e.g. "plan-tools MCP server missing in
-    # the eval worktree") kept accumulating contradictory entries the cosine guard
+    # so a recurring known-contradictory topic (e.g. "pytest-xdist -n0 serial override")
+    # kept accumulating contradictory entries the cosine guard
     # never fired on. This deterministic substring matcher targets exactly those known
     # clusters. Same ownership note as the near-dup fields above: enforced in the
     # server layer (server/near_duplicate_guard.py::find_matching_topic_cluster /
@@ -1493,8 +1809,13 @@ class ReconciliationConfig(BaseModel):
             "phrases -- OR any single one of that cluster's sufficient_phrases, for "
             'phrases distinctive enough to qualify alone -- is soft-blocked '
             '(error_type=ProceduralKnowledgeKnownTopicClusterWriteRejected) BEFORE '
-            'the cosine near-dup search. Seeded with the two known eval-worktree '
-            'clusters (gates 2841/2844); an empty list disables the topic guard. '
+            'the cosine near-dup search. Seeded with five clusters (pytest-xdist, '
+            'the two architect families, ruff-format, and npx-pyright-EACCES); '
+            'the two eval-worktree '
+            'clusters that were seeded originally are RETIRED -- both their human '
+            'gates (2841/2844) are done -- and must not be reinstated without '
+            'reading the retirement notes on _default_topic_guard_clusters. An '
+            'empty list disables the topic guard. '
             'A sufficient_phrases entry absent from that cluster\'s phrases is '
             'rejected at load/reload rather than silently matching nothing. Green-tier '
             'hot-reloadable via the reload_config MCP tool (read live per add_memory '
@@ -1504,6 +1825,37 @@ class ReconciliationConfig(BaseModel):
         ),
     )
 
+    # Topic-anchored canonical recall (task 3111): the READ-side counterpart to the
+    # write-side duplicate guards above. Consolidating a near-duplicate cluster into
+    # one canonical makes that canonical the LEAST retrievable member of its own
+    # cluster -- it is long and general, each surviving sibling is a tighter cosine
+    # match -- so at limit=5 the window fills with siblings and the record that
+    # answers the question never appears. Same ownership note as the near-dup fields
+    # above: enforced in the SERVICE read path (services/topic_anchor.py::
+    # resolve_topic_anchor_enabled + the anchoring block in MemoryService.search),
+    # colocated on ReconciliationConfig because it is the retrieval-side counterpart
+    # to the same duplicate-accretion problem Stage-1 consolidation creates, NOT
+    # because the reconciliation subsystem executes it. Read live per
+    # MemoryService.search off the shared config object, so it satisfies the
+    # reload.py live-read reload-safety rule.
+    topic_anchored_recall_enabled: bool = Field(
+        default=True,
+        description=(
+            'Enable the topic-anchored canonical pin in MemoryService.search. When '
+            "True, a search whose Mem0 results carry a metadata.topic looks up that "
+            "topic's canonical:true record and PROMOTES it to index 0 of the returned "
+            'window, flagged topic_anchored=True. Green-tier hot-reloadable via the '
+            'reload_config MCP tool (read live per MemoryService.search by '
+            'resolve_topic_anchor_enabled in services/topic_anchor.py, off the shared '
+            'config object and never captured at construction, so a reload takes '
+            'effect on the next search with no restart). The promoting pin is the arm '
+            "SELECTED BY MEASUREMENT in task 4004 (plans/read-transform-selection-"
+            'report.md, recommendation.arm = promoting_pin): claim recall 1.00 at '
+            '1070.27 tokens/query against a 1181.29 baseline, dropping no ranked '
+            'records. False disables the transform entirely, so every search skips '
+            'the extra backend round-trip.'
+        ),
+    )
 
 class TicketJanitorConfig(BaseModel):
     """Background sweep that surfaces failed tickets to the orchestrator.
@@ -1580,8 +1932,23 @@ class CuratorConfig(BaseModel):
     pool_dependency_cap: int = Field(default=3)
     pool_total_cap: int = Field(default=30)
 
-    # Lock-key depth must match the scheduler's lock_depth to make module-pool
-    # matching scheduler-consistent. Default 2 matches shared.locking defaults.
+    # COARSE FALLBACK ONLY — this is not the depth the curator normally uses.
+    # Module-pool keys must match the *scheduler's* lock_depth to be
+    # scheduler-consistent, and that depth is per-project (measured 2026-08-07
+    # across the fleet this one server serves: 3, 4, 4, 4, 4, 10, 12). The
+    # curator resolves it per call from <project_root>'s scheduler_state.json
+    # snapshot via ``effective_lock_depth``; this scalar is used only when no
+    # snapshot exists (a freshly onboarded project whose orchestrator has never
+    # run) or it is unreadable. Deliberately COARSE rather than a guess at the
+    # fleet's usual value: a too-fine key under-matches, missing the
+    # overlapping task every time, and costs a DUPLICATE TASK. A too-coarse
+    # key over-matches, which is usually just one LLM look at an irrelevant
+    # pool entry — but not always free: the module stream is ordered by status
+    # and priority, NOT by relevance, then truncated at pool_module_cap, so a
+    # very coarse key against a deep project can push the genuinely
+    # overlapping task past the cap and produce the same duplicate. Coarse
+    # degrades only past the cap where fine fails always, hence the direction;
+    # the fallback is still a fallback, not a good operating point.
     lock_depth: int = Field(default=2)
 
     # Idempotency cache: skip re-invoking the LLM for the same candidate payload
@@ -1800,8 +2167,11 @@ class WriteTriageConfig(BaseModel):
     of reconciliation, move these two fields to a dedicated server-owned config
     section instead of assuming colocation implies subsystem ownership") —
     write triage IS that growth, so the bands land here rather than accreting
-    onto the reconciliation submodel. PRD leaf beta adds `write_triage_enabled`
-    to this same section.
+    onto the reconciliation submodel. PRD leaf beta added that staged-rollout
+    flag to this same section, spelled `enabled` (dotted path
+    `write_triage.enabled`, matching the `mem0_update.enabled` sibling in
+    config/reload.py) — the PRD calls it `write_triage_enabled`, which is the
+    same knob under its cross-reference name.
 
     Declared on FusedMemoryConfig as a BARE (non-Optional) submodel so
     config/reload.py's `_iter_leaves` descends into per-leaf paths. An
@@ -1809,9 +2179,55 @@ class WriteTriageConfig(BaseModel):
     restart_required entry (esc-2718-1), which would force a server restart
     for every calibration run.
 
-    Every field defaults to None, and that is load-bearing: None means
+    Every CALIBRATED BAND field (t_high, t_low, calibration_report_path,
+    t_high_by_category) defaults to None, and that is load-bearing: None means
     UNCALIBRATED, which the triage router must read as fail-open to `stored`.
+    The two OPERATOR KNOBS below (`enabled`, `candidate_k`) deliberately do
+    NOT follow that rule — they are hand-set and ship with real defaults,
+    because there is no such thing as an uncalibrated kill switch, and a
+    retrieval width of None would have no fail-open reading at all.
     """
+
+    enabled: bool = Field(
+        default=False,
+        description=(
+            'Staged-rollout flag for add_memory write triage — the PRD\'s '
+            '`write_triage_enabled` (D10). While False the two reject guards in '
+            'server/tools.py::add_memory run exactly as they do today and no '
+            'triage code executes. While True those guards RETIRE for the write '
+            'and it is routed redirect-not-reject: a restatement becomes a '
+            'sighting child of its canonical instead of a rejection. Ships FALSE '
+            'and stays False until the flip gate (task 3169) — the judge (leaf '
+            'gamma) has to land first, and until it does the middle band is '
+            'answered by a deliberate stub. This is also the one lever that '
+            'stops an in-flight triage incident, which is why it is green-tier '
+            'hot-reloadable rather than restart-only: read live off '
+            'memory_service.config.write_triage on every write, never captured '
+            'at construction.'
+        ),
+    )
+    candidate_k: int = Field(
+        default=20,
+        ge=1,
+        description=(
+            'How many candidates the triage retrieval asks for. This is a WIDTH, '
+            'NOT a threshold: it is the rank property that caps what any band '
+            'can achieve, because a candidate that never enters the result set '
+            'cannot be scored by t_high or t_low at all. The 20 default is the '
+            'measured 69.4% same-category recall point on the live corpus (26.1% '
+            '@5, 43.9% @10, 69.4% @20, 88.5% @50) — deliberately NOT the retired '
+            "near-dup guard's hardcoded limit=5, at which three quarters of the "
+            'duplicates triage exists to catch are invisible to it. Note the '
+            'count is a TOTAL across the three Mem0-primary categories, so '
+            'effective per-category depth is lower than k. If calibration (task '
+            '3199 / leaf gamma) shows recall rather than the thresholds is the '
+            'binding constraint, 20-50 is where the remaining recall lives. '
+            'Bounded ge=1 so a 0 cannot silently disable retrieval — that would '
+            'read as "no comparable candidate" on every write and route '
+            'everything to `stored` with nothing logged. Green-tier '
+            'hot-reloadable, read live per write.'
+        ),
+    )
 
     t_high: float | None = Field(
         default=None,
@@ -1952,29 +2368,40 @@ class Mem0UpdateConfig(BaseModel):
         ),
     )
     content_amend_allowed_agent_prefixes: list[str] = Field(
-        default_factory=lambda: ['recon-stage-'],
+        default_factory=lambda: ['recon-stage-', 'curator-'],
         description=(
-            'agent_id prefixes authorized to AMEND CONTENT in place. Defaults to '
-            'the narrow recon-stage- bar (the same literal prefix '
-            'add_system_record gates on) because a content amend is a silent '
-            'history-rewrite primitive. NOTE: agent_id is SELF-REPORTED, so this '
-            'is a misuse deterrent for cooperating callers, not cryptographic '
-            'authorization. Deliberately a separate list from '
-            'metadata_patch_allowed_agent_prefixes so the two bars move '
-            'independently. Green-tier hot-reloadable via reload_config.'
+            'agent_id prefixes authorized to AMEND CONTENT in place. Narrow by '
+            'design, because a content amend is a silent history-rewrite '
+            'primitive. recon-stage- (the same literal prefix add_system_record '
+            'gates on) admits every reconciliation stage agent; curator- is the '
+            'dedicated prefix an interactive memory-consolidation sitting opts '
+            'into while executing skills/curate-fused-memories (esc-3524-1 '
+            'ruling (b), 2026-08-11; made an all-deployments schema default '
+            'rather than a per-machine config.yaml override by ruling '
+            '2026-08-12 — the skill does not work without it). Deliberately NOT '
+            'the everyday claude-interactive, which would grant silent '
+            'history-rewrite authority to every interactive session. NOTE: '
+            'agent_id is SELF-REPORTED, so this is a misuse deterrent for '
+            'cooperating callers, not cryptographic authorization. Deliberately '
+            'a separate list from metadata_patch_allowed_agent_prefixes so the '
+            'two bars move independently. Green-tier hot-reloadable via '
+            'reload_config.'
         ),
     )
     metadata_patch_allowed_agent_prefixes: list[str] = Field(
-        default_factory=lambda: ['recon-stage-'],
+        default_factory=lambda: ['recon-stage-', 'curator-'],
         description=(
             'agent_id prefixes authorized to PATCH METADATA in place. Ships '
             'identical to the content-amend list but is independently '
-            'configurable, and that is the point: widening THIS list alone is the '
-            'supported way to admit an interactive curator-gate flow (tagging a '
-            'survivor with topic=) without granting content-amend authority. A '
-            'mistagged patch is cheap to notice and cheap to correct; a runaway '
-            'silent content rewrite is not. Green-tier hot-reloadable via '
-            'reload_config.'
+            'configurable, and that is the point: widening THIS list alone '
+            'remains the supported way to admit a new interactive tagging flow '
+            'without granting content-amend authority. A mistagged patch is '
+            'cheap to notice and cheap to correct; a runaway silent content '
+            'rewrite is not. curator- deliberately holds BOTH arms, not only '
+            'this one: gate 3200 ratified retain-and-tag, whose folded entries '
+            'are retained as topic-stamped peers via a metadata-only patch — '
+            'content_amend alone would be the destructive half without the '
+            'preserving half. Green-tier hot-reloadable via reload_config.'
         ),
     )
     storm_threshold: int = Field(

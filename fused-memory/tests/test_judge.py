@@ -1,10 +1,16 @@
 """Tests for the LLM-as-judge module (judge.py)."""
 
+import logging
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from shared.phantom_verdict import (
+    UNPARSEABLE_ISSUE_PREFIX,
+    UNPARSEABLE_VERDICT_CODE,
+    is_phantom_verdict_row,
+)
 from shared.testing import make_gate_mock
 
 from fused_memory.config.schema import ReconciliationConfig
@@ -13,7 +19,8 @@ from fused_memory.models.reconciliation import (
     VerdictAction,
     VerdictSeverity,
 )
-from fused_memory.reconciliation.judge import Judge
+from fused_memory.reconciliation import judge as judge_module
+from fused_memory.reconciliation.judge import Judge, is_phantom_verdict
 from fused_memory.reconciliation.prompts.judge import JUDGE_SYSTEM_PROMPT
 
 
@@ -729,22 +736,346 @@ async def test_judge_call_llm_openai_none_content(mock_journal):
     assert result == ''
 
 
+# --- is_phantom_verdict tests ---
+
+
+def _legacy_phantom_finding() -> dict:
+    """A fresh single-finding phantom payload in the pre-2947 unmarked
+    shape: severity=serious, no 'code' key at all — the only signal
+    is_phantom_verdict has for a row written before task 2947's structured
+    marker existed. One spelling, reused by every test that needs this
+    shape so a future change to the fabricated payload needs one edit, not
+    one per call site."""
+    return {
+        'issue': (
+            'Judge response could not be parsed: Expecting value: '
+            'line 1 column 1 (char 0)'
+        ),
+        'severity': 'serious',
+        'recommendation': (
+            'This verdict was not a real review — the judge output was '
+            'unparseable. Investigate the judge LLM/CLI output before '
+            'trusting subsequent verdicts.'
+        ),
+    }
+
+
+def _marked_phantom_finding() -> dict:
+    """A fresh single-finding phantom payload in the post-2947
+    structured-marker shape: the legacy shape plus the 'code':
+    'unparseable_judge_response' marker, mirroring how _parse_verdict
+    actually derives one from the other in production."""
+    return {**_legacy_phantom_finding(), 'code': 'unparseable_judge_response'}
+
+
+class TestIsPhantomVerdict:
+    """is_phantom_verdict(verdict) — True iff *verdict* is a fabricated
+    stand-in for a review that never happened (built by
+    Judge._parse_verdict's except-block fallback when the judge output
+    could not be parsed), as opposed to a genuine judge finding.
+
+    Two shapes must be recognised: the structured-marker shape
+    (``code == 'unparseable_judge_response'``, written for every run after
+    task 2947 landed) and the legacy unmarked shape (pre-2947 rows, which
+    carry no ``code`` key at all — identified instead by severity=serious +
+    exactly one finding + an ``issue`` starting with the fixed parse-failure
+    prefix).
+    """
+
+    def test_marked_unparseable_finding_is_phantom(self):
+        """Real d741ffe3 / 33581299 / ad861d89 / c7d84e9f shape: severity=serious,
+        one finding carrying the structured code marker."""
+        verdict = JudgeVerdict(
+            run_id='run-marked',
+            reviewed_at=datetime.now(UTC),
+            severity=VerdictSeverity.serious,
+            findings=[_marked_phantom_finding()],
+        )
+        assert is_phantom_verdict(verdict) is True
+
+    def test_genuine_serious_with_five_findings_and_no_code_is_not_phantom(self):
+        """Real bc9459b8 shape: severity=serious, five substantive findings,
+        none carrying the code marker."""
+        verdict = JudgeVerdict(
+            run_id='run-genuine',
+            reviewed_at=datetime.now(UTC),
+            severity=VerdictSeverity.serious,
+            findings=[
+                {
+                    'issue': f'Substantive content issue #{i}',
+                    'severity': 'serious',
+                    'recommendation': f'Fix issue #{i}',
+                }
+                for i in range(5)
+            ],
+        )
+        assert is_phantom_verdict(verdict) is False
+
+    def test_empty_findings_is_not_phantom(self):
+        verdict = JudgeVerdict(
+            run_id='run-empty-findings',
+            reviewed_at=datetime.now(UTC),
+            severity=VerdictSeverity.serious,
+            findings=[],
+        )
+        assert is_phantom_verdict(verdict) is False
+
+    def test_ordinary_ok_verdict_is_not_phantom(self):
+        verdict = JudgeVerdict(
+            run_id='run-ok',
+            reviewed_at=datetime.now(UTC),
+            severity=VerdictSeverity.ok,
+            findings=[],
+        )
+        assert is_phantom_verdict(verdict) is False
+
+    def test_legacy_unmarked_shape_e87d8e4a_is_phantom(self):
+        """Real e87d8e4a (2026-07-20) shape: pre-2947, no code key at all."""
+        verdict = JudgeVerdict(
+            run_id='e87d8e4a',
+            reviewed_at=datetime(2026, 7, 20, tzinfo=UTC),
+            severity=VerdictSeverity.serious,
+            findings=[_legacy_phantom_finding()],
+        )
+        assert is_phantom_verdict(verdict) is True
+
+    def test_legacy_unmarked_shape_09d14a75_is_phantom(self):
+        """Real 09d14a75 (2026-07-22) shape: pre-2947, no code key at all."""
+        verdict = JudgeVerdict(
+            run_id='09d14a75',
+            reviewed_at=datetime(2026, 7, 22, tzinfo=UTC),
+            severity=VerdictSeverity.serious,
+            findings=[_legacy_phantom_finding()],
+        )
+        assert is_phantom_verdict(verdict) is True
+
+    def test_legacy_shape_with_moderate_severity_is_not_phantom(self):
+        """The fabrication path only ever emits severity=serious — a
+        moderate verdict carrying the same single finding must not match,
+        or the filter could start dropping genuine moderate evidence."""
+        verdict = JudgeVerdict(
+            run_id='run-moderate-lookalike',
+            reviewed_at=datetime.now(UTC),
+            severity=VerdictSeverity.moderate,
+            findings=[_legacy_phantom_finding()],
+        )
+        assert is_phantom_verdict(verdict) is False
+
+    def test_legacy_shape_with_two_findings_is_not_phantom(self):
+        """Two findings, only one of which carries the parse-failure issue
+        text, must not match — the single-finding conjunct is what
+        separates this from the genuine five-finding bc9459b8 row."""
+        verdict = JudgeVerdict(
+            run_id='run-two-findings',
+            reviewed_at=datetime.now(UTC),
+            severity=VerdictSeverity.serious,
+            findings=[
+                _legacy_phantom_finding(),
+                {
+                    'issue': 'A second, genuine content finding',
+                    'severity': 'serious',
+                    'recommendation': 'Fix the second issue',
+                },
+            ],
+        )
+        assert is_phantom_verdict(verdict) is False
+
+    def test_legacy_shape_unrelated_prose_mentioning_parsing_is_not_phantom(self):
+        """A single serious finding whose issue text merely mentions parsing
+        somewhere in unrelated prose — but does not START WITH the
+        parse-failure prefix — must not match. Pins that the check is a
+        startswith, not a substring containment test."""
+        verdict = JudgeVerdict(
+            run_id='run-unrelated-prose',
+            reviewed_at=datetime.now(UTC),
+            severity=VerdictSeverity.serious,
+            findings=[{
+                'issue': (
+                    'Note: the historical "Judge response could not be parsed" '
+                    'error seen in an earlier run was traced to a logging '
+                    'artifact, not a genuine content problem.'
+                ),
+                'severity': 'serious',
+                'recommendation': 'No action needed — logging bug, already fixed',
+            }],
+        )
+        assert is_phantom_verdict(verdict) is False
+
+
+class TestPhantomRuleIsTheSharedRule:
+    """Drift guard: judge.py's phantom detection must BE the shared rule
+    (``shared.phantom_verdict``), not a second copy of it.
+
+    Task 3287 hoisted the rule to ``shared`` because its two new consumers
+    cannot import judge.py — ``journal.py`` would be a circular import
+    (judge.py already imports journal at module scope) and the ``dashboard``
+    package deliberately does not depend on ``fused-memory`` at all.  The
+    hoist is only worth anything if judge.py DELEGATES rather than keeping a
+    parallel implementation, so that is what these cases pin.
+
+    The class above (``TestIsPhantomVerdict``, task 3070) stays untouched and
+    remains the behavioural net: together, "the behaviour is still right" and
+    "the behaviour comes from one place" are the two halves of the contract.
+    """
+
+    def test_marker_constants_match_the_shared_spellings(self):
+        """The two module-level constants carry the shared spellings.
+
+        EQUALITY, not identity.  The `is`-based assertions this replaces made
+        the suite's pass/fail depend on CPython constant folding: one of them
+        (`'unparseable_judge_response'`, identifier-shaped, therefore interned
+        at compile time) was a no-op that passed even before the hoist, and the
+        other was a genuine check only by accident of the same interning rules.
+        Equality is what the production code actually needs to be true, and it
+        holds under any interpreter.
+
+        Delegation itself is pinned by the two cases below — a spy that proves
+        the call happens, and an equivalence corpus that proves the answers
+        never diverge — neither of which depends on object identity.
+        """
+        assert judge_module._UNPARSEABLE_ISSUE_PREFIX == UNPARSEABLE_ISSUE_PREFIX
+        assert judge_module._UNPARSEABLE_VERDICT_CODE == UNPARSEABLE_VERDICT_CODE
+
+    def test_is_phantom_verdict_calls_the_shared_predicate(self, monkeypatch):
+        """`judge.is_phantom_verdict` DELEGATES; it does not re-implement.
+
+        Patches the name judge.py bound at import (`judge_module.
+        is_phantom_verdict_row`) with a spy that returns a value the real rule
+        never would for these inputs — an ordinary `ok` verdict with no
+        findings.  If judge.py grew a parallel implementation, it would return
+        False and this goes red.
+
+        This is the assertion the deleted `is`-identity checks were reaching
+        for, without depending on how the interpreter interns str literals.
+        """
+        calls = []
+
+        def _spy(severity, findings):
+            calls.append((severity, findings))
+            return True
+
+        monkeypatch.setattr(judge_module, 'is_phantom_verdict_row', _spy)
+        verdict = JudgeVerdict(
+            run_id='run-delegation',
+            reviewed_at=datetime.now(UTC),
+            severity=VerdictSeverity.ok,
+            findings=[],
+        )
+
+        assert is_phantom_verdict(verdict) is True
+        assert calls == [(VerdictSeverity.ok, [])]
+
+    @pytest.mark.parametrize(
+        ('severity', 'findings'),
+        [
+            pytest.param(
+                VerdictSeverity.serious,
+                [_marked_phantom_finding()],
+                id='marked-phantom-serious',
+            ),
+            pytest.param(
+                VerdictSeverity.moderate,
+                [_marked_phantom_finding()],
+                id='marked-phantom-moderate-severity-agnostic',
+            ),
+            pytest.param(
+                VerdictSeverity.serious,
+                [_legacy_phantom_finding()],
+                id='legacy-unmarked-phantom',
+            ),
+            pytest.param(
+                VerdictSeverity.moderate,
+                [_legacy_phantom_finding()],
+                id='legacy-shape-at-moderate',
+            ),
+            pytest.param(
+                VerdictSeverity.serious,
+                [
+                    {
+                        'issue': f'Substantive content issue #{i}',
+                        'severity': 'serious',
+                        'recommendation': f'Fix issue #{i}',
+                    }
+                    for i in range(5)
+                ],
+                id='genuine-five-finding-serious-bc9459b8',
+            ),
+            pytest.param(
+                VerdictSeverity.serious,
+                [_legacy_phantom_finding(), {'issue': 'A second, genuine finding'}],
+                id='two-findings-not-phantom',
+            ),
+            pytest.param(
+                VerdictSeverity.serious,
+                [
+                    {
+                        'issue': (
+                            'Note: the historical "Judge response could not be '
+                            'parsed" error was a logging artifact.'
+                        )
+                    }
+                ],
+                id='prefix-mentioned-mid-string',
+            ),
+            pytest.param(VerdictSeverity.serious, [], id='empty-findings'),
+            pytest.param(VerdictSeverity.ok, [], id='ordinary-ok'),
+            pytest.param(
+                VerdictSeverity.minor,
+                [{'issue': 'minor drift in entity summary wording'}],
+                id='ordinary-minor',
+            ),
+            pytest.param(VerdictSeverity.serious, [{}], id='finding-without-issue'),
+            pytest.param(
+                VerdictSeverity.serious, [{'issue': None}], id='issue-is-none'
+            ),
+        ],
+    )
+    def test_model_api_agrees_with_shared_row_predicate(self, severity, findings):
+        """The model-typed API and the row-level primitive must never disagree.
+
+        This is the guard that actually catches divergence: it compares the
+        two implementations' ANSWERS across every shape task 3070 and task
+        3287 care about, so a judge.py edit that changes a conjunct — or a
+        constant, interned or not — turns this red even though the public
+        signature is unchanged.
+        """
+        verdict = JudgeVerdict(
+            run_id='run-equivalence',
+            reviewed_at=datetime.now(UTC),
+            severity=severity,
+            findings=findings,
+        )
+        assert is_phantom_verdict(verdict) is is_phantom_verdict_row(severity, findings)
+
+
 # --- Error trend detection tests ---
 
 
-def _make_verdicts(severities: list[str], *, spacing_seconds: float = 60.0):
+def _make_verdicts(
+    severities: list[str],
+    *,
+    spacing_seconds: float = 60.0,
+    findings_by_index: dict[int, list[dict]] | None = None,
+):
     """Build a list of JudgeVerdict objects, oldest first.
 
     Successive verdicts are spaced ``spacing_seconds`` apart so tests exercising
     time-windowed logic have a well-defined ordering.
+
+    ``findings_by_index`` optionally overrides the findings list of specific
+    verdicts by position (e.g. to build a phantom verdict inline). Existing
+    call sites that omit it are unaffected: every verdict still defaults to
+    findings=[], exactly as before this parameter existed.
     """
     from datetime import timedelta as _td
+    findings_by_index = findings_by_index or {}
     base = datetime.now(tz=UTC)
     return [
         JudgeVerdict(
             run_id=f'run-{i}',
             reviewed_at=base + _td(seconds=i * spacing_seconds),
             severity=VerdictSeverity(s),
+            findings=findings_by_index.get(i, []),
         )
         for i, s in enumerate(severities)
     ]
@@ -872,6 +1203,332 @@ async def test_error_trend_outside_window_no_halt(mock_journal):
     await judge._check_error_trends('proj', verdicts)
 
     assert not judge.is_halted('proj')
+
+
+# --- Error trend detection: phantom-verdict exclusion (task 3070) ---
+
+
+@pytest.mark.asyncio
+async def test_error_trend_phantom_serious_alone_does_not_halt(mock_journal):
+    """Six phantom severity=serious verdicts (a mix of the marked and
+    legacy-unmarked shapes) must NOT halt — a phantom carries no evidence
+    that a review ever happened, so it must not feed either gate.
+
+    Fails on current main: six serious verdicts satisfy both the
+    consecutive-most-recent streak gate (newest three are serious) and the
+    non-ok count gate (6 >= halt_trend_moderate_count=5), so the project
+    halts on evidence that is entirely fabricated.
+    """
+    config = _make_judge_config(
+        halt_on_judge_serious=True,
+        halt_trend_moderate_count=5,
+        halt_trend_consecutive_required=3,
+        halt_trend_window_hours=24.0,
+    )
+    judge = Judge(config=config, journal=mock_journal)
+
+    verdicts = _make_verdicts(
+        ['serious'] * 6,
+        findings_by_index={
+            0: [_marked_phantom_finding()],
+            1: [_legacy_phantom_finding()],
+            2: [_marked_phantom_finding()],
+            3: [_legacy_phantom_finding()],
+            4: [_marked_phantom_finding()],
+            5: [_legacy_phantom_finding()],
+        },
+    )
+    await judge._check_error_trends('proj', verdicts)
+
+    assert not judge.is_halted('proj')
+    mock_journal.set_halt.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_error_trend_phantom_does_not_complete_consecutive_streak(mock_journal):
+    """A trailing phantom serious verdict must not hold the
+    consecutive-most-recent streak gate open. Once the phantom is excluded
+    from the evidence entirely, the true newest three verdicts are
+    moderate, moderate, ok — the ok breaks the streak.
+
+    The genuine (non-phantom) non-ok count is 6 (>= halt_trend_moderate_count
+    =5), so the count gate alone is met honestly here — this test isolates
+    the streak gate. Fails after step-6: that fix only reaches the count
+    gate (non_ok_in_window); the streak gate still reads the phantom's raw
+    severity='serious' off the unfiltered ``windowed`` list and treats it as
+    real non-ok evidence, incorrectly keeping the streak open.
+    """
+    config = _make_judge_config(
+        halt_on_judge_serious=True,
+        halt_trend_moderate_count=5,
+        halt_trend_consecutive_required=3,
+        halt_trend_window_hours=24.0,
+    )
+    judge = Judge(config=config, journal=mock_journal)
+
+    # oldest -> newest: moderate x4, ok, moderate x2, phantom-serious
+    verdicts = _make_verdicts(
+        ['moderate', 'moderate', 'moderate', 'moderate', 'ok', 'moderate',
+         'moderate', 'serious'],
+        findings_by_index={7: [_marked_phantom_finding()]},
+    )
+    await judge._check_error_trends('proj', verdicts)
+
+    assert not judge.is_halted('proj')
+    mock_journal.set_halt.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_error_trend_count_gate_excludes_phantoms_when_streak_passes_honestly(
+    mock_journal,
+):
+    """Isolates the COUNT gate from the streak gate. The three most-recent
+    verdicts are genuinely moderate, so the consecutive-most-recent streak
+    gate passes honestly and needs no phantom-exclusion help at all — but
+    the non-ok COUNT only reaches halt_trend_moderate_count=5 if the two
+    oldest phantom-serious verdicts are counted alongside the three
+    moderates. This is the primary failure mode task 3070 exists to fix
+    (phantoms inflating the count), and it would stay green even if the
+    exclusion were miswired to affect only the streak slice — unlike
+    test_error_trend_phantom_does_not_complete_consecutive_streak above,
+    which isolates the streak gate the same way in reverse.
+    """
+    config = _make_judge_config(
+        halt_on_judge_serious=True,
+        halt_trend_moderate_count=5,
+        halt_trend_consecutive_required=3,
+        halt_trend_window_hours=24.0,
+    )
+    judge = Judge(config=config, journal=mock_journal)
+
+    # oldest -> newest: phantom-serious, phantom-serious, moderate x3
+    verdicts = _make_verdicts(
+        ['serious', 'serious', 'moderate', 'moderate', 'moderate'],
+        findings_by_index={
+            0: [_marked_phantom_finding()],
+            1: [_marked_phantom_finding()],
+        },
+    )
+    await judge._check_error_trends('proj', verdicts)
+
+    assert not judge.is_halted('proj')
+    mock_journal.set_halt.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_error_trend_phantom_minor_still_breaks_streak(mock_journal):
+    """Regression guard: a phantom-SHAPED verdict whose severity is 'minor'
+    must still break the consecutive-most-recent streak, exactly like any
+    other minor verdict.
+
+    The phantom-verdict exclusion is scoped to non-ok severities only (see
+    the design rationale in _check_error_trends) — it must never remove a
+    minor/ok verdict from the ordering, or a streak could close over it and
+    make halts MORE likely, a fail-open change outside this task's ask.
+    Expected green both before and after the phantom-exclusion fix.
+    """
+    config = _make_judge_config(
+        halt_on_judge_serious=True,
+        halt_trend_moderate_count=5,
+        halt_trend_consecutive_required=3,
+        halt_trend_window_hours=24.0,
+    )
+    judge = Judge(config=config, journal=mock_journal)
+
+    # Looks phantom-shaped (single finding, parse-failure issue prefix) but
+    # is severity='minor' — is_phantom_verdict's legacy branch requires
+    # severity=serious, so this does not even classify as phantom; and even
+    # if it did, 'minor' is not a _NON_OK_SEVERITIES member and must stay in
+    # the ordering either way. The finding-level 'severity' key inside
+    # _legacy_phantom_finding() says 'serious', but is_phantom_verdict never
+    # reads it — only verdict.severity (set to 'minor' below via
+    # _make_verdicts) and the finding's 'issue'/'code' matter.
+    verdicts = _make_verdicts(
+        ['moderate'] * 7 + ['minor'],
+        findings_by_index={7: [_legacy_phantom_finding()]},
+    )
+    await judge._check_error_trends('proj', verdicts)
+
+    assert not judge.is_halted('proj')
+
+
+@pytest.mark.asyncio
+async def test_error_trend_logs_structured_record_when_phantoms_excluded(
+    mock_journal, caplog,
+):
+    """Discarding phantom evidence must be loud, not silent: an operator
+    looking at a run that did NOT halt must be able to tell "no trend"
+    apart from "trend evidence was discounted as phantom" (task 3070's
+    loud-over-silent-degradation requirement).
+
+    Fails on current main: _check_error_trends drops phantoms from the
+    evidence set with no log record at all.
+    """
+    config = _make_judge_config(
+        halt_on_judge_serious=True,
+        halt_trend_moderate_count=5,
+        halt_trend_consecutive_required=3,
+        halt_trend_window_hours=24.0,
+    )
+    judge = Judge(config=config, journal=mock_journal)
+
+    # oldest -> newest: moderate, moderate, phantom-serious, phantom-serious
+    # (run-2, run-3 per _make_verdicts' f'run-{i}' naming).
+    verdicts = _make_verdicts(
+        ['moderate', 'moderate', 'serious', 'serious'],
+        findings_by_index={
+            2: [_marked_phantom_finding()],
+            3: [_marked_phantom_finding()],
+        },
+    )
+
+    with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.judge'):
+        await judge._check_error_trends('proj', verdicts)
+
+    excluded = [
+        r for r in caplog.records
+        if r.getMessage() == 'reconciliation.judge_trend_phantom_excluded'
+    ]
+    assert len(excluded) == 1, (
+        f"Expected exactly one phantom-excluded log record, got: "
+        f"{[r.getMessage() for r in caplog.records]}"
+    )
+    record = excluded[0]
+    assert getattr(record, 'project_id', None) == 'proj'
+    assert getattr(record, 'excluded_count', None) == 2
+    assert set(getattr(record, 'excluded_run_ids', [])) == {'run-2', 'run-3'}
+    # The two moderates (run-0, run-1) are the only genuine evidence left
+    # after excluding the two phantoms — pins that remaining_verdicts
+    # describes the surviving evidence, not e.g. the pre-exclusion total.
+    assert getattr(record, 'remaining_verdicts', None) == 2
+
+
+@pytest.mark.asyncio
+async def test_error_trend_no_log_when_no_phantoms_excluded(mock_journal, caplog):
+    """Companion silence assertion: a trend run over verdicts with NO
+    phantoms must not emit the phantom-excluded record at all."""
+    config = _make_judge_config(halt_on_judge_serious=True)
+    judge = Judge(config=config, journal=mock_journal)
+
+    verdicts = _make_verdicts(['minor'] * 10)
+
+    with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.judge'):
+        await judge._check_error_trends('proj', verdicts)
+
+    excluded = [
+        r for r in caplog.records
+        if r.getMessage() == 'reconciliation.judge_trend_phantom_excluded'
+    ]
+    assert excluded == []
+
+
+class TestPhantomVerdictAnchors:
+    """Acceptance regression (expected green on arrival, following the
+    precedent of task 3067's commit 17ce3e3124): the six dated rows named
+    in task 3070's evidence table (a read-only inspection of the live
+    judge_verdicts table), reconstructed with their verbatim persisted
+    findings payloads rather than a guessed approximation of them.
+    """
+
+    @staticmethod
+    def _anchor_verdicts() -> list[JudgeVerdict]:
+        """The six phantom rows dated in the task's evidence table: the
+        pre-2947 unmarked legacy shape (e87d8e4a 07-20, 09d14a75 07-22) and
+        the post-2947 code-marked shape (d741ffe3 / 33581299 07-23,
+        ad861d89 07-24, c7d84e9f 07-25). Both shapes share the same
+        persisted issue text; the marked shape additionally carries the
+        structured code key task 2947 started stamping.
+        """
+        anchors = [
+            ('e87d8e4a', datetime(2026, 7, 20, tzinfo=UTC), _legacy_phantom_finding()),
+            ('09d14a75', datetime(2026, 7, 22, tzinfo=UTC), _legacy_phantom_finding()),
+            ('d741ffe3', datetime(2026, 7, 23, tzinfo=UTC), _marked_phantom_finding()),
+            ('33581299', datetime(2026, 7, 23, tzinfo=UTC), _marked_phantom_finding()),
+            ('ad861d89', datetime(2026, 7, 24, tzinfo=UTC), _marked_phantom_finding()),
+            ('c7d84e9f', datetime(2026, 7, 25, tzinfo=UTC), _marked_phantom_finding()),
+        ]
+        return [
+            JudgeVerdict(
+                run_id=run_id,
+                reviewed_at=reviewed_at,
+                severity=VerdictSeverity.serious,
+                findings=[finding],
+            )
+            for run_id, reviewed_at, finding in anchors
+        ]
+
+    # Per-row phantom classification for these six shapes is already pinned
+    # by TestIsPhantomVerdict (the marked and legacy-unmarked cases). The
+    # two tests below are what that class does NOT cover: the trend gates'
+    # behavior over a realistic window of exactly these six rows, and that
+    # a genuine severity=serious row still counts toward a halt.
+
+    @pytest.mark.asyncio
+    async def test_trend_window_of_exactly_the_six_anchors_does_not_halt(
+        self, mock_journal,
+    ):
+        """A trend window containing exactly the six dated phantom rows —
+        the real shape of the live judge_verdicts table before this fix,
+        which independently satisfies both the streak gate (all six are
+        severity=serious) and the count gate (6 >= a count of 5) on raw
+        severity alone — must not halt."""
+        config = _make_judge_config(
+            halt_on_judge_serious=True,
+            halt_trend_moderate_count=5,
+            halt_trend_consecutive_required=3,
+            # Wide enough to span the anchors' real dated timestamps from
+            # "now" without the window gate discarding them — this test is
+            # about the phantom filter, not the window gate.
+            halt_trend_window_hours=24.0 * 365,
+        )
+        judge = Judge(config=config, journal=mock_journal)
+
+        await judge._check_error_trends('proj', self._anchor_verdicts())
+
+        assert not judge.is_halted('proj')
+        mock_journal.set_halt.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_genuine_bc9459b8_is_not_phantom_and_still_counts_toward_halt(
+        self, mock_journal,
+    ):
+        """The one real severity=serious row in the live DB (bc9459b8, 5
+        substantive findings, no code key) must still count as genuine
+        non-ok evidence toward a halt when paired with genuine moderates —
+        the fix must not become a back door for suppressing a real halt.
+        (That bc9459b8's shape classifies as non-phantom is already pinned
+        at the unit level by
+        TestIsPhantomVerdict.test_genuine_serious_with_five_findings_and_no_code_is_not_phantom;
+        the halt assertion below is the stronger, behavioral proof of the
+        same property — if this verdict were mistakenly excluded as
+        phantom, the halt below would not fire.)"""
+        genuine = JudgeVerdict(
+            run_id='bc9459b8',
+            reviewed_at=datetime.now(UTC),
+            severity=VerdictSeverity.serious,
+            findings=[
+                {
+                    'issue': f'Substantive content issue #{i}',
+                    'severity': 'serious',
+                    'recommendation': f'Fix issue #{i}',
+                }
+                for i in range(5)
+            ],
+        )
+
+        config = _make_judge_config(
+            halt_on_judge_serious=True,
+            halt_trend_moderate_count=3,
+            halt_trend_consecutive_required=3,
+            halt_trend_window_hours=24.0,
+        )
+        judge = Judge(config=config, journal=mock_journal)
+        verdicts = [*_make_verdicts(['moderate', 'moderate']), genuine]
+
+        await judge._check_error_trends('proj', verdicts)
+
+        assert judge.is_halted('proj')
+        mock_journal.set_halt.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -1443,6 +2100,54 @@ async def test_call_judge_cli_empty_output_returns_empty_string(mock_journal):
 
 
 @pytest.mark.asyncio
+async def test_call_judge_cli_input_rejected_raises_infra_error(mock_journal):
+    """A pre-turn CLI rejection is INFRA, not a benign empty verdict (task 3143).
+
+    The legacy "empty stdout = valid empty verdict" contract is scoped to a
+    genuine EMPTY_OUTPUT: we asked the judge something and it returned nothing.
+    A rejection means the judge was never asked at all — returning '' there
+    would have _parse_verdict fabricate a benign severity=minor verdict for a
+    review that never happened, exactly the silent degradation this module
+    exists to prevent.  invoke_with_cap_retry has already spent its one
+    automatic retry by the time we get here, so raising is the right escalation.
+    """
+    from unittest.mock import AsyncMock
+
+    from shared.cli_invoke import AgentResult
+
+    from fused_memory.reconciliation.judge import JudgeInfraError
+
+    fake_gate = make_gate_mock()
+    config = _make_judge_config(
+        judge_llm_provider='claude_cli',
+        judge_llm_model='claude-sonnet-4-5',
+    )
+    judge = Judge(config=config, journal=mock_journal, usage_gate=fake_gate)
+
+    rejected_result = AgentResult(
+        success=False,
+        output='Agent produced no output',
+        subtype='error_cli_input_rejected',
+        stderr=(
+            'Error: Input must be provided either through stdin or as a '
+            'prompt argument when using --print\n'
+        ),
+        session_id='jsess-2',
+    )
+
+    with patch(
+        'fused_memory.reconciliation.judge.invoke_with_cap_retry',
+        new_callable=AsyncMock,
+        return_value=rejected_result,
+    ), pytest.raises(JudgeInfraError) as excinfo:
+        await judge._call_judge_cli('Evaluate this run.')
+
+    assert 'Input must be provided' in str(excinfo.value), (
+        f'the raised message must carry the CLI stderr cause, got {excinfo.value!r}'
+    )
+
+
+@pytest.mark.asyncio
 async def test_call_judge_cli_forwards_cwd_to_invoke_claude_agent(mock_journal, tmp_path):
     """_call_judge_cli passes cwd all the way through to invoke_claude_agent.
 
@@ -1489,6 +2194,122 @@ async def test_call_judge_cli_forwards_cwd_to_invoke_claude_agent(mock_journal, 
     mock_agent.assert_called_once()
     call_kwargs = mock_agent.call_args.kwargs
     assert call_kwargs['cwd'] == Path(explore_root)
+
+
+@pytest.mark.asyncio
+async def test_call_judge_cli_scopes_mcp_to_no_servers(mock_journal):
+    """The judge strict-scopes its run to ZERO MCP servers.
+
+    ``disallowed_tools=['*']`` alone does NOT keep MCP tools unreachable here:
+    under an ``output_schema`` cli_invoke expands the wildcard into a
+    BUILT-INS-ONLY deny-list carrying no MCP tool pattern, and ``cwd`` is
+    ``explore_codebase_root`` (the project root, task 1989), which holds a live
+    ``.mcp.json`` the CLI would ambient-merge — under ``bypassPermissions``,
+    that is unreviewed access to tools like ``halt_scheduler`` /
+    ``delete_memory``.  Closing it takes a truthy scoping ``mcp_config`` plus
+    ``strict_mcp_config=True``; the four pre-existing guarantees are asserted
+    alongside so this fix cannot be traded against them.
+    """
+    from pathlib import Path
+    from unittest.mock import AsyncMock
+
+    from shared.cli_invoke import AgentResult
+
+    from fused_memory.reconciliation.judge import JUDGE_VERDICT_SCHEMA
+
+    config = _make_judge_config(
+        judge_llm_provider='claude_cli',
+        judge_llm_model='claude-sonnet-4-5',
+    )
+    judge = Judge(config=config, journal=mock_journal, usage_gate=make_gate_mock())
+
+    # A usable structured payload: a success carrying none is classified as
+    # cli_output_empty infra, which would mask this test's kwargs assertions.
+    fake_result = AgentResult(
+        success=True,
+        output='',
+        structured_output={'severity': 'ok', 'findings': []},
+        session_id='jsess-mcp',
+    )
+
+    with patch(
+        'fused_memory.reconciliation.judge.invoke_with_cap_retry',
+        new_callable=AsyncMock,
+    ) as mock_invoke:
+        mock_invoke.return_value = fake_result
+
+        await judge._call_judge_cli('Evaluate this run.')
+
+    mock_invoke.assert_called_once()
+    call_kwargs = mock_invoke.call_args.kwargs
+
+    assert call_kwargs['strict_mcp_config'] is True
+    # A zero-server config, but a TRUTHY one — the --strict-mcp-config emit is
+    # gated on `if mcp_config:`, so an inline `{}` regression fails here.
+    assert call_kwargs['mcp_config'] == {'mcpServers': {}}
+
+    # Unregressed pre-existing guarantees.
+    assert call_kwargs['disallowed_tools'] == ['*']
+    assert call_kwargs['output_schema'] is JUDGE_VERDICT_SCHEMA
+    assert call_kwargs['permission_mode'] == 'bypassPermissions'
+    assert call_kwargs['cwd'] == Path(config.explore_codebase_root)
+
+
+@pytest.mark.asyncio
+async def test_call_judge_cli_forwards_mcp_scoping_to_invoke_claude_agent(mock_journal, tmp_path):
+    """Both MCP-scoping kwargs survive invoke_with_cap_retry's forwarding layer.
+
+    ``invoke_with_cap_retry`` takes ``**invoke_kwargs`` and forwards them blind,
+    so the kwargs-level test above proves only that the judge NAMES these
+    kwargs.  Patching one level lower with ``usage_gate=None`` (the
+    single-invocation fast path) runs the real forwarding code, proving the
+    keys are not dropped en route — same rationale as
+    test_call_judge_cli_forwards_cwd_to_invoke_claude_agent above.
+
+    ``autospec=True`` is load-bearing, not incidental: a bare ``AsyncMock`` is
+    signature-less and swallows arbitrary keywords, so a misspelled
+    ``strict_mcp_configs=True`` would be forwarded and asserted-on happily here
+    and surface as a TypeError only in production.  The autospec'd mock is
+    built from the real ``invoke_claude_agent`` signature and raises TypeError
+    on a kwarg it does not accept, so this test also pins that both names are
+    genuinely supported parameters.
+
+    Deliberately NOT asserted: that the ambient .mcp.json is actually
+    suppressed.  That is the external CLI's own documented
+    ``--strict-mcp-config`` contract, not hermetically testable here.
+    """
+    from shared.cli_invoke import AgentResult
+
+    # Use tmp_path so the cwd Path actually exists on disk.
+    config = _make_judge_config(
+        judge_llm_provider='claude_cli',
+        judge_llm_model='claude-sonnet-4-5',
+        explore_codebase_root=str(tmp_path),
+    )
+
+    fake_result = AgentResult(
+        success=True,
+        output='',
+        structured_output={'severity': 'ok', 'findings': []},
+        session_id='jsess-mcp-deep',
+    )
+
+    # autospec (not a bare AsyncMock): validates every kwarg against the real
+    # invoke_claude_agent signature, so an unsupported/misspelled one raises
+    # TypeError here instead of only in production. See the docstring.
+    with patch(
+        'shared.cli_invoke.invoke_claude_agent',
+        autospec=True,
+    ) as mock_agent:
+        mock_agent.return_value = fake_result
+
+        judge = Judge(config=config, journal=mock_journal, usage_gate=None)
+        await judge._call_judge_cli('Evaluate this run.')
+
+    mock_agent.assert_called_once()
+    call_kwargs = mock_agent.call_args.kwargs
+    assert call_kwargs['strict_mcp_config'] is True
+    assert call_kwargs['mcp_config'] == {'mcpServers': {}}
 
 
 # ---------------------------------------------------------------------------

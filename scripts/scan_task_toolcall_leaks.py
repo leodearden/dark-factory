@@ -47,13 +47,15 @@ discriminator described above is unchanged.
 
 Note the division of labour with :mod:`fused_memory.server.markup_tripwire`,
 which owns the LIVE write-boundary rejection at the
-``submit_task``/``update_task``/``add_memory``/``add_episode`` MCP tools and
-is the authoritative enumeration of the envelope literals. That guard is
-deliberately broader (a bare substring scan, accepting over-reporting to
-maximise recall at write time). This detector is deliberately PRECISE,
-because it runs over an already-stored corpus where a false positive would
-provoke an unnecessary content rewrite. The two are not redundant and must
-not be collapsed into one another.
+``submit_task``/``update_task``/``add_memory``/``add_episode`` MCP tools. That
+write-boundary guard is deliberately broader (a bare substring scan,
+accepting over-reporting to maximise recall at write time). This detector is
+deliberately PRECISE, because it runs over an already-stored corpus where a
+false positive would provoke an unnecessary content rewrite. The two are not redundant and must
+not be collapsed into one another. What they DO share, since task 3688, is the
+envelope-literal enumeration itself: it lives once in
+:mod:`shared.toolcall_markup` (INV-5), and the two calibrations are two named
+predicates over that one set rather than two independently spelled sets.
 """
 from __future__ import annotations
 
@@ -64,6 +66,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 from _task_db_scan import (
+    SCAN_EXIT_CODE_EPILOG,
     add_db_discovery_args,
     format_json,
     group_matches_by_db,
@@ -89,6 +92,28 @@ from _task_db_scan import (
 _FM_SRC = Path(__file__).resolve().parent.parent / "fused-memory" / "src"
 if str(_FM_SRC) not in sys.path:
     sys.path.insert(0, str(_FM_SRC))
+
+# ...and shared/src alongside it, same idiom and same precedence argument:
+# toolcall_xml_leak now imports the envelope-literal enumeration from
+# shared.toolcall_markup (INV-5, task 3688), so without this entry the import
+# below fails outright, and with a hardcoded or install-provided one a worktree
+# run would resolve `shared` to the MAIN checkout's copy of the literals.
+#
+# NOTE the cost, so the "bare interpreter" claim above is not read too strongly:
+# shared/__init__.py imports the whole package eagerly, so
+# `import shared.toolcall_markup` drags in shared's third-party dependencies
+# (aiosqlite and friends) even though toolcall_markup is itself pure and
+# stdlib-only. A dependency-free system python can therefore no longer run this
+# script; an interpreter that has the project's dependencies — the repo venv,
+# `uv run` — still can. That is not a new class of constraint here:
+# scripts/repair_wiped_metadata_files.py and
+# scripts/audit_combine_gate_marker_loss.py already import `shared` through this
+# identical bootstrap and already pay it. Making a leaf importable without the
+# package init would be a shared-wide change and is deliberately not one this
+# task takes on.
+_SHARED_SRC = Path(__file__).resolve().parent.parent / "shared" / "src"
+if str(_SHARED_SRC) not in sys.path:
+    sys.path.insert(0, str(_SHARED_SRC))
 
 from fused_memory.utils.toolcall_xml_leak import (  # noqa: E402
     LEAK_TAIL,
@@ -195,24 +220,14 @@ def _build_parser() -> argparse.ArgumentParser:
             'serialized <parameter name="..."> tool-call fragment). '
             "Detection/reporting only -- never mutates task text."
         ),
-        # The 0/1/2/3 codes below are RETURNED BY run_scan_cli() in
-        # _task_db_scan.py, not by anything in this file -- this epilog is only
-        # a --help-visible copy of that contract. It is the fourth copy, beside
-        # run_scan_cli()'s docstring, main()'s docstring below, and the
-        # byte-parallel epilog in scan_provenance_note_log_leaks.py. Nothing
-        # enforces the lockstep, so change all four together. The standing fix
-        # is to hoist the shared wording into a SCAN_EXIT_CODE_EPILOG constant
-        # beside NO_DB_RESOLVED_MESSAGE in _task_db_scan.py, which task 3547
-        # held no lock on. (audit_wiped_metadata_files.py's epilog is NOT a
-        # copy -- it documents its own main()'s distinct codes.)
-        epilog=(
-            "exit codes: 0 = clean, no leaks found; 1 = at least one leak "
-            "found; 2 = no tasks.db could be resolved from --db / "
-            "--project-root / DASHBOARD_KNOWN_PROJECT_ROOTS / the "
-            "dark-factory default; 3 = every resolved tasks.db was "
-            "unreadable, so NOTHING was scanned (never treat 3 as a clean "
-            "run)."
-        ),
+        # The 0/1/2/3 codes are RETURNED BY run_scan_cli() in _task_db_scan.py,
+        # not by anything in this file -- SCAN_EXIT_CODE_EPILOG (defined there,
+        # beside NO_DB_RESOLVED_MESSAGE) is just a --help-visible copy of that
+        # contract, shared with scan_provenance_note_log_leaks.py so the two
+        # scanners' epilogs cannot drift apart (task 3744, follow-up to 3547).
+        # main()'s docstring below restates the same numbers in its own prose,
+        # and nothing keeps the two in lockstep -- change them together.
+        epilog=SCAN_EXIT_CODE_EPILOG,
     )
     add_db_discovery_args(
         parser,

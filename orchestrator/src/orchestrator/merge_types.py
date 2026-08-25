@@ -1055,6 +1055,19 @@ class RealMergeItem:
     merged_branch_tip: str | None = None  # γ2: branch HEAD rev-parsed by the merger; passed to _finalize_advanced_merge
     cap_permit: CapPermit | None = None  # θ: merge-ahead-cap token owned by PermitLedger; non-None for non-speculative, non-train successful merges (Mechanism 1)
     permit: SpecPermit | None = None  # ζ: speculation-slot token owned by PermitLedger; threaded/released by η
+    # task 3206 / PRD §5.3 re-merge carve-out: True → produced by _remerge (a
+    # RECOVERY re-merge onto real main), so the §5.3 verify-base⊄frozen-tip
+    # guard is exempt.  Set ONLY at _remerge's single-exit chokepoint (which
+    # covers all five consumer paths); default False keeps every other
+    # construction site unchanged.
+    #
+    # SCOPED TO THE RECOVERY BASE, NOT THE ITEM'S LIFETIME.  dataclasses.replace
+    # copies the marker like any other field, so a re-anchoring rebuild would
+    # otherwise carry the exemption onto a base the carve-out never justified.
+    # The two finalize-path rebuilds that re-anchor base_sha (gate rebase, CAS
+    # retry) therefore pass remerge_recovery=False explicitly; a future re-anchor
+    # site must do the same or it opens a silent §5.3 false-negative window.
+    remerge_recovery: bool = False
 
 
 @dataclass
@@ -1079,6 +1092,16 @@ class DecidedItem:
     already_delivered: bool = False  # True → merger resolved req.result OOB; verifier skips set_result but still runs n_failed/slot bookkeeping
     failure_diagnostic: dict[str, str] | None = None  # Populated on non-conflict merge failure
     permit: SpecPermit | None = None  # ζ: speculation-slot token owned by PermitLedger; threaded/released by η
+    # task 3206 / PRD §5.3: mirrors RealMergeItem so BOTH arms of the union
+    # carry the marker.  Currently UNREAD on this arm — both §5.3 consumers
+    # (_warn_if_verify_base_not_frozen_tip, _frozen_base_chain) type-narrow to
+    # RealMergeItem before reading it, because only a real merge has a verify
+    # base to check.  It is not decorative, though: _remerge's single-exit
+    # chokepoint stamps the marker with dataclasses.replace on whichever
+    # variant its body returned, and replace() raises TypeError for an unknown
+    # field — so dropping this would break every DecidedItem exit of the
+    # recovery path.  See the RealMergeItem field for the lifetime scoping.
+    remerge_recovery: bool = False
 
 
 SpeculativeItem: TypeAlias = RealMergeItem | DecidedItem
@@ -1142,6 +1165,89 @@ class Decided:
 
     outcome: MergeOutcome
     merge_result: MergeResult | None = None
+
+
+@dataclass
+class ChainResult:
+    """Result of a deep merge-ahead chain build (``plans/deep-merge-ahead-prd.md``
+    §Contract, task β).
+
+    Returned by :func:`orchestrator.merge_queue.build_chain`, which
+    sequentially merges queued items in submission order onto the frozen
+    head's merge commit inside ONE scratch worktree, truncating at the first
+    textual conflict.  Sibling of the ``classify_and_merge`` sum type
+    (:class:`MergedOk` / :class:`Decided`) — same family, one level up: those
+    describe a single item's merge, this describes a whole speculative chain.
+
+    Field semantics:
+
+    * ``links`` — ``(task_id, merge_commit)`` in LAND order.  A contiguous
+      PREFIX of the queue snapshot: never a subset with a hole, because δ
+      lands these in order through the existing CAS advance and a hole would
+      break the in-order / frozen-prefix invariant.
+    * ``tip`` — the SHA the chain ends at.  Equals ``head_merge_commit`` when
+      ``links`` is empty, so a zero-link result still names a verifiable tip.
+    * ``truncated_at`` — ``task_id`` of the first item that did NOT chain, or
+      ``None``.  **A depth stop is NOT a truncation**: when the walk stopped
+      because it reached ``target_depth``/``cap``, or ran the whole snapshot
+      clean, ``truncated_at`` is ``None``.
+    * ``truncated_reason`` — ``'conflict'`` (genuine textual conflict — an
+      expected, benign chain outcome), ``'train_request'`` (a
+      :class:`GroupMergeRequest`, which ``_do_train_merge`` owns),
+      ``'already_merged'`` (the item's work is ALREADY in the base, so
+      ``git merge --no-ff`` was a no-op — benign: it caps the chain but
+      signals no fault, and the item's real verdict is rendered by the
+      sequential path's ``_is_genuinely_merged`` guard), or ``'merge_error'``
+      (a non-conflict merge failure: missing ref, hook rejection).  **Only
+      ``'merge_error'`` denotes a genuine fault** — the other three are
+      expected outcomes and are deliberately NOT collapsed into it, so ε's
+      deep-fail reader is not inflated with non-faults.
+    * ``lane`` / ``lane_warm`` — the ONE scratch worktree holding ``tip``.
+    * ``build_ms`` — wall-clock milliseconds the build cost, stamped by γ's
+      caller (``_deep_chain_placement``) rather than by ``build_chain``
+      itself, so it measures the FULL stall the dispatch loop pays: lane
+      acquisition, the sequential merges, and the ``asyncio.timeout`` wrapper's
+      own overhead.  ``None`` on any result ``build_chain`` returned directly
+      to a caller that did not stamp it.  γ emits it as the ``chain_build_ms``
+      field on the same ``merge_verify`` event that carries ``chain_items``,
+      because the build is awaited INLINE on the dispatch path: for its whole
+      duration ``_verifier_loop`` cannot run FINALIZE-HEAD, and that per-round
+      stall must be attributable to the chain rather than misread as verify
+      time (see the Caller-cost note on ``build_chain``).
+
+    **Decision #4 — the ``truncated_at`` item MUST NOT have any outcome
+    emitted for it.**  A chain conflict at position j may be a conflict with
+    an *unlanded* predecessor, so item j is not genuinely conflicted; it takes
+    its normal sequential path later.  ``build_chain`` therefore never
+    resolves a future, never calls ``_emit_merge_attempt``, and never calls
+    ``_note_conflict_detected`` for any item in the snapshot.
+
+    **Lane ownership.**  A NON-EMPTY result HOLDS ``lane``, and the caller
+    MUST release it via
+    :func:`orchestrator.merge_liveness.release_chain_build_lane` (passing
+    ``warm=lane_warm``) once done with the tip.  An EMPTY result never holds a
+    lane (``lane is None``, ``lane_warm is False``), so a caller that skips
+    the release on the empty path cannot leak one.
+    """
+
+    links: list[tuple[str, str]]
+    tip: str
+    truncated_at: str | None = None
+    truncated_reason: str | None = None
+    lane: Path | None = None
+    lane_warm: bool = False
+    build_ms: int | None = None
+
+    @property
+    def depth(self) -> int:
+        """Number of chained links — items ADDITIONAL to the dispatching one.
+
+        Off by one from the ``chain_items`` telemetry field on purpose: the
+        dispatching item is chain item #1 and is not a link, so γ emits
+        ``1 + depth`` (merge_queue.py, ``_run_inflight_verify``'s chain arm).
+        A 2-link chain is ``depth == 2`` and ``chain_items == 3``.
+        """
+        return len(self.links)
 
 
 class InflightStatus(StrEnum):
@@ -1344,6 +1450,18 @@ class InflightEntry:
     verify_result  : set when the verify has completed (pass=None; fail=VerifyResult)
     status         : optional sentinel string ('DROPPED', 'REQUEUED', 'RUNNER_UNAVAILABLE')
                      returned by _run_inflight_verify to signal special handling by _finalize_inflight
+    chain          : the :class:`ChainResult` this dispatch's verify was
+                     REDIRECTED onto (task 3185, PRD γ), or ``None`` on the
+                     ordinary adjacent-verify path.  Recorded for disposition
+                     and diagnosis only: γ reads it nowhere but the dispatch
+                     seam that set it, because a tip verdict is deliberately
+                     non-adopting (see _run_inflight_verify's chain arm).  δ
+                     (task 3186) is what consumes ``links`` — the in-order CAS
+                     walk that lands the verified prefix.  NOTE the lane
+                     referenced here is already RELEASED by the time
+                     _finalize_inflight sees this entry: _run_inflight_verify
+                     returns it to the pool in its own ``finally``, so this
+                     field is never a release handle.
     """
 
     item: SpeculativeItem
@@ -1356,6 +1474,7 @@ class InflightEntry:
     status: InflightStatus | None = None    # sentinel: DROPPED / REQUEUED / RUNNER_UNAVAILABLE / ABANDONED_PREDISPATCH / REQUEUED_PREDISPATCH
     started_at: float | None = None         # time.time() at dispatch construction (≈ verify start)
     permit: SpecPermit | None = None        # ζ: speculation-slot token owned by PermitLedger; threaded/released by η
+    chain: ChainResult | None = None        # γ (task 3185): the deep chain this verify was redirected onto
 
     def __post_init__(self) -> None:
         """Enforce the I2-shadow invariant (task 1990 / MQ-invariants ε).
@@ -1407,7 +1526,11 @@ class InflightVerifyResult:
                   InflightStatus.DROPPED             — sole-waiter abandoned; merge_wt cleaned
                   InflightStatus.REQUEUED             — operator halt; req re-queued on _queue
                   InflightStatus.RUNNER_UNAVAILABLE — remote runner raised RunnerUnavailable;
-                                        merge_wt NOT cleaned (will be re-dispatched)
+                                        merge_wt NOT cleaned at the raise site — it is carried
+                                        to _finalize_inflight, which disposes of it via
+                                        _release_or_cleanup before _remerge allocates the
+                                        replacement _merge-<uuid> (task 3251).  spec_warm is
+                                        carried with it, because that disposal routes on it.
     reason      : str(exc) from the RunnerUnavailable exception when status is
                   InflightStatus.RUNNER_UNAVAILABLE; None on all other paths.  Used by
                   the unavailability tracker + alarm to name the actual failure cause

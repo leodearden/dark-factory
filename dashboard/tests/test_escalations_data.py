@@ -1,14 +1,21 @@
 """Tests for dashboard.data.escalations module.
 
-Tests use tmp_path to materialise fake escalation dirs (root + archive subdirs)
-and synthesise minimal escalation-shaped dicts.  No async / MCP traffic.
+Most tests use tmp_path to materialise fake escalation dirs (root + archive
+subdirs) and synthesise minimal escalation-shaped dicts — no async / MCP
+traffic.  The exception is :class:`TestFetchPinsRecovery` at the bottom, which
+drives the ``fetch_pins_recovery`` escalation-URL fan-out over an
+``httpx.MockTransport`` (same idiom as tests/test_merge_halt.py).
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from pathlib import Path
+
+import httpx
+import pytest
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -1087,3 +1094,382 @@ class TestResolveOwningProjectPrefixRegression:
             f"Expected None but got {result!r} — "
             ".worktrees-archive false-matched .worktrees root via string prefix"
         )
+
+
+# ---------------------------------------------------------------------------
+# fetch_pins_recovery — escalation-URL fan-out (task 3543 step-23, spec S8)
+# ---------------------------------------------------------------------------
+#
+# `get_pending_escalations` now computes a per-record `pins_recovery` list
+# (escalation/src/escalation/server.py) and deliberately OMITS the key when it
+# could not be computed.  These tests pin the dashboard-side fan-out that reads
+# it, and in particular its THREE-state discipline, which mirrors
+# `escalation.pins.PinReport.store_unavailable`:
+#
+#   None  — this project could not be read (transport error, timeout, error
+#           envelope).  UNKNOWN.  The UI must render nothing.
+#   {}    — read succeeded; no record carried an annotation.
+#   {id: [task_ids]} — read succeeded and these records are annotated.
+#
+# Collapsing the first into the second is the exact esc-3163 defect: an empty
+# map reads as "nothing pins this", which routes a genuinely-pinned strand down
+# the wrong branch.  The same discipline applies per RECORD: an id absent from
+# a non-None map is unknown, never "does not pin".
+
+
+def _init_response(request_id: int = 1) -> httpx.Response:
+    """Minimal MCP `initialize` reply so McpSession completes its handshake."""
+    return httpx.Response(
+        200,
+        json={
+            'jsonrpc': '2.0',
+            'id': request_id,
+            'result': {
+                'protocolVersion': '2025-03-26',
+                'capabilities': {'tools': {}},
+                'serverInfo': {'name': 'test', 'version': '0.1'},
+            },
+        },
+        headers={'mcp-session-id': 'test-session-id'},
+    )
+
+
+def _tool_response(inner, request_id: int = 1) -> httpx.Response:
+    """Encode *inner* the way FastMCP encodes a list-returning tool's result.
+
+    Verified against the installed fastmcp 3.2.2
+    (``fastmcp/tools/base.py::_convert_to_content``): a non-empty ``list`` of
+    plain dicts is aggregated into a SINGLE TextContent block holding the
+    JSON-serialised list, while an EMPTY list short-circuits to an empty
+    ``content`` array (the ``all(isinstance(...))`` guard is vacuously true for
+    ``[]``, so the list itself is returned as the content blocks).
+
+    That asymmetry is load-bearing for this fan-out: the dashboard's
+    ``_extract_tool_result`` maps empty content to ``{}``, so an authoritative
+    "no pending escalations" arrives as a dict, not as a list.  A fixture that
+    always emitted a text block would test a wire shape the real server never
+    produces and would leave that branch unexercised.
+    """
+    if isinstance(inner, list) and not inner:
+        content = []
+    else:
+        content = [{'type': 'text', 'text': json.dumps(inner)}]
+    return httpx.Response(
+        200,
+        json={'jsonrpc': '2.0', 'id': request_id, 'result': {'content': content}},
+        headers={'mcp-session-id': 'test-session-id'},
+    )
+
+
+class _PinsHandler:
+    """MockTransport handler dispatching per-port `get_pending_escalations`.
+
+    ``responses`` maps port → the value that port's escalation server returns
+    (normally a ``list[dict]``).  ``fail_ports`` raise ``httpx.ConnectError``;
+    ``slow_ports`` sleep first so the per-call timeout path can be driven.
+    Every tools/call is recorded in ``tool_calls`` as ``(port, name, args)``.
+    """
+
+    def __init__(
+        self,
+        responses: dict[int, object] | None = None,
+        *,
+        fail_ports: set[int] | None = None,
+        slow_ports: dict[int, float] | None = None,
+    ):
+        self.responses: dict[int, object] = responses or {}
+        self.fail_ports = fail_ports or set()
+        self.slow_ports = slow_ports or {}
+        self.tool_calls: list[tuple[int, str, dict]] = []
+
+    async def __call__(self, request: httpx.Request) -> httpx.Response:
+        port = request.url.port
+        assert port is not None
+        if port in self.fail_ports:
+            raise httpx.ConnectError('refused')
+        if port in self.slow_ports:
+            await asyncio.sleep(self.slow_ports[port])
+        body = json.loads(request.content)
+        method = body.get('method', '')
+        request_id = body.get('id', 1)
+        if method == 'initialize':
+            return _init_response(request_id)
+        if method.startswith('notifications/'):
+            return httpx.Response(202, headers={'mcp-session-id': 'test-session-id'})
+        params = body.get('params') or {}
+        self.tool_calls.append(
+            (port, params.get('name', ''), params.get('arguments') or {}),
+        )
+        return _tool_response(self.responses.get(port, []), request_id)
+
+
+class _ExplodingHandler:
+    """Handler that fails the test if any HTTP request is issued at all."""
+
+    def __init__(self):
+        self.called = False
+
+    async def __call__(self, request: httpx.Request) -> httpx.Response:
+        self.called = True
+        raise AssertionError(f'unexpected HTTP request to {request.url}')
+
+
+def _pins_urls(*ports: int) -> dict[str, str]:
+    return {f'proj{p}': f'http://127.0.0.1:{p}/mcp' for p in ports}
+
+
+def _rec(esc_id: str, **extra) -> dict:
+    """A compact pending-escalation record as the escalation server returns it."""
+    d = {'id': esc_id, 'task_id': '3543', 'level': 1, 'status': 'pending'}
+    d.update(extra)
+    return d
+
+
+class TestFetchPinsRecovery:
+    """`fetch_pins_recovery(client, escalation_urls)` fan-out contract."""
+
+    @pytest.fixture(autouse=True)
+    def _clean_sessions(self):
+        from dashboard.data.memory import reset_sessions
+        reset_sessions()
+        yield
+        reset_sessions()
+
+    async def test_empty_urls_short_circuits_without_any_http_call(self):
+        """No configured escalation URLs → `{}` and not a single request."""
+        from dashboard.data.escalations import fetch_pins_recovery
+
+        handler = _ExplodingHandler()
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            result = await fetch_pins_recovery(client, {})
+        assert result == {}
+        assert handler.called is False
+
+    async def test_annotated_records_map_id_to_task_ids(self):
+        """A successful read returns `{esc_id: pins_recovery}` per project."""
+        from dashboard.data.escalations import fetch_pins_recovery
+
+        handler = _PinsHandler({
+            8100: [
+                _rec('esc-a', pins_recovery=['3543']),
+                _rec('esc-b', pins_recovery=[]),
+            ],
+            8105: [_rec('esc-c', task_id='99', pins_recovery=['99'])],
+        })
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            result = await fetch_pins_recovery(client, _pins_urls(8100, 8105))
+
+        assert set(result) == {'proj8100', 'proj8105'}
+        assert result['proj8100'] == {'esc-a': ['3543'], 'esc-b': []}
+        assert result['proj8105'] == {'esc-c': ['99']}
+
+    async def test_requests_compact_pending_records(self):
+        """The fan-out asks for `get_pending_escalations(compact=True)`.
+
+        `_COMPACT_PENDING_FIELDS` (escalation/server.py) exists precisely
+        because the dashboard reads compact records — it re-adds
+        `pins_recovery` on top of the shared compact projection.  Requesting
+        the full record would haul detail/members/options across the wire on
+        every poll for a field this caller never reads.
+        """
+        from dashboard.data.escalations import fetch_pins_recovery
+
+        handler = _PinsHandler({8100: [_rec('esc-a', pins_recovery=['3543'])]})
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            await fetch_pins_recovery(client, _pins_urls(8100))
+
+        assert len(handler.tool_calls) == 1, handler.tool_calls
+        _port, name, args = handler.tool_calls[0]
+        assert name == 'get_pending_escalations'
+        assert args.get('compact') is True
+
+    async def test_record_without_the_key_is_omitted_not_defaulted(self):
+        """An older escalation server omits `pins_recovery` → omit the id.
+
+        Defaulting the missing key to `[]` would manufacture a confident
+        "this record pins nothing" out of a server that never computed the
+        annotation — the same false-negative the escalation side refuses to
+        emit.  The id must simply be absent from the map so downstream renders
+        UNKNOWN.
+        """
+        from dashboard.data.escalations import fetch_pins_recovery
+
+        handler = _PinsHandler({
+            8100: [
+                _rec('esc-old'),                            # pre-3543 server
+                _rec('esc-new', pins_recovery=['3543']),
+            ],
+        })
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            result = await fetch_pins_recovery(client, _pins_urls(8100))
+
+        annotated = result['proj8100']
+        assert annotated is not None  # a successful read, not the UNKNOWN state
+        assert annotated == {'esc-new': ['3543']}
+        assert 'esc-old' not in annotated
+
+    async def test_non_list_annotation_is_omitted(self):
+        """A malformed `pins_recovery` (not a list) is dropped, not coerced."""
+        from dashboard.data.escalations import fetch_pins_recovery
+
+        handler = _PinsHandler({
+            8100: [
+                _rec('esc-bad', pins_recovery='3543'),
+                _rec('esc-null', pins_recovery=None),
+                _rec('esc-ok', pins_recovery=['3543']),
+            ],
+        })
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            result = await fetch_pins_recovery(client, _pins_urls(8100))
+
+        assert result['proj8100'] == {'esc-ok': ['3543']}
+
+    async def test_authoritative_empty_queue_maps_to_empty_dict(self):
+        """Zero pending escalations is a SUCCESSFUL read → `{}`, never None.
+
+        FastMCP encodes an empty list as empty `content`, which the shared
+        `_extract_tool_result` collapses to `{}` — so this arrives as a dict
+        even though the tool returns a list.  It must still be distinguishable
+        from an unreachable project.
+        """
+        from dashboard.data.escalations import fetch_pins_recovery
+
+        handler = _PinsHandler({8100: []})
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            result = await fetch_pins_recovery(client, _pins_urls(8100))
+
+        assert result['proj8100'] is not None
+        assert result['proj8100'] == {}
+
+    async def test_connect_error_maps_to_none_not_empty(self):
+        """An unreachable project is UNKNOWN (None), not "nothing pins" (`{}`)."""
+        from dashboard.data.escalations import fetch_pins_recovery
+
+        handler = _PinsHandler(fail_ports={8102})
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            result = await fetch_pins_recovery(client, _pins_urls(8102))
+
+        assert 'proj8102' in result
+        assert result['proj8102'] is None
+
+    async def test_timeout_maps_to_none(self):
+        """A project that does not answer inside per_call_timeout is UNKNOWN."""
+        from dashboard.data.escalations import fetch_pins_recovery
+
+        handler = _PinsHandler(
+            {8100: [_rec('esc-a', pins_recovery=['3543'])], 8105: []},
+            slow_ports={8105: 0.5},
+        )
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            result = await fetch_pins_recovery(
+                client, _pins_urls(8100, 8105), per_call_timeout=0.05,
+            )
+
+        assert result['proj8100'] == {'esc-a': ['3543']}
+        assert result['proj8105'] is None
+
+    async def test_error_envelope_maps_to_none(self):
+        """A tool result that is a dict (error envelope) is UNKNOWN, not empty.
+
+        The tool's contract is `list[dict]`; anything else means the call did
+        not deliver the annotation.  The one exception — an EMPTY dict, which
+        is how FastMCP+`_extract_tool_result` render an authoritative empty
+        list — is covered by its own test above.
+        """
+        from dashboard.data.escalations import fetch_pins_recovery
+
+        handler = _PinsHandler({8100: {'error': 'no escalation queue wired'}})
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            result = await fetch_pins_recovery(client, _pins_urls(8100))
+
+        assert result['proj8100'] is None
+
+    async def test_one_project_failure_never_sinks_the_others(self):
+        """Per-project isolation: every configured label is always present."""
+        from dashboard.data.escalations import fetch_pins_recovery
+
+        handler = _PinsHandler(
+            {
+                8100: [_rec('esc-a', pins_recovery=['3543'])],
+                8107: [],
+            },
+            fail_ports={8102},
+        )
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            result = await fetch_pins_recovery(client, _pins_urls(8100, 8102, 8107))
+
+        assert set(result) == {'proj8100', 'proj8102', 'proj8107'}
+        assert result['proj8100'] == {'esc-a': ['3543']}
+        assert result['proj8102'] is None
+        assert result['proj8107'] == {}
+
+    async def test_unanticipated_exception_sinks_only_its_own_project(self):
+        """An exception class the probe does NOT catch degrades one project.
+
+        ``_fetch_pins_one`` catches the transport family it can anticipate
+        ((TimeoutError, httpx.HTTPError, OSError, ValueError)), but
+        ``mcp_tool_call`` reaches ``McpSession.call_tool``, whose failure modes
+        are not contractually narrowed to those.  If such an escape propagated
+        out of the gather, app.py's outer ``except Exception`` would blank the
+        annotation for EVERY project at once — the fleet-wide collapse this
+        per-project fan-out exists to prevent.  A RuntimeError stands in for
+        the whole unanticipated class.
+        """
+        from unittest.mock import patch
+
+        from dashboard.data.escalations import fetch_pins_recovery
+
+        async def _mcp(_client, base_url, _tool, _args):
+            if '8102' in base_url:
+                raise RuntimeError('session state went sideways')
+            return [_rec('esc-a', pins_recovery=['3543'])]
+
+        handler = _ExplodingHandler()  # every call is intercepted below
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            with patch(
+                'dashboard.data.escalations.mcp_tool_call', side_effect=_mcp,
+            ):
+                result = await fetch_pins_recovery(
+                    client, _pins_urls(8100, 8102, 8107),
+                )
+
+        assert set(result) == {'proj8100', 'proj8102', 'proj8107'}, (
+            'every configured label must still be present; got '
+            f'{sorted(result)!r}'
+        )
+        assert result['proj8102'] is None, (
+            'the raising project degrades to UNKNOWN, not to an empty map'
+        )
+        assert result['proj8100'] == {'esc-a': ['3543']}, (
+            "a sibling's unanticipated exception must not blank this "
+            f"project's annotation; got {result['proj8100']!r}"
+        )
+        assert result['proj8107'] == {'esc-a': ['3543']}
+
+    async def test_records_that_are_not_dicts_do_not_raise(self):
+        """A ragged list (strings/None mixed in) degrades instead of raising.
+
+        This runs inside a dashboard poll cycle; a TypeError here would 500 the
+        endpoint on account of one malformed record.
+        """
+        from dashboard.data.escalations import fetch_pins_recovery
+
+        handler = _PinsHandler({
+            8100: ['not-a-record', None, _rec('esc-ok', pins_recovery=['3543']), {}],
+        })
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            result = await fetch_pins_recovery(client, _pins_urls(8100))
+
+        assert result['proj8100'] == {'esc-ok': ['3543']}

@@ -164,7 +164,9 @@ class _StatusWriteNotPersisted(Exception):
     rather than just building the error dict inline — lets ``_txn``'s
     ``except`` clause roll back the whole transaction first, so on the
     atomic writer a mismatch rolls back the metadata merge too (both-or-
-    neither). Always caught by the same method that raised it and mapped to
+    neither). Raised by the shared :meth:`SqliteTaskBackend._write_status_and_verify`
+    tail and always caught by the public method that invoked it
+    (``set_task_status`` / ``set_status_and_stamp_audit``) and mapped to
     :meth:`to_error_dict`; never escapes to a caller.
     """
 
@@ -572,9 +574,13 @@ async def _migrate_v3_to_v4(
       rows are cancelled directly (``UPDATE ... SET status = 'cancelled'``),
       each stamped with a durable ``auto_cancelled_by_self_heal`` metadata
       provenance marker (canonical id + candidate_key) merged onto its
-      existing metadata, plus a loud per-group WARNING log. Fixes reify
-      incident esc-candidate-key-migration-2 (37 dup groups / 58 rows that
-      previously required a manual ``set_task_status`` cancel per row).
+      existing metadata, plus a loud per-group WARNING log. Each healed
+      group's cancels are committed as soon as that group completes, so a
+      failure on a LATER group cannot unwind an earlier group's heal, and
+      ``healed`` in the result dict names exactly the durably-committed
+      groups. Fixes reify incident esc-candidate-key-migration-2 (37 dup
+      groups / 58 rows that previously required a manual
+      ``set_task_status`` cancel per row).
     * **Flag** — ambiguous (``reason`` is ``'mixed_status'`` or
       ``'title_divergent'``): left untouched and collected — with its
       ``reason`` — into ``flagged_groups`` for escalation below.
@@ -605,6 +611,8 @@ async def _migrate_v3_to_v4(
     additionally guarded against ``sqlite3.IntegrityError`` (a residual
     duplicate slipping past the audit, e.g. a race) -- skip, don't raise --
     and the whole step is wrapped so nothing unexpected propagates either.
+    The failure path additionally rolls the connection back, so a
+    partially-applied heal can never survive on the cached connection.
 
     Deliberately NOT added to ``_SCHEMA_SQL``: a fresh-schema ``executescript``
     run at every connection-open would raise ``IntegrityError`` building the
@@ -613,15 +621,35 @@ async def _migrate_v3_to_v4(
     v0->v1->v2->v3->v4 chain, where this audit is trivially clean.
 
     Returns a result dict ``{'index_built': bool, 'healed': [...],
-    'flagged': [...]}`` at every exit -- ``healed``/``flagged`` are lists of
-    per-group descriptor dicts (``flagged`` entries are the same shape fed to
+    'flagged': [...], 'audit_complete': bool}`` at every exit, INCLUDING the
+    unexpected-failure path -- ``healed``/``flagged`` are lists of per-group
+    descriptor dicts (``flagged`` entries are the same shape fed to
     ``residual_dup_escalation_cb``; ``healed`` entries carry ``tag``/
-    ``candidate_key``/``canonical_id``/``cancelled_ids``). The connection-open
-    call site (``_migrate``) ignores this return value -- it exists so
-    ``SqliteTaskBackend.reaudit_candidate_key_index`` (the live, on-demand
-    re-run) can share this single implementation and report an accurate
-    status without a server restart.
+    ``candidate_key``/``canonical_id``/``cancelled_ids``).
+
+    ``audit_complete`` discriminates a full pass from a truncated one:
+    ``True`` on both normal exits (clean build, and self-gated-on-flagged --
+    the residual audit ran to completion either way, so ``flagged`` is the
+    EXHAUSTIVE set of ambiguous groups); ``False`` only on the
+    unexpected-failure path below, which additionally carries
+    ``'error': 'migration_failed'``. There, ``healed`` names exactly the
+    groups whose cancels were durably committed before the failure -- the
+    group that was still in flight when the failure hit is rolled back and,
+    never having been appended, can never appear here -- and ``flagged``
+    names only the ambiguous groups classified SO FAR (a pure observation;
+    nothing is mutated for a flagged group either way): callers must treat
+    it as a partial snapshot, not the full residual set, whenever
+    ``audit_complete`` is ``False``.
+
+    The connection-open call site (``_migrate``) ignores this return value
+    -- it exists so ``SqliteTaskBackend.reaudit_candidate_key_index`` (the
+    live, on-demand re-run) can share this single implementation and report
+    an accurate status without a server restart.
     """
+    # Hoisted above the try/except so the failure path below can report the
+    # groups this pass actually healed/flagged instead of hard-coding [].
+    healed_groups: list[dict[str, Any]] = []
+    flagged_groups: list[dict[str, Any]] = []
     try:
         dup_cursor = await conn.execute(
             """
@@ -637,8 +665,6 @@ async def _migrate_v3_to_v4(
         # to a list so len() below type-checks (it's already a list at runtime).
         residual_rows = list(await dup_cursor.fetchall())
 
-        healed_groups: list[dict[str, Any]] = []
-        flagged_groups: list[dict[str, Any]] = []
         for group in residual_rows:
             rows_cursor = await conn.execute(
                 "SELECT id, title, status, metadata, candidate_key FROM tasks "
@@ -680,6 +706,17 @@ async def _migrate_v3_to_v4(
                     "metadata = ? WHERE tag = ? AND id = ?",
                     (now, new_metadata, group['tag'], cancel_id),
                 )
+            # Commit per group, BEFORE recording it in `healed_groups`, so the
+            # list names exactly the groups whose cancels are durably on
+            # disk -- see this function's docstring (Returns) for the full
+            # failure-path contract this establishes. If this commit itself
+            # raises, the group is correctly absent from `healed_groups` and
+            # the except handler's rollback (below) takes over.
+            # (Not deferred to the clean-build commit below: a still-flagged
+            # group causes an early `return`, and healed cancels must
+            # survive that skip rather than riding on a commit that may
+            # never happen.)
+            await conn.commit()
             healed_groups.append({
                 'tag': group['tag'],
                 'candidate_key': group['candidate_key'],
@@ -697,13 +734,6 @@ async def _migrate_v3_to_v4(
                 len(cancel_ids), group['tag'], group['candidate_key'],
                 canonical_id, cancel_ids,
             )
-
-        if healed_groups:
-            # Commit unconditionally here (not deferred to the clean-build
-            # commit below): a still-flagged group below causes an early
-            # `return`, and healed cancels must survive that skip rather
-            # than riding on a commit that may never happen.
-            await conn.commit()
 
         if flagged_groups:
             groups_desc = '; '.join(
@@ -736,7 +766,10 @@ async def _migrate_v3_to_v4(
                         'candidate_key group(s) for project_root=%r',
                         len(flagged_groups), project_root,
                     )
-            return {'index_built': False, 'healed': healed_groups, 'flagged': flagged_groups}
+            return {
+                'index_built': False, 'healed': healed_groups,
+                'flagged': flagged_groups, 'audit_complete': True,
+            }
 
         try:
             await conn.execute(
@@ -751,7 +784,10 @@ async def _migrate_v3_to_v4(
                 'clean audit (race?); skipping index build, user_version '
                 'stays at 3.',
             )
-            return {'index_built': False, 'healed': healed_groups, 'flagged': []}
+            return {
+                'index_built': False, 'healed': healed_groups,
+                'flagged': [], 'audit_complete': True,
+            }
 
         await conn.execute('PRAGMA user_version = 4')
         await conn.commit()
@@ -761,15 +797,58 @@ async def _migrate_v3_to_v4(
             '(tag, candidate_key) and advanced user_version to 4 '
             '(fm-task-dedup task A2).',
         )
-        return {'index_built': True, 'healed': healed_groups, 'flagged': []}
+        return {
+            'index_built': True, 'healed': healed_groups,
+            'flagged': [], 'audit_complete': True,
+        }
     except Exception:
+        # Discard whatever this pass left pending. The migration runs on
+        # `_get_connection`'s cached WRITE connection, opened via
+        # `connect_daemon(str(db_path))` WITHOUT `isolation_level=None` --
+        # i.e. Python sqlite3's legacy deferred-transaction mode (see
+        # `_get_read_connection`'s docstring). Without this rollback a raise
+        # partway through the heal loop leaves the already-executed
+        # `UPDATE ... SET status='cancelled'` statements uncommitted on a
+        # connection that `_get_connection` then caches, and the very next
+        # unrelated successful write -- `_txn` commits with no BEGIN/rollback
+        # preamble -- silently flushes that partial heal to disk.
+        # The rollback itself must never displace the real error (this step
+        # must NEVER raise at connection-open, see docstring) -- but a
+        # failing rollback must not go silent either (no-silent-fail-soft):
+        # it means a partial heal may still be pending on the connection
+        # `_get_connection` is about to cache, i.e. the original bug,
+        # re-armed, so it's logged loudly rather than bare-suppressed.
+        try:
+            await conn.rollback()
+        except Exception:
+            logger.exception(
+                'sqlite_task_backend: v3->v4 rollback failed after migration '
+                'error; a partial self-heal may still be pending on the '
+                'cached write connection for project_root=%r',
+                project_root,
+            )
         # Defensive backstop -- this step must NEVER raise at connection-open
         # (see docstring): a raising migration would crash-loop fused-memory.
         logger.exception(
             'sqlite_task_backend: schema v3->v4 migration failed unexpectedly; '
             'skipping (user_version stays below 4, retried on next open)',
         )
-        return {'index_built': False, 'healed': [], 'flagged': []}
+        # `healed`/`flagged` name exactly what this pass actually committed/
+        # classified before the failure hit -- see this function's docstring
+        # (Returns) for the full contract, and the per-group commit in the
+        # heal loop above for how `healed_groups` stays accurate. Marked
+        # `audit_complete=False` so callers know `flagged` is a partial
+        # snapshot here, not the exhaustive residual set. Deliberately does
+        # NOT invoke `residual_dup_escalation_cb` -- escalation stays on the
+        # completed-audit path above; a half-finished pass must never fire a
+        # partial/misleading escalation.
+        return {
+            'index_built': False,
+            'healed': healed_groups,
+            'flagged': flagged_groups,
+            'audit_complete': False,
+            'error': 'migration_failed',
+        }
 
 
 async def _claimant_columns_present(conn: aiosqlite.Connection) -> bool:
@@ -1843,6 +1922,7 @@ class SqliteTaskBackend:
     async def _write_status_and_verify(
         self,
         conn: aiosqlite.Connection,
+        *,
         set_columns: list[str],
         set_values: list[Any],
         tag: str,
@@ -1876,7 +1956,16 @@ class SqliteTaskBackend:
         far, including a metadata merge on the atomic writer) and mapped to
         an explicit ``{'success': False, 'error': 'status_write_not_persisted',
         ...}`` error dict.
+
+        Does not mutate the caller's ``set_columns``/``set_values`` lists —
+        the claimant tri-state columns are appended to local copies.
         """
+        # Copy rather than append in place: callers build these lists fresh
+        # per call today, but the helper should not rely on that — mutating
+        # caller-owned lists in place is a surprising contract for a shared
+        # tail to hold.
+        set_columns = [*set_columns]
+        set_values = [*set_values]
         if claimant_run_id is not _UNSET or heartbeat_at is not _UNSET:
             if self._claimant_columns_cache.get(project_root, False):
                 if claimant_run_id is not _UNSET:
@@ -1995,58 +2084,21 @@ class SqliteTaskBackend:
 
                 set_columns = ['status = ?', 'updated_at = ?']
                 set_values: list[Any] = [status, _now()]
-                if claimant_run_id is not _UNSET or heartbeat_at is not _UNSET:
-                    if self._claimant_columns_cache.get(project_root, False):
-                        if claimant_run_id is not _UNSET:
-                            set_columns.append('claimant_run_id = ?')
-                            set_values.append(claimant_run_id)
-                        if heartbeat_at is not _UNSET:
-                            set_columns.append('heartbeat_at = ?')
-                            set_values.append(heartbeat_at)
-                    else:
-                        logger.warning(
-                            'set_task_status: claimant_run_id/heartbeat_at columns absent '
-                            '(pre-migration connection) — writing status only for '
-                            'task_id=%s project_root=%s',
-                            task_id, project_root,
-                        )
-
-                try:
-                    await self._apply_status_row_update(
-                        conn, set_columns, set_values, tag, tid,
-                    )
-                except sqlite3.IntegrityError as exc:
-                    # Only the candidate_key partial UNIQUE index is mapped to a
-                    # typed collision (mirrors add_task's collision mapping); any
-                    # other integrity violation is unrelated and re-raised
-                    # untouched. Reachable via the narrow un-cancel path (see the
-                    # docstring above). Nothing in this transaction has been
-                    # written yet — this is the first write statement — so this
-                    # survivor lookup sees the same state a post-rollback read
-                    # would (this row's own candidate_key/status are unaffected,
-                    # having never been applied).
-                    if row_candidate_key is None or 'candidate_key' not in str(exc):
-                        raise
-                    survivor_cursor = await conn.execute(
-                        "SELECT id, status FROM tasks WHERE tag = ? AND candidate_key = ? "
-                        "AND status != 'cancelled' ORDER BY id LIMIT 1",
-                        (tag, row_candidate_key),
-                    )
-                    survivor = await survivor_cursor.fetchone()
-                    raise DuplicateCandidateKeyError(
-                        existing_id=survivor['id'] if survivor is not None else None,
-                        existing_status=survivor['status'] if survivor is not None else None,
-                        tag=tag,
-                        candidate_key=row_candidate_key,
-                    ) from exc
-
-                verify_cursor = await conn.execute(
-                    'SELECT status FROM tasks WHERE tag = ? AND id = ?', (tag, tid),
+                persisted_status = await self._write_status_and_verify(
+                    conn,
+                    set_columns=set_columns,
+                    set_values=set_values,
+                    tag=tag,
+                    tid=tid,
+                    task_id=task_id,
+                    status=status,
+                    row_candidate_key=row_candidate_key,
+                    claimant_run_id=claimant_run_id,
+                    heartbeat_at=heartbeat_at,
+                    project_root=project_root,
+                    caller_name='set_task_status',
+                    write_desc='status',
                 )
-                verify_row = await verify_cursor.fetchone()
-                persisted_status = verify_row['status'] if verify_row is not None else None
-                if persisted_status != status:
-                    raise _StatusWriteNotPersisted(task_id, status, persisted_status)
         except _StatusWriteNotPersisted as exc:
             return exc.to_error_dict()
         return {
@@ -2129,49 +2181,21 @@ class SqliteTaskBackend:
 
                 set_columns = ['status = ?', 'metadata = ?', 'updated_at = ?']
                 set_values: list[Any] = [status, new_metadata, _now()]
-                if claimant_run_id is not _UNSET or heartbeat_at is not _UNSET:
-                    if self._claimant_columns_cache.get(project_root, False):
-                        if claimant_run_id is not _UNSET:
-                            set_columns.append('claimant_run_id = ?')
-                            set_values.append(claimant_run_id)
-                        if heartbeat_at is not _UNSET:
-                            set_columns.append('heartbeat_at = ?')
-                            set_values.append(heartbeat_at)
-                    else:
-                        logger.warning(
-                            'set_status_and_stamp_audit: claimant_run_id/heartbeat_at '
-                            'columns absent (pre-migration connection) — writing '
-                            'status+metadata only for task_id=%s project_root=%s',
-                            task_id, project_root,
-                        )
-
-                try:
-                    await self._apply_status_row_update(
-                        conn, set_columns, set_values, tag, tid,
-                    )
-                except sqlite3.IntegrityError as exc:
-                    if row_candidate_key is None or 'candidate_key' not in str(exc):
-                        raise
-                    survivor_cursor = await conn.execute(
-                        "SELECT id, status FROM tasks WHERE tag = ? AND candidate_key = ? "
-                        "AND status != 'cancelled' ORDER BY id LIMIT 1",
-                        (tag, row_candidate_key),
-                    )
-                    survivor = await survivor_cursor.fetchone()
-                    raise DuplicateCandidateKeyError(
-                        existing_id=survivor['id'] if survivor is not None else None,
-                        existing_status=survivor['status'] if survivor is not None else None,
-                        tag=tag,
-                        candidate_key=row_candidate_key,
-                    ) from exc
-
-                verify_cursor = await conn.execute(
-                    'SELECT status FROM tasks WHERE tag = ? AND id = ?', (tag, tid),
+                persisted_status = await self._write_status_and_verify(
+                    conn,
+                    set_columns=set_columns,
+                    set_values=set_values,
+                    tag=tag,
+                    tid=tid,
+                    task_id=task_id,
+                    status=status,
+                    row_candidate_key=row_candidate_key,
+                    claimant_run_id=claimant_run_id,
+                    heartbeat_at=heartbeat_at,
+                    project_root=project_root,
+                    caller_name='set_status_and_stamp_audit',
+                    write_desc='status+metadata',
                 )
-                verify_row = await verify_cursor.fetchone()
-                persisted_status = verify_row['status'] if verify_row is not None else None
-                if persisted_status != status:
-                    raise _StatusWriteNotPersisted(task_id, status, persisted_status)
         except _StatusWriteNotPersisted as exc:
             return exc.to_error_dict()
         return {

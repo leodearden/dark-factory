@@ -23,6 +23,7 @@ import json
 import logging
 import sqlite3
 from bisect import bisect_left
+from collections.abc import Mapping
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -356,6 +357,7 @@ def _lifespan_block(
     *,
     now: datetime,
     downsample_threshold: int = 10_000,
+    pins_by_id: Mapping[str, list[str]] | None = None,
 ) -> dict:
     """Lifespan aggregates over *records*: percentiles, samples, open items, promotion.
 
@@ -368,7 +370,9 @@ def _lifespan_block(
       :func:`~escalation.classify.classify_resolver_tier` of ``resolved_by``.
     - ``open_items``: one ``{id, task_id, level, age_secs, breach_6h}`` per
       pending record, ``age_secs`` = ``now - timestamp``,
-      ``breach_6h`` = ``age_secs > 6h``.
+      ``breach_6h`` = ``age_secs > 6h``, plus ``pins_recovery`` /
+      ``pins_recovery_task_ids`` when *pins_by_id* names that record (see
+      below).
     - ``l1_to_l2_promotion``: ``{count, p50_secs, p90_secs}`` computed from
       every ``level == 2`` record's ``members`` — ``L2.timestamp -
       member.timestamp`` per member id found in the by-id index (uses the
@@ -393,6 +397,22 @@ def _lifespan_block(
     the result carries ``samples_downsampled=True`` plus ``samples_total``
     (the pre-downsample count) — a loud marker, never silent truncation.
     Below/at threshold, ``samples`` is untouched and neither key appears.
+
+    *pins_by_id* is this project's ``{escalation_id: [task_ids]}`` annotation
+    as returned by :func:`dashboard.data.escalations.fetch_pins_recovery`,
+    passed IN rather than fetched: this module is the pure-sync core that the
+    route runs inside ``asyncio.to_thread``, so a network round-trip here
+    would block a worker thread.  An open item is stamped with
+    ``pins_recovery`` (bool) and ``pins_recovery_task_ids`` ONLY when its id
+    appears in the mapping.  Both keys are omitted — never defaulted to
+    ``False``/``[]`` — when *pins_by_id* is ``None`` (that project's
+    escalation MCP could not be read) and when the id is simply absent from a
+    non-``None`` mapping (a pre-3543 server, or one that computed the
+    annotation and deliberately withheld it).  Absent means UNKNOWN and must
+    render as nothing: a stamped ``False`` asserts "this escalation pins no
+    recovery" on evidence nobody produced, which is the esc-3163 false
+    negative that both the escalation server and the fanout already refuse to
+    emit.  Render-when-present matches ``triage_segments`` above.
     """
     by_id: dict[str, Escalation] = {esc.id: esc for esc in records}
 
@@ -449,13 +469,22 @@ def _lifespan_block(
                 )
                 continue
             age_secs = (now - filed_at).total_seconds()
-            open_items.append({
+            item = {
                 'id': esc.id,
                 'task_id': esc.task_id,
                 'level': esc.level,
                 'age_secs': age_secs,
                 'breach_6h': age_secs > _BREACH_SECONDS,
-            })
+            }
+            # Render-when-present: `is not None` and `in`, never `.get(id, [])`.
+            # A default would convert both "this project was unreadable" and
+            # "this record carried no annotation" into a confident
+            # "pins nothing" — see the pins_by_id note in the docstring.
+            if pins_by_id is not None and esc.id in pins_by_id:
+                pinned = list(pins_by_id[esc.id])
+                item['pins_recovery'] = bool(pinned)
+                item['pins_recovery_task_ids'] = pinned
+            open_items.append(item)
             continue
 
         if esc.status not in ('resolved', 'dismissed'):
@@ -689,8 +718,13 @@ def _aggregate_project(
     *,
     now: datetime,
     downsample_threshold: int = 10_000,
+    pins_by_id: Mapping[str, list[str]] | None = None,
 ) -> tuple[dict, int]:
     """Aggregate one project's escalation archive into a Seam-2 payload entry.
+
+    *pins_by_id* is THIS project's pins_recovery annotation (``None`` when its
+    escalation MCP could not be read); it is only consumed by
+    :func:`_lifespan_block`'s ``open_items``.
 
     Returns ``(entry, parse_failures)``.
     """
@@ -698,7 +732,10 @@ def _aggregate_project(
     entry = {
         'project': project,
         'origin': _origin_block(records, now=now),
-        'lifespan': _lifespan_block(records, now=now, downsample_threshold=downsample_threshold),
+        'lifespan': _lifespan_block(
+            records, now=now, downsample_threshold=downsample_threshold,
+            pins_by_id=pins_by_id,
+        ),
         'workflow': _workflow_block(records, Path(runs_db)),
     }
     return entry, parse_failures
@@ -715,6 +752,7 @@ def build_escalation_analytics(
     now: datetime | None = None,
     regime_markers_path: Path | None = None,
     downsample_threshold: int = 10_000,
+    pins_by_project: Mapping[str, Mapping[str, list[str]] | None] | None = None,
 ) -> dict:
     """Build the full Seam-2 escalation-analytics payload across *project_dirs*.
 
@@ -731,6 +769,17 @@ def build_escalation_analytics(
 
     ``downsample_threshold`` bounds each project's ``lifespan.samples`` —
     see :func:`_lifespan_block` and :func:`_downsample_stratified`.
+
+    ``pins_by_project`` is :func:`dashboard.data.escalations.fetch_pins_recovery`'s
+    return value passed through verbatim: ``{label: {escalation_id: [task_ids]}
+    | None}``.  Both maps are keyed by project BASENAME, which is why no
+    translation is needed here — ``_analytics_project_dirs`` labels and
+    ``config.escalation_urls`` keys are the same ``root.name``.  A project
+    absent from the mapping (no escalation URL was ever discovered for that
+    root) and a project mapped to ``None`` (its escalation MCP could not be
+    read) are treated identically: UNKNOWN, so nothing is stamped.  This
+    function stays pure — the fetch happens in the route, outside the
+    ``asyncio.to_thread`` boundary.
 
     Two archive-reach signals, both computed from ONE ``is_dir`` stat per
     project.  They exist because nothing else in the payload can answer either
@@ -777,6 +826,7 @@ def build_escalation_analytics(
         entry, project_parse_failures = _aggregate_project(
             project, escalations_dir, runs_db, now=resolved_now,
             downsample_threshold=downsample_threshold,
+            pins_by_id=(pins_by_project or {}).get(project),
         )
         parse_failures += project_parse_failures
         per_project.append(entry)

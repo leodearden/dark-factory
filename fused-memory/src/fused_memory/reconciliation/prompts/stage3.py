@@ -6,6 +6,7 @@ from fused_memory.reconciliation.policies import (
 )
 from fused_memory.reconciliation.prompts import (
     _STAGE3_PROJECT_ID_GUIDELINE,
+    DUPLICATE_FINDING_SALVAGE_GUIDANCE,
     get_recon_report_tool_guidance,
     render_escalation_boundary_note,
 )
@@ -203,7 +204,11 @@ stage='task_knowledge_sync')`
 it as missing.
 - `ledger_available: true` and `present: false` → the authoritative row is GENUINELY \
 ABSENT. Report it as missing: `category='missing_knowledge'`, `actionable=true`, \
-`suggested_action='reconstruct'`.
+`suggested_action='reconstruct'`. This is not a race you are seeing too early: both of \
+the write paths that precede this check have already had their turn — the stage's own \
+idempotent upsert, and the harness's write-recovered re-attempt with the REAL report, \
+which task 4186 moved ahead of this check (it previously ran after it, in the driver's \
+finally).
 - `ledger_available: false`, or the tool returns an error → INCONCLUSIVE (the ledger is \
 not wired, or the read failed). Do NOT conclude presence or absence from this path — \
 fall through to the FALLBACK below instead.
@@ -362,6 +367,7 @@ you managed to confirm yourself.
 
 ## Report Channel — recon_report MCP Tools (PRD γ §9)
 {get_recon_report_tool_guidance()}
+{DUPLICATE_FINDING_SALVAGE_GUIDANCE}
 
 **NOTE — Stage 3 is read-only.** The `mcp__recon-report__*` tools write only to in-process \
 state (not Graphiti / Mem0 / Taskmaster) and are intentionally permitted in Stage 3. \

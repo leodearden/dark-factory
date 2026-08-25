@@ -40,6 +40,7 @@ mirroring task β's test_merge_gates.py:
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -74,6 +75,103 @@ def test_merge_drift_logger_name_is_merge_queue() -> None:
     assert merge_drift.logger.name == 'orchestrator.merge_queue'
 
 
+class TestDriftCheckStatePersistence:
+    """Unit tests for DriftCheckState + _load_drift_check_state + _save_drift_check_state.
+
+    Fix 1a (task 2886): the drift-check cadence counter must be PERSISTED so it
+    survives the ~8h fleet redeploy that resets the in-memory worker counter
+    (which is why the drift check has NEVER fired).  The persistence primitive
+    is an EXACT mirror of merge_shadow's ShadowCompareState +
+    _load_shadow_compare_state/_save_shadow_compare_state (fail-safe JSON), the
+    same contract asserted by
+    test_merge_queue_warm_cold_shadow.py::TestShadowCompareStatePersistence.
+
+    RED (pre-impl): DriftCheckState / _load_drift_check_state /
+    _save_drift_check_state do not exist yet in orchestrator.merge_drift.
+    """
+
+    def test_drift_check_state_defaults_land_count_zero(self) -> None:
+        from orchestrator.merge_drift import DriftCheckState
+
+        assert DriftCheckState().land_count == 0
+
+    def test_load_returns_default_when_file_missing(self, tmp_path: Path) -> None:
+        from orchestrator.merge_drift import DriftCheckState, _load_drift_check_state
+
+        state = _load_drift_check_state(tmp_path / 'nonexistent.json')
+        assert state == DriftCheckState(land_count=0)
+
+    def test_load_returns_default_on_corrupt_json(self, tmp_path: Path) -> None:
+        from orchestrator.merge_drift import DriftCheckState, _load_drift_check_state
+
+        path = tmp_path / 'drift.json'
+        path.write_text('{ not valid json !!!')
+        assert _load_drift_check_state(path) == DriftCheckState(land_count=0)
+
+    def test_load_returns_default_on_empty_json_object(self, tmp_path: Path) -> None:
+        # Missing keys → fail-safe default (mirror shadow's empty-object test).
+        from orchestrator.merge_drift import DriftCheckState, _load_drift_check_state
+
+        path = tmp_path / 'drift.json'
+        path.write_text('{}')
+        assert _load_drift_check_state(path) == DriftCheckState(land_count=0)
+
+    def test_load_returns_default_on_wrong_typed_key(self, tmp_path: Path) -> None:
+        # int("not-an-int") raises ValueError → fail-safe default.
+        from orchestrator.merge_drift import DriftCheckState, _load_drift_check_state
+
+        path = tmp_path / 'drift.json'
+        path.write_text('{"land_count": "not-an-int"}')
+        assert _load_drift_check_state(path) == DriftCheckState(land_count=0)
+
+    def test_load_returns_default_on_null_key(self, tmp_path: Path) -> None:
+        # int(None) raises TypeError → fail-safe default.
+        from orchestrator.merge_drift import DriftCheckState, _load_drift_check_state
+
+        path = tmp_path / 'drift.json'
+        path.write_text('{"land_count": null}')
+        assert _load_drift_check_state(path) == DriftCheckState(land_count=0)
+
+    def test_round_trip_preserves_count(self, tmp_path: Path) -> None:
+        from orchestrator.merge_drift import (
+            DriftCheckState,
+            _load_drift_check_state,
+            _save_drift_check_state,
+        )
+
+        path = tmp_path / 'drift.json'
+        _save_drift_check_state(path, DriftCheckState(land_count=19))
+        assert _load_drift_check_state(path).land_count == 19
+
+    def test_round_trip_count_zero(self, tmp_path: Path) -> None:
+        from orchestrator.merge_drift import (
+            DriftCheckState,
+            _load_drift_check_state,
+            _save_drift_check_state,
+        )
+
+        path = tmp_path / 'drift.json'
+        original = DriftCheckState(land_count=0)
+        _save_drift_check_state(path, original)
+        assert _load_drift_check_state(path) == original
+
+    def test_save_creates_parent_dirs(self, tmp_path: Path) -> None:
+        from orchestrator.merge_drift import DriftCheckState, _save_drift_check_state
+
+        path = tmp_path / 'a' / 'b' / 'c' / 'drift.json'
+        _save_drift_check_state(path, DriftCheckState(land_count=5))
+        assert path.exists()
+
+    def test_save_writes_valid_json(self, tmp_path: Path) -> None:
+        from orchestrator.merge_drift import DriftCheckState, _save_drift_check_state
+
+        path = tmp_path / 'drift.json'
+        _save_drift_check_state(path, DriftCheckState(land_count=3))
+        data = json.loads(path.read_text())
+        assert 'land_count' in data
+        assert data['land_count'] == 3
+
+
 @pytest.mark.asyncio
 async def test_maybe_run_drift_check_guards_against_non_positive_every_n() -> None:
     """0 or negative verify_drift_check_every_n_lands must degrade to a no-op.
@@ -100,6 +198,97 @@ async def test_maybe_run_drift_check_guards_against_non_positive_every_n() -> No
 
     assert worker._drift_land_count == 0, 'land count must not advance on the disabled path'
     assert len(worker._drift_check_tasks) == 0, 'no drift-check task should be scheduled'
+
+
+def _build_drift_worker(state_path: Path) -> MagicMock:
+    """A MagicMock SpeculativeMergeWorker wired for _maybe_run_drift_check.
+
+    Fresh in-memory ``_drift_land_count=0`` (models the post-restart reset) but a
+    caller-supplied ``_drift_state_path`` so the PERSISTED cadence can be shared
+    across simulated restarts (fix 1a).
+    """
+    w = MagicMock()
+    w._drift_land_count = 0
+    w._drift_check_tasks = set()
+    w._drift_state_path = state_path
+    w._ensure_host_allocator = MagicMock(return_value=MagicMock())
+    return w
+
+
+@pytest.mark.asyncio
+class TestDriftCheckCadencePersistence:
+    """Fix 1a (task 2886): the drift-check cadence must use a PERSISTED counter
+    so it survives the ~8h fleet redeploy that resets the in-memory worker
+    counter — the root cause of the drift check having NEVER fired.
+
+    RED (pre step-4): ``_maybe_run_drift_check`` keys the cadence off the
+    in-memory ``worker._drift_land_count`` and never touches
+    ``_drift_state_path``, so (a) no state file is written and (b) a fresh
+    (restarted) worker resets the count to 0 and the carried-over cadence
+    never fires.
+    """
+
+    async def test_persisted_counter_drives_cadence_and_is_saved(
+        self, tmp_path: Path,
+    ) -> None:
+        from orchestrator.merge_drift import (
+            _load_drift_check_state,
+            _maybe_run_drift_check,
+        )
+
+        state_path = tmp_path / 'drift_check_state.json'
+        git_ops = MagicMock()
+        req = MagicMock()
+        req.config.enabled_verify_runners = ['laptop']
+        req.config.verify_drift_check_every_n_lands = 3
+
+        reachback = AsyncMock(return_value=None)
+        worker = _build_drift_worker(state_path)
+        with patch('orchestrator.merge_queue._run_drift_check', reachback):
+            # Land 1: no fire; persisted count advances to 1.
+            await _maybe_run_drift_check(worker, git_ops, req, 'c1')
+            assert len(worker._drift_check_tasks) == 0
+            assert _load_drift_check_state(state_path).land_count == 1
+            # Land 2: no fire; persisted count advances to 2.
+            await _maybe_run_drift_check(worker, git_ops, req, 'c2')
+            assert len(worker._drift_check_tasks) == 0
+            assert _load_drift_check_state(state_path).land_count == 2
+            # Land 3: fires (3 % 3 == 0), keyed off the PERSISTED count.
+            await _maybe_run_drift_check(worker, git_ops, req, 'c3')
+            assert len(worker._drift_check_tasks) == 1
+            for t in list(worker._drift_check_tasks):
+                await t
+        assert reachback.await_count == 1
+
+    async def test_cadence_survives_simulated_restart(self, tmp_path: Path) -> None:
+        from orchestrator.merge_drift import _maybe_run_drift_check
+
+        state_path = tmp_path / 'drift_check_state.json'
+        git_ops = MagicMock()
+        req = MagicMock()
+        req.config.enabled_verify_runners = ['laptop']
+        req.config.verify_drift_check_every_n_lands = 3
+
+        reachback = AsyncMock(return_value=None)
+        with patch('orchestrator.merge_queue._run_drift_check', reachback):
+            # Worker A observes 2 lands (no fire), then the process restarts.
+            worker_a = _build_drift_worker(state_path)
+            await _maybe_run_drift_check(worker_a, git_ops, req, 'c1')
+            await _maybe_run_drift_check(worker_a, git_ops, req, 'c2')
+            assert len(worker_a._drift_check_tasks) == 0
+            assert reachback.await_count == 0
+
+            # RESTART: a FRESH worker with the in-memory counter reset to 0 but
+            # the SAME persisted state path.  The 3rd land must still fire
+            # because the persisted count (2) carried over — proving the
+            # cadence does not depend on the in-memory _drift_land_count.
+            worker_b = _build_drift_worker(state_path)
+            assert worker_b._drift_land_count == 0  # in-memory counter reset
+            await _maybe_run_drift_check(worker_b, git_ops, req, 'c3')
+            assert len(worker_b._drift_check_tasks) == 1
+            for t in list(worker_b._drift_check_tasks):
+                await t
+        assert reachback.await_count == 1
 
 
 @pytest.mark.asyncio
@@ -227,18 +416,20 @@ class TestReachBackRouting:
             f'emitted event types: {event_store.emitted!r}'
         )
 
-    async def test_run_drift_check_reachback_for_task_file_derivation(
+    async def test_run_drift_check_full_gate_when_task_files_none(
         self, tmp_path: Path,
     ) -> None:
-        """_run_drift_check must resolve _derive_task_files_from_git via
-        orchestrator.merge_queue (not a merge_drift-local binding) when
-        task_files is None and Lever C verify runners are enabled.
+        """Fix 1b (task 2886): with req.task_files=None + enabled Lever-C
+        runners — the branch that USED to derive dispatching-host task_files —
+        _run_drift_check must now build a FULL-GATE spec (task_files=None) and
+        NOT invoke _derive_task_files_from_git.
 
-        This exercises the derivation branch that test_run_drift_check_reachback_to_verify_pool_deps
-        above does not: that test always supplies an explicit task_files list.
-        Mirrors test_dispatching_host_derives_task_files_when_enabled_runners in
-        test_merge_queue_multihost_wiring.py, which covers the identical gate for
-        _run_post_merge_verify's own dispatching-host derivation path.
+        Complements TestDriftCheckFullGateSpec's explicit-task_files case by
+        covering the previously-deriving branch.  Still exercises reach-back
+        routing (the build_merge_verify_spec spy only captures calls when
+        _run_drift_check resolves it via orchestrator.merge_queue).  Before
+        fix 1b this asserted the derived files flowed into the spec; that
+        derivation path is gone.
         """
         import orchestrator.verify_runner as _vr
         from orchestrator.event_store import EventStore
@@ -290,6 +481,7 @@ class TestReachBackRouting:
             spec_calls.append(task_files)
             return orig_build_spec(config, module_configs, task_files, **kw)
 
+        derive_spy = AsyncMock(return_value=['derived/from/mq.py'])
         with (
             patch(
                 'orchestrator.merge_queue.build_merge_verify_spec',
@@ -297,7 +489,7 @@ class TestReachBackRouting:
             ),
             patch(
                 'orchestrator.merge_queue._derive_task_files_from_git',
-                AsyncMock(return_value=['derived/from/mq.py']),
+                derive_spy,
             ),
             patch(
                 'orchestrator.merge_queue.run_scoped_verification',
@@ -310,9 +502,94 @@ class TestReachBackRouting:
             )
 
         assert spec_calls, 'expected build_merge_verify_spec to be called at least once'
-        assert spec_calls[0] == ('derived/from/mq.py',), (
-            f'expected the orchestrator.merge_queue-patched _derive_task_files_from_git '
-            f'to flow into the built spec, got task_files={spec_calls[0]!r}'
+        assert spec_calls[0] is None, (
+            f'drift spec must be FULL-GATE (task_files=None) even when '
+            f'req.task_files is None; got task_files={spec_calls[0]!r}'
+        )
+        derive_spy.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+class TestDriftCheckFullGateSpec:
+    """Fix 1b (task 2886, PRD §8δ): the drift check must re-dispatch a
+    FULL-GATE spec (task_files=None) to both hosts, NOT the scoped/no-source
+    spec that produced the (trivial) pass under investigation.
+
+    Re-dispatching the SAME scoped spec trivially passes on both hosts and
+    structurally cannot catch the trivial-pass divergence class — so the drift
+    check must force the complete workspace gate on the local trust-anchor AND
+    the eligible remote.
+
+    RED (pre step-6): _run_drift_check scopes the spec to req.task_files (or the
+    git-derived task_files) instead of passing task_files=None.
+    """
+
+    async def test_run_drift_check_builds_full_gate_spec(self, tmp_path: Path) -> None:
+        import orchestrator.verify_runner as _vr
+        from orchestrator.merge_drift import _run_drift_check
+        from orchestrator.verify_runner import HostAllocator
+
+        git_ops = MagicMock()
+        git_ops.create_throwaway_verify_worktree = AsyncMock(
+            return_value=Path('/repo/_throwaway')
+        )
+        git_ops.cleanup_merge_worktree = AsyncMock()
+
+        req = MagicMock()
+        req.task_id = 'task-drift-fullgate'
+        # Scoping signal PRESENT: an explicit task_files list that the pre-fix
+        # code would tuple-ify and pass straight into build_merge_verify_spec.
+        req.task_files = ['src/foo.py']
+        req.module_configs = []
+        req.config = OrchestratorConfig(
+            project_root=tmp_path,
+            verify_runners=[  # type: ignore[arg-type]
+                {'name': 'laptop', 'ssh_host': 'laptop.local', 'git_remote': 'origin'},
+            ],
+        )
+
+        pass_result = VerifyResult(
+            passed=True, test_output='', lint_output='', type_output='', summary='ok',
+        )
+        fake_remote = MagicMock()
+        fake_remote.name = 'laptop'
+        fake_remote.is_local = False
+        fake_remote.run_merge_verify = AsyncMock(return_value=pass_result)
+        allocator = HostAllocator([fake_remote], quarantine=set())
+
+        spec_calls: list = []
+        orig_build_spec = _vr.build_merge_verify_spec
+
+        def spy_build_spec(config, module_configs, task_files, **kw):
+            spec_calls.append(task_files)
+            return orig_build_spec(config, module_configs, task_files, **kw)
+
+        with (
+            patch(
+                'orchestrator.merge_queue.build_merge_verify_spec',
+                side_effect=spy_build_spec,
+            ),
+            # A full-gate drift spec must NOT derive/scope task_files at all.
+            patch(
+                'orchestrator.merge_queue._derive_task_files_from_git',
+                AsyncMock(side_effect=AssertionError(
+                    'drift check must NOT derive task_files for a full-gate spec'
+                )),
+            ),
+            patch(
+                'orchestrator.merge_queue.run_scoped_verification',
+                AsyncMock(return_value=pass_result),
+            ),
+        ):
+            await _run_drift_check(
+                git_ops, req, 'commit-sha', None, None, set(),
+                allocator=allocator,
+            )
+
+        assert spec_calls, 'expected build_merge_verify_spec to be called at least once'
+        assert spec_calls[0] is None, (
+            f'drift spec must be FULL-GATE (task_files=None) so both hosts run the '
+            f'complete suite and CAN diverge; got task_files={spec_calls[0]!r}'
         )
 
 

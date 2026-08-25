@@ -17,7 +17,9 @@ function endpointsFor(win) {
   const w = encodeURIComponent(win);
   return {
     '/api/v2/dashboard/orchestrators':                ['ORCHESTRATORS', 'PROJECTS', 'ORCHESTRATORS_SPARK'],
-    '/api/v2/dashboard/tasks':                        ['ACTIVE_TASKS', 'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS', 'DONE_COUNTS'],
+    '/api/v2/dashboard/tasks':                        ['ACTIVE_TASKS', 'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS',
+                                                       'TASKS_DEGRADED_PROJECTS', 'TASKS_COUNT_UNKNOWN_PROJECTS', 'TASKS_PROJECT_COUNT',
+                                                       'DONE_COUNTS'],
     '/api/v2/dashboard/memory':                       ['MEMORY_STATUS'],
     '/api/v2/dashboard/memory-graphs':                ['MEMORY_TIMESERIES', 'MEMORY_OPS_BREAKDOWN'],
     '/api/v2/dashboard/recon':                        ['RECON_STATE', 'AGENTS'],
@@ -44,9 +46,29 @@ window.DF_DATA = {
   AGENTS: [],
   ORCHESTRATORS: [],
   ORCHESTRATORS_SPARK: { labels: [], values: [] },
+  // ACTIVE_TASKS row shape: {id, project, title, status, agent, started, loops,
+  //   attempts, lane, phase, lane_state, runtime_offline, deps, meta_files,
+  //   train, external_deps, prd, claimant_run_id, heartbeat_at, stranded}.
+  //   `agent` is worktree PRESENCE (it stays truthy after the agent dies);
+  //   `stranded` (task 3543) is the independent liveness verdict, computed
+  //   server-side from the claim columns via shared.task_claimant.is_stranded.
   ACTIVE_TASKS: [],
   TASKS_OFFLINE: false,
   TASKS_OFFLINE_PROJECTS: [],
+  // Projects the tasks handler ran out of budget for — state UNKNOWN, not
+  // offline. Defaulted here (not just on the wire) because the first render
+  // happens before any fetch completes.
+  TASKS_DEGRADED_PROJECTS: [],
+  // Projects whose rows are current but whose compact status map failed, so
+  // the done count was never measured — neither offline nor degraded. Without
+  // this list they would render as healthy with a confident "0 done".
+  TASKS_COUNT_UNKNOWN_PROJECTS: [],
+  // N for the banner's "k of N": how many task project roots the tasks handler
+  // fanned out over. Comes from the server so it denominates the same
+  // population TASKS_OFFLINE_PROJECTS is drawn from — PROJECTS (orchestrator-
+  // derived) is a different one. 0 pre-fetch, which the banner reads as "no
+  // count yet" rather than dividing by it.
+  TASKS_PROJECT_COUNT: 0,
   DONE_COUNTS: {},
   PERFORMANCE: {},
   MEMORY_STATUS: {
@@ -81,7 +103,10 @@ window.DF_DATA = {
     // counts+rates, cap-hit rate, $/done, plus per-role turn-cap saturation.
     by_model_role: { rows: [], turn_cap_saturation: {} },
   },
-  BURNDOWN: { labels: [], done: [], in_progress: [], blocked: [], pending: [], forecast_low: null, forecast_high: null },
+  // in_progress_live + in_progress_stranded band the in_progress census; the
+  // parity_* fields are the server's cap-breach verdict (task 3543). Seeded so
+  // a cold client renders empty bands and no banner, never `undefined` ones.
+  BURNDOWN: { labels: [], done: [], in_progress: [], in_progress_live: [], in_progress_stranded: [], blocked: [], pending: [], forecast_low: null, forecast_high: null, parity_alarm: false, parity_cap: null, parity_peak: null, parity_breach_count: 0, parity_projects: [] },
   BURNDOWN_BY_PROJECT: {},
   // CURATOR_STATE is an object (not a captured top-level array), so it is NOT
   // added to STABLE_ARRAY_KEYS. applyKey replaces the reference on each poll;

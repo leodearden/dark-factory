@@ -9,6 +9,7 @@ import logging
 import os
 import signal
 import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -16,6 +17,7 @@ import pytest
 from _orch_helpers import make_gate_yielding as _make_gate_yielding  # centralized (task 1458)
 from _orch_helpers import make_mock_gate as _make_gate  # centralized factory (task 1458)
 from shared.cli_invoke import CAP_HIT_RESUME_PROMPT, AgentResult
+from shared.testing_stdin import STDIN_STARVATION_STUB, make_starving_exec
 from shared.usage_gate import AccountLease, InvokeSlot
 
 from orchestrator.agents.invoke import (
@@ -1886,3 +1888,191 @@ class TestMakeGateFactory:
             f'_make_gate_yielding is missing factory keys: {factory_keys - yielding_keys!r}'
         )
 
+
+
+@pytest.mark.asyncio
+class TestSandboxPathRejectsBlankPrompt:
+    """The SANDBOXED claude path builds its own argv and calls _run_subprocess
+    directly, BYPASSING shared.cli_invoke._invoke_claude entirely -- so it needs
+    its own non-blank-prompt precondition or the esc-3118-1 failure stays
+    reachable through it (task 3143).
+
+    The claude argv carries no positional prompt and no '-' stdin marker, so the
+    prompt is delivered solely by ``stdin_data = prompt.encode()``: a blank one
+    is piped happily and the CLI then rejects the invocation before any model
+    turn with an opaque argument error.
+    """
+
+    @staticmethod
+    def _sandbox_patches(run_subprocess, argv_mock=None):
+        argv_patch = (
+            patch('orchestrator.agents.invoke.build_claude_argv', argv_mock)
+            if argv_mock is not None
+            else contextlib.nullcontext()
+        )
+        return (
+            patch(
+                'orchestrator.agents.sandbox_dispatch.resolve_active_backend',
+                return_value='bwrap',
+            ),
+            patch(
+                'orchestrator.agents.sandbox_dispatch.wrap_command',
+                side_effect=lambda cmd, cwd, mods, writable_extras=None: cmd,
+            ),
+            patch('orchestrator.agents.invoke._run_subprocess', side_effect=run_subprocess),
+            argv_patch,
+        )
+
+    async def _assert_blank_prompt_rejected(self, prompt, tmp_path):
+        # A real _SubprocessResult so that a leak past the guard fails on the
+        # missing ValueError rather than exploding inside _parse_claude_output.
+        run_mock = AsyncMock(
+            return_value=_SubprocessResult(
+                stdout='', stderr='', returncode=0, duration_ms=10, timed_out=False,
+            )
+        )
+        argv_mock = MagicMock(return_value=(['claude', '--print'], []))
+        backend_p, wrap_p, run_p, argv_p = self._sandbox_patches(run_mock, argv_mock)
+
+        with backend_p, wrap_p, run_p, argv_p, pytest.raises(ValueError):
+            await _invoke_claude_with_sandbox(
+                prompt=prompt, system_prompt='sys', cwd=tmp_path,
+                model='claude-sonnet-4-5', max_turns=5, max_budget_usd=1.0,
+                allowed_tools=None, disallowed_tools=None,
+                mcp_config=None, output_schema=None,
+                permission_mode='bypassPermissions',
+                sandbox_modules=['m'],
+                effort=None, timeout_seconds=30.0,
+            )
+
+        # No temp files may be created and no subprocess spawned for a blank
+        # prompt: the guard has to fire strictly before build_claude_argv.
+        argv_mock.assert_not_called()
+        run_mock.assert_not_called()
+
+    async def test_empty_prompt_raises_before_argv_or_subprocess(self, tmp_path):
+        await self._assert_blank_prompt_rejected('', tmp_path)
+
+    async def test_whitespace_only_prompt_raises_before_argv_or_subprocess(self, tmp_path):
+        await self._assert_blank_prompt_rejected('  \n\t ', tmp_path)
+
+    async def test_a_normal_prompt_still_reaches_the_subprocess_via_stdin(self, tmp_path):
+        """REGRESSION: the guard must not narrow the happy path, and must not
+        change how the prompt is delivered."""
+        captured: dict = {}
+
+        async def mock_run_subprocess(cmd, cwd, env, model, timeout_seconds, **kwargs):
+            captured.update(kwargs)
+            captured['cmd'] = cmd
+            return _SubprocessResult(
+                stdout='', stderr='', returncode=0, duration_ms=50, timed_out=False,
+            )
+
+        backend_p, wrap_p, run_p, _ = self._sandbox_patches(mock_run_subprocess)
+
+        with backend_p, wrap_p, run_p:
+            await _invoke_claude_with_sandbox(
+                prompt='a real prompt', system_prompt='sys', cwd=tmp_path,
+                model='claude-sonnet-4-5', max_turns=5, max_budget_usd=1.0,
+                allowed_tools=None, disallowed_tools=None,
+                mcp_config=None, output_schema=None,
+                permission_mode='bypassPermissions',
+                sandbox_modules=['m'],
+                effort=None, timeout_seconds=30.0,
+            )
+
+        assert captured['stdin_data'] == b'a real prompt'
+        assert 'a real prompt' not in captured['cmd'], (
+            'the prompt is a stdin payload, never an argv element'
+        )
+
+
+# ── stdin-starvation race, local runner (task 3147 / esc-3118-1) ─────────────
+#
+# _run_subprocess_local is a SECOND, independent implementation of the spawn
+# path carrying the codex backend's payload, and it had the byte-for-byte
+# identical defect as shared.cli_invoke._run_subprocess: stdin=PIPE plus
+# communicate(input=...), i.e. the payload written by the EVENT LOOP after
+# execve.  Fixing only the shared runner would have left a live instance of
+# exactly the bug this task exists to close.
+
+# The stub CLI and the loop-starving exec fake are IMPORTED from
+# shared.testing_stdin (see this module's imports), not re-declared here.  They
+# were briefly duplicated from shared/tests/test_cli_invoke.py because
+# `shared.tests` is not an importable package under the orchestrator pytest
+# rootdir; the fix was to move the single definition into the shipped `shared`
+# package — which orchestrator already depends on — alongside shared.testing.
+# One copy means an edit to the stub's rejection signature cannot land in one
+# suite and silently miss the other.
+
+
+@pytest.mark.asyncio
+class TestStdinStarvationRaceLocal:
+    """_run_subprocess_local delivers stdin even when the loop stalls after spawn."""
+
+    @pytest.mark.timeout(30)
+    async def test_local_runner_delivers_stdin_when_loop_starved(self, tmp_path):
+        """A 1.0s post-spawn loop stall must not cost the codex child its payload."""
+        stub = tmp_path / 'stub_cli.py'
+        stub.write_text(STDIN_STARVATION_STUB)
+
+        payload = b'Y' * 4242
+
+        with patch(
+            'orchestrator.agents.invoke.asyncio.create_subprocess_exec',
+            side_effect=make_starving_exec(1.0),
+        ):
+            result = await _run_subprocess_local(
+                [sys.executable, str(stub)],
+                tmp_path,
+                env={},
+                backend='codex',
+                model='stub',
+                max_budget_usd=1.0,
+                timeout_seconds=20.0,
+                stdin_data=payload,
+            )
+
+        assert result.returncode == 0, (
+            f'stub CLI rejected the invocation; stderr={result.stderr!r}'
+        )
+        assert result.stdout.strip() == f'GOT:{len(payload)}'
+        assert 'no stdin data received' not in result.stderr
+        assert 'Input must be provided' not in result.stderr
+
+    async def test_none_stdin_data_still_inherits_stdin(self, tmp_path):
+        """stdin_data=None must still spawn with stdin=None (inherited).
+
+        Protects the gemini and pi branches, which pass the prompt on argv,
+        pass stdin_data=None, and rely on inherited stdin.
+        """
+        captured_kwargs: dict = {}
+
+        async def fake_exec(*args, **kwargs):
+            captured_kwargs.update(kwargs)
+            proc = MagicMock()
+            proc.communicate = AsyncMock(return_value=(b'', b''))
+            proc.returncode = 0
+            proc.terminate = MagicMock()
+            proc.kill = MagicMock()
+            proc.wait = AsyncMock()
+            return proc
+
+        with patch(
+            'orchestrator.agents.invoke.asyncio.create_subprocess_exec',
+            side_effect=fake_exec,
+        ):
+            await _run_subprocess_local(
+                ['gemini', '-p', 'hello'],
+                tmp_path,
+                env={},
+                backend='gemini',
+                model='stub',
+                max_budget_usd=1.0,
+                stdin_data=None,
+            )
+
+        assert 'stdin' in captured_kwargs
+        assert captured_kwargs['stdin'] is None, (
+            f'stdin_data=None must inherit stdin; got {captured_kwargs["stdin"]!r}'
+        )

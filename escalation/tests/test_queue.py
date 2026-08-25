@@ -17,7 +17,15 @@ import pytest
 
 from escalation.classify import effective_benign
 from escalation.models import Escalation
-from escalation.queue import EscalationQueue, iter_all_escalation_paths
+from escalation.queue import (
+    _MAX_AMENDMENT_DETAIL_CHARS,
+    _MAX_AMENDMENT_LINE_CHARS,
+    _MAX_AMENDMENT_OPTIONS,
+    _MAX_AMENDMENTS,
+    AmendmentOutcome,
+    EscalationQueue,
+    iter_all_escalation_paths,
+)
 
 
 def _make_escalation(esc_id: str, task_id: str = '1', status: str = 'pending', level: int = 0) -> Escalation:
@@ -2765,6 +2773,561 @@ class TestAddMembersToL2:
             f'Expected 3 unique members (esc-l1-0, esc-l1-1, esc-l1-2), got {result.members}'
         )
 
+    # -- C2: incoming framing is PRESERVED, not discarded (task 3997) --------
+
+    def _framed_l2(self, queue: EscalationQueue) -> Escalation:
+        """A pending L2 carrying its OWN original framing, so it is assertable."""
+        esc = Escalation(
+            id=queue.make_id('task-1'),
+            task_id='task-1',
+            agent_role='escalation-watcher-auto',
+            severity='blocking',
+            category='design_concern',
+            summary='ORIGINAL one-line hypothesis',
+            detail='ORIGINAL evidence text',
+            root_cause='Bad merge strategy',
+            options=['A: fix', 'B: rollback'],
+            level=2,
+            members=['esc-l1-0'],
+        )
+        queue.submit(esc)
+        return esc
+
+    def _on_disk(self, queue: EscalationQueue, esc_id: str) -> Escalation:
+        return Escalation.from_json((queue.queue_dir / f'{esc_id}.json').read_text())
+
+    def test_add_members_preserves_incoming_framing(self, tmp_path: Path):
+        """A fold's incoming framing is APPENDED to `amendments`, never discarded.
+
+        C2.  Repeated promotes of the same cluster used to drop every incoming
+        root_cause/evidence/options/summary on the floor (measured: 336,875
+        characters lost).  They are now preserved alongside — never instead of —
+        the record's own original framing.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._framed_l2(queue)
+        original_ts = l2.timestamp
+
+        result = queue.add_members_to_l2(
+            l2.id, ['esc-l1-1'],
+            root_cause='canonical root cause v2',
+            evidence='NEW evidence text authored by this promote',
+            options=['C: third way'],
+            summary='new one-line hypothesis',
+            agent_role='escalation-watcher-auto',
+        )
+
+        assert result is not None
+        # (a) the incoming framing landed, verbatim.
+        assert len(result.amendments) == 1, (
+            f'Expected exactly one amendment, got {result.amendments!r}'
+        )
+        amendment = result.amendments[0]
+        assert amendment['root_cause'] == 'canonical root cause v2'
+        assert amendment['summary'] == 'new one-line hypothesis'
+        assert amendment['options'] == ['C: third way']
+        assert amendment['detail'] == 'NEW evidence text authored by this promote', (
+            "the incoming `evidence` argument is stored under `detail` — the same "
+            f'field the create path writes it to; got {amendment!r}'
+        )
+        assert amendment['agent_role'] == 'escalation-watcher-auto'
+
+        # (b) the queue stamped the clock itself — a real, parseable ISO instant.
+        from datetime import datetime
+        assert amendment['timestamp'], f'amendment carries no timestamp: {amendment!r}'
+        datetime.fromisoformat(amendment['timestamp'])
+
+        # (c) APPEND, NOT OVERWRITE: the record's own framing is immutable.
+        assert result.root_cause == 'Bad merge strategy'
+        assert result.detail == 'ORIGINAL evidence text'
+        assert result.options == ['A: fix', 'B: rollback']
+        assert result.summary == 'ORIGINAL one-line hypothesis'
+        assert result.timestamp == original_ts
+
+        # (d) DURABILITY: it is on disk, not just on the returned object.
+        reloaded = self._on_disk(queue, l2.id)
+        assert reloaded.amendments == result.amendments, (
+            f'amendment did not survive to disk: {reloaded.amendments!r}'
+        )
+        assert reloaded.root_cause == 'Bad merge strategy'
+
+    def test_add_members_records_amendment_with_no_new_members(self, tmp_path: Path):
+        """A framing-only fold (ZERO new members) still preserves the framing.
+
+        This is the repeated-promote-of-the-same-cluster case where the measured
+        336,875 characters were lost: `if not new_member_ids and severity_floor
+        is None: return esc` treated it as a no-op and discarded the framing.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._framed_l2(queue)
+        assert l2.updated_at is None
+
+        result = queue.add_members_to_l2(
+            l2.id, [],
+            root_cause='same cluster, third pass',
+            evidence='third-pass evidence',
+            summary='third-pass hypothesis',
+            agent_role='escalation-watcher-auto',
+        )
+
+        assert result is not None
+        assert len(result.amendments) == 1, (
+            f'A framing-only fold must NOT be treated as a no-op: {result.amendments!r}'
+        )
+        assert result.amendments[0]['detail'] == 'third-pass evidence'
+        # New framing IS a substantive content change: it is exactly the
+        # re-assess trigger the watcher's stamp-then-skip protocol keys off
+        # (updated_at > triaged_at), so it must bump rather than sit silent.
+        assert result.updated_at is not None, (
+            'A framing-only fold must stamp updated_at — otherwise a record that '
+            'silently gained new framing is skipped forever'
+        )
+        assert result.members == ['esc-l1-0'], (
+            f'members must be untouched by a framing-only fold, got {result.members}'
+        )
+        assert self._on_disk(queue, l2.id).amendments == result.amendments
+
+    def test_add_members_without_framing_records_no_amendment(self, tmp_path: Path):
+        """The existing two-positional-arg call form appends nothing (back-compat).
+
+        No framing means no amendment: a bare member append must not manufacture
+        an empty row that burns cap budget and reads as a reframing that never
+        happened.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._framed_l2(queue)
+
+        result = queue.add_members_to_l2(l2.id, ['esc-l1-1'])
+
+        assert result is not None
+        assert result.members == ['esc-l1-0', 'esc-l1-1']
+        assert result.amendments == [], (
+            f'A framing-free call must record no amendment, got {result.amendments!r}'
+        )
+        assert self._on_disk(queue, l2.id).amendments == []
+
+    def test_repeated_identical_framing_records_one_amendment(self, tmp_path: Path):
+        """Framing identical to the LAST amendment is a true no-op — not re-recorded.
+
+        A rotation re-promoting the same cluster with UNCHANGED text has
+        contributed nothing.  Re-recording it would manufacture a spurious
+        updated_at bump (re-triggering the watcher's re-assess on a no-op — the
+        contract task 3976 pinned) and burn cap budget, so _MAX_AMENDMENTS worth
+        of identical rows would push genuinely-distinct earlier framings out via
+        the drop-oldest policy.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._framed_l2(queue)
+        framing = {
+            'root_cause': 'canonical root cause v2',
+            'evidence': 'evidence text',
+            'summary': 'hypothesis',
+            'options': ['C: third way'],
+            'agent_role': 'escalation-watcher-auto',
+        }
+
+        first = queue.add_members_to_l2(l2.id, [], **framing)
+        assert first is not None and len(first.amendments) == 1
+        bumped_at = first.updated_at
+        assert bumped_at is not None
+
+        again = queue.add_members_to_l2(l2.id, [], **framing)
+
+        assert again is not None
+        assert len(again.amendments) == 1, (
+            f'identical framing must not be re-recorded, got {again.amendments!r}'
+        )
+        assert again.updated_at == bumped_at, (
+            'a framing-identical re-promote is a true no-op and must not bump '
+            f'updated_at, got {bumped_at!r} -> {again.updated_at!r}'
+        )
+
+        # But a genuine reframing is new relative to what the record currently
+        # says, so it IS recorded.
+        changed = queue.add_members_to_l2(
+            l2.id, [], **{**framing, 'summary': 'a genuinely different hypothesis'},
+        )
+        assert changed is not None
+        assert len(changed.amendments) == 2, (
+            f'a changed framing must be recorded, got {changed.amendments!r}'
+        )
+
+        # A -> B -> A: returning to an EARLIER position is new relative to what
+        # the record currently says, so it is recorded too.  This is the whole
+        # justification for comparing against the LAST position rather than the
+        # whole list — without this call, an "optimisation" that deduped against
+        # every past amendment would pass this suite untouched.
+        returned = queue.add_members_to_l2(l2.id, [], **framing)
+        assert returned is not None
+        assert len(returned.amendments) == 3, (
+            f'a return to an earlier framing must be recorded, got '
+            f'{returned.amendments!r}'
+        )
+        first_view, last_view = (
+            {k: a[k] for k in ('root_cause', 'summary', 'detail', 'options')}
+            for a in (returned.amendments[0], returned.amendments[-1])
+        )
+        assert last_view == first_view, (
+            f'the re-submitted framing must round-trip verbatim (timestamp aside): '
+            f'{first_view!r} -> {last_view!r}'
+        )
+        assert returned.amendments[-1]['timestamp'] != returned.amendments[0]['timestamp'], (
+            'each amendment is stamped at ITS OWN write time; two entries sharing '
+            'a timestamp would mean the queue reused the first stamp'
+        )
+
+    def test_repromote_identical_to_the_records_own_framing_is_a_no_op(
+        self, tmp_path: Path,
+    ):
+        """The FIRST re-promote is compared against the record's OWN framing.
+
+        An L2's first re-promote is the one most likely to carry text
+        byte-identical to the create — the watcher recomputes the same cluster
+        and re-sends the same framing.  Treating "no amendments yet" as
+        "nothing to compare against" recorded a verbatim copy of the record's
+        own root_cause/detail/options/summary: one spurious `updated_at` bump
+        per L2, which re-triggers the watcher's stamp-then-skip re-assess
+        protocol (the contract task 3976 pinned) on a genuine no-op, plus one
+        cap slot burned on text already durably on the record.
+
+        The record's own framing IS the implicit `amendments[-1]`.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._framed_l2(queue)
+        assert l2.updated_at is None
+
+        result = queue.add_members_to_l2(
+            l2.id,
+            ['esc-l1-0'],  # already a member: nothing new to append either
+            # Byte-identical to what _framed_l2 created the record with.
+            root_cause='Bad merge strategy',
+            evidence='ORIGINAL evidence text',
+            options=['A: fix', 'B: rollback'],
+            summary='ORIGINAL one-line hypothesis',
+            agent_role='escalation-watcher-auto',
+        )
+
+        assert result is not None
+        assert result.amendments == [], (
+            'framing identical to the record\'s OWN framing contributes nothing '
+            f'and must not be recorded, got {result.amendments!r}'
+        )
+        assert result.updated_at is None, (
+            'a no-op must not bump updated_at — that bump re-triggers the '
+            f'watcher re-assess protocol on nothing, got {result.updated_at!r}'
+        )
+        # DURABILITY: not merely absent from the returned object.
+        on_disk = self._on_disk(queue, l2.id)
+        assert on_disk.amendments == []
+        assert on_disk.updated_at is None
+
+    def test_repromote_differing_only_in_root_cause_whitespace_is_a_no_op(
+        self, tmp_path: Path,
+    ):
+        """The dedup KEY is compared stripped, mirroring how the fold was routed.
+
+        `find_pending_l2_by_root_cause` matches on `root_cause.strip()`, and the
+        create path stores the stripped value — so a fold whose key differs only
+        in surrounding whitespace found THIS L2 by that very key.  Recording it
+        as new framing would contradict the lookup that routed it here.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._framed_l2(queue)
+
+        result = queue.add_members_to_l2(
+            l2.id, [],
+            root_cause='  Bad merge strategy\n',
+            evidence='ORIGINAL evidence text',
+            options=['A: fix', 'B: rollback'],
+            summary='ORIGINAL one-line hypothesis',
+        )
+
+        assert result is not None
+        assert result.amendments == [], (
+            f'whitespace on the dedup key is not a reframing, got {result.amendments!r}'
+        )
+        assert result.updated_at is None
+
+    def test_amendment_fields_are_elided_to_their_named_caps(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ):
+        """Each entry is BYTE-bounded, marked, and the loss is counted.
+
+        The entry cap alone bounds nothing: an amendment's `detail` is the
+        promote's unbounded free-text `evidence` argument — the same field the
+        compact projection exists to keep off the wire — so a hot-folding L2
+        could sit "inside `_MAX_AMENDMENTS`" while growing by hundreds of KB,
+        and every reader of a FULL record pays that (`get_escalation`,
+        `get_pending_escalations(compact=False)`, every sweep's JSON parse).
+
+        Bounds are derived from the constants' NAMES, never their values.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._framed_l2(queue)
+        over = 50  # comfortably past every cap, whatever they are retuned to
+
+        with caplog.at_level(logging.WARNING, logger='escalation.queue'):
+            result = queue.add_members_to_l2(
+                l2.id, [],
+                root_cause='R' * (_MAX_AMENDMENT_LINE_CHARS + over),
+                summary='S' * (_MAX_AMENDMENT_LINE_CHARS + over),
+                evidence='D' * (_MAX_AMENDMENT_DETAIL_CHARS + over),
+                options=(
+                    ['O' * (_MAX_AMENDMENT_LINE_CHARS + over)]
+                    * (_MAX_AMENDMENT_OPTIONS + 2)
+                ),
+                agent_role='escalation-watcher-auto',
+            )
+
+        assert result is not None
+        assert len(result.amendments) == 1
+        amendment = result.amendments[0]
+
+        # (a) the KEPT text of each field is capped — the marker is allowed to
+        # push the stored string past the cap, but the payload is not.
+        assert amendment['root_cause'].count('R') == _MAX_AMENDMENT_LINE_CHARS
+        assert amendment['summary'].count('S') == _MAX_AMENDMENT_LINE_CHARS
+        assert amendment['detail'].count('D') == _MAX_AMENDMENT_DETAIL_CHARS
+        # (b) the options LIST is capped in length, and each option in width.
+        assert len(amendment['options']) == _MAX_AMENDMENT_OPTIONS, (
+            f'the options list must be length-capped, got '
+            f'{len(amendment["options"])}'
+        )
+        assert all(
+            o.count('O') == _MAX_AMENDMENT_LINE_CHARS for o in amendment['options']
+        )
+        # (c) the elision is MARKED IN-BAND, so a reader can tell the head of a
+        # framing from the whole of one without cross-referencing anything.
+        assert amendment['detail'].endswith(' ...]'), (
+            f'elision must be marked in-band, got tail {amendment["detail"][-80:]!r}'
+        )
+        assert str(over) in amendment['detail'], (
+            f'the marker must name what it dropped: {amendment["detail"][-120:]!r}'
+        )
+        # (d) the loss is DURABLY COUNTED on the record (INV-8) — the byte-side
+        # counterpart of amendments_truncated.
+        shed_options = 2 * (_MAX_AMENDMENT_LINE_CHARS + over)
+        expected = over * (3 + _MAX_AMENDMENT_OPTIONS) + shed_options
+        assert result.amendments_chars_elided == expected, (
+            f'expected {expected} elided chars, got {result.amendments_chars_elided}'
+        )
+        assert self._on_disk(queue, l2.id).amendments_chars_elided == expected
+        assert any(
+            'elided' in r.getMessage() for r in caplog.records
+        ), 'elision must also be loud in the log'
+
+        # (e) elision does not defeat repeat detection: the SAME oversized
+        # framing re-submitted is still a no-op, because both sides are elided
+        # by the same builder.
+        bumped_at = result.updated_at
+        again = queue.add_members_to_l2(
+            l2.id, [],
+            root_cause='R' * (_MAX_AMENDMENT_LINE_CHARS + over),
+            summary='S' * (_MAX_AMENDMENT_LINE_CHARS + over),
+            evidence='D' * (_MAX_AMENDMENT_DETAIL_CHARS + over),
+            options=(
+                ['O' * (_MAX_AMENDMENT_LINE_CHARS + over)]
+                * (_MAX_AMENDMENT_OPTIONS + 2)
+            ),
+        )
+        assert again is not None
+        assert len(again.amendments) == 1, (
+            f'elided framing must still compare equal, got {again.amendments!r}'
+        )
+        assert again.updated_at == bumped_at
+
+    def test_amendment_list_size_envelope_is_bounded(self, tmp_path: Path):
+        """The whole list's SIZE — not just its length — is bounded by the caps.
+
+        The property the caps exist for, asserted end-to-end: feed folds far
+        larger than any cap, fill past `_MAX_AMENDMENTS`, and the stored framing
+        still fits an envelope computed FROM the constants.  Without per-field
+        elision this is ~5 MB of durable record.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._framed_l2(queue)
+        huge = 50_000
+
+        for i in range(_MAX_AMENDMENTS + 3):
+            queue.add_members_to_l2(
+                l2.id, [],
+                root_cause=f'{i}' + 'R' * huge,
+                summary=f'{i}' + 'S' * huge,
+                evidence=f'{i}' + 'D' * huge,
+                options=[f'{i}' + 'O' * huge] * 10,
+                agent_role='escalation-watcher-auto',
+            )
+
+        record = self._on_disk(queue, l2.id)
+        assert len(record.amendments) == _MAX_AMENDMENTS
+        stored = sum(
+            len(a['root_cause']) + len(a['summary']) + len(a['detail'])
+            + sum(len(o) for o in a['options'])
+            for a in record.amendments
+        )
+        # Per-entry payload, derived from the constants; the marker allowance
+        # covers the in-band elision notes (one per elided field).
+        marker_allowance = 120
+        fields_per_entry = 3 + _MAX_AMENDMENT_OPTIONS
+        envelope = _MAX_AMENDMENTS * (
+            2 * _MAX_AMENDMENT_LINE_CHARS
+            + _MAX_AMENDMENT_DETAIL_CHARS
+            + _MAX_AMENDMENT_OPTIONS * _MAX_AMENDMENT_LINE_CHARS
+            + fields_per_entry * marker_allowance
+        )
+        assert stored <= envelope, (
+            f'amendments must stay inside the {envelope}-char envelope the caps '
+            f'imply, got {stored}'
+        )
+        # And the byte loss is counted, not silent.
+        assert record.amendments_chars_elided > 0
+
+    def test_add_members_reports_its_amendment_outcome(self, tmp_path: Path):
+        """The WRITER reports what it did, on every return path.
+
+        `promote_to_l2` needs two facts per fold — did this call record framing,
+        and did it shed any — to report `amendment_recorded` and to trigger the
+        truncation storm escape.  Re-deriving them in the server from a pre-read
+        plus a "did the count grow" heuristic cost a second full record parse per
+        fold and raced: this queue is built for cross-process mutators, so a
+        concurrent fold between the pre-read and the call made the flag wrong in
+        either direction.  Computed inside `escalation_id_lock`, it is exact.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._framed_l2(queue)
+
+        def fresh() -> AmendmentOutcome:
+            return {'recorded': False, 'dropped': 0}
+
+        # (a) NOT FOUND — filled, not left missing, so the caller can read it
+        # without guarding.
+        missing = fresh()
+        assert queue.add_members_to_l2(
+            'esc-does-not-exist', ['esc-l1-9'], outcome=missing,
+        ) is None
+        assert missing == {'recorded': False, 'dropped': 0}
+
+        # (b) NO-OP early return (no members, no floor, no framing).
+        noop = fresh()
+        queue.add_members_to_l2(l2.id, [], outcome=noop)
+        assert noop == {'recorded': False, 'dropped': 0}
+
+        # (c) a bare member append records nothing.
+        bare = fresh()
+        queue.add_members_to_l2(l2.id, ['esc-l1-1'], outcome=bare)
+        assert bare == {'recorded': False, 'dropped': 0}
+
+        # (d) framing recorded, nothing shed.  One definition of the framing
+        # text, used by both this call and the repeat below, so (e) is a true
+        # byte-identical re-promote by construction.
+        def fold(outcome: AmendmentOutcome) -> None:
+            queue.add_members_to_l2(
+                l2.id, [], outcome=outcome,
+                root_cause='canonical root cause v2',
+                evidence='first evidence',
+                summary='first hypothesis',
+            )
+
+        recorded = fresh()
+        fold(recorded)
+        assert recorded == {'recorded': True, 'dropped': 0}
+
+        # (e) a framing-identical repeat is suppressed — and says so.
+        repeat = fresh()
+        fold(repeat)
+        assert repeat == {'recorded': False, 'dropped': 0}, (
+            'a suppressed repeat must not report a write'
+        )
+
+        # (f) at the cap, an append SHEDS — and the count is this call's own,
+        # not a difference inferred from a racy pre-read.
+        for i in range(_MAX_AMENDMENTS):
+            queue.add_members_to_l2(
+                l2.id, [], root_cause=f'fill {i}', evidence=f'fill evidence {i}',
+            )
+        truncating = fresh()
+        queue.add_members_to_l2(
+            l2.id, [], outcome=truncating,
+            root_cause='one past the cap', evidence='overflow evidence',
+        )
+        assert truncating == {'recorded': True, 'dropped': 1}, (
+            f'a truncating append must report both facts, got {truncating}'
+        )
+        capped = queue.get(l2.id)
+        assert capped is not None and len(capped.amendments) == _MAX_AMENDMENTS
+
+    def test_amendment_list_is_capped_and_truncation_is_loud(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ):
+        """Amendment growth is bounded, sheds the OLDEST, and counts what it shed.
+
+        INV-7: the cap has a NAME (`_MAX_AMENDMENTS`), a direction (drop oldest)
+        and an owner (this method, at write time).  The loop bound is derived
+        FROM the constant, never hardcoded — a literal here would encode the
+        constant's VALUE instead of its NAME and go stale the moment it is
+        retuned (sibling task 3998 raises the fold rate by design).
+
+        Shedding the OLDEST is safe precisely because the ORIGINAL framing is
+        never in this list at all: it lives permanently in the record's own
+        immutable root_cause/detail/options/summary, so the oldest amendment is
+        the least-informative entry and a rotation triaging NOW needs the most
+        recent framing.
+        """
+        overflow = 3
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._framed_l2(queue)
+
+        with caplog.at_level(logging.WARNING, logger='escalation.queue'):
+            for i in range(_MAX_AMENDMENTS + overflow):
+                result = queue.add_members_to_l2(
+                    l2.id, [],
+                    root_cause=f'root cause pass {i}',
+                    evidence=f'evidence pass {i}',
+                    agent_role='escalation-watcher-auto',
+                )
+
+        assert result is not None
+        # (a) growth is BOUNDED.
+        assert len(result.amendments) == _MAX_AMENDMENTS, (
+            f'Expected the list capped at {_MAX_AMENDMENTS}, '
+            f'got {len(result.amendments)}'
+        )
+        # (b) the RETAINED entries are the most RECENT ones — identified by
+        # index-derived content, not by position alone.
+        retained = {a['root_cause'] for a in result.amendments}
+        assert retained == {
+            f'root cause pass {i}'
+            for i in range(overflow, _MAX_AMENDMENTS + overflow)
+        }, f'Expected the newest {_MAX_AMENDMENTS} passes to survive, got {sorted(retained)}'
+        assert result.amendments[-1]['detail'] == (
+            f'evidence pass {_MAX_AMENDMENTS + overflow - 1}'
+        ), 'the most recent framing must be the LAST entry'
+        # (c) the loss is DURABLY COUNTED on the record — assertable without
+        # scraping logs (INV-8).
+        assert result.amendments_truncated == overflow, (
+            f'Expected {overflow} shed entries counted, got {result.amendments_truncated}'
+        )
+
+        # (d) and it is LOUD.
+        warning_records = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and r.name == 'escalation.queue'
+        ]
+        assert warning_records, (
+            f"Expected a WARNING at logger 'escalation.queue'; got records: {caplog.records}"
+        )
+        assert any(l2.id in r.getMessage() for r in warning_records), (
+            f'Expected a truncation WARNING naming {l2.id}; '
+            f'got {[r.getMessage() for r in warning_records]}'
+        )
+
+        # The cap is enforced on DISK too, not just on the returned object —
+        # the trim rides the same single _rewrite as the append.
+        reloaded = self._on_disk(queue, l2.id)
+        assert len(reloaded.amendments) == _MAX_AMENDMENTS
+        assert reloaded.amendments_truncated == overflow
+        assert {a['root_cause'] for a in reloaded.amendments} == retained
+
 
 class TestStampTriage:
     """EscalationQueue.stamp_triage() stamps a triage-ack annotation on a pending record.
@@ -4412,3 +4975,201 @@ class TestResolveGrantedFiles:
         updated = queue.get('esc-1-1')
         assert updated is not None
         assert updated.granted_files == []
+
+
+class TestResolvedAtIsStampedFromTheLiveClock:
+    """REGRESSION PIN, not a fix — companion to the models-side pin (task 3236).
+
+    See ``test_models.py::TestTimestampIsStampedFromTheLiveClock``: no
+    cached/session clock exists in the stamping code, so this pins the
+    falsifiable part — resolved_at is stamped, tz-aware, and ordered after the
+    record's own timestamp.
+    """
+
+    def test_resolve_stamps_resolved_at_after_timestamp(self, tmp_path):
+        """resolved_at is stamped, tz-aware, and never precedes timestamp."""
+        from datetime import datetime
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = _make_escalation('esc-1-1')
+        queue.submit(esc)
+
+        resolved = queue.resolve('esc-1-1', 'fixed', resolved_by='steward')
+
+        assert resolved is not None
+        assert resolved.resolved_at is not None, 'resolve() left resolved_at unstamped'
+        stamped = datetime.fromisoformat(resolved.resolved_at)
+        assert stamped.tzinfo is not None, f'Naive resolved_at: {resolved.resolved_at!r}'
+        assert stamped >= datetime.fromisoformat(resolved.timestamp), (
+            f'resolved_at {resolved.resolved_at!r} precedes timestamp '
+            f'{resolved.timestamp!r} for the same record'
+        )
+
+
+class TestAddMembersToL2SeverityFloor:
+    """add_members_to_l2 applies an UPWARD-ONLY severity floor (task 3976).
+
+    Invariant: **an L2's severity is monotonically non-decreasing after mint.**
+
+    This closes a regression that promote_to_l2's new inherited default would
+    otherwise introduce.  Before, every L2 was born 'blocking', so this method
+    never touching severity was harmless.  Once an L2 can be born 'info', a
+    genuine blocker folding into it under the same root_cause would sit at
+    'info' forever — under-escalation, the exact mirror of the inflation this
+    task removes.
+    """
+
+    def _make_l2(
+        self,
+        queue: EscalationQueue,
+        severity: str = 'info',
+        task_id: str = 'task-1',
+    ) -> Escalation:
+        esc = Escalation(
+            id=queue.make_id(task_id),
+            task_id=task_id,
+            agent_role='escalation-watcher-auto',
+            severity=severity,
+            category='design_concern',
+            summary='L2 cluster for severity-floor test',
+            level=2,
+            root_cause='Bad merge strategy',
+            members=['esc-l1-0'],
+        )
+        queue.submit(esc)
+        return esc
+
+    def _on_disk(self, queue: EscalationQueue, esc_id: str) -> dict[str, Any]:
+        return json.loads((queue.queue_dir / f'{esc_id}.json').read_text())
+
+    def test_floor_promotes_info_l2_to_blocking(self, tmp_path: Path):
+        """(a) A blocking floor raises an info L2 — in the return value AND on disk."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2(queue, severity='info')
+
+        result = queue.add_members_to_l2(l2.id, ['esc-new'], severity_floor='blocking')
+
+        assert result is not None
+        assert result.severity == 'blocking', (
+            f'Expected the floor to raise info→blocking, got {result.severity!r}'
+        )
+        assert self._on_disk(queue, l2.id)['severity'] == 'blocking', (
+            'The promoted severity must be persisted, not only returned'
+        )
+
+    def test_floor_never_demotes(self, tmp_path: Path):
+        """(b) A lower floor is a no-op — the floor can only ever add attention."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2(queue, severity='blocking')
+
+        result = queue.add_members_to_l2(l2.id, ['esc-new'], severity_floor='info')
+
+        assert result is not None
+        assert result.severity == 'blocking', (
+            f'A floor must never demote; got {result.severity!r}'
+        )
+
+    def test_floor_is_ranked_not_string_compared(self, tmp_path: Path):
+        """(c) critical outranks blocking, and blocking does not outrank critical."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        blocking_l2 = self._make_l2(queue, severity='blocking', task_id='task-1')
+        critical_l2 = self._make_l2(queue, severity='critical', task_id='task-2')
+
+        raised = queue.add_members_to_l2(
+            blocking_l2.id, ['esc-new'], severity_floor='critical',
+        )
+        held = queue.add_members_to_l2(
+            critical_l2.id, ['esc-new'], severity_floor='blocking',
+        )
+
+        assert raised is not None
+        assert raised.severity == 'critical'
+        assert held is not None
+        assert held.severity == 'critical', (
+            f'blocking must not outrank critical; got {held.severity!r}'
+        )
+
+    def test_omitting_the_floor_is_a_no_op(self, tmp_path: Path):
+        """(d) Every existing caller is unaffected — severity is untouched."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2(queue, severity='info')
+
+        result = queue.add_members_to_l2(l2.id, ['esc-new'])
+
+        assert result is not None
+        assert result.severity == 'info', (
+            f'Omitting severity_floor must not change severity; got {result.severity!r}'
+        )
+
+    def test_severity_only_change_bumps_updated_at(self, tmp_path: Path):
+        """(e) A severity-only change IS a content change — it must bump updated_at.
+
+        The watcher's re-assess protocol keys off updated_at > triaged_at
+        ('Triage-ack freshness contract'), so a record that silently got more
+        severe without bumping would be stamp-then-skipped forever.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2(queue, severity='info')
+        # No NEW member ids — 'esc-l1-0' is already present.
+        assert l2.updated_at is None
+
+        result = queue.add_members_to_l2(
+            l2.id, ['esc-l1-0'], severity_floor='blocking',
+        )
+
+        assert result is not None
+        assert result.severity == 'blocking'
+        assert result.updated_at is not None, (
+            'A severity-only promotion must stamp updated_at'
+        )
+
+        before = result.updated_at
+        raised_again = queue.add_members_to_l2(
+            l2.id, ['esc-l1-0'], severity_floor='critical',
+        )
+        assert raised_again is not None
+        assert raised_again.updated_at is not None
+        assert raised_again.updated_at > before, (
+            f'Expected updated_at to strictly increase, got {before!r} -> '
+            f'{raised_again.updated_at!r}'
+        )
+
+    def test_no_op_stays_a_no_op(self, tmp_path: Path):
+        """(f) No new members AND a floor at/below current severity → no bump.
+
+        Do not manufacture a re-assess trigger for nothing.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2(queue, severity='blocking')
+
+        result = queue.add_members_to_l2(l2.id, ['esc-l1-0'], severity_floor='info')
+
+        assert result is not None
+        assert result.severity == 'blocking'
+        assert result.updated_at is None, (
+            f'Expected no updated_at bump for a true no-op, got {result.updated_at!r}'
+        )
+
+    def test_unknown_floor_does_not_corrupt_the_record(self, tmp_path: Path, caplog):
+        """(g) An unknown floor fails soft to rank 0 — the record keeps its severity."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2(queue, severity='blocking')
+
+        with caplog.at_level(logging.WARNING):
+            result = queue.add_members_to_l2(
+                l2.id, ['esc-new'], severity_floor='warn',
+            )
+
+        assert result is not None
+        assert result.severity == 'blocking', (
+            f'An unknown floor must not corrupt severity; got {result.severity!r}'
+        )
+        assert self._on_disk(queue, l2.id)['severity'] == 'blocking'
+        warned = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and 'warn' in r.getMessage()
+        ]
+        assert warned, (
+            'Expected a WARNING naming the unrecognised severity; got: '
+            f'{[r.getMessage() for r in caplog.records]}'
+        )

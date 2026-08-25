@@ -187,6 +187,13 @@ def _normalize_plan(plan: dict) -> tuple[dict, bool]:
 
 _VALID_VERDICT_ROLE_RE = re.compile(r'^[A-Za-z0-9_-]+$')
 
+#: How many consecutive residue filenames ``write_markup_residue`` will probe
+#: before giving up LOUDLY. Every probe past the first means another writer
+#: claimed that index in the same instant, so this is a bound on simultaneous
+#: writers against one artifacts root — a reviewer panel is a handful, and the
+#: orchestrator runs one guarded MCP server per subprocess.
+_MARKUP_RESIDUE_MAX_PROBES = 64
+
 
 def _validate_verdict_role(role: str) -> None:
     """Guard ``verdicts/<role>.json`` against escaping the ``verdicts/`` dir.
@@ -1270,12 +1277,161 @@ class TaskArtifacts:
         _validate_verdict_role(role)
         self._clear_path(f'verdicts/{role}.json')
 
-    def lock_plan(self, session_id: str) -> bool:
+    def write_markup_residue(self, record: dict) -> str | None:
+        """Preserve the residue of a tool call refused for unrepairable markup.
+
+        This is the ONLY surviving copy of a payload the calling agent could not
+        re-emit: the leak is, by construction, a serialization defect that
+        mangled text the agent produced once. Preserving it is what makes
+        refusing a corrupted call NON-DESTRUCTIVE (PRD C2 L187 / INV-7) rather
+        than a silent data loss dressed up as a clean error.
+
+        IT IS THE LAST RESORT, NOT THE CHANNEL. The primary channel for both
+        orchestrator-side boundary guards is the real escalation queue, via
+        ``orchestrator.mcp.markup_sink.make_escalation_sink`` — a queued record
+        names an owner, carries the standing L2 age bound, and is actually READ.
+        This writer is what a guard falls back to when that queue cannot be
+        opened at all (an unresolvable project root, a missing ``escalation``
+        package). Its root lives inside the task's own worktree/meta root, which
+        the orchestrator destroys at teardown with ``git worktree remove
+        --force`` and which a pooled lane clears on acquisition — so a payload
+        parked here survives only until the lane is reaped and nothing
+        proactively surfaces it. Strictly better than losing the payload the
+        instant the queue is down; strictly worse than a queued escalation.
+        Callers must wire it as ``last_resort=``, never as the sink itself.
+        ``.task/`` is gitignored, so a residue file can never contaminate a
+        task's diff or its verify.
+
+        Returns the bare FILENAME (e.g. ``markup_residue-3.json``), not an
+        absolute path: the id stays stable across the worktree/``.task-meta``
+        split and is short enough to sit legibly in a refusal payload, which
+        quotes it so a bounced agent can point an operator at its own data.
+        Returns ``None`` when the root has vanished and nothing was written —
+        never a name for a file that does not exist, because the middleware's
+        hint is conditional on exactly this value, and a caller pointed at a
+        missing file is told its data is safe when it is gone.
+
+        The next index is derived by SCANNING the directory rather than from
+        in-process state: a fresh subprocess's counter would restart at 1 and
+        clobber the previous invocation's evidence. The scan only picks where to
+        START, though — the name itself is CLAIMED with ``O_CREAT | O_EXCL``,
+        the same primitive ``lock_plan`` uses below and for the same reason.
+        Scanning then writing would leave a window a re-check cannot close: a
+        reviewer panel runs several verdict-tools subprocesses against ONE
+        artifacts root (only ``verdicts/<role>.json`` is per-role), a
+        serialization leak is bursty and correlated across panel members, and
+        two writers that both scan before either writes would both choose the
+        same index — the second write silently destroying the first payload.
+
+        There is deliberately no ``read_markup_residue``/``clear_markup_residue``
+        pair. The ``write_*``/``read_*``/``clear_*`` triads in this class exist
+        for records the orchestrator CONSUMES to make a routing decision;
+        residue is durable evidence for an operator, and inventing a consumer
+        API with no consumer would imply a sweep that does not exist. Wiring
+        proactive surfacing is follow-up work, filed against this task.
+        """
+        # The same root-gone guard write_review/write_verdict carry, and for the
+        # same reason. MEASURED: _write_json's FileNotFoundError tolerance does
+        # NOT cover this on its own, because its mkdir(parents=True) RE-CREATES
+        # a root that was deleted out-of-band — resurrecting a worktree
+        # directory as a side effect of a best-effort write. Both siblings guard
+        # explicitly ahead of the call for exactly that reason; this is that one
+        # policy, not a second one.
+        if not self.root.is_dir():
+            logger.info(
+                'TaskArtifacts: skipping write_markup_residue for %s.%s — '
+                'root %s no longer exists; %d chars of residue are NOT preserved',
+                record.get('tool'), record.get('field'), self.root,
+                len(record.get('raw_value') or ''),
+            )
+            return None
+
+        existing = sorted(self.root.glob('markup_residue-*.json'))
+        highest = 0
+        for path in existing:
+            suffix = path.stem.removeprefix('markup_residue-')
+            if suffix.isdigit():
+                highest = max(highest, int(suffix))
+
+        name = None
+        # Bounded, and the bound is stated rather than assumed: this many
+        # writers would have to hold consecutive names at once to exhaust it,
+        # and a real reviewer panel is a handful. Exhaustion is LOUD below
+        # rather than silently rolling over to a second naming scheme.
+        for index in range(highest + 1, highest + 1 + _MARKUP_RESIDUE_MAX_PROBES):
+            candidate = self.root / f'markup_residue-{index}.json'
+            try:
+                # The claim IS the atomicity: O_EXCL fails rather than truncates
+                # if the name was taken between the scan and here, so a loser
+                # moves to the next index instead of overwriting a winner. It
+                # also skips a non-numeric or out-of-band file for free — such a
+                # name must never cost an operator the record.
+                os.close(os.open(candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644))
+            except FileExistsError:
+                continue
+            except OSError:
+                # A vanished root between the guard above and here, or any other
+                # storage failure. _call_sink's never-raises contract makes this
+                # a heads-up, not a crash on the caller's refusal path.
+                logger.info(
+                    'TaskArtifacts: could not claim a residue name under %s for '
+                    '%s.%s; %d chars of residue are NOT preserved',
+                    self.root, record.get('tool'), record.get('field'),
+                    len(record.get('raw_value') or ''),
+                )
+                return None
+            name = candidate.name
+            break
+
+        if name is None:
+            logger.error(
+                'TaskArtifacts: %d consecutive residue names from %d are taken '
+                'under %s; %d chars of residue are NOT preserved for %s.%s',
+                _MARKUP_RESIDUE_MAX_PROBES, highest + 1, self.root,
+                len(record.get('raw_value') or ''),
+                record.get('tool'), record.get('field'),
+            )
+            return None
+
+        # Via _write_json, NOT a hand-rolled write_text: it already carries the
+        # mkdir, the indent+newline convention and the vanished-root tolerance
+        # every other writer in this class relies on. One write policy. It
+        # overwrites the empty claim, which is what the claim is for.
+        self._write_json(self.root / name, record)
+        # A claim with nothing in it is worse than no claim: it holds an index
+        # AND reads as a preserved record that is in fact empty. Only a file
+        # with content earns the name this returns.
+        try:
+            if (self.root / name).stat().st_size == 0:
+                (self.root / name).unlink()
+                return None
+        except OSError:
+            return None
+        return name
+
+    def lock_plan(self, session_id: str, *, run_id: str | None = None) -> bool:
         """Atomically acquire the plan lock.
 
         Uses O_CREAT|O_EXCL for atomic exclusive creation (POSIX).
         Returns True if the lock was acquired, False if already locked.
         Raises ValueError if os.getpid() returns a non-int (unexpected env).
+
+        *run_id* is the PROCESS-level run id (``Harness._run_id``, threaded
+        through as ``TaskWorkflow._process_run_id``).  Recording it lets
+        ``TaskGroundTruth._resolve_live_claimant`` compose a full
+        ``shared.task_claimant.compose_claimant_run_id`` identity from the
+        lock — byte-identical to the DB claimant stamp that this same
+        incarnation writes, since ``owner_pid`` below is this same process's
+        pid and the caller passes this same ``session_id`` (task 3563).
+
+        The ``run_id`` key is written ONLY when it is known and non-blank, so
+        its ABSENCE unambiguously means "unknown" — the state of every legacy
+        lock already on disk and of harness-less (test/eval) workflows, whose
+        ``_process_run_id`` is None.  TaskGroundTruth reads that as an unknown
+        claimant identity (``Claimant.run_id is None``) rather than composing
+        a partial one: a well-shaped-but-wrong identity would string-mismatch
+        the DB-composed filing identity and be read downstream as "a DIFFERENT
+        incarnation is live", which is the unsafe direction.
         """
         lock_path = self.root / 'plan.lock'
         try:
@@ -1288,11 +1444,15 @@ class TaskArtifacts:
                 raise ValueError(
                     f'plan.lock owner_pid must be a non-null int, got {owner_pid!r}'
                 )
-            data = json.dumps({
+            payload = {
                 'session_id': session_id,
                 'locked_at': datetime.now(UTC).isoformat(),
                 'owner_pid': owner_pid,
-            })
+            }
+            # Omit entirely when unknown — never write '' (see docstring).
+            if isinstance(run_id, str) and run_id.strip():
+                payload['run_id'] = run_id
+            data = json.dumps(payload)
             os.write(fd, data.encode())
         except Exception:
             # Clean up the empty file created by O_CREAT|O_EXCL so a subsequent

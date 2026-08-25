@@ -380,4 +380,60 @@ born-at-L2 escalation carrying its recipe — no worktree, no code):
 3. **Thin-brief exclusions.** The curation criterion is "brief fails to state
    an implementable goal", judged during β1 with every decision recorded in
    the committed table — auditable rather than threshold-pinned.
-4. **Driver filename/placement under `scripts/`.** Decide during β2.
+4. ~~**Driver filename/placement under `scripts/`.** Decide during β2.~~
+   **RESOLVED in β2 (task 3632).** The driver landed at
+   `scripts/run_fable_trial_v2_campaign.py`, with its tests at
+   `scripts/tests/test_run_fable_trial_v2_campaign.py` (merged as
+   `a98e91997a`, "Merge task/3632 into main"). All logic lives in that
+   one script: no new module was added inside
+   `orchestrator/src/orchestrator/evals/` — the β2 merge touched exactly
+   two files, both under `scripts/`. The instrument (`run_ofat_stage`,
+   `build_plan_quality_report`, `produced_a_plan`, `get_config_by_name`)
+   is consumed unmodified.
+
+   Why that constraint bound: decision **D1** above ("Instrument
+   single-ownership honored") states this PRD's own tasks "edit nothing
+   in the instrument", and task 3632 declared `Modules touched: scripts/`
+   accordingly. A module under `orchestrator/evals/` would have crossed
+   the eval-framework-revival lane's single-ownership boundary. The
+   `run_<campaign>.py` filename spelling follows the committed
+   eval-driver siblings `run_judge_ofat_pilot.py` and `run_vllm_eval.py`
+   (cross-referencing **D10** by label, which already names the driver as
+   committed under `scripts/`; this entry supplies the filename D10 left
+   generic).
+
+   The nearest committed sibling, `scripts/run_judge_ofat_pilot.py`, is
+   a thin CLI over `orchestrator.evals.judge_pilot`: its own docstring
+   states "all decision/render logic lives there; this file only parses
+   args, drives I/O, and maps the verdict to a process exit code". β2
+   copies that sibling's NAME convention but deliberately not its
+   structure — the v2 campaign driver keeps decision and render logic in
+   the script itself.
+
+   The reason is not stylistic preference. Splitting logic out the
+   judge-pilot way requires a new module inside the instrument package
+   `orchestrator/src/orchestrator/evals/`, which D1 forbids from this
+   PRD's lane. The judge pilot could take that shape because
+   `judge_pilot.py` was authored in the eval-framework-revival lane that
+   owns the instrument; β2 was not. Stated honestly rather than sold as a
+   virtue: the driver is correspondingly larger, and is unit-tested as a
+   script rather than as a library module. If instrument ownership ever
+   permits it, extracting the logic half into `orchestrator/evals/` would
+   restore the sibling shape — a future eval-revival-lane change, not a
+   defect in β2.
+
+   Tests live in `scripts/tests/`, not `orchestrator/tests/`, because that
+   is the only placement that actually gates the driver.
+   `scripts/orchestrator.yaml` declares
+   `test_command: "uv run --project shared pytest tests/scripts/ scripts/tests/ --tb=short -q --timeout=300"`,
+   and `verify_plan._derive_module_runs` arm 3 — the task-3294
+   production-file floor, gated on `role == 'task'` — runs the owning
+   module's `test_command` VERBATIM at `ScopeKind.FULL_SUITE` for any
+   `scripts/` production diff at task role. So a task-role edit to the
+   driver runs that command, and only that command. `orchestrator/tests/`
+   is not named in it: counterpart tests placed there would collect only
+   under an `orchestrator/` diff, so a driver-only edit would clear the TEST
+   leg green with them never having run. That is the same silent coverage
+   gap `scripts/orchestrator.yaml`'s own "COVERAGE GAP CLOSED" block
+   records — opened by task 3445, closed by task 3460 — and placing β2's
+   tests under `orchestrator/tests/` would have reopened it for this file.

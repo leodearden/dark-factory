@@ -52,16 +52,14 @@ reproducing the very bug under test. This module needs no such literal today
 from __future__ import annotations
 
 import hashlib
-import importlib.util
-import inspect
 import json
 import re
-import sys
-import types
-from datetime import datetime
+import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from _fm_helpers import load_script_module
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'sweep_toolcall_xml_leak.py'
 
@@ -72,47 +70,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 ARTIFACT_GLOB = 'toolcall-xml-leak-sweep-*'
 
 
-def _load_module() -> types.ModuleType:
-    """Load sweep_toolcall_xml_leak.py from its file path.
-
-    Reuse of test_sweep_toolcall_xml_leak.py's loader: scripts/ is not a
-    package and the script is not on PYTHONPATH, so importlib is how the
-    production detector is reached without sys.path pollution.
-
-    One deliberate difference from that copy: an already-loaded module for the
-    SAME file is reused rather than re-executed. Both test modules register the
-    key ``sweep_toolcall_xml_leak`` in ``sys.modules``, so an unconditional
-    load makes the second import execute the 965-line script a second time and
-    silently REPLACE the first module object -- two live module objects whose
-    identity depends on collection order. Harmless while only pure functions
-    are used, but a latent hazard the moment anything holds module state.
-
-    The remaining half of the reviewer's ask -- hoisting this loader into
-    ``fused-memory/tests/conftest.py`` so the loading contract has ONE
-    definition -- is not applied here: conftest.py is outside this task's
-    locked module set.
-    """
-    mod_name = 'sweep_toolcall_xml_leak'
-    cached = sys.modules.get(mod_name)
-    cached_file = getattr(cached, '__file__', None)
-    if cached is not None and cached_file is not None and (
-        Path(cached_file).resolve() == SCRIPT_PATH.resolve()
-    ):
-        return cached
-    spec = importlib.util.spec_from_file_location(mod_name, SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module
-    try:
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
-
-
-_mod = _load_module()
+_mod = load_script_module(SCRIPT_PATH, mod_name='sweep_toolcall_xml_leak')
 
 classify_record = _mod.classify_record
 CLASSIFICATIONS = _mod.CLASSIFICATIONS
@@ -167,27 +125,22 @@ def _provenance_path(report_path: Path) -> Path:
 _SHA_RE = re.compile(r'\A[0-9a-f]{40}\Z')
 
 # The four per-record outcomes the runbook (docs/mcp-toolcall-xml-leak.md §5
-# remediation table) says a HUMAN must adjudicate. Lifted verbatim as a
-# vocabulary rather than re-derived, so this module's notion of "a mutation
-# somebody has to deal with" is the runbook's, not a fresh invention.
+# remediation table) says a HUMAN must adjudicate. Bound directly to the
+# script's own HUMAN_ADJUDICATION_FLAGS export (task 3738) rather than
+# hand-copied, so this module's notion of "a mutation somebody has to deal
+# with" cannot drift from the production predicate's -- add a fifth danger
+# outcome to the sweep and this tuple grows with it automatically, instead of
+# _unrepaired_danger_records() silently returning [] for a record carrying an
+# outcome nobody told this module about.
 #
-# There is no shared constant to import: the script spells the same four
-# inline in resolve_exit_code(). That makes this tuple a HAND COPY, and a hand
-# copy of a growth-prone list is a silent-drift hazard -- add a fifth danger
-# outcome to the sweep and _unrepaired_danger_records() would return [] for a
-# record carrying it, every test below would hit its "if not outstanding"
-# early exit, and the whole class would go GREEN while a real unrepaired live
-# mutation landed untracked. TestDangerFlagsMatchTheProductionScript pins this
-# tuple against resolve_exit_code's own source so that drift is RED, not
-# silent. (Exporting the constant FROM the script, as the reviewer suggested,
-# is the cleaner fix but edits scripts/sweep_toolcall_xml_leak.py, which is
-# outside this task's locked module set.)
-DANGER_FLAGS = (
-    'record_error',
-    'content_lost_in_flight',
-    'skipped_not_mem0_routed',
-    'skipped_metadata_would_be_rejected',
-)
+# KEEP THIS A BINDING. Re-typing the names here as a literal restores the hand
+# copy this deleted, and one that has quietly dropped a flag still passes every
+# test below: a dropped flag also shrinks the parametrize set of
+# TestDangerFlagsBindTheProductionVocabulary, while _unrepaired_danger_records()
+# goes blind to that outcome and TestUnrepairedMutationsAreTracked takes its
+# `if not outstanding` early exit. Nothing tests this line -- an assertion about
+# it could only ever restate it -- so it is a convention, stated here.
+DANGER_FLAGS = _mod.HUMAN_ADJUDICATION_FLAGS
 
 # The two shapes repair_content() knows how to fix. Only these carry a
 # repaired_content, so only for these can the recovery payload be checked for
@@ -275,6 +228,98 @@ def _payload_record(memory_id: str, payload_path: Path, field: str) -> dict:
     return matches[0]
 
 
+#: Keys that may only appear on an entry once ``recovered`` is true. Each one
+#: is a claim ABOUT a completed recovery, so its presence while nothing has
+#: been re-added is a partially-filled entry claiming provenance it has not
+#: earned.
+_RECOVERY_CLAIM_KEYS = ('new_id', 'recovered_via', 'recovered_at')
+
+
+def _recovery_claim_problems(memory_id: str, entry: dict) -> list[str]:
+    """Every way *entry*'s ``recovered`` claim fails to be CHECKABLE. Pure.
+
+    ``recovered: true`` is the one field in this tracker that can silently
+    convert a real, outstanding data loss into a closed one. A bare
+    "non-empty string" check on ``new_id`` is satisfied by ``"yes"``, so the
+    claim has to carry something a later reader can independently verify
+    against the store: a well-formed UUID, distinct from the id it replaced,
+    plus the mechanism and the timestamp that produced it.
+
+    Returns a list of problems (empty means the claim is checkable) rather
+    than asserting, so the contract itself can be exercised directly over
+    synthetic entries — see ``TestRecoveryClaimContract``. Without that, the
+    whole contract would sit behind ``if recovered:`` and never run while the
+    committed tracker still says false, i.e. it would report "passed" without
+    ever having been evaluated.
+    """
+    problems: list[str] = []
+    recovered = entry.get('recovered')
+    if not isinstance(recovered, bool):
+        return [f'{memory_id}: recovered={recovered!r} must be a bool']
+
+    if not recovered:
+        for key in _RECOVERY_CLAIM_KEYS:
+            if key in entry:
+                problems.append(
+                    f'{memory_id}: recovered=false but {key!r} is present. '
+                    'Nothing has been re-added, so the entry must not carry '
+                    'provenance for a recovery that never happened.'
+                )
+        return problems
+
+    new_id = entry.get('new_id')
+    if not isinstance(new_id, str) or not new_id.strip():
+        problems.append(
+            f'{memory_id}: recovered=true but new_id={new_id!r}. A re-added '
+            'memory necessarily gets a NEW id; without it the recovery claim '
+            'cannot be checked against the store.'
+        )
+    else:
+        try:
+            uuid.UUID(new_id)
+        except (ValueError, AttributeError, TypeError):
+            problems.append(
+                f'{memory_id}: new_id={new_id!r} is not a well-formed UUID. '
+                'Mem0 ids are Qdrant point UUIDs, so a value that cannot be '
+                'parsed as one was typed by a human, not returned by a store.'
+            )
+        if new_id == memory_id:
+            problems.append(
+                f'{memory_id}: new_id equals the original id. A re-add mints a '
+                'NEW id, so equality means nothing was actually re-added.'
+            )
+
+    via = entry.get('recovered_via')
+    if not isinstance(via, str) or not via.strip():
+        problems.append(
+            f'{memory_id}: recovered=true but recovered_via={via!r}. Name the '
+            'mechanism that performed the re-add, so a future reader can tell '
+            'a real recovery from an optimistic edit.'
+        )
+
+    at = entry.get('recovered_at')
+    if not isinstance(at, str) or not at.strip():
+        problems.append(
+            f'{memory_id}: recovered=true but recovered_at={at!r}. A recovery '
+            'without a timestamp cannot be placed against the loss it undoes.'
+        )
+    else:
+        try:
+            parsed = datetime.fromisoformat(at)
+        except ValueError:
+            problems.append(
+                f'{memory_id}: recovered_at={at!r} is not ISO-8601 parseable.'
+            )
+        else:
+            if parsed.tzinfo is None or parsed.utcoffset() != UTC.utcoffset(None):
+                problems.append(
+                    f'{memory_id}: recovered_at={at!r} is not UTC. Every other '
+                    'timestamp in these artifacts is UTC; a naive or '
+                    'locally-offset one cannot be ordered against them.'
+                )
+    return problems
+
+
 def _unrepaired_danger_records(report: dict) -> list[dict]:
     """Records where the sweep ATTEMPTED a mutation and did not repair.
 
@@ -292,90 +337,43 @@ def _unrepaired_danger_records(report: dict) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Vocabulary drift — the hand copy vs the production script
+# Vocabulary — DANGER_FLAGS binds the production script's export
 # ---------------------------------------------------------------------------
 
 
-def _production_danger_flags() -> tuple[set[str], str]:
-    """The danger-flag set the SCRIPT actually acts on, plus where it came from.
+class TestDangerFlagsBindTheProductionVocabulary:
+    """Every name DANGER_FLAGS carries is one the script escalates to a human.
 
-    PREFERS a real exported constant. The moment the script grows one (the
-    clean fix — see the note on the getsource exception below), this binds to
-    it and the source-reading branch goes dormant with no test-side edit.
+    ``DANGER_FLAGS`` IS ``_mod.HUMAN_ADJUDICATION_FLAGS`` (task 3738), so there
+    is no hand copy left to compare it against and nothing here reads the
+    script's source. The earlier ``inspect.getsource`` + regex-over-source
+    helper was deleted once the export existed, because from that moment its
+    export-preferring branch always returned and the comparison it fed was
+    ``set(X) == set(X)`` — an unfalsifiable test guarding an unreachable
+    fallback, in the exact brittle style this suite documents having removed
+    (da8e5a4c96).
 
-    Falls back to reading the flag names out of ``resolve_exit_code``'s source,
-    because that function IS the production consumer of these flags and is
-    today the only place they are enumerated.
-
-    NORM EXCEPTION, stated rather than smuggled: fused-memory's tests
-    deliberately avoid ``inspect.getsource`` tripwires — four sites document
-    having REMOVED them as brittle (test_tool_errors.py, test_stages.py,
-    test_mem0_tombstone.py, test_bulk_reset_guard.py, citing da8e5a4c96) — and
-    the standing preference is a runtime-behaviour test instead. That norm
-    targets guards that pin WORDING or assert "pattern X must not reappear",
-    which go stale on any behaviour-preserving rewrite. This is a different
-    thing: it binds a VOCABULARY that has no exported constant to bind to, and
-    the behavioural half is here too (``test_each_flag_forces_a_non_zero_exit``
-    drives the real predicate). The exception is also self-limiting — it
-    disappears when the constant is exported, which is filed as follow-up.
-    """
-    for name in ('HUMAN_ADJUDICATION_FLAGS', 'DANGER_FLAGS'):
-        exported = getattr(_mod, name, None)
-        if exported is not None:
-            return set(exported), f'{name} exported by the script'
-    source = inspect.getsource(_mod.resolve_exit_code)
-    # Only record.get(...) — report.get('counts'/'truncated'/'records') are the
-    # run-level conditions, not per-record human-adjudication outcomes.
-    names = re.findall(r"record\.get\(\s*'([A-Za-z_][A-Za-z0-9_]*)'", source)
-    if not names:
-        # The one brittleness the norm warns about, made ACTIONABLE instead of
-        # cryptic: a behaviour-preserving refactor (iterating some constant
-        # this helper does not know the name of) empties the parse, and a bare
-        # set-difference would then read as "the script dropped all four
-        # flags". Say what actually happened and what to do about it.
-        pytest.fail(
-            'resolve_exit_code() no longer spells the danger flags inline, so '
-            'this module can no longer derive them from it. If they now live '
-            'in a module-level constant, name it HUMAN_ADJUDICATION_FLAGS (or '
-            'add its name to _production_danger_flags) so DANGER_FLAGS binds '
-            'to the real thing instead of drifting from it silently.'
-        )
-    return set(names), 'resolve_exit_code() source'
-
-
-class TestDangerFlagsMatchTheProductionScript:
-    """DANGER_FLAGS is a hand copy. This is what keeps it honest.
-
-    The script spells the same four names inline in ``resolve_exit_code`` and
-    exports no shared constant, so nothing structurally prevents the two lists
-    from diverging. Divergence here fails in the WORST direction: a fifth
-    danger outcome added upstream would make ``_unrepaired_danger_records()``
-    return ``[]`` for a record carrying it, every test in
-    ``TestUnrepairedMutationsAreTracked`` would take its ``if not outstanding``
-    early exit, and the suite would report all-green while a real unrepaired
-    live-corpus mutation landed with no tracking entry required — this module's
-    own failure class, reintroduced one level up.
+    What remains is behavioural: each name is driven through the production
+    exit-code predicate, so no name can sit in this module's vocabulary that
+    the sweep does not actually treat as needing a human. The binding itself
+    carries no test — an assertion about a binding three hundred lines up in
+    this same file could only restate it, and no production edit could falsify
+    it — it is stated as a convention beside the binding instead. Losing the
+    export outright is not silent either: it raises at import, before
+    collection.
     """
 
-    def test_hand_copy_equals_what_the_script_acts_on(self) -> None:
-        production, origin = _production_danger_flags()
-        # Widened to set[str]: the tuple's inferred literal type makes the
-        # difference operator ill-typed against a set[str] read at runtime.
-        hand_copy: set[str] = set(DANGER_FLAGS)
-        assert hand_copy == production, (
-            f'DANGER_FLAGS {sorted(DANGER_FLAGS)} != the flags the script acts '
-            f'on {sorted(production)} (read from {origin}).'
-            '\n  missing here: '
-            f'{sorted(production - hand_copy)}'
-            '\n  stale here:   '
-            f'{sorted(hand_copy - production)}'
-            '\nRe-bind DANGER_FLAGS. Do NOT delete this assertion: while the '
-            'two lists disagree, an unrepaired mutation carrying a flag this '
-            'module does not know about is tracked by nobody and the whole '
-            'TestUnrepairedMutationsAreTracked class silently no-ops.'
-        )
+    def test_no_duplicate_flag_names(self) -> None:
+        """A repeat in the production tuple is a lost flag, not a cosmetic slip.
 
-    def test_no_duplicates_in_the_hand_copy(self) -> None:
+        Kept despite being a lint over a four-element literal because it is the
+        one shape of growth mistake nothing else here catches: the natural way
+        to add a fifth outcome is to copy a line of the tuple and edit the
+        string, and forgetting that edit leaves a duplicate WHERE THE NEW NAME
+        SHOULD BE. resolve_exit_code() then never escalates the new outcome,
+        and every other test in this module is parametrized over the same
+        (still self-consistent) tuple, so all of them stay green.
+        """
         assert len(set(DANGER_FLAGS)) == len(DANGER_FLAGS), (
             f'DANGER_FLAGS {DANGER_FLAGS} repeats a name'
         )
@@ -846,6 +844,98 @@ class TestTheTrackingGateIsNotVacuous:
 
 
 # ---------------------------------------------------------------------------
+# The recovery claim itself: proof the contract can FIRE
+# ---------------------------------------------------------------------------
+
+
+class TestRecoveryClaimContract:
+    """Direct, hermetic cover for ``_recovery_claim_problems``.
+
+    ``recovered: true`` is the single field in this tracker that can convert a
+    real, outstanding data loss into an apparently-closed one. While the
+    committed tracker says false, every ``recovered=true`` assertion sits down
+    an untaken branch — so the contract that is supposed to keep the claim
+    honest would report "passed" without ever having been evaluated, and would
+    only be discovered to be wrong at the exact moment someone flipped the
+    flag. That is the wrong time to find out.
+
+    So the contract is exercised here over synthetic entries, independent of
+    what is committed: it must ACCEPT a genuine recovery and REJECT each way of
+    faking one.
+    """
+
+    ORIGINAL = '7d073281-4c5d-4ba3-a01c-3a167f4460f4'
+    REPLACEMENT = '0f2a9c31-6b4e-4d0a-9c77-1e5b8a2d4f60'
+
+    def _valid(self, **overrides) -> dict:
+        entry = {
+            'recovered': True,
+            'new_id': self.REPLACEMENT,
+            'recovered_via': 'mcp__fused-memory__add_memory',
+            'recovered_at': '2026-08-06T12:00:00+00:00',
+        }
+        entry.update(overrides)
+        return entry
+
+    def test_a_genuine_recovery_claim_is_accepted(self) -> None:
+        """The contract must not be unsatisfiable — otherwise a real recovery
+        could never be recorded and the pressure would be to delete the test."""
+        assert _recovery_claim_problems(self.ORIGINAL, self._valid()) == []
+
+    def test_an_unrecovered_entry_is_accepted(self) -> None:
+        assert _recovery_claim_problems(self.ORIGINAL, {'recovered': False}) == []
+
+    @pytest.mark.parametrize('bogus', ['yes', 'recovered', '', '   ', 'new-id-1'])
+    def test_a_new_id_that_is_not_a_uuid_is_rejected(self, bogus: str) -> None:
+        """The precise hole this tightening closes: the previous contract asked
+        only for a non-empty string, which ``"yes"`` satisfies."""
+        problems = _recovery_claim_problems(self.ORIGINAL, self._valid(new_id=bogus))
+        assert problems, f'new_id={bogus!r} must not pass as a recovery claim'
+
+    def test_reusing_the_original_id_is_rejected(self) -> None:
+        """A re-add mints a NEW id, so equality proves nothing was re-added."""
+        problems = _recovery_claim_problems(
+            self.ORIGINAL, self._valid(new_id=self.ORIGINAL)
+        )
+        assert any('equals the original id' in p for p in problems)
+
+    @pytest.mark.parametrize('key', ['new_id', 'recovered_via', 'recovered_at'])
+    def test_a_missing_provenance_key_is_rejected(self, key: str) -> None:
+        entry = self._valid()
+        del entry[key]
+        assert _recovery_claim_problems(self.ORIGINAL, entry), (
+            f'recovered=true without {key!r} must be rejected'
+        )
+
+    @pytest.mark.parametrize('bad_at', ['yesterday', '2026-08-06', ''])
+    def test_an_unparseable_or_naive_timestamp_is_rejected(self, bad_at: str) -> None:
+        assert _recovery_claim_problems(self.ORIGINAL, self._valid(recovered_at=bad_at))
+
+    def test_a_non_utc_timestamp_is_rejected(self) -> None:
+        """Every other timestamp in these artifacts is UTC; a locally-offset one
+        cannot be ordered against the loss it undoes."""
+        problems = _recovery_claim_problems(
+            self.ORIGINAL, self._valid(recovered_at='2026-08-06T12:00:00+05:30')
+        )
+        assert any('not UTC' in p for p in problems)
+
+    @pytest.mark.parametrize('key', _RECOVERY_CLAIM_KEYS)
+    def test_provenance_on_an_unrecovered_entry_is_rejected(self, key: str) -> None:
+        """A partially-filled entry must not claim provenance for a recovery
+        that never happened — the half-edited-tracker failure mode."""
+        entry = {'recovered': False, key: self._valid()[key]}
+        assert _recovery_claim_problems(self.ORIGINAL, entry), (
+            f'recovered=false alongside {key!r} must be rejected'
+        )
+
+    @pytest.mark.parametrize('bad', ['true', 1, None, 'false'])
+    def test_a_non_boolean_recovered_flag_is_rejected(self, bad) -> None:
+        """``recovered: "false"`` is truthy in Python — a string here would
+        silently read as recovered by any naive consumer."""
+        assert _recovery_claim_problems(self.ORIGINAL, {'recovered': bad})
+
+
+# ---------------------------------------------------------------------------
 # Unrepaired live-corpus mutations: named owner + still-recoverable payload
 # ---------------------------------------------------------------------------
 
@@ -1032,10 +1122,17 @@ class TestUnrepairedMutationsAreTracked:
     def test_recovered_flag_and_new_id_agree(self, path: Path) -> None:
         """``recovered`` must never overstate what happened.
 
-        While it is False the entry carries no ``new_id`` (nothing was
-        re-added, so there is no id to carry). If a future session flips it to
-        True it MUST carry the id of the memory it re-added — otherwise
-        "recovered" is an unfalsifiable claim.
+        While it is False the entry carries no ``new_id``, no
+        ``recovered_via`` and no ``recovered_at`` (nothing was re-added, so
+        there is nothing to carry and no provenance to claim). If a future
+        session flips it to True it MUST carry a well-formed UUID distinct
+        from the id it replaced, plus the mechanism and the UTC timestamp of
+        the re-add — otherwise "recovered" is an unfalsifiable claim, and a
+        real outstanding data loss silently reads as closed.
+
+        The contract lives in the pure ``_recovery_claim_problems`` so it can
+        be exercised directly (``TestRecoveryClaimContract``) instead of only
+        ever running down the branch the committed tracker happens to take.
         """
         report = _load(path)
         outstanding = _unrepaired_danger_records(report)
@@ -1043,23 +1140,8 @@ class TestUnrepairedMutationsAreTracked:
             return
         tracking = _load(_recovery_tracking_path(path.parent))
         for record in outstanding:
-            entry = tracking[record['id']]
-            recovered = entry.get('recovered')
-            assert isinstance(recovered, bool), (
-                f'{record["id"]}: recovered={recovered!r} must be a bool'
-            )
-            if recovered:
-                new_id = entry.get('new_id')
-                assert isinstance(new_id, str) and new_id.strip(), (
-                    f'{record["id"]}: recovered=true but new_id={new_id!r}. '
-                    'A re-added memory necessarily gets a NEW id; without it '
-                    'the recovery claim cannot be checked against the store.'
-                )
-            else:
-                assert 'new_id' not in entry, (
-                    f'{record["id"]}: recovered=false but a new_id is present. '
-                    'Nothing has been re-added; the two disagree.'
-                )
+            problems = _recovery_claim_problems(record['id'], tracking[record['id']])
+            assert not problems, '\n'.join(problems)
 
     def test_recovery_payload_is_still_present_and_leak_free(
         self, path: Path

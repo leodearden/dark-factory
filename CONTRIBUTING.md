@@ -101,7 +101,7 @@ Other top-level dirs:
   `<prd-stem>.capability-manifest.yaml` sidecar — schema in
   `shared/src/shared/capability_manifest.py`). This is the durable record;
   `plans/` is not.
-- **`docs/legibility/`** — `design-invariants.md` (INV-1..INV-5, gates
+- **`docs/legibility/`** — `design-invariants.md` (gates
   `/prd` decompose and `/review` phase 2 — see §6) plus its calibration
   fixtures and the confusion-codebook incident taxonomy.
 - **`dashboard/`** — web UI for task/escalation state.
@@ -109,6 +109,68 @@ Other top-level dirs:
   watchdog, host setup).
 - **`hooks/`** — git hooks (`pre-commit`, `pre-merge-commit`, see §4-§5),
   install via `hooks/setup.sh`.
+
+<!-- line-pin-policy:begin
+     The repo's decision on bare `file.py:NNN` citations (esc-3815-7).
+     Mirrored in CLAUDE.md and pinned by
+     tests/scripts/test_line_pin_policy.py — that guard asserts these
+     markers still delimit non-empty prose and that nothing enforces the
+     convention mechanically. It deliberately asserts nothing about the
+     WORDING below, so this paragraph can be rewritten freely. -->
+
+**Cite code by symbol, not by line number.** The blessed form for a
+cross-file reference in a source comment or docstring is
+`path/to/module.py::symbol`. It is greppable and it survives edits above
+the site; a bare `module.py:1234` does neither.
+
+**The existing bare pins are tolerated drift, not debt.** Measured for
+esc-3815-7 (2026-08-24): **428 bare `file.py:NNN` pins** across the four
+`src` trees, 1842 repo-wide in `.py`. A 49-pin hand-adjudicated sample put
+**~80% of them wrong** (Wilson 95% CI 66–89%) with a median time-to-rot of
+about **six days**, and two of eight blame-traced pins were wrong at the
+commit that authored them. A task proposing to sweep them — repo-wide or
+over some subset — is correctly closable as won't-fix, and so is an
+escalation re-reporting the population.
+
+A repo-wide sweep was considered and declined for four reasons.
+**No realised harm has ever been found**: a search of 9,579 agent
+transcripts, 5,629 escalation records and full `git log --all` bodies
+returns zero cases of a wrong pin misleading a reader, against a
+same-method control that returns 25 for `git stash`. Wrong pins are
+useless rather than deceptive — 0% cite past end-of-file, ~32% land on a
+blank line, import or comment, and nearly all sit beside a symbol name the
+reader greps in seconds. **The repair is mostly not mechanical**: only 78
+of the 428 can be rewritten by script, and 143 name no symbol at all —
+they describe a behaviour, so a sweep would either drop information or
+invent it. **The diff conflicts with most in-flight work**: 476 files
+carry a pin, and 58% of the branches active in a given three-day window
+touch one — the objection §3 records for `ruff format`, with a worse
+ratio. And **a one-off sweep buys about a week** before the six-day rot
+half-life catches up.
+
+**The rule, scoped deliberately to the change in front of you:** cite by
+symbol in prose *this change introduces or edits*. Don't de-number a file
+you are merely passing through. An unscoped sweep is the expensive gate
+that gets routed around rather than applied — the same reasoning
+`skills/prd/references/author-mode.md` gives for session-scoping the
+identical rule over PRD prose, which
+`skills/prd/references/decompose-mode.md` states for `delivered_check`s.
+This paragraph extends both to source comments and docstrings.
+
+**Nothing enforces this mechanically, by choice.** A write-time guard was
+designed and costed (diff-scoped, zero violations on today's corpus) and
+declined: with zero measured harm it does not earn its ~700 lines, and the
+one prior attempt at a class-level citation guard (task 4240) burned
+$35.97 over 18 `recovery_vetoed` events without landing. Where a line
+number *is* load-bearing — a gate key, or guard prose an assertion pins —
+it gets fixed structurally instead; see task 1910's re-key of
+`shared/tests/silent_fallthrough_allowlist.py` to
+`(relpath, qualname, content_hash)`, which notes that keys "omit `lineno`
+entirely".
+
+Reversing this decision means updating this section, `CLAUDE.md` and
+`tests/scripts/test_line_pin_policy.py` together.
+<!-- line-pin-policy:end -->
 
 ---
 
@@ -146,6 +208,28 @@ Other top-level dirs:
   `fused-memory/scripts/check_bare_magicmock_config.py` over each package's
   `tests/` — so see `lint_command` in `dark-factory-orchestrator.yaml` for
   the full chain.
+- **Formatting**: this repo runs `ruff check` only. **`ruff format` is not part
+  of the toolchain** and is not enforced anywhere — not in `hooks/pre-commit`,
+  not in any `orchestrator.yaml` `lint_command`, not in verify. There is no CI.
+
+  As of task 3441, 1125 of 1357 first-party package `.py` files (83%) are not
+  `ruff format`-clean. **That is the expected steady state, not debt.** A task
+  proposing to "fix formatting" over some subset of files is correctly closable
+  as won't-fix. A repo-wide sweep was considered and declined for three
+  reasons: it reverses the deliberate `ignore = ["E501"]` that every package
+  sets, which tolerates long lines on purpose while the formatter exists to
+  rewrap them; a 1125-file diff conflicts with every in-flight branch in a repo
+  whose normal mode is many concurrent agent branches against a
+  continuously-draining merge queue; and it rewrites the blame history that
+  this repo's incident forensics and reconciliation lean on.
+
+  The `[tool.ruff.format]` block in each package's `pyproject.toml` is **style
+  config, not a gate**. It is retained so that an ad-hoc or editor-on-save
+  `ruff format` produces a single-quoted, repo-consistent diff — measured
+  ~4.5x smaller than the same run under ruff's own defaults.
+
+  Reversing this decision means updating this section, `CLAUDE.md` and
+  `tests/scripts/test_ruff_format_policy.py` together.
 - **Type-check** (pyright, run from each configured package directory so it
   picks up that package's `[tool.pyright]` block):
   ```bash
@@ -244,11 +328,10 @@ Every PRD authored or decomposed through `/prd` runs a fixed gate sequence
   boundary-test sketch) vs. a bare vertical slice.
 - **G6** premise validity — numeric bounds, exactness claims, and rejection
   assertions must be substantiated, not guessed.
-- **G7** design invariants — re-checked against
-  `docs/legibility/design-invariants.md` (**INV-1..INV-5**:
-  `contracts-machine-checked`, `structured-facts-at-failure`,
-  `corroborate-before-acting`, `storm-escape-required`,
-  `no-lockstep-duplication`). An unresolved, unwaived hit blocks the batch;
+- **G7** design invariants — every task in a batch is re-checked against the
+  named, checkable invariants in `docs/legibility/design-invariants.md` (the
+  single normative list; slugs are stable ids, so read it rather than a copy).
+  An unresolved, unwaived hit blocks the batch;
   a deliberate exception is a `G7 waiver: <slug> — <rationale>` line in the
   PRD plus `metadata.g7_waivers` on the filed task.
 - **Capability manifest** — mechanizes G3/G6 per leaf task, committed
@@ -257,10 +340,12 @@ Every PRD authored or decomposed through `/prd` runs a fixed gate sequence
   oversight, produce a complete, coherent, good design?"
 
 `design-invariants.md` also gates `/review` phase 2's cross-module audit —
-it's the single normative copy of the five invariants; don't restate them
-elsewhere. If you're hand-writing a task (not going through `/prd`) for a
-nontrivial design change, walk it against the same checklist yourself
-before filing.
+it's the single normative copy; don't restate them elsewhere (a restatement
+here went stale once already — task 3802, and
+`scripts/tests/test_design_invariants_consistency.py` now fails if a copy
+comes back; citing one invariant by name is still fine). If you're hand-writing a task (not going through
+`/prd`) for a nontrivial design change, walk it against the same checklist
+yourself before filing.
 
 ---
 
@@ -313,6 +398,13 @@ chore: <housekeeping>
   promotion process.
 - **Don't `--no-verify` the pre-commit hook** to skip ruff/pyright — if it's
   genuinely too slow, raise the timeout instead (§4).
+- **Don't file a cleanup task — or an escalation — for a stale
+  `file.py:NNN` citation** in a comment or docstring. It is tolerated drift
+  (§2): ~80% of the 428 existing pins are already wrong and none has ever
+  been shown to mislead a reader. Fix a pin in prose you are already
+  editing; leave the rest. Twenty tasks, $141.77 and 31 escalations (14 of
+  them human-facing) have gone into this class one file at a time, against
+  a population that grows about 20x faster than the lane clears it.
 - **Don't use a bare task number as a branch slug**, or reuse a
   blocked/in-flight task's id for unrelated work — either can corrupt that
   task's merge bookkeeping (non-numeric `task/<slug>` branches are the

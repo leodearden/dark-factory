@@ -6,7 +6,7 @@ import asyncio
 import contextlib
 import json
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
@@ -15,6 +15,20 @@ from fastmcp import FastMCP
 from fastmcp.server.dependencies import get_http_headers
 from pydantic import ValidationError
 from shared.branch_names import canonical_queued_branch_name
+
+# Fully qualified rather than `from shared import ...`: the module is
+# deliberately NOT re-exported from shared/__init__, so `import shared` does
+# not pull fastmcp into every consumer of the base layer.
+from shared.mcp_markup_middleware import (
+    FACT_MARKUP_DETECTED,
+    MARKUP_RESIDUE_ERROR_TYPES,
+    MARKUP_STORM_ERROR_TYPE,
+    MARKUP_UNRECOVERED_PARAM_ERROR_TYPE,
+    MARKUP_UNREPAIRABLE_ERROR_TYPE,
+    MarkupGuardMiddleware,
+    RepairPolicy,
+)
+from shared.storm_counter import StormCounter
 from shared.task_runtime_state import TaskRuntimeEntry, TaskRuntimeSnapshot
 
 from escalation import sweep as _sweep
@@ -23,13 +37,17 @@ from escalation.authority import PROMOTE_ALLOWED, ROLE_LEVEL_ALLOWLIST, l2_auto_
 from escalation.dedupe import DedupeConfig
 from escalation.dedupe import submit_or_dedupe as _dedupe_submit_or_dedupe
 from escalation.models import (
+    AGENT_FILABLE_LEVELS,
     BORN_AT_L2_SEVERITIES,
     KNOWN_SEVERITIES,
     RESOLUTION_CLASSES,
     Escalation,
     EvidenceEntry,
+    max_severity,
 )
-from escalation.queue import EscalationQueue
+from escalation.pins import classify_pins
+from escalation.queue import AmendmentOutcome, EscalationQueue
+from escalation.queue import observed_submit_response as _observed_submit_response
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +81,139 @@ def _is_harness_sentinel_role(agent_role: str) -> bool:
     through to the downgrade path instead of raising ``AttributeError``.
     """
     return any((agent_role or '').startswith(p) for p in _HARNESS_SENTINEL_ROLE_PREFIXES)
+
+
+def _derive_l2_severity(queue: EscalationQueue, member_ids: list[str]) -> str | None:
+    """Return max(member severities) for a promoted L2, or None if none is usable.
+
+    This is what an OMITTED ``promote_to_l2(severity=...)`` argument resolves
+    to (task 3976).  The old literal ``'blocking'`` default inflated every
+    cluster of purely-informational L1s into a human-paging L2 — and did so
+    non-deterministically, since the outcome hinged on whether the LLM caller
+    happened to type the argument at all.
+
+    Members are read through ``queue.get()`` rather than the queue root
+    directly, so a member already resolved and archived between the watcher's
+    drain and its promote still contributes its true severity (``get`` falls
+    back to the archive), and repeated lookups of a genuinely nonexistent id
+    are negative-cached rather than re-scanning the archive each time.
+
+    **The fold ranges over ``KNOWN_SEVERITIES`` ONLY.**  A member is USABLE
+    only if it resolves AND its ``severity`` is in the vocabulary.  Nothing
+    validates a record's severity on write — ``Escalation`` is a plain
+    dataclass and ``queue.submit``/``_rewrite`` are field-agnostic
+    passthroughs — so a legacy, corrupt, or externally-written member can carry
+    an out-of-vocabulary string (``''``, ``'warn'``).  ``max_severity`` ranks
+    an unknown at 0, but its ``>=`` tie-break would let that string WIN over a
+    genuine ``'info'`` sibling and be minted onto the L2 verbatim, reported
+    back through the response ``severity`` key and missed by cockpit's
+    ``severity_weights``.  Treating it as unusable keeps the tool's promise
+    that a filed severity is always one of ``KNOWN_SEVERITIES``.
+
+    **Returning None means "the members say nothing".**  The two call paths
+    need different fail-safes, so this function reports the fact rather than
+    picking one:
+
+    - CREATE must choose a severity, so it fails safe UP to ``'blocking'`` —
+      today's behaviour, unchanged.  Rejecting the promotion instead would
+      silently drop a promotion the caller believed it had made, and quieting
+      it to ``'info'`` would fail in the dangerous direction.  This matches
+      ``escalation.pins`` link 2: an unknown severity fails safe to pinning,
+      never to conversion.
+    - UPDATE must NOT: the existing L2 already carries a severity derived from
+      real members, so an underivable set has nothing to contribute.  Failing
+      up there would inflate a correctly-inherited ``info`` L2 to ``blocking``
+      (and bump ``updated_at``, re-triggering the watcher's re-assess) merely
+      because an id was typo'd or momentarily unreadable.
+
+    Either way the unusable ids are named at WARNING — loud, never silent.
+
+    A PARTIALLY usable set derives from the usable subset only — discarding a
+    known-info member because a sibling id was unreadable would reintroduce
+    the very inflation this exists to remove.  The fold is therefore seeded
+    from the first USABLE member rather than from ``'info'``: an empty-ish
+    seed would be indistinguishable from a real info member, and the explicit
+    nothing-usable branch is what carries the fail-safe.
+    """
+    resolved: list[str] = []
+    unusable: list[str] = []
+    for mid in member_ids:
+        member = queue.get(mid)
+        if member is None:
+            unusable.append(mid)
+        elif member.severity not in KNOWN_SEVERITIES:
+            logger.warning(
+                'promote_to_l2: member escalation %s carries out-of-vocabulary '
+                'severity %r (expected one of %s); excluding it from the derived '
+                'L2 severity rather than propagating it.',
+                mid, member.severity, sorted(KNOWN_SEVERITIES),
+            )
+            unusable.append(mid)
+        else:
+            resolved.append(member.severity)
+
+    if not resolved:
+        logger.warning(
+            'promote_to_l2: no member escalation yielded a usable severity for %s '
+            '— cannot derive an L2 severity from members. Unusable ids: %s',
+            member_ids, ', '.join(unusable) or '(none)',
+        )
+        return None
+
+    if unusable:
+        logger.warning(
+            'promote_to_l2: %d of %d member escalation(s) yielded no usable '
+            'severity; deriving from the usable subset only. Unusable ids: %s',
+            len(unusable), len(member_ids), ', '.join(unusable),
+        )
+
+    derived = resolved[0]
+    for sev in resolved[1:]:
+        derived = max_severity(derived, sev)
+    return derived
+
+
+# The role the steward's own filings carry (orchestrator.steward
+# _auto_escalate_to_human hard-codes ``agent_role='steward'``). Level-1 is the
+# steward's documented recourse, so an L1 from this role — or from a harness
+# sentinel — is the EXPECTED shape and is not logged.
+_EXPECTED_L1_FILER_ROLE = 'steward'
+
+
+def _warn_if_unexpected_l1_filer(agent_role: str, task_id: str, category: str) -> None:
+    """Log a WARNING when a non-steward, non-sentinel role files at ``level=1``.
+
+    Task 3236 amendment.  ``level=1`` is deliberately NOT role-gated, and that
+    is a considered choice rather than an oversight:
+
+    - ``agent_role`` is a free-form MCP tool argument, not an enforced
+      property.  A hard gate on ``agent_role == 'steward'`` is defeated by any
+      caller that simply passes that string, so it would buy the APPEARANCE of
+      authority enforcement without the substance.
+    - Worse, a hard REJECT is not fail-safe.  The steward briefing does not
+      mandate any particular ``agent_role`` spelling, so a steward filing under
+      a different string would have its re-escalation rejected and lost —
+      re-introducing precisely the swallowed-re-escalation failure this task
+      exists to fix.  The C4/D3 severity precedent is a DOWNGRADE (the record
+      still lands), never a rejection.
+
+    So the level axis is closed by OBSERVABILITY instead of by a gate: every
+    unexpected L1 filing is loud and attributable in the server log, honouring
+    the loud-over-silent-degradation norm.  ``_ESCALATION_INSTRUCTIONS`` in
+    ``orchestrator.agents.roles`` states the same thing to agents.
+    """
+    role = agent_role or ''
+    if role == _EXPECTED_L1_FILER_ROLE or _is_harness_sentinel_role(role):
+        return
+    logger.warning(
+        'Level-1 escalation filed by agent_role=%r (task_id=%r, category=%r), '
+        'which is neither %r nor a harness sentinel. Level 1 skips the steward, '
+        'is read by escalation-watcher-auto (which may promote to L2), and pins '
+        'the task via QUEUE_HANDOFF independently of the filer. This is allowed '
+        'but recorded: agent_role is caller-supplied, so it is observed, not '
+        'enforced.',
+        role, task_id, category, _EXPECTED_L1_FILER_ROLE,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -237,18 +388,351 @@ CATEGORIES = [
     'stranded_merge_failed',
 ]
 
-# Fields returned by get_pending_escalations(compact=True) — the triage-relevant
-# subset a long-running L2 watcher needs to decide whether to pull a full record.
-# The heavy fields (detail, members, options, root_cause, train_state,
-# workflow_state, worktree, dedupe_*) are dropped to keep the watcher's context
-# small as the pending pile grows during an AFK window. The triage-ack fields
-# (triaged_at, triaged_by, triage_note, updated_at) are included so a compact
-# drain can decide stamp-then-skip without a per-record get_escalation round-trip.
+# OUTPUT keys of a compact row — the triage-relevant subset a long-running L2
+# watcher needs to decide whether to pull a full record.  NOTE these are output
+# keys, not model field names: ``member_ids`` is a PROJECTION of the model's
+# ``members`` list (renamed once, in _compact_escalation below), so this tuple is
+# no longer a pure key subset of Escalation.to_dict().
+# The heavy fields (detail, options, train_state, workflow_state, worktree,
+# dedupe_*) are still dropped to keep the watcher's context small as the pending
+# pile grows during an AFK window; `detail` in particular is the unbounded
+# free-text field that motivated compact mode.  ``root_cause`` and
+# ``member_ids`` are what let a rotating watcher rebuild `already_promoted` from
+# the drain ALONE, with no session memory (task 3997, C1).  ``amendments`` is
+# deliberately NOT projected, so preserved incoming framing never inflates a
+# drain.
+#
+# NEITHER OF THE TWO ADDED FIELDS IS BOUNDED IN PRINCIPLE, and this comment used
+# to claim they were "bounded by construction" — they are not.  ``promote_to_l2``
+# validates only that ``root_cause.strip()`` is non-empty, so an arbitrarily long
+# key rides every compact row, and ``member_ids`` grows with cluster size.  Both
+# are short in PRACTICE (a one-line dedup key; ~20-char ids), which is the actual
+# basis for including them.  Bounding them here was considered and REJECTED in
+# both available forms: truncating ``root_cause`` in the projection would
+# silently break the exact-match rebuild that is C1's entire point, and capping
+# it at mint would either fail a legitimate promote outright or collapse two
+# distinct keys into one L2 — over-folding, the very failure the amendment
+# storm report exists to surface.  The cost is real and named rather than
+# denied: every compact reader pays it, including the dashboard's
+# ``fetch_pins_recovery`` poll (dashboard/.../escalations.py), which asks for
+# ``compact=True`` on a loop and reads nothing but ``pins_recovery``.
+# The triage-ack fields (triaged_at, triaged_by, triage_note, updated_at) are
+# included so a compact drain can decide stamp-then-skip without a per-record
+# get_escalation round-trip.
 _COMPACT_ESCALATION_FIELDS = (
     'id', 'task_id', 'category', 'severity', 'level', 'status',
     'summary', 'suggested_action', 'timestamp',
     'triaged_at', 'triaged_by', 'triage_note', 'updated_at',
+    'root_cause', 'member_ids',
 )
+
+# get_pending_escalations(compact=True) additionally keeps its computed
+# pins_recovery annotation: the dashboard reads compact records, so dropping it
+# here would blank the whole PINNING surface.  Kept as a separate tuple so
+# get_task_escalations — which never computes the annotation — is untouched.
+_COMPACT_PENDING_FIELDS = (*_COMPACT_ESCALATION_FIELDS, 'pins_recovery')
+
+
+def _compact_escalation(d: dict[str, Any], fields: tuple[str, ...]) -> dict[str, Any]:
+    """Project one Escalation.to_dict() into a compact row over *fields*.
+
+    THE single site that knows compact rows expose ``member_ids`` where the model
+    says ``members`` (task 3997).  Both compact apply sites route through here so
+    the rename exists exactly once; widening _COMPACT_ESCALATION_FIELDS is then
+    enough to change both tools' wire shape.
+
+    Keys absent from *d* are OMITTED rather than defaulted.  That is not
+    defensive tidiness: ``pins_recovery`` is deliberately absent when it cannot
+    be computed, and emitting a false ``[]`` there reads as "nothing pins this
+    task" — the exact collapse (esc-3163) the omission contract exists to
+    prevent.
+    """
+    row: dict[str, Any] = {}
+    for k in fields:
+        if k == 'member_ids':
+            # Projection, not a model field: renamed from `members`.  Copied so a
+            # caller mutating the row cannot reach back into the loaded record.
+            row[k] = list(d.get('members', []))
+        elif k in d:
+            row[k] = d[k]
+    return row
+
+
+# INV-4 storm escape for L2 amendment truncation (task 3997).  Sizing: with
+# ``queue._MAX_AMENDMENTS`` = 20, ONE L2 has to fold 21+ times inside the window
+# to truncate even ONCE, so three truncations in an hour is not routine churn.
+# It says either the cap is systematically wrong for the live fold rate, or
+# root-cause matching is over-folding unrelated clusters into a single L2 — and
+# task 3998 canonicalises that matching, which RAISES the fold rate BY DESIGN.
+# Both readings are worth a human-adjacent signal rather than a WARNING nobody
+# reads; the durable per-record ``amendments_truncated`` counter remains the
+# primary structured fact (INV-8), this is the notification layered on it.
+#
+# Module constants rather than a config leaf, following the sanctioned
+# precedent of ``reconciliation/harness.py``'s ``_PLACEHOLDER_DROP_STORM_*``,
+# whose stated reason — the counter is private to this module — holds
+# identically here.  They are still passed per ``record()`` call because that
+# is ``StormCounter``'s API (see its RELOAD SAFETY note).
+_AMENDMENT_TRUNCATION_STORM_THRESHOLD = 3
+_AMENDMENT_TRUNCATION_STORM_WINDOW_SECONDS = 3600.0  # 1 h
+
+# A stable SYNTHETIC anchor (not a real task id), mirroring
+# ``markup_tripwire._ANCHOR_TASK_ID`` and its siblings.  The condition this
+# report describes — cap sizing, or root-cause matching over-folding unrelated
+# clusters — is SYSTEM-scoped, and a burst routinely spans several L2s across
+# several tasks, so filing it against whichever promote happened to cross the
+# threshold would be arbitrary attribution with two real costs:
+# ``get_task_escalations(that_task)`` would surface an infra record unrelated to
+# the task, and because this helper calls ``_submit_or_dedupe`` directly (it is
+# sync, and must never fail the promote) it bypasses the terminal-task
+# chokepoint, so the report could land PENDING on an already-terminal task.
+# The affected L2 ids stay named in the summary and detail, which is where the
+# attribution belongs.  The ids also form one greppable
+# ``esc-l2-amendment-truncation-N`` series.
+_AMENDMENT_TRUNCATION_ANCHOR_TASK_ID = 'l2-amendment-truncation'
+
+
+# --- Leaked-envelope-markup residue anchors (task 3690, PRD section 4 C2) ---
+#
+# Two SYNTHETIC anchors, same reasoning as ``_AMENDMENT_TRUNCATION_ANCHOR_TASK_ID``
+# above and as ``markup_tripwire._ANCHOR_TASK_ID``: both conditions are properties
+# of the HARNESS serialization leak, not of whichever task's call happened to
+# carry the damage.  The middleware's residue record has no ``task_id`` at all —
+# it resolves ``agent_id``/``project`` and deliberately does not guess a task —
+# so there is no caller task to file against even if one were wanted.
+#
+# They are DISTINCT anchors because the two records have opposite dedup needs.
+# A residue record is the ONLY surviving copy of one specific caller's payload,
+# so every one must land on its own; a storm record is a rate alarm about a
+# condition, so a second one while the first is still open is noise.  One shared
+# anchor would force a single answer to both.
+_MARKUP_RESIDUE_ANCHOR_TASK_ID = 'mcp-markup-residue'
+_MARKUP_STORM_ANCHOR_TASK_ID = 'mcp-markup-storm'
+
+# The burst alarm's own category. Named once because it is written on the way
+# IN (the record this sink files) and read on the way OUT (the dedup predicate
+# asking whether this guard's own alarm is already open) — and a dedup that
+# matches on a second spelling of the category it writes silently stops
+# deduping, which is the failure mode that is hardest to notice from the queue.
+_MARKUP_STORM_CATEGORY = 'mcp_markup_storm'
+
+# The sentinel role these records are filed under.  A born-at-L2 record must
+# carry a role in ``_HARNESS_SENTINEL_ROLE_PREFIXES`` — the same contract
+# ``submit.py`` enforces at its argument boundary for the file-backed CLI, and
+# the reason the agent-role downgrade gate below exists.  The residue sink
+# writes ``level=2`` directly via ``queue.submit`` and so bypasses that gate;
+# honouring the contract here is what keeps the on-disk record legal rather than
+# merely unchecked.
+_MARKUP_GUARD_AGENT_ROLE = 'harness-markup-guard'
+
+# Born-at-L2 severity for the residue record.  ``level=2`` and a severity in
+# ``BORN_AT_L2_SEVERITIES`` are one decision, not two: ``models`` states that an
+# escalation is born at L2 *when* its severity is in that set, so a level=2
+# record carrying 'info' would be internally incoherent to every reader of the
+# consumer-per-level contract.
+#
+# THE SIBLING GUARDS FILE THE SAME RECORD CLASS AT 'blocking'
+# (``orchestrator.mcp.markup_sink.file_residue``), and that is ONE rule
+# resolving two ways, not two sites disagreeing.  The rule is the sentinel-role
+# gate directly below — ``_is_harness_sentinel_role`` — which this repo applies
+# wherever a born-at-L2 severity is minted: ``_chokepoint_or_submit`` downgrades
+# critical/urgent to 'blocking' for any non-sentinel role, and ``submit.py``
+# rejects a non-sentinel ``--agent-role`` outright.  This guard runs INSIDE the
+# escalation server and files as ``harness-markup-guard``, a sentinel; the
+# orchestrator-side guards file as ``plan-tools-markup-guard`` /
+# ``verdict-tools-markup-guard``, which are not, so 'blocking' is the only
+# severity those records may legally carry.  Both sites reach the queue through
+# a direct ``queue.submit`` that bypasses the gate, so each honours the rule by
+# construction rather than by being checked — which is exactly why the answer is
+# written down at both, and why neither may be "made to match" the other by
+# changing the severity alone.
+#
+# The severity is NOT the flood control, and must not be mistaken for it: an
+# actively running leak files one undeduped level=2 record per refused call, and
+# ``escalation.watcher`` emits one notification per pending L2 (it exits after
+# the first match and re-arms), so N refusals page N times regardless of which
+# born-at-L2 severity is written.  Batching that channel is the L2 watcher's own
+# concern — see the digest rule in ``skills/escalation-watcher/SKILL.md`` and the
+# rolling-window ceiling ``scripts/dashboard-watchdog.py`` already keeps — and
+# filed as follow-up work rather than fixed here, because the alternative inside
+# this sink is to dedup residue records, which destroys the one payload each of
+# them exists to preserve.
+_MARKUP_RESIDUE_SEVERITY = 'critical'
+
+
+def _markup_residue_prose(record: dict[str, Any]) -> str:
+    """What actually happened to the call, in the reader's own terms.
+
+    DISPATCHED ON ``error_type``, never assumed, because this sink receives two
+    residue kinds whose triage is OPPOSITE and this server is the only site that
+    produces both.  ``MARKUP_UNREPAIRABLE_ERROR_TYPE`` means the call was
+    REFUSED — nothing was written, and the caller was told, so a human may
+    reasonably wait for it to resend.  ``MARKUP_UNRECOVERED_PARAM_ERROR_TYPE``
+    means the call was FORWARDED and LANDED without the parameter, and nobody
+    was told: no retry is coming, and the stored record is already wrong.  One
+    hardcoded "the call was refused" sentence renders the second kind a record
+    that contradicts its own summary three lines above, and the false half is
+    the half that changes what an operator does.
+
+    ``shared.mcp_markup_middleware`` names the kinds precisely so a sink written
+    when only the refusal existed cannot silently mis-file the newer one; this
+    is that sink, matching the set rather than a single name.
+
+    An UNRECOGNISED kind is filed anyway, with a visibly-hedged body that
+    renders the middleware's own ``summary`` and ``suggested_action`` — the same
+    posture ``orchestrator.mcp.markup_sink`` takes.  Dropping a record kind is
+    the silent fail-soft this PRD exists to end, and an unfamiliar record in the
+    queue is a question an operator can answer.
+    """
+    error_type = record.get('error_type')
+    if error_type == MARKUP_UNREPAIRABLE_ERROR_TYPE:
+        return (
+            'THE CALL WAS REFUSED. The leaked fragment\'s own boundary could '
+            'not be determined, so no repair was attempted and nothing was '
+            'guessed. Nothing this call carried reached the escalation store, '
+            'and the caller WAS told: it holds its own copy and can resend, so '
+            'the payload below is a recovery aid rather than the only route '
+            'back to the data.'
+        )
+    if error_type == MARKUP_UNRECOVERED_PARAM_ERROR_TYPE:
+        return (
+            'THE CALL WAS FORWARDED WITHOUT THIS PARAMETER, and it LANDED. The '
+            'value below was recovered from the leak but could not be typed '
+            'against the parameter\'s declared schema, so it was dropped from '
+            'the call rather than passed through untyped. The caller was NOT '
+            'told — nobody is waiting on a retry, and the record that call '
+            'filed is already stored missing this field. The payload below is '
+            'the only surviving copy of it.'
+        )
+    logger.warning(
+        'markup guard: filing an unrecognised residue kind %r — the middleware '
+        'emits something this sink does not know about (known: %s)',
+        error_type, sorted(MARKUP_RESIDUE_ERROR_TYPES),
+    )
+    return '\n'.join([
+        f'UNRECOGNISED RESIDUE KIND {error_type!r}. This sink does not know '
+        'what this call\'s outcome was, so it states neither — the middleware '
+        'grew a record kind that escalation/src/escalation/server.py has not '
+        'been taught. Its own words for what happened follow; treat them, not '
+        'this paragraph, as the account of the call.',
+        '',
+        f'summary: {record.get("summary")!r}',
+        f'suggested_action: {record.get("suggested_action")!r}',
+    ])
+
+
+# Task statuses from which a recovery/redispatch is still possible.  A record
+# on a task outside this set pins nothing: there is no recovery to block.
+_RECOVERABLE_STATUSES = frozenset({'in-progress', 'blocked'})
+
+
+async def _annotate_pins_recovery(
+    queue: EscalationQueue,
+    harness: Any,
+    escalations: Sequence[Any],
+    dicts: list[dict[str, Any]],
+    *,
+    level: int | None,
+) -> None:
+    """Stamp ``pins_recovery`` on *dicts* in place, or leave the key ABSENT.
+
+    See ``get_pending_escalations``' docstring for the contract.  The key is
+    omitted rather than defaulted to ``[]`` on every path where the answer is
+    unknown, because ``[]`` reads as "nothing pins this task" — the esc-3163
+    collapse that routes a genuinely-pinned strand down the wrong branch.
+    """
+    if not dicts:
+        return
+    # No `if harness is not None` guard: getattr(None, 'scheduler', None) is
+    # already None, so the test is redundant AND actively harmful — it narrows
+    # `harness` to None for the whole function under pyright (the `else None`
+    # arm survives the `scheduler is None` return, since narrowing does not
+    # propagate backwards from `scheduler` to `harness`), which is what made
+    # the liveness read below a reportOptionalMemberAccess error.
+    scheduler = getattr(harness, 'scheduler', None)
+    if scheduler is None:
+        logger.debug(
+            'pins_recovery omitted for %d pending record(s): no orchestrator '
+            'harness/scheduler wired in, so task status is unreadable',
+            len(dicts),
+        )
+        return
+
+    task_ids = sorted({e.task_id for e in escalations})
+    # Deliberately unguarded.  Scheduler.get_statuses is TOTAL: it wraps its
+    # own body and returns ({}, exc) on any failure, logging the traceback
+    # itself (scheduler.py:2560).  Its designed failure channel is the `err`
+    # slot read just below.  A raise here would mean the duck-typed harness
+    # violated that contract — a seam failure, caught once by the call site's
+    # guard in get_pending_escalations, not swallowed at DEBUG per call.
+    statuses, err = await scheduler.get_statuses(task_ids)
+    if err is not None:
+        # get_statuses' failure shape is ({}, exc); reading only the dict would
+        # make a failed read indistinguishable from "no tasks" and report [].
+        logger.debug('pins_recovery omitted: status read failed: %s', err)
+        return
+
+    # classify_pins judges a record against its task's WHOLE open set, so a
+    # filtered view must not become a filtered classification.  Only a `level`
+    # filter narrows that set; without one the selection already IS the full
+    # open set for every task it mentions.
+    if level is None:
+        open_by_task: dict[str, list[Any]] = {}
+        for esc in escalations:
+            open_by_task.setdefault(esc.task_id, []).append(esc)
+    else:
+        open_by_task = {}
+        for tid in task_ids:
+            try:
+                open_by_task[tid] = queue.get_by_task(tid, status='pending')
+            except Exception as exc:  # noqa: BLE001 — real I/O, see below
+                # The ONE genuinely-reachable failure in this function (a
+                # filesystem scan plus JSON parse over esc-*.json), and the one
+                # place per-task recovery is real rather than nominal: a single
+                # unreadable file degrades exactly one task.  Leaving `tid` out
+                # of open_by_task makes the loop below skip it, so its key stays
+                # ABSENT (= UNKNOWN) instead of becoming a false [].  WARNING
+                # because a queue directory this process cannot read is
+                # operator-actionable and otherwise invisible on this surface.
+                logger.warning(
+                    'pins_recovery UNKNOWN for task %s: pending re-read failed: %s',
+                    tid, exc,
+                )
+
+    reports: dict[str, Any] = {}
+    live_by_task: dict[str, bool] = {}
+    for tid in task_ids:
+        if tid not in open_by_task:
+            continue
+        # Deliberately unguarded.  is_workflow_active is a dict membership test
+        # (harness.py:11182), so it cannot fail for one task id and succeed for
+        # the next — a per-task `continue` here would be granularity in name
+        # only.  A harness that cannot answer at all is a seam failure, handled
+        # once by the call site's guard.
+        live = bool(harness.is_workflow_active(tid))
+        live_by_task[tid] = live
+        # live_claimant_id is unavailable here (the harness exposes no composed
+        # claimant id), which classify_pins treats as UNKNOWN and fails safe to
+        # pinning for a live-claimant L0.  Fail-safe is the correct direction:
+        # this annotation must never under-report a pin.
+        reports[tid] = classify_pins(tid, open_by_task[tid], live_claimant=live)
+
+    for esc, d in zip(escalations, dicts, strict=True):
+        tid = esc.task_id
+        status = statuses.get(tid)
+        report = reports.get(tid)
+        if status is None or report is None:
+            logger.debug(
+                'pins_recovery omitted for %s: task %s status/classification unresolved',
+                d.get('id'), tid,
+            )
+            continue
+        pins = (
+            status in _RECOVERABLE_STATUSES
+            and not live_by_task.get(tid, True)
+            and esc.id in report.queue_handoff
+        )
+        d['pins_recovery'] = [tid] if pins else []
 
 
 def create_server(
@@ -305,6 +789,228 @@ def create_server(
     deterministic and wall-clock-independent.
     """
     mcp = FastMCP('escalation')
+
+    # --- Leaked tool-call envelope markup (task 3690, PRD section 4 C2) ---
+    #
+    # Registered HERE, immediately after the server exists and before any
+    # @mcp.tool() below, so every tool on this server is covered by one
+    # registration and a tool added later cannot miss it.
+    #
+    # FORWARD_REPAIR, not REJECT_WITH_REPAIR, and the reason is C2's own: a
+    # lost escalate_info STRANDS A TASK (INV-6). Where bouncing a caller costs
+    # more than proceeding, the guard repairs in place and warns rather than
+    # refusing. The tier is passed EXPLICITLY as a keyword because INV-1 makes
+    # it a registration-time DECLARATION — never inferred per call from the
+    # shape of the damage or from a tool's name.
+    #
+    # exempt_tools is likewise written out even though frozenset() is the
+    # default: an exemption is a declaration, and spelling it makes a future
+    # tool addition on this server a DECISION rather than an omission. No tool
+    # here legitimately carries envelope literals as data — the
+    # scan_memory_content case that motivates exemptions lives on fused-memory
+    # (sibling task 4458). A name added here would match BARE (`escalate_info`,
+    # never the agent-facing mcp__escalation__escalate_info spelling the
+    # specimen corpus records), because context.message.name is the in-server
+    # name and a declaration that fails open is worse than none.
+    #
+    # strict_input_validation is deliberately NOT set (PRD boundary row B15):
+    # with it on the SDK jsonschema-validates before FastMCP's handler, the
+    # middleware chain is never entered, and every required-parameter leak
+    # becomes silently unrepairable.
+    def _emit_markup_fact(fact: dict[str, Any]) -> None:
+        """Emit the ``markup_detected`` record itself, as ONE structured line.
+
+        INV-2: every outcome emits the fact, and no consumer re-derives it by
+        log-scraping.  The middleware already logs a human-readable WARNING for
+        an operator reading the stream, so duplicating that prose here would add
+        a second thing to read and still nothing to parse.  This emits the
+        RECORD — greppable by its own name, then ``json.loads``-able whole.
+
+        Never raises by construction (``json.dumps`` over a flat record of
+        strings and ``None``s), and the middleware invokes every sink
+        defensively anyway: a sink that raised would be logged and would not
+        change the caller's outcome.
+        """
+        logger.info('%s %s', FACT_MARKUP_DETECTED, json.dumps(fact, sort_keys=True))
+
+    def _file_markup_residue(record: dict[str, Any]) -> str | None:
+        """Persist an unrepairable call's payload, or report a storm burst.
+
+        The escalation channel the guard writes to (C2 L187 / INV-7).  Returns
+        the queued id as a ``str`` — the middleware propagates it into the
+        refusal payload so a bounced caller can point an operator at its own
+        preserved data, and treats a non-``str`` as reporting no id.
+
+        THE QUEUE IS WRITTEN DIRECTLY, and both halves of that are deliberate:
+
+        * NOT through ``escalate_info``/``escalate_blocker``.  Those re-enter
+          this same middleware, and a residue payload is BY CONSTRUCTION full of
+          envelope markup — it would be detected, refused, and recursed on.
+        * NOT through ``_submit_or_dedupe``.  Folding a residue record into a
+          pending parent destroys the raw payload the record exists to preserve.
+          (Its born-at-L2 branch would in fact bypass dedupe for this severity;
+          calling ``queue.submit`` directly is that branch's own mechanism, used
+          without depending on a severity check to keep choosing it.)
+
+        Blocking file I/O inside an async caller, matching every other write on
+        this server: ``escalate_info`` reaches ``queue.submit`` the same way.
+        """
+        error_type = record.get('error_type')
+        if error_type == MARKUP_STORM_ERROR_TYPE:
+            return _file_markup_storm(record)
+
+        # `level` and `category` are read from the RECORD rather than restated,
+        # so the middleware stays the single source of the contract (INV-5).
+        # The fallbacks matter only if that contract is ever violated, and they
+        # fail toward L2 rather than toward a silently-L0 record nobody reads.
+        level = int(record.get('level') or 2)
+        subject_task_id = record.get('subject_task_id')
+        detail = '\n'.join([
+            # WHOSE call leaked. Rendered FIRST and unconditionally because on
+            # this server it is the only attribution that ever resolves: the
+            # middleware's `_identity` reads `agent_id` / `project_root` /
+            # `project_id` off the call's own arguments, and no escalation tool
+            # declares any of the three, so the two fields below it are
+            # structurally None here. The record's own `task_id` is the
+            # synthetic anchor, not the caller's, so without these two lines a
+            # critical L2 record names nobody at all.
+            f'subject_task_id={subject_task_id!r}',
+            f'subject_agent_role={record.get("subject_agent_role")!r}',
+            # The OWNER that will exit this hold unprompted (INV-7), read off
+            # the record rather than restated: the middleware names it, and a
+            # second spelling here could name a consumer that no longer exists.
+            f'owner={record.get("owner")!r}',
+            f'tool={record.get("tool")!r}',
+            f'field={record.get("field")!r}',
+            f'matched_pattern={record.get("matched_pattern")!r}',
+            f'agent_id={record.get("agent_id")!r}',
+            f'project={record.get("project")!r}',
+            f'raw_value_chars={len(record.get("raw_value") or "")}',
+            '',
+            _markup_residue_prose(record),
+            '',
+            'RAW PAYLOAD, VERBATIM AND ENTIRE — the only surviving copy. '
+            'Recover it for the caller if it is still needed, then chase the '
+            'harness serialization leak that produced it '
+            '(plans/toolcall-markup-containment-prd.md).',
+            '',
+            str(record.get('raw_value') or ''),
+        ])
+        esc = Escalation(
+            id=queue.make_id(_MARKUP_RESIDUE_ANCHOR_TASK_ID),
+            task_id=_MARKUP_RESIDUE_ANCHOR_TASK_ID,
+            agent_role=_MARKUP_GUARD_AGENT_ROLE,
+            # Derived from `level`, never asserted beside it: the two are one
+            # decision (see _MARKUP_RESIDUE_SEVERITY), so if the middleware ever
+            # lowers the level this record follows it down instead of writing a
+            # born-at-L2 severity onto an L0/L1 record.
+            severity=_MARKUP_RESIDUE_SEVERITY if level >= 2 else 'blocking',
+            category=str(record.get('category') or 'mcp_markup_residue'),
+            # The subject is PREFIXED rather than left to the detail: the
+            # record's own task_id is the synthetic anchor, so a reader
+            # scanning summaries alone — which is what the L2 watcher's
+            # notification shows — would otherwise have no way to tell whose
+            # call leaked. Same shape the sibling sink uses.
+            summary=(
+                f'[{subject_task_id}] ' if subject_task_id else ''
+            ) + str(record.get('summary') or ''),
+            detail=detail,
+            suggested_action=str(record.get('suggested_action') or ''),
+            level=level,
+        )
+        return queue.submit(esc)
+
+    def _file_markup_storm(record: dict[str, Any]) -> str | None:
+        """One open record per burst, not one per window (INV-4).
+
+        The middleware's own ``StormCounter`` already rate-limits to one fire
+        per window and states that dedup is the SINK's knowledge, not its own.
+        A leak running for hours would otherwise file one record per hour; this
+        collapses them into the single open record until an operator resolves
+        it, exactly as ``markup_tripwire.emit_markup_storm_escalation`` does.
+
+        A read failure falls THROUGH to filing rather than bailing: losing
+        duplicate suppression is strictly better than losing the alarm for an
+        actively running leak.
+
+        The open-record test is "is MY alarm already open", never "is anything
+        pending on this anchor", and the difference is measured rather than
+        theoretical. The anchor is a SYNTHETIC id, so nothing reserves it and
+        any producer of SYSTEM-scoped records may land one there;
+        ``markup_tripwire``'s own docstring records what a category-blind test
+        then costs — it "filed nothing 2026-08-16..2026-08-19 while 41
+        rejections occurred" because another producer held its shared anchor
+        open, and that silence read as calm. Both halves of the identity are
+        checked because both can differ independently: another PRODUCER's
+        record (any category), and a sibling guard's record (this category,
+        another server). ``getattr`` rather than attribute access so a record
+        shape that predates either field cannot raise on this path.
+        """
+        try:
+            existing = queue.get_by_task(_MARKUP_STORM_ANCHOR_TASK_ID, status='pending')
+        except Exception:
+            logger.exception(
+                'markup guard: could not check for an open storm record; '
+                'filing a new one rather than dropping the alarm',
+            )
+            existing = []
+        mine = [
+            esc for esc in existing
+            if getattr(esc, 'category', None) == _MARKUP_STORM_CATEGORY
+            and getattr(esc, 'agent_role', None) == _MARKUP_GUARD_AGENT_ROLE
+        ]
+        if mine:
+            # Sorted by id, not `mine[0]`: get_by_task's order comes from a
+            # directory glob, so folding into "whichever came back first" would
+            # make the id this returns — the one a caller is told to look up —
+            # depend on filesystem enumeration order. The ids carry a
+            # monotonic sequence, so the lowest is the record that opened the
+            # alarm.
+            open_alarm = min(mine, key=lambda esc: esc.id)
+            logger.info(
+                'markup guard: %s already open (storm %r now); not duplicating',
+                open_alarm.id, record,
+            )
+            return open_alarm.id
+
+        outcome = record.get('outcome')
+        return queue.submit(Escalation(
+            id=queue.make_id(_MARKUP_STORM_ANCHOR_TASK_ID),
+            task_id=_MARKUP_STORM_ANCHOR_TASK_ID,
+            agent_role=_MARKUP_GUARD_AGENT_ROLE,
+            # 'blocking', not a born-at-L2 severity: this is a rate alarm about
+            # a condition, and markup_tripwire's storm record is filed the same
+            # way. The residue records it accompanies carry the L2 routing.
+            severity='blocking',
+            category=_MARKUP_STORM_CATEGORY,
+            summary=(
+                f'{record.get("count")} {outcome} MCP call(s) in '
+                f'{record.get("window_seconds")}s for project='
+                f'{record.get("project")!r} — the serialization leak is ACTIVE'
+            ),
+            detail='\n'.join(
+                f'{key}={record[key]!r}' for key in sorted(record)
+            ),
+            suggested_action=(
+                'identify the leaking caller from the markup_detected facts and '
+                'report it against plans/toolcall-markup-containment-prd.md'
+            ),
+            level=1,
+        ))
+
+    mcp.add_middleware(MarkupGuardMiddleware(
+        policy=RepairPolicy.FORWARD_REPAIR,
+        exempt_tools=frozenset(),
+        # C2 L187 / INV-7. Without this the guard logs "no escalation_sink is
+        # wired, so the residue of %r will not be preserved anywhere" and the
+        # refusal DESTROYS the caller's payload — which for a leak that is by
+        # construction an agent emitting text it cannot re-emit identically is
+        # not something a retry recovers. The queue is in-process here, so this
+        # server is the one place the residue can actually be preserved.
+        escalation_sink=_file_markup_residue,
+        fact_sink=_emit_markup_fact,
+    ))
+
     cfg = dedupe_config if dedupe_config is not None else DedupeConfig()
 
     # --- Startup sweep (pre-serving single-writer window) ---
@@ -347,10 +1053,19 @@ def create_server(
         ``level=2``.  Folding them into an existing parent (which retains its
         original lower level) would silently drop the L2 routing signal.
 
-        Response shapes (from dedupe.submit_or_dedupe):
-        - Queued:        ``{'id': esc_id, 'status': 'queued'}``
+        Response shapes (from dedupe.submit_or_dedupe).  ``level`` is present on
+        every branch:
+        - Queued:        ``{'id': esc_id, 'status': 'queued', 'level': <persisted>}``
+        - Auto-resolved/dismissed (the record was NOT pending after the write,
+          e.g. a concurrent sweep won the race): ``{'id', 'status',
+          'resolution', 'resolved_by', 'level'}``.  Task 3236: both this
+          function's L2 branch and dedupe.submit_or_dedupe report OBSERVED
+          post-write state rather than write intent, and fail open to
+          ``'queued'`` — carrying ``esc.level`` — when the re-read is
+          unavailable.
         - Dedup-skipped: ``{'id': parent_id, 'status': 'dedup_skipped',
-                            'parent_id': parent_id, 'child_id': esc.id}``
+                            'parent_id': parent_id, 'child_id': esc.id,
+                            'level': esc.level}``
           (never returned for L2 escalations — they always produce 'queued')
 
         Cross-task resume contract: see DESIGN.md "Escalation cross-task dedupe"
@@ -360,9 +1075,102 @@ def create_server(
         # L2 escalations bypass deduplication: their level=2 stamp must be
         # preserved on an independent on-disk record (see docstring above).
         if esc.severity in BORN_AT_L2_SEVERITIES:
-            queue.submit(esc)
-            return {'id': esc.id, 'status': 'queued'}
+            esc_id = queue.submit(esc)
+            # Task 3236: this branch does NOT route through dedupe, so it needs
+            # the observed-state response separately.  Fail-open to 'queued'
+            # (still carrying esc.level, so the 'level' echo is never missing).
+            return _observed_submit_response(queue, esc_id, fallback_level=esc.level)
         return _dedupe_submit_or_dedupe(queue, esc, cfg)
+
+    # --- Amendment-truncation storm escape (INV-4, task 3997) ---
+
+    # PROCESS-LOCAL and per-instance BY CONSTRUCTION.  StormCounter documents
+    # its state as resetting on restart and not bleeding between servers (or
+    # between tests), and server.py otherwise holds zero module-level mutable
+    # state — every module-level name above is a frozen constant.  Keeping the
+    # counter in this closure is what preserves that property.
+    _amendment_truncation_storm = StormCounter()
+
+    def _report_amendment_truncation_storm(l2_id: str) -> None:
+        """File ONE info escalation when amendment truncation BURSTS.
+
+        ``queue.add_members_to_l2`` already counts every dropped amendment on
+        the record itself (``amendments_truncated``) and logs a WARNING.  The
+        counter stays the PRIMARY structured fact — the contract is assertable
+        from the record, never by log-scrape (INV-8) — but a WARNING has no
+        audience.  This is the rate-thresholded NOTIFICATION layered on top,
+        which is what INV-4 asks for: a hearer, at a threshold.
+
+        Deliberately lives here and not in ``queue.py``.  That module is a pure
+        storage leaf, and a self-file from inside ``add_members_to_l2`` would
+        re-enter ``make_id``/``submit``/``_atomic_write`` while still holding
+        ``escalation_id_lock``.  ``promote_to_l2`` already calls ``queue.submit``
+        on its create path and runs outside that flock.
+
+        PURELY ADDITIVE, NEVER FATAL, mirroring the house analogues
+        ``emit_markup_storm_escalation`` and
+        ``emit_residual_candidate_key_escalation``: nothing raised in here may
+        fail the promote that triggered it.  A dropped report costs a
+        notification; a raised one would cost the fold.
+
+        Filed under ``_AMENDMENT_TRUNCATION_ANCHOR_TASK_ID``, following the same
+        analogues, because the condition is system-scoped rather than a property
+        of whichever task's promote crossed the threshold.  The affected L2 ids
+        are named in the summary and detail instead.
+        """
+        try:
+            storm = _amendment_truncation_storm.record(
+                threshold=_AMENDMENT_TRUNCATION_STORM_THRESHOLD,
+                window_seconds=_AMENDMENT_TRUNCATION_STORM_WINDOW_SECONDS,
+                # The label is load-bearing, not decoration: it is what lets the
+                # report name WHICH L2s truncated instead of blaming whichever
+                # call happened to cross the threshold.
+                label=l2_id,
+            )
+            # None means below threshold, or a previous fire is still inside the
+            # window (one report per window, so a runaway escalates once).
+            if storm is None:
+                return
+            labels = ', '.join(storm['labels']) or l2_id
+            _submit_or_dedupe(Escalation(
+                # Filed under the synthetic anchor, NOT the triggering promote's
+                # task_id — see _AMENDMENT_TRUNCATION_ANCHOR_TASK_ID.
+                id=queue.make_id(_AMENDMENT_TRUNCATION_ANCHOR_TASK_ID),
+                task_id=_AMENDMENT_TRUNCATION_ANCHOR_TASK_ID,
+                agent_role='escalation-server',
+                # A report about lost framing is a notification, not a page:
+                # 'info' keeps it off the born-at-L2 human-direct route.
+                severity='info',
+                category='infra_issue',
+                summary=(
+                    f"L2 amendment truncation storm: {storm['count']} truncations "
+                    f"in {storm['window_seconds']}s "
+                    f"(threshold {storm['threshold']}); L2s: {labels}"
+                ),
+                detail=(
+                    f"OBSERVED: {storm['count']} amendment truncations within "
+                    f"{storm['window_seconds']}s across L2 escalation(s): {labels}.\n"
+                    f"Each truncation drops the OLDEST entry of that L2's "
+                    f"`amendments` list at the queue._MAX_AMENDMENTS cap; the "
+                    f"record's own `amendments_truncated` field holds the durable "
+                    f"per-L2 total, and its own root_cause/detail/options/summary "
+                    f"are never touched.\n"
+                    f"Hypothesis: either the cap is too low for the live fold "
+                    f"rate, or root-cause matching is over-folding unrelated L1 "
+                    f"clusters into one L2."
+                ),
+                suggested_action=(
+                    'Read the named L2s and compare each record\'s own framing '
+                    'against its amendments to judge whether those folds belong '
+                    'together; then either raise queue._MAX_AMENDMENTS or tighten '
+                    'root-cause matching.'
+                ),
+            ))
+        except Exception as e:  # pragma: no cover - defensive, never fatal
+            logger.exception(
+                'amendment-truncation storm report failed for L2 %s (non-fatal): %s',
+                l2_id, e,
+            )
 
     # --- Terminal-task chokepoint helper ---
 
@@ -418,6 +1226,14 @@ def create_server(
         # gate bypass.  L2 escalations also skip deduplication in _submit_or_dedupe
         # so they are never silently folded into a lower-level parent.
         # After the downgrade above, only sentinel-filed criticals/urgents reach here.
+        #
+        # Task 3236 ordering dependency — do NOT move this above the Escalation
+        # construction in escalate_blocker.  That tool now accepts an explicit
+        # `level` (restricted to {0, 1}), stamped at construction time; because
+        # this assignment runs AFTER construction, the born-at-L2 severity route
+        # keeps precedence over any explicitly passed level, which is the
+        # intended precedence and is pinned by
+        # test_server.py::TestEscalateBlockerLevelParam.
         if esc.severity in BORN_AT_L2_SEVERITIES:
             esc.level = 2
 
@@ -466,6 +1282,10 @@ def create_server(
                 'status': resolved.status,
                 'resolution': resolved.resolution,
                 'resolved_by': resolved.resolved_by,
+                # Task 3236: `resolved` is the persisted record, so echoing its
+                # level costs no read and keeps the documented 'level' echo
+                # present on this branch too.
+                'level': resolved.level,
             }
 
         # Non-terminal or unknown status → submit normally
@@ -515,11 +1335,15 @@ def create_server(
         fact.  A single observation is not sufficient to recommend a destructive
         intervention (a ref move / rewind) — re-run or re-measure first.
 
-        Response shape:
-        - Queued (task alive):    ``{id, status}``  where status='queued'
-        - Deduped (folded):       ``{id, status, parent_id, child_id}``
+        Response shape (``level`` is present on every branch):
+        - Queued (task alive):    ``{id, status, level}``  where status='queued'
+        - Deduped (folded):       ``{id, status, parent_id, child_id, level}``
           (L2 escalations are never deduped — they always produce 'queued')
-        - Auto-resolved (terminal task): ``{id, status, resolution, resolved_by}``
+        - Auto-resolved (terminal task): ``{id, status, resolution, resolved_by, level}``
+        - Already resolved/dismissed at filing time (a concurrent resolver or
+          sweep won the race): ``{id, status, resolution, resolved_by, level}``
+          with the record's REAL status — the response reports observed
+          post-write state, never write intent (task 3236).
           Callers needing the full record can call get_escalation(id).
         """
         if severity not in KNOWN_SEVERITIES:
@@ -559,6 +1383,7 @@ def create_server(
         workflow_state: str | None = None,
         evidence: list[dict[str, Any]] | None = None,
         terminal_state_is_the_bug: bool = False,
+        level: int = 0,
     ) -> dict[str, Any]:
         """Report a blocking problem. After calling this, commit any in-progress work,
         log your iteration, and STOP. Do NOT retry — the handler will resolve the issue
@@ -581,6 +1406,31 @@ def create_server(
         expected to be terminal (bypasses the auto-resolve chokepoint and submits
         normally).  action='terminate_cleanly' is still returned.
 
+        *level* — the escalation ladder rung this filing is born at.  Defaults to
+        ``0`` (agent → steward).  Pass ``level=1`` to file a level-1
+        re-escalation (steward → escalation-watcher-auto): this is the steward's
+        documented recourse when it cannot resolve an L0 itself, and it is the
+        ONLY way an agent-side filing reaches the auto-watcher, which filters on
+        level.  A level-1 record is also outside the workflow's level=0-scoped
+        dismissal sweeps by construction, and ``escalation.pins`` routes any
+        ``level != 0`` record to QUEUE_HANDOFF, so it pins the task independently
+        of the filer's liveness.
+
+        ``level=1`` is not restricted to any role — ``agent_role`` is
+        caller-supplied and so cannot be enforced, and a hard reject would lose
+        a steward re-escalation filed under an unexpected role string.  It is
+        instead OBSERVED: a level=1 filing from a role that is neither
+        ``'steward'`` nor a harness sentinel is logged at WARNING naming the
+        role and task_id.  The record is still filed.
+
+        Only ``{0, 1}`` are accepted — anything else (including ``2``) is
+        rejected with an ``{'error': ...}`` response and NOTHING is submitted.
+        Agents must not self-mint L2: the legitimate routes there are a
+        born-at-L2 *severity* filed by a harness sentinel role, or
+        ``promote_to_l2``.  Note that born-at-L2 severity takes precedence over
+        this parameter — a sentinel-filed ``severity='critical'`` still lands at
+        level 2 even when ``level=1`` is passed.
+
         *evidence* — optional list of structured raw-OBSERVATION entries, each a
         ``{observation, measured_at, ref}`` dict (e.g. the HEAD SHA at measurement,
         a ref listing, a rerun result, a raw exit code).  Stored and returned
@@ -591,11 +1441,21 @@ def create_server(
         fact.  A single observation is not sufficient to recommend a destructive
         intervention (a ref move / rewind) — re-run or re-measure first.
 
-        Response shape always includes ``action='terminate_cleanly'`` plus:
-        - Queued:        ``{id, status, action}``  where status='queued'
-        - Deduped:       ``{id, status, parent_id, child_id, action}``
+        Response shape always includes ``action='terminate_cleanly'`` and
+        ``level`` (on EVERY branch, including the fail-open one) plus:
+        - Queued:        ``{id, status, level, action}``  where status='queued'
+        - Deduped:       ``{id, status, parent_id, child_id, level, action}``
           (L2 escalations are never deduped — they always produce 'queued')
-        - Auto-resolved: ``{id, status, resolution, resolved_by, action}``
+        - Auto-resolved: ``{id, status, resolution, resolved_by, level, action}``
+        - Already resolved/dismissed at filing time (a concurrent resolver or
+          sweep won the race): ``{id, status, resolution, resolved_by, level,
+          action}`` with the record's REAL status.  Task 3236: the response
+          reports observed post-write state, never write intent — a
+          ``status='queued'`` reply now means the record really was pending
+          after the write.  ``level`` echoes the level actually persisted
+          (falling back to the level written when a post-write re-read is
+          unavailable), so a caller that passed ``level=1`` can confirm it
+          landed without risking a ``KeyError`` on a degraded path.
           Callers needing the full record can call get_escalation(id).
         """
         if severity not in KNOWN_SEVERITIES:
@@ -605,6 +1465,27 @@ def create_server(
                     f'expected one of {sorted(KNOWN_SEVERITIES)}'
                 ),
             }
+        # Task 3236: validate `level` BEFORE constructing the Escalation, using
+        # the same {'error': ...} early-return shape as the severity guard above,
+        # so a misconfigured caller gets immediate feedback instead of a
+        # silently-misrouted escalation.  bool is an int subclass — reject it
+        # explicitly so escalate_blocker(level=True) is not read as level=1.
+        if isinstance(level, bool) or not isinstance(level, int) or level not in AGENT_FILABLE_LEVELS:
+            return {
+                'error': (
+                    f'invalid level {level!r}; expected one of '
+                    f'{sorted(AGENT_FILABLE_LEVELS)} (0 = agent→steward, '
+                    '1 = steward re-escalation → escalation-watcher-auto). '
+                    'Agents cannot self-mint level 2: file with a born-at-L2 '
+                    "severity ('critical'/'urgent') from a harness sentinel role, "
+                    'or use promote_to_l2.'
+                ),
+            }
+        # Level=1 is not role-gated (see _warn_if_unexpected_l1_filer for why a
+        # gate on caller-supplied agent_role would be both defeatable and
+        # fail-dangerous); an unexpected filer is made observable instead.
+        if level == 1:
+            _warn_if_unexpected_l1_filer(agent_role, task_id, category)
         esc = Escalation(
             id=queue.make_id(task_id),
             task_id=task_id,
@@ -617,6 +1498,7 @@ def create_server(
             worktree=worktree,
             workflow_state=workflow_state,
             evidence=cast(list[EvidenceEntry], evidence or []),
+            level=level,
         )
         result = await _chokepoint_or_submit(esc, terminal_state_is_the_bug)
         return {**result, 'action': 'terminate_cleanly'}
@@ -929,7 +1811,7 @@ def create_server(
         return esc.to_dict()
 
     @mcp.tool()
-    def get_pending_escalations(
+    async def get_pending_escalations(
         task_id: str | None = None,
         level: int | None = None,
         compact: bool = False,
@@ -947,15 +1829,50 @@ def create_server(
         ANY escalation ever exist for this task", use ``get_task_escalations``
         instead — an empty result here is not evidence of absence.
 
-        *compact* — when True, each returned dict is projected to only the
-        triage-relevant fields (``id``, ``task_id``, ``category``, ``severity``,
-        ``level``, ``status``, ``summary``, ``suggested_action``, ``timestamp``);
-        the heavy free-text/cluster fields (``detail``, ``members``, ``options``,
-        ``root_cause``, ``train_state``, ``workflow_state``, ``worktree``,
-        ``dedupe_*``) are omitted.  Use this from a long-running watcher to keep
-        context small as the pending pile grows; fetch the full record for a
-        specific id via ``get_escalation`` only when you are about to act on it.
-        Default False preserves the full-dict shape for existing callers.
+        *compact* — when True, each returned dict is projected to the
+        triage-relevant field subset, plus this tool's computed
+        ``pins_recovery`` (below).  The authoritative list is
+        :data:`_COMPACT_ESCALATION_FIELDS` — read it there rather than trusting
+        a prose copy, which is how this paragraph drifted before.  What is
+        DROPPED: the heavy free-text/cluster fields ``detail``, ``options``,
+        ``train_state``, ``workflow_state``, ``worktree`` and ``dedupe_*``, plus
+        ``amendments``.  ``detail`` is the unbounded free-text field compact mode
+        exists to keep out of a long-running watcher's context.
+
+        Two L2-cluster fields ARE returned, because they are bounded by
+        construction and load-bearing for triage (task 3997): ``root_cause``,
+        the one-line dedup key ``promote_to_l2`` folds on, and ``member_ids``,
+        the PROJECTION of the record's ``members`` list under a contract name
+        (the raw ``members`` key stays dropped).  Together they make a drain
+        SELF-SUFFICIENT: a rotating watcher rebuilds ``already_promoted`` as
+        {root_cause of the pending L2s} u {their member_ids} across the returned
+        rows, with NO session memory — previously that set could only be carried
+        forward in-session, so a rotation re-promoted clusters it had already
+        promoted.
+
+        Use this from a long-running watcher to keep context small as the
+        pending pile grows; fetch the full record for a specific id via
+        ``get_escalation`` only when you are about to act on it.  Default False
+        preserves the full-dict shape for existing callers.
+
+        *pins_recovery* — each returned dict carries a computed
+        ``pins_recovery`` list: ``[task_id]`` when THIS record is what stops
+        that task from being recovered/redispatched, else ``[]``.  It is the
+        conjunction of four things (spec S8): the task is ``in-progress`` or
+        ``blocked`` (there is something to recover), no live claimant holds it
+        (it is stranded, not running), the record lands in
+        :attr:`~escalation.pins.PinReport.queue_handoff` (so an info record and
+        a dead L0 do NOT pin — derived from the classifier, never from
+        ``bool(open_escalations)``), and the task's status could be read.
+
+        The key is **OMITTED entirely** — never emitted as ``[]`` — when the
+        annotation cannot be computed: no harness/scheduler wired in, the
+        status read failed or raised, or that record's task is missing from
+        the status map.  A false ``[]`` reads as "nothing pins this task",
+        which is the exact collapse (esc-3163) that
+        :attr:`~escalation.pins.PinReport.store_unavailable` exists to
+        prevent, so callers must treat an absent key as UNKNOWN and render
+        nothing rather than "not pinning".
         """
         if task_id:
             escalations = queue.get_by_task(task_id, status='pending', level=level)
@@ -963,12 +1880,33 @@ def create_server(
             escalations = queue.get_pending()
             if level is not None:
                 escalations = [e for e in escalations if e.level == level]
+
+        dicts = [e.to_dict() for e in escalations]
+        try:
+            await _annotate_pins_recovery(queue, harness, escalations, dicts, level=level)
+        except Exception:
+            # THE seam guard.  `harness` is duck-typed Any because this package
+            # deliberately does not import orchestrator, so the annotation can
+            # never fully trust its contract.  Stating "an annotation must never
+            # fail the tool" once, here, makes it true BY CONSTRUCTION for every
+            # line inside _annotate_pins_recovery — including ones added later —
+            # instead of by enumerating which calls someone guessed might throw.
+            # Records already stamped keep their value; the rest keep the key
+            # ABSENT, which is the contract's UNKNOWN, never a false [].
+            # logger.exception (not .debug) so a real seam violation yields a
+            # traceback rather than a one-line repr.
+            logger.exception(
+                'pins_recovery annotation failed for %d pending record(s); '
+                'unstamped records report UNKNOWN (key absent)', len(dicts),
+            )
         if compact:
-            return [
-                {k: d[k] for k in _COMPACT_ESCALATION_FIELDS}
-                for d in (e.to_dict() for e in escalations)
-            ]
-        return [e.to_dict() for e in escalations]
+            # _compact_escalation OMITS absent keys because pins_recovery is
+            # deliberately absent when unknown — projecting it unconditionally
+            # would KeyError on exactly the degraded path the omission contract
+            # exists for.  The same helper also owns the members -> member_ids
+            # rename, so both compact tools share one projection (task 3997).
+            return [_compact_escalation(d, _COMPACT_PENDING_FIELDS) for d in dicts]
+        return dicts
 
     @mcp.tool()
     def get_task_escalations(
@@ -1030,7 +1968,7 @@ def create_server(
         )
         if compact:
             return [
-                {k: d[k] for k in _COMPACT_ESCALATION_FIELDS}
+                _compact_escalation(d, _COMPACT_ESCALATION_FIELDS)
                 for d in (e.to_dict() for e in escalations)
             ]
         return [e.to_dict() for e in escalations]
@@ -1166,7 +2104,7 @@ def create_server(
         options: list[str],
         summary: str,
         category: str = 'design_concern',
-        severity: str = 'blocking',
+        severity: str | None = None,
     ) -> dict[str, Any]:
         """Promote one or more L1 escalations to an L2 cluster (human-facing).
 
@@ -1179,7 +2117,17 @@ def create_server(
         **Root-cause dedup**: if a pending L2 with the same *root_cause* already
         exists, this call UPDATES that existing L2 (appends new members) rather
         than filing a duplicate.  The response ``status`` distinguishes the two
-        outcomes: ``'created'`` for a new L2, ``'updated'`` for an append.
+        outcomes: ``'created'`` for a new L2, ``'updated'`` for an append.  An
+        append RAISES the existing L2's severity when the incoming members (or
+        an explicit *severity*) justify it, and never lowers it — an L2's
+        severity is monotonically non-decreasing after mint, so a record cannot
+        be quieted out from under a human already looking at it.  An append also
+        APPENDS this call's *root_cause*/*evidence*/*options*/*summary* to the
+        existing L2's ``amendments`` list rather than discarding them (task
+        3997): the record's OWN framing stays immutable, but the framing a fold
+        carried in is no longer lost.  That list is bounded — oldest-shed at
+        ``queue._MAX_AMENDMENTS``, with every drop counted in the record's
+        ``amendments_truncated``.
 
         **Members stay at L1**: the member L1 escalations are referenced but
         NOT promoted; they remain pending at L1 until the L2 is resolved.
@@ -1188,7 +2136,9 @@ def create_server(
         (create path) or ``queue.add_members_to_l2()`` (update path).  The
         terminal-task auto-resolve gate and severity→level=2 gate in
         ``_chokepoint_or_submit`` are intentionally bypassed — L2 is set
-        explicitly by this tool.
+        explicitly by this tool.  Because that severity→level gate is bypassed
+        by design, nothing else reconciles an L2's severity with the records it
+        clusters; the inherited default below is what does it.
 
         **Identity gate** (PRD task-status-authority C8/D7): the create side
         is gated by ``escalation.authority.PROMOTE_ALLOWED`` — a connection
@@ -1219,20 +2169,78 @@ def create_server(
         category:
             Escalation category; defaults to ``'design_concern'``.
         severity:
-            Severity tag; defaults to ``'blocking'``.  Decoupled from
-            ``level=2`` — the tool sets ``level=2`` explicitly.  Must be one
-            of ``models.KNOWN_SEVERITIES``; unknown values return
-            ``{'error': ...}`` (mirrors ``escalate_blocker`` validation).
+            Severity tag, decoupled from ``level=2`` — the tool sets
+            ``level=2`` explicitly.  **Omit it (or pass ``None``) and the L2
+            INHERITS ``max(member severities)``** — this is the correct default
+            in the overwhelming majority of cases, and is what stops a cluster
+            of purely-informational L1s from being born ``'blocking'`` and
+            paging a human (task 3976).
+
+            An EXPLICIT value overrides the derivation in BOTH directions at
+            mint time.  Upward in particular stays fully available and is not
+            discouraged: a cluster of individually-informational findings CAN
+            be collectively blocking, and a caller whose RCA concluded that
+            should say so explicitly.  (Post-mint the update path applies a
+            monotonic floor and will not accept a demotion — see
+            **Root-cause dedup**.)
+
+            The derivation ranges over ``models.KNOWN_SEVERITIES`` ONLY: a
+            member that does not resolve, or that resolves carrying an
+            out-of-vocabulary severity (nothing validates a record's severity
+            on write), contributes nothing and is named at WARNING.  A
+            partially usable set derives from the usable subset, so the filed
+            severity is always a member of the vocabulary.
+
+            When NO member yields a usable severity the two paths fail safe in
+            DIFFERENT directions.  CREATE must pick something, so it fails safe
+            UP to ``'blocking'``.  UPDATE deliberately does not: the existing
+            L2 already carries a severity derived from real members, so it is
+            left untouched (no floor, no ``updated_at`` bump) rather than being
+            inflated on nothing more than a typo'd or momentarily unreadable
+            member id.
+
+            An explicit value must be one of ``models.KNOWN_SEVERITIES``;
+            unknown values return ``{'error': ...}`` (mirrors
+            ``escalate_blocker`` validation) and mint nothing.
+
+            **An inherited ``'info'`` L2 is deliberately NON_PINNING.**  Before
+            task 3976 no producer could mint an L2 below ``'blocking'``, so
+            every L2 classified ``QUEUE_HANDOFF`` in ``escalation.pins``.  Link
+            1 there short-circuits on ``severity == 'info'`` BEFORE the
+            ``level != 0`` link — "an info record never pins, at any level" —
+            so an inherited-info L2 no longer vetoes its subject task's
+            ``done`` flip.  That is the INTENDED semantics and was considered
+            here, not an oversight: the members it clusters were themselves
+            non-pinning, and a record that does not merit a human's attention
+            must not hold a task open waiting for one.  An L2 that genuinely
+            should pin is one whose members are genuinely non-info, or one the
+            caller filed with an explicit upward *severity*.
 
         Response shapes
         ---------------
         Create (new L2)::
 
-            {'id': <new_id>, 'status': 'created', 'members': [<member_ids>]}
+            {'id': <new_id>, 'status': 'created', 'members': [<member_ids>],
+             'severity': <severity_filed>}
 
         Update (existing pending L2 with same root_cause)::
 
-            {'id': <existing_id>, 'status': 'updated', 'members': [<all_members>]}
+            {'id': <existing_id>, 'status': 'updated', 'members': [<all_members>],
+             'severity': <severity_after_floor>,
+             'amendment_recorded': <bool>, 'amendments': <int>}
+
+        ``amendment_recorded`` is True when THIS call's framing was appended.
+        It is reported by ``add_members_to_l2`` from inside its own write lock
+        (``queue.AmendmentOutcome``), so it describes this call's write exactly
+        — not a difference inferred from a pre-read, which cost an extra record
+        parse per fold and raced concurrent folds in either direction.  A
+        framing-free or framing-identical re-promote appends nothing and
+        correctly reports False.  ``amendments`` is the resulting list length,
+        which saturates at ``queue._MAX_AMENDMENTS``.
+
+        ``severity`` reports what was ACTUALLY filed, which for a caller that
+        omitted the argument is how the inherited value becomes visible — and
+        on the update path is the post-floor value, not the argument.
 
         Error::
 
@@ -1254,7 +2262,7 @@ def create_server(
             return {'error': 'member_ids must be a non-empty list'}
         if not root_cause.strip():
             return {'error': 'root_cause must be a non-empty string'}
-        if severity not in KNOWN_SEVERITIES:
+        if severity is not None and severity not in KNOWN_SEVERITIES:
             return {
                 'error': (
                     f'invalid severity {severity!r}; '
@@ -1262,15 +2270,85 @@ def create_server(
                 ),
             }
 
+        # Validate FIRST, derive second — an invalid explicit severity must mint
+        # nothing and must never be reachable past the derive branch.  Derived
+        # from the RAW member_ids: the fold is order-independent by
+        # construction, and deduplicating the id list is a storage concern.
+        #
+        # `derived is None` means the members said nothing usable (no id
+        # resolved, or every resolved member carried an out-of-vocabulary
+        # severity).  The two paths below fail safe in DIFFERENT directions,
+        # which is why the helper reports the fact instead of picking one.
+        derived = (
+            None if severity is not None else _derive_l2_severity(queue, member_ids)
+        )
+
+        # CREATE must land on some severity, so an underivable set fails safe
+        # UP to 'blocking' — unchanged from before task 3976.
+        effective_severity = (
+            severity
+            if severity is not None
+            else (derived if derived is not None else 'blocking')
+        )
+
+        # UPDATE must NOT fail up: the existing L2 already carries a severity
+        # derived from its real members, so an underivable set has nothing to
+        # contribute and leaves the record (and its updated_at) alone.  Failing
+        # up here would re-inflate a correctly-inherited info L2 to blocking on
+        # nothing more than a typo'd or momentarily unreadable member id —
+        # exactly the inflation this task removes.
+        severity_floor = severity if severity is not None else derived
+
         # Dedup check: look for an existing pending L2 with the same root_cause.
         existing_id = queue.find_pending_l2_by_root_cause(root_cause)
         if existing_id is not None:
-            updated = queue.add_members_to_l2(existing_id, list(dict.fromkeys(member_ids)))
+            # severity_floor is the caller's explicit value, or max(member
+            # severities) over the ids in THIS call — exactly the floor the
+            # incoming members justify — or None when they justify none, in
+            # which case add_members_to_l2 leaves the severity untouched.
+            # Upward-only inside add_members_to_l2, so an append can never
+            # quiet an existing L2.
+            # What this fold did to `amendments` is reported BY THE WRITER,
+            # from inside `escalation_id_lock` where it is already computed —
+            # not re-derived here from a pre-read plus a "did the count grow"
+            # heuristic.  That heuristic cost a second full read+parse per fold
+            # and was a real TOCTOU: the queue is built for cross-process
+            # mutators, so a concurrent fold between the pre-read and the call
+            # made the flag wrong in either direction.
+            outcome: AmendmentOutcome = {'recorded': False, 'dropped': 0}
+            updated = queue.add_members_to_l2(
+                existing_id,
+                list(dict.fromkeys(member_ids)),
+                severity_floor=severity_floor,
+                # The framing this promote carried in is APPENDED to the L2's
+                # `amendments` rather than discarded (task 3997, C2).  The
+                # record's OWN root_cause/detail/options/summary are untouched.
+                root_cause=root_cause,
+                evidence=evidence,
+                options=list(options),
+                summary=summary,
+                agent_role=agent_role,
+                outcome=outcome,
+            )
             if updated is not None:
+                # INV-4: repeated truncation gets a HEARER, not just a WARNING.
+                # The trigger is this call's OWN shed count, so it fires on the
+                # event rather than on an inferred difference.  Purely additive —
+                # _report_amendment_truncation_storm never raises, so a failed
+                # report can never fail this fold.
+                if outcome['dropped']:
+                    _report_amendment_truncation_storm(existing_id)
                 return {
                     'id': existing_id,
                     'status': 'updated',
                     'members': updated.members,
+                    # Read off the returned Escalation, so this is the
+                    # POST-floor value rather than the argument.
+                    'severity': updated.severity,
+                    # Report the preservation, so a caller LEARNS its framing
+                    # landed instead of having to re-read the record to find out.
+                    'amendment_recorded': outcome['recorded'],
+                    'amendments': len(updated.amendments),
                 }
             # Race: the pending L2 was resolved/archived between find and update.
             # Fall through to the create path so the caller gets a valid result
@@ -1288,7 +2366,7 @@ def create_server(
             id=queue.make_id(task_id),
             task_id=task_id,
             agent_role=agent_role,
-            severity=severity,
+            severity=effective_severity,
             category=category,
             summary=summary,
             detail=evidence,
@@ -1298,7 +2376,12 @@ def create_server(
             options=list(options),
         )
         queue.submit(esc)
-        return {'id': esc.id, 'status': 'created', 'members': esc.members}
+        return {
+            'id': esc.id,
+            'status': 'created',
+            'members': esc.members,
+            'severity': esc.severity,
+        }
 
     # --- Merge queue tools ---
 
@@ -1389,12 +2472,13 @@ def create_server(
             do NOT read a first-tick ``'unknown'`` as a terminal failure.
 
           ``pollable`` is the boolean shorthand ``poll_by != 'branch'`` — i.e.
-          "this response carries a handle naming the in-flight merge".  Caller-
-          side doc updates (skills/unblock/SKILL.md step 7, skills/merge-queue/
-          SKILL.md §5, which still say to submit-then-poll and to merge_cancel
-          on the attached request_id unconditionally) are tracked by follow-up
-          ticket ``tkt_0RRWDD1N3YS9NQTZ8NNEGWHKT8`` — those files are outside
-          task 3148's lock set.
+          "this response carries a handle naming the in-flight merge".  Both
+          caller-side docs (skills/unblock/SKILL.md step 7;
+          skills/merge-queue/SKILL.md "Poll for completion" + §5) consume
+          this disclosure — picking the poll handle and gating
+          ``merge_cancel`` off ``poll_by``/``pollable`` rather than assuming
+          submit-then-poll-by-request_id and an unconditional
+          ``merge_cancel`` on the attached request_id.
         - Duplicate-in-verify reject (C3/D3): ``{error, code='duplicate_in_verify',
           existing_mr, existing_sha, verify_age_secs, hint='merge_cancel then
           resubmit'}``.  Returned when a *newer* SHA for the branch is submitted
@@ -1404,10 +2488,19 @@ def create_server(
           that verify has been running.  Cancel it (merge_cancel) then resubmit.
         - Already merged: ``{status='already_merged', commit, reason='',
           conflict_details='', push_status=None}``.  Either the branch tip is
-          already an ancestor of main (fast-path — no enqueue, no request_id)
+          already an ancestor of main AND the branch is not degenerate — i.e.
+          it advanced past its recorded ``branch_base_sha``; a zero-commit
+          branch is parked at an OLD main commit, which satisfies ancestry
+          while carrying none of the task's work (task 3103)
+          (fast-path — no enqueue, no request_id)
           or the worker detected the branch was already merged via merge marker
           (worker-path — also carries request_id and a None commit from
-          outcome.merge_sha).  All keys are present in both paths; callers
+          outcome.merge_sha).  The degeneracy guard REDIRECTS a degenerate
+          branch from the fast path to the worker rather than eliminating it:
+          the worker reaches ``already_merged`` by its own ancestry
+          short-circuit, so this status is still reachable for that shape — but
+          it arrives with ``commit=None`` and a request_id instead of the
+          parked foreign SHA.  All keys are present in both paths; callers
           can safely read reason/conflict_details/push_status without KeyError.
         """
         if merge_queue is None:
@@ -1420,6 +2513,9 @@ def create_server(
         # resolves at runtime because the escalation server is hosted inside the
         # orchestrator process; it is unresolvable in escalation's standalone
         # typecheck env (orchestrator is not on its path), hence the suppression.
+        from orchestrator.landing_evidence import (  # type: ignore[reportMissingImports]
+            branch_is_degenerate,
+        )
         from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
             MergeOutcome,
             MergeRequest,
@@ -1461,9 +2557,121 @@ def create_server(
                 'conflict_details': '',
                 'push_status': None,
             }
-            if resolved_tip is not None and await git_ops_for_scan.is_ancestor(
+            # Degeneracy guard (task 3103).  Gates BOTH fast-path arms,
+            # deliberately.  patch_content_contained runs
+            # `git cherry <main> <tip>` and returns True when no `+` lines
+            # appear, which for a ZERO-COMMIT branch is true VACUOUSLY (git
+            # emits nothing), so gating only the is_ancestor arm would leak the
+            # degenerate branch into the backstop and still return
+            # {status:'already_merged', commit:<parked foreign SHA>} — a phantom
+            # done on a WRITE path (the runbooks treat already_merged the same
+            # as done and stamp done_provenance from result['commit']).  The
+            # 2945 backstop's own logic is untouched: a rebased landing has
+            # commits beyond its base, so it is non-degenerate by construction
+            # and this guard never fires on it.
+            #
+            # Evaluated LAST in each arm, and memoized across the two (review
+            # #1).  The guard's only power is to SUPPRESS an already_merged
+            # return, so it is pure cost on the overwhelmingly common
+            # submission where neither arm hits.  Hoisting it above the block
+            # made every merge_request pay a scheduler.get_task round-trip —
+            # a Taskmaster MCP dispatch with an internal timeout=15
+            # (scheduler.py:2485) — on the submit path.  Ordering it after the
+            # arm test is logically identical (`not degenerate and (A or B)`
+            # ≡ `(A and not degenerate) or (B and not degenerate)`) and pays
+            # that cost only when an arm is about to return.
+            #
+            # Fail-soft with its OWN try/except (merge_request's fast-path has
+            # no enclosing fire-safe wrapper): a probe fault must never break
+            # submission.
+            #
+            # What declining the fast path actually does.  NOT "the worker
+            # re-detects already-merged, a redundant no-op merge" — the worker
+            # performs no merge at all here.  merge_queue.py:5616 finds
+            # effective_tip (the parked base) an ancestor of main;
+            # _already_merged_is_genuine (:5455) resolves candidate_tip to that
+            # same parked base and returns True at its FIRST ancestry check
+            # (:5515); :5650 returns a terminal MergeOutcome('already_merged')
+            # with merge_sha=None, which the terminal-outcome block below maps
+            # to {'status':'already_merged', 'commit': None, 'request_id': ...}.
+            # A degenerate branch is therefore REDIRECTED to the worker, not
+            # eliminated, and this guard buys exactly three things:
+            #   (i)   the submit-time response can no longer carry the parked
+            #         foreign SHA as 'commit', which skills/unblock/SKILL.md
+            #         stamps verbatim as done_provenance={"commit": ...} — a
+            #         fabricated provenance record pointing at an unrelated
+            #         task's commit;
+            #   (ii)  the submission becomes an auditable queue record (a
+            #         request_id and a merge_queued event) instead of a silent
+            #         submit-time short-circuit;
+            #   (iii) on the worker path 'commit' is None, which routes that
+            #         same runbook clause to its exact-subject marker search —
+            #         empty for a genuinely unmerged branch — and thence to a
+            #         {"note": ...} provenance rather than a SHA.
+            # Residual, stated plainly: 'status' is still 'already_merged',
+            # which the runbooks treat as terminal success, so the phantom-done
+            # hole is narrowed, not closed.  Follow-up
+            # tkt_0RSHM98C6F78MW4J0SK3S29YZG; single fix point
+            # merge_queue.py:5515.
+            #
+            # Why this task does NOT instead gate _already_merged_is_genuine on
+            # branch_is_degenerate: that makes the worker fall THROUGH and
+            # merge.  _classify_branch_presence (merge_queue.py:3939) returns
+            # None because the ref is present, and `git merge --no-ff
+            # <ancestor>` is a no-op ("Already up to date.", rc 0, HEAD
+            # unchanged), so merge_to_main's `git rev-parse HEAD`
+            # (git_ops.py:9306) reads back that unchanged main HEAD and reports
+            # MergeResult(success=True, merge_commit=<unrelated main commit>).
+            # That converts today's already_merged/None into a 'done' carrying
+            # a real-looking foreign SHA — strictly worse — and burns a
+            # head-of-line verify slot on a guaranteed no-op.  Long form lives
+            # in the ticket above.
+            _degenerate_verdict: bool | None = None
+
+            async def _declined() -> bool:
+                """True iff the branch is degenerate → decline the fast path.
+
+                Memoized so the two arms share one scheduler round-trip and
+                one verdict.  ``branch_tip_sha=resolved_tip`` hands the probe
+                the tip the arm above just tested, so the degeneracy verdict
+                and the ancestry/patch-id evidence it gates are computed
+                against the SAME observed SHA (review #2) — a warm-lane
+                reseed between two independent ref reads cannot split them.
+                """
+                nonlocal _degenerate_verdict
+                if _degenerate_verdict is not None:
+                    return _degenerate_verdict
+                try:
+                    # Derive the id from the branch, exactly as merge_status
+                    # does (server.py `tid = full_branch.removeprefix(prefix)`),
+                    # NOT from the caller-supplied task_id parameter (review
+                    # #6).  merge_request takes task_id and branch as two
+                    # independent parameters; keying the metadata off one and
+                    # the tip off the other would compare task X's recorded
+                    # branch_base_sha against task Y's branch tip, silently
+                    # disabling the guard on any mismatched submission.  The
+                    # branch is the single source of truth here because it is
+                    # what resolved_tip was read from.
+                    _degenerate_verdict = await branch_is_degenerate(
+                        git_ops_for_scan, full_branch,
+                        await _git_authority_task_metadata(
+                            full_branch.removeprefix(orch_config.git.branch_prefix),
+                            site='merge_request',
+                        ),
+                        branch_tip_sha=resolved_tip,
+                    )
+                except Exception:
+                    logger.warning(
+                        'merge_request: degeneracy probe failed for %s — proceeding '
+                        'as non-degenerate',
+                        full_branch, exc_info=True,
+                    )
+                    _degenerate_verdict = False
+                return _degenerate_verdict
+
+            if (resolved_tip is not None and await git_ops_for_scan.is_ancestor(
                 resolved_tip, orch_config.git.main_branch
-            ):
+            ) and not await _declined()):
                 return already_merged_response
             # Rebased-landing backstop (task 2945): a branch whose content
             # landed on main as a rebased/cherry-picked commit is NOT a literal
@@ -1473,9 +2681,9 @@ def create_server(
             # resubmission at the door — NO enqueue, NO merge_queued event, same
             # already_merged shape as the ancestor arm.  Fail-open: any git
             # error → False → falls through to the normal coalesce/enqueue path.
-            if resolved_tip is not None and await patch_content_contained(
+            if (resolved_tip is not None and await patch_content_contained(
                 resolved_tip, orch_config.git.main_branch, git_ops_for_scan
-            ):
+            ) and not await _declined()):
                 return already_merged_response
 
         # module_configs_or_empty normalises the post-1405 None sentinel (direct-
@@ -1728,8 +2936,10 @@ def create_server(
         # Resolved within clamp → fall through to terminal outcome shape below.
         # 'commit' (outcome.merge_sha) is included for shape convergence with the
         # fast-path already_merged response.  It is None for most statuses and for
-        # the worker-produced already_merged case (merge marker path returns no SHA);
-        # it is non-None for 'done' and 'done_wip_recovery' where main was advanced.
+        # the worker-produced already_merged case (neither the merge-marker path
+        # nor the ancestry short-circuit that a degenerate branch takes returns a
+        # SHA); it is non-None for 'done' and 'done_wip_recovery' where main was
+        # advanced.
         result: dict[str, Any] = {
             'status': outcome.status,
             'request_id': merge_req.request_id,
@@ -2349,17 +3559,38 @@ def create_server(
     def _found_on_main_response(request_id: str | None, merge_sha: str) -> dict[str, Any]:
         """Build the git-authority Tier-3.5 done/found_on_main response.
 
-        ``merge_sha`` semantics differ between the two resolution paths:
+        ``merge_sha`` is a commit ON MAIN on both resolution paths, with one
+        explicit exception stated below (task 3103):
 
-        - **Live-branch path** (``is_ancestor`` hit): ``merge_sha`` is the
-          *branch tip* SHA — an ancestor of main but, for ``--no-ff`` merges,
-          NOT the merge-commit SHA (they are distinct commits).
-        - **Deleted-branch path** (``find_merge_marker`` hit): ``merge_sha``
-          is the *merge-commit* SHA found on main via ``git log``.
+        - **Live-branch path** (``is_ancestor`` hit): the citation commit
+          discovered by ``validate_landing_evidence`` — a commit on main
+          whose subject cites the task.
+        - **Deleted-branch path** (``find_merge_marker`` hit): the
+          merge-commit SHA found on main via ``git log``.
 
-        Callers that specifically need the merge commit (e.g. for provenance
-        that must reference the commit on main's first-parent chain) should
-        prefer the deleted-branch path's value or resolve via ``git log``.
+        Both are effect-present-checked against current main HEAD before
+        being returned, so ``merge_sha`` is safe to record as provenance
+        as-is.  (Before task 3103 the live-branch path returned the *branch
+        tip*, which for a ``--no-ff`` merge is a distinct commit that is not
+        on main's first-parent chain — callers were told to prefer the
+        deleted-branch path's value.  That caveat no longer applies.)
+
+        **The one exception — ``git.commit_citation_pattern == ''``.**  That
+        is the documented per-project opt-out for projects with no citation
+        convention (config.py; ``find_task_citation_commit`` honours it by
+        returning None for everything, so running the gate would reject
+        unconditionally and turn this tier into dead code).  On that setting
+        the live-branch path skips the citation gate entirely and
+        ``merge_sha`` is the raw BRANCH TIP, neither citation-discovered nor
+        effect-present-checked — i.e. exactly the pre-3103 ``--no-ff`` wart,
+        deliberately retained as the price of the opt-out (the degeneracy
+        guard still applies).  Do not read the paragraphs above as
+        unconditional: on such a project a caller stamping ``merge_sha`` as
+        provenance is recording a branch tip, and a reverted landing is
+        indistinguishable from a live one (review #4).  The opt-out is
+        ``''`` only; ``None`` means "use the built-in default pattern" and
+        keeps the full guarantee.  Both SKILL.md runbooks carry the same
+        exception.
         """
         return {
             'state': 'done',
@@ -2369,6 +3600,52 @@ def create_server(
             'merge_sha': merge_sha,
             'outcome': 'found_on_main',
         }
+
+    async def _git_authority_task_metadata(tid: str, *, site: str) -> dict[str, Any]:
+        """Best-effort task metadata for the git-authority guards (task 3103).
+
+        Returns ``{}`` on EVERY failure mode — no harness, no ``scheduler``
+        attribute, ``get_task`` raising, or a None/metadata-less task — and
+        never raises.  A scheduler fault must degrade a single guard, not
+        swallow the whole probe.
+
+        ``{}`` deliberately FAILS OPEN out of the degeneracy check.  On the
+        ``merge_status`` path it then falls THROUGH to the citation gate,
+        which is git-only and needs no task metadata; on the
+        ``merge_request`` fast path there is no citation gate, so the block
+        simply reverts to its pre-3103 ancestry/patch-id behaviour.  Either
+        way this is exact parity with the harness, which treats an absent or
+        non-40-hex ``branch_base_sha`` as "no degeneracy signal" rather than
+        as grounds to reject: a metadata fault must never fabricate a
+        confident answer, and must never hard-fail a genuinely merged branch.
+
+        Args:
+            tid: Bare task id (no ``task/`` prefix).  Both callers derive it
+                from the branch ref they resolved the tip from, so the
+                metadata and the tip always describe the same branch.
+            site: The calling tool (``'merge_status'`` / ``'merge_request'``),
+                interpolated into the degradation warning.  Without it a
+                scheduler fault on the SUBMIT path was logged as a
+                merge_status failure, so an operator grepping for a
+                submit-path degradation would not find it (review #3).
+        """
+        if harness is None:
+            return {}
+        scheduler = getattr(harness, 'scheduler', None)
+        if scheduler is None:
+            return {}
+        try:
+            task = await scheduler.get_task(tid)
+        except Exception:
+            logger.warning(
+                '%s: scheduler.get_task(%s) failed — proceeding without task '
+                'metadata (degeneracy check skipped)',
+                site, tid, exc_info=True,
+            )
+            return {}
+        if not task:
+            return {}
+        return task.get('metadata') or {}
 
     @mcp.tool()
     async def merge_status(
@@ -2391,16 +3668,40 @@ def create_server(
         ``orch_config.git.branch_prefix`` unless the value already starts
         with the prefix — the same shape-tolerant rule shared with
         ``recover_pending_merges``), then:
-        - If the branch still exists: calls ``is_ancestor(tip, main)``.
-          An additional ``tip != main_tip`` guard prevents a false-positive
-          ``done`` when the branch sits at exactly main's HEAD with no extra
-          commits (a commit is its own ancestor).  On hit →
-          state='done', kind='found_on_main',
-          merge_sha=<branch-tip SHA>.
-          Note: for ``--no-ff`` merges the branch tip is NOT the merge-commit;
-          see ``_found_on_main_response`` for the semantic distinction.
+        - If the branch still exists: calls ``is_ancestor(tip, main)``, then
+          applies THREE guards in order (task 3103 brought the last two to
+          parity with the orchestrator harness's already-landed dispatch
+          gate, which has had them since task 1226):
+            1. ``tip != main_tip`` — a branch sitting at exactly main's HEAD
+               satisfies ``is_ancestor`` trivially (a commit is its own
+               ancestor) but nothing has been merged;
+            2. NOT degenerate — a tip still equal to the recorded
+               ``branch_base_sha`` proves zero commits were ever pushed, so
+               the branch is merely parked at an OLD main commit (which IS an
+               ancestor of main and IS distinct from main_tip, so guard 1
+               does not catch it);
+            3. ``validate_landing_evidence`` DISCOVERY mode — a commit on
+               main must positively cite the task and its effect must still
+               be present at main HEAD.
+          On hit → state='done', kind='found_on_main',
+          merge_sha=<the citation commit on main>.
+          Guards 2 and 3 are independent and both required: a re-seeded
+          branch is non-degenerate yet uncited, while a degenerate branch may
+          still have a citing commit on main.  When
+          ``git.commit_citation_pattern`` is ``''`` (the documented
+          per-project opt-out) guard 3 is skipped and merge_sha is the branch
+          tip — not a commit on main, and not effect-present-checked; guard 2
+          still applies.  See ``_found_on_main_response`` for what that costs
+          a caller stamping merge_sha as provenance.
         - If the branch ref is gone (tip is None): calls ``find_merge_marker``
-          which searches git log for the merge commit subject.
+          which searches git log for the merge commit subject.  On hit, two
+          further guards (task 3103, mirroring the harness marker arm):
+          the marker must NOT predate the recorded ``branch_base_sha`` (else
+          the branch was deleted and recreated under the same id and the
+          marker belongs to a previous incarnation), and
+          ``validate_landing_evidence`` CANDIDATE mode must find the marker's
+          effect still present at main HEAD (the marker's subject match
+          already establishes attribution).
           On hit → state='done', kind='found_on_main',
           merge_sha=<merge-commit SHA on main>.
         Fire-safe: any git failure degrades to the honest Tier-4 unknown
@@ -2413,9 +3714,9 @@ def create_server(
         Live entries also carry: position, enqueued_at, eta_seconds.
         Terminal entries carry: outcome (raw state), finished_at.
         git-authority terminal shape: state='done', kind='found_on_main',
-            merge_sha=<branch-tip or merge-commit SHA — see
-            ``_found_on_main_response`` docstring for path-specific
-            semantics>, outcome='found_on_main'.
+            merge_sha=<a commit ON MAIN — the discovered citation or the
+            merge marker; see ``_found_on_main_response``>,
+            outcome='found_on_main'.
         Unknown carries: hint.
         """
         # Validation — at least one key required
@@ -2494,15 +3795,92 @@ def create_server(
                     full_branch = canonical_queued_branch_name(key, prefix)
                     tip = await git_ops.resolve_branch_sha(full_branch)
                     main_tip = await git_ops.resolve_branch_sha(orch_config.git.main_branch)
+                    tid = full_branch.removeprefix(prefix)
+                    # Runtime-only reverse import: orchestrator depends on escalation,
+                    # not vice versa, so this lazy import deliberately avoids a static
+                    # cycle (same shape as server.py:1423 / :2049 / :2148).  It resolves
+                    # at runtime because the escalation server is hosted inside the
+                    # orchestrator process.  An ImportError is an Exception and therefore
+                    # already degrades to the honest Tier-4 unknown via the wrapper below.
+                    from orchestrator.landing_evidence import (  # type: ignore[reportMissingImports]
+                        branch_is_degenerate,
+                        is_valid_sha_40,
+                        validate_landing_evidence,
+                    )
                     if (tip is not None and tip != main_tip
                             and await git_ops.is_ancestor(tip, orch_config.git.main_branch)):
                         # Live branch is already an ancestor of main (normal merged case).
                         # tip != main_tip guards against the no-op case: a branch sitting at
                         # exactly main's HEAD satisfies is_ancestor trivially (a commit is
                         # its own ancestor) but nothing has been merged.
-                        # merge_sha = branch tip (NOT the merge commit for --no-ff; see
-                        # _found_on_main_response docstring for the semantic distinction).
-                        return _found_on_main_response(request_id, tip)
+                        # Degeneracy guard (task 3103): a tip still equal to the
+                        # recorded branch_base_sha proves ZERO commits were ever
+                        # pushed beyond the creation point.  Such a branch is parked
+                        # at an OLD main commit, which makes it an ancestor of main
+                        # AND distinct from main_tip — both conjuncts above pass — so
+                        # without this guard the tier stamps a confident `done`
+                        # against a commit containing none of the task's work.  A
+                        # degenerate branch falls through to the honest Tier-4
+                        # unknown.  Runs FIRST and independently of the citation gate:
+                        # a degenerate branch whose task DOES have a citing commit on
+                        # main (reify 5493) is caught only by this ordering.
+                        # branch_tip_sha=tip: the probe judges degeneracy
+                        # against the SAME tip the is_ancestor check above
+                        # just ran on, instead of re-reading the ref (review
+                        # #2) — one subprocess fewer, and no window for a
+                        # warm-lane reseed to split the two observations.
+                        metadata = await _git_authority_task_metadata(
+                            tid, site='merge_status',
+                        )
+                        if not await branch_is_degenerate(
+                            git_ops, full_branch, metadata, branch_tip_sha=tip,
+                        ):
+                            # Citation gate.  Read the pattern off orch_config.git for
+                            # consistency with the adjacent .main_branch / .branch_prefix
+                            # reads (same object as git_ops.config in production).
+                            pattern = orch_config.git.commit_citation_pattern
+                            if pattern == '':
+                                # Documented per-project opt-out (config.py
+                                # commit_citation_pattern): '' disables the citation
+                                # check entirely for projects without citation
+                                # conventions, and find_task_citation_commit honours it
+                                # by returning None for EVERYTHING.  Running the gate
+                                # here would therefore reject unconditionally and turn
+                                # Tier 3.5 into dead code rather than merely un-gated —
+                                # a silent capability loss for an explicit opt-in.
+                                # Note: None means "use the built-in
+                                # DEFAULT_COMMIT_CITATION_PATTERN" and is NOT the
+                                # opt-out.  The degeneracy guard above still applies in
+                                # this mode.
+                                # The returned merge_sha is therefore the raw BRANCH
+                                # TIP — not a commit on main, and NOT effect-present
+                                # checked.  That is the price of the opt-out, and it is
+                                # called out explicitly in _found_on_main_response's
+                                # docstring and in both SKILL.md runbooks so a caller
+                                # on such a project does not stamp it as verified
+                                # provenance (review #4).
+                                return _found_on_main_response(request_id, tip)
+                            # DISCOVERY mode: a commit on main must positively cite the
+                            # task (FIX 2) AND its effect must still be present at main
+                            # HEAD (FIX 1', the task-1175 reverted-landing guard).  The
+                            # accepted evidence_sha is a commit ON MAIN, which also
+                            # retires the old wart of answering with the branch tip.
+                            # No escalation on reject — mirrors the harness ancestor
+                            # arm's silent-False, and merge_status is a read-only probe.
+                            verdict = await validate_landing_evidence(
+                                git_ops, tid, full_branch,
+                                branch_tip_sha=tip,
+                                pattern_template=pattern,
+                            )
+                            # `accepted` implies a non-None evidence_sha (see
+                            # LandingEvidenceVerdict), but assert it explicitly:
+                            # _found_on_main_response's merge_sha is a hard `str`,
+                            # and a contract violation must degrade to Tier-4
+                            # unknown rather than emit a `done` with a null sha.
+                            if verdict.accepted and verdict.evidence_sha is not None:
+                                return _found_on_main_response(
+                                    request_id, verdict.evidence_sha,
+                                )
                     elif tip is None:
                         # Branch ref gone — the canonical 4352 deleted-branch shape.
                         # find_merge_marker internally gates on branch existence so it only
@@ -2512,7 +3890,41 @@ def create_server(
                         # merge_sha = merge-commit SHA on main (via git log scan).
                         marker = await git_ops.find_merge_marker(full_branch)
                         if marker is not None:
-                            return _found_on_main_response(request_id, marker)
+                            metadata = await _git_authority_task_metadata(
+                                tid, site='merge_status',
+                            )
+                            branch_base_sha = metadata.get('branch_base_sha')
+                            # Predates-this-incarnation veto (task 3103, mirroring
+                            # the harness marker arm): the branch was deleted and
+                            # recreated under the SAME task id, so a marker older
+                            # than this incarnation's base attributes a previous
+                            # run's merge to the current task.  is_valid_sha_40 sits
+                            # on the LEFT of the `and` so a missing or malformed
+                            # base never reaches is_ancestor with a bad argument.
+                            if not (
+                                is_valid_sha_40(branch_base_sha)
+                                and await git_ops.is_ancestor(marker, branch_base_sha)
+                            ):
+                                # CANDIDATE mode: the marker's subject match already
+                                # establishes attribution, so only the FIX 1'
+                                # effect-present guard remains — closing the
+                                # task-1175 clobber where a reverted merge still
+                                # read as a genuine landing.  No escalation on
+                                # reject (unlike the harness marker path):
+                                # merge_status is a read-only probe with no write
+                                # side, so a reject degrades to Tier-4 unknown.
+                                verdict = await validate_landing_evidence(
+                                    git_ops, tid, full_branch,
+                                    branch_tip_sha=None,
+                                    candidate_sha=marker,
+                                )
+                                # Same non-None assertion as the ancestor arm
+                                # above: reject a null evidence sha into Tier-4
+                                # unknown rather than into a `done` response.
+                                if verdict.accepted and verdict.evidence_sha is not None:
+                                    return _found_on_main_response(
+                                        request_id, verdict.evidence_sha,
+                                    )
                 except Exception:
                     logger.warning(
                         'merge_status: git-authority probe failed, returning unknown',

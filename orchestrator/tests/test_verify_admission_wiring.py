@@ -46,8 +46,14 @@ def _leg_for_cmd(cmd: str) -> str:
     active admission gate nice-wraps the test leg (``<nice argv> /bin/bash -c
     <shlex.quote(cmd)>``), so its captured cmd still CONTAINS ``_TEST_CMD``
     but is no longer equal to it. lint/type are never wrapped either way.
+
+    Checks ``'pytest'``/``'tests/'`` as two SEPARATE substrings rather than the
+    joined ``_TEST_CMD``: a ``verify_admission_pytest_n`` cap splices new flags
+    BETWEEN them (``pytest tests/`` -> ``pytest -n 8 tests/``), breaking
+    containment of the joined string and silently mislabelling every test leg
+    (task 4456; same rationale as test_verify_admission_pytest_n.py:56-66).
     """
-    if _TEST_CMD in cmd:
+    if 'pytest' in cmd and 'tests/' in cmd:
         return 'test'
     if _LINT_CMD in cmd:
         return 'lint'
@@ -75,6 +81,7 @@ class TestVerifyAdmissionAcquireWiring:
 
     @pytest.mark.real_verify_admission
     @pytest.mark.asyncio
+    @pytest.mark.usefixtures("code_default_config")
     async def test_acquire_called_once_before_test_leg_only(self, tmp_path):
         events: list = []
 
@@ -185,6 +192,7 @@ class TestVerifyAdmissionAcquireWiring:
 
     @pytest.mark.real_verify_admission
     @pytest.mark.asyncio
+    @pytest.mark.usefixtures("code_default_config")
     async def test_fail_open_when_slots_dir_unmkdirable(self, tmp_path):
         run_cmd_calls: list[str] = []
 
@@ -227,6 +235,7 @@ class TestVerifyAdmissionAcquireWiring:
 
     @pytest.mark.real_verify_admission
     @pytest.mark.asyncio
+    @pytest.mark.usefixtures("code_default_config")
     async def test_real_acquire_serializes_test_leg_across_concurrent_verifies(self, tmp_path):
         slots_dir = tmp_path / 'slots'
         config = OrchestratorConfig(
@@ -324,6 +333,7 @@ class TestNicePrefixIntegration:
 
     @pytest.mark.real_verify_admission
     @pytest.mark.asyncio
+    @pytest.mark.usefixtures("code_default_config")
     async def test_task_role_wraps_test_leg_with_nice_and_bash_c(self, tmp_path):
         captured_cmds: list[str] = []
 
@@ -488,6 +498,7 @@ class TestBackgroundRoleWiring:
 
     @pytest.mark.real_verify_admission
     @pytest.mark.asyncio
+    @pytest.mark.usefixtures("code_default_config")
     async def test_background_role_acquires_slot_and_applies_nice_19_tier(self, tmp_path):
         events: list = []
 

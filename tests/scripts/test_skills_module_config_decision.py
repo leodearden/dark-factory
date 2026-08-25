@@ -111,9 +111,6 @@ import posixpath
 import shlex
 import subprocess
 
-from orchestrator import verify_cmd
-from orchestrator.config import _discover_module_configs
-
 # The skills/ ruff probe itself, imported so the DECIDING FACT can be asserted
 # against its RUNTIME target list rather than only against its path. Resolves
 # because tests/scripts/conftest.py puts this directory on sys.path (pytest's
@@ -122,6 +119,9 @@ from orchestrator.config import _discover_module_configs
 # for systemd_unit_invariants. A bare `import`, never an importorskip: if the
 # probe stops importing, this guard must fail loudly.
 import test_root_lint_covers_nonmember_py as skills_ruff_probe
+from orchestrator.config import _discover_module_configs
+
+from orchestrator import verify_cmd
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 
@@ -174,6 +174,9 @@ SKILLS_CONSUMING_TESTS = (
     SKILLS_PY_RUFF_PROBE,
     # Reads skills/spawn/spawn-claude.sh to cross-check a bash/Python mirror.
     "scripts/tests/test_legibility_inventory.py",
+    # LOADS AND EXECUTES the real skills/factory-init/scripts/find_escalation_port.py
+    # via importlib (task 3705) — a REAL consumer, not a synthetic mention.
+    "tests/scripts/test_find_escalation_port.py",
 )
 
 
@@ -232,9 +235,18 @@ def test_no_skills_prefixed_module_config_is_registered() -> None:
     if discovery's excluded-directory pruning ever changes such that a
     committed ``skills/orchestrator.yaml`` stops being walked.
 
-    ``skills`` (prefix depth 1) is well inside the effective ``lock_depth`` of
-    4, and ``_discover_module_configs`` only skips ``prefix == '.'``, so such a
+    ``skills`` (prefix depth 1) is inside ``lock_depth`` at every layer the
+    config can resolve — the pydantic Field default, the package-bundled
+    ``defaults.yaml``, and this project's override alike — and
+    ``_discover_module_configs`` only skips ``prefix == '.'``, so such a
     config WOULD be discovered. Registering one is feasible; it is declined.
+
+        CORRECTED IN PLACE (task 3866): this used to read "the effective
+        ``lock_depth`` of 4", which stopped being true when
+        ``dark-factory-orchestrator.yaml`` moved that knob to 12. The
+        conclusion never depended on the number — depth 1 is inside 2, 4 and
+        12 alike — so it is now stated as the invariant rather than re-pinned,
+        and the next retune falsifies nothing here.
 
     TWO REASONS, both measured (task 3554, full record in the DECIDED block):
 
@@ -441,7 +453,8 @@ def _pytest_collected_dirs(cmd: str) -> list[str]:
     base main ``7c6039327d`` rather than assumed:
 
     1. ``--directory``. Most module ``test_command``s are
-       ``uv run --project X --directory X pytest tests/ ...`` — the target
+       ``uv run --directory X pytest tests/ ...`` (task 3830 retired the
+       former ``--project X --directory X`` pairing) — the target
        ``tests/`` is relative to ``X``, not to the worktree root. Ignoring the
        ``--directory`` prefix would resolve ``orchestrator``'s target to a
        repo-root ``tests/`` that no consumer test lives under, silently

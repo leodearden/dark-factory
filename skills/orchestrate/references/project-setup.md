@@ -166,7 +166,7 @@ When the scheduler acquires a lock for a task touching `crates/reify-core/src/fo
 
 ### Picking values: the `analyze_modules` helper
 
-Guessing the right `max_per_module` for each hot crate is hard and the best way to ground the numbers is measured conflict rates from `runs.db`. The helper reads recent `lock_acquired` / `lock_released` / `task_skipped` events and prints a table suggesting per-module overrides:
+Guessing the right `max_per_module` for each hot crate is hard and the best way to ground the numbers is measured conflict rates from `runs.db`. The helper reads recent `lock_acquired` / `lock_released` / `task_skipped` / `service_restart` events and prints a table suggesting per-module overrides:
 
 ```bash
 uv run --project orchestrator python -m orchestrator.analyze_modules \
@@ -175,12 +175,16 @@ uv run --project orchestrator python -m orchestrator.analyze_modules \
 
 Output columns:
 
-- `module` — first-path-component grouping
+- `module` — the lock module, exactly as the event payload carries it: the depth-`lock_depth` path that `module_overrides` is keyed by, so a row's label is directly pasteable into the override file
 - `dispatches` — number of `lock_acquired` events
 - `skipped` — number of `task_skipped` events where this module appeared in the modules field
-- `conflict` — `skipped / dispatches` ratio (0 = idle, >1 = hot)
+- `conflict` — `skipped / dispatches` ratio (0 = idle, >1 = hot), or `n/a` for a module that was skipped but never dispatched at all in the window — the ratio is undefined there, not zero, and those rows sort first
 - `avg_hold_s` — mean lock-held duration
-- `suggest` — heuristic suggested `max_per_module` (1 for `conflict >= 2.0`, 2 for `>= 0.5`, 3 for `>= 0.1`, 4 otherwise)
+- `samples` — how many hold spans that mean is over — the denominator `trunc` is a share of
+- `trunc` — how many of those hold samples are right-censored **lower bounds** rather than clean releases
+- `suggest` — heuristic suggested `max_per_module` (1 for a skipped-but-never-dispatched module, then 1 for `conflict >= 2.0`, 2 for `>= 0.5`, 3 for `>= 0.1`, 4 otherwise)
+
+Hold statistics include spans an *era boundary* ended — a `service_restart` row, or a run change — because a lock really did block others up to that point. Those are the `trunc` count: real lower bounds, so `avg_hold_s` is an under-estimate by however much of it they make up — read `trunc` against `samples` to see how much that is (`--json` publishes the ratio directly as `truncated_fraction`, alongside `hold_samples`). Holds still open at the end of the window are excluded entirely, since nothing observed their end.
 
 Pass `--json` for machine-readable output, `--min-dispatches N` to drop quiet modules.
 

@@ -2497,9 +2497,10 @@ class TestB5AttributionSkew:
 
 # =========================================================================
 # TestLeaseIsCurrent — gate.lease_is_current(lease) detects a lease gone
-# stale from a mid-flight account re-transition (PRD §7.4, task W4-δ). This
-# is the detectability primitive consumer ε's InvokeSlot.report() Q4
-# log-and-proceed fail-safe hooks into.
+# stale from either of two signals: a mid-flight account re-transition, or
+# the leased account no longer being present in gate._accounts (PRD §7.4,
+# task W4-δ). This is the detectability primitive consumer ε's
+# InvokeSlot.report() Q4 log-and-proceed fail-safe hooks into.
 # =========================================================================
 
 
@@ -2522,3 +2523,20 @@ class TestLeaseIsCurrent:
 
         assert gate.lease_is_current(lease) is False
         assert lease.generation != acct.generation
+
+    async def test_stale_when_account_removed_from_account_list(self):
+        """Pins the `acct is not None` branch: a lease naming an account
+        no longer in `gate._accounts` is stale."""
+        gate = make_gate(['a', 'b'])
+        async with gate.invoke_slot() as slot:
+            lease = slot.lease
+
+        assert isinstance(lease, AccountLease)
+        assert gate.lease_is_current(lease) is True
+
+        # Drop only the leased account, resolved by name; the sibling stays.
+        gate._accounts[:] = [a for a in gate._accounts if a.name != lease.name]
+        assert all(a.name != lease.name for a in gate._accounts)
+        assert gate._accounts, 'sibling account must survive — this is not the empty-gate case'
+
+        assert gate.lease_is_current(lease) is False

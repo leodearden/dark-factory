@@ -26,11 +26,25 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import textwrap
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).parents[2]
+# APPEND, never insert(0, ...): the repo root must stay LAST on sys.path or the
+# subproject directories resolve as namespace packages shadowing their own
+# src/<pkg>/ — the failure the root conftest.py docstring exists to prevent.
+if str(REPO_ROOT) not in sys.path:
+    sys.path.append(str(REPO_ROOT))
+
+from df_pytest_isolation import assert_synthetic_units  # noqa: E402
+
 SCRIPT = REPO_ROOT / "scripts" / "restart-all-orchestrators.sh"
+# The ORIGINAL synthetic literal, and the precedent task 3799's allowlist prefix
+# was chosen around: `orchestrator-fake` with no stem is a legal fixture name, so
+# this file needed no rename. Left as a literal rather than routed through
+# synthetic_unit() because it has no stem to name; _run_script below still puts
+# it through the same checker every other fixture name goes through.
 UNIT_NAME = "orchestrator-fake.service"
 
 # Stateful fake `systemctl`: `list-units` reports one fake orchestrator unit;
@@ -127,6 +141,14 @@ def _run_script(
     env["PATH"] = f"{bin_dir}{os.pathsep}{env['PATH']}"
     env["FAKE_SYSTEMCTL_MARKER"] = str(tmp_path / "restarted.marker")
     env["FAKE_SYSTEMCTL_SCENARIO"] = scenario
+    # The PATH-shimming seam for this file (task 3799): the unit name reaches the
+    # fake through the environment rather than through _make_fake_systemctl, so
+    # the check belongs here. Same hazard as the sibling factories -- the fake
+    # shadows `systemctl` only while its tmpdir lives on PATH.
+    assert_synthetic_units(
+        [UNIT_NAME],
+        where="tests/scripts/test_restart_all_orchestrators.py::_run_script",
+    )
     env["FAKE_SYSTEMCTL_UNIT"] = UNIT_NAME
     env["ORCH_FLEET_DEPLOY_CLOCK"] = str(clock_file)
     env["RESTART_VERIFY_TIMEOUT"] = verify_timeout

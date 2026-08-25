@@ -1,0 +1,49 @@
+{
+  "id": "reify_task_2325",
+  "name": "Implement OCCT FFI for center_of_mass and moment_of_inertia with density",
+  "project": "reify",
+  "project_root": "/home/leo/src/reify",
+  "pre_task_commit": "0cfbb2d73c8bac951315163794e8e02beb3c339f",
+  "post_task_commit": "",
+  "task_definition": {
+    "title": "Implement OCCT FFI for center_of_mass and moment_of_inertia with density",
+    "description": "Develop foreign function interface (FFI) bindings for calculating center of mass and moment of inertia using OCCT, incorporating density."
+  },
+  "verify_commands": {
+    "test": "cargo test --workspace",
+    "lint": "cargo clippy --workspace",
+    "typecheck": ""
+  },
+  "modules": [
+    "crates/reify-kernel-occt/cpp/occt_wrapper.cpp",
+    "crates/reify-kernel-occt/cpp/occt_wrapper.h",
+    "crates/reify-kernel-occt/src/ffi.rs",
+    "crates/reify-kernel-occt/src/lib.rs",
+    "crates/reify-test-support/src/mocks.rs",
+    "crates/reify-types/src/geometry.rs"
+  ],
+  "complexity": null,
+  "cohort": "fable-trial-v2-hard",
+  "provenance": {
+    "merge_sha": "",
+    "sampled_at": "2026-08-08T00:00:00+00:00",
+    "seed": 3631,
+    "plan_source": "unavailable",
+    "baseline_source": "status_autocommit",
+    "task_status": "done",
+    "reference_unavailable": "No single \"Merge task/2325 into main\" commit exists in /home/leo/src/reify (SPLIT / direct-landed, or several merges carry this id), so no landed post-commit is available to diff against. This fixture is planRate-only: it is scored on plan production, never on reference-diff similarity. Its pre_task_commit came from baseline rung 'status_autocommit'."
+  },
+  "verify_outcome": {
+    "source": "unavailable",
+    "passed": null,
+    "commands": {
+      "test": "cargo test --workspace",
+      "lint": "cargo clippy --workspace",
+      "typecheck": ""
+    },
+    "reason": "No landed post-commit is available for task 2325 (terminal status 'done'), so there is no commit at which these gates can be claimed to have passed. This fixture is planRate-only and is never scored against a landed verify outcome; the commands are carried for provenance only."
+  },
+  "plan": null,
+  "max_architect_turns": 120,
+  "timeout_minutes": 180
+}

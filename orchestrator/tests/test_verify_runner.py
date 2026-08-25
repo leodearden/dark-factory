@@ -1144,6 +1144,192 @@ class TestVerifyRunnerPool:
         assert data['retry_subset_sizes'] is None
 
 
+@pytest.mark.asyncio
+class TestDispatchChainItems:
+    """``chain_items`` on the merge_verify event (task 3185, PRD γ decision 8).
+
+    A 1-INDEXED count of items in the tree that was actually verified, so the
+    smallest truthful value is ``1`` — which is why the kwarg defaults to ``1``
+    and NOT to ``None`` the way ``depth``/``speculative`` do.  The PRD contract
+    is "``chain_items >= 1`` on EVERY merge verify", and the two merge_shadow.py
+    callers (:1254, :1368) thread no telemetry kwargs at all, so a ``None``
+    default would emit ``chain_items: null`` there and break both the contract
+    and η1's already-committed reader (scripts/merge-deep-canary-predicate.sh:84).
+
+    Template: ``test_dispatch_emits_retry_scope_for_narrowed_verify`` above —
+    including its explicit re-assertion of every pre-existing key, so a future
+    payload edit cannot silently drop one.
+    """
+
+    def _make_local_pool(self, **pool_kwargs):
+        """Return ``(pool, emitted)`` over a single passing local runner."""
+        from orchestrator.verify_runner import VerifyRunnerPool
+
+        fake_runner = MagicMock(spec=VerifyRunner)
+        fake_runner.name = 'local'
+        fake_runner.is_local = True
+        fake_runner.run_merge_verify = AsyncMock(return_value=_make_pass_result())
+
+        emitted = []
+        event_store = MagicMock()
+        event_store.emit = MagicMock(side_effect=lambda *a, **kw: emitted.append((a, kw)))
+        pool = VerifyRunnerPool(
+            [fake_runner], event_store=event_store, task_id='t-chain', **pool_kwargs,
+        )
+        return pool, emitted
+
+    async def test_bare_call_emits_chain_items_one_not_none(self):
+        """No telemetry kwargs → ``chain_items == 1`` (an int, never None).
+
+        This is the merge_shadow.py:1254 / :1368 case: those callers pass
+        nothing, and they are exactly the ones that make ">= 1 on EVERY merge
+        verify" a real contract rather than a wish.
+        """
+        from orchestrator.event_store import EventType
+
+        pool, emitted = self._make_local_pool()
+
+        await pool.dispatch('sha-bare', _make_spec())
+
+        (event_type,), kwargs = emitted[-1]
+        assert event_type == EventType.merge_verify
+        data = kwargs['data']
+        assert data['chain_items'] == 1
+        assert isinstance(data['chain_items'], int)
+        # ``chain_build_ms`` is the nullable companion: a bare dispatch chained
+        # nothing, so it paid no build.  Present-but-None, never absent, so a
+        # reader does a plain .get() with no per-event schema branching.
+        assert 'chain_build_ms' in data
+        assert data['chain_build_ms'] is None
+
+    async def test_explicit_chain_build_ms_is_emitted_verbatim(self):
+        """The per-round DISPATCH STALL reaches telemetry alongside chain_items.
+
+        Non-None implies a chain was built, so it always rides with
+        ``chain_items >= 2``; η1 reads the pair against drain-time so a
+        dispatch stall cannot be misattributed to verify time.
+        """
+        from orchestrator.event_store import EventType
+
+        pool, emitted = self._make_local_pool()
+
+        await pool.dispatch(
+            'sha-deep', _make_spec(), chain_items=3, chain_build_ms=1234,
+        )
+
+        (event_type,), kwargs = emitted[-1]
+        assert event_type == EventType.merge_verify
+        assert kwargs['data']['chain_build_ms'] == 1234
+        assert kwargs['data']['chain_items'] == 3
+
+    async def test_explicit_chain_items_is_emitted_verbatim(self):
+        from orchestrator.event_store import EventType
+
+        pool, emitted = self._make_local_pool()
+
+        await pool.dispatch('sha-deep', _make_spec(), chain_items=4)
+
+        (event_type,), kwargs = emitted[-1]
+        assert event_type == EventType.merge_verify
+        assert kwargs['data']['chain_items'] == 4
+
+    async def test_preexisting_keys_present_and_unchanged(self, tmp_path):
+        """The new key is ADDITIVE — every pre-2340/2837 key still rides along.
+
+        Copied from the retry_scope suite's re-assertion block so a future
+        payload edit cannot drop one silently.
+        """
+        from orchestrator.event_store import EventType
+
+        pool, emitted = self._make_local_pool()
+
+        debug_file = tmp_path / 'nextest-retry-debug.filter'
+        debug_file.write_text('\n'.join(['id::a', 'id::b']))  # 2 ids
+        narrowed_spec = dataclasses.replace(
+            _make_spec(),
+            verify_env={
+                'REIFY_VERIFY_RETRY_SCOPE': 'failed_only',
+                'REIFY_RUN_ALL_MEMBER_SUBSET': 'm1',
+                'REIFY_GUI_RETRY_SPECS': '',
+                'REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_DEBUG': str(debug_file),
+            },
+        )
+
+        await pool.dispatch(
+            'sha-all-keys', narrowed_spec,
+            attempt=1, depth=3, speculative=False, chain_items=5,
+        )
+
+        (event_type,), kwargs = emitted[-1]
+        assert event_type == EventType.merge_verify
+        data = kwargs['data']
+        assert data['chain_items'] == 5
+        # Pre-existing keys still present/unchanged.
+        assert data['runner'] == 'local'
+        assert data['merge_sha'] == 'sha-all-keys'
+        assert data['passed'] is True
+        assert 'duration_ms' in data
+        assert data['attempt'] == 1
+        assert data['depth'] == 3
+        assert data['speculative'] is False
+        assert data['retry_scope'] == 'failed_only'
+        assert data['retry_subset_sizes'] == {
+            'run_all': 1,
+            'gui': 0,
+            'nextest_debug': 2,
+            'nextest_release': None,
+        }
+
+    async def test_no_event_store_does_not_raise(self):
+        """``event_store=None`` still must not raise with the new kwarg."""
+        from orchestrator.verify_runner import VerifyRunnerPool
+
+        fake_runner = MagicMock(spec=VerifyRunner)
+        fake_runner.name = 'local'
+        fake_runner.is_local = True
+        fake_runner.run_merge_verify = AsyncMock(return_value=_make_pass_result())
+
+        bare_pool = VerifyRunnerPool([fake_runner], event_store=None)
+        result = await bare_pool.dispatch('abc123', _make_spec(), chain_items=3)
+
+        assert result.passed is True
+
+    async def test_survives_runner_unavailable_local_fallback(self):
+        """The value survives the RunnerUnavailable→local-fallback arm.
+
+        On that arm ``actual_runner`` differs from ``selected``
+        (verify_runner.py:2011-2024), and the emit happens AFTER the swap — so
+        this pins that the fallback path does not lose the caller's telemetry.
+        """
+        from orchestrator.verify_runner import RunnerUnavailable, VerifyRunnerPool
+
+        remote_fake = MagicMock(spec=VerifyRunner)
+        remote_fake.name = 'laptop'
+        remote_fake.is_local = False
+        remote_fake.run_merge_verify = AsyncMock(
+            side_effect=RunnerUnavailable('host down'),
+        )
+        local_fake = MagicMock(spec=VerifyRunner)
+        local_fake.name = 'local'
+        local_fake.is_local = True
+        local_fake.run_merge_verify = AsyncMock(return_value=_make_pass_result())
+
+        emitted = []
+        event_store = MagicMock()
+        event_store.emit = MagicMock(side_effect=lambda *a, **kw: emitted.append((a, kw)))
+        pool = VerifyRunnerPool(
+            [local_fake, remote_fake], event_store=event_store,
+        )
+
+        await pool.dispatch('sha-fallback', _make_spec(), chain_items=7)
+
+        assert len(emitted) == 1
+        (_, kwargs) = emitted[0]
+        data = kwargs['data']
+        assert data['runner'] == 'local'      # the fallback ran
+        assert data['chain_items'] == 7       # ...and telemetry survived it
+
+
 # ---------------------------------------------------------------------------
 # retry_scope_event_fields — merge_verify event honesty (task 2837, PRD D5)
 # ---------------------------------------------------------------------------

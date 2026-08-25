@@ -1310,20 +1310,43 @@ class TestMaybeScheduleShadowCompare:
         assert len(worker._shadow_compare_tasks) == 0
         assert not worker._shadow_state_path.exists()
 
-    # Empty warm_results → no-op
-    def test_empty_warm_results_no_op(self, tmp_path: Path) -> None:
+    # Empty warm_results (map-less land) + due → routes to the COARSE compare.
+    #
+    # FIX 2 (task 2886, PRD leaf δ §3.4): the historical empty-warm_results
+    # no-op is intentionally GONE.  Trivial-pass / remote-verdict lands have no
+    # per-test warm map yet CAN diverge, so a due map-less land must be sampled
+    # via the COARSE suite-level _run_coarse_shadow_compare (reach-back seam at
+    # orchestrator.merge_queue._run_coarse_shadow_compare) — never the per-test
+    # _run_shadow_compare.  (Authoritative FIX-2 coverage lives in
+    # test_merge_shadow.py::TestScheduleShadowCompareMapLess.)
+    @pytest.mark.asyncio
+    async def test_empty_warm_results_schedules_coarse_compare(
+        self, tmp_path: Path
+    ) -> None:
         worker = _make_worker_stub(tmp_path)
         req = MagicMock()
-        req.config = _make_shadow_config(tmp_path, shadow_compare_on=True)
+        # every_n=1 → the count leg is due on this first land (deterministic;
+        # does not lean on the nightly-clock-vs-wall-clock leg).
+        req.config = _make_shadow_config(tmp_path, every_n=1)
 
-        asyncio.run(
-            _maybe_schedule_shadow_compare(
+        coarse = AsyncMock(return_value=None)
+        per_test = AsyncMock(return_value=None)
+        with (
+            patch('orchestrator.merge_queue._run_coarse_shadow_compare', coarse),
+            patch('orchestrator.merge_queue._run_shadow_compare', per_test),
+        ):
+            await _maybe_schedule_shadow_compare(
                 worker, MagicMock(), req, 'sha', {}, None, None
             )
-        )
+            # A coarse compare task is scheduled for the map-less land.
+            assert len(worker._shadow_compare_tasks) == 1
+            task = next(iter(worker._shadow_compare_tasks))
+            await task
 
-        assert len(worker._shadow_compare_tasks) == 0
-        assert not worker._shadow_state_path.exists()
+        coarse.assert_awaited_once()
+        per_test.assert_not_called()
+        # Due path reset + persisted the cadence counter (no longer a no-op).
+        assert worker._shadow_state_path.exists()
 
     # _shadow_state_path is None (bare-harness worker) + knob ON → no-op, no raise
     def test_none_shadow_state_path_no_op(self, tmp_path: Path) -> None:

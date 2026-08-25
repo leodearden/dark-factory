@@ -1,11 +1,13 @@
 """Tests for reindex maintenance: GraphitiBackend stale-embedding queries and ReindexManager."""
 from __future__ import annotations
 
+import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _fm_helpers import assert_ro_query_only, extract_cypher, extract_params
 
+from fused_memory.backends.falkor_indices import vector_drop_statement
 from fused_memory.backends.graphiti_client import (
     EdgeNotFoundError,
     GraphitiBackend,
@@ -260,6 +262,17 @@ class TestUpdateEdgeEmbedding:
 # step-7: list_indices / drop_index
 # ---------------------------------------------------------------------------
 
+#: The MEASURED live ``CALL db.indexes()`` header (task 3706, 2026-08-06), taken
+#: read-only via ``GRAPH.RO_QUERY dark_factory "CALL db.indexes()"``.  Note that
+#: ``entitytype`` is index 6 and ``options`` is index 3 — the gap that hid the
+#: pre-3706 ``entity_type: row[3]`` mis-binding.  ``list_indices()`` now resolves
+#: these by NAME, so the order here is data, not a contract.
+LIVE_INDEXES_HEADER = [
+    [1, 'label'], [1, 'properties'], [1, 'types'], [1, 'options'], [1, 'language'],
+    [1, 'stopwords'], [1, 'entitytype'], [1, 'status'], [1, 'info'],
+]
+
+
 class TestListIndices:
     """GraphitiBackend.list_indices() returns parsed index records.
 
@@ -268,29 +281,46 @@ class TestListIndices:
     ``CALL db.indexes()`` on the ``GRAPH.RO_QUERY`` path lives in
     ``fused-memory/tests/test_list_indices_integration.py``
     (Task 530 / esc-486-49).
+
+    Column-binding and normalizer-composition tests live in
+    ``tests/test_falkor_indices.py::TestListIndicesColumnBinding`` (task 3706).
     """
 
     @pytest.mark.asyncio
     async def test_returns_index_list(self, mock_config, make_backend, make_graph_mock):
         backend = make_backend(mock_config)
-        # FalkorDB index records: [label, property, type, entity_type]
+        # The MEASURED live shape (task 3706, 2026-08-06, read-only via
+        # `GRAPH.RO_QUERY dark_factory "CALL db.indexes()"`): a 9-column header,
+        # `properties` a LIST, `types` a DICT of property -> list of index-type
+        # strings, and `entitytype` the string 'NODE'/'RELATIONSHIP' at index 6.
+        #
+        # This previously mocked 4-column rows with SCALAR type values
+        # (['Entity', 'name_embedding', 'VECTOR', 'NODE']) — a shape live
+        # FalkorDB never emits. Do not reintroduce it: that fiction is what let
+        # list_indices() bind entity_type to the `options` column unnoticed.
         rows = [
-            ['Entity', 'name_embedding', 'VECTOR', 'NODE'],
-            ['Entity', 'name', 'FULLTEXT', 'NODE'],
+            [
+                'Entity', ['name_embedding'], {'name_embedding': ['VECTOR']},
+                {'name_embedding': {}}, 'english', [], 'NODE', 'OPERATIONAL', {},
+            ],
+            [
+                'Entity', ['name'], {'name': ['FULLTEXT']},
+                {'name': {}}, 'english', [], 'NODE', 'OPERATIONAL', {},
+            ],
         ]
-        graph = make_graph_mock(rows)
+        graph = make_graph_mock(rows, header=LIVE_INDEXES_HEADER)
         backend._driver._get_graph = MagicMock(return_value=graph)
         result = await backend.list_indices(group_id='test')
         assert len(result) == 2
         assert result[0]['label'] == 'Entity'
-        assert result[0]['field'] == 'name_embedding'
-        assert result[0]['type'] == 'VECTOR'
+        assert result[0]['field'] == ['name_embedding']
+        assert result[0]['type'] == {'name_embedding': ['VECTOR']}
         assert result[0]['entity_type'] == 'NODE'
 
     @pytest.mark.asyncio
     async def test_returns_empty_when_no_indices(self, mock_config, make_backend, make_graph_mock):
         backend = make_backend(mock_config)
-        graph = make_graph_mock([])
+        graph = make_graph_mock([], header=LIVE_INDEXES_HEADER)
         backend._driver._get_graph = MagicMock(return_value=graph)
         result = await backend.list_indices(group_id='test')
         assert result == []
@@ -305,7 +335,14 @@ class TestListIndices:
     async def test_uses_ro_query_not_query(self, mock_config, make_backend, make_graph_mock):
         """list_indices uses ro_query (read-only path) and never calls graph.query."""
         backend = make_backend(mock_config)
-        graph = await assert_ro_query_only(backend, make_graph_mock, [], 'list_indices', group_id='test')
+        # The factory is wrapped rather than passed bare because list_indices()
+        # now resolves its columns by name and so needs a real header; the shared
+        # helper's own contract (ro_query awaited once, query never) is unchanged.
+        graph = await assert_ro_query_only(
+            backend,
+            lambda rows: make_graph_mock(rows, header=LIVE_INDEXES_HEADER),
+            [], 'list_indices', group_id='test',
+        )
         cypher = extract_cypher(graph.ro_query.call_args)
         assert 'db.indexes' in cypher
 
@@ -340,45 +377,163 @@ class TestDropIndex:
             await backend.drop_index('Entity', 'name_embedding', group_id='test')
 
 
+class TestDropVectorIndex:
+    """GraphitiBackend.drop_vector_index() issues the VECTOR-specific DROP verb.
+
+    The sibling ``drop_index`` above cannot serve VECTOR — measured, its
+    old-style form fails with ``no such index`` against a live one (see
+    ``drop_vector_indices``' docstring for the full measurement).
+
+    Statements are asserted against ``vector_drop_statement``'s output rather
+    than re-spelled here, so the byte-for-byte pinning lives in exactly one
+    place (``TestVectorDropStatement`` in ``test_falkor_indices.py``) and this
+    class pins the WIRING instead of re-forking the form.  That chain also
+    carries the REGRESSION INTENT — the emitted statement can never be the
+    old-style ``DROP INDEX ON :label(field)`` form, because
+    ``TestVectorDropStatement`` pins the exact bytes it is compared against.  A
+    separate negative assertion here would only re-state what these equalities
+    already enforce.
+    """
+
+    @pytest.mark.asyncio
+    async def test_issues_the_node_vector_drop_statement(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+
+        await backend.drop_vector_index(
+            'Entity', 'name_embedding', entity_type='NODE', group_id='test',
+        )
+
+        assert extract_cypher(graph.query.call_args) == vector_drop_statement(
+            'Entity', 'name_embedding', entity_type='NODE',
+        )
+
+    @pytest.mark.asyncio
+    async def test_issues_the_relationship_vector_drop_statement(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        """entity_type is load-bearing: measured, the NODE form errors 'no such index' here."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+
+        await backend.drop_vector_index(
+            'RELATES_TO', 'fact_embedding', entity_type='RELATIONSHIP', group_id='test',
+        )
+
+        assert extract_cypher(graph.query.call_args) == vector_drop_statement(
+            'RELATES_TO', 'fact_embedding', entity_type='RELATIONSHIP',
+        )
+
+    @pytest.mark.asyncio
+    async def test_uses_the_write_path_not_ro_query(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        """A DROP is a write; ro_query would be rejected."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+
+        await backend.drop_vector_index(
+            'Entity', 'name_embedding', entity_type='NODE', group_id='test',
+        )
+
+        graph.query.assert_called_once()
+        graph.ro_query.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_raises_when_not_initialized(self, mock_config):
+        backend = GraphitiBackend(mock_config)
+        with pytest.raises(RuntimeError, match='not initialized'):
+            await backend.drop_vector_index(
+                'Entity', 'name_embedding', entity_type='NODE', group_id='test',
+            )
+
+
 # ---------------------------------------------------------------------------
 # step-1 (task-52): GraphitiBackend.drop_vector_indices()
 # ---------------------------------------------------------------------------
 
 class TestDropVectorIndices:
-    """GraphitiBackend.drop_vector_indices() drops only VECTOR-type indices."""
+    """GraphitiBackend.drop_vector_indices() drops only VECTOR-type indices.
+
+    Stubs use the MEASURED live record shape (``'type': {'name_embedding':
+    ['VECTOR']}``), never the SCALAR fiction (``'type': 'VECTOR'``) — the same
+    fiction ``TestListIndices`` above bans, and for the same reason: a stub live
+    FalkorDB never emits is how the ``entity_type: row[3]`` mis-binding survived
+    unnoticed.
+
+    Task 3706 recorded the defect against that real shape as two
+    ``xfail(strict=True)`` tests naming task 3769; task 3769 fixed it, so those
+    marks are gone.  Un-xfailing was NOT sufficient: they asserted on
+    ``drop_index``, which the fix no longer calls (see ``drop_vector_indices``'
+    docstring for why that method cannot serve VECTOR).  So every assertion here
+    is retargeted to ``drop_vector_index``, and the calls are checked to carry
+    the per-property STRING field (``'name_embedding'``, not
+    ``['name_embedding']``) plus the record's ``entity_type``, which selects the
+    statement shape.
+    """
 
     @pytest.mark.asyncio
     async def test_drops_only_vector_type_indices(self, mock_config, make_backend):
-        """Calls drop_index for VECTOR indices only, not FULLTEXT/RANGE."""
+        """Calls drop_vector_index for VECTOR indices only, not FULLTEXT/RANGE."""
         backend = make_backend(mock_config)
 
         indices = [
-            {'label': 'Entity', 'field': 'name_embedding', 'type': 'VECTOR', 'entity_type': 'NODE'},
-            {'label': 'Entity', 'field': 'name', 'type': 'FULLTEXT', 'entity_type': 'NODE'},
-            {'label': 'RELATES_TO', 'field': 'fact_embedding', 'type': 'VECTOR', 'entity_type': 'RELATIONSHIP'},
+            {
+                'label': 'Entity', 'field': ['name_embedding'],
+                'type': {'name_embedding': ['VECTOR']}, 'entity_type': 'NODE',
+            },
+            {
+                'label': 'Entity', 'field': ['name'],
+                'type': {'name': ['FULLTEXT']}, 'entity_type': 'NODE',
+            },
+            {
+                'label': 'RELATES_TO', 'field': ['fact_embedding'],
+                'type': {'fact_embedding': ['VECTOR']}, 'entity_type': 'RELATIONSHIP',
+            },
         ]
         backend.list_indices = AsyncMock(return_value=indices)
-        backend.drop_index = AsyncMock()
+        backend.drop_vector_index = AsyncMock()
 
         await backend.drop_vector_indices(group_id='test')
 
-        assert backend.drop_index.call_count == 2
-        calls = backend.drop_index.call_args_list
-        called_pairs = [(c[0][0], c[0][1]) for c in calls]
-        assert ('Entity', 'name_embedding') in called_pairs
-        assert ('RELATES_TO', 'fact_embedding') in called_pairs
+        assert backend.drop_vector_index.call_count == 2
+        calls = backend.drop_vector_index.call_args_list
+        # The per-property STRING field, not the record's field LIST: a list here
+        # would render as `ON (n.['name_embedding'])` and drop nothing.
+        # entity_type is read from kwargs because it is keyword-only — it and
+        # `field` are both plain strings, so a positional slot would let a swap
+        # type-check.
+        called = [(c[0][0], c[0][1], c.kwargs['entity_type']) for c in calls]
+        assert ('Entity', 'name_embedding', 'NODE') in called
+        assert ('RELATES_TO', 'fact_embedding', 'RELATIONSHIP') in called
 
     @pytest.mark.asyncio
     async def test_returns_list_of_dropped_indices(self, mock_config, make_backend):
-        """Returns list of dicts with 'label' and 'field' for each dropped index."""
+        """Returns list of dicts with 'label' and 'field' for each dropped index.
+
+        The return shape stays EXACTLY ``{'label', 'field'}``: reindex.py's
+        docstring documents it and this exact-dict assertion pins it, so
+        ``entity_type`` is deliberately NOT added.
+        """
         backend = make_backend(mock_config)
 
         indices = [
-            {'label': 'Entity', 'field': 'name_embedding', 'type': 'VECTOR', 'entity_type': 'NODE'},
-            {'label': 'Entity', 'field': 'name', 'type': 'FULLTEXT', 'entity_type': 'NODE'},
+            {
+                'label': 'Entity', 'field': ['name_embedding'],
+                'type': {'name_embedding': ['VECTOR']}, 'entity_type': 'NODE',
+            },
+            {
+                'label': 'Entity', 'field': ['name'],
+                'type': {'name': ['FULLTEXT']}, 'entity_type': 'NODE',
+            },
         ]
         backend.list_indices = AsyncMock(return_value=indices)
-        backend.drop_index = AsyncMock()
+        backend.drop_vector_index = AsyncMock()
 
         result = await backend.drop_vector_indices(group_id='test')
 
@@ -386,20 +541,178 @@ class TestDropVectorIndices:
         assert result[0] == {'label': 'Entity', 'field': 'name_embedding'}
 
     @pytest.mark.asyncio
-    async def test_no_op_when_no_vector_indices(self, mock_config, make_backend):
-        """When no VECTOR indices exist, drop_index not called and returns []."""
+    async def test_drops_vector_property_from_a_merged_record(
+        self, mock_config, make_backend,
+    ):
+        """THE shape live FalkorDB actually emits: one MERGED record per label.
+
+        MEASURED 2026-08-16 on throwaway graph ``_impl3769_probe`` — a graph with
+        a VECTOR index on ``Entity.emb`` and a RANGE index on ``Entity.name``
+        yields a SINGLE row with ``properties=['emb','name']`` and
+        ``types={'emb': ['VECTOR'], 'name': ['RANGE']}``.  The one-record-per-
+        property stubs the other tests inherit are a milder fiction; this is the
+        real one, and a record-level predicate cannot express it.
+        """
         backend = make_backend(mock_config)
 
         indices = [
-            {'label': 'Entity', 'field': 'name', 'type': 'FULLTEXT', 'entity_type': 'NODE'},
-            {'label': 'Entity', 'field': 'created_at', 'type': 'RANGE', 'entity_type': 'NODE'},
+            {
+                'label': 'Entity',
+                'field': ['name_embedding', 'name'],
+                'type': {'name_embedding': ['VECTOR'], 'name': ['RANGE']},
+                'entity_type': 'NODE',
+            },
         ]
         backend.list_indices = AsyncMock(return_value=indices)
-        backend.drop_index = AsyncMock()
+        backend.drop_vector_index = AsyncMock()
 
         result = await backend.drop_vector_indices(group_id='test')
 
-        backend.drop_index.assert_not_called()
+        backend.drop_vector_index.assert_called_once()
+        call = backend.drop_vector_index.call_args
+        assert call[0][:2] == ('Entity', 'name_embedding')
+        assert call.kwargs['entity_type'] == 'NODE'
+        assert result == [{'label': 'Entity', 'field': 'name_embedding'}]
+
+    @pytest.mark.asyncio
+    async def test_drops_a_property_carrying_both_range_and_vector(
+        self, mock_config, make_backend,
+    ):
+        """MEASURED: one property can carry ``['RANGE', 'VECTOR']``.
+
+        ``DROP VECTOR INDEX`` removes only the VECTOR half (measured: the record
+        came back as ``{name: ['RANGE']}``), so this property must be dropped, not
+        skipped.  A list-equality predicate would silently omit exactly these.
+        """
+        backend = make_backend(mock_config)
+
+        indices = [
+            {
+                'label': 'Entity', 'field': ['name'],
+                'type': {'name': ['RANGE', 'VECTOR']}, 'entity_type': 'NODE',
+            },
+        ]
+        backend.list_indices = AsyncMock(return_value=indices)
+        backend.drop_vector_index = AsyncMock()
+
+        result = await backend.drop_vector_indices(group_id='test')
+
+        backend.drop_vector_index.assert_called_once()
+        assert result == [{'label': 'Entity', 'field': 'name'}]
+
+    @pytest.mark.asyncio
+    async def test_drops_relationship_vector_index_with_relationship_syntax(
+        self, mock_config, make_backend,
+    ):
+        """entity_type must reach drop_vector_index — it selects the statement shape.
+
+        MEASURED 2026-08-16: the NODE form against a RELATIONSHIP vector index
+        (``DROP VECTOR INDEX FOR (n:RELATES_TO) ON (n.fact_embedding)``) fails
+        with ``no such index``, while the edge form deletes it.  Losing
+        ``entity_type`` here reproduces the exact failure this task removes.
+        """
+        backend = make_backend(mock_config)
+
+        indices = [
+            {
+                'label': 'RELATES_TO',
+                'field': ['uuid', 'fact_embedding'],
+                'type': {'uuid': ['RANGE'], 'fact_embedding': ['VECTOR']},
+                'entity_type': 'RELATIONSHIP',
+            },
+        ]
+        backend.list_indices = AsyncMock(return_value=indices)
+        backend.drop_vector_index = AsyncMock()
+
+        result = await backend.drop_vector_indices(group_id='test')
+
+        backend.drop_vector_index.assert_called_once()
+        call = backend.drop_vector_index.call_args
+        assert call[0][:2] == ('RELATES_TO', 'fact_embedding')
+        assert call.kwargs['entity_type'] == 'RELATIONSHIP'
+        assert result == [{'label': 'RELATES_TO', 'field': 'fact_embedding'}]
+
+    @pytest.mark.asyncio
+    async def test_does_not_absorb_a_failing_drop(self, mock_config, make_backend):
+        """A failed drop PROPAGATES; it is never reported as a clean run.
+
+        Deliberately the inverse of ``ensure_indices``, which absorbs per-statement
+        failures because a partial provision beats none.  The sole caller here
+        drops indices immediately BEFORE re-embedding, so a partial drop reported
+        as success leaves stale fixed-dimension indices behind while the operator
+        believes the rebuild was clean — the same silent fail-soft this task
+        exists to remove.
+        """
+        backend = make_backend(mock_config)
+
+        indices = [
+            {
+                'label': 'Entity', 'field': ['name_embedding'],
+                'type': {'name_embedding': ['VECTOR']}, 'entity_type': 'NODE',
+            },
+        ]
+        backend.list_indices = AsyncMock(return_value=indices)
+        backend.drop_vector_index = AsyncMock(side_effect=RuntimeError('boom'))
+
+        with pytest.raises(RuntimeError, match='boom'):
+            await backend.drop_vector_indices(group_id='test')
+
+    @pytest.mark.asyncio
+    async def test_logs_what_was_already_dropped_before_re_raising(
+        self, mock_config, make_backend, caplog,
+    ):
+        """Propagating is not the same as saying nothing.
+
+        A mid-loop failure leaves the graph GENUINELY half-dropped, and the
+        locally-accumulated list dies with the frame: ``reindex_and_replay``
+        never assigns ``indices_dropped`` because ``drop_vector_indices`` never
+        returns.  So the partial list must reach the operator recovering from it
+        — structured facts at failure.  The propagate-don't-absorb contract above
+        is unchanged; only the diagnostics improve.
+        """
+        backend = make_backend(mock_config)
+
+        indices = [
+            {
+                'label': 'Entity',
+                'field': ['name_embedding', 'other_embedding'],
+                'type': {
+                    'name_embedding': ['VECTOR'], 'other_embedding': ['VECTOR'],
+                },
+                'entity_type': 'NODE',
+            },
+        ]
+        backend.list_indices = AsyncMock(return_value=indices)
+        backend.drop_vector_index = AsyncMock(side_effect=[None, RuntimeError('boom')])
+
+        with caplog.at_level(logging.ERROR), pytest.raises(RuntimeError, match='boom'):
+            await backend.drop_vector_indices(group_id='test')
+
+        errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+        assert any('name_embedding' in msg for msg in errors), errors
+        assert any('after dropping 1' in msg for msg in errors), errors
+
+    @pytest.mark.asyncio
+    async def test_no_op_when_no_vector_indices(self, mock_config, make_backend):
+        """When no VECTOR indices exist, drop_vector_index not called and returns []."""
+        backend = make_backend(mock_config)
+
+        indices = [
+            {
+                'label': 'Entity', 'field': ['name'],
+                'type': {'name': ['FULLTEXT']}, 'entity_type': 'NODE',
+            },
+            {
+                'label': 'Entity', 'field': ['created_at'],
+                'type': {'created_at': ['RANGE']}, 'entity_type': 'NODE',
+            },
+        ]
+        backend.list_indices = AsyncMock(return_value=indices)
+        backend.drop_vector_index = AsyncMock()
+
+        result = await backend.drop_vector_indices(group_id='test')
+
+        backend.drop_vector_index.assert_not_called()
         assert result == []
 
 
@@ -847,6 +1160,145 @@ class TestRunReindex:
         mock_cfg_cls.assert_called_once()
         call_kwargs = mock_cfg_cls.call_args[1]
         assert call_kwargs.get('embedding_dim') == 768
+
+    @pytest.mark.asyncio
+    async def test_creates_embedder_with_config_base_url(
+        self, standard_mock_config, make_fake_maintenance_service,
+    ):
+        """run_reindex() passes the configured endpoint to OpenAIEmbedderConfig.
+
+        The reindex tool was the outlier: backends/graphiti_client.py has
+        always passed base_url on its embedder path, so a re-embed run would
+        silently have gone to api.openai.com regardless of configuration.
+
+        NB this assertion alone is NOT sufficient evidence that the endpoint is
+        honoured — OpenAIEmbedderConfig is a pydantic model with the default
+        extra='ignore', so a MISSPELLED kwarg would be dropped silently and
+        this mock-based test would still pass while traffic went to
+        api.openai.com. That is the graphiti-#912 failure class this task
+        exists to prevent, and only a real socket disproves it; see
+        tests/test_local_endpoint_base_url_integration.py.
+        """
+        from fused_memory.config.schema import OpenAIProviderConfig
+
+        standard_mock_config.embedder.providers.openai = OpenAIProviderConfig(
+            api_key='test-key', api_url='http://127.0.0.1:5678/v1',
+        )
+
+        mock_service = AsyncMock()
+        mock_service.durable_queue = MagicMock()
+        mock_service.graphiti = MagicMock()
+
+        mock_result = {'reindex_result': ReindexResult(), 'replay_count': 0}
+
+        with (
+            patch(
+                'fused_memory.maintenance.reindex.maintenance_service',
+                side_effect=make_fake_maintenance_service(standard_mock_config, mock_service),
+            ),
+            patch('fused_memory.maintenance.reindex.OpenAIEmbedderConfig') as mock_cfg_cls,
+            patch('fused_memory.maintenance.reindex.OpenAIEmbedder'),
+            patch('fused_memory.maintenance.reindex.ReindexManager') as mock_mgr_cls,
+        ):
+            mock_mgr = MagicMock()
+            mock_mgr.reindex_and_replay = AsyncMock(return_value=mock_result)
+            mock_mgr_cls.return_value = mock_mgr
+
+            await run_reindex()
+
+        mock_cfg_cls.assert_called_once()
+        call_kwargs = mock_cfg_cls.call_args[1]
+        assert call_kwargs.get('base_url') == 'http://127.0.0.1:5678/v1'
+        # The pre-existing kwargs are still passed exactly as before.
+        assert call_kwargs.get('api_key') == 'test-key'
+        assert call_kwargs.get('embedding_model') == standard_mock_config.embedder.model
+        assert call_kwargs.get('embedding_dim') == standard_mock_config.embedder.dimensions
+
+    @pytest.mark.asyncio
+    async def test_reports_when_it_overrides_an_ambient_base_url(
+        self, standard_mock_config, make_fake_maintenance_service, monkeypatch, caplog,
+    ):
+        """The configured endpoint now WINS over OPENAI_BASE_URL, which is an
+        egress change for a re-embed run that used to follow that env var.
+        Announce it — a re-embed silently pointed at a different host would
+        bill and leak to somewhere the operator did not choose.
+        """
+        from fused_memory.config.env_precedence import reset_warning_cache
+        from fused_memory.config.schema import OpenAIProviderConfig
+
+        reset_warning_cache()
+        monkeypatch.setenv('OPENAI_BASE_URL', 'https://gateway.example.invalid/v1')
+        standard_mock_config.embedder.providers.openai = OpenAIProviderConfig(
+            api_key='test-key', api_url='http://127.0.0.1:5678/v1',
+        )
+
+        mock_service = AsyncMock()
+        mock_service.durable_queue = MagicMock()
+        mock_service.graphiti = MagicMock()
+
+        mock_result = {'reindex_result': ReindexResult(), 'replay_count': 0}
+
+        with (
+            patch(
+                'fused_memory.maintenance.reindex.maintenance_service',
+                side_effect=make_fake_maintenance_service(standard_mock_config, mock_service),
+            ),
+            patch('fused_memory.maintenance.reindex.OpenAIEmbedderConfig'),
+            patch('fused_memory.maintenance.reindex.OpenAIEmbedder'),
+            patch('fused_memory.maintenance.reindex.ReindexManager') as mock_mgr_cls,
+            caplog.at_level(logging.WARNING),
+        ):
+            mock_mgr = MagicMock()
+            mock_mgr.reindex_and_replay = AsyncMock(return_value=mock_result)
+            mock_mgr_cls.return_value = mock_mgr
+
+            await run_reindex()
+
+        reset_warning_cache()
+        assert any(
+            'OPENAI_BASE_URL' in r.message and 'http://127.0.0.1:5678/v1' in r.message
+            for r in caplog.records
+        ), [r.message for r in caplog.records]
+
+    @pytest.mark.asyncio
+    async def test_none_provider_block_yields_base_url_none(
+        self, standard_mock_config, make_fake_maintenance_service,
+    ):
+        """Regression guard: the new plumbing must stay INSIDE the existing
+        `if openai_provider is not None` guard.
+
+        standard_mock_config has embedder.providers.openai = None (the case the
+        sibling tests already exercise with a real OpenAIEmbedderConfig), so
+        reaching for .api_url unguarded would raise AttributeError. base_url=None
+        yields the SDK default, preserving today's behaviour.
+        """
+        assert standard_mock_config.embedder.providers.openai is None
+
+        mock_service = AsyncMock()
+        mock_service.durable_queue = MagicMock()
+        mock_service.graphiti = MagicMock()
+
+        mock_result = {'reindex_result': ReindexResult(), 'replay_count': 0}
+
+        with (
+            patch(
+                'fused_memory.maintenance.reindex.maintenance_service',
+                side_effect=make_fake_maintenance_service(standard_mock_config, mock_service),
+            ),
+            patch('fused_memory.maintenance.reindex.OpenAIEmbedderConfig') as mock_cfg_cls,
+            patch('fused_memory.maintenance.reindex.OpenAIEmbedder'),
+            patch('fused_memory.maintenance.reindex.ReindexManager') as mock_mgr_cls,
+        ):
+            mock_mgr = MagicMock()
+            mock_mgr.reindex_and_replay = AsyncMock(return_value=mock_result)
+            mock_mgr_cls.return_value = mock_mgr
+
+            await run_reindex()  # must not raise AttributeError
+
+        mock_cfg_cls.assert_called_once()
+        call_kwargs = mock_cfg_cls.call_args[1]
+        assert call_kwargs.get('base_url') is None
+        assert call_kwargs.get('api_key') is None
 
     @pytest.mark.asyncio
     async def test_embedder_constructor_failure_propagates(self, standard_mock_config, make_fake_maintenance_service):

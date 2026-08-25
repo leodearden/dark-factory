@@ -923,3 +923,29 @@ marked `done`.
   the shallow-merge contract in §3 already supports multi-key patches without change, but a
   schema-validated metadata vocabulary would need its own reserved-key list layered on top of
   `_MEM0_MANAGED_METADATA_KEYS`, not a replacement of it.
+
+### Addendum 2026-08-12 — the under-scoping clause fired, and resolved differently than predicted
+
+The second falsification bullet above ("the authorization model is under-scoped if a second,
+non-`recon-stage-*` caller needs content-amend or metadata-patch authority… a real second caller
+arriving quickly would validate widening one list, not redesigning the gate") **fired** within two
+weeks of shipping: the interactive memory-consolidation sitting (task 3524 / esc-3524-1, the exact
+"interactive curator-gate correction flow" the bullet names). Two of its predictions held and one
+did not:
+
+- **Held:** the gate mechanism needed no redesign — the resolver, arms, and kill switch are
+  untouched.
+- **Held:** the new caller arrived under a dedicated narrow prefix (`curator-`), not a broad one.
+- **Did not hold:** the resolution widened **both** lists, not one. Ruling (b) on esc-3524-1
+  (2026-08-11) granted `curator-` content-amend AND metadata-patch, because gate 3200's
+  retain-and-tag write shape stamps retained peers via metadata-only patches — content-amend alone
+  would be the destructive half without the preserving half. "Widen the metadata bar alone"
+  remains the supported path for tagging-only flows; consolidation is not one.
+
+A second ruling (2026-08-12) then promoted the grant from a per-machine `config.yaml` override to
+the **schema default** (`['recon-stage-', 'curator-']` on both arms), after the override tripped
+the `test_recon_amend_tool_advertisement.py` premise tests: the skill that performs the sitting
+(`skills/curate-fused-memories`) does not work without the grant, so it belongs to every
+deployment, and `config.yaml`'s `mem0_update:` block returns to fully-commented. §4's code block
+above shows the original single-entry defaults; read it as the design as first shipped, not the
+current values.
