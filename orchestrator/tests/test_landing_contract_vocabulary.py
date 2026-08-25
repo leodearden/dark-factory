@@ -81,7 +81,11 @@ class TestLandingReasonVocabulary:
         source = landing_evidence.__file__
         with open(source, encoding='utf-8') as handle:
             text = handle.read()
-        assert 'enum.auto()' not in text, 'explicit string values, not auto()'
+        # An assignment, not a mention: the module's own docstrings discuss
+        # ``enum.auto()`` to explain why it is not used, so a bare substring
+        # test would fail on the very prose that documents the rule.
+        assert '= enum.auto()' not in text, 'explicit string values, not auto()'
+        assert '= auto()' not in text, 'explicit string values, not auto()'
         for member in LandingReason:
             assert f"{member.name} = '{member.value}'" in text, member
 

@@ -43,7 +43,7 @@ its first parameter, deliberately NOT a ``GitOps`` method and NOT a
 
 **Pure / read-only** — this function never marks a task done, never
 escalates, and never mutates git or task state. It returns a frozen
-:class:`LandingEvidenceVerdict` describing whether the evidence is
+:class:`LandingVerdict` describing whether the evidence is
 attributable and effect-present; each call site owns its own stamp-vs-
 escalate-vs-revert action, which differs per site (the dispatch gate returns
 a bool, the sweep reverts to pending, the coalesce re-drive calls
@@ -107,6 +107,7 @@ delegate to — the two differ only in the ``agent_role`` they pass.
 
 from __future__ import annotations
 
+import enum
 import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, TypeGuard
@@ -117,6 +118,101 @@ if TYPE_CHECKING:
     from orchestrator.git_ops import GitOps
 
 logger = logging.getLogger(__name__)
+
+__all__ = [
+    'LandingEvidenceVerdict',
+    'LandingMethod',
+    'LandingReason',
+    'LandingVerdict',
+    'branch_is_degenerate',
+    'file_unattributed_landing_escalation',
+    'format_unattributed_landing_detail',
+    'is_valid_sha_40',
+    'validate_landing_evidence',
+]
+
+
+class LandingReason(enum.StrEnum):
+    """The closed vocabulary of landing-evidence verdict codes.
+
+    Genuine ``str`` members (mirrors ``orchestrator.recovery_emission``'s
+    ``RecoverySite`` / ``LeaveReason`` and ``escalation.pins.PinClass``) so
+    equality against a plain string holds without an explicit ``.value``, a
+    member resolves as a plain-string dict key — which
+    :data:`_REASON_EXPLANATIONS` depends on — and a member JSON-encodes as its
+    spelling.
+
+    Values are written out LITERALLY rather than produced by ``enum.auto()``.
+    That is not style: this task's ``metadata.delivered_checks`` greps this
+    module for the literal ``'no_attribution'``, so an ``auto()`` declaration
+    would build an identical runtime vocabulary and silently fail the gate.
+
+    ONE vocabulary, not two.  The first six members are the PRD Contract's
+    closed set, emitted by :func:`branch_work_landed`.  The last three are the
+    PRE-CONTRACT spelling :func:`validate_landing_evidence` still emits, kept
+    here rather than in a separate legacy enum because a second vocabulary
+    would be two authorities that must be kept in step forever, and because a
+    legacy code reaching a formatter that cannot explain it renders
+    ``'Unrecognized reason code: ...'`` into an L1 body a human reads.  Leaf
+    epsilon retires the legacy three when it repoints the consumers.
+    """
+
+    #: Accepted — the branch's work is attributably present on main.
+    landed = 'landed'
+    #: Rejected — a landing marker exists but the branch's NET contribution is
+    #: empty, so the task delivered nothing (the task-1175 shape).
+    no_op_landing = 'no_op_landing'
+    #: Rejected — the branch's work is genuinely absent from main.
+    not_landed = 'not_landed'
+    #: Rejected — the work IS on main but no main-reachable commit could be
+    #: attributed to this task, so there is nothing to anchor provenance on.
+    #: The Contract's rename of the legacy ``no_citation``.
+    no_attribution = 'no_attribution'
+    #: Rejected — a provisioning-only branch whose tip never advanced past its
+    #: recorded ``branch_base_sha`` (#1226).  Patch-id-contained in main by
+    #: construction, which is exactly why it needs its own code.
+    degenerate_branch = 'degenerate_branch'
+    #: Rejected — git could not answer.  A FAIL-SOFT DEGRADATION and the one
+    #: code whose repetition means THE DETECTOR is broken rather than the task
+    #: being unlanded.  No consumer may collapse it into ``not_landed``.
+    git_error = 'git_error'
+
+    #: Legacy (``validate_landing_evidence`` accept).  Epsilon retires it.
+    ok = 'ok'
+    #: Legacy (``validate_landing_evidence`` DISCOVERY miss).  The Contract's
+    #: spelling is :attr:`no_attribution`; epsilon flips the emitted value.
+    no_citation = 'no_citation'
+    #: Legacy (``validate_landing_evidence`` survival reject, FIX 1').
+    effect_absent = 'effect_absent'
+
+
+class LandingMethod(enum.StrEnum):
+    """The closed vocabulary of HOW a landing was attributed.
+
+    Genuine ``str`` members, for the same reasons as :class:`LandingReason`.
+
+    This is the explicit mode/policy discriminator the PRD's epsilon bullet
+    demands in place of two separate functions: it maps one-to-one onto the
+    three production attribution paths, so any consumer can read which policy
+    decided a verdict — in particular whether it came from the NON-DECAYING
+    patch-id contract or from the legacy effect-present policy epsilon is
+    retiring at the landing-detection sites.
+    """
+
+    #: :func:`branch_work_landed` — ``git cherry`` patch-id equivalence.  The
+    #: non-decaying path.
+    patch_id = 'patch_id'
+    #: :func:`validate_landing_evidence` CANDIDATE mode — attribution was
+    #: already established by the caller's merge-marker subject match.
+    merge_marker = 'merge_marker'
+    #: :func:`validate_landing_evidence` DISCOVERY mode — attribution by
+    #: ``find_task_citation_commit`` subject-anchored citation discovery.
+    citation = 'citation'
+    #: No attribution path ran: the verdict was hand-constructed rather than
+    #: produced by this module (the shape several gate-wiring test files
+    #: build).  The default, so existing four-keyword constructions are
+    #: unchanged.
+    unspecified = 'unspecified'
 
 
 def is_valid_sha_40(s: object) -> TypeGuard[str]:
@@ -186,8 +282,15 @@ async def branch_is_degenerate(
 
 
 @dataclass(frozen=True)
-class LandingEvidenceVerdict:
-    """The verdict of :func:`validate_landing_evidence`.
+class LandingVerdict:
+    """The verdict of this module's landing-evidence producers.
+
+    ONE verdict type for the whole producer family — :func:`branch_work_landed`
+    and :func:`validate_landing_evidence` both return this — so a consumer
+    never has to know which produced the verdict in order to read it, and there
+    is no second shape that must be kept in step forever.  Formerly named
+    ``LandingEvidenceVerdict``; that spelling survives as a module-level alias
+    (below) and remains valid.
 
     Attributes:
         accepted: Whether the evidence is attributable AND effect-present.
@@ -227,12 +330,28 @@ class LandingEvidenceVerdict:
             - ``effect_probe_error`` — present only when the probe raised;
               the ``repr`` of the exception.  Recorded rather than swallowed
               so the escalation states plainly that the paths are unknown.
+        method: WHICH attribution path produced this verdict — the explicit
+            mode discriminator (see :class:`LandingMethod`).
+            ``LandingMethod.unspecified`` means no path ran: the verdict was
+            hand-constructed rather than produced by this module.  LAST and
+            defaulted on purpose, so every existing positional and
+            four-keyword construction is unchanged.
     """
 
     accepted: bool
     evidence_sha: str | None
-    reason: str
+    reason: LandingReason
     probe: dict[str, Any]
+    method: LandingMethod = LandingMethod.unspecified
+
+
+#: Backward-compatible alias for the pre-rename spelling.  ``harness.py`` and
+#: ``merge_queue.py`` import this name and use it as an annotation, and four
+#: sibling test files construct it by keyword; the alias keeps every one of
+#: them working with zero edits.  Deliberately an ALIAS and not a second
+#: dataclass or a subclass — two verdict types that must agree forever is
+#: exactly the lockstep duplication this task exists to avoid.
+LandingEvidenceVerdict = LandingVerdict
 
 
 async def _record_effect_divergence(
@@ -533,7 +652,7 @@ async def validate_landing_evidence(
     candidate_sha: str | None = None,
     pattern_template: str | None = None,
     delivered_checks: list[dict[str, Any]] | None = None,
-) -> LandingEvidenceVerdict:
+) -> LandingVerdict:
     """Validate already-landed evidence for *task_id* on *branch*.
 
     See the module docstring for the DISCOVERY (``candidate_sha=None``) vs
@@ -596,7 +715,7 @@ async def validate_landing_evidence(
             seven sites regressed to the default.
 
     Returns:
-        A :class:`LandingEvidenceVerdict`.
+        A :class:`LandingVerdict`.
     """
     probe: dict[str, Any] = {
         'task_id': task_id,
@@ -615,15 +734,15 @@ async def validate_landing_evidence(
         ),
     }
 
-    def _reject(reason: str) -> LandingEvidenceVerdict:
+    def _reject(reason: str) -> LandingVerdict:
         probe['reason'] = reason
-        return LandingEvidenceVerdict(
+        return LandingVerdict(
             accepted=False, evidence_sha=None, reason=reason, probe=dict(probe),
         )
 
-    def _accept(evidence_sha: str) -> LandingEvidenceVerdict:
+    def _accept(evidence_sha: str) -> LandingVerdict:
         probe['reason'] = 'ok'
-        return LandingEvidenceVerdict(
+        return LandingVerdict(
             accepted=True, evidence_sha=evidence_sha, reason='ok', probe=dict(probe),
         )
 
@@ -712,7 +831,65 @@ async def validate_landing_evidence(
     return _accept(citation)
 
 
+#: Operator-facing prose for every :class:`LandingReason` member.
+#:
+#: COMPLETE by contract, machine-checked in
+#: test_landing_contract_vocabulary.py by iterating the enum: a member with no
+#: entry here makes :func:`format_unattributed_landing_detail` render the
+#: literal ``'Unrecognized reason code: ...'`` into the L1 body a human reads.
 _REASON_EXPLANATIONS: dict[str, str] = {
+    'landed': (
+        "The branch's work is present on main by PATCH-ID equivalence and a "
+        'main-reachable commit was attributed to this task. Accepted.'
+    ),
+    'no_op_landing': (
+        'A landing marker for this task is on main, but the branch '
+        'contributes NO NET CHANGE relative to where it forked — its own '
+        'commits cancel out (added then removed, or reverted within the '
+        'branch). The merge is genuine; the deliverable is not. Stamping '
+        'this done would record a task as delivered when nothing shipped '
+        '(the task-1175 shape), so it is rejected on purpose. Check whether '
+        'the work was backed out mid-branch or landed on a different branch.'
+    ),
+    'not_landed': (
+        "The branch's commits are genuinely absent from main: no commit on "
+        'main carries an equivalent patch. This is the ordinary negative — '
+        'the task has not landed and should be dispatched normally.'
+    ),
+    'no_attribution': (
+        'The work IS on main, but no main-reachable commit could be '
+        'attributed to THIS task — no commit cites it and no equivalent '
+        'commit resolved. There is no sha to anchor provenance on, and this '
+        'producer refuses to guess: anchoring on the branch tip (not on '
+        'main) or on main\'s current tip would fabricate provenance, which '
+        'is the defect the citation guard exists to prevent. The Contract\'s '
+        'rename of the legacy "no_citation".'
+    ),
+    'degenerate_branch': (
+        'The branch never advanced past its recorded branch_base_sha '
+        '(#1226): zero commits were ever pushed beyond the creation point. '
+        'Such a branch is patch-id-contained in main BY CONSTRUCTION, so '
+        'every containment check reads it as a confident landing of a '
+        "foreign commit's content. Rejected before any attribution runs. "
+        'The task has no work to attribute; investigate why the branch is '
+        'empty rather than why the check failed.'
+    ),
+    'git_error': (
+        'Git could not answer. This is a FAIL-SOFT DEGRADATION of the '
+        'DETECTOR, not a statement about the task: a repo lock, a corrupt '
+        'object, an unresolvable ref or an unreadable merge-base all land '
+        'here. It must NEVER be read as "not landed" — a git failure '
+        'silently reading as unlanded re-dispatches an already-landed task '
+        'on every tick forever, which is the defect this machinery exists '
+        'to fix rather than an instance of it. See probe.git_error_stage '
+        'for which operation failed. If this code repeats, the detector is '
+        'broken; fix the repo or the ref, do not re-dispatch the task.'
+    ),
+    'ok': (
+        'The evidence is attributable and its effect is present at main '
+        'HEAD. Accepted. (The pre-Contract spelling of an accept; '
+        ':attr:`LandingReason.landed` is the Contract\'s.)'
+    ),
     'no_citation': (
         'No commit on main cites this task (find_task_citation_commit found '
         'nothing) — there is no positive evidence to attribute a landing to.'
@@ -737,10 +914,41 @@ _REASON_EXPLANATIONS: dict[str, str] = {
 }
 
 
+#: Operator-facing prose for every :class:`LandingMethod` member — WHICH
+#: attribution path decided.  Complete by contract, machine-checked the same
+#: way :data:`_REASON_EXPLANATIONS` is.
+_METHOD_EXPLANATIONS: dict[str, str] = {
+    'patch_id': (
+        'Attributed by patch-id equivalence (`git cherry`): every commit the '
+        'branch contributes is already present in main as an equivalent '
+        'patch. This is the NON-DECAYING path — later commits touching the '
+        'same paths cannot make an equivalent patch stop existing in '
+        "main's history."
+    ),
+    'merge_marker': (
+        'Attribution was established by the CALLER (a merge-marker subject '
+        'match or a stranded-sweep ground-truth report) and this module only '
+        'applied the effect-present guard to the supplied candidate — '
+        'validate_landing_evidence CANDIDATE mode.'
+    ),
+    'citation': (
+        "Attributed by subject-anchored citation discovery over main's "
+        'history (find_task_citation_commit) — validate_landing_evidence '
+        'DISCOVERY mode. Depends on a commit on main naming the task, so a '
+        'rebase landing that dropped the citation is invisible to it.'
+    ),
+    'unspecified': (
+        'No attribution path ran: this verdict was hand-constructed rather '
+        'than produced by this module (the shape several gate-wiring tests '
+        'build). Not a landing claim.'
+    ),
+}
+
+
 def format_unattributed_landing_detail(
-    task_id: str, branch: str, verdict: LandingEvidenceVerdict,
+    task_id: str, branch: str, verdict: LandingVerdict,
 ) -> tuple[str, str]:
-    """Render a rejected :class:`LandingEvidenceVerdict` as (summary, detail).
+    """Render a rejected :class:`LandingVerdict` as (summary, detail).
 
     Shared (INV-5) across every escalating call site — the harness
     ``_file_unattributed_landing_escalation`` helper and the merge_queue
@@ -860,7 +1068,7 @@ def _survival_lines(probe: dict[str, Any]) -> list[str]:
 
 
 def _render_effect_divergence(
-    verdict: LandingEvidenceVerdict,
+    verdict: LandingVerdict,
 ) -> tuple[str, str]:
     """Render the effect_absent divergence diagnostics (task 3116).
 
@@ -938,7 +1146,7 @@ def _render_effect_divergence(
 
 
 def _render_delivered_checks_differential(
-    verdict: LandingEvidenceVerdict,
+    verdict: LandingVerdict,
 ) -> str:
     """Render the delivered-checks differential outcome (task 3116 part b).
 
@@ -1015,7 +1223,7 @@ def file_unattributed_landing_escalation(
     escalation_queue: EscalationQueue | None,
     task_id: str,
     branch: str,
-    verdict: LandingEvidenceVerdict,
+    verdict: LandingVerdict,
     *,
     agent_role: str,
 ) -> None:
@@ -1056,7 +1264,7 @@ def file_unattributed_landing_escalation(
         escalation_queue: The caller's ``EscalationQueue``, or ``None``.
         task_id: The task (or coalesce member) id the escalation is filed for.
         branch: The branch the evidence check ran against.
-        verdict: A rejected :class:`LandingEvidenceVerdict`.
+        verdict: A rejected :class:`LandingVerdict`.
         agent_role: The filing caller's role, e.g. ``'harness-reconcile'``
             or ``'orchestrator-merge-worker'`` — the only thing that
             distinguishes the two call sites.
