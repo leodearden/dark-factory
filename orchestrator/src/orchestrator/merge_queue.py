@@ -18786,6 +18786,19 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # `spec_warm=False` for the same reason — this is an ephemeral
                 # worktree, not a warm `_spec-` lane, and the disposal routes
                 # on that flag.
+                #
+                # THE HEAD CANCEL (PRD decision #3), fired HERE rather than in
+                # the finalize half for one reason: the head's own
+                # `_finalize_inflight` is, in the common topology, ALREADY
+                # parked on `await entry.verify_task` and will stay parked
+                # until something cancels it.  Deferring the cancel to a
+                # finalize that cannot start until that park ends would
+                # deadlock.  See `_adopt_head_on_tip_authority` for which
+                # entry counts as the head, why the tip's verdict covers it,
+                # and the two lease axes the teardown must leave idle.
+                await self._adopt_head_on_tip_authority(
+                    req.request_id, req.task_id,
+                )
                 return InflightVerifyResult(
                     outcome=None,
                     merge_wt=item.merge_wt,
@@ -19003,6 +19016,124 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         buffer needs no re-arming at all; it needs its slot back.
         """
         self._lane_buffers[lane].insert(idx, req)
+
+    async def _adopt_head_on_tip_authority(
+        self, tip_req_id: str, tip_task_id: str,
+    ) -> InflightEntry | None:
+        """Claim the HEAD I0 for a green chain tip and tear its verify down
+        (task 3186, PRD δ; decision #3).
+
+        WHY THE HEAD IS DELTA'S BUSINESS AT ALL.  ``_deep_chain_placement`` is
+        gated on ``item.speculative``, so slot 1's head is never chained — but
+        the speculative slot-2 item that IS chained was merged onto the head's
+        merge commit (the frozen-prefix tip), and the links were merged onto
+        that.  The tip tree the verify just passed therefore strictly CONTAINS
+        the head's tree.  Two consequences, and both are decision #3:
+
+          * The head's own verdict is about a SUBSET the tip has better
+            evidence for.  Waiting for it buys nothing; OBEYING it when it is
+            red would fail an item the tip just proved good and strand the
+            whole prefix behind it (the "Head-fail + tip-pass" boundary row).
+          * The head must nonetheless land FIRST.  Every downstream
+            ``expected_main`` is chained off it — the speculative item CASes
+            against ``base_sha`` = the head's merge commit — so a walk that ran
+            ahead of the head would CAS-fail on its very first link.  Nothing
+            here arranges that: the ``_inflight`` deque already finalizes in
+            submission order, and the head was appended first.
+
+        WHERE THE HEAD IS.  Two topologies, and the common one is the second:
+
+          1. Still on the deque — ``self._inflight[0]``, dispatch-fill has run
+             but FINALIZE-HEAD has not.
+          2. ALREADY POPPED for finalize and parked on
+             ``await entry.verify_task`` — invisible to the deque and
+             reachable only through :meth:`_finalizing_head_entry`
+             (merge_queue.py:13504-13508 records that ``_inflight[0]`` is the
+             SECOND entry during that window).  A δ that only read the deque
+             would silently skip the cancel in exactly the case that matters,
+             leaving the finalize parked on a verdict it no longer needs.
+
+        Either way the TIP'S OWN entry is excluded explicitly: in production it
+        sits on ``_inflight`` behind the head, and reading it as "the head"
+        would have this coroutine cancel itself.
+
+        THE TEARDOWN IS THE SANCTIONED PAIR, in the head-failure cascade's
+        order: :meth:`_teardown_verify_task` (which owns the load-bearing
+        abort-BEFORE-cancel ordering — the verify coroutine's finally clears
+        ``_inflight_request_id`` on cancellation, and a cancel_verify() after
+        that is a silent no-op that orphans a remote verify-merge process),
+        then :meth:`_cancel_and_release_tracked`, then ``lease = None`` so no
+        later path double-releases.  Hand-rolling either step is refused by an
+        AST ratchet (``TestVerifyTeardownChokepoint``,
+        ``TestCancelAndReleaseChokepoint``).
+
+        LEASE CLEANLINESS — the PRD's "Lease released on head-cancel" row, and
+        DF-3071's precondition.  Two INDEPENDENT busy axes must go idle or
+        3071's admission guard reads ``_merge-verify`` BUSY and defers the
+        fleet: the kernel flock on ``<worktree_base>/_merge-verify.lock``, and
+        the fixed-key holder-pgid rendezvous that
+        ``reset_persistent_merge_worktree`` reads FAIL-CLOSED.  A LOCAL head
+        needs nothing extra — cancelling its task unwinds
+        ``GitOps.merge_verify_lease``'s finally (git_ops.py:3549-3554), which
+        clears the rendezvous AND releases the flock.  A REMOTE head goes
+        ssh -> ``orchestrator cancel-verify`` -> ``cancel_request`` -> SIGKILL,
+        which skips cli.py's own finally and would leak the rendezvous; δ
+        closes that at ``cli.py:cancel_verify`` (see verify_cancel.py's
+        stale-file note).
+
+        Returns the adopted entry, or ``None`` when there is no head to adopt
+        (single-slot round, head already finalized, passthrough head).
+        """
+        head = self._finalizing_head_entry()
+        if head is None and self._inflight:
+            candidate = self._inflight[0]
+            if candidate.item.request.request_id != tip_req_id:
+                head = candidate
+        if head is None or head.item.request.request_id == tip_req_id:
+            return None
+        if head.verify_task is None:
+            # A passthrough / pre-established-PASS entry has no verify to
+            # cancel and no verdict to decline — it is already decided, and
+            # decision #3 says nothing about it.
+            return None
+
+        head_task_id = head.item.request.task_id
+        # Set BEFORE the teardown, and that ordering is load-bearing: the
+        # cancel below is what resumes a `_finalize_inflight` already parked at
+        # `await entry.verify_task`, and this flag is the only thing that tells
+        # it the CancelledError it receives is δ's doing rather than a
+        # shutdown.  No await intervenes, so the window is not observable.
+        head.chain_adopted = True
+
+        if not head.verify_task.done():
+            logger.info(
+                'Task %s: deep tip passed — cancelling head task %s\'s '
+                'in-flight verify and landing it on the tip\'s authority '
+                '(the tip tree contains its own)',
+                tip_task_id, head_task_id,
+            )
+            await self._teardown_verify_task(
+                head.lease, head.verify_task, head_task_id,
+            )
+            await self._cancel_and_release_tracked(head.lease)
+            head.lease = None
+            # The compat shim `_finalize_inflight` already documents at its
+            # verify await: `verify_task=None` means PASS was pre-established.
+            # Setting it here is what makes topology 1 take the PASS arm with
+            # no exception at all; topology 2 already entered the await and is
+            # covered by the `chain_adopted` tolerance there instead.
+            head.verify_task = None
+        else:
+            # The verdict already arrived.  Nothing to tear down — but the flag
+            # above still declines it if it was RED, which is the whole of the
+            # "Head-fail + tip-pass" row.  Its lease/worktree stay on
+            # `_finalize_inflight`'s ordinary release path, untouched.
+            logger.info(
+                'Task %s: deep tip passed — head task %s had already returned '
+                'a verdict; adopting the tip\'s instead',
+                tip_task_id, head_task_id,
+            )
+        return head
 
     async def _land_chain_prefix(self, entry: InflightEntry, head_sha: str) -> None:
         """Land ``entry.chain.links`` on main, in order, by CAS (task 3186, PRD δ).
@@ -19405,7 +19536,29 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # step-12 tests where entry is constructed with a known-pass worktree).
             vr: InflightVerifyResult | None = None
             if entry.verify_task is not None:
-                vr = await entry.verify_task
+                try:
+                    vr = await entry.verify_task
+                except asyncio.CancelledError:
+                    # ── task 3186 (PRD δ): THE ADOPTED HEAD'S TORN-DOWN VERIFY ──
+                    # This is the COMMON deep topology, not an edge case: the
+                    # head is popped for finalize and parked right here while
+                    # the speculative slot verifies the chain tip, so when the
+                    # tip goes green `_adopt_head_on_tip_authority` cancels
+                    # this very task and the cancellation surfaces at this
+                    # await.  `chain_adopted` is set immediately before that
+                    # cancel, with no await in between, and by nothing else —
+                    # so it is exactly the discriminator between "δ decided to
+                    # land this head on the tip's authority" and a genuine
+                    # external cancellation, which still propagates untouched.
+                    #
+                    # `vr = None` puts the entry on the same footing as the
+                    # verify_task=None compat shim documented above: PASS
+                    # pre-established, `merge_wt` taken from the entry.  That
+                    # is the correct reading, not a fallback — the tip verdict
+                    # IS this item's verdict now.
+                    if not entry.chain_adopted:
+                        raise
+                    vr = None
 
             # ── (c) DROPPED / REQUEUED sentinels ────────────────────────────
             # See this method's docstring, SENTINEL DISPOSITION (task 3082):
@@ -19714,7 +19867,15 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 return await self._void_and_remerge(entry, item, _dead_link, vr)
 
             # ── (a) FAIL / skip ──────────────────────────────────────────────
-            if vr is not None and vr.outcome is not None:
+            # `not entry.chain_adopted` is task 3186 (PRD δ), the
+            # "Head-fail + tip-pass" boundary row: this head's verify came back
+            # RED about a tree the green chain tip strictly CONTAINS, so the
+            # tip is the better evidence and this verdict is declined outright
+            # — no `MergeOutcome('blocked')` is resolved for it and the prefix
+            # behind it is not stranded.  Falls through to the PASS arm, which
+            # keeps reading `vr` for `merge_wt` / `spec_warm` / `warm_results`
+            # because the verify really did run and really does own them.
+            if vr is not None and vr.outcome is not None and not entry.chain_adopted:
                 fail_merge_wt = vr.merge_wt
                 await self._release_or_cleanup(fail_merge_wt, spec_warm=vr.spec_warm)
                 # I4 runs.db surface (task 2383 β, step 18): thread the skew
@@ -19785,6 +19946,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # ── PASS: CAS advance_main ───────────────────────────────────────
             # Reached when verify passed (vr.outcome is None) or verify_task=None.
             merge_wt = entry.merge_wt if vr is None else vr.merge_wt
+            if merge_wt is None and entry.chain_adopted:
+                # task 3186 (PRD δ) only: a DECLINED fail verdict (above) is
+                # the one way this arm can be reached with `vr.merge_wt` unset
+                # — the fail path is allowed to hand back None, the pass path
+                # never is.  Scoped to the adopted case so an ordinary PASS
+                # with a missing worktree still trips the assert below rather
+                # than silently landing from the entry's stale handle.
+                merge_wt = entry.merge_wt
             assert merge_wt is not None
             # Reached only by falling through the PASSTHROUGH/pre-dispatch returns
             # above, both of which return unconditionally for a DecidedItem-backed

@@ -331,6 +331,18 @@ def cancel_request(
     # removal — i.e. a wedged warm lane, not a mis-aimed SIGKILL.  Bounded only
     # by the next run that acquires the build lane lock and overwrites it.
     #
+    # PARTIALLY CLOSED (task 3186, PRD δ).  The MERGE-WORKER-INITIATED route
+    # -- ssh -> ``orchestrator cancel-verify`` -> this function -> SIGKILL --
+    # no longer leaks the fixed key: ``cli.py:cancel_verify`` now calls
+    # :func:`remove_lock_holder_pgid` on its rc == 0 path, so the caller that
+    # skipped the victim's ``finally`` performs the clear on its behalf.  That
+    # is the route δ's head-verify teardown takes for a REMOTE lease, and its
+    # cleanliness is DF-3071's precondition (a leaked key reads BUSY and defers
+    # the fleet).  Deliberately NOT closed: the ``fire_watchdog_kill``
+    # ``os._exit(1)`` route below, which is self-inflicted and has no surviving
+    # caller to clean up after it -- still the dominant leak source, and still
+    # what the hardening note below is for.
+    #
     # Hardening (unchanged, now better motivated): stamp a boot-id alongside
     # the pgid (e.g. /proc/sys/kernel/random/boot_id) and validate it before
     # trusting the value, plus a GC for the leaked per-request files.

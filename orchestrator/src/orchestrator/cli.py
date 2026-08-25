@@ -858,6 +858,34 @@ def cancel_verify(request_id: str, config_path: Path | None):
     pgf = pgid_file(git_ops.worktree_base, request_id)
     failed_pids: list[int] = []
     rc = cancel_request(pgf, failed_pids_out=failed_pids)
+    if rc == 0:
+        # ── task 3186 (PRD δ): CLEAR THE FIXED-KEY HOLDER RENDEZVOUS ────────
+        # `cancel_request` SIGKILLs the verify-merge tree, which skips that
+        # process's own `finally` — the one that would have called
+        # `remove_lock_holder_pgid`.  The per-request pgid file it removes
+        # itself is harmless when leaked (request ids are uuid4 and never
+        # revisited), but the FIXED key is a different animal: every run
+        # overwrites it, and `GitOps._merge_verify_lease_active` probes it with
+        # `killpg(pgid, 0)`.  A leaked — or, once the pid counter wraps,
+        # RECYCLED — entry there reads as a LIVE holder, and
+        # `reset_persistent_merge_worktree` consumes that predicate FAIL-CLOSED:
+        # it raises `MergeVerifyLeaseHeld` and the warm `_merge-verify` lane is
+        # wedged until some later run happens to overwrite the key.  See
+        # verify_cancel.py's stale-file / PID-reuse note for the measured
+        # picture.
+        #
+        # ONLY on rc == 0.  A non-zero rc means a LIVE process refused SIGKILL,
+        # so it plausibly still holds both lease axes; clearing the rendezvous
+        # then would tell every reader the lane is free while it is not,
+        # converting a visible retry-or-escalate into a silent unprotected
+        # overlap.  Same fail-closed reasoning as `cancel_request`'s own
+        # retention of the per-request pgid file on that path.
+        #
+        # SCOPE: this closes the merge-worker-initiated cancel — the route δ's
+        # head-verify teardown takes for a REMOTE lease.  The
+        # `fire_watchdog_kill` `os._exit(1)` leak (verify_cancel.py:310-317) is
+        # a different route and is deliberately NOT addressed here.
+        remove_lock_holder_pgid(git_ops.worktree_base)
     for pid in failed_pids:
         click.echo(
             f'cancel-verify: PermissionError: could not SIGKILL pid {pid} '

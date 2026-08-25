@@ -2129,9 +2129,10 @@ class TestHeadCancelOnAdoption:
         ]
         assert await _rev_parse(s['repo'], 'main') == s['chain'].tip
         assert s['reqs']['100'].result.result().status == 'done'
-        rows = _finalized_rows(s['db_path'])
-        by_task = {r['task_id']: r for r in rows}
-        assert by_task['100']['state'] == 'done'
+        # `merge_finalized`'s payload keys the item by BRANCH (`bare_id`);
+        # `task_id` is a top-level event column, not a `data` field.
+        by_branch = {r['branch']: r for r in _finalized_rows(s['db_path'])}
+        assert by_branch['100']['state'] == 'done'
 
     async def test_the_head_landing_is_not_attributed_to_the_chain(
         self, git_repo: Path, tmp_path: Path, monkeypatch,
@@ -2146,11 +2147,11 @@ class TestHeadCancelOnAdoption:
         s = await _adopt_and_land(await _head_and_prefix_scene(
             git_repo, tmp_path, monkeypatch, db_name='delta-head-canary.db',
         ))
-        by_task = {r['task_id']: r for r in _finalized_rows(s['db_path'])}
+        by_branch = {r['branch']: r for r in _finalized_rows(s['db_path'])}
 
-        assert by_task['100']['landed_via_chain'] is None
+        assert by_branch['100']['landed_via_chain'] is None
         for tid in ('101', *_DELTA_LINKS):
-            assert by_task[tid]['landed_via_chain'] == 1
+            assert by_branch[tid]['landed_via_chain'] == 1
 
     async def test_a_red_head_verdict_does_not_block_the_prefix(
         self, git_repo: Path, tmp_path: Path, monkeypatch,
@@ -2248,8 +2249,10 @@ class TestHeadCancelLeavesTheLaneIdle:
             'the kernel flock axis must be free — this is the ONLY axis '
             'warm-lane-lock-guard.sh measures'
         )
-        # And the fail-closed consumer agrees: no MergeVerifyLeaseHeld.
-        assert await git_ops.reset_persistent_merge_worktree() is not None
+        # And the predicate `reset_persistent_merge_worktree` consumes
+        # FAIL-CLOSED agrees, which is the whole point of asserting the
+        # rendezvous axis separately from the flock one.
+        assert git_ops._merge_verify_lease_active() is False
 
 
 class TestRemoteCancelClearsTheHolderRendezvous:

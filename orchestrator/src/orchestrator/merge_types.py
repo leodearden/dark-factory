@@ -1489,6 +1489,22 @@ class InflightEntry:
                      _finalize_inflight sees this entry: _run_inflight_verify
                      returns it to the pool in its own ``finally``, so this
                      field is never a release handle.
+    chain_adopted  : ``True`` when δ (task 3186) claimed THIS entry for a
+                     green chain tip.  Set only on the HEAD I0 — the
+                     non-speculative trust anchor whose merge commit the
+                     speculative slot-2 item was stacked on, so the tip's
+                     cumulative tree strictly CONTAINS the head's.  PRD
+                     decision #3 makes that tip authoritative for the whole
+                     prefix, which is why the adopting exit cancels the head's
+                     own in-flight verify rather than waiting for a verdict
+                     about a subset it already has better evidence for.
+                     ``_finalize_inflight`` reads it for exactly two things:
+                     to tolerate the ``CancelledError`` that teardown produces
+                     at its ``await entry.verify_task``, and to decline a
+                     verdict that already came back RED (the PRD's
+                     "Head-fail + tip-pass" boundary row).  Never set on a
+                     chain LINK — links are landed by the walk and never had
+                     an ``InflightEntry`` at all.
     """
 
     item: SpeculativeItem
@@ -1502,6 +1518,7 @@ class InflightEntry:
     started_at: float | None = None         # time.time() at dispatch construction (≈ verify start)
     permit: SpecPermit | None = None        # ζ: speculation-slot token owned by PermitLedger; threaded/released by η
     chain: ChainResult | None = None        # γ (task 3185): the deep chain this verify was redirected onto
+    chain_adopted: bool = False             # δ (task 3186): this HEAD lands on a green tip's authority
 
     def __post_init__(self) -> None:
         """Enforce the I2-shadow invariant (task 1990 / MQ-invariants ε).
