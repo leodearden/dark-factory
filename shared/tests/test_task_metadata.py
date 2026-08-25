@@ -28,6 +28,7 @@ from shared.task_metadata import (
     ExternalDep,
     MemoryHints,
     Milestone,
+    Recurrence,
     RetryLedger,
     RoutingDecisionMirror,
     RoutingState,
@@ -622,6 +623,53 @@ class TestMilestone:
     def test_unknown_subfield_retained_and_reemitted(self):
         m = Milestone(mode='delayed', after_secs=604800, x_extra='keep')  # type: ignore[call-arg]
         dumped = m.model_dump()
+        assert dumped['x_extra'] == 'keep'
+
+
+class TestRecurrence:
+    """``metadata.recurrence`` — the recurring-chain link spec (task 4676).
+
+    PRD ``docs/prds/recurring-deterministic-tasks.md`` decision R-D4. A
+    recurrence marks one link of a chain of deterministic predicate tasks:
+    ``key`` is the stable chain id every link shares, ``interval_secs`` is
+    the cadence, and ``minted_from`` is the predecessor's task id — absent
+    on the seed link an author writes, stamped by the mint on successors.
+    """
+
+    def test_minimal_seed_link_constructs(self):
+        r = Recurrence(key='reify-closure-staleness', interval_secs=86400)
+        assert r.key == 'reify-closure-staleness'
+        assert r.interval_secs == 86400
+        assert r.minted_from is None
+
+    def test_minted_link_constructs(self):
+        r = Recurrence(key='reify-closure-staleness', interval_secs=86400, minted_from='4676')
+        assert r.minted_from == '4676'
+
+    @pytest.mark.parametrize(
+        'kwargs',
+        [
+            pytest.param({'key': 'k', 'interval_secs': 0}, id='interval_secs_zero'),
+            pytest.param({'key': 'k', 'interval_secs': -1}, id='interval_secs_negative'),
+            pytest.param({'key': 'k', 'interval_secs': '1d'}, id='interval_secs_non_int'),
+            pytest.param({'key': 'k'}, id='interval_secs_missing'),
+            pytest.param({'interval_secs': 86400}, id='key_missing'),
+            pytest.param({'key': '', 'interval_secs': 86400}, id='key_empty'),
+            pytest.param({'key': 'Reify-Closure', 'interval_secs': 86400}, id='key_upper'),
+            pytest.param({'key': 'reify_closure', 'interval_secs': 86400}, id='key_underscore'),
+            pytest.param({'key': 'reify closure', 'interval_secs': 86400}, id='key_space'),
+            pytest.param({'key': '-reify', 'interval_secs': 86400}, id='key_leading_dash'),
+            pytest.param({'key': 'reify-', 'interval_secs': 86400}, id='key_trailing_dash'),
+            pytest.param({'key': 'reify--closure', 'interval_secs': 86400}, id='key_double_dash'),
+        ],
+    )
+    def test_invalid_specs_rejected(self, kwargs):
+        with pytest.raises(ValidationError):
+            Recurrence(**kwargs)  # type: ignore[arg-type]
+
+    def test_unknown_subfield_retained_and_reemitted(self):
+        r = Recurrence(key='k', interval_secs=86400, x_extra='keep')  # type: ignore[call-arg]
+        dumped = r.model_dump()
         assert dumped['x_extra'] == 'keep'
 
 
