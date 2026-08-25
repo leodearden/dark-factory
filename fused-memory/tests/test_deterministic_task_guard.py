@@ -717,6 +717,113 @@ class TestDeterministicTaskErrorRecurrenceShape:
         assert deterministic_task_error('deterministic', meta, str(tmp_path)) is None
 
 
+class TestDeterministicTaskErrorRecurrenceCarrier:
+    """metadata.recurrence CARRIER contract via deterministic_task_error.
+
+    Contract C-1 of PRD ``docs/prds/recurring-deterministic-tasks.md``: a
+    recurrence may ride ONLY on ``task_kind='deterministic'`` ∧
+    ``before_done.kind='predicate'`` ∧ ``metadata.milestone{mode: 'dated'}``.
+    Every recurrence in this class is WELL-FORMED, so a rejection can only be
+    the carrier rule — the shape half (the class above) cannot account for it.
+
+    The seed shape r2/r6 will file is pinned by the acceptance rows: if those
+    ever go red, the feature's own carrier has become unsubmittable.
+    """
+
+    _VALID = {'key': 'reify-closure-staleness', 'interval_secs': 86400}
+
+    # -- rejections ----------------------------------------------------
+
+    def test_recurrence_on_explicit_deploy_kind_rejects(self, tmp_path):
+        """before_done.kind='deploy' + a well-formed recurrence → reject (PRD B6 shape 3).
+
+        The headline signal. The error names the offending kind and the hint
+        states the PRD "Out of scope" rationale — the combination is
+        deliberately UNRULED and forbidden UNTIL separately ruled, not an
+        oversight — so a future reader cannot mistake the rejection for a
+        gap to be quietly filled in.
+        """
+        meta = _predicate_carrier(tmp_path, dict(self._VALID))
+        meta['before_done']['kind'] = 'deploy'
+        result = deterministic_task_error('deterministic', meta, str(tmp_path))
+        _assert_recurrence_rejection(result)
+        assert 'deploy' in result['error']
+        hint = result['hint'].lower()
+        assert 'unruled' in hint
+        assert 'until' in hint
+
+    def test_recurrence_on_omitted_kind_rejects(self, tmp_path):
+        """before_done with NO kind key → reject identically ('deploy' is the default).
+
+        Guards against a rule that only checks ``kind == 'deploy'``
+        explicitly and lets the shared BeforeDone default slip through.
+        """
+        meta = _predicate_carrier(tmp_path, dict(self._VALID))
+        del meta['before_done']['kind']
+        result = deterministic_task_error('deterministic', meta, str(tmp_path))
+        _assert_recurrence_rejection(result)
+
+    def test_recurrence_on_normal_task_rejects(self):
+        """task_kind='normal' + recurrence → reject; the error names task_kind.
+
+        No before_done here — one would trip invariant 3 first and the
+        rejection would be miscredited.
+        """
+        meta = {
+            'milestone': {'mode': 'dated', 'at': '2026-09-01T00:00:00+00:00'},
+            'recurrence': dict(self._VALID),
+        }
+        result = deterministic_task_error('normal', meta, '/proj')
+        _assert_recurrence_rejection(result)
+        assert 'task_kind' in result['error']
+
+    def test_recurrence_on_pure_gate_rejects(self):
+        """A pure escalation gate (always_escalates, no before_done) is not a chain link.
+
+        Also proves the carrier clause survives ``before_done is None``
+        without raising.
+        """
+        meta = {
+            'always_escalates': True,
+            'milestone': {'mode': 'dated', 'at': '2026-09-01T00:00:00+00:00'},
+            'recurrence': dict(self._VALID),
+        }
+        result = deterministic_task_error('deterministic', meta, '/proj')
+        _assert_recurrence_rejection(result)
+
+    def test_recurrence_without_milestone_rejects(self, tmp_path):
+        """A valid predicate carrier with NO milestone → reject; the error names milestone."""
+        meta = _predicate_carrier(tmp_path, dict(self._VALID))
+        del meta['milestone']
+        result = deterministic_task_error('deterministic', meta, str(tmp_path))
+        _assert_recurrence_rejection(result)
+        assert 'milestone' in result['error']
+
+    def test_recurrence_with_delayed_milestone_rejects(self, tmp_path):
+        """mode='delayed' → reject; the error names 'dated'.
+
+        A delayed anchor carries no fire time to advance from, so C-1
+        requires a dated milestone.
+        """
+        meta = _predicate_carrier(tmp_path, dict(self._VALID))
+        meta['milestone'] = {'mode': 'delayed', 'after_secs': 86400}
+        result = deterministic_task_error('deterministic', meta, str(tmp_path))
+        _assert_recurrence_rejection(result)
+        assert 'dated' in result['error']
+
+    # -- acceptance ------------------------------------------------------
+
+    def test_full_valid_carrier_accepts(self, tmp_path):
+        """The complete C-1 carrier → accept. This is the shape r2/r6 will file."""
+        meta = _predicate_carrier(tmp_path, dict(self._VALID))
+        assert deterministic_task_error('deterministic', meta, str(tmp_path)) is None
+
+    def test_valid_carrier_with_minted_from_accepts(self, tmp_path):
+        """The successor shape r2's mint produces (minted_from set) → accept."""
+        meta = _predicate_carrier(tmp_path, {**self._VALID, 'minted_from': '4676'})
+        assert deterministic_task_error('deterministic', meta, str(tmp_path)) is None
+
+
 # ---------------------------------------------------------------------------
 # δ (task 2337, step-3): predicate before_done validation (_validate_before_done)
 # ---------------------------------------------------------------------------
