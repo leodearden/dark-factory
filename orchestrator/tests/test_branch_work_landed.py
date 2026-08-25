@@ -48,13 +48,18 @@ from _orch_helpers import (
     git_env_with_ceiling,
 )
 
-from orchestrator.config import GitConfig
+from orchestrator import landing_evidence
+from orchestrator.config import GitConfig, RecoveryEmissionConfig
 from orchestrator.git_ops import GitOps
 from orchestrator.landing_evidence import (
+    LANDING_GIT_ERROR_STORM_CATEGORY,
+    LANDING_GIT_ERROR_STORM_SENTINEL,
     LandingMethod,
     LandingReason,
+    LandingTally,
     LandingVerdict,
     branch_work_landed,
+    file_landing_git_error_storm_escalation,
     format_unattributed_landing_detail,
 )
 
@@ -1683,3 +1688,475 @@ class TestBranchWorkLandedNeverRaises:
         assert 'Unrecognized reason code' not in detail
         assert 'Unrecognized reason code' not in summary
         assert 'git_error' in summary
+
+
+# ---------------------------------------------------------------------------
+# The G7 STORM ESCAPE: a per-reason tally, and a rate-gated escape hatch for
+# `git_error`.
+#
+# `git_error` is the one code whose REPETITION means the detector is broken
+# rather than the task being unlanded, and a broken detector is silent by
+# construction: every one of its verdicts rejects, and a rejecting detector
+# looks exactly like a repo with nothing landed in it.  The tally makes the
+# silence audible, and the rate gate escalates it once — not once per verdict,
+# which would be the storm the escape hatch exists to prevent.
+# ---------------------------------------------------------------------------
+
+
+class _FakeEscalationQueue:
+    """Minimal queue exposing only what the storm filer touches.
+
+    ``has_open_l1`` mirrors the REAL semantics
+    (``escalation/src/escalation/queue.py::EscalationQueue.has_open_l1``): a
+    category filter narrows the match, and ``category=None`` matches any open
+    L1 on the id.  A stub that ignored the category would answer every dedup
+    question identically and could not distinguish the narrow guard this task
+    requires from the widened one the task-4105 incident forbids.
+    """
+
+    def __init__(
+        self,
+        *,
+        submit_raises: bool = False,
+        preopen: list[tuple[str, str]] | None = None,
+    ) -> None:
+        self.submitted: list = []
+        #: Every ``(task_id, category)`` pair the filer asked about.
+        self.checked: list[tuple[str, str | None]] = []
+        self._submit_raises = submit_raises
+        self._preopen = list(preopen or [])
+
+    def _open_rows(self) -> list[tuple[str, str]]:
+        return self._preopen + [(e.task_id, e.category) for e in self.submitted]
+
+    def has_open_l1(self, task_id: str, *, category: str | None = None) -> bool:
+        self.checked.append((task_id, category))
+        return any(
+            row_task == task_id and (category is None or row_category == category)
+            for row_task, row_category in self._open_rows()
+        )
+
+    def make_id(self, task_id: str) -> str:
+        return f'esc-{task_id}-{len(self.submitted) + 1}'
+
+    def submit(self, escalation) -> None:
+        if self._submit_raises:
+            raise RuntimeError('escalation queue is down')
+        self.submitted.append(escalation)
+
+
+def _storm_config(*, rate: int = 3, enabled: bool = True) -> RecoveryEmissionConfig:
+    """A deliberately TINY rate so a storm costs four git calls, not eleven.
+
+    The threshold under test is the comparison, not the shipped number — that
+    is pinned once, in ``test_config.py``'s ``TestRecoveryEmissionConfig``.
+    """
+    return RecoveryEmissionConfig(
+        landing_git_error_rate_per_hour=rate,
+        landing_git_error_escalation_enabled=enabled,
+    )
+
+
+async def _drive_git_errors(
+    git_ops: GitOps,
+    count: int,
+    *,
+    queue: _FakeEscalationQueue | None = None,
+    recovery_emission: RecoveryEmissionConfig | None = None,
+) -> list[LandingVerdict]:
+    """Produce *count* genuine ``git_error`` verdicts against a real repo.
+
+    An unresolvable branch ref is the cheapest one — a single ``git rev-parse``
+    that legitimately fails — so the storm is driven through the REAL producer
+    rather than by calling ``tally.record`` directly.  That matters: the thing
+    under test is that ``branch_work_landed`` charges the counter on every
+    verdict it returns, which a direct ``record`` call would assume rather than
+    check.
+    """
+    verdicts: list[LandingVerdict] = []
+    for _ in range(count):
+        verdict = await branch_work_landed(
+            git_ops, TASK_ID, 'task/does-not-exist', branch_tip_sha=None,
+            escalation_queue=queue, recovery_emission=recovery_emission,
+        )
+        assert verdict.reason is LandingReason.git_error, verdict.probe
+        verdicts.append(verdict)
+    return verdicts
+
+
+@pytest.fixture
+def tally(monkeypatch: pytest.MonkeyPatch) -> LandingTally:
+    """A FRESH module-level tally for each test.
+
+    A process-lifetime monotonic counter is exactly right in the orchestrator
+    and exactly wrong across a test session: shared, every count would depend
+    on test ORDER, and the rate gate would fire in whichever test happened to
+    run last.  Replacing the module global is the isolation seam.
+    """
+    fresh = LandingTally()
+    monkeypatch.setattr(landing_evidence, 'LANDING_TALLY', fresh)
+    return fresh
+
+
+class TestLandingTally:
+    """The tally itself: monotonic, whole-vocabulary, and window-aware."""
+
+    def test_every_reason_in_the_vocabulary_has_a_key(self) -> None:
+        """Keyed from the ENUM, so a new member can never go untallied.
+
+        Seeding from ``LandingReason`` rather than from a literal list is the
+        whole point: a future reason added to the vocabulary and forgotten here
+        would be invisible in the tally, which is the one place an operator
+        looks to find out what the detector has been saying.
+        """
+        assert set(LandingTally().snapshot()) == set(LandingReason)
+
+    def test_unseen_reasons_read_zero_rather_than_missing(self) -> None:
+        """A seeded key, not a ``KeyError`` and not an absent row."""
+        snapshot = LandingTally().snapshot()
+        assert all(count == 0 for count in snapshot.values())
+        assert snapshot[LandingReason.no_op_landing] == 0
+
+    def test_counts_accumulate_per_reason(self) -> None:
+        subject = LandingTally()
+        subject.record(LandingReason.landed)
+        subject.record(LandingReason.landed)
+        subject.record(LandingReason.git_error)
+        snapshot = subject.snapshot()
+        assert snapshot[LandingReason.landed] == 2
+        assert snapshot[LandingReason.git_error] == 1
+        assert snapshot[LandingReason.not_landed] == 0
+
+    def test_counts_are_monotonic(self) -> None:
+        """No count ever decreases, sampled across the whole sequence.
+
+        Sampled rather than end-state-checked for the same reason B1 samples
+        every churn commit: "never decreased" and "decreased and recovered" are
+        indistinguishable from a single final reading.
+        """
+        subject = LandingTally()
+        previous = subject.snapshot()
+        for index, reason in enumerate(list(LandingReason) * 3):
+            subject.record(reason)
+            current = subject.snapshot()
+            assert all(
+                current[key] >= previous[key] for key in LandingReason
+            ), f'a count decreased at step {index} ({previous} -> {current})'
+            previous = current
+        assert sum(previous.values()) == len(LandingReason) * 3
+
+    def test_the_snapshot_is_a_copy(self) -> None:
+        """A caller mutating what it got back must not corrupt the tally."""
+        subject = LandingTally()
+        subject.record(LandingReason.landed)
+        taken = subject.snapshot()
+        taken[LandingReason.landed] = 999
+        assert subject.snapshot()[LandingReason.landed] == 1
+
+    def test_the_git_error_rate_window_is_the_trailing_hour(self) -> None:
+        """The RATE window and the MONOTONIC tally are different questions.
+
+        The tally answers "what has this detector said, ever" and must never
+        decrease.  The rate window answers "is it failing RIGHT NOW" and must,
+        or a single bad hour would keep the alarm latched for the life of the
+        process.
+        """
+        now = [0.0]
+        subject = LandingTally(clock=lambda: now[0])
+        for _ in range(5):
+            subject.record(LandingReason.git_error)
+        assert subject.git_error_count_in_window() == 5
+
+        now[0] = subject.window_secs + 1.0
+        assert subject.git_error_count_in_window() == 0, 'the window must slide'
+        assert subject.snapshot()[LandingReason.git_error] == 5, (
+            'the cumulative tally is monotonic and must NOT slide with it'
+        )
+
+    def test_only_git_error_charges_the_rate_window(self) -> None:
+        """A repo with genuinely nothing landed in it is not a storm."""
+        subject = LandingTally()
+        for reason in LandingReason:
+            if reason is not LandingReason.git_error:
+                subject.record(reason)
+        assert subject.git_error_count_in_window() == 0
+
+
+@pytest.mark.asyncio
+class TestTallyIsChargedByEveryVerdict:
+    """``branch_work_landed`` charges the tally on EVERY verdict it returns."""
+
+    async def test_an_accept_and_a_git_error_are_both_recorded(
+        self, git_ops: GitOps, repo: _Repo, tally: LandingTally,
+    ) -> None:
+        scenario = build_rebased_landing(repo)
+        accepted = await branch_work_landed(
+            git_ops, TASK_ID, scenario.branch,
+            branch_tip_sha=scenario.branch_tip_sha, metadata=scenario.metadata,
+        )
+        assert accepted.accepted is True
+        assert tally.snapshot()[LandingReason.landed] == 1
+
+        await _drive_git_errors(git_ops, 1)
+        snapshot = tally.snapshot()
+        assert snapshot[LandingReason.landed] == 1
+        assert snapshot[LandingReason.git_error] == 1
+
+    async def test_a_rejection_is_recorded_under_its_own_reason(
+        self, git_ops: GitOps, repo: _Repo, tally: LandingTally,
+    ) -> None:
+        scenario = build_unlanded_branch(repo)
+        await branch_work_landed(
+            git_ops, TASK_ID, scenario.branch,
+            branch_tip_sha=scenario.branch_tip_sha, metadata=scenario.metadata,
+        )
+        assert tally.snapshot()[LandingReason.not_landed] == 1
+
+    async def test_every_pass_logs_the_snapshot(
+        self, git_ops: GitOps, repo: _Repo, tally: LandingTally,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """An operator must be able to see the tally WITHOUT a dashboard.
+
+        A counter nobody can read is not an escape hatch; it is a second
+        silence layered on the first.
+        """
+        scenario = build_rebased_landing(repo)
+        with caplog.at_level('INFO', logger='orchestrator.landing_evidence'):
+            await branch_work_landed(
+                git_ops, TASK_ID, scenario.branch,
+                branch_tip_sha=scenario.branch_tip_sha, metadata=scenario.metadata,
+            )
+        messages = [record.getMessage() for record in caplog.records]
+        assert any('landing tally' in message for message in messages), messages
+        assert any('landed' in message for message in messages), messages
+
+
+@pytest.mark.asyncio
+class TestGitErrorStormEscape:
+    """The rate-gated L1: fires ONCE per storm, and only for ``git_error``."""
+
+    async def test_no_queue_files_nothing_and_never_raises(
+        self, git_ops: GitOps, repo: _Repo, tally: LandingTally,
+    ) -> None:
+        """``escalation_queue=None`` is a SUPPORTED shape, not a degraded one.
+
+        Every verdict this producer returns is correct without a queue (bare
+        harness and bare worker unit tests construct exactly that), so a
+        missing queue must cost the storm alarm and nothing else — the same
+        best-effort guard ``file_unattributed_landing_escalation`` uses.
+        """
+        build_unlanded_branch(repo)
+        verdicts = await _drive_git_errors(
+            git_ops, 5, queue=None, recovery_emission=_storm_config(rate=1),
+        )
+        assert len(verdicts) == 5
+        assert tally.git_error_count_in_window() == 5
+
+    async def test_more_than_the_rate_files_exactly_one_blocking_l1(
+        self, git_ops: GitOps, repo: _Repo, tally: LandingTally,
+    ) -> None:
+        build_unlanded_branch(repo)
+        queue = _FakeEscalationQueue()
+        await _drive_git_errors(
+            git_ops, 4, queue=queue, recovery_emission=_storm_config(rate=3),
+        )
+        assert len(queue.submitted) == 1, (
+            'a storm files ONE alarm; one per verdict IS the storm'
+        )
+        escalation = queue.submitted[0]
+        assert escalation.severity == 'blocking'
+        assert escalation.level == 1
+
+    async def test_at_or_below_the_rate_files_none(
+        self, git_ops: GitOps, repo: _Repo, tally: LandingTally,
+    ) -> None:
+        """The threshold is a strict EXCEEDANCE, so the rate itself is quiet."""
+        build_unlanded_branch(repo)
+        queue = _FakeEscalationQueue()
+        await _drive_git_errors(
+            git_ops, 3, queue=queue, recovery_emission=_storm_config(rate=3),
+        )
+        assert queue.submitted == []
+
+    async def test_other_reasons_never_file_however_many_there_are(
+        self, git_ops: GitOps, repo: _Repo, tally: LandingTally,
+    ) -> None:
+        """A repo with genuinely nothing landed must never page anyone."""
+        scenario = build_unlanded_branch(repo)
+        queue = _FakeEscalationQueue()
+        for _ in range(6):
+            verdict = await branch_work_landed(
+                git_ops, TASK_ID, scenario.branch,
+                branch_tip_sha=scenario.branch_tip_sha, metadata=scenario.metadata,
+                escalation_queue=queue, recovery_emission=_storm_config(rate=1),
+            )
+            assert verdict.reason is LandingReason.not_landed
+        assert queue.submitted == []
+
+    async def test_the_kill_switch_suppresses_the_filing_not_the_tally(
+        self, git_ops: GitOps, repo: _Repo, tally: LandingTally,
+    ) -> None:
+        """The narrow kill switch: silence the alarm, keep the telemetry.
+
+        Same discipline as ``streak_escalation_enabled`` — the only part of the
+        mechanism that WRITES to the escalation queue gets its own switch, so a
+        noisy alarm can be silenced without losing what explains it.
+        """
+        build_unlanded_branch(repo)
+        queue = _FakeEscalationQueue()
+        await _drive_git_errors(
+            git_ops, 4, queue=queue,
+            recovery_emission=_storm_config(rate=3, enabled=False),
+        )
+        assert queue.submitted == []
+        assert tally.snapshot()[LandingReason.git_error] == 4
+
+    async def test_the_dedup_uses_its_own_category(
+        self, git_ops: GitOps, repo: _Repo, tally: LandingTally,
+    ) -> None:
+        """NEVER ``provenance_unattributed``, and never a bare ``task_id``.
+
+        Category scoping is load-bearing after the task-4105 incident
+        (``landing_evidence.py::file_unattributed_landing_escalation``): a
+        ``category=None`` dedup matches ANY open L1, so an unrelated escalation
+        silently suppresses the filing.  Widening it back would let a broken
+        DETECTOR hide behind whatever else happened to be open.
+        """
+        build_unlanded_branch(repo)
+        queue = _FakeEscalationQueue()
+        await _drive_git_errors(
+            git_ops, 4, queue=queue, recovery_emission=_storm_config(rate=3),
+        )
+        assert queue.checked, 'the filer must consult has_open_l1'
+        for _task_id, category in queue.checked:
+            assert category == LANDING_GIT_ERROR_STORM_CATEGORY
+            assert category is not None, 'a bare task_id dedup is the 4105 defect'
+            assert category != 'provenance_unattributed'
+        assert queue.submitted[0].category == LANDING_GIT_ERROR_STORM_CATEGORY
+
+    async def test_a_second_storm_in_the_same_window_files_no_duplicate(
+        self, git_ops: GitOps, repo: _Repo, tally: LandingTally,
+    ) -> None:
+        build_unlanded_branch(repo)
+        queue = _FakeEscalationQueue()
+        await _drive_git_errors(
+            git_ops, 4, queue=queue, recovery_emission=_storm_config(rate=3),
+        )
+        assert len(queue.submitted) == 1
+        await _drive_git_errors(
+            git_ops, 4, queue=queue, recovery_emission=_storm_config(rate=3),
+        )
+        assert len(queue.submitted) == 1, 'has_open_l1 must suppress the re-file'
+
+    async def test_an_open_l1_in_another_category_does_not_suppress_it(
+        self, git_ops: GitOps, repo: _Repo, tally: LandingTally,
+    ) -> None:
+        """The other half of the 4105 lesson, asserted in the live direction."""
+        build_unlanded_branch(repo)
+        queue = _FakeEscalationQueue(
+            preopen=[(LANDING_GIT_ERROR_STORM_SENTINEL, 'task_failure')],
+        )
+        await _drive_git_errors(
+            git_ops, 4, queue=queue, recovery_emission=_storm_config(rate=3),
+        )
+        assert len(queue.submitted) == 1
+
+    async def test_it_is_filed_against_a_synthetic_sentinel_not_a_task(
+        self, git_ops: GitOps, repo: _Repo, tally: LandingTally,
+    ) -> None:
+        """A storm is a claim about the DETECTOR, so it names no task.
+
+        Filing it against a real task id would be arbitrary (a storm spans
+        every task the sweep touched) and actively harmful: an open L1 on a
+        task is read by the recovery predicates as a hold, so the alarm would
+        deepen the very strand it reports.  Same reasoning and same shape as
+        ``recovery_emission.RECOVERY_VETO_STREAK_SENTINEL_PREFIX``.
+        """
+        build_unlanded_branch(repo)
+        queue = _FakeEscalationQueue()
+        await _drive_git_errors(
+            git_ops, 4, queue=queue, recovery_emission=_storm_config(rate=3),
+        )
+        escalation = queue.submitted[0]
+        assert escalation.task_id == LANDING_GIT_ERROR_STORM_SENTINEL
+        assert escalation.task_id != TASK_ID
+
+    async def test_the_detail_names_the_tally_the_window_and_the_threshold(
+        self, git_ops: GitOps, repo: _Repo, tally: LandingTally,
+    ) -> None:
+        build_unlanded_branch(repo)
+        queue = _FakeEscalationQueue()
+        await _drive_git_errors(
+            git_ops, 4, queue=queue, recovery_emission=_storm_config(rate=3),
+        )
+        detail = queue.submitted[0].detail
+        assert 'git_error' in detail
+        assert '4' in detail, 'the observed count'
+        assert '3' in detail, 'the configured threshold'
+        assert 'hour' in detail.lower(), 'the window'
+        # The per-reason tally, not just the git_error row.
+        for reason in LandingReason:
+            assert str(reason) in detail, f'{reason} missing from the tally block'
+
+    async def test_the_detail_says_the_detector_is_broken(
+        self, git_ops: GitOps, repo: _Repo, tally: LandingTally,
+    ) -> None:
+        """The one sentence that decides what the reader does next.
+
+        Without it a human reads a wall of rejected verdicts and concludes the
+        tasks never landed — which is precisely the inference this whole PRD
+        exists to prevent, made by a person instead of by code.
+        """
+        build_unlanded_branch(repo)
+        queue = _FakeEscalationQueue()
+        await _drive_git_errors(
+            git_ops, 4, queue=queue, recovery_emission=_storm_config(rate=3),
+        )
+        escalation = queue.submitted[0]
+        blob = f'{escalation.summary}\n{escalation.detail}'.lower()
+        assert 'detector' in blob
+        assert 'not_landed' in blob, (
+            'the detail must say plainly that these are NOT not_landed verdicts'
+        )
+        assert escalation.suggested_action
+
+    async def test_a_broken_queue_never_breaks_the_verdict(
+        self, git_ops: GitOps, repo: _Repo, tally: LandingTally,
+    ) -> None:
+        """Best-effort, exactly as the sibling filer is: log and continue.
+
+        A recovery sweep that dies because its own alarm could not be filed
+        stops recovering every OTHER task in the same pass.
+        """
+        build_unlanded_branch(repo)
+        queue = _FakeEscalationQueue(submit_raises=True)
+        verdicts = await _drive_git_errors(
+            git_ops, 4, queue=queue, recovery_emission=_storm_config(rate=3),
+        )
+        assert all(v.reason is LandingReason.git_error for v in verdicts)
+        assert queue.submitted == []
+
+    async def test_the_filer_is_directly_callable_and_reports_what_it_did(
+        self, tally: LandingTally,
+    ) -> None:
+        """The filing is a named, testable unit — not an inline block.
+
+        ``file_unattributed_landing_escalation`` is extracted for the same
+        reason: two call sites already inline near-verbatim filing boilerplate,
+        and a third would have been the copy that drifts.
+        """
+        for _ in range(4):
+            tally.record(LandingReason.git_error)
+        queue = _FakeEscalationQueue()
+        filed = file_landing_git_error_storm_escalation(
+            queue, tally=tally, rate_per_hour=3,
+        )
+        assert filed is True
+        assert len(queue.submitted) == 1
+        assert file_landing_git_error_storm_escalation(
+            queue, tally=tally, rate_per_hour=3,
+        ) is False, 'the dedup answer must be reported, not merely applied'
+        assert file_landing_git_error_storm_escalation(
+            None, tally=tally, rate_per_hour=3,
+        ) is False
