@@ -69,7 +69,7 @@ from typing import NamedTuple
 # scripts/, and this script must NEVER be invoked via `python -m` — the CLI
 # tests shell out to the script path and resolve this import solely because a
 # DIRECTLY-EXECUTED script puts its own directory at sys.path[0].
-from _task_db_scan import tasks_db_path
+from _task_db_scan import format_coverage_block, format_kv_line, tasks_db_path
 
 # Bind `shared` to the SAME checkout as this script via a __file__-relative
 # path, never a hardcoded absolute. An editable install puts the MAIN
@@ -450,3 +450,142 @@ def audit_project(project_root: str, manifest_root: str | None = None) -> Projec
             uncomparable_details=tuple(uncomparable_details),
         ),
     )
+
+
+_COVERAGE_CAVEAT = (
+    "  COVERAGE (the findings above are a comparison of MATCHED PAIRS only, "
+    "not the whole corpus - a capability with no same-named task-record entry, "
+    "a manifest binding a task_id with no tasks.db row, and an unparseable "
+    "sidecar are all counted here and are NONE of them drift; the "
+    "missing-entry class is owned by audit_combine_gate_marker_loss.py and is "
+    "never remediated from this report):"
+)
+
+# Printed ABOVE a git-discovery-failed project's rows, because a reader must
+# see that the zero below means "nothing was enumerated" before reading it as
+# "nothing was wrong".
+_DISCOVERY_FAILED_NOTICE = (
+    "  WARNING: the manifest corpus could not be enumerated -- this is NOT a "
+    "clean result, it is an UNKNOWN one (an empty corpus and a clean corpus "
+    "are indistinguishable in the finding count below)"
+)
+
+
+def _format_finding_line(drift: DescriptorDrift) -> str:
+    """One drift row, in the sibling audits' ``key=value`` style.
+
+    The field set and order are this script's; format_kv_line supplies only the
+    indent and separator. ``fields`` is deliberately shorter than the
+    ``differing_fields`` attribute it carries.
+    """
+    return format_kv_line([
+        ("manifest", drift.manifest),
+        ("task_id", drift.task_id),
+        ("capability", drift.capability),
+        ("fields", ",".join(drift.differing_fields)),
+    ])
+
+
+def _format_coverage(coverage: AuditCoverage) -> list[str]:
+    """Render the always-printed coverage block.
+
+    Never omitted and never abbreviated when there are no findings: the point
+    is that the finding list compares matched pairs only, and a reader must be
+    told the size of the unpaired remainder.
+
+    The details NAME the unreadable sidecars and the unvalidatable task
+    entries, never just count them. A count alone tells an operator that
+    coverage is incomplete but not where to look, which swallows the failure at
+    exactly the reporting boundary no-silent-fail-soft is about.
+
+    Only the ALIGNMENT is shared with the sibling audits (via
+    format_coverage_block); _COVERAGE_CAVEAT and the labels below are this
+    script's, and say what THIS script could not see.
+    """
+    return format_coverage_block(
+        _COVERAGE_CAVEAT,
+        [
+            ("manifests swept:", coverage.manifests_swept),
+            ("mechanical capabilities compared:", coverage.mechanical_capabilities_compared),
+            ("capabilities with no task entry:", coverage.capabilities_without_task_entry),
+            ("manifest tasks with no db row:", coverage.manifest_tasks_without_db_row),
+            ("unvalidatable task entries:", coverage.malformed_task_entries),
+            ("manifests that failed to parse:", coverage.manifest_parse_failures),
+        ],
+        details=(*coverage.manifest_parse_failure_details, *coverage.uncomparable_details),
+    )
+
+
+def format_report(audits: list[ProjectAudit]) -> str:
+    """Render *audits* as a human-readable report.
+
+    Every project gets its COVERAGE block, INCLUDING projects with zero
+    findings — see :func:`_format_coverage`.
+
+    Both roots are named on the header line so a ``--manifest-root`` run is
+    unambiguous: a reader never has to guess which manifest tree was compared
+    against which task store.
+
+    Pure: returns the text and never prints. ``main()`` does the single print.
+    """
+    lines: list[str] = []
+    total = 0
+    for audit in audits:
+        if audit.manifest_root == audit.project_root:
+            lines.append(f"{audit.project_root}:")
+        else:
+            lines.append(
+                f"{audit.project_root} (manifests from {audit.manifest_root}):"
+            )
+        if audit.coverage.git_discovery_failed:
+            # ABOVE the rows on purpose — see _DISCOVERY_FAILED_NOTICE.
+            lines.append(_DISCOVERY_FAILED_NOTICE)
+
+        total += len(audit.findings)
+        lines.append(f"  -- drifted descriptors ({len(audit.findings)}) --")
+        for drift in audit.findings:
+            lines.append(_format_finding_line(drift))
+            for field in drift.differing_fields:
+                lines.append(
+                    f"      {field}: sidecar={drift.sidecar_check[field]!r} "
+                    f"task={drift.task_check[field]!r}"
+                )
+        lines.extend(_format_coverage(audit.coverage))
+
+    lines.append(
+        f"{total} drifted descriptor(s) across {len(audits)} project(s)"
+    )
+    return "\n".join(lines)
+
+
+def format_json(audits: list[ProjectAudit]) -> str:
+    """Render *audits* as a JSON OBJECT (never a bare array).
+
+    An object because the coverage block must travel WITH the findings: a
+    machine consumer handed a bare finding array could read it as the whole
+    corpus, which is the exact false-completeness the coverage block exists to
+    prevent. The caveat prose ships in the payload for the same reason.
+    """
+    return json.dumps({
+        "caveat": _COVERAGE_CAVEAT,
+        "projects": [
+            {
+                "project_root": audit.project_root,
+                "manifest_root": audit.manifest_root,
+                "coverage": audit.coverage._asdict(),
+                "findings": [drift._asdict() for drift in audit.findings],
+            }
+            for audit in audits
+        ],
+    })
+
+
+def _is_dirty(audits: list[ProjectAudit]) -> bool:
+    """Exit 1 keys on findings OR a failed manifest discovery.
+
+    The second disjunct is not belt-and-braces. An empty corpus and a clean
+    corpus are INDISTINGUISHABLE in the finding count, and only one of them is
+    good news — so a run that could not enumerate the corpus must never exit 0
+    (docs/legibility/design-invariants.md, no-silent-fail-soft).
+    """
+    return any(a.findings or a.coverage.git_discovery_failed for a in audits)

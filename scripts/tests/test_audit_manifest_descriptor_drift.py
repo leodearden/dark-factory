@@ -598,12 +598,12 @@ def test_report_coverage_rows_render_with_their_column_alignment(
 
     lines = format_report([audit_project(str(root))]).splitlines()
 
-    assert " manifests swept:                   1" in lines
-    assert " mechanical capabilities compared:  1" in lines
-    assert " capabilities with no task entry:   1" in lines
-    assert " manifest tasks with no db row:     0" in lines
-    assert " unvalidatable task entries:        0" in lines
-    assert " manifests that failed to parse:    0" in lines
+    assert "    manifests swept:                    1" in lines
+    assert "    mechanical capabilities compared:   1" in lines
+    assert "    capabilities with no task entry:    1" in lines
+    assert "    manifest tasks with no db row:      0" in lines
+    assert "    unvalidatable task entries:         0" in lines
+    assert "    manifests that failed to parse:     0" in lines
 
 
 def test_finding_line_names_manifest_task_capability_and_fields(
