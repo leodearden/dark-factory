@@ -39,6 +39,7 @@ import tempfile
 from pathlib import Path
 
 import pytest
+from fastmcp.tools.function_tool import FunctionTool
 from shared.toolcall_markup import detect, repair
 
 from escalation.queue import EscalationQueue
@@ -196,6 +197,18 @@ async def _escalate_info_call_shape() -> tuple[frozenset[str], frozenset[str]]:
             EscalationQueue(Path(tmp) / "esc"), startup_sweep=False
         )
         tool = await server.get_tool("escalate_info")
+        # `get_tool` is typed `Tool | None`, and the base `Tool` declares no
+        # `.fn` — only the `FunctionTool` subclass does. Narrow before the
+        # standard `tool.fn` unit-test read, the convention established by
+        # `orchestrator/tests/test_workflow_e2e.py::test_steward_l1_reescalation_survives_the_wip_l0_sweep`.
+        # The assertion is load-bearing beyond the type checker: if
+        # `escalate_info` ever stops being registered, or is re-registered as
+        # a non-function tool, the derivation below would otherwise fail with
+        # an opaque AttributeError instead of naming the cause.
+        assert isinstance(tool, FunctionTool), (
+            "escalate_info is not registered on the escalation server as a "
+            "FunctionTool; the replayed call shape cannot be derived"
+        )
         parameters = inspect.signature(tool.fn).parameters
 
     schema_params = frozenset(parameters)
