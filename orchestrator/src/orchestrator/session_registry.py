@@ -1373,6 +1373,131 @@ def normalize_escalations_dir(value: str | Path) -> str:
         return raw
 
 
+_PROJECT_TOKEN_UNDERSCORE_RE = re.compile(r'_+')
+"""Collapses a run of '_' to one, mirroring the _DECISION_ID_SANITIZE_RE
+idiom (module-level compiled regex, used by exactly one normalizer). Applied
+AFTER '-' has been translated to '_', so 'dark--factory' and 'dark-_factory'
+both land on 'dark_factory'."""
+
+
+PROJECT_TOKEN_ALIASES: dict[str, str] = {
+    'df': 'dark_factory',
+}
+"""Maps an ALREADY-FOLDED project token to its ALREADY-FOLDED canonical
+spelling, for the cases case/separator folding alone cannot merge (task
+3807). Applied as the LAST step of normalize_project_token, so both key and
+value must themselves already be canonical under the fold.
+
+ADMISSION RULE for a new entry -- the canonical value must be the
+``memory.project_id`` declared by a real project root's
+``dark-factory-orchestrator.yaml``. That keeps the table mechanical and
+auditable instead of a per-case judgement call, and it is the reason this
+table is deliberately NOT a config read: this module is stdlib-only with no
+intra-orchestrator imports (see module docstring), so the mapping is a
+hand-maintained constant kept in sync with those configs.
+
+EVIDENCE for the sole seeded entry: three independent declarations name
+``dark_factory`` as this project's identity -- ``dark-factory-orchestrator
+.yaml`` (``memory.project_id``), ``orchestrator/src/orchestrator/config.py``
+(the ``project_id`` field default), and CLAUDE.md's write-tagging
+convention. ``df`` appears ONLY inside the decision registry and as a
+hand-typed ``df-`` prefix on ``--id`` (which is part of the id a human
+types, never derived from ``--project``), so aliasing it costs nothing
+elsewhere.
+
+Folding alone merges a split whose spellings differ ONLY by case or
+separator -- ``autopilot-video`` = ``autopilot_video`` -- so those need no
+entry here. It does NOT reconcile a project whose filed tokens fold to
+something OTHER than its declared ``memory.project_id``; only an alias can
+bridge that.
+
+KNOWN RESIDUAL GAP (measured 2026-08-07, 407 records):
+``/home/leo/src/solar-challenge`` declares ``my_solar_challenge``, but its
+5 OPEN decisions are filed under ``solar-challenge`` (3) and
+``solar_challenge`` (2). Folding merges those two into ONE bucket --
+strictly better than before, when a reap scoped to either missed the other
+-- but the bucket is named ``solar_challenge``, so a reaper passing the
+config-declared ``my_solar_challenge`` matches ZERO of them. Adding
+``'solar_challenge': 'my_solar_challenge'`` would close it and the
+admission rule above already licenses it; that call is deliberately NOT
+made here because it is a cross-project behaviour change owned by its own
+filed decision task (3813). Until it lands, reap that project with a token
+that folds to ``solar_challenge`` -- and note the collapse guard is
+unaffected either way, since ``solar_challenge_platform`` is a distinct
+project root with a distinct folded token."""
+
+
+def normalize_project_token(value: object) -> str:
+    """The ONE canonical spelling of a project token (task 3807).
+
+    Direct sibling of ``normalize_escalations_dir`` and wired the same way:
+    both sides of the (fleet-global decisions <-> per-project reaper) join
+    run their project token through this one helper -- the ``write-decision``
+    verb stamps the normalized form onto ``DecisionRecord.project``, and the
+    ``reap-decisions`` verb normalizes both its own ``--project`` and the
+    decision's stored value before comparing them. Routing both through one
+    function is what makes ``df``, ``dark-factory`` and ``Dark_Factory``
+    compare EQUAL; a raw string compare silently PARTITIONS one project's
+    decisions, which is the bug this exists to prevent (measured 2026-08-06:
+    41 OPEN dark-factory decisions split 22/17/2 across
+    ``dark_factory``/``df``/``dark-factory``, each partition invisible to a
+    reap scoped to either of the others).
+
+    The fold: strip, casefold, ``-`` -> ``_``, collapse ``_`` runs, strip
+    edge ``_``, then apply PROJECT_TOKEN_ALIASES.
+
+    Returns ``''`` -- the "unset" sentinel, never a token -- for an empty,
+    whitespace-only or ``None`` *value*, mirroring normalize_escalations_dir's
+    ``''`` contract so a reader learns ONE rule for both boundary
+    normalizers. ``''`` only ever matches ``''``, so an unset token cannot
+    accidentally join a real project.
+
+    IDEMPOTENT: ``f(f(x)) == f(x)`` for every input. Load-bearing --
+    ``migrate_decision_project_tokens`` decides a record is already canonical
+    by comparing ``normalize_project_token(p) == p``, so a non-idempotent
+    fold would rewrite every record on every run.
+
+    It deliberately merges ONLY case and separator differences (plus an
+    explicit alias). It does NOT merge tokens that differ by more than that:
+    ``solar_challenge`` and ``solar_challenge_platform`` are two DIFFERENT
+    project roots whose tokens merely share a prefix, and merging them would
+    let one project's reaper close the other's decisions -- strictly worse
+    than the bug being fixed. A named collapse-guard test pins that.
+
+    SCOPE: this canonicalizes ``DecisionRecord.project`` ONLY.
+    ``SessionRecord.project`` is the other half of the same fleet-global
+    project axis and is deliberately NOT normalized here -- the cockpit
+    unions the two (``known_projects`` over records + decisions, and one
+    ``project_weights`` lookup keyed on ``item.project`` for both row kinds),
+    so until the session side folds too, the picker can list one project
+    under two names and an operator-set weight keyed on the session spelling
+    will not apply to decision rows. That is a KNOWN, filed gap (task 3812),
+    not an oversight: the session population is ~39k records written on the
+    spawn path, and folding it is a strictly larger change than task 3807's
+    decision-registry fix. Do not read "canonical" here as "canonical
+    fleet-wide".
+
+    Stdlib-only and fail-soft: never raises, and coerces a non-str *value*
+    via ``str()`` rather than rejecting it -- ``42`` becomes ``'42'``, which
+    matches no real project (the fail-OPEN direction, leaving a decision
+    visible to the human rather than risking a false close). ``None`` is the
+    one coercion NOT left to ``str()``: it means "unset", but ``str(None)``
+    would fold to ``'none'`` -- an ordinary-looking token, not a sentinel --
+    so a hand-edited record carrying ``"project": null`` (which
+    ``DecisionRecord.from_dict`` accepts unguarded) would be migrated onto a
+    literal ``'none'`` bucket a reaper could then match. ``None`` therefore
+    maps to ``''`` alongside the empty string. Keeps this module's
+    no-intra-orchestrator-imports rule (see module docstring).
+    """
+    if value is None:
+        return ''
+    raw = str(value).strip()
+    if not raw:
+        return ''
+    folded = _PROJECT_TOKEN_UNDERSCORE_RE.sub('_', raw.casefold().replace('-', '_')).strip('_')
+    return PROJECT_TOKEN_ALIASES.get(folded, folded)
+
+
 def read_escalation_status(escalations_dir: Path | str, escalation_id: str) -> str | None:
     """Best-effort read of *escalation_id*'s ``status`` field (Fleet Cockpit C8 reaper).
 
@@ -1499,6 +1624,156 @@ def reap_answered_decisions(
             ReapedDecision(id=decision.id, escalation_id=escalation_id, new_state=str(new_state))
         )
     return reaped
+
+
+@dataclass(frozen=True)
+class MigratedDecision:
+    """One DecisionRecord whose project token was canonicalized (task 3807).
+
+    id: the migrated decision's id -- NEVER rewritten by the migration, so
+        this is also its filename stem before and after.
+    old_project: the non-canonical token it was filed under.
+    new_project: the canonical token it now carries (see
+        normalize_project_token).
+    """
+
+    id: str
+    old_project: str
+    new_project: str
+
+
+def migrate_decision_project_tokens(
+    root: Path | str | None = None,
+    *,
+    dry_run: bool = False,
+) -> list[MigratedDecision]:
+    """One-shot, idempotent backfill of DecisionRecord.project onto the canonical token.
+
+    Repairs the population filed BEFORE ``write-decision`` canonicalized
+    ``--project`` (task 3807). For each ``list_decisions(root)`` entry whose
+    stored token differs from ``normalize_project_token`` of itself, rewrites
+    ONLY that field. Returns one MigratedDecision per record actually
+    changed; an already-canonical record and an unrelated project's record
+    are skipped and absent from the result.
+
+    Load-bearing invariants, in the order they matter:
+
+    (a) SAME LOCK AS EVERY OTHER MUTATOR. The read-modify-write runs under
+        ``decision_id_lock``, exactly as ``update_decision_state`` and
+        ``set_manual_boost`` do, so a concurrent cockpit ``set_manual_boost``
+        or watcher state-update on the SAME id is serialized rather than
+        having one side's mutation dropped.
+
+    (b) RE-READ INSIDE THE LOCK, AND RECOMPUTE FROM THE RE-READ. The scan is
+        a point-in-time snapshot; a state transition landing between the scan
+        and the write would be ROLLED BACK by writing that stale snapshot, so
+        re-reading under the lock is what stops the sweep resurrecting a
+        decision the human just answered. That argument only covers the
+        carried-through fields, so the ONE field this sweep writes is
+        recomputed from the re-read record too: both "does this still need
+        migrating?" and the new token come from what is actually on disk
+        under the lock, never from the snapshot. Otherwise a writer that
+        changed ``.project`` in that window would be clobbered by a value
+        derived from the old spelling, and the reported ``old_project`` would
+        name a value that was never on disk at write time -- an audit trail
+        that quietly lies. A record another writer already canonicalized in
+        the window is simply skipped. (The snapshot IS still used as a cheap
+        pre-filter, to avoid locking the already-canonical majority; a
+        pre-filter that lets through a record needing no work costs one
+        wasted lock, never a wrong write.)
+
+    (c) ONLY ``.project`` IS TOUCHED. ``state`` and ``filed_at`` (and every
+        other field) are carried through from the re-read record untouched,
+        so an already-ANSWERED/DROPPED row can never be reopened and the
+        cockpit's age/ordering signal is not restamped. (a)+(b)+(c) make this
+        structurally identical to ``update_decision_state``, so the guarantee
+        is inherited from a shape already pinned by TestDecisionIdLock rather
+        than re-argued here.
+
+    (d) IDEMPOTENT. Because ``normalize_project_token`` is idempotent, a
+        second run finds nothing to change and returns ``[]`` without
+        rewriting a single file. That is what makes this safe to keep
+        permanently as the repair tool for a hand-edited record, rather than
+        a one-shot script that must be deleted after use.
+
+    (e) THE ID IS NEVER REWRITTEN. Only the ``project`` FIELD moves; the
+        record keeps its id and therefore its ``<id>.json`` filename, so the
+        ``df-`` prefix on ids like ``df-esc-3524-1`` and every cockpit
+        cross-link survive intact.
+
+    (f) ``dry_run=True`` PREVIEWS, guaranteed side-effect-free. It returns
+        the MigratedDecision list the real run would produce over a quiescent
+        tree, reporting off the scan snapshot because taking no lock is the
+        whole point -- so a record mutated between the preview and the real
+        run is reported as the preview saw it, which is what "preview" means.
+        It takes no lock and performs no write, so an operator can see the
+        full rewrite of the live population before committing to it. It does
+        not even materialize a ``<id>.json.lock`` sidecar, which matters
+        because ``decision_id_lock`` documents that merely TAKING a lock
+        creates one (its ORPHAN SIDECARS note); a preview that littered one
+        per record across the whole fleet would not be side-effect-free.
+
+    Iterates ``list_decisions`` rather than doing its own scan, inheriting
+    its skip-a-corrupt-file tolerance for free. FAIL-SOFT PER RECORD: the
+    lock/read/write span is guarded, so a record that is unreadable,
+    unwritable, or faults mid-write is logged at ERROR and skipped while the
+    sweep of the rest completes -- one bad record must never deny the
+    operator the repair of the other 390, matching the module-wide
+    convention (``write_decision``, ``update_decision_state`` and
+    ``list_decisions`` all self-guard). A record whose write fails is simply
+    absent from the returned list, mirroring ``reap_answered_decisions``'
+    "only record it when the update actually succeeded" contract.
+    """
+    migrated: list[MigratedDecision] = []
+    for decision in list_decisions(root):
+        # Cheap pre-filter off the scan snapshot -- avoids taking a lock for
+        # the (usually large) already-canonical majority. NOT the decision of
+        # record: for a real run that is re-made under the lock below.
+        if normalize_project_token(decision.project) == decision.project:
+            continue
+        if dry_run:
+            migrated.append(
+                MigratedDecision(
+                    id=decision.id,
+                    old_project=decision.project,
+                    new_project=normalize_project_token(decision.project),
+                )
+            )
+            continue
+        try:
+            path = decision_path_for_id(decision.id, root=root)
+            with decision_id_lock(decision.id, root=root):
+                # Re-read under the lock -- see invariant (b). Both the
+                # decision to migrate AND the value written are recomputed
+                # from THIS record, never from the snapshot: a writer that
+                # changed .project between the scan and the lock must not
+                # have its value clobbered by one derived from the old
+                # spelling, and old_project must name what was actually on
+                # disk at write time or the audit trail lies.
+                record = DecisionRecord.from_json(path.read_text())
+                old_project = record.project
+                new_project = normalize_project_token(old_project)
+                if new_project == old_project:
+                    # A concurrent writer already canonicalized it.
+                    continue
+                record.project = new_project
+                if not write_decision(record, root=root):
+                    continue
+                migrated.append(
+                    MigratedDecision(
+                        id=decision.id,
+                        old_project=old_project,
+                        new_project=new_project,
+                    )
+                )
+        except Exception:
+            logger.error(
+                'migrate_decision_project_tokens: skipping %s',
+                decision.id,
+                exc_info=True,
+            )
+            continue
+    return migrated
 
 
 # ---------------------------------------------------------------------------
@@ -3429,6 +3704,26 @@ def _run_write_decision(
     weight this ask (Fleet Cockpit F7 fix 1); defaults to '' when the
     caller doesn't supply one.
 
+    ``project`` is stored NORMALIZED (see normalize_project_token, task
+    3807), so ``df``, ``dark-factory`` and ``Dark_Factory`` all persist as
+    the one canonical ``dark_factory`` and ``reap-decisions`` can no longer
+    miss a partition. This NORMALIZES an unrecognized spelling rather than
+    REJECTING it, deliberately: (1) this verb is fail-soft by contract --
+    main() always returns 0 and write_decision never raises -- so a rejection
+    would silently DROP the decision, which is precisely the
+    fail-into-invisibility harm the whole verb exists to prevent; a human's
+    parked question would vanish instead of appearing under a slightly-off
+    token. (2) An allowlist would mean a genuinely new project cannot file a
+    decision until someone ships a code change, turning a data-hygiene rule
+    into an availability dependency. A rewrite is logged at WARNING so it
+    stays LOUD rather than silent.
+
+    NOTE that ``decision_id`` is untouched by that normalization: the ``df-``
+    prefix on an id like ``df-esc-3524-1`` is part of ``--id``, which the
+    caller types, and is never derived from or rewritten because of
+    ``--project``. Conflating the two is how the three-way project split
+    arose.
+
     ``escalations_dir`` names the escalation QUEUE *escalation_id* belongs
     to, and is stored NORMALIZED (see normalize_escalations_dir). A watcher
     passes the SAME queue dir it later reaps with, so this fleet-global
@@ -3529,9 +3824,15 @@ def _run_write_decision(
         )
         return
 
+    canonical_project = normalize_project_token(project)
+    if canonical_project != project:
+        logger.warning(
+            'write-decision: normalized --project %r -> %r', project, canonical_project
+        )
+
     incoming = DecisionRecord(
         id=decision_id,
-        project=project,
+        project=canonical_project,
         text=text,
         filed_at=datetime.now(UTC).isoformat(),
         task_id=task_id,
@@ -3570,7 +3871,7 @@ def _run_write_decision(
                 # corrupt: all fall through to writing fresh.
                 existing = None
             if existing is not None and existing.state == DecisionState.OPEN:
-                if existing.project != project:
+                if normalize_project_token(existing.project) != canonical_project:
                     # SAME id, DIFFERENT project: an id COLLISION, not a
                     # MODE-2 collapse. Both SKILL.md files tell a watcher to
                     # use the escalation id as the decision id, and
@@ -3582,6 +3883,17 @@ def _run_write_decision(
                     # folded into the OTHER project's row -- one cockpit row
                     # claiming to be project A's ask while B's human gate is
                     # invisible and unreapable by B's reaper.
+                    #
+                    # BOTH sides go through normalize_project_token (task
+                    # 3807), exactly as the reap-decisions project axis does.
+                    # A raw compare here would read one project's own
+                    # historical spellings as a cross-project collision --
+                    # a watcher passing `--project df` against a stored
+                    # `dark_factory` row (this verb now stamps the canonical
+                    # form) would be REFUSED, turning the partition bug 3807
+                    # removes into a hard filing failure. Normalizing only
+                    # ever merges spellings of the SAME project, so the
+                    # collision this guard exists to catch still trips.
                     #
                     # Refuse rather than overwrite: overwriting would DELETE a
                     # live row (with any operator boost and state on it),
@@ -3657,7 +3969,20 @@ def _run_reap_decisions(project: str, escalations_dir: str) -> None:
        (``~/.claude/fleet/decisions/``) but escalations are per-project
        (``<project_root>/data/escalations``), so a decision belonging to a
        DIFFERENT project is skipped. Scoping this way keeps the join correct
-       without fragile project_id -> path auto-discovery.
+       without fragile project_id -> path auto-discovery. The match is on the
+       CANONICAL token (see normalize_project_token, task 3807), with BOTH
+       sides normalized -- the reaper's own ``--project`` AND the decision's
+       stored value -- so a single run covers every historical spelling of
+       one project. A raw compare silently PARTITIONED one project's
+       decisions: measured 2026-08-06, 41 OPEN dark-factory decisions split
+       22/17/2 across ``dark_factory``/``df``/``dark-factory``, each
+       partition invisible to a reap scoped to either of the others, forcing
+       an L2 session to run this verb once per token. That
+       run-once-per-token workaround is now removed. Normalization only ever
+       WIDENS the axis-1 match to spellings of the SAME project; it never
+       widens ACROSS projects (``solar_challenge`` vs
+       ``solar_challenge_platform`` are different project roots and are
+       guarded from merging), so the fail-OPEN framing below is intact.
     2. QUEUE (task 3528). An escalation id (``esc-<taskid>-<n>``) is unique
        only WITHIN one queue, and a project can run several: dark_factory
        runs ``data/escalations`` (orchestrator) and
@@ -3710,9 +4035,17 @@ def _run_reap_decisions(project: str, escalations_dir: str) -> None:
     decision, mirroring `write-decision` printing the filed id.
     """
     reaper_dir = normalize_escalations_dir(escalations_dir)
+    reaper_project = normalize_project_token(project)
 
     def _status(decision: DecisionRecord) -> str | None:
-        if decision.project != project:
+        # Axis 1: normalize the decision's OWN stored token at compare time
+        # too, not just at write time -- for the same reason axis 2 already
+        # does. A raw compare fails open for any record write-decision did
+        # not produce (hand-repaired, migrated between checkouts, filed by an
+        # older build), which is exactly the 173 legacy records the migration
+        # verb exists to repair; comparing honestly means the fix holds even
+        # for a record the migration has not reached yet.
+        if normalize_project_token(decision.project) != reaper_project:
             return None
         if decision.escalation_id is None:
             # Belt-and-suspenders, not reachable via reap_answered_decisions
@@ -3742,6 +4075,29 @@ def _run_reap_decisions(project: str, escalations_dir: str) -> None:
 
     for reaped in reap_answered_decisions(escalation_status=_status):
         print(f'{reaped.id} {reaped.new_state}')
+
+
+def _run_migrate_decision_projects(dry_run: bool) -> None:
+    """Run the ``migrate-decision-projects`` verb (task 3807).
+
+    The one-shot backfill for DecisionRecords filed BEFORE ``write-decision``
+    canonicalized ``--project`` (see migrate_decision_project_tokens for the
+    preservation invariants -- ``state`` and ``filed_at`` are carried
+    through, so an already-answered row is never reopened, and the record's
+    id/filename is never rewritten).
+
+    It is IDEMPOTENT, so a re-run once the fleet is clean prints nothing.
+    That is what makes it safe to keep permanently rather than delete after
+    first use: it doubles as the repair tool for a hand-edited or
+    externally-written record, with no need to reason about whether it has
+    already run. Run it with ``--dry-run`` first to preview.
+
+    Prints one ``f'{id} {old_project} -> {new_project}'`` line per migrated
+    record, mirroring `reap-decisions` printing one line per closed decision.
+    Root resolves via $CLAUDE_FLEET_ROOT, same as every other verb.
+    """
+    for migrated in migrate_decision_project_tokens(dry_run=dry_run):
+        print(f'{migrated.id} {migrated.old_project} -> {migrated.new_project}')
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -3848,7 +4204,15 @@ def _build_parser() -> argparse.ArgumentParser:
         help='file an OPEN DecisionRecord (Fleet Cockpit C8: park-to-registry)',
     )
     write_decision_p.add_argument('--id', required=True, help="this decision's id")
-    write_decision_p.add_argument('--project', required=True)
+    write_decision_p.add_argument(
+        '--project',
+        required=True,
+        help=(
+            "this decision's project; stored NORMALIZED to one canonical token "
+            '(see normalize_project_token), so df/dark-factory/Dark_Factory all '
+            'persist as dark_factory'
+        ),
+    )
     write_decision_p.add_argument('--text', required=True, help='the decision/question text')
     write_decision_p.add_argument('--task-id', default=None)
     write_decision_p.add_argument('--escalation-id', default=None)
@@ -3879,8 +4243,26 @@ def _build_parser() -> argparse.ArgumentParser:
         'reap-decisions',
         help='close OPEN decisions whose escalation has resolved/dismissed (Fleet Cockpit C8)',
     )
-    reap_decisions_p.add_argument('--project', required=True)
+    reap_decisions_p.add_argument(
+        '--project',
+        required=True,
+        help=(
+            'project to scope the reap to; matched on the canonical token '
+            '(see normalize_project_token), so ONE run closes every '
+            'historical spelling of that project'
+        ),
+    )
     reap_decisions_p.add_argument('--escalations-dir', required=True)
+
+    migrate_projects_p = sub.add_parser(
+        'migrate-decision-projects',
+        help='canonicalize DecisionRecord.project onto one token per project',
+    )
+    migrate_projects_p.add_argument(
+        '--dry-run',
+        action='store_true',
+        help='print what would be migrated without writing anything',
+    )
 
     return parser
 
@@ -4010,6 +4392,8 @@ def main(argv: list[str] | None = None) -> int:
             )
         elif args.verb == 'reap-decisions':
             _run_reap_decisions(args.project, args.escalations_dir)
+        elif args.verb == 'migrate-decision-projects':
+            _run_migrate_decision_projects(args.dry_run)
     except Exception:
         logger.error('session_registry %s failed', args.verb, exc_info=True)
         return 0

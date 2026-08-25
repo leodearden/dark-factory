@@ -22,7 +22,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
@@ -4805,13 +4805,186 @@ def test_main_write_decision_files_open_record(
     assert len(listed) == 1
     rec = listed[0]
     assert rec.id == 'dec-park-1'
-    assert rec.project == 'df'
+    # Stored CANONICAL, not verbatim: --project is normalized at the CLI
+    # boundary (task 3807, see test_main_write_decision_canonicalizes_project).
+    assert rec.project == 'dark_factory'
     assert rec.text == 'Approve risky merge?'
     assert rec.task_id == '2085'
     assert rec.escalation_id == 'esc-1'
     assert rec.session_id == 'watcher-df-99'
     assert rec.state == sr.DecisionState.OPEN
     assert rec.filed_at != ''
+
+
+@pytest.mark.parametrize(
+    'raw_project',
+    ['df', 'DF', 'dark-factory', 'Dark-Factory', '  DARK_FACTORY '],
+)
+def test_main_write_decision_canonicalizes_project(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    raw_project: str,
+) -> None:
+    """--project is stored NORMALIZED, not verbatim (task 3807).
+
+    Mirrors how --escalations-dir is already stamped normalized one line
+    below in _run_write_decision. Storing the raw argv string is what let one
+    project's decisions accumulate in three separate partitions, each
+    invisible to a reap scoped to either of the others.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+
+    rc = sr.main(
+        [
+            'write-decision',
+            '--id',
+            'd-alias',
+            '--project',
+            raw_project,
+            '--text',
+            'q?',
+            '--escalations-dir',
+            str(tmp_path / 'escalations'),
+        ]
+    )
+
+    assert rc == 0
+    listed = sr.list_decisions(root=tmp_path)
+    assert len(listed) == 1
+    assert listed[0].project == 'dark_factory'
+
+
+def test_main_write_decision_canonicalizes_an_unaliased_project(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The fold applies to EVERY project, not just the one aliased token: a
+    genuinely new project must be able to file without a code change, so the
+    verb normalizes rather than rejecting an unrecognized spelling.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+
+    rc = sr.main(
+        [
+            'write-decision',
+            '--id',
+            'd-av',
+            '--project',
+            'autopilot-video',
+            '--text',
+            'q?',
+            '--escalations-dir',
+            str(tmp_path / 'escalations'),
+        ]
+    )
+
+    assert rc == 0
+    listed = sr.list_decisions(root=tmp_path)
+    assert len(listed) == 1
+    assert listed[0].project == 'autopilot_video'
+
+
+def test_main_write_decision_project_normalization_never_touches_the_id(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The ``df-`` prefix belongs to --id, which YOU type; write-decision
+    never derives it from, or rewrites it because of, --project.
+
+    Conflating the two is how the three-way split arose in the first place --
+    a human reading ``df-esc-3524-1`` inferred that ``--project df`` was the
+    right spelling. The id (and therefore the record's filename) must survive
+    project canonicalization byte-for-byte, or every cockpit cross-link to a
+    filed decision would break.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+
+    rc = sr.main(
+        [
+            'write-decision',
+            '--id',
+            'df-esc-3524-1',
+            '--project',
+            'df',
+            '--text',
+            'q?',
+            '--escalations-dir',
+            str(tmp_path / 'escalations'),
+        ]
+    )
+
+    assert rc == 0
+    assert (tmp_path / 'decisions' / 'df-esc-3524-1.json').is_file()
+    assert 'df-esc-3524-1' in capsys.readouterr().out
+    listed = sr.list_decisions(root=tmp_path)
+    assert [(d.id, d.project) for d in listed] == [('df-esc-3524-1', 'dark_factory')]
+
+
+def test_main_write_decision_logs_a_project_rewrite(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A rewrite is LOUD, not silent (project norm: loud-over-silent
+    degradation) -- so an operator can see that what they typed is not what
+    was stored, and fix the spelling at the source.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+
+    with caplog.at_level(logging.WARNING):
+        assert (
+            sr.main(
+                [
+                    'write-decision',
+                    '--id',
+                    'd-w',
+                    '--project',
+                    'df',
+                    '--text',
+                    'q?',
+                    '--escalations-dir',
+                    str(tmp_path / 'escalations'),
+                ]
+            )
+            == 0
+        )
+
+    assert any(
+        r.levelno >= logging.WARNING and 'df' in r.getMessage() and 'dark_factory' in r.getMessage()
+        for r in caplog.records
+    )
+
+
+def test_main_write_decision_already_canonical_project_logs_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The warning fires only on an actual REWRITE. A watcher already passing
+    the canonical token -- which is what both SKILL.md files now tell it to
+    do -- must not emit a warning on every park, or the signal is noise.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+
+    with caplog.at_level(logging.WARNING):
+        rc = sr.main(
+            [
+                'write-decision',
+                '--id',
+                'd-ok',
+                '--project',
+                'dark_factory',
+                '--text',
+                'q?',
+                '--escalations-dir',
+                str(tmp_path / 'escalations'),
+            ]
+        )
+
+    assert rc == 0
+    assert sr.list_decisions(root=tmp_path)[0].project == 'dark_factory'
+    assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
 
 
 def test_main_write_decision_stamps_severity(
@@ -5525,6 +5698,157 @@ def test_merge_decision_enrichment_touches_only_the_documented_fields() -> None:
     assert merged == dataclasses.replace(existing, severity='urgent')
 
 
+# ---------------------------------------------------------------------------
+# Project-token canonicalization (task 3807)
+# ---------------------------------------------------------------------------
+
+_PROJECT_TOKEN_CASES: list[tuple[str, str]] = [
+    # Separator/case folding: one project, five spellings, one token.
+    ('dark_factory', 'dark_factory'),
+    ('dark-factory', 'dark_factory'),
+    ('Dark-Factory', 'dark_factory'),
+    ('DARK_FACTORY', 'dark_factory'),
+    ('  dark-factory  ', 'dark_factory'),
+    # Alias: the one seeded PROJECT_TOKEN_ALIASES entry, itself folded first.
+    ('df', 'dark_factory'),
+    ('DF', 'dark_factory'),
+    (' df ', 'dark_factory'),
+    ('-df-', 'dark_factory'),
+    # Unset sentinel -- '' is never a token (mirrors normalize_escalations_dir).
+    ('', ''),
+    ('   ', ''),
+    ('\t\n', ''),
+    # Pass-through: an already-canonical token of another project is untouched.
+    ('reify', 'reify'),
+    # A split whose spellings differ ONLY by separator folds with no alias
+    # entry -- and autopilot_video is also what that project's config
+    # declares, so folding fully resolves it.
+    ('autopilot-video', 'autopilot_video'),
+    ('autopilot_video', 'autopilot_video'),
+    # solar-challenge's two spellings fold into ONE bucket, but that bucket
+    # is NOT its declared memory.project_id. See the residual-gap test below
+    # -- this row deliberately does not claim folding resolved it.
+    ('solar-challenge', 'solar_challenge'),
+    ('solar_challenge', 'solar_challenge'),
+]
+
+
+@pytest.mark.parametrize(('raw', 'expected'), _PROJECT_TOKEN_CASES)
+def test_normalize_project_token_table(raw: str, expected: str) -> None:
+    """One project must have ONE token, whatever spelling it was filed under.
+
+    The live population that motivated this (2026-08-06): 41 OPEN
+    dark-factory decisions split 22/17/2 across ``dark_factory``/``df``/
+    ``dark-factory``, each partition invisible to a reap scoped to either of
+    the others.
+    """
+    assert sr.normalize_project_token(raw) == expected
+
+
+def test_normalize_project_token_does_not_merge_solar_challenge_platform() -> None:
+    """COLLAPSE GUARD: folding must never merge two DIFFERENT projects.
+
+    ``/home/leo/src/solar-challenge`` declares ``my_solar_challenge`` and
+    ``/home/leo/src/solar-challenge-platform`` declares
+    ``solar_challenge_platform`` -- separate project roots, separate
+    orchestrator configs, separate escalation queues, whose tokens merely
+    share a prefix. Merging them would let one project's reaper close the
+    other's decisions, which is strictly worse than the bug being fixed. Only
+    case and separator differences may ever fold.
+    """
+    assert sr.normalize_project_token('solar_challenge_platform') == 'solar_challenge_platform'
+    assert sr.normalize_project_token('solar-challenge-platform') == 'solar_challenge_platform'
+    assert sr.normalize_project_token('solar_challenge_platform') != sr.normalize_project_token(
+        'solar-challenge'
+    )
+
+
+@pytest.mark.parametrize('raw', [case[0] for case in _PROJECT_TOKEN_CASES])
+def test_normalize_project_token_is_idempotent(raw: str) -> None:
+    """f(f(x)) == f(x) for every token in the table.
+
+    Load-bearing twice over: the migration decides a record is already
+    canonical by comparing ``normalize_project_token(p) == p``, so a
+    non-idempotent fold would rewrite the same record on every run; and the
+    reaper normalizes an already-normalized stored token on every compare.
+    """
+    once = sr.normalize_project_token(raw)
+    assert sr.normalize_project_token(once) == once
+
+
+@pytest.mark.parametrize('raw', [None, 42, 3.5, Path('/tmp/x'), object()])
+def test_normalize_project_token_fail_soft_on_non_str(raw: object) -> None:
+    """Fail-soft, matching normalize_escalations_dir's contract for helpers a
+    C8 watch loop calls directly: a non-str value never raises into the
+    caller.
+    """
+    assert isinstance(sr.normalize_project_token(raw), str)
+
+
+def test_normalize_project_token_coerces_non_str_to_a_matchless_token() -> None:
+    """Pins the VALUE a coercion produces, not just that it is a str.
+
+    ``isinstance(..., str)`` alone is a tautology under a ``return str(...)``
+    body -- it cannot fail, so it cannot defend the docstring's actual claim
+    that a coerced token "matches no real project". These assert the claim.
+    """
+    assert sr.normalize_project_token(42) == '42'
+    assert sr.normalize_project_token(3.5) == '3.5'
+
+
+def test_normalize_project_token_maps_none_to_the_unset_sentinel() -> None:
+    """``None`` means UNSET, so it must land on ``''``, not on ``'none'``.
+
+    ``str(None)`` folds to ``'none'`` -- an ordinary-looking token, not a
+    sentinel. That matters because ``DecisionRecord.from_dict`` reads
+    ``data['project']`` with no coercion, so a hand-edited record carrying
+    ``"project": null`` round-trips a real ``None``; without this case the
+    migration would rewrite it onto a literal ``'none'`` bucket that a
+    reaper scoped to a project spelled that way could then match. ``''``
+    only ever matches ``''``, keeping the fail-OPEN direction.
+    """
+    assert sr.normalize_project_token(None) == ''
+    assert sr.normalize_project_token(None) != 'none'
+
+
+def test_normalize_project_token_solar_challenge_gap_is_known_not_resolved() -> None:
+    """RESIDUAL GAP, pinned so it stays a known state rather than a surprise.
+
+    Folding DOES merge solar-challenge's two filed spellings into one bucket
+    -- an improvement, since a reap scoped to either previously missed the
+    other (live 2026-08-07: 3 OPEN under ``solar-challenge``, 2 under
+    ``solar_challenge``). But that bucket is ``solar_challenge``, while
+    ``/home/leo/src/solar-challenge/dark-factory-orchestrator.yaml`` declares
+    ``my_solar_challenge``, and no alias bridges them. So a reaper passing
+    the config-declared token matches ZERO of those 5 rows.
+
+    This test exists so nobody reads the folding rows above as "solved" and
+    so the day an alias IS added (its own filed decision task, 3813) this
+    test fails loudly and must be updated deliberately -- rather than the
+    gap silently changing shape. The skills' ``--project`` guidance carries
+    the same caveat for the humans and watchers that read it.
+    """
+    assert sr.normalize_project_token('solar-challenge') == 'solar_challenge'
+    assert sr.normalize_project_token('solar-challenge') == sr.normalize_project_token(
+        'solar_challenge'
+    )
+    assert sr.normalize_project_token('my_solar_challenge') != sr.normalize_project_token(
+        'solar-challenge'
+    )
+    assert 'solar_challenge' not in sr.PROJECT_TOKEN_ALIASES
+
+
+def test_project_token_aliases_maps_folded_to_folded() -> None:
+    """Every PROJECT_TOKEN_ALIASES key AND value must already be canonical
+    under the fold, or a lookup would miss (key) or emit a non-canonical
+    token (value) -- the alias map is applied AFTER folding, never before.
+    """
+    assert sr.PROJECT_TOKEN_ALIASES['df'] == 'dark_factory'
+    for alias, canonical in sr.PROJECT_TOKEN_ALIASES.items():
+        assert sr.normalize_project_token(alias) == canonical
+        assert sr.normalize_project_token(canonical) == canonical
+
+
 def test_read_escalation_status_reads_queue_root_file(tmp_path: Path) -> None:
     """A still-pending escalation lives directly under the queue root."""
     escalations_dir = tmp_path / 'escalations'
@@ -5753,6 +6077,102 @@ def test_main_reap_decisions_scopes_to_project(
     assert rc == 0
     listed = {d.id: d.state for d in sr.list_decisions(root=tmp_path)}
     assert listed['dec-other-project'] == sr.DecisionState.OPEN
+
+
+def test_main_reap_decisions_closes_every_spelling_of_one_project(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """THE REGRESSION (task 3807): ONE run closes EVERY spelling of ONE project.
+
+    Measured live 2026-08-06: 41 OPEN dark-factory decisions split 22/17/2
+    across ``dark_factory``/``df``/``dark-factory``. The reaper compared
+    ``decision.project`` to ``--project`` as raw strings, so each partition
+    was invisible to a reap scoped to either of the others and an L2 session
+    had to run the verb once per token to close them all.
+
+    All four decisions share ONE queue and each pins its own resolved
+    escalation, so the axis-2 queue guard is satisfied and cannot short-
+    circuit this into a vacuous pass -- ``escalations_dir=`` is therefore
+    passed explicitly at each call site, per _make_decision's documented rule.
+
+    One test, both directions: the three dark-factory spellings must ALL
+    close, and the unrelated ``reify`` decision must stay OPEN -- so widening
+    the axis-1 match to spellings of the SAME project provably does not widen
+    it ACROSS projects.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    escalations_dir = tmp_path / 'esc'
+    archive_dir = escalations_dir / 'archive' / '2026-08-06'
+    archive_dir.mkdir(parents=True)
+    for esc_id in ('esc-a', 'esc-b', 'esc-c', 'esc-other'):
+        (archive_dir / f'{esc_id}.json').write_text(json.dumps({'status': 'resolved'}))
+    seeded = {
+        'dec-df': ('df', 'esc-a'),
+        'dec-hyphen': ('dark-factory', 'esc-b'),
+        'dec-canonical': ('dark_factory', 'esc-c'),
+        'dec-reify': ('reify', 'esc-other'),
+    }
+    for decision_id, (project, escalation_id) in seeded.items():
+        sr.write_decision(
+            _make_decision(
+                id=decision_id,
+                project=project,
+                escalation_id=escalation_id,
+                state=sr.DecisionState.OPEN,
+                escalations_dir=str(escalations_dir),
+            ),
+            root=tmp_path,
+        )
+
+    rc = sr.main(
+        ['reap-decisions', '--project', 'dark_factory', '--escalations-dir', str(escalations_dir)]
+    )
+
+    assert rc == 0
+    listed = {d.id: d.state for d in sr.list_decisions(root=tmp_path)}
+    assert listed['dec-df'] == sr.DecisionState.ANSWERED
+    assert listed['dec-hyphen'] == sr.DecisionState.ANSWERED
+    assert listed['dec-canonical'] == sr.DecisionState.ANSWERED
+    assert listed['dec-reify'] == sr.DecisionState.OPEN
+
+
+@pytest.mark.parametrize('reaper_project', ['DF', 'df', 'dark-factory', ' Dark_Factory '])
+def test_main_reap_decisions_normalizes_the_reapers_own_project(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    reaper_project: str,
+) -> None:
+    """BOTH sides of the join normalize, mirroring the axis-2 queue guard.
+
+    A watcher invoking with a stale ``--project`` spelling must still close a
+    decision stored under the canonical token -- otherwise the fix would be
+    half-applied and the caller's own spelling would become a new way to
+    silently miss rows.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    escalations_dir = tmp_path / 'esc'
+    archive_dir = escalations_dir / 'archive' / '2026-08-06'
+    archive_dir.mkdir(parents=True)
+    (archive_dir / 'esc-r.json').write_text(json.dumps({'status': 'resolved'}))
+    sr.write_decision(
+        _make_decision(
+            id='dec-canon',
+            project='dark_factory',
+            escalation_id='esc-r',
+            state=sr.DecisionState.OPEN,
+            escalations_dir=str(escalations_dir),
+        ),
+        root=tmp_path,
+    )
+
+    rc = sr.main(
+        ['reap-decisions', '--project', reaper_project, '--escalations-dir', str(escalations_dir)]
+    )
+
+    assert rc == 0
+    listed = {d.id: d.state for d in sr.list_decisions(root=tmp_path)}
+    assert listed['dec-canon'] == sr.DecisionState.ANSWERED
 
 
 def _two_queues(tmp_path: Path) -> tuple[Path, Path]:
@@ -6602,7 +7022,11 @@ def test_main_write_decision_same_id_different_project_is_refused(
     assert [d.id for d in listed] == ['esc-42-1']
     survivor = listed[0]
     # Untouched in EVERY field -- not merged, not overwritten, not enriched.
-    assert survivor.project == 'df'
+    # 'dark_factory', not the 'df' filed above: write-decision canonicalizes
+    # --project at the CLI boundary (task 3807), so that IS this record's
+    # untouched stored value. The incumbent still has to survive the colliding
+    # filing unchanged, which is what this test pins.
+    assert survivor.project == 'dark_factory'
     assert survivor.text == 'Adopt the reify plan?'
     assert survivor.severity == 'info'  # NOT maxed up by the other project
     assert survivor.task_id is None  # no empty field filled from reify
@@ -6615,7 +7039,8 @@ def test_main_write_decision_same_id_different_project_is_refused(
     ]
     assert refusals, 'the refusal must be logged, not silent'
     assert 'reify' in refusals[0].getMessage()  # names the refused project
-    assert 'df' in refusals[0].getMessage()  # ...and the incumbent
+    # ...and the incumbent, under its canonical stored spelling (task 3807).
+    assert 'dark_factory' in refusals[0].getMessage()
 
 
 def test_main_write_decision_non_open_record_is_still_overwritten(
@@ -7850,3 +8275,521 @@ class TestStdlibOnlySelfContainment:
             'guard.\n'
             f'{detail}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Decision project-token migration (task 3807)
+# ---------------------------------------------------------------------------
+
+
+def _seed_mixed_spellings(tmp_path: Path) -> dict[str, dict[str, Any]]:
+    """Seed the observed mixed-spelling population, one record per case.
+
+    Mirrors the live 2026-08-06 census in miniature: three dark-factory
+    spellings needing repair (one per DecisionState, so preservation is
+    checked against a row that must NOT be reopened), one already-canonical
+    dark-factory row, and one unrelated project. Returns each seeded record's
+    ``to_dict()`` keyed by id, so a test can diff the whole dict before/after
+    and catch a field a future change lets escape.
+    """
+    seeds = {
+        'd-df': ('df', sr.DecisionState.OPEN),
+        'd-hyphen': ('dark-factory', sr.DecisionState.ANSWERED),
+        'd-mixed': ('Dark_Factory', sr.DecisionState.DROPPED),
+        'd-canon': ('dark_factory', sr.DecisionState.OPEN),
+        'd-reify': ('reify', sr.DecisionState.OPEN),
+    }
+    before: dict[str, dict[str, Any]] = {}
+    for decision_id, (project, state) in seeds.items():
+        record = _make_decision(id=decision_id, project=project, state=state)
+        sr.write_decision(record, root=tmp_path)
+        before[decision_id] = record.to_dict()
+    return before
+
+
+def test_migrate_decision_project_tokens_reports_only_changed_records(tmp_path: Path) -> None:
+    """Returns one MigratedDecision per CHANGED record and nothing else.
+
+    An already-canonical row and an unrelated project's row are not
+    "migrated" -- reporting them would make the operator's `| wc -l` lie
+    about how much of the legacy population actually needed repair.
+    """
+    _seed_mixed_spellings(tmp_path)
+
+    migrated = sr.migrate_decision_project_tokens(root=tmp_path)
+
+    assert {(m.id, m.old_project, m.new_project) for m in migrated} == {
+        ('d-df', 'df', 'dark_factory'),
+        ('d-hyphen', 'dark-factory', 'dark_factory'),
+        ('d-mixed', 'Dark_Factory', 'dark_factory'),
+    }
+
+
+def test_migrate_decision_project_tokens_canonicalizes_on_disk(tmp_path: Path) -> None:
+    """The point of the sweep: after it, every dark-factory row -- whatever
+    it was filed under -- reads back as the ONE canonical token, and an
+    unrelated project is untouched.
+    """
+    _seed_mixed_spellings(tmp_path)
+
+    sr.migrate_decision_project_tokens(root=tmp_path)
+
+    on_disk = {d.id: d.project for d in sr.list_decisions(root=tmp_path)}
+    assert on_disk == {
+        'd-df': 'dark_factory',
+        'd-hyphen': 'dark_factory',
+        'd-mixed': 'dark_factory',
+        'd-canon': 'dark_factory',
+        'd-reify': 'reify',
+    }
+
+
+def test_migrate_decision_project_tokens_changes_only_the_project_field(tmp_path: Path) -> None:
+    """PRESERVATION: exactly one key may differ, on every record.
+
+    Asserted as a whole-dict diff rather than a field checklist so a future
+    field added to DecisionRecord cannot silently escape the check. This is
+    the invariant that makes the sweep safe to run against the live
+    population: an ANSWERED/DROPPED row must never be reopened, and filed_at
+    (the cockpit's age/ordering signal) must not be restamped.
+    """
+    before = _seed_mixed_spellings(tmp_path)
+
+    sr.migrate_decision_project_tokens(root=tmp_path)
+
+    after = {d.id: d.to_dict() for d in sr.list_decisions(root=tmp_path)}
+    assert set(after) == set(before)
+    for decision_id, before_dict in before.items():
+        differing = {
+            key
+            for key in set(before_dict) | set(after[decision_id])
+            if before_dict.get(key) != after[decision_id].get(key)
+        }
+        assert differing <= {'project'}, decision_id
+    # Spelled out for the states that must survive, so the intent survives a
+    # future refactor of the diff above.
+    states = {d.id: d.state for d in sr.list_decisions(root=tmp_path)}
+    assert states['d-df'] == sr.DecisionState.OPEN
+    assert states['d-hyphen'] == sr.DecisionState.ANSWERED
+    assert states['d-mixed'] == sr.DecisionState.DROPPED
+
+
+def test_migrate_decision_project_tokens_is_idempotent(tmp_path: Path) -> None:
+    """A second sweep is a no-op: nothing reported, no file rewritten.
+
+    Follows from normalize_project_token's idempotence, and is what makes the
+    verb safe to keep as a permanent repair tool rather than a one-shot
+    script that must be deleted after use.
+    """
+    _seed_mixed_spellings(tmp_path)
+    sr.migrate_decision_project_tokens(root=tmp_path)
+    settled = {
+        path: path.read_text() for path in sorted((tmp_path / 'decisions').glob('*.json'))
+    }
+
+    assert sr.migrate_decision_project_tokens(root=tmp_path) == []
+    assert {path: path.read_text() for path in sorted((tmp_path / 'decisions').glob('*.json'))} == (
+        settled
+    )
+
+
+def test_migrated_decision_is_a_frozen_result_record() -> None:
+    """Mirrors the sibling ReapedDecision contract: a frozen dataclass, so a
+    caller cannot mutate the audit trail of what the sweep actually did.
+    """
+    migrated = sr.MigratedDecision(id='d-1', old_project='df', new_project='dark_factory')
+
+    assert (migrated.id, migrated.old_project, migrated.new_project) == (
+        'd-1',
+        'df',
+        'dark_factory',
+    )
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        migrated.new_project = 'other'  # type: ignore[misc]
+
+
+def test_migrate_decision_project_tokens_dry_run_reports_without_writing(
+    tmp_path: Path,
+) -> None:
+    """dry_run=True previews the exact same work but touches nothing.
+
+    An operator must be able to see the full rewrite of the live population
+    -- 391 records at filing -- before committing to it. Compared as RAW FILE
+    TEXT before/after, so even a byte-identical re-serialization would fail:
+    "side-effect-free" means the files are not written at all, not that they
+    happen to round-trip.
+    """
+    _seed_mixed_spellings(tmp_path)
+    before_text = {
+        path: path.read_text() for path in sorted((tmp_path / 'decisions').glob('*.json'))
+    }
+
+    previewed = sr.migrate_decision_project_tokens(root=tmp_path, dry_run=True)
+
+    assert {(m.id, m.old_project, m.new_project) for m in previewed} == {
+        ('d-df', 'df', 'dark_factory'),
+        ('d-hyphen', 'dark-factory', 'dark_factory'),
+        ('d-mixed', 'Dark_Factory', 'dark_factory'),
+    }
+    assert {
+        path: path.read_text() for path in sorted((tmp_path / 'decisions').glob('*.json'))
+    } == before_text
+
+
+def test_migrate_decision_project_tokens_dry_run_does_not_consume_the_work(
+    tmp_path: Path,
+) -> None:
+    """A preview must not be mistaken for the migration: the real run
+    afterwards still reports and performs the identical set of rewrites.
+    """
+    _seed_mixed_spellings(tmp_path)
+
+    previewed = sr.migrate_decision_project_tokens(root=tmp_path, dry_run=True)
+    performed = sr.migrate_decision_project_tokens(root=tmp_path)
+
+    assert {(m.id, m.old_project, m.new_project) for m in performed} == {
+        (m.id, m.old_project, m.new_project) for m in previewed
+    }
+    assert {d.id for d in sr.list_decisions(root=tmp_path) if d.project == 'dark_factory'} == {
+        'd-df',
+        'd-hyphen',
+        'd-mixed',
+        'd-canon',
+    }
+
+
+def test_migrate_decision_project_tokens_dry_run_creates_no_lock_sidecar(
+    tmp_path: Path,
+) -> None:
+    """dry_run takes no lock, so it leaves no ``<id>.json.lock`` sidecar.
+
+    decision_id_lock documents that merely TAKING a lock materializes a
+    sidecar (its ORPHAN SIDECARS note). A preview that littered one per
+    record across the whole fleet would not be the side-effect-free
+    operation its name promises.
+    """
+    _seed_mixed_spellings(tmp_path)
+
+    sr.migrate_decision_project_tokens(root=tmp_path, dry_run=True)
+
+    assert list((tmp_path / 'decisions').glob('*.lock')) == []
+
+
+def test_migrate_decision_project_tokens_takes_the_per_id_lock(tmp_path: Path) -> None:
+    """POSITIVE counterpart to the dry-run sidecar test: a real run DOES lock.
+
+    decision_id_lock materializes ``<id>.json.lock`` on entry (its ORPHAN
+    SIDECARS note), so the sidecar's presence is the observable proof the
+    read-modify-write actually ran under the same lock every other mutator
+    takes -- invariant (a). Without this, a regression that dropped the lock
+    would leave every other migration test green.
+    """
+    sr.write_decision(_make_decision(id='d-df', project='df'), root=tmp_path)
+
+    sr.migrate_decision_project_tokens(root=tmp_path)
+
+    assert (tmp_path / 'decisions' / 'd-df.json.lock').exists()
+
+
+def test_migrate_decision_project_tokens_does_not_roll_back_a_racing_transition(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """INVARIANT (b): a state transition landing between the scan and the
+    write survives the sweep.
+
+    This is the entire safety argument for running the sweep against the live
+    population, and it is what a regression reusing the ``list_decisions``
+    snapshot record (instead of re-reading under the lock) would break --
+    silently resurrecting an ANSWERED decision back to OPEN while every other
+    test stayed green.
+
+    The race is injected deterministically by wrapping decision_id_lock: the
+    concurrent transition is applied to the file just after the lock is held
+    and just before the migration's re-read, which is exactly the window the
+    invariant claims to cover. It writes the file directly rather than via
+    update_decision_state, which would re-enter the patched lock.
+    """
+    sr.write_decision(
+        _make_decision(id='d-race', project='df', state=sr.DecisionState.OPEN), root=tmp_path
+    )
+    real_lock = sr.decision_id_lock
+    path = tmp_path / 'decisions' / 'd-race.json'
+
+    @contextlib.contextmanager
+    def _racing_lock(decision_id: str, root: Path | str | None = None) -> Iterator[None]:
+        with real_lock(decision_id, root=root):
+            # A human answers the decision in the scan->write window.
+            raced = json.loads(path.read_text())
+            raced['state'] = sr.DecisionState.ANSWERED.value
+            path.write_text(json.dumps(raced))
+            yield
+
+    monkeypatch.setattr(sr, 'decision_id_lock', _racing_lock)
+
+    migrated = sr.migrate_decision_project_tokens(root=tmp_path)
+
+    settled = {d.id: d for d in sr.list_decisions(root=tmp_path)}
+    assert settled['d-race'].project == 'dark_factory'
+    assert settled['d-race'].state == sr.DecisionState.ANSWERED
+    assert {m.id for m in migrated} == {'d-race'}
+
+
+def test_migrate_decision_project_tokens_reports_the_token_it_actually_replaced(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """INVARIANT (b), audit half: ``old_project`` names what was ON DISK at
+    write time, not what the pre-lock scan happened to see.
+
+    Here a concurrent writer re-spells the token inside the scan->write
+    window. Deriving the new token from the stale snapshot would clobber that
+    writer's value, and reporting the snapshot's ``old_project`` would put a
+    token in the audit trail that was never the one replaced.
+    """
+    sr.write_decision(_make_decision(id='d-respell', project='df'), root=tmp_path)
+    real_lock = sr.decision_id_lock
+    path = tmp_path / 'decisions' / 'd-respell.json'
+
+    @contextlib.contextmanager
+    def _respelling_lock(decision_id: str, root: Path | str | None = None) -> Iterator[None]:
+        with real_lock(decision_id, root=root):
+            raced = json.loads(path.read_text())
+            raced['project'] = 'Dark-Factory'
+            path.write_text(json.dumps(raced))
+            yield
+
+    monkeypatch.setattr(sr, 'decision_id_lock', _respelling_lock)
+
+    migrated = sr.migrate_decision_project_tokens(root=tmp_path)
+
+    assert [(m.id, m.old_project, m.new_project) for m in migrated] == [
+        ('d-respell', 'Dark-Factory', 'dark_factory')
+    ]
+
+
+def test_migrate_decision_project_tokens_skips_a_record_canonicalized_in_the_window(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A record another writer already canonicalized in the scan->write window
+    is skipped, not re-reported.
+
+    The pre-filter runs off the snapshot, so such a record still reaches the
+    lock; the re-read is what turns it into a no-op. Reporting it would make
+    the operator's audit trail claim a rewrite that this sweep never made.
+    """
+    sr.write_decision(_make_decision(id='d-beaten', project='df'), root=tmp_path)
+    real_lock = sr.decision_id_lock
+    path = tmp_path / 'decisions' / 'd-beaten.json'
+
+    @contextlib.contextmanager
+    def _beating_lock(decision_id: str, root: Path | str | None = None) -> Iterator[None]:
+        with real_lock(decision_id, root=root):
+            raced = json.loads(path.read_text())
+            raced['project'] = 'dark_factory'
+            path.write_text(json.dumps(raced))
+            yield
+
+    monkeypatch.setattr(sr, 'decision_id_lock', _beating_lock)
+
+    assert sr.migrate_decision_project_tokens(root=tmp_path) == []
+    assert {d.id: d.project for d in sr.list_decisions(root=tmp_path)} == {
+        'd-beaten': 'dark_factory'
+    }
+
+
+def test_migrate_decision_project_tokens_skips_a_corrupt_neighbour(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """One unparseable file must not abort the sweep of the rest.
+
+    list_decisions already skips it on the read side; this pins that the
+    whole call still migrates every good record and leaves the bad file
+    byte-for-byte alone rather than "repairing" something it cannot parse.
+    """
+    for decision_id in ('d-good-1', 'd-good-2'):
+        sr.write_decision(_make_decision(id=decision_id, project='df'), root=tmp_path)
+    broken = tmp_path / 'decisions' / 'broken.json'
+    broken.write_text('{not json at all')
+
+    with caplog.at_level(logging.ERROR):
+        migrated = sr.migrate_decision_project_tokens(root=tmp_path)
+
+    assert {m.id for m in migrated} == {'d-good-1', 'd-good-2'}
+    assert {d.id: d.project for d in sr.list_decisions(root=tmp_path)} == {
+        'd-good-1': 'dark_factory',
+        'd-good-2': 'dark_factory',
+    }
+    assert broken.read_text() == '{not json at all'
+
+
+def test_migrate_decision_project_tokens_skips_an_unwritable_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A record whose write fails is absent from the result and does not stop
+    the sweep -- mirrors reap_answered_decisions' "only record it when the
+    update actually succeeded" contract. Reporting a rewrite that never
+    landed would make the operator's audit trail lie.
+    """
+    for decision_id in ('d-ok', 'd-bad'):
+        sr.write_decision(_make_decision(id=decision_id, project='df'), root=tmp_path)
+    real_write = sr.write_decision
+
+    def _flaky_write(record: sr.DecisionRecord, root: Path | str | None = None) -> bool:
+        if record.id == 'd-bad':
+            return False
+        return real_write(record, root=root)
+
+    monkeypatch.setattr(sr, 'write_decision', _flaky_write)
+
+    with caplog.at_level(logging.ERROR):
+        migrated = sr.migrate_decision_project_tokens(root=tmp_path)
+
+    assert {m.id for m in migrated} == {'d-ok'}
+    assert {d.id: d.project for d in sr.list_decisions(root=tmp_path)} == {
+        'd-ok': 'dark_factory',
+        'd-bad': 'df',
+    }
+
+
+def test_migrate_decision_project_tokens_survives_a_raising_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A per-record fault mid-loop is logged and skipped, never propagated.
+
+    Matches the module-wide fail-soft convention (write_decision,
+    update_decision_state and list_decisions all self-guard): one record
+    faulting must not deny the operator the repair of the other 390.
+    """
+    for decision_id in ('d-ok', 'd-boom'):
+        sr.write_decision(_make_decision(id=decision_id, project='df'), root=tmp_path)
+    real_write = sr.write_decision
+
+    def _exploding_write(record: sr.DecisionRecord, root: Path | str | None = None) -> bool:
+        if record.id == 'd-boom':
+            raise OSError('disk on fire')
+        return real_write(record, root=root)
+
+    monkeypatch.setattr(sr, 'write_decision', _exploding_write)
+
+    with caplog.at_level(logging.ERROR):
+        migrated = sr.migrate_decision_project_tokens(root=tmp_path)
+
+    assert {m.id for m in migrated} == {'d-ok'}
+    assert any(r.levelno >= logging.ERROR for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# CLI migrate-decision-projects verb (task 3807: one-shot project backfill)
+# ---------------------------------------------------------------------------
+
+
+def test_main_migrate_decision_projects_prints_one_line_per_migrated_record(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """One ``<id> <old> -> <new>`` line per migrated record, mirroring
+    reap-decisions' one-line-per-closed-decision convention -- so the verb is
+    grep-able and diffable the same way and an operator's ``| wc -l`` habits
+    transfer unchanged. Asserted as a SET: ordering is list_decisions' sorted
+    glob, not a promise this verb makes.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    _seed_mixed_spellings(tmp_path)
+
+    rc = sr.main(['migrate-decision-projects'])
+
+    assert rc == 0
+    printed = {line for line in capsys.readouterr().out.splitlines() if line.strip()}
+    assert printed == {
+        'd-df df -> dark_factory',
+        'd-hyphen dark-factory -> dark_factory',
+        'd-mixed Dark_Factory -> dark_factory',
+    }
+    assert {d.id: d.project for d in sr.list_decisions(root=tmp_path)} == {
+        'd-df': 'dark_factory',
+        'd-hyphen': 'dark_factory',
+        'd-mixed': 'dark_factory',
+        'd-canon': 'dark_factory',
+        'd-reify': 'reify',
+    }
+
+
+def test_main_migrate_decision_projects_dry_run_prints_without_writing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """--dry-run prints the same preview lines and leaves every record's
+    project unchanged, so an operator can read the plan before running it
+    against the live fleet root.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    _seed_mixed_spellings(tmp_path)
+
+    rc = sr.main(['migrate-decision-projects', '--dry-run'])
+
+    assert rc == 0
+    printed = {line for line in capsys.readouterr().out.splitlines() if line.strip()}
+    assert printed == {
+        'd-df df -> dark_factory',
+        'd-hyphen dark-factory -> dark_factory',
+        'd-mixed Dark_Factory -> dark_factory',
+    }
+    assert {d.id: d.project for d in sr.list_decisions(root=tmp_path)} == {
+        'd-df': 'df',
+        'd-hyphen': 'dark-factory',
+        'd-mixed': 'Dark_Factory',
+        'd-canon': 'dark_factory',
+        'd-reify': 'reify',
+    }
+
+
+def test_main_migrate_decision_projects_is_a_no_op_when_already_clean(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Re-running after the fleet is clean prints NOTHING.
+
+    That silence is what makes the verb safe to keep permanently: it doubles
+    as the repair tool for a hand-edited record without an operator having to
+    reason about whether it already ran.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    _seed_mixed_spellings(tmp_path)
+    assert sr.main(['migrate-decision-projects']) == 0
+    capsys.readouterr()
+
+    rc = sr.main(['migrate-decision-projects'])
+
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == ''
+
+
+def test_main_migrate_decision_projects_fail_soft_when_fleet_root_under_a_file(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Mirrors test_main_write_decision_fail_soft_when_fleet_root_under_a_file:
+    an unusable fleet root must return 0 and raise nothing, preserving the
+    module's documented boundary that a registry fault can never change a
+    bash caller's exit code.
+    """
+    blocker = tmp_path / 'blocker'
+    blocker.write_text('not a directory')
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(blocker / 'fleet'))
+
+    rc = sr.main(['migrate-decision-projects'])
+
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == ''
+    assert not (blocker / 'fleet').exists()
