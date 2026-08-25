@@ -3914,7 +3914,32 @@ class MemoryService:
         for finding in stats.findings:
             intended = finding.intended_referent
             if not finding.resolvable or intended is None:
-                # NEVER GUESS — see the unresolvable arm's own commentary.
+                # NEVER GUESS, as the STRUCTURAL default rather than a branch
+                # this pass chose to add. `ReferentFinding.resolvable` already
+                # DEFAULTS to False — zeta made fail-closed structural, so a
+                # finding is unrepairable unless something positively
+                # determined a target — and this arm is what honours it.
+                #
+                # The PRD's boundary row, verbatim: "Unary fact, no correct
+                # target: flagged, recorded, left unrepaired". Its live case is
+                # the fact "Umbrella task 2519 was filed and then cancelled to
+                # avoid orphaning its vector" sitting on the `Task 2520` node —
+                # the fact names exactly ONE task and it is not the one the
+                # edge landed on, so there is no second candidate to move it
+                # to and any target eta picked would be invented.
+                #
+                # The RECORD EXISTING AT ALL is the point. A dropped finding
+                # and a repaired one are indistinguishable to leaf iota's rate
+                # and to an operator reading the audit; an 'unrepairable'
+                # record carrying zeta's own `reason` is the evidence a human
+                # uses to decide the case by hand. The reason is copied
+                # VERBATIM rather than paraphrased — a paraphrase is a second
+                # site that can drift from the rule that actually fired.
+                #
+                # `intended is None` is folded in here rather than crashed on:
+                # zeta forbids that shape (a resolvable finding always names a
+                # referent) but the TYPE permits it, and fail-closed means an
+                # impossible shape becomes a refusal, never a guess.
                 repair_stats.repairs.append(ReferentRepair(
                     edge_uuid=finding.edge_uuid,
                     which_end=finding.which_end,
