@@ -5612,6 +5612,56 @@ class Harness:
         ):
             action = RecoveryAction.RE_FILE_ESCALATION
 
+        # Task 3539 — OBSERVE-BEFORE-ENFORCE for CONVERT_TO_BLOCKED.  Third
+        # thin sweep-side adjustment, same pattern and same siting rule as the
+        # two above: it has its say BEFORE the chokepoint, so `action` is still
+        # final at that line's stated contract.
+        #
+        # WHY this exists at all: every other row in `_RECOVERY` was already
+        # writing the status it names long before 3535 described it, but
+        # CONVERT_TO_BLOCKED is a recovery row that has NEVER written a status.
+        # A row like that has no field history to argue from, so it ships
+        # measured rather than assumed — log mode names the exact population it
+        # WOULD move, in the journal, where an operator can count it against
+        # the `recovery_vetoed` stream before a single row changes.  Log mode
+        # is byte-identical to pre-3539: same (absent) writes, same return
+        # value, same veto row.
+        #
+        # Removal is a ONE-LINE DELETION once `convert_to_blocked_enforce`
+        # defaults True and the promotion has soaked: drop this block and the
+        # `downgraded_reason` seed with it; the applier arm below and the two
+        # `downgraded_reason or leave_reason(report)` call sites then reduce to
+        # their pre-3539 spellings with no other edit.
+        #
+        # getattr-tolerant for the same documented reason as
+        # `_emit_recovery_disposition`: several narrow-scope test harnesses
+        # build a Harness via `Harness.__new__(Harness)`, bypassing __init__.
+        # Note this only covers a missing ATTRIBUTE — a spec'd-MagicMock config
+        # still reports a truthy mock, which is why the suites that drive this
+        # path pin the flag explicitly in their fixtures.
+        downgraded_reason: LeaveReason | None = None
+        if (
+            action == RecoveryAction.CONVERT_TO_BLOCKED
+            and not getattr(self.config, 'convert_to_blocked_enforce', False)
+        ):
+            logger.info(
+                'Reconcile: task %s would convert_to_blocked (shape=%s, '
+                'branch=%s, pinned by %s) — log mode, no status write '
+                '(convert_to_blocked_enforce=False)',
+                tid,
+                recovery_shape_str(report),
+                report.branch_state.kind.value,
+                ', '.join(str(ref.id) for ref in report.open_escalations) or '-',
+            )
+            # `leave_reason` returns None for every non-LEAVE disposition, by
+            # design, so that a caller can never mislabel an action as a hold —
+            # and that contract is preserved UNCHANGED here.  Log mode really
+            # IS a hold, so it threads the reason explicitly instead: without
+            # it the chokepoint below would drop the very `recovery_vetoed`
+            # stream this mode exists to be measured in.
+            downgraded_reason = LeaveReason.escalation_pinned
+            action = RecoveryAction.LEAVE
+
         # Task 3535 (beta) — THE chokepoint for this sweep's emission, sited
         # here because `action` is final at this line: the table has spoken and
         # both sweep-side upgrades above have had their say, so a LEAVE
@@ -5625,7 +5675,7 @@ class Harness:
             self._emit_recovery_disposition(
                 tid,
                 site=RecoverySite.reconcile_sweep,
-                reason=leave_reason(report),
+                reason=downgraded_reason or leave_reason(report),
                 shape=recovery_shape_str(report),
                 records=report.open_escalations,
                 store_unavailable=report.escalation_store_unavailable,
@@ -5991,7 +6041,10 @@ class Harness:
                 self._emit_recovery_disposition(
                     tid,
                     site=RecoverySite.reconcile_sweep,
-                    reason=leave_reason(report),
+                    # Same substitution as the chokepoint above, so the two
+                    # emission sites cannot disagree about a log-mode hold if a
+                    # future refactor ever opens a route to this one.
+                    reason=downgraded_reason or leave_reason(report),
                     shape=recovery_shape_str(report),
                     records=report.open_escalations,
                     store_unavailable=report.escalation_store_unavailable,

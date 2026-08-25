@@ -3898,6 +3898,33 @@ class OrchestratorConfig(BaseSettings):
     # is resolved.  Self-dedupes via the pending-escalation check.
     stranded_blocked_escalate_enabled: bool = Field(default=True)
 
+    # Task 3539 — observe-before-enforce gate for the CONVERT_TO_BLOCKED
+    # recovery row.  Sited here beside its two nearest neighbours (the sweep's
+    # own kill switch above and the stranded-`blocked` backstop) and flat, like
+    # them: no `defaults.yaml` stanza and no `RELOADABLE_FIELDS` entry, so the
+    # promotion below is a deliberate, deployed decision rather than something
+    # hot-flipped under a running sweep.
+    convert_to_blocked_enforce: bool = Field(
+        default=False,
+        description=(
+            'Enforce the CONVERT_TO_BLOCKED recovery row (task 3539).  False — '
+            'the shipped default — is LOG MODE: the reconcile sweep logs the '
+            'conversion it WOULD perform for each escalation-pinned, '
+            'unclaimed, stranded in-progress task and then falls back '
+            'byte-identically to pre-3539 behaviour (no status write, same '
+            'return value, same `recovery_vetoed` row with reason '
+            '`escalation_pinned`), so an operator can count the population '
+            'from the journal before any row moves.  Flipping it to True is '
+            'the observe-to-enforce promotion: the sweep then writes '
+            "`blocked` — the honest resting status for \"pinned, awaiting a "
+            'human\" — instead of leaving the row churning a dispatchable '
+            '`in-progress` forever (measured: 39 consecutive `recovery_vetoed` '
+            'over 10.5h on task 3717).  Conversion is NOT completion: the '
+            'converted row keeps its pin, and its exit is a human or task '
+            '3541 — never an automatic self-heal.'
+        ),
+    )
+
     # Kill-switch for the verified-green merge-queue-direct remediation
     # (stranding-remediation-scheduler-ergonomics-prd.md leaf α).  When enabled
     # (default), a stranded-`blocked` task whose warm lane holds an ASSIGNED,
