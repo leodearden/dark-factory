@@ -94,7 +94,12 @@ async def test_verify_requires_codebase_root_keyword(tmp_path):
     patcher, _mock_cls, _instance = _mock_agent_loop()
     try:
         with pytest.raises(TypeError):
-            await verifier.verify(claim='x')
+            # The omission is the assertion: `codebase_root` is deliberately
+            # absent so argument binding raises at runtime.  pyright sees the
+            # same missing required argument statically, which is the very
+            # thing under test, so the diagnostic is suppressed here rather
+            # than satisfied — passing the argument would delete the test.
+            await verifier.verify(claim='x')  # pyright: ignore[reportCallIssue]
     finally:
         patcher.stop()
 
