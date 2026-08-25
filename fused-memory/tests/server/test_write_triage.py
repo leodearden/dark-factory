@@ -46,6 +46,7 @@ from fused_memory.server.write_triage import (
     TriageFailOpenCounter,
     _canonical_id_of,
     _stub_judge,
+    attach_write_landed,
     decide_band,
     emit_triage_fail_open_storm_escalation,
     resolve_bands,
@@ -1507,3 +1508,45 @@ class TestEmitTriageFailOpenStormEscalation:
         assert seen == [payload['task_id']], (
             f'deduped against {seen!r} but filed under {payload["task_id"]!r}'
         )
+
+
+class TestAttachWriteLanded:
+    """The ack may only claim a link that actually exists.
+
+    `MemoryService.add_memory` does NOT raise when a store fails — it folds
+    the error into `message` and returns an ordinary AddMemoryResponse — so
+    the raising path the tool already handles is only half the failure
+    surface, and the smaller half. `memory_ids` is the honest signal: the mem0
+    arm appends ids only after `mem0.add` resolves without raising.
+    """
+
+    def test_a_response_with_ids_landed(self) -> None:
+        assert attach_write_landed(types.SimpleNamespace(memory_ids=['m1'])) is True
+
+    @pytest.mark.parametrize('empty', [[], ()])
+    def test_an_explicitly_empty_memory_ids_did_not_land(self, empty) -> None:
+        """The store-failure shape, and the silent dedup/infer drop with it.
+
+        Both reach the caller as a non-raising response carrying no ids, and
+        `MemoryService.add_memory` itself logs the second as anomalous — so
+        reading them the same way here is not a conflation.
+        """
+        assert attach_write_landed(types.SimpleNamespace(memory_ids=empty)) is False
+
+    @pytest.mark.parametrize(
+        ('label', 'result'),
+        [
+            ('a missing attribute', types.SimpleNamespace()),
+            ('an unspecced test double', Mock()),
+            ('None instead of a list', types.SimpleNamespace(memory_ids=None)),
+        ],
+    )
+    def test_an_unreadable_response_reads_as_landed(self, label, result) -> None:
+        """Ambiguity resolves toward "landed" ON PURPOSE.
+
+        This predicate only ever DOWNGRADES an ack. Failing the other way
+        would invent an attach failure out of an unreadable response shape and
+        silently disable the `restated` outcome altogether — the redirect
+        would still happen, and the caller would never be told about it.
+        """
+        assert attach_write_landed(result) is True, label

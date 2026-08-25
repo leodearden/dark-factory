@@ -27,6 +27,8 @@ through it and the test content needs no markup-proofing.)
 
 from __future__ import annotations
 
+import json
+import logging
 import types
 from unittest.mock import AsyncMock, MagicMock
 
@@ -35,15 +37,19 @@ import pytest
 from fused_memory.config.schema import ProceduralTopicCluster
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.memory import MemoryResult
-from fused_memory.server import tools
+from fused_memory.server import tools, write_triage
 from fused_memory.server.grouped_read import PARENT_ID_KEY, SIGHTING_KIND
 from fused_memory.server.tools import create_mcp_server
 from fused_memory.server.write_triage import (
+    _FAIL_OPEN_STORM_THRESHOLD,
     CANONICAL_ID_KEY,
+    FAIL_OPEN_ESCALATION_ID_KEY,
+    OUTCOME_CONTESTED,
     OUTCOME_RESTATED,
     OUTCOME_STORED,
     ROUTED_KEY,
     TRIAGE_OUTCOMES,
+    BandDecision,
     TriageFailOpenCounter,
 )
 from fused_memory.services.memory_service import RRF_K, SearchResults
@@ -149,6 +155,29 @@ def _configure_pass_through_add_memory(
     }
     mock_service.add_memory.return_value = mem_result
     return mem_result
+
+
+def _install_counter(
+    monkeypatch, cls: type[TriageFailOpenCounter] = TriageFailOpenCounter,
+) -> TriageFailOpenCounter:
+    """Bind a readable counter into the server the next call builds.
+
+    `create_mcp_server` constructs its counter closure-locally (so nothing
+    bleeds between servers), which also means a test cannot reach it. The
+    zero-arg construction is the seam: substituting the class with a factory
+    returning OUR instance leaves the production wiring identical while making
+    the count observable.
+
+    The clock is FROZEN, so every fail-open a test records lands inside one
+    window — a burst is driven by count, never by wall time, and a slow CI box
+    cannot age half a burst out from under the assertion.
+
+    *cls* substitutes a subclass for the cases that need to shape what the
+    counter reports (see `_UnresolvableLabelCounter`).
+    """
+    counter = cls(time_provider=lambda: 1000.0)
+    monkeypatch.setattr(tools, 'TriageFailOpenCounter', lambda: counter)
+    return counter
 
 
 async def _call(server, **overrides) -> dict:
@@ -678,20 +707,6 @@ class TestC1HoldsEndToEnd:
     still a blocked write if the tool body then raises on the attach.
     """
 
-    @staticmethod
-    def _install_counter(monkeypatch) -> TriageFailOpenCounter:
-        """Bind a readable counter into the server the next call builds.
-
-        `create_mcp_server` constructs its counter closure-locally (so nothing
-        bleeds between servers), which also means a test cannot reach it. The
-        zero-arg construction is the seam: substituting the class with a
-        factory returning OUR instance leaves the production wiring identical
-        while making the count observable.
-        """
-        counter = TriageFailOpenCounter(time_provider=lambda: 1000.0)
-        monkeypatch.setattr(tools, 'TriageFailOpenCounter', lambda: counter)
-        return counter
-
     @pytest.mark.asyncio
     async def test_a_raising_search_still_stores_the_write(self, monkeypatch) -> None:
         """A retrieval outage degrades triage; it must not touch the write.
@@ -701,7 +716,7 @@ class TestC1HoldsEndToEnd:
         here is an errored write, i.e. a blocked write. The loudness is
         preserved as an ERROR log plus a counted fail-open instead.
         """
-        counter = self._install_counter(monkeypatch)
+        counter = _install_counter(monkeypatch)
         mock_service = AsyncMock()
         _configure_config(mock_service, enabled=True)
         _configure_pass_through_add_memory(mock_service)
@@ -731,7 +746,7 @@ class TestC1HoldsEndToEnd:
         this test — with a raising mock the suite passes while an actual
         outage stores every write untriaged, uncounted and unescalated.
         """
-        counter = self._install_counter(monkeypatch)
+        counter = _install_counter(monkeypatch)
         mock_service = AsyncMock()
         _configure_config(mock_service, enabled=True)
         _configure_pass_through_add_memory(mock_service)
@@ -754,7 +769,7 @@ class TestC1HoldsEndToEnd:
         self, monkeypatch,
     ) -> None:
         """A changed MemoryService.search signature is the concrete case."""
-        counter = self._install_counter(monkeypatch)
+        counter = _install_counter(monkeypatch)
         mock_service = AsyncMock()
         _configure_config(mock_service, enabled=True)
         _configure_pass_through_add_memory(mock_service)
@@ -781,7 +796,7 @@ class TestC1HoldsEndToEnd:
         fallback stores the same FULL content standalone, which is exactly the
         pre-triage outcome.
         """
-        counter = self._install_counter(monkeypatch)
+        counter = _install_counter(monkeypatch)
         mock_service = AsyncMock()
         _configure_config(mock_service, enabled=True)
         mem_result = MagicMock()
@@ -825,7 +840,7 @@ class TestC1HoldsEndToEnd:
         destroy; leaving it read-only is what makes a wrong attach a cheap,
         reversible metadata edit (D4).
         """
-        self._install_counter(monkeypatch)
+        _install_counter(monkeypatch)
         scenarios = [
             ('restate', {'search': AsyncMock(return_value=[_candidate('m1', 0.97)])}),
             ('judge band', {'search': AsyncMock(return_value=[_candidate('m1', 0.80)])}),
@@ -858,7 +873,7 @@ class TestC1HoldsEndToEnd:
         documented in shared/mcp_markup_middleware.py (it used to live on
         `build_markup_block`, which task 4458 deleted).
         """
-        self._install_counter(monkeypatch)
+        _install_counter(monkeypatch)
         for score in (0.0, 0.10, 0.69, _T_LOW, 0.80, _T_HIGH, 0.97, 1.0):
             mock_service = AsyncMock()
             _configure_config(mock_service, enabled=True)
@@ -895,7 +910,7 @@ class TestC1HoldsEndToEnd:
         A Graphiti-primary category is out of scope for a leaf whose retrieval
         is a mem0 vector search.
         """
-        self._install_counter(monkeypatch)
+        _install_counter(monkeypatch)
         mock_service = AsyncMock()
         _configure_config(mock_service, enabled=True)
         _configure_pass_through_add_memory(mock_service)
@@ -907,3 +922,322 @@ class TestC1HoldsEndToEnd:
         assert ROUTED_KEY not in result, f'{label} was triaged: {result!r}'
         assert CANONICAL_ID_KEY not in result, f'{label}: {result!r}'
         mock_service.add_memory.assert_awaited_once()
+
+
+class _UnresolvableLabelCounter(TriageFailOpenCounter):
+    """A counter whose storm summary names NO project.
+
+    `StormCounter` reports the distinct non-None labels it saw, and the tool
+    always has a `project_id` to label with — so at the tool seam the empty
+    case is unreachable by ordinary inputs, which is exactly why it needs a
+    seam of its own rather than an untested `or`. Subclassing the drain is the
+    narrowest one available: the production filing loop and its
+    `or [project_id]` fallback run completely unmodified.
+    """
+
+    def drain_storm(self) -> dict | None:
+        storm = super().drain_storm()
+        if storm is not None:
+            storm['projects'] = []
+        return storm
+
+
+def _filed_escalations(root) -> list[dict]:
+    """Every escalation record sitting in *root*'s queue directory."""
+    return [
+        json.loads(path.read_text())
+        for path in sorted((root / 'data' / 'escalations').glob('esc-*.json'))
+    ]
+
+
+@pytest.mark.skipif(
+    not write_triage.HAS_ESCALATION,
+    reason='the escalation package is not installed in this environment',
+)
+class TestTheFailOpenStormReachesAnOperator:
+    """The alarm END TO END: counter → drain → per-project filing → ack echo.
+
+    Both halves of this path already had coverage and the JOIN between them
+    had none — `TriageFailOpenCounter` is unit-tested, so is
+    `emit_triage_fail_open_storm_escalation`, and nothing asserted that the
+    tool body ever reaches the second with the output of the first.
+
+    That gap is the failure mode this module's own escalation-anchor comment
+    cites from the markup-tripwire incident: an alarm path that never fires,
+    whose silence is indistinguishable from health. A test that drives the
+    counter but stops short of the threshold reproduces it exactly, so these
+    drive a real crossing against a real `EscalationQueue` in `tmp_path`.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_burst_files_a_record_and_echoes_its_id_on_the_ack(
+        self, tmp_path, monkeypatch,
+    ) -> None:
+        """The crossing write carries the filed id; the ones before it do not.
+
+        And every write in the burst still LANDS — that is the whole claim the
+        escalation makes on the operator's behalf ("no write was lost or
+        blocked"), so it is asserted here rather than taken on trust.
+        """
+        _install_counter(monkeypatch)
+        root = tmp_path / 'dark_factory'
+        root.mkdir()
+        mock_service = AsyncMock()
+        _configure_config(mock_service, enabled=True)
+        _configure_pass_through_add_memory(mock_service)
+        mock_service.search.side_effect = RuntimeError('mem0 unreachable')
+        server = create_mcp_server(
+            mock_service, known_projects={_PROJECT_ID: str(root)},
+        )
+
+        acks = [await _call(server) for _ in range(_FAIL_OPEN_STORM_THRESHOLD)]
+
+        for ack in acks:
+            assert 'error' not in ack, f'a fail-open must not block the write: {ack!r}'
+            assert ack[ROUTED_KEY] == OUTCOME_STORED, f'{ack!r}'
+        assert mock_service.add_memory.await_count == _FAIL_OPEN_STORM_THRESHOLD
+
+        records = _filed_escalations(root)
+        assert len(records) == 1, f'expected exactly one filed record: {records!r}'
+        assert records[0]['task_id'] == write_triage._ANCHOR_TASK_ID
+        assert records[0]['category'] == 'write_triage_fail_open_storm'
+
+        assert acks[-1][FAIL_OPEN_ESCALATION_ID_KEY] == records[0]['id'], (
+            f'the crossing ack must name the filed record: {acks[-1]!r}'
+        )
+        for ack in acks[:-1]:
+            assert FAIL_OPEN_ESCALATION_ID_KEY not in ack, (
+                f'only the crossing write may carry an escalation id: {ack!r}'
+            )
+
+    @pytest.mark.asyncio
+    async def test_every_project_in_the_window_gets_the_alarm(
+        self, tmp_path, monkeypatch,
+    ) -> None:
+        """The counter's window is per-SERVER; the queues are per-PROJECT.
+
+        A burst can therefore span projects, and filing only into whichever
+        one happened to cross the threshold would leave the co-affected
+        project's operator with nothing at all — the same silence-reads-as-calm
+        failure as not filing.
+        """
+        _install_counter(monkeypatch)
+        roots = {}
+        for pid in ('dark_factory', 'know_live'):
+            roots[pid] = tmp_path / pid
+            roots[pid].mkdir()
+        mock_service = AsyncMock()
+        _configure_config(mock_service, enabled=True)
+        _configure_pass_through_add_memory(mock_service)
+        mock_service.search.side_effect = RuntimeError('mem0 unreachable')
+        server = create_mcp_server(
+            mock_service,
+            known_projects={pid: str(root) for pid, root in roots.items()},
+        )
+
+        half = _FAIL_OPEN_STORM_THRESHOLD // 2
+        for _ in range(half):
+            await _call(server, project_id='dark_factory')
+        acks = [
+            await _call(server, project_id='know_live')
+            for _ in range(_FAIL_OPEN_STORM_THRESHOLD - half)
+        ]
+
+        filed_ids = set()
+        for pid, root in roots.items():
+            records = _filed_escalations(root)
+            assert len(records) == 1, f'{pid} got no alarm: {records!r}'
+            assert f'projects_in_window={sorted(roots)!r}' in records[0]['detail'], (
+                f'{pid}: the record must name every affected project: '
+                f'{records[0]["detail"]!r}'
+            )
+            filed_ids.add(records[0]['id'])
+        assert acks[-1][FAIL_OPEN_ESCALATION_ID_KEY] in filed_ids, f'{acks[-1]!r}'
+
+    @pytest.mark.asyncio
+    async def test_a_burst_naming_no_project_still_alarms_this_calls_own_queue(
+        self, tmp_path, monkeypatch,
+    ) -> None:
+        """The `or [project_id]` fallback in the filing loop.
+
+        A burst whose labels were all unresolvable still deserves an alarm
+        somewhere, and this call's own project is the only queue that can be
+        named. Without the fallback the loop would iterate zero times and the
+        crossing would be counted, drained, and dropped on the floor.
+        """
+        _install_counter(monkeypatch, cls=_UnresolvableLabelCounter)
+        root = tmp_path / 'dark_factory'
+        root.mkdir()
+        mock_service = AsyncMock()
+        _configure_config(mock_service, enabled=True)
+        _configure_pass_through_add_memory(mock_service)
+        mock_service.search.side_effect = RuntimeError('mem0 unreachable')
+        server = create_mcp_server(
+            mock_service, known_projects={_PROJECT_ID: str(root)},
+        )
+
+        acks = [await _call(server) for _ in range(_FAIL_OPEN_STORM_THRESHOLD)]
+
+        records = _filed_escalations(root)
+        assert len(records) == 1, f'the fallback did not fire: {records!r}'
+        assert acks[-1][FAIL_OPEN_ESCALATION_ID_KEY] == records[0]['id']
+
+    @pytest.mark.asyncio
+    async def test_an_unknown_project_is_a_quiet_no_op_not_a_blocked_write(
+        self, tmp_path, monkeypatch,
+    ) -> None:
+        """No resolvable root means no queue to file into — and no failure.
+
+        `_kp.get(...)` answers None, which the emitter treats as a no-op. The
+        burst is still counted and still logged; what is lost is only the
+        queued heads-up. A write blocked because triage could not report its
+        own degradation would be the exact C1 violation the apparatus exists
+        to prevent.
+        """
+        _install_counter(monkeypatch)
+        root = tmp_path / 'other'
+        root.mkdir()
+        mock_service = AsyncMock()
+        _configure_config(mock_service, enabled=True)
+        _configure_pass_through_add_memory(mock_service)
+        mock_service.search.side_effect = RuntimeError('mem0 unreachable')
+        # A registry that KNOWS this project (so the write-boundary gate lets
+        # it through) but maps it to a root with no escalation queue is not
+        # the case under test — an unregistered id cannot reach add_memory at
+        # all. The case is a label the filing loop cannot resolve, which is
+        # what an empty registry reproduces.
+        server = create_mcp_server(mock_service, known_projects=None)
+
+        acks = [await _call(server) for _ in range(_FAIL_OPEN_STORM_THRESHOLD)]
+
+        for ack in acks:
+            assert 'error' not in ack, f'{ack!r}'
+            assert ack[ROUTED_KEY] == OUTCOME_STORED, f'{ack!r}'
+            assert FAIL_OPEN_ESCALATION_ID_KEY not in ack, (
+                f'nothing was filed, so nothing may be named: {ack!r}'
+            )
+        assert not (root / 'data' / 'escalations').exists()
+        assert mock_service.add_memory.await_count == _FAIL_OPEN_STORM_THRESHOLD
+
+
+class TestAnAttachThatDidNotLandIsNotAcked:
+    """`routed`/`canonical_id` may only describe a link that actually exists.
+
+    A raise is only HALF the failure surface at this seam, and the smaller
+    half. `MemoryService.add_memory` does not raise when a store fails: it
+    catches the exception into `_graphiti_error`/`_mem0_error`, folds it into
+    `message`, and returns an ordinary `AddMemoryResponse` with no memory_ids.
+    So the `except` fallback never sees a store-level failure, and without an
+    explicit check the ack announces `restated` + a canonical_id for a child
+    that was never persisted — an ack claiming an attach that did not happen,
+    which the wiring's own comment calls worse than no ack at all.
+    """
+
+    @staticmethod
+    def _failed_response(message: str = 'Memory queued for [] [mem0_error: down]'):
+        """The shape a store-level failure really returns: no memory_ids."""
+        result = MagicMock()
+        result.memory_ids = []
+        result.stores_written = []
+        result.message = message
+        result.model_dump.return_value = {'memory_ids': [], 'message': message}
+        return result
+
+    @pytest.mark.asyncio
+    async def test_a_child_write_that_never_persisted_acks_as_stored(
+        self, monkeypatch,
+    ) -> None:
+        counter = _install_counter(monkeypatch)
+        mock_service = AsyncMock()
+        _configure_config(mock_service, enabled=True)
+        mock_service.add_memory.return_value = self._failed_response()
+        mock_service.search.return_value = [_candidate('m1', 0.97)]
+        server = create_mcp_server(mock_service)
+
+        result = await _call(server)
+
+        assert result[ROUTED_KEY] == OUTCOME_STORED, (
+            f'the child never landed, so the ack must not claim it did: {result!r}'
+        )
+        assert CANONICAL_ID_KEY not in result, (
+            f'a link that does not exist may not be named: {result!r}'
+        )
+        assert counter.live_count() == 1, 'a lost attach is a degradation (INV-4)'
+        # NOT retried, unlike the raising path: there the failure is
+        # attributable to the injected parent link, here the store itself just
+        # failed on this exact content and a re-issue would fail identically
+        # (and risk a duplicate if the response under-reports a partial write).
+        assert mock_service.add_memory.await_count == 1, (
+            f'{mock_service.add_memory.await_args_list!r}'
+        )
+        # The caller still gets the real response, message and all — exactly
+        # the pre-triage outcome.
+        assert 'mem0_error' in result['message']
+
+    @pytest.mark.asyncio
+    async def test_a_landed_child_is_still_acked_as_an_attach(
+        self, monkeypatch,
+    ) -> None:
+        """The guard must not downgrade a REAL attach.
+
+        Ambiguity resolves toward "landed" on purpose, so this pins that a
+        response carrying ids keeps its `restated` ack — a check that
+        downgraded on anything unreadable would silently disable the whole
+        redirect outcome.
+        """
+        _install_counter(monkeypatch)
+        mock_service = AsyncMock()
+        _configure_config(mock_service, enabled=True)
+        landed = MagicMock()
+        landed.memory_ids = ['child-id']
+        landed.model_dump.return_value = {'memory_ids': ['child-id']}
+        mock_service.add_memory.return_value = landed
+        mock_service.search.return_value = [_candidate('m1', 0.97)]
+        server = create_mcp_server(mock_service)
+
+        result = await _call(server)
+
+        assert result[ROUTED_KEY] == OUTCOME_RESTATED, f'{result!r}'
+        assert result[CANONICAL_ID_KEY] == 'm1', f'{result!r}'
+
+
+class TestAVerdictWithNoWiredAttachKindIsVisible:
+    """`contested` is in TRIAGE_OUTCOMES but has no entry in _TRIAGE_ATTACH_KINDS.
+
+    Unreachable today — the stub judge only returns `stored` — but this is a
+    trap laid for leaf gamma: its FIRST contested verdict would otherwise be
+    discarded, acked as plain `stored`, and indistinguishable from "nothing
+    matched". The docstring advertises `contested` as a value `routed` can
+    carry, so a consumer would wait for it forever with nothing to grep.
+    """
+
+    @pytest.mark.asyncio
+    async def test_it_stores_but_says_so_loudly(self, monkeypatch, caplog) -> None:
+        counter = _install_counter(monkeypatch)
+        mock_service = AsyncMock()
+        _configure_config(mock_service, enabled=True)
+        _configure_pass_through_add_memory(mock_service)
+        monkeypatch.setattr(
+            tools, 'triage_write',
+            AsyncMock(return_value=BandDecision(
+                OUTCOME_CONTESTED, 'm1', 0.85, _T_HIGH, _T_LOW,
+            )),
+        )
+        server = create_mcp_server(mock_service)
+
+        with caplog.at_level(logging.WARNING, logger=tools.logger.name):
+            result = await _call(server)
+
+        assert result[ROUTED_KEY] == OUTCOME_STORED, f'{result!r}'
+        assert CANONICAL_ID_KEY not in result, f'{result!r}'
+        metadata = mock_service.add_memory.await_args.kwargs['metadata']
+        assert PARENT_ID_KEY not in (metadata or {}), (
+            f'a half-wired outcome must not invent a parent link: {metadata!r}'
+        )
+        assert any(
+            OUTCOME_CONTESTED in record.getMessage() for record in caplog.records
+        ), f'the discarded verdict must name itself: {caplog.text!r}'
+        assert counter.live_count() == 1, (
+            'a gap between the judge vocabulary and the tool wiring is a '
+            'fail-open, not a routing decision nobody notices (INV-4)'
+        )

@@ -52,12 +52,27 @@ from shared.storm_counter import StormCounter
 from fused_memory.models.enums import MEM0_PRIMARY
 from fused_memory.server.grouped_read import CHILD_KINDS, PARENT_ID_KEY
 
+# The per-store-cosine reader, IMPORTED rather than re-implemented (INV-5) —
+# the same treatment PARENT_ID_KEY and CHILD_KINDS get above. This module
+# retires ``near_duplicate_guard``, so a copy here would have been the obvious
+# shortcut; it is also exactly how task 3658's field move (relevance_score →
+# metadata['store_score']) would go wrong a second time. One copy updated and
+# the other left behind does not raise — it scores every candidate as
+# uncomparable, which routes every write to ``stored`` and is indistinguishable
+# from a genuinely novel corpus. If that module is ever deleted rather than
+# left dormant, this import fails LOUDLY at import time, which is the right
+# way to be told to hoist the helper. (Hoisting it into a shared home is the
+# better end state and is deliberately NOT done here: near_duplicate_guard.py
+# is outside this task's lock set.)
+from fused_memory.server.near_duplicate_guard import _cosine_of
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 
     from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
 
     from fused_memory.models.memory import MemoryResult
+    from fused_memory.services.memory_service import SearchResults
 
 # Defensive import of the optional ``escalation`` workspace package, copied
 # from markup_tripwire.py (which took it from middleware/candidate_key_
@@ -126,6 +141,38 @@ TRIAGE_OUTCOMES: frozenset[str] = frozenset({
     OUTCOME_AMENDED,
     OUTCOME_CONTESTED,
 })
+
+
+def attach_write_landed(result: Any) -> bool:
+    """Did the child write for an ATTACH outcome actually persist?
+
+    The ack may only claim :data:`CANONICAL_ID_KEY` for a link that exists, so
+    the write path needs this BEFORE building the ack.
+
+    A raise is only half the failure surface, and the smaller half — the same
+    asymmetry :func:`triage_write` handles for retrieval.
+    ``MemoryService.add_memory`` does not raise when a store fails: it catches
+    the Graphiti/Mem0 exception into ``_graphiti_error``/``_mem0_error``, folds
+    it into ``message``, and returns an ordinary ``AddMemoryResponse``. What it
+    does NOT do on that path is return any ``memory_ids`` — the mem0 arm
+    appends ids only after ``mem0.add`` resolves without raising — so an
+    EXPLICITLY empty ``memory_ids`` is the honest "nothing landed" signal for
+    the Mem0-primary categories triage covers. (An empty ``memory_ids`` from a
+    non-raising mem0 call is the silent dedup/infer drop
+    ``MemoryService.add_memory`` itself logs as anomalous; treating it as
+    not-landed here is the same reading.)
+
+    Answers ``True`` for anything that is not an explicitly empty sequence —
+    a missing attribute, or the ``Mock`` an unspecced test double
+    auto-generates. Ambiguity resolves toward "landed" on purpose: this
+    predicate only ever DOWNGRADES an ack, and downgrading a real attach
+    because the response shape was unreadable would invent a failure that did
+    not happen. Production always returns a real ``AddMemoryResponse``, whose
+    lists are real lists, so the check is exact where it matters.
+    """
+    memory_ids = getattr(result, 'memory_ids', None)
+    return not (isinstance(memory_ids, list | tuple) and not memory_ids)
+
 
 # --- config defaults --------------------------------------------------------
 
@@ -251,22 +298,6 @@ class BandDecision:
     #: The band edges this decision was made against, echoed as read.
     t_high: float | None
     t_low: float | None
-
-
-def _cosine_of(result: MemoryResult) -> float | None:
-    """Read the per-store cosine a search result carries, or ``None``.
-
-    Since task 3658 ``MemoryService.search`` puts the honest per-store
-    similarity in ``metadata['store_score']`` (the Mem0 cosine; ``None`` for
-    Graphiti, which exposes no scores) and leaves ``relevance_score`` an
-    ORDINAL Reciprocal-Rank-Fusion value. Same shape as
-    ``near_duplicate_guard._cosine_of``, including the ``bool`` exclusion, so
-    a non-measurement can never be read as a similarity.
-    """
-    value = (result.metadata or {}).get('store_score')
-    if isinstance(value, int | float) and not isinstance(value, bool):
-        return float(value)
-    return None
 
 
 def _canonical_id_of(result: MemoryResult) -> str:
@@ -409,7 +440,7 @@ async def retrieve_candidates(
     content: str,
     project_id: str,
     k: int,
-) -> list[MemoryResult]:
+) -> SearchResults:
     """Fetch up to *k* comparable candidates for *content*, cross-category.
 
     Two things about this call are load-bearing.
@@ -461,7 +492,11 @@ async def retrieve_candidates(
     This is why the ``SearchResults`` object is returned UN-TRANSFORMED — no
     slice, no comprehension, no ``sorted()``. Those all return a plain
     ``list`` and silently drop ``degraded``/``failed_stores``, which would
-    re-hide the outage from the only code positioned to count it.
+    re-hide the outage from the only code positioned to count it. The return
+    type is annotated ``SearchResults`` rather than ``list[MemoryResult]`` so
+    that invariant is checkable rather than merely argued: under the looser
+    annotation a "cleanup" to a slice or a comprehension type-checks fine,
+    and the resulting outage reads as healthy-and-empty.
     """
     return await memory_service.search(
         query=content,

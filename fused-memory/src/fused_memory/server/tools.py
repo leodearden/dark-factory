@@ -129,6 +129,7 @@ from fused_memory.server.write_triage import (
     OUTCOME_STORED,
     ROUTED_KEY,
     TriageFailOpenCounter,
+    attach_write_landed,
     emit_triage_fail_open_storm_escalation,
     resolve_write_triage_enabled,
     triage_write,
@@ -1221,7 +1222,7 @@ def create_mcp_server(
     # Mem0UpdateStormEscalator's per-instance state is built on.
     _triage_fail_open_counter = TriageFailOpenCounter()
 
-    def _file_triage_fail_open_storm(storm: dict, project_id: str) -> str | None:
+    async def _file_triage_fail_open_storm(storm: dict, project_id: str) -> str | None:
         """File the fail-open storm escalation for every project in the window.
 
         Returns one filed escalation id to echo back, or None.
@@ -1238,6 +1239,19 @@ def create_mcp_server(
         would turn a future regression there into an outage on the write path.
         An unresolvable project yields no root at all, which the emitter
         treats as a quiet no-op.
+
+        ASYNC ON PURPOSE — do not re-inline the escalation hop.
+        ``emit_triage_fail_open_storm_escalation`` does BLOCKING filesystem
+        I/O (queue construction, a queue-directory scan in ``get_by_task``, and
+        an fsync-flushed ``submit``), and this loop runs it once per project in
+        the window. Called directly from this coroutine it would run that I/O
+        ON the event loop and stall every other concurrent memory write for its
+        duration, so each call is handed to ``asyncio.to_thread``. Same
+        treatment, and the same reasoning, as
+        ``memory_service._validate_and_census``'s
+        ``file_unknown_key_storm_escalation`` hop. Rare by construction (one
+        crossing per rolling window) but this is the higher-volume
+        ``add_memory`` path, so the cheap hop is worth taking.
         """
         esc_id = None
         # `or [project_id]`: a burst whose labels were all unresolvable still
@@ -1245,7 +1259,9 @@ def create_mcp_server(
         # queue we can name.
         for pid in storm.get('projects') or [project_id]:
             try:
-                filed = emit_triage_fail_open_storm_escalation(_kp.get(pid), storm)
+                filed = await asyncio.to_thread(
+                    emit_triage_fail_open_storm_escalation, _kp.get(pid), storm,
+                )
             except Exception:  # pragma: no cover — defensive only
                 logger.exception(
                     'write_triage: emit_triage_fail_open_storm_escalation raised '
@@ -3303,6 +3319,34 @@ def create_mcp_server(
             if triage_decision is not None and attach_kind is not None
             else None
         )
+        if (
+            triage_decision is not None
+            and attach_kind is None
+            and triage_decision.outcome != OUTCOME_STORED
+        ):
+            # A verdict this body cannot ACT on. `contested` is the concrete
+            # case: it is a full member of TRIAGE_OUTCOMES, so `triage_write`
+            # accepts it from a judge, but it has no entry in
+            # _TRIAGE_ATTACH_KINDS (deliberately — leaf gamma owns the
+            # contested child, which also carries CONTESTED_METADATA_KEY).
+            # Without this arm the verdict is discarded and the ack quietly
+            # reports `stored`, indistinguishable from "nothing matched" — a
+            # trap laid for leaf gamma's FIRST contested verdict, whose
+            # silence would read as the judge never firing.
+            #
+            # Counted as a fail-open for the same reason `triage_write` counts
+            # an out-of-vocabulary verdict: the write still lands untriaged
+            # (C1 holds), but a gap between the judge's vocabulary and this
+            # body's wiring must surface as a storm escalation rather than as
+            # nothing at all.
+            logger.warning(
+                'write_triage: outcome=%r has no attach kind wired at the tool '
+                'seam; the write is stored standalone and the ack reports %r. '
+                'This is a wiring gap between the judge vocabulary and '
+                '_TRIAGE_ATTACH_KINDS, not a routing decision.',
+                triage_decision.outcome, OUTCOME_STORED,
+            )
+            _triage_fail_open_counter.record(project=project_id)
         write_meta = cleaned_meta
         if attached_to is not None:
             write_meta = {
@@ -3355,6 +3399,35 @@ def create_mcp_server(
                 causation_id=causation_id,
                 _source=source,
             )
+        if attached_to is not None and not attach_write_landed(result):
+            # A RAISE IS ONLY HALF THE FAILURE SURFACE — and the smaller half,
+            # the same asymmetry `triage_write` handles for retrieval.
+            # `MemoryService.add_memory` does NOT raise when a store fails: it
+            # catches the Graphiti/Mem0 exception into `_graphiti_error` /
+            # `_mem0_error`, folds it into `message`, and returns an ordinary
+            # AddMemoryResponse with NO memory_ids. So a child write that died
+            # at the store never reaches the `except` arm above, and the ack
+            # would otherwise announce `restated` + canonical_id for a link
+            # that was never persisted — precisely the "ack claiming an attach
+            # that did not happen" the comment below calls worse than no ack.
+            #
+            # NOT retried standalone, unlike the `except` arm. There the
+            # failure is attributable to the INJECTED parent link (a
+            # MemoryMetadataValidationError raised before any backend call), so
+            # dropping the link and re-writing genuinely helps. Here the store
+            # itself just failed on this exact content; re-issuing it would
+            # fail the same way, and would risk a duplicate if the response
+            # under-reports a partial success. The caller gets the failed
+            # response unchanged — message and all — which is the exact
+            # pre-triage outcome.
+            logger.warning(
+                'write_triage: the child write for canonical=%r did not persist '
+                '(no memory_ids returned); acking as %r rather than claiming an '
+                'attach that never landed. Response message: %r',
+                attached_to, OUTCOME_STORED, getattr(result, 'message', None),
+            )
+            _triage_fail_open_counter.record(project=project_id)
+            attached_to = None
         ack = result.model_dump()
         if triage_decision is not None:
             # Purely ADDITIVE over the AddMemoryResponse: every existing caller
@@ -3373,7 +3446,7 @@ def create_mcp_server(
             # triage_write's internal fail-opens and this body's own.
             storm = _triage_fail_open_counter.drain_storm()
             if storm:
-                esc_id = _file_triage_fail_open_storm(storm, project_id)
+                esc_id = await _file_triage_fail_open_storm(storm, project_id)
                 if esc_id is not None:
                     # Echoed so the writer (or a reviewer reading the response)
                     # can find the filed record without grepping logs — the
