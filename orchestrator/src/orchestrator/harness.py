@@ -27,7 +27,7 @@ from shared.config_dir import CONFIG_DIR_PREFIX
 from shared.cost_store import CostStore
 from shared.mcp_envelope import resolver_failed
 from shared.storm_counter import StormCounter
-from shared.task_claimant import has_live_claimant
+from shared.task_claimant import compose_claimant_run_id, has_live_claimant
 from shared.task_metadata import RoutingState
 from shared.timestamps import parse_timestamp_or_warn
 from shared.transcript_archive import (
@@ -246,6 +246,15 @@ _DIRTY_TREE_ESCALATION_SENTINEL: str = 'dirty-project-root-startup'
 # workflow waits on, giving get_by_task(..., level=2) a durable self-heal handle
 # and make_id a per-sentinel counter across restarts.
 _CONFIG_UNKNOWN_KEYS_SENTINEL: str = 'config-unknown-keys-startup'
+
+# The session_id component the harness embeds in the claimant identity it
+# stamps on every Escalation it files (task 3550, see
+# Harness._filing_claimant_run_id).  A FIXED literal, not a per-task value:
+# the harness is a process-level filer with no per-task session id at any of
+# its filing sites.  Deliberately not in TaskWorkflow.session_id's
+# f'{task_id}-{uuid4().hex[:8]}' shape — no '-', no '/', under 10 chars — so a
+# harness-filed record can never collide with a workflow's identity.
+_HARNESS_FILING_SESSION_ID: str = 'harness'
 
 # Statuses swept by _reconcile_stranded_in_progress for stranded-task recovery.
 # Intentionally EXCLUDES:
@@ -2015,6 +2024,48 @@ class Harness:
 
         # Singleton lock — held for the duration of run()
         self._lock_file: IO | None = None
+
+    @property
+    def _filing_claimant_run_id(self) -> str | None:
+        """This harness process's identity, stamped on every ``Escalation`` it files.
+
+        Task 3550.  Spec ``docs/task-escalation-state-spec.md`` S6, realised
+        by ``escalation.pins::classify_pins`` Link 4: an L0 is a live handoff
+        only while the incarnation that FILED it lives, judged by comparing
+        this value WHOLE against the live claimant.  Three facts a reviewer
+        needs about why this differs from
+        :attr:`TaskWorkflow._filing_claimant_run_id`:
+
+        1. The harness is a PROCESS-level filer, not a task-workflow
+           incarnation.  None of its ~27 filing sites has a per-task
+           ``session_id``, and there is no live-``TaskWorkflow`` registry to
+           look one up from — :meth:`is_workflow_active` is a bare
+           ``_workflow_cancel_events`` membership test, not a workflow map.
+           So a genuine per-task incarnation identity is structurally
+           unavailable here.
+        2. ``_HARNESS_FILING_SESSION_ID`` is therefore a fixed literal, and
+           deliberately disjoint from every ``{task_id}-{uuid8}`` workflow
+           session id.  A harness-filed L0 can never be mistaken for a
+           workflow handoff, whatever task id a workflow carries.
+        3. Unlike ``TaskWorkflow``'s property there is no DB claimant
+           counterpart this must stay byte-identical to — that constraint
+           comes from the dispatch stamp, which the harness does not write.
+           So an unknown ``_run_id`` (the pre-:meth:`run` startup window,
+           where ``__init__`` has only declared it ``None``) degrades to a
+           fail-safe ``None`` rather than emitting the well-shaped-but-wrong
+           partial ``'/harness/pid={pid}'``.  A partial would carry the
+           ``/pid=`` marker, survive ``pins._norm_id``'s shape guard, and then
+           be compared whole as if KNOWN — mismatching every live claimant.
+           This is the same choice ``workflow.py``'s ``lock_plan`` call site
+           already makes ("Passed RAW, not ``or ''`` as the DB stamp does"),
+           and the one task 3563 ratified when it left that DB stamp's
+           asymmetry in place.
+        """
+        if not self._run_id:
+            return None
+        return compose_claimant_run_id(
+            self._run_id, _HARNESS_FILING_SESSION_ID, os.getpid(),
+        )
 
     def _is_action_teardown_task(self, tid: str) -> bool:
         """Bound-method wrapper wired as the ``suppress_blocked_write``
