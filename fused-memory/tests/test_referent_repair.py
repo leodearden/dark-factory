@@ -277,6 +277,12 @@ def service(mock_config):
     svc.graphiti.reassign_edge = AsyncMock(return_value=_reassigned())
     svc.graphiti.refresh_entity_summary = AsyncMock(return_value={})
     svc.graphiti.get_valid_edges_for_node = AsyncMock(return_value=[])
+    # `0` keeps the established positive path deleting exactly as it did before
+    # the fourth condition existed. It must be an explicit AsyncMock: without
+    # it the attribute autospecs to a truthy MagicMock that cannot be awaited,
+    # and every deletion test in this file breaks on the await rather than on
+    # anything it means to assert.
+    svc.graphiti.count_foreign_relationships = AsyncMock(return_value=0)
     svc.graphiti.delete_entity = AsyncMock(return_value={})
     install_identity_mocks(svc.graphiti)
     return svc
@@ -928,9 +934,16 @@ class TestEmptiedNodeCleanup:
 
     @pytest.mark.asyncio
     async def test_positive_an_emptied_canonical_task_node_is_deleted(self, service):
-        """`force=False` SPECIFICALLY: the backend's own `ActiveEdgesError`
-        guard is a second, INDEPENDENT check of the emptiness we just observed,
-        and `force=True` would discard it."""
+        """`force=False` SPECIFICALLY: it guards a genuine RACE on valid edges
+        — a node that gains a live edge between our read and the delete — and
+        `force=True` would discard that.
+
+        It is NOT, however, an independent check of the emptiness this cleanup
+        is predicated on: `delete_entity` re-checks by calling
+        `get_valid_edges_for_node`, the SAME query, so it is blind to exactly
+        what condition 4 exists to see. See
+        `TestTheFourthConditionOnTheCleanup`.
+        """
         service.graphiti.get_valid_edges_for_node = AsyncMock(return_value=[])
 
         stats = await service._repair_episode_referents(
@@ -1103,6 +1116,292 @@ class TestEmptiedNodeCleanup:
         assert any('n-3129' in r.getMessage() for r in caplog.records)
 
 
+class TestTheFourthConditionOnTheCleanup:
+    """The node must have NO relationship of ANY type or validity other than
+    THIS episode's own `MENTIONS` link.
+
+    THE DEFECT THIS CLOSES. The original three-condition guard could
+    irreversibly destroy a real, project-owned task entity together with its
+    entire temporal history, and the exposure is neither cross-episode nor
+    hypothetical — it is reachable inside ONE critical section:
+
+    * `get_valid_edges_for_node` is `MATCH (n:Entity {uuid:$uuid})-[e:RELATES_TO]-()
+      WHERE e.invalid_at IS NULL`. It sees ONLY currently-valid RELATES_TO, and
+      is blind to invalidated RELATES_TO history and to `MENTIONS` from
+      Episodic nodes.
+    * `delete_entity(force=False)` re-checks by calling THAT SAME function, so
+      it supplies no independent protection here; a same-query recheck cannot
+      see what the first query is blind to. It still guards a genuine race on
+      VALID edges, which is worth keeping, and nothing more.
+    * `delete_entity_node` issues a bare `MATCH (n:Entity {uuid:$uuid}) DETACH
+      DELETE n`, destroying EVERY relationship.
+    * `parse_node_name` cannot discriminate: a genuine `Task 3129` node passes
+      that guard BY CONSTRUCTION, since it is exactly a canonical task label.
+
+    `_invalidate_stale_superseded_ttl_edges` is sub-pass FOUR of the same
+    `_reconcile_episode_identity` chain and this cleanup is sub-pass EIGHT. So a
+    real, project-owned `Task N` node whose facts were TTL-invalidated at pass 4
+    reads as "empty" at pass 8 the moment eta moves its one remaining valid edge
+    away — and is deleted with its full history, inside one critical section.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_node_whose_history_is_merely_INVALIDATED_is_never_deleted(
+        self, service,
+    ):
+        """THE CONFIRMED DEFECT, pinned. `Task 3129` is a real task the project
+        owns; sub-pass four TTL-invalidated its facts earlier in this very
+        chain, so `get_valid_edges_for_node` reports it empty while its
+        temporal history is still in the graph and DETACH DELETE would destroy
+        it.
+
+        Refusing the cleanup must never un-count the reassignment that already
+        committed: the endpoint move is the correctness fix, the deletion is
+        opportunistic hygiene, and their outcomes are independent.
+        """
+        service.graphiti.get_valid_edges_for_node = AsyncMock(return_value=[])
+        service.graphiti.count_foreign_relationships = AsyncMock(return_value=2)
+
+        stats = await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory', episode_uuid='ep-1',
+        )
+
+        service.graphiti.delete_entity.assert_not_awaited()
+        assert stats.repairs[0].deleted_emptied_node == ''
+        assert stats.nodes_deleted == 0
+        assert stats.repairs[0].outcome == 'repaired'
+        assert stats.repaired == 1
+
+    @pytest.mark.asyncio
+    async def test_a_node_mentioned_by_a_DIFFERENT_episode_is_never_deleted(
+        self, service,
+    ):
+        """`(ep:Episodic)-[:MENTIONS]->(n:Entity)` provenance from any episode
+        other than the one in flight proves the node pre-existed this write.
+        Those links are load-bearing content — `maintenance/cross_graph_move.py`
+        recreates them precisely because losing them loses provenance — and are
+        invisible to every RELATES_TO-typed query in the backend."""
+        service.graphiti.get_valid_edges_for_node = AsyncMock(return_value=[])
+        service.graphiti.count_foreign_relationships = AsyncMock(return_value=1)
+
+        stats = await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory', episode_uuid='ep-1',
+        )
+
+        service.graphiti.delete_entity.assert_not_awaited()
+        assert stats.repairs[0].deleted_emptied_node == ''
+        assert stats.nodes_deleted == 0
+        assert stats.repaired == 1
+
+    @pytest.mark.asyncio
+    async def test_the_exclusion_is_LIVE_not_dead_code(self, service):
+        """THE PHANTOM THE CLEANUP EXISTS TO REMOVE still gets removed.
+
+        graphiti_core's extraction mints the mis-resolved node AND its
+        `MENTIONS` link from the same episodic node in the same `add_episode`,
+        so a strict zero-degree predicate would NEVER fire on it — shipping
+        dead code while leaving the duplicate-name key that disables
+        `dedup_helpers`' deterministic exact-match protection. Excluding only
+        this episode's own MENTIONS is what makes the guard both safe and
+        useful.
+        """
+        service.graphiti.get_valid_edges_for_node = AsyncMock(return_value=[])
+        service.graphiti.count_foreign_relationships = AsyncMock(return_value=0)
+
+        stats = await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory', episode_uuid='ep-live-1',
+        )
+
+        service.graphiti.count_foreign_relationships.assert_awaited_once_with(
+            'n-3129', group_id='dark_factory', episode_uuid='ep-live-1',
+        )
+        service.graphiti.delete_entity.assert_awaited_once_with(
+            'n-3129', group_id='dark_factory', force=False,
+        )
+        assert stats.repairs[0].deleted_emptied_node == 'n-3129'
+        assert stats.nodes_deleted == 1
+
+    @pytest.mark.asyncio
+    async def test_FAIL_CLOSED_an_unknown_episode_costs_a_deletion_never_grants_one(
+        self, service,
+    ):
+        """With `episode_uuid=''` the exclusion is dropped, so the node's own
+        in-flight MENTIONS now COUNTS and the delete is refused.
+
+        Losing the episode identity must cost a deletion, never grant one. That
+        is the whole reason the parameter defaults to `''` rather than to
+        something permissive.
+        """
+        service.graphiti.get_valid_edges_for_node = AsyncMock(return_value=[])
+        service.graphiti.count_foreign_relationships = AsyncMock(return_value=1)
+
+        stats = await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory',
+        )
+
+        service.graphiti.count_foreign_relationships.assert_awaited_once_with(
+            'n-3129', group_id='dark_factory', episode_uuid='',
+        )
+        service.graphiti.delete_entity.assert_not_awaited()
+        assert stats.nodes_deleted == 0
+        assert stats.repaired == 1
+
+    # ---- call shape and ORDER --------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_it_is_consulted_with_the_candidate_uuid_and_group(self, service):
+        service.graphiti.get_valid_edges_for_node = AsyncMock(return_value=[])
+
+        await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory', episode_uuid='ep-1',
+        )
+
+        service.graphiti.count_foreign_relationships.assert_awaited_once_with(
+            'n-3129', group_id='dark_factory', episode_uuid='ep-1',
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_node_with_a_surviving_valid_edge_is_never_even_queried(
+        self, service,
+    ):
+        """THE CHEAP GUARDS STAY FIRST. Condition 3 is the cheap typed query;
+        condition 4 is a new UNTYPED degree query, and both run inside the
+        per-group identity lock where every avoidable round-trip is contention
+        every other writer pays for. The new query is an ADDITION to the
+        existing conditions, never a substitute for them."""
+        service.graphiti.get_valid_edges_for_node = AsyncMock(
+            return_value=[{'uuid': 'e-other', 'fact': 'unrelated', 'name': 'X'}],
+        )
+
+        await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory', episode_uuid='ep-1',
+        )
+
+        service.graphiti.count_foreign_relationships.assert_not_awaited()
+        service.graphiti.delete_entity.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_non_canonical_name_is_never_even_queried(self, service):
+        """Condition 2 is a free local check and stays ahead of both queries."""
+        service.graphiti.get_valid_edges_for_node = AsyncMock(return_value=[])
+        service.graphiti.reassign_edge = AsyncMock(
+            return_value=_reassigned(old_endpoint_uuid='n-worker'),
+        )
+
+        await service._repair_episode_referents(
+            _stats(_finding(
+                old_endpoint_uuid='n-worker', old_endpoint_name='merge worker',
+                endpoint_referent=Referent(number='3129'),
+            )),
+            group_id='dark_factory', episode_uuid='ep-1',
+        )
+
+        service.graphiti.count_foreign_relationships.assert_not_awaited()
+        service.graphiti.delete_entity.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_no_op_move_is_never_even_queried(self, service):
+        """Condition 1 is a free local check: nothing left the node, so it has
+        no business asking anything about the node's degree."""
+        service.graphiti.reassign_edge = AsyncMock(
+            return_value=_reassigned(moved=False, refreshed_nodes=[]),
+        )
+        service.graphiti.get_valid_edges_for_node = AsyncMock(return_value=[])
+
+        await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory', episode_uuid='ep-1',
+        )
+
+        service.graphiti.count_foreign_relationships.assert_not_awaited()
+        service.graphiti.delete_entity.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_exactly_one_call_per_deduplicated_candidate(self, service):
+        """Two repairs moving endpoints off the SAME node produce ONE degree
+        query, matching the existing one-emptiness-check-per-candidate pin."""
+        service.graphiti.get_valid_edges_for_node = AsyncMock(return_value=[])
+        service.graphiti.reassign_edge = AsyncMock(side_effect=[
+            _reassigned(uuid='e1'), _reassigned(uuid='e2'),
+        ])
+
+        await service._repair_episode_referents(
+            _stats(_finding(edge_uuid='e1'), _finding(edge_uuid='e2')),
+            group_id='dark_factory', episode_uuid='ep-1',
+        )
+
+        service.graphiti.count_foreign_relationships.assert_awaited_once_with(
+            'n-3129', group_id='dark_factory', episode_uuid='ep-1',
+        )
+
+    # ---- guarded exactly like its neighbours ------------------------------
+
+    @pytest.mark.asyncio
+    async def test_a_raise_is_a_clean_per_candidate_skip(self, service, caplog):
+        """It shares the SAME per-candidate try/except as the other two cleanup
+        primitives — no new guard is introduced. A degree query that cannot be
+        read is a refusal to delete, which is the safe direction, and it must
+        not touch the reassignment that already committed."""
+        service.graphiti.get_valid_edges_for_node = AsyncMock(return_value=[])
+        service.graphiti.count_foreign_relationships = AsyncMock(
+            side_effect=RuntimeError('falkor down'),
+        )
+
+        with caplog.at_level(logging.WARNING):
+            stats = await service._repair_episode_referents(
+                _stats(_finding()), group_id='dark_factory', episode_uuid='ep-1',
+            )
+
+        service.graphiti.delete_entity.assert_not_awaited()
+        assert stats.repairs[0].outcome == 'repaired'
+        assert stats.repairs[0].deleted_emptied_node == ''
+        assert stats.repaired == 1
+        assert stats.nodes_deleted == 0
+        assert any(r.exc_info for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_one_unreadable_candidate_does_not_strand_the_rest(self, service):
+        service.graphiti.get_valid_edges_for_node = AsyncMock(return_value=[])
+        service.graphiti.reassign_edge = AsyncMock(side_effect=[
+            _reassigned(uuid='e1', old_endpoint_uuid='n-3129'),
+            _reassigned(uuid='e2', old_endpoint_uuid='n-3130',
+                        refreshed_nodes=['n-3130', 'n-3127']),
+        ])
+        service.graphiti.count_foreign_relationships = AsyncMock(
+            side_effect=[RuntimeError('falkor down'), 0],
+        )
+
+        stats = await service._repair_episode_referents(
+            _stats(
+                _finding(edge_uuid='e1'),
+                _finding(edge_uuid='e2', old_endpoint_uuid='n-3130',
+                         old_endpoint_name='Task 3130',
+                         endpoint_referent=Referent(number='3130')),
+            ),
+            group_id='dark_factory', episode_uuid='ep-1',
+        )
+
+        service.graphiti.delete_entity.assert_awaited_once_with(
+            'n-3130', group_id='dark_factory', force=False,
+        )
+        assert stats.repaired == 2
+        assert stats.nodes_deleted == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'exc_type', [asyncio.CancelledError, KeyboardInterrupt, SystemExit],
+    )
+    async def test_it_never_swallows_cancellation(self, service, exc_type):
+        service.graphiti.get_valid_edges_for_node = AsyncMock(return_value=[])
+        service.graphiti.count_foreign_relationships = AsyncMock(
+            side_effect=exc_type('interrupted'),
+        )
+
+        with pytest.raises(exc_type):
+            await service._repair_episode_referents(
+                _stats(_finding()), group_id='dark_factory', episode_uuid='ep-1',
+            )
+
+
 class TestCleanupIsGuardedIndependently:
     """A cleanup failure must never discard or un-count reassignments that
     already succeeded.
@@ -1116,7 +1415,9 @@ class TestCleanupIsGuardedIndependently:
     """
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize('failing', ['get_valid_edges_for_node', 'delete_entity'])
+    @pytest.mark.parametrize('failing', [
+        'get_valid_edges_for_node', 'count_foreign_relationships', 'delete_entity',
+    ])
     async def test_a_cleanup_failure_leaves_every_reassignment_intact(
         self, service, caplog, failing,
     ):
@@ -1124,7 +1425,7 @@ class TestCleanupIsGuardedIndependently:
             service.graphiti, failing,
             AsyncMock(side_effect=RuntimeError('falkor down')),
         )
-        if failing == 'delete_entity':
+        if failing != 'get_valid_edges_for_node':
             service.graphiti.get_valid_edges_for_node = AsyncMock(return_value=[])
 
         with caplog.at_level(logging.WARNING):
@@ -1143,7 +1444,9 @@ class TestCleanupIsGuardedIndependently:
         assert any(r.exc_info for r in caplog.records)
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize('failing', ['get_valid_edges_for_node', 'delete_entity'])
+    @pytest.mark.parametrize('failing', [
+        'get_valid_edges_for_node', 'count_foreign_relationships', 'delete_entity',
+    ])
     @pytest.mark.parametrize(
         'exc_type', [asyncio.CancelledError, KeyboardInterrupt, SystemExit],
     )
@@ -1153,7 +1456,7 @@ class TestCleanupIsGuardedIndependently:
         setattr(
             service.graphiti, failing, AsyncMock(side_effect=exc_type('interrupted')),
         )
-        if failing == 'delete_entity':
+        if failing != 'get_valid_edges_for_node':
             service.graphiti.get_valid_edges_for_node = AsyncMock(return_value=[])
 
         with pytest.raises(exc_type):
