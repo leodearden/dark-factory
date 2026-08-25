@@ -354,9 +354,9 @@ tasks:
     verdict: PASS
     delivered_check:
       kind: grep
-      pattern: owner_task_id
+      pattern: owner=\{d\.owner_task_id\}
       paths:
-      - orchestrator/src/orchestrator/cli.py
+      - orchestrator/src/orchestrator/flake_report.py
       expect: present
 - label: κ
   task_id: 3794

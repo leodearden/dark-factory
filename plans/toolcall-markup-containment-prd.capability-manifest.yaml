@@ -280,7 +280,7 @@ tasks:
     verdict: PASS
     delivered_check:
       kind: grep
-      pattern: </invoke>
+      pattern: parameter name=
       paths:
       - docs/task-recovery-2026-05-13/worktree-inventory.json
       expect: present
