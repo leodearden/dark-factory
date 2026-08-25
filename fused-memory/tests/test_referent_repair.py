@@ -32,6 +32,7 @@ import pytest
 from _fm_helpers import install_identity_mocks
 from test_referent_verification import _WRITE_PRIMITIVES, assert_never_repaired
 
+from fused_memory.backends.graphiti_client import ActiveEdgesError
 from fused_memory.services.memory_service import (
     REFERENT_REPAIR_OUTCOMES,
     MemoryService,
@@ -862,3 +863,196 @@ class TestDegenerateEdges:
         assert stats.degenerate_edges == 0
         assert stats.repaired == 1
         assert stats.flagged_unrepairable == 1
+
+
+class TestEmptiedNodeCleanup:
+    """EDGE CASE (b): delete a node this pass emptied — under THREE conditions,
+    all of which must hold.
+
+    Two situations the node can be in, and the narrow guard is what
+    distinguishes them.  If the project GENUINELY OWNS the task, the node keeps
+    its pre-existing edges after the repair and must never be deleted —
+    deleting a real task entity to fix an attribution error would be a far more
+    damaging bug than the one being fixed.  If the node was MINTED by this very
+    episode out of the mis-resolved reference alone, the repair leaves it
+    edgeless and semantically wrong, and it would otherwise persist as a
+    phantom entity future writes keep re-colliding with — leaving the fix only
+    half-working, and keeping the duplicate-name key that disables
+    `dedup_helpers`' deterministic exact-match protection.
+    """
+
+    @pytest.mark.asyncio
+    async def test_positive_an_emptied_canonical_task_node_is_deleted(self, service):
+        """`force=False` SPECIFICALLY: the backend's own `ActiveEdgesError`
+        guard is a second, INDEPENDENT check of the emptiness we just observed,
+        and `force=True` would discard it."""
+        service.graphiti.get_valid_edges_for_node = AsyncMock(return_value=[])
+
+        stats = await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory',
+        )
+
+        service.graphiti.get_valid_edges_for_node.assert_awaited_once_with(
+            'n-3129', group_id='dark_factory',
+        )
+        service.graphiti.delete_entity.assert_awaited_once_with(
+            'n-3129', group_id='dark_factory', force=False,
+        )
+        assert stats.repairs[0].deleted_emptied_node == 'n-3129'
+        assert stats.nodes_deleted == 1
+
+    @pytest.mark.asyncio
+    async def test_negative_1_a_node_the_project_genuinely_owns_is_never_deleted(
+        self, service,
+    ):
+        service.graphiti.get_valid_edges_for_node = AsyncMock(
+            return_value=[{'uuid': 'e-other', 'fact': 'unrelated', 'name': 'X'}],
+        )
+
+        stats = await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory',
+        )
+
+        service.graphiti.delete_entity.assert_not_awaited()
+        assert stats.repairs[0].deleted_emptied_node == ''
+        assert stats.nodes_deleted == 0
+        assert stats.repaired == 1
+
+    @pytest.mark.asyncio
+    async def test_negative_2_a_name_that_is_not_a_canonical_task_label_is_never_deleted(
+        self, service,
+    ):
+        """`parse_node_name` is the single normative label vocabulary and is
+        ANCHORED by design, so 'merge worker' — and 'Task 42 orchestrator' —
+        are never deletion candidates however empty they look."""
+        service.graphiti.get_valid_edges_for_node = AsyncMock(return_value=[])
+        service.graphiti.reassign_edge = AsyncMock(
+            return_value=_reassigned(old_endpoint_uuid='n-worker'),
+        )
+
+        stats = await service._repair_episode_referents(
+            _stats(_finding(
+                old_endpoint_uuid='n-worker', old_endpoint_name='merge worker',
+                endpoint_referent=Referent(number='3129'),
+            )),
+            group_id='dark_factory',
+        )
+
+        service.graphiti.delete_entity.assert_not_awaited()
+        assert stats.repairs[0].deleted_emptied_node == ''
+
+    @pytest.mark.asyncio
+    async def test_negative_3i_a_no_op_move_is_not_even_a_candidate(self, service):
+        """`moved=False` means no endpoint LEFT the node — this pass emptied
+        nothing, so it has no business asking whether the node is empty."""
+        service.graphiti.reassign_edge = AsyncMock(
+            return_value=_reassigned(moved=False, refreshed_nodes=[]),
+        )
+        service.graphiti.get_valid_edges_for_node = AsyncMock(return_value=[])
+
+        stats = await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory',
+        )
+
+        service.graphiti.get_valid_edges_for_node.assert_not_awaited()
+        service.graphiti.delete_entity.assert_not_awaited()
+        assert stats.repairs[0].deleted_emptied_node == ''
+
+    @pytest.mark.asyncio
+    async def test_negative_3ii_the_node_that_GAINED_the_edge_is_never_a_candidate(
+        self, service,
+    ):
+        """Only the OLD endpoint lost an edge.  Deleting the repair TARGET
+        would undo the repair."""
+        service.graphiti.get_valid_edges_for_node = AsyncMock(return_value=[])
+
+        await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory',
+        )
+
+        deleted = [c.args[0] for c in service.graphiti.delete_entity.await_args_list]
+        assert 'n-3127' not in deleted
+        assert deleted == ['n-3129']
+
+    @pytest.mark.asyncio
+    async def test_negative_4_a_node_only_flagged_is_never_a_candidate(self, service):
+        """Nothing moved off a node whose finding was recorded 'unrepairable'
+        or 'degenerate' — by definition, since eta refused to act on it."""
+        service.graphiti.get_valid_edges_for_node = AsyncMock(return_value=[])
+        unresolvable = _finding(
+            edge_uuid='e-u', old_endpoint_uuid='n-2520',
+            old_endpoint_name='Task 2520',
+            endpoint_referent=Referent(number='2520'),
+            intended_referent=None, new_endpoint_uuid=None,
+            resolvable=False, reason='no candidate target',
+        )
+        degenerate = (
+            _finding(
+                edge_uuid='e-d', which_end='source', old_endpoint_uuid='n-2521',
+                old_endpoint_name='Task 2521',
+                endpoint_referent=Referent(number='2521'),
+            ),
+            _finding(
+                edge_uuid='e-d', which_end='target', old_endpoint_uuid='n-2521',
+                old_endpoint_name='Task 2521',
+                endpoint_referent=Referent(number='2521'),
+            ),
+        )
+
+        stats = await service._repair_episode_referents(
+            _stats(unresolvable, *degenerate), group_id='dark_factory',
+        )
+
+        service.graphiti.get_valid_edges_for_node.assert_not_awaited()
+        service.graphiti.delete_entity.assert_not_awaited()
+        assert stats.nodes_deleted == 0
+
+    @pytest.mark.asyncio
+    async def test_the_candidate_set_is_deduplicated(self, service):
+        """Two repairs moving endpoints off the SAME node produce exactly ONE
+        emptiness check and ONE delete — the check is a query inside the
+        identity lock, and the delete is irreversible."""
+        service.graphiti.get_valid_edges_for_node = AsyncMock(return_value=[])
+        service.graphiti.ensure_entity_node = AsyncMock(return_value='n-3127')
+        service.graphiti.reassign_edge = AsyncMock(side_effect=[
+            _reassigned(uuid='e1'), _reassigned(uuid='e2'),
+        ])
+
+        stats = await service._repair_episode_referents(
+            _stats(_finding(edge_uuid='e1'), _finding(edge_uuid='e2')),
+            group_id='dark_factory',
+        )
+
+        service.graphiti.get_valid_edges_for_node.assert_awaited_once_with(
+            'n-3129', group_id='dark_factory',
+        )
+        service.graphiti.delete_entity.assert_awaited_once_with(
+            'n-3129', group_id='dark_factory', force=False,
+        )
+        # Stamped onto BOTH records — each one is evidence for the same delete.
+        assert [r.deleted_emptied_node for r in stats.repairs] == ['n-3129', 'n-3129']
+        assert stats.nodes_deleted == 1
+
+    @pytest.mark.asyncio
+    async def test_a_lost_race_is_a_clean_skip_not_a_destroyed_entity(
+        self, service, caplog,
+    ):
+        """`ActiveEdgesError` means the node GAINED an edge between our check
+        and the delete.  `force=False` is exactly what turns that lost race
+        into a refusal — and a refusal must not un-count the repair that
+        already committed."""
+        service.graphiti.get_valid_edges_for_node = AsyncMock(return_value=[])
+        service.graphiti.delete_entity = AsyncMock(
+            side_effect=ActiveEdgesError('Entity n-3129 has 1 valid active edge(s)'),
+        )
+
+        with caplog.at_level(logging.INFO):
+            stats = await service._repair_episode_referents(
+                _stats(_finding()), group_id='dark_factory',
+            )
+
+        assert stats.repairs[0].outcome == 'repaired'
+        assert stats.repairs[0].deleted_emptied_node == ''
+        assert stats.nodes_deleted == 0
+        assert stats.repaired == 1
+        assert any('n-3129' in r.getMessage() for r in caplog.records)
