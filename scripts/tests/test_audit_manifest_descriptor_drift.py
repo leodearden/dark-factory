@@ -32,7 +32,6 @@ from pathlib import Path
 
 import pytest
 import yaml
-
 from audit_manifest_descriptor_drift import (
     MECHANICAL_CHECK_KINDS,
     DescriptorDrift,
