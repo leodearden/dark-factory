@@ -51,6 +51,7 @@ each. Whether a check is satisfied on main is the δ gate's question and
 """
 from __future__ import annotations
 
+import argparse
 import json
 import sqlite3
 import subprocess
@@ -69,7 +70,16 @@ from typing import NamedTuple
 # scripts/, and this script must NEVER be invoked via `python -m` — the CLI
 # tests shell out to the script path and resolve this import solely because a
 # DIRECTLY-EXECUTED script puts its own directory at sys.path[0].
-from _task_db_scan import format_coverage_block, format_kv_line, tasks_db_path
+from _task_db_scan import (
+    AUDIT_EXIT_FINDINGS,
+    AUDIT_EXIT_NO_ROOT,
+    AUDIT_EXIT_NOTHING_AUDITED,
+    AUDIT_EXIT_OK,
+    format_coverage_block,
+    format_kv_line,
+    run_audit_cli,
+    tasks_db_path,
+)
 
 # Bind `shared` to the SAME checkout as this script via a __file__-relative
 # path, never a hardcoded absolute. An editable install puts the MAIN
@@ -589,3 +599,146 @@ def _is_dirty(audits: list[ProjectAudit]) -> bool:
     (docs/legibility/design-invariants.md, no-silent-fail-soft).
     """
     return any(a.findings or a.coverage.git_discovery_failed for a in audits)
+
+
+# The per-script NAMES survive because this script's epilog wording is its own,
+# but the VALUES have ONE home: the returns live in _task_db_scan.run_audit_cli,
+# so a local re-spelling would drift from what actually gets returned.
+# test_exit_constants_alias_the_shared_tier_3_codes is what keeps these honest.
+EXIT_OK = AUDIT_EXIT_OK                            # swept; no drift
+EXIT_DRIFT = AUDIT_EXIT_FINDINGS                   # a drifted descriptor, or a
+                                                   # failed manifest discovery
+EXIT_NO_ROOT = AUDIT_EXIT_NO_ROOT                  # no project root resolved to
+                                                   # a readable tasks.db
+EXIT_NOTHING_AUDITED = AUDIT_EXIT_NOTHING_AUDITED  # roots resolved but EVERY
+                                                   # one failed to audit
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "READ-ONLY sweep for capability-manifest delivered_check "
+            "descriptors that have drifted from the "
+            "metadata.delivered_checks entry on their producer task. "
+            "delivered_checks is copied one way, sidecar -> task, at "
+            "commit_planning and never syncs back, so a hand-repaired task "
+            "record sits beside a stale sidecar that any re-decompose would "
+            "re-stamp over the repair. Reporting only -- never mutates a task "
+            "record or a manifest. Resyncing a drifted sidecar is a separate, "
+            "individually-reviewed edit."
+        ),
+        epilog=(
+            "exit codes: 0 = swept, every compared descriptor agrees; 1 = at "
+            "least one drifted descriptor, OR the manifest corpus could not be "
+            "enumerated (an empty corpus and a clean corpus are "
+            "indistinguishable in the finding count, and only one is good "
+            "news); 2 = no project root resolved to a readable tasks.db; 3 = "
+            "roots resolved but every one failed to audit, so NOTHING was "
+            "swept (never treat 3 as a clean run). A drift row means the two "
+            "spellings DISAGREE -- it is not a claim that either one passes."
+        ),
+    )
+    parser.add_argument(
+        "--project-root", dest="project_roots", action="append",
+        help=(
+            "Project root to audit (resolves <root>/.taskmaster/tasks/tasks.db, "
+            "and its own tracked *.capability-manifest.yaml files unless "
+            "--manifest-root says otherwise). May be repeated."
+        ),
+    )
+    parser.add_argument(
+        "--manifest-root", dest="manifest_root", default=None,
+        help=(
+            "Git checkout to read manifest sidecars FROM (default: the project "
+            "root itself). Exists because .taskmaster/ is gitignored and lives "
+            "only in the primary checkout, so auditing a task WORKTREE's "
+            "sidecars means reading manifests from the worktree while reading "
+            "the task store from the primary root. INTENDED FOR SINGLE-ROOT "
+            "RUNS: this is ONE manifest tree applied to EVERY resolved root, "
+            "so combining it with several roots is warned about on stderr."
+        ),
+    )
+    parser.add_argument(
+        "--json", action="store_true",
+        help="Emit a JSON object (findings plus coverage) instead of a report.",
+    )
+    return parser
+
+
+def _audit_root(root: str, args: argparse.Namespace) -> ProjectAudit:
+    """Audit ONE project root under the (possibly overridden) manifest root.
+
+    Raises ``sqlite3.Error`` for an unreadable task store, which
+    :func:`_task_db_scan.sweep_project_roots` turns into a warn-and-skip; every
+    other exception propagates. Returns exactly one audit, per that function's
+    one-audit-per-root contract.
+    """
+    return audit_project(root, args.manifest_root)
+
+
+def _render(audits: list[ProjectAudit], args: argparse.Namespace) -> str:
+    return format_json(audits) if args.json else format_report(audits)
+
+
+def _warn_manifest_root_across_roots(
+    roots: list[str], args: argparse.Namespace
+) -> None:
+    """Warn once, up front, that ONE --manifest-root is applied to MANY roots.
+
+    Runs on the RESOLVED root list, before the empty-roots exit-2 return — the
+    position run_audit_cli's on_roots hook occupies. Warned, not rejected: one
+    manifest tree over several same-corpus task stores is a legitimate use, and
+    this script reports rather than gatekeeps.
+    """
+    if len(roots) > 1 and args.manifest_root:
+        print(
+            f"warning: --manifest-root {args.manifest_root!r} is applied to ALL "
+            f"{len(roots)} resolved project roots, so every root is audited "
+            "against the SAME manifest tree rather than its own. Any root whose "
+            "sidecars differ will be compared against another checkout's "
+            "spellings. Prefer one --manifest-root run per root.",
+            file=sys.stderr,
+        )
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI entry point.
+
+    Exit codes: 0 = swept, every compared descriptor agrees; 1 = a drifted
+    descriptor OR a manifest corpus that could not be enumerated; 2 = no
+    project root resolved to a readable tasks.db; 3 = roots resolved but EVERY
+    one failed to audit, so NOTHING was swept.
+
+    3 exists because 0 would otherwise be returned for two opposite outcomes —
+    "swept everything, found nothing" and "swept nothing at all" — and a
+    CI/cron consumer reading only the exit code would take a total failure for
+    a clean run. That is exactly the silent fail-soft this module refuses to do
+    (see the module docstring).
+
+    1 covers the failed-discovery case for the SAME reason, one level down: a
+    root whose `git ls-files` failed produces zero findings, and zero findings
+    from an unenumerable corpus is an UNKNOWN result, not a clean one.
+
+    A single unreadable project (a corrupt/locked tasks.db) does NOT abort the
+    sweep: it is logged to stderr and skipped so every other project is still
+    audited, and a trailing warning states that the results are incomplete.
+
+    The roots loop, the warn-and-continue skip and the exit-code ladder are
+    :func:`_task_db_scan.run_audit_cli` (Tier 3). What stays here is what
+    genuinely differs: this script's parser and epilog, its ``--manifest-root``
+    handling (:func:`_audit_root` and :func:`_warn_manifest_root_across_roots`),
+    its object-shaped JSON, its report and its :func:`_is_dirty` predicate.
+    Nothing in this file returns a bare integer.
+    """
+    return run_audit_cli(
+        argv,
+        parser=_build_parser(),
+        audit_fn=_audit_root,
+        render=_render,
+        is_dirty=_is_dirty,
+        on_roots=_warn_manifest_root_across_roots,
+    )
+
+
+if __name__ == "__main__":
+    sys.exit(main())
