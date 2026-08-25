@@ -15884,9 +15884,14 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     #     already-merged task.  Escalation.filing_claimant_run_id
                     #     is the field that would make a real
                     #     filed-by-this-incarnation predicate possible, but it
-                    #     is stamped only in tests today, never on a
-                    #     production filing path; stamping it is the
-                    #     principled follow-up.
+                    #     is now stamped on every production filing path
+                    #     (task 3550: TaskWorkflow, Harness, and the
+                    #     escalate_blocker/escalate_info chokepoint).  This
+                    #     sweep's dismissal set is nonetheless STILL
+                    #     deliberately unchanged — narrowing it to a real
+                    #     filed-by-this-incarnation predicate is a behaviour
+                    #     change owned by task 3541, not by the task that
+                    #     merely populated the field.
                     # (iii) Do NOT "fix" the sibling sweep sites by symmetry:
                     #     each of them has an L1 open by construction, so
                     #     dismissing a stray L0 there is deliberate

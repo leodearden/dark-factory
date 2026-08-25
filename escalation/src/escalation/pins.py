@@ -330,10 +330,18 @@ def classify_pins(
     judged against THAT incarnation, never against "some workflow for this
     task is alive": a newer live incarnation never keeps a prior incarnation's
     unconsumed L0 alive.  ``None`` means "filing identity unknown" — legacy
-    records, and every producer not yet stamping it — which fails safe to
+    records, and producers that do not stamp it — which fails safe to
     PINNING, because the classifier may only convert an L0 when it can PROVE
     the filing incarnation is dead.  The identity is stored and compared
-    verbatim, never parsed.
+    verbatim, never parsed.  As of task 3550 the stamping producers are
+    ``orchestrator.workflow.TaskWorkflow``, ``orchestrator.harness.Harness``,
+    and the ``escalate_blocker``/``escalate_info`` chokepoint in
+    ``escalation.server`` (via its injected ``task_claimant_lookup``).  Still
+    NOT stamping: ``escalation.submit``'s detached CLI (a systemd OnFailure
+    entry point with no orchestrator run_id and no session, so it structurally
+    cannot), ``orchestrator.deterministic_runner``, ``orchestrator.merge_queue``
+    and the other level-1/2-only filers — where link 3 makes the identity moot
+    anyway.
 
     See the precedence chain above :func:`_classify_record` for the rules, and
     :class:`PinReport` for the buckets and the two derived predicates.

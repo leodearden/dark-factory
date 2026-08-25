@@ -351,9 +351,9 @@ class TestDeadL0FilingIncarnationRule:
         """The classifier may only convert an L0 when it can PROVE the filing
         incarnation is dead. It cannot here, so it pins.
 
-        This is the branch that governs TODAY: until a producer stamps
-        filing_claimant_run_id, every real record carries None — so the
-        widening cannot by itself change any disposition."""
+        Governs every record whose filing identity is unknown: legacy rows
+        written before task 3550, and producers that still do not stamp
+        (submit.py's detached CLI and the other level-1/2-only filers)."""
         bucket = _bucket_of(
             _rec(level=0, severity='blocking', filing=filing),
             live_claimant=True,
