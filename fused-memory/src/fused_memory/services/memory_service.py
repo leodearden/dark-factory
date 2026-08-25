@@ -2197,6 +2197,47 @@ REFERENT_REPAIR_OUTCOMES: tuple[str, ...] = (
 _REFERENT_REPAIR_STREAK_THRESHOLD: int = 10
 
 
+def _episode_uuid_of(result: Any) -> str:
+    """The uuid of the episode *result* describes, or ``''`` if unreadable.
+
+    WHY THE EXTRACTION IS DEFENSIVE rather than a plain ``result.episode.uuid``.
+    Its one caller is the EIGHTH sub-pass of ``_reconcile_episode_identity``,
+    which runs AFTER the episode write is already durable —
+    :meth:`MemoryService._reconcile_episode_identity`'s ``_run_pass`` guard
+    exists precisely so a sub-pass failure never fails that committed write.
+    The other seven sub-passes already treat ``result`` as duck-typed. Raising
+    an ``AttributeError`` while merely READING an identifier would forfeit the
+    repair for a reason wholly unrelated to repairing, which is an absurd way
+    to lose it.
+
+    WHAT ``''`` MEANS DOWNSTREAM. Not "no exclusion is needed" but "we could not
+    establish which episode this is, so exclude nothing and refuse more
+    deletions" — the fail-closed direction, consistent with
+    :attr:`ReferentFinding.resolvable` defaulting to ``False``. It flows into
+    :meth:`GraphitiBackend.count_foreign_relationships`, whose ``episode_uuid``
+    argument narrows a delete guard; dropping the exclusion can only ever make
+    that guard STRICTER.
+
+    A non-``str`` uuid is rejected along with an absent one. That is not
+    hypothetical tidiness: a ``MagicMock`` result — the shape most of this
+    module's tests hand it — auto-creates ``.episode.uuid`` as a child mock,
+    and passing that into a Cypher parameter would be a silently wrong query
+    rather than a clean refusal.
+
+    Args:
+        result: Whatever ``graphiti.add_episode`` returned, however malformed.
+
+    Returns:
+        A non-empty ``str`` uuid, or ``''``.
+    """
+    try:
+        uuid = getattr(getattr(result, 'episode', None), 'uuid', None)
+    except Exception:
+        # A property that raises is still a shape we must survive; see above.
+        return ''
+    return uuid if isinstance(uuid, str) and uuid else ''
+
+
 @dataclass(frozen=True, kw_only=True)
 class ReferentRepair:
     """What eta DID about one :class:`ReferentFinding` — the audit record.
@@ -3893,7 +3934,7 @@ class MemoryService:
         return rows[0]['uuid'] if len(rows) == 1 else None
 
     async def _repair_episode_referents(
-        self, stats: ReferentStats, *, group_id: str
+        self, stats: ReferentStats, *, group_id: str, episode_uuid: str = ''
     ) -> ReferentRepairStats:
         """REPAIR the edge endpoints leaf zeta found on the wrong node.
 
@@ -3951,9 +3992,30 @@ class MemoryService:
         endpoint itself: a second read would be a second answer that can
         disagree with the one the write actually used.
 
+        WHY THE PASS NEEDS THE EPISODE'S IDENTITY. The emptied-node cleanup's
+        guard claims to distinguish "the node was MINTED by this very episode
+        out of the mis-resolved reference alone" from "the project GENUINELY
+        OWNS the task". Until it was given ``episode_uuid`` it had no datum
+        capable of making that distinction — it inferred mintedness from
+        valid-edge emptiness, which is a different and much weaker proposition
+        (see :meth:`_cleanup_emptied_nodes`, condition 4). The identifier is
+        threaded straight down to that guard and used nowhere else.
+
+        ``episode_uuid`` is KEYWORD-ONLY and DEFAULTED so the parameter is
+        purely additive: existing direct callers are unaffected, and anything
+        that forgets to pass it degrades to the STRICT, more-conservative
+        predicate rather than a looser one. ``''`` does not mean "no exclusion
+        is needed"; it means "we could not establish which episode this is, so
+        exclude nothing and refuse more deletions" — the fail-closed direction,
+        consistent with :attr:`ReferentFinding.resolvable` defaulting to
+        ``False``. See :func:`_episode_uuid_of` for how the chain extracts it.
+
         Args:
             stats: zeta's ``ReferentStats`` for this episode, consumed verbatim.
             group_id: The project graph, which is also the project_id.
+            episode_uuid: UUID of the episode whose write is in flight, used
+                ONLY by the emptied-node cleanup's fourth condition. ``''``
+                (the default) is the fail-closed value.
 
         Returns:
             A ``ReferentRepairStats`` carrying one record per finding —
@@ -4012,7 +4074,8 @@ class MemoryService:
             )
 
         await self._cleanup_emptied_nodes(
-            repair_stats, endpoint_names, group_id=group_id,
+            repair_stats, endpoint_names,
+            group_id=group_id, episode_uuid=episode_uuid,
         )
 
         streak = self._record_referent_repair_pass(
@@ -4213,6 +4276,7 @@ class MemoryService:
         endpoint_names: Mapping[str, str],
         *,
         group_id: str,
+        episode_uuid: str = '',
     ) -> None:
         """Delete the nodes THIS PASS emptied — under three conditions, all required.
 
@@ -4736,7 +4800,10 @@ class MemoryService:
         # must never act on evidence its detector failed to produce.
         stats.repair_stats = await _run_pass(
             '_repair_episode_referents',
-            self._repair_episode_referents(stats.referent_stats, group_id=group_id),
+            self._repair_episode_referents(
+                stats.referent_stats, group_id=group_id,
+                episode_uuid=_episode_uuid_of(result),
+            ),
             ReferentRepairStats(),
         )
         return stats
