@@ -4057,6 +4057,29 @@ class MemoryService:
                     uuid,
                 )
                 continue
+            except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                raise
+            except Exception:
+                # PER-CANDIDATE, and guarded SEPARATELY from the reassignments
+                # above rather than sharing the outer `_run_pass`. `_run_pass`
+                # substitutes an EMPTY ReferentRepairStats on a raise, which
+                # would discard the structured record of every reassignment
+                # that had ALREADY COMMITTED to the graph — reporting zero
+                # repairs for an episode that performed several. That is the
+                # exact silent-degradation shape INV-2 and the
+                # no-silent-fail-soft invariant rule out. Cleanup is
+                # opportunistic hygiene; the reassignment is the correctness
+                # fix, and their failure domains must not be shared.
+                #
+                # Per-candidate so one node whose emptiness cannot be read does
+                # not strand every other phantom node behind it.
+                logger.warning(
+                    'Referent repair: emptied-node cleanup failed for node %s; '
+                    'the endpoint move(s) that emptied it already committed '
+                    'and stand, but the node may remain as a phantom entity',
+                    uuid, exc_info=True,
+                )
+                continue
             logger.info(
                 'Referent repair: deleted emptied node %s (%r) — this pass '
                 'moved its last edge off it',
