@@ -267,7 +267,7 @@ Every auto-closed L2 **MUST** be enumerated in the rotation digest — see [Dige
    (Member L1s stay pending at L1 after promotion; without this filter every cycle re-scans
     and re-promotes the same items, inflating the counter and re-spending RCA budget)
 4. Apply shallow RCA across work_batch — detect causal clusters (see Shallow-by-default RCA)
-5. For each escalation in work_batch: autonomous dispatch (scope_violation / dependency / cleanup)
+5. For each escalation in work_batch: autonomous dispatch (path-guard scope_violation closes / dependency / cleanup)
    OR promote to L2 / legacy-leave-pending (judgement classes — see routing table below)
 6. Increment escalations_handled by len(work_batch) — already-promoted items filtered in step 3
    do NOT count toward the rotation limit
@@ -377,6 +377,8 @@ These categories require only admin-level MCP operations. Dispatch them directly
 
 Agent discovered it needs to touch files beyond its assigned scope.
 
+**This category is split, and only one half is autonomous.** Path-guard synthetic-anchor records (no real task) are closed autonomously by the branch immediately below. Every **real-task** `scope_violation` is a **judgement-class** item that you `promote_to_l2` — no mechanism exists for you to deliver a scope widening, so resolving one autonomously would re-pend it into an escalate/resume loop. The steps further below trace that; do not treat this heading's "handle and resolve" framing as licence to resume one.
+
 ##### Path-guard synthetic-anchor audit records (no real task — close, do not resume)
 
 **Handle these even if `triaged_at` is fresh** — they are carved out of the drain-step-5 triage-freshness skip (see [Triage-ack freshness contract](#triage-ack-freshness-contract)). A stamp cannot clear `_watcher_has_actionable_l1`; only the `close_only` below can.
@@ -428,30 +430,37 @@ task = mcp__fused-memory__get_task(id=<task_id>, project_root=<project_root>)
 
 **If the task DOES exist**, fall through to the steps below unchanged. This branch must never close a record whose task exists — that would silently drop real scope work.
 
-1. Resolve with `action='resume'`, carrying the grant as `granted_files`:
-   ```
-   mcp__escalation__resolve_issue(
-     escalation_id="...",
-     resolution="Scope expanded to include [<files>]; resuming.",
-     action='resume',
-     granted_files=["<project-relative file path>", ...],
-     resolved_by="escalation-watcher-auto",
-     resolution_class="actionable"
-   )
-   ```
-   `granted_files` takes **file-level, project-relative paths** — not module names, not directories. That distinction is load-bearing: the old form of this recipe was module-shaped, and a module name passed here is not a file the orchestrator can add to the plan.
+1. **Do not `resume`.** A `resume` here re-pends the task into a non-terminating escalate/resume loop — the reasoning is traced below, and it holds for *every* real-task `scope_violation` reaching this queue, not just some of them.
 
-   **Pass `granted_files` — but do NOT assume it takes effect on the next dispatch.** It is persisted durably on the escalation record either way. The fold into `plan.files` / `metadata.files` / file-locks happens at exactly one place: `orchestrator/src/orchestrator/workflow.py::TaskWorkflow._collect_granted_files` has a single call site, inside `workflow.py::TaskWorkflow._drive`'s live verify/review loop, reached only after `_wait_for_resolution()` returns **for a workflow process that is still alive** — i.e. the **L0, in-workflow** resume path the per-task steward uses. That is why the identical wording is correct in the steward's own role text (`orchestrator/src/orchestrator/agents/roles.py::STEWARD`) and is **not** correct here.
+   **The fold into `plan.files` / `metadata.files` / file-locks happens at exactly one place**: `orchestrator/src/orchestrator/workflow.py::TaskWorkflow._collect_granted_files` has a single call site, inside `workflow.py::TaskWorkflow._drive`'s live verify/review loop, reached only after `_wait_for_resolution()` returns **for a workflow process that is still alive** — i.e. the **L0, in-workflow** resume path the per-task steward uses. That is why the `granted_files` wording is correct in the steward's own role text (`orchestrator/src/orchestrator/agents/roles.py::STEWARD`) and is **not** correct here.
 
    **You are the L1 watcher, and an L1 `scope_violation` is normally on a `blocked` task whose workflow slot is gone.** Its `_escalation_events` entry has been popped, so resolution takes the orphan branch (`escalation.task_id not in self._escalation_events`, in `orchestrator/src/orchestrator/harness.py::Harness._on_escalation_resolved`) into `harness.py::Harness._cascade_unblock_member`, which **only flips `blocked` → `pending`**. It never reads `granted_files`, never calls `_set_task_scope`, and never touches `plan.files` / `metadata.files` / locks — read the method; the gap is visible in its body, not inferred. The repo agrees in writing: `plans/task-escalation-state-graph-prd.md` **D8** lists “`granted_files` scope grants deliver on the re-pend path” among the semantics it proposes to *build*, which is the authority for the blocked/re-pend case here. (`docs/task-escalation-state-spec.md` **E9** says “`granted_files` scope grants deliver to nobody”, but that sentence is scoped to the adjacent **strand** case, where `_cascade_unblock_member`'s `status == 'blocked'` requirement means no re-pend happens at all — do not cite E9 for a `blocked` record.)
 
-   **Consequence you must plan around.** A bare `resume` + `granted_files` on a blocked task re-pends it with its ORIGINAL `plan.files`; the re-dispatched agent hits the same scope wall and escalates again — a non-terminating escalate/resume loop. So:
-   - Still pass `granted_files` (it is durable and unions in should this task later reach a live L0 resume) — but treat it as a record, not as a mechanism.
-   - If the widened scope must be effective for the next dispatch, `resume` alone does not deliver it — and **nothing else does either**: `_set_task_scope` (the only writer of both `plan.files` and `metadata.files`) is reachable only from a live workflow, and an `update_task(metadata={"files": ...})` widens locks but not `plan.files`, then gets narrowed back to `plan.files` by `workflow.py::TaskWorkflow._reconcile_scope_locks` on the next dispatch. So `promote_to_l2` rather than resuming into the loop above — not because the human has a persisting path you lack, but because the real fix is a **re-plan** (the architect is the sanctioned widener) and that is a judgement call above your authority. Say so in the promotion rationale; do not tell the human to "widen the scope" as if a mechanism existed.
+   So a bare `resume` re-pends the task with its ORIGINAL `plan.files`; the re-dispatched agent hits the same scope wall and escalates again. **And nothing else delivers the widening either**: `_set_task_scope` (the only writer of both `plan.files` and `metadata.files`) is reachable only from a live workflow, and an `update_task(metadata={"files": ...})` does not reliably reach lock derivation — `scheduler.py::Scheduler._get_modules` is **cache-first** (it returns out of `self._module_cache` before ever reading `metadata.files`), and `scheduler.py::Scheduler._phase_stale_sweep` evicts that cache only for terminal-status or absent-from-`tasks_by_id` tasks, which a `blocked` task is neither. Independently, such a write is narrowed back to `plan.files` by `workflow.py::TaskWorkflow._reconcile_scope_locks` on the next dispatch, and never widens `plan.files` (what the implementer actually works to) at all.
 
-   A lock conflict is handled orchestrator-side: the scope-widening choke point returns False and the task requeues rather than resuming under another task's file lock. You do **not** need to pre-check locks.
+   A `scope_violation` exists *because* an agent could not touch a file it needed, so the widening always has to be effective — there is no variant of this category where resuming is the right call.
 
-2. Add to digest: `DISPATCHED: scope_violation — <task_id> — scope expanded to [granted files]`
+2. **Promote to L2 with a re-plan rationale.** This is the terminal disposition. The real fix is a **re-plan** — the architect is the sanctioned widener — and that is a judgement call above your authority. Carry the requested files in `evidence`: `granted_files` is a parameter of `resolve_issue` only, and is consumed **solely** on the live-L0 resume path (`escalation/src/escalation/server.py::resolve_issue` documents that it is not even forwarded to `park`), so there is no way to record it here except as text. Do **not** tell the human to "widen the scope" as if a mechanism existed.
+   ```python
+   mcp__escalation__promote_to_l2(
+     task_id=<task_id>,
+     agent_role="escalation-watcher-auto",
+     member_ids=[<escalation_id>],
+     root_cause="scope-violation-needs-replan:" + <task_id>,
+     evidence=<escalation detail> + "\n\nFiles the agent reported needing: [<project-relative file paths>]. "
+              "Not resumed: no mechanism folds a scope grant into a blocked task with no live workflow "
+              "(_collect_granted_files is live-L0-only; _cascade_unblock_member only flips blocked->pending), "
+              "so a resume would re-pend against the original plan.files and re-escalate.",
+     options=["A: re-plan the task with the widened file set (architect widens at plan time)", "B: split the out-of-scope work into a separate task", "C: narrow the task so the extra files are not needed", "D: something else"],
+     summary="scope_violation needs a re-plan — " + <task_id> + " — agent blocked on files outside plan.files",
+     category="scope_violation",
+   )
+   ```
+   Promotion does **not** resolve the member — the L1 stays pending until the human resolves the L2, and that resolution cascades down. So do not also call `resolve_issue` on it.
+
+   File-level, project-relative paths only — not module names, not directories. That distinction is load-bearing: the old form of this recipe was module-shaped, and a module name is not a file the orchestrator can add to a plan.
+
+3. Add to digest: `PROMOTED (L2 <result['id']>): scope_violation — <task_id> — widening needs a re-plan; requested files [<files>]`
 
 #### `dependency_discovered`
 
@@ -798,7 +807,7 @@ Feature-detect `mcp__escalation__promote_to_l2` **once at startup** (step 2 in t
 | Condition | Behaviour |
 |-----------|-----------|
 | Tool **present** | Use L2 promotion paths for all judgement-class items (steps 4 and 5 of the routing table). Emit PROMOTED lines in the digest. |
-| Tool **absent** | Fall back to **legacy mode**: leave judgement-class items pending at L1 and emit PENDING lines in the digest (the pre-tiering behaviour). Autonomous dispatch is unchanged in both modes. |
+| Tool **absent** | Fall back to **legacy mode**: leave judgement-class items pending at L1 and emit PENDING lines in the digest (the pre-tiering behaviour). Autonomous dispatch is unchanged in both modes. Note this now covers **real-task `scope_violation`** as well: leave it pending rather than resuming it, since a resume delivers nothing and re-escalates. |
 
 This makes the skill safe to land **before** the orchestrators are restarted onto the new escalation server — the skill degrades gracefully until `promote_to_l2` becomes available at runtime.
 
@@ -833,12 +842,12 @@ Exit reason: <"escalation limit reached" | "time limit reached">
 Mode: <"L2-promotion (promote_to_l2 available)" | "LEGACY (promote_to_l2 not available)">
 
 ### Dispatched (autonomous)
-- DISPATCHED: scope_violation — task-42 — scope expanded to [orchestrator/src/orchestrator/harness.py] via granted_files [actionable]
 - DISPATCHED: cleanup_needed — task-99 — dead code in scheduler.py flagged for follow-up [actionable]
 - DISPATCHED: dependency_discovered — task-77 → depends on task-55 [actionable]
 
 ### Promoted to L2 (L2-promotion mode only)
 - PROMOTED (L2 esc-42-7): task_failure — task-12 — verify exhausted after 3 attempts
+- PROMOTED (L2 esc-42-11): scope_violation — task-42 — widening needs a re-plan; requested files [orchestrator/src/orchestrator/harness.py]
     Proposal: fix import in tests/test_foo.py line 42 [risk: low]
 - PROMOTED cluster (L2 esc-42-8): bad-merge-to-main-breaks-scheduler — 3 members: [esc-42-1, esc-42-3, esc-42-5]
 - PROMOTED (L2 esc-42-9): design_concern — task-88 — architectural question about X
