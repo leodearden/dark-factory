@@ -847,8 +847,8 @@ Mode: <"L2-promotion (promote_to_l2 available)" | "LEGACY (promote_to_l2 not ava
 
 ### Promoted to L2 (L2-promotion mode only)
 - PROMOTED (L2 esc-42-7): task_failure — task-12 — verify exhausted after 3 attempts
-- PROMOTED (L2 esc-42-11): scope_violation — task-42 — widening needs a re-plan; requested files [orchestrator/src/orchestrator/harness.py]
     Proposal: fix import in tests/test_foo.py line 42 [risk: low]
+- PROMOTED (L2 esc-42-11): scope_violation — task-42 — widening needs a re-plan; requested files [orchestrator/src/orchestrator/harness.py]
 - PROMOTED cluster (L2 esc-42-8): bad-merge-to-main-breaks-scheduler — 3 members: [esc-42-1, esc-42-3, esc-42-5]
 - PROMOTED (L2 esc-42-9): design_concern — task-88 — architectural question about X
 - PROMOTED (L2 esc-42-10): dependency_discovered — task-33 — no matching task for: "GraphitiV2 migration complete"
