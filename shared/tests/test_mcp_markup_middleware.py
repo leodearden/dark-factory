@@ -1612,12 +1612,28 @@ class TestB5UnrepairableIsNeverGuessed:
 
     @BOTH_POLICIES
     async def test_the_escalation_locates_the_leak(self, policy):
+        """The pattern is the leak's OWN tag as of task 4696, not the one after it.
+
+        This specimen's ``how`` mis-closes on ``\\x3c/how>`` and only LATER
+        carries an ``\\x3c/invoke>``. While the boundary scan was param-blind it
+        reported the invoke closer — i.e. it blamed whatever happened to follow
+        the leak, which is verbatim the diagnosis failure PRD section 2.2 was
+        written about ("a mis-closed ``description`` could not report its own
+        tag and the write-time guard blamed whatever happened to follow it").
+        Now the earliest-by-text-position rule reaches the self-name closer, so
+        the operator record names where the leak actually STARTS.
+        """
         h, _, _ = await self._refuse(policy)
 
         record = h.escalations[0]
         assert record['tool'] == 'add_reuse_item'
         assert record['field'] == 'how'
-        assert record['matched_pattern'] == INVOKE_CLOSER
+        assert record['matched_pattern'] == _closer('how')
+        assert INVOKE_CLOSER in self._value(), (
+            'the invoke closer must still be PRESENT but LATER — otherwise this '
+            'row stops testing that the earliest tag wins'
+        )
+        assert self._value().index(_closer('how')) < self._value().index(INVOKE_CLOSER)
 
     @BOTH_POLICIES
     async def test_the_refusal_names_the_escalation_and_offers_no_repair(self, policy):
@@ -2251,7 +2267,13 @@ class TestINV2StructuredFacts:
         assert h.facts[0]['pattern'] != h.facts[0]['misclose']
 
     async def test_the_unrepairable_fact_still_names_the_matched_pattern(self):
-        """A refusal that could not say WHAT it saw would be unactionable."""
+        """A refusal that could not say WHAT it saw would be unactionable.
+
+        Names ``\\x3c/how>`` rather than ``\\x3c/invoke>`` as of task 4696 — the
+        leak's own tag, not the literal that happens to follow it. See
+        :meth:`TestB5UnrepairableIsNeverGuessed.test_the_escalation_locates_the_leak`
+        for why that is the point rather than a changed expectation.
+        """
         h = build_harness(RepairPolicy.REJECT_WITH_REPAIR)
 
         with pytest.raises(ToolError):
@@ -2264,7 +2286,7 @@ class TestINV2StructuredFacts:
                 },
             )
 
-        assert h.facts[0]['pattern'] == INVOKE_CLOSER
+        assert h.facts[0]['pattern'] == _closer('how')
 
     # -- identity: read from the call's own arguments -----------------------
 
