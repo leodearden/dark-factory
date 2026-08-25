@@ -95,7 +95,7 @@ from typing import Any, NamedTuple
 
 from fastmcp import FastMCP
 from shared.mcp_markup_middleware import MarkupGuardMiddleware, RepairPolicy
-from shared.toolcall_markup import detect, repair
+from shared.toolcall_markup import detect_for, repair
 
 from orchestrator.artifacts import PLAN_SCHEMA_VERSION, TaskArtifacts
 from orchestrator.mcp import markup_sink
@@ -487,7 +487,14 @@ def _repair_one_field(
     value = holder.get(record.field)
     if not isinstance(value, str):
         return None
-    pattern = detect(value)
+    # PARAMETER-AWARE, and free here (task 4696). Unlike the middleware
+    # boundary — which holds only the argument name and will not pay an awaited
+    # get_tool to learn more — this site already has the whole schema in hand
+    # off the DECLARED table, so it scans the shared enumeration widened by
+    # this field's own closer AND every sibling parameter's. The diagnostic
+    # below therefore names the tag actually seen instead of whatever fixed
+    # literal happens to trail the leak.
+    pattern = detect_for(value, record.field, record.schema_params)
     if pattern is None:
         # The cheap prefilter, and the overwhelmingly common path: no literal
         # anywhere in the value, so repair() is never called.
@@ -642,16 +649,33 @@ def _walk_repairable(plan: dict) -> Iterator[tuple[dict[str, Any], int | None, _
 
 
 def _carries_markup(plan: dict) -> bool:
-    """True when ANY declared field of *plan* trips :func:`detect`.
+    """True when ANY declared field of *plan* trips :func:`detect_for`.
 
     The cheap prefilter over the whole document, run before anything is copied.
-    ``detect`` is a substring scan; a deep copy of a plan is tens of KB of
-    analysis prose plus every step description, and on the overwhelmingly common
-    clean path that copy would be pure waste.
+    Each check is ONE compiled pass over the value; a deep copy of a plan is
+    tens of KB of analysis prose plus every step description, and on the
+    overwhelmingly common clean path that copy would be pure waste.
+
+    PARAMETER-AWARE AS OF TASK 4696, and this gate is why the task exists. It
+    asked the param-free ``detect``, whose fixed literal set spells none of
+    plan-tools' own parameter names — so a plan whose only damage was a field
+    mis-closed with its OWN tag looked CLEAN, the pass never ran, and the
+    corruption survived every read. Measured on 2026-08-25: 296 ``rationale``
+    and 129 ``how`` specimens sitting unrepaired on disk for that reason.
+
+    The widening costs this site NOTHING: the walk already yields the
+    ``_PlanField`` record, so ``record.field`` and ``record.schema_params``
+    come straight off the declared table — no lookup, no second enumeration
+    (INV-5). It is deliberately WIDER than the middleware's gate, which holds
+    only the argument's own name; the asymmetry is a cost decision, recorded at
+    ``MarkupGuardMiddleware._first_markup_argument``, not a divergence.
     """
     for holder, _index, record in _walk_repairable(plan):
         value = holder.get(record.field)
-        if isinstance(value, str) and detect(value) is not None:
+        if (
+            isinstance(value, str)
+            and detect_for(value, record.field, record.schema_params) is not None
+        ):
             return True
     return False
 
@@ -672,10 +696,13 @@ def _repair_plan_fields(plan: dict) -> tuple[dict, list[dict[str, Any]]]:
     which :func:`_read_plan_repaired`'s callers do, since ``read_plan`` parses
     the file anew on every call.
 
-    The prefilter runs ``detect`` a second time on the values that DO trip it
-    (once here, once inside :func:`_repair_one_field`). That is deliberate: the
-    duplicate pass is paid only on the corrupted path, where the walk is about
-    to call ``repair()`` anyway, and it buys skipping the copy on the clean one.
+    The prefilter runs ``detect_for`` a second time on the values that DO trip
+    it (once here, once inside :func:`_repair_one_field`). That is deliberate:
+    the duplicate pass is paid only on the corrupted path, where the walk is
+    about to call ``repair()`` anyway, and it buys skipping the copy on the
+    clean one. Both passes ask the SAME parameter-aware predicate with the SAME
+    record, so the prefilter can never wave through a value the walk would then
+    decline to look at, nor the reverse.
     """
     if not _carries_markup(plan):
         return plan, []
