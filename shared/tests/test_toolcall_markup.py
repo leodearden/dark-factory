@@ -23,6 +23,7 @@ appears verbatim in the file text. Leave it escaped.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -37,6 +38,7 @@ from shared.toolcall_markup import (
     Repair,
     closer_for,
     detect,
+    detect_for,
     markup_override_requested,
     repair,
     strip_markup_override,
@@ -139,6 +141,164 @@ class TestDetect:
     )
     def test_returns_none_without_raising(self, value):
         assert detect(value) is None
+
+
+
+class TestParameterAwareDetection:
+    """``detect_for`` — the FOURTH named predicate, and the one the GATES need.
+
+    Task **4696**. :func:`detect` scans a FIXED six-literal union that echoes
+    no INVOKED TOOL'S OWN parameter names, while :func:`repair` has always
+    qualified a candidate on ``X == param`` / ``X in schema_params``. That
+    asymmetry — a schema-aware repairer behind a schema-blind detector — WAS
+    the silent write path: a value mis-closed with its own parameter's tag
+    matched no literal, every gate that asked ``detect`` first returned
+    ``None``, and the corrupt value went straight to disk unrepaired even
+    though the repairer standing behind the gate could already fix it.
+
+    Measured over ``.worktrees/.task-meta/*/plan.json`` (2026-08-25): 444
+    corrupted entries, of which **212 (48%) are invisible to the fixed literal
+    set** — and **212 of 212** of those are caught by the SELF-NAME closer
+    alone. That measurement is why the new predicate takes ``param``
+    positionally and ``schema_params`` optionally: the self-name half is what
+    the dominant population needs, and the schema half is free at the two
+    call sites that already hold a schema.
+
+    ``detect`` is deliberately NOT changed and NOT given a keyword argument:
+    three call sites legitimately have no parameter in hand (``repair``'s own
+    diagnostic, the sweep's bare list items, prose scans), and an optional
+    keyword would make each site's blindness ungreppable. The predicates split
+    by NAME so a reader can see which gates are parameter-aware.
+    """
+
+    #: The dominant real dialect, as it lands on disk today: plan-tools writes
+    #: ``rationale``, and the model closes it with its own name-echoing tag.
+    _SILENT_RATIONALE = (
+        'Both mechanisms partition rather than race.' + closer_for('rationale') + '\n'
+    )
+    #: The second-commonest, 129 specimens: ``add_reuse_item``'s ``how``.
+    _SILENT_HOW = 'Reuse the declared table directly.' + closer_for('how')
+
+    def test_the_silent_write_specimen_is_invisible_to_detect(self):
+        """The defect itself, pinned before the fix so it cannot be re-argued.
+
+        ``rationale`` is a parameter of ``add_design_decision`` but not a
+        member of ``PARAMETER_CLOSER_NAMES``, so its closer is in no literal
+        the blanket predicate scans.
+        """
+        assert closer_for('rationale') not in ENVELOPE_LITERALS
+        assert detect(self._SILENT_RATIONALE) is None
+
+    def test_detect_for_sees_the_self_name_closer(self):
+        assert detect_for(self._SILENT_RATIONALE, 'rationale') == closer_for('rationale')
+
+    def test_the_how_dialect_is_the_same_shape(self):
+        assert detect(self._SILENT_HOW) is None
+        assert detect_for(self._SILENT_HOW, 'how') == closer_for('how')
+
+    def test_a_foreign_param_does_not_widen_onto_the_self_name_closer(self):
+        """Only the INVOKED parameter's own closer is added, not every name."""
+        assert detect_for(self._SILENT_RATIONALE, 'title') is None
+
+    @pytest.mark.parametrize('literal', ENVELOPE_LITERALS)
+    def test_is_a_strict_superset_of_detect(self, literal):
+        """Every fixed literal detect() reports is still reported, unchanged.
+
+        Widening may only ADD needles. A parameter name unrelated to any
+        literal must not shadow, reorder or suppress the existing set.
+        """
+        value = 'lead ' + literal + ' tail'
+        assert detect(value) == literal
+        assert detect_for(value, 'unrelated_param') == detect(value)
+        assert detect_for(value, 'unrelated_param', ('other', 'names')) == detect(value)
+
+    def test_earliest_by_text_position_when_the_self_name_closer_LEADS(self):
+        """The added needle wins when it comes first, exactly as detect()'s rule says."""
+        value = 'a ' + closer_for('rationale') + ' b ' + INVOKE_CLOSER
+        assert detect(value) == INVOKE_CLOSER
+        assert detect_for(value, 'rationale') == closer_for('rationale')
+
+    def test_earliest_by_text_position_when_the_fixed_literal_LEADS(self):
+        """...and loses when it comes second. Position, never tuple order."""
+        value = 'a ' + INVOKE_CLOSER + ' b ' + closer_for('rationale')
+        assert detect_for(value, 'rationale') == INVOKE_CLOSER
+
+    def test_a_param_whose_closer_is_ALREADY_a_literal_is_unchanged(self):
+        """``content`` is both a plan-tools field and PREFILTER_NEEDLES[3]."""
+        value = 'body' + closer_for('content')
+        assert detect_for(value, 'content') == detect(value) == closer_for('content')
+
+    def test_schema_params_widens_the_set(self):
+        """A CROSS-FIELD misclose: the closer names a SIBLING parameter."""
+        value = 'Chose X.' + closer_for('decision')
+        assert detect(value) is None
+        assert detect_for(value, 'rationale') is None
+        assert detect_for(value, 'rationale', ()) is None
+        assert detect_for(
+            value, 'rationale', ('task_id', 'decision', 'rationale')
+        ) == closer_for('decision')
+
+    @pytest.mark.parametrize(
+        'value',
+        [
+            None,
+            '',
+            0,
+            17,
+            {'content': 'x'},
+            ['\x3c/invoke>'],
+            b'\x3c/invoke>',
+            'ordinary prose with no envelope markup at all',
+        ],
+    )
+    def test_totality_matches_detect_for_non_text(self, value):
+        assert detect_for(value, 'rationale') is None
+        assert detect_for(value, 'rationale', ('decision',)) is None
+
+    @pytest.mark.parametrize('schema_params', [None, 0, 17, object(), b'decision'])
+    def test_a_non_iterable_schema_params_degrades_to_the_param_alone(self, schema_params):
+        assert detect_for(self._SILENT_RATIONALE, 'rationale', schema_params) == closer_for(
+            'rationale'
+        )
+        assert detect_for('Chose X.' + closer_for('decision'), 'rationale', schema_params) is None
+
+    def test_a_bare_str_schema_params_never_iterates_into_CHARACTERS(self):
+        """The same fail-safe ``_as_name_set`` gives ``repair``.
+
+        A caller passing the parameter NAME where a collection belongs is a
+        bug; reading it as one-letter names would manufacture needles like the
+        closer for ``r`` out of the string ``rationale``.
+        """
+        assert detect_for('text' + closer_for('r'), 'rationale', 'rationale') is None
+        assert detect_for(self._SILENT_RATIONALE, 'rationale', 'rationale') == closer_for(
+            'rationale'
+        )
+
+    @pytest.mark.parametrize('param', [None, '', 0, 17, b'rationale', {'a': 1}])
+    def test_a_missing_or_non_string_param_degrades_to_exactly_detect(self, param):
+        """Never to a DEGENERATE EMPTY-NAME TAG, which would match prose."""
+        assert detect_for('\x3c/>', param) is None
+        assert detect_for('body ' + INVOKE_CLOSER, param) == INVOKE_CLOSER
+        assert detect_for('plain prose', param) is None
+        assert detect_for(self._SILENT_RATIONALE, param) is None
+
+
+def test_this_module_spells_no_raw_envelope_literal():
+    """This file's own SOURCE must never contain a raw ``chr(60)`` + ``/``.
+
+    The mechanical half of the authoring-hazard note in the module docstring
+    above, promoted here from ``scripts/tests/test_sweep_toolcall_markup.py``
+    by task **4696** so every file this containment work touches carries the
+    same guard. Computed at runtime from :func:`chr` so the needle itself is
+    not spelled here either — a test that had to write the literal to check
+    for it would be the very hazard it guards.
+    """
+    needle = chr(60) + '/'
+    source = Path(__file__).read_text(encoding='utf-8')
+    assert needle not in source, (
+        'A raw envelope literal was written into this test file. Spell it with '
+        'the \\x3c escape instead — see this module\'s docstring for why.'
+    )
 
 
 # ---------------------------------------------------------------------------
