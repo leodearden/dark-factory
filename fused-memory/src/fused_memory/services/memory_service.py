@@ -3911,7 +3911,112 @@ class MemoryService:
         """
         repair_stats = ReferentRepairStats()
 
+        # Grouped by edge FIRST, so the degenerate predicate is evaluated once
+        # per edge BEFORE any backend call for that edge. dict preserves
+        # insertion order, so findings are still processed in zeta's order.
+        findings_by_edge: dict[str, list[ReferentFinding]] = {}
         for finding in stats.findings:
+            findings_by_edge.setdefault(finding.edge_uuid, []).append(finding)
+
+        for edge_uuid, edge_findings in findings_by_edge.items():
+            if self._is_degenerate_edge(edge_findings):
+                # Skip the edge WHOLE — never half-move it. One warning naming
+                # the edge and BOTH endpoint node uuids, because "which edge,
+                # which nodes" is the whole of what a human needs to decide
+                # this case by hand (NEVER GUESS: recorded, left alone).
+                logger.warning(
+                    'Referent repair: skipping degenerate edge %s WHOLE — both '
+                    'ends would sit on one node (endpoints %s); repairing '
+                    'either end alone would leave the edge half-attributed, '
+                    'and repairing both would fold it into a self-referential '
+                    'RELATES_TO. Recorded and left alone: %s',
+                    edge_uuid,
+                    sorted({f.old_endpoint_uuid for f in edge_findings}),
+                    [f.to_dict() for f in edge_findings],
+                )
+                for finding in edge_findings:
+                    repair_stats.repairs.append(ReferentRepair(
+                        edge_uuid=finding.edge_uuid,
+                        which_end=finding.which_end,
+                        outcome='degenerate',
+                        old_endpoint_uuid=finding.old_endpoint_uuid,
+                        check=finding.check,
+                        reason=(
+                            'both ends of this edge would sit on one node; '
+                            'skipped whole rather than half-moved'
+                        ),
+                    ))
+                continue
+
+            await self._repair_edge_findings(
+                edge_findings, repair_stats, group_id=group_id,
+            )
+
+        return repair_stats
+
+    @staticmethod
+    def _is_degenerate_edge(findings: list[ReferentFinding]) -> bool:
+        """Would repairing this edge's findings fold it into a self-loop?
+
+        ONE predicate, evaluated once per edge BEFORE any backend call for that
+        edge — deliberately NOT an ``except ValueError`` around
+        ``reassign_edge``. That primitive does refuse a move whose new endpoint
+        equals the endpoint left in place, but by the time it raises, the FIRST
+        end has already committed: the half-attributed edge the rule exists to
+        prevent has already happened, and the exception arrives too late to be
+        a guard. Deciding before any write is the only formulation that can
+        "skip the edge whole".
+
+        Two shapes, both reachable, both producing the identical outcome:
+
+        LITERAL — two findings share an ``old_endpoint_uuid``. Both ends
+        already sit on the node being repaired away from, i.e. a self-loop on
+        the wrong node. Not hypothetical:
+        :meth:`GraphitiBackend.get_valid_edges_for_node`'s own docstring
+        documents that an A->A ``RELATES_TO`` edge exists in this graph and
+        double-matches its undirected query.
+
+        PROJECTED — two RESOLVABLE findings share an ``intended_referent``. The
+        two moves would converge both ends onto one node. Equally reachable
+        through zeta's rules: ``_candidate_targets`` subtracts ``endpoint`` and
+        ``other_endpoint``, neither of which removes a THIRD referent that both
+        ends would legitimately move onto. This is the SAME predicate evaluated
+        on post-repair endpoints, which is why it lives here as one extra
+        comparison rather than as a second guard that could drift.
+
+        Comparing the ``intended_referent`` rather than a resolved uuid is
+        equivalent and available BEFORE the mint: two ``Referent``s resolve to
+        the same node only if they render the same ``node_name``, i.e. are the
+        same frozen ``Referent``.
+
+        Resolvable findings only, on the projected arm: a finding eta will
+        never act on cannot converge with anything.
+        """
+        if len(findings) < 2:
+            return False
+        endpoints = [f.old_endpoint_uuid for f in findings]
+        if len(set(endpoints)) < len(endpoints):
+            return True
+        targets = [
+            f.intended_referent for f in findings
+            if f.resolvable and f.intended_referent is not None
+        ]
+        return len(set(targets)) < len(targets)
+
+    async def _repair_edge_findings(
+        self,
+        findings: list[ReferentFinding],
+        repair_stats: ReferentRepairStats,
+        *,
+        group_id: str,
+    ) -> None:
+        """Run the repair sequence for one non-degenerate edge's findings.
+
+        Split out from :meth:`_repair_episode_referents` so the pre-write
+        degenerate predicate reads as a gate on the whole edge rather than as
+        another branch inside the per-finding loop.
+        """
+        for finding in findings:
             intended = finding.intended_referent
             if not finding.resolvable or intended is None:
                 # NEVER GUESS, as the STRUCTURAL default rather than a branch
@@ -3982,8 +4087,6 @@ class MemoryService:
                 moved=moved,
                 summaries_refreshed=refreshed,
             ))
-
-        return repair_stats
 
     async def _backstop_endpoint_summaries(
         self, result: dict[str, Any], *, group_id: str
