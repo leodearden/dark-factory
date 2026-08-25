@@ -125,6 +125,7 @@ __all__ = [
     'LandingReason',
     'LandingVerdict',
     'branch_is_degenerate',
+    'branch_work_landed',
     'file_unattributed_landing_escalation',
     'format_unattributed_landing_detail',
     'is_valid_sha_40',
@@ -641,6 +642,196 @@ async def _delivered_checks_differential(
     probe['delivered_checks_legs'] = legs
     probe['delivered_checks_outcome'] = 'confirmed' if confirmed else 'no_signal'
     return confirmed
+
+
+async def _resolve_main_reachable_evidence(
+    git_ops: GitOps, task_id: str, head: str, probe: dict[str, Any],
+) -> str | None:
+    """Resolve a MAIN-REACHABLE commit carrying *task_id*'s work, or None.
+
+    Contract invariant 3 in one place: the sha :func:`branch_work_landed`
+    anchors provenance on must be a commit reachable from main that carries
+    this task's work.  Two tiers, tried in order, and NO third tier:
+
+    1. **Citation** — ``find_task_citation_commit`` walks
+       ``config.main_branch``'s own history, so anything it returns is
+       main-reachable by construction; no extra reachability check is needed
+       (and none is done, which is what keeps this leg off the decaying
+       path-set predicates — see :func:`branch_work_landed`).
+    2. **Patch-id equivalent** — ``find_equivalent_commit`` over
+       ``merge-base(main, head)..HEAD`` in ``project_root``, whose HEAD is
+       main.  The map it builds is keyed on ``git patch-id --stable``, so the
+       sha it returns is the commit on main whose diff is equivalent to
+       *head*'s — the replayed twin a rebase landing produces.  It carries its
+       own refuse-to-guess posture (an ambiguous patch-id, or an ambiguous
+       subject in its tier-2 fallback, yields ``None`` rather than an
+       arbitrary pick), which is inherited here deliberately.
+
+    Returns ``None`` when NEITHER tier resolves.  The caller turns that into
+    :attr:`LandingReason.no_attribution` rather than accepting: anchoring on
+    the branch tip (which in the rebase-landing shape is not on main at all)
+    or on main's current tip (which is whatever landed most recently, from any
+    task) would FABRICATE provenance — the exact defect the citation guard was
+    introduced to prevent, re-created one layer down.
+
+    *head* is used as the equivalence target as-is.  A tip that carries no
+    diff of its own — an empty commit, or a merge commit, whose ``git log -p``
+    output git suppresses by default — simply fails to resolve and lands on
+    ``no_attribution``; it is never guessed around.  (The sync-merge tip
+    shape, boundary row B2, is handled explicitly by a later step of this
+    task; until then it degrades to a refusal, not to a wrong answer.)
+
+    Every decision is recorded in *probe* under ``evidence_source`` so a
+    reader of the escalation can see WHICH tier answered, or which one
+    declined.
+    """
+    citation = await git_ops.find_task_citation_commit(task_id)
+    if citation:
+        probe['citation'] = citation
+        probe['evidence_source'] = 'citation'
+        return citation
+
+    base = await git_ops.merge_base_with_main(head)
+    probe['merge_base'] = base
+    if base is None:
+        # No fork point means no range to search for a replayed twin. Not an
+        # answer about the task — recorded as its own source so it is not read
+        # as "searched and found nothing".
+        probe['evidence_source'] = 'merge_base_unresolved'
+        return None
+
+    equivalent = await git_ops.find_equivalent_commit(git_ops.project_root, base, head)
+    probe['evidence_source'] = (
+        'patch_id_equivalent' if equivalent else 'no_equivalent_on_main'
+    )
+    return equivalent
+
+
+async def branch_work_landed(
+    git_ops: GitOps,
+    task_id: str,
+    branch: str,
+    *,
+    branch_tip_sha: str | None,
+    metadata: dict[str, Any] | None = None,
+    escalation_queue: EscalationQueue | None = None,
+) -> LandingVerdict:
+    """Has *branch*'s work landed on main, by PATCH-ID equivalence?
+
+    The PRD "landed-not-done-recovery" Contract's producer, and the
+    NON-DECAYING counterpart to :func:`validate_landing_evidence`.  Both
+    return the same :class:`LandingVerdict`; this one sets
+    :attr:`LandingMethod.patch_id` so a consumer can read which policy
+    decided.
+
+    **Why a second producer rather than a fix to the first.** The existing
+    landing-detection policy asks two questions that DECAY: "does a commit on
+    main cite this task?" (a rebase landing rewrites the shas and drops the
+    citation, so there is nothing to cite) and "is the cited commit's effect
+    still present at main HEAD?" (later commits touching the same paths erode
+    line survival past the 0.98/0.90 thresholds).  Patch-id equivalence asks
+    instead "is an equivalent patch anywhere in main's history?", which no
+    later commit can un-answer.
+
+    **Attribution is by ``git cherry``**, via the EXISTING production helper
+    ``merge_queue.patch_content_contained`` rather than a second local
+    implementation — two patch-id authorities in one repo is precisely the
+    lockstep duplication this task exists to remove.  The import is
+    FUNCTION-SCOPED because ``merge_queue.py`` imports from THIS module at
+    module level, so a top-level reverse import would be a cycle; that is the
+    same idiom this module already uses for ``orchestrator.delivered_checks``
+    and ``escalation.models``, and that ``merge_queue`` itself uses for its
+    main-health fingerprint.
+
+    **Mind the argument order at that call**: the helper's signature is
+    ``patch_content_contained(head, upstream, git_ops)`` but it shells
+    ``git cherry <upstream> <head>``.  Passing them the way the shell command
+    reads would invert the question into "is main's history contained in the
+    branch?", which a freshly-created branch answers YES to.
+
+    Pure and read-only, exactly as :func:`validate_landing_evidence` is: it
+    never stamps a task done, never escalates and never mutates git or task
+    state.  The caller owns the action.
+
+    Args:
+        git_ops: A ``GitOps`` instance, or a duck-typed stand-in exposing
+            ``resolve_branch_sha`` / ``find_task_citation_commit`` /
+            ``merge_base_with_main`` / ``find_equivalent_commit`` and a
+            ``project_root``.
+        task_id: Bare task id (no ``task/`` prefix).
+        branch: The task's branch name (e.g. ``f'task/{task_id}'``).
+        branch_tip_sha: An already-resolved tip for *branch*, or ``None`` to
+            resolve it here.  REQUIRED-BY-KEYWORD rather than defaulted, so a
+            caller must state which it means: a caller that already anchored
+            other checks on a tip it observed must pass that SAME tip, or a
+            concurrent warm-lane reseed between the two reads would anchor
+            this verdict on a tip that is no longer current (the hazard
+            :func:`branch_is_degenerate` documents from the task 3103 review).
+        metadata: The task's metadata dict.  A documented WIDENING of the
+            Contract's sketched signature — boundary row B6 needs
+            ``branch_base_sha``, which the sketched four-argument form cannot
+            supply.  Consumed by the degenerate-branch guard.
+        escalation_queue: The queue the ``git_error`` storm-escape L1 is filed
+            on.  STAGING, and named so it cannot go permanent: the tally and
+            its rate-gated escalation are wired by a later step of this task,
+            so a call passing this today changes nothing.  ``None`` means "no
+            queue available", which must stay a supported shape — every
+            verdict this function returns is correct without one.
+
+    Returns:
+        A :class:`LandingVerdict` with ``method`` set to
+        :attr:`LandingMethod.patch_id`.
+    """
+    upstream = _main_ref(git_ops)
+    probe: dict[str, Any] = {
+        'task_id': task_id,
+        'branch': branch,
+        'branch_tip_sha': branch_tip_sha,
+        'upstream_ref': upstream,
+        'citation': None,
+        # Recorded up front, not only on the accept: WHICH producer answered
+        # is a property of the call, and a consumer reading a rejected verdict
+        # needs to know it came from the patch-id policy and not the legacy
+        # effect-present one.
+        'method': LandingMethod.patch_id,
+    }
+
+    def _reject(reason: LandingReason) -> LandingVerdict:
+        probe['reason'] = reason
+        return LandingVerdict(
+            accepted=False, evidence_sha=None, reason=reason,
+            probe=dict(probe), method=LandingMethod.patch_id,
+        )
+
+    def _accept(evidence_sha: str) -> LandingVerdict:
+        probe['reason'] = LandingReason.landed
+        return LandingVerdict(
+            accepted=True, evidence_sha=evidence_sha, reason=LandingReason.landed,
+            probe=dict(probe), method=LandingMethod.patch_id,
+        )
+
+    head = branch_tip_sha
+    if head is None:
+        head = await git_ops.resolve_branch_sha(branch)
+        probe['branch_tip_sha'] = head
+    if head is None:
+        # An unresolvable ref is a broken DETECTOR, not an unlanded task.
+        probe['git_error_stage'] = 'resolve_branch_sha'
+        return _reject(LandingReason.git_error)
+
+    # Function-scoped: merge_queue.py imports from this module at module
+    # level, so importing it back at module level would close an import cycle.
+    from orchestrator.merge_queue import patch_content_contained  # noqa: PLC0415
+
+    contained = await patch_content_contained(head, upstream, git_ops)
+    probe['patch_id_contained'] = contained
+    if not contained:
+        return _reject(LandingReason.not_landed)
+
+    evidence_sha = await _resolve_main_reachable_evidence(git_ops, task_id, head, probe)
+    if evidence_sha is None:
+        return _reject(LandingReason.no_attribution)
+    return _accept(evidence_sha)
 
 
 async def validate_landing_evidence(
