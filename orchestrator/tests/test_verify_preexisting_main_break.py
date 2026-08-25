@@ -1916,3 +1916,213 @@ class TestPreexistingVerdictDowngradedByIsolatedRerun:
         assert result == (True, MAIN_SHA), result
         scoped_probe_mock.assert_not_awaited()
         isolated_rerun_mock.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Test 11 — step-11 (task 3226): the PARALLEL per-main-SHA SKIPPED-id baseline
+#           cache.  A skipped test id is evidence that main NEVER RAN that
+#           test — categorically different from "main ran it and it passed",
+#           which is all the failing-id baseline can express.  Without a
+#           second cache the bare-main probe's SKIP is indistinguishable from
+#           a PASS (the 2026-07-29 reify-allowlist incident's shape).
+#
+#           Deliberately a PARALLEL dict rather than a widened
+#           _BASELINE_FAILING_IDS_CACHE value tuple: the 2-tuple shape is
+#           pinned by test_merge_queue_main_health.py's
+#           _BASELINE_FAILING_IDS_CACHE['abcsha'] unpack, and
+#           seed_main_baseline's 2-arg signature is pinned by every existing
+#           caller.  Both back-compat facts are asserted below so a future
+#           "just widen the tuple" refactor fails here first.
+# ---------------------------------------------------------------------------
+
+
+class TestMainBaselineSkippedIds:
+    """seed_main_baseline_skipped / cached_main_baseline_skipped_ids mirror the
+    failing-side pair, and ONE probe seeds BOTH sides so the two caches never
+    disagree about whether a given sha was probed at all."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_both_caches(self):
+        from orchestrator import verify as verify_module
+        verify_module._BASELINE_FAILING_IDS_CACHE.clear()
+        verify_module._BASELINE_SKIPPED_IDS_CACHE.clear()
+        yield
+        verify_module._BASELINE_FAILING_IDS_CACHE.clear()
+        verify_module._BASELINE_SKIPPED_IDS_CACHE.clear()
+
+    def test_seed_then_cached_round_trips_a_frozenset(self) -> None:
+        """seed_main_baseline_skipped(sha, ids) -> cached_main_baseline_skipped_ids(sha)
+        returns exactly those ids as a frozenset."""
+        from orchestrator import verify as verify_module
+
+        verify_module.seed_main_baseline_skipped(MAIN_SHA, ['t::a', 't::b', 't::a'])
+
+        got = verify_module.cached_main_baseline_skipped_ids(MAIN_SHA)
+        assert got == frozenset({'t::a', 't::b'}), f'expected the seeded ids; got {got!r}'
+        assert isinstance(got, frozenset), f'expected a frozenset; got {type(got).__name__}'
+
+    def test_unseeded_sha_returns_none(self) -> None:
+        """An sha that was never probed/seeded is None — NOT an empty set.  The
+        distinction matters: empty means "main was probed and skipped nothing",
+        None means "we know nothing about main", and only the former licenses
+        a confident task-fault verdict."""
+        from orchestrator import verify as verify_module
+
+        assert verify_module.cached_main_baseline_skipped_ids('neverseensha') is None
+
+    def test_entry_older_than_ttl_returns_none(self, monkeypatch) -> None:
+        """An entry seeded more than _PROBE_CACHE_TTL ago is treated as absent,
+        matching the failing-side TTL discipline."""
+        import time as time_module
+
+        from orchestrator import verify as verify_module
+
+        base = time_module.monotonic()
+        monkeypatch.setattr(verify_module.time, 'monotonic', lambda: base)
+        verify_module.seed_main_baseline_skipped(MAIN_SHA, ['t::stale'])
+        assert verify_module.cached_main_baseline_skipped_ids(MAIN_SHA) == frozenset({'t::stale'})
+
+        # Advance past the TTL.
+        monkeypatch.setattr(
+            verify_module.time, 'monotonic',
+            lambda: base + verify_module._PROBE_CACHE_TTL + 1.0,
+        )
+        assert verify_module.cached_main_baseline_skipped_ids(MAIN_SHA) is None, (
+            'an entry older than _PROBE_CACHE_TTL must read as absent'
+        )
+
+    def test_one_probe_seeds_both_caches(self, tmp_path: Path) -> None:
+        """A single cache-miss probe of bare main seeds the failing AND the
+        skipped baseline — one probe, two caches, so a later cache-only peek at
+        either side sees the same sha as probed."""
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        git_ops = GitOps(config.git, config.project_root)
+        git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+
+        probe_result = VerifyResult(
+            passed=False, test_output='', lint_output='', type_output='',
+            summary='Failures: tests failed',
+            failing_test_ids=['m::fails'],
+            skipped_test_ids=['m::skipped', 'm::also_skipped'],
+        )
+
+        async def _fake_verify(*args, **kwargs) -> VerifyResult:
+            return probe_result
+
+        with (
+            patch.object(verify_module, 'run_scoped_verification', side_effect=_fake_verify),
+            patch('orchestrator.git_ops._run', side_effect=_fake_git_run),
+        ):
+            failing = asyncio.run(
+                verify_module.main_baseline_failing_ids(config, [], git_ops, MAIN_SHA)
+            )
+
+        assert failing == frozenset({'m::fails'})
+        assert verify_module.cached_main_baseline_skipped_ids(MAIN_SHA) == frozenset(
+            {'m::skipped', 'm::also_skipped'}
+        ), 'the same probe must seed the skipped baseline'
+
+    def test_probe_with_no_skipped_ids_seeds_the_skipped_side_as_empty(
+        self, tmp_path: Path,
+    ) -> None:
+        """A probe whose skipped_test_ids is None still seeds the skipped side —
+        as EMPTY, not unseeded.  Leaving it unseeded would make the two caches
+        disagree about whether that sha was probed at all, and a cache-only peek
+        would then read "main skipped nothing" as "we never probed main"."""
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        git_ops = GitOps(config.git, config.project_root)
+        git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+
+        probe_result = VerifyResult(
+            passed=False, test_output='', lint_output='', type_output='',
+            summary='Failures: tests failed',
+            failing_test_ids=['m::fails'],
+            skipped_test_ids=None,
+        )
+
+        async def _fake_verify(*args, **kwargs) -> VerifyResult:
+            return probe_result
+
+        with (
+            patch.object(verify_module, 'run_scoped_verification', side_effect=_fake_verify),
+            patch('orchestrator.git_ops._run', side_effect=_fake_git_run),
+        ):
+            asyncio.run(
+                verify_module.main_baseline_failing_ids(config, [], git_ops, MAIN_SHA)
+            )
+
+        assert verify_module.cached_main_baseline_skipped_ids(MAIN_SHA) == frozenset(), (
+            'a None skipped_test_ids must seed the skipped side as EMPTY, not leave it unseeded'
+        )
+
+    def test_degraded_probe_seeds_neither_cache(self, tmp_path: Path) -> None:
+        """The B3 degrade (failing_test_ids is None) still caches nothing on
+        EITHER side — the early return above the seed call is untouched."""
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        git_ops = GitOps(config.git, config.project_root)
+        git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+
+        opaque = VerifyResult(
+            passed=False, test_output='', lint_output='', type_output='',
+            summary='opaque failure', failing_test_ids=None, skipped_test_ids=['m::s'],
+        )
+
+        async def _fake_verify(*args, **kwargs) -> VerifyResult:
+            return opaque
+
+        with (
+            patch.object(verify_module, 'run_scoped_verification', side_effect=_fake_verify),
+            patch('orchestrator.git_ops._run', side_effect=_fake_git_run),
+        ):
+            result = asyncio.run(
+                verify_module.main_baseline_failing_ids(config, [], git_ops, 'degradedsha')
+            )
+
+        assert result is None
+        assert verify_module.cached_main_baseline_skipped_ids('degradedsha') is None, (
+            'a degraded (B3) probe must not seed the skipped side either'
+        )
+
+    def test_failing_cache_shape_and_seed_signature_stay_back_compat(self) -> None:
+        """BACK-COMPAT PIN — this is what forbids "just widen the value tuple".
+
+        ``verify._BASELINE_FAILING_IDS_CACHE[sha]`` must stay a 2-tuple
+        unpackable as ``_, ids = ...`` (pinned by
+        test_merge_queue_main_health.py's direct unpack), and
+        ``seed_main_baseline`` must keep its two-argument signature.
+        """
+        import inspect
+
+        from orchestrator import verify as verify_module
+
+        verify_module.seed_main_baseline(MAIN_SHA, ['t::x'])
+        entry = verify_module._BASELINE_FAILING_IDS_CACHE[MAIN_SHA]
+        assert isinstance(entry, tuple) and len(entry) == 2, (
+            f'_BASELINE_FAILING_IDS_CACHE values must stay 2-tuples; got {entry!r}'
+        )
+        _, ids = entry  # the exact unpack pinned by test_merge_queue_main_health.py
+        assert ids == frozenset({'t::x'})
+
+        params = list(inspect.signature(verify_module.seed_main_baseline).parameters)
+        assert params == ['main_sha', 'ids'], (
+            f'seed_main_baseline must keep its 2-arg signature; got {params}'
+        )
+
+    def test_the_two_caches_are_distinct_objects(self) -> None:
+        """The skipped baseline is a separate dict, not an alias — seeding one
+        side must not mutate the other."""
+        from orchestrator import verify as verify_module
+
+        verify_module.seed_main_baseline(MAIN_SHA, ['t::fails'])
+        verify_module.seed_main_baseline_skipped(MAIN_SHA, ['t::skips'])
+
+        assert verify_module._BASELINE_FAILING_IDS_CACHE is not \
+            verify_module._BASELINE_SKIPPED_IDS_CACHE
+        assert verify_module.cached_main_baseline_failing_ids(MAIN_SHA) == frozenset({'t::fails'})
+        assert verify_module.cached_main_baseline_skipped_ids(MAIN_SHA) == frozenset({'t::skips'})
