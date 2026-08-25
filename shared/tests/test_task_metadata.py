@@ -1292,6 +1292,98 @@ class TestMilestoneRegistration:
             parse_metadata({'milestone': {'mode': 'delayed'}}, direction='write', enforce=True)
 
 
+class TestRecurrenceRegistration:
+    """``recurrence``'s registration with the W10 extension point + parse_metadata integration.
+
+    Task 4676 / PRD ``docs/prds/recurring-deterministic-tasks.md`` R-D4. The
+    cardinality pin lives HERE rather than in
+    TestProductionRegistrationCardinality for the reason that class's
+    docstring gives: cardinality is pinned in the suite that imports the
+    registering module, and this file imports ``shared.task_metadata``
+    directly.
+
+    These rows READ the production registration made at import time; none of
+    them calls ``register_metadata_submodel('recurrence', ...)``, because the
+    autouse fixture's teardown fails any test that adds a non-``_stub`` key
+    (task 3352).
+    """
+
+    _CARRIER = {
+        'task_kind': 'deterministic',
+        'milestone': {'mode': 'dated', 'at': '2026-09-01T00:00:00+00:00'},
+        'before_done': {
+            'kind': 'predicate',
+            'script': 'scripts/x.sh',
+            'timeout_secs': 120,
+        },
+        'recurrence': {'key': 'reify-closure-staleness', 'interval_secs': 86400},
+    }
+
+    def test_registered_at_import(self):
+        assert task_metadata_module._SUBMODEL_REGISTRY['recurrence'] is Recurrence
+
+    def test_registered_as_dict_cardinality(self):
+        assert task_metadata_module._SUBMODEL_CARDINALITY['recurrence'] == 'dict'
+
+    def test_carrier_round_trip_no_warnings(self):
+        model, warnings = parse_metadata(copy.deepcopy(self._CARRIER), direction='write')
+        assert warnings == []
+        assert isinstance(model.recurrence, Recurrence)  # type: ignore[attr-defined]
+        dumped = model.model_dump()['recurrence']
+        assert not isinstance(dumped, BaseModel)
+        assert dumped == {
+            'key': 'reify-closure-staleness',
+            'interval_secs': 86400,
+            'minted_from': None,
+        }
+
+    def test_malformed_slice_read_warns_and_retains_raw(self):
+        model, warnings = parse_metadata({'recurrence': {'key': 'k'}}, direction='read')
+        assert len(warnings) == 1
+        assert warnings[0].field == 'recurrence'
+        assert warnings[0].code == 'invalid_submodel'
+        assert model.model_dump()['recurrence'] == {'key': 'k'}
+
+    def test_malformed_slice_write_enforce_raises(self):
+        with pytest.raises(ValidationError):
+            parse_metadata({'recurrence': {'key': 'k'}}, direction='write', enforce=True)
+
+    def test_scalar_slice_is_invalid_submodel_not_wrong_cardinality(self):
+        """A scalar slice falls through to ``submodel(**raw)`` — a TypeError, not a shape error.
+
+        The task-4142 cardinality gate compares ``isinstance(raw, list)``
+        against the declared cardinality, so a SCALAR never trips it; only a
+        list value does (see the row below).
+        """
+        _, warnings = parse_metadata({'recurrence': 'nope'}, direction='read')
+        assert len(warnings) == 1
+        assert warnings[0].field == 'recurrence'
+        assert warnings[0].code == 'invalid_submodel'
+
+    def test_list_slice_read_warns_wrong_cardinality(self):
+        model, warnings = parse_metadata(
+            {'recurrence': [{'key': 'k', 'interval_secs': 86400}]}, direction='read'
+        )
+        assert len(warnings) == 1
+        assert warnings[0].field == 'recurrence'
+        assert warnings[0].code == 'wrong_cardinality'
+        assert model.model_dump()['recurrence'] == [{'key': 'k', 'interval_secs': 86400}]
+
+    def test_list_slice_write_enforce_raises_type_error(self):
+        """The task-4142 shape rejection registration buys under write+enforce.
+
+        This is what covers ``update_task``, which never runs fused-memory's
+        deterministic-task guard: registering the key subjects the slice to
+        the cardinality gate at the write boundary regardless of caller.
+        """
+        with pytest.raises(TypeError):
+            parse_metadata(
+                {'recurrence': [{'key': 'k', 'interval_secs': 86400}]},
+                direction='write',
+                enforce=True,
+            )
+
+
 class TestRoutingRegistration:
     """``routing``'s registration with the W10 extension point + parse_metadata integration."""
 
