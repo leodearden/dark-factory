@@ -1,13 +1,26 @@
 """Shared landing-evidence helper for already-landed re-derivation sites (task 2678).
 
-Five always-on sites re-derive "has this task's work already landed on
-main?" from live git state before stamping a task ``done``:
+SEVEN always-on call sites re-derive "has this task's work already landed on
+main?" from live git state before stamping a task ``done`` (re-measured
+2026-08-25; this list said "five" until task 4647 recounted it, and the two it
+omitted were the pair that never had a ``Harness`` or worker method to be
+named after):
 
   1. ``Harness._already_landed_dispatch_gate``'s ancestry path
-  2. ``Harness._already_landed_dispatch_gate``'s branch-deleted merge-marker path
+     (``harness.py:11710``)
+  2. ``Harness._already_landed_dispatch_gate``'s branch-deleted merge-marker
+     path (``harness.py:11752``)
   3. ``Harness._already_landed_dispatch_gate``'s content-equivalence fallback
-  4. the stranded-in-progress sweep (``Harness._reconcile_one_stranded``)
-  5. ``SpeculativeMergeWorker._redrive_coalesce_members`` (coalesce re-drive)
+     (``harness.py:11780``)
+  4. the stranded-in-progress sweep (``Harness._reconcile_one_stranded``,
+     ``harness.py:5715``)
+  5. ``SpeculativeMergeWorker._redrive_coalesce_members`` (coalesce re-drive,
+     ``merge_queue.py:14805``)
+  6. and 7. the escalation server's ``merge_status`` query
+     (``escalation/server.py:3870`` and ``:3916``) — a read-only report rather
+     than a recovery action, which is why it is easy to miss when counting
+     "sites that stamp a task done", and why it is nonetheless a site: it
+     shows a human the same verdict the other five act on.
 
 Prior to task 2678 each site inlined its own subset of two primitives landed
 by task 2675 (dep δ): ``git_ops.find_task_citation_commit`` (FIX 2,
@@ -21,8 +34,19 @@ two more lean on a silent ``x or <fallback-sha>`` expression that fabricated
 provenance when discovery came up empty.
 
 This module is the single, INV-5 extraction point: ONE async function,
-:func:`validate_landing_evidence`, that both ``harness.py`` (×4 call sites)
-and ``merge_queue.py`` (×1 call site) delegate to.
+:func:`validate_landing_evidence`, that ``harness.py`` (×4 call sites),
+``merge_queue.py`` (×1) and ``escalation/server.py`` (×2) all delegate to.
+
+Task 4647 added a SECOND producer beside it — :func:`branch_work_landed`, the
+PRD "landed-not-done-recovery" Contract's NON-DECAYING patch-id policy — plus
+the two closed vocabularies both producers share (:class:`LandingReason`,
+:class:`LandingMethod`), the :class:`LandingTally` storm escape, and the
+:class:`LandingVerdict` rename (``LandingEvidenceVerdict`` is now an alias).
+See **ONE PRODUCER FAMILY** below for how the two relate.  It removed no
+effect-present call site: the complete enumeration of those, the ruling on
+which are in scope for leaf ε, and the re-derived precision arithmetic ε must
+cite live in
+``docs/prds/landed-not-done-recovery.effect-present-caller-enumeration.md``.
 
 **Module-level, not a method** — a standalone function taking ``git_ops`` as
 its first parameter, deliberately NOT a ``GitOps`` method and NOT a
