@@ -4575,22 +4575,45 @@ def _format_flagged(
     return '\n'.join(lines)
 
 
+_DONE_PROVENANCE_SECTION_CHAR_BUDGET = 20_000
+
+
 async def _render_done_provenance_section(
     done_tasks: list[dict],
     project_root: ProjectRoot | None,
     *,
     max_files_per_task: int = 50,
     max_chars_per_task: int = 2000,
+    section_budget_chars: int = _DONE_PROVENANCE_SECTION_CHAR_BUDGET,
 ) -> str:
     """Render a '### Done-task Provenance' block from task metadata.done_provenance.
 
     For each done task:
     - With ``commit``: emits the resolved SHA + a bounded file list produced by
-      ``git show --name-only --format=%H%n%ai%n%s <sha>``. Capped at
-      ``max_files_per_task`` files and ``max_chars_per_task`` characters per task
-      so a single runaway commit can't blow the prompt budget.
+      :func:`_git_show_name_only` (see that function's docstring for the exact
+      git invocation — restated here would just be a second copy that can
+      drift out of sync, which is what happened before task 4702's
+      amendment). Capped at ``max_files_per_task`` files and
+      ``max_chars_per_task`` characters per task so a single runaway commit
+      can't blow the prompt budget.
     - With ``note``: emits the note text verbatim (no git call).
     - Without either: emits ``provenance: unknown (legacy)``.
+
+    The section as a whole is additionally capped at *section_budget_chars*,
+    mirroring :func:`_format_flagged`'s pattern: once appending the next
+    task's block would exceed the budget, rendering stops, a ``... and N
+    more (truncated: section char budget)`` footer line is appended, and a
+    ``reconciliation.done_provenance_section_truncated`` warning is logged
+    with the rendered/dropped counts. Per-task truncation
+    (``max_files_per_task``/``max_chars_per_task``) only bounds a single
+    runaway commit; before task 4702's fix a done task citing a merge commit
+    contributed ~0 file lines (git's combined diff is empty for a clean
+    merge), so this section-level cap did not matter in practice. Now a
+    merge can contribute up to its full per-task cap, and up to
+    ``MAX_DONE_TASKS_RETAINED`` (30) done tasks are retained, so a
+    merge-heavy briefing could otherwise grow unboundedly — this keeps that
+    degradation loud and bounded instead of silently crowding out the rest
+    of the Stage-2 prompt.
 
     Returns an empty string when ``done_tasks`` is empty — no section is injected
     in that case, keeping the prompt tight when no new completions exist.
@@ -4598,7 +4621,11 @@ async def _render_done_provenance_section(
     if not done_tasks:
         return ''
 
-    lines: list[str] = ['### Done-task Provenance']
+    header_line = '### Done-task Provenance'
+    lines: list[str] = [header_line]
+    running_chars = len(header_line)
+    rendered = 0
+
     for task in done_tasks:
         if not isinstance(task, dict):
             continue
@@ -4608,28 +4635,49 @@ async def _render_done_provenance_section(
         prov = metadata.get('done_provenance') if isinstance(metadata, dict) else None
         header = f'- [{tid}] {title}'
 
+        task_lines: list[str] = []
         if not isinstance(prov, dict):
-            lines.append(f'{header} — provenance: unknown (legacy)')
-            continue
+            task_lines.append(f'{header} — provenance: unknown (legacy)')
+        else:
+            commit = prov.get('commit') if isinstance(prov.get('commit'), str) else None
+            note = prov.get('note') if isinstance(prov.get('note'), str) else None
 
-        commit = prov.get('commit') if isinstance(prov.get('commit'), str) else None
-        note = prov.get('note') if isinstance(prov.get('note'), str) else None
+            if commit and project_root:
+                diff_block = await _git_show_name_only(
+                    project_root,
+                    commit,
+                    max_files=max_files_per_task,
+                    max_chars=max_chars_per_task,
+                )
+                task_lines.append(f'{header}\n  commit: {commit}')
+                if diff_block:
+                    indented = '\n'.join('    ' + ln for ln in diff_block.splitlines())
+                    task_lines.append(indented)
+            if note:
+                task_lines.append(f'  note: {note}')
+            if not commit and not note:
+                task_lines.append(f'{header} — provenance: unknown (legacy)')
 
-        if commit and project_root:
-            diff_block = await _git_show_name_only(
-                project_root,
-                commit,
-                max_files=max_files_per_task,
-                max_chars=max_chars_per_task,
+        # +1 per line for the '\n' that '\n'.join would insert between it
+        # and its predecessor.
+        addition = sum(len(ln) + 1 for ln in task_lines)
+        if running_chars + addition > section_budget_chars:
+            remaining = len(done_tasks) - rendered
+            lines.append(f'... and {remaining} more (truncated: section char budget)')
+            logger.warning(
+                'reconciliation.done_provenance_section_truncated',
+                extra={
+                    'total': len(done_tasks),
+                    'rendered': rendered,
+                    'dropped': remaining,
+                    'section_budget_chars': section_budget_chars,
+                },
             )
-            lines.append(f'{header}\n  commit: {commit}')
-            if diff_block:
-                indented = '\n'.join('    ' + ln for ln in diff_block.splitlines())
-                lines.append(indented)
-        if note:
-            lines.append(f'  note: {note}')
-        if not commit and not note:
-            lines.append(f'{header} — provenance: unknown (legacy)')
+            return '\n'.join(lines) + '\n'
+
+        lines.extend(task_lines)
+        running_chars += addition
+        rendered += 1
 
     return '\n'.join(lines) + '\n'
 
@@ -4666,6 +4714,22 @@ async def _git_show_name_only(
     documents the same fix for the same reason. ``--first-parent -m`` is a
     verified no-op for an ordinary single-parent commit, so this is a strict
     improvement over the prior invocation.
+
+    Direction assumption: ``--first-parent`` reports the diff against parent
+    1, which is correct for the merge lane's own merges — it resets a
+    worktree to main and runs ``git merge --no-ff <task-branch>``
+    (``orchestrator/src/orchestrator/git_ops.py``), so parent 1 is main and
+    the first-parent diff is exactly what the task brought in. It would be
+    WRONG in the opposite direction: a done_provenance commit citing a merge
+    made INSIDE a task worktree (main merged into the branch, e.g. a
+    conflict-resolution catch-up merge) has the task branch as parent 1, so
+    the first-parent diff becomes everything main gained since the branch
+    point — potentially hundreds of unrelated files handed to Stage-2 as the
+    "shipped via" gate. No guard against that case is implemented here (out
+    of scope for task 4702); ``git merge-base --is-ancestor <parent1> main``
+    would detect it — see
+    ``scripts/audit_found_on_main_provenance.py::_git_is_ancestor`` for the
+    existing implementation of that check.
 
     Returns an empty string on subprocess failure — the caller still emits the
     commit SHA header, just without the file list. We deliberately don't raise
