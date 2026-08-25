@@ -1545,3 +1545,289 @@ class TestReferentRepairCountsAccessor:
         assert fresh['repaired'] == 1
         assert fresh['streaks'] == {'dark_factory': 1}
         assert service._referent_repair_streaks == {'dark_factory': 1}
+
+
+@pytest.fixture
+def to_thread_spy(monkeypatch):
+    """Records every `asyncio.to_thread` dispatch and whether it COMPLETED.
+
+    Patching the real hop rather than the escalator seam is deliberate: the
+    thing under test is that the blocking escalation I/O leaves the event loop
+    at all (`memory_service.py`'s "ASYNC ON PURPOSE — do not re-inline the
+    escalation hop"), which a mock on the escalator alone cannot observe.
+    """
+    calls: list[tuple] = []
+    completed: list[tuple] = []
+    real_to_thread = asyncio.to_thread
+
+    async def _spy(func, *args, **kwargs):
+        calls.append((func, args, kwargs))
+        if getattr(func, '__module__', '').startswith('fused_memory.middleware'):
+            # Don't touch a real escalation queue from a unit test.
+            completed.append((func, args, kwargs))
+            return None
+        result = await real_to_thread(func, *args, **kwargs)
+        completed.append((func, args, kwargs))
+        return result
+
+    monkeypatch.setattr(asyncio, 'to_thread', _spy)
+    _spy.calls = calls  # type: ignore[attr-defined]
+    _spy.completed = completed  # type: ignore[attr-defined]
+    return _spy
+
+
+def _escalations(spy) -> list[tuple]:
+    return [
+        (args, kwargs) for func, args, kwargs in spy.calls
+        if getattr(func, '__name__', '') == 'emit_referent_repair_storm_escalation'
+    ]
+
+
+@pytest.mark.asyncio
+class TestTheStormGate:
+    """INV-4: the alarm fires from the tail of the repair pass — and the
+    repairs go right on happening while it does."""
+
+    async def test_the_threshold_constant_is_ten(self):
+        """The resolution of PRD Open Question 1, chosen against the measured
+        ~0.22% base rate. Pinned so a silent retune is a test failure."""
+        from fused_memory.services import memory_service as ms_mod
+
+        assert ms_mod._REFERENT_REPAIR_STREAK_THRESHOLD == 10
+
+    async def test_below_the_threshold_nothing_is_escalated(
+        self, service, to_thread_spy, monkeypatch,
+    ):
+        monkeypatch.setattr(
+            'fused_memory.services.memory_service._REFERENT_REPAIR_STREAK_THRESHOLD', 3,
+        )
+        service.set_known_projects({'dark_factory': '/tmp/df-root'})
+
+        for _ in range(2):
+            await service._repair_episode_referents(
+                _stats(_finding()), group_id='dark_factory',
+            )
+
+        assert _escalations(to_thread_spy) == []
+
+    async def test_the_predicate_is_ge_not_eq_so_every_breach_fires(
+        self, service, to_thread_spy, monkeypatch,
+    ):
+        """Single-firing is the ESCALATOR's dedupe-fold job, not the counter's
+        — the merge_liveness division of labour. A counter that fired only on
+        the exact boundary would go permanently silent the moment one breach
+        was missed."""
+        monkeypatch.setattr(
+            'fused_memory.services.memory_service._REFERENT_REPAIR_STREAK_THRESHOLD', 3,
+        )
+        service.set_known_projects({'dark_factory': '/tmp/df-root'})
+
+        for _ in range(5):
+            await service._repair_episode_referents(
+                _stats(_finding()), group_id='dark_factory',
+            )
+
+        fired = _escalations(to_thread_spy)
+        assert [kwargs['streak'] for _, kwargs in fired] == [3, 4, 5]
+
+    async def test_the_escalator_is_dispatched_off_the_event_loop_and_awaited(
+        self, service, to_thread_spy, monkeypatch,
+    ):
+        """`EscalationQueue` construction, a directory scan and an fsync'd
+        write would otherwise block the loop — inside the per-group identity
+        lock, no less. Awaited rather than fire-and-forgotten so it can never
+        outlive the write or be dropped by task GC."""
+        monkeypatch.setattr(
+            'fused_memory.services.memory_service._REFERENT_REPAIR_STREAK_THRESHOLD', 1,
+        )
+        service.set_known_projects({'dark_factory': '/tmp/df-root'})
+
+        await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory',
+        )
+
+        assert len(_escalations(to_thread_spy)) == 1
+        assert len(to_thread_spy.completed) == 1, (
+            'the hop must have COMPLETED before the pass returned'
+        )
+
+    async def test_the_dispatch_carries_the_root_positionally_and_the_payload(
+        self, service, to_thread_spy, monkeypatch,
+    ):
+        monkeypatch.setattr(
+            'fused_memory.services.memory_service._REFERENT_REPAIR_STREAK_THRESHOLD', 1,
+        )
+        service.set_known_projects({'dark_factory': '/tmp/df-root'})
+
+        repair_stats = await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory',
+        )
+
+        (args, kwargs), = _escalations(to_thread_spy)
+        assert args == ('/tmp/df-root',)
+        assert kwargs['project_id'] == 'dark_factory'
+        assert kwargs['streak'] == 1
+        assert kwargs['threshold'] == 1
+        assert kwargs['repairs'] == 1
+        assert kwargs['records'] == [r.to_dict() for r in repair_stats.repairs], (
+            'INV-2: the alarm ships the structured evidence, not a count'
+        )
+
+    async def test_repairs_continue_while_the_alarm_fires(
+        self, service, to_thread_spy, monkeypatch,
+    ):
+        """The escalation is the ALARM, NOT A HALT."""
+        monkeypatch.setattr(
+            'fused_memory.services.memory_service._REFERENT_REPAIR_STREAK_THRESHOLD', 1,
+        )
+        service.set_known_projects({'dark_factory': '/tmp/df-root'})
+
+        repair_stats = await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory',
+        )
+
+        service.graphiti.reassign_edge.assert_awaited_once()
+        assert repair_stats.repaired == 1
+        assert [r.outcome for r in repair_stats.repairs] == ['repaired']
+
+    async def test_an_escalator_failure_is_caught_logged_and_never_propagates(
+        self, service, monkeypatch, caplog,
+    ):
+        """Belt to the escalator's own never-raise braces: a raise here would
+        fail an already-committed episode's reconcile chain because the
+        COMPLAINT about the write failed."""
+        monkeypatch.setattr(
+            'fused_memory.services.memory_service._REFERENT_REPAIR_STREAK_THRESHOLD', 1,
+        )
+        service.set_known_projects({'dark_factory': '/tmp/df-root'})
+
+        async def _boom(*_a, **_kw):
+            raise OSError('queue exploded')
+
+        monkeypatch.setattr(asyncio, 'to_thread', _boom)
+
+        with caplog.at_level(logging.WARNING):
+            repair_stats = await service._repair_episode_referents(
+                _stats(_finding()), group_id='dark_factory',
+            )
+
+        assert repair_stats.repaired == 1
+        assert [r.outcome for r in repair_stats.repairs] == ['repaired']
+        assert caplog.records
+
+    @pytest.mark.parametrize(
+        'exc_type', [asyncio.CancelledError, KeyboardInterrupt, SystemExit],
+    )
+    async def test_the_gate_guard_never_swallows_cancellation(
+        self, service, monkeypatch, exc_type,
+    ):
+        monkeypatch.setattr(
+            'fused_memory.services.memory_service._REFERENT_REPAIR_STREAK_THRESHOLD', 1,
+        )
+        service.set_known_projects({'dark_factory': '/tmp/df-root'})
+
+        async def _interrupted(*_a, **_kw):
+            raise exc_type('interrupted')
+
+        monkeypatch.setattr(asyncio, 'to_thread', _interrupted)
+
+        with pytest.raises(exc_type):
+            await service._repair_episode_referents(
+                _stats(_finding()), group_id='dark_factory',
+            )
+
+    async def test_a_reset_restarts_the_streak_so_the_next_alarm_needs_a_fresh_one(
+        self, service, to_thread_spy, monkeypatch,
+    ):
+        monkeypatch.setattr(
+            'fused_memory.services.memory_service._REFERENT_REPAIR_STREAK_THRESHOLD', 3,
+        )
+        service.set_known_projects({'dark_factory': '/tmp/df-root'})
+
+        for _ in range(3):
+            await service._repair_episode_referents(
+                _stats(_finding()), group_id='dark_factory',
+            )
+        assert len(_escalations(to_thread_spy)) == 1
+
+        # A pass that LOOKED and found nothing — the positive health signal.
+        await service._repair_episode_referents(
+            ReferentStats(endpoints_checked=6), group_id='dark_factory',
+        )
+        assert service._referent_repair_streaks['dark_factory'] == 0
+
+        for _ in range(2):
+            await service._repair_episode_referents(
+                _stats(_finding()), group_id='dark_factory',
+            )
+        assert service._referent_repair_streaks['dark_factory'] == 2
+        assert len(_escalations(to_thread_spy)) == 1, (
+            'the streak restarted at 1, so the next alarm needs a full fresh '
+            'run to the threshold'
+        )
+
+
+@pytest.mark.asyncio
+class TestTheStormGateProjectRoot:
+    """Where the alarm is FILED, and the fallback that must not exist."""
+
+    async def test_the_root_is_resolved_from_known_projects(
+        self, service, to_thread_spy, monkeypatch,
+    ):
+        """graphiti `group_id == project_id` (models/scope.py), so the map
+        injected by `set_known_projects` is the correct resolution."""
+        monkeypatch.setattr(
+            'fused_memory.services.memory_service._REFERENT_REPAIR_STREAK_THRESHOLD', 1,
+        )
+        service.set_known_projects({
+            'dark_factory': '/tmp/df-root', 'reify': '/tmp/reify-root',
+        })
+
+        await service._repair_episode_referents(
+            _stats(_finding()), group_id='reify',
+        )
+
+        (args, _kwargs), = _escalations(to_thread_spy)
+        assert args == ('/tmp/reify-root',)
+
+    async def test_an_unknown_group_escalates_nothing_and_warns_structurally(
+        self, service, to_thread_spy, monkeypatch, caplog,
+    ):
+        monkeypatch.setattr(
+            'fused_memory.services.memory_service._REFERENT_REPAIR_STREAK_THRESHOLD', 1,
+        )
+        service.set_known_projects({'reify': '/tmp/reify-root'})
+
+        with caplog.at_level(logging.WARNING):
+            repair_stats = await service._repair_episode_referents(
+                _stats(_finding()), group_id='dark_factory',
+            )
+
+        assert _escalations(to_thread_spy) == []
+        message = '\n'.join(record.getMessage() for record in caplog.records)
+        assert 'dark_factory' in message
+        assert '1' in message
+        # ...and the repairs still happened. An unfileable alarm is a lost
+        # heads-up, never a lost repair.
+        assert repair_stats.repaired == 1
+
+    async def test_the_taskmaster_project_root_is_never_used_as_a_fallback(
+        self, service, to_thread_spy, monkeypatch,
+    ):
+        """`config.taskmaster.project_root` defaults to '.', so a fallback
+        would file into the SERVER CWD — where no operator is watching — and
+        report success doing it. Explicitly forbidden by the mem0 escalator's
+        docstring."""
+        monkeypatch.setattr(
+            'fused_memory.services.memory_service._REFERENT_REPAIR_STREAK_THRESHOLD', 1,
+        )
+        service.set_known_projects({})
+        service.config.taskmaster.project_root = '/tmp/server-cwd-trap'
+
+        await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory',
+        )
+
+        assert _escalations(to_thread_spy) == [], (
+            'no root is a REFUSAL to file, never a guess at one'
+        )
