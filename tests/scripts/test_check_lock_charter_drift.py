@@ -46,10 +46,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+import check_lock_charter_drift as drift
 import pytest
 from shared.locking import EXTENSIONLESS_FILENAMES, FILE_EXTENSIONS
-
-import check_lock_charter_drift as drift
 
 # The two vectors dark-factory declares, in the exact form the guard script
 # emits them (one per line, sorted).  Read from `shared.locking` — never from
