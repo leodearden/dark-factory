@@ -28,15 +28,21 @@ scripts/tests/test_lms_marker_contract.py.
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
 import yaml
+from _task_db_scan import format_kv_line
 from audit_manifest_descriptor_drift import (
+    _COVERAGE_CAVEAT,
     MECHANICAL_CHECK_KINDS,
     DescriptorDrift,
     ProjectAudit,
+    _is_dirty,
     audit_project,
+    format_json,
+    format_report,
 )
 
 # ---------------------------------------------------------------------------
@@ -350,3 +356,314 @@ def test_audit_records_both_project_root_and_manifest_root(
     decoupled = audit_project(str(root), str(other))
     assert decoupled.project_root == str(root)
     assert decoupled.manifest_root == str(other)
+
+
+# ---------------------------------------------------------------------------
+# COVERAGE — the three classes that never reach a comparison at all.
+#
+# Each is COUNTED and NOT reported as a finding. The finding list is a
+# comparison of MATCHED PAIRS only, so presenting it as the whole corpus would
+# be a no-silent-fail-soft violation (docs/legibility/design-invariants.md).
+# ---------------------------------------------------------------------------
+
+def test_capability_with_no_same_named_task_entry_is_coverage_not_a_finding(
+        tmp_path, make_tasks_db):
+    """An ABSENCE is not a DISAGREEMENT.
+
+    Measured live on this corpus: 32 mechanical capabilities whose producer
+    task carries no same-named metadata.delivered_checks entry. That class is a
+    different defect — its dominant cause is the curator-combine `metadata`
+    wipe — and it is already OWNED by scripts/audit_combine_gate_marker_loss.py
+    (tasks 3146/3329). Double-filing it here would both duplicate that audit
+    and break this sweep's "exactly 8" result.
+    """
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[_task(100, [_entry("other-cap", _GREP_CHECK)])],
+        manifests=[("plans/a-prd.capability-manifest.yaml", _manifest_doc(100))],
+    )
+
+    audit = audit_project(str(root))
+
+    assert audit.findings == []
+    assert audit.coverage.capabilities_without_task_entry == 1
+    # Still COMPARED-eligible: it was a mechanical capability we tried to pair.
+    assert audit.coverage.mechanical_capabilities_compared == 1
+
+
+def test_manifest_task_with_no_db_row_is_coverage_not_a_finding(
+        tmp_path, make_tasks_db):
+    """A stamped task_id with no tasks.db row binds nothing comparable.
+
+    Measured live on this corpus: 6 manifest task blocks whose stamped task_id
+    has no row. Counted separately from the missing-entry class above because
+    the two have different causes and different owners; collapsing them would
+    misattribute 6 rows into a population of 32.
+    """
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[_task(999, [_entry("gate", _GREP_CHECK)])],
+        manifests=[("plans/a-prd.capability-manifest.yaml", _manifest_doc(100))],
+    )
+
+    audit = audit_project(str(root))
+
+    assert audit.findings == []
+    assert audit.coverage.manifest_tasks_without_db_row == 1
+    # The whole task block is skipped, so none of its capabilities are compared.
+    assert audit.coverage.mechanical_capabilities_compared == 0
+
+
+@pytest.mark.parametrize("bad_entry,why", [
+    ({"name": "gate", "kind": "grep", "pattern": "p", "expect": "present",
+      "typo_key": "x"}, "unknown key (extra='forbid')"),
+    ({"name": "gate", "kind": "manual", "reason": "r"}, "kind='manual' is not a meta kind"),
+    ({"name": "gate", "kind": "grep", "pattern": "p"}, "grep entry missing expect"),
+])
+def test_unvalidatable_task_entry_is_coverage_and_is_NAMED(
+        tmp_path, make_tasks_db, bad_entry, why):
+    """A task entry that will not validate cannot be compared — and is NAMED.
+
+    Counted in malformed_task_entries AND named in the coverage details with
+    its (task_id, capability). A count alone tells an operator that coverage is
+    incomplete but not where to look, which swallows the failure at exactly the
+    reporting boundary no-silent-fail-soft is about.
+    """
+    root = _one_project(tmp_path, make_tasks_db,
+                        sidecar_check=_GREP_CHECK, task_entry=bad_entry)
+
+    audit = audit_project(str(root))
+
+    assert audit.findings == [], why
+    assert audit.coverage.malformed_task_entries == 1
+    named = " ".join(audit.coverage.uncomparable_details)
+    assert "100" in named and "gate" in named
+    # Not conflated with the sidecar-parse channel.
+    assert audit.coverage.manifest_parse_failures == 0
+
+
+@pytest.mark.parametrize("bad_doc", [
+    "prd: [unclosed\n  nope: {",                       # invalid YAML syntax
+    {"prd": "plans/a-prd.md", "schema_version": 1,     # schema-invalid document
+     "tasks": [{"label": "δ", "task_id": 100,
+                "capabilities": [{"name": "gate", "delivered_check": {"kind": "nonsense"}}]}]},
+])
+def test_unloadable_sidecar_is_recorded_and_the_sweep_continues(
+        tmp_path, make_tasks_db, bad_doc):
+    """One bad sidecar never aborts the sweep, and is NAMED with its error."""
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[_task(100, [_entry("gate", {**_GREP_CHECK, "pattern": "drifted"})])],
+        manifests=[
+            ("plans/bad-prd.capability-manifest.yaml", bad_doc),
+            ("plans/good-prd.capability-manifest.yaml", _manifest_doc(100)),
+        ],
+    )
+
+    audit = audit_project(str(root))
+
+    # The REMAINING manifest was still swept and still produced its finding.
+    assert _triples(audit) == {("plans/good-prd.capability-manifest.yaml", 100, "gate")}
+    assert audit.coverage.manifests_swept == 1
+    assert audit.coverage.manifest_parse_failures == 1
+    details = audit.coverage.manifest_parse_failure_details
+    assert len(details) == 1
+    assert details[0].startswith("plans/bad-prd.capability-manifest.yaml: ")
+
+
+def test_manifests_swept_and_compared_are_counted(tmp_path, make_tasks_db):
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[_task(100, []), _task(200, [])],
+        manifests=[
+            ("plans/a-prd.capability-manifest.yaml",
+             _manifest_doc(100, checks=(("c1", _GREP_CHECK), ("c2", _SCRIPT_CHECK),
+                                        ("c3", _MANUAL_CHECK)))),
+            ("docs/prds/b-prd.capability-manifest.yaml",
+             _manifest_doc(200, prd="docs/prds/b-prd.md")),
+        ],
+    )
+
+    coverage = audit_project(str(root)).coverage
+
+    assert coverage.manifests_swept == 2
+    # c1 + c2 + the b-prd gate; c3 is manual and never mechanical.
+    assert coverage.mechanical_capabilities_compared == 3
+
+
+# ---------------------------------------------------------------------------
+# Non-vacuity / loudness. A silently-empty corpus must NEVER render as a clean
+# zero: an empty corpus and a clean corpus are indistinguishable in the finding
+# count, and only one of them is good news.
+# ---------------------------------------------------------------------------
+
+def test_manifest_root_that_is_not_a_git_checkout_is_DIRTY_not_clean(
+        tmp_path, make_tasks_db):
+    """git discovery failure is recorded, not degraded to an empty sweep."""
+    root = _one_project(tmp_path, make_tasks_db,
+                        sidecar_check=_GREP_CHECK,
+                        task_entry=_entry("gate", _GREP_CHECK))
+    not_a_checkout = tmp_path / "bare"
+    not_a_checkout.mkdir()
+
+    audit = audit_project(str(root), str(not_a_checkout))
+
+    assert audit.coverage.git_discovery_failed is True
+    assert audit.findings == []
+    assert audit.coverage.manifests_swept == 0
+    # NAMED, not merely flagged.
+    assert any("ls-files" in d for d in audit.coverage.uncomparable_details)
+    assert _is_dirty([audit]) is True
+
+
+def test_a_root_with_zero_tracked_manifests_is_clean_not_dirty(
+        tmp_path, make_tasks_db):
+    """THE OTHER HALF, pinned so the distinction cannot collapse.
+
+    A foreign project may legitimately have no capability manifests at all.
+    That is a real, complete, clean sweep of an empty corpus — unlike the
+    discovery FAILURE above, where the corpus size is unknown.
+    """
+    root = _make_project(tmp_path, make_tasks_db, tasks=[_task(100, [])])
+
+    audit = audit_project(str(root))
+
+    assert audit.coverage.manifests_swept == 0
+    assert audit.coverage.git_discovery_failed is False
+    assert _is_dirty([audit]) is False
+
+
+# ---------------------------------------------------------------------------
+# Formatting. Both formatters are PURE — they return str and print nothing;
+# main() does the single print.
+# ---------------------------------------------------------------------------
+
+def _drifted_audit(tmp_path, make_tasks_db):
+    root = _one_project(tmp_path, make_tasks_db,
+                        sidecar_check=_GREP_CHECK,
+                        task_entry=_entry("gate", {**_GREP_CHECK, "pattern": "def bar"}))
+    return audit_project(str(root))
+
+
+def test_formatters_are_pure_and_print_nothing(tmp_path, make_tasks_db, capsys):
+    """Both return str and neither prints — main() does the single print."""
+    audits = [_drifted_audit(tmp_path, make_tasks_db)]
+    capsys.readouterr()
+
+    assert isinstance(format_report(audits), str)
+    assert isinstance(format_json(audits), str)
+    assert capsys.readouterr().out == ""
+
+
+def test_coverage_block_is_printed_even_on_a_zero_finding_sweep(
+        tmp_path, make_tasks_db):
+    """ALWAYS printed. The whole point is that the finding list is a comparison
+    of matched pairs, and a reader must be told the size of the remainder."""
+    root = _one_project(tmp_path, make_tasks_db,
+                        sidecar_check=_GREP_CHECK,
+                        task_entry=_entry("gate", _GREP_CHECK))
+
+    report = format_report([audit_project(str(root))])
+
+    assert "COVERAGE" in report
+    assert _COVERAGE_CAVEAT in report
+
+
+def test_coverage_caveat_is_a_module_constant_not_inline_prose():
+    """Pinned to the constant so the report's honesty claim has ONE home.
+
+    Naming what the sweep can and cannot see is load-bearing, and inline prose
+    in the formatter would let the report and the module's own account of its
+    limits drift apart silently.
+    """
+    assert isinstance(_COVERAGE_CAVEAT, str)
+    assert "COVERAGE" in _COVERAGE_CAVEAT
+    # It must name the missing-entry class's real owner, not imply this sweep
+    # remediates it.
+    assert "audit_combine_gate_marker_loss" in _COVERAGE_CAVEAT
+
+
+def test_report_coverage_rows_render_with_their_column_alignment(
+        tmp_path, make_tasks_db):
+    """WHOLE LINES with their alignment, never a bare digit substring.
+
+    A bare `assert "32" in report` passes off any number anywhere in the text,
+    including a task id, so it cannot tell a correct count from a coincidence.
+    """
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[_task(100, [_entry("other", _GREP_CHECK)])],
+        manifests=[("plans/a-prd.capability-manifest.yaml", _manifest_doc(100))],
+    )
+
+    lines = format_report([audit_project(str(root))]).splitlines()
+
+    assert " manifests swept:                   1" in lines
+    assert " mechanical capabilities compared:  1" in lines
+    assert " capabilities with no task entry:   1" in lines
+    assert " manifest tasks with no db row:     0" in lines
+    assert " unvalidatable task entries:        0" in lines
+    assert " manifests that failed to parse:    0" in lines
+
+
+def test_finding_line_names_manifest_task_capability_and_fields(
+        tmp_path, make_tasks_db):
+    """Every finding line carries the identity triple AND what differs."""
+    report = format_report([_drifted_audit(tmp_path, make_tasks_db)])
+
+    assert format_kv_line([
+        ("manifest", "plans/a-prd.capability-manifest.yaml"),
+        ("task_id", 100),
+        ("capability", "gate"),
+        ("fields", "pattern"),
+    ]) in report.splitlines()
+
+
+def test_report_names_both_roots_so_a_decoupled_run_is_unambiguous(
+        tmp_path, make_tasks_db):
+    root = _make_project(tmp_path, make_tasks_db, tasks=[_task(100, [])])
+    other = _make_project(tmp_path, make_tasks_db, name="other")
+
+    report = format_report([audit_project(str(root), str(other))])
+
+    assert str(root) in report
+    assert str(other) in report
+
+
+def test_report_says_so_prominently_when_git_discovery_failed(
+        tmp_path, make_tasks_db):
+    """A silently-empty corpus must never RENDER as a clean zero either."""
+    root = _make_project(tmp_path, make_tasks_db, tasks=[_task(100, [])])
+    not_a_checkout = tmp_path / "bare"
+    not_a_checkout.mkdir()
+
+    report = format_report([audit_project(str(root), str(not_a_checkout))])
+
+    assert "NOT a clean result" in report
+    assert "manifest corpus could not be enumerated" in report
+
+
+def test_format_json_emits_an_object_with_projects_coverage_and_findings(
+        tmp_path, make_tasks_db):
+    """An OBJECT, not an array: coverage travels WITH the findings, so a
+    machine consumer cannot read the finding list without the caveat."""
+    payload = json.loads(format_json([_drifted_audit(tmp_path, make_tasks_db)]))
+
+    assert isinstance(payload, dict)
+    assert set(payload) >= {"projects"}
+    (project,) = payload["projects"]
+    assert project["project_root"].endswith("proj")
+    assert project["manifest_root"] == project["project_root"]
+    assert project["coverage"]["mechanical_capabilities_compared"] == 1
+    assert project["coverage"]["git_discovery_failed"] is False
+    (finding,) = project["findings"]
+    assert finding["manifest"] == "plans/a-prd.capability-manifest.yaml"
+    assert finding["task_id"] == 100
+    assert finding["capability"] == "gate"
+    assert finding["differing_fields"] == ["pattern"]
+    # BOTH normalized descriptors travel, so a consumer never has to re-read
+    # the two sources to learn what the two spellings actually were.
+    assert finding["sidecar_check"]["pattern"] == "def foo"
+    assert finding["task_check"]["pattern"] == "def bar"
+    # The caveat travels in the payload too, for the same reason.
+    assert _COVERAGE_CAVEAT in json.dumps(payload)
