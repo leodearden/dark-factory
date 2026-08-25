@@ -2209,3 +2209,208 @@ def test_a_double_self_name_misclose_is_refused_and_classified():
     assert outcomes[0].reason == sweep.REASON_UNREPAIRABLE
     assert not sweep.has_leak_signature(_DOUBLE_SELF_NAME)
     assert outcomes[0].residue == sweep.RESIDUE_QUOTED_ONLY
+
+
+# ---------------------------------------------------------------------------
+# task 4696 — the meta-plans lane over the DURABLE per-lane plan store.
+# ---------------------------------------------------------------------------
+#
+# The worktree-lane-lifecycle W11 relocation moved plan state OUT of the lane
+# and into ``<root>/.worktrees/.task-meta/<id>/plan.json``, which is what a live
+# lane's ``.task/plan.json`` symlinks into. The orphaned-lane glob reaches that
+# store only through a lane that still exists to hold the link — so once a lane
+# is reclaimed AND its link is gone, its plan was unreachable by this sweep
+# while remaining the durable artifact. That is where the 2026-08-25
+# measurement found the corruption.
+
+
+@pytest.fixture
+def meta_plans_root(tmp_path) -> Path:
+    """A root holding three meta-root plans: DEAD-corrupt, LIVE-corrupt, clean.
+
+    The liveness axis is the whole point of the lane: ``7002`` still has a
+    ``.worktrees/7002`` directory, so a running task may be reading its plan
+    through the symlink and this sweep must refuse it. ``7001`` has no live
+    lane and no orphaned link either — unreachable by the plans glob, which is
+    exactly the population this lane exists to reach.
+    """
+    root = tmp_path / 'repo'
+    meta = root / '.worktrees' / '.task-meta'
+    write_plan(
+        meta / '7001' / 'plan.json',
+        _self_name_plan(_SELF_NAME_RATIONALE, _SELF_NAME_HOW_PROSE),
+    )
+    write_plan(
+        meta / '7002' / 'plan.json',
+        _self_name_plan(_SELF_NAME_RATIONALE, _SELF_NAME_HOW_PROSE),
+    )
+    write_plan(
+        meta / '7003' / 'plan.json',
+        _self_name_plan(_SELF_NAME_RATIONALE_PROSE, _SELF_NAME_HOW_PROSE),
+    )
+    (root / '.worktrees' / '7002').mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _meta_plan(root: Path, lane_id: str) -> Path:
+    return root / '.worktrees' / '.task-meta' / lane_id / 'plan.json'
+
+
+def _fingerprint(root: Path) -> dict:
+    """Every file's bytes AND st_mtime_ns — the "nothing was written" pin.
+
+    Bytes alone would pass an atomic rewrite that produced identical content,
+    which is still a write: it races the reader this sweep refuses to race.
+    """
+    return {
+        path.relative_to(root).as_posix(): (
+            path.read_bytes(), path.stat().st_mtime_ns
+        )
+        for path in sorted(root.rglob('*'))
+        if path.is_file()
+    }
+
+
+def test_discovery_tags_the_meta_root_plans_with_the_new_lane(meta_plans_root):
+    """(a) The glob is the exact ``<id>/plan.json`` tail under the meta-root."""
+    targets = sweep.discover_targets(meta_plans_root)
+    found = [t for t in targets if t.lane == sweep.LANE_META_PLANS]
+
+    assert [t.path for t in found] == [
+        _meta_plan(meta_plans_root, lane_id) for lane_id in ('7001', '7002', '7003')
+    ]
+    assert sweep.LANE_META_PLANS in sweep._LANE_CHOICES
+
+
+def test_the_meta_plans_lane_selects_the_same_files_as_all(meta_plans_root):
+    """(a, continued) ``--lane meta-plans`` and ``--lane all`` agree here.
+
+    This root holds nothing but meta-root plans, so the two runs must produce
+    identical summaries. A lane constant that discovery tagged but the CLI
+    could not select would be a lane in name only.
+    """
+    scoped, _ = sweep.run_sweep(meta_plans_root, lane=sweep.LANE_META_PLANS)
+    everything, _ = sweep.run_sweep(meta_plans_root, lane='all')
+
+    assert scoped.files_scanned == 3
+    assert scoped.as_dict() == everything.as_dict()
+
+
+def test_the_default_dry_run_reports_the_dead_lane_and_writes_nothing(meta_plans_root):
+    """(b) Dry run IS the periodic detector this task owes.
+
+    One invocation, exit 1, and not one byte written. That is what makes the
+    lane a check rather than a sixth script that would have to re-enumerate the
+    literals (INV-5).
+    """
+    before = _fingerprint(meta_plans_root)
+
+    summary, diffs = sweep.run_sweep(meta_plans_root, lane=sweep.LANE_META_PLANS)
+
+    assert _fingerprint(meta_plans_root) == before, 'a DRY run writes NOTHING'
+    assert summary.repaired == 1, 'only the dead lane is repairable'
+    assert summary.pending == 1
+    assert summary.exit_code() == sweep.EXIT_REPAIRABLE_REMAINS
+    assert len(diffs) == 1 and '7001' in diffs[0]
+
+
+def test_apply_repairs_the_dead_lane_and_refuses_the_live_one(meta_plans_root):
+    """(c) The corpus is PARTITIONED with plan-tools, never raced over it.
+
+    ``7002`` is skipped under the existing REASON_LIVE_LANE_PRESENT, which the
+    lane inherits rather than re-deriving: a live lane's plan belongs to
+    plan-tools' lazy read-back (PRD D4), and that read-back is atomic. Two
+    writers converging on one file is the one shape this split exists to
+    prevent.
+    """
+    live_before = _meta_plan(meta_plans_root, '7002').read_bytes()
+    clean_before = _meta_plan(meta_plans_root, '7003').read_bytes()
+
+    summary, _ = sweep.run_sweep(
+        meta_plans_root, lane=sweep.LANE_META_PLANS, apply=True
+    )
+
+    dead = json.loads(_meta_plan(meta_plans_root, '7001').read_text(encoding='utf-8'))
+    assert dead['design_decisions'][0]['rationale'] == _SELF_NAME_RATIONALE_PROSE
+
+    assert _meta_plan(meta_plans_root, '7002').read_bytes() == live_before, (
+        'a running task must never have its plan rewritten under it'
+    )
+    assert _meta_plan(meta_plans_root, '7003').read_bytes() == clean_before
+
+    assert summary.skipped == {sweep.REASON_LIVE_LANE_PRESENT: 1}
+    assert summary.repaired == 1
+    assert summary.failed == 0
+
+
+def test_a_second_apply_run_over_the_same_tree_exits_clean(meta_plans_root):
+    """(e) The acceptance invariant delta already uses: second run reports 0."""
+    sweep.run_sweep(meta_plans_root, lane=sweep.LANE_META_PLANS, apply=True)
+
+    summary, diffs = sweep.run_sweep(
+        meta_plans_root, lane=sweep.LANE_META_PLANS, apply=True
+    )
+
+    assert summary.pending == 0
+    assert diffs == []
+    assert summary.exit_code() == sweep.EXIT_CLEAN
+
+
+def test_never_touch_still_fires_for_a_meta_plans_shaped_target(meta_plans_root):
+    """(d) The committed-evidence guard is checked BEFORE any location gate."""
+    evidence = (
+        meta_plans_root / '.worktrees' / '.task-meta' / '7004'
+        / 'docs' / 'task-recovery-2026-05-13' / 'worktree-inventory.json'
+    )
+    target = sweep.Target(path=evidence, lane=sweep.LANE_META_PLANS)
+
+    refusal = sweep.resolve_write_target(target, meta_plans_root)
+
+    assert isinstance(refusal, sweep.Refusal)
+    assert refusal.reason == sweep.REASON_NEVER_TOUCH
+
+
+def test_a_meta_plan_resolving_outside_the_root_is_refused(meta_plans_root, tmp_path):
+    """(d, continued) The location gate binds this lane exactly as it binds plans.
+
+    Discovery follows symlinked FILES, so without the containment check the
+    realpath resolution that makes the write land on the right file would just
+    as happily land it outside the repo.
+    """
+    outside = tmp_path / 'elsewhere' / 'plan.json'
+    write_plan(outside, _self_name_plan(_SELF_NAME_RATIONALE, _SELF_NAME_HOW_PROSE))
+    link = _meta_plan(meta_plans_root, '7005')
+    link.parent.mkdir(parents=True, exist_ok=True)
+    os.symlink(str(outside), str(link))
+
+    refusal = sweep.resolve_write_target(
+        sweep.Target(path=link, lane=sweep.LANE_META_PLANS), meta_plans_root
+    )
+
+    assert isinstance(refusal, sweep.Refusal)
+    assert refusal.reason == sweep.REASON_UNSANCTIONED_PLAN_LOCATION
+
+
+def test_an_orphaned_link_and_its_meta_root_target_dedupe_to_one(meta_plans_root):
+    """(f) The same realpath must never be swept twice in one run.
+
+    Both globs now reach the same file whenever an orphaned lane still holds
+    the link. Writing it twice is not merely wasteful — the second pass would
+    re-read the first pass's output, and any asymmetry between them would
+    surface as churn an operator cannot account for.
+    """
+    link = meta_plans_root / '.worktrees-orphaned' / '7001' / '.task' / 'plan.json'
+    link.parent.mkdir(parents=True, exist_ok=True)
+    os.symlink(str(_meta_plan(meta_plans_root, '7001')), str(link))
+
+    discovered = sweep.discover_targets(meta_plans_root)
+    deduped = sweep.dedupe_by_realpath(discovered)
+
+    assert len([t for t in discovered if '7001' in str(t.path)]) == 2
+    survivors = [t for t in deduped if '7001' in str(t.path)]
+    assert [t.lane for t in survivors] == [sweep.LANE_META_PLANS], (
+        'the meta-root target sorts first and claims the realpath'
+    )
+
+    summary, _ = sweep.run_sweep(meta_plans_root, lane='all', apply=True)
+    assert summary.repaired == 1, 'one repair, not two passes over one file'
