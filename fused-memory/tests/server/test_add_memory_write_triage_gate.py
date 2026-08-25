@@ -44,6 +44,7 @@ from fused_memory.server.write_triage import (
     _FAIL_OPEN_STORM_THRESHOLD,
     CANONICAL_ID_KEY,
     FAIL_OPEN_ESCALATION_ID_KEY,
+    OUTCOME_AMENDED,
     OUTCOME_CONTESTED,
     OUTCOME_RESTATED,
     OUTCOME_STORED,
@@ -1091,6 +1092,20 @@ class TestTheFailOpenStormReachesAnOperator:
                 f'only the crossing write may carry an escalation id: {ack!r}'
             )
 
+        # And the write AFTER the crossing is quiet again. The burst is still
+        # over threshold and still inside the window, so a `drain_storm` that
+        # PEEKED instead of draining would hand this write the same summary —
+        # and because the emitter dedupes on its anchor, the symptom would not
+        # be a second record but this id echoed on every ack until the window
+        # rolled. Driving exactly `_FAIL_OPEN_STORM_THRESHOLD` calls, with the
+        # crossing as the last one, could never have caught that.
+        after = await _call(server)
+        assert FAIL_OPEN_ESCALATION_ID_KEY not in after, (
+            f'one crossing files one alarm, and names it once: {after!r}'
+        )
+        assert after[ROUTED_KEY] == OUTCOME_STORED, f'{after!r}'
+        assert len(_filed_escalations(root)) == 1, 'and files it exactly once'
+
     @pytest.mark.asyncio
     async def test_every_project_in_the_window_gets_the_alarm(
         self, tmp_path, monkeypatch,
@@ -1165,7 +1180,7 @@ class TestTheFailOpenStormReachesAnOperator:
 
     @pytest.mark.asyncio
     async def test_an_unknown_project_is_a_quiet_no_op_not_a_blocked_write(
-        self, tmp_path, monkeypatch,
+        self, monkeypatch,
     ) -> None:
         """No resolvable root means no queue to file into — and no failure.
 
@@ -1174,10 +1189,14 @@ class TestTheFailOpenStormReachesAnOperator:
         queued heads-up. A write blocked because triage could not report its
         own degradation would be the exact C1 violation the apparatus exists
         to prevent.
+
+        There is deliberately no `tmp_path` root here. An earlier version made
+        one and asserted no queue appeared under it, which could not fail — the
+        directory was created by the test, named by nothing, and no code path
+        could have written into it. What the no-op has to be observed by is the
+        ACK, and that is what is asserted below.
         """
         _install_counter(monkeypatch)
-        root = tmp_path / 'other'
-        root.mkdir()
         mock_service = AsyncMock()
         _configure_config(mock_service, enabled=True)
         _configure_pass_through_add_memory(mock_service)
@@ -1197,7 +1216,6 @@ class TestTheFailOpenStormReachesAnOperator:
             assert FAIL_OPEN_ESCALATION_ID_KEY not in ack, (
                 f'nothing was filed, so nothing may be named: {ack!r}'
             )
-        assert not (root / 'data' / 'escalations').exists()
         assert mock_service.add_memory.await_count == _FAIL_OPEN_STORM_THRESHOLD
 
 
@@ -1280,6 +1298,58 @@ class TestAnAttachThatDidNotLandIsNotAcked:
 
         assert result[ROUTED_KEY] == OUTCOME_RESTATED, f'{result!r}'
         assert result[CANONICAL_ID_KEY] == 'm1', f'{result!r}'
+
+
+class TestEveryWiredAttachKindReachesThePersistedChild:
+    """Which `kind` an attach outcome writes is a CONTENT-VISIBILITY decision.
+
+    Only `restated` had coverage, so mutating `_TRIAGE_ATTACH_KINDS`'s
+    `amended` entry to `SIGHTING_KIND` passed the whole suite. That mix-up is
+    silent and lossy in one direction: `grouped_read` DIGESTS amendment text
+    into the grouped document and merely COUNTS sightings, so an amendment
+    demoted to a sighting stops being readable — the same C1 content loss the
+    caller-declared-parentage force-store exists to prevent, arriving instead
+    through the wiring table.
+
+    Unreachable until leaf gamma's judge can answer `amended`, which is
+    exactly why it is pinned now: the first real amendment must not be the
+    thing that discovers the table was wrong.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('outcome', 'expected_kind'),
+        [(OUTCOME_RESTATED, SIGHTING_KIND), (OUTCOME_AMENDED, AMENDMENT_KIND)],
+    )
+    async def test_the_verdict_picks_the_child_kind(
+        self, outcome, expected_kind, monkeypatch,
+    ) -> None:
+        counter = _install_counter(monkeypatch)
+        mock_service = AsyncMock()
+        _configure_config(mock_service, enabled=True)
+        _configure_pass_through_add_memory(mock_service)
+        monkeypatch.setattr(
+            tools, 'triage_write',
+            AsyncMock(return_value=BandDecision(
+                outcome, 'canonical-A', 0.95, _T_HIGH, _T_LOW,
+            )),
+        )
+        server = create_mcp_server(mock_service)
+
+        result = await _call(server)
+
+        assert result[ROUTED_KEY] == outcome, f'{result!r}'
+        assert result[CANONICAL_ID_KEY] == 'canonical-A', f'{result!r}'
+        metadata = mock_service.add_memory.await_args.kwargs['metadata']
+        assert metadata['kind'] == expected_kind, (
+            f'the verdict decides how the child READS, not just how it acks: '
+            f'{metadata!r}'
+        )
+        assert metadata[PARENT_ID_KEY] == 'canonical-A', f'{metadata!r}'
+        assert mock_service.add_memory.await_args.kwargs['content'] == _CONTENT, (
+            'C1: the submitted content is what gets attached, verbatim'
+        )
+        assert counter.live_count() == 0, 'a wired attach outcome is not a failure'
 
 
 class TestAVerdictWithNoWiredAttachKindIsVisible:
