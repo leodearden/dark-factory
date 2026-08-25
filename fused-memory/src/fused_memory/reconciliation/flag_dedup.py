@@ -3276,19 +3276,37 @@ _NON_CANCELLED_TASK_STATUSES: list[str] = sorted(
 #: filed' and 'fix task has been filed' are deliberately NOT entries here,
 #: even though they would otherwise widen coverage.
 #:
-#: The seven 'no fix task has been filed'..'not been filed' entries were
-#: added by task 4711 to reach the "no fix task has been filed" complaint
-#: class — the wording of Leo's 2026-08-17 ruling on gate 3841, from the
-#: originating know_live flag e3527208 / dark_factory task 598 — which the
-#: original five "never .../no tracked task" entries did not match. Two
-#: other candidates were considered and deliberately EXCLUDED as
-#: over-broad: 'untracked' (matches unrelated findings like 'The git
-#: working tree has untracked files ...' — cf. flag_types
+#: The seven task-4711 entries below ('no task has been filed' ..
+#: 'task has not been filed') were added to reach the "no fix task has
+#: been filed" complaint class — the wording of Leo's 2026-08-17 ruling on
+#: gate 3841, from the originating know_live flag e3527208 / dark_factory
+#: task 598 — which the original five "never .../no tracked task" entries
+#: did not match. Two other candidates were considered and deliberately
+#: EXCLUDED as over-broad: 'untracked' (matches unrelated findings like
+#: 'The git working tree has untracked files ...' — cf. flag_types
 #: untracked_process_gap, git_working_tree_missing_operator_decision) and
 #: 'no task' (matches 'This flag has no task_id attached, so Stage 2
 #: cannot route it.'). See TestNeverTrackedLexiconWidening in
 #: test_flag_dedup.py for the reproduced counterexamples backing both
 #: exclusions.
+#:
+#: task-4711 REVIEW-AMENDMENT narrowing: the entries below are not the
+#: literal wording first landed. 'no fix task has been filed' was dropped
+#: — it is entirely subsumed by 'no fix task has been' (any text
+#: containing the former already contains the latter), so keeping both was
+#: dead weight in the frozenset. The bare 'no fix task', 'no follow-up
+#: task' and 'not been filed' entries were over-broad generics of exactly
+#: the kind excluded above, reproduced as false candidates: 'no fix task'
+#: matched 'The flag has no fix task id recorded in metadata.';
+#: 'no follow-up task' matched 'No follow-up task ordering is enforced by
+#: the scheduler.'; 'not been filed' matched 'The escalation record shows
+#: the decision has not been filed yet.' (subject is a decision, not a
+#: task). Anchoring each to '...has been'/'task has not been filed'
+#: preserves the originating wording (still reachable as a substring)
+#: while excluding all three counterexamples. An unhyphenated 'no follow
+#: up task has been' variant sits alongside the hyphenated one since
+#: matching is plain substring containment with no whitespace/punctuation
+#: normalisation.
 #:
 #: _STOPWORDS is deliberately NOT extended with 'fix' even though it is now
 #: boilerplate from the "no fix task has been filed" wrapper: stopwording a
@@ -3301,15 +3319,17 @@ _NEVER_TRACKED_PHRASES: frozenset[str] = frozenset({
     'never tracked',
     'never filed as a task',
     'no tracked task',
-    # task 4711 additions — see the docstring above for the negation-token
-    # invariant and the deliberately excluded 'untracked' / 'no task'.
-    'no fix task has been filed',
+    # task 4711 additions, re-anchored by the review-amendment pass — see
+    # the docstring above for the negation-token invariant and the
+    # deliberately excluded/narrowed 'untracked', 'no task', bare 'no fix
+    # task', bare 'no follow-up task' and bare 'not been filed'.
     'no task has been filed',
-    'no fix task',
-    'no follow-up task',
+    'no fix task has been',
+    'no follow-up task has been',
+    'no follow up task has been',
     'no task exists',
     'never been filed',
-    'not been filed',
+    'task has not been filed',
 })
 
 #: Small English + domain stopword set for _significant_terms.  The domain
