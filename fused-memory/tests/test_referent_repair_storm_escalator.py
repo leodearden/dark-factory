@@ -92,6 +92,7 @@ class TestTheFiledEscalation:
 
     def test_carries_the_category_severity_role_and_anchor(self, tmp_path):
         esc_id = _emit(tmp_path)
+        assert esc_id is not None
         record = _filed(tmp_path)[0]
 
         assert record['category'] == 'referent_repair_storm'
@@ -174,6 +175,7 @@ class TestDedupeFold:
         """`queue.get_by_task(anchor, status='pending')` — per-PROJECT, which
         is the whole reason for the module-function shape."""
         first = _emit(tmp_path)
+        assert first is not None
         from escalation.queue import EscalationQueue
 
         EscalationQueue(tmp_path / 'data' / 'escalations').resolve(

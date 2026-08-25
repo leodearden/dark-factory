@@ -26,6 +26,7 @@ import asyncio
 import dataclasses
 import json
 import logging
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -47,7 +48,10 @@ from fused_memory.utils.canonical_labels import Referent
 
 def _repair(**overrides) -> ReferentRepair:
     """A minimally-valid repair record; overrides tune whichever field a test pins."""
-    fields = {
+    # Annotated because the literal below is all-str: without it the inferred
+    # `dict[str, str]` rejects the `**fields` unpack for `ReferentRepair`'s
+    # bool and tuple fields, which only ever arrive via *overrides*.
+    fields: dict[str, Any] = {
         'edge_uuid': 'e1',
         'which_end': 'source',
         'outcome': 'repaired',
