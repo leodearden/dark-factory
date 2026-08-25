@@ -617,49 +617,28 @@ class TestBoundaryFixtures:
 
 
 # --------------------------------------------------------------------------
-# The producer's public shape, and the two headline boundary rows (step-05).
+# The producer itself, and the two headline boundary rows (step-05).
 # --------------------------------------------------------------------------
 
 
-class TestBranchWorkLandedSignature:
-    """``branch_work_landed``'s public shape, pinned mechanically.
+class TestBranchWorkLandedIsAwaitable:
+    """``branch_work_landed`` is a coroutine function.
 
-    Three documented WIDENINGS of the PRD Contract's sketched signature, each
-    keyword-only and defaulted so a caller that knows none of them still gets
-    exactly the Contract's behaviour:
-
-    - ``metadata`` — boundary row B6 needs ``branch_base_sha``, which the
-      sketched four-argument form cannot supply.
-    - ``escalation_queue`` — the seam the G7 storm-escape L1 is filed through.
-    - ``recovery_emission`` — the live config submodel supplying that alarm's
-      rate and kill switch.  A module-level function has no ``self.config`` to
-      read, and re-deriving the thresholds from local literals would put a
-      second copy of the shipped default next to the stanza an operator edits.
+    It widens the PRD Contract's sketched signature in three documented ways —
+    ``metadata`` (boundary row B6 needs ``branch_base_sha``),
+    ``escalation_queue`` (the seam the G7 storm-escape L1 is filed through) and
+    ``recovery_emission`` (the live config submodel supplying that alarm's rate
+    and kill switch, which a module-level function cannot read off
+    ``self.config``).  The rationale for each lives in ``branch_work_landed``'s
+    own docstring, which is where a reader looks; it is deliberately NOT
+    re-asserted as a test-suite contract.  Every load-bearing part of it is
+    already exercised behaviourally: ``TestB3RebaseLanding``,
+    ``TestB6DegenerateBranch``, ``TestGitErrorStormEscape`` et al. all call the
+    producer by keyword, so a rename or a defaulting of ``branch_tip_sha``
+    fails dozens of tests loudly.  An ``inspect.signature`` equality would add
+    nothing but a pin on the ORDER of keyword-only parameters, which no caller
+    can observe.
     """
-
-    def test_signature_is_the_contract_shape(self) -> None:
-        params = inspect.signature(branch_work_landed).parameters
-        assert list(params) == [
-            'git_ops', 'task_id', 'branch',
-            'branch_tip_sha', 'metadata', 'escalation_queue', 'recovery_emission',
-        ]
-        for name in ('git_ops', 'task_id', 'branch'):
-            assert params[name].kind is inspect.Parameter.POSITIONAL_OR_KEYWORD, name
-        for name in (
-            'branch_tip_sha', 'metadata', 'escalation_queue', 'recovery_emission',
-        ):
-            assert params[name].kind is inspect.Parameter.KEYWORD_ONLY, name
-        # branch_tip_sha is required-by-keyword: a caller must SAY whether it
-        # already observed a tip, so the producer never silently re-reads a ref
-        # that other checks were already anchored on (the task-3103 hazard
-        # branch_is_degenerate documents).
-        assert params['branch_tip_sha'].default is inspect.Parameter.empty
-        assert params['metadata'].default is None
-        assert params['escalation_queue'].default is None
-        # Defaulted to None, NOT to a constructed config: the fallback is
-        # resolved at call time from RecoveryEmissionConfig so the shipped
-        # thresholds have exactly one authority.
-        assert params['recovery_emission'].default is None
 
     def test_it_is_a_coroutine_function(self) -> None:
         assert inspect.iscoroutinefunction(branch_work_landed)

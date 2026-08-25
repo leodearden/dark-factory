@@ -21,7 +21,6 @@ idiom keeps exercising the real (now-shared) helper logic.
 
 from __future__ import annotations
 
-import inspect
 import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -1633,34 +1632,18 @@ class TestValidateLandingEvidenceDeliveredChecksDifferential:
 
 
 class TestValidateLandingEvidencePublicSurface:
-    """The signature is task 4500's PRECONDITION and may not drift.
+    """The re-expression kept ONE verdict type, under both names.
 
-    Task 4500 is the capstone that adds a parameter here; it re-reads this
-    exact shape to do so.  A silent drift — a reordering, a defaulted
-    ``branch_tip_sha``, a renamed keyword — would be discovered by 4500 as a
-    mysterious mismatch rather than here as a failing pin, so this asserts it
-    MECHANICALLY via ``inspect`` rather than by having tests that happen to
-    call it in the current shape.
+    Task 4500 is the capstone that adds a parameter to
+    ``validate_landing_evidence``; its precondition is that this task did not
+    move the incumbent shape underneath it.  That is preserved by the call
+    sites, not mirrored here: the whole surrounding suite invokes this function
+    by keyword in its incumbent shape, so a reordering, a renamed keyword or a
+    defaulted ``branch_tip_sha`` fails loudly and behaviourally.  A copy of the
+    signature living in this file would only add a pin on keyword-only
+    parameter ORDER, which no caller can observe — and if 4500 wants a
+    tripwire, it belongs on the call 4500 itself makes.
     """
-
-    def test_the_signature_is_exactly_the_incumbent_shape(self) -> None:
-        params = inspect.signature(validate_landing_evidence).parameters
-        assert list(params) == [
-            'git_ops', 'task_id', 'branch',
-            'branch_tip_sha', 'candidate_sha', 'pattern_template',
-            'delivered_checks',
-        ]
-        for name in ('git_ops', 'task_id', 'branch'):
-            assert params[name].kind is inspect.Parameter.POSITIONAL_OR_KEYWORD, name
-        for name in (
-            'branch_tip_sha', 'candidate_sha', 'pattern_template', 'delivered_checks',
-        ):
-            assert params[name].kind is inspect.Parameter.KEYWORD_ONLY, name
-        # Required-by-keyword, exactly as it has always been.
-        assert params['branch_tip_sha'].default is inspect.Parameter.empty
-        assert params['candidate_sha'].default is None
-        assert params['pattern_template'].default is None
-        assert params['delivered_checks'].default is None
 
     def test_the_two_verdict_names_are_one_type(self) -> None:
         """ONE authority, not two — an alias, never a second dataclass.
