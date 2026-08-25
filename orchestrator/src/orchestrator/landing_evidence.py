@@ -64,6 +64,31 @@ guaranteeing the failure goes unnoticed.  It is rate-gated, deduped and
 kill-switched (``recovery_emission.landing_git_error_escalation_enabled``) so
 the write stays one alarm per storm.
 
+**ONE PRODUCER FAMILY, not two functions** (task 4647).  This module exposes
+two producers — :func:`branch_work_landed` (the PRD Contract's NON-DECAYING
+patch-id policy) and :func:`validate_landing_evidence` (the legacy
+citation + effect-present policy) — and they share every observable:
+
+- ONE verdict type, :class:`LandingVerdict` (``LandingEvidenceVerdict`` is an
+  alias, not a second dataclass), so a consumer never has to know which
+  producer answered in order to read the answer.
+- ONE reason vocabulary, :class:`LandingReason`, carrying the Contract's codes
+  and the legacy ones together.  A second enum would be two authorities that
+  must be kept in step forever, and a code reaching a formatter that cannot
+  explain it renders ``'Unrecognized reason code'`` into an L1 body a human
+  reads.
+- ONE exit path, :func:`_stamped_verdict`, so the tally cannot be bypassed.
+- :attr:`LandingVerdict.method` as the EXPLICIT mode/policy discriminator —
+  the shape the PRD's epsilon bullet mandates in place of two functions a
+  consumer must tell apart by which one it happened to call.  It is what lets
+  epsilon distinguish a verdict from the non-decaying patch-id contract from
+  one produced by the effect-present policy it is retiring.
+
+``validate_landing_evidence`` is therefore best read as a MODE over that
+family rather than as a separate helper: its two arms set
+:attr:`LandingMethod.merge_marker` and :attr:`LandingMethod.citation`, and
+everything else about its public surface is unchanged.
+
 **Two modes**, selected by whether ``candidate_sha`` is given:
 
 - **DISCOVERY** (``candidate_sha=None``) — the branch ref is live: discover
@@ -1040,6 +1065,123 @@ async def _no_op_question(
     return _NoOpQuestion(None, None, False)
 
 
+def _new_probe(
+    *,
+    task_id: str,
+    branch: str,
+    branch_tip_sha: str | None,
+    method: LandingMethod,
+    **extra: Any,
+) -> dict[str, Any]:
+    """Seed the structured-facts probe both producers carry.
+
+    ``method`` is seeded UP FRONT rather than stamped on the accept: WHICH
+    policy answered is a property of the CALL, not of the outcome, and a
+    consumer reading a REJECTED verdict is precisely the one that needs to
+    know whether the answer came from the non-decaying patch-id contract or
+    from the legacy effect-present policy.
+
+    *extra* carries each producer's own seeds — ``upstream_ref`` for
+    :func:`branch_work_landed`, ``effect_check_sha`` and
+    ``delivered_checks_state`` for :func:`validate_landing_evidence`.  They
+    stay per-producer rather than being unioned here: a key seeded for a
+    producer that never writes it would read as "measured, and absent" when
+    the truth is "never asked".
+    """
+    probe: dict[str, Any] = {
+        'task_id': task_id,
+        'branch': branch,
+        'branch_tip_sha': branch_tip_sha,
+        'citation': None,
+        'method': method,
+    }
+    probe.update(extra)
+    return probe
+
+
+def _stamped_verdict(
+    *,
+    accepted: bool,
+    evidence_sha: str | None,
+    reason: LandingReason,
+    probe: dict[str, Any],
+    method: LandingMethod,
+    escalation_queue: EscalationQueue | None,
+    recovery_emission: RecoveryEmissionConfig | None,
+) -> LandingVerdict:
+    """Build, tally and return one verdict — the family's single exit.
+
+    Every verdict either producer returns comes through here, which is what
+    makes the tally trustworthy: a counter that some exits bypass reports a
+    healthier detector than the one that is running, and the one exit most
+    likely to be forgotten is the exception handler — the exact path that
+    matters most.
+
+    ``probe`` is COPIED into the verdict, so the caller may keep mutating its
+    working dict across later arms without retroactively editing a verdict it
+    already returned.
+    """
+    probe['reason'] = reason
+    verdict = LandingVerdict(
+        accepted=accepted,
+        evidence_sha=evidence_sha,
+        reason=reason,
+        probe=dict(probe),
+        method=method,
+    )
+    _observe_landing_verdict(
+        verdict,
+        escalation_queue=escalation_queue,
+        recovery_emission=recovery_emission,
+    )
+    return verdict
+
+
+def _accept_verdict(
+    evidence_sha: str,
+    *,
+    reason: LandingReason,
+    probe: dict[str, Any],
+    method: LandingMethod,
+    escalation_queue: EscalationQueue | None = None,
+    recovery_emission: RecoveryEmissionConfig | None = None,
+) -> LandingVerdict:
+    """An accepted verdict anchored on *evidence_sha*.
+
+    ``reason`` is explicit and not defaulted because the two producers accept
+    under DIFFERENT codes — :attr:`LandingReason.landed` for the Contract's
+    patch-id producer, the legacy :attr:`LandingReason.ok` for
+    :func:`validate_landing_evidence` until epsilon repoints its consumers.
+    Defaulting it would let a caller silently emit the other one's spelling.
+    """
+    return _stamped_verdict(
+        accepted=True, evidence_sha=evidence_sha, reason=reason,
+        probe=probe, method=method,
+        escalation_queue=escalation_queue, recovery_emission=recovery_emission,
+    )
+
+
+def _reject_verdict(
+    reason: LandingReason,
+    *,
+    probe: dict[str, Any],
+    method: LandingMethod,
+    escalation_queue: EscalationQueue | None = None,
+    recovery_emission: RecoveryEmissionConfig | None = None,
+) -> LandingVerdict:
+    """A rejected verdict.  ``evidence_sha`` is always ``None``.
+
+    Structurally, not by convention: a rejected verdict carrying a sha is an
+    invitation for a caller to stamp provenance on evidence this module just
+    refused to attribute.
+    """
+    return _stamped_verdict(
+        accepted=False, evidence_sha=None, reason=reason,
+        probe=probe, method=method,
+        escalation_queue=escalation_queue, recovery_emission=recovery_emission,
+    )
+
+
 async def branch_work_landed(
     git_ops: GitOps,
     task_id: str,
@@ -1243,43 +1385,23 @@ async def branch_work_landed(
         :attr:`LandingMethod.patch_id`.
     """
     upstream = _main_ref(git_ops)
-    probe: dict[str, Any] = {
-        'task_id': task_id,
-        'branch': branch,
-        'branch_tip_sha': branch_tip_sha,
-        'upstream_ref': upstream,
-        'citation': None,
-        # Recorded up front, not only on the accept: WHICH producer answered
-        # is a property of the call, and a consumer reading a rejected verdict
-        # needs to know it came from the patch-id policy and not the legacy
-        # effect-present one.
-        'method': LandingMethod.patch_id,
-    }
-
-    def _finish(verdict: LandingVerdict) -> LandingVerdict:
-        # EVERY exit routes through here — including the except-clause reject
-        # below — so the tally can never under-count the reason that matters
-        # most.  Wholly best-effort inside; it can never break the verdict.
-        _observe_landing_verdict(
-            verdict,
-            escalation_queue=escalation_queue,
-            recovery_emission=recovery_emission,
-        )
-        return verdict
+    probe = _new_probe(
+        task_id=task_id, branch=branch, branch_tip_sha=branch_tip_sha,
+        method=LandingMethod.patch_id, upstream_ref=upstream,
+    )
 
     def _reject(reason: LandingReason) -> LandingVerdict:
-        probe['reason'] = reason
-        return _finish(LandingVerdict(
-            accepted=False, evidence_sha=None, reason=reason,
-            probe=dict(probe), method=LandingMethod.patch_id,
-        ))
+        return _reject_verdict(
+            reason, probe=probe, method=LandingMethod.patch_id,
+            escalation_queue=escalation_queue, recovery_emission=recovery_emission,
+        )
 
     def _accept(evidence_sha: str) -> LandingVerdict:
-        probe['reason'] = LandingReason.landed
-        return _finish(LandingVerdict(
-            accepted=True, evidence_sha=evidence_sha, reason=LandingReason.landed,
-            probe=dict(probe), method=LandingMethod.patch_id,
-        ))
+        return _accept_verdict(
+            evidence_sha, reason=LandingReason.landed, probe=probe,
+            method=LandingMethod.patch_id,
+            escalation_queue=escalation_queue, recovery_emission=recovery_emission,
+        )
 
     try:
         head = branch_tip_sha
@@ -1387,7 +1509,28 @@ async def validate_landing_evidence(
     """Validate already-landed evidence for *task_id* on *branch*.
 
     See the module docstring for the DISCOVERY (``candidate_sha=None``) vs
-    CANDIDATE (``candidate_sha`` given) mode split.
+    CANDIDATE (``candidate_sha`` given) mode split, and for the
+    ONE-PRODUCER-FAMILY shape this function is a MODE of: it sets
+    :attr:`LandingMethod.merge_marker` in CANDIDATE mode and
+    :attr:`LandingMethod.citation` in DISCOVERY mode, so a consumer can read
+    which policy decided without inferring it from the reason code.
+
+    **The reason codes it EMITS are the legacy spellings, deliberately**
+    (task 4647).  ``'ok'`` on accept, ``'no_citation'`` on a DISCOVERY miss and
+    ``'effect_absent'`` on a survival reject — now as :class:`LandingReason`
+    members, which are genuine ``str`` subclasses, so every incumbent
+    comparison against a plain string holds and none of the seven production
+    call sites needs an edit.
+
+    ``no_attribution`` is the Contract's RENAME of ``no_citation``, and it is
+    REGISTERED in :class:`LandingReason` today while this function keeps
+    emitting the old spelling.  Registration is the load-bearing half: it is
+    what guarantees that when leaf epsilon flips the emitted value, no
+    escalation can render the literal ``'Unrecognized reason code'`` into an
+    L1 body — the vocabulary and its operator-facing prose already cover both
+    spellings.  Flipping the EMITTED value is epsilon's edit, made together
+    with repointing the consumers, and doing it here would break the pins in
+    five test files for no gain.
 
     Args:
         git_ops: A ``GitOps`` instance (or a duck-typed stand-in exposing
@@ -1448,33 +1591,38 @@ async def validate_landing_evidence(
     Returns:
         A :class:`LandingVerdict`.
     """
-    probe: dict[str, Any] = {
-        'task_id': task_id,
-        'branch': branch,
-        'branch_tip_sha': branch_tip_sha,
-        'citation': None,
-        'effect_check_sha': None,
+    # THE MODE, made explicit.  The two arms below have always been two
+    # policies; until now the only way to tell which one produced a verdict was
+    # to know which branch the caller's arguments had taken.  Naming it here
+    # makes it readable off the verdict itself.
+    method = (
+        LandingMethod.merge_marker if candidate_sha is not None
+        else LandingMethod.citation
+    )
+    probe = _new_probe(
+        task_id=task_id, branch=branch, branch_tip_sha=branch_tip_sha,
+        method=method,
+        effect_check_sha=None,
         # Supply state, recorded unconditionally — wiring is a property of the
         # CALL SITE, not of the outcome, so an accepted verdict must show it
         # too.  Otherwise the only way to learn a site is unwired is to wait
         # for it to reject.
-        'delivered_checks_state': (
+        delivered_checks_state=(
             'unwired' if delivered_checks is None
             else 'evaluated' if delivered_checks
             else 'none_declared'
         ),
-    }
+    )
 
-    def _reject(reason: str) -> LandingVerdict:
-        probe['reason'] = reason
-        return LandingVerdict(
-            accepted=False, evidence_sha=None, reason=reason, probe=dict(probe),
-        )
+    def _reject(reason: LandingReason) -> LandingVerdict:
+        return _reject_verdict(reason, probe=probe, method=method)
 
     def _accept(evidence_sha: str) -> LandingVerdict:
-        probe['reason'] = 'ok'
-        return LandingVerdict(
-            accepted=True, evidence_sha=evidence_sha, reason='ok', probe=dict(probe),
+        # LEGACY spelling, deliberately.  See this function's docstring: the
+        # Contract's codes are REGISTERED in LandingReason today and epsilon
+        # flips the EMITTED value when it repoints the consumers.
+        return _accept_verdict(
+            evidence_sha, reason=LandingReason.ok, probe=probe, method=method,
         )
 
     if candidate_sha is not None:
@@ -1493,14 +1641,14 @@ async def validate_landing_evidence(
                 git_ops, candidate_sha, delivered_checks, probe,
             ):
                 return _accept(candidate_sha)
-            return _reject('effect_absent')
+            return _reject(LandingReason.effect_absent)
         return _accept(candidate_sha)
 
     citation = await git_ops.find_task_citation_commit(
         task_id, pattern_template=pattern_template,
     )
     if citation is None:
-        return _reject('no_citation')
+        return _reject(LandingReason.no_citation)
     probe['citation'] = citation
 
     # Citation-anchor selection (task 2870, esc-5252-9; formerly the FIX 2
@@ -1557,7 +1705,7 @@ async def validate_landing_evidence(
             anchor_is_branch_tip=anchor_is_branch_tip,
         ):
             return _accept(citation)
-        return _reject('effect_absent')
+        return _reject(LandingReason.effect_absent)
 
     return _accept(citation)
 
