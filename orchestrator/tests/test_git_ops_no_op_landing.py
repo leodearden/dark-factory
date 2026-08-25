@@ -203,6 +203,7 @@ class TestNoOpFixtures:
         assert 'GIT_CEILING_DIRECTORIES' in _Repo(git_repo)._env
 
 
+@pytest.mark.asyncio
 class TestNetDiffIsEmpty:
     """``GitOps.net_diff_is_empty(upstream, head)`` — the no-op predicate.
 
