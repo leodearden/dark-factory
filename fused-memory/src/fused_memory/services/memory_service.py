@@ -4571,7 +4571,7 @@ class MemoryService:
         self, result: Any, *, group_id: str, referents: ReferentSet = (),
         content: str = '', referent_source: str = 'derived',
     ) -> ReconcileStats:
-        """Fold the seven post-write identity/verification sweeps into one call.
+        """Fold the eight post-write identity/verification/repair sweeps into one call.
 
         Task 2202 (W6-β): the single reconcile step ``_execute_graphiti_write``
         runs immediately after ``add_episode``, inside α's (task 2198)
@@ -4608,12 +4608,39 @@ class MemoryService:
         it DETECTS and records, and its ``ReferentStats`` is the structured
         evidence eta acts on.
 
+        ``_repair_episode_referents`` (task 3672, PRD leaf eta) is the EIGHTH
+        and last, and the ONLY WRITING CONSUMER of zeta's detect-only output —
+        it re-derives no verdict of its own, acting on nothing but the findings
+        handed to it. Its placement after zeta is a data dependency (it takes
+        zeta's ``ReferentStats`` as its argument), and its placement after
+        ``_normalize_task_node_names`` is load-bearing in the SAME direction
+        zeta's is, only more so: eta MINTS ``Task N`` nodes and REPOINTS edges
+        onto them, so minting before normalization ran would create exactly the
+        duplicate-name pair that pass exists to collapse — the repair would
+        introduce the disease it was called to cure.
+
+        Running inside this chain is also what satisfies alpha's
+        ``ensure_entity_node`` LOCK CONTRACT: ``_execute_graphiti_write`` wraps
+        this whole call in ``async with _identity_lock_for(group_id)``, and eta
+        performs no locking of its own. That placement is load-bearing, not
+        incidental.
+
+        One repair shape is deliberately NOT automated: a stale sentence still
+        carried by a genuinely VALID edge. ``refresh_entity_summary`` regenerates
+        a summary from the edges that remain, so it cannot remove a sentence
+        whose edge is correct; ``GraphitiBackend.set_entity_summary`` (task 2057)
+        stays the documented MANUAL escape hatch for that case. Overwriting a
+        summary verbatim is not a decision a write-time pass may take unattended.
+
         Each sub-pass runs under its own best-effort guard: a generic
         ``Exception`` is logged and recorded as that sub-pass's label in
         ``ReconcileStats.errors`` (leaving its count at its default — ``0`` for
-        the six int passes, an empty ``ReferentStats`` for zeta), and the
-        remaining sub-passes still run — a single sub-pass failure must
-        never fail the already-committed episode write.
+        the six int passes, an empty ``ReferentStats`` for zeta, an empty
+        ``ReferentRepairStats`` for eta), and the remaining sub-passes still
+        run — a single sub-pass failure must never fail the already-committed
+        episode write. That guarantee is worth most at eta, the one pass that
+        WRITES: its failure is the likeliest to be real, and it arrives after
+        the episode is already durable.
         ``CancelledError``/``KeyboardInterrupt``/``SystemExit`` are never
         swallowed; they propagate immediately and skip any later sub-passes.
 
@@ -4629,7 +4656,8 @@ class MemoryService:
 
         Returns:
             A ReconcileStats aggregating every sub-pass's count, the
-            verification pass's findings, and any per-sub-pass failure labels.
+            verification pass's findings, the repair pass's structured records,
+            and any per-sub-pass failure labels.
         """
         stats = ReconcileStats()
 
@@ -4695,6 +4723,21 @@ class MemoryService:
                 content=content, referent_source=referent_source,
             ),
             ReferentStats(),
+        )
+        # EIGHTH, and constructed sequentially rather than alongside the seven
+        # above, because the coroutine's ARGUMENT is zeta's result: eta consumes
+        # `stats.referent_stats`, which does not exist until the line above has
+        # awaited. That data dependency is the whole ordering constraint, and
+        # writing it this way makes it un-reorderable by accident.
+        #
+        # `stats.referent_stats` is passed even on zeta's failure path, where
+        # `_run_pass` substituted an empty `ReferentStats` — eta then walks no
+        # findings and no-ops, which is the correct degradation: a repair pass
+        # must never act on evidence its detector failed to produce.
+        stats.repair_stats = await _run_pass(
+            '_repair_episode_referents',
+            self._repair_episode_referents(stats.referent_stats, group_id=group_id),
+            ReferentRepairStats(),
         )
         return stats
 

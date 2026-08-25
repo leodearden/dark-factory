@@ -1852,8 +1852,8 @@ class TestEndToEndThroughTheWritePath:
             'name': 'episode-1',
             'source': 'text',
             'referents': {
-                'source': 'explicit',
-                'refs': [{'kind': 'task', 'project_id': None, 'number': '3127'}],
+                'source': 'declared',
+                'refs': [{'kind': 'task', 'project_id': '', 'number': '3127'}],
             },
         }
 
