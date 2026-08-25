@@ -447,7 +447,7 @@ task = mcp__fused-memory__get_task(id=<task_id>, project_root=<project_root>)
 
    **Consequence you must plan around.** A bare `resume` + `granted_files` on a blocked task re-pends it with its ORIGINAL `plan.files`; the re-dispatched agent hits the same scope wall and escalates again — a non-terminating escalate/resume loop. So:
    - Still pass `granted_files` (it is durable and unions in should this task later reach a live L0 resume) — but treat it as a record, not as a mechanism.
-   - If the widened scope must be effective for the next dispatch, `resume` alone does not deliver it. Prefer `promote_to_l2` so a human can widen scope through a path that actually persists, rather than resuming into the loop above.
+   - If the widened scope must be effective for the next dispatch, `resume` alone does not deliver it — and **nothing else does either**: `_set_task_scope` (the only writer of both `plan.files` and `metadata.files`) is reachable only from a live workflow, and an `update_task(metadata={"files": ...})` widens locks but not `plan.files`, then gets narrowed back to `plan.files` by `workflow.py::TaskWorkflow._reconcile_scope_locks` on the next dispatch. So `promote_to_l2` rather than resuming into the loop above — not because the human has a persisting path you lack, but because the real fix is a **re-plan** (the architect is the sanctioned widener) and that is a judgement call above your authority. Say so in the promotion rationale; do not tell the human to "widen the scope" as if a mechanism existed.
 
    A lock conflict is handled orchestrator-side: the scope-widening choke point returns False and the task requeues rather than resuming under another task's file lock. You do **not** need to pre-check locks.
 
