@@ -1271,3 +1271,276 @@ class TestPerFindingFailureContainment:
             await service._repair_episode_referents(
                 _stats(_finding()), group_id='dark_factory',
             )
+
+
+@pytest.mark.asyncio
+class TestReferentRepairStreakSemantics:
+    """INV-4: the consecutive-repair streak, per group_id.
+
+    The counter half of the storm escape.  It copies
+    `MergeWorker._record_runner_unavailable` / `_record_runner_recovered`
+    exactly, including their ASYMMETRY: the streak is cleared only by a
+    POSITIVE health signal (a pass that actually looked and found nothing to
+    repair), never by the mere absence of a failure.  A pass that checked
+    nothing has produced no evidence either way, and letting it clear the
+    streak would make the alarm unreachable in a corpus where most writes
+    carry no referent set at all.
+    """
+
+    async def test_the_streak_map_is_constructed_unconditionally(self, service):
+        """Like the three storm counters already in `__init__`: an alarm bound
+        to a conditionally-constructed component goes dark in exactly the
+        degraded configuration where a repair storm is least likely to be
+        noticed any other way."""
+        assert service._referent_repair_streaks == {}
+        assert isinstance(service._referent_repair_streaks, dict)
+
+    async def test_a_pass_that_repaired_increments_the_streak_by_exactly_one(
+        self, service,
+    ):
+        """The streak counts consecutive EPISODES; the per-episode repair count
+        rides separately, so three repairs in one pass is still +1."""
+        await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory',
+        )
+        assert service._referent_repair_streaks['dark_factory'] == 1
+
+        await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory',
+        )
+        assert service._referent_repair_streaks['dark_factory'] == 2
+
+    async def test_many_repairs_in_one_pass_still_increment_by_one(self, service):
+        service.graphiti.reassign_edge = AsyncMock(side_effect=[
+            _reassigned(uuid='e1'), _reassigned(uuid='e2'), _reassigned(uuid='e3'),
+        ])
+
+        stats = await service._repair_episode_referents(
+            _stats(
+                _finding(edge_uuid='e1'),
+                _finding(edge_uuid='e2'),
+                _finding(edge_uuid='e3'),
+            ),
+            group_id='dark_factory',
+        )
+
+        assert stats.repaired == 3
+        assert service._referent_repair_streaks['dark_factory'] == 1
+
+    async def test_a_pass_that_checked_and_repaired_nothing_resets_the_streak(
+        self, service,
+    ):
+        """The POSITIVE health signal — we looked, the graph was clean."""
+        service._referent_repair_streaks['dark_factory'] = 7
+
+        await service._repair_episode_referents(
+            ReferentStats(edges_scanned=4, endpoints_checked=8),
+            group_id='dark_factory',
+        )
+
+        assert service._referent_repair_streaks['dark_factory'] == 0
+
+    async def test_a_pass_that_checked_nothing_leaves_the_streak_unchanged(
+        self, service,
+    ):
+        """"We did not look" is not evidence of health."""
+        service._referent_repair_streaks['dark_factory'] = 7
+
+        await service._repair_episode_referents(
+            ReferentStats(edges_scanned=0, endpoints_checked=0),
+            group_id='dark_factory',
+        )
+
+        assert service._referent_repair_streaks['dark_factory'] == 7
+
+    async def test_a_checked_nothing_pass_does_not_even_create_the_key(
+        self, service,
+    ):
+        await service._repair_episode_referents(
+            ReferentStats(endpoints_checked=0), group_id='reify',
+        )
+        assert 'reify' not in service._referent_repair_streaks
+
+    async def test_an_unrepairable_only_pass_does_not_increment(self, service):
+        service._referent_repair_streaks['dark_factory'] = 3
+
+        stats = await service._repair_episode_referents(
+            _stats(_finding(resolvable=False, intended_referent=None)),
+            group_id='dark_factory',
+        )
+
+        assert stats.repaired == 0
+        assert service._referent_repair_streaks['dark_factory'] == 0, (
+            'it CHECKED an endpoint and performed no repair — that is the '
+            'reset arm, not the unchanged arm'
+        )
+
+    async def test_a_degenerate_only_pass_does_not_increment(self, service):
+        service._referent_repair_streaks['dark_factory'] = 3
+
+        stats = await service._repair_episode_referents(
+            _stats(
+                _finding(which_end='source', old_endpoint_uuid='n-2520'),
+                _finding(which_end='target', old_endpoint_uuid='n-2520'),
+            ),
+            group_id='dark_factory',
+        )
+
+        assert stats.degenerate_edges == 1
+        assert stats.repaired == 0
+        assert service._referent_repair_streaks['dark_factory'] == 0
+
+    async def test_a_failed_only_pass_does_not_increment(self, service):
+        """A broken backend must never masquerade as a repair storm."""
+        service._referent_repair_streaks['dark_factory'] = 3
+        service.graphiti.ensure_entity_node = AsyncMock(
+            side_effect=RuntimeError('falkor down'),
+        )
+
+        stats = await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory',
+        )
+
+        assert stats.failed == 1
+        assert service._referent_repair_streaks['dark_factory'] == 0
+
+    async def test_a_moved_false_no_op_pass_does_not_increment(self, service):
+        """`reassign_edge`'s corroborate-before-acting no-op: the edge was
+        ALREADY correct, so the graph is healthy, not storming."""
+        service._referent_repair_streaks['dark_factory'] = 3
+        service.graphiti.reassign_edge = AsyncMock(return_value=_reassigned(
+            moved=False, old_endpoint_uuid='n-3127', refreshed_nodes=[],
+        ))
+
+        stats = await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory',
+        )
+
+        assert stats.repaired == 0
+        assert service._referent_repair_streaks['dark_factory'] == 0
+
+    async def test_streaks_are_independent_per_group_id(self, service):
+        """The escalation queue is per-project: a regression in one project's
+        graph must not be masked by another project's clean writes."""
+        await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory',
+        )
+        await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory',
+        )
+        assert service._referent_repair_streaks['dark_factory'] == 2
+        assert 'reify' not in service._referent_repair_streaks
+
+        # A clean pass in `reify` must not touch dark_factory's streak.
+        await service._repair_episode_referents(
+            ReferentStats(endpoints_checked=4), group_id='reify',
+        )
+        assert service._referent_repair_streaks['reify'] == 0
+        assert service._referent_repair_streaks['dark_factory'] == 2
+
+        # ...and a repair in `reify` does not increment dark_factory's.
+        await service._repair_episode_referents(
+            _stats(_finding()), group_id='reify',
+        )
+        assert service._referent_repair_streaks['reify'] == 1
+        assert service._referent_repair_streaks['dark_factory'] == 2
+
+
+@pytest.mark.asyncio
+class TestReferentRepairCountsAccessor:
+    """The read side leaf IOTA consumes."""
+
+    async def test_every_bucket_exists_from_construction(self, service):
+        """A reader never has to distinguish "zero" from "absent"."""
+        counts = service.referent_repair_counts()
+        assert counts == {
+            'repaired': 0,
+            'flagged_unrepairable': 0,
+            'failed': 0,
+            'nodes_minted': 0,
+            'nodes_deleted': 0,
+            'streaks': {},
+        }
+
+    async def test_totals_are_process_lifetime_not_per_episode(self, service):
+        service.graphiti.reassign_edge = AsyncMock(side_effect=[
+            _reassigned(uuid='e1'), _reassigned(uuid='e2'),
+        ])
+
+        await service._repair_episode_referents(
+            _stats(_finding(edge_uuid='e1')), group_id='dark_factory',
+        )
+        await service._repair_episode_referents(
+            _stats(
+                _finding(edge_uuid='e2'),
+                _finding(edge_uuid='e9', resolvable=False, intended_referent=None),
+            ),
+            group_id='dark_factory',
+        )
+
+        counts = service.referent_repair_counts()
+        assert counts['repaired'] == 2
+        assert counts['flagged_unrepairable'] == 1
+
+    async def test_totals_accumulate_across_group_ids(self, service):
+        await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory',
+        )
+        await service._repair_episode_referents(
+            _stats(_finding()), group_id='reify',
+        )
+
+        assert service.referent_repair_counts()['repaired'] == 2
+
+    async def test_minted_and_deleted_are_reported(self, service):
+        service.graphiti.ensure_entity_node = AsyncMock(return_value='n-3127')
+        service.graphiti.get_nodes_by_exact_name = AsyncMock(return_value=[])
+        service.graphiti.get_valid_edges_for_node = AsyncMock(return_value=[])
+
+        await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory',
+        )
+
+        counts = service.referent_repair_counts()
+        assert counts['nodes_minted'] == 1
+        assert counts['nodes_deleted'] == 1
+
+    async def test_failed_is_reported_separately_from_flagged(self, service):
+        service.graphiti.ensure_entity_node = AsyncMock(
+            side_effect=RuntimeError('falkor down'),
+        )
+
+        await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory',
+        )
+
+        counts = service.referent_repair_counts()
+        assert counts['failed'] == 1
+        assert counts['flagged_unrepairable'] == 0
+
+    async def test_live_streaks_ride_alongside_the_totals(self, service):
+        await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory',
+        )
+
+        counts = service.referent_repair_counts()
+        assert counts['streaks'] == {'dark_factory': 1}
+
+    async def test_returns_a_copy_the_caller_cannot_use_to_mutate_state(
+        self, service,
+    ):
+        """A read-only escape hatch a consumer can write through is not an
+        escape hatch."""
+        await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory',
+        )
+
+        counts = service.referent_repair_counts()
+        counts['repaired'] = 9999
+        counts['streaks']['dark_factory'] = 9999
+        counts['streaks']['injected'] = 1
+
+        fresh = service.referent_repair_counts()
+        assert fresh['repaired'] == 1
+        assert fresh['streaks'] == {'dark_factory': 1}
+        assert service._referent_repair_streaks == {'dark_factory': 1}
