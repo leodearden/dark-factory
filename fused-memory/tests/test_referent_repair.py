@@ -1831,3 +1831,143 @@ class TestTheStormGateProjectRoot:
         assert _escalations(to_thread_spy) == [], (
             'no root is a REFUSAL to file, never a guess at one'
         )
+
+
+@pytest.mark.asyncio
+class TestEndToEndThroughTheWritePath:
+    """The PRD's user-observable signal, driven through `_execute_graphiti_write`.
+
+    A write about Task 3127 whose edge landed on the `Task 3129` node: after
+    the episode commits, the edge hangs off `Task 3127` and the `Task 3129`
+    node's summary no longer carries the sentence. Every earlier test in this
+    file drives `_repair_episode_referents` directly; this one is the only
+    proof that the chain actually reaches it, under the lock, on a real payload.
+    """
+
+    @staticmethod
+    def _payload() -> dict:
+        return {
+            'content': 'Task 3127 landed the referent repair path.',
+            'group_id': 'dark_factory',
+            'name': 'episode-1',
+            'source': 'text',
+            'referents': {
+                'source': 'explicit',
+                'refs': [{'kind': 'task', 'project_id': None, 'number': '3127'}],
+            },
+        }
+
+    @staticmethod
+    def _result():
+        from _fm_helpers import MockAddEpisodeResult, MockEdge, MockNode
+
+        result = MockAddEpisodeResult(
+            edges=[MockEdge(
+                fact='the referent repair path landed on main',
+                uuid='e1',
+                source_node_uuid='n-3129',
+                target_node_uuid='n-worker',
+            )],
+            nodes=[
+                MockNode(name='Task 3129', uuid='n-3129'),
+                MockNode(name='merge worker', uuid='n-worker'),
+            ],
+        )
+        result.entity_edges = []
+        return result
+
+    async def test_the_whole_path_repairs_the_conflated_endpoint(self, service):
+        service.graphiti.add_episode = AsyncMock(return_value=self._result())
+        service.graphiti.get_nodes_by_exact_name = AsyncMock(return_value=[])
+        service.graphiti.ensure_entity_node = AsyncMock(return_value='n-3127')
+        service.graphiti.reassign_edge = AsyncMock(return_value=_reassigned(
+            refreshed_nodes=[],
+        ))
+        service.graphiti.get_valid_edges_for_node = AsyncMock(return_value=[
+            {'uuid': 'e-other'},
+        ])
+
+        await service._execute_graphiti_write('add_episode', self._payload())
+
+        service.graphiti.ensure_entity_node.assert_awaited_once_with(
+            'Task 3127', group_id='dark_factory',
+        )
+        service.graphiti.reassign_edge.assert_awaited_once_with(
+            'e1', 'n-3127', which_end='source', group_id='dark_factory',
+        )
+        refreshed = {
+            call.args[0]
+            for call in service.graphiti.refresh_entity_summary.await_args_list
+        }
+        assert 'n-3129' in refreshed, (
+            "the PRD's observable signal: the Task 3129 summary is regenerated "
+            'so it no longer carries the sentence'
+        )
+
+    async def test_the_repair_is_structurally_recorded_on_the_aggregate(
+        self, service,
+    ):
+        """INV-2 all the way out to the caller, not just inside the pass."""
+        recorded: list[ReconcileStats] = []
+        real_reconcile = service._reconcile_episode_identity
+
+        async def _capture(*args, **kwargs):
+            stats = await real_reconcile(*args, **kwargs)
+            recorded.append(stats)
+            return stats
+
+        service._reconcile_episode_identity = _capture
+        service.graphiti.add_episode = AsyncMock(return_value=self._result())
+        service.graphiti.get_nodes_by_exact_name = AsyncMock(return_value=[])
+        service.graphiti.ensure_entity_node = AsyncMock(return_value='n-3127')
+        service.graphiti.reassign_edge = AsyncMock(return_value=_reassigned())
+        service.graphiti.get_valid_edges_for_node = AsyncMock(
+            return_value=[{'uuid': 'e-other'}],
+        )
+
+        await service._execute_graphiti_write('add_episode', self._payload())
+
+        stats, = recorded
+        assert isinstance(stats.repair_stats, ReferentRepairStats)
+        assert stats.repair_stats.repaired == 1
+        record, = stats.repair_stats.repairs
+        assert record.outcome == 'repaired'
+        assert record.edge_uuid == 'e1'
+        assert record.which_end == 'source'
+        assert record.old_endpoint_uuid == 'n-3129'
+        assert record.new_endpoint_uuid == 'n-3127'
+        assert record.intended_referent == 'Task 3127'
+
+    async def test_the_identity_lock_is_held_while_ensure_entity_node_runs(
+        self, service,
+    ):
+        """ALPHA'S LOCK CONTRACT, checked rather than assumed.
+
+        `ensure_entity_node`'s docstring states that callers MUST hold
+        `_identity_lock_for(group_id)` — it performs no locking of its own, and
+        a concurrent same-group writer between its resolve and its mint
+        produces exactly the duplicate-name pair the identity gate exists to
+        prevent. eta satisfies that by PLACEMENT, which is precisely the kind
+        of guarantee that decays silently under refactoring unless a test
+        observes it from INSIDE the call.
+        """
+        held: list[bool] = []
+
+        async def _observe_lock(_name, *, group_id, **_kw):
+            held.append(service.graphiti._identity_lock_for(group_id).locked())
+            return 'n-3127'
+
+        service.graphiti.add_episode = AsyncMock(return_value=self._result())
+        service.graphiti.get_nodes_by_exact_name = AsyncMock(return_value=[])
+        service.graphiti.ensure_entity_node = AsyncMock(side_effect=_observe_lock)
+        service.graphiti.reassign_edge = AsyncMock(return_value=_reassigned())
+        service.graphiti.get_valid_edges_for_node = AsyncMock(
+            return_value=[{'uuid': 'e-other'}],
+        )
+
+        await service._execute_graphiti_write('add_episode', self._payload())
+
+        assert held == [True], (
+            'ensure_entity_node ran OUTSIDE the per-group identity lock — '
+            "alpha's contract is violated by placement"
+        )
