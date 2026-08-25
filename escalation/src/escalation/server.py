@@ -781,6 +781,7 @@ def create_server(
     harness: Any = None,
     dedupe_config: DedupeConfig | None = None,
     task_status_lookup: Callable[[str], Awaitable[str | None]] | None = None,
+    task_claimant_lookup: Callable[[str], Awaitable[str | None]] | None = None,
     merge_inflight_registry: Any = None,
     startup_sweep: bool = True,
     startup_sweep_now: datetime | None = None,
@@ -804,6 +805,19 @@ def create_server(
     already in a terminal state (``'done'`` or ``'cancelled'``).  When omitted
     (the default), the auto-resolve chokepoint is disabled and all escalations
     are submitted normally.
+
+    *task_claimant_lookup* is the deliberate MIRROR of *task_status_lookup*
+    (task 3550): an optional async callable ``(task_id) -> str|None`` returning
+    the task's current ``claimant_run_id``.  When provided, ``escalate_blocker``
+    and ``escalate_info`` stamp that value onto the filed record's
+    ``filing_claimant_run_id``, which is what lets ``escalation.pins`` Link 4
+    tell a LIVE agent handoff from one filed by a dead incarnation.  The DB row
+    is the right source because it holds the identity ``TaskWorkflow``'s
+    dispatch stamp wrote via ``shared.task_claimant.compose_claimant_run_id``,
+    so an agent-filed escalation carries the identity of the incarnation that
+    dispatched that agent.  When omitted (the default — the standalone
+    escalation server, and every caller that predates 3550) the field stays
+    ``None``, which ``pins`` reads as UNKNOWN and fails safe to pinning.
 
     *merge_inflight_registry* is an optional ``InFlightMergeRegistry`` injected
     for testing.  When *merge_queue* is not None and no registry is supplied, a
@@ -934,6 +948,10 @@ def create_server(
             '',
             str(record.get('raw_value') or ''),
         ])
+        # Task 3550 deliberately does NOT stamp filing_claimant_run_id here:
+        # filed under the synthetic _MARKUP_RESIDUE_ANCHOR_TASK_ID and bypassing
+        # _chokepoint_or_submit entirely, so no task-workflow incarnation filed it
+        # and there is no honest identity to record.
         esc = Escalation(
             id=queue.make_id(_MARKUP_RESIDUE_ANCHOR_TASK_ID),
             task_id=_MARKUP_RESIDUE_ANCHOR_TASK_ID,
@@ -1012,6 +1030,9 @@ def create_server(
             return open_alarm.id
 
         outcome = record.get('outcome')
+        # Task 3550: unstamped by design — synthetic _MARKUP_STORM_ANCHOR_TASK_ID,
+        # level=1 (pins Link 3 -> QUEUE_HANDOFF regardless of filing identity),
+        # and not filed by any task-workflow incarnation.
         return queue.submit(Escalation(
             id=queue.make_id(_MARKUP_STORM_ANCHOR_TASK_ID),
             task_id=_MARKUP_STORM_ANCHOR_TASK_ID,
@@ -1170,6 +1191,9 @@ def create_server(
             if storm is None:
                 return
             labels = ', '.join(storm['labels']) or l2_id
+            # Task 3550: unstamped by design — synthetic anchor task id and
+            # severity='info' (pins Link 1 -> NON_PINNING), so the filing
+            # identity is never read, and no incarnation filed it anyway.
             _submit_or_dedupe(Escalation(
                 # Filed under the synthetic anchor, NOT the triggering promote's
                 # task_id — see _AMENDMENT_TRUNCATION_ANCHOR_TASK_ID.
@@ -1315,6 +1339,38 @@ def create_server(
                any other status or None → submit normally
           On any exception from the lookup: fail-open to _submit_or_dedupe (never drop).
         """
+        # Task 3550 — stamp the FILING incarnation, ABOVE everything else.
+        #
+        # Placement is the whole design: this runs before the C4/D3 downgrade,
+        # before the born-at-L2 `esc.level = 2` assignment, and before all four
+        # gates, so EVERY exit path carries the identity — the two bypass
+        # gates, the lookup-disabled gate, _submit_or_dedupe, the fail-open
+        # except branch below, and the terminal-task submit_resolved
+        # auto-resolve.  No gate can lose it, so those cases need no
+        # special-casing.
+        #
+        # `escalation.pins` Link 4 reads this to tell a LIVE agent handoff from
+        # one filed by a dead incarnation.  None means UNKNOWN, which pins
+        # fails safe to pinning — so every degraded path here leaves it None
+        # rather than inventing a value.
+        if task_claimant_lookup is not None and not esc.filing_claimant_run_id:
+            # Never overwrite a caller-supplied value.
+            try:
+                _claimant = await task_claimant_lookup(esc.task_id)
+            except Exception as exc:
+                # Same fail-open discipline as gate 4's status lookup: a
+                # filing must NEVER be dropped because an identity lookup
+                # broke.  Loud, not silent — the record is named at WARNING.
+                logger.warning(
+                    'task_claimant_lookup raised for task %s, leaving filing '
+                    'identity unknown: %s',
+                    esc.task_id, exc,
+                )
+            else:
+                # Normalise blank/whitespace-only to None so an empty string
+                # never reaches pins._norm_id as a pseudo-value.
+                esc.filing_claimant_run_id = (_claimant or '').strip() or None
+
         # C4/D3: Agent-role severity downgrade — runs FIRST, before the born-at-L2
         # stamp, so the existing level=2 gate and the _submit_or_dedupe L2-bypass
         # both naturally observe 'blocking' and route the downgraded record through
@@ -2541,6 +2597,9 @@ def create_server(
         # Create path: build a fresh L2 and submit it.
         # Deduplicate member_ids via dict.fromkeys so duplicate ids in the input
         # do not create duplicate entries in the on-disk record.
+        # Task 3550: unstamped by design — level=2 (pins Link 3 -> QUEUE_HANDOFF
+        # regardless of filing identity) and filed by a human/watcher promotion,
+        # not by a task-workflow incarnation.
         esc = Escalation(
             id=queue.make_id(task_id),
             task_id=task_id,

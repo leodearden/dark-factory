@@ -7773,12 +7773,12 @@ class TestFilingClaimantIdentityStamp:
         esc = queue.get(result['id'])
         assert esc is not None
         assert esc.filing_claimant_run_id is None
+        warnings = [
+            r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
+        ]
         assert any(
-            'task_claimant_lookup' in r.message % r.args if r.args else
-            'task_claimant_lookup' in r.message
-            for r in caplog.records
-        ), f'expected a WARNING naming task_claimant_lookup, got: {caplog.text}'
-        assert 'task-999' in caplog.text
+            'task_claimant_lookup' in m and 'task-999' in m for m in warnings
+        ), f'expected a WARNING naming task_claimant_lookup and the task: {warnings}'
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize('returned', [None, '', '   '])
