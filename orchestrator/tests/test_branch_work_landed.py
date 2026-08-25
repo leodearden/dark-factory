@@ -745,3 +745,275 @@ class TestB5GenuinelyUnlanded:
         assert 'Unrecognized reason code' not in summary
         assert 'genuinely absent from main' in detail
         assert 'not_landed' in summary
+
+
+# --------------------------------------------------------------------------
+# The rejection rows and THE ORDERING RULE (step-07).
+# --------------------------------------------------------------------------
+
+
+def _spy_on_method(monkeypatch: pytest.MonkeyPatch, obj: object, name: str) -> list[tuple]:
+    """Wrap ``obj.name`` so calls are recorded, and still run the real thing.
+
+    A WRAPPER, never a stub: the ordering assertions must not change what the
+    producer actually decides, or "the guard ran first" would be pinned
+    against a fixture the guard never really saw.
+    """
+    calls: list[tuple] = []
+    original = getattr(obj, name)
+
+    async def _recording(*args: object, **kwargs: object) -> object:
+        calls.append((args, kwargs))
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(obj, name, _recording)
+    return calls
+
+
+def _spy_on_patch_content_contained(monkeypatch: pytest.MonkeyPatch) -> list[tuple]:
+    """Spy on the lazily-imported ``git cherry`` helper.
+
+    ``branch_work_landed`` imports it INSIDE the function (merge_queue.py
+    imports back from landing_evidence at module level, so a top-level reverse
+    import would be a cycle), which is exactly what makes patching the module
+    attribute effective: the lookup happens at call time.
+    """
+    import orchestrator.merge_queue as mq
+
+    calls: list[tuple] = []
+    original = mq.patch_content_contained
+
+    async def _recording(*args: object, **kwargs: object) -> object:
+        calls.append((args, kwargs))
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(mq, 'patch_content_contained', _recording)
+    return calls
+
+
+@pytest.mark.asyncio
+class TestB4NoOpLanding:
+    """B4 — a genuine merge marker over a branch that delivered nothing.
+
+    The task-1175 shape: every commit on the branch is real work, but the
+    branch's NET contribution relative to its fork point is empty (added then
+    removed).  Stamping it done records a task as delivered when nothing
+    shipped.
+    """
+
+    async def test_no_op_landing_is_rejected(
+        self, git_ops: GitOps, repo: _Repo,
+    ) -> None:
+        sc = build_no_op_landing(repo)
+        verdict = await branch_work_landed(
+            git_ops, TASK_ID, sc.branch,
+            branch_tip_sha=sc.branch_tip_sha, metadata=sc.metadata,
+        )
+        assert verdict.accepted is False
+        assert verdict.reason is LandingReason.no_op_landing
+        assert verdict.evidence_sha is None
+
+    async def test_the_merge_marker_and_the_citation_are_both_genuine(
+        self, git_ops: GitOps, repo: _Repo,
+    ) -> None:
+        """What makes B4 hard: nothing about the LANDING is fake.
+
+        A merge commit exists on main and its subject cites the task, so every
+        marker-based and citation-based check reads this as a confident
+        landing.  Only the net-contribution question separates it from a real
+        one.
+        """
+        sc = build_no_op_landing(repo)
+        assert f'Merge {sc.branch} into main' in repo.subjects('main')
+        assert await git_ops.find_task_citation_commit(TASK_ID) is not None
+        verdict = await branch_work_landed(
+            git_ops, TASK_ID, sc.branch,
+            branch_tip_sha=sc.branch_tip_sha, metadata=sc.metadata,
+        )
+        assert verdict.reason is LandingReason.no_op_landing
+
+    async def test_rejection_renders_without_an_unrecognized_reason(
+        self, git_ops: GitOps, repo: _Repo,
+    ) -> None:
+        sc = build_no_op_landing(repo)
+        verdict = await branch_work_landed(
+            git_ops, TASK_ID, sc.branch,
+            branch_tip_sha=sc.branch_tip_sha, metadata=sc.metadata,
+        )
+        summary, detail = format_unattributed_landing_detail(TASK_ID, sc.branch, verdict)
+        assert 'Unrecognized reason code' not in detail
+        assert 'Unrecognized reason code' not in summary
+        assert 'NO NET CHANGE' in detail
+
+
+@pytest.mark.asyncio
+class TestOrderingRule:
+    """THE NORMATIVE ORDERING RULE — Contract invariant 2.
+
+    ``degenerate_branch`` -> ``no_op_landing`` -> patch-id -> landed/not_landed,
+    and the order is normative rather than merely defensive.  BOTH guards
+    describe states in which the patch-id arm would confidently accept:
+
+    * a no-op merge has every branch commit patch-id-present in main (they
+      really were merged) AND an empty net diff;
+    * a degenerate branch is patch-id-contained in main BY CONSTRUCTION — it
+      is parked at an old main commit and contributes nothing of its own.
+
+    Run in the wrong order the producer attributes a foreign commit's content
+    to the task with full confidence, which is worse than any false negative.
+    """
+
+    async def test_no_op_outranks_patch_id_acceptance(
+        self, git_ops: GitOps, repo: _Repo,
+    ) -> None:
+        """The adversarial case, with BOTH preconditions asserted first."""
+        sc = build_no_op_landing(repo)
+
+        # Precondition 1: the patch-id arm WOULD accept — every branch commit
+        # is present in main as an equivalent patch.
+        from orchestrator.merge_queue import patch_content_contained
+        assert await patch_content_contained(sc.branch_tip_sha, 'main', git_ops) is True
+        # Precondition 2: ...and the branch's net contribution is empty.
+        assert await git_ops.net_diff_is_empty('main', sc.branch_tip_sha) is True
+
+        verdict = await branch_work_landed(
+            git_ops, TASK_ID, sc.branch,
+            branch_tip_sha=sc.branch_tip_sha, metadata=sc.metadata,
+        )
+        assert verdict.reason is LandingReason.no_op_landing, (
+            'the no-op guard must run BEFORE patch-id acceptance'
+        )
+        assert verdict.accepted is False
+
+    async def test_no_op_guard_short_circuits_before_the_patch_id_arm(
+        self, git_ops: GitOps, repo: _Repo, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Ordering asserted MECHANICALLY, not just by outcome."""
+        sc = build_no_op_landing(repo)
+        no_op_calls = _spy_on_method(monkeypatch, git_ops, 'net_diff_is_empty')
+        cherry_calls = _spy_on_patch_content_contained(monkeypatch)
+
+        verdict = await branch_work_landed(
+            git_ops, TASK_ID, sc.branch,
+            branch_tip_sha=sc.branch_tip_sha, metadata=sc.metadata,
+        )
+        assert verdict.reason is LandingReason.no_op_landing
+        assert len(no_op_calls) == 1, 'the no-op guard must run'
+        assert cherry_calls == [], (
+            'a rejected no-op must never reach the patch-id arm'
+        )
+
+    async def test_degenerate_guard_runs_before_the_no_op_check_and_patch_id(
+        self, git_ops: GitOps, repo: _Repo, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The degenerate arm is FIRST, asserted by what never runs.
+
+        A branch parked at an old main commit is patch-id-contained by
+        construction, so both later arms would answer about main's history
+        rather than about the task.
+        """
+        sc = build_degenerate_branch(repo)
+        no_op_calls = _spy_on_method(monkeypatch, git_ops, 'net_diff_is_empty')
+        cherry_calls = _spy_on_patch_content_contained(monkeypatch)
+
+        verdict = await branch_work_landed(
+            git_ops, TASK_ID, sc.branch,
+            branch_tip_sha=sc.branch_tip_sha, metadata=sc.metadata,
+        )
+        assert verdict.reason is LandingReason.degenerate_branch
+        assert no_op_calls == [], 'the no-op check must not run for a degenerate branch'
+        assert cherry_calls == [], 'the patch-id arm must not run for a degenerate branch'
+
+
+@pytest.mark.asyncio
+class TestB6DegenerateBranch:
+    """B6 — a provisioning-only branch that never advanced past its base (#1226)."""
+
+    async def test_degenerate_branch_is_rejected_as_degenerate(
+        self, git_ops: GitOps, repo: _Repo,
+    ) -> None:
+        sc = build_degenerate_branch(repo)
+        assert sc.branch_tip_sha == sc.branch_base_sha
+        verdict = await branch_work_landed(
+            git_ops, TASK_ID, sc.branch,
+            branch_tip_sha=sc.branch_tip_sha, metadata=sc.metadata,
+        )
+        assert verdict.accepted is False
+        assert verdict.reason is LandingReason.degenerate_branch
+        assert verdict.evidence_sha is None
+
+    async def test_it_would_otherwise_read_as_a_confident_landing(
+        self, git_ops: GitOps, repo: _Repo,
+    ) -> None:
+        """Why the row exists: containment says YES for a branch with no work."""
+        sc = build_degenerate_branch(repo)
+        from orchestrator.merge_queue import patch_content_contained
+        assert await patch_content_contained(sc.branch_tip_sha, 'main', git_ops) is True, (
+            'a parked branch is patch-id-contained in main by construction'
+        )
+
+    async def test_rejection_renders_without_an_unrecognized_reason(
+        self, git_ops: GitOps, repo: _Repo,
+    ) -> None:
+        sc = build_degenerate_branch(repo)
+        verdict = await branch_work_landed(
+            git_ops, TASK_ID, sc.branch,
+            branch_tip_sha=sc.branch_tip_sha, metadata=sc.metadata,
+        )
+        summary, detail = format_unattributed_landing_detail(TASK_ID, sc.branch, verdict)
+        assert 'Unrecognized reason code' not in detail
+        assert 'Unrecognized reason code' not in summary
+        assert 'branch_base_sha' in detail
+
+
+@pytest.mark.asyncio
+class TestDegenerateArmBackwardCompatibility:
+    """Absent or malformed ``branch_base_sha`` must cost nothing.
+
+    The same backward-compatible posture ``branch_is_degenerate`` already
+    documents: pre-#1226 tasks and tasks whose metadata write failed
+    transiently have no recorded base, and a producer that treated "no base"
+    as "degenerate" would reject every one of them.
+    """
+
+    async def test_metadata_none_falls_through_to_the_normal_arms(
+        self, git_ops: GitOps, repo: _Repo,
+    ) -> None:
+        sc = build_unlanded_branch(repo)
+        verdict = await branch_work_landed(
+            git_ops, TASK_ID, sc.branch,
+            branch_tip_sha=sc.branch_tip_sha, metadata=None,
+        )
+        assert verdict.reason is LandingReason.not_landed
+
+    async def test_malformed_branch_base_sha_falls_through(
+        self, git_ops: GitOps, repo: _Repo,
+    ) -> None:
+        sc = build_unlanded_branch(repo)
+        for bogus in ('', 'not-a-sha', 'ABCDEF' * 6 + 'abcd', 123, None):
+            verdict = await branch_work_landed(
+                git_ops, TASK_ID, sc.branch,
+                branch_tip_sha=sc.branch_tip_sha,
+                metadata={'branch_base_sha': bogus},
+            )
+            assert verdict.reason is LandingReason.not_landed, bogus
+
+    async def test_a_degenerate_branch_without_metadata_is_not_called_degenerate(
+        self, git_ops: GitOps, repo: _Repo,
+    ) -> None:
+        """The cost of the backward-compatible posture, pinned rather than hidden.
+
+        Without the recorded base the producer CANNOT know the branch never
+        advanced, so it falls through — and lands on ``no_attribution``,
+        because nothing on main cites the task and no equivalent commit
+        resolves for a tip that contributed nothing.  A refusal, not a
+        confident accept: the fall-through degrades legibility, never safety.
+        """
+        sc = build_degenerate_branch(repo)
+        verdict = await branch_work_landed(
+            git_ops, TASK_ID, sc.branch,
+            branch_tip_sha=sc.branch_tip_sha, metadata=None,
+        )
+        assert verdict.reason is not LandingReason.degenerate_branch
+        assert verdict.reason is LandingReason.no_attribution
+        assert verdict.accepted is False
