@@ -15,7 +15,10 @@ write boundary is guarded now. The measured answer, recorded in full in
     both records.
 
 This module makes those claims executable rather than prose, replayed against
-the two preserved records themselves.
+the two preserved records themselves — plus their clean sibling `esc-3514-2`,
+preserved as a NEGATIVE control so that the one predicate a future sweep must
+not use (`evidence == []`, which the clean record shares) fails a test rather
+than merely contradicting a paragraph.
 
 AUTHORING RULE, mandatory in this file — the same rule
 `shared/tests/fixtures/toolcall_markup_corpus.README.md` rule 1 states.
@@ -50,20 +53,19 @@ LT = chr(0x3C)
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures" / "markup_specimens"
 
-# Digests recorded in prerequisite pre-1 (commit 53a0f25839) against the SOURCE
-# records under `data/escalations/archive/`, before any re-encoding.
-#
 # `parsed_sha256` is sha256(json.dumps(obj, sort_keys=True)) — the parsed-VALUE
-# digest. It is what proves the escaping applied to the committed text
-# is lossless: the file text changes, the parsed value does not.
+# digest, recorded in prerequisite pre-1 (commit 53a0f25839) against each SOURCE
+# record under `data/escalations/archive/` before any re-encoding, and measured
+# the same way for the control when it was preserved. It is what proves the
+# escaping applied to the committed text is lossless: the file text changes, the
+# parsed value does not.
+#
+# The source PATHS and source-byte digests are deliberately not repeated here.
+# The fixture README's provenance table is their one home; a pin in code that no
+# assertion reads is exactly what a later reader mistakes for a live guarantee.
+# This module pins the parsed value, never the source bytes.
 SPECIMENS: dict[str, dict[str, object]] = {
     "esc-3514-1.json": {
-        "source_path": (
-            "data/escalations/archive/2026-08-03/esc-3514-1.json"
-        ),
-        "source_sha256": (
-            "c0231182da2fab09e8ed2652688b646b5e7bcd77083a2461d2840748639070a7"
-        ),
         "parsed_sha256": (
             "a4fbd90ff0371a88c711b82d63f3cbd6ba3bdcae217540cc74db486eb6023299"
         ),
@@ -71,14 +73,9 @@ SPECIMENS: dict[str, dict[str, object]] = {
         "agent_role": "implementer",
         "detail_len": 2812,
         "suggested_action": "",
+        "detail_carries_envelope_literals": True,
     },
     "esc-3514-3.json": {
-        "source_path": (
-            "data/escalations/archive/2026-08-08/esc-3514-3.json"
-        ),
-        "source_sha256": (
-            "cab14ac7e97f097fa5a3e53fe835d63be1ee513cc4c685131656f320c4581664"
-        ),
         "parsed_sha256": (
             "aeaeb3dca1a345ebfe0afd3e9d97db51d760f754cd2100564a8ac022f6429c56"
         ),
@@ -87,10 +84,33 @@ SPECIMENS: dict[str, dict[str, object]] = {
         "detail_len": 2873,
         # Not empty here but a bare default — the same loss, differently shaped.
         "suggested_action": "manual_intervention",
+        "detail_carries_envelope_literals": True,
     },
 }
 
+# THE NEGATIVE CONTROL, preserved for exactly the reason the two specimens were:
+# it lived only in the gitignored `data/` tree, and the caveat it anchors — that
+# an empty `evidence` list is NOT a corruption signal — was prose until the
+# record itself was committed. Same task 3514, a different producer, and clean.
+CONTROL_ID = "esc-3514-2.json"
+
+CONTROL: dict[str, object] = {
+    "parsed_sha256": (
+        "0f8319e76220e3293fbdd10b1d6e820d0bbf2216507fdca5d2834b31db3533bd"
+    ),
+    "agent_role": "orchestrator",
+    "detail_len": 3481,
+    "suggested_action": "await_preexisting_main_hotfix",
+    # Its `summary` does carry one literal opening bracket (the repr of an enum
+    # member), so the committed text is still non-trivially escaped — but its
+    # `detail`, the field the detector reads, carries none. That is the control.
+    "detail_carries_envelope_literals": False,
+}
+
+FIXTURES: dict[str, dict[str, object]] = {**SPECIMENS, CONTROL_ID: CONTROL}
+
 SPECIMEN_IDS = sorted(SPECIMENS)
+FIXTURE_IDS = sorted(FIXTURES)
 
 
 def _text(name: str) -> str:
@@ -112,9 +132,9 @@ def _parsed_digest(obj: object) -> str:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("name", SPECIMEN_IDS)
+@pytest.mark.parametrize("name", FIXTURE_IDS)
 def test_specimen_parses_and_matches_the_preserved_parsed_digest(name: str) -> None:
-    """The committed fixture is value-identical to the record pre-1 preserved.
+    """The committed fixture is value-identical to the record that was preserved.
 
     This is the losslessness pin for the `\\u003c` re-encoding: the file TEXT is
     rewritten, so its own sha256 changes, but the PARSED value must not move.
@@ -126,21 +146,26 @@ def test_specimen_parses_and_matches_the_preserved_parsed_digest(name: str) -> N
     obj = _load(name)
     assert isinstance(obj, dict)
 
-    assert _parsed_digest(obj) == SPECIMENS[name]["parsed_sha256"], (
+    assert _parsed_digest(obj) == FIXTURES[name]["parsed_sha256"], (
         f"{name}: parsed-value digest moved — the re-encoding was NOT lossless"
     )
 
 
-@pytest.mark.parametrize("name", SPECIMEN_IDS)
+@pytest.mark.parametrize("name", FIXTURE_IDS)
 def test_committed_text_is_escaped_while_the_parsed_value_is_not(name: str) -> None:
     """THE ESCAPING INVARIANT.
 
     The committed file text carries no literal opening angle bracket, while the
-    parsed `detail` demonstrably still does. That is the convention
-    `shared/tests/fixtures/toolcall_markup_corpus.README.md` establishes: the
-    escaped form is standard JSON so nothing is lost, and it is what makes the
-    fixture safe for a future agent to hand-edit (PRD G6 anticipates exactly
-    that edit when the repairer improves).
+    parsed value demonstrably still carries whatever it carried. That is the
+    convention `shared/tests/fixtures/toolcall_markup_corpus.README.md`
+    establishes: the escaped form is standard JSON so nothing is lost, and it is
+    what makes the fixture safe for a future agent to hand-edit (PRD G6
+    anticipates exactly that edit when the repairer improves).
+
+    The second assertion is direction-aware. For the two specimens the literals
+    in `detail` ARE the payload and must survive re-encoding; for the control
+    their ABSENCE is the payload, since a control whose detail acquired markup
+    would stop discriminating anything.
     """
     text = _text(name)
     assert LT not in text, (
@@ -149,9 +174,11 @@ def test_committed_text_is_escaped_while_the_parsed_value_is_not(name: str) -> N
     )
 
     detail = _load(name)["detail"]
-    assert LT in detail, (
-        f"{name}: parsed detail no longer carries envelope literals — the "
-        f"corruption IS the payload and must survive re-encoding"
+    expected = FIXTURES[name]["detail_carries_envelope_literals"]
+    assert (LT in detail) == expected, (
+        f"{name}: parsed detail carries envelope literals = {LT in detail}, "
+        f"expected {expected}. For a specimen the corruption IS the payload and "
+        f"must survive re-encoding; for the control the clean detail is."
     )
 
 
@@ -167,8 +194,16 @@ def test_readme_documents_the_specimens() -> None:
 # ---------------------------------------------------------------------------
 
 
+_CALL_SHAPE_CACHE: tuple[frozenset[str], frozenset[str]] | None = None
+
+
 async def _escalate_info_call_shape() -> tuple[frozenset[str], frozenset[str]]:
     """Return `(schema_params, supplied)` for replaying a specimen through `repair`.
+
+    MEMOISED. The derivation stands up a temporary directory, a queue and a full
+    server, and it is called once per parametrized invocation of two tests; the
+    signature it reads cannot differ between them, so repeating the construction
+    bought nothing. The cache is per-process, like the signature it holds.
 
     DERIVED, never hardcoded. A hardcoded parameter list would keep passing
     while modelling a call shape that no longer exists — `repair()` consults
@@ -192,6 +227,10 @@ async def _escalate_info_call_shape() -> tuple[frozenset[str], frozenset[str]]:
     `supplied`, so listing them here would return None for entirely the wrong
     reason and make the unrepairable assertion vacuous.
     """
+    global _CALL_SHAPE_CACHE
+    if _CALL_SHAPE_CACHE is not None:
+        return _CALL_SHAPE_CACHE
+
     with tempfile.TemporaryDirectory() as tmp:
         server = create_server(
             EscalationQueue(Path(tmp) / "esc"), startup_sweep=False
@@ -227,7 +266,21 @@ async def _escalate_info_call_shape() -> tuple[frozenset[str], frozenset[str]]:
     )
     assert required, "escalate_info declares no required parameters"
 
-    return schema_params, required | {"detail"}
+    supplied = required | {"detail"}
+    # The docstring's warning, made mechanical rather than left to a reader.
+    # If `escalate_info` ever gives `suggested_action` or `evidence` a required
+    # (default-less) parameter, it enters `required` and therefore `supplied`,
+    # and repair() would start returning None because the recovered names
+    # collide with a supplied one — so the unrepairable pin would keep passing
+    # for a reason with nothing to do with the recorded verdict. Fail here,
+    # where the cause can be named, instead of there.
+    assert {"suggested_action", "evidence"}.isdisjoint(supplied), (
+        "escalate_info now requires the swallowed params; the replayed call "
+        "shape no longer models the specimen"
+    )
+
+    _CALL_SHAPE_CACHE = (schema_params, supplied)
+    return _CALL_SHAPE_CACHE
 
 
 # ---------------------------------------------------------------------------
@@ -261,8 +314,7 @@ BARE_SUGGESTED_ACTIONS = {"", "manual_intervention"}
 
 
 @pytest.mark.parametrize("name", SPECIMEN_IDS)
-@pytest.mark.asyncio
-async def test_the_landed_detector_fires_on_the_specimen(name: str) -> None:
+def test_the_landed_detector_fires_on_the_specimen(name: str) -> None:
     """(a) DETECTED — the shipped detector covers this payload.
 
     Task 3690 registers `MarkupGuardMiddleware` on the escalation server
@@ -356,6 +408,35 @@ async def test_the_quoted_pattern_is_the_sole_blocker(name: str) -> None:
     assert detect(result.clean_value) is None
 
 
+def _empty_evidence(record: dict) -> bool:
+    """The NON-discriminating half of the caveat, as code rather than prose.
+
+    Fires on the clean control too — which is the whole point, and is asserted
+    in `test_the_control_record_is_clean_yet_shares_the_empty_evidence_list`.
+    """
+    return record["evidence"] == []
+
+
+def _swallowed_sibling_signature(record: dict) -> bool:
+    """The DISCRIMINATING pair from the fixture README, as code.
+
+    (1) `detect()` fires on `detail`; AND (2) `suggested_action` is empty or a
+    bare default WHILE the argument it lost is still legible inside `detail` —
+    its own parameter NAME is there, absorbed along with the rest of the
+    envelope. A clean record has neither leg.
+
+    Task 3691's sweep wants this predicate, not the empty-evidence list. It is
+    kept executable here so that "the empty list does not discriminate" is a
+    test rather than a paragraph a sweep author may not read.
+    """
+    detail = record["detail"]
+    return (
+        detect(detail) is not None
+        and record["suggested_action"] in BARE_SUGGESTED_ACTIONS
+        and "suggested_action" in detail
+    )
+
+
 @pytest.mark.parametrize("name", SPECIMEN_IDS)
 def test_the_corruption_signature_is_the_discriminating_pair(name: str) -> None:
     """(d) THE SIGNATURE — stated so a future sweep does not repeat a known error.
@@ -365,26 +446,72 @@ def test_the_corruption_signature_is_the_discriminating_pair(name: str) -> None:
     inside `detail`.
 
     An empty `evidence` list is deliberately NOT treated as a signal on its
-    own. Sibling record `esc-3514-2` (same task, `agent_role=orchestrator`) is
-    clean — zero matching markup patterns, `suggested_action` intact — and
-    stores `evidence == []` too. Most escalations simply never pass evidence.
-    It is asserted here only in CONJUNCTION with the entries being legible
-    inside `detail`, which the control record has no counterpart for.
+    own — the clean control record stores one too. That asymmetry is asserted
+    directly in the control test below; here `evidence == []` is claimed only
+    in CONJUNCTION with the entries being legible inside `detail`.
     """
     obj = _load(name)
     detail = obj["detail"]
+
+    assert _swallowed_sibling_signature(obj), (
+        f"{name}: the discriminating pair no longer holds on this record"
+    )
 
     assert len(detail) == SPECIMENS[name]["detail_len"]
     assert obj["agent_role"] == SPECIMENS[name]["agent_role"]
 
     stored_action = obj["suggested_action"]
     assert stored_action == SPECIMENS[name]["suggested_action"]
-    assert stored_action in BARE_SUGGESTED_ACTIONS
     assert REAL_SUGGESTED_ACTION_PREFIX in detail, (
         f"{name}: the real suggested_action is no longer legible in detail, so "
         f"the loss is no longer demonstrable from the record alone"
     )
 
-    assert obj["evidence"] == []
+    assert _empty_evidence(obj)
     assert detail.count(OBSERVATION_KEY) == EVIDENCE_ENTRY_COUNT
     assert EVIDENCE_HEAD_PIN in detail
+
+
+def test_the_control_record_is_clean_yet_shares_the_empty_evidence_list() -> None:
+    """(e) THE CONTROL — the caveat as an executable pair, not a paragraph.
+
+    `esc-3514-2` is the same task's sibling filing by a different producer
+    (`agent_role=orchestrator`), and it is CLEAN: the landed detector does not
+    fire on its `detail`, and its `suggested_action` of
+    `await_preexisting_main_hotfix` is intact and informative. It nevertheless
+    stores `evidence == []`, exactly as both corrupted records do — most
+    escalations simply never pass evidence.
+
+    A sweep keyed on the empty list alone would therefore fire on clean records.
+    That warning was prose in three places and enforced nowhere, while the
+    control itself lived only in the gitignored `data/` tree — as perishable as
+    the two records this directory exists to rescue, and `esc-3514-3` had
+    already been archived out from under an earlier plan. Preserving it and
+    asserting both halves here is what makes the claim load-bearing: the naive
+    predicate fires on all three records, the discriminating pair on the two
+    corrupted ones only. Task 3691 is the sweep that needs the difference.
+    """
+    control = _load(CONTROL_ID)
+    specimens = [_load(name) for name in SPECIMEN_IDS]
+
+    assert control["agent_role"] == CONTROL["agent_role"]
+    assert len(control["detail"]) == CONTROL["detail_len"]
+    assert detect(control["detail"]) is None, (
+        "the control record is no longer clean, so it discriminates nothing"
+    )
+    assert control["suggested_action"] == CONTROL["suggested_action"]
+    assert control["suggested_action"] not in BARE_SUGGESTED_ACTIONS
+
+    # The NON-discriminating half: true of the clean record and both corrupted.
+    assert _empty_evidence(control), (
+        "the control no longer stores an empty evidence list — it can no longer "
+        "demonstrate that the empty list is not a corruption signal"
+    )
+    assert all(_empty_evidence(record) for record in specimens)
+
+    # The DISCRIMINATING pair: false of the clean record, true of both corrupted.
+    assert not _swallowed_sibling_signature(control), (
+        "the discriminating pair now fires on a CLEAN record; a sweep built on "
+        "it would produce false positives"
+    )
+    assert all(_swallowed_sibling_signature(record) for record in specimens)

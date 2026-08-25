@@ -1,12 +1,19 @@
 # `markup_specimens/` — the esc-3514 escalation records
 
-Two REAL persisted escalation records that carry leaked MCP envelope markup in
-their `detail`, preserved verbatim so the leak can be replayed against the
-landed containment code. Consumed by
+Three REAL persisted escalation records from task 3514, preserved verbatim so
+the leak can be replayed against the landed containment code: **two specimens**
+that carry leaked MCP envelope markup in their `detail`, and **one clean
+control** that does not. Consumed by
 `escalation/tests/test_markup_specimen_3514.py`; the verification answer they
 support is written up in `docs/escalation-markup-write-boundary.md`.
 
 PRD `plans/toolcall-markup-containment-prd.md`. Preserved by task **3643**.
+
+**This file is the normative home for the measured figures below.** Per INV-5
+(`no-lockstep-duplication`, `docs/legibility/design-invariants.md`) the
+write-up in `docs/escalation-markup-write-boundary.md` keeps the narrative
+answer and links here for the numbers rather than restating them — they sit
+next to the bytes they describe, and the test pins them.
 
 ## Never hand-write these files — and why they contain no `\x3c`
 
@@ -33,17 +40,18 @@ Two rules, both load-bearing, both lifted unchanged from
 
 ## Provenance
 
-Both records were copied on **2026-08-25** from the live escalation tree at
+All three records were copied on **2026-08-25** from the live escalation tree at
 `/home/leo/src/dark-factory/data/escalations/`, which `.gitignore` excludes —
-so before this directory existed, neither record was in git and either could
+so before this directory existed, no record was in git and any of them could
 vanish. That risk was not theoretical: `esc-3514-3` was `status=pending` in the
 LIVE queue when task 3643 was first planned, and had been dismissed and moved
 into `archive/2026-08-08/` by the time it was preserved. It moved once already.
 
-| File | Source path (under `data/escalations/`) | Source bytes | `agent_role` |
-|---|---|---|---|
-| `esc-3514-1.json` | `archive/2026-08-03/esc-3514-1.json` | 3958 | `implementer` |
-| `esc-3514-3.json` | `archive/2026-08-08/esc-3514-3.json` | 7740 | `harness-orphan-reaper` |
+| File | Source path (under `data/escalations/`) | Source bytes | `agent_role` | Role here |
+|---|---|---|---|---|
+| `esc-3514-1.json` | `archive/2026-08-03/esc-3514-1.json` | 3958 | `implementer` | specimen |
+| `esc-3514-3.json` | `archive/2026-08-08/esc-3514-3.json` | 7740 | `harness-orphan-reaper` | specimen |
+| `esc-3514-2.json` | `archive/2026-08-03/esc-3514-2.json` | 7941 | `orchestrator` | **control** |
 
 `esc-3514-1` is the **direct producer** record: the leaking session's own
 filing. `esc-3514-3` is the **reaper's re-filing** of that orphaned L0, which
@@ -52,12 +60,17 @@ share an identical 2812-character prefix, and `esc-3514-3` differs only by a
 trailing `[note] originating worktree may be reaped` line. That propagation is
 itself part of the finding: nothing between the two filings noticed the markup.
 
+`esc-3514-2` is the **clean sibling**, filed by the orchestrator about an
+unrelated preexisting main break. It is here as the negative control — see
+"The control caveat" below for what it disproves.
+
 Digests, taken against the SOURCE files before any re-encoding:
 
 | File | `sha256` of source bytes | `sha256(json.dumps(obj, sort_keys=True))` |
 |---|---|---|
 | `esc-3514-1.json` | `c0231182da2fab09e8ed2652688b646b5e7bcd77083a2461d2840748639070a7` | `a4fbd90ff0371a88c711b82d63f3cbd6ba3bdcae217540cc74db486eb6023299` |
 | `esc-3514-3.json` | `cab14ac7e97f097fa5a3e53fe835d63be1ee513cc4c685131656f320c4581664` | `aeaeb3dca1a345ebfe0afd3e9d97db51d760f754cd2100564a8ac022f6429c56` |
+| `esc-3514-2.json` | `81c6a946095dd3503a82251a75bfc594426fc35e5707e9d3362fcbb3e170ff6e` | `0f8319e76220e3293fbdd10b1d6e820d0bbf2216507fdca5d2834b31db3533bd` |
 
 The second column is the **parsed-value digest**, and it is the one that
 matters. The committed text was re-encoded (pretty-printed, key-sorted, opening
@@ -87,15 +100,19 @@ against. Nothing today sweeps `data/escalations/` for this class.
 Measured on the committed fixtures, against the landed
 `shared.toolcall_markup`:
 
-| | `esc-3514-1` | `esc-3514-3` |
-|---|---|---|
-| `len(detail)` | 2812 | 2873 |
-| literal `\x3c` in `detail` | 5 | 5 |
-| `MCP_MARKUP_PATTERNS` matching | 2 of 3 | 2 of 3 |
-| `detect(detail)` | the `parameter` closer | the `parameter` closer |
-| stored `suggested_action` | `''` | `'manual_intervention'` |
-| stored `evidence` | `[]` | `[]` |
-| `level` / `status` | 0 / `dismissed` | 1 / `dismissed` |
+The control column is the point of the table, not an afterthought: every row
+where it AGREES with the specimens is a row no sweep may key on.
+
+| | `esc-3514-1` | `esc-3514-3` | `esc-3514-2` (control) |
+|---|---|---|---|
+| `len(detail)` | 2812 | 2873 | 3481 |
+| literal `\x3c` in `detail` | 5 | 5 | **0** |
+| `MCP_MARKUP_PATTERNS` matching | 2 of 3 | 2 of 3 | **0 of 3** |
+| `detect(detail)` | the `parameter` closer | the `parameter` closer | **`None`** |
+| stored `suggested_action` | `''` | `'manual_intervention'` | **`'await_preexisting_main_hotfix'`** |
+| `'suggested_action'` legible in `detail` | yes | yes | **no** |
+| stored `evidence` | `[]` | `[]` | `[]` — *same* |
+| `level` / `status` | 0 / `dismissed` | 1 / `dismissed` | 0 / `resolved` |
 
 > **Correction to an earlier count.** An earlier write-up of these records said
 > "3 markup hits". The measured number is **2 of the 3** patterns in
@@ -150,24 +167,35 @@ B5 shape that `test_markup_middleware_registration.py` describes for
 
 ## The control caveat — do not read `evidence == []` as corruption
 
-Sibling record `esc-3514-2` (same task, `agent_role=orchestrator`, still only
-in `data/escalations/archive/2026-08-03/`) is **clean**: zero matching markup
-patterns, `detect(detail)` returns `None`, and its `suggested_action` of
-`'await_preexisting_main_hotfix'` is intact. It nevertheless ALSO stores
-`evidence == []`.
+Sibling record `esc-3514-2` (same task, `agent_role=orchestrator`) is
+**clean**: zero matching markup patterns, `detect(detail)` returns `None`, and
+its `suggested_action` of `'await_preexisting_main_hotfix'` is intact. It
+nevertheless ALSO stores `evidence == []`.
 
 An empty `evidence` list is therefore **not** a corruption signal on its own —
 most escalations simply never pass evidence, and a detector keyed on it would
 fire on clean records. The discriminating pair is:
 
 1. `detect()` fires on `detail`; **and**
-2. `suggested_action` is empty or a bare default **while its real text is a
-   substring of `detail`**.
+2. `suggested_action` is empty or a bare default **while the argument it lost
+   is still legible inside `detail`** — its own parameter NAME is there,
+   absorbed with the rest of the envelope, as is its real text.
 
 `esc-3514-3` shows why (2) must allow "a bare default" and not just "empty":
 its stored value is `'manual_intervention'`, a plausible-looking default, which
 is the same loss wearing a disguise. Any future sweep (task 3691) should use
 this pair, not the empty list.
+
+**The control is preserved here for the same reason the specimens are**, and it
+is not decoration. It lived only in the gitignored `data/` tree, so it was
+exactly as perishable as the two records this directory rescued — and the
+caveat above was, until it was committed, a claim asserted in three prose
+places and enforced in none.
+`test_the_control_record_is_clean_yet_shares_the_empty_evidence_list` now
+asserts both halves against the bytes: the naive empty-evidence predicate fires
+on all three records, and the discriminating pair on the two corrupted ones
+only. A sweep that keys on the wrong half fails a test instead of shipping
+false positives.
 
 ## Do not clean, do not regenerate, do not normalise
 
@@ -178,6 +206,11 @@ For future consolidation, janitor, lint and formatting passes:
   `evidence`, or normalises the text destroys the only preserved copy — the
   sources are in a gitignored tree and one of them has already been archived
   out from under an earlier plan.
+- **The control's CLEANLINESS is equally the payload.** `esc-3514-2.json` is
+  not a spare specimen: if an edit ever puts envelope markup into its `detail`
+  or empties its `suggested_action`, it stops disproving anything and the
+  discriminating pair loses its negative half. Two tests fail if that happens,
+  by design.
 - **The `\u003c` escaping must be preserved on any edit**, for the reason in
   rule 2 above.
 - **The parsed-value digests are pinned** in
