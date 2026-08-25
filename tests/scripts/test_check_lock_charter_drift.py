@@ -42,12 +42,14 @@ because ``--import-mode=importlib`` deliberately does not).
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 from pathlib import Path
 
 import check_lock_charter_drift as drift
 import pytest
+import shared.reify_checkout as reify_checkout
 from shared.locking import EXTENSIONLESS_FILENAMES, FILE_EXTENSIONS, is_file_path
 
 # The two vectors dark-factory declares, in the exact form the guard script
@@ -621,3 +623,252 @@ class TestCheckComposition:
         assert report['parts']['corpus']['exit_code'] == drift.EXIT_DRIFT
         assert report['parts']['vectors']['exit_code'] == drift.EXIT_UNAVAILABLE
         assert report['exit_code'] == drift.EXIT_UNAVAILABLE
+
+
+# ---------------------------------------------------------------------------
+# RESOLUTION and the CLI.
+#
+# DIVISION OF OWNERSHIP, stated so this file does not grow a duplicate of a
+# matrix another suite already owns.  `shared/tests/test_reify_checkout.py`
+# owns the RESOLVER's semantics — the bare-vs-worktree-vs-extra-nesting layout
+# matrix, nearest-ancestor precedence, marker-less-dir shadowing, and the whole
+# REIFY_ROOT override contract — in one place, 40-plus cases.  Restating it here
+# would mean two suites to edit for one semantic change, which is the exact
+# duplication the promotion of that module to shared/ existed to remove (see
+# `TestReifyCheckoutAdapter`'s note in fused-memory's copy).
+#
+# What THIS file pins is only what is specific to THIS call site: that it
+# DELEGATES rather than keeping a private copy of the walk, that it binds the
+# right marker and starts at its own tree, that an explicit flag out-ranks the
+# env var, that the answer does not vary with the caller's cwd, and that no
+# `parents[N]` index arithmetic has crept back in.
+# ---------------------------------------------------------------------------
+
+
+class TestResolve:
+    """``resolve(explicit=None)`` — precedence, delegation, layout independence."""
+
+    def test_delegates_to_the_shared_single_source(self, tmp_path, monkeypatch):
+        """The ancestor walk must live in ONE place — shared.reify_checkout.
+
+        Deliberately white-box, and deliberately the only genuinely-RED
+        assertion available for this property: a black-box equivalence check
+        cannot express it, because a faithful local COPY of the walk would
+        satisfy every one of them while defeating the single-sourcing.  What
+        this pin buys is that a second copy cannot quietly reappear here — which
+        is precisely what the stale WIP this task discarded had done.
+        """
+        sentinel = tmp_path / 'sentinel-reify'
+        seen = {}
+
+        def _stub(marker, *, start):
+            seen['marker'] = Path(marker)
+            seen['start'] = Path(start)
+            return reify_checkout.ReifyCheckout(sentinel, False)
+
+        monkeypatch.setattr(reify_checkout, 'resolve_reify_checkout', _stub)
+
+        assert drift.resolve().root == sentinel
+        assert seen['marker'] == Path('scripts') / 'lock-charter-guard.sh'
+        assert seen['start'] == Path(drift.__file__), (
+            'the walk must START at this script, not at shared/src/shared/ — a '
+            "shared-relative start would walk the WRONG tree's ancestors"
+        )
+
+    def test_source_contains_no_parents_index_arithmetic(self):
+        """No ``Path(__file__).parents[N]`` hop, in any spelling.
+
+        The standing regression guard for this task's charter.  Measured in
+        shared.reify_checkout's docstring: ``.worktrees/<id>`` contributes
+        exactly two path segments, so parents[5] is correct in a worktree and
+        parents[3] is correct in a bare checkout — NO fixed index is correct in
+        both, and orchestrator verify runs in a worktree while an operator's
+        shell runs in a bare checkout.  A fixed index here would silently
+        resolve to a different repo depending on who invoked the script.
+        """
+        src = Path(drift.__file__).read_text()
+        assert 'parents[' not in src, (
+            'fixed parents[N] arithmetic is a REGRESSION, not a fix — delegate '
+            'to shared.reify_checkout.resolve_reify_checkout instead'
+        )
+
+    def test_explicit_repo_beats_reify_root(self, tmp_path, monkeypatch):
+        """``--reify-repo`` is the operator saying "this one, now"."""
+        monkeypatch.setenv('REIFY_ROOT', str(tmp_path / 'from-env'))
+        explicit = tmp_path / 'from-flag'
+
+        checkout = drift.resolve(str(explicit))
+
+        assert checkout.root == explicit.resolve()
+        assert checkout.named_by_env is False, (
+            'a flag-named root did not come from the env var; claiming it did '
+            'would blame the operator for a path they did not set'
+        )
+
+    def test_explicit_repo_is_expanded_and_resolved(self, monkeypatch, tmp_path):
+        monkeypatch.setenv('HOME', str(tmp_path))
+        assert drift.resolve('~/somewhere').root == (tmp_path / 'somewhere').resolve()
+
+    def test_reify_root_beats_discovery_and_is_marked_as_such(self, tmp_path, monkeypatch):
+        """Provenance travels WITH the root, so a later message cannot misattribute it."""
+        monkeypatch.setenv('REIFY_ROOT', str(tmp_path / 'from-env'))
+
+        checkout = drift.resolve()
+
+        assert checkout.root == (tmp_path / 'from-env').resolve()
+        assert checkout.named_by_env is True
+
+    def test_no_ambient_environ_reread(self, tmp_path, monkeypatch):
+        """This module must not read REIFY_ROOT itself — the resolver owns that arm.
+
+        An ambient re-read is what lets a message blame the operator for a
+        DISCOVERED root (see `reify_skip_reason`'s docstring).  Keeping the read
+        inside the resolver means the answer and its provenance are produced
+        together and cannot disagree.
+        """
+        src = Path(drift.__file__).read_text()
+        assert 'REIFY_ROOT' not in src.replace('REIFY_ROOT_ENV', '')
+
+    @pytest.mark.parametrize(
+        'layout',
+        ['dark-factory/scripts', 'dark-factory/.worktrees/3226/scripts'],
+        ids=['bare-checkout', 'worktree'],
+    )
+    def test_resolution_does_not_vary_with_the_callers_cwd(self, tmp_path, monkeypatch, layout):
+        """A bare-checkout cwd and a ``.worktrees/<n>`` cwd must resolve identically.
+
+        The two shapes differ by exactly the two segments that made a fixed
+        ``parents[N]`` index wrong in one of them.  Resolution keys off the
+        SCRIPT's own location, never the caller's, so an operator running this
+        from inside a worktree and a cron running it from the main checkout get
+        the same answer about the same sibling.
+        """
+        cwd = tmp_path / layout
+        cwd.mkdir(parents=True)
+        seen = []
+
+        def _stub(marker, *, start):
+            seen.append(Path(start))
+            return reify_checkout.ReifyCheckout(tmp_path / 'sentinel-reify', False)
+
+        monkeypatch.setattr(reify_checkout, 'resolve_reify_checkout', _stub)
+        monkeypatch.chdir(cwd)
+
+        assert drift.resolve().root == tmp_path / 'sentinel-reify'
+        assert seen == [Path(drift.__file__)], (
+            f'start varied with cwd {cwd} — resolution must key off the script, '
+            f'not the caller'
+        )
+
+
+class TestMainCli:
+    """``main(argv)`` — exit code, stream routing, and single-sourced wording."""
+
+    def test_returns_the_reports_exit_code_on_ok(self, tmp_path, capsys):
+        repo = _plant_repo(tmp_path / 'reify', ['a/b.py'])
+        _plant_guard(repo, extensions=DF_EXTENSIONS, extensionless=DF_EXTENSIONLESS)
+
+        rc = drift.main(['--reify-repo', str(repo)])
+
+        assert rc == drift.EXIT_OK
+        captured = capsys.readouterr()
+        assert captured.out.strip(), 'an OK run must say so on stdout'
+        assert captured.err == '', 'an OK run must not write to stderr'
+
+    def test_drift_goes_to_stderr_not_stdout(self, tmp_path, capsys):
+        """A drift report must survive ``>/dev/null`` in whatever wraps this.
+
+        A scheduled job that discards stdout and mails stderr is the ordinary
+        shape; a drift report on stdout would be silently thrown away by it.
+        """
+        repo = _plant_repo(tmp_path / 'reify', ['a/b.py'])
+        _plant_guard(
+            repo,
+            extensions=sorted([*DF_EXTENSIONS, 'protobuf']),
+            extensionless=DF_EXTENSIONLESS,
+        )
+
+        rc = drift.main(['--reify-repo', str(repo)])
+
+        assert rc == drift.EXIT_DRIFT
+        captured = capsys.readouterr()
+        assert 'protobuf' in captured.err
+        assert captured.out == ''
+
+    def test_unavailable_goes_to_stderr(self, tmp_path, capsys):
+        repo = _plant_repo(tmp_path / 'reify', ['a/b.py'])  # no guard script
+
+        rc = drift.main(['--reify-repo', str(repo)])
+
+        assert rc == drift.EXIT_UNAVAILABLE
+        captured = capsys.readouterr()
+        assert 'lock-charter-guard.sh' in captured.err
+        assert captured.out == ''
+
+    def test_json_emits_one_parseable_object_on_stdout(self, tmp_path, capsys):
+        """``--json`` is the MACHINE channel and is on stdout for every status.
+
+        A consumer that piped ``--json`` and got nothing on a drift run — the
+        run it most needs to parse — would have to fall back to scraping the
+        human text.
+        """
+        repo = _plant_repo(tmp_path / 'reify', ['x/y.proto'])
+        _plant_guard(repo, extensions=DF_EXTENSIONS, extensionless=DF_EXTENSIONLESS)
+
+        rc = drift.main(['--reify-repo', str(repo), '--json'])
+
+        payload = json.loads(capsys.readouterr().out)
+        assert payload['status'] == 'drift'
+        assert payload['exit_code'] == rc == drift.EXIT_DRIFT
+
+    def test_json_is_emitted_for_an_unavailable_run_too(self, tmp_path, capsys):
+        repo = _plant_repo(tmp_path / 'reify', ['a/b.py'])
+
+        rc = drift.main(['--reify-repo', str(repo), '--json'])
+
+        payload = json.loads(capsys.readouterr().out)
+        assert payload['status'] == 'unavailable'
+        assert payload['exit_code'] == rc == drift.EXIT_UNAVAILABLE
+
+    def test_discovery_miss_message_is_single_sourced(self, monkeypatch, capsys):
+        """The miss wording must be EXACTLY what the in-suite gates say.
+
+        Two call sites describing the same condition in two hand-rolled strings
+        is how "reify is not checked out" and "your REIFY_ROOT is wrong" get
+        conflated — the distinction `reify_skip_reason` exists to keep.
+        """
+        monkeypatch.setattr(
+            reify_checkout,
+            'resolve_reify_checkout',
+            lambda marker, *, start: reify_checkout.ReifyCheckout(None, False),
+        )
+
+        rc = drift.main([])
+
+        assert rc == drift.EXIT_UNAVAILABLE
+        expected = reify_checkout.reify_skip_reason(
+            Path('scripts') / 'lock-charter-guard.sh', None, named_by_env=False
+        )
+        assert expected is not None
+        assert expected in capsys.readouterr().err
+
+    def test_bad_reify_root_names_the_path_the_operator_named(self, tmp_path, capsys, monkeypatch):
+        """A typo'd override must be self-evident, not silently fall back to discovery."""
+        bogus = tmp_path / 'typo'
+        bogus.mkdir()
+        monkeypatch.setenv('REIFY_ROOT', str(bogus))
+
+        rc = drift.main([])
+
+        assert rc == drift.EXIT_UNAVAILABLE
+        err = capsys.readouterr().err
+        assert str(bogus) in err
+        assert 'REIFY_ROOT' in err
+
+    def test_module_is_executable(self):
+        """A script an operator is told to run must be runnable."""
+        import os
+
+        assert os.access(drift.__file__, os.X_OK), (
+            f'{drift.__file__} is not executable — chmod +x it'
+        )
