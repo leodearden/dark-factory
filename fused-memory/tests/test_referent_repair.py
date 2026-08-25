@@ -1493,12 +1493,13 @@ class TestReferentRepairCountsAccessor:
         assert service.referent_repair_counts()['repaired'] == 2
 
     async def test_minted_and_deleted_are_reported(self, service):
-        service.graphiti.ensure_entity_node = AsyncMock(return_value='n-3127')
-        service.graphiti.get_nodes_by_exact_name = AsyncMock(return_value=[])
+        """`new_endpoint_uuid is None` is zeta reporting no pre-existing node,
+        so `ensure_entity_node` took the MINT path; the emptied old endpoint is
+        then a canonical task label with no valid edges left."""
         service.graphiti.get_valid_edges_for_node = AsyncMock(return_value=[])
 
         await service._repair_episode_referents(
-            _stats(_finding()), group_id='dark_factory',
+            _stats(_finding(new_endpoint_uuid=None)), group_id='dark_factory',
         )
 
         counts = service.referent_repair_counts()

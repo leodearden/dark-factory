@@ -2425,6 +2425,36 @@ class MemoryService:
         self._referent_finding_counts: dict[str, int] = dict.fromkeys(
             (*REFERENT_CHECKS, 'unresolvable'), 0,
         )
+        # INV-4 storm escape for the REPAIR sub-pass (task 3672, PRD leaf eta):
+        # the counter half of the alarm whose fire half is
+        # `middleware/referent_repair_storm_escalator`. Both dicts are
+        # constructed UNCONDITIONALLY, for the reason the two counters above
+        # give and which applies with more force here: this is the escape hatch
+        # for a pass that WRITES to the graph, and an alarm sourced from
+        # `_write_journal` or the ReconciliationHarness would go dark in exactly
+        # the degraded configuration where a repair storm is least likely to be
+        # noticed any other way.
+        #
+        # `_referent_repair_streaks` maps group_id -> CONSECUTIVE episodes whose
+        # repair pass moved at least one endpoint. Per group_id because the
+        # escalation queue is per-project: a regression in one project's graph
+        # must not be masked by another project's clean writes, which is exactly
+        # what a single global streak would do (any interleaved clean project
+        # would reset it, and the alarm would be unreachable under concurrency).
+        #
+        # Bounded by the LIVE PROJECT SET — `group_id == project_id`, of which
+        # there are a handful — so unlike the per-agent mem0 storm counters
+        # above it needs no pruning; there is no unbounded key space to leak.
+        self._referent_repair_streaks: dict[str, int] = {}
+        # Process-lifetime totals, monotonic and never reset, keyed by a closed
+        # five-member vocabulary so a reader never distinguishes "zero" from
+        # "absent". Deliberately SEPARATE from the streaks: the streak is a live
+        # gauge that resets on a clean pass, these are counters a reader samples
+        # and differences (the uptime-baseline convention above).
+        self._referent_repair_counts: dict[str, int] = dict.fromkeys(
+            ('repaired', 'flagged_unrepairable', 'failed',
+             'nodes_minted', 'nodes_deleted'), 0,
+        )
         # Test seam for the injectable-clock convention: a 3600s window has to
         # be exercised by advancing a fake clock, not by sleeping.
         self._mem0_update_storm_time_provider: Callable[[], float] = time.time
@@ -3965,7 +3995,76 @@ class MemoryService:
             repair_stats, endpoint_names, group_id=group_id,
         )
 
+        self._record_referent_repair_pass(
+            stats, repair_stats, group_id=group_id,
+        )
+
         return repair_stats
+
+    def _record_referent_repair_pass(
+        self,
+        stats: ReferentStats,
+        repair_stats: ReferentRepairStats,
+        *,
+        group_id: str,
+    ) -> None:
+        """Fold one completed repair pass into the INV-4 escape hatch.
+
+        Two independent things, deliberately kept apart:
+
+        THE PROCESS-LIFETIME TOTALS accumulate unconditionally — monotonic
+        counters leaf iota samples and differences.
+
+        THE PER-GROUP STREAK counts CONSECUTIVE EPISODES that needed a repair,
+        and its update rule is a three-way branch, not a two-way one:
+
+        * ``repaired >= 1`` -> ``+1``, by exactly one however many endpoints
+          moved. The streak's unit is the EPISODE; the per-episode repair count
+          rides separately in :attr:`ReferentRepairStats.repaired` and is
+          carried into the escalation's evidence. Making the increment
+          proportional would let a single wide episode breach the threshold on
+          its own, which is precisely the "one bad write" case this alarm is
+          not for.
+        * zero repairs but ``endpoints_checked > 0`` -> ``0``. THE POSITIVE
+          HEALTH SIGNAL: we looked at this episode's edge endpoints and none
+          needed moving.
+        * zero repairs and ``endpoints_checked == 0`` -> UNCHANGED, and the key
+          is not even created.
+
+        THE ASYMMETRY IS THE POINT, and it is copied from
+        ``MergeWorker._record_runner_recovered``, which pops a host's
+        unavailability entry only on a SUCCESSFUL probe — never on the mere
+        absence of a failure. Here the analogue of "no failure observed" is an
+        episode that declared no referents, produced no edges, or yielded no
+        findings: the pass ran, looked at nothing, and returned. That is no
+        evidence of health, and clearing the streak on it would make the alarm
+        structurally UNREACHABLE — the measured base rate is ~0.22% of live
+        task-mentioning edges, so the overwhelming majority of episodes check
+        nothing, and any one of them interleaved between two repairs would zero
+        a streak that can then never reach ten.
+
+        Only ``repaired`` (``outcome == 'repaired' and moved``) counts toward
+        the streak. A ``moved=False`` result is ``reassign_edge``'s
+        corroborate-before-acting no-op — the edge was ALREADY correct — and
+        ``'unrepairable'``/``'degenerate'``/``'failed'`` are a refusal, a
+        refusal, and an infrastructure fault respectively. None of the four is
+        evidence that the resolver is producing wrong endpoints, and counting
+        any of them would let a FalkorDB outage page as a scanner regression.
+        """
+        self._referent_repair_counts['repaired'] += repair_stats.repaired
+        self._referent_repair_counts['flagged_unrepairable'] += (
+            repair_stats.flagged_unrepairable
+        )
+        self._referent_repair_counts['failed'] += repair_stats.failed
+        self._referent_repair_counts['nodes_minted'] += repair_stats.nodes_minted
+        self._referent_repair_counts['nodes_deleted'] += repair_stats.nodes_deleted
+
+        if repair_stats.repaired:
+            self._referent_repair_streaks[group_id] = (
+                self._referent_repair_streaks.get(group_id, 0) + 1
+            )
+        elif stats.endpoints_checked:
+            self._referent_repair_streaks[group_id] = 0
 
     async def _cleanup_emptied_nodes(
         self,
@@ -4525,6 +4624,41 @@ class MemoryService:
         the convention above.
         """
         return dict(self._referent_finding_counts)
+
+    def referent_repair_counts(self) -> dict[str, Any]:
+        """What the REPAIR sub-pass has done, ever, plus its live streaks.
+
+        The read side of ``_referent_repair_counts`` / ``_referent_repair_streaks``
+        and the INV-4 storm escape for the repair sub-pass (task 3672, PRD leaf
+        eta) — the third in the series, deliberately mirroring
+        :meth:`referent_source_counts` and :meth:`referent_finding_counts`
+        rather than inventing a fourth idiom in this file.
+
+        THE FIVE TOTALS ARE PROCESS-LIFETIME AND MONOTONIC, never reset: a
+        reader samples and differences them. They partition eta's dispositions
+        the way :data:`REFERENT_REPAIR_OUTCOMES` describes —
+        ``flagged_unrepairable`` folds the two REFUSALS ('unrepairable',
+        'degenerate') while ``failed`` stays separate, because conflating an
+        infrastructure fault with a refusal would let a FalkorDB outage read as
+        a scanner regression in leaf iota's rate. ``repaired`` counts endpoints
+        actually MOVED, so it is a strict measure of what changed in the graph.
+
+        ``'streaks'`` IS A GAUGE, NOT A COUNTER, and the only entry here that
+        can go DOWN: group_id -> consecutive episodes whose repair pass moved
+        something, cleared by a pass that looked and found nothing. It is the
+        value the storm gate thresholds, exposed so an operator can see how
+        close a project is to the alarm rather than only learning at the breach.
+        A group appears only once a pass has produced evidence about it, so an
+        absent key means "no repair pass has drawn a conclusion here yet" —
+        distinct from a present ``0``, which means "checked, clean".
+
+        Returns a COPY at BOTH levels — the nested streaks dict included — so a
+        caller cannot mutate the escape hatch's own state. A read-only escape
+        hatch a consumer can write through is not an escape hatch.
+        """
+        counts: dict[str, Any] = dict(self._referent_repair_counts)
+        counts['streaks'] = dict(self._referent_repair_streaks)
+        return counts
 
     async def _execute_graphiti_write(
         self, operation: str, payload: dict[str, Any]
