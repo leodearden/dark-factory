@@ -33,11 +33,16 @@ have already been moved once by the archiver.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
+import tempfile
 from pathlib import Path
 
 import pytest
 from shared.toolcall_markup import detect, repair
+
+from escalation.queue import EscalationQueue
+from escalation.server import create_server
 
 # The opening angle bracket, never typed as a literal. See the authoring rule.
 LT = chr(0x3C)
@@ -154,6 +159,62 @@ def test_readme_documents_the_specimens() -> None:
     readme = FIXTURE_DIR / "README.md"
     assert readme.is_file(), f"{readme} is missing"
     assert readme.read_text(encoding="utf-8").strip(), f"{readme} is empty"
+
+
+# ---------------------------------------------------------------------------
+# The replayed call shape, DERIVED from the live tool.
+# ---------------------------------------------------------------------------
+
+
+async def _escalate_info_call_shape() -> tuple[frozenset[str], frozenset[str]]:
+    """Return `(schema_params, supplied)` for replaying a specimen through `repair`.
+
+    DERIVED, never hardcoded. A hardcoded parameter list would keep passing
+    while modelling a call shape that no longer exists — `repair()` consults
+    `schema_params` to decide whether a recovered name is real, so a silent
+    drift there would weaken every assertion in this module without failing
+    anything. Reading the names off the live tool means a rename fails loudly,
+    here, with a message that says so.
+
+    The server is built the established way — see
+    `escalation/tests/test_markup_middleware_registration.py` — with the
+    startup sweep off. Nothing is CALLED through it: this reads
+    `escalate_info`'s signature only, so the middleware-bypass warning that
+    file carries does not apply.
+
+    `supplied` models the argument NAMES the corrupted call actually arrived
+    with: the tool's required parameters plus `detail`, and DELIBERATELY NOT
+    `suggested_action` or `evidence`. That omission is the whole point of the
+    specimen — the harness dropped them from the arguments map, which is why
+    they ended up absorbed into `detail` instead. It also matters mechanically:
+    `repair()` refuses any candidate whose recovered names intersect
+    `supplied`, so listing them here would return None for entirely the wrong
+    reason and make the unrepairable assertion vacuous.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        server = create_server(
+            EscalationQueue(Path(tmp) / "esc"), startup_sweep=False
+        )
+        tool = await server.get_tool("escalate_info")
+        parameters = inspect.signature(tool.fn).parameters
+
+    schema_params = frozenset(parameters)
+    required = frozenset(
+        name
+        for name, p in parameters.items()
+        if p.default is inspect.Parameter.empty
+    )
+
+    # A rename must fail HERE, loudly, rather than quietly weakening the
+    # specimen assertions below.
+    missing = {"detail", "suggested_action", "evidence"} - schema_params
+    assert not missing, (
+        f"escalate_info no longer declares {sorted(missing)}; the replayed "
+        f"call shape no longer models the call these specimens came from"
+    )
+    assert required, "escalate_info declares no required parameters"
+
+    return schema_params, required | {"detail"}
 
 
 # ---------------------------------------------------------------------------
