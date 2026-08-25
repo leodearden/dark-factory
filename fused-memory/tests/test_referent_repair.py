@@ -685,3 +685,180 @@ class TestNeverGuess:
         assert {r.outcome for r in stats.repairs} == {'repaired', 'unrepairable'}
         assert stats.repaired == 1
         assert stats.flagged_unrepairable == 1
+
+
+class TestDegenerateEdges:
+    """EDGE CASE (a): both ends of one edge would sit on one node.  Skip the
+    edge WHOLE — never half-move it.
+
+    Moving one end leaves the edge half-attributed between two different
+    referents, and moving the second makes `reassign_edge` raise its
+    self-referential-RELATES_TO ValueError — by which point the FIRST end has
+    already committed, so the exception arrives far too late to be a guard.
+    The decision therefore has to be made BEFORE any write for that edge.
+    """
+
+    @pytest.mark.asyncio
+    async def test_case_a_a_self_loop_on_the_wrong_node_is_skipped_whole(
+        self, service, caplog,
+    ):
+        """The LITERAL shape: one edge whose source and target are the SAME
+        node, producing two findings that share an `old_endpoint_uuid`.
+        Reachable, not hypothetical — `get_valid_edges_for_node`'s own
+        docstring documents that an A->A RELATES_TO edge exists in this graph
+        and double-matches its undirected query."""
+        findings = (
+            _finding(
+                edge_uuid='e1', which_end='source',
+                old_endpoint_uuid='n-2520', old_endpoint_name='Task 2520',
+                endpoint_referent=Referent(number='2520'),
+                intended_referent=Referent(number='2519'),
+                new_endpoint_uuid='n-2519',
+            ),
+            _finding(
+                edge_uuid='e1', which_end='target',
+                old_endpoint_uuid='n-2520', old_endpoint_name='Task 2520',
+                endpoint_referent=Referent(number='2520'),
+                intended_referent=Referent(number='2519'),
+                new_endpoint_uuid='n-2519',
+            ),
+        )
+
+        with caplog.at_level(logging.WARNING):
+            stats = await service._repair_episode_referents(
+                _stats(*findings), group_id='dark_factory',
+            )
+
+        # Decided BEFORE any write, not by catching the ValueError after one
+        # end has already moved.
+        assert_never_repaired(service)
+        assert len(stats.repairs) == 2
+        for record in stats.repairs:
+            assert record.outcome == 'degenerate'
+            assert record.moved is False
+            assert record.minted is False
+        assert stats.flagged_unrepairable == 2
+        assert stats.degenerate_edges == 1
+        assert stats.repaired == 0
+
+        warnings = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and 'e1' in r.getMessage()
+        ]
+        assert len(warnings) == 1
+        assert 'n-2520' in warnings[0].getMessage()
+
+    @pytest.mark.asyncio
+    async def test_case_b_two_ends_converging_on_one_target_is_skipped_whole(
+        self, service, caplog,
+    ):
+        """The PROJECTED shape: different `old_endpoint_uuid`s, but the SAME
+        `intended_referent`, so applying both would leave `source == target` —
+        exactly the self-loop `reassign_edge` refuses.  Equally reachable
+        through zeta's rules: `_candidate_targets` subtracts `endpoint` and
+        `other_endpoint`, neither of which removes a THIRD referent both ends
+        would move onto."""
+        findings = (
+            _finding(
+                edge_uuid='e2', which_end='source',
+                old_endpoint_uuid='n-2520', old_endpoint_name='Task 2520',
+                endpoint_referent=Referent(number='2520'),
+                intended_referent=Referent(number='2519'),
+            ),
+            _finding(
+                edge_uuid='e2', which_end='target',
+                old_endpoint_uuid='n-2521', old_endpoint_name='Task 2521',
+                endpoint_referent=Referent(number='2521'),
+                intended_referent=Referent(number='2519'),
+            ),
+        )
+
+        with caplog.at_level(logging.WARNING):
+            stats = await service._repair_episode_referents(
+                _stats(*findings), group_id='dark_factory',
+            )
+
+        assert_never_repaired(service)
+        assert [r.outcome for r in stats.repairs] == ['degenerate', 'degenerate']
+        assert stats.degenerate_edges == 1
+        assert stats.repaired == 0
+
+        warnings = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and 'e2' in r.getMessage()
+        ]
+        assert len(warnings) == 1
+        assert 'n-2520' in warnings[0].getMessage()
+        assert 'n-2521' in warnings[0].getMessage()
+
+    @pytest.mark.asyncio
+    async def test_case_c_a_legitimate_both_ends_repair_is_not_swallowed(
+        self, service,
+    ):
+        """THE negative that keeps the guard from eating real work: different
+        old endpoints AND different intended referents is a legitimate
+        both-ends repair, and both ends must be repaired."""
+        service.graphiti.ensure_entity_node = AsyncMock(
+            side_effect=['n-2519', 'n-2518'],
+        )
+        service.graphiti.reassign_edge = AsyncMock(side_effect=[
+            _reassigned(
+                uuid='e3', which_end='source',
+                old_endpoint_uuid='n-2520', new_endpoint_uuid='n-2519',
+                refreshed_nodes=['n-2520', 'n-2519'],
+            ),
+            _reassigned(
+                uuid='e3', which_end='target',
+                old_endpoint_uuid='n-2521', new_endpoint_uuid='n-2518',
+                refreshed_nodes=['n-2521', 'n-2518'],
+            ),
+        ])
+        findings = (
+            _finding(
+                edge_uuid='e3', which_end='source',
+                old_endpoint_uuid='n-2520', old_endpoint_name='Task 2520',
+                endpoint_referent=Referent(number='2520'),
+                intended_referent=Referent(number='2519'),
+            ),
+            _finding(
+                edge_uuid='e3', which_end='target',
+                old_endpoint_uuid='n-2521', old_endpoint_name='Task 2521',
+                endpoint_referent=Referent(number='2521'),
+                intended_referent=Referent(number='2518'),
+            ),
+        )
+
+        stats = await service._repair_episode_referents(
+            _stats(*findings), group_id='dark_factory',
+        )
+
+        assert service.graphiti.ensure_entity_node.await_count == 2
+        assert service.graphiti.reassign_edge.await_count == 2
+        assert stats.repaired == 2
+        assert stats.degenerate_edges == 0
+        assert stats.flagged_unrepairable == 0
+
+    @pytest.mark.asyncio
+    async def test_an_unresolvable_second_finding_does_not_make_an_edge_degenerate(
+        self, service,
+    ):
+        """The converging-target arm compares RESOLVABLE findings only: a
+        finding eta will never act on cannot converge with anything."""
+        findings = (
+            _finding(edge_uuid='e4', which_end='source'),
+            _finding(
+                edge_uuid='e4', which_end='target',
+                old_endpoint_uuid='n-other', old_endpoint_name='Task 9999',
+                endpoint_referent=Referent(number='9999'),
+                intended_referent=None, new_endpoint_uuid=None,
+                resolvable=False, reason='no candidate target',
+            ),
+        )
+
+        stats = await service._repair_episode_referents(
+            _stats(*findings), group_id='dark_factory',
+        )
+
+        assert stats.degenerate_edges == 0
+        assert stats.repaired == 1
+        assert stats.flagged_unrepairable == 1
