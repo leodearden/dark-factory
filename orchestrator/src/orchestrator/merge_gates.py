@@ -1217,6 +1217,46 @@ async def resolve_already_landed_branch(
     task_id: str,
     branch: str,
 ) -> AlreadyLandedResult | None:
+    """Never-raises guard around :func:`_resolve_already_landed_branch`.
+
+    The predicate's whole contract is that it fails CLOSED — None means
+    "carve nothing out", i.e. exactly today's behaviour.  A RAISE is not
+    failing closed: it would propagate out of the already-failing
+    ``_submit_to_merge_queue`` arm and take down the entire merge submission
+    for what is a purely advisory recognition step.  And the probes really do
+    raise: ``_run`` raises :class:`WorktreeMissing` when ``cwd`` is gone, and
+    every ``git_ops`` probe can surface an unexpected error of its own.
+
+    ``asyncio.CancelledError`` is re-raised: cancellation is not a git error
+    and swallowing it would strand the awaiting task.
+
+    See :func:`_resolve_already_landed_branch` for the three signals.
+    """
+    try:
+        return await _resolve_already_landed_branch(
+            plan_files, base_sha, branch_head, git_ops,
+            task_id=task_id, branch=branch,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            'already-landed: probe raised for task_id=%s branch=%s — failing '
+            'closed (the unchanged plan_files_not_touched path runs)',
+            task_id, branch, exc_info=True,
+        )
+        return None
+
+
+async def _resolve_already_landed_branch(
+    plan_files: list[str],
+    base_sha: str,
+    branch_head: str,
+    git_ops: GitOps,
+    *,
+    task_id: str,
+    branch: str,
+) -> AlreadyLandedResult | None:
     """Recognize a branch that is empty BECAUSE its work already landed.
 
     Returns a result only when ALL THREE independent signals hold, and None

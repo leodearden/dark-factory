@@ -1313,6 +1313,63 @@ class TestResolveAlreadyLandedBranch:
             'the range probe must actually have been attempted'
         )
 
+    # --- (7b) a raising probe is also failing closed -------------------------
+
+    async def test_a_probe_that_RAISES_is_still_failing_closed(
+        self, git_repo: Path, git_ops: GitOps, monkeypatch,
+    ) -> None:
+        """Returning None is failing closed; RAISING is not.
+
+        The predicate sits inside the already-failing arm of a live merge
+        submission.  An exception escaping it would take down the whole
+        submission for what is a purely advisory recognition step — strictly
+        worse than the bug it is fixing.  And the probes really do raise:
+        ``_run`` raises ``WorktreeMissing`` when its cwd is gone, which is
+        exactly what a MagicMock ``git_ops.project_root`` produces.
+        """
+        plan_files = ['src/pkg/alpha.py']
+        await _land_via_merge(
+            git_repo, 'task/908', {f: f'# {f}\n' for f in plan_files},
+        )
+        parked = await _head_of(git_repo)
+        await _reseed(git_repo, 'task/908', parked)
+
+        async def boom(*a, **k):  # noqa: ARG001
+            raise RuntimeError('probe exploded')
+        monkeypatch.setattr('orchestrator.merge_gates._run', boom)
+
+        assert await _resolve(
+            plan_files, parked, parked, git_ops,
+            task_id='908', branch='task/908',
+        ) is None
+
+    async def test_a_missing_project_root_is_failing_closed(
+        self, git_ops: GitOps, tmp_path: Path,
+    ) -> None:
+        """The concrete shape that surfaced this: ``_run`` raises
+        ``WorktreeMissing`` — not a git rc — when the cwd does not exist."""
+        git_ops.project_root = tmp_path / 'does_not_exist'
+
+        assert await _resolve(
+            ['a.py'], 'base', 'head', git_ops,
+            task_id='909', branch='task/909',
+        ) is None
+
+    async def test_cancellation_is_not_swallowed(
+        self, git_ops: GitOps, monkeypatch,
+    ) -> None:
+        """Cancellation is not a git error.  Swallowing it would strand the
+        awaiting task in a state the caller believes it left."""
+        async def cancel(*a, **k):  # noqa: ARG001
+            raise asyncio.CancelledError
+        monkeypatch.setattr('orchestrator.merge_gates._run', cancel)
+
+        with pytest.raises(asyncio.CancelledError):
+            await _resolve(
+                ['a.py'], 'base', 'head', git_ops,
+                task_id='910', branch='task/910',
+            )
+
     # --- (8) nothing declared ------------------------------------------------
 
     async def test_no_declared_plan_files_is_not_an_already_landed_branch(
@@ -1512,7 +1569,11 @@ class TestSubmitToMergeQueueAlreadyLanded:
         assert base_sha == 'base_sha', 'the branch\'s RECORDED base, not HEAD'
         assert branch_head == 'fake_head_sha'
         assert kw.get('task_id') == wf.task_id
-        assert kw.get('branch') and '2656' in kw['branch']
+        # EXACT, not a substring: the merge-marker probe greps for the literal
+        # subject `Merge task/2656 into main`, so a double-prefixed
+        # `task/task/2656` would fail closed on a marker that is really there
+        # — and a substring assertion would wave it through.
+        assert kw.get('branch') == 'task/2656'
 
     # --- NEGATIVE — the unchanged path stays byte-identical ------------------
 

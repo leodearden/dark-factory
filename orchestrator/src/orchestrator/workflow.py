@@ -10410,6 +10410,85 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 )
                 narrowing_succeeded = False
                 if check.not_touched:
+                    # ALREADY-LANDED carve-out (task 3539).  Sited INSIDE the
+                    # already-failing arm and BEFORE the narrowing pass — not
+                    # alongside the cross-repo check at the top of the block —
+                    # so the three extra git probes are paid only on the path
+                    # that was going to escalate anyway, and the architect is
+                    # never asked to adjudicate work that is already on main.
+                    #
+                    # THE MECHANISM.  After a task's work merges, re-dispatching
+                    # it re-cuts task/<id> from post-landing main, which
+                    # correctly drops every commit as already-upstream and parks
+                    # the ref on one of MAIN'S OWN merge commits at 0 commits
+                    # ahead of its recorded base.  The gate reads that empty
+                    # range and emits the exact INVERSE of the truth —
+                    # plan_files_not_touched, via _mark_blocked(...,
+                    # escalate_to_human=True), whose default
+                    # category='task_failure' mints the escalation that PINS the
+                    # task.  The pin then vetoes the recovery that would have
+                    # marked it done, so the row churns and is re-dispatched,
+                    # repeating (measured: 39 consecutive recovery_vetoed over
+                    # 10.5h on task 3717).  Routing to an honest terminal
+                    # outcome on the NORMAL ladder — no escalate_to_human — is
+                    # what leaves the loop with no fuel.
+                    #
+                    # classify_block_reason deliberately does NOT map this new
+                    # prefix: it falls through to BlockClass.AGENT_FAILURE
+                    # exactly as CROSS_REPO_DELIVERABLE_REASON_PREFIX does.  It
+                    # must NOT be mapped to MERGE_VERIFY_RED, which would feed
+                    # the b3 gate a red that does not exist — nothing failed
+                    # verify here; the work is already on main.
+                    #
+                    # Imported directly from merge_gates (NOT the merge_queue
+                    # shim) for the same reason recorded on the cross-repo
+                    # import above: keep hot merge_queue.py out of this task's
+                    # lock scope.
+                    from orchestrator import merge_gates as _merge_gates
+                    already_landed = await _merge_gates.resolve_already_landed_branch(
+                        list(self._task_files),
+                        self._base_commit,
+                        branch_head.strip(),
+                        self.git_ops,
+                        task_id=self.task_id,
+                        # The merge-marker probe greps for the exact subject
+                        # `Merge <prefix><id> into main`, so it needs the
+                        # PREFIXED branch.  Both production call sites pass
+                        # `branch_name = self.task_id` (bare), same as the
+                        # rebind below — but stripping any prefix already
+                        # present before re-adding it makes the derivation
+                        # correct for a prefixed caller too, instead of
+                        # silently producing `task/task/<id>` and failing
+                        # closed on a marker that is really there.
+                        branch=(
+                            f'{self.config.git.branch_prefix}'
+                            f'{branch_name.split("/")[-1]}'
+                        ),
+                    )
+                    if already_landed is not None:
+                        _emit_merge_attempt(
+                            self.event_store, self.task_id,
+                            OutcomeKind.plan_files_already_landed,
+                        )
+                        reason = (
+                            f'{_merge_gates.ALREADY_LANDED_REASON_PREFIX}: '
+                            f'{", ".join(check.not_touched)}. '
+                            f'This branch is 0 commits ahead of its base '
+                            f'because the declared work ALREADY LANDED on '
+                            f'main at {already_landed.landed_sha} '
+                            f'(attributed by {already_landed.mechanism}), '
+                            f'which covers every declared entry: '
+                            f'{", ".join(already_landed.matched_files)}.  '
+                            f'Verify the landing and CLOSE this task — do not '
+                            f're-run the (legitimately empty) branch, and do '
+                            f'not narrow the plan to silence the gate.'
+                        )
+                        return await self._mark_blocked(
+                            reason,
+                            merge_phase=merge_phase,
+                            category='already_landed',
+                            suggested_action='verify_landing_and_close',
+                        )
                     narrowed = await self._try_narrow_plan(check.not_touched)
                     if narrowed:
                         # Re-check the (possibly narrowed) plan against the
