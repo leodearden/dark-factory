@@ -749,6 +749,31 @@ async def branch_work_landed(
     reads would invert the question into "is main's history contained in the
     branch?", which a freshly-created branch answers YES to.
 
+    **THE ORDERING RULE, and it is NORMATIVE — not defensive.** The arms run
+    in exactly this order and may not be reordered::
+
+        git preflight -> degenerate_branch -> no_op_landing -> patch-id
+                      -> landed / not_landed
+
+    Both guards describe states in which the patch-id arm would confidently
+    ACCEPT, which is why they must precede it rather than merely accompany it:
+
+    - a **no-op landing** really was merged, so every one of its commits is
+      patch-id-present in main — and its net contribution is nonetheless
+      empty.  ``git cherry`` is answering truthfully; the question it answers
+      is just not the one that decides whether anything shipped.
+    - a **degenerate branch** is patch-id-contained BY CONSTRUCTION: it is
+      parked at an old main commit and contributes no commits of its own, so
+      containment holds vacuously.
+
+    Run in the other order, the producer does not merely mis-report — it
+    attributes a FOREIGN commit's content to the task and stamps provenance
+    on it, with full confidence.  That is strictly worse than any false
+    negative here, because a false negative re-dispatches a task while a
+    false positive closes one that never delivered.  The ordering is pinned
+    mechanically by ``test_branch_work_landed.py``'s ``TestOrderingRule``,
+    which asserts what never runs rather than only what the verdict says.
+
     Pure and read-only, exactly as :func:`validate_landing_evidence` is: it
     never stamps a task done, never escalates and never mutates git or task
     state.  The caller owns the action.
@@ -818,6 +843,32 @@ async def branch_work_landed(
         # An unresolvable ref is a broken DETECTOR, not an unlanded task.
         probe['git_error_stage'] = 'resolve_branch_sha'
         return _reject(LandingReason.git_error)
+
+    # GUARD 1 — degenerate branch.  Passing the ALREADY-RESOLVED tip is
+    # mandatory, not an optimisation: re-reading the ref would let a
+    # concurrent warm-lane reseed land between the two reads, so the verdict
+    # could be anchored on a tip that is no longer the one the later arms
+    # judge (task 3103 review; see branch_is_degenerate's own docstring).
+    degenerate = await branch_is_degenerate(
+        git_ops, branch, metadata or {}, branch_tip_sha=head,
+    )
+    probe['degenerate'] = degenerate
+    if degenerate:
+        return _reject(LandingReason.degenerate_branch)
+
+    # GUARD 2 — no-op landing.  The probe out-parameter carries the tip's
+    # parent shas and the merge-base into the verdict, so an escalation body
+    # can show whether the tip is a merge without re-running git.
+    net_empty = await git_ops.net_diff_is_empty(upstream, head, probe=probe)
+    probe['net_diff_is_empty'] = net_empty
+    if net_empty is None:
+        # TRI-STATE, and the third state is NOT "not a no-op": collapsing it
+        # would launder a broken merge-base or an unreadable commit into a
+        # statement about the task.  Fully classified in a later step.
+        probe['git_error_stage'] = 'net_diff_is_empty'
+        return _reject(LandingReason.git_error)
+    if net_empty:
+        return _reject(LandingReason.no_op_landing)
 
     # Function-scoped: merge_queue.py imports from this module at module
     # level, so importing it back at module level would close an import cycle.

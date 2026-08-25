@@ -1004,10 +1004,18 @@ class TestDegenerateArmBackwardCompatibility:
         """The cost of the backward-compatible posture, pinned rather than hidden.
 
         Without the recorded base the producer CANNOT know the branch never
-        advanced, so it falls through — and lands on ``no_attribution``,
-        because nothing on main cites the task and no equivalent commit
-        resolves for a tip that contributed nothing.  A refusal, not a
-        confident accept: the fall-through degrades legibility, never safety.
+        advanced, so the degenerate arm is skipped and the next guard in the
+        normative order answers instead.  That guard is the no-op check, and
+        it catches this branch on its own terms: a tip parked at its fork
+        point IS its own merge-base, so ``merge-base(main, tip)..tip`` is
+        empty and the branch's net contribution is genuinely nothing.
+
+        So the fall-through costs LEGIBILITY — the operator is told "this
+        branch delivered no net change" rather than the sharper "this branch
+        never advanced past its base" — and never SAFETY: the verdict is still
+        a refusal, never the confident accept that patch-id containment would
+        have produced for a parked branch.  Pinned here so the degradation is
+        a recorded property rather than a surprise.
         """
         sc = build_degenerate_branch(repo)
         verdict = await branch_work_landed(
@@ -1015,5 +1023,6 @@ class TestDegenerateArmBackwardCompatibility:
             branch_tip_sha=sc.branch_tip_sha, metadata=None,
         )
         assert verdict.reason is not LandingReason.degenerate_branch
-        assert verdict.reason is LandingReason.no_attribution
+        assert verdict.reason is LandingReason.no_op_landing
         assert verdict.accepted is False
+        assert verdict.evidence_sha is None
