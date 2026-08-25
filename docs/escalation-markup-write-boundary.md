@@ -13,9 +13,18 @@ stopped it. It landed in the escalation queue instead. That boundary **is**
 guarded now, for DETECTION. It is **not** recovered, and the reason is
 self-referential and generalises. Details follow in four parts.
 
-Specimens: `escalation/tests/fixtures/markup_specimens/` (see its `README.md`
-for provenance and the measured signature). Executable form:
+Specimens: `escalation/tests/fixtures/markup_specimens/` — two corrupted
+records and their clean control. Executable form:
 `escalation/tests/test_markup_specimen_3514.py`.
+
+**Where the numbers live.** That fixture directory's `README.md` is the
+normative home for every measured figure — provenance, digests, the corruption
+signature table, the recovered lengths, the control comparison. This page keeps
+the narrative answer and links there rather than restating them, per INV-5
+(`no-lockstep-duplication`, `docs/legibility/design-invariants.md`): two copies
+of a measurement that must agree byte-for-byte is exactly the shape that drifts
+when one is re-measured. Where a figure appears below it is because the
+sentence is about that figure, not because the table is being mirrored.
 
 ---
 
@@ -37,17 +46,15 @@ corpus, containment worked exactly as designed.
 The write that *succeeded* was `escalate_info`, on the escalation MCP server.
 Two records carry the residue, and both show the silent sibling-argument-loss
 shape — `suggested_action` and `evidence` dropped from the arguments map and
-absorbed into `detail`:
-
-| record | `agent_role` | `len(detail)` | stored `suggested_action` | stored `evidence` |
-|---|---|---|---|---|
-| `esc-3514-1` | `implementer` | 2812 | `''` | `[]` |
-| `esc-3514-3` | `harness-orphan-reaper` | 2873 | `'manual_intervention'` | `[]` |
+absorbed into `detail`, where nothing reads them.
 
 `esc-3514-1` is the direct producer filing; `esc-3514-3` is the orphan reaper's
 re-filing, which propagated the identical corrupted `detail` verbatim. Nothing
 between the two filings noticed the markup — that propagation is part of the
-finding, not incidental to it.
+finding, not incidental to it. Per-record figures — detail lengths, pattern
+hits, what each stored in `suggested_action` — are in the fixture README's
+signature table, alongside the clean control that anchors what those figures
+do and do not prove.
 
 Both were reachable by none of 3083's tooling, for a structural reason rather
 than an oversight. 3083 shipped `MemoryService.scan_memory_content`,
@@ -111,13 +118,11 @@ markup leak*. That quotation is the second mis-close.
 
 Replacing only that one quoted literal with an inert placeholder — every other
 byte of `detail` untouched, verified by round-trip — flips the outcome:
-
-    repair(...) -> Repair(recovered={'evidence', 'suggested_action'})
-      suggested_action  261 chars, beginning "Attach these observations to
-                        DF task 3083 (root cause + retroactive corpus sweep)"
-      evidence          the three {observation, measured_at, ref} entries,
-                        each pinned to HEAD=860abb2210110deec67355c12b235b8b38f50c77
-      clean_value       1453 chars, and detect(clean_value) is None
+`repair()` returns a `Repair` recovering **both** swallowed siblings, the real
+`suggested_action` text and the three `{observation, measured_at, ref}`
+evidence entries, with a `clean_value` the detector no longer fires on. The
+recovered lengths and the exact strings are tabulated in the fixture README;
+`test_the_quoted_pattern_is_the_sole_blocker` asserts them against the bytes.
 
 **The quote is the sole blocker.** Generalised, and this is the part worth
 carrying forward:
@@ -135,22 +140,27 @@ recurring shape, not a one-off property of one record.
 
 ### A measurement correction
 
-Earlier write-ups of these records said "3 markup hits". The measured figures
-are **2 of the 3** patterns in `shared.toolcall_markup::MCP_MARKUP_PATTERNS`,
-with **5** literal opening angle brackets in `detail`. The "3" conflated the
-pattern count with the hit count. Use the fixture README's table.
+Earlier write-ups of these records said "3 markup hits", conflating the pattern
+count with the hit count. The corrected figures, and the correction itself, are
+recorded in the fixture README's signature table — read them there, not from
+memory or from any older write-up.
 
 ### And a caveat for any future sweep
 
 Sibling record `esc-3514-2` (same task, `agent_role=orchestrator`) is **clean**
-— zero matching patterns, `suggested_action` intact — and nevertheless stores
-`evidence == []`. An empty `evidence` list is therefore **not** a corruption
-signal on its own; most escalations simply never pass evidence. The
-discriminating pair is `detect()` firing on `detail` **plus** a
-`suggested_action` that is empty or a bare default while its real text sits
-inside `detail`. `esc-3514-3` is why "a bare default" must be in that
-predicate: its stored value is `manual_intervention`, which looks like an
-answer.
+— the detector does not fire on it and its `suggested_action` is intact — and
+nevertheless stores `evidence == []`. An empty `evidence` list is therefore
+**not** a corruption signal on its own; most escalations simply never pass
+evidence, so a sweep keyed on it would flag clean records.
+
+That is no longer a warning a sweep author has to read and believe. The control
+record is preserved beside the specimens as `esc-3514-2.json`, and
+`test_the_control_record_is_clean_yet_shares_the_empty_evidence_list` asserts
+both halves: the naive empty-evidence predicate fires on all three records, the
+discriminating pair on the two corrupted ones only. The predicate's exact legs
+— including why it must accept a plausible-looking default such as
+`manual_intervention` and not only an empty string — are stated once, in the
+fixture README, and implemented once, in that test.
 
 ---
 
@@ -158,8 +168,9 @@ answer.
 
 Stated explicitly so nothing here is quietly dropped.
 
-- **No production code was changed by task 3643.** It preserved two specimens,
-  made them load-bearing with a regression test, and wrote this page.
+- **No production code was changed by task 3643.** It preserved two corrupted
+  specimens and their clean control, made them load-bearing with a regression
+  test, and wrote this page.
 - **The fix does not belong here.** PRD `plans/toolcall-markup-containment-prd.md`
   D7 puts the originating defect model-side (wrong closing-tag dialect) and the
   amplification harness-side (over-consuming instead of raising a parse error),
@@ -175,7 +186,9 @@ Stated explicitly so nothing here is quietly dropped.
 - **There is still no discovery sweep for this class in `data/escalations/`.**
   Task 3691 (the escalation-corpus sweep) is the intended consumer of these
   fixtures; until it lands, the size of this population is unmeasured. Two
-  records is what was found by hand, not a count.
+  records is what was found by hand, not a count. The predicate that sweep
+  should use is committed and tested against a clean control (see the caveat
+  above); what is missing is the sweep that runs it.
 - **The repair gap is filed as a follow-up**, to be coordinated with the
   3688 / 3689 / 3690 owners rather than patched independently.
 
@@ -191,7 +204,7 @@ Stated explicitly so nothing here is quietly dropped.
 | 3690 | Registering that guard on the **escalation** server, with the residue sink. |
 | 4458 | Registering it on the **fused-memory** server, retiring 3141's four gates. |
 | 3691 | The escalation-corpus sweep — the intended consumer of these fixtures. |
-| **3643** | **This page, the two preserved specimens, and the regression test that pins the verdict.** |
+| **3643** | **This page, the two preserved specimens plus their clean control, and the regression test that pins the verdict.** |
 
 ## If the unrepairable pin ever fails
 
