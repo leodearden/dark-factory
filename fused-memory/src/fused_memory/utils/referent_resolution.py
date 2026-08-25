@@ -216,6 +216,45 @@ def _local_project(group_id: str) -> str:
         return ''
 
 
+def local_referent(referent: Referent, *, group_id: str) -> Referent:
+    """Apply the self-qualified reclassification to an already-parsed referent.
+
+    PUBLIC, unlike its :func:`_local_project` collaborator, because the rule has
+    a FOURTH consumer outside this module: the verification sub-pass
+    (``memory_service._verify_episode_referents``, PRD leaf ζ) parses edge
+    ENDPOINT NODE NAMES with :func:`~fused_memory.utils.canonical_labels.parse_node_name`
+    and compares the result against referents that came through this module. A
+    bare parse keeps the qualifier, so in group ``'dark_factory'`` an endpoint
+    node named ``'dark_factory:3127'`` parsed to
+    ``Referent(number='3127', project_id='dark_factory')`` while
+    :func:`~fused_memory.utils.canonical_labels.scan_content` and
+    :func:`resolve_referents` both answered the LOCAL
+    ``Referent(number='3127')`` for the identical spelling — so the endpoint
+    compared unequal to the very referent the write declared itself to be
+    about, and ζ emitted a repair instruction for a correctly-attached edge.
+
+    That is the exact source-invariance break this module's docstring forbids —
+    "a given spelling denotes the same node whichever source happens to win" —
+    so the remedy is a shared callable rather than a fourth inline copy of
+    ``project_id == local``. Exporting it keeps the rule at ONE site per INV-5,
+    which is the same reasoning that produced :func:`_local_project` after the
+    metadata path was found to have skipped the rule entirely.
+
+    Returns *referent* UNCHANGED when it is already own-project, when
+    *group_id* names no canonical project (the ``''`` sentinel — see
+    :func:`_local_project`, and note that keeping a foreign referent foreign is
+    strictly safer than collapsing it onto an untrustworthy local id), or when
+    the qualifier names a genuinely different project.
+    """
+    local = _local_project(group_id)
+    if referent.project_id and local and referent.project_id == local:
+        # Rebuilt through the constructor rather than dataclasses.replace, so
+        # the frozen vocabulary type's __post_init__ validation runs on the
+        # reclassified value too.
+        return Referent(kind=referent.kind, number=referent.number)
+    return referent
+
+
 def _conflicting_referents(declared: ReferentSet, scan: LabelScan) -> ReferentSet:
     """The declared referents the scanned content CONTRADICTS.
 
@@ -576,17 +615,11 @@ def _metadata_referents(metadata: dict | None, *, group_id: str) -> ReferentSet:
         # needs canonicalizing here — do not add a second canonicalize of the
         # parsed side.
         #
-        # The `referent.project_id and local` guard is what keeps a foreign
-        # referent foreign when group_id is path-shaped; :func:`_local_project`
-        # explains the '' sentinel it guards against. Same guard, same reason,
-        # as on the declared path.
-        local = _local_project(group_id)
-        if referent.project_id and local and referent.project_id == local:
-            # Rebuilt through the constructor rather than dataclasses.replace,
-            # so the frozen vocabulary type's __post_init__ validation runs on
-            # the reclassified value too.
-            referent = Referent(kind=referent.kind, number=referent.number)
-        return (referent,)
+        # Through :func:`local_referent`, which is THE site for the rule — the
+        # same guard, and the same reason, as on the declared path. ζ's
+        # endpoint-name path reads it too, so a change here cannot leave that
+        # consumer comparing against a differently-classified referent.
+        return (local_referent(referent, group_id=group_id),)
 
     # Exactly ONE shape of our own: the bare digit run that metadata.task_id
     # actually carries, and the one parse_node_name is anchored to refuse.
