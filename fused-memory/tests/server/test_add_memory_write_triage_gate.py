@@ -38,7 +38,7 @@ from fused_memory.config.schema import ProceduralTopicCluster
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.memory import MemoryResult
 from fused_memory.server import tools, write_triage
-from fused_memory.server.grouped_read import PARENT_ID_KEY, SIGHTING_KIND
+from fused_memory.server.grouped_read import AMENDMENT_KIND, PARENT_ID_KEY, SIGHTING_KIND
 from fused_memory.server.tools import create_mcp_server
 from fused_memory.server.write_triage import (
     _FAIL_OPEN_STORM_THRESHOLD,
@@ -71,6 +71,10 @@ _CANONICAL_CONTENT = (
 # rounding change would silently reclassify them.
 _T_HIGH = 0.90
 _T_LOW = 0.70
+
+#: A caller-supplied parent id, in the full-UUID shape `memory_metadata`
+#: validates `parent_id` against.
+_EXPLICIT_PARENT = '11111111-2222-3333-4444-555555555555'
 
 
 def _candidate(
@@ -607,7 +611,7 @@ class TestTheFlagOnPathRetiresBothRejectGuards:
 
 
 class TestTheForceStoreArms:
-    """Two inputs that skip triage entirely, even with the flag on."""
+    """Inputs that skip triage entirely, even with the flag on."""
 
     @pytest.mark.asyncio
     async def test_allow_near_duplicate_forces_a_plain_store(self) -> None:
@@ -696,6 +700,83 @@ class TestTheForceStoreArms:
         metadata = mock_service.add_memory.await_args.kwargs['metadata']
         assert PARENT_ID_KEY not in (metadata or {}), f'{metadata!r}'
         mock_service.search.assert_not_awaited()
+
+
+    @pytest.mark.asyncio
+    async def test_an_explicit_parent_link_survives_triage_unchanged(self) -> None:
+        """A caller-declared child is a decision triage does not get to revise.
+
+        `parent_id` and `kind` are first-class caller-supplied Tier-A metadata
+        keys — `memory_metadata` validates both and `MemoryService` resolves
+        parent liveness — so an agent CAN submit an explicit child through
+        `add_memory`. The attach arm overwrites BOTH keys, so without a
+        force-store the declared parentage is discarded and a declared
+        `amendment` is demoted to a `sighting`. That demotion is a C1 content
+        loss: `grouped_read._read_grouped_document` surfaces amendment TEXT as
+        digests while sightings are only COUNTED, so the submitted content
+        stops being readable in the grouped document.
+        """
+        mock_service = AsyncMock()
+        _configure_config(mock_service, enabled=True)
+        _configure_pass_through_add_memory(mock_service)
+        mock_service.search.return_value = [_candidate('canonical-A', 0.97)]
+        server = create_mcp_server(mock_service)
+
+        result = await _call(
+            server,
+            metadata={'parent_id': _EXPLICIT_PARENT, 'kind': AMENDMENT_KIND},
+        )
+
+        assert result[ROUTED_KEY] == OUTCOME_STORED, f'{result!r}'
+        assert CANONICAL_ID_KEY not in result, f're-parented by triage: {result!r}'
+        metadata = mock_service.add_memory.await_args.kwargs['metadata']
+        assert metadata[PARENT_ID_KEY] == _EXPLICIT_PARENT, f'{metadata!r}'
+        assert metadata['kind'] == AMENDMENT_KIND, f'demoted to a sighting: {metadata!r}'
+        mock_service.search.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_declared_child_kind_alone_force_stores(self) -> None:
+        """Either key alone is enough — the attach overwrites BOTH.
+
+        Deliberately wider than `grouped_read._parent_id_in_meta`, which needs
+        both keys well-formed to answer "does this record group?". The question
+        here is "did the caller say anything about parentage that triage would
+        overwrite?", and a half-declared link is a caller bug for
+        `memory_metadata` validation to report, not one for triage to hide by
+        quietly converting it into an attach.
+        """
+        mock_service = AsyncMock()
+        _configure_config(mock_service, enabled=True)
+        _configure_pass_through_add_memory(mock_service)
+        mock_service.search.return_value = [_candidate('canonical-A', 0.97)]
+        server = create_mcp_server(mock_service)
+
+        result = await _call(server, metadata={'kind': SIGHTING_KIND})
+
+        assert result[ROUTED_KEY] == OUTCOME_STORED, f'{result!r}'
+        assert CANONICAL_ID_KEY not in result, f'{result!r}'
+        metadata = mock_service.add_memory.await_args.kwargs['metadata']
+        assert PARENT_ID_KEY not in (metadata or {}), f'invented a parent: {metadata!r}'
+        assert metadata['kind'] == SIGHTING_KIND, f'{metadata!r}'
+
+    @pytest.mark.asyncio
+    async def test_a_non_child_kind_still_triages(self) -> None:
+        """The predicate is scoped: an ordinary `kind` is not a parentage claim.
+
+        Guards the other direction of the same edge — force-storing on ANY
+        `kind` value would disable triage for a large slice of the corpus
+        silently, which is the failure mode the whole module exists to avoid.
+        """
+        mock_service = AsyncMock()
+        _configure_config(mock_service, enabled=True)
+        _configure_pass_through_add_memory(mock_service)
+        mock_service.search.return_value = [_candidate('canonical-A', 0.97)]
+        server = create_mcp_server(mock_service)
+
+        result = await _call(server, metadata={'kind': 'decision'})
+
+        assert result[ROUTED_KEY] == OUTCOME_RESTATED, f'{result!r}'
+        assert result[CANONICAL_ID_KEY] == 'canonical-A', f'{result!r}'
 
 
 class TestC1HoldsEndToEnd:

@@ -300,6 +300,38 @@ class BandDecision:
     t_low: float | None
 
 
+def declares_child_link(metadata: Any) -> bool:
+    """True when the CALLER's own *metadata* already declares a child record.
+
+    ``parent_id`` and ``kind`` are first-class caller-supplied Tier-A metadata
+    keys — ``memory_metadata`` validates ``kind`` against the registry and
+    ``parent_id`` for UUID shape, and ``MemoryService`` resolves parent
+    liveness — so an agent CAN and does submit an explicit child through
+    ``add_memory``. When it does, the parentage is a DECLARED INTENT, not a
+    gap for triage to fill: rerouting it would silently re-parent the record
+    under whatever triage picked, and an ``amendment`` re-labelled as a
+    ``sighting`` stops contributing its TEXT to the grouped document (an
+    amendment surfaces as a digest; a sighting is only counted). That is a C1
+    content loss produced by the mechanism built to prevent one, so a declared
+    child force-stores exactly as ``allow_near_duplicate`` does.
+
+    Deliberately an OR over the two keys, and deliberately WIDER than
+    ``grouped_read._parent_id_in_meta`` (which requires both, well-formed).
+    That reader is answering "does this record group?"; this predicate is
+    answering "did the caller say something about parentage that triage would
+    overwrite?" — and triage's attach overwrites BOTH keys, so either one
+    present is enough to make an override lossy. A half-declared link (a
+    ``parent_id`` with no child ``kind``, say) is a caller bug that
+    ``memory_metadata`` validation owns; quietly "fixing" it into a triage
+    attach would hide it.
+    """
+    if not isinstance(metadata, dict):
+        return False
+    if metadata.get('kind') in CHILD_KINDS:
+        return True
+    return PARENT_ID_KEY in metadata
+
+
 def _canonical_id_of(result: MemoryResult) -> str:
     """The id a write should attach to for *result* — hoisting a CHILD.
 
@@ -651,6 +683,7 @@ async def triage_write(
     counter: TriageFailOpenCounter,
     judge: Any = None,
     allow_near_duplicate: bool = False,
+    caller_declared_child: bool = False,
     is_recon_stage_agent: bool = False,
 ) -> BandDecision:
     """Route one ``add_memory`` write. NEVER raises, NEVER blocks, NEVER errors.
@@ -672,10 +705,12 @@ async def triage_write(
     fail-open — so a changed ``MemoryService.search`` signature surfaces as a
     storm escalation rather than as a stream of errored writes.
 
-    *allow_near_duplicate* and *is_recon_stage_agent* are passed IN rather than
-    recomputed: ``add_memory`` already derives both from the metadata and the
-    agent_id it holds, and a second derivation here is a second place for the
-    two to disagree about who is exempt.
+    *allow_near_duplicate*, *caller_declared_child* and *is_recon_stage_agent*
+    are passed IN rather than recomputed: ``add_memory`` already derives all
+    three from the metadata and the agent_id it holds, and a second derivation
+    here is a second place for them to disagree about who is exempt.
+    :func:`declares_child_link` is the one spelling of the
+    *caller_declared_child* predicate.
     """
     if allow_near_duplicate:
         # D2 reinterprets the retired guard's bypass flag as triage's
@@ -688,6 +723,21 @@ async def triage_write(
         # vector round-trip, and a writer who has already declared the content
         # distinct should not pay for a lookup whose answer cannot change the
         # outcome.
+        return BandDecision(OUTCOME_STORED, None, None, None, None)
+
+    if caller_declared_child:
+        # The caller already declared this record's parentage (a ``parent_id``
+        # and/or a child ``kind``), and an attach OVERWRITES both of those
+        # keys. Routing it would re-parent the record under whatever canonical
+        # triage picked, and would demote a declared ``amendment`` to a
+        # ``sighting`` — whose TEXT never reaches the grouped document, since
+        # an amendment surfaces as a digest and a sighting is only counted.
+        # That is a C1 content loss caused by the C1 mechanism, so an explicit
+        # declaration wins: triage does not get a second vote on a decision
+        # the caller already made.
+        #
+        # Returned before retrieval for the same reason as the flag above: no
+        # candidate can change the answer, so no round-trip is spent asking.
         return BandDecision(OUTCOME_STORED, None, None, None, None)
 
     if is_recon_stage_agent:

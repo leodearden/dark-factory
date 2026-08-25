@@ -48,6 +48,7 @@ from fused_memory.server.write_triage import (
     _stub_judge,
     attach_write_landed,
     decide_band,
+    declares_child_link,
     emit_triage_fail_open_storm_escalation,
     resolve_bands,
     resolve_candidate_k,
@@ -967,6 +968,50 @@ class TestTriageFailOpenCounter:
         assert summary['projects'] == []
 
 
+class TestDeclaresChildLink:
+    """The caller-declared-parentage force-store predicate.
+
+    Deliberately WIDER than `grouped_read._parent_id_in_meta`, which requires
+    both a child `kind` AND a well-formed `parent_id` because it answers "does
+    this record group?". This predicate answers a different question — "did
+    the caller say anything about parentage that a triage attach would
+    overwrite?" — and the attach overwrites BOTH keys, so either one present
+    on its own already makes an override lossy.
+    """
+
+    @pytest.mark.parametrize(
+        ('label', 'metadata'),
+        [
+            ('a full explicit child', {'parent_id': 'p-1', 'kind': 'amendment'}),
+            ('a sighting', {'parent_id': 'p-1', 'kind': 'sighting'}),
+            ('a parent_id with no kind', {'parent_id': 'p-1'}),
+            ('a child kind with no parent_id', {'kind': 'amendment'}),
+            ('an empty parent_id the caller still declared', {'parent_id': ''}),
+        ],
+    )
+    def test_a_declared_link_force_stores(self, label, metadata) -> None:
+        assert declares_child_link(metadata) is True, label
+
+    @pytest.mark.parametrize(
+        ('label', 'metadata'),
+        [
+            ('no metadata at all', None),
+            ('empty metadata', {}),
+            ('an unrelated key', {'source': 'notes'}),
+            ('a non-child kind', {'kind': 'decision'}),
+            ('a non-dict', 'parent_id=p-1'),
+        ],
+    )
+    def test_everything_else_still_triages(self, label, metadata) -> None:
+        """Scoped on purpose.
+
+        Force-storing on ANY `kind` value, or on an unreadable metadata shape,
+        would disable triage for a large slice of the corpus with no signal —
+        the silent degradation the module exists to prevent.
+        """
+        assert declares_child_link(metadata) is False, label
+
+
 class TestTriageWriteFailsOpen:
     """C1 is ABSOLUTE: never an error, never a blocked write, always a decision."""
 
@@ -976,6 +1021,31 @@ class TestTriageWriteFailsOpen:
                           'candidate_k': 20, **write_triage})
         service.search = search or AsyncMock(return_value=[])
         return service
+
+    @pytest.mark.asyncio
+    async def test_a_caller_declared_child_force_stores_before_retrieval(self) -> None:
+        """An explicit parentage skips triage entirely — and skips the lookup.
+
+        Same shape as `allow_near_duplicate`: no candidate can change the
+        answer, so no embedding + vector round-trip is spent asking. Pinned
+        because the ONLY thing keeping the attach arm's unconditional
+        `parent_id`/`kind` overwrite honest is that this write never reaches
+        it.
+        """
+        counter = TriageFailOpenCounter(time_provider=_Clock())
+        service = self._service(
+            search=AsyncMock(return_value=[_result('m1', 0.99)]),
+        )
+
+        decision = await triage_write(
+            service, content='c', project_id='p', counter=counter,
+            caller_declared_child=True,
+        )
+
+        assert decision.outcome == OUTCOME_STORED
+        assert decision.canonical_id is None
+        service.search.assert_not_awaited()
+        assert counter.live_count() == 0, 'a force-store is not a fail-open'
 
     @pytest.mark.asyncio
     async def test_a_raising_search_stores_and_counts_once(self) -> None:

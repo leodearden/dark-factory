@@ -130,6 +130,7 @@ from fused_memory.server.write_triage import (
     ROUTED_KEY,
     TriageFailOpenCounter,
     attach_write_landed,
+    declares_child_link,
     emit_triage_fail_open_storm_escalation,
     resolve_write_triage_enabled,
     triage_write,
@@ -3043,7 +3044,9 @@ def create_mcp_server(
         reinterpreted rather than retired: it now means FORCE-STORE — store
         this standalone, do not reroute it — for the same reason it meant
         "do not reject me" before. recon-stage-* agents are likewise
-        force-stored.
+        force-stored, as is any write whose own metadata already declares a
+        child link (a ``parent_id`` and/or ``kind`` in {amendment, sighting}):
+        an explicit parentage is a decision triage does not override.
 
         Content carrying a raw MCP envelope fragment is REJECTED outright
         (error_type=mcp_markup_detected, or mcp_markup_unrepairable when the
@@ -3192,6 +3195,11 @@ def create_mcp_server(
         allow_near_duplicate = (
             isinstance(metadata, dict) and metadata.get('allow_near_duplicate') is True
         )
+        # A caller-supplied `parent_id`/child `kind` is an EXPLICIT parentage
+        # declaration, and the attach below overwrites both keys — so it
+        # force-stores exactly like allow_near_duplicate. See
+        # write_triage.declares_child_link for why either key alone is enough.
+        caller_declared_child = declares_child_link(metadata)
         is_recon_stage_agent = isinstance(agent_id, str) and agent_id.startswith('recon-stage-')
         # Write triage (task 3127, PRD leaf beta) SUPERSEDES the two reject
         # guards below rather than layering on top of them (D2: redirect
@@ -3220,6 +3228,7 @@ def create_mcp_server(
                 # recomputed inside triage_write: a second derivation is a
                 # second place for the two to disagree about who is exempt.
                 allow_near_duplicate=allow_near_duplicate,
+                caller_declared_child=caller_declared_child,
                 is_recon_stage_agent=is_recon_stage_agent,
             )
         if (
@@ -3349,6 +3358,11 @@ def create_mcp_server(
             _triage_fail_open_counter.record(project=project_id)
         write_meta = cleaned_meta
         if attached_to is not None:
+            # Overwriting the caller's PARENT_ID_KEY/`kind` here is safe ONLY
+            # because `caller_declared_child` force-stored every write that
+            # carried either key, so neither can be present. Removing that
+            # force-store silently re-parents explicit children and demotes
+            # declared amendments to sightings.
             write_meta = {
                 **(cleaned_meta or {}),
                 PARENT_ID_KEY: attached_to,
