@@ -42,6 +42,7 @@ because ``--import-mode=importlib`` deliberately does not).
 
 from __future__ import annotations
 
+import ast
 import json
 import subprocess
 import sys
@@ -61,6 +62,19 @@ from shared.locking import EXTENSIONLESS_FILENAMES, FILE_EXTENSIONS, is_file_pat
 # the in-suite Tier-1 guard cannot disagree about what dark-factory declares.
 DF_EXTENSIONS = sorted(FILE_EXTENSIONS)
 DF_EXTENSIONLESS = sorted(EXTENSIONLESS_FILENAMES)
+
+
+def _source_ast() -> ast.Module:
+    """The module-under-test's source, PARSED — never scanned as text.
+
+    Two structural guards below ("no parents[N] hop", "no ambient environ
+    re-read") describe things the script must not DO.  A substring scan cannot
+    express that, because the script's own docstrings EXPLAIN at length why it
+    does neither — a text scan fires on the explanation and would push a future
+    maintainer to delete the rationale in order to go green, which is the worst
+    possible incentive to build into a guard.  The AST sees code only.
+    """
+    return ast.parse(Path(drift.__file__).read_text())
 
 
 @pytest.fixture(autouse=True)
@@ -685,11 +699,23 @@ class TestResolve:
         both, and orchestrator verify runs in a worktree while an operator's
         shell runs in a bare checkout.  A fixed index here would silently
         resolve to a different repo depending on who invoked the script.
+
+        Asserted over the AST rather than as a substring scan, for the reason
+        given on `_source_ast`: the module's own prose EXPLAINS why parents[N]
+        is a regression, and a text scan would fire on that explanation.  The
+        AST form is also strictly stronger — it catches ``p.parents[3]``,
+        ``x.parents [3]`` and an aliased ``par = p.parents; par[3]`` alike.
         """
-        src = Path(drift.__file__).read_text()
-        assert 'parents[' not in src, (
-            'fixed parents[N] arithmetic is a REGRESSION, not a fix — delegate '
-            'to shared.reify_checkout.resolve_reify_checkout instead'
+        hops = [
+            ast.dump(node)
+            for node in ast.walk(_source_ast())
+            if isinstance(node, ast.Subscript)
+            and isinstance(node.value, ast.Attribute)
+            and node.value.attr == 'parents'
+        ]
+        assert hops == [], (
+            f'fixed parents[N] arithmetic is a REGRESSION, not a fix — delegate '
+            f'to shared.reify_checkout.resolve_reify_checkout instead: {hops!r}'
         )
 
     def test_explicit_repo_beats_reify_root(self, tmp_path, monkeypatch):
@@ -718,16 +744,28 @@ class TestResolve:
         assert checkout.root == (tmp_path / 'from-env').resolve()
         assert checkout.named_by_env is True
 
-    def test_no_ambient_environ_reread(self, tmp_path, monkeypatch):
-        """This module must not read REIFY_ROOT itself — the resolver owns that arm.
+    def test_no_ambient_environ_reread(self):
+        """This module must not read the environment itself — the resolver owns that arm.
 
         An ambient re-read is what lets a message blame the operator for a
         DISCOVERED root (see `reify_skip_reason`'s docstring).  Keeping the read
         inside the resolver means the answer and its provenance are produced
         together and cannot disagree.
+
+        Asserted over the AST rather than as a substring scan, for the reason
+        given on `_source_ast`: the module's own prose EXPLAINS why it does not
+        re-read REIFY_ROOT, and a text scan would fire on that explanation.
         """
-        src = Path(drift.__file__).read_text()
-        assert 'REIFY_ROOT' not in src.replace('REIFY_ROOT_ENV', '')
+        reads = [
+            node.attr
+            for node in ast.walk(_source_ast())
+            if isinstance(node, ast.Attribute) and node.attr in ('environ', 'getenv')
+        ]
+        assert reads == [], (
+            f'environment access {reads!r} in the script — the REIFY_ROOT arm '
+            f'belongs to shared.reify_checkout.resolve_reify_checkout, so that '
+            f'the answer and its provenance are produced together'
+        )
 
     @pytest.mark.parametrize(
         'layout',

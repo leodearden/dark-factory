@@ -56,10 +56,14 @@ Contract pinned by ``tests/scripts/test_check_lock_charter_drift.py``.
 
 from __future__ import annotations
 
+import argparse
+import json
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
+import shared.reify_checkout as reify_checkout
 from shared.locking import EXTENSIONLESS_FILENAMES, FILE_EXTENSIONS, is_file_path
 
 # --------------------------------------------------------------------------
@@ -401,3 +405,111 @@ def check(reify_repo: Path, *, timeout: float = GUARD_TIMEOUT_SECS) -> Report:
         'parts': parts,
         'detail': '\n'.join(f'[{name}] {p["detail"]}' for name, p in parts.items()),
     }
+
+
+def resolve(explicit: str | None = None) -> reify_checkout.ReifyCheckout:
+    """Locate the reify checkout to compare against, with its PROVENANCE.
+
+    Precedence: an explicit ``--reify-repo`` out-ranks everything (the operator
+    saying "this one, now"), and everything else is delegated VERBATIM to
+    `shared.reify_checkout.resolve_reify_checkout`, which already owns the
+    ``$REIFY_ROOT``-then-nearest-ancestor order.
+
+    THREE THINGS ARE DELIBERATELY NOT DONE HERE, each of which has already been
+    a bug in this lineage:
+
+      * No local copy of the ancestor walk.  `shared.reify_checkout` exists to
+        be the one implementation; the stale WIP this task discarded carried a
+        private ``resolve_reify_repo``, which is how two call sites drift.
+      * No re-read of ``os.environ['REIFY_ROOT']``.  The env arm belongs to the
+        resolver, so the answer and its provenance are produced together — an
+        ambient re-read is what lets a message say "(named by REIFY_ROOT)" about
+        a root that was actually DISCOVERED, blaming the operator for a path
+        they never typed (see `reify_skip_reason`'s docstring).
+      * No ``Path(__file__).parents[N]`` hop.  Measured in the resolver's
+        docstring: ``.worktrees/<id>`` contributes exactly two segments, so
+        parents[5] is right in a worktree and parents[3] is right in a bare
+        checkout — no fixed index is right in both, and this script is run from
+        both.
+
+    *start* is this module's own file, and that is what makes the answer
+    independent of the CALLER's cwd: an operator in a worktree and a cron job in
+    the main checkout resolve the same sibling.
+
+    The explicit arm reports ``named_by_env=False`` because a flag-named root
+    did not come from the env var — claiming otherwise would misattribute the
+    choice in any downstream message.
+    """
+    if explicit is not None:
+        return reify_checkout.ReifyCheckout(Path(explicit).expanduser().resolve(), False)
+    return reify_checkout.resolve_reify_checkout(GUARD_RELPATH, start=Path(__file__))
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Run the reconciliation and return its exit code.
+
+    STREAM ROUTING IS PART OF THE CONTRACT.  An OK line goes to stdout; DRIFT
+    and UNAVAILABLE go to stderr.  The wrapper this is meant to live in — a cron
+    entry, a scheduled lane — discards stdout and surfaces stderr, so a drift
+    report written to stdout would be silently thrown away by exactly the
+    caller that most needs it.
+
+    ``--json`` is the MACHINE channel and goes to stdout for EVERY status,
+    including drift and unavailable: a consumer that piped ``--json`` and got
+    nothing on the run it most needs to parse would have to fall back to
+    scraping the human text.
+
+    A resolution problem short-circuits before any comparison, and its message
+    comes from `shared.reify_checkout.reify_skip_reason` rather than a local
+    string.  That single-sourcing is what keeps the two arms distinct — the
+    benign standalone-checkout MISS ("nobody has reify here") versus an
+    operator's ``REIFY_ROOT`` naming a path that is not there — which two
+    hand-rolled strings in two call sites reliably conflate.
+    """
+    parser = argparse.ArgumentParser(
+        prog='check_lock_charter_drift.py',
+        description=(
+            'Reconcile reify and dark-factory lock-charter declarations. '
+            'Exits 0 (agree), 1 (drift), or 2 (could not check). There is no '
+            'skip: 2 is a LOUD "not checked", never a pass.'
+        ),
+    )
+    parser.add_argument(
+        '--reify-repo',
+        default=None,
+        help='reify checkout to compare against (out-ranks $REIFY_ROOT and discovery)',
+    )
+    parser.add_argument(
+        '--json', action='store_true', help='emit the full report as JSON on stdout'
+    )
+    args = parser.parse_args(argv)
+
+    checkout = resolve(args.reify_repo)
+    reason = reify_checkout.reify_skip_reason(
+        GUARD_RELPATH, checkout.root, named_by_env=checkout.named_by_env
+    )
+    if reason is not None:
+        report: Report = {
+            'status': _STATUS_BY_EXIT[EXIT_UNAVAILABLE],
+            'exit_code': EXIT_UNAVAILABLE,
+            'parts': {},
+            'detail': (
+                f'cross-repo lock-charter reconciliation NOT PERFORMED: {reason}.  '
+                f'This is not a pass — nothing was compared.'
+            ),
+        }
+    else:
+        assert checkout.root is not None  # reify_skip_reason returned None
+        report = check(checkout.root)
+
+    if args.json:
+        print(json.dumps(report, indent=2, sort_keys=True))
+    elif report['exit_code'] == EXIT_OK:
+        print(report['detail'])
+    else:
+        print(report['detail'], file=sys.stderr)
+    return report['exit_code']
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))
