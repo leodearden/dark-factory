@@ -425,19 +425,29 @@ def _spy_chain_lane_release(monkeypatch) -> list[tuple]:
     return calls
 
 
-def _spy_advance_main(git_ops: GitOps, monkeypatch) -> list[tuple]:
+def _spy_advance_main(git_ops: GitOps, monkeypatch, *, hook=None) -> list[tuple]:
     """Record every ``advance_main`` call as ``(merge_sha, expected_main)``.
 
     Spied on the GitOps INSTANCE (not a merge_queue module reach-back, which
     test_merge_queue_reachback_patch_guard.py freezes) and PASSTHROUGH, so main
     really moves and the recorded ``expected_main`` chain can be checked against
     real history.  Template: test_merge_speculation.py:2280-2295.
+
+    *hook*, when given, is awaited with the 1-based call ordinal BEFORE the
+    passthrough.  Returning ``None`` falls through to the real
+    ``advance_main``; returning an :class:`~orchestrator.git_ops.AdvanceOutcome`
+    (or raising) SHORT-CIRCUITS that one call, which is how a δ scenario
+    injects the mid-walk failure it is about.
     """
     calls: list[tuple] = []
     real = git_ops.advance_main
 
     async def _recording(merge_sha, merge_worktree=None, **kwargs):
         calls.append((merge_sha, kwargs.get('expected_main'), merge_worktree))
+        if hook is not None:
+            injected = await hook(len(calls))
+            if injected is not None:
+                return injected
         return await real(merge_sha, merge_worktree, **kwargs)
 
     monkeypatch.setattr(git_ops, 'advance_main', _recording)
@@ -1063,102 +1073,125 @@ def _events_for_task(db_path: Path, task_id: str) -> list[str]:
     return [r[0] for r in rows]
 
 
+async def _prefix_scene_upto_finalize(
+    git_repo: Path, tmp_path: Path, monkeypatch, *,
+    db_name: str = 'delta-walk.db', advance_hook=None, verify_outcome=None,
+) -> dict:
+    """Build a 4-item clean chain with a green tip, stopping just BEFORE
+    ``_finalize_inflight``, and return everything the assertions read.
+
+    Shared by every δ landing scenario — full landing, stale-CAS abort and
+    typed-lease defer alike — so each differs ONLY in what it interposes and
+    in what it does with the returned ``entry``.  *advance_hook* is forwarded
+    to :func:`_spy_advance_main`, which is how a scenario makes main move (or
+    a synthetic :class:`AdvanceOutcome` appear) partway down the walk.
+
+    *verify_outcome* is ``_run_post_merge_verify``'s return value in
+    :func:`_spy_post_merge_verify`'s vocabulary — ``None`` is a PASS (a GREEN
+    tip, the adopting arm), a :class:`VerifyResult` is a FAIL.
+
+    ``advance_main`` is NOT stubbed — it is spied PASSTHROUGH, so main really
+    moves and the recorded ``expected_main`` chain can be checked against real
+    history.
+    """
+    from orchestrator.event_store import EventStore
+    from orchestrator.merge_queue import enqueue_merge_request
+    from orchestrator.merge_types import InflightEntry
+
+    git_ops = _make_git_ops(git_repo, size=2)
+    config = _make_config(git_repo, chain_cap=6)
+    await _create_branch_editing(git_repo, 'task/101', 'a.txt', 'edit-101\n')
+    await _create_branch_editing(
+        git_repo, 'task/102', 'shared.txt', _shared_txt_with(5, 'from-102'),
+    )
+    await _create_branch_editing(git_repo, 'task/103', 'c.txt', 'edit-103\n')
+    await _create_branch_editing(git_repo, 'task/104', 'd.txt', 'edit-104\n')
+    await _create_branch_editing(
+        git_repo, 'task/105', 'shared.txt', _shared_txt_with(5, 'from-105'),
+    )
+    head_mc = await _merge_commit_off_main(git_repo, 'task/101', '101')
+    main_sha = await _rev_parse(git_repo, 'main')
+
+    db_path = tmp_path / db_name
+    store = EventStore(db_path, 'run-delta-walk')
+    worker = _make_worker(git_ops)
+    worker._event_store = store
+
+    # Every request goes on through the REAL enqueue chokepoint: that is
+    # what registers `_on_finalized`, and `merge_finalized` has no other
+    # emit site (merge_queue.py:4763-4777).  Draining them into the lane
+    # buffers is likewise the real path — it is what registers each id at
+    # LANE_BUFFERED, so the "reaches TERMINAL" assertion below is a claim
+    # about a genuinely-tracked request rather than an unregistered one.
+    reqs: dict[str, MergeRequest] = {}
+    for tid in ('101', *_DELTA_LINKS, _DELTA_TRUNCATOR):
+        reqs[tid] = _make_req(tid, tid, config, git_repo)
+        await enqueue_merge_request(worker._queue, reqs[tid], store)
+    worker._drain_queue_into_lanes()
+    popped = worker._pop_next_pickable()
+    assert popped is reqs['101'], 'the head must be the first pickable'
+
+    item = RealMergeItem(
+        request=reqs['101'],
+        merge_result=MergeResult(
+            success=True, merge_commit=head_mc,
+            merge_worktree=_ephemeral_merge_wt(git_ops, 'walk'),
+        ),
+        merge_wt=_ephemeral_merge_wt(git_ops, 'walk'),
+        base_sha=main_sha,          # the head CASes against REAL main
+        speculative=True,
+    )
+    chain = await worker._deep_chain_placement(item)
+    assert chain is not None
+    assert [tid for tid, _ in chain.links] == list(_DELTA_LINKS)
+    assert chain.truncated_at == _DELTA_TRUNCATOR
+    assert chain.truncated_reason == 'conflict'
+
+    _spy_post_merge_verify(monkeypatch, outcome=verify_outcome)
+    _spy_chain_lane_release(monkeypatch)
+    # BOTH post-advance gates run FOR REAL here, deliberately: they are
+    # part of what the walk must reuse per link, and stubbing them would
+    # have to reach back through `orchestrator.merge_queue.<private>` —
+    # the exact patch surface test_merge_queue_reachback_patch_guard.py
+    # freezes.  The pyright gate quick-exits clean because no module here
+    # defines a `type_check_command` (merge_gates.py:2105-2107), and the
+    # equivalence gate passes because every commit in this scene is a
+    # genuine `--no-ff` merge of the branch it names.
+    adv = _spy_advance_main(git_ops, monkeypatch, hook=advance_hook)
+
+    res = await worker._run_inflight_verify(item, _local_lease(), chain=chain)
+    done: asyncio.Future = asyncio.get_running_loop().create_future()
+    done.set_result(res)
+    entry = InflightEntry(
+        item=item, lease=_local_lease(), verify_task=done,  # type: ignore[arg-type]
+        merge_wt=res.merge_wt, was_speculative=True, chain=chain,
+    )
+    return {
+        'git_ops': git_ops, 'worker': worker, 'chain': chain, 'reqs': reqs,
+        'head_mc': head_mc, 'main_sha': main_sha, 'adv': adv,
+        'db_path': db_path, 'repo': git_repo, 'entry': entry, 'item': item,
+    }
+
+
+
 @pytest.mark.asyncio
 @pytest.mark.timeout(180)
 class TestInOrderCasWalk:
     """δ's walk: the whole verified PREFIX lands, in order, by CAS."""
 
     async def _scene(self, git_repo: Path, tmp_path: Path, monkeypatch):
-        """Drive a 4-item clean chain with a green tip all the way through
-        ``_finalize_inflight``, and return everything the assertions read.
+        """The clean 4-item chain, driven all the way THROUGH the finalize half.
 
-        The gates are stubbed at the two documented reach-back seams
-        (``_check_post_merge_equivalence`` / ``_check_post_merge_pyright``,
-        merge_gates.py:401-406 and :480-484) so the scene is about the WALK.
-        ``advance_main`` is NOT stubbed — it is spied PASSTHROUGH, so main
-        really moves and the recorded ``expected_main`` chain can be checked
-        against real history.
+        :func:`_prefix_scene_upto_finalize` owns the build; this adds only the
+        ``_finalize_inflight`` call the walk hangs off, plus the event-loop
+        turn that lets every ``_on_finalized`` done-callback run.
         """
-        from orchestrator.event_store import EventStore
-        from orchestrator.merge_queue import enqueue_merge_request
-        from orchestrator.merge_types import InflightEntry
-
-        git_ops = _make_git_ops(git_repo, size=2)
-        config = _make_config(git_repo, chain_cap=6)
-        await _create_branch_editing(git_repo, 'task/101', 'a.txt', 'edit-101\n')
-        await _create_branch_editing(
-            git_repo, 'task/102', 'shared.txt', _shared_txt_with(5, 'from-102'),
+        s = await _prefix_scene_upto_finalize(
+            git_repo, tmp_path, monkeypatch, db_name='delta-walk.db',
         )
-        await _create_branch_editing(git_repo, 'task/103', 'c.txt', 'edit-103\n')
-        await _create_branch_editing(git_repo, 'task/104', 'd.txt', 'edit-104\n')
-        await _create_branch_editing(
-            git_repo, 'task/105', 'shared.txt', _shared_txt_with(5, 'from-105'),
-        )
-        head_mc = await _merge_commit_off_main(git_repo, 'task/101', '101')
-        main_sha = await _rev_parse(git_repo, 'main')
-
-        db_path = tmp_path / 'delta-walk.db'
-        store = EventStore(db_path, 'run-delta-walk')
-        worker = _make_worker(git_ops)
-        worker._event_store = store
-
-        # Every request goes on through the REAL enqueue chokepoint: that is
-        # what registers `_on_finalized`, and `merge_finalized` has no other
-        # emit site (merge_queue.py:4763-4777).  Draining them into the lane
-        # buffers is likewise the real path — it is what registers each id at
-        # LANE_BUFFERED, so the "reaches TERMINAL" assertion below is a claim
-        # about a genuinely-tracked request rather than an unregistered one.
-        reqs: dict[str, MergeRequest] = {}
-        for tid in ('101', *_DELTA_LINKS, _DELTA_TRUNCATOR):
-            reqs[tid] = _make_req(tid, tid, config, git_repo)
-            await enqueue_merge_request(worker._queue, reqs[tid], store)
-        worker._drain_queue_into_lanes()
-        popped = worker._pop_next_pickable()
-        assert popped is reqs['101'], 'the head must be the first pickable'
-
-        item = RealMergeItem(
-            request=reqs['101'],
-            merge_result=MergeResult(
-                success=True, merge_commit=head_mc,
-                merge_worktree=_ephemeral_merge_wt(git_ops, 'walk'),
-            ),
-            merge_wt=_ephemeral_merge_wt(git_ops, 'walk'),
-            base_sha=main_sha,          # the head CASes against REAL main
-            speculative=True,
-        )
-        chain = await worker._deep_chain_placement(item)
-        assert chain is not None
-        assert [tid for tid, _ in chain.links] == list(_DELTA_LINKS)
-        assert chain.truncated_at == _DELTA_TRUNCATOR
-        assert chain.truncated_reason == 'conflict'
-
-        _spy_post_merge_verify(monkeypatch, outcome=None)
-        _spy_chain_lane_release(monkeypatch)
-        # BOTH post-advance gates run FOR REAL here, deliberately: they are
-        # part of what the walk must reuse per link, and stubbing them would
-        # have to reach back through `orchestrator.merge_queue.<private>` —
-        # the exact patch surface test_merge_queue_reachback_patch_guard.py
-        # freezes.  The pyright gate quick-exits clean because no module here
-        # defines a `type_check_command` (merge_gates.py:2105-2107), and the
-        # equivalence gate passes because every commit in this scene is a
-        # genuine `--no-ff` merge of the branch it names.
-        adv = _spy_advance_main(git_ops, monkeypatch)
-
-        res = await worker._run_inflight_verify(item, _local_lease(), chain=chain)
-        done: asyncio.Future = asyncio.get_running_loop().create_future()
-        done.set_result(res)
-        entry = InflightEntry(
-            item=item, lease=_local_lease(), verify_task=done,  # type: ignore[arg-type]
-            merge_wt=res.merge_wt, was_speculative=True, chain=chain,
-        )
-        advanced = await worker._finalize_inflight(entry)
+        s['advanced'] = await s['worker']._finalize_inflight(s['entry'])
         await asyncio.sleep(0)  # let every `_on_finalized` done-callback run
-
-        return {
-            'git_ops': git_ops, 'worker': worker, 'chain': chain, 'reqs': reqs,
-            'head_mc': head_mc, 'main_sha': main_sha, 'adv': adv,
-            'db_path': db_path, 'advanced': advanced, 'repo': git_repo,
-        }
+        return s
 
     async def test_advance_main_runs_once_per_chain_item_in_land_order(
         self, git_repo: Path, tmp_path: Path, monkeypatch,
@@ -1290,3 +1323,423 @@ class TestInOrderCasWalk:
         assert s['worker']._lifecycle.current(trunc.request_id) == (
             ItemLifecycleState.LANE_BUFFERED
         ), 'it stays queued for its ordinary sequential path'
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# step-07 RED — stale-CAS abort (PRD decision #9) + 3003 DEFER inheritance
+#
+#   (a) an advance that does not return 'advanced' ABORTS the walk; the
+#       already-landed prefix stays landed and every unlanded link is left
+#       exactly as it was — still buffered, future unresolved, non-terminal
+#   (b) no unlanded link renders a `MergeOutcome('blocked')` and none emits a
+#       `merge_attempt`, so `consecutive_merge_thrash` cannot be fed
+#   (c) a typed `MergeVerifyLeaseContended` / `MergeVerifyLeaseHeld` reaching
+#       the walk inherits 3003's DEFER classification — streak bookkeeping
+#       moves, and it NEVER becomes the bare-RuntimeError -> 'blocked' path
+#   (d) the walk aborts on the FIRST failure — it never skips a link and
+#       carries on with later ones (that would hole the contiguous prefix)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+async def _external_main_bump(repo: Path) -> str:
+    """Land an unrelated commit directly on main; return its SHA.
+
+    Written with ``commit-tree`` + ``update-ref`` rather than a checkout and a
+    ``git commit`` so the bump does NOT disturb the working tree — by the time
+    a scenario calls this, ``advance_main`` has already moved ``refs/heads/main``
+    out from under the checkout, and a plumbing bump is the only way to model
+    "another writer got there first" without also rewriting that state.
+
+    The new commit carries main's CURRENT tree, so the bump is a pure ref move:
+    the resulting abort is attributable to the moved ref alone, never to a
+    content conflict the next link would have hit anyway.
+    """
+    cur = await _rev_parse(repo, 'main')
+    tree = await _rev_parse(repo, 'main^{tree}')
+    _, new, _ = await _run(
+        ['git', 'commit-tree', tree, '-p', cur, '-m', 'external writer'], cwd=repo,
+    )
+    new = new.strip()
+    await _run(['git', 'update-ref', 'refs/heads/main', new, cur], cwd=repo)
+    return new
+
+
+def _abort_hook_at(call_no: int, *, outcome=None, raises=None, bump_repo=None):
+    """Build an :func:`_spy_advance_main` hook that disrupts call *call_no*.
+
+    Exactly one of *outcome* (return a synthetic
+    :class:`~orchestrator.git_ops.AdvanceOutcome` instead of advancing),
+    *raises*, or *bump_repo* (move main for real, then fall through to the
+    real ``advance_main``, which then refuses).
+    """
+    async def _hook(n: int):
+        if n != call_no:
+            return None
+        if bump_repo is not None:
+            await _external_main_bump(bump_repo)
+            return None
+        if raises is not None:
+            raise raises
+        return outcome
+
+    return _hook
+
+
+def _lane_of(worker: SpeculativeMergeWorker, task_id: str) -> str | None:
+    """Return the lane whose buffer currently holds *task_id*, or None."""
+    for lane in ('high', 'normal'):
+        if any(r.task_id == task_id for r in worker._lane_buffers[lane]):
+            return lane
+    return None
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(180)
+class TestStaleCasAbortLeavesTheRestAlone:
+    """PRD decision #9: the walk ABORTS, it never FAILS anyone.
+
+    ``advance_main`` returns an :class:`AdvanceOutcome` rather than raising
+    (git_ops.py:13151), so a lost race is a VALUE the walk must read — and the
+    only correct response is to stop.  Every link past the abort point was
+    verified only as part of the cumulative tip; re-anchoring one onto the
+    moved main would land a tree nothing verified, the same false-green the
+    SOUNDNESS RULE at merge_queue.py:18606-18614 fences off.
+    """
+
+    async def _aborting_scene(
+        self, git_repo: Path, tmp_path: Path, monkeypatch, hook, *, db_name: str,
+    ):
+        s = await _prefix_scene_upto_finalize(
+            git_repo, tmp_path, monkeypatch, db_name=db_name, advance_hook=hook,
+        )
+        s['advanced'] = await s['worker']._finalize_inflight(s['entry'])
+        await asyncio.sleep(0)
+        return s
+
+    async def test_external_main_move_aborts_and_keeps_the_landed_prefix(
+        self, git_repo: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """(a) Main moves under the walk → it stops, and what landed stays landed.
+
+        The REAL-git shape of the race.  Note WHICH code the abort arrives as:
+        the walk passes ``merge_wt=None`` deliberately (a link's tree is the one
+        the tip verdict covered, so opting out of ``advance_main``'s rebase
+        retry is the point), and with no worktree to rebase in, ``advance_main``
+        refuses at its descendant check with ``'not_descendant'`` rather than
+        reaching the CAS at all.  Decision #9 is about the FAMILY — "the first
+        result that is not ``'advanced'``" — not about one code.
+        """
+        s = await self._aborting_scene(
+            git_repo, tmp_path, monkeypatch,
+            _abort_hook_at(3, bump_repo=git_repo), db_name='delta-stale.db',
+        )
+        worker, reqs = s['worker'], s['reqs']
+
+        # head + link '102' landed; the walk stopped trying at '103'.
+        assert [c[0] for c in s['adv']] == [
+            s['head_mc'], s['chain'].links[0][1], s['chain'].links[1][1],
+        ]
+        for tid in ('101', '102'):
+            assert reqs[tid].result.done(), f'task {tid} should have landed'
+            assert reqs[tid].result.result().status == 'done'
+        for sha in (s['head_mc'], s['chain'].links[0][1]):
+            rc, _, _ = await _run(
+                ['git', 'merge-base', '--is-ancestor', sha, 'main'], cwd=git_repo,
+            )
+            assert rc == 0, f'{sha[:8]} un-landed by the abort'
+        assert not set(worker._lifecycle.non_terminal_items()) & {
+            reqs[t].request_id for t in ('101', '102')
+        }
+
+    async def test_unlanded_links_are_left_exactly_as_they_were(
+        self, git_repo: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """(a) "Untouched" means buffered, unresolved, and non-terminal.
+
+        Not merely "not failed": the link must go back to the SAME lane
+        position it was taken from, because that position is its place in
+        submission order for the next round's ``chain_snapshot``.
+        """
+        from orchestrator.git_ops import AdvanceOutcome
+        from orchestrator.merge_types import ItemLifecycleState
+
+        s = await self._aborting_scene(
+            git_repo, tmp_path, monkeypatch,
+            _abort_hook_at(3, outcome=AdvanceOutcome('cas_failed')),
+            db_name='delta-cas.db',
+        )
+        worker, reqs = s['worker'], s['reqs']
+
+        for tid in ('103', '104', _DELTA_TRUNCATOR):
+            req = reqs[tid]
+            assert not req.result.done(), f'task {tid} must render NO outcome'
+            assert _lane_of(worker, tid) is not None, f'task {tid} left its buffer'
+            assert worker._lifecycle.current(req.request_id) == (
+                ItemLifecycleState.LANE_BUFFERED
+            ), f'task {tid} left LANE_BUFFERED'
+        # Submission order preserved inside the lane, so the next round's
+        # chain_snapshot sees the same prefix it would have seen without δ.
+        assert [
+            r.task_id for r in worker._lane_buffers['normal']
+        ] == ['103', '104', _DELTA_TRUNCATOR]
+
+    async def test_the_walk_stops_at_the_first_failure(
+        self, git_repo: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """(d) No skip-and-continue — that would hole the contiguous prefix.
+
+        ``links`` is contiguous in LAND order precisely so each member CASes
+        against its predecessor (merge_queue.py:6376-6379).  Skipping a failed
+        link and landing the next one would CAS it against a commit that never
+        reached main.
+        """
+        from orchestrator.git_ops import AdvanceOutcome
+
+        s = await self._aborting_scene(
+            git_repo, tmp_path, monkeypatch,
+            _abort_hook_at(3, outcome=AdvanceOutcome('cas_failed')),
+            db_name='delta-firstfail.db',
+        )
+
+        assert len(s['adv']) == 3, (
+            f'the walk kept going past the failure: {[c[0][:8] for c in s["adv"]]}'
+        )
+        assert s['chain'].links[2][1] not in [c[0] for c in s['adv']]
+
+    async def test_the_abort_feeds_the_thrash_ladder_nothing(
+        self, git_repo: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """(b) Zero 'blocked' outcomes and zero ``merge_attempt`` rows.
+
+        A rendered failure would give ``workflow.py``'s
+        ``consecutive_merge_thrash`` ladder a DETERMINISTIC
+        ``merge_outcome_signature`` on every deep round — a false-positive
+        human escalation for a race that resolves itself on the next round.
+        """
+        from orchestrator.git_ops import AdvanceOutcome
+
+        s = await self._aborting_scene(
+            git_repo, tmp_path, monkeypatch,
+            _abort_hook_at(3, outcome=AdvanceOutcome('cas_failed')),
+            db_name='delta-thrash.db',
+        )
+
+        for tid in ('103', '104', _DELTA_TRUNCATOR):
+            assert _events_for_task(s['db_path'], tid) == ['merge_queued'], (
+                f'task {tid} emitted more than its own enqueue event'
+            )
+
+    async def test_two_consecutive_tip_fails_render_nothing_for_any_link(
+        self, git_repo: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """(b) The same silence across two RED tips in a row.
+
+        Two rounds is the interesting number: ``max_consecutive_merge_thrash``
+        defaults to 2, so a pair of identical rendered failures is exactly what
+        would trip the ladder.  The chain arm must produce no such pair.
+        """
+        import dataclasses
+
+        from orchestrator.merge_types import InflightEntry
+
+        s = await _prefix_scene_upto_finalize(
+            git_repo, tmp_path, monkeypatch, db_name='delta-tipfail.db',
+            verify_outcome=_fail_verify_result(),
+        )
+        worker, git_ops, reqs = s['worker'], s['git_ops'], s['reqs']
+        await worker._finalize_inflight(s['entry'])
+        await asyncio.sleep(0)
+
+        # Round 2.  The head was REQUEUED by the fail arm, so it now sits on
+        # `_queue` and is deliberately left there — draining it back into a lane
+        # would make the head a member of its OWN next chain (chain_snapshot
+        # walks lane buffers), which is a different scenario.  Everything the
+        # claim is about — the three links — is still buffered where round 1
+        # left it, so the rebuild sees exactly the prefix it saw before.
+        assert worker._queue.qsize() == 1, 'the fail arm must have requeued the head'
+        item2 = dataclasses.replace(
+            s['item'], merge_wt=_ephemeral_merge_wt(git_ops, 'tipfail2'),
+        )
+        chain2 = await worker._deep_chain_placement(item2)
+        assert chain2 is not None and chain2.links
+        res2 = await worker._run_inflight_verify(item2, _local_lease(), chain=chain2)
+        done2: asyncio.Future = asyncio.get_running_loop().create_future()
+        done2.set_result(res2)
+        await worker._finalize_inflight(InflightEntry(
+            item=item2, lease=_local_lease(), verify_task=done2,  # type: ignore[arg-type]
+            merge_wt=res2.merge_wt, was_speculative=True, chain=chain2,
+        ))
+        await asyncio.sleep(0)
+
+        assert not s['adv'], 'a red tip lands NOTHING via the chain'
+        for tid in (*_DELTA_LINKS, _DELTA_TRUNCATOR):
+            assert not reqs[tid].result.done(), f'task {tid} rendered an outcome'
+            assert _events_for_task(s['db_path'], tid) == ['merge_queued'], (
+                f'task {tid} emitted a merge_attempt across two red tips'
+            )
+
+    async def test_a_halt_worthy_advance_result_still_halts_the_queue(
+        self, git_repo: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """A shared main-checkout fault is not a per-link race — halt anyway.
+
+        ``_HALT_ADVANCE_RESULTS`` (merge_queue.py:676) names the codes that
+        report a fault affecting EVERY subsequent task, not just this link
+        (``unmerged_state``: project_root already has unresolved conflicts).
+        Decision #9's silence is about not blaming the LINK; it was never a
+        licence to swallow a queue-wide fault the head path halts on.
+        """
+        from orchestrator.git_ops import AdvanceOutcome
+
+        s = await self._aborting_scene(
+            git_repo, tmp_path, monkeypatch,
+            _abort_hook_at(3, outcome=AdvanceOutcome('unmerged_state')),
+            db_name='delta-halt.db',
+        )
+
+        assert s['worker'].is_wip_halted, (
+            'a halt-worthy advance result inside the walk left the queue running'
+        )
+        assert not s['reqs']['103'].result.done(), (
+            'the halt must not also render a per-link blocked outcome'
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(180)
+class TestContendedLeaseDeferInheritance:
+    """3003's DEFER classification reaches the walk too.
+
+    ``MergeVerifyLeaseContended`` / ``MergeVerifyLeaseHeld`` mean "the shared
+    merge-verify lane was unavailable, so the raiser refused to act
+    UNPROTECTED" — a transient come-back-later, never a verdict.  Mapping one
+    to ``MergeOutcome('blocked')`` renders a DETERMINISTIC reason string, hence
+    an identical ``merge_outcome_signature`` every time, which is exactly what
+    tripped ``consecutive_merge_thrash`` into false-positive human escalations
+    before task 3003 (git_ops.py:1673-1683).  The walk must inherit that fix,
+    which means catching the typed pair BEFORE any generic ``except Exception``
+    — the ordering that IS the opt-in at merge_queue.py:18039-18054.
+    """
+
+    async def _deferring_scene(
+        self, git_repo: Path, tmp_path: Path, monkeypatch, exc, *, db_name: str,
+    ):
+        """Raise *exc* out of the THIRD ``push_main`` — link '103''s finalize.
+
+        ``push_main`` is the last seam inside ``_finalize_advanced_merge``
+        (merge_gates.py, after the POST_ADVANCE_GATES chain), so raising there
+        models the realistic shape: the link's advance already succeeded and
+        the lane went unavailable during the post-advance half.  Patched on the
+        GitOps INSTANCE, not through ``orchestrator.merge_queue.<private>`` —
+        the reach-back surface test_merge_queue_reachback_patch_guard.py
+        freezes.  Call 1 is the head's, call 2 is link '102''s.
+        """
+        s = await _prefix_scene_upto_finalize(
+            git_repo, tmp_path, monkeypatch, db_name=db_name,
+        )
+        git_ops = s['git_ops']
+        real_push = git_ops.push_main
+        pushes: list[int] = []
+
+        async def _pushing(*a, **kw):
+            pushes.append(len(pushes) + 1)
+            if len(pushes) == 3:
+                raise exc
+            return await real_push(*a, **kw)
+
+        monkeypatch.setattr(git_ops, 'push_main', _pushing)
+        s['advanced'] = await s['worker']._finalize_inflight(s['entry'])
+        await asyncio.sleep(0)
+        s['pushes'] = pushes
+        return s
+
+    def _contended(self, tmp_path: Path):
+        from orchestrator.git_ops import MergeVerifyLeaseContended
+
+        return MergeVerifyLeaseContended(tmp_path / '_merge-verify.lock', 30.0)
+
+    def _held(self, tmp_path: Path):
+        from orchestrator.git_ops import MergeVerifyLeaseHeld
+
+        return MergeVerifyLeaseHeld(tmp_path / '_merge-verify', 4242)
+
+    @pytest.mark.parametrize('which', ['contended', 'held'])
+    async def test_typed_lease_error_defers_and_moves_the_streak(
+        self, which: str, git_repo: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """Both typed raisers DEFER, and the 3003 streak bookkeeping moves.
+
+        The streak is what BOUNDS the defer: without it a permanently wedged
+        lane holder would defer forever with no terminal resolution at all.
+        Feeding it from the walk keeps the walk's defers on the same budget the
+        head path's are on, rather than inventing a second, unbounded one.
+        """
+        exc = (
+            self._contended(tmp_path) if which == 'contended'
+            else self._held(tmp_path)
+        )
+        s = await self._deferring_scene(
+            git_repo, tmp_path, monkeypatch, exc, db_name=f'delta-lease-{which}.db',
+        )
+        worker = s['worker']
+
+        assert s['pushes'] == [1, 2, 3], 'the walk must stop after the raiser'
+        assert worker._contended_lease_requeues.get('103') == 1, (
+            'the walk did not feed the contended-lane streak'
+        )
+        assert '103' in worker._contended_lease_first_defer_at
+        assert '103' in worker._contended_lease_last_defer_at
+        worker._clear_contended_lease_streak('103')
+        assert '103' not in worker._contended_lease_requeues
+        assert '103' not in worker._contended_lease_first_defer_at
+
+    @pytest.mark.parametrize('which', ['contended', 'held'])
+    async def test_typed_lease_error_never_renders_blocked(
+        self, which: str, git_repo: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """Never the bare-RuntimeError -> ``MergeOutcome('blocked')`` path."""
+        from orchestrator.merge_types import ItemLifecycleState
+
+        exc = (
+            self._contended(tmp_path) if which == 'contended'
+            else self._held(tmp_path)
+        )
+        s = await self._deferring_scene(
+            git_repo, tmp_path, monkeypatch, exc,
+            db_name=f'delta-lease-nb-{which}.db',
+        )
+        worker, reqs = s['worker'], s['reqs']
+
+        for tid in ('103', '104'):
+            assert not reqs[tid].result.done(), (
+                f'task {tid} rendered an outcome on a transient lane refusal'
+            )
+            assert _lane_of(worker, tid) is not None
+            assert worker._lifecycle.current(reqs[tid].request_id) == (
+                ItemLifecycleState.LANE_BUFFERED
+            )
+        # …and the prefix that DID land is untouched by the defer.
+        for tid in ('101', '102'):
+            assert reqs[tid].result.result().status == 'done'
+
+    async def test_a_bare_error_is_contained_without_moving_the_streak(
+        self, git_repo: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """The generic arm is NOT the typed arm — that distinction is the fix.
+
+        A bare fault is still contained (one bad link may not strand the rest
+        of the accounting) and still aborts the walk, but it must not be
+        counted as lane contention: doing so would let a genuine git fault
+        consume the contended-lane budget and mask the real pathology.
+        """
+        s = await self._deferring_scene(
+            git_repo, tmp_path, monkeypatch, RuntimeError('git exploded'),
+            db_name='delta-bare.db',
+        )
+        worker = s['worker']
+
+        assert '103' not in worker._contended_lease_requeues
+        assert '103' not in worker._contended_lease_first_defer_at
+        assert not s['reqs']['103'].result.done()
+        for tid in ('101', '102'):
+            assert s['reqs'][tid].result.result().status == 'done'
