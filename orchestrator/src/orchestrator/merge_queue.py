@@ -19101,6 +19101,48 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             return None
 
         head_task_id = head.item.request.task_id
+        if head.verify_task.done() and head.item.request.result.done():
+            # ── task 3186 (PRD δ), review fix #4: DELIVERED ≠ UNDECIDED ─────
+            # Decision #3 makes the tip authoritative for an UNDECIDED head.
+            # It is NOT a licence to RETRACT an outcome the workflow has
+            # already been handed.  Three terminal paths in
+            # `_run_inflight_verify` resolve `req.result` with a
+            # `MergeOutcome('blocked')` and THEN return a non-sentinel result
+            # — the dead-verify busy-loop cap-out (:18106), the contended-lease
+            # terminal cap-out (:18330) and the generic `Verification error:`
+            # handler (:18528) — so without this guard a green tip adopts a
+            # head whose verdict is already out in the world.
+            #
+            # Both concrete harms, named so a later edit cannot re-widen this:
+            #   (i)  adoption skips `_finalize_inflight`'s fail arm via
+            #        `and not entry.chain_adopted`, so the PASS arm CASes main
+            #        forward from a worktree all three of those paths already
+            #        handed to `_dispose_verify_worktree()`; and
+            #   (ii) `_resolve_or_drop_abandoned` then SILENTLY DROPS the
+            #        resulting `'done'` onto the already-resolved future, so
+            #        the branch lands on main while the workflow is still told
+            #        BLOCKED — and can be escalated, re-dispatched or marked
+            #        failed for work that is already on main.
+            #
+            # The key is DELIVERY, not the verdict: the `else` arm below
+            # (verdict arrived, future NOT resolved) is the genuine
+            # "Head-fail + tip-pass" row and must still adopt-and-decline.
+            # `.result()` is not safe to call unguarded here: an ABANDONED
+            # request's future is CANCELLED, which is `done()` too — and that
+            # is still "decided", so it still declines.
+            _fut = head.item.request.result
+            _delivered = (
+                'cancelled' if _fut.cancelled()
+                else getattr(_fut.result(), 'status', '?')
+            )
+            logger.info(
+                'Task %s: deep tip passed — head task %s had ALREADY delivered '
+                '%s to its workflow; declining to adopt it (δ retracts no '
+                'delivered outcome) and leaving it on its ordinary fail path',
+                tip_task_id, head_task_id, _delivered,
+            )
+            return None
+
         # Set BEFORE the teardown, and that ordering is load-bearing: the
         # cancel below is what resumes a `_finalize_inflight` already parked at
         # `await entry.verify_task`, and this flag is the only thing that tells
@@ -19902,7 +19944,21 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # behind it is not stranded.  Falls through to the PASS arm, which
             # keeps reading `vr` for `merge_wt` / `spec_warm` / `warm_results`
             # because the verify really did run and really does own them.
-            if vr is not None and vr.outcome is not None and not entry.chain_adopted:
+            #
+            # DEFENSE IN DEPTH (review fix #4): the decline is additionally
+            # gated on the outcome NOT having been delivered yet.
+            # `_adopt_head_on_tip_authority` already refuses to set
+            # `chain_adopted` on a delivered head — this second gate is what
+            # keeps a FUTURE adopter from re-opening the same hole, because
+            # declining a delivered verdict does not un-deliver it: it merely
+            # sends the entry to the PASS arm, which advances main from an
+            # already-disposed worktree and then has its `'done'` silently
+            # dropped onto the resolved future.
+            _delivered = req.result.done()
+            if (
+                vr is not None and vr.outcome is not None
+                and (not entry.chain_adopted or _delivered)
+            ):
                 fail_merge_wt = vr.merge_wt
                 await self._release_or_cleanup(fail_merge_wt, spec_warm=vr.spec_warm)
                 # I4 runs.db surface (task 2383 β, step 18): thread the skew
