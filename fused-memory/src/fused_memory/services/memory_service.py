@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, cast
 
 from graphiti_core.nodes import EpisodeType
 
-from fused_memory.backends.graphiti_client import GraphitiBackend
+from fused_memory.backends.graphiti_client import ActiveEdgesError, GraphitiBackend
 from fused_memory.backends.mem0_client import (
     _FUSED_MEMORY_OWNED_METADATA_KEYS,
     Mem0Backend,
@@ -3918,6 +3918,15 @@ class MemoryService:
         for finding in stats.findings:
             findings_by_edge.setdefault(finding.edge_uuid, []).append(finding)
 
+        # uuid -> the name this episode's result reported for that node, the
+        # only thing the cleanup's canonical-label guard has to parse. Keyed by
+        # the FINDING's uuid: when `reassign_edge`'s topology re-read disagrees
+        # with it, we have no name for the node that actually lost the edge,
+        # and no name means no deletion (fail closed).
+        endpoint_names: dict[str, str] = {
+            f.old_endpoint_uuid: f.old_endpoint_name for f in stats.findings
+        }
+
         for edge_uuid, edge_findings in findings_by_edge.items():
             if self._is_degenerate_edge(edge_findings):
                 # Skip the edge WHOLE — never half-move it. One warning naming
@@ -3952,7 +3961,115 @@ class MemoryService:
                 edge_findings, repair_stats, group_id=group_id,
             )
 
+        await self._cleanup_emptied_nodes(
+            repair_stats, endpoint_names, group_id=group_id,
+        )
+
         return repair_stats
+
+    async def _cleanup_emptied_nodes(
+        self,
+        repair_stats: ReferentRepairStats,
+        endpoint_names: Mapping[str, str],
+        *,
+        group_id: str,
+    ) -> None:
+        """Delete the nodes THIS PASS emptied — under three conditions, all required.
+
+        Runs AFTER every reassignment for the episode, because a node is only
+        empty once every edge that was going to leave it has left.
+
+        THE TWO SITUATIONS THE NODE CAN BE IN, and why the guard is this narrow:
+
+        * The project GENUINELY OWNS the task. The node keeps its pre-existing
+          edges after the repair, so the emptiness check fails and it is never
+          touched. Deleting a real task entity to fix an attribution error
+          would be a far more damaging bug than the one being fixed.
+        * The node was MINTED by this very episode out of the mis-resolved
+          reference alone. The repair leaves it edgeless and semantically
+          wrong, and it would otherwise persist as a phantom entity that future
+          writes keep re-colliding with — leaving the fix only half-working
+          and, per the PRD's "coupling" section, keeping the duplicate-name key
+          that disables ``dedup_helpers``' deterministic exact-match protection.
+
+        THE THREE CONDITIONS:
+
+        1. This pass moved at least one endpoint OFF the node — an
+           ``outcome='repaired'`` record with ``moved=True``. A ``moved=False``
+           no-op emptied nothing, so it is not even a candidate and the
+           emptiness query is never issued for it. The node that GAINED the
+           edge is never a candidate either; deleting the repair target would
+           undo the repair.
+        2. Its name parses as a canonical task label —
+           :func:`~fused_memory.utils.canonical_labels.parse_node_name`, the
+           single normative label vocabulary (PRD leaf beta), reused here
+           rather than respelled as a regex at the delete site. That function
+           is ANCHORED by design, so a node merely MENTIONING a task
+           ('Task 42 orchestrator') returns ``None`` and survives. This is the
+           guard where a drifting pattern would delete a real entity, which is
+           exactly the duplication INV-5 exists to prevent.
+        3. ``get_valid_edges_for_node`` returns empty.
+
+        The delete goes through :meth:`GraphitiBackend.delete_entity` with
+        ``force=False``, never the lower-level ``delete_entity_node``,
+        precisely FOR its ``ActiveEdgesError`` guard: that re-checks — at the
+        backend, under this same lock, after our own read — the emptiness this
+        cleanup is predicated on, turning a lost race (the node gained an edge
+        in between) into a REFUSAL rather than a destroyed entity.
+        ``delete_entity_node`` issues a bare DETACH DELETE with no edge guard
+        and no neighbour refresh, so using it would mean re-implementing both.
+
+        The stamp back onto the matching records uses
+        :func:`dataclasses.replace`, never mutation — the record is frozen
+        because it is evidence for destructive edge surgery.
+        """
+        candidates: list[str] = []
+        for record in repair_stats.repairs:
+            if record.outcome != 'repaired' or not record.moved:
+                continue
+            uuid = record.old_endpoint_uuid
+            if uuid in candidates:
+                continue
+            name = endpoint_names.get(uuid, '')
+            if not name or parse_node_name(name) is None:
+                continue
+            candidates.append(uuid)
+
+        for uuid in candidates:
+            try:
+                remaining = await self.graphiti.get_valid_edges_for_node(
+                    uuid, group_id=group_id,
+                )
+                if remaining:
+                    continue
+                await self.graphiti.delete_entity(
+                    uuid, group_id=group_id, force=False,
+                )
+            except ActiveEdgesError:
+                # A LOST RACE, not a failure: the node gained an edge between
+                # our read and the delete, and force=False refused. Exactly
+                # what that argument is for. INFO, because the outcome is
+                # correct — the node is still there and still has an edge.
+                logger.info(
+                    'Referent repair: not deleting emptied node %s — it '
+                    'gained a valid edge between the emptiness check and the '
+                    'delete, and delete_entity(force=False) refused',
+                    uuid,
+                )
+                continue
+            logger.info(
+                'Referent repair: deleted emptied node %s (%r) — this pass '
+                'moved its last edge off it',
+                uuid, endpoint_names.get(uuid, ''),
+            )
+            for index, record in enumerate(repair_stats.repairs):
+                if (
+                    record.outcome == 'repaired' and record.moved
+                    and record.old_endpoint_uuid == uuid
+                ):
+                    repair_stats.repairs[index] = dataclasses.replace(
+                        record, deleted_emptied_node=uuid,
+                    )
 
     @staticmethod
     def _is_degenerate_edge(findings: list[ReferentFinding]) -> bool:
