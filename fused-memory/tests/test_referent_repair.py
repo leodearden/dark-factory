@@ -587,3 +587,101 @@ class TestTheRefreshBackstop:
             await service._repair_episode_referents(
                 _stats(_finding()), group_id='dark_factory',
             )
+
+
+class TestNeverGuess:
+    """An unresolvable finding is RECORDED and LEFT ALONE.
+
+    The PRD's live boundary row, verbatim: the unary fact "Umbrella task 2519
+    was filed and then cancelled to avoid orphaning its vector" sitting on the
+    `Task 2520` node.  There is no correct target — the fact names exactly one
+    task and it is not the one the edge landed on — so zeta records it with
+    `resolvable=False` and a reason, and eta must not invent one.
+    """
+
+    UNARY_REASON = (
+        'no candidate target could be determined from the declared referents'
+    )
+
+    def _unary_finding(self, **overrides) -> ReferentFinding:
+        fields = {
+            'edge_uuid': 'e-2520',
+            'old_endpoint_uuid': 'n-2520',
+            'old_endpoint_name': 'Task 2520',
+            'endpoint_referent': Referent(number='2520'),
+            'referent_set': ('Task 2519',),
+            'intended_referent': None,
+            'new_endpoint_uuid': None,
+            'resolvable': False,
+            'reason': self.UNARY_REASON,
+        }
+        fields.update(overrides)
+        return _finding(**fields)
+
+    @pytest.mark.asyncio
+    async def test_no_write_primitive_is_awaited_at_all(self, service):
+        """Not "attempted and rolled back" — never attempted.  The refusal is
+        decided before any backend call."""
+        await service._repair_episode_referents(
+            _stats(self._unary_finding()), group_id='dark_factory',
+        )
+        assert_never_repaired(service)
+
+    @pytest.mark.asyncio
+    async def test_the_record_carries_zetas_own_reason_verbatim(self, service):
+        """The operator must see zeta's explanation, not an eta-authored
+        paraphrase — a paraphrase is a second site that can drift from the rule
+        that actually fired."""
+        stats = await service._repair_episode_referents(
+            _stats(self._unary_finding()), group_id='dark_factory',
+        )
+
+        assert len(stats.repairs) == 1
+        record = stats.repairs[0]
+        assert record.outcome == 'unrepairable'
+        assert record.reason == self.UNARY_REASON
+        assert record.edge_uuid == 'e-2520'
+        assert record.which_end == 'source'
+        assert record.old_endpoint_uuid == 'n-2520'
+        assert record.check == 'set-membership'
+        # Nothing was targeted, minted, moved or refreshed.
+        assert record.new_endpoint_uuid == ''
+        assert record.intended_referent == ''
+        assert record.moved is False
+        assert record.minted is False
+        assert record.summaries_refreshed == ()
+        assert record.deleted_emptied_node == ''
+
+    @pytest.mark.asyncio
+    async def test_it_lands_in_the_flagged_bucket_and_never_in_repaired(
+        self, service,
+    ):
+        stats = await service._repair_episode_referents(
+            _stats(self._unary_finding()), group_id='dark_factory',
+        )
+        assert stats.flagged_unrepairable == 1
+        assert stats.repaired == 0
+        assert stats.failed == 0
+
+    @pytest.mark.asyncio
+    async def test_a_mixed_batch_repairs_the_resolvable_one_and_records_both(
+        self, service,
+    ):
+        """Different EDGES, so the degenerate-edge guard is not what is being
+        exercised here — one finding refusing to be guessed at must not stop
+        an unrelated edge's repair."""
+        stats = await service._repair_episode_referents(
+            _stats(_finding(edge_uuid='e1'), self._unary_finding()),
+            group_id='dark_factory',
+        )
+
+        service.graphiti.ensure_entity_node.assert_awaited_once_with(
+            'Task 3127', group_id='dark_factory',
+        )
+        service.graphiti.reassign_edge.assert_awaited_once_with(
+            'e1', 'n-3127', which_end='source', group_id='dark_factory',
+        )
+        assert len(stats.repairs) == 2
+        assert {r.outcome for r in stats.repairs} == {'repaired', 'unrepairable'}
+        assert stats.repaired == 1
+        assert stats.flagged_unrepairable == 1
