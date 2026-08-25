@@ -32,7 +32,7 @@ import pytest
 from _fm_helpers import install_identity_mocks
 from test_referent_verification import _WRITE_PRIMITIVES, assert_never_repaired
 
-from fused_memory.backends.graphiti_client import ActiveEdgesError
+from fused_memory.backends.graphiti_client import ActiveEdgesError, EdgeNotFoundError
 from fused_memory.services.memory_service import (
     REFERENT_REPAIR_OUTCOMES,
     MemoryService,
@@ -1147,3 +1147,127 @@ class TestCleanupIsGuardedIndependently:
         )
         assert stats.repaired == 2
         assert stats.nodes_deleted == 1
+
+
+class TestPerFindingFailureContainment:
+    """`'failed'` is a THIRD disposition, distinct from both `'repaired'` and
+    `'unrepairable'`.
+
+    Unrepairable means WE REFUSED TO GUESS; failed means WE TRIED AND THE
+    BACKEND DID NOT COOPERATE.  Conflating them would let a FalkorDB outage
+    read as a scanner regression in leaf iota's rate, and would feed a false
+    repair-storm streak whose whole claim is "the scanner or the resolver has
+    REGRESSED".
+
+    Containment is per-FINDING because each finding names a distinct
+    (edge, end): one failure carries no information about the others, and
+    aborting the batch would leave the graph in a state neither zeta's findings
+    nor eta's records describe.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_failing_ensure_entity_node_contains_to_that_finding(
+        self, service, caplog,
+    ):
+        service.graphiti.ensure_entity_node = AsyncMock(
+            side_effect=[RuntimeError('falkor down'), 'n-3127'],
+        )
+        service.graphiti.reassign_edge = AsyncMock(return_value=_reassigned(uuid='e2'))
+
+        with caplog.at_level(logging.WARNING):
+            stats = await service._repair_episode_referents(
+                _stats(_finding(edge_uuid='e1'), _finding(edge_uuid='e2')),
+                group_id='dark_factory',
+            )
+
+        # No reassign for the failed finding; the OTHER one is fully repaired.
+        service.graphiti.reassign_edge.assert_awaited_once_with(
+            'e2', 'n-3127', which_end='source', group_id='dark_factory',
+        )
+        failed = [r for r in stats.repairs if r.outcome == 'failed']
+        assert len(failed) == 1
+        assert failed[0].edge_uuid == 'e1'
+        assert 'falkor down' in failed[0].reason
+        assert stats.repaired == 1
+        assert stats.failed == 1
+        # The operator sees WHICH edge end was left unrepaired.
+        assert any('e1' in r.getMessage() for r in caplog.records)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('exc', [
+        EdgeNotFoundError('edge e1 not found'),
+        ValueError('reassign_edge: refusing to create a self-referential edge'),
+    ])
+    async def test_a_failing_reassign_edge_contains_to_that_finding(
+        self, service, exc,
+    ):
+        """`EdgeNotFoundError` = the edge was tombstoned between zeta and eta.
+        `ValueError` = the self-loop refusal.  Both contain identically."""
+        service.graphiti.reassign_edge = AsyncMock(
+            side_effect=[exc, _reassigned(uuid='e2')],
+        )
+
+        stats = await service._repair_episode_referents(
+            _stats(_finding(edge_uuid='e1'), _finding(edge_uuid='e2')),
+            group_id='dark_factory',
+        )
+
+        assert stats.failed == 1
+        assert stats.repaired == 1
+        assert [r.outcome for r in stats.repairs] == ['failed', 'repaired']
+
+    @pytest.mark.asyncio
+    async def test_a_failed_reassign_leaves_the_node_out_of_the_cleanup_candidates(
+        self, service,
+    ):
+        """Nothing moved off it, so there is nothing to clean up — and a node
+        deleted on the strength of a move that did not happen would be the
+        most damaging possible outcome of this pass."""
+        service.graphiti.reassign_edge = AsyncMock(
+            side_effect=ValueError('refusing to create a self-referential edge'),
+        )
+        service.graphiti.get_valid_edges_for_node = AsyncMock(return_value=[])
+
+        stats = await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory',
+        )
+
+        service.graphiti.get_valid_edges_for_node.assert_not_awaited()
+        service.graphiti.delete_entity.assert_not_awaited()
+        assert stats.nodes_deleted == 0
+
+    @pytest.mark.asyncio
+    async def test_a_failed_record_never_counts_as_a_repair(self, service):
+        """A broken backend must not masquerade as a repair storm."""
+        service.graphiti.ensure_entity_node = AsyncMock(
+            side_effect=RuntimeError('falkor down'),
+        )
+
+        stats = await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory',
+        )
+
+        assert stats.repaired == 0
+        assert stats.flagged_unrepairable == 0, (
+            "'failed' must not be folded into the NEVER-GUESS bucket"
+        )
+        assert stats.failed == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'primitive', ['ensure_entity_node', 'reassign_edge'],
+    )
+    @pytest.mark.parametrize(
+        'exc_type', [asyncio.CancelledError, KeyboardInterrupt, SystemExit],
+    )
+    async def test_the_per_finding_guard_never_swallows_cancellation(
+        self, service, primitive, exc_type,
+    ):
+        setattr(
+            service.graphiti, primitive, AsyncMock(side_effect=exc_type('interrupted')),
+        )
+
+        with pytest.raises(exc_type):
+            await service._repair_episode_referents(
+                _stats(_finding()), group_id='dark_factory',
+            )
