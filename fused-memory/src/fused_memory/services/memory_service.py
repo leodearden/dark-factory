@@ -4195,17 +4195,50 @@ class MemoryService:
                 ))
                 continue
 
-            target_uuid = await self.graphiti.ensure_entity_node(
-                intended.node_name, group_id=group_id,
-            )
-            result = await self.graphiti.reassign_edge(
-                finding.edge_uuid, target_uuid,
-                which_end=finding.which_end, group_id=group_id,
-            )
-            moved = bool(result.get('moved'))
-            refreshed = await self._backstop_endpoint_summaries(
-                result, group_id=group_id,
-            ) if moved else ()
+            # PER-FINDING containment, not per-pass: each finding names a
+            # distinct (edge, end), so one failure carries NO information about
+            # the others, and aborting the batch would leave the graph in a
+            # state neither zeta's findings nor eta's records describe. A batch
+            # of independent edge repairs must be able to make partial
+            # progress.
+            #
+            # `'failed'` is a THIRD disposition, distinct from BOTH
+            # `'repaired'` and `'unrepairable'`: unrepairable means we REFUSED
+            # TO GUESS, failed means we TRIED and the backend did not
+            # cooperate. Conflating them would let a FalkorDB outage read as a
+            # scanner regression in leaf iota's rate, and would feed a false
+            # repair-storm streak whose whole claim is that the scanner or the
+            # resolver has REGRESSED.
+            try:
+                target_uuid = await self.graphiti.ensure_entity_node(
+                    intended.node_name, group_id=group_id,
+                )
+                result = await self.graphiti.reassign_edge(
+                    finding.edge_uuid, target_uuid,
+                    which_end=finding.which_end, group_id=group_id,
+                )
+                moved = bool(result.get('moved'))
+                refreshed = await self._backstop_endpoint_summaries(
+                    result, group_id=group_id,
+                ) if moved else ()
+            except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                raise
+            except Exception as exc:
+                logger.warning(
+                    'Referent repair FAILED for one edge end; it is left '
+                    'unrepaired and recorded as such (%s): %s',
+                    exc, finding.to_dict(), exc_info=True,
+                )
+                repair_stats.repairs.append(ReferentRepair(
+                    edge_uuid=finding.edge_uuid,
+                    which_end=finding.which_end,
+                    outcome='failed',
+                    old_endpoint_uuid=finding.old_endpoint_uuid,
+                    check=finding.check,
+                    intended_referent=intended.node_name,
+                    reason=f'{type(exc).__name__}: {exc}',
+                ))
+                continue
             repair_stats.repairs.append(ReferentRepair(
                 edge_uuid=finding.edge_uuid,
                 which_end=finding.which_end,
