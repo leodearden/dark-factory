@@ -1049,18 +1049,34 @@ resolution, and is never a flake.
 
 ### `scope_violation` (info or blocking)
 
-Agent discovered it needs modules beyond its assigned scope.
+Agent discovered it needs to touch files beyond its assigned scope.
 
-1. Extend the required modules in task metadata via `mcp__fused-memory__update_task`
-2. Re-pend the task — it will be dispatched with the expanded module lock set:
-   ```
-   mcp__escalation__resolve_issue(
-     escalation_id="...",
-     resolution="Scope expanded to include [modules]. Task re-pends with updated module locks.",
-     action='resume',   # flips blocked→pending; task redispatches with expanded scope
-     resolved_by="escalation-watcher"
-   )
-   ```
+Resolve with `action='resume'`, carrying the scope grant as `granted_files` — a single call, no task-metadata edit:
+```
+mcp__escalation__resolve_issue(
+  escalation_id="...",
+  resolution="Scope expanded to include [<files>]; resuming.",
+  action='resume',   # flips blocked→pending; see the caveat below — the re-pend does NOT fold the grant
+  granted_files=["<project-relative file path>", ...],   # file-level paths, not module names
+  resolved_by="escalation-watcher"
+)
+```
+
+**Pass `granted_files`, but do not assume it takes effect on the next dispatch.** It is persisted durably on the escalation record either way. The fold into `plan.files` / `metadata.files` / file-locks happens at exactly one place — `orchestrator/src/orchestrator/workflow.py::TaskWorkflow._collect_granted_files` has a single call site, in `workflow.py::TaskWorkflow._drive`, on the **live L0 in-workflow** resume path (reached only after `_wait_for_resolution()` returns for a still-alive workflow process) → `_set_task_scope`. That is the per-task steward's path, which is why the identical wording is correct in `orchestrator/src/orchestrator/agents/roles.py::STEWARD` and not here.
+
+This queue is L2, and the `scope_violation` items reaching it are normally on a `blocked` task whose workflow slot is gone. Resolution then takes the orphan branch (in `orchestrator/src/orchestrator/harness.py::Harness._on_escalation_resolved`) into `harness.py::Harness._cascade_unblock_member`, which **only flips `blocked` → `pending`** — it never reads `granted_files`, never calls `_set_task_scope`, never touches `plan.files` / `metadata.files` / locks. That is visible in the method body, and `plans/task-escalation-state-graph-prd.md` **D8** confirms it by listing “`granted_files` scope grants deliver on the re-pend path” as semantics still to be *built*. (`docs/task-escalation-state-spec.md` **E9** phrases the same gap as “deliver to nobody”, but scoped to the **strand** case, where no re-pend happens at all — it is not the authority for a `blocked` record.)
+
+So a bare `resume` + `granted_files` on a blocked task re-pends it with its ORIGINAL `plan.files`, the agent hits the same wall and re-escalates.
+
+**No mechanism persists a scope widening for a blocked task with no live workflow. Do not go looking for one, and do not tell the next reader you used one.** Traced end-to-end rather than assumed, because a recipe naming a mechanism that does not exist is the exact defect this section was rewritten to remove:
+
+- `orchestrator/src/orchestrator/workflow.py::TaskWorkflow._set_task_scope` is the only choke point that writes **both** `plan.files` and `metadata.files`. It is an instance method on a **live** `TaskWorkflow` (it needs `self.plan` / `self.artifacts` / `self.session_id`), and its only call sites are the in-workflow grant consumer and the post-replan reconcile. Nothing can reach it for a dead workflow.
+- `mcp__fused-memory__update_task(id=..., updates={"metadata": {"files": [...]}})` **is** a real durable write — metadata merges by default, so it will not clobber your other keys — but it does **not** reliably widen the scheduler's locks either. `orchestrator/src/orchestrator/scheduler.py::Scheduler._get_modules` is **cache-first**: its own docstring gives the priority as “deterministic short-circuit > in-memory cache > metadata.files > fallback”, and the body returns out of `self._module_cache` *before* it ever reads `metadata.get('files')`. That cache is written on the dispatch read (`scheduler.py::Scheduler._write_module_cache`, the sole assigning call site) and evicted in exactly one place — `scheduler.py::Scheduler._phase_stale_sweep` — and only for tasks that are (a) in a terminal status or (b) absent from `ctx.tasks_by_id`. A `blocked` task is **neither**: `blocked` lives in `orchestrator/src/orchestrator/task_status.py::ACTIVE_TASK_STATUSES`, not `TERMINAL_STATUSES`, and the active-only `get_tasks` fetch that seeds `tasks_by_id` drops only done/cancelled producers. So the narrow cache entry from the task's prior dispatch **survives the escalation**, and your durable write is not consulted for lock derivation on the next `_get_modules` read. It does **not** widen the agent's working scope either: the implementer works to `plan.json`, and `workflow.py::TaskWorkflow._task_files` reads `plan['files']`, which the durable `.task-meta/<task>/plan.json` still holds narrow.
+- **Independently** — and this bites even in the rarer case where the cache *had* been evicted and the widening did reach lock derivation — that write is **self-reverting** exactly when it matters. `workflow.py::TaskWorkflow._reconcile_scope_locks` — called by `_plan()` and by `_apply_revalidation_skip()` — persists `metadata.files = plan_files` on *every* successful refinement ("widen, narrow, **or shift**", per its own docstring), skipping only when the derived module set is unchanged. A `scope_violation` widening crosses a module boundary by definition, so the next dispatch narrows your widened `metadata.files` straight back down to the old `plan.files`.
+
+**What to do instead: re-plan, don't re-lock.** The plan boundary is the sanctioned widening path — `scripts/migrate_metadata_modules_to_files.py` states the same rule for a deferred scope ("Scope is deferred to the architect, which widens it at plan time"). A `metadata.files` write is still worth making before you resume, for one narrow reason: on a re-dispatch with a finalized plan the architect runs its **revalidation** branch, and `orchestrator/src/orchestrator/agents/briefing.py::BriefingBuilder._format_task` emits a `**Files:** <metadata.files>` line into that prompt (default `include_files=True` — unlike the fresh-plan `build_architect_prompt`, which passes `include_files=False` to anti-anchor the first derivation). So the widened list reaches the architect's eyes. Treat it as **advisory input to a re-plan, not a scope grant**: nothing forces the architect to fold it in, and `_apply_revalidation_skip` can bypass the architect entirely. Write that caveat into your `resolution`, and re-check `plan.files` after the re-dispatch instead of assuming the widening took.
+
+Do **not** try to widen scope by writing `modules` into task metadata. Lock derivation (`Scheduler._get_modules`) reads `metadata.files` and has never read that key, so such a write is a silent no-op that reports success. A lock conflict on the grant is handled orchestrator-side — the task requeues rather than resuming under another task's lock.
 
 ### `dependency_discovered` (info or blocking)
 
