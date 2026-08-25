@@ -5013,6 +5013,23 @@ class TestNormalizeTaskNodeNames:
 # Tests for _reconcile_episode_identity  (task 2202 / W6-β, step 3)
 # ---------------------------------------------------------------------------
 
+def _episode_result(episode):
+    """An add_episode result carrying *episode* verbatim, however malformed.
+
+    Built here rather than by extending `_fm_helpers.MockAddEpisodeResult`
+    because the shapes under test are precisely the ones a dataclass field
+    cannot express — an attribute that is ABSENT, not merely None.
+    """
+    from types import SimpleNamespace
+    return SimpleNamespace(entity_edges=[], edges=[], nodes=[], episode=episode)
+
+
+def _episode_result_uuid(uuid):
+    """An add_episode result whose episode carries *uuid*, however malformed."""
+    from types import SimpleNamespace
+    return _episode_result(SimpleNamespace(uuid=uuid))
+
+
 class TestReconcileEpisodeIdentity:
     """Unit tests for MemoryService._reconcile_episode_identity — the single
     orchestration point (task 2202 / W6-β) that folds the five post-write
@@ -5256,10 +5273,100 @@ class TestReconcileEpisodeIdentity:
         await service._reconcile_episode_identity(mock_result, group_id='test')
 
         service._repair_episode_referents.assert_awaited_once_with(
-            populated, group_id='test',
+            populated, group_id='test', episode_uuid='',
         )
         (args, _kwargs), = service._repair_episode_referents.await_args_list
         assert args[0] is populated
+
+    @pytest.mark.asyncio
+    async def test_the_repair_pass_is_told_which_episode_is_in_flight(self, service):
+        """eta needs THIS episode's uuid to answer "was this node minted by
+        this very write?" — the question the emptied-node cleanup's guard
+        claims to ask and, until it had this datum, could not.
+
+        `_reconcile_episode_identity` already receives `result` and forwards it
+        verbatim to the other seven sub-passes, so the identifier is present at
+        the call site; the eighth just has to be handed it.
+        """
+        from types import SimpleNamespace
+
+        from _fm_helpers import MockAddEpisodeResult
+
+        mock_result = MockAddEpisodeResult()
+        mock_result.episode = SimpleNamespace(uuid='ep-live-1')
+        populated = ReferentStats(edges_scanned=2, endpoints_checked=3)
+        service._verify_episode_referents = AsyncMock(return_value=populated)
+        service._repair_episode_referents = AsyncMock(return_value=ReferentRepairStats())
+
+        await service._reconcile_episode_identity(mock_result, group_id='test')
+
+        service._repair_episode_referents.assert_awaited_once_with(
+            populated, group_id='test', episode_uuid='ep-live-1',
+        )
+        (args, _kwargs), = service._repair_episode_referents.await_args_list
+        assert args[0] is populated, (
+            'the exact-object identity pin must survive the new argument'
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'make_result, label',
+        [
+            (lambda: None, 'result is None'),
+            (lambda: object(), 'result has no .episode at all'),
+            (lambda: _episode_result(None), 'episode is None'),
+            (lambda: _episode_result(object()), 'episode has no .uuid'),
+            (lambda: _episode_result_uuid(''), 'uuid is empty'),
+            (lambda: _episode_result_uuid(None), 'uuid is None'),
+            (lambda: _episode_result_uuid(12345), 'uuid is a non-str'),
+            (lambda: _episode_result_uuid(MagicMock()), 'uuid is an auto-mock'),
+        ],
+    )
+    async def test_a_malformed_result_degrades_to_the_fail_closed_empty_uuid(
+        self, service, make_result, label,
+    ):
+        """READING an identifier must never be able to lose the repair.
+
+        This sub-pass runs AFTER the episode write is already durable, and
+        `_run_pass` exists precisely so a sub-pass failure never fails that
+        committed write. The other seven sub-passes already treat `result` as
+        duck-typed, so an AttributeError raised while merely reading
+        `result.episode.uuid` would forfeit the repair for a reason wholly
+        unrelated to repairing.
+
+        `''` does not mean "no exclusion is needed" — it means "we could not
+        establish which episode this is, so exclude nothing and refuse more
+        deletions". The fail-closed direction, matching
+        `ReferentFinding.resolvable` defaulting to False.
+        """
+        service._verify_episode_referents = AsyncMock(return_value=ReferentStats())
+        service._repair_episode_referents = AsyncMock(return_value=ReferentRepairStats())
+
+        stats = await service._reconcile_episode_identity(
+            make_result(), group_id='test',
+        )
+
+        _args, kwargs = service._repair_episode_referents.await_args
+        assert kwargs['episode_uuid'] == '', label
+        assert '_repair_episode_referents' not in stats.errors, (
+            f'{label}: reading the episode uuid must not raise'
+        )
+
+    def test_the_extraction_helper_never_raises(self):
+        """Pinned directly on the helper too, not only through the chain, so a
+        future caller cannot reintroduce the raise by using it elsewhere."""
+        from types import SimpleNamespace
+
+        from fused_memory.services.memory_service import _episode_uuid_of
+
+        class _Exploding:
+            @property
+            def episode(self):
+                raise RuntimeError('boom')
+
+        assert _episode_uuid_of(_Exploding()) == ''
+        assert _episode_uuid_of(None) == ''
+        assert _episode_uuid_of(SimpleNamespace(episode=SimpleNamespace(uuid='ep-1'))) == 'ep-1'
 
     @pytest.mark.asyncio
     async def test_the_repair_stats_are_carried_on_the_aggregate(self, service):

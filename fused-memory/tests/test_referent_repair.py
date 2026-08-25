@@ -333,6 +333,47 @@ def _reassigned(**overrides) -> dict:
     return payload
 
 
+class TestTheEpisodeIdentityParameter:
+    """`episode_uuid` is keyword-only and defaults to `''` — the fail-closed one.
+
+    The pass needs the identity of the episode whose write is in flight because
+    the emptied-node cleanup's guard claims to distinguish "MINTED by this very
+    episode out of the mis-resolved reference alone" from "the project GENUINELY
+    OWNS the task", and until now it had no datum capable of making that
+    distinction — it inferred mintedness from valid-edge emptiness, a different
+    and much weaker proposition.
+
+    Keyword-only and DEFAULTED so the change is additive: every direct-call test
+    in this file keeps working unchanged, and anything that forgets to thread it
+    degrades to the STRICTER predicate, never a looser one.
+    """
+
+    def test_signature_is_keyword_only_and_defaults_to_empty(self):
+        import inspect
+
+        sig = inspect.signature(MemoryService._repair_episode_referents)
+        param = sig.parameters['episode_uuid']
+        assert param.kind is inspect.Parameter.KEYWORD_ONLY
+        assert param.default == ''
+        assert sig.parameters['group_id'].kind is inspect.Parameter.KEYWORD_ONLY
+
+    @pytest.mark.asyncio
+    async def test_omitting_it_still_repairs_exactly_as_before(self, service):
+        """The additive-ness pinned directly: the repair sequence is unchanged
+        by the new parameter's absence."""
+        stats = await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory',
+        )
+
+        service.graphiti.ensure_entity_node.assert_awaited_once_with(
+            'Task 3127', group_id='dark_factory',
+        )
+        service.graphiti.reassign_edge.assert_awaited_once_with(
+            'e1', 'n-3127', which_end='source', group_id='dark_factory',
+        )
+        assert stats.repaired == 1
+
+
 class TestTheRepairSequence:
     """ensure_entity_node THEN reassign_edge, in that order, per resolvable finding."""
 
