@@ -2060,11 +2060,21 @@ class Harness:
            already makes ("Passed RAW, not ``or ''`` as the DB stamp does"),
            and the one task 3563 ratified when it left that DB stamp's
            asymmetry in place.
+
+        Read via ``getattr`` because this sits on the ESCALATION-FILING path,
+        which ``Harness.__new__``-built test fixtures reach without running
+        ``__init__`` (see ``tests/_orch_helpers.py::_init_harness_state_for_test``).
+        That is the same reason the filing sites themselves read
+        ``getattr(self, '_escalation_queue', None)`` rather than the attribute
+        directly.  It widens nothing: a MISSING ``_run_id`` and a declared-but
+        -``None`` one are the same statement — the run id is unknown — and
+        point 3 above already routes unknown to a fail-safe ``None``.
         """
-        if not self._run_id:
+        run_id = getattr(self, '_run_id', None)
+        if not run_id:
             return None
         return compose_claimant_run_id(
-            self._run_id, _HARNESS_FILING_SESSION_ID, os.getpid(),
+            run_id, _HARNESS_FILING_SESSION_ID, os.getpid(),
         )
 
     def _is_action_teardown_task(self, tid: str) -> bool:

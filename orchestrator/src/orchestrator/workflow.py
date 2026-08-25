@@ -1492,9 +1492,22 @@ class TaskWorkflow:
         follow-up's job; do not "fix" it by changing the plan.lock side to
         match, and do not change it here — this side must keep matching the
         DB stamp it composes.
+
+        Both components are read via ``getattr`` because this sits on the
+        ESCALATION-FILING path, which ``object.__new__(TaskWorkflow)`` test
+        fixtures reach while setting only the handful of attributes their
+        methods touch (see ``tests/test_workflow_sandbox_refusal.py``).  This
+        does NOT weaken the byte-identity guarantee above — the dispatch stamp
+        routes through this same property, so the two cannot diverge whatever
+        the attributes hold.  Nor does it widen the hazard: a MISSING
+        attribute and a declared-but-``None`` one are the same statement (the
+        component is unknown), which the ratified ``or ''`` already maps to an
+        empty component.
         """
         return compose_claimant_run_id(
-            self._process_run_id or '', self.session_id, os.getpid(),
+            getattr(self, '_process_run_id', None) or '',
+            getattr(self, 'session_id', None) or '',
+            os.getpid(),
         )
 
     @property

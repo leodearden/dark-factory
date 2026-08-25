@@ -322,10 +322,27 @@ class TestEscalationServerWiring:
         serve_task = MagicMock()
         serve_task.done.return_value = False
 
+        # Patching asyncio.create_task means the _serve() coroutine is built
+        # but never scheduled or awaited.  Capture and close it: a coroutine
+        # GC'd un-awaited raises an *unraisable* exception at collection time,
+        # which pytest attributes to whichever test happens to be running in
+        # this xdist worker when the GC fires — a spurious failure in an
+        # unrelated file (observed against
+        # test_harness_already_landed_gate_wiring.py).  close() on a
+        # never-started coroutine is the sanctioned way to retire it.
+        created_coros: list = []
+
+        def _capture_task(coro, **kwargs):
+            created_coros.append(coro)
+            return serve_task
+
         with patch('orchestrator.harness.create_server') as mock_create, \
-             patch('asyncio.create_task', return_value=serve_task), \
+             patch('asyncio.create_task', side_effect=_capture_task), \
              patch('asyncio.sleep', new=AsyncMock()):
             await h._start_escalation_server()
+
+        for coro in created_coros:
+            coro.close()
 
         assert mock_create.called, '_start_escalation_server did not reach create_server'
         kwargs = mock_create.call_args.kwargs
