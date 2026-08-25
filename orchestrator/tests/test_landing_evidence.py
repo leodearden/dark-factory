@@ -21,6 +21,8 @@ idiom keeps exercising the real (now-shared) helper logic.
 
 from __future__ import annotations
 
+import inspect
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -30,6 +32,9 @@ from orchestrator.delivered_checks import DeliveredCheckResult
 from orchestrator.git_ops import CommitEffectProbe
 from orchestrator.landing_evidence import (
     LandingEvidenceVerdict,
+    LandingMethod,
+    LandingReason,
+    LandingVerdict,
     file_unattributed_landing_escalation,
     format_unattributed_landing_detail,
     validate_landing_evidence,
@@ -1611,3 +1616,337 @@ class TestValidateLandingEvidenceDeliveredChecksDifferential:
         assert calls == [], 'an unwired call site must issue no check subprocesses'
         # The effect_absent diagnostics from Part A are untouched by Part B.
         assert rejected.probe['diverged_paths'] == ['shared/manifest.py']
+
+
+# ---------------------------------------------------------------------------
+# task 4647 — validate_landing_evidence re-expressed as a MODE over the shared
+# producer family.
+#
+# The PRD's epsilon bullet asks for ONE producer family with an explicit
+# mode/policy discriminator, not two functions that must be kept in step
+# forever.  These tests pin the two halves of that: the discriminator is
+# readable (`method`), and NOTHING ELSE observable moved.  The second half is
+# the load-bearing one — this function has seven incumbent production call
+# sites and four test files pinning its reason strings, so an unchanged public
+# surface is what lets it be re-expressed at all.
+# ---------------------------------------------------------------------------
+
+
+class TestValidateLandingEvidencePublicSurface:
+    """The signature is task 4500's PRECONDITION and may not drift.
+
+    Task 4500 is the capstone that adds a parameter here; it re-reads this
+    exact shape to do so.  A silent drift — a reordering, a defaulted
+    ``branch_tip_sha``, a renamed keyword — would be discovered by 4500 as a
+    mysterious mismatch rather than here as a failing pin, so this asserts it
+    MECHANICALLY via ``inspect`` rather than by having tests that happen to
+    call it in the current shape.
+    """
+
+    def test_the_signature_is_exactly_the_incumbent_shape(self) -> None:
+        params = inspect.signature(validate_landing_evidence).parameters
+        assert list(params) == [
+            'git_ops', 'task_id', 'branch',
+            'branch_tip_sha', 'candidate_sha', 'pattern_template',
+            'delivered_checks',
+        ]
+        for name in ('git_ops', 'task_id', 'branch'):
+            assert params[name].kind is inspect.Parameter.POSITIONAL_OR_KEYWORD, name
+        for name in (
+            'branch_tip_sha', 'candidate_sha', 'pattern_template', 'delivered_checks',
+        ):
+            assert params[name].kind is inspect.Parameter.KEYWORD_ONLY, name
+        # Required-by-keyword, exactly as it has always been.
+        assert params['branch_tip_sha'].default is inspect.Parameter.empty
+        assert params['candidate_sha'].default is None
+        assert params['pattern_template'].default is None
+        assert params['delivered_checks'].default is None
+
+    def test_the_two_verdict_names_are_one_type(self) -> None:
+        """ONE authority, not two — an alias, never a second dataclass.
+
+        Both producers return this; a consumer must never have to know which
+        one answered in order to read the verdict.
+        """
+        assert LandingEvidenceVerdict is LandingVerdict
+
+
+@pytest.mark.asyncio
+class TestValidateLandingEvidenceModeDiscriminator:
+    """``method`` is the explicit mode/policy discriminator.
+
+    It is what makes one producer family legible: a consumer can read whether
+    a verdict came from the NON-DECAYING patch-id contract or from the legacy
+    effect-present policy, without inferring it from the reason code or from
+    which function it happened to call.  Leaf epsilon retires the legacy
+    policy at the landing-detection sites and needs exactly this to tell them
+    apart.
+    """
+
+    @staticmethod
+    def _rejecting_git_ops(sha: str) -> MagicMock:
+        return _git_ops(
+            citation=sha,
+            is_ancestor_map={},
+            effect_present=False,
+            effect_probe=CommitEffectProbe(
+                present=False, diverged_paths=['pkg/a.py'], failure=None,
+                anchor_sha=sha,
+            ),
+        )
+
+    async def test_candidate_mode_reports_the_merge_marker_method(self) -> None:
+        sha = 'a' * 40
+        verdict = await validate_landing_evidence(
+            _git_ops(citation=None, is_ancestor_map={}, effect_present=True),
+            '42', 'task/42', branch_tip_sha=None, candidate_sha=sha,
+        )
+        assert verdict.accepted is True
+        assert verdict.method is LandingMethod.merge_marker
+
+    async def test_candidate_mode_reports_it_on_a_REJECT_too(self) -> None:
+        """WHICH policy answered is a property of the CALL, not of the outcome.
+
+        A consumer reading a rejected verdict is exactly the one that needs to
+        know which policy produced it — that is the reader deciding whether to
+        re-dispatch, escalate, or distrust the answer.
+        """
+        sha = 'b' * 40
+        verdict = await validate_landing_evidence(
+            self._rejecting_git_ops(sha), '42', 'task/42',
+            branch_tip_sha=None, candidate_sha=sha,
+        )
+        assert verdict.accepted is False
+        assert verdict.method is LandingMethod.merge_marker
+
+    async def test_discovery_mode_reports_the_citation_method(self) -> None:
+        branch, tip, citation = 'task/42', 'f' * 40, 'a' * 40
+        verdict = await validate_landing_evidence(
+            _git_ops(
+                citation=citation,
+                is_ancestor_map={(citation, branch): True},
+                effect_present=True,
+            ),
+            '42', branch, branch_tip_sha=tip,
+        )
+        assert verdict.accepted is True
+        assert verdict.method is LandingMethod.citation
+
+    async def test_discovery_mode_reports_it_on_a_no_citation_miss(self) -> None:
+        verdict = await validate_landing_evidence(
+            _git_ops(citation=None, is_ancestor_map={}, effect_present=True),
+            '42', 'task/42', branch_tip_sha='f' * 40,
+        )
+        assert verdict.reason == 'no_citation'
+        assert verdict.method is LandingMethod.citation
+
+    async def test_discovery_mode_reports_it_on_an_effect_absent_reject(self) -> None:
+        branch, citation = 'task/42', 'a' * 40
+        verdict = await validate_landing_evidence(
+            _git_ops(
+                citation=citation,
+                is_ancestor_map={(citation, branch): False},
+                effect_present=False,
+            ),
+            '42', branch, branch_tip_sha=None,
+        )
+        assert verdict.reason == 'effect_absent'
+        assert verdict.method is LandingMethod.citation
+
+    async def test_it_is_NEVER_the_patch_id_contract(self) -> None:
+        """The whole point of the discriminator.
+
+        ``patch_id`` marks the non-decaying producer.  If this legacy policy
+        ever claimed it, a consumer would trust a DECAYING answer as if it
+        could not decay — which is strictly worse than having no discriminator
+        at all, because it converts an unknown into a wrong certainty.
+        """
+        branch, tip, citation = 'task/42', 'f' * 40, 'a' * 40
+        verdicts = [
+            await validate_landing_evidence(
+                _git_ops(
+                    citation=citation,
+                    is_ancestor_map={(citation, branch): True},
+                    effect_present=True,
+                ),
+                '42', branch, branch_tip_sha=tip,
+            ),
+            await validate_landing_evidence(
+                _git_ops(citation=None, is_ancestor_map={}, effect_present=True),
+                '42', branch, branch_tip_sha=tip,
+            ),
+            await validate_landing_evidence(
+                _git_ops(citation=None, is_ancestor_map={}, effect_present=True),
+                '42', branch, branch_tip_sha=None, candidate_sha=citation,
+            ),
+        ]
+        for verdict in verdicts:
+            assert verdict.method is not LandingMethod.patch_id
+            assert verdict.method is not LandingMethod.unspecified, (
+                'a verdict this module produced always names the path that '
+                'produced it; unspecified means hand-constructed'
+            )
+
+
+@pytest.mark.asyncio
+class TestValidateLandingEvidenceBehaviourPreservation:
+    """NOTHING OBSERVABLE MOVED — the half that makes the change safe.
+
+    Seven production call sites (harness.py x4, merge_queue.py x1,
+    escalation/server.py x2) and five test files read this function's reason
+    codes.  The reason values become :class:`LandingReason` MEMBERS, which are
+    genuine ``str`` subclasses, so every incumbent comparison against a plain
+    string holds unchanged and no consumer edit is needed.  The rename to the
+    Contract's ``no_attribution`` spelling is REGISTERED (so no escalation can
+    render 'Unrecognized reason code') but not yet EMITTED here; leaf epsilon
+    flips the emitted value when it repoints the consumers.
+    """
+
+    async def test_an_accept_still_reports_ok(self) -> None:
+        sha = 'a' * 40
+        verdict = await validate_landing_evidence(
+            _git_ops(citation=None, is_ancestor_map={}, effect_present=True),
+            '42', 'task/42', branch_tip_sha=None, candidate_sha=sha,
+        )
+        assert verdict.reason == 'ok'
+        assert verdict.reason is LandingReason.ok
+        assert verdict.probe['reason'] == 'ok'
+        # A StrEnum member must survive the round trips a consumer subjects it
+        # to: an f-string, a dict key, and JSON.
+        assert f'{verdict.reason}' == 'ok'
+        assert {verdict.reason: 1}['ok'] == 1
+        assert json.loads(json.dumps({'reason': verdict.reason}))['reason'] == 'ok'
+
+    async def test_a_discovery_miss_still_reports_no_citation(self) -> None:
+        verdict = await validate_landing_evidence(
+            _git_ops(citation=None, is_ancestor_map={}, effect_present=True),
+            '42', 'task/42', branch_tip_sha='f' * 40,
+        )
+        assert verdict.reason == 'no_citation'
+        assert verdict.reason is LandingReason.no_citation
+        assert verdict.reason != LandingReason.no_attribution, (
+            'the Contract rename is REGISTERED here, not yet EMITTED — '
+            'epsilon flips it when it repoints the consumers'
+        )
+
+    async def test_a_survival_reject_still_reports_effect_absent(self) -> None:
+        branch, citation = 'task/42', 'a' * 40
+        verdict = await validate_landing_evidence(
+            _git_ops(
+                citation=citation,
+                is_ancestor_map={(citation, branch): False},
+                effect_present=False,
+            ),
+            '42', branch, branch_tip_sha=None,
+        )
+        assert verdict.reason == 'effect_absent'
+        assert verdict.reason is LandingReason.effect_absent
+
+    @pytest.mark.parametrize(
+        ('delivered_checks', 'expected'),
+        [
+            (None, 'unwired'),
+            ([], 'none_declared'),
+            ([{'name': 'x', 'kind': 'grep', 'pattern': 'y', 'files': ['z']}], 'evaluated'),
+        ],
+    )
+    async def test_delivered_checks_state_is_seeded_exactly_as_before(
+        self, delivered_checks, expected,
+    ) -> None:
+        """Recorded UNCONDITIONALLY, on accepts too.
+
+        Wiring is a property of the CALL SITE, not of the outcome: if only
+        rejections carried it, the sole way to learn a site is unwired would
+        be to wait for it to reject.  Task 4500 reads exactly this key to tell
+        a genuinely-unwired site from a site that declared nothing.
+        """
+        sha = 'a' * 40
+        verdict = await validate_landing_evidence(
+            _git_ops(citation=None, is_ancestor_map={}, effect_present=True),
+            '42', 'task/42', branch_tip_sha=None, candidate_sha=sha,
+            delivered_checks=delivered_checks,
+        )
+        assert verdict.accepted is True, 'seeded on the ACCEPT path too'
+        assert verdict.probe['delivered_checks_state'] == expected
+
+    async def test_the_probe_keys_are_unchanged(self) -> None:
+        """Every incumbent key still present, spelled and valued as before."""
+        branch, tip, citation = 'task/42', 'f' * 40, 'a' * 40
+        verdict = await validate_landing_evidence(
+            _git_ops(
+                citation=citation,
+                is_ancestor_map={(citation, branch): True},
+                effect_present=True,
+            ),
+            '42', branch, branch_tip_sha=tip,
+        )
+        probe = verdict.probe
+        assert probe['task_id'] == '42'
+        assert probe['branch'] == branch
+        assert probe['branch_tip_sha'] == tip
+        assert probe['citation'] == citation
+        assert probe['effect_check_sha'] == tip
+        assert probe['delivered_checks_state'] == 'unwired'
+        assert probe['reason'] == 'ok'
+
+    async def test_the_effect_absent_divergence_keys_survive(self) -> None:
+        branch, citation = 'task/42', 'a' * 40
+        verdict = await validate_landing_evidence(
+            _git_ops(
+                citation=citation,
+                is_ancestor_map={(citation, branch): False},
+                effect_present=False,
+                effect_probe=CommitEffectProbe(
+                    present=False, diverged_paths=['pkg/a.py'],
+                    failure=None, anchor_sha=citation,
+                ),
+            ),
+            '42', branch, branch_tip_sha=None,
+        )
+        assert verdict.probe['diverged_paths'] == ['pkg/a.py']
+        assert verdict.probe['effect_failure'] is None
+        assert verdict.probe['effect_anchor_sha'] == citation
+
+
+@pytest.mark.asyncio
+class TestEffectDivergenceGateSurvivesTheStrEnum:
+    """(f) ``_render_effect_divergence`` gates on ``reason != 'effect_absent'``.
+
+    That comparison is the ONLY literal reason comparison left in production
+    code, and it now runs against a :class:`LandingReason` member rather than
+    a plain string.  A StrEnum compares equal to its spelling, so it still
+    holds — but "it should still hold" is exactly the class of assumption that
+    silently stops holding, and this block's disappearance would be invisible:
+    the escalation would still render, just without the one section that
+    answers "is this a revert or just skew?".
+    """
+
+    async def test_the_divergence_block_renders_for_an_effect_absent_verdict(
+        self,
+    ) -> None:
+        branch, citation = 'task/42', 'a' * 40
+        verdict = await validate_landing_evidence(
+            _git_ops(
+                citation=citation,
+                is_ancestor_map={(citation, branch): False},
+                effect_present=False,
+                effect_probe=CommitEffectProbe(
+                    present=False, diverged_paths=['pkg/a.py'],
+                    failure=None, anchor_sha=citation,
+                ),
+            ),
+            '42', branch, branch_tip_sha=None,
+        )
+        _summary, detail = format_unattributed_landing_detail('42', branch, verdict)
+        assert 'diverged paths' in detail
+        assert 'pkg/a.py' in detail
+        assert 'Unrecognized reason code' not in detail
+
+    async def test_the_block_stays_absent_for_every_other_reason(self) -> None:
+        verdict = await validate_landing_evidence(
+            _git_ops(citation=None, is_ancestor_map={}, effect_present=True),
+            '42', 'task/42', branch_tip_sha='f' * 40,
+        )
+        _summary, detail = format_unattributed_landing_detail('42', 'task/42', verdict)
+        assert 'diverged paths' not in detail
+        assert 'Unrecognized reason code' not in detail
