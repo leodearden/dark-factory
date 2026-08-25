@@ -8911,15 +8911,6 @@ class TestCommittedReportMarkdown:
                 f'columns match: {bullets[0]!r}'
             )
 
-    def test_it_renders_byte_identically_from_the_committed_json(self):
-        """The markdown is a pure function of the JSON, so the two cannot have
-        been edited apart — and a rerun's diff stays signal."""
-        mod = _mod()
-
-        assert mod.render_markdown(_committed_report()) == (
-            mod.DEFAULT_REPORT_MD.read_text(encoding='utf-8')
-        )
-
     # --- the +1-re-emission probe (task 4012) -----------------------------
     #
     # The JSON half above pins that the probe RAN and measured everything.
@@ -8927,10 +8918,10 @@ class TestCommittedReportMarkdown:
     # reading order puts it, its tables carry no `—`, and the disclosure that
     # qualifies every number in it is present verbatim.
     #
-    # `test_it_renders_byte_identically_from_the_committed_json` does NOT
-    # subsume these.  Both sides of that comparison go through
-    # `render_markdown`, so a renderer that dropped the section, or a JSON
-    # half that never carried it, agrees with itself perfectly.
+    # `TestTheCommittedPairAgrees` below does NOT subsume these.  Both sides
+    # of that comparison go through `render_markdown`, so a renderer that
+    # dropped the section, or a JSON half that never carried it, agrees with
+    # itself perfectly.
 
     def test_the_regrowth_section_sits_between_by_query_kind_and_d10(self):
         """The committed artifact's reading order, not just the renderer's.
@@ -9022,3 +9013,71 @@ class TestCommittedReportMarkdown:
         for row in rows:
             for cell in _cells(row):
                 assert mod._NO_MEASUREMENT not in cell, row
+
+
+class TestTheCommittedPairAgrees:
+    """The two committed halves must describe the SAME run.
+
+    `render_markdown` is byte-deterministic for identical input, and
+    `write_artifacts` renders the markdown BEFORE either atomic replace
+    precisely so the pair can never describe different runs.  Nothing
+    checked that property against the COMMITTED pair, though — so a
+    renderer edit could, and did, leave a stale markdown claiming things
+    the current code no longer says while every other committed-artifact
+    test stayed green.  Those tests assert table headers, bullet anchors,
+    a disclosure constant and the absence of `—` cells; a derived SENTENCE
+    that went stale is invisible to all of them.
+
+    This is the mechanical gate for that.  It is a pure file read, so it
+    runs in the merge lane on every commit, which is the point: it goes red
+    the moment a renderer change lands without the artifact being
+    re-rendered, rather than leaving a wrong sentence in the artifact for a
+    downstream reader to find.
+
+    Pins NO metric value, rate or bound.  What it pins is that the two
+    halves agree.
+    """
+
+    #: The step-23 re-render.  Named in the failure message because the fix
+    #: for this test is never "edit the markdown" — it is "re-render it from
+    #: the JSON", and a reader who hand-edits the prose to match reintroduces
+    #: exactly the drift this test exists to catch.
+    RE_RENDER = (
+        "cd fused-memory && uv run python -c \"\n"
+        "import json, importlib.util, sys, pathlib\n"
+        "p = pathlib.Path('scripts/bake_off_storage_shape.py')\n"
+        "spec = importlib.util.spec_from_file_location("
+        "'bake_off_storage_shape', p)\n"
+        "m = importlib.util.module_from_spec(spec)\n"
+        "sys.modules['bake_off_storage_shape'] = m\n"
+        "spec.loader.exec_module(m)\n"
+        "report = json.loads(m.DEFAULT_REPORT_JSON.read_text(encoding='utf-8'))\n"
+        "m._atomic_write_text(m.DEFAULT_REPORT_MD, m.render_markdown(report))\n"
+        "\""
+    )
+
+    def test_the_committed_markdown_is_what_the_renderer_produces_today(self):
+        mod = _mod()
+
+        assert mod.DEFAULT_REPORT_MD.read_text(encoding='utf-8') == (
+            mod.render_markdown(_committed_report())
+        ), (
+            f'{mod.DEFAULT_REPORT_MD.name} is stale: it is not what the '
+            f'current renderer produces from '
+            f'{mod.DEFAULT_REPORT_JSON.name}.  The measurements have not '
+            f'changed — re-render the markdown, do NOT hand-edit it and do '
+            f'NOT re-run the bake-off:\n\n{self.RE_RENDER}'
+        )
+
+    def test_rendering_the_committed_json_twice_is_byte_identical(self):
+        """The determinism contract, re-anchored on the real committed data
+        rather than a synthetic report.
+
+        The test above is only a gate if re-rendering is reproducible: a
+        renderer that varied run to run would make it flap, and the fix it
+        names would not fix anything.
+        """
+        mod = _mod()
+        report = _committed_report()
+
+        assert mod.render_markdown(report) == mod.render_markdown(report)
