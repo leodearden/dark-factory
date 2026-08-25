@@ -215,6 +215,7 @@ from orchestrator.verify import (
     VerifyResult,
     _derive_task_files_from_git,
     cached_main_baseline_failing_ids,
+    cached_main_baseline_skipped_ids,
     diff_new_failures,
     run_scoped_verification,
     run_verification,
@@ -596,6 +597,27 @@ via MAIN_RED) until a non-trivial merge or an operator greens main. The gate
 logs a distinct WITHHELD warning so this edge is recognisable rather than read
 as routine main-red churn."""
 
+
+
+SKIPPED_ON_MAIN_REASON_CLAUSE = (
+    'test(s) SKIPPED on main (main never ran them — not evidence of a branch fault)'
+)
+"""Clause appended to a branch-block ``MergeOutcome.reason`` naming
+branch-failing test ids that main's SKIPPED baseline covers (task 3226).
+
+WHY the partition exists: the enrichment below cites "N new failing test(s)
+not present on main", where "not present on main" means "absent from main's
+FAILING baseline".  That is true of two categorically different populations —
+tests main RAN and passed (real evidence the branch broke them) and tests main
+NEVER RAN (evidence of nothing at all).  Counting them together overstates the
+branch's fault in the one artifact a human actually reads, and the 2026-07-29
+reify-allowlist incident is exactly that shape: a guard that SKIPPED on one
+side of a comparison and looked pass-shaped on the other.
+
+Ids under this clause are named, but explicitly NOT counted as new failures.
+Sourced from :func:`verify.cached_main_baseline_skipped_ids` — a CACHE-ONLY
+peek that never triggers a probe on the critical path (G4, task 2564); a cold
+skipped baseline degrades to the pre-3226 wording byte-identically."""
 
 MAIN_HEALTH_PROBE_PENDING_NOTE = (
     'provisional: an off-critical-path main-health probe is still checking '
@@ -3645,10 +3667,32 @@ async def _run_post_merge_verify(
                 if _cached_baseline is not None:
                     new_ids = diff_new_failures(verify.failing_test_ids, _cached_baseline)
         if new_ids:
-            reason = (
-                f'Post-merge verification failed: {len(new_ids)} new failing '
-                f"test(s) not present on main: {', '.join(sorted(new_ids))}"
+            # Task 3226: partition the new ids against main's SKIPPED baseline
+            # before counting any of them as a branch fault.  See
+            # SKIPPED_ON_MAIN_REASON_CLAUSE for the full rationale; CACHE-ONLY
+            # peek (never a probe, G4/task 2564) and a cold skipped baseline
+            # reads as an empty set, degrading to the pre-3226 wording exactly.
+            _skipped_baseline = (
+                cached_main_baseline_skipped_ids(_current_main_sha) or frozenset()
             )
+            skipped_on_main = new_ids & _skipped_baseline
+            genuinely_new = new_ids - skipped_on_main
+            _skipped_clause = (
+                f'{len(skipped_on_main)} {SKIPPED_ON_MAIN_REASON_CLAUSE}: '
+                f"{', '.join(sorted(skipped_on_main))}"
+            ) if skipped_on_main else ''
+            if genuinely_new:
+                reason = (
+                    f'Post-merge verification failed: {len(genuinely_new)} new failing '
+                    f"test(s) not present on main: {', '.join(sorted(genuinely_new))}"
+                )
+                if _skipped_clause:
+                    reason = f'{reason}; plus {_skipped_clause}'
+            else:
+                # Every new id was skipped on main — there is no genuinely-new
+                # failing test to claim, so the affirmative block wording would
+                # be a false statement.  Report only what is actually known.
+                reason = f'Post-merge verification failed: {_skipped_clause}'
         else:
             reason = f'Post-merge verification failed: {verify.summary}'
             # Append the failure category so the timeout-vs-real-failure
