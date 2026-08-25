@@ -17,7 +17,6 @@ Kept separate from ``test_verify_agent_failure.py`` — that file is task 4343's
 failure-token census guard, and each file here pins ONE contract.
 """
 
-import inspect
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -103,9 +102,20 @@ async def test_verify_requires_codebase_root_keyword(tmp_path):
     finally:
         patcher.stop()
 
-    param = inspect.signature(CodebaseVerifier.verify).parameters['codebase_root']
-    assert param.kind is inspect.Parameter.KEYWORD_ONLY
-    assert param.default is inspect.Parameter.empty
+    # Keyword-ONLY, pinned behaviourally rather than by introspecting the
+    # signature: a root passed POSITIONALLY must not bind.  (The old
+    # `param.default is empty` half was fully subsumed by the TypeError
+    # above, and signature introspection tends to ossify cosmetic shape
+    # rather than behaviour.)  The keyword NAME stays pinned by every other
+    # test in this file, all of which call `codebase_root=`.
+    patcher, _mock_cls, _instance = _mock_agent_loop()
+    try:
+        with pytest.raises(TypeError):
+            # Four positionals against a three-positional signature; the
+            # static diagnostic is the same fact under test.
+            await verifier.verify('claim', '', None, tmp_path)  # pyright: ignore[reportCallIssue]
+    finally:
+        patcher.stop()
 
 
 def test_verifier_holds_no_global_codebase_root(tmp_path):

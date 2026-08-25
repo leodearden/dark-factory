@@ -1483,11 +1483,16 @@ async def test_agent_loop_explicit_cwd_overrides_config_explore_root(tmp_path):
 async def test_agent_loop_cwd_defaults_to_config_explore_root(tmp_path):
     """Without an explicit cwd, AgentLoop falls back to config.explore_codebase_root.
 
-    PRD D5's "test compat" clause: `cwd` is optional precisely so the ~20
-    existing construction sites (recon stages, the judge harness, and the
-    delegation-contract / MCP-scoping tests in this file) keep working
-    unchanged.  This pins the fallback so it cannot be dropped once the
-    verifier stops relying on it.
+    PRD D5's "test compat" clause: `cwd` is optional precisely so this file's
+    ~28 existing construction sites keep working unchanged.  That is the
+    WHOLE blast radius — `AgentLoop(` has exactly ONE call site outside
+    tests, verify.py, and it always passes `cwd`.  The recon stages, the
+    judge harness and cli_stage_runner call `invoke_with_cap_retry` directly
+    and never construct an AgentLoop at all, so nothing in production depends
+    on this fallback and the default is in fact unreachable there.
+
+    This pins the fallback while those test sites still rely on it; a later
+    task can make `cwd` required outright once they pass it explicitly.
     """
     from pathlib import Path
 
