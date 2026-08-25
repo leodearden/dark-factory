@@ -7863,6 +7863,16 @@ async def verify_failure_is_preexisting_on_main(
           - ``git_ops.get_main_sha()`` fails or returns empty.
           - ``git worktree add --detach`` fails after retries.
           - Any unexpected exception during probing.
+          - UNATTRIBUTABLE IDS (task 3226): the task-μ id-diff fast path
+            found branch-failing ids absent from main's failing baseline,
+            but at least one of them appears in main's SKIPPED baseline —
+            main never RAN it, so the diff is evidence of nothing.  Such a
+            failure is NEVER treated as task fault on the strength of the
+            diff alone; the function falls through to the (category,
+            cause_hint) signature comparison and returns whatever THAT
+            concludes.  See the 2026-07-29 reify-allowlist incident, whose
+            shape was exactly a guard that skipped on one side of a
+            comparison and looked pass-shaped on the other.
           - CONFIRM GATE (task 3597): the signature matched, but
             ``_main_probe_failure_is_isolated_flake`` positively confirmed
             every named failing test passes in isolation on the main
@@ -7954,7 +7964,33 @@ async def verify_failure_is_preexisting_on_main(
             if baseline is not None:
                 branch_ids = frozenset(failing_result.failing_test_ids)
                 wholly = is_wholly_preexisting(branch_ids, baseline)
-                return wholly, (main_sha if wholly else '')
+                if wholly:
+                    return True, main_sha
+                # Task 3226: a SKIP is not a PASS.  `wholly` False only says
+                # some branch-failing id is absent from main's FAILING
+                # baseline, which conflates two different worlds — main RAN
+                # the test and it passed (the branch broke it), and main NEVER
+                # RAN it (the diff proves nothing).  Only the first licenses
+                # the confident task-fault verdict below.  Cache-ONLY peek
+                # (never a probing variant) so this costs nothing on the
+                # critical path (G4, task 2564); a cold skipped cache reads as
+                # an empty set and degrades to the pre-3226 verdict exactly.
+                _new_ids = diff_new_failures(branch_ids, baseline)
+                _unattributable = _new_ids & (
+                    cached_main_baseline_skipped_ids(main_sha) or frozenset()
+                )
+                if _unattributable:
+                    logger.warning(
+                        'verify_failure_is_preexisting_on_main: %d branch-failing '
+                        'id(s) were SKIPPED on main %.8s (%s) — main never ran '
+                        'them, so the id diff supports no verdict; deferring to '
+                        'the signature probe instead of blaming the branch',
+                        len(_unattributable), main_sha,
+                        ', '.join(sorted(_unattributable)),
+                    )
+                    # Fall through to the legacy signature comparison below.
+                else:
+                    return False, ''
             # baseline is None (B3) — fall through to the legacy probe below.
 
         # Check the process-wide probe cache before paying the worktree-add cost.
