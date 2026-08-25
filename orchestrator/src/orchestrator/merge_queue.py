@@ -19298,6 +19298,27 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # placement rule: before the resolve, because the resolve is what
                 # freezes the `merge_finalized` payload.
                 outcome = dataclasses.replace(outcome, landed_via_chain=1)
+                # ── CONSERVATION: a chain consumes NO per-item permits ──────
+                # This is the link's WHOLE retirement, and the absence below is
+                # deliberate: `_resolve_or_drop_abandoned` resolves the future
+                # and retires the request_id (best-effort TERMINAL + drop from
+                # `_live_items`), and NOTHING releases a permit — because this
+                # link never dispatched, so it never acquired a `SpecPermit`
+                # or a `CapPermit` to give back.  Only the DISPATCHING item
+                # carries `entry.permit`/`item.cap_permit`, and its release
+                # stays where it is, in `_finalize_inflight`'s single
+                # `finally`, so no walk exit can double-release it.
+                #
+                # Do NOT add a release here "for symmetry" with the head path.
+                # `PermitLedger.release` raises AssertionError on a token it
+                # never issued (merge_speculation_controller.py:213-239) — and
+                # the `except Exception` below would SWALLOW it, so the damage
+                # would show up only as a chain that mysteriously lands one
+                # item; releasing the HEAD's token per link instead would
+                # over-release the semaphore, lifting `slot_available` above
+                # `depth` and licensing more concurrent speculation than the
+                # operator configured.  Both are pinned by
+                # test_merge_queue_deep_landing.py::TestChainWalkConsumesNoPermits.
                 self._resolve_or_drop_abandoned(link_req, outcome)
                 link_resolved = True
                 landed += 1
