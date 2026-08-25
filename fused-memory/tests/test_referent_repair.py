@@ -22,6 +22,9 @@ them would let a FalkorDB outage read as a scanner regression.
 
 from __future__ import annotations
 
+import dataclasses
+import json
+
 import pytest
 
 from fused_memory.services.memory_service import (
@@ -82,7 +85,7 @@ class TestReferentRepairRecordVocabulary:
         """A repair record is evidence for DESTRUCTIVE edge surgery — a
         consumer must not be able to rewrite which edge end it names."""
         record = _repair()
-        with pytest.raises(Exception):
+        with pytest.raises(dataclasses.FrozenInstanceError):
             record.outcome = 'unrepairable'  # type: ignore[misc]
 
     def test_summaries_refreshed_is_a_tuple_not_a_list(self):
@@ -107,8 +110,6 @@ class TestReferentRepairRecordVocabulary:
             assert registered in message
 
     def test_to_dict_is_json_safe_and_keyed_by_field_names(self):
-        import json
-
         record = _repair(
             new_endpoint_uuid='n-3127',
             intended_referent='Task 3127',

@@ -1608,6 +1608,15 @@ class ReconcileStats:
     #: carry any of that, which is exactly why the logger.debug-only int shape
     #: above is not enough for it. Leaf eta reads the findings off this field.
     referent_stats: ReferentStats = field(default_factory=lambda: ReferentStats())
+    #: The repair sub-pass's records (task 3672, PRD leaf eta) — what was
+    #: actually DONE about the findings on ``referent_stats``, including the
+    #: two dispositions where the right answer was to do nothing. A structured
+    #: record set for the same reason zeta's is: "we refused to guess at this
+    #: edge end" is a fact an operator has to act on, and no count can carry
+    #: it. Eta is the only WRITING consumer of zeta's detect-only output.
+    repair_stats: ReferentRepairStats = field(
+        default_factory=lambda: ReferentRepairStats()
+    )
     errors: list[str] = field(default_factory=list)
 
 
@@ -2139,6 +2148,200 @@ class ReferentStats:
     def unresolvable_findings(self) -> int:
         """Findings recorded with no determinable correct target — left alone."""
         return sum(1 for f in self.findings if not f.resolvable)
+
+
+#: THE closed vocabulary of repair dispositions (task 3672, PRD leaf eta).
+#: The single normative site for the "what happened to this finding" field on
+#: every repair record — an outcome must be REGISTERED here, never spelled as a
+#: bare string at a call site, or the operator surface and leaf iota's rate key
+#: off vocabularies that drift.
+#:
+#: The four are genuinely different answers to the operator's question, and the
+#: split is load-bearing:
+#:
+#: * ``'repaired'``    — the ensure -> reassign sequence ran. ``moved=False``
+#:   inside this outcome is ``reassign_edge``'s own corroborate-before-acting
+#:   no-op (the edge was ALREADY correct), which is why the streak counts
+#:   ``moved=True`` records rather than this outcome alone.
+#: * ``'unrepairable'``— zeta could not determine a correct target and eta
+#:   REFUSED TO GUESS. Working as designed.
+#: * ``'degenerate'``  — both ends of one edge would land on one node; the edge
+#:   was skipped WHOLE. Also a refusal, which is why it shares
+#:   ``flagged_unrepairable`` with the row above.
+#: * ``'failed'``      — we tried and the backend did not cooperate. An
+#:   INFRASTRUCTURE signal, deliberately not folded into the refusal bucket:
+#:   conflating them would let a FalkorDB outage read as a scanner regression
+#:   in leaf iota's rate, and would feed a false repair-storm streak.
+REFERENT_REPAIR_OUTCOMES: tuple[str, ...] = (
+    'repaired', 'unrepairable', 'degenerate', 'failed',
+)
+
+
+@dataclass(frozen=True, kw_only=True)
+class ReferentRepair:
+    """What eta DID about one :class:`ReferentFinding` — the audit record.
+
+    The eta half of INV-2 structured-facts-at-failure. zeta's finding says
+    "this edge end is wrong and here is what it should point at"; this record
+    says what was then done about it, including the two dispositions where the
+    right answer was to do NOTHING. A dropped finding and a repaired one are
+    indistinguishable to a downstream rate; an ``'unrepairable'`` record is the
+    evidence a human uses to decide the case by hand.
+
+    FROZEN, and its collection field is a TUPLE, for exactly the reason
+    :class:`ReferentFinding` is: this is evidence for DESTRUCTIVE edge surgery,
+    and ``frozen=True`` blocks attribute rebinding only — a list field would
+    leave ``record.summaries_refreshed.append(...)`` open, letting a consumer
+    quietly widen the claim about what this pass actually refreshed. The
+    emptied-node stamp is applied with :func:`dataclasses.replace`, never
+    mutation, for the same reason.
+
+    Keyword-only because twelve fields, seven of them strings, is exactly the
+    shape where a positional argument silently lands in the wrong slot.
+    """
+
+    #: The edge this record is about.
+    edge_uuid: str
+    #: Which end: ``'source'`` or ``'target'``. With :attr:`edge_uuid` this is
+    #: the identity of the finding this record answers.
+    which_end: str
+    #: What happened; one of :data:`REFERENT_REPAIR_OUTCOMES`.
+    outcome: str
+    #: The node the edge end was attached to when the finding was recorded.
+    old_endpoint_uuid: str
+    #: Which zeta check produced the finding, carried through unchanged so a
+    #: reader never has to join this record back to a ``ReferentStats`` to
+    #: learn why the repair happened.
+    check: str
+    #: The node the end now points at. ``''`` when nothing was targeted (every
+    #: outcome other than ``'repaired'``).
+    new_endpoint_uuid: str = ''
+    #: The canonical ``node_name`` of the referent that target denotes. ``''``
+    #: when none — a finding zeta left unresolvable names no intended referent.
+    intended_referent: str = ''
+    #: Whether ``ensure_entity_node`` MINTED the target rather than resolving
+    #: an existing node.
+    minted: bool = False
+    #: Whether ``reassign_edge`` actually moved the endpoint. ``False`` on its
+    #: corroborated no-op arm — the edge was already correct.
+    moved: bool = False
+    #: Node uuids whose summary is known to reflect the post-repair edge set:
+    #: the union of what ``reassign_edge`` reported refreshing itself and what
+    #: eta's backstop then re-refreshed. Says what is true of the GRAPH, not
+    #: what this method happened to call.
+    summaries_refreshed: tuple[str, ...] = ()
+    #: The uuid of an emptied node this pass deleted, when the narrow
+    #: three-condition cleanup fired. ``''`` when nothing was deleted.
+    deleted_emptied_node: str = ''
+    #: Why, for the outcomes that did not repair. Carried VERBATIM from
+    #: ``ReferentFinding.reason`` on the ``'unrepairable'`` arm — the operator
+    #: must see zeta's own explanation, not an eta-authored paraphrase — and
+    #: carrying the exception text on the ``'failed'`` arm.
+    reason: str = ''
+
+    def __post_init__(self) -> None:
+        if self.outcome not in REFERENT_REPAIR_OUTCOMES:
+            raise ValueError(
+                f'unregistered repair outcome {self.outcome!r}; registered '
+                f'outcomes are {list(REFERENT_REPAIR_OUTCOMES)}. Add it to '
+                'memory_service.REFERENT_REPAIR_OUTCOMES rather than recording '
+                'a disposition no consumer can key off.'
+            )
+
+    def to_dict(self) -> dict[str, Any]:
+        """A plain, JSON-safe dict keyed exactly by this record's field names.
+
+        The payload the operator warning and the storm escalation's detail
+        carry. :attr:`summaries_refreshed` renders as a LIST because a tuple is
+        not JSON, and the escalation detail is serialized.
+        """
+        return {
+            'edge_uuid': self.edge_uuid,
+            'which_end': self.which_end,
+            'outcome': self.outcome,
+            'old_endpoint_uuid': self.old_endpoint_uuid,
+            'new_endpoint_uuid': self.new_endpoint_uuid,
+            'intended_referent': self.intended_referent,
+            'check': self.check,
+            'minted': self.minted,
+            'moved': self.moved,
+            'summaries_refreshed': list(self.summaries_refreshed),
+            'deleted_emptied_node': self.deleted_emptied_node,
+            'reason': self.reason,
+        }
+
+
+@dataclass
+class ReferentRepairStats:
+    """What one ``_repair_episode_referents`` run did, and what it declined to do.
+
+    The in-process half of eta's INV-2 record: returned on
+    ``ReconcileStats.repair_stats`` and carried verbatim into the repair-storm
+    escalation's detail, so the alarm ships the EVIDENCE rather than a count.
+
+    Every summary count is a ``@property`` comprehension over :attr:`repairs`
+    rather than a field, precisely so it CANNOT drift from the list it
+    summarizes — the same property-not-field discipline
+    :class:`ReferentStats` follows. A stored count is a second site that must
+    be incremented in lockstep with every append.
+    """
+
+    repairs: list[ReferentRepair] = field(default_factory=list)
+
+    @property
+    def repaired(self) -> int:
+        """Endpoints this pass actually MOVED.
+
+        ``moved=True`` specifically, not merely ``outcome == 'repaired'``: a
+        ``moved=False`` result is ``reassign_edge``'s corroborate-before-acting
+        no-op, meaning the edge was already correct. Counting it would make the
+        INV-4 storm streak fire on a graph that needed no repairs at all.
+        """
+        return sum(
+            1 for r in self.repairs if r.outcome == 'repaired' and r.moved
+        )
+
+    @property
+    def flagged_unrepairable(self) -> int:
+        """Findings RECORDED AND LEFT ALONE — the NEVER GUESS disposition.
+
+        Deliberately folds ``'unrepairable'`` and ``'degenerate'`` into ONE
+        bucket: the task's NEVER GUESS rule assigns both the same disposition
+        (recorded, not acted on), so the operator reads one number for "we
+        refused to act". ``'failed'`` is excluded on purpose — see
+        :data:`REFERENT_REPAIR_OUTCOMES`.
+        """
+        return sum(
+            1 for r in self.repairs
+            if r.outcome in ('unrepairable', 'degenerate')
+        )
+
+    @property
+    def degenerate_edges(self) -> int:
+        """EDGES skipped whole, not records — a degenerate edge yields one
+        record per end, and the operator's question is how many edges."""
+        return len({r.edge_uuid for r in self.repairs if r.outcome == 'degenerate'})
+
+    @property
+    def failed(self) -> int:
+        """Findings whose repair was ATTEMPTED and did not complete."""
+        return sum(1 for r in self.repairs if r.outcome == 'failed')
+
+    @property
+    def nodes_minted(self) -> int:
+        """Repair targets ``ensure_entity_node`` had to create."""
+        return sum(1 for r in self.repairs if r.minted)
+
+    @property
+    def nodes_deleted(self) -> int:
+        """DISTINCT emptied nodes the cleanup phase deleted.
+
+        Distinct, because two repairs moving endpoints off the same node stamp
+        that one deletion onto both records.
+        """
+        return len({
+            r.deleted_emptied_node for r in self.repairs if r.deleted_emptied_node
+        })
 
 
 class DescendantScan(NamedTuple):
