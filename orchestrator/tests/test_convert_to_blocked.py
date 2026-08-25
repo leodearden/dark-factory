@@ -1506,7 +1506,10 @@ class TestSubmitToMergeQueueAlreadyLanded:
         assert 'plan_files_not_touched' not in emits, (
             'emitting the inverse of the truth is the bug being fixed'
         )
-        narrow.assert_not_awaited(), (
+        # `narrow.assert_not_awaited(), (msg)` would build a TUPLE, silently
+        # discarding the message on failure; spelled as a real assert so the
+        # rationale actually reaches whoever breaks it.
+        assert not narrow.await_count, (
             'already-landed work must not be dragged through a narrowing pass'
         )
         mark_blocked.assert_awaited_once()
