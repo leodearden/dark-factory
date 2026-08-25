@@ -507,3 +507,262 @@ class TestDisallowListForDeleteEntity:
         via DISALLOW_MEMORY_WRITES)."""
         from fused_memory.reconciliation.cli_stage_runner import STAGE3_DISALLOWED
         assert 'mcp__fused-memory__delete_entity' in STAGE3_DISALLOWED
+
+
+# ---------------------------------------------------------------------------
+# step-25: GraphitiBackend.count_foreign_relationships
+# ---------------------------------------------------------------------------
+
+class TestCountForeignRelationships:
+    """``count_foreign_relationships(node_uuid, *, group_id, episode_uuid='') -> int``.
+
+    THE QUESTION THIS PRIMITIVE ANSWERS, and why no existing one could.
+    ``get_valid_edges_for_node`` answers "does this node still carry live
+    facts?" — it is typed to ``RELATES_TO`` and filtered to
+    ``invalid_at IS NULL``.  Every other count query in ``graphiti_client.py``
+    is likewise typed to ``RELATES_TO``.  So a node's INVALIDATED temporal
+    history and its Episodic ``MENTIONS`` provenance links are invisible to
+    every primitive this backend has — while ``delete_entity_node`` issues a
+    bare ``MATCH (n:Entity {uuid: $uuid}) DETACH DELETE n`` that destroys all
+    of them.
+
+    A guard that authorises a destructive operation must test EXACTLY what
+    that operation destroys.  This one therefore counts every relationship of
+    any type and any validity, minus the single link the caller can prove it
+    minted itself: this episode's own ``MENTIONS``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_uses_ro_query_not_query(self, mock_config, make_backend, make_graph_mock):
+        """READ-ONLY, and must stay so: this primitive is a guard.  A guard
+        that can write is a guard that can cause the damage it exists to
+        prevent."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock(ro_rows=[[0]])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        await backend.count_foreign_relationships('n-3129', group_id='test')
+        graph.ro_query.assert_awaited_once()
+        graph.query.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_match_is_untyped_and_undirected(self, mock_config, make_backend, make_graph_mock):
+        """``MATCH (n:Entity {uuid: $uuid})-[r]-(m)`` — no relationship type,
+        no direction.  DETACH DELETE respects neither, so neither may this."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock(ro_rows=[[0]])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        await backend.count_foreign_relationships('n-3129', group_id='test')
+        cypher = extract_cypher(graph.ro_query.call_args)
+        assert '(n:Entity {uuid: $uuid})' in cypher
+        assert '-[r]-' in cypher
+        assert '->' not in cypher and '<-' not in cypher, (
+            'a directed match would miss half the relationships DETACH DELETE '
+            'destroys'
+        )
+
+    @pytest.mark.asyncio
+    async def test_cypher_names_neither_RELATES_TO_nor_invalid_at(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        """THESE TWO OMISSIONS ARE THE POINT OF THE PRIMITIVE.
+
+        Re-adding either would silently reintroduce the deletion bug: typing
+        the match to ``RELATES_TO`` re-blinds it to ``MENTIONS``, and filtering
+        ``invalid_at IS NULL`` re-blinds it to the temporal history DETACH
+        DELETE destroys.  Both edits look like harmless tidying next to the
+        sibling queries in the same file, which is exactly why this asserts on
+        their ABSENCE.
+        """
+        backend = make_backend(mock_config)
+        graph = make_graph_mock(ro_rows=[[0]])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        await backend.count_foreign_relationships('n-3129', group_id='test')
+        cypher = extract_cypher(graph.ro_query.call_args)
+        assert 'RELATES_TO' not in cypher
+        assert 'invalid_at' not in cypher
+
+    @pytest.mark.asyncio
+    async def test_passes_the_node_uuid_as_a_param(self, mock_config, make_backend, make_graph_mock):
+        backend = make_backend(mock_config)
+        graph = make_graph_mock(ro_rows=[[0]])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        await backend.count_foreign_relationships('n-3129', group_id='test')
+        assert extract_params(graph.ro_query.call_args).get('uuid') == 'n-3129'
+
+    # -- episode_uuid='' : the fail-closed default counts EVERYTHING ---------
+
+    @pytest.mark.asyncio
+    async def test_default_applies_no_exclusion(self, mock_config, make_backend, make_graph_mock):
+        """``episode_uuid=''`` means "we could not establish which episode this
+        is", so nothing is excluded and the predicate is strictly
+        conservative."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock(ro_rows=[[0]])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        await backend.count_foreign_relationships('n-3129', group_id='test')
+        cypher = extract_cypher(graph.ro_query.call_args)
+        assert 'MENTIONS' not in cypher
+        assert 'WHERE' not in cypher
+
+    @pytest.mark.asyncio
+    async def test_default_counts_an_invalidated_relates_to(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        """A node whose every fact was superseded or TTL-invalidated still has
+        that history in the graph, and DETACH DELETE would destroy it.
+        ``get_valid_edges_for_node`` reports it as empty; this reports 1."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock(ro_rows=[[1]])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        assert await backend.count_foreign_relationships('n-3129', group_id='test') == 1
+
+    @pytest.mark.asyncio
+    async def test_default_counts_an_episodic_mentions(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        """``(ep:Episodic)-[:MENTIONS]->(n:Entity)`` links are real,
+        load-bearing provenance (``maintenance/cross_graph_move.py`` recreates
+        them precisely because losing them loses provenance) and are invisible
+        to every RELATES_TO-typed query in the backend."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock(ro_rows=[[1]])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        assert await backend.count_foreign_relationships('n-3129', group_id='test') == 1
+
+    @pytest.mark.asyncio
+    async def test_a_node_with_no_relationships_at_all_returns_zero(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        """The pattern REQUIRES a relationship, so a node with none produces no
+        rows — the empty result_set IS the zero path, not merely a defensive
+        one."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock(ro_rows=[])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        assert await backend.count_foreign_relationships('n-3129', group_id='test') == 0
+
+    @pytest.mark.asyncio
+    async def test_an_absent_result_set_returns_zero(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        """``result_set = None`` degrades the same way as an empty one."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock(ro_rows=[])
+        result = MagicMock()
+        result.result_set = None
+        graph.ro_query = AsyncMock(return_value=result)
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        assert await backend.count_foreign_relationships('n-3129', group_id='test') == 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('malformed', [[[]], [[None]], [['not-a-number']]])
+    async def test_a_present_but_unreadable_row_raises_rather_than_reading_zero(
+        self, mock_config, make_backend, make_graph_mock, malformed,
+    ):
+        """THE DEFENSIVE ZERO MUST NOT MASK A MALFORMED RESPONSE.
+
+        ``count(r)`` has no grouping key, so against a real server it always
+        yields exactly one readable row.  A row that is PRESENT but unreadable
+        is a broken response, and quietly reading it as ``0`` would AUTHORISE a
+        deletion on the strength of a response nobody understood.  Raising is
+        the safe direction: the single caller wraps this in a per-candidate
+        try/except, so a raise becomes a logged skip — a refusal to delete.
+        """
+        backend = make_backend(mock_config)
+        graph = make_graph_mock(ro_rows=[])
+        result = MagicMock()
+        result.result_set = malformed
+        graph.ro_query = AsyncMock(return_value=result)
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        with pytest.raises((IndexError, TypeError, ValueError)):
+            await backend.count_foreign_relationships('n-3129', group_id='test')
+
+    # -- episode_uuid='ep-1' : exclude only THIS episode's own MENTIONS ------
+
+    @pytest.mark.asyncio
+    async def test_a_non_empty_episode_uuid_excludes_that_episodes_mentions(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        """The exclusion is NARROW by construction: it names the relationship
+        TYPE and the specific episode node, so any invalidated RELATES_TO, and
+        any MENTIONS from a DIFFERENT episode, still count."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock(ro_rows=[[0]])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        await backend.count_foreign_relationships(
+            'n-3129', group_id='test', episode_uuid='ep-1',
+        )
+        cypher = extract_cypher(graph.ro_query.call_args)
+        assert 'WHERE' in cypher
+        assert "type(r) = 'MENTIONS'" in cypher
+        assert 'm.uuid = $episode_uuid' in cypher
+        assert 'NOT (' in cypher
+        assert extract_params(graph.ro_query.call_args).get('episode_uuid') == 'ep-1'
+
+    @pytest.mark.asyncio
+    async def test_a_node_whose_only_link_is_this_episodes_mentions_returns_zero(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        """THE EXCLUSION IS LIVE, NOT DEAD CODE.  graphiti_core mints the
+        mis-resolved node AND its MENTIONS link from the same episodic node in
+        the same ``add_episode``, so a strict zero-degree predicate could never
+        fire on the very phantom the cleanup exists to remove."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock(ro_rows=[[0]])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        count = await backend.count_foreign_relationships(
+            'n-3129', group_id='test', episode_uuid='ep-1',
+        )
+        assert count == 0
+
+    @pytest.mark.asyncio
+    async def test_a_mentions_from_a_different_episode_still_counts(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        """Any MENTIONS from an episode OTHER than the one in flight proves
+        pre-existing provenance and must refuse the delete."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock(ro_rows=[[1]])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        count = await backend.count_foreign_relationships(
+            'n-3129', group_id='test', episode_uuid='ep-1',
+        )
+        assert count == 1
+
+    # -- the deliberate self-loop double-count ------------------------------
+
+    @pytest.mark.asyncio
+    async def test_a_self_loop_double_counts_and_is_deliberately_not_deduped(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        """A single A->A relationship matches the undirected pattern twice and
+        returns 2, NOT 1 — the OPPOSITE choice from
+        ``get_valid_edges_for_node``, which dedupes on ``e.uuid`` for exactly
+        this reason.
+
+        The asymmetry is correct because the two values are consumed
+        differently: that one's list is enumerated, while this one is consumed
+        only as ``== 0``.  Inflation can therefore only ever REFUSE a delete,
+        which is the safe direction.  A test pinning 1 here would be pinning a
+        dedup this guard must not have.
+        """
+        backend = make_backend(mock_config)
+        graph = make_graph_mock(ro_rows=[[2]])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        assert await backend.count_foreign_relationships('n-3129', group_id='test') == 2
+
+    @pytest.mark.asyncio
+    async def test_raises_when_not_initialized(self, mock_config):
+        backend = GraphitiBackend(mock_config)
+        with pytest.raises(RuntimeError, match='not initialized'):
+            await backend.count_foreign_relationships('n-3129', group_id='test')
+
+    def test_episode_uuid_is_keyword_only_and_defaults_to_empty(self):
+        """Keyword-only and defaulted, so the fail-closed strict form is what a
+        caller that forgets to thread the episode identity gets."""
+        import inspect
+        sig = inspect.signature(GraphitiBackend.count_foreign_relationships)
+        param = sig.parameters['episode_uuid']
+        assert param.kind is inspect.Parameter.KEYWORD_ONLY
+        assert param.default == ''
+        assert sig.parameters['group_id'].kind is inspect.Parameter.KEYWORD_ONLY
