@@ -29,13 +29,25 @@ scripts/tests/test_lms_marker_contract.py.
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 import yaml
-from _task_db_scan import format_kv_line
+from _task_db_scan import (
+    AUDIT_EXIT_FINDINGS,
+    AUDIT_EXIT_NO_ROOT,
+    AUDIT_EXIT_NOTHING_AUDITED,
+    AUDIT_EXIT_OK,
+    format_kv_line,
+)
 from audit_manifest_descriptor_drift import (
     _COVERAGE_CAVEAT,
+    EXIT_DRIFT,
+    EXIT_NO_ROOT,
+    EXIT_NOTHING_AUDITED,
+    EXIT_OK,
     MECHANICAL_CHECK_KINDS,
     DescriptorDrift,
     ProjectAudit,
@@ -667,3 +679,232 @@ def test_format_json_emits_an_object_with_projects_coverage_and_findings(
     assert finding["task_check"]["pattern"] == "def bar"
     # The caveat travels in the payload too, for the same reason.
     assert _COVERAGE_CAVEAT in json.dumps(payload)
+
+
+# ---------------------------------------------------------------------------
+# main() — driven by SUBPROCESS, never in-process.
+#
+# Shelling out to the script PATH (never `python -m`) is also what PROVES the
+# flat-sibling `import _task_db_scan` resolves: a directly-executed script puts
+# its own directory at sys.path[0], and scripts/tests/conftest.py's sys.path
+# insertion does not reach a child process.
+#
+# Every test passes an explicit tmp_path --project-root, so the LIVE default
+# root (/home/leo/src/dark-factory) is never reached from this suite.
+#   exit 0 = no drift; 1 = drift or a failed discovery; 2 = no root resolved;
+#   3 = roots resolved but NOTHING was audited.
+# ---------------------------------------------------------------------------
+
+_SCRIPT = str(Path(__file__).parent.parent / "audit_manifest_descriptor_drift.py")
+
+
+def _run_cli(*args):
+    return subprocess.run(
+        [sys.executable, _SCRIPT, *args], capture_output=True, text=True
+    )
+
+
+def test_main_exit_0_on_a_clean_project_and_still_prints_coverage(
+        tmp_path, make_tasks_db):
+    """A clean sweep still shows its coverage — see _format_coverage."""
+    root = _one_project(tmp_path, make_tasks_db,
+                        sidecar_check=_GREP_CHECK,
+                        task_entry=_entry("gate", _GREP_CHECK))
+
+    result = _run_cli("--project-root", str(root))
+
+    assert result.returncode == 0, result.stderr
+    assert "COVERAGE" in result.stdout
+
+
+def test_main_exit_1_and_names_the_drifted_row(tmp_path, make_tasks_db):
+    root = _one_project(tmp_path, make_tasks_db,
+                        sidecar_check=_GREP_CHECK,
+                        task_entry=_entry("gate", {**_GREP_CHECK, "pattern": "def bar"}))
+
+    result = _run_cli("--project-root", str(root))
+
+    assert result.returncode == 1
+    assert "plans/a-prd.capability-manifest.yaml" in result.stdout
+    assert "task_id=100" in result.stdout
+    assert "capability=gate" in result.stdout
+    assert "fields=pattern" in result.stdout
+
+
+def test_main_exit_2_when_no_project_root_resolves(tmp_path):
+    """The literal 2, NOT the imported constant.
+
+    Deliberate, and the sibling suite records why: importing the constant lets
+    a renumber stay green while the epilog keeps promising 2 to operators and
+    CI. The number in the contract is what a consumer branches on.
+    """
+    result = _run_cli("--project-root", str(tmp_path / "no-such-project"))
+
+    assert result.returncode == 2
+    assert "no project root" in result.stderr.lower()
+
+
+def test_main_exit_3_when_the_only_tasks_db_is_unreadable(tmp_path):
+    """Roots resolved but every one failed, so NOTHING was audited.
+
+    3, hardcoded, for the same reason as 2 above. Never treat it as clean:
+    stdout on this path is a well-formed EMPTY payload.
+    """
+    root = tmp_path / "corrupt"
+    (root / ".taskmaster" / "tasks").mkdir(parents=True)
+    (root / ".taskmaster" / "tasks" / "tasks.db").write_text("this is not a database")
+
+    result = _run_cli("--project-root", str(root))
+
+    assert result.returncode == 3
+    assert "nothing was" in result.stderr.lower()
+
+
+def test_main_json_payload_shape(tmp_path, make_tasks_db):
+    root = _one_project(tmp_path, make_tasks_db,
+                        sidecar_check=_GREP_CHECK,
+                        task_entry=_entry("gate", {**_GREP_CHECK, "pattern": "def bar"}))
+
+    result = _run_cli("--project-root", str(root), "--json")
+
+    assert result.returncode == 1
+    payload = json.loads(result.stdout)
+    (project,) = payload["projects"]
+    assert project["coverage"]["mechanical_capabilities_compared"] == 1
+    assert [f["capability"] for f in project["findings"]] == ["gate"]
+
+
+def test_main_project_root_is_repeatable(tmp_path, make_tasks_db):
+    """Each root produces its own audit block in ONE render."""
+    a = _one_project(tmp_path, make_tasks_db,
+                     sidecar_check=_GREP_CHECK,
+                     task_entry=_entry("gate", _GREP_CHECK))
+    b = _make_project(
+        tmp_path, make_tasks_db, name="b",
+        tasks=[_task(200, [_entry("gate", {**_GREP_CHECK, "pattern": "drifted"})])],
+        manifests=[("plans/b-prd.capability-manifest.yaml",
+                    _manifest_doc(200, prd="plans/b-prd.md"))],
+    )
+
+    result = _run_cli("--project-root", str(a), "--project-root", str(b), "--json")
+
+    assert result.returncode == 1
+    payload = json.loads(result.stdout)
+    assert [p["project_root"] for p in payload["projects"]] == [str(a), str(b)]
+    assert [len(p["findings"]) for p in payload["projects"]] == [0, 1]
+
+
+def test_manifest_root_decouples_the_manifest_tree_from_the_task_store(
+        tmp_path, make_tasks_db):
+    """THE FLAG'S REASON FOR EXISTING, with both halves asserted.
+
+    `.taskmaster/` is gitignored and exists only in the primary checkout, so a
+    task WORKTREE has no tasks.db at all — and discover_project_roots DROPS a
+    root without one. Sweeping a worktree's sidecars therefore requires reading
+    the manifests from tree B while reading the task store from root A.
+
+    The second half is what makes this non-vacuous: WITHOUT the flag the same
+    invocation reports A's own (empty) manifest tree, so the flag is shown to
+    genuinely change discovery rather than merely being accepted.
+    """
+    store = _make_project(tmp_path, make_tasks_db, name="store",
+                          tasks=[_task(300, [_entry("gate", {**_GREP_CHECK,
+                                                             "pattern": "drifted"})])])
+    sidecars = tmp_path / "sidecars"
+    _write_manifest(sidecars, "plans/w-prd.capability-manifest.yaml",
+                    _manifest_doc(300, prd="plans/w-prd.md"))
+    _git_init(sidecars)
+
+    decoupled = _run_cli("--project-root", str(store),
+                         "--manifest-root", str(sidecars), "--json")
+    assert decoupled.returncode == 1
+    (project,) = json.loads(decoupled.stdout)["projects"]
+    assert project["project_root"] == str(store)
+    assert project["manifest_root"] == str(sidecars)
+    assert [f["capability"] for f in project["findings"]] == ["gate"]
+
+    # The report NAMES both roots, so a decoupled run is unambiguous on stdout.
+    named = _run_cli("--project-root", str(store), "--manifest-root", str(sidecars))
+    assert str(store) in named.stdout and str(sidecars) in named.stdout
+
+    # WITHOUT the flag: A's own manifest tree, which is empty. Same task store,
+    # same drifted record, zero findings — so the flag changed discovery.
+    default = _run_cli("--project-root", str(store), "--json")
+    assert default.returncode == 0
+    (only,) = json.loads(default.stdout)["projects"]
+    assert only["manifest_root"] == str(store)
+    assert only["findings"] == []
+    assert only["coverage"]["manifests_swept"] == 0
+
+
+def test_manifest_root_with_two_project_roots_warns_and_still_runs(
+        tmp_path, make_tasks_db):
+    """The on_roots warn-not-fail shape: ONE manifest tree over MANY task
+    stores is a coherent thing to ask for, so it is warned about, not
+    rejected."""
+    a = _make_project(tmp_path, make_tasks_db, name="a", tasks=[_task(1, [])])
+    b = _make_project(tmp_path, make_tasks_db, name="b", tasks=[_task(2, [])])
+    sidecars = _make_project(tmp_path, make_tasks_db, name="side")
+
+    result = _run_cli("--project-root", str(a), "--project-root", str(b),
+                      "--manifest-root", str(sidecars), "--json")
+
+    assert result.returncode == 0
+    assert "warning" in result.stderr.lower()
+    assert len(json.loads(result.stdout)["projects"]) == 2
+
+
+def test_main_manifest_root_that_is_not_a_checkout_is_loudly_non_zero(
+        tmp_path, make_tasks_db):
+    """It must NOT report a clean zero — the corpus size is UNKNOWN, not zero."""
+    root = _make_project(tmp_path, make_tasks_db, tasks=[_task(100, [])])
+    not_a_checkout = tmp_path / "bare"
+    not_a_checkout.mkdir()
+
+    result = _run_cli("--project-root", str(root), "--manifest-root", str(not_a_checkout))
+
+    assert result.returncode != 0
+    assert "NOT a clean result" in result.stdout
+
+
+def test_main_run_is_strictly_read_only(tmp_path, make_tasks_db):
+    """THE READ-ONLY CLAIM, CHECKED. The tasks.db AND every manifest YAML have
+    their (mtime, sha256) captured before and after a full run, and the whole
+    mapping must be unchanged."""
+    import hashlib
+
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[_task(100, [_entry("gate", {**_GREP_CHECK, "pattern": "drifted"})])],
+        manifests=[
+            ("plans/a-prd.capability-manifest.yaml", _manifest_doc(100)),
+            ("docs/prds/b-prd.capability-manifest.yaml",
+             _manifest_doc(100, label="γ", prd="docs/prds/b-prd.md")),
+        ],
+    )
+    inputs = [
+        root / ".taskmaster" / "tasks" / "tasks.db",
+        root / "plans" / "a-prd.capability-manifest.yaml",
+        root / "docs" / "prds" / "b-prd.capability-manifest.yaml",
+    ]
+
+    def fingerprint():
+        return {
+            str(p): (p.stat().st_mtime_ns, hashlib.sha256(p.read_bytes()).hexdigest())
+            for p in inputs
+        }
+
+    before = fingerprint()
+    assert _run_cli("--project-root", str(root)).returncode == 1
+
+    assert fingerprint() == before
+
+
+def test_exit_constants_alias_the_shared_tier_3_codes():
+    """The per-script NAMES survive; the VALUES have ONE home.
+
+    Keeps the aliases honest, exactly as the sibling audit's counterpart does:
+    a local re-spelling would drift from what run_audit_cli actually returns.
+    """
+    assert (EXIT_OK, EXIT_DRIFT, EXIT_NO_ROOT, EXIT_NOTHING_AUDITED) == (
+        AUDIT_EXIT_OK, AUDIT_EXIT_FINDINGS, AUDIT_EXIT_NO_ROOT, AUDIT_EXIT_NOTHING_AUDITED)
