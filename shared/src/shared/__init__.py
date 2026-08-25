@@ -67,6 +67,7 @@ if TYPE_CHECKING:
         AccountState,
         IllegalTransitionError,
         InvokeSlot,
+        ProbeSpawnError,
         SessionBudgetExhausted,
         UsageGate,
     )
@@ -143,6 +144,7 @@ _SYMBOL_MODULE: dict[str, str] = {
     'AccountState': 'usage_gate',
     'IllegalTransitionError': 'usage_gate',
     'InvokeSlot': 'usage_gate',
+    'ProbeSpawnError': 'usage_gate',
     'SessionBudgetExhausted': 'usage_gate',
     'UsageGate': 'usage_gate',
 }
@@ -239,6 +241,7 @@ __all__ = [
     'InvokeSlot',
     'SessionBudgetExhausted',
     'IllegalTransitionError',
+    'ProbeSpawnError',
     'normalize_lock',
     'files_to_modules',
     'modules_conflict',
