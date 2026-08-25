@@ -2103,6 +2103,57 @@ async def _adopt_and_land(s: dict) -> dict:
     return s
 
 
+def _delivered_terminal_task(reason: str):
+    """A head verify that ALREADY DELIVERED a terminal ``'blocked'`` outcome.
+
+    Reproduces the shape of `_run_inflight_verify`'s three terminal
+    resolve-then-return paths — the dead-verify busy-loop cap-out
+    (merge_queue.py:18106-18108), the contended-lease terminal cap-out
+    (18330-18332) and the generic ``Verification error:`` handler
+    (18528-18530).  Each does ``req.result.set_result(MergeOutcome('blocked'))``
+    and THEN returns ``InflightVerifyResult(outcome=err_outcome, merge_wt=None)``
+    — a NON-sentinel result (``status`` is None, so neither DROPPED nor
+    REQUEUED) whose worktree was already handed to ``_dispose_verify_worktree``.
+
+    The factory only builds the task; the caller resolves the future (the
+    scene builder does not hand the factory its request), which is what
+    :func:`_deliver_terminal_blocked` does.
+    """
+    from orchestrator.merge_types import InflightVerifyResult, MergeOutcome
+
+    def _factory(_git_ops):
+        async def _body():
+            return InflightVerifyResult(
+                outcome=MergeOutcome('blocked', reason=reason), merge_wt=None,
+            )
+        return asyncio.get_running_loop().create_task(_body())
+
+    return _factory
+
+
+async def _deliver_terminal_blocked(s: dict, reason: str) -> object:
+    """Complete the head's verify AND hand its ``'blocked'`` to the workflow.
+
+    The second half is the whole point: those three paths resolve the REQUEST
+    FUTURE before returning, so by the time a green tip arrives the workflow
+    has already been told BLOCKED and may have been escalated, re-dispatched or
+    marked failed.  Also removes the head's ephemeral merge worktree, because
+    each of the three paths reached ``_dispose_verify_worktree`` first — so a δ
+    that adopts the head would thread a path that no longer exists into
+    ``advance_main``.
+    """
+    import shutil
+
+    await asyncio.sleep(0)  # let the head verify task actually finish
+    assert s['head_task'].done(), 'the terminal head verify must have returned'
+    delivered = s['head_task'].result().outcome
+    assert delivered is not None and delivered.status == 'blocked'
+    s['reqs']['100'].result.set_result(delivered)
+    shutil.rmtree(s['head_item'].merge_wt, ignore_errors=True)
+    s['delivered'] = delivered
+    return delivered
+
+
 @pytest.mark.asyncio
 @pytest.mark.timeout(180)
 class TestHeadCancelOnAdoption:
@@ -2285,6 +2336,168 @@ class TestHeadCancelOnAdoption:
         assert await _rev_parse(s['repo'], 'main') == s['chain'].tip
         for tid in ('101', *_DELTA_LINKS):
             assert s['reqs'][tid].result.result().status == 'done'
+
+    # ── step-15 (review fix #4): a DELIVERED head is not δ's to retract ──────
+
+    async def test_a_head_whose_outcome_was_already_delivered_is_not_adopted(
+        self, git_repo: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """(a) Future already resolved ⇒ `_adopt_head_on_tip_authority` declines.
+
+        Decision #3 makes the tip authoritative for an UNDECIDED head; it is
+        not a licence to RETRACT an outcome the workflow has already been
+        handed.  Today the only guard is `head.verify_task is None`
+        (merge_queue.py:19099) — nothing looks at the request future — so the
+        three terminal resolve-then-return paths produce a head that is adopted
+        after its `MergeOutcome('blocked')` was already delivered.
+        """
+        s = await _head_and_prefix_scene(
+            git_repo, tmp_path, monkeypatch, db_name='delta-head-delivered.db',
+            head_task_factory=_delivered_terminal_task('dead/hung verify cap-out x3'),
+        )
+        await _deliver_terminal_blocked(s, 'dead/hung verify cap-out x3')
+        worker, head = s['worker'], s['head_entry']
+
+        adopted = await worker._adopt_head_on_tip_authority(
+            s['reqs']['101'].request_id, '101',
+        )
+
+        assert adopted is None, (
+            'a head whose outcome is already delivered must not be adopted; '
+            f'got {adopted!r}'
+        )
+        assert head.chain_adopted is False, (
+            '`chain_adopted` is what makes _finalize_inflight skip the fail '
+            'arm (merge_queue.py:19905) — it must stay unset for a delivered head'
+        )
+        assert head.verify_task is not None, (
+            'the decline must leave the entry untouched: nulling verify_task '
+            'would push it onto the PASS arm by the other route'
+        )
+        assert head.lease is not None, 'nothing was torn down, so nothing was released'
+
+    async def test_a_delivered_head_never_advances_main_and_keeps_its_verdict(
+        self, git_repo: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """(b)+(c) The ordinary fail arm runs; main never sees its merge commit.
+
+        Today `chain_adopted` skips the fail arm, the PASS arm CASes the head's
+        merge commit onto main from `entry.merge_wt` — the ephemeral path those
+        three terminal routes already `_dispose_verify_worktree()`d — and
+        `_resolve_or_drop_abandoned` then SILENTLY DROPS the resulting `'done'`
+        onto the already-resolved future.  Net effect: the branch lands on main
+        while the workflow is told BLOCKED and can be escalated, re-dispatched
+        or marked failed for work that is already on main.
+        """
+        s = await _head_and_prefix_scene(
+            git_repo, tmp_path, monkeypatch, db_name='delta-head-delivered-fin.db',
+            head_task_factory=_delivered_terminal_task('Verification error: boom'),
+        )
+        delivered = await _deliver_terminal_blocked(s, 'Verification error: boom')
+        s = await _adopt_and_land(s)
+
+        assert s['head_advanced'] is False, (
+            'the head must take the ordinary FAIL/skip arm, not the PASS arm'
+        )
+        assert all(call[0] != s['head_mc'] for call in s['adv']), (
+            'main must never be advanced to a declined head\'s merge commit; '
+            f'advance_main calls: {[(c[0][:8], (c[1] or "")[:8]) for c in s["adv"]]}'
+        )
+        # (c) the disposed worktree is never threaded into a CAS advance.
+        assert all(call[2] != s['head_item'].merge_wt for call in s['adv']), (
+            'the fail arm exists so the already-disposed ephemeral worktree '
+            'never reaches advance_main'
+        )
+        assert s['reqs']['100'].result.result() is delivered, (
+            'the delivered outcome is the workflow\'s; nothing may overwrite it'
+        )
+        by_branch = {r['branch']: r for r in _finalized_rows(s['db_path'])}
+        assert by_branch['100']['state'] == 'blocked'
+        assert by_branch['100']['landed_via_chain'] is None
+
+    async def test_no_link_is_cased_against_the_declined_heads_merge_commit(
+        self, git_repo: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """(d) Decision #9: nothing lands on a base that never reached main.
+
+        The tip's `expected_main` IS the declined head's merge commit, so the
+        tip's FIRST CAS is refused and the walk over `chain.links` is not
+        reached from it.
+
+        PLAN PREMISE CORRECTED (step-15 (d) predicted every link would stay
+        queued): it does not, and δ neither introduces nor may bypass the
+        reason.  `cas_failed` is TRANSIENT — merge_queue.py:20296-20305
+        re-anchors `item.base_sha` to `get_main_sha()` and retries, so the tip
+        lands one attempt later against REAL main and the prefix follows it.
+        What decision #9 actually forbids, and what is pinned here, is a link
+        CASed against a base no `advance_main` ever put on main: every link's
+        `expected_main` is its PREDECESSOR'S landed sha, and `head_mc` is not
+        among them.
+        """
+        s = await _head_and_prefix_scene(
+            git_repo, tmp_path, monkeypatch, db_name='delta-head-delivered-cas.db',
+            head_task_factory=_delivered_terminal_task('lane cap-out #1'),
+        )
+        await _deliver_terminal_blocked(s, 'lane cap-out #1')
+        s = await _adopt_and_land(s)
+        link_shas = [mc for _tid, mc in s['chain'].links]
+
+        assert s['adv'][0] == (s['spec_mc'], s['head_mc'], s['adv'][0][2]), (
+            'the tip must first try its real base — the head\'s merge commit'
+        )
+        assert s['adv'][1][:2] == (s['spec_mc'], s['main_sha']), (
+            'that CAS must be REFUSED, so the retry re-anchors onto real main'
+        )
+        assert [c[0] for c in s['adv'][1:]] == [s['spec_mc'], *link_shas]
+        assert [c[1] for c in s['adv'][2:]] == [s['spec_mc'], *link_shas[:-1]], (
+            'each link CASes against its predecessor\'s landed sha, never '
+            'against the head\'s un-landed merge commit'
+        )
+        assert s['head_mc'] not in [c[1] for c in s['adv'][1:]]
+
+    async def test_a_red_head_with_an_unresolved_future_is_still_adopted(
+        self, git_repo: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """CONTRAST — the guard keys on DELIVERY, not on the verdict being red.
+
+        Same head shape as the delivered case in every respect but one: the
+        request future is still pending.  That is the genuine "Head-fail +
+        tip-pass" boundary row, and it must still be adopted-and-declined — a
+        guard that keyed on `vr.outcome is not None` instead would silently
+        re-strand the whole prefix behind a verdict the green tip outranks.
+        """
+        s = await _head_and_prefix_scene(
+            git_repo, tmp_path, monkeypatch, db_name='delta-head-red-unresolved.db',
+            head_task_factory=_delivered_terminal_task('head verify red (flake)'),
+        )
+        await asyncio.sleep(0)
+        assert s['head_task'].done()
+        assert not s['reqs']['100'].result.done(), 'future deliberately UNresolved'
+
+        adopted = await s['worker']._adopt_head_on_tip_authority(
+            s['reqs']['101'].request_id, '101',
+        )
+
+        assert adopted is s['head_entry']
+        assert s['head_entry'].chain_adopted is True
+
+    async def test_a_head_still_verifying_is_still_adopted(
+        self, git_repo: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """CONTRAST — an UNDECIDED head is exactly what decision #3 is about."""
+        s = await _head_and_prefix_scene(
+            git_repo, tmp_path, monkeypatch, db_name='delta-head-still-verifying.db',
+        )
+        assert not s['head_task'].done()
+        assert not s['reqs']['100'].result.done()
+
+        adopted = await s['worker']._adopt_head_on_tip_authority(
+            s['reqs']['101'].request_id, '101',
+        )
+
+        assert adopted is s['head_entry']
+        assert s['head_entry'].chain_adopted is True
+        assert s['head_entry'].verify_task is None, 'torn down, per topology 1'
 
 
 @pytest.mark.asyncio
