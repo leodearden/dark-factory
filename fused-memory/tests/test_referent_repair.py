@@ -1056,3 +1056,94 @@ class TestEmptiedNodeCleanup:
         assert stats.nodes_deleted == 0
         assert stats.repaired == 1
         assert any('n-3129' in r.getMessage() for r in caplog.records)
+
+
+class TestCleanupIsGuardedIndependently:
+    """A cleanup failure must never discard or un-count reassignments that
+    already succeeded.
+
+    The guard is the CLEANUP's OWN try/except, not the outer `_run_pass`:
+    `_run_pass` substitutes an EMPTY `ReferentRepairStats` on a raise, which
+    would discard the structured record of every reassignment that had already
+    committed to the graph — reporting zero repairs for an episode that
+    performed several.  Cleanup is opportunistic hygiene; the reassignment is
+    the correctness fix, and their failure domains must not be shared.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('failing', ['get_valid_edges_for_node', 'delete_entity'])
+    async def test_a_cleanup_failure_leaves_every_reassignment_intact(
+        self, service, caplog, failing,
+    ):
+        setattr(
+            service.graphiti, failing,
+            AsyncMock(side_effect=RuntimeError('falkor down')),
+        )
+        if failing == 'delete_entity':
+            service.graphiti.get_valid_edges_for_node = AsyncMock(return_value=[])
+
+        with caplog.at_level(logging.WARNING):
+            stats = await service._repair_episode_referents(
+                _stats(_finding()), group_id='dark_factory',
+            )
+
+        # Returns NORMALLY, with a POPULATED stats — proving the guard is the
+        # cleanup's own, not `_run_pass`'s empty-default substitution.
+        assert isinstance(stats, ReferentRepairStats)
+        assert len(stats.repairs) == 1
+        assert stats.repairs[0].outcome == 'repaired'
+        assert stats.repairs[0].summaries_refreshed == ('n-3129', 'n-3127')
+        assert stats.repaired == 1
+        assert stats.nodes_deleted == 0
+        assert any(r.exc_info for r in caplog.records)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('failing', ['get_valid_edges_for_node', 'delete_entity'])
+    @pytest.mark.parametrize(
+        'exc_type', [asyncio.CancelledError, KeyboardInterrupt, SystemExit],
+    )
+    async def test_cleanup_never_swallows_cancellation(
+        self, service, failing, exc_type,
+    ):
+        setattr(
+            service.graphiti, failing, AsyncMock(side_effect=exc_type('interrupted')),
+        )
+        if failing == 'delete_entity':
+            service.graphiti.get_valid_edges_for_node = AsyncMock(return_value=[])
+
+        with pytest.raises(exc_type):
+            await service._repair_episode_referents(
+                _stats(_finding()), group_id='dark_factory',
+            )
+
+    @pytest.mark.asyncio
+    async def test_one_bad_candidate_does_not_stop_the_remaining_candidates(
+        self, service,
+    ):
+        """Per-CANDIDATE, so a single node whose emptiness cannot be read does
+        not leave every other phantom node behind."""
+        service.graphiti.ensure_entity_node = AsyncMock(return_value='n-3127')
+        service.graphiti.reassign_edge = AsyncMock(side_effect=[
+            _reassigned(uuid='e1', old_endpoint_uuid='n-3129'),
+            _reassigned(uuid='e2', old_endpoint_uuid='n-3130',
+                        refreshed_nodes=['n-3130', 'n-3127']),
+        ])
+        service.graphiti.get_valid_edges_for_node = AsyncMock(
+            side_effect=[RuntimeError('falkor down'), []],
+        )
+
+        stats = await service._repair_episode_referents(
+            _stats(
+                _finding(edge_uuid='e1'),
+                _finding(edge_uuid='e2', old_endpoint_uuid='n-3130',
+                         old_endpoint_name='Task 3130',
+                         endpoint_referent=Referent(number='3130')),
+            ),
+            group_id='dark_factory',
+        )
+
+        service.graphiti.delete_entity.assert_awaited_once_with(
+            'n-3130', group_id='dark_factory', force=False,
+        )
+        assert stats.repaired == 2
+        assert stats.nodes_deleted == 1
