@@ -27,20 +27,30 @@ import json
 
 import pytest
 
+from fused_memory.models.enums import MemoryCategory, SourceStore
+from fused_memory.models.memory import MemoryResult
 from fused_memory.server import write_triage, write_triage_judge
+from fused_memory.server.grouped_read import AMENDMENT_KIND, PARENT_ID_KEY
 from fused_memory.server.write_triage import (
     OUTCOME_AMENDED,
     OUTCOME_CONTESTED,
+    OUTCOME_JUDGE,
     OUTCOME_RESTATED,
     OUTCOME_STORED,
     TRIAGE_OUTCOMES,
+    BandDecision,
 )
 from fused_memory.server.write_triage_judge import (
+    _ELIDED_MARKER,
+    JUDGE_SYSTEM_PROMPT,
     JUDGE_VERDICTS,
     VERDICT_KEY,
     JudgeOutputError,
+    build_judge_prompt,
     parse_judge_verdict,
+    select_judge_candidates,
 )
+from fused_memory.services.memory_service import RRF_K, SearchResults
 
 
 def _payload(word: object) -> str:
@@ -237,3 +247,262 @@ class TestParseJudgeVerdict:
         """An SDK that returned None for the body is a judge failure, not a TypeError."""
         with pytest.raises(JudgeOutputError):
             parse_judge_verdict(None)  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# candidate selection + prompt rendering
+# ---------------------------------------------------------------------------
+
+# The real post-RRF relevance_score for a rank-1 mem0 hit — an ORDINAL, not a
+# cosine. Spelled the same way `test_write_triage.py` spells it, so a test
+# that passes only because something read `relevance_score` instead of the
+# per-store cosine fails here too.
+_RRF_RANK1 = 1.0 / (RRF_K + 1)
+
+
+def _result(
+    id_: str,
+    score: float | None,
+    *,
+    content: str = 'some procedural content',
+    relevance_score: float = _RRF_RANK1,
+    omit_store_score: bool = False,
+    extra_metadata: dict | None = None,
+) -> MemoryResult:
+    """A POST-RRF ``MemoryResult``: *score* is the COSINE, in metadata.
+
+    Same shape as ``test_write_triage.py::_result`` — kept local rather than
+    imported across suites, matching how the two triage suites already stand
+    alone.
+    """
+    metadata: dict = {'store_rank': 1}
+    if not omit_store_score:
+        metadata['store_score'] = score
+    if extra_metadata:
+        metadata.update(extra_metadata)
+    return MemoryResult(
+        id=id_,
+        content=content,
+        category=MemoryCategory.procedural_knowledge,
+        source_store=SourceStore.mem0,
+        relevance_score=relevance_score,
+        metadata=metadata,
+    )
+
+
+def _decision(canonical_id: str | None, similarity: float | None = 0.80) -> BandDecision:
+    """A middle-band decision naming *canonical_id* as the attach target."""
+    return BandDecision(OUTCOME_JUDGE, canonical_id, similarity, 0.95, 0.70)
+
+
+class TestSelectJudgeCandidates:
+    """Which of the retrieved results the judge actually gets to see.
+
+    ``triage_write`` hands the judge the WHOLE ``SearchResults`` object
+    (un-transformed, so `degraded`/`failed_stores` survive). Trimming to the
+    PRD's top 3-5 is the judge's own job, and this is where it happens.
+    """
+
+    def test_at_most_n_candidates_are_returned(self) -> None:
+        """The width is a cap, and the prompt budget depends on it holding."""
+        results = [_result(f'm{i}', 0.90 - i / 100) for i in range(12)]
+        selected = select_judge_candidates(results, 5, canonical_id='m0')
+        assert len(selected) == 5
+
+    def test_candidates_are_ordered_by_descending_cosine(self) -> None:
+        """Highest per-store cosine first: the judge reads the strongest evidence first."""
+        results = [_result('lo', 0.62), _result('hi', 0.95), _result('mid', 0.70)]
+        selected = select_judge_candidates(results, 3, canonical_id='hi')
+        assert [r.id for r in selected] == ['hi', 'mid', 'lo']
+
+    def test_the_ordering_follows_store_score_not_relevance_score(self) -> None:
+        """The RRF ordinal is NOT a similarity — the same trap `decide_band` avoids.
+
+        Mirrors ``test_write_triage.py::test_the_winner_is_not_the_max_relevance_score``:
+        `relevance_score` is deliberately inverted against the cosine here, so
+        a selector that sorted on it produces the opposite order and fails.
+        """
+        results = [
+            _result('rank1', 0.61, relevance_score=1.0 / (RRF_K + 1)),
+            _result('rank2', 0.96, relevance_score=1.0 / (RRF_K + 2)),
+        ]
+        selected = select_judge_candidates(results, 2, canonical_id='rank2')
+        assert [r.id for r in selected] == ['rank2', 'rank1']
+
+    @pytest.mark.parametrize(
+        ('label', 'uncomparable'),
+        [
+            ('store_score key absent', _result('pin', None, omit_store_score=True)),
+            ('store_score is None', _result('pin', None)),
+            ('store_score is a bool', _result('pin', True)),  # type: ignore[arg-type]
+            ('store_score is a string', _result('pin', '0.99')),  # type: ignore[arg-type]
+        ],
+        ids=['absent', 'none', 'bool', 'string'],
+    )
+    def test_an_uncomparable_candidate_is_dropped(
+        self, label: str, uncomparable: MemoryResult,
+    ) -> None:
+        """A record with no numeric cosine spends a judge slot for nothing.
+
+        A topic-anchored pin (services/topic_anchor.py) deliberately carries
+        no ``store_score``. ``decide_band`` already drops it because it can
+        never clear a threshold; the judge drops it for the adjacent reason —
+        there is no measured similarity to put in front of the model, and the
+        slot is better spent on a record that can actually be compared.
+        """
+        results = [uncomparable, _result('m1', 0.80)]
+        selected = select_judge_candidates(results, 5, canonical_id='m1')
+        assert [r.id for r in selected] == ['m1'], label
+
+    def test_the_bands_winner_is_always_present(self) -> None:
+        """A judge asked about a set excluding the attach target cannot answer.
+
+        The verdict routes the write to `decision.canonical_id` and nowhere
+        else (D3: the band names the target, the judge only names the
+        relationship). If that record is not in the prompt, every verdict is
+        about a different memory than the one the attach will touch.
+        """
+        results = [_result(f'm{i}', 0.95 - i / 100) for i in range(8)]
+        # 'm7' is the weakest, so a plain top-3 would drop it.
+        selected = select_judge_candidates(results, 3, canonical_id='m7')
+        assert 'm7' in [r.id for r in selected]
+        assert len(selected) <= 3
+
+    def test_the_winner_is_present_even_when_hoisted(self) -> None:
+        """`_canonical_id_of` HOISTS a child winner to its parent id.
+
+        So `decision.canonical_id` can name a record that is not itself in the
+        result set at all. The parent is what the attach targets, so when the
+        hoisted id is absent the CHILD that carried the evidence must stay —
+        dropping both would leave the judge with no view of the match at all.
+        """
+        child = _result(
+            'child-1', 0.97,
+            extra_metadata={'kind': AMENDMENT_KIND, PARENT_ID_KEY: 'parent-1'},
+        )
+        results = [child, *[_result(f'm{i}', 0.90 - i / 100) for i in range(6)]]
+        selected = select_judge_candidates(results, 3, canonical_id='parent-1')
+        assert 'child-1' in [r.id for r in selected]
+
+    def test_an_empty_input_returns_empty_without_raising(self) -> None:
+        """Nothing to compare is a decision, not a failure."""
+        assert select_judge_candidates([], 5, canonical_id=None) == []
+
+    def test_a_wholly_uncomparable_input_returns_empty(self) -> None:
+        """A slate of pins yields no candidates and still does not raise."""
+        results = [_result(f'pin{i}', None, omit_store_score=True) for i in range(4)]
+        assert select_judge_candidates(results, 5, canonical_id='pin0') == []
+
+    def test_a_search_results_object_is_accepted(self) -> None:
+        """`triage_write` passes the un-transformed SearchResults, not a list.
+
+        That object is a sequence of `MemoryResult` carrying `degraded` and
+        `failed_stores` alongside; the selector must iterate it as given
+        rather than requiring the caller to slice it (which would drop those
+        fields — the failure mode `retrieve_candidates` warns about).
+        """
+        results = SearchResults([_result('m1', 0.80), _result('m2', 0.60)])
+        selected = select_judge_candidates(results, 5, canonical_id='m1')
+        assert [r.id for r in selected] == ['m1', 'm2']
+
+
+class TestBuildJudgePrompt:
+    """What actually reaches the model — and, as loudly, what must not."""
+
+    def test_the_submitted_content_is_rendered(self) -> None:
+        prompt = build_judge_prompt('the new entry text', [_result('m1', 0.9)])
+        assert 'the new entry text' in prompt
+
+    def test_every_candidate_id_and_text_is_rendered(self) -> None:
+        candidates = [
+            _result('mem-aaa', 0.9, content='first candidate body'),
+            _result('mem-bbb', 0.8, content='second candidate body'),
+        ]
+        prompt = build_judge_prompt('new', candidates)
+        for candidate in candidates:
+            assert candidate.id in prompt
+            assert candidate.content in prompt
+
+    def test_the_four_closed_verdicts_are_named(self) -> None:
+        """A model cannot answer in a vocabulary it was never shown."""
+        prompt = build_judge_prompt('new', [_result('m1', 0.9)])
+        for word in JUDGE_VERDICTS:
+            assert word in prompt
+
+    def test_the_prompt_asks_for_a_bare_json_object(self) -> None:
+        """The parser's happy path is what the instructions must request."""
+        prompt = build_judge_prompt('new', [_result('m1', 0.9)])
+        assert VERDICT_KEY in prompt
+        assert 'JSON' in prompt or 'json' in prompt
+
+    def test_a_long_candidate_is_truncated_and_marked(self) -> None:
+        """The fixture contains a ~9k-char canonical; the budget is ~2.5k tokens.
+
+        Truncating silently would be worse than not truncating: a model told
+        nothing would treat a severed sentence as the whole record. The elided
+        marker is what keeps the cut honest.
+        """
+        long_body = 'x' * 9_000
+        prompt = build_judge_prompt('new', [_result('m1', 0.9, content=long_body)])
+        assert long_body not in prompt
+        assert len(prompt) < 9_000
+        assert _ELIDED_MARKER in prompt
+
+    def test_a_long_submitted_content_is_truncated_and_marked(self) -> None:
+        """The submitted side is bounded for the same reason as the candidates."""
+        long_body = 'y' * 9_000
+        prompt = build_judge_prompt(long_body, [_result('m1', 0.9)])
+        assert long_body not in prompt
+        assert _ELIDED_MARKER in prompt
+
+    def test_short_content_is_not_marked_as_elided(self) -> None:
+        """The marker means something only if it is absent when nothing was cut."""
+        prompt = build_judge_prompt('short', [_result('m1', 0.9, content='also short')])
+        assert _ELIDED_MARKER not in prompt
+
+    def test_no_repo_or_task_context_reaches_the_model(self) -> None:
+        """PRD C1: the judge sees CONTENT, and nothing about who wrote it.
+
+        Structural rather than incidental — ``build_judge_prompt`` interpolates
+        no metadata at all — so this holds for a candidate carrying every
+        context key a real record can. Rendered with all of them present, so a
+        future edit that started quoting `metadata` fails here.
+        """
+        leaky = _result(
+            'mem-1', 0.9,
+            content='candidate body',
+            extra_metadata={
+                'task_id': '3128',
+                'agent_id': 'claude-task-3128-implementer',
+                'project_id': 'dark_factory',
+                'source': 'fused-memory/src/fused_memory/server/tools.py',
+                'topic': 'write-triage',
+            },
+        )
+        prompt = build_judge_prompt('new entry', [leaky])
+        for forbidden in (
+            'task_id', '3128',
+            'agent_id', 'claude-task-3128-implementer',
+            'project_id', 'dark_factory',
+            'fused-memory/src/fused_memory/server/tools.py',
+        ):
+            assert forbidden not in prompt, forbidden
+
+    def test_an_empty_candidate_list_still_renders(self) -> None:
+        """Pure and total: rendering never raises, whatever it is handed."""
+        assert isinstance(build_judge_prompt('new', []), str)
+
+    def test_the_system_prompt_states_detect_not_adjudicate(self) -> None:
+        """D3 lives in the model's own instructions, not only in a docstring.
+
+        A judge told merely to "classify" would happily decide which of two
+        contradictory memories is TRUE. Reify esc-5557/esc-5626 showed that
+        adjudication needs code-reading the synchronous write path cannot do,
+        so the instruction has to say the judge is detecting a contradiction
+        and routing it, not resolving it.
+        """
+        lowered = JUDGE_SYSTEM_PROMPT.lower()
+        assert 'relationship' in lowered
+        assert 'not' in lowered
+        for word in JUDGE_VERDICTS:
+            assert word in lowered
