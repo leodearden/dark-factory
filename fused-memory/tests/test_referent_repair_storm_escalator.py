@@ -186,7 +186,11 @@ class TestDedupeFold:
             'once the prior alarm is resolved a fresh storm must be able to '
             'file again, or the alarm is one-shot for the process lifetime'
         )
-        assert len(_filed(tmp_path)) == 2
+        # `resolve` archives the first out of the queue root, so the root now
+        # holds exactly the fresh alarm — the dedupe lookup is scoped to
+        # PENDING, not to "an escalation was ever filed".
+        live = _filed(tmp_path)
+        assert [record['id'] for record in live] == [third]
 
     def test_two_projects_do_not_dedupe_against_each_other(self, tmp_path):
         """Attribution is per-project: `reify` storming must not be silenced
