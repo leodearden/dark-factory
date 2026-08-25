@@ -131,6 +131,39 @@ outcome on the NORMAL ladder (``category='cross_repo_deliverable'``,
 external landing instead of re-running the empty branch."""
 
 
+ALREADY_LANDED_REASON_PREFIX = 'Plan files already landed on main'
+"""Prefix of the ``MergeOutcome.reason`` string emitted when the pre-merge
+Decision-1 gate recognizes an *already-landed* branch — a task whose declared
+plan files are demonstrably ON MAIN already, so its own ``base..HEAD`` range
+is legitimately EMPTY.
+
+Same "the branch is legitimately empty" family as
+``CROSS_REPO_DELIVERABLE_REASON_PREFIX``, reached by a different route.  After
+a task's work merges, re-dispatching it re-cuts ``task/<id>`` from
+post-landing main, which correctly drops every commit as already-upstream and
+parks the ref on one of MAIN'S OWN commits at 0 commits ahead of its recorded
+base (measured parking spots: 3604 on ``9ab336bd6e``, 3779 on ``f16803d748``,
+3717 on ``ce5b830caf``, 3572 on ``6d7487b2ef`` — each an unrelated task's merge
+commit).  The gate then reads that empty range and emits the exact INVERSE of
+the truth: ``PLAN_FILES_NOT_TOUCHED_REASON_PREFIX``, through
+``_mark_blocked(..., escalate_to_human=True)``, whose default
+``category='task_failure'`` mints the escalation that PINS the task — which in
+turn vetoes the recovery that would have marked it done, so the row churns and
+is re-dispatched, repeating (measured: 39 consecutive ``recovery_vetoed`` over
+10.5h on task 3717).
+
+Rather than false-flag that as under-delivery — which would force the
+architect through the same dishonest narrowing pass the cross-repo docstring
+names (drop = falsify provenance, confirm = mislabel complete work) and
+escalate straight to a human — the workflow short-circuits to the honest
+``OutcomeKind.plan_files_already_landed`` terminal outcome on the NORMAL
+ladder, so no ``task_failure`` pin is minted and the loop has no fuel.
+
+See :func:`resolve_already_landed_branch` for the three signals required
+before this prefix may be used, and for the two traps a naive version misses.
+"""
+
+
 POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX = 'Post-merge content equivalence failed'
 """Prefix of the ``MergeOutcome.reason`` string emitted by the post-merge
 Decision-2 check.  After ``advance_main`` succeeds, we verify that
@@ -1149,6 +1182,214 @@ def is_cross_repo_task(
         if Path(entry).resolve().is_relative_to(root):
             return False
     return True
+
+
+@dataclasses.dataclass(frozen=True)
+class AlreadyLandedResult:
+    """Structured return value from :func:`resolve_already_landed_branch`.
+
+    Attributes:
+        landed_sha: The commit on main that ATTRIBUTES the landing to this
+            task — a per-task merge commit, or (for a coalesce-train member,
+            which has none) the task's own commit whose subject cites it.
+        mechanism: Which attribution probe answered — ``'merge_marker'`` or
+            ``'task_citation'``.  Recorded so an operator reading the
+            outcome can tell the two landing shapes apart without re-running
+            the probes.
+        matched_files: The declared plan entries this landing was shown to
+            cover, in the architect's own spelling (pre-normalization), so
+            the diagnostic names exactly what plan.json says.  ALWAYS the
+            complete declared set — a partial match returns None rather than
+            a partial result.
+    """
+
+    landed_sha: str
+    mechanism: str
+    matched_files: list[str]
+
+
+async def resolve_already_landed_branch(
+    plan_files: list[str],
+    base_sha: str,
+    branch_head: str,
+    git_ops: GitOps,
+    *,
+    task_id: str,
+    branch: str,
+) -> AlreadyLandedResult | None:
+    """Recognize a branch that is empty BECAUSE its work already landed.
+
+    Returns a result only when ALL THREE independent signals hold, and None
+    on any unmet signal or any git error.  Fails CLOSED by construction: None
+    means "carve nothing out", i.e. exactly today's behaviour, so a
+    mis-measurement can never excuse real non-delivery.
+
+    **1. EMPTY RANGE** — ``git rev-list --count <base>..<head>`` parses to
+    exactly 0.  This is the signal that SEPARATES "ref parked on one of
+    main's own commits after a rebase dropped every commit as already
+    upstream" from the genuine non-delivery case of a branch that HAS commits
+    which simply missed the declared files.  Without it the carve-out would
+    be a blanket amnesty for under-delivery, which is the opposite of what
+    the gate is for.
+
+    **2. ATTRIBUTION** — :meth:`GitOps.find_merge_marker` with
+    ``gate_on_existing_ref=False``, falling back to
+    :meth:`GitOps.find_task_citation_commit`.  ``gate_on_existing_ref=False``
+    is not optional here: the parked ref still EXISTS (that is the whole
+    shape), and the default gate would return None for every case this
+    predicate cares about.
+
+    **TRAP 1 — the citation fallback is mandatory, not belt-and-braces.**  A
+    non-tip coalesce-train member lands with NO per-task merge marker: the
+    TRAIN carries the merge subject, its members do not (live specimen: task
+    4104 inside train ``coalesce-4181-b2a290cd`` at ``d25b24468c``).  The
+    member's own commits are still on main carrying task-id subjects, so the
+    citation probe is what keeps that whole population from being
+    false-negatived and left in the loop.
+
+    **3. COVERAGE** — every declared entry must appear in the LANDING'S OWN
+    touched set, computed as ``get_files_touched_in_branch(f'{sha}^1', sha)``
+    against the attributing sha.  For a merge commit ``^1..`` enumerates
+    exactly the merged-in commits (the task's own work); for a plain commit
+    ``^1`` is ``^``, so the same call is correct for both.  Comparison uses
+    :func:`_normalize_plan_path` plus the same directory-prefix arm the gate
+    itself uses, so a declared directory is satisfied by a file beneath it.
+
+    This is the guard against a task that landed a PARTIAL earlier increment,
+    was re-dispatched for the rest, and delivered nothing this time —
+    attribution alone would wrongly excuse it.  It matches the measured
+    evidence exactly: 3604's landed file set equals its 3 declared plan
+    files, 3572's equals its 7.
+
+    **TRAP 2 — a knowingly invisible class.**  A rebase landing with no merge
+    commit and no task-id citation anywhere (specimen: task 3916, findable
+    only by ``git cherry`` patch-id equivalence) cannot be seen by any
+    grep-based predicate.  It falls through to the UNCHANGED
+    ``plan_files_not_touched`` path exactly as today.  That limitation is
+    stated here loudly rather than silently accepted, per the repo's
+    loud-over-silent-degradation norm, and is pinned by a test.
+
+    **NOT task 3560's defect.**  Task 3560 was a SINGLE-REF misread — two refs
+    existed (``task/3560`` empty, ``task/3560-skip-attempt`` with 40 commits)
+    and the gate read the wrong one.  Here ``git branch -a --list '*<id>*'``
+    finds exactly one ref and the emptiness is real.  Same gate, sibling
+    mechanism: do NOT widen this predicate to fold the two together, or it
+    stops requiring evidence that the work is on main at all.
+
+    Args:
+        plan_files: The architect's declared entries, original spelling.
+        base_sha: The branch's recorded base — the left side of the range.
+        branch_head: The branch tip — the right side of the range.
+        git_ops: Provides ``project_root`` and the three probes.
+        task_id: Bare task id (no ``task/`` prefix), for the citation probe.
+        branch: Full prefixed branch name, for the merge-marker probe.
+    """
+    if not plan_files:
+        return None
+
+    # --- signal 1: the range is measurably EMPTY ---------------------------
+    rc, out, err = await _run(
+        ['git', 'rev-list', '--count', f'{base_sha}..{branch_head}'],
+        cwd=git_ops.project_root,
+    )
+    if rc != 0:
+        logger.warning(
+            'already-landed: rev-list --count %s..%s failed task_id=%s '
+            'rc=%s stderr=%s — failing closed',
+            base_sha, branch_head, task_id, rc, (err or '').strip()[:400],
+        )
+        return None
+    try:
+        ahead = int(out.strip())
+    except ValueError:
+        # Unparseable output is an unmeasured range, not an empty one.
+        logger.warning(
+            'already-landed: rev-list --count %s..%s returned unparseable '
+            'output task_id=%s out=%r — failing closed',
+            base_sha, branch_head, task_id, (out or '')[:200],
+        )
+        return None
+    if ahead != 0:
+        # The branch did real work; if it missed the declared files that is
+        # genuine non-delivery and belongs to the unchanged gate.
+        return None
+
+    # --- signal 2: the landing is ATTRIBUTABLE to this task ----------------
+    mechanism = 'merge_marker'
+    landed_sha = await git_ops.find_merge_marker(
+        branch, gate_on_existing_ref=False,
+    )
+    if not landed_sha:
+        mechanism = 'task_citation'
+        landed_sha = await git_ops.find_task_citation_commit(task_id)
+    if not landed_sha:
+        # TRAP 2 — no marker and no citation.  Invisible here by design.
+        logger.info(
+            'already-landed: empty range for task_id=%s branch=%s but no '
+            'merge marker and no task-id citation on main — failing closed '
+            '(a patch-id-only rebase landing is not visible to a '
+            'grep-based probe)',
+            task_id, branch,
+        )
+        return None
+    landed_sha = landed_sha.strip()
+
+    # --- signal 3: the landing COVERS every declared entry -----------------
+    touched = await git_ops.get_files_touched_in_branch(
+        f'{landed_sha}^1', landed_sha,
+    )
+    touched_set = set(touched)
+    if not touched_set:
+        # `get_files_touched_in_branch` fails OPEN with [] on a git error, so
+        # an empty set is indistinguishable from "could not measure".  Either
+        # way there is no coverage evidence, so decline.
+        logger.warning(
+            'already-landed: attributing commit %s (mechanism=%s) touched no '
+            'measurable files task_id=%s — failing closed',
+            landed_sha, mechanism, task_id,
+        )
+        return None
+
+    matched: list[str] = []
+    for entry in plan_files:
+        if not entry:
+            continue
+        norm = _normalize_plan_path(entry)
+        if norm in touched_set:
+            matched.append(entry)
+            continue
+        # Same directory arm as the gate itself (arm (b)): a declared
+        # directory is covered when a touched path sits beneath it.  Done by
+        # prefix alone rather than by an ls-tree object-type probe, because
+        # a landed directory's contents ARE the evidence — if nothing beneath
+        # it was touched, the entry is uncovered whatever its object type is.
+        prefix = norm.rstrip('/') + '/'
+        if any(t.startswith(prefix) for t in touched_set):
+            matched.append(entry)
+            continue
+        # One uncovered entry is enough: a PARTIAL earlier landing must not
+        # excuse a later empty branch.
+        logger.info(
+            'already-landed: declared entry %r is not covered by landing %s '
+            '(mechanism=%s) task_id=%s — failing closed',
+            entry, landed_sha, mechanism, task_id,
+        )
+        return None
+
+    if not matched:
+        return None
+
+    logger.info(
+        'already-landed: task_id=%s branch=%s is empty because its work '
+        'landed at %s (mechanism=%s, %d declared entr%s covered)',
+        task_id, branch, landed_sha, mechanism, len(matched),
+        'y' if len(matched) == 1 else 'ies',
+    )
+    return AlreadyLandedResult(
+        landed_sha=landed_sha,
+        mechanism=mechanism,
+        matched_files=matched,
+    )
 
 
 def _normalize_plan_path(entry: str) -> str:
