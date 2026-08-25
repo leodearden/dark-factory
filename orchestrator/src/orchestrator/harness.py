@@ -4934,6 +4934,10 @@ class Harness:
         reverted = 0
         marked_done = 0
         stale_conflicts = 0
+        # Task 3539.  Counted separately from marked_done/reverted: a
+        # conversion is neither a completion nor a re-dispatch, and folding it
+        # into either would make this line misreport what the sweep did.
+        converted = 0
         # One tally per PASS (task 3535) — see RecoverySweepTally for why the
         # summary below is no longer gated on something having moved.
         tally = RecoverySweepTally()
@@ -5018,6 +5022,8 @@ class Harness:
                 # arbitration, so it is deliberately NOT added to the
                 # reverted+marked_done "changed" total below.
                 stale_conflicts += 1
+            elif outcome == 'converted_to_blocked':
+                converted += 1
 
         # UNCONDITIONAL (task 3535, part 2).  This used to be gated on
         # `if reverted or marked_done or stale_conflicts`, so the one sweep
@@ -5029,15 +5035,21 @@ class Harness:
         logger.info(
             '%s: %d stranded task(s) reverted to pending; '
             '%d marked done (branch already on main); '
-            '%d held on provenance conflict (done_evidence_stale); %s',
-            log_prefix, reverted, marked_done, stale_conflicts, tally.render(),
+            '%d held on provenance conflict (done_evidence_stale); '
+            '%d converted to blocked (escalation-pinned); %s',
+            log_prefix, reverted, marked_done, stale_conflicts, converted,
+            tally.render(),
         )
         # Every task this pass did NOT re-observe as held has stopped being
         # held: pop its streak and resolve any alarm it filed (task 3535).
         self._release_recovery_veto_streaks(tally)
         # Deliberately NOT `+ tally.held`: the caller uses this to decide
         # whether the main loop keeps running, and counting holds as progress
-        # would make a fully-stuck fleet look busy forever.
+        # would make a fully-stuck fleet look busy forever.  `converted` is
+        # excluded for the same reason and a stronger one: a conversion is a
+        # row coming to REST, so counting it as progress would make a fleet
+        # that is doing nothing but parking pinned strands look busy — the
+        # exact misreading task 3539 exists to end.
         return reverted + marked_done
 
     def _resolve_task_worktree(self, tid: str) -> Path:
@@ -5481,7 +5493,12 @@ class Harness:
         self, tid: str, status: str, *, mid_run: bool,
         tally: RecoverySweepTally | None = None,
     ) -> str | None:
-        """Reconcile a single stranded task. Returns 'marked_done', 'reverted', or None.
+        """Reconcile a single stranded task.
+
+        Returns 'marked_done', 'reverted', 'stale_conflict',
+        'converted_to_blocked' (task 3539 — an escalation-pinned, unclaimed
+        stranded in-progress row brought to rest in `blocked`, enforce mode
+        only), or None.
 
         Raises ``SetTaskStatusRejected`` if the persistence layer refuses the
         recovery write — caller handles failure counting + escalation.
@@ -5689,6 +5706,59 @@ class Harness:
             # incomplete information.  A store-unavailable LEAVE is already
             # counted under `left`, hence the elif rather than a second fold.
             tally.record_store_unavailable()
+
+        if action == RecoveryAction.CONVERT_TO_BLOCKED:
+            # Task 3539 — the ENFORCE arm.  Sited here, after the chokepoint
+            # and BEFORE the MARK_DONE arm, so it cannot be shadowed by the
+            # `if status == 'blocked'` fall-through further down (a converting
+            # report is always keyed IN_PROGRESS, but siting it after that
+            # branch would make the arm's correctness depend on that fact
+            # holding forever).  Unreachable unless
+            # `convert_to_blocked_enforce` is True: log mode above has already
+            # downgraded `action` to LEAVE.
+            #
+            # CHESTERTON'S FENCE — this file's standing "the reconcile sweep
+            # NEVER changes status" rule.  What that rule actually forbids is
+            # silently RELEASING a deliberate `blocked` park into `pending`:
+            # a park is a human/automation decision and re-dispatching over it
+            # destroys work.  This write moves the OPPOSITE way — out of a
+            # churning, dispatchable `in-progress` and into the more
+            # conservative, non-dispatchable `blocked` — and only for a task an
+            # escalation is ALREADY holding, so it removes a dispatch
+            # opportunity rather than creating one.  It is also off by default
+            # until the population has been observed (see the log-mode block).
+            #
+            # CONVERSION IS NOT COMPLETION.  The converted row arrives in
+            # `blocked` STILL CARRYING ITS PIN; its exit is a human or task
+            # 3541's `classify_pins` veto collapse, never an automatic
+            # self-heal.  No `done_provenance` is written and no escalation is
+            # filed — the task is already pinned, and a second record would be
+            # the duplicate/competing-escalation hazard rows (g)/(h) exist to
+            # avoid.
+            logger.warning(
+                'Reconcile: converting task %s in-progress -> blocked '
+                '(shape=%s, branch=%s, pinned by %s) — pinned and unclaimed, '
+                'so it can no longer be re-dispatched; it keeps its pin and '
+                'its exit is a human or task 3541, NOT a self-heal',
+                tid,
+                recovery_shape_str(report),
+                report.branch_state.kind.value,
+                ', '.join(str(ref.id) for ref in report.open_escalations) or '-',
+            )
+            try:
+                await self.scheduler.set_task_status(tid, 'blocked')
+            except Exception:
+                # Fail-open, the shape used verbatim at every existing harness
+                # blocked-write: one refused conversion must never abort the
+                # pass for every other stranded task.  Returning None (not the
+                # marker) keeps the sweep summary honest — nothing moved.
+                logger.warning(
+                    'Reconcile: failed to convert task %s to blocked — '
+                    'leaving it in-progress for the next sweep',
+                    tid, exc_info=True,
+                )
+                return None
+            return 'converted_to_blocked'
 
         if action == RecoveryAction.MARK_DONE_WITH_PROVENANCE:
             # Degenerate-branch refinement (task 2243, W10-θ2; RESOLVER GAP
