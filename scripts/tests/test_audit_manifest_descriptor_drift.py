@@ -56,6 +56,7 @@ from audit_manifest_descriptor_drift import (
     format_json,
     format_report,
 )
+from shared.capability_manifest import load_capability_manifest
 
 # ---------------------------------------------------------------------------
 # Fixtures. The tasks-table schema and the tasks.db builder live in
@@ -908,3 +909,295 @@ def test_exit_constants_alias_the_shared_tier_3_codes():
     """
     assert (EXIT_OK, EXIT_DRIFT, EXIT_NO_ROOT, EXIT_NOTHING_AUDITED) == (
         AUDIT_EXIT_OK, AUDIT_EXIT_FINDINGS, AUDIT_EXIT_NO_ROOT, AUDIT_EXIT_NOTHING_AUDITED)
+
+
+# ---------------------------------------------------------------------------
+# THE EIGHT MEASURED DRIFT ROWS (task 4545).
+#
+# Each row is (manifest relpath, task_id, label, capability, stale_pattern_
+# fields, resynced_pattern_fields) — the two spellings as MEASURED on base
+# 4ab3b731f3, transcribed verbatim. `stale` is what the sidecar carried before
+# the resync; `resynced` is what the (already-repaired) task record carries and
+# what the sidecar must carry after step 8.
+#
+# AUTHORING HAZARD, row toolcall-markup: its stale pattern IS the raw envelope
+# closer sentinel. A literal here would force this file's own author to emit
+# that sentinel inside a tool call, reproducing exactly the leak the
+# toolcall-markup PRD exists to CONTAIN. It is therefore built from chr(60) —
+# never typed. The resynced value 'parameter name=' is CANONICAL_OPENER_PREFIX
+# written without its leading angle bracket: deliberate, and verified
+# equivalent (the bracket-free and full-sentinel anchors return an identical
+# 3-line match set on the pinned worktree-inventory.json, with a negative
+# control against README.md returning rc=1).
+# ---------------------------------------------------------------------------
+
+_INVOKE_CLOSER = chr(60) + "/invoke" + chr(62)
+
+
+def _grep(pattern, paths, expect="present"):
+    return {"kind": "grep", "pattern": pattern, "paths": list(paths), "expect": expect}
+
+
+_MEASURED_DRIFT_ROWS = (
+    (
+        "plans/agent-transcript-archival-prd.capability-manifest.yaml", 2730, "γ",
+        "archive-root-shipped-on-in-legibility-yaml",
+        # The single-line regex cannot match block-style YAML; the capability
+        # IS delivered, at docs/legibility/legibility.yaml:20-21.
+        _grep(r"agent_transcript_roots:\s*\[?\s*data/orchestrator/agent-transcripts",
+              ["docs/legibility/legibility.yaml"]),
+        _grep("data/orchestrator/agent-transcripts",
+              ["docs/legibility/legibility.yaml"]),
+    ),
+    (
+        "plans/flake-ledger-prd.capability-manifest.yaml", 3793, "ι",
+        "report-surfaces-the-hold-with-its-owner-and-age",
+        # cli.py's flake_ledger_cmd is a 25-line click wrapper; the owner+age
+        # render lives in flake_report.py, where the BARE token matches 3 lines
+        # and the braced form matches exactly 1.
+        _grep("owner_task_id", ["orchestrator/src/orchestrator/cli.py"]),
+        _grep(r"owner=\{d\.owner_task_id\}",
+              ["orchestrator/src/orchestrator/flake_report.py"]),
+    ),
+    (
+        "plans/os-sandbox-worktree-containment-prd.capability-manifest.yaml", 2906, "α4",
+        "enforcement-matrix-suite-exists",
+        # BENIGN — both spellings deliver. Resynced anyway so the sweep can
+        # assert zero drift rather than carrying an allowlist.
+        _grep("test_sandbox_enforcement_matrix", ["orchestrator/tests/"]),
+        _grep("Landlock enforcement-matrix suite", ["orchestrator/tests/"]),
+    ),
+    (
+        "plans/task-escalation-state-graph-prd.capability-manifest.yaml", 3534, "η0",
+        "dispatch-gate-any-level-veto",
+        # The ONE row whose `expect` also flips. Five has_open_l1 sites
+        # legitimately remain — three unrelated functions keep L1-only dedup
+        # and were never in 3534's scope — so the absent-grep could not hold.
+        _grep(r"has_open_l1\(task_id\)", ["orchestrator/src/orchestrator/harness.py"],
+              expect="absent"),
+        _grep("vetoes_done_flip", ["orchestrator/src/orchestrator/harness.py"]),
+    ),
+    (
+        "plans/task-escalation-state-graph-prd.capability-manifest.yaml", 3536, "γ1",
+        "no-steward-less-escalated-exit-at-merge-entry",
+        # THE FILENAME-VS-CONTENT MODE. orchestrator/tests/
+        # test_workflow_merge_gating_strand.py DOES exist, but kind=grep
+        # searches CONTENT and a test module does not mention its own name.
+        _grep("test_workflow_merge_gating_strand", ["orchestrator/tests/"]),
+        _grep("TestNoStrandExitProperty", ["orchestrator/tests/"]),
+    ),
+    (
+        "plans/toolcall-markup-containment-prd.capability-manifest.yaml", 3691, "δ",
+        "committed-evidence-file-survives-the-sweep",
+        _grep(_INVOKE_CLOSER,
+              ["docs/task-recovery-2026-05-13/worktree-inventory.json"]),
+        _grep("parameter name=",
+              ["docs/task-recovery-2026-05-13/worktree-inventory.json"]),
+    ),
+    (
+        "plans/transcript-preservation-seam-prd.capability-manifest.yaml", 3618, "α",
+        "complete-gz-consumer-set-including-memory-eval-corpus",
+        # DELIBERATELY SUPERSEDED, and it stays FAILING by design: task 3578
+        # RESTORED gzip reading after 3618 removed it, so BOTH spellings fail
+        # on main. Only the SPELLING is resynced here — this row is not to be
+        # "repaired" to pass, and its sibling capability writer-emits-plain-
+        # jsonl (pattern ^import gzip) is not drifted and is not touched.
+        _grep(r"jsonl\.gz", [
+            "fused-memory/scripts/memory_eval_transcript_corpus.py",
+            "scripts/gc_agent_transcripts.py",
+            "scripts/legibility/",
+            "shared/src/shared/transcript_archive.py",
+        ], expect="absent"),
+        _grep(r"gzip\.open", [
+            "fused-memory/scripts/memory_eval_transcript_corpus.py",
+            "scripts/gc_agent_transcripts.py",
+            "scripts/legibility/",
+            "shared/src/shared/transcript_archive.py",
+        ], expect="absent"),
+    ),
+    (
+        "plans/warm-lane-infra-repatriation-prd.capability-manifest.yaml", 3075, "γ",
+        "per-lane-recheck-not-snapshot",
+        # A comment naming the REJECTED --assigned-lanes alternative trips the
+        # whole-file absent-grep; the anchored form excludes comment lines and
+        # returns 0 hits.
+        _grep("--assigned-lanes", ["orchestrator/scripts/warm-lane/",
+                                   "orchestrator/src/orchestrator/"], expect="absent"),
+        _grep(r"^[^#]*--assigned-lanes", ["orchestrator/scripts/warm-lane/",
+                                          "orchestrator/src/orchestrator/"],
+              expect="absent"),
+    ),
+)
+
+
+def _rows_as_project(tmp_path, make_tasks_db, *, sidecar_index):
+    """Rebuild all 8 measured rows as ONE synthetic project.
+
+    *sidecar_index* picks which spelling the SIDECAR side carries: 4 for the
+    stale one (reproducing the pre-resync corpus) or 5 for the resynced one
+    (the post-resync corpus). The tasks.db side always carries the resynced
+    spelling, because the task records were already repaired by hand — that
+    asymmetry IS the defect being detected.
+
+    Decoys are included so the assertion is a genuine SET equality over a
+    mixed corpus rather than "everything present drifted": a non-drifted grep
+    row, an ABBREVIATED task entry omitting script/args/timeout_secs, and a
+    manual-kind capability.
+    """
+    by_manifest: dict[str, list] = {}
+    tasks: dict[int, list] = {}
+    for relpath, task_id, label, cap, stale, resynced in _MEASURED_DRIFT_ROWS:
+        by_manifest.setdefault(relpath, []).append(
+            (label, task_id, cap, [stale, resynced][sidecar_index - 4]))
+        tasks.setdefault(task_id, []).append(_entry(cap, resynced))
+
+    # Decoys, all on one extra task/manifest.
+    tasks[9001] = [
+        _entry("decoy-agrees", _GREP_CHECK),
+        # Abbreviated: no script, no args, no timeout_secs. Must NOT drift.
+        {"name": "decoy-abbreviated", "kind": "grep", "pattern": "def foo",
+         "paths": ["a.py"], "expect": "present"},
+    ]
+
+    manifests = []
+    for relpath, rows in by_manifest.items():
+        blocks: dict[tuple[str, int], list] = {}
+        for label, task_id, cap, check in rows:
+            blocks.setdefault((label, task_id), []).append(_capability(cap, check))
+        manifests.append((relpath, {
+            "prd": relpath.replace(".capability-manifest.yaml", ".md"),
+            "schema_version": 1,
+            "tasks": [{"label": label, "task_id": task_id, "capabilities": caps}
+                      for (label, task_id), caps in blocks.items()],
+        }))
+    manifests.append(("plans/decoy-prd.capability-manifest.yaml", {
+        "prd": "plans/decoy-prd.md", "schema_version": 1,
+        "tasks": [{"label": "ζ", "task_id": 9001, "capabilities": [
+            _capability("decoy-agrees", _GREP_CHECK),
+            _capability("decoy-abbreviated", _GREP_CHECK),
+            _capability("decoy-manual", _MANUAL_CHECK),
+        ]}],
+    }))
+
+    return _make_project(
+        tmp_path, make_tasks_db, name=f"corpus{sidecar_index}",
+        tasks=[_task(tid, entries) for tid, entries in sorted(tasks.items())],
+        manifests=manifests,
+    )
+
+
+def test_the_eight_measured_drift_rows_are_reported_exactly(tmp_path, make_tasks_db):
+    """SET EQUALITY on the eight NAMED triples, then the paired flip to zero.
+
+    This is the DURABLE stand-in for the live before/after measurement, and it
+    is synthetic for the reason this module's docstring gives: tasks.db is
+    gitignored, orchestrator-mutated and absent from a clean clone, so a live
+    assertion on it would go red on unrelated branches. The synthetic corpus
+    reproduces all 8 real rows verbatim — stale sidecar spelling against
+    resynced task-record spelling — so the test cannot stay green while the
+    sweep reports the WRONG rows, which a bare count assertion would allow.
+    """
+    stale_root = _rows_as_project(tmp_path, make_tasks_db, sidecar_index=4)
+
+    audit = audit_project(str(stale_root))
+
+    assert _triples(audit) == {
+        (relpath, task_id, cap)
+        for relpath, task_id, _label, cap, _stale, _resynced in _MEASURED_DRIFT_ROWS
+    }
+
+    # THE PAIRED FLIP: the same corpus with the RESYNCED spellings on the
+    # sidecar side reports nothing. Without this half, a sweep that reported
+    # every capability as drifted would still satisfy the set equality above
+    # for these eight.
+    resynced_root = _rows_as_project(tmp_path, make_tasks_db, sidecar_index=5)
+
+    assert audit_project(str(resynced_root)).findings == []
+
+
+def test_the_measured_rows_carry_the_two_differing_field_sets(
+        tmp_path, make_tasks_db):
+    """Two of the eight differ in MORE than `pattern`, and that is pinned.
+
+    3793 also moved `paths` (cli.py -> flake_report.py) and 3534 also flips
+    `expect` (absent -> present). A sweep that compared only `pattern` would
+    report all 8 triples and still be wrong about these two.
+    """
+    audit = audit_project(str(_rows_as_project(tmp_path, make_tasks_db, sidecar_index=4)))
+    fields = {(d.task_id, d.capability): d.differing_fields for d in audit.findings}
+
+    assert fields[(3793, "report-surfaces-the-hold-with-its-owner-and-age")] == (
+        "paths", "pattern")
+    assert fields[(3534, "dispatch-gate-any-level-veto")] == ("expect", "pattern")
+    assert all(
+        f == ("pattern",) for (tid, _cap), f in fields.items() if tid not in (3793, 3534)
+    )
+
+
+# ---------------------------------------------------------------------------
+# The LIVE corpus pin — PURE GIT, no tasks.db, no databases at all.
+#
+# Same legitimacy as shared/tests/test_capability_manifest.py::
+# TestCheckedInManifestCorpus and scripts/tests/test_lms_marker_contract.py:
+# it reads only TRACKED files in this checkout. That is what makes it a
+# legitimate live assertion where a tasks.db one would not be.
+# ---------------------------------------------------------------------------
+
+def _repo_root():
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(Path(__file__).parent), "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return completed.stdout.strip() if completed.returncode == 0 else None
+
+
+@pytest.mark.parametrize(
+    "relpath,task_id,label,capability,resynced",
+    [(r[0], r[1], r[2], r[3], r[5]) for r in _MEASURED_DRIFT_ROWS],
+    ids=[f"{r[1]}-{r[3]}" for r in _MEASURED_DRIFT_ROWS],
+)
+def test_live_sidecars_carry_the_resynced_descriptors(
+        relpath, task_id, label, capability, resynced):
+    """Each of the 8 tracked sidecars carries its task record's spelling.
+
+    Parametrized so a failure NAMES its own manifest/label/capability rather
+    than reporting "one of eight".
+    """
+    root = _repo_root()
+    if root is None:
+        pytest.skip("not a git checkout")
+
+    # NON-VACUITY FLOOR: assert the sidecar is TRACKED before reading it, so a
+    # renamed or deleted manifest cannot make this test pass by finding
+    # nothing to check.
+    tracked = subprocess.run(
+        ["git", "-C", root, "ls-files", "--", relpath],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert tracked.stdout.strip(), f"{relpath} is not tracked in {root}"
+
+    doc = load_capability_manifest(Path(root) / relpath)
+    matches = [
+        cap for task in doc.tasks if task.label == label
+        for cap in task.capabilities if cap.name == capability
+    ]
+    assert len(matches) == 1, (
+        f"expected exactly one {capability!r} under label {label!r} "
+        f"in {relpath}, found {len(matches)}"
+    )
+
+    check = matches[0].delivered_check
+    assert check is not None
+    assert check.model_dump() == {
+        "kind": resynced["kind"],
+        "pattern": resynced["pattern"],
+        "expect": resynced["expect"],
+        "paths": resynced["paths"],
+        "script": None,
+        "args": [],
+        "timeout_secs": None,
+        "reason": None,
+    }, f"{relpath} label {label} capability {capability} (task {task_id}) is STALE"
