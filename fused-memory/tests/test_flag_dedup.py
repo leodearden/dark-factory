@@ -9322,6 +9322,398 @@ class TestFilterAlreadyTrackedSystemicPatternsCrossProject:
 
 
 # ---------------------------------------------------------------------------
+# task 4711 — widen _NEVER_TRACKED_PHRASES so the pointer-free cross-project
+# filter reaches the "no fix task has been filed" complaint class
+# ---------------------------------------------------------------------------
+
+
+class TestNeverTrackedLexiconWidening:
+    """Tests for task 4711: widen _NEVER_TRACKED_PHRASES to reach the "no fix
+    task has been filed" complaint class — the wording of Leo's 2026-08-17
+    ruling on gate 3841 (originating know_live flag e3527208 / task 598) —
+    which the original five-phrase lexicon (all "never .../no tracked task"
+    variants) does not match.
+
+    RED until step-2 widens _NEVER_TRACKED_PHRASES.
+    """
+
+    #: MEASURED DROP fixture (task 4711 plan): 9 significant terms against
+    #: _make_covering_task's title+description, coverage 0.889 (>= the
+    #: default match_coverage=0.75), precision 0.800 (>= the default
+    #: min_task_term_precision=0.2) — comfortably clears min_key_terms=4.
+    #: Deliberately NOT the bare repro fragment 'no fix task has been filed
+    #: for this recurring finding' from the task description: that fragment
+    #: yields only 2 significant terms ({'fix', 'recurring'}, since
+    #: 'filed'/'file'/'task'/'finding' are already _STOPWORDS), which is
+    #: below min_key_terms=4 and is therefore KEPT unconditionally
+    #: regardless of the lexicon — a drop assertion built on it could never
+    #: pass.
+    _DROP_DESCRIPTION = (
+        'No fix task has been filed for this recurring pattern: the '
+        'remediation payload omits the live workflow signals section.'
+    )
+
+    def _make_flag(self, description: str) -> dict:
+        """A systemic_pattern finding, mirroring _make_never_tracked_flag's
+        shape with *description* swapped in for the "no fix task has been
+        filed" wrapper wording."""
+        return {
+            'task_id': None,
+            'category': 'systemic_pattern',
+            'flag_type': 'systemic_pattern',
+            'description': description,
+            'suggested_action': (
+                'File a task to wire the live workflow signals into the '
+                'remediation payload.'
+            ),
+        }
+
+    def _make_covering_task(self, status: str = 'pending') -> dict:
+        """A task whose title+description covers _DROP_DESCRIPTION's terms.
+
+        Mirrors TestFilterAlreadyTrackedSystemicPatternsCrossProject's
+        _make_covering_task shape, adapted to the remediation-payload prose
+        (MEASURED: 10 task terms, 8 overlap with the 9 finding terms above).
+        *status* is parameterised (default 'pending') so the
+        permanent-silencing guard below can reuse this same covering-task
+        prose with status='cancelled'.
+        """
+        return {
+            'id': '3839',
+            'status': status,
+            'title': 'Wire live workflow signals into the remediation payload',
+            'description': (
+                'The remediation payload omits the live workflow signals '
+                'section for this recurring pattern; wire the signals '
+                'through.'
+            ),
+        }
+
+    # ---- (1) unit: the widened phrase is recognised -----------------------
+
+    def test_no_fix_task_has_been_filed_is_recognised_as_never_tracked_language(self):
+        """(1) UNIT: _asserts_never_tracked recognises the task-named
+        originating phrasing directly, and _is_systemic_pattern_candidate
+        reaches it via a realistic full-length flag description."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _asserts_never_tracked,
+            _is_systemic_pattern_candidate,
+        )
+
+        assert _asserts_never_tracked('no fix task has been filed') is True
+
+        flag = self._make_flag(self._DROP_DESCRIPTION)
+        assert _is_systemic_pattern_candidate(flag) is True, (
+            f'Expected the widened lexicon to reach {flag["description"]!r}'
+        )
+
+    # ---- (2) end-to-end: a foreign-project covering task drops the flag ---
+
+    @pytest.mark.asyncio
+    async def test_foreign_project_covering_task_drops_no_fix_task_filed_flag(self):
+        """(2) END-TO-END: a non-cancelled covering task in a foreign known
+        project drops the widened "no fix task has been filed" finding."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_already_tracked_systemic_patterns,
+        )
+
+        flag = self._make_flag(self._DROP_DESCRIPTION)
+        taskmaster = AsyncMock()
+        taskmaster.get_tasks = AsyncMock(return_value={
+            'tasks': [self._make_covering_task()],
+        })
+
+        result = await filter_already_tracked_systemic_patterns(
+            taskmaster, {'know_live': '/kl'}, [flag],
+        )
+
+        assert result == [], (
+            'A non-cancelled covering task in a foreign known project must '
+            f'DROP the widened "no fix task has been filed" finding; got {result!r}'
+        )
+
+    # ---- (3) permanent-silencing guard: cancelled-only coverage keeps -----
+
+    @pytest.mark.asyncio
+    async def test_cancelled_only_covering_task_does_not_drop_the_flag(self):
+        """(a) PERMANENT-SILENCING GUARD: a CANCELLED-only covering task must
+        NOT drop the widened finding — mirrors
+        TestFilterAlreadyTrackedSystemicPatternsCrossProject's
+        test_cancelled_task_returned_by_backend_does_not_drop_the_flag. A
+        cancelled task means the work was explicitly abandoned, so letting
+        it suppress would silence this complaint forever.
+        """
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_already_tracked_systemic_patterns,
+        )
+
+        flag = self._make_flag(self._DROP_DESCRIPTION)
+        taskmaster = AsyncMock()
+        taskmaster.get_tasks = AsyncMock(return_value={
+            'tasks': [self._make_covering_task(status='cancelled')],
+        })
+
+        result = await filter_already_tracked_systemic_patterns(
+            taskmaster, {'know_live': '/kl'}, [flag],
+        )
+
+        assert result == [flag], (
+            'A CANCELLED-only covering task must NOT drop the widened '
+            f'"no fix task has been filed" finding; got {result!r}'
+        )
+
+    # ---- (4) precision-floor guard: below-coverage near-miss keeps --------
+
+    #: MEASURED near-miss KEEP fixture (task 4711 plan): 13 significant
+    #: terms, coverage 0.692 (< the default match_coverage=0.75), precision
+    #: 0.750 — a genuine near-miss rather than a trivially-unrelated task at
+    #: coverage 0.0, so this test actually exercises the match_coverage
+    #: floor rather than passing vacuously.
+    _NEAR_MISS_DESCRIPTION = (
+        'This recurring finding has been reconfirmed across multiple '
+        'cycles but no fix task has been filed: the remediation payload '
+        'omits the live workflow signals section.'
+    )
+
+    def _make_near_miss_covering_task(self) -> dict:
+        """A task that covers most, but not enough, of _NEAR_MISS_DESCRIPTION.
+
+        MEASURED: 12 task terms, 9 overlap with the 13 finding terms above
+        -> coverage 0.692 (below match_coverage=0.75), precision 0.750.
+        """
+        return {
+            'id': '3839',
+            'status': 'pending',
+            'title': 'Wire live workflow signals into the remediation payload',
+            'description': (
+                "The remediation payload omits its live-workflow signals "
+                "section; wire the live workflow signals through so the "
+                "reconfirmed recurring finding is addressed."
+            ),
+        }
+
+    @pytest.mark.asyncio
+    async def test_below_coverage_near_miss_keeps_the_flag(self):
+        """(b) PRECISION-FLOOR GUARD: a near-miss covering task below
+        match_coverage must KEEP the widened finding, not drop it."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_already_tracked_systemic_patterns,
+        )
+
+        flag = self._make_flag(self._NEAR_MISS_DESCRIPTION)
+        taskmaster = AsyncMock()
+        taskmaster.get_tasks = AsyncMock(return_value={
+            'tasks': [self._make_near_miss_covering_task()],
+        })
+
+        result = await filter_already_tracked_systemic_patterns(
+            taskmaster, {'know_live': '/kl'}, [flag],
+        )
+
+        assert result == [flag], (
+            'A covering task below match_coverage must KEEP the widened '
+            f'finding, not drop it; got {result!r}'
+        )
+
+    # ---- (5) negation-flip guard -------------------------------------------
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            'A fix task has been filed for this recurring finding (dark_factory 3839).',
+            'A follow-up task has been filed and is pending.',
+            'Task 3833 has been filed to cover this pattern.',
+        ],
+        ids=[
+            'fix-task-has-been-filed',
+            'follow-up-task-has-been-filed',
+            'task-has-been-filed',
+        ],
+    )
+    def test_negation_flip_text_is_not_a_candidate(self, text):
+        """(c) NEGATION-FLIP GUARD: text announcing a task DOES exist must
+        NOT be classified as never-tracked language — a dropped negation
+        token would match the OPPOSITE claim and permanently silence a
+        finding whose complaint is already answered."""
+        from fused_memory.reconciliation.flag_dedup import _is_systemic_pattern_candidate
+
+        flag = self._make_flag(text)
+        assert _is_systemic_pattern_candidate(flag) is False, (
+            f'Expected {text!r} (a task DOES exist) to NOT be a never-tracked candidate'
+        )
+
+    # ---- (6) generic-term guard ---------------------------------------------
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            'The git working tree has untracked files that the operator decision path ignores.',
+            'This flag has no task_id attached, so Stage 2 cannot route it.',
+            # task 4711 review-amendment: these three pin the re-anchoring of
+            # the bare 'no fix task' / 'no follow-up task' / 'not been
+            # filed' entries — all three matched before they were narrowed
+            # to '...has been' / 'task has not been filed'.
+            'The flag has no fix task id recorded in metadata.',
+            'No follow-up task ordering is enforced by the scheduler.',
+            'The escalation record shows the decision has not been filed yet.',
+        ],
+        ids=[
+            'git-untracked-files',
+            'no-task-id-attached',
+            'no-fix-task-id-recorded',
+            'no-follow-up-task-ordering',
+            'decision-not-been-filed',
+        ],
+    )
+    def test_generic_term_text_is_not_a_candidate(self, text):
+        """(d) GENERIC-TERM GUARD: unrelated systemic findings that happen to
+        contain a bare generic term ('untracked', 'no task') must NOT be
+        classified as never-tracked language. The last three cases pin the
+        review-amendment narrowing (reviewer_comprehensive, task 4711
+        amendment): 'no fix task' and 'no follow-up task' were bare-generic
+        matches on non-complaint text, and 'not been filed' was not
+        anchored to a task noun at all, so a finding about an unfiled
+        escalation/decision/PR would have wrongly become a drop candidate.
+        """
+        from fused_memory.reconciliation.flag_dedup import _is_systemic_pattern_candidate
+
+        flag = self._make_flag(text)
+        assert _is_systemic_pattern_candidate(flag) is False, (
+            f'Expected {text!r} (an unrelated systemic finding) to NOT be a '
+            'never-tracked candidate'
+        )
+
+    # ---- (7) structural invariant: every entry retains a negation token ---
+
+    def test_every_lexicon_entry_retains_a_negation_token(self):
+        """(b) STRUCTURAL INVARIANT: every _NEVER_TRACKED_PHRASES entry must
+        contain at least one negation token ('no', 'never', 'not') as a
+        whole word, so a future append that drops the negation fails at
+        test time instead of silently inverting the filter's meaning — see
+        the negation-flip guard above and the docstring on
+        _NEVER_TRACKED_PHRASES.
+
+        Word-boundary matching (reviewer_comprehensive, task 4711
+        amendment): plain substring containment for 'no'/'not'/'never'
+        would let a future entry like 'a fix task is now filed' or 'a fix
+        task is known to be filed' pass this guard while asserting the
+        OPPOSITE claim — 'no' is a substring of both 'now' and 'known'.
+        \\b keeps the check honest about the tokens actually being
+        standalone words, matching the docstring's 'no '/'never'/'not '
+        spelling.
+
+        First test in the repo to reference _NEVER_TRACKED_PHRASES directly.
+        """
+        import re
+
+        from fused_memory.reconciliation.flag_dedup import _NEVER_TRACKED_PHRASES
+
+        negation_token_re = re.compile(r'\b(?:no|never|not)\b')
+        offenders = [
+            phrase for phrase in _NEVER_TRACKED_PHRASES
+            if not negation_token_re.search(phrase)
+        ]
+        assert offenders == [], (
+            'Every _NEVER_TRACKED_PHRASES entry must contain a negation '
+            f'token (no/never/not) as a whole word, or it can match the '
+            f'OPPOSITE claim; offending entries: {offenders!r}'
+        )
+
+    # ---- (8) structural invariant: no entry is dead weight -----------------
+
+    def test_no_lexicon_entry_is_a_substring_of_another(self):
+        """(f) STRUCTURAL INVARIANT: no _NEVER_TRACKED_PHRASES entry is
+        entirely subsumed by another entry. Any text matching a subsumed
+        (longer) entry already matches the shorter one, so the longer
+        entry would be dead weight in the frozenset and misleadingly imply
+        it is doing independent work (reviewer_comprehensive,
+        code-duplication, task 4711 amendment: 'no fix task has been
+        filed' was dropped for exactly this reason — it was fully
+        subsumed by 'no fix task has been'). Keeps future appends honest:
+        a new entry that only widens an existing one should not be added
+        as a separate literal.
+        """
+        from itertools import permutations
+
+        from fused_memory.reconciliation.flag_dedup import _NEVER_TRACKED_PHRASES
+
+        offenders = [
+            (shorter, longer)
+            for shorter, longer in permutations(_NEVER_TRACKED_PHRASES, 2)
+            if shorter in longer
+        ]
+        assert offenders == [], (
+            'Every _NEVER_TRACKED_PHRASES entry must do independent work; '
+            'the following (shorter, longer) pairs make the longer entry '
+            f'dead weight: {offenders!r}'
+        )
+
+    # ---- (9) test-coverage: every task-4711 phrase individually pinned -----
+
+    @pytest.mark.parametrize(
+        'phrase, sentence',
+        [
+            (
+                'no task has been filed',
+                'No task has been filed for this recurring configuration drift.',
+            ),
+            (
+                'no fix task has been',
+                'No fix task has been opened for this recurring failure mode.',
+            ),
+            (
+                'no follow-up task has been',
+                'No follow-up task has been created for this recurring alert.',
+            ),
+            (
+                'no follow up task has been',
+                'No follow up task has been created for this recurring alert.',
+            ),
+            (
+                'no task exists',
+                'No task exists to track this recurring configuration drift.',
+            ),
+            (
+                'never been filed',
+                'A fix for this recurring pattern has never been filed as a task.',
+            ),
+            (
+                'task has not been filed',
+                'A fix task has not been filed for this recurring pattern.',
+            ),
+        ],
+        ids=[
+            'no-task-has-been-filed',
+            'no-fix-task-has-been',
+            'no-follow-up-task-has-been-hyphenated',
+            'no-follow-up-task-has-been-unhyphenated',
+            'no-task-exists',
+            'never-been-filed',
+            'task-has-not-been-filed',
+        ],
+    )
+    def test_each_task_4711_phrase_is_individually_recognised(self, phrase, sentence):
+        """(g) TEST-COVERAGE: every task-4711 lexicon entry is exercised on
+        its own, not just incidentally via _DROP_DESCRIPTION (which only
+        ever routes through 'no fix task has been') — a typo in any other
+        entry, e.g. 'no follow up task' vs 'no follow-up task', would
+        otherwise ship silently (reviewer_comprehensive, test-coverage,
+        task 4711 amendment). The two 'no follow up/-up task has been'
+        cases also pin that BOTH the hyphenated and unhyphenated surface
+        forms are needed, since matching does no punctuation
+        normalisation.
+        """
+        from fused_memory.reconciliation.flag_dedup import _asserts_never_tracked
+
+        assert phrase in sentence.lower(), (
+            f'Fixture bug: {phrase!r} must literally appear in {sentence!r}'
+        )
+        assert _asserts_never_tracked(sentence) is True, (
+            f'Expected _asserts_never_tracked to recognise {phrase!r} via {sentence!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
 # task 4381 amendment pass (review fixes) — the bounded, batched and
 # instrumented cross-project fix-task gate
 # ---------------------------------------------------------------------------
