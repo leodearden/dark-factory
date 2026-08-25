@@ -9549,13 +9549,32 @@ class TestNeverTrackedLexiconWidening:
         [
             'The git working tree has untracked files that the operator decision path ignores.',
             'This flag has no task_id attached, so Stage 2 cannot route it.',
+            # task 4711 review-amendment: these three pin the re-anchoring of
+            # the bare 'no fix task' / 'no follow-up task' / 'not been
+            # filed' entries — all three matched before they were narrowed
+            # to '...has been' / 'task has not been filed'.
+            'The flag has no fix task id recorded in metadata.',
+            'No follow-up task ordering is enforced by the scheduler.',
+            'The escalation record shows the decision has not been filed yet.',
         ],
-        ids=['git-untracked-files', 'no-task-id-attached'],
+        ids=[
+            'git-untracked-files',
+            'no-task-id-attached',
+            'no-fix-task-id-recorded',
+            'no-follow-up-task-ordering',
+            'decision-not-been-filed',
+        ],
     )
     def test_generic_term_text_is_not_a_candidate(self, text):
         """(d) GENERIC-TERM GUARD: unrelated systemic findings that happen to
         contain a bare generic term ('untracked', 'no task') must NOT be
-        classified as never-tracked language."""
+        classified as never-tracked language. The last three cases pin the
+        review-amendment narrowing (reviewer_comprehensive, task 4711
+        amendment): 'no fix task' and 'no follow-up task' were bare-generic
+        matches on non-complaint text, and 'not been filed' was not
+        anchored to a task noun at all, so a finding about an unfiled
+        escalation/decision/PR would have wrongly become a drop candidate.
+        """
         from fused_memory.reconciliation.flag_dedup import _is_systemic_pattern_candidate
 
         flag = self._make_flag(text)
@@ -9568,24 +9587,129 @@ class TestNeverTrackedLexiconWidening:
 
     def test_every_lexicon_entry_retains_a_negation_token(self):
         """(b) STRUCTURAL INVARIANT: every _NEVER_TRACKED_PHRASES entry must
-        contain at least one negation token ('no', 'never', 'not'), so a
-        future append that drops the negation fails at test time instead of
-        silently inverting the filter's meaning — see the negation-flip
-        guard above and the docstring on _NEVER_TRACKED_PHRASES.
+        contain at least one negation token ('no', 'never', 'not') as a
+        whole word, so a future append that drops the negation fails at
+        test time instead of silently inverting the filter's meaning — see
+        the negation-flip guard above and the docstring on
+        _NEVER_TRACKED_PHRASES.
+
+        Word-boundary matching (reviewer_comprehensive, task 4711
+        amendment): plain substring containment for 'no'/'not'/'never'
+        would let a future entry like 'a fix task is now filed' or 'a fix
+        task is known to be filed' pass this guard while asserting the
+        OPPOSITE claim — 'no' is a substring of both 'now' and 'known'.
+        \\b keeps the check honest about the tokens actually being
+        standalone words, matching the docstring's 'no '/'never'/'not '
+        spelling.
 
         First test in the repo to reference _NEVER_TRACKED_PHRASES directly.
         """
+        import re
+
         from fused_memory.reconciliation.flag_dedup import _NEVER_TRACKED_PHRASES
 
-        negation_tokens = ('no', 'never', 'not')
+        negation_token_re = re.compile(r'\b(?:no|never|not)\b')
         offenders = [
             phrase for phrase in _NEVER_TRACKED_PHRASES
-            if not any(token in phrase for token in negation_tokens)
+            if not negation_token_re.search(phrase)
         ]
         assert offenders == [], (
             'Every _NEVER_TRACKED_PHRASES entry must contain a negation '
-            f'token (no/never/not) or it can match the OPPOSITE claim; '
-            f'offending entries: {offenders!r}'
+            f'token (no/never/not) as a whole word, or it can match the '
+            f'OPPOSITE claim; offending entries: {offenders!r}'
+        )
+
+    # ---- (8) structural invariant: no entry is dead weight -----------------
+
+    def test_no_lexicon_entry_is_a_substring_of_another(self):
+        """(f) STRUCTURAL INVARIANT: no _NEVER_TRACKED_PHRASES entry is
+        entirely subsumed by another entry. Any text matching a subsumed
+        (longer) entry already matches the shorter one, so the longer
+        entry would be dead weight in the frozenset and misleadingly imply
+        it is doing independent work (reviewer_comprehensive,
+        code-duplication, task 4711 amendment: 'no fix task has been
+        filed' was dropped for exactly this reason — it was fully
+        subsumed by 'no fix task has been'). Keeps future appends honest:
+        a new entry that only widens an existing one should not be added
+        as a separate literal.
+        """
+        from itertools import permutations
+
+        from fused_memory.reconciliation.flag_dedup import _NEVER_TRACKED_PHRASES
+
+        offenders = [
+            (shorter, longer)
+            for shorter, longer in permutations(_NEVER_TRACKED_PHRASES, 2)
+            if shorter in longer
+        ]
+        assert offenders == [], (
+            'Every _NEVER_TRACKED_PHRASES entry must do independent work; '
+            'the following (shorter, longer) pairs make the longer entry '
+            f'dead weight: {offenders!r}'
+        )
+
+    # ---- (9) test-coverage: every task-4711 phrase individually pinned -----
+
+    @pytest.mark.parametrize(
+        'phrase, sentence',
+        [
+            (
+                'no task has been filed',
+                'No task has been filed for this recurring configuration drift.',
+            ),
+            (
+                'no fix task has been',
+                'No fix task has been opened for this recurring failure mode.',
+            ),
+            (
+                'no follow-up task has been',
+                'No follow-up task has been created for this recurring alert.',
+            ),
+            (
+                'no follow up task has been',
+                'No follow up task has been created for this recurring alert.',
+            ),
+            (
+                'no task exists',
+                'No task exists to track this recurring configuration drift.',
+            ),
+            (
+                'never been filed',
+                'A fix for this recurring pattern has never been filed as a task.',
+            ),
+            (
+                'task has not been filed',
+                'A fix task has not been filed for this recurring pattern.',
+            ),
+        ],
+        ids=[
+            'no-task-has-been-filed',
+            'no-fix-task-has-been',
+            'no-follow-up-task-has-been-hyphenated',
+            'no-follow-up-task-has-been-unhyphenated',
+            'no-task-exists',
+            'never-been-filed',
+            'task-has-not-been-filed',
+        ],
+    )
+    def test_each_task_4711_phrase_is_individually_recognised(self, phrase, sentence):
+        """(g) TEST-COVERAGE: every task-4711 lexicon entry is exercised on
+        its own, not just incidentally via _DROP_DESCRIPTION (which only
+        ever routes through 'no fix task has been') — a typo in any other
+        entry, e.g. 'no follow up task' vs 'no follow-up task', would
+        otherwise ship silently (reviewer_comprehensive, test-coverage,
+        task 4711 amendment). The two 'no follow up/-up task has been'
+        cases also pin that BOTH the hyphenated and unhyphenated surface
+        forms are needed, since matching does no punctuation
+        normalisation.
+        """
+        from fused_memory.reconciliation.flag_dedup import _asserts_never_tracked
+
+        assert phrase in sentence.lower(), (
+            f'Fixture bug: {phrase!r} must literally appear in {sentence!r}'
+        )
+        assert _asserts_never_tracked(sentence) is True, (
+            f'Expected _asserts_never_tracked to recognise {phrase!r} via {sentence!r}'
         )
 
 
