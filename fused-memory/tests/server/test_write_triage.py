@@ -17,6 +17,7 @@ triage for every input.
 from __future__ import annotations
 
 import json
+import logging
 import types
 from unittest.mock import AsyncMock, Mock
 
@@ -714,7 +715,7 @@ class TestRetrieveCandidates:
         return service
 
     @pytest.mark.asyncio
-    async def test_issues_exactly_one_search_and_touches_nothing_else(self) -> None:
+    async def test_issues_exactly_one_search_and_nothing_more(self) -> None:
         """The INV-5 pin: this leaf builds no second retrieval.
 
         Task 3111 lands topic-anchored recall AT the `MemoryService.search`
@@ -723,19 +724,20 @@ class TestRetrieveCandidates:
         a second implementation to keep in sync forever. A second call — to a
         store, an embedder, or search again with different arguments — is the
         regression this catches.
+
+        This used to also assert `update_memory`/`delete_memory`/`add_memory`
+        were not called, which could not fail: the mocks were created by the
+        test itself and the function under test is a single `return await
+        search(...)` expression. The C1 "triage never edits a canonical" pin
+        lives where it can genuinely fail — over the whole tool body, at
+        `test_add_memory_write_triage_gate.py::
+        TestC1HoldsEndToEnd::test_the_canonical_is_never_mutated_on_any_path`.
         """
         service = self._service()
-        service.update_memory = AsyncMock()
-        service.delete_memory = AsyncMock()
-        service.add_memory = AsyncMock()
 
         await retrieve_candidates(service, 'some content', 'dark_factory', 20)
 
         assert service.search.await_count == 1
-        # C1: triage never edits a canonical, on any path including this one.
-        service.update_memory.assert_not_called()
-        service.delete_memory.assert_not_called()
-        service.add_memory.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_the_search_kwargs_are_the_published_shape(self) -> None:
@@ -808,23 +810,6 @@ class TestRetrieveCandidates:
         service = self._service()
         await retrieve_candidates(service, 'c', 'p', 37)
         assert service.search.await_args.kwargs['limit'] == 37
-
-    @pytest.mark.asyncio
-    async def test_the_shipped_default_width_is_wider_than_the_retired_guards_five(
-        self,
-    ) -> None:
-        """The retired guard's `limit=5` must not be inherited by analogy.
-
-        Measured same-category recall: 26.1% @5 vs 69.4% @20. Retrieval width
-        caps what any band threshold can achieve, so narrowing back to 5 would
-        discard three quarters of the duplicates triage exists to catch,
-        silently.
-        """
-        service = self._service()
-        await retrieve_candidates(
-            service, 'c', 'p', resolve_candidate_k(self._service()),
-        )
-        assert service.search.await_args.kwargs['limit'] > 5
 
     @pytest.mark.asyncio
     async def test_the_results_are_returned_unchanged(self) -> None:
@@ -957,6 +942,26 @@ class TestTriageFailOpenCounter:
             a.record(project='p')
         assert b.record(project='p') is None
 
+    def test_the_pending_storm_is_drained_not_left_pending(self) -> None:
+        """DRAINED, so one crossing files one alarm and not a stream of them.
+
+        The summary has to be stashed as well as returned, because the party
+        that records a fail-open (deep inside `triage_write`) is not the party
+        that can file the escalation (the tool body, which holds the
+        project-root registry). A `drain_storm` that merely PEEKED would hand
+        that same summary to every subsequent write until the window rolled.
+        The emitter dedupes on its anchor, so the visible symptom would not be
+        duplicate records — it would be a `triage_fail_open_escalation_id`
+        echoed on the ack of every later write, naming a record that was filed
+        once. Subtle, and precisely the alarm fatigue INV-4 exists to avoid.
+        """
+        counter = TriageFailOpenCounter(time_provider=_Clock())
+        for _ in range(_FAIL_OPEN_STORM_THRESHOLD):
+            counter.record(project='dark_factory')
+
+        assert counter.drain_storm() is not None, 'the crossing must be drainable'
+        assert counter.drain_storm() is None, 'a drained storm must not re-fire'
+
     def test_an_unresolved_project_still_counts(self) -> None:
         """A write whose project could not be resolved is still a fail-open."""
         counter = TriageFailOpenCounter(time_provider=_Clock())
@@ -1059,9 +1064,18 @@ class TestTriageWriteFailsOpen:
         assert decision.outcome == OUTCOME_STORED, 'the write is never blocked'
         assert counter.live_count() == 1
 
+    @staticmethod
+    def _fail_open_logs(caplog) -> list[logging.LogRecord]:
+        return [
+            record for record in caplog.records
+            if 'fail-open at stage' in record.getMessage()
+        ]
+
     @pytest.mark.asyncio
     @pytest.mark.parametrize('exc', [TypeError, AttributeError, NameError])
-    async def test_a_wiring_bug_class_also_fails_open_and_counts(self, exc) -> None:
+    async def test_a_wiring_bug_class_fails_open_counts_and_logs_at_error(
+        self, exc, caplog,
+    ) -> None:
         """The one place this deliberately diverges from the retired guard.
 
         `tools.py`'s near-dup call site RE-RAISES TypeError/AttributeError/
@@ -1071,16 +1085,49 @@ class TestTriageWriteFailsOpen:
         the exception type AND counted, so a changed `MemoryService.search`
         signature surfaces as a storm escalation rather than as a stream of
         errored writes.
+
+        THE LEVEL IS THE ENTIRE COMPENSATION, so it is asserted rather than
+        described. Without this, `_WIRING_BUG_CLASSES` could be deleted and
+        every wiring bug demoted to the same WARNING a transient mem0 blip
+        gets — with the whole suite still green and the stated divergence
+        silently undone.
         """
         counter = TriageFailOpenCounter(time_provider=_Clock())
         service = self._service(search=AsyncMock(side_effect=exc('boom')))
 
-        decision = await triage_write(
-            service, content='c', project_id='p', counter=counter,
-        )
+        with caplog.at_level(logging.DEBUG, logger=write_triage.logger.name):
+            decision = await triage_write(
+                service, content='c', project_id='p', counter=counter,
+            )
 
         assert decision.outcome == OUTCOME_STORED
         assert counter.live_count() == 1
+        logged = self._fail_open_logs(caplog)
+        assert [record.levelno for record in logged] == [logging.ERROR], (
+            f'a wiring bug must be louder than a blip: {caplog.text!r}'
+        )
+        assert f'exc={exc.__name__}' in logged[0].getMessage(), (
+            f'the line must name the class to be greppable: {caplog.text!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_ordinary_outage_stays_at_warning(self, caplog) -> None:
+        """The other side of the level boundary.
+
+        If every fail-open logged at ERROR the distinction would carry no
+        information: a transient backend blip is expected and handled, a
+        wiring bug is neither.
+        """
+        counter = TriageFailOpenCounter(time_provider=_Clock())
+        service = self._service(search=AsyncMock(side_effect=RuntimeError('mem0 down')))
+
+        with caplog.at_level(logging.DEBUG, logger=write_triage.logger.name):
+            await triage_write(service, content='c', project_id='p', counter=counter)
+
+        logged = self._fail_open_logs(caplog)
+        assert [record.levelno for record in logged] == [logging.WARNING], (
+            f'a transient outage is not a wiring bug: {caplog.text!r}'
+        )
 
     @pytest.mark.asyncio
     async def test_a_degraded_search_stores_and_counts_once(self) -> None:
@@ -1171,6 +1218,85 @@ class TestTriageWriteFailsOpen:
         assert counter.live_count() == 1
 
     @pytest.mark.asyncio
+    async def test_a_verdict_outside_the_closed_set_fails_open(self) -> None:
+        """D3's closed output set is ENFORCED, not merely documented.
+
+        A judge answering something outside `TRIAGE_OUTCOMES` is a bug, not an
+        extension point. Routing on it would put an unpublished word in the
+        `routed` ack, where no consumer can act on it and nothing counts it —
+        so it is counted as a fail-open, which is what turns a judge that has
+        drifted out of vocabulary into a storm escalation instead of a stream
+        of writes routed by a value nobody recognises.
+        """
+        counter = TriageFailOpenCounter(time_provider=_Clock())
+        service = self._service(search=AsyncMock(return_value=[_result('m1', 0.75)]))
+
+        async def _out_of_vocabulary(**_kwargs):
+            return 'nonsense'
+
+        decision = await triage_write(
+            service, content='c', project_id='p', counter=counter,
+            judge=_out_of_vocabulary,
+        )
+
+        assert decision.outcome == OUTCOME_STORED
+        assert decision.canonical_id is None, (
+            'an unrecognised verdict must not smuggle an attach target through'
+        )
+        assert counter.live_count() == 1
+
+    @pytest.mark.asyncio
+    async def test_a_stored_verdict_carries_no_canonical(self) -> None:
+        """A judge that declined to attach must not name a target anyway.
+
+        `decide_band` already picked a winner to hand the judge, so
+        `decision.canonical_id` IS populated on this path — carrying it
+        through would ack `stored` alongside a `canonical_id`, inviting a
+        caller to attach to the very candidate the judge declined to endorse.
+        """
+        counter = TriageFailOpenCounter(time_provider=_Clock())
+        service = self._service(search=AsyncMock(return_value=[_result('m1', 0.75)]))
+
+        async def _declines(**_kwargs):
+            return OUTCOME_STORED
+
+        decision = await triage_write(
+            service, content='c', project_id='p', counter=counter, judge=_declines,
+        )
+
+        assert decision.outcome == OUTCOME_STORED
+        assert decision.canonical_id is None
+        assert counter.live_count() == 0, 'a verdict in the vocabulary is not a failure'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('verdict', [OUTCOME_RESTATED, OUTCOME_AMENDED])
+    async def test_an_attach_verdict_carries_the_bands_winner_and_score(
+        self, verdict,
+    ) -> None:
+        """The judge names the RELATIONSHIP; the band already named the target.
+
+        A judge that returns only a word would otherwise have to be trusted to
+        also identify a canonical, which is exactly the detect-don't-adjudicate
+        split D3 draws. The similarity travels with it because the ack quotes
+        the number that produced the routing — dropping it leaves an attach
+        outcome no reader can second-guess.
+        """
+        counter = TriageFailOpenCounter(time_provider=_Clock())
+        service = self._service(search=AsyncMock(return_value=[_result('m1', 0.75)]))
+
+        async def _judge(**_kwargs):
+            return verdict
+
+        decision = await triage_write(
+            service, content='c', project_id='p', counter=counter, judge=_judge,
+        )
+
+        assert decision.outcome == verdict
+        assert decision.canonical_id == 'm1'
+        assert decision.similarity == pytest.approx(0.75)
+        assert counter.live_count() == 0
+
+    @pytest.mark.asyncio
     async def test_the_deliberate_stub_judge_counts_zero(self) -> None:
         """A STUB IS NOT AN OUTAGE — the other side of the C1 boundary.
 
@@ -1189,6 +1315,9 @@ class TestTriageWriteFailsOpen:
         )
 
         assert decision.outcome == OUTCOME_STORED
+        assert decision.canonical_id is None, (
+            'the stub declined to attach, so it names no canonical'
+        )
         assert counter.live_count() == 0, 'a deliberate stub is not a fail-open'
 
     @pytest.mark.asyncio
@@ -1252,6 +1381,62 @@ class TestTriageWriteFailsOpen:
         assert await _stub_judge(
             memory_service=None, content='c', project_id='p', decision=None,
         ) == OUTCOME_STORED
+
+
+# ---------------------------------------------------------------------------
+# The config -> retrieval join (the width is only real if it reaches the wire)
+# ---------------------------------------------------------------------------
+
+class TestTheConfiguredWidthReachesTheWire:
+    """`candidate_k` is only worth configuring if `triage_write` joins it up.
+
+    Both halves already had coverage and the JOIN between them had none:
+    `resolve_candidate_k` is unit-tested above, and `retrieve_candidates` is
+    shown to forward its `k` argument to `limit` — but nothing pinned that
+    `triage_write` passes the RESOLVED width rather than a literal. Triage
+    could therefore regress to exactly the retired guard's `limit=5` with
+    every other test still green.
+
+    That is the failure the schema field description calls invisible: measured
+    same-category recall is 26.1% @5 against 69.4% @20, so three quarters of
+    the duplicates simply never enter the candidate slate. No error is raised,
+    no band threshold can compensate, and the corpus fills up again.
+    """
+
+    @staticmethod
+    def _service(**write_triage) -> types.SimpleNamespace:
+        service = _svc(**{'enabled': True, 't_high': T_HIGH, 't_low': T_LOW,
+                          **write_triage})
+        service.search = AsyncMock(return_value=[])
+        return service
+
+    @pytest.mark.asyncio
+    async def test_a_configured_width_reaches_the_search_limit(self) -> None:
+        """A sentinel unrelated to every default, so nothing passes by luck."""
+        service = self._service(candidate_k=37)
+
+        await triage_write(
+            service, content='c', project_id='p',
+            counter=TriageFailOpenCounter(time_provider=_Clock()),
+        )
+
+        assert service.search.await_args.kwargs['limit'] == 37
+
+    @pytest.mark.asyncio
+    async def test_an_unconfigured_width_reaches_it_as_the_shipped_default(
+        self,
+    ) -> None:
+        """The default travels the same road — it is not merely resolvable."""
+        service = self._service()
+
+        await triage_write(
+            service, content='c', project_id='p',
+            counter=TriageFailOpenCounter(time_provider=_Clock()),
+        )
+
+        limit = service.search.await_args.kwargs['limit']
+        assert limit == _DEFAULT_CANDIDATE_K == resolve_candidate_k(service)
+        assert limit > 5, 'the retired guard\'s limit=5 must not return by analogy'
 
 
 # ---------------------------------------------------------------------------
