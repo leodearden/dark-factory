@@ -2230,6 +2230,34 @@ REGROWTH_METRIC_LABELS: tuple[str, ...] = (
     'tokens/query',
 )
 
+#: Which SIGN of a regrowth delta is the COST, per metric.  ``-1`` means a
+#: NEGATIVE delta is the cost (recall and discoverability rates: losing them
+#: is what regrowth does); ``+1`` means a POSITIVE delta is the cost
+#: (``tokens/query``, and ``median canonical rank`` — a bigger rank NUMBER is
+#: a worse rank).
+#:
+#: ENUMERATED rather than inferred, deliberately.  "Higher is better" is true
+#: of five of these seven columns and false of the other two, so a helper
+#: that guessed would get exactly those two silently wrong — in the one
+#: sentence a gate reads.  ``_check_regrowth_cost_signs`` (called at import,
+#: below :func:`_regrowth_metric_keys`) pins the key set to
+#: ``REGROWTH_METRICS``, so adding a metric without declaring its direction
+#: fails loudly instead of defaulting to "higher is better".
+#:
+#: Consumed by :func:`_absorption_phrase` and :func:`_cost_phrase`, which are
+#: the only two places in this renderer that turn a delta into a DIRECTIONAL
+#: claim.  The tables themselves render signed values through
+#: :func:`_gap_cell` and make no directional claim, so they need none of this.
+_REGROWTH_COST_SIGN: dict[str, int] = {
+    'claim_recall.at_5': -1,
+    'claim_recall.at_10': -1,
+    'discoverability.stored_canonical_in_top_5_rate': -1,
+    'discoverability.stored_canonical_median_rank': +1,
+    'discoverability.stored_canonical_found_count': -1,
+    'discoverability.canonical_in_top_5_rate': -1,
+    'tokens_per_query.mean': +1,
+}
+
 #: The regrowth delta table's columns, pinned in one place for the same
 #: reason ``DECISION_TABLE_COLUMNS`` is: a column quietly dropped from a
 #: delta table is a metric quietly dropped from the decision, so the test
@@ -2749,28 +2777,102 @@ def _stored_gap_lines(report: dict[str, Any]) -> list[str]:
     return lines
 
 
-def _absorption_phrase(flat: Any, selected: Any) -> str:
+def _cost_phrase(delta: Any, *, cost_sign: int) -> str:
+    """One delta, as a COST or a GAIN — the verb derived, never typed.
+
+    ``cost_sign`` comes from :data:`_REGROWTH_COST_SIGN`, so the signed cost
+    is ``delta * cost_sign``: positive means the injection took something,
+    negative means it gave something back, zero means it did not move the
+    column at all.
+
+    This exists because the signal sentence hard-typed the word "costs"
+    around :func:`_gap_cell`.  The committed artifact therefore read "one
+    unstamped re-emission per topic costs <0.01 claim recall@5" for a
+    MEASURED GAIN of +0.0042 — a false statement in the probe's headline
+    sentence, produced by a verb that could not see the sign of the number
+    it was attached to.
+
+    :func:`_gap_cell` stays the number formatter: this changes the verb, not
+    the formatting, so ``<0.01`` (moved, too little to round up) still never
+    prints as ``0.00`` (measured, did not move).  The MAGNITUDE is rendered,
+    because the verb already carries the direction and "gains -0.10" is not
+    a sentence.
+    """
+    if delta is None:
+        return f'was never measured on this column ({_NO_MEASUREMENT})'
+    cost = delta * cost_sign
+    if cost == 0:
+        return f'does not move it ({_gap_cell(delta)})'
+    if cost > 0:
+        return f'costs {_gap_cell(abs(delta))}'
+    return f'gains {_gap_cell(abs(delta))}'
+
+
+def _absorption_phrase(flat: Any, selected: Any, *, cost_sign: int) -> str:
     """Does 4004's selected transform absorb the flat read's regrowth cost?
 
-    DERIVED and deliberately COMPARATIVE: it reports which of two measured
-    deltas sits closer to baseline and asserts no threshold on either (gate
+    DERIVED and deliberately COMPARATIVE: it reports how two measured deltas
+    stand relative to each other and asserts no threshold on either (gate
     G6).  The alternative — a typed sentence about what the transform does —
     is a claim that goes stale the first time this generator is rerun, three
     lines above the table that then contradicts it.
+
+    Branches on SIGNED COST (``delta * cost_sign``), NOT on ``abs()``.  The
+    ``abs()`` form was the defect this replaced: distance-from-baseline
+    cannot tell a gain from a loss, so a measured GAIN of 0.0042 and a
+    measured LOSS of 0.0042 came out as "the same distance from baseline" —
+    which is what the committed artifact published for the flat read
+    (+0.0042) against ``promoting_pin`` (-0.0042) on claim recall@5.  Two
+    opposite findings, declared equivalent, in the one sentence a gate
+    reads.  Deriving the sentence (see this function's and
+    :func:`_regrowth_lines`' rationale) is what keeps it from going stale;
+    it is necessary and it was not sufficient — the derivation also has to
+    be sign-correct.
+
+    Not symmetric in its two arguments, on purpose: the flat read and the
+    selected transform play different roles in the sentence, so a call site
+    that transposed them could not be silent.
     """
     if flat is None or selected is None:
         return ('is not comparable on this column — one of the two arms was '
                 'never measured')
-    if flat == 0 and selected == 0:
+    cost_flat = flat * cost_sign
+    cost_selected = selected * cost_sign
+    if cost_flat == 0 and cost_selected == 0:
         return 'had nothing to absorb: neither arm moved on this column'
-    if abs(selected) < abs(flat):
+    if cost_flat <= 0 and cost_selected <= 0:
+        # Both moved AGAINST the cost direction (or one did not move).  Name
+        # both values: a reader told "nothing happened" when both arms GAINED
+        # cannot reconstruct the table from the sentence.
+        return (f'had nothing to absorb — neither arm paid a cost (the flat '
+                f'read moved {_gap_cell(flat)}, the selected transform '
+                f'{_gap_cell(selected)})')
+    if cost_flat <= 0:  # and cost_selected > 0
+        return (f'moved the two arms in opposite directions — the flat read '
+                f'{_cost_phrase(flat, cost_sign=cost_sign)} while the '
+                f'selected transform '
+                f'{_cost_phrase(selected, cost_sign=cost_sign)} '
+                f'({_gap_cell(flat)} against {_gap_cell(selected)}), so there '
+                f'was no flat-read cost for it to absorb')
+    if cost_selected == 0:
+        return (f'absorbs all of it — the selected transform did not move '
+                f'where the flat read '
+                f'{_cost_phrase(flat, cost_sign=cost_sign)} '
+                f'({_gap_cell(selected)} against {_gap_cell(flat)})')
+    if cost_selected < 0:
+        return (f'more than absorbs it, with a sign flip — the flat read '
+                f'{_cost_phrase(flat, cost_sign=cost_sign)} while the '
+                f'selected transform '
+                f'{_cost_phrase(selected, cost_sign=cost_sign)} '
+                f'({_gap_cell(flat)} against {_gap_cell(selected)})')
+    if cost_selected < cost_flat:
         return (f'absorbs part of it ({_gap_cell(selected)} against the flat '
                 f"read's {_gap_cell(flat)})")
-    if abs(selected) == abs(flat):
-        return (f'does not change it ({_gap_cell(selected)}, the same '
-                f'distance from baseline as the flat read)')
-    return (f'does not absorb it — it lands further from baseline '
-            f'({_gap_cell(selected)}) than the flat read ({_gap_cell(flat)})')
+    if cost_selected == cost_flat:
+        return (f'does not change it ({_gap_cell(selected)}, the same cost '
+                f'the flat read paid)')
+    return (f'does not absorb it — it costs more than the flat read did '
+            f'({_gap_cell(selected)} against {_gap_cell(flat)})')
 
 
 def _regrowth_lines(report: dict[str, Any]) -> list[str]:
@@ -2873,19 +2975,29 @@ def _regrowth_lines(report: dict[str, Any]) -> list[str]:
             f'canonical-in-top-5 under this arm.'
         )
 
+    # The verb and the absorption verdict are both DIRECTIONAL claims, so
+    # both go through the metric's declared cost direction.  Hard-typing
+    # either one is what made the committed artifact call a measured GAIN a
+    # cost, and call a gain and a loss of the same magnitude equivalent.
+    recall_sign = _REGROWTH_COST_SIGN[recall]
+    stored_sign = _REGROWTH_COST_SIGN[stored]
     lines += [
         '',
         f'**The signal sentence.**  Under the ratified `{shape}` write '
-        f'shape, one unstamped re-emission per topic costs '
-        f'{_gap_cell(deltas["unstamped"]["flat"][recall])} claim recall@5 '
-        f'and {_gap_cell(deltas["unstamped"]["flat"][stored])} stored '
-        f'canonical-in-top-5 on a flat read.  4004\'s selected transform '
-        f'(`{selected}`) {_absorption_phrase(deltas["unstamped"]["flat"][recall], deltas["unstamped"][selected][recall])} '
+        f'shape, one unstamped re-emission per topic '
+        f'{_cost_phrase(deltas["unstamped"]["flat"][recall], cost_sign=recall_sign)} '
+        f'claim recall@5 and '
+        f'{_cost_phrase(deltas["unstamped"]["flat"][stored], cost_sign=stored_sign)} '
+        f'stored canonical-in-top-5 on a flat read.  4004\'s selected '
+        f'transform (`{selected}`) '
+        f'{_absorption_phrase(deltas["unstamped"]["flat"][recall], deltas["unstamped"][selected][recall], cost_sign=recall_sign)} '
         f'on claim recall@5, and '
-        f'{_absorption_phrase(deltas["unstamped"]["flat"][stored], deltas["unstamped"][selected][stored])} '
-        f'on stored canonical-in-top-5.  Stamped, the same injection costs '
-        f'{_gap_cell(deltas["stamped"]["flat"][recall])} and '
-        f'{_gap_cell(deltas["stamped"]["flat"][stored])} on a flat read.',
+        f'{_absorption_phrase(deltas["unstamped"]["flat"][stored], deltas["unstamped"][selected][stored], cost_sign=stored_sign)} '
+        f'on stored canonical-in-top-5.  Stamped, the same injection '
+        f'{_cost_phrase(deltas["stamped"]["flat"][recall], cost_sign=recall_sign)} '
+        f'and '
+        f'{_cost_phrase(deltas["stamped"]["flat"][stored], cost_sign=stored_sign)} '
+        f'on a flat read.',
         '',
         'Both `canonical in top-5` columns travel together and neither can '
         'be quoted without the other.  The `(stored)` trio is the SCORED '
@@ -4763,6 +4875,33 @@ def _regrowth_metric_keys() -> tuple[str, ...]:
     about what a metric is called or what order the table reports it in.
     """
     return tuple(f'{block}.{key}' for block, key in REGROWTH_METRICS)
+
+
+def _check_regrowth_cost_signs() -> None:
+    """``_REGROWTH_COST_SIGN`` covers exactly ``REGROWTH_METRICS``, or raise.
+
+    Called at import (immediately below), so a metric added to
+    ``REGROWTH_METRICS`` without a declared cost direction fails LOUDLY
+    instead of being silently defaulted to "higher is better" — which is
+    false of ``tokens_per_query.mean`` and ``stored_canonical_median_rank``,
+    the two columns a default would get backwards.
+
+    A raise rather than an ``assert`` so ``python -O`` cannot strip the one
+    check standing between a new metric and a wrong directional claim.
+    """
+    declared = set(_REGROWTH_COST_SIGN)
+    expected = set(_regrowth_metric_keys())
+    if declared != expected:
+        raise RuntimeError(
+            f'_REGROWTH_COST_SIGN does not cover REGROWTH_METRICS: '
+            f'undeclared {sorted(expected - declared)}, '
+            f'unknown {sorted(declared - expected)}. Every regrowth metric '
+            f'must declare which SIGN of its delta is the cost; the signal '
+            f'sentence reads it to choose between "costs" and "gains".'
+        )
+
+
+_check_regrowth_cost_signs()
 
 
 def _pluck_regrowth_metrics(measurement: dict[str, Any]) -> dict[str, Any]:
