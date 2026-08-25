@@ -60,7 +60,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from shared.locking import EXTENSIONLESS_FILENAMES, FILE_EXTENSIONS
+from shared.locking import EXTENSIONLESS_FILENAMES, FILE_EXTENSIONS, is_file_path
 
 # --------------------------------------------------------------------------
 # The three-outcome contract.  These numbers are API: a cron entry or CI lane
@@ -245,4 +245,159 @@ def check_vectors(reify_repo: Path, *, timeout: float = GUARD_TIMEOUT_SECS) -> R
         'exit_code': EXIT_DRIFT,
         'vectors': vectors,
         'detail': '\n'.join(lines),
+    }
+
+
+def tracked_paths(repo_root: Path) -> tuple[list[str], list[str]]:
+    """``(non_gitlink_paths, gitlink_paths)`` for *repo_root*'s tracked corpus.
+
+    ONE parse of the corpus, split by git's OWN mode column, so nothing
+    downstream can disagree about what "the corpus" means.  ``git ls-files -s``
+    (not plain ``ls-files``) is what makes that column available; mode
+    ``160000`` is a submodule gitlink.
+
+    Gitlinks are returned SEPARATELY rather than discarded, matching the
+    rationale already recorded on ``_tracked_entries`` in the in-suite copies:
+    deriving the exclusion from the mode column rather than from hardcoded
+    submodule names means it keeps working the day reify renames or adds one.
+
+    Raises `GuardUnavailable` on a non-zero rc — a directory that is not a
+    checkout did not answer the question, and returning an empty corpus would
+    report a vacuous, confident OK.
+    """
+    result = subprocess.run(
+        ['git', '-C', str(repo_root), 'ls-files', '-s', '-z'],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise GuardUnavailable(
+            f'`git ls-files` in {repo_root} exited {result.returncode} — not a '
+            f'git checkout, so the tracked corpus was never swept.\n'
+            f'  stderr: {result.stderr[:400]!r}'
+        )
+    paths: list[str] = []
+    gitlinks: list[str] = []
+    for entry in result.stdout.split('\0'):
+        if not entry:
+            continue
+        # Format: "<mode> <sha> <stage>\t<path>"
+        meta, _, path = entry.partition('\t')
+        if not path:
+            continue
+        if meta.split(' ', 1)[0] == '160000':
+            gitlinks.append(path)
+        else:
+            paths.append(path)
+    return paths, gitlinks
+
+
+def check_corpus(reify_repo: Path) -> Report:
+    """Sweep reify's tracked corpus and report paths the predicate REJECTS.
+
+    Direction: **corpus -> allowlist**.  This is the failure mode that produced
+    the originating 2026-07-28 incident and the one the vector comparison
+    structurally cannot catch — both repos can agree perfectly on a vector that
+    is missing the same extension.  ``tests/infra/run-all-classification.
+    manifest`` was a genuinely tracked file whose extension was simply absent
+    from the allowlist, so `is_file_path` called it a directory and
+    ``update_task`` rejected the declaration with a LockCharterViolation.
+
+    Findings are keyed by EXTENSION, valued by the FIRST offending tracked path.
+    The actionable unit is the extension — that is what gets allowlisted — and
+    one witness per extension is enough to prove it is real; a reify-scale
+    corpus can carry hundreds of files behind a single missing entry.
+
+    Only DOTTED final segments can produce a finding.  A no-dot segment
+    (``README``) is also rejected by the predicate, but there is no token to
+    allowlist: reporting it under a key of ``''`` would tell the reader to add
+    an empty extension.  Widening ``EXTENSIONLESS_FILENAMES`` is a separate,
+    name-by-name judgement and stays out of this sweep.
+    """
+    try:
+        paths, gitlinks = tracked_paths(Path(reify_repo))
+    except GuardUnavailable as exc:
+        return {
+            'status': _STATUS_BY_EXIT[EXIT_UNAVAILABLE],
+            'exit_code': EXIT_UNAVAILABLE,
+            'findings': {},
+            'detail': (
+                f'tracked-corpus sweep NOT PERFORMED: {exc}  '
+                f'This is not a pass — nothing was swept.'
+            ),
+        }
+
+    findings: dict[str, str] = {}
+    for path in paths:
+        segment = path.rsplit('/', 1)[-1]
+        if '.' not in segment or is_file_path(path):
+            continue
+        findings.setdefault(segment.rsplit('.', 1)[1], path)
+
+    if not findings:
+        return {
+            'status': _STATUS_BY_EXIT[EXIT_OK],
+            'exit_code': EXIT_OK,
+            'findings': {},
+            'detail': (
+                f'every one of {len(paths)} tracked non-gitlink paths in '
+                f'{reify_repo} classifies as a file ({len(gitlinks)} gitlink(s) '
+                f'excluded by mode 160000)'
+            ),
+        }
+
+    lines = [
+        f'{len(findings)} tracked extension(s) in {reify_repo} are REJECTED by '
+        f'is_file_path, so a declaration naming such a path is refused as a '
+        f'directory:'
+    ]
+    lines += [f'  .{ext} — e.g. {path}' for ext, path in sorted(findings.items())]
+    lines.append(
+        'This is a CROSS-REPO MIRROR gap owned by a mirror task: the shared '
+        'allowlist does not cover reify\'s tracked corpus.  It is NOT a fault '
+        'in any dark-factory branch under test.'
+    )
+    return {
+        'status': _STATUS_BY_EXIT[EXIT_DRIFT],
+        'exit_code': EXIT_DRIFT,
+        'findings': findings,
+        'detail': '\n'.join(lines),
+    }
+
+
+#: Severity order for folding part exit codes: an UNAVAILABLE half can never be
+#: masked by an OK (or even a DRIFT) half.  `max` over this ranking rather than
+#: over the raw codes, so the ordering stays explicit and survives any future
+#: renumbering of the constants themselves.
+_SEVERITY = {EXIT_OK: 0, EXIT_DRIFT: 1, EXIT_UNAVAILABLE: 2}
+
+
+def check(reify_repo: Path, *, timeout: float = GUARD_TIMEOUT_SECS) -> Report:
+    """Run both halves and fold them into one report, worst outcome wins.
+
+    Ordering is UNAVAILABLE > DRIFT > OK.  This is the same "absence is never a
+    pass" invariant as the individual halves, applied to composition: a reify
+    checkout can easily have a git index and no guard script, and reporting OK
+    because the half that COULD run agreed would be the silent green of a pytest
+    skip, one level up.  Likewise a drifting half plus an unavailable half is
+    not a complete drift report — the unexamined half may hold worse.
+
+    Both halves ALWAYS run; neither short-circuits the other.  A single
+    invocation should tell the operator everything that is knowable right now,
+    and a report that stopped at the first problem would need re-running to
+    find the second.
+
+    The per-part sub-reports are kept under ``parts`` so a ``--json`` consumer
+    can see exactly WHICH half was unavailable rather than inferring it.
+    """
+    parts = {
+        'vectors': check_vectors(Path(reify_repo), timeout=timeout),
+        'corpus': check_corpus(Path(reify_repo)),
+    }
+    exit_code = max((p['exit_code'] for p in parts.values()), key=lambda c: _SEVERITY[c])
+    return {
+        'status': _STATUS_BY_EXIT[exit_code],
+        'exit_code': exit_code,
+        'parts': parts,
+        'detail': '\n'.join(f'[{name}] {p["detail"]}' for name, p in parts.items()),
     }
