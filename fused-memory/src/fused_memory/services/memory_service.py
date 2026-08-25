@@ -38,6 +38,9 @@ from fused_memory.memory_metadata import (
     validate_memory_metadata,
 )
 from fused_memory.middleware.mem0_update_storm_escalator import Mem0UpdateStormEscalator
+from fused_memory.middleware.referent_repair_storm_escalator import (
+    emit_referent_repair_storm_escalation,
+)
 from fused_memory.models.enums import (
     GRAPHITI_PRIMARY,
     MEM0_PRIMARY,
@@ -2176,6 +2179,23 @@ REFERENT_REPAIR_OUTCOMES: tuple[str, ...] = (
     'repaired', 'unrepairable', 'degenerate', 'failed',
 )
 
+#: CONSECUTIVE episodes whose repair pass moved at least one edge endpoint
+#: before the INV-4 storm alarm fires (task 3672, PRD leaf eta).
+#:
+#: TEN, which is this leaf's resolution of PRD OPEN QUESTION 1, taking the
+#: PRD's own suggested value. Chosen against the measured base rate: ~0.22% of
+#: live task-mentioning edges carry a conflated endpoint, arriving at random.
+#: Ten consecutive episodes each needing a repair is not that distribution by
+#: any reading, so the threshold trades a vanishing false-positive rate for a
+#: detection delay of at most ten writes — the right side of that trade for an
+#: alarm whose subject is a REGRESSION IN THE PRODUCER, which by definition
+#: persists until someone fixes it.
+#:
+#: A LOWER value would page on ordinary clustering (a burst of writes about one
+#: task family legitimately repairs several times running); a HIGHER one buys
+#: nothing, because the condition does not self-heal.
+_REFERENT_REPAIR_STREAK_THRESHOLD: int = 10
+
 
 @dataclass(frozen=True, kw_only=True)
 class ReferentRepair:
@@ -3995,9 +4015,13 @@ class MemoryService:
             repair_stats, endpoint_names, group_id=group_id,
         )
 
-        self._record_referent_repair_pass(
+        streak = self._record_referent_repair_pass(
             stats, repair_stats, group_id=group_id,
         )
+        if streak is not None and streak >= _REFERENT_REPAIR_STREAK_THRESHOLD:
+            await self._escalate_referent_repair_storm(
+                repair_stats, group_id=group_id, streak=streak,
+            )
 
         return repair_stats
 
@@ -4007,7 +4031,7 @@ class MemoryService:
         repair_stats: ReferentRepairStats,
         *,
         group_id: str,
-    ) -> None:
+    ) -> int | None:
         """Fold one completed repair pass into the INV-4 escape hatch.
 
         Two independent things, deliberately kept apart:
@@ -4050,6 +4074,15 @@ class MemoryService:
         refusal, and an infrastructure fault respectively. None of the four is
         evidence that the resolver is producing wrong endpoints, and counting
         any of them would let a FalkorDB outage page as a scanner regression.
+
+        Returns:
+            The group's streak AFTER the increment, when this pass incremented
+            it — i.e. the reading the storm gate thresholds. ``None`` on the
+            other two arms. Returning the value rather than having the caller
+            re-read the dict is what keeps the gate from firing on a pass that
+            merely LEFT a breached streak in place: an episode that checked
+            nothing performs no repair, so it must not re-page an alarm it
+            produced no evidence for.
         """
         self._referent_repair_counts['repaired'] += repair_stats.repaired
         self._referent_repair_counts['flagged_unrepairable'] += (
@@ -4060,11 +4093,119 @@ class MemoryService:
         self._referent_repair_counts['nodes_deleted'] += repair_stats.nodes_deleted
 
         if repair_stats.repaired:
-            self._referent_repair_streaks[group_id] = (
-                self._referent_repair_streaks.get(group_id, 0) + 1
-            )
-        elif stats.endpoints_checked:
+            streak = self._referent_repair_streaks.get(group_id, 0) + 1
+            self._referent_repair_streaks[group_id] = streak
+            return streak
+        if stats.endpoints_checked:
             self._referent_repair_streaks[group_id] = 0
+        return None
+
+    async def _escalate_referent_repair_storm(
+        self,
+        repair_stats: ReferentRepairStats,
+        *,
+        group_id: str,
+        streak: int,
+    ) -> None:
+        """Fire the INV-4 repair-storm alarm for *group_id*.
+
+        THE PREDICATE IS ``streak >= threshold``, NOT ``==``, and the caller
+        spells it inline. Every subsequent breach re-enters here; collapsing a
+        sustained storm to ONE operator entry is the ESCALATOR's job, via its
+        pending-anchor dedupe fold. That is the same division of labour
+        ``merge_liveness`` uses — ``_record_runner_unavailable`` returns
+        ``streak >= threshold`` on every episode and the filing side folds — and
+        it is the robust arrangement: a counter that fired only on the exact
+        boundary would go permanently silent if one breach were ever missed
+        (a filing failure, a restart, a config change to the threshold), and
+        nothing downstream would notice the alarm had been disarmed.
+
+        ``orchestrator.critical_gate.critical_filing_gate`` is the canonical
+        spelling of this predicate and is deliberately NOT imported: fused-memory
+        depends on ``dark-factory-shared`` only, and the sole orchestrator
+        imports anywhere under ``fused_memory/`` are lazy, optional and confined
+        to ``reconciliation/sandbox_guard.py``. Taking a hard dependency on the
+        orchestrator package to reuse a one-line comparison would invert that
+        layering for no gain. INV-5's no-lockstep-duplication concern does not
+        bite here either, because ``>=`` is not a VOCABULARY — there is nothing
+        two sites must agree byte-for-byte about, unlike
+        :data:`REFERENT_REPAIR_OUTCOMES` above, which is exactly why that one
+        does live at a single normative site.
+
+        ``asyncio.to_thread`` IS LOAD-BEARING — do not re-inline the escalation
+        hop. ``EscalationQueue`` construction, its queue-directory scan and its
+        fsync-flushed write are blocking filesystem I/O; called directly from
+        this coroutine they would run ON the event loop and stall every other
+        concurrent memory write for their duration. That warning and its
+        precedent are already recorded on ``_check_memory_metadata`` in this
+        file ("ASYNC ON PURPOSE — do not re-inline the escalation hop"), and the
+        ported module (``middleware/candidate_key_escalation``) carries its
+        never-raise contract over but not its synchronous-caller assumption.
+        It is AWAITED rather than fire-and-forgotten so the call can never
+        outlive the write or be dropped by task GC.
+
+        The per-group IDENTITY LOCK IS STILL HELD across that hop, which is
+        accepted rather than overlooked. It is tolerable because this path runs
+        only at ``streak >= 10`` — an already-anomalous condition, not the
+        steady state — and because it folds to a single ``get_by_task`` read
+        the moment one escalation is open, so a sustained storm does not
+        repeatedly pay for a full filing.
+
+        PROJECT ROOT resolution is ``self._known_projects[group_id]`` and has NO
+        FALLBACK. graphiti's ``group_id`` IS the ``project_id`` (models/scope.py),
+        so that map is the correct and only answer. Falling back to
+        ``config.taskmaster.project_root`` is explicitly forbidden by the mem0
+        storm escalator's docstring and for the reason it gives: that field
+        defaults to ``'.'``, so the fallback files into the SERVER'S CWD, where
+        no operator is watching, and reports success doing it — a silent
+        misfile is strictly worse than a logged refusal, because it also
+        destroys the evidence that the alarm ever fired.
+
+        NEVER RAISES a generic exception. The repairs this is complaining about
+        have already committed to the graph, and this runs inside the reconcile
+        chain of an episode whose write is already durable — failing that chain
+        because the COMPLAINT about it failed would turn a heads-up into an
+        outage. Belt to the escalator's own never-raise braces, matching the
+        guard discipline every best-effort hop in this file uses;
+        ``CancelledError`` / ``KeyboardInterrupt`` / ``SystemExit`` still
+        propagate.
+        """
+        project_root = self._known_projects.get(group_id)
+        if not project_root:
+            # A REFUSAL, never a guess. Structured so the operator who finds
+            # this line has everything the escalation would have carried.
+            logger.warning(
+                'referent repair storm in group_id=%r (streak=%d, threshold=%d, '
+                '%d repair(s) this episode) could NOT be escalated: the group '
+                'is absent from `_known_projects`, so no project queue can be '
+                'resolved. Not falling back to config.taskmaster.project_root '
+                '(it defaults to the server cwd, where nobody is watching). '
+                'Repairs continue. Records: %s',
+                group_id, streak, _REFERENT_REPAIR_STREAK_THRESHOLD,
+                repair_stats.repaired,
+                [r.to_dict() for r in repair_stats.repairs],
+            )
+            return
+
+        try:
+            await asyncio.to_thread(
+                emit_referent_repair_storm_escalation,
+                project_root,
+                project_id=group_id,
+                streak=streak,
+                threshold=_REFERENT_REPAIR_STREAK_THRESHOLD,
+                repairs=repair_stats.repaired,
+                records=[r.to_dict() for r in repair_stats.repairs],
+            )
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            logger.warning(
+                'referent repair storm alarm for group_id=%r (streak=%d) could '
+                'not be filed; the repairs themselves already committed and are '
+                'unaffected',
+                group_id, streak, exc_info=True,
+            )
 
     async def _cleanup_emptied_nodes(
         self,
