@@ -533,6 +533,15 @@ class TestWriteTriageLeavesAreGreenTier:
         'write_triage.t_high',
         'write_triage.t_low',
         'write_triage.calibration_report_path',
+        # Operator knobs (task 3127, PRD leaf beta), green-tier for a
+        # DIFFERENT reason than their calibrated siblings above. `enabled` is
+        # the staged-rollout kill switch: it is what an operator flips to stop
+        # an in-flight triage incident, and a restart-only kill switch is no
+        # kill switch (the mem0_update.enabled lesson, reload.py). `candidate_k`
+        # is the retrieval width, tuned against measured recall on a running
+        # server rather than by redeploying.
+        'write_triage.enabled',
+        'write_triage.candidate_k',
     )
 
     @pytest.mark.parametrize('path', PATHS)
@@ -545,6 +554,8 @@ class TestWriteTriageLeavesAreGreenTier:
             ('write_triage.t_high', 0.87),
             ('write_triage.t_low', 0.61),
             ('write_triage.calibration_report_path', 'calibration/report.json'),
+            ('write_triage.enabled', True),
+            ('write_triage.candidate_k', 37),
         ],
     )
     def test_changed_leaf_lands_in_applied_candidates(self, path, new_value):
@@ -552,7 +563,15 @@ class TestWriteTriageLeavesAreGreenTier:
         fresh = FusedMemoryConfig()
         field = path.split('.', 1)[1]
         old = getattr(live.write_triage, field)
-        assert old is None, 'the uncalibrated default is None'
+        # The precondition this needs is only that the leaf actually CHANGES —
+        # diff_config reports nothing otherwise and the lookup below raises
+        # KeyError on a test that is not about that. It used to be spelled
+        # `old is None`, which stopped being true of the whole section when the
+        # operator knobs landed with real defaults (there is no such thing as
+        # an uncalibrated kill switch). The `defaults to None` invariant for
+        # the three CALIBRATED fields is pinned where it belongs, in
+        # test_config_schema.py::TestWriteTriageConfig.
+        assert old != new_value, f'{path} must actually change for this to assert anything'
         object.__setattr__(fresh.write_triage, field, new_value)
 
         d = diff_config(live, fresh)

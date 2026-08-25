@@ -2167,8 +2167,11 @@ class WriteTriageConfig(BaseModel):
     of reconciliation, move these two fields to a dedicated server-owned config
     section instead of assuming colocation implies subsystem ownership") —
     write triage IS that growth, so the bands land here rather than accreting
-    onto the reconciliation submodel. PRD leaf beta adds `write_triage_enabled`
-    to this same section.
+    onto the reconciliation submodel. PRD leaf beta added that staged-rollout
+    flag to this same section, spelled `enabled` (dotted path
+    `write_triage.enabled`, matching the `mem0_update.enabled` sibling in
+    config/reload.py) — the PRD calls it `write_triage_enabled`, which is the
+    same knob under its cross-reference name.
 
     Declared on FusedMemoryConfig as a BARE (non-Optional) submodel so
     config/reload.py's `_iter_leaves` descends into per-leaf paths. An
@@ -2176,9 +2179,55 @@ class WriteTriageConfig(BaseModel):
     restart_required entry (esc-2718-1), which would force a server restart
     for every calibration run.
 
-    Every field defaults to None, and that is load-bearing: None means
+    Every CALIBRATED BAND field (t_high, t_low, calibration_report_path,
+    t_high_by_category) defaults to None, and that is load-bearing: None means
     UNCALIBRATED, which the triage router must read as fail-open to `stored`.
+    The two OPERATOR KNOBS below (`enabled`, `candidate_k`) deliberately do
+    NOT follow that rule — they are hand-set and ship with real defaults,
+    because there is no such thing as an uncalibrated kill switch, and a
+    retrieval width of None would have no fail-open reading at all.
     """
+
+    enabled: bool = Field(
+        default=False,
+        description=(
+            'Staged-rollout flag for add_memory write triage — the PRD\'s '
+            '`write_triage_enabled` (D10). While False the two reject guards in '
+            'server/tools.py::add_memory run exactly as they do today and no '
+            'triage code executes. While True those guards RETIRE for the write '
+            'and it is routed redirect-not-reject: a restatement becomes a '
+            'sighting child of its canonical instead of a rejection. Ships FALSE '
+            'and stays False until the flip gate (task 3169) — the judge (leaf '
+            'gamma) has to land first, and until it does the middle band is '
+            'answered by a deliberate stub. This is also the one lever that '
+            'stops an in-flight triage incident, which is why it is green-tier '
+            'hot-reloadable rather than restart-only: read live off '
+            'memory_service.config.write_triage on every write, never captured '
+            'at construction.'
+        ),
+    )
+    candidate_k: int = Field(
+        default=20,
+        ge=1,
+        description=(
+            'How many candidates the triage retrieval asks for. This is a WIDTH, '
+            'NOT a threshold: it is the rank property that caps what any band '
+            'can achieve, because a candidate that never enters the result set '
+            'cannot be scored by t_high or t_low at all. The 20 default is the '
+            'measured 69.4% same-category recall point on the live corpus (26.1% '
+            '@5, 43.9% @10, 69.4% @20, 88.5% @50) — deliberately NOT the retired '
+            "near-dup guard's hardcoded limit=5, at which three quarters of the "
+            'duplicates triage exists to catch are invisible to it. Note the '
+            'count is a TOTAL across the three Mem0-primary categories, so '
+            'effective per-category depth is lower than k. If calibration (task '
+            '3199 / leaf gamma) shows recall rather than the thresholds is the '
+            'binding constraint, 20-50 is where the remaining recall lives. '
+            'Bounded ge=1 so a 0 cannot silently disable retrieval — that would '
+            'read as "no comparable candidate" on every write and route '
+            'everything to `stored` with nothing logged. Green-tier '
+            'hot-reloadable, read live per write.'
+        ),
+    )
 
     t_high: float | None = Field(
         default=None,
