@@ -7272,6 +7272,7 @@ class TaskWorkflow:
                 ),
                 suggested_action='manual_intervention',
                 level=2,
+                filing_claimant_run_id=self._filing_claimant_run_id,
             )
             self.escalation_queue.submit(esc)
         except Exception:
@@ -8996,6 +8997,7 @@ class TaskWorkflow:
             suggested_action='verify_wip_reconciliation',
             worktree=str(self.worktree) if self.worktree else None,
             workflow_state=self.state.value,
+            filing_claimant_run_id=self._filing_claimant_run_id,
         )
         self.escalation_queue.submit(esc)
 
@@ -11282,6 +11284,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 suggested_action='main_health_auto_heal_in_flight',
                 worktree=str(self.worktree) if self.worktree else None,
                 workflow_state=self.state.value,
+                filing_claimant_run_id=self._filing_claimant_run_id,
             )
             if fp:
                 esc.dedupe_fingerprint = fp
@@ -12123,6 +12126,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     workflow_state=self.state.value,
                     level=1,
                     train_state=train_state,  # type: ignore[arg-type]
+                    filing_claimant_run_id=self._filing_claimant_run_id,
                 )
                 self.escalation_queue.submit(esc)
                 logger.warning(
@@ -12323,6 +12327,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             worktree=str(self.worktree) if self.worktree else None,
             workflow_state=self.state.value,
             train_state=train_state,  # type: ignore[arg-type]
+            filing_claimant_run_id=self._filing_claimant_run_id,
         )
         self._submit_halt_owning_escalation(esc)
         logger.info(
@@ -12380,6 +12385,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 worktree=str(self.worktree) if self.worktree else None,
                 workflow_state=self.state.value,
                 train_state=train_state,  # type: ignore[arg-type]
+                filing_claimant_run_id=self._filing_claimant_run_id,
             )
             self.escalation_queue.submit(esc)
         except Exception:
@@ -12424,6 +12430,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 level=1,
                 worktree=str(self.worktree) if self.worktree else None,
                 workflow_state=self.state.value,
+                filing_claimant_run_id=self._filing_claimant_run_id,
             )
             await self._submit_halt_escalation_and_wait(esc)
             logger.info(f'Task {self.task_id}: WIP conflict resolved — retrying merge')
@@ -12468,6 +12475,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 level=1,
                 worktree=str(self.worktree) if self.worktree else None,
                 workflow_state=self.state.value,
+                filing_claimant_run_id=self._filing_claimant_run_id,
             )
             await self._submit_halt_escalation_and_wait(esc)
             logger.info(f'Task {self.task_id}: WIP recovery escalation resolved')
@@ -14763,6 +14771,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             suggested_action='investigate_and_retry',
             worktree=str(self.worktree) if self.worktree else None,
             workflow_state=self.state.value,
+            filing_claimant_run_id=self._filing_claimant_run_id,
         )
         self.escalation_queue.submit(esc)
         if self.event_store:
@@ -14852,6 +14861,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             suggested_action='install_sandbox_backend_or_set_backend_none',
             worktree=str(self.worktree) if self.worktree else None,
             workflow_state=self.state.value,
+            filing_claimant_run_id=self._filing_claimant_run_id,
         )
         self.escalation_queue.submit(esc)
         if self.event_store:
@@ -15169,6 +15179,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             suggested_action='investigate_and_retry',
             worktree=str(self.worktree) if self.worktree else None,
             workflow_state=self.state.value,
+            filing_claimant_run_id=self._filing_claimant_run_id,
         )
         self.escalation_queue.submit(esc)
         if self.event_store:
@@ -15204,6 +15215,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             suggested_action='investigate_log_corruption',
             worktree=str(self.worktree) if self.worktree else None,
             workflow_state=self.state.value,
+            filing_claimant_run_id=self._filing_claimant_run_id,
         )
         self.escalation_queue.submit(esc)
 
@@ -15364,6 +15376,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 worktree=str(self.worktree) if self.worktree else None,
                 workflow_state=self.state.value,
                 level=1,
+                filing_claimant_run_id=self._filing_claimant_run_id,
             )
             self.escalation_queue.submit(l1)
             if self.event_store:
@@ -15698,6 +15711,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     suggested_action=suggested_action,
                     worktree=str(self.worktree) if self.worktree else None,
                     workflow_state=self.state.value,
+                    filing_claimant_run_id=self._filing_claimant_run_id,
                 )
                 if dedupe_fingerprint:
                     # Cross-task N->1 dedup: stamp the fingerprint and route
@@ -16170,6 +16184,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             level=1,
             train_state=train_state,
             root_cause=root_cause,
+            filing_claimant_run_id=self._filing_claimant_run_id,
         )
         self.escalation_queue.submit(esc)
         if self.event_store:
@@ -16612,6 +16627,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             suggested_action='triage_suggestions',
             worktree=str(self.worktree) if self.worktree else None,
             workflow_state=self.state.value,
+            filing_claimant_run_id=self._filing_claimant_run_id,
         )
         self.escalation_queue.submit(esc)
         if self.event_store:
@@ -16651,6 +16667,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             suggested_action='fix_review_issues',
             worktree=str(self.worktree) if self.worktree else None,
             workflow_state=self.state.value,
+            filing_claimant_run_id=self._filing_claimant_run_id,
         )
         self.escalation_queue.submit(esc)
         if self.event_store:
