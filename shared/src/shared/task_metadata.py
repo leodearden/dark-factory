@@ -916,11 +916,19 @@ _WHOLE_METADATA_FIELD = '<metadata>'
 # depend on but that are not (yet) typed TaskMetadata fields. Skipped in
 # parse_metadata's unknown-key scan below so a deliberate, documented
 # convention doesn't manufacture unknown_key census noise — extra='allow'
-# still preserves each value byte-for-value (I1). None of these collide with
-# TaskMetadata.model_fields or _SUBMODEL_REGISTRY (only 'milestone' is
-# currently registered there). gate_escalated_at / before_done_ran_at /
-# before_done_verified_at / before_done_verified_pid are the
-# DeterministicRunner's own stamps (CLAUDE.md "Deterministic task kind").
+# still preserves each value byte-for-value (I1). Blessed keys are NORMALLY
+# disjoint from TaskMetadata.model_fields and _SUBMODEL_REGISTRY — a typed
+# field or a registered submodel already suppresses unknown_key via
+# known_fields, so blessing it too would be redundant. 'recurrence' is the
+# one deliberate overlap: task 4676 / PRD
+# docs/prds/recurring-deterministic-tasks.md R-D4 specifies both, so the key
+# stays suppressed if its registration is ever moved or made lazy, and so
+# migrate_task_metadata_to_x_namespace.py refuses to x_-namespace it, which
+# for a submodel-backed key with live readers is the correct refusal.
+#
+# gate_escalated_at / before_done_ran_at / before_done_verified_at /
+# before_done_verified_pid are the DeterministicRunner's own stamps
+# (CLAUDE.md "Deterministic task kind").
 #
 # Tier-B alias-drift keys (prd/prd_ref/prd_leaf, inv, related_task*) and
 # Tier-C ad-hoc/timestamped one-off keys are deliberately NOT included here
@@ -1052,6 +1060,10 @@ _BLESSED_METADATA_KEYS: frozenset[str] = frozenset(
         # against a live reader — renaming it on one task would fork the
         # vocabulary and be re-added on the next block.
         'last_blocked_at',
+        # recurrence (task 4676, PRD docs/prds/recurring-deterministic-tasks.md
+        # R-D4) is the ONE blessed key that is also a registered submodel — see
+        # the header note above on why the overlap is deliberate.
+        'recurrence',
     }
 )
 
