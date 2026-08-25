@@ -1284,6 +1284,38 @@ def is_wholly_preexisting(branch: Iterable[str], baseline: Iterable[str]) -> boo
 _BASELINE_FAILING_IDS_CACHE: dict[str, tuple[float, frozenset[str]]] = {}
 
 
+# Process-wide cache for the per-main-SHA SKIPPED-test-id baseline (task
+# 3226).  Deliberately a PARALLEL dict rather than a widened
+# _BASELINE_FAILING_IDS_CACHE value tuple: that tuple's 2-element shape is
+# unpacked directly by callers and tests (see
+# orchestrator/tests/test_merge_queue_main_health.py), and seed_main_baseline
+# keeps its two-argument signature.
+#
+# WHY a second baseline at all: the failing baseline can only say "id X was
+# red on main".  Its ABSENCE is ambiguous — it conflates "main RAN X and it
+# passed" (evidence the branch broke it) with "main NEVER RAN X" (evidence of
+# nothing at all).  Only the first licenses the confident task-fault verdict
+# in verify_failure_is_preexisting_on_main's id-diff fast path.  This cache
+# holds the second population so the two can be told apart; see the
+# 2026-07-29 reify-allowlist incident, where a sibling repo's mutable state
+# made a whole guard skip on one side of a comparison and pass-shaped on the
+# other.
+# Key: main_sha; Value: (seeded_or_probed_at, skipped_test_ids frozenset).
+_BASELINE_SKIPPED_IDS_CACHE: dict[str, tuple[float, frozenset[str]]] = {}
+
+
+def seed_main_baseline_skipped(main_sha: str, ids: Iterable[str]) -> None:
+    """Seed (or refresh) the per-main-SHA SKIPPED-id baseline cache.
+
+    Mirror of :func:`seed_main_baseline` for the skipped population, with the
+    same monotonic-timestamp value shape and the same
+    :data:`_PROBE_CACHE_TTL` discipline.  Seeded from the SAME bare-main probe
+    that seeds the failing side (see :func:`main_baseline_failing_ids`), so
+    the two caches always agree about which shas have been probed.
+    """
+    _BASELINE_SKIPPED_IDS_CACHE[main_sha] = (time.monotonic(), frozenset(ids))
+
+
 def seed_main_baseline(main_sha: str, ids: Iterable[str]) -> None:
     """Seed (or refresh) the per-main-SHA failing-id baseline cache for free.
 
@@ -1379,6 +1411,15 @@ async def main_baseline_failing_ids(
 
             ids = frozenset(probe_result.failing_test_ids)
             seed_main_baseline(main_sha, ids)
+            # Task 3226: the SAME probe seeds the parallel SKIPPED baseline.
+            # A skipped_test_ids of None (this probe collected a junit report
+            # — the B3 early return above already handled the no-junit case —
+            # but nothing was skipped, or an older result shape) seeds EMPTY
+            # rather than leaving the skipped side unseeded, so the two caches
+            # never disagree about which shas were probed at all.  Leaving it
+            # unseeded would make a cache-only peek read "main skipped
+            # nothing" as "main was never probed".
+            seed_main_baseline_skipped(main_sha, probe_result.skipped_test_ids or ())
             return ids
 
     except EphemeralWorktreeError as e:
@@ -1403,6 +1444,37 @@ def cached_main_baseline_failing_ids(main_sha: str) -> 'frozenset[str] | None':
     probes on a miss), this helper only ever reads.
     """
     _cached = _BASELINE_FAILING_IDS_CACHE.get(main_sha)
+    if _cached is None:
+        return None
+    _cached_at, _cached_ids = _cached
+    if time.monotonic() - _cached_at >= _PROBE_CACHE_TTL:
+        return None
+    return _cached_ids
+
+
+def cached_main_baseline_skipped_ids(main_sha: str) -> 'frozenset[str] | None':
+    """Cache-ONLY peek at the per-main-SHA SKIPPED-id baseline — never probes.
+
+    Mirror of :func:`cached_main_baseline_failing_ids` for the skipped
+    population: pure, synchronous, side-effect-free, TTL-bounded by
+    :data:`_PROBE_CACHE_TTL`.
+
+    Read the return values precisely — the whole point of this cache is that
+    they are NOT interchangeable:
+
+    - ``None``      — this sha was never probed (or the entry aged out).  We
+                      know nothing; no verdict may be derived from it.
+    - ``frozenset()`` — main WAS probed and skipped nothing.
+    - non-empty     — main NEVER RAN these tests.  Their absence from the
+                      failing baseline is therefore not evidence that the
+                      branch broke them.
+
+    Used on the critical path by ``verify_failure_is_preexisting_on_main``'s
+    id-diff fast path and by ``merge_queue._run_post_merge_verify``'s
+    branch-block reason enrichment, both of which must NEVER trigger a probe
+    (G4, task 2564) — hence cache-only.
+    """
+    _cached = _BASELINE_SKIPPED_IDS_CACHE.get(main_sha)
     if _cached is None:
         return None
     _cached_at, _cached_ids = _cached

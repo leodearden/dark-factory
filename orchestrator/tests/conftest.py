@@ -692,6 +692,12 @@ def _clear_probe_cache():
     silently serve a later test's ``main_baseline_failing_ids`` call from
     cache instead of exercising its own probe/seed path).
 
+    ``_BASELINE_SKIPPED_IDS_CACHE`` (task 3226) is the PARALLEL per-main-SHA
+    SKIPPED-test-id baseline, seeded from the same probe and keyed the same
+    way — same hazard, and additionally a leaked skipped baseline would make
+    the id-diff fast path in ``verify_failure_is_preexisting_on_main`` treat
+    another test's ids as unattributable.
+
     Clearing the caches before *and* after each test ensures:
     - every test starts with empty caches regardless of prior teardown;
     - this suite's pollution cannot escape to any later consumer.
@@ -703,15 +709,17 @@ def _clear_probe_cache():
     If ``orchestrator/src/orchestrator/verify.py`` gains additional
     module-level caches (e.g. a sibling result cache), add a matching
     ``.clear()`` call here so they are also reset between tests.  The
-    relevant globals are defined near ``_PROBE_CACHE``/``_PROBE_CACHE_TTL``
-    and ``_BASELINE_FAILING_IDS_CACHE``.
+    relevant globals are defined near ``_PROBE_CACHE``/``_PROBE_CACHE_TTL``,
+    ``_BASELINE_FAILING_IDS_CACHE`` and ``_BASELINE_SKIPPED_IDS_CACHE``.
     """
     from orchestrator import verify
     verify._PROBE_CACHE.clear()
     verify._BASELINE_FAILING_IDS_CACHE.clear()
+    verify._BASELINE_SKIPPED_IDS_CACHE.clear()
     yield
     verify._PROBE_CACHE.clear()
     verify._BASELINE_FAILING_IDS_CACHE.clear()
+    verify._BASELINE_SKIPPED_IDS_CACHE.clear()
 
 
 @pytest.fixture(autouse=True)
