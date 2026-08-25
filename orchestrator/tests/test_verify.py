@@ -1917,6 +1917,161 @@ class TestExtractFailingTestIdsFromJunit:
         ]
 
 
+class TestExtractSkippedTestIdsFromJunit:
+    """``_extract_skipped_test_ids_from_junit(path)`` — the SKIPPED half of the same report.
+
+    Task 3226.  The failing parser above deliberately excludes ``<skipped>``,
+    and that exclusion is correct — a skipped test did not fail.  But it leaves
+    ``main_baseline_failing_ids`` recording only what main FAILED, so nothing
+    downstream can tell "main RAN this test and it passed" apart from "main
+    never ran it at all".  Only the first supports the confident task-fault
+    conclusion the id-diff fast path in ``verify_failure_is_preexisting_on_main``
+    draws from it; from the second, the honest answer is "unknown".
+
+    This parser supplies the missing half.  Same file, same traversal, same id
+    composition — only the selection predicate differs — so the two vectors are
+    directly comparable and cannot drift on what an "id" means.
+
+    RED today: the helper does not exist yet.
+    """
+
+    # DELIBERATELY the same fixture the failing parser's class uses, verbatim.
+    # The point of the partition assertion below is that ONE report yields two
+    # disjoint vectors; a separate fixture could drift and make that claim
+    # vacuous.
+    _JUNIT_XML = TestExtractFailingTestIdsFromJunit._JUNIT_XML
+
+    def test_returns_sorted_deduped_ids_for_skipped_only(self, tmp_path: Path):
+        junit_path = tmp_path / 'junit.xml'
+        junit_path.write_text(self._JUNIT_XML)
+
+        ids = verify._extract_skipped_test_ids_from_junit(junit_path)
+
+        assert ids == ['tests.test_sample::test_skip'], (
+            f'expected only the <skipped> cases, sorted+deduped; got {ids!r}'
+        )
+
+    def test_the_two_parsers_partition_one_report(self, tmp_path: Path):
+        """Failing and skipped are DISJOINT, and neither swallows the other.
+
+        The pinned exclusion of ``<skipped>`` from the failing side must remain
+        green and unmoved: widening it would misreport a skip as a failure,
+        which is a strictly worse error than the one this task fixes — it would
+        manufacture a main-health red out of a test main deliberately declined
+        to run.
+        """
+        junit_path = tmp_path / 'junit.xml'
+        junit_path.write_text(self._JUNIT_XML)
+
+        failing = verify._extract_failing_test_ids_from_junit(junit_path)
+        skipped = verify._extract_skipped_test_ids_from_junit(junit_path)
+
+        assert failing == ['tests.test_sample::test_error', 'tests.test_sample::test_fail']
+        assert skipped == ['tests.test_sample::test_skip']
+        assert set(failing or []).isdisjoint(skipped or [])
+        assert 'tests.test_sample::test_pass' not in (failing or []) + (skipped or []), (
+            'a passing testcase belongs to NEITHER vector — that is exactly the '
+            'state the id-diff fast path may draw a confident conclusion from'
+        )
+
+    def test_nothing_skipped_returns_empty_list_not_none(self, tmp_path: Path):
+        """``[]`` is "junit collected, zero skipped" and is NOT the same as ``None``.
+
+        The distinction is the whole mechanism: ``[]`` licenses the downstream
+        conclusion "main ran everything", while ``None`` means the report is
+        missing and nothing may be concluded from its absence.
+        """
+        junit_path = tmp_path / 'junit.xml'
+        junit_path.write_text(
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            '<testsuites><testsuite name="pytest" tests="1">'
+            '<testcase classname="tests.test_sample" name="test_pass" time="0.001" />'
+            '</testsuite></testsuites>\n'
+        )
+
+        assert verify._extract_skipped_test_ids_from_junit(junit_path) == []
+
+    def test_bare_testsuite_root_is_handled(self, tmp_path: Path):
+        """Both ``<testsuites><testsuite>`` and a bare ``<testsuite>`` root work.
+
+        ``root.iter('testcase')`` rather than a fixed path, matching the failing
+        parser: a writer that omits the ``<testsuites>`` wrapper must not
+        silently yield an empty vector, which would read as "nothing skipped".
+        """
+        junit_path = tmp_path / 'junit.xml'
+        junit_path.write_text(
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            '<testsuite name="pytest" tests="1">'
+            '<testcase classname="tests.test_sample" name="test_skip">'
+            '<skipped message="no reify checkout" type="pytest.skip" />'
+            '</testcase></testsuite>\n'
+        )
+
+        assert verify._extract_skipped_test_ids_from_junit(junit_path) == [
+            'tests.test_sample::test_skip',
+        ]
+
+    def test_falls_back_to_file_then_bare_name_for_the_id(self, tmp_path: Path):
+        """Identical id composition to the failing parser — classname, then file, then name.
+
+        Load-bearing rather than symmetry for its own sake: the two vectors are
+        SET-DIFFERENCED against each other downstream, so any divergence in how
+        an id is spelled would silently make every comparison miss.
+        """
+        junit_path = tmp_path / 'junit.xml'
+        junit_path.write_text(
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            '<testsuites><testsuite name="pytest">'
+            '<testcase file="tests/test_x.py" name="test_by_file">'
+            '<skipped message="s" /></testcase>'
+            '<testcase name="test_bare"><skipped message="s" /></testcase>'
+            '</testsuite></testsuites>\n'
+        )
+
+        assert verify._extract_skipped_test_ids_from_junit(junit_path) == [
+            'test_bare',
+            'tests/test_x.py::test_by_file',
+        ]
+
+    def test_duplicate_ids_across_testsuites_are_deduplicated(self, tmp_path: Path):
+        junit_path = tmp_path / 'junit.xml'
+        junit_path.write_text(
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            '<testsuites>'
+            '<testsuite name="pytest"><testcase classname="tests.test_sample" name="test_skip">'
+            '<skipped message="x" /></testcase></testsuite>'
+            '<testsuite name="pytest-rerun"><testcase classname="tests.test_sample" name="test_skip">'
+            '<skipped message="x" /></testcase></testsuite>'
+            '</testsuites>\n'
+        )
+
+        assert verify._extract_skipped_test_ids_from_junit(junit_path) == [
+            'tests.test_sample::test_skip',
+        ]
+
+    def test_nonexistent_path_returns_none(self, tmp_path: Path):
+        """No junit collected — the B3 degrade signal, and NOT "nothing was skipped".
+
+        Returning ``[]`` here would be the very conflation this task closes, one
+        layer down: it would license the downstream "main ran everything"
+        conclusion from a report that was never written.
+        """
+        assert verify._extract_skipped_test_ids_from_junit(tmp_path / 'missing.xml') is None
+
+    def test_malformed_xml_returns_none(self, tmp_path: Path):
+        junit_path = tmp_path / 'junit.xml'
+        junit_path.write_text('not valid xml <<<')
+
+        assert verify._extract_skipped_test_ids_from_junit(junit_path) is None
+
+    def test_empty_file_returns_none(self, tmp_path: Path):
+        junit_path = tmp_path / 'junit.xml'
+        junit_path.write_text('')
+
+        assert verify._extract_skipped_test_ids_from_junit(junit_path) is None
+
+
+
 # ---------------------------------------------------------------------------
 # Task μ (verify-scope-inversion-prd.md) step-05: VerifyResult.failing_test_ids
 # — a plain JSON-native `list[str] | None` (mirrors the `contention` (task
