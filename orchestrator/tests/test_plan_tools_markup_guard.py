@@ -64,7 +64,13 @@ from escalation.models import Escalation
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
 from shared.mcp_markup_middleware import MarkupGuardMiddleware, RepairPolicy
-from shared.toolcall_markup import ENVELOPE_LITERALS, MARKUP_OVERRIDE_KEY, detect, repair
+from shared.toolcall_markup import (
+    ENVELOPE_LITERALS,
+    MARKUP_OVERRIDE_KEY,
+    detect,
+    detect_for,
+    repair,
+)
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.mcp import plan_tools
@@ -744,7 +750,17 @@ class TestUnrepairableResidueIsPreserved:
     async def test_the_residue_record_carries_the_caller_payload_verbatim(
         self, monkeypatch, artifacts: TaskArtifacts
     ):
-        """(b) INV-7's contracted keys, and the only surviving copy of the data."""
+        """(b) INV-7's contracted keys, and the only surviving copy of the data.
+
+        ``matched_pattern`` is the SCAN's pattern, not a repair's. On the
+        reject and forward paths the two coincide; here ``repair`` returned
+        ``None``, so there is no ``Repair`` to read one off and the guard
+        publishes what ``_first_markup_argument`` actually matched on --
+        ``detect_for(value, param)`` since task 4696 widened it. Asserting
+        the blanket ``detect`` here would name a literal that merely TRAILS
+        the leak (PRD 2.2) and would disagree with the fact for the same
+        event, which already carries the widened value.
+        """
         rig = build_residue_rig(monkeypatch, artifacts)
         await rig.harness.seed_plan()
 
@@ -758,7 +774,7 @@ class TestUnrepairableResidueIsPreserved:
         assert record['level'] == 2
         assert record['tool'] == 'add_design_decision'
         assert record['field'] == 'decision'
-        assert record['matched_pattern'] == detect(UNREPAIRABLE_DECISION)
+        assert record['matched_pattern'] == detect_for(UNREPAIRABLE_DECISION, 'decision')
         assert record['raw_value'] == UNREPAIRABLE_DECISION
 
     @pytest.mark.asyncio
@@ -913,6 +929,15 @@ class TestUnrepairableResidueIsPreserved:
 
         The refusal is already decided before escalation is attempted, so every
         failure mode degrades to a logged ``None`` plus an unchanged payload.
+
+        ``matched_pattern`` is the SCAN's pattern, not a repair's. On the
+        reject and forward paths the two coincide; here ``repair`` returned
+        ``None``, so there is no ``Repair`` to read one off and the guard
+        publishes what ``_first_markup_argument`` actually matched on --
+        ``detect_for(value, param)`` since task 4696 widened it. Asserting
+        the blanket ``detect`` here would name a literal that merely TRAILS
+        the leak (PRD 2.2) and would disagree with the fact for the same
+        event, which already carries the widened value.
         """
         queue = _FakeQueue(submit_error=OSError('queue is unwritable'))
         rig = build_residue_rig(monkeypatch, artifacts, queue)
@@ -923,7 +948,9 @@ class TestUnrepairableResidueIsPreserved:
         )
 
         assert payload['error_type'] == 'mcp_markup_unrepairable'
-        assert payload['matched_pattern'] == detect(UNREPAIRABLE_DECISION)
+        assert payload['matched_pattern'] == detect_for(
+            UNREPAIRABLE_DECISION, 'decision'
+        )
         assert payload['escalation_id'] is None, (
             'the caller is better told nothing than pointed at a record that '
             'was never written'
