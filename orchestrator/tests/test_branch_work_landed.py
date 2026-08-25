@@ -36,6 +36,7 @@ The boundary rows the scenario builders below exist to construct:
 
 from __future__ import annotations
 
+import inspect
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -49,6 +50,13 @@ from _orch_helpers import (
 
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import GitOps
+from orchestrator.landing_evidence import (
+    LandingMethod,
+    LandingReason,
+    LandingVerdict,
+    branch_work_landed,
+    format_unattributed_landing_detail,
+)
 
 TASK_ID = '4647'
 BRANCH = f'task/{TASK_ID}'
@@ -555,3 +563,185 @@ class TestBoundaryFixtures:
             _Repo(nested)
         # And the ceiling is really set on the guarded wrapper's environment.
         assert 'GIT_CEILING_DIRECTORIES' in _Repo(git_repo)._env
+
+
+# --------------------------------------------------------------------------
+# The producer's public shape, and the two headline boundary rows (step-05).
+# --------------------------------------------------------------------------
+
+
+class TestBranchWorkLandedSignature:
+    """``branch_work_landed``'s public shape, pinned mechanically.
+
+    ``metadata`` is a documented WIDENING of the PRD Contract's sketched
+    signature: boundary row B6 needs ``branch_base_sha``, which the sketched
+    four-argument form cannot supply.  ``escalation_queue`` is the seam the G7
+    storm-escape L1 is filed through.  Both are keyword-only and defaulted, so
+    a caller that knows neither still gets exactly the Contract's behaviour.
+    """
+
+    def test_signature_is_the_contract_shape(self) -> None:
+        params = inspect.signature(branch_work_landed).parameters
+        assert list(params) == [
+            'git_ops', 'task_id', 'branch',
+            'branch_tip_sha', 'metadata', 'escalation_queue',
+        ]
+        for name in ('git_ops', 'task_id', 'branch'):
+            assert params[name].kind is inspect.Parameter.POSITIONAL_OR_KEYWORD, name
+        for name in ('branch_tip_sha', 'metadata', 'escalation_queue'):
+            assert params[name].kind is inspect.Parameter.KEYWORD_ONLY, name
+        # branch_tip_sha is required-by-keyword: a caller must SAY whether it
+        # already observed a tip, so the producer never silently re-reads a ref
+        # that other checks were already anchored on (the task-3103 hazard
+        # branch_is_degenerate documents).
+        assert params['branch_tip_sha'].default is inspect.Parameter.empty
+        assert params['metadata'].default is None
+        assert params['escalation_queue'].default is None
+
+    def test_it_is_a_coroutine_function(self) -> None:
+        assert inspect.iscoroutinefunction(branch_work_landed)
+
+
+@pytest.mark.asyncio
+class TestB3RebaseLanding:
+    """B3 — work replayed onto main with rewritten shas and NO citation.
+
+    THE headline row.  This is the shape the existing citation-based and
+    effect-present detectors cannot see at all, and the whole reason the PRD
+    asks for a patch-id producer: ``find_task_citation_commit`` has nothing to
+    find, yet every branch commit is present in main as an equivalent patch.
+    """
+
+    async def test_rebase_landing_is_accepted_by_patch_id(
+        self, git_ops: GitOps, repo: _Repo,
+    ) -> None:
+        sc = build_rebased_landing(repo)
+        verdict = await branch_work_landed(
+            git_ops, TASK_ID, sc.branch, branch_tip_sha=sc.branch_tip_sha,
+        )
+        assert isinstance(verdict, LandingVerdict)
+        assert verdict.accepted is True
+        assert verdict.reason is LandingReason.landed
+        assert verdict.method is LandingMethod.patch_id
+
+    async def test_evidence_sha_is_main_reachable_and_never_a_fallback(
+        self, git_ops: GitOps, repo: _Repo,
+    ) -> None:
+        """Contract invariant 3, in its three separately-checkable halves.
+
+        Main is advanced by one unrelated commit AFTER the replay so that "the
+        producer resolved the right evidence sha" and "the producer lazily fell
+        back to main's current tip" are distinguishable at all — with the
+        replay sitting at main's tip the two are the same sha and the
+        invariant would be untestable.
+        """
+        sc = build_rebased_landing(repo)
+        repo.git('checkout', 'main')
+        repo.commit('chore: an unrelated follow-up', {'CHANGELOG.md': _numbered('log', 7)})
+        sc.refresh()
+
+        verdict = await branch_work_landed(
+            git_ops, TASK_ID, sc.branch, branch_tip_sha=sc.branch_tip_sha,
+        )
+        evidence = verdict.evidence_sha
+        assert evidence is not None, 'an accepted verdict must anchor provenance'
+        # (1) reachable from main
+        assert repo.git_rc('merge-base', '--is-ancestor', evidence, 'main')[0] == 0, (
+            f'evidence_sha {evidence} is not reachable from main'
+        )
+        # (2) never the branch tip, which is NOT on main in this shape
+        assert evidence != sc.branch_tip_sha
+        # (3) never main's current tip as a lazy fallback
+        assert evidence != sc.main_sha
+        # ...and it is one of the commits that actually replayed this work.
+        assert repo.git('log', '--format=%s', '-1', evidence).startswith(
+            'chore: unattributed replay',
+        )
+
+    async def test_probe_carries_the_structured_facts(
+        self, git_ops: GitOps, repo: _Repo,
+    ) -> None:
+        """PRD correction 6bis / the manifest FAIL binding.
+
+        A four-field verdict would silently empty the L1 body rendered by
+        ``format_unattributed_landing_detail`` and its two sub-renderers, so
+        the probe is asserted on the ACCEPT path too: what a call recorded is
+        a property of the CALL, not of the outcome.
+        """
+        sc = build_rebased_landing(repo)
+        verdict = await branch_work_landed(
+            git_ops, TASK_ID, sc.branch, branch_tip_sha=sc.branch_tip_sha,
+        )
+        assert verdict.probe, 'the probe must never be empty'
+        assert verdict.probe['task_id'] == TASK_ID
+        assert verdict.probe['branch'] == sc.branch
+        assert verdict.probe['branch_tip_sha'] == sc.branch_tip_sha
+        assert verdict.probe['method'] == LandingMethod.patch_id
+        assert verdict.probe['reason'] == LandingReason.landed
+
+    async def test_tip_is_resolved_from_the_ref_when_not_supplied(
+        self, git_ops: GitOps, repo: _Repo,
+    ) -> None:
+        sc = build_rebased_landing(repo)
+        verdict = await branch_work_landed(
+            git_ops, TASK_ID, sc.branch, branch_tip_sha=None,
+        )
+        assert verdict.accepted is True
+        assert verdict.probe['branch_tip_sha'] == sc.branch_tip_sha
+
+
+@pytest.mark.asyncio
+class TestB5GenuinelyUnlanded:
+    """B5 — the ordinary negative, which must stay ordinary.
+
+    A producer that is generous enough to see B3 must still be strict enough
+    to call an unmerged branch unlanded; otherwise every pending task reads as
+    delivered.
+    """
+
+    async def test_unlanded_branch_is_not_landed(
+        self, git_ops: GitOps, repo: _Repo,
+    ) -> None:
+        sc = build_unlanded_branch(repo)
+        verdict = await branch_work_landed(
+            git_ops, TASK_ID, sc.branch, branch_tip_sha=sc.branch_tip_sha,
+        )
+        assert verdict.accepted is False
+        assert verdict.reason is LandingReason.not_landed
+        assert verdict.evidence_sha is None, (
+            'a rejected verdict must carry no provenance anchor'
+        )
+
+    async def test_probe_carries_the_structured_facts(
+        self, git_ops: GitOps, repo: _Repo,
+    ) -> None:
+        sc = build_unlanded_branch(repo)
+        verdict = await branch_work_landed(
+            git_ops, TASK_ID, sc.branch, branch_tip_sha=sc.branch_tip_sha,
+        )
+        assert verdict.probe
+        for key in ('task_id', 'branch', 'branch_tip_sha', 'method', 'reason'):
+            assert key in verdict.probe, key
+        assert verdict.probe['reason'] == LandingReason.not_landed
+
+    async def test_rejection_renders_without_an_unrecognized_reason(
+        self, git_ops: GitOps, repo: _Repo,
+    ) -> None:
+        """The G7 contracts-are-machine-checked half, at the RENDER boundary.
+
+        A reason code the shared formatter cannot explain renders the literal
+        ``Unrecognized reason code: ...`` into an L1 body a human reads, which
+        is how a new vocabulary silently degrades the escalation it was added
+        to improve.
+        """
+        sc = build_unlanded_branch(repo)
+        verdict = await branch_work_landed(
+            git_ops, TASK_ID, sc.branch, branch_tip_sha=sc.branch_tip_sha,
+        )
+        summary, detail = format_unattributed_landing_detail(
+            TASK_ID, sc.branch, verdict,
+        )
+        assert 'Unrecognized reason code' not in detail
+        assert 'Unrecognized reason code' not in summary
+        assert 'genuinely absent from main' in detail
+        assert 'not_landed' in summary
