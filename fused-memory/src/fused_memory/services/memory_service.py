@@ -3841,6 +3841,120 @@ class MemoryService:
             )
             return None
         return rows[0]['uuid'] if len(rows) == 1 else None
+
+    async def _repair_episode_referents(
+        self, stats: ReferentStats, *, group_id: str
+    ) -> ReferentRepairStats:
+        """REPAIR the edge endpoints leaf zeta found on the wrong node.
+
+        The write-time repair sub-pass (task 3672, PRD leaf eta). zeta
+        (``_verify_episode_referents``) detects and records; this pass is the
+        only WRITER, and it acts on nothing but zeta's structured findings — it
+        re-derives no verdict of its own. Per resolvable finding:
+
+        1. ``ensure_entity_node(intended.node_name)`` — resolve-or-mint the
+           node the edge should hang off.
+        2. ``reassign_edge(edge_uuid, <that uuid>, which_end=...)`` — move the
+           one endpoint, losslessly and atomically.
+        3. ``refresh_entity_summary`` as a BACKSTOP over step 2's own internal
+           refresh (see the loop body).
+
+        ALPHA LOCK CONTRACT. ``ensure_entity_node``'s docstring states that
+        callers MUST hold ``_identity_lock_for(group_id)`` — it performs no
+        locking of its own, and a concurrent same-group writer between its
+        resolve and its mint produces exactly the duplicate-name pair the
+        identity gate exists to prevent. This pass satisfies that by PLACEMENT:
+        it runs inside ``_reconcile_episode_identity``, whose whole chain
+        ``_execute_graphiti_write`` wraps in ``async with
+        self.graphiti._identity_lock_for(payload['group_id'])``. That placement
+        is load-bearing, not incidental — moving this pass out of the chain, or
+        calling it from anywhere that does not already hold the lock, would
+        reintroduce the race alpha's contract forbids.
+
+        ``ensure_entity_node`` IS CALLED UNCONDITIONALLY, for every resolvable
+        finding, and ITS RETURN — never ``finding.new_endpoint_uuid`` — is the
+        uuid handed to ``reassign_edge``. Three reasons:
+
+        * It is IDEMPOTENT: once the node exists, every later call takes the
+          resolve path and mints nothing. A branch on ``new_endpoint_uuid is
+          None`` would buy no round-trips worth having and would create a
+          SECOND site that can disagree about what the edge should point at.
+        * zeta returns ``None`` for BOTH "absent" and "duplicate-name group"
+          (``_intended_endpoint_uuid``: ``len(rows) != 1`` yields ``None``, so
+          zeta never pre-empts the identity-lock-held collapse), and
+          ``ensure_entity_node`` handles the two identically — it
+          resolves-or-collapses-or-mints through ``_resolve_or_create_entity``.
+          Branching would have to re-derive the distinction zeta explicitly
+          declined to make.
+        * It re-reads from the graph under the lock, so the target is
+          corroborated at WRITE time rather than taken from a lookup made a few
+          statements earlier. zeta's ``new_endpoint_uuid`` is demoted to what
+          its own docstring already calls it: an audit convenience.
+
+        INV-3 CORROBORATE-BEFORE-ACTING is preserved by DELEGATION, not by a
+        second check here. ``reassign_edge`` re-reads BOTH endpoints from
+        topology (a directed MATCH) and returns ``moved=False`` without issuing
+        any write when the end already points at the target — so its report
+        outranks zeta's in-memory snapshot, and the record's
+        ``old_endpoint_uuid`` is read back from it rather than copied from the
+        finding. This pass must therefore never pre-read or second-guess an
+        endpoint itself: a second read would be a second answer that can
+        disagree with the one the write actually used.
+
+        Args:
+            stats: zeta's ``ReferentStats`` for this episode, consumed verbatim.
+            group_id: The project graph, which is also the project_id.
+
+        Returns:
+            A ``ReferentRepairStats`` carrying one record per finding —
+            including the ones deliberately left alone.
+        """
+        repair_stats = ReferentRepairStats()
+
+        for finding in stats.findings:
+            intended = finding.intended_referent
+            if not finding.resolvable or intended is None:
+                # NEVER GUESS — see the unresolvable arm's own commentary.
+                repair_stats.repairs.append(ReferentRepair(
+                    edge_uuid=finding.edge_uuid,
+                    which_end=finding.which_end,
+                    outcome='unrepairable',
+                    old_endpoint_uuid=finding.old_endpoint_uuid,
+                    check=finding.check,
+                    reason=finding.reason,
+                ))
+                continue
+
+            target_uuid = await self.graphiti.ensure_entity_node(
+                intended.node_name, group_id=group_id,
+            )
+            result = await self.graphiti.reassign_edge(
+                finding.edge_uuid, target_uuid,
+                which_end=finding.which_end, group_id=group_id,
+            )
+            moved = bool(result.get('moved'))
+            repair_stats.repairs.append(ReferentRepair(
+                edge_uuid=finding.edge_uuid,
+                which_end=finding.which_end,
+                outcome='repaired',
+                # From reassign_edge's topology re-read, NOT from the finding.
+                old_endpoint_uuid=result.get(
+                    'old_endpoint_uuid', finding.old_endpoint_uuid,
+                ),
+                check=finding.check,
+                new_endpoint_uuid=target_uuid,
+                intended_referent=intended.node_name,
+                # zeta found no single pre-existing node keyed by this name
+                # moments earlier under this same lock, so ensure_entity_node
+                # took its mint-or-collapse path. The two are deliberately not
+                # distinguished here — zeta collapses them to one `None` on
+                # purpose, and telling them apart would cost a second query
+                # inside the identity lock to sharpen a telemetry count.
+                minted=finding.new_endpoint_uuid is None,
+                moved=moved,
+            ))
+
+        return repair_stats
     async def _reconcile_episode_identity(
         self, result: Any, *, group_id: str, referents: ReferentSet = (),
         content: str = '', referent_source: str = 'derived',
