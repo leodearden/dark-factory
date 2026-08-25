@@ -1026,3 +1026,274 @@ class TestDegenerateArmBackwardCompatibility:
         assert verdict.reason is LandingReason.no_op_landing
         assert verdict.accepted is False
         assert verdict.evidence_sha is None
+
+
+# --------------------------------------------------------------------------
+# B1 non-decay and B2 sync-merge tip (step-09).
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestB1NonDecay:
+    """B1 — the PRD's HEADLINE invariant, and the one that must not be waived.
+
+    The failure this whole PRD exists to fix is MONOTONIC: the legacy
+    effect-present policy compares a landed commit's added lines against main
+    HEAD, so every later commit touching those paths makes the next detection
+    attempt strictly LESS likely to succeed.  A task that goes unnoticed for a
+    day is therefore harder to recover on day two than on day one, and by the
+    time anyone looks it is unrecoverable — the shape that stranded tasks 3103
+    and 3916.
+
+    A patch-id producer must be immune to that by construction: "is an
+    equivalent patch anywhere in main's HISTORY" is a question no later commit
+    can un-answer.  These tests hold main still for nothing — they churn
+    exactly the paths the task touched, past the 0.98 aggregate / 0.90
+    per-file survival thresholds a decaying predicate applies, and demand the
+    same verdict every time.
+    """
+
+    async def test_landing_survives_five_same_path_churn_commits(
+        self, git_ops: GitOps, repo: _Repo,
+    ) -> None:
+        """Re-run after EVERY commit, not only at the end.
+
+        Asserting once after all five would not distinguish "never decayed"
+        from "decayed and recovered", and monotonic decay is precisely a
+        property you can only see by sampling the whole sequence.
+        """
+        sc = build_merged_landing(repo)
+        first = await branch_work_landed(
+            git_ops, TASK_ID, sc.branch,
+            branch_tip_sha=sc.branch_tip_sha, metadata=sc.metadata,
+        )
+        assert first.accepted is True, first.probe
+        assert first.reason is LandingReason.landed
+
+        for i in range(5):
+            # The LAST commit rewrites the lines the task added, which is the
+            # shape that trips the survival thresholds.
+            advance_main_touching_same_paths(sc, 1, rewrite=(i == 4))
+            verdict = await branch_work_landed(
+                git_ops, TASK_ID, sc.branch,
+                branch_tip_sha=sc.branch_tip_sha, metadata=sc.metadata,
+            )
+            assert verdict.accepted is True, f'decayed at churn commit {i}: {verdict.probe}'
+            assert verdict.reason is LandingReason.landed, i
+            assert verdict.method is LandingMethod.patch_id, i
+            assert verdict.evidence_sha is not None, i
+
+    async def test_the_churn_really_would_decay_a_survival_predicate(
+        self, git_ops: GitOps, repo: _Repo,
+    ) -> None:
+        """The pin is only meaningful if the fixture is genuinely hostile.
+
+        Measured against the REAL thresholds rather than a restated constant,
+        so a future change to either threshold re-tests this fixture instead
+        of silently making the row vacuous.
+        """
+        from orchestrator.git_ops import (
+            _EFFECT_SURVIVAL_AGGREGATE_THRESHOLD,
+            _EFFECT_SURVIVAL_PER_FILE_THRESHOLD,
+        )
+
+        sc = build_merged_landing(repo)
+        advance_main_touching_same_paths(sc, 5, rewrite=True)
+        added = _numbered('feature', 40).splitlines()
+        head_lines = set((repo.root / WORK_PATH).read_text().splitlines())
+        survival = sum(1 for line in added if line in head_lines) / len(added)
+        assert survival < _EFFECT_SURVIVAL_PER_FILE_THRESHOLD
+        assert survival < _EFFECT_SURVIVAL_AGGREGATE_THRESHOLD
+
+        verdict = await branch_work_landed(
+            git_ops, TASK_ID, sc.branch,
+            branch_tip_sha=sc.branch_tip_sha, metadata=sc.metadata,
+        )
+        assert verdict.accepted is True, verdict.probe
+
+    async def test_the_rebase_landing_also_does_not_decay(
+        self, git_ops: GitOps, repo: _Repo,
+    ) -> None:
+        """Non-decay is a property of the POLICY, not of one landing shape."""
+        sc = build_rebased_landing(repo)
+        advance_main_touching_same_paths(sc, 5, rewrite=True)
+        verdict = await branch_work_landed(
+            git_ops, TASK_ID, sc.branch,
+            branch_tip_sha=sc.branch_tip_sha, metadata=sc.metadata,
+        )
+        assert verdict.accepted is True, verdict.probe
+        assert verdict.reason is LandingReason.landed
+
+    async def test_the_pin_is_not_vacuous_genuine_removal_flips_it(
+        self, git_ops: GitOps, repo: _Repo,
+    ) -> None:
+        """B1's PAIRED NEGATIVE — the invariant is conditional, not "always True".
+
+        "Must not decay" would be trivially satisfiable by a producer that
+        returned ``landed`` unconditionally, so the row is only a real pin
+        alongside a construction that genuinely takes the work out of main.
+
+        The plan's sketch named ``git revert`` as that construction; MEASURED
+        against real git (``TestBoundaryFixtures.
+        test_post_hoc_revert_does_not_remove_the_patch_ids``) it is not one —
+        a revert ADDS an inverse commit and leaves the original patch-ids in
+        main's history, so containment still holds.  :func:`rewind_landing`
+        is the shape that does remove them, and it is used here instead.  The
+        revert residual is pinned separately below as a priced tradeoff.
+        """
+        sc = build_merged_landing(repo)
+        assert (await branch_work_landed(
+            git_ops, TASK_ID, sc.branch,
+            branch_tip_sha=sc.branch_tip_sha, metadata=sc.metadata,
+        )).accepted is True
+
+        rewind_landing(sc)
+        verdict = await branch_work_landed(
+            git_ops, TASK_ID, sc.branch,
+            branch_tip_sha=sc.branch_tip_sha, metadata=sc.metadata,
+        )
+        assert verdict.accepted is False, verdict.probe
+        assert verdict.reason is LandingReason.not_landed
+        assert verdict.evidence_sha is None
+
+    async def test_a_post_hoc_revert_is_the_priced_residual_not_a_flip(
+        self, git_ops: GitOps, repo: _Repo,
+    ) -> None:
+        """The direct, deliberate COST of non-decay, recorded rather than hidden.
+
+        A predicate able to notice this revert is exactly a predicate that
+        decays under ordinary same-path churn — the two are the same
+        measurement pointed in opposite directions, so this residual cannot be
+        removed without giving up B1.  D1 prices it (2 genuine post-hoc
+        reverts across both repos in 5.4 months) and the PRD accepts it; the
+        legacy effect-present producer remains available for callers that need
+        the other tradeoff.
+        """
+        sc = build_merged_landing(repo)
+        revert_landing(sc)
+        verdict = await branch_work_landed(
+            git_ops, TASK_ID, sc.branch,
+            branch_tip_sha=sc.branch_tip_sha, metadata=sc.metadata,
+        )
+        assert verdict.accepted is True, verdict.probe
+        assert verdict.reason is LandingReason.landed
+
+
+@pytest.mark.asyncio
+class TestB2SyncMergeTip:
+    """B2 — a branch whose TIP is a conflict-resolution merge of main into it.
+
+    Routine in this repo: a long-running branch pulls main in to resolve a
+    conflict, so its tip is a merge commit whose ``parents[1]`` is main.  The
+    tip therefore carries main's own history as well as the task's work, and a
+    producer that asks "is everything reachable from the tip in main?" without
+    care will either mis-read main's merged-in commits as unlanded task work
+    or compute a diff over main's entire touched-path set.
+    """
+
+    async def test_sync_merge_tip_is_accepted(
+        self, git_ops: GitOps, repo: _Repo,
+    ) -> None:
+        sc = build_sync_merge_branch(repo)
+        assert len(repo.parents(sc.branch_tip_sha)) == 2, 'the tip must be a merge'
+        verdict = await branch_work_landed(
+            git_ops, TASK_ID, sc.branch,
+            branch_tip_sha=sc.branch_tip_sha, metadata=sc.metadata,
+        )
+        assert verdict.accepted is True, verdict.probe
+        assert verdict.reason is LandingReason.landed
+        assert verdict.method is LandingMethod.patch_id
+
+    async def test_the_sync_merge_tip_is_not_a_no_op(
+        self, git_ops: GitOps, repo: _Repo,
+    ) -> None:
+        """Step-10(c): the no-op guard must let this shape through.
+
+        Relative to the branch's FORK POINT the tip is a real net change — it
+        carries both the task's work and main's merged-in commit — so the
+        no-op arm answers False and the verdict is decided by patch-id, not by
+        a guard that fired on the wrong question.
+        """
+        sc = build_sync_merge_branch(repo)
+        verdict = await branch_work_landed(
+            git_ops, TASK_ID, sc.branch,
+            branch_tip_sha=sc.branch_tip_sha, metadata=sc.metadata,
+        )
+        assert verdict.reason is not LandingReason.no_op_landing, verdict.probe
+        assert verdict.probe.get('patch_id_contained') is True, (
+            'the patch-id arm must actually have run and answered'
+        )
+
+    async def test_an_unmerged_sync_merge_branch_is_still_not_landed(
+        self, git_ops: GitOps, repo: _Repo,
+    ) -> None:
+        """The negative control for step-10(a).
+
+        ``git cherry`` skips merge commits, so the containment question is
+        answered over the branch's OWN non-merge commits.  That must not make
+        a sync-merged-but-unlanded branch read as contained just because its
+        merge commit is invisible to ``git cherry``: its real work commits are
+        still absent from main.
+        """
+        base, _tip = _seed_branch(repo)
+        main_edit = repo.commit(
+            'chore: main edits the same file',
+            {WORK_PATH: _numbered('feature', 40) + _numbered('mainside', 6)},
+        )
+        repo.git('checkout', BRANCH)
+        rc, _ = repo.git_rc('merge', '--no-ff', 'main', '-m', f'Merge main into {BRANCH}')
+        assert rc != 0
+        repo.write(WORK_PATH, _numbered('feature', 40) + _numbered('mainside', 6))
+        repo.git('add', '-A')
+        repo.git('commit', '--no-edit')
+        tip = repo.sha('HEAD')
+        assert repo.parents(tip)[1] == main_edit
+        repo.git('checkout', 'main')
+
+        verdict = await branch_work_landed(
+            git_ops, TASK_ID, BRANCH,
+            branch_tip_sha=tip, metadata={'branch_base_sha': base},
+        )
+        assert verdict.accepted is False, verdict.probe
+        assert verdict.reason is LandingReason.not_landed
+
+    @pytest.mark.parametrize(
+        'build',
+        [
+            build_merged_landing,
+            build_rebased_landing,
+            build_sync_merge_branch,
+            build_no_op_landing,
+            build_unlanded_branch,
+            build_degenerate_branch,
+        ],
+    )
+    async def test_neither_decaying_predicate_is_ever_awaited(
+        self, git_ops: GitOps, repo: _Repo, monkeypatch: pytest.MonkeyPatch, build,
+    ) -> None:
+        """The checkable form of "the ~300-file main-history diff is never computed".
+
+        Asserting a ZERO call count on the real ``GitOps`` is a structural
+        pin, not a performance one: as long as neither decaying predicate is
+        reachable, the producer's non-decay property cannot be re-introduced
+        by accident through an evidence-resolution or preflight leg that
+        happens to call one of them.  Both are wrapped rather than stubbed, so
+        a call would still behave normally and the failure reported is the
+        call itself.
+
+        Parametrised over EVERY boundary row because the hazard is a code
+        PATH, and a leg only some rows reach is exactly the one that would
+        slip through a single-row assertion.
+        """
+        branch_content = _spy_on_method(monkeypatch, git_ops, 'branch_content_in_main')
+        effect_present = _spy_on_method(monkeypatch, git_ops, 'commit_effect_present_in_main')
+        describe_effect = _spy_on_method(monkeypatch, git_ops, 'describe_commit_effect_in_main')
+
+        sc = build(repo)
+        await branch_work_landed(
+            git_ops, TASK_ID, sc.branch,
+            branch_tip_sha=sc.branch_tip_sha, metadata=sc.metadata,
+        )
+        assert branch_content == [], 'branch_content_in_main (git_ops.py) must never be reached'
+        assert effect_present == [], 'commit_effect_present_in_main must never be reached'
+        assert describe_effect == [], 'describe_commit_effect_in_main must never be reached'
