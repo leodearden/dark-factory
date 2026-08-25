@@ -1326,3 +1326,292 @@ class TestResolveAlreadyLandedBranch:
         assert await _resolve(
             [], parked, parked, git_ops, task_id='907', branch='task/907',
         ) is None
+
+
+# ---------------------------------------------------------------------------
+# step-9 — the `_submit_to_merge_queue` carve-out
+#
+# Step 7/8 proved the PREDICATE reads git correctly.  These tests prove the
+# gate ACTS on it: that the already-landed shape stops minting the
+# `task_failure` pin, which is the single assertion that closes the loop's
+# ENTRY.  Modelled member-for-member on `TestSubmitToMergeQueueCrossRepo` in
+# test_workflow.py, which covers the sibling carve-out in the same arm.
+#
+# `_make_workflow` is imported from test_workflow rather than duplicated:
+# cross-test-module helper reuse is established here (test_coalesce_
+# integration_gate, test_harness_digest_rollup, test_eval_boundary_suite and
+# ~6 others do it), and the helper carries a dozen non-obvious MagicMock
+# landmine guards that a local copy would silently drift from.
+# ---------------------------------------------------------------------------
+
+from unittest.mock import AsyncMock  # noqa: E402
+
+from test_workflow import _make_workflow  # noqa: E402
+
+from orchestrator.merge_gates import PlanFilesTouchedResult  # noqa: E402
+from orchestrator.workflow import WorkflowOutcome  # noqa: E402
+
+
+@pytest.mark.asyncio
+class TestSubmitToMergeQueueAlreadyLanded:
+    """The already-landed short-circuit inside ``_submit_to_merge_queue``.
+
+    A task whose work already merged gets re-dispatched onto a branch that is
+    legitimately EMPTY, and today's Decision-1 gate reads that empty range and
+    emits the exact INVERSE of the truth — ``plan_files_not_touched`` through
+    ``_mark_blocked(..., escalate_to_human=True)``, whose default
+    ``category='task_failure'`` mints the pin that fuels the zombie loop.
+
+    The carve-out must route that shape to the honest
+    ``plan_files_already_landed`` terminal outcome on the NORMAL ladder.  The
+    load-bearing assertion is ``escalate_to_human is not True``: everything
+    else is presentation, but THAT is what stops the pin being minted.
+    """
+
+    def _wire(self, wf, monkeypatch):
+        """Shared stubs: capture emits, forbid narrowing, stub ``_mark_blocked``.
+
+        The not-touched gate is stubbed to FAIL so that without the carve-out
+        the flow deterministically reaches the ``plan_files_not_touched``
+        escalation — a clean assertion failure rather than an
+        ``await MagicMock`` crash.
+        """
+        async def fake_run(cmd, **kwargs):  # noqa: ARG001
+            return 0, 'fake_head_sha\n', ''
+        monkeypatch.setattr('orchestrator.workflow._run', fake_run)
+
+        async def fake_check(*a, **k):  # noqa: ARG001
+            return PlanFilesTouchedResult(not_touched=['a.py'])
+        monkeypatch.setattr(
+            'orchestrator.merge_queue._check_plan_files_touched_in_branch',
+            fake_check,
+        )
+
+        emits: list = []
+
+        def fake_emit(event_store, task_id, outcome, **kwargs):  # noqa: ARG001
+            emits.append(outcome)
+        monkeypatch.setattr(
+            'orchestrator.merge_queue._emit_merge_attempt', fake_emit,
+        )
+
+        narrow = AsyncMock(return_value=False)
+        wf._try_narrow_plan = narrow  # type: ignore[method-assign]
+        mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
+        wf._mark_blocked = mark_blocked  # type: ignore[method-assign]
+        return emits, narrow, mark_blocked
+
+    @staticmethod
+    def _stub_predicate(monkeypatch, result, *, seen: list | None = None):
+        """Point the workflow's predicate at *result*, recording its args."""
+        async def fake_resolve(plan_files, base_sha, branch_head, git_ops, **kw):
+            if seen is not None:
+                seen.append((list(plan_files), base_sha, branch_head, kw))
+            return result
+        monkeypatch.setattr(
+            'orchestrator.merge_gates.resolve_already_landed_branch',
+            fake_resolve,
+        )
+
+    @staticmethod
+    def _landed():
+        from orchestrator.merge_gates import AlreadyLandedResult
+
+        return AlreadyLandedResult(
+            landed_sha='9ab336bd6e' * 4,
+            mechanism='merge_marker',
+            matched_files=['a.py', 'b.py', 'c.py'],
+        )
+
+    # --- POSITIVE -----------------------------------------------------------
+
+    async def test_an_already_landed_branch_mints_no_human_pin(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """THE assertion that closes the loop's ENTRY.
+
+        Everything else here is presentation; ``escalate_to_human is not
+        True`` is what stops ``_mark_blocked``'s default
+        ``category='task_failure'`` from minting the escalation that pins the
+        task, vetoes its recovery, and feeds it back round the loop.
+        """
+        from orchestrator.merge_gates import ALREADY_LANDED_REASON_PREFIX
+
+        wf = _make_workflow(tmp_path=tmp_path)
+        landed = self._landed()
+        self._stub_predicate(monkeypatch, landed)
+        emits, narrow, mark_blocked = self._wire(wf, monkeypatch)
+
+        outcome = await wf._submit_to_merge_queue('task/2656', pre_rebased=False)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        assert 'plan_files_already_landed' in emits
+        assert 'plan_files_not_touched' not in emits, (
+            'emitting the inverse of the truth is the bug being fixed'
+        )
+        narrow.assert_not_awaited(), (
+            'already-landed work must not be dragged through a narrowing pass'
+        )
+        mark_blocked.assert_awaited_once()
+        args, kwargs = mark_blocked.call_args
+        reason = args[0] if args else kwargs['reason']
+        assert reason.startswith(ALREADY_LANDED_REASON_PREFIX)
+        assert landed.landed_sha in reason, 'the landing must be citable'
+        assert landed.mechanism in reason, (
+            'an operator must be able to tell the two landing shapes apart '
+            'without re-running the probes'
+        )
+        assert kwargs.get('category') == 'already_landed'
+        assert kwargs.get('suggested_action') == 'verify_landing_and_close'
+        assert kwargs.get('escalate_to_human') is not True
+
+    async def test_a_train_member_landing_is_named_by_its_mechanism(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """The TRAP-1 shape reaches the same honest outcome.
+
+        A coalesce-train member has no per-task merge marker, so it is
+        attributed by citation; the outcome must be identical and the reason
+        must SAY which probe answered.
+        """
+        from orchestrator.merge_gates import AlreadyLandedResult
+
+        wf = _make_workflow(tmp_path=tmp_path)
+        self._stub_predicate(monkeypatch, AlreadyLandedResult(
+            landed_sha='d25b24468c' * 4,
+            mechanism='task_citation',
+            matched_files=['a.py', 'b.py', 'c.py'],
+        ))
+        emits, narrow, mark_blocked = self._wire(wf, monkeypatch)
+
+        await wf._submit_to_merge_queue('task/2656', pre_rebased=False)
+
+        assert 'plan_files_already_landed' in emits
+        narrow.assert_not_awaited()
+        _args, kwargs = mark_blocked.call_args
+        reason = _args[0] if _args else kwargs['reason']
+        assert 'task_citation' in reason
+        assert kwargs.get('escalate_to_human') is not True
+
+    async def test_the_predicate_is_given_the_branch_and_the_recorded_base(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """The predicate cannot measure the range or find the marker without
+        both, and a plausible-looking wiring that passes neither would make
+        every case fail closed — i.e. silently restore the bug."""
+        wf = _make_workflow(tmp_path=tmp_path)
+        seen: list = []
+        self._stub_predicate(monkeypatch, self._landed(), seen=seen)
+        self._wire(wf, monkeypatch)
+
+        await wf._submit_to_merge_queue('task/2656', pre_rebased=False)
+
+        assert len(seen) == 1
+        plan_files, base_sha, branch_head, kw = seen[0]
+        assert plan_files == ['a.py', 'b.py', 'c.py']
+        assert base_sha == 'base_sha', 'the branch\'s RECORDED base, not HEAD'
+        assert branch_head == 'fake_head_sha'
+        assert kw.get('task_id') == wf.task_id
+        assert kw.get('branch') and '2656' in kw['branch']
+
+    # --- NEGATIVE — the unchanged path stays byte-identical ------------------
+
+    async def test_a_genuine_miss_is_still_escalated_to_a_human(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """The carve-out must not become a blanket amnesty.
+
+        With the predicate declining, EVERY pre-3539 behaviour must survive:
+        the same outcome, the same narrowing attempt, the same reason prefix
+        and the same forced human ladder.
+        """
+        from orchestrator.merge_gates import PLAN_FILES_NOT_TOUCHED_REASON_PREFIX
+
+        wf = _make_workflow(tmp_path=tmp_path)
+        self._stub_predicate(monkeypatch, None)
+        emits, narrow, mark_blocked = self._wire(wf, monkeypatch)
+
+        outcome = await wf._submit_to_merge_queue('task/2656', pre_rebased=False)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        assert 'plan_files_not_touched' in emits
+        assert 'plan_files_already_landed' not in emits
+        narrow.assert_awaited_once()
+        mark_blocked.assert_awaited_once()
+        args, kwargs = mark_blocked.call_args
+        reason = args[0] if args else kwargs['reason']
+        assert reason.startswith(PLAN_FILES_NOT_TOUCHED_REASON_PREFIX)
+        assert kwargs.get('escalate_to_human') is True
+
+    # --- ORDERING — the extra git work stays off the hot path ----------------
+
+    async def test_a_passing_gate_never_consults_the_predicate(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """Three git probes per merge submission is real cost.
+
+        The carve-out is sited INSIDE the already-failing ``not_touched`` arm
+        precisely so a healthy branch — the overwhelming majority — pays
+        nothing for it.
+        """
+        wf = _make_workflow(tmp_path=tmp_path)
+        seen: list = []
+        self._stub_predicate(monkeypatch, self._landed(), seen=seen)
+        emits, narrow, mark_blocked = self._wire(wf, monkeypatch)
+
+        # Re-stub the gate to PASS, overriding _wire's failing stub.
+        async def passing_check(*a, **k):  # noqa: ARG001
+            return PlanFilesTouchedResult()
+        monkeypatch.setattr(
+            'orchestrator.merge_queue._check_plan_files_touched_in_branch',
+            passing_check,
+        )
+
+        # A healthy branch runs off the end of the gate and into the real
+        # enqueue, which this minimal harness cannot service (its queue is a
+        # MagicMock).  Rather than pin that incidental crash, stop the flow at
+        # the enqueue boundary with a sentinel: reaching it is itself the
+        # proof that the gate passed and nothing short-circuited.
+        class _ReachedEnqueue(Exception):
+            pass
+
+        async def boom(*a, **k):  # noqa: ARG001
+            raise _ReachedEnqueue
+        monkeypatch.setattr(
+            'orchestrator.merge_queue.register_and_enqueue_merge_request', boom,
+        )
+
+        with pytest.raises(_ReachedEnqueue):
+            await wf._submit_to_merge_queue('task/2656', pre_rebased=False)
+
+        assert seen == [], 'the predicate must not run on a healthy branch'
+        assert 'plan_files_already_landed' not in emits
+        mark_blocked.assert_not_awaited()
+        narrow.assert_not_awaited()
+
+    async def test_the_predicate_runs_before_any_narrowing_pass(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """Ordering WITHIN the failing arm.
+
+        Siting the carve-out after ``_try_narrow_plan`` would still reach the
+        right outcome, but only after asking the architect to adjudicate work
+        that is already on main — the dishonest narrowing pass the cross-repo
+        carve-out's docstring names.  Assert the architect is never asked.
+        """
+        wf = _make_workflow(tmp_path=tmp_path)
+        order: list[str] = []
+
+        async def fake_resolve(*a, **k):  # noqa: ARG001
+            order.append('predicate')
+            return self._landed()
+        monkeypatch.setattr(
+            'orchestrator.merge_gates.resolve_already_landed_branch',
+            fake_resolve,
+        )
+        _emits, narrow, _mark_blocked = self._wire(wf, monkeypatch)
+        narrow.side_effect = lambda *a, **k: order.append('narrow') or False
+
+        await wf._submit_to_merge_queue('task/2656', pre_rebased=False)
+
+        assert order == ['predicate']

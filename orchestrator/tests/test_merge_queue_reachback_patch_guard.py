@@ -305,6 +305,12 @@ ALLOWLIST: frozenset[tuple[str, str]] = frozenset({
     ('test_merge_speculation.py', '_maybe_schedule_shadow_compare'),
     ('test_merge_speculation.py', '_reverify_rebased_tree'),
     ('test_merge_speculation.py', '_run_cold_shadow_verify'),
+    # Task 3539 — the already-landed carve-out's workflow-side tests.  Same
+    # genuinely-unavoidable reach-back as ('test_workflow.py', ...) above: the
+    # consumer in `_submit_to_merge_queue` resolves this name through the
+    # merge_queue shim, so a stub installed on merge_gates would sit off the
+    # resolution path and the test would pass vacuously.
+    ('test_convert_to_blocked.py', '_check_plan_files_touched_in_branch'),
     ('test_workflow.py', '_check_plan_files_touched_in_branch'),
 })
 
