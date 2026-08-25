@@ -164,6 +164,19 @@ def harness(tmp_path: Path, mock_orch_config):
          patch('orchestrator.harness.BriefingAssembler'):
         h = Harness(mock_orch_config)
 
+    # Task 3539 — pin the observe-before-enforce flag to its PRODUCTION
+    # default.  `mock_orch_config` is a `MagicMock(spec_set=...)`, so every
+    # bool field it is not explicitly given reads back as a truthy child mock;
+    # `convert_to_blocked_enforce` would therefore enforce here while the real
+    # `OrchestratorConfig` ships it False.  Pinning it restores production
+    # semantics, which is what every assertion in this file was written
+    # against: these suites pin the PRE-3539 LEAVE contract for an
+    # escalation-pinned, unclaimed stranded row, and that contract is exactly
+    # what log mode preserves byte-for-byte.  The enforce arm has its own
+    # fixture (`enforce_harness` in test_convert_to_blocked.py), so nothing is
+    # left uncovered by this pin.
+    h.config.convert_to_blocked_enforce = False
+
     # Replace scheduler with async mocks
     h.scheduler = MagicMock()
     # Wire real (non-auto-mock) liveness-accessor behaviour (task 2235:

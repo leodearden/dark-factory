@@ -804,7 +804,7 @@ class TestConvertToBlockedApplierEnforce:
         from orchestrator.scheduler import SetTaskStatusRejected
 
         enforce_harness.scheduler.set_task_status.side_effect = (
-            SetTaskStatusRejected('nope')
+            SetTaskStatusRejected(_TID, 'rejected', 'nope')
         )
         _bind(enforce_harness, _pinned_in_progress())
 
