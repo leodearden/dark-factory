@@ -5288,12 +5288,7 @@ class TestReconcileEpisodeIdentity:
         verbatim to the other seven sub-passes, so the identifier is present at
         the call site; the eighth just has to be handed it.
         """
-        from types import SimpleNamespace
-
-        from _fm_helpers import MockAddEpisodeResult
-
-        mock_result = MockAddEpisodeResult()
-        mock_result.episode = SimpleNamespace(uuid='ep-live-1')
+        mock_result = _episode_result_uuid('ep-live-1')
         populated = ReferentStats(edges_scanned=2, endpoints_checked=3)
         service._verify_episode_referents = AsyncMock(return_value=populated)
         service._repair_episode_referents = AsyncMock(return_value=ReferentRepairStats())
@@ -5346,7 +5341,7 @@ class TestReconcileEpisodeIdentity:
             make_result(), group_id='test',
         )
 
-        _args, kwargs = service._repair_episode_referents.await_args
+        (_args, kwargs), = service._repair_episode_referents.await_args_list
         assert kwargs['episode_uuid'] == '', label
         assert '_repair_episode_referents' not in stats.errors, (
             f'{label}: reading the episode uuid must not raise'
