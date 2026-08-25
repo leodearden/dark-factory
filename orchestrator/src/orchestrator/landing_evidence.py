@@ -707,6 +707,33 @@ async def _resolve_main_reachable_evidence(
     return equivalent
 
 
+async def _unresolvable_endpoints(git_ops: GitOps, *refs: str) -> list[str]:
+    """Which of *refs* do NOT resolve to a commit in this repo right now.
+
+    The health re-probe behind the fail-open disambiguation in
+    :func:`branch_work_landed`.  ``merge_queue.patch_content_contained``
+    returns ``False`` both for "the work is genuinely not there" and for
+    "``git cherry`` failed", so the only way to tell them apart at the call
+    site is to ask git a question whose failure is unambiguous.
+
+    Implemented as ``is_ancestor(ref, ref)``: ``git merge-base --is-ancestor
+    X X`` succeeds for every commit (a commit is its own ancestor) and fails
+    for anything that does not resolve, so the rc alone answers "does this
+    ref exist?" without a second ref-resolution authority in the module and
+    without :meth:`resolve_branch_sha`'s ``refs/heads/`` restriction — the
+    endpoints here are a raw sha and a branch NAME, and only one of them is a
+    local branch.
+
+    Returns the refs that failed, in the order given, so the caller can
+    record WHICH endpoint was unreadable rather than only that one was.
+    """
+    unresolvable: list[str] = []
+    for ref in refs:
+        if not await git_ops.is_ancestor(ref, ref):
+            unresolvable.append(ref)
+    return unresolvable
+
+
 class _NoOpQuestion(NamedTuple):
     """Which two commit-ishes the no-op guard should diff, if any.
 
@@ -905,6 +932,57 @@ async def branch_work_landed(
     mechanically by ``test_branch_work_landed.py``'s ``TestOrderingRule``,
     which asserts what never runs rather than only what the verdict says.
 
+    **``git_error`` IS A FAIL-SOFT DEGRADATION, AND NO CONSUMER MAY COLLAPSE
+    IT INTO ``not_landed``.** The two codes answer different questions.
+    ``not_landed`` is a claim ABOUT THE TASK — the work is not on main, so
+    dispatch it.  ``git_error`` is a claim about the DETECTOR — it could not
+    look, and says nothing whatsoever about the task.  A repo lock, a corrupt
+    object or an unresolvable ref silently reading as "not landed" re-dispatches
+    a task whose work is already on main, and keeps re-dispatching it, because
+    re-running the check does not fix whatever broke it.  That is the defect
+    this PRD exists to fix, so producing it here would be strictly worse than
+    shipping nothing.  A consumer that cannot act on ``git_error`` must
+    escalate or retry — never treat it as a negative.
+
+    Every git failure therefore reaches the caller as ``git_error`` with the
+    failing operation named in ``probe['git_error_stage']``, which is
+    structured facts at failure rather than a bare code:
+
+    - ``resolve_branch_sha`` — the branch ref did not resolve.
+    - ``no_op_baseline`` — no fork point could be computed (see
+      :func:`_no_op_question`; distinct from "no baseline EXISTS for this
+      shape", which is recorded as ``no_op_baseline == 'unavailable'`` and is
+      not an error).
+    - ``net_diff_is_empty`` — the tri-state primitive returned ``None``.
+    - ``patch_id_containment`` — the fail-open disambiguation below.
+    - ``unexpected_exception`` — with ``probe['exception']`` carrying the
+      repr and a traceback logged at WARNING.
+
+    **The fail-open disambiguation.** ``patch_content_contained`` swallows
+    ``rc != 0`` into ``False`` for its own caller, which then falls through to
+    a full merge attempt and is therefore safe under a wrong ``False``.  Here
+    the same ``False`` would mean "this task never landed", so it is re-probed
+    instead of believed: both endpoints were resolved before the call, so if
+    either fails to re-resolve afterwards the answer came from a broken repo.
+    Which branch was taken is recorded in ``probe['containment_recheck']``
+    (``'healthy'`` / ``'unhealthy'``) and ``probe['containment_unresolvable']``,
+    so a reader can see a genuine negative distinguished from an unreadable
+    repo without re-running git.  Re-implementing ``git cherry`` locally would
+    have avoided the disambiguation and created a SECOND patch-id authority in
+    the same repo, which is the duplication this task exists to remove.
+
+    Two legs remain fail-soft rather than fail-closed, recorded here so the
+    residue is known rather than discovered: :func:`branch_is_degenerate`
+    returns a plain ``bool`` and so cannot report its own git failures (a
+    failure there reads as "not degenerate" and the later arms decide), and
+    the evidence-resolution tiers degrade to ``no_attribution`` rather than
+    ``git_error`` — a refusal that escalates for a human rather than one that
+    re-dispatches, with ``probe['evidence_source']`` naming which tier
+    declined.
+
+    It NEVER RAISES.  Whatever happens, a verdict comes back — it never
+    accepts on doubt and never propagates.
+
     Pure and read-only, exactly as :func:`validate_landing_evidence` is: it
     never stamps a task done, never escalates and never mutates git or task
     state.  The caller owns the action.
@@ -966,66 +1044,97 @@ async def branch_work_landed(
             probe=dict(probe), method=LandingMethod.patch_id,
         )
 
-    head = branch_tip_sha
-    if head is None:
-        head = await git_ops.resolve_branch_sha(branch)
-        probe['branch_tip_sha'] = head
-    if head is None:
-        # An unresolvable ref is a broken DETECTOR, not an unlanded task.
-        probe['git_error_stage'] = 'resolve_branch_sha'
-        return _reject(LandingReason.git_error)
-
-    # GUARD 1 — degenerate branch.  Passing the ALREADY-RESOLVED tip is
-    # mandatory, not an optimisation: re-reading the ref would let a
-    # concurrent warm-lane reseed land between the two reads, so the verdict
-    # could be anchored on a tip that is no longer the one the later arms
-    # judge (task 3103 review; see branch_is_degenerate's own docstring).
-    degenerate = await branch_is_degenerate(
-        git_ops, branch, metadata or {}, branch_tip_sha=head,
-    )
-    probe['degenerate'] = degenerate
-    if degenerate:
-        return _reject(LandingReason.degenerate_branch)
-
-    # GUARD 2 — no-op landing.  The BASELINE comes from a ladder rather than
-    # from `upstream` directly (see _no_op_question): once the branch has
-    # merged, merge-base(upstream, head) IS head, so asking the question
-    # against `upstream` reports every landed branch as a no-op.
-    question = await _no_op_question(git_ops, upstream, head, metadata, probe)
-    if question.indeterminate:
-        probe['git_error_stage'] = 'no_op_baseline'
-        return _reject(LandingReason.git_error)
-    if question.left is not None and question.right is not None:
-        # The probe out-parameter carries the measured commit's parent shas
-        # and merge-base into the verdict, so an escalation body can show
-        # whether it is a merge without re-running git.
-        net_empty = await git_ops.net_diff_is_empty(
-            question.left, question.right, probe=probe,
-        )
-        probe['net_diff_is_empty'] = net_empty
-        if net_empty is None:
-            # TRI-STATE, and the third state is NOT "not a no-op": collapsing
-            # it would launder a broken merge-base or an unreadable commit
-            # into a statement about the task.  Fully classified in a later
-            # step.
-            probe['git_error_stage'] = 'net_diff_is_empty'
+    try:
+        head = branch_tip_sha
+        if head is None:
+            head = await git_ops.resolve_branch_sha(branch)
+            probe['branch_tip_sha'] = head
+        if head is None:
+            # An unresolvable ref is a broken DETECTOR, not an unlanded task.
+            probe['git_error_stage'] = 'resolve_branch_sha'
             return _reject(LandingReason.git_error)
-        if net_empty:
-            return _reject(LandingReason.no_op_landing)
 
-    # Function-scoped: merge_queue.py imports from this module at module
-    # level, so importing it back at module level would close an import cycle.
-    from orchestrator.merge_queue import patch_content_contained  # noqa: PLC0415
+        # GUARD 1 — degenerate branch.  Passing the ALREADY-RESOLVED tip is
+        # mandatory, not an optimisation: re-reading the ref would let a
+        # concurrent warm-lane reseed land between the two reads, so the verdict
+        # could be anchored on a tip that is no longer the one the later arms
+        # judge (task 3103 review; see branch_is_degenerate's own docstring).
+        degenerate = await branch_is_degenerate(
+            git_ops, branch, metadata or {}, branch_tip_sha=head,
+        )
+        probe['degenerate'] = degenerate
+        if degenerate:
+            return _reject(LandingReason.degenerate_branch)
 
-    contained = await patch_content_contained(head, upstream, git_ops)
-    probe['patch_id_contained'] = contained
-    if not contained:
-        return _reject(LandingReason.not_landed)
+        # GUARD 2 — no-op landing.  The BASELINE comes from a ladder rather than
+        # from `upstream` directly (see _no_op_question): once the branch has
+        # merged, merge-base(upstream, head) IS head, so asking the question
+        # against `upstream` reports every landed branch as a no-op.
+        question = await _no_op_question(git_ops, upstream, head, metadata, probe)
+        if question.indeterminate:
+            probe['git_error_stage'] = 'no_op_baseline'
+            return _reject(LandingReason.git_error)
+        if question.left is not None and question.right is not None:
+            # The probe out-parameter carries the measured commit's parent shas
+            # and merge-base into the verdict, so an escalation body can show
+            # whether it is a merge without re-running git.
+            net_empty = await git_ops.net_diff_is_empty(
+                question.left, question.right, probe=probe,
+            )
+            probe['net_diff_is_empty'] = net_empty
+            if net_empty is None:
+                # TRI-STATE, and the third state is NOT "not a no-op": collapsing
+                # it would launder a broken merge-base or an unreadable commit
+                # into a statement about the task.  Fully classified in a later
+                # step.
+                probe['git_error_stage'] = 'net_diff_is_empty'
+                return _reject(LandingReason.git_error)
+            if net_empty:
+                return _reject(LandingReason.no_op_landing)
 
-    evidence_sha = await _resolve_main_reachable_evidence(git_ops, task_id, head, probe)
-    if evidence_sha is None:
-        return _reject(LandingReason.no_attribution)
-    return _accept(evidence_sha)
+        # Function-scoped: merge_queue.py imports from this module at module
+        # level, so importing it back at module level would close an import cycle.
+        from orchestrator.merge_queue import patch_content_contained  # noqa: PLC0415
+
+        contained = await patch_content_contained(head, upstream, git_ops)
+        probe['patch_id_contained'] = contained
+        if not contained:
+            # THE FAIL-OPEN DISAMBIGUATION.  patch_content_contained deliberately
+            # swallows `rc != 0` into False for ITS caller, which falls through to
+            # a full merge attempt and is therefore safe under a wrong False.  The
+            # same False here would mean "this task never landed", so it is
+            # re-probed rather than believed: both endpoints were resolved before
+            # the call, so if either fails to re-resolve NOW the containment answer
+            # came from a broken repo and not from the task.
+            unresolvable = await _unresolvable_endpoints(git_ops, head, upstream)
+            probe['containment_unresolvable'] = unresolvable
+            probe['containment_recheck'] = 'unhealthy' if unresolvable else 'healthy'
+            if unresolvable:
+                probe['git_error_stage'] = 'patch_id_containment'
+                return _reject(LandingReason.git_error)
+            return _reject(LandingReason.not_landed)
+
+        evidence_sha = await _resolve_main_reachable_evidence(git_ops, task_id, head, probe)
+        if evidence_sha is None:
+            return _reject(LandingReason.no_attribution)
+        return _accept(evidence_sha)
+    except Exception as exc:
+        # CONTAINED but not SWALLOWED, the same discipline as
+        # _record_effect_divergence and _delivered_checks_differential above.
+        # Every caller is a RECOVERY path — a stranded-task sweep, a dispatch
+        # gate, a merge-status query — so an exception escaping here does not
+        # fail one check, it stops every OTHER task in the same sweep from
+        # being recovered.  The repr goes into the probe (structured facts for
+        # the escalation body) and a traceback goes to the log, so a contained
+        # failure is never mistakable for a clean negative.
+        logger.warning(
+            'branch_work_landed: unexpected failure for task %s on %s; '
+            'returning git_error rather than a claim about the task',
+            task_id, branch, exc_info=True,
+        )
+        probe['git_error_stage'] = 'unexpected_exception'
+        probe['exception'] = repr(exc)
+        return _reject(LandingReason.git_error)
 
 
 async def validate_landing_evidence(
