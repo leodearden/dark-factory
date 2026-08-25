@@ -3343,6 +3343,26 @@ class VerifyResult:
     # collected, zero failing" (main/branch genuinely clean under this
     # run) and must NOT be conflated with None.
     failing_test_ids: list[str] | None = None
+    # Task 3226: the SKIPPED node ids from the same junit report, parsed by
+    # _extract_skipped_test_ids_from_junit at the same seam. A plain
+    # JSON-native `list[str] | None` exactly like failing_test_ids above, so it
+    # round-trips through the generic codec (asdict / VerifyResult(**d)) with
+    # no allowlist to touch.
+    #
+    # WHY IT IS CARRIED ALONGSIDE failing_test_ids rather than derived: the
+    # failing vector alone cannot distinguish "this run RAN the test and it
+    # passed" from "this run never ran it". Both look identical — an id absent
+    # from failing_test_ids — yet only the first is evidence about the code.
+    # Consumers that diff a branch's ids against a main baseline need the
+    # second vector to know which of the two they are looking at; without it a
+    # SKIP on main reads as a PASS on main, and a test that main never ran gets
+    # attributed to the branch under test.
+    #
+    # None = "no junit collected" (the same B3 degrade signal as above) — and
+    # deliberately NOT a licence to assume nothing was skipped. `[]` = "junit
+    # collected, zero skipped", which IS such a licence, and the two must never
+    # be conflated.
+    skipped_test_ids: list[str] | None = None
     # Task 3173: one FailureCategory per FAILING leg, in test/lint/type order,
     # exactly as `_summarize_checks` classified them (its fifth return
     # element). Deliberately a plain JSON-native `list[str] | None` (mirrors
@@ -6317,9 +6337,15 @@ async def run_verification(
     # 'full') or the report is missing/unparseable (nothing ever injected
     # the flag, or the test leg was skipped/crashed before writing it) — the
     # B3 degrade signal. See _extract_failing_test_ids_from_junit's docstring.
+    #
+    # Task 3226: the SKIPPED vector is parsed from the SAME report under the
+    # SAME guard, never a second condition — the two must always describe one
+    # run, or a caller diffing them would be comparing two different ones.
     failing_test_ids: list[str] | None = None
+    skipped_test_ids: list[str] | None = None
     if junit_path is not None:
         failing_test_ids = _extract_failing_test_ids_from_junit(junit_path)
+        skipped_test_ids = _extract_skipped_test_ids_from_junit(junit_path)
 
     result = VerifyResult(
         passed=attempt.passed,
@@ -6334,6 +6360,7 @@ async def run_verification(
         archive_log_paths=archive_log_paths,
         duration_secs=_wall_secs,
         failing_test_ids=failing_test_ids,
+        skipped_test_ids=skipped_test_ids,
         failing_leg_categories=failing_leg_categories,
     )
 
@@ -6444,6 +6471,19 @@ def _aggregate_results(results: list[VerifyResult]) -> VerifyResult:
         sorted({fid for ids in _child_failing_ids for fid in ids}) if _child_failing_ids else None
     )
 
+    # Task 3226: aggregate skipped_test_ids by the IDENTICAL rule. The
+    # None-contributes-nothing half is what matters here: a module that
+    # collected no junit (OPAQUE command, breadth != full) knows nothing about
+    # skips, and letting it poison the aggregate to None would discard a
+    # SIBLING module's real, collected skip evidence — returning the whole run
+    # to the can't-tell state this field exists to escape. Note this is the
+    # failing_test_ids rule, NOT the deliberately-different fail-closed rule
+    # used by failing_leg_categories just below.
+    _child_skipped_ids = [r.skipped_test_ids for r in results if r.skipped_test_ids is not None]
+    skipped_test_ids = (
+        sorted({sid for ids in _child_skipped_ids for sid in ids}) if _child_skipped_ids else None
+    )
+
     # Task 3173 review amendment: union the per-leg categories across FAILING
     # children only, order-preserved and de-duplicated (same deterministic
     # style as the kill-note fragment merge above).  A PASSING child has no
@@ -6480,6 +6520,7 @@ def _aggregate_results(results: list[VerifyResult]) -> VerifyResult:
         # tasks hit the len==1 fast path above and carry the exact value.
         duration_secs=max((r.duration_secs for r in results), default=0.0),
         failing_test_ids=failing_test_ids,
+        skipped_test_ids=skipped_test_ids,
         failing_leg_categories=failing_leg_categories,
     )
 
