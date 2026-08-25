@@ -378,8 +378,15 @@ class LandingTally:
             maxlen=max_stamps,
         )
 
-    def record(self, reason: LandingReason) -> None:
-        """Charge one verdict.  Called for EVERY verdict, accepted or not."""
+    def record(self, reason: LandingReason | str) -> None:
+        """Charge one verdict.  Called for EVERY verdict, accepted or not.
+
+        Accepts the bare spelling as well as a member — matching
+        :attr:`LandingVerdict.reason`, which is what every caller passes, and
+        ``recovery_emission.py``'s ``record``/``streak``/``span``/``clear``.
+        The coercion below already treated it that way; only the annotation
+        disagreed.
+        """
         try:
             key = LandingReason(reason)
         except ValueError:
@@ -609,7 +616,18 @@ class LandingVerdict:
 
     accepted: bool
     evidence_sha: str | None
-    reason: LandingReason
+    #: ``| str`` mirrors the house spelling for a closed StrEnum vocabulary
+    #: whose callers legitimately pass the bare spelling
+    #: (``recovery_emission.py``'s ``site: RecoverySite | str`` /
+    #: ``reason: LeaveReason | str | None``).  Load-bearing here, not stylistic:
+    #: sibling test files OUTSIDE this task's scope hand-construct this verdict
+    #: with ``reason='ok'`` / ``'no_citation'`` / ``'effect_absent'``, and the
+    #: alias above promises them zero edits — a promise a narrowed annotation
+    #: would keep at runtime but break under the type checker.  The vocabulary
+    #: stays closed where it is actually enforced: `_REASON_EXPLANATIONS`
+    #: completeness is machine-checked against the enum, and this module's own
+    #: producers are annotated to emit :class:`LandingReason` members.
+    reason: LandingReason | str
     probe: dict[str, Any]
     method: LandingMethod = LandingMethod.unspecified
 

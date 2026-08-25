@@ -40,6 +40,7 @@ import inspect
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 from _orch_helpers import (
@@ -62,6 +63,9 @@ from orchestrator.landing_evidence import (
     file_landing_git_error_storm_escalation,
     format_unattributed_landing_detail,
 )
+
+if TYPE_CHECKING:
+    from escalation.queue import EscalationQueue
 
 TASK_ID = '4647'
 BRANCH = f'task/{TASK_ID}'
@@ -842,7 +846,10 @@ def _spy_on_patch_content_contained(monkeypatch: pytest.MonkeyPatch) -> list[tup
     calls: list[tuple] = []
     original = mq.patch_content_contained
 
-    async def _recording(*args: object, **kwargs: object) -> object:
+    # `Any`, not `object`: unlike the `getattr` capture above, `original` here
+    # is the concretely-typed `patch_content_contained`, so forwarding
+    # `object`-typed varargs into it is a type error at the call.
+    async def _recording(*args: Any, **kwargs: Any) -> Any:
         calls.append((args, kwargs))
         return await original(*args, **kwargs)
 
@@ -1757,6 +1764,23 @@ class _FakeEscalationQueue:
         self.submitted.append(escalation)
 
 
+def _as_queue(queue: _FakeEscalationQueue | None) -> EscalationQueue | None:
+    """Present the fake to the production signature's concrete queue type.
+
+    The producers annotate ``escalation_queue: EscalationQueue | None`` (a
+    concrete class, not a Protocol), so a structural stand-in is not statically
+    assignable.  Cast at the CALL, matching
+    ``test_offline_lane_integration.py``, rather than casting where the fake is
+    built — the tests then go on to read ``.submitted`` / ``.checked`` off it,
+    which the real type does not carry.
+
+    Deliberately not a ``MagicMock`` (the older spelling a sibling test uses):
+    the class above mirrors ``has_open_l1``'s real category-filter semantics,
+    which is exactly the distinction these tests exist to make.
+    """
+    return cast('EscalationQueue | None', queue)
+
+
 def _storm_config(*, rate: int = 3, enabled: bool = True) -> RecoveryEmissionConfig:
     """A deliberately TINY rate so a storm costs four git calls, not eleven.
 
@@ -1789,7 +1813,7 @@ async def _drive_git_errors(
     for _ in range(count):
         verdict = await branch_work_landed(
             git_ops, TASK_ID, 'task/does-not-exist', branch_tip_sha=None,
-            escalation_queue=queue, recovery_emission=recovery_emission,
+            escalation_queue=_as_queue(queue), recovery_emission=recovery_emission,
         )
         assert verdict.reason is LandingReason.git_error, verdict.probe
         verdicts.append(verdict)
@@ -2001,7 +2025,7 @@ class TestGitErrorStormEscape:
             verdict = await branch_work_landed(
                 git_ops, TASK_ID, scenario.branch,
                 branch_tip_sha=scenario.branch_tip_sha, metadata=scenario.metadata,
-                escalation_queue=queue, recovery_emission=_storm_config(rate=1),
+                escalation_queue=_as_queue(queue), recovery_emission=_storm_config(rate=1),
             )
             assert verdict.reason is LandingReason.not_landed
         assert queue.submitted == []
@@ -2162,12 +2186,12 @@ class TestGitErrorStormEscape:
             tally.record(LandingReason.git_error)
         queue = _FakeEscalationQueue()
         filed = file_landing_git_error_storm_escalation(
-            queue, tally=tally, rate_per_hour=3,
+            _as_queue(queue), tally=tally, rate_per_hour=3,
         )
         assert filed is True
         assert len(queue.submitted) == 1
         assert file_landing_git_error_storm_escalation(
-            queue, tally=tally, rate_per_hour=3,
+            _as_queue(queue), tally=tally, rate_per_hour=3,
         ) is False, 'the dedup answer must be reported, not merely applied'
         assert file_landing_git_error_storm_escalation(
             None, tally=tally, rate_per_hour=3,

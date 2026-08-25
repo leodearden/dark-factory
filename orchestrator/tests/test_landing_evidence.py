@@ -1690,7 +1690,7 @@ class TestValidateLandingEvidenceModeDiscriminator:
             is_ancestor_map={},
             effect_present=False,
             effect_probe=CommitEffectProbe(
-                present=False, diverged_paths=['pkg/a.py'], failure=None,
+                present=False, diverged_paths=('pkg/a.py',), failure=None,
                 anchor_sha=sha,
             ),
         )
@@ -1814,7 +1814,13 @@ class TestValidateLandingEvidenceBehaviourPreservation:
         # A StrEnum member must survive the round trips a consumer subjects it
         # to: an f-string, a dict key, and JSON.
         assert f'{verdict.reason}' == 'ok'
-        assert {verdict.reason: 1}['ok'] == 1
+        # Annotated rather than inferred: the `is LandingReason.ok` assert
+        # above narrows `verdict.reason` to the member type, which would make
+        # the plain-string lookup a type error while still passing at runtime.
+        # A member IS a str, so `dict[str, int]` is the honest key type — and
+        # spelling it out is precisely the round trip being claimed.
+        keyed_by_member: dict[str, int] = {verdict.reason: 1}
+        assert keyed_by_member['ok'] == 1
         assert json.loads(json.dumps({'reason': verdict.reason}))['reason'] == 'ok'
 
     async def test_a_discovery_miss_still_reports_no_citation(self) -> None:
@@ -1897,7 +1903,7 @@ class TestValidateLandingEvidenceBehaviourPreservation:
                 is_ancestor_map={(citation, branch): False},
                 effect_present=False,
                 effect_probe=CommitEffectProbe(
-                    present=False, diverged_paths=['pkg/a.py'],
+                    present=False, diverged_paths=('pkg/a.py',),
                     failure=None, anchor_sha=citation,
                 ),
             ),
@@ -1931,7 +1937,7 @@ class TestEffectDivergenceGateSurvivesTheStrEnum:
                 is_ancestor_map={(citation, branch): False},
                 effect_present=False,
                 effect_probe=CommitEffectProbe(
-                    present=False, diverged_paths=['pkg/a.py'],
+                    present=False, diverged_paths=('pkg/a.py',),
                     failure=None, anchor_sha=citation,
                 ),
             ),

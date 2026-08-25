@@ -127,14 +127,24 @@ class TestGenuineStrMembers:
 
     def test_members_resolve_as_plain_string_dict_keys(self) -> None:
         assert {'landed': 1}[LandingReason.landed] == 1
-        assert {LandingReason.landed: 1}['landed'] == 1
+        # Annotated `dict[str, int]` rather than left to inference on purpose:
+        # a member IS a str, so it is a legal `str` key, and spelling that out
+        # is the assertion — an inferred `dict[LandingReason, int]` would make
+        # the plain-string lookup below a type error while still passing at
+        # runtime, which is the opposite of what this test claims.
+        keyed_by_member: dict[str, int] = {LandingReason.landed: 1}
+        assert keyed_by_member['landed'] == 1
         assert {'patch_id': 2}[LandingMethod.patch_id] == 2
 
 
 class TestLandingVerdictType:
     def test_is_a_frozen_dataclass_with_the_five_fields(self) -> None:
         assert dataclasses.is_dataclass(LandingVerdict)
-        assert LandingVerdict.__dataclass_params__.frozen is True
+        # `__dataclass_params__` is a real runtime attribute the stdlib sets,
+        # but it is absent from typeshed's dataclass stubs (the same reason
+        # `_pytest._io.pprint` suppresses it), so the check is asserted at
+        # runtime and silenced for the checker rather than dropped.
+        assert LandingVerdict.__dataclass_params__.frozen is True  # type: ignore[attr-defined]
         names = [f.name for f in dataclasses.fields(LandingVerdict)]
         assert names == ['accepted', 'evidence_sha', 'reason', 'probe', 'method']
 
