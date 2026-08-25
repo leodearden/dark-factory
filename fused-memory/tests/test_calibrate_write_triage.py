@@ -1769,6 +1769,25 @@ write_triage:
     # explanatory note about a
 """
 
+# The SHIPPED config.yaml shape: hand-written operator prose in two
+# paragraphs, sitting at the very end of the block below an OWNED key
+# (`t_high_by_category`). `keeping_children` is therefore False across the
+# whole run, which is the branch that used to discard it.
+WITH_A_PARAGRAPHED_TRAILING_NOTE_BELOW_AN_OWNED_KEY = """\
+write_triage:
+  enabled: true
+  t_high: 0.11
+  t_low: 0.05
+  calibration_report_path: old/report.json
+  t_high_by_category:
+    procedural_knowledge: 0.83
+  # EVIDENCE STATUS (hand-added operator prose, paragraph one).
+  # - procedural_knowledge: has its own cutoff above.
+
+  # - observations_and_summaries: NO cutoff, insufficient_pairs.
+  # - preferences_and_norms: NO cutoff, empty_class.
+"""
+
 WITH_A_BLANK_INSIDE_A_NESTED_VALUE = """\
 write_triage:
   future_map:
@@ -2089,6 +2108,46 @@ class TestWriteTriageConfigBlock:
         parsed = yaml.safe_load(_call(WITH_A_BLANK_INSIDE_A_NESTED_VALUE))['write_triage']
         assert parsed['future_map'] == {'a': 1, 'b': 2}
         assert parsed['another'] == 3
+
+    def test_a_blank_line_never_discards_the_comment_run_above_it(self) -> None:
+        """The shipped-config data loss: a paragraph break ate a paragraph.
+
+        `pending.clear()` on a blank line discarded the comment run ABOVE it
+        whenever `keeping_children` was False — and nobody re-emits that run,
+        so it was simply gone. config.yaml ships exactly this shape (the
+        `# EVIDENCE STATUS` note follows the OWNED `t_high_by_category`), so
+        one blank line typed into that note deleted the paragraph above it:
+        nine lines of hand-written task-3357 prose, with nothing logged.
+
+        Worse, the deletion was IDEMPOTENT — `_call(out) == out` held on the
+        damaged output — so no later run produced a diff to notice it by. Both
+        halves are asserted: every comment line survives, and the result is
+        stable.
+
+        The blank SEPARATOR itself is still dropped, matching the benign
+        preserved-key path; only content is promised, not spacing.
+        """
+        source = WITH_A_PARAGRAPHED_TRAILING_NOTE_BELOW_AN_OWNED_KEY
+        out = _call(source)
+
+        comments = [ln for ln in source.splitlines() if ln.strip().startswith('#')]
+        assert len(comments) == 4, 'fixture must hold both paragraphs'
+        survivors = out.splitlines()
+        for line in comments:
+            assert line in survivors, f'operator prose dropped: {line!r}\n{out}'
+        assert _call(out) == out, 'and it must survive a SECOND run'
+
+    def test_a_blank_line_with_no_comment_above_it_is_still_dropped(self) -> None:
+        """The bound on the fix: separators must not accumulate.
+
+        The discarding branch existed for a reason — without it the rebuilt
+        block grows a run of blank lines across successive runs. Only a blank
+        that would take hand-written text with it is buffered now, so a bare
+        separator is still consumed and the output stays stable.
+        """
+        out = _call(WITH_A_PARAGRAPHED_TRAILING_NOTE_BELOW_AN_OWNED_KEY)
+        assert _call(_call(out)) == out, 'blank separators must not accumulate'
+        assert '\n\n\n' not in out, f'blank run grew: {out!r}'
 
     def test_a_comment_trailing_a_nested_value_is_not_severed_either(self) -> None:
         """The narrower sibling of the severed-children defect.

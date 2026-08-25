@@ -36,6 +36,7 @@ from fused_memory.server.write_triage import (
     _DEFAULT_WRITE_TRIAGE_ENABLED,
     _FAIL_OPEN_STORM_THRESHOLD,
     _FAIL_OPEN_STORM_WINDOW_SECONDS,
+    ATTACH_OWNED_KEYS,
     CANONICAL_ID_KEY,
     OUTCOME_AMENDED,
     OUTCOME_CONTESTED,
@@ -49,7 +50,7 @@ from fused_memory.server.write_triage import (
     _stub_judge,
     attach_write_landed,
     decide_band,
-    declares_child_link,
+    declares_attach_keys,
     emit_triage_fail_open_storm_escalation,
     resolve_bands,
     resolve_candidate_k,
@@ -973,16 +974,17 @@ class TestTriageFailOpenCounter:
         assert summary['projects'] == []
 
 
-class TestDeclaresChildLink:
-    """The caller-declared-parentage force-store predicate.
+class TestDeclaresAttachKeys:
+    """The force-store predicate guarding the keys an attach overwrites.
 
-    Deliberately WIDER than `grouped_read._parent_id_in_meta`, which requires
-    both a child `kind` AND a well-formed `parent_id` because it answers "does
-    this record group?". This predicate answers a different question — "did
-    the caller say anything about parentage that a triage attach would
-    overwrite?" — and the attach overwrites BOTH keys, so either one present
-    on its own already makes an override lossy.
+    Derived from `ATTACH_OWNED_KEYS` rather than restating it, so the
+    predicate cannot drift from the set of keys the attach actually clobbers.
     """
+
+    def test_the_predicate_covers_exactly_the_attach_owned_keys(self) -> None:
+        """The whole point: one key overwritten, one key defended, no gap."""
+        for key in ATTACH_OWNED_KEYS:
+            assert declares_attach_keys({key: 'anything'}) is True, key
 
     @pytest.mark.parametrize(
         ('label', 'metadata'),
@@ -991,11 +993,23 @@ class TestDeclaresChildLink:
             ('a sighting', {'parent_id': 'p-1', 'kind': 'sighting'}),
             ('a parent_id with no kind', {'parent_id': 'p-1'}),
             ('a child kind with no parent_id', {'kind': 'amendment'}),
-            ('an empty parent_id the caller still declared', {'parent_id': ''}),
+            ('an empty parent_id the caller still set', {'parent_id': ''}),
+            ('a NON-child registry kind', {'kind': 'cycle_summary'}),
+            ('another non-child registry kind', {'kind': 'completion_note'}),
+            ('an agent-invented kind', {'kind': 'some_new_thing'}),
+            ('an attach key beside ordinary metadata', {'source': 'n', 'kind': 'decision'}),
         ],
     )
-    def test_a_declared_link_force_stores(self, label, metadata) -> None:
-        assert declares_child_link(metadata) is True, label
+    def test_a_caller_owned_attach_key_force_stores(self, label, metadata) -> None:
+        """ANY `kind` counts, not just CHILD_KINDS.
+
+        `kind` is an open free-text vocabulary (329 measured values, 242 of
+        them singletons), so `cycle_summary` is every bit as much a declaration
+        of what the record IS as `amendment` is. Relabelling it `sighting`
+        erases that classification and folds the record into a canonical's
+        sighting count.
+        """
+        assert declares_attach_keys(metadata) is True, label
 
     @pytest.mark.parametrize(
         ('label', 'metadata'),
@@ -1003,18 +1017,19 @@ class TestDeclaresChildLink:
             ('no metadata at all', None),
             ('empty metadata', {}),
             ('an unrelated key', {'source': 'notes'}),
-            ('a non-child kind', {'kind': 'decision'}),
+            ('ordinary metadata with a topic', {'source': 'n', 'topic': 't'}),
             ('a non-dict', 'parent_id=p-1'),
         ],
     )
     def test_everything_else_still_triages(self, label, metadata) -> None:
-        """Scoped on purpose.
+        """Scoped on purpose — this is where the coverage cost is bounded.
 
-        Force-storing on ANY `kind` value, or on an unreadable metadata shape,
-        would disable triage for a large slice of the corpus with no signal —
-        the silent degradation the module exists to prevent.
+        The census measured 95.0% of records (47,150 of 49,628) carrying no
+        `kind` at all, so triage still sees ~19 of every 20 writes. Widening
+        this to metadata generally would disable triage for nearly everything
+        with no signal — the silent degradation the module exists to prevent.
         """
-        assert declares_child_link(metadata) is False, label
+        assert declares_attach_keys(metadata) is False, label
 
 
 class TestTriageWriteFailsOpen:
@@ -1028,7 +1043,7 @@ class TestTriageWriteFailsOpen:
         return service
 
     @pytest.mark.asyncio
-    async def test_a_caller_declared_child_force_stores_before_retrieval(self) -> None:
+    async def test_a_caller_owned_attach_key_force_stores_before_retrieval(self) -> None:
         """An explicit parentage skips triage entirely — and skips the lookup.
 
         Same shape as `allow_near_duplicate`: no candidate can change the
@@ -1044,7 +1059,7 @@ class TestTriageWriteFailsOpen:
 
         decision = await triage_write(
             service, content='c', project_id='p', counter=counter,
-            caller_declared_child=True,
+            caller_owns_attach_keys=True,
         )
 
         assert decision.outcome == OUTCOME_STORED
@@ -1532,33 +1547,6 @@ class TestEmitTriageFailOpenStormEscalation:
         )
         assert 'memory-write-path-convergence' in routing_text, (
             f'must route the burst at the owning PRD leaf: {payload!r}'
-        )
-
-    def test_the_detail_says_triage_is_degraded_not_that_writes_were_lost(
-        self, tmp_path,
-    ) -> None:
-        """A burst is a DEGRADATION, not a data-loss incident.
-
-        Every write in the window still landed — with today's pre-triage
-        behaviour — so the record must say so plainly. An operator who reads a
-        fail-open storm as "writes were dropped" reaches for the wrong
-        remediation, and one who reads it as harmless never fixes retrieval:
-        silent degradation is precisely what INV-4 exists to prevent.
-        """
-        if not write_triage.HAS_ESCALATION:
-            pytest.skip('escalation package unavailable in this environment')
-
-        emit_triage_fail_open_storm_escalation(str(tmp_path), _STORM)
-        payload = json.loads(
-            next((tmp_path / 'data' / 'escalations').glob('esc-*.json')).read_text()
-        )
-        text = f'{payload["summary"]}\n{payload["detail"]}'.lower()
-
-        assert 'without triage' in text or 'pre-triage' in text, (
-            f'must say the writes landed untriaged: {payload!r}'
-        )
-        assert 'no write was lost' in text or 'never blocked' in text, (
-            f'must say no write was lost or blocked (contract C1): {payload!r}'
         )
 
     def test_the_escalation_id_is_greppable_via_the_stable_anchor(

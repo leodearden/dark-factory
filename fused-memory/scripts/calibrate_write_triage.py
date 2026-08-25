@@ -726,13 +726,30 @@ def _preserved_block_lines(lines: Sequence[str]) -> tuple[list[str], list[str]]:
     for line in lines:
         stripped = line.strip()
         if not stripped:
-            # A blank line is a separator, never content on its own. Inside a
-            # preserved key's nested value it is BUFFERED and flushed with the
-            # next kept line, so the block's internal spacing round-trips;
-            # elsewhere it ends -- and discards -- any comment run above it,
-            # so the rebuilt block cannot accumulate a growing run of
-            # separators across successive runs.
-            if keeping_children:
+            # A blank line is a separator, never content on its own. It is
+            # BUFFERED whenever discarding it would take hand-written text
+            # with it -- inside a preserved key's nested value, so the block's
+            # internal spacing round-trips, AND inside a COMMENT RUN, where a
+            # blank is a paragraph break rather than a terminator.
+            #
+            # The second case is not symmetry for its own sake. `pending.clear()`
+            # here discards the comment run ABOVE the blank, and that run is
+            # never re-emitted by anyone: config.yaml ships exactly this shape
+            # (the `# EVIDENCE STATUS` prose follows `t_high_by_category`, an
+            # OWNED key, so `keeping_children` is False for it), so one blank
+            # line typed into that note silently deleted nine lines of operator
+            # prose -- and the deletion was IDEMPOTENT, so no later run showed a
+            # diff to notice it by. That is the hand-written-config loss this
+            # whole function exists to prevent, in the one branch that was
+            # still doing it.
+            #
+            # A blank with no comment above it is still dropped, which is what
+            # keeps the rebuilt block from accumulating a growing run of
+            # separators across successive runs. Buffered blanks cannot
+            # accumulate either: every flush site either re-emits the run
+            # verbatim (stable under re-parse) or filters blanks out entirely
+            # (`_interior_comment_run`, and the `trailing` comprehension below).
+            if keeping_children or any(p.lstrip().startswith('#') for p in pending):
                 pending.append(line)
             else:
                 pending.clear()

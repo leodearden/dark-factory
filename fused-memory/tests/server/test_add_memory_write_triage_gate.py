@@ -42,6 +42,7 @@ from fused_memory.server.grouped_read import AMENDMENT_KIND, PARENT_ID_KEY, SIGH
 from fused_memory.server.tools import create_mcp_server
 from fused_memory.server.write_triage import (
     _FAIL_OPEN_STORM_THRESHOLD,
+    ATTACH_OWNED_KEYS,
     CANONICAL_ID_KEY,
     FAIL_OPEN_ESCALATION_ID_KEY,
     OUTCOME_AMENDED,
@@ -771,12 +772,18 @@ class TestTheForceStoreArms:
         assert metadata['kind'] == SIGHTING_KIND, f'{metadata!r}'
 
     @pytest.mark.asyncio
-    async def test_a_non_child_kind_still_triages(self) -> None:
-        """The predicate is scoped: an ordinary `kind` is not a parentage claim.
+    @pytest.mark.parametrize('kind', ['cycle_summary', 'completion_note', 'decision'])
+    async def test_a_non_child_kind_is_preserved_not_relabelled(self, kind) -> None:
+        """A caller's `kind` survives triage even when it is not a child kind.
 
-        Guards the other direction of the same edge — force-storing on ANY
-        `kind` value would disable triage for a large slice of the corpus
-        silently, which is the failure mode the whole module exists to avoid.
+        `kind` is an open free-text vocabulary, so `cycle_summary` is as much a
+        declaration of what the record IS as `amendment`. Rerouting the write
+        would replace it with `sighting` — erasing the classification AND
+        folding the record into a canonical's sighting count.
+
+        Asserts the PERSISTED metadata, not just the ack: an earlier version of
+        this test checked only `routed`/`canonical_id` and so passed while the
+        caller's kind was being silently overwritten one layer down.
         """
         mock_service = AsyncMock()
         _configure_config(mock_service, enabled=True)
@@ -784,10 +791,59 @@ class TestTheForceStoreArms:
         mock_service.search.return_value = [_candidate('canonical-A', 0.97)]
         server = create_mcp_server(mock_service)
 
-        result = await _call(server, metadata={'kind': 'decision'})
+        result = await _call(server, metadata={'kind': kind})
+
+        assert result[ROUTED_KEY] == OUTCOME_STORED, f'{result!r}'
+        assert CANONICAL_ID_KEY not in result, f'{result!r}'
+        metadata = mock_service.add_memory.await_args.kwargs['metadata']
+        assert metadata['kind'] == kind, f'caller kind was relabelled: {metadata!r}'
+        assert PARENT_ID_KEY not in metadata, f'invented a parent: {metadata!r}'
+
+    @pytest.mark.asyncio
+    async def test_ordinary_metadata_does_not_disable_triage(self) -> None:
+        """The bound on what the force-store costs.
+
+        Only the two attach-owned keys force-store. A write carrying a `source`
+        or a `topic` — nearly all of them; the census measured 95% of records
+        with no `kind` at all — must still route.
+        """
+        mock_service = AsyncMock()
+        _configure_config(mock_service, enabled=True)
+        _configure_pass_through_add_memory(mock_service)
+        mock_service.search.return_value = [_candidate('canonical-A', 0.97)]
+        server = create_mcp_server(mock_service)
+
+        result = await _call(server, metadata={'source': 'notes', 'topic': 'git-stash'})
 
         assert result[ROUTED_KEY] == OUTCOME_RESTATED, f'{result!r}'
         assert result[CANONICAL_ID_KEY] == 'canonical-A', f'{result!r}'
+
+    @pytest.mark.asyncio
+    async def test_every_key_the_attach_writes_is_defended_by_the_force_store(self) -> None:
+        """The anti-drift pin `tools.py`'s attach comment promises.
+
+        That comment justifies overwriting `parent_id`/`kind` unconditionally
+        on the grounds that the force-store already caught every write
+        carrying either. A third key added to the attach dict without being
+        added to ATTACH_OWNED_KEYS would silently re-open the same loss for
+        that key, so the two sets are pinned against each other HERE, by
+        reading back what the attach actually persisted.
+        """
+        mock_service = AsyncMock()
+        _configure_config(mock_service, enabled=True)
+        _configure_pass_through_add_memory(mock_service)
+        mock_service.search.return_value = [_candidate('canonical-A', 0.97)]
+        server = create_mcp_server(mock_service)
+
+        await _call(server, metadata={'source': 'notes'})
+
+        persisted = mock_service.add_memory.await_args.kwargs['metadata']
+        written_by_attach = set(persisted) - {'source'}
+        assert written_by_attach == set(ATTACH_OWNED_KEYS), (
+            f'the attach writes {written_by_attach!r} but the force-store defends '
+            f'{set(ATTACH_OWNED_KEYS)!r}; a key in the first set and not the second '
+            f'is silently destroyed when a caller supplies it'
+        )
 
 
 class TestC1HoldsEndToEnd:

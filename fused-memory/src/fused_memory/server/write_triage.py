@@ -110,6 +110,19 @@ CANONICAL_ID_KEY = 'canonical_id'
 #: rare by construction, and additive like the other two.
 FAIL_OPEN_ESCALATION_ID_KEY = 'triage_fail_open_escalation_id'
 
+#: The metadata keys an ATTACH outcome OVERWRITES when it reroutes a write
+#: into a child record. This is the definition the force-store predicate
+#: below is derived from, so the two cannot drift: every key the attach
+#: writes is a key a caller must be allowed to keep.
+#:
+#: ``'kind'`` is spelled as a literal because ``grouped_read`` exports the
+#: kind VALUES (``AMENDMENT_KIND``/``SIGHTING_KIND``) but no constant for the
+#: key itself, and that module is outside this task's scope to extend.
+#: ``tests/server/test_add_memory_write_triage_gate.py`` pins this set against
+#: the keys ``tools.py`` actually writes, so a third key added to the attach
+#: without widening this set fails there rather than silently.
+ATTACH_OWNED_KEYS: frozenset[str] = frozenset({PARENT_ID_KEY, 'kind'})
+
 #: The write was stored as a new standalone memory. Also the fail-open
 #: outcome and the deliberate-stub outcome — from the caller's side those are
 #: indistinguishable from a genuine "nothing matched", which is the point.
@@ -300,36 +313,46 @@ class BandDecision:
     t_low: float | None
 
 
-def declares_child_link(metadata: Any) -> bool:
-    """True when the CALLER's own *metadata* already declares a child record.
+def declares_attach_keys(metadata: Any) -> bool:
+    """True when the CALLER's own *metadata* already sets a key an attach owns.
 
     ``parent_id`` and ``kind`` are first-class caller-supplied Tier-A metadata
-    keys — ``memory_metadata`` validates ``kind`` against the registry and
-    ``parent_id`` for UUID shape, and ``MemoryService`` resolves parent
-    liveness — so an agent CAN and does submit an explicit child through
-    ``add_memory``. When it does, the parentage is a DECLARED INTENT, not a
-    gap for triage to fill: rerouting it would silently re-parent the record
-    under whatever triage picked, and an ``amendment`` re-labelled as a
-    ``sighting`` stops contributing its TEXT to the grouped document (an
-    amendment surfaces as a digest; a sighting is only counted). That is a C1
-    content loss produced by the mechanism built to prevent one, so a declared
-    child force-stores exactly as ``allow_near_duplicate`` does.
+    keys — ``memory_metadata`` validates ``kind`` against ``KIND_REGISTRY``
+    and ``parent_id`` for UUID shape, and ``MemoryService`` resolves parent
+    liveness — so an agent CAN and does set both through ``add_memory``. An
+    ATTACH outcome overwrites BOTH (see :data:`ATTACH_OWNED_KEYS`), so
+    whatever the caller put there is destroyed with no log line and no
+    fail-open count. Under a contract whose first clause is *never lose
+    content*, a write that would cost the caller its own metadata force-stores
+    instead.
 
-    Deliberately an OR over the two keys, and deliberately WIDER than
-    ``grouped_read._parent_id_in_meta`` (which requires both, well-formed).
-    That reader is answering "does this record group?"; this predicate is
-    answering "did the caller say something about parentage that triage would
-    overwrite?" — and triage's attach overwrites BOTH keys, so either one
-    present is enough to make an override lossy. A half-declared link (a
-    ``parent_id`` with no child ``kind``, say) is a caller bug that
-    ``memory_metadata`` validation owns; quietly "fixing" it into a triage
-    attach would hide it.
+    Scoped to those two keys and NOT to metadata generally: triage must still
+    fire for the ordinary write that carries a ``source`` or a ``topic``,
+    which is nearly all of them. The keys here are exactly the ones the attach
+    clobbers, no wider.
+
+    ANY ``kind`` counts, not just ``CHILD_KINDS``. The narrower rule looked
+    sufficient — an ``amendment`` demoted to a ``sighting`` is the loudest
+    case, because ``grouped_read`` digests amendment TEXT while sightings are
+    only COUNTED — but ``kind`` is an open free-text vocabulary (the census
+    measured 329 distinct values, 242 of them singletons), so a
+    ``cycle_summary`` or ``completion_note`` write is just as much a
+    declaration of what the record IS. Relabelling one ``sighting`` erases
+    that classification AND folds the record into some canonical's sighting
+    count. The coverage this costs is small and measured: the census found
+    95.0% of records (47,150 of 49,628) carry no ``kind`` at all, so triage
+    still sees ~19 of every 20 writes.
+
+    Likewise ANY ``parent_id``, well-formed or not: a malformed link is a
+    caller bug for ``memory_metadata`` validation to report, and quietly
+    converting it into a triage attach would hide it. Contrast
+    ``grouped_read._parent_id_in_meta``, which requires both keys well-formed
+    because it answers a different question — "does this record group?" rather
+    than "did the caller set something an attach would overwrite?".
     """
     if not isinstance(metadata, dict):
         return False
-    if metadata.get('kind') in CHILD_KINDS:
-        return True
-    return PARENT_ID_KEY in metadata
+    return any(key in metadata for key in ATTACH_OWNED_KEYS)
 
 
 def _canonical_id_of(result: MemoryResult) -> str:
@@ -683,7 +706,7 @@ async def triage_write(
     counter: TriageFailOpenCounter,
     judge: Any = None,
     allow_near_duplicate: bool = False,
-    caller_declared_child: bool = False,
+    caller_owns_attach_keys: bool = False,
     is_recon_stage_agent: bool = False,
 ) -> BandDecision:
     """Route one ``add_memory`` write. NEVER raises, NEVER blocks, NEVER errors.
@@ -705,12 +728,12 @@ async def triage_write(
     fail-open — so a changed ``MemoryService.search`` signature surfaces as a
     storm escalation rather than as a stream of errored writes.
 
-    *allow_near_duplicate*, *caller_declared_child* and *is_recon_stage_agent*
-    are passed IN rather than recomputed: ``add_memory`` already derives all
-    three from the metadata and the agent_id it holds, and a second derivation
-    here is a second place for them to disagree about who is exempt.
-    :func:`declares_child_link` is the one spelling of the
-    *caller_declared_child* predicate.
+    *allow_near_duplicate*, *caller_owns_attach_keys* and
+    *is_recon_stage_agent* are passed IN rather than recomputed:
+    ``add_memory`` already derives all three from the metadata and the
+    agent_id it holds, and a second derivation here is a second place for them
+    to disagree about who is exempt. :func:`declares_attach_keys` is the one
+    spelling of the *caller_owns_attach_keys* predicate.
     """
     if allow_near_duplicate:
         # D2 reinterprets the retired guard's bypass flag as triage's
@@ -725,16 +748,20 @@ async def triage_write(
         # outcome.
         return BandDecision(OUTCOME_STORED, None, None, None, None)
 
-    if caller_declared_child:
-        # The caller already declared this record's parentage (a ``parent_id``
-        # and/or a child ``kind``), and an attach OVERWRITES both of those
-        # keys. Routing it would re-parent the record under whatever canonical
-        # triage picked, and would demote a declared ``amendment`` to a
-        # ``sighting`` — whose TEXT never reaches the grouped document, since
-        # an amendment surfaces as a digest and a sighting is only counted.
-        # That is a C1 content loss caused by the C1 mechanism, so an explicit
-        # declaration wins: triage does not get a second vote on a decision
-        # the caller already made.
+    if caller_owns_attach_keys:
+        # The caller already set `parent_id` and/or `kind`, and an attach
+        # OVERWRITES both. Routing this write would re-parent the record under
+        # whatever canonical triage picked and replace the caller's `kind`
+        # with `sighting`/`amendment` — destroying, in the `kind` case, the
+        # record's own declared classification and folding it into a
+        # canonical's sighting count. A declared `amendment` demoted to a
+        # `sighting` is the sharpest version: `grouped_read` digests amendment
+        # TEXT while sightings are only counted, so the submitted content
+        # stops being readable in the grouped document.
+        #
+        # All of that is C1 content loss caused by the C1 mechanism, so the
+        # caller's own metadata wins: triage does not get a second vote on a
+        # classification the caller already made.
         #
         # Returned before retrieval for the same reason as the flag above: no
         # candidate can change the answer, so no round-trip is spent asking.
