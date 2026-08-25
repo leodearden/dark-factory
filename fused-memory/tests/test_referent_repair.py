@@ -24,15 +24,22 @@ from __future__ import annotations
 
 import dataclasses
 import json
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _fm_helpers import install_identity_mocks
+from test_referent_verification import _WRITE_PRIMITIVES, assert_never_repaired
 
 from fused_memory.services.memory_service import (
     REFERENT_REPAIR_OUTCOMES,
+    MemoryService,
     ReconcileStats,
+    ReferentFinding,
     ReferentRepair,
     ReferentRepairStats,
+    ReferentStats,
 )
+from fused_memory.utils.canonical_labels import Referent
 
 
 def _repair(**overrides) -> ReferentRepair:
@@ -235,3 +242,208 @@ class TestReconcileStatsCarriesTheRepairRecord:
         second = ReconcileStats()
         first.repair_stats.repairs.append(_repair())
         assert second.repair_stats.repairs == []
+
+
+# ---------------------------------------------------------------------------
+# The repair sequence: ensure_entity_node -> reassign_edge -> refresh_entity_summary
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def service(mock_config):
+    """MemoryService with fully-mocked backends.
+
+    `install_identity_mocks` is REQUIRED, not decorative: the end-to-end wiring
+    test drives `_execute_graphiti_write`, which wraps its critical section in
+    `async with self.graphiti._identity_lock_for(...)`, which a bare MagicMock
+    cannot satisfy — and alpha's `ensure_entity_node` LOCK CONTRACT is the
+    thing that section exists to honour.
+    """
+    svc = MemoryService(mock_config)
+    svc.graphiti = MagicMock()
+    svc.graphiti.add_episode = AsyncMock(return_value=None)
+    svc.graphiti._require_client = MagicMock()
+    svc.graphiti.get_nodes_by_exact_name = AsyncMock(return_value=[])
+    for name in _WRITE_PRIMITIVES:
+        setattr(svc.graphiti, name, AsyncMock(return_value=None))
+    svc.graphiti.ensure_entity_node = AsyncMock(return_value='n-3127')
+    svc.graphiti.reassign_edge = AsyncMock(return_value=_reassigned())
+    svc.graphiti.refresh_entity_summary = AsyncMock(return_value={})
+    svc.graphiti.get_valid_edges_for_node = AsyncMock(return_value=[])
+    svc.graphiti.delete_entity = AsyncMock(return_value={})
+    install_identity_mocks(svc.graphiti)
+    return svc
+
+
+def _finding(**overrides) -> ReferentFinding:
+    """A RESOLVABLE finding — eta's common case. Overrides tune what a test pins."""
+    fields = {
+        'edge_uuid': 'e1',
+        'which_end': 'source',
+        'check': 'set-membership',
+        'old_endpoint_uuid': 'n-3129',
+        'old_endpoint_name': 'Task 3129',
+        'endpoint_referent': Referent(number='3129'),
+        'referent_set': ('Task 3127',),
+        'intended_referent': Referent(number='3127'),
+        'new_endpoint_uuid': 'n-3127',
+        'resolvable': True,
+    }
+    fields.update(overrides)
+    return ReferentFinding(**fields)
+
+
+def _stats(*findings, endpoints_checked: int | None = None) -> ReferentStats:
+    """zeta's return value, carrying *findings*.
+
+    `endpoints_checked` defaults to the finding count so the INV-4 "did we
+    actually look" question has a truthful answer without every test spelling
+    it; a test pinning the checked-nothing arm passes 0 explicitly.
+    """
+    stats = ReferentStats(
+        edges_scanned=len({f.edge_uuid for f in findings}),
+        endpoints_checked=(
+            len(findings) if endpoints_checked is None else endpoints_checked
+        ),
+    )
+    stats.findings.extend(findings)
+    return stats
+
+
+def _reassigned(**overrides) -> dict:
+    """`reassign_edge`'s audit dict, defaulting to a real move whose internal
+    summary refresh SUCCEEDED for both affected endpoints (the ~100% path)."""
+    payload = {
+        'uuid': 'e1',
+        'which_end': 'source',
+        'old_endpoint_uuid': 'n-3129',
+        'new_endpoint_uuid': 'n-3127',
+        'unchanged_endpoint_uuid': 'n-other',
+        'moved': True,
+        'refreshed_nodes': ['n-3129', 'n-3127'],
+    }
+    payload.update(overrides)
+    return payload
+
+
+class TestTheRepairSequence:
+    """ensure_entity_node THEN reassign_edge, in that order, per resolvable finding."""
+
+    @pytest.mark.asyncio
+    async def test_ensure_then_reassign_in_order_with_the_contract_arguments(
+        self, service,
+    ):
+        """The mint step graphiti_core will never do for us, then the lossless
+        endpoint move — ORDER pinned, not just arguments."""
+        manager = MagicMock()
+        manager.attach_mock(service.graphiti.ensure_entity_node, 'ensure_entity_node')
+        manager.attach_mock(service.graphiti.reassign_edge, 'reassign_edge')
+
+        stats = await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory',
+        )
+
+        service.graphiti.ensure_entity_node.assert_awaited_once_with(
+            'Task 3127', group_id='dark_factory',
+        )
+        service.graphiti.reassign_edge.assert_awaited_once_with(
+            'e1', 'n-3127', which_end='source', group_id='dark_factory',
+        )
+        assert [c[0] for c in manager.mock_calls] == [
+            'ensure_entity_node', 'reassign_edge',
+        ]
+        assert stats.repaired == 1
+
+    @pytest.mark.asyncio
+    async def test_the_reassign_target_comes_from_ensure_entity_node_not_from_zeta(
+        self, service,
+    ):
+        """THE assertion that keeps a stale zeta lookup from becoming the repair
+        target.  `ensure_entity_node` re-reads under the lock and COLLAPSES a
+        duplicate-name group; `finding.new_endpoint_uuid` is audit metadata its
+        own docstring already calls "an audit convenience"."""
+        service.graphiti.ensure_entity_node = AsyncMock(return_value='n-3127')
+        service.graphiti.reassign_edge = AsyncMock(return_value=_reassigned())
+
+        await service._repair_episode_referents(
+            _stats(_finding(new_endpoint_uuid='n-stale')), group_id='dark_factory',
+        )
+
+        service.graphiti.reassign_edge.assert_awaited_once_with(
+            'e1', 'n-3127', which_end='source', group_id='dark_factory',
+        )
+
+    @pytest.mark.asyncio
+    async def test_ensure_entity_node_is_called_even_when_zeta_already_resolved_a_uuid(
+        self, service,
+    ):
+        """UNCONDITIONALLY, not only on zeta's None branch: it is idempotent
+        (the resolve path mints nothing), and branching would create a second
+        site that can disagree about what the edge should point at."""
+        await service._repair_episode_referents(
+            _stats(_finding(new_endpoint_uuid='n-3127')), group_id='dark_factory',
+        )
+        service.graphiti.ensure_entity_node.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_the_repair_record_carries_every_contract_field(self, service):
+        stats = await service._repair_episode_referents(
+            _stats(_finding(check='per-edge-pairing')), group_id='dark_factory',
+        )
+
+        assert len(stats.repairs) == 1
+        record = stats.repairs[0]
+        assert record.edge_uuid == 'e1'
+        assert record.which_end == 'source'
+        assert record.outcome == 'repaired'
+        assert record.moved is True
+        assert record.old_endpoint_uuid == 'n-3129'
+        assert record.new_endpoint_uuid == 'n-3127'
+        assert record.intended_referent == 'Task 3127'
+        # Carried through from the finding that justified the repair, so a
+        # reader never has to join back to the ReferentStats to learn why.
+        assert record.check == 'per-edge-pairing'
+        assert stats.repaired == 1
+
+    @pytest.mark.asyncio
+    async def test_the_old_endpoint_is_read_from_reassign_edge_not_from_the_finding(
+        self, service,
+    ):
+        """INV-3 corroborate-before-acting, preserved by DELEGATION:
+        `reassign_edge` re-reads BOTH endpoints from topology, so its report of
+        what the edge actually hung off outranks zeta's in-memory snapshot."""
+        service.graphiti.reassign_edge = AsyncMock(
+            return_value=_reassigned(old_endpoint_uuid='n-actually-3130'),
+        )
+
+        stats = await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory',
+        )
+
+        assert stats.repairs[0].old_endpoint_uuid == 'n-actually-3130'
+
+    @pytest.mark.asyncio
+    async def test_a_resolvable_finding_with_no_intended_referent_is_unrepairable(
+        self, service,
+    ):
+        """A shape zeta forbids but the TYPE permits.  Fail closed — record it,
+        do not crash, and above all do not guess a target."""
+        stats = await service._repair_episode_referents(
+            _stats(_finding(resolvable=True, intended_referent=None)),
+            group_id='dark_factory',
+        )
+
+        assert_never_repaired(service)
+        assert len(stats.repairs) == 1
+        assert stats.repairs[0].outcome == 'unrepairable'
+        assert stats.repaired == 0
+
+    @pytest.mark.asyncio
+    async def test_no_findings_costs_nothing(self, service):
+        """The ~99.8% clean path must issue ZERO backend calls inside the
+        per-group identity lock."""
+        stats = await service._repair_episode_referents(
+            _stats(), group_id='dark_factory',
+        )
+        assert_never_repaired(service)
+        assert stats.repairs == []
