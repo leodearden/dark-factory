@@ -39,8 +39,9 @@ from __future__ import annotations
 import ast
 import os
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 from escalation.models import Escalation
 from escalation.pins import _norm_id, classify_pins
 from shared.task_claimant import compose_claimant_run_id
@@ -243,3 +244,94 @@ class TestEveryHarnessFilingSiteIsStamped:
             f'must stamp the filing incarnation (task 3550); use '
             f'self._filing_claimant_run_id.'
         )
+
+
+# ---------------------------------------------------------------------------
+# step-13/14: wiring the server seam to the task DB row
+# ---------------------------------------------------------------------------
+
+
+class TestBuildTaskClaimantLookup:
+    """``Harness._build_task_claimant_lookup`` — the closure injected into
+    ``create_server`` as ``task_claimant_lookup``.
+
+    It must be TOTAL.  The escalation server's own fail-open exists for
+    genuinely unexpected breakage; a closure that propagates would merely
+    exercise that except branch on ordinary conditions (an absent task, a
+    fused-memory blip) instead of the intended path.
+    """
+
+    @pytest.mark.asyncio
+    async def test_returns_the_rows_claimant_run_id(self, mock_orch_config) -> None:
+        h = _build_harness(mock_orch_config)
+        h.scheduler = MagicMock()
+        h.scheduler.get_task = AsyncMock(
+            return_value={'id': '42', 'claimant_run_id': 'run-1/42-abcd1234/pid=99'},
+        )
+
+        lookup = h._build_task_claimant_lookup()
+
+        assert await lookup('42') == 'run-1/42-abcd1234/pid=99'
+        h.scheduler.get_task.assert_awaited_once_with('42')
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'row',
+        [None, {}, {'id': '42'}, {'id': '42', 'claimant_run_id': None},
+         {'id': '42', 'claimant_run_id': '   '}],
+        ids=['no-task', 'empty-dict', 'key-absent', 'value-none', 'value-blank'],
+    )
+    async def test_absent_or_blank_claimant_is_none(
+        self, mock_orch_config, row,
+    ) -> None:
+        """UNKNOWN, never a pseudo-value — ``pins`` fails safe to pinning on None."""
+        h = _build_harness(mock_orch_config)
+        h.scheduler = MagicMock()
+        h.scheduler.get_task = AsyncMock(return_value=row)
+
+        assert await h._build_task_claimant_lookup()('42') is None
+
+    @pytest.mark.asyncio
+    async def test_a_raising_get_task_does_not_propagate(
+        self, mock_orch_config,
+    ) -> None:
+        """The closure absorbs its own failures — see the class docstring."""
+        h = _build_harness(mock_orch_config)
+        h.scheduler = MagicMock()
+        h.scheduler.get_task = AsyncMock(side_effect=RuntimeError('fused-memory down'))
+
+        assert await h._build_task_claimant_lookup()('42') is None
+
+
+class TestEscalationServerWiring:
+    """``_start_escalation_server`` passes the closure into ``create_server``."""
+
+    @pytest.mark.asyncio
+    async def test_task_claimant_lookup_kwarg_is_wired(
+        self, mock_orch_config, tmp_path: Path,
+    ) -> None:
+        """Exactly as the sibling ``task_status_lookup=`` argument already is."""
+        h = _build_harness(mock_orch_config)
+        h._escalation_queue = MagicMock()
+        mock_orch_config.escalation.queue_dir = str(tmp_path / 'esc')
+        mock_orch_config.escalation.host = '127.0.0.1'
+        mock_orch_config.escalation.port = 0
+
+        # The server task must look alive, or _start_escalation_server's
+        # did-it-crash check re-raises from a MagicMock 'exception'.
+        serve_task = MagicMock()
+        serve_task.done.return_value = False
+
+        with patch('orchestrator.harness.create_server') as mock_create, \
+             patch('asyncio.create_task', return_value=serve_task), \
+             patch('asyncio.sleep', new=AsyncMock()):
+            await h._start_escalation_server()
+
+        assert mock_create.called, '_start_escalation_server did not reach create_server'
+        kwargs = mock_create.call_args.kwargs
+        assert 'task_claimant_lookup' in kwargs, (
+            f'task_claimant_lookup not passed to create_server; got {sorted(kwargs)}'
+        )
+        assert callable(kwargs['task_claimant_lookup'])
+        # The sibling seam it mirrors is still wired.
+        assert callable(kwargs['task_status_lookup'])
