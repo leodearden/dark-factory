@@ -6886,6 +6886,232 @@ class TestCostPhrase:
         assert mod._gap_cell(abs(delta)) in phrase, phrase
 
 
+# ===========================================================================
+# step-19 — the stamping table's zeros are STRUCTURALLY FORCED
+# ===========================================================================
+#
+# THE DEFECT.  `### What topic-stamping buys` publishes `stamped delta -
+# unstamped delta` per read arm, and the prose attaches a causal claim to it
+# ("the difference is what the campaign buys against regrowth").  On the
+# committed artifact every `after.unstamped.flat` value is bit-identical to
+# `after.stamped.flat`, `stamping_value['flat']` and
+# `stamping_value['additive_pin']` are all-`0.0`, and only
+# `promoting_pin.tokens_per_query.mean` is nonzero.  A reader takes away
+# "stamping buys 0.00 everywhere" — the wrong input for task 4006.
+#
+# Those zeros are not measurements.  Three separate ceilings force them, and
+# each is mechanically checkable, so each gets a test: if a ceiling stops
+# being true the disclosure that names it must fail loudly rather than go on
+# explaining away a number that has become real.
+#
+# Pure — every number below is a literal this file wrote or a structural
+# equality between two runs of the same pure function over hand-built data.
+# NO threshold or bound on any measured quantity (G6).
+
+
+def _ceiling_arm(mode: str, *, k: int = 5):
+    """A hand-built `c_peers` arm with ONE injected re-emission, in `mode`.
+
+    The two modes differ in EXACTLY the way the real injections do — a
+    `topic` key on the injected record and nothing else — so any measured
+    difference between them is a difference a read arm expressed from
+    metadata alone.
+
+    The canonical sits LAST in the ranking, outside a `k`-window: that is
+    both what makes the additive pin have something to add (ceiling 2) and
+    what keeps every discoverability metric measurable rather than `None`
+    (`topic_discoverability` scores the RAW hits, so a canonical outside the
+    read window is still found).
+    """
+    mod = _mod()
+    canonical = _rec('canon', topic='t', canonical=True, claim_ids=['k-canon'])
+    peers = [_rec(f'p{i}', topic='t', claim_ids=[f'k{i}']) for i in range(k - 1)]
+    metadata: dict = {'category': 'procedural_knowledge'}
+    if mode == 'stamped':
+        metadata['topic'] = 't'
+    injection = mod.ArmRecord(
+        record_id='regrow-1',
+        content='the canonical claim, restated in different words',
+        metadata=metadata,
+        cluster_id='c1',
+        claim_ids=['k-canon'],
+        role=mod.REGROWTH_ROLE,
+    )
+    records = [canonical, *peers, injection]
+    seeded = _seeded(
+        'c_peers', records,
+        canonical_by_topic={'t': canonical},
+        canonical_by_cluster={'c1': 'canon'},
+        siblings_by_cluster={'c1': {r.record_id for r in (*peers, injection)}},
+    )
+    ranked = [*peers, injection, canonical]
+    hits = [_sh(record, 0.9 - i / 100.0) for i, record in enumerate(ranked)]
+    return seeded, hits
+
+
+def _ceiling_base(*, k: int = 5):
+    """The same arm with NO injection — the baseline the deltas subtract."""
+    canonical = _rec('canon', topic='t', canonical=True, claim_ids=['k-canon'])
+    peers = [_rec(f'p{i}', topic='t', claim_ids=[f'k{i}']) for i in range(k - 1)]
+    seeded = _seeded(
+        'c_peers', [canonical, *peers],
+        canonical_by_topic={'t': canonical},
+        canonical_by_cluster={'c1': 'canon'},
+        siblings_by_cluster={'c1': {r.record_id for r in peers}},
+    )
+    hits = [_sh(record, 0.9 - i / 100.0) for i, record in enumerate([*peers, canonical])]
+    return seeded, hits
+
+
+def _ceiling_arms(seeded, hits, *, limit: int = 5) -> dict:
+    """`measure_regrowth_arms` over one hand-built ranking, projected flat."""
+    mod = _mod()
+    return mod._plucked_regrowth_arms(mod.measure_regrowth_arms(
+        seeded,
+        {'queries': {'q1': hits}, 'probes': {'c1': hits}},
+        queries=[_query()],
+        probes=[],
+        estimator=_CHARS,
+        guard_threshold=0.92,
+        limit=limit,
+    ))
+
+
+@functools.cache
+def _ceiling_stamping_value() -> dict:
+    """`stamping_value` end to end over the hand-built pair.
+
+    Same arithmetic the artifact's table is built from — `measure_arm` is
+    pure over `(SeededArm, fetched)`, so the whole chain runs with no store.
+    """
+    mod = _mod()
+    baseline = _ceiling_arms(*_ceiling_base())
+    deltas = {
+        mode: mod.regrowth_deltas(baseline, _ceiling_arms(*_ceiling_arm(mode)))
+        for mode in mod.REGROWTH_MODES
+    }
+    return mod.regrowth_stamping_value(deltas)
+
+
+class TestTheStampingTableCeilings:
+    """Why two of the three rows in `### What topic-stamping buys` are zero.
+
+    Not "stamping is worth nothing" — "this arm could not express a
+    difference".  The disclosure the renderer emits states these three
+    premises in prose; these tests are the premises themselves.
+    """
+
+    # --- ceiling 1: a metadata-blind read arm ---------------------------
+
+    def test_the_two_modes_emit_byte_identical_record_text(self):
+        """mem0 embeds the record CONTENT, so the two modes are the same
+        corpus to the embedder.  Whatever a stamping campaign changes, it is
+        not what the vectors look like.
+        """
+        assert (
+            [r.content for r in _regrowth_records('unstamped')]
+            == [r.content for r in _regrowth_records('stamped')]
+        )
+
+    def test_the_two_modes_differ_in_exactly_the_topic_key(self):
+        for unstamped, stamped in zip(
+            _regrowth_records('unstamped'), _regrowth_records('stamped'),
+            strict=True,
+        ):
+            assert (set(unstamped.metadata) ^ set(stamped.metadata)) == {'topic'}
+            assert {
+                key: value for key, value in stamped.metadata.items()
+                if key != 'topic'
+            } == dict(unstamped.metadata)
+
+    def test_a_metadata_blind_read_arm_cannot_express_a_stamping_difference(self):
+        """`read_path(pin=False)` slices `hits[:k]` and consults no metadata.
+
+        So the same ranking measured under the two modes returns EQUAL
+        metrics, and it could not have been otherwise.
+        """
+        mod = _mod()
+        measured = {
+            mode: mod._pluck_regrowth_metrics(
+                _measure(*_ceiling_arm(mode), pin=False, promote=False, limit=5)
+            )
+            for mode in mod.REGROWTH_MODES
+        }
+
+        assert measured['unstamped'] == measured['stamped']
+
+    def test_the_flat_rows_stamping_value_is_zero_on_every_metric(self):
+        """The property the disclosure claims, asserted end to end.
+
+        A structural zero, not a measurement: it is the difference between
+        two runs of the same pure function over inputs that differ only in a
+        key that function never reads.
+        """
+        flat = _ceiling_stamping_value()['flat']
+
+        assert set(flat) == set(_mod()._regrowth_metric_keys())
+        assert all(value == 0.0 for value in flat.values()), flat
+
+    # --- ceiling 2: a full window has no room for an additive pin -------
+
+    def test_a_full_window_additive_pin_cannot_express_one_either(self):
+        """`apply_topic_anchor` APPENDS and `read_path` truncates AFTER.
+
+        At `len(window) == k` the pinned canonical is taken straight back
+        off — the same thing `pin changed window = 0.00` reports elsewhere
+        in this artifact — so the additive arm's window is the flat arm's
+        window in BOTH modes.
+        """
+        mod = _mod()
+        for mode in mod.REGROWTH_MODES:
+            seeded, hits = _ceiling_arm(mode)
+            assert len(hits) > 5, 'the window must be full for this ceiling'
+
+            flat = mod.read_path(seeded, hits, 5, pin=False, promote=False)
+            pinned = mod.read_path(seeded, hits, 5, pin=True, promote=False)
+
+            assert [r.record_id for r in pinned] == [r.record_id for r in flat]
+            assert 'canon' not in [r.record_id for r in pinned]
+
+    def test_the_additive_pin_rows_stamping_value_is_zero_on_every_metric(self):
+        additive = _ceiling_stamping_value()['additive_pin']
+
+        assert set(additive) == set(_mod()._regrowth_metric_keys())
+        assert all(value == 0.0 for value in additive.values()), additive
+
+    # --- ceiling 3: arm (c) stamps every peer ---------------------------
+
+    def test_arm_c_stamps_every_peer_so_the_pin_usually_fires_from_a_sibling(self):
+        """`_materialize_c_peers` sets `topic` unconditionally.
+
+        So the injection's OWN stamp can only change the pin's firing when
+        the injection is the sole windowed record for its topic.  The probe
+        therefore measures stamping value against a 100%-stamped corpus —
+        the exact inverse of the live corpus esc-3200-3 documents, where
+        `count_memories_by_metadata(topic=...)` returned 1.  That bounds
+        `promoting_pin`'s stamping value from ABOVE; the inference is what
+        the disclosure states in prose, this asserts the arm-c property it
+        rests on.
+        """
+        records = _knowledge(_arm('c_peers'))
+
+        assert records
+        for record in records:
+            assert 'topic' in record.metadata, record.record_id
+
+    def test_every_injected_record_shares_its_topic_with_the_arm_c_peers(self):
+        """The other half of the same ceiling: the injection is never alone
+        in its topic, because arm (c) already stamped every peer of the
+        cluster it belongs to.
+        """
+        stamped_topics = {
+            record.metadata['topic'] for record in _knowledge(_arm('c_peers'))
+        }
+
+        for injection in _injections():
+            assert injection.topic in stamped_topics
+
+
 class TestRenderMarkdownRegrowthSection:
     """The operator-facing half of the probe.
 
@@ -7181,6 +7407,49 @@ class TestRenderMarkdownRegrowthSection:
             mod.render_markdown(_report_with_regrowth())
             == mod.render_markdown(_report_with_regrowth())
         )
+
+
+    # --- step-19: the stamping table's forced zeros, disclosed -----------
+
+    def test_the_stamping_ceiling_disclosure_appears_verbatim_in_the_section(self):
+        """VERBATIM identity on a module constant, not substrings of prose.
+
+        The convention `test_the_disclosure_appears_verbatim_in_the_protocol_
+        section` already established: the constant's TEXT is operator-facing
+        prose and free to change; what is pinned is that it is there and
+        where it is.
+        """
+        mod = _mod()
+        section = _section(
+            mod.render_markdown(_report_with_regrowth()), '## Regrowth deltas',
+        )
+
+        assert mod.REGROWTH_STAMPING_CEILING_DISCLOSURE in section
+
+    def test_it_sits_between_the_stamping_heading_and_the_stamping_table(self):
+        """Asserted by relative index: a disclosure that drifts away from the
+        number it qualifies is not a disclosure.
+        """
+        mod = _mod()
+        section = _section(
+            mod.render_markdown(_report_with_regrowth()), '## Regrowth deltas',
+        )
+
+        heading_at = section.index('### What topic-stamping buys')
+        disclosure_at = section.index(mod.REGROWTH_STAMPING_CEILING_DISCLOSURE)
+        header_at = section.index(_header_row(mod.REGROWTH_STAMPING_COLUMNS))
+
+        assert heading_at < disclosure_at < header_at
+
+    def test_it_is_not_emitted_when_there_is_no_stamping_table_to_qualify(self):
+        """Unlike the blind-authoring disclosure, which describes the probe's
+        AUTHORING and is emitted always, this one qualifies a specific table.
+        On a `--no-regrowth` run there is no table and nothing to qualify.
+        """
+        mod = _mod()
+
+        assert mod.REGROWTH_STAMPING_CEILING_DISCLOSURE not in mod.render_markdown(
+            _report())
 
 
 class TestTheNotBlindAuthoredDisclosure:
