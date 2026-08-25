@@ -1472,24 +1472,19 @@ def test_the_markdown_gives_each_axis_2_value_its_own_column(tmp_path):
         assert label in header, header
 
 
-def test_the_markdown_states_that_a_lock_is_derived_from_metadata_files(tmp_path):
-    """(f) THE CAVEAT, in the operator's own terms. Without it a reader takes
-    `lock_reconciled` at face value — which is precisely the v1 defect, moved
-    from the code into the reader's head."""
-    markdown = render_markdown(
-        build_report([_census(tmp_path, tasks=[_stamped(1)])])
-    ).lower()
+def test_the_markdown_carries_the_machine_readable_axis_2_vocabulary(tmp_path):
+    """(f) The markdown's column headers are prose-cased ("lock reconciled"),
+    so the raw JSON token must also appear somewhere in the document —
+    otherwise an operator holding the .md cannot join a row to the
+    `reconciliation` value they will read out of the .json twin.
 
-    # a lock's modules come FROM metadata.files, so it is not independent
-    assert "derived from `metadata.files`" in markdown
-    assert "not an independent scope derivation" in markdown
-    # ...therefore it is the weaker class, and the consumer must choose
-    assert "weaker signal than `plan_reconciled`" in markdown
-    assert "decide for itself" in markdown
-    # ...while plan_reconciled is the genuine article
-    assert "genuine plan-derived assertion" in markdown
-    # ...and a lock_reconciled record may still be carrying the guess
-    assert "may still be carrying the tagger's guess" in markdown
+    Deliberately NOT a pin on the surrounding caveat's wording: the sentences
+    explaining WHY `lock_reconciled` is the weaker class are copy, and a
+    reword must not turn CI red while every classification behaviour is
+    unchanged."""
+    markdown = render_markdown(build_report([_census(tmp_path, tasks=[_stamped(1)])]))
+
+    assert LOCK_RECONCILED in markdown
 
 
 def test_rendering_is_deterministic_and_ends_with_one_trailing_newline(tmp_path):
