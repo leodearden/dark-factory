@@ -82,6 +82,7 @@ from shared.toolcall_markup import (  # noqa: E402
     PREFILTER_NEEDLES,
     Repair,
     detect,
+    detect_for,
     repair,
 )
 
@@ -499,7 +500,7 @@ def dedupe_by_realpath(targets: list[Target]) -> list[Target]:
 #: A repair was applied: the field was truncated to its clean prefix and every
 #: recovered sibling restored.
 ACTION_REPAIRED = 'repaired'
-#: The string was flagged by detect() but repair() declined. The value is left
+#: The string was flagged by the gate but repair() declined. The value is left
 #: BYTE-IDENTICAL and the reason is reported for human adjudication.
 ACTION_REFUSED = 'refused'
 
@@ -548,7 +549,13 @@ REASON_LIST_ELEMENT_NO_OBJECT = 'list-element-no-object'
 
 
 class Outcome(NamedTuple):
-    """What happened to one detect()-flagged string, and where."""
+    """What happened to one flagged string, and where.
+
+    "Flagged" is ``detect_for`` inside an object — where the field name and the
+    record's own keys are in hand — and the blanket ``detect`` for a bare list
+    element, which has neither. One enumeration, two named predicates over it
+    (INV-5).
+    """
 
     #: Dotted/indexed location within the document, e.g.
     #: ``design_decisions[1].rationale``. Built for the operator's report.
@@ -641,12 +648,22 @@ def _repair_dict(node: dict, path: str, outcomes: list[Outcome]) -> tuple[dict, 
         value = working[key]
 
         if isinstance(value, str):
-            if detect(value) is None:
-                continue
             # Recomputed per FIELD, not once per object: a hole filled by an
             # earlier repair in this same pass is no longer a hole, and two
-            # corrupted fields must never both claim it.
+            # corrupted fields must never both claim it. Hoisted above the gate
+            # because the gate now needs it too.
             schema = set(working.keys())
+            # PARAMETER-AWARE (task 4696). The blanket ``detect`` spells none of
+            # the writing tools' own parameter names, so a field mis-closed with
+            # its OWN tag was skipped here and reached NEITHER the repair nor the
+            # residue counters — silently absent from the human-adjudication
+            # queue, which is the one thing this sweep must never do with
+            # unrepaired leak. This object's own keys ARE the schema the repair
+            # below is already qualified against, so asking the wider predicate
+            # costs one set() that was being built two lines later anyway, and
+            # re-spells nothing (INV-5).
+            if detect_for(value, key, schema) is None:
+                continue
             targets = _string_holes(working) - {key}
             result = repair(value, key, schema, schema - targets - {key})
 
@@ -716,6 +733,11 @@ def _repair_list(node: list, path: str, outcomes: list[Outcome]) -> tuple[list, 
     changed = False
     for index, item in enumerate(node):
         if isinstance(item, str):
+            # The BLANKET predicate here, deliberately, and NOT the
+            # parameter-aware one the object gate uses (task 4696): a bare list
+            # element has no field name and no sibling keys, so there is no
+            # parameter context to be aware of. The asymmetry is a consequence
+            # of the shape, not a missed site.
             if detect(item) is not None:
                 outcomes.append(Outcome(
                     json_path=f'{path}[{index}]',
