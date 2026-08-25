@@ -2001,6 +2001,45 @@ class TestParseMetadataFailurePolicy:
         ]
         assert offending == [], f'Expected no unknown_key warning for files_tagged_at; got: {offending}'
 
+    def test_recurrence_metadata_key_is_blessed(self):
+        """The recurring-chain link spec is deliberately blessed AND registered (task 4676).
+
+        PRD ``docs/prds/recurring-deterministic-tasks.md`` R-D4 specifies
+        BOTH: ``recurrence`` is a registered submodel (so parse_metadata
+        types and validates the slice) and a Tier-A blessed key (so the
+        unknown-key scan skips it even if the registration is ever moved,
+        made lazy, or otherwise not yet in place when a blob is parsed) —
+        and so that migrate_task_metadata_to_x_namespace.py refuses to
+        x_-namespace it, which for a submodel-backed key with live readers
+        is the correct refusal.
+
+        Assertion 2 exists precisely because assertion-by-unknown_key-alone
+        cannot distinguish the blessing from the registration: a REGISTERED
+        key is already in known_fields and never reaches the unknown-key
+        scan, so the obvious spelling of this test would be born green. It
+        pops the registration to isolate the property the blessing buys.
+
+        The parametrized
+        test_every_blessed_metadata_key_individually_suppresses_unknown_key_warning
+        above also covers the key for free once blessed — this test carries
+        the rationale, not the coverage.
+        """
+        # 1. Direct membership: the blessing is belt-and-braces over the
+        #    registration.
+        assert 'recurrence' in task_metadata_module._BLESSED_METADATA_KEYS
+
+        # 2. The behaviour that membership buys, proven independently of the
+        #    registration. The autouse fixture snapshots and restores
+        #    _SUBMODEL_REGISTRY, and its ownership assertion inspects only
+        #    keys a test ADDED — so a pop is safe and is restored on
+        #    teardown. Do NOT re-register the production key (task 3352).
+        task_metadata_module._SUBMODEL_REGISTRY.pop('recurrence')
+        _, warnings = parse_metadata(
+            {'recurrence': {'key': 'k', 'interval_secs': 1}}, direction='read'
+        )
+        unknown_key_fields = {w.field for w in warnings if w.code == 'unknown_key'}
+        assert 'recurrence' not in unknown_key_fields
+
     def test_cross_repo_metadata_keys_are_blessed(self):
         """The cross-repo deliverable marker must not census-warn (task 3004).
 
