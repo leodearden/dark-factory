@@ -36,14 +36,18 @@ Covers:
 
 from __future__ import annotations
 
+import ast
 import os
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
-from escalation.pins import _norm_id
+from escalation.models import Escalation
+from escalation.pins import _norm_id, classify_pins
+from shared.task_claimant import compose_claimant_run_id
 
 import orchestrator.harness as harness_module
 from orchestrator.harness import Harness
+from orchestrator.scheduler import SetTaskStatusRejected
 
 _HARNESS_SRC_PATH = Path(harness_module.__file__)
 
@@ -125,3 +129,117 @@ class TestHarnessFilingClaimantIdentity:
         assert '-' not in session
         assert len(session) < 10
         assert '/' not in session  # would corrupt the composed identity's shape
+
+
+# ---------------------------------------------------------------------------
+# step-7/8: the identity on a real harness filing, and the tripwire
+# ---------------------------------------------------------------------------
+
+
+class TestHarnessFilingsCarryTheIdentity:
+    """A REAL harness filing stamps it, and Link 4 then acts on it."""
+
+    def test_reconcile_failure_filing_is_stamped_and_classifies_dead_l0(
+        self, mock_orch_config,
+    ) -> None:
+        """``_escalate_reconcile_failure`` — the one harness record Link 4 governs.
+
+        An ast scan of ``harness.py``'s ``Escalation(...)`` sites shows this
+        is the ONLY one filing a level-0, non-``info`` record against a REAL
+        task id.  Every other site is either ``severity='info'`` (Link 1 →
+        NON_PINNING) or an explicit ``level=1``/``level=2`` (Link 3 →
+        QUEUE_HANDOFF), so the filing identity never reaches Link 4 there.
+
+        The downstream MEANING is asserted, not left incidental: the harness's
+        synthetic session literal can never equal a workflow claimant, so once
+        task 3541 wires ``live_claimant_id`` through, this record classifies
+        ``dead_l0`` and stops pinning recovery.  That is the PRD's stated
+        intent (``plans/task-escalation-state-graph-prd.md`` task eta item 4 —
+        an unconsumed L0 whose filing incarnation is dead should be PROMOTED
+        for visibility, not left immortal), and it is safe because the
+        PROTECTIVE half survives: ``vetoes_done_flip`` stays True.
+
+        NOTE: ``level == 0`` here encodes the OBSERVED status quo.  That
+        site's docstring says "Submit an L1 escalation" but it passes no
+        ``level=``, so it builds at the dataclass default 0.  The
+        contradiction is filed as out-of-scope ticket
+        tkt_0RSVX7E03MYACJPMGPH1GWMW08 and deliberately NOT resolved here —
+        correcting the docstring is behaviour-neutral, while adding
+        ``level=1`` would flip this record from reaper-eligible DEAD_L0 to
+        permanently-pinning QUEUE_HANDOFF.  Whoever resolves that ticket moves
+        this assertion with them.
+        """
+        h = _build_harness(mock_orch_config)
+        h._run_id = 'run-xyz'
+
+        submitted: list[Escalation] = []
+        queue = MagicMock()
+        queue.make_id = MagicMock(return_value='esc-77-1')
+        queue.submit = MagicMock(side_effect=submitted.append)
+        h._escalation_queue = queue
+
+        h._escalate_reconcile_failure(
+            '77',
+            SetTaskStatusRejected('77', 'provenance_missing', 'raw text'),
+        )
+
+        assert len(submitted) == 1
+        esc = submitted[0]
+        assert esc.filing_claimant_run_id == h._filing_claimant_run_id
+        # The status quo this assertion encodes — see ticket note above.
+        assert esc.level == 0
+        assert esc.severity == 'blocking'
+
+        # A workflow-shaped claimant holds the task; the harness identity can
+        # never equal it, so the handoff has no live consumer.
+        workflow_id = compose_claimant_run_id('run-xyz', '77-abcd1234', os.getpid())
+        assert workflow_id != esc.filing_claimant_run_id
+        report = classify_pins(
+            '77', [esc], live_claimant=True, live_claimant_id=workflow_id,
+        )
+        assert report.dead_l0 == ('esc-77-1',)
+        assert report.pins is False           # recovery is no longer blocked...
+        assert report.vetoes_done_flip is True  # ...but the done-flip veto holds
+
+
+def _escalation_call_sites(module_path: Path) -> list[ast.Call]:
+    """Every ``Escalation(...)`` construction in *module_path*.
+
+    MUST be ``ast``, never a regex: ``harness.py`` carries docstring and
+    comment prose mentioning ``Escalation(...)``, which a regex would report
+    as an unstamped filing site.
+    """
+    tree = ast.parse(module_path.read_text(encoding='utf-8'))
+    return [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == 'Escalation'
+    ]
+
+
+class TestEveryHarnessFilingSiteIsStamped:
+    """Structural tripwire over ``harness.py`` — the sibling of
+    ``test_workflow_claimant.py::TestEveryWorkflowFilingSiteIsStamped``.
+
+    TOTAL rule, no allowlist, for the same reason: the field is load-bearing
+    only at level-0 non-``info`` records, but a site whose level later flips
+    to 0 would silently lose the stamp — which is how this defect arose.
+    """
+
+    def test_all_escalation_constructions_pass_filing_claimant_run_id(self) -> None:
+        calls = _escalation_call_sites(_HARNESS_SRC_PATH)
+        # Baseline at the time of writing; a drop means sites moved out of
+        # this module and the tripwire's coverage silently shrank.
+        assert len(calls) >= 27, f'expected >=27 Escalation(...) sites, found {len(calls)}'
+
+        unstamped = [
+            node.lineno for node in calls
+            if not any(kw.arg == 'filing_claimant_run_id' for kw in node.keywords)
+        ]
+        assert not unstamped, (
+            f'{_HARNESS_SRC_PATH.name}: Escalation(...) without '
+            f'filing_claimant_run_id at lines {unstamped} — every filing site '
+            f'must stamp the filing incarnation (task 3550); use '
+            f'self._filing_claimant_run_id.'
+        )
