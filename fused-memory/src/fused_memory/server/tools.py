@@ -3231,6 +3231,30 @@ def create_mcp_server(
                 caller_declared_child=caller_declared_child,
                 is_recon_stage_agent=is_recon_stage_agent,
             )
+        # DEFERRED, DELIBERATELY: the topic-cluster signal contributes nothing
+        # to triage routing in this leaf. The PRD's band rule (§Bands) is
+        # "`s < T_high` with a topic-cluster hit still goes to the judge", and
+        # what happens here instead is that the deterministic topic pre-check
+        # below is switched off with the cosine reject it shares a gate with,
+        # so a topic hit under `t_high` routes to `stored`.
+        #
+        # It costs nothing OBSERVABLE today, which is why it is deferred whole
+        # rather than half-built: `_stub_judge` answers `stored`, so routing a
+        # topic hit to the judge would produce the same ack, the same persisted
+        # record and the same counter reading as not routing it. The arm is
+        # worth writing alongside something that can act on it — leaf GAMMA's
+        # real judge — and worth reading from a cluster store worth reading,
+        # which is leaf ZETA's job (the config-seeded list is 5
+        # dark-factory-only topics fed by a manual hop that most topics never
+        # got). Both land before task 3169, the deterministic flip gate, so
+        # the operator reviewing that gate sees the PRD rule either
+        # implemented or still named here.
+        #
+        # The signpost for whoever restores it:
+        # `test_a_topic_cluster_match_lands_rather_than_bouncing` asserts
+        # `routed == stored` for a topic match, and a real judge may answer
+        # otherwise. That assertion is EXPECTED to change with this arm — it
+        # pins the retirement of the soft-block, not the outcome `stored`.
         if (
             not triage_enabled
             and category == 'procedural_knowledge'

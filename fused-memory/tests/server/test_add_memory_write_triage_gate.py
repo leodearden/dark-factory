@@ -569,10 +569,20 @@ class TestTheFlagOnPathRetiresBothRejectGuards:
 
         Below `t_high` a topic hit is a JUDGE question, not a rejection (C1) —
         and while the judge is a deliberate stub answering `stored`, the
-        observable contract at this boundary is that the write LANDS. What the
-        judge eventually does with the topic signal is leaf gamma's; what this
-        pins is that the agent's text is never thrown away for matching a
+        observable contract at this boundary is that the write LANDS. What
+        this pins is that the agent's text is never thrown away for matching a
         known-contradictory topic.
+
+        WHAT IT DOES NOT PIN is the value `stored`. The PRD's band rule
+        (§Bands) routes a sub-`t_high` topic hit to the judge, and this leaf
+        does not: the cluster signal reaches no routing decision at all, which
+        is deferred deliberately and documented at the gate in
+        `tools.py::add_memory` — the two are indistinguishable while
+        `_stub_judge` answers `stored`, so building the arm now would add a
+        branch no test could tell from its absence. Leaf gamma's real judge is
+        what makes them differ, and gamma may well answer `restated` here; the
+        assertion below is expected to move with that arm rather than to
+        forbid it.
         """
         mock_service = AsyncMock()
         _configure_config(
