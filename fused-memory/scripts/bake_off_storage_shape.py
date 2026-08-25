@@ -3018,9 +3018,17 @@ def _regrowth_lines(report: dict[str, Any]) -> list[str]:
         'number task 4006\'s stamping campaign is owed: the unstamped delta '
         'is what one re-emission costs today, the stamped delta is what it '
         'would cost if the write path stamped every re-emission, and the '
-        'difference is what the campaign buys against regrowth.  Sign is the '
+        'difference is what the campaign buys against regrowth ON THE ARMS '
+        'THAT CAN EXPRESS ONE — which is not all three of them.  Read the '
+        'paragraph below before reading the table.  Sign is the '
         'underlying column\'s: on recall and discoverability a positive '
         'value is cost recovered, on `tokens/query` it is not.',
+        '',
+        # Spliced BETWEEN the heading and the table on purpose: this
+        # qualifies the numbers in the rows immediately below it, and a
+        # qualifier a section away is not a qualifier on this number.  A
+        # test pins the relative index.
+        REGROWTH_STAMPING_CEILING_DISCLOSURE,
         '',
         '| ' + ' | '.join(REGROWTH_STAMPING_COLUMNS) + ' |',
         '| ' + ' | '.join('---' for _ in REGROWTH_STAMPING_COLUMNS) + ' |',
@@ -3470,6 +3478,47 @@ REGROWTH_BLIND_AUTHORING_DISCLOSURE = (
     'was injected before any delta was seen, not before the metrics were '
     'written.  Its commit is in the fixture table below.  Read the regrowth '
     'section as a disclosed non-blind measurement, not as a blind one.'
+)
+
+#: Why two of the three rows in `### What topic-stamping buys` are zero, in
+#: the report's own voice, spliced BESIDE that table rather than into a
+#: distant section — a qualifier placed anywhere else is not a qualifier on
+#: this number.
+#:
+#: The hazard it guards is the one 3560 and 4004 each had to correct after
+#: publication: a number that could not have been anything else, read as a
+#: measurement.  Every ceiling named here is asserted mechanically by
+#: ``TestTheStampingTableCeilings``, so a ceiling that stops being true
+#: fails a test rather than leaving this text explaining away a number that
+#: has become real.
+#:
+#: The rows themselves STAY (review option (b)).  That is the convention
+#: this artifact already uses for exactly this hazard — ``guard matched
+#: (replay)`` publishes its ceiling as ``(n=covered/probes)`` plus a
+#: paragraph naming a limit "identical across all six arms and unrelated to
+#: storage shape", and ``median canonical rank`` carries
+#: ``(n=found/candidates)``.  Neither drops the row: a dropped row hides
+#: that the arm was measured at all, a disclosed row tells the reader both
+#: the number and why it could not have been otherwise.
+REGROWTH_STAMPING_CEILING_DISCLOSURE = (
+    '**Two of these three rows are forced to `0.00` by construction, not by '
+    'measurement.**  `flat` cannot express a stamping difference at all: the '
+    'two modes emit byte-identical record TEXT and differ only in a `topic` '
+    'metadata key, mem0 embeds the content, and a flat read consults no '
+    'metadata — a metadata-blind read arm has nothing to read the stamp '
+    'with.  `additive_pin` is forced to `0.00` wherever the read window is '
+    'full: the pin APPENDS its canonical and the window budget truncates it '
+    'straight back off, which is the same thing `pin changed window = 0.00` '
+    'reports elsewhere in this artifact.  `promoting_pin` is the only arm '
+    'that can express one, and its value is bounded from ABOVE, because arm '
+    '(c) stamps `topic` on every peer — so the pin usually fires from a '
+    'sibling rather than from the injection\'s own stamp, and the probe is '
+    'measuring stamping value against a 100%-stamped corpus.  That is the '
+    'INVERSE of the live corpus esc-3200-3 documents, where '
+    '`count_memories_by_metadata(topic=…)` returned one stamped record for '
+    'the whole topic.  So a `0.00` in this table reads as "this arm could '
+    'not express a difference", NOT as "stamping is worth nothing", and '
+    'task 4006\'s campaign is not scored by this table alone.'
 )
 
 
