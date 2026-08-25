@@ -6680,6 +6680,212 @@ def _header_row(columns) -> str:
     return '| ' + ' | '.join(columns) + ' |'
 
 
+# ===========================================================================
+# step-17 — the signal sentence's two derived phrases
+# ===========================================================================
+#
+# `_absorption_phrase` and `_cost_phrase` are the only two places in this
+# renderer that turn a measured delta into a DIRECTIONAL CLAIM, and they sit
+# in the probe's headline sentence.  Both had zero direct coverage, and both
+# are wrong on the committed data: `_absorption_phrase` compared `abs()`, so
+# a measured GAIN of 0.0042 and a measured LOSS of 0.0042 read as "the same
+# distance from baseline", and the sentence hard-typed the verb "costs"
+# around `_gap_cell`, so a measured GAIN rendered as a cost.
+#
+# Pure — every input below is a literal this file writes, so NO measured
+# magnitude, threshold or bound is pinned (gate G6).  What is pinned is the
+# SENTENCE'S LOGIC, which stays valid whatever the next run measures.
+
+
+class TestAbsorptionPhrase:
+    """Does 4004's selected transform absorb the flat read's cost?
+
+    The question is directional, so the answer has to be computed from the
+    SIGNED cost `delta * cost_sign` — not from distance-from-baseline, which
+    cannot tell a gain from a loss.
+    """
+
+    def test_every_metric_declares_a_cost_direction(self):
+        """By EQUALITY, and covering every key `REGROWTH_METRICS` projects.
+
+        A metric with no declared direction must not be silently defaulted
+        to "higher is better": that is true of five of these seven columns
+        and false of the other two, and a default would get the exceptions
+        wrong in the one sentence a gate reads.
+        """
+        mod = _mod()
+        assert mod._REGROWTH_COST_SIGN == {
+            'claim_recall.at_5': -1,
+            'claim_recall.at_10': -1,
+            'discoverability.stored_canonical_in_top_5_rate': -1,
+            'discoverability.stored_canonical_median_rank': +1,
+            'discoverability.stored_canonical_found_count': -1,
+            'discoverability.canonical_in_top_5_rate': -1,
+            'tokens_per_query.mean': +1,
+        }
+
+    def test_its_keys_are_exactly_the_regrowth_metric_keys(self):
+        """So adding a metric without declaring its direction fails loudly."""
+        mod = _mod()
+        assert set(mod._REGROWTH_COST_SIGN) == set(mod._regrowth_metric_keys())
+
+    @pytest.mark.parametrize('flat,selected,cost_sign,expected', [
+        # Either side never measured — unchanged behaviour.
+        (None, -0.10, -1, 'not comparable'),
+        (-0.10, None, -1, 'not comparable'),
+        (None, None, +1, 'not comparable'),
+        # Neither arm moved at all.
+        (0.0, 0.0, -1, 'neither arm moved'),
+        (0.0, 0.0, +1, 'neither arm moved'),
+        # Both moved AGAINST the cost direction: nobody paid anything.
+        (+0.10, +0.20, -1, 'neither arm paid a cost'),
+        (+0.10, 0.0, -1, 'neither arm paid a cost'),
+        (-0.10, -0.20, +1, 'neither arm paid a cost'),
+        # The flat read paid; the selected transform paid nothing.
+        (-0.10, 0.0, -1, 'absorbs all of it'),
+        (+3.13, 0.0, +1, 'absorbs all of it'),
+        # The flat read paid; the selected transform GAINED — a sign flip.
+        (-0.10, +0.30, -1, 'more than absorbs it'),
+        (+3.13, -1.00, +1, 'more than absorbs it'),
+        # The flat read paid more than the selected transform did.
+        (-0.20, -0.10, -1, 'absorbs part of it'),
+        (+3.13, +1.00, +1, 'absorbs part of it'),
+        # Both paid the same.
+        (-0.10, -0.10, -1, 'does not change it'),
+        (+3.13, +3.13, +1, 'does not change it'),
+        # The selected transform paid MORE.
+        (-0.10, -0.20, -1, 'costs more than the flat read'),
+        (+1.00, +3.13, +1, 'costs more than the flat read'),
+        # The flat read did not pay, the selected transform did.  This is
+        # the committed-data case, and the one the `abs()` form got wrong.
+        (+0.10, -0.30, -1, 'opposite directions'),
+        (0.0, -0.30, -1, 'opposite directions'),
+        (-1.00, +3.13, +1, 'opposite directions'),
+    ])
+    def test_the_branch_table(self, flat, selected, cost_sign, expected):
+        phrase = _mod()._absorption_phrase(flat, selected, cost_sign=cost_sign)
+        assert expected in phrase, phrase
+
+    @pytest.mark.parametrize('flat,selected,cost_sign', [
+        (+0.10, +0.20, -1),          # neither paid — name both, not "nothing"
+        (-0.10, +0.30, -1),          # the sign flip
+        (+0.0042372881355934, -0.0042372881355934, -1),   # committed data
+        (-1.00, +3.13, +1),          # opposite directions
+    ])
+    def test_it_names_both_signed_values_wherever_the_two_arms_disagree(
+        self, flat, selected, cost_sign,
+    ):
+        """A reader told "nothing happened" when both arms GAINED, or told
+        one arm's number when the two moved in opposite directions, cannot
+        reconstruct the table from the sentence.
+        """
+        mod = _mod()
+        phrase = mod._absorption_phrase(flat, selected, cost_sign=cost_sign)
+        assert mod._gap_cell(flat) in phrase, phrase
+        assert mod._gap_cell(selected) in phrase, phrase
+
+    def test_the_committed_data_case_is_not_reported_as_no_change(self):
+        """The regression anchor, pinned by VALUE.
+
+        These two floats are the committed
+        `deltas.unstamped.{flat,promoting_pin}.claim_recall.at_5`: the flat
+        read GAINED 0.0042 while `promoting_pin` LOST 0.0042.  The `abs()`
+        form called that 'does not change it (-<0.01, the same distance from
+        baseline as the flat read)' — two opposite findings declared
+        equivalent in the probe's headline sentence.
+
+        They are literals this test carries, not a threshold on a
+        re-measurement: the assertion is about the sentence's LOGIC and
+        stays valid whatever the next run measures.
+        """
+        mod = _mod()
+        phrase = mod._absorption_phrase(
+            +0.0042372881355934, -0.0042372881355934, cost_sign=-1,
+        )
+        assert 'does not change it' not in phrase, phrase
+        assert mod._gap_cell(+0.0042372881355934) in phrase, phrase
+        assert mod._gap_cell(-0.0042372881355934) in phrase, phrase
+
+    @pytest.mark.parametrize('a,b,cost_sign', [
+        (-0.10, 0.0, -1),
+        (-0.10, -0.20, -1),
+        (+0.10, +0.20, -1),
+        (-0.10, +0.30, -1),
+        (+1.00, +3.13, +1),
+        (+0.0042372881355934, -0.0042372881355934, -1),
+    ])
+    def test_the_two_arguments_are_not_interchangeable(self, a, b, cost_sign):
+        """Symmetry is NOT claimed, so a transposed call site cannot be
+        silent: the flat read and the selected transform play different
+        roles in the sentence and swapping them must change what it says.
+        """
+        mod = _mod()
+        assert (
+            mod._absorption_phrase(a, b, cost_sign=cost_sign)
+            != mod._absorption_phrase(b, a, cost_sign=cost_sign)
+        )
+
+
+class TestCostPhrase:
+    """One delta, rendered as a cost or a gain — never hard-typed.
+
+    The committed artifact reads 'one unstamped re-emission per topic costs
+    <0.01 claim recall@5' for a measured GAIN of +0.0042, because the
+    sentence typed the word "costs" around `_gap_cell`.  The verb has to be
+    derived from the same `cost_sign` the absorption phrase branches on.
+    """
+
+    @pytest.mark.parametrize('delta,cost_sign,expected', [
+        # cost_sign -1: a NEGATIVE delta is the cost.
+        (-0.10, -1, 'costs'),
+        (+0.10, -1, 'gains'),
+        (-0.0042372881355934, -1, 'costs'),
+        (+0.0042372881355934, -1, 'gains'),
+        # cost_sign +1: a POSITIVE delta is the cost (tokens, rank).
+        (+3.13, +1, 'costs'),
+        (-3.13, +1, 'gains'),
+    ])
+    def test_the_verb_follows_the_cost_direction(
+        self, delta, cost_sign, expected,
+    ):
+        phrase = _mod()._cost_phrase(delta, cost_sign=cost_sign)
+        assert phrase.startswith(expected), phrase
+
+    @pytest.mark.parametrize('cost_sign', [-1, +1])
+    def test_an_exact_zero_did_not_move(self, cost_sign):
+        phrase = _mod()._cost_phrase(0.0, cost_sign=cost_sign)
+        assert 'does not move' in phrase, phrase
+        assert 'costs' not in phrase, phrase
+        assert 'gains' not in phrase, phrase
+
+    @pytest.mark.parametrize('cost_sign', [-1, +1])
+    def test_a_never_measured_delta_says_so(self, cost_sign):
+        """`None` is "no measurement", which is a different finding from
+        "measured zero" everywhere else in this renderer and stays different
+        here.
+        """
+        phrase = _mod()._cost_phrase(None, cost_sign=cost_sign)
+        assert 'never measured' in phrase, phrase
+        assert 'costs' not in phrase, phrase
+        assert 'gains' not in phrase, phrase
+        assert 'does not move' not in phrase, phrase
+
+    @pytest.mark.parametrize('delta,cost_sign', [
+        (-0.10, -1), (+0.10, -1), (+3.13, +1), (-3.13, +1),
+        (+0.0042372881355934, -1),
+    ])
+    def test_it_carries_the_magnitude_through_the_shared_formatter(
+        self, delta, cost_sign,
+    ):
+        """`_gap_cell` stays the number formatter — this changes the VERB,
+        not the formatting, so `<0.01` (moved, too little to round up) can
+        never come out as `0.00` (measured, did not move).
+        """
+        mod = _mod()
+        phrase = mod._cost_phrase(delta, cost_sign=cost_sign)
+        assert mod._gap_cell(abs(delta)) in phrase, phrase
+
+
 class TestRenderMarkdownRegrowthSection:
     """The operator-facing half of the probe.
 
