@@ -742,7 +742,7 @@ def register_metadata_submodel(
 # time (rather than lazily) guarantees the 'milestone' slice is validated
 # and typed before any of parse_metadata's many callers across packages run.
 #
-# cardinality='dict' is stated explicitly on all three registrations below
+# cardinality='dict' is stated explicitly on every registration below
 # even though it is the default: these are the load-bearing declarations the
 # task-4142 shape gate exists to make legible, and an explicit call site is
 # immune to a future flip of the default.
@@ -760,6 +760,15 @@ register_metadata_submodel('routing', RoutingState, cardinality='dict')
 # `| None = None` field, staying absent from model_dump() when unset (no
 # None-noise on every task).
 register_metadata_submodel('merge_retry_pending', MergeRetryPending, cardinality='dict')
+
+# recurrence (PRD docs/prds/recurring-deterministic-tasks.md R-D4, task
+# 4676): registered at import time like milestone/routing/merge_retry_pending
+# so the slice is typed and validated before any of parse_metadata's
+# cross-package callers run, lands in known_fields (no unknown_key census
+# noise), stays absent from model_dump() when unset, and picks up the
+# task-4142 cardinality gate — so a list-shaped value is REJECTED under
+# write+enforce instead of silently validating element-wise.
+register_metadata_submodel('recurrence', Recurrence, cardinality='dict')
 
 
 def _normalize_legacy_memory_hints(value: object) -> object:
