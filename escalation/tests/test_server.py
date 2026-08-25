@@ -7653,3 +7653,238 @@ class TestRootCauseOverfoldReport:
         assert len(refreshed.dedupe_children) == 1, (
             f'the folded child must be recorded: {refreshed.dedupe_children!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# task 3550: the agent filing surface stamps the filing incarnation
+# ---------------------------------------------------------------------------
+
+
+def _claimant_lookup(value: str | None, *, calls: list[str] | None = None):
+    """An async ``(task_id) -> str|None`` stand-in for the injected seam.
+
+    Mirrors how ``test_server_chokepoint.py`` injects ``task_status_lookup``.
+    """
+    async def _lookup(task_id: str) -> str | None:
+        if calls is not None:
+            calls.append(task_id)
+        return value
+
+    return _lookup
+
+
+class TestFilingClaimantIdentityStamp:
+    """``task_claimant_lookup`` stamps ``Escalation.filing_claimant_run_id``.
+
+    Task 3550.  ``escalation.pins`` Link 4 can only distinguish a live handoff
+    from a dead one when the record carries the identity of the incarnation
+    that FILED it; before this, nothing outside tests ever stamped it, so
+    every real record read as "unknown" and fell back to pinning.
+
+    The DB row's ``claimant_run_id`` is the right source because it holds the
+    identity ``TaskWorkflow``'s dispatch stamp wrote via the same
+    ``compose_claimant_run_id`` call — so an AGENT-filed escalation is stamped
+    with the identity of the incarnation that dispatched that agent,
+    byte-identical to that workflow's own filings.
+    """
+
+    _ID = 'run-1/sess-1/pid=7'
+
+    @pytest.mark.asyncio
+    async def test_blocker_filing_is_stamped(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(
+            queue,
+            task_claimant_lookup=_claimant_lookup(self._ID),
+            startup_sweep=False,
+        )
+
+        result = await _blocker(server, **_COMMON_KWARGS)
+
+        esc = queue.get(result['id'])
+        assert esc is not None
+        assert esc.level == 0
+        assert esc.filing_claimant_run_id == self._ID
+
+    @pytest.mark.asyncio
+    async def test_info_filing_is_stamped(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(
+            queue,
+            task_claimant_lookup=_claimant_lookup(self._ID),
+            startup_sweep=False,
+        )
+
+        result = await _info(server, **_COMMON_KWARGS)
+
+        esc = queue.get(result['id'])
+        assert esc is not None
+        assert esc.filing_claimant_run_id == self._ID
+
+    @pytest.mark.asyncio
+    async def test_lookup_is_called_with_the_filings_task_id(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        calls: list[str] = []
+        server = create_server(
+            queue,
+            task_claimant_lookup=_claimant_lookup(self._ID, calls=calls),
+            startup_sweep=False,
+        )
+
+        await _blocker(server, **_COMMON_KWARGS)
+
+        assert calls == ['task-999']
+
+    @pytest.mark.asyncio
+    async def test_no_lookup_injected_leaves_the_field_none(self, tmp_path: Path):
+        """The standalone escalation server (and every pre-3550 test) is undisturbed.
+
+        The seam is optional-with-None exactly like ``task_status_lookup``, so
+        omitting it preserves the legacy record shape.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue, startup_sweep=False)
+
+        result = await _blocker(server, **_COMMON_KWARGS)
+
+        esc = queue.get(result['id'])
+        assert esc is not None
+        assert esc.filing_claimant_run_id is None
+
+    @pytest.mark.asyncio
+    async def test_a_raising_lookup_fails_open_and_warns(
+        self, tmp_path: Path, caplog,
+    ):
+        """A broken identity lookup must never DROP a filing.
+
+        Mirrors gate 4's existing ``task_status_lookup`` fail-open. Loud, not
+        silent: the record is submitted, the field stays unknown, and a
+        WARNING names the task.
+        """
+        async def _boom(task_id: str) -> str | None:
+            raise RuntimeError('lookup exploded')
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue, task_claimant_lookup=_boom, startup_sweep=False)
+
+        with caplog.at_level(logging.WARNING):
+            result = await _blocker(server, **_COMMON_KWARGS)
+
+        esc = queue.get(result['id'])
+        assert esc is not None
+        assert esc.filing_claimant_run_id is None
+        assert any(
+            'task_claimant_lookup' in r.message % r.args if r.args else
+            'task_claimant_lookup' in r.message
+            for r in caplog.records
+        ), f'expected a WARNING naming task_claimant_lookup, got: {caplog.text}'
+        assert 'task-999' in caplog.text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('returned', [None, '', '   '])
+    async def test_unknown_or_blank_lookup_result_stays_none(
+        self, tmp_path: Path, returned: str | None,
+    ):
+        """Unclaimed/unknown task → ``None``, which ``pins`` fails safe to pinning.
+
+        A blank string must NOT reach ``pins._norm_id`` as a pseudo-value.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(
+            queue,
+            task_claimant_lookup=_claimant_lookup(returned),
+            startup_sweep=False,
+        )
+
+        result = await _blocker(server, **_COMMON_KWARGS)
+
+        esc = queue.get(result['id'])
+        assert esc is not None
+        assert esc.filing_claimant_run_id is None
+
+    @pytest.mark.asyncio
+    async def test_stamp_survives_the_terminal_task_auto_resolve_exit(
+        self, tmp_path: Path,
+    ):
+        """Gate 4's ``submit_resolved`` exit still writes the identity.
+
+        The stamp is applied at the TOP of ``_chokepoint_or_submit``, above
+        every gate, so no exit path can lose it.
+        """
+        async def _status(task_id: str) -> str | None:
+            return 'done'
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(
+            queue,
+            task_status_lookup=_status,
+            task_claimant_lookup=_claimant_lookup(self._ID),
+            startup_sweep=False,
+        )
+
+        result = await _blocker(server, **_COMMON_KWARGS)
+
+        assert result['status'] == 'resolved', f'expected auto-resolve, got: {result}'
+        esc = queue.get(result['id'])
+        assert esc is not None
+        assert esc.filing_claimant_run_id == self._ID
+
+    @pytest.mark.asyncio
+    async def test_stamp_coexists_with_the_born_at_l2_path(self, tmp_path: Path):
+        """A sentinel role is exempt from the C4/D3 downgrade, so this genuinely
+        reaches the born-at-L2 branch."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(
+            queue,
+            task_claimant_lookup=_claimant_lookup(self._ID),
+            startup_sweep=False,
+        )
+
+        result = await _blocker(
+            server, severity='critical',
+            **{**_COMMON_KWARGS, 'agent_role': 'orchestrator-watcher-supervisor'},
+        )
+
+        esc = queue.get(result['id'])
+        assert esc is not None
+        assert esc.level == 2
+        assert esc.filing_claimant_run_id == self._ID
+
+    @pytest.mark.asyncio
+    async def test_stamp_survives_the_c4_d3_severity_downgrade(self, tmp_path: Path):
+        """A non-sentinel role's 'critical' is rewritten to 'blocking' with a
+        '[downgraded:critical]' summary suffix — and still carries the identity."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(
+            queue,
+            task_claimant_lookup=_claimant_lookup(self._ID),
+            startup_sweep=False,
+        )
+
+        result = await _blocker(server, severity='critical', **_COMMON_KWARGS)
+
+        esc = queue.get(result['id'])
+        assert esc is not None
+        assert esc.severity == 'blocking'
+        assert '[downgraded:critical]' in esc.summary
+        assert esc.filing_claimant_run_id == self._ID
+
+    @pytest.mark.asyncio
+    async def test_level_1_re_escalation_is_stamped(self, tmp_path: Path):
+        """The steward's level=1 route is stamped too (inert for pins — Link 3
+        classifies any level != 0 as QUEUE_HANDOFF — but honest provenance)."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(
+            queue,
+            task_claimant_lookup=_claimant_lookup(self._ID),
+            startup_sweep=False,
+        )
+
+        result = await _blocker(
+            server, level=1, **{**_COMMON_KWARGS, 'agent_role': 'steward'},
+        )
+
+        esc = queue.get(result['id'])
+        assert esc is not None
+        assert esc.level == 1
+        assert esc.filing_claimant_run_id == self._ID
