@@ -2647,3 +2647,463 @@ class TestChainWalkConsumesNoPermits:
         assert [lane for lane, _warm in s['lane_releases']] == [s['chain'].lane], (
             'the adopting exit must return the chain lane exactly once'
         )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# step-13 RED — δ END TO END: the task's USER-OBSERVABLE signal
+#
+# Everything above pins a seam.  This class is the only place the seams are
+# driven the way production drives them — `_dispatch_item` →
+# `_deep_chain_placement` → `_run_inflight_verify` → `_finalize_inflight` →
+# the walk — against a real repo whose main really moves.
+#
+# γ's `_DeepScene` (test_merge_queue_deep_dispatch.py:2208) stopped one call
+# short of exactly this, and said so (:2266-2268: "this scene stops short of
+# finalize (γ lands nothing)").  `_DeltaScene` below is that scene with the
+# missing call restored, which is the whole of δ's addition to the round.
+#
+# Four properties, one per PRD row:
+#   (a) ONE PASSING TIP LANDS k ITEMS IN ORDER, linear on main
+#   (b) TIP FAIL LANDS NOTHING VIA THE CHAIN — and the item still lands later
+#   (c) KILL SWITCH — at the shipped cap=0 the round is byte-identical
+#   (d) HOT RELOAD — cap 0 -> 4 through the REAL `apply_reload`, no restart
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+_DELTA_E2E_FOLLOWERS = ('102', '103', '104', '105', '106')
+"""Five chainable followers, all editing DISJOINT files.
+
+``queue_len`` is therefore 6 (five followers plus the head), so a ``cap`` of 4
+is what binds and the built depth is a statement about the POLICY rather than
+about the fixture's length.  Cleanliness is the point too: nothing truncates,
+so a short landing can only ever be δ's doing.
+"""
+
+
+class _DeltaScene:
+    """One repo + worker + queue, driven round after round THROUGH finalize.
+
+    Cloned from γ's ``_DeepScene`` rather than imported — ``orchestrator/tests``
+    has no ``__init__.py``, so a cross-module import would couple the two
+    suites' collection order (the reason recorded in this module's docstring).
+
+    The differences from γ's are the ones δ is:
+      * every head item CASes against the REAL main sha of the moment
+        (``base_sha=main_before``), because these rounds actually land;
+      * ``round_`` continues into ``_finalize_inflight``;
+      * each round takes its own head BRANCH, since a branch that has landed
+        cannot produce a second merge commit.
+    """
+
+    def __init__(self, git_ops, config, worker, repo, store, db_path) -> None:
+        self.git_ops = git_ops
+        self.config = config
+        self.worker = worker
+        self.repo = repo
+        self.store = store
+        self.db_path = db_path
+        self.calls: list[dict] = []
+        self.posted: list[dict] = []
+        self.built: list[dict] = []
+        self.lane_releases: list[tuple] = []
+        self.reqs: dict[str, MergeRequest] = {}
+        self._round_no = 0
+
+    async def enqueue(self, task_ids) -> None:
+        """Put *task_ids* on the queue through the REAL enqueue chokepoint.
+
+        ``enqueue_merge_request`` is what registers ``_on_finalized``, and
+        ``merge_finalized`` has no other emit site (merge_queue.py:4763-4777) —
+        so a scene that stuffed ``_lane_buffers`` directly (γ's shortcut, valid
+        for a scene that lands nothing) would make every landing assertion here
+        blind to the payload δ exists to produce.
+        """
+        from orchestrator.merge_queue import enqueue_merge_request
+
+        for tid in task_ids:
+            self.reqs[tid] = _make_req(tid, tid, self.config, self.repo)
+            await enqueue_merge_request(
+                self.worker._queue, self.reqs[tid], self.store,
+            )
+        self.worker._drain_queue_into_lanes()
+
+    async def round_(
+        self, *, tag: str, head_tid: str, req: MergeRequest | None = None,
+    ) -> dict:
+        """Drive ONE round: dispatch → verify → finalize.
+
+        *req* re-dispatches an EXISTING request (the one a previous round put
+        back) instead of picking the next one off the lane buffers — which is
+        how a scenario asserts that the very same request lands on a later
+        round's own verdict.
+
+        Returns the recorded ``_run_inflight_verify`` kwargs plus the round's
+        own facts (``'advanced'``, ``'main_before'``, ``'head_mc'``).
+        """
+        from orchestrator.merge_types import MergeResult, RealMergeItem
+
+        self._round_no += 1
+        worker = self.worker
+        main_before = await _rev_parse(self.repo, 'main')
+        head_mc = await _merge_commit_off_main(
+            self.repo, f'task/{head_tid}', f'{tag}-r{self._round_no}',
+        )
+        # The head leaves the buffers the way the merger takes it — it must not
+        # still be queued when `chain_snapshot` runs, or it would chain itself.
+        popped = req if req is not None else worker._pop_next_pickable()
+        assert popped is not None and popped.task_id == head_tid, (
+            f'expected {head_tid} to be the pickable head, got '
+            f'{None if popped is None else popped.task_id}'
+        )
+        wt = _ephemeral_merge_wt(self.git_ops, f'{tag}-r{self._round_no}')
+        item = RealMergeItem(
+            request=popped,
+            merge_result=MergeResult(
+                success=True, merge_commit=head_mc, merge_worktree=wt,
+            ),
+            merge_wt=wt,
+            base_sha=main_before,   # this round really CASes against main
+            speculative=True,       # slot 2 — the only kind that chains
+        )
+        entry = await worker._dispatch_item(item)
+        assert entry is not None, 'dispatch must not decline: a host is free'
+        assert entry.verify_task is not None
+        await entry.verify_task
+        advanced = await worker._finalize_inflight(entry)
+        await asyncio.sleep(0)  # let every `_on_finalized` done-callback run
+
+        rec = self.calls[-1]
+        rec.update({
+            'round': self._round_no, 'item': item, 'advanced': advanced,
+            'main_before': main_before, 'head_mc': head_mc, 'req': popped,
+        })
+        if entry.lease is not None:
+            await worker._host_allocator.release(entry.lease)
+        return rec
+
+
+async def _make_delta_scene(
+    repo: Path, tmp_path: Path, monkeypatch, *,
+    chain_cap: int, script: list[bool], db_name: str,
+    heads: tuple[str, ...] = ('101',),
+) -> _DeltaScene:
+    """Build a finalize-capable scene whose verify returns *script* in order."""
+    from orchestrator.event_store import EventStore
+
+    git_ops = _make_git_ops(repo, size=2)
+    config = _make_config(repo, chain_cap=chain_cap)
+    for tid in (*heads, *_DELTA_E2E_FOLLOWERS):
+        await _create_branch_editing(repo, f'task/{tid}', f'f{tid}.txt', f'edit-{tid}\n')
+    db_path = tmp_path / db_name
+    store = EventStore(db_path, f'run-{db_name}')
+    worker = _make_worker(git_ops)
+    worker._event_store = store
+    scene = _DeltaScene(git_ops, config, worker, repo, store, db_path)
+    await scene.enqueue((*heads, *_DELTA_E2E_FOLLOWERS))
+
+    # The round recorder, installed ONCE — re-wrapping per round would capture
+    # the previous round's recorder as `real` and nest a wrapper deeper each
+    # round (γ's note at test_merge_queue_deep_dispatch.py:2398-2401).
+    real_verify = worker._run_inflight_verify
+
+    async def _recording(_item, _lease, **kwargs):
+        rec = dict(kwargs)
+        scene.calls.append(rec)
+        rec['result'] = await real_verify(_item, _lease, **kwargs)
+        return rec['result']
+
+    monkeypatch.setattr(worker, '_run_inflight_verify', _recording)
+    scene.lane_releases = _spy_chain_lane_release(monkeypatch)
+
+    real_build = merge_queue.build_chain
+
+    async def _recording_build(git_ops_, queue_snapshot, head_merge_commit, **kw):
+        scene.built.append({
+            'queue_snapshot': tuple(queue_snapshot),
+            'head_merge_commit': head_merge_commit, **kw,
+        })
+        return await real_build(git_ops_, queue_snapshot, head_merge_commit, **kw)
+
+    monkeypatch.setattr(merge_queue, 'build_chain', _recording_build)
+
+    verdicts = list(script)
+
+    async def _oracle(_git_ops, _req, merge_wt, **kwargs):
+        scene.posted.append({'merge_wt': merge_wt, **kwargs})
+        passed = verdicts.pop(0) if verdicts else True
+        return None if passed else _fail_verify_result()
+
+    monkeypatch.setattr('orchestrator.merge_queue._run_post_merge_verify', _oracle)
+    return scene
+
+
+def _delta_round_transcript(scene: _DeltaScene, idx: int) -> dict:
+    """Normalise ONE round into a repo-independent, comparable transcript.
+
+    γ's normaliser (test_merge_queue_deep_dispatch.py:2348) with the FINALIZE
+    facts appended — absolute paths and SHAs differ between fixture repos, so
+    the comparison is on the facts: was a chain handed down, what was labelled,
+    did the round advance main, and did anything carry δ's landing stamp.
+    """
+    rec = scene.calls[idx]
+    posted = scene.posted[idx]
+    item = rec['item']
+    outcome = rec['req'].result.result() if rec['req'].result.done() else None
+    return {
+        'chain': rec['chain'],
+        'chain_items': rec['chain_items'],
+        'depth': rec['depth'],
+        'probe_base': rec['probe_base'],
+        'verified_the_items_own_merge_commit':
+            posted['merge_sha'] == item.merge_result.merge_commit,
+        'result_status': rec['result'].status,
+        'result_has_worktree': rec['result'].merge_wt is not None,
+        'advanced': rec['advanced'],
+        'outcome_status': None if outcome is None else outcome.status,
+        'landed_via_chain': None if outcome is None else outcome.landed_via_chain,
+        'build_chain_calls': len(scene.built),
+        'halving_state': scene.worker._chain_halving_state,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(180)
+class TestDeepLandingEndToEnd:
+    """δ driven the way production drives it, one round at a time."""
+
+    async def test_one_passing_tip_lands_the_whole_prefix_in_order(
+        self, git_repo: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """(a) ONE verify → k in-order landings, and main stays LINEAR.
+
+        The user-observable claim of the whole PRD: a single verify run pays
+        for the whole clean prefix.  Linearity is asserted through
+        ``rev-list --first-parent``, which is the shape the startup reconciler
+        and every ``merge-base --is-ancestor`` consumer downstream assume.
+        """
+        scene = await _make_delta_scene(
+            git_repo, tmp_path, monkeypatch,
+            chain_cap=4, script=[True], db_name='delta-e2e-land.db',
+        )
+        rec = await scene.round_(tag='land', head_tid='101')
+
+        chain = rec['chain']
+        assert chain is not None and len(chain.links) == 3, (
+            f'cap=4 must bind: expected a 4-item chain, got {chain!r}'
+        )
+        # The dispatch-time kwarg is the FLOOR (merge_queue.py:20878 passes a
+        # literal 1); `_run_inflight_verify` recomputes it from the chain it was
+        # handed (:17588), which is what reaches η1's `merge_verify` row.
+        assert rec['chain_items'] == 1
+        assert len(scene.posted) == 1, 'ONE verify paid for the whole prefix'
+
+        landed = ['101', *[tid for tid, _ in chain.links]]
+        for tid in landed:
+            req = scene.reqs[tid]
+            assert req.result.done(), f'task {tid} never resolved'
+            assert req.result.result().status == 'done', f'task {tid} did not land'
+        # Every LINK carries the stamp; the head landed by the ordinary
+        # advance, and its own stamp is asserted in TestLandedViaChainCarrier.
+        for tid in landed[1:]:
+            assert scene.reqs[tid].result.result().landed_via_chain == 1
+
+        # ── main is LINEAR, in land order ────────────────────────────────────
+        _rc, out, _err = await _run(
+            ['git', 'rev-list', '--first-parent', 'main'], cwd=git_repo,
+        )
+        first_parents = out.split()
+        expected = [rec['head_mc'], *[mc for _tid, mc in chain.links]]
+        assert first_parents[:len(expected)] == list(reversed(expected)), (
+            'main\'s first-parent history must be exactly the land order'
+        )
+        for earlier, later in zip(expected, expected[1:], strict=False):
+            rc, _o, _e = await _run(
+                ['git', 'merge-base', '--is-ancestor', earlier, later], cwd=git_repo,
+            )
+            assert rc == 0, f'{earlier[:8]} is not an ancestor of {later[:8]}'
+
+        # ── the `_merge-verify` lane reads IDLE on BOTH axes ─────────────────
+        from orchestrator.verify_cancel import (
+            lane_lock_holder_pids_strict,
+            lane_lock_path,
+            read_lock_holder_pgid,
+        )
+
+        lock_path = lane_lock_path(scene.git_ops.persistent_merge_worktree_path)
+        # An ABSENT lock file is the strongest form of idle — nothing in this
+        # round ever opened the lane, let alone held it — but the strict reader
+        # raises FileNotFoundError on it rather than returning [], so the two
+        # shapes are spelled out separately instead of collapsed.
+        assert (not lock_path.exists()) or lane_lock_holder_pids_strict(
+            lock_path
+        ) == [], 'the kernel flock axis must read idle after the round'
+        assert read_lock_holder_pgid(scene.git_ops.worktree_base) is None, (
+            'the rendezvous axis must read idle, or the next '
+            'reset_persistent_merge_worktree raises MergeVerifyLeaseHeld'
+        )
+
+        assert _drain_residue(scene.worker) == {'105', '106'}
+        scene.worker._running = True
+        _assert_quiescent(
+            scene.worker, await _rev_parse(git_repo, 'main'),
+            list(scene.reqs.values()),
+        )
+
+    async def test_a_failing_tip_lands_nothing_and_the_item_still_lands_later(
+        self, git_repo: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """(b) A red tip is a NON-EVENT for the queue — and costs nobody a verdict.
+
+        γ pinned "nothing lands on the fail arm" at the seam; this pins the
+        ROUND consequence: the queue is exactly as it was, the halving state
+        halved, and the very same request lands on the next round's own
+        verdict.  A red tip that terminally failed anyone would be the
+        false-green's mirror image — a false RED — and would feed the thrash
+        ladder a signature every deep round.
+        """
+        scene = await _make_delta_scene(
+            git_repo, tmp_path, monkeypatch,
+            chain_cap=4, script=[False, True], db_name='delta-e2e-fail.db',
+        )
+        from orchestrator.merge_types import InflightStatus
+
+        main_before = await _rev_parse(git_repo, 'main')
+
+        red = await scene.round_(tag='fail', head_tid='101')
+
+        assert red['chain'] is not None and len(red['chain'].links) == 3
+        assert red['result'].status is InflightStatus.REQUEUED, (
+            f'the fail arm must stay non-adopting, got {red["result"].status!r}'
+        )
+        assert await _rev_parse(git_repo, 'main') == main_before, (
+            'a red tip must not move main'
+        )
+        for tid in _DELTA_E2E_FOLLOWERS:
+            assert not scene.reqs[tid].result.done(), (
+                f'task {tid} was handed a verdict no verify produced'
+            )
+        assert not scene.reqs['101'].result.done()
+        # Every FOLLOWER kept its exact lane slot — the chain took nothing.
+        assert {
+            lane: [r.task_id for r in scene.worker._lane_buffers[lane]]
+            for lane in ('high', 'normal')
+        } == {'high': [], 'normal': list(_DELTA_E2E_FOLLOWERS)}, (
+            'the chain mutated the queue on a red tip'
+        )
+        # The head itself went back on `_queue` through the requeue chokepoint,
+        # unresolved — "deferred", not "failed".
+        assert scene.worker._queue.qsize() == 1
+        requeued = scene.worker._queue.get_nowait()
+        assert requeued is scene.reqs['101']
+        assert not requeued.result.done()
+        assert scene.worker._chain_halving_state == max(1, 4 // 2)
+
+        # ── and now the ordinary path, on its own verdict ────────────────────
+        green = await scene.round_(tag='fail', head_tid='101', req=requeued)
+        assert scene.reqs['101'].result.done()
+        assert scene.reqs['101'].result.result().status == 'done'
+        assert await _rev_parse(git_repo, 'main') != main_before
+
+        landed_by_chain = {
+            tid for tid, _mc in (green['chain'].links if green['chain'] else [])
+        }
+        assert _drain_residue(scene.worker) == (
+            set(_DELTA_E2E_FOLLOWERS) - landed_by_chain
+        )
+        scene.worker._running = True
+        _assert_quiescent(
+            scene.worker, await _rev_parse(git_repo, 'main'),
+            list(scene.reqs.values()),
+        )
+
+    async def test_the_shipped_kill_switch_reaches_no_delta_code(
+        self, git_repo: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """(c) At ``chain_cap=0`` the round is byte-identical to pre-δ merging.
+
+        The transcript is compared against a GOLDEN literal rather than
+        against a second run, because "no δ code ran" is a claim about
+        absences — no chain built, no chain handed down, no landing stamp, no
+        halving state — and a literal states each absence by name.
+        """
+        scene = await _make_delta_scene(
+            git_repo, tmp_path, monkeypatch,
+            chain_cap=0, script=[True], db_name='delta-e2e-killed.db',
+        )
+        rec = await scene.round_(tag='killed', head_tid='101')
+
+        assert _delta_round_transcript(scene, 0) == {
+            'chain': None,
+            'chain_items': 1,
+            'depth': 0,
+            'probe_base': None,
+            'verified_the_items_own_merge_commit': True,
+            'result_status': rec['result'].status,
+            'result_has_worktree': True,
+            'advanced': True,
+            'outcome_status': 'done',
+            'landed_via_chain': None,
+            'build_chain_calls': 0,
+            'halving_state': None,
+        }
+        assert scene.lane_releases == [], 'no chain lane is taken at cap=0'
+        # The ordinary path landed exactly ONE item; every follower is untouched.
+        for tid in _DELTA_E2E_FOLLOWERS:
+            assert not scene.reqs[tid].result.done()
+
+        assert _drain_residue(scene.worker) == set(_DELTA_E2E_FOLLOWERS)
+        scene.worker._running = True
+        _assert_quiescent(
+            scene.worker, await _rev_parse(git_repo, 'main'),
+            list(scene.reqs.values()),
+        )
+
+    async def test_flipping_the_cap_in_place_starts_landing_chains(
+        self, git_repo: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """(d) HOT RELOAD: 0 -> 4 through the REAL `apply_reload`, no restart.
+
+        ``merge_deep.chain_cap`` is a green-tier ``RELOADABLE_FIELDS`` leaf, and
+        the worker reads it LIVE off the dispatching request's config
+        (merge_queue.py:12348) — so the round after the flip must build and
+        land a chain against the very same worker, queue and repo.  Driven
+        through ``config.apply_reload`` rather than by assigning the attribute,
+        because the operator-facing claim is about the reload path, not about
+        Python attribute assignment.
+        """
+        from orchestrator.config import apply_reload
+
+        scene = await _make_delta_scene(
+            git_repo, tmp_path, monkeypatch,
+            chain_cap=0, script=[True, True], db_name='delta-e2e-reload.db',
+            heads=('101', '107'),
+        )
+        cold = await scene.round_(tag='reload', head_tid='101')
+        assert cold['chain'] is None and scene.built == []
+
+        result = apply_reload(scene.config, _make_config(git_repo, chain_cap=4))
+        assert result['reloaded'] is True
+        assert 'merge_deep.chain_cap' in result['applied'], (
+            f'chain_cap must be a green-tier leaf; got {result!r}'
+        )
+        assert result['restart_required'] == {}
+        assert scene.config.merge_deep.chain_cap == 4
+
+        hot = await scene.round_(tag='reload', head_tid='107')
+        assert hot['chain'] is not None and len(hot['chain'].links) == 3, (
+            'the very next round must build a chain — no restart'
+        )
+        landed = ['107', *[tid for tid, _mc in hot['chain'].links]]
+        for tid in landed:
+            assert scene.reqs[tid].result.result().status == 'done'
+        for tid in landed[1:]:
+            assert scene.reqs[tid].result.result().landed_via_chain == 1
+
+        assert _drain_residue(scene.worker) == (
+            set(_DELTA_E2E_FOLLOWERS) - set(landed[1:])
+        )
+        scene.worker._running = True
+        _assert_quiescent(
+            scene.worker, await _rev_parse(git_repo, 'main'),
+            list(scene.reqs.values()),
+        )
