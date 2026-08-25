@@ -2126,3 +2126,194 @@ class TestMainBaselineSkippedIds:
             verify_module._BASELINE_SKIPPED_IDS_CACHE
         assert verify_module.cached_main_baseline_failing_ids(MAIN_SHA) == frozenset({'t::fails'})
         assert verify_module.cached_main_baseline_skipped_ids(MAIN_SHA) == frozenset({'t::skips'})
+
+
+# ---------------------------------------------------------------------------
+# Test 12 — step-13 (task 3226): the id-diff fast path must not read a SKIP as
+#           a PASS.  `is_wholly_preexisting` returning False means "some
+#           branch-failing id is absent from main's FAILING baseline" — which
+#           conflates two very different worlds:
+#
+#             main RAN it and it passed  -> the branch broke it (task fault)
+#             main NEVER RAN it (skipped) -> the diff proves nothing
+#
+#           Only the first licenses the confident `(False, '')` task-fault
+#           verdict.  This is the exact shape of the 2026-07-29 incident: a
+#           guard that skips on one side of the comparison and is pass-shaped
+#           on the other.  When any unattributable id is present the function
+#           must FALL THROUGH to the legacy (category, cause_hint) signature
+#           comparison instead of blaming the branch.
+# ---------------------------------------------------------------------------
+
+
+class TestIdDiffFastPathSkippedOnMainGuard:
+    """Cases seed BOTH real baselines (so main_baseline_failing_ids is a cache
+    hit and no probe worktree is ever minted) and seed _PROBE_CACHE with a
+    known signature verdict, so "did we fall through?" is observable in the
+    returned tuple rather than inferred."""
+
+    # A failing result whose (category, cause_hint) signature is what the
+    # seeded _PROBE_CACHE entries below are keyed on.
+    CATEGORY = 'test_failure'
+    CAUSE_HINT = 'AssertionError in t::x'
+
+    def _seed_probe_cache(self, verdict: bool) -> None:
+        import time as time_module
+
+        from orchestrator import verify as verify_module
+        from orchestrator.workflow import _normalize_cause_hint as _norm
+
+        key = (MAIN_SHA, self.CATEGORY, _norm(self.CAUSE_HINT))
+        verify_module._PROBE_CACHE[key] = (time_module.monotonic(), verdict)
+
+    def _run(
+        self,
+        tmp_path: Path,
+        branch_ids: list[str],
+        main_failing: set[str],
+        main_skipped: set[str],
+        signature_verdict: bool,
+    ) -> tuple[tuple[bool, str], AsyncMock]:
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        worktree = tmp_path / 'task-wt'
+        worktree.mkdir()
+        mock_git_ops = GitOps(config.git, config.project_root)
+        mock_git_ops.get_main_sha = AsyncMock(return_value=MAIN_SHA)  # type: ignore[method-assign]
+        mock_git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+
+        verify_module.seed_main_baseline(MAIN_SHA, main_failing)
+        verify_module.seed_main_baseline_skipped(MAIN_SHA, main_skipped)
+        self._seed_probe_cache(signature_verdict)
+
+        failing_result = VerifyResult(
+            passed=False, test_output='', lint_output='', type_output='',
+            summary='Failures: tests failed',
+            cause_hint=self.CAUSE_HINT, category=self.CATEGORY,
+            failing_test_ids=branch_ids,
+        )
+        # Would mint a probe worktree if the seeded _PROBE_CACHE entry were
+        # somehow missed — asserted un-awaited so a real probe can't hide.
+        legacy_probe_mock = AsyncMock(return_value=DIFFERENT_RESULT)
+
+        with patch.object(verify_module, 'run_scoped_verification', new=legacy_probe_mock):
+            result = asyncio.run(
+                verify_module.verify_failure_is_preexisting_on_main(
+                    worktree, config, [], ['src/foo.py'], failing_result, mock_git_ops,
+                )
+            )
+        return result, legacy_probe_mock
+
+    def test_branch_failure_skipped_on_main_falls_through_not_task_fault(
+        self, tmp_path: Path,
+    ) -> None:
+        """THE BUG.  The branch fails t::skipped_on_main; main's FAILING
+        baseline lacks it but main's SKIPPED baseline has it.  Main never RAN
+        that test, so the id diff carries no evidence either way — the
+        confident task-fault verdict must NOT be returned from the diff."""
+        result, legacy_probe_mock = self._run(
+            tmp_path,
+            branch_ids=['t::skipped_on_main'],
+            main_failing=set(),
+            main_skipped={'t::skipped_on_main'},
+            signature_verdict=True,
+        )
+
+        assert result == (True, MAIN_SHA), (
+            'a branch-failing id that main SKIPPED is unattributable — the fast '
+            'path must fall through to the signature comparison (which here says '
+            f"preexisting), not return the task-fault verdict; got {result!r}"
+        )
+        legacy_probe_mock.assert_not_awaited()
+
+    def test_id_main_ran_and_passed_still_returns_task_fault(self, tmp_path: Path) -> None:
+        """Byte-identical to today: an id absent from BOTH baselines means main
+        RAN it and it passed, so the branch broke it.  The seeded _PROBE_CACHE
+        entry says (True, MAIN_SHA) — getting (False, '') proves the fast path
+        returned directly rather than falling through."""
+        result, legacy_probe_mock = self._run(
+            tmp_path,
+            branch_ids=['t::genuinely_new'],
+            main_failing=set(),
+            main_skipped={'t::unrelated_skip'},
+            signature_verdict=True,
+        )
+
+        assert result == (False, ''), (
+            f"an id main ran and passed must still blame the branch; got {result!r}"
+        )
+        legacy_probe_mock.assert_not_awaited()
+
+    def test_wholly_preexisting_is_unchanged(self, tmp_path: Path) -> None:
+        """Branch failures wholly contained in main's failing baseline still
+        return (True, main_sha) from the early return, untouched.  The seeded
+        signature verdict is False here, so a fall-through would show up as
+        (False, '')."""
+        result, legacy_probe_mock = self._run(
+            tmp_path,
+            branch_ids=['t::red_on_main'],
+            main_failing={'t::red_on_main', 't::other'},
+            main_skipped={'t::red_on_main'},
+            signature_verdict=False,
+        )
+
+        assert result == (True, MAIN_SHA), (
+            f'the wholly-preexisting early return must be untouched; got {result!r}'
+        )
+        legacy_probe_mock.assert_not_awaited()
+
+    def test_one_unattributable_id_invalidates_the_whole_diff(self, tmp_path: Path) -> None:
+        """A branch-failing set MIXING a genuinely-new id with a skipped-on-main
+        id must also fall through: a single unattributable id is enough to
+        invalidate the diff as a basis for the confident verdict."""
+        result, legacy_probe_mock = self._run(
+            tmp_path,
+            branch_ids=['t::genuinely_new', 't::skipped_on_main'],
+            main_failing=set(),
+            main_skipped={'t::skipped_on_main'},
+            signature_verdict=True,
+        )
+
+        assert result == (True, MAIN_SHA), (
+            'one unattributable id must invalidate the whole diff and defer to '
+            f'the signature probe; got {result!r}'
+        )
+        legacy_probe_mock.assert_not_awaited()
+
+    def test_no_skipped_baseline_cached_behaves_as_today(self, tmp_path: Path) -> None:
+        """An UNSEEDED skipped baseline (cache-only peek returns None) must not
+        change anything: the guard is a cache-only refinement, never a probe,
+        so a cold skipped cache degrades to today's verdict."""
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        worktree = tmp_path / 'task-wt'
+        worktree.mkdir()
+        mock_git_ops = GitOps(config.git, config.project_root)
+        mock_git_ops.get_main_sha = AsyncMock(return_value=MAIN_SHA)  # type: ignore[method-assign]
+        mock_git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+
+        verify_module.seed_main_baseline(MAIN_SHA, frozenset())
+        # deliberately NOT seeding the skipped side
+        self._seed_probe_cache(True)
+
+        failing_result = VerifyResult(
+            passed=False, test_output='', lint_output='', type_output='',
+            summary='Failures: tests failed',
+            cause_hint=self.CAUSE_HINT, category=self.CATEGORY,
+            failing_test_ids=['t::whatever'],
+        )
+        legacy_probe_mock = AsyncMock(return_value=DIFFERENT_RESULT)
+
+        with patch.object(verify_module, 'run_scoped_verification', new=legacy_probe_mock):
+            result = asyncio.run(
+                verify_module.verify_failure_is_preexisting_on_main(
+                    worktree, config, [], ['src/foo.py'], failing_result, mock_git_ops,
+                )
+            )
+
+        assert result == (False, ''), (
+            f'a cold skipped cache must degrade to today behaviour; got {result!r}'
+        )
+        legacy_probe_mock.assert_not_awaited()
