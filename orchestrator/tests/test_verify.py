@@ -1,5 +1,6 @@
 """Tests for orchestrator/verify.py, specifically _run_cmd bash executable handling."""
 
+import ast
 import asyncio
 import contextlib
 import logging
@@ -2121,6 +2122,182 @@ class TestVerifyResultFailingTestIds:
 
         assert restored.failing_test_ids == []
         assert restored.failing_test_ids is not None
+
+
+class TestVerifyResultSkippedTestIds:
+    """VerifyResult carries `skipped_test_ids` beside `failing_test_ids` (task 3226).
+
+    Same three seams as the failing field — dataclass default, generic
+    asdict/**d codec, and `_aggregate_results` — because the two vectors are
+    consumed TOGETHER: a caller asks "did main run this test?" by checking one
+    against the other, and a field that survived only two of the three seams
+    would answer that question with stale or absent data at the third.
+
+    JSON-native `list[str] | None` like `contention`/`plan`/`failing_test_ids`,
+    so no serialization allowlist needs editing.
+    """
+
+    def _make_result(self, **overrides: Any) -> VerifyResult:
+        defaults: dict[str, Any] = dict(
+            passed=True,
+            test_output='',
+            lint_output='',
+            type_output='',
+            summary='all good',
+        )
+        defaults.update(overrides)
+        return VerifyResult(**defaults)
+
+    def test_default_skipped_test_ids_is_none(self):
+        """None is the fail-OPAQUE default: no junit collected, nothing may be concluded."""
+        assert self._make_result().skipped_test_ids is None
+
+    def test_skipped_test_ids_round_trips_via_asdict_codec(self):
+        vr = self._make_result(skipped_test_ids=['a::b'])
+
+        restored = VerifyResult(**asdict(vr))
+
+        assert restored.skipped_test_ids == ['a::b']
+        assert restored == vr
+
+    def test_empty_skipped_test_ids_is_preserved_not_coerced_to_none(self):
+        """`[]` ("junit collected, zero skipped") must survive the codec distinctly.
+
+        Coercing it to None across the wire would erase the only positive
+        evidence that main ran its whole suite — turning a genuine "main ran
+        everything" into "we do not know", which fails the wrong way for the
+        caller this field exists to serve.
+        """
+        vr = self._make_result(skipped_test_ids=[])
+
+        restored = VerifyResult(**asdict(vr))
+
+        assert restored.skipped_test_ids == []
+        assert restored.skipped_test_ids is not None
+
+    def test_run_verification_parses_both_vectors_at_the_same_seam(self):
+        """Both parsers are called under ONE junit guard, and both reach the result.
+
+        STRUCTURAL rather than end-to-end, and deliberately so: driving
+        ``run_verification``'s junit seam for real needs a full subprocess
+        harness with an injected ``--junitxml``, which pins the plumbing at
+        enormous cost while the invariant that actually matters is cheap to
+        state — the two vectors must be parsed from the SAME report under the
+        SAME ``if junit_path is not None`` guard, so they always describe the
+        same run.  A skipped vector parsed under a different condition (or left
+        unwired while the failing one is populated) would silently pair a fresh
+        failing vector with a stale or absent skipped one, and every downstream
+        comparison between them would then be answering about two different
+        runs — a subtler version of the exact conflation this task closes.
+        """
+        tree = ast.parse(Path(verify.__file__).read_text())
+        fn = next(
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.AsyncFunctionDef | ast.FunctionDef)
+            and n.name == 'run_verification'
+        )
+
+        guards = [
+            n
+            for n in ast.walk(fn)
+            if isinstance(n, ast.If)
+            and {
+                c.func.id
+                for c in ast.walk(n)
+                if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)
+            }
+            >= {'_extract_failing_test_ids_from_junit', '_extract_skipped_test_ids_from_junit'}
+        ]
+        assert guards, (
+            'both junit parsers must be called under the SAME guard in '
+            'run_verification, so the two vectors always describe one report'
+        )
+
+        constructed = [
+            {kw.arg for kw in n.keywords}
+            for n in ast.walk(fn)
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Name)
+            and n.func.id == 'VerifyResult'
+        ]
+        assert constructed, 'run_verification must construct a VerifyResult'
+        assert all(
+            {'failing_test_ids', 'skipped_test_ids'} <= kwargs for kwargs in constructed
+        ), (
+            f'every VerifyResult built by run_verification must carry BOTH id '
+            f'vectors; got {constructed!r}'
+        )
+
+    def test_both_id_vectors_coexist_on_one_result(self):
+        """The two fields are independent — neither aliases nor overwrites the other."""
+        vr = self._make_result(failing_test_ids=['f::1'], skipped_test_ids=['s::1'])
+
+        restored = VerifyResult(**asdict(vr))
+
+        assert restored.failing_test_ids == ['f::1']
+        assert restored.skipped_test_ids == ['s::1']
+
+
+class TestAggregateResultsSkippedTestIds:
+    """`_aggregate_results` unions skipped_test_ids by the SAME rule as the failing side."""
+
+    def _r(self, **overrides: Any) -> VerifyResult:
+        defaults: dict[str, Any] = dict(
+            passed=True, test_output='', lint_output='', type_output='', summary='ok'
+        )
+        defaults.update(overrides)
+        return VerifyResult(**defaults)
+
+    def test_all_none_stays_none(self):
+        agg = _aggregate_results([self._r(), self._r()])
+        assert agg.skipped_test_ids is None
+
+    def test_one_none_child_does_not_erase_another_childs_skip_evidence(self):
+        """The mixed case, and the reason the rule is None-iff-EVERY-child-is-None.
+
+        A module that collected no junit at all (None — OPAQUE command, or
+        breadth != full) knows nothing about skips; letting it POISON the
+        aggregate to None would discard a sibling module's real, collected skip
+        evidence and silently return the whole run to the can't-tell state this
+        task closes. None contributes nothing; it does not suppress.
+        """
+        agg = _aggregate_results([self._r(), self._r(skipped_test_ids=['a::b'])])
+
+        assert agg.skipped_test_ids == ['a::b'], (
+            f'an OPAQUE module must not erase a sibling\'s collected skips; got '
+            f'{agg.skipped_test_ids!r}'
+        )
+
+    def test_unions_sorts_and_dedupes_across_children(self):
+        agg = _aggregate_results(
+            [
+                self._r(skipped_test_ids=['y::2', 'shared::s']),
+                self._r(skipped_test_ids=['x::1', 'shared::s']),
+            ]
+        )
+
+        assert agg.skipped_test_ids == ['shared::s', 'x::1', 'y::2']
+
+    def test_empty_child_makes_the_aggregate_non_none(self):
+        """A child that collected junit and found zero skips is EVIDENCE, not silence."""
+        agg = _aggregate_results([self._r(), self._r(skipped_test_ids=[])])
+
+        assert agg.skipped_test_ids == []
+        assert agg.skipped_test_ids is not None
+
+    def test_failing_and_skipped_aggregate_independently(self):
+        """Wiring the new field must not perturb the failing side's aggregation."""
+        agg = _aggregate_results(
+            [
+                self._r(failing_test_ids=['f::1']),
+                self._r(skipped_test_ids=['s::1']),
+            ]
+        )
+
+        assert agg.failing_test_ids == ['f::1']
+        assert agg.skipped_test_ids == ['s::1']
+
 
 
 # ---------------------------------------------------------------------------
