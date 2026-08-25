@@ -121,6 +121,7 @@ from orchestrator.scheduler import (
     SchedulerCallbacks,
     SetTaskStatusRejected,
     StaleEvidenceRejection,
+    TerminalExitRejection,
 )
 from orchestrator.service_restart import (
     FLEET_DEPLOY_CLOCK_RELPATH,
@@ -6085,11 +6086,19 @@ class Harness:
         # A1 guard (task 2200/ω4): a verify-complete task held by a transient
         # infra failure — first-class status == 'infra-hold', via
         # is_infra_held — must NOT be re-pended by the stranded recovery
-        # sweep.  The open infra_issue L1 is the non-dispatch hold (dispatch
-        # is pending-only; the open L1 suppresses stranded_blocked re-file).
-        # Flipping to pending would force the task to re-win its full
-        # implement footprint in the scheduler's footprint-locked dispatch —
-        # the root cause of the 3465 starvation.
+        # sweep.  The reason is the HOLD itself, not any footprint property:
+        # the infra_issue L1 is still OPEN, meaning the infrastructure fault
+        # has not been fixed, so re-pending would hand the task straight back
+        # to a dispatcher to fail the same way.  The row is meant to sit here
+        # until the escalation RESOLVES, at which point
+        # _cascade_unblock_member re-pends it (task 3538: that resume writes
+        # 'pending' — an 'in-progress' resume was undispatchable and stranded
+        # on the write; see the rationale block on that method).  This guard
+        # is unchanged by 3538 — only the cross-reference is corrected: the
+        # retired "re-pending re-competes for the implement footprint, the
+        # 3465 root cause" framing does not hold, because dispatch is
+        # pending-only and status-first, so a non-pending row never reaches
+        # try_acquire and holds no footprint either way.
         # Guard conditions: is_infra_held(task) AND the branch is
         # non-degenerate (has commits beyond branch_base_sha).  Degenerate
         # branches (provisioned but never implemented) are not protected because
@@ -6379,6 +6388,153 @@ class Harness:
             suggested_action='investigate_persistence_layer_rejection',
         )
         self._escalation_queue.submit(esc)
+
+    # agent_role for cascade status-write rejection escalations. Doubles as the
+    # dedup key (see _escalate_cascade_status_rejection): one open record per
+    # task for this condition, matched via get_by_task + this exact role.
+    _CASCADE_REJECTION_ROLE: str = 'harness-cascade'
+
+    # Category for the same records.  A NAMED CONSTANT rather than a literal at
+    # the filing site because escalation categories are prose, not a checked
+    # contract: nothing rejects a typo'd category at submit time, and every
+    # categorized reader (auto-watcher triage, category-filtered queue scans)
+    # depends on filer and reader spelling it identically — so the one spelling
+    # this file owns lives in exactly one place.
+    #
+    # escalation/src/escalation/models.py carries a standing REFACTOR TRIGGER
+    # (task 3709) saying the NEXT category addition promotes that prose
+    # vocabulary to an enum or a submit-time lint.  This IS that addition, but
+    # models.py is outside task 3538's locked module scope, so the promotion is
+    # filed as follow-up work instead of done here; this constant is the
+    # interim single source of truth for the spelling.
+    _CASCADE_REJECTION_CATEGORY: str = 'cascade_status_rejection'
+
+    def _escalate_cascade_status_rejection(
+        self,
+        task_id: str,
+        target_status: str,
+        exc: BaseException,
+        *,
+        resolved_by: str | None,
+    ) -> None:
+        """Surface a refused cascade resume write instead of swallowing it (INV-4).
+
+        ``_cascade_unblock_member`` runs fire-and-forget after an escalation
+        RESOLVES.  If its status write is refused and we only log, the outcome
+        is a permanent SILENT hold: the escalation is already closed so nothing
+        will retry, and the task keeps a status the dispatcher will never pick
+        up.  This filer is the loud half.
+
+        "Retry-then-escalate" resolves to escalate-ONLY here, deliberately:
+        :meth:`Scheduler.set_task_status` already owns the transient retry loop
+        (``fm_retry_backoffs()``) and raises ``SetTaskStatusRejected`` only for
+        NON-transient rejections, so an exception reaching this caller is by
+        construction post-retry and a caller-level re-retry would be dead code.
+
+        Carve-out: a :class:`TerminalExitRejection` whose ``old_status`` is
+        terminal is a legitimately-finished row, not a hold.  Nothing is stuck
+        and nobody needs to investigate, so it is logged at INFO and NOT filed —
+        filing there would be pure noise on a common, benign race.
+
+        Dedup: one open record per task via
+        ``get_by_task(status='pending', agent_role=...)`` on this class's own
+        role, the same idiom the sentinel escalations above use — the role
+        filter is the queue's own, applied in its single scan pass rather than
+        re-implemented as a post-filter here.  ``make_id`` cannot serve as the
+        guard — it mints a strictly-increasing id per call by design — so a
+        persistently-refusing backend would otherwise file one record per
+        resolved escalation.
+
+        Best-effort and total: a no-op without a queue (bare-Harness unit
+        tests), and every internal failure is contained.  The caller is
+        fire-and-forget, so an exception escaping here would surface only as an
+        unretrieved-task-exception at GC time — i.e. be lost.
+        """
+        if isinstance(exc, TerminalExitRejection) and exc.old_status in TERMINAL_STATUSES:
+            logger.info(
+                'cascade-unblock: resume of task %s to %r refused because the row '
+                'is already %s — legitimately finished out of band, not a hold; '
+                'not escalating',
+                task_id, target_status, exc.old_status,
+            )
+            return
+
+        queue = getattr(self, '_escalation_queue', None)
+        if not queue:        # bare-Harness unit tests / lifecycle tests stay green
+            return
+        try:
+            already = queue.get_by_task(
+                task_id, status='pending',
+                agent_role=self._CASCADE_REJECTION_ROLE,
+            )
+            if already:
+                logger.warning(
+                    'cascade-unblock: %s→%s refused again for task %s; escalation '
+                    '%s is already open — not filing a duplicate',
+                    task_id, target_status, task_id, already[0].id,
+                )
+                return
+
+            from escalation.models import Escalation  # noqa: PLC0415
+
+            error_code = getattr(exc, 'error_code', type(exc).__name__)
+            raw = getattr(exc, 'raw', str(exc))
+            esc = Escalation(
+                id=queue.make_id(task_id),
+                task_id=task_id,
+                agent_role=self._CASCADE_REJECTION_ROLE,
+                severity='blocking',
+                level=1,
+                category=self._CASCADE_REJECTION_CATEGORY,
+                summary=(
+                    f'Cascade resume failed to set task {task_id} to '
+                    f'{target_status!r}'
+                )[:200],
+                detail=(
+                    f'set_task_status({task_id!r}, {target_status!r}) was refused '
+                    f'while resuming the task after an escalation resolved.\n\n'
+                    f'error_code: {error_code}\n'
+                    f'raw: {raw}\n'
+                    f'resolved_by: {resolved_by}\n\n'
+                    f'The resolving escalation is already closed, so NOTHING WILL '
+                    f'RETRY this write — the task is left in whatever status it '
+                    f'held and will not be dispatched. Manual investigation '
+                    f'required: re-drive the row to {target_status!r} once the '
+                    f'rejection cause is cleared.\n\n'
+                    f'Note this rejection is already post-retry — '
+                    f'Scheduler.set_task_status exhausts the transient backoff '
+                    f'loop and raises only for non-transient rejections.'
+                ),
+                suggested_action='investigate_persistence_layer_rejection',
+            )
+            queue.submit(esc)
+            try:
+                if self.event_store:
+                    self.event_store.emit(
+                        EventType.escalation_created,
+                        task_id=task_id,
+                        data={
+                            'escalation_id': esc.id,
+                            'category': esc.category,
+                            'severity': esc.severity,
+                            'level': esc.level,
+                            'reason': 'cascade-status-write-rejected',
+                        },
+                    )
+            except Exception:
+                # Isolated from the outer handler: the record is already filed,
+                # so a failure here is an observability-only miss, never a
+                # "failed to escalate" condition.
+                logger.warning(
+                    'cascade-unblock: escalation %s filed but escalation_created '
+                    'emit failed', esc.id, exc_info=True,
+                )
+        except Exception:
+            logger.error(
+                'cascade-unblock: failed to escalate the refused %s→%s write for '
+                'task %s — the row is stuck with NO open record',
+                task_id, target_status, task_id, exc_info=True,
+            )
 
     # Synthetic task_id for scheduler-pause escalations.  Filename-safe for
     # EscalationQueue.make_id (yields esc-__scheduler__-N); never a real task,
@@ -14589,28 +14745,73 @@ class Harness:
 
         # A1 guard (task 2200/ω4): an infra-held task (first-class status ==
         # 'infra-hold', via is_infra_held) is a verify-complete branch held by
-        # a transient infra failure.  Checked BEFORE the blocked-only gate
-        # below — an infra-held task's status is 'infra-hold', never
-        # 'blocked', so this must run first or the gate would skip it
-        # entirely.  Flipping to 'pending' would force the task to re-compete
-        # for its implement footprint in the scheduler's footprint-locked
-        # dispatch — the 3465 starvation root cause.  Instead resume-at-verify:
-        # set in-progress (the scheduler already skips re-implement for
-        # branches with prior work via _has_prior_implementation).  There is
-        # no metadata flag to clear anymore — the status IS the hold.
+        # a transient infra failure.  The branch is KEPT — checked BEFORE the
+        # blocked-only gate below, because an infra-held task's status is
+        # 'infra-hold', never 'blocked', so without this pre-gate the gate
+        # would skip the row entirely and it would never resume at all.  There
+        # is no metadata flag to clear anymore — the status IS the hold.
+        #
+        # The RESUME TARGET is 'pending' (task 3538 / PRD γ3, D6).  It used to
+        # be 'in-progress', defended by a no-recompete argument that does not
+        # survive contact with the code:
+        #
+        #   - Dispatch is pending-only and status-first:
+        #     Scheduler._eligible_for_dispatch returns early at
+        #     `status != 'pending'`, BEFORE any lock work, and every candidate
+        #     list is filtered to pending.  So an 'in-progress' row is never
+        #     dispatched and never reaches try_acquire — it holds no footprint
+        #     and blocks nobody (the slot exit already released every module
+        #     lock via Scheduler.release).
+        #   - This is the ORPHAN path: no live workflow, so nothing stamps a
+        #     claimant and nothing heartbeats.  An 'in-progress' write here
+        #     lands the row in exactly the shape shared.task_claimant.is_stranded
+        #     is defined to detect — stranded on the write.
+        #   - The only route from that row back to execution was therefore the
+        #     stranded sweep's _RECOVERY row (c) REVERT_TO_PENDING
+        #     (shared.task_ground_truth), firing at
+        #     stranded_reconcile_interval_secs cadence — which writes 'pending'
+        #     and re-competes for the footprint anyway.  No-recompete was
+        #     deferred by up to one sweep interval, never delivered; and
+        #     because row (c) is keyed on `has_open_escalation is False`, any
+        #     record still open left the task there forever (the 3465-shaped
+        #     starvation this branch claimed to prevent).  The HOLD-side guard
+        #     in _revert_in_progress_if_no_live_claimant does not protect it
+        #     either: that guard tests is_infra_held, which is status-keyed and
+        #     already False the moment this line writes 'in-progress'.
+        #   - Resume-at-verify is NOT lost, because it was never status-keyed.
+        #     It is delivered branch-side by TaskWorkflow._has_prior_implementation
+        #     (worktree base_commit + durable iteration log) gating the
+        #     plan-step re-derivation, plus green_checkpoint_at_tip.  The
+        #     retired comment attributed that skip to the scheduler; there is
+        #     no _has_prior_implementation in scheduler.py.
+        #     See test_harness_infra_resume_truthful.py, which pins the skip
+        #     across infra-hold/in-progress/pending row statuses alike.
+        #   - Claim-then-status (stamp a claimant, then write 'in-progress')
+        #     was considered and rejected: Scheduler.set_task_claimant swallows
+        #     every exception and never raises, so a silently-failed stamp
+        #     reproduces the identical strand with nothing to catch; and a
+        #     stamp carrying a FRESH heartbeat with no heartbeat loop behind it
+        #     makes is_stranded False, converting the strand into a permanent
+        #     SILENT hold until claimant_liveness_ttl_secs expires — strictly
+        #     worse than the bug it replaces.
+        #
+        # Deliberately NOT routed through the reblock guard: that guard exists
+        # to damp blocked→pending churn, and withholding a legitimate infra
+        # resume would re-create the starvation this change removes.
+        #
         # Migration-window caveat (review amendment, task 2200): this check
         # cannot see a legacy metadata.infra_hold-only row (status still
-        # 'blocked') — it falls through to the ordinary Table B resume below
-        # and re-competes for its footprint.  See
-        # orchestrator.task_status.is_infra_held's docstring for the
-        # accepted-risk rationale and the operator follow-up.
+        # 'blocked') — it falls through to the ordinary Table B resume below,
+        # which now targets the same 'pending'.  See
+        # orchestrator.task_status.is_infra_held's docstring.
         _infra_task = await self.scheduler.get_task(task_id)
         if is_infra_held(_infra_task):
             try:
-                await self.scheduler.set_task_status(task_id, 'in-progress')
+                await self.scheduler.set_task_status(task_id, 'pending')
                 logger.info(
-                    'cascade-unblock: task %s is infra-held — resuming at '
-                    'verify (infra-hold→in-progress) via %s',
+                    'cascade-unblock: task %s is infra-held — re-pending for '
+                    'dispatch (infra-hold→pending; resume-at-verify is '
+                    'branch-keyed, not status-keyed) via %s',
                     task_id, escalation.resolved_by,
                 )
             except SetTaskStatusRejected as e:
@@ -14619,10 +14820,16 @@ class Harness:
                     '(TOCTOU race or guard): %s',
                     task_id, e,
                 )
-            except Exception:
+                self._escalate_cascade_status_rejection(
+                    task_id, 'pending', e, resolved_by=escalation.resolved_by,
+                )
+            except Exception as e:
                 logger.warning(
                     'cascade-unblock: infra-hold resume failed for %s',
                     task_id, exc_info=True,
+                )
+                self._escalate_cascade_status_rejection(
+                    task_id, 'pending', e, resolved_by=escalation.resolved_by,
                 )
             return
 
@@ -14675,6 +14882,34 @@ class Harness:
             logger.warning(
                 'cascade-unblock: refused to flip %s (TOCTOU race or guard): %s',
                 task_id, e,
+            )
+            # Symmetric with the infra arm above (INV-4): a swallowed rejection
+            # here strands a plain blocked task just as permanently.  The
+            # terminal carve-out lives inside the filer, so the common benign
+            # TOCTOU-to-terminal race stays quiet.
+            self._escalate_cascade_status_rejection(
+                task_id, _resume_target, e, resolved_by=escalation.resolved_by,
+            )
+        except Exception as e:
+            # The OTHER half of that symmetry, and not defensive padding: the
+            # rejection taxonomy does NOT cover every way this write dies.
+            # Scheduler.set_task_status raises a BARE RuntimeError once its
+            # fm_retry_backoffs() transient loop is exhausted (fused-memory
+            # restarting / MCP unreachable) and dispatch_tool can surface bare
+            # transport errors — neither is a SetTaskStatusRejected.  This
+            # method has no outer try and is scheduled fire-and-forget via
+            # _schedule_coro_threadsafe → create_task, whose only done-callback
+            # discards the task, so an escape here is never retrieved: it
+            # surfaces (at best) as an unretrieved-task-exception warning at GC
+            # time, leaving a plain blocked task at 'blocked' with NO open
+            # record and nothing that will retry — exactly the silent permanent
+            # hold INV-4 exists to close.
+            logger.warning(
+                'cascade-unblock: blocked→%s resume failed for %s',
+                _resume_target, task_id, exc_info=True,
+            )
+            self._escalate_cascade_status_rejection(
+                task_id, _resume_target, e, resolved_by=escalation.resolved_by,
             )
 
     def get_merge_halt_status(self) -> dict[str, Any]:

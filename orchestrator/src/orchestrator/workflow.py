@@ -2965,6 +2965,27 @@ class TaskWorkflow:
                 'Task %s: warm-lane requeue (%s, counts_against_requeue_cap=%s): %s',
                 self.task_id, block_reason, disp.counts_against_requeue_cap, e,
             )
+            # γ3/D6: make the REQUEUED exit TRUTHFUL — re-pend the row BEFORE
+            # returning, so the harness slot `finally` (which nulls the
+            # claimant right after) cannot leave the `(in-progress, NULL
+            # claimant)` strand shape behind for a merely transient capacity
+            # signal.  NOTE this clause is a SIBLING of `except
+            # SetTaskStatusRejected` above, not nested inside it: ANYTHING
+            # raised here escapes _drive() and run() has no handler for it
+            # (run() catches only WorkflowCancelled), which would destroy the
+            # REQUEUED TerminalReport built below and with it the retry-cap
+            # bookkeeping — so the write MUST stay locally guarded.  That is
+            # exactly what _repend_for_requeue delivers: it never re-raises,
+            # including for the bare RuntimeError Scheduler.set_task_status
+            # raises when its transient-retry loop is exhausted (the sole
+            # deliberate exception is WorkflowCancelled, re-raised so CX-1's
+            # single catch site keeps its monopoly).  A non-None
+            # return means the row is terminal and that verdict WINS over the
+            # requeue intent; return it directly without stashing the REQUEUED
+            # report, so run()'s SM-2 exit check sees a consistent pair.
+            repend_outcome = await self._repend_for_requeue()
+            if repend_outcome is not None:
+                return repend_outcome
             # TerminalReport.phase is machine.state — this path never calls
             # _enter_phase, so it is the pre-existing working phase (PLAN,
             # since create_worktree runs before the first _enter_phase call
@@ -4332,6 +4353,136 @@ class TaskWorkflow:
             blocked_from_phase=self.machine.state,
         )
         return WorkflowOutcome.REQUEUED
+
+    async def _repend_for_requeue(self) -> WorkflowOutcome | None:
+        """Write ``pending`` so a REQUEUED exit is TRUTHFUL, returning a terminal
+        override outcome when the row turns out to be terminal, else ``None``.
+
+        The single choke point for the two SLOT-EXITING requeue paths that
+        historically returned ``WorkflowOutcome.REQUEUED`` with NO status
+        write — ``_drive()``'s ``except WarmLaneRequeue`` clause and
+        ``_handle_soft_cancel``'s spurious-wakeup fallback (PRD γ3 / D6).
+        Leaving the row ``in-progress`` there is not merely imprecise: the
+        harness's slot ``finally`` nulls the claimant immediately afterwards,
+        producing exactly the ``(in-progress, NULL claimant)`` shape
+        ``shared.task_claimant.is_stranded`` is defined to detect, so a
+        transient capacity signal degenerates into a strand recoverable only
+        by the stranded sweep — which refuses to act while ANY escalation is
+        open. Ordering therefore matters: the write must land BEFORE the
+        caller returns. Same helper-per-family precedent as
+        ``_requeue_on_lock_conflict`` above; the write itself is the one
+        already used by ``_plan()``'s plan-lock requeue and the
+        blocking-dependency requeue.
+
+        SCOPE — "two" is a claim about SLOT EXITS, not about the literal
+        ``return WorkflowOutcome.REQUEUED`` population, which is larger.  The
+        membership test is "does this return hand control back to the harness,
+        so the slot ``finally`` nulls the claimant next?".  The other REQUEUED
+        returns in this file were each checked and are NOT members:
+
+        * ``_handle_wip_conflict`` — its REQUEUED returns into
+          ``_submit_to_merge_queue`` → the merge-retry loop in
+          ``_merge_and_finalise``, whose REQUEUED arm retries the merge
+          IN-PLACE (see MERGE_PHASE_RATIONALE there): the coroutine keeps the
+          slot and stays a LIVE claimant, so no unclaimed ``in-progress`` row
+          exists, and loop exhaustion exits through ``_mark_blocked``, which
+          writes the row itself.  Same for the other in-loop merge handlers
+          and ``_resolve_and_resubmit``, which re-enters the same call.
+        * ``_requeue_on_lock_conflict`` — the row is already re-pended one
+          layer down, by ``Scheduler.handle_blast_radius_expansion``'s
+          acquire-failure branch (it writes ``pending`` before returning
+          False).  Routing it through here would be a duplicate write.
+        * ``_run_simple_task`` — its REQUEUED is an internal fall-through
+          sentinel, consumed by ``_drive()``'s ``else:`` arm (drop the plan,
+          run the architect path); it is never returned to the harness.
+
+        So the strand class this helper closes IS closed for the exits that
+        can produce it.  A future REQUEUED return that EXITS the slot is a new
+        member and belongs here — that, not the count, is the invariant.
+
+        Rejection handling (INV-4). ``Scheduler.set_task_status`` already owns
+        the transient retry loop and raises ``SetTaskStatusRejected`` only for
+        NON-transient, logically-refused writes, so a rejection arriving here
+        is by construction post-retry — a caller-level re-retry would be dead
+        code that only delays the loud signal. What remains is to classify it:
+
+        * ``TerminalExitRejection`` — the row is terminal; defer to
+          ``_observed_terminal_outcome(exc.old_status)`` and return its
+          verdict, which the caller returns INSTEAD of REQUEUED (a terminal
+          row wins over a requeue intent). Bypass-done discrimination is
+          deliberately NOT performed here: introducing phantom-done policy on
+          a requeue path would be new policy surface, and the any-level
+          dispatch gate already owns done-legitimacy.
+        * anything else — log at ERROR and return ``None``. The caller keeps
+          its REQUEUED exit and the row stays ``in-progress``, which
+          ``_OUTCOME_ALLOWED['requeued']`` still permits today; task θ's
+          narrowing of that row to ``{PENDING}`` is what will make this case
+          loud at ``run()``'s SM-2 check, and that is the correct owner.
+
+        This helper never re-raises, and that is delivered BY CONSTRUCTION
+        (the terminal ``except Exception`` arm), not merely by the rejection
+        taxonomy above.  Both call sites are structurally unable to catch an
+        escape: the ``WarmLaneRequeue`` clause is a SIBLING of ``_drive()``'s
+        ``except SetTaskStatusRejected`` / ``except Exception``, so a raise
+        inside it is not caught by later clauses of the same ``try``; and
+        ``_handle_soft_cancel`` runs from INSIDE ``run()``'s ``except
+        WorkflowCancelled`` handler, while ``run()`` catches nothing else.  So
+        an escape does not merely lose the write — it destroys the
+        ``TerminalReport`` (the harness sees ``report is None``), skipping the
+        ``_apply_retry_cap`` / ``record_requeue`` /
+        ``counts_against_requeue_cap`` bookkeeping entirely, AND leaves the row
+        ``in-progress`` for the slot ``finally`` to strand: strictly worse than
+        the pre-γ3 behaviour this method exists to improve on.  The concrete
+        escape the blanket arm closes is the ``RuntimeError`` family from
+        ``Scheduler.set_task_status``'s exhausted ``fm_retry_backoffs()``
+        transient loop (fused-memory restarting / MCP unreachable) — which is
+        precisely the infra degradation that GENERATES warm-lane requeues.
+
+        That arm deliberately does NOT escalate.  It mirrors the non-terminal
+        rejection arm's policy exactly — log loudly, keep the REQUEUED exit —
+        because the condition it handles is transient infra degradation during
+        a capacity event, so escalating would fire an L1 on every blip; and the
+        row is left in the same state the pre-γ3 code always left it.
+        ``WorkflowCancelled`` is carved out and re-raised: it subclasses
+        ``Exception``, so the blanket arm would otherwise capture the ONE typed
+        cancellation signal CX-1 requires be caught only in ``run()``.
+        """
+        try:
+            await self.scheduler.set_task_status(self.task_id, 'pending')
+        except TerminalExitRejection as exc:
+            return self._observed_terminal_outcome(exc.old_status)
+        except SetTaskStatusRejected as exc:
+            logger.error(
+                'Task %s: re-pend before requeue REJECTED (%s — %s); exiting '
+                'REQUEUED with the row left in-progress',
+                self.task_id, exc.error_code, exc.raw,
+            )
+        except WorkflowCancelled:
+            # Load-bearing, NOT defensive noise: WorkflowCancelled subclasses
+            # Exception (workflow_types.py), so the blanket arm below would
+            # otherwise swallow it and violate CX-1's "raised by
+            # CancellationScope and caught at EXACTLY ONE place —
+            # TaskWorkflow.run()", silently downgrading a cancellation into a
+            # REQUEUED exit.  Do not "simplify" this away.
+            # (asyncio.CancelledError needs no arm: it derives from
+            # BaseException on this repo's >=3.11 floor, so hard-cancel
+            # injection propagates past `except Exception` untouched.)
+            raise
+        except Exception as exc:
+            # The non-rejection escape: Scheduler.set_task_status raises a BARE
+            # RuntimeError once its fm_retry_backoffs() transient loop is
+            # exhausted, and dispatch_tool can surface bare transport errors —
+            # neither is a SetTaskStatusRejected, and NOTHING at either call
+            # site would catch them (see the docstring).  Same policy as the
+            # rejection arm above: loud, but the caller keeps its REQUEUED exit
+            # with the row left in-progress — degraded, and no worse than the
+            # pre-γ3 code that always exited REQUEUED without any write.
+            logger.error(
+                'Task %s: re-pend before requeue FAILED (%r); exiting '
+                'REQUEUED with the row left in-progress',
+                self.task_id, exc,
+            )
+        return None
 
     async def _plan(self) -> WorkflowOutcome:
         """Invoke the architect to produce a plan."""
@@ -10531,10 +10682,12 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 merge_phase=merge_phase,
             )
         # ``blocked`` — but first check for the worktree-missing race: if a
-        # human marked the task ``done`` and removed the worktree while the
-        # merge was in flight, the merge worker surfaces a known reason
-        # prefix.  Re-read task status; if terminal, exit cleanly without
-        # creating an escalation.
+        # human resolved the task out-of-band (``done`` OR ``cancelled``) and
+        # removed the worktree while the merge was in flight, the merge worker
+        # surfaces a known reason prefix.  Re-read task status; if terminal,
+        # exit cleanly without creating an escalation, reporting WHICH terminal
+        # it was (γ3 / boundary #14b — collapsing both onto DONE reported a
+        # cancellation as a completion and tripped run()'s SM-2 check).
         from orchestrator.merge_queue import WORKTREE_MISSING_REASON_PREFIX
         if result.reason.startswith(WORKTREE_MISSING_REASON_PREFIX):
             try:
@@ -10548,10 +10701,10 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             if status in TERMINAL_STATUSES:
                 logger.info(
                     f'Task {self.task_id}: worktree missing but task '
-                    f'status={status!r} (terminal) — exiting DONE without '
-                    f'escalation'
+                    f'status={status!r} (terminal) — exiting on that terminal '
+                    f'without escalation'
                 )
-                return WorkflowOutcome.DONE
+                return self._observed_terminal_outcome(status)
         # Drop-guard short-circuit: a real merger-drop is the human-judgement
         # case the gate exists for.  Steward mediation (e.g. mutating plan.json
         # to silence the gate) would undermine the safeguard, so skip the L0
@@ -14769,6 +14922,48 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             return WorkflowOutcome.CANCELLED
         return None
 
+    def _observed_terminal_outcome(self, status: str | None) -> WorkflowOutcome:
+        """Map an OBSERVED terminal task row onto its truthful outcome.
+
+        The sibling of ``_handle_cancelled_terminal_exit`` above: that one
+        answers "a *rejection* told us the row is cancelled", this one answers
+        "a status *read* told us the row is terminal". Callers have already
+        established ``status in TERMINAL_STATUSES``; this decides which
+        terminal it actually is (PRD γ3 / spec §5, "observed-terminal reported
+        as that terminal").
+
+        ``'cancelled'`` → :attr:`WorkflowOutcome.CANCELLED`, entering
+        ``WorkflowState.CANCELLED`` (SM-1 terminal absorption) — guarded by
+        ``machine.is_terminal()`` because one caller
+        (``_handle_soft_cancel``, reached from ``_finalise_cancellation``)
+        has ALREADY entered CANCELLED, and re-entering an absorbing state
+        would raise ``IllegalTransition`` out of a path with no handler for
+        it. This branch is also a live crash fix, not only a relabelling:
+        ``_OUTCOME_ALLOWED['done'] == {DONE}``
+        (``shared/task_transitions.py``), so the DONE-on-``cancelled`` exits
+        this replaces fail ``run()``'s SM-2 consistency assertion with an
+        ``AssertionError``; ``_OUTCOME_ALLOWED['cancelled'] == {CANCELLED}``
+        makes the truthful pairing consistent by construction. It also
+        de-inflates the completed tally, which counts ``outcome == DONE``.
+
+        Anything else (in practice ``'done'``) → :attr:`WorkflowOutcome.DONE`
+        with the phase deliberately UNTOUCHED. Moving it would be a
+        behaviour change at all three call sites — every existing DONE exit
+        leaves the machine in its working phase, and several tests assert
+        that phase — so the DONE branch stays byte-identical to today and
+        only the cancelled branch is new behaviour.
+        """
+        if status == TaskStatus.CANCELLED.value:
+            logger.info(
+                'Task %s: cancelled out-of-band; aborting gracefully '
+                '(no reopen, no escalation)',
+                self.task_id,
+            )
+            if not self.machine.is_terminal():
+                self._enter_phase(WorkflowState.CANCELLED)
+            return WorkflowOutcome.CANCELLED
+        return WorkflowOutcome.DONE
+
     async def _handle_terminal_exit_on_block(
         self,
         exc: TerminalExitRejection,
@@ -16277,8 +16472,18 @@ Update the plan to address the blocking issues. You may add new steps to the `st
 
         Three-way decision based on scheduler status and cancel-event state:
 
-        1. ``status in TERMINAL_STATUSES`` → ``DONE``
-           A human marked the task done out-of-band; exit cleanly.
+        1. ``status in TERMINAL_STATUSES`` → the OBSERVED terminal
+           (``DONE`` for a ``done`` row, ``CANCELLED`` for a ``cancelled``
+           one), via :meth:`_observed_terminal_outcome`.
+           A human resolved the task out-of-band; exit cleanly, reporting
+           which terminal it actually was.  Collapsing both onto ``DONE``
+           was not merely imprecise: ``_OUTCOME_ALLOWED['done'] == {DONE}``,
+           so a DONE exit against a ``cancelled`` row fails ``run()``'s SM-2
+           consistency assertion, and the completed tally (``outcome ==
+           DONE``) counted a cancellation as a completion.  The CANCELLED
+           branch also completes SM-1 terminal absorption — though on this
+           path ``_finalise_cancellation`` has already entered CANCELLED, so
+           the mapper's ``is_terminal()`` guard makes it a no-op here.
 
         2. ``self._cancel_event.is_set()`` (pending soft-cancel, non-terminal)
            → ``SOFT_CANCELLED``
@@ -16288,7 +16493,12 @@ Update the plan to address the blocking issues. You may add new steps to the `st
 
         3. Otherwise (cancel event cleared or spurious wakeup) → ``REQUEUED``
            Defensive fallback: re-run the slot once the cancel condition clears.
-           Preserves the original REQUEUED semantics for non-soft-cancel callers.
+           Preserves the original REQUEUED semantics for non-soft-cancel callers,
+           but re-pends the row first via :meth:`_repend_for_requeue` (γ3/D6) so
+           the exit is truthful — otherwise the row is left ``in-progress`` and
+           the harness slot ``finally`` nulls the claimant right after, which is
+           precisely the stranded shape.  If that write reveals a terminal row,
+           the terminal verdict is returned instead of REQUEUED.
 
         **Watcher-race note** — ``_scan_for_terminal_active_tasks`` fires a soft-
         cancel when it observes a terminal status, but by the time this method
@@ -16297,9 +16507,12 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         non-terminal, ``_cancel_event`` is set, and we return ``SOFT_CANCELLED``
         (slot exits with ``requeued=False``) rather than the prior ``REQUEUED``
         (which would have re-dispatched the now-live task).  Recovery for watcher-
-        triggered soft-cancels therefore relies on the scheduler's stranded-in-
-        progress sweep or normal re-dispatch of a ``pending`` task rather than
-        immediate requeue.  The ``release_workflow`` MCP path (human-initiated
+        triggered soft-cancels therefore relies on normal re-dispatch of a
+        ``pending`` task rather than immediate requeue.  (The stranded-in-progress
+        sweep is no longer part of that story for case 3: as of γ3 the fallback
+        re-pends the row itself, so recovery is ordinary dispatch — the sweep
+        cannot be relied on anyway, since it refuses to act while any escalation
+        is open.)  The ``release_workflow`` MCP path (human-initiated
         takeover) is unaffected — ``release_workflow`` always follows a
         ``SOFT_CANCELLED`` exit with an explicit ``set_task_status`` park.
         """
@@ -16315,10 +16528,13 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             f'scheduler status={status!r}'
         )
         if status in TERMINAL_STATUSES:
-            return WorkflowOutcome.DONE
+            return self._observed_terminal_outcome(status)
         if self._cancel_event.is_set():
+            # No status write: release_workflow owns the park that follows a
+            # SOFT_CANCELLED exit, and writing here would race it.
             return WorkflowOutcome.SOFT_CANCELLED
-        return WorkflowOutcome.REQUEUED
+        outcome = await self._repend_for_requeue()
+        return outcome if outcome is not None else WorkflowOutcome.REQUEUED
 
     @staticmethod
     def _outcome_severity(outcome: StewardOutcome) -> int:
