@@ -71,7 +71,7 @@ invalidates task assumptions, completed work not reflected in tasks).
 
 {render_source_completion_section(can_file_tasks=False)}
 
-{render_consolidation_gate_section()}
+{render_consolidation_gate_section(can_file_tasks=False)}
 
 ## Authority Model
 - Knowledge contradicts task assumptions → Knowledge wins (more recent). Flag for Stage 2.

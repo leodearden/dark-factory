@@ -76,7 +76,7 @@ returned. Treat as success, not failure.
 
 {render_predicate_contradiction_section()}
 
-{render_consolidation_gate_section()}
+{render_consolidation_gate_section(can_file_tasks=True)}
 
 ## Splitting Tasks (do NOT create subtasks)
 Subtask creation is **not available** in this stage (blocked via `DISALLOW_SUBTASK_CREATE`). \

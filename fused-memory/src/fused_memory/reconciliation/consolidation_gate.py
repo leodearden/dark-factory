@@ -734,29 +734,67 @@ def build_consolidation_gate_task(
     )
 
 
-def render_consolidation_gate_section() -> str:
+def render_consolidation_gate_section(*, can_file_tasks: bool) -> str:
     """Render the consolidation-gate filing-convention prompt section (task
     3112), mirroring ``render_predicate_contradiction_section``'s style.
 
-    Interpolated into BOTH stage system prompts — Stage 1 and Stage 2 each hold
-    the memory-mutation tools, so either can reach the point of filing a gate.
+    Interpolated into BOTH stage system prompts. Both stages hold the
+    memory-mutation tools, so either can REACH a gate-worthy judgment call —
+    but only Stage 2 holds ``submit_task``, so only the HOW clause is
+    parameterized on *can_file_tasks*: Stage 2 (``True``) builds and files the
+    gate itself; Stage 1 (``False``) relays it to Stage 2 through the
+    ``flag_for_stage2`` / ``flagged_items`` channel. ``flagged_items`` is the
+    DURABLE half of that channel — the Mem0 ``flag_for_stage2=true`` write
+    alone is best-effort — which is what stage1.py already tells the stage
+    about flag delivery.
+
+    ``reconciliation.cli_stage_runner::STAGE1_DISALLOWED`` is the source of
+    truth for what Stage 1 cannot call; it is cited rather than restated here,
+    for the reason :func:`recon_self_model.render_source_completion_section`
+    gives in its own docstring — a mirrored inventory goes stale silently. The
+    sibling :func:`predicate_contradiction.render_predicate_contradiction_section`
+    is Stage-2-only for exactly this reason, so this is the third instance of
+    one convention rather than a new one.
+
+    Everything OTHER than the HOW clause is shared and byte-identical across
+    both variants: the end state does not depend on which stage files the gate.
     It reuses :func:`render_end_state_brief` VERBATIM, so the prompt, the filed
     gate's description and the closure predicate's target are one text and
     cannot drift into disagreeing.
     """
+    if can_file_tasks:
+        how_clause = (
+            'HOW: you hold `submit_task` in this stage, so file it yourself. '
+            "Build the submission with `build_consolidation_gate_task("
+            "topic='<slug>', rationale=...)` (module "
+            '`fused_memory.reconciliation.consolidation_gate`) and submit its '
+            '`as_submit_task_kwargs()`. It emits an '
+            "`execution_class='operational'` + `operational_mode='gate'` task "
+            f'whose `metadata.{GATE_METADATA_KEY}.topic` carries the cluster '
+            'TOPIC.'
+        )
+    else:
+        how_clause = (
+            'HOW: you do NOT hold submit_task in this stage (task writes are '
+            'disallowed here via DISALLOW_TASK_WRITES), so you cannot file the '
+            'gate here. Relay it to Stage 2 via the `flag_for_stage2` / '
+            '`flagged_items` channel, carrying the cluster\'s topic SLUG and '
+            'the rationale, so Stage 2 can build it with '
+            "`build_consolidation_gate_task(topic='<slug>', rationale=...)` "
+            '(module `fused_memory.reconciliation.consolidation_gate`) and '
+            "file it as an `execution_class='operational'` + "
+            "`operational_mode='gate'` task whose "
+            f'`metadata.{GATE_METADATA_KEY}.topic` carries that TOPIC. The '
+            'topic slug and the rationale are the whole payload Stage 2 needs '
+            '— relay them, do not relay a member list (see below).'
+        )
     return (
         '## Consolidation Gate\n'
         'When a memory consolidation reaches an irreversible, content-losing '
         'judgment call, file it as a human gate — but file it with a TARGET '
         'and a working key, not just a description of the problem. A gate that '
         'does not say what "done" looks like gets a different answer from '
-        'every cycle that reads it.\n\n'
-        'HOW: build the submission with `build_consolidation_gate_task('
-        "topic='<slug>', rationale=...)` (module "
-        '`fused_memory.reconciliation.consolidation_gate`) and submit its '
-        '`as_submit_task_kwargs()`. It emits an '
-        "`execution_class='operational'` + `operational_mode='gate'` task whose "
-        f'`metadata.{GATE_METADATA_KEY}.topic` carries the cluster TOPIC.\n\n'
+        'every cycle that reads it.\n\n' + how_clause + '\n\n'
         'EMIT THE TOPIC, NOT A MEMBER LIST. The live `metadata.topic` scroll is '
         'the working list. A hand-written enumeration is accepted only as inert '
         "provenance (`authoritative: false`) and can never make a gate "
