@@ -327,6 +327,77 @@ def render_escalation_boundary_note(*, can_escalate: bool) -> str:
     )
     return f'{ESCALATION_BOUNDARY_NOTE} {clause}\n\n{_GATE_CLOSURE_ARCHIVE_GUIDANCE}'
 
+
+def render_finding_provenance_section(*, can_file_tasks: bool) -> str:
+    """Render the finding-provenance section for one stage (esc-3796-1, task 4373).
+
+    Follows the :func:`render_escalation_boundary_note` /
+    :func:`render_source_completion_section` (recon_self_model.py) precedent:
+    ONE shared stage-agnostic body plus a single clause selected by a
+    keyword-only capability flag, so the shared half exists exactly once
+    (INV-5 ``no-lockstep-duplication``).
+
+    The clause is parameterized because ``submit_task`` IS in
+    ``DISALLOW_TASK_WRITES``: Stage 2 holds it and sets the keys itself, while
+    Stage 1 does not and can only relay. Naming a tool in a stage's prompt is a
+    live positive license, not inert prose, so handing Stage 1 the Stage-2 text
+    would instruct it to take an action it cannot take. Read the per-stage
+    disallow lists at their source in ``cli_stage_runner.py`` — their
+    composition is deliberately NOT restated here, because a mirrored inventory
+    in a docstring goes stale silently (exactly the failure mode that hid the
+    Stage-2 escalation-read gap until task 3163).
+
+    One deliberate DIVERGENCE from ``render_source_completion_section``'s
+    relay branch: that one names the tool it is denying ("you do NOT hold
+    submit_task in this stage"), whereas this one does not name it at all. The
+    relay CHANNEL wording is mirrored so the two sections tell Stage 1 the same
+    story about the same channel, but the tool token is withheld — a name
+    surfaced to a model in a negation is still a name surfaced, and the
+    capability test pins its absence from this branch.
+
+    Args:
+        can_file_tasks: True for Stage 2, which holds the task-write tools and
+            persists the keys itself; False for Stage 1, which holds none and
+            must relay to Stage 2.
+
+    Returns:
+        The shared provenance body plus the matching capability clause. Free of
+        literal braces so it drops cleanly into the stage f-strings.
+    """
+    if can_file_tasks:
+        capability_clause = (
+            'You hold `submit_task` in this stage, so set both keys yourself, in '
+            'the `metadata=` you pass to `mcp__fused-memory__submit_task` at the '
+            'moment you file the task — not as a later `update_task` repair, which '
+            'leaves a window in which the task exists with no provenance at all.'
+        )
+    else:
+        capability_clause = (
+            'You cannot file tasks in this stage (task writes are disallowed '
+            'here), so you cannot persist these keys yourself. Relay the finding '
+            'id and its cited memory ids to Stage 2 via the `flag_for_stage2` / '
+            '`flagged_items` channel, so Stage 2 can set them under those same '
+            'two names. A relayed finding id that arrives without its memory ids '
+            'cannot be reconstructed later — carry both.'
+        )
+    return (
+        '## Finding Provenance\n'
+        'A task filed from a Stage-1 finding must carry that finding\'s provenance '
+        'under two named keys:\n'
+        f'- `metadata.{FINDING_ID_METADATA_KEY}` — the `finding_id`, captured '
+        'verbatim from the filing response. How you obtain it is governed by the '
+        '`## Verifying add_finding responses` rule; never compose or guess one.\n'
+        f'- `metadata.{FINDING_MEMORY_IDS_METADATA_KEY}` — the memory ids that '
+        'finding cites.\n\n'
+        'Those two spellings are the WHOLE vocabulary. Never mint a per-topic '
+        'variant of either name: the corpus already forked into 64 such spellings '
+        '(e.g. `title_count_corrected_source_finding`, '
+        '`stage2_addendum_finding_latest`), which is what made finding provenance '
+        'ungreppable in the first place. A genuinely one-off annotation goes under '
+        'the `x_` namespace — silently allowed — rather than becoming a 65th '
+        'bespoke top-level key. ' + capability_clause
+    )
+
 # Shared guidance about the memory_ids=[] + stores=['graphiti'] → graphiti_writes_queued
 # invariant.  Both stages need to teach the LLM not to count async-enqueued Graphiti
 # writes under their `memories_*` stats; only the stat-key tokens differ between stages.
