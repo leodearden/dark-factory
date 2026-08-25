@@ -35,6 +35,16 @@ from __future__ import annotations
 import pytest
 from shared.task_metadata import parse_metadata
 
+# The call-opener scanners are imported from the drift-guard module that owns
+# them rather than re-implemented, for the same reason step-6 imports
+# DISALLOW_TASK_WRITES from cli_stage_runner: a hand-rolled twin of a guard
+# tracks the original only until one of them is edited.
+from test_recon_report_guidance_drift import (
+    _AGENT_CALLED_REPORT_TOOLS,
+    _extract_call_args_at,
+    _iter_call_openers,
+)
+
 from fused_memory.reconciliation.cli_stage_runner import DISALLOW_TASK_WRITES
 from fused_memory.reconciliation.prompts import (
     FINDING_ID_METADATA_KEY,
@@ -48,16 +58,6 @@ from fused_memory.reconciliation.prompts.stage2 import (
     build_stage2_system_prompt,
 )
 from fused_memory.reconciliation.prompts.stage3 import STAGE3_SYSTEM_PROMPT
-
-# The call-opener scanners are imported from the drift-guard module that owns
-# them rather than re-implemented, for the same reason step-6 imports
-# DISALLOW_TASK_WRITES from cli_stage_runner: a hand-rolled twin of a guard
-# tracks the original only until one of them is edited.
-from test_recon_report_guidance_drift import (  # noqa: E402
-    _AGENT_CALLED_REPORT_TOOLS,
-    _extract_call_args_at,
-    _iter_call_openers,
-)
 
 _STAGE1_SECTION = render_finding_provenance_section(can_file_tasks=False)
 _STAGE2_SECTION = render_finding_provenance_section(can_file_tasks=True)
