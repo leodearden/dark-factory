@@ -1460,6 +1460,44 @@ class TaskWorkflow:
         self._claimant_heartbeat_task: asyncio.Task | None = None
 
     @property
+    def _filing_claimant_run_id(self) -> str:
+        """This incarnation's identity, stamped on every ``Escalation`` it files.
+
+        Task 3550.  Spec ``docs/task-escalation-state-spec.md`` S6, realised
+        by ``escalation.pins::classify_pins`` Link 4: an L0 is a live handoff
+        ONLY while the incarnation that FILED it lives, and liveness is judged
+        by comparing this value WHOLE against the live claimant.  That live
+        claimant is read from the ``claimant_run_id`` DB column, so this
+        property is also the SINGLE expression composing that column's value
+        — :meth:`_setup_worktree_and_artifacts`'s dispatch stamp routes
+        through it.  Two copies could drift, and a drifted filing identity
+        classifies a genuinely LIVE filer's own L0 as ``dead_l0``, the unsafe
+        direction.  Byte-identical by construction is the only guarantee
+        strong enough for an exact-string rule.
+
+        KNOWN HAZARD, unfixed here (ticket tkt_0RSGFS860E6VY37A7XH6S9FYCP, a
+        task 3563 follow-up): ``or ''`` means a HARNESS-LESS workflow
+        (``_process_run_id is None`` — tests/evals, see the field comment at
+        its declaration) composes the PARTIAL identity
+        ``'/{session_id}/pid={pid}'``.  That string carries the ``/pid=``
+        marker, so it passes ``escalation.pins._norm_id``'s shape guard and is
+        then compared whole as if it were KNOWN.  The ``plan.lock`` writer
+        deliberately does the OPPOSITE — it omits the key entirely when the
+        run id is unknown, so ``TaskGroundTruth`` resolves a fail-safe
+        ``None`` (see the :meth:`Artifacts.lock_plan` call site and the
+        ``Claimant`` docstring), and ``Harness._filing_claimant_run_id``
+        makes that same choice because it has no DB counterpart to match.
+        Task 3563 landed while deliberately leaving THIS side alone, so the
+        asymmetry is ratified and owned elsewhere.  Normalising it is the
+        follow-up's job; do not "fix" it by changing the plan.lock side to
+        match, and do not change it here — this side must keep matching the
+        DB stamp it composes.
+        """
+        return compose_claimant_run_id(
+            self._process_run_id or '', self.session_id, os.getpid(),
+        )
+
+    @property
     def state(self) -> WorkflowState:
         """Current workflow phase, delegated to :attr:`machine`.
 
@@ -2299,23 +2337,15 @@ class TaskWorkflow:
         # claimant atomically with the dispatch status write, so there is no
         # window where the task is in-progress with no live claimant.
         #
-        # KNOWN HAZARD, unfixed here (ticket tkt_0RSGFS860E6VY37A7XH6S9FYCP,
-        # a task 3563 follow-up): `or ''` means a HARNESS-LESS workflow
-        # (`_process_run_id is None` — tests/evals, see the field comment at
-        # its declaration) stamps the PARTIAL identity '/{session_id}/pid={pid}'.
-        # That string carries the '/pid=' marker, so it passes
-        # escalation.pins._norm_id's shape guard and is then compared whole
-        # against filing identities as if it were KNOWN. The plan.lock writer
-        # below deliberately does the OPPOSITE — it omits the key entirely when
-        # the run id is unknown, so TaskGroundTruth resolves a fail-safe None
-        # (see the lock_plan call site and the Claimant docstring). Normalising
-        # THIS side is the follow-up's job; do not "fix" it by changing the
-        # plan.lock side to match.
+        # Composed via `_filing_claimant_run_id` (task 3550), which is the ONE
+        # expression producing this workflow's identity — the same value every
+        # Escalation this incarnation files carries. `escalation.pins` Link 4
+        # compares the two WHOLE, so they must not be able to drift; the
+        # property's docstring also carries the `or ''` KNOWN HAZARD note that
+        # used to live here.
         await self.scheduler.set_task_status(
             self.task_id, 'in-progress',
-            claimant_run_id=compose_claimant_run_id(
-                self._process_run_id or '', self.session_id, os.getpid(),
-            ),
+            claimant_run_id=self._filing_claimant_run_id,
             heartbeat_at=datetime.now(UTC).isoformat(),
         )
         self._claimant_heartbeat_task = asyncio.create_task(
