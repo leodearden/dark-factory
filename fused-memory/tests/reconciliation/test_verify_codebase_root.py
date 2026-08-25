@@ -340,6 +340,13 @@ async def test_unusable_root_refuses_without_spawning_an_agent(tmp_path, shape):
     # The offending path must be legible in the row itself, so an operator
     # reading the census sees WHICH root failed without re-running anything.
     assert str(bad_root) in result.summary, result.summary
+    # ...and WHY.  The three shapes collapse to one census token by design
+    # (closed vocabulary, so GROUP BY does not fragment), which is exactly
+    # why the discriminator has to survive in the prose: 'no_dot_git' is a
+    # real tree that is merely not a checkout root — a permanently-refused
+    # project — while 'missing' is a bogus path.  Same token, different
+    # operational story.
+    assert f'({shape})' in result.summary, result.summary
 
     mock_cls.assert_not_called()
 
@@ -430,3 +437,57 @@ async def test_refusal_summary_keeps_the_agent_failed_sentinel(tmp_path):
         patcher.stop()
 
     assert result.summary.startswith('agent-failed:'), result.summary
+
+
+@pytest.mark.asyncio
+async def test_malformed_root_refuses_instead_of_raising(tmp_path):
+    """A path that cannot even be RESOLVED still produces the refusal.
+
+    ``Path.resolve()`` raises where the stat checks merely return False:
+    ValueError('embedded null character') for a path carrying a NUL.
+    ``require_project_root`` validates SHAPE only (non-empty +
+    ``os.path.isabs``), and ``'/tmp/a\x00b'`` passes both — so such a path
+    genuinely reaches verify().  Letting the exception escape would land it
+    in targeted.py's generic handler as a ``verify|codebase|error`` row
+    instead of this structured refusal, which is a (narrow) breach of PRD D4:
+    *a wrong or unresolvable root produces a structured refusal*.
+    """
+    malformed = Path('/tmp/a\x00b')
+
+    patcher, mock_cls, _instance = _mock_agent_loop()
+    try:
+        verifier = CodebaseVerifier(_config())
+        # The assertion is that this does NOT raise.
+        result = await verifier.verify(claim='Task X completed', codebase_root=malformed)
+    finally:
+        patcher.stop()
+
+    assert result.agent_failed is True
+    assert result.failure_token == 'codebase_root_unresolved'
+    assert '(unresolvable)' in result.summary, result.summary
+    mock_cls.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_refusal_warning_carries_the_sub_reason(tmp_path, caplog):
+    """The operator-facing WARNING names the root AND why it was refused.
+
+    The log line is the only place the discriminator is machine-greppable
+    (the census token is deliberately single-valued), so it is pinned here
+    rather than left to drift.
+    """
+    bad_root = tmp_path / 'no-git'
+    bad_root.mkdir()
+
+    patcher, _mock_cls, _instance = _mock_agent_loop()
+    try:
+        verifier = CodebaseVerifier(_config())
+        with caplog.at_level('WARNING'):
+            await verifier.verify(claim='Task X completed', codebase_root=bad_root)
+    finally:
+        patcher.stop()
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == 'WARNING']
+    assert any('verification_root_unresolved' in m for m in warnings), warnings
+    assert any('reason=no_dot_git' in m for m in warnings), warnings
+    assert any(str(bad_root.resolve()) in m for m in warnings), warnings

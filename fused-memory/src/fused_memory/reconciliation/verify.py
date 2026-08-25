@@ -28,8 +28,28 @@ _MAX_FAILURE_TOKEN_LEN = 64
 CODEBASE_ROOT_UNRESOLVED = 'codebase_root_unresolved'
 
 
-def _is_usable_codebase_root(root: Path) -> bool:
-    """Whether ``root`` looks like a checkout the explore agent can search.
+# Sub-reasons for a refused root.  They discriminate the populations hiding
+# behind the single CODEBASE_ROOT_UNRESOLVED token: 'no_dot_git' is a real
+# tree that merely is not a checkout ROOT (a monorepo subdirectory, or a
+# project not under git at all) and would refuse that project's every sparse
+# verification forever, which is a wholly different operational story from a
+# path that does not exist.  They ride the WARNING and the summary prose
+# ONLY — the census token stays closed-vocabulary and single-valued so an
+# operator's GROUP BY does not fragment when a sub-reason is added here.
+ROOT_DEFECT_UNRESOLVABLE = 'unresolvable'
+ROOT_DEFECT_MISSING = 'missing'
+ROOT_DEFECT_NOT_A_DIR = 'not_a_dir'
+ROOT_DEFECT_NO_DOT_GIT = 'no_dot_git'
+
+
+def _resolve_codebase_root(root: Path) -> tuple[Path, str | None]:
+    """Resolve ``root`` and say why it is not a checkout the agent can search.
+
+    Returns ``(resolved_root, None)`` when usable, else ``(root, <sub-reason>)``.
+    The resolve lives HERE, inside the guard, rather than at the call site: it
+    is the one step of the pre-flight that can RAISE, so leaving it outside
+    would make this function's fail-closed-by-construction claim true of the
+    checks but not of the pre-flight as a whole.
 
     Stat-only by design (INV-8): verify() runs on the event loop, so a
     ``git rev-parse --show-toplevel`` probe — stricter, but a subprocess —
@@ -40,13 +60,31 @@ def _is_usable_codebase_root(root: Path) -> bool:
     and how the non-dark_factory projects this check exists to serve are laid
     out — ``.git`` is a FILE holding a ``gitdir:`` pointer.  Requiring a
     directory would refuse exactly that population.
-
-    No try/except: ``Path.is_dir()`` and ``Path.exists()`` already swallow
-    ``OSError``/``ValueError`` internally and return False, so an unreadable
-    or malformed path fails closed by construction.  Wrapping them would
-    imply a hazard that is not there.
     """
-    return root.is_dir() and (root / '.git').exists()
+    try:
+        resolved = Path(root).resolve()
+    except (OSError, ValueError):
+        # ``Path.resolve()`` RAISES where the stat calls below merely return
+        # False: ValueError('embedded null byte') for a path carrying a NUL,
+        # OSError for a resolution the OS refuses outright.  Since
+        # ``require_project_root`` validates SHAPE only (non-empty +
+        # ``os.path.isabs``), such a path really does reach verify() — and an
+        # exception escaping it would land in targeted.py's generic handler
+        # as a ``verify|codebase|error`` row instead of the structured
+        # refusal PRD D4 requires.  TypeError is deliberately NOT caught: a
+        # non-path argument is a caller bug, not a property of the root.
+        return root, ROOT_DEFECT_UNRESOLVABLE
+
+    # Ordered most-specific-last so the sub-reason names the FIRST thing that
+    # is wrong; each check swallows OSError/ValueError internally and returns
+    # False, so an unreadable path still fails closed.
+    if not resolved.exists():
+        return resolved, ROOT_DEFECT_MISSING
+    if not resolved.is_dir():
+        return resolved, ROOT_DEFECT_NOT_A_DIR
+    if not (resolved / '.git').exists():
+        return resolved, ROOT_DEFECT_NO_DOT_GIT
+    return resolved, None
 
 
 def _as_failure_token(value: object) -> str:
@@ -118,7 +156,7 @@ class CodebaseVerifier:
         mistake, the missing wiring was — and the thing the verifier actually
         needs is a filesystem root, not a logical id.
         """
-        codebase_root = Path(codebase_root).resolve()
+        codebase_root, root_defect = _resolve_codebase_root(codebase_root)
 
         # ── Fail-closed root pre-flight (PRD D4) ───────────────────────────
         # Refuse BEFORE building any tools or constructing the agent.  The
@@ -132,18 +170,25 @@ class CodebaseVerifier:
         # `verify|codebase|agent_failed` row carrying the token, logs the
         # summary, and writes NO memory.  No new model field, no new branch
         # in targeted.py.
-        if not _is_usable_codebase_root(codebase_root):
-            logger.warning('verification_root_unresolved root=%s', codebase_root)
+        if root_defect is not None:
+            logger.warning(
+                'verification_root_unresolved root=%s reason=%s',
+                codebase_root, root_defect,
+            )
             return VerificationResult(
                 verdict=VerificationVerdict.inconclusive,
                 confidence=0.0,
                 evidence=[],
-                # Task 1811's human-facing sentinel prefix plus the offending
-                # path, so an operator grepping 'agent-failed:' still sees
-                # this failure and can tell WHICH root was refused.  The
-                # structured failure_token stays the machine-readable
+                # Task 1811's human-facing sentinel prefix, the offending
+                # path, and the sub-reason — so an operator grepping
+                # 'agent-failed:' still sees this failure, and can tell both
+                # WHICH root was refused and WHY without re-running anything.
+                # The structured failure_token stays the machine-readable
                 # channel (INV-2) — nothing branches on this prose.
-                summary=f'agent-failed:{CODEBASE_ROOT_UNRESOLVED}: {codebase_root}',
+                summary=(
+                    f'agent-failed:{CODEBASE_ROOT_UNRESOLVED}: '
+                    f'{codebase_root} ({root_defect})'
+                ),
                 git_context=None,
                 agent_failed=True,
                 failure_token=CODEBASE_ROOT_UNRESOLVED,
