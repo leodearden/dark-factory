@@ -1479,12 +1479,11 @@ class InflightEntry:
                      returned by _run_inflight_verify to signal special handling by _finalize_inflight
     chain          : the :class:`ChainResult` this dispatch's verify was
                      REDIRECTED onto (task 3185, PRD γ), or ``None`` on the
-                     ordinary adjacent-verify path.  Recorded for disposition
-                     and diagnosis only: γ reads it nowhere but the dispatch
-                     seam that set it, because a tip verdict is deliberately
-                     non-adopting (see _run_inflight_verify's chain arm).  δ
-                     (task 3186) is what consumes ``links`` — the in-order CAS
-                     walk that lands the verified prefix.  NOTE the lane
+                     ordinary adjacent-verify path.  Its READER is
+                     SpeculativeMergeWorker._land_chain_prefix (task 3186, PRD
+                     δ), the in-order CAS walk that lands ``links`` once the
+                     tip has passed; a red or errored tip still adopts nothing
+                     (see _run_inflight_verify's chain arm).  NOTE the lane
                      referenced here is already RELEASED by the time
                      _finalize_inflight sees this entry: _run_inflight_verify
                      returns it to the pool in its own ``finally``, so this

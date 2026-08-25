@@ -6265,10 +6265,13 @@ async def build_chain(
     here count ADDITIONAL LINKS BEYOND ``head_merge_commit``, so the gate
     passes ``cap - 1`` / ``d - 1``.
 
-    γ never LANDS anything built here — it verifies the tip and requeues on
-    both arms (see :meth:`SpeculativeMergeWorker._run_inflight_verify`'s
-    non-adopting exit).  δ (task 3186) is what adopts a green tip, and it is
-    the only place adoption may be introduced.
+    Building a chain still LANDS nothing here.  A green tip is adopted one
+    layer up, by :meth:`SpeculativeMergeWorker._land_chain_prefix` (task 3186,
+    PRD δ) — the in-order CAS walk that reads ``links`` out of the
+    ``InflightEntry`` — and that walk is the ONLY place adoption exists.  A
+    red or errored tip still requeues on both of
+    :meth:`SpeculativeMergeWorker._run_inflight_verify`'s remaining
+    non-adopting arms.
 
     See the module section comment above for the two invariants (purity and
     one-worktree) this function exists to uphold.
@@ -19413,9 +19416,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
           FAIL/skip     — vr.outcome is not None: clean merge_wt, resolve req,
                           _n_failed=True, return False.
           DROPPED       — sole-waiter abandoned: cancel_and_release, _n_failed=True.
-          REQUEUED      — operator halt, a contended-lease defer, or task 3185
-                          γ's non-adopting deep-tip exit (item already back on
-                          _queue): cancel_and_release, _n_failed=True.  The
+          REQUEUED      — operator halt, a contended-lease defer, or a deep-tip
+                          NON-adopting exit (the fail and error arms only, once
+                          task 3186's δ made the pass arm adopt; item already
+                          back on _queue): cancel_and_release, _n_failed=True.  The
                           flag means "this item did not LAND", not "this item
                           failed" — see the sentinel branch below for why that
                           reading is what makes it correct for all three, and
@@ -19592,9 +19596,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # abandon / operator-halt / deep-tip non-adoption → chain stale.
                 #
                 # THE DEEP-TIP CASE (task 3185 amend, reviewer_comprehensive
-                # design): γ's non-adopting exits reuse this same REQUEUED
-                # sentinel, so a deep round lands here on EVERY tip verdict
-                # once merge_deep.chain_cap > 0.  `True` is CORRECT for it, and
+                # design): the chain arm's two NON-adopting exits reuse this
+                # same REQUEUED sentinel, so a deep round lands here on a red
+                # or errored tip once merge_deep.chain_cap > 0 — but no longer
+                # on a green one, which task 3186's δ routes to the PASS arm
+                # and its CAS walk instead.  `True` is CORRECT for it, and
                 # for the identical reason it is correct for an operator halt:
                 # the disposition this flag describes is "this item did NOT
                 # land", not "this item failed".  A requeued item's merge
