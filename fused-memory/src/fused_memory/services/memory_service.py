@@ -4278,7 +4278,7 @@ class MemoryService:
         group_id: str,
         episode_uuid: str = '',
     ) -> None:
-        """Delete the nodes THIS PASS emptied — under three conditions, all required.
+        """Delete the nodes THIS PASS emptied — under four conditions, all required.
 
         Runs AFTER every reassignment for the episode, because a node is only
         empty once every edge that was going to leave it has left.
@@ -4296,14 +4296,16 @@ class MemoryService:
           and, per the PRD's "coupling" section, keeping the duplicate-name key
           that disables ``dedup_helpers``' deterministic exact-match protection.
 
-        THE THREE CONDITIONS:
+        THE FOUR CONDITIONS, in the order they are evaluated — the two free
+        local checks first, then the cheap typed query, then the new untyped
+        degree query, so the ~99.8% clean path pays nothing extra inside the
+        identity lock:
 
         1. This pass moved at least one endpoint OFF the node — an
            ``outcome='repaired'`` record with ``moved=True``. A ``moved=False``
-           no-op emptied nothing, so it is not even a candidate and the
-           emptiness query is never issued for it. The node that GAINED the
-           edge is never a candidate either; deleting the repair target would
-           undo the repair.
+           no-op emptied nothing, so it is not even a candidate and neither
+           query is issued for it. The node that GAINED the edge is never a
+           candidate either; deleting the repair target would undo the repair.
         2. Its name parses as a canonical task label —
            :func:`~fused_memory.utils.canonical_labels.parse_node_name`, the
            single normative label vocabulary (PRD leaf beta), reused here
@@ -4313,15 +4315,59 @@ class MemoryService:
            guard where a drifting pattern would delete a real entity, which is
            exactly the duplication INV-5 exists to prevent.
         3. ``get_valid_edges_for_node`` returns empty.
+        4. :meth:`GraphitiBackend.count_foreign_relationships` returns 0 — the
+           node has NO relationship of ANY type or validity other than THIS
+           episode's own ``MENTIONS`` link.
 
-        The delete goes through :meth:`GraphitiBackend.delete_entity` with
-        ``force=False``, never the lower-level ``delete_entity_node``,
-        precisely FOR its ``ActiveEdgesError`` guard: that re-checks — at the
-        backend, under this same lock, after our own read — the emptiness this
-        cleanup is predicated on, turning a lost race (the node gained an edge
-        in between) into a REFUSAL rather than a destroyed entity.
+        WHY CONDITION 4 EXISTS, AND WHAT CONDITION 3 ALONE COULD NOT
+        DISTINGUISH. Conditions 1-3 do not test the proposition this guard's
+        stated intent claims, and the gap is a confirmed data-loss defect, not
+        a theoretical one:
+
+        * ``get_valid_edges_for_node`` is ``MATCH (n:Entity {uuid:$uuid})
+          -[e:RELATES_TO]-() WHERE e.invalid_at IS NULL``. It sees ONLY
+          currently-valid ``RELATES_TO``, and is blind both to INVALIDATED
+          ``RELATES_TO`` history and to ``MENTIONS`` from Episodic nodes.
+        * ``delete_entity_node`` issues a bare ``MATCH (n:Entity {uuid:$uuid})
+          DETACH DELETE n``, destroying EVERY relationship — all of the above
+          included.
+        * ``parse_node_name`` cannot help, because a genuine ``Task N`` node
+          passes it BY CONSTRUCTION: it is exactly a canonical task label.
+
+        The exposure is reachable inside ONE critical section.
+        :meth:`_invalidate_stale_superseded_ttl_edges` is sub-pass FOUR of the
+        same ``_reconcile_episode_identity`` chain and exists precisely to
+        invalidate same-subject superseded edges; this cleanup is sub-pass
+        EIGHT. So a real, project-owned ``Task N`` node whose facts were
+        TTL-invalidated at pass 4 reads as "empty" at pass 8 the moment this
+        pass moves its one remaining valid edge away — and would be
+        irreversibly deleted with its full temporal history.
+
+        WHAT ``force=False`` DOES AND DOES NOT SUPPLY. The delete goes through
+        :meth:`GraphitiBackend.delete_entity` with ``force=False``, never the
+        lower-level ``delete_entity_node``, and that argument still guards a
+        genuine RACE on VALID edges — a node that gains a live edge between our
+        read and the delete — turning the lost race into an
+        ``ActiveEdgesError`` refusal. That is worth keeping.
+
+        It is NOT, however, "a second, INDEPENDENT check" of the emptiness this
+        cleanup is predicated on, as this docstring previously claimed:
+        ``delete_entity`` re-checks by calling ``get_valid_edges_for_node`` —
+        the SAME query — so it is blind to exactly what condition 4 exists to
+        see. A same-query recheck cannot see what the first query missed.
+        Condition 4 is the only thing standing between this cleanup and
+        destroying a real entity's temporal history.
+
         ``delete_entity_node`` issues a bare DETACH DELETE with no edge guard
         and no neighbour refresh, so using it would mean re-implementing both.
+
+        CONDITION 4 IS THE CONSERVATIVE DIRECTION BY CONSTRUCTION. Its two
+        imprecisions both only ever REFUSE a delete: an undirected self-loop
+        double-counts, and an unresolved ``episode_uuid`` of ``''`` drops the
+        exclusion entirely (see :func:`_episode_uuid_of`). If it ever fires
+        more often than expected, the correct response is to INVESTIGATE THE
+        NODE — something is attached to it that nobody expected — never to
+        relax the predicate.
 
         The stamp back onto the matching records uses
         :func:`dataclasses.replace`, never mutation — the record is frozen
@@ -4345,6 +4391,24 @@ class MemoryService:
                     uuid, group_id=group_id,
                 )
                 if remaining:
+                    continue
+                # CONDITION 4, and the only thing standing between this cleanup
+                # and destroying a real entity's temporal history. Runs LAST
+                # because it is the most expensive: an untyped degree query,
+                # issued only for candidates that already passed the two free
+                # local checks and the cheap typed one.
+                foreign = await self.graphiti.count_foreign_relationships(
+                    uuid, group_id=group_id, episode_uuid=episode_uuid,
+                )
+                if foreign:
+                    logger.info(
+                        'Referent repair: not deleting emptied node %s — it '
+                        'still has %d relationship(s) that a DETACH DELETE '
+                        'would destroy (invalidated RELATES_TO history, or '
+                        'MENTIONS from an episode other than %r). The endpoint '
+                        'move stands; the node does too',
+                        uuid, foreign, episode_uuid,
+                    )
                     continue
                 await self.graphiti.delete_entity(
                     uuid, group_id=group_id, force=False,
