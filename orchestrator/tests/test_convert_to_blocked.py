@@ -626,3 +626,264 @@ class TestConvertToBlockedApplierLogMode:
         assert tally.pinning_ids == ['esc-3539-1']
         assert tally.left == {}
         assert tally.observed_task_ids == {_TID}
+
+
+# ---------------------------------------------------------------------------
+# step-5 — the applier in ENFORCE mode
+#
+# The promotion.  Everything log mode deliberately withheld now happens, and
+# nothing else does: ONE `blocked` write, no `done_provenance`, no escalation,
+# no event row (the sweep ACTED — it did not hold), fail-open on a rejected
+# write, and structurally one-shot.
+# ---------------------------------------------------------------------------
+
+#: The marker `_reconcile_one_stranded` returns for a conversion, distinct from
+#: 'marked_done' / 'reverted' / 'stale_conflict' so the sweep summary can count
+#: conversions on their own.
+_CONVERTED = 'converted_to_blocked'
+
+
+@pytest.fixture
+def enforce_harness(applier_harness):
+    """The step-3 harness with the observe-before-enforce gate flipped."""
+    applier_harness.config.convert_to_blocked_enforce = True
+    return applier_harness
+
+
+@pytest.mark.asyncio
+class TestConvertToBlockedApplierEnforce:
+    """``convert_to_blocked_enforce=True`` — write `blocked`, and nothing else."""
+
+    # (1) exactly one write, and it is not a completion ---------------------
+
+    @pytest.mark.parametrize('kind', ALL_BRANCH_KINDS)
+    async def test_writes_blocked_exactly_once(
+        self, enforce_harness, kind: BranchStateKind,
+    ) -> None:
+        _bind(enforce_harness, _pinned_in_progress(kind))
+
+        await enforce_harness._reconcile_one_stranded(
+            _TID, 'in-progress', mid_run=False,
+        )
+
+        enforce_harness.scheduler.set_task_status.assert_awaited_once_with(
+            _TID, 'blocked',
+        )
+
+    @pytest.mark.parametrize('kind', ALL_BRANCH_KINDS)
+    async def test_never_marks_done_and_carries_no_provenance(
+        self, enforce_harness, kind: BranchStateKind,
+    ) -> None:
+        """Refusing to mark done IS the veto the pin exists to enforce.
+
+        Two of the four converting shapes (ON_MAIN, GONE_WITH_MERGE_MARKER)
+        carry landing evidence that would justify MARK_DONE_WITH_PROVENANCE
+        without the pin — so this is the assertion that keeps 3539 from
+        quietly becoming a phantom-completion path.
+        """
+        _bind(enforce_harness, _pinned_in_progress(kind))
+
+        await enforce_harness._reconcile_one_stranded(
+            _TID, 'in-progress', mid_run=False,
+        )
+
+        assert enforce_harness.scheduler.mark_done.await_count == 0
+        call = enforce_harness.scheduler.set_task_status.await_args
+        assert 'done_provenance' not in call.kwargs
+        assert 'done' not in call.args
+
+    # (2) the sweep can count conversions separately ------------------------
+
+    @pytest.mark.parametrize('kind', ALL_BRANCH_KINDS)
+    async def test_returns_its_own_marker(
+        self, enforce_harness, kind: BranchStateKind,
+    ) -> None:
+        """A conversion is not a 'marked_done' and not a 'reverted'; folding it
+        into either would make the per-sweep summary lie about what moved."""
+        _bind(enforce_harness, _pinned_in_progress(kind))
+
+        result = await enforce_harness._reconcile_one_stranded(
+            _TID, 'in-progress', mid_run=False,
+        )
+
+        assert result == _CONVERTED
+
+    # (3) a status change must explain itself -------------------------------
+
+    async def test_a_warning_names_the_task_the_shape_and_the_pins(
+        self, enforce_harness, caplog,
+    ) -> None:
+        """A status change with no explanation is the silent fail-soft this
+        repo forbids — and this one moves a row an escalation is holding."""
+        import logging
+
+        from orchestrator.task_ground_truth import recovery_shape_str
+
+        report = _pinned_in_progress(refs=[PIN_REFS[0], PIN_REFS[2]])
+        _bind(enforce_harness, report)
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.harness'):
+            await enforce_harness._reconcile_one_stranded(
+                _TID, 'in-progress', mid_run=False,
+            )
+
+        lines = [
+            r.getMessage() for r in caplog.records
+            if r.levelno >= logging.WARNING
+        ]
+        assert len(lines) == 1, f'expected exactly one WARNING, got {lines}'
+        line = lines[0]
+        assert _TID in line
+        assert recovery_shape_str(report) in line
+        assert 'esc-3539-0' in line and 'esc-3539-2' in line
+
+    async def test_the_log_mode_line_is_gone_once_enforcing(
+        self, enforce_harness, caplog,
+    ) -> None:
+        """The would-convert line and the did-convert line are different
+        statements; emitting both would double-count the population an
+        operator sized in log mode."""
+        import logging
+
+        _bind(enforce_harness, _pinned_in_progress())
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.harness'):
+            await enforce_harness._reconcile_one_stranded(
+                _TID, 'in-progress', mid_run=False,
+            )
+
+        assert [
+            r.getMessage() for r in caplog.records
+            if 'log mode' in r.getMessage()
+        ] == []
+
+    # (4) an ACTION is not a hold -------------------------------------------
+
+    @pytest.mark.parametrize('kind', ALL_BRANCH_KINDS)
+    async def test_no_recovery_event_row_is_emitted(
+        self, enforce_harness, kind: BranchStateKind,
+    ) -> None:
+        """``leave_reason`` returns None for a non-LEAVE disposition precisely
+        so a site can never mislabel an action as a hold.  Enforce mode ACTS,
+        so the veto stream must fall silent for this task — that silence is
+        exactly how an operator sees the promotion take effect."""
+        _bind(enforce_harness, _pinned_in_progress(kind))
+
+        await enforce_harness._reconcile_one_stranded(
+            _TID, 'in-progress', mid_run=False,
+        )
+
+        assert _recovery_rows(enforce_harness) == []
+
+    async def test_the_sweep_tally_does_not_count_it_as_held(
+        self, enforce_harness,
+    ) -> None:
+        from orchestrator.recovery_emission import RecoverySweepTally
+
+        tally = RecoverySweepTally()
+        _bind(enforce_harness, _pinned_in_progress())
+
+        await enforce_harness._reconcile_one_stranded(
+            _TID, 'in-progress', mid_run=False, tally=tally,
+        )
+
+        assert tally.held == 0
+        assert tally.left == {}
+
+    # (5) fail-open ----------------------------------------------------------
+
+    async def test_a_rejected_write_never_aborts_the_sweep(
+        self, enforce_harness, caplog,
+    ) -> None:
+        """One bad write must not take the whole pass down with it — the same
+        try/except discipline as every existing harness blocked-write
+        (`_block_and_escalate_delivered_check` / `_external_dep` /
+        `_cross_repo`)."""
+        import logging
+
+        from orchestrator.scheduler import SetTaskStatusRejected
+
+        enforce_harness.scheduler.set_task_status.side_effect = (
+            SetTaskStatusRejected('nope')
+        )
+        _bind(enforce_harness, _pinned_in_progress())
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.harness'):
+            result = await enforce_harness._reconcile_one_stranded(
+                _TID, 'in-progress', mid_run=False,
+            )
+
+        assert result is None, 'a failed conversion is not a conversion'
+        assert any(
+            r.levelno >= logging.WARNING and _TID in r.getMessage()
+            for r in caplog.records
+        ), 'the failure must be named, not swallowed'
+
+    async def test_an_arbitrary_write_error_is_also_contained(
+        self, enforce_harness,
+    ) -> None:
+        """Fail-open covers the backend hiccup, not just the modelled refusal."""
+        enforce_harness.scheduler.set_task_status.side_effect = RuntimeError('boom')
+        _bind(enforce_harness, _pinned_in_progress())
+
+        assert await enforce_harness._reconcile_one_stranded(
+            _TID, 'in-progress', mid_run=False,
+        ) is None
+
+    # (6) no second record ---------------------------------------------------
+
+    @pytest.mark.parametrize('kind', ALL_BRANCH_KINDS)
+    async def test_the_conversion_files_no_escalation(
+        self, enforce_harness, kind: BranchStateKind,
+    ) -> None:
+        """The task is ALREADY pinned.  Filing a second record is the
+        duplicate/competing-escalation hazard rows (g)/(h) are written to
+        avoid — and it would deepen the very hold this conversion is resting."""
+        from unittest.mock import MagicMock
+
+        enforce_harness._escalation_queue = MagicMock(
+            wraps=enforce_harness._escalation_queue,
+        )
+        _bind(enforce_harness, _pinned_in_progress(kind))
+
+        await enforce_harness._reconcile_one_stranded(
+            _TID, 'in-progress', mid_run=False,
+        )
+
+        assert enforce_harness._escalation_queue.submit.call_count == 0
+
+    # (7) idempotence end to end --------------------------------------------
+
+    @pytest.mark.parametrize('kind', ALL_BRANCH_KINDS)
+    async def test_enforce_mode_cannot_churn(
+        self, enforce_harness, kind: BranchStateKind,
+    ) -> None:
+        """The anti-churn argument, end to end rather than table-only.
+
+        The converted row is still pinned, and a pinned `blocked` row matches
+        no ``_RECOVERY`` row at all — so the next sweep classifies LEAVE and
+        the status stays put.  That is what makes conversion structurally
+        one-shot with no persisted counter.
+        """
+        _bind(enforce_harness, _pinned_in_progress(kind))
+        assert await enforce_harness._reconcile_one_stranded(
+            _TID, 'in-progress', mid_run=False,
+        ) == _CONVERTED
+
+        # The very next sweep observes the row it just wrote.
+        _bind(enforce_harness, TruthReport(
+            db_status=TaskStatus.BLOCKED,
+            live_claimant=None,
+            branch_state=_branch(kind),
+            worktree_present=True,
+            open_escalations=[PIN_REFS[1]],
+            deploy_phase=None,
+        ))
+        result = await enforce_harness._reconcile_one_stranded(
+            _TID, 'blocked', mid_run=False,
+        )
+
+        assert result is None
+        assert enforce_harness.scheduler.set_task_status.await_count == 1, (
+            'a second write means the sweep is oscillating on its own output'
+        )
