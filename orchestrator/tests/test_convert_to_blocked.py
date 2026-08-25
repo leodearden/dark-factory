@@ -1676,3 +1676,223 @@ class TestSubmitToMergeQueueAlreadyLanded:
         await wf._submit_to_merge_queue('task/2656', pre_rebased=False)
 
         assert order == ['predicate']
+
+
+# ---------------------------------------------------------------------------
+# step-11 — the composed regression
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestLandedButPinnedZombieLoop:
+    """The measured task-3717/3604 loop, reconstructed at BOTH ends.
+
+    Loop today: work already merged -> task re-dispatched -> branch re-seeded
+    from post-landing main so ``base..HEAD`` is legitimately EMPTY -> the
+    Decision-1 gate reads that empty range and emits the INVERSE of the truth
+    (``plan_files_not_touched``) via ``_mark_blocked(...,
+    escalate_to_human=True)``, whose default ``category='task_failure'`` mints
+    a pin -> that pin vetoes the recovery that would have marked the task done
+    -> the row churns (39 consecutive ``recovery_vetoed`` over 10.5h on 3717)
+    and is re-dispatched, repeating.
+
+    The ENTRY half runs against a REAL git repository, and the EXIT half
+    against the REAL ``Harness._reconcile_one_stranded``, precisely so an
+    integration gap between the two halves surfaces HERE rather than in
+    production.
+
+    HONESTY PIN — conversion is NOT completion.  The converted row arrives in
+    ``blocked`` STILL CARRYING ITS PIN.  ``MERGE_REMEDIABLE_ESC_CATEGORIES`` is
+    ``{'stranded_blocked'}`` and ``_only_merge_remediable`` is an ``all(...)``,
+    so a ``task_failure`` pin fails both blocked-arm upgrade clauses, and
+    ``_RECOVERY``'s only BLOCKED row keys ``has_open_escalation=False``.
+    ``blocked`` + pinned is therefore a TERMINAL RESTING STATE whose exit is a
+    human or task 3541 — never an automatic recovery, and never this task.
+    """
+
+    _PLAN_FILES = ['src/pkg/alpha.py', 'docs/alpha.md']
+
+    # --- ENTRY half ---------------------------------------------------------
+
+    async def test_entry_the_gate_no_longer_mints_the_pin(
+        self, git_repo: Path, git_ops: GitOps, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """Over a REAL repo in the measured parked shape, the gate must not
+        produce the ``escalate_to_human=True`` block whose default
+        ``category='task_failure'`` is the loop's only fuel."""
+        merge_sha = await _land_via_merge(
+            git_repo, 'task/3717',
+            {f: f'# {f}\n' for f in self._PLAN_FILES},
+        )
+        # Parked on an UNRELATED task's merge commit — the measured shape
+        # (3604 on 9ab336bd6e, 3717 on ce5b830caf, ...), not merely on its own.
+        parked = await _land_via_merge(
+            git_repo, 'task/9999', {'unrelated.py': 'x\n'},
+        )
+        await _reseed(git_repo, 'task/3717', parked)
+
+        wf = _make_workflow(tmp_path=tmp_path / 'wf', task_id='3717')
+        wf.plan = {'files': list(self._PLAN_FILES)}
+        wf._base_commit = parked
+        wf.git_ops = git_ops
+        wf.config.project_root = git_repo
+
+        async def fake_run(cmd, **kwargs):  # noqa: ARG001
+            return 0, f'{parked}\n', ''
+        monkeypatch.setattr('orchestrator.workflow._run', fake_run)
+
+        async def fake_check(*a, **k):  # noqa: ARG001
+            # The REAL gate's verdict for this shape: the empty range touches
+            # none of the declared files.  Stubbed rather than run so this
+            # test pins the CARVE-OUT, not a second copy of the gate (which
+            # test_merge_gates_plan_files_rename.py already owns).
+            return PlanFilesTouchedResult(not_touched=list(self._PLAN_FILES))
+        monkeypatch.setattr(
+            'orchestrator.merge_queue._check_plan_files_touched_in_branch',
+            fake_check,
+        )
+
+        emits: list = []
+        monkeypatch.setattr(
+            'orchestrator.merge_queue._emit_merge_attempt',
+            lambda es, tid, outcome, **k: emits.append(outcome),  # noqa: ARG005
+        )
+        narrow = AsyncMock(return_value=False)
+        wf._try_narrow_plan = narrow  # type: ignore[method-assign]
+        mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
+        wf._mark_blocked = mark_blocked  # type: ignore[method-assign]
+
+        await wf._submit_to_merge_queue('3717', pre_rebased=False)
+
+        _args, kwargs = mark_blocked.call_args
+        assert kwargs.get('escalate_to_human') is not True, (
+            'this is the loop\'s only fuel — minting it here re-arms the loop'
+        )
+        assert kwargs.get('category') == 'already_landed'
+        assert kwargs.get('category') != 'task_failure'
+        assert 'plan_files_already_landed' in emits
+        assert 'plan_files_not_touched' not in emits
+        narrow.assert_not_awaited()
+        # The predicate ran for real against real git and found the real
+        # marker — not a stub agreeing with itself.
+        reason = _args[0] if _args else kwargs['reason']
+        assert merge_sha in reason
+        assert 'merge_marker' in reason
+
+    # --- EXIT half ----------------------------------------------------------
+
+    @staticmethod
+    def _landed_but_pinned() -> TruthReport:
+        """3717's measured signature, pinned by exactly what
+        ``_mark_blocked(..., escalate_to_human=True)`` mints."""
+        return TruthReport(
+            db_status=TaskStatus.IN_PROGRESS,
+            live_claimant=None,
+            branch_state=_branch(BranchStateKind.ON_MAIN),
+            worktree_present=True,
+            open_escalations=[PIN_REFS[1]],
+            deploy_phase=None,
+        )
+
+    async def test_exit_the_row_comes_to_rest_and_cannot_re_arm(
+        self, enforce_harness,
+    ) -> None:
+        """One conversion, then nothing — the churn stops for good."""
+        _bind(enforce_harness, self._landed_but_pinned())
+
+        assert await enforce_harness._reconcile_one_stranded(
+            _TID, 'in-progress', mid_run=False,
+        ) == _CONVERTED
+        enforce_harness.scheduler.set_task_status.assert_awaited_once_with(
+            _TID, 'blocked',
+        )
+
+        # The next sweep observes the row it just wrote.
+        converted = TruthReport(
+            db_status=TaskStatus.BLOCKED,
+            live_claimant=None,
+            branch_state=_branch(BranchStateKind.ON_MAIN),
+            worktree_present=True,
+            open_escalations=[PIN_REFS[1]],
+            deploy_phase=None,
+        )
+        _bind(enforce_harness, converted)
+
+        assert await enforce_harness._reconcile_one_stranded(
+            _TID, 'blocked', mid_run=False,
+        ) is None
+        assert enforce_harness.scheduler.set_task_status.await_count == 1, (
+            'a second write means the sweep is oscillating on its own output'
+        )
+        assert classify_recovery(converted) == RecoveryAction.LEAVE
+        # The re-dispatch limb of the loop is concretely the sweep's
+        # revert-to-`pending` write (`_revert_in_progress_if_no_live_claimant`).
+        # Asserting on that specific write, rather than on some notion of
+        # "dispatchability", pins the limb that actually re-armed 3717.
+        for call in enforce_harness.scheduler.set_task_status.await_args_list:
+            assert 'pending' not in call.args, (
+                'reverting to pending is what re-dispatches the row and '
+                'closes the loop back on itself'
+            )
+
+    async def test_exit_the_converted_row_is_never_marked_done(
+        self, enforce_harness,
+    ) -> None:
+        """THE honesty pin, asserted at its CAUSE and not just its effect.
+
+        A converted row is pinned by a ``task_failure`` escalation, and
+        ``_only_merge_remediable`` is an ``all(...)`` over
+        ``MERGE_REMEDIABLE_ESC_CATEGORIES == {'stranded_blocked'}``.  That is
+        WHY both blocked-arm upgrade clauses decline, and why the row rests
+        instead of self-healing.  Pinning the mechanism means a future widening
+        of that category set fails HERE, loudly, rather than silently turning
+        conversion into completion.
+        """
+        from orchestrator.harness import Harness
+
+        assert frozenset({'stranded_blocked'}) == (
+            Harness.MERGE_REMEDIABLE_ESC_CATEGORIES
+        )
+        assert Harness._only_merge_remediable([PIN_REFS[1]]) is False
+
+        _bind(enforce_harness, self._landed_but_pinned())
+        await enforce_harness._reconcile_one_stranded(
+            _TID, 'in-progress', mid_run=False,
+        )
+
+        enforce_harness.scheduler.mark_done.assert_not_awaited()
+        for call in enforce_harness.scheduler.set_task_status.await_args_list:
+            assert 'done' not in call.args, (
+                'conversion is NOT completion — the row keeps its pin and its '
+                'exit is a human or task 3541, never this sweep'
+            )
+
+    # --- the two halves compose ---------------------------------------------
+
+    async def test_with_the_entry_closed_the_exit_is_a_backstop_not_the_path(
+        self, enforce_harness,
+    ) -> None:
+        """What the composition actually buys.
+
+        With the ENTRY closed, this producer never mints the ``task_failure``
+        pin at all, so on a healthy fleet the CONVERT arm sees nothing from
+        it.  The arm is therefore a BACKSTOP for pins minted by OTHER
+        producers — which is exactly why it must be inert on an unpinned row,
+        or it would start converting rows nobody is holding.
+        """
+        unpinned = TruthReport(
+            db_status=TaskStatus.IN_PROGRESS,
+            live_claimant=None,
+            branch_state=_branch(BranchStateKind.ON_MAIN),
+            worktree_present=True,
+            open_escalations=[],
+            deploy_phase=None,
+        )
+        assert classify_recovery(unpinned) != RecoveryAction.CONVERT_TO_BLOCKED
+
+        _bind(enforce_harness, unpinned)
+        assert await enforce_harness._reconcile_one_stranded(
+            _TID, 'in-progress', mid_run=False,
+        ) != _CONVERTED
+        for call in enforce_harness.scheduler.set_task_status.await_args_list:
+            assert 'blocked' not in call.args
