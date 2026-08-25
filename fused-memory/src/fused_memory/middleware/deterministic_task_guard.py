@@ -203,6 +203,71 @@ def _validate_recurrence(
                 "'minted_from' task id, absent on the seed link)."
             ),
         )
+
+    # Carrier clause 1: task_kind.
+    if task_kind != 'deterministic':
+        return _validation_error(
+            f"metadata.recurrence requires task_kind='deterministic' "
+            f'(got task_kind={task_kind!r}).',
+            hint=(
+                "A recurring job is a chain of deterministic PREDICATE tasks. "
+                "Either set task_kind='deterministic' with a "
+                "'before_done': {'kind': 'predicate', ...}, or remove "
+                "'recurrence' from metadata."
+            ),
+        )
+
+    # Carrier clause 2: before_done must be a PREDICATE action. The isinstance
+    # half is defence-in-depth (invariant 4 already guarantees a dict when
+    # before_done is not None) and simultaneously covers the pure-gate case
+    # where before_done is None.
+    if not isinstance(before_done, dict):
+        return _validation_error(
+            'metadata.recurrence requires a before_done action with '
+            "kind='predicate', but this task has no before_done (a pure "
+            'escalation gate is not a chain link — there is nothing to '
+            're-run on the next tick).',
+            hint=(
+                "Add 'before_done': {'kind': 'predicate', 'script': '<path>', "
+                "'timeout_secs': <n>}, or remove 'recurrence' from metadata."
+            ),
+        )
+    # The shared BeforeDone.kind default is 'deploy', so an OMITTED kind must
+    # be reported (and rejected) as the deploy it actually is — not slip
+    # through because the key is merely absent.
+    effective_kind = before_done.get('kind') or 'deploy'
+    if effective_kind != 'predicate':
+        return _validation_error(
+            f"metadata.recurrence requires before_done.kind='predicate' "
+            f'(got {effective_kind!r}).',
+            hint=(
+                'Recurrence on a deploy-kind deterministic task is not merely '
+                'unimplemented — it is deliberately UNRULED, and therefore '
+                'forbidden UNTIL it is separately ruled on (PRD '
+                'docs/prds/recurring-deterministic-tasks.md, "Out of scope"): '
+                'a recurring chain of act-then-done deploys has no agreed '
+                'semantics for what re-running the action means. Use '
+                "kind='predicate', or remove 'recurrence' from metadata."
+            ),
+        )
+
+    # Carrier clause 3: a DATED milestone. Milestone's own shape is already
+    # validated by deterministic_task_error before this runs, so this clause
+    # only has to discriminate the mode.
+    if not isinstance(milestone, dict) or milestone.get('mode') != 'dated':
+        return _validation_error(
+            "metadata.recurrence requires a metadata.milestone with "
+            "mode='dated' (the chain link's fire time).",
+            hint=(
+                'A chain link is withheld until its fire time by the existing '
+                'milestone scheduler gate, and only a dated milestone carries '
+                "the 'at' the mint advances by interval_secs — a delayed "
+                'anchor has no fire time to advance from. Add '
+                "'milestone': {'mode': 'dated', 'at': '<ISO-8601 datetime>'}, "
+                "or remove 'recurrence' from metadata."
+            ),
+        )
+
     return None
 
 
