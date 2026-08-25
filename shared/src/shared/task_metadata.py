@@ -32,6 +32,7 @@ __all__ = [
     'MemoryHints',
     'MergeRetryPending',
     'Milestone',
+    'Recurrence',
     'RetryLedger',
     'RoutingDecisionMirror',
     'RoutingState',
@@ -280,6 +281,22 @@ _FILE_LINE_RE = re.compile(
 )
 _WHITESPACE_RE = re.compile(r'\s+')
 
+# The kebab-case shape of a recurrence chain key (task 4676, PRD
+# docs/prds/recurring-deterministic-tasks.md R-D4). Kept as a pattern STRING
+# because it is handed to pydantic's Field(pattern=...) rather than used via
+# re.match. Deliberately MIRRORS fused_memory.topic_slug::TOPIC_SLUG_RE
+# instead of importing it: `shared` is the base package fused-memory depends
+# on, so the reverse import would be a layering violation.
+#
+# The one intentional difference from that mirror is the END anchor's CASE:
+# TOPIC_SLUG_RE is a compiled *Python* regex and spells it `\Z`, whereas
+# pydantic v2 compiles Field(pattern=...) with the Rust regex crate, which
+# rejects `\Z` outright ("unrecognized escape sequence") and spells the same
+# end-of-haystack anchor `\z`. Both reject a trailing newline, which is the
+# property TOPIC_SLUG_RE's own comment says the anchor exists for — `$` would
+# NOT, under a Python-engine fallback.
+_RECURRENCE_KEY_RE_STR = r'^[a-z0-9]+(?:-[a-z0-9]+)*\z'
+
 
 class RetryLedger(BaseModel):
     """``metadata.retry_ledger`` — anti-thrash counters (PRD §5).
@@ -390,6 +407,41 @@ class Milestone(BaseModel):
             if self.at is not None:
                 raise ValueError("Milestone: at must not be set when mode='delayed'.")
         return self
+
+
+class Recurrence(BaseModel):
+    """``metadata.recurrence`` — one link of a recurring deterministic chain.
+
+    Task 4676 / PRD ``docs/prds/recurring-deterministic-tasks.md`` decision
+    R-D4. A recurring job is modelled as a CHAIN of ``task_kind='deterministic'``
+    predicate tasks rather than as a single self-rescheduling task, so every
+    run, failure and overdue-ness is visible in the task tree.
+
+    ``key`` is the stable chain id shared by every link of one chain —
+    kebab-case so it is safe as a slug and as a grep anchor. The pattern
+    deliberately MIRRORS ``fused_memory.topic_slug::TOPIC_SLUG_RE`` rather
+    than importing it, because ``shared`` is the base package fused-memory
+    depends on and the reverse import would be a layering violation.
+
+    ``interval_secs`` (> 0) is the cadence, measured from the predecessor's
+    TERMINAL time — never from a missed slot, so a late or long-running link
+    shifts the chain forward instead of accruing catch-up runs (contract
+    C-6).
+
+    ``minted_from`` is the predecessor's task id: ABSENT on the seed link an
+    author writes, and stamped by r2's mint on every successor. It is typed
+    ``str`` because task ids are ``str`` codebase-wide (the SQLite task
+    backend's signatures, ``ExternalDep.task_id``).
+
+    ``extra='allow'`` matches the Milestone/routing/merge_retry_pending
+    precedent, so a later writer's field survives round-trip untouched (I1).
+    """
+
+    model_config = ConfigDict(extra='allow')
+
+    key: str = Field(min_length=1, pattern=_RECURRENCE_KEY_RE_STR)
+    interval_secs: int = Field(gt=0)
+    minted_from: str | None = None
 
 
 class RoutingDecisionMirror(BaseModel):
