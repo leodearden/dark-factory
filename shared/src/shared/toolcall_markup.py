@@ -470,14 +470,24 @@ def repair(
     PARTIAL repair.
 
     NO SILENT PARTIAL REPAIR. The returned ``clean_value`` is guaranteed to
-    satisfy ``detect(clean_value) is None``. This is a contract, not an
-    accident of the scan: contract C2's middleware forwards ``clean_value`` as
-    the repaired argument, so a value that still tripped :func:`detect` would
-    re-trip the write-time tripwire downstream AND would have silently dropped
-    whatever caller arguments were hiding in the residue — the exact failure
-    this module exists to end, reintroduced by its own repairer. When the only
-    candidates that parse would leave a poisoned prefix, the honest answer is
-    ``None``.
+    satisfy ``detect_for(clean_value, param, schema_params) is None`` — and
+    therefore ``detect(clean_value) is None`` too, since the parameter-aware
+    predicate is a strict superset. This is a contract, not an accident of the
+    scan: contract C2's middleware forwards ``clean_value`` as the repaired
+    argument, so a value that still tripped the detector would re-trip the
+    write-time tripwire downstream AND would have silently dropped whatever
+    caller arguments were hiding in the residue — the exact failure this module
+    exists to end, reintroduced by its own repairer. When the only candidates
+    that parse would leave a poisoned prefix, the honest answer is ``None``.
+
+    The guard is stated against :func:`detect_for` rather than :func:`detect`
+    as of task **4696**, because the gates that consume ``clean_value`` are
+    parameter-aware: a prefix carrying a canonical closer for *param* or for a
+    *schema_params* member would re-trip ``plan_tools._carries_markup`` and the
+    sweep on the very next read. Measured over the committed corpus at that
+    task's HEAD — 504 records, 443 accepted, ZERO carrying a qualifying closer
+    in the accepted prefix — so the tightening changed no per-specimen
+    expectation; it closed the DOUBLE SELF-NAME MISCLOSE hole and nothing else.
 
     The canonical closer is always a candidate even though C1's literal wording
     does not list it. PRD section 2.1's fourth specimen mis-closes ``content``
@@ -529,13 +539,23 @@ def repair(
         # candidate whose tail does not parse, which leaves that closer sitting
         # inside every LATER candidate's prefix — and if it is itself an
         # envelope literal, accepting would hand back a clean_value that still
-        # trips detect() while permanently dropping whatever arguments hide in
-        # the residue. `continue` rather than `return None` keeps all three
+        # trips the detector while permanently dropping whatever arguments hide
+        # in the residue. `continue` rather than `return None` keeps all three
         # refusals one shape; the outcome is identical either way because
         # candidate start positions increase monotonically, so a poisoned
         # prefix stays poisoned — but `continue` needs no such argument to be
         # correct.
-        if detect(clean_value) is not None:
+        #
+        # TASK 4696: this guard was ITSELF blind to the dominant dialect until
+        # now. It asked the param-free detect(), which spells none of the
+        # invoked tool's own parameter names — so a DOUBLE self-name misclose
+        # was accepted with the first closer still in the prefix AND the prose
+        # stranded between the two closers silently dropped. It now asks
+        # detect_for with the same (param, schema_params) the candidate
+        # qualification above uses, which is the only way the guard can be as
+        # wide as the rule it is guarding: every candidate this scan can step
+        # over is, by construction, a closer detect_for spells.
+        if detect_for(clean_value, param, schema) is not None:
             continue
 
         misclose = candidate.group(0)
@@ -547,7 +567,18 @@ def repair(
         # contain a closing tag. Hoisting a detect() above the loop would
         # instead pay a full-string scan on that overwhelmingly common no-op
         # path, at a per-tool-call middleware boundary (PRD contract C2) over
-        # values the corpus shows reaching tens of KB.
+        # values the corpus shows reaching tens of KB. That argument is
+        # unchanged by task 4696: the accept path now pays the WIDENED scan
+        # above, and the refuse path still pays neither.
+        #
+        # DELIBERATELY the BLANKET predicate, unlike the guard above (4696).
+        # `pattern` below already falls back to `misclose` when no literal is
+        # present, so it ALREADY self-heals for a name outside the literal set
+        # and detect_for here would change no observable value — while making
+        # the blanket/param-aware split at this one site harder to read. It
+        # matters that it keeps its exact current values: Repair.pattern is
+        # what mcp_markup_middleware's _reject and _forward publish as
+        # `matched_pattern`.
         detected = detect(value)
         return Repair(
             clean_value=clean_value,
