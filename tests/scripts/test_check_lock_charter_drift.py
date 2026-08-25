@@ -48,7 +48,7 @@ from pathlib import Path
 
 import check_lock_charter_drift as drift
 import pytest
-from shared.locking import EXTENSIONLESS_FILENAMES, FILE_EXTENSIONS
+from shared.locking import EXTENSIONLESS_FILENAMES, FILE_EXTENSIONS, is_file_path
 
 # The two vectors dark-factory declares, in the exact form the guard script
 # emits them (one per line, sorted).  Read from `shared.locking` — never from
@@ -395,3 +395,229 @@ class TestImportIsHermetic:
             timeout=60,
         )
         assert proc.returncode == 0, proc.stderr
+
+
+# ---------------------------------------------------------------------------
+# The CORPUS sweep: corpus -> allowlist, the direction the originating
+# 2026-07-28 incident actually failed in.
+#
+# `tests/infra/run-all-classification.manifest` was a genuinely TRACKED file
+# whose extension was simply absent from the allowlist, so `is_file_path`
+# classified it as a directory and `update_task` rejected the declaration with
+# a LockCharterViolation.  The vector comparison above structurally cannot
+# catch that: both repos can agree perfectly on a vector that is missing the
+# same extension.  Only sweeping the real tracked corpus finds the 23rd
+# omission.
+#
+# Every case plants a REAL `git init` checkout under tmp_path — no commit is
+# needed, `git ls-files` reads the index — and uses `shared.locking.
+# is_file_path` ITSELF as the oracle, so an assertion here cannot drift from
+# the predicate it is auditing.
+# ---------------------------------------------------------------------------
+
+
+def _plant_repo(root: Path, paths: list[str], *, gitlinks: list[str] | None = None) -> Path:
+    """`git init` a checkout at *root* with *paths* tracked, plus any *gitlinks*.
+
+    Gitlinks are planted with ``git update-index --add --cacheinfo 160000,...``
+    rather than a real submodule: that is what actually produces the mode column
+    the sweep filters on, without needing a second repo on disk or network.
+    """
+    root.mkdir(parents=True, exist_ok=True)
+    subprocess.run(['git', 'init', '-q', str(root)], check=True, capture_output=True)
+    for rel in paths:
+        target = root / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text('x\n')
+    if paths:
+        subprocess.run(
+            ['git', '-C', str(root), 'add', '--', *paths], check=True, capture_output=True
+        )
+    for rel in gitlinks or []:
+        subprocess.run(
+            [
+                'git', '-C', str(root), 'update-index', '--add',
+                '--cacheinfo', f'160000,{"0" * 39}1,{rel}',
+            ],
+            check=True,
+            capture_output=True,
+        )
+    return root
+
+
+class TestCheckCorpus:
+    """``check_corpus(reify_repo)`` — every tracked path must classify as a file."""
+
+    def test_clean_corpus_reports_ok_with_no_findings(self, tmp_path):
+        """A corpus every one of whose paths the predicate accepts is not drift."""
+        paths = ['a/b.py', 'docs/readme.md', 'ops/Dockerfile']
+        for rel in paths:
+            assert is_file_path(rel), f'oracle disagrees: {rel} must be accepted'
+        repo = _plant_repo(tmp_path / 'reify', paths)
+
+        report = drift.check_corpus(repo)
+
+        assert report['findings'] == {}
+        assert report['exit_code'] == drift.EXIT_OK
+        assert report['status'] == 'ok'
+
+    def test_tracked_path_with_unallowlisted_extension_is_drift(self, tmp_path):
+        """The 2026-07-28 incident's exact shape, reproduced structurally.
+
+        The finding must name BOTH the extension (what to add) and a
+        representative tracked path (the evidence that a real file is affected)
+        — an extension alone reads as a style opinion, while a path alone leaves
+        the reader to re-derive which token to allowlist.
+        """
+        assert not is_file_path('x/y.proto'), (
+            "this case needs an extension the allowlist REJECTS; if 'proto' has "
+            'since been allowlisted, pick another absent one'
+        )
+        repo = _plant_repo(tmp_path / 'reify', ['a/b.py', 'x/y.proto'])
+
+        report = drift.check_corpus(repo)
+
+        assert report['exit_code'] == drift.EXIT_DRIFT
+        assert report['status'] == 'drift'
+        assert report['findings'] == {'proto': 'x/y.proto'}
+        assert 'proto' in report['detail']
+        assert 'x/y.proto' in report['detail']
+
+    def test_gitlink_is_excluded_from_the_sweep(self, tmp_path):
+        """A mode-160000 submodule mount point is not a file in THIS repo.
+
+        Load-bearing rather than tidiness: admitting a mount point would let a
+        whole vendored subtree be declared as a lock charter.  The gitlink here
+        carries a deliberately unallowlisted extension, so if the mode filter
+        were dropped it would surface as a finding and this case would fail —
+        the exclusion is proven to be doing real work, not merely asserted.
+        """
+        repo = _plant_repo(tmp_path / 'reify', ['a/b.py'], gitlinks=['vendor/sub.proto'])
+
+        report = drift.check_corpus(repo)
+
+        assert report['findings'] == {}
+        assert report['exit_code'] == drift.EXIT_OK
+
+    def test_extensionless_tracked_path_is_not_a_finding(self, tmp_path):
+        """No-dot segments have no extension to report, so they cannot be findings.
+
+        ``README`` (no dot, not in EXTENSIONLESS_FILENAMES) IS rejected by the
+        predicate, but there is no token to allowlist — reporting it under a key
+        of ``''`` would tell a reader to add an empty extension.  Widening
+        EXTENSIONLESS_FILENAMES is a separate, name-by-name judgement, so the
+        extension sweep stays scoped to dotted segments.
+        """
+        assert not is_file_path('README')
+        repo = _plant_repo(tmp_path / 'reify', ['README', 'a/b.py'])
+
+        assert drift.check_corpus(repo)['findings'] == {}
+
+    def test_non_git_directory_is_unavailable_and_never_ok(self, tmp_path):
+        """`git ls-files` failed, so the sweep did not happen — that is not a pass."""
+        plain = tmp_path / 'not-a-checkout'
+        plain.mkdir()
+
+        report = drift.check_corpus(plain)
+
+        assert report['exit_code'] == drift.EXIT_UNAVAILABLE
+        assert report['exit_code'] != drift.EXIT_OK
+        assert report['status'] == 'unavailable'
+        assert report['findings'] == {}
+
+    def test_first_offending_path_is_recorded_per_extension(self, tmp_path):
+        """One representative path per extension, not an unbounded list.
+
+        A reify-scale corpus can carry hundreds of files behind a single missing
+        extension; the actionable unit is the extension, and one witness is
+        enough to prove it is real.
+        """
+        repo = _plant_repo(tmp_path / 'reify', ['a/one.proto', 'b/two.proto', 'c/three.sql'])
+
+        findings = drift.check_corpus(repo)['findings']
+
+        assert set(findings) == {'proto', 'sql'}
+        assert findings['proto'] in ('a/one.proto', 'b/two.proto')
+        assert findings['sql'] == 'c/three.sql'
+
+
+class TestTrackedPaths:
+    """``tracked_paths`` — one parse of the corpus, split by git's own mode column."""
+
+    def test_partitions_on_the_mode_column(self, tmp_path):
+        """The gitlink set is DERIVED from mode 160000, never from hardcoded names.
+
+        Matching the rationale already recorded on ``_tracked_entries`` in the
+        in-suite copies: a name list would silently stop excluding the day reify
+        renames or adds a submodule.
+        """
+        repo = _plant_repo(tmp_path / 'reify', ['a/b.py'], gitlinks=['vendor/sub.proto'])
+
+        paths, gitlinks = drift.tracked_paths(repo)
+
+        assert paths == ['a/b.py']
+        assert gitlinks == ['vendor/sub.proto']
+
+    def test_raises_guard_unavailable_when_not_a_checkout(self, tmp_path):
+        plain = tmp_path / 'plain'
+        plain.mkdir()
+        with pytest.raises(drift.GuardUnavailable):
+            drift.tracked_paths(plain)
+
+
+class TestCheckComposition:
+    """``check`` — the worst of its parts, so an unavailable half is never masked."""
+
+    def test_ok_when_both_halves_are_ok(self, tmp_path):
+        repo = _plant_repo(tmp_path / 'reify', ['a/b.py'])
+        _plant_guard(repo, extensions=DF_EXTENSIONS, extensionless=DF_EXTENSIONLESS)
+
+        report = drift.check(repo)
+
+        assert report['exit_code'] == drift.EXIT_OK
+        assert report['status'] == 'ok'
+        assert set(report['parts']) == {'vectors', 'corpus'}
+        assert report['parts']['vectors']['exit_code'] == drift.EXIT_OK
+        assert report['parts']['corpus']['exit_code'] == drift.EXIT_OK
+
+    def test_drift_in_either_half_alone_surfaces(self, tmp_path):
+        repo = _plant_repo(tmp_path / 'reify', ['x/y.proto'])
+        _plant_guard(repo, extensions=DF_EXTENSIONS, extensionless=DF_EXTENSIONLESS)
+
+        report = drift.check(repo)
+
+        assert report['exit_code'] == drift.EXIT_DRIFT
+        assert report['parts']['vectors']['exit_code'] == drift.EXIT_OK
+        assert report['parts']['corpus']['exit_code'] == drift.EXIT_DRIFT
+
+    def test_unavailable_half_is_never_masked_by_an_ok_half(self, tmp_path):
+        """The composition-level restatement of 'absence is never a pass'.
+
+        The corpus half sweeps a real checkout while the vector half needs the
+        guard script; a reify checkout can easily have one and not the other.
+        Reporting OK because the half that COULD run agreed would be the same
+        silent green as a pytest skip, one level up.
+        """
+        repo = _plant_repo(tmp_path / 'reify', ['a/b.py'])  # no guard script planted
+
+        report = drift.check(repo)
+
+        assert report['parts']['corpus']['exit_code'] == drift.EXIT_OK
+        assert report['parts']['vectors']['exit_code'] == drift.EXIT_UNAVAILABLE
+        assert report['exit_code'] == drift.EXIT_UNAVAILABLE
+        assert report['status'] == 'unavailable'
+
+    def test_unavailable_outranks_drift(self, tmp_path):
+        """Ordering is UNAVAILABLE > DRIFT > OK, not last-writer-wins.
+
+        A drifting half plus an unavailable half is not a complete drift report:
+        the unexamined half may hold worse. The exit code must say so.
+        """
+        repo = _plant_repo(tmp_path / 'reify', ['x/y.proto'])  # corpus drifts
+        _plant_guard(repo, extensions=DF_EXTENSIONS, rc=3)  # vectors unavailable
+
+        report = drift.check(repo)
+
+        assert report['parts']['corpus']['exit_code'] == drift.EXIT_DRIFT
+        assert report['parts']['vectors']['exit_code'] == drift.EXIT_UNAVAILABLE
+        assert report['exit_code'] == drift.EXIT_UNAVAILABLE
