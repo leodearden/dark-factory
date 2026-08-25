@@ -110,7 +110,7 @@ from __future__ import annotations
 import enum
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, TypeGuard
+from typing import TYPE_CHECKING, Any, NamedTuple, TypeGuard
 
 if TYPE_CHECKING:
     from escalation.queue import EscalationQueue
@@ -707,6 +707,93 @@ async def _resolve_main_reachable_evidence(
     return equivalent
 
 
+class _NoOpQuestion(NamedTuple):
+    """Which two commit-ishes the no-op guard should diff, if any.
+
+    Three distinguishable outcomes, and collapsing any pair of them
+    re-introduces a bug this task exists to remove:
+
+    - ``left``/``right`` both set — ask ``left..right``.
+    - both ``None`` with ``indeterminate=False`` — the question is
+      INAPPLICABLE (no baseline exists for this shape).  The guard is skipped
+      and the verdict is decided by the arms after it.
+    - both ``None`` with ``indeterminate=True`` — git could not answer.  That
+      is a broken DETECTOR, never a statement about the task, so the caller
+      maps it to ``git_error``.
+    """
+
+    left: str | None
+    right: str | None
+    indeterminate: bool
+
+
+async def _no_op_question(
+    git_ops: GitOps,
+    upstream: str,
+    head: str,
+    metadata: dict[str, Any] | None,
+    probe: dict[str, Any],
+) -> _NoOpQuestion:
+    """Resolve the baseline the no-op guard measures *head*'s contribution from.
+
+    A LADDER, tried in order, because no single formula is correct for every
+    landing shape.  Which rung answered is recorded in
+    ``probe['no_op_baseline']``; a reader of the escalation can then see what
+    the emptiness claim was measured against, which the bare boolean cannot
+    say.
+
+    1. **The recorded ``branch_base_sha``** — the fork point the orchestrator
+       wrote down when it CREATED the branch, and the only rung that stays
+       correct for a COALESCED landing: a merge train brings several tasks in
+       at once, so the train merge's own diff is non-empty even when this
+       branch contributed nothing to it.  Rungs 2 and 3 would both read that
+       as "not a no-op".  Validated with :func:`is_valid_sha_40` and required
+       to be an ancestor of *head*, so a malformed, foreign or
+       rebase-stale value falls through instead of making ``git diff`` fail.
+    2. **``merge-base(upstream, head)``** — the honest fork point while the
+       branch is still OUTSIDE ``upstream``'s history (the unlanded and
+       rebase-landing shapes).
+    3. **The landing merge's own contribution** — used exactly when rung 2
+       degenerates, i.e. when *head* is ALREADY an ancestor of *upstream* and
+       the merge base is therefore *head* itself.  See
+       :meth:`~orchestrator.git_ops.GitOps.landing_merge_for`: taking rung 2's
+       answer at face value here would report EVERY merged landing as a no-op
+       and re-dispatch it forever.
+
+    When rung 3 finds no merge either — a fast-forward landing, or a branch
+    parked at an old ``upstream`` commit with no metadata — there is no
+    baseline at all and the question is declared INAPPLICABLE rather than
+    answered.  That is a deliberate, recorded degradation: the guard goes
+    quiet and the later arms decide, so the cost is a no-op landing that must
+    be caught by attribution instead.  Supplying ``branch_base_sha`` (rung 1)
+    removes it, which is why every orchestrator-dispatched caller has one.
+    """
+    recorded = (metadata or {}).get('branch_base_sha')
+    if is_valid_sha_40(recorded) and await git_ops.is_ancestor(recorded, head):
+        probe['no_op_baseline'] = 'recorded_branch_base'
+        return _NoOpQuestion(recorded, head, False)
+
+    fork_point = await git_ops.merge_base_with_main(head)
+    probe['no_op_fork_point'] = fork_point
+    if fork_point is None:
+        # Two disconnected histories, an unreadable object or a locked repo.
+        # NOT "the branch has content" and NOT "the branch delivered nothing".
+        probe['no_op_baseline'] = 'indeterminate'
+        return _NoOpQuestion(None, None, True)
+    if fork_point != head:
+        probe['no_op_baseline'] = 'merge_base'
+        return _NoOpQuestion(fork_point, head, False)
+
+    landing_merge = await git_ops.landing_merge_for(head, upstream)
+    if landing_merge is not None:
+        probe['no_op_baseline'] = 'landing_merge'
+        probe['no_op_landing_merge'] = landing_merge
+        return _NoOpQuestion(f'{landing_merge}^1', landing_merge, False)
+
+    probe['no_op_baseline'] = 'unavailable'
+    return _NoOpQuestion(None, None, False)
+
+
 async def branch_work_landed(
     git_ops: GitOps,
     task_id: str,
@@ -748,6 +835,50 @@ async def branch_work_landed(
     ``git cherry <upstream> <head>``.  Passing them the way the shell command
     reads would invert the question into "is main's history contained in the
     branch?", which a freshly-created branch answers YES to.
+
+    ``git cherry`` SKIPS merge commits (measured, not assumed — see
+    ``TestBoundaryFixtures.test_git_cherry_skips_merge_commits``), which is what
+    makes a sync-merge tip safe here: a branch that pulled main in to resolve
+    a conflict has a merge commit at its tip carrying main's own history, and
+    a containment check that counted it would report a landed branch as
+    unlanded.  The containment question is therefore already restricted to the
+    branch's OWN non-merge commits, with no extra filtering needed.
+
+    **THE NON-DECAY INVARIANT — the PRD's headline, and it may not be
+    waived.** Once this function has reported a branch landed, NO subsequent
+    commit on main may change that verdict unless the work is GENUINELY
+    REMOVED from main's history.  Later commits that touch, rewrite or churn
+    the very same paths must not weaken it, and neither must a post-hoc
+    ``git revert`` (which ADDS an inverse commit and leaves the original
+    patch-ids in place).  Its regression pin is
+    ``test_branch_work_landed.py``'s ``TestB1NonDecay``, which re-runs this
+    function after EVERY one of five same-path churn commits — sampling the
+    whole sequence, because "never decayed" and "decayed and recovered" are
+    indistinguishable from a single end-state check.
+
+    It is the headline invariant because the legacy policy's false negative is
+    MONOTONIC: each later commit touching those paths erodes line survival
+    further, so every detection attempt is strictly less likely to succeed
+    than the one before it.  A stranded task therefore becomes progressively
+    LESS recoverable the longer it goes unnoticed, and past some point is not
+    recoverable at all — the failure mode that stranded tasks 3103 and 3916.
+    A merely-flaky detector is an annoyance; a monotonically-decaying one
+    converts a transient miss into a permanent loss.
+
+    Concretely, that forbids two things in this function's body, and both are
+    pinned at a zero call count by ``TestB2SyncMergeTip.
+    test_neither_decaying_predicate_is_ever_awaited`` across every boundary
+    row: ``git_ops.branch_content_in_main`` (byte-identity of the touched
+    paths against main RIGHT NOW) and ``git_ops.commit_effect_present_in_main``
+    / ``describe_commit_effect_in_main`` (line survival against main HEAD).
+    Both answer questions about main's CURRENT state, so both decay by
+    construction — including on the evidence-resolution path, where a
+    reachability check must never be implemented by diffing a path set.
+
+    The one construction that DOES flip the verdict is a genuine rewind: if
+    the commits are no longer in main's history, their patch-ids are genuinely
+    absent and the answer is ``not_landed``.  That keeps the invariant
+    conditional rather than vacuous.
 
     **THE ORDERING RULE, and it is NORMATIVE — not defensive.** The arms run
     in exactly this order and may not be reordered::
@@ -856,19 +987,31 @@ async def branch_work_landed(
     if degenerate:
         return _reject(LandingReason.degenerate_branch)
 
-    # GUARD 2 — no-op landing.  The probe out-parameter carries the tip's
-    # parent shas and the merge-base into the verdict, so an escalation body
-    # can show whether the tip is a merge without re-running git.
-    net_empty = await git_ops.net_diff_is_empty(upstream, head, probe=probe)
-    probe['net_diff_is_empty'] = net_empty
-    if net_empty is None:
-        # TRI-STATE, and the third state is NOT "not a no-op": collapsing it
-        # would launder a broken merge-base or an unreadable commit into a
-        # statement about the task.  Fully classified in a later step.
-        probe['git_error_stage'] = 'net_diff_is_empty'
+    # GUARD 2 — no-op landing.  The BASELINE comes from a ladder rather than
+    # from `upstream` directly (see _no_op_question): once the branch has
+    # merged, merge-base(upstream, head) IS head, so asking the question
+    # against `upstream` reports every landed branch as a no-op.
+    question = await _no_op_question(git_ops, upstream, head, metadata, probe)
+    if question.indeterminate:
+        probe['git_error_stage'] = 'no_op_baseline'
         return _reject(LandingReason.git_error)
-    if net_empty:
-        return _reject(LandingReason.no_op_landing)
+    if question.left is not None and question.right is not None:
+        # The probe out-parameter carries the measured commit's parent shas
+        # and merge-base into the verdict, so an escalation body can show
+        # whether it is a merge without re-running git.
+        net_empty = await git_ops.net_diff_is_empty(
+            question.left, question.right, probe=probe,
+        )
+        probe['net_diff_is_empty'] = net_empty
+        if net_empty is None:
+            # TRI-STATE, and the third state is NOT "not a no-op": collapsing
+            # it would launder a broken merge-base or an unreadable commit
+            # into a statement about the task.  Fully classified in a later
+            # step.
+            probe['git_error_stage'] = 'net_diff_is_empty'
+            return _reject(LandingReason.git_error)
+        if net_empty:
+            return _reject(LandingReason.no_op_landing)
 
     # Function-scoped: merge_queue.py imports from this module at module
     # level, so importing it back at module level would close an import cycle.

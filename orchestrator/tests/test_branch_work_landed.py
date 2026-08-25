@@ -385,7 +385,7 @@ def build_unlanded_branch(repo: _Repo, *, branch: str = BRANCH) -> Scenario:
 
 
 def advance_main_touching_same_paths(
-    sc: Scenario, count: int, *, rewrite: bool = False,
+    sc: Scenario, count: int, *, rewrite: bool = False, start: int = 0,
 ) -> list[str]:
     """(f) B1 — *count* unrelated commits on main that TOUCH THE SAME PATHS.
 
@@ -394,12 +394,20 @@ def advance_main_touching_same_paths(
     line-survival thresholds a decaying effect-present predicate applies.  The
     task's work is not removed — it is churned — so a non-decaying producer
     must still report it landed.
+
+    *start* offsets the churn counter so a caller advancing main ONE commit at
+    a time (to re-run the producer after each) still writes distinct content
+    every time.  Without it a repeated ``count=1`` call rewrites byte-identical
+    content and ``git commit`` fails with "nothing to commit" — the fixture
+    would silently stop advancing main and the non-decay pin would measure
+    nothing.
     """
     repo = sc.repo
     repo.git('checkout', 'main')
     shas: list[str] = []
-    for i in range(count):
-        last = rewrite and i == count - 1
+    for n in range(count):
+        i = start + n
+        last = rewrite and n == count - 1
         body = (
             _numbered('rewritten', 40, start=1000) if last
             else _numbered('feature', 40) + _numbered('churn', 4, start=100 * (i + 1))
@@ -543,6 +551,40 @@ class TestBoundaryFixtures:
         revert_landing(sc)
         cherry = repo.git('cherry', 'main', sc.branch_tip_sha)
         assert not [line for line in cherry.splitlines() if line.startswith('+')], cherry
+
+    def test_git_cherry_skips_merge_commits(self, repo: _Repo) -> None:
+        """Step-10(a), MEASURED against real git rather than assumed.
+
+        The containment helper shells ``git cherry``, and the whole
+        sync-merge-tip question turns on what it does with the merge commit at
+        the tip.  If ``git cherry`` reported the merge as an unlanded commit,
+        every branch that ever pulled main in would read as not landed, and
+        the producer would need to restrict the question to the branch's own
+        non-merge commits by hand.  It does not — so no such filtering exists
+        in the producer, and this test is what would notice if that ever
+        changed under us.
+        """
+        base, _tip = _seed_branch(repo)
+        main_edit = repo.commit(
+            'chore: main edits the same file',
+            {WORK_PATH: _numbered('feature', 40) + _numbered('mainside', 6)},
+        )
+        repo.git('checkout', BRANCH)
+        rc, _ = repo.git_rc('merge', '--no-ff', 'main', '-m', f'Merge main into {BRANCH}')
+        assert rc != 0
+        repo.write(WORK_PATH, _numbered('feature', 40) + _numbered('mainside', 6))
+        repo.git('add', '-A')
+        repo.git('commit', '--no-edit')
+        tip = repo.sha('HEAD')
+        assert repo.parents(tip)[1] == main_edit
+        assert base
+
+        listed = {line.split()[-1] for line in repo.git('cherry', 'main', tip).splitlines()}
+        walked = set(repo.git('rev-list', f'main..{tip}').splitlines())
+        assert tip in walked, 'the merge tip IS in the range git cherry walks'
+        assert tip not in listed, 'git cherry must skip the merge commit itself'
+        assert listed, 'the branch\'s own non-merge commits must still be listed'
+        assert listed < walked
 
     def test_rewind_removes_the_work_by_patch_id(self, repo: _Repo) -> None:
         sc = build_merged_landing(repo)
@@ -1004,18 +1046,30 @@ class TestDegenerateArmBackwardCompatibility:
         """The cost of the backward-compatible posture, pinned rather than hidden.
 
         Without the recorded base the producer CANNOT know the branch never
-        advanced, so the degenerate arm is skipped and the next guard in the
-        normative order answers instead.  That guard is the no-op check, and
-        it catches this branch on its own terms: a tip parked at its fork
-        point IS its own merge-base, so ``merge-base(main, tip)..tip`` is
-        empty and the branch's net contribution is genuinely nothing.
+        advanced, so the degenerate arm is skipped and the arms after it in the
+        normative order answer instead.
 
-        So the fall-through costs LEGIBILITY — the operator is told "this
-        branch delivered no net change" rather than the sharper "this branch
-        never advanced past its base" — and never SAFETY: the verdict is still
-        a refusal, never the confident accept that patch-id containment would
-        have produced for a parked branch.  Pinned here so the degradation is
-        a recorded property rather than a surprise.
+        The no-op guard does NOT catch it, and the reason is worth stating
+        because an earlier revision of this suite asserted the opposite.  A
+        parked tip is its own merge-base with main, so
+        ``merge-base(main, tip)..tip`` is empty — but so is the merge base of
+        main with EVERY branch that has already landed, which is why that
+        formula cannot be the no-op guard's baseline (B1 pins that: it reported
+        every merged landing as a no-op).  With the baseline ladder in place
+        the guard finds no baseline for this shape at all
+        (``probe['no_op_baseline'] == 'unavailable'``) and correctly declines
+        to answer rather than answering by accident.
+
+        So the verdict comes from attribution: the parked tip IS patch-id
+        contained in main, and no main-reachable commit can be attributed to
+        the task, giving ``no_attribution``.  The fall-through therefore costs
+        LEGIBILITY — the operator is told "nothing on main could be attributed
+        to this task" rather than the sharper "this branch never advanced past
+        its base" — and never SAFETY: the verdict is still a refusal carrying
+        no provenance anchor, never the confident accept that patch-id
+        containment alone would have produced for a parked branch.  Supplying
+        ``branch_base_sha`` restores the sharp answer, which is why every
+        orchestrator-dispatched caller has one.
         """
         sc = build_degenerate_branch(repo)
         verdict = await branch_work_landed(
@@ -1023,7 +1077,8 @@ class TestDegenerateArmBackwardCompatibility:
             branch_tip_sha=sc.branch_tip_sha, metadata=None,
         )
         assert verdict.reason is not LandingReason.degenerate_branch
-        assert verdict.reason is LandingReason.no_op_landing
+        assert verdict.probe['no_op_baseline'] == 'unavailable'
+        assert verdict.reason is LandingReason.no_attribution
         assert verdict.accepted is False
         assert verdict.evidence_sha is None
 
@@ -1073,7 +1128,7 @@ class TestB1NonDecay:
         for i in range(5):
             # The LAST commit rewrites the lines the task added, which is the
             # shape that trips the survival thresholds.
-            advance_main_touching_same_paths(sc, 1, rewrite=(i == 4))
+            advance_main_touching_same_paths(sc, 1, rewrite=(i == 4), start=i)
             verdict = await branch_work_landed(
                 git_ops, TASK_ID, sc.branch,
                 branch_tip_sha=sc.branch_tip_sha, metadata=sc.metadata,
@@ -1256,6 +1311,62 @@ class TestB2SyncMergeTip:
         )
         assert verdict.accepted is False, verdict.probe
         assert verdict.reason is LandingReason.not_landed
+
+    async def test_the_baseline_ladder_reports_which_rung_answered(
+        self, git_ops: GitOps, repo: _Repo,
+    ) -> None:
+        """The no-op baseline is a structured fact, not an implicit choice.
+
+        No single formula is correct for every landing shape, so which one was
+        used decides what an emptiness claim MEANS.  Recording it lets a reader
+        of the escalation see what the measurement was taken against instead of
+        having to re-derive it from the shape of the repo.
+        """
+        landed = build_merged_landing(repo)
+        verdict = await branch_work_landed(
+            git_ops, TASK_ID, landed.branch,
+            branch_tip_sha=landed.branch_tip_sha, metadata=landed.metadata,
+        )
+        assert verdict.probe['no_op_baseline'] == 'recorded_branch_base'
+
+    async def test_a_merged_landing_without_metadata_uses_the_landing_merge(
+        self, git_ops: GitOps, repo: _Repo,
+    ) -> None:
+        """Rung 3 — and it is load-bearing, not a nicety.
+
+        Without the recorded base, rung 2's ``merge-base(main, tip)`` IS the
+        tip for any branch that has merged, so the no-op question would answer
+        "empty" for EVERY landed branch.  Rung 3 asks the PRD Contract's
+        literal ``merge-base(first_parent, tip)..tip`` form about the landing
+        merge instead, which stays well-defined after the fact — and it must
+        keep distinguishing a real landing from a no-op one WITHOUT the
+        metadata, or the task-1175 shape would be accepted whenever a caller
+        has none.
+        """
+        sc = build_merged_landing(repo)
+        real = await branch_work_landed(
+            git_ops, TASK_ID, sc.branch, branch_tip_sha=sc.branch_tip_sha, metadata=None,
+        )
+        assert real.probe['no_op_baseline'] == 'landing_merge'
+        assert real.accepted is True, real.probe
+        assert real.reason is LandingReason.landed
+
+    async def test_a_no_op_landing_without_metadata_is_still_rejected(
+        self, git_ops: GitOps, repo: _Repo,
+    ) -> None:
+        """Rung 3's other half — the guard must not go quiet when metadata is absent.
+
+        Skipping the no-op check whenever the recorded base is missing would
+        silently accept the task-1175 shape, and a false ACCEPT closes a task
+        that never delivered — strictly worse here than any false negative.
+        """
+        sc = build_no_op_landing(repo)
+        verdict = await branch_work_landed(
+            git_ops, TASK_ID, sc.branch, branch_tip_sha=sc.branch_tip_sha, metadata=None,
+        )
+        assert verdict.probe['no_op_baseline'] == 'landing_merge'
+        assert verdict.accepted is False, verdict.probe
+        assert verdict.reason is LandingReason.no_op_landing
 
     @pytest.mark.parametrize(
         'build',
