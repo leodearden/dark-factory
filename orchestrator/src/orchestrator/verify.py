@@ -948,6 +948,65 @@ def _extract_failing_test_ids_from_junit(path: Path) -> list[str] | None:
     return sorted(ids)
 
 
+def _extract_skipped_test_ids_from_junit(path: Path) -> list[str] | None:
+    """Parse a pytest junitxml report at *path* into SKIPPED test ids.
+
+    Task 3226.  The exact structural counterpart of
+    :func:`_extract_failing_test_ids_from_junit` above — same file, same
+    ``root.iter('testcase')`` traversal, same ``classname::name`` /
+    ``file::name`` / bare-``name`` id composition, same never-raises contract —
+    differing only in the selection predicate: a ``<testcase>`` counts here iff
+    it has a ``<skipped>`` child.  That symmetry is load-bearing rather than
+    tidy: the two vectors are set-differenced against each other by callers, so
+    any divergence in how an id is spelled would silently make every comparison
+    miss.
+
+    WHY THE SKIPPED VECTOR IS NEEDED AT ALL, and the asymmetry that motivates
+    it.  The failing parser's ``[]`` means "main ran everything and nothing
+    failed" — a positive fact a caller may reason from.  A SKIPPED id means the
+    opposite kind of thing: main NEVER RAN that test, so its absence from the
+    failing vector is not evidence about the branch at all.  Without this
+    vector, ``main_baseline_failing_ids`` records only failures and a caller
+    cannot distinguish "main ran it and it passed" from "main never ran it",
+    even though only the first supports a confident task-fault conclusion.
+    That conflation is what makes a skip read as a pass.
+
+    Returns:
+        - ``None`` when *path* does not exist, or the file is empty/malformed
+          (``ET.ParseError``) — "no junit collected", the B3 degrade signal.
+          Deliberately NOT ``[]``: returning "nothing was skipped" for a report
+          that was never written would license the very "main ran everything"
+          conclusion this function exists to withhold.
+        - ``[]`` when the report parses but no testcase was skipped ("junit
+          collected, zero skipped").
+        - Otherwise a sorted, de-duplicated list of skipped ids.
+
+    Never raises: any parse-time failure degrades to ``None``.
+    """
+    try:
+        tree = ET.parse(path)
+    except (OSError, ET.ParseError):
+        return None
+    root = tree.getroot()
+    if root is None:
+        return None
+
+    ids: set[str] = set()
+    for testcase in root.iter('testcase'):
+        if testcase.find('skipped') is None:
+            continue
+        name = testcase.get('name', '')
+        classname = testcase.get('classname')
+        if classname:
+            test_id = f'{classname}::{name}'
+        else:
+            file_attr = testcase.get('file')
+            test_id = f'{file_attr}::{name}' if file_attr else name
+        ids.add(test_id)
+    return sorted(ids)
+
+
+
 def _extract_cause_hint(output: str) -> str:
     """Extract a one-line failure hint from command output.
 
