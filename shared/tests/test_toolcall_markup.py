@@ -1018,6 +1018,7 @@ class TestNoSilentPartialRepairOfSelfNameMisclose:
         """
         value = 'The intended prose.' + _closer(param)
         result = repair(value, param, ('task_id', param), ('task_id', param))
+        assert result is not None
         assert result == Repair(
             clean_value='The intended prose.',
             recovered={},
