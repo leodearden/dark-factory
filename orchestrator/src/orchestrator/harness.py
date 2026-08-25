@@ -11583,6 +11583,61 @@ class Harness:
 
         return _lookup
 
+    def _build_task_claimant_lookup(self) -> Callable[[str], Awaitable[str | None]]:
+        """Return an async callable (task_id) -> claimant_run_id|None (task 3550).
+
+        Injected into the escalation MCP server as ``task_claimant_lookup``,
+        the deliberate mirror of :meth:`_build_task_status_lookup`.  The server
+        stamps the returned value onto every agent-filed ``Escalation``'s
+        ``filing_claimant_run_id``, which is what lets ``escalation.pins``
+        Link 4 tell a live agent handoff from one filed by a dead incarnation.
+
+        WHY THE DB ROW IS THE SOURCE.  ``claimant_run_id`` holds the identity
+        ``TaskWorkflow``'s dispatch stamp wrote, via the very same
+        ``shared.task_claimant.compose_claimant_run_id`` call that
+        ``TaskWorkflow._filing_claimant_run_id`` uses — so an agent-filed
+        escalation is stamped with the identity of the incarnation that
+        DISPATCHED that agent, byte-identical to what that workflow stamps on
+        its own filings.  Reading it introduces no new coupling:
+        ``scheduler.get_task`` returning the full task dict is an already
+        proven server-side access pattern (the escalation server reaches
+        through ``getattr(harness, 'scheduler', None)`` to it in
+        ``_git_authority_task_metadata``); this is just a second, narrower
+        closure over the same source.
+
+        WHY NOT THE HEADER.  ``X-Escalation-Identity`` carries only a bare role
+        string (see the header constant here and
+        ``escalation/src/escalation/authority.py``), is read only at non-filing
+        sites (``resolve_issue``, ``stamp_triage``, ``promote_to_l2``), and
+        regular dispatched agents send no header at all — no run_id/session_id/
+        pid ever crosses the escalation MCP boundary in any form.  A new tool
+        argument was likewise rejected: it would be caller-supplied and
+        therefore unenforceable, the weakness ``server.py`` already documents
+        for ``agent_role``.
+
+        TOTAL BY CONSTRUCTION.  Every degraded outcome — no such task, no
+        ``claimant_run_id`` key, a ``None``/blank value, or a raising
+        ``get_task`` — yields ``None``, which ``pins`` reads as UNKNOWN and
+        fails safe to pinning.  The server has its own fail-open, but that
+        exists for genuinely unexpected breakage; letting ordinary conditions
+        propagate into it would be a louder path to the same answer.
+        """
+        async def _lookup(task_id: str) -> str | None:
+            try:
+                task = await self.scheduler.get_task(task_id)
+            except Exception as exc:
+                logger.warning(
+                    'task_claimant_lookup: get_task(%s) failed, filing '
+                    'identity left unknown: %s', task_id, exc,
+                )
+                return None
+            claimant = (task or {}).get('claimant_run_id')
+            # Blank/whitespace normalises to None so an empty string never
+            # reaches escalation.pins._norm_id as a pseudo-value.
+            return (claimant or '').strip() or None
+
+        return _lookup
+
     async def _start_escalation_server(self) -> None:
         """Start the escalation MCP server as a background asyncio task."""
         if not HAS_ESCALATION:
@@ -11629,6 +11684,7 @@ class Harness:
             event_store=self.event_store,
             harness=self,
             task_status_lookup=self._build_task_status_lookup(),
+            task_claimant_lookup=self._build_task_claimant_lookup(),
             merge_inflight_registry=self._merge_inflight_registry,
         )
         host = self.config.escalation.host
