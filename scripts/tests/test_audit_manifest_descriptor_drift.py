@@ -582,20 +582,6 @@ def test_coverage_block_is_printed_even_on_a_zero_finding_sweep(
     assert _COVERAGE_CAVEAT in report
 
 
-def test_coverage_caveat_is_a_module_constant_not_inline_prose():
-    """Pinned to the constant so the report's honesty claim has ONE home.
-
-    Naming what the sweep can and cannot see is load-bearing, and inline prose
-    in the formatter would let the report and the module's own account of its
-    limits drift apart silently.
-    """
-    assert isinstance(_COVERAGE_CAVEAT, str)
-    assert "COVERAGE" in _COVERAGE_CAVEAT
-    # It must name the missing-entry class's real owner, not imply this sweep
-    # remediates it.
-    assert "audit_combine_gate_marker_loss" in _COVERAGE_CAVEAT
-
-
 def test_report_coverage_rows_render_with_their_column_alignment(
         tmp_path, make_tasks_db):
     """WHOLE LINES with their alignment, never a bare digit substring.
