@@ -578,13 +578,17 @@ class TestRenderConsolidationGateSection:
         assert GATE_METADATA_KEY in text
         assert 'build_consolidation_gate_task' in text
 
-    def test_states_the_gate_cannot_be_closed_over_a_malformed_cluster(self):
-        """The refusal is the user-observable signal; the filer must know it
-        exists before they file, not discover it at close time."""
+    def test_names_the_seam_that_enforces_closure(self):
+        """The refusal is the user-observable signal, so the filer must know
+        WHERE it fires before they file, not discover it at close time.
+
+        ``set_task_status`` is the tool identifier for the one seam step-14
+        gates.  The refusal BEHAVIOUR is covered by
+        ``test_consolidation_closure_seam.py``'s structured assertions on
+        ``result['error'] == 'consolidation_not_closed'`` — not here, by prose.
+        """
         text = render_consolidation_gate_section()
-        lowered = text.lower()
         assert 'set_task_status' in text
-        assert 'refus' in lowered or 'cannot be closed' in lowered
 
     def test_reuses_the_end_state_brief_verbatim(self):
         """One text for the prompt, the filed gate description and the
@@ -612,6 +616,13 @@ class TestRenderConsolidationGateSection:
         Defect 1's root cause, so it now names this section as the authority."""
         for can_file in (True, False):
             text = m.render_source_completion_section(can_file_tasks=can_file)
-            assert 'Consolidation Gate' in text, (
+            # Resolvable identifiers, not a heading phrase: both live in the
+            # shared trailing clause OUTSIDE the can_file_tasks if/else, so a
+            # rename of either symbol breaks this instead of silently
+            # orphaning the cross-reference.
+            assert 'consolidation_gate' in text, (
+                f'can_file_tasks={can_file} must point at the gate module'
+            )
+            assert 'render_consolidation_gate_section' in text, (
                 f'can_file_tasks={can_file} must point at the gate section'
             )

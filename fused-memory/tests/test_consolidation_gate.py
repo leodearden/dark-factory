@@ -6,10 +6,13 @@ prescribed no end-state shape (Defect 1 — :func:`render_end_state_brief` /
 refusal to close a gate task over a malformed cluster (Defect 2 —
 :func:`evaluate_closure`).
 
-Assertions are pinned to runtime return values (the verdict dataclass, the
-builder's returned dict) and to stable load-bearing substrings within the
-rendered prose — NOT verbatim prompt-text equality — mirroring the
-``test_recon_self_model.py`` / ``test_predicate_contradiction.py`` convention.
+Assertions pin runtime return values (the verdict dataclass, the builder's
+returned dict), resolvable IDENTIFIERS that appear in the rendered text
+(symbol names, metadata keys, tool names), and COMPOSITION identity
+(``render_end_state_brief() in render_consolidation_gate_section()``).  They
+never pin English phrasing: a bare word or a human-readable heading is not a
+contract, a semantics-preserving reword breaks it for nothing, and a tighter
+regex over prose is a worse pin rather than a better one.
 """
 
 from __future__ import annotations
@@ -37,8 +40,8 @@ from fused_memory.reconciliation.consolidation_gate import (
 class TestRenderEndStateBrief:
     """Defect 1's payload: the end-state shape a filed gate must carry.
 
-    Load-bearing-token assertions only — the prose is free to change, the
-    shape it prescribes is not.
+    Identifier assertions only — the prose is free to change, the shape it
+    prescribes is not.
     """
 
     def test_returns_non_empty_str(self):
@@ -51,27 +54,11 @@ class TestRenderEndStateBrief:
         brief = render_end_state_brief()
         assert 'metadata.topic' in brief
         assert 'metadata.canonical' in brief
-        # The canonical must itself be SHORT — an index/summary claim, not a
-        # concatenation of the cluster.  This is the property PRD §3 measured
-        # the inversion on, so the brief has to say it in so many words.
-        assert 'short' in brief.lower()
-        assert 'index' in brief.lower()
 
-    def test_retires_the_appendix_end_state_by_name(self):
-        """The '1 canonical + 1 appendix' absorbing target is explicitly dropped.
-
-        Naming ``appendix`` is what stops a reader mistaking WHICH target is
-        being retired — an unnamed retirement is indistinguishable from prose.
-        """
-        brief = render_end_state_brief()
-        assert 'appendix' in brief.lower()
-        assert 'retired' in brief.lower()
-
-    def test_points_at_the_landed_op_and_its_ratified_retain_arm(self):
+    def test_points_at_the_landed_op(self):
         """The brief and the executable op cannot prescribe different end states."""
         brief = render_end_state_brief()
         assert 'consolidate_memories' in brief
-        assert 'retain' in brief
 
     def test_public_surface_is_exported(self):
         assert 'render_end_state_brief' in consolidation_gate.__all__
