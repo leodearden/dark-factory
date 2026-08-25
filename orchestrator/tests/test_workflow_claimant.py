@@ -24,7 +24,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _orch_helpers import pydantic_spec
-from escalation.pins import PinReport, classify_pins
+from escalation.pins import PinReport, _norm_id, classify_pins
 from shared.task_claimant import compose_claimant_run_id
 
 from orchestrator.config import OrchestratorConfig
@@ -472,3 +472,65 @@ async def test_resolved_plan_lock_identity_discriminates_live_from_dead_filers(
     assert _classify(live_id).queue_handoff == ('esc-303-1',)
     # A dead incarnation's L0 does not — nobody is left to consume it.
     assert _classify(dead_id).dead_l0 == ('esc-303-1',)
+
+
+# ---------------------------------------------------------------------------
+# task 3550: the FILING incarnation's identity
+# ---------------------------------------------------------------------------
+
+
+class TestFilingClaimantIdentity:
+    """``TaskWorkflow._filing_claimant_run_id`` — the identity stamped on
+    every ``Escalation`` this workflow files (task 3550).
+
+    Spec ``docs/task-escalation-state-spec.md`` S6 / ``escalation.pins``
+    Link 4: an L0 is a live handoff ONLY while the incarnation that FILED it
+    lives, judged by an EXACT whole-string comparison of the filed identity
+    against the live claimant.  The live claimant is read from the DB column
+    the dispatch stamp writes, so the filed identity has to be
+    byte-identical to that stamp or a live filer's own L0 classifies
+    ``dead_l0`` — the unsafe direction.  These tests pin that equality at the
+    source: one property, one expression, no second copy to drift.
+    """
+
+    @pytest.mark.asyncio
+    async def test_property_is_the_composed_identity(self, tmp_path: Path):
+        """The property is exactly compose_claimant_run_id(run_id, session, pid)."""
+        wf = _make_workflow(project_root=tmp_path, task_id='101', run_id='run-abc123')
+
+        assert wf._filing_claimant_run_id == compose_claimant_run_id(
+            'run-abc123', wf.session_id, os.getpid(),
+        )
+
+    @pytest.mark.asyncio
+    async def test_property_is_byte_identical_to_the_db_dispatch_stamp(
+        self, tmp_path: Path,
+    ):
+        """The filed identity and the DB claimant stamp are the SAME string.
+
+        Link 4 compares them whole (``shared.task_claimant`` ships a composer
+        and deliberately no parser), so anything short of byte-identity —
+        a differing ``pid=`` suffix included — reads as a DIFFERENT
+        incarnation.
+        """
+        wf = _make_workflow(project_root=tmp_path, task_id='101', run_id='run-abc123')
+
+        await _setup(wf)
+        await wf._stop_claimant_heartbeat()
+
+        db_identity = wf.scheduler.set_task_status.call_args.kwargs['claimant_run_id']  # type: ignore[attr-defined]
+        assert wf._filing_claimant_run_id == db_identity
+
+    @pytest.mark.asyncio
+    async def test_property_passes_the_pins_shape_guard(self, tmp_path: Path):
+        """``escalation.pins._norm_id`` leaves the value untouched.
+
+        A value without the ``/pid=`` marker collapses to UNKNOWN inside
+        ``_norm_id`` and Link 4 then fails safe to pinning — the stamp would
+        be inert.  ``_norm_id(prop) == prop`` is the guard that the stamp is
+        actually COMPARABLE, not merely present.
+        """
+        wf = _make_workflow(project_root=tmp_path, task_id='101', run_id='run-abc123')
+
+        prop = wf._filing_claimant_run_id
+        assert _norm_id(prop) == prop
