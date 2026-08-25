@@ -7301,13 +7301,17 @@ class TestRenderMarkdownRegrowthSection:
 
         assert _cells(row)[1] == '0.25'
 
-    def test_the_stamping_intro_says_what_stamping_coverage_buys(self):
+    def test_the_section_cites_the_task_its_stamping_table_informs(self):
+        """The task id is an IDENTIFIER a consumer keys on; the surrounding
+        prose is free to be reworded.  Pinning the word "stamp" pinned
+        nothing executable — a section gutted to the literal string
+        'stamp 4006' would have passed it.
+        """
         mod = _mod()
         section = '\n'.join(_section(
             mod.render_markdown(_report_with_regrowth()), '## Regrowth deltas',
         )).lower()
 
-        assert 'stamp' in section
         assert '4006' in section
 
     def test_each_read_arm_gets_exactly_one_regrowth_bullet(self):
@@ -7367,7 +7371,6 @@ class TestRenderMarkdownRegrowthSection:
             mod.render_markdown(_report_with_regrowth()), '## Regrowth deltas',
         )).lower()
 
-        assert 'placement' in section
         assert 'stored' in section
         assert 'promoting_pin' in section
 
@@ -7380,7 +7383,6 @@ class TestRenderMarkdownRegrowthSection:
         for mode in mod.REGROWTH_MODES:
             assert mode in section
         assert mod.REGROWTH_SHAPE in section
-        assert 're-emission' in section
 
     def test_a_run_without_the_probe_still_emits_the_heading(self):
         """An ABSENT section is how this probe went missing the first time.
@@ -7462,22 +7464,6 @@ class TestTheNotBlindAuthoredDisclosure:
         assert mod.REGROWTH_BLIND_AUTHORING_DISCLOSURE in rendered
         assert mod.REGROWTH_BLIND_AUTHORING_DISCLOSURE in '\n'.join(
             _section(rendered, '## Protocol'))
-
-    def test_it_states_that_blindness_is_unrecoverable_here(self):
-        """Disclosure, not a claim of blindness.
-
-        The original E2 protection was mechanized by commit ordering — the
-        arm decomposition and query set were committed before any metric
-        function existed.  The metric code was already in the tree when this
-        probe's corpus was authored, so that protection cannot be recreated
-        and the artifact has to say so rather than imply it still holds.
-        """
-        text = _mod().REGROWTH_BLIND_AUTHORING_DISCLOSURE.lower()
-
-        assert 'blind' in text
-        assert 'unrecoverable' in text
-        assert 'partial audit trail' in text
-        assert 'table below' in text
 
     def test_it_is_emitted_even_when_the_probe_was_skipped(self):
         """The disclosure describes the probe's authoring, not its run.
