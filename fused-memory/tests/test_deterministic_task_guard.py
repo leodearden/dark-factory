@@ -11,6 +11,8 @@ import json
 import logging
 import os
 
+import pytest
+
 from fused_memory.middleware.deterministic_task_guard import (
     deterministic_task_error,
 )
@@ -582,6 +584,137 @@ class TestDeterministicTaskErrorMilestone:
             '/proj',
         )
         assert result is None
+
+
+# ---------------------------------------------------------------------------
+# task 4676: metadata.recurrence carrier contract (PRD
+# docs/prds/recurring-deterministic-tasks.md C-1 / R-D4)
+# ---------------------------------------------------------------------------
+
+
+def _predicate_carrier(tmp_path, recurrence=None):
+    """Build an otherwise-VALID recurrence carrier rooted at *tmp_path*.
+
+    A carrier is a deterministic task whose before_done is a PREDICATE and
+    whose milestone is DATED — the only combination contract C-1 permits to
+    carry ``metadata.recurrence``. Every row below starts from this and
+    breaks exactly one thing, so the violation under test is the ONLY
+    violation and a rejection cannot be miscredited to an unrelated
+    invariant.
+
+    Uses the file's existing executable-script idiom because invariant 4
+    resolves before_done.script under project_root and requires os.access
+    X_OK. Pass *recurrence* to attach one; omit it for the no-recurrence
+    control rows.
+    """
+    script = tmp_path / 'run.sh'
+    script.write_text('#!/bin/sh\nexit 0\n')
+    os.chmod(script, 0o755)
+    meta = {
+        'before_done': {'kind': 'predicate', 'script': 'run.sh', 'timeout_secs': 60},
+        'milestone': {'mode': 'dated', 'at': '2026-09-01T00:00:00+00:00'},
+    }
+    if recurrence is not None:
+        meta['recurrence'] = recurrence
+    return meta
+
+
+def _assert_recurrence_rejection(result):
+    """Assert *result* is a structured recurrence rejection carrying a hint.
+
+    The hint is half of this task's user-observable signal (PRD B6), so it is
+    asserted on every row — a deliberate strengthening over the milestone
+    precedent, which asserts hint content nowhere.
+    """
+    assert result is not None
+    assert result.get('error_type') == 'ValidationError'
+    assert 'recurrence' in result['error']
+    assert isinstance(result.get('hint'), str)
+
+
+class TestDeterministicTaskErrorRecurrenceShape:
+    """metadata.recurrence SHAPE validation via deterministic_task_error.
+
+    Covers PRD B6 shapes 1 (interval_secs: 0) and 2 (missing key); shape 3
+    (recurrence on a deploy-kind task) is the carrier class below. Drives the
+    PUBLIC guard entry point only — the same function submit_task calls
+    (tools.py::submit_task) — never the private validator, so these rows
+    prove the user-observable boundary and not just a helper.
+
+    Shape is delegated to shared.task_metadata::Recurrence rather than
+    re-implemented, exactly as milestone delegates to Milestone.
+    """
+
+    # -- rejections ----------------------------------------------------
+
+    def test_interval_secs_zero_rejects(self, tmp_path):
+        """interval_secs=0 → reject (PRD B6 shape 1)."""
+        meta = _predicate_carrier(tmp_path, {'key': 'k', 'interval_secs': 0})
+        _assert_recurrence_rejection(deterministic_task_error('deterministic', meta, str(tmp_path)))
+
+    def test_interval_secs_negative_rejects(self, tmp_path):
+        """interval_secs=-1 → reject."""
+        meta = _predicate_carrier(tmp_path, {'key': 'k', 'interval_secs': -1})
+        _assert_recurrence_rejection(deterministic_task_error('deterministic', meta, str(tmp_path)))
+
+    def test_interval_secs_non_int_rejects(self, tmp_path):
+        """interval_secs='1d' (non-int) → reject."""
+        meta = _predicate_carrier(tmp_path, {'key': 'k', 'interval_secs': '1d'})
+        _assert_recurrence_rejection(deterministic_task_error('deterministic', meta, str(tmp_path)))
+
+    def test_interval_secs_missing_rejects(self, tmp_path):
+        """interval_secs absent → reject (it is the cadence; there is no default)."""
+        meta = _predicate_carrier(tmp_path, {'key': 'k'})
+        _assert_recurrence_rejection(deterministic_task_error('deterministic', meta, str(tmp_path)))
+
+    def test_key_missing_rejects(self, tmp_path):
+        """key absent → reject (PRD B6 shape 2: without it a chain has no identity)."""
+        meta = _predicate_carrier(tmp_path, {'interval_secs': 86400})
+        _assert_recurrence_rejection(deterministic_task_error('deterministic', meta, str(tmp_path)))
+
+    def test_key_empty_rejects(self, tmp_path):
+        """key='' → reject."""
+        meta = _predicate_carrier(tmp_path, {'key': '', 'interval_secs': 86400})
+        _assert_recurrence_rejection(deterministic_task_error('deterministic', meta, str(tmp_path)))
+
+    @pytest.mark.parametrize(
+        'key',
+        ['Reify-Closure', 'reify_closure', 'reify closure', '-reify', 'reify-'],
+    )
+    def test_non_kebab_key_rejects(self, tmp_path, key):
+        """A non-kebab-case key → reject (the key doubles as a slug/grep anchor)."""
+        meta = _predicate_carrier(tmp_path, {'key': key, 'interval_secs': 86400})
+        _assert_recurrence_rejection(deterministic_task_error('deterministic', meta, str(tmp_path)))
+
+    def test_recurrence_as_bare_string_rejects(self, tmp_path):
+        """recurrence as a non-dict (bare string) → TypeError-wrapped rejection."""
+        meta = _predicate_carrier(tmp_path, 'not-a-dict')
+        _assert_recurrence_rejection(deterministic_task_error('deterministic', meta, str(tmp_path)))
+
+    def test_recurrence_as_list_rejects(self, tmp_path):
+        """recurrence as a non-dict (list) → TypeError-wrapped rejection."""
+        meta = _predicate_carrier(tmp_path, [{'key': 'k', 'interval_secs': 1}])
+        _assert_recurrence_rejection(deterministic_task_error('deterministic', meta, str(tmp_path)))
+
+    def test_malformed_recurrence_via_json_string_metadata_rejects(self, tmp_path):
+        """A malformed recurrence supplied via JSON-string metadata is also rejected."""
+        meta_str = json.dumps(_predicate_carrier(tmp_path, {'key': 'k'}))
+        _assert_recurrence_rejection(
+            deterministic_task_error('deterministic', meta_str, str(tmp_path))
+        )
+
+    # -- no-collateral-damage guards ------------------------------------
+
+    def test_absent_recurrence_on_predicate_carrier_still_accepts(self, tmp_path):
+        """The same carrier WITHOUT recurrence → accept (the rule must not over-fire)."""
+        meta = _predicate_carrier(tmp_path)
+        assert deterministic_task_error('deterministic', meta, str(tmp_path)) is None
+
+    def test_absent_recurrence_on_deploy_task_still_accepts(self, tmp_path):
+        """A deploy-kind deterministic task with no recurrence → accept, unchanged."""
+        meta = _predicate_carrier(tmp_path)
+        meta['before_done']['kind'] = 'deploy'
+        assert deterministic_task_error('deterministic', meta, str(tmp_path)) is None
 
 
 # ---------------------------------------------------------------------------
