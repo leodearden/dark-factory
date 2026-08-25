@@ -52,7 +52,7 @@ from __future__ import annotations
 import asyncio
 import os
 from pathlib import Path
-from typing import Literal
+from typing import Literal, TypedDict
 
 import pytest
 
@@ -61,7 +61,13 @@ from orchestrator.config import GitConfig, MergeDeepConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_queue import MergeRequest, SpeculativeMergeWorker
-from orchestrator.merge_types import MergeResult, QueuedBranch, RealMergeItem
+from orchestrator.merge_types import (
+    CapPermit,
+    MergeResult,
+    QueuedBranch,
+    RealMergeItem,
+    SpecPermit,
+)
 
 # ── repo fixtures (cloned from test_merge_queue_deep_dispatch.py:59-112) ──────
 
@@ -455,7 +461,26 @@ def _spy_advance_main(git_ops: GitOps, monkeypatch, *, hook=None) -> list[tuple]
     return calls
 
 
-def _permit_census(worker: SpeculativeMergeWorker) -> dict[str, object]:
+class _PermitCensus(TypedDict):
+    """The shape :func:`_permit_census` returns — declared, not inferred.
+
+    A bare ``dict[str, object]`` return erases every value type, so the
+    conservation identity ``slot_available + len(live) == depth`` stops
+    type-checking at the assertion sites that read it (``object`` supports
+    neither ``+``/``>=`` nor ``len()``).  Spelling the six keys out keeps the
+    counts ``int`` and the token views ``frozenset`` for the checker as well
+    as for the reader.
+    """
+
+    spec_live: frozenset[SpecPermit]
+    spec_available: int
+    spec_depth: int
+    cap_live: frozenset[CapPermit]
+    cap_available: int
+    cap_depth: int
+
+
+def _permit_census(worker: SpeculativeMergeWorker) -> _PermitCensus:
     """Snapshot BOTH permit ledgers' conservation state in one comparable dict.
 
     ``live`` is captured as the frozenset of actual TOKENS, not merely a count:
