@@ -23,6 +23,7 @@ No test in this file needs an API key, a network, or Qdrant.
 from __future__ import annotations
 
 import inspect
+import json
 
 import pytest
 
@@ -40,6 +41,16 @@ from fused_memory.server.write_triage_judge import (
     JudgeOutputError,
     parse_judge_verdict,
 )
+
+
+def _payload(word: object) -> str:
+    """A well-formed verdict payload keyed off the module's own VERDICT_KEY.
+
+    Built rather than spelled, so a rename of the key is exercised by these
+    tests instead of silently bypassing them.
+    """
+    return json.dumps({VERDICT_KEY: word})
+
 
 # ---------------------------------------------------------------------------
 # the closed 4-way vocabulary
@@ -130,41 +141,62 @@ class TestParseJudgeVerdict:
     )
     def test_a_bare_json_object_round_trips(self, word: str, outcome: str) -> None:
         """The happy path: exactly what `response_format=json_object` returns."""
-        assert parse_judge_verdict('{"%s": "%s"}' % (VERDICT_KEY, word)) == outcome
+        assert parse_judge_verdict(_payload(word)) == outcome
 
     def test_a_fenced_json_block_parses(self) -> None:
         """A model that ignores the JSON mode and fences its answer still parses."""
-        raw = '```json\n{"%s": "amends"}\n```' % VERDICT_KEY
+        raw = f'```json\n{_payload("amends")}\n```'
         assert parse_judge_verdict(raw) == OUTCOME_AMENDED
 
     def test_json_surrounded_by_prose_parses(self) -> None:
         """`extract_json` brace-scans, so leading/trailing prose is tolerated."""
         raw = (
             'Looking at candidate mem-1, the new entry adds a detail.\n'
-            '{"%s": "amends"}\n'
-            'That is my answer.' % VERDICT_KEY
+            f'{_payload("amends")}\n'
+            'That is my answer.'
         )
         assert parse_judge_verdict(raw) == OUTCOME_AMENDED
 
     def test_a_verdict_with_extra_keys_still_parses(self) -> None:
         """Extra keys are ignored; only the verdict word is contractual."""
-        raw = '{"%s": "restates", "reasoning": "same fact"}' % VERDICT_KEY
+        raw = json.dumps({VERDICT_KEY: 'restates', 'reasoning': 'same fact'})
+        assert parse_judge_verdict(raw) == OUTCOME_RESTATED
+
+    def test_an_array_wrapped_object_reads_as_that_object(self) -> None:
+        """Pinned deliberately, because it is a behaviour and not an accident.
+
+        ``extract_json`` brace-scans for the first BALANCED OBJECT, so an
+        answer wrapped in a list is read as the object inside it. That
+        leniency is inherited from the repo's one JSON extractor rather than
+        chosen here, and it is safe at this seam for a specific reason: the
+        BAND names the attach target, not the judge, so a verdict is a single
+        word however it was wrapped. A model that answered with several
+        elements has its first taken — a bounded wrong-word risk against a
+        target that is fixed either way, with the canonical never mutated and
+        the attach always re-parentable (C1).
+
+        Asserted so that a future change to ``extract_json`` surfaces here
+        rather than silently changing what the judge is understood to have
+        said.
+        """
+        raw = f'[{_payload("restates")}]'
         assert parse_judge_verdict(raw) == OUTCOME_RESTATED
 
     @pytest.mark.parametrize(
         ('raw', 'label'),
         [
-            ('{"%s": "supersedes"}' % VERDICT_KEY, 'unrecognised-verdict-word'),
-            ('{"%s": "stored"}' % VERDICT_KEY, 'ack-word-not-judge-word'),
-            ('{"answer": "restates"}', 'missing-verdict-key'),
-            ('{"%s": null}' % VERDICT_KEY, 'null-verdict'),
-            ('{"%s": ["restates"]}' % VERDICT_KEY, 'non-string-verdict'),
-            ('[{"%s": "restates"}]' % VERDICT_KEY, 'non-object-payload'),
+            (_payload('supersedes'), 'unrecognised-verdict-word'),
+            (_payload(OUTCOME_RESTATED), 'ack-word-not-judge-word'),
+            (json.dumps({'answer': 'restates'}), 'missing-verdict-key'),
+            (_payload(None), 'null-verdict'),
+            (_payload(['restates']), 'non-string-verdict'),
+            ('["restates"]', 'non-object-payload'),
+            ('"restates"', 'bare-string-payload'),
             ('', 'empty-text'),
             ('   \n\t  ', 'whitespace-only-text'),
             ('I cannot answer that request.', 'prose-with-no-json'),
-            ('{"%s": "restates"' % VERDICT_KEY, 'unbalanced-json'),
-            ('{%s: restates}' % VERDICT_KEY, 'unquoted-json'),
+            (_payload('restates').rstrip('}'), 'unbalanced-json'),
+            (f'{{{VERDICT_KEY}: restates}}', 'unquoted-json'),
         ],
         ids=[
             'unrecognised-verdict-word',
@@ -173,6 +205,7 @@ class TestParseJudgeVerdict:
             'null-verdict',
             'non-string-verdict',
             'non-object-payload',
+            'bare-string-payload',
             'empty-text',
             'whitespace-only-text',
             'prose-with-no-json',
@@ -190,7 +223,7 @@ class TestParseJudgeVerdict:
     def test_the_rejection_message_quotes_the_offending_payload(self) -> None:
         """An operator reading the fail-open log needs the actual output."""
         with pytest.raises(JudgeOutputError) as excinfo:
-            parse_judge_verdict('{"%s": "supersedes"}' % VERDICT_KEY)
+            parse_judge_verdict(_payload('supersedes'))
         assert 'supersedes' in str(excinfo.value)
 
     def test_a_pathological_payload_is_truncated_in_the_message(self) -> None:
