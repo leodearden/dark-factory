@@ -455,6 +455,65 @@ def _spy_advance_main(git_ops: GitOps, monkeypatch, *, hook=None) -> list[tuple]
     return calls
 
 
+def _permit_census(worker: SpeculativeMergeWorker) -> dict[str, object]:
+    """Snapshot BOTH permit ledgers' conservation state in one comparable dict.
+
+    ``live`` is captured as the frozenset of actual TOKENS, not merely a count:
+    δ's hazard is not "how many permits" but "whose".  A walk that released a
+    link's token would raise ``AssertionError`` (the token was never issued —
+    merge_speculation_controller.py:213-239), while a walk that released the
+    DISPATCHING item's token early would keep every count plausible and break
+    only ownership — invisible to a size comparison, obvious to a set one.
+
+    ``slot_available``/``depth`` come along so a reader can check the structural
+    identity ``slot_available + len(live) == depth`` directly at any point,
+    rather than only through ``speculation_accounting_violations``'s
+    ``_running``-gated wrapper.
+    """
+    spec, cap = worker._speculation_ledger, worker._merge_ahead_ledger
+    return {
+        'spec_live': spec.live,
+        'spec_available': spec.slot_available,
+        'spec_depth': spec.depth,
+        'cap_live': cap.live,
+        'cap_available': cap.slot_available,
+        'cap_depth': cap.depth,
+    }
+
+
+def _drain_residue(worker: SpeculativeMergeWorker) -> set[str]:
+    """Retire whatever δ deliberately LEFT queued; return its task ids.
+
+    δ's contract is "the walk touches the prefix and NOTHING else": the
+    truncator, and every link past an abort, stay buffered with unresolved
+    futures for their ordinary sequential path on a later round.  A scene that
+    stops after one finalize therefore rests with real, INTENDED residue — so
+    the whole-registry surfaces of :func:`_assert_quiescent` ((a) every future
+    resolved, (f) nothing non-terminal) cannot hold until that residue is taken
+    off the pipeline the way a later round would take it.
+
+    This stands in for that round: each still-buffered request is detached by
+    its waiter (``cancel()``) and retired through ``_retire_item``, the same
+    registry chokepoint every terminal path funnels through.
+
+    The RETURNED SET is what makes this safe rather than a whitewash — every
+    caller asserts it equals the residue δ promised BEFORE trusting the
+    quiescence that follows, so a landed link that wrongly stayed buffered (the
+    double-land hazard) shows up as a residue-set mismatch instead of being
+    quietly drained away.
+    """
+    drained: set[str] = set()
+    for lane in ('high', 'normal'):
+        buf = worker._lane_buffers[lane]
+        while buf:
+            req = buf.popleft()  # a deque, not a list — `pop(0)` is a TypeError
+            drained.add(req.task_id)
+            if not req.result.done():
+                req.result.cancel()
+            worker._retire_item(req.request_id)
+    return drained
+
+
 # ── quiescence oracle (from test_merge_queue_invariant_integration_gate.py:508) ─
 
 
@@ -1142,14 +1201,21 @@ async def _prefix_scene_upto_finalize(
         base_sha=main_sha,          # the head CASes against REAL main
         speculative=True,
     )
+    permits_before_build = _permit_census(worker)
     chain = await worker._deep_chain_placement(item)
+    permits_after_build = _permit_census(worker)
     assert chain is not None
     assert [tid for tid, _ in chain.links] == list(_DELTA_LINKS)
     assert chain.truncated_at == _DELTA_TRUNCATOR
     assert chain.truncated_reason == 'conflict'
 
     _spy_post_merge_verify(monkeypatch, outcome=verify_outcome)
-    _spy_chain_lane_release(monkeypatch)
+    # Installed AFTER `_deep_chain_placement`, deliberately: the lane the chain
+    # build acquired is held across the verify and returned on the way OUT of
+    # `_run_inflight_verify` (its `finally`), so a spy armed here sees exactly
+    # the releases attributable to the EXIT — which is the thing δ adds a
+    # fourth branch to.
+    lane_releases = _spy_chain_lane_release(monkeypatch)
     # BOTH post-advance gates run FOR REAL here, deliberately: they are
     # part of what the walk must reuse per link, and stubbing them would
     # have to reach back through `orchestrator.merge_queue.<private>` —
@@ -1171,6 +1237,10 @@ async def _prefix_scene_upto_finalize(
         'git_ops': git_ops, 'worker': worker, 'chain': chain, 'reqs': reqs,
         'head_mc': head_mc, 'main_sha': main_sha, 'adv': adv,
         'db_path': db_path, 'repo': git_repo, 'entry': entry, 'item': item,
+        'lane_releases': lane_releases,
+        'permits_before_build': permits_before_build,
+        'permits_after_build': permits_after_build,
+        'permits_after_verify': _permit_census(worker),
     }
 
 
@@ -2362,3 +2432,218 @@ class TestRemoteCancelClearsTheHolderRendezvous:
 
         assert r.exit_code == 3
         assert read_lock_holder_pgid(worktree_base) == os.getpgrp()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# step-11 RED — conservation: the walk consumes no per-item speculation permits
+#
+# THE δ-SPECIFIC HAZARD, stated once.  Every other landing path in this file
+# lands an item that DISPATCHED: it acquired a `SpecPermit` from the
+# speculation ledger (and possibly a `CapPermit` from the merge-ahead ledger),
+# carried the token on its `InflightEntry`/`RealMergeItem`, and gives it back
+# in `_finalize_inflight`'s single `finally`.  A chain LINK did none of that —
+# it sat in a lane buffer for the whole round and never dispatched at all — so
+# the walk lands k items while only ONE of them ever held a permit.
+#
+# That asymmetry is exactly what a "for symmetry" edit would break, in either
+# direction: releasing a link's non-existent token raises AssertionError
+# (merge_speculation_controller.py:213-239), and releasing the head's token
+# once per landed item would over-release the semaphore, silently raising
+# `slot_available` above `depth` and licensing more concurrent speculation than
+# the operator configured.  Both are invisible to the landing assertions in
+# TestInOrderCasWalk — they land the same four commits either way — which is
+# why conservation gets its own oracle here.
+#
+# Note the SWALLOWING: `_land_chain_prefix`'s per-link `except Exception`
+# contains a stray AssertionError rather than propagating it, so "no bad
+# release happened" is NOT observable as a raised exception.  It is observable
+# as (i) the landing running to completion instead of stopping short and
+# (ii) the containment arm's WARNING never being logged — both asserted below.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(180)
+class TestChainWalkConsumesNoPermits:
+    """A chain consumes no per-item speculation permits — only the head's."""
+
+    async def _landing_scene(
+        self, git_repo: Path, tmp_path: Path, monkeypatch, *,
+        db_name: str, hook=None,
+    ) -> dict:
+        """Build the 4-item chain and drive it THROUGH ``_finalize_inflight``."""
+        s = await _prefix_scene_upto_finalize(
+            git_repo, tmp_path, monkeypatch, db_name=db_name, advance_hook=hook,
+        )
+        s['advanced'] = await s['worker']._finalize_inflight(s['entry'])
+        await asyncio.sleep(0)  # let every `_on_finalized` done-callback run
+        return s
+
+    async def test_a_full_landing_leaves_the_pipeline_quiescent(
+        self, git_repo: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """(a) k+1 landings, then all six quiescence surfaces are green.
+
+        The audits are gated on ``_running`` and on a REAL ``main_sha`` (both
+        traps are documented on :func:`_assert_quiescent`), so both are
+        supplied here rather than left to whatever the scene happened to leave
+        behind — a stopped worker or an 'unknown' sha would make this pass
+        vacuously instead of meaningfully.
+        """
+        s = await self._landing_scene(
+            git_repo, tmp_path, monkeypatch, db_name='delta-conserve-full.db',
+        )
+        worker = s['worker']
+        landed = ['101', *_DELTA_LINKS]
+
+        assert [c[0] for c in s['adv']] == [
+            s['head_mc'], *[mc for _tid, mc in s['chain'].links],
+        ], 'the whole prefix must have landed before conservation means anything'
+
+        # Asserted BEFORE the drain: a landed link that wrongly stayed buffered
+        # would show up here, not be quietly drained away.
+        assert _drain_residue(worker) == {_DELTA_TRUNCATOR}
+
+        worker._running = True
+        main_now = await _rev_parse(git_repo, 'main')
+        _assert_quiescent(
+            worker, main_now,
+            [s['reqs'][t] for t in (*landed, _DELTA_TRUNCATOR)],
+        )
+
+    async def test_a_stale_cas_partial_landing_leaves_the_pipeline_quiescent(
+        self, git_repo: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """(b) The identities survive a MID-WALK abort too.
+
+        The abort path is where a half-updated accounting would hide: the
+        prefix that landed is terminal, the links past the abort are still
+        buffered and unresolved, and the two populations must not have been
+        conflated.  Decision #9's "left exactly as they were" is asserted as
+        the residue SET; conservation is asserted over the rest.
+        """
+        from orchestrator.git_ops import AdvanceOutcome
+
+        s = await self._landing_scene(
+            git_repo, tmp_path, monkeypatch, db_name='delta-conserve-abort.db',
+            hook=_abort_hook_at(3, outcome=AdvanceOutcome('cas_failed')),
+        )
+        worker = s['worker']
+
+        assert len(s['adv']) == 3, 'the walk must have stopped at the 3rd CAS'
+        assert _drain_residue(worker) == {'103', '104', _DELTA_TRUNCATOR}
+
+        worker._running = True
+        main_now = await _rev_parse(git_repo, 'main')
+        _assert_quiescent(
+            worker, main_now,
+            [s['reqs'][t] for t in ('101', *_DELTA_LINKS, _DELTA_TRUNCATOR)],
+        )
+
+    async def test_only_the_dispatching_items_permit_is_ever_released(
+        self, git_repo: Path, tmp_path: Path, monkeypatch, caplog,
+    ) -> None:
+        """(c) THE hazard: one release, and it is the head's own token.
+
+        The head is given a REAL ``SpecPermit`` first, so "released exactly
+        once" is a claim about a token that genuinely exists rather than the
+        vacuous zero an entry with ``permit=None`` would produce.  Four items
+        land; exactly one permit comes back.
+
+        A stray ``release`` for a link cannot surface as a propagated
+        exception — the walk's per-link ``except Exception`` contains it — so
+        it is caught here by its two visible shadows: the landing would stop
+        short of four, and the containment arm would log.
+        """
+        import logging
+
+        s = await _prefix_scene_upto_finalize(
+            git_repo, tmp_path, monkeypatch, db_name='delta-conserve-permit.db',
+        )
+        worker, entry = s['worker'], s['entry']
+
+        before = _permit_census(worker)
+        assert before['spec_available'] >= 1, (
+            'the scene needs a free speculation slot to hand the head'
+        )
+        head_permit = await worker._speculation_ledger.acquire()
+        entry.permit = head_permit
+
+        spec_released: list = []
+        cap_released: list = []
+        _real_spec_release = worker._speculation_ledger.release
+        _real_cap_release = worker._merge_ahead_ledger.release
+        monkeypatch.setattr(
+            worker._speculation_ledger, 'release',
+            lambda p: (spec_released.append(p), _real_spec_release(p))[1],
+        )
+        monkeypatch.setattr(
+            worker._merge_ahead_ledger, 'release',
+            lambda p: (cap_released.append(p), _real_cap_release(p))[1],
+        )
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            await worker._finalize_inflight(entry)
+            await asyncio.sleep(0)
+
+        assert spec_released == [head_permit], (
+            'the walk must release the DISPATCHING item\'s permit exactly once '
+            'and no link\'s — a link never acquired one'
+        )
+        assert cap_released == [], 'no link ever held a merge-ahead cap permit'
+        assert len(s['adv']) == 1 + len(s['chain'].links), (
+            'the landing stopped short — a swallowed AssertionError from a '
+            'release() on a non-live token looks exactly like this'
+        )
+        assert not [
+            r for r in caplog.records if 'raised during its landing' in r.getMessage()
+        ], 'the per-link containment arm fired — something raised inside the walk'
+
+        after = _permit_census(worker)
+        assert after['spec_live'] == before['spec_live'], (
+            'the ledger must end the walk holding exactly the tokens it held '
+            'before the head acquired one'
+        )
+        assert after['spec_available'] == before['spec_available']
+        assert after['spec_available'] + len(after['spec_live']) == after['spec_depth']
+        assert after['cap_available'] + len(after['cap_live']) == after['cap_depth']
+
+    async def test_the_chain_build_and_verify_take_no_permits(
+        self, git_repo: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """(d) The permit census is unmoved by the BUILD half as well.
+
+        β acquires a worktree lane for the build (``acquire_chain_build_lane``)
+        and nothing else — no speculation slot, no merge-ahead cap — and δ must
+        not have quietly changed that while teaching the tip to adopt.  Read
+        across both halves: the build itself, and the whole verify that follows.
+        """
+        s = await _prefix_scene_upto_finalize(
+            git_repo, tmp_path, monkeypatch, db_name='delta-conserve-build.db',
+        )
+
+        assert s['permits_after_build'] == s['permits_before_build'], (
+            'building a chain must not consume a permit — it takes a worktree '
+            'lane and nothing else'
+        )
+        assert s['permits_after_verify'] == s['permits_before_build'], (
+            'the tip verify must not consume a permit either'
+        )
+
+    async def test_the_chain_lane_is_released_exactly_once_on_the_adopting_exit(
+        self, git_repo: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """(e) ChainResult's EXACTLY-once lane contract, on δ's new exit.
+
+        γ shipped three exits through the release in ``_run_inflight_verify``'s
+        ``finally``; δ adds the adopting fourth.  A double release would hand
+        the same lane to two concurrent chain builds; a skipped one would
+        starve the pool a lane per deep round.
+        """
+        s = await self._landing_scene(
+            git_repo, tmp_path, monkeypatch, db_name='delta-conserve-lane.db',
+        )
+
+        assert [lane for lane, _warm in s['lane_releases']] == [s['chain'].lane], (
+            'the adopting exit must return the chain lane exactly once'
+        )
