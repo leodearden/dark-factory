@@ -654,6 +654,35 @@ _CALIBRATION_OWNED_KEYS = frozenset({
 })
 
 
+def _interior_comment_run(pending: Sequence[str]) -> list[str]:
+    """The leading sub-run of *pending* that belongs to the value ABOVE it.
+
+    A comment run sitting between a preserved key's last child and the next
+    ``indent<=2`` key is ambiguous: it either TRAILS the nested value it
+    follows or HEADS the key beneath it. INDENT decides, the same way it
+    decides child membership everywhere else in this parser — a comment
+    indented deeper than 2 is interior to the value above; one at indent<=2
+    is a header for what comes next.
+
+    Only the leading deep sub-run is returned, so a mixed run splits at the
+    first indent<=2 comment. A trailing blank run is dropped: a blank line is
+    pure separator and belongs to nobody, which is the same rule that keeps
+    ``trailing`` comment-only.
+    """
+    interior: list[str] = []
+    for line in pending:
+        stripped = line.strip()
+        if not stripped:
+            interior.append(line)
+            continue
+        if len(line) - len(line.lstrip()) <= 2:
+            break
+        interior.append(line)
+    while interior and not interior[-1].strip():
+        interior.pop()
+    return interior
+
+
 def _preserved_block_lines(lines: Sequence[str]) -> tuple[list[str], list[str]]:
     """Split an existing ``write_triage:`` body into the parts this writer does not own.
 
@@ -664,8 +693,10 @@ def _preserved_block_lines(lines: Sequence[str]) -> tuple[list[str], list[str]]:
       in ``_CALIBRATION_OWNED_KEYS``, together with the run of comment lines
       immediately above it (its explanatory note) and ALL deeper-indented
       child lines below it (its nested value), interior comments and blank
-      separators included. A comment run that is followed by an OWNED key --
-      the ``# CALIBRATION OUTPUT`` fence and its explanation -- is dropped,
+      separators included -- including a comment that TRAILS the value with
+      no child line after it, which ``_interior_comment_run`` splits out by
+      indent. A comment run that HEADS an OWNED key -- the
+      ``# CALIBRATION OUTPUT`` fence and its explanation -- is dropped,
       because the rebuilt block re-emits its own copy.
     * ``trailing`` — a comment run at the very END of the body, with no key
       beneath it. This is hand-written operator prose (config.yaml's
@@ -718,14 +749,29 @@ def _preserved_block_lines(lines: Sequence[str]) -> tuple[list[str], list[str]]:
             pending.clear()
             continue
         key = stripped.split(':', 1)[0].strip()
+        was_keeping = keeping_children
         keeping_children = key not in _CALIBRATION_OWNED_KEYS
         if keeping_children:
             kept.extend(pending)
             kept.append(line)
+        elif was_keeping:
+            # An OWNED key ends a preserved value's child run, and `pending`
+            # may hold a comment that TRAILED that value rather than heading
+            # this key. Dropping the whole run wholesale lost it — narrower
+            # than the severed-children defect above, and the same class of
+            # hand-written-config loss this function exists to prevent.
+            kept.extend(_interior_comment_run(pending))
         pending.clear()
-    # Whatever is still pending is a comment run with no key beneath it. Only
-    # the comments are kept (a trailing blank run is pure separator); they are
-    # returned separately so the caller can re-emit them at the end.
+    # Whatever is still pending is a comment run with no key beneath it — with
+    # the same ambiguity an owned key creates, so it is split the same way: a
+    # deeper-indented leading run trailed the last preserved VALUE and stays
+    # with it, and only the rest is operator prose belonging to the block.
+    if keeping_children:
+        interior = _interior_comment_run(pending)
+        kept.extend(interior)
+        pending = list(pending[len(interior):])
+    # Only the comments are kept (a trailing blank run is pure separator); they
+    # are returned separately so the caller can re-emit them at the end.
     trailing = [line for line in pending if line.strip()]
     return kept, trailing
 

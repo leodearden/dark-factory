@@ -1727,6 +1727,48 @@ write_triage:
   calibration_report_path: old/report.json
 """
 
+# The narrower sibling of WITH_A_COMMENTED_NESTED_VALUE: the interior comment
+# is the LAST line of the nested value, with no child beneath it to carry it
+# through. It is the shape a hand-added knob acquires the moment someone
+# annotates its final entry.
+WITH_A_COMMENT_TRAILING_A_NESTED_VALUE = """\
+write_triage:
+  future_map:
+    a: 1
+    # explanatory note about a
+  t_high: 0.11
+  t_low: 0.05
+  calibration_report_path: old/report.json
+"""
+
+# Both readings of a comment run in the same position, so the split is pinned
+# rather than merely the keep: the deep line trails `future_map`, the indent-2
+# line heads the OWNED `t_high` and is the fence-style comment the rebuilt
+# block re-emits its own copy of.
+WITH_A_MIXED_COMMENT_RUN_BEFORE_AN_OWNED_KEY = """\
+write_triage:
+  future_map:
+    a: 1
+    # explanatory note about a
+  # a header note for t_high, which this writer owns
+  t_high: 0.11
+  t_low: 0.05
+  calibration_report_path: old/report.json
+"""
+
+# The end-of-body case: the same trailing interior comment with NOTHING after
+# it, where the ambiguity is between the nested value above and the block-level
+# operator prose `trailing` exists for.
+WITH_A_COMMENT_TRAILING_THE_LAST_NESTED_VALUE = """\
+write_triage:
+  t_high: 0.11
+  t_low: 0.05
+  calibration_report_path: old/report.json
+  future_map:
+    a: 1
+    # explanatory note about a
+"""
+
 WITH_A_BLANK_INSIDE_A_NESTED_VALUE = """\
 write_triage:
   future_map:
@@ -2047,6 +2089,55 @@ class TestWriteTriageConfigBlock:
         parsed = yaml.safe_load(_call(WITH_A_BLANK_INSIDE_A_NESTED_VALUE))['write_triage']
         assert parsed['future_map'] == {'a': 1, 'b': 2}
         assert parsed['another'] == 3
+
+    def test_a_comment_trailing_a_nested_value_is_not_severed_either(self) -> None:
+        """The narrower sibling of the severed-children defect.
+
+        An interior comment reached the next OWNED key with nothing after it
+        to carry it into `kept`, so the whole pending run was cleared and the
+        note vanished. Same class of hand-written-config loss as dropping
+        `b: 2`, just one line of it — and idempotent, so once dropped it stays
+        dropped with nothing to notice.
+        """
+        out = _call(WITH_A_COMMENT_TRAILING_A_NESTED_VALUE)
+        parsed = yaml.safe_load(out)['write_triage']
+        assert parsed['future_map'] == {'a': 1}
+        assert '    # explanatory note about a' in out.splitlines(), out
+        assert _call(out) == out, 'and it must survive a SECOND run'
+
+    def test_a_comment_run_splits_by_indent_between_the_value_and_the_next_key(
+        self,
+    ) -> None:
+        """The discriminator, asserted in both directions at once.
+
+        A run in this position is genuinely ambiguous — it either trails the
+        value above or heads the key below — and indent is what decides, the
+        same rule that decides child membership everywhere else in this
+        parser. Keeping the whole run would smuggle the fence-style header
+        comment of an owned key back in, which the rebuilt block then emits a
+        second copy of.
+        """
+        body = _block_lines(_call(WITH_A_MIXED_COMMENT_RUN_BEFORE_AN_OWNED_KEY))
+        assert '    # explanatory note about a' in body, body
+        assert '  # a header note for t_high, which this writer owns' not in body, body
+
+    def test_a_comment_trailing_the_LAST_nested_value_stays_with_its_value(
+        self,
+    ) -> None:
+        """End of body: interior to a preserved value, not block-level prose.
+
+        `trailing` re-emits its run BELOW the derived keys, so treating this
+        note as trailing would silently relocate it out of the value it
+        annotates and park it under the calibration fence.
+        """
+        out = _call(WITH_A_COMMENT_TRAILING_THE_LAST_NESTED_VALUE)
+        body = _block_lines(out)
+        assert '    # explanatory note about a' in body, body
+        assert body.index('    # explanatory note about a') > body.index('    a: 1')
+        assert body.index('    # explanatory note about a') < body.index(
+            '  # CALIBRATION OUTPUT — do not hand-edit.'
+        ), f'the note was relocated below the fence: {body!r}'
+        assert _call(out) == out, 'and it must survive a SECOND run'
 
     def test_a_trailing_comment_run_survives_and_stays_at_the_end(self) -> None:
         """Hand-written prose that belongs to no key is still operator content.
