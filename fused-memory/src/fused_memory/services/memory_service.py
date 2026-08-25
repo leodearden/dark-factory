@@ -3933,6 +3933,9 @@ class MemoryService:
                 which_end=finding.which_end, group_id=group_id,
             )
             moved = bool(result.get('moved'))
+            refreshed = await self._backstop_endpoint_summaries(
+                result, group_id=group_id,
+            ) if moved else ()
             repair_stats.repairs.append(ReferentRepair(
                 edge_uuid=finding.edge_uuid,
                 which_end=finding.which_end,
@@ -3952,9 +3955,77 @@ class MemoryService:
                 # inside the identity lock to sharpen a telemetry count.
                 minted=finding.new_endpoint_uuid is None,
                 moved=moved,
+                summaries_refreshed=refreshed,
             ))
 
         return repair_stats
+
+    async def _backstop_endpoint_summaries(
+        self, result: dict[str, Any], *, group_id: str
+    ) -> tuple[str, ...]:
+        """Step 3 of the repair sequence — a BACKSTOP, not a third unconditional call.
+
+        ``reassign_edge`` already refreshes the two AFFECTED endpoint summaries
+        after a real move (the OLD endpoint, which lost the edge, and the NEW
+        one, which gained it) — but per-node try/except that LOGS AND SWALLOWS,
+        reporting only what actually succeeded in ``refreshed_nodes``. That
+        leaves the two naive options both wrong:
+
+        * An unconditional third call DOUBLES the summary regeneration on the
+          ~100% happy path, inside the per-group identity lock where every
+          extra round-trip serializes same-group writes.
+        * Omitting step 3 entirely leaves the PRD's stated user-observable
+          signal — "the ``Task N±1`` summary no longer contains it" — silently
+          degradable whenever that swallowed exception fires.
+
+        Reading ``refreshed_nodes`` and re-refreshing only the REMAINDER is the
+        only formulation that makes the signal a guarantee at zero happy-path
+        cost: it is the primitive's own report of what it actually achieved,
+        and it is the only way to tell the two apart from out here.
+
+        Per-node try/except that logs and swallows a generic ``Exception``: the
+        topology move has ALREADY COMMITTED by the time this runs, so a failed
+        summary regeneration must never un-count the repair — that would report
+        zero repairs for an episode that performed one, the exact
+        silent-degradation shape INV-2 rules out.
+        ``CancelledError``/``KeyboardInterrupt``/``SystemExit`` propagate.
+
+        :meth:`GraphitiBackend.set_entity_summary` (task 2057) remains the
+        documented MANUAL escape hatch for a stale sentence still carried by a
+        genuinely VALID edge, and is deliberately never invoked from here:
+        overwriting a summary verbatim is not a decision a write-time pass may
+        take unattended.
+
+        Returns:
+            The union of what ``reassign_edge`` reported refreshing and what
+            this backstop then refreshed — what is true of the GRAPH, not what
+            was called.
+        """
+        already = list(result.get('refreshed_nodes') or ())
+        affected = [
+            result.get('old_endpoint_uuid'), result.get('new_endpoint_uuid'),
+        ]
+        refreshed = list(already)
+        for node_uuid in affected:
+            if not node_uuid or node_uuid in refreshed:
+                continue
+            try:
+                await self.graphiti.refresh_entity_summary(
+                    node_uuid, group_id=group_id,
+                )
+            except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                raise
+            except Exception:
+                logger.warning(
+                    'Referent repair: backstop summary refresh failed for node '
+                    '%s (edge %s); the endpoint move already committed and '
+                    'stands, but that node\'s summary may still name the '
+                    'referent the edge no longer hangs off',
+                    node_uuid, result.get('uuid'), exc_info=True,
+                )
+                continue
+            refreshed.append(node_uuid)
+        return tuple(refreshed)
     async def _reconcile_episode_identity(
         self, result: Any, *, group_id: str, referents: ReferentSet = (),
         content: str = '', referent_source: str = 'derived',
