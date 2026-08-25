@@ -22,8 +22,10 @@ them would let a FalkorDB outage read as a scanner regression.
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import json
+import logging
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -447,3 +449,141 @@ class TestTheRepairSequence:
         )
         assert_never_repaired(service)
         assert stats.repairs == []
+
+
+class TestTheRefreshBackstop:
+    """Step 3 is a CONDITIONAL backstop, not an unconditional third call.
+
+    `reassign_edge` already refreshes both AFFECTED endpoint summaries after a
+    real move — but per-node try/except that LOGS AND SWALLOWS, reporting only
+    what actually succeeded in `refreshed_nodes`.  So an unconditional third
+    call doubles the summary regeneration on the ~100% happy path (inside the
+    per-group identity lock, where every extra round-trip serializes same-group
+    writes), while omitting step 3 leaves the PRD's stated user-observable
+    signal — "the `Task N±1` summary no longer contains it" — silently
+    degradable whenever that swallowed exception fires.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_backstop_fires_for_both_endpoints_when_the_internal_refresh_failed(
+        self, service,
+    ):
+        """`refreshed_nodes == []` is reassign_edge reporting that its own
+        best-effort refresh was swallowed.  This is what makes the PRD's
+        observable signal a GUARANTEE rather than a best effort."""
+        service.graphiti.reassign_edge = AsyncMock(
+            return_value=_reassigned(refreshed_nodes=[]),
+        )
+
+        stats = await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory',
+        )
+
+        refreshed = {
+            c.args[0] for c in service.graphiti.refresh_entity_summary.await_args_list
+        }
+        assert refreshed == {'n-3129', 'n-3127'}
+        for call in service.graphiti.refresh_entity_summary.await_args_list:
+            assert call.kwargs == {'group_id': 'dark_factory'}
+        assert set(stats.repairs[0].summaries_refreshed) == {'n-3129', 'n-3127'}
+
+    @pytest.mark.asyncio
+    async def test_no_double_work_when_reassign_edge_already_refreshed_both(
+        self, service,
+    ):
+        """The happy path costs ZERO extra round-trips inside the identity
+        lock — and the record still reports both, because it says what is true
+        of the GRAPH, not what this method happened to call."""
+        service.graphiti.reassign_edge = AsyncMock(
+            return_value=_reassigned(refreshed_nodes=['n-3129', 'n-3127']),
+        )
+
+        stats = await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory',
+        )
+
+        service.graphiti.refresh_entity_summary.assert_not_awaited()
+        assert set(stats.repairs[0].summaries_refreshed) == {'n-3129', 'n-3127'}
+
+    @pytest.mark.asyncio
+    async def test_a_partial_internal_refresh_re_refreshes_only_the_remainder(
+        self, service,
+    ):
+        service.graphiti.reassign_edge = AsyncMock(
+            return_value=_reassigned(refreshed_nodes=['n-3127']),
+        )
+
+        stats = await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory',
+        )
+
+        service.graphiti.refresh_entity_summary.assert_awaited_once_with(
+            'n-3129', group_id='dark_factory',
+        )
+        assert set(stats.repairs[0].summaries_refreshed) == {'n-3129', 'n-3127'}
+
+    @pytest.mark.asyncio
+    async def test_the_inv3_no_op_arm_refreshes_nothing_and_is_not_a_repair(
+        self, service,
+    ):
+        """`moved=False` is `reassign_edge`'s own corroborate-before-acting
+        guard: the edge had ALREADY been repointed, so no summary can have
+        changed and no repair happened.  A corroborated no-op must not later
+        feed the storm streak."""
+        service.graphiti.reassign_edge = AsyncMock(
+            return_value=_reassigned(moved=False, refreshed_nodes=[]),
+        )
+
+        stats = await service._repair_episode_referents(
+            _stats(_finding()), group_id='dark_factory',
+        )
+
+        service.graphiti.refresh_entity_summary.assert_not_awaited()
+        assert stats.repairs[0].outcome == 'repaired'
+        assert stats.repairs[0].moved is False
+        assert stats.repairs[0].summaries_refreshed == ()
+        assert stats.repaired == 0
+
+    @pytest.mark.asyncio
+    async def test_a_failing_backstop_refresh_is_swallowed_and_the_repair_stands(
+        self, service, caplog,
+    ):
+        """The topology move ALREADY COMMITTED.  Un-counting it because the
+        cosmetic summary regeneration failed would report zero repairs for an
+        episode that performed one."""
+        service.graphiti.reassign_edge = AsyncMock(
+            return_value=_reassigned(refreshed_nodes=['n-3127']),
+        )
+        service.graphiti.refresh_entity_summary = AsyncMock(
+            side_effect=RuntimeError('falkor down'),
+        )
+
+        with caplog.at_level(logging.WARNING):
+            stats = await service._repair_episode_referents(
+                _stats(_finding()), group_id='dark_factory',
+            )
+
+        assert stats.repairs[0].outcome == 'repaired'
+        assert stats.repairs[0].moved is True
+        assert stats.repaired == 1
+        # Only what actually succeeded — the record never claims a refresh
+        # that raised.
+        assert stats.repairs[0].summaries_refreshed == ('n-3127',)
+        assert any('n-3129' in r.getMessage() for r in caplog.records)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'exc_type', [asyncio.CancelledError, KeyboardInterrupt, SystemExit],
+    )
+    async def test_the_backstop_never_swallows_cancellation(self, service, exc_type):
+        service.graphiti.reassign_edge = AsyncMock(
+            return_value=_reassigned(refreshed_nodes=[]),
+        )
+        service.graphiti.refresh_entity_summary = AsyncMock(
+            side_effect=exc_type('interrupted'),
+        )
+
+        with pytest.raises(exc_type):
+            await service._repair_episode_referents(
+                _stats(_finding()), group_id='dark_factory',
+            )
