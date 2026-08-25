@@ -887,3 +887,442 @@ class TestConvertToBlockedApplierEnforce:
         assert enforce_harness.scheduler.set_task_status.await_count == 1, (
             'a second write means the sweep is oscillating on its own output'
         )
+
+
+# ---------------------------------------------------------------------------
+# step-7 — `resolve_already_landed_branch` over REAL git fixtures
+#
+# This is the ENTRY half of the loop.  The gate that mints the pin is a
+# *history* gate, so testing it against mocked git would only prove that the
+# mock agrees with itself; every case below therefore stages a real repository
+# and lets real git answer.  The fixture triple and the `_RunSpy` delegating
+# wrapper are modelled on `test_merge_gates_plan_files_rename.py`, which
+# covers a sibling false-positive class of the SAME gate — per-file
+# duplication rather than promotion to conftest.py is the established
+# convention across ~60 test files here.
+#
+# `_RunSpy` is the one deviation from pure real-git, used for exactly the
+# property real git will not produce on demand: a non-zero rc from a chosen
+# subcommand, which is what proves the predicate fails CLOSED rather than
+# carving out on evidence it never measured.
+# ---------------------------------------------------------------------------
+
+import asyncio  # noqa: E402
+from collections.abc import Callable, Sequence  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+from orchestrator.config import GitConfig  # noqa: E402
+from orchestrator.git_ops import GitOps, _run  # noqa: E402
+
+
+@pytest.fixture
+def git_repo(tmp_path: Path) -> Path:
+    """A real temporary git repository with an initial commit on `main`."""
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    asyncio.run(_setup_repo(repo))
+    return repo
+
+
+async def _setup_repo(repo: Path) -> None:
+    await _run(['git', 'init', '-b', 'main'], cwd=repo)
+    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
+    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
+    (repo / 'README.md').write_text('# Test\n')
+    await _run(['git', 'add', '-A'], cwd=repo)
+    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
+
+
+@pytest.fixture
+def git_config() -> GitConfig:
+    return GitConfig(
+        main_branch='main',
+        branch_prefix='task/',
+        remote='origin',
+        worktree_dir='.worktrees',
+        # tmp repo, no real remote — disabling the push keeps the tests quiet.
+        push_after_advance=False,
+    )
+
+
+@pytest.fixture
+def git_ops(git_config: GitConfig, git_repo: Path) -> GitOps:
+    return GitOps(git_config, git_repo)
+
+
+async def _head_of(repo: Path) -> str:
+    rc, out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=repo)
+    assert rc == 0
+    return out.strip()
+
+
+async def _commit_on_main(
+    repo: Path, paths_content: dict[str, str], msg: str,
+) -> str:
+    """Write *paths_content* on main and commit it.  Returns the SHA."""
+    for rel, content in paths_content.items():
+        target = repo / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content)
+    await _run(['git', 'add', '-A'], cwd=repo)
+    rc, _, err = await _run(['git', 'commit', '-m', msg], cwd=repo)
+    assert rc == 0, f'commit on main failed: {err}'
+    return await _head_of(repo)
+
+
+async def _land_via_merge(
+    repo: Path,
+    branch: str,
+    paths_content: dict[str, str],
+    *,
+    main: str = 'main',
+    subject: str | None = None,
+) -> str:
+    """Commit *paths_content* on *branch*, then no-ff merge it into *main*.
+
+    The merge subject defaults to the canonical ``Merge <branch> into <main>``
+    that ``git_ops._merge_subject`` derives and ``find_merge_marker`` greps
+    for — writer and reader share one derivation in production, and this
+    helper reproduces that exact string so the probe under test is exercised
+    against the real format rather than a paraphrase.  Returns the merge SHA.
+    """
+    rc, _, err = await _run(['git', 'checkout', '-b', branch], cwd=repo)
+    assert rc == 0, err
+    for rel, content in paths_content.items():
+        target = repo / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content)
+    await _run(['git', 'add', '-A'], cwd=repo)
+    rc, _, err = await _run(
+        ['git', 'commit', '-m', f'impl: work for {branch}'], cwd=repo,
+    )
+    assert rc == 0, err
+    rc, _, err = await _run(['git', 'checkout', main], cwd=repo)
+    assert rc == 0, err
+    rc, _, err = await _run(
+        ['git', 'merge', '--no-ff', '-m', subject or f'Merge {branch} into {main}',
+         branch],
+        cwd=repo,
+    )
+    assert rc == 0, err
+    return await _head_of(repo)
+
+
+async def _reseed(repo: Path, branch: str, sha: str) -> None:
+    """Park *branch* on *sha* — the re-dispatch rebase's measured end state.
+
+    After a task's work merges, re-cutting ``task/<id>`` from post-landing
+    main drops every commit as already-upstream and leaves the ref sitting on
+    one of MAIN'S OWN commits at 0 commits ahead of its recorded base.  The
+    ref still EXISTS, which is precisely why the attribution probe must be
+    called with ``gate_on_existing_ref=False``.
+    """
+    rc, _, err = await _run(['git', 'branch', '-f', branch, sha], cwd=repo)
+    assert rc == 0, err
+
+
+class _RunSpy:
+    """Delegating wrapper around ``merge_gates._run`` that records every call.
+
+    Everything not matched by *fail_when* still runs through the real
+    ``_run``, so the repository work stays real; a matched command returns
+    ``(128, '', <fatal>)`` without being executed.  Copied in shape from
+    ``test_merge_gates_plan_files_rename.py``, which needs the same one
+    capability against the same gate.
+    """
+
+    def __init__(
+        self, fail_when: Callable[[Sequence[str]], bool] | None = None,
+    ) -> None:
+        self.calls: list[list[str]] = []
+        self._fail_when = fail_when
+
+    async def __call__(
+        self, cmd: list[str], cwd: Path | None = None, **kwargs,
+    ) -> tuple[int, str, str]:
+        self.calls.append(list(cmd))
+        if self._fail_when is not None and self._fail_when(cmd):
+            return 128, '', 'fatal: injected failure (test fault injection)\n'
+        return await _run(cmd, cwd, **kwargs)
+
+
+def _is_rev_list_count(cmd: Sequence[str]) -> bool:
+    """True for the predicate's ``git rev-list --count <base>..<head>`` probe."""
+    return list(cmd[:3]) == ['git', 'rev-list', '--count']
+
+
+async def _resolve(plan_files, base, head, git_ops, *, task_id, branch):
+    """Thin call-through to the step-8 predicate.
+
+    The import is LOCAL on purpose.  At step 7 the predicate does not exist
+    yet; a module-level import would turn every already-green step-1/3/5 test
+    in this file into a collection ERROR, which is a far worse RED signal than
+    a failing new class.  Keeping it local means the RED is exactly the eight
+    cases below and nothing else.
+    """
+    from orchestrator.merge_gates import resolve_already_landed_branch
+
+    return await resolve_already_landed_branch(
+        plan_files, base, head, git_ops, task_id=task_id, branch=branch,
+    )
+
+
+@pytest.mark.asyncio
+class TestResolveAlreadyLandedBranch:
+    """The already-landed predicate: THREE independent signals, fail closed.
+
+    The carve-out excuses an empty ``base..HEAD`` range only when the work it
+    was supposed to deliver is demonstrably already ON MAIN.  Requiring all
+    three of (empty range, attribution, coverage) is what keeps it from
+    becoming a blanket amnesty for genuine under-delivery — each negative case
+    below removes exactly one signal and asserts the predicate declines.
+    """
+
+    # --- vocabulary ---------------------------------------------------------
+
+    async def test_the_reason_prefix_is_distinct_from_the_one_it_replaces(
+        self,
+    ) -> None:
+        """The carve-out needs its OWN prefix, or workflow-side routing that
+        keys on ``PLAN_FILES_NOT_TOUCHED_REASON_PREFIX`` would still send this
+        shape to a human."""
+        from orchestrator.merge_gates import (
+            ALREADY_LANDED_REASON_PREFIX,
+            CROSS_REPO_DELIVERABLE_REASON_PREFIX,
+            PLAN_FILES_NOT_TOUCHED_REASON_PREFIX,
+        )
+
+        assert ALREADY_LANDED_REASON_PREFIX
+        assert not ALREADY_LANDED_REASON_PREFIX.startswith(
+            PLAN_FILES_NOT_TOUCHED_REASON_PREFIX,
+        )
+        assert not PLAN_FILES_NOT_TOUCHED_REASON_PREFIX.startswith(
+            ALREADY_LANDED_REASON_PREFIX,
+        )
+        assert ALREADY_LANDED_REASON_PREFIX != CROSS_REPO_DELIVERABLE_REASON_PREFIX
+
+    # --- (1) POSITIVE — merge marker ---------------------------------------
+
+    async def test_a_merge_marker_landing_with_an_empty_range_carves_out(
+        self, git_repo: Path, git_ops: GitOps,
+    ) -> None:
+        """The headline shape, staged end to end.
+
+        The task's declared files merge into main under the canonical subject;
+        an unrelated commit then lands; the re-dispatched branch is re-cut
+        from that later main tip and is 0 commits ahead of its recorded base.
+        Today's gate reads that empty range and emits the exact inverse of the
+        truth.  The predicate must read the three real signals instead.
+
+        Both attribution signals are present here (the branch commit's own
+        subject cites ``task/900`` too), which makes the ``mechanism``
+        assertion a pin on the probe ORDER: the merge marker is the stronger,
+        branch-keyed evidence and must win.
+        """
+        plan_files = ['src/pkg/alpha.py', 'docs/alpha.md']
+        merge_sha = await _land_via_merge(
+            git_repo, 'task/900',
+            {f: f'# {f}\n' for f in plan_files},
+        )
+        parked = await _commit_on_main(
+            git_repo, {'unrelated.md': 'x\n'}, 'chore: unrelated later work',
+        )
+        await _reseed(git_repo, 'task/900', parked)
+
+        result = await _resolve(
+            plan_files, parked, parked, git_ops,
+            task_id='900', branch='task/900',
+        )
+
+        assert result is not None, 'the landing is on main and measurable'
+        assert result.landed_sha == merge_sha
+        assert result.mechanism == 'merge_marker'
+        assert sorted(result.matched_files) == sorted(plan_files)
+
+    # --- (2) NEGATIVE — the range is not empty ------------------------------
+
+    async def test_a_branch_with_real_commits_is_never_excused(
+        self, git_repo: Path, git_ops: GitOps,
+    ) -> None:
+        """The signal that keeps this from excusing genuine under-delivery.
+
+        The marker EXISTS and the declared files ARE on main — but the branch
+        also carries a real commit of its own, so this is not the
+        empty-because-already-upstream shape; it is a branch that did work and
+        missed the declared files.  That is exactly what
+        ``plan_files_not_touched`` is FOR, so the predicate must decline and
+        let the unchanged path run.
+        """
+        plan_files = ['src/pkg/alpha.py']
+        await _land_via_merge(
+            git_repo, 'task/900', {f: f'# {f}\n' for f in plan_files},
+        )
+        base = await _head_of(git_repo)
+        await _reseed(git_repo, 'task/900', base)
+
+        rc, _, err = await _run(['git', 'checkout', 'task/900'], cwd=git_repo)
+        assert rc == 0, err
+        head = await _commit_on_main(
+            git_repo, {'src/pkg/beta.py': 'x\n'}, 'impl: something else',
+        )
+        await _run(['git', 'checkout', 'main'], cwd=git_repo)
+
+        assert await _resolve(
+            plan_files, base, head, git_ops,
+            task_id='900', branch='task/900',
+        ) is None
+
+    # --- (3) TRAP 1 — the coalesce-train member -----------------------------
+
+    async def test_a_task_citation_covers_a_train_member_with_no_marker(
+        self, git_repo: Path, git_ops: GitOps,
+    ) -> None:
+        """A non-tip coalesce-train member lands with NO per-task marker.
+
+        Live specimen: task 4104 inside train ``coalesce-4181-b2a290cd`` at
+        ``d25b24468c`` — the TRAIN gets a merge subject, its members do not.
+        The member's own commits are still on main carrying task-id subjects,
+        so the citation probe is the required second attribution signal;
+        without it every train member below the tip is false-negatived and
+        keeps feeding the loop.
+        """
+        plan_files = ['src/pkg/gamma.py']
+        landed = await _commit_on_main(
+            git_repo, {f: f'# {f}\n' for f in plan_files},
+            'impl(901): deliver the declared files inside a coalesce train',
+        )
+        await _reseed(git_repo, 'task/901', landed)
+
+        result = await _resolve(
+            plan_files, landed, landed, git_ops,
+            task_id='901', branch='task/901',
+        )
+
+        assert result is not None
+        assert result.landed_sha == landed
+        assert result.mechanism == 'task_citation'
+        assert sorted(result.matched_files) == sorted(plan_files)
+
+    # --- (4) TRAP 2 — the invisible rebase landing --------------------------
+
+    async def test_a_rebase_landing_with_no_provenance_fails_closed(
+        self, git_repo: Path, git_ops: GitOps,
+    ) -> None:
+        """KNOWN LIMITATION, asserted rather than silently accepted.
+
+        Specimen: task 3916, whose work is genuinely on main but reachable
+        only by ``git cherry`` patch-id equivalence — no merge commit, no
+        task-id citation in any subject.  A grep-based predicate cannot see
+        it, so it must fall through to the UNCHANGED ``plan_files_not_touched``
+        path rather than guess.  This test exists so the limitation stays
+        visible in the suite instead of living only in a docstring.
+        """
+        plan_files = ['src/pkg/delta.py']
+        landed = await _commit_on_main(
+            git_repo, {f: f'# {f}\n' for f in plan_files},
+            'land the files by rebase, provenance lost',
+        )
+        await _reseed(git_repo, 'task/903', landed)
+
+        assert await _resolve(
+            plan_files, landed, landed, git_ops,
+            task_id='903', branch='task/903',
+        ) is None, (
+            'a landing with no merge marker and no task-id citation is '
+            'invisible to a grep-based predicate and must fail CLOSED'
+        )
+
+    # --- (5) PARTIAL landing ------------------------------------------------
+
+    async def test_a_partial_earlier_landing_cannot_excuse_a_later_empty_one(
+        self, git_repo: Path, git_ops: GitOps,
+    ) -> None:
+        """Attribution alone is not enough — coverage is the third signal.
+
+        A task that landed a PARTIAL increment, was re-dispatched for the
+        rest, and delivered nothing this time has a marker AND an empty range.
+        Excusing it on attribution alone would let real non-delivery through,
+        so every declared entry must appear in the landing's own touched set.
+        """
+        plan_files = ['src/pkg/alpha.py', 'src/pkg/never_landed.py']
+        await _land_via_merge(
+            git_repo, 'task/904', {'src/pkg/alpha.py': '# alpha\n'},
+        )
+        parked = await _head_of(git_repo)
+        await _reseed(git_repo, 'task/904', parked)
+
+        assert await _resolve(
+            plan_files, parked, parked, git_ops,
+            task_id='904', branch='task/904',
+        ) is None
+
+    # --- (6) directory plan entry -------------------------------------------
+
+    async def test_a_declared_directory_is_satisfied_by_a_file_beneath_it(
+        self, git_repo: Path, git_ops: GitOps,
+    ) -> None:
+        """Coverage must use the gate's OWN arm-(b) prefix semantics.
+
+        ``_check_plan_files_touched_in_branch`` accepts a declared directory
+        when a touched path sits beneath it.  If the carve-out compared only
+        exact paths it would decline for every directory-declaring task and
+        leave that whole population in the loop.
+        """
+        plan_files = ['src/pkg']
+        await _land_via_merge(
+            git_repo, 'task/905', {'src/pkg/mod.py': '# mod\n'},
+        )
+        parked = await _head_of(git_repo)
+        await _reseed(git_repo, 'task/905', parked)
+
+        result = await _resolve(
+            plan_files, parked, parked, git_ops,
+            task_id='905', branch='task/905',
+        )
+
+        assert result is not None
+        assert result.matched_files == ['src/pkg']
+
+    # --- (7) fail closed on a git error -------------------------------------
+
+    async def test_an_unmeasurable_range_never_carves_out(
+        self, git_repo: Path, git_ops: GitOps, monkeypatch,
+    ) -> None:
+        """No carve-out on evidence we did not measure.
+
+        The whole point of the empty-range signal is that it SEPARATES
+        already-upstream from genuine non-delivery.  If the probe cannot
+        answer, the separation was never made, so the predicate must decline
+        exactly as if the range were non-empty.
+        """
+        plan_files = ['src/pkg/alpha.py']
+        await _land_via_merge(
+            git_repo, 'task/906', {f: f'# {f}\n' for f in plan_files},
+        )
+        parked = await _head_of(git_repo)
+        await _reseed(git_repo, 'task/906', parked)
+
+        spy = _RunSpy(fail_when=_is_rev_list_count)
+        monkeypatch.setattr('orchestrator.merge_gates._run', spy)
+
+        assert await _resolve(
+            plan_files, parked, parked, git_ops,
+            task_id='906', branch='task/906',
+        ) is None
+        assert any(_is_rev_list_count(c) for c in spy.calls), (
+            'the range probe must actually have been attempted'
+        )
+
+    # --- (8) nothing declared ------------------------------------------------
+
+    async def test_no_declared_plan_files_is_not_an_already_landed_branch(
+        self, git_repo: Path, git_ops: GitOps,
+    ) -> None:
+        """With nothing declared there is nothing to have landed — and the
+        gate this carve-out sits inside never fires for an empty
+        ``plan_files`` either, so a truthy answer here would be reachable
+        only by a future caller wiring it up wrong."""
+        parked = await _head_of(git_repo)
+        assert await _resolve(
+            [], parked, parked, git_ops, task_id='907', branch='task/907',
+        ) is None
