@@ -469,3 +469,75 @@ fixture stems (`reify_task_12`, `reify_task_27`, `df_task_18`), which pass both
 axes of `scripts/run_fable_trial_v2_campaign.py::filter_campaign_results` and
 would silently contaminate the calibration. This campaign's cells were
 snapshotted to an isolated directory by modification time before re-analysis.
+
+## Errata — added 2026-08-25 at γ2 ruling time (esc-3634-1)
+
+γ2's ruling was preceded by a four-agent re-derivation of this report from
+**primary data** rather than from its prose: the 45 raw γ1 cells (located at
+`orchestrator/src/orchestrator/evals/results/`, selected by mtime — a 25.4-day
+gap separates them from every other file in that shared store, so the cut is not
+boundary-sensitive), the three v1 dumps merged under the supersede rule in
+`data/eval-campaign/run_resume_phase.sh`, and the 42 committed fixtures. The
+banding table was reproduced by importing and calling this campaign's own
+`partition_bands`, not by reimplementing it.
+
+**Almost everything reproduced digit-for-digit** — total spend $359.8646, the
+band partition and all seven discard names, Q_ceiling's six anchor statistics,
+planRate 0.7381, the no-plan turn list, the +0.0810 inflation, cap-excluded
+$26.6359, the 1.2744 fable ratio and the 1.3849 high→max step. The v1
+reconstruction check is also **non-vacuous**: base-only (unmerged) yields a
+headline lead of −0.1381 instead of +0.0600, so the merge genuinely
+discriminates. Five corrections follow. None changes the ruling; ζ should carry
+them.
+
+1. **§Headline, "budget exhaustions (`cost_usd >= 15`) — 0 — max observed
+   $11.38".** `reify_task_2908` has `cost_usd = $15.579`. The substantive claim
+   holds — `cost_usd` includes judge cost and that cell's architect spend was
+   $14.74, so no cell exhausted its architect budget — but the predicate as
+   written is false, and $11.38 is the maximum over *no-plan* cells, not the
+   maximum observed ($15.58).
+
+2. **§Step 1, the base-only counterfactual.** It attributes the Q_ceiling shift
+   to the reify fixtures being scored 0.0; those fixtures are excluded from the
+   anchor anyway (no reference). The actual cause is `df_task_2430_adv_plan`
+   trial 3, cap-starved to `plan_quality` 0.625, which drags the base-only anchor
+   mean to 0.8550. Right conclusion, wrong mechanism.
+
+3. **§Step 2, "the only validly-referenced v1 fixtures that exist".** True only
+   under D6's dump-scoped reading. **14 non-adversarial fixtures carried a
+   `reference` block at the v1 run tip**, with 19 `architect-opus-max` cells in
+   the packaged results dir from 2026-07-20/27/28. A non-adversarial anchor was
+   available at zero extra spend and was never weighed. It yields Q ≈ 0.84 → 11
+   discarded — the *lossy* direction — which is why surfacing it does not change
+   the ruling, but it should have been considered.
+
+4. **§Sensitivity, "moves only 31→35 across the plausible range (0.84–0.89), so
+   `Q_ceiling` is not the lever".** The window 0.84–0.89 is the **second-steepest**
+   0.05 window in the whole range (+4 fixtures; 0.89–0.94 moves +7), not a flat
+   one — everything *below* 0.84 is flatter. The prose also narrows "the
+   plausible range" so as to exclude the 0.94 row of its own table. The
+   conclusion survives on a better argument: the entire threshold lever spans
+   only 15 discard-eligible fixtures / **$875** across its full range, against
+   ~$1,400 for the reference-minting and band-rescope levers. Also note
+   `df_task_2169` scores **exactly 0.89** and is therefore discarded at Q=0.890
+   on a `>=` at precisely the anchor mean.
+
+5. **Two cost labels.** "$359.86" (§⚠️) and "$345" (§⚠️, two paragraphs later)
+   are inconsistent by ~4%; $359.86 is the reproducible figure. And **$8.57/cell
+   is not the cost of an admissible cell** — it is total spend *including the
+   $26.64 that bought no measurement* ÷ 42 admissible cells. The marginal
+   admissible cost is **$7.93**, and the retained-set mean is **$7.67** because
+   the retained set skews toward the cheap no-plan band (no-plan cells measured
+   **$3.53** each against $9.50 for planned cells). Using the blended rate
+   therefore **over**-prices the no-plan-band-only option: it is **$320–565** of
+   real cells, not ~$640.
+
+**One further caveat for ζ, load-bearing and not stated above.** Regimes (b) and
+(c) are **not derivable from this report's published inputs**. Both rest on an
+implied fable-at-$25 cell cost of ~$14.67 that appears nowhere in the text and
+follows from nothing measured — the PRD says "lifted (**e.g.** $25)", an
+illustrative figure, and no fable $/turn exists anywhere (the v1 dumps carry no
+turn field at all). On this report's own stated inputs a fable cell costs $10.92,
+below both the $15 and $25 caps, so lifting the cap would change nothing and (b)
+would equal (a). Only regime (a) and the no-plan-band figure are reconstructible
+from published inputs.
