@@ -50,6 +50,7 @@ test_merge_queue_deep_dispatch.py:1-36):
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
 from typing import Literal
 
@@ -1743,3 +1744,618 @@ class TestContendedLeaseDeferInheritance:
         assert not s['reqs']['103'].result.done()
         for tid in ('101', '102'):
             assert s['reqs'][tid].result.result().status == 'done'
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# step-9 RED — head-verify cancellation with a clean verify-lease release
+#
+# PRD decision #3 ("tip pass is authoritative for the whole prefix") in its
+# sharpest form: slot 1's head I0 is the trust anchor verified against REAL
+# main, and its merge commit is the base the speculative slot-2 item was
+# stacked on — so the green tip's cumulative tree CONTAINS I0's tree.  δ
+# therefore lands I0 on the TIP's authority and cancels its in-flight verify
+# rather than waiting for (or obeying) a verdict about a subset it already
+# has better evidence for.  Two boundary rows fall out:
+#
+#   * "Head-fail + tip-pass" — head verify red (flake), tip green ⇒ the FULL
+#     prefix lands, head verify cancelled.  A red head resolves no
+#     MergeOutcome('blocked'): it is not a verdict δ is entitled to act on.
+#   * "Lease released on head-cancel" — 3071's oracle
+#     (`warm-lane-lock-guard.sh check`) must read the `_merge-verify` lane
+#     IDLE within one round.  BOTH BUSY axes are asserted here, because they
+#     are independent and only one of them is what 3071 measures:
+#       (a) the kernel flock on `<worktree_base>/_merge-verify.lock`, read via
+#           the STRICT reader so an unreadable /proc/locks fails loudly rather
+#           than letting a negative assertion pass vacuously (task 3604, the
+#           `lane_is_free` precedent at test_lane_lock_leak_guard.py:496);
+#       (b) the FIXED-key holder-pgid rendezvous, which
+#           `reset_persistent_merge_worktree` reads FAIL-CLOSED — a leaked
+#           entry there raises MergeVerifyLeaseHeld and wedges the warm lane.
+#
+# A LOCAL head is clean by construction: cancelling its task unwinds
+# `GitOps.merge_verify_lease`'s finally (git_ops.py:3549-3554), which removes
+# the holder pgid AND releases the flock.  A REMOTE head is NOT: the abort
+# goes ssh -> `orchestrator cancel-verify` -> `cancel_request` -> SIGKILL,
+# which skips cli.py's own finally (:620-623) and leaks the rendezvous file —
+# the hazard verify_cancel.py:303-336 documents.  δ closes that by having
+# `cli.py cancel_verify` clear the fixed key on its rc==0 path.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+async def _merge_commit_onto(
+    repo: Path, branch: str, base_sha: str, label: str,
+) -> str:
+    """A REAL ``--no-ff`` merge commit of *branch* onto *base_sha*.
+
+    The speculative-stacking twin of :func:`_merge_commit_off_main`: slot 2's
+    item is merged onto the HEAD's merge commit, not onto main, which is
+    exactly what makes the head's tree a subset of the chain tip's.
+    """
+    await _run(['git', 'checkout', '-b', f'_tmp-{label}', base_sha], cwd=repo)
+    await _run(['git', 'merge', '--no-ff', '-m', f'merge {branch}', branch], cwd=repo)
+    sha = await _rev_parse(repo)
+    await _run(['git', 'checkout', 'main'], cwd=repo)
+    return sha
+
+
+def _remote_lease(order: list[str] | None = None):
+    """A REMOTE :class:`HostLease` whose ``cancel_verify`` records its ordinal.
+
+    The remote axis is the one with an ORDER contract: `_abort_remote_verify`
+    must fire while `_inflight_request_id` is still live, i.e. BEFORE
+    `verify_task.cancel()` — otherwise the verify coroutine's own finally has
+    already cleared the id and the cancel RPC is a silent no-op that orphans a
+    remote verify-merge process (merge_queue.py:17178-17186).
+    """
+    from unittest.mock import AsyncMock, MagicMock
+
+    from orchestrator.verify_runner import HostLease
+
+    runner = MagicMock()
+    runner.name = 'remote-head'
+    runner.is_local = False
+
+    async def _cancel_verify():
+        if order is not None:
+            order.append('abort')
+        return 0
+
+    runner.cancel_verify = AsyncMock(side_effect=_cancel_verify)
+    runner.probe_clean = AsyncMock(return_value=True)
+    return HostLease(name='remote-head', runner=runner, is_local=False)
+
+
+def _head_verify_task(
+    order: list[str] | None = None,
+    *,
+    lease_ctx=None,
+    started: asyncio.Event | None = None,
+):
+    """A live head verify task that never finishes on its own.
+
+    *lease_ctx*, when given, is an async context manager entered for the whole
+    (never-ending) span — used to hold the REAL ``merge_verify_lease`` so the
+    lane-idle assertions measure a genuinely-held lane rather than an empty one.
+    """
+    async def _body():
+        try:
+            if lease_ctx is None:
+                if started is not None:
+                    started.set()
+                await asyncio.Event().wait()
+            else:
+                async with lease_ctx:
+                    if started is not None:
+                        started.set()
+                    await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            if order is not None:
+                order.append('cancelled')
+            raise
+        return None
+
+    return asyncio.get_running_loop().create_task(_body())
+
+
+async def _head_and_prefix_scene(
+    git_repo: Path, tmp_path: Path, monkeypatch, *,
+    db_name: str = 'delta-head.db',
+    head_lease=None,
+    head_task_factory=None,
+    head_popped_for_finalize: bool = False,
+) -> dict:
+    """A REAL two-slot scene: head I0 at slot 1, deep chain at slot 2.
+
+    Distinct from :func:`_prefix_scene_upto_finalize`, which has no head at
+    all — there the chain's dispatching item CASes against real main.  Here the
+    topology is production's:
+
+        main ← I0 (head, non-speculative, base = real main)
+                 ← I1 (speculative, base = I0's merge commit, carries the chain)
+                    ← I2 … Ik (links, built on I1's merge commit)
+
+    which is what makes the head's tree a SUBSET of the tip's and its landing
+    on the tip's authority sound.  The head is appended through the real
+    ``_inflight_append`` chokepoint so it is genuinely registered at VERIFYING
+    and genuinely visible to ``_finalizing_head_entry`` / ``_inflight[0]``.
+    """
+    from orchestrator.event_store import EventStore
+    from orchestrator.merge_queue import enqueue_merge_request
+    from orchestrator.merge_types import InflightEntry, ItemLifecycleState
+
+    git_ops = _make_git_ops(git_repo, size=2)
+    config = _make_config(git_repo, chain_cap=6)
+    await _create_branch_editing(git_repo, 'task/100', 'h.txt', 'edit-100\n')
+    await _create_branch_editing(git_repo, 'task/101', 'a.txt', 'edit-101\n')
+    await _create_branch_editing(
+        git_repo, 'task/102', 'shared.txt', _shared_txt_with(5, 'from-102'),
+    )
+    await _create_branch_editing(git_repo, 'task/103', 'c.txt', 'edit-103\n')
+    await _create_branch_editing(git_repo, 'task/104', 'd.txt', 'edit-104\n')
+    await _create_branch_editing(
+        git_repo, 'task/105', 'shared.txt', _shared_txt_with(5, 'from-105'),
+    )
+    main_sha = await _rev_parse(git_repo, 'main')
+    head_mc = await _merge_commit_off_main(git_repo, 'task/100', '100')
+    spec_mc = await _merge_commit_onto(git_repo, 'task/101', head_mc, '101')
+
+    db_path = tmp_path / db_name
+    store = EventStore(db_path, 'run-delta-head')
+    worker = _make_worker(git_ops)
+    worker._event_store = store
+
+    reqs: dict[str, MergeRequest] = {}
+    for tid in ('100', '101', *_DELTA_LINKS, _DELTA_TRUNCATOR):
+        reqs[tid] = _make_req(tid, tid, config, git_repo)
+        await enqueue_merge_request(worker._queue, reqs[tid], store)
+    worker._drain_queue_into_lanes()
+    assert worker._pop_next_pickable() is reqs['100']
+    assert worker._pop_next_pickable() is reqs['101']
+
+    head_item = RealMergeItem(
+        request=reqs['100'],
+        merge_result=MergeResult(
+            success=True, merge_commit=head_mc,
+            merge_worktree=_ephemeral_merge_wt(git_ops, 'head'),
+        ),
+        merge_wt=_ephemeral_merge_wt(git_ops, 'head'),
+        base_sha=main_sha,          # slot 1 CASes against REAL main
+        speculative=False,          # the trust anchor — never chained
+    )
+    spec_item = RealMergeItem(
+        request=reqs['101'],
+        merge_result=MergeResult(
+            success=True, merge_commit=spec_mc,
+            merge_worktree=_ephemeral_merge_wt(git_ops, 'spec'),
+        ),
+        merge_wt=_ephemeral_merge_wt(git_ops, 'spec'),
+        base_sha=head_mc,           # stacked on the head's merge commit
+        speculative=True,
+    )
+
+    head_lease = head_lease if head_lease is not None else _local_lease()
+    head_task = (
+        head_task_factory(git_ops) if head_task_factory is not None
+        else _head_verify_task()
+    )
+    head_entry = InflightEntry(
+        item=head_item, lease=head_lease, verify_task=head_task,  # type: ignore[arg-type]
+        merge_wt=head_item.merge_wt, was_speculative=False,
+    )
+    worker._note_transition(
+        reqs['100'].request_id, ItemLifecycleState.MERGING,
+        ItemLifecycleState.DISPATCHING, live_obj=head_item,
+    )
+    worker._inflight_append(head_entry)
+    if head_popped_for_finalize:
+        # The FINALIZE-HEAD window: `_finalize_inflight` popped the entry off
+        # the deque before its long `await entry.verify_task`, so the head is
+        # visible only through `_finalizing_head_entry()` and `_inflight[0]`
+        # would be the SECOND entry (merge_queue.py:13504-13508).
+        worker._inflight_popleft()
+
+    chain = await worker._deep_chain_placement(spec_item)
+    assert chain is not None
+    assert [tid for tid, _ in chain.links] == list(_DELTA_LINKS)
+    assert chain.truncated_at == _DELTA_TRUNCATOR
+
+    _spy_post_merge_verify(monkeypatch, outcome=None)   # GREEN tip
+    _spy_chain_lane_release(monkeypatch)
+    adv = _spy_advance_main(git_ops, monkeypatch)
+
+    return {
+        'git_ops': git_ops, 'worker': worker, 'chain': chain, 'reqs': reqs,
+        'head_mc': head_mc, 'spec_mc': spec_mc, 'main_sha': main_sha,
+        'adv': adv, 'db_path': db_path, 'repo': git_repo,
+        'head_entry': head_entry, 'head_item': head_item,
+        'head_task': head_task, 'spec_item': spec_item,
+    }
+
+
+async def _adopt_and_land(s: dict) -> dict:
+    """Run the adopting exit, then finalize head-then-spec in deque order.
+
+    That order is the deque's, not a choice this helper makes: the head was
+    appended first, so FINALIZE-HEAD reaches it first — which is exactly what
+    makes the spec item's ``expected_main`` (= the head's merge commit) correct
+    without any coordination.
+    """
+    from orchestrator.merge_types import InflightEntry
+
+    worker = s['worker']
+    res = await worker._run_inflight_verify(
+        s['spec_item'], _local_lease(), chain=s['chain'],
+    )
+    s['verify_result'] = res
+    # BOUNDED, and the bound is part of the contract: the head's verify never
+    # completes on its own in these scenes, so a δ that failed to tear it down
+    # would leave `_finalize_inflight` parked on `await entry.verify_task`
+    # FOREVER — the whole queue behind it stalled on a verdict it no longer
+    # needs.  Expressing that as a timeout makes the failure a fast, legible
+    # RED instead of a hung suite.
+    s['head_advanced'] = await asyncio.wait_for(
+        worker._finalize_inflight(s['head_entry']), timeout=60,
+    )
+    spec_done: asyncio.Future = asyncio.get_running_loop().create_future()
+    spec_done.set_result(res)
+    spec_entry = InflightEntry(
+        item=s['spec_item'], lease=_local_lease(), verify_task=spec_done,  # type: ignore[arg-type]
+        merge_wt=res.merge_wt, was_speculative=True, chain=s['chain'],
+    )
+    s['spec_entry'] = spec_entry
+    s['spec_advanced'] = await worker._finalize_inflight(spec_entry)
+    await asyncio.sleep(0)  # let every `_on_finalized` done-callback run
+    return s
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(180)
+class TestHeadCancelOnAdoption:
+    """(a)-(c) The head is torn down through the chokepoint and lands FIRST."""
+
+    async def test_the_head_verify_is_torn_down_through_the_chokepoint(
+        self, git_repo: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """(a) `_teardown_verify_task` then `_cancel_and_release_tracked`.
+
+        Hand-rolling `verify_task.cancel()` / `_abort_remote_verify` here would
+        be caught by the AST ratchet
+        (test_merge_queue_concurrent_verify.py::TestVerifyTeardownChokepoint),
+        so the assertion is that δ went through the SANCTIONED pair, in the
+        order the head-failure-cascade template uses, and cleared `entry.lease`
+        afterwards so nothing double-releases.
+        """
+        s = await _head_and_prefix_scene(
+            git_repo, tmp_path, monkeypatch, db_name='delta-head-teardown.db',
+        )
+        worker = s['worker']
+        calls: list[str] = []
+        _real_td = worker._teardown_verify_task
+        _real_cr = worker._cancel_and_release_tracked
+
+        async def _td(lease, verify_task, task_id, **kw):
+            calls.append(f'teardown:{task_id}')
+            return await _real_td(lease, verify_task, task_id, **kw)
+
+        async def _cr(lease):
+            calls.append(f'cancel_release:{getattr(lease, "name", None)}')
+            return await _real_cr(lease)
+
+        monkeypatch.setattr(worker, '_teardown_verify_task', _td)
+        monkeypatch.setattr(worker, '_cancel_and_release_tracked', _cr)
+
+        await worker._run_inflight_verify(
+            s['spec_item'], _local_lease(), chain=s['chain'],
+        )
+
+        assert calls == ['teardown:100', 'cancel_release:local'], calls
+        assert s['head_task'].done(), 'the head verify task must be reaped'
+        assert s['head_entry'].lease is None, (
+            'entry.lease must be cleared after the release so no later path '
+            'double-releases it'
+        )
+
+    async def test_the_remote_abort_precedes_the_cancel(
+        self, git_repo: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """(a) ORDER IS LOAD-BEARING: abort, THEN cancel.
+
+        The verify coroutine's finally clears `_inflight_request_id` on
+        cancellation, which turns a later `cancel_verify()` into a silent no-op
+        and orphans the remote verify-merge process.  Observed directly by
+        recording both sides into one list.
+        """
+        order: list[str] = []
+        s = await _head_and_prefix_scene(
+            git_repo, tmp_path, monkeypatch, db_name='delta-head-order.db',
+            head_lease=_remote_lease(order),
+            head_task_factory=lambda _go: _head_verify_task(order),
+        )
+
+        await s['worker']._run_inflight_verify(
+            s['spec_item'], _local_lease(), chain=s['chain'],
+        )
+
+        assert order == ['abort', 'cancelled'], order
+
+    async def test_the_finalizing_head_is_found_when_it_is_off_the_deque(
+        self, git_repo: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """(a) The COMMON topology: the head is already mid-finalize.
+
+        `_finalize_inflight` pops its entry BEFORE the long
+        `await entry.verify_task`, so during that window the head is invisible
+        to `_inflight[0]` and reachable only via `_finalizing_head_entry()`
+        (merge_queue.py:10265).  A δ that only looked at the deque would silently
+        skip the cancel in exactly the case that matters most.
+        """
+        s = await _head_and_prefix_scene(
+            git_repo, tmp_path, monkeypatch, db_name='delta-head-offdeque.db',
+            head_popped_for_finalize=True,
+        )
+        worker = s['worker']
+        assert worker._finalizing_head_entry() is s['head_entry']
+
+        await worker._run_inflight_verify(
+            s['spec_item'], _local_lease(), chain=s['chain'],
+        )
+
+        assert s['head_task'].cancelled(), (
+            'the finalizing head\'s verify must be cancelled too'
+        )
+        assert s['head_entry'].lease is None
+
+    async def test_the_head_lands_first_and_main_history_stays_linear(
+        self, git_repo: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """(b) I0 → I1 → I2… in ONE linear first-parent chain on main.
+
+        The head lands on the TIP's authority (its own verdict never arrived),
+        and it lands FIRST — which is the only reason the spec item's
+        `expected_main` (= the head's merge commit) matches.
+        """
+        s = await _adopt_and_land(await _head_and_prefix_scene(
+            git_repo, tmp_path, monkeypatch, db_name='delta-head-lands.db',
+        ))
+        link_shas = [mc for _tid, mc in s['chain'].links]
+
+        assert s['head_advanced'] is True
+        assert s['spec_advanced'] is True
+        assert [c[0] for c in s['adv']] == [
+            s['head_mc'], s['spec_mc'], *link_shas,
+        ]
+        assert [c[1] for c in s['adv']] == [
+            s['main_sha'], s['head_mc'], s['spec_mc'], *link_shas[:-1],
+        ]
+        assert await _rev_parse(s['repo'], 'main') == s['chain'].tip
+        assert s['reqs']['100'].result.result().status == 'done'
+        rows = _finalized_rows(s['db_path'])
+        by_task = {r['task_id']: r for r in rows}
+        assert by_task['100']['state'] == 'done'
+
+    async def test_the_head_landing_is_not_attributed_to_the_chain(
+        self, git_repo: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """(b) The head is I0, NOT a chain link — the canary must not count it.
+
+        `landed_via_chain` sums to items-landed-per-deep-verify
+        (scripts/merge-deep-canary-predicate.sh:89-91).  The head carries no
+        chain of its own, so stamping it would inflate that ratio by one on
+        every deep round for an item the walk never touched.
+        """
+        s = await _adopt_and_land(await _head_and_prefix_scene(
+            git_repo, tmp_path, monkeypatch, db_name='delta-head-canary.db',
+        ))
+        by_task = {r['task_id']: r for r in _finalized_rows(s['db_path'])}
+
+        assert by_task['100']['landed_via_chain'] is None
+        for tid in ('101', *_DELTA_LINKS):
+            assert by_task[tid]['landed_via_chain'] == 1
+
+    async def test_a_red_head_verdict_does_not_block_the_prefix(
+        self, git_repo: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """(c) HEAD-FAIL + TIP-PASS — the PRD boundary row, verbatim.
+
+        A head verify that already came back RED is a verdict about a SUBSET
+        tree that the green tip has strictly better evidence for; acting on it
+        would fail an item the tip just proved good and would strand the whole
+        prefix behind it.  So the red verdict resolves NO
+        MergeOutcome('blocked') and the full prefix still lands.
+        """
+        from orchestrator.merge_types import InflightVerifyResult, MergeOutcome
+
+        def _red_task(_git_ops):
+            async def _body():
+                return InflightVerifyResult(
+                    outcome=MergeOutcome('blocked', reason='head verify red (flake)'),
+                    merge_wt=None,
+                    spec_warm=False,
+                )
+            return asyncio.get_running_loop().create_task(_body())
+
+        s = await _head_and_prefix_scene(
+            git_repo, tmp_path, monkeypatch, db_name='delta-head-red.db',
+            head_task_factory=_red_task,
+        )
+        await asyncio.sleep(0)  # let the red verdict actually land
+        assert s['head_task'].done()
+        s = await _adopt_and_land(s)
+
+        head_outcome = s['reqs']['100'].result.result()
+        assert head_outcome.status == 'done', (
+            f'a red head verdict must not survive a green tip; got {head_outcome!r}'
+        )
+        assert await _rev_parse(s['repo'], 'main') == s['chain'].tip
+        for tid in ('101', *_DELTA_LINKS):
+            assert s['reqs'][tid].result.result().status == 'done'
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(180)
+class TestHeadCancelLeavesTheLaneIdle:
+    """(d) BOTH BUSY axes read IDLE after the cancel — 3071's precondition."""
+
+    async def test_both_lease_axes_are_free_after_a_local_head_cancel(
+        self, git_repo: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """The flock axis AND the fixed-key rendezvous axis, independently.
+
+        A LOCAL head is clean BY CONSTRUCTION — cancelling its task unwinds
+        `GitOps.merge_verify_lease`'s finally, which does BOTH releases — but
+        "by construction" is exactly the kind of claim that rots silently, and
+        3071's admission guard reads the lane BUSY and defers the FLEET if it
+        is wrong.  Held for real, then measured for real.
+        """
+        from orchestrator.verify_cancel import (
+            lane_lock_holder_pids_strict,
+            lane_lock_path,
+            read_lock_holder_pgid,
+        )
+
+        started = asyncio.Event()
+
+        def _leased_task(git_ops):
+            # The scene hands its own GitOps to the factory, so the head's
+            # verify holds the SAME `_merge-verify` lane lock a real local
+            # verify would — no module-attribute patching needed.
+            return _head_verify_task(
+                lease_ctx=git_ops.merge_verify_lease(), started=started,
+            )
+
+        s = await _head_and_prefix_scene(
+            git_repo, tmp_path, monkeypatch, db_name='delta-head-lease.db',
+            head_task_factory=_leased_task,
+        )
+        git_ops = s['git_ops']
+        await asyncio.wait_for(started.wait(), timeout=30)
+        lock_path = lane_lock_path(git_ops.persistent_merge_worktree_path)
+        # Staging check: the lane really IS busy on both axes before δ acts,
+        # so the post-cancel assertions cannot pass vacuously.
+        assert git_ops._merge_verify_lease_active() is True
+        assert os.getpid() in lane_lock_holder_pids_strict(lock_path)
+
+        await s['worker']._run_inflight_verify(
+            s['spec_item'], _local_lease(), chain=s['chain'],
+        )
+
+        assert read_lock_holder_pgid(git_ops.worktree_base) is None, (
+            'the fixed-key holder rendezvous must be cleared — '
+            'reset_persistent_merge_worktree reads it FAIL-CLOSED'
+        )
+        assert git_ops._merge_verify_lease_active() is False
+        assert lane_lock_holder_pids_strict(lock_path) == [], (
+            'the kernel flock axis must be free — this is the ONLY axis '
+            'warm-lane-lock-guard.sh measures'
+        )
+        # And the fail-closed consumer agrees: no MergeVerifyLeaseHeld.
+        assert await git_ops.reset_persistent_merge_worktree() is not None
+
+
+class TestRemoteCancelClearsTheHolderRendezvous:
+    """(e) `cancel-verify` closes the merge-worker-initiated leak.
+
+    Sync class, deliberately: pytest-asyncio is STRICT here and a sync
+    ``test_*`` inside an ``@pytest.mark.asyncio`` class is an ERROR.
+    """
+
+    def test_cancel_verify_clears_the_fixed_key_holder_file(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """`cancel_request`'s SIGKILL skips cli.py's finally — so the CLI must.
+
+        verify_cancel.py:303-336 records the consequence: the FIXED-key holder
+        file is what `_merge_verify_lease_active` probes with `killpg(pgid, 0)`,
+        and a leaked (or pid-recycled) entry there reads as a LIVE holder and
+        fails CLOSED — a wedged warm lane, bounded only by the next run that
+        happens to overwrite it.  δ cancels REMOTE head verifies through this
+        exact command, so it must leave the rendezvous clean.
+        """
+        from unittest.mock import MagicMock
+
+        from click.testing import CliRunner
+
+        from orchestrator import cli as cli_module
+        from orchestrator.cli import main
+        from orchestrator.config import OrchestratorConfig
+        from orchestrator.verify_cancel import (
+            pgid_file,
+            read_lock_holder_pgid,
+            write_lock_holder_pgid,
+        )
+
+        worktree_base = tmp_path / '.worktrees'
+        worktree_base.mkdir()
+        write_lock_holder_pgid(worktree_base, os.getpgrp())
+        assert read_lock_holder_pgid(worktree_base) == os.getpgrp()
+
+        monkeypatch.setattr(
+            cli_module, 'load_config',
+            lambda _: OrchestratorConfig(project_root=tmp_path),
+        )
+        mock_git_ops = MagicMock()
+        mock_git_ops.worktree_base = worktree_base
+        monkeypatch.setattr(
+            'orchestrator.git_ops.GitOps', MagicMock(return_value=mock_git_ops),
+        )
+        cfg_file = tmp_path / 'config.yaml'
+        cfg_file.write_text('')
+
+        r = CliRunner().invoke(main, [
+            'cancel-verify', '--request-id', 'delta-head-req',
+            '--config', str(cfg_file),
+        ])
+
+        assert r.exit_code == 0, r.output
+        assert read_lock_holder_pgid(worktree_base) is None, (
+            'cancel-verify must clear the fixed-key holder rendezvous the '
+            'SIGKILLed verify-merge could not clear itself'
+        )
+        assert not pgid_file(worktree_base, '_merge_verify_lock_holder').exists()
+
+    def test_cancel_verify_leaves_the_rendezvous_alone_when_the_kill_failed(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """A non-zero rc means a LIVE process refused SIGKILL — it still holds.
+
+        Clearing the rendezvous then would tell `_merge_verify_lease_active`
+        the lane is free while a live verify still owns it, converting a
+        visible retry-or-escalate into a silent unprotected overlap.  Same
+        fail-closed reasoning as the retained per-request pgid file.
+        """
+        from unittest.mock import MagicMock
+
+        from click.testing import CliRunner
+
+        from orchestrator import cli as cli_module
+        from orchestrator.cli import main
+        from orchestrator.config import OrchestratorConfig
+        from orchestrator.verify_cancel import (
+            read_lock_holder_pgid,
+            write_lock_holder_pgid,
+        )
+
+        worktree_base = tmp_path / '.worktrees'
+        worktree_base.mkdir()
+        write_lock_holder_pgid(worktree_base, os.getpgrp())
+
+        monkeypatch.setattr(
+            cli_module, 'load_config',
+            lambda _: OrchestratorConfig(project_root=tmp_path),
+        )
+        mock_git_ops = MagicMock()
+        mock_git_ops.worktree_base = worktree_base
+        monkeypatch.setattr(
+            'orchestrator.git_ops.GitOps', MagicMock(return_value=mock_git_ops),
+        )
+        monkeypatch.setattr(cli_module, 'cancel_request', lambda *a, **k: 3)
+        cfg_file = tmp_path / 'config.yaml'
+        cfg_file.write_text('')
+
+        r = CliRunner().invoke(main, [
+            'cancel-verify', '--request-id', 'delta-head-req',
+            '--config', str(cfg_file),
+        ])
+
+        assert r.exit_code == 3
+        assert read_lock_holder_pgid(worktree_base) == os.getpgrp()
