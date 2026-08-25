@@ -667,6 +667,14 @@ recovery_emission:
   # The narrower kill switch: the only part of the mechanism that WRITES to the
   # escalation queue.  Turn this off to keep the telemetry and silence the L1.
   streak_escalation_enabled: true
+  # Task 4647 -- the landing-detector storm escape.  git_error is the one
+  # landing reason whose REPETITION means the detector is broken rather than
+  # the task being unlanded, and a broken detector is silent by construction:
+  # every verdict it produces rejects.  STRICT exceedance of this trailing-hour
+  # rate files ONE blocking L1 against a synthetic sentinel.  Same narrow
+  # kill-switch discipline as streak_escalation_enabled above.
+  landing_git_error_rate_per_hour: 10
+  landing_git_error_escalation_enabled: true
 
 # Autonomous dry-run unblock hook
 unblock_auto:

@@ -49,6 +49,21 @@ escalate-vs-revert action, which differs per site (the dispatch gate returns
 a bool, the sweep reverts to pending, the coalesce re-drive calls
 ``redrive_member``).
 
+**THE ONE CARVE-OUT, and it is narrow on purpose** (task 4647): the G7 storm
+escape — :class:`LandingTally` and
+:func:`file_landing_git_error_storm_escalation` — DOES write to the escalation
+queue.  It is a claim about DETECTOR HEALTH, never about a task: it still
+never marks a task done, never changes any task's status, and never mutates
+git.  It is filed against a synthetic sentinel id rather than a real task
+precisely so it cannot be read as a hold on one, which is what keeps the
+promise above intact for task state.  The carve-out exists because a landing
+detector fails SILENTLY by construction — every verdict a broken one produces
+rejects, so an unreadable repo is indistinguishable from a repo with nothing
+landed in it — and a purity rule that forbids saying so buys purity by
+guaranteeing the failure goes unnoticed.  It is rate-gated, deduped and
+kill-switched (``recovery_emission.landing_git_error_escalation_enabled``) so
+the write stays one alarm per storm.
+
 **Two modes**, selected by whether ``candidate_sha`` is given:
 
 - **DISCOVERY** (``candidate_sha=None``) — the branch ref is live: discover
@@ -107,25 +122,35 @@ delegate to — the two differ only in the ``agent_role`` they pass.
 
 from __future__ import annotations
 
+import collections
 import enum
 import logging
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeGuard
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from escalation.queue import EscalationQueue
 
+    from orchestrator.config import RecoveryEmissionConfig
     from orchestrator.git_ops import GitOps
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    'LANDING_GIT_ERROR_STORM_CATEGORY',
+    'LANDING_GIT_ERROR_STORM_SENTINEL',
+    'LANDING_TALLY',
     'LandingEvidenceVerdict',
     'LandingMethod',
     'LandingReason',
+    'LandingTally',
     'LandingVerdict',
     'branch_is_degenerate',
     'branch_work_landed',
+    'file_landing_git_error_storm_escalation',
     'file_unattributed_landing_escalation',
     'format_unattributed_landing_detail',
     'is_valid_sha_40',
@@ -214,6 +239,200 @@ class LandingMethod(enum.StrEnum):
     #: build).  The default, so existing four-keyword constructions are
     #: unchanged.
     unspecified = 'unspecified'
+
+
+#: Category used for BOTH the storm filing and its ``has_open_l1`` dedup
+#: filter.  Its OWN category, deliberately NOT ``'provenance_unattributed'``:
+#: category scoping is load-bearing after the task-4105 incident (see
+#: :func:`file_unattributed_landing_escalation`), and a detector-health alarm
+#: sharing a category with a provenance defect would let each silently
+#: suppress the other.
+LANDING_GIT_ERROR_STORM_CATEGORY = 'landing_detector_git_error'
+
+#: The SYNTHETIC task id the storm alarm is filed against.
+#:
+#: Never a real task id, for two reasons.  A storm spans every task the sweep
+#: touched, so any single id would be arbitrary — the alarm is a claim about
+#: the DETECTOR, not about one task's work.  And an open L1 on a real task is
+#: read by the recovery predicates as a hold, so filing there would deepen the
+#: very strand the alarm reports.  Same shape and same reasoning as
+#: ``recovery_emission.RECOVERY_VETO_STREAK_SENTINEL_PREFIX``.
+LANDING_GIT_ERROR_STORM_SENTINEL = '__landing_git_error_storm__'
+
+#: agent_role stamped on the storm alarm.
+_GIT_ERROR_STORM_ROLE = 'orchestrator-landing-evidence'
+
+
+class LandingTally:
+    """A monotonic per-reason count of the verdicts this module has produced.
+
+    **Why a counter at all.** ``git_error`` is the one landing reason whose
+    REPETITION means the DETECTOR is broken rather than the task being
+    unlanded, and a broken detector is SILENT BY CONSTRUCTION: every verdict
+    it produces rejects, so a repo whose git is unreadable looks exactly like
+    a repo with nothing landed in it.  Nothing downstream can tell those apart
+    from a single verdict — only the RATE can.  This is the object that makes
+    that rate observable, and :func:`file_landing_git_error_storm_escalation`
+    is the escape hatch it feeds.
+
+    **Two different questions, deliberately kept apart.**
+
+    - :meth:`snapshot` answers "what has this detector said, ever".  It is
+      MONOTONIC: no count ever decreases, so an operator reading it late still
+      sees what happened early.
+    - :meth:`git_error_count_in_window` answers "is it failing RIGHT NOW".  It
+      slides, because a latched alarm that never clears is one that gets
+      ignored rather than fixed.
+
+    Collapsing the two would break whichever question lost.
+
+    The count is keyed from the :class:`LandingReason` ENUM rather than from a
+    literal list, so a reason added to the vocabulary is tallied the day it
+    ships.  A reason that is not a member is dropped LOUDLY (a WARNING) rather
+    than silently widening the keyspace — the closed keyspace is what lets a
+    reader trust that a zero row means "never happened" rather than "never
+    counted".
+
+    **Deliberately NOT thread-safe.**  The orchestrator runs a single event
+    loop and every caller of this module is awaited on it, so a lock here
+    would buy nothing and would only add a way for the counter to deadlock a
+    recovery sweep.  If a second loop ever charges it, the counts drift by at
+    most the interleaved increments — a telemetry inaccuracy, never a wrong
+    verdict, because nothing reads the tally to DECIDE a landing.
+    """
+
+    #: The trailing span the ``git_error`` rate is measured over.  One hour,
+    #: matching the ``landing_git_error_rate_per_hour`` config leaf's units.
+    DEFAULT_WINDOW_SECS = 3600.0
+
+    #: Hard cap on retained stamps, so a pathological storm cannot grow the
+    #: deque without bound between trims.  Far above any threshold an operator
+    #: would set; it exists as a memory backstop, not as a policy.
+    DEFAULT_MAX_STAMPS = 4096
+
+    def __init__(
+        self,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+        window_secs: float = DEFAULT_WINDOW_SECS,
+        max_stamps: int = DEFAULT_MAX_STAMPS,
+    ) -> None:
+        #: Injectable so the window can be driven deterministically in tests.
+        #: ``time.monotonic`` and not ``time.time``: an NTP step backwards
+        #: would otherwise appear as a burst of stamps inside the window.
+        self._clock = clock
+        self.window_secs = window_secs
+        self._counts: collections.Counter[LandingReason] = collections.Counter(
+            dict.fromkeys(LandingReason, 0),
+        )
+        self._git_error_stamps: collections.deque[float] = collections.deque(
+            maxlen=max_stamps,
+        )
+
+    def record(self, reason: LandingReason) -> None:
+        """Charge one verdict.  Called for EVERY verdict, accepted or not."""
+        try:
+            key = LandingReason(reason)
+        except ValueError:
+            logger.warning(
+                'landing tally: unrecognised reason %r was not counted; the '
+                'tally keyspace is closed over LandingReason by design',
+                reason,
+            )
+            return
+        self._counts[key] += 1
+        if key is LandingReason.git_error:
+            self._git_error_stamps.append(self._clock())
+            self._trim()
+
+    def _trim(self) -> None:
+        cutoff = self._clock() - self.window_secs
+        while self._git_error_stamps and self._git_error_stamps[0] <= cutoff:
+            self._git_error_stamps.popleft()
+
+    def git_error_count_in_window(self) -> int:
+        """How many ``git_error`` verdicts fall in the trailing window."""
+        self._trim()
+        return len(self._git_error_stamps)
+
+    def snapshot(self) -> dict[LandingReason, int]:
+        """A COPY of the cumulative per-reason counts.
+
+        A copy so a caller that mutates what it got back — an escalation body
+        builder, say — cannot corrupt the counter it is describing.
+        """
+        return dict(self._counts)
+
+    def render(self) -> str:
+        """One grep-friendly line, every reason present including the zeros.
+
+        Fixed shape on purpose: a row that disappears when its count is zero
+        makes ``grep`` answer "no such reason" and "never happened"
+        identically.
+        """
+        return ' '.join(f'{reason}={self._counts[reason]}' for reason in LandingReason)
+
+
+#: The process-lifetime tally every :func:`branch_work_landed` verdict charges.
+#:
+#: Module-level rather than per-call because the question it answers — "is this
+#: detector failing repeatedly?" — is not a property of any one call.  Tests
+#: replace this attribute with a fresh instance for isolation.
+LANDING_TALLY = LandingTally()
+
+
+def _resolve_recovery_emission(
+    recovery_emission: RecoveryEmissionConfig | None,
+) -> RecoveryEmissionConfig:
+    """The caller's live config submodel, or the shipped defaults.
+
+    Lazily imported so this module stays importable without pulling in the
+    config stack, and constructed from ``RecoveryEmissionConfig`` rather than
+    from local literals so the thresholds have exactly ONE authority.  A
+    second copy of ``10`` here would drift from the stanza the operator edits.
+    """
+    if recovery_emission is not None:
+        return recovery_emission
+    from orchestrator.config import RecoveryEmissionConfig as _Config  # noqa: PLC0415
+
+    return _Config()
+
+
+def _observe_landing_verdict(
+    verdict: LandingVerdict,
+    *,
+    escalation_queue: EscalationQueue | None = None,
+    recovery_emission: RecoveryEmissionConfig | None = None,
+) -> None:
+    """Tally, log, and rate-gate the storm alarm for one verdict.
+
+    Wholly best-effort: :func:`branch_work_landed` promises never to raise, and
+    an alarm that cannot be recorded must not be allowed to destroy the verdict
+    it was describing.  A recovery sweep that dies because its own telemetry
+    failed stops recovering every OTHER task in the same pass.
+    """
+    try:
+        tally = LANDING_TALLY
+        tally.record(verdict.reason)
+        # Logged EVERY pass, at INFO: a counter nobody can read without a
+        # dashboard is a second silence layered on the first.
+        logger.info('landing tally (cumulative, per reason): %s', tally.render())
+        if verdict.reason is not LandingReason.git_error:
+            return
+        config = _resolve_recovery_emission(recovery_emission)
+        if not config.landing_git_error_escalation_enabled:
+            return
+        file_landing_git_error_storm_escalation(
+            escalation_queue,
+            tally=tally,
+            rate_per_hour=config.landing_git_error_rate_per_hour,
+        )
+    except Exception:
+        logger.warning(
+            'landing tally/storm-escape failed (non-fatal); the verdict is '
+            'unaffected',
+            exc_info=True,
+        )
 
 
 def is_valid_sha_40(s: object) -> TypeGuard[str]:
@@ -829,6 +1048,7 @@ async def branch_work_landed(
     branch_tip_sha: str | None,
     metadata: dict[str, Any] | None = None,
     escalation_queue: EscalationQueue | None = None,
+    recovery_emission: RecoveryEmissionConfig | None = None,
 ) -> LandingVerdict:
     """Has *branch*'s work landed on main, by PATCH-ID equivalence?
 
@@ -1006,11 +1226,17 @@ async def branch_work_landed(
             ``branch_base_sha``, which the sketched four-argument form cannot
             supply.  Consumed by the degenerate-branch guard.
         escalation_queue: The queue the ``git_error`` storm-escape L1 is filed
-            on.  STAGING, and named so it cannot go permanent: the tally and
-            its rate-gated escalation are wired by a later step of this task,
-            so a call passing this today changes nothing.  ``None`` means "no
-            queue available", which must stay a supported shape — every
-            verdict this function returns is correct without one.
+            on (see :func:`file_landing_git_error_storm_escalation`).
+            ``None`` means "no queue available", which is a SUPPORTED shape
+            and not a degraded one — every verdict this function returns is
+            correct without one; a missing queue costs the storm alarm and
+            nothing else.
+        recovery_emission: The live ``config.recovery_emission`` submodel,
+            supplying the storm gate's rate and kill switch.  Pass the
+            OrchestratorConfig's own submodel (a reference, not a copy) so the
+            green-tier hot-reload of those leaves takes effect without a
+            restart.  ``None`` falls back to the shipped defaults, which is
+            what the bare-harness construction sites want.
 
     Returns:
         A :class:`LandingVerdict` with ``method`` set to
@@ -1030,19 +1256,30 @@ async def branch_work_landed(
         'method': LandingMethod.patch_id,
     }
 
+    def _finish(verdict: LandingVerdict) -> LandingVerdict:
+        # EVERY exit routes through here — including the except-clause reject
+        # below — so the tally can never under-count the reason that matters
+        # most.  Wholly best-effort inside; it can never break the verdict.
+        _observe_landing_verdict(
+            verdict,
+            escalation_queue=escalation_queue,
+            recovery_emission=recovery_emission,
+        )
+        return verdict
+
     def _reject(reason: LandingReason) -> LandingVerdict:
         probe['reason'] = reason
-        return LandingVerdict(
+        return _finish(LandingVerdict(
             accepted=False, evidence_sha=None, reason=reason,
             probe=dict(probe), method=LandingMethod.patch_id,
-        )
+        ))
 
     def _accept(evidence_sha: str) -> LandingVerdict:
         probe['reason'] = LandingReason.landed
-        return LandingVerdict(
+        return _finish(LandingVerdict(
             accepted=True, evidence_sha=evidence_sha, reason=LandingReason.landed,
             probe=dict(probe), method=LandingMethod.patch_id,
-        )
+        ))
 
     try:
         head = branch_tip_sha
@@ -1796,3 +2033,148 @@ def file_unattributed_landing_escalation(
             '(branch %s) — continuing without it',
             task_id, branch, exc_info=True,
         )
+
+
+def file_landing_git_error_storm_escalation(
+    escalation_queue: EscalationQueue | None,
+    *,
+    tally: LandingTally,
+    rate_per_hour: int,
+    agent_role: str = _GIT_ERROR_STORM_ROLE,
+) -> bool:
+    """Best-effort, rate-gated, dedup-guarded L1 for a ``git_error`` STORM.
+
+    The G7 storm escape (task 4647).  ``git_error`` is a FAIL-SOFT
+    DEGRADATION: one of them is a transient — a repo lock, a ref that lost a
+    race — and says nothing about any task.  A STREAM of them says the
+    detector itself is broken, and a broken landing detector is silent by
+    construction, because every verdict it produces rejects and a rejecting
+    detector is indistinguishable from a repo with nothing landed in it.  This
+    is the one thing that makes that silence audible.
+
+    **Strict exceedance.**  The configured rate is quiet; only ``> rate`` in
+    the trailing window files.  That keeps the shipped default a ceiling an
+    operator can reason about rather than a fence they trip over.
+
+    **Exactly one alarm per storm.**  The dedup is ``has_open_l1`` under
+    :data:`LANDING_GIT_ERROR_STORM_CATEGORY`, so re-observing the same storm
+    on the next sweep re-files nothing.  One L1 per verdict would BE the storm
+    this function exists to report.
+
+    **Category-scoped, never a bare id.**  ``category=None`` matches ANY open
+    L1, so an unrelated escalation would silently suppress this filing and a
+    broken detector would hide behind whatever else happened to be open — the
+    task-4105 two-way blindfold documented at
+    :func:`file_unattributed_landing_escalation`.  Do not widen it.
+
+    **Filed against a synthetic sentinel**, never a real task — see
+    :data:`LANDING_GIT_ERROR_STORM_SENTINEL` for why filing it against a task
+    would deepen the very strand it reports.
+
+    Best-effort in the same sense as its sibling filer: a ``None`` queue is a
+    supported shape (bare-harness and bare-worker unit tests construct exactly
+    that), and any failure to build or submit the alarm is logged and
+    swallowed.  Every verdict the producer returns is correct without it.
+
+    Args:
+        escalation_queue: The caller's ``EscalationQueue``, or ``None``.
+        tally: The :class:`LandingTally` whose window and counts are reported.
+        rate_per_hour: ``recovery_emission.landing_git_error_rate_per_hour``.
+        agent_role: The filing role stamped on the alarm.
+
+    Returns:
+        True iff an escalation was actually submitted.  Reported rather than
+        merely applied so a caller (and a test) can tell "suppressed by the
+        dedup" from "below the rate" from "filed".
+    """
+    observed = tally.git_error_count_in_window()
+    if observed <= rate_per_hour:
+        return False
+    if not escalation_queue:
+        return False
+    try:
+        if escalation_queue.has_open_l1(
+            LANDING_GIT_ERROR_STORM_SENTINEL,
+            category=LANDING_GIT_ERROR_STORM_CATEGORY,
+        ):
+            return False
+        from escalation.models import Escalation  # noqa: PLC0415
+
+        window_hours = tally.window_secs / 3600.0
+        summary = (
+            f'Landing detector produced {observed} git_error verdicts in the '
+            f'trailing {window_hours:.0f} hour (threshold {rate_per_hour}) — '
+            'THE DETECTOR IS BROKEN, not the tasks unlanded'
+        )
+        detail = (
+            f'Observed git_error verdicts: {observed}\n'
+            f'Window: the trailing {window_hours:.0f} hour '
+            f'({tally.window_secs:.0f}s)\n'
+            f'Threshold (strict exceedance): {rate_per_hour} per hour '
+            '(recovery_emission.landing_git_error_rate_per_hour)\n'
+            f'Cumulative tally by reason: {tally.render()}\n'
+            '\n'
+            'WHAT THIS IS NOT: these are NOT not_landed verdicts.  '
+            'not_landed is a claim ABOUT A TASK — its work is not on main, so '
+            'dispatch it.  git_error is a claim about the DETECTOR — it could '
+            'not look, and says nothing whatsoever about any task.  Do not '
+            'read the rejections above as "these tasks never landed"; that '
+            'inference, made by a human or by code, is the exact defect the '
+            'landed-not-done-recovery PRD exists to prevent.\n'
+            '\n'
+            'WHY IT MATTERS: a repo lock, a corrupt object or an unresolvable '
+            'ref reading as "not landed" re-dispatches tasks whose work is '
+            'already on main, and keeps re-dispatching them, because '
+            're-running the check does not fix whatever broke it.  While this '
+            'holds, every landing verdict from this detector should be treated '
+            'as unknown rather than negative.\n'
+            '\n'
+            'WHERE TO LOOK: the failing stage is named per verdict in '
+            "probe['git_error_stage'] — resolve_branch_sha, no_op_baseline, "
+            'net_diff_is_empty, patch_id_containment or unexpected_exception '
+            "(the last also carries probe['exception']).  Grep the "
+            "orchestrator log for 'landing tally' to see the per-reason "
+            'counts over time.\n'
+            '\n'
+            f'This alarm is filed against a SYNTHETIC sentinel task id '
+            f'({LANDING_GIT_ERROR_STORM_SENTINEL}), never against a real '
+            'task: a storm spans every task the sweep touched, and an open L1 '
+            'on a real task is read by the recovery predicates as a hold, so '
+            'filing it there would deepen the very strand it reports.'
+        )
+        esc = Escalation(
+            id=escalation_queue.make_id(LANDING_GIT_ERROR_STORM_SENTINEL),
+            task_id=LANDING_GIT_ERROR_STORM_SENTINEL,
+            agent_role=agent_role,
+            severity='blocking',
+            category=LANDING_GIT_ERROR_STORM_CATEGORY,
+            summary=summary,
+            detail=detail,
+            suggested_action=(
+                'Investigate git health in project_root and the task '
+                'worktrees (index locks, corrupt objects, unresolvable refs) '
+                'before acting on ANY recent landing verdict.  If the storm '
+                'is understood and the alarm is the noisy part, retune or '
+                'silence it live via the green-tier config leaves '
+                'recovery_emission.{landing_git_error_rate_per_hour,'
+                'landing_git_error_escalation_enabled} — no fleet restart '
+                'needed.'
+            ),
+            level=1,
+        )
+        escalation_queue.submit(esc)
+    except Exception:
+        logger.warning(
+            'Failed to file %s escalation for the landing detector '
+            '(%d git_error verdicts observed) — continuing without it',
+            LANDING_GIT_ERROR_STORM_CATEGORY, observed, exc_info=True,
+        )
+        return False
+    logger.warning(
+        'Filed %s escalation %s — %d git_error landing verdicts in the '
+        'trailing %.0fs (threshold %d/hour); the DETECTOR is broken, not the '
+        'tasks unlanded',
+        LANDING_GIT_ERROR_STORM_CATEGORY, esc.id, observed,
+        tally.window_secs, rate_per_hour,
+    )
+    return True
