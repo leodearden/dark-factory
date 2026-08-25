@@ -5388,6 +5388,7 @@ class Harness:
                 ),
                 suggested_action='manual_intervention',
                 level=1,
+                filing_claimant_run_id=self._filing_claimant_run_id,
             )
             self._escalation_queue.submit(esc)
             self._escalation_queue.resolve(
@@ -5606,6 +5607,7 @@ class Harness:
             ),
             suggested_action='manual_intervention',
             level=2,
+            filing_claimant_run_id=self._filing_claimant_run_id,
         )
         self._escalation_queue.submit(esc)
         if self.event_store is not None:
@@ -6263,6 +6265,7 @@ class Harness:
                     ),
                     suggested_action='manual_intervention',
                     level=1,
+                    filing_claimant_run_id=self._filing_claimant_run_id,
                 )
                 self._escalation_queue.submit(esc)
                 if self.event_store:
@@ -6732,6 +6735,7 @@ class Harness:
                 f'be failing.'
             ),
             suggested_action='investigate_persistence_layer_rejection',
+            filing_claimant_run_id=self._filing_claimant_run_id,
         )
         self._escalation_queue.submit(esc)
 
@@ -6852,6 +6856,7 @@ class Harness:
                     f'loop and raises only for non-transient rejections.'
                 ),
                 suggested_action='investigate_persistence_layer_rejection',
+                filing_claimant_run_id=self._filing_claimant_run_id,
             )
             queue.submit(esc)
             try:
@@ -7070,6 +7075,7 @@ class Harness:
                     'this escalation.'
                 ),
                 level=1,
+                filing_claimant_run_id=self._filing_claimant_run_id,
             )
             self._escalation_queue.submit(esc)
             # Cleared only on a successful file: while dedup suppresses, the
@@ -7153,6 +7159,7 @@ class Harness:
                     '_resolve_pool_storage_absent_escalation().'
                 ),
                 level=1,
+                filing_claimant_run_id=self._filing_claimant_run_id,
             )
             self._escalation_queue.submit(esc)
             logger.warning('Filed L1 pool-storage-absent escalation %s', esc.id)
@@ -7227,6 +7234,7 @@ class Harness:
                     'fixed.'
                 ),
                 level=1,
+                filing_claimant_run_id=self._filing_claimant_run_id,
             )
             self._escalation_queue.submit(esc)
             logger.warning('Filed L1 session-resume fallback-storm escalation %s', esc.id)
@@ -7314,6 +7322,7 @@ class Harness:
                 ),
                 suggested_action='investigate_and_resume_scheduler',
                 level=1,
+                filing_claimant_run_id=self._filing_claimant_run_id,
             )
             self._escalation_queue.submit(esc)
             logger.warning('Filed L1 scheduler-pause escalation %s', esc.id)
@@ -7385,6 +7394,7 @@ class Harness:
             detail=detail,
             suggested_action='manual_intervention',
             level=1,
+            filing_claimant_run_id=self._filing_claimant_run_id,
         )
         self._escalation_queue.submit(esc)
         logger.warning(
@@ -7467,6 +7477,7 @@ class Harness:
             detail=detail,
             suggested_action='manual_intervention',
             level=2,
+            filing_claimant_run_id=self._filing_claimant_run_id,
         )
         self._escalation_queue.submit(esc)
         logger.warning(
@@ -7531,6 +7542,7 @@ class Harness:
             detail=detail,
             suggested_action='manual_investigation',
             level=0,
+            filing_claimant_run_id=self._filing_claimant_run_id,
         )
         self._escalation_queue.submit(esc)
         logger.info(
@@ -7630,6 +7642,7 @@ class Harness:
                 detail=detail,
                 suggested_action='Run reify/scripts/ensure-warm-base.sh',
                 level=0,
+                filing_claimant_run_id=self._filing_claimant_run_id,
             )
             self._escalation_queue.submit(esc)
             logger.warning(
@@ -7679,6 +7692,7 @@ class Harness:
                 detail=detail,
                 suggested_action='Run reify/scripts/ensure-warm-base.sh',
                 level=2,
+                filing_claimant_run_id=self._filing_claimant_run_id,
             )
             self._escalation_queue.submit(esc)
             logger.warning(
@@ -7793,6 +7807,7 @@ class Harness:
                 ),
                 suggested_action='manual_investigation',
                 level=0,
+                filing_claimant_run_id=self._filing_claimant_run_id,
             )
             self._escalation_queue.submit(esc)
             logger.info(
@@ -8254,6 +8269,7 @@ class Harness:
             detail=detail,
             suggested_action='manual_intervention',
             level=1,
+            filing_claimant_run_id=self._filing_claimant_run_id,
         )
         self._escalation_queue.submit(esc)
         logger.warning(
@@ -8330,6 +8346,7 @@ class Harness:
             detail=detail,
             suggested_action='manual_intervention',
             level=1,
+            filing_claimant_run_id=self._filing_claimant_run_id,
         )
         self._escalation_queue.submit(esc)
         logger.warning(
@@ -8594,6 +8611,7 @@ class Harness:
                     'autonomous triage.'
                 ),
                 suggested_action='investigate_watcher_supervisor',
+                filing_claimant_run_id=self._filing_claimant_run_id,
             )
             queue.submit(esc)
             logger.warning(
@@ -8732,6 +8750,7 @@ class Harness:
                 suggested_action=(
                     'Commit or stash the dirty files listed above in project_root.'
                 ),
+                filing_claimant_run_id=self._filing_claimant_run_id,
             )
         self._escalation_queue.submit(esc)
 
@@ -8831,6 +8850,7 @@ class Harness:
                 summary=summary,
                 detail=detail,
                 suggested_action='fix_unknown_config_keys',
+                filing_claimant_run_id=self._filing_claimant_run_id,
             )
             queue.submit(esc)
             try:
@@ -12802,6 +12822,7 @@ class Harness:
                 worktree=None,
                 workflow_state=esc.workflow_state,
                 level=1,
+                filing_claimant_run_id=self._filing_claimant_run_id,
             )
             self._escalation_queue.submit(reesc)
             self._escalation_queue.resolve(
@@ -13666,6 +13687,7 @@ class Harness:
             detail=detail,
             suggested_action='manual_intervention',
             level=1,
+            filing_claimant_run_id=self._filing_claimant_run_id,
         )
         self._escalation_queue.submit(esc)
         logger.warning(
@@ -13915,6 +13937,7 @@ class Harness:
             detail=detail,
             suggested_action=suggested_action,
             level=1,
+            filing_claimant_run_id=self._filing_claimant_run_id,
         )
         self._escalation_queue.submit(esc)
         if self.event_store:
@@ -13992,6 +14015,7 @@ class Harness:
             detail=detail,
             options=options,
             level=2,
+            filing_claimant_run_id=self._filing_claimant_run_id,
         )
         self._escalation_queue.submit(esc)
         if self.event_store:
@@ -15130,6 +15154,7 @@ class Harness:
                 summary=summary,
                 detail=detail,
                 suggested_action='investigate_reblock_loop',
+                filing_claimant_run_id=self._filing_claimant_run_id,
             )
             queue.submit(esc)
             try:
@@ -15235,6 +15260,7 @@ class Harness:
                 summary=summary,
                 detail=detail,
                 suggested_action='investigate_lane_record_drift',
+                filing_claimant_run_id=self._filing_claimant_run_id,
             )
             queue.submit(esc)
             try:
@@ -15362,6 +15388,7 @@ class Harness:
                 summary=summary,
                 detail=detail,
                 suggested_action='investigate_warm_lane_structural_exhaustion',
+                filing_claimant_run_id=self._filing_claimant_run_id,
             )
             queue.submit(esc)
             try:
