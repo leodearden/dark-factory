@@ -13543,3 +13543,160 @@ async def test_get_ticket_row_without_a_store_warns_and_returns_none(
         assert await interceptor.get_ticket_row('tkt_0RRRC5AASJ9Z630VP4PCN9H376') is None
 
     assert any('ticket_store' in record.message for record in caplog.records)
+
+
+# --------------------------------------------------------------------------- #
+# Gate ORDER in _apply_status_transition (task 3112, step-15b)
+#
+# The consolidation-closure gate was inserted between two existing gates. These
+# pin that insertion point mechanically: the pre-done hook gate must still run
+# BEFORE it, and the transition-legality gate must still run AFTER it. Without
+# this, a later edit could hoist the new gate above the hook (spending a store
+# read on a transition the hook was going to refuse anyway) or drop it below
+# the legality check (letting a log-mode illegal_transition WARNING be emitted
+# for a transition that is then refused) and nothing would notice.
+# --------------------------------------------------------------------------- #
+
+
+_ORDER_TOPIC = 'gate-order-topic'
+
+
+def _order_gate_metadata():
+    from fused_memory.reconciliation.consolidation_gate import GATE_METADATA_KEY
+
+    return {
+        'execution_class': 'operational',
+        'operational_mode': 'gate',
+        'task_kind': 'deterministic',
+        'always_escalates': True,
+        GATE_METADATA_KEY: {'topic': _ORDER_TOPIC},
+    }
+
+
+def _order_member(n, *, canonical=None):
+    meta: dict[str, Any] = {'topic': _ORDER_TOPIC}
+    if canonical is not None:
+        meta['canonical'] = canonical
+    return {
+        'id': f'00000000-0000-4000-8000-{n:012d}',
+        'created_at': '2026-08-24T00:00:00+00:00',
+        'metadata': meta,
+    }
+
+
+def _wire_order_spies(interceptor, monkeypatch, *, members, hook_result=None):
+    """Install three ordered spies and return the shared call-order list.
+
+    One list, three appenders — an ORDER assertion, not three independent
+    called/not-called assertions, because "ran at all" is exactly what a
+    reordering edit would keep satisfying.
+    """
+    order: list[str] = []
+
+    async def _spy_run_hook(task_id, project_root, **kwargs):
+        order.append('pre_done_hook')
+        return hook_result
+
+    monkeypatch.setattr(
+        'fused_memory.middleware.task_interceptor._run_hook', _spy_run_hook
+    )
+
+    async def _scroll(filters, *, limit, project_id):
+        order.append('consolidation_scroll')
+        return list(members)
+
+    def _spy_is_legal_transition(old_status, status, actor, **kwargs):
+        order.append('transition_legality')
+        return True
+
+    monkeypatch.setattr(
+        'fused_memory.middleware.task_interceptor.is_legal_transition',
+        _spy_is_legal_transition,
+    )
+    # No count collaborator: the count call would be a second 'consolidation'
+    # entry and would blur the single ordering signal this asserts.
+    interceptor.set_consolidation_scroll(_scroll)
+    return order
+
+
+@pytest.fixture
+def order_interceptor(taskmaster, reconciler, event_buffer):
+    taskmaster.get_task = AsyncMock(
+        return_value={
+            'id': '1',
+            'status': 'pending',
+            'title': 'Consolidation gate',
+            'metadata': _order_gate_metadata(),
+        }
+    )
+    return TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+
+@pytest.mark.asyncio
+async def test_gate_chain_order_is_hook_then_consolidation_then_legality(
+    order_interceptor, taskmaster, monkeypatch
+):
+    """The documented chain, end to end, on a transition every gate passes."""
+    order = _wire_order_spies(
+        order_interceptor,
+        monkeypatch,
+        members=[_order_member(1, canonical=True), _order_member(2)],
+    )
+
+    result = await order_interceptor.set_task_status('1', 'done', '/project')
+
+    assert 'error' not in result, result
+    assert order == ['pre_done_hook', 'consolidation_scroll', 'transition_legality']
+    taskmaster.set_task_status.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_pre_done_hook_still_runs_before_the_consolidation_gate(
+    order_interceptor, taskmaster, monkeypatch
+):
+    """A hook refusal short-circuits: the closure scroll is never spent.
+
+    The cluster here is MALFORMED (no canonical), so if the new gate had been
+    hoisted above the hook the returned error would be
+    ``consolidation_not_closed`` instead.
+    """
+    order = _wire_order_spies(
+        order_interceptor,
+        monkeypatch,
+        members=[_order_member(1), _order_member(2)],
+        hook_result={
+            'success': False,
+            'error': 'pre_done_hook_rejected',
+            'task_id': '1',
+        },
+    )
+
+    result = await order_interceptor.set_task_status('1', 'done', '/project')
+
+    assert result['error'] == 'pre_done_hook_rejected'
+    assert order == ['pre_done_hook']
+    taskmaster.set_task_status.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_transition_legality_gate_still_runs_after_the_consolidation_gate(
+    order_interceptor, taskmaster, monkeypatch
+):
+    """A closure refusal short-circuits before the legality gate.
+
+    Log-mode legality (the default) emits a would-reject WARNING rather than
+    returning, so running it on a transition that is about to be refused would
+    put a phantom illegal_transition line in the log for a write that never
+    happened.
+    """
+    order = _wire_order_spies(
+        order_interceptor,
+        monkeypatch,
+        members=[_order_member(1), _order_member(2)],  # no canonical
+    )
+
+    result = await order_interceptor.set_task_status('1', 'done', '/project')
+
+    assert result['error'] == 'consolidation_not_closed'
+    assert order == ['pre_done_hook', 'consolidation_scroll']
+    taskmaster.set_task_status.assert_not_called()
