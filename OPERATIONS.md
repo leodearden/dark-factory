@@ -1279,6 +1279,83 @@ directly, not just interactive sessions. Treat it accordingly:
 
 ---
 
+## 9a. Cross-repo lock-charter reconciliation
+
+dark-factory and the sibling **reify** repo each carry a copy of the
+lock-charter file-path allowlist (`FILE_EXTENSIONS` /
+`EXTENSIONLESS_FILENAMES`). They must agree, and historically that
+agreement was checked *live, in-suite*, on the merge-verify critical path.
+That is why the 2026-07-29 incident happened: reify widened its allowlist
+36 → 58 with no dark-factory change involved, and every dark-factory
+worktree's full suite went red.
+
+The explicitly-invoked reconciliation moves that comparison **off** the
+critical path. Run it whenever either repo's allowlist changes, and before
+believing an in-suite drift failure:
+
+```bash
+uv run --project shared python scripts/check_lock_charter_drift.py
+uv run --project shared python scripts/check_lock_charter_drift.py --json
+uv run --project shared python scripts/check_lock_charter_drift.py \
+    --reify-repo /path/to/reify
+```
+
+The reify checkout is located by `--reify-repo`, then `$REIFY_ROOT`, then a
+marker-bound nearest-ancestor walk — the same single-sourced resolution
+(`shared/src/shared/reify_checkout.py`) the in-suite guards use, so the
+script and the suite can never disagree about *which* checkout they mean.
+
+### The three exit codes
+
+There is deliberately **no skip state**: an absent or unrunnable sibling is
+reported as loudly as real drift, so a comparison that did not happen can
+never read as a pass.
+
+| Exit | Status | Meaning |
+|---|---|---|
+| `0` | `ok` | Both vectors agree and reify's tracked corpus is fully covered by the allowlist. |
+| `1` | `drift` | The two repos disagree, or a tracked reify path has an extension the allowlist rejects. |
+| `2` | `unavailable` | The comparison **did not happen** — no reify checkout found, no guard script, the guard exited non-zero, it timed out, or the corpus sweep could not run. |
+
+### Attribution contract
+
+Read the outcome as a statement about the *pair of repos*, not about
+whatever dark-factory branch happens to be under test:
+
+- **`drift` is a cross-repo MIRROR gap, owned by a mirror task. It is NEVER
+  a fault in the dark-factory branch under test.** Do not debug, revert, or
+  re-dispatch a task on the strength of a drift result; file/advance the
+  mirror work instead.
+- **`unavailable` is not a pass.** Nothing was compared. Fix the
+  availability problem (check out the sibling, correct `$REIFY_ROOT`, repair
+  the guard script) and re-run before drawing any conclusion.
+
+### A SKIP is no longer readable as a PASS
+
+The same "absence is not evidence" rule now holds inside the bare-main
+health probe (task 3226). The probe records **skipped** test ids separately
+from failing ones (`verify._BASELINE_SKIPPED_IDS_CACHE`, seeded from the
+same single probe that seeds the failing baseline), because a test's absence
+from the failing baseline conflates two different worlds:
+
+- main **ran** it and it passed → the branch broke it (task fault);
+- main **never ran** it → the id diff is evidence of nothing.
+
+When a branch-failing id appears in main's *skipped* baseline,
+`verify.verify_failure_is_preexisting_on_main` no longer returns the
+confident task-fault verdict from the id diff — it logs the unattributable
+ids and falls through to the `(category, cause_hint)` signature comparison.
+A single unattributable id is enough to invalidate the whole diff. The
+merge-queue branch-block reason partitions the same way, so
+"N new failing test(s) not present on main" counts only tests main actually
+ran, and skipped-on-main ids are named under their own clause stating they
+are not evidence of a branch fault.
+
+Both refinements are **cache-only** — they never trigger a probe on the
+critical path — so a cold cache degrades to the previous behaviour exactly.
+
+---
+
 ## 10. Troubleshooting
 
 | Symptom | Cause | Fix |
