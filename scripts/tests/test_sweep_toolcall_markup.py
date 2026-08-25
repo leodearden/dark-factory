@@ -428,13 +428,20 @@ def _discovered(root):
     }
 
 
-def test_discovery_yields_exactly_the_two_pinned_path_sets(sweep_root):
-    """Discovery is an allowlist of two shapes, not a repo-wide .json walk.
+def test_discovery_yields_exactly_the_three_pinned_path_sets(sweep_root):
+    """Discovery is an allowlist of three shapes, not a repo-wide .json walk.
 
     Pinning the WHOLE mapping (rather than asserting membership of a few
     interesting paths) is deliberate: the hazard this sweep carries is
     over-reach onto files it was never meant to rewrite, and a membership-only
     assertion cannot fail when a new path is wrongly swept in.
+
+    The third shape is the durable meta-root store (task 4696). Note that the
+    9002 plan appears TWICE here, once per direction — as the orphaned lane's
+    symlink and as the meta-root file it points at. Discovery is deliberately
+    the wrong place to collapse that: ``dedupe_by_realpath`` owns it, so a
+    target dropped for sharing a realpath is dropped where the report can
+    account for it rather than silently at the glob.
     """
     assert _discovered(sweep_root) == {
         'data/escalations/esc-1-1.json': sweep.LANE_ESCALATIONS,
@@ -443,6 +450,7 @@ def test_discovery_yields_exactly_the_two_pinned_path_sets(sweep_root):
         'data/escalations/archive/2026-08-08/esc-3-1.json': sweep.LANE_ESCALATIONS,
         '.worktrees-orphaned/9001-2026/.task/plan.json': sweep.LANE_PLANS,
         '.worktrees-orphaned/9002-2026/.task/plan.json': sweep.LANE_PLANS,
+        '.worktrees/.task-meta/9002/plan.json': sweep.LANE_META_PLANS,
     }
 
 
