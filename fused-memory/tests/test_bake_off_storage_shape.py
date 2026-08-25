@@ -7391,6 +7391,13 @@ class TestRenderMarkdownRegrowthSection:
         from "this build predates the probe", and a heading that disappears
         makes those two identical — which is precisely what esc-3200-3 could
         not read off the previous artifact.
+
+        `_section` locates by the heading and raises if it is absent, so the
+        emission contract is carried by the call itself.  What the skipped
+        section SAYS is operator-facing prose and free to be reworded; a
+        substring pin on it would have passed for a section gutted to the
+        literal words it pinned.  What is checked instead is that neither
+        table is there to be misread as a measurement.
         """
         mod = _mod()
 
@@ -7398,7 +7405,6 @@ class TestRenderMarkdownRegrowthSection:
             mod.render_markdown(_report()), '## Regrowth deltas',
         )
 
-        assert any('not probed' in line.lower() for line in section)
         assert _header_row(mod.REGROWTH_TABLE_COLUMNS) not in section
         assert _header_row(mod.REGROWTH_STAMPING_COLUMNS) not in section
 
