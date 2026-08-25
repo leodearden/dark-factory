@@ -213,7 +213,9 @@ class TestClosureVerdictContract:
         assert dataclasses.is_dataclass(verdict)
         assert dataclasses.fields(ClosureVerdict)
         with pytest.raises(dataclasses.FrozenInstanceError):
-            verdict.closed = False
+            # setattr, not a direct attribute assignment, so this stays pyright-clean
+            # (a direct assignment on a frozen dataclass is reportAttributeAccessIssue).
+            setattr(verdict, 'closed', False)  # noqa: B010
 
     def test_closed_and_exit_code_can_never_disagree(self):
         closed = _closure(_well_formed_cluster(3))
@@ -550,7 +552,9 @@ class TestBuildConsolidationGateTask:
         spec = build_consolidation_gate_task(topic=_TOPIC)
         assert dataclasses.is_dataclass(spec)
         with pytest.raises(dataclasses.FrozenInstanceError):
-            spec.title = 'x'
+            # setattr, not a direct attribute assignment, so this stays pyright-clean
+            # (a direct assignment on a frozen dataclass is reportAttributeAccessIssue).
+            setattr(spec, 'title', 'x')  # noqa: B010
 
     def test_as_submit_task_kwargs_is_exactly_the_submit_task_key_set(self):
         """Splattable straight into submit_task, matching the sibling builder."""

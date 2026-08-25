@@ -722,6 +722,21 @@ async def run_server():
     # PRD γ §11: fail loudly before harness construction if reconciliation is
     # enabled but the transport cannot host the recon-report MCP server.
     _require_http_transport_for_reconciliation(config)
+
+    # Task 3112: project_id-adapting wrappers over the deterministic metadata
+    # scroll, for the consolidation-gate closure check. The service methods take
+    # project_id first positionally; the interceptor passes it by keyword because
+    # it resolves scope per task. Defined ABOVE the reconciliation branch because
+    # BOTH TaskInterceptor construction sites wire them — defining them inside the
+    # enabled arm left the disabled arm raising NameError at startup.
+    async def _closure_scroll(filters, *, limit, project_id):
+        return await memory_service.get_memories_by_metadata(
+            project_id, filters, limit=limit
+        )
+
+    async def _closure_count(filters, *, project_id):
+        return await memory_service.count_memories_by_metadata(project_id, filters)
+
     if config.reconciliation and config.reconciliation.enabled:
         from fused_memory.middleware.task_interceptor import TaskInterceptor
         from fused_memory.reconciliation.backlog_policy import BacklogPolicy
@@ -853,18 +868,6 @@ async def run_server():
         )
 
         ticket_store = await _build_ticket_store(Path(config.reconciliation.data_dir))
-        # Task 3112: project_id-adapting wrappers over the deterministic
-        # metadata scroll, for the consolidation-gate closure check. The
-        # service methods take project_id first positionally; the interceptor
-        # passes it by keyword because it resolves scope per task.
-        async def _closure_scroll(filters, *, limit, project_id):
-            return await memory_service.get_memories_by_metadata(
-                project_id, filters, limit=limit
-            )
-
-        async def _closure_count(filters, *, project_id):
-            return await memory_service.count_memories_by_metadata(project_id, filters)
-
         task_interceptor = TaskInterceptor(
             taskmaster, targeted, event_buffer,
             config=config, escalator=curator_escalator,
