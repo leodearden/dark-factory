@@ -1408,3 +1408,278 @@ class TestB2SyncMergeTip:
         assert branch_content == [], 'branch_content_in_main (git_ops.py) must never be reached'
         assert effect_present == [], 'commit_effect_present_in_main must never be reached'
         assert describe_effect == [], 'describe_commit_effect_in_main must never be reached'
+
+
+# --------------------------------------------------------------------------
+# Contract invariant 4 — fail-closed, and git_error is never not_landed
+# (step-11).
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def broken_main_git_ops(git_repo: Path) -> GitOps:
+    """A ``GitOps`` whose configured main branch does not exist.
+
+    The cheapest REAL unhealthy-repo construction available to a test: every
+    ref the producer resolves against ``config.main_branch`` genuinely fails,
+    with no patching of the code under test, so what is measured is the
+    producer's behaviour on a broken repo rather than on a simulated one.
+    """
+    return GitOps(
+        GitConfig(
+            main_branch='no-such-main-branch',
+            branch_prefix='task/',
+            remote='origin',
+            worktree_dir='.worktrees',
+            push_after_advance=False,
+        ),
+        git_repo,
+    )
+
+
+@pytest.mark.asyncio
+class TestGitErrorIsNeverNotLanded:
+    """G7 storm-escape, and the single most consequential rule in this module.
+
+    ``not_landed`` is a claim ABOUT THE TASK: the work is not on main, so
+    dispatch it.  ``git_error`` is a claim about the DETECTOR: it could not
+    look.  Collapsing the second into the first makes a repo lock, a corrupt
+    object or an unresolvable ref read as "this task never landed", so a task
+    that DID land is re-dispatched — forever, since the condition that broke
+    the check is not fixed by re-running it.  That is the defect this PRD
+    exists to fix, so producing it here would be strictly worse than shipping
+    nothing.
+
+    Every case therefore asserts the REASON, not merely ``accepted is False``:
+    both codes reject, and it is only the code that tells a consumer whether
+    to re-dispatch or to escalate.
+    """
+
+    async def test_an_unresolvable_branch_ref_is_a_git_error(
+        self, git_ops: GitOps, repo: _Repo,
+    ) -> None:
+        build_unlanded_branch(repo)
+        verdict = await branch_work_landed(
+            git_ops, TASK_ID, 'task/does-not-exist', branch_tip_sha=None,
+        )
+        assert verdict.accepted is False
+        assert verdict.reason is LandingReason.git_error
+        assert verdict.probe['git_error_stage'] == 'resolve_branch_sha'
+
+    async def test_an_unresolvable_tip_sha_is_a_git_error(
+        self, git_ops: GitOps, repo: _Repo,
+    ) -> None:
+        """A caller-supplied tip that is not in this repo at all."""
+        sc = build_unlanded_branch(repo)
+        verdict = await branch_work_landed(
+            git_ops, TASK_ID, sc.branch,
+            branch_tip_sha='0' * 39 + '1', metadata=sc.metadata,
+        )
+        assert verdict.accepted is False
+        assert verdict.reason is LandingReason.git_error
+
+    @pytest.mark.parametrize('with_metadata', [True, False])
+    async def test_an_unresolvable_main_ref_is_a_git_error(
+        self, broken_main_git_ops: GitOps, repo: _Repo, with_metadata: bool,
+    ) -> None:
+        """Parametrised because the two paths reach the failure DIFFERENTLY.
+
+        Without metadata the baseline ladder resolves against main and fails
+        early.  WITH metadata the ladder answers from the recorded base
+        without touching main at all, so the first thing to see the broken ref
+        is ``git cherry`` — whose fail-OPEN ``False`` is exactly the
+        misclassification this class exists to prevent.
+        """
+        sc = build_unlanded_branch(repo)
+        verdict = await branch_work_landed(
+            broken_main_git_ops, TASK_ID, sc.branch,
+            branch_tip_sha=sc.branch_tip_sha,
+            metadata=sc.metadata if with_metadata else None,
+        )
+        assert verdict.accepted is False
+        assert verdict.reason is LandingReason.git_error, verdict.probe
+        assert verdict.probe.get('git_error_stage'), 'the failing stage must be named'
+
+    async def test_a_landed_branch_is_a_git_error_not_a_landing_when_main_is_broken(
+        self, broken_main_git_ops: GitOps, repo: _Repo,
+    ) -> None:
+        """The direction that matters most: a REAL landing must not silently reject.
+
+        This branch genuinely landed.  With main unresolvable the containment
+        helper returns its fail-open ``False``, and reading that as
+        ``not_landed`` would re-dispatch a task whose work is already on main
+        — the exact stranding this PRD exists to fix, re-created by the
+        recovery path itself.
+        """
+        sc = build_merged_landing(repo)
+        verdict = await branch_work_landed(
+            broken_main_git_ops, TASK_ID, sc.branch,
+            branch_tip_sha=sc.branch_tip_sha, metadata=sc.metadata,
+        )
+        assert verdict.reason is LandingReason.git_error, verdict.probe
+        assert verdict.reason is not LandingReason.not_landed
+
+    async def test_the_fail_open_containment_answer_is_disambiguated(
+        self, broken_main_git_ops: GitOps, repo: _Repo,
+    ) -> None:
+        """THE fail-open disambiguation, and the probe must SHOW which branch was taken.
+
+        ``merge_queue.patch_content_contained`` is documented fail-OPEN and
+        returns ``False`` on ``rc != 0`` — correct for ITS caller, which falls
+        through to a full merge attempt, and exactly backwards here, where
+        ``False`` means "not landed".  The producer therefore re-probes ref
+        health on a ``False`` and records the outcome, so a reader can tell a
+        genuine negative from an unreadable repo without re-running git.
+        """
+        sc = build_merged_landing(repo)
+        verdict = await branch_work_landed(
+            broken_main_git_ops, TASK_ID, sc.branch,
+            branch_tip_sha=sc.branch_tip_sha, metadata=sc.metadata,
+        )
+        assert verdict.reason is LandingReason.git_error
+        assert verdict.probe['containment_recheck'] == 'unhealthy'
+        assert verdict.probe['containment_unresolvable'], (
+            'the endpoints that failed to re-resolve must be recorded'
+        )
+
+    async def test_the_contrasting_positive_control_on_a_healthy_repo(
+        self, git_ops: GitOps, repo: _Repo,
+    ) -> None:
+        """The disambiguation must not have relabelled every rejection.
+
+        Same producer, same ``False`` from the containment helper — but a
+        healthy repo, so the answer is trustworthy and the verdict stays the
+        ordinary ``not_landed``.  Without this control, "always say git_error
+        on False" would pass every other case in this class.
+        """
+        sc = build_unlanded_branch(repo)
+        verdict = await branch_work_landed(
+            git_ops, TASK_ID, sc.branch,
+            branch_tip_sha=sc.branch_tip_sha, metadata=sc.metadata,
+        )
+        assert verdict.reason is LandingReason.not_landed, verdict.probe
+        assert verdict.probe['containment_recheck'] == 'healthy'
+        assert verdict.probe['containment_unresolvable'] == []
+        assert 'git_error_stage' not in verdict.probe
+
+    async def test_an_indeterminate_no_op_answer_is_a_git_error(
+        self, git_ops: GitOps, repo: _Repo, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The tri-state's third state must not be read as "not a no-op".
+
+        ``net_diff_is_empty`` returns ``None`` for an unreadable commit or an
+        uncomputable merge-base.  Treating that as ``False`` would let the run
+        continue to the patch-id arm on a repo that just proved it cannot
+        answer questions.
+        """
+        sc = build_merged_landing(repo)
+
+        async def _indeterminate(*_args: object, **_kwargs: object) -> None:
+            return None
+
+        monkeypatch.setattr(git_ops, 'net_diff_is_empty', _indeterminate)
+        verdict = await branch_work_landed(
+            git_ops, TASK_ID, sc.branch,
+            branch_tip_sha=sc.branch_tip_sha, metadata=sc.metadata,
+        )
+        assert verdict.accepted is False
+        assert verdict.reason is LandingReason.git_error
+        assert verdict.probe['git_error_stage'] == 'net_diff_is_empty'
+
+    async def test_an_unresolvable_baseline_is_a_git_error(
+        self, git_ops: GitOps, repo: _Repo, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        sc = build_unlanded_branch(repo)
+
+        async def _no_merge_base(*_args: object, **_kwargs: object) -> None:
+            return None
+
+        monkeypatch.setattr(git_ops, 'merge_base_with_main', _no_merge_base)
+        verdict = await branch_work_landed(
+            git_ops, TASK_ID, sc.branch, branch_tip_sha=sc.branch_tip_sha, metadata=None,
+        )
+        assert verdict.reason is LandingReason.git_error
+        assert verdict.probe['git_error_stage'] == 'no_op_baseline'
+
+
+@pytest.mark.asyncio
+class TestBranchWorkLandedNeverRaises:
+    """It always RETURNS a verdict — it never accepts on doubt and never propagates.
+
+    Its callers are recovery paths: a sweep over stranded tasks, a dispatch
+    gate, a merge-status query.  An exception escaping here takes the whole
+    sweep down with it, so one unreadable repo would stop every OTHER task
+    from being recovered — turning a single broken task into a stalled queue.
+    Containing it is not defensive coding; it is the difference between a
+    degraded check and a dead one.
+    """
+
+    @pytest.mark.parametrize(
+        'method',
+        [
+            'resolve_branch_sha',
+            'is_ancestor',
+            'merge_base_with_main',
+            'net_diff_is_empty',
+            'find_task_citation_commit',
+            'find_equivalent_commit',
+        ],
+    )
+    async def test_an_unexpected_exception_becomes_a_git_error_verdict(
+        self, git_ops: GitOps, repo: _Repo, monkeypatch: pytest.MonkeyPatch, method: str,
+    ) -> None:
+        sc = build_rebased_landing(repo)
+
+        async def _boom(*_args: object, **_kwargs: object) -> object:
+            raise RuntimeError(f'simulated {method} failure')
+
+        monkeypatch.setattr(git_ops, method, _boom)
+        verdict = await branch_work_landed(
+            git_ops, TASK_ID, sc.branch,
+            branch_tip_sha=None if method == 'resolve_branch_sha' else sc.branch_tip_sha,
+            metadata=sc.metadata,
+        )
+        assert isinstance(verdict, LandingVerdict)
+        assert verdict.accepted is False, 'never accept on doubt'
+        assert verdict.reason is LandingReason.git_error
+        assert verdict.evidence_sha is None
+
+    async def test_the_exception_is_recorded_and_logged_not_swallowed(
+        self, git_ops: GitOps, repo: _Repo, monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """CONTAINED but not SWALLOWED — the module's existing discipline.
+
+        A caught exception that leaves no trace is indistinguishable from a
+        clean negative, so the repr goes in the probe (structured facts for
+        the escalation body) AND a warning with a traceback goes to the log
+        (for whoever is reading logs rather than escalations).
+        """
+        sc = build_rebased_landing(repo)
+
+        async def _boom(*_args: object, **_kwargs: object) -> object:
+            raise RuntimeError('simulated merge_base failure')
+
+        monkeypatch.setattr(git_ops, 'merge_base_with_main', _boom)
+        with caplog.at_level('WARNING', logger='orchestrator.landing_evidence'):
+            verdict = await branch_work_landed(
+                git_ops, TASK_ID, sc.branch,
+                branch_tip_sha=sc.branch_tip_sha, metadata=None,
+            )
+        assert verdict.reason is LandingReason.git_error
+        assert 'simulated merge_base failure' in str(verdict.probe.get('exception'))
+        assert verdict.probe['git_error_stage'] == 'unexpected_exception'
+        assert any(r.exc_info for r in caplog.records), 'a traceback must be logged'
+
+    async def test_the_verdict_still_renders_without_an_unrecognized_reason(
+        self, broken_main_git_ops: GitOps, repo: _Repo,
+    ) -> None:
+        sc = build_merged_landing(repo)
+        verdict = await branch_work_landed(
+            broken_main_git_ops, TASK_ID, sc.branch,
+            branch_tip_sha=sc.branch_tip_sha, metadata=sc.metadata,
+        )
+        summary, detail = format_unattributed_landing_detail(TASK_ID, sc.branch, verdict)
+        assert 'Unrecognized reason code' not in detail
+        assert 'Unrecognized reason code' not in summary
+        assert 'git_error' in summary
