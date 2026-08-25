@@ -9966,6 +9966,65 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             return
         self._note_transition(request_id, current, ItemLifecycleState.QUEUED, live_obj=live_obj)
 
+    def _advance_contended_lease_streak(
+        self, task_id: str, exc: BaseException,
+    ) -> tuple[int, float]:
+        """Advance the 3003 contended-lane defer streak for *task_id*.
+
+        Returns ``(streak, elapsed_secs)`` — the number of consecutive defers
+        including this one, and how long the unbroken streak has been running.
+        The caller decides what to DO with them (the head path escalates the
+        log at the crossing and caps out terminally; δ's chain walk only ever
+        aborts), but both must move the SAME bookkeeping, or a task that
+        defers alternately on the two paths would keep restarting its budget
+        and the terminal cap could never be reached.
+
+        Extracted verbatim from :meth:`_run_inflight_verify`'s
+        ``MergeVerifyLeaseContended``/``MergeVerifyLeaseHeld`` arm (task 3186,
+        PRD δ) — a straight factoring with no flag argument, which is what the
+        local extraction bar asks for.
+
+        STALENESS FIRST (task 3003, review fix 2 + its amend).  Nothing
+        guarantees a deferred request comes back through a defer arm at all: it
+        can remerge into a conflict, be abandoned, or die at shutdown, and
+        these dicts live for the whole orchestrator process (~8 h between fleet
+        redeploys).  A gap since the last defer far larger than the defer
+        cadence can explain therefore CLOSES the streak and starts a fresh one
+        — otherwise one defer at T0 plus a single brief transient hours later
+        would find the elapsed budget already blown and cap out on the FIRST
+        defer of a new streak.
+        """
+        _defer_now = time.monotonic()
+        _waited = float(getattr(exc, 'wait_secs', 0.0) or 0.0)
+        _prev_defer_at = self._contended_lease_last_defer_at.get(task_id)
+        _streak_stale_after = max(
+            self.CONTENDED_LEASE_STREAK_STALE_FLOOR_SECS,
+            self.CONTENDED_LEASE_STREAK_STALE_FACTOR
+            * max(self.CONTENDED_LEASE_DEFER_MIN_PERIOD_SECS, _waited),
+        )
+        if (
+            _prev_defer_at is not None
+            and _defer_now - _prev_defer_at > _streak_stale_after
+        ):
+            logger.info(
+                'Task %s: %.0fs since its last contended-lane defer '
+                '(> %.0fs) — that gap cannot be explained by the defer '
+                'cadence, so the previous streak is closed and this defer '
+                'starts a fresh one',
+                task_id, _defer_now - _prev_defer_at, _streak_stale_after,
+            )
+            self._clear_contended_lease_streak(task_id)
+        self._contended_lease_last_defer_at[task_id] = _defer_now
+        _contended_streak = self._contended_lease_requeues.get(task_id, 0) + 1
+        self._contended_lease_requeues[task_id] = _contended_streak
+        # task 3003 (review fix 2): bound the streak in ELAPSED time. The
+        # stamp marks the START of the unbroken streak (setdefault), so the
+        # very first defer measures 0s and always defers.
+        _streak_started_at = self._contended_lease_first_defer_at.setdefault(
+            task_id, _defer_now,
+        )
+        return _contended_streak, _defer_now - _streak_started_at
+
     def _requeue_request(self, req: MergeRequest) -> None:
         """THE requeue recipe: put *req* back on ``_queue`` and re-arm both the
         ledger and the lifecycle registry, atomically (task 3204).
@@ -18188,36 +18247,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # _contended_lease_requeues counter had the same staleness gap, but
             # it only shaped log severity; the elapsed budget is TERMINAL, so the
             # gap now has consequences.)
-            _defer_now = time.monotonic()
             _waited = float(getattr(exc, 'wait_secs', 0.0) or 0.0)
-            _prev_defer_at = self._contended_lease_last_defer_at.get(req.task_id)
-            _streak_stale_after = max(
-                self.CONTENDED_LEASE_STREAK_STALE_FLOOR_SECS,
-                self.CONTENDED_LEASE_STREAK_STALE_FACTOR
-                * max(self.CONTENDED_LEASE_DEFER_MIN_PERIOD_SECS, _waited),
+            _contended_streak, _contended_elapsed = (
+                self._advance_contended_lease_streak(req.task_id, exc)
             )
-            if (
-                _prev_defer_at is not None
-                and _defer_now - _prev_defer_at > _streak_stale_after
-            ):
-                logger.info(
-                    'Task %s: %.0fs since its last contended-lane defer '
-                    '(> %.0fs) — that gap cannot be explained by the defer '
-                    'cadence, so the previous streak is closed and this defer '
-                    'starts a fresh one',
-                    req.task_id, _defer_now - _prev_defer_at, _streak_stale_after,
-                )
-                self._clear_contended_lease_streak(req.task_id)
-            self._contended_lease_last_defer_at[req.task_id] = _defer_now
-            _contended_streak = self._contended_lease_requeues.get(req.task_id, 0) + 1
-            self._contended_lease_requeues[req.task_id] = _contended_streak
-            # task 3003 (review fix 2): bound the streak in ELAPSED time. The
-            # stamp marks the START of the unbroken streak (setdefault), so the
-            # very first defer measures 0s and always defers.
-            _streak_started_at = self._contended_lease_first_defer_at.setdefault(
-                req.task_id, _defer_now,
-            )
-            _contended_elapsed = _defer_now - _streak_started_at
             if _contended_elapsed >= self.MAX_CONTENDED_LEASE_DEFER_SECS:
                 # Terminal cap, shaped like the MAX_INFLIGHT_DEAD_VERIFY_ABORTS
                 # busy-loop guard above. A contended-lane defer never escalates
@@ -18998,6 +19031,24 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         class ``build_chain``'s decision-4 purity guards against upstream, and
         the PRD's "deep fails never feed thrash guard" boundary row.
 
+        The one thing decision #9 does NOT license is swallowing a QUEUE-WIDE
+        fault: an advance result in :data:`_HALT_ADVANCE_RESULTS` reports a
+        shared main-checkout problem that recurs for every subsequent task, so
+        the walk halts on it exactly as the head path does.  Silence is about
+        not blaming the LINK.
+
+        THREE ABORT ARMS, ONE DISPOSITION.  A non-``'advanced'`` result, a
+        typed ``MergeVerifyLeaseContended``/``MergeVerifyLeaseHeld``, and a
+        bare exception all end the same way — the link goes back to its exact
+        lane slot via :meth:`_restore_chain_link_request` and the walk stops.
+        They differ only in their bookkeeping: the typed pair inherits task
+        3003's DEFER classification and moves the shared contended-lane streak
+        (:meth:`_advance_contended_lease_streak`), while a bare fault
+        deliberately does not, so it cannot consume the budget that exists to
+        surface a genuinely wedged lane holder.  None of the three renders a
+        ``MergeOutcome``.  The typed arm is written BEFORE the generic one on
+        purpose — that ORDER is the opt-in, mirroring merge_queue.py:18109.
+
         NO PERMITS ARE TOUCHED.  A chain link never acquired a ``SpecPermit`` or
         a ``CapPermit`` — it sat in a lane buffer for the whole round — so this
         walk must never call ``PermitLedger.release`` for it, which asserts on a
@@ -19034,82 +19085,164 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 )
                 break
             _lane, _idx, link_req = taken
+            # Set the instant the link's future is resolved, which is the point
+            # of no return: past it the link is TERMINAL and putting it back in
+            # a lane buffer would re-merge an item that already landed.  Every
+            # abort arm below therefore restores ONLY while this is False.
+            link_resolved = False
 
-            # `merge_commit^2` is the branch tip build_chain's `--no-ff` merge
-            # incorporated — the same derivation _finalize_advanced_merge
-            # prefers, resolved here as well so the write-ahead LandedRow the
-            # startup reconciler reads is not blank.
-            branch_tip = await _resolve_second_parent(self._git_ops, merge_commit)
-            adv_outcome = await _journal_landed_then_advance(
-                self._landed_outbox, self._git_ops,
-                task_id=link_req.task_id,
-                branch_tip_sha=branch_tip,
-                advanced_sha=merge_commit,
-                # None, deliberately: see _journal_landed_then_advance's own
-                # note.  A link's tree is the one the tip verdict covered, so
-                # opting out of advance_main's rebase-retry is the point — a
-                # rebased link would land a tree nothing verified.
-                merge_wt=None,
-                branch=link_req.branch.full_name,
-                max_attempts=1,
-                expected_main=expected_main,
-                reverify_on_rebase=True,
-            )
-            if adv_outcome.result != 'advanced':
-                # Decision #9: STALE-CAS ABORT.  Silent by design — see the
-                # docstring.  INFO, not WARNING: main moving under a
-                # speculative prefix is an expected race, not a fault.
-                logger.info(
-                    'deep chain walk: advance for task %s returned %r — '
-                    'stopping after %d link(s); the rest stay queued',
-                    task_id, adv_outcome.result, landed,
+            try:
+                # `merge_commit^2` is the branch tip build_chain's `--no-ff` merge
+                # incorporated — the same derivation _finalize_advanced_merge
+                # prefers, resolved here as well so the write-ahead LandedRow the
+                # startup reconciler reads is not blank.
+                branch_tip = await _resolve_second_parent(self._git_ops, merge_commit)
+                adv_outcome = await _journal_landed_then_advance(
+                    self._landed_outbox, self._git_ops,
+                    task_id=link_req.task_id,
+                    branch_tip_sha=branch_tip,
+                    advanced_sha=merge_commit,
+                    # None, deliberately: see _journal_landed_then_advance's own
+                    # note.  A link's tree is the one the tip verdict covered, so
+                    # opting out of advance_main's rebase-retry is the point — a
+                    # rebased link would land a tree nothing verified.
+                    merge_wt=None,
+                    branch=link_req.branch.full_name,
+                    max_attempts=1,
+                    expected_main=expected_main,
+                    reverify_on_rebase=True,
                 )
-                self._restore_chain_link_request(_lane, _idx, link_req)
+                if adv_outcome.result != 'advanced':
+                    # Decision #9: STALE-CAS ABORT.  Silent to the QUEUE by
+                    # design — no outcome, no event, nothing for the thrash
+                    # ladder to eat (see the docstring).  That silence is
+                    # exactly why this line is a WARNING rather than the INFO
+                    # an "expected race" would otherwise earn: it is the ONLY
+                    # operator-visible trace of a short landing, so an
+                    # unexplained "landed 1 of 4" has somewhere to be
+                    # attributed.  It cannot be noisy at the shipped
+                    # `chain_cap=0`, where the walk never runs at all.
+                    logger.warning(
+                        'deep chain walk: advance for task %s returned %r — '
+                        'stopping after %d link(s); the rest stay queued',
+                        task_id, adv_outcome.result, landed,
+                    )
+                    if adv_outcome.result in _HALT_ADVANCE_RESULTS:
+                        # Not a per-link race: these codes report a SHARED
+                        # main-checkout fault (unresolved conflicts in
+                        # project_root's index, an unparkable dirty tree) that
+                        # recurs identically for every subsequent task, which is
+                        # why the head path halts the queue on them via
+                        # _map_advance_failure.  Decision #9's silence is about
+                        # not BLAMING the link; it was never a licence to
+                        # swallow a queue-wide fault.  halt_for_wip only clears
+                        # the lane events, so a double-halt is a no-op.
+                        self.halt_for_wip(
+                            f'advance_main: {adv_outcome.result} (deep chain)'
+                        )
+                    self._restore_chain_link_request(_lane, _idx, link_req)
+                    break
+
+                landed_sha = adv_outcome.advanced_sha or merge_commit
+                outcome = await _finalize_advanced_merge(
+                    self._git_ops, link_req, self._event_store,
+                    merge_commit_fallback=merge_commit,
+                    base_sha=expected_main,
+                    # A link has no dispatch stamp — it never dispatched.  None is
+                    # forwarded verbatim by _elapsed_ms, so the merge_attempt row
+                    # simply carries no duration rather than a fabricated one.
+                    started_monotonic=None,
+                    cas_retries=self._cas_retries,
+                    timeouts=self._post_merge_verify_timeouts,
+                    enospc_retries=self._post_merge_verify_enospc_retries,
+                    log_label=' (deep chain)',
+                    # None, matching trains (PRD D9): γ2 generation auto-chaining
+                    # is an equivalence-gate-FAILURE interceptor, and a link that
+                    # reaches here was verified as part of the green tip.
+                    chain_ctx=None,
+                    merged_branch_tip=branch_tip,
+                    advanced_sha=adv_outcome.advanced_sha,
+                )
+                # Same ONE-per-landed-item unit as the head's stamp, and the same
+                # placement rule: before the resolve, because the resolve is what
+                # freezes the `merge_finalized` payload.
+                outcome = dataclasses.replace(outcome, landed_via_chain=1)
+                self._resolve_or_drop_abandoned(link_req, outcome)
+                link_resolved = True
+                landed += 1
+                expected_main = landed_sha
+
+                if outcome.status == 'done':
+                    self._note_merge_landing(link_req.request_id)
+                    if outcome.merge_sha is not None:
+                        self._last_known_main_sha = outcome.merge_sha
+                    if (
+                        outcome.merge_sha is not None
+                        and self._on_merge_landed is not None
+                    ):
+                        try:
+                            await self._on_merge_landed(
+                                link_req.task_id,
+                                adv_outcome.advanced_sha or expected_main,
+                                outcome.merge_sha,
+                            )
+                        except Exception:
+                            logger.warning(
+                                'on_merge_landed hook raised for task %s; ignoring '
+                                '(fail-open)', link_req.task_id, exc_info=True,
+                            )
+            except (MergeVerifyLeaseContended, MergeVerifyLeaseHeld) as exc:
+                # TASK 3003's DEFER CLASSIFICATION, INHERITED.  Placed BEFORE
+                # the generic arm below — that ORDER is the whole opt-in, the
+                # same shape as merge_queue.py:18109.  The lane was
+                # unavailable, so the raiser refused to act UNPROTECTED; that
+                # is a transient come-back-later, never a verdict about this
+                # link.  Rendering it as MergeOutcome('blocked') would produce
+                # a DETERMINISTIC reason string, hence an identical
+                # merge_outcome_signature every round, which is precisely what
+                # tripped workflow.py's consecutive_merge_thrash ladder into
+                # false-positive human escalations before 3003.
+                #
+                # The streak bookkeeping is SHARED with the head path
+                # (_advance_contended_lease_streak) so a task that defers
+                # alternately on the two paths keeps ONE budget.  The terminal
+                # cap-out is deliberately NOT replicated here: the walk is not
+                # this link's sole advancer — restoring it hands it back to the
+                # ordinary sequential path, whose own defer arm owns the
+                # bound.  Capping out here would render the 'blocked' this arm
+                # exists to avoid.
+                _streak, _elapsed = self._advance_contended_lease_streak(
+                    task_id, exc,
+                )
+                logger.warning(
+                    'deep chain walk: merge-verify lane unavailable for task %s '
+                    '(%s) — DEFERRING it and stopping after %d link(s) '
+                    '(consecutive contended-lane defer #%d, %.0fs into the '
+                    'streak); it keeps its queue slot and no outcome is '
+                    'rendered', task_id, exc, landed, _streak, _elapsed,
+                )
+                if not link_resolved:
+                    self._restore_chain_link_request(_lane, _idx, link_req)
                 break
-
-            landed_sha = adv_outcome.advanced_sha or merge_commit
-            outcome = await _finalize_advanced_merge(
-                self._git_ops, link_req, self._event_store,
-                merge_commit_fallback=merge_commit,
-                base_sha=expected_main,
-                # A link has no dispatch stamp — it never dispatched.  None is
-                # forwarded verbatim by _elapsed_ms, so the merge_attempt row
-                # simply carries no duration rather than a fabricated one.
-                started_monotonic=None,
-                cas_retries=self._cas_retries,
-                timeouts=self._post_merge_verify_timeouts,
-                enospc_retries=self._post_merge_verify_enospc_retries,
-                log_label=' (deep chain)',
-                # None, matching trains (PRD D9): γ2 generation auto-chaining
-                # is an equivalence-gate-FAILURE interceptor, and a link that
-                # reaches here was verified as part of the green tip.
-                chain_ctx=None,
-                merged_branch_tip=branch_tip,
-                advanced_sha=adv_outcome.advanced_sha,
-            )
-            # Same ONE-per-landed-item unit as the head's stamp, and the same
-            # placement rule: before the resolve, because the resolve is what
-            # freezes the `merge_finalized` payload.
-            outcome = dataclasses.replace(outcome, landed_via_chain=1)
-            self._resolve_or_drop_abandoned(link_req, outcome)
-            landed += 1
-            expected_main = landed_sha
-
-            if outcome.status == 'done':
-                self._note_merge_landing(link_req.request_id)
-                if outcome.merge_sha is not None:
-                    self._last_known_main_sha = outcome.merge_sha
-                if outcome.merge_sha is not None and self._on_merge_landed is not None:
-                    try:
-                        await self._on_merge_landed(
-                            link_req.task_id, adv_outcome.advanced_sha or expected_main,
-                            outcome.merge_sha,
-                        )
-                    except Exception:
-                        logger.warning(
-                            'on_merge_landed hook raised for task %s; ignoring '
-                            '(fail-open)', link_req.task_id, exc_info=True,
-                        )
+            except Exception:
+                # PER-LINK CONTAINMENT, then STOP.  Contained so one bad link
+                # cannot strand the accounting for the prefix that already
+                # landed (the head-failure cascade's per-entry containment,
+                # merge_queue.py:16240-16260, is the same shape); STOP because
+                # the prefix is CONTIGUOUS — skipping this link and landing the
+                # next would CAS it against a commit that never reached main.
+                #
+                # Deliberately NOT counted as lane contention: letting a
+                # genuine git fault consume the contended-lane budget would
+                # mask the real pathology the streak exists to surface.
+                logger.warning(
+                    'deep chain walk: task %s raised during its landing — '
+                    'stopping after %d link(s); it keeps its queue slot and no '
+                    'outcome is rendered', task_id, landed, exc_info=True,
+                )
+                if not link_resolved:
+                    self._restore_chain_link_request(_lane, _idx, link_req)
+                break
 
         logger.info(
             'deep chain walk: landed %d of %d chained link(s) on top of %s',
