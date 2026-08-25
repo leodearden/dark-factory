@@ -201,3 +201,122 @@ class TestNoOpFixtures:
         with pytest.raises(NonIsolatedGitRepoError):
             _Repo(nested)
         assert 'GIT_CEILING_DIRECTORIES' in _Repo(git_repo)._env
+
+
+class TestNetDiffIsEmpty:
+    """``GitOps.net_diff_is_empty(upstream, head)`` — the no-op predicate.
+
+    The question is "does *head* contribute any NET change relative to where
+    it forked from *upstream*?", i.e. is ``merge-base(upstream, head)..head``
+    empty.  Deliberately NOT the same question as
+    ``branch_content_in_main``'s byte-identity containment, and deliberately
+    TRI-STATE.
+    """
+
+    async def test_branch_that_adds_a_file_is_not_a_no_op(
+        self, git_ops: GitOps, repo: _Repo,
+    ) -> None:
+        repo.git('checkout', '-b', 'task/adds')
+        repo.commit('feat: add the feature', {'pkg/f.py': _numbered('f', 20)})
+        assert await git_ops.net_diff_is_empty('main', 'task/adds') is False
+
+    async def test_no_op_merge_on_main_is_a_no_op(
+        self, git_ops: GitOps, repo: _Repo,
+    ) -> None:
+        """The task-1175 shape: real commits, empty net contribution.
+
+        The branch adds the feature and takes it out again, so the merge
+        marker on main is genuine while the deliverable is nothing.
+        """
+        base = repo.sha('main')
+        repo.git('checkout', '-b', 'task/noop')
+        repo.commit('feat: add the feature', {'pkg/f.py': _numbered('f', 20)})
+        repo.git('rm', '-q', 'pkg/f.py')
+        repo.git('commit', '-m', 'fix: back it out again')
+        tip = repo.sha('HEAD')
+        repo.git('checkout', 'main')
+        repo.git('merge', '--no-ff', 'task/noop', '-m', 'Merge task/noop into main')
+
+        assert await git_ops.net_diff_is_empty(base, tip) is True
+
+    async def test_empty_commit_is_a_no_op(
+        self, git_ops: GitOps, repo: _Repo,
+    ) -> None:
+        """A branch whose only commit is empty contributes genuinely nothing."""
+        base = repo.sha('main')
+        repo.git('checkout', '-b', 'task/empty')
+        repo.commit_empty('chore: an empty commit')
+        assert await git_ops.net_diff_is_empty(base, 'task/empty') is True
+
+    async def test_unresolvable_head_is_none_not_false(
+        self, git_ops: GitOps,
+    ) -> None:
+        """THE tri-state assertion. ``None``, never ``False``.
+
+        A ``False`` here would be laundered by the caller into "the branch has
+        real content", and a ``True`` into "the task delivered nothing" — both
+        of them a git FAILURE silently re-decided as a fact about the task.
+        ``branch_work_landed`` maps ``None`` to ``git_error`` for exactly this
+        reason, which a bool return could not express.
+        """
+        assert await git_ops.net_diff_is_empty('main', 'refs/heads/does-not-exist') is None
+
+    async def test_unresolvable_upstream_is_none(self, git_ops: GitOps) -> None:
+        assert await git_ops.net_diff_is_empty('refs/heads/nope', 'main') is None
+
+    async def test_uncomputable_merge_base_is_none(
+        self, git_ops: GitOps, repo: _Repo,
+    ) -> None:
+        """Two disconnected root histories have no merge-base at all."""
+        orphan = make_disconnected_root(repo)
+        assert await git_ops.net_diff_is_empty('main', orphan) is None
+
+    async def test_root_commit_head_does_not_raise_and_is_determinate(
+        self, git_ops: GitOps, repo: _Repo,
+    ) -> None:
+        """A parentless head must not fall off the parent-reading path."""
+        root = repo.git('rev-list', '--max-parents=0', 'main').strip()
+        assert repo.parents(root) == []
+        result = await git_ops.net_diff_is_empty(root, root)
+        assert result is True, 'a commit compared against itself is empty'
+        assert result is not None
+
+    async def test_probe_records_the_head_commits_parents(
+        self, git_ops: GitOps, repo: _Repo,
+    ) -> None:
+        """Structured facts for the caller, not a second git call.
+
+        ``branch_work_landed`` puts these in the verdict probe, so an operator
+        reading a no_op_landing L1 can see the tip's shape (merge or not)
+        without re-running git.
+        """
+        base = repo.sha('main')
+        repo.git('checkout', '-b', 'task/parents')
+        first = repo.commit('feat: one', {'pkg/f.py': _numbered('f', 8)})
+        tip = repo.commit('feat: two', {'pkg/g.py': _numbered('g', 8)})
+
+        probe: dict[str, object] = {}
+        assert await git_ops.net_diff_is_empty(base, tip, probe=probe) is False
+        assert probe['net_diff_head_parents'] == [first]
+        assert probe['net_diff_merge_base'] == base
+
+    async def test_probe_records_parents_of_a_merge_head(
+        self, git_ops: GitOps, repo: _Repo,
+    ) -> None:
+        base = repo.sha('main')
+        repo.git('checkout', '-b', 'task/m')
+        repo.commit('feat: branch work', {'pkg/f.py': _numbered('f', 8)})
+        repo.git('checkout', 'main')
+        main_tip = repo.commit('chore: main work', {'pkg/h.py': _numbered('h', 8)})
+        repo.git('merge', '--no-ff', 'task/m', '-m', 'Merge task/m into main')
+        merge_sha = repo.sha('main')
+
+        probe: dict[str, object] = {}
+        await git_ops.net_diff_is_empty(base, merge_sha, probe=probe)
+        parents = probe['net_diff_head_parents']
+        assert isinstance(parents, list) and len(parents) == 2
+        assert parents[0] == main_tip
+
+    async def test_probe_is_optional(self, git_ops: GitOps, repo: _Repo) -> None:
+        """Every caller that does not want facts must not have to pass a dict."""
+        assert await git_ops.net_diff_is_empty('main', 'main') is True
