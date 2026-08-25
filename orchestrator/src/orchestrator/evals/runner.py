@@ -62,48 +62,62 @@ logger = logging.getLogger(__name__)
 
 RESULTS_DIR = Path(__file__).parent / 'results'
 
-# Cap-wait patience for the architect eval invoke (eval-revival φ) — the INV-4
-# storm escape. `invoke_with_cap_retry` otherwise inherits
-# `_DEFAULT_CAP_WAIT_SANITY_SECS` (14 days), which is the right answer for a
-# per-task AFK implementer and the WRONG one here: an eval campaign is a
-# bounded, queue-blocking job, so a fully-capped pool must fail LOUD into the
-# existing cap_tainted/cap_excluded backstop rather than park a campaign for
-# two weeks. 1800 s is the established house value for short-lived,
-# queue-blocking callers — `_DRY_RUN_CAP_WAIT_SANITY_SECS` (dry_run_unblock.py)
-# and `_RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS` (the three reconciliation
-# stage runners) — both recorded in cli_invoke.py's per-caller policy table
-# alongside this one.
+# Cap-wait patience for the architect eval invoke (eval-revival φ).
 #
-# Deliberately NO `max_cap_retries` companion: a fixed count scales the wrong
-# way. Cooldown doubles per full cycle through the pool, so a fixed count buys
-# a 4-account pool far LESS wall-clock patience than a 1-account pool — a
-# bigger, healthier pool would give up sooner. Wall clock is also the bound
-# that literally expresses the requirement ("never hang a campaign"). Both
-# bounds raise the same AllAccountsCappedException from one chokepoint, so the
-# handler below is correct either way.
+# RAISED 1800 s → 48 h on 2026-08-25 (Leo, during the γ2 ruling session,
+# esc-3634-1). The original 1800 s took the house value shared by
+# `_DRY_RUN_CAP_WAIT_SANITY_SECS` and
+# `_RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS`, on the rationale that "an eval
+# campaign is a bounded, queue-blocking job, so a fully-capped pool must fail
+# LOUD rather than park a campaign for two weeks". That rationale does not
+# survive contact with the gate:
 #
-# WHAT THIS BOUND DOES NOT COVER (reviewer: robustness — stated here so the
-# guarantee is not read as stronger than it is). `cap_wait_sanity_secs` is
-# consulted at exactly one place, `_check_cap_wait`, which runs in the cap-hit
-# branch AFTER an invocation returned and was classified as a cap. It therefore
-# bounds cap-RETRY patience. It does NOT bound the gate's own all-accounts-
-# capped wait: the next loop iteration re-enters `usage_gate.invoke_slot` →
-# `before_invoke`, which ends in an unbounded `await self._open.wait()`
-# (usage_gate.py:996) released only by a real cap reset or a successful resume
-# probe — hours, not 30 minutes. So a pool that is ALREADY frozen when a cell
-# starts can still block; what this bound guarantees is that a campaign
-# cap-retrying in a loop gives up loudly instead of churning for two weeks.
+#   A SHORT BOUND NEVER PREVENTED THE PARK. When every account is capped,
+#   `before_invoke` reaches `self._open.clear(); await self._open.wait()`
+#   (usage_gate.py) — unbounded, released only by a real cap reset or a
+#   successful resume probe. Freeing a campaign slot therefore buys no
+#   progress: the next cell parks in that same wait. The old bound only decided
+#   how many IN-FLIGHT cells were destroyed on the way to parking; the campaign
+#   parked either way. Worst of both.
 #
-# Deliberately NOT closed here with an outer
-# `asyncio.wait_for(invoke_with_cap_retry(...), ...)`: that timer cannot tell a
-# frozen pool from a genuinely slow candidate, so it would route a slow-but-
-# healthy architect into the cap handler → arch_unmeasurable → EXCLUDED, which
-# is the differential-exclusion bias φ exists to remove, re-created from the
-# other side. The bound belongs where the cause is known — inside the shared
-# wrapper, where waiting in `before_invoke` is definitionally a cap wait — and
-# that is a shared-seam change affecting dry_run_unblock and the reconciliation
-# stage runners too, so it is filed as follow-up rather than done here.
-_EVAL_CAP_WAIT_SANITY_SECS = 30 * 60
+#   AND TAINTING IS STRICTLY MORE EXPENSIVE THAN WAITING. A cap lands MID-cell,
+#   after the architect has already spent real money (γ1 mean: $8.88 banked per
+#   cap-excluded cell). `invoke_with_cap_retry` resumes the capped session via
+#   `--resume` on a freed account, preserving that work, so waiting costs ~$0
+#   extra. Tainting discards the banked spend AND pays full freight again on the
+#   prescribed re-run — strictly more total dollars and strictly more total wall
+#   clock, for the same measurement.
+#
+#   NOR IS RESTART A CHEAP ESCAPE. `run_ofat_stage` — the path campaign drivers
+#   use — has NO skip-existing guard (that is `run_eval_matrix`'s
+#   `_result_exists` check, a different function). Cells persist individually
+#   via `save_result`, so a kill loses no data, but a relaunch RE-RUNS and
+#   RE-SPENDS them unless the operator hand-restricts `--tasks-dir`.
+#
+# 48 h is sized to the observed account regime, not to a round number: 1-3
+# accounts typically sit uncapped against the WEEKLY cap and are hit repeatedly
+# against their 5-HOUR caps, giving short all-capped windows regularly plus one
+# long window each week. 1800 s cannot skate a 5-hour window; 48 h skates it
+# with large margin. A weekly exhaustion outlasts even this bound — but per the
+# park analysis above, no value of this constant makes that case loud, so the
+# choice costs nothing there.
+#
+# Deliberately NO `max_cap_retries` companion (unchanged): a fixed count scales
+# the wrong way, since cooldown doubles per full cycle through the pool, so a
+# bigger, healthier pool would give up SOONER. Wall clock is the bound that
+# literally expresses the requirement. Both raise the same
+# AllAccountsCappedException from one chokepoint, so the handler below is
+# correct either way.
+#
+# WHAT THIS BOUND STILL DOES NOT COVER. `cap_wait_sanity_secs` is consulted at
+# exactly one place, `_check_cap_wait`, which runs in the cap-hit branch AFTER
+# an invocation returned and was classified as a cap. It bounds cap-RETRY
+# patience and nothing else — the unbounded `_open.wait()` above is out of its
+# reach, and raising it does not change that. Making a fully-capped park
+# VISIBLE (rather than indistinguishable from a slow campaign) is filed as
+# follow-up; it is the "fail loud" the original comment wanted, implemented in
+# the wrong place.
+_EVAL_CAP_WAIT_SANITY_SECS = 48 * 3600
 
 
 async def _build_eval_usage_gate(orch_config: OrchestratorConfig) -> UsageGate | None:

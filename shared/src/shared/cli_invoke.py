@@ -134,17 +134,32 @@ _WATCHDOG_WORKING_POLL_SECS = 60.0
 #                                         retryable 'infra_failure' proposal
 #                                         entry instead of raising.
 #
-# orchestrator/evals/runner.py            _EVAL_CAP_WAIT_SANITY_SECS = 1800 s (30 min).
-#   (run_architect_eval invocation)       One cell of a bounded, queue-blocking
-#                                         eval campaign; the 14-day default
-#                                         would park the whole campaign on a
-#                                         single capped cell.
-#                                         AllAccountsCappedException is caught
-#                                         and recorded as a `cap_exhausted:`
-#                                         marker on the cell (tainted, so the
-#                                         cell is EXCLUDED from the reported
-#                                         mean rather than scored a fabricated
-#                                         0.0), never raised.  No
+# orchestrator/evals/runner.py            _EVAL_CAP_WAIT_SANITY_SECS = 172800 s (48 h).
+#   (run_architect_eval invocation)       RAISED from 1800 s on 2026-08-25
+#                                         (esc-3634-1).  It is the one caller in
+#                                         this table that does NOT take the
+#                                         short house value, deliberately.  The
+#                                         short bound was justified as "fail
+#                                         loud rather than park the campaign",
+#                                         but it never prevented the park — a
+#                                         fully-capped pool blocks in the gate's
+#                                         own unbounded _open.wait() regardless
+#                                         (see SCOPE note below), so the bound
+#                                         only chose how many in-flight cells
+#                                         were tainted on the way there.  And a
+#                                         cap lands MID-cell after real spend,
+#                                         which --resume preserves across the
+#                                         account switch: waiting is ~free,
+#                                         while tainting discards that spend and
+#                                         pays it again on the re-run.  48 h
+#                                         skates the 5-hour account caps that
+#                                         produce the common short all-capped
+#                                         windows.  AllAccountsCappedException
+#                                         is still caught and recorded as a
+#                                         `cap_exhausted:` marker on the cell
+#                                         (tainted, so the cell is EXCLUDED from
+#                                         the reported mean rather than scored a
+#                                         fabricated 0.0), never raised.  No
 #                                         max_cap_retries: cooldown doubles per
 #                                         pool cycle, so a fixed count would
 #                                         give a BIGGER account pool LESS
