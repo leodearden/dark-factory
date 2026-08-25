@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 import pytest_asyncio
 from _fm_helpers import make_8df8_scenario, pydantic_spec
+from _git_root_helper import make_git_root
 
 from fused_memory.config.schema import FusedMemoryConfig, ReconciliationConfig
 from fused_memory.models.enums import SourceStore
@@ -4332,9 +4333,7 @@ class TestVerificationFailureAudit:
         # unusable root BEFORE spawning an agent, so driving this through the
         # old '/tmp/test' default would flip the token under test to
         # 'codebase_root_unresolved' and stop exercising the CLI chain at all.
-        real_root = tmp_path / 'checkout'
-        real_root.mkdir()
-        (real_root / '.git').mkdir()
+        real_root = make_git_root(tmp_path, 'checkout')
 
         with patch('fused_memory.reconciliation.verify.AgentLoop') as MockAgentLoop:
             agent = AsyncMock()

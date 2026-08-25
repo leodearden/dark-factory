@@ -27,6 +27,7 @@ import logging
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from _git_root_helper import make_git_root
 from pydantic import ValidationError
 
 from fused_memory.config.schema import ReconciliationConfig
@@ -50,11 +51,11 @@ def git_root(tmp_path):
     a root that does not look like a checkout, so every call below needs a
     real one.  The assertions in this file are unchanged — it remains task
     4343's failure-token census guard; only the call shape moved.
+
+    The shape itself comes from the shared ``make_git_root`` helper so this
+    file cannot drift from the other two that build the same thing.
     """
-    root = tmp_path / 'repo'
-    root.mkdir()
-    (root / '.git').mkdir()
-    return root
+    return make_git_root(tmp_path)
 
 
 # ---------------------------------------------------------------------------

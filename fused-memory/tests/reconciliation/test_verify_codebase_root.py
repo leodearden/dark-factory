@@ -21,6 +21,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from _git_root_helper import make_git_root
 
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.reconciliation import VerificationVerdict
@@ -29,18 +30,11 @@ from fused_memory.reconciliation.verify import CodebaseVerifier
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-def _git_root(base: Path, name: str) -> Path:
-    """A directory that looks like a real checkout to the verifier.
-
-    ``.git`` is created as a DIRECTORY here; ``test_git_worktree_root_is_accepted``
-    covers the file-shaped ``.git`` of a ``git worktree`` checkout separately.
-    """
-    root = base / name
-    root.mkdir(parents=True, exist_ok=True)
-    (root / '.git').mkdir(exist_ok=True)
-    return root
+#
+# ``make_git_root`` (tests/_git_root_helper.py) builds the checkout-shaped
+# root verify() now requires.  It is shared with test_verify_agent_failure.py
+# and test_targeted.py: "usable root" is a production contract, so its
+# test-side mirror is defined once rather than per file.
 
 
 def _config(explore_root: str = '/nonexistent/global/explore/root') -> ReconciliationConfig:
@@ -125,7 +119,7 @@ def test_verifier_holds_no_global_codebase_root(tmp_path):
     second resolver being reintroduced as a "harmless" fallback: with no
     ``self.codebase_root`` there is nothing for a future edit to fall back to.
     """
-    config = _config(str(_git_root(tmp_path, 'global')))
+    config = _config(str(make_git_root(tmp_path, 'global')))
     verifier = CodebaseVerifier(config)
 
     assert not hasattr(verifier, 'codebase_root')
@@ -137,7 +131,7 @@ def test_verifier_holds_no_global_codebase_root(tmp_path):
 @pytest.mark.asyncio
 async def test_prompt_names_the_per_call_root(tmp_path):
     """The prompt's ``### Codebase Root`` line names the caller's root."""
-    root_a = _git_root(tmp_path, 'root_a')
+    root_a = make_git_root(tmp_path, 'root_a')
     config = _config()
     patcher, mock_cls, instance = _mock_agent_loop()
     try:
@@ -158,7 +152,7 @@ async def test_agent_cwd_is_the_per_call_root(tmp_path):
     Task 1989's rationale, re-pointed: the cwd's auto-loaded CLAUDE.md is the
     agent's main passive codebase signal, so it must be the TARGET project's.
     """
-    root_a = _git_root(tmp_path, 'root_a')
+    root_a = make_git_root(tmp_path, 'root_a')
     config = _config()
     patcher, mock_cls, _instance = _mock_agent_loop()
     try:
@@ -182,11 +176,11 @@ async def test_tool_closures_resolve_against_the_per_call_root(tmp_path):
     the global root at a POPULATED decoy makes the wrong-tree read return the
     WRONG file, so the regression fails loudly.
     """
-    root_a = _git_root(tmp_path, 'root_a')
+    root_a = make_git_root(tmp_path, 'root_a')
     (root_a / 'alpha.py').write_text('# alpha\n')
     (root_a / 'probe.txt').write_text('from-root-a')
 
-    decoy = _git_root(tmp_path, 'decoy')
+    decoy = make_git_root(tmp_path, 'decoy')
     (decoy / 'beta.py').write_text('# beta\n')
     (decoy / 'probe.txt').write_text('from-decoy')
 
@@ -215,8 +209,8 @@ async def test_subprocess_tools_run_in_the_per_call_root(tmp_path):
     run: that keeps the test hermetic and asserts the exact wiring (the cwd
     kwarg and grep's search path) instead of inferring it from output.
     """
-    root_a = _git_root(tmp_path, 'root_a')
-    decoy = _git_root(tmp_path, 'decoy')
+    root_a = make_git_root(tmp_path, 'root_a')
+    decoy = make_git_root(tmp_path, 'decoy')
 
     config = _config(str(decoy))
     patcher, mock_cls, _instance = _mock_agent_loop()
@@ -258,8 +252,8 @@ async def test_path_escape_guard_survives_the_rebind(tmp_path):
     breaks the guard in both directions.  This pins that the guard keeps
     refusing an escape after the root moved from __init__ to verify().
     """
-    root_a = _git_root(tmp_path, 'root_a')
-    decoy = _git_root(tmp_path, 'decoy')
+    root_a = make_git_root(tmp_path, 'root_a')
+    decoy = make_git_root(tmp_path, 'decoy')
     (decoy / 'probe.txt').write_text('from-decoy')
 
     patcher, mock_cls, _instance = _mock_agent_loop()
@@ -286,8 +280,8 @@ async def test_root_is_per_call_not_per_instance(tmp_path):
     project through it, so an implementation that caches the first root on
     ``self`` would be correct exactly once per process.  This kills that shape.
     """
-    root_a = _git_root(tmp_path, 'root_a')
-    root_b = _git_root(tmp_path, 'root_b')
+    root_a = make_git_root(tmp_path, 'root_a')
+    root_b = make_git_root(tmp_path, 'root_b')
 
     patcher, mock_cls, instance = _mock_agent_loop()
     try:
@@ -394,9 +388,7 @@ async def test_git_worktree_root_is_accepted(tmp_path):
     — and in the census that refusal would look identical to a genuinely bogus
     root.
     """
-    worktree = tmp_path / 'worktree'
-    worktree.mkdir()
-    (worktree / '.git').write_text('gitdir: /home/leo/src/project/.git/worktrees/wt\n')
+    worktree = make_git_root(tmp_path, 'worktree', dot_git='file')
 
     patcher, mock_cls, _instance = _mock_agent_loop()
     try:
@@ -413,7 +405,7 @@ async def test_git_worktree_root_is_accepted(tmp_path):
 @pytest.mark.asyncio
 async def test_valid_root_still_spawns_the_agent(tmp_path):
     """Positive control: without it, an implementation refusing EVERY root passes."""
-    root_a = _git_root(tmp_path, 'root_a')
+    root_a = make_git_root(tmp_path, 'root_a')
 
     patcher, mock_cls, _instance = _mock_agent_loop()
     try:
