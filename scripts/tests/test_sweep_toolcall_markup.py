@@ -54,6 +54,7 @@ from shared.toolcall_markup import (  # noqa: E402
     CANONICAL_OPENER_PREFIX,
     PREFILTER_NEEDLES,
     detect,
+    detect_for,
 )
 from shared.toolcall_markup import INVOKE_CLOSER as SHARED_INVOKE_CLOSER  # noqa: E402
 
@@ -953,33 +954,46 @@ def test_repair_leaves_quoting_prose_alone_when_it_cannot_be_repaired():
     assert [o.action for o in outcomes] == [sweep.ACTION_REFUSED]
 
 
-def test_echo_dialect_falls_through_to_a_later_candidate():
-    """MEASURED asymmetry between the two dialects. Documented, not asserted away.
+def test_echo_dialect_no_longer_half_repairs_past_its_own_misclose():
+    """MEASURED asymmetry between the two dialects — now CLOSED by task 4696.
 
-    When the tail names a sibling that is NOT a legal target, what repair()
-    does next depends on which dialect the tail is written in:
+    When the tail names a sibling that is NOT a legal target, repair() steps
+    over that candidate and tries the next one. What used to happen next
+    depended on which dialect the tail was written in:
 
     * CANONICAL — the later candidate is the ``parameter`` closer, and the
       clean prefix it would produce still contains the opener prefix, which IS
       an enumerated literal. repair()'s prefix-clean accept condition therefore
       rejects it and the whole value is refused. This is the live corpus's
       shape and the source of the 37 measured refusals.
-    * NAME-ECHOING — the later candidate is the pseudo-parameter's own closer,
+    * NAME-ECHOING — the later candidate was the pseudo-parameter's OWN closer,
       and neither it nor its opener is an enumerated literal, so the prefix
-      comes back clean and repair() ACCEPTS a truncation at that point.
+      came back "clean" to the param-BLIND ``detect`` and repair() ACCEPTED a
+      truncation there.
 
-    The echo outcome is cosmetic — it strips the trailing invoke terminator and
-    leaves the earlier mis-close sitting in the value as prose. It is still
-    LOSSLESS (invariant D5: the result is a prefix of the input, so no byte of
-    the swallowed text is destroyed), and the result no longer trips detect(),
-    so the second-run-zero invariant is unaffected.
+    That acceptance was the same defect task 4696 exists to end, merely wearing
+    the repairer's own clothes: the accepted ``clean_value`` still carried the
+    field's own ``detail`` mis-close, AND the ``evidence`` value the tail
+    declared was silently dropped on the floor. A caller reading the result
+    would see a value that is still corrupt and a sibling that was never told
+    anything went missing.
 
-    This sweep does NOT add a second policy layer to override it. repair() is
-    the gate by design (decision 7), and re-deciding its verdict here would
-    mean re-implementing the matching this module deliberately owns none of
-    (INV-5). The behaviour belongs to ``shared.toolcall_markup`` (task 3688);
-    this test pins what the sweep actually inherits so a future change there is
-    visible here rather than silent.
+    Now that the prefix-clean condition asks the parameter-AWARE predicate, the
+    field's own closer disqualifies that prefix, no later candidate qualifies,
+    and the whole value is REFUSED — visible, byte-identical residue instead of
+    a cosmetic half-repair. The reason is :data:`REASON_NO_STRING_HOLE_TARGET`
+    rather than :data:`REASON_UNREPAIRABLE`, and that distinction is
+    load-bearing: it says the tail DID parse and named a real field, and the
+    only thing blocking the repair is that ``evidence`` is a list holding no
+    string hole. An operator reading the report can therefore see the
+    recoverable value is still in there.
+
+    This sweep still adds NO second policy layer. repair() is the gate by
+    design (decision 7), and re-deciding its verdict here would mean
+    re-implementing the matching this module deliberately owns none of (INV-5).
+    The behaviour belongs to ``shared.toolcall_markup``; this row pins what the
+    sweep actually inherits so a future change there is visible rather than
+    silent.
     """
     record = make_escalation(
         'esc-7-7', 'resolved', _swallowed_echo('Detail.', 'detail', 'evidence', 'some text')
@@ -988,11 +1002,21 @@ def test_echo_dialect_falls_through_to_a_later_candidate():
 
     repaired, outcomes = sweep.repair_document(record)
 
-    assert [o.action for o in outcomes] == [sweep.ACTION_REPAIRED]
-    assert outcomes[0].recovered_names == (), 'nothing was restored — a truncation'
-    assert original_detail.startswith(repaired['detail']), 'D5 still holds: a PREFIX'
+    assert [o.action for o in outcomes] == [sweep.ACTION_REFUSED]
+    assert outcomes[0].reason == sweep.REASON_NO_STRING_HOLE_TARGET
+    assert outcomes[0].residue == sweep.RESIDUE_LEAK, (
+        'this dialect DOES carry the invoke terminator, so it is real leak '
+        'residue rather than prose that merely quotes a literal'
+    )
+    assert repaired['detail'] == original_detail, (
+        'a refusal leaves the value byte-identical — the earlier mis-close is '
+        'no longer left sitting inside a value the sweep called repaired'
+    )
     assert repaired['evidence'] == [], 'the list-typed field is still NOT displaced'
-    assert detect(repaired['detail']) is None, 'and the result no longer trips detect()'
+    assert detect_for(repaired['detail'], 'detail') is not None, (
+        'and the residue is still VISIBLE to the gate, so a later run that '
+        'gains a legal target for it will find it again'
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2033,3 +2057,155 @@ def test_the_did_not_converge_path_does_not_duplicate_refusals(monkeypatch):
     assert len([o for o in outcomes if o.action == sweep.ACTION_REPAIRED]) == (
         sweep._MAX_REPAIR_ROUNDS
     ), 'repairs still ACCUMULATE across rounds — one per round'
+
+
+# ---------------------------------------------------------------------------
+# task 4696 — the SELF-NAME dialect the per-field gate could not see.
+# ---------------------------------------------------------------------------
+
+#: The dominant written-corruption shape, measured 2026-08-25 over
+#: ``.worktrees/.task-meta/*/plan.json``: a field mis-closed with its OWN
+#: name-echoing tag and NOTHING else — no invoke terminator, no canonical
+#: opener. 212 of the 444 corrupted entries (48%) are invisible to the fixed
+#: literal set for exactly this reason, and 212 of those 212 are caught by the
+#: field's own closer alone.
+_SELF_NAME_RATIONALE_PROSE = 'Both mechanisms partition rather than race.'
+_SELF_NAME_RATIONALE = _SELF_NAME_RATIONALE_PROSE + _closer('rationale')
+
+_SELF_NAME_HOW_PROSE = 'Reuse the declared table directly.'
+_SELF_NAME_HOW = _SELF_NAME_HOW_PROSE + _closer('how')
+
+#: The DOUBLE mis-close: two self-name closers with prose stranded between
+#: them. repair() declines it structurally — the first candidate's tail does
+#: not parse, and the second would leave a clean_value still carrying the
+#: first — so the sweep must REFUSE rather than write a half-repair that
+#: silently swallowed the stranded prose.
+_DOUBLE_SELF_NAME = (
+    'Part one.' + _closer('rationale') + 'Stranded prose.' + _closer('rationale')
+)
+
+
+def _self_name_plan(rationale: str, how: str) -> dict:
+    """A plan-shaped document carrying BOTH dominant victims.
+
+    ``make_plan`` above is shared with the byte-fixture and discovery rows and
+    declares no ``reuse`` collection, so this builder is local rather than a
+    widening of it. The nesting is the real artifact's: a list of objects under
+    a named collection, each object holding only its own sibling keys.
+    """
+    return {
+        'task_id': '4696',
+        'title': 'fixture plan 4696',
+        'design_decisions': [{'decision': 'Widen the gate.', 'rationale': rationale}],
+        'reuse': [{'what': 'the declared table', 'how': how, 'where': 'plan_tools'}],
+        '_schema_version': 1,
+    }
+
+
+def test_the_self_name_specimen_is_invisible_to_the_blanket_predicate():
+    """Otherwise these rows would be re-testing an already-caught dialect.
+
+    The non-circular control: both specimens must be INVISIBLE to ``detect``
+    and VISIBLE to ``detect_for`` when it is told the name the value was
+    received as. If a future widening of the fixed literal set caught them
+    anyway, this row fails and the rows below stop proving anything.
+    """
+    for value, param in (
+        (_SELF_NAME_RATIONALE, 'rationale'),
+        (_SELF_NAME_HOW, 'how'),
+        (_DOUBLE_SELF_NAME, 'rationale'),
+    ):
+        assert detect(value) is None, 'the blanket predicate must NOT see it'
+        assert detect_for(value, param) == _closer(param)
+
+
+def test_repair_document_repairs_a_self_name_closer_in_a_dict_field():
+    """The gate widening, asserted where the sweep actually writes.
+
+    Today ``_repair_dict``'s per-field gate asks the param-free ``detect``, so
+    both fields are skipped, the document round-trips UNCHANGED and the sweep
+    reports nothing at all — the corruption is not even counted as residue.
+    """
+    document = _self_name_plan(_SELF_NAME_RATIONALE, _SELF_NAME_HOW)
+    original = json.loads(json.dumps(document))
+
+    repaired, outcomes = sweep.repair_document(document)
+
+    assert repaired['design_decisions'][0]['rationale'] == _SELF_NAME_RATIONALE_PROSE
+    assert repaired['reuse'][0]['how'] == _SELF_NAME_HOW_PROSE
+
+    # D5, asserted rather than assumed: the result is a PREFIX of the input, so
+    # no byte of authored text was destroyed and nothing was fabricated.
+    assert original['design_decisions'][0]['rationale'].startswith(
+        repaired['design_decisions'][0]['rationale']
+    )
+    assert original['reuse'][0]['how'].startswith(repaired['reuse'][0]['how'])
+
+    # Every sibling key untouched, by value AND type.
+    assert repaired['design_decisions'][0]['decision'] == 'Widen the gate.'
+    assert repaired['reuse'][0]['what'] == 'the declared table'
+    assert repaired['reuse'][0]['where'] == 'plan_tools'
+    assert sorted(repaired['reuse'][0]) == ['how', 'what', 'where'], (
+        'a repair may never add a key'
+    )
+
+    assert [o.action for o in outcomes] == [sweep.ACTION_REPAIRED] * 2
+    assert [o.json_path for o in outcomes] == [
+        'design_decisions[0].rationale',
+        'reuse[0].how',
+    ]
+    assert [o.field for o in outcomes] == ['rationale', 'how']
+    assert [o.recovered_names for o in outcomes] == [(), ()], (
+        'the B4 last-parameter shape: the mis-closed field was the final '
+        'argument, so nothing was dropped and nothing is recovered'
+    )
+    assert [o.reason for o in outcomes] == ['', '']
+
+
+def test_a_clean_plan_shaped_document_still_comes_back_by_identity():
+    """Copy-on-write must survive the widening.
+
+    The sweep decides whether to rewrite a file by whether the document
+    changed, so a gate that started copying on the clean path would make the
+    whole corpus look dirty. Pinned on the SAME shape the row above corrupts,
+    so the two differ in exactly one thing: the closer.
+    """
+    document = _self_name_plan(_SELF_NAME_RATIONALE_PROSE, _SELF_NAME_HOW_PROSE)
+
+    repaired, outcomes = sweep.repair_document(document)
+
+    assert outcomes == []
+    assert repaired is document, 'no copy churn on the clean path'
+
+
+def test_a_double_self_name_misclose_is_refused_and_classified():
+    """The paired refusal control: newly VISIBLE is not newly REPAIRABLE.
+
+    Widening the gate must make this string reach the residue counters, not
+    make it repairable. repair() declines it structurally, so the sweep reports
+    :data:`REASON_UNREPAIRABLE` and leaves the bytes alone.
+
+    The residue class is asserted explicitly rather than assumed, because it is
+    the reporting semantics of a population that could not previously be
+    reported at all: a self-name-closer-only value carries neither the invoke
+    terminator nor the canonical opener prefix, which are the only two needles
+    ``has_leak_signature`` looks for — so it classifies
+    :data:`RESIDUE_QUOTED_ONLY` even though it IS real corruption. That is a
+    measured consequence of the widening, recorded here so a future change to
+    the residue split is visible rather than silent.
+    """
+    document = _self_name_plan(_DOUBLE_SELF_NAME, _SELF_NAME_HOW_PROSE)
+    before = json.dumps(document, indent=2)
+
+    repaired, outcomes = sweep.repair_document(document)
+
+    assert json.dumps(repaired, indent=2) == before, (
+        'a refusal must leave the document byte-identical — a rewrite here '
+        'would mean the stranded prose was silently swallowed'
+    )
+    assert [o.action for o in outcomes] == [sweep.ACTION_REFUSED]
+    assert outcomes[0].json_path == 'design_decisions[0].rationale'
+    assert outcomes[0].field == 'rationale'
+    assert outcomes[0].reason == sweep.REASON_UNREPAIRABLE
+    assert not sweep.has_leak_signature(_DOUBLE_SELF_NAME)
+    assert outcomes[0].residue == sweep.RESIDUE_QUOTED_ONLY
