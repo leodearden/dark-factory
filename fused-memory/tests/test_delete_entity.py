@@ -604,38 +604,57 @@ class TestCountForeignRelationships:
         assert 'MENTIONS' not in cypher
         assert 'WHERE' not in cypher
 
-    @pytest.mark.asyncio
-    async def test_default_counts_an_invalidated_relates_to(
-        self, mock_config, make_backend, make_graph_mock,
-    ):
-        """A node whose every fact was superseded or TTL-invalidated still has
-        that history in the graph, and DETACH DELETE would destroy it.
-        ``get_valid_edges_for_node`` reports it as empty; this reports 1."""
-        backend = make_backend(mock_config)
-        graph = make_graph_mock(ro_rows=[[1]])
-        backend._driver._get_graph = MagicMock(return_value=graph)
-        assert await backend.count_foreign_relationships('n-3129', group_id='test') == 1
+    # WHERE THE GRAPH-LEVEL SEMANTICS ARE ACTUALLY GUARDED.  The guarantees
+    # this primitive exists for — an invalidated RELATES_TO still counts, an
+    # Episodic MENTIONS still counts, only THIS episode's own MENTIONS is
+    # excluded, and a self-loop is deliberately not deduped — are properties of
+    # the CYPHER, and are pinned by the cypher-shape tests above
+    # (`test_match_is_untyped_and_undirected`,
+    # `test_cypher_names_neither_RELATES_TO_nor_invalid_at`,
+    # `test_default_applies_no_exclusion`,
+    # `test_a_non_empty_episode_uuid_excludes_that_episodes_mentions`).
+    #
+    # They CANNOT be pinned by stubbing `ro_query` with a fixed scalar: a mock
+    # that is told to answer 1 and is then asserted to answer 1 stipulates its
+    # own conclusion and would pass unchanged if the semantics inverted.  What
+    # the stub genuinely exercises is the row-reading contract, so that is all
+    # the test below claims.  Real graph-level coverage needs an integration
+    # test against a live FalkorDB, where an invalidated RELATES_TO and a
+    # cross-episode MENTIONS can actually be created.
 
     @pytest.mark.asyncio
-    async def test_default_counts_an_episodic_mentions(
-        self, mock_config, make_backend, make_graph_mock,
+    @pytest.mark.parametrize('scalar', [0, 1, 2])
+    async def test_returns_the_scalar_the_query_yields(
+        self, mock_config, make_backend, make_graph_mock, scalar,
     ):
-        """``(ep:Episodic)-[:MENTIONS]->(n:Entity)`` links are real,
-        load-bearing provenance (``maintenance/cross_graph_move.py`` recreates
-        them precisely because losing them loses provenance) and are invisible
-        to every RELATES_TO-typed query in the backend."""
+        """The row-reading contract: whatever ``count(r)`` reports is returned
+        verbatim, with NO post-processing.
+
+        The absence of post-processing is the point.  ``2`` must survive as
+        ``2`` — a single A->A relationship double-matches the undirected pattern
+        and is intentionally NOT deduped, the OPPOSITE choice from
+        ``get_valid_edges_for_node``'s uuid-keyed dedup.  The asymmetry is
+        correct because the values are consumed differently: that one's list is
+        enumerated, while this one is consumed only as ``== 0``, so inflation can
+        only ever REFUSE a delete — the safe direction.
+        """
         backend = make_backend(mock_config)
-        graph = make_graph_mock(ro_rows=[[1]])
+        graph = make_graph_mock(ro_rows=[[scalar]])
         backend._driver._get_graph = MagicMock(return_value=graph)
-        assert await backend.count_foreign_relationships('n-3129', group_id='test') == 1
+        count = await backend.count_foreign_relationships('n-3129', group_id='test')
+        assert count == scalar
 
     @pytest.mark.asyncio
-    async def test_a_node_with_no_relationships_at_all_returns_zero(
+    async def test_an_empty_result_set_degrades_to_zero(
         self, mock_config, make_backend, make_graph_mock,
     ):
-        """The pattern REQUIRES a relationship, so a node with none produces no
-        rows — the empty result_set IS the zero path, not merely a defensive
-        one."""
+        """A DEFENSIVE branch, not the primary zero path.
+
+        ``count(r)`` is an ungrouped aggregate, so against a real server a node
+        with no relationships still comes back as one readable ``0`` row — the
+        ``int(rows[0][0])`` path above.  This covers only a driver that hands
+        back an empty ``result_set``.
+        """
         backend = make_backend(mock_config)
         graph = make_graph_mock(ro_rows=[])
         backend._driver._get_graph = MagicMock(return_value=graph)
@@ -699,57 +718,16 @@ class TestCountForeignRelationships:
         assert 'NOT (' in cypher
         assert extract_params(graph.ro_query.call_args).get('episode_uuid') == 'ep-1'
 
-    @pytest.mark.asyncio
-    async def test_a_node_whose_only_link_is_this_episodes_mentions_returns_zero(
-        self, mock_config, make_backend, make_graph_mock,
-    ):
-        """THE EXCLUSION IS LIVE, NOT DEAD CODE.  graphiti_core mints the
-        mis-resolved node AND its MENTIONS link from the same episodic node in
-        the same ``add_episode``, so a strict zero-degree predicate could never
-        fire on the very phantom the cleanup exists to remove."""
-        backend = make_backend(mock_config)
-        graph = make_graph_mock(ro_rows=[[0]])
-        backend._driver._get_graph = MagicMock(return_value=graph)
-        count = await backend.count_foreign_relationships(
-            'n-3129', group_id='test', episode_uuid='ep-1',
-        )
-        assert count == 0
-
-    @pytest.mark.asyncio
-    async def test_a_mentions_from_a_different_episode_still_counts(
-        self, mock_config, make_backend, make_graph_mock,
-    ):
-        """Any MENTIONS from an episode OTHER than the one in flight proves
-        pre-existing provenance and must refuse the delete."""
-        backend = make_backend(mock_config)
-        graph = make_graph_mock(ro_rows=[[1]])
-        backend._driver._get_graph = MagicMock(return_value=graph)
-        count = await backend.count_foreign_relationships(
-            'n-3129', group_id='test', episode_uuid='ep-1',
-        )
-        assert count == 1
-
-    # -- the deliberate self-loop double-count ------------------------------
-
-    @pytest.mark.asyncio
-    async def test_a_self_loop_double_counts_and_is_deliberately_not_deduped(
-        self, mock_config, make_backend, make_graph_mock,
-    ):
-        """A single A->A relationship matches the undirected pattern twice and
-        returns 2, NOT 1 — the OPPOSITE choice from
-        ``get_valid_edges_for_node``, which dedupes on ``e.uuid`` for exactly
-        this reason.
-
-        The asymmetry is correct because the two values are consumed
-        differently: that one's list is enumerated, while this one is consumed
-        only as ``== 0``.  Inflation can therefore only ever REFUSE a delete,
-        which is the safe direction.  A test pinning 1 here would be pinning a
-        dedup this guard must not have.
-        """
-        backend = make_backend(mock_config)
-        graph = make_graph_mock(ro_rows=[[2]])
-        backend._driver._get_graph = MagicMock(return_value=graph)
-        assert await backend.count_foreign_relationships('n-3129', group_id='test') == 2
+    # WHY THE EXCLUSION IS LIVE AND NOT DEAD CODE, and why no scalar-stub test
+    # is asserted for it: graphiti_core mints the mis-resolved node AND its
+    # MENTIONS link from the same episodic node in the same `add_episode`, so a
+    # strict zero-degree predicate could never fire on the very phantom the
+    # cleanup exists to remove.  The narrowness that makes that safe — the
+    # WHERE names the relationship TYPE and the specific episode node, so any
+    # invalidated RELATES_TO, and any MENTIONS from a DIFFERENT episode, still
+    # count — lives in the emitted Cypher and is asserted by
+    # `test_a_non_empty_episode_uuid_excludes_that_episodes_mentions` above.
+    # Stubbing `ro_query` to return 0 and asserting 0 would exercise none of it.
 
     @pytest.mark.asyncio
     async def test_raises_when_not_initialized(self, mock_config):
