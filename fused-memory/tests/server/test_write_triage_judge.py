@@ -24,6 +24,8 @@ from __future__ import annotations
 
 import inspect
 import json
+import types
+from unittest.mock import Mock
 
 import pytest
 
@@ -41,6 +43,11 @@ from fused_memory.server.write_triage import (
     BandDecision,
 )
 from fused_memory.server.write_triage_judge import (
+    _DEFAULT_JUDGE_CANDIDATE_COUNT,
+    _DEFAULT_JUDGE_ENABLED,
+    _DEFAULT_JUDGE_MODEL,
+    _DEFAULT_JUDGE_PROVIDER,
+    _DEFAULT_JUDGE_TIMEOUT_SECONDS,
     _ELIDED_MARKER,
     JUDGE_SYSTEM_PROMPT,
     JUDGE_VERDICTS,
@@ -48,6 +55,11 @@ from fused_memory.server.write_triage_judge import (
     JudgeOutputError,
     build_judge_prompt,
     parse_judge_verdict,
+    resolve_judge_candidate_count,
+    resolve_judge_enabled,
+    resolve_judge_model,
+    resolve_judge_provider,
+    resolve_judge_timeout,
     select_judge_candidates,
 )
 from fused_memory.services.memory_service import RRF_K, SearchResults
@@ -506,3 +518,264 @@ class TestBuildJudgePrompt:
         assert 'not' in lowered
         for word in JUDGE_VERDICTS:
             assert word in lowered
+
+
+# ---------------------------------------------------------------------------
+# defensive config resolvers
+# ---------------------------------------------------------------------------
+
+
+def _svc(llm: object = None, **write_triage) -> types.SimpleNamespace:
+    """A memory_service double whose config leaves are REAL namespaces.
+
+    Same shape as ``test_write_triage.py::_svc``, extended with the ``llm``
+    section the judge resolvers INHERIT from. A plain ``Mock()`` is used
+    deliberately in the negative cases: an unspecced Mock auto-generates every
+    attribute, so ``config.write_triage.judge_enabled`` yields a truthy Mock
+    rather than a bool — which is precisely the shape these resolvers refuse.
+    """
+    return types.SimpleNamespace(
+        config=types.SimpleNamespace(
+            write_triage=types.SimpleNamespace(**write_triage),
+            llm=llm,
+        ),
+    )
+
+
+_MISSING_HOPS = [
+    ('no config', types.SimpleNamespace()),
+    ('config is None', types.SimpleNamespace(config=None)),
+    (
+        'write_triage is None',
+        types.SimpleNamespace(config=types.SimpleNamespace(write_triage=None, llm=None)),
+    ),
+    ('no leaf', _svc()),
+    ('unspecced mock', Mock()),
+]
+
+
+class TestResolveJudgeEnabled:
+    """The judge's own kill switch — a finer lever than `write_triage.enabled`.
+
+    Defaults TRUE, unlike its sibling, and that asymmetry is deliberate. The
+    judge is structurally INERT while `write_triage.enabled` is false (no
+    triage code runs at all), so default-True costs nothing on today's shipped
+    config. Default-False would be the footgun: at the task-3169 flip the
+    operator would turn `enabled` on, silently get stub behaviour, and read
+    the resulting all-`stored` ack stream as evidence the corpus is novel.
+    """
+
+    def test_the_default_is_on(self) -> None:
+        assert _DEFAULT_JUDGE_ENABLED is True
+
+    @pytest.mark.parametrize('value', [True, False])
+    def test_a_configured_bool_is_used(self, value: bool) -> None:
+        assert resolve_judge_enabled(_svc(judge_enabled=value)) is value
+
+    @pytest.mark.parametrize(
+        ('label', 'service'), _MISSING_HOPS,
+        ids=[label for label, _ in _MISSING_HOPS],
+    )
+    def test_a_missing_hop_falls_back_to_the_default(
+        self, label: str, service: object,
+    ) -> None:
+        assert resolve_judge_enabled(service) is _DEFAULT_JUDGE_ENABLED, label
+
+    @pytest.mark.parametrize('value', [1, 0, 'true', 'false', [], None, object()])
+    def test_a_non_bool_falls_back_to_the_default(self, value: object) -> None:
+        """`isinstance(bool)` only — a truthy 1 must not enable by accident.
+
+        Nor may a falsy 0 DISABLE by accident: an operator who wrote `0` into
+        the wrong leaf would otherwise silently turn the judge off and see the
+        exact symptom the default-True choice exists to prevent.
+        """
+        assert resolve_judge_enabled(_svc(judge_enabled=value)) is _DEFAULT_JUDGE_ENABLED
+
+
+class TestResolveJudgeProvider:
+    """`judge_provider` — pinned, else INHERITED from `llm.provider`."""
+
+    @pytest.mark.parametrize('value', ['openai', 'anthropic'])
+    def test_a_known_provider_is_used(self, value: str) -> None:
+        assert resolve_judge_provider(_svc(judge_provider=value)) == value
+
+    def test_none_inherits_the_llm_provider(self) -> None:
+        """The judge follows the model the deployment already trusts.
+
+        Asserted explicitly against `anthropic`, not the module default, so
+        an implementation that merely returned the default would fail here
+        rather than passing by coincidence.
+        """
+        service = _svc(
+            judge_provider=None,
+            llm=types.SimpleNamespace(provider='anthropic', model=None),
+        )
+        assert resolve_judge_provider(service) == 'anthropic'
+
+    @pytest.mark.parametrize(
+        ('label', 'service'), _MISSING_HOPS,
+        ids=[label for label, _ in _MISSING_HOPS],
+    )
+    def test_a_missing_hop_falls_back_to_the_default(
+        self, label: str, service: object,
+    ) -> None:
+        assert resolve_judge_provider(service) == _DEFAULT_JUDGE_PROVIDER, label
+
+    @pytest.mark.parametrize('value', ['gemini', '', 42, True, []])
+    def test_an_unknown_provider_falls_back_rather_than_being_honoured(
+        self, value: object,
+    ) -> None:
+        """A provider string no arm implements would fail every single write.
+
+        Falling back is right here and RAISING is wrong: this resolver runs on
+        the write path, where C1 forbids raising. The unresolvable-provider
+        raise lives in the fan-out (`judge_write`), which IS inside
+        `triage_write`'s fail-open arm.
+        """
+        service = _svc(
+            judge_provider=value,
+            llm=types.SimpleNamespace(provider=None, model=None),
+        )
+        assert resolve_judge_provider(service) == _DEFAULT_JUDGE_PROVIDER
+
+    def test_an_unknown_llm_provider_falls_back_to_the_module_default(self) -> None:
+        service = _svc(
+            judge_provider=None,
+            llm=types.SimpleNamespace(provider='gemini', model=None),
+        )
+        assert resolve_judge_provider(service) == _DEFAULT_JUDGE_PROVIDER
+
+
+class TestResolveJudgeModel:
+    """`judge_model` — pinned, else INHERITED from `llm.model`."""
+
+    def test_a_configured_model_is_used(self) -> None:
+        assert resolve_judge_model(_svc(judge_model='gpt-4.1-nano')) == 'gpt-4.1-nano'
+
+    def test_none_inherits_the_llm_model(self) -> None:
+        service = _svc(
+            judge_model=None,
+            llm=types.SimpleNamespace(provider=None, model='claude-3-5-haiku-latest'),
+        )
+        assert resolve_judge_model(service) == 'claude-3-5-haiku-latest'
+
+    @pytest.mark.parametrize(
+        ('label', 'service'), _MISSING_HOPS,
+        ids=[label for label, _ in _MISSING_HOPS],
+    )
+    def test_a_missing_hop_falls_back_to_the_default(
+        self, label: str, service: object,
+    ) -> None:
+        assert resolve_judge_model(service) == _DEFAULT_JUDGE_MODEL, label
+
+    @pytest.mark.parametrize('value', ['', '   ', 42, True, [], object()])
+    def test_a_non_string_or_empty_model_falls_back(self, value: object) -> None:
+        """An empty model name reaches the SDK as a 404 on every write."""
+        service = _svc(
+            judge_model=value,
+            llm=types.SimpleNamespace(provider=None, model=None),
+        )
+        assert resolve_judge_model(service) == _DEFAULT_JUDGE_MODEL
+
+
+class TestResolveJudgeTimeout:
+    """The timeout is new to this codebase and it is not optional.
+
+    No LLM call anywhere in fused-memory sets one today, and the openai SDK
+    default is 600 seconds. On the SYNCHRONOUS `add_memory` write path that is
+    a wedge, not a degradation — the caller waits ten minutes for a write that
+    contract C1 promises never to block.
+    """
+
+    def test_the_default_is_bounded_well_under_the_sdk_default(self) -> None:
+        assert 0 < _DEFAULT_JUDGE_TIMEOUT_SECONDS <= 60
+
+    @pytest.mark.parametrize('value', [1, 2.5, 30, 0.01])
+    def test_a_configured_positive_number_is_used(self, value: float) -> None:
+        assert resolve_judge_timeout(_svc(judge_timeout_seconds=value)) == value
+
+    @pytest.mark.parametrize(
+        ('label', 'service'), _MISSING_HOPS,
+        ids=[label for label, _ in _MISSING_HOPS],
+    )
+    def test_a_missing_hop_falls_back_to_the_default(
+        self, label: str, service: object,
+    ) -> None:
+        assert resolve_judge_timeout(service) == _DEFAULT_JUDGE_TIMEOUT_SECONDS, label
+
+    @pytest.mark.parametrize('value', [0, 0.0, -1, -2.5, True, False, '10', [], None])
+    def test_a_non_positive_or_non_numeric_timeout_falls_back(
+        self, value: object,
+    ) -> None:
+        """A zero timeout fails EVERY call and reads as a total judge outage.
+
+        Honouring it would turn a config typo into a permanent storm
+        escalation whose stated cause (a broken judge) is not what is wrong.
+        `bool` is excluded for the usual reason: `True` would resolve to a
+        one-second budget with nothing to explain it.
+        """
+        service = _svc(judge_timeout_seconds=value)
+        assert resolve_judge_timeout(service) == _DEFAULT_JUDGE_TIMEOUT_SECONDS
+
+
+class TestResolveJudgeCandidateCount:
+    """How many candidates reach the prompt — PRD C1's "top 3-5"."""
+
+    def test_the_default_is_the_top_of_the_prd_range(self) -> None:
+        assert _DEFAULT_JUDGE_CANDIDATE_COUNT == 5
+
+    def test_a_configured_int_is_used(self) -> None:
+        assert resolve_judge_candidate_count(_svc(judge_candidate_count=3)) == 3
+
+    @pytest.mark.parametrize(
+        ('label', 'service'), _MISSING_HOPS,
+        ids=[label for label, _ in _MISSING_HOPS],
+    )
+    def test_a_missing_hop_falls_back_to_the_default(
+        self, label: str, service: object,
+    ) -> None:
+        assert (
+            resolve_judge_candidate_count(service) == _DEFAULT_JUDGE_CANDIDATE_COUNT
+        ), label
+
+    @pytest.mark.parametrize('value', [0, -1, 2.5, '5', True, False, [], None])
+    def test_a_non_positive_or_non_int_count_falls_back(self, value: object) -> None:
+        """A zero count would empty the slate and answer `stored` every time."""
+        service = _svc(judge_candidate_count=value)
+        assert (
+            resolve_judge_candidate_count(service) == _DEFAULT_JUDGE_CANDIDATE_COUNT
+        )
+
+
+class TestEveryResolverReadsLive:
+    """Nothing is captured at import or construction.
+
+    This is the precondition that makes the green-tier RELOADABLE_FIELDS
+    registration REAL rather than restart-only in disguise: `apply_reload`
+    mutates the shared config object IN PLACE, and a captured value cannot
+    observe an in-place mutation. A kill switch sitting in the allowlist while
+    silently requiring a restart is worse than no kill switch, because the
+    operator believes they turned it off.
+
+    Same property `test_write_triage.py::test_the_flag_is_read_live_not_captured`
+    pins for leaf beta.
+    """
+
+    @pytest.mark.parametrize(
+        ('resolver', 'attr', 'first', 'second'),
+        [
+            (resolve_judge_enabled, 'judge_enabled', True, False),
+            (resolve_judge_provider, 'judge_provider', 'openai', 'anthropic'),
+            (resolve_judge_model, 'judge_model', 'model-a', 'model-b'),
+            (resolve_judge_timeout, 'judge_timeout_seconds', 5.0, 12.0),
+            (resolve_judge_candidate_count, 'judge_candidate_count', 3, 4),
+        ],
+        ids=['enabled', 'provider', 'model', 'timeout', 'candidate_count'],
+    )
+    def test_a_mutation_is_observed_on_the_very_next_call(
+        self, resolver, attr: str, first: object, second: object,
+    ) -> None:
+        service = _svc(**{attr: first})
+        assert resolver(service) == first
+        setattr(service.config.write_triage, attr, second)
+        assert resolver(service) == second
