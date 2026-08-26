@@ -1608,6 +1608,9 @@ async def _run_architect_eval_hermetic(
     usage_gate_error=None,
     task_timeout_minutes=None,
     declines: dict[str, dict] | None = None,
+    decline_reader_errors: dict[str, BaseException] | None = None,
+    cleanup_side_effect=None,
+    expose_mocks: dict | None = None,
 ):
     """Drive run_architect_eval with every git/worktree/LLM boundary patched.
 
@@ -1648,6 +1651,19 @@ async def _run_architect_eval_hermetic(
     named kinds' readers to return the supplied artifact dicts (the shape
     ``artifacts.write_*`` persists, including the ``reported_at`` stamp the
     terminal-kind ordering policy compares). An unnamed kind stays ``None``.
+    ``decline_reader_errors={'already_done': OSError(...)}`` makes a named
+    reader RAISE instead — the corrupt-artifact path, which must degrade that
+    one kind rather than the cell.
+
+    ``cleanup_side_effect`` hangs a side_effect on the patched
+    ``cleanup_eval_worktree``. It has to be a CONSTRUCTOR argument rather than
+    something a caller sets on ``mocks['cleanup']`` afterwards, because the
+    thing worth asserting is ORDERING *during* the run: cleanup rmtree's the
+    relocated meta root, so a callback that samples state at the moment cleanup
+    is awaited is the only way to prove an artifact was read while it still
+    existed. ``expose_mocks`` is the dict such a callback reads the internal
+    doubles from — the harness fills it BEFORE the run starts, which the
+    returned ``mocks`` (available only afterwards) cannot do.
 
     ``orch_config_side_effect`` makes the patched ``build_eval_orch_config``
     RAISE — the harness-crash shape where the eval orch config (and therefore
@@ -1720,6 +1736,12 @@ async def _run_architect_eval_hermetic(
             f'unknown decline kind {_kind!r}: no TaskArtifacts.{_reader}'
         )
         getattr(artifacts_instance, _reader).return_value = _artifact
+    for _kind, _exc in (decline_reader_errors or {}).items():
+        _reader = f'read_{_kind}'
+        assert _reader in _decline_readers, (
+            f'unknown decline kind {_kind!r}: no TaskArtifacts.{_reader}'
+        )
+        getattr(artifacts_instance, _reader).side_effect = _exc
 
     briefing_instance = MagicMock()
     briefing_instance.build_architect_prompt = AsyncMock(return_value='ARCH PROMPT')
@@ -1742,7 +1764,7 @@ async def _run_architect_eval_hermetic(
     # hang a side_effect on it and observe ORDERING against the decline reads —
     # cleanup_eval_worktree rmtree's the meta root, so anything that must read
     # an artifact has to have done so before this mock is awaited.
-    mock_cleanup = AsyncMock()
+    mock_cleanup = AsyncMock(side_effect=cleanup_side_effect)
 
     # ``timeout_minutes`` rides in on the TASK dict (where it is untyped data)
     # rather than the ``timeout_override: int | None`` parameter, so a test can
@@ -1758,6 +1780,10 @@ async def _run_architect_eval_hermetic(
             MagicMock(side_effect=usage_gate_error) if usage_gate_error is not None
             else MagicMock(return_value=usage_gate)
         )
+
+    if expose_mocks is not None:
+        expose_mocks.update(artifacts=artifacts_instance, cleanup=mock_cleanup,
+                            invoke=mock_invoke, judge=mock_judge)
 
     with contextlib.ExitStack() as es:
         p = es.enter_context
@@ -4775,3 +4801,155 @@ class TestArchitectEvalCapResume:
         _first, second = mocks['invoke'].call_args_list
         assert second.kwargs.get('resume_session_id') is None
         assert second.kwargs['prompt'] == 'ARCH PROMPT'
+
+
+def _decline_artifact(reported_at: str = '2026-07-19T12:00:00+00:00') -> dict:
+    """A decline artifact in the shape every ``artifacts.write_*`` persists."""
+    return {'evidence': 'because', 'reason': 'because', 'reported_at': reported_at}
+
+
+@pytest.mark.asyncio
+class TestArchitectCellPersistsTerminalKind:
+    """Task 4760: the cell now says WHY ``plan_steps == 0``, without forensics.
+
+    Before this, an architect that took an explicit plan-tools decline exit
+    persisted a cell byte-indistinguishable from one that silently failed to
+    plan. The decline artifact was written and then rmtree'd by
+    ``cleanup_eval_worktree`` before anything read it, so tranche-1's 47
+    no-plan cells could be split into causes only from
+    ``~/.claude/projects/*run-<id>/`` transcripts.
+    """
+
+    def _cfg(self):
+        from orchestrator.evals.configs import EvalConfig
+
+        return EvalConfig(
+            'architect-sonnet-high', 'claude', 'sonnet', 'high', role='architect',
+        )
+
+    async def test_ordinary_plan_cell_persists_planned(self):
+        result, _ = await _run_architect_eval_hermetic(
+            self._cfg(), produced_plan=_well_formed_plan(),
+        )
+
+        assert result.metrics['terminal_kind'] == 'planned'
+
+    @pytest.mark.parametrize('kind', [
+        'false_premise', 'already_done', 'blocking_dependency',
+        'unactionable', 'ready_to_merge',
+    ])
+    async def test_decline_cell_persists_its_kind_and_stays_scored(self, kind):
+        """THE tranche-1 shape, now legible: no plan, an explicit decline.
+
+        ``plan_steps`` and ``outcome`` are UNCHANGED — a decline is a correct
+        refusal, not a content failure, so nothing about the existing cell moves.
+        """
+        result, _ = await _run_architect_eval_hermetic(
+            self._cfg(), produced_plan={},
+            declines={kind: _decline_artifact()},
+        )
+
+        assert result.metrics['terminal_kind'] == kind
+        assert result.metrics['plan_steps'] == 0
+        assert result.outcome == 'done'
+
+    async def test_silent_no_plan_cell_persists_none(self):
+        """The genuine "could not plan" outcome stays DISTINGUISHABLE from a
+        decline — which is the entire point of the field.
+        """
+        result, _ = await _run_architect_eval_hermetic(
+            self._cfg(), produced_plan={},
+        )
+
+        assert result.metrics['terminal_kind'] == 'none'
+        assert result.metrics['plan_steps'] == 0
+
+    async def test_plan_then_later_decline_persists_both_facts(self):
+        """The reify_task_4026 / run e522b1b0 ordering cell.
+
+        BOTH facts survive, so a downstream reader can bucket it either way and
+        neither reading is destroyed — planRate keeps its historical derivation.
+        """
+        plan = _well_formed_plan()
+        plan['steps'] = [
+            *plan['steps'],
+            {'id': 'step-5', 'type': 'test', 'description': 'RED test for Z'},
+            {'id': 'step-6', 'type': 'impl', 'description': 'GREEN implement Z'},
+        ]
+        plan['_finalized_at'] = '2026-07-19T10:00:00+00:00'
+
+        result, _ = await _run_architect_eval_hermetic(
+            self._cfg(), produced_plan=plan,
+            declines={'already_done': _decline_artifact('2026-07-19T11:00:00+00:00')},
+        )
+
+        assert result.metrics['plan_steps'] == 6
+        assert result.metrics['terminal_kind'] == 'already_done'
+
+    async def test_declines_are_read_before_the_worktree_is_cleaned_up(self):
+        """THE ordering ``cleanup_eval_worktree``'s rmtree would destroy.
+
+        ``snapshots.cleanup_eval_worktree`` rmtree's the relocated
+        ``.task-meta/<name>/`` root, so a read placed ANYWHERE after it — which
+        is everywhere post-``finally`` — would find nothing. Sampling the read
+        count at the moment cleanup is awaited is the only way to prove the
+        artifact was read while it still existed.
+        """
+        at_cleanup: dict[str, int] = {}
+        doubles: dict = {}
+
+        async def _sample_at_cleanup(*_args, **_kwargs):
+            at_cleanup['reads'] = doubles[
+                'artifacts'].read_false_premise.call_count
+
+        result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(), produced_plan={},
+            declines={'false_premise': _decline_artifact()},
+            cleanup_side_effect=_sample_at_cleanup,
+            expose_mocks=doubles,
+        )
+
+        assert mocks['cleanup'].await_count == 1
+        assert at_cleanup['reads'] >= 1, (
+            "the decline artifacts were still unread when "
+            "cleanup_eval_worktree rmtree'd the meta root"
+        )
+        assert result.metrics['terminal_kind'] == 'false_premise'
+
+    async def test_timeout_cell_still_persists_the_decline_kind(self):
+        """ONE read site covers all four exits — including the timeout, whose
+        plan is never read at all.
+        """
+        result, _ = await _run_architect_eval_hermetic(
+            self._cfg(), produced_plan={},
+            invoke_side_effect=TimeoutError,
+            declines={'blocking_dependency': _decline_artifact()},
+        )
+
+        assert result.outcome == 'timeout'
+        assert result.metrics['terminal_kind'] == 'blocking_dependency'
+
+    async def test_harness_error_cell_persists_none_and_does_not_raise(self):
+        """``artifacts`` is never constructed, so there is nothing to read —
+        and the ``finally``-block read must not turn that into a SECOND crash.
+        """
+        result, _ = await _run_architect_eval_hermetic(
+            self._cfg(), produced_plan=_well_formed_plan(),
+            orch_config_side_effect=RuntimeError('eval orch config exploded'),
+        )
+
+        assert result.outcome == 'blocked'
+        assert result.metrics['terminal_kind'] == 'none'
+
+    async def test_raising_decline_reader_leaves_the_cell_scored(self):
+        """A corrupt artifact costs THAT KIND's visibility, never the cell: the
+        terminal kind still resolves from the plan alone.
+        """
+        result, _ = await _run_architect_eval_hermetic(
+            self._cfg(), produced_plan=_well_formed_plan(),
+            decline_reader_errors={'already_done': OSError('corrupt json')},
+        )
+
+        assert result.outcome == 'done'
+        assert isinstance(result.metrics['plan_quality'], float)
+        assert result.metrics['terminal_kind'] == 'planned'
