@@ -28,6 +28,7 @@ from fused_memory.models.memory import MemoryResult
 from fused_memory.server import write_triage
 from fused_memory.server.grouped_read import (
     CHILD_KINDS,
+    CONTESTED_METADATA_KEY,
     PARENT_ID_KEY,
     _parent_id_in_meta,
 )
@@ -982,9 +983,25 @@ class TestDeclaresAttachKeys:
     """
 
     def test_the_predicate_covers_exactly_the_attach_owned_keys(self) -> None:
-        """The whole point: one key overwritten, one key defended, no gap."""
+        """The whole point: every key overwritten is a key defended, no gap."""
         for key in ATTACH_OWNED_KEYS:
             assert declares_attach_keys({key: 'anything'}) is True, key
+
+    def test_the_contested_flag_is_an_attach_owned_key(self) -> None:
+        """The third key, added by leaf gamma's contested attach (task 3128).
+
+        A `contested` child is an amendment PLUS `grouped_read`'s contested
+        flag, so the attach now writes three keys where it wrote two. Asserted
+        against the IMPORTED constant rather than the 'x_contested' literal:
+        `grouped_read`'s own docstring asks the write side to spell this from
+        there, because a read side and a write side that disagree about the
+        key produce children flagged in a way nothing reads.
+        """
+        assert CONTESTED_METADATA_KEY in ATTACH_OWNED_KEYS, (
+            f'the contested attach overwrites {CONTESTED_METADATA_KEY!r} but the '
+            f'force-store defends only {set(ATTACH_OWNED_KEYS)!r} — a caller who '
+            f'set it themselves has it silently destroyed'
+        )
 
     @pytest.mark.parametrize(
         ('label', 'metadata'),
@@ -998,6 +1015,10 @@ class TestDeclaresAttachKeys:
             ('another non-child registry kind', {'kind': 'completion_note'}),
             ('an agent-invented kind', {'kind': 'some_new_thing'}),
             ('an attach key beside ordinary metadata', {'source': 'n', 'kind': 'decision'}),
+            ('the contested flag the caller set themselves', {CONTESTED_METADATA_KEY: True}),
+            ('a contested flag beside ordinary metadata',
+             {'source': 'n', CONTESTED_METADATA_KEY: True}),
+            ('a contested flag the caller set FALSE', {CONTESTED_METADATA_KEY: False}),
         ],
     )
     def test_a_caller_owned_attach_key_force_stores(self, label, metadata) -> None:

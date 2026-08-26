@@ -27,10 +27,11 @@ through it and the test content needs no markup-proofing.)
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import types
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -38,7 +39,13 @@ from fused_memory.config.schema import ProceduralTopicCluster
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.memory import MemoryResult
 from fused_memory.server import tools, write_triage
-from fused_memory.server.grouped_read import AMENDMENT_KIND, PARENT_ID_KEY, SIGHTING_KIND
+from fused_memory.server.grouped_read import (
+    AMENDMENT_KIND,
+    CONTESTED_METADATA_KEY,
+    PARENT_ID_KEY,
+    SIGHTING_KIND,
+    is_contested_child,
+)
 from fused_memory.server.tools import create_mcp_server
 from fused_memory.server.write_triage import (
     _FAIL_OPEN_STORM_THRESHOLD,
@@ -819,26 +826,44 @@ class TestTheForceStoreArms:
         assert result[CANONICAL_ID_KEY] == 'canonical-A', f'{result!r}'
 
     @pytest.mark.asyncio
-    async def test_every_key_the_attach_writes_is_defended_by_the_force_store(self) -> None:
+    async def test_every_key_the_attach_writes_is_defended_by_the_force_store(
+        self, monkeypatch,
+    ) -> None:
         """The anti-drift pin `tools.py`'s attach comment promises.
 
-        That comment justifies overwriting `parent_id`/`kind` unconditionally
-        on the grounds that the force-store already caught every write
-        carrying either. A third key added to the attach dict without being
-        added to ATTACH_OWNED_KEYS would silently re-open the same loss for
-        that key, so the two sets are pinned against each other HERE, by
-        reading back what the attach actually persisted.
+        That comment justifies overwriting the attach-owned keys
+        unconditionally on the grounds that the force-store already caught
+        every write carrying any of them. A key added to the attach dict
+        without being added to ATTACH_OWNED_KEYS would silently re-open the
+        same loss for that key, so the two sets are pinned against each other
+        HERE, by reading back what the attach actually persisted.
+
+        Swept across EVERY attach outcome and UNIONED, because the outcomes no
+        longer write the same keys: leaf gamma's `contested` child is an
+        amendment PLUS `grouped_read`'s contested flag, so a single-outcome
+        probe would measure two keys and call a three-key defence too wide.
+        The union is the honest quantity — ATTACH_OWNED_KEYS must cover every
+        key ANY attach can overwrite, not merely the keys the commonest one
+        does.
         """
-        mock_service = AsyncMock()
-        _configure_config(mock_service, enabled=True)
-        _configure_pass_through_add_memory(mock_service)
-        mock_service.search.return_value = [_candidate('canonical-A', 0.97)]
-        server = create_mcp_server(mock_service)
+        written_by_attach: set[str] = set()
+        for outcome in (OUTCOME_RESTATED, OUTCOME_AMENDED, OUTCOME_CONTESTED):
+            mock_service = AsyncMock()
+            _configure_config(mock_service, enabled=True)
+            _configure_pass_through_add_memory(mock_service)
+            mock_service.search.return_value = [_candidate('canonical-A', 0.97)]
+            with patch.object(
+                tools, 'triage_write',
+                AsyncMock(return_value=BandDecision(
+                    outcome, 'canonical-A', 0.95, _T_HIGH, _T_LOW,
+                )),
+            ):
+                server = create_mcp_server(mock_service)
+                await _call(server, metadata={'source': 'notes'})
 
-        await _call(server, metadata={'source': 'notes'})
+            persisted = mock_service.add_memory.await_args.kwargs['metadata']
+            written_by_attach |= set(persisted) - {'source'}
 
-        persisted = mock_service.add_memory.await_args.kwargs['metadata']
-        written_by_attach = set(persisted) - {'source'}
         assert written_by_attach == set(ATTACH_OWNED_KEYS), (
             f'the attach writes {written_by_attach!r} but the force-store defends '
             f'{set(ATTACH_OWNED_KEYS)!r}; a key in the first set and not the second '
@@ -981,12 +1006,20 @@ class TestC1HoldsEndToEnd:
     async def test_the_canonical_is_never_mutated_on_any_path(
         self, monkeypatch,
     ) -> None:
-        """Swept across restate, store, judge-stub and every fail-open.
+        """Swept across restate, amend, CONTEST, store and every fail-open.
 
         Triage issues no update_memory and no delete_memory, ever. A canonical
         the write path can rewrite is a canonical a mis-scored write can
         destroy; leaving it read-only is what makes a wrong attach a cheap,
         reversible metadata edit (D4).
+
+        `contested` is the sharpest member of the sweep and the reason it was
+        extended (task 3128): a verdict that says the canonical is WRONG is
+        the one a reasonable implementation is most tempted to act on — by
+        editing, retracting or flagging the parent record itself. Triage
+        DETECTS, it does not adjudicate (D3): the contradiction is recorded as
+        a flagged child and the canonical is left exactly as it was, for the
+        existing gate machinery and a human to settle.
         """
         _install_counter(monkeypatch)
         scenarios = [
@@ -995,15 +1028,30 @@ class TestC1HoldsEndToEnd:
             ('store', {'search': AsyncMock(return_value=[_candidate('m1', 0.10)])}),
             ('no candidates', {'search': AsyncMock(return_value=[])}),
             ('fail-open', {'search': AsyncMock(side_effect=RuntimeError('down'))}),
+            ('amended', {'search': AsyncMock(return_value=[_candidate('m1', 0.80)]),
+                         'verdict': OUTCOME_AMENDED}),
+            ('contested', {'search': AsyncMock(return_value=[_candidate('m1', 0.80)]),
+                           'verdict': OUTCOME_CONTESTED}),
         ]
         for label, wiring in scenarios:
             mock_service = AsyncMock()
             _configure_config(mock_service, enabled=True)
             _configure_pass_through_add_memory(mock_service)
             mock_service.search = wiring['search']
-            server = create_mcp_server(mock_service)
-
-            await _call(server)
+            verdict = wiring.get('verdict')
+            forced = (
+                patch.object(
+                    tools, 'triage_write',
+                    AsyncMock(return_value=BandDecision(
+                        verdict, 'm1', 0.80, _T_HIGH, _T_LOW,
+                    )),
+                )
+                if verdict is not None
+                else contextlib.nullcontext()
+            )
+            with forced:
+                server = create_mcp_server(mock_service)
+                await _call(server)
 
             mock_service.update_memory.assert_not_awaited()
             mock_service.delete_memory.assert_not_awaited()
@@ -1418,14 +1466,29 @@ class TestEveryWiredAttachKindReachesThePersistedChild:
         assert counter.live_count() == 0, 'a wired attach outcome is not a failure'
 
 
-class TestAVerdictWithNoWiredAttachKindIsVisible:
-    """`contested` is in TRIAGE_OUTCOMES but has no entry in _TRIAGE_ATTACH_KINDS.
+#: A verdict word no judge publishes and no table wires — the FIFTH outcome,
+#: standing in for whatever a future leaf teaches the judge to say. Held here
+#: as a literal on purpose: the moment this becomes a real constant somewhere
+#: it must also gain a `_TRIAGE_ATTACH_KINDS` entry, and the test below is
+#: what notices if it does not.
+_UNWIRED_FUTURE_VERDICT = 'superseded'
 
-    Unreachable today — the stub judge only returns `stored` — but this is a
-    trap laid for leaf gamma: its FIRST contested verdict would otherwise be
-    discarded, acked as plain `stored`, and indistinguishable from "nothing
-    matched". The docstring advertises `contested` as a value `routed` can
-    carry, so a consumer would wait for it forever with nothing to grep.
+
+class TestAVerdictWithNoWiredAttachKindIsVisible:
+    """A verdict in nobody's wiring table stores, but never silently.
+
+    This began as leaf beta's trap for `contested`, which task 3128 has since
+    WIRED — so the arm is now unreachable for all four published outcomes.
+    That is precisely what keeps it worth having rather than dead code: it is
+    the guard for the FIFTH verdict, arriving from a future judge whose
+    vocabulary grew without `_TRIAGE_ATTACH_KINDS` growing with it. Without
+    this arm such a verdict is discarded, acked as plain `stored`, and
+    indistinguishable from "nothing matched" — a consumer would wait for it
+    forever with nothing to grep.
+
+    Reachable only by forcing the decision, because `triage_write` refuses an
+    out-of-vocabulary verdict upstream. Two independent defences against the
+    same drift, and this is the tool-seam one.
     """
 
     @pytest.mark.asyncio
@@ -1437,7 +1500,7 @@ class TestAVerdictWithNoWiredAttachKindIsVisible:
         monkeypatch.setattr(
             tools, 'triage_write',
             AsyncMock(return_value=BandDecision(
-                OUTCOME_CONTESTED, 'm1', 0.85, _T_HIGH, _T_LOW,
+                _UNWIRED_FUTURE_VERDICT, 'm1', 0.85, _T_HIGH, _T_LOW,
             )),
         )
         server = create_mcp_server(mock_service)
@@ -1452,9 +1515,137 @@ class TestAVerdictWithNoWiredAttachKindIsVisible:
             f'a half-wired outcome must not invent a parent link: {metadata!r}'
         )
         assert any(
-            OUTCOME_CONTESTED in record.getMessage() for record in caplog.records
+            _UNWIRED_FUTURE_VERDICT in record.getMessage() for record in caplog.records
         ), f'the discarded verdict must name itself: {caplog.text!r}'
         assert counter.live_count() == 1, (
             'a gap between the judge vocabulary and the tool wiring is a '
             'fail-open, not a routing decision nobody notices (INV-4)'
         )
+
+
+class TestAContestedVerdictLandsAsAFlaggedAmendmentChild:
+    """Leaf gamma's third named signal: `contested` is wired end to end.
+
+    The judge DETECTS a contradiction; it does not adjudicate one (D3). So a
+    contested write lands as a child carrying the full submitted text, flagged
+    with `grouped_read.CONTESTED_METADATA_KEY` for the gate machinery that
+    already reads that flag — and the canonical it contradicts is not touched.
+    """
+
+    @staticmethod
+    def _server(monkeypatch, canonical: str = 'canonical-A'):
+        """A server whose triage answers `contested` naming *canonical*."""
+        mock_service = AsyncMock()
+        _configure_config(mock_service, enabled=True)
+        _configure_pass_through_add_memory(mock_service)
+        monkeypatch.setattr(
+            tools, 'triage_write',
+            AsyncMock(return_value=BandDecision(
+                OUTCOME_CONTESTED, canonical, 0.85, _T_HIGH, _T_LOW,
+            )),
+        )
+        return mock_service, create_mcp_server(mock_service)
+
+    @pytest.mark.asyncio
+    async def test_the_ack_names_the_memory_the_write_contradicts(
+        self, monkeypatch,
+    ) -> None:
+        """`routed: contested` is a real ack now, not a value nothing emits."""
+        mock_service, server = self._server(monkeypatch)
+
+        result = await _call(server)
+
+        assert result[ROUTED_KEY] == OUTCOME_CONTESTED, f'{result!r}'
+        assert result[CANONICAL_ID_KEY] == 'canonical-A', (
+            f'a contested write IS an attach, so the ack must name what it '
+            f'attached to: {result!r}'
+        )
+        assert 'error' not in result, f'the write was blocked: {result!r}'
+        assert mock_service.add_memory.await_args.kwargs['content'] == _CONTENT, (
+            'C1: the contradicting text is stored verbatim, never summarised '
+            'and never dropped'
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_child_is_an_amendment_and_not_a_sighting(
+        self, monkeypatch,
+    ) -> None:
+        """A sighting's TEXT is invisible in the grouped document.
+
+        `grouped_read` DIGESTS amendment text into the grouped block and
+        merely COUNTS sightings. A contested child filed as a sighting would
+        have its correction suppressed under the very entry it contests —
+        the esc-5712 five-week-wrong-appendix shape that `is_contested_child`
+        exists to prevent. The kind is the whole difference between a
+        correction someone reads and a tally nobody does.
+        """
+        mock_service, server = self._server(monkeypatch)
+
+        await _call(server)
+
+        metadata = mock_service.add_memory.await_args.kwargs['metadata']
+        assert metadata['kind'] == AMENDMENT_KIND, f'{metadata!r}'
+        assert metadata['kind'] != SIGHTING_KIND, f'{metadata!r}'
+        assert metadata[PARENT_ID_KEY] == 'canonical-A', f'{metadata!r}'
+
+    @pytest.mark.asyncio
+    async def test_the_read_side_predicate_recognises_what_the_write_side_stamped(
+        self, monkeypatch,
+    ) -> None:
+        """Asserted THROUGH `is_contested_child`, not by re-reading the key.
+
+        This is the pin `grouped_read`'s docstring asks leaf gamma for: the
+        write side and the read side agreeing by construction. Re-reading
+        `metadata['x_contested']` here would pass just as happily if the two
+        modules had drifted onto different spellings, which is the one failure
+        this is for.
+        """
+        mock_service, server = self._server(monkeypatch)
+
+        await _call(server)
+
+        metadata = mock_service.add_memory.await_args.kwargs['metadata']
+        assert is_contested_child(metadata) is True, (
+            f'the write side stamped {metadata!r} and the read-side predicate '
+            f'does not recognise it as contested'
+        )
+        assert metadata[CONTESTED_METADATA_KEY] is True, f'{metadata!r}'
+
+    @pytest.mark.asyncio
+    async def test_the_contested_path_is_not_a_fail_open(
+        self, monkeypatch, caplog,
+    ) -> None:
+        """The trap leaf beta laid, now sprung the right way round.
+
+        Before this wiring a `contested` verdict fell into the no-attach-kind
+        arm, was COUNTED as a fail-open and acked `stored`. A wired outcome is
+        a routing decision, not a degradation: a judge answering contested at
+        any volume must not read as a fail-open storm.
+        """
+        counter = _install_counter(monkeypatch)
+        mock_service, server = self._server(monkeypatch)
+
+        with caplog.at_level(logging.WARNING, logger=tools.logger.name):
+            result = await _call(server)
+
+        assert result[ROUTED_KEY] == OUTCOME_CONTESTED, f'{result!r}'
+        assert counter.live_count() == 0, (
+            'a wired attach outcome is a decision, not a failure; counting it '
+            'would drown INV-4 in false storms exactly when the judge works'
+        )
+        assert not any(
+            'no attach kind wired' in record.getMessage() for record in caplog.records
+        ), f'contested is wired now — nothing may call it unwired: {caplog.text!r}'
+
+    @pytest.mark.asyncio
+    async def test_the_canonical_it_contradicts_is_not_touched(
+        self, monkeypatch,
+    ) -> None:
+        """D3/D4: triage detects the contradiction, it does not settle it."""
+        mock_service, server = self._server(monkeypatch)
+
+        await _call(server)
+
+        mock_service.update_memory.assert_not_awaited()
+        mock_service.delete_memory.assert_not_awaited()
+        assert mock_service.add_memory.await_count == 1
