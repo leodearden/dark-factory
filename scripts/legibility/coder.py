@@ -561,6 +561,42 @@ def code_digest(
     try:
         judgment = parse_coder_output(raw)
     except CoderParseError as exc:
+        # The SECOND cap scan site, and its placement INSIDE this arm is
+        # load-bearing. The CLI does not always exit non-zero when it declines
+        # to answer -- it can print the banner and exit 0, so the "reply"
+        # arrives here as prose that could not be parsed into a verdict.
+        #
+        # Scanning only AFTER the parse has failed is census's
+        # split-on-parse-success rule, adopted unchanged (see
+        # ``census._build_default_verify_fn``'s docstring, which records the
+        # live defect): scanning arbitrary model output with the loose marker
+        # list aborted the census on cap-THEMED clusters, because this repo's
+        # codebook is dominated by clusters ABOUT usage and weekly limits, so
+        # the markers match ordinary HEALTHY content. The coder is exposed
+        # identically -- a judgment's model-authored
+        # ``title``/``cause``/``evidence_quote`` legitimately quote capped
+        # sessions, since "an agent stalled on a usage limit" is a real
+        # confusion worth coding. A pre-parse scan would discard exactly those
+        # findings, quietly, and label the loss a deferral. A reply that
+        # PARSES into a verdict is a verdict.
+        #
+        # ONE deliberate divergence from census: no confirmation probe. Census
+        # needs one because its scan can strike a reply it would otherwise
+        # have ACCEPTED, so a false positive there destroys a good verdict.
+        # Both of the coder's scan sites sit on already-failed paths, where
+        # the alternative disposition is already "per-digest failure" -- so a
+        # false positive can only re-LABEL a digest that was failing anyway,
+        # never launder a genuine verdict into a defer. The hazard the probe
+        # exists to prevent does not exist here.
+        marker = looks_like_blocking_banner(raw)
+        if marker:
+            return CodingResult(
+                ok=False, record=None, session=session, capped=True,
+                reason=(
+                    f"CLI reply is a capacity/auth banner, not a verdict "
+                    f"(marker: {marker!r}); {exc}"
+                ),
+            )
         return CodingResult(ok=False, record=None, reason=str(exc), session=session)
 
     record = {
