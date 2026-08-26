@@ -34,6 +34,15 @@ route to. That is an agent-facing read improvement and a machine-consumer
 regression; see :func:`retrieve_candidates` for the full reasoning. Use the
 seam, and pass the flags a candidate-set consumer needs.
 
+THE JUDGE SLOT IS FILLED. ``server/write_triage_judge.py`` (leaf gamma) is
+the real middle-band judge, and ``server/tools.py`` is the SINGLE place that
+wires it in as ``triage_write(..., judge=judge_write)``. The import direction
+is one-way and load-bearing: that module imports this one for the ``OUTCOME_*``
+constants, so this module must NEVER import it — making the real judge
+``triage_write``'s own default would be a circular import. ``_stub_judge``
+remains the default here for direct callers and for the contract tests that
+inject their own fakes.
+
 The pure/impure split mirrors ``near_duplicate_guard``: pure synchronous
 selectors and defensive ``getattr``-at-every-hop config resolvers, with the
 one async retrieval helper and the async orchestrator kept separate from them.
@@ -50,7 +59,11 @@ from typing import TYPE_CHECKING, Any
 from shared.storm_counter import StormCounter
 
 from fused_memory.models.enums import MEM0_PRIMARY
-from fused_memory.server.grouped_read import CHILD_KINDS, PARENT_ID_KEY
+from fused_memory.server.grouped_read import (
+    CHILD_KINDS,
+    CONTESTED_METADATA_KEY,
+    PARENT_ID_KEY,
+)
 
 # The per-store-cosine reader, IMPORTED rather than re-implemented (INV-5) —
 # the same treatment PARENT_ID_KEY and CHILD_KINDS get above. This module
@@ -115,13 +128,27 @@ FAIL_OPEN_ESCALATION_ID_KEY = 'triage_fail_open_escalation_id'
 #: below is derived from, so the two cannot drift: every key the attach
 #: writes is a key a caller must be allowed to keep.
 #:
+#: THREE keys, not two, since task 3128 wired the ``contested`` outcome: that
+#: child is an amendment PLUS ``CONTESTED_METADATA_KEY``, so a caller who set
+#: the contested flag themselves must force-store like any other. Note the
+#: outcomes no longer write the SAME keys — only ``contested`` writes the
+#: third — so this set is the UNION over outcomes, which is what the force
+#: store has to defend. The gate suite pins it that way, sweeping every attach
+#: outcome and unioning what each persisted.
+#:
 #: ``'kind'`` is spelled as a literal because ``grouped_read`` exports the
 #: kind VALUES (``AMENDMENT_KIND``/``SIGHTING_KIND``) but no constant for the
 #: key itself, and that module is outside this task's scope to extend.
+#: ``CONTESTED_METADATA_KEY`` by contrast IS exported, so it is imported —
+#: ``grouped_read`` owns the read-side predicate that has to recognise what
+#: the write side stamps, and two spellings of that key would produce children
+#: flagged in a way nothing reads.
 #: ``tests/server/test_add_memory_write_triage_gate.py`` pins this set against
-#: the keys ``tools.py`` actually writes, so a third key added to the attach
+#: the keys ``tools.py`` actually writes, so a FOURTH key added to the attach
 #: without widening this set fails there rather than silently.
-ATTACH_OWNED_KEYS: frozenset[str] = frozenset({PARENT_ID_KEY, 'kind'})
+ATTACH_OWNED_KEYS: frozenset[str] = frozenset({
+    PARENT_ID_KEY, 'kind', CONTESTED_METADATA_KEY,
+})
 
 #: The write was stored as a new standalone memory. Also the fail-open
 #: outcome and the deliberate-stub outcome — from the caller's side those are
@@ -320,16 +347,22 @@ def declares_attach_keys(metadata: Any) -> bool:
     keys — ``memory_metadata`` validates ``kind`` against ``KIND_REGISTRY``
     and ``parent_id`` for UUID shape, and ``MemoryService`` resolves parent
     liveness — so an agent CAN and does set both through ``add_memory``. An
-    ATTACH outcome overwrites BOTH (see :data:`ATTACH_OWNED_KEYS`), so
+    ATTACH outcome overwrites them (see :data:`ATTACH_OWNED_KEYS`), so
     whatever the caller put there is destroyed with no log line and no
     fail-open count. Under a contract whose first clause is *never lose
     content*, a write that would cost the caller its own metadata force-stores
     instead.
 
-    Scoped to those two keys and NOT to metadata generally: triage must still
+    Scoped to those keys and NOT to metadata generally: triage must still
     fire for the ordinary write that carries a ``source`` or a ``topic``,
     which is nearly all of them. The keys here are exactly the ones the attach
     clobbers, no wider.
+
+    PRESENCE is the test, never truthiness — which matters most for the third
+    key: a caller who explicitly wrote ``x_contested: False`` has made a
+    claim about the record, and letting a contested attach flip it to ``True``
+    would be the same silent overwrite in the one direction where the value
+    reverses the record's meaning.
 
     ANY ``kind`` counts, not just ``CHILD_KINDS``. The narrower rule looked
     sufficient — an ``amendment`` demoted to a ``sighting`` is the loudest
@@ -675,8 +708,9 @@ async def _stub_judge(
     content: str,
     project_id: str,
     decision: BandDecision | None,
+    candidates: Any = (),
 ) -> str:
-    """Middle-band adjudication — LEAF GAMMA'S REPLACEMENT POINT.
+    """Middle-band adjudication — leaf gamma's ``write_triage_judge`` replaces this.
 
     Returns :data:`OUTCOME_STORED` unconditionally. That is a DELIBERATE STUB,
     explicitly NOT a fail-open event: it must never be routed through
@@ -694,6 +728,19 @@ async def _stub_judge(
     Storing is also the right stub answer on the merits: with no judge, the
     only alternative is to attach on a similarity the calibration explicitly
     declined to call deterministic.
+
+    *candidates* carries the retrieved records and is accepted with a DEFAULT,
+    so a four-keyword call from a direct caller stays valid. This stub ignores
+    them; leaf gamma's real judge consumes them and trims to PRD C1's top 3-5
+    itself.
+
+    STILL THE DEFAULT, deliberately, now that the real judge has landed.
+    ``server/tools.py`` is the single place that passes
+    ``judge=write_triage_judge.judge_write``, which keeps this module free of
+    that import and the dependency acyclic (``write_triage_judge`` imports
+    THIS module; this module must never import that one). It also keeps the
+    judge-slot contract tests above meaningful — they inject their own fakes
+    and must not accidentally reach a live LLM.
     """
     return OUTCOME_STORED
 
@@ -831,6 +878,15 @@ async def triage_write(
             content=content,
             project_id=project_id,
             decision=decision,
+            # PRD C1's judge input is "the new entry + top 3-5 candidates", so
+            # the retrieved records have to survive the trip. Passed WHOLE and
+            # un-transformed, for the same reason `retrieve_candidates` returns
+            # it whole: a slice or a comprehension yields a plain list and
+            # silently drops `degraded`/`failed_stores`. Trimming to the top
+            # few is the judge's own job (write_triage_judge.
+            # select_judge_candidates), which is also why no width is imposed
+            # here -- one home for that decision.
+            candidates=results,
         )
     except Exception as exc:  # noqa: BLE001 — C1: nothing escapes this path.
         _record_fail_open(counter, project_id, exc, stage='judge')

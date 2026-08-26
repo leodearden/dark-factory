@@ -102,6 +102,35 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
     # Retrieval width, tuned against measured recall on a running server rather
     # than by redeploying. Read live per write, same path as the flag above.
     'write_triage.candidate_k',
+    # The six write-triage JUDGE knobs (task 3128, PRD leaf gamma). Green-tier
+    # for exactly the reason the two operator knobs above are: every one of
+    # them is read LIVE off the shared memory_service.config.write_triage
+    # object per middle-band write by server/write_triage_judge.py's resolvers,
+    # and nothing is captured at import or at construction -- which is what
+    # makes this registration real rather than restart-only in disguise.
+    # tests/test_config_reload.py::TestWriteTriageJudgeLeavesAreGreenTier pins
+    # both halves, and derives the expected leaf set from
+    # WriteTriageConfig.model_fields, so a SEVENTH judge_* leaf added later
+    # without a line here fails there rather than degrading silently.
+    #
+    # `judge_enabled` in particular MUST be green-tier, for the same reason
+    # `write_triage.enabled` and `mem0_update.enabled` are: it is the lever an
+    # operator flips to stop an in-flight JUDGE incident (spend, latency, a bad
+    # model) WITHOUT disabling the deterministic bands, and a restart-only kill
+    # switch is no kill switch. It is the strictly finer of the two levers, so
+    # making it restart-only would leave `enabled` -- the blunt one -- as the
+    # only hot response to a judge-specific problem.
+    'write_triage.judge_enabled',
+    'write_triage.judge_provider',
+    'write_triage.judge_model',
+    'write_triage.judge_timeout_seconds',
+    'write_triage.judge_candidate_count',
+    # The traceability pointer to leaf gamma's committed accuracy report, the
+    # exact sibling of calibration_report_path above: reloaded alongside the
+    # knobs it describes so config never names a stale measurement run. This is
+    # the one judge leaf with no live resolver -- it is read by the operator at
+    # the task-3169 flip gate, not on the write path.
+    'write_triage.judge_accuracy_report_path',
     # In-place update_memory authorization (task 3088). Read live per tool call
     # by resolve_mem0_update_enabled (server/mem0_update_authz.py) off the
     # shared memory_service.config.mem0_update object -- the resolver captures

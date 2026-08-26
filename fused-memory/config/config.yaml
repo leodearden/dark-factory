@@ -389,6 +389,41 @@ write_triage:
   # 88.5% @50); the retired guard's limit=5 is the number this deliberately is
   # not. Counted as a TOTAL across the three Mem0-primary categories.
   candidate_k: 20
+  # JUDGE KNOBS (leaf gamma, task 3128) — also hand-set operator knobs, and
+  # deliberately ABOVE the calibration fence below so --write-config preserves
+  # them. All six are green-tier hot-reloadable and read live per middle-band
+  # write.
+  #
+  # judge_enabled: the kill switch for the LLM arm alone. Defaults TRUE,
+  # unlike `enabled` above, because the judge is inert while triage is off —
+  # and because a judge that had to be switched on SEPARATELY at the 3169 flip
+  # is a footgun: the operator would flip `enabled`, get stub behaviour, and
+  # read the all-`stored` ack stream as "the corpus is novel". Set false to
+  # stop an in-flight judge incident without disabling the deterministic bands.
+  judge_enabled: true
+  # judge_provider / judge_model: null INHERITS llm.provider / llm.model, so
+  # the judge follows the model this deployment already trusts for add_memory
+  # auto-classification. "haiku-class" in the PRD is a cost/size class, not a
+  # vendor pin.
+  judge_provider: null
+  judge_model: null
+  # judge_timeout_seconds: NOT optional. No LLM call elsewhere in fused-memory
+  # sets a timeout and the openai SDK default is 600s; on the synchronous
+  # add_memory write path that is a wedge, not a degradation. A timeout
+  # propagates into triage_write's fail-open arm — stored, plus a counted
+  # fail-open (INV-4).
+  judge_timeout_seconds: 10.0
+  # judge_candidate_count: how many of the `candidate_k` retrieved records
+  # reach the prompt — PRD C1's "top 3-5". The band's own winner is always
+  # included regardless of this cap.
+  judge_candidate_count: 5
+  # judge_accuracy_report_path: traceability from the judge shipped here back
+  # to the run that MEASURED it against leaf alpha's curator-labelled fixture,
+  # exactly as calibration_report_path points at the run that produced
+  # t_high/t_low. This is the operator's input at the task-3169 flip gate; no
+  # accuracy floor is asserted anywhere in code or tests (PRD D10 makes the
+  # report the arbiter and the human the gate).
+  judge_accuracy_report_path: calibration/write_triage_judge_accuracy_report.json
   # CALIBRATION OUTPUT — do not hand-edit.
   # Derived from measured similarity distributions by
   # scripts/calibrate_write_triage.py; both values are order statistics of

@@ -28,6 +28,7 @@ from fused_memory.models.memory import MemoryResult
 from fused_memory.server import write_triage
 from fused_memory.server.grouped_read import (
     CHILD_KINDS,
+    CONTESTED_METADATA_KEY,
     PARENT_ID_KEY,
     _parent_id_in_meta,
 )
@@ -982,9 +983,25 @@ class TestDeclaresAttachKeys:
     """
 
     def test_the_predicate_covers_exactly_the_attach_owned_keys(self) -> None:
-        """The whole point: one key overwritten, one key defended, no gap."""
+        """The whole point: every key overwritten is a key defended, no gap."""
         for key in ATTACH_OWNED_KEYS:
             assert declares_attach_keys({key: 'anything'}) is True, key
+
+    def test_the_contested_flag_is_an_attach_owned_key(self) -> None:
+        """The third key, added by leaf gamma's contested attach (task 3128).
+
+        A `contested` child is an amendment PLUS `grouped_read`'s contested
+        flag, so the attach now writes three keys where it wrote two. Asserted
+        against the IMPORTED constant rather than the 'x_contested' literal:
+        `grouped_read`'s own docstring asks the write side to spell this from
+        there, because a read side and a write side that disagree about the
+        key produce children flagged in a way nothing reads.
+        """
+        assert CONTESTED_METADATA_KEY in ATTACH_OWNED_KEYS, (
+            f'the contested attach overwrites {CONTESTED_METADATA_KEY!r} but the '
+            f'force-store defends only {set(ATTACH_OWNED_KEYS)!r} — a caller who '
+            f'set it themselves has it silently destroyed'
+        )
 
     @pytest.mark.parametrize(
         ('label', 'metadata'),
@@ -998,6 +1015,10 @@ class TestDeclaresAttachKeys:
             ('another non-child registry kind', {'kind': 'completion_note'}),
             ('an agent-invented kind', {'kind': 'some_new_thing'}),
             ('an attach key beside ordinary metadata', {'source': 'n', 'kind': 'decision'}),
+            ('the contested flag the caller set themselves', {CONTESTED_METADATA_KEY: True}),
+            ('a contested flag beside ordinary metadata',
+             {'source': 'n', CONTESTED_METADATA_KEY: True}),
+            ('a contested flag the caller set FALSE', {CONTESTED_METADATA_KEY: False}),
         ],
     )
     def test_a_caller_owned_attach_key_force_stores(self, label, metadata) -> None:
@@ -1396,6 +1417,116 @@ class TestTriageWriteFailsOpen:
         assert await _stub_judge(
             memory_service=None, content='c', project_id='p', decision=None,
         ) == OUTCOME_STORED
+
+    @pytest.mark.asyncio
+    async def test_the_stub_judge_accepts_candidates_with_a_default(self) -> None:
+        """Leaf gamma's real judge consumes `candidates`; the stub tolerates it.
+
+        The DEFAULT is what keeps the four-keyword call above valid — beta's
+        own contract tests, and any direct caller, must not have to learn a
+        new argument to invoke a stub that ignores it.
+        """
+        assert await _stub_judge(
+            memory_service=None, content='c', project_id='p', decision=None,
+            candidates=[_result('m1', 0.80)],
+        ) == OUTCOME_STORED
+
+
+# ---------------------------------------------------------------------------
+# The candidates -> judge join (PRD C1: the judge sees the top 3-5)
+# ---------------------------------------------------------------------------
+
+class TestTheRetrievedCandidatesReachTheJudge:
+    """Beta's judge slot passed a canonical ID and nothing to compare it with.
+
+    PRD C1 requires the judge's input to be "the new entry + top 3-5
+    candidates", so the records retrieval found have to survive the trip from
+    `retrieve_candidates` to the judge. Trimming to the top few is the judge's
+    own job (`write_triage_judge.select_judge_candidates`), which is why what
+    is handed over is the WHOLE object rather than a slice.
+    """
+
+    @staticmethod
+    def _service(results, **write_triage) -> types.SimpleNamespace:
+        service = _svc(**{'enabled': True, 't_high': T_HIGH, 't_low': T_LOW,
+                          'candidate_k': 20, **write_triage})
+        service.search = AsyncMock(return_value=results)
+        return service
+
+    @pytest.mark.asyncio
+    async def test_the_judge_receives_the_search_results_object_itself(self) -> None:
+        """Asserted by IDENTITY, not equality, and that is the whole point.
+
+        `degraded` and `failed_stores` do NOT survive a slice, a comprehension
+        or a `sorted()` — `SearchResults`' own docstring warns about exactly
+        this, and `retrieve_candidates` returns the object un-transformed for
+        that reason. An `is` assertion is what makes a later "cleanup" into a
+        `results[:5]` fail here rather than silently re-hiding a mem0 outage
+        from the only code positioned to count it.
+        """
+        seen = {}
+
+        async def _judge(**kwargs):
+            seen.update(kwargs)
+            return OUTCOME_STORED
+
+        results = SearchResults([_result('m1', 0.75)])
+        counter = TriageFailOpenCounter(time_provider=_Clock())
+
+        await triage_write(
+            self._service(results), content='c', project_id='p',
+            counter=counter, judge=_judge,
+        )
+
+        assert seen['candidates'] is results
+
+    @pytest.mark.asyncio
+    async def test_the_other_judge_arguments_are_unchanged(self) -> None:
+        """The new keyword is ADDITIVE — beta's four are still passed as before."""
+        seen = {}
+
+        async def _judge(**kwargs):
+            seen.update(kwargs)
+            return OUTCOME_STORED
+
+        service = self._service(SearchResults([_result('m1', 0.75)]))
+        counter = TriageFailOpenCounter(time_provider=_Clock())
+
+        await triage_write(
+            service, content='submitted text', project_id='proj',
+            counter=counter, judge=_judge,
+        )
+
+        assert seen['memory_service'] is service
+        assert seen['content'] == 'submitted text'
+        assert seen['project_id'] == 'proj'
+        assert seen['decision'].outcome == OUTCOME_JUDGE
+        assert seen['decision'].canonical_id == 'm1'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('score', 'label'),
+        [(0.99, 'deterministic restated'), (0.10, 'below t_low')],
+        ids=['deterministic-restated', 'below-t-low'],
+    )
+    async def test_the_judge_is_not_consulted_outside_the_middle_band(
+        self, score: float, label: str,
+    ) -> None:
+        """No spend on a decision the deterministic bands already made."""
+        called = []
+
+        async def _judge(**kwargs):
+            called.append(kwargs)
+            return OUTCOME_STORED
+
+        counter = TriageFailOpenCounter(time_provider=_Clock())
+
+        await triage_write(
+            self._service(SearchResults([_result('m1', score)])),
+            content='c', project_id='p', counter=counter, judge=_judge,
+        )
+
+        assert called == [], label
 
 
 # ---------------------------------------------------------------------------

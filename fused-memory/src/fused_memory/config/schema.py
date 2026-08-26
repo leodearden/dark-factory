@@ -2229,6 +2229,107 @@ class WriteTriageConfig(BaseModel):
         ),
     )
 
+    # --- judge knobs (leaf gamma, task 3128) -------------------------------
+    #
+    # OPERATOR KNOBS like `enabled`/`candidate_k` above, NOT calibrated bands:
+    # they ship with real defaults, and None on the two inheriting leaves means
+    # "follow llm.*", never "uncalibrated". All six are green-tier
+    # hot-reloadable and read LIVE per middle-band write by
+    # server/write_triage_judge.py's resolvers — nothing is captured at import
+    # or construction, which is what makes the registration in
+    # config/reload.py real rather than restart-only in disguise.
+
+    judge_enabled: bool = Field(
+        default=True,
+        description=(
+            "Kill switch for write triage's LLM judge arm — the middle band "
+            'between t_low and t_high. While False that band answers `stored` '
+            'without an LLM call, exactly as leaf beta\'s deliberate stub did, '
+            'and the deterministic bands keep running. Defaults TRUE, unlike '
+            'the `enabled` sibling above, and the asymmetry is deliberate: the '
+            'judge is structurally INERT while write_triage.enabled is false '
+            '(no triage code executes at all), so it costs nothing on the '
+            'shipped config. Default-False would be an operator footgun — at '
+            'the task-3169 flip the operator would turn `enabled` on, silently '
+            'get stub behaviour, and read the resulting all-`stored` ack stream '
+            'as evidence that the corpus is novel. Its real purpose is stopping '
+            'an in-flight JUDGE incident (spend, latency, a bad model) while '
+            'leaving the deterministic bands running, which is a strictly finer '
+            'lever than `enabled` and green-tier for the same reason.'
+        ),
+    )
+    judge_provider: Literal['openai', 'anthropic'] | None = Field(
+        default=None,
+        description=(
+            'Which SDK arm the judge calls. None INHERITS llm.provider, so the '
+            'judge follows whatever model the deployment already trusts for '
+            "add_memory auto-classification rather than needing a second knob "
+            'kept in sync. Pin it only to run the judge on a different provider '
+            'from the rest of the server. An unrecognised value falls back '
+            'rather than raising — this is read on the write path, where '
+            'contract C1 forbids raising.'
+        ),
+    )
+    judge_model: str | None = Field(
+        default=None,
+        description=(
+            'The model the judge calls. None INHERITS llm.model. The PRD\'s '
+            '"haiku-class" is a cost/size class, not a vendor pin: this is a '
+            'single-turn ~2.5k-token classification with a four-word closed '
+            'output, so the smallest capable model is the right one. Whatever '
+            'is resolved here is stamped into the accuracy report\'s provenance '
+            'block by scripts/eval_write_triage_judge.py, so the operator at '
+            'the 3169 flip gate can tell which model produced the numbers.'
+        ),
+    )
+    judge_timeout_seconds: float = Field(
+        default=10.0,
+        gt=0,
+        description=(
+            'Per-call wall-clock budget for the judge, enforced with '
+            'asyncio.wait_for. NOT optional and not a tuning nicety: no LLM '
+            'call anywhere in fused-memory sets a timeout today and the openai '
+            'SDK default is 600 SECONDS, which on the synchronous add_memory '
+            'write path is a wedge rather than a degradation — the caller waits '
+            'ten minutes for a write contract C1 promises never to block. A '
+            'TimeoutError propagates into triage_write\'s fail-open arm, which '
+            'is exactly C1\'s "judge error/timeout => stored + storm counter" '
+            '(INV-4). Bounded gt=0 because a zero budget would fail every call '
+            'and read as a total judge outage caused by nothing.'
+        ),
+    )
+    judge_candidate_count: int = Field(
+        default=5,
+        ge=1,
+        description=(
+            "How many retrieved candidates reach the judge's prompt — PRD C1's "
+            '"top 3-5". Distinct from candidate_k above, which is the '
+            'RETRIEVAL width: triage retrieves k, then the judge is shown the '
+            'best few of them, because prompt tokens are the expensive resource '
+            'and a candidate ranked 15th is not going to be the one the entry '
+            'restates. The band\'s own winner is always included regardless of '
+            'this cap. Bounded ge=1 so a 0 cannot silently empty the slate — '
+            'that would answer `stored` on every middle-band write, reducing '
+            'triage to its below-t_low behaviour with nothing logged.'
+        ),
+    )
+    judge_accuracy_report_path: str | None = Field(
+        default=None,
+        description=(
+            "Path to the JSON accuracy report measuring the judge against leaf "
+            "alpha's curator-labelled calibration fixture — the traceability "
+            'link from the judge shipped here back to the run that measured it, '
+            'exactly as calibration_report_path points at the run that produced '
+            't_high/t_low. Written by scripts/eval_write_triage_judge.py. This '
+            'is what the task-3169 flip gate reads: it is an OPERATOR input, '
+            'not a threshold, and deliberately no accuracy floor is asserted '
+            'anywhere in code or tests (PRD D10 makes the report the arbiter '
+            'and the human the gate). Package-relative, never absolute — an '
+            'absolute per-task-worktree path dangles the moment the branch '
+            'merges. Green-tier hot-reloadable via reload_config.'
+        ),
+    )
+
     t_high: float | None = Field(
         default=None,
         ge=0.0,
