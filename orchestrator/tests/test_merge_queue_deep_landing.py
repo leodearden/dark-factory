@@ -31,6 +31,8 @@ Step → coverage map:
   step-09 RED — head-verify cancellation with a clean verify-lease release
   step-11 RED — conservation: the walk consumes no per-item speculation permits
   step-13 RED — δ end to end (landing walk, tip fail, kill switch, hot reload)
+  step-15 RED — a head whose outcome was already DELIVERED is not δ's to retract
+  step-17 RED — the adopted head lands from its POST-verify worktree
 
 Harness notes (see plan pre-1; conventions cloned from
 test_merge_queue_deep_dispatch.py:1-36):
@@ -50,6 +52,7 @@ test_merge_queue_deep_dispatch.py:1-36):
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 from pathlib import Path
 from typing import Literal, TypedDict
@@ -59,7 +62,7 @@ import pytest
 from orchestrator import merge_queue
 from orchestrator.config import GitConfig, MergeDeepConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
-from orchestrator.git_ops import GitOps, _run
+from orchestrator.git_ops import PERSISTENT_MERGE_WORKTREE_NAME, GitOps, _run
 from orchestrator.merge_queue import MergeRequest, SpeculativeMergeWorker
 from orchestrator.merge_types import (
     CapPermit,
@@ -388,18 +391,33 @@ async def _merge_commit_off_main(repo: Path, branch: str, label: str) -> str:
     return sha
 
 
-def _spy_post_merge_verify(monkeypatch, outcome=None, *, raises=None) -> list[dict]:
+def _spy_post_merge_verify(
+    monkeypatch, outcome=None, *, raises=None,
+    park: set[str] | None = None,
+    parked: asyncio.Event | None = None,
+) -> list[dict]:
     """Replace ``_run_post_merge_verify`` with a recorder returning *outcome*.
 
     ``outcome=None`` is a PASS in this function's vocabulary; a
     :class:`VerifyResult` is a FAIL.  *raises* makes the verify blow up
     instead, which is the third exit — the one that stays NON-adopting under δ
     (merge_queue.py:18623).
+
+    *park* names task ids whose verify NEVER RETURNS — the shape a live head
+    has while the speculative slot verifies the chain tip, and the only way to
+    exercise a head that has already been WARM-SWAPPED but has no verdict.
+    *parked*, when given, is set the moment such a call is entered, so a test
+    can wait for the swap to have happened rather than sleeping for it.
     """
     calls: list[dict] = []
 
     async def _recording(git_ops, req, merge_wt, **kwargs):
-        calls.append({'merge_wt': merge_wt, **kwargs})
+        calls.append({'task_id': req.task_id, 'merge_wt': merge_wt, **kwargs})
+        if park is not None and req.task_id in park:
+            if parked is not None:
+                parked.set()
+            # Never completes on its own: δ's teardown is what ends it.
+            await asyncio.Event().wait()
         if raises is not None:
             raise raises
         return outcome
@@ -1958,6 +1976,11 @@ async def _head_and_prefix_scene(
     head_lease=None,
     head_task_factory=None,
     head_popped_for_finalize: bool = False,
+    git_config: GitConfig | None = None,
+    head_speculative: bool = False,
+    park_verify_for: set[str] | None = None,
+    parked: asyncio.Event | None = None,
+    late_head_task_factory=None,
 ) -> dict:
     """A REAL two-slot scene: head I0 at slot 1, deep chain at slot 2.
 
@@ -1973,13 +1996,32 @@ async def _head_and_prefix_scene(
     on the tip's authority sound.  The head is appended through the real
     ``_inflight_append`` chokepoint so it is genuinely registered at VERIFYING
     and genuinely visible to ``_finalizing_head_entry`` / ``_inflight[0]``.
+
+    *git_config* overrides the GitConfig for BOTH the GitOps and the
+    per-request OrchestratorConfig — the two must agree, because the warm swap
+    reads ``req.config.git`` while the lane paths come from ``git_ops``.
+
+    *head_speculative* makes the head a SLOT-2 item.  That is not exotic: in a
+    three-slot round the entry ``_adopt_head_on_tip_authority`` finds at
+    ``_inflight[0]`` is itself speculative, and it is the only shape that
+    routes the head's warm swap to the ``_spec-`` lane POOL rather than the
+    serial ``_merge-verify`` lane.
+
+    *late_head_task_factory*, when given, is awaited with the scene dict AFTER
+    the spies are installed and the chain is built, and its result replaces
+    ``head_entry.verify_task``.  That ordering is what lets a scene run the
+    head's REAL ``_run_inflight_verify`` — which must see the parked verify spy,
+    and must not race the chain build for a git worktree.
     """
     from orchestrator.event_store import EventStore
     from orchestrator.merge_queue import enqueue_merge_request
     from orchestrator.merge_types import InflightEntry, ItemLifecycleState
 
-    git_ops = _make_git_ops(git_repo, size=2)
-    config = _make_config(git_repo, chain_cap=6)
+    git_ops = (
+        GitOps(git_config, git_repo, merge_spec_warm_lane_pool_size=2)
+        if git_config is not None else _make_git_ops(git_repo, size=2)
+    )
+    config = _make_config(git_repo, git_config, chain_cap=6)
     await _create_branch_editing(git_repo, 'task/100', 'h.txt', 'edit-100\n')
     await _create_branch_editing(git_repo, 'task/101', 'a.txt', 'edit-101\n')
     await _create_branch_editing(
@@ -2015,7 +2057,7 @@ async def _head_and_prefix_scene(
         ),
         merge_wt=_ephemeral_merge_wt(git_ops, 'head'),
         base_sha=main_sha,          # slot 1 CASes against REAL main
-        speculative=False,          # the trust anchor — never chained
+        speculative=head_speculative,   # the trust anchor — never chained
     )
     spec_item = RealMergeItem(
         request=reqs['101'],
@@ -2035,7 +2077,7 @@ async def _head_and_prefix_scene(
     )
     head_entry = InflightEntry(
         item=head_item, lease=head_lease, verify_task=head_task,  # type: ignore[arg-type]
-        merge_wt=head_item.merge_wt, was_speculative=False,
+        merge_wt=head_item.merge_wt, was_speculative=head_speculative,
     )
     worker._note_transition(
         reqs['100'].request_id, ItemLifecycleState.MERGING,
@@ -2054,17 +2096,32 @@ async def _head_and_prefix_scene(
     assert [tid for tid, _ in chain.links] == list(_DELTA_LINKS)
     assert chain.truncated_at == _DELTA_TRUNCATOR
 
-    _spy_post_merge_verify(monkeypatch, outcome=None)   # GREEN tip
+    pmv = _spy_post_merge_verify(               # GREEN tip
+        monkeypatch, outcome=None, park=park_verify_for, parked=parked,
+    )
     _spy_chain_lane_release(monkeypatch)
     adv = _spy_advance_main(git_ops, monkeypatch)
 
-    return {
+    scene = {
         'git_ops': git_ops, 'worker': worker, 'chain': chain, 'reqs': reqs,
         'head_mc': head_mc, 'spec_mc': spec_mc, 'main_sha': main_sha,
         'adv': adv, 'db_path': db_path, 'repo': git_repo,
         'head_entry': head_entry, 'head_item': head_item,
         'head_task': head_task, 'spec_item': spec_item,
+        'head_lease': head_lease, 'config': config, 'store': store,
+        'pmv': pmv,
     }
+    if late_head_task_factory is not None:
+        # The placeholder never ran (nothing has yielded to it that could let
+        # it start a verify), so cancelling it costs nothing and keeps the
+        # loop free of a task nobody will ever await.
+        head_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await head_task
+        real_task = await late_head_task_factory(scene)
+        head_entry.verify_task = real_task
+        scene['head_task'] = real_task
+    return scene
 
 
 async def _adopt_and_land(s: dict) -> dict:
@@ -2561,6 +2618,353 @@ class TestHeadCancelLeavesTheLaneIdle:
         # FAIL-CLOSED agrees, which is the whole point of asserting the
         # rendezvous axis separately from the flock one.
         assert git_ops._merge_verify_lease_active() is False
+
+
+def _spy_release_or_cleanup(
+    worker: SpeculativeMergeWorker, monkeypatch,
+) -> list[tuple[Path | None, bool]]:
+    """Record every ``(merge_wt, spec_warm)`` pair the release router is given.
+
+    Passthrough, on the INSTANCE: the routing decision is the thing under test
+    (a warm lane must be RELEASED to the pool, a cold one REMOVED), so the real
+    routing has to still happen for the on-disk assertions to mean anything.
+    """
+    calls: list[tuple[Path | None, bool]] = []
+    real = worker._release_or_cleanup
+
+    async def _recording(merge_wt, *, spec_warm):
+        calls.append((merge_wt, spec_warm))
+        return await real(merge_wt, spec_warm=spec_warm)
+
+    monkeypatch.setattr(worker, '_release_or_cleanup', _recording)
+    return calls
+
+
+def _spy_refresh_warm_base(git_ops: GitOps, monkeypatch) -> list:
+    """Record ``refresh_warm_base`` calls; STUBBED, not passthrough.
+
+    The real implementation shells out to ``scripts/refresh-warm-base.sh`` in
+    the ``_merge-verify`` lane, which the fixture repo does not carry.  What is
+    under test is whether the D10 promote-provenance gate
+    (``merge_wt.name == PERSISTENT_MERGE_WORKTREE_NAME``) MATCHES for an
+    adopted head at all — not what the script does once it fires.
+    """
+    calls: list = []
+
+    async def _recording(landed_commit=None):
+        calls.append(landed_commit)
+        return True
+
+    monkeypatch.setattr(git_ops, 'refresh_warm_base', _recording)
+    return calls
+
+
+def _warm_head_git_config(**extra) -> GitConfig:
+    """A GitConfig whose LOCAL head verify performs the warm swap.
+
+    ``persistent_merge_worktree_safety_valve_every_n`` is left at its default
+    0 (disabled) deliberately: at any positive value the FIRST attempt — the
+    only one these scenes run — would be the valve's own cold round and the
+    swap would never happen, making every assertion here vacuous.
+    """
+    return _make_spec_git_config(
+        on=True, persistent_merge_worktree=True, **extra,
+    )
+
+
+async def _adopted_warm_head_scene(
+    git_repo: Path, tmp_path: Path, monkeypatch, *,
+    db_name: str,
+    git_config: GitConfig | None = None,
+    head_speculative: bool = False,
+    head_popped_for_finalize: bool = False,
+) -> dict:
+    """A head whose REAL ``_run_inflight_verify`` warm-swapped, then parked.
+
+    This is the shape review fix #3 is about, and NO other scene in this module
+    produces it: every other head here is a stand-in coroutine that never runs
+    ``_run_inflight_verify`` at all, so its ``InflightEntry.merge_wt`` and the
+    worktree its verify actually holds are trivially the same path.  Here they
+    DIVERGE — the warm swap replaced the ephemeral ``_merge-<uuid>`` with the
+    persistent ``_merge-verify`` lane (or a pooled ``_spec-`` lane), deregistered
+    the ephemeral from the liveness ledger, and ``git worktree remove``d it —
+    which is exactly the production LOCAL path (merge_queue.py's warm-swap
+    block) and exactly what δ's ``vr is None`` adoption then has to land from.
+
+    Adds ``post_verify_wt``: the worktree the head's verify is REALLY sitting
+    in, read off the verify spy rather than asserted from the config, so the
+    scene cannot silently stop swapping.
+    """
+    parked = asyncio.Event()
+
+    async def _real_head_verify(scene: dict):
+        task = asyncio.ensure_future(
+            scene['worker']._run_inflight_verify(
+                scene['head_item'], scene['head_lease'],
+            )
+        )
+        # Waiting for the PARK (not sleeping) is what makes the swap an
+        # established fact before anything else in the scene runs.
+        await asyncio.wait_for(parked.wait(), timeout=60)
+        return task
+
+    s = await _head_and_prefix_scene(
+        git_repo, tmp_path, monkeypatch, db_name=db_name,
+        git_config=git_config if git_config is not None else _warm_head_git_config(),
+        head_speculative=head_speculative,
+        head_popped_for_finalize=head_popped_for_finalize,
+        park_verify_for={'100'},
+        parked=parked,
+        late_head_task_factory=_real_head_verify,
+    )
+    head_calls = [c for c in s['pmv'] if c['task_id'] == '100']
+    assert len(head_calls) == 1, 'the head verify must have reached the park'
+    post_verify_wt = head_calls[0]['merge_wt']
+    assert post_verify_wt is not None
+    assert post_verify_wt != s['head_item'].merge_wt, (
+        'staging check: the warm swap must actually have swapped, or every '
+        'assertion in this class passes vacuously'
+    )
+    assert post_verify_wt.is_dir(), 'the post-verify lane is live on disk'
+    assert not s['head_item'].merge_wt.exists(), (
+        'staging check: the pre-verify ephemeral is GONE — _acquire_warm_'
+        'verify_worktree cleaned it up the moment the lane took the commit'
+    )
+    s['post_verify_wt'] = post_verify_wt
+    return s
+
+
+async def _adopt_head_only(s: dict, *, timeout: float = 120) -> dict:
+    """Run the adopting exit, then finalize ONLY the head.
+
+    :func:`_adopt_and_land` also finalizes the speculative entry, whose
+    ``expected_main`` is the head's ORIGINAL merge commit — correct in the
+    clean scene, but not after the head has had to rebase.  A test about the
+    head's retry loop therefore stops here.
+    """
+    worker = s['worker']
+    s['verify_result'] = await worker._run_inflight_verify(
+        s['spec_item'], _local_lease(), chain=s['chain'],
+    )
+    s['head_advanced'] = await asyncio.wait_for(
+        worker._finalize_inflight(s['head_entry']), timeout=timeout,
+    )
+    await asyncio.sleep(0)
+    return s
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(180)
+class TestAdoptedHeadLandsWithThePostVerifyWorktree:
+    """(review fix #3) An adopted head lands from its POST-verify worktree.
+
+    ``InflightEntry.merge_wt`` is written ONCE, at construction, from
+    ``item.merge_wt`` — the PRE-verify fact, as its own field doc says.  δ made
+    ``vr is None`` a PRODUCTION path for an adopted head in BOTH topologies
+    (topology 1 nulls ``verify_task``; topology 2 sets ``vr = None`` in the
+    ``except asyncio.CancelledError`` handler), so the
+    ``merge_wt is None and entry.chain_adopted`` fallback hands the PASS arm a
+    path the warm swap already DEREGISTERED and REMOVED.
+
+    Four consequences, each pinned below: the D10 warm-base refresh silently
+    stops firing, the real warm lane never reaches the release path (leaked)
+    while a dead path is "removed", the CAS retry loop runs ``git rebase``
+    against a nonexistent cwd, and the shadow-compare cadence is fed from a
+    corpse.
+    """
+
+    async def test_advance_main_gets_the_live_post_verify_worktree(
+        self, git_repo: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """The cwd threaded into ``advance_main`` must EXIST.
+
+        ``advance_main``'s retry loop is the consumer: ``git rebase`` /
+        ``git reset --hard`` / ``git merge`` all run with ``cwd=merge_worktree``,
+        and ``_run`` raises :class:`WorktreeMissing` on a cwd that is not a
+        directory.  A dead handle is therefore not a cosmetic wrong-path — it
+        is a landing that cannot retry.
+        """
+        s = await _adopted_warm_head_scene(
+            git_repo, tmp_path, monkeypatch, db_name='delta-warm-head.db',
+        )
+        await _adopt_and_land(s)
+
+        head_call = s['adv'][0]
+        assert head_call[0] == s['head_mc'], 'staging: first advance is the head'
+        threaded = head_call[2]
+        assert threaded == s['post_verify_wt'], (
+            f'the adopted head must land from the post-verify lane '
+            f'{s["post_verify_wt"]}, not the pre-verify handle {threaded}'
+        )
+        assert threaded is not None and threaded.is_dir(), (
+            'advance_main was handed a cwd that does not exist — its retry '
+            'loop would raise WorktreeMissing instead of rebasing'
+        )
+
+    async def test_the_warm_base_refresh_fires_for_an_adopted_head(
+        self, git_repo: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """D10 promote-provenance is gated on the lane NAME, so it must match.
+
+        The gate is ``merge_wt.name == PERSISTENT_MERGE_WORKTREE_NAME``.  Fed
+        the pre-verify ``_merge-<uuid>`` it can never match, so the rolling warm
+        base silently stops advancing after every adopted-head landing — a
+        fail-quiet degradation of the warm-verify provenance chain, invisible
+        because ``refresh_warm_base`` is best-effort and never raises.
+        """
+        s = await _adopted_warm_head_scene(
+            git_repo, tmp_path, monkeypatch, db_name='delta-warm-refresh.db',
+        )
+        refreshed = _spy_refresh_warm_base(s['git_ops'], monkeypatch)
+        await _adopt_and_land(s)
+
+        assert s['post_verify_wt'].name == PERSISTENT_MERGE_WORKTREE_NAME, (
+            'staging check: this scene really is on the serial warm lane'
+        )
+        assert len(refreshed) == 1, (
+            'refresh_warm_base must fire for an adopted head exactly as it '
+            f'does for an ordinary warm-verified land; got {refreshed}'
+        )
+
+    async def test_the_release_router_gets_the_warm_lane_not_the_corpse(
+        self, git_repo: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """Both halves of the routing bug, in one place.
+
+        Today the pre-verify path is handed to ``_release_or_cleanup`` with
+        ``spec_warm=False`` — a ``git worktree remove`` against a path that was
+        already removed — while the lane the verify ACTUALLY held never reaches
+        the release path at all.
+        """
+        s = await _adopted_warm_head_scene(
+            git_repo, tmp_path, monkeypatch, db_name='delta-warm-release.db',
+        )
+        released = _spy_release_or_cleanup(s['worker'], monkeypatch)
+        await _adopt_and_land(s)
+
+        assert (s['post_verify_wt'], True) in released, (
+            f'the warm lane {s["post_verify_wt"]} must be released as WARM; '
+            f'the release router only ever saw {released}'
+        )
+        assert not any(
+            wt == s['head_item'].merge_wt for wt, _ in released
+        ), (
+            'the deregistered pre-verify ephemeral must not be handed to the '
+            f'release router at all; saw {released}'
+        )
+
+    async def test_a_cas_losing_adopted_head_can_still_rebase(
+        self, git_repo: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """Main moved under the head — the retry loop needs a live cwd.
+
+        With the pre-verify corpse threaded through, ``advance_main``'s first
+        ``git rebase`` raises :class:`WorktreeMissing` out of the whole
+        finalize; before the ``_run`` pre-flight typed that error it degraded to
+        ``'not_descendant'``, i.e. a permanently blocked branch.  Either way the
+        landing is lost for a reason that has nothing to do with the merge.
+        """
+        s = await _adopted_warm_head_scene(
+            git_repo, tmp_path, monkeypatch, db_name='delta-warm-cas.db',
+        )
+        # Main advances past the head's merge commit, exactly as a concurrent
+        # direct-to-main landing would.
+        await _create_branch_editing(git_repo, 'task/199', 'z.txt', 'edit-199\n')
+        await _merge_commit_off_main(git_repo, 'task/199', '199')
+        await _run(['git', 'merge', '--ff-only', 'task/199'], cwd=git_repo)
+
+        await _adopt_head_only(s)
+
+        outcome = s['reqs']['100'].result.result()
+        assert outcome.status == 'done', (
+            f'the adopted head must survive a lost CAS race by rebasing in '
+            f'its live lane; got {outcome.status} / {outcome.reason!r}'
+        )
+
+    async def test_a_warm_spec_lane_head_goes_back_to_the_pool(
+        self, git_repo: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """The ``_spec-`` variant: a POOL lane must be released, never removed.
+
+        A head at ``_inflight[0]`` in a three-slot round is itself speculative,
+        so its warm swap routes to ``merge_spec_warm_lane_pool`` and comes back
+        ``warm=True``.  Routing that lane through the cold arm would
+        ``git worktree remove`` a pool member — a permanently lost slot, the
+        precise hazard ``_release_or_cleanup``'s "WHICH ONE DO I CALL?" rule
+        exists to prevent.
+        """
+        s = await _adopted_warm_head_scene(
+            git_repo, tmp_path, monkeypatch, db_name='delta-warm-spec.db',
+            git_config=_make_spec_git_config(on=True),   # pool ON, persistent OFF
+            head_speculative=True,
+        )
+        assert s['post_verify_wt'].name.startswith('_spec-'), (
+            'staging check: the head really did route to the spec pool'
+        )
+        released = _spy_release_or_cleanup(s['worker'], monkeypatch)
+        await _adopt_and_land(s)
+
+        assert (s['post_verify_wt'], True) in released, (
+            f'the pooled lane must be released WARM; saw {released}'
+        )
+        assert s['post_verify_wt'].is_dir(), (
+            'a released pool lane stays on disk (FREE, target/ retained) — '
+            'it must not have been git worktree remove-d'
+        )
+
+    async def test_topology_two_lands_from_the_same_live_lane(
+        self, git_repo: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """The COMMON topology: head already popped, parked on its await.
+
+        Here ``vr = None`` comes from the ``except asyncio.CancelledError``
+        handler rather than from ``verify_task = None``, so it is a genuinely
+        separate route into the same fallback and needs its own pin.
+        """
+        s = await _adopted_warm_head_scene(
+            git_repo, tmp_path, monkeypatch, db_name='delta-warm-topo2.db',
+            head_popped_for_finalize=True,
+        )
+        await _adopt_and_land(s)
+
+        threaded = s['adv'][0][2]
+        assert threaded == s['post_verify_wt'], (
+            f'topology 2 must land from the post-verify lane too; got {threaded}'
+        )
+        assert threaded is not None and threaded.is_dir()
+
+    async def test_the_shadow_compare_still_fires_for_the_adopted_head(
+        self, git_repo: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """The warm-vs-cold cadence must not skip an adopted-head landing.
+
+        NOTE on the map: an adopted head's per-test ``warm_results`` map is
+        legitimately EMPTY — its verify was torn down mid-flight, so
+        ``build_warm_shadow_results`` never ran and there is nothing truthful to
+        thread.  That is the MAP-LESS population task 2886 deliberately kept
+        samplable (it routes to the COARSE compare instead of being dropped),
+        so what has to hold is that the scheduler is still CALLED, for the
+        commit that actually landed.
+        """
+        calls: list[tuple] = []
+
+        async def _recording(worker, git_ops, req, merge_commit, **kwargs):
+            calls.append((req.task_id, merge_commit, kwargs.get('warm_results')))
+
+        monkeypatch.setattr(
+            'orchestrator.merge_queue._maybe_schedule_shadow_compare', _recording,
+        )
+        s = await _adopted_warm_head_scene(
+            git_repo, tmp_path, monkeypatch, db_name='delta-warm-shadow.db',
+        )
+        await _adopt_and_land(s)
+
+        head_calls = [c for c in calls if c[0] == '100']
+        assert len(head_calls) == 1, (
+            f'the adopted head must still reach the shadow-compare cadence; '
+            f'saw {calls}'
+        )
+        assert head_calls[0][1] == s['head_mc']
 
 
 class TestRemoteCancelClearsTheHolderRendezvous:
