@@ -42,6 +42,37 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Terminal outcome vocabulary (task 4760) — what the architect's LAST statement
+# about the task actually was.
+#
+# ``_DECLINE_READERS`` single-sources the kind <-> artifact correspondence: each
+# key is a member of DECLINE_KINDS, each value the ``TaskArtifacts`` reader that
+# answers "did the architect take that exit?".  It is the ONE place the two
+# vocabularies below and :func:`read_decline_artifacts` all derive from, so a
+# sixth architect exit cannot be half-added.
+# test_eval_terminal_kind.py::test_every_decline_kind_has_a_real_task_artifacts_reader
+# pins every value against the real class, so a rename there fails the suite
+# instead of silently degrading that kind to ``'none'``.
+# ---------------------------------------------------------------------------
+_DECLINE_READERS: dict[str, str] = {
+    'already_done': 'read_already_done',
+    'blocking_dependency': 'read_blocking_dependency',
+    'false_premise': 'read_false_premise',
+    'unactionable': 'read_unactionable_task',
+    'ready_to_merge': 'read_ready_to_merge',
+}
+
+# The five EXPLICIT plan-tools decline exits (plan_tools._report_* →
+# artifacts.TaskArtifacts.write_*), in the fixed order that breaks a
+# same-timestamp tie in :func:`resolve_terminal_kind`.
+DECLINE_KINDS: tuple[str, ...] = tuple(_DECLINE_READERS)
+
+# The CLOSED terminal vocabulary: a scorable plan, the five declines, or
+# neither.  :func:`resolve_terminal_kind` always returns a member of this tuple.
+TERMINAL_KINDS: tuple[str, ...] = ('planned', *DECLINE_KINDS, 'none')
+
+
 @dataclass
 class EvalMetrics:
     """Metrics collected from a single eval run."""
@@ -235,6 +266,47 @@ class EvalMetrics:
     # referenceless fixture is loud at run time instead.
     judged_without_reference: bool = False
 
+    # The architect's TERMINAL STATEMENT about this task (task 4760) — a member
+    # of ``TERMINAL_KINDS``, resolved by :func:`resolve_terminal_kind`:
+    #
+    #   ``'planned'``               a scorable plan was the terminal statement.
+    #   ``'already_done'`` |
+    #   ``'blocking_dependency'`` |
+    #   ``'false_premise'`` |
+    #   ``'unactionable'`` |
+    #   ``'ready_to_merge'``        the architect took THAT explicit plan-tools
+    #                               exit (plan_tools._report_* → an artifact on
+    #                               disk), which the prompt tells it to take
+    #                               INSTEAD of planning.
+    #   ``'none'``                  neither a scorable plan nor any decline
+    #                               artifact — the genuine "could not plan"
+    #                               outcome, or an infra failure (read
+    #                               ``invocation_error`` / ``cap_tainted`` to
+    #                               tell those two apart).
+    #
+    # A DECLINE IS NOT A FAILURE. ``plan_steps``, ``produced_a_plan`` and the
+    # report layer's ``plan_rate`` are DELIBERATELY untouched by this field —
+    # planRate keeps its exact historical derivation (``plan_steps > 0``) so
+    # every committed campaign artifact quoting it stays comparable. This field
+    # exists so a ``plan_steps = 0`` cell can be split BY CAUSE without
+    # transcript forensics, which is the whole defect: tranche-1's 47 no-plan
+    # cells were every one of them an explicit, server-accepted decline, and
+    # the readout could not say so because the artifacts were rmtree'd
+    # unread. A plan-then-decline cell persists BOTH facts
+    # (``plan_steps=6, terminal_kind='already_done'``), so neither reading is
+    # destroyed.
+    #
+    # ``None`` means NOT MEASURED: either a non-architect cell (disambiguated by
+    # ``role_under_test``, exactly as ``plan_quality``'s null is) or a cell
+    # persisted before this field existed. Cell-level ABSENCE is NOT
+    # interchangeable with ``None`` — ``to_dict`` below is a bare ``asdict``, so
+    # every cell written by post-4760 code carries the key regardless of value,
+    # which gives "key absent" exactly ONE cause. Do not make the write
+    # conditional: the report layer's ``terminal_kind_unmeasured`` count depends
+    # on it, and collapsing the two would let a partially-measured corpus report
+    # a reassuring ``declined = 0`` for cells nobody ever asked.
+    terminal_kind: str | None = None
+
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
@@ -280,6 +352,27 @@ def produced_a_plan(metrics: dict[str, Any]) -> bool:
     (the empty shape ``len(... or [])`` guards) — both mean "no plan".
     """
     return int(metrics.get('plan_steps') or 0) > 0
+
+
+def terminal_kind_of(metrics: dict[str, Any]) -> str | None:
+    """THE consumer accessor for :attr:`EvalMetrics.terminal_kind` (task 4760).
+
+    Sibling of :func:`produced_a_plan` above: both read ONE persisted field off
+    a metrics dict and nothing else, and both exist so the report layer and the
+    campaign driver consult the same expression rather than two bare ``.get``
+    calls that a later change has to keep in sync.
+
+    Returns ``None`` for BOTH a missing key and an explicit ``None`` — the two
+    are indistinguishable to a consumer that only wants the kind, and both mean
+    UNMEASURED. Callers that need to tell "predates the field" from "not an
+    architect cell" must test key PRESENCE (``'terminal_kind' in metrics``)
+    directly, which is what ``report.build_plan_quality_report``'s
+    ``terminal_kind_unmeasured`` count does; see the field's docstring for why
+    that distinction is load-bearing.
+
+    Pure: no I/O, no mutation.
+    """
+    return metrics.get('terminal_kind')
 
 
 def _is_false_green(m: EvalMetrics, max_iterations: int) -> bool:

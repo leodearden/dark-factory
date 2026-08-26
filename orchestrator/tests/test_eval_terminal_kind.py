@@ -73,7 +73,7 @@ class TestEvalMetricsTerminalKindField:
         scoring as ``'none'``.
         """
         from orchestrator.artifacts import TaskArtifacts
-        from orchestrator.evals.metrics import DECLINE_KINDS, _DECLINE_READERS
+        from orchestrator.evals.metrics import _DECLINE_READERS, DECLINE_KINDS
 
         assert tuple(_DECLINE_READERS) == DECLINE_KINDS
         for kind in DECLINE_KINDS:
