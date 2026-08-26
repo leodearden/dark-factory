@@ -23,6 +23,8 @@ import pytest
 from shared.cli_invoke import (
     AgentFailureKind,
     AgentResult,
+    _content_blocks,
+    _iter_result_texts,
     _parse_claude_output,
     _SubprocessResult,
     classify_agent_failure,
@@ -776,3 +778,144 @@ class TestClassifyEndedAwaitingBackground:
         )
         cls = classify_agent_failure(result)
         assert 'transcript_turns=' in cls.diagnostic_detail
+
+
+class TestDetectorTotalityAndTokenHygiene:
+    """Amendment pass (reviewer_comprehensive, task 3639).
+
+    Three properties the detector's own docstring promises but nothing pinned:
+    a malformed BLOCK never raises (the docstring's "malformed
+    records/blocks ... are skipped, never raise" previously covered only
+    records), a degenerate identity token cannot mute the whole verdict, and
+    the token scan sees the same strings the old whole-input ``json.dumps``
+    exposed.
+    """
+
+    def test_non_str_tool_use_name_never_raises(self) -> None:
+        """A tool_use block whose ``name`` is unhashable is skipped, not fatal.
+
+        Pre-amendment this raised ``TypeError: unhashable type`` at ``name in
+        _BACKGROUND_REAP_TOOLS``.  The call site in ``_run_subprocess`` is
+        unguarded, so the exception would fail the whole agent invocation —
+        a malformed block breaking a completed run.
+        """
+        records = [
+            _assistant([_bash_launch()]),
+            _assistant([{'type': 'tool_use', 'name': ['weird'], 'input': {}}]),
+        ]
+        assert detect_ended_awaiting_background(records) is True
+
+    def test_non_str_name_block_still_reaps_by_token(self) -> None:
+        """Name normalization does not cost the block its token-based reap."""
+        records = [
+            _assistant([_bash_launch()]),
+            _bg_launch_result(),
+            _assistant([
+                {'type': 'tool_use', 'name': None, 'input': {'file_path': _bg_log_path()}},
+            ]),
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+    @pytest.mark.parametrize('degenerate_id', ['a', 'b1', 'xyz'])
+    def test_degenerate_task_id_is_not_a_usable_token(self, degenerate_id: str) -> None:
+        """A too-short ``backgroundTaskId`` is dropped rather than matched.
+
+        A 1-2 char token is a substring of essentially every serialized tool
+        input, so honoring it would mark the next tool_use of ANY kind as a
+        reap and silently mute the abandonment verdict.  Here the following
+        ``Write`` has nothing to do with the launch, so the run IS abandoned.
+        """
+        records = [
+            _assistant([_bash_launch()]),
+            {
+                'type': 'user',
+                'toolUseResult': {'stdout': '', 'backgroundTaskId': degenerate_id},
+                'message': {'role': 'user', 'content': []},
+            },
+            _assistant([
+                {'type': 'tool_use', 'name': 'Write',
+                 'input': {'file_path': '/tmp/notes.md', 'content': 'a b1 xyz'}},
+            ]),
+        ]
+        assert detect_ended_awaiting_background(records) is True
+
+    def test_real_length_task_id_is_still_a_usable_token(self) -> None:
+        """The length floor is inert for a real id (9 chars, e.g. ``b1ucu6z5t``)."""
+        records = [
+            _assistant([_bash_launch()]),
+            _bg_launch_result(task_id='b1ucu6z5t', in_text=False),
+            _assistant([_fg_bash('tail -50 /tmp/x/tasks/b1ucu6z5t.output')]),
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+    def test_token_found_in_nested_non_str_input(self) -> None:
+        """The token scan walks lists/nested dicts, as ``json.dumps`` did.
+
+        Parity guard for replacing whole-input serialization with a walk over
+        the input's individual ``str`` values: a token buried under a list and
+        a nested dict must still count as a reap.
+        """
+        records = [
+            _assistant([_bash_launch()]),
+            _bg_launch_result(),
+            _assistant([{
+                'type': 'tool_use',
+                'name': 'SomeTool',
+                'input': {
+                    'n': 3,
+                    'flag': True,
+                    'nested': {'paths': [None, {'p': _bg_log_path()}]},
+                },
+            }]),
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+    def test_input_with_no_strings_is_not_a_reap(self) -> None:
+        """An input carrying no ``str`` anywhere cannot match a token."""
+        records = [
+            _assistant([_bash_launch()]),
+            _bg_launch_result(),
+            _assistant([
+                {'type': 'tool_use', 'name': 'SomeTool', 'input': {'n': 1, 'ok': False}},
+            ]),
+        ]
+        assert detect_ended_awaiting_background(records) is True
+
+
+class TestContentBlockNestingSeam:
+    """``_content_blocks`` is the SINGLE expression of the transcript
+    content-nesting tolerance rule (amendment, task 3639) — previously
+    duplicated verbatim between ``_iter_result_texts`` and the detector, so a
+    CLI nesting change had to be fixed in two places and only one was covered
+    by the ``nested=True/False`` parametrization.
+    """
+
+    @pytest.mark.parametrize('record', [
+        None,
+        'not-a-dict',
+        {},
+        {'message': 'not-a-dict'},
+        {'message': {'content': 'not-a-list'}},
+        {'content': 'not-a-list'},
+        {'message': {}, 'content': None},
+    ])
+    def test_malformed_records_yield_no_blocks(self, record: object) -> None:
+        assert _content_blocks(record) == []
+
+    def test_both_nestings_resolve(self) -> None:
+        blocks = [{'type': 'tool_use', 'name': 'Bash'}]
+        assert _content_blocks({'message': {'content': blocks}}) is blocks
+        assert _content_blocks({'content': blocks}) is blocks
+
+    def test_message_nesting_wins_over_flat(self) -> None:
+        """Precedence matches the real CLI shape (message first)."""
+        nested = [{'type': 'tool_use', 'name': 'A'}]
+        flat = [{'type': 'tool_use', 'name': 'B'}]
+        assert _content_blocks({'message': {'content': nested}, 'content': flat}) is nested
+
+    def test_result_text_extraction_shares_the_seam(self) -> None:
+        """``_iter_result_texts`` reads both nestings through the same helper."""
+        block = {'type': 'tool_result', 'content': 'hello'}
+        assert list(_iter_result_texts({'message': {'content': [block]}})) == ['hello']
+        assert list(_iter_result_texts({'content': [block]})) == ['hello']
+        assert list(_iter_result_texts({'content': 'not-a-list'})) == []

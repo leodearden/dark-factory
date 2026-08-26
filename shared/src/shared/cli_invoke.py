@@ -671,23 +671,59 @@ def _tool_base_name(name: object) -> str:
 # requires whitespace/end after it, which a mid-path dot never satisfies).
 _BG_LOG_PATH_RE = re.compile(r'Output is being written to:\s*(\S+?)\.?(?=\s|$)')
 
+# Minimum length for a background identity token to be usable as a reap key.
+# The token is matched as a SUBSTRING of later tool inputs, so a short one is
+# not merely weak evidence — it is actively destructive: a 1-2 char id matches
+# essentially every serialized input, marking the first subsequent tool_use of
+# any kind as a reap and silently muting the abandonment verdict for the whole
+# transcript.  Real ``backgroundTaskId`` values sampled from transcripts are 9
+# chars (e.g. ``b1ucu6z5t``) and log paths are far longer, so 6 discards only
+# degenerate/corrupt ids while never rejecting a real one.  Note the tradeoff
+# is NOT free in the module's usual fail-safe direction: dropping a token loses
+# a reap and so makes the detector MORE likely to fire (i.e. to downgrade), the
+# direction this module otherwise avoids.  It is accepted because the floor is
+# unreachable by any observed real id — the guard is inert on real transcripts
+# — whereas the failure it prevents mutes the detector for the ENTIRE
+# transcript, which is the strictly larger loss (reviewer_comprehensive
+# amendment, task 3639).
+_MIN_BG_TOKEN_LEN = 6
+
+
+def _content_blocks(record: object) -> list:
+    """Return *record*'s content blocks, tolerating both transcript nestings.
+
+    The real CLI shape nests blocks under ``record['message']['content']``;
+    a flat ``record['content']`` is also accepted (older records and the
+    ``nested=False`` half of the detector's parametrized fixtures).  Anything
+    else — a non-dict record, a missing key, a non-list content — yields an
+    empty list rather than raising.
+
+    SOLE expression of that tolerance rule: both ``_iter_result_texts`` and
+    ``detect_ended_awaiting_background`` route through here, so a future CLI
+    nesting change is a one-line fix in one place rather than two copies that
+    can drift (reviewer_comprehensive amendment, task 3639 — previously the
+    same cascade was inlined in each).
+    """
+    if not isinstance(record, dict):
+        return []
+    message = record.get('message')
+    if isinstance(message, dict) and isinstance(message.get('content'), list):
+        return message['content']
+    content = record.get('content')
+    if isinstance(content, list):
+        return content
+    return []
+
 
 def _iter_result_texts(record: dict):
     """Yield the text of every ``tool_result`` block in a transcript *record*.
 
-    Tolerant of both content nestings (``record['message']['content']`` and a
-    flat ``record['content']``) and of a block ``content`` that is either a
-    plain ``str`` or a list of ``{'type': 'text', 'text': ...}`` sub-blocks.
-    Malformed shapes yield nothing rather than raising.
+    Tolerant of both content nestings (via ``_content_blocks``) and of a block
+    ``content`` that is either a plain ``str`` or a list of
+    ``{'type': 'text', 'text': ...}`` sub-blocks.  Malformed shapes yield
+    nothing rather than raising.
     """
-    message = record.get('message')
-    if isinstance(message, dict) and isinstance(message.get('content'), list):
-        blocks = message['content']
-    elif isinstance(record.get('content'), list):
-        blocks = record['content']
-    else:
-        return
-    for block in blocks:
+    for block in _content_blocks(record):
         if not isinstance(block, dict) or block.get('type') != 'tool_result':
             continue
         content = block.get('content')
@@ -697,6 +733,38 @@ def _iter_result_texts(record: dict):
             for sub in content:
                 if isinstance(sub, dict) and isinstance(sub.get('text'), str):
                     yield sub['text']
+
+
+def _iter_input_strings(value: object):
+    """Yield every ``str`` reachable inside a tool_use ``input`` *value*.
+
+    Walks dict values (and str keys) and list/tuple items depth-first; scalars
+    that are not ``str`` (``int``/``float``/``bool``/``None``) yield nothing,
+    and any other object yields its ``str()`` — preserving what
+    ``json.dumps(..., default=str)`` used to expose for an exotic leaf such as
+    a ``Path``.
+
+    Replaces serializing the whole input (reviewer_comprehensive amendment,
+    task 3639): once ``bg_tokens`` is non-empty, EVERY subsequent tool_use was
+    fully ``json.dumps``-ed, allocating a complete string copy of every
+    ``Write`` body / ``Edit`` old+new pair / ``TodoWrite`` list in the
+    transcript on each invocation-end.  Yielding the already-materialized
+    strings lets ``any()`` short-circuit on the first hit and allocates
+    nothing for the common case.
+    """
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            if isinstance(key, str):
+                yield key
+            yield from _iter_input_strings(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _iter_input_strings(item)
+    elif value is not None and not isinstance(value, (int, float)):
+        # bool is an int subclass, so it is covered by the isinstance above.
+        yield str(value)
 
 
 def _collect_bg_tokens(record: dict, tokens: set[str]) -> None:
@@ -714,15 +782,19 @@ def _collect_bg_tokens(record: dict, tokens: set[str]) -> None:
     (``/tmp/claude-1000/<slug>/<sess>/tasks/<id>.output``), so either token
     identifies a later reference to the file.  Every access is isinstance-
     guarded: a malformed record contributes nothing and never raises.
+
+    Tokens shorter than ``_MIN_BG_TOKEN_LEN`` are DROPPED (see that constant):
+    a degenerate id would substring-match essentially every tool input and
+    silently mute the detector altogether.
     """
     tur = record.get('toolUseResult')
     if isinstance(tur, dict):
         task_id = tur.get('backgroundTaskId')
-        if isinstance(task_id, str) and task_id:
+        if isinstance(task_id, str) and len(task_id) >= _MIN_BG_TOKEN_LEN:
             tokens.add(task_id)
     for text in _iter_result_texts(record):
         for match in _BG_LOG_PATH_RE.findall(text):
-            if match:
+            if len(match) >= _MIN_BG_TOKEN_LEN:
                 tokens.add(match)
 
 
@@ -808,18 +880,24 @@ def detect_ended_awaiting_background(records: list[dict]) -> bool:
             continue
         if record.get('type') != 'assistant':
             continue
-        message = record.get('message')
-        if isinstance(message, dict) and isinstance(message.get('content'), list):
-            blocks = message['content']
-        elif isinstance(record.get('content'), list):
-            blocks = record['content']
-        else:
-            continue
-        for block in blocks:
+        for block in _content_blocks(record):
             if not isinstance(block, dict) or block.get('type') != 'tool_use':
                 continue
             pos += 1
+            # Normalize the name to ``str`` ONCE, up front, so every membership
+            # test below is on a hashable.  A block carrying a non-scalar name
+            # (``'name': ['weird']``) previously reached ``name in
+            # _BACKGROUND_REAP_TOOLS`` and raised ``TypeError: unhashable
+            # type`` — breaking this function's "malformed blocks are skipped,
+            # never raise" contract at an unguarded call site inside
+            # ``_run_subprocess``, i.e. failing the whole agent invocation
+            # (reviewer_comprehensive amendment, task 3639).  ``''`` matches no
+            # tool name, so such a block falls through to the token check —
+            # exactly its pre-normalization classification for the non-raising
+            # shapes.
             name = block.get('name')
+            if not isinstance(name, str):
+                name = ''
             if name == 'Bash':
                 inp = block.get('input')
                 if isinstance(inp, dict) and inp.get('run_in_background'):
@@ -834,12 +912,15 @@ def detect_ended_awaiting_background(records: list[dict]) -> bool:
             # token reference.  A ``run_in_background`` Bash that happens to
             # mention an earlier token is still classified as a LAUNCH.
             if bg_tokens:
-                inp = block.get('input')
                 try:
-                    serialized = json.dumps(inp, default=str) if isinstance(inp, dict) else str(inp)
-                except Exception:  # pragma: no cover - json.dumps(default=str) is total
-                    serialized = str(inp)
-                if any(token in serialized for token in bg_tokens):
+                    matched = any(
+                        token in text
+                        for text in _iter_input_strings(block.get('input'))
+                        for token in bg_tokens
+                    )
+                except Exception:  # pragma: no cover - the walk is total
+                    matched = False
+                if matched:
                     last_reap_idx = pos
     return last_launch_idx != -1 and last_launch_idx > last_reap_idx
 
