@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 from pathlib import Path
 
@@ -900,18 +901,31 @@ def test_invoke_cli_nonzero_exit_with_empty_stderr_still_says_why(tmp_path):
     assert not message.rstrip().endswith(":"), message
 
 
-def test_invoke_cli_nonzero_exit_tail_bounds_stdout_keeping_the_tail(tmp_path):
-    """A huge stdout is bounded the same way stderr already is -- and bounded
-    to its TAIL, because the CLI's last words are the diagnostic ones."""
+@pytest.mark.parametrize("stream", ["stdout", "stderr"])
+def test_invoke_cli_nonzero_exit_tail_bounds_each_stream_keeping_the_tail(
+    tmp_path, stream,
+):
+    """Each stream is bounded, to the SAME constant, keeping its TAIL.
+
+    Parametrized over both streams rather than source-grepping for a stray
+    ``[-2000:]``: the bound that matters is the one the code APPLIES, and a
+    grep cannot tell a live literal from the docstrings that deliberately
+    cite the old one-stream slice as the incident's provenance.  Asserting
+    the behaviour on both streams pins "one shared bound, symmetrically
+    applied" directly -- an unbounded stream or a head-truncated one fails
+    here whatever the source happens to spell.
+    """
     bound = mod._ERROR_STREAM_TAIL_CHARS
-    stdout_text = (
-        "HEAD_MARKER_HM7412" + ("x" * (bound * 2)) + "TAIL_MARKER_TM7412"
-    )
+    assert isinstance(bound, int) and bound > 0
+
+    payload = "HEAD_MARKER_HM7412" + ("x" * (bound * 2)) + "TAIL_MARKER_TM7412"
 
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     _write_fake_claude_failing_on_both_streams(
-        bin_dir, stdout_text=stdout_text, stderr_text="",
+        bin_dir,
+        stdout_text=payload if stream == "stdout" else "",
+        stderr_text=payload if stream == "stderr" else "",
     )
 
     with pytest.raises(mod.CoderInvocationError) as excinfo:
@@ -922,23 +936,23 @@ def test_invoke_cli_nonzero_exit_tail_bounds_stdout_keeping_the_tail(tmp_path):
 
     message = str(excinfo.value)
     assert "TAIL_MARKER_TM7412" in message, (
-        f"stdout must be truncated to its TAIL, not its head; got {message!r}"
+        f"{stream} must be truncated to its TAIL, not its head -- a CLI's "
+        f"last words are its diagnostic ones; got {message!r}"
     )
     assert "HEAD_MARKER_HM7412" not in message, (
-        "an unbounded stdout would blow up every journal line and escalation "
-        "body it lands in; the bound must actually bind"
+        f"an unbounded {stream} would blow up every journal line, "
+        f"run.failures entry and escalation body it lands in; the bound must "
+        f"actually bind"
     )
-
-
-def test_invoke_cli_stream_tail_bound_is_one_shared_constant():
-    """Both streams are bounded by the SAME named constant, so the two can
-    never drift apart into a one-bounded/one-unbounded pair."""
-    assert isinstance(mod._ERROR_STREAM_TAIL_CHARS, int)
-    assert mod._ERROR_STREAM_TAIL_CHARS > 0
-    source = Path(mod.__file__).read_text(encoding="utf-8")
-    assert "[-2000:]" not in source, (
-        "a literal tail bound survives next to the named constant -- that is "
-        "the drift this constant exists to prevent"
+    # The bound BINDS, and binds to the shared constant: the surviving run of
+    # x's cannot exceed it.  (The message also carries the invocation context
+    # and the other, empty stream, so an exact length check would be pinning
+    # the prose rather than the bound.)
+    runs = [len(m) for m in re.findall(r"x+", message)]
+    assert runs, message
+    assert max(runs) <= bound, (
+        f"{stream}'s surviving payload ({max(runs)} chars) exceeds the shared "
+        f"bound of {bound}"
     )
 
 

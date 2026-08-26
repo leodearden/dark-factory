@@ -67,9 +67,21 @@ class CoderParseError(Exception):
 
 class CoderInvocationError(Exception):
     """Raised when the ``claude -p --model`` subprocess invocation fails —
-    non-zero exit or a timeout. Carries a stderr tail for diagnosis. Never
-    silently swallowed: code_digest turns this into a per-digest failure,
-    never a fabricated record."""
+    non-zero exit or a timeout. Carries a tail of BOTH output streams for
+    diagnosis, each labelled. Never silently swallowed: code_digest turns
+    this into a per-digest failure, never a fabricated record.
+
+    BOTH streams, not just stderr, because of what happened on 2026-08-24:
+    the claude CLI wrote its usage-cap banner to STDOUT and exited 1, and
+    this error embedded only ``(proc.stderr or "")[-2000:]``. With stderr
+    empty, the reason that reached the journal, the epsilon escalation and
+    ``run.failures`` was the bare ``claude CLI exited 1 (model='haiku',
+    ...): `` — nothing after the colon — on 17 of 20 digests. The CLI had
+    stated exactly what was wrong and the coder discarded it, so a night
+    with one plain cause was investigated as twenty causeless failures.
+    A diagnostic the process EMITTED must never be dropped on the floor
+    because it arrived on the less-expected stream.
+    """
 
 
 @dataclass
@@ -271,6 +283,16 @@ _CLAUDE_BIN_ENV_VAR = "LEGIBILITY_CLAUDE_BIN"
 """Env var overriding the `claude` binary path; falls back to the bare
 "claude" (PATH-resolved -- /home/leo/.local/bin is on PATH)."""
 
+_ERROR_STREAM_TAIL_CHARS = 2000
+"""How much of EACH captured output stream a CoderInvocationError carries.
+
+One constant for both streams, deliberately: this started as a bare
+``[-2000:]`` on stderr alone, and the asymmetry that grew beside it (stdout
+not bounded because stdout was not carried at all) is exactly the 2026-08-24
+diagnostic loss. Bounded because the text lands verbatim in journal lines,
+``run.failures`` entries and escalation bodies; the TAIL is kept because a
+CLI's last words are its diagnostic ones."""
+
 
 def _invoke_cli(
     prompt: str,
@@ -318,10 +340,20 @@ def _invoke_cli(
 
     Raises CoderInvocationError on a non-zero exit, a timeout, or a
     failure to START the process at all -- never silently swallowed, never
-    a fabricated empty stdout. The error message carries a stderr tail for
-    diagnosis, plus the resolved cwd, so a future sandbox/permission
-    failure NAMES the directory the process was scoped to instead of
-    leaving it to be inferred.
+    a fabricated empty stdout. On a non-zero exit the error message carries
+    a tail of BOTH output streams, each LABELLED, plus the resolved cwd, so
+    a future sandbox/permission failure NAMES the directory the process was
+    scoped to instead of leaving it to be inferred.
+
+    Both streams because the CLI does not reliably diagnose itself on
+    stderr: on 2026-08-24 it wrote a usage-cap banner to STDOUT and exited
+    1, and a stderr-only message reached the journal EMPTY after the colon
+    on 17 of 20 digests (see CoderInvocationError). The exit-0 RETURN
+    contract is untouched by that -- stdout is still returned raw and
+    unbounded there, which census._build_stage_invokes (wiring this
+    function as its mining/verify/synthesis primitive) and
+    census.preflight_headroom (scanning the returned reply itself) both
+    depend on.
 
     That third case is why the ``OSError`` arm below exists. Passing *cwd*
     hands ``subprocess.run`` a second thing that can be missing besides the
@@ -366,10 +398,17 @@ def _invoke_cli(
         ) from exc
 
     if proc.returncode != 0:
-        stderr_tail = (proc.stderr or "")[-2000:]
+        # BOTH streams, each labelled. The claude CLI does not reliably put
+        # its own diagnostics on stderr -- on 2026-08-24 it wrote a usage-cap
+        # banner to STDOUT and exited 1 -- so carrying one stream and
+        # labelling neither loses both the text and the fact of WHICH stream
+        # said it. See CoderInvocationError's docstring for the incident.
+        stdout_tail = (proc.stdout or "")[-_ERROR_STREAM_TAIL_CHARS:]
+        stderr_tail = (proc.stderr or "")[-_ERROR_STREAM_TAIL_CHARS:]
         raise CoderInvocationError(
             f"claude CLI exited {proc.returncode} (model={model!r}, "
-            f"claude_bin={resolved_bin!r}, cwd={cwd!r}): {stderr_tail}"
+            f"claude_bin={resolved_bin!r}, cwd={cwd!r}): "
+            f"stdout={stdout_tail!r} stderr={stderr_tail!r}"
         )
 
     return proc.stdout
