@@ -876,7 +876,7 @@ def test_pins_recovery_js_loads_before_tab_escalation_analytics(
 
 
 def test_redux_cache_buster_bumped(index_html_body: str) -> None:
-    """All /static/redux/*?v= cache-busters must share a single version >= 45,
+    """All /static/redux/*?v= cache-busters must share a single version >= 50,
     and graph_layout.js / prd_grouping.js / task_status_counts.js /
     runtime_format.js / orch_filter.js / esc_flow_layout.js / spark_path.js
     must all be among the versioned assets.
@@ -913,6 +913,24 @@ def test_redux_cache_buster_bumped(index_html_body: str) -> None:
     newer than every version already released: when a branch that bumps sits
     in flight long enough for main to bump too, re-check the number before
     merging rather than trusting the one the plan named.
+
+    Task 3517 is that case, and is why the floor is now 50. 3517 teaches the
+    dashboard to tell "orchestrator unreachable" apart from "dashboard too
+    starved to ask" — the distinction whose absence caused the 2026-07-30
+    event to be misdiagnosed as an orchestrator outage. It sat in flight long
+    enough for main to reach 49, and it merged onto that 49 CLEANLY. So a
+    floor of 45 would have passed with no bump at all, shipping a green suite
+    while every already-open browser kept serving a cached runtime_format.js
+    that has no rtProbe/rtProbeSummary and kept rendering all three probe
+    failure modes as identical blank cells — the very misdiagnosis the task
+    exists to remove, restored by a build that looks correct. 50 and not 49
+    precisely because main already released 49.
+
+    Like 3489 this one BLANKS rather than merely mis-renders, and by the same
+    mechanism: tab_tasks.jsx destructures rtProbe and rtProbeSummary from
+    window.DF_RUNTIME_FMT at module top level, so a fresh tab_tasks.jsx beside
+    a cached runtime_format.js binds two undefined names and throws in the
+    render path, taking the Tasks tab down rather than degrading it.
     """
     versions = {int(v) for v in re.findall(r'/static/redux/[^"?]+\?v=(\d+)', index_html_body)}
     assert len(versions) == 1, (
@@ -920,19 +938,20 @@ def test_redux_cache_buster_bumped(index_html_body: str) -> None:
         'bump all of them uniformly to the same value.'
     )
     v = int(next(iter(versions)))
-    assert v >= 45, (
-        f'index.html cache-buster version is {v}, expected >= 45 (proves the '
-        "uniform bump for task 3489's null-sample fix in LineChart / "
-        'StackedAreaChart / BarChart / HistBar actually reaches already-open '
-        'browsers. This one can BLANK the page rather than merely mis-draw it: '
-        "charts.jsx's top-level window.DF_SPARK_PATH destructure now reaches "
-        'for five new builder names, so a cached spark_path.js at any '
-        'previously released version (42, 43, 44 — all of which ship the OLD '
-        'four-export module) next to a fresh charts.jsx binds five undefined '
-        'builders and every tab that renders a chart goes blank; a fully '
-        'cached older pair instead keeps drawing missing samples as measured '
-        'zeros at the chart floor. 44 is NOT sufficient here precisely because '
-        'main already released it.).'
+    assert v >= 50, (
+        f'index.html cache-buster version is {v}, expected >= 50 (proves the '
+        "uniform bump for task 3517's runtime-probe distinction actually "
+        'reaches already-open browsers. Without it a browser keeps serving a '
+        'cached runtime_format.js with no rtProbe/rtProbeSummary and keeps '
+        'rendering "orchestrator unreachable", "dashboard too starved to ask" '
+        'and "no runtime endpoint configured" as identical blank cells — the '
+        '2026-07-30 misdiagnosis this task exists to remove. Like 3489 it can '
+        "BLANK the tab rather than merely mis-render it: tab_tasks.jsx's "
+        'top-level window.DF_RUNTIME_FMT destructure reaches for rtProbe and '
+        'rtProbeSummary, so a cached runtime_format.js at any previously '
+        'released version binds two undefined names and throws in the render '
+        'path. 49 is NOT sufficient here precisely because main already '
+        'released it.).'
     )
     assert re.search(r'/static/redux/graph_layout\.js\?v=\d+', index_html_body), (
         'graph_layout.js is not present among the versioned /static/redux/* '
