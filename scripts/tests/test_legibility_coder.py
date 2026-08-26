@@ -786,6 +786,162 @@ def test_invoke_cli_nonzero_exit_raises_invocation_error(tmp_path):
         )
 
 
+# ---------------------------------------------------------------------------
+# task 4736 / GAP 2: a non-zero exit must carry BOTH streams, each labelled
+#
+# The 2026-08-24 incident: the claude CLI wrote its cap banner to STDOUT and
+# exited 1, and _invoke_cli embedded only `(proc.stderr or "")[-2000:]`.  With
+# stderr empty, the reason string that reached the journal, the escalation and
+# `run.failures` was the bare `claude CLI exited 1 (model='haiku', ...): ` on
+# 17 of 20 digests -- the CLI had SAID exactly what was wrong and the coder
+# discarded it.
+# ---------------------------------------------------------------------------
+
+def _write_fake_claude_failing_on_both_streams(
+    bin_dir, *, stdout_text="", stderr_text="", exit_code=1,
+):
+    """Fake `claude` binary: emit *stdout_text* on STDOUT and *stderr_text* on
+    STDERR, then exit *exit_code*.
+
+    Payloads travel through sidecar FILES that the script ``cat``s, never
+    interpolated into the shell source the way _write_fake_claude_failing
+    does it.  Not fastidiousness: the task-4736 cap tests parametrize this
+    writer over ``shared.cap_markers.REAL_CLI_CAP_MESSAGES``, whose entries
+    already carry apostrophes and a U+00B7, and the next transcript-cited
+    entry may carry a ``"``, a ``$`` or a backtick that the shell would eat
+    or that would split the script outright.  The bytes the fake CLI emits
+    have to be the corpus's bytes, or a green test would be proving something
+    other than what the CLI actually said.
+    """
+    out_file = bin_dir / "fake_stdout.txt"
+    err_file = bin_dir / "fake_stderr.txt"
+    out_file.write_text(stdout_text, encoding="utf-8")
+    err_file.write_text(stderr_text, encoding="utf-8")
+    p = bin_dir / "claude"
+    p.write_text(
+        "#!/usr/bin/env bash\n"
+        # Drain the prompt so a large stdin can never EPIPE the fake before
+        # it has emitted its payloads.
+        "cat > /dev/null\n"
+        f'cat "{out_file}"\n'
+        f'cat "{err_file}" >&2\n'
+        f"exit {exit_code}\n"
+    )
+    p.chmod(0o755)
+
+
+def test_invoke_cli_nonzero_exit_carries_both_streams_labelled(tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_fake_claude_failing_on_both_streams(
+        bin_dir,
+        stdout_text="STDOUT_MARKER_SO7412 the CLI's own diagnostic",
+        stderr_text="STDERR_MARKER_SE7412 the backend's complaint",
+    )
+
+    with pytest.raises(mod.CoderInvocationError) as excinfo:
+        mod._invoke_cli(
+            "prompt text", "haiku",
+            claude_bin=str(bin_dir / "claude"), timeout=10, cwd=str(tmp_path),
+        )
+
+    message = str(excinfo.value)
+
+    # (a) BOTH streams reach the reader.  Dropping either one is the defect.
+    assert "STDOUT_MARKER_SO7412" in message, (
+        f"the CLI's stdout must reach the error text -- this is the exact "
+        f"byte the 2026-08-24 incident discarded; got {message!r}"
+    )
+    assert "STDERR_MARKER_SE7412" in message, message
+
+    # (b) Each stream is LABELLED, so a reader can tell which stream said
+    # what.  Two unlabelled blobs concatenated would carry the bytes but not
+    # the provenance, and "the CLI wrote its banner to STDOUT" is precisely
+    # the fact this incident turned on.
+    assert "stdout=" in message, (
+        f"each stream must be labelled so the reader knows which one carried "
+        f"the diagnostic; got {message!r}"
+    )
+    assert "stderr=" in message, message
+
+    # (c) The pre-existing invocation context is still there -- this change
+    # ADDS a stream, it does not trade one diagnostic for another.
+    assert "model='haiku'" in message, message
+    assert "claude_bin=" in message, message
+    assert "cwd=" in message, message
+    assert "exited 1" in message, message
+
+
+def test_invoke_cli_nonzero_exit_with_empty_stderr_still_says_why(tmp_path):
+    """The exact 17-of-20 shape from 2026-08-24: everything on stdout,
+    stderr EMPTY, exit 1.  Before this change the operator-visible reason was
+    the empty-tailed `...cwd=None): ` -- a failure that named no cause."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_fake_claude_failing_on_both_streams(
+        bin_dir,
+        stdout_text="ONLY_ON_STDOUT_OS7412",
+        stderr_text="",
+    )
+
+    with pytest.raises(mod.CoderInvocationError) as excinfo:
+        mod._invoke_cli(
+            "prompt text", "haiku",
+            claude_bin=str(bin_dir / "claude"), timeout=10,
+        )
+
+    message = str(excinfo.value)
+    assert "ONLY_ON_STDOUT_OS7412" in message, (
+        f"with stderr empty the stdout text is the ONLY diagnostic the CLI "
+        f"produced; an error that omits it names no cause at all -- which is "
+        f"what reached the journal on 17 of 20 digests; got {message!r}"
+    )
+    # And the reason is no longer effectively empty after the colon.
+    assert not message.rstrip().endswith(":"), message
+
+
+def test_invoke_cli_nonzero_exit_tail_bounds_stdout_keeping_the_tail(tmp_path):
+    """A huge stdout is bounded the same way stderr already is -- and bounded
+    to its TAIL, because the CLI's last words are the diagnostic ones."""
+    bound = mod._ERROR_STREAM_TAIL_CHARS
+    stdout_text = (
+        "HEAD_MARKER_HM7412" + ("x" * (bound * 2)) + "TAIL_MARKER_TM7412"
+    )
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_fake_claude_failing_on_both_streams(
+        bin_dir, stdout_text=stdout_text, stderr_text="",
+    )
+
+    with pytest.raises(mod.CoderInvocationError) as excinfo:
+        mod._invoke_cli(
+            "prompt text", "haiku",
+            claude_bin=str(bin_dir / "claude"), timeout=10,
+        )
+
+    message = str(excinfo.value)
+    assert "TAIL_MARKER_TM7412" in message, (
+        f"stdout must be truncated to its TAIL, not its head; got {message!r}"
+    )
+    assert "HEAD_MARKER_HM7412" not in message, (
+        "an unbounded stdout would blow up every journal line and escalation "
+        "body it lands in; the bound must actually bind"
+    )
+
+
+def test_invoke_cli_stream_tail_bound_is_one_shared_constant():
+    """Both streams are bounded by the SAME named constant, so the two can
+    never drift apart into a one-bounded/one-unbounded pair."""
+    assert isinstance(mod._ERROR_STREAM_TAIL_CHARS, int)
+    assert mod._ERROR_STREAM_TAIL_CHARS > 0
+    source = Path(mod.__file__).read_text(encoding="utf-8")
+    assert "[-2000:]" not in source, (
+        "a literal tail bound survives next to the named constant -- that is "
+        "the drift this constant exists to prevent"
+    )
+
+
 def test_invoke_cli_timeout_raises_invocation_error(tmp_path):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
