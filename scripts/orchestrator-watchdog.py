@@ -2094,12 +2094,17 @@ def report() -> int:
     only a confirmed-stale unit does.
 
     IMPORTANT: the verdict reflects raw start_epoch-vs-commit_epoch staleness
-    only. It does NOT evaluate the is_unit_enabled, STARTUP_GRACE_SECS, or
-    STALENESS_GRACE_SECS restraint gates that staleness_pass() applies before
-    actually restarting a unit — a unit reported 'stale' here may be one that
-    staleness_pass() will (correctly) leave alone this tick because it is
-    disabled, within its startup grace window, or the newest watched commit
-    is still within the fleet-wide commit-grace window. Treat 'stale' as
+    only. It does NOT evaluate the is_unit_enabled, STARTUP_GRACE_SECS,
+    ORCH_RESTART_MIN_INTERVAL_SECS, min-interval-anchored head-start
+    (_within_fleet_staleness_head_start, task 4754), or STALENESS_GRACE_SECS
+    restraint gates that staleness_pass() applies before actually restarting
+    a unit — a unit reported 'stale' here may be one that staleness_pass()
+    will (correctly) leave alone this tick because it is disabled, within its
+    startup grace window, inside the fleet-deploy min-interval window, still
+    inside the head start that window's opening started, or the newest watched
+    commit is still within the fleet-wide commit-grace window. The DEPLOY-AGE
+    column below surfaces the clock age a reader needs to predict the two
+    clock gates. Treat 'stale' as
     "not running code from the newest watched commit", not as a prediction
     that a restart is imminent.
 
@@ -2131,9 +2136,9 @@ def report() -> int:
     commit_str = _format_epoch(commit_epoch)
     print(
         "NOTE: verdict reflects raw start-time-vs-commit staleness only; it "
-        "does not account for the enabled / startup-grace / commit-grace "
-        "restraint gates staleness_pass() applies before actually restarting "
-        "a unit."
+        "does not account for the enabled / startup-grace / min-interval / "
+        "head-start / commit-grace restraint gates staleness_pass() applies "
+        "before actually restarting a unit."
     )
     print(
         f"{'UNIT':<50} {'START':<24} {'NEWEST WATCHED COMMIT':<24} {'VERDICT':<10} "
