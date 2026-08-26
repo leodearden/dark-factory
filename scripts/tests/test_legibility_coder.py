@@ -751,20 +751,25 @@ def _batch_digests(n):
 # ---------------------------------------------------------------------------
 
 def _mixed_batch_invoke(*, capped, failed):
-    """Return (digests, invoke) for a batch whose first *capped* digests hit a
-    cap, the next *failed* return unparseable garbage, and the rest code
-    cleanly.  Dispatch is by the session marker the digest carries into the
-    prompt, mirroring the existing batch helpers above."""
+    """Return an *invoke* for a batch whose first *capped* digests hit a cap,
+    the next *failed* return unparseable garbage, and the rest code cleanly.
+
+    Dispatch matches the QUOTED session as it appears in the frontmatter
+    (`session: "batch-sess-7"`), not the bare id.  A bare-substring match is
+    ambiguous the moment a batch reaches ten digests -- "batch-sess-1" is a
+    prefix of "batch-sess-19" -- and these batches deliberately run to twenty
+    to exercise the storm threshold.
+    """
     def fake_invoke(prompt, model):
         for i in range(capped):
-            if f"batch-sess-{i}" in prompt:
+            if f'"batch-sess-{i}"' in prompt:
                 raise mod.CoderCapExhausted(
                     "claude CLI exited 1 (model='haiku', ...): "
                     "stdout=\"You've hit your weekly limit - resets 2pm\" stderr=''",
                     marker="you've hit your",
                 )
         for i in range(capped, capped + failed):
-            if f"batch-sess-{i}" in prompt:
+            if f'"batch-sess-{i}"' in prompt:
                 return "not parseable as json, sorry"
         return json.dumps({"matches": [], "candidates": []})
     return fake_invoke

@@ -633,6 +633,24 @@ class RunResult:
     failed is NOT a storm and stays ``"ok"``. This function never
     escalates and never touches the codebook — that is epsilon/gamma's
     job; it only returns the tallied result.
+
+    ``capped`` counts how many of those failures were a usage/auth CAP
+    rather than a failure of the coding — digests the CLI never actually
+    looked at. It REFINES ``failed`` (a capped digest is counted in both),
+    and it is deliberately a COUNT plus the ``is_cap_deferral`` predicate
+    rather than a third ``status`` value: ``census.py`` computes
+    ``saturated = dup_rate >= config.dup_rate and run_result.status !=
+    "failure"`` and selects storm batches with ``s.status == "failure"``, so
+    a new status value would silently make a capped mining batch count as
+    saturated and stop the census early.
+
+    TAINT-AND-EXCLUDE for a sub-storm capped run: a capped digest is
+    labelled and left out of ``records``, but the batch's genuinely coded
+    records still merge. 2 capped of 20 stays ``status="ok"`` and returns
+    all 18 real records — the same contract ``evals/runner.py`` uses when it
+    excludes a ``cap_exhausted:`` cell from a reported mean instead of
+    scoring it 0.0. Discarding 18 records that cost real tokens because two
+    digests found no headroom would be its own kind of fabrication.
     """
 
     status: str
@@ -641,6 +659,7 @@ class RunResult:
     total: int
     succeeded: int
     failed: int
+    capped: int = 0
 
 
 def code_digests(
@@ -711,6 +730,7 @@ def code_digests(
     """
     records = []
     failures = []
+    capped = 0
 
     for digest_text in digests:
         try:
@@ -718,20 +738,26 @@ def code_digests(
                 digest_text, codebook, project=project, model=model, invoke=invoke,
             )
         except Exception as exc:  # isolate: one crash can't abort the batch
-            failure = (None, str(exc))
+            # An unexpected crash is never a cap: the cap paths are typed and
+            # return a CodingResult, they do not escape as bare exceptions.
+            failure, was_capped = (None, str(exc)), False
         else:
             if result.ok:
                 records.append(result.record)
                 continue
-            failure = (result.session, result.reason)
+            failure, was_capped = (result.session, result.reason), result.capped
 
         # ONE append+log site for BOTH failure paths, so they cannot drift
-        # apart and a later edit cannot silence one of them.
+        # apart and a later edit cannot silence one of them. The cap tally is
+        # threaded THROUGH this funnel rather than counted at a second site,
+        # for the same reason: two sites are two things to forget.
         session, reason = failure
         logger.warning(
             "legibility coder: digest failed (session=%s): %s", session, reason,
         )
         failures.append(failure)
+        if was_capped:
+            capped += 1
 
     total = len(digests)
     failed = len(failures)
@@ -740,8 +766,40 @@ def code_digests(
 
     return RunResult(
         status=status, records=records, failures=failures,
-        total=total, succeeded=succeeded, failed=failed,
+        total=total, succeeded=succeeded, failed=failed, capped=capped,
     )
+
+
+def is_cap_deferral(result: RunResult) -> bool:
+    """True when a run-level FAILURE is really a capped night — a DEFERRAL
+    rather than a coder failure.
+
+    An all-accounts-capped night is a NORMAL operating condition (Leo's
+    standing directive; sibling task 4503), not an incident. The coder must
+    not fabricate a verdict for a digest it never got to look at, and must
+    not present the resulting empty night as an infra failure. Before this
+    existed, 2026-08-24 came back as 17 of 20 hard per-digest failures,
+    tripped the >50% storm threshold, and became ``exit_code=1`` plus an
+    ERROR-level escalation — an operator paged for expected weather.
+
+    The majority rule (``capped * 2 > failed``) deliberately reuses the storm
+    threshold's own strictly-greater-than-half shape. A genuine coder
+    regression that merely COINCIDES with a cap or two still reads as a
+    storm, still exits non-zero, and still gets looked at: the deferral
+    branch must not become a place for real bugs to hide.
+
+    A PREDICATE over ``RunResult``, deliberately NOT a third ``status``
+    value. ``census.py`` computes ``saturated = dup_rate >= config.dup_rate
+    and run_result.status != "failure"`` and selects storm batches with
+    ``s.status == "failure"``; adding a status value would silently make a
+    capped mining batch count as saturated and stop the census early. One
+    policy, one home, two callers (``main`` here and ``nightly.run_nightly``).
+
+    Note the ``status == "failure"`` guard: a sub-storm run with a minority of
+    caps is NOT a deferral. Those runs coded most of their digests and their
+    records still merge (see ``RunResult``'s taint-and-exclude contract).
+    """
+    return result.status == "failure" and result.capped * 2 > result.failed
 
 
 # ---------------------------------------------------------------------------
