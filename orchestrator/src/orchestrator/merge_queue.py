@@ -19407,6 +19407,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 self._resolve_or_drop_abandoned(link_req, outcome)
                 link_resolved = True
                 landed += 1
+                # task 3186 (PRD δ), review fix #2: this link's PREDECESSOR,
+                # captured before `expected_main` moves on to become the NEXT
+                # link's CAS base.  It is the `base_sha` the on_merge_landed
+                # hook below must report — `harness._note_merge_all` runs
+                # `git_ops.get_merge_diff_files(base_sha, head_sha)` over that
+                # pair, so a degenerate `X..X` range arms every service-restart
+                # coordinator with an EMPTY changed-file list and blinds the
+                # pipeline-landing tripwire, silently, for every chain-landed
+                # link.
+                link_base = expected_main
                 expected_main = landed_sha
 
                 if outcome.status == 'done':
@@ -19419,9 +19429,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     ):
                         try:
                             await self._on_merge_landed(
-                                link_req.task_id,
-                                adv_outcome.advanced_sha or expected_main,
-                                outcome.merge_sha,
+                                # The PREDECESSOR, matching the head path's
+                                # `item.base_sha`.  `adv_outcome.advanced_sha`
+                                # is the NEW tip, so it is never a correct base
+                                # — the old `or` fallback only ever masked that.
+                                link_req.task_id, link_base, outcome.merge_sha,
                             )
                         except Exception:
                             logger.warning(
