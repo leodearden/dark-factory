@@ -906,6 +906,29 @@ def _finalized_rows(db_path: Path) -> list[dict]:
     return [json.loads(r[0]) for r in rows]
 
 
+def _rows_of_type(db_path: Path, event_type: EventType) -> list[dict]:
+    """Return every row of *event_type*'s parsed ``data`` dict, in order.
+
+    The un-specialised sibling of :func:`_finalized_rows` / :func:`_verify_rows`,
+    for the rows a claim is about the ABSENCE of.  Reading the durable tier
+    rather than a capturing fake matters most for an absence claim: an
+    in-memory recorder can only miss an emit the real store would have
+    persisted, so a fake would make "no row" the easy answer.
+    """
+    import json
+    import sqlite3
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        rows = conn.execute(
+            'SELECT data FROM events WHERE event_type = ? ORDER BY rowid',
+            (event_type.value,),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [json.loads(r[0]) for r in rows]
+
+
 def _events_for_task(db_path: Path, task_id: str) -> list[str]:
     """Return every ``event_type`` recorded against *task_id*, in order."""
     import sqlite3
@@ -2710,4 +2733,393 @@ class TestRow3HalvingIsolatesTheBadItem:
         assert scene.verdicts and not any(v['passed'] is False for v in scene.verdicts), (
             f'no verdict may be red when the keyed file exists nowhere; got '
             f'{scene.verdicts!r}'
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# -- step-09 RED: Row 8 — DEEP FAILS NEVER FEED THE THRASH GUARD --
+#
+# The row upstream is ONE-WAY.  test_merge_queue_deep_landing.py pins the
+# merge-queue half as event SILENCE — ``test_the_abort_feeds_the_thrash_ladder
+# _nothing`` and ``test_two_consecutive_tip_fails_render_nothing_for_any_link``
+# assert that an unlanded link emits nothing but its own ``merge_queued`` and
+# renders no outcome.  Both are statements about merge_queue.py.
+#
+# But the row's CLAIM is about workflow.py: task 3003's signature class is a
+# ``consecutive_merge_thrash`` ladder that trips on two identical rendered
+# merge failures in a row and escalates a human.  "Deep fails never feed the
+# thrash guard" is therefore a claim about the CONSUMER, and nobody anywhere
+# in the tree drives that consumer with a deep round's real outputs.  Event
+# silence is the PREMISE; the conclusion — that the silence actually reaches
+# the ladder and leaves it unmoved — is unasserted.
+#
+# So this row is driven TWO-WAY:
+#
+#   WORKER SIDE (the premise, re-asserted at composition level across a PAIR
+#   of rounds rather than as two independent single-round scenes): zero blocked
+#   ``MergeOutcome``s, zero ``merge_attempt`` rows, every chained future still
+#   pending, every chained request still at its original lane INDEX, main
+#   unmoved.
+#
+#   LEDGER SIDE (original here): the pair of rounds' real observable outputs
+#   are folded through the SHIPPED ladder — ``workflow._evaluate_merge_thrash``
+#   over a real ``shared.task_metadata.RetryLedger``, keyed by the SHIPPED
+#   ``workflow._compute_merge_outcome_signature`` — and the ladder comes back
+#   byte-identical.  Deriving the signature THROUGH the production function
+#   rather than restating a string is the point: a signature-format change
+#   would otherwise slip past this gate silently.
+#
+# TWO rounds, and both at depth >= 4, is the load-bearing shape.
+# ``max_consecutive_merge_thrash`` defaults to 2, so a PAIR of identical
+# rendered failures is exactly the input that trips the ladder — one round
+# could not distinguish "never feeds it" from "has not fed it twice yet".
+#
+# The inertness control is mandatory.  An "unmoved" assertion over a driver
+# that folds nothing proves only that the driver is inert, so the same helper
+# is handed a genuine repeated blocked signature and must advance the counter
+# to the escalation threshold.
+# ═══════════════════════════════════════════════════════════════════════════
+
+_ROW8_CAP = 8
+"""Chain cap for the row-8 pair.  With 8 followers the walk is 8 -> 4: round 1
+targets ``min(queue_len=9, cap=8)`` and round 2 targets ``min(9, 8,
+next_halving_state(False, 8)=4)``.  Both are >= 4, so NEITHER round of the
+pair is near the ``< 2`` floor where no chain code runs at all — a pair that
+halved into the floor would be asserting silence about a round that never
+chained."""
+
+_ROW8_FOLLOWERS = 8
+
+
+def _blocked_signature(outcome) -> str:
+    """The ladder key workflow.py would compute for *outcome*, via the SHIPPED fn.
+
+    workflow.py stashes ``result.reason`` / ``result.failure_category`` /
+    ``result.failure_cause_hint`` off a blocked :class:`MergeOutcome` and later
+    fingerprints exactly that triple.  Transcribing the fingerprint here would
+    make the gate pass through a format change; delegating to
+    ``workflow._compute_merge_outcome_signature`` makes it fail on one.
+    """
+    from orchestrator.workflow import _compute_merge_outcome_signature
+
+    return _compute_merge_outcome_signature(
+        outcome.failure_category, outcome.failure_cause_hint, outcome.reason or '',
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(300)
+class TestRow8DeepFailsNeverFeedTheThrashLadder:
+    """Row 8: a red deep tip renders nothing, so the ladder has nothing to eat."""
+
+    async def _pair(
+        self, git_repo: Path, tmp_path: Path, monkeypatch, *, db_name: str,
+    ) -> _GateScene:
+        """Two consecutive RED deep tips over the same head, depths 8 then 4.
+
+        The head is re-dispatched by OBJECT on round 2 rather than re-popped:
+        a red tip REQUEUES its dispatching request onto ``_queue`` (deliberately
+        NOT back into a lane buffer — draining it would make the head a member
+        of its own next chain), so ``_pop_next_pickable`` would hand back a
+        FOLLOWER and the second round would be a different scenario entirely.
+        """
+        scene = await _make_gate_scene(
+            git_repo, tmp_path, monkeypatch,
+            chain_cap=_ROW8_CAP, n_followers=_ROW8_FOLLOWERS, db_name=db_name,
+            script=[False, False],
+        )
+        head = scene.reqs['101']
+        await scene.round_(tag='row8', head_tid='101')
+        await scene.round_(tag='row8', head_tid='101', req=head)
+        return scene
+
+    async def test_two_red_deep_tips_render_nothing_on_either_tier(
+        self, git_repo: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """WORKER SIDE — the premise, across the PAIR that would trip the ladder.
+
+        Five absences, each a different mechanism, so a failure names which:
+        the depths really were deep, no outcome was rendered, no durable row
+        was written, no future resolved, and no request moved in its lane.
+        """
+        from orchestrator.merge_queue import next_halving_state, select_chain_depth
+
+        scene = await self._pair(
+            git_repo, tmp_path, monkeypatch, db_name='gate-row8-pair.db',
+        )
+        worker = scene.worker
+
+        # 0 — the pair really was deep, and deep at the depths the policy picks.
+        queue_len = 1 + _ROW8_FOLLOWERS
+        expected = [
+            select_chain_depth(_ROW8_CAP, queue_len, None),
+            select_chain_depth(
+                _ROW8_CAP, queue_len, next_halving_state(False, _ROW8_CAP),
+            ),
+        ]
+        assert scene.depths == expected, (
+            f'the pair must chain at the policy-selected depths {expected!r}; '
+            f'got {scene.depths!r}'
+        )
+        assert all(d is not None and d >= 4 for d in scene.depths), (
+            f'both rounds must be >= 4 deep — a round that halved into the '
+            f'``< 2`` floor runs no chain code and its silence proves nothing; '
+            f'got {scene.depths!r}'
+        )
+
+        # 1 — no blocked outcome for ANY item, on either round.
+        for rec in scene.rounds:
+            assert rec['outcome'] is None, (
+                f'round {rec["round"]} rendered an outcome for its dispatching '
+                f'request: {rec["outcome"]!r}'
+            )
+        resolved = {
+            tid: req.result for tid, req in scene.reqs.items() if req.result.done()
+        }
+        assert resolved == {}, (
+            f'every chained request stays pending across a red pair; these '
+            f'resolved: {sorted(resolved, key=int)!r}'
+        )
+
+        # 2 — the durable tier is silent for every task in the queue.
+        for tid in scene.reqs:
+            assert _events_for_task(scene.db_path, tid) == ['merge_queued'], (
+                f'task {tid} emitted more than its own enqueue event: '
+                f'{_events_for_task(scene.db_path, tid)!r}'
+            )
+        attempts = _rows_of_type(scene.db_path, EventType.merge_attempt)
+        assert attempts == [], (
+            f'a red deep tip must write no merge_attempt row — that row is '
+            f'what a rendered failure looks like on the durable tier, and it '
+            f'carries the very (category, cause_hint) pair the thrash ladder '
+            f'keys on; got {attempts!r}'
+        )
+        assert _finalized_rows(scene.db_path) == [], (
+            f'nothing landed, so nothing may be finalized; got '
+            f'{_finalized_rows(scene.db_path)!r}'
+        )
+
+        # 3 — main never moved, on either round.
+        for rec in scene.rounds:
+            assert rec['main_after'] == rec['main_before'], (
+                f'main moved on red round {rec["round"]}: '
+                f'{rec["main_before"][:8]} -> {rec["main_after"][:8]}'
+            )
+            assert rec['advanced'] is False, (
+                f'round {rec["round"]} advanced on a red tip: {rec["advanced"]!r}'
+            )
+
+        # 4 — every follower is still at its ORIGINAL lane index.  Order, not
+        # membership: a chain rebuild that reordered the buffer would leave the
+        # next round chaining a different prefix while every membership
+        # assertion above still passed.
+        assert [r.task_id for r in worker._lane_buffers['normal']] == list(
+            _gate_followers(_ROW8_FOLLOWERS)
+        ), (
+            f'the followers left their submission order: '
+            f'{[r.task_id for r in worker._lane_buffers["normal"]]!r}'
+        )
+        assert list(worker._lane_buffers['high']) == [], (
+            f'nothing was ever enqueued high; got '
+            f'{[r.task_id for r in worker._lane_buffers["high"]]!r}'
+        )
+
+    async def test_the_pair_leaves_the_shipped_thrash_ladder_byte_identical(
+        self, git_repo: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """LEDGER SIDE — the conclusion, folded through the REAL ladder.
+
+        The pair's own observable outputs are handed to
+        ``workflow._evaluate_merge_thrash``.  It has nothing to eat, because the
+        ladder is fed ONLY from a rendered blocked ``MergeOutcome`` (workflow.py
+        stashes ``result.reason`` into ``_last_merge_block_reason`` and gates
+        the whole thrash check on it being non-None), and a deep red tip
+        REQUEUES without rendering one.
+
+        Asserted from BOTH a virgin ledger and a MID-RUN one.  A mid-run ledger
+        — a task that genuinely blocked sequentially earlier — is the case that
+        actually matters: it already carries a signature, so a deep fail that
+        leaked ANY signature would either increment the counter (identical
+        signature) or reset it to 1 (a different one), and both are visible
+        only against a non-zero starting point.
+        """
+        scene = await self._pair(
+            git_repo, tmp_path, monkeypatch, db_name='gate-row8-ladder.db',
+        )
+
+        virgin = RetryLedger()
+        after_virgin = _ladder_after(
+            scene.rounds, ledger=virgin, requests=list(scene.reqs.values()),
+        )
+        assert after_virgin.consecutive_merge_thrash == 0, (
+            f'a red deep pair fed the ladder a signature from nothing: counter '
+            f'{virgin.consecutive_merge_thrash!r} -> '
+            f'{after_virgin.consecutive_merge_thrash!r}'
+        )
+        assert after_virgin.last_merge_outcome_signature is None, (
+            f'a red deep pair rendered a signature: '
+            f'{after_virgin.last_merge_outcome_signature!r}'
+        )
+
+        mid_run = RetryLedger(
+            consecutive_merge_thrash=1,
+            last_merge_outcome_signature='sig-from-an-earlier-sequential-block',
+        )
+        after_mid = _ladder_after(
+            scene.rounds, ledger=mid_run, requests=list(scene.reqs.values()),
+        )
+        assert (
+            after_mid.consecutive_merge_thrash == mid_run.consecutive_merge_thrash
+        ), (
+            f'the deep pair moved a mid-run counter: '
+            f'{mid_run.consecutive_merge_thrash!r} -> '
+            f'{after_mid.consecutive_merge_thrash!r}'
+        )
+        assert (
+            after_mid.last_merge_outcome_signature
+            == mid_run.last_merge_outcome_signature
+        ), (
+            f'the deep pair overwrote a mid-run signature: '
+            f'{mid_run.last_merge_outcome_signature!r} -> '
+            f'{after_mid.last_merge_outcome_signature!r}'
+        )
+
+    async def test_the_pair_is_conserved_and_two_way_quiescent(
+        self, git_repo: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """The oracle, over the pair, with the ladder as its CAS/ledger half.
+
+        The residue is retired explicitly and CHECKED against what the pair
+        promised to leave behind before the oracle runs, so a follower that
+        wrongly landed shows up as a residue mismatch rather than being quietly
+        drained away.  The head is retired separately because a red tip parks it
+        on ``_queue``, which ``_drain_residue`` (a LANE-buffer drain) cannot
+        reach.
+        """
+        scene = await self._pair(
+            git_repo, tmp_path, monkeypatch, db_name='gate-row8-quiesce.db',
+        )
+        worker = scene.worker
+        main_sha = scene.rounds[-1]['main_after']
+        permits_before = _permit_census(worker)
+
+        head = scene.reqs['101']
+        assert not head.result.done(), (
+            'the head must still be unresolved — it is requeued, not blocked'
+        )
+        head.result.cancel()
+        worker._retire_item(head.request_id)
+
+        residue = _drain_residue(worker)
+        assert residue == set(_gate_followers(_ROW8_FOLLOWERS)), (
+            f'the pair promised to leave every follower buffered and nothing '
+            f'else; drained {sorted(residue, key=int)!r}'
+        )
+
+        before = RetryLedger()
+        _assert_two_way_quiescent(
+            worker, main_sha, list(scene.reqs.values()),
+            permits_before=permits_before,
+            ladder={
+                'before': before,
+                'after': _ladder_after(
+                    scene.rounds, ledger=before,
+                    requests=list(scene.reqs.values()),
+                ),
+            },
+        )
+
+
+class TestLadderDriverIsNotInert:
+    """The inertness control for :func:`_ladder_after`, and its keying.
+
+    Sync by design: the control is about the FOLD, not about the pipeline, so
+    it fabricates the round records rather than driving a scene.  (Note this
+    class carries no ``@pytest.mark.asyncio`` — pytest-asyncio is STRICT here,
+    and a sync test inside a class-level ``asyncio`` mark is a hard ERROR.)
+    """
+
+    def _blocked_round(
+        self, *, reason: str, category: str = 'gui_tsc',
+        cause_hint: str = 'src/App.tsx: TS2322',
+    ) -> dict:
+        """A round record whose dispatching request RESOLVED blocked."""
+        from orchestrator.merge_types import MergeOutcome
+
+        return {
+            'round': 1,
+            'tag': 'control',
+            'outcome': MergeOutcome(
+                status='blocked', reason=reason,
+                failure_category=category, failure_cause_hint=cause_hint,
+            ),
+        }
+
+    def test_a_repeated_blocked_signature_reaches_the_escalation_threshold(
+        self,
+    ) -> None:
+        """Without this, "unmoved" would prove only that the driver is inert.
+
+        Two rounds carrying the SAME rendered failure is precisely 3003's
+        signature class, and ``max_consecutive_merge_thrash`` defaults to 2, so
+        the counter must arrive exactly AT the threshold — not one short of it
+        (which would mean the second round was dropped) and not past it (which
+        would mean a round was folded twice).
+        """
+        rounds = [
+            self._blocked_round(reason='post-merge verification failed'),
+            self._blocked_round(reason='post-merge verification failed'),
+        ]
+        after = _ladder_after(rounds, ledger=RetryLedger())
+
+        assert after.consecutive_merge_thrash == _MERGE_THRASH_THRESHOLD, (
+            f'two identical rendered failures must reach the threshold '
+            f'{_MERGE_THRASH_THRESHOLD}; got '
+            f'{after.consecutive_merge_thrash!r} — the driver folded nothing, '
+            f'so every "unmoved" assertion in this row is vacuous'
+        )
+        assert after.last_merge_outcome_signature == _blocked_signature(
+            rounds[-1]['outcome'],
+        ), (
+            f'the ladder must key on the SHIPPED signature function; got '
+            f'{after.last_merge_outcome_signature!r}'
+        )
+
+    def test_two_different_blocked_signatures_reset_rather_than_accumulate(
+        self,
+    ) -> None:
+        """The driver must reproduce the ladder's RESET arm too.
+
+        A driver that only ever incremented would report thrash for a task
+        making genuine progress between blocks, and would still pass the
+        threshold control above.
+        """
+        rounds = [
+            self._blocked_round(reason='a', cause_hint='src/App.tsx: TS2322'),
+            self._blocked_round(reason='b', cause_hint='src/Other.tsx: TS7006'),
+        ]
+        after = _ladder_after(rounds, ledger=RetryLedger())
+
+        assert after.consecutive_merge_thrash == 1, (
+            f'a DIFFERING signature resets the counter to 1 (one occurrence of '
+            f'something new observed); got {after.consecutive_merge_thrash!r}'
+        )
+
+    def test_a_round_that_landed_feeds_the_ladder_nothing(self) -> None:
+        """Only 'blocked' feeds the ladder — a DONE outcome is not a failure.
+
+        The row's silence claim would be trivially true if the driver ignored
+        every outcome, so it must be shown to ignore exactly the right ones.
+        """
+        from orchestrator.merge_types import MergeOutcome
+
+        landed = {
+            'round': 1, 'tag': 'control',
+            'outcome': MergeOutcome(status='done', merge_sha='deadbeef'),
+        }
+        after = _ladder_after([landed], ledger=RetryLedger())
+
+        assert after.consecutive_merge_thrash == 0, (
+            f'a landed round is not a merge failure and must not feed the '
+            f'ladder; got {after.consecutive_merge_thrash!r}'
         )
