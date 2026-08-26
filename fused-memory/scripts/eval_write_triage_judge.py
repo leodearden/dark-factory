@@ -65,7 +65,8 @@ fixture format and the label words have one home.
 
 Usage
 -----
-  # Prove the pipeline without spending anything.
+  # Prove the pipeline without spending anything. Its fixed answers are
+  # redirected away from the committed artifact — see `guard_committed_report`.
   python scripts/eval_write_triage_judge.py --dry-run
 
   # A cheap live smoke over the first few cases.
@@ -623,6 +624,80 @@ _EVAL_PROJECT_ID = 'dark_factory'
 #: attach, never like a confident classification.
 _DRY_RUN_VERDICT = OUTCOME_STORED
 
+#: Where a ``--dry-run`` writes when it was aimed at the committed artifact.
+#: A fixed name rather than ``mkdtemp``: a dry run is a smoke, and telling the
+#: operator exactly where its throwaway landed beats a fresh random directory
+#: every invocation.
+_DRY_RUN_REPORT_NAME = 'write_triage_judge_accuracy_report.dry-run.json'
+
+
+def _is_committed_report(report_path: str) -> bool:
+    """Is ``report_path`` the committed artifact, however it was spelled?
+
+    ``resolve()`` on BOTH sides deliberately: a string ``==`` would call
+    ``calibration/write_triage_judge_accuracy_report.json`` (relative, as an
+    operator would naturally type it from the package root) a different file
+    from the absolute default, and wave through the exact overwrite this
+    guard exists to catch.
+    """
+    try:
+        return Path(report_path).resolve() == Path(_DEFAULT_REPORT_PATH).resolve()
+    except OSError:  # pragma: no cover - resolve() on a pathological path
+        return False
+
+
+def guard_committed_report(
+    report_path: str, *, dry_run: bool, limit: int | None,
+) -> str:
+    """Keep a non-measurement run from publishing itself as the measurement.
+
+    The committed report is what ``write_triage.judge_accuracy_report_path``
+    points at and, per D10, what the operator reads at the task-3169 flip
+    gate. Two kinds of run can reach it without having measured what it
+    claims, and they are NOT the same hazard, so they get different answers:
+
+    - ``--dry-run`` measures NOTHING. Every number in its report comes from a
+      fixed-answer stub, so publishing it would put fabricated figures under
+      the operator's nose with no artifact-level tell beyond a
+      ``judge_provider`` field nobody is obliged to read. It is REDIRECTED to
+      a temp path — the documented "prove the pipeline" invocation keeps
+      working and still prints its report, it just cannot overwrite the
+      committed one.
+    - ``--limit N`` measures REALLY, just partially. Its numbers are the
+      judge's own, and ``provenance.limit`` records the truncation in the
+      artifact itself, so an operator (and
+      ``TestCommittedJudgeAccuracyReportIsTraceable``) can tell. That is a
+      loud WARNING and a proceed, not a redirect.
+
+    Returns the path to actually write to.
+    """
+    if not _is_committed_report(report_path):
+        return report_path
+
+    if dry_run:
+        import tempfile  # noqa: PLC0415
+
+        redirected = str(Path(tempfile.gettempdir()) / _DRY_RUN_REPORT_NAME)
+        logger.warning(
+            'a --dry-run scores a FIXED-ANSWER stub, not the judge: it has no '
+            'measurement to publish. Redirecting its report away from the '
+            'committed artifact at %s and writing %s instead. Pass '
+            '--report-path to choose somewhere else.',
+            report_path, redirected,
+        )
+        return redirected
+
+    if limit is not None:
+        logger.warning(
+            'a --limit run is about to OVERWRITE the committed report at '
+            '%s. It is a partial smoke, not the corpus-wide measurement '
+            'the task-3169 flip gate reads: provenance.limit=%d records '
+            'that. Pass --report-path to keep the committed artifact.',
+            report_path, limit,
+        )
+
+    return report_path
+
 
 def build_judge_fn(config: Any) -> Any:
     """The LIVE edge: drive the SHIPPED judge, not a re-implementation.
@@ -704,6 +779,13 @@ def _run(args: Any) -> int:
     if args.config:
         os.environ['CONFIG_PATH'] = str(args.config)
 
+    # BEFORE any work, and outside the --limit block: a bare --dry-run also
+    # defaults to the committed path, and used to rewrite both committed
+    # artifacts with fixed-answer numbers.
+    report_path = guard_committed_report(
+        args.report_path, dry_run=args.dry_run, limit=args.limit,
+    )
+
     config = FusedMemoryConfig()
     service = types.SimpleNamespace(config=config)
     provider = resolve_judge_provider(service)
@@ -765,15 +847,6 @@ def _run(args: Any) -> int:
             '(%d canonical(s) pulled in to keep every slate resolvable)',
             args.limit, len(records), len(wanted), len(canonicals),
         )
-        if args.report_path == _DEFAULT_REPORT_PATH:
-            logger.warning(
-                'a --limit run is about to OVERWRITE the committed report at '
-                '%s. It is a partial smoke, not the corpus-wide measurement '
-                'the task-3169 flip gate reads: provenance.limit=%d records '
-                'that. Pass --report-path to keep the committed artifact.',
-                args.report_path, args.limit,
-            )
-
     if args.dry_run:
         judge_fn = _dry_run_judge_fn()
         provider, model = 'dry-run', f'fixed:{_DRY_RUN_VERDICT}'
@@ -787,7 +860,7 @@ def _run(args: Any) -> int:
     report = run_judge_eval(
         records=records,
         judge_fn=judge_fn,
-        report_path=args.report_path,
+        report_path=report_path,
         provenance={
             'fixture_path': package_relative(args.fixture),
             'judge_provider': provider,

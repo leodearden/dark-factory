@@ -843,6 +843,92 @@ class TestRunJudgeEval:
 # The committed artifact
 # ---------------------------------------------------------------------------
 
+class TestGuardCommittedReport:
+    """A run that did not measure must not publish itself as the measurement.
+
+    The committed report is what the operator reads at the task-3169 flip
+    gate. The regression this class pins: the overwrite guard used to live
+    INSIDE ``_run``'s ``if args.limit is not None:`` block, so a bare
+    ``--dry-run`` — the FIRST invocation in the module docstring, and the one
+    that measures nothing at all — defaulted to the committed path and
+    rewrote both artifacts with fixed-answer numbers under a `dry-run`
+    provider nobody was obliged to notice.
+    """
+
+    def test_an_unrelated_path_is_returned_untouched(self, tmp_path: Path) -> None:
+        target = str(tmp_path / 'somewhere-else.json')
+        assert _mod().guard_committed_report(
+            target, dry_run=True, limit=None) == target
+
+    def test_a_dry_run_is_redirected_off_the_committed_artifact(self) -> None:
+        committed = _mod()._DEFAULT_REPORT_PATH
+        got = _mod().guard_committed_report(committed, dry_run=True, limit=None)
+        assert Path(got).resolve() != Path(committed).resolve(), (
+            'a --dry-run scores a fixed-answer stub; publishing it puts '
+            'fabricated numbers in front of the flip-gate operator'
+        )
+        assert Path(got).name == _mod()._DRY_RUN_REPORT_NAME
+
+    def test_a_relative_spelling_of_the_committed_path_is_also_caught(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """A string ``==`` misses this; ``resolve()`` on both sides catches it."""
+        committed = Path(_mod()._DEFAULT_REPORT_PATH)
+        monkeypatch.chdir(committed.parent.parent)
+        relative = str(Path('calibration') / committed.name)
+        got = _mod().guard_committed_report(relative, dry_run=True, limit=None)
+        assert Path(got).resolve() != committed.resolve()
+
+    def test_the_dry_run_redirect_is_logged_loudly(self, caplog) -> None:
+        with caplog.at_level(logging.WARNING):
+            _mod().guard_committed_report(
+                _mod()._DEFAULT_REPORT_PATH, dry_run=True, limit=None)
+        assert any(r.levelno >= logging.WARNING for r in caplog.records)
+
+    def test_a_limit_run_still_writes_the_committed_path_but_warns(
+        self, caplog,
+    ) -> None:
+        """`--limit` measures REALLY, just partially.
+
+        Its numbers are the judge's own and ``provenance.limit`` records the
+        truncation in the artifact, so this one warns and proceeds rather
+        than redirecting — the artifact-level tell is what
+        :meth:`TestCommittedJudgeAccuracyReportIsTraceable.test_the_committed_report_is_a_full_measurement`
+        reads.
+        """
+        committed = _mod()._DEFAULT_REPORT_PATH
+        with caplog.at_level(logging.WARNING):
+            got = _mod().guard_committed_report(committed, dry_run=False, limit=5)
+        assert got == committed
+        assert any(r.levelno >= logging.WARNING for r in caplog.records)
+
+    def test_a_full_live_run_is_neither_redirected_nor_warned(
+        self, caplog,
+    ) -> None:
+        committed = _mod()._DEFAULT_REPORT_PATH
+        with caplog.at_level(logging.WARNING):
+            got = _mod().guard_committed_report(committed, dry_run=False, limit=None)
+        assert got == committed
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+    def test_the_guard_is_reached_outside_the_limit_block(self) -> None:
+        """`_run` must consult the guard on EVERY path, not just `--limit`.
+
+        Asserted against the call SITE rather than by driving `_run` (which
+        would need a config, a fixture load and a provider resolution) —
+        narrow, but it is exactly the structural mistake being pinned: the
+        guard nested one `if` too deep.
+        """
+        import inspect  # noqa: PLC0415
+
+        source = inspect.getsource(_mod()._run)
+        head = source.split('if args.limit is not None:')[0]
+        assert 'guard_committed_report(' in head, (
+            'the guard must run before/outside the --limit block, or a bare '
+            '--dry-run reaches the committed artifact again'
+        )
+
+
 class TestCommittedJudgeAccuracyReportIsTraceable:
     """A number gating a decision must be a number some run measured.
 
@@ -975,6 +1061,34 @@ class TestCommittedJudgeAccuracyReportIsTraceable:
         assert report is not None and resolved is not None
         sibling = resolved.with_suffix('.md')
         assert sibling.exists(), f'no markdown sibling at {sibling}'
+
+    def test_the_committed_report_is_a_full_measurement(self) -> None:
+        """Not a `--dry-run` stub, and not a truncated `--limit` smoke.
+
+        The guard in the script stops the first case at write time; this
+        stops BOTH at review time, so a clobbered artifact is a red test
+        rather than a silent substitution of fabricated (or partial) numbers
+        for the measurement the task-3169 flip gate reads.
+
+        `judge_provider` is checked against the shipped `_KNOWN_PROVIDERS`
+        tuple, which the `dry-run` sentinel is deliberately not a member of.
+        Still no assertion on any accuracy VALUE — this is about whether a
+        run happened, never about whether it scored well.
+        """
+        from fused_memory.server import write_triage_judge  # noqa: PLC0415
+
+        _block, report, _resolved = self._committed()
+        assert report is not None
+        provenance = report['provenance']
+        assert provenance['limit'] is None, (
+            f'the committed report is a --limit {provenance["limit"]!r} smoke, '
+            f'not the corpus-wide measurement — re-run the eval without --limit'
+        )
+        assert provenance['judge_provider'] in write_triage_judge._KNOWN_PROVIDERS, (
+            f'judge_provider {provenance["judge_provider"]!r} is not a real '
+            f'provider {list(write_triage_judge._KNOWN_PROVIDERS)} — this '
+            f'artifact was written by a stub, not measured'
+        )
 
     def test_provenance_names_the_model_and_the_fixture(self) -> None:
         _block, report, _resolved = self._committed()
