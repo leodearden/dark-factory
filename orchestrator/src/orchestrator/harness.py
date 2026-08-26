@@ -27,6 +27,7 @@ from shared.config_dir import CONFIG_DIR_PREFIX
 from shared.cost_store import CostStore
 from shared.mcp_envelope import resolver_failed
 from shared.storm_counter import StormCounter
+from shared.task_claimant import has_live_claimant
 from shared.task_metadata import RoutingState
 from shared.timestamps import parse_timestamp_or_warn
 from shared.transcript_archive import (
@@ -254,6 +255,22 @@ _CONFIG_UNKNOWN_KEYS_SENTINEL: str = 'config-unknown-keys-startup'
 # The explicit merge-deferred early-return in _reconcile_one_stranded mirrors
 # the open-L1 /unblock veto guard (harness.py _reconcile_one_stranded:~1598).
 _RECONCILE_SWEEP_STATUSES: frozenset[str] = frozenset({'in-progress', 'blocked'})
+
+# Statuses a resolution-driven `resume` may re-pend (task 3540 / PRD
+# `plans/task-escalation-state-graph-prd.md` D8, spec E9).  Deliberately an
+# ALLOW-list, not a deny-list: a deny-list would silently acquire every future
+# status added to the vocabulary — the "sweep carve-out treadmill" D2 rejects.
+# Every excluded status is excluded for its own reason:
+#   'done' / 'cancelled'  — terminal; a flip would resurrect completed work
+#   'deferred'            — a deliberate operator park
+#   'merge-deferred'      — owned by the merge queue, whose train/derail
+#                            machinery would lose its member
+#   'review'              — human-only (PRD open question 3)
+#   'pending'             — already the target; a no-op write that would still
+#                            spuriously charge the re-block guard
+# 'infra-hold' never reaches the gate — its pre-gate in
+# `_cascade_unblock_member` returns first.
+_RESUME_REPEND_STATUSES: frozenset[str] = frozenset({'blocked', 'in-progress'})
 
 # heartbeat_ttl the harness configures TaskGroundTruth (task 2243, W10-θ2)
 # with — the staleness threshold TG-3's live_claimant folding applies to the
@@ -15308,28 +15325,103 @@ class Harness:
         normalized = ' '.join(raw.split()).lower()
         return f'{escalation.category}:{normalized[:120]}'
 
-    async def _cascade_unblock_member(self, escalation) -> None:
-        """Async helper: flip a cascade-resolved L1 member task from blocked→pending.
+    def _resume_repend_liveness(self, task_id: str, row: Mapping | None) -> bool:
+        """True when *task_id* currently has a LIVE claimant.
 
-        Only 'blocked' tasks are flipped. Every other status — including
-        terminal statuses (done, cancelled), non-terminal live statuses
-        (deferred, in-progress, pending, merge-deferred), and any future
-        status — is DEBUG-skipped. The intent of this feature is purely to
-        unblock 'blocked' tasks; terminal members completing normally while
-        their L2 cluster is still pending is an expected, common outcome and
-        should not produce operator-visible WARNINGs.
+        The status-agnostic half of the resume gate (task 3540 / PRD
+        ``plans/task-escalation-state-graph-prd.md`` D8, spec E9). Folds two
+        signals, in-memory FIRST:
+
+          1. ``Scheduler.is_actively_held`` — dispatched, holding a module
+             lock, or inside the cancel-grace window. Consulted first,
+             mirroring ``TaskGroundTruth._resolve_live_claimant``'s priority
+             order: it closes the dispatch race where a workflow holds the slot
+             and the locks but has not yet stamped a claimant row, which a
+             DB-only oracle would read as stranded. ``_escalation_events`` does
+             not cover this — it is popped at slot exit, while
+             ``is_actively_held`` also folds in the cancel-grace window.
+          2. ``shared.task_claimant.has_live_claimant`` on the store row — the
+             only member of that module that fits, since ``is_stranded`` gates
+             on ``status == 'in-progress'`` and ``is_stranded_blocked`` on
+             ``status == 'blocked'``, so neither can answer the single
+             status-agnostic question this fork asks. This is also the half
+             that sees a claimant held by ANOTHER orchestrator, which the
+             process-local ``_escalation_events`` check structurally cannot.
+
+        TTL choice: ``config.claimant_liveness_ttl_secs`` (300s, operator-
+        tunable and green-tier hot-reloadable), NOT this module's hardcoded
+        600s ``_RECONCILE_HEARTBEAT_TTL``. The re-pend's immediate downstream
+        consumer is ``Scheduler._eligible_for_dispatch``, which gates on
+        exactly this knob and this same ``has_live_claimant`` call; aligning
+        them guarantees we never write ``pending`` to a row the dispatcher
+        would then refuse to dispatch — which would be a fresh silent hold.
+
+        A ``None``/absent row reads as NOT live (no claimant column at all), so
+        an unreadable row never suppresses a re-pend here. The write-time
+        corroborating read applies the opposite, fail-safe rule for a row it
+        cannot read at all — see :meth:`_cascade_unblock_member`.
+        """
+        if self.scheduler.is_actively_held(task_id):
+            return True
+        return has_live_claimant(
+            row or {},
+            datetime.now(UTC),
+            timedelta(seconds=self.config.claimant_liveness_ttl_secs),
+        )
+
+    async def _cascade_unblock_member(self, escalation) -> None:
+        """Async helper: re-pend a resolution-resumed task to Table B's target.
+
+        The gate is CLAIMANT LIVENESS, not ``status == 'blocked'`` (task 3540 /
+        PRD ``plans/task-escalation-state-graph-prd.md`` D8, spec E9). Two
+        conditions must hold for the flip:
+
+          1. The status is in :data:`_RESUME_REPEND_STATUSES`
+             (``{blocked, in-progress}``). Every other status — terminal
+             (done, cancelled), operator-parked (deferred), queue-owned
+             (merge-deferred), human-only (review), already-the-target
+             (pending), and any future status — is DEBUG-skipped. Terminal
+             members completing normally while their L2 cluster is still
+             pending is an expected, common outcome and must not produce
+             operator-visible WARNINGs.
+          2. The task has NO live claimant. A live claimant means a workflow
+             is running and owns its own re-pend — it was already woken
+             synchronously by ``event.set()`` in ``_on_escalation_resolved``,
+             and flipping here would race it.
+
+        What this replaced, and why: the old gate skipped every non-``blocked``
+        row on its status alone. That stranded any task whose workflow died
+        between filing the escalation and exiting — the row stayed
+        ``in-progress`` with nothing heartbeating it and its escalation now
+        closed, so nothing was left to advance it.
+
+        The live-claimant skip applies to ``blocked`` rows too, which is a
+        genuine behaviour change (``blocked`` previously flipped
+        unconditionally). Its recovery edge is named rather than assumed: the
+        scheduler's stranded-blocked-redispatch sweep
+        (``scheduler.py::Scheduler`` / ``shared.task_claimant.is_stranded_blocked``,
+        ``stranded_blocked_redispatch_enabled`` default True) re-owns exactly a
+        ``blocked`` row with no live claimant and no open escalation — precisely
+        the shape left behind if the skipped row's claimant later dies with the
+        record already closed. In practice the skip fires rarely: production
+        ``blocked`` rows commonly carry a STALE claimant that was never cleared,
+        and only a heartbeat fresher than ``claimant_liveness_ttl_secs``
+        suppresses the flip.
 
         EXCEPTION: an infra-held task (first-class status == 'infra-hold',
         via is_infra_held — task 2200/ω4) is checked FIRST, before the
-        'blocked'-only gate below, because its status is 'infra-hold', never
-        'blocked' — see the A1 guard.
+        status/liveness gate below, because its status is 'infra-hold', never
+        'blocked' or 'in-progress' — see the A1 guard.
 
-        TOCTOU note: get_status and set_task_status are separate MCP
-        round-trips with no atomic compare-and-set. If the task transitions
-        away from 'blocked' between the read and the write (e.g. a workflow
-        picks it up → 'in-progress'), set_task_status('pending') may succeed
-        and clobber the newer status. This is accepted as a best-effort
-        policy; the race window is narrow in practice.
+        TOCTOU note: these are separate MCP round-trips with no atomic
+        compare-and-set, so the window cannot be closed — only narrowed. It is
+        narrowed by a CORROBORATING ``get_task`` immediately before the write
+        (task 3540): status AND claimant liveness are re-derived from that ONE
+        snapshot, and a disagreement aborts without writing. The remaining
+        window is (corroborating get_task → set_task_status), one hop, versus
+        the previous (get_status → guard get_task → guard update_task →
+        set_task_status). Status and claimant also now come from a single
+        snapshot rather than two skewed reads.
 
         Efficiency note (review amendment, task 2200): get_task above (used
         only for the is_infra_held pre-gate) and get_status below both
@@ -15443,19 +15535,34 @@ class Harness:
         # docstring.
         status = await self.scheduler.get_status(task_id)
 
-        if status != 'blocked':
+        if status not in _RESUME_REPEND_STATUSES:
             logger.debug(
-                'cascade-unblock: task %s is %s (not blocked; skipping flip via %s)',
+                'cascade-unblock: task %s is %s (not a re-pendable status; '
+                'skipping flip via %s)',
+                task_id, status, escalation.resolved_by,
+            )
+            return
+
+        # Claimant-liveness fork (task 3540 / PRD D8, spec E9).  Evaluated
+        # against the _infra_task snapshot already fetched for the infra
+        # pre-gate above, so the SKIP path costs no extra round-trip.
+        if self._resume_repend_liveness(task_id, _infra_task):
+            logger.debug(
+                'cascade-unblock: task %s is %s with a live claimant — the '
+                'synchronous wake path owns the re-pend; skipping flip via %s',
                 task_id, status, escalation.resolved_by,
             )
             return
 
         # Re-block guard (C5/D6): count same-signature re-pends cross-incarnation;
-        # withhold the flip when the threshold is reached.
+        # withhold the flip when the threshold is reached.  Deliberately AFTER
+        # the status/liveness gate, so a skipped row never charges the counter —
+        # and it now charges for in-progress-originated re-pends too, which is
+        # intended: the resolution-driven flip still charges the guard.
         if not await self._check_reblock_guard(escalation, task_id):
             return
 
-        # Only 'blocked' reaches here — attempt the flip.
+        # Only a re-pendable status with no live claimant reaches here.
         # Table B (ω3, task 2196): source the target from the same authority
         # _on_escalation_resolved / escalation.server.resolve_issue use, so
         # resume→pending cannot drift into a third independent copy.
@@ -15478,8 +15585,8 @@ class Harness:
         try:
             await self.scheduler.set_task_status(task_id, _resume_target)
             logger.info(
-                'cascade-unblock: task %s flipped blocked→%s (via %s)',
-                task_id, _resume_target, escalation.resolved_by,
+                'cascade-unblock: task %s flipped %s→%s (via %s)',
+                task_id, status, _resume_target, escalation.resolved_by,
             )
         except SetTaskStatusRejected as e:
             # Defensive TOCTOU guard: task may have transitioned to a terminal
@@ -15510,8 +15617,8 @@ class Harness:
             # record and nothing that will retry — exactly the silent permanent
             # hold INV-4 exists to close.
             logger.warning(
-                'cascade-unblock: blocked→%s resume failed for %s',
-                _resume_target, task_id, exc_info=True,
+                'cascade-unblock: %s→%s resume failed for %s',
+                status, _resume_target, task_id, exc_info=True,
             )
             self._escalate_cascade_status_rejection(
                 task_id, _resume_target, e, resolved_by=escalation.resolved_by,
