@@ -1937,11 +1937,35 @@ def fused_memory_staleness_pass() -> None:
     fleet's coordinator.
 
     Gate order (mirrors staleness_pass): (1) fm-deploy min-interval clock cap
-    FIRST (fm's OWN clock, throttled skip-log); (2) newest fm-watched commit,
-    None -> no-op; (3) commit-grace head-start reusing STALENESS_GRACE_SECS so
-    the polite fm coordinator gets its head start before the backstop acts;
-    (4) enabled / startup-grace / ActiveEnterTimestamp-vs-commit -> delegate
-    once via _delegate_fm_restart().
+    FIRST (fm's OWN clock, throttled skip-log); (2) fm coordinator head start,
+    a SECOND clock gate measured from when that min-interval window OPENED
+    (task 4754 — see below); (3) newest fm-watched commit, None -> no-op;
+    (4) the RETAINED commit-age anchor reusing STALENESS_GRACE_SECS, so the
+    effective head start is the LATER of anchors (2) and (4); (5) enabled /
+    startup-grace / ActiveEnterTimestamp-vs-commit -> delegate once via
+    _delegate_fm_restart().
+
+    Corrected head-start anchor (task 4754): gate (4) alone measured the head
+    start from the COMMIT, which had already lapsed by construction whenever
+    fm's own 8h window opened — in a repo that ships fm's watched paths
+    continuously, the newest commit is typically hours old at that boundary
+    (measured 2026-08-25: zero watched-path commits in the 30 minutes before
+    ANY of 12 dark_factory run boundaries over 08-22..08-25). So the "the
+    polite fm coordinator gets its head start" claim this docstring used to
+    make was not true in the common case. Gate (2) —
+    scripts/orchestrator-watchdog.py::_within_fm_staleness_head_start — makes
+    it true.
+
+    Gate (2) uses fm's OWN clock (FM_DEPLOY_CLOCK_PATH) and fm's OWN cap
+    (FM_RESTART_MIN_INTERVAL_SECS), never the fleet's. The two clocks stay
+    deliberately independent (see the FM_DEPLOY_CLOCK_PATH module comment), so
+    an orchestrator fleet redeploy does not open or reset fm's head-start
+    window and vice-versa.
+
+    SCOPE: this orders the two TIERS at each clock-open only. It does NOT
+    address the backstop colliding with its OWN in-flight sweep (a tick whose
+    min-interval check passed before an in-flight redeploy stamped the clock),
+    which needs in-flight state and is task 4755.
 
     Stateless (I6): staleness is recomputed from live systemd + git each tick,
     so a successful restart (from this pass or the fm coordinator) advances
@@ -1956,9 +1980,12 @@ def fused_memory_staleness_pass() -> None:
     revive path (I5: brokenness is not a scheduled deploy).
     """
     if _within_fm_deploy_min_interval():
-        # Bucket on wall-clock time (no extra clock read beyond the gate's) —
-        # see SKIP_LOG_INTERVAL_SECS. The gate check still runs every tick;
-        # only the log emission is throttled.
+        # Bucket on wall-clock time — see SKIP_LOG_INTERVAL_SECS. The gate
+        # check still runs every tick; only the log emission is throttled. The
+        # head-start gate below takes a SECOND small-JSON clock read on ticks
+        # where this first gate is open, deliberately: each gate keeps its own
+        # named reader seam rather than threading one epoch through both
+        # (task 4754).
         if time.time() % SKIP_LOG_INTERVAL_SECS < 120:
             log(
                 "skip: within fm-deploy min-interval "
@@ -1966,11 +1993,20 @@ def fused_memory_staleness_pass() -> None:
             )
         return
 
+    if _within_fm_staleness_head_start():
+        log(
+            f"skip: holding the {STALENESS_GRACE_SECS}s fm-coordinator head start "
+            "since the fm-deploy min-interval opened"
+        )
+        return
+
     commit_epoch = _newest_fm_watched_commit_epoch()
     if commit_epoch is None:
         return  # undeterminable — fall safe, no restart this tick
     if time.time() - commit_epoch < STALENESS_GRACE_SECS:
-        # Give the polite event-driven fm coordinator its head start.
+        # RETAINED second anchor (task 4754 decision 1, applied identically to
+        # both tiers): the head start is the LATER of "since fm's min-interval
+        # window opened" (gate above) and "since the newest fm-watched commit".
         return
 
     try:
