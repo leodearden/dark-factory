@@ -722,10 +722,27 @@ function TasksTab({ projectFilter, search }) {
   // Runtime-probe health, derived frontend-side from the ACTIVE_TASKS rows
   // (deliberately not a new top-level payload key — the per-project fact is
   // already fully recoverable from `runtime_status`, so a new key would carry
-  // zero extra information). Independent of tasksOffline above: fused-memory
-  // being reachable says nothing about whether we could probe the
-  // orchestrators, and gating this on tasksOffline would hide a probe failure
-  // in the common case where fused-memory is up. Both banners can show at once.
+  // zero extra information). `runtime_status` is produced by
+  // task_runtime._probe_one (which names the fault domain) and mapped to the
+  // row vocabulary by active_tasks._probe_status — grep either end to find
+  // the other.
+  //
+  // A SIBLING of bannerNotices above, not a fifth kind inside it. The two
+  // answer different questions: tasksBannerNotices reports whether TASK DATA
+  // is available, a distinction decided server-side in app.api_tasks, while
+  // rtProbeSummary is a client-side derivation over the ACTIVE_TASKS rows
+  // reporting whether we could reach the ORCHESTRATORS. Those are independent
+  // — fused-memory being down says nothing about orchestrator reachability —
+  // so both banners can show at once, and neither gates the other.
+  //
+  // Folding this into tasksBannerNotices would not merely blur that: it would
+  // SUPPRESS the probe verdict. That function short-circuits
+  // (tasks_offline_banner.js:112-115) — when `offline` is true it returns a
+  // single global notice and never evaluates the other kinds — so a probe
+  // notice routed through it would vanish during precisely the fused-memory
+  // outage we must not gate on, which is when an operator is already
+  // mid-triage and least able to afford a missing signal. Pinned by
+  // test_tab_tasks_runtime.py::test_probe_banner_is_not_a_tasksbannernotices_kind.
   //
   // Computed over the UNFILTERED rows, and deliberately NOT narrowable.
   // `selfInflicted` is an assertion about the DASHBOARD's own health — that it
