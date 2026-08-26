@@ -2752,3 +2752,410 @@ class TestJudgedWithoutReferenceRendering:
         assert '2 of 2 scored cell(s)' in line
         # …and it must not read as the clean answer.
         assert 'judged without reference: 0 ' not in out
+
+
+# ---------------------------------------------------------------------------
+# Task 4760: the no-plan band, split by TERMINAL CAUSE
+#
+# ``no_plan`` says HOW MANY architect cells emitted no plan; it never said WHY.
+# Tranche 1 read 47 of 53 ``plan_steps = 0`` cells as an 89% planning failure
+# when every one of them was an explicit, adversarially-verified-true decline
+# (``report_false_premise`` and friends) — a CORRECT refusal. The split below is
+# EXPLANATORY: it moves no cell between pools and changes no existing number.
+# ---------------------------------------------------------------------------
+
+def _kinded(result, terminal_kind):
+    """Stamp the persisted ``terminal_kind`` onto a built cell (task 4760).
+
+    ``_mresult`` builds its metrics through ``EvalMetrics.to_dict``, which emits
+    ``terminal_kind=None`` on every cell — the "not measured" shape. A cell that
+    RESOLVED to a kind is what ``run_architect_eval`` now persists, so the
+    fixtures say which kind out loud rather than leaving the report layer to
+    infer one from ``plan_steps``.
+    """
+    result.metrics['terminal_kind'] = terminal_kind
+    return result
+
+
+def _pre_terminal_kind(result):
+    """A cell written BEFORE ``terminal_kind`` existed — the key is ABSENT.
+
+    The ``_keyless`` precedent one field over (task 3628): the tranche-1 corpus
+    already on disk carries no such key, and that shape is not constructible any
+    other way. The report layer must read it as UNMEASURED, never as "this cell
+    was measured and did not decline" — a partial count that wears the
+    appearance of a complete one is the exact defect this task removes.
+    """
+    result.metrics.pop('terminal_kind', None)
+    return result
+
+
+class TestPlanQualityReportSplitsNoPlanByDecline:
+    """``no_plan`` gains a WHY, and ``plan_rate`` keeps its historical HOW MANY.
+
+    Four new keys, all describing the SAME admitted pool ``n`` / ``no_plan`` /
+    ``plan_rate`` / ``mean_plan_quality`` already describe:
+
+    - ``declined`` — admitted cells whose terminal statement was one of the five
+      explicit plan-tools decline exits;
+    - ``declined_by_kind`` — that total broken out by kind, key-sorted, for the
+      same reason ``cap_excluded_by_cause`` is: the kinds are not
+      interchangeable;
+    - ``no_plan_declined`` — the intersection with ``no_plan``, i.e. THE tranche-1
+      number ("47 of 47 no-plan cells were declines");
+    - ``terminal_kind_unmeasured`` — admitted cells that predate the field, so a
+      partial split never reads as a complete one.
+    """
+
+    @staticmethod
+    def _four_cells_three_no_plan():
+        """2 declines + 1 silent no-plan + 1 planned cell, all admitted.
+
+        THE tranche-1 shape in miniature: three cells recorded
+        ``plan_steps = 0`` and only ONE of them is a genuine "could not plan".
+        """
+        return [
+            _kinded(_arch('p1', 'arch-split', 1, plan_steps=0, plan_quality=0.0,
+                          cost_usd=0.3, duration_ms=60000), 'false_premise'),
+            _kinded(_arch('p2', 'arch-split', 1, plan_steps=0, plan_quality=0.0,
+                          cost_usd=0.3, duration_ms=60000), 'already_done'),
+            _kinded(_arch('p3', 'arch-split', 1, plan_steps=0, plan_quality=0.0,
+                          cost_usd=0.3, duration_ms=60000), 'none'),
+            _kinded(_arch('p4', 'arch-split', 1, plan_steps=6, plan_quality=0.8,
+                          cost_usd=0.3, duration_ms=60000), 'planned'),
+        ]
+
+    # -- (a) the per-row field -------------------------------------------
+
+    def test_every_row_carries_the_persisted_terminal_kind(self):
+        from orchestrator.evals.report import build_plan_quality_report
+
+        report = build_plan_quality_report(self._four_cells_three_no_plan())
+        by_task = {r['task_id']: r['terminal_kind'] for r in report['rows']}
+
+        assert by_task == {
+            'p1': 'false_premise',
+            'p2': 'already_done',
+            'p3': 'none',
+            'p4': 'planned',
+        }
+
+    def test_an_unmeasured_row_carries_none_never_a_fabricated_kind(self):
+        """Both unmeasured shapes read ``None``: an implementer cell (the field
+        does not apply) and a legacy cell (the field did not exist)."""
+        from orchestrator.evals.report import build_plan_quality_report
+
+        results = [
+            _mresult('impl', 'impl-cfg', 1, quality=1.0, cost_usd=0.3,
+                     duration_ms=60000),
+            _pre_terminal_kind(
+                _arch('legacy', 'arch-legacy', 1, plan_steps=0,
+                      plan_quality=0.0, cost_usd=0.3, duration_ms=60000)
+            ),
+        ]
+        report = build_plan_quality_report(results)
+        by_task = {r['task_id']: r for r in report['rows']}
+
+        assert by_task['impl']['terminal_kind'] is None
+        assert by_task['legacy']['terminal_kind'] is None
+        # …and the key is PRESENT on every row, so a consumer never has to tell
+        # "absent" from "None" at the row layer.
+        assert all('terminal_kind' in r for r in report['rows'])
+
+    # -- (b) the per-config counts ---------------------------------------
+
+    def test_declined_counts_the_explicit_decline_exits_by_kind(self):
+        from orchestrator.evals.metrics import DECLINE_KINDS
+        from orchestrator.evals.report import build_plan_quality_report
+
+        cfg = build_plan_quality_report(
+            self._four_cells_three_no_plan()
+        )['configs'][0]
+
+        assert cfg['declined'] == 2
+        # Key-SORTED, mirroring cap_excluded_by_cause: the rendered split must
+        # not reorder itself between two builds over the same results.
+        assert cfg['declined_by_kind'] == {'already_done': 1, 'false_premise': 1}
+        assert list(cfg['declined_by_kind']) == sorted(cfg['declined_by_kind'])
+        # Only the five explicit exits count — 'planned' and 'none' are terminal
+        # kinds but not declines, and neither may leak into the tally.
+        assert set(cfg['declined_by_kind']) <= set(DECLINE_KINDS)
+
+    # -- (c) the tranche-1 number, beside an UNCHANGED plan_rate ----------
+
+    def test_the_no_plan_band_splits_three_ways_without_moving_plan_rate(self):
+        """THE acceptance shape: the same 3 no-plan cells, now readable.
+
+        ``plan_rate`` keeps its exact historical derivation (``plan_steps > 0``
+        over the admitted pool) so every committed campaign artifact stays
+        comparable; the split is reported ALONGSIDE it.
+        """
+        from orchestrator.evals.report import build_plan_quality_report
+
+        cfg = build_plan_quality_report(
+            self._four_cells_three_no_plan()
+        )['configs'][0]
+
+        assert cfg['n'] == 4
+        assert cfg['no_plan'] == 3
+        assert cfg['no_plan_declined'] == 2
+        assert cfg['declined'] == 2
+        assert cfg['plan_rate'] == 0.25
+        # The silent "could not plan" cell is what is LEFT — the one cell the
+        # 89%-failure reading was ever entitled to.
+        assert cfg['no_plan'] - cfg['no_plan_declined'] == 1
+
+    # -- (d) the plan-then-decline cell ----------------------------------
+
+    def test_a_plan_then_decline_cell_is_declined_but_not_no_plan(self):
+        """reify_task_4026 / run e522b1b0: a 6-step plan, then ``already_done``.
+
+        BOTH facts survive — ``plan_steps=6`` keeps it out of ``no_plan`` and
+        out of ``plan_rate``'s numerator complement, while ``declined`` records
+        the terminal call. ``declined - no_plan_declined`` recovers it exactly.
+        """
+        from orchestrator.evals.report import build_plan_quality_report
+
+        results = [
+            *self._four_cells_three_no_plan(),
+            _kinded(_arch('p5', 'arch-split', 1, plan_steps=6, plan_quality=0.7,
+                          cost_usd=0.3, duration_ms=60000), 'already_done'),
+        ]
+        cfg = build_plan_quality_report(results)['configs'][0]
+
+        assert cfg['n'] == 5
+        assert cfg['no_plan'] == 3            # unchanged: this cell planned
+        assert cfg['no_plan_declined'] == 2   # unchanged: it is not a no-plan
+        assert cfg['declined'] == 3           # …but it IS a decline
+        assert cfg['declined_by_kind'] == {'already_done': 2, 'false_premise': 1}
+        assert cfg['declined'] - cfg['no_plan_declined'] == 1
+
+    # -- (e) pool discipline ---------------------------------------------
+
+    def test_a_cap_tainted_decline_is_in_neither_new_count(self):
+        """A cap-tainted cell is not in the admitted pool AT ALL.
+
+        It belongs to ``cap_excluded`` alone — exactly as it already does for
+        ``no_plan`` and ``judged_without_reference``. Counting its stale
+        terminal kind would describe a cell the mean beside it never saw.
+        """
+        from orchestrator.evals.report import build_plan_quality_report
+
+        results = [
+            *self._four_cells_three_no_plan(),
+            _kinded(_arch('p9', 'arch-split', 1, plan_steps=0, plan_quality=0.0,
+                          cost_usd=0.0, duration_ms=0, cap_tainted=True),
+                    'false_premise'),
+        ]
+        cfg = build_plan_quality_report(results)['configs'][0]
+
+        assert cfg['cap_excluded'] == 1
+        assert cfg['total'] == 5
+        assert cfg['n'] == 4                      # the admitted pool, unchanged
+        assert cfg['declined'] == 2               # the tainted cell is absent
+        assert cfg['declined_by_kind'] == {'already_done': 1, 'false_premise': 1}
+        assert cfg['terminal_kind_unmeasured'] == 0
+
+    # -- (f) the legacy cell ---------------------------------------------
+
+    def test_a_keyless_cell_is_unmeasured_not_not_declined(self):
+        """Absence is not "did not decline" — the ``judged_without_reference``
+        rule, applied to the field beside it."""
+        from orchestrator.evals.report import build_plan_quality_report
+
+        results = [
+            *self._four_cells_three_no_plan(),
+            _pre_terminal_kind(
+                _arch('p8', 'arch-split', 1, plan_steps=0, plan_quality=0.0,
+                      cost_usd=0.3, duration_ms=60000)
+            ),
+        ]
+        cfg = build_plan_quality_report(results)['configs'][0]
+
+        assert cfg['n'] == 5
+        assert cfg['no_plan'] == 4
+        assert cfg['terminal_kind_unmeasured'] == 1
+        assert cfg['declined'] == 2               # NOT 3, and NOT silently 2/5
+        assert cfg['no_plan_declined'] == 2
+
+    def test_a_fully_measured_config_reports_zero_unmeasured(self):
+        """A count that only appears when it fires cannot be read."""
+        from orchestrator.evals.report import build_plan_quality_report
+
+        cfg = build_plan_quality_report(
+            self._four_cells_three_no_plan()
+        )['configs'][0]
+
+        assert cfg['terminal_kind_unmeasured'] == 0
+        assert cfg['declined_by_kind'] != {} or cfg['declined'] == 0
+
+    # -- (g) report-level totals -----------------------------------------
+
+    def test_report_totals_equal_the_per_config_sums(self):
+        from orchestrator.evals.report import build_plan_quality_report
+
+        results = [
+            *self._four_cells_three_no_plan(),
+            _kinded(_arch('q1', 'arch-other', 1, plan_steps=0, plan_quality=0.0,
+                          cost_usd=0.3, duration_ms=60000), 'unactionable'),
+            _kinded(_arch('q2', 'arch-other', 1, plan_steps=6, plan_quality=0.9,
+                          cost_usd=0.3, duration_ms=60000), 'planned'),
+        ]
+        report = build_plan_quality_report(results)
+
+        assert report['declined'] == sum(c['declined'] for c in report['configs'])
+        assert report['declined'] == 3
+        assert report['declined_by_kind'] == {
+            'already_done': 1, 'false_premise': 1, 'unactionable': 1,
+        }
+        assert list(report['declined_by_kind']) == sorted(
+            report['declined_by_kind']
+        )
+        merged: dict[str, int] = {}
+        for c in report['configs']:
+            for kind, n in c['declined_by_kind'].items():
+                merged[kind] = merged.get(kind, 0) + n
+        assert report['declined_by_kind'] == merged
+
+    # -- (h) the rendered surface ----------------------------------------
+
+    def test_the_mean_section_renders_a_declined_column(self):
+        from orchestrator.evals.report import (
+            _PLAN_QUALITY_MEAN_COLUMNS,
+            _PLAN_QUALITY_MEAN_HEADER,
+            build_plan_quality_report,
+            format_plan_quality_table,
+        )
+
+        # Pin the column tuple FIRST (the file's established idiom): the split
+        # is rendered IMMEDIATELY AFTER the number it explains, never appended
+        # away from it, and the mean stays last.
+        assert (
+            _PLAN_QUALITY_MEAN_COLUMNS.index('declined')
+            == _PLAN_QUALITY_MEAN_COLUMNS.index('no_plan') + 1
+        )
+        assert _PLAN_QUALITY_MEAN_COLUMNS[-1] == 'mean_plan_quality'
+
+        out = format_plan_quality_table(
+            build_plan_quality_report(self._four_cells_three_no_plan())
+        )
+        header = _table_row_cells(
+            out, 'config_name', section=_PLAN_QUALITY_MEAN_HEADER,
+        )
+        cells = _table_row_cells(
+            out, 'arch-split', section=_PLAN_QUALITY_MEAN_HEADER,
+        )
+
+        assert cells[header.index('declined')] == '2'
+        # The numbers it explains stay legible beside it, unchanged.
+        assert cells[header.index('no_plan')] == '3'
+        assert cells[header.index('plan_rate')] == '0.2500'
+
+    def test_a_config_with_no_declines_renders_zero_not_the_null_sentinel(self):
+        """``-`` already means "not an architect run" on this surface; a
+        measured zero must not borrow it."""
+        from orchestrator.evals.report import (
+            _PLAN_QUALITY_MEAN_HEADER,
+            build_plan_quality_report,
+            format_plan_quality_table,
+        )
+
+        results = [
+            _kinded(_arch('p1', 'arch-clean', 1, plan_steps=6, plan_quality=0.8,
+                          cost_usd=0.3, duration_ms=60000), 'planned'),
+        ]
+        out = format_plan_quality_table(build_plan_quality_report(results))
+        header = _table_row_cells(
+            out, 'config_name', section=_PLAN_QUALITY_MEAN_HEADER,
+        )
+        cells = _table_row_cells(
+            out, 'arch-clean', section=_PLAN_QUALITY_MEAN_HEADER,
+        )
+
+        assert cells[header.index('declined')] == '0'
+
+    def test_the_decline_split_section_names_each_kind_and_count(self):
+        from orchestrator.evals.report import (
+            build_plan_quality_report,
+            format_plan_quality_table,
+        )
+
+        out = format_plan_quality_table(
+            build_plan_quality_report(self._four_cells_three_no_plan())
+        )
+        line = next(
+            ln for ln in out.splitlines() if ln.startswith('declined:')
+        )
+
+        # Stated against its OWN pool as an EXACT substring, so a TRANSPOSED
+        # "4 of 2" cannot pass (the cap_excluded / judged-without-reference
+        # precedent one section up).
+        assert 'declined: 2 of 4 scored cell(s)' in line
+        assert 'already_done: 1' in line
+        assert 'false_premise: 1' in line
+        # THE tranche-1 sentence: how much of the no-plan band was a refusal.
+        assert '2 of 3 no-plan cell(s)' in line
+        # …and the existing sections are untouched.
+        assert 'excluded:' in out
+
+    def test_the_split_section_notes_an_unmeasured_population(self):
+        """A PARTIAL split must say so, or it reads as a complete one."""
+        from orchestrator.evals.report import (
+            build_plan_quality_report,
+            format_plan_quality_table,
+        )
+
+        results = [
+            *self._four_cells_three_no_plan(),
+            _pre_terminal_kind(
+                _arch('p8', 'arch-split', 1, plan_steps=0, plan_quality=0.0,
+                      cost_usd=0.3, duration_ms=60000)
+            ),
+        ]
+        out = format_plan_quality_table(build_plan_quality_report(results))
+        line = next(
+            ln for ln in out.splitlines() if ln.startswith('terminal kind:')
+        )
+
+        assert 'UNMEASURED' in line
+        assert '1 of 5 scored cell(s)' in line
+
+    def test_a_fully_measured_report_grows_no_unmeasured_note(self):
+        from orchestrator.evals.report import (
+            build_plan_quality_report,
+            format_plan_quality_table,
+        )
+
+        out = format_plan_quality_table(
+            build_plan_quality_report(self._four_cells_three_no_plan())
+        )
+
+        assert 'terminal kind:' not in out
+
+    def test_the_widened_surface_stays_byte_deterministic(self):
+        from orchestrator.evals.report import (
+            build_plan_quality_report,
+            format_plan_quality_table,
+        )
+
+        report = build_plan_quality_report(self._four_cells_three_no_plan())
+
+        assert (
+            format_plan_quality_table(report)
+            == format_plan_quality_table(report)
+        )
+
+    def test_no_existing_key_or_number_is_disturbed(self):
+        """The split is EXPLANATORY: it moves no cell and changes no number."""
+        from orchestrator.evals.report import build_plan_quality_report
+
+        cfg = build_plan_quality_report(
+            self._four_cells_three_no_plan()
+        )['configs'][0]
+
+        # mean over [0.0, 0.0, 0.0, 0.8] — the three no-plan cells still floor
+        # to 0.0 and stay IN the mean, declines and all.
+        assert cfg['mean_plan_quality'] == pytest.approx(0.2)
+        assert cfg['cap_excluded'] == 0
+        assert cfg['judged_without_reference'] == 0
+        assert cfg['total'] == 4
