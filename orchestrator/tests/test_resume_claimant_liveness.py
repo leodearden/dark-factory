@@ -832,6 +832,15 @@ class TestResumeLevelGateRemoved:
         sentinel = Harness._SCHEDULER_PAUSE_SENTINEL
         esc = _esc(task_id=sentinel, level=0, resolved_by='steward')
         _wire(harness, _row('blocked', task_id=sentinel, claimant=None, heartbeat=None))
+        # Not paused → the dedicated auto-resume block above the action dispatch
+        # is also a no-op, so the ONLY thing that could reach a re-pend is the
+        # resume branch — which must skip the sentinel.  Without this stub the
+        # bare MagicMock attribute is TRUTHY and that auto-resume branch fires
+        # instead, so the assertion below would pass for the wrong reason.
+        # `harness.scheduler` is a MagicMock (fixture); narrow it so the mock
+        # attribute is settable — the real Scheduler.is_paused is a read-only
+        # @property.  Same idiom as test_cascade_unblock.py.
+        assert isinstance(harness.scheduler, MagicMock)
         harness.scheduler.is_paused = False
 
         harness._on_escalation_resolved(esc)
