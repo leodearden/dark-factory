@@ -4945,9 +4945,25 @@ class MemoryService:
 
         The read side of ``_referent_repair_counts`` / ``_referent_repair_streaks``
         and the INV-4 storm escape for the repair sub-pass (task 3672, PRD leaf
-        eta) — the third in the series, deliberately mirroring
+        eta) — the third in the series, following
         :meth:`referent_source_counts` and :meth:`referent_finding_counts`
         rather than inventing a fourth idiom in this file.
+
+        IT DOES NOT MIRROR THEIR RETURN TYPE, and a caller must not assume it
+        does.  Both siblings return ``dict[str, int]``; this returns
+        ``dict[str, Any]``, because the repair sub-pass is the only one of the
+        three that has a GAUGE to report as well as counters, and eta specifies
+        its read side as ONE accessor carrying both.  Two consequences a
+        consumer has to know, because they are the ones that bite:
+
+        - ``sum(counts.values())``, and "emit every key as a gauge", work on
+          both siblings and BREAK here: ``'streaks'`` is a nested
+          ``dict[str, int]``, not an int.  Read the totals as
+          ``{k: v for k, v in counts.items() if k != 'streaks'}`` and iterate
+          the gauge separately.
+        - ``'streaks'`` shares the flat key space with the outcome buckets, so
+          the name is RESERVED.  A future sixth bucket called 'streaks' would
+          silently shadow the gauge rather than collide loudly.
 
         THE FIVE TOTALS ARE PROCESS-LIFETIME AND MONOTONIC, never reset: a
         reader samples and differences them. They partition eta's dispositions
