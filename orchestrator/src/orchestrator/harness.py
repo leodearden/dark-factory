@@ -15634,10 +15634,15 @@ class Harness:
         narrowed by a CORROBORATING ``get_task`` immediately before the write
         (task 3540): status AND claimant liveness are re-derived from that ONE
         snapshot, and a disagreement aborts without writing. The remaining
-        window is (corroborating get_task → set_task_status), one hop, versus
+        window is (corroborating get_task → [granted-files fold, only when the
+        resolving record actually carries a grant] → set_task_status), versus
         the previous (get_status → guard get_task → guard update_task →
         set_task_status). Status and claimant also now come from a single
-        snapshot rather than two skewed reads.
+        snapshot rather than two skewed reads. The fold sits INSIDE the
+        remaining window by choice (review amendment) — see the three ordering
+        constraints at its call site: paying a slightly wider window is the
+        price of never leaving a partial scope widen behind on an aborted
+        resume, and on the common no-grant path it costs nothing at all.
 
         Efficiency note (review amendment, task 2200; refreshed by 3540):
         get_task above (the is_infra_held pre-gate AND, since 3540, the
@@ -15801,9 +15806,11 @@ class Harness:
         # guard's own read-and-persist round-trips; re-authorise it here against
         # a single snapshot taken immediately before the write, so the TOCTOU
         # window narrows from (get_status → guard get_task → guard update_task →
-        # set_task_status) to one hop.  Status and claimant liveness are
-        # re-derived from the SAME row, so they can no longer be two skewed
-        # reads that never described the task at the same instant.
+        # set_task_status) to (this read → the granted-files fold, which is
+        # entered only when the resolving record carries a grant →
+        # set_task_status).  Status and claimant liveness are re-derived from
+        # the SAME row, so they can no longer be two skewed reads that never
+        # described the task at the same instant.
         _late = await self.scheduler.get_task(task_id)
         if _late is None:
             # Fail-SAFE, not fail-open.  Deliberately the OPPOSITE default from
