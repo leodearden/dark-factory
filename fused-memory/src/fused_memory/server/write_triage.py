@@ -34,6 +34,15 @@ route to. That is an agent-facing read improvement and a machine-consumer
 regression; see :func:`retrieve_candidates` for the full reasoning. Use the
 seam, and pass the flags a candidate-set consumer needs.
 
+THE JUDGE SLOT IS FILLED. ``server/write_triage_judge.py`` (leaf gamma) is
+the real middle-band judge, and ``server/tools.py`` is the SINGLE place that
+wires it in as ``triage_write(..., judge=judge_write)``. The import direction
+is one-way and load-bearing: that module imports this one for the ``OUTCOME_*``
+constants, so this module must NEVER import it — making the real judge
+``triage_write``'s own default would be a circular import. ``_stub_judge``
+remains the default here for direct callers and for the contract tests that
+inject their own fakes.
+
 The pure/impure split mirrors ``near_duplicate_guard``: pure synchronous
 selectors and defensive ``getattr``-at-every-hop config resolvers, with the
 one async retrieval helper and the async orchestrator kept separate from them.
@@ -675,8 +684,9 @@ async def _stub_judge(
     content: str,
     project_id: str,
     decision: BandDecision | None,
+    candidates: Any = (),
 ) -> str:
-    """Middle-band adjudication — LEAF GAMMA'S REPLACEMENT POINT.
+    """Middle-band adjudication — leaf gamma's ``write_triage_judge`` replaces this.
 
     Returns :data:`OUTCOME_STORED` unconditionally. That is a DELIBERATE STUB,
     explicitly NOT a fail-open event: it must never be routed through
@@ -694,6 +704,19 @@ async def _stub_judge(
     Storing is also the right stub answer on the merits: with no judge, the
     only alternative is to attach on a similarity the calibration explicitly
     declined to call deterministic.
+
+    *candidates* carries the retrieved records and is accepted with a DEFAULT,
+    so a four-keyword call from a direct caller stays valid. This stub ignores
+    them; leaf gamma's real judge consumes them and trims to PRD C1's top 3-5
+    itself.
+
+    STILL THE DEFAULT, deliberately, now that the real judge has landed.
+    ``server/tools.py`` is the single place that passes
+    ``judge=write_triage_judge.judge_write``, which keeps this module free of
+    that import and the dependency acyclic (``write_triage_judge`` imports
+    THIS module; this module must never import that one). It also keeps the
+    judge-slot contract tests above meaningful — they inject their own fakes
+    and must not accidentally reach a live LLM.
     """
     return OUTCOME_STORED
 
@@ -831,6 +854,15 @@ async def triage_write(
             content=content,
             project_id=project_id,
             decision=decision,
+            # PRD C1's judge input is "the new entry + top 3-5 candidates", so
+            # the retrieved records have to survive the trip. Passed WHOLE and
+            # un-transformed, for the same reason `retrieve_candidates` returns
+            # it whole: a slice or a comprehension yields a plain list and
+            # silently drops `degraded`/`failed_stores`. Trimming to the top
+            # few is the judge's own job (write_triage_judge.
+            # select_judge_candidates), which is also why no width is imposed
+            # here -- one home for that decision.
+            candidates=results,
         )
     except Exception as exc:  # noqa: BLE001 — C1: nothing escapes this path.
         _record_fail_open(counter, project_id, exc, stage='judge')

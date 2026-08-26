@@ -39,6 +39,7 @@ inject their own fakes and must not accidentally exercise a live LLM.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import TYPE_CHECKING, Any
 
@@ -503,3 +504,184 @@ def resolve_judge_candidate_count(memory_service: Any) -> int:
     if isinstance(value, int) and not isinstance(value, bool) and value > 0:
         return value
     return _DEFAULT_JUDGE_CANDIDATE_COUNT
+
+
+# --- the LLM call ------------------------------------------------------------
+
+#: Output cap. The answer is a four-word closed vocabulary inside a one-key
+#: JSON object, so this is generous by an order of magnitude — sized to leave
+#: room for a model that adds a `reasoning` key (the parser ignores extra
+#: keys) without leaving room for an essay billed per token on every
+#: middle-band write.
+_JUDGE_MAX_TOKENS = 64
+
+
+def _provider_credentials(memory_service: Any, provider: str) -> dict[str, Any]:
+    """``api_key``/``base_url`` for *provider*, defensively, possibly empty.
+
+    An empty dict is a FIRST-CLASS result, not a failure: both SDKs fall back
+    to their standard environment variables, which is how this deployment is
+    actually configured (``OPENAI_API_KEY`` in the shell, nothing in
+    config.yaml). Reading the config section is for a deployment that pins a
+    key or points at an OpenAI-compatible local endpoint.
+    """
+    config = getattr(memory_service, 'config', None)
+    llm = getattr(config, 'llm', None)
+    providers = getattr(llm, 'providers', None)
+    section = getattr(providers, provider, None)
+    creds: dict[str, Any] = {}
+    api_key = getattr(section, 'api_key', None)
+    if isinstance(api_key, str) and api_key:
+        creds['api_key'] = api_key
+    api_url = getattr(section, 'api_url', None)
+    if isinstance(api_url, str) and api_url:
+        creds['base_url'] = api_url
+    return creds
+
+
+async def _call_llm(
+    *,
+    provider: str,
+    model: str,
+    prompt: str,
+    memory_service: Any,
+    timeout: float,
+) -> str:
+    """One single-turn call to *provider*, returning the raw response text.
+
+    Mirrors ``reconciliation/judge.py::_call_llm``'s two-arm fan-out at
+    write-path scale: ``temperature=0`` (this is a classification, not a
+    generation), a small :data:`_JUDGE_MAX_TOKENS`, and — on the openai arm —
+    ``response_format={'type': 'json_object'}`` so the happy path is the
+    parser's happy path. The anthropic arm passes the system prompt via
+    ``system=`` because Anthropic has no system ROLE; a system message would
+    arrive as an ordinary user turn.
+
+    The client is constructed PER CALL and deliberately not cached on a module
+    global. ``add_memory`` is served by one long-lived server process, and a
+    cached client keyed to a config that hot-reloads would pin a stale
+    model/api_url past a reload that the operator was told had applied —
+    silently converting a green-tier knob into a restart-only one. Client
+    construction is cheap relative to the round-trip it precedes.
+
+    NO ``try``/``except`` ANYWHERE. Every failure propagates to
+    ``triage_write``'s ``except`` arm (write_triage.py:835), which logs with
+    ``exc_info``, counts exactly one fail-open, and returns ``stored``.
+
+    An unrecognised *provider* RAISES rather than falling back to a default.
+    That is the opposite of :func:`resolve_judge_provider`'s behaviour, and
+    deliberately so: the resolver runs on the write path where C1 forbids
+    raising, whereas this raise lands INSIDE the fail-open arm. Silently
+    picking an arm here would bill an account the operator never chose.
+    """
+    if provider == 'openai':
+        import openai  # noqa: PLC0415 — per-call import, matching judge.py
+
+        client = openai.AsyncOpenAI(**_provider_credentials(memory_service, provider))
+        response = await asyncio.wait_for(
+            client.chat.completions.create(
+                model=model,
+                messages=[
+                    {'role': 'system', 'content': JUDGE_SYSTEM_PROMPT},
+                    {'role': 'user', 'content': prompt},
+                ],
+                temperature=0.0,
+                max_tokens=_JUDGE_MAX_TOKENS,
+                response_format={'type': 'json_object'},
+            ),
+            timeout=timeout,
+        )
+        return response.choices[0].message.content
+
+    if provider == 'anthropic':
+        import anthropic  # noqa: PLC0415 — per-call import, matching judge.py
+
+        client = anthropic.AsyncAnthropic(
+            **_provider_credentials(memory_service, provider),
+        )
+        response = await asyncio.wait_for(
+            client.messages.create(
+                model=model,
+                max_tokens=_JUDGE_MAX_TOKENS,
+                system=JUDGE_SYSTEM_PROMPT,
+                messages=[{'role': 'user', 'content': prompt}],
+            ),
+            timeout=timeout,
+        )
+        # First TEXT block, not first block: a leading thinking/tool_use block
+        # must not be read as the answer.
+        texts = [b.text for b in response.content if getattr(b, 'type', None) == 'text']
+        return texts[0] if texts else ''
+
+    raise ValueError(
+        f'unknown judge provider {provider!r}; implemented arms are '
+        f'{list(_KNOWN_PROVIDERS)}',
+    )
+
+
+async def judge_write(
+    *,
+    memory_service: Any,
+    content: str,
+    project_id: str,
+    decision: Any,
+    candidates: Any = (),
+) -> str:
+    """Adjudicate one middle-band write. Returns a member of ``TRIAGE_OUTCOMES``.
+
+    This is what ``tools.py`` passes as ``triage_write(..., judge=...)``,
+    replacing leaf beta's ``_stub_judge``. The signature is beta's, plus the
+    ``candidates`` keyword beta's slot did not carry: PRD C1 requires the
+    judge to see the new entry AND its top 3–5 candidates, and a judge shown
+    only a canonical ID cannot classify anything.
+
+    Flow: resolve config LIVE → return ``stored`` early if disabled or if the
+    slate selects to empty → build the prompt → call the provider under
+    ``asyncio.wait_for`` → parse.
+
+    RAISES on every failure — transport, timeout, unparseable output,
+    out-of-vocabulary verdict — and catches nothing. ``triage_write`` owns the
+    fail-open apparatus (INV-4): its ``except`` arm logs with ``exc_info``,
+    counts exactly one fail-open, and returns ``stored``. A second apparatus
+    here would double-count or hide the failure, and hiding it is the
+    catastrophic direction: every write during a judge outage would look
+    identical to "nothing matched", the counter would never increment, and no
+    storm escalation would ever fire.
+
+    The two early returns are the deliberate exceptions, and they are
+    DECISIONS rather than failures. ``judge_enabled: false`` is an operator
+    stopping the LLM arm on purpose; an empty candidate set is a write with
+    nothing to be compared against. Routing either through the counter would
+    guarantee a storm escalation describing an outage that is not happening,
+    which trains an operator to ignore the alarm that exists to catch a real
+    one — the same boundary ``_stub_judge``'s own docstring draws.
+
+    PROVIDER. ``judge_provider``/``judge_model`` default to None and INHERIT
+    ``llm.provider``/``llm.model``, which ship as ``openai``/``gpt-4o-mini``.
+    That default is evidence-based, not preference: measured on this
+    deployment ``ANTHROPIC_API_KEY`` is unset (CLAUDE.md — agents use OAuth)
+    while ``OPENAI_API_KEY`` is set and demonstrably works, since leaf alpha's
+    committed calibration report is the product of live OpenAI calls from this
+    same checkout. The anthropic arm is implemented and selectable by config
+    for a deployment that has the key; PRD C1's "haiku-class" is a cost/size
+    class, not a vendor pin.
+    """
+    if not resolve_judge_enabled(memory_service):
+        return OUTCOME_STORED
+
+    selected = select_judge_candidates(
+        candidates,
+        resolve_judge_candidate_count(memory_service),
+        canonical_id=getattr(decision, 'canonical_id', None),
+    )
+    if not selected:
+        return OUTCOME_STORED
+
+    raw = await _call_llm(
+        provider=resolve_judge_provider(memory_service),
+        model=resolve_judge_model(memory_service),
+        prompt=build_judge_prompt(content, selected),
+        memory_service=memory_service,
+        timeout=resolve_judge_timeout(memory_service),
+    )
+    return parse_judge_verdict(raw)
