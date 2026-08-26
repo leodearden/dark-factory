@@ -2121,3 +2121,449 @@ class TestRow11TimeoutMargin:
             'a timeout is not a pass — resetting the bisector would read a '
             'hung verify as a clean bill of health'
         )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# -- step-07 RED: Row 3 — THE HALVING WALK ISOLATES THE BAD ITEM --
+#
+# The row upstream covers only HALFWAY.  test_merge_queue_deep_dispatch.py's
+# ``test_dispatch_depths_follow_the_halving_walk`` drives the depths
+# ``[6, 3, None, 6]`` off a POSITIONAL script (``[False, False, True, True]``):
+# round 1 is red because it is the first element of a list, not because
+# anything in the tree it verified is wrong.  That proves the POLICY — halve
+# on a fail, reset on a pass — and nothing at all about ISOLATION, which is
+# the claim the PRD row actually makes ("item 3 of 6 genuinely red").
+#
+# What a positional script structurally cannot show:
+#
+#   * that the SAME physical item is red at every depth and in every chain
+#     that contains it (a script is blind to which items were in the tree);
+#   * that its innocent successors are green in the very same rounds;
+#   * that the bisection TERMINATES on the culprit — items 1 and 2 landing at
+#     the floor, item 3 blocking on its own subset verify, and deep resuming
+#     once it is gone.  Under a script, "round 3 passes" is an input, so the
+#     walk's shape is assumed rather than derived.
+#
+# So the verdict here is CONTENT-KEYED: red iff the tree that actually ran
+# contains item 3's file.  Every number below is then a CONSEQUENCE of that
+# one fact plus the shipped policy, and the row's assertions cross-check each
+# dispatched depth against ``select_chain_depth`` evaluated on the live queue
+# and each halving step against ``next_halving_state`` — so a walk that
+# happened to produce the right list for the wrong reason still fails.
+#
+# THE MEASURED WALK (6 items, item 3 = task 103 genuinely red, cap=6).  The
+# head is re-dispatched until it resolves, which is what the real pipeline
+# does with a requeued head:
+#
+#   rnd | head | dispatched | halving after | landed        | why
+#   ----+------+------------+---------------+---------------+------------------
+#    1  | 101  | 6 items    | 3             | —             | chain holds 103
+#    2  | 101  | 3 items    | 1             | —             | chain holds 103
+#    3  | 101  | floor      | None (reset)  | 101           | own tree is clean
+#    4  | 102  | 5 items    | 2             | —             | chain holds 103
+#    5  | 102  | 2 items    | 1             | —             | chain holds 103
+#    6  | 102  | floor      | None (reset)  | 102           | own tree is clean
+#    7  | 103  | 4 items    | 2             | —             | BASE holds 103
+#    8  | 103  | 2 items    | 1             | —             | BASE holds 103
+#    9  | 103  | floor      | 1 (unmoved)   | — (BLOCKED)   | own tree is red
+#   10  | 104  | floor      | None (reset)  | 104           | state 1 → floor
+#   11  | 105  | 2 items    | None          | 105 + 106     | deep RESUMED
+#
+# Two things in that table are worth stating out loud because a reader's naive
+# model gets them wrong:
+#
+#   (i)  the floor round RESETS the bisector rather than leaving it pinned at
+#        1.  A passing slot-2 verify folds ``next_halving_state(True, 1)``
+#        (``_run_inflight_verify``'s floor arm) — PRD decision 5's "ANY pass
+#        resets".  Without it the walk is a one-way ratchet and two red rounds
+#        would disable deep merge-ahead for the life of the process.  The
+#        visible cost is rounds 4 and 7: the bisector re-probes deep once per
+#        landed item while the bad item is still queued.  That is the design,
+#        not a defect — it is the only way the walk climbs back out.
+#   (ii) round 9 leaves the bisector UNMOVED at 1.  The floor arm is
+#        PASS-ONLY, deliberately: folding a non-chain FAIL there would halve
+#        off ordinary red branches and pin the ceiling at the floor without a
+#        single deep chain having failed.
+#
+# RED for the absence of ``_verdict_from_tree`` (step-08).
+# ═══════════════════════════════════════════════════════════════════════════
+
+_ROW3_BAD_TASK = '103'
+_ROW3_BAD_FILE = f'f{_ROW3_BAD_TASK}.txt'
+_ROW3_CAP = 6
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(300)
+class TestRow3HalvingIsolatesTheBadItem:
+    """Row 3: one genuinely-red item, and a bisection that terminates on it."""
+
+    def _assert_conserved(
+        self, worker: SpeculativeMergeWorker, main_sha: str,
+        permits_before: _PermitCensus, *, where: str,
+    ) -> None:
+        """The MID-RUN half of the two-way contract, asserted after every round.
+
+        :func:`_assert_two_way_quiescent` cannot be called between rounds of a
+        walk like this one, and the reason is a property of the walk rather
+        than a gap in the oracle: its surfaces (a), (d) and (f) are
+        WHOLE-REGISTRY claims — every request resolved, the request-liveness
+        ledger empty, no non-terminal lifecycle entry — and a walk that is
+        deliberately mid-flight has four items still queued with pending
+        futures at every one of these checkpoints.  Asserting them here would
+        either fail honestly or force the caller to pass an empty request list,
+        which is the vacuum the oracle's own guard clauses exist to refuse.
+
+        What DOES hold after every single round is conservation, so that is
+        what this checks — the three fail-safe audits plus the token-level
+        permit census.  The full oracle runs once at the end, after
+        :func:`_drain_residue` reports the run left no residue at all.
+        """
+        spec_violations = worker.speculation_accounting_violations()
+        assert spec_violations == [], (
+            f'speculation_accounting_violations() non-empty {where}: '
+            f'{spec_violations!r}'
+        )
+        wt_violations = worker.worktree_ledger_violations()
+        assert wt_violations == [], (
+            f'worktree_ledger_violations() non-empty {where}: {wt_violations!r}'
+        )
+        tli = worker.two_layer_invariants(main_sha)
+        assert tli == [], (
+            f'two_layer_invariants({main_sha[:8]!r}) non-empty {where}: {tli!r}'
+        )
+        now = _permit_census(worker)
+        assert now['spec_live'] == permits_before['spec_live'], (
+            f'spec_live moved {where}: gained '
+            f'{set(now["spec_live"]) - set(permits_before["spec_live"])!r}, lost '
+            f'{set(permits_before["spec_live"]) - set(now["spec_live"])!r}'
+        )
+        assert now['cap_live'] == permits_before['cap_live'], (
+            f'cap_live moved {where}: gained '
+            f'{set(now["cap_live"]) - set(permits_before["cap_live"])!r}, lost '
+            f'{set(permits_before["cap_live"]) - set(now["cap_live"])!r}'
+        )
+
+    async def _walk(
+        self, git_repo: Path, tmp_path: Path, monkeypatch, *,
+        db_name: str, bad_file: str = _ROW3_BAD_FILE, max_rounds: int = 20,
+        after_round=None,
+    ) -> tuple[_GateScene, list[int], _PermitCensus]:
+        """Drive the queue to rest, re-dispatching the head until it resolves.
+
+        Returns the scene, the per-round 1-indexed queue length observed AT
+        DISPATCH (the input ``select_chain_depth`` was actually evaluated on),
+        and the at-rest permit census taken before the first round.
+
+        *after_round*, when given, is called with each round's record the
+        moment it completes — the only way to sample a state that is true
+        DURING the bisection and no longer true once the queue has drained.
+
+        The schedule is the pipeline's, not the test's convenience: a red tip
+        REQUEUES its dispatching head, and the real merger picks that same
+        request again on the next pass.  Popping the NEXT item instead would
+        walk a different queue and quietly make the bisection look like it
+        terminated when it had merely moved on.
+        """
+        scene = await _make_gate_scene(
+            git_repo, tmp_path, monkeypatch,
+            chain_cap=_ROW3_CAP, n_followers=5, db_name=db_name,
+            verdict=_verdict_from_tree(bad_file),
+        )
+        worker = scene.worker
+        permits_before = _permit_census(worker)
+        queue_lens: list[int] = []
+        pending: MergeRequest | None = None
+        for _ in range(max_rounds):
+            if pending is None:
+                nxt = worker._pop_next_pickable()
+                if nxt is None:
+                    break
+            else:
+                nxt = pending
+            # Sampled AFTER the pop, so it is exactly the 1-indexed count
+            # `_deep_chain_placement` computes (`1 + len(chain_snapshot())`).
+            queue_lens.append(1 + len(worker.chain_snapshot()))
+            rec = await scene.round_(tag='row3', head_tid=nxt.task_id, req=nxt)
+            pending = None if nxt.result.done() else nxt
+            self._assert_conserved(
+                worker, rec['main_after'], permits_before,
+                where=f'after round {rec["round"]} (head {nxt.task_id})',
+            )
+            if after_round is not None:
+                after_round(scene, rec)
+        else:  # pragma: no cover - a walk that never drains is the bug
+            pytest.fail(
+                f'the queue never drained in {max_rounds} rounds; depths so far '
+                f'were {scene.depths!r}'
+            )
+        return scene, queue_lens, permits_before
+
+    async def test_the_bisection_walks_down_and_terminates_on_the_red_item(
+        self, git_repo: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """The whole row, in one continuous run against one red ITEM.
+
+        Asserted as four linked claims, in the order the walk produces them,
+        because each is a different mechanism and a failure should name which:
+
+          1. DEPTHS.  Every round's dispatched depth is exactly
+             ``select_chain_depth(cap, queue_len_at_dispatch, state_before)``.
+             Cross-checking against the pure policy — rather than against a
+             list of literals alone — is what distinguishes "the bisector ran"
+             from "the fixture happened to produce these numbers".
+          2. HALVING LADDER.  Every state transition is
+             ``next_halving_state(passed, built_depth)``, with the floor arm's
+             pass-only reset folded at depth 1.
+          3. THE CLEAN PREFIX LANDS AT THE FLOOR.  Items 1 and 2 land on
+             floor rounds, in order, one main commit each, and neither carries
+             ``landed_via_chain`` — a floor round chains nothing, so attributing
+             its landing to a chain would inflate η1's items-per-deep-verify.
+          4. THE CULPRIT BLOCKS, THEN DEEP RESUMES.  Item 3 fails its OWN
+             un-chained subset verify and blocks through the ordinary path;
+             the very next pass resets the bisector and the round after it
+             chains again at ``min(queue, cap)``.
+        """
+        from orchestrator.merge_queue import next_halving_state, select_chain_depth
+
+        scene, queue_lens, _permits = await self._walk(
+            git_repo, tmp_path, monkeypatch, db_name='gate-row3-walk.db',
+        )
+        rounds = scene.rounds
+        heads = [r['req'].task_id for r in rounds]
+        depths = scene.depths
+        states = [r['halving_state'] for r in rounds]
+
+        assert heads == [
+            '101', '101', '101', '102', '102', '102',
+            '103', '103', '103', '104', '105',
+        ], f'the requeued head must be re-dispatched until it resolves; got {heads!r}'
+
+        # ── 1. depths ────────────────────────────────────────────────────────
+        assert depths == [6, 3, None, 5, 2, None, 4, 2, None, None, 2], (
+            f'the bisection walk moved: {depths!r}'
+        )
+        states_before = [None, *states[:-1]]
+        predicted = [
+            select_chain_depth(_ROW3_CAP, qlen, state)
+            for qlen, state in zip(queue_lens, states_before, strict=True)
+        ]
+        assert predicted == depths, (
+            f'a dispatched depth disagreed with select_chain_depth evaluated on '
+            f'the live queue: policy said {predicted!r}, dispatch did {depths!r} '
+            f'(queue_len {queue_lens!r}, state before each round {states_before!r})'
+        )
+
+        # ── 2. the halving ladder, every step derived from the policy ────────
+        assert states == [3, 1, None, 2, 1, None, 2, 1, 1, None, None], (
+            f'the halving ladder moved: {states!r}'
+        )
+        for i, (rec, before, after) in enumerate(
+            zip(rounds, states_before, states, strict=True), start=1,
+        ):
+            passed = rec['outcome'] is not None and rec['outcome'].status == 'done'
+            if rec['chain'] is not None:
+                expected = next_halving_state(passed, 1 + len(rec['chain'].links))
+            elif passed and before is not None:
+                # The floor arm's reset, folded at depth 1: at the floor the
+                # tree that ran IS a one-item chain.
+                expected = next_halving_state(True, 1)
+            else:
+                # A red floor round folds NOTHING — the arm is pass-only.
+                expected = before
+            assert after == expected, (
+                f'round {i} (head {rec["req"].task_id}, chain '
+                f'{None if rec["chain"] is None else 1 + len(rec["chain"].links)}, '
+                f'passed={passed}) left the bisector at {after!r}; the policy '
+                f'says {expected!r}'
+            )
+
+        # ── 3. the clean prefix lands at the floor, unchained ────────────────
+        floor_landings = [
+            r for r in rounds if r['advanced'] and r['chain'] is None
+        ]
+        assert [r['req'].task_id for r in floor_landings] == ['101', '102', '104'], (
+            f'expected the three clean items to land on FLOOR rounds; got '
+            f'{[(r["req"].task_id, r["round"]) for r in floor_landings]!r}'
+        )
+        first_two = floor_landings[:2]
+        assert [r['round'] for r in first_two] == [3, 6], (
+            f'items 1 and 2 must land on the floor round that ENDS each '
+            f'bisection, got rounds {[r["round"] for r in first_two]!r}'
+        )
+        counts = []
+        for rec in first_two:
+            _rc, out, _err = await _run(
+                ['git', 'rev-list', '--count',
+                 f'{rec["main_before"]}..{rec["main_after"]}'],
+                cwd=git_repo,
+            )
+            counts.append(int(out.strip()))
+        assert counts == [2, 2], (
+            f'each floor landing is ONE --no-ff merge commit plus the branch '
+            f'commit it brings in; got {counts!r} new commits on main'
+        )
+        finalized = {r['branch']: r for r in _finalized_rows(scene.db_path)}
+        for tid in ('101', '102', '104'):
+            assert finalized[tid]['state'] == 'done', (
+                f'task {tid} must land, got {finalized[tid]!r}'
+            )
+            assert finalized[tid]['landed_via_chain'] is None, (
+                f'task {tid} landed on a FLOOR round, which chains nothing, so '
+                f'landed_via_chain must be absent; got '
+                f'{finalized[tid]["landed_via_chain"]!r}'
+            )
+
+        # ── 4. the culprit blocks, then deep resumes ─────────────────────────
+        blocking = rounds[8]
+        assert blocking['req'].task_id == _ROW3_BAD_TASK
+        assert blocking['chain'] is None, (
+            'the culprit must be isolated by its OWN un-chained subset verify, '
+            f'but round 9 dispatched a chain of '
+            f'{1 + len(blocking["chain"].links)} items'
+        )
+        assert blocking['outcome'] is not None
+        assert blocking['outcome'].status == 'blocked', (
+            f'the red item must block through the ordinary path; got '
+            f'{blocking["outcome"].status!r}'
+        )
+        assert finalized[_ROW3_BAD_TASK]['state'] == 'blocked'
+        resumed = rounds[10]
+        assert resumed['chain'] is not None and len(resumed['chain'].links) == 1, (
+            'deep must RESUME once the bad item is gone; round 11 dispatched '
+            f'{None if resumed["chain"] is None else 1 + len(resumed["chain"].links)} '
+            'items'
+        )
+        assert [tid for tid, _ in resumed['chain'].links] == ['106']
+        assert sorted(resumed['landed'], key=int) == ['101', '102', '104', '105', '106'], (
+            f'the resumed chain must land its whole prefix; got {resumed["landed"]!r}'
+        )
+        for tid in ('105', '106'):
+            assert finalized[tid]['landed_via_chain'] == 1, (
+                f'task {tid} landed VIA the resumed chain, so it must carry '
+                f'landed_via_chain=1 (one per landed item, summed by η1); got '
+                f'{finalized[tid]["landed_via_chain"]!r}'
+            )
+
+    async def test_the_innocent_successors_are_never_smeared(
+        self, git_repo: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """Items 4–6 pay NOTHING for being chained behind a red item.
+
+        This is the isolation claim stated negatively, and it is the one a
+        positional script cannot make at all: rounds 1, 4, 7 and 8 all built
+        chains CONTAINING tasks 104–106 and all came back red, so if a red tip
+        were ever attributed down the chain it would land on exactly these
+        three.  Two surfaces are checked, because they fail differently:
+
+          * the REQUEST surface — no blocked/failed ``MergeOutcome`` for any of
+            them; each resolves ``done`` on its own verdict, later;
+          * the DURABLE surface — through the whole bisection (rounds 1–9)
+            their event streams stay at ``['merge_queued']``.  A ``merge_attempt``
+            or ``merge_finalized`` row appearing while they were merely chain
+            LINKS would mean the walk rendered per-item outcomes for a tree
+            whose verdict names no culprit — β's "never emit per-item outcomes"
+            contract, read from the tier η1 actually reads.
+
+        Ends with the FULL two-way oracle: the run must come to rest with no
+        residue at all, so the whole-registry surfaces the mid-run checkpoints
+        cannot assert are asserted here exactly once.
+        """
+        innocents = ('104', '105', '106')
+        streams: list[dict[str, list[str]]] = []
+
+        def _snapshot(scene: _GateScene, _rec: dict) -> None:
+            streams.append({
+                tid: _events_for_task(scene.db_path, tid) for tid in innocents
+            })
+
+        scene, _queue_lens, permits_before = await self._walk(
+            git_repo, tmp_path, monkeypatch, db_name='gate-row3-smear.db',
+            after_round=_snapshot,
+        )
+
+        during_bisection = scene.rounds[8]
+        assert during_bisection['round'] == 9, 'round 9 ends the bisection'
+        chained_at_least_once = {
+            tid
+            for rec in scene.rounds[:9] if rec['chain'] is not None
+            for tid, _sha in rec['chain'].links
+        }
+        assert set(innocents) <= chained_at_least_once, (
+            f'the claim is vacuous unless 104-106 were really chained behind '
+            f'the red item; chains held {sorted(chained_at_least_once)!r}'
+        )
+
+        for tid in innocents:
+            outcome = scene.reqs[tid].result.result()
+            assert outcome.status == 'done', (
+                f'task {tid} was only ever a LINK in a red chain, never a '
+                f'culprit; got {outcome.status!r} ({outcome.reason!r})'
+            )
+        blocked_rows = [
+            r for r in _finalized_rows(scene.db_path)
+            if r['state'] == 'blocked'
+        ]
+        assert [r['branch'] for r in blocked_rows] == [_ROW3_BAD_TASK], (
+            f'exactly ONE item may block in this walk — the red one; got '
+            f'{[(r["branch"], r["state"]) for r in blocked_rows]!r}'
+        )
+
+        # The durable-tier half.  Sampled from the per-round snapshot taken
+        # while the bisection was still running, so it cannot be satisfied by
+        # rows the innocents legitimately earned once they became heads.
+        for tid in innocents:
+            during = streams[8][tid]
+            assert during == ['merge_queued'], (
+                f'task {tid} was a chain LINK for the whole bisection and must '
+                f'have earned no per-item row; its stream after round 9 was '
+                f'{during!r}'
+            )
+
+        drained = _drain_residue(scene.worker)
+        assert drained == set(), (
+            f'this walk resolves every request, so nothing may be left queued; '
+            f'drained {drained!r}'
+        )
+        _assert_two_way_quiescent(
+            scene.worker,
+            await _rev_parse(git_repo, 'main'),
+            list(scene.reqs.values()),
+            permits_before=permits_before,
+        )
+
+    async def test_the_content_keyed_oracle_is_green_without_the_bad_file(
+        self, git_repo: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """CONTROL: the same fixture, keyed on a file no branch creates.
+
+        Without this the whole row could pass for the wrong reason — an oracle
+        that is red for a reason unrelated to its ``bad_file`` argument (a
+        typo'd path that never matches, inverted, would be red everywhere)
+        produces a plausible-looking bisection too.  Keyed on an absent file
+        the very first round must chain all six items, pass, and land the whole
+        prefix, so the redness in the row above is demonstrably caused by
+        item 3's content and by nothing else in the fixture.
+        """
+        scene = await _make_gate_scene(
+            git_repo, tmp_path, monkeypatch,
+            chain_cap=_ROW3_CAP, n_followers=5, db_name='gate-row3-control.db',
+            verdict=_verdict_from_tree('f999-no-branch-creates-this.txt'),
+        )
+        rec = await scene.round_(tag='row3ctl', head_tid='101')
+
+        assert rec['chain'] is not None and len(rec['chain'].links) == 5, (
+            f'six queued items at cap=6 must chain all six; got '
+            f'{None if rec["chain"] is None else 1 + len(rec["chain"].links)}'
+        )
+        assert scene.worker._chain_halving_state is None, (
+            f'a green tip resets the bisector; got '
+            f'{scene.worker._chain_halving_state!r}'
+        )
+        assert sorted(rec['landed'], key=int) == ['101', '102', '103', '104', '105', '106'], (
+            f'a green six-item tip lands the whole prefix; got {rec["landed"]!r}'
+        )
+        assert scene.verdicts and not any(v['passed'] is False for v in scene.verdicts), (
+            f'no verdict may be red when the keyed file exists nowhere; got '
+            f'{scene.verdicts!r}'
+        )
