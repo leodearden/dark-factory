@@ -2427,6 +2427,97 @@ def test_staleness_pass_proceeds_when_fleet_deploy_gate_open(
     )
 
 
+def test_staleness_head_start_anchored_on_fleet_min_interval_expiry_real_clock_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """ACCEPTANCE (task 4754, FLEET tier): the head start is measured from
+    min-interval EXPIRY, not from the newest watched commit — driven through a
+    REAL on-disk fleet-deploy clock file.
+
+    Neither _within_fleet_deploy_min_interval nor
+    _within_fleet_staleness_head_start is monkeypatched here: both gates must
+    evaluate the real _read_last_fleet_deploy_epoch() file read, which is what
+    makes this an anchor test rather than a restatement of a stub. Uses the
+    _fleet_fake_run harness defined below (resolved at call time) exactly as
+    test_boundary1_staleness_inside_window_real_clock_file does.
+
+    The newest watched commit is pinned SIX HOURS old, so the RETAINED
+    commit-age grace is wide open in both halves and only the new anchor can
+    decide the outcome. "now" is pinned to a SKIP_LOG_INTERVAL_SECS bucket
+    boundary so the skip line is guaranteed and cannot flake on the throttle
+    (the same trick test_boundary1_staleness_inside_window_real_clock_file
+    uses); the mid-bucket suppression half lives in
+    test_staleness_pass_suppresses_head_start_skip_log_outside_log_bucket.
+
+    Half (a) is the KNOWN-RED half before this task lands: today the
+    min-interval has expired and the commit is hours old, so every gate is
+    open and the pass delegates a fleet redeploy the instant the 8h window
+    opens — beating the polite event-driven coordinator by poll cadence. Half
+    (b) passes today and is the non-regression half: once the head start has
+    genuinely elapsed the backstop must still act.
+    """
+    wdog = _load_watchdog()
+
+    now = wdog.SKIP_LOG_INTERVAL_SECS * 1000.0
+    commit_epoch = int(now) - 6 * 3600  # HOURS old: the commit-age grace is wide open
+    unit = "orchestrator-know-live.service"
+
+    def run_pass_with_clock_age(age_secs: float) -> tuple[list[list[str]], list[str]]:
+        """Drive staleness_pass with the fleet clock stamped *age_secs* ago."""
+        clock_file = tmp_path / f"clock_{int(age_secs)}.json"
+        clock_file.write_text(
+            json.dumps({"ts": now - age_secs, "iso": "2026-08-26T00:00:00+00:00"})
+        )
+        monkeypatch.setattr(wdog, "FLEET_DEPLOY_CLOCK_PATH", str(clock_file))
+
+        recorded_calls: list[list[str]] = []
+        log_messages: list[str] = []
+        fake_run = _fleet_fake_run(
+            units=[unit],
+            commit_epoch=commit_epoch,
+            start_epochs={unit: commit_epoch - 100},  # genuinely stale
+            recorded_calls=recorded_calls,
+            log_messages=log_messages,
+        )
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        monkeypatch.setattr(wdog.time, "time", lambda: now)
+        monkeypatch.setattr(
+            wdog.time, "clock_gettime", lambda _clk_id: _E2E_CLOCK_MONOTONIC_NOW
+        )
+
+        wdog.staleness_pass()
+        return recorded_calls, log_messages
+
+    # --- (a) 300s past min-interval expiry: inside the head start, hold off.
+    inside_calls, inside_logs = run_pass_with_clock_age(
+        wdog.ORCH_RESTART_MIN_INTERVAL_SECS + 300
+    )
+
+    assert not any(c[0] == "systemd-run" for c in inside_calls), (
+        f"must not delegate a fleet redeploy 300s after the min-interval window "
+        f"opened — the coordinator's {wdog.STALENESS_GRACE_SECS}s head start is "
+        f"still running; got {inside_calls}"
+    )
+    assert not any(
+        c[:3] == ["systemctl", "--user", "list-units"] for c in inside_calls
+    ), f"the head-start gate must return before enumeration; got {inside_calls}"
+    _assert_zero_mutating_calls(inside_calls)
+    assert any(
+        "skip" in m and str(wdog.STALENESS_GRACE_SECS) in m for m in inside_logs
+    ), f"Expected a skip log line naming the head start: {inside_logs}"
+
+    # --- (b) head start elapsed: the backstop is released and must act.
+    past_calls, _past_logs = run_pass_with_clock_age(
+        wdog.ORCH_RESTART_MIN_INTERVAL_SECS + wdog.STALENESS_GRACE_SECS + 60
+    )
+
+    delegate_calls = [c for c in past_calls if c[0] == "systemd-run"]
+    assert len(delegate_calls) == 1, (
+        f"once the head start has elapsed the backstop must delegate exactly one "
+        f"fleet redeploy for the stale {unit}; got {delegate_calls}"
+    )
+
+
 def test_main_liveness_unaffected_by_fleet_deploy_gate(monkeypatch: pytest.MonkeyPatch) -> None:
     """I5: the fleet-deploy clock gate must never affect main()'s liveness restarts.
 
