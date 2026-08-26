@@ -11,10 +11,10 @@
 
 ## Confusion — expected class by observed verdict
 
-| class | stored | amended | contested | restated |
+| class | stored | restated | amended | contested |
 |---|---|---|---|---|
-| duplicate | 31 | 30 | 4 | 10 |
-| distinct | 2 | 1 | 0 | 0 |
+| duplicate | 31 | 10 | 30 | 4 |
+| distinct | 2 | 0 | 1 | 0 |
 | pseudo_contradiction | 3 | 1 | 1 | 1 |
 | distractor | 18 | 0 | 0 | 0 |
 
@@ -41,7 +41,10 @@
 - `fixture_path`: `tests/fixtures/write_triage_calibration.jsonl`
 - `judge_provider`: `openai`
 - `judge_model`: `gpt-4o-mini`
+- `limit`: `None`
 - `record_count`: `104`
 - `case_count`: `102`
 - `candidate_count`: `5`
+- `candidate_count_min`: `5`
+- `distractor_count_requested`: `4`
 - `distractor_count`: `4`

@@ -396,6 +396,19 @@ _KNOWN_PROVIDERS = ('openai', 'anthropic')
 _DEFAULT_JUDGE_PROVIDER = 'openai'
 _DEFAULT_JUDGE_MODEL = 'gpt-4o-mini'
 
+#: The haiku-class default for each implemented arm, used when the judge's
+#: provider is pinned AWAY from ``llm.provider``. Inheriting ``llm.model``
+#: across a provider boundary is the exact 404-on-every-write outage
+#: :func:`resolve_judge_model` exists to prevent: the documented configuration
+#: ``judge_provider: anthropic`` + ``judge_model: null`` on an
+#: ``llm.provider: openai`` deployment would otherwise post ``gpt-4o-mini`` to
+#: ``anthropic.messages.create``, and the resulting total judge outage would be
+#: counted as a fail-open storm whose stated cause is not what is wrong.
+_DEFAULT_MODEL_BY_PROVIDER = {
+    'openai': 'gpt-4o-mini',
+    'anthropic': 'claude-3-5-haiku-latest',
+}
+
 #: No LLM call anywhere in fused-memory sets a timeout today, and the openai
 #: SDK default is 600 seconds. On the SYNCHRONOUS ``add_memory`` write path
 #: that is a wedge, not a degradation: the caller waits ten minutes for a
@@ -468,14 +481,33 @@ def resolve_judge_model(memory_service: Any) -> str:
     A non-string or blank model name falls back: an empty model reaches the
     SDK as a 404 on every single write, i.e. a total judge outage caused by a
     config typo.
+
+    The ``llm.model`` leg is CONDITIONAL on the two providers agreeing. A model
+    id is vendor-specific, so borrowing one across a provider boundary produces
+    the same total-outage 404 as a blank name, only harder to read: the config
+    is schema-valid, ``judge_provider``'s own schema description invites
+    pinning it away from ``llm.provider``, and ``judge_model`` ships as
+    ``null``. When ``llm.provider`` is a KNOWN provider that differs from the
+    resolved judge provider, the inheritance is skipped in favour of that
+    provider's own default. When ``llm.provider`` is absent or unrecognised
+    there is nothing to disagree with — the vendor of ``llm.model`` is simply
+    unknown — so the inheritance stands, as it did before.
     """
-    for value in (
-        _judge_attr(memory_service, 'judge_model'),
-        _llm_attr(memory_service, 'model'),
-    ):
+    provider = resolve_judge_provider(memory_service)
+    llm_provider = _llm_attr(memory_service, 'provider')
+    inheritable = not (
+        isinstance(llm_provider, str)
+        and llm_provider in _KNOWN_PROVIDERS
+        and llm_provider != provider
+    )
+
+    candidates = [_judge_attr(memory_service, 'judge_model')]
+    if inheritable:
+        candidates.append(_llm_attr(memory_service, 'model'))
+    for value in candidates:
         if isinstance(value, str) and value.strip():
             return value
-    return _DEFAULT_JUDGE_MODEL
+    return _DEFAULT_MODEL_BY_PROVIDER.get(provider, _DEFAULT_JUDGE_MODEL)
 
 
 def resolve_judge_timeout(memory_service: Any) -> float:

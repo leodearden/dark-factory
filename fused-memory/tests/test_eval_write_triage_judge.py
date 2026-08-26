@@ -23,6 +23,7 @@ from __future__ import annotations
 import functools
 import importlib.util
 import json
+import logging
 import types
 from pathlib import Path
 
@@ -776,6 +777,66 @@ class TestRunJudgeEval:
         )
         assert provenance['distractor_count'] == 2
         assert provenance['judge_model'] == 'gpt-4o-mini'
+
+    def test_slate_width_provenance_is_measured_not_asserted(
+        self, tmp_path: Path,
+    ) -> None:
+        """The report must publish the width it BUILT, not the one asked for.
+
+        `_rotated` truncates when the distractor pool is short, so
+        `distractors + 1` is a REQUEST that can silently exceed what the
+        slates actually carried. Recording the request as `candidate_count`
+        is the "silently narrows a slate the report claims was 5 wide"
+        failure `run_judge_eval`'s docstring says its KeyError prevents,
+        arriving by the other door — and the artifact is the operator's
+        stated input at the task-3169 flip gate.
+
+        A single-cluster corpus is the concrete trigger: `_distractor_pool`
+        draws only from OTHER clusters, so it is empty and every labelled
+        slate collapses to the canonical alone.
+        """
+        single = [r for r in _corpus() if r['cluster_id'] == _corpus()[0]['cluster_id']]
+        report = _run(tmp_path, corpus=single, distractors=4)
+        provenance = report['provenance']
+
+        widths = {
+            len(c['candidates'])
+            for c in _mod().build_judge_cases(single, distractors=4)
+        }
+        assert max(widths) < 5, 'precondition: this corpus cannot fill a 5-wide slate'
+        assert provenance['candidate_count'] == max(widths)
+        assert provenance['candidate_count'] != 5, (
+            'the report must not claim a width it never built'
+        )
+        assert provenance['distractor_count_requested'] == 4
+        assert provenance['distractor_count'] == max(widths) - 1
+
+    def test_a_short_pool_is_logged_loudly(
+        self, tmp_path: Path, caplog,
+    ) -> None:
+        """Silence here reads as "covered everything" when it did not."""
+        single = [r for r in _corpus() if r['cluster_id'] == _corpus()[0]['cluster_id']]
+        with caplog.at_level(logging.WARNING):
+            _run(tmp_path, corpus=single, distractors=4)
+        assert any(
+            record.levelno >= logging.WARNING for record in caplog.records
+        ), 'a narrowed slate must warn, not pass silently'
+
+    def test_a_full_width_run_records_the_requested_width(
+        self, tmp_path: Path,
+    ) -> None:
+        """Measuring must not CHANGE the numbers when the pool is adequate.
+
+        The committed artifact reports candidate_count 5 / distractor_count 4;
+        measurement has to agree with that on a corpus that can supply it,
+        or this fix would silently restate the operator's own input.
+        """
+        report = _run(tmp_path, distractors=2)
+        provenance = report['provenance']
+        assert provenance['candidate_count'] == 3
+        assert provenance['candidate_count_min'] == 3
+        assert provenance['distractor_count'] == 2
+        assert provenance['distractor_count_requested'] == 2
 
 
 # ---------------------------------------------------------------------------

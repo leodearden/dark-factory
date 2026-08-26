@@ -99,6 +99,13 @@ _PACKAGE_ROOT = Path(__file__).resolve().parent.parent
 
 _CALIBRATE_PATH = _PACKAGE_ROOT / 'scripts' / 'calibrate_write_triage.py'
 
+#: The COMMITTED artifact's path — the operator's stated input at the task-3169
+#: flip gate. Named so `_run` can tell "writing the committed report" from
+#: "writing somewhere else" and warn before a `--limit` smoke overwrites it.
+_DEFAULT_REPORT_PATH = str(
+    _PACKAGE_ROOT / 'calibration' / 'write_triage_judge_accuracy_report.json'
+)
+
 
 def _load_calibrate() -> types.ModuleType:
     """Load leaf alpha's script as a module.
@@ -217,9 +224,23 @@ def _rotated(pool: list[str], offset: int, count: int) -> list[str]:
     a plain ``pool[:count]`` would be equally deterministic and would measure
     one arbitrary handful of clusters over and over instead of the corpus.
     """
-    if not pool or count <= 0:
+    if count <= 0:
         return []
+    if not pool or len(pool) < count:
+        # LOUD rather than silent: a short pool narrows every slate, and the
+        # report's own width provenance is measured downstream rather than
+        # asserted, so the two together are what stop a 1-wide smoke run being
+        # read as the 5-wide measurement the operator is deciding on.
+        logger.warning(
+            'distractor pool holds %d record(s), %d requested — slate narrowed. '
+            'Cross-cluster distractors come only from OTHER clusters, so a '
+            'single-cluster run (typically --limit slicing one cluster) leaves '
+            'nothing to draw from.',
+            len(pool), count,
+        )
     take = min(count, len(pool))
+    if take <= 0:
+        return []
     start = offset % len(pool)
     return [pool[(start + i) % len(pool)] for i in range(take)]
 
@@ -544,11 +565,27 @@ def run_judge_eval(
 
     scored = score_cases(cases, verdicts)
 
+    # MEASURED, not asserted. `_rotated` truncates when the pool is short, so
+    # `distractors + 1` is what was REQUESTED and can silently exceed what the
+    # slates actually carried — the failure this function's own docstring says
+    # the KeyError exists to prevent, arriving by the other door. A run whose
+    # slates all came out 1 wide must not publish `candidate_count: 5`.
+    widths = [len(case['candidates']) for case in cases]
     run_provenance = dict(provenance)
     run_provenance.setdefault('record_count', len(records))
     run_provenance.setdefault('case_count', len(cases))
-    run_provenance.setdefault('candidate_count', distractors + 1)
-    run_provenance.setdefault('distractor_count', distractors)
+    run_provenance.setdefault('candidate_count', max(widths) if widths else 0)
+    run_provenance.setdefault('candidate_count_min', min(widths) if widths else 0)
+    run_provenance.setdefault('distractor_count_requested', distractors)
+    run_provenance.setdefault(
+        'distractor_count', (max(widths) - 1) if widths else 0,
+    )
+    if widths and min(widths) != distractors + 1:
+        logger.warning(
+            'slate widths ran %d..%d against a requested %d — the report '
+            'records what was measured, not what was asked for',
+            min(widths), max(widths), distractors + 1,
+        )
     report = build_report(scored=scored, provenance=run_provenance)
 
     report_path = Path(report_path)
@@ -675,24 +712,67 @@ def _run(args: Any) -> int:
     records = load_fixture(args.fixture)
     logger.info('Loaded %d labeled record(s) from %s', len(records), args.fixture)
 
-    if args.limit:
+    if args.limit is not None:
         # Truncating RECORDS rather than cases, plus whatever canonicals those
         # records point at. A bare head-N slice can cut a cluster's canonical
         # while keeping its members, and the runner would then KeyError on an
         # unresolvable slate partway through a paid run — the right behaviour
         # for a dangling id in the real fixture, a useless one for a smoke.
-        kept = records[: args.limit]
+        # Drawn ROUND-ROBIN across clusters, not as a head slice. The fixture
+        # is grouped by cluster in file order, so `records[:5]` is five records
+        # of ONE cluster: `_distractor_pool` draws only from OTHER clusters, so
+        # it comes back empty, every slate collapses to width 1, and the lone
+        # control case gets `candidates == []` — which `judge_write`
+        # short-circuits to `stored` with no provider call at all. The
+        # documented `--limit 5` smoke would then score the distractor class
+        # 100% having asked the model nothing. Taking one record per cluster
+        # before taking a second from any keeps a real cross-cluster pool.
+        #
+        # Only NON-canonical records are drawn: a canonical produces no
+        # labelled case (it IS the attach target), so a slice of them would
+        # report `case_count: 0` and score nothing. The canonicals each drawn
+        # record needs are pulled in below regardless, so `--limit N` means N
+        # labelled cases rather than N lines of the file.
+        by_cluster: dict[str, list[Any]] = {}
+        for record in records:
+            if str(record['label']) == LABEL_CANONICAL:
+                continue
+            by_cluster.setdefault(str(record['cluster_id']), []).append(record)
+        kept: list[Any] = []
+        for depth in range(max((len(v) for v in by_cluster.values()), default=0)):
+            if len(kept) >= args.limit:
+                break
+            for group in by_cluster.values():
+                if depth < len(group):
+                    kept.append(group[depth])
+                    if len(kept) >= args.limit:
+                        break
+
+        # Whatever canonicals those records point at come along too. A slice
+        # that cuts a cluster's canonical while keeping its members would
+        # KeyError on an unresolvable slate partway through a PAID run — the
+        # right behaviour for a dangling id in the real fixture, a useless one
+        # for a smoke.
+        kept_ids = {id(r) for r in kept}
         wanted = {str(r['cluster_id']) for r in kept}
         canonicals = [
             r for r in records
-            if str(r['memory_id']) in wanted and r not in kept
+            if str(r['memory_id']) in wanted and id(r) not in kept_ids
         ]
         records = [*kept, *canonicals]
         logger.info(
-            '--limit %d: measuring %d record(s) (%d canonical(s) pulled in to '
-            'keep every slate resolvable)',
-            args.limit, len(records), len(canonicals),
+            '--limit %d: measuring %d record(s) across %d cluster(s) '
+            '(%d canonical(s) pulled in to keep every slate resolvable)',
+            args.limit, len(records), len(wanted), len(canonicals),
         )
+        if args.report_path == _DEFAULT_REPORT_PATH:
+            logger.warning(
+                'a --limit run is about to OVERWRITE the committed report at '
+                '%s. It is a partial smoke, not the corpus-wide measurement '
+                'the task-3169 flip gate reads: provenance.limit=%d records '
+                'that. Pass --report-path to keep the committed artifact.',
+                args.report_path, args.limit,
+            )
 
     if args.dry_run:
         judge_fn = _dry_run_judge_fn()
@@ -712,6 +792,12 @@ def _run(args: Any) -> int:
             'fixture_path': package_relative(args.fixture),
             'judge_provider': provider,
             'judge_model': model,
+            # Present on EVERY run, `None` on a full one. An absent key would
+            # be indistinguishable from an artifact predating the field, and
+            # this is the one field that says a committed report is a partial
+            # smoke rather than the corpus-wide measurement the task-3169
+            # flip gate reads it as.
+            'limit': args.limit,
         },
         distractors=args.distractors,
     )
@@ -726,16 +812,18 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--fixture', default=str(
         repo / 'tests' / 'fixtures' / 'write_triage_calibration.jsonl'))
-    parser.add_argument('--report-path', dest='report_path', default=str(
-        repo / 'calibration' / 'write_triage_judge_accuracy_report.json'))
+    parser.add_argument('--report-path', dest='report_path',
+                        default=_DEFAULT_REPORT_PATH)
     parser.add_argument('--config', default=None,
                         help='Path to fused-memory config file (sets CONFIG_PATH)')
     parser.add_argument('--distractors', type=int, default=4,
                         help="cross-cluster candidates per slate; 4 gives PRD C1's "
                              'top-5 width alongside the attach target (default: 4)')
     parser.add_argument('--limit', type=int, default=None,
-                        help='measure only the first N records, plus the canonicals their '
-                             'slates need (a cheap live smoke)')
+                        help='measure only N labelled records, drawn round-robin across '
+                             'clusters, plus the canonicals their slates need '
+                             '(a cheap live smoke). Recorded in the report as '
+                             'provenance.limit')
     parser.add_argument('--dry-run', dest='dry_run', action='store_true',
                         help='score a fixed-answer judge; makes no provider call')
     return _run(parser.parse_args())

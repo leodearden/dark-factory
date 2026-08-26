@@ -66,9 +66,12 @@
     "fixture_path": "tests/fixtures/write_triage_calibration.jsonl",
     "judge_provider": "openai",
     "judge_model": "gpt-4o-mini",
+    "limit": null,
     "record_count": 104,
     "case_count": 102,
     "candidate_count": 5,
+    "candidate_count_min": 5,
+    "distractor_count_requested": 4,
     "distractor_count": 4
   }
 }

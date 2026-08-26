@@ -51,7 +51,9 @@ from fused_memory.server.write_triage_judge import (
     _DEFAULT_JUDGE_MODEL,
     _DEFAULT_JUDGE_PROVIDER,
     _DEFAULT_JUDGE_TIMEOUT_SECONDS,
+    _DEFAULT_MODEL_BY_PROVIDER,
     _ELIDED_MARKER,
+    _KNOWN_PROVIDERS,
     JUDGE_SYSTEM_PROMPT,
     JUDGE_VERDICTS,
     VERDICT_KEY,
@@ -650,6 +652,67 @@ class TestResolveJudgeModel:
             llm=types.SimpleNamespace(provider=None, model=None),
         )
         assert resolve_judge_model(service) == _DEFAULT_JUDGE_MODEL
+
+    def test_a_pinned_foreign_provider_does_not_borrow_the_llm_model(self) -> None:
+        """The documented cross-provider pin must not post an openai id to anthropic.
+
+        `judge_provider`'s schema description explicitly invites pinning the
+        judge away from the rest of the server, and `judge_model` ships as
+        `null`. Inheriting `llm.model` unconditionally would send
+        `gpt-4o-mini` to `anthropic.messages.create` on THIS deployment
+        (llm.provider=openai) — a 404 on every middle-band write, i.e. a total
+        judge outage counted as a fail-open on every write and escalated as a
+        storm whose stated cause is not what is wrong. That is the same
+        outage the blank-name fallback above exists to prevent, arriving by a
+        schema-VALID door.
+        """
+        service = _svc(
+            judge_provider='anthropic',
+            judge_model=None,
+            llm=types.SimpleNamespace(provider='openai', model='gpt-4o-mini'),
+        )
+        assert resolve_judge_provider(service) == 'anthropic'
+        assert resolve_judge_model(service) != 'gpt-4o-mini'
+        assert resolve_judge_model(service) == _DEFAULT_MODEL_BY_PROVIDER['anthropic']
+
+    def test_the_mirror_pin_does_not_borrow_either(self) -> None:
+        """Symmetric: an anthropic-configured server with the judge on openai."""
+        service = _svc(
+            judge_provider='openai',
+            judge_model=None,
+            llm=types.SimpleNamespace(
+                provider='anthropic', model='claude-3-5-haiku-latest',
+            ),
+        )
+        assert resolve_judge_model(service) == _DEFAULT_MODEL_BY_PROVIDER['openai']
+
+    def test_every_known_provider_has_a_default_model(self) -> None:
+        """A provider with no entry would fall back to the OTHER vendor's id.
+
+        `_DEFAULT_MODEL_BY_PROVIDER.get(provider, _DEFAULT_JUDGE_MODEL)` is a
+        safe shape only while every arm `_call_llm` implements is a key here;
+        a third arm added without an entry silently reintroduces the 404.
+        """
+        for provider in _KNOWN_PROVIDERS:
+            assert _DEFAULT_MODEL_BY_PROVIDER.get(provider), provider
+
+    def test_an_agreeing_provider_still_inherits(self) -> None:
+        """The pin only SKIPS the inheritance when the two vendors differ."""
+        service = _svc(
+            judge_provider='openai',
+            judge_model=None,
+            llm=types.SimpleNamespace(provider='openai', model='gpt-4.1-nano'),
+        )
+        assert resolve_judge_model(service) == 'gpt-4.1-nano'
+
+    def test_an_explicit_pin_wins_over_the_per_provider_default(self) -> None:
+        """Skipping the inheritance must not also override an operator's pin."""
+        service = _svc(
+            judge_provider='anthropic',
+            judge_model='claude-sonnet-4-5',
+            llm=types.SimpleNamespace(provider='openai', model='gpt-4o-mini'),
+        )
+        assert resolve_judge_model(service) == 'claude-sonnet-4-5'
 
 
 class TestResolveJudgeTimeout:
