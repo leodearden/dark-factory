@@ -7093,6 +7093,84 @@ def _ceiling_stamping_value() -> dict:
     return mod.regrowth_stamping_value(deltas)
 
 
+class TestTheReseedingControlPhrase:
+    """The artifact used to CLAIM a delta carried no cross-seeding noise.
+
+    It does not: `after` is measured over `c_peers_regrowth_<mode>` while the
+    baseline is measured over `c_peers`, so a baseline-vs-after delta spans
+    two seedings.  Only the three read arms within one mode are seeding-free.
+    What the artifact reports instead is the noise floor it actually has —
+    the `flat` stamping row, whose two sides are two separately seeded
+    injected collections differing only in a metadata key a flat read never
+    consults.
+    """
+
+    @staticmethod
+    def _flat(**overrides):
+        return {
+            metric: overrides.get(metric, 0.0)
+            for metric in _mod()._regrowth_metric_keys()
+        }
+
+    def test_an_all_zero_row_reports_that_re_seeding_moved_nothing(self):
+        phrase = _mod()._reseeding_control_phrase(self._flat())
+
+        assert 'exactly `0.00` on every column' in phrase, phrase
+
+    def test_a_nonzero_row_says_so_and_names_the_largest_cell(self):
+        """The point of DERIVING it.  A typed "re-seeding contributes
+        nothing" would still read as a guarantee on the first run where it
+        stopped being true, three lines above the table that disagrees."""
+        mod = _mod()
+        flat = self._flat(**{'claim_recall.at_5': -0.25,
+                             'tokens_per_query.mean': +0.10})
+
+        phrase = mod._reseeding_control_phrase(flat)
+
+        assert 'did NOT come out flat' in phrase, phrase
+        assert mod._gap_cell(-0.25) in phrase, phrase
+
+    def test_the_largest_cell_is_by_magnitude_not_by_value(self):
+        """A negative floor is a floor.  Picking the max by VALUE would
+        report `+0.01` while a `-3.00` sat in the same row."""
+        mod = _mod()
+        flat = self._flat(**{'claim_recall.at_5': +0.01,
+                             'discoverability.stored_canonical_found_count': -3.0})
+
+        phrase = mod._reseeding_control_phrase(flat)
+
+        assert mod._gap_cell(-3.0) in phrase, phrase
+
+    def test_an_unmeasured_row_says_so_rather_than_reporting_a_zero(self):
+        """`None` is "never asked", and reporting it as a clean control is
+        exactly the overclaim this function exists to stop making."""
+        mod = _mod()
+        flat = {metric: None for metric in mod._regrowth_metric_keys()}
+
+        assert 'not measured' in mod._reseeding_control_phrase(flat)
+
+    def test_the_rendered_section_carries_it_rather_than_the_old_guarantee(self):
+        """The published claim, narrowed.
+
+        The section must not tell a gate reader that a delta contains the
+        re-emission's contribution "and not ANN noise between two seedings" —
+        a methodological guarantee the two-collection design does not
+        provide.  What it may say is which comparison IS seeding-free, and
+        what the measured noise floor came out as.
+        """
+        mod = _mod()
+        block = _regrowth_block()
+        section = '\n'.join(_section(
+            mod.render_markdown(_report_with_regrowth(block)),
+            '## Regrowth deltas',
+        ))
+
+        assert mod._reseeding_control_phrase(
+            block['stamping_value']['flat']
+        ) in section
+        assert 'not ANN noise between two seedings' not in section
+
+
 class TestTheStampingTableCeilings:
     """Why two of the three rows in `### What topic-stamping buys` are zero.
 
@@ -7463,16 +7541,49 @@ class TestRenderMarkdownRegrowthSection:
 
         Under `promoting_pin` the credited column is a PLACEMENT property —
         the transform injects the canonical into the window — exactly as
-        `apply_grouped_read`'s was under `b_grouped`.  The disclosure has to
-        be beside the number it qualifies, not three sections away.
+        `apply_grouped_read`'s was under `b_grouped`.
+
+        VERBATIM identity on the module constant, not substrings of the
+        rendered prose.  The substring form this replaced asserted `'stored'`
+        and `'promoting_pin'` were somewhere in the section — both of which
+        the delta TABLE supplies on its own (`canonical in top-5 (stored)` is
+        a column header, `promoting_pin` labels three rows), so deleting the
+        whole paragraph left it green.  A disclosure test that survives the
+        disclosure's deletion is not a disclosure test.
         """
         mod = _mod()
-        section = '\n'.join(_section(
+        section = _section(
             mod.render_markdown(_report_with_regrowth()), '## Regrowth deltas',
-        )).lower()
+        )
 
-        assert 'stored' in section
-        assert 'promoting_pin' in section
+        assert mod.REGROWTH_CREDITED_SEMANTICS_DISCLOSURE in section
+
+    def test_the_credited_semantics_sit_between_the_delta_table_and_the_next(self):
+        """Asserted by relative index, like the stamping ceiling below.
+
+        It qualifies the two `canonical in top-5` columns of the delta table,
+        so it belongs after that table and before the next heading takes the
+        reader somewhere else.  A qualifier a section away is not a qualifier
+        on this number.
+        """
+        mod = _mod()
+        section = _section(
+            mod.render_markdown(_report_with_regrowth()), '## Regrowth deltas',
+        )
+
+        table_at = section.index(_header_row(mod.REGROWTH_TABLE_COLUMNS))
+        disclosure_at = section.index(mod.REGROWTH_CREDITED_SEMANTICS_DISCLOSURE)
+        next_heading_at = section.index('### What topic-stamping buys')
+
+        assert table_at < disclosure_at < next_heading_at
+
+    def test_the_credited_semantics_are_not_emitted_with_no_table_to_qualify(self):
+        """A `--no-regrowth` run has no columns for this to be about."""
+        mod = _mod()
+
+        assert mod.REGROWTH_CREDITED_SEMANTICS_DISCLOSURE not in (
+            mod.render_markdown(_report())
+        )
 
     def test_the_section_says_what_was_injected_and_what_the_modes_mean(self):
         mod = _mod()

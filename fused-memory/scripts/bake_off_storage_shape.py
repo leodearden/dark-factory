@@ -145,8 +145,11 @@ re-emission per topic — twice, once ``unstamped`` (no ``topic`` key at all,
 the organically observed case) and once ``stamped`` (the write path's best
 case) — and scores each injected pass under three READ arms: ``flat``,
 ``additive_pin`` and 4004's selected ``promoting_pin``.  The un-injected
-baseline is the ratified arm's OWN rankings, so a delta contains the
-re-emission's contribution and not ANN noise between two seedings.  The
+baseline is the ratified arm's OWN rankings, so the three read arms are
+scored from ONE set of rankings and an arm-vs-arm comparison carries no
+cross-seeding noise; a baseline-vs-after delta does span two collections,
+and the artifact reports its own re-seeding noise floor beside the table
+rather than arguing the difference away.  The
 deltas, and the ``stamped - unstamped`` difference that is what task 4006's
 stamping campaign buys, land in the report's ``regrowth`` block and its
 ``## Regrowth deltas`` section.  ``--no-regrowth`` skips it, and the block is
@@ -2890,6 +2893,43 @@ def _absorption_phrase(flat: Any, selected: Any, *, cost_sign: int) -> str:
             f'({_gap_cell(selected)} against {_gap_cell(flat)})')
 
 
+def _reseeding_control_phrase(flat_stamping: dict[str, Any]) -> str:
+    """What the `flat` stamping row came out as — the re-seeding noise floor.
+
+    DERIVED, for the same reason :func:`_absorption_phrase` is: a typed
+    "re-seeding contributes nothing" is a claim about a previous run, and the
+    first re-measurement that moves it turns the sentence into a falsehood
+    sitting beside the table that contradicts it.
+
+    Why that row IS a control.  ``stamping_value`` cancels the baseline
+    (``(after_stamped - base) - (after_unstamped - base)``), so the `flat`
+    row compares two SEPARATELY SEEDED injected collections directly.  Their
+    records carry byte-identical text and differ only in a ``topic`` metadata
+    key, and a flat read consults no metadata — so nothing but the seeding
+    can move it.  That is the same structural forcing
+    ``REGROWTH_STAMPING_CEILING_DISCLOSURE`` warns makes the row useless as
+    evidence ABOUT STAMPING; it is exactly what makes it useful here.
+
+    Its reach is bounded and the sentence says so: it measures re-seeding
+    between two INJECTED collections at this corpus size.  It is evidence
+    about the noise floor, not a proof about the baseline collection.
+    """
+    measured = [
+        flat_stamping[metric] for metric in _regrowth_metric_keys()
+        if flat_stamping.get(metric) is not None
+    ]
+    if not measured:
+        return 'was not measured in this run'
+    worst = max(measured, key=abs)
+    if worst == 0:
+        return ('came out as exactly `0.00` on every column, so at this '
+                'corpus size a second seeding moved nothing any of these '
+                'metrics can see')
+    return (f'did NOT come out flat — the largest cell in it is '
+            f'{_gap_cell(worst)} — so at least that much of any delta below '
+            f'is re-seeding rather than re-emission')
+
+
 def _regrowth_lines(report: dict[str, Any]) -> list[str]:
     """The +1-re-emission probe's section: what was injected, and what moved.
 
@@ -2940,8 +2980,23 @@ def _regrowth_lines(report: dict[str, Any]) -> list[str]:
         'set.  The gap between their deltas is the second table.',
         '',
         'Baseline is the SAME read arm over the un-injected corpus — the '
-        'rankings the decision table above is built from — so a delta is the '
-        're-emission\'s contribution and not ANN noise between two seedings. '
+        'rankings the decision table above is built from.  Two comparisons '
+        'live in this table and they are NOT equally strong.  An '
+        'arm-vs-arm comparison (three rows of one mode) carries no '
+        'cross-seeding noise at all: all three arms are scored from ONE set '
+        'of rankings, varying only the read transform.  A '
+        'baseline-vs-after delta is weaker — its two sides are two '
+        'separately seeded collections (the ratified arm\'s, and the '
+        'injected pass\'s own), so it carries whatever a re-seeding '
+        'contributes on top of the re-emission.',
+        '',
+        'The control for that is in this artifact rather than argued for. '
+        'The `flat` row of the stamping table below compares two separately '
+        'seeded INJECTED collections whose records carry byte-identical text '
+        'and differ only in a `topic` metadata key a flat read never '
+        'consults — so nothing but the seeding can move it, and it reads as '
+        'the re-seeding noise floor at this corpus size.  In this run it '
+        f'{_reseeding_control_phrase(regrowth["stamping_value"]["flat"])}. '
         '**No threshold is asserted on any delta here** (gate G6): the probe '
         'informs gate η and task 4006\'s stamping campaign, it does not gate '
         'a build.',
@@ -3014,18 +3069,15 @@ def _regrowth_lines(report: dict[str, Any]) -> list[str]:
         f'{_cost_phrase(deltas["stamped"]["flat"][stored], cost_sign=stored_sign)} '
         f'on a flat read.',
         '',
-        'Both `canonical in top-5` columns travel together and neither can '
-        'be quoted without the other.  The `(stored)` trio is the SCORED '
-        'discoverability — `topic_discoverability` over the RAW store hits, '
-        'before any `read_path` — so it is scored by the TRUE canonical '
-        'record id and never by an aliased one, which is what makes it '
-        'readable as retrieval.  The `(credited)` column is what the reader '
-        'was handed AFTER the read transform ran, and under `promoting_pin` '
-        'it is a PLACEMENT property: the transform injects the canonical '
-        'into the window, in exactly the way `apply_grouped_read`\'s '
-        'record-id aliasing did under `b_grouped`.  A credited column that '
-        'holds while the stored one falls means the transform is masking '
-        'regrowth at read time, not that retrieval survived it.',
+        # A module constant, spliced BETWEEN the delta table and the
+        # stamping heading, for the same reason
+        # `REGROWTH_STAMPING_CEILING_DISCLOSURE` is: it qualifies the two
+        # `canonical in top-5` columns of the table above it, a test pins
+        # its relative index, and a substring pin on its prose would have
+        # passed for a paragraph gutted to the words it pinned — or, worse,
+        # for one deleted entirely, since every word it used to be checked
+        # for is also supplied by the table's own header row.
+        REGROWTH_CREDITED_SEMANTICS_DISCLOSURE,
         '',
         '### What topic-stamping buys',
         '',
@@ -3515,6 +3567,27 @@ REGROWTH_BLIND_AUTHORING_DISCLOSURE = (
 #: ``(n=found/candidates)``.  Neither drops the row: a dropped row hides
 #: that the arm was measured at all, a disclosed row tells the reader both
 #: the number and why it could not have been otherwise.
+#: Neither `canonical in top-5` column can be quoted without the other, and
+#: the disclosure saying so has to sit beside the numbers it qualifies rather
+#: than three sections away.  Lifted out of :func:`_regrowth_lines` so its
+#: PRESENCE and PLACEMENT are executable while its wording stays free — the
+#: convention `REGROWTH_STAMPING_CEILING_DISCLOSURE` established below.
+REGROWTH_CREDITED_SEMANTICS_DISCLOSURE = (
+    'Both `canonical in top-5` columns travel together and neither can '
+    'be quoted without the other.  The `(stored)` trio is the SCORED '
+    'discoverability — `topic_discoverability` over the RAW store hits, '
+    'before any `read_path` — so it is scored by the TRUE canonical '
+    'record id and never by an aliased one, which is what makes it '
+    'readable as retrieval.  The `(credited)` column is what the reader '
+    'was handed AFTER the read transform ran, and under `promoting_pin` '
+    'it is a PLACEMENT property: the transform injects the canonical '
+    'into the window, in exactly the way `apply_grouped_read`\'s '
+    'record-id aliasing did under `b_grouped`.  A credited column that '
+    'holds while the stored one falls means the transform is masking '
+    'regrowth at read time, not that retrieval survived it.'
+)
+
+
 REGROWTH_STAMPING_CEILING_DISCLOSURE = (
     '**Two of these three rows are forced to `0.00` by construction, not by '
     'measurement.**  `flat` cannot express a stamping difference at all: the '
@@ -4912,12 +4985,21 @@ def measure_regrowth_arms(
 
     ``measure_arm`` is pure over ``(SeededArm, fetched)`` and takes ``pin`` /
     ``promote`` as flags, so all three arms are scored from the SAME
-    rankings.  That is what makes the baseline free — it is computed from
-    the ``c_peers`` arm's own fetches, the very rankings the decision table
-    is built from — and, more importantly, what keeps HNSW insertion-order
-    noise out of the deltas: re-seeding a separate control collection would
-    put exactly the difference the deltas must not contain between the two
-    sides.
+    rankings.  That also makes the baseline free — it is computed from the
+    ``c_peers`` arm's own fetches, the very rankings the decision table is
+    built from.
+
+    Be exact about the REACH of that, because the artifact publishes it: what
+    this buys is that an ARM-vs-ARM comparison is seeding-free, there being
+    only one seeding behind the three measurements it returns.  It does NOT
+    make a baseline-vs-after delta seeding-free — the driver measures
+    ``after`` over a separate ``c_peers_regrowth_<mode>`` collection, so that
+    delta does span two seedings.  What bounds THAT is a measurement rather
+    than an argument: the ``flat`` row of the stamping table compares two
+    separately seeded injected collections whose records differ only in a
+    metadata key a flat read never consults, so it reads re-seeding and
+    nothing else, and :func:`_reseeding_control_phrase` reports what it came
+    out as beside the deltas it qualifies.
     """
     return {
         arm: measure_arm(
@@ -5334,10 +5416,12 @@ async def run_bake_off(
             # The probe additionally captures the RATIFIED arm's fetches,
             # because they ARE its baseline: `measure_arm` is pure over
             # `(SeededArm, fetched)`, so the un-injected side is scored from
-            # the very rankings the decision table above is built from.  A
-            # separately seeded control collection would put HNSW
-            # insertion-order noise between the two sides — exactly the
-            # difference a delta must not contain.
+            # the very rankings the decision table above is built from — and
+            # the three read arms over it are scored from one seeding, which
+            # is what makes an arm-vs-arm comparison seeding-free.  The
+            # `after` side below is a separate collection, so a
+            # baseline-vs-after delta is not; the `flat` stamping row is the
+            # noise floor that bounds it (see `_reseeding_control_phrase`).
             capture = dump_fetches_to is not None or (
                 probe_regrowth and shape == REGROWTH_SHAPE
             )
