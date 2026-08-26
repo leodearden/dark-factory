@@ -386,23 +386,27 @@ class TestGuardVectorHelper:
 class TestImportIsHermetic:
     """Importing the module must not touch a real checkout (task 3226 pre-3)."""
 
-    def test_module_import_resolves_no_checkout_at_module_scope(self, tmp_path, monkeypatch):
+    def test_module_import_resolves_no_checkout_at_module_scope(self):
         """A fresh interpreter importing the module must not shell out or resolve reify.
 
         Module-level resolution is what makes the in-suite guards' constants
         evaluate at IMPORT time and therefore un-steerable by ``monkeypatch``.
         Here it would also mean a scheduled job's ``--help`` silently depended on
         the ambient ``REIFY_ROOT``.
-        """
-        src = Path(drift.__file__).read_text()
-        # A module-scope call to either resolver would appear at column 0.
-        offenders = [
-            line
-            for line in src.splitlines()
-            if line and not line[0].isspace() and 'resolve_reify_checkout(' in line
-        ]
-        assert offenders == [], f'module-scope reify resolution: {offenders!r}'
 
+        Deliberately NOT a source-text scan.  A column-0 substring sweep for
+        ``resolve_reify_checkout(`` also matches this module's OWN docstring
+        lines, so rewording prose -- changing no code -- turned it red: it
+        pinned comment content, not referential integrity.
+
+        What this case still buys: a fresh interpreter must import the module
+        cleanly, so an import-time shell-out or raise is caught here.  The
+        stronger half of the invariant -- that resolution is per-call and so
+        remains steerable by ``monkeypatch`` -- is covered BEHAVIOURALLY by
+        `TestResolve`, whose cases set ``REIFY_ROOT`` *after* import.  Verified
+        by construction (task 3226): freezing the answer in a module-scope
+        constant and serving it from ``resolve()`` reds six of them.
+        """
         proc = subprocess.run(
             [sys.executable, '-c', 'import check_lock_charter_drift'],
             capture_output=True,
