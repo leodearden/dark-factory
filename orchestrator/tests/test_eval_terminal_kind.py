@@ -310,3 +310,117 @@ class TestResolveTerminalKind:
 
         assert plan == plan_before
         assert declines == declines_before
+
+
+# The five real writers, keyed by decline kind, with the positional arguments
+# each one's signature actually takes. Driving the REAL TaskArtifacts (rather
+# than a double) is what makes this suite falsifiable if a writer's filename or
+# a reader's parse ever changes.
+_WRITERS = {
+    'already_done': ('write_already_done', ('deadbeef', 'already on main')),
+    'blocking_dependency': (
+        'write_blocking_dependency', ('4759', 'needs 4759', 'cafe1234')),
+    'false_premise': (
+        'write_false_premise',
+        ('unreachable', 'the premise', 'the evidence', 'respec it')),
+    'unactionable': ('write_unactionable_task', ('contradictory', 'the evidence')),
+    'ready_to_merge': ('write_ready_to_merge', ('feedface', 'verify passed')),
+}
+
+
+@pytest.fixture
+def eval_artifacts(tmp_path):
+    """A REAL TaskArtifacts built the way ``run_architect_eval`` builds one:
+    a relocated ``meta_root`` SIBLING of the worktree, then ``.init(...)``.
+    """
+    from orchestrator.artifacts import TaskArtifacts
+
+    worktree = tmp_path / 'wt-4760'
+    worktree.mkdir()
+    artifacts = TaskArtifacts(
+        worktree,
+        meta_root=TaskArtifacts.meta_root_for(tmp_path, 'wt-4760'),
+    )
+    artifacts.init('4760', 'a task', 'a description', base_commit='abc1234')
+    return artifacts
+
+
+class TestReadDeclineArtifacts:
+    """The best-effort reader: five real artifacts in, a COMPLETE map out."""
+
+    def test_nothing_written_is_the_complete_all_none_map(self, eval_artifacts):
+        """The key set is ALWAYS complete, so a consumer never has to guess
+        whether a kind was checked or merely omitted.
+        """
+        from orchestrator.evals.metrics import DECLINE_KINDS, read_decline_artifacts
+
+        out = read_decline_artifacts(eval_artifacts)
+        assert set(out) == set(DECLINE_KINDS)
+        assert all(v is None for v in out.values())
+
+    @pytest.mark.parametrize('kind', list(_WRITERS))
+    def test_each_writer_is_read_back_under_its_own_kind(
+            self, eval_artifacts, kind):
+        from orchestrator.evals.metrics import DECLINE_KINDS, read_decline_artifacts
+
+        method, args = _WRITERS[kind]
+        getattr(eval_artifacts, method)(*args)
+
+        out = read_decline_artifacts(eval_artifacts)
+        assert set(out) == set(DECLINE_KINDS)
+        assert isinstance(out[kind], dict)
+        # The reported_at stamp is what makes the ordering policy exact.
+        assert out[kind]['reported_at']
+        assert all(out[k] is None for k in DECLINE_KINDS if k != kind)
+
+    def test_two_declines_both_come_back(self, eval_artifacts):
+        """The multi-decline shape ``resolve_terminal_kind`` orders."""
+        from orchestrator.evals.metrics import read_decline_artifacts
+
+        eval_artifacts.write_already_done(*_WRITERS['already_done'][1])
+        eval_artifacts.write_false_premise(*_WRITERS['false_premise'][1])
+
+        out = read_decline_artifacts(eval_artifacts)
+        assert out['already_done'] is not None
+        assert out['false_premise'] is not None
+        assert out['ready_to_merge'] is None
+
+    def test_corrupt_artifact_degrades_only_that_kind(
+            self, eval_artifacts, caplog):
+        """A decline read must NEVER raise into ``run_architect_eval``'s
+        ``finally``, where it would turn a scored cell into a lost one — so an
+        unreadable artifact costs exactly ONE kind's visibility (the
+        ``runner._verdict_cost_usd`` precedent), not the cell.
+        """
+        import logging
+
+        from orchestrator.evals.metrics import read_decline_artifacts
+
+        eval_artifacts.write_false_premise(*_WRITERS['false_premise'][1])
+        (eval_artifacts.root / 'already_done.json').write_text('{not json')
+
+        with caplog.at_level(logging.WARNING):
+            out = read_decline_artifacts(eval_artifacts)
+
+        assert out['already_done'] is None
+        assert out['false_premise'] is not None       # the others survive
+        assert 'already_done' in caplog.text
+
+    def test_none_artifacts_returns_the_all_none_map(self):
+        """The harness-error path: ``artifacts`` was never constructed."""
+        from orchestrator.evals.metrics import DECLINE_KINDS, read_decline_artifacts
+
+        out = read_decline_artifacts(None)
+        assert set(out) == set(DECLINE_KINDS)
+        assert all(v is None for v in out.values())
+
+    def test_artifacts_object_missing_a_reader_degrades_that_kind(self):
+        """A legacy/monkeypatched artifacts object without the reader."""
+        from orchestrator.evals.metrics import DECLINE_KINDS, read_decline_artifacts
+
+        class _NoReaders:
+            pass
+
+        out = read_decline_artifacts(_NoReaders())  # type: ignore[arg-type]
+        assert set(out) == set(DECLINE_KINDS)
+        assert all(v is None for v in out.values())
