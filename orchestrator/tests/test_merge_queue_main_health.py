@@ -1038,6 +1038,22 @@ class TestPostMergeVerifySeedsBaseline:
     never pays for a probe. Seeding must NOT happen when there is no junit-
     derived id set (scoped/degraded) or no merge_sha to key on."""
 
+    @pytest.fixture(autouse=True)
+    def reset_baseline_caches(self):
+        """Both process-global baselines are cleared around every case here:
+        these tests assert on cache CONTENTS, and without this they read
+        another test's residue (shape copied from
+        TestBranchBlockReasonSkippedOnMainPartition)."""
+        from orchestrator.verify import (
+            _BASELINE_FAILING_IDS_CACHE,
+            _BASELINE_SKIPPED_IDS_CACHE,
+        )
+        _BASELINE_FAILING_IDS_CACHE.clear()
+        _BASELINE_SKIPPED_IDS_CACHE.clear()
+        yield
+        _BASELINE_FAILING_IDS_CACHE.clear()
+        _BASELINE_SKIPPED_IDS_CACHE.clear()
+
     def test_passing_merge_full_verify_seeds_baseline(self, tmp_path: Path) -> None:
         config = _make_config(tmp_path, merge_verify_breadth='full')
         git_ops = _make_git_ops(tmp_path)
@@ -1158,6 +1174,197 @@ class TestPostMergeVerifySeedsBaseline:
             f'Empty merge_sha must not seed anything; before={before_keys!r} '
             f'after={after_keys!r}'
         )
+
+    # -- step-18 (task 3226): the pass path must seed BOTH baselines --------
+    #
+    # Seeding only the failing side makes the whole 3226 guard a no-op in
+    # steady state: every merge-seeded sha would have a WARM failing cache
+    # and a COLD skipped cache, so cached_main_baseline_skipped_ids returns
+    # None -> `or frozenset()` -> the unattributable set is always empty ->
+    # neither the verify.py fall-through guard nor the merge_queue reason
+    # partition can ever fire outside a hand-seeded fixture.
+
+    def _drive_pass(
+        self,
+        tmp_path: Path,
+        passing_result: VerifyResult,
+        merge_sha: str,
+    ) -> MergeOutcome | None:
+        config = _make_config(tmp_path, merge_verify_breadth='full')
+        git_ops = _make_git_ops(tmp_path)
+        merge_wt = tmp_path / 'merge-wt'
+        merge_wt.mkdir()
+        req = _make_req('3226', tmp_path / 'task-wt', config)
+        (tmp_path / 'task-wt').mkdir()
+
+        async def _run() -> MergeOutcome | None:
+            with patch(
+                'orchestrator.merge_queue.run_scoped_verification',
+                new=AsyncMock(return_value=passing_result),
+            ):
+                return await _run_post_merge_verify(
+                    git_ops, req, merge_wt,
+                    timeouts={},
+                    enospc_retries={},
+                    max_timeouts=3,
+                    max_enospc=1,
+                    merge_sha=merge_sha,
+                )
+
+        return asyncio.run(_run())
+
+    def test_passing_verify_seeds_the_skipped_baseline_too(self, tmp_path: Path) -> None:
+        """(a) A passing full-breadth result carrying skipped ids seeds the
+        SKIPPED cache verbatim, while the failing side still seeds the empty
+        frozenset exactly as before (task-2590 amendment, untouched)."""
+        from orchestrator.verify import (
+            _BASELINE_FAILING_IDS_CACHE,
+            cached_main_baseline_skipped_ids,
+        )
+
+        outcome = self._drive_pass(
+            tmp_path,
+            VerifyResult(
+                passed=True, test_output='', lint_output='', type_output='',
+                summary='all checks passed',
+                failing_test_ids=[], skipped_test_ids=['t::s'],
+            ),
+            merge_sha='abcsha',
+        )
+        assert outcome is None, f'Expected the verify-passed sentinel (None); got {outcome!r}'
+
+        assert cached_main_baseline_skipped_ids('abcsha') == frozenset({'t::s'}), (
+            'the pass path must seed the SKIPPED baseline for the merge sha — '
+            'otherwise every merge-seeded sha has a cold skipped cache and the '
+            'whole 3226 guard is inert in steady state; got '
+            f'{cached_main_baseline_skipped_ids("abcsha")!r}'
+        )
+        _, seeded_failing = _BASELINE_FAILING_IDS_CACHE['abcsha']
+        assert seeded_failing == frozenset(), (
+            f'the failing side must still seed the empty set; got {seeded_failing!r}'
+        )
+
+    def test_passing_verify_with_no_skipped_ids_seeds_empty_not_unseeded(
+        self, tmp_path: Path,
+    ) -> None:
+        """(b) skipped_test_ids=None seeds the skipped side EMPTY rather than
+        leaving it unseeded, so the two caches never disagree about WHICH SHAS
+        WERE PROBED — the same invariant main_baseline_failing_ids already
+        honours and seed_main_baseline_skipped's docstring asserts is
+        universal."""
+        from orchestrator.verify import (
+            _BASELINE_FAILING_IDS_CACHE,
+            cached_main_baseline_skipped_ids,
+        )
+
+        outcome = self._drive_pass(
+            tmp_path,
+            VerifyResult(
+                passed=True, test_output='', lint_output='', type_output='',
+                summary='all checks passed',
+                failing_test_ids=[], skipped_test_ids=None,
+            ),
+            merge_sha='abcsha',
+        )
+        assert outcome is None
+
+        assert 'abcsha' in _BASELINE_FAILING_IDS_CACHE
+        assert cached_main_baseline_skipped_ids('abcsha') == frozenset(), (
+            'skipped_test_ids=None must seed the EMPTY set, not leave the sha '
+            'unseeded (an unseeded sha is indistinguishable from never-probed); '
+            f'got {cached_main_baseline_skipped_ids("abcsha")!r}'
+        )
+
+    def test_degraded_pass_seeds_neither_cache(self, tmp_path: Path) -> None:
+        """(c) failing_test_ids is None (scoped/degraded) -> NEITHER cache is
+        seeded, so the outer `if` stays the single gate for both sides."""
+        from orchestrator.verify import (
+            _BASELINE_FAILING_IDS_CACHE,
+            _BASELINE_SKIPPED_IDS_CACHE,
+        )
+
+        outcome = self._drive_pass(
+            tmp_path,
+            VerifyResult(
+                passed=True, test_output='', lint_output='', type_output='',
+                summary='all checks passed',
+                failing_test_ids=None, skipped_test_ids=['t::s'],
+            ),
+            merge_sha='scopedsha',
+        )
+        assert outcome is None
+
+        assert 'scopedsha' not in _BASELINE_FAILING_IDS_CACHE, (
+            f'keys={list(_BASELINE_FAILING_IDS_CACHE)!r}'
+        )
+        assert 'scopedsha' not in _BASELINE_SKIPPED_IDS_CACHE, (
+            'a degraded pass must not seed the skipped side either — the outer '
+            'failing_test_ids guard is the single gate for both; keys='
+            f'{list(_BASELINE_SKIPPED_IDS_CACHE)!r}'
+        )
+
+    def test_merge_seeded_baseline_arms_the_skipped_on_main_guard(
+        self, tmp_path: Path,
+    ) -> None:
+        """(d) END-TO-END: the guard must fire against a MERGE-seeded baseline,
+        not only a hand-seeded fixture.  Drive the pass path to seed both caches
+        for 'abcsha', then ask verify_failure_is_preexisting_on_main about a
+        branch failure naming the id main SKIPPED, with get_main_sha returning
+        that same 'abcsha' (the merged tree IS the next main tip — that identity
+        is the whole point of the pass-path seed)."""
+        import time as time_module
+
+        from orchestrator import verify as verify_module
+        from orchestrator.workflow import _normalize_cause_hint as _norm
+
+        outcome = self._drive_pass(
+            tmp_path,
+            VerifyResult(
+                passed=True, test_output='', lint_output='', type_output='',
+                summary='all checks passed',
+                failing_test_ids=[], skipped_test_ids=['t::skipped_on_main'],
+            ),
+            merge_sha='abcsha',
+        )
+        assert outcome is None
+
+        category = 'test_failure'
+        cause_hint = 'AssertionError in t::skipped_on_main'
+        verify_module._PROBE_CACHE[('abcsha', category, _norm(cause_hint))] = (
+            time_module.monotonic(), True,
+        )
+
+        config = _make_config(tmp_path, merge_verify_breadth='full')
+        worktree = tmp_path / 'branch-wt'
+        worktree.mkdir()
+        probe_git_ops = GitOps(config.git, config.project_root)
+        probe_git_ops.get_main_sha = AsyncMock(return_value='abcsha')  # type: ignore[method-assign]
+        probe_git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+
+        failing_result = VerifyResult(
+            passed=False, test_output='', lint_output='', type_output='',
+            summary='Failures: tests failed',
+            cause_hint=cause_hint, category=category,
+            failing_test_ids=['t::skipped_on_main'],
+        )
+        legacy_probe_mock = AsyncMock(return_value=COMPILE_ERROR_RESULT)
+
+        async def _ask() -> tuple[bool, str]:
+            with patch.object(
+                verify_module, 'run_scoped_verification', new=legacy_probe_mock,
+            ):
+                return await verify_module.verify_failure_is_preexisting_on_main(
+                    worktree, config, [], ['src/foo.py'], failing_result, probe_git_ops,
+                )
+
+        result = asyncio.run(_ask())
+
+        assert result == (True, 'abcsha'), (
+            'against a MERGE-seeded baseline, a branch-failing id that main '
+            'SKIPPED must be unattributable and defer to the signature probe — '
+            f'not the confident task-fault verdict; got {result!r}'
+        )
+        legacy_probe_mock.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
