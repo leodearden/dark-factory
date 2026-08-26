@@ -86,7 +86,9 @@ verdict column is re-confirmed in step-16.
       |                            |   the_item_still_lands_later
    3  | PARTIAL — policy only      | test_merge_queue_deep_dispatch.py
       |   → ORIGINAL: isolation    |   (the depths [6,3,None,6] walk, driven by
-      |                            |   a POSITIONAL pass/fail script)
+      |   (step-07/08, class       |   a POSITIONAL pass/fail script)
+      |   TestRow3HalvingIsolates- |
+      |   TheBadItem)              |
    4  | FULLY SUBSUMED (unit)      | test_merge_queue_deep_dispatch.py +
       |   → composition only       |   test_merge_queue_deep_landing.py
       |                            |   (truncator 105 vs link 102)
@@ -171,6 +173,14 @@ file AND its origin red, and the origin is where the unit-level contract lives.
                                  |   is test_merge_queue.py::
                                  |   _mock_verify_timeout's, narrowed to a
                                  |   real VerifyResult rather than a mock.
+  _verdict_from_tree             | ORIGINAL.  Nothing upstream keys a verdict
+                                 |   on TREE CONTENT — both deep modules use a
+                                 |   POSITIONAL pass/fail script, which is
+                                 |   blind to which items were in the tree and
+                                 |   therefore cannot state Row 3's isolation
+                                 |   claim.  Installed over the same public
+                                 |   `run_scoped_verification` name conftest's
+                                 |   autouse stub uses.
   -------------------------------+-------------------------------------------
   _canary_predicate_items_per    | a verbatim transcription of the SHIPPED
                                  |   scripts/merge-deep-canary-predicate.sh,
@@ -584,6 +594,77 @@ def _timed_out_verify_result():
         passed=False, test_output='', lint_output='', type_output='',
         summary='verify timed out', category='', timed_out=True,
     )
+
+
+def _verdict_from_tree(bad_file: str):
+    """A ``run_scoped_verification``-shaped verdict keyed on TREE CONTENT.
+
+    Returns red iff *bad_file* is present in the worktree the verify was
+    actually handed, green otherwise.  That one property is what turns Row 3
+    from a policy replay into an ISOLATION claim: the same physical item is
+    red at every depth and in EVERY chain that contains it, and green nowhere,
+    so the bisection's shape is a consequence of the item rather than of the
+    fixture.  A positional pass/fail script (the ``script=`` vocabulary, and
+    what test_merge_queue_deep_dispatch.py's halving walk uses) cannot make
+    that claim at all — it is blind to which items were in the tree, and its
+    round-3 pass is an INPUT rather than a derived fact.
+
+    WHICH WORKTREE, per arm — both are real, and the stub does not need to
+    know which it is looking at:
+
+      * a DEEP round hands it ``chain.lane``, the ``_spec-`` scratch lane that
+        ``build_chain`` merged the whole chain into, so the file is present iff
+        the culprit is somewhere in the chain (or in its BASE — a chain built
+        ON the culprit is red too, which is exactly why rounds 7–8 of the walk
+        stay red);
+      * a FLOOR round hands it the warm-swapped ``_spec-`` lane checked out at
+        the item's OWN merge commit, so the file is present iff the culprit is
+        the dispatching item itself.
+
+    SEAM.  ``orchestrator.merge_queue.run_scoped_verification`` — the same name
+    conftest's autouse ``_mock_merge_queue_verification`` replaces with a
+    ``passed=True`` stub, so this is a documented, public patch point and not a
+    ``merge_queue.<private>`` reach-back (which
+    test_merge_queue_reachback_patch_guard.py freezes).  Patching HERE rather
+    than replacing ``_run_post_merge_verify`` is what keeps the row honest:
+    the real ``_run_post_merge_verify`` still runs, so a red on the ordinary
+    arm is rendered into a genuine blocked :class:`MergeOutcome` by production
+    code, and its ``timeouts``/``enospc_retries`` bookkeeping stays in the
+    loop.  A stub in its place would be asserting the test's own arithmetic —
+    and, because that function returns ``MergeOutcome | None`` rather than a
+    ``VerifyResult``, would take the ordinary arm down a path it cannot handle.
+
+    FAILS LOUDLY, never green, when the worktree it is handed does not exist.
+    That guard is not defensive noise: an item's ephemeral ``_merge-<uuid>``
+    is a bare path in this module (see :func:`_ephemeral_merge_wt`), so a round
+    that never reached the warm swap would hand over a directory that is not
+    there — and a stub that answered "no bad file, therefore green" for it
+    would make the whole row pass vacuously, on a tree that was never read.
+    """
+    from orchestrator.verify import VerifyResult
+
+    async def _verdict(worktree, config, module_configs, task_files=None, **kwargs):
+        wt = Path(worktree)
+        assert wt.is_dir(), (
+            f'_verdict_from_tree({bad_file!r}) was handed a worktree that does '
+            f'not exist: {wt}. A verdict derived from an absent tree would be '
+            f'green for the wrong reason and make the whole row vacuous — the '
+            f'usual cause is a round that never reached the warm swap, leaving '
+            f'the item\'s bare ephemeral _merge-<uuid> path in place.'
+        )
+        if (wt / bad_file).exists():
+            return VerifyResult(
+                passed=False, test_output=f'{bad_file} is present in this tree',
+                lint_output='', type_output='', summary='fail', category='',
+            )
+        return VerifyResult(
+            passed=True, test_output='ok', lint_output='', type_output='',
+            summary='ok', category='',
+        )
+
+    _verdict.bad_file = bad_file  # type: ignore[attr-defined]
+    return _verdict
+
 
 
 # ── dispatch-scene spies ─────────────────────────────────────────────────────
@@ -1428,6 +1509,7 @@ class _GateScene:
         self.db_path = db_path
         self.calls: list[dict] = []
         self.posted: list[dict] = []
+        self.verdicts: list[dict] = []
         self.built: list[dict] = []
         self.lane_releases: list[tuple] = []
         self.advance_calls: list[tuple] = []
@@ -1477,6 +1559,36 @@ class _GateScene:
         """
         self._round_no += 1
         worker = self.worker
+        # ── slot-1 steady state, restored before EVERY dispatch ─────────────
+        # `_n_failed` and `_remerge_occurred` are facts about SLOT 1 and about
+        # the enclosing `_verifier_loop` ITERATION.  This scene models neither:
+        # it drives `_dispatch_item` directly, one slot-2 item per round, with
+        # a structurally empty `_inflight`.
+        #
+        # A REAL slot-2 dispatch never reads either flag.  `_dispatch_item`
+        # gates the whole chain-invalidation / Mechanism-2 re-merge block on
+        # `not _has_inflight_verify`, and a genuine speculative dispatch
+        # happens precisely WHILE the head verify is in flight — so the block
+        # is skipped by construction.  Driving dispatch with an empty
+        # `_inflight` re-opens it, and two artifacts the pipeline itself never
+        # produces then appear:
+        #
+        #   * any round that requeued (i.e. every red tip) leaves
+        #     `_n_failed=True`, so the NEXT round's speculative item is
+        #     re-merged into a NON-speculative one and `_deep_chain_placement`
+        #     declines at its `item.speculative` guard.  The halving walk could
+        #     never take a second step — round 2 of every bisection would
+        #     silently be an ordinary verify.
+        #   * `_remerge_occurred` is self-sustaining once set (it is assigned
+        #     from the same dispatch's own `iteration_did_remerge`), so ONE
+        #     re-merge would disable chaining for the rest of the scene.
+        #
+        # Resetting both restores exactly the state a healthy head slot leaves
+        # behind, which is the premise every row in this file is written
+        # against.  It is a fidelity choice about what this scene models, not a
+        # workaround: nothing in the deep path reads these flags.
+        worker._n_failed = False
+        worker._remerge_occurred = False
         n_built_before = len(self.built)
         n_releases_before = len(self.lane_releases)
         n_advances_before = len(self.advance_calls)
@@ -1592,6 +1704,7 @@ async def _make_gate_scene(
     n_followers: int,
     db_name: str,
     script: list[bool] | None = None,
+    verdict=None,
     heads: tuple[str, ...] = ('101',),
     remote: bool = False,
     real_local: bool = False,
@@ -1619,6 +1732,18 @@ async def _make_gate_scene(
         claim can be made at.  The caller supplies the recorder; *script* is
         ignored on this arm (the verdict is whatever the real stack produces —
         a pass, since the recorder returns rc 0).
+
+    *verdict* is the CONTENT-KEYED alternative to the positional *script*, and
+    it selects a fourth seam — the deepest one that still decides a verdict.
+    It is a ``run_scoped_verification``-shaped callable (see
+    :func:`_verdict_from_tree`) installed over conftest's autouse stub, with
+    everything above it left real: a LOCAL lease (so the ordinary arm really
+    warm-swaps into a ``_spec-`` lane and the verdict sees a real tree), the
+    real ``_run_post_merge_verify``, and therefore the real rendering of a red
+    into a blocked :class:`MergeOutcome`.  Mutually exclusive with *script* —
+    a scene that stated its verdicts BOTH by position and by content would
+    have two answers for the same round.  Every call is recorded on
+    ``scene.verdicts``.
 
     Module-level monkeypatching is confined to the four names
     test_merge_queue_reachback_patch_guard.py sanctions (``build_chain``,
@@ -1680,7 +1805,26 @@ async def _make_gate_scene(
 
     monkeypatch.setattr(merge_queue, 'build_chain', _recording_build)
 
-    if not remote and not real_local:
+    if verdict is not None:
+        assert not script, (
+            'script= and verdict= are mutually exclusive: a scene cannot state '
+            'its verdicts both by position and by tree content'
+        )
+
+        async def _recording_verdict(worktree, *args, **kwargs):
+            result = await verdict(worktree, *args, **kwargs)
+            scene.verdicts.append({
+                'worktree': Path(worktree), 'passed': result.passed,
+            })
+            return result
+
+        # The same public name conftest's autouse `_mock_merge_queue_verification`
+        # patches, so this is a documented seam rather than a
+        # `merge_queue.<private>` reach-back.  Installed AFTER it, so it wins.
+        monkeypatch.setattr(
+            'orchestrator.merge_queue.run_scoped_verification', _recording_verdict,
+        )
+    elif not remote and not real_local:
         verdicts = list(script or [])
 
         async def _oracle(_git_ops, _req, merge_wt, **kwargs):
