@@ -3240,3 +3240,295 @@ class TestLadderDriverIsNotInert:
             f'a landed round is not a merge failure and must not feed the '
             f'ladder; got {after.consecutive_merge_thrash!r}'
         )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# -- step-11 RED: Row 7 — KILL-SWITCH BYTE-IDENTITY, over a ROUND SEQUENCE --
+#
+# Both upstream forms of this row compare ONE round.
+# test_merge_queue_deep_dispatch.py compares a single-round transcript against
+# the same round re-run; test_merge_queue_deep_landing.py compares a single
+# round against a golden dict literal.  The PRD's claim is bigger than either:
+# at cap=0 "dispatch/behaviour is identical to the pre-PRD golden transcript",
+# which is a claim about a RUN.
+#
+# Why a SEQUENCE and not one round.  Every piece of deep state that could leak
+# into the kill-switched path is state that survives ACROSS rounds —
+# ``_chain_halving_state``, the ``_spec-`` lane pool, the speculation permit
+# ledger, ``_n_failed`` / ``_remerge_occurred``.  A one-round comparison cannot
+# see any of it, because a single round has no previous round to inherit from.
+# The three rounds are deliberately MIXED — a pass, a fail, a pass — since the
+# fail is the only round that could arm halving state at all, and the pass
+# after it is the only round that could then observe it.
+#
+# Why a GOLDEN LITERAL and not a second run.  The claim is about ABSENCES, and
+# a literal names each one: chain None, chain_build_ms None, build_chain_calls
+# 0, spec_lane_acquisitions 0, halving_state None, landed_via_chain None,
+# chain_items 1, verified_the_items_own_merge_commit True.  A differential
+# comparison against a re-run would go green for two runs that were identically
+# WRONG.
+#
+# Why the POSITIVE CONTROL is mandatory.  A golden of absences passes trivially
+# over an inert scene.  The SAME script over the SAME seeded queue at cap=6
+# must produce a transcript that differs in every one of those fields — which
+# is what proves the cap=0 transcript is a kill switch and not a broken fixture.
+#
+# One deliberate scene choice, and it is NOT about the deep path: the remote
+# cross-check of a remote green (``verify_cross_check_remote_green``, default
+# True) runs a full LOCAL trust-anchor suite on the merge worktree, and whether
+# that produces ``verdict_parity_ok``, ``verify_cross_check_inconclusive`` or
+# nothing at all varies run to run in a fixture repo.  Measured: the same
+# scene emitted ``verdict_parity_ok`` on one run and not on the next.  That
+# variance is unrelated to the kill switch and would make an event-stream
+# golden flaky, so the row turns the cross-check OFF and pins a stream that was
+# then measured identical across three consecutive runs.
+# ═══════════════════════════════════════════════════════════════════════════
+
+_ROW7_FOLLOWERS = 7
+"""Eight queued items, so BOTH arms of the row get three real rounds.
+
+At cap=0 the three heads are 101/102/103 and the rest stay queued; at cap=6 the
+first round chains six and lands them, leaving 107 and 108 for rounds 2 and 3.
+Fewer followers and the cap=6 control would run out of queue after one round,
+which would make "the same sequence" a comparison of a 3-round run against a
+1-round one — a difference proving nothing about the kill switch."""
+
+_ROW7_SCRIPT = [True, False, True]
+"""Pass, FAIL, pass.  The fail is the only round that can arm halving state,
+and the pass after it is the only round that can observe it having leaked."""
+
+_ROW7_GOLDEN: list[dict] = [
+    # ── round 1 — head 101, GREEN.  Lands by the ordinary adjacent path. ──
+    {
+        'advanced': True,
+        'build_chain_calls': 0,          # no chain was ever built
+        'chain': None,                   # ...so none was handed to the verify
+        'chain_build_ms': None,          # ...and none was costed for the reader
+        'chain_items': 1,                # η1 sees a ONE-item verify
+        'events': [
+            'merge_queued', 'merge_verify', 'merge_attempt', 'merge_finalized',
+        ],
+        'halving_state': None,           # nothing to bisect
+        'landed_via_chain': None,        # landed by advance_main, not by a walk
+        'main_moved': True,
+        'outcome_status': 'done',
+        'probe_base': None,
+        'result_has_outcome': False,     # a green verify renders no MergeOutcome
+        'result_has_worktree': True,     # the floor path returns the item's own
+        'result_status': None,           # no InflightStatus sentinel
+        'spec_lane_acquisitions': 0,     # no scratch lane was ever claimed
+        'verified_the_items_own_merge_commit': True,
+    },
+    # ── round 2 — head 102, RED.  Blocks through the ordinary path. ───────
+    #
+    # The absence of `merge_attempt` here is not a deep fact: a blocked
+    # post-merge verify on the ordinary path writes merge_finalized and no
+    # attempt row.  It is pinned because the cap=6 control's red round emits a
+    # DIFFERENT stream again (no merge_finalized at all — the chain arm
+    # requeues rather than blocking), and that contrast is the row.
+    {
+        'advanced': False,
+        'build_chain_calls': 0,
+        'chain': None,
+        'chain_build_ms': None,
+        'chain_items': 1,
+        'events': ['merge_queued', 'merge_verify', 'merge_finalized'],
+        'halving_state': None,           # THE round that would arm it, if deep
+        'landed_via_chain': None,
+        'main_moved': False,
+        'outcome_status': 'blocked',     # a named culprit — the ordinary verdict
+        'probe_base': None,
+        'result_has_outcome': True,
+        'result_has_worktree': True,
+        'result_status': None,
+        'spec_lane_acquisitions': 0,
+        'verified_the_items_own_merge_commit': True,
+    },
+    # ── round 3 — head 103, GREEN.  Byte-identical to round 1. ────────────
+    {
+        'advanced': True,
+        'build_chain_calls': 0,
+        'chain': None,
+        'chain_build_ms': None,
+        'chain_items': 1,
+        'events': [
+            'merge_queued', 'merge_verify', 'merge_attempt', 'merge_finalized',
+        ],
+        'halving_state': None,           # the red round left NOTHING behind
+        'landed_via_chain': None,
+        'main_moved': True,
+        'outcome_status': 'done',
+        'probe_base': None,
+        'result_has_outcome': False,
+        'result_has_worktree': True,
+        'result_status': None,
+        'spec_lane_acquisitions': 0,
+        'verified_the_items_own_merge_commit': True,
+    },
+]
+"""The pre-PRD transcript, stated as a literal so every absence is NAMED.
+
+Recorded from a measured run and then justified field by field above; the
+positive control below is what makes the recording meaningful rather than
+circular.
+"""
+
+_ROW7_DEEP_FIELDS = (
+    'build_chain_calls',
+    'chain',
+    'chain_build_ms',
+    'chain_items',
+    'landed_via_chain',
+    'spec_lane_acquisitions',
+    'verified_the_items_own_merge_commit',
+)
+"""Every transcript field the deep path can move.  The control asserts ALL of
+them differ at cap=6 — a control that only checked one could pass while the
+other six were silently inert."""
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(300)
+class TestRow7KillSwitchByteIdentity:
+    """Row 7: at cap=0 a whole RUN is byte-identical to the pre-PRD transcript."""
+
+    async def _sequence(
+        self, git_repo: Path, tmp_path: Path, monkeypatch, *,
+        chain_cap: int, db_name: str,
+    ) -> _GateScene:
+        """Drive the fixed 3-round mixed sequence over one seeded queue.
+
+        ``remote=True`` so the REAL ``_run_post_merge_verify`` runs and the
+        ``merge_verify`` row is genuinely emitted — ``chain_items`` and
+        ``chain_build_ms`` are produced strictly below that call, so a scene
+        that stubbed it out could not state their absence at all.
+        """
+        scene = await _make_gate_scene(
+            git_repo, tmp_path, monkeypatch,
+            chain_cap=chain_cap, n_followers=_ROW7_FOLLOWERS, db_name=db_name,
+            remote=True, script=list(_ROW7_SCRIPT),
+        )
+        # See the section banner: the remote cross-check is run-to-run
+        # nondeterministic in a fixture repo and has nothing to do with the
+        # kill switch.  Mutating the live config object is what an operator
+        # reload does too (OrchestratorConfig is a plain mutable BaseModel), and
+        # every enqueued request holds THIS object by reference.
+        scene.config.verify_cross_check_remote_green = False
+        for tag in ('r1', 'r2', 'r3'):
+            nxt = scene.worker._pop_next_pickable()
+            assert nxt is not None, (
+                f'the queue ran dry before round {tag}: a 3-round claim needs '
+                f'three real rounds, not a short run that passes vacuously'
+            )
+            await scene.round_(tag=tag, head_tid=nxt.task_id, req=nxt)
+        return scene
+
+    async def test_the_kill_switched_run_matches_the_golden_transcript(
+        self, git_repo: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """The whole three-round sequence, compared against the literal.
+
+        Compared as ONE equality on the whole list rather than field by field,
+        so a field that stopped being extracted at all fails here instead of
+        silently dropping out of the comparison.
+        """
+        scene = await self._sequence(
+            git_repo, tmp_path, monkeypatch,
+            chain_cap=0, db_name='gate-row7-golden.db',
+        )
+        transcript = _gate_sequence_transcript(scene)
+
+        assert len(transcript) == 3, (
+            f'the golden is a THREE-round claim; got {len(transcript)} rounds'
+        )
+        assert transcript == _ROW7_GOLDEN, (
+            'the kill-switched run diverged from the pre-PRD golden.\n'
+            + '\n'.join(
+                f'  round {i + 1} {key}: golden {_ROW7_GOLDEN[i][key]!r} != '
+                f'observed {got.get(key, "<MISSING>")!r}'
+                for i, got in enumerate(transcript)
+                for key in sorted(set(_ROW7_GOLDEN[i]) | set(got))
+                if _ROW7_GOLDEN[i].get(key, '<MISSING>') != got.get(key, '<MISSING>')
+            )
+        )
+
+    async def test_the_same_sequence_at_cap_six_moves_every_deep_field(
+        self, git_repo: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """POSITIVE CONTROL — without it the golden could pass over an inert scene.
+
+        The same script over the same seeded queue, with only ``chain_cap``
+        changed.  Every field the deep path can move must actually move on the
+        very first round, and the whole sequence must differ.
+        """
+        scene = await self._sequence(
+            git_repo, tmp_path, monkeypatch,
+            chain_cap=6, db_name='gate-row7-control.db',
+        )
+        transcript = _gate_sequence_transcript(scene)
+
+        assert transcript != _ROW7_GOLDEN, (
+            'cap=6 produced the kill-switched transcript — the scene is inert '
+            'and the golden above proves nothing'
+        )
+        for field in _ROW7_DEEP_FIELDS:
+            assert transcript[0][field] != _ROW7_GOLDEN[0][field], (
+                f'round 1 field {field!r} did not move at cap=6: still '
+                f'{transcript[0][field]!r}'
+            )
+        # The red round diverges STRUCTURALLY, not just numerically: the chain
+        # arm requeues without naming a culprit, so it renders no outcome and
+        # writes no merge_finalized at all.
+        assert transcript[1]['outcome_status'] is None, (
+            f'a red deep tip names no culprit; got '
+            f'{transcript[1]["outcome_status"]!r}'
+        )
+        assert 'merge_finalized' not in transcript[1]['events'], (
+            f'a requeued deep round finalizes nothing; got '
+            f'{transcript[1]["events"]!r}'
+        )
+        assert transcript[1]['halving_state'] == 1, (
+            f'the red deep round must ARM the bisector (this is exactly what '
+            f'the golden proves cap=0 never does); got '
+            f'{transcript[1]["halving_state"]!r}'
+        )
+
+    async def test_a_restarted_worker_inherits_no_halving_suspicion(
+        self, git_repo: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """The golden survives a worker restart, for a STRUCTURAL reason.
+
+        ``halving_state: None`` appears in all three golden rounds, and a
+        reader could reasonably suspect that is an artifact of THIS worker
+        never having been deep.  It is not: a freshly constructed worker starts
+        at ``None``, and at cap=0 ``select_chain_depth`` short-circuits on the
+        cap BEFORE halving state is consulted at all — so no state a previous
+        process could have left behind can change the transcript.
+        """
+        from orchestrator.merge_queue import select_chain_depth
+
+        scene = await self._sequence(
+            git_repo, tmp_path, monkeypatch,
+            chain_cap=0, db_name='gate-row7-restart.db',
+        )
+        assert scene.worker._chain_halving_state is None, (
+            f'the kill-switched run armed the bisector: '
+            f'{scene.worker._chain_halving_state!r}'
+        )
+
+        restarted = _make_worker(scene.git_ops)
+        assert restarted._chain_halving_state is None, (
+            f'a fresh worker must start with no suspicion; got '
+            f'{restarted._chain_halving_state!r}'
+        )
+        assert restarted._n_failed is False and restarted._remerge_occurred is False
+
+        # ...and the cap short-circuit makes the point unconditional: NO
+        # halving state, inherited or otherwise, can produce a chain at cap=0.
+        for queue_len in (1, 2, 8, 32):
+            for state in (None, 1, 2, 4, 16):
+                assert select_chain_depth(0, queue_len, state) is None, (
+                    f'select_chain_depth(0, {queue_len}, {state}) returned '
+                    f'{select_chain_depth(0, queue_len, state)!r} — the kill '
+                    f'switch must be unconditional'
+                )
