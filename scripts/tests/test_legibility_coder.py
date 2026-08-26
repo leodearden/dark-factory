@@ -28,6 +28,15 @@ import coder as mod
 import digest as digest_mod
 import pytest
 
+# Imported AFTER `coder`, deliberately: it is coder.py's own module-level
+# sys.path bootstrap that puts this checkout's shared/src on the path, so this
+# line doubles as proof the bootstrap works under the scripts test harness.
+# The corpus is imported, never restated -- a second hand-maintained copy of a
+# verbatim transcript is the drift trap that let a weekly cap through the
+# census preflight (task 3645), and deriving from the one home means a CLI
+# rewording the markers stop covering turns THIS suite red too.
+from shared.cap_markers import REAL_CLI_CAP_MESSAGES
+
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _LIVE_CODEBOOK_PATH = _REPO_ROOT / "docs" / "legibility" / "confusion-codebook.yaml"
 
@@ -603,6 +612,129 @@ def test_code_digest_malformed_frontmatter_is_never_labelled_capped():
     assert result.session is None
 
 
+# ---------------------------------------------------------------------------
+# task 4736: the EXIT-0 banner, and the guard that bounds where it is scanned
+#
+# The CLI does not always exit non-zero when it declines to answer -- it can
+# print the banner and exit 0, at which point the "reply" is prose that
+# parse_coder_output cannot turn into a verdict.  That is the second scan
+# site, and it is reached ONLY after the parse has already failed.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("message", REAL_CLI_CAP_MESSAGES)
+def test_code_digest_exit_zero_cap_banner_is_labelled_capped(message):
+    """A banner that arrives as a successful-looking reply is still a cap.
+
+    Every corpus message is plain prose, so parse_coder_output cannot parse
+    it -- the same premise the census side already pins in
+    test_every_real_cli_cap_message_fails_to_parse_as_a_verdict.  Without
+    this, an exit-0 capped night looks like twenty digests of garbled model
+    output: a coder defect, investigated as one.
+    """
+    def fake_invoke(prompt, model):
+        return message
+
+    result = mod.code_digest(
+        _hand_digest(_SESSION_ID, "a confusing correction happened here"),
+        _tiny_codebook(), project="dark_factory", model="haiku",
+        invoke=fake_invoke,
+    )
+
+    assert result.capped is True, (
+        f"an exit-0 reply that is nothing but a cap banner must be labelled "
+        f"a cap, not filed as garbled model output; got {result.reason!r}"
+    )
+    assert result.ok is False
+    assert result.record is None
+    assert result.reason, "a capped digest must still record WHY"
+
+
+def test_code_digest_exit_zero_cap_reason_names_the_marker():
+    def fake_invoke(prompt, model):
+        return "You've hit your weekly limit - resets 2pm (Europe/London)"
+
+    result = mod.code_digest(
+        _hand_digest(_SESSION_ID, "a confusing correction happened here"),
+        _tiny_codebook(), project="dark_factory", model="haiku",
+        invoke=fake_invoke,
+    )
+    assert result.capped is True
+    assert "weekly limit" in result.reason.lower(), (
+        f"the reason must quote WHICH signal fired -- 'deferred: weekly "
+        f"limit' and 'deferred' are different messages to the operator "
+        f"reading the morning journal; got {result.reason!r}"
+    )
+
+
+def test_code_digest_a_verdict_QUOTING_cap_text_is_never_read_as_a_banner():
+    """THE load-bearing guard.  A reply that parses into a verdict IS a
+    verdict.
+
+    This is census.py's own recorded defect, adopted as a rule rather than
+    rediscovered: scanning arbitrary model output with the loose marker list
+    aborted the census on cap-THEMED clusters, because this repo's codebook is
+    dominated by clusters ABOUT usage and weekly limits, so the markers match
+    ordinary HEALTHY content.  The coder is exposed to exactly the same
+    hazard -- its judgments carry model-authored title/cause/evidence_quote
+    fields that legitimately quote capped sessions, since "an agent stalled on
+    a usage limit" is a real confusion worth coding.
+
+    A pre-parse scan here would silently discard genuine findings about
+    capped-agent confusions -- the one cluster class this codebook most needs
+    -- and would do it quietly, labelled as a cap.
+    """
+    judgment = {
+        "matches": [],
+        "candidates": [{
+            "title": "agent stalled on a usage limit",
+            "cause": "You've hit your weekly limit - resets 2pm (Europe/London)",
+            "area": "orchestrator",
+            "origin_phase": "unknown",
+            "manifested_phase": "unknown",
+            "evidence_quote": "You've hit your usage limit for Claude Pro.",
+        }],
+    }
+
+    def fake_invoke(prompt, model):
+        return json.dumps(judgment)
+
+    result = mod.code_digest(
+        _hand_digest(_SESSION_ID, "a confusing correction happened here"),
+        _tiny_codebook(), project="dark_factory", model="haiku",
+        invoke=fake_invoke,
+    )
+
+    assert result.capped is False, (
+        "a WELL-FORMED judgment that merely QUOTES cap text was read as a cap "
+        "banner -- that discards a genuine finding about a capped-agent "
+        "confusion and labels the loss a deferral.  Split on parse success: a "
+        "reply that parses into a verdict is a verdict."
+    )
+    # Whether it codes cleanly or trips schema validation is not this test's
+    # business -- either is an honest disposition.  What must not happen is
+    # the cap label, and the record must not silently vanish into a deferral.
+    assert result.ok is True or result.reason, (
+        "a parsed verdict must end up either coded or explicitly rejected, "
+        "never quietly dropped"
+    )
+
+
+def test_code_digest_ordinary_garbage_stays_an_unlabelled_parse_failure():
+    """NEGATIVE.  Unparseable output carrying no marker keeps its existing
+    disposition: a plain parse failure, capped=False."""
+    def fake_invoke(prompt, model):
+        return "I'm sorry, I cannot help with that request."
+
+    result = mod.code_digest(
+        _hand_digest(_SESSION_ID, "a confusing correction happened here"),
+        _tiny_codebook(), project="dark_factory", model="haiku",
+        invoke=fake_invoke,
+    )
+    assert result.ok is False
+    assert result.capped is False
+    assert result.reason
+
+
 def _batch_digests(n):
     return [_hand_digest(f"batch-sess-{i}", f"body marker {i}") for i in range(n)]
 
@@ -1087,8 +1219,6 @@ def test_invoke_cli_nonzero_exit_tail_bounds_each_stream_keeping_the_tail(
 # actually makes `shared` importable under the scripts test harness, which has
 # no orchestrator/shared install of its own.
 # ---------------------------------------------------------------------------
-
-from shared.cap_markers import REAL_CLI_CAP_MESSAGES  # noqa: E402
 
 
 def test_cap_exhausted_is_a_subclass_of_invocation_error():
