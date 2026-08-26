@@ -15430,7 +15430,10 @@ class Harness:
         is intentional, not an oversight: get_status is kept as an
         independent, as-late-as-possible read to narrow the TOCTOU window
         above rather than reuse the earlier (by-then slightly staler)
-        get_task snapshot. Collapsing the two would also require reworking
+        get_task snapshot. Task 3540's corroborating read is a THIRD read of
+        the same row on the flip path (a fourth counting the re-block guard's
+        own), bought for the same reason and paid only by rows that actually
+        reach the write. Collapsing the two would also require reworking
         test_cascade_unblock.py (outside this task's locked module scope),
         whose mixed-status-cascade coverage
         (test_criterion_7_mixed_status_cascade) drives get_status with a
@@ -15582,6 +15585,54 @@ class Harness:
                 "%s — defaulting to 'pending'", task_id,
             )
             _resume_target = 'pending'
+
+        # INV-3 corroborating read (task 3540 / PRD D8, spec E9).  Everything
+        # above authorised the flip against snapshots taken BEFORE the re-block
+        # guard's own read-and-persist round-trips; re-authorise it here against
+        # a single snapshot taken immediately before the write, so the TOCTOU
+        # window narrows from (get_status → guard get_task → guard update_task →
+        # set_task_status) to one hop.  Status and claimant liveness are
+        # re-derived from the SAME row, so they can no longer be two skewed
+        # reads that never described the task at the same instant.
+        _late = await self.scheduler.get_task(task_id)
+        if _late is None:
+            # Fail-SAFE, not fail-open.  Deliberately the OPPOSITE default from
+            # _resume_repend_liveness, where an absent row reads as "no live
+            # claimant" so an unreadable row never SUPPRESSES a flip: there a
+            # missing row means missing claimant columns and the conservative
+            # reading is "not live"; here it means no evidence at all that the
+            # write is still correct, and the conservative action is to write
+            # nothing.  Nothing is stranded by the skip — the resolution has
+            # already been recorded, and the next dispatch, sweep or resolution
+            # re-derives the row.
+            logger.warning(
+                'cascade-unblock: could not re-read task %s before the '
+                '%s→%s flip (store unreachable?) — skipping the write via %s',
+                task_id, status, _resume_target, escalation.resolved_by,
+            )
+            return
+        _late_status = _late.get('status')
+        if (
+            _late_status not in _RESUME_REPEND_STATUSES
+            or self._resume_repend_liveness(task_id, _late)
+        ):
+            # A benign lost race: some other owner (a completing workflow, a
+            # freshly-dispatched one, an operator) wrote this row between the
+            # gate and here, and that write is newer than ours.  Deliberately
+            # NOT escalated — INV-4's silent-permanent-hold concern does not
+            # apply, because the row is in a status somebody just chose, not
+            # parked with nothing to advance it.  INFO rather than DEBUG: it is
+            # rare and worth seeing when reconstructing a resume that "did
+            # nothing".
+            logger.info(
+                'cascade-unblock: task %s changed under the resume — re-read '
+                'shows status %s / claimant %s (the gate saw %s); skipping the '
+                '%s write via %s',
+                task_id, _late_status, _late.get('claimant_run_id'), status,
+                _resume_target, escalation.resolved_by,
+            )
+            return
+
         try:
             await self.scheduler.set_task_status(task_id, _resume_target)
             logger.info(

@@ -20,7 +20,6 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
 from _orch_helpers import wire_scheduler_liveness_mock
 from escalation.action_effects import ACTION_EFFECTS, ANY, WORKFLOW_NONE, TaskEffect
 from escalation.models import Escalation
@@ -51,7 +50,14 @@ def harness(tmp_path: Path, mock_orch_config) -> Harness:
     wire_scheduler_liveness_mock(h.scheduler)
     h.scheduler.get_status = AsyncMock(return_value='blocked')
     h.scheduler.set_task_status = AsyncMock()
-    h.scheduler.get_task = AsyncMock(return_value={'id': 'task', 'metadata': {}})
+    # Task 3540: the row must carry 'status' too, and it must AGREE with
+    # get_status above. _cascade_unblock_member re-reads the row immediately
+    # before the write and re-applies the status/liveness gate to THAT
+    # snapshot (INV-3), so a row that omits 'status' describes a task that
+    # cannot exist and reads as "left the re-pendable statuses" -> no write.
+    h.scheduler.get_task = AsyncMock(
+        return_value={'id': 'task', 'status': 'blocked', 'metadata': {}}
+    )
     h.scheduler.update_task = AsyncMock(return_value=True)
 
     # _merge_worker stays None — unhalt branch skipped in all tests here
@@ -1167,8 +1173,14 @@ class TestActionEffectsTableCoupling:
             level=1,
         )
         harness.scheduler.get_status = AsyncMock(return_value='blocked')
+        # 'status' must be present and AGREE with get_status above — task
+        # 3540's corroborating read (INV-3) re-applies the status/liveness gate
+        # to this snapshot immediately before the write, so a row omitting
+        # 'status' reads as "left the re-pendable statuses" and no flip lands.
         harness.scheduler.get_task = AsyncMock(
-            return_value={'id': task_id, 'metadata': {}},  # no infra_hold
+            return_value={  # no infra_hold
+                'id': task_id, 'status': 'blocked', 'metadata': {},
+            },
         )
         harness._escalation_events.pop(task_id, None)  # ensure orphan (no active workflow)
 

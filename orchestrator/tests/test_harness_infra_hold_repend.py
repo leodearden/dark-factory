@@ -32,7 +32,6 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
 from _orch_helpers import wire_scheduler_liveness_mock
 
 from orchestrator.harness import Harness
@@ -396,9 +395,14 @@ class TestInfraHoldEscalationResolution:
         """
         tid = '1884'
 
-        # No infra_hold in metadata
+        # No infra_hold in metadata.  'status' must be present and must AGREE
+        # with get_status below — task 3540's _cascade_unblock_member re-reads
+        # the row immediately before the write and re-applies the
+        # status/liveness gate to THAT snapshot (INV-3), so a row omitting
+        # 'status' reads as "left the re-pendable statuses" and no flip lands.
         harness.scheduler.get_task = AsyncMock(return_value={
             'id': tid,
+            'status': 'blocked',
             'metadata': {},
         })
         harness.scheduler.get_status = AsyncMock(return_value='blocked')

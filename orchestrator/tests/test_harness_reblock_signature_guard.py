@@ -54,7 +54,14 @@ def harness(mock_orch_config) -> Harness:
     wire_scheduler_liveness_mock(h.scheduler)
     h.scheduler.get_status = AsyncMock(return_value='blocked')
     h.scheduler.set_task_status = AsyncMock()
-    h.scheduler.get_task = AsyncMock(return_value={'id': '42', 'metadata': {}})
+    # Task 3540: the row must carry 'status' too, and it must AGREE with
+    # get_status above. _cascade_unblock_member re-reads the row immediately
+    # before the write and re-applies the status/liveness gate to THAT
+    # snapshot (INV-3), so a row that omits 'status' describes a task that
+    # cannot exist and reads as "left the re-pendable statuses" -> no write.
+    h.scheduler.get_task = AsyncMock(
+        return_value={'id': '42', 'status': 'blocked', 'metadata': {}}
+    )
     h.scheduler.update_task = AsyncMock(return_value=True)
 
     # No escalation queue by default (bare-harness style)
@@ -149,20 +156,29 @@ class TestSignatureDerivation:
 # ---------------------------------------------------------------------------
 
 
-def _make_fake_scheduler(harness, initial_metadata: dict | None = None):
+def _make_fake_scheduler(
+    harness, initial_metadata: dict | None = None, status: str = 'blocked'
+):
     """Wire harness.scheduler with a simple in-memory task backend.
 
     Returns (persisted_metadata, call_order) so tests can inspect state.
     The backend simulates:
-      - get_task: returns the current persisted_metadata
+      - get_task: returns the current persisted_metadata, under *status*
       - update_task: applies update (with optional append/merge semantics)
       - set_task_status: records the call in call_order
+
+    *status* must AGREE with the ``harness`` fixture's ``get_status`` stub.
+    Task 3540: ``_cascade_unblock_member`` re-reads the row immediately before
+    the write and re-applies the status/liveness gate to THAT snapshot
+    (INV-3), so a row omitting ``status`` describes a task that cannot exist
+    and reads as "left the re-pendable statuses" — the flip would be skipped
+    and every ordering assertion below would go vacuous.
     """
     persisted_metadata: dict = dict(initial_metadata or {})
     call_order: list[str] = []
 
     async def fake_get_task(tid):
-        return {'id': tid, 'metadata': dict(persisted_metadata)}
+        return {'id': tid, 'status': status, 'metadata': dict(persisted_metadata)}
 
     async def fake_update_task(tid, md, *, append=False, metadata_mode=None):
         if isinstance(md, dict):
