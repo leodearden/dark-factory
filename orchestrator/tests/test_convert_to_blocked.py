@@ -2008,6 +2008,174 @@ class TestSubmitToMergeQueueAlreadyLanded:
 
 
 # ---------------------------------------------------------------------------
+# amendment pass, review finding #4 — WHICH LADDER THE ROW ACTUALLY LANDS ON
+#
+# Every test above stubs `_mark_blocked`, so the suite pinned the ARGUMENTS
+# the carve-out passes and nothing about where the row ends up.  The claim
+# being defended is narrow — "no `escalate_to_human=True`, so no `task_failure`
+# pin is minted" — and the honest residue is that the NORMAL ladder still runs:
+# an L0 in the new `already_landed` category, a steward, and (on fall-through)
+# an L1 in that same category.  These tests run the REAL `_mark_blocked` so
+# that residue is measured rather than asserted, and so a future change to the
+# ladder cannot silently reintroduce the pin this task removed.
+#
+# Production reaches this through `_run_merge_phase` with merge_phase=True (the
+# only literal origin in workflow.py), so these tests pass merge_phase=True
+# too: the entry status write is suppressed and the park write happens at the
+# slot-exiting return, which is a materially different path from the
+# merge_phase=False default the tests above exercise.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestAlreadyLandedLadderWithRealMarkBlocked:
+    """The real `_mark_blocked`, so the ladder is measured not assumed."""
+
+    @staticmethod
+    def _wire_real(wf, tmp_path, monkeypatch):
+        """Same gate/predicate stubs as the class above, but `_mark_blocked` REAL.
+
+        The steward is deliberately left absent (`_steward is None`) so the
+        flow is deterministic and takes the BLOCKED fall-through — the arm
+        that decides the terminal ladder.  A live steward's own arms
+        (`StewardResolved` -> REQUEUED) are `_run_merge_phase`'s bounded
+        retry, covered by that method's own suite.
+        """
+        from unittest.mock import MagicMock
+
+        from escalation.queue import EscalationQueue
+
+        async def fake_run(cmd, **kwargs):  # noqa: ARG001
+            return 0, 'fake_head_sha\n', ''
+        monkeypatch.setattr('orchestrator.workflow._run', fake_run)
+
+        async def fake_check(*a, **k):  # noqa: ARG001
+            return PlanFilesTouchedResult(not_touched=['a.py'])
+        monkeypatch.setattr(
+            'orchestrator.merge_queue._check_plan_files_touched_in_branch',
+            fake_check,
+        )
+        monkeypatch.setattr(
+            'orchestrator.merge_queue._emit_merge_attempt',
+            lambda *a, **k: None,
+        )
+
+        queue = EscalationQueue(tmp_path / 'escalations')
+        wf.escalation_queue = queue
+        wf.event_store = None
+        wf._try_narrow_plan = AsyncMock(return_value=False)
+        wf.scheduler.set_task_status = AsyncMock()
+        wf.scheduler.update_task = AsyncMock()
+        # Not part of this ladder: the dry-run investigator is a merge_phase
+        # =False side effect and would launch a real spawn against a spec'd
+        # MagicMock config.
+        wf._spawn_dry_run_unblock = MagicMock()
+        wf._ensure_steward_started = AsyncMock()
+        wf._steward = None
+        return queue
+
+    @staticmethod
+    def _categories(queue, task_id: str = '2656') -> list[str]:
+        return [
+            e.category for e in queue.get_by_task(task_id)
+        ]
+
+    async def test_the_row_lands_blocked_and_never_in_a_task_failure_pin(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """THE claim, measured end to end through the real ladder.
+
+        `task_failure` is the category whose pin vetoed the recovery and fed
+        the loop.  Whatever else the ladder does, no record it files may carry
+        it — that, and not the absence of escalations in general, is what
+        "the loop has no fuel" means.
+        """
+        wf = _make_workflow(tmp_path=tmp_path)
+        queue = self._wire_real(wf, tmp_path, monkeypatch)
+        TestSubmitToMergeQueueAlreadyLanded._stub_predicate(
+            monkeypatch, TestSubmitToMergeQueueAlreadyLanded._landed(),
+        )
+
+        outcome = await wf._submit_to_merge_queue(
+            'task/2656', pre_rebased=False, merge_phase=True,
+        )
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        cats = self._categories(queue)
+        assert cats, 'the row must not be parked silently — a human is owed one'
+        assert set(cats) == {'already_landed'}, cats
+        assert wf.scheduler.set_task_status.await_args is not None
+        assert wf.scheduler.set_task_status.await_args.args[1] == 'blocked'
+
+    async def test_the_l0_carries_the_operator_facing_action(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """`verify_landing_and_close` is the whole point of the new route.
+
+        The L0 is what a steward and an operator read.  If it says
+        `investigate_and_retry` (the `_mark_blocked` default) the human is
+        pointed at re-running a branch that is legitimately empty, which is
+        the behaviour this task exists to stop.
+        """
+        wf = _make_workflow(tmp_path=tmp_path)
+        queue = self._wire_real(wf, tmp_path, monkeypatch)
+        TestSubmitToMergeQueueAlreadyLanded._stub_predicate(
+            monkeypatch, TestSubmitToMergeQueueAlreadyLanded._landed(),
+        )
+
+        await wf._submit_to_merge_queue(
+            'task/2656', pre_rebased=False, merge_phase=True,
+        )
+
+        l0 = [e for e in queue.get_by_task('2656') if e.level == 0]
+        assert l0, 'the normal ladder starts at L0'
+        assert l0[0].suggested_action == 'verify_landing_and_close'
+
+    async def test_a_legacy_task_failure_pin_gets_the_honest_record_too(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """DELIBERATE, and the reason is worth stating (review finding #4a).
+
+        `has_open_l1` dedup is CATEGORY-SCOPED, so a legacy row still carrying
+        a stale `task_failure` L1 from a pre-carve-out cycle receives an
+        ADDITIONAL `already_landed` record rather than none.  That is the
+        wanted direction: the stale record asserts the branch under-delivered,
+        which is false; the new one names what is actually true and what to do
+        about it.  Retiring the stale pin is the EXIT half's job
+        (CONVERT_TO_BLOCKED), not this one's — so what must NOT happen is a
+        SECOND `task_failure` record, and that is what this asserts.
+        """
+        from escalation.models import Escalation
+
+        wf = _make_workflow(tmp_path=tmp_path)
+        queue = self._wire_real(wf, tmp_path, monkeypatch)
+        queue.submit(Escalation(
+            id=queue.make_id('2656'),
+            task_id='2656',
+            agent_role='orchestrator',
+            severity='blocking',
+            category='task_failure',
+            summary='stale: plan files not touched',
+            detail='filed by a pre-carve-out cycle',
+            level=1,
+        ))
+        TestSubmitToMergeQueueAlreadyLanded._stub_predicate(
+            monkeypatch, TestSubmitToMergeQueueAlreadyLanded._landed(),
+        )
+
+        await wf._submit_to_merge_queue(
+            'task/2656', pre_rebased=False, merge_phase=True,
+        )
+
+        cats = self._categories(queue)
+        assert cats.count('task_failure') == 1, (
+            'the carve-out must never ADD a task_failure record — that is the '
+            f'pin category that fuels the loop: {cats}'
+        )
+        assert 'already_landed' in cats
+
+
+# ---------------------------------------------------------------------------
 # step-11 — the composed regression
 # ---------------------------------------------------------------------------
 

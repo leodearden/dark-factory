@@ -10433,6 +10433,37 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     # outcome on the NORMAL ladder — no escalate_to_human — is
                     # what leaves the loop with no fuel.
                     #
+                    # SCOPE OF THAT LAST SENTENCE (amendment pass, review
+                    # finding #4).  It is about the `task_failure` L1 PIN and
+                    # nothing else; the NORMAL ladder still runs, exactly as it
+                    # does for the cross-repo sibling above.  Two residues,
+                    # both deliberate and both now pinned by tests that drive
+                    # the REAL _mark_blocked (TestAlreadyLandedLadderWith
+                    # RealMarkBlocked) rather than a stub:
+                    #
+                    #   (a) has_open_l1 dedup is CATEGORY-scoped, so a legacy
+                    #       row still carrying a stale task_failure L1 gets an
+                    #       ADDITIONAL already_landed record rather than none.
+                    #       Wanted: the stale record claims the branch
+                    #       under-delivered (false), the new one names what is
+                    #       true and what to do.  Retiring the stale pin is the
+                    #       EXIT half's job (CONVERT_TO_BLOCKED), not this one's
+                    #       — what must never happen is a SECOND task_failure
+                    #       record, and that is what the test asserts.
+                    #   (b) A StewardResolved verdict returns REQUEUED into
+                    #       _run_merge_phase's `for _merge_attempt in
+                    #       range(self.config.max_merge_retries)` loop, which
+                    #       re-enters this arm on the same legitimately-empty
+                    #       branch.  BOUNDED by max_merge_retries and then
+                    #       terminal — a capped re-check, not the unbounded
+                    #       churn this task ends.  skip_escalation=True would
+                    #       remove even that, at the cost of parking the row
+                    #       with NO human-facing record at all, which the
+                    #       reason text below ("Verify the landing and CLOSE
+                    #       this task") exists precisely to avoid; and it would
+                    #       diverge from the sibling carve-out for no measured
+                    #       reason.  Deliberately not taken.
+                    #
                     # classify_block_reason deliberately does NOT map this new
                     # prefix: it falls through to BlockClass.AGENT_FAILURE
                     # exactly as CROSS_REPO_DELIVERABLE_REASON_PREFIX does.  It
