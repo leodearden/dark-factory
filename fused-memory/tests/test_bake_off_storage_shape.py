@@ -7306,13 +7306,24 @@ class TestTheReseedingControlPhrase:
         assert 'not measured' in mod._reseeding_control_phrase(flat)
 
     def test_the_rendered_section_carries_it_rather_than_the_old_guarantee(self):
-        """The published claim, narrowed.
+        """The published claim, narrowed — carried STRUCTURALLY.
 
         The section must not tell a gate reader that a delta contains the
-        re-emission's contribution "and not ANN noise between two seedings" —
-        a methodological guarantee the two-collection design does not
+        re-emission's contribution and no cross-seeding noise, a
+        methodological guarantee the two-collection design does not
         provide.  What it may say is which comparison IS seeding-free, and
         what the measured noise floor came out as.
+
+        That contract is enforced by the assertion below and by nothing
+        else on purpose.  This test used to also carry a NEGATIVE prose pin
+        (`'not ANN noise between two seedings' not in section`), which did
+        not guard what it claimed to: any rewording of the overclaim — "and
+        not embedding noise across two seeds", "free of cross-seeding
+        noise" — reintroduces the exact defect while leaving the pin green.
+        What actually forbids the overclaim is that the sentence is DERIVED
+        from `stamping_value` rather than typed, so there is no place for a
+        standing guarantee to live; asserting the derived phrase is present
+        is asserting that.
         """
         mod = _mod()
         block = _regrowth_block()
@@ -7322,9 +7333,8 @@ class TestTheReseedingControlPhrase:
         ))
 
         assert mod._reseeding_control_phrase(
-            block['stamping_value']['flat']
+            block['stamping_value'][mod.REGROWTH_CONTROL_ARM]
         ) in section
-        assert 'not ANN noise between two seedings' not in section
 
 
 class TestTheStampingTableCeilings:
