@@ -2913,21 +2913,44 @@ def _reseeding_control_phrase(flat_stamping: dict[str, Any]) -> str:
     Its reach is bounded and the sentence says so: it measures re-seeding
     between two INJECTED collections at this corpus size.  It is evidence
     about the noise floor, not a proof about the baseline collection.
+
+    PER COLUMN, never collapsed to one scalar.  The seven metrics are in
+    four different units — 0..1 rates, a raw count in the hundreds, a rank,
+    and a mean token count in the thousands — so a max-by-magnitude across
+    the row is a category error: it would bound a `claim recall@5` delta of
+    `-0.01` by a `tokens/query` cell of `-3.13` and read as "that delta is
+    entirely noise".  A cell bounds re-seeding in ITS OWN column and in no
+    other, and the sentence this returns says exactly that, naming the
+    columns that moved with the labels the table below uses.
     """
-    measured = [
-        flat_stamping[metric] for metric in _regrowth_metric_keys()
+    metrics = _regrowth_metric_keys()
+    labels = dict(zip(metrics, REGROWTH_METRIC_LABELS, strict=True))
+    measured = {
+        metric: flat_stamping[metric] for metric in metrics
         if flat_stamping.get(metric) is not None
-    ]
+    }
     if not measured:
         return 'was not measured in this run'
-    worst = max(measured, key=abs)
-    if worst == 0:
+    moved = {
+        metric: value for metric, value in measured.items() if value
+    }
+    if not moved:
         return ('came out as exactly `0.00` on every column, so at this '
                 'corpus size a second seeding moved nothing any of these '
                 'metrics can see')
-    return (f'did NOT come out flat — the largest cell in it is '
-            f'{_gap_cell(worst)} — so at least that much of any delta below '
-            f'is re-seeding rather than re-emission')
+    cells = ', '.join(
+        f'`{labels[metric]}` {_gap_cell(value)}'
+        for metric, value in moved.items()
+    )
+    return (f'did NOT come out flat — it moved on {len(moved)} of '
+            f'{len(measured)} columns ({cells}), and those cells ARE the '
+            f'noise floor, PER COLUMN.  Each bounds re-seeding in its own '
+            f'column only: these metrics are in different units (rates, a '
+            f'count, a rank, token counts), so no cell says anything about '
+            f'how much of a delta in a DIFFERENT column is re-seeding, and '
+            f'a column whose `flat` cell is `0.00` has no measured '
+            f're-seeding contribution however large another column\'s cell '
+            f'is')
 
 
 def _regrowth_lines(report: dict[str, Any]) -> list[str]:

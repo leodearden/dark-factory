@@ -7117,10 +7117,14 @@ class TestTheReseedingControlPhrase:
 
         assert 'exactly `0.00` on every column' in phrase, phrase
 
-    def test_a_nonzero_row_says_so_and_names_the_largest_cell(self):
+    def test_a_nonzero_row_says_so_and_names_every_column_that_moved(self):
         """The point of DERIVING it.  A typed "re-seeding contributes
         nothing" would still read as a guarantee on the first run where it
-        stopped being true, three lines above the table that disagrees."""
+        stopped being true, three lines above the table that disagrees.
+
+        Every moved cell is named, not just one: the floor is per column, so
+        a reader needs the cell belonging to the column they are reading.
+        """
         mod = _mod()
         flat = self._flat(**{'claim_recall.at_5': -0.25,
                              'tokens_per_query.mean': +0.10})
@@ -7129,17 +7133,47 @@ class TestTheReseedingControlPhrase:
 
         assert 'did NOT come out flat' in phrase, phrase
         assert mod._gap_cell(-0.25) in phrase, phrase
+        assert mod._gap_cell(+0.10) in phrase, phrase
+        assert 'claim recall@5' in phrase, phrase
+        assert 'tokens/query' in phrase, phrase
 
-    def test_the_largest_cell_is_by_magnitude_not_by_value(self):
-        """A negative floor is a floor.  Picking the max by VALUE would
-        report `+0.01` while a `-3.00` sat in the same row."""
+    def test_the_floor_is_per_column_not_a_cross_unit_maximum(self):
+        """The seven metrics are in four different units, so the row must
+        never be collapsed to one scalar and published as a floor on every
+        column.  A `tokens/query` cell of `-3.13` beside an otherwise flat
+        row must not be rendered as a bound on a claim-recall delta: the
+        sentence names the ONE column that moved, says the floor is per
+        column, and does not claim that much of "any delta below" is noise.
+        """
         mod = _mod()
-        flat = self._flat(**{'claim_recall.at_5': +0.01,
-                             'discoverability.stored_canonical_found_count': -3.0})
+        flat = self._flat(**{'tokens_per_query.mean': -3.13})
 
         phrase = mod._reseeding_control_phrase(flat)
 
-        assert mod._gap_cell(-3.0) in phrase, phrase
+        assert mod._gap_cell(-3.13) in phrase, phrase
+        assert 'tokens/query' in phrase, phrase
+        assert 'PER COLUMN' in phrase, phrase
+        # The old cross-unit overclaim, in the two spellings it took.
+        assert 'largest cell' not in phrase, phrase
+        assert 'any delta below' not in phrase, phrase
+        # A column that did not move is not bounded by another one's cell.
+        assert 'claim recall@5' not in phrase, phrase
+
+    def test_every_moved_column_is_named_with_the_tables_own_label(self):
+        """The floor is only usable if the reader can match a cell to the
+        column it bounds, and the stamping table's headers are
+        `REGROWTH_METRIC_LABELS` — so the sentence must use those spellings
+        rather than the internal `<block>.<key>` metric keys."""
+        mod = _mod()
+        metrics = mod._regrowth_metric_keys()
+        labels = dict(zip(metrics, mod.REGROWTH_METRIC_LABELS, strict=True))
+        flat = self._flat(**{metric: 0.5 for metric in metrics})
+
+        phrase = mod._reseeding_control_phrase(flat)
+
+        for metric in metrics:
+            assert labels[metric] in phrase, (metric, phrase)
+            assert metric not in phrase, (metric, phrase)
 
     def test_an_unmeasured_row_says_so_rather_than_reporting_a_zero(self):
         """`None` is "never asked", and reporting it as a clean control is
