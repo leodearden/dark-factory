@@ -25,7 +25,6 @@ cite-time existence check — i.e. precisely the unchecked path this task closes
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import AsyncMock, patch
 

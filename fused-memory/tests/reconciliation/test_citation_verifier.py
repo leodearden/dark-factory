@@ -338,7 +338,8 @@ async def test_stat_prefix_is_keyword_only():
     """``stat_prefix`` is keyword-only, so a 4th positional argument cannot be
     mistaken for it (the 3 positional params keep their existing meaning)."""
     with pytest.raises(TypeError):
-        await verify_cited_memories([], AsyncMock(), 'test_project', 'stage2')
+        # Deliberately wrong arity: the 4th positional is what this test forbids.
+        await verify_cited_memories([], AsyncMock(), 'test_project', 'stage2')  # type: ignore[call-arg]
 
 
 @pytest.mark.asyncio
@@ -366,11 +367,12 @@ async def test_stat_prefix_zero_stats_shape_on_the_no_citations_path():
 def test_stage_stat_prefix_covers_every_stage_id():
     """``STAGE_STAT_PREFIX`` maps every ``StageId`` member to its stage number,
     so ``BaseStage.run()``'s lookup can never miss a stage."""
-    assert STAGE_STAT_PREFIX == {
+    expected = {
         StageId.memory_consolidator: 'stage1',
         StageId.task_knowledge_sync: 'stage2',
         StageId.integrity_check: 'stage3',
     }
+    assert expected == STAGE_STAT_PREFIX
     assert set(STAGE_STAT_PREFIX) == set(StageId)
 
 

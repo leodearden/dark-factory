@@ -3218,6 +3218,7 @@ class TestApplyCitationVerification:
         assert [c['memory_id'] for c in post['cited_memories']] == [self._GOOD]
 
         assembled = state.get_assembled_report(run_id, 'memory_consolidator')
+        assert assembled is not None
         assembled_finding = assembled['flagged_items'][0]
         assert [c['memory_id'] for c in assembled_finding['cited_memories']] == [self._GOOD]
 
@@ -3235,6 +3236,7 @@ class TestApplyCitationVerification:
         expected = [{'memory_id': self._PHANTOM, 'store': 'mem0', 'reason': 'memory_not_found'}]
         assert state.get_findings_for_run(run_id)[0]['citation_failures'] == expected
         assembled = state.get_assembled_report(run_id, 'memory_consolidator')
+        assert assembled is not None
         assert assembled['flagged_items'][0]['citation_failures'] == expected
 
     @pytest.mark.asyncio
@@ -3250,6 +3252,7 @@ class TestApplyCitationVerification:
         from fused_memory.server.recon_report_store import ReconReportStore
 
         state, store, run_id, finding_id = self._state_with_two_citations(tmp_path)
+        assert store is not None  # tmp_path was passed, so a store was built.
         await self._cite_both(state, run_id, finding_id)
         state.complete(run_id, summary='s')
 
