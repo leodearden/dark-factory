@@ -34,6 +34,7 @@ Step → coverage map:
   step-15 RED — a head whose outcome was already DELIVERED is not δ's to retract
   step-17 RED — the adopted head lands from its POST-verify worktree
   step-19 RED — `on_merge_landed` reports the PREDECESSOR as base_sha
+  step-21 RED — `cancel-verify` clears the SHARED holder key only on identity
 
 Harness notes (see plan pre-1; conventions cloned from
 test_merge_queue_deep_dispatch.py:1-36):
@@ -3081,23 +3082,50 @@ class TestAdoptedHeadLandsWithThePostVerifyWorktree:
 
 
 class TestRemoteCancelClearsTheHolderRendezvous:
-    """(e) `cancel-verify` closes the merge-worker-initiated leak.
+    """(e) `cancel-verify` closes the merge-worker-initiated leak — SAFELY.
 
     Sync class, deliberately: pytest-asyncio is STRICT here and a sync
     ``test_*`` inside an ``@pytest.mark.asyncio`` class is an ERROR.
+
+    THE STAKE, stated once for the whole class.  ``cli.py:607-622`` shows the
+    fixed key's owner writes it ONLY when it won the build-lane flock, and
+    clears it only in its OWN ``finally`` — so at any moment the key routinely
+    names a DIFFERENT, live verify than the one a given cancel is aimed at.
+    Clearing it then makes ``GitOps._merge_verify_lease_active`` fail-OPEN
+    (``read_lock_holder_pgid`` -> ``None`` -> "not held"): the typed
+    ``MergeVerifyLeaseHeld`` diagnosis ``reset_persistent_merge_worktree``
+    raises is lost, and — per ``_adopt_head_on_tip_authority``'s own LEASE
+    CLEANLINESS paragraph — DF-3071's admission guard reads ``_merge-verify``
+    as IDLE while a verify is live, so the fleet REDEPLOYS over it instead of
+    deferring.  That is strictly worse than the wedged-lane risk the clear was
+    added to remove.
+
+    ``cancel_request`` returns 0 for FOUR distinct cases, only ONE of which
+    killed anything: a successful kill, ``FileNotFoundError``
+    (verify_cancel.py:287-288), corrupt/unparseable content (290-295), and
+    ``pgid <= 0`` (297-301).  The absent-file case is the COMMON one — a
+    verify-merge that completes normally removes its own per-request pgid file
+    in its ``finally``, so a cancel racing normal completion (exactly the race
+    δ's head teardown creates) kills nothing at all and then, on rc alone,
+    would unlink whichever pgid the shared key currently names.  rc == 0 is
+    therefore NOT evidence that anything was killed: the clear must be gated on
+    IDENTITY — the key names the process this cancel actually SIGKILLed.
     """
 
-    def test_cancel_verify_clears_the_fixed_key_holder_file(
-        self, tmp_path: Path, monkeypatch,
-    ) -> None:
-        """`cancel_request`'s SIGKILL skips cli.py's finally — so the CLI must.
+    @staticmethod
+    def _invoke(
+        tmp_path: Path, monkeypatch, *,
+        holder_pgid: int | None,
+        request_content: str | None,
+        rc_override: int | None = None,
+        request_id: str = 'delta-head-req',
+    ):
+        """Run ``cancel-verify`` for real with the SIGKILL sweep declawed.
 
-        verify_cancel.py:303-336 records the consequence: the FIXED-key holder
-        file is what `_merge_verify_lease_active` probes with `killpg(pgid, 0)`,
-        and a leaked (or pid-recycled) entry there reads as a LIVE holder and
-        fails CLOSED — a wedged warm lane, bounded only by the next run that
-        happens to overwrite it.  δ cancels REMOTE head verifies through this
-        exact command, so it must leave the rendezvous clean.
+        The REAL ``cancel_request`` runs — that is the point, all four of its
+        return-0 paths are under test — but ``kill``/``killpg`` are spies, so
+        no signal ever leaves the test process.  Returns
+        ``(result, worktree_base, signalled_pids)``.
         """
         from unittest.mock import MagicMock
 
@@ -3106,17 +3134,33 @@ class TestRemoteCancelClearsTheHolderRendezvous:
         from orchestrator import cli as cli_module
         from orchestrator.cli import main
         from orchestrator.config import OrchestratorConfig
-        from orchestrator.verify_cancel import (
-            pgid_file,
-            read_lock_holder_pgid,
-            write_lock_holder_pgid,
-        )
+        from orchestrator.verify_cancel import cancel_request as real_cancel_request
+        from orchestrator.verify_cancel import pgid_file, write_lock_holder_pgid
 
         worktree_base = tmp_path / '.worktrees'
-        worktree_base.mkdir()
-        write_lock_holder_pgid(worktree_base, os.getpgrp())
-        assert read_lock_holder_pgid(worktree_base) == os.getpgrp()
+        worktree_base.mkdir(exist_ok=True)
+        if holder_pgid is not None:
+            write_lock_holder_pgid(worktree_base, holder_pgid)
 
+        pgf = pgid_file(worktree_base, request_id)
+        if request_content is not None:
+            pgf.parent.mkdir(parents=True, exist_ok=True)
+            pgf.write_text(request_content)
+
+        signalled: list[int] = []
+
+        def _declawed(path, **kwargs):
+            if rc_override is not None:
+                return rc_override
+            return real_cancel_request(
+                path,
+                ppid_map_provider=dict,
+                kill=lambda pid, _sig: signalled.append(pid),
+                killpg=lambda pgid, _sig: signalled.append(pgid),
+                **kwargs,
+            )
+
+        monkeypatch.setattr(cli_module, 'cancel_request', _declawed)
         monkeypatch.setattr(
             cli_module, 'load_config',
             lambda _: OrchestratorConfig(project_root=tmp_path),
@@ -3130,16 +3174,143 @@ class TestRemoteCancelClearsTheHolderRendezvous:
         cfg_file.write_text('')
 
         r = CliRunner().invoke(main, [
-            'cancel-verify', '--request-id', 'delta-head-req',
+            'cancel-verify', '--request-id', request_id,
             '--config', str(cfg_file),
         ])
+        return r, worktree_base, signalled
+
+    def test_clears_the_key_when_it_names_the_process_it_just_killed(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """(a) The real δ case: the SIGKILLed verify WAS the lane holder.
+
+        `cancel_request`'s SIGKILL skips that process's own `finally` — the one
+        that would have called `remove_lock_holder_pgid` — so the caller must
+        perform the clear on its behalf.  Only here: the key demonstrably names
+        the victim, so clearing it states a truth (that pgid is dead) rather
+        than a guess.
+        """
+        from orchestrator.verify_cancel import (
+            LOCK_HOLDER_PGID_KEY,
+            pgid_file,
+            read_lock_holder_pgid,
+        )
+
+        victim = 424242
+        r, wb, signalled = self._invoke(
+            tmp_path, monkeypatch,
+            holder_pgid=victim, request_content=str(victim),
+        )
 
         assert r.exit_code == 0, r.output
-        assert read_lock_holder_pgid(worktree_base) is None, (
+        assert victim in signalled, (
+            'the identity gate is only meaningful if this cancel really did '
+            f'sweep the victim; signalled={signalled}'
+        )
+        assert read_lock_holder_pgid(wb) is None, (
             'cancel-verify must clear the fixed-key holder rendezvous the '
             'SIGKILLed verify-merge could not clear itself'
         )
-        assert not pgid_file(worktree_base, '_merge_verify_lock_holder').exists()
+        assert not pgid_file(wb, LOCK_HOLDER_PGID_KEY).exists()
+
+    def test_leaves_the_key_alone_when_there_was_nothing_to_cancel(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """(b) No per-request pgid file -> rc 0, but NOTHING was killed.
+
+        This is the COMMON rc == 0 case, not an exotic one: a verify-merge that
+        finishes normally removes its own per-request file, so a cancel racing
+        normal completion lands here.  The shared key at that moment names
+        whichever verify currently holds the build-lane flock — very plausibly
+        a live one on another request — and unlinking it would fail-OPEN the
+        lease read for that live verify.
+        """
+        from orchestrator.verify_cancel import read_lock_holder_pgid
+
+        holder = os.getpgrp()
+        r, wb, signalled = self._invoke(
+            tmp_path, monkeypatch, holder_pgid=holder, request_content=None,
+        )
+
+        assert r.exit_code == 0, r.output
+        assert signalled == [], 'nothing to cancel means nothing signalled'
+        assert read_lock_holder_pgid(wb) == holder, (
+            'rc == 0 with no per-request pgid file killed NOTHING — clearing '
+            'the shared key here fail-OPENs the lease read for a live verify'
+        )
+
+    def test_leaves_the_key_alone_when_it_names_a_different_live_verify(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """(c) Killed P, but the key names a different, LIVE pgid Q.
+
+        The key is SHARED and fixed — one filename for the whole host — so the
+        run that owns it is whichever one last won the build-lane flock, not
+        necessarily the request being cancelled.  Q here is this test's own
+        process group: unambiguously alive, and unambiguously not the victim.
+        """
+        from orchestrator.verify_cancel import read_lock_holder_pgid
+
+        live_other = os.getpgrp()
+        victim = 424242
+        assert victim != live_other
+        r, wb, signalled = self._invoke(
+            tmp_path, monkeypatch,
+            holder_pgid=live_other, request_content=str(victim),
+        )
+
+        assert r.exit_code == 0, r.output
+        assert victim in signalled
+        assert read_lock_holder_pgid(wb) == live_other, (
+            'the cancel killed a different process than the one the shared key '
+            'names — clearing it tells every reader the lane is free while a '
+            'live verify still holds it'
+        )
+
+    def test_leaves_the_key_alone_when_the_per_request_file_was_corrupt(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """(d1) Unparseable content -> verify_cancel.py:290-295 returns 0.
+
+        The corrupt file is removed and rc is 0, but no signal was ever sent:
+        there was no pgid to send one to.
+        """
+        from orchestrator.verify_cancel import read_lock_holder_pgid
+
+        holder = os.getpgrp()
+        r, wb, signalled = self._invoke(
+            tmp_path, monkeypatch,
+            holder_pgid=holder, request_content='not-an-int',
+            request_id='delta-head-corrupt',
+        )
+
+        assert r.exit_code == 0, r.output
+        assert signalled == []
+        assert read_lock_holder_pgid(wb) == holder
+
+    def test_leaves_the_key_alone_when_the_recorded_pgid_is_nonsensical(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """(d2) ``pgid <= 0`` -> verify_cancel.py:297-301 returns 0.
+
+        0 would kill the caller's own group and negatives are invalid, so the
+        file is treated as corrupt and removed without any kill.  Same rc, same
+        absence of a victim, same conclusion for the shared key.
+        """
+        from orchestrator.verify_cancel import read_lock_holder_pgid
+
+        holder = os.getpgrp()
+        for content in ('0', '-1'):
+            r, wb, signalled = self._invoke(
+                tmp_path, monkeypatch,
+                holder_pgid=holder, request_content=content,
+                request_id=f'delta-head-pgid{content}',
+            )
+            assert r.exit_code == 0, r.output
+            assert signalled == [], f'content={content!r} must kill nothing'
+            assert read_lock_holder_pgid(wb) == holder, (
+                f'content={content!r} is a nothing-to-cancel return-0 path'
+            )
 
     def test_cancel_verify_leaves_the_rendezvous_alone_when_the_kill_failed(
         self, tmp_path: Path, monkeypatch,
