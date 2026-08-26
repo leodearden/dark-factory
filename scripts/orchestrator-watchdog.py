@@ -1874,10 +1874,13 @@ def staleness_pass() -> None:
         return
 
     if _within_fleet_staleness_head_start():
-        log(
-            f"skip: holding the {STALENESS_GRACE_SECS}s coordinator head start "
-            "since the fleet-deploy min-interval opened"
-        )
+        # Same bucket idiom as the gate above: the gate CHECK still runs every
+        # tick, only the log EMISSION is throttled.
+        if time.time() % SKIP_LOG_INTERVAL_SECS < 120:
+            log(
+                f"skip: holding the {STALENESS_GRACE_SECS}s coordinator head start "
+                "since the fleet-deploy min-interval opened"
+            )
         return
 
     commit_epoch = _newest_watched_commit_epoch()
@@ -1994,10 +1997,13 @@ def fused_memory_staleness_pass() -> None:
         return
 
     if _within_fm_staleness_head_start():
-        log(
-            f"skip: holding the {STALENESS_GRACE_SECS}s fm-coordinator head start "
-            "since the fm-deploy min-interval opened"
-        )
+        # Same bucket idiom as the gate above: the gate CHECK still runs every
+        # tick, only the log EMISSION is throttled.
+        if time.time() % SKIP_LOG_INTERVAL_SECS < 120:
+            log(
+                f"skip: holding the {STALENESS_GRACE_SECS}s fm-coordinator head start "
+                "since the fm-deploy min-interval opened"
+            )
         return
 
     commit_epoch = _newest_fm_watched_commit_epoch()
