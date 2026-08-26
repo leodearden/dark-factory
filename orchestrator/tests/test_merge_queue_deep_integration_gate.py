@@ -221,6 +221,7 @@ from pathlib import Path
 from typing import Literal, TypedDict
 
 import pytest
+from shared.task_metadata import RetryLedger
 
 from orchestrator import merge_queue
 from orchestrator.config import GitConfig, MergeDeepConfig, OrchestratorConfig
@@ -786,6 +787,199 @@ def _canary_predicate_items_per(
         if isinstance(d.get('landed_via_chain'), int) and d['landed_via_chain'] >= 1
     ]
     return (sum(landed) / n_deep) if n_deep else None  # items landed per deep verify run
+
+
+# ── the TWO-WAY quiescence oracle (step-2) ───────────────────────────────────
+
+
+class _LadderClaim(TypedDict):
+    """The ``ladder=`` argument's shape: a ledger PAIR, before and after.
+
+    ``before`` is what was handed to workflow.py's ladder; ``after`` is what
+    the ladder returned once the round's REAL observable outputs were folded
+    through it (see ``_ladder_after``).  Row 8's claim is that a deep round
+    moves neither field, so the oracle compares the two rather than comparing
+    ``after`` against a hard-coded zero — a ladder that started mid-run (a
+    genuine sequential block earlier in the same scene) still has an unmoved
+    claim to make, and a literal would silently stop being one.
+    """
+
+    before: RetryLedger
+    after: RetryLedger
+
+
+def _assert_two_way_quiescent(
+    worker: SpeculativeMergeWorker,
+    main_sha: str,
+    requests: list[MergeRequest],
+    *,
+    permits_before: _PermitCensus | None = None,
+    ladder: _LadderClaim | None = None,
+) -> None:
+    """Assert the TWO-WAY quiescence contract holds for *worker*.
+
+    The gate's single oracle, called after EVERY round of every multi-round
+    scenario below.  It composes the six WORKER-side surfaces that
+    test_merge_queue_deep_landing.py::_assert_quiescent already checks (itself
+    a clone of test_merge_queue_invariant_integration_gate.py::_assert_quiescent
+    — this is the third clone; see the module PROVENANCE table) with the
+    CAS/LEDGER side, which is original here.
+
+    Each surface is listed with the way it can go SILENT, because a surface
+    that fails open is worth nothing in an oracle called eleven times.
+
+    GUARD CLAUSES (both self-tested in :class:`TestTwoWayOracleContract`)
+      * ``worker._running`` must be True.  ``speculation_accounting_violations``
+        and ``worktree_ledger_violations`` BOTH ``return []`` immediately on a
+        stopped worker — ``stop()`` over-releases both semaphores by depth+1 as
+        a shutdown safety valve, which would otherwise read as a spurious
+        violation — so an oracle that accepted a stopped worker would report
+        green over a genuinely leaking one.
+      * *main_sha* must be a REAL sha, never falsy and never the literal
+        ``'unknown'``.  ``two_layer_invariants`` gates its base-chain
+        (``check_frozen_prefix_invariant``) and verify-base sub-checks on
+        exactly that condition, leaving only the two graph-consistency checks
+        running for the sentinel.
+
+    WORKER SIDE
+      (a) every request in *requests* has resolved (done or cancelled) — no
+          dangling in-flight work left over from the round.  Goes silent only
+          if *requests* is empty, which is why every caller passes the scene's
+          whole request registry rather than the round's own items.
+      (b) ``speculation_accounting_violations() == []`` — I4 permit/cap
+          conservation.  Silent when not ``_running`` (guarded above).
+      (c) ``worktree_ledger_violations() == []`` — I6, the on-disk
+          ``_merge-*`` worktree ledger.  Silent when not ``_running`` (guarded
+          above), and additionally exempts trees younger than
+          ``RESOURCE_AUDIT_WORKTREE_GRACE_SECS`` by design.
+      (d) the request-liveness ledger is empty AFTER sweeping resolved
+          entries.  Resolution is detected PASSIVELY — RequestLedger has no
+          on-resolve hook, so a resolved request stays armed until
+          ``sweep_resolved()`` runs; calling it here before ``is_empty()`` is
+          required, not optional.
+      (e) ``two_layer_invariants(main_sha) == []`` — §5.3.  Partially silent
+          for the ``'unknown'`` sentinel (guarded above).
+      (f) ``set(worker._lifecycle.non_terminal_items()) == set()`` — the
+          ItemLifecycle registry has retired every request_id.  Placed after
+          the (d) sweep so it samples a truly-drained pipeline.
+
+    CAS/LEDGER SIDE
+      (g) *permits_before* (optional): both ledgers' ``live`` views are
+          compared as frozensets of TOKENS, not as counts.  ``SpecPermit`` and
+          ``CapPermit`` are ``eq=False`` dataclasses, so identity IS the
+          comparison: a round that released the dispatching head's token early
+          and acquired a replacement keeps every count plausible and breaks
+          only ownership.  Both endpoints are sampled AT REST, so the head's
+          own permit — taken and returned inside the round — is absent from
+          each; a head permit that SURVIVED the round shows up here as an
+          extra token.  The structural identity
+          ``slot_available + len(live) == depth`` is checked directly for both
+          ledgers as well, so this surface stays meaningful even if the
+          ``_running``-gated wrapper in (b) is ever loosened.
+      (h) *ladder* (optional): the workflow.py merge-thrash ladder must be
+          UNMOVED — ``consecutive_merge_thrash`` and
+          ``last_merge_outcome_signature`` byte-equal between the ledger handed
+          in and the ledger that came back out.  This is row 8's other half:
+          the merge-queue side proves event silence, and this proves the
+          silence reaches the consumer that 3003's signature class lives in.
+    """
+    # ── guard clauses: refuse the two inputs that would pass vacuously ───────
+    assert worker._running is True, (
+        f'_assert_two_way_quiescent requires a worker with _running=True, got '
+        f'{worker._running!r}: speculation_accounting_violations() and '
+        f'worktree_ledger_violations() BOTH short-circuit to [] on a stopped '
+        f'worker, so surfaces (b) and (c) would pass vacuously'
+    )
+    assert main_sha and main_sha != 'unknown', (
+        f'_assert_two_way_quiescent requires a REAL main_sha, got '
+        f'{main_sha!r}: two_layer_invariants silently skips its base-chain and '
+        f'verify-base sub-checks for a falsy or \'unknown\' sha, so surface '
+        f'(e) would pass vacuously'
+    )
+
+    # ── (a) every tracked request resolved ──────────────────────────────────
+    for req in requests:
+        assert req.result.done() or req.result.cancelled(), (
+            f'Expected request {req.request_id!r} (task {req.task_id!r}) to '
+            f'have resolved (done or cancelled) at quiescence, but it is '
+            f'still pending'
+        )
+
+    # ── (b) I4 permit/cap conservation ──────────────────────────────────────
+    spec_violations = worker.speculation_accounting_violations()
+    assert spec_violations == [], (
+        f'speculation_accounting_violations() non-empty at quiescence: '
+        f'{spec_violations!r}'
+    )
+
+    # ── (c) I6 on-disk worktree ledger ──────────────────────────────────────
+    wt_violations = worker.worktree_ledger_violations()
+    assert wt_violations == [], (
+        f'worktree_ledger_violations() non-empty at quiescence: {wt_violations!r}'
+    )
+
+    # ── (d) request-liveness ledger, swept first ────────────────────────────
+    worker._request_ledger.sweep_resolved()
+    assert worker._request_ledger.is_empty(), (
+        f'request-liveness ledger non-empty at quiescence: '
+        f'{worker._request_ledger.open_request_ids()!r}'
+    )
+
+    # ── (e) §5.3 two-layer invariants ───────────────────────────────────────
+    tli_violations = worker.two_layer_invariants(main_sha)
+    assert tli_violations == [], (
+        f'two_layer_invariants({main_sha!r}) non-empty at quiescence: '
+        f'{tli_violations!r}'
+    )
+
+    # ── (f) ItemLifecycle registry fully retired ────────────────────────────
+    registry_ids = set(worker._lifecycle.non_terminal_items())
+    assert registry_ids == set(), (
+        f'ItemLifecycle registry non-terminal at quiescence: {registry_ids!r}'
+    )
+
+    # ── (g) token-level permit census, both ledgers ─────────────────────────
+    if permits_before is not None:
+        after = _permit_census(worker)
+        assert after['spec_live'] == permits_before['spec_live'], (
+            f'spec_live moved across the run: '
+            f'gained {set(after["spec_live"]) - set(permits_before["spec_live"])!r}, '
+            f'lost {set(permits_before["spec_live"]) - set(after["spec_live"])!r}'
+        )
+        assert after['cap_live'] == permits_before['cap_live'], (
+            f'cap_live moved across the run: '
+            f'gained {set(after["cap_live"]) - set(permits_before["cap_live"])!r}, '
+            f'lost {set(permits_before["cap_live"]) - set(after["cap_live"])!r}'
+        )
+        assert after['spec_available'] + len(after['spec_live']) == after['spec_depth'], (
+            f'speculation identity broken at quiescence: '
+            f'{after["spec_available"]!r} + {len(after["spec_live"])!r} != '
+            f'{after["spec_depth"]!r}'
+        )
+        assert after['cap_available'] + len(after['cap_live']) == after['cap_depth'], (
+            f'merge-ahead-cap identity broken at quiescence: '
+            f'{after["cap_available"]!r} + {len(after["cap_live"])!r} != '
+            f'{after["cap_depth"]!r}'
+        )
+
+    # ── (h) the workflow.py merge-thrash ladder, unmoved ────────────────────
+    if ladder is not None:
+        before_l, after_l = ladder['before'], ladder['after']
+        assert (
+            after_l.consecutive_merge_thrash == before_l.consecutive_merge_thrash
+        ), (
+            f'consecutive_merge_thrash moved across the run: '
+            f'{before_l.consecutive_merge_thrash!r} -> '
+            f'{after_l.consecutive_merge_thrash!r}'
+        )
+        assert (
+            after_l.last_merge_outcome_signature
+            == before_l.last_merge_outcome_signature
+        ), (
+            f'last_merge_outcome_signature moved across the run: '
+            f'{before_l.last_merge_outcome_signature!r} -> '
+            f'{after_l.last_merge_outcome_signature!r}'
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
