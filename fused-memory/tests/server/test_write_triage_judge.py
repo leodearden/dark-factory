@@ -22,10 +22,12 @@ No test in this file needs an API key, a network, or Qdrant.
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import types
-from unittest.mock import Mock
+from dataclasses import dataclass
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 
@@ -41,6 +43,8 @@ from fused_memory.server.write_triage import (
     OUTCOME_STORED,
     TRIAGE_OUTCOMES,
     BandDecision,
+    TriageFailOpenCounter,
+    triage_write,
 )
 from fused_memory.server.write_triage_judge import (
     _DEFAULT_JUDGE_CANDIDATE_COUNT,
@@ -53,7 +57,9 @@ from fused_memory.server.write_triage_judge import (
     JUDGE_VERDICTS,
     VERDICT_KEY,
     JudgeOutputError,
+    _call_llm,
     build_judge_prompt,
+    judge_write,
     parse_judge_verdict,
     resolve_judge_candidate_count,
     resolve_judge_enabled,
@@ -779,3 +785,421 @@ class TestEveryResolverReadsLive:
         assert resolver(service) == first
         setattr(service.config.write_triage, attr, second)
         assert resolver(service) == second
+
+
+# ---------------------------------------------------------------------------
+# the async entry point
+# ---------------------------------------------------------------------------
+
+
+def _openai_client(content: str | None) -> MagicMock:
+    """A fake ``AsyncOpenAI`` yielding *content* as the message body.
+
+    Same construction shape as ``test_classifier.py::_make_mock_client`` — the
+    established openai double in this repo.
+    """
+    message = MagicMock()
+    message.content = content
+    choice = MagicMock()
+    choice.message = message
+    response = MagicMock()
+    response.choices = [choice]
+    client = MagicMock()
+    client.chat.completions.create = AsyncMock(return_value=response)
+    return client
+
+
+@dataclass
+class FakeAnthropicTextBlock:
+    """Fake Anthropic TextBlock.
+
+    A hand-rolled dataclass rather than a ``MagicMock``, copying
+    ``test_judge.py``: ``MagicMock`` treats ``.name`` specially, which makes
+    content blocks the one place a mock silently misbehaves.
+    """
+
+    type: str = 'text'
+    text: str = ''
+
+
+def _anthropic_client(blocks: list[FakeAnthropicTextBlock]) -> MagicMock:
+    """A fake ``AsyncAnthropic`` whose ``messages.create`` yields *blocks*."""
+    response = MagicMock()
+    response.content = blocks
+    client = MagicMock()
+    client.messages.create = AsyncMock(return_value=response)
+    return client
+
+
+def _judge_svc(provider: str = 'openai', **write_triage) -> types.SimpleNamespace:
+    """A service double configured for the judge, with an llm section."""
+    write_triage.setdefault('judge_provider', provider)
+    write_triage.setdefault('judge_model', 'test-model')
+    return _svc(
+        llm=types.SimpleNamespace(
+            provider=provider, model='inherited-model', providers=None,
+        ),
+        **write_triage,
+    )
+
+
+class TestJudgeWriteDecisionsThatAreNotFailures:
+    """Two paths answer `stored` WITHOUT raising, and they must not be counted.
+
+    Everything else in this module raises so `triage_write` can count exactly
+    one fail-open. These two are DECISIONS, not outages, and the boundary is
+    the same one `_stub_judge`'s docstring draws for leaf beta: counting them
+    would guarantee a storm escalation describing a failure that is not
+    happening, which trains an operator to ignore the alarm.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_disabled_judge_answers_stored_and_makes_no_call(self) -> None:
+        """The kill switch must not cost a round-trip, and must not raise."""
+        client = _openai_client(_payload('restates'))
+        with patch('openai.AsyncOpenAI', return_value=client):
+            verdict = await judge_write(
+                memory_service=_judge_svc(judge_enabled=False),
+                content='c',
+                project_id='p',
+                decision=_decision('m1'),
+                candidates=[_result('m1', 0.80)],
+            )
+        assert verdict == OUTCOME_STORED
+        client.chat.completions.create.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_an_empty_candidate_set_answers_stored_and_makes_no_call(self) -> None:
+        """Nothing to compare against — a call that cannot produce an attach is waste."""
+        client = _openai_client(_payload('restates'))
+        with patch('openai.AsyncOpenAI', return_value=client):
+            verdict = await judge_write(
+                memory_service=_judge_svc(),
+                content='c',
+                project_id='p',
+                decision=_decision(None),
+                candidates=[],
+            )
+        assert verdict == OUTCOME_STORED
+        client.chat.completions.create.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_wholly_uncomparable_slate_answers_stored(self) -> None:
+        """A slate of topic pins selects to empty, and takes the same path."""
+        client = _openai_client(_payload('restates'))
+        with patch('openai.AsyncOpenAI', return_value=client):
+            verdict = await judge_write(
+                memory_service=_judge_svc(),
+                content='c',
+                project_id='p',
+                decision=_decision('pin0'),
+                candidates=[_result('pin0', None, omit_store_score=True)],
+            )
+        assert verdict == OUTCOME_STORED
+        client.chat.completions.create.assert_not_awaited()
+
+
+class TestJudgeWriteOpenAIArm:
+    """The shipped arm: `llm.provider` is openai on this deployment."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('word', 'outcome'),
+        [
+            ('distinct', OUTCOME_STORED),
+            ('restates', OUTCOME_RESTATED),
+            ('amends', OUTCOME_AMENDED),
+            ('contests', OUTCOME_CONTESTED),
+        ],
+        ids=['distinct', 'restates', 'amends', 'contests'],
+    )
+    async def test_each_verdict_round_trips(self, word: str, outcome: str) -> None:
+        client = _openai_client(_payload(word))
+        with patch('openai.AsyncOpenAI', return_value=client):
+            verdict = await judge_write(
+                memory_service=_judge_svc(),
+                content='c',
+                project_id='p',
+                decision=_decision('m1'),
+                candidates=[_result('m1', 0.80)],
+            )
+        assert verdict == outcome
+
+    @pytest.mark.asyncio
+    async def test_the_call_is_made_once_with_the_resolved_shape(self) -> None:
+        """Deterministic, bounded, and JSON-forced — one call, no retry loop."""
+        client = _openai_client(_payload('amends'))
+        with patch('openai.AsyncOpenAI', return_value=client):
+            await judge_write(
+                memory_service=_judge_svc(judge_model='pinned-model'),
+                content='c',
+                project_id='p',
+                decision=_decision('m1'),
+                candidates=[_result('m1', 0.80)],
+            )
+        client.chat.completions.create.assert_awaited_once()
+        kwargs = client.chat.completions.create.call_args.kwargs
+        assert kwargs['model'] == 'pinned-model'
+        assert kwargs['temperature'] == 0.0
+        assert 0 < kwargs['max_tokens'] <= 256
+        assert kwargs['response_format'] == {'type': 'json_object'}
+        assert kwargs['messages'][0] == {
+            'role': 'system', 'content': JUDGE_SYSTEM_PROMPT,
+        }
+        assert kwargs['messages'][1]['role'] == 'user'
+
+    @pytest.mark.asyncio
+    async def test_at_most_the_configured_candidate_count_reaches_the_prompt(self) -> None:
+        """The width knob is only worth configuring if it reaches the wire."""
+        client = _openai_client(_payload('distinct'))
+        candidates = [_result(f'm{i}', 0.90 - i / 100) for i in range(9)]
+        with patch('openai.AsyncOpenAI', return_value=client):
+            await judge_write(
+                memory_service=_judge_svc(judge_candidate_count=3),
+                content='c',
+                project_id='p',
+                decision=_decision('m0'),
+                candidates=candidates,
+            )
+        rendered = client.chat.completions.create.call_args.kwargs['messages'][1]['content']
+        assert sum(1 for c in candidates if f'id: {c.id}\n' in rendered) == 3
+
+
+class TestJudgeWriteAnthropicArm:
+    """Implemented and selectable by config, for a deployment that has the key.
+
+    Unused here — ANTHROPIC_API_KEY is unset on this deployment (CLAUDE.md:
+    agents use OAuth) — so it is covered by construction rather than by the
+    eval, and "haiku-class" in the PRD is a cost/size class, not a vendor pin.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_verdict_round_trips_through_the_anthropic_arm(self) -> None:
+        client = _anthropic_client([FakeAnthropicTextBlock(text=_payload('contests'))])
+        with patch('anthropic.AsyncAnthropic', return_value=client):
+            verdict = await judge_write(
+                memory_service=_judge_svc('anthropic'),
+                content='c',
+                project_id='p',
+                decision=_decision('m1'),
+                candidates=[_result('m1', 0.80)],
+            )
+        assert verdict == OUTCOME_CONTESTED
+
+    @pytest.mark.asyncio
+    async def test_the_system_prompt_goes_via_the_system_parameter(self) -> None:
+        """Anthropic has no system ROLE — a system message would be a user turn."""
+        client = _anthropic_client([FakeAnthropicTextBlock(text=_payload('amends'))])
+        with patch('anthropic.AsyncAnthropic', return_value=client):
+            await judge_write(
+                memory_service=_judge_svc('anthropic', judge_model='pinned-model'),
+                content='c',
+                project_id='p',
+                decision=_decision('m1'),
+                candidates=[_result('m1', 0.80)],
+            )
+        kwargs = client.messages.create.call_args.kwargs
+        assert kwargs['system'] == JUDGE_SYSTEM_PROMPT
+        assert kwargs['model'] == 'pinned-model'
+        assert 0 < kwargs['max_tokens'] <= 256
+        assert [m['role'] for m in kwargs['messages']] == ['user']
+
+    @pytest.mark.asyncio
+    async def test_a_non_text_first_block_does_not_crash_the_read(self) -> None:
+        """A leading non-text block must not be read as the answer."""
+        client = _anthropic_client([
+            FakeAnthropicTextBlock(type='thinking', text=''),
+            FakeAnthropicTextBlock(text=_payload('restates')),
+        ])
+        with patch('anthropic.AsyncAnthropic', return_value=client):
+            verdict = await judge_write(
+                memory_service=_judge_svc('anthropic'),
+                content='c',
+                project_id='p',
+                decision=_decision('m1'),
+                candidates=[_result('m1', 0.80)],
+            )
+        assert verdict == OUTCOME_RESTATED
+
+
+class TestJudgeWriteFailuresRaise:
+    """Every failure PROPAGATES. `triage_write` owns the fail-open counting.
+
+    A judge that caught its own errors and returned `stored` would produce
+    the exact silent degradation INV-4 exists to prevent: every write during
+    an outage would look identical to "nothing matched", the counter would
+    never increment, and no storm escalation would ever fire.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_transport_error_propagates(self) -> None:
+        client = MagicMock()
+        client.chat.completions.create = AsyncMock(side_effect=RuntimeError('boom'))
+        with patch('openai.AsyncOpenAI', return_value=client), \
+                pytest.raises(RuntimeError):
+            await judge_write(
+                memory_service=_judge_svc(),
+                content='c', project_id='p',
+                decision=_decision('m1'), candidates=[_result('m1', 0.80)],
+            )
+
+    @pytest.mark.asyncio
+    async def test_a_hang_past_the_configured_timeout_raises(self) -> None:
+        """The timeout is NEW here and non-negotiable: the SDK default is 600s.
+
+        On the synchronous `add_memory` write path that is a wedge, not a
+        degradation. A TimeoutError propagates into `triage_write`'s fail-open
+        arm, which is exactly C1's "judge error/timeout => stored + storm
+        counter".
+        """
+        async def _hang(*_args, **_kwargs):
+            await asyncio.sleep(5)
+
+        client = MagicMock()
+        client.chat.completions.create = AsyncMock(side_effect=_hang)
+        with patch('openai.AsyncOpenAI', return_value=client), \
+                pytest.raises(TimeoutError):
+            await judge_write(
+                memory_service=_judge_svc(judge_timeout_seconds=0.01),
+                content='c', project_id='p',
+                decision=_decision('m1'), candidates=[_result('m1', 0.80)],
+            )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('body', 'label'),
+        [
+            ('I cannot answer that.', 'prose'),
+            (_payload('supersedes'), 'out-of-vocabulary'),
+            ('', 'empty-body'),
+            (None, 'null-body'),
+        ],
+        ids=['prose', 'out-of-vocabulary', 'empty-body', 'null-body'],
+    )
+    async def test_an_unusable_response_raises_judge_output_error(
+        self, body: str | None, label: str,
+    ) -> None:
+        client = _openai_client(body)
+        with patch('openai.AsyncOpenAI', return_value=client), \
+                pytest.raises(JudgeOutputError):
+            await judge_write(
+                memory_service=_judge_svc(),
+                content='c', project_id='p',
+                decision=_decision('m1'), candidates=[_result('m1', 0.80)],
+            )
+
+    @pytest.mark.asyncio
+    async def test_an_unresolvable_provider_raises_rather_than_guessing(self) -> None:
+        """Silently picking an arm would bill an account the operator did not choose.
+
+        Unreachable through `resolve_judge_provider`, which falls back — this
+        guards the fan-out itself, so a future caller passing a provider
+        directly cannot land on a silent default.
+        """
+        with pytest.raises(ValueError, match='provider'):
+            await _call_llm(
+                provider='gemini', model='m', prompt='p',
+                memory_service=_judge_svc(), timeout=1.0,
+            )
+
+
+class TestJudgeWriteInheritsBetasFailOpenApparatus:
+    """The INTEGRATION property, asserted directly rather than argued.
+
+    Gamma adds no second fail-open apparatus; it inherits beta's. So the thing
+    worth pinning is not "the judge raises" but what `triage_write` DOES with
+    a raising judge: exactly one counted fail-open, and an ack of `stored`.
+    """
+
+    @staticmethod
+    def _mid_band_service(**write_triage) -> types.SimpleNamespace:
+        """A service whose retrieval lands squarely in the middle band."""
+        service = _judge_svc(t_high=0.95, t_low=0.50, **write_triage)
+        service.search = AsyncMock(
+            return_value=SearchResults([_result('m1', 0.80)]),
+        )
+        return service
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('body', 'side_effect', 'label'),
+        [
+            (None, RuntimeError('transport down'), 'transport-error'),
+            ('I cannot answer that.', None, 'unparseable'),
+            ('', None, 'empty-body'),
+        ],
+        ids=['transport-error', 'unparseable', 'empty-body'],
+    )
+    async def test_a_broken_judge_stores_and_counts_exactly_once(
+        self, body: str | None, side_effect: Exception | None, label: str,
+    ) -> None:
+        counter = TriageFailOpenCounter()
+        service = self._mid_band_service()
+        client = _openai_client(body)
+        if side_effect is not None:
+            client.chat.completions.create = AsyncMock(side_effect=side_effect)
+
+        with patch('openai.AsyncOpenAI', return_value=client):
+            decision = await triage_write(
+                service, content='c', project_id='p',
+                counter=counter, judge=judge_write,
+            )
+
+        assert decision.outcome == OUTCOME_STORED, label
+        assert decision.canonical_id is None, label
+        assert counter.live_count() == 1, label
+
+    @pytest.mark.asyncio
+    async def test_a_timeout_stores_and_counts_exactly_once(self) -> None:
+        async def _hang(*_args, **_kwargs):
+            await asyncio.sleep(5)
+
+        counter = TriageFailOpenCounter()
+        service = self._mid_band_service(judge_timeout_seconds=0.01)
+        client = MagicMock()
+        client.chat.completions.create = AsyncMock(side_effect=_hang)
+
+        with patch('openai.AsyncOpenAI', return_value=client):
+            decision = await triage_write(
+                service, content='c', project_id='p',
+                counter=counter, judge=judge_write,
+            )
+
+        assert decision.outcome == OUTCOME_STORED
+        assert counter.live_count() == 1
+
+    @pytest.mark.asyncio
+    async def test_a_deliberately_disabled_judge_counts_zero(self) -> None:
+        """The boundary that keeps the alarm meaningful.
+
+        A disabled judge is not an outage. Counting it would make the first
+        ten middle-band writes after the 3169 flip fire a storm escalation
+        describing a failure that is not happening.
+        """
+        counter = TriageFailOpenCounter()
+        service = self._mid_band_service(judge_enabled=False)
+
+        decision = await triage_write(
+            service, content='c', project_id='p',
+            counter=counter, judge=judge_write,
+        )
+
+        assert decision.outcome == OUTCOME_STORED
+        assert counter.live_count() == 0
+
+    @pytest.mark.asyncio
+    async def test_a_healthy_judge_routes_and_counts_zero(self) -> None:
+        """The happy path end-to-end: a verdict becomes an ack, nothing counted."""
+        counter = TriageFailOpenCounter()
+        service = self._mid_band_service()
+        client = _openai_client(_payload('amends'))
+
+        with patch('openai.AsyncOpenAI', return_value=client):
+            decision = await triage_write(
+                service, content='c', project_id='p',
+                counter=counter, judge=judge_write,
+            )
+
+        assert decision.outcome == OUTCOME_AMENDED
+        assert decision.canonical_id == 'm1'
+        assert counter.live_count() == 0
