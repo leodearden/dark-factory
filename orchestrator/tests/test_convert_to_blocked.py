@@ -2064,7 +2064,11 @@ class TestAlreadyLandedLadderWithRealMarkBlocked:
         wf.escalation_queue = queue
         wf.event_store = None
         wf._try_narrow_plan = AsyncMock(return_value=False)
-        wf.scheduler.set_task_status = AsyncMock()
+        # Held as a LOCAL rather than read back off `wf.scheduler` at assert
+        # time: `TaskWorkflow.scheduler` is typed `Scheduler`, so pyright sees
+        # a bound method there and rejects `.await_args` on it.
+        set_status = AsyncMock()
+        wf.scheduler.set_task_status = set_status
         wf.scheduler.update_task = AsyncMock()
         # Not part of this ladder: the dry-run investigator is a merge_phase
         # =False side effect and would launch a real spawn against a spec'd
@@ -2072,7 +2076,7 @@ class TestAlreadyLandedLadderWithRealMarkBlocked:
         wf._spawn_dry_run_unblock = MagicMock()
         wf._ensure_steward_started = AsyncMock()
         wf._steward = None
-        return queue
+        return queue, set_status
 
     @staticmethod
     def _categories(queue, task_id: str = '2656') -> list[str]:
@@ -2091,7 +2095,7 @@ class TestAlreadyLandedLadderWithRealMarkBlocked:
         "the loop has no fuel" means.
         """
         wf = _make_workflow(tmp_path=tmp_path)
-        queue = self._wire_real(wf, tmp_path, monkeypatch)
+        queue, set_status = self._wire_real(wf, tmp_path, monkeypatch)
         TestSubmitToMergeQueueAlreadyLanded._stub_predicate(
             monkeypatch, TestSubmitToMergeQueueAlreadyLanded._landed(),
         )
@@ -2104,8 +2108,8 @@ class TestAlreadyLandedLadderWithRealMarkBlocked:
         cats = self._categories(queue)
         assert cats, 'the row must not be parked silently — a human is owed one'
         assert set(cats) == {'already_landed'}, cats
-        assert wf.scheduler.set_task_status.await_args is not None
-        assert wf.scheduler.set_task_status.await_args.args[1] == 'blocked'
+        assert set_status.await_args is not None
+        assert set_status.await_args.args[1] == 'blocked'
 
     async def test_the_l0_carries_the_operator_facing_action(
         self, tmp_path: Path, monkeypatch,
@@ -2118,7 +2122,7 @@ class TestAlreadyLandedLadderWithRealMarkBlocked:
         the behaviour this task exists to stop.
         """
         wf = _make_workflow(tmp_path=tmp_path)
-        queue = self._wire_real(wf, tmp_path, monkeypatch)
+        queue, _set_status = self._wire_real(wf, tmp_path, monkeypatch)
         TestSubmitToMergeQueueAlreadyLanded._stub_predicate(
             monkeypatch, TestSubmitToMergeQueueAlreadyLanded._landed(),
         )
@@ -2148,7 +2152,7 @@ class TestAlreadyLandedLadderWithRealMarkBlocked:
         from escalation.models import Escalation
 
         wf = _make_workflow(tmp_path=tmp_path)
-        queue = self._wire_real(wf, tmp_path, monkeypatch)
+        queue, _set_status = self._wire_real(wf, tmp_path, monkeypatch)
         queue.submit(Escalation(
             id=queue.make_id('2656'),
             task_id='2656',
