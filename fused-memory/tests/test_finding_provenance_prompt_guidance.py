@@ -28,18 +28,38 @@ The identifiers are single-sourced from the module constants and imported here
 rather than retyped, so a rename at the source cannot leave this test silently
 agreeing with itself. The cross-check against `parse_metadata` is what catches
 a rename to a spelling that is not blessed.
+
+TWO VOCABULARIES, NOT ONE
+-------------------------
+The keys above are TASK METADATA keys, cross-checked against `parse_metadata`.
+The relay hop that carries a finding from Stage 1 to Stage 2 uses a DIFFERENT
+vocabulary — the field names of the flagged item that
+`ReconReportState.get_assembled_report` projects — and it gets its own
+cross-check, an in-process round-trip through that projection. Collapsing the
+two is not hypothetical: the first shipped Stage-1 clause told Stage 1 to carry
+the METADATA key names as flagged-item fields, on a projection that has no
+passthrough, which made the whole Stage-1 half a silent no-op. Both
+cross-checks exist so that neither vocabulary can be asserted against nothing
+but itself.
 """
 
 from __future__ import annotations
 
+import re
+
 import pytest
 from shared.task_metadata import parse_metadata
 
-from fused_memory.reconciliation.cli_stage_runner import DISALLOW_TASK_WRITES
+from fused_memory.reconciliation.cli_stage_runner import (
+    DISALLOW_TASK_WRITES,
+    STAGE1_DISALLOWED,
+)
 from fused_memory.reconciliation.prompts import (
     FINDING_ID_METADATA_KEY,
     FINDING_MEMORY_IDS_METADATA_KEY,
     FINDING_PROVENANCE_VOCABULARY_RULE,
+    FLAGGED_ITEM_CITED_MEMORIES_FIELD,
+    FLAGGED_ITEM_FINDING_ID_FIELD,
     get_recon_report_tool_guidance,
     render_finding_provenance_section,
 )
@@ -49,6 +69,7 @@ from fused_memory.reconciliation.prompts.stage2 import (
     build_stage2_system_prompt,
 )
 from fused_memory.reconciliation.prompts.stage3 import STAGE3_SYSTEM_PROMPT
+from fused_memory.server.recon_report import ReconReportState
 
 _STAGE1_SECTION = render_finding_provenance_section(can_file_tasks=False)
 _STAGE2_SECTION = render_finding_provenance_section(can_file_tasks=True)
@@ -324,4 +345,178 @@ class TestCapabilitySplitOfTheActionableRule:
         assert key in _STAGE2_SECTION, (
             f'The can_file_tasks=True rendering must name {key!r} — it is the key '
             'Stage 2 is being told to set.'
+        )
+
+
+# The relay-channel field names, paired with the spelling
+# `ReconReportState.get_assembled_report` actually projects. Same discipline as
+# `_RATIFIED_SPELLINGS` above: the ONE place in this file these literals are
+# written down.
+_RELAY_FIELD_SPELLINGS = [
+    (FLAGGED_ITEM_FINDING_ID_FIELD, 'finding_id'),
+    (FLAGGED_ITEM_CITED_MEMORIES_FIELD, 'cited_memories'),
+]
+
+_RELAY_FIELD_IDS = ['flagged_finding_id', 'flagged_cited_memories']
+
+
+def _names_token(text: str, token: str) -> bool:
+    """True when *text* names *token* as a STANDALONE identifier.
+
+    A bare ``in`` is worthless for ``finding_id``: it is a substring of
+    ``source_finding_id``, so the shared provenance body would satisfy it
+    without the relay clause existing at all. The boundary form is borrowed
+    from `test_recon_report_guidance_drift.py`, which guards its tool tokens
+    the same way and for the same reason.
+    """
+    return re.search(rf'(?<![A-Za-z0-9_]){re.escape(token)}(?![A-Za-z0-9_])', text) is not None
+
+
+def _state_with_finding() -> tuple[ReconReportState, str, str]:
+    """(state, run_id, stage) — one started report holding one actionable finding.
+
+    Construction mirrors `tests/server/test_recon_report_hook_b.py`'s helper of
+    the same name, minus its `memory_service`: nothing here cites anything, and
+    `cited_memories` is projected unconditionally as `list(f.cited_memories)`,
+    so the FIELD is present on a finding with zero citations. That is precisely
+    the property under test — the field's existence, not its contents.
+    """
+    state = ReconReportState(ttl_seconds=300, clock=lambda: 0.0)
+    run_id, stage = 'run-1', 'reconciler'
+    state.start_report(run_id=run_id, stage=stage, project_id='dark_factory')
+    state.add_finding(
+        run_id=run_id,
+        severity='moderate',
+        category='systemic_pattern',
+        description='d',
+        suggested_action='a',
+        actionable=True,
+        task_id='42',
+        flag_type='orphaned_knowledge',
+    )
+    return state, run_id, stage
+
+
+class TestRelayChannelFieldNames:
+    """The Stage-1 → Stage-2 hop names fields that survive report assembly.
+
+    This class exists because the first shipped `can_file_tasks=False` clause
+    did NOT. It told Stage 1 to carry the finding id and memory ids "in the
+    `flagged_items` entry under those same two field names", justified by
+    "`flagged_items` entries are free-form objects" — and that justification is
+    false on the production path, which `test_the_projection_is_not_a_passthrough`
+    below now pins as an executable fact. `stages/base.py` overwrites
+    `stage_result.report` with `ReconReportState.get_assembled_report(...)`
+    whenever `recon_report_state` is wired (production always wires it), and
+    that projection builds each flagged item as a fixed field-by-field dict. So
+    every assertion the old clause could have satisfied was a prose assertion,
+    and the whole Stage-1 half was a silent no-op.
+
+    The structural guard that was missing is `test_both_relay_fields_are_real_projection_keys`:
+    an in-process round-trip that goes red if either field name the prompt
+    directs a stage to use stops being a key the assembler emits.
+    """
+
+    @pytest.mark.parametrize(
+        'constant, projected', _RELAY_FIELD_SPELLINGS, ids=_RELAY_FIELD_IDS
+    )
+    def test_constant_equals_projected_field_name(self, constant: str, projected: str):
+        """The relay vocabulary, written down once.
+
+        Kept separate from `_RATIFIED_SPELLINGS` deliberately: these are
+        flagged-item FIELD names, not task-metadata KEYS. The two hops carry
+        the same values under different names, and conflating them is the
+        defect this class was added to close.
+        """
+        assert constant == projected, (
+            f'The prompt names {constant!r} as a flagged-item field, but '
+            f'get_assembled_report projects it as {projected!r}.'
+        )
+
+    @pytest.mark.parametrize(
+        'constant, _projected', _RELAY_FIELD_SPELLINGS, ids=_RELAY_FIELD_IDS
+    )
+    def test_both_relay_fields_are_real_projection_keys(self, constant: str, _projected: str):
+        """THE drift-stopper — the assertion that would have caught the defect.
+
+        A real in-process round-trip: start a report, add a finding, assemble.
+        A prompt that directs a stage at a field the assembler does not emit is
+        a no-op instruction, and no prose pin can tell the difference. This can.
+        """
+        state, run_id, stage = _state_with_finding()
+        report = state.get_assembled_report(run_id, stage)
+        assert report is not None, 'get_assembled_report returned None for a started run'
+        item = report['flagged_items'][0]
+        assert constant in item, (
+            f'The prompts direct a stage to use the flagged-item field {constant!r}, '
+            f'but get_assembled_report projects only {sorted(item)}. An instruction '
+            'naming a field the assembler drops is a silent no-op.'
+        )
+
+    def test_the_projection_is_not_a_passthrough(self):
+        """The NEGATIVE half: there is no mechanism to attach an extra field.
+
+        `add_finding` takes no `**kwargs` at either layer, and the assembler
+        builds each flagged item as a fixed field-by-field dict. Pinning that
+        behaviourally is what stops a future author re-deriving the refuted
+        free-form-relay design from this suite — the two assertions above say
+        which fields ARE carried; this one says no others can be.
+
+        Deliberately NOT an assertion on the full projected key SET: that goes
+        red on any unrelated field addition, which is a legitimate change.
+        """
+        state, run_id, _stage = _state_with_finding()
+        with pytest.raises(TypeError):
+            state.add_finding(
+                run_id=run_id,
+                severity='moderate',
+                category='systemic_pattern',
+                description='d2',
+                suggested_action='a',
+                **{FINDING_ID_METADATA_KEY: 'f1'},
+            )
+
+    def test_stage1_holds_the_citation_tool_its_clause_names(self):
+        """Tool licensing for the corrected Stage-1 channel.
+
+        Memory ids reach Stage 2 ONLY via `cite_memory` — the relay clause is
+        inert without it — so naming it is load-bearing, and naming a tool
+        Stage 1 does not hold would be the licensing violation this package
+        forbids. Membership is checked against the imported `STAGE1_DISALLOWED`
+        rather than a hard-coded mirror, matching
+        `test_only_the_task_filing_branch_names_submit_task`.
+
+        (`cli_stage_runner.py` documents that the in-process
+        `mcp__recon-report__*` tools are intentionally in NO disallow list.)
+        """
+        qualified = 'mcp__recon-report__cite_memory'
+        assert qualified not in STAGE1_DISALLOWED, (
+            f'{qualified} is now in STAGE1_DISALLOWED — the relay clause names a tool '
+            'Stage 1 no longer holds, so the CHANNEL needs re-deciding, not this '
+            'assertion updating.'
+        )
+        assert qualified in _STAGE1_SECTION, (
+            f'The can_file_tasks=False rendering must name {qualified!r}: it is the '
+            'only way a finding\'s memory ids reach Stage 2, and a relay clause that '
+            'omits it leaves every relayed finding arriving with an empty list.'
+        )
+
+    @pytest.mark.parametrize(
+        'constant, _projected', _RELAY_FIELD_SPELLINGS, ids=_RELAY_FIELD_IDS
+    )
+    def test_both_renderings_name_both_relay_fields(self, constant: str, _projected: str):
+        """Producer side and reader side agree structurally, not by convention.
+
+        Stage 1 produces the flagged item; Stage 2 reads it and copies the two
+        values into task metadata. Both halves must name the same fields, or
+        the hop is two independent guesses that happen to line up today.
+        """
+        assert _names_token(_STAGE1_SECTION, constant), (
+            f'The can_file_tasks=False rendering must name the flagged-item field '
+            f'{constant!r} — it is the PRODUCER side of the relay.'
+        )
+        assert _names_token(_STAGE2_SECTION, constant), (
+            f'The can_file_tasks=True rendering must name the flagged-item field '
+            f'{constant!r} — it is the READER side, and it is where the value is '
+            'taken FROM.'
         )
