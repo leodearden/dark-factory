@@ -34,6 +34,7 @@ from shared.task_runtime_state import TaskRuntimeEntry, TaskRuntimeSnapshot
 from escalation import sweep as _sweep
 from escalation.action_effects import effect_for
 from escalation.authority import PROMOTE_ALLOWED, ROLE_LEVEL_ALLOWLIST, l2_auto_close_class
+from escalation.canonical import canonical_root_cause
 from escalation.dedupe import DedupeConfig
 from escalation.dedupe import submit_or_dedupe as _dedupe_submit_or_dedupe
 from escalation.models import (
@@ -404,18 +405,30 @@ CATEGORIES = [
 #
 # NEITHER OF THE TWO ADDED FIELDS IS BOUNDED IN PRINCIPLE, and this comment used
 # to claim they were "bounded by construction" — they are not.  ``promote_to_l2``
-# validates only that ``root_cause.strip()`` is non-empty, so an arbitrarily long
-# key rides every compact row, and ``member_ids`` grows with cluster size.  Both
-# are short in PRACTICE (a one-line dedup key; ~20-char ids), which is the actual
-# basis for including them.  Bounding them here was considered and REJECTED in
-# both available forms: truncating ``root_cause`` in the projection would
-# silently break the exact-match rebuild that is C1's entire point, and capping
-# it at mint would either fail a legitimate promote outright or collapse two
-# distinct keys into one L2 — over-folding, the very failure the amendment
+# validates only that ``root_cause`` is non-empty and canonicalises to something,
+# so an arbitrarily long key rides every compact row, and ``member_ids`` grows
+# with cluster size.  Both are short in PRACTICE (a one-line dedup key; ~20-char
+# ids), which is the actual basis for including them.  Bounding them here was
+# considered and REJECTED in both available forms: truncating ``root_cause`` in
+# the projection would silently break the C1 rebuild that is its entire point
+# (the key would no longer canonicalise to what the server matches on), and
+# capping it at mint would either fail a legitimate promote outright or collapse
+# two distinct keys into one L2 — over-folding, the very failure the amendment
 # storm report exists to surface.  The cost is real and named rather than
 # denied: every compact reader pays it, including the dashboard's
 # ``fetch_pins_recovery`` poll (dashboard/.../escalations.py), which asks for
 # ``compact=True`` on a loop and reads nothing but ``pins_recovery``.
+#
+# NO CANONICAL-FORM FIELD IS PROJECTED (task 3998), deliberately: matching moved
+# to the canonical form, but adding a second key would roughly double
+# root_cause's share of every compact row for no gain.  A client-side rebuild
+# should import ``escalation.canonical.canonical_root_cause`` — it is exported
+# publicly for exactly that — rather than reimplementing the transform; and
+# because the server now folds near-duplicates itself, a rebuild sees ONE row
+# where it used to see two.  A rebuild that keeps comparing raw strings is
+# strictly MORE conservative than the server (it re-promotes a near-duplicate,
+# the server folds it and answers ``status:'updated'``), so it stays correct.
+#
 # The triage-ack fields (triaged_at, triaged_by, triage_note, updated_at) are
 # included so a compact drain can decide stamp-then-skip without a per-record
 # get_escalation round-trip.
@@ -619,6 +632,31 @@ def _markup_residue_prose(record: dict[str, Any]) -> str:
         f'summary: {record.get("summary")!r}',
         f'suggested_action: {record.get("suggested_action")!r}',
     ])
+
+
+# INV-4 storm escape for root-cause OVER-FOLDING (task 3998).  Canonicalising
+# the pending-L2 lookup folds more promotes BY DESIGN, so its failure mode is
+# over-folding: distinct causes silently merged under one canonical key.  The
+# signature is a single L2 addressed by many mutually-DISTINCT pre-canonical
+# spellings, counted durably in `Escalation.root_cause_variants` (+ _truncated),
+# which stays the primary structured fact (INV-8); this is the notification.
+#
+# THRESHOLD CALIBRATED AGAINST MEASUREMENT, NOT TASTE: over the live queue
+# (data/escalations root + archive, 398 distinct non-empty root_cause keys,
+# measured 2026-08-19) there are ZERO canonical classes holding more than one
+# spelling.  Five distinct spellings of ONE canonical key is therefore far
+# outside the observed baseline.  It also sits well below
+# `queue._MAX_ROOT_CAUSE_VARIANTS` = 20, so the cap never decides whether the
+# alarm fires.
+_ROOT_CAUSE_OVERFOLD_VARIANT_THRESHOLD = 5
+
+# Synthetic anchor, for the same reason as _AMENDMENT_TRUNCATION_ANCHOR_TASK_ID:
+# the condition is system-scoped (is the MATCHING rule too loose?) and a burst
+# spans tasks, so attributing it to whichever promote crossed the threshold
+# would surface an unrelated infra record on that task and could land PENDING on
+# an already-terminal one (this helper bypasses the terminal-task chokepoint).
+# The affected L2 id is named in the summary and detail instead.
+_ROOT_CAUSE_OVERFOLD_ANCHOR_TASK_ID = 'l2-root-cause-overfold'
 
 
 # Task statuses from which a recovery/redispatch is still possible.  A record
@@ -1169,6 +1207,92 @@ def create_server(
         except Exception as e:  # pragma: no cover - defensive, never fatal
             logger.exception(
                 'amendment-truncation storm report failed for L2 %s (non-fatal): %s',
+                l2_id, e,
+            )
+
+    def _report_root_cause_overfold(l2_id: str, variants: int) -> None:
+        """File ONE info escalation when *l2_id* reaches the distinct-spelling threshold.
+
+        ``queue.add_members_to_l2`` already accumulates every DISTINCT
+        pre-canonical root_cause spelling on the record itself
+        (``root_cause_variants`` / ``root_cause_variants_truncated``).  Those
+        counters stay the PRIMARY structured fact — assertable from the record,
+        never by log-scrape (INV-8) — and this is the thresholded NOTIFICATION
+        layered on top, which is what INV-4 asks for: a hearer, at a threshold.
+
+        WHY A PER-RECORD CROSSING, NOT A ``StormCounter`` RATE (the one place
+        this deliberately diverges from ``_report_amendment_truncation_storm``,
+        which it otherwise copies line for line): the two conditions have
+        different shapes.  Truncation is an EVENT that bursts across many L2s, so
+        a rate-in-a-window counter fits it.  Over-folding is an ACCUMULATION on
+        ONE record — "this single cluster has now been addressed by five mutually
+        distinct spellings of one canonical key" — which a rate window would
+        either miss (slow accumulation) or spam (fast one).  Because the count is
+        monotone and increments by one, the caller's
+        ``variant_added and variants == THRESHOLD`` test fires exactly once per
+        L2 by construction, with no extra suppression state to keep.
+
+        WHY THE TRUNCATION REPORT DOES NOT ALREADY COVER THIS: it only fires once
+        an L2 has blown the 20-entry amendment cap, so it is deaf to an over-fold
+        at five or six distinct causes — exactly the range this one hears.
+
+        Fleet-wide burst control is still present and free: ``severity='info'`` /
+        ``category='infra_issue'`` routes through ``_submit_or_dedupe``, so a
+        hundred simultaneous crossings fold under ``summary_dedupe_key``'s
+        first-three-token key.  That is why the summary's LEADING tokens are kept
+        stable and the L2 id placed later in the string.
+
+        PURELY ADDITIVE, NEVER FATAL, like its neighbour: a dropped report costs
+        a notification; a raised one would cost the fold.
+        """
+        try:
+            _submit_or_dedupe(Escalation(
+                # Synthetic anchor, NOT the triggering promote's task_id — see
+                # _ROOT_CAUSE_OVERFOLD_ANCHOR_TASK_ID.
+                id=queue.make_id(_ROOT_CAUSE_OVERFOLD_ANCHOR_TASK_ID),
+                task_id=_ROOT_CAUSE_OVERFOLD_ANCHOR_TASK_ID,
+                agent_role='escalation-server',
+                # A report about matching precision is a notification, not a
+                # page: 'info' keeps it off the born-at-L2 human-direct route.
+                severity='info',
+                category='infra_issue',
+                # Leading tokens FIXED so a fleet-wide burst folds under one
+                # dedupe parent; the varying parts come after.
+                summary=(
+                    f'L2 root-cause over-fold suspected: {variants} distinct '
+                    f'root_cause spellings folded into one L2 ({l2_id})'
+                ),
+                detail=(
+                    f'OBSERVED: L2 escalation {l2_id} has now been addressed by '
+                    f'{variants} mutually DISTINCT pre-canonical root_cause '
+                    f'spellings that all canonicalise to the same key (threshold '
+                    f'{_ROOT_CAUSE_OVERFOLD_VARIANT_THRESHOLD}).\n'
+                    f'The spellings themselves are on the record in '
+                    f'`root_cause_variants`; the TRUE distinct total is '
+                    f'len(root_cause_variants) + root_cause_variants_truncated, '
+                    f'and the L2\'s own root_cause/detail/options/summary are '
+                    f'never touched by a fold.\n'
+                    f'MEASURED BASELINE: across the live queue (398 distinct '
+                    f'non-empty root_cause keys, 2026-08-19) ZERO canonical '
+                    f'classes hold more than one spelling, so this is far '
+                    f'outside the observed norm.\n'
+                    f'Hypothesis: root-cause canonicalisation is OVER-folding — '
+                    f'merging genuinely distinct causes under one canonical key '
+                    f'— rather than the same cause simply being re-spelled by '
+                    f'successive watcher rotations.'
+                ),
+                suggested_action=(
+                    f'Read {l2_id} and compare its `root_cause_variants` entries '
+                    'against each other: if they name genuinely different causes, '
+                    'the canonicalisation policy in escalation/canonical.py is '
+                    'too aggressive and the wrongly-merged members need splitting '
+                    'into separate L2s; if they are re-spellings of one cause, '
+                    'this is working as intended and the report can be dismissed.'
+                ),
+            ))
+        except Exception as e:  # pragma: no cover - defensive, never fatal
+            logger.exception(
+                'root-cause over-fold report failed for L2 %s (non-fatal): %s',
                 l2_id, e,
             )
 
@@ -1848,7 +1972,12 @@ def create_server(
         {root_cause of the pending L2s} u {their member_ids} across the returned
         rows, with NO session memory — previously that set could only be carried
         forward in-session, so a rotation re-promoted clusters it had already
-        promoted.
+        promoted.  Since task 3998 the SERVER matches root causes on their
+        CANONICAL form, so a client-side rebuild should compare
+        ``escalation.canonical.canonical_root_cause(row['root_cause'])`` rather
+        than raw strings; comparing raw is still safe, just more conservative
+        (it re-promotes a near-duplicate and the server folds it, answering
+        ``status:'updated'`` without creating anything).
 
         Use this from a long-running watcher to keep context small as the
         pending pile grows; fetch the full record for a specific id via
@@ -2116,7 +2245,17 @@ def create_server(
 
         **Root-cause dedup**: if a pending L2 with the same *root_cause* already
         exists, this call UPDATES that existing L2 (appends new members) rather
-        than filing a duplicate.  The response ``status`` distinguishes the two
+        than filing a duplicate.  "Same" means the same CANONICAL FORM, not the
+        same bytes (task 3998): two promotes describing one cause but spelled
+        differently — differing only in case, in whitespace runs or in
+        punctuation — now fold into the first instead of minting two decision
+        points for one incident.  Canonicalisation happens once, in
+        ``escalation.canonical.canonical_root_cause``, and only at COMPARE time:
+        the surviving record's own ``root_cause`` is never rewritten to the
+        canonical form.  Punctuation is treated as a SEPARATOR rather than
+        deleted, so keys whose identity lives in delimited segments
+        (``risk:3184`` vs ``risk:318:4``) stay distinct.  The response ``status``
+        distinguishes the two
         outcomes: ``'created'`` for a new L2, ``'updated'`` for an append.  An
         append RAISES the existing L2's severity when the incoming members (or
         an explicit *severity*) justify it, and never lowers it — an L2's
@@ -2157,8 +2296,16 @@ def create_server(
             Non-empty list of L1 escalation ids forming this cluster.
             Passing an empty list returns ``{'error': ...}``.
         root_cause:
-            Non-empty exact-string dedup key.  Whitespace-only input returns
-            ``{'error': ...}`` (mirrors ``find_pending_l2_by_root_cause``).
+            Non-empty dedup key, matched on its CANONICAL FORM (task 3998):
+            ``escalation.canonical.canonical_root_cause`` is the single
+            canonicalisation site, and near-duplicates differing only in case,
+            whitespace or punctuation therefore FOLD into the existing L2 rather
+            than minting a second decision point for one incident.  Input that
+            is whitespace-only — or whose canonical form is empty, i.e. a key of
+            pure punctuation like ``'::'`` — returns ``{'error': ...}`` (mirrors
+            ``find_pending_l2_by_root_cause``'s falsy-key guard, which is now on
+            the canonical form).  The record's own ``root_cause`` is stored and
+            displayed VERBATIM; the canonical form is never persisted.
         evidence:
             Supporting context — stored in the escalation's ``detail`` field.
         options:
@@ -2262,6 +2409,26 @@ def create_server(
             return {'error': 'member_ids must be a non-empty list'}
         if not root_cause.strip():
             return {'error': 'root_cause must be a non-empty string'}
+        # Stricter than `.strip()` since task 3998: matching is on the CANONICAL
+        # form, so a key made only of punctuation/symbols ('::', '--') is not a
+        # usable dedup key — it canonicalises to nothing and the dedup scan could
+        # never find the L2 again, so every subsequent promote would mint another
+        # one.  That is a silent, self-perpetuating duplicate source, which is the
+        # exact defect class this task exists to reduce; refusing at the boundary
+        # where the caller can still fix it is the loud-over-silent norm.
+        # Measured safe: 0 of the 398 distinct live root_cause keys canonicalise
+        # to empty, and `\w` is Unicode-aware so CJK and other non-Latin keys are
+        # unaffected.
+        if not canonical_root_cause(root_cause):
+            return {
+                'error': (
+                    f'root_cause {root_cause!r} canonicalises to the empty string '
+                    '(it carries no word characters, only punctuation/symbols), so '
+                    'no L2 filed under it could ever be found again by the '
+                    'root-cause dedup scan — every promote would mint another '
+                    'duplicate. Supply a key with at least one word character.'
+                ),
+            }
         if severity is not None and severity not in KNOWN_SEVERITIES:
             return {
                 'error': (
@@ -2315,7 +2482,10 @@ def create_server(
             # and was a real TOCTOU: the queue is built for cross-process
             # mutators, so a concurrent fold between the pre-read and the call
             # made the flag wrong in either direction.
-            outcome: AmendmentOutcome = {'recorded': False, 'dropped': 0}
+            outcome: AmendmentOutcome = {
+                'recorded': False, 'dropped': 0,
+                'variant_added': False, 'variants': 0,
+            }
             updated = queue.add_members_to_l2(
                 existing_id,
                 list(dict.fromkeys(member_ids)),
@@ -2338,6 +2508,15 @@ def create_server(
                 # report can never fail this fold.
                 if outcome['dropped']:
                     _report_amendment_truncation_storm(existing_id)
+                # INV-4 for the failure canonicalisation INTRODUCES: over-folding.
+                # Exactly-once per L2 by construction — `variants` is monotone
+                # and increments by one, so the equality can only hold on the
+                # single fold that crosses.  Never fatal, same as above.
+                if (
+                    outcome['variant_added']
+                    and outcome['variants'] == _ROOT_CAUSE_OVERFOLD_VARIANT_THRESHOLD
+                ):
+                    _report_root_cause_overfold(existing_id, outcome['variants'])
                 return {
                     'id': existing_id,
                     'status': 'updated',

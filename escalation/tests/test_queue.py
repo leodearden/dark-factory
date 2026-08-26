@@ -22,6 +22,7 @@ from escalation.queue import (
     _MAX_AMENDMENT_LINE_CHARS,
     _MAX_AMENDMENT_OPTIONS,
     _MAX_AMENDMENTS,
+    _MAX_ROOT_CAUSE_VARIANTS,
     AmendmentOutcome,
     EscalationQueue,
     iter_all_escalation_paths,
@@ -2626,6 +2627,171 @@ class TestFindPendingL2ByRootCause:
             f"got caplog.records: {[(r.levelname, r.message) for r in caplog.records]}"
         )
 
+    # ------------------------------------------------------------------
+    # Canonical-form matching (task 3998).  The match used to be stripped
+    # EXACT-string equality, so an L2 filed as 'Watcher lease stolen.' and a
+    # re-promote spelled 'watcher  lease STOLEN' minted two L2s for one cause.
+    # ------------------------------------------------------------------
+
+    def test_root_cause_match_is_canonicalised(self, tmp_path: Path):
+        """THE PIN: case, whitespace runs and trailing punctuation all fold.
+
+        PRD boundary row B4.  This is the capability the task delivers: the
+        stored key and the query differ in case, in internal whitespace and in a
+        trailing '.', and the lookup must still route the re-promote to the
+        existing L2 instead of minting a near-duplicate.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2(queue, 'task-1', 'Watcher lease stolen.')
+
+        result = queue.find_pending_l2_by_root_cause('watcher  lease STOLEN')
+
+        assert result == l2.id, (
+            f'Expected the canonically-equal query to find {l2.id!r}; got {result!r}'
+        )
+
+    def test_punctuation_is_a_separator_at_the_match_site(self, tmp_path: Path):
+        """A delimiter-dense key folds onto its space-separated spelling."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2(queue, 'task-1', 'starvation:2370:persistent-lock-contention')
+
+        result = queue.find_pending_l2_by_root_cause(
+            'Starvation 2370 persistent lock contention'
+        )
+
+        assert result == l2.id, f'Expected {l2.id!r}; got {result!r}'
+
+    def test_canonically_distinct_keys_still_miss(self, tmp_path: Path):
+        """The CONSERVATIVE direction — the regression guard against deletion semantics.
+
+        Under DELETION semantics (``a.b`` -> ``ab``) these two keys collapse into
+        one and two distinct incidents are silently absorbed into a single L2.
+        69% of live root_cause keys carry a digit adjacent to a separator, so
+        this is the common shape, not a corner case.  An under-fold leaves a
+        noisy but safe duplicate; an over-fold is silent.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        self._make_l2(queue, 'task-1', 'risk:3184')
+
+        assert queue.find_pending_l2_by_root_cause('risk:318:4') is None
+
+        queue2 = EscalationQueue(tmp_path / 'esc2')
+        self._make_l2(queue2, 'task-2', 'curator-failure:account-cap-2026-08-05')
+
+        assert queue2.find_pending_l2_by_root_cause(
+            'curator-failure:account-cap-2026-0-805'
+        ) is None
+
+    @pytest.mark.parametrize('query', ['::', '--', '  :  ', '!!!'])
+    def test_query_with_empty_canonical_form_never_matches(
+        self, tmp_path: Path, query: str,
+    ):
+        """The falsy-key guard now applies to the CANONICAL form, not `.strip()`.
+
+        `'::'` survives `.strip()` but carries no identity at all, so it must not
+        be used as a lookup key against a real L2.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        self._make_l2(queue, 'task-1', 'Bad merge strategy')
+
+        assert queue.find_pending_l2_by_root_cause(query) is None
+
+    @pytest.mark.parametrize('query', ['::', '--', 'Bad merge strategy', ''])
+    def test_stored_key_with_empty_canonical_form_is_never_matched(
+        self, tmp_path: Path, query: str,
+    ):
+        """The guard is symmetric: a stored all-punctuation key matches nothing.
+
+        Such an L2 is unfoldable by construction, which is why the server refuses
+        to mint one in the first place (see promote_to_l2's mint validation).
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        self._make_l2(queue, 'task-1', '::')
+
+        assert queue.find_pending_l2_by_root_cause(query) is None
+
+    def test_oldest_wins_across_canonically_equal_spellings(self, tmp_path: Path):
+        """Oldest-wins still holds when the matches are canonical, not exact.
+
+        Two pending L2s carrying textually-DIFFERENT but canonically-EQUAL keys
+        must resolve to the older one, exactly as two exact-key twins do — the
+        tie-break is unchanged by canonicalisation.
+        """
+        import time
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        older = self._make_l2(queue, 'task-1', 'Watcher lease stolen.')
+        time.sleep(0.01)  # ensure distinct timestamps
+        newer = self._make_l2(queue, 'task-2', 'watcher  lease STOLEN')
+
+        result = queue.find_pending_l2_by_root_cause('WATCHER-LEASE-STOLEN')
+
+        assert result == older.id, (
+            f'Expected oldest id={older.id!r}, got {result!r} (newer={newer.id!r})'
+        )
+
+    def test_l0_l1_with_canonically_matching_root_cause_still_excluded(
+        self, tmp_path: Path,
+    ):
+        """The level==2 filter is unchanged — canonicalisation must not widen it."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        for level, role in ((0, 'implementer'), (1, 'steward')):
+            esc = Escalation(
+                id=queue.make_id(f'task-{level}'),
+                task_id=f'task-{level}',
+                agent_role=role,
+                severity='blocking',
+                category='design_concern',
+                summary=f'L{level} test',
+                level=level,
+                root_cause='Watcher lease stolen.',
+            )
+            queue.submit(esc)
+
+        result = queue.find_pending_l2_by_root_cause('watcher  lease STOLEN')
+
+        assert result is None, f'Expected None (level filter), got {result!r}'
+
+    def test_corrupt_timestamp_warning_fires_on_a_canonical_match(
+        self, tmp_path: Path, caplog,
+    ):
+        """The malformed-timestamp WARNING path survives the switch to canonical matching.
+
+        The parse happens only for entries that MATCHED, so a match found
+        canonically rather than exactly must still reach it — otherwise the
+        data-quality signal would silently vanish for exactly the folds this task
+        adds.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = Escalation(
+            id=queue.make_id('task-99'),
+            task_id='task-99',
+            agent_role='escalation-watcher-auto',
+            severity='blocking',
+            category='design_concern',
+            summary='L2 cluster corrupt-ts canonical test',
+            level=2,
+            root_cause='Watcher lease stolen.',
+        )
+        l2.timestamp = 'not-a-timestamp'
+        queue.submit(l2)
+
+        with caplog.at_level(logging.WARNING, logger='shared.timestamps'):
+            result = queue.find_pending_l2_by_root_cause('watcher  lease STOLEN')
+
+        assert result == l2.id, (
+            f'Expected corrupt-ts L2 to still be returned; got result={result!r}'
+        )
+        warning_records = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING
+            and 'queue.find_pending_l2_by_root_cause' in r.message
+        ]
+        assert warning_records, (
+            f"Expected >=1 WARNING mentioning 'queue.find_pending_l2_by_root_cause'; "
+            f"got caplog.records: {[(r.levelname, r.message) for r in caplog.records]}"
+        )
+
 
 class TestAddMembersToL2:
     """EscalationQueue.add_members_to_l2() appends member ids to a pending L2."""
@@ -3197,25 +3363,40 @@ class TestAddMembersToL2:
         l2 = self._framed_l2(queue)
 
         def fresh() -> AmendmentOutcome:
-            return {'recorded': False, 'dropped': 0}
+            # Deliberately seeded with WRONG values on every key, so "filled on
+            # every return path" is actually tested rather than assumed.
+            return {
+                'recorded': True, 'dropped': 9, 'variant_added': True, 'variants': 99,
+            }
 
-        # (a) NOT FOUND — filled, not left missing, so the caller can read it
-        # without guarding.
+        def amendment_facts(outcome: AmendmentOutcome) -> dict[str, object]:
+            """Just the amendment half — the variant half has its own suite."""
+            return {'recorded': outcome['recorded'], 'dropped': outcome['dropped']}
+
+        # (a) NOT FOUND — EVERY key filled, not left missing, so the caller can
+        # read any of them without guarding.
         missing = fresh()
         assert queue.add_members_to_l2(
             'esc-does-not-exist', ['esc-l1-9'], outcome=missing,
         ) is None
-        assert missing == {'recorded': False, 'dropped': 0}
+        assert missing == {
+            'recorded': False, 'dropped': 0, 'variant_added': False, 'variants': 0,
+        }
 
         # (b) NO-OP early return (no members, no floor, no framing).
         noop = fresh()
         queue.add_members_to_l2(l2.id, [], outcome=noop)
-        assert noop == {'recorded': False, 'dropped': 0}
+        assert noop == {
+            'recorded': False, 'dropped': 0, 'variant_added': False, 'variants': 0,
+        }
 
-        # (c) a bare member append records nothing.
+        # (c) a bare member append records nothing — and carries no spelling, so
+        # it seeds no variant either.
         bare = fresh()
         queue.add_members_to_l2(l2.id, ['esc-l1-1'], outcome=bare)
-        assert bare == {'recorded': False, 'dropped': 0}
+        assert bare == {
+            'recorded': False, 'dropped': 0, 'variant_added': False, 'variants': 0,
+        }
 
         # (d) framing recorded, nothing shed.  One definition of the framing
         # text, used by both this call and the repeat below, so (e) is a true
@@ -3230,12 +3411,12 @@ class TestAddMembersToL2:
 
         recorded = fresh()
         fold(recorded)
-        assert recorded == {'recorded': True, 'dropped': 0}
+        assert amendment_facts(recorded) == {'recorded': True, 'dropped': 0}
 
         # (e) a framing-identical repeat is suppressed — and says so.
         repeat = fresh()
         fold(repeat)
-        assert repeat == {'recorded': False, 'dropped': 0}, (
+        assert amendment_facts(repeat) == {'recorded': False, 'dropped': 0}, (
             'a suppressed repeat must not report a write'
         )
 
@@ -3250,7 +3431,7 @@ class TestAddMembersToL2:
             l2.id, [], outcome=truncating,
             root_cause='one past the cap', evidence='overflow evidence',
         )
-        assert truncating == {'recorded': True, 'dropped': 1}, (
+        assert amendment_facts(truncating) == {'recorded': True, 'dropped': 1}, (
             f'a truncating append must report both facts, got {truncating}'
         )
         capped = queue.get(l2.id)
@@ -5172,4 +5353,315 @@ class TestAddMembersToL2SeverityFloor:
         assert warned, (
             'Expected a WARNING naming the unrecognised severity; got: '
             f'{[r.getMessage() for r in caplog.records]}'
+        )
+
+
+class TestAddMembersToL2RootCauseVariants:
+    """`root_cause_variants` — the distinct PRE-canonical spellings a cluster folded (task 3998).
+
+    Canonicalising the root-cause match makes MORE promotes fold by design, so
+    the failure it introduces is OVER-folding: distinct causes silently merged
+    under one canonical key.  The only observable signature is the set of
+    mutually-distinct spellings one L2 has been addressed by, which is what
+    `add_members_to_l2` — the SOLE writer — accumulates here.
+    """
+
+    def _make_l2(
+        self, queue: EscalationQueue, task_id: str = 'task-1',
+        root_cause: str = 'Watcher lease stolen.',
+    ) -> Escalation:
+        esc = Escalation(
+            id=queue.make_id(task_id),
+            task_id=task_id,
+            agent_role='escalation-watcher-auto',
+            severity='blocking',
+            category='design_concern',
+            summary='L2 cluster',
+            level=2,
+            root_cause=root_cause,
+            members=['esc-l1-0'],
+        )
+        queue.submit(esc)
+        return esc
+
+    def test_first_fold_seeds_the_records_own_spelling_then_appends(self, tmp_path: Path):
+        """(a) The record's OWN spelling is seeded first, then the incoming one.
+
+        Seeding matters: the distinct count must reflect every spelling the
+        cluster has EVER been addressed by, not only the post-mint ones —
+        otherwise the first fold reads as "1 variant" when two distinct spellings
+        have already reached this L2.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2(queue)
+
+        queue.add_members_to_l2(l2.id, ['esc-l1-1'], root_cause='watcher  lease STOLEN')
+
+        record = queue.get(l2.id)
+        assert record is not None
+        assert record.root_cause_variants == [
+            'Watcher lease stolen.', 'watcher  lease STOLEN',
+        ], f'expected own-then-incoming, got {record.root_cause_variants!r}'
+        assert record.root_cause_variants_truncated == 0
+
+    def test_byte_identical_respelling_adds_nothing_and_does_not_bump_updated_at(
+        self, tmp_path: Path,
+    ):
+        """(b) A repeat of an already-listed spelling is not a new variant.
+
+        It must also not manufacture a spurious `updated_at` bump, which would
+        re-trigger the watcher's re-assess protocol on a true no-op.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2(queue)
+        queue.add_members_to_l2(l2.id, ['esc-l1-1'], root_cause='watcher  lease STOLEN')
+        before = queue.get(l2.id)
+        assert before is not None
+
+        # Same members, same spelling — nothing new on any axis.
+        queue.add_members_to_l2(l2.id, ['esc-l1-1'], root_cause='watcher  lease STOLEN')
+
+        after = queue.get(l2.id)
+        assert after is not None
+        assert after.root_cause_variants == before.root_cause_variants, (
+            f'a repeated spelling must not be listed twice: {after.root_cause_variants!r}'
+        )
+        assert after.updated_at == before.updated_at, (
+            f'no-op fold must not bump updated_at: '
+            f'{before.updated_at!r} -> {after.updated_at!r}'
+        )
+
+    def test_two_spellings_of_one_canonical_key_produce_two_variants(
+        self, tmp_path: Path,
+    ):
+        """(c) THE POINT: canonically-equal spellings are separately recorded.
+
+        The match folded them together; the pre-canonical spellings are the only
+        evidence that the fold happened at all.
+        """
+        from escalation.canonical import canonical_root_cause
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2(queue)
+
+        queue.add_members_to_l2(l2.id, ['esc-l1-1'], root_cause='watcher  lease STOLEN')
+        queue.add_members_to_l2(l2.id, ['esc-l1-2'], root_cause='WATCHER-LEASE-STOLEN')
+
+        record = queue.get(l2.id)
+        assert record is not None
+        # All three canonicalise to ONE key — that is exactly why they must be
+        # kept apart on the record.
+        canonical = {canonical_root_cause(v) for v in record.root_cause_variants}
+        assert len(canonical) == 1, f'expected one canonical class, got {canonical!r}'
+        assert len(record.root_cause_variants) == 3, (
+            f'expected 3 distinct spellings, got {record.root_cause_variants!r}'
+        )
+
+    def test_framing_free_fold_touches_neither_field(self, tmp_path: Path):
+        """(d) A plain member append carries no spelling and records none."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2(queue)
+
+        queue.add_members_to_l2(l2.id, ['esc-l1-1'])
+
+        record = queue.get(l2.id)
+        assert record is not None
+        assert record.root_cause_variants == [], (
+            f'a framing-free fold must not seed variants: {record.root_cause_variants!r}'
+        )
+        assert record.root_cause_variants_truncated == 0
+
+    def test_cap_sheds_oldest_and_counts_every_drop(self, tmp_path: Path):
+        """(e) Oldest-shed at `_MAX_ROOT_CAUSE_VARIANTS`, each drop counted durably.
+
+        The TRUE distinct count stays `len(variants) + truncated`, so the loss is
+        a structured fact on the record rather than log-only (INV-8).
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2(queue)
+
+        overshoot = 5
+        total_spellings = _MAX_ROOT_CAUSE_VARIANTS + overshoot
+        # -1 because the record's own spelling is seeded by the first fold.
+        for i in range(total_spellings - 1):
+            queue.add_members_to_l2(l2.id, [f'esc-l1-{i}'], root_cause=f'cause number {i}')
+
+        record = queue.get(l2.id)
+        assert record is not None
+        assert len(record.root_cause_variants) == _MAX_ROOT_CAUSE_VARIANTS, (
+            f'list must be capped, got {len(record.root_cause_variants)}'
+        )
+        assert record.root_cause_variants_truncated == overshoot, (
+            f'expected {overshoot} drops counted, got {record.root_cause_variants_truncated}'
+        )
+        assert (
+            len(record.root_cause_variants) + record.root_cause_variants_truncated
+            == total_spellings
+        ), 'the true distinct count must stay recoverable from the record'
+        # OLDEST shed: the record's own seeded spelling is the first to go.
+        assert 'Watcher lease stolen.' not in record.root_cause_variants
+        assert f'cause number {total_spellings - 2}' in record.root_cause_variants, (
+            'the most recent spelling must survive'
+        )
+
+    def test_long_spelling_is_elided_with_the_in_band_marker(self, tmp_path: Path):
+        """(e cont.) Each stored spelling is capped by the existing `_elide` helper."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2(queue)
+        long_cause = 'x' * (_MAX_AMENDMENT_LINE_CHARS + 250)
+
+        queue.add_members_to_l2(l2.id, ['esc-l1-1'], root_cause=long_cause)
+
+        record = queue.get(l2.id)
+        assert record is not None
+        stored = record.root_cause_variants[-1]
+        assert stored != long_cause, 'an over-long spelling must be elided'
+        assert stored.startswith('x' * _MAX_AMENDMENT_LINE_CHARS)
+        assert 'elided' in stored, (
+            f'elision must be MARKED IN-BAND, not silent: {stored[-120:]!r}'
+        )
+
+    def test_outcome_reports_variant_facts_on_every_return_path(self, tmp_path: Path):
+        """(f) `variant_added` / `variants` are complete on every return, like recorded/dropped.
+
+        Reported from INSIDE `escalation_id_lock` where they are already
+        computed — a caller re-deriving them from a pre-read would be wrong in
+        both directions under the cross-process folds this queue is built for.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2(queue)
+
+        # (i) NOT-FOUND early return — every key still present.
+        missing: AmendmentOutcome = {
+            'recorded': True, 'dropped': 9, 'variant_added': True, 'variants': 99,
+        }
+        assert queue.add_members_to_l2('esc-nope-1', ['x'], outcome=missing) is None
+        assert missing['variant_added'] is False, f'not-found must reset: {missing}'
+        assert missing['variants'] == 0, f'not-found must reset: {missing}'
+
+        # (ii) NO-OP early return (no members, no floor, no framing).
+        noop: AmendmentOutcome = {
+            'recorded': True, 'dropped': 9, 'variant_added': True, 'variants': 99,
+        }
+        assert queue.add_members_to_l2(l2.id, [], outcome=noop) is not None
+        assert noop['variant_added'] is False, f'no-op must reset: {noop}'
+        assert noop['variants'] == 0, f'no-op must reset: {noop}'
+
+        # (iii) a real variant-adding fold.
+        first: AmendmentOutcome = {
+            'recorded': False, 'dropped': 0, 'variant_added': False, 'variants': 0,
+        }
+        queue.add_members_to_l2(
+            l2.id, ['esc-l1-1'], root_cause='watcher  lease STOLEN', outcome=first,
+        )
+        assert first['variant_added'] is True, f'expected a new variant: {first}'
+        assert first['variants'] == 2, (
+            f'own spelling + incoming = 2 distinct: {first}'
+        )
+
+        # (iv) a REPEAT fold adds nothing but still reports the running total.
+        repeat: AmendmentOutcome = {
+            'recorded': False, 'dropped': 0, 'variant_added': True, 'variants': 0,
+        }
+        queue.add_members_to_l2(
+            l2.id, ['esc-l1-1'], root_cause='watcher  lease STOLEN', outcome=repeat,
+        )
+        assert repeat['variant_added'] is False, f'a repeat adds no variant: {repeat}'
+        assert repeat['variants'] == 2, (
+            f'the running DISTINCT total is still reported: {repeat}'
+        )
+
+    def test_variants_count_includes_truncated_drops(self, tmp_path: Path):
+        """(f cont.) `variants` is the TRUE distinct total, not just the list length.
+
+        Past the cap the list stops growing, so reporting `len(list)` would make
+        the over-fold signal plateau exactly when it matters most.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2(queue)
+        for i in range(_MAX_ROOT_CAUSE_VARIANTS + 2):
+            queue.add_members_to_l2(l2.id, [f'esc-l1-{i}'], root_cause=f'cause number {i}')
+
+        outcome: AmendmentOutcome = {
+            'recorded': False, 'dropped': 0, 'variant_added': False, 'variants': 0,
+        }
+        queue.add_members_to_l2(
+            l2.id, ['esc-l1-last'], root_cause='a brand new spelling', outcome=outcome,
+        )
+
+        record = queue.get(l2.id)
+        assert record is not None
+        assert outcome['variants'] == (
+            len(record.root_cause_variants) + record.root_cause_variants_truncated
+        ), f'reported total must match the record: {outcome}'
+        assert outcome['variants'] > _MAX_ROOT_CAUSE_VARIANTS, (
+            f'the count must keep climbing past the cap: {outcome}'
+        )
+
+
+class TestAddMembersToL2VariantConcurrency:
+    """Two-OS-process test: concurrent variant-carrying folds must lose no spelling."""
+
+    @pytest.mark.timeout(30)
+    def test_concurrent_variant_folds_preserve_the_union(self, tmp_path: Path):
+        """Variants accumulate inside the SAME `escalation_id_lock` as members.
+
+        Without that, each process reads the same pre-mutation snapshot and the
+        second write clobbers the first's spelling — and the over-fold signal
+        would silently under-count exactly under the concurrent load that makes
+        an over-fold likely.
+        """
+        queue_dir = tmp_path / 'queue'
+        queue = EscalationQueue(queue_dir)
+        l2 = Escalation(
+            id=queue.make_id('task-1'),
+            task_id='task-1',
+            agent_role='escalation-watcher-auto',
+            severity='info',
+            category='design_concern',
+            summary='Concurrent variant test',
+            level=2,
+            root_cause='seeded spelling',
+            members=[],
+        )
+        queue.submit(l2)
+
+        env = os.environ.copy()
+        src_path = str(Path(__file__).parent.parent / 'src')
+        existing = env.get('PYTHONPATH', '')
+        env['PYTHONPATH'] = f'{src_path}:{existing}' if existing else src_path
+
+        # Kept well under the cap so the assertion is about the LOCK, not the
+        # trimmer: 2*count + 1 seeded spelling must all fit.
+        count = (_MAX_ROOT_CAUSE_VARIANTS - 1) // 2
+        child_args = [sys.executable, str(_CHILD_SCRIPT), str(queue_dir)]
+        proc_a = subprocess.Popen(
+            child_args + ['add_members_with_variant', l2.id, 'a', str(count)], env=env,
+        )
+        proc_b = subprocess.Popen(
+            child_args + ['add_members_with_variant', l2.id, 'b', str(count)], env=env,
+        )
+        rc_a = rc_b = None
+        try:
+            rc_a = proc_a.wait(timeout=25)
+            rc_b = proc_b.wait(timeout=25)
+        finally:
+            for proc in (proc_a, proc_b):
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
+        assert rc_a == 0, f'Child process A exited with rc={rc_a}'
+        assert rc_b == 0, f'Child process B exited with rc={rc_b}'
+
+        record = queue.get(l2.id)
+        assert record is not None
+        assert record.root_cause_variants_truncated == 0, (
+            'this scenario must stay under the cap so it tests the lock'
+        )
+        expected = {'seeded spelling'} | {
+            f'cause {prefix} {i}' for prefix in ('a', 'b') for i in range(count)
+        }
+        assert set(record.root_cause_variants) == expected, (
+            'concurrent folds lost spellings — missing: '
+            f'{sorted(expected - set(record.root_cause_variants))}'
         )

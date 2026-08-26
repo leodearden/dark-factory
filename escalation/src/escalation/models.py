@@ -10,7 +10,11 @@ All other escalations start at L0 (level=0) and are promoted by handlers.
 
 L2 cluster fields (default-empty; L0/L1 are unaffected):
   members:    list of member L1 escalation ids forming this cluster
-  root_cause: exact-string dedup key for pending-L2 lookup
+  root_cause: dedup key for pending-L2 lookup, matched on its CANONICAL form
+              (`escalation.canonical.canonical_root_cause`; task 3998), so
+              near-duplicates differing only in case/whitespace/punctuation fold.
+              Stored and displayed VERBATIM — the canonical form is a
+              compare-time value and is never persisted.
   options:    proposed resolution options (e.g. ['A: rollback', 'B: fix forward'])
 
 Structured-evidence field (default-empty; task 2558):
@@ -34,6 +38,24 @@ Incoming-framing amendments (default-empty; task 3997):
               text, so the two counters together are what make the list's size
               envelope assertable from the record.
   SOLE WRITER: `queue.add_members_to_l2`.
+
+Over-fold evidence (default-empty; task 3998):
+  root_cause_variants:
+              the DISTINCT PRE-CANONICAL root_cause spellings that have folded
+              into this L2, the record's own spelling seeded first.
+              Canonicalising the match makes more promotes fold BY DESIGN, so
+              its failure mode is OVER-folding — distinct causes silently merged
+              under one canonical key — and this set is that failure's only
+              observable signature.  NOT derivable from `amendments`, which
+              sheds its oldest at the cap and would therefore under-report
+              precisely during the runaway the count exists to catch.
+  root_cause_variants_truncated:
+              count of oldest spellings shed to the
+              `queue._MAX_ROOT_CAUSE_VARIANTS` cap.  The TRUE distinct count is
+              `len(root_cause_variants) + root_cause_variants_truncated`, so the
+              loss stays assertable from the record rather than only by
+              log-scrape.
+  SOLE WRITER: `queue.add_members_to_l2` (also the sole trimmer).
 
 Filing-identity field (default-None; task 3533):
   filing_claimant_run_id:
@@ -264,7 +286,7 @@ class Escalation:
     # Old JSON files (pre-L2) deserialise correctly via from_dict's __dataclass_fields__
     # filter: absent keys map to the dataclass defaults without any migration required.
     members: list[str] = field(default_factory=list)  # member L1 escalation ids (cluster composition)
-    root_cause: str = ''  # root-cause hypothesis; exact-string dedup key for pending-L2 lookup
+    root_cause: str = ''  # root-cause hypothesis; dedup key for pending-L2 lookup, matched on its CANONICAL form (task 3998) but stored verbatim
     options: list[str] = field(default_factory=list)  # proposed resolution options ['A: ...', 'B: ...']
     # Structured raw-OBSERVATION entries backing this escalation (task 2558).
     # Each is a {observation, measured_at, ref} dict recording a measurement
@@ -346,6 +368,29 @@ class Escalation:
     # per-field caps that make the list's size (not merely its length) bounded.
     # Same zero-migration story as the two fields above.
     amendments_chars_elided: int = 0
+    # The DISTINCT PRE-CANONICAL root_cause spellings that have folded into this
+    # L2 (task 3998), the record's own spelling seeded first.  Canonicalising the
+    # root-cause match makes MORE promotes fold BY DESIGN, so its failure mode is
+    # OVER-folding — distinct causes silently merged under one canonical key —
+    # and the set of mutually-distinct spellings one cluster has been addressed
+    # by is that failure's only observable signature.
+    #
+    # NOT DERIVABLE FROM `amendments`, which is why this is a field and not a
+    # scan: that list sheds its OLDEST entries at `queue._MAX_AMENDMENTS` and
+    # elides each field at `_MAX_AMENDMENT_LINE_CHARS`, so a derived count would
+    # silently plateau and then UNDER-report precisely during the runaway the
+    # count exists to catch — reintroducing the silent suppression it is meant to
+    # close.
+    #
+    # The count that matters is `len(root_cause_variants) +
+    # root_cause_variants_truncated`, so the loss at the cap stays assertable
+    # FROM THE RECORD and is never log-only (INV-8).  `queue.add_members_to_l2`
+    # is the SOLE writer and sole trimmer (oldest-shed past
+    # `queue._MAX_ROOT_CAUSE_VARIANTS`, each drop counted), exactly as for
+    # `amendments`.  Zero migration by the same from_dict __dataclass_fields__
+    # filter as every field above.
+    root_cause_variants: list[str] = field(default_factory=list)
+    root_cause_variants_truncated: int = 0
 
     def to_dict(self) -> dict:
         return asdict(self)
