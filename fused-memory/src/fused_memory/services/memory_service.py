@@ -4492,10 +4492,22 @@ class MemoryService:
         on post-repair endpoints, which is why it lives here as one extra
         comparison rather than as a second guard that could drift.
 
-        Comparing the ``intended_referent`` rather than a resolved uuid is
-        equivalent and available BEFORE the mint: two ``Referent``s resolve to
-        the same node only if they render the same ``node_name``, i.e. are the
-        same frozen ``Referent``.
+        Comparing the intended ``node_name`` rather than a resolved uuid is
+        equivalent and available BEFORE the mint: ``ensure_entity_node`` keys
+        on the NAME, so two findings converge on one node exactly when their
+        referents render the same ``node_name``.
+
+        THE COMPARISON IS ON THE RENDERED NAME, NOT ON THE ``Referent``.
+        Those are not the same test. :attr:`Referent.node_name` returns
+        ``f'{project_id}:{number}'` whenever ``project_id`` is non-empty,
+        IGNORING ``kind`` entirely — so two ``Referent``s differing only in
+        ``kind`` render the SAME node name while comparing unequal as frozen
+        dataclasses. Comparing the objects would therefore miss a convergence
+        the mint will then actually perform. It happens to be unobservable
+        today only because ``canonical_labels._KIND_LABELS`` has exactly one
+        entry, and this is a pre-write safety gate for destructive edge
+        surgery — the post-hoc ``reassign_edge`` ValueError arrives too late to
+        substitute for it — so it must not silently depend on that.
 
         Resolvable findings only, on the projected arm: a finding eta will
         never act on cannot converge with anything.
@@ -4506,7 +4518,7 @@ class MemoryService:
         if len(set(endpoints)) < len(endpoints):
             return True
         targets = [
-            f.intended_referent for f in findings
+            f.intended_referent.node_name for f in findings
             if f.resolvable and f.intended_referent is not None
         ]
         return len(set(targets)) < len(targets)
@@ -4523,6 +4535,15 @@ class MemoryService:
         Split out from :meth:`_repair_episode_referents` so the pre-write
         degenerate predicate reads as a gate on the whole edge rather than as
         another branch inside the per-finding loop.
+
+        TWO GUARDS PER FINDING, NOT ONE, split at the commit point. The first
+        wraps ``ensure_entity_node`` + ``reassign_edge`` — everything that can
+        fail with NOTHING written — and its ``except`` records ``'failed'``.
+        The second wraps only the post-write summary backstop, whose failures
+        cannot un-write the move that already landed and therefore must not be
+        able to book it as ``'failed'``. Sharing one ``except`` across the
+        commit point is what would let a cosmetic post-write problem report an
+        episode's real repair as an infrastructure fault that did nothing.
         """
         for finding in findings:
             intended = finding.intended_referent
@@ -4586,9 +4607,6 @@ class MemoryService:
                     which_end=finding.which_end, group_id=group_id,
                 )
                 moved = bool(result.get('moved'))
-                refreshed = await self._backstop_endpoint_summaries(
-                    result, group_id=group_id,
-                ) if moved else ()
             except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
                 raise
             except Exception as exc:
@@ -4607,6 +4625,49 @@ class MemoryService:
                     reason=f'{type(exc).__name__}: {exc}',
                 ))
                 continue
+
+            # STEP 3 SITS OUTSIDE THE WRITE GUARD, in its own, deliberately.
+            # By here the endpoint move has ALREADY COMMITTED to the graph, so
+            # the two steps' failures mean opposite things and must not share
+            # an `except`: a raise from the backstop caught by the write guard
+            # above would record `outcome='failed'` with `moved` never set —
+            # a committed repair booked as an infrastructure failure that did
+            # nothing. That would un-count it in `ReferentRepairStats.repaired`,
+            # suppress its `_referent_repair_streaks` increment, and drop the
+            # emptied node from `_cleanup_emptied_nodes` candidacy: the exact
+            # "report zero repairs for an episode that performed one" shape
+            # that `_backstop_endpoint_summaries` and the cleanup's own
+            # independent guard both already exist to rule out. Same reasoning,
+            # same remedy, third site.
+            #
+            # `_backstop_endpoint_summaries` swallows per node, so only a
+            # malformed `result` reaches this arm — and when it does, the
+            # fallback reports what `reassign_edge` said IT refreshed, read
+            # totally so the recovery path cannot itself raise.
+            refreshed: tuple[str, ...] = ()
+            if moved:
+                try:
+                    refreshed = await self._backstop_endpoint_summaries(
+                        result, group_id=group_id,
+                    )
+                except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                    raise
+                except Exception:
+                    logger.warning(
+                        'Referent repair: the backstop summary refresh failed '
+                        'wholesale for edge %s; the endpoint move already '
+                        'committed and STANDS, and is recorded as a repair. '
+                        'Only the summary regeneration is in doubt',
+                        finding.edge_uuid, exc_info=True,
+                    )
+                    reported = (
+                        result.get('refreshed_nodes')
+                        if isinstance(result, dict) else None
+                    )
+                    refreshed = (
+                        tuple(reported)
+                        if isinstance(reported, (list, tuple)) else ()
+                    )
             repair_stats.repairs.append(ReferentRepair(
                 edge_uuid=finding.edge_uuid,
                 which_end=finding.which_end,

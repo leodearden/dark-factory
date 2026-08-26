@@ -43,6 +43,7 @@ from fused_memory.services.memory_service import (
     ReferentRepairStats,
     ReferentStats,
 )
+from fused_memory.utils import canonical_labels
 from fused_memory.utils.canonical_labels import Referent
 
 
@@ -641,6 +642,60 @@ class TestTheRefreshBackstop:
                 _stats(_finding()), group_id='dark_factory',
             )
 
+    @pytest.mark.asyncio
+    async def test_a_wholesale_backstop_failure_never_downgrades_a_committed_move(
+        self, service, caplog, monkeypatch,
+    ):
+        """THE GUARD SPLIT AT THE COMMIT POINT, pinned.
+
+        The backstop swallows per node, so reaching THIS arm takes a wholesale
+        failure — a malformed `reassign_edge` result, say.  What matters is
+        that it happens AFTER the endpoint move committed, so it must not be
+        caught by the write guard around `ensure_entity_node`/`reassign_edge`:
+        that would record `outcome='failed'` with `moved` never set, booking a
+        real repair as an infrastructure fault that did nothing.  The
+        downstream damage is not cosmetic — the repair vanishes from
+        `stats.repaired`, its streak increment is suppressed, and the node it
+        emptied drops out of the cleanup's candidate set.
+        """
+        async def _boom(*_a, **_kw):
+            raise TypeError('malformed reassign_edge result')
+
+        monkeypatch.setattr(service, '_backstop_endpoint_summaries', _boom)
+
+        with caplog.at_level(logging.WARNING):
+            stats = await service._repair_episode_referents(
+                _stats(_finding()), group_id='dark_factory', episode_uuid='ep-1',
+            )
+
+        assert stats.repairs[0].outcome == 'repaired'
+        assert stats.repairs[0].moved is True
+        assert stats.repaired == 1
+        # Falls back to what `reassign_edge` itself reported refreshing — the
+        # recovery path reports the graph, and cannot itself raise.
+        assert stats.repairs[0].summaries_refreshed == ('n-3129', 'n-3127')
+        # The three downstream consequences of a wrong `'failed'`, all absent.
+        assert service._referent_repair_streaks['dark_factory'] == 1
+        service.graphiti.delete_entity.assert_awaited_once()
+        assert any('committed' in r.getMessage() for r in caplog.records)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'exc_type', [asyncio.CancelledError, KeyboardInterrupt, SystemExit],
+    )
+    async def test_the_wholesale_backstop_guard_never_swallows_cancellation(
+        self, service, monkeypatch, exc_type,
+    ):
+        async def _interrupted(*_a, **_kw):
+            raise exc_type('interrupted')
+
+        monkeypatch.setattr(service, '_backstop_endpoint_summaries', _interrupted)
+
+        with pytest.raises(exc_type):
+            await service._repair_episode_referents(
+                _stats(_finding()), group_id='dark_factory',
+            )
+
 
 class TestNeverGuess:
     """An unresolvable finding is RECORDED and LEFT ALONE.
@@ -915,6 +970,53 @@ class TestDegenerateEdges:
         assert stats.degenerate_edges == 0
         assert stats.repaired == 1
         assert stats.flagged_unrepairable == 1
+
+    @pytest.mark.asyncio
+    async def test_convergence_is_decided_by_the_rendered_name_not_Referent_identity(
+        self, service, monkeypatch,
+    ):
+        """The projected arm must compare what `ensure_entity_node` KEYS ON.
+
+        `Referent.node_name` returns `f'{project_id}:{number}'` whenever
+        `project_id` is non-empty, IGNORING `kind` — so two `Referent`s
+        differing only in `kind` render the SAME node name while comparing
+        unequal as frozen dataclasses.  Comparing the objects would let both
+        ends converge onto one node with the pre-write gate seeing nothing,
+        leaving `reassign_edge`'s ValueError to arrive after the first end had
+        already committed — precisely the half-attributed edge the gate exists
+        to prevent.
+
+        `_KIND_LABELS` has exactly one entry today, which is the ONLY reason
+        the object comparison was not already observably wrong; registering a
+        second kind is what this monkeypatch simulates, so the guarantee does
+        not silently depend on that registry's size.
+        """
+        monkeypatch.setattr(
+            canonical_labels, '_KIND_LABELS', {'task': 'Task', 'ticket': 'Ticket'},
+        )
+        first = Referent(number='3127', kind='task', project_id='reify')
+        second = Referent(number='3127', kind='ticket', project_id='reify')
+        assert first != second, 'distinct Referents, or the test proves nothing'
+        assert first.node_name == second.node_name == 'reify:3127'
+
+        findings = (
+            _finding(edge_uuid='e5', which_end='source', intended_referent=first),
+            _finding(
+                edge_uuid='e5', which_end='target',
+                old_endpoint_uuid='n-other', old_endpoint_name='Task 9999',
+                endpoint_referent=Referent(number='9999'),
+                intended_referent=second,
+            ),
+        )
+
+        stats = await service._repair_episode_referents(
+            _stats(*findings), group_id='dark_factory',
+        )
+
+        assert stats.degenerate_edges == 1
+        assert stats.repaired == 0
+        assert [r.outcome for r in stats.repairs] == ['degenerate', 'degenerate']
+        service.graphiti.reassign_edge.assert_not_awaited()
 
 
 class TestEmptiedNodeCleanup:
@@ -2113,6 +2215,40 @@ class TestTheStormGate:
         assert len(_escalations(to_thread_spy)) == 1, (
             'the streak restarted at 1, so the next alarm needs a full fresh '
             'run to the threshold'
+        )
+
+    async def test_a_checked_nothing_pass_never_re_pages_an_already_breached_streak(
+        self, service, to_thread_spy, monkeypatch,
+    ):
+        """THE UNCHANGED ARM, which is not the reset arm.
+
+        The gate thresholds the value `_record_referent_repair_pass` RETURNED
+        for this pass, never a re-read of `_referent_repair_streaks`.  That
+        distinction is the whole reason the recorder returns `int | None`, and
+        only this case can tell the two formulations apart: an episode that
+        checked nothing performs no repair and leaves a breached streak exactly
+        where it was, so it has produced no evidence and must not re-page the
+        alarm.  A gate rewritten as `if self._referent_repair_streaks.get(
+        group_id, 0) >= _REFERENT_REPAIR_STREAK_THRESHOLD:` would fire on every
+        such no-op episode — and, without this test, would pass the whole
+        suite: the reset arm above exercises `endpoints_checked > 0`, which
+        zeroes the streak and therefore cannot distinguish them.
+        """
+        monkeypatch.setattr(
+            'fused_memory.services.memory_service._REFERENT_REPAIR_STREAK_THRESHOLD', 3,
+        )
+        service.set_known_projects({'dark_factory': '/tmp/df-root'})
+        service._referent_repair_streaks['dark_factory'] = 5
+
+        # Looked at nothing: no referents declared, no edges, no findings.
+        await service._repair_episode_referents(
+            ReferentStats(endpoints_checked=0), group_id='dark_factory',
+        )
+
+        assert _escalations(to_thread_spy) == []
+        assert service._referent_repair_streaks['dark_factory'] == 5, (
+            'a pass that checked nothing is no evidence of health either — it '
+            'leaves the streak alone rather than resetting it'
         )
 
 
