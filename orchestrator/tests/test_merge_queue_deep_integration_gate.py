@@ -786,3 +786,261 @@ def _canary_predicate_items_per(
         if isinstance(d.get('landed_via_chain'), int) and d['landed_via_chain'] >= 1
     ]
     return (sum(landed) / n_deep) if n_deep else None  # items landed per deep verify run
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# -- step-01 RED: the TWO-WAY oracle's own contract, self-tested for vacuity --
+#
+# Every row below leans on ONE oracle, so the oracle is the gate's single point
+# of failure: an oracle that passes vacuously turns eleven rows green without
+# testing anything.  Three of its surfaces are DOCUMENTED to go silent rather
+# than to fail —
+#
+#   * `speculation_accounting_violations()` and `worktree_ledger_violations()`
+#     both `return []` immediately when `not self._running` (stop() over-
+#     releases both semaphores by depth+1 as a shutdown safety valve, which
+#     would otherwise read as a spurious violation);
+#   * `two_layer_invariants(main_sha)` SKIPS its base-chain and verify-base
+#     sub-checks for a falsy or 'unknown' main_sha (the snapshot() sentinel).
+#
+# — so the oracle must REJECT those inputs rather than consume them.  This
+# class pins all three as POSITIVE CONTROLS, and pins a forced permit leak as
+# the proof that the green it reports is meaningful.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestTwoWayOracleContract:
+    """``_assert_two_way_quiescent`` — the gate's own oracle, self-tested.
+
+    Sync deliberately: every surface here is pure/synchronous (no await, no
+    git subprocess), and pytest-asyncio STRICT makes a sync ``test_*`` inside
+    an ``@pytest.mark.asyncio`` class a hard ERROR.  The one surface that
+    genuinely needs a running loop — an unresolved request future — lives in
+    :class:`TestTwoWayOracleContractAsync` below.
+    """
+
+    def test_a_clean_at_rest_worker_passes_on_both_halves(
+        self, git_repo: Path,
+    ) -> None:
+        """The GREEN baseline: an oracle that always raised would prove nothing.
+
+        Every rejection test below is only evidence if the oracle can also say
+        yes — so this pins the accepting branch of all eight surfaces at once
+        (six worker-side, plus the permit census and the thrash ladder).
+        """
+        from shared.task_metadata import RetryLedger
+
+        worker = _make_worker(_make_git_ops(git_repo))
+        main_sha = asyncio.run(_rev_parse(git_repo, 'main'))
+        census = _permit_census(worker)
+        ledger = RetryLedger()
+
+        _assert_two_way_quiescent(
+            worker, main_sha, [],
+            permits_before=census, ladder={'before': ledger, 'after': ledger},
+        )
+
+    def test_a_stopped_worker_is_rejected_rather_than_passing_vacuously(
+        self, git_repo: Path,
+    ) -> None:
+        """VACUITY TRAP (i): both audits short-circuit to [] when not ``_running``.
+
+        Demonstrated, not quoted: a REAL forced leak is installed first, and
+        the two audits are observed answering ``[]`` about it while the worker
+        is stopped.  That is exactly the state in which an oracle that merely
+        called them would report a clean green over a broken worker — so the
+        oracle owes a guard clause, and this asserts it has one.
+        """
+        worker = _make_worker(_make_git_ops(git_repo))
+        main_sha = asyncio.run(_rev_parse(git_repo, 'main'))
+
+        # A genuine identity break: a permit vanished from the shared semaphore
+        # without being recorded held-by-merger, transferred, or available.
+        worker._speculation_slot._value -= 1
+        worker._running = False
+
+        spec_violations = worker.speculation_accounting_violations()
+        assert spec_violations == [], (
+            f'the vacuity trap this guard exists for did not reproduce: a '
+            f'stopped worker with a forced speculation-slot leak should have '
+            f'short-circuited to [], got {spec_violations!r}'
+        )
+        wt_violations = worker.worktree_ledger_violations()
+        assert wt_violations == [], (
+            f'worktree_ledger_violations() should short-circuit to [] on a '
+            f'stopped worker, got {wt_violations!r}'
+        )
+
+        with pytest.raises(AssertionError, match='_running'):
+            _assert_two_way_quiescent(worker, main_sha, [])
+
+    def test_the_unknown_main_sha_sentinel_is_rejected(
+        self, git_repo: Path,
+    ) -> None:
+        """VACUITY TRAP (ii): ``two_layer_invariants`` skips sub-checks for 'unknown'.
+
+        ``snapshot()`` passes the literal ``'unknown'`` when ``get_main_sha()``
+        is unavailable, and the base-chain + verify-base sub-checks are gated
+        off for it (and for a falsy sha) so startup does not report spurious
+        violations.  A gate that handed the oracle that sentinel would be
+        asserting only the two graph-consistency checks and calling it §5.3.
+
+        The same worker with a REAL sha is accepted in the same test, so the
+        rejection is attributable to the sentinel and not to the worker.
+        """
+        worker = _make_worker(_make_git_ops(git_repo))
+        real_sha = asyncio.run(_rev_parse(git_repo, 'main'))
+
+        for sentinel in ('unknown', '', None):
+            with pytest.raises(AssertionError, match='main_sha'):
+                _assert_two_way_quiescent(worker, sentinel, [])  # type: ignore[arg-type]
+
+        _assert_two_way_quiescent(worker, real_sha, [])
+
+    def test_a_forced_speculation_slot_leak_is_detected(
+        self, git_repo: Path,
+    ) -> None:
+        """POSITIVE CONTROL: the green the oracle reports is meaningful.
+
+        The control is transcribed from
+        test_merge_queue_resource_audit.py::TestSpeculationAccountingViolations::
+        test_forced_speculation_slot_leak_yields_one_violation — the identity
+        (a) break that ``speculation_accounting_violations`` exists to catch.
+        Without this, every "audits green" assertion in the gate would be
+        consistent with an audit that never fires at all.
+        """
+        worker = _make_worker(_make_git_ops(git_repo))
+        main_sha = asyncio.run(_rev_parse(git_repo, 'main'))
+
+        worker._speculation_slot._value -= 1
+        assert worker._running is True, (
+            'the leak control is only meaningful on a RUNNING worker; got '
+            f'_running={worker._running!r}'
+        )
+
+        with pytest.raises(AssertionError, match='speculation_accounting_violations'):
+            _assert_two_way_quiescent(worker, main_sha, [])
+
+    def test_a_permit_token_that_did_not_survive_the_run_is_rejected(
+        self, git_repo: Path,
+    ) -> None:
+        """CAS/LEDGER half (a): the census is compared by TOKEN, not by count.
+
+        ``SpecPermit``/``CapPermit`` are ``eq=False`` dataclasses — IDENTITY
+        comparison — so a ledger's ``live`` set treats every acquired token as
+        a distinct member.  A run that released the dispatching head's token
+        early and acquired a replacement would keep every COUNT plausible and
+        break only ownership: invisible to a size comparison, and exactly what
+        a frozenset comparison catches.
+
+        The forged census stands in for "a token that was live before the run
+        and is not live after it", which is the same set difference either way
+        round.
+        """
+        worker = _make_worker(_make_git_ops(git_repo))
+        main_sha = asyncio.run(_rev_parse(git_repo, 'main'))
+
+        census = _permit_census(worker)
+        forged: _PermitCensus = {**census, 'spec_live': frozenset({SpecPermit()})}
+        with pytest.raises(AssertionError, match='spec_live'):
+            _assert_two_way_quiescent(worker, main_sha, [], permits_before=forged)
+
+        forged_cap: _PermitCensus = {**census, 'cap_live': frozenset({CapPermit()})}
+        with pytest.raises(AssertionError, match='cap_live'):
+            _assert_two_way_quiescent(worker, main_sha, [], permits_before=forged_cap)
+
+    def test_a_moved_thrash_counter_is_rejected(self, git_repo: Path) -> None:
+        """CAS/LEDGER half (b): row 8's claim is about workflow.py's LADDER.
+
+        The `after` ledger is produced by the REAL
+        ``workflow._evaluate_merge_thrash`` over a real ``RetryLedger`` rather
+        than by hand, so a change to the ladder's counter arithmetic moves this
+        control rather than leaving it stale.  ``before is after`` is the
+        UNMOVED shape row 8 asserts; a single genuine blocked signature folded
+        through the ladder is the MOVED shape it must be able to tell apart.
+        """
+        from shared.task_metadata import RetryLedger
+
+        from orchestrator.workflow import (
+            _compute_merge_outcome_signature,
+            _evaluate_merge_thrash,
+        )
+
+        worker = _make_worker(_make_git_ops(git_repo))
+        main_sha = asyncio.run(_rev_parse(git_repo, 'main'))
+
+        before = RetryLedger()
+        signature = _compute_merge_outcome_signature('merge_conflict', 'shared.txt', '')
+        moved = _evaluate_merge_thrash(before, None, signature, 2).ledger
+        assert moved.consecutive_merge_thrash == 1, (
+            f'the ladder control is inert: folding one genuine blocked '
+            f'signature must move the counter off 0, got '
+            f'{moved.consecutive_merge_thrash!r}'
+        )
+
+        with pytest.raises(AssertionError, match='consecutive_merge_thrash'):
+            _assert_two_way_quiescent(
+                worker, main_sha, [], ladder={'before': before, 'after': moved},
+            )
+
+        _assert_two_way_quiescent(
+            worker, main_sha, [], ladder={'before': before, 'after': before},
+        )
+
+    def test_a_moved_outcome_signature_is_rejected(self, git_repo: Path) -> None:
+        """CAS/LEDGER half (b), second field: the SIGNATURE must be unmoved too.
+
+        A deep round that requeued WITHOUT rendering a block reason leaves both
+        ladder fields untouched.  Pinning the counter alone would miss a round
+        that re-keyed ``last_merge_outcome_signature`` while happening to leave
+        the counter where it was — which is precisely the state that makes the
+        NEXT genuine block increment instead of reset.
+        """
+        from shared.task_metadata import RetryLedger
+
+        from orchestrator.workflow import _compute_merge_outcome_signature
+
+        worker = _make_worker(_make_git_ops(git_repo))
+        main_sha = asyncio.run(_rev_parse(git_repo, 'main'))
+
+        before = RetryLedger(consecutive_merge_thrash=1, last_merge_outcome_signature=None)
+        rekeyed = before.model_copy(update={
+            'last_merge_outcome_signature': _compute_merge_outcome_signature(
+                'verify_failure', 'tip is red', '',
+            ),
+        })
+        assert rekeyed.consecutive_merge_thrash == before.consecutive_merge_thrash, (
+            'this control must move ONLY the signature; the counter moved too'
+        )
+
+        with pytest.raises(AssertionError, match='last_merge_outcome_signature'):
+            _assert_two_way_quiescent(
+                worker, main_sha, [], ladder={'before': before, 'after': rekeyed},
+            )
+
+
+@pytest.mark.asyncio
+class TestTwoWayOracleContractAsync:
+    """The one oracle surface that needs a running loop: request futures."""
+
+    async def test_an_unresolved_request_future_is_rejected(
+        self, git_repo: Path,
+    ) -> None:
+        """Surface (a): every tracked request must have resolved at quiescence.
+
+        ``_make_req`` builds its future off ``asyncio.get_running_loop()``, so
+        this leg cannot be sync.  The SAME request is then cancelled and the
+        oracle accepts it — pinning that "resolved" means done-OR-cancelled,
+        the shape a requeued-then-drained item actually rests in.
+        """
+        git_ops = _make_git_ops(git_repo)
+        worker = _make_worker(git_ops)
+        config = _make_config(git_repo, chain_cap=0)
+        main_sha = await _rev_parse(git_repo, 'main')
+
+        req = _make_req('101', '101', config, git_repo)
+        with pytest.raises(AssertionError, match='still pending'):
+            _assert_two_way_quiescent(worker, main_sha, [req])
+
+        req.result.cancel()
+        _assert_two_way_quiescent(worker, main_sha, [req])
