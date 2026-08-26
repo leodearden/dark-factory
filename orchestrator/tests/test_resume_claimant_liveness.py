@@ -649,3 +649,189 @@ class TestCorroboratingReadBeforeTheWrite:
             f"The corroborating read must come AFTER the re-block guard's "
             f'persist, not before it; observed call order {order}'
         )
+
+
+# ---------------------------------------------------------------------------
+# step-6 — the `level >= 1` gate removal in _on_escalation_resolved
+# ---------------------------------------------------------------------------
+
+def _record_scheduling(harness: Harness) -> list[str]:
+    """Start recording the labels ``_on_escalation_resolved`` schedules under.
+
+    Call BEFORE the drive; the returned list fills in as coroutines are
+    scheduled. Asserting on WHICH coroutine was scheduled — not only on the
+    eventual ``set_task_status`` — is what separates "the routing let it
+    through" from "the routing dropped it and something else wrote the
+    status". The labels are the harness's own, produced at the two scheduling
+    sites inside the ``WORKFLOW_RESUME`` branch (``cascade-unblock task ...``
+    / ``orphan-unblock task ...``).
+
+    ``_schedule_coro_threadsafe`` does NOT put its ``label`` on the asyncio
+    task name, so the label is observable only by wrapping the method. This
+    WRAPS rather than replaces: the coroutine is still really scheduled, so
+    the ``await asyncio.gather(*_background_tasks)`` drain idiom keeps working
+    and the assertions below stay end-to-end.
+    """
+    labels: list[str] = []
+    original = harness._schedule_coro_threadsafe
+
+    def _spy(coro, *, label: str):
+        labels.append(label)
+        return original(coro, label=label)
+
+    harness._schedule_coro_threadsafe = _spy  # type: ignore[method-assign]
+    return labels
+
+
+@pytest.mark.asyncio
+class TestResumeLevelGateRemoved:
+    """``_on_escalation_resolved`` routes the ``resume`` effect on LIVENESS,
+    not on ``escalation.level`` (task 3540 / PRD D8, spec E9).
+
+    The old ``level >= 1`` wrapper rested on "every L0 has a live workflow
+    waiting on ``event.set()``". That is false for exactly the workflows this
+    task exists to rescue: one that died between filing its escalation and
+    exiting has already had its ``_escalation_events`` entry popped, so the
+    synchronous wake sets nothing and the gate then dropped the re-pend in
+    silence. The local ``_escalation_events`` check below is the process-local
+    half of the liveness test and is unchanged; the store-side claimant oracle
+    inside ``_cascade_unblock_member`` is the authoritative half, and is the
+    one that can see a claimant held by ANOTHER orchestrator.
+    """
+
+    async def test_level0_orphan_reaches_the_repend(self, harness: Harness):
+        """[THE red assertion] An L0 with no live workflow re-pends.
+
+        Today the ``level >= 1`` gate returns before either scheduling site,
+        so a stranded in-progress row with a closed escalation has nothing
+        left that will ever advance it.
+        """
+        esc = _esc(task_id='3438', level=0, resolved_by='escalation-watcher-auto')
+        _wire(harness, _row('in-progress', claimant=None, heartbeat=None))
+        harness._escalation_events.pop('3438', None)
+
+        labels = _record_scheduling(harness)
+        harness._on_escalation_resolved(esc)
+        await asyncio.gather(*list(harness._background_tasks))
+
+        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            '3438', _resume_target(esc)
+        )
+        assert any('orphan-unblock task 3438' in label for label in labels), (
+            f'Expected the orphan-unblock coro to be scheduled; got {labels}'
+        )
+
+    async def test_level0_with_a_live_workflow_is_woken_not_flipped(
+        self, harness: Harness
+    ):
+        """The half of the old L0 rule that SURVIVES, and why it survives.
+
+        A registered ``_escalation_events`` entry IS the process-local live
+        signal. The workflow is woken synchronously and owns its own re-pend,
+        so nothing is scheduled and nothing is written. The event assertion is
+        the regression half: removing the level gate must not disturb the wake
+        path that made the gate defensible in the first place.
+        """
+        esc = _esc(task_id='3438', level=0, resolved_by='escalation-watcher-auto')
+        _wire(harness, _row('in-progress', claimant=None, heartbeat=None))
+        event = asyncio.Event()
+        harness._escalation_events['3438'] = event
+
+        harness._on_escalation_resolved(esc)
+        await asyncio.gather(*list(harness._background_tasks))
+
+        assert event.is_set(), 'The synchronous wake path must still fire'
+        harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
+
+    async def test_level0_with_a_cross_host_claimant_is_scheduled_then_skipped(
+        self, harness: Harness, caplog
+    ):
+        """The two liveness halves are BOTH needed, and they are not redundant.
+
+        This row has no ``_escalation_events`` entry — process-locally it looks
+        orphaned, so the routing above schedules it — but its claimant is
+        heartbeating, which is what a workflow running under ANOTHER
+        orchestrator looks like from here. Only the store-side oracle inside
+        ``_cascade_unblock_member`` can see that, and it withholds the write.
+        """
+        esc = _esc(task_id='3438', level=0, resolved_by='escalation-watcher-auto')
+        _wire(harness, _row('in-progress', claimant=LIVE_CLAIMANT, heartbeat='fresh'))
+        harness._escalation_events.pop('3438', None)
+
+        labels = _record_scheduling(harness)
+        with caplog.at_level(logging.DEBUG):
+            harness._on_escalation_resolved(esc)
+            await asyncio.gather(*list(harness._background_tasks))
+
+        assert any('orphan-unblock task 3438' in label for label in labels), (
+            f'The routing must still schedule it — the local half sees no '
+            f'live workflow; got {labels}'
+        )
+        harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
+        assert any(
+            r.levelno == logging.DEBUG and 'live claimant' in r.getMessage()
+            for r in caplog.records
+        ), 'Expected the store-side oracle to name the live claimant'
+
+    @pytest.mark.parametrize(
+        ('resolved_by', 'expected_label'),
+        [
+            ('l2-cascade:esc-4000-39', 'cascade-unblock task 3438'),
+            ('steward', 'orphan-unblock task 3438'),
+        ],
+    )
+    async def test_level1_routing_is_unchanged(
+        self, harness: Harness, resolved_by: str, expected_label: str
+    ):
+        """[regression] Removing the wrapper must not disturb the discrimination
+        INSIDE it: an l2-cascade member still routes to the cascade label and a
+        non-cascade orphan to the orphan label, at L1 exactly as today."""
+        esc = _esc(task_id='3438', level=1, resolved_by=resolved_by)
+        _wire(harness, _row('blocked', claimant=None, heartbeat=None))
+        harness._escalation_events.pop('3438', None)
+
+        labels = _record_scheduling(harness)
+        harness._on_escalation_resolved(esc)
+        await asyncio.gather(*list(harness._background_tasks))
+
+        assert any(expected_label in label for label in labels), (
+            f'Expected {expected_label!r} to be scheduled; got {labels}'
+        )
+        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            '3438', _resume_target(esc)
+        )
+
+    async def test_dismissed_level0_is_close_only(self, harness: Harness):
+        """[regression] The gate removal must widen only the ``resume`` effect.
+
+        A DISMISSED escalation maps to ``close_only`` -> ``WORKFLOW_NONE``,
+        which returns before the resume branch entirely. Without this, "L0 now
+        reaches the re-pend" could quietly mean "an abandoned L0 re-pends too",
+        which is the opposite of what dismissal means.
+        """
+        esc = _esc(task_id='3438', level=0, status='dismissed', resolved_by='steward')
+        _wire(harness, _row('in-progress', claimant=None, heartbeat=None))
+        harness._escalation_events.pop('3438', None)
+
+        labels = _record_scheduling(harness)
+        harness._on_escalation_resolved(esc)
+        assert labels == [], f'close_only must schedule nothing; got {labels}'
+        await asyncio.gather(*list(harness._background_tasks))
+
+        harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
+
+    async def test_scheduler_pause_sentinel_returns_before_dispatch(
+        self, harness: Harness
+    ):
+        """[regression] The synthetic pause-sentinel id is not a real task and
+        still returns before action dispatch — it has its own auto-resume
+        handling above, and a re-pend of ``__scheduler__`` would be nonsense."""
+        sentinel = Harness._SCHEDULER_PAUSE_SENTINEL
+        esc = _esc(task_id=sentinel, level=0, resolved_by='steward')
+        _wire(harness, _row('blocked', task_id=sentinel, claimant=None, heartbeat=None))
+        harness.scheduler.is_paused = False
+
+        harness._on_escalation_resolved(esc)
+        await asyncio.gather(*list(harness._background_tasks))
+
+        harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
